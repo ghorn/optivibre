@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+          components: rustfmt, clippy, llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets
+      - name: Run tests
+        run: cargo test --workspace
+      - name: Coverage summary
+        run: cargo llvm-cov --workspace --json --summary-only --output-path coverage-summary.json
+      - name: Print coverage summary
+        run: python3 scripts/coverage_summary.py coverage-summary.json
+      - name: Coverage lcov
+        run: cargo llvm-cov report --lcov --output-path coverage.lcov

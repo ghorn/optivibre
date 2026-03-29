@@ -1,0 +1,46 @@
+[package]
+name = "examples_run"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+ad-bench-artifacts = []
+
+[dependencies]
+anyhow.workspace = true
+bench_report = { path = "../bench_report" }
+examples_source = { path = "../examples_source" }
+serde.workspace = true
+serde_json.workspace = true
+sx_core = { path = "../sx_core" }
+sx_codegen = { path = "../sx_codegen" }
+sx_codegen_llvm = { path = "../sx_codegen_llvm" }
+tempfile.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true
+examples_source = { path = "../examples_source" }
+sx_codegen = { path = "../sx_codegen" }
+sx_codegen_llvm = { path = "../sx_codegen_llvm" }
+
+[dev-dependencies]
+criterion.workspace = true
+examples_source = { path = "../examples_source" }
+sx_codegen = { path = "../sx_codegen" }
+
+[[bench]]
+name = "ad_cost"
+harness = false
+required-features = ["ad-bench-artifacts"]
+
+[[bin]]
+name = "ad_cost_suite"
+path = "src/bin/ad_cost_suite.rs"
+required-features = ["ad-bench-artifacts"]

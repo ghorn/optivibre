@@ -1,0 +1,13 @@
+[package]
+name = "examples_source"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+sx_core = { path = "../sx_core" }

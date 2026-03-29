@@ -1,0 +1,49 @@
+casadi_commit = "838d585b15f3de6f2a1e8d058c91e445a01d43e3"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_scalarSX"
+rust_test = "sx_core::core::sx_cse_and_constant_folding"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_gradient"
+rust_test = "sx_core::core::gradient_matches_manual_rosenbrock"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_SXJacobian"
+rust_test = "sx_core::core::jacobian_and_hessian_shapes"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_const_folding_on_the_fly"
+rust_test = "sx_core::core::sx_cse_and_constant_folding"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/function.py::test_jacobian"
+rust_test = "sx_core::core::jacobian_and_hessian_shapes"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/function.py::test_hessians"
+rust_test = "sx_core::core::jacobian_and_hessian_shapes"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/function.py::test_codegen_with_jac_sparsity"
+rust_test = "sx_codegen::codegen::generated_contexts_and_signatures"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/ad.py::test_Jacobian"
+rust_test = "sx_core::core::forward_reverse_directionals_match_finite_difference"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_taylor"
+status = "unsupported"
+
+[[entries]]
+casadi_case = "test/python/function.py::test_jit_buffer_eval"
+status = "unsupported"

@@ -1,0 +1,19 @@
+[package]
+name = "sx_codegen_llvm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+llvm-sys.workspace = true
+sx_codegen = { path = "../sx_codegen" }
+sx_core = { path = "../sx_core" }
+
+[dev-dependencies]
+rstest.workspace = true
+sx_core = { path = "../sx_core" }

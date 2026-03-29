@@ -1,0 +1,41 @@
+[workspace]
+members = [
+    "bench_report",
+    "sx_core",
+    "sx_codegen",
+    "sx_codegen_llvm",
+    "optimization",
+    "examples_source",
+    "examples_run",
+    "xtask",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.94"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1.0.97"
+approx = "0.5.1"
+clarabel = "0.11.1"
+criterion = { version = "0.5.1", features = ["html_reports"] }
+llvm-sys = { version = "221.0.0", features = ["prefer-dynamic", "strict-versioning"] }
+nalgebra = { version = "0.33.2", default-features = false, features = ["std"] }
+proptest = "1.7.0"
+rstest = "0.25.0"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+tempfile = "3.20.0"
+thiserror = "2.0.12"
+toml = "0.8.22"
+
+[workspace.lints.rust]
+warnings = "deny"
+
+[workspace.lints.clippy]
+all = "deny"
+todo = "deny"
+unimplemented = "deny"
