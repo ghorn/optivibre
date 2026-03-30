@@ -18,12 +18,28 @@ struct ReportPaths {
     markdown: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParityReportPaths {
+    dir: PathBuf,
+    markdown: PathBuf,
+    json: PathBuf,
+}
+
 fn report_paths(root: &Path) -> ReportPaths {
     let dir = root.join("target/reports");
     ReportPaths {
         debug_json: dir.join("ad_cost_debug.json"),
         release_json: dir.join("ad_cost_release.json"),
         markdown: dir.join("ad_cost_report.md"),
+        dir,
+    }
+}
+
+fn parity_report_paths(root: &Path) -> ParityReportPaths {
+    let dir = root.join("target/reports");
+    ParityReportPaths {
+        markdown: dir.join("casadi_parity_audit.md"),
+        json: dir.join("casadi_parity_audit.json"),
         dir,
     }
 }
@@ -119,9 +135,35 @@ fn generate_ad_cost_report() -> Result<()> {
     Ok(())
 }
 
+fn generate_casadi_parity_report() -> Result<()> {
+    let root = workspace_root()?;
+    let paths = parity_report_paths(&root);
+    fs::create_dir_all(&paths.dir)?;
+    let output = Command::new("python3")
+        .arg("scripts/casadi_parity_audit.py")
+        .output()
+        .context("failed to run scripts/casadi_parity_audit.py")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "casadi parity report generation failed with status {}:\n{stderr}",
+            output.status
+        );
+    }
+    if !paths.markdown.exists() {
+        bail!("expected parity markdown report was not generated");
+    }
+    if !paths.json.exists() {
+        bail!("expected parity JSON report was not generated");
+    }
+    println!("{}", paths.markdown.display());
+    Ok(())
+}
+
 fn main() -> Result<()> {
     match env::args().nth(1).as_deref() {
         Some("ad-cost-report") | None => generate_ad_cost_report(),
+        Some("casadi-parity-report") => generate_casadi_parity_report(),
         Some(other) => bail!("unknown xtask command: {other}"),
     }
 }
@@ -157,6 +199,21 @@ mod tests {
         assert_eq!(
             paths.markdown,
             PathBuf::from("/tmp/workspace/target/reports/ad_cost_report.md")
+        );
+    }
+
+    #[test]
+    fn parity_report_paths_point_into_target_reports() {
+        let root = Path::new("/tmp/workspace");
+        let paths = parity_report_paths(root);
+        assert_eq!(paths.dir, PathBuf::from("/tmp/workspace/target/reports"));
+        assert_eq!(
+            paths.markdown,
+            PathBuf::from("/tmp/workspace/target/reports/casadi_parity_audit.md")
+        );
+        assert_eq!(
+            paths.json,
+            PathBuf::from("/tmp/workspace/target/reports/casadi_parity_audit.json")
         );
     }
 

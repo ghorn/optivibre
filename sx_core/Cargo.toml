@@ -17,4 +17,6 @@ approx.workspace = true
 proptest.workspace = true
 rstest.workspace = true
 serde.workspace = true
+sx_codegen = { path = "../sx_codegen" }
+sx_codegen_llvm = { path = "../sx_codegen_llvm" }
 toml.workspace = true

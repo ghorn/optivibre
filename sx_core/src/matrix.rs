@@ -186,6 +186,13 @@ impl SXMatrix {
         Self::dense(values.len(), 1, values)
     }
 
+    pub fn map_nonzeros(&self, mut f: impl FnMut(SX) -> SX) -> Self {
+        Self {
+            ccs: self.ccs.clone(),
+            nonzeros: self.nonzeros.iter().copied().map(&mut f).collect(),
+        }
+    }
+
     pub fn sym(name: impl AsRef<str>, ccs: CCS) -> Result<Self> {
         let values = ccs
             .positions()
@@ -221,6 +228,41 @@ impl SXMatrix {
 
     pub fn shape(&self) -> (Index, Index) {
         (self.ccs.nrow(), self.ccs.ncol())
+    }
+
+    pub fn transpose(&self) -> Self {
+        let ccs = self.ccs.transpose();
+        let nonzeros = ccs
+            .positions()
+            .into_iter()
+            .map(|(row, col)| self.get(col, row))
+            .collect();
+        Self { ccs, nonzeros }
+    }
+
+    pub fn reshape(&self, nrow: Index, ncol: Index) -> Result<Self> {
+        let ccs = self.ccs.reshape(nrow, ncol)?;
+        let old_nrow = self.ccs.nrow();
+        let value_by_linear = self
+            .ccs
+            .positions()
+            .into_iter()
+            .zip(self.nonzeros.iter().copied())
+            .map(|((row, col), value)| (row + col * old_nrow, value))
+            .collect::<HashMap<_, _>>();
+        let nonzeros = ccs
+            .positions()
+            .into_iter()
+            .map(|(row, col)| {
+                let linear = row + col * nrow;
+                value_by_linear.get(&linear).copied().ok_or_else(|| {
+                    SxError::Shape(format!(
+                        "missing reshaped nonzero value at linear index {linear}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Self::new(ccs, nonzeros)
     }
 
     pub fn scalar_expr(&self) -> Result<SX> {

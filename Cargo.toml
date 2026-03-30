@@ -39,3 +39,6 @@ warnings = "deny"
 all = "deny"
 todo = "deny"
 unimplemented = "deny"
+
+[patch.crates-io]
+ipopt-sys = { path = "third_party/ipopt-sys" }

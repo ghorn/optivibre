@@ -31,6 +31,7 @@ sx_codegen = { path = "../sx_codegen" }
 sx_codegen_llvm = { path = "../sx_codegen_llvm" }
 
 [dev-dependencies]
+approx.workspace = true
 criterion.workspace = true
 examples_source = { path = "../examples_source" }
 sx_codegen = { path = "../sx_codegen" }

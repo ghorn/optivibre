@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
-use crate::Index;
 use crate::error::{Result, SxError};
+use crate::{Index, SignedIndex, checked_len_product};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CCS {
@@ -124,6 +124,22 @@ impl CCS {
         }
     }
 
+    pub fn diag(size: Index) -> Self {
+        let mut col_ptrs = Vec::with_capacity(size + 1);
+        let mut row_indices = Vec::with_capacity(size);
+        col_ptrs.push(0);
+        for idx in 0..size {
+            row_indices.push(idx);
+            col_ptrs.push(row_indices.len());
+        }
+        Self {
+            nrow: size,
+            ncol: size,
+            col_ptrs,
+            row_indices,
+        }
+    }
+
     pub fn from_positions(nrow: Index, ncol: Index, positions: &[(Index, Index)]) -> Result<Self> {
         let mut cols = vec![Vec::new(); ncol];
         for &(row, col) in positions {
@@ -144,6 +160,55 @@ impl CCS {
             col_ptrs.push(row_indices.len());
         }
         Self::new(nrow, ncol, col_ptrs, row_indices)
+    }
+
+    pub fn triplet(
+        nrow: Index,
+        ncol: Index,
+        row_indices: &[Index],
+        col_indices: &[Index],
+    ) -> Result<Self> {
+        if row_indices.len() != col_indices.len() {
+            return Err(SxError::Ccs(format!(
+                "triplet row/col index length mismatch: {} rows, {} cols",
+                row_indices.len(),
+                col_indices.len()
+            )));
+        }
+        let positions = row_indices
+            .iter()
+            .copied()
+            .zip(col_indices.iter().copied())
+            .collect::<Vec<_>>();
+        Self::from_positions(nrow, ncol, &positions)
+    }
+
+    pub fn rowcol(rows: &[Index], cols: &[Index], nrow: Index, ncol: Index) -> Result<Self> {
+        let mut positions = Vec::with_capacity(rows.len().saturating_mul(cols.len()));
+        for &col in cols {
+            for &row in rows {
+                positions.push((row, col));
+            }
+        }
+        Self::from_positions(nrow, ncol, &positions)
+    }
+
+    pub fn nonzeros(nrow: Index, ncol: Index, linear_indices: &[Index]) -> Result<Self> {
+        let Some(numel) = checked_len_product(nrow, ncol) else {
+            return Err(SxError::Ccs("CCS nonzero constructor size overflow".into()));
+        };
+        let mut positions = Vec::with_capacity(linear_indices.len());
+        for &linear in linear_indices {
+            if linear >= numel {
+                return Err(SxError::Ccs(format!(
+                    "linear index {linear} out of bounds for {nrow}x{ncol}"
+                )));
+            }
+            let row = linear % nrow;
+            let col = linear / nrow;
+            positions.push((row, col));
+        }
+        Self::from_positions(nrow, ncol, &positions)
     }
 
     pub fn nrow(&self) -> Index {
@@ -168,6 +233,189 @@ impl CCS {
 
     pub fn row_indices(&self) -> &[Index] {
         &self.row_indices
+    }
+
+    pub fn get_ccs(&self) -> (Vec<Index>, Vec<Index>) {
+        (self.col_ptrs.clone(), self.row_indices.clone())
+    }
+
+    pub fn find(&self) -> Vec<Index> {
+        self.positions()
+            .into_iter()
+            .map(|(row, col)| row + col * self.nrow)
+            .collect()
+    }
+
+    pub fn serialize(&self) -> String {
+        let col_ptrs = self
+            .col_ptrs
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let row_indices = self
+            .row_indices
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "ccs-v1|{}|{}|{}|{}",
+            self.nrow, self.ncol, col_ptrs, row_indices
+        )
+    }
+
+    pub fn deserialize(serialized: &str) -> Result<Self> {
+        let mut parts = serialized.split('|');
+        let Some(version) = parts.next() else {
+            return Err(SxError::Ccs("missing CCS serialization version".into()));
+        };
+        if version != "ccs-v1" {
+            return Err(SxError::Ccs(format!(
+                "unsupported CCS serialization version `{version}`"
+            )));
+        }
+        let Some(nrow) = parts.next() else {
+            return Err(SxError::Ccs("missing serialized row count".into()));
+        };
+        let Some(ncol) = parts.next() else {
+            return Err(SxError::Ccs("missing serialized column count".into()));
+        };
+        let Some(col_ptrs) = parts.next() else {
+            return Err(SxError::Ccs("missing serialized column pointers".into()));
+        };
+        let Some(row_indices) = parts.next() else {
+            return Err(SxError::Ccs("missing serialized row indices".into()));
+        };
+        if parts.next().is_some() {
+            return Err(SxError::Ccs("trailing CCS serialization fields".into()));
+        }
+
+        let nrow = nrow
+            .parse::<Index>()
+            .map_err(|_| SxError::Ccs(format!("invalid serialized row count `{nrow}`")))?;
+        let ncol = ncol
+            .parse::<Index>()
+            .map_err(|_| SxError::Ccs(format!("invalid serialized column count `{ncol}`")))?;
+
+        let parse_list = |label: &str, payload: &str| -> Result<Vec<Index>> {
+            if payload.is_empty() {
+                return Ok(Vec::new());
+            }
+            payload
+                .split(',')
+                .map(|item| {
+                    item.parse::<Index>().map_err(|_| {
+                        SxError::Ccs(format!("invalid serialized {label} entry `{item}`"))
+                    })
+                })
+                .collect()
+        };
+
+        Self::new(
+            nrow,
+            ncol,
+            parse_list("column pointer", col_ptrs)?,
+            parse_list("row index", row_indices)?,
+        )
+    }
+
+    pub fn get_diag(&self) -> Result<(Self, Vec<Index>)> {
+        if self.ncol == 1 {
+            let diag_positions = self
+                .positions()
+                .into_iter()
+                .map(|(row, _)| (row, row))
+                .collect::<Vec<_>>();
+            return Ok((
+                Self::from_positions(self.nrow, self.nrow, &diag_positions)?,
+                (0..self.nnz()).collect(),
+            ));
+        }
+        if self.nrow == 1 {
+            let diag_positions = self
+                .positions()
+                .into_iter()
+                .map(|(_, col)| (col, col))
+                .collect::<Vec<_>>();
+            return Ok((
+                Self::from_positions(self.ncol, self.ncol, &diag_positions)?,
+                (0..self.nnz()).collect(),
+            ));
+        }
+
+        let mut diag_rows = Vec::new();
+        let mut mapping = Vec::new();
+        for (idx, (row, col)) in self.positions().into_iter().enumerate() {
+            if row == col {
+                diag_rows.push((row, 0));
+                mapping.push(idx);
+            }
+        }
+        let diag = Self::from_positions(self.nrow.min(self.ncol), 1, &diag_rows)?;
+        Ok((diag, mapping))
+    }
+
+    pub fn get_lower(&self) -> Result<Self> {
+        let positions = self
+            .positions()
+            .into_iter()
+            .filter(|&(row, col)| row >= col)
+            .collect::<Vec<_>>();
+        Self::from_positions(self.nrow, self.ncol, &positions)
+    }
+
+    pub fn pattern_inverse(&self) -> Result<Self> {
+        let positions = (0..self.ncol)
+            .flat_map(|col| (0..self.nrow).map(move |row| (row, col)))
+            .filter(|&(row, col)| self.nz_index(row, col).is_none())
+            .collect::<Vec<_>>();
+        Self::from_positions(self.nrow, self.ncol, &positions)
+    }
+
+    pub fn kron(&self, other: &Self) -> Result<Self> {
+        let Some(nrow) = self.nrow.checked_mul(other.nrow) else {
+            return Err(SxError::Ccs("kron row count overflow".into()));
+        };
+        let Some(ncol) = self.ncol.checked_mul(other.ncol) else {
+            return Err(SxError::Ccs("kron column count overflow".into()));
+        };
+        let mut positions = Vec::with_capacity(self.nnz().saturating_mul(other.nnz()));
+        for (lhs_row, lhs_col) in self.positions() {
+            for (rhs_row, rhs_col) in other.positions() {
+                positions.push((
+                    lhs_row * other.nrow + rhs_row,
+                    lhs_col * other.ncol + rhs_col,
+                ));
+            }
+        }
+        Self::from_positions(nrow, ncol, &positions)
+    }
+
+    pub fn get_nz(&self, linear_indices: &[Index]) -> Result<Vec<SignedIndex>> {
+        let Some(numel) = checked_len_product(self.nrow, self.ncol) else {
+            return Err(SxError::Ccs("CCS get_nz size overflow".into()));
+        };
+        linear_indices
+            .iter()
+            .copied()
+            .map(|linear| {
+                if linear >= numel {
+                    return Err(SxError::Ccs(format!(
+                        "linear index {linear} out of bounds for {}x{}",
+                        self.nrow, self.ncol
+                    )));
+                }
+                let row = linear % self.nrow;
+                let col = linear / self.nrow;
+                Ok(match self.nz_index(row, col) {
+                    Some(idx) => SignedIndex::try_from(idx).map_err(|_| {
+                        SxError::Ccs("nonzero index does not fit into isize".into())
+                    })?,
+                    None => -1,
+                })
+            })
+            .collect()
     }
 
     pub fn positions(&self) -> Vec<(Index, Index)> {
@@ -212,6 +460,111 @@ impl CCS {
             col_ptrs,
             row_indices,
         }
+    }
+
+    pub fn get_crs(&self) -> (Vec<Index>, Vec<Index>) {
+        self.transpose().get_ccs()
+    }
+
+    pub fn reshape(&self, nrow: Index, ncol: Index) -> Result<Self> {
+        let Some(current_numel) = checked_len_product(self.nrow, self.ncol) else {
+            return Err(SxError::Ccs("current CCS shape overflow".into()));
+        };
+        let Some(target_numel) = checked_len_product(nrow, ncol) else {
+            return Err(SxError::Ccs("target CCS shape overflow".into()));
+        };
+        if current_numel != target_numel {
+            return Err(SxError::Ccs(format!(
+                "reshape requires identical element count, got {} and {}",
+                current_numel, target_numel
+            )));
+        }
+
+        let positions = self
+            .positions()
+            .into_iter()
+            .map(|(row, col)| {
+                let linear = row + col * self.nrow;
+                (linear % nrow, linear / nrow)
+            })
+            .collect::<Vec<_>>();
+        Self::from_positions(nrow, ncol, &positions)
+    }
+
+    pub fn enlarge(
+        &self,
+        nrow: Index,
+        ncol: Index,
+        row_map: &[Index],
+        col_map: &[Index],
+    ) -> Result<Self> {
+        if row_map.len() != self.nrow {
+            return Err(SxError::Ccs(format!(
+                "row map length {} does not match current row count {}",
+                row_map.len(),
+                self.nrow
+            )));
+        }
+        if col_map.len() != self.ncol {
+            return Err(SxError::Ccs(format!(
+                "column map length {} does not match current column count {}",
+                col_map.len(),
+                self.ncol
+            )));
+        }
+        if row_map.iter().any(|&row| row >= nrow) {
+            return Err(SxError::Ccs(
+                "row map contains out-of-bounds target row".into(),
+            ));
+        }
+        if col_map.iter().any(|&col| col >= ncol) {
+            return Err(SxError::Ccs(
+                "column map contains out-of-bounds target column".into(),
+            ));
+        }
+
+        let positions = self
+            .positions()
+            .into_iter()
+            .map(|(row, col)| (row_map[row], col_map[col]))
+            .collect::<Vec<_>>();
+        Self::from_positions(nrow, ncol, &positions)
+    }
+
+    pub fn unite(&self, other: &Self) -> Result<Self> {
+        if self.nrow != other.nrow || self.ncol != other.ncol {
+            return Err(SxError::Ccs(format!(
+                "cannot unite CCS patterns with shapes {}x{} and {}x{}",
+                self.nrow, self.ncol, other.nrow, other.ncol
+            )));
+        }
+        let mut positions = self.positions();
+        positions.extend(other.positions());
+        Self::from_positions(self.nrow, self.ncol, &positions)
+    }
+
+    pub fn intersect(&self, other: &Self) -> Result<Self> {
+        if self.nrow != other.nrow || self.ncol != other.ncol {
+            return Err(SxError::Ccs(format!(
+                "cannot intersect CCS patterns with shapes {}x{} and {}x{}",
+                self.nrow, self.ncol, other.nrow, other.ncol
+            )));
+        }
+        let positions = self
+            .positions()
+            .into_iter()
+            .filter(|&(row, col)| other.nz_index(row, col).is_some())
+            .collect::<Vec<_>>();
+        Self::from_positions(self.nrow, self.ncol, &positions)
+    }
+
+    pub fn is_subset_of(&self, other: &Self) -> bool {
+        if self.nrow != other.nrow || self.ncol != other.ncol {
+            return false;
+        }
+        self.positions()
+            .into_iter()
+            .all(|(row, col)| other.nz_index(row, col).is_some())
     }
 
     pub fn row_adjacency(&self) -> Vec<Vec<Index>> {

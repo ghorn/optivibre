@@ -74,7 +74,8 @@ fn write_llvm_wrapper_bundle(
 
     let archive_path = out_dir.join(format!("lib{archive_name}.a"));
     archive_objects(&archive_path, &object_paths)?;
-    println!("cargo:rustc-link-arg={}", archive_path.display());
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static={archive_name}");
     Ok(())
 }
 

@@ -7,21 +7,26 @@ use std::slice;
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, anyhow, bail};
+use llvm_sys::LLVMRealPredicate::{LLVMRealOGT, LLVMRealOLT};
 use llvm_sys::analysis::{LLVMVerifierFailureAction, LLVMVerifyModule};
 use llvm_sys::core::{
-    LLVMAddFunction, LLVMAppendBasicBlockInContext, LLVMBuildFAdd, LLVMBuildFDiv, LLVMBuildFMul,
-    LLVMBuildFSub, LLVMBuildInBoundsGEP2, LLVMBuildLoad2, LLVMBuildRetVoid, LLVMBuildStore,
-    LLVMConstInt, LLVMConstReal, LLVMContextCreate, LLVMContextDispose, LLVMCreateBuilderInContext,
-    LLVMDisposeBuilder, LLVMDisposeMemoryBuffer, LLVMDisposeMessage, LLVMDoubleTypeInContext,
-    LLVMFunctionType, LLVMGetBufferSize, LLVMGetBufferStart, LLVMGetParam, LLVMInt64TypeInContext,
-    LLVMModuleCreateWithNameInContext, LLVMPointerType, LLVMPositionBuilderAtEnd, LLVMSetTarget,
-    LLVMVoidTypeInContext,
+    LLVMAddFunction, LLVMAppendBasicBlockInContext, LLVMBuildCall2, LLVMBuildFAdd, LLVMBuildFCmp,
+    LLVMBuildFDiv, LLVMBuildFMul, LLVMBuildFSub, LLVMBuildInBoundsGEP2, LLVMBuildLoad2,
+    LLVMBuildRetVoid, LLVMBuildSelect, LLVMBuildStore, LLVMConstInt, LLVMConstReal,
+    LLVMContextCreate, LLVMContextDispose, LLVMCreateBuilderInContext, LLVMDisposeBuilder,
+    LLVMDisposeMemoryBuffer, LLVMDisposeMessage, LLVMDoubleTypeInContext, LLVMFunctionType,
+    LLVMGetBufferSize, LLVMGetBufferStart, LLVMGetNamedFunction, LLVMGetParam,
+    LLVMGlobalGetValueType, LLVMInt64TypeInContext, LLVMModuleCreateWithNameInContext,
+    LLVMPointerType, LLVMPositionBuilderAtEnd, LLVMSetTarget, LLVMVoidTypeInContext,
 };
 use llvm_sys::error::{LLVMDisposeErrorMessage, LLVMErrorRef, LLVMGetErrorMessage};
 use llvm_sys::orc2::LLVMOrcExecutorAddress;
 use llvm_sys::orc2::lljit::{
     LLVMOrcCreateLLJIT, LLVMOrcDisposeLLJIT, LLVMOrcLLJITAddObjectFile,
     LLVMOrcLLJITGetGlobalPrefix, LLVMOrcLLJITGetMainJITDylib, LLVMOrcLLJITLookup,
+};
+use llvm_sys::orc2::{
+    LLVMOrcCreateDynamicLibrarySearchGeneratorForProcess, LLVMOrcJITDylibAddGenerator,
 };
 use llvm_sys::prelude::{
     LLVMBuilderRef, LLVMContextRef, LLVMMemoryBufferRef, LLVMModuleRef, LLVMTypeRef, LLVMValueRef,
@@ -42,9 +47,10 @@ use llvm_sys::transforms::pass_builder::{
     LLVMCreatePassBuilderOptions, LLVMDisposePassBuilderOptions, LLVMRunPasses,
 };
 use sx_codegen::{
-    LoweredFunction, ValueRef, format_rust_source, lower_function, sanitize_ident, to_pascal_case,
+    InstructionKind, LoweredFunction, ValueRef, format_rust_source, lower_function, sanitize_ident,
+    to_pascal_case,
 };
-use sx_core::{BinaryOp, SXFunction};
+use sx_core::{BinaryOp, SXFunction, UnaryOp};
 
 type RawKernelFn = unsafe extern "C" fn(*const *const f64, *const *mut f64);
 
@@ -60,9 +66,8 @@ impl LlvmOptimizationLevel {
     fn codegen_level(self) -> LLVMCodeGenOptLevel {
         match self {
             Self::O0 => LLVMCodeGenOptLevel::LLVMCodeGenLevelNone,
-            Self::O2 => LLVMCodeGenOptLevel::LLVMCodeGenLevelDefault,
+            Self::O2 | Self::Os => LLVMCodeGenOptLevel::LLVMCodeGenLevelDefault,
             Self::O3 => LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
-            Self::Os => LLVMCodeGenOptLevel::LLVMCodeGenLevelDefault,
         }
     }
 
@@ -143,6 +148,8 @@ impl CompiledJitFunction {
         )?;
         let lljit = create_lljit()?;
         let main_dylib = unsafe { LLVMOrcLLJITGetMainJITDylib(lljit) };
+        let prefix = unsafe { LLVMOrcLLJITGetGlobalPrefix(lljit) };
+        attach_current_process_symbols(main_dylib, prefix)?;
         let add_error = unsafe { LLVMOrcLLJITAddObjectFile(lljit, main_dylib, object) };
         if let Err(error) = consume_llvm_error(add_error) {
             let _ = unsafe { LLVMOrcDisposeLLJIT(lljit) };
@@ -403,34 +410,45 @@ unsafe fn build_module(
         let outputs_param = unsafe { LLVMGetParam(function, 1) };
         let mut temps = Vec::with_capacity(lowered.instructions.len());
         for instruction in &lowered.instructions {
-            let lhs = unsafe {
-                emit_value(
-                    builder,
-                    inputs_param,
-                    &temps,
-                    instruction.lhs,
-                    f64_ty,
-                    f64_ptr_ty,
-                    i64_ty,
-                )
-            };
-            let rhs = unsafe {
-                emit_value(
-                    builder,
-                    inputs_param,
-                    &temps,
-                    instruction.rhs,
-                    f64_ty,
-                    f64_ptr_ty,
-                    i64_ty,
-                )
-            };
-            let temp = unsafe {
-                match instruction.op {
-                    BinaryOp::Add => LLVMBuildFAdd(builder, lhs, rhs, c"".as_ptr()),
-                    BinaryOp::Sub => LLVMBuildFSub(builder, lhs, rhs, c"".as_ptr()),
-                    BinaryOp::Mul => LLVMBuildFMul(builder, lhs, rhs, c"".as_ptr()),
-                    BinaryOp::Div => LLVMBuildFDiv(builder, lhs, rhs, c"".as_ptr()),
+            let temp = match instruction.kind {
+                InstructionKind::Unary { op, input } => {
+                    let input = unsafe {
+                        emit_value(
+                            builder,
+                            inputs_param,
+                            &temps,
+                            input,
+                            f64_ty,
+                            f64_ptr_ty,
+                            i64_ty,
+                        )
+                    };
+                    unsafe { emit_unary_op(builder, module, op, input, f64_ty) }
+                }
+                InstructionKind::Binary { op, lhs, rhs } => {
+                    let lhs = unsafe {
+                        emit_value(
+                            builder,
+                            inputs_param,
+                            &temps,
+                            lhs,
+                            f64_ty,
+                            f64_ptr_ty,
+                            i64_ty,
+                        )
+                    };
+                    let rhs = unsafe {
+                        emit_value(
+                            builder,
+                            inputs_param,
+                            &temps,
+                            rhs,
+                            f64_ty,
+                            f64_ptr_ty,
+                            i64_ty,
+                        )
+                    };
+                    unsafe { emit_binary_op(builder, module, op, lhs, rhs, f64_ty) }
                 }
             };
             if temps.len() != instruction.temp {
@@ -471,6 +489,137 @@ unsafe fn build_module(
             Err(error)
         }
     }
+}
+
+unsafe fn emit_unary_op(
+    builder: LLVMBuilderRef,
+    module: LLVMModuleRef,
+    op: UnaryOp,
+    input: LLVMValueRef,
+    f64_ty: LLVMTypeRef,
+) -> LLVMValueRef {
+    match op {
+        UnaryOp::Abs => unsafe { call_unary_math(builder, module, c"fabs", input, f64_ty) },
+        UnaryOp::Floor => unsafe { call_unary_math(builder, module, c"floor", input, f64_ty) },
+        UnaryOp::Ceil => unsafe { call_unary_math(builder, module, c"ceil", input, f64_ty) },
+        UnaryOp::Round => unsafe { call_unary_math(builder, module, c"round", input, f64_ty) },
+        UnaryOp::Trunc => unsafe { call_unary_math(builder, module, c"trunc", input, f64_ty) },
+        UnaryOp::Sqrt => unsafe { call_unary_math(builder, module, c"sqrt", input, f64_ty) },
+        UnaryOp::Exp => unsafe { call_unary_math(builder, module, c"exp", input, f64_ty) },
+        UnaryOp::Log => unsafe { call_unary_math(builder, module, c"log", input, f64_ty) },
+        UnaryOp::Sin => unsafe { call_unary_math(builder, module, c"sin", input, f64_ty) },
+        UnaryOp::Cos => unsafe { call_unary_math(builder, module, c"cos", input, f64_ty) },
+        UnaryOp::Tan => unsafe { call_unary_math(builder, module, c"tan", input, f64_ty) },
+        UnaryOp::Asin => unsafe { call_unary_math(builder, module, c"asin", input, f64_ty) },
+        UnaryOp::Acos => unsafe { call_unary_math(builder, module, c"acos", input, f64_ty) },
+        UnaryOp::Atan => unsafe { call_unary_math(builder, module, c"atan", input, f64_ty) },
+        UnaryOp::Sinh => unsafe { call_unary_math(builder, module, c"sinh", input, f64_ty) },
+        UnaryOp::Cosh => unsafe { call_unary_math(builder, module, c"cosh", input, f64_ty) },
+        UnaryOp::Tanh => unsafe { call_unary_math(builder, module, c"tanh", input, f64_ty) },
+        UnaryOp::Asinh => unsafe { call_unary_math(builder, module, c"asinh", input, f64_ty) },
+        UnaryOp::Acosh => unsafe { call_unary_math(builder, module, c"acosh", input, f64_ty) },
+        UnaryOp::Atanh => unsafe { call_unary_math(builder, module, c"atanh", input, f64_ty) },
+        UnaryOp::Sign => unsafe { emit_sign(builder, input, f64_ty) },
+    }
+}
+
+unsafe fn emit_binary_op(
+    builder: LLVMBuilderRef,
+    module: LLVMModuleRef,
+    op: BinaryOp,
+    lhs: LLVMValueRef,
+    rhs: LLVMValueRef,
+    f64_ty: LLVMTypeRef,
+) -> LLVMValueRef {
+    match op {
+        BinaryOp::Add => unsafe { LLVMBuildFAdd(builder, lhs, rhs, c"".as_ptr()) },
+        BinaryOp::Sub => unsafe { LLVMBuildFSub(builder, lhs, rhs, c"".as_ptr()) },
+        BinaryOp::Mul => unsafe { LLVMBuildFMul(builder, lhs, rhs, c"".as_ptr()) },
+        BinaryOp::Div => unsafe { LLVMBuildFDiv(builder, lhs, rhs, c"".as_ptr()) },
+        BinaryOp::Pow => unsafe { call_binary_math(builder, module, c"pow", lhs, rhs, f64_ty) },
+        BinaryOp::Atan2 => unsafe { call_binary_math(builder, module, c"atan2", lhs, rhs, f64_ty) },
+        BinaryOp::Hypot => unsafe { call_binary_math(builder, module, c"hypot", lhs, rhs, f64_ty) },
+        BinaryOp::Mod => unsafe { call_binary_math(builder, module, c"fmod", lhs, rhs, f64_ty) },
+        BinaryOp::Copysign => unsafe {
+            call_binary_math(builder, module, c"copysign", lhs, rhs, f64_ty)
+        },
+    }
+}
+
+unsafe fn emit_sign(
+    builder: LLVMBuilderRef,
+    input: LLVMValueRef,
+    f64_ty: LLVMTypeRef,
+) -> LLVMValueRef {
+    let zero = unsafe { LLVMConstReal(f64_ty, 0.0) };
+    let one = unsafe { LLVMConstReal(f64_ty, 1.0) };
+    let minus_one = unsafe { LLVMConstReal(f64_ty, -1.0) };
+    let positive = unsafe { LLVMBuildFCmp(builder, LLVMRealOGT, input, zero, c"".as_ptr()) };
+    let negative = unsafe { LLVMBuildFCmp(builder, LLVMRealOLT, input, zero, c"".as_ptr()) };
+    let negative_or_zero =
+        unsafe { LLVMBuildSelect(builder, negative, minus_one, zero, c"".as_ptr()) };
+    unsafe { LLVMBuildSelect(builder, positive, one, negative_or_zero, c"".as_ptr()) }
+}
+
+unsafe fn call_unary_math(
+    builder: LLVMBuilderRef,
+    module: LLVMModuleRef,
+    name: &CStr,
+    input: LLVMValueRef,
+    f64_ty: LLVMTypeRef,
+) -> LLVMValueRef {
+    let (function, function_ty) = unsafe { get_or_declare_math_fn(module, name, 1, f64_ty) };
+    let mut args = [input];
+    unsafe {
+        LLVMBuildCall2(
+            builder,
+            function_ty,
+            function,
+            args.as_mut_ptr(),
+            1,
+            c"".as_ptr(),
+        )
+    }
+}
+
+unsafe fn call_binary_math(
+    builder: LLVMBuilderRef,
+    module: LLVMModuleRef,
+    name: &CStr,
+    lhs: LLVMValueRef,
+    rhs: LLVMValueRef,
+    f64_ty: LLVMTypeRef,
+) -> LLVMValueRef {
+    let (function, function_ty) = unsafe { get_or_declare_math_fn(module, name, 2, f64_ty) };
+    let mut args = [lhs, rhs];
+    unsafe {
+        LLVMBuildCall2(
+            builder,
+            function_ty,
+            function,
+            args.as_mut_ptr(),
+            2,
+            c"".as_ptr(),
+        )
+    }
+}
+
+unsafe fn get_or_declare_math_fn(
+    module: LLVMModuleRef,
+    name: &CStr,
+    arity: usize,
+    f64_ty: LLVMTypeRef,
+) -> (LLVMValueRef, LLVMTypeRef) {
+    let existing = unsafe { LLVMGetNamedFunction(module, name.as_ptr()) };
+    if !existing.is_null() {
+        return (existing, unsafe { LLVMGlobalGetValueType(existing) });
+    }
+    let mut params = vec![f64_ty; arity];
+    let function_ty = unsafe { LLVMFunctionType(f64_ty, params.as_mut_ptr(), arity as u32, 0) };
+    (
+        unsafe { LLVMAddFunction(module, name.as_ptr(), function_ty) },
+        function_ty,
+    )
 }
 
 unsafe fn llvm_data_layout_string(target_machine: LLVMTargetMachineRef) -> Result<String> {
@@ -721,7 +870,7 @@ pub fn generate_aot_wrapper_module(
         output_ptrs.join(", ")
     ));
     out.push_str(&format!(
-        "        unsafe {{ {}(input_ptrs.as_ptr(), output_ptrs.as_mut_ptr()) }};\n",
+        "        unsafe {{ {}(input_ptrs.as_ptr(), output_ptrs.as_mut_ptr()); }}\n",
         lowered.name
     ));
     for assignment in scalar_output_assignments {
@@ -830,6 +979,24 @@ fn create_lljit() -> Result<llvm_sys::orc2::lljit::LLVMOrcLLJITRef> {
     Ok(lljit)
 }
 
+fn attach_current_process_symbols(
+    jit_dylib: llvm_sys::orc2::LLVMOrcJITDylibRef,
+    global_prefix: i8,
+) -> Result<()> {
+    let mut generator = ptr::null_mut();
+    let error = unsafe {
+        LLVMOrcCreateDynamicLibrarySearchGeneratorForProcess(
+            &mut generator,
+            global_prefix,
+            None,
+            ptr::null_mut(),
+        )
+    };
+    consume_llvm_error(error).context("failed to create current-process search generator")?;
+    unsafe { LLVMOrcJITDylibAddGenerator(jit_dylib, generator) };
+    Ok(())
+}
+
 fn lookup_symbol_address(
     lljit: llvm_sys::orc2::lljit::LLVMOrcLLJITRef,
     symbol_name: &str,
@@ -919,7 +1086,7 @@ mod tests {
         emit_object_bytes_lowered, generate_aot_wrapper_module,
     };
     use sx_codegen::lower_function;
-    use sx_core::{BinaryOp, NamedMatrix, SXFunction, SXMatrix};
+    use sx_core::{BinaryOp, NamedMatrix, SXFunction, SXMatrix, UnaryOp};
 
     fn eval_lowered(lowered: &sx_codegen::LoweredFunction, inputs: &[Vec<f64>]) -> Vec<Vec<f64>> {
         let mut temps = vec![0.0; lowered.instructions.len()];
@@ -929,13 +1096,56 @@ mod tests {
             sx_codegen::ValueRef::Input { slot, offset } => inputs[slot][offset],
         };
         for instruction in &lowered.instructions {
-            let lhs = resolve(instruction.lhs, &temps);
-            let rhs = resolve(instruction.rhs, &temps);
-            temps[instruction.temp] = match instruction.op {
-                BinaryOp::Add => lhs + rhs,
-                BinaryOp::Sub => lhs - rhs,
-                BinaryOp::Mul => lhs * rhs,
-                BinaryOp::Div => lhs / rhs,
+            temps[instruction.temp] = match instruction.kind {
+                sx_codegen::InstructionKind::Unary { op, input } => {
+                    let input = resolve(input, &temps);
+                    match op {
+                        UnaryOp::Abs => input.abs(),
+                        UnaryOp::Sign => {
+                            if input > 0.0 {
+                                1.0
+                            } else if input < 0.0 {
+                                -1.0
+                            } else {
+                                0.0
+                            }
+                        }
+                        UnaryOp::Floor => input.floor(),
+                        UnaryOp::Ceil => input.ceil(),
+                        UnaryOp::Round => input.round(),
+                        UnaryOp::Trunc => input.trunc(),
+                        UnaryOp::Sqrt => input.sqrt(),
+                        UnaryOp::Exp => input.exp(),
+                        UnaryOp::Log => input.ln(),
+                        UnaryOp::Sin => input.sin(),
+                        UnaryOp::Cos => input.cos(),
+                        UnaryOp::Tan => input.tan(),
+                        UnaryOp::Asin => input.asin(),
+                        UnaryOp::Acos => input.acos(),
+                        UnaryOp::Atan => input.atan(),
+                        UnaryOp::Sinh => input.sinh(),
+                        UnaryOp::Cosh => input.cosh(),
+                        UnaryOp::Tanh => input.tanh(),
+                        UnaryOp::Asinh => input.asinh(),
+                        UnaryOp::Acosh => input.acosh(),
+                        UnaryOp::Atanh => input.atanh(),
+                    }
+                }
+                sx_codegen::InstructionKind::Binary { op, lhs, rhs } => {
+                    let lhs = resolve(lhs, &temps);
+                    let rhs = resolve(rhs, &temps);
+                    match op {
+                        BinaryOp::Add => lhs + rhs,
+                        BinaryOp::Sub => lhs - rhs,
+                        BinaryOp::Mul => lhs * rhs,
+                        BinaryOp::Div => lhs / rhs,
+                        BinaryOp::Pow => lhs.powf(rhs),
+                        BinaryOp::Atan2 => lhs.atan2(rhs),
+                        BinaryOp::Hypot => lhs.hypot(rhs),
+                        BinaryOp::Mod => lhs % rhs,
+                        BinaryOp::Copysign => lhs.copysign(rhs),
+                    }
+                }
             };
         }
         lowered
@@ -1028,5 +1238,83 @@ mod tests {
         assert!(wrapper.contains("unsafe extern \"C\""));
         assert!(wrapper.contains("fn llvm_aot_wrapper"));
         assert!(wrapper.contains("pub struct LlvmAotWrapperLlvmAotContext"));
+    }
+
+    #[test]
+    fn llvm_jit_matches_lowered_reference_for_transcendentals() {
+        let x = SXMatrix::sym_dense("x", 2, 1).unwrap();
+        let output = SXMatrix::scalar(
+            x.nz(0).sin()
+                + x.nz(0).cos()
+                + x.nz(0).tan()
+                + x.nz(0).exp()
+                + x.nz(0).log()
+                + x.nz(0).sqrt()
+                + x.nz(0).atan()
+                + x.nz(0).sinh()
+                + x.nz(0).tanh()
+                + x.nz(0).powf(1.5)
+                + x.nz(0).hypot(x.nz(1))
+                + x.nz(0).atan2(x.nz(1))
+                + x.nz(0).modulo(x.nz(1)),
+        );
+        let function = SXFunction::new(
+            "llvm_transcendentals",
+            vec![NamedMatrix::new("x", x).unwrap()],
+            vec![NamedMatrix::new("y", output).unwrap()],
+        )
+        .unwrap();
+        let lowered = lower_function(&function).unwrap();
+        let compiled =
+            CompiledJitFunction::compile_lowered(&lowered, JitOptimizationLevel::O2).unwrap();
+        for point in [[1.7, 0.8], [0.9, 1.1], [2.3, 0.6]] {
+            let expected = eval_lowered(&lowered, &[point.to_vec()]);
+            let mut context = compiled.create_context();
+            context.input_mut(0).copy_from_slice(&point);
+            compiled.eval(&mut context);
+            assert_eq!(context.output(0).len(), 1);
+            assert!((context.output(0)[0] - expected[0][0]).abs() <= 1e-12);
+        }
+    }
+
+    #[test]
+    fn llvm_jit_matches_lowered_reference_for_transcendental_gradient_bundle() {
+        let x = SXMatrix::sym_dense("x", 2, 1).unwrap();
+        let objective = SXMatrix::scalar(
+            x.nz(0).sin()
+                + x.nz(0).exp()
+                + x.nz(0).powf(1.5)
+                + x.nz(0).hypot(x.nz(1))
+                + x.nz(0).atan2(x.nz(1))
+                + x.nz(1).log(),
+        );
+        let gradient = objective.gradient(&x).unwrap();
+        let function = SXFunction::new(
+            "llvm_transcendental_gradient_bundle",
+            vec![NamedMatrix::new("x", x).unwrap()],
+            vec![
+                NamedMatrix::new("objective", objective).unwrap(),
+                NamedMatrix::new("gradient", gradient).unwrap(),
+            ],
+        )
+        .unwrap();
+        let lowered = lower_function(&function).unwrap();
+        let compiled =
+            CompiledJitFunction::compile_lowered(&lowered, JitOptimizationLevel::O2).unwrap();
+
+        for point in [[1.7, 0.8], [0.9, 1.1], [2.3, 0.6]] {
+            let expected = eval_lowered(&lowered, &[point.to_vec()]);
+            let mut context = compiled.create_context();
+            context.input_mut(0).copy_from_slice(&point);
+            compiled.eval(&mut context);
+            assert_eq!(context.output(0).len(), expected[0].len());
+            assert_eq!(context.output(1).len(), expected[1].len());
+            for (lhs, rhs) in context.output(0).iter().zip(expected[0].iter()) {
+                assert!((lhs - rhs).abs() <= 1e-12);
+            }
+            for (lhs, rhs) in context.output(1).iter().zip(expected[1].iter()) {
+                assert!((lhs - rhs).abs() <= 1e-12);
+            }
+        }
     }
 }

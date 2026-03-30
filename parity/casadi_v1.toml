@@ -2,48 +2,344 @@ casadi_commit = "838d585b15f3de6f2a1e8d058c91e445a01d43e3"
 
 [[entries]]
 casadi_case = "test/python/sx.py::test_scalarSX"
-rust_test = "sx_core::core::sx_cse_and_constant_folding"
+rust_test = "sx_core::casadi_parity::sx_scalar_sx_matches_casadi_test_scalar_sx"
 status = "supported"
 
 [[entries]]
 casadi_case = "test/python/sx.py::test_gradient"
-rust_test = "sx_core::core::gradient_matches_manual_rosenbrock"
+rust_test = "sx_core::casadi_parity::sx_gradient_matches_casadi_test_gradient"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_gradient2"
+rust_test = "sx_core::casadi_parity::sx_gradient2_matches_casadi_test_gradient2"
 status = "supported"
 
 [[entries]]
 casadi_case = "test/python/sx.py::test_SXJacobian"
-rust_test = "sx_core::core::jacobian_and_hessian_shapes"
+rust_test = "sx_core::casadi_parity::sx_unary_jacobian_matches_casadi_test_sx_jacobian"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_SXJac"
+rust_test = "sx_core::casadi_parity::sx_unary_jac_matches_casadi_test_sx_jac"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_SXJacobians"
+rust_test = "sx_core::casadi_parity::sx_unary_column_jacobian_matches_casadi_test_sx_jacobians"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_SXJacobians2"
+rust_test = "sx_core::casadi_parity::sx_unary_row_jacobian_matches_casadi_test_sx_jacobians2"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_equivalence"
+rust_test = "sx_core::casadi_parity::sx_equivalence_matches_casadi_test_equivalence"
 status = "supported"
 
 [[entries]]
 casadi_case = "test/python/sx.py::test_const_folding_on_the_fly"
-rust_test = "sx_core::core::sx_cse_and_constant_folding"
+rust_test = "sx_core::casadi_parity::sx_const_folding_on_the_fly_matches_casadi"
 status = "supported"
 
 [[entries]]
-casadi_case = "test/python/function.py::test_jacobian"
-rust_test = "sx_core::core::jacobian_and_hessian_shapes"
+casadi_case = "test/python/sx.py::test_issue107"
+rust_test = "sx_core::casadi_parity::sx_issue107_add_assign_preserves_original_symbolicity"
 status = "supported"
 
 [[entries]]
-casadi_case = "test/python/function.py::test_hessians"
-rust_test = "sx_core::core::jacobian_and_hessian_shapes"
+casadi_case = "test/python/sx.py::test_SXbinary"
+rust_test = "sx_core::casadi_parity::sx_binary_dense_matches_casadi_test_sxbinary_via_dense_adaptor"
 status = "supported"
 
 [[entries]]
-casadi_case = "test/python/function.py::test_codegen_with_jac_sparsity"
-rust_test = "sx_codegen::codegen::generated_contexts_and_signatures"
+casadi_case = "test/python/sx.py::test_SXbinarySparse"
+rust_test = "sx_core::casadi_parity::sx_binary_sparse_matches_casadi_test_sxbinary_sparse_via_dense_adaptor"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_SXbinary_diff"
+rust_test = "sx_core::casadi_parity::sx_binary_diff_matches_casadi_test_sxbinary_diff_via_dense_adaptor"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_DMbinary"
+rust_test = "sx_core::casadi_parity::dm_binary_matches_casadi_test_dmbinary_via_dense_adaptor"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_SXbinary_codegen"
+rust_test = "sx_codegen_llvm::casadi_parity::llvm_codegen_matches_casadi_test_sxbinary_codegen_via_backend_adaptor"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_SXsimplifications"
+rust_test = "sx_core::casadi_parity::sx_simplifications_match_casadi_test_sxsimplifications"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_copysign"
+rust_test = "sx_core::casadi_parity::sx_copysign_matches_casadi_test_copysign_via_adaptor"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_depends_on"
+rust_test = "sx_core::casadi_parity::sx_depends_on_matches_casadi_test_depends_on_via_adaptor"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_symvar"
+rust_test = "sx_core::casadi_parity::sx_symvar_matches_casadi_test_symvar_via_adaptor"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_contains"
+rust_test = "sx_core::casadi_parity::sx_contains_matches_casadi_test_contains_via_adaptor"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_pow"
+rust_test = "sx_core::casadi_parity::sx_pow_matches_casadi_test_pow_via_dense_adaptor"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_primitivefunctions"
+rust_test = "sx_core::casadi_parity::sx_primitivefunctions_match_casadi_test_primitivefunctions_via_adaptors"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_is_regular"
+rust_test = "sx_core::casadi_parity::sx_is_regular_matches_casadi_test_is_regular_via_adaptor"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/ad.py::test_hessian"
+rust_test = "sx_core::casadi_parity::ad_hessian_matches_casadi_test_hessian"
 status = "supported"
 
 [[entries]]
 casadi_case = "test/python/ad.py::test_Jacobian"
-rust_test = "sx_core::core::forward_reverse_directionals_match_finite_difference"
+rust_test = "sx_core::casadi_parity::ad_jacobian_matches_casadi_test_jacobian_via_dense_adaptor"
 status = "supported"
 
 [[entries]]
-casadi_case = "test/python/sx.py::test_taylor"
-status = "unsupported"
+casadi_case = "test/python/ad.py::test_jacobianSX"
+rust_test = "sx_core::casadi_parity::ad_jacobian_sx_matches_casadi_test_jacobian_sx_via_dense_adaptor"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/ad.py::test_jacsparsity"
+rust_test = "sx_core::casadi_parity::ad_jacobian_sparsity_matches_casadi_test_jacsparsity_via_dense_adaptor"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/ad.py::test_bugshape"
+rust_test = "sx_core::function_ccs::jacobian_construction_does_not_mutate_original_output_shape_regression"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/ad.py::test_bugglibc"
+rust_test = "sx_core::casadi_parity::ad_bugglibc_reconstructing_jacobian_after_evaluation_matches_casadi_regression"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sparsity.py::test_NZ"
+rust_test = "sx_core::casadi_parity::ccs_nz_matches_casadi_test_nz"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sparsity.py::test_rowcol"
+rust_test = "sx_core::casadi_parity::ccs_rowcol_matches_casadi_test_rowcol"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sparsity.py::test_union"
+rust_test = "sx_core::casadi_parity::ccs_union_matches_casadi_test_union"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sparsity.py::test_intersection"
+rust_test = "sx_core::casadi_parity::ccs_intersection_matches_casadi_test_intersection"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sparsity.py::test_get_nzDense"
+rust_test = "sx_core::casadi_parity::ccs_get_nz_dense_matches_casadi_test_get_nz_dense"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sparsity.py::test_splower"
+rust_test = "sx_core::casadi_parity::ccs_get_lower_matches_casadi_test_splower"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sparsity.py::test_inverse"
+rust_test = "sx_core::casadi_parity::ccs_pattern_inverse_matches_casadi_test_inverse"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sparsity.py::test_kron"
+rust_test = "sx_core::casadi_parity::ccs_kron_matches_casadi_test_kron"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sparsity.py::test_nz_method"
+rust_test = "sx_core::casadi_parity::ccs_get_nz_matches_casadi_test_nz_method"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sparsity.py::test_serialize"
+rust_test = "sx_core::casadi_parity::ccs_serialize_matches_casadi_test_serialize"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sparsity.py::test_is_subset"
+rust_test = "sx_core::casadi_parity::ccs_is_subset_matches_casadi_test_is_subset"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sparsity.py::test_get_ccs"
+rust_test = "sx_core::casadi_parity::ccs_get_ccs_matches_casadi_test_get_ccs"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sparsity.py::test_find_nonzero"
+rust_test = "sx_core::casadi_parity::ccs_find_nonzero_matches_casadi_test_find_nonzero"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sparsity.py::test_reshape"
+rust_test = "sx_core::casadi_parity::ccs_reshape_matches_casadi_test_reshape"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sparsity.py::test_enlarge"
+rust_test = "sx_core::casadi_parity::ccs_enlarge_matches_casadi_test_enlarge"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sparsity.py::test_diag"
+rust_test = "sx_core::casadi_parity::ccs_diag_matches_casadi_test_diag"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_SX_func"
+rust_test = "sx_core::casadi_parity::sx_function_constructors_match_casadi_test_sx_func"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_SX"
+rust_test = "sx_core::casadi_parity::sx_dense_unary_matches_casadi_test_sx"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_SXSparse"
+rust_test = "sx_core::casadi_parity::sx_sparse_unary_matches_casadi_test_sxsparse"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_SXslicing"
+rust_test = "sx_core::casadi_parity::sx_slicing_matches_casadi_test_sxslicing_via_adaptor"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_SXconversion"
+rust_test = "sx_core::casadi_parity::sx_conversion_matches_casadi_test_sxconversion"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_SX_func2"
+rust_test = "sx_core::casadi_parity::sx_function_typemap_constructors_match_casadi_test_sx_func2"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_SX_func3"
+rust_test = "sx_core::casadi_parity::sx_function_vector_constructors_match_casadi_test_sx_func3"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_SX1"
+rust_test = "sx_core::casadi_parity::sx_function_evaluation_matches_casadi_test_sx1"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_SX2"
+rust_test = "sx_core::casadi_parity::sx_function_evaluation_matches_casadi_test_sx2"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_eval"
+rust_test = "sx_core::casadi_parity::sx_function_eval_matches_casadi_test_eval"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_symbolcheck"
+rust_test = "sx_core::casadi_parity::sx_symbolcheck_matches_casadi_test_symbolcheck"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_sparseconstr"
+rust_test = "sx_core::casadi_parity::sx_sparseconstr_matches_casadi_test_sparseconstr"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_null"
+rust_test = "sx_core::casadi_parity::sx_null_matches_casadi_test_null"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_evalchecking"
+rust_test = "sx_core::casadi_parity::sx_evalchecking_matches_casadi_test_evalchecking"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/sparsity.py::test_refcount"
+rust_test = "sx_core::casadi_parity::ccs_refcount_matches_casadi_test_refcount"
+status = "supported"
+
+[[entries]]
+casadi_case = "test/python/function.py::test_jacobian"
+status = "intentionally_descoped"
+
+[[entries]]
+casadi_case = "test/python/function.py::test_hessians"
+status = "intentionally_descoped"
+
+[[entries]]
+casadi_case = "test/python/function.py::test_codegen_with_jac_sparsity"
+status = "intentionally_descoped"
 
 [[entries]]
 casadi_case = "test/python/function.py::test_jit_buffer_eval"
+status = "intentionally_descoped"
+
+[[entries]]
+casadi_case = "test/python/function.py::test_conditional"
+status = "intentionally_descoped"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_SXbool"
+status = "intentionally_descoped"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_SXineq"
+status = "intentionally_descoped"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_truth"
+status = "intentionally_descoped"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_if_else"
+status = "intentionally_descoped"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_if_else_zero_sens"
+status = "intentionally_descoped"
+
+[[entries]]
+casadi_case = "test/python/sx.py::test_taylor"
 status = "unsupported"

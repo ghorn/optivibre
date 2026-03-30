@@ -204,3 +204,25 @@ fn lower_triangular_ccs_is_canonical() {
         ]
     );
 }
+
+#[rstest]
+fn jacobian_construction_does_not_mutate_original_output_shape_regression() {
+    let x = SX::sym("x");
+    let y = SX::sym("y");
+    let input_ccs = CCS::from_positions(5, 1, &[(0, 0), (3, 0)]).expect("input CCS");
+    let input = SXMatrix::new(input_ccs, vec![x, y]).expect("sparse input");
+    let output = SXMatrix::dense_column(vec![x + y, x, y]).expect("dense output");
+    let original_shape = output.shape();
+
+    let jacobian = output.jacobian(&input).expect("jacobian");
+    assert_eq!(output.shape(), original_shape);
+    assert_eq!(jacobian.shape(), (3, 2));
+
+    let function = SXFunction::new(
+        "shape_regression",
+        vec![NamedMatrix::new("inp", input).expect("input slot")],
+        vec![NamedMatrix::new("out", output.clone()).expect("output slot")],
+    )
+    .expect("function");
+    assert_eq!(function.outputs()[0].matrix().shape(), original_shape);
+}

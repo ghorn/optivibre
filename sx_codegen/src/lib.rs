@@ -3,7 +3,7 @@ use std::io::Write as _;
 use std::process::{Command, Stdio};
 
 use anyhow::{Result, anyhow, bail};
-use sx_core::{BinaryOp, CCS, Index, NodeView, SX, SXFunction};
+use sx_core::{BinaryOp, CCS, Index, NodeView, SX, SXFunction, UnaryOp};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LoweredFunction {
@@ -28,11 +28,22 @@ pub enum ValueRef {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub enum InstructionKind {
+    Unary {
+        op: UnaryOp,
+        input: ValueRef,
+    },
+    Binary {
+        op: BinaryOp,
+        lhs: ValueRef,
+        rhs: ValueRef,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Instruction {
     pub temp: Index,
-    pub op: BinaryOp,
-    pub lhs: ValueRef,
-    pub rhs: ValueRef,
+    pub kind: InstructionKind,
 }
 
 pub fn sanitize_ident(name: &str) -> String {
@@ -98,6 +109,11 @@ fn topo_visit(
                 bail!("symbol {expr} is not bound as a function input")
             }
         }
+        NodeView::Unary { arg, .. } => {
+            topo_visit(arg, input_bindings, seen, order)?;
+            order.push(expr);
+            Ok(())
+        }
         NodeView::Binary { lhs, rhs, .. } => {
             topo_visit(lhs, input_bindings, seen, order)?;
             topo_visit(rhs, input_bindings, seen, order)?;
@@ -121,7 +137,7 @@ fn value_ref(
                 .ok_or_else(|| anyhow!("symbol {expr} is not a declared function input"))?;
             ValueRef::Input { slot, offset }
         }
-        NodeView::Binary { .. } => ValueRef::Temp(
+        NodeView::Unary { .. } | NodeView::Binary { .. } => ValueRef::Temp(
             *temps
                 .get(&expr)
                 .ok_or_else(|| anyhow!("internal node {expr} was not topologically lowered"))?,
@@ -160,18 +176,21 @@ pub fn lower_function(function: &SXFunction) -> Result<LoweredFunction> {
     let mut instructions = Vec::with_capacity(order.len());
     for (temp, node) in order.iter().copied().enumerate() {
         temps.insert(node, temp);
-        let (op, lhs, rhs) = match node.inspect() {
-            NodeView::Binary { op, lhs, rhs } => (op, lhs, rhs),
+        let kind = match node.inspect() {
+            NodeView::Unary { op, arg } => InstructionKind::Unary {
+                op,
+                input: value_ref(arg, &input_bindings, &temps)?,
+            },
+            NodeView::Binary { op, lhs, rhs } => InstructionKind::Binary {
+                op,
+                lhs: value_ref(lhs, &input_bindings, &temps)?,
+                rhs: value_ref(rhs, &input_bindings, &temps)?,
+            },
             NodeView::Constant(_) | NodeView::Symbol { .. } => {
-                bail!("topological order should only contain binary operations")
+                bail!("topological order should only contain unary or binary operations")
             }
         };
-        instructions.push(Instruction {
-            temp,
-            op,
-            lhs: value_ref(lhs, &input_bindings, &temps)?,
-            rhs: value_ref(rhs, &input_bindings, &temps)?,
-        });
+        instructions.push(Instruction { temp, kind });
     }
 
     let output_values = function

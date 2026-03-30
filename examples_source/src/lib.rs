@@ -72,28 +72,28 @@ pub fn ad_cost_expectations(scenario: AdCostScenario) -> AdCostExpectations {
         AdCostScenario::ReverseGradient => AdCostExpectations {
             description: "Scalar primal; reverse AD returns value plus gradient.",
             exact_original_ops: 952,
-            exact_augmented_ops: 2376,
+            exact_augmented_ops: 2658,
             directional_ratio_limit: Some(5.0),
             normalized_ratio_limit: None,
         },
         AdCostScenario::ForwardSweep => AdCostExpectations {
             description: "Vector primal; one forward sweep returns primal plus directional.",
             exact_original_ops: 1281,
-            exact_augmented_ops: 2881,
+            exact_augmented_ops: 3040,
             directional_ratio_limit: Some(5.0),
             normalized_ratio_limit: None,
         },
         AdCostScenario::Jacobian => AdCostExpectations {
             description: "Vector primal; full Jacobian cost normalized by sweep count.",
-            exact_original_ops: 322,
-            exact_augmented_ops: 4113,
+            exact_original_ops: 321,
+            exact_augmented_ops: 5228,
             directional_ratio_limit: None,
             normalized_ratio_limit: Some(8.0),
         },
         AdCostScenario::Hessian => AdCostExpectations {
             description: "Scalar primal; Hessian cost normalized by sweep count.",
             exact_original_ops: 232,
-            exact_augmented_ops: 11439,
+            exact_augmented_ops: 14037,
             directional_ratio_limit: None,
             normalized_ratio_limit: Some(8.0),
         },
@@ -165,14 +165,145 @@ fn rosenbrock_bundle() -> Result<Vec<ExampleArtifact>> {
     ])
 }
 
+fn casadi_rosenbrock_nlp_bundle() -> Result<Vec<ExampleArtifact>> {
+    let vars = SXMatrix::sym_dense("x", 3, 1)?;
+    let x = vars.nz(0);
+    let y = vars.nz(1);
+    let z = vars.nz(2);
+    let objective = SXMatrix::scalar(x.sqr() + 100.0 * z.sqr());
+    let gradient = objective.gradient(&vars)?;
+    let constraints = SXMatrix::dense_column(vec![z + (1.0 - x).sqr() - y])?;
+    let jacobian = constraints.jacobian(&vars)?;
+    let lambda_eq = SXMatrix::sym_dense("lambda_eq", 1, 1)?;
+    let lagrangian = SXMatrix::scalar(objective.nz(0) + lambda_eq.nz(0) * constraints.nz(0));
+    let lagrangian_hessian = lagrangian.hessian(&vars)?;
+
+    Ok(vec![
+        ExampleArtifact {
+            module_name: "casadi_rosenbrock_nlp_objective".into(),
+            function: single_io_function(
+                "casadi_rosenbrock_nlp_objective",
+                "x",
+                vars.clone(),
+                "objective",
+                objective,
+            )?,
+        },
+        ExampleArtifact {
+            module_name: "casadi_rosenbrock_nlp_gradient".into(),
+            function: single_io_function(
+                "casadi_rosenbrock_nlp_gradient",
+                "x",
+                vars.clone(),
+                "gradient",
+                gradient,
+            )?,
+        },
+        ExampleArtifact {
+            module_name: "casadi_rosenbrock_nlp_constraints".into(),
+            function: single_io_function(
+                "casadi_rosenbrock_nlp_constraints",
+                "x",
+                vars.clone(),
+                "constraints",
+                constraints,
+            )?,
+        },
+        ExampleArtifact {
+            module_name: "casadi_rosenbrock_nlp_jacobian".into(),
+            function: single_io_function(
+                "casadi_rosenbrock_nlp_jacobian",
+                "x",
+                vars.clone(),
+                "jacobian",
+                jacobian,
+            )?,
+        },
+        ExampleArtifact {
+            module_name: "casadi_rosenbrock_nlp_lagrangian_hessian".into(),
+            function: named_function(
+                "casadi_rosenbrock_nlp_lagrangian_hessian",
+                vec![("x", vars), ("lambda_eq", lambda_eq)],
+                vec![("hessian", lagrangian_hessian)],
+            )?,
+        },
+    ])
+}
+
+fn simple_nlp_bundle() -> Result<Vec<ExampleArtifact>> {
+    let x = SXMatrix::sym_dense("x", 2, 1)?;
+    let objective = SXMatrix::scalar(x.nz(0).sqr() + x.nz(1).sqr());
+    let gradient = objective.gradient(&x)?;
+    let constraints = SXMatrix::dense_column(vec![x.nz(0) + x.nz(1) - 10.0])?;
+    let jacobian = constraints.jacobian(&x)?;
+    let lambda_eq = SXMatrix::sym_dense("lambda_eq", 1, 1)?;
+    let lagrangian = SXMatrix::scalar(objective.nz(0) + lambda_eq.nz(0) * constraints.nz(0));
+    let lagrangian_hessian = lagrangian.hessian(&x)?;
+
+    Ok(vec![
+        ExampleArtifact {
+            module_name: "simple_nlp_objective".into(),
+            function: single_io_function(
+                "simple_nlp_objective",
+                "x",
+                x.clone(),
+                "objective",
+                objective,
+            )?,
+        },
+        ExampleArtifact {
+            module_name: "simple_nlp_gradient".into(),
+            function: single_io_function(
+                "simple_nlp_gradient",
+                "x",
+                x.clone(),
+                "gradient",
+                gradient,
+            )?,
+        },
+        ExampleArtifact {
+            module_name: "simple_nlp_constraints".into(),
+            function: single_io_function(
+                "simple_nlp_constraints",
+                "x",
+                x.clone(),
+                "constraints",
+                constraints,
+            )?,
+        },
+        ExampleArtifact {
+            module_name: "simple_nlp_jacobian".into(),
+            function: single_io_function(
+                "simple_nlp_jacobian",
+                "x",
+                x.clone(),
+                "jacobian",
+                jacobian,
+            )?,
+        },
+        ExampleArtifact {
+            module_name: "simple_nlp_lagrangian_hessian".into(),
+            function: named_function(
+                "simple_nlp_lagrangian_hessian",
+                vec![("x", x), ("lambda_eq", lambda_eq)],
+                vec![("hessian", lagrangian_hessian)],
+            )?,
+        },
+    ])
+}
+
 fn constrained_rosenbrock_bundle() -> Result<Vec<ExampleArtifact>> {
     let x = SXMatrix::sym_dense("x", 2, 1)?;
     let x0 = x.nz(0);
     let x1 = x.nz(1);
     let objective = SXMatrix::scalar((1.0 - x0).sqr() + 100.0 * (x1 - x0.sqr()).sqr());
+    let gradient = objective.gradient(&x)?;
     let constraints = SXMatrix::dense_column(vec![x0 + x1 - 1.0])?;
     let jacobian = constraints.jacobian(&x)?;
     let hessian = objective.hessian(&x)?;
+    let lambda_eq = SXMatrix::sym_dense("lambda_eq", 1, 1)?;
+    let lagrangian = SXMatrix::scalar(objective.nz(0) + lambda_eq.nz(0) * constraints.nz(0));
+    let lagrangian_hessian = lagrangian.hessian(&x)?;
 
     Ok(vec![
         ExampleArtifact {
@@ -196,6 +327,16 @@ fn constrained_rosenbrock_bundle() -> Result<Vec<ExampleArtifact>> {
             )?,
         },
         ExampleArtifact {
+            module_name: "constrained_rosenbrock_gradient".into(),
+            function: single_io_function(
+                "constrained_rosenbrock_gradient",
+                "x",
+                x.clone(),
+                "gradient",
+                gradient,
+            )?,
+        },
+        ExampleArtifact {
             module_name: "constrained_rosenbrock_jacobian".into(),
             function: single_io_function(
                 "constrained_rosenbrock_jacobian",
@@ -210,9 +351,17 @@ fn constrained_rosenbrock_bundle() -> Result<Vec<ExampleArtifact>> {
             function: single_io_function(
                 "constrained_rosenbrock_hessian",
                 "x",
-                x,
+                x.clone(),
                 "hessian",
                 hessian,
+            )?,
+        },
+        ExampleArtifact {
+            module_name: "constrained_rosenbrock_lagrangian_hessian".into(),
+            function: named_function(
+                "constrained_rosenbrock_lagrangian_hessian",
+                vec![("x", x), ("lambda_eq", lambda_eq)],
+                vec![("hessian", lagrangian_hessian)],
             )?,
         },
     ])
@@ -247,8 +396,15 @@ fn hanging_chain_bundle() -> Result<Vec<ExampleArtifact>> {
     constraints
         .push((prev_x - anchor_right.0).sqr() + (prev_y - anchor_right.1).sqr() - link_length_sq);
     let constraints = SXMatrix::dense_column(constraints)?;
+    let gradient = objective.gradient(&vars)?;
     let jacobian = constraints.jacobian(&vars)?;
     let hessian = objective.hessian(&vars)?;
+    let lambda_eq = SXMatrix::sym_dense("lambda_eq", points + 1, 1)?;
+    let mut lagrangian_expr = objective.nz(0);
+    for idx in 0..=points {
+        lagrangian_expr += lambda_eq.nz(idx) * constraints.nz(idx);
+    }
+    let lagrangian_hessian = SXMatrix::scalar(lagrangian_expr).hessian(&vars)?;
 
     Ok(vec![
         ExampleArtifact {
@@ -272,6 +428,16 @@ fn hanging_chain_bundle() -> Result<Vec<ExampleArtifact>> {
             )?,
         },
         ExampleArtifact {
+            module_name: "hanging_chain_gradient".into(),
+            function: single_io_function(
+                "hanging_chain_gradient",
+                "q",
+                vars.clone(),
+                "gradient",
+                gradient,
+            )?,
+        },
+        ExampleArtifact {
             module_name: "hanging_chain_jacobian".into(),
             function: single_io_function(
                 "hanging_chain_jacobian",
@@ -283,7 +449,313 @@ fn hanging_chain_bundle() -> Result<Vec<ExampleArtifact>> {
         },
         ExampleArtifact {
             module_name: "hanging_chain_hessian".into(),
-            function: single_io_function("hanging_chain_hessian", "q", vars, "hessian", hessian)?,
+            function: single_io_function(
+                "hanging_chain_hessian",
+                "q",
+                vars.clone(),
+                "hessian",
+                hessian,
+            )?,
+        },
+        ExampleArtifact {
+            module_name: "hanging_chain_lagrangian_hessian".into(),
+            function: named_function(
+                "hanging_chain_lagrangian_hessian",
+                vec![("q", vars), ("lambda_eq", lambda_eq)],
+                vec![("hessian", lagrangian_hessian)],
+            )?,
+        },
+    ])
+}
+
+fn hs021_bundle() -> Result<Vec<ExampleArtifact>> {
+    let x = SXMatrix::sym_dense("x", 2, 1)?;
+    let x0 = x.nz(0);
+    let x1 = x.nz(1);
+    let objective = SXMatrix::scalar(0.01 * x0.sqr() + x1.sqr() - 100.0);
+    let gradient = objective.gradient(&x)?;
+    let inequalities = SXMatrix::dense_column(vec![
+        -10.0 * x0 + x1 + 10.0,
+        2.0 - x0,
+        x0 - 50.0,
+        -50.0 - x1,
+        x1 - 50.0,
+    ])?;
+    let inequality_jacobian = inequalities.jacobian(&x)?;
+    let mu = SXMatrix::sym_dense("mu", 5, 1)?;
+    let mut lagrangian_expr = objective.nz(0);
+    for idx in 0..5 {
+        lagrangian_expr += mu.nz(idx) * inequalities.nz(idx);
+    }
+    let lagrangian_hessian = SXMatrix::scalar(lagrangian_expr).hessian(&x)?;
+
+    Ok(vec![
+        ExampleArtifact {
+            module_name: "hs021_objective".into(),
+            function: single_io_function(
+                "hs021_objective",
+                "x",
+                x.clone(),
+                "objective",
+                objective,
+            )?,
+        },
+        ExampleArtifact {
+            module_name: "hs021_gradient".into(),
+            function: single_io_function("hs021_gradient", "x", x.clone(), "gradient", gradient)?,
+        },
+        ExampleArtifact {
+            module_name: "hs021_inequalities".into(),
+            function: single_io_function(
+                "hs021_inequalities",
+                "x",
+                x.clone(),
+                "inequalities",
+                inequalities,
+            )?,
+        },
+        ExampleArtifact {
+            module_name: "hs021_inequality_jacobian".into(),
+            function: single_io_function(
+                "hs021_inequality_jacobian",
+                "x",
+                x.clone(),
+                "jacobian",
+                inequality_jacobian,
+            )?,
+        },
+        ExampleArtifact {
+            module_name: "hs021_lagrangian_hessian".into(),
+            function: named_function(
+                "hs021_lagrangian_hessian",
+                vec![("x", x), ("mu", mu)],
+                vec![("hessian", lagrangian_hessian)],
+            )?,
+        },
+    ])
+}
+
+fn hs035_bundle() -> Result<Vec<ExampleArtifact>> {
+    let x = SXMatrix::sym_dense("x", 3, 1)?;
+    let x0 = x.nz(0);
+    let x1 = x.nz(1);
+    let x2 = x.nz(2);
+    let objective = SXMatrix::scalar(
+        9.0 - 8.0 * x0 - 6.0 * x1 - 4.0 * x2
+            + 2.0 * x0.sqr()
+            + 2.0 * x1.sqr()
+            + x2.sqr()
+            + 2.0 * x0 * x1
+            + 2.0 * x0 * x2,
+    );
+    let gradient = objective.gradient(&x)?;
+    let inequalities = SXMatrix::dense_column(vec![x0 + x1 + 2.0 * x2 - 3.0, -x0, -x1, -x2])?;
+    let inequality_jacobian = inequalities.jacobian(&x)?;
+    let mu = SXMatrix::sym_dense("mu", 4, 1)?;
+    let mut lagrangian_expr = objective.nz(0);
+    for idx in 0..4 {
+        lagrangian_expr += mu.nz(idx) * inequalities.nz(idx);
+    }
+    let lagrangian_hessian = SXMatrix::scalar(lagrangian_expr).hessian(&x)?;
+
+    Ok(vec![
+        ExampleArtifact {
+            module_name: "hs035_objective".into(),
+            function: single_io_function(
+                "hs035_objective",
+                "x",
+                x.clone(),
+                "objective",
+                objective,
+            )?,
+        },
+        ExampleArtifact {
+            module_name: "hs035_gradient".into(),
+            function: single_io_function("hs035_gradient", "x", x.clone(), "gradient", gradient)?,
+        },
+        ExampleArtifact {
+            module_name: "hs035_inequalities".into(),
+            function: single_io_function(
+                "hs035_inequalities",
+                "x",
+                x.clone(),
+                "inequalities",
+                inequalities,
+            )?,
+        },
+        ExampleArtifact {
+            module_name: "hs035_inequality_jacobian".into(),
+            function: single_io_function(
+                "hs035_inequality_jacobian",
+                "x",
+                x.clone(),
+                "jacobian",
+                inequality_jacobian,
+            )?,
+        },
+        ExampleArtifact {
+            module_name: "hs035_lagrangian_hessian".into(),
+            function: named_function(
+                "hs035_lagrangian_hessian",
+                vec![("x", x), ("mu", mu)],
+                vec![("hessian", lagrangian_hessian)],
+            )?,
+        },
+    ])
+}
+
+fn hs071_bundle() -> Result<Vec<ExampleArtifact>> {
+    let x = SXMatrix::sym_dense("x", 4, 1)?;
+    let x0 = x.nz(0);
+    let x1 = x.nz(1);
+    let x2 = x.nz(2);
+    let x3 = x.nz(3);
+    let objective = SXMatrix::scalar(x0 * x3 * (x0 + x1 + x2) + x2);
+    let gradient = objective.gradient(&x)?;
+    let equalities =
+        SXMatrix::dense_column(vec![x0.sqr() + x1.sqr() + x2.sqr() + x3.sqr() - 40.0])?;
+    let equality_jacobian = equalities.jacobian(&x)?;
+    let inequalities = SXMatrix::dense_column(vec![
+        25.0 - x0 * x1 * x2 * x3,
+        1.0 - x0,
+        1.0 - x1,
+        1.0 - x2,
+        1.0 - x3,
+        x0 - 5.0,
+        x1 - 5.0,
+        x2 - 5.0,
+        x3 - 5.0,
+    ])?;
+    let inequality_jacobian = inequalities.jacobian(&x)?;
+    let lambda_eq = SXMatrix::sym_dense("lambda_eq", 1, 1)?;
+    let mu = SXMatrix::sym_dense("mu", 9, 1)?;
+    let mut lagrangian_expr = objective.nz(0) + lambda_eq.nz(0) * equalities.nz(0);
+    for idx in 0..9 {
+        lagrangian_expr += mu.nz(idx) * inequalities.nz(idx);
+    }
+    let lagrangian_hessian = SXMatrix::scalar(lagrangian_expr).hessian(&x)?;
+
+    Ok(vec![
+        ExampleArtifact {
+            module_name: "hs071_objective".into(),
+            function: single_io_function(
+                "hs071_objective",
+                "x",
+                x.clone(),
+                "objective",
+                objective,
+            )?,
+        },
+        ExampleArtifact {
+            module_name: "hs071_gradient".into(),
+            function: single_io_function("hs071_gradient", "x", x.clone(), "gradient", gradient)?,
+        },
+        ExampleArtifact {
+            module_name: "hs071_equalities".into(),
+            function: single_io_function(
+                "hs071_equalities",
+                "x",
+                x.clone(),
+                "equalities",
+                equalities,
+            )?,
+        },
+        ExampleArtifact {
+            module_name: "hs071_equality_jacobian".into(),
+            function: single_io_function(
+                "hs071_equality_jacobian",
+                "x",
+                x.clone(),
+                "jacobian",
+                equality_jacobian,
+            )?,
+        },
+        ExampleArtifact {
+            module_name: "hs071_inequalities".into(),
+            function: single_io_function(
+                "hs071_inequalities",
+                "x",
+                x.clone(),
+                "inequalities",
+                inequalities,
+            )?,
+        },
+        ExampleArtifact {
+            module_name: "hs071_inequality_jacobian".into(),
+            function: single_io_function(
+                "hs071_inequality_jacobian",
+                "x",
+                x.clone(),
+                "jacobian",
+                inequality_jacobian,
+            )?,
+        },
+        ExampleArtifact {
+            module_name: "hs071_lagrangian_hessian".into(),
+            function: named_function(
+                "hs071_lagrangian_hessian",
+                vec![("x", x), ("lambda_eq", lambda_eq), ("mu", mu)],
+                vec![("hessian", lagrangian_hessian)],
+            )?,
+        },
+    ])
+}
+
+fn parameterized_quadratic_bundle() -> Result<Vec<ExampleArtifact>> {
+    let x = SXMatrix::sym_dense("x", 2, 1)?;
+    let p = SXMatrix::sym_dense("p", 2, 1)?;
+    let x0 = x.nz(0);
+    let x1 = x.nz(1);
+    let p0 = p.nz(0);
+    let p1 = p.nz(1);
+    let objective = SXMatrix::scalar((x0 - p0).sqr() + (x1 - p1).sqr());
+    let gradient = objective.gradient(&x)?;
+    let equalities = SXMatrix::dense_column(vec![x0 + x1 - 1.0])?;
+    let equality_jacobian = equalities.jacobian(&x)?;
+    let lambda_eq = SXMatrix::sym_dense("lambda_eq", 1, 1)?;
+    let lagrangian = SXMatrix::scalar(objective.nz(0) + lambda_eq.nz(0) * equalities.nz(0));
+    let lagrangian_hessian = lagrangian.hessian(&x)?;
+
+    Ok(vec![
+        ExampleArtifact {
+            module_name: "parameterized_quadratic_objective".into(),
+            function: named_function(
+                "parameterized_quadratic_objective",
+                vec![("x", x.clone()), ("p", p.clone())],
+                vec![("objective", objective)],
+            )?,
+        },
+        ExampleArtifact {
+            module_name: "parameterized_quadratic_gradient".into(),
+            function: named_function(
+                "parameterized_quadratic_gradient",
+                vec![("x", x.clone()), ("p", p.clone())],
+                vec![("gradient", gradient)],
+            )?,
+        },
+        ExampleArtifact {
+            module_name: "parameterized_quadratic_equalities".into(),
+            function: named_function(
+                "parameterized_quadratic_equalities",
+                vec![("x", x.clone()), ("p", p.clone())],
+                vec![("equalities", equalities)],
+            )?,
+        },
+        ExampleArtifact {
+            module_name: "parameterized_quadratic_equality_jacobian".into(),
+            function: named_function(
+                "parameterized_quadratic_equality_jacobian",
+                vec![("x", x.clone()), ("p", p.clone())],
+                vec![("jacobian", equality_jacobian)],
+            )?,
+        },
+        ExampleArtifact {
+            module_name: "parameterized_quadratic_lagrangian_hessian".into(),
+            function: named_function(
+                "parameterized_quadratic_lagrangian_hessian",
+                vec![("x", x), ("p", p), ("lambda_eq", lambda_eq)],
+                vec![("hessian", lagrangian_hessian)],
+            )?,
         },
     ])
 }
@@ -486,7 +958,7 @@ pub fn hessian_strategy_expectation(strategy: HessianStrategy) -> HessianStrateg
     match strategy {
         HessianStrategy::LowerTriangleByColumn
         | HessianStrategy::LowerTriangleSelectedOutputs
-        | HessianStrategy::LowerTriangleColored => HessianStrategyExpectation { exact_ops: 11_439 },
+        | HessianStrategy::LowerTriangleColored => HessianStrategyExpectation { exact_ops: 14_037 },
     }
 }
 
@@ -523,7 +995,13 @@ pub fn ad_cost_artifacts() -> Result<Vec<ExampleArtifact>> {
 pub fn all_examples() -> Result<Vec<ExampleArtifact>> {
     let mut artifacts = Vec::new();
     artifacts.extend(rosenbrock_bundle()?);
+    artifacts.extend(casadi_rosenbrock_nlp_bundle()?);
+    artifacts.extend(simple_nlp_bundle()?);
     artifacts.extend(constrained_rosenbrock_bundle()?);
+    artifacts.extend(hs021_bundle()?);
+    artifacts.extend(hs035_bundle()?);
+    artifacts.extend(hs071_bundle()?);
+    artifacts.extend(parameterized_quadratic_bundle()?);
     artifacts.extend(hanging_chain_bundle()?);
     Ok(artifacts)
 }

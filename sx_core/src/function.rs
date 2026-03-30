@@ -100,12 +100,28 @@ impl SXFunction {
         &self.name
     }
 
+    pub fn n_in(&self) -> Index {
+        self.inputs.len()
+    }
+
+    pub fn n_out(&self) -> Index {
+        self.outputs.len()
+    }
+
     pub fn inputs(&self) -> &[NamedMatrix] {
         &self.inputs
     }
 
     pub fn outputs(&self) -> &[NamedMatrix] {
         &self.outputs
+    }
+
+    pub fn size_in(&self, slot: Index) -> (Index, Index) {
+        self.inputs[slot].matrix.shape()
+    }
+
+    pub fn size_out(&self, slot: Index) -> (Index, Index) {
+        self.outputs[slot].matrix.shape()
     }
 
     pub fn input_bindings(&self) -> HashMap<SX, (Index, Index)> {
