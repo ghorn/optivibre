@@ -314,6 +314,24 @@ prop_compose! {
     }
 }
 
+fn central_difference_1d(expr: SX, symbol: SX, point: f64, eps: f64) -> f64 {
+    let vars_plus = HashMap::from([(symbol.id(), point + eps)]);
+    let vars_minus = HashMap::from([(symbol.id(), point - eps)]);
+    (eval(expr, &vars_plus) - eval(expr, &vars_minus)) / (2.0 * eps)
+}
+
+fn central_difference_2d_x(expr: SX, x: SX, xv: f64, z: SX, zv: f64, eps: f64) -> f64 {
+    let vars_plus = HashMap::from([(x.id(), xv + eps), (z.id(), zv)]);
+    let vars_minus = HashMap::from([(x.id(), xv - eps), (z.id(), zv)]);
+    (eval(expr, &vars_plus) - eval(expr, &vars_minus)) / (2.0 * eps)
+}
+
+fn central_difference_2d_z(expr: SX, x: SX, xv: f64, z: SX, zv: f64, eps: f64) -> f64 {
+    let vars_plus = HashMap::from([(x.id(), xv), (z.id(), zv + eps)]);
+    let vars_minus = HashMap::from([(x.id(), xv), (z.id(), zv - eps)]);
+    (eval(expr, &vars_plus) - eval(expr, &vars_minus)) / (2.0 * eps)
+}
+
 prop_compose! {
     fn smooth_unary_samples()(
         trig in -0.8f64..0.8,
@@ -438,8 +456,7 @@ proptest! {
             let f = SXMatrix::scalar(expr);
             let grad = f.gradient(&wrt).unwrap();
             let vars = HashMap::from([(x.id(), point)]);
-            let vars_eps = HashMap::from([(x.id(), point + eps)]);
-            let fd = (eval(expr, &vars_eps) - eval(expr, &vars)) / eps;
+            let fd = central_difference_1d(expr, x, point, eps);
             let ad = eval(grad.nz(0), &vars);
             prop_assert!(
                 (ad - fd).abs() < 1e-4,
@@ -466,10 +483,8 @@ proptest! {
             let f = SXMatrix::scalar(expr);
             let grad = f.gradient(&wrt).unwrap();
             let vars = HashMap::from([(x.id(), xv), (z.id(), zv)]);
-            let vars_x = HashMap::from([(x.id(), xv + eps), (z.id(), zv)]);
-            let vars_z = HashMap::from([(x.id(), xv), (z.id(), zv + eps)]);
-            let fd_x = (eval(expr, &vars_x) - eval(expr, &vars)) / eps;
-            let fd_z = (eval(expr, &vars_z) - eval(expr, &vars)) / eps;
+            let fd_x = central_difference_2d_x(expr, x, xv, z, zv, eps);
+            let fd_z = central_difference_2d_z(expr, x, xv, z, zv, eps);
             let ad_x = eval(grad.nz(0), &vars);
             let ad_z = eval(grad.nz(1), &vars);
             prop_assert!(

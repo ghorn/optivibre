@@ -9,9 +9,14 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
+mod interior_point;
 #[cfg(feature = "ipopt")]
 mod ipopt_backend;
 
+pub use interior_point::{
+    InteriorPointLinearSolver, InteriorPointOptions, InteriorPointProfiling,
+    InteriorPointSolveError, InteriorPointSummary, solve_nlp_interior_point,
+};
 #[cfg(feature = "ipopt")]
 pub use ipopt_backend::{
     IpoptMuStrategy, IpoptOptions, IpoptSolveError, IpoptSummary, solve_nlp_ipopt,
