@@ -2462,6 +2462,40 @@ where
     }
 }
 
+pub fn compile_and_solve_multiple_shooting<Compiled, Compile, Build, const N: usize>(
+    compile: Compile,
+    runtime: MultipleShootingRuntimeValues<
+        Compiled::PNum,
+        Compiled::CBounds,
+        Compiled::BeqNum,
+        Compiled::BineqBounds,
+        Compiled::XNum,
+        Compiled::UNum,
+        N,
+    >,
+    solver_method: SolverMethod,
+    solver_config: &SqpConfig,
+    build_artifact: Build,
+) -> Result<SolveArtifact>
+where
+    Compiled: MultipleShootingCompiled<N>,
+    Compile: FnOnce() -> Result<Compiled>,
+    Build: FnMut(
+        &MultipleShootingTrajectories<Compiled::XNum, Compiled::UNum, N>,
+        &[IntervalArc<Compiled::XNum>],
+        &[IntervalArc<Compiled::UNum>],
+    ) -> SolveArtifact,
+{
+    let compiled = compile()?;
+    solve_multiple_shooting_problem(
+        &compiled,
+        &runtime,
+        solver_method,
+        solver_config,
+        build_artifact,
+    )
+}
+
 pub fn solve_multiple_shooting_problem_with_progress<Compiled, Emit, Build, const N: usize>(
     compiled: &Compiled,
     runtime: &MultipleShootingRuntimeValues<
@@ -2754,6 +2788,53 @@ where
     }
 }
 
+pub fn compile_and_solve_multiple_shooting_with_progress<
+    Compiled,
+    Compile,
+    Emit,
+    Build,
+    const N: usize,
+>(
+    compile: Compile,
+    runtime: MultipleShootingRuntimeValues<
+        Compiled::PNum,
+        Compiled::CBounds,
+        Compiled::BeqNum,
+        Compiled::BineqBounds,
+        Compiled::XNum,
+        Compiled::UNum,
+        N,
+    >,
+    solver_method: SolverMethod,
+    solver_config: &SqpConfig,
+    emit: Emit,
+    build_artifact: Build,
+) -> Result<SolveArtifact>
+where
+    Compiled: MultipleShootingCompiled<N>,
+    Compile: FnOnce(
+        &mut dyn FnMut(BackendTimingMetadata),
+    ) -> Result<(Compiled, BackendTimingMetadata)>,
+    Emit: FnMut(SolveStreamEvent) + Send,
+    Build: FnMut(
+        &MultipleShootingTrajectories<Compiled::XNum, Compiled::UNum, N>,
+        &[IntervalArc<Compiled::XNum>],
+        &[IntervalArc<Compiled::UNum>],
+    ) -> SolveArtifact,
+{
+    let mut lifecycle = SolveLifecycleReporter::new(emit, solver_method);
+    let (compiled, running_solver) = lifecycle.compile_with_progress(compile)?;
+    solve_multiple_shooting_problem_with_progress(
+        &compiled,
+        &runtime,
+        solver_method,
+        solver_config,
+        lifecycle.into_emit(),
+        running_solver,
+        build_artifact,
+    )
+}
+
 pub fn solve_direct_collocation_problem<Compiled, Build, const N: usize, const K: usize>(
     compiled: &Compiled,
     runtime: &DirectCollocationRuntimeValues<
@@ -2823,6 +2904,40 @@ where
             Ok(with_solve_time(artifact, started))
         }
     }
+}
+
+pub fn compile_and_solve_direct_collocation<Compiled, Compile, Build, const N: usize, const K: usize>(
+    compile: Compile,
+    runtime: DirectCollocationRuntimeValues<
+        Compiled::PNum,
+        Compiled::CBounds,
+        Compiled::BeqNum,
+        Compiled::BineqBounds,
+        Compiled::XNum,
+        Compiled::UNum,
+        N,
+        K,
+    >,
+    solver_method: SolverMethod,
+    solver_config: &SqpConfig,
+    build_artifact: Build,
+) -> Result<SolveArtifact>
+where
+    Compiled: DirectCollocationCompiled<N, K>,
+    Compile: FnOnce() -> Result<Compiled>,
+    Build: FnMut(
+        &DirectCollocationTrajectories<Compiled::XNum, Compiled::UNum, N, K>,
+        &DirectCollocationTimeGrid<N, K>,
+    ) -> SolveArtifact,
+{
+    let compiled = compile()?;
+    solve_direct_collocation_problem(
+        &compiled,
+        &runtime,
+        solver_method,
+        solver_config,
+        build_artifact,
+    )
 }
 
 pub fn solve_direct_collocation_problem_with_progress<
@@ -3085,6 +3200,54 @@ where
             Ok(artifact)
         }
     }
+}
+
+pub fn compile_and_solve_direct_collocation_with_progress<
+    Compiled,
+    Compile,
+    Emit,
+    Build,
+    const N: usize,
+    const K: usize,
+>(
+    compile: Compile,
+    runtime: DirectCollocationRuntimeValues<
+        Compiled::PNum,
+        Compiled::CBounds,
+        Compiled::BeqNum,
+        Compiled::BineqBounds,
+        Compiled::XNum,
+        Compiled::UNum,
+        N,
+        K,
+    >,
+    solver_method: SolverMethod,
+    solver_config: &SqpConfig,
+    emit: Emit,
+    build_artifact: Build,
+) -> Result<SolveArtifact>
+where
+    Compiled: DirectCollocationCompiled<N, K>,
+    Compile: FnOnce(
+        &mut dyn FnMut(BackendTimingMetadata),
+    ) -> Result<(Compiled, BackendTimingMetadata)>,
+    Emit: FnMut(SolveStreamEvent) + Send,
+    Build: FnMut(
+        &DirectCollocationTrajectories<Compiled::XNum, Compiled::UNum, N, K>,
+        &DirectCollocationTimeGrid<N, K>,
+    ) -> SolveArtifact,
+{
+    let mut lifecycle = SolveLifecycleReporter::new(emit, solver_method);
+    let (compiled, running_solver) = lifecycle.compile_with_progress(compile)?;
+    solve_direct_collocation_problem_with_progress(
+        &compiled,
+        &runtime,
+        solver_method,
+        solver_config,
+        lifecycle.into_emit(),
+        running_solver,
+        build_artifact,
+    )
 }
 
 pub fn sqp_progress(snapshot: &SqpIterationSnapshot) -> SolveProgress {

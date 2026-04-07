@@ -1,15 +1,15 @@
 use crate::common::{
     FromMap, LatexSection, MetricKey, PlotMode, ProblemId, ProblemSpec, Scene2D, SceneAnimation,
-    SceneFrame, ScenePath, SolveArtifact, SolveLifecycleReporter, SolveStreamEvent, SolverMethod,
-    SolverReport, SqpConfig, TranscriptionConfig, TranscriptionMethod, chart,
-    default_solver_method, default_sqp_config, default_transcription, deg_to_rad, expect_finite,
+    SceneFrame, ScenePath, SolveArtifact, SolveStreamEvent, SolverMethod, SolverReport, SqpConfig,
+    TranscriptionConfig, TranscriptionMethod, chart, compile_and_solve_direct_collocation,
+    compile_and_solve_direct_collocation_with_progress, compile_and_solve_multiple_shooting,
+    compile_and_solve_multiple_shooting_with_progress, default_solver_method,
+    default_sqp_config, default_transcription, deg_to_rad, expect_finite,
     interval_arc_bound_series, interval_arc_series, metric_with_key, node_times,
     numeric_metric_with_key, problem_controls, problem_scientific_slider_control,
     problem_slider_control, problem_spec, rad_to_deg, sample_or_default, segmented_bound_series,
-    segmented_series, solve_direct_collocation_problem,
-    solve_direct_collocation_problem_with_progress, solve_multiple_shooting_problem,
-    solve_multiple_shooting_problem_with_progress, solver_config_from_map, solver_method_from_map,
-    transcription_from_map, transcription_metrics,
+    segmented_series, solver_config_from_map, solver_method_from_map, transcription_from_map,
+    transcription_metrics,
 };
 use anyhow::Result;
 use optimal_control::{
@@ -612,11 +612,9 @@ fn dc_runtime<const N: usize, const K: usize>(
     }
 }
 fn solve_multiple_shooting<const N: usize>(params: &Params) -> Result<SolveArtifact> {
-    let compiled = model_ms::<N>(params).compile_jit()?;
-    let runtime = ms_runtime::<N>(params);
-    solve_multiple_shooting_problem(
-        &compiled,
-        &runtime,
+    compile_and_solve_multiple_shooting(
+        || Ok(model_ms::<N>(params).compile_jit()?),
+        ms_runtime::<N>(params),
         params.solver_method,
         &params.solver,
         |trajectories, x_arcs, u_arcs| {
@@ -627,11 +625,9 @@ fn solve_multiple_shooting<const N: usize>(params: &Params) -> Result<SolveArtif
 fn solve_direct_collocation<const N: usize, const K: usize>(
     params: &Params,
 ) -> Result<SolveArtifact> {
-    let compiled = model_dc::<N, K>(params).compile_jit()?;
-    let runtime = dc_runtime::<N, K>(params);
-    solve_direct_collocation_problem(
-        &compiled,
-        &runtime,
+    compile_and_solve_direct_collocation(
+        || Ok(model_dc::<N, K>(params).compile_jit()?),
+        dc_runtime::<N, K>(params),
         params.solver_method,
         &params.solver,
         |trajectories, time_grid| artifact_from_dc_trajectories(params, trajectories, time_grid),
@@ -644,21 +640,16 @@ fn solve_multiple_shooting_with_progress<const N: usize, F>(
 where
     F: FnMut(SolveStreamEvent) + Send,
 {
-    let model = model_ms::<N>(params);
-    let mut lifecycle = SolveLifecycleReporter::new(emit, params.solver_method);
-    let (compiled, running_solver) = lifecycle.compile_with_progress(|on_symbolic_ready| {
-        let compiled = model.compile_jit_with_symbolic_callback(on_symbolic_ready)?;
-        let timing = compiled.backend_timing_metadata();
-        Ok((compiled, timing))
-    })?;
-    let runtime = ms_runtime::<N>(params);
-    solve_multiple_shooting_problem_with_progress(
-        &compiled,
-        &runtime,
+    compile_and_solve_multiple_shooting_with_progress(
+        |on_symbolic_ready| {
+            let compiled = model_ms::<N>(params).compile_jit_with_symbolic_callback(on_symbolic_ready)?;
+            let timing = compiled.backend_timing_metadata();
+            Ok((compiled, timing))
+        },
+        ms_runtime::<N>(params),
         params.solver_method,
         &params.solver,
-        lifecycle.into_emit(),
-        running_solver,
+        emit,
         |trajectories, x_arcs, u_arcs| {
             artifact_from_ms_trajectories(params, trajectories, x_arcs, u_arcs)
         },
@@ -671,21 +662,17 @@ fn solve_direct_collocation_with_progress<const N: usize, const K: usize, F>(
 where
     F: FnMut(SolveStreamEvent) + Send,
 {
-    let model = model_dc::<N, K>(params);
-    let mut lifecycle = SolveLifecycleReporter::new(emit, params.solver_method);
-    let (compiled, running_solver) = lifecycle.compile_with_progress(|on_symbolic_ready| {
-        let compiled = model.compile_jit_with_symbolic_callback(on_symbolic_ready)?;
-        let timing = compiled.backend_timing_metadata();
-        Ok((compiled, timing))
-    })?;
-    let runtime = dc_runtime::<N, K>(params);
-    solve_direct_collocation_problem_with_progress(
-        &compiled,
-        &runtime,
+    compile_and_solve_direct_collocation_with_progress(
+        |on_symbolic_ready| {
+            let compiled =
+                model_dc::<N, K>(params).compile_jit_with_symbolic_callback(on_symbolic_ready)?;
+            let timing = compiled.backend_timing_metadata();
+            Ok((compiled, timing))
+        },
+        dc_runtime::<N, K>(params),
         params.solver_method,
         &params.solver,
-        lifecycle.into_emit(),
-        running_solver,
+        emit,
         |trajectories, time_grid| artifact_from_dc_trajectories(params, trajectories, time_grid),
     )
 }
