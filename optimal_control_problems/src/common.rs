@@ -298,6 +298,27 @@ pub struct SolveArtifact {
     pub notes: Vec<String>,
 }
 
+impl SolveArtifact {
+    pub fn new(
+        title: impl Into<String>,
+        summary: Vec<Metric>,
+        solver: SolverReport,
+        charts: Vec<Chart>,
+        scene: Scene2D,
+        notes: Vec<String>,
+    ) -> Self {
+        Self {
+            title: title.into(),
+            summary,
+            solver,
+            constraint_panels: ConstraintPanels::default(),
+            charts,
+            scene,
+            notes,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConstraintPanelSeverity {
@@ -380,11 +401,27 @@ pub struct SolveProgress {
     pub line_search_iterations: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SolveStage {
+    SymbolicSetup,
+    JitCompilation,
+    Solving,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SolveStatus {
+    pub stage: SolveStage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub solver_method: Option<SolverMethod>,
+    pub solver: SolverReport,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SolveStreamEvent {
     Status {
-        message: String,
+        status: SolveStatus,
     },
     Log {
         line: String,
@@ -402,15 +439,33 @@ pub enum SolveStreamEvent {
     },
 }
 
-pub const SYMBOLIC_SETUP_STATUS: &str = "Setting up symbolic model...";
+pub fn emit_solve_status<F>(
+    emit: &mut F,
+    stage: SolveStage,
+    solver_method: Option<SolverMethod>,
+    solver: SolverReport,
+) where
+    F: FnMut(SolveStreamEvent),
+{
+    emit(SolveStreamEvent::Status {
+        status: SolveStatus {
+            stage,
+            solver_method,
+            solver,
+        },
+    });
+}
 
 pub fn emit_symbolic_setup_status<F>(emit: &mut F)
 where
     F: FnMut(SolveStreamEvent),
 {
-    emit(SolveStreamEvent::Status {
-        message: SYMBOLIC_SETUP_STATUS.to_string(),
-    });
+    emit_solve_status(
+        emit,
+        SolveStage::SymbolicSetup,
+        None,
+        SolverReport::in_progress("Setting up symbolic model..."),
+    );
 }
 
 #[derive(Debug)]
@@ -507,7 +562,8 @@ pub struct SqpConfig {
     pub complementarity_tol: f64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SolverMethod {
     Sqp,
     Nlip,
@@ -550,6 +606,36 @@ impl SolverReport {
             jit_s: None,
             solve_s: None,
         }
+    }
+
+    pub fn in_progress(status_label: impl Into<String>) -> Self {
+        Self {
+            completed: false,
+            status_label: status_label.into(),
+            status_kind: SolverStatusKind::Info,
+            iterations: None,
+            symbolic_setup_s: None,
+            jit_s: None,
+            solve_s: None,
+        }
+    }
+
+    pub fn with_backend_timing(mut self, timing: BackendTimingMetadata) -> Self {
+        self.symbolic_setup_s = symbolic_setup_seconds(timing);
+        self.jit_s = duration_seconds(timing.jit_time);
+        self
+    }
+
+    pub fn with_iterations(mut self, iterations: usize) -> Self {
+        self.iterations = Some(iterations);
+        self
+    }
+
+    pub fn with_solve_seconds(mut self, solve_s: f64) -> Self {
+        if solve_s.is_finite() && solve_s >= 0.0 {
+            self.solve_s = Some(solve_s);
+        }
+        self
     }
 }
 
@@ -620,26 +706,66 @@ pub fn default_solver_method() -> SolverMethod {
     SolverMethod::Sqp
 }
 
+pub fn solver_running_label(method: SolverMethod) -> &'static str {
+    match method {
+        SolverMethod::Sqp => "Running SQP...",
+        SolverMethod::Nlip => "Running NLIP solver...",
+        #[cfg(feature = "ipopt")]
+        SolverMethod::Ipopt => "Running IPOPT...",
+    }
+}
+
+pub(crate) struct SolveLifecycleReporter<Emit> {
+    emit: Emit,
+    solver_method: SolverMethod,
+}
+
+impl<Emit> SolveLifecycleReporter<Emit>
+where
+    Emit: FnMut(SolveStreamEvent),
+{
+    pub fn new(emit: Emit, solver_method: SolverMethod) -> Self {
+        Self {
+            emit,
+            solver_method,
+        }
+    }
+
+    pub fn compile_with_progress<Compiled, Compile>(
+        &mut self,
+        compile: Compile,
+    ) -> Result<(Compiled, SolverReport)>
+    where
+        Compile: FnOnce(
+            &mut dyn FnMut(BackendTimingMetadata),
+        ) -> Result<(Compiled, BackendTimingMetadata)>,
+    {
+        emit_symbolic_setup_status(&mut self.emit);
+        let mut on_symbolic_ready = |timing: BackendTimingMetadata| {
+            emit_solve_status(
+                &mut self.emit,
+                SolveStage::JitCompilation,
+                None,
+                SolverReport::in_progress("Compiling JIT...").with_backend_timing(timing),
+            );
+        };
+        let (compiled, timing) = compile(&mut on_symbolic_ready)?;
+        let running_solver = SolverReport::in_progress(solver_running_label(self.solver_method))
+            .with_backend_timing(timing);
+        Ok((compiled, running_solver))
+    }
+
+    pub fn into_emit(self) -> Emit {
+        self.emit
+    }
+}
+
 pub fn transcription_controls(
     default: TranscriptionConfig,
     supported_intervals: &[usize],
     supported_degrees: &[usize],
 ) -> Vec<ControlSpec> {
     vec![
-        select_control(
-            SharedControlId::TranscriptionMethod.id(),
-            "Transcription",
-            match default.method {
-                TranscriptionMethod::MultipleShooting => 0.0,
-                TranscriptionMethod::DirectCollocation => 1.0,
-            },
-            "",
-            "Switch between RK4 multiple shooting and direct collocation.",
-            &[(0.0, "Multiple Shooting"), (1.0, "Direct Collocation")],
-            ControlSection::Transcription,
-            ControlVisibility::Always,
-            ControlSemantic::TranscriptionMethod,
-        ),
         select_control(
             SharedControlId::TranscriptionIntervals.id(),
             "Intervals",
@@ -653,6 +779,20 @@ pub fn transcription_controls(
             ControlSection::Transcription,
             ControlVisibility::Always,
             ControlSemantic::TranscriptionIntervals,
+        ),
+        select_control(
+            SharedControlId::TranscriptionMethod.id(),
+            "Transcription",
+            match default.method {
+                TranscriptionMethod::MultipleShooting => 0.0,
+                TranscriptionMethod::DirectCollocation => 1.0,
+            },
+            "",
+            "Switch between RK4 multiple shooting and direct collocation.",
+            &[(0.0, "Multiple Shooting"), (1.0, "Direct Collocation")],
+            ControlSection::Transcription,
+            ControlVisibility::Always,
+            ControlSemantic::TranscriptionMethod,
         ),
         select_control(
             SharedControlId::CollocationFamily.id(),
@@ -1108,6 +1248,114 @@ pub fn text_control(
         semantic,
         value_display,
         choices: Vec::new(),
+    }
+}
+
+pub fn problem_slider_control(
+    id: impl Into<String>,
+    label: impl Into<String>,
+    min: f64,
+    max: f64,
+    step: f64,
+    default: f64,
+    unit: impl Into<String>,
+    help: impl Into<String>,
+) -> ControlSpec {
+    problem_slider_control_with_display(
+        id,
+        label,
+        min,
+        max,
+        step,
+        default,
+        unit,
+        help,
+        ControlValueDisplay::Scalar,
+    )
+}
+
+pub fn problem_scientific_slider_control(
+    id: impl Into<String>,
+    label: impl Into<String>,
+    min: f64,
+    max: f64,
+    step: f64,
+    default: f64,
+    unit: impl Into<String>,
+    help: impl Into<String>,
+) -> ControlSpec {
+    problem_slider_control_with_display(
+        id,
+        label,
+        min,
+        max,
+        step,
+        default,
+        unit,
+        help,
+        ControlValueDisplay::Scientific,
+    )
+}
+
+fn problem_slider_control_with_display(
+    id: impl Into<String>,
+    label: impl Into<String>,
+    min: f64,
+    max: f64,
+    step: f64,
+    default: f64,
+    unit: impl Into<String>,
+    help: impl Into<String>,
+    value_display: ControlValueDisplay,
+) -> ControlSpec {
+    ControlSpec {
+        id: id.into(),
+        label: label.into(),
+        min,
+        max,
+        step,
+        default,
+        unit: unit.into(),
+        help: help.into(),
+        section: ControlSection::Problem,
+        editor: ControlEditor::Slider,
+        visibility: ControlVisibility::Always,
+        semantic: ControlSemantic::ProblemParameter,
+        value_display,
+        choices: Vec::new(),
+    }
+}
+
+pub fn problem_controls(
+    transcription: TranscriptionConfig,
+    supported_intervals: &[usize],
+    supported_degrees: &[usize],
+    solver_method: SolverMethod,
+    solver: SqpConfig,
+    extra_controls: impl IntoIterator<Item = ControlSpec>,
+) -> Vec<ControlSpec> {
+    let mut controls =
+        transcription_controls(transcription, supported_intervals, supported_degrees);
+    controls.extend(solver_controls(solver_method, solver));
+    controls.extend(extra_controls);
+    controls
+}
+
+pub fn problem_spec(
+    id: ProblemId,
+    name: impl Into<String>,
+    description: impl Into<String>,
+    controls: Vec<ControlSpec>,
+    math_sections: Vec<LatexSection>,
+    notes: Vec<String>,
+) -> ProblemSpec {
+    ProblemSpec {
+        id,
+        name: name.into(),
+        description: description.into(),
+        controls,
+        math_sections,
+        notes,
     }
 }
 
@@ -2228,6 +2476,7 @@ pub fn solve_multiple_shooting_problem_with_progress<Compiled, Emit, Build, cons
     solver_method: SolverMethod,
     solver_config: &SqpConfig,
     emit: Emit,
+    running_solver: SolverReport,
     build_artifact: Build,
 ) -> Result<SolveArtifact>
 where
@@ -2247,10 +2496,16 @@ where
             emit_event(
                 &emit,
                 SolveStreamEvent::Status {
-                    message: "Running SQP...".to_string(),
+                    status: SolveStatus {
+                        stage: SolveStage::Solving,
+                        solver_method: Some(solver_method),
+                        solver: running_solver.clone().with_solve_seconds(0.0),
+                    },
                 },
             );
             let emit_for_worker = emit.clone();
+            let solve_started = started;
+            let running_solver = running_solver.clone();
             let solved = with_latest_only_worker(
                 move |event| {
                     emit_event(&emit_for_worker, event);
@@ -2270,6 +2525,11 @@ where
                                 let mut artifact =
                                     (*builder)(&snapshot.trajectories, &x_arcs, &u_arcs);
                                 drop(builder);
+                                let progress = sqp_progress(&snapshot.solver);
+                                artifact.solver = running_solver
+                                    .clone()
+                                    .with_iterations(progress.iteration)
+                                    .with_solve_seconds(solve_started.elapsed().as_secs_f64());
                                 if let Err(error) = try_attach_multiple_shooting_constraint_panels(
                                     &mut artifact,
                                     compiled,
@@ -2284,10 +2544,7 @@ where
                                         level: SolveLogLevel::Warning,
                                     });
                                 }
-                                submit.submit(SolveStreamEvent::Iteration {
-                                    progress: sqp_progress(&snapshot.solver),
-                                    artifact,
-                                });
+                                submit.submit(SolveStreamEvent::Iteration { progress, artifact });
                             }
                             Err(error) => submit.submit(SolveStreamEvent::Log {
                                 line: format!("[iteration visualization failed: {error}]"),
@@ -2325,10 +2582,16 @@ where
             emit_event(
                 &emit,
                 SolveStreamEvent::Status {
-                    message: "Running NLIP solver...".to_string(),
+                    status: SolveStatus {
+                        stage: SolveStage::Solving,
+                        solver_method: Some(solver_method),
+                        solver: running_solver.clone().with_solve_seconds(0.0),
+                    },
                 },
             );
             let emit_for_worker = emit.clone();
+            let solve_started = started;
+            let running_solver = running_solver.clone();
             let solved = with_latest_only_worker(
                 move |event| {
                     emit_event(&emit_for_worker, event);
@@ -2348,6 +2611,11 @@ where
                                 let mut artifact =
                                     (*builder)(&snapshot.trajectories, &x_arcs, &u_arcs);
                                 drop(builder);
+                                let progress = nlip_progress(&snapshot.solver);
+                                artifact.solver = running_solver
+                                    .clone()
+                                    .with_iterations(progress.iteration)
+                                    .with_solve_seconds(solve_started.elapsed().as_secs_f64());
                                 if let Err(error) = try_attach_multiple_shooting_constraint_panels(
                                     &mut artifact,
                                     compiled,
@@ -2362,10 +2630,7 @@ where
                                         level: SolveLogLevel::Warning,
                                     });
                                 }
-                                submit.submit(SolveStreamEvent::Iteration {
-                                    progress: nlip_progress(&snapshot.solver),
-                                    artifact,
-                                });
+                                submit.submit(SolveStreamEvent::Iteration { progress, artifact });
                             }
                             Err(error) => submit.submit(SolveStreamEvent::Log {
                                 line: format!("[iteration visualization failed: {error}]"),
@@ -2404,10 +2669,16 @@ where
             emit_event(
                 &emit,
                 SolveStreamEvent::Status {
-                    message: "Running IPOPT...".to_string(),
+                    status: SolveStatus {
+                        stage: SolveStage::Solving,
+                        solver_method: Some(solver_method),
+                        solver: running_solver.clone().with_solve_seconds(0.0),
+                    },
                 },
             );
             let emit_for_worker = emit.clone();
+            let solve_started = started;
+            let running_solver = running_solver.clone();
             let solved = with_latest_only_worker(
                 move |event| {
                     emit_event(&emit_for_worker, event);
@@ -2427,6 +2698,11 @@ where
                                 let mut artifact =
                                     (*builder)(&snapshot.trajectories, &x_arcs, &u_arcs);
                                 drop(builder);
+                                let progress = ipopt_progress(&snapshot.solver);
+                                artifact.solver = running_solver
+                                    .clone()
+                                    .with_iterations(progress.iteration)
+                                    .with_solve_seconds(solve_started.elapsed().as_secs_f64());
                                 if let Err(error) = try_attach_multiple_shooting_constraint_panels(
                                     &mut artifact,
                                     compiled,
@@ -2441,10 +2717,7 @@ where
                                         level: SolveLogLevel::Warning,
                                     });
                                 }
-                                submit.submit(SolveStreamEvent::Iteration {
-                                    progress: ipopt_progress(&snapshot.solver),
-                                    artifact,
-                                });
+                                submit.submit(SolveStreamEvent::Iteration { progress, artifact });
                             }
                             Err(error) => submit.submit(SolveStreamEvent::Log {
                                 line: format!("[iteration visualization failed: {error}]"),
@@ -2573,6 +2846,7 @@ pub fn solve_direct_collocation_problem_with_progress<
     solver_method: SolverMethod,
     solver_config: &SqpConfig,
     emit: Emit,
+    running_solver: SolverReport,
     build_artifact: Build,
 ) -> Result<SolveArtifact>
 where
@@ -2591,10 +2865,16 @@ where
             emit_event(
                 &emit,
                 SolveStreamEvent::Status {
-                    message: "Running SQP...".to_string(),
+                    status: SolveStatus {
+                        stage: SolveStage::Solving,
+                        solver_method: Some(solver_method),
+                        solver: running_solver.clone().with_solve_seconds(0.0),
+                    },
                 },
             );
             let emit_for_worker = emit.clone();
+            let solve_started = started;
+            let running_solver = running_solver.clone();
             let solved = with_latest_only_worker(
                 move |event| {
                     emit_event(&emit_for_worker, event);
@@ -2611,6 +2891,11 @@ where
                                     .expect("artifact builder poisoned");
                                 (*builder)(&snapshot.trajectories, &snapshot.time_grid)
                             };
+                            let progress = sqp_progress(&snapshot.solver);
+                            artifact.solver = running_solver
+                                .clone()
+                                .with_iterations(progress.iteration)
+                                .with_solve_seconds(solve_started.elapsed().as_secs_f64());
                             if let Err(error) = try_attach_direct_collocation_constraint_panels(
                                 &mut artifact,
                                 compiled,
@@ -2623,10 +2908,7 @@ where
                                     level: SolveLogLevel::Warning,
                                 });
                             }
-                            submit.submit(SolveStreamEvent::Iteration {
-                                progress: sqp_progress(&snapshot.solver),
-                                artifact,
-                            });
+                            submit.submit(SolveStreamEvent::Iteration { progress, artifact });
                         },
                     )
                 },
@@ -2657,10 +2939,16 @@ where
             emit_event(
                 &emit,
                 SolveStreamEvent::Status {
-                    message: "Running NLIP solver...".to_string(),
+                    status: SolveStatus {
+                        stage: SolveStage::Solving,
+                        solver_method: Some(solver_method),
+                        solver: running_solver.clone().with_solve_seconds(0.0),
+                    },
                 },
             );
             let emit_for_worker = emit.clone();
+            let solve_started = started;
+            let running_solver = running_solver.clone();
             let solved = with_latest_only_worker(
                 move |event| {
                     emit_event(&emit_for_worker, event);
@@ -2677,6 +2965,11 @@ where
                                     .expect("artifact builder poisoned");
                                 (*builder)(&snapshot.trajectories, &snapshot.time_grid)
                             };
+                            let progress = nlip_progress(&snapshot.solver);
+                            artifact.solver = running_solver
+                                .clone()
+                                .with_iterations(progress.iteration)
+                                .with_solve_seconds(solve_started.elapsed().as_secs_f64());
                             if let Err(error) = try_attach_direct_collocation_constraint_panels(
                                 &mut artifact,
                                 compiled,
@@ -2689,10 +2982,7 @@ where
                                     level: SolveLogLevel::Warning,
                                 });
                             }
-                            submit.submit(SolveStreamEvent::Iteration {
-                                progress: nlip_progress(&snapshot.solver),
-                                artifact,
-                            });
+                            submit.submit(SolveStreamEvent::Iteration { progress, artifact });
                         },
                     )
                 },
@@ -2724,10 +3014,16 @@ where
             emit_event(
                 &emit,
                 SolveStreamEvent::Status {
-                    message: "Running IPOPT...".to_string(),
+                    status: SolveStatus {
+                        stage: SolveStage::Solving,
+                        solver_method: Some(solver_method),
+                        solver: running_solver.clone().with_solve_seconds(0.0),
+                    },
                 },
             );
             let emit_for_worker = emit.clone();
+            let solve_started = started;
+            let running_solver = running_solver.clone();
             let solved = with_latest_only_worker(
                 move |event| {
                     emit_event(&emit_for_worker, event);
@@ -2744,6 +3040,11 @@ where
                                     .expect("artifact builder poisoned");
                                 (*builder)(&snapshot.trajectories, &snapshot.time_grid)
                             };
+                            let progress = ipopt_progress(&snapshot.solver);
+                            artifact.solver = running_solver
+                                .clone()
+                                .with_iterations(progress.iteration)
+                                .with_solve_seconds(solve_started.elapsed().as_secs_f64());
                             if let Err(error) = try_attach_direct_collocation_constraint_panels(
                                 &mut artifact,
                                 compiled,
@@ -2756,10 +3057,7 @@ where
                                     level: SolveLogLevel::Warning,
                                 });
                             }
-                            submit.submit(SolveStreamEvent::Iteration {
-                                progress: ipopt_progress(&snapshot.solver),
-                                artifact,
-                            });
+                            submit.submit(SolveStreamEvent::Iteration { progress, artifact });
                         },
                     )
                 },
@@ -3017,4 +3315,145 @@ pub trait FromMap: Sized {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SolveRequest {
     pub values: BTreeMap<String, f64>,
+}
+
+#[cfg(test)]
+pub(crate) fn assert_shared_progress_lifecycle(events: &[SolveStreamEvent]) {
+    let status_count = events
+        .iter()
+        .filter(|event| matches!(event, SolveStreamEvent::Status { .. }))
+        .count();
+    let saw_jit_status = events.iter().any(|event| {
+        matches!(
+            event,
+            SolveStreamEvent::Status { status }
+                if status.stage == SolveStage::JitCompilation
+        )
+    });
+    let saw_solving_timing = events.iter().any(|event| {
+        matches!(
+            event,
+            SolveStreamEvent::Status { status }
+                if status.stage == SolveStage::Solving
+                    && status.solver.symbolic_setup_s.is_some()
+                    && status.solver.jit_s.is_some()
+        )
+    });
+    assert!(
+        status_count >= 3,
+        "expected symbolic, jit, and solve status updates"
+    );
+    assert!(
+        saw_jit_status,
+        "expected an explicit jit-compilation status"
+    );
+    assert!(
+        saw_solving_timing,
+        "expected solving status to include setup and jit timings"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_close(actual: Option<f64>, expected: f64) {
+        let value = actual.expect("expected timing value");
+        assert!(
+            (value - expected).abs() < 1.0e-12,
+            "expected {expected}, got {value}"
+        );
+    }
+
+    #[test]
+    fn solve_lifecycle_reporter_emits_shared_compile_status_updates() {
+        let symbolic_timing = BackendTimingMetadata {
+            function_creation_time: Some(Duration::from_millis(250)),
+            derivative_generation_time: Some(Duration::from_millis(500)),
+            jit_time: None,
+        };
+        let compiled_timing = BackendTimingMetadata {
+            jit_time: Some(Duration::from_secs(2)),
+            ..symbolic_timing
+        };
+        let mut events = Vec::new();
+        let (compiled, running_solver) = {
+            let mut reporter =
+                SolveLifecycleReporter::new(|event| events.push(event), SolverMethod::Sqp);
+            let result = reporter
+                .compile_with_progress(|on_symbolic_ready| {
+                    on_symbolic_ready(symbolic_timing);
+                    Ok::<_, anyhow::Error>(("compiled", compiled_timing))
+                })
+                .expect("compile should succeed");
+            let _ = reporter.into_emit();
+            result
+        };
+
+        assert_eq!(compiled, "compiled");
+        assert_eq!(events.len(), 2, "expected symbolic and timed jit statuses");
+
+        match &events[0] {
+            SolveStreamEvent::Status { status } => {
+                assert_eq!(status.stage, SolveStage::SymbolicSetup);
+                assert_eq!(status.solver.status_label, "Setting up symbolic model...");
+                assert!(status.solver.symbolic_setup_s.is_none());
+                assert!(status.solver.jit_s.is_none());
+            }
+            event => panic!("expected initial symbolic status, got {event:?}"),
+        }
+
+        match &events[1] {
+            SolveStreamEvent::Status { status } => {
+                assert_eq!(status.stage, SolveStage::JitCompilation);
+                assert_eq!(status.solver.status_label, "Compiling JIT...");
+                assert_close(status.solver.symbolic_setup_s, 0.75);
+                assert!(status.solver.jit_s.is_none());
+            }
+            event => panic!("expected timed jit status, got {event:?}"),
+        }
+
+        assert_eq!(running_solver.status_label, "Running SQP...");
+        assert_close(running_solver.symbolic_setup_s, 0.75);
+        assert_close(running_solver.jit_s, 2.0);
+        assert!(running_solver.solve_s.is_none());
+        assert!(running_solver.iterations.is_none());
+    }
+
+    #[test]
+    fn shared_progress_lifecycle_helper_accepts_timed_solving_status() {
+        let symbolic_timing = BackendTimingMetadata {
+            function_creation_time: Some(Duration::from_millis(250)),
+            derivative_generation_time: Some(Duration::from_millis(500)),
+            jit_time: Some(Duration::from_secs(2)),
+        };
+        let events = vec![
+            SolveStreamEvent::Status {
+                status: SolveStatus {
+                    stage: SolveStage::SymbolicSetup,
+                    solver_method: None,
+                    solver: SolverReport::in_progress("Setting up symbolic model..."),
+                },
+            },
+            SolveStreamEvent::Status {
+                status: SolveStatus {
+                    stage: SolveStage::JitCompilation,
+                    solver_method: None,
+                    solver: SolverReport::in_progress("Compiling JIT...")
+                        .with_backend_timing(symbolic_timing),
+                },
+            },
+            SolveStreamEvent::Status {
+                status: SolveStatus {
+                    stage: SolveStage::Solving,
+                    solver_method: Some(SolverMethod::Sqp),
+                    solver: SolverReport::in_progress("Running SQP...")
+                        .with_backend_timing(symbolic_timing)
+                        .with_solve_seconds(0.0),
+                },
+            },
+        ];
+
+        assert_shared_progress_lifecycle(&events);
+    }
 }

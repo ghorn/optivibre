@@ -1,14 +1,15 @@
 use crate::common::{
-    ControlSpec, FromMap, LatexSection, MetricKey, PlotMode, ProblemId, ProblemSpec, Scene2D,
-    SceneAnimation, SceneFrame, ScenePath, SolveArtifact, SolveStreamEvent, SolverMethod,
+    FromMap, LatexSection, MetricKey, PlotMode, ProblemId, ProblemSpec, Scene2D, SceneAnimation,
+    SceneFrame, ScenePath, SolveArtifact, SolveLifecycleReporter, SolveStreamEvent, SolverMethod,
     SolverReport, SqpConfig, TranscriptionConfig, TranscriptionMethod, chart,
-    default_solver_method, default_sqp_config, default_transcription, deg_to_rad,
-    emit_symbolic_setup_status, expect_finite, interval_arc_bound_series, interval_arc_series,
-    metric_with_key, node_times, numeric_metric_with_key, rad_to_deg, sample_or_default,
-    segmented_bound_series, segmented_series, solve_direct_collocation_problem,
+    default_solver_method, default_sqp_config, default_transcription, deg_to_rad, expect_finite,
+    interval_arc_bound_series, interval_arc_series, metric_with_key, node_times,
+    numeric_metric_with_key, problem_controls, problem_scientific_slider_control,
+    problem_slider_control, problem_spec, rad_to_deg, sample_or_default, segmented_bound_series,
+    segmented_series, solve_direct_collocation_problem,
     solve_direct_collocation_problem_with_progress, solve_multiple_shooting_problem,
-    solve_multiple_shooting_problem_with_progress, solver_config_from_map, solver_controls,
-    solver_method_from_map, transcription_controls, transcription_from_map, transcription_metrics,
+    solve_multiple_shooting_problem_with_progress, solver_config_from_map, solver_method_from_map,
+    transcription_from_map, transcription_metrics,
 };
 use anyhow::Result;
 use optimal_control::{
@@ -140,107 +141,91 @@ impl FromMap for Params {
     }
 }
 pub fn spec() -> ProblemSpec {
-    let mut controls = transcription_controls(
-        Params::default().transcription,
-        &SUPPORTED_INTERVALS,
-        &SUPPORTED_DEGREES,
-    );
-    controls.extend(solver_controls(
-        Params::default().solver_method,
-        Params::default().solver,
-    ));
-    controls.extend(vec![
-        ControlSpec {
-            id: "target_x_m".to_string(),
-            label: "Target X".to_string(),
-            min: 4.0,
-            max: 16.0,
-            step: 0.25,
-            default: Params::default().target_x_m,
-            unit: "m".to_string(),
-            help: "Trolley travel distance.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "tf_s".to_string(),
-            label: "Transfer Time".to_string(),
-            min: 3.0,
-            max: 10.0,
-            step: 0.25,
-            default: Params::default().tf_s,
-            unit: "s".to_string(),
-            help: "Fixed time allocated for the move.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "rope_length_m".to_string(),
-            label: "Rope Length".to_string(),
-            min: 1.0,
-            max: 6.0,
-            step: 0.1,
-            default: Params::default().rope_length_m,
-            unit: "m".to_string(),
-            help: "Distance from trolley hook to the payload.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "force_limit_n".to_string(),
-            label: "Force Limit".to_string(),
-            min: 5.0,
-            max: 80.0,
-            step: 1.0,
-            default: Params::default().force_limit_n,
-            unit: "N".to_string(),
-            help: "Absolute bound on commanded cart force.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "force_rate_limit_nps".to_string(),
-            label: "Force-Rate Limit".to_string(),
-            min: 5.0,
-            max: 200.0,
-            step: 1.0,
-            default: Params::default().force_rate_limit_nps,
-            unit: "N/s".to_string(),
-            help: "Absolute bound on the rate of change of cart force.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "force_rate_regularization".to_string(),
-            label: "Force-Rate Weight".to_string(),
-            min: 0.0,
-            max: 5.0e-3,
-            step: 5.0e-5,
-            default: Params::default().force_rate_regularization,
-            unit: "".to_string(),
-            help: "Quadratic stage-cost weight on force-rate effort.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "swing_limit_deg".to_string(),
-            label: "Swing Limit".to_string(),
-            min: 3.0,
-            max: 25.0,
-            step: 0.5,
-            default: Params::default().swing_limit_deg,
-            unit: "deg".to_string(),
-            help: "Maximum payload swing angle.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-    ]);
-    ProblemSpec {
-        id: ProblemId::CraneTransfer,
-        name: "Crane Load Transfer".to_string(),
-        description: "A trolley drives a suspended load with a bounded cart force and bounded force-rate while respecting the fully coupled cart-pole dynamics.".to_string(),
-        controls,
-        math_sections: vec![
+    let defaults = Params::default();
+    problem_spec(
+        ProblemId::CraneTransfer,
+        "Crane Load Transfer",
+        "A trolley drives a suspended load with a bounded cart force and bounded force-rate while respecting the fully coupled cart-pole dynamics.",
+        problem_controls(
+            defaults.transcription,
+            &SUPPORTED_INTERVALS,
+            &SUPPORTED_DEGREES,
+            defaults.solver_method,
+            defaults.solver,
+            vec![
+                problem_slider_control(
+                    "target_x_m",
+                    "Target X",
+                    4.0,
+                    16.0,
+                    0.25,
+                    defaults.target_x_m,
+                    "m",
+                    "Trolley travel distance.",
+                ),
+                problem_slider_control(
+                    "tf_s",
+                    "Transfer Time",
+                    3.0,
+                    10.0,
+                    0.25,
+                    defaults.tf_s,
+                    "s",
+                    "Fixed time allocated for the move.",
+                ),
+                problem_slider_control(
+                    "rope_length_m",
+                    "Rope Length",
+                    1.0,
+                    6.0,
+                    0.1,
+                    defaults.rope_length_m,
+                    "m",
+                    "Distance from trolley hook to the payload.",
+                ),
+                problem_slider_control(
+                    "force_limit_n",
+                    "Force Limit",
+                    5.0,
+                    80.0,
+                    1.0,
+                    defaults.force_limit_n,
+                    "N",
+                    "Absolute bound on commanded cart force.",
+                ),
+                problem_slider_control(
+                    "force_rate_limit_nps",
+                    "Force-Rate Limit",
+                    5.0,
+                    200.0,
+                    1.0,
+                    defaults.force_rate_limit_nps,
+                    "N/s",
+                    "Absolute bound on the rate of change of cart force.",
+                ),
+                problem_scientific_slider_control(
+                    "force_rate_regularization",
+                    "Force-Rate Weight",
+                    0.0,
+                    5.0e-3,
+                    5.0e-5,
+                    defaults.force_rate_regularization,
+                    "",
+                    "Quadratic stage-cost weight on force-rate effort.",
+                ),
+                problem_slider_control(
+                    "swing_limit_deg",
+                    "Swing Limit",
+                    3.0,
+                    25.0,
+                    0.5,
+                    defaults.swing_limit_deg,
+                    "deg",
+                    "Maximum payload swing angle.",
+                ),
+            ],
+        ),
+        vec![
             LatexSection {
                 title: "Physical State".to_string(),
                 entries: vec![r"\mathbf{x} = \begin{bmatrix} x & v & \theta & \omega \end{bmatrix}^{\mathsf T}".to_string()],
@@ -269,14 +254,14 @@ pub fn spec() -> ProblemSpec {
                 ],
             },
         ],
-        notes: vec![
+        vec![
             format!(
                 "The cart-pole model uses M = {:.1} kg, m = {:.1} kg, cart friction b = {:.1} N·s/m, and pivot damping c = {:.1} N·m·s.",
                 CART_MASS_KG, LOAD_MASS_KG, CART_FRICTION_NSPM, PIVOT_FRICTION_NMS
             ),
             "This example supports both multiple shooting and direct collocation with the same coupled cart-pole dynamics.".to_string(),
         ],
-    }
+    )
 }
 fn model_ms<const N: usize>(
     params: &Params,
@@ -654,20 +639,26 @@ fn solve_direct_collocation<const N: usize, const K: usize>(
 }
 fn solve_multiple_shooting_with_progress<const N: usize, F>(
     params: &Params,
-    mut emit: F,
+    emit: F,
 ) -> Result<SolveArtifact>
 where
     F: FnMut(SolveStreamEvent) + Send,
 {
-    emit_symbolic_setup_status(&mut emit);
-    let compiled = model_ms::<N>(params).compile_jit()?;
+    let model = model_ms::<N>(params);
+    let mut lifecycle = SolveLifecycleReporter::new(emit, params.solver_method);
+    let (compiled, running_solver) = lifecycle.compile_with_progress(|on_symbolic_ready| {
+        let compiled = model.compile_jit_with_symbolic_callback(on_symbolic_ready)?;
+        let timing = compiled.backend_timing_metadata();
+        Ok((compiled, timing))
+    })?;
     let runtime = ms_runtime::<N>(params);
     solve_multiple_shooting_problem_with_progress(
         &compiled,
         &runtime,
         params.solver_method,
         &params.solver,
-        emit,
+        lifecycle.into_emit(),
+        running_solver,
         |trajectories, x_arcs, u_arcs| {
             artifact_from_ms_trajectories(params, trajectories, x_arcs, u_arcs)
         },
@@ -675,20 +666,26 @@ where
 }
 fn solve_direct_collocation_with_progress<const N: usize, const K: usize, F>(
     params: &Params,
-    mut emit: F,
+    emit: F,
 ) -> Result<SolveArtifact>
 where
     F: FnMut(SolveStreamEvent) + Send,
 {
-    emit_symbolic_setup_status(&mut emit);
-    let compiled = model_dc::<N, K>(params).compile_jit()?;
+    let model = model_dc::<N, K>(params);
+    let mut lifecycle = SolveLifecycleReporter::new(emit, params.solver_method);
+    let (compiled, running_solver) = lifecycle.compile_with_progress(|on_symbolic_ready| {
+        let compiled = model.compile_jit_with_symbolic_callback(on_symbolic_ready)?;
+        let timing = compiled.backend_timing_metadata();
+        Ok((compiled, timing))
+    })?;
     let runtime = dc_runtime::<N, K>(params);
     solve_direct_collocation_problem_with_progress(
         &compiled,
         &runtime,
         params.solver_method,
         &params.solver,
-        emit,
+        lifecycle.into_emit(),
+        running_solver,
         |trajectories, time_grid| artifact_from_dc_trajectories(params, trajectories, time_grid),
     )
 }
@@ -792,9 +789,9 @@ fn artifact_from_ms_trajectories<const N: usize>(
     let max_force_rate = force_rate
         .iter()
         .fold(0.0_f64, |acc, value| acc.max(value.abs()));
-    SolveArtifact {
-        title: "Crane Load Transfer".to_string(),
-        summary: artifact_summary(
+    SolveArtifact::new(
+        "Crane Load Transfer",
+        artifact_summary(
             params,
             terminal.x,
             max_swing,
@@ -802,9 +799,8 @@ fn artifact_from_ms_trajectories<const N: usize>(
             max_force_rate,
             trajectories.tf,
         ),
-        solver: SolverReport::placeholder(),
-        constraint_panels: Default::default(),
-        charts: vec![
+        SolverReport::placeholder(),
+        vec![
             chart(
                 "Trolley Position",
                 "x (m)",
@@ -901,7 +897,7 @@ fn artifact_from_ms_trajectories<const N: usize>(
                 },
             ),
         ],
-        scene: Scene2D {
+        Scene2D {
             title: "Crane Geometry".to_string(),
             x_label: "x (m)".to_string(),
             y_label: "height (m)".to_string(),
@@ -924,11 +920,11 @@ fn artifact_from_ms_trajectories<const N: usize>(
                 frames,
             }),
         },
-        notes: vec![
+        vec![
             "Cart force is the control-state and force rate is the true decision variable.".to_string(),
             "The multiple-shooting charts show RK4 interval arcs reconstructed from each mesh node with the same substepping used by the transcription.".to_string(),
         ],
-    }
+    )
 }
 fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
     params: &Params,
@@ -987,9 +983,9 @@ fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
                 max_force_rate.max(trajectories.root_dudt.intervals[interval][root].force.abs());
         }
     }
-    SolveArtifact {
-        title: "Crane Load Transfer".to_string(),
-        summary: artifact_summary(
+    SolveArtifact::new(
+        "Crane Load Transfer",
+        artifact_summary(
             params,
             terminal.x,
             max_swing,
@@ -997,9 +993,8 @@ fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
             max_force_rate,
             trajectories.tf,
         ),
-        solver: SolverReport::placeholder(),
-        constraint_panels: Default::default(),
-        charts: vec![
+        SolverReport::placeholder(),
+        vec![
             chart(
                 "Trolley Position",
                 "x (m)",
@@ -1090,7 +1085,7 @@ fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
                 },
             ),
         ],
-        scene: Scene2D {
+        Scene2D {
             title: "Crane Geometry".to_string(),
             x_label: "x (m)".to_string(),
             y_label: "height (m)".to_string(),
@@ -1113,11 +1108,11 @@ fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
                 frames,
             }),
         },
-        notes: vec![
+        vec![
             "Cart force is the control-state and force rate is the true decision variable.".to_string(),
             "The collocation charts are interval-local: state-like quantities include the extrapolated interval endpoint, while force rate is only shown at collocation nodes.".to_string(),
         ],
-    }
+    )
 }
 #[cfg(test)]
 mod tests {

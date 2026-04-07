@@ -1,14 +1,14 @@
 use crate::common::{
-    ControlSpec, FromMap, LatexSection, MetricKey, PlotMode, ProblemId, ProblemSpec, Scene2D,
-    SceneAnimation, SceneArrow, SceneFrame, ScenePath, SolveArtifact, SolveStreamEvent,
+    FromMap, LatexSection, MetricKey, PlotMode, ProblemId, ProblemSpec, Scene2D, SceneAnimation,
+    SceneArrow, SceneFrame, ScenePath, SolveArtifact, SolveLifecycleReporter, SolveStreamEvent,
     SolverMethod, SolverReport, SqpConfig, TimeSeries, TranscriptionConfig, TranscriptionMethod,
     chart, default_solver_method, default_sqp_config, default_transcription, deg_to_rad,
-    emit_symbolic_setup_status, expect_finite, interval_arc_bound_series, interval_arc_series,
-    metric_with_key, node_times, numeric_metric_with_key, rad_to_deg, sample_or_default,
-    segmented_series, solve_direct_collocation_problem,
-    solve_direct_collocation_problem_with_progress, solve_multiple_shooting_problem,
-    solve_multiple_shooting_problem_with_progress, solver_config_from_map, solver_controls,
-    solver_method_from_map, transcription_controls, transcription_from_map, transcription_metrics,
+    expect_finite, interval_arc_bound_series, interval_arc_series, metric_with_key, node_times,
+    numeric_metric_with_key, problem_controls, problem_scientific_slider_control,
+    problem_slider_control, problem_spec, rad_to_deg, sample_or_default, segmented_series,
+    solve_direct_collocation_problem, solve_direct_collocation_problem_with_progress,
+    solve_multiple_shooting_problem, solve_multiple_shooting_problem_with_progress,
+    solver_config_from_map, solver_method_from_map, transcription_from_map, transcription_metrics,
 };
 use anyhow::Result;
 use optimal_control::{
@@ -190,167 +190,141 @@ impl FromMap for Params {
 }
 
 pub fn spec() -> ProblemSpec {
-    let mut controls = transcription_controls(
-        Params::default().transcription,
-        &SUPPORTED_INTERVALS,
-        &SUPPORTED_DEGREES,
-    );
-    controls.extend(solver_controls(
-        Params::default().solver_method,
-        Params::default().solver,
-    ));
-    controls.extend(vec![
-        ControlSpec {
-            id: "wind_speed_mps".to_string(),
-            label: "True Wind Speed".to_string(),
-            min: 2.0,
-            max: 12.0,
-            step: 0.25,
-            default: Params::default().wind_speed_mps,
-            unit: "m/s".to_string(),
-            help: "True wind points in the negative x direction.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "initial_time_guess_s".to_string(),
-            label: "Initial Time Guess".to_string(),
-            min: 2.0,
-            max: 40.0,
-            step: 0.5,
-            default: Params::default().initial_time_guess_s,
-            unit: "s".to_string(),
-            help: "Initial guess for the free final time.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "min_final_time_s".to_string(),
-            label: "Min Final Time".to_string(),
-            min: 0.5,
-            max: 20.0,
-            step: 0.5,
-            default: Params::default().min_final_time_s,
-            unit: "s".to_string(),
-            help: "Lower bound on the free final time.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "max_final_time_s".to_string(),
-            label: "Max Final Time".to_string(),
-            min: 5.0,
-            max: 80.0,
-            step: 0.5,
-            default: Params::default().max_final_time_s,
-            unit: "s".to_string(),
-            help: "Upper bound on the free final time.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "gamma_limit_deg".to_string(),
-            label: "Fin AoA Limit".to_string(),
-            min: 4.0,
-            max: 20.0,
-            step: 0.5,
-            default: Params::default().gamma_limit_deg,
-            unit: "deg".to_string(),
-            help: "Absolute bound on the water-fin angle of attack.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "omega_limit_deg_s".to_string(),
-            label: "Fin Rate Limit".to_string(),
-            min: 1.0,
-            max: 15.0,
-            step: 0.25,
-            default: Params::default().omega_limit_deg_s,
-            unit: "deg/s".to_string(),
-            help: "Absolute bound on the fin-angle rate control.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "alpha_limit_deg".to_string(),
-            label: "Sail AoA Limit".to_string(),
-            min: 4.0,
-            max: 20.0,
-            step: 0.5,
-            default: Params::default().alpha_limit_deg,
-            unit: "deg".to_string(),
-            help: "Absolute bound on sail angle of attack.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "omega_weight".to_string(),
-            label: "Fin Rate Weight".to_string(),
-            min: 0.0,
-            max: 1.0e-2,
-            step: 1.0e-4,
-            default: Params::default().omega_weight,
-            unit: "".to_string(),
-            help: "Quadratic stage-cost weight on the fin-rate control state.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "alpha_weight".to_string(),
-            label: "Sail AoA Weight".to_string(),
-            min: 0.0,
-            max: 1.0e-2,
-            step: 1.0e-4,
-            default: Params::default().alpha_weight,
-            unit: "".to_string(),
-            help: "Quadratic stage-cost weight on sail angle of attack.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "omega_rate_regularization".to_string(),
-            label: "Fin Accel Weight".to_string(),
-            min: 0.0,
-            max: 1.0e-2,
-            step: 1.0e-4,
-            default: Params::default().omega_rate_regularization,
-            unit: "".to_string(),
-            help: "Optional quadratic regularization on the fin-rate derivative.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "alpha_rate_regularization".to_string(),
-            label: "Sail Accel Weight".to_string(),
-            min: 0.0,
-            max: 1.0e-2,
-            step: 1.0e-4,
-            default: Params::default().alpha_rate_regularization,
-            unit: "".to_string(),
-            help: "Optional quadratic regularization on the sail-AoA derivative.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "cross_track_limit_m".to_string(),
-            label: "Cross-Track Limit".to_string(),
-            min: 10.0,
-            max: 60.0,
-            step: 0.5,
-            default: Params::default().cross_track_limit_m,
-            unit: "m".to_string(),
-            help: "Absolute bound on the lateral displacement z.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-    ]);
-    ProblemSpec {
-        id: ProblemId::SailboatUpwind,
-        name: "Sailboat Symmetric Tack".to_string(),
-        description: "A dynobud-style point-mass sailboat with coupled aerodynamic and hydrodynamic lift/drag, mirrored tack boundary conditions, and a free final time chosen to maximize average upwind velocity.".to_string(),
-        controls,
-        math_sections: vec![
+    let defaults = Params::default();
+    problem_spec(
+        ProblemId::SailboatUpwind,
+        "Sailboat Symmetric Tack",
+        "A dynobud-style point-mass sailboat with coupled aerodynamic and hydrodynamic lift/drag, mirrored tack boundary conditions, and a free final time chosen to maximize average upwind velocity.",
+        problem_controls(
+            defaults.transcription,
+            &SUPPORTED_INTERVALS,
+            &SUPPORTED_DEGREES,
+            defaults.solver_method,
+            defaults.solver,
+            vec![
+                problem_slider_control(
+                    "wind_speed_mps",
+                    "True Wind Speed",
+                    2.0,
+                    12.0,
+                    0.25,
+                    defaults.wind_speed_mps,
+                    "m/s",
+                    "True wind points in the negative x direction.",
+                ),
+                problem_slider_control(
+                    "initial_time_guess_s",
+                    "Initial Time Guess",
+                    2.0,
+                    40.0,
+                    0.5,
+                    defaults.initial_time_guess_s,
+                    "s",
+                    "Initial guess for the free final time.",
+                ),
+                problem_slider_control(
+                    "min_final_time_s",
+                    "Min Final Time",
+                    0.5,
+                    20.0,
+                    0.5,
+                    defaults.min_final_time_s,
+                    "s",
+                    "Lower bound on the free final time.",
+                ),
+                problem_slider_control(
+                    "max_final_time_s",
+                    "Max Final Time",
+                    5.0,
+                    80.0,
+                    0.5,
+                    defaults.max_final_time_s,
+                    "s",
+                    "Upper bound on the free final time.",
+                ),
+                problem_slider_control(
+                    "gamma_limit_deg",
+                    "Fin AoA Limit",
+                    4.0,
+                    20.0,
+                    0.5,
+                    defaults.gamma_limit_deg,
+                    "deg",
+                    "Absolute bound on the water-fin angle of attack.",
+                ),
+                problem_slider_control(
+                    "omega_limit_deg_s",
+                    "Fin Rate Limit",
+                    1.0,
+                    15.0,
+                    0.25,
+                    defaults.omega_limit_deg_s,
+                    "deg/s",
+                    "Absolute bound on the fin-angle rate control.",
+                ),
+                problem_slider_control(
+                    "alpha_limit_deg",
+                    "Sail AoA Limit",
+                    4.0,
+                    20.0,
+                    0.5,
+                    defaults.alpha_limit_deg,
+                    "deg",
+                    "Absolute bound on sail angle of attack.",
+                ),
+                problem_slider_control(
+                    "omega_weight",
+                    "Fin Rate Weight",
+                    0.0,
+                    1.0e-2,
+                    1.0e-4,
+                    defaults.omega_weight,
+                    "",
+                    "Quadratic stage-cost weight on the fin-rate control state.",
+                ),
+                problem_slider_control(
+                    "alpha_weight",
+                    "Sail AoA Weight",
+                    0.0,
+                    1.0e-2,
+                    1.0e-4,
+                    defaults.alpha_weight,
+                    "",
+                    "Quadratic stage-cost weight on sail angle of attack.",
+                ),
+                problem_scientific_slider_control(
+                    "omega_rate_regularization",
+                    "Fin Accel Weight",
+                    0.0,
+                    1.0e-2,
+                    1.0e-4,
+                    defaults.omega_rate_regularization,
+                    "",
+                    "Optional quadratic regularization on the fin-rate derivative.",
+                ),
+                problem_scientific_slider_control(
+                    "alpha_rate_regularization",
+                    "Sail Accel Weight",
+                    0.0,
+                    1.0e-2,
+                    1.0e-4,
+                    defaults.alpha_rate_regularization,
+                    "",
+                    "Optional quadratic regularization on the sail-AoA derivative.",
+                ),
+                problem_slider_control(
+                    "cross_track_limit_m",
+                    "Cross-Track Limit",
+                    10.0,
+                    60.0,
+                    0.5,
+                    defaults.cross_track_limit_m,
+                    "m",
+                    "Absolute bound on the lateral displacement z.",
+                ),
+            ],
+        ),
+        vec![
             LatexSection {
                 title: "Physical State".to_string(),
                 entries: vec![r"\mathbf{x} = \begin{bmatrix} \gamma & x & z & v_x & v_z \end{bmatrix}^{\mathsf T}".to_string()],
@@ -405,14 +379,14 @@ pub fn spec() -> ProblemSpec {
                 ],
             },
         ],
-        notes: vec![
+        vec![
             format!(
                 "This matches the dynobud sailboat example structure with m = {:.0} kg, rho_air = {:.1}, rho_water = {:.0}, sail area = {:.1} m^2, and fin area = {:.2} m^2.",
                 BOAT_PLUS_SAILOR_MASS_KG, RHO_AIR, RHO_WATER, SAIL_AREA_M2, FIN_AREA_M2
             ),
             "The mirrored terminal equalities enforce a symmetric tack segment rather than a point-to-point return-to-centerline problem.".to_string(),
         ],
-    }
+    )
 }
 
 fn clift_sx(alpha: SX) -> SX {
@@ -876,20 +850,26 @@ fn solve_direct_collocation<const N: usize, const K: usize>(
 
 fn solve_multiple_shooting_with_progress<const N: usize, F>(
     params: &Params,
-    mut emit: F,
+    emit: F,
 ) -> Result<SolveArtifact>
 where
     F: FnMut(SolveStreamEvent) + Send,
 {
-    emit_symbolic_setup_status(&mut emit);
-    let compiled = model_ms::<N>(params).compile_jit()?;
+    let model = model_ms::<N>(params);
+    let mut lifecycle = SolveLifecycleReporter::new(emit, params.solver_method);
+    let (compiled, running_solver) = lifecycle.compile_with_progress(|on_symbolic_ready| {
+        let compiled = model.compile_jit_with_symbolic_callback(on_symbolic_ready)?;
+        let timing = compiled.backend_timing_metadata();
+        Ok((compiled, timing))
+    })?;
     let runtime = ms_runtime::<N>(params);
     solve_multiple_shooting_problem_with_progress(
         &compiled,
         &runtime,
         params.solver_method,
         &params.solver,
-        emit,
+        lifecycle.into_emit(),
+        running_solver,
         |trajectories, x_arcs, u_arcs| {
             artifact_from_ms_trajectories(params, trajectories, x_arcs, u_arcs)
         },
@@ -898,20 +878,26 @@ where
 
 fn solve_direct_collocation_with_progress<const N: usize, const K: usize, F>(
     params: &Params,
-    mut emit: F,
+    emit: F,
 ) -> Result<SolveArtifact>
 where
     F: FnMut(SolveStreamEvent) + Send,
 {
-    emit_symbolic_setup_status(&mut emit);
-    let compiled = model_dc::<N, K>(params).compile_jit()?;
+    let model = model_dc::<N, K>(params);
+    let mut lifecycle = SolveLifecycleReporter::new(emit, params.solver_method);
+    let (compiled, running_solver) = lifecycle.compile_with_progress(|on_symbolic_ready| {
+        let compiled = model.compile_jit_with_symbolic_callback(on_symbolic_ready)?;
+        let timing = compiled.backend_timing_metadata();
+        Ok((compiled, timing))
+    })?;
     let runtime = dc_runtime::<N, K>(params);
     solve_direct_collocation_problem_with_progress(
         &compiled,
         &runtime,
         params.solver_method,
         &params.solver,
-        emit,
+        lifecycle.into_emit(),
+        running_solver,
         |trajectories, time_grid| artifact_from_dc_trajectories(params, trajectories, time_grid),
     )
 }
@@ -1127,12 +1113,11 @@ fn artifact_from_interval_data(
     let frames = states.iter().map(point_frame).collect::<Vec<_>>();
     let left_extent = x.iter().fold(0.0_f64, |acc, value| acc.min(*value)) - 5.0;
     let right_extent = x.iter().fold(0.0_f64, |acc, value| acc.max(*value)) + 5.0;
-    SolveArtifact {
-        title: "Sailboat Symmetric Tack".to_string(),
-        summary: summary_metrics(params, &metrics),
-        solver: SolverReport::placeholder(),
-        constraint_panels: Default::default(),
-        charts: vec![
+    SolveArtifact::new(
+        "Sailboat Symmetric Tack",
+        summary_metrics(params, &metrics),
+        SolverReport::placeholder(),
+        vec![
             chart(
                 "Upwind Position",
                 "x (m)",
@@ -1277,7 +1262,7 @@ fn artifact_from_interval_data(
             chart("Omega Rate", "omega_dot (deg/s^2)", omega_rate_series),
             chart("Alpha Rate", "alpha_dot (deg/s^2)", alpha_rate_series),
         ],
-        scene: Scene2D {
+        Scene2D {
             title: "Plan View".to_string(),
             x_label: "x (m, upwind positive)".to_string(),
             y_label: "z (m)".to_string(),
@@ -1316,7 +1301,7 @@ fn artifact_from_interval_data(
             }),
         },
         notes,
-    }
+    )
 }
 
 fn artifact_from_ms_trajectories<const N: usize>(
@@ -1446,10 +1431,7 @@ mod tests {
         };
         let mut events = Vec::new();
         let result = solve_with_progress(&params, |event| events.push(event));
-        let status_count = events
-            .iter()
-            .filter(|event| matches!(event, SolveStreamEvent::Status { .. }))
-            .count();
+        crate::common::assert_shared_progress_lifecycle(&events);
         let iteration_count = events
             .iter()
             .filter(|event| matches!(event, SolveStreamEvent::Iteration { .. }))
@@ -1458,10 +1440,6 @@ mod tests {
             .iter()
             .filter(|event| matches!(event, SolveStreamEvent::Final { .. }))
             .count();
-        assert!(
-            status_count >= 2,
-            "expected compile and solve status updates"
-        );
         assert!(
             iteration_count > 0 || final_count > 0 || result.is_err(),
             "expected a real solve attempt rather than a preview shortcut"

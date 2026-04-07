@@ -1,13 +1,14 @@
 use crate::common::{
-    ControlSpec, FromMap, LatexSection, MetricKey, PlotMode, ProblemId, ProblemSpec, Scene2D,
-    ScenePath, SolveArtifact, SolveStreamEvent, SolverMethod, SolverReport, SqpConfig,
+    FromMap, LatexSection, MetricKey, PlotMode, ProblemId, ProblemSpec, Scene2D, ScenePath,
+    SolveArtifact, SolveLifecycleReporter, SolveStreamEvent, SolverMethod, SolverReport, SqpConfig,
     TranscriptionConfig, TranscriptionMethod, chart, default_solver_method, default_sqp_config,
-    default_transcription, emit_symbolic_setup_status, expect_finite, interval_arc_bound_series,
-    interval_arc_series, metric_with_key, numeric_metric_with_key, sample_or_default,
-    segmented_bound_series, segmented_series, solve_direct_collocation_problem,
+    default_transcription, expect_finite, interval_arc_bound_series, interval_arc_series,
+    metric_with_key, numeric_metric_with_key, problem_controls, problem_scientific_slider_control,
+    problem_slider_control, problem_spec, sample_or_default, segmented_bound_series,
+    segmented_series, solve_direct_collocation_problem,
     solve_direct_collocation_problem_with_progress, solve_multiple_shooting_problem,
-    solve_multiple_shooting_problem_with_progress, solver_config_from_map, solver_controls,
-    solver_method_from_map, transcription_controls, transcription_from_map, transcription_metrics,
+    solve_multiple_shooting_problem_with_progress, solver_config_from_map, solver_method_from_map,
+    transcription_from_map, transcription_metrics,
 };
 use anyhow::Result;
 use optimal_control::{
@@ -130,107 +131,91 @@ impl FromMap for Params {
     }
 }
 pub fn spec() -> ProblemSpec {
-    let mut controls = transcription_controls(
-        Params::default().transcription,
-        &SUPPORTED_INTERVALS,
-        &SUPPORTED_DEGREES,
-    );
-    controls.extend(solver_controls(
-        Params::default().solver_method,
-        Params::default().solver,
-    ));
-    controls.extend(vec![
-        ControlSpec {
-            id: "target_x_m".to_string(),
-            label: "Target X".to_string(),
-            min: 8.0,
-            max: 20.0,
-            step: 0.5,
-            default: Params::default().target_x_m,
-            unit: "m".to_string(),
-            help: "Downrange target position.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "tf_s".to_string(),
-            label: "Transfer Time".to_string(),
-            min: 3.0,
-            max: 10.0,
-            step: 0.25,
-            default: Params::default().tf_s,
-            unit: "s".to_string(),
-            help: "Fixed maneuver duration.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "lateral_amplitude_m".to_string(),
-            label: "S Amplitude".to_string(),
-            min: 0.4,
-            max: 2.5,
-            step: 0.1,
-            default: Params::default().lateral_amplitude_m,
-            unit: "m".to_string(),
-            help: "Peak lateral excursion encouraged by the stage cost.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "corridor_half_width_m".to_string(),
-            label: "Corridor Half-Width".to_string(),
-            min: 0.8,
-            max: 4.0,
-            step: 0.1,
-            default: Params::default().corridor_half_width_m,
-            unit: "m".to_string(),
-            help: "Absolute bound on lateral displacement.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "accel_limit_mps2".to_string(),
-            label: "Accel Limit".to_string(),
-            min: 1.0,
-            max: 8.0,
-            step: 0.1,
-            default: Params::default().accel_limit_mps2,
-            unit: "m/s²".to_string(),
-            help: "Absolute bound on both acceleration components.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "jerk_limit_mps3".to_string(),
-            label: "Jerk Limit".to_string(),
-            min: 1.0,
-            max: 16.0,
-            step: 0.2,
-            default: Params::default().jerk_limit_mps3,
-            unit: "m/s³".to_string(),
-            help: "Absolute bound on both jerk components.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "jerk_regularization".to_string(),
-            label: "Jerk Weight".to_string(),
-            min: 0.0,
-            max: 1.0e-1,
-            step: 1.0e-3,
-            default: Params::default().jerk_regularization,
-            unit: "".to_string(),
-            help: "Quadratic stage-cost weight on jerk magnitude.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-    ]);
-    ProblemSpec {
-        id: ProblemId::LinearSManeuver,
-        name: "Linear Point-to-Point S Maneuver".to_string(),
-        description: "A jerk-limited planar point mass driven between endpoints while tracking a smooth S-shaped lateral reference inside a bounded corridor.".to_string(),
-        controls,
-        math_sections: vec![
+    let defaults = Params::default();
+    problem_spec(
+        ProblemId::LinearSManeuver,
+        "Linear Point-to-Point S Maneuver",
+        "A jerk-limited planar point mass driven between endpoints while tracking a smooth S-shaped lateral reference inside a bounded corridor.",
+        problem_controls(
+            defaults.transcription,
+            &SUPPORTED_INTERVALS,
+            &SUPPORTED_DEGREES,
+            defaults.solver_method,
+            defaults.solver,
+            vec![
+                problem_slider_control(
+                    "target_x_m",
+                    "Target X",
+                    8.0,
+                    20.0,
+                    0.5,
+                    defaults.target_x_m,
+                    "m",
+                    "Downrange target position.",
+                ),
+                problem_slider_control(
+                    "tf_s",
+                    "Transfer Time",
+                    3.0,
+                    10.0,
+                    0.25,
+                    defaults.tf_s,
+                    "s",
+                    "Fixed maneuver duration.",
+                ),
+                problem_slider_control(
+                    "lateral_amplitude_m",
+                    "S Amplitude",
+                    0.4,
+                    2.5,
+                    0.1,
+                    defaults.lateral_amplitude_m,
+                    "m",
+                    "Peak lateral excursion encouraged by the stage cost.",
+                ),
+                problem_slider_control(
+                    "corridor_half_width_m",
+                    "Corridor Half-Width",
+                    0.8,
+                    4.0,
+                    0.1,
+                    defaults.corridor_half_width_m,
+                    "m",
+                    "Absolute bound on lateral displacement.",
+                ),
+                problem_slider_control(
+                    "accel_limit_mps2",
+                    "Accel Limit",
+                    1.0,
+                    8.0,
+                    0.1,
+                    defaults.accel_limit_mps2,
+                    "m/s²",
+                    "Absolute bound on both acceleration components.",
+                ),
+                problem_slider_control(
+                    "jerk_limit_mps3",
+                    "Jerk Limit",
+                    1.0,
+                    16.0,
+                    0.2,
+                    defaults.jerk_limit_mps3,
+                    "m/s³",
+                    "Absolute bound on both jerk components.",
+                ),
+                problem_scientific_slider_control(
+                    "jerk_regularization",
+                    "Jerk Weight",
+                    0.0,
+                    1.0e-1,
+                    1.0e-3,
+                    defaults.jerk_regularization,
+                    "",
+                    "Quadratic stage-cost weight on jerk magnitude.",
+                ),
+            ],
+        ),
+        vec![
             LatexSection {
                 title: "Physical State".to_string(),
                 entries: vec![r"\mathbf{x} = \begin{bmatrix} x & y & v_x & v_y \end{bmatrix}^{\mathsf T}".to_string()],
@@ -268,11 +253,11 @@ pub fn spec() -> ProblemSpec {
                 ],
             },
         ],
-        notes: vec![
+        vec![
             "The dynamics are linear in position, velocity, acceleration, and jerk.".to_string(),
             "The S-shape is produced by a smooth lateral-reference objective, while acceleration, jerk, and lateral position remain hard-constrained.".to_string(),
         ],
-    }
+    )
 }
 fn s_reference(x: f64, params: &Params) -> f64 {
     let s = (x / params.target_x_m).clamp(0.0, 1.0);
@@ -618,20 +603,26 @@ fn solve_direct_collocation<const N: usize, const K: usize>(
 }
 fn solve_multiple_shooting_with_progress<const N: usize, F>(
     params: &Params,
-    mut emit: F,
+    emit: F,
 ) -> Result<SolveArtifact>
 where
     F: FnMut(SolveStreamEvent) + Send,
 {
-    emit_symbolic_setup_status(&mut emit);
-    let compiled = model_ms::<N>(params).compile_jit()?;
+    let model = model_ms::<N>(params);
+    let mut lifecycle = SolveLifecycleReporter::new(emit, params.solver_method);
+    let (compiled, running_solver) = lifecycle.compile_with_progress(|on_symbolic_ready| {
+        let compiled = model.compile_jit_with_symbolic_callback(on_symbolic_ready)?;
+        let timing = compiled.backend_timing_metadata();
+        Ok((compiled, timing))
+    })?;
     let runtime = ms_runtime::<N>(params);
     solve_multiple_shooting_problem_with_progress(
         &compiled,
         &runtime,
         params.solver_method,
         &params.solver,
-        emit,
+        lifecycle.into_emit(),
+        running_solver,
         |trajectories, x_arcs, u_arcs| {
             artifact_from_ms_trajectories(params, trajectories, x_arcs, u_arcs)
         },
@@ -639,20 +630,26 @@ where
 }
 fn solve_direct_collocation_with_progress<const N: usize, const K: usize, F>(
     params: &Params,
-    mut emit: F,
+    emit: F,
 ) -> Result<SolveArtifact>
 where
     F: FnMut(SolveStreamEvent) + Send,
 {
-    emit_symbolic_setup_status(&mut emit);
-    let compiled = model_dc::<N, K>(params).compile_jit()?;
+    let model = model_dc::<N, K>(params);
+    let mut lifecycle = SolveLifecycleReporter::new(emit, params.solver_method);
+    let (compiled, running_solver) = lifecycle.compile_with_progress(|on_symbolic_ready| {
+        let compiled = model.compile_jit_with_symbolic_callback(on_symbolic_ready)?;
+        let timing = compiled.backend_timing_metadata();
+        Ok((compiled, timing))
+    })?;
     let runtime = dc_runtime::<N, K>(params);
     solve_direct_collocation_problem_with_progress(
         &compiled,
         &runtime,
         params.solver_method,
         &params.solver,
-        emit,
+        lifecycle.into_emit(),
+        running_solver,
         |trajectories, time_grid| artifact_from_dc_trajectories(params, trajectories, time_grid),
     )
 }
@@ -748,9 +745,9 @@ fn artifact_from_ms_trajectories<const N: usize>(
         .iter()
         .chain(jy.iter())
         .fold(0.0_f64, |acc, value| acc.max(value.abs()));
-    SolveArtifact {
-        title: "Linear S Maneuver".to_string(),
-        summary: artifact_summary(
+    SolveArtifact::new(
+        "Linear S Maneuver",
+        artifact_summary(
             params,
             terminal_state.x,
             terminal_state.y,
@@ -759,9 +756,8 @@ fn artifact_from_ms_trajectories<const N: usize>(
             peak_jerk,
             trajectories.tf,
         ),
-        solver: SolverReport::placeholder(),
-        constraint_panels: Default::default(),
-        charts: vec![
+        SolverReport::placeholder(),
+        vec![
             chart(
                 "x Position",
                 "x (m)",
@@ -875,7 +871,7 @@ fn artifact_from_ms_trajectories<const N: usize>(
                 },
             ),
         ],
-        scene: Scene2D {
+        Scene2D {
             title: "Planar Path".to_string(),
             x_label: "x (m)".to_string(),
             y_label: "y (m)".to_string(),
@@ -895,11 +891,11 @@ fn artifact_from_ms_trajectories<const N: usize>(
             arrows: Vec::new(),
             animation: None,
         },
-        notes: vec![
+        vec![
             "Acceleration is treated as the control-state and jerk is the decision variable.".to_string(),
             "When direct collocation is selected, the chart traces are interval-local arcs so polynomial endpoints and continuity defects stay visible.".to_string(),
         ],
-    }
+    )
 }
 fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
     params: &Params,
@@ -941,9 +937,9 @@ fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
                 .max(trajectories.root_dudt.intervals[interval][root].ay.abs());
         }
     }
-    SolveArtifact {
-        title: "Linear S Maneuver".to_string(),
-        summary: artifact_summary(
+    SolveArtifact::new(
+        "Linear S Maneuver",
+        artifact_summary(
             params,
             trajectories.x.terminal.x,
             trajectories.x.terminal.y,
@@ -952,9 +948,8 @@ fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
             peak_jerk,
             trajectories.tf,
         ),
-        solver: SolverReport::placeholder(),
-        constraint_panels: Default::default(),
-        charts: vec![
+        SolverReport::placeholder(),
+        vec![
             chart(
                 "x Position",
                 "x (m)",
@@ -1062,7 +1057,7 @@ fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
                 },
             ),
         ],
-        scene: Scene2D {
+        Scene2D {
             title: "Planar Path".to_string(),
             x_label: "x (m)".to_string(),
             y_label: "y (m)".to_string(),
@@ -1082,11 +1077,11 @@ fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
             arrows: Vec::new(),
             animation: None,
         },
-        notes: vec![
+        vec![
             "Acceleration is treated as the control-state and jerk is the decision variable.".to_string(),
             "Each direct-collocation interval is drawn separately so the mesh nodes, collocation nodes, and extrapolated interval endpoints are all visible.".to_string(),
         ],
-    }
+    )
 }
 #[cfg(test)]
 mod tests {

@@ -16,6 +16,11 @@ jobs:
       LLVM_SYS_221_PREFIX: /opt/homebrew/opt/llvm
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: optimal_control_webapp/package-lock.json
       - uses: Swatinem/rust-cache@v2
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -23,8 +28,16 @@ jobs:
           components: rustfmt, clippy, llvm-tools-preview
       - name: Install LLVM
         run: brew install llvm
+      - name: Install webapp npm dependencies
+        working-directory: optimal_control_webapp
+        run: npm ci
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Check webapp TypeScript
+        working-directory: optimal_control_webapp
+        run: npm run check
+      - name: Cargo check webapp
+        run: cargo check -p optimal_control_webapp
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Run clippy

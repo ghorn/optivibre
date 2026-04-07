@@ -15,7 +15,7 @@ use axum::{
     body::{Body, Bytes},
     extract::Path,
     http::{HeaderValue, StatusCode, header},
-    response::{Html, IntoResponse},
+    response::IntoResponse,
     routing::{get, post},
 };
 use optimal_control_problems::{
@@ -28,6 +28,15 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 static SOLVE_STDIO_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const TEXT_HTML_UTF8: &str = "text/html; charset=utf-8";
+const TEXT_JAVASCRIPT_UTF8: &str = "text/javascript; charset=utf-8";
+const TEXT_CSS_UTF8: &str = "text/css; charset=utf-8";
+const APPLICATION_NDJSON_UTF8: &str = "application/x-ndjson; charset=utf-8";
+const GENERATED_APP_JS: &str = include_str!(concat!(env!("OUT_DIR"), "/app.js"));
+
+type ApiError = (StatusCode, Json<ErrorResponse>);
+type ApiResult<T> = Result<T, ApiError>;
+type StreamSender = mpsc::Sender<Result<Bytes, Infallible>>;
 
 struct AnsiColorModeGuard(AnsiColorMode);
 
@@ -63,28 +72,23 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn index() -> Html<&'static str> {
-    Html(include_str!("../static/index.html"))
+fn static_text_response(content_type: &'static str, body: &'static str) -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, HeaderValue::from_static(content_type))],
+        body,
+    )
+}
+
+async fn index() -> impl IntoResponse {
+    static_text_response(TEXT_HTML_UTF8, include_str!("../static/index.html"))
 }
 
 async fn app_js() -> impl IntoResponse {
-    (
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("text/javascript; charset=utf-8"),
-        )],
-        include_str!("../static/app.js"),
-    )
+    static_text_response(TEXT_JAVASCRIPT_UTF8, GENERATED_APP_JS)
 }
 
 async fn styles_css() -> impl IntoResponse {
-    (
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("text/css; charset=utf-8"),
-        )],
-        include_str!("../static/styles.css"),
-    )
+    static_text_response(TEXT_CSS_UTF8, include_str!("../static/styles.css"))
 }
 
 async fn problems() -> Json<Vec<optimal_control_problems::ProblemSpec>> {
@@ -94,7 +98,7 @@ async fn problems() -> Json<Vec<optimal_control_problems::ProblemSpec>> {
 async fn solve(
     Path(problem): Path<ProblemId>,
     Json(request): Json<SolveRequest>,
-) -> Result<Json<optimal_control_problems::SolveArtifact>, (StatusCode, Json<ErrorResponse>)> {
+) -> ApiResult<Json<optimal_control_problems::SolveArtifact>> {
     solve_problem(problem, &request.values)
         .map(Json)
         .map_err(internal_error)
@@ -103,66 +107,55 @@ async fn solve(
 async fn solve_stream(
     Path(problem): Path<ProblemId>,
     Json(request): Json<SolveRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+) -> ApiResult<impl IntoResponse> {
     let (sender, receiver) = mpsc::channel::<Result<Bytes, Infallible>>(64);
 
-    tokio::task::spawn_blocking(move || {
-        let _capture_lock = solve_stdio_lock()
-            .lock()
-            .expect("stdio capture lock poisoned");
-        let _ansi_color_guard = AnsiColorModeGuard(set_ansi_color_mode(AnsiColorMode::Always));
+    spawn_solve_stream_worker(problem, request, sender);
 
-        let sender_for_progress = sender.clone();
-        #[cfg(unix)]
-        let mut capture_state = match SolveStdIoCapture::start() {
-            Ok((capture_guard, stdout_reader, stderr_reader)) => Some((
-                capture_guard,
-                spawn_stdio_reader(stdout_reader, sender.clone()),
-                spawn_stdio_reader(stderr_reader, sender.clone()),
-            )),
-            Err(error) => {
-                send_stream_event(
-                    &sender,
-                    SolveStreamEvent::Log {
-                        line: format!("[stdout/stderr capture unavailable: {error}]"),
-                        level: SolveLogLevel::Warning,
-                    },
-                );
-                None
-            }
-        };
-
-        let result = solve_problem_with_progress(problem, &request.values, |event| {
-            send_stream_event(&sender_for_progress, event);
-        });
-
-        #[cfg(unix)]
-        if let Some((capture_guard, stdout_handle, stderr_handle)) = capture_state.take() {
-            drop(capture_guard);
-            let _ = stdout_handle.join();
-            let _ = stderr_handle.join();
-        }
-
-        if let Err(error) = result {
-            send_stream_event(
-                &sender,
-                SolveStreamEvent::Error {
-                    message: error.to_string(),
-                },
-            );
-        }
-    });
-
-    Ok((
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/x-ndjson; charset=utf-8"),
-        )],
-        Body::from_stream(ReceiverStream::new(receiver)),
-    ))
+    Ok(ndjson_stream_response(receiver))
 }
 
-fn internal_error(error: impl ToString) -> (StatusCode, Json<ErrorResponse>) {
+fn spawn_solve_stream_worker(problem: ProblemId, request: SolveRequest, sender: StreamSender) {
+    tokio::task::spawn_blocking(move || run_solve_stream(problem, request, sender));
+}
+
+fn run_solve_stream(problem: ProblemId, request: SolveRequest, sender: StreamSender) {
+    let _capture_lock = solve_stdio_lock()
+        .lock()
+        .expect("stdio capture lock poisoned");
+    let _ansi_color_guard = AnsiColorModeGuard(set_ansi_color_mode(AnsiColorMode::Always));
+
+    #[cfg(unix)]
+    let capture_state = StreamStdIoCapture::start(&sender);
+
+    let sender_for_progress = sender.clone();
+    let result = solve_problem_with_progress(problem, &request.values, |event| {
+        send_stream_event(&sender_for_progress, event);
+    });
+
+    #[cfg(unix)]
+    if let Some(capture_state) = capture_state {
+        capture_state.finish();
+    }
+
+    if let Err(error) = result {
+        send_stream_error(&sender, error);
+    }
+}
+
+fn ndjson_stream_response(
+    receiver: mpsc::Receiver<Result<Bytes, Infallible>>,
+) -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(APPLICATION_NDJSON_UTF8),
+        )],
+        Body::from_stream(ReceiverStream::new(receiver)),
+    )
+}
+
+fn internal_error(error: impl ToString) -> ApiError {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ErrorResponse {
@@ -171,7 +164,26 @@ fn internal_error(error: impl ToString) -> (StatusCode, Json<ErrorResponse>) {
     )
 }
 
-fn send_stream_event(sender: &mpsc::Sender<Result<Bytes, Infallible>>, event: SolveStreamEvent) {
+fn send_stream_log(sender: &StreamSender, level: SolveLogLevel, line: impl Into<String>) {
+    send_stream_event(
+        sender,
+        SolveStreamEvent::Log {
+            line: line.into(),
+            level,
+        },
+    );
+}
+
+fn send_stream_error(sender: &StreamSender, error: impl ToString) {
+    send_stream_event(
+        sender,
+        SolveStreamEvent::Error {
+            message: error.to_string(),
+        },
+    );
+}
+
+fn send_stream_event(sender: &StreamSender, event: SolveStreamEvent) {
     if let Ok(mut payload) = serde_json::to_vec(&event) {
         payload.push(b'\n');
         let _ = sender.blocking_send(Ok(Bytes::from(payload)));
@@ -180,6 +192,40 @@ fn send_stream_event(sender: &mpsc::Sender<Result<Bytes, Infallible>>, event: So
 
 fn solve_stdio_lock() -> &'static Mutex<()> {
     SOLVE_STDIO_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[cfg(unix)]
+struct StreamStdIoCapture {
+    capture_guard: SolveStdIoCapture,
+    stdout_handle: thread::JoinHandle<()>,
+    stderr_handle: thread::JoinHandle<()>,
+}
+
+#[cfg(unix)]
+impl StreamStdIoCapture {
+    fn start(sender: &StreamSender) -> Option<Self> {
+        match SolveStdIoCapture::start() {
+            Ok((capture_guard, stdout_reader, stderr_reader)) => Some(Self {
+                capture_guard,
+                stdout_handle: spawn_stdio_reader(stdout_reader, sender.clone()),
+                stderr_handle: spawn_stdio_reader(stderr_reader, sender.clone()),
+            }),
+            Err(error) => {
+                send_stream_log(
+                    sender,
+                    SolveLogLevel::Warning,
+                    format!("[stdout/stderr capture unavailable: {error}]"),
+                );
+                None
+            }
+        }
+    }
+
+    fn finish(self) {
+        drop(self.capture_guard);
+        let _ = self.stdout_handle.join();
+        let _ = self.stderr_handle.join();
+    }
 }
 
 #[cfg(unix)]
@@ -213,16 +259,14 @@ impl SolveStdIoCapture {
             let saved_stderr = libc::dup(libc::STDERR_FILENO);
             if saved_stdout < 0 || saved_stderr < 0 {
                 let err = io::Error::last_os_error();
-                let _ = libc::close(stdout_pipe[0]);
-                let _ = libc::close(stdout_pipe[1]);
-                let _ = libc::close(stderr_pipe[0]);
-                let _ = libc::close(stderr_pipe[1]);
-                if saved_stdout >= 0 {
-                    let _ = libc::close(saved_stdout);
-                }
-                if saved_stderr >= 0 {
-                    let _ = libc::close(saved_stderr);
-                }
+                close_fds([
+                    stdout_pipe[0],
+                    stdout_pipe[1],
+                    stderr_pipe[0],
+                    stderr_pipe[1],
+                    saved_stdout,
+                    saved_stderr,
+                ]);
                 return Err(err);
             }
 
@@ -232,17 +276,18 @@ impl SolveStdIoCapture {
                 let err = io::Error::last_os_error();
                 let _ = libc::dup2(saved_stdout, libc::STDOUT_FILENO);
                 let _ = libc::dup2(saved_stderr, libc::STDERR_FILENO);
-                let _ = libc::close(saved_stdout);
-                let _ = libc::close(saved_stderr);
-                let _ = libc::close(stdout_pipe[0]);
-                let _ = libc::close(stdout_pipe[1]);
-                let _ = libc::close(stderr_pipe[0]);
-                let _ = libc::close(stderr_pipe[1]);
+                close_fds([
+                    saved_stdout,
+                    saved_stderr,
+                    stdout_pipe[0],
+                    stdout_pipe[1],
+                    stderr_pipe[0],
+                    stderr_pipe[1],
+                ]);
                 return Err(err);
             }
 
-            let _ = libc::close(stdout_pipe[1]);
-            let _ = libc::close(stderr_pipe[1]);
+            close_fds([stdout_pipe[1], stderr_pipe[1]]);
 
             Ok((
                 Self {
@@ -253,6 +298,22 @@ impl SolveStdIoCapture {
                 std::fs::File::from_raw_fd(stderr_pipe[0]),
             ))
         }
+    }
+}
+
+#[cfg(unix)]
+fn close_fd(fd: RawFd) {
+    if fd >= 0 {
+        unsafe {
+            let _ = libc::close(fd);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn close_fds<const N: usize>(fds: [RawFd; N]) {
+    for fd in fds {
+        close_fd(fd);
     }
 }
 
@@ -286,13 +347,7 @@ fn spawn_stdio_reader(
                 Ok(_) => {
                     let trimmed = line.trim_end_matches(['\n', '\r']);
                     if !trimmed.is_empty() {
-                        send_stream_event(
-                            &sender,
-                            SolveStreamEvent::Log {
-                                line: trimmed.to_string(),
-                                level: SolveLogLevel::Console,
-                            },
-                        );
+                        send_stream_log(&sender, SolveLogLevel::Console, trimmed);
                     }
                 }
                 Err(_) => break,

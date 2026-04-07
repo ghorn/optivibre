@@ -1,12 +1,12 @@
 use anyhow::Result as AnyResult;
 use optimization::{
-    ClarabelSqpError, ClarabelSqpOptions, ClarabelSqpSummary, ConstraintBoundSide,
-    ConstraintSatisfaction, InteriorPointIterationSnapshot, InteriorPointOptions,
-    InteriorPointSolveError, InteriorPointSummary, LlvmOptimizationLevel, ScalarLeaf,
-    SqpIterationSnapshot, SymbolicNlpBuildError, SymbolicNlpCompileError, SymbolicNlpOutputs,
-    TypedCompiledJitNlp, TypedRuntimeNlpBounds, Vectorize, VectorizeLayoutError,
-    classify_constraint_satisfaction, constraint_bound_side, flatten_value, symbolic_column,
-    symbolic_nlp, symbolic_value, unflatten_value, worst_bound_violation,
+    BackendTimingMetadata, ClarabelSqpError, ClarabelSqpOptions, ClarabelSqpSummary,
+    ConstraintBoundSide, ConstraintSatisfaction, InteriorPointIterationSnapshot,
+    InteriorPointOptions, InteriorPointSolveError, InteriorPointSummary, LlvmOptimizationLevel,
+    ScalarLeaf, SqpIterationSnapshot, SymbolicNlpBuildError, SymbolicNlpCompileError,
+    SymbolicNlpOutputs, TypedCompiledJitNlp, TypedRuntimeNlpBounds, Vectorize,
+    VectorizeLayoutError, classify_constraint_satisfaction, constraint_bound_side, flatten_value,
+    symbolic_column, symbolic_nlp, symbolic_value, unflatten_value, worst_bound_violation,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptIterationSnapshot, IpoptOptions, IpoptSolveError, IpoptSummary};
@@ -562,7 +562,6 @@ type MsArcOutputNum<X, U> = (
     [Numeric<X>; MULTIPLE_SHOOTING_ARC_SAMPLES],
     [Numeric<U>; MULTIPLE_SHOOTING_ARC_SAMPLES],
 );
-
 #[derive(Clone, Debug)]
 struct PromotionPlan {
     rows: Vec<RawInequalityRow>,
@@ -795,11 +794,73 @@ where
         self.compile_jit_with_opt_level(LlvmOptimizationLevel::O3)
     }
 
+    pub fn compile_jit_with_symbolic_callback<CB>(
+        &self,
+        on_symbolic_ready: CB,
+    ) -> Result<CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>, OcpCompileError>
+    where
+        CB: FnMut(BackendTimingMetadata),
+        Mesh<X, N>: Vectorize<SX, Rebind<SX> = Mesh<X, N>>,
+        Mesh<U, N>: Vectorize<SX, Rebind<SX> = Mesh<U, N>>,
+        [C; N]: Vectorize<SX, Rebind<SX> = [C; N]>,
+        [X; N]: Vectorize<SX, Rebind<SX> = [X; N]>,
+        [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,
+        MsVars<X, U, N>:
+            Vectorize<SX, Rebind<SX> = MsVars<X, U, N>, Rebind<f64> = MsVarsNum<X, U, N>>,
+        MsEqualities<X, U, N>: Vectorize<SX, Rebind<SX> = MsEqualities<X, U, N>>,
+        MsIneq<C, Beq, Bineq, N>: Vectorize<
+                SX,
+                Rebind<SX> = MsIneq<C, Beq, Bineq, N>,
+                Rebind<f64> = MsIneqNum<C, Beq, Bineq, N>,
+            >,
+        OcpParameters<P, Beq>: Vectorize<
+                SX,
+                Rebind<SX> = OcpParameters<P, Beq>,
+                Rebind<f64> = OcpParametersNum<P, Beq>,
+            >,
+        OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
+    {
+        self.compile_jit_with_opt_level_and_symbolic_callback(
+            LlvmOptimizationLevel::O3,
+            on_symbolic_ready,
+        )
+    }
+
     pub fn compile_jit_with_opt_level(
         &self,
         opt_level: LlvmOptimizationLevel,
     ) -> Result<CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>, OcpCompileError>
     where
+        Mesh<X, N>: Vectorize<SX, Rebind<SX> = Mesh<X, N>>,
+        Mesh<U, N>: Vectorize<SX, Rebind<SX> = Mesh<U, N>>,
+        [C; N]: Vectorize<SX, Rebind<SX> = [C; N]>,
+        [X; N]: Vectorize<SX, Rebind<SX> = [X; N]>,
+        [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,
+        MsVars<X, U, N>:
+            Vectorize<SX, Rebind<SX> = MsVars<X, U, N>, Rebind<f64> = MsVarsNum<X, U, N>>,
+        MsEqualities<X, U, N>: Vectorize<SX, Rebind<SX> = MsEqualities<X, U, N>>,
+        MsIneq<C, Beq, Bineq, N>: Vectorize<
+                SX,
+                Rebind<SX> = MsIneq<C, Beq, Bineq, N>,
+                Rebind<f64> = MsIneqNum<C, Beq, Bineq, N>,
+            >,
+        OcpParameters<P, Beq>: Vectorize<
+                SX,
+                Rebind<SX> = OcpParameters<P, Beq>,
+                Rebind<f64> = OcpParametersNum<P, Beq>,
+            >,
+        OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
+    {
+        self.compile_jit_with_opt_level_and_symbolic_callback(opt_level, |_| {})
+    }
+
+    pub fn compile_jit_with_opt_level_and_symbolic_callback<CB>(
+        &self,
+        opt_level: LlvmOptimizationLevel,
+        on_symbolic_ready: CB,
+    ) -> Result<CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>, OcpCompileError>
+    where
+        CB: FnMut(BackendTimingMetadata),
         Mesh<X, N>: Vectorize<SX, Rebind<SX> = Mesh<X, N>>,
         Mesh<U, N>: Vectorize<SX, Rebind<SX> = Mesh<U, N>>,
         [C; N]: Vectorize<SX, Rebind<SX> = [C; N]>,
@@ -840,7 +901,8 @@ where
             self.transcribe_multiple_shooting(vars, params)
                 .expect("multiple shooting transcription should be infallible after validation")
         })?;
-        let compiled = symbolic.compile_jit_with_opt_level(opt_level)?;
+        let compiled = symbolic
+            .compile_jit_with_opt_level_and_symbolic_callback(opt_level, on_symbolic_ready)?;
         let xdot_helper = compile_xdot_helper::<X, U, P>(&*self.ode, opt_level)?;
         let rk4_arc_helper =
             compile_multiple_shooting_arc_helper::<X, U, P, RK4_SUBSTEPS>(&*self.ode, opt_level)?;
@@ -988,11 +1050,77 @@ where
         self.compile_jit_with_opt_level(LlvmOptimizationLevel::O3)
     }
 
+    pub fn compile_jit_with_symbolic_callback<CB>(
+        &self,
+        on_symbolic_ready: CB,
+    ) -> Result<CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq, N, K>, OcpCompileError>
+    where
+        CB: FnMut(BackendTimingMetadata),
+        Mesh<X, N>: Vectorize<SX, Rebind<SX> = Mesh<X, N>>,
+        Mesh<U, N>: Vectorize<SX, Rebind<SX> = Mesh<U, N>>,
+        IntervalGrid<X, N, K>: Vectorize<SX, Rebind<SX> = IntervalGrid<X, N, K>>,
+        IntervalGrid<U, N, K>: Vectorize<SX, Rebind<SX> = IntervalGrid<U, N, K>>,
+        IntervalGrid<C, N, K>: Vectorize<SX, Rebind<SX> = IntervalGrid<C, N, K>>,
+        DcVars<X, U, N, K>:
+            Vectorize<SX, Rebind<SX> = DcVars<X, U, N, K>, Rebind<f64> = DcVarsNum<X, U, N, K>>,
+        DcEqualities<X, U, N, K>: Vectorize<SX, Rebind<SX> = DcEqualities<X, U, N, K>>,
+        DcIneq<C, Beq, Bineq, N, K>: Vectorize<
+                SX,
+                Rebind<SX> = DcIneq<C, Beq, Bineq, N, K>,
+                Rebind<f64> = DcIneqNum<C, Beq, Bineq, N, K>,
+            >,
+        OcpParameters<P, Beq>: Vectorize<
+                SX,
+                Rebind<SX> = OcpParameters<P, Beq>,
+                Rebind<f64> = OcpParametersNum<P, Beq>,
+            >,
+        [X; N]: Vectorize<SX, Rebind<SX> = [X; N]>,
+        [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,
+        OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
+    {
+        self.compile_jit_with_opt_level_and_symbolic_callback(
+            LlvmOptimizationLevel::O3,
+            on_symbolic_ready,
+        )
+    }
+
     pub fn compile_jit_with_opt_level(
         &self,
         opt_level: LlvmOptimizationLevel,
     ) -> Result<CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq, N, K>, OcpCompileError>
     where
+        Mesh<X, N>: Vectorize<SX, Rebind<SX> = Mesh<X, N>>,
+        Mesh<U, N>: Vectorize<SX, Rebind<SX> = Mesh<U, N>>,
+        IntervalGrid<X, N, K>: Vectorize<SX, Rebind<SX> = IntervalGrid<X, N, K>>,
+        IntervalGrid<U, N, K>: Vectorize<SX, Rebind<SX> = IntervalGrid<U, N, K>>,
+        IntervalGrid<C, N, K>: Vectorize<SX, Rebind<SX> = IntervalGrid<C, N, K>>,
+        DcVars<X, U, N, K>:
+            Vectorize<SX, Rebind<SX> = DcVars<X, U, N, K>, Rebind<f64> = DcVarsNum<X, U, N, K>>,
+        DcEqualities<X, U, N, K>: Vectorize<SX, Rebind<SX> = DcEqualities<X, U, N, K>>,
+        DcIneq<C, Beq, Bineq, N, K>: Vectorize<
+                SX,
+                Rebind<SX> = DcIneq<C, Beq, Bineq, N, K>,
+                Rebind<f64> = DcIneqNum<C, Beq, Bineq, N, K>,
+            >,
+        OcpParameters<P, Beq>: Vectorize<
+                SX,
+                Rebind<SX> = OcpParameters<P, Beq>,
+                Rebind<f64> = OcpParametersNum<P, Beq>,
+            >,
+        [X; N]: Vectorize<SX, Rebind<SX> = [X; N]>,
+        [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,
+        OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
+    {
+        self.compile_jit_with_opt_level_and_symbolic_callback(opt_level, |_| {})
+    }
+
+    pub fn compile_jit_with_opt_level_and_symbolic_callback<CB>(
+        &self,
+        opt_level: LlvmOptimizationLevel,
+        on_symbolic_ready: CB,
+    ) -> Result<CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq, N, K>, OcpCompileError>
+    where
+        CB: FnMut(BackendTimingMetadata),
         Mesh<X, N>: Vectorize<SX, Rebind<SX> = Mesh<X, N>>,
         Mesh<U, N>: Vectorize<SX, Rebind<SX> = Mesh<U, N>>,
         IntervalGrid<X, N, K>: Vectorize<SX, Rebind<SX> = IntervalGrid<X, N, K>>,
@@ -1038,7 +1166,8 @@ where
             self.transcribe_direct_collocation(vars, params, &coefficients)
                 .expect("direct collocation transcription should be infallible after validation")
         })?;
-        let compiled = symbolic.compile_jit_with_opt_level(opt_level)?;
+        let compiled = symbolic
+            .compile_jit_with_opt_level_and_symbolic_callback(opt_level, on_symbolic_ready)?;
         let xdot_helper = compile_xdot_helper::<X, U, P>(&*self.ode, opt_level)?;
         Ok(CompiledDirectCollocationOcp {
             compiled,
@@ -1238,6 +1367,10 @@ where
     MsIneqNum<C, Beq, Bineq, N>: Vectorize<f64, Rebind<f64> = MsIneqNum<C, Beq, Bineq, N>>,
     OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
 {
+    pub fn backend_timing_metadata(&self) -> BackendTimingMetadata {
+        self.compiled.backend_timing_metadata()
+    }
+
     pub fn solve_sqp(
         &self,
         values: &MultipleShootingRuntimeValues<
@@ -1821,6 +1954,10 @@ where
     DcIneqNum<C, Beq, Bineq, N, K>: Vectorize<f64, Rebind<f64> = DcIneqNum<C, Beq, Bineq, N, K>>,
     OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
 {
+    pub fn backend_timing_metadata(&self) -> BackendTimingMetadata {
+        self.compiled.backend_timing_metadata()
+    }
+
     pub fn solve_sqp(
         &self,
         values: &DirectCollocationRuntimeValues<

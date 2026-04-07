@@ -237,6 +237,39 @@ fn typed_symbolic_compile_exposes_timing_metadata() {
     assert!(timing.jit_time.is_some());
 }
 
+#[test]
+fn typed_symbolic_compile_callback_reports_full_pre_jit_symbolic_timing() {
+    let symbolic = symbolic_nlp::<Pair<SX>, (), (), (), _>("timed_rosenbrock_callback", |x, _| {
+        SymbolicNlpOutputs {
+            objective: (1.0 - x.x).sqr() + 100.0 * (x.y - x.x.sqr()).sqr(),
+            equalities: (),
+            inequalities: (),
+        }
+    })
+    .expect("symbolic NLP should build");
+    let mut callback_timing = None;
+    let compiled = symbolic
+        .compile_jit_with_symbolic_callback(|timing| {
+            callback_timing = Some(timing);
+        })
+        .expect("JIT compile should succeed");
+    let callback_timing = callback_timing.expect("callback timing should be captured");
+    let final_timing = compiled.backend_timing_metadata();
+
+    assert!(callback_timing.function_creation_time.is_some());
+    assert!(callback_timing.derivative_generation_time.is_some());
+    assert_eq!(callback_timing.jit_time, None);
+    assert_eq!(
+        callback_timing.function_creation_time,
+        final_timing.function_creation_time
+    );
+    assert_eq!(
+        callback_timing.derivative_generation_time,
+        final_timing.derivative_generation_time
+    );
+    assert!(final_timing.jit_time.is_some());
+}
+
 #[cfg(feature = "ipopt")]
 #[test]
 fn typed_symbolic_rosenbrock_solves_with_ipopt_without_box_bounds() {

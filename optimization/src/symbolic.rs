@@ -263,12 +263,48 @@ where
         self.compile_jit_with_opt_level(LlvmOptimizationLevel::O3)
     }
 
+    pub fn compile_jit_with_symbolic_callback<CB>(
+        &self,
+        on_symbolic_ready: CB,
+    ) -> Result<TypedCompiledJitNlp<X, P, E, I>, SymbolicNlpCompileError>
+    where
+        CB: FnMut(BackendTimingMetadata),
+    {
+        self.compile_jit_with_opt_level_and_symbolic_callback(
+            LlvmOptimizationLevel::O3,
+            on_symbolic_ready,
+        )
+    }
+
+    pub fn backend_timing_metadata(&self) -> BackendTimingMetadata {
+        BackendTimingMetadata {
+            function_creation_time: self.symbolic.construction_time,
+            derivative_generation_time: None,
+            jit_time: None,
+        }
+    }
+
     pub fn compile_jit_with_opt_level(
         &self,
         opt_level: LlvmOptimizationLevel,
     ) -> Result<TypedCompiledJitNlp<X, P, E, I>, SymbolicNlpCompileError> {
+        self.compile_jit_with_opt_level_and_symbolic_callback(opt_level, |_| {})
+    }
+
+    pub fn compile_jit_with_opt_level_and_symbolic_callback<CB>(
+        &self,
+        opt_level: LlvmOptimizationLevel,
+        on_symbolic_ready: CB,
+    ) -> Result<TypedCompiledJitNlp<X, P, E, I>, SymbolicNlpCompileError>
+    where
+        CB: FnMut(BackendTimingMetadata),
+    {
         Ok(TypedCompiledJitNlp {
-            inner: compile_symbolic_nlp(&self.symbolic, opt_level)?,
+            inner: compile_symbolic_nlp_with_symbolic_callback(
+                &self.symbolic,
+                opt_level,
+                on_symbolic_ready,
+            )?,
             _marker: PhantomData,
         })
     }
@@ -326,10 +362,16 @@ impl CompiledJitNlp {
     fn from_symbolic(
         symbolic: &SymbolicNlp,
         opt_level: LlvmOptimizationLevel,
+        mut on_symbolic_ready: impl FnMut(BackendTimingMetadata),
     ) -> Result<Self, SymbolicNlpCompileError> {
         let derivative_started = Instant::now();
         let functions = derive_symbolic_functions(symbolic)?;
         let derivative_generation_time = derivative_started.elapsed();
+        on_symbolic_ready(BackendTimingMetadata {
+            function_creation_time: symbolic.construction_time,
+            derivative_generation_time: Some(derivative_generation_time),
+            jit_time: None,
+        });
 
         let jit_started = Instant::now();
         let objective_value = JitKernel::compile(&functions.objective_value, opt_level)?;
@@ -967,11 +1009,12 @@ pub fn rank_nlp_constraint_violations(
     Ok(report)
 }
 
-fn compile_symbolic_nlp(
+fn compile_symbolic_nlp_with_symbolic_callback(
     symbolic: &SymbolicNlp,
     opt_level: LlvmOptimizationLevel,
+    on_symbolic_ready: impl FnMut(BackendTimingMetadata),
 ) -> Result<CompiledJitNlp, SymbolicNlpCompileError> {
-    CompiledJitNlp::from_symbolic(symbolic, opt_level)
+    CompiledJitNlp::from_symbolic(symbolic, opt_level, on_symbolic_ready)
 }
 
 impl RuntimeBoundedJitNlp<'_> {

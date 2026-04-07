@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "lib": ["DOM", "DOM.Iterable", "ES2022"],
+    "rootDir": "static",
+    "strict": true,
+    "noEmitOnError": true,
+    "skipLibCheck": true
+  },
+  "include": ["static/app.ts", "static/globals.d.ts"]
+}

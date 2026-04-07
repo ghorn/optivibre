@@ -1,15 +1,14 @@
 use crate::common::{
-    ControlSpec, FromMap, LatexSection, MetricKey, PlotMode, ProblemId, ProblemSpec, Scene2D,
-    ScenePath, SolveArtifact, SolveStreamEvent, SolverMethod, SolverReport, SqpConfig,
+    FromMap, LatexSection, MetricKey, PlotMode, ProblemId, ProblemSpec, Scene2D, ScenePath,
+    SolveArtifact, SolveLifecycleReporter, SolveStreamEvent, SolverMethod, SolverReport, SqpConfig,
     TranscriptionConfig, TranscriptionMethod, chart, default_solver_method, default_sqp_config,
-    default_transcription, deg_to_rad, emit_symbolic_setup_status, expect_finite,
-    interval_arc_bound_series, interval_arc_series, metric_with_key, node_times,
-    numeric_metric_with_key, rad_to_deg, sample_or_default, segmented_bound_series,
-    segmented_series, solve_direct_collocation_problem,
+    default_transcription, deg_to_rad, expect_finite, interval_arc_bound_series,
+    interval_arc_series, metric_with_key, node_times, numeric_metric_with_key, problem_controls,
+    problem_scientific_slider_control, problem_slider_control, problem_spec, rad_to_deg,
+    sample_or_default, segmented_bound_series, segmented_series, solve_direct_collocation_problem,
     solve_direct_collocation_problem_with_progress, solve_multiple_shooting_problem,
-    solve_multiple_shooting_problem_with_progress, solver_config_from_map, solver_controls,
-    solver_method_from_map, transcription_controls, transcription_from_map, transcription_metrics,
-    trapezoid_integral,
+    solve_multiple_shooting_problem_with_progress, solver_config_from_map, solver_method_from_map,
+    transcription_from_map, transcription_metrics, trapezoid_integral,
 };
 use anyhow::{Result, anyhow};
 use optimal_control::{
@@ -156,107 +155,91 @@ impl FromMap for Params {
     }
 }
 pub fn spec() -> ProblemSpec {
-    let mut controls = transcription_controls(
-        Params::default().transcription,
-        &SUPPORTED_INTERVALS,
-        &SUPPORTED_DEGREES,
-    );
-    controls.extend(solver_controls(
-        Params::default().solver_method,
-        Params::default().solver,
-    ));
-    controls.extend(vec![
-        ControlSpec {
-            id: "launch_speed_mps".to_string(),
-            label: "Launch Speed".to_string(),
-            min: 10.0,
-            max: 50.0,
-            step: 0.5,
-            default: Params::default().launch_speed_mps,
-            unit: "m/s".to_string(),
-            help: "Initial speed magnitude. The optimizer chooses the launch angle subject to this speed norm.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "initial_alpha_deg".to_string(),
-            label: "Initial AoA Guess".to_string(),
-            min: 0.0,
-            max: 15.0,
-            step: 0.25,
-            default: Params::default().initial_alpha_deg,
-            unit: "deg".to_string(),
-            help: "Initial guess for the launch angle of attack. This is not a hard boundary condition.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "initial_time_guess_s".to_string(),
-            label: "Initial Time Guess".to_string(),
-            min: 0.0,
-            max: 60.0,
-            step: 0.25,
-            default: Params::default().initial_time_guess_s,
-            unit: "s".to_string(),
-            help: "Initial guess for the free final time.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "min_time_bound_s".to_string(),
-            label: "Min Final Time".to_string(),
-            min: 0.0,
-            max: 500.0,
-            step: 0.5,
-            default: Params::default().min_time_bound_s,
-            unit: "s".to_string(),
-            help: "Lower bound on the free final time.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "max_time_bound_s".to_string(),
-            label: "Max Final Time".to_string(),
-            min: 1.0,
-            max: 500.0,
-            step: 1.0,
-            default: Params::default().max_time_bound_s,
-            unit: "s".to_string(),
-            help: "Upper bound on the free final time.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "max_alpha_rate_deg_s".to_string(),
-            label: "AoA Rate Limit".to_string(),
-            min: 5.0,
-            max: 60.0,
-            step: 0.5,
-            default: Params::default().max_alpha_rate_deg_s,
-            unit: "deg/s".to_string(),
-            help: "How quickly the glider may retune its angle of attack.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-        ControlSpec {
-            id: "alpha_rate_regularization".to_string(),
-            label: "AoA Rate Weight".to_string(),
-            min: 0.0,
-            max: 5.0e-2,
-            step: 5.0e-4,
-            default: Params::default().alpha_rate_regularization,
-            unit: "".to_string(),
-            help: "Quadratic stage-cost weight on angle-of-attack rate.".to_string(),
-            choices: Vec::new(),
-            ..Default::default()
-        },
-    ]);
-    ProblemSpec {
-        id: ProblemId::OptimalDistanceGlider,
-        name: "Optimal Distance Glider".to_string(),
-        description: "A planar particle glider with free final time, a launch-angle choice enforced through an initial speed-magnitude constraint, and downrange-distance maximization under altitude, forward-speed, lift-coefficient, and control-rate limits.".to_string(),
-        controls,
-        math_sections: vec![
+    let defaults = Params::default();
+    problem_spec(
+        ProblemId::OptimalDistanceGlider,
+        "Optimal Distance Glider",
+        "A planar particle glider with free final time, a launch-angle choice enforced through an initial speed-magnitude constraint, and downrange-distance maximization under altitude, forward-speed, lift-coefficient, and control-rate limits.",
+        problem_controls(
+            defaults.transcription,
+            &SUPPORTED_INTERVALS,
+            &SUPPORTED_DEGREES,
+            defaults.solver_method,
+            defaults.solver,
+            vec![
+                problem_slider_control(
+                    "launch_speed_mps",
+                    "Launch Speed",
+                    10.0,
+                    50.0,
+                    0.5,
+                    defaults.launch_speed_mps,
+                    "m/s",
+                    "Initial speed magnitude. The optimizer chooses the launch angle subject to this speed norm.",
+                ),
+                problem_slider_control(
+                    "initial_alpha_deg",
+                    "Initial AoA Guess",
+                    0.0,
+                    15.0,
+                    0.25,
+                    defaults.initial_alpha_deg,
+                    "deg",
+                    "Initial guess for the launch angle of attack. This is not a hard boundary condition.",
+                ),
+                problem_slider_control(
+                    "initial_time_guess_s",
+                    "Initial Time Guess",
+                    0.0,
+                    60.0,
+                    0.25,
+                    defaults.initial_time_guess_s,
+                    "s",
+                    "Initial guess for the free final time.",
+                ),
+                problem_slider_control(
+                    "min_time_bound_s",
+                    "Min Final Time",
+                    0.0,
+                    500.0,
+                    0.5,
+                    defaults.min_time_bound_s,
+                    "s",
+                    "Lower bound on the free final time.",
+                ),
+                problem_slider_control(
+                    "max_time_bound_s",
+                    "Max Final Time",
+                    1.0,
+                    500.0,
+                    1.0,
+                    defaults.max_time_bound_s,
+                    "s",
+                    "Upper bound on the free final time.",
+                ),
+                problem_slider_control(
+                    "max_alpha_rate_deg_s",
+                    "AoA Rate Limit",
+                    5.0,
+                    60.0,
+                    0.5,
+                    defaults.max_alpha_rate_deg_s,
+                    "deg/s",
+                    "How quickly the glider may retune its angle of attack.",
+                ),
+                problem_scientific_slider_control(
+                    "alpha_rate_regularization",
+                    "AoA Rate Weight",
+                    0.0,
+                    5.0e-2,
+                    5.0e-4,
+                    defaults.alpha_rate_regularization,
+                    "",
+                    "Quadratic stage-cost weight on angle-of-attack rate.",
+                ),
+            ],
+        ),
+        vec![
             LatexSection {
                 title: "Physical State".to_string(),
                 entries: vec![r"\mathbf{x} = \begin{bmatrix} x & h & v_x & v_y \end{bmatrix}^{\mathsf T}".to_string()],
@@ -301,14 +284,14 @@ pub fn spec() -> ProblemSpec {
                 ],
             },
         ],
-        notes: vec![
+        vec![
             "The lift curve uses CL = 2*pi*alpha*10/12, with the path constraint applied directly as -0.5 <= CL <= 1.5.".to_string(),
             "The particle model carries translational velocity directly, with drag opposing the velocity vector and lift acting orthogonally as (-v_y, v_x)/V.".to_string(),
             "Aerodynamic forces now use L = 0.5*rho*V^2*C_L*S_ref and D = 0.5*rho*V^2*C_D*S_ref with rho = 1.15, S_ref = 4.0 m^2, and mass = 30.0 kg.".to_string(),
             "The launch angle and initial AoA are free: the boundary conditions fix x(0)=0, h(0)=1 m, and ||v(0)|| = V_launch while letting the optimizer choose the vx/vy split and α(0).".to_string(),
             "Final time is free with configurable bounds T_min <= T <= T_max, so the solver can use a terminal flare if that increases downrange distance while respecting h(t) >= 0 and v_x(t) >= 0.".to_string(),
         ],
-    }
+    )
 }
 fn cl(alpha: SX) -> SX {
     CL_SLOPE * alpha
@@ -644,20 +627,26 @@ fn solve_direct_collocation<const N: usize, const K: usize>(
 }
 fn solve_multiple_shooting_with_progress<const N: usize, F>(
     params: &Params,
-    mut emit: F,
+    emit: F,
 ) -> Result<SolveArtifact>
 where
     F: FnMut(SolveStreamEvent) + Send,
 {
-    emit_symbolic_setup_status(&mut emit);
-    let compiled = model_ms::<N>(params).compile_jit()?;
+    let model = model_ms::<N>(params);
+    let mut lifecycle = SolveLifecycleReporter::new(emit, params.solver_method);
+    let (compiled, running_solver) = lifecycle.compile_with_progress(|on_symbolic_ready| {
+        let compiled = model.compile_jit_with_symbolic_callback(on_symbolic_ready)?;
+        let timing = compiled.backend_timing_metadata();
+        Ok((compiled, timing))
+    })?;
     let runtime = ms_runtime::<N>(params);
     solve_multiple_shooting_problem_with_progress(
         &compiled,
         &runtime,
         params.solver_method,
         &params.solver,
-        emit,
+        lifecycle.into_emit(),
+        running_solver,
         |trajectories, x_arcs, u_arcs| {
             artifact_from_ms_trajectories(params, trajectories, x_arcs, u_arcs)
         },
@@ -665,20 +654,26 @@ where
 }
 fn solve_direct_collocation_with_progress<const N: usize, const K: usize, F>(
     params: &Params,
-    mut emit: F,
+    emit: F,
 ) -> Result<SolveArtifact>
 where
     F: FnMut(SolveStreamEvent) + Send,
 {
-    emit_symbolic_setup_status(&mut emit);
-    let compiled = model_dc::<N, K>(params).compile_jit()?;
+    let model = model_dc::<N, K>(params);
+    let mut lifecycle = SolveLifecycleReporter::new(emit, params.solver_method);
+    let (compiled, running_solver) = lifecycle.compile_with_progress(|on_symbolic_ready| {
+        let compiled = model.compile_jit_with_symbolic_callback(on_symbolic_ready)?;
+        let timing = compiled.backend_timing_metadata();
+        Ok((compiled, timing))
+    })?;
     let runtime = dc_runtime::<N, K>(params);
     solve_direct_collocation_problem_with_progress(
         &compiled,
         &runtime,
         params.solver_method,
         &params.solver,
-        emit,
+        lifecycle.into_emit(),
+        running_solver,
         |trajectories, time_grid| artifact_from_dc_trajectories(params, trajectories, time_grid),
     )
 }
@@ -762,9 +757,9 @@ fn artifact_from_ms_trajectories<const N: usize>(
             .map(|value| value * value)
             .collect::<Vec<_>>(),
     );
-    SolveArtifact {
-        title: "Optimal Distance Glider".to_string(),
-        summary: artifact_summary(
+    SolveArtifact::new(
+        "Optimal Distance Glider",
+        artifact_summary(
             params,
             tf,
             distance,
@@ -772,9 +767,8 @@ fn artifact_from_ms_trajectories<const N: usize>(
             altitude.iter().fold(f64::NEG_INFINITY, |acc, value| acc.max(*value)),
             trim_cost,
         ),
-        solver: SolverReport::placeholder(),
-        constraint_panels: Default::default(),
-        charts: vec![
+        SolverReport::placeholder(),
+        vec![
             chart(
                 "Downrange x",
                 "Downrange x (m)",
@@ -890,7 +884,7 @@ fn artifact_from_ms_trajectories<const N: usize>(
                 },
             ),
         ],
-        scene: Scene2D {
+        Scene2D {
             title: "Glide Path".to_string(),
             x_label: "Downrange x (m)".to_string(),
             y_label: "Altitude (m)".to_string(),
@@ -903,13 +897,13 @@ fn artifact_from_ms_trajectories<const N: usize>(
             arrows: Vec::new(),
             animation: None,
         },
-        notes: vec![
+        vec![
             "The particle model uses velocity states directly, with drag aligned opposite motion and lift using the orthogonal direction (-v_y, v_x)/V.".to_string(),
             "Lift and drag are computed from dynamic pressure using rho = 1.15 kg/m^3, S_ref = 4.0 m^2, and mass = 30.0 kg.".to_string(),
             "The bounded aerodynamic path constraint is applied directly to lift coefficient, with -0.5 <= C_L <= 1.5 rendered as red overlays.".to_string(),
             "Altitude and forward speed are constrained as h(t) >= 0 and v_x(t) >= 0 throughout the trajectory, with free final time 1 <= T <= 500 s.".to_string(),
         ],
-    }
+    )
 }
 fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
     params: &Params,
@@ -956,9 +950,9 @@ fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
     } else {
         0.0
     };
-    SolveArtifact {
-        title: "Optimal Distance Glider".to_string(),
-        summary: artifact_summary(
+    SolveArtifact::new(
+        "Optimal Distance Glider",
+        artifact_summary(
             params,
             trajectories.tf,
             trajectories.x.terminal.x,
@@ -966,9 +960,8 @@ fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
             peak_altitude,
             trim_cost,
         ),
-        solver: SolverReport::placeholder(),
-        constraint_panels: Default::default(),
-        charts: vec![
+        SolverReport::placeholder(),
+        vec![
             chart(
                 "Downrange x",
                 "Downrange x (m)",
@@ -1080,7 +1073,7 @@ fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
                 },
             ),
         ],
-        scene: Scene2D {
+        Scene2D {
             title: "Glide Path".to_string(),
             x_label: "Downrange x (m)".to_string(),
             y_label: "Altitude (m)".to_string(),
@@ -1093,14 +1086,14 @@ fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
             arrows: Vec::new(),
             animation: None,
         },
-        notes: vec![
+        vec![
             "The particle model uses velocity states directly, with drag aligned opposite motion and lift using the orthogonal direction (-v_y, v_x)/V.".to_string(),
             "Lift and drag are computed from dynamic pressure using rho = 1.15 kg/m^3, S_ref = 4.0 m^2, and mass = 30.0 kg.".to_string(),
             "Each collocation interval is rendered as its own start-root-end arc, while the AoA-rate decision variable is only shown at collocation nodes.".to_string(),
             "The bounded aerodynamic path constraint is applied directly to lift coefficient, with -0.5 <= C_L <= 1.5 rendered as red overlays.".to_string(),
             "Altitude and forward speed are constrained as h(t) >= 0 and v_x(t) >= 0 throughout the trajectory, with free final time 1 <= T <= 500 s.".to_string(),
         ],
-    }
+    )
 }
 #[cfg(test)]
 mod tests {

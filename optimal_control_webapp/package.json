@@ -1,0 +1,11 @@
+{
+  "name": "optimal_control_webapp",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.json --outDir dist",
+    "check": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "6.0.2"
+  }
+}

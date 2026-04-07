@@ -98,7 +98,6 @@ h2 {
 .lede,
 .hero-description,
 .card-subtitle,
-.status,
 .control-help,
 .notes li,
 .problem-card p {
@@ -175,11 +174,41 @@ h2 {
   padding: 2px 2px 0;
 }
 
+.control-section-toggle {
+  width: 100%;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0;
+  background: none;
+  border: none;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.control-section-toggle:hover .control-section-title,
+.control-section-toggle:hover .control-section-chevron {
+  color: var(--accent-2);
+}
+
+.control-section-toggle:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 78%, white);
+  outline-offset: 6px;
+  border-radius: 14px;
+}
+
+.control-section-header-text {
+  min-width: 0;
+}
+
 .control-section-title {
   font-family: "Avenir Next", Futura, "Trebuchet MS", sans-serif;
   font-weight: 700;
   font-size: 0.92rem;
   color: var(--ink);
+  transition: color 140ms ease;
 }
 
 .control-section-help {
@@ -187,6 +216,24 @@ h2 {
   color: var(--muted);
   font-size: 0.82rem;
   line-height: 1.35;
+}
+
+.control-section-chevron {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 1rem;
+  line-height: 1;
+  transform: rotate(0deg);
+  transform-origin: 50% 50%;
+  transition: transform 140ms ease, color 140ms ease;
+}
+
+.control-section[data-collapsed="true"] .control-section-chevron {
+  transform: rotate(-90deg);
+}
+
+.control-section[data-collapsed="true"] .control-section-body {
+  display: none;
 }
 
 .solve-button,
@@ -224,10 +271,10 @@ h2 {
 }
 
 .control-header {
-  display: flex;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 16px;
-  align-items: baseline;
+  align-items: start;
 }
 
 .control-label {
@@ -239,6 +286,11 @@ h2 {
   font-family: Menlo, Monaco, Consolas, monospace;
   font-size: 0.86rem;
   color: var(--accent-2);
+  white-space: nowrap;
+  word-break: normal;
+  overflow-wrap: normal;
+  text-align: right;
+  justify-self: end;
 }
 
 .control-inputs {
@@ -294,29 +346,74 @@ select {
 }
 
 .status {
-  min-height: 1.4em;
-  padding: 9px 12px;
-  border-radius: 999px;
+  width: 100%;
+  min-height: 88px;
+  padding: 12px 14px;
+  border-radius: 18px;
   border: 1px solid rgba(177, 214, 222, 0.16);
-  background: rgba(5, 20, 29, 0.62);
+  background:
+    linear-gradient(140deg, rgba(124, 198, 254, 0.06), transparent 58%),
+    rgba(5, 20, 29, 0.72);
+  display: grid;
+  gap: 6px;
+  align-content: start;
+}
+
+.status-eyebrow {
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  font-size: 0.68rem;
+  color: var(--muted);
+}
+
+.status-main {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--ink);
+  font-family: "Avenir Next", Futura, "Trebuchet MS", sans-serif;
+  font-size: 1.02rem;
+  line-height: 1.15;
+}
+
+.status-detail {
+  color: var(--muted);
   font-size: 0.84rem;
-  line-height: 1.2;
+  line-height: 1.3;
 }
 
-.status.error {
-  color: #ff9795;
+.status-spinner {
+  width: 0.95rem;
+  height: 0.95rem;
+  border-radius: 50%;
+  border: 2px solid rgba(177, 214, 222, 0.22);
+  border-top-color: rgba(247, 178, 103, 0.96);
+  border-right-color: rgba(247, 178, 103, 0.68);
+  flex: 0 0 auto;
+  animation: metric-spin 0.9s linear infinite;
 }
 
-.status.success {
+.status.status-active {
+  border-color: rgba(247, 178, 103, 0.42);
+  box-shadow:
+    inset 0 0 0 1px rgba(247, 178, 103, 0.08),
+    0 0 0 1px rgba(247, 178, 103, 0.04);
+}
+
+.status.success .status-main {
   color: var(--accent-2);
 }
 
-.status.warning {
+.status.warning .status-main {
   color: var(--accent);
 }
 
-.status.info {
-  color: var(--muted);
+.status.error .status-main {
+  color: #ff9795;
+}
+
+.status.info .status-main {
+  color: var(--ink);
 }
 
 .hero {
@@ -363,6 +460,24 @@ select {
   border: 1px solid rgba(177, 214, 222, 0.16);
 }
 
+.metric-card-group {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.metric-group-item + .metric-group-item {
+  padding-left: 14px;
+  border-left: 1px solid rgba(177, 214, 222, 0.1);
+}
+
+.metric-card.metric-card-active {
+  border-color: rgba(247, 178, 103, 0.42);
+  box-shadow:
+    inset 0 0 0 1px rgba(247, 178, 103, 0.1),
+    0 0 0 1px rgba(247, 178, 103, 0.04);
+}
+
 .metric-label {
   color: var(--muted);
   font-size: 0.84rem;
@@ -372,6 +487,46 @@ select {
 .metric-value {
   font-family: Menlo, Monaco, Consolas, monospace;
   font-size: 0.96rem;
+}
+
+@media (max-width: 720px) {
+  .metric-card-group {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
+  .metric-group-item + .metric-group-item {
+    padding-left: 0;
+    padding-top: 10px;
+    border-left: none;
+    border-top: 1px solid rgba(177, 214, 222, 0.1);
+  }
+}
+
+.metric-value.metric-value-progress {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.metric-spinner {
+  width: 0.85rem;
+  height: 0.85rem;
+  border-radius: 50%;
+  border: 2px solid rgba(177, 214, 222, 0.24);
+  border-top-color: rgba(247, 178, 103, 0.95);
+  border-right-color: rgba(247, 178, 103, 0.7);
+  flex: 0 0 auto;
+  animation: metric-spin 0.9s linear infinite;
+}
+
+@keyframes metric-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .metric-card.metric-card-success {
@@ -632,18 +787,6 @@ select {
 .solver-chip-value {
   font-family: Menlo, Monaco, Consolas, monospace;
   font-size: 0.88rem;
-}
-
-.solver-chip.solver-chip-success {
-  border-color: rgba(91, 209, 181, 0.32);
-}
-
-.solver-chip.solver-chip-warning {
-  border-color: rgba(247, 178, 103, 0.32);
-}
-
-.solver-chip.solver-chip-error {
-  border-color: rgba(242, 95, 92, 0.32);
 }
 
 .solver-log {

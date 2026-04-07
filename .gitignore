@@ -1,3 +1,5 @@
 /target
+**/node_modules
+optimal_control_webapp/dist
 **/*.rs.bk
 casadi_reference

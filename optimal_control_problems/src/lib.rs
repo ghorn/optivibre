@@ -12,9 +12,10 @@ pub use common::{
     Chart, ControlChoice, ControlEditor, ControlSection, ControlSemantic, ControlSpec,
     ControlValueDisplay, ControlVisibility, LatexSection, Metric, MetricKey, PlotMode, ProblemId,
     ProblemSpec, Scene2D, SceneAnimation, SceneArrow, SceneCircle, SceneFrame, ScenePath,
-    SolveArtifact, SolveLogLevel, SolvePhase, SolveProgress, SolveRequest, SolveStreamEvent,
-    SolverMethod, SolverReport, SolverStatusKind, TimeSeries, TimeSeriesRole, TranscriptionConfig,
-    TranscriptionMethod, find_metric, metric, metric_with_key, numeric_metric_with_key,
+    SolveArtifact, SolveLogLevel, SolvePhase, SolveProgress, SolveRequest, SolveStage, SolveStatus,
+    SolveStreamEvent, SolverMethod, SolverReport, SolverStatusKind, TimeSeries, TimeSeriesRole,
+    TranscriptionConfig, TranscriptionMethod, find_metric, metric, metric_with_key,
+    numeric_metric_with_key,
 };
 
 pub fn problem_specs() -> Vec<ProblemSpec> {
