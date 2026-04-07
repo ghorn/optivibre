@@ -15,6 +15,12 @@ struct Ab<T> {
 }
 
 #[derive(Clone, Debug, PartialEq, optimization::Vectorize)]
+struct Abc<T> {
+    xyz: Xyz<T>,
+    t: T,
+}
+
+#[derive(Clone, Debug, PartialEq, optimization::Vectorize)]
 struct WithArray<T> {
     head: T,
     tail: [Xyz<T>; 2],
@@ -159,4 +165,56 @@ fn generated_borrowed_view_is_correct_for_const_generic_nested_types() {
     assert_eq!(*view.right.x, 5.0);
     assert_eq!(*view.right.y, 6.0);
     assert_eq!(*view.right.z, 7.0);
+}
+
+#[test]
+fn layout_names_use_field_paths_for_nested_types() {
+    let names = Ab::<SX>::layout_names().flatten_cloned();
+    assert_eq!(names, vec!["a", "b.x", "b.y", "b.z"]);
+}
+
+#[test]
+fn layout_names_preserve_recursive_shape() {
+    let names = Abc::<SX>::layout_names();
+    assert_eq!(names.xyz.x, "xyz.x");
+    assert_eq!(names.xyz.y, "xyz.y");
+    assert_eq!(names.xyz.z, "xyz.z");
+    assert_eq!(names.t, "t");
+}
+
+#[test]
+fn layout_names_use_indices_for_arrays_and_tuples() {
+    let array_names = WithArray::<SX>::layout_names().flatten_cloned();
+    assert_eq!(
+        array_names,
+        vec![
+            "head",
+            "tail[0].x",
+            "tail[0].y",
+            "tail[0].z",
+            "tail[1].x",
+            "tail[1].y",
+            "tail[1].z",
+        ]
+    );
+
+    let tuple_names = <(SX, Xyz<SX>) as Vectorize<SX>>::layout_names().flatten_cloned();
+    assert_eq!(tuple_names, vec!["[0]", "[1].x", "[1].y", "[1].z"]);
+}
+
+#[test]
+fn layout_names_can_be_prefixed() {
+    let names = NestedConst::<SX, 3>::layout_names_with_prefix("state").flatten_cloned();
+    assert_eq!(
+        names,
+        vec![
+            "state.left.bias",
+            "state.left.coords[0]",
+            "state.left.coords[1]",
+            "state.left.coords[2]",
+            "state.right.x",
+            "state.right.y",
+            "state.right.z",
+        ]
+    );
 }

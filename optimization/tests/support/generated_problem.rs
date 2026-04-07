@@ -270,6 +270,23 @@ fn lock_context<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GeneratedProblemInputRole {
+    DecisionVariables,
+    EqualityMultipliers,
+    InequalityMultipliers,
+    Parameter,
+}
+
+fn generated_problem_input_role(slot_name: &str) -> GeneratedProblemInputRole {
+    match slot_name {
+        "x" | "q" => GeneratedProblemInputRole::DecisionVariables,
+        "lambda_eq" => GeneratedProblemInputRole::EqualityMultipliers,
+        "mu" => GeneratedProblemInputRole::InequalityMultipliers,
+        _ => GeneratedProblemInputRole::Parameter,
+    }
+}
+
 fn load_jit_inputs(
     function: &CompiledJitFunction,
     context: &mut JitExecutionContext,
@@ -281,11 +298,15 @@ fn load_jit_inputs(
     let mut parameter_index = 0;
     for (slot_index, slot) in function.lowered().inputs.iter().enumerate() {
         let input = context.input_mut(slot_index);
-        match slot.name.as_str() {
-            "x" | "q" => input.copy_from_slice(x),
-            "lambda_eq" => input.copy_from_slice(equality_multipliers),
-            "mu" => input.copy_from_slice(inequality_multipliers),
-            _ => {
+        match generated_problem_input_role(&slot.name) {
+            GeneratedProblemInputRole::DecisionVariables => input.copy_from_slice(x),
+            GeneratedProblemInputRole::EqualityMultipliers => {
+                input.copy_from_slice(equality_multipliers)
+            }
+            GeneratedProblemInputRole::InequalityMultipliers => {
+                input.copy_from_slice(inequality_multipliers)
+            }
+            GeneratedProblemInputRole::Parameter => {
                 input.copy_from_slice(parameters[parameter_index].values);
                 parameter_index += 1;
             }

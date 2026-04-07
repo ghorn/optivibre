@@ -70,6 +70,19 @@ fn derive_vectorize_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenSt
         let value_expr = construct_value_expr(&field.ty, &leaf_ident);
         quote! { #access: #value_expr }
     });
+    let layout_name_statements = data.fields.iter().enumerate().map(|(index, field)| {
+        let component = field
+            .ident
+            .as_ref()
+            .map_or_else(|| format!("[{index}]"), ToString::to_string);
+        let field_ty = &field.ty;
+        quote! {
+            <#field_ty as ::optimization::Vectorize<#leaf_ident>>::flat_layout_names(
+                &::optimization::extend_layout_name(prefix, #component)
+                , out
+            )
+        }
+    });
     let view_field_defs = data.fields.iter().enumerate().map(|(index, field)| {
         let access = field.ident.clone().map_or_else(
             || {
@@ -221,6 +234,10 @@ fn derive_vectorize_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenSt
             {
                 #view_construct_expr
             }
+
+            fn flat_layout_names(prefix: &str, out: &mut ::std::vec::Vec<::std::string::String>) {
+                #(#layout_name_statements;)*
+            }
         }
     })
 }
@@ -284,8 +301,17 @@ fn rebind_generics(
 }
 
 fn rebind_expr_path(ident: &Ident, generics: &Generics) -> proc_macro2::TokenStream {
+    let replacement: Type = parse_quote!(U);
+    rebind_expr_path_with_replacement(ident, generics, &replacement)
+}
+
+fn rebind_expr_path_with_replacement(
+    ident: &Ident,
+    generics: &Generics,
+    replacement: &Type,
+) -> proc_macro2::TokenStream {
     let args = generics.params.iter().map(|param| match param {
-        GenericParam::Type(_) => quote!(U),
+        GenericParam::Type(_) => quote!(#replacement),
         GenericParam::Lifetime(lifetime) => {
             let lifetime = &lifetime.lifetime;
             quote!(#lifetime)

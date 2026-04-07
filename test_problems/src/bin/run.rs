@@ -27,22 +27,18 @@ fn main() -> Result<()> {
             }
             "--solver" => {
                 let Some(value) = args.next() else {
-                    bail!("--solver requires sqp|interior_point|ipopt|both|all");
+                    bail!("--solver requires sqp|nlip|ipopt|both|all");
                 };
                 request.solvers = match value.as_str() {
                     "sqp" => vec![SolverKind::Sqp],
-                    "interior_point" | "ip" => vec![SolverKind::InteriorPoint],
+                    "nlip" | "ip" => vec![SolverKind::Nlip],
                     #[cfg(feature = "ipopt")]
                     "ipopt" => vec![SolverKind::Ipopt],
-                    "both" => vec![SolverKind::Sqp, SolverKind::InteriorPoint],
+                    "both" => vec![SolverKind::Sqp, SolverKind::Nlip],
                     #[cfg(not(feature = "ipopt"))]
-                    "all" => vec![SolverKind::Sqp, SolverKind::InteriorPoint],
+                    "all" => vec![SolverKind::Sqp, SolverKind::Nlip],
                     #[cfg(feature = "ipopt")]
-                    "all" => vec![
-                        SolverKind::Sqp,
-                        SolverKind::InteriorPoint,
-                        SolverKind::Ipopt,
-                    ],
+                    "all" => vec![SolverKind::Sqp, SolverKind::Nlip, SolverKind::Ipopt],
                     _ => bail!("unknown solver: {value}"),
                 };
             }
@@ -136,6 +132,6 @@ fn main() -> Result<()> {
 
 fn print_help() {
     println!(
-        "Usage: cargo run --release -p test_problems -- [--problem ID]... [--solver sqp|interior_point|ipopt|both|all] [--problem-set fast|slow|all] [--jit-opt 0|2|3|s|all] [--jobs N] [--output-dir DIR] [--include-skipped] [--no-progress]"
+        "Usage: cargo run --release -p test_problems -- [--problem ID]... [--solver sqp|nlip|ipopt|both|all] [--problem-set fast|slow|all] [--jit-opt 0|2|3|s|all] [--jobs N] [--output-dir DIR] [--include-skipped] [--no-progress]"
     );
 }

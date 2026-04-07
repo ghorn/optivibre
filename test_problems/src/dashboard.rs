@@ -18,6 +18,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
 <head>
   <meta charset="utf-8">
   <title>ad_codegen_rs solver dashboard</title>
+  <script defer src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
   <style>
     :root {{
       --bg: #0f172a;
@@ -173,7 +174,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
     .bad {{ color: var(--fail); }}
     .skip {{ color: var(--skip); }}
     .solver-sqp {{ color: var(--sqp); }}
-    .solver-interior_point {{ color: var(--ip); }}
+    .solver-nlip {{ color: var(--ip); }}
     .solver-ipopt {{ color: var(--ipopt); }}
     .grid-2 {{
       display: grid;
@@ -209,6 +210,13 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
       height: 11px;
       display: inline-block;
       transform: rotate(45deg);
+    }}
+    .scatter-plot {{
+      min-height: 320px;
+      border-radius: 12px;
+      overflow: hidden;
+      background: linear-gradient(180deg, rgba(11, 18, 32, 0.88), rgba(8, 13, 24, 0.98));
+      border: 1px solid var(--border-soft);
     }}
     .chart-point {{ cursor: pointer; }}
     .tooltip {{
@@ -360,14 +368,14 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
           <span class="legend-item"><span class="dot" style="background:var(--fail)"></span>failed</span>
           <span class="legend-item"><span class="dot" style="background:var(--skip)"></span>skipped</span>
           <span class="legend-item"><span class="dot" style="background:#cbd5e1"></span>SQP</span>
-          <span class="legend-item"><span class="square" style="background:#cbd5e1"></span>native IP</span>
+          <span class="legend-item"><span class="square" style="background:#cbd5e1"></span>NLIP</span>
           <span class="legend-item"><span class="diamond" style="background:#cbd5e1"></span>IPOPT</span>
         </div>
-        <div id="chart-vars-iters"></div>
+        <div id="chart-vars-iters" class="scatter-plot"></div>
       </div>
       <div class="card">
         <h2>Total Time vs DOF</h2>
-        <div id="chart-dof-time"></div>
+        <div id="chart-dof-time" class="scatter-plot"></div>
       </div>
     </div>
 
@@ -412,7 +420,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
     ];
 
     const statusOrder = ["passed", "reduced_accuracy", "failed_validation", "solve_error", "skipped"];
-    const solverOrder = ["sqp", "interior_point", "ipopt"];
+    const solverOrder = ["sqp", "nlip", "ipopt"];
 
     const byId = (id) => document.getElementById(id);
 
@@ -447,7 +455,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
     const solverLabel = (solver) => {{
       switch (solver) {{
         case "sqp": return "SQP";
-        case "interior_point": return "native IP";
+        case "nlip": return "NLIP";
         case "ipopt": return "IPOPT";
         default: return solver;
       }}
@@ -629,63 +637,93 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
       return `<div class="metric"><div class="label">${{htmlEscape(label)}}</div><div class="value ${{cls}}">${{htmlEscape(value)}}</div><div class="sub">${{htmlEscape(sub)}}</div></div>`;
     }}
 
-    function shapeForSolver(record, x, y, fill) {{
-      const tip = htmlEscape(hoverText(record, currentScatterMeta.xLabel, currentScatterMeta.yLabel, currentScatterMeta.xValue(record), currentScatterMeta.yValue(record)));
-      const href = problemHref(record);
-      let shape = '';
-      switch (record.solver) {{
-        case 'sqp':
-          shape = `<circle class="chart-point" cx="${{x.toFixed(1)}}" cy="${{y.toFixed(1)}}" r="5.2" fill="${{fill}}" data-tip="${{tip}}"></circle>`;
-          break;
-        case 'interior_point':
-          shape = `<rect class="chart-point" x="${{(x - 5.2).toFixed(1)}}" y="${{(y - 5.2).toFixed(1)}}" width="10.4" height="10.4" fill="${{fill}}" data-tip="${{tip}}"></rect>`;
-          break;
-        case 'ipopt':
-          shape = `<polygon class="chart-point" points="${{x.toFixed(1)}},${{(y - 6).toFixed(1)}} ${{(x + 6).toFixed(1)}},${{y.toFixed(1)}} ${{x.toFixed(1)}},${{(y + 6).toFixed(1)}} ${{(x - 6).toFixed(1)}},${{y.toFixed(1)}}" fill="${{fill}}" data-tip="${{tip}}"></polygon>`;
-          break;
-      }}
-      return href ? `<a href="${{htmlEscape(href)}}">${{shape}}</a>` : shape;
-    }}
+    const scatterStatusColor = (status) => ({{
+      passed: '#34d399',
+      reduced_accuracy: '#fbbf24',
+      failed_validation: '#f87171',
+      solve_error: '#f87171',
+      skipped: '#94a3b8',
+    }})[status] || '#94a3b8';
 
-    let currentScatterMeta = null;
+    const scatterSolverSymbol = (solver) => ({{
+      sqp: 'circle',
+      nlip: 'square',
+      ipopt: 'diamond',
+    }})[solver] || 'circle';
+
+    function scatterTrace(records, solver, xLabel, yLabel, xValue, yValue) {{
+      const solverRecords = records.filter((record) => record.solver === solver);
+      return {{
+        type: 'scatter',
+        mode: 'markers',
+        name: solverLabel(solver),
+        x: solverRecords.map((record) => xValue(record)),
+        y: solverRecords.map((record) => yValue(record)),
+        text: solverRecords.map((record) => hoverText(record, xLabel, yLabel, xValue(record), yValue(record))),
+        customdata: solverRecords.map((record) => problemHref(record) || ''),
+        marker: {{
+          color: solverRecords.map((record) => scatterStatusColor(record.status)),
+          symbol: scatterSolverSymbol(solver),
+          size: 11,
+          line: {{ color: 'rgba(11, 18, 32, 0.95)', width: 1.2 }},
+        }},
+        hovertemplate: '%{{text}}<extra>' + htmlEscape(solverLabel(solver)) + '</extra>',
+      }};
+    }}
 
     function renderScatter(records, mountId, xLabel, yLabel, xValue, yValue) {{
       const mount = byId(mountId);
       if (!records.length) {{
+        if (window.Plotly) {{
+          window.Plotly.purge(mount);
+        }}
         mount.innerHTML = '<div class="empty-state">No runs match the current filters.</div>';
         return;
       }}
-      currentScatterMeta = {{ xLabel, yLabel, xValue, yValue }};
-      const width = 640;
-      const height = 320;
-      const left = 58;
-      const right = 18;
-      const top = 14;
-      const bottom = 40;
-      const plotWidth = width - left - right;
-      const plotHeight = height - top - bottom;
-      const maxX = Math.max(1, ...records.map(xValue));
-      const maxY = Math.max(1, ...records.map(yValue));
-      const points = records.map((record) => {{
-        const x = left + (xValue(record) / maxX) * plotWidth;
-        const y = top + plotHeight - (yValue(record) / maxY) * plotHeight;
-        const fill = {{
-          passed: '#34d399',
-          reduced_accuracy: '#fbbf24',
-          failed_validation: '#f87171',
-          solve_error: '#f87171',
-          skipped: '#94a3b8',
-        }}[record.status] || '#94a3b8';
-        return shapeForSolver(record, x, y, fill);
-      }}).join('');
-      mount.innerHTML = `
-        <svg width="100%" viewBox="0 0 ${{width}} ${{height}}" role="img" aria-label="${{htmlEscape(yLabel)}} vs ${{htmlEscape(xLabel)}}">
-          <line x1="${{left}}" y1="${{top}}" x2="${{left}}" y2="${{top + plotHeight}}" stroke="#475569"></line>
-          <line x1="${{left}}" y1="${{top + plotHeight}}" x2="${{left + plotWidth}}" y2="${{top + plotHeight}}" stroke="#475569"></line>
-          <text x="${{left + plotWidth / 2}}" y="${{height - 8}}" fill="#cbd5e1" text-anchor="middle" font-size="12">${{htmlEscape(xLabel)}}</text>
-          <text x="16" y="${{top + plotHeight / 2}}" fill="#cbd5e1" text-anchor="middle" font-size="12" transform="rotate(-90 16 ${{top + plotHeight / 2}})">${{htmlEscape(yLabel)}}</text>
-          ${{points}}
-        </svg>`;
+      if (!window.Plotly) {{
+        mount.innerHTML = '<div class="empty-state">Plotly is still loading.</div>';
+        return;
+      }}
+      mount.innerHTML = '';
+      const traces = solverOrder
+        .map((solver) => scatterTrace(records, solver, xLabel, yLabel, xValue, yValue))
+        .filter((trace) => trace.x.length > 0);
+      const layout = {{
+        paper_bgcolor: 'rgba(0,0,0,0)',
+        plot_bgcolor: 'rgba(11, 18, 32, 0.88)',
+        margin: {{ l: 58, r: 18, t: 14, b: 48 }},
+        font: {{ color: '#e2e8f0', family: 'ui-sans-serif, system-ui, sans-serif', size: 12 }},
+        legend: {{ orientation: 'h', y: -0.22, x: 0, font: {{ color: '#94a3b8', size: 11 }} }},
+        hoverlabel: {{ bgcolor: 'rgba(11, 18, 32, 0.98)', bordercolor: '#334155', font: {{ color: '#e2e8f0' }} }},
+        xaxis: {{
+          title: xLabel,
+          gridcolor: 'rgba(148, 163, 184, 0.12)',
+          linecolor: '#475569',
+          zeroline: false,
+          ticks: 'outside',
+          titlefont: {{ color: '#cbd5e1' }},
+        }},
+        yaxis: {{
+          title: yLabel,
+          gridcolor: 'rgba(148, 163, 184, 0.12)',
+          linecolor: '#475569',
+          zeroline: false,
+          ticks: 'outside',
+          titlefont: {{ color: '#cbd5e1' }},
+        }},
+      }};
+      const config = {{ responsive: true, displaylogo: false, displayModeBar: false }};
+      window.Plotly.react(mount, traces, layout, config).then(() => {{
+        if (!mount.__problemLinkBound && typeof mount.on === 'function') {{
+          mount.on('plotly_click', (event) => {{
+            const href = event?.points?.[0]?.customdata;
+            if (href) {{
+              window.location.href = href;
+            }}
+          }});
+          mount.__problemLinkBound = true;
+        }}
+      }});
     }}
 
     function renderSlowest(records) {{

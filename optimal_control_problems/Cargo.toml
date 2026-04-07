@@ -1,0 +1,28 @@
+[package]
+name = "optimal_control_problems"
+version.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+description = "Reference optimal-control problems and visualization payloads for the optimal_control crate."
+
+[lints]
+workspace = true
+
+[features]
+default = ["ipopt"]
+ipopt = ["optimal_control/ipopt", "optimization/ipopt"]
+
+[dependencies]
+anyhow.workspace = true
+optimal_control = { path = "../optimal_control" }
+optimization = { path = "../optimization" }
+serde.workspace = true
+serde_json.workspace = true
+sx_core = { path = "../sx_core" }
+
+[dev-dependencies]
+approx.workspace = true

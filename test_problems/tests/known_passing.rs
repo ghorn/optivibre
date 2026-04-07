@@ -37,8 +37,8 @@ fn known_passing_sqp_fast_cases_stay_green() {
 }
 
 #[test]
-fn known_passing_interior_point_fast_cases_stay_green() {
-    assert_known_passing_solver(SolverKind::InteriorPoint, Some(ProblemSpeed::Fast));
+fn known_passing_nlip_fast_cases_stay_green() {
+    assert_known_passing_solver(SolverKind::Nlip, Some(ProblemSpeed::Fast));
 }
 
 #[test]
@@ -49,6 +49,6 @@ fn known_passing_sqp_full_suite_stays_green() {
 
 #[test]
 #[ignore = "slow full-suite regression"]
-fn known_passing_interior_point_full_suite_stays_green() {
-    assert_known_passing_solver(SolverKind::InteriorPoint, None);
+fn known_passing_nlip_full_suite_stays_green() {
+    assert_known_passing_solver(SolverKind::Nlip, None);
 }

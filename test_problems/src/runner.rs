@@ -25,7 +25,7 @@ impl Default for RunRequest {
     fn default() -> Self {
         Self {
             problem_ids: None,
-            solvers: vec![SolverKind::Sqp, SolverKind::InteriorPoint],
+            solvers: vec![SolverKind::Sqp, SolverKind::Nlip],
             run_options: vec![ProblemRunOptions {
                 jit_opt_level: JitOptLevel::O3,
             }],
@@ -67,7 +67,7 @@ pub fn run_cases(request: &RunRequest) -> Result<RunResults> {
                         .ok_or_else(|| anyhow!("missing manifest entry for {}", case.id))?;
                     let expected = match solver {
                         SolverKind::Sqp => manifest.sqp,
-                        SolverKind::InteriorPoint => manifest.interior_point,
+                        SolverKind::Nlip => manifest.nlip,
                         #[cfg(feature = "ipopt")]
                         SolverKind::Ipopt => manifest.ipopt,
                     };
@@ -76,7 +76,7 @@ pub fn run_cases(request: &RunRequest) -> Result<RunResults> {
                     }
                     let max_iters_limit = match solver {
                         SolverKind::Sqp => manifest.max_iters.sqp,
-                        SolverKind::InteriorPoint => manifest.max_iters.interior_point,
+                        SolverKind::Nlip => manifest.max_iters.nlip,
                         #[cfg(feature = "ipopt")]
                         SolverKind::Ipopt => manifest.max_iters.ipopt,
                     };

@@ -1,0 +1,1133 @@
+use crate::common::{
+    ControlSpec, FromMap, LatexSection, MetricKey, PlotMode, ProblemId, ProblemSpec, Scene2D,
+    ScenePath, SolveArtifact, SolveStreamEvent, SolverMethod, SolverReport, SqpConfig,
+    TranscriptionConfig, TranscriptionMethod, chart, default_solver_method, default_sqp_config,
+    default_transcription, deg_to_rad, emit_symbolic_setup_status, expect_finite,
+    interval_arc_bound_series, interval_arc_series, metric_with_key, node_times,
+    numeric_metric_with_key, rad_to_deg, sample_or_default, segmented_bound_series,
+    segmented_series, solve_direct_collocation_problem,
+    solve_direct_collocation_problem_with_progress, solve_multiple_shooting_problem,
+    solve_multiple_shooting_problem_with_progress, solver_config_from_map, solver_controls,
+    solver_method_from_map, transcription_controls, transcription_from_map, transcription_metrics,
+    trapezoid_integral,
+};
+use anyhow::{Result, anyhow};
+use optimal_control::{
+    Bounds1D, DirectCollocation, DirectCollocationInitialGuess, DirectCollocationRuntimeValues,
+    DirectCollocationTimeGrid, DirectCollocationTrajectories, IntervalArc, MultipleShooting,
+    MultipleShootingInitialGuess, MultipleShootingRuntimeValues, MultipleShootingTrajectories, Ocp,
+    direct_collocation_root_arcs, direct_collocation_state_like_arcs,
+};
+use serde::Serialize;
+use std::f64::consts::PI;
+use sx_core::SX;
+const RK4_SUBSTEPS: usize = 2;
+const DEFAULT_INTERVALS: usize = 30;
+const DEFAULT_COLLOCATION_DEGREE: usize = 3;
+const SUPPORTED_INTERVALS: [usize; 1] = [DEFAULT_INTERVALS];
+const SUPPORTED_DEGREES: [usize; 1] = [DEFAULT_COLLOCATION_DEGREE];
+const ASPECT_RATIO: f64 = 10.0;
+const EFFICIENCY: f64 = 0.95;
+const CL_SLOPE: f64 = 2.0 * PI * ASPECT_RATIO / 12.0;
+const CL_LOWER_BOUND: f64 = -0.5;
+const CL_UPPER_BOUND: f64 = 1.5;
+const GRAVITY: f64 = 9.81;
+const AIR_DENSITY: f64 = 1.15;
+const REFERENCE_AREA: f64 = 4.0;
+const GLIDER_MASS: f64 = 30.0;
+const SPEED_EPS: f64 = 1.0e-3;
+const INITIAL_ALTITUDE_M: f64 = 1.0;
+const LAUNCH_PATH_SEED_DEG: f64 = 12.0;
+const MIN_FLIGHT_TIME_S: f64 = 1.0;
+const MAX_FLIGHT_TIME_S: f64 = 500.0;
+#[derive(Clone, Debug, PartialEq, Serialize, optimization::Vectorize)]
+pub struct State<T> {
+    pub x: T,
+    pub altitude: T,
+    pub vx: T,
+    pub vy: T,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, optimization::Vectorize)]
+pub struct Control<T> {
+    pub alpha: T,
+}
+#[derive(Clone, Debug, PartialEq, optimization::Vectorize)]
+struct Path<T> {
+    altitude: T,
+    vx: T,
+    cl: T,
+    alpha_rate: T,
+}
+#[derive(Clone, Debug, PartialEq, optimization::Vectorize)]
+struct Boundary<T> {
+    x0: T,
+    altitude0: T,
+    speed_sq0: T,
+}
+#[derive(Clone, Debug)]
+pub struct Params {
+    pub launch_speed_mps: f64,
+    pub initial_alpha_deg: f64,
+    pub initial_time_guess_s: f64,
+    pub min_time_bound_s: f64,
+    pub max_time_bound_s: f64,
+    pub max_alpha_rate_deg_s: f64,
+    pub alpha_rate_regularization: f64,
+    pub solver_method: SolverMethod,
+    pub solver: SqpConfig,
+    pub transcription: TranscriptionConfig,
+}
+impl Default for Params {
+    fn default() -> Self {
+        Self {
+            launch_speed_mps: 30.0,
+            initial_alpha_deg: 7.0,
+            initial_time_guess_s: 5.0,
+            min_time_bound_s: MIN_FLIGHT_TIME_S,
+            max_time_bound_s: MAX_FLIGHT_TIME_S,
+            max_alpha_rate_deg_s: 25.0,
+            alpha_rate_regularization: 5.0e-3,
+            solver_method: default_solver_method(),
+            solver: default_sqp_config(),
+            transcription: default_transcription(DEFAULT_INTERVALS),
+        }
+    }
+}
+impl FromMap for Params {
+    fn from_map(values: &std::collections::BTreeMap<String, f64>) -> Result<Self> {
+        let defaults = Self::default();
+        let min_time_bound_s = expect_finite(
+            sample_or_default(values, "min_time_bound_s", defaults.min_time_bound_s),
+            "min_time_bound_s",
+        )?;
+        let max_time_bound_s = expect_finite(
+            sample_or_default(values, "max_time_bound_s", defaults.max_time_bound_s),
+            "max_time_bound_s",
+        )?;
+        if min_time_bound_s > max_time_bound_s {
+            return Err(anyhow!(
+                "min_time_bound_s must be less than or equal to max_time_bound_s"
+            ));
+        }
+        Ok(Self {
+            launch_speed_mps: expect_finite(
+                sample_or_default(values, "launch_speed_mps", defaults.launch_speed_mps),
+                "launch_speed_mps",
+            )?,
+            initial_alpha_deg: expect_finite(
+                sample_or_default(values, "initial_alpha_deg", defaults.initial_alpha_deg),
+                "initial_alpha_deg",
+            )?,
+            initial_time_guess_s: expect_finite(
+                sample_or_default(
+                    values,
+                    "initial_time_guess_s",
+                    defaults.initial_time_guess_s,
+                ),
+                "initial_time_guess_s",
+            )?,
+            min_time_bound_s,
+            max_time_bound_s,
+            max_alpha_rate_deg_s: expect_finite(
+                sample_or_default(
+                    values,
+                    "max_alpha_rate_deg_s",
+                    defaults.max_alpha_rate_deg_s,
+                ),
+                "max_alpha_rate_deg_s",
+            )?,
+            alpha_rate_regularization: expect_finite(
+                sample_or_default(
+                    values,
+                    "alpha_rate_regularization",
+                    defaults.alpha_rate_regularization,
+                ),
+                "alpha_rate_regularization",
+            )?,
+            solver_method: solver_method_from_map(values, defaults.solver_method)?,
+            solver: solver_config_from_map(values, defaults.solver)?,
+            transcription: transcription_from_map(
+                values,
+                defaults.transcription,
+                &SUPPORTED_INTERVALS,
+                &SUPPORTED_DEGREES,
+            )?,
+        })
+    }
+}
+pub fn spec() -> ProblemSpec {
+    let mut controls = transcription_controls(
+        Params::default().transcription,
+        &SUPPORTED_INTERVALS,
+        &SUPPORTED_DEGREES,
+    );
+    controls.extend(solver_controls(
+        Params::default().solver_method,
+        Params::default().solver,
+    ));
+    controls.extend(vec![
+        ControlSpec {
+            id: "launch_speed_mps".to_string(),
+            label: "Launch Speed".to_string(),
+            min: 10.0,
+            max: 50.0,
+            step: 0.5,
+            default: Params::default().launch_speed_mps,
+            unit: "m/s".to_string(),
+            help: "Initial speed magnitude. The optimizer chooses the launch angle subject to this speed norm.".to_string(),
+            choices: Vec::new(),
+            ..Default::default()
+        },
+        ControlSpec {
+            id: "initial_alpha_deg".to_string(),
+            label: "Initial AoA Guess".to_string(),
+            min: 0.0,
+            max: 15.0,
+            step: 0.25,
+            default: Params::default().initial_alpha_deg,
+            unit: "deg".to_string(),
+            help: "Initial guess for the launch angle of attack. This is not a hard boundary condition.".to_string(),
+            choices: Vec::new(),
+            ..Default::default()
+        },
+        ControlSpec {
+            id: "initial_time_guess_s".to_string(),
+            label: "Initial Time Guess".to_string(),
+            min: 0.0,
+            max: 60.0,
+            step: 0.25,
+            default: Params::default().initial_time_guess_s,
+            unit: "s".to_string(),
+            help: "Initial guess for the free final time.".to_string(),
+            choices: Vec::new(),
+            ..Default::default()
+        },
+        ControlSpec {
+            id: "min_time_bound_s".to_string(),
+            label: "Min Final Time".to_string(),
+            min: 0.0,
+            max: 500.0,
+            step: 0.5,
+            default: Params::default().min_time_bound_s,
+            unit: "s".to_string(),
+            help: "Lower bound on the free final time.".to_string(),
+            choices: Vec::new(),
+            ..Default::default()
+        },
+        ControlSpec {
+            id: "max_time_bound_s".to_string(),
+            label: "Max Final Time".to_string(),
+            min: 1.0,
+            max: 500.0,
+            step: 1.0,
+            default: Params::default().max_time_bound_s,
+            unit: "s".to_string(),
+            help: "Upper bound on the free final time.".to_string(),
+            choices: Vec::new(),
+            ..Default::default()
+        },
+        ControlSpec {
+            id: "max_alpha_rate_deg_s".to_string(),
+            label: "AoA Rate Limit".to_string(),
+            min: 5.0,
+            max: 60.0,
+            step: 0.5,
+            default: Params::default().max_alpha_rate_deg_s,
+            unit: "deg/s".to_string(),
+            help: "How quickly the glider may retune its angle of attack.".to_string(),
+            choices: Vec::new(),
+            ..Default::default()
+        },
+        ControlSpec {
+            id: "alpha_rate_regularization".to_string(),
+            label: "AoA Rate Weight".to_string(),
+            min: 0.0,
+            max: 5.0e-2,
+            step: 5.0e-4,
+            default: Params::default().alpha_rate_regularization,
+            unit: "".to_string(),
+            help: "Quadratic stage-cost weight on angle-of-attack rate.".to_string(),
+            choices: Vec::new(),
+            ..Default::default()
+        },
+    ]);
+    ProblemSpec {
+        id: ProblemId::OptimalDistanceGlider,
+        name: "Optimal Distance Glider".to_string(),
+        description: "A planar particle glider with free final time, a launch-angle choice enforced through an initial speed-magnitude constraint, and downrange-distance maximization under altitude, forward-speed, lift-coefficient, and control-rate limits.".to_string(),
+        controls,
+        math_sections: vec![
+            LatexSection {
+                title: "Physical State".to_string(),
+                entries: vec![r"\mathbf{x} = \begin{bmatrix} x & h & v_x & v_y \end{bmatrix}^{\mathsf T}".to_string()],
+            },
+            LatexSection {
+                title: "Control-State".to_string(),
+                entries: vec![r"\mathbf{u} = \begin{bmatrix} \alpha \end{bmatrix}, \qquad \dot{\mathbf{u}} = \begin{bmatrix} \nu_\alpha \end{bmatrix}".to_string()],
+            },
+            LatexSection {
+                title: "Aerodynamic Relations".to_string(),
+                entries: vec![
+                    r"C_L = 2 \pi \alpha \frac{10}{12}, \qquad -0.5 \le C_L \le 1.5".to_string(),
+                    r"C_D = 0.001 + \frac{C_L^2}{\pi \cdot 10 \cdot 0.95}".to_string(),
+                    r"L = \tfrac{1}{2} \rho V^2 C_L S_{\mathrm{ref}}, \qquad D = \tfrac{1}{2} \rho V^2 C_D S_{\mathrm{ref}}".to_string(),
+                    r"\rho = 1.15, \qquad S_{\mathrm{ref}} = 4.0, \qquad m = 30.0, \qquad \hat{\mathbf{e}}_D = -\frac{1}{V}\begin{bmatrix} v_x \\ v_y \end{bmatrix}, \qquad \hat{\mathbf{e}}_L = \frac{1}{V}\begin{bmatrix} -v_y \\ v_x \end{bmatrix}".to_string(),
+                    r"\left(\frac{L}{D}\right)(\alpha) = \frac{C_L}{C_D}".to_string(),
+                ],
+            },
+            LatexSection {
+                title: "Objective".to_string(),
+                entries: vec![
+                    r"J = \int_0^T w_{\dot{\alpha}} \, \nu_\alpha^2 \, dt - x(T)".to_string(),
+                ],
+            },
+            LatexSection {
+                title: "Boundary and Path Constraints".to_string(),
+                entries: vec![
+                    r"x(0) = 0, \qquad h(0) = 1, \qquad v_x(0)^2 + v_y(0)^2 = V_{\mathrm{launch}}^2".to_string(),
+                    r"h(t) \ge 0, \qquad v_x(t) \ge 0, \qquad -0.5 \le C_L \le 1.5, \qquad |\nu_\alpha| \le \nu_{\alpha,\max}".to_string(),
+                    r"T_{\min} \le T \le T_{\max}".to_string(),
+                ],
+            },
+            LatexSection {
+                title: "Differential Equations".to_string(),
+                entries: vec![
+                    r"V = \sqrt{v_x^2 + v_y^2}, \qquad q_m = \frac{1}{2m} \rho V^2 S_{\mathrm{ref}}".to_string(),
+                    r"\dot{x} = v_x".to_string(),
+                    r"\dot{h} = v_y".to_string(),
+                    r"\dot{v}_x = q_m \left(C_D \hat{e}_{D,x} + C_L \hat{e}_{L,x}\right)".to_string(),
+                    r"\dot{v}_y = q_m \left(C_D \hat{e}_{D,y} + C_L \hat{e}_{L,y}\right) - g".to_string(),
+                    r"\dot{\alpha} = \nu_\alpha".to_string(),
+                ],
+            },
+        ],
+        notes: vec![
+            "The lift curve uses CL = 2*pi*alpha*10/12, with the path constraint applied directly as -0.5 <= CL <= 1.5.".to_string(),
+            "The particle model carries translational velocity directly, with drag opposing the velocity vector and lift acting orthogonally as (-v_y, v_x)/V.".to_string(),
+            "Aerodynamic forces now use L = 0.5*rho*V^2*C_L*S_ref and D = 0.5*rho*V^2*C_D*S_ref with rho = 1.15, S_ref = 4.0 m^2, and mass = 30.0 kg.".to_string(),
+            "The launch angle and initial AoA are free: the boundary conditions fix x(0)=0, h(0)=1 m, and ||v(0)|| = V_launch while letting the optimizer choose the vx/vy split and α(0).".to_string(),
+            "Final time is free with configurable bounds T_min <= T <= T_max, so the solver can use a terminal flare if that increases downrange distance while respecting h(t) >= 0 and v_x(t) >= 0.".to_string(),
+        ],
+    }
+}
+fn cl(alpha: SX) -> SX {
+    CL_SLOPE * alpha
+}
+fn cd(alpha: SX) -> SX {
+    let cl_value = cl(alpha);
+    0.001 + cl_value.sqr() / (PI * ASPECT_RATIO * EFFICIENCY)
+}
+fn cl_numeric(alpha: f64) -> f64 {
+    CL_SLOPE * alpha
+}
+fn cd_numeric(alpha: f64) -> f64 {
+    let cl_value = cl_numeric(alpha);
+    0.001 + cl_value.powi(2) / (PI * ASPECT_RATIO * EFFICIENCY)
+}
+fn best_glide_alpha() -> f64 {
+    (0.001 * PI * ASPECT_RATIO * EFFICIENCY).sqrt() / CL_SLOPE
+}
+fn glide_ratio_numeric(alpha: f64) -> f64 {
+    let cl_value = cl_numeric(alpha);
+    let cd_value = cd_numeric(alpha);
+    cl_value / cd_value.max(1.0e-6)
+}
+fn seed_launch_velocity(params: &Params) -> (f64, f64) {
+    let path = deg_to_rad(LAUNCH_PATH_SEED_DEG);
+    (
+        params.launch_speed_mps * path.cos(),
+        params.launch_speed_mps * path.sin(),
+    )
+}
+fn glide_slope_deg(vx: f64, vy: f64) -> f64 {
+    rad_to_deg(vy.atan2(vx))
+}
+fn aerodynamic_acceleration_sx(state: &State<SX>, control: &Control<SX>) -> (SX, SX) {
+    let speed = (state.vx.sqr() + state.vy.sqr() + SPEED_EPS * SPEED_EPS).sqrt();
+    let inv_speed = SX::one() / speed;
+    let drag_x = -state.vx * inv_speed;
+    let drag_y = -state.vy * inv_speed;
+    let lift_x = -state.vy * inv_speed;
+    let lift_y = state.vx * inv_speed;
+    let force_per_mass = 0.5 * AIR_DENSITY * REFERENCE_AREA * speed.sqr() / GLIDER_MASS;
+    let cl_value = cl(control.alpha);
+    let cd_value = cd(control.alpha);
+    (
+        force_per_mass * (cd_value * drag_x + cl_value * lift_x),
+        force_per_mass * (cd_value * drag_y + cl_value * lift_y) - GRAVITY,
+    )
+}
+fn model_ms<const N: usize>(
+    params: &Params,
+) -> Ocp<State<SX>, Control<SX>, (), Path<SX>, Boundary<SX>, (), MultipleShooting<N, RK4_SUBSTEPS>>
+{
+    let alpha_rate_weight = params.alpha_rate_regularization;
+    Ocp::new("glider_problem", MultipleShooting::<N, RK4_SUBSTEPS>)
+        .objective_lagrange(
+            move |_: &State<SX>, _: &Control<SX>, alpha_rate: &Control<SX>, _: &()| {
+                alpha_rate_weight * alpha_rate.alpha.sqr()
+            },
+        )
+        .objective_mayer(
+            |_: &State<SX>,
+             _: &Control<SX>,
+             terminal: &State<SX>,
+             _: &Control<SX>,
+             _: &(),
+             _: &SX| { -terminal.x },
+        )
+        .ode(|state: &State<SX>, control: &Control<SX>, _: &()| {
+            let (ax, ay) = aerodynamic_acceleration_sx(state, control);
+            State {
+                x: state.vx,
+                altitude: state.vy,
+                vx: ax,
+                vy: ay,
+            }
+        })
+        .path_constraints(
+            |state: &State<SX>, control: &Control<SX>, alpha_rate: &Control<SX>, _: &()| Path {
+                altitude: state.altitude,
+                vx: state.vx,
+                cl: cl(control.alpha),
+                alpha_rate: alpha_rate.alpha,
+            },
+        )
+        .boundary_equalities(
+            |initial: &State<SX>,
+             _: &Control<SX>,
+             _: &State<SX>,
+             _: &Control<SX>,
+             _: &(),
+             _: &SX| Boundary {
+                x0: initial.x,
+                altitude0: initial.altitude,
+                speed_sq0: initial.vx.sqr() + initial.vy.sqr(),
+            },
+        )
+        .boundary_inequalities(
+            |_: &State<SX>, _: &Control<SX>, _: &State<SX>, _: &Control<SX>, _: &(), _: &SX| (),
+        )
+        .build()
+        .expect("glider model should build")
+}
+fn model_dc<const N: usize, const K: usize>(
+    params: &Params,
+) -> Ocp<State<SX>, Control<SX>, (), Path<SX>, Boundary<SX>, (), DirectCollocation<N, K>> {
+    let alpha_rate_weight = params.alpha_rate_regularization;
+    Ocp::new(
+        "glider_problem",
+        DirectCollocation::<N, K> {
+            family: params.transcription.collocation_family,
+        },
+    )
+    .objective_lagrange(
+        move |_: &State<SX>, _: &Control<SX>, alpha_rate: &Control<SX>, _: &()| {
+            alpha_rate_weight * alpha_rate.alpha.sqr()
+        },
+    )
+    .objective_mayer(
+        |_: &State<SX>, _: &Control<SX>, terminal: &State<SX>, _: &Control<SX>, _: &(), _: &SX| {
+            -terminal.x
+        },
+    )
+    .ode(|state: &State<SX>, control: &Control<SX>, _: &()| {
+        let (ax, ay) = aerodynamic_acceleration_sx(state, control);
+        State {
+            x: state.vx,
+            altitude: state.vy,
+            vx: ax,
+            vy: ay,
+        }
+    })
+    .path_constraints(
+        |state: &State<SX>, control: &Control<SX>, alpha_rate: &Control<SX>, _: &()| Path {
+            altitude: state.altitude,
+            vx: state.vx,
+            cl: cl(control.alpha),
+            alpha_rate: alpha_rate.alpha,
+        },
+    )
+    .boundary_equalities(
+        |initial: &State<SX>, _: &Control<SX>, _: &State<SX>, _: &Control<SX>, _: &(), _: &SX| {
+            Boundary {
+                x0: initial.x,
+                altitude0: initial.altitude,
+                speed_sq0: initial.vx.sqr() + initial.vy.sqr(),
+            }
+        },
+    )
+    .boundary_inequalities(
+        |_: &State<SX>, _: &Control<SX>, _: &State<SX>, _: &Control<SX>, _: &(), _: &SX| (),
+    )
+    .build()
+    .expect("glider model should build")
+}
+fn rollout_guess_ms<const N: usize>(
+    params: &Params,
+) -> MultipleShootingInitialGuess<State<f64>, Control<f64>, (), N> {
+    let trim_alpha = best_glide_alpha().max(0.01);
+    let (vx0, vy0) = seed_launch_velocity(params);
+    MultipleShootingInitialGuess::Rollout {
+        x0: State {
+            x: 0.0,
+            altitude: INITIAL_ALTITUDE_M,
+            vx: vx0,
+            vy: vy0,
+        },
+        u0: Control {
+            alpha: deg_to_rad(params.initial_alpha_deg),
+        },
+        tf: params
+            .initial_time_guess_s
+            .clamp(params.min_time_bound_s, params.max_time_bound_s),
+        controller: Box::new(move |_, _, u, _| Control {
+            alpha: 1.5 * (trim_alpha - u.alpha),
+        }),
+    }
+}
+fn rollout_guess_dc<const N: usize, const K: usize>(
+    params: &Params,
+) -> DirectCollocationInitialGuess<State<f64>, Control<f64>, (), N, K> {
+    let trim_alpha = best_glide_alpha().max(0.01);
+    let (vx0, vy0) = seed_launch_velocity(params);
+    DirectCollocationInitialGuess::Rollout {
+        x0: State {
+            x: 0.0,
+            altitude: INITIAL_ALTITUDE_M,
+            vx: vx0,
+            vy: vy0,
+        },
+        u0: Control {
+            alpha: deg_to_rad(params.initial_alpha_deg),
+        },
+        tf: params
+            .initial_time_guess_s
+            .clamp(params.min_time_bound_s, params.max_time_bound_s),
+        controller: Box::new(move |_, _, u, _| Control {
+            alpha: 1.5 * (trim_alpha - u.alpha),
+        }),
+    }
+}
+fn ms_runtime<const N: usize>(
+    params: &Params,
+) -> MultipleShootingRuntimeValues<(), Path<Bounds1D>, Boundary<f64>, (), State<f64>, Control<f64>, N>
+{
+    MultipleShootingRuntimeValues {
+        parameters: (),
+        beq: Boundary {
+            x0: 0.0,
+            altitude0: INITIAL_ALTITUDE_M,
+            speed_sq0: params.launch_speed_mps.powi(2),
+        },
+        bineq_bounds: (),
+        path_bounds: Path {
+            altitude: Bounds1D {
+                lower: Some(0.0),
+                upper: None,
+            },
+            vx: Bounds1D {
+                lower: Some(0.0),
+                upper: None,
+            },
+            cl: Bounds1D {
+                lower: Some(CL_LOWER_BOUND),
+                upper: Some(CL_UPPER_BOUND),
+            },
+            alpha_rate: Bounds1D {
+                lower: Some(-deg_to_rad(params.max_alpha_rate_deg_s)),
+                upper: Some(deg_to_rad(params.max_alpha_rate_deg_s)),
+            },
+        },
+        tf_bounds: Bounds1D {
+            lower: Some(params.min_time_bound_s),
+            upper: Some(params.max_time_bound_s),
+        },
+        initial_guess: rollout_guess_ms(params),
+    }
+}
+fn dc_runtime<const N: usize, const K: usize>(
+    params: &Params,
+) -> DirectCollocationRuntimeValues<
+    (),
+    Path<Bounds1D>,
+    Boundary<f64>,
+    (),
+    State<f64>,
+    Control<f64>,
+    N,
+    K,
+> {
+    DirectCollocationRuntimeValues {
+        parameters: (),
+        beq: Boundary {
+            x0: 0.0,
+            altitude0: INITIAL_ALTITUDE_M,
+            speed_sq0: params.launch_speed_mps.powi(2),
+        },
+        bineq_bounds: (),
+        path_bounds: Path {
+            altitude: Bounds1D {
+                lower: Some(0.0),
+                upper: None,
+            },
+            vx: Bounds1D {
+                lower: Some(0.0),
+                upper: None,
+            },
+            cl: Bounds1D {
+                lower: Some(CL_LOWER_BOUND),
+                upper: Some(CL_UPPER_BOUND),
+            },
+            alpha_rate: Bounds1D {
+                lower: Some(-deg_to_rad(params.max_alpha_rate_deg_s)),
+                upper: Some(deg_to_rad(params.max_alpha_rate_deg_s)),
+            },
+        },
+        tf_bounds: Bounds1D {
+            lower: Some(params.min_time_bound_s),
+            upper: Some(params.max_time_bound_s),
+        },
+        initial_guess: rollout_guess_dc(params),
+    }
+}
+pub fn solve(params: &Params) -> Result<SolveArtifact> {
+    match params.transcription.method {
+        TranscriptionMethod::MultipleShooting => {
+            solve_multiple_shooting::<DEFAULT_INTERVALS>(params)
+        }
+        TranscriptionMethod::DirectCollocation => {
+            solve_direct_collocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(params)
+        }
+    }
+}
+pub fn solve_with_progress<F>(params: &Params, emit: F) -> Result<SolveArtifact>
+where
+    F: FnMut(SolveStreamEvent) + Send,
+{
+    match params.transcription.method {
+        TranscriptionMethod::MultipleShooting => {
+            solve_multiple_shooting_with_progress::<DEFAULT_INTERVALS, F>(params, emit)
+        }
+        TranscriptionMethod::DirectCollocation => {
+            solve_direct_collocation_with_progress::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE, F>(
+                params, emit,
+            )
+        }
+    }
+}
+fn solve_multiple_shooting<const N: usize>(params: &Params) -> Result<SolveArtifact> {
+    let compiled = model_ms::<N>(params).compile_jit()?;
+    let runtime = ms_runtime::<N>(params);
+    solve_multiple_shooting_problem(
+        &compiled,
+        &runtime,
+        params.solver_method,
+        &params.solver,
+        |trajectories, x_arcs, u_arcs| {
+            artifact_from_ms_trajectories(params, trajectories, x_arcs, u_arcs)
+        },
+    )
+}
+fn solve_direct_collocation<const N: usize, const K: usize>(
+    params: &Params,
+) -> Result<SolveArtifact> {
+    let compiled = model_dc::<N, K>(params).compile_jit()?;
+    let runtime = dc_runtime::<N, K>(params);
+    solve_direct_collocation_problem(
+        &compiled,
+        &runtime,
+        params.solver_method,
+        &params.solver,
+        |trajectories, time_grid| artifact_from_dc_trajectories(params, trajectories, time_grid),
+    )
+}
+fn solve_multiple_shooting_with_progress<const N: usize, F>(
+    params: &Params,
+    mut emit: F,
+) -> Result<SolveArtifact>
+where
+    F: FnMut(SolveStreamEvent) + Send,
+{
+    emit_symbolic_setup_status(&mut emit);
+    let compiled = model_ms::<N>(params).compile_jit()?;
+    let runtime = ms_runtime::<N>(params);
+    solve_multiple_shooting_problem_with_progress(
+        &compiled,
+        &runtime,
+        params.solver_method,
+        &params.solver,
+        emit,
+        |trajectories, x_arcs, u_arcs| {
+            artifact_from_ms_trajectories(params, trajectories, x_arcs, u_arcs)
+        },
+    )
+}
+fn solve_direct_collocation_with_progress<const N: usize, const K: usize, F>(
+    params: &Params,
+    mut emit: F,
+) -> Result<SolveArtifact>
+where
+    F: FnMut(SolveStreamEvent) + Send,
+{
+    emit_symbolic_setup_status(&mut emit);
+    let compiled = model_dc::<N, K>(params).compile_jit()?;
+    let runtime = dc_runtime::<N, K>(params);
+    solve_direct_collocation_problem_with_progress(
+        &compiled,
+        &runtime,
+        params.solver_method,
+        &params.solver,
+        emit,
+        |trajectories, time_grid| artifact_from_dc_trajectories(params, trajectories, time_grid),
+    )
+}
+fn artifact_summary(
+    params: &Params,
+    tf: f64,
+    distance: f64,
+    terminal_ld: f64,
+    peak_altitude: f64,
+    trim_cost: f64,
+) -> Vec<crate::common::Metric> {
+    let mut summary = transcription_metrics(&params.transcription).to_vec();
+    summary.extend([
+        numeric_metric_with_key(
+            MetricKey::Distance,
+            "Distance",
+            distance,
+            format!("{distance:.1} m"),
+        ),
+        numeric_metric_with_key(MetricKey::FinalTime, "Final Time", tf, format!("{tf:.2} s")),
+        metric_with_key(
+            MetricKey::BestGlideAlpha,
+            "Best-L/D Alpha",
+            format!("{:.2} deg", rad_to_deg(best_glide_alpha())),
+        ),
+        metric_with_key(
+            MetricKey::TerminalLiftToDrag,
+            "Terminal L/D",
+            format!("{terminal_ld:.2}"),
+        ),
+        metric_with_key(
+            MetricKey::PeakAltitude,
+            "Peak Altitude",
+            format!("{peak_altitude:.2} m"),
+        ),
+        metric_with_key(MetricKey::TrimCost, "Rate Cost", format!("{trim_cost:.3}")),
+    ]);
+    summary
+}
+fn artifact_from_ms_trajectories<const N: usize>(
+    params: &Params,
+    trajectories: &MultipleShootingTrajectories<State<f64>, Control<f64>, N>,
+    x_arcs: &[IntervalArc<State<f64>>],
+    u_arcs: &[IntervalArc<Control<f64>>],
+) -> SolveArtifact {
+    let tf = trajectories.tf;
+    let times = node_times::<N>(tf);
+    let mut altitude = Vec::with_capacity(N + 1);
+    let mut vx = Vec::with_capacity(N + 1);
+    let mut vy = Vec::with_capacity(N + 1);
+    let mut alpha_rate = Vec::with_capacity(N + 1);
+    let mut ld_ratio = Vec::with_capacity(N + 1);
+    let mut x = Vec::with_capacity(N + 1);
+    let mut y = Vec::with_capacity(N + 1);
+    for index in 0..N {
+        let state = &trajectories.x.nodes[index];
+        let control = &trajectories.u.nodes[index];
+        let rate = &trajectories.dudt[index];
+        altitude.push(state.altitude);
+        vx.push(state.vx);
+        vy.push(state.vy);
+        alpha_rate.push(rad_to_deg(rate.alpha));
+        ld_ratio.push(glide_ratio_numeric(control.alpha));
+        x.push(state.x);
+        y.push(state.altitude);
+    }
+    let terminal = &trajectories.x.terminal;
+    let terminal_control = &trajectories.u.terminal;
+    altitude.push(terminal.altitude);
+    vx.push(terminal.vx);
+    vy.push(terminal.vy);
+    alpha_rate.push(*alpha_rate.last().unwrap_or(&0.0));
+    ld_ratio.push(glide_ratio_numeric(terminal_control.alpha));
+    x.push(terminal.x);
+    y.push(terminal.altitude);
+    let distance = *x.last().unwrap_or(&0.0);
+    let trim_cost = trapezoid_integral(
+        &times,
+        &alpha_rate
+            .iter()
+            .map(|value| value * value)
+            .collect::<Vec<_>>(),
+    );
+    SolveArtifact {
+        title: "Optimal Distance Glider".to_string(),
+        summary: artifact_summary(
+            params,
+            tf,
+            distance,
+            *ld_ratio.last().unwrap_or(&0.0),
+            altitude.iter().fold(f64::NEG_INFINITY, |acc, value| acc.max(*value)),
+            trim_cost,
+        ),
+        solver: SolverReport::placeholder(),
+        constraint_panels: Default::default(),
+        charts: vec![
+            chart(
+                "Downrange x",
+                "Downrange x (m)",
+                interval_arc_series("x (m)", x_arcs, PlotMode::LinesMarkers, |state| state.x),
+            ),
+            chart(
+                "Altitude",
+                "Altitude (m)",
+                {
+                    let mut series_out = interval_arc_series(
+                        "Altitude (m)",
+                        x_arcs,
+                        PlotMode::LinesMarkers,
+                        |state| state.altitude,
+                    );
+                    series_out.extend(interval_arc_bound_series(
+                        x_arcs,
+                        Some(0.0),
+                        None,
+                        PlotMode::Lines,
+                    ));
+                    series_out
+                },
+            ),
+            chart(
+                "Horizontal Velocity",
+                "v_x (m/s)",
+                {
+                    let mut series_out = interval_arc_series(
+                        "v_x (m/s)",
+                        x_arcs,
+                        PlotMode::LinesMarkers,
+                        |state| state.vx,
+                    );
+                    series_out.extend(interval_arc_bound_series(
+                        x_arcs,
+                        Some(0.0),
+                        None,
+                        PlotMode::Lines,
+                    ));
+                    series_out
+                },
+            ),
+            chart(
+                "Vertical Velocity",
+                "v_y (m/s)",
+                interval_arc_series("v_y (m/s)", x_arcs, PlotMode::LinesMarkers, |state| state.vy),
+            ),
+            chart(
+                "Velocity Norm",
+                "‖v‖ (m/s)",
+                interval_arc_series("‖v‖ (m/s)", x_arcs, PlotMode::LinesMarkers, |state| {
+                    (state.vx * state.vx + state.vy * state.vy).sqrt()
+                }),
+            ),
+            chart(
+                "Glide Slope",
+                "Glide Slope (deg)",
+                interval_arc_series("Glide Slope (deg)", x_arcs, PlotMode::LinesMarkers, |state| {
+                    glide_slope_deg(state.vx, state.vy)
+                }),
+            ),
+            chart(
+                "Lift Coefficient",
+                "C_L (-)",
+                {
+                    let mut series_out = interval_arc_series(
+                        "C_L (-)",
+                        u_arcs,
+                        PlotMode::LinesMarkers,
+                        |control| cl_numeric(control.alpha),
+                    );
+                    series_out.extend(interval_arc_bound_series(
+                        u_arcs,
+                        Some(CL_LOWER_BOUND),
+                        Some(CL_UPPER_BOUND),
+                        PlotMode::Lines,
+                    ));
+                    series_out
+                },
+            ),
+            chart(
+                "Angle of Attack",
+                "Angle of Attack (deg)",
+                interval_arc_series(
+                    "AoA (deg)",
+                    u_arcs,
+                    PlotMode::LinesMarkers,
+                    |control| rad_to_deg(control.alpha),
+                ),
+            ),
+            chart(
+                "Angle of Attack Rate",
+                "AoA Rate (deg/s)",
+                {
+                    let mut series_out = segmented_series(
+                        "AoA Rate (deg/s)",
+                        x_arcs.iter().enumerate().map(|(interval, arc)| {
+                            (
+                                arc.times.clone(),
+                                vec![rad_to_deg(trajectories.dudt[interval].alpha); arc.times.len()],
+                            )
+                        }),
+                        PlotMode::LinesMarkers,
+                    );
+                    series_out.extend(segmented_bound_series(
+                        x_arcs.iter().map(|arc| arc.times.clone()),
+                        Some(-params.max_alpha_rate_deg_s),
+                        Some(params.max_alpha_rate_deg_s),
+                        PlotMode::Lines,
+                    ));
+                    series_out
+                },
+            ),
+        ],
+        scene: Scene2D {
+            title: "Glide Path".to_string(),
+            x_label: "Downrange x (m)".to_string(),
+            y_label: "Altitude (m)".to_string(),
+            paths: vec![ScenePath {
+                name: "Trajectory".to_string(),
+                x,
+                y,
+            }],
+            circles: Vec::new(),
+            arrows: Vec::new(),
+            animation: None,
+        },
+        notes: vec![
+            "The particle model uses velocity states directly, with drag aligned opposite motion and lift using the orthogonal direction (-v_y, v_x)/V.".to_string(),
+            "Lift and drag are computed from dynamic pressure using rho = 1.15 kg/m^3, S_ref = 4.0 m^2, and mass = 30.0 kg.".to_string(),
+            "The bounded aerodynamic path constraint is applied directly to lift coefficient, with -0.5 <= C_L <= 1.5 rendered as red overlays.".to_string(),
+            "Altitude and forward speed are constrained as h(t) >= 0 and v_x(t) >= 0 throughout the trajectory, with free final time 1 <= T <= 500 s.".to_string(),
+        ],
+    }
+}
+fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
+    params: &Params,
+    trajectories: &DirectCollocationTrajectories<State<f64>, Control<f64>, N, K>,
+    time_grid: &DirectCollocationTimeGrid<N, K>,
+) -> SolveArtifact {
+    let x_arcs =
+        direct_collocation_state_like_arcs(&trajectories.x, &trajectories.root_x, time_grid)
+            .expect("collocation state arcs should match trajectory layout");
+    let u_arcs =
+        direct_collocation_state_like_arcs(&trajectories.u, &trajectories.root_u, time_grid)
+            .expect("collocation control-state arcs should match trajectory layout");
+    let dudt_arcs = direct_collocation_root_arcs(&trajectories.root_dudt, time_grid);
+    let mut x = Vec::with_capacity(N + 1);
+    let mut y = Vec::with_capacity(N + 1);
+    let mut peak_altitude = f64::NEG_INFINITY;
+    for index in 0..N {
+        let state = &trajectories.x.nodes[index];
+        x.push(state.x);
+        y.push(state.altitude);
+        peak_altitude = peak_altitude.max(state.altitude);
+    }
+    x.push(trajectories.x.terminal.x);
+    y.push(trajectories.x.terminal.altitude);
+    peak_altitude = peak_altitude.max(trajectories.x.terminal.altitude);
+    let root_times = dudt_arcs
+        .iter()
+        .flat_map(|arc| arc.times.iter().copied())
+        .collect::<Vec<_>>();
+    let root_rates = (0..N)
+        .flat_map(|interval| {
+            (0..K)
+                .map(move |root| rad_to_deg(trajectories.root_dudt.intervals[interval][root].alpha))
+        })
+        .collect::<Vec<_>>();
+    let trim_cost = if root_times.len() >= 2 {
+        trapezoid_integral(
+            &root_times,
+            &root_rates
+                .iter()
+                .map(|value| value * value)
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        0.0
+    };
+    SolveArtifact {
+        title: "Optimal Distance Glider".to_string(),
+        summary: artifact_summary(
+            params,
+            trajectories.tf,
+            trajectories.x.terminal.x,
+            glide_ratio_numeric(trajectories.u.terminal.alpha),
+            peak_altitude,
+            trim_cost,
+        ),
+        solver: SolverReport::placeholder(),
+        constraint_panels: Default::default(),
+        charts: vec![
+            chart(
+                "Downrange x",
+                "Downrange x (m)",
+                interval_arc_series("x (m)", &x_arcs, PlotMode::LinesMarkers, |state| state.x),
+            ),
+            chart(
+                "Altitude",
+                "Altitude (m)",
+                {
+                    let mut series_out = interval_arc_series(
+                        "Altitude (m)",
+                        &x_arcs,
+                        PlotMode::LinesMarkers,
+                        |state| state.altitude,
+                    );
+                    series_out.extend(interval_arc_bound_series(
+                        &x_arcs,
+                        Some(0.0),
+                        None,
+                        PlotMode::Lines,
+                    ));
+                    series_out
+                },
+            ),
+            chart(
+                "Horizontal Velocity",
+                "v_x (m/s)",
+                {
+                    let mut series_out = interval_arc_series(
+                        "v_x (m/s)",
+                        &x_arcs,
+                        PlotMode::LinesMarkers,
+                        |state| state.vx,
+                    );
+                    series_out.extend(interval_arc_bound_series(
+                        &x_arcs,
+                        Some(0.0),
+                        None,
+                        PlotMode::Lines,
+                    ));
+                    series_out
+                },
+            ),
+            chart(
+                "Vertical Velocity",
+                "v_y (m/s)",
+                interval_arc_series("v_y (m/s)", &x_arcs, PlotMode::LinesMarkers, |state| state.vy),
+            ),
+            chart(
+                "Velocity Norm",
+                "‖v‖ (m/s)",
+                interval_arc_series("‖v‖ (m/s)", &x_arcs, PlotMode::LinesMarkers, |state| {
+                    (state.vx * state.vx + state.vy * state.vy).sqrt()
+                }),
+            ),
+            chart(
+                "Glide Slope",
+                "Glide Slope (deg)",
+                interval_arc_series("Glide Slope (deg)", &x_arcs, PlotMode::LinesMarkers, |state| {
+                    glide_slope_deg(state.vx, state.vy)
+                }),
+            ),
+            chart(
+                "Lift Coefficient",
+                "C_L (-)",
+                {
+                    let mut series_out = interval_arc_series(
+                        "C_L (-)",
+                        &u_arcs,
+                        PlotMode::LinesMarkers,
+                        |control| cl_numeric(control.alpha),
+                    );
+                    series_out.extend(interval_arc_bound_series(
+                        &u_arcs,
+                        Some(CL_LOWER_BOUND),
+                        Some(CL_UPPER_BOUND),
+                        PlotMode::Lines,
+                    ));
+                    series_out
+                },
+            ),
+            chart(
+                "Angle of Attack",
+                "Angle of Attack (deg)",
+                interval_arc_series(
+                    "AoA (deg)",
+                    &u_arcs,
+                    PlotMode::LinesMarkers,
+                    |control| rad_to_deg(control.alpha),
+                ),
+            ),
+            chart(
+                "Angle of Attack Rate",
+                "AoA Rate (deg/s)",
+                {
+                    let mut series_out = interval_arc_series(
+                        "AoA Rate (deg/s)",
+                        &dudt_arcs,
+                        PlotMode::LinesMarkers,
+                        |rate| rad_to_deg(rate.alpha),
+                    );
+                    series_out.extend(interval_arc_bound_series(
+                        &dudt_arcs,
+                        Some(-params.max_alpha_rate_deg_s),
+                        Some(params.max_alpha_rate_deg_s),
+                        PlotMode::Lines,
+                    ));
+                    series_out
+                },
+            ),
+        ],
+        scene: Scene2D {
+            title: "Glide Path".to_string(),
+            x_label: "Downrange x (m)".to_string(),
+            y_label: "Altitude (m)".to_string(),
+            paths: vec![ScenePath {
+                name: "Trajectory".to_string(),
+                x,
+                y,
+            }],
+            circles: Vec::new(),
+            arrows: Vec::new(),
+            animation: None,
+        },
+        notes: vec![
+            "The particle model uses velocity states directly, with drag aligned opposite motion and lift using the orthogonal direction (-v_y, v_x)/V.".to_string(),
+            "Lift and drag are computed from dynamic pressure using rho = 1.15 kg/m^3, S_ref = 4.0 m^2, and mass = 30.0 kg.".to_string(),
+            "Each collocation interval is rendered as its own start-root-end arc, while the AoA-rate decision variable is only shown at collocation nodes.".to_string(),
+            "The bounded aerodynamic path constraint is applied directly to lift coefficient, with -0.5 <= C_L <= 1.5 rendered as red overlays.".to_string(),
+            "Altitude and forward speed are constrained as h(t) >= 0 and v_x(t) >= 0 throughout the trajectory, with free final time 1 <= T <= 500 s.".to_string(),
+        ],
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn glider_converges_to_a_reasonable_glide() {
+        let artifact = solve(&Params {
+            launch_speed_mps: 30.0,
+            initial_alpha_deg: 6.0,
+            max_alpha_rate_deg_s: 12.0,
+            ..Params::default()
+        })
+        .expect("glider solve should succeed");
+        let distance_metric = crate::find_metric(&artifact.summary, crate::MetricKey::Distance)
+            .expect("distance metric should exist");
+        let distance = distance_metric
+            .numeric_value
+            .expect("distance metric should carry its numeric value");
+        let final_time = crate::find_metric(&artifact.summary, crate::MetricKey::FinalTime)
+            .expect("final time metric should exist")
+            .numeric_value
+            .expect("final time metric should carry its numeric value");
+        assert!(distance > 25.0, "glider should travel forward");
+        assert!(
+            (Params::default().min_time_bound_s..=Params::default().max_time_bound_s)
+                .contains(&final_time),
+            "free final time should stay within the configured bounds"
+        );
+    }
+}

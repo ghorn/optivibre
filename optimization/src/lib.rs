@@ -12,7 +12,10 @@ use std::io::{self, IsTerminal, Read, Write};
 #[cfg(unix)]
 use std::os::fd::FromRawFd;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{
+    Mutex, OnceLock,
+    atomic::{AtomicU8, Ordering},
+};
 use std::time::{Duration, Instant};
 pub use sx_codegen_llvm::LlvmOptimizationLevel;
 use thiserror::Error;
@@ -44,13 +47,101 @@ pub use symbolic::{
     TypedSymbolicNlp, symbolic_nlp,
 };
 pub use vectorize::{
-    ScalarLeaf, Vectorize, VectorizeLayoutError, flat_view, flatten_value, symbolic_column,
-    symbolic_value, unflatten_value,
+    ScalarLeaf, Vectorize, VectorizeLayoutError, extend_layout_name, flat_view, flatten_value,
+    symbolic_column, symbolic_value, unflatten_value,
 };
 
 pub type Index = usize;
 pub(crate) const NLP_INF: f64 = 1e20;
 const BOX_LABEL_WIDTH: usize = 13;
+pub(crate) const EQ_INF_LABEL: &str = "‖eq‖∞";
+pub(crate) const INEQ_INF_LABEL: &str = "‖ineq₊‖∞";
+pub(crate) const DUAL_INF_LABEL: &str = "‖∇L‖∞";
+pub(crate) const SQP_COMP_INF_LABEL: &str = "‖g∘λ‖∞";
+pub(crate) const STEP_INF_LABEL: &str = "‖Δx‖∞";
+pub(crate) const PRIMAL_INF_LABEL: &str = "max(‖eq‖∞, ‖ineq₊‖∞)";
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConstraintSatisfaction {
+    FullAccuracy,
+    ReducedAccuracy,
+    Violated,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConstraintBoundSide {
+    Equality,
+    Lower,
+    Upper,
+    Both,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NlpInequalitySource {
+    ConstraintRow { row: Index },
+    VariableBound { index: Index },
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct NlpEqualityViolation {
+    pub row: Index,
+    pub value: f64,
+    pub abs_violation: f64,
+    pub satisfaction: ConstraintSatisfaction,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct NlpInequalityViolation {
+    pub source: NlpInequalitySource,
+    pub value: f64,
+    pub lower_bound: Option<f64>,
+    pub upper_bound: Option<f64>,
+    pub lower_violation: f64,
+    pub upper_violation: f64,
+    pub worst_violation: f64,
+    pub bound_side: ConstraintBoundSide,
+    pub satisfaction: ConstraintSatisfaction,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NlpConstraintViolationReport {
+    pub equalities: Vec<NlpEqualityViolation>,
+    pub inequalities: Vec<NlpInequalityViolation>,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnsiColorMode {
+    Auto = 0,
+    Always = 1,
+    Never = 2,
+}
+
+impl AnsiColorMode {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Always,
+            2 => Self::Never,
+            _ => Self::Auto,
+        }
+    }
+}
+
+static ANSI_COLOR_MODE: AtomicU8 = AtomicU8::new(AnsiColorMode::Auto as u8);
+
+pub fn ansi_color_mode() -> AnsiColorMode {
+    AnsiColorMode::from_u8(ANSI_COLOR_MODE.load(Ordering::Relaxed))
+}
+
+pub fn set_ansi_color_mode(mode: AnsiColorMode) -> AnsiColorMode {
+    AnsiColorMode::from_u8(ANSI_COLOR_MODE.swap(mode as u8, Ordering::Relaxed))
+}
 
 #[cfg(feature = "serde")]
 mod duration_seconds_serde {
@@ -1574,8 +1665,16 @@ impl SqpEventLegendState {
 }
 
 fn ansi_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none())
+    match ansi_color_mode() {
+        AnsiColorMode::Always => true,
+        AnsiColorMode::Never => false,
+        AnsiColorMode::Auto => {
+            static ENABLED: OnceLock<bool> = OnceLock::new();
+            *ENABLED.get_or_init(|| {
+                io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+            })
+        }
+    }
 }
 
 fn style(text: &str, code: &str) -> String {
@@ -1604,6 +1703,57 @@ fn style_yellow_bold(text: &str) -> String {
 
 fn style_red_bold(text: &str) -> String {
     style(text, "1;31")
+}
+
+pub fn reduced_accuracy_tolerance(tolerance: f64) -> f64 {
+    100.0 * tolerance
+}
+
+pub fn classify_constraint_satisfaction(value: f64, tolerance: f64) -> ConstraintSatisfaction {
+    if value <= tolerance {
+        ConstraintSatisfaction::FullAccuracy
+    } else if value <= reduced_accuracy_tolerance(tolerance) {
+        ConstraintSatisfaction::ReducedAccuracy
+    } else {
+        ConstraintSatisfaction::Violated
+    }
+}
+
+pub(crate) fn style_metric_against_tolerance(text: &str, value: f64, tolerance: f64) -> String {
+    match classify_constraint_satisfaction(value, tolerance) {
+        ConstraintSatisfaction::FullAccuracy => style_green_bold(text),
+        ConstraintSatisfaction::ReducedAccuracy => style_yellow_bold(text),
+        ConstraintSatisfaction::Violated => style_red_bold(text),
+    }
+}
+
+pub fn constraint_bound_side(lower_violation: f64, upper_violation: f64) -> ConstraintBoundSide {
+    match (lower_violation > 0.0, upper_violation > 0.0) {
+        (true, true) => ConstraintBoundSide::Both,
+        (true, false) => ConstraintBoundSide::Lower,
+        (false, true) => ConstraintBoundSide::Upper,
+        (false, false) => ConstraintBoundSide::Equality,
+    }
+}
+
+pub fn worst_bound_violation(
+    value: f64,
+    lower_bound: Option<f64>,
+    upper_bound: Option<f64>,
+) -> (f64, f64) {
+    let lower_violation = lower_bound.map_or(0.0, |lower| (lower - value).max(0.0));
+    let upper_violation = upper_bound.map_or(0.0, |upper| (value - upper).max(0.0));
+    (lower_violation, upper_violation)
+}
+
+pub fn rank_nlp_constraint_violations(
+    problem: &impl CompiledNlpProblem,
+    x: &[f64],
+    parameters: &[ParameterMatrix<'_>],
+    bounds: &RuntimeNlpBounds,
+    tolerance: f64,
+) -> Result<NlpConstraintViolationReport, symbolic::RuntimeNlpBoundsError> {
+    symbolic::rank_nlp_constraint_violations(problem, x, parameters, bounds, tolerance)
 }
 
 fn sci_text(value: f64) -> String {
@@ -1740,17 +1890,29 @@ fn fmt_line_search_iterations(iterations: Option<Index>) -> String {
     }
 }
 
-fn fmt_iteration(iteration: Index) -> String {
-    format!("{iteration:>4}")
+pub(crate) fn fmt_iteration_label(label: &str) -> String {
+    format!("{label:>4}")
 }
 
-fn style_iteration_cell(iteration: Index, iteration_limit_reached: bool) -> String {
-    let cell = fmt_iteration(iteration);
+pub(crate) fn style_iteration_label_cell(label: &str, iteration_limit_reached: bool) -> String {
+    let cell = fmt_iteration_label(label);
     if iteration_limit_reached {
         style_red_bold(&cell)
     } else {
         cell
     }
+}
+
+fn style_iteration_cell(snapshot: &SqpIterationSnapshot) -> String {
+    let label = match snapshot.phase {
+        SqpIterationPhase::Initial => "pre".to_string(),
+        SqpIterationPhase::AcceptedStep => snapshot.iteration.to_string(),
+        SqpIterationPhase::PostConvergence => "post".to_string(),
+    };
+    style_iteration_label_cell(
+        &label,
+        has_event(snapshot, SqpIterationEvent::MaxIterationsReached),
+    )
 }
 
 fn time_callback<R>(
@@ -1954,17 +2116,25 @@ fn log_sqp_status_summary(summary: &ClarabelSqpSummary, options: &ClarabelSqpOpt
         boxed_line(
             "result",
             format!(
-                "objective={}  primal_inf={}  dual_inf={}",
+                "objective={}  {}={}  {}={}",
                 sci_text(summary.objective),
+                PRIMAL_INF_LABEL,
                 style_residual_text(summary.primal_inf_norm, options.constraint_tol),
+                DUAL_INF_LABEL,
                 style_residual_text(summary.dual_inf_norm, options.dual_tol),
             ),
         ),
         boxed_line(
             "",
             format!(
-                "eq_inf={}  ineq_inf={}  comp_inf={}  iterations={}",
-                eq_text, ineq_text, comp_text, summary.iterations,
+                "{}={}  {}={}  {}={}  iterations={}",
+                EQ_INF_LABEL,
+                eq_text,
+                INEQ_INF_LABEL,
+                ineq_text,
+                SQP_COMP_INF_LABEL,
+                comp_text,
+                summary.iterations,
             ),
         ),
         String::new(),
@@ -2195,11 +2365,7 @@ fn log_sqp_problem_header<P>(
 
 fn style_residual_text(value: f64, tolerance: f64) -> String {
     let text = sci_text(value);
-    if value <= tolerance {
-        style_green_bold(&text)
-    } else {
-        text
-    }
+    style_metric_against_tolerance(&text, value, tolerance)
 }
 
 fn style_residual_cell(value: f64, tolerance: f64, is_applicable: bool) -> String {
@@ -2207,11 +2373,7 @@ fn style_residual_cell(value: f64, tolerance: f64, is_applicable: bool) -> Strin
         return format!("{:>9}", "--");
     }
     let cell = fmt_sci(value);
-    if value <= tolerance {
-        style_green_bold(&cell)
-    } else {
-        cell
-    }
+    style_metric_against_tolerance(&cell, value, tolerance)
 }
 
 fn style_line_search_iterations_cell(iterations: Option<Index>) -> String {
@@ -2330,13 +2492,13 @@ fn log_sqp_iteration(
         let header = [
             format!("{:>4}", "iter"),
             format!("{:>9}", "f"),
-            format!("{:>9}", "eq_inf"),
-            format!("{:>9}", "ineq_inf"),
-            format!("{:>9}", "dual_inf"),
-            format!("{:>9}", "comp_inf"),
-            format!("{:>9}", "step_inf"),
+            format!("{:>9}", EQ_INF_LABEL),
+            format!("{:>9}", INEQ_INF_LABEL),
+            format!("{:>9}", DUAL_INF_LABEL),
+            format!("{:>9}", SQP_COMP_INF_LABEL),
+            format!("{:>9}", STEP_INF_LABEL),
             format!("{:>9}", "penalty"),
-            format!("{:>9}", "alpha"),
+            format!("{:>9}", "α"),
             format!("{:>5}", "ls_it"),
             format!("{:>4}", "evt"),
             format!("{:>5}", "qp_it"),
@@ -2347,10 +2509,7 @@ fn log_sqp_iteration(
     let line_search = snapshot.line_search.as_ref();
     let qp = snapshot.qp.as_ref();
     let row = [
-        style_iteration_cell(
-            snapshot.iteration,
-            has_event(snapshot, SqpIterationEvent::MaxIterationsReached),
-        ),
+        style_iteration_cell(snapshot),
         fmt_sci(snapshot.objective),
         style_residual_cell(
             snapshot.eq_inf.unwrap_or(0.0),
@@ -2835,7 +2994,7 @@ where
         log_sqp_problem_header(problem, parameters, options);
     }
 
-    for iteration in 0..options.max_iters {
+    for iteration in 0..options.max_iters.max(1) {
         let iteration_started = Instant::now();
         profiling.adapter_timing = problem.sqp_adapter_timing_snapshot();
         let iteration_timing_baseline = IterationTimingBaseline::capture(&profiling);
@@ -2998,6 +3157,17 @@ where
         callback(&current_snapshot);
         if options.verbose {
             log_sqp_iteration(&current_snapshot, options, &mut event_state);
+        }
+        if iteration == options.max_iters {
+            return Err(ClarabelSqpError::MaxIterations {
+                iterations: options.max_iters,
+                context: failure_context(
+                    SqpTermination::MaxIterations,
+                    Some(current_snapshot),
+                    last_accepted_state,
+                    &profiling,
+                ),
+            });
         }
         if converged {
             profiling.preprocessing_time += preprocess_duration;

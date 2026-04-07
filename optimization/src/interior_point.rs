@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use super::{
-    BackendTimingMetadata, BoundConstraints, CompiledNlpProblem, EvalTimingStat, Index,
-    ParameterMatrix, SQP_EVENT_SEEN_LINE_SEARCH, SQP_EVENT_SEEN_MAX_ITER, SQP_EVENT_SEEN_PENALTY,
+    BackendTimingMetadata, BoundConstraints, CompiledNlpProblem, DUAL_INF_LABEL, EQ_INF_LABEL,
+    EvalTimingStat, INEQ_INF_LABEL, Index, PRIMAL_INF_LABEL, ParameterMatrix,
+    SQP_EVENT_SEEN_LINE_SEARCH, SQP_EVENT_SEEN_MAX_ITER, SQP_EVENT_SEEN_PENALTY,
     SQP_LOG_HAS_EQUALITIES, SQP_LOG_HAS_INEQUALITIES, SQP_LOG_ITERATION_LIMIT_REACHED,
     SQP_LOG_PENALTY_UPDATED, SolverAdapterTiming, SqpEventLegendState, augment_inequality_values,
     boxed_line, build_bound_jacobian, ccs_to_dense, choose_summary_duration_unit,
@@ -17,9 +18,12 @@ use super::{
     fmt_optional_duration_in_unit, inf_norm, lagrangian_gradient, log_boxed_section,
     lower_tri_fill_percent, lower_triangle_to_symmetric_dense, positive_part_inf_norm,
     regularize_hessian, sci_text, split_augmented_inequality_multipliers, style_bold,
-    style_cyan_bold, style_green_bold, style_red_bold, style_yellow_bold, time_callback,
-    validate_nlp_problem_shapes, validate_parameter_inputs,
+    style_cyan_bold, style_green_bold, style_iteration_label_cell, style_metric_against_tolerance,
+    style_red_bold, style_yellow_bold, time_callback, validate_nlp_problem_shapes,
+    validate_parameter_inputs,
 };
+
+const IP_COMP_INF_LABEL: &str = "‖s∘z‖∞";
 
 const IP_LOG_LINEAR_FALLBACK: u8 = 1 << 4;
 const IP_EVENT_SEEN_LINEAR_FALLBACK: u8 = 1 << 4;
@@ -159,6 +163,7 @@ pub struct InteriorPointSummary {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InteriorPointIterationPhase {
+    Initial,
     AcceptedStep,
     Converged,
 }
@@ -215,19 +220,19 @@ pub struct InteriorPointIterationSnapshot {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Error)]
 pub enum InteriorPointSolveError {
-    #[error("invalid interior-point input: {0}")]
+    #[error("invalid NLIP input: {0}")]
     InvalidInput(String),
-    #[error("interior-point linear solve failed using {solver:?}")]
+    #[error("NLIP linear solve failed using {solver:?}")]
     LinearSolve { solver: InteriorPointLinearSolver },
     #[error(
-        "interior-point line search failed (residual merit {merit}, mu {mu}, step inf-norm {step_inf_norm})"
+        "NLIP line search failed (residual merit {merit}, mu {mu}, step inf-norm {step_inf_norm})"
     )]
     LineSearchFailed {
         merit: f64,
         mu: f64,
         step_inf_norm: f64,
     },
-    #[error("interior-point failed to converge in {iterations} iterations")]
+    #[error("NLIP failed to converge in {iterations} iterations")]
     MaxIterations { iterations: Index },
 }
 
@@ -936,11 +941,7 @@ fn style_ip_residual_text(value: f64, tolerance: f64, applicable: bool) -> Strin
         return "--".to_string();
     }
     let text = sci_text(value);
-    if value <= tolerance {
-        style_green_bold(&text)
-    } else {
-        text
-    }
+    style_metric_against_tolerance(&text, value, tolerance)
 }
 
 fn style_ip_residual_cell(value: f64, tolerance: f64, applicable: bool) -> String {
@@ -948,11 +949,7 @@ fn style_ip_residual_cell(value: f64, tolerance: f64, applicable: bool) -> Strin
         return format!("{:>9}", "--");
     }
     let cell = format!("{:>9}", sci_text(value));
-    if value <= tolerance {
-        style_green_bold(&cell)
-    } else {
-        cell
-    }
+    style_metric_against_tolerance(&cell, value, tolerance)
 }
 
 fn fmt_optional_ip_sci(value: Option<f64>) -> String {
@@ -980,6 +977,7 @@ fn style_ip_line_search_cell(iterations: Option<Index>) -> String {
 
 struct InteriorPointIterationLog {
     iteration: Index,
+    phase: InteriorPointIterationPhase,
     flags: u8,
     objective_value: f64,
     equality_inf: f64,
@@ -1040,7 +1038,7 @@ fn ip_event_suffix(log: &InteriorPointIterationLog, state: &mut SqpEventLegendSt
     if log.flags & SQP_LOG_ITERATION_LIMIT_REACHED != 0
         && state.mark_if_new(SQP_EVENT_SEEN_MAX_ITER)
     {
-        parts.push("M=maximum interior-point iterations reached");
+        parts.push("M=maximum NLIP iterations reached");
     }
     if parts.is_empty() {
         String::new()
@@ -1058,24 +1056,28 @@ fn log_interior_point_iteration(
         let header = [
             format!("{:>4}", "iter"),
             format!("{:>9}", "f"),
-            format!("{:>9}", "eq_inf"),
-            format!("{:>9}", "ineq_inf"),
-            format!("{:>9}", "dual_inf"),
-            format!("{:>9}", "comp_inf"),
+            format!("{:>9}", EQ_INF_LABEL),
+            format!("{:>9}", INEQ_INF_LABEL),
+            format!("{:>9}", DUAL_INF_LABEL),
+            format!("{:>9}", IP_COMP_INF_LABEL),
             format!("{:>9}", "mu"),
-            format!("{:>9}", "alpha"),
+            format!("{:>9}", "α"),
             format!("{:>5}", "ls_it"),
             format!("{:>4}", "evt"),
             format!("{:>7}", "lin_t"),
         ];
         eprintln!("{}", style_bold(&header.join("  ")));
     }
+    let iteration_label = match log.phase {
+        InteriorPointIterationPhase::Initial => "pre".to_string(),
+        InteriorPointIterationPhase::AcceptedStep => log.iteration.to_string(),
+        InteriorPointIterationPhase::Converged => "post".to_string(),
+    };
     let row = [
-        if log.flags & SQP_LOG_ITERATION_LIMIT_REACHED != 0 {
-            style_red_bold(&format!("{:>4}", log.iteration))
-        } else {
-            format!("{:>4}", log.iteration)
-        },
+        style_iteration_label_cell(
+            &iteration_label,
+            log.flags & SQP_LOG_ITERATION_LIMIT_REACHED != 0,
+        ),
         format!("{:>9}", sci_text(log.objective_value)),
         style_ip_residual_cell(
             log.equality_inf,
@@ -1191,7 +1193,7 @@ fn log_interior_point_problem_header<P>(
             ),
         ),
     ];
-    log_boxed_section("Interior-point problem / settings", &lines, style_cyan_bold);
+    log_boxed_section("NLIP problem / settings", &lines, style_cyan_bold);
 }
 
 fn log_interior_point_status_summary(
@@ -1302,9 +1304,11 @@ fn log_interior_point_status_summary(
         boxed_line(
             "result",
             format!(
-                "objective={}  primal_inf={}  dual_inf={}  mu={}",
+                "objective={}  {}={}  {}={}  mu={}",
                 sci_text(summary.objective),
+                PRIMAL_INF_LABEL,
                 style_ip_residual_text(summary.primal_inf_norm, options.constraint_tol, true),
+                DUAL_INF_LABEL,
                 style_ip_residual_text(summary.dual_inf_norm, options.dual_tol, true),
                 sci_text(summary.barrier_parameter),
             ),
@@ -1312,8 +1316,14 @@ fn log_interior_point_status_summary(
         boxed_line(
             "",
             format!(
-                "eq_inf={}  ineq_inf={}  comp_inf={}  iterations={}",
-                eq_text, ineq_text, comp_text, summary.iterations,
+                "{}={}  {}={}  {}={}  iterations={}",
+                EQ_INF_LABEL,
+                eq_text,
+                INEQ_INF_LABEL,
+                ineq_text,
+                IP_COMP_INF_LABEL,
+                comp_text,
+                summary.iterations,
             ),
         ),
         String::new(),
@@ -1555,6 +1565,87 @@ where
     let mut nonlinear_inequality_multipliers = vec![0.0; inequality_count];
     let mut last_linear_solver = options.linear_solver;
 
+    if options.max_iters == 0 {
+        let equality_inf = inf_norm(&initial_state.equality_values);
+        let inequality_inf = positive_part_inf_norm(&initial_state.augmented_inequality_values);
+        let dual_inf = inf_norm(&lagrangian_gradient(
+            &initial_state.gradient,
+            &initial_state.equality_jacobian,
+            &lambda_eq,
+            &initial_state.inequality_jacobian,
+            &z,
+        ));
+        let complementarity_inf = if augmented_inequality_count > 0 {
+            complementarity_inf_norm(&slack, &z)
+        } else {
+            0.0
+        };
+        let mu = barrier_parameter(&slack, &z);
+        let snapshot = InteriorPointIterationSnapshot {
+            iteration: 0,
+            phase: InteriorPointIterationPhase::Initial,
+            x: x.clone(),
+            objective: initial_state.objective_value,
+            eq_inf: (equality_count > 0).then_some(equality_inf),
+            ineq_inf: (augmented_inequality_count > 0).then_some(inequality_inf),
+            dual_inf,
+            comp_inf: (augmented_inequality_count > 0).then_some(complementarity_inf),
+            barrier_parameter: (augmented_inequality_count > 0).then_some(mu),
+            alpha: None,
+            line_search_iterations: None,
+            linear_solver: last_linear_solver,
+            linear_solve_time: None,
+            timing: InteriorPointIterationTiming {
+                adapter_timing: profiling.adapter_timing,
+                callback: setup_callback_time,
+                kkt_assembly: Duration::ZERO,
+                linear_solve: Duration::ZERO,
+                preprocess: setup_started.elapsed().saturating_sub(setup_callback_time),
+                total: setup_started.elapsed(),
+            },
+            events: vec![InteriorPointIterationEvent::MaxIterationsReached],
+        };
+        callback(&snapshot);
+        if options.verbose {
+            let flags = (if equality_count > 0 {
+                SQP_LOG_HAS_EQUALITIES
+            } else {
+                0
+            }) | (if augmented_inequality_count > 0 {
+                SQP_LOG_HAS_INEQUALITIES
+            } else {
+                0
+            }) | SQP_LOG_ITERATION_LIMIT_REACHED;
+            log_interior_point_iteration(
+                &InteriorPointIterationLog {
+                    iteration: 0,
+                    phase: InteriorPointIterationPhase::Initial,
+                    flags,
+                    objective_value: initial_state.objective_value,
+                    equality_inf,
+                    inequality_inf,
+                    dual_inf,
+                    complementarity_inf,
+                    barrier_parameter: if augmented_inequality_count > 0 {
+                        mu.max(options.mu_min)
+                    } else {
+                        0.0
+                    },
+                    alpha: None,
+                    line_search_iterations: None,
+                    linear_time_secs: None,
+                    constraint_tol: options.constraint_tol,
+                    dual_tol: options.dual_tol,
+                    complementarity_tol: options.complementarity_tol,
+                },
+                &mut event_state,
+            );
+        }
+        return Err(InteriorPointSolveError::MaxIterations {
+            iterations: options.max_iters,
+        });
+    }
+
     'iterations: for iteration in 0..options.max_iters {
         let iteration_started = Instant::now();
         let mut iteration_callback_time = Duration::ZERO;
@@ -1675,6 +1766,7 @@ where
                 log_interior_point_iteration(
                     &InteriorPointIterationLog {
                         iteration,
+                        phase: InteriorPointIterationPhase::Converged,
                         flags: (if equality_count > 0 {
                             SQP_LOG_HAS_EQUALITIES
                         } else {
@@ -2075,6 +2167,7 @@ where
             log_interior_point_iteration(
                 &InteriorPointIterationLog {
                     iteration,
+                    phase: InteriorPointIterationPhase::AcceptedStep,
                     flags,
                     objective_value: state.objective_value,
                     equality_inf,

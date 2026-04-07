@@ -5,6 +5,10 @@ members = [
     "sx_codegen",
     "sx_codegen_llvm",
     "optimization",
+    "optimal_control",
+    "optimal_control_problems",
+    "optimal_control_webapp",
+    "lqr_solvers",
     "optimization_derive",
     "test_problems",
     "examples_source",
@@ -49,6 +53,9 @@ all = "deny"
 todo = "deny"
 unimplemented = "deny"
 
+# TODO(greg): Remove this temporary vendored override once
+# https://github.com/elrnv/ipopt-rs/pull/19 is released to crates.io, then
+# switch back to the published `ipopt`/`ipopt-sys` 0.7.x crates.
 [patch.crates-io]
 ipopt = { path = "third_party/ipopt" }
 ipopt-sys = { path = "third_party/ipopt-sys" }

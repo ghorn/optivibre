@@ -9,7 +9,7 @@ use crate::manifest::KnownStatus;
 #[serde(rename_all = "snake_case")]
 pub enum SolverKind {
     Sqp,
-    InteriorPoint,
+    Nlip,
     #[cfg(feature = "ipopt")]
     Ipopt,
 }
@@ -18,7 +18,7 @@ impl SolverKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::Sqp => "sqp",
-            Self::InteriorPoint => "interior_point",
+            Self::Nlip => "nlip",
             #[cfg(feature = "ipopt")]
             Self::Ipopt => "ipopt",
         }

@@ -408,8 +408,8 @@ where
                 }
             }
         }
-        SolverKind::InteriorPoint => {
-            let interior_point_options = InteriorPointOptions {
+        SolverKind::Nlip => {
+            let nlip_options = InteriorPointOptions {
                 max_iters: max_iters_limit,
                 dual_tol: STRICT_TERMINATION_TOL,
                 constraint_tol: STRICT_TERMINATION_TOL,
@@ -417,20 +417,20 @@ where
                 verbose: false,
                 ..InteriorPointOptions::default()
             };
-            let solver_thresholds = format_interior_point_thresholds(&interior_point_options);
+            let solver_thresholds = format_nlip_thresholds(&nlip_options);
             let solve_started = Instant::now();
             let mut snapshots = Vec::new();
             let result = data.compiled.solve_interior_point_with_callback(
                 &data.x0,
                 &data.parameters,
                 &data.bounds,
-                &interior_point_options,
+                &nlip_options,
                 |snapshot: &InteriorPointIterationSnapshot| snapshots.push(snapshot.clone()),
             );
             let solve_wall_time = solve_started.elapsed();
             match result {
                 Ok(summary) => {
-                    let metrics = metrics_from_interior_point_summary(&summary);
+                    let metrics = metrics_from_nlip_summary(&summary);
                     let mut record = ProblemRunRecord {
                         id: metadata.id.to_string(),
                         solver,
@@ -459,7 +459,7 @@ where
                     } else if matches!(record.validation.tier, ValidationTier::ReducedAccuracy) {
                         record.status = RunStatus::ReducedAccuracy;
                     }
-                    record.console_output = Some(render_interior_point_transcript(
+                    record.console_output = Some(render_nlip_transcript(
                         &record,
                         &snapshots,
                         Some(&summary),
@@ -487,7 +487,7 @@ where
                         validation: ValidationOutcome {
                             tier: ValidationTier::Failed,
                             tolerance: "solver must succeed".to_string(),
-                            detail: "interior-point solve failed".to_string(),
+                            detail: "NLIP solve failed".to_string(),
                         },
                         solver_thresholds: Some(solver_thresholds),
                         error: Some(err.to_string()),
@@ -495,7 +495,7 @@ where
                         console_output_path: None,
                     };
                     promote_solve_error_if_reduced_accuracy(&mut record, REDUCED_TERMINATION_TOL);
-                    record.console_output = Some(render_interior_point_transcript(
+                    record.console_output = Some(render_nlip_transcript(
                         &record,
                         &snapshots,
                         None,
@@ -633,7 +633,7 @@ fn format_sqp_thresholds(options: &ClarabelSqpOptions) -> String {
     )
 }
 
-fn format_interior_point_thresholds(options: &InteriorPointOptions) -> String {
+fn format_nlip_thresholds(options: &InteriorPointOptions) -> String {
     format!(
         "strict: primal<={:.1e}, dual<={:.1e}, comp<={:.1e}; reduced: primal<={:.1e}, dual<={:.1e}, comp<={:.1e}",
         options.constraint_tol,
@@ -802,7 +802,7 @@ fn solve_time_from_sqp_error(error: &ClarabelSqpError) -> Option<std::time::Dura
     context.map(|ctx| ctx.profiling.total_time)
 }
 
-fn metrics_from_interior_point_summary(summary: &InteriorPointSummary) -> SolverMetrics {
+fn metrics_from_nlip_summary(summary: &InteriorPointSummary) -> SolverMetrics {
     SolverMetrics {
         iterations: Some(summary.iterations),
         objective: Some(summary.objective),
@@ -1155,7 +1155,7 @@ fn render_sqp_transcript(
     out
 }
 
-fn render_interior_point_transcript(
+fn render_nlip_transcript(
     record: &ProblemRunRecord,
     snapshots: &[InteriorPointIterationSnapshot],
     summary: Option<&InteriorPointSummary>,
@@ -1229,7 +1229,7 @@ fn render_interior_point_transcript(
     }
     if let Some(error) = error {
         let _ = writeln!(out, "\ntermination: error");
-        let _ = writeln!(out, "error_kind: {}", interior_point_error_code(error));
+        let _ = writeln!(out, "error_kind: {}", nlip_error_code(error));
     }
     out.push_str(&render_problem_footer(record));
     out
@@ -1387,7 +1387,7 @@ fn sqp_error_code(error: &ClarabelSqpError) -> &'static str {
     }
 }
 
-fn interior_point_error_code(error: &InteriorPointSolveError) -> &'static str {
+fn nlip_error_code(error: &InteriorPointSolveError) -> &'static str {
     match error {
         InteriorPointSolveError::InvalidInput(_) => "invalid_input",
         InteriorPointSolveError::LinearSolve { .. } => "linear_solve",

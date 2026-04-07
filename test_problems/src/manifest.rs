@@ -18,7 +18,7 @@ pub enum ProblemSpeed {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IterationLimits {
     pub sqp: usize,
-    pub interior_point: usize,
+    pub nlip: usize,
     pub ipopt: usize,
 }
 
@@ -26,7 +26,7 @@ impl IterationLimits {
     pub const fn with_default(default: usize) -> Self {
         Self {
             sqp: default,
-            interior_point: default,
+            nlip: default,
             ipopt: default,
         }
     }
@@ -36,7 +36,7 @@ impl IterationLimits {
 pub struct ProblemManifestEntry {
     pub id: &'static str,
     pub sqp: KnownStatus,
-    pub interior_point: KnownStatus,
+    pub nlip: KnownStatus,
     pub ipopt: KnownStatus,
     pub max_iters: IterationLimits,
     pub speed: ProblemSpeed,
@@ -47,14 +47,14 @@ pub const DEFAULT_MAX_ITERS: usize = 300;
 pub const fn manifest_entry(
     id: &'static str,
     sqp: KnownStatus,
-    interior_point: KnownStatus,
+    nlip: KnownStatus,
     max_iters: IterationLimits,
 ) -> ProblemManifestEntry {
     ProblemManifestEntry {
         id,
         sqp,
-        interior_point,
-        ipopt: interior_point,
+        nlip,
+        ipopt: nlip,
         max_iters,
         speed: ProblemSpeed::Fast,
     }
@@ -63,14 +63,14 @@ pub const fn manifest_entry(
 pub const fn manifest_entry_with_ipopt(
     id: &'static str,
     sqp: KnownStatus,
-    interior_point: KnownStatus,
+    nlip: KnownStatus,
     ipopt: KnownStatus,
     max_iters: IterationLimits,
 ) -> ProblemManifestEntry {
     ProblemManifestEntry {
         id,
         sqp,
-        interior_point,
+        nlip,
         ipopt,
         max_iters,
         speed: ProblemSpeed::Fast,
@@ -80,14 +80,14 @@ pub const fn manifest_entry_with_ipopt(
 pub const fn slow_manifest_entry(
     id: &'static str,
     sqp: KnownStatus,
-    interior_point: KnownStatus,
+    nlip: KnownStatus,
     max_iters: IterationLimits,
 ) -> ProblemManifestEntry {
     ProblemManifestEntry {
         id,
         sqp,
-        interior_point,
-        ipopt: interior_point,
+        nlip,
+        ipopt: nlip,
         max_iters,
         speed: ProblemSpeed::Slow,
     }
@@ -96,14 +96,14 @@ pub const fn slow_manifest_entry(
 pub const fn slow_manifest_entry_with_ipopt(
     id: &'static str,
     sqp: KnownStatus,
-    interior_point: KnownStatus,
+    nlip: KnownStatus,
     ipopt: KnownStatus,
     max_iters: IterationLimits,
 ) -> ProblemManifestEntry {
     ProblemManifestEntry {
         id,
         sqp,
-        interior_point,
+        nlip,
         ipopt,
         max_iters,
         speed: ProblemSpeed::Slow,
@@ -139,7 +139,7 @@ const MANIFEST: &[ProblemManifestEntry] = &[
         KnownStatus::KnownPassing,
         IterationLimits {
             sqp: 400,
-            interior_point: 400,
+            nlip: 400,
             ipopt: 400,
         },
     ),
@@ -185,7 +185,7 @@ const MANIFEST: &[ProblemManifestEntry] = &[
         KnownStatus::KnownPassing,
         IterationLimits {
             sqp: 400,
-            interior_point: 400,
+            nlip: 400,
             ipopt: 400,
         },
     ),
@@ -210,7 +210,7 @@ const MANIFEST: &[ProblemManifestEntry] = &[
         KnownStatus::KnownPassing,
         IterationLimits {
             sqp: 400,
-            interior_point: 400,
+            nlip: 400,
             ipopt: 400,
         },
     ),
@@ -305,7 +305,7 @@ const MANIFEST: &[ProblemManifestEntry] = &[
         KnownStatus::KnownPassing,
         IterationLimits {
             sqp: 500,
-            interior_point: 500,
+            nlip: 500,
             ipopt: 500,
         },
     ),
@@ -316,7 +316,7 @@ const MANIFEST: &[ProblemManifestEntry] = &[
         KnownStatus::KnownPassing,
         IterationLimits {
             sqp: 500,
-            interior_point: 500,
+            nlip: 500,
             ipopt: 500,
         },
     ),
@@ -327,7 +327,7 @@ const MANIFEST: &[ProblemManifestEntry] = &[
         KnownStatus::KnownPassing,
         IterationLimits {
             sqp: 500,
-            interior_point: 500,
+            nlip: 500,
             ipopt: 500,
         },
     ),
@@ -338,7 +338,7 @@ const MANIFEST: &[ProblemManifestEntry] = &[
         KnownStatus::KnownPassing,
         IterationLimits {
             sqp: 500,
-            interior_point: 500,
+            nlip: 500,
             ipopt: 500,
         },
     ),
@@ -349,7 +349,7 @@ const MANIFEST: &[ProblemManifestEntry] = &[
         KnownStatus::KnownPassing,
         IterationLimits {
             sqp: 500,
-            interior_point: 500,
+            nlip: 500,
             ipopt: 500,
         },
     ),
@@ -360,7 +360,7 @@ const MANIFEST: &[ProblemManifestEntry] = &[
         KnownStatus::KnownPassing,
         IterationLimits {
             sqp: 500,
-            interior_point: 500,
+            nlip: 500,
             ipopt: 500,
         },
     ),
@@ -371,7 +371,7 @@ const MANIFEST: &[ProblemManifestEntry] = &[
         KnownStatus::KnownPassing,
         IterationLimits {
             sqp: 800,
-            interior_point: 800,
+            nlip: 800,
             ipopt: 800,
         },
     ),
@@ -382,7 +382,7 @@ const MANIFEST: &[ProblemManifestEntry] = &[
         KnownStatus::KnownPassing,
         IterationLimits {
             sqp: 800,
-            interior_point: 800,
+            nlip: 800,
             ipopt: 800,
         },
     ),
@@ -393,7 +393,7 @@ const MANIFEST: &[ProblemManifestEntry] = &[
         KnownStatus::KnownPassing,
         IterationLimits {
             sqp: 800,
-            interior_point: 800,
+            nlip: 800,
             ipopt: 800,
         },
     ),
@@ -404,7 +404,7 @@ const MANIFEST: &[ProblemManifestEntry] = &[
         KnownStatus::KnownPassing,
         IterationLimits {
             sqp: 800,
-            interior_point: 800,
+            nlip: 800,
             ipopt: 800,
         },
     ),
@@ -415,7 +415,7 @@ const MANIFEST: &[ProblemManifestEntry] = &[
         KnownStatus::KnownPassing,
         IterationLimits {
             sqp: 800,
-            interior_point: 800,
+            nlip: 800,
             ipopt: 800,
         },
     ),
@@ -426,7 +426,7 @@ const MANIFEST: &[ProblemManifestEntry] = &[
         KnownStatus::KnownPassing,
         IterationLimits {
             sqp: 800,
-            interior_point: 800,
+            nlip: 800,
             ipopt: 800,
         },
     ),
@@ -455,7 +455,7 @@ const MANIFEST: &[ProblemManifestEntry] = &[
         KnownStatus::KnownFailing,
         IterationLimits {
             sqp: 400,
-            interior_point: 400,
+            nlip: 400,
             ipopt: 400,
         },
     ),

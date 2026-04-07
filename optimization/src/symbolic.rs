@@ -10,9 +10,11 @@ use thiserror::Error;
 use crate::{
     BackendTimingMetadata, CCS, ClarabelSqpError, ClarabelSqpOptions, ClarabelSqpSummary,
     CompiledNlpProblem, Index, InteriorPointIterationSnapshot, InteriorPointOptions,
-    InteriorPointSolveError, InteriorPointSummary, ParameterMatrix, SqpAdapterTiming, Vectorize,
+    InteriorPointSolveError, InteriorPointSummary, NlpConstraintViolationReport,
+    NlpEqualityViolation, NlpInequalitySource, NlpInequalityViolation, ParameterMatrix,
+    SqpAdapterTiming, Vectorize, classify_constraint_satisfaction, constraint_bound_side,
     flatten_value, solve_nlp_interior_point, solve_nlp_interior_point_with_callback, solve_nlp_sqp,
-    solve_nlp_sqp_with_callback, symbolic_column, symbolic_value,
+    solve_nlp_sqp_with_callback, symbolic_column, symbolic_value, worst_bound_violation,
 };
 #[cfg(feature = "ipopt")]
 use crate::{
@@ -588,10 +590,55 @@ where
     I: Vectorize<SX, Rebind<SX> = I>,
     <X as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
     <P as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
+    <E as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
     <I as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
 {
     pub fn backend_timing_metadata(&self) -> BackendTimingMetadata {
         self.inner.backend_timing_metadata()
+    }
+
+    pub fn evaluate_equalities_flat(
+        &self,
+        x: &<X as Vectorize<SX>>::Rebind<f64>,
+        parameters: &<P as Vectorize<SX>>::Rebind<f64>,
+    ) -> Vec<f64> {
+        let x_values = flatten_value(x);
+        let parameter_values = flatten_value(parameters);
+        let parameter_storage = if P::LEN == 0 {
+            Vec::new()
+        } else {
+            vec![ParameterMatrix {
+                ccs: self.inner.parameter_ccs(0),
+                values: &parameter_values,
+            }]
+        };
+        let mut values = vec![0.0; self.inner.equality_count()];
+        let _ = self
+            .inner
+            .equality_values_timed(&x_values, &parameter_storage, &mut values);
+        values
+    }
+
+    pub fn evaluate_inequalities_flat(
+        &self,
+        x: &<X as Vectorize<SX>>::Rebind<f64>,
+        parameters: &<P as Vectorize<SX>>::Rebind<f64>,
+    ) -> Vec<f64> {
+        let x_values = flatten_value(x);
+        let parameter_values = flatten_value(parameters);
+        let parameter_storage = if P::LEN == 0 {
+            Vec::new()
+        } else {
+            vec![ParameterMatrix {
+                ccs: self.inner.parameter_ccs(0),
+                values: &parameter_values,
+            }]
+        };
+        let mut values = vec![0.0; self.inner.inequality_base_count()];
+        let _ = self
+            .inner
+            .inequality_values_timed(&x_values, &parameter_storage, &mut values);
+        values
     }
 
     pub fn bind_runtime_bounds(
@@ -791,6 +838,133 @@ where
             callback,
         )
     }
+
+    pub fn rank_constraint_violations(
+        &self,
+        x: &<X as Vectorize<SX>>::Rebind<f64>,
+        parameters: &<P as Vectorize<SX>>::Rebind<f64>,
+        bounds: &TypedRuntimeNlpBounds<X, I>,
+        tolerance: f64,
+    ) -> Result<NlpConstraintViolationReport, RuntimeNlpBoundsError> {
+        let x_values = flatten_value(x);
+        let parameter_values = flatten_value(parameters);
+        let parameter_storage = if P::LEN == 0 {
+            Vec::new()
+        } else {
+            vec![ParameterMatrix {
+                ccs: self.inner.parameter_ccs(0),
+                values: &parameter_values,
+            }]
+        };
+        rank_nlp_constraint_violations(
+            &self.inner,
+            &x_values,
+            &parameter_storage,
+            &RuntimeNlpBounds {
+                variables: ConstraintBounds {
+                    lower: bounds.variable_lower.as_ref().map(flatten_value),
+                    upper: bounds.variable_upper.as_ref().map(flatten_value),
+                },
+                inequalities: ConstraintBounds {
+                    lower: bounds.inequality_lower.as_ref().map(flatten_value),
+                    upper: bounds.inequality_upper.as_ref().map(flatten_value),
+                },
+            },
+            tolerance,
+        )
+    }
+}
+
+pub fn rank_nlp_constraint_violations(
+    problem: &impl CompiledNlpProblem,
+    x: &[f64],
+    parameters: &[ParameterMatrix<'_>],
+    bounds: &RuntimeNlpBounds,
+    tolerance: f64,
+) -> Result<NlpConstraintViolationReport, RuntimeNlpBoundsError> {
+    let variable_bounds =
+        validate_bound_vectors(problem.dimension(), bounds.variables.clone(), true)?;
+    let inequality_bounds = validate_bound_vectors(
+        problem.inequality_count(),
+        bounds.inequalities.clone(),
+        false,
+    )?;
+
+    let mut equalities = vec![0.0; problem.equality_count()];
+    problem.equality_values(x, parameters, &mut equalities);
+
+    let mut inequalities = vec![0.0; problem.inequality_count()];
+    problem.inequality_values(x, parameters, &mut inequalities);
+
+    let mut report = NlpConstraintViolationReport::default();
+    report.equalities = equalities
+        .into_iter()
+        .enumerate()
+        .map(|(row, value)| {
+            let abs_violation = value.abs();
+            NlpEqualityViolation {
+                row,
+                value,
+                abs_violation,
+                satisfaction: classify_constraint_satisfaction(abs_violation, tolerance),
+            }
+        })
+        .collect();
+    report
+        .equalities
+        .sort_by(|lhs, rhs| rhs.abs_violation.total_cmp(&lhs.abs_violation));
+
+    let inequality_lower = inequality_bounds.lower.unwrap_or_default();
+    let inequality_upper = inequality_bounds.upper.unwrap_or_default();
+    for (row, value) in inequalities.into_iter().enumerate() {
+        let lower_bound = inequality_lower.get(row).copied();
+        let upper_bound = inequality_upper.get(row).copied();
+        if lower_bound.is_none() && upper_bound.is_none() {
+            continue;
+        }
+        let (lower_violation, upper_violation) =
+            worst_bound_violation(value, lower_bound, upper_bound);
+        let worst_violation = lower_violation.max(upper_violation);
+        report.inequalities.push(NlpInequalityViolation {
+            source: NlpInequalitySource::ConstraintRow { row },
+            value,
+            lower_bound,
+            upper_bound,
+            lower_violation,
+            upper_violation,
+            worst_violation,
+            bound_side: constraint_bound_side(lower_violation, upper_violation),
+            satisfaction: classify_constraint_satisfaction(worst_violation, tolerance),
+        });
+    }
+
+    let variable_lower = variable_bounds.lower.unwrap_or_default();
+    let variable_upper = variable_bounds.upper.unwrap_or_default();
+    for (index, &value) in x.iter().enumerate() {
+        let lower_bound = variable_lower.get(index).copied();
+        let upper_bound = variable_upper.get(index).copied();
+        if lower_bound.is_none() && upper_bound.is_none() {
+            continue;
+        }
+        let (lower_violation, upper_violation) =
+            worst_bound_violation(value, lower_bound, upper_bound);
+        let worst_violation = lower_violation.max(upper_violation);
+        report.inequalities.push(NlpInequalityViolation {
+            source: NlpInequalitySource::VariableBound { index },
+            value,
+            lower_bound,
+            upper_bound,
+            lower_violation,
+            upper_violation,
+            worst_violation,
+            bound_side: constraint_bound_side(lower_violation, upper_violation),
+            satisfaction: classify_constraint_satisfaction(worst_violation, tolerance),
+        });
+    }
+    report
+        .inequalities
+        .sort_by(|lhs, rhs| rhs.worst_violation.total_cmp(&lhs.worst_violation));
+    Ok(report)
 }
 
 fn compile_symbolic_nlp(
@@ -811,6 +985,95 @@ impl RuntimeBoundedJitNlp<'_> {
     fn record_layout_projection(&self, elapsed: Duration) {
         let mut totals = lock_context(&self.adapter_timing);
         totals.layout_projection += elapsed;
+    }
+}
+
+impl CompiledNlpProblem for CompiledJitNlp {
+    fn dimension(&self) -> Index {
+        self.dimension()
+    }
+
+    fn parameter_count(&self) -> Index {
+        self.parameter_count()
+    }
+
+    fn parameter_ccs(&self, parameter_index: Index) -> &CCS {
+        self.parameter_ccs(parameter_index)
+    }
+
+    fn backend_timing_metadata(&self) -> BackendTimingMetadata {
+        self.backend_timing_metadata()
+    }
+
+    fn equality_count(&self) -> Index {
+        self.equality_count()
+    }
+
+    fn inequality_count(&self) -> Index {
+        self.inequality_base_count()
+    }
+
+    fn objective_value(&self, x: &[f64], parameters: &[ParameterMatrix<'_>]) -> f64 {
+        self.objective_value_timed(x, parameters).0
+    }
+
+    fn objective_gradient(&self, x: &[f64], parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
+        let _ = self.objective_gradient_timed(x, parameters, out);
+    }
+
+    fn equality_jacobian_ccs(&self) -> &CCS {
+        self.equality_jacobian_ccs()
+    }
+
+    fn equality_values(&self, x: &[f64], parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
+        let _ = self.equality_values_timed(x, parameters, out);
+    }
+
+    fn equality_jacobian_values(
+        &self,
+        x: &[f64],
+        parameters: &[ParameterMatrix<'_>],
+        out: &mut [f64],
+    ) {
+        let _ = self.equality_jacobian_values_timed(x, parameters, out);
+    }
+
+    fn inequality_jacobian_ccs(&self) -> &CCS {
+        self.inequality_base_jacobian_ccs()
+    }
+
+    fn inequality_values(&self, x: &[f64], parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
+        let _ = self.inequality_values_timed(x, parameters, out);
+    }
+
+    fn inequality_jacobian_values(
+        &self,
+        x: &[f64],
+        parameters: &[ParameterMatrix<'_>],
+        out: &mut [f64],
+    ) {
+        let _ = self.inequality_jacobian_values_timed(x, parameters, out);
+    }
+
+    fn lagrangian_hessian_ccs(&self) -> &CCS {
+        self.lagrangian_hessian_ccs()
+    }
+
+    fn lagrangian_hessian_values(
+        &self,
+        x: &[f64],
+        parameters: &[ParameterMatrix<'_>],
+        equality_multipliers: &[f64],
+        inequality_multipliers: &[f64],
+        out: &mut [f64],
+    ) {
+        let _ = self.lagrangian_hessian_values_timed(
+            x,
+            parameters,
+            equality_multipliers,
+            inequality_multipliers,
+            out,
+        );
     }
 }
 
@@ -1238,6 +1501,23 @@ fn lock_context<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompiledNlpInputRole {
+    DecisionVariables,
+    EqualityMultipliers,
+    InequalityMultipliers,
+    Parameter,
+}
+
+fn compiled_nlp_input_role(slot_name: &str) -> CompiledNlpInputRole {
+    match slot_name {
+        "x" => CompiledNlpInputRole::DecisionVariables,
+        "lambda_equalities" => CompiledNlpInputRole::EqualityMultipliers,
+        "lambda_inequalities" => CompiledNlpInputRole::InequalityMultipliers,
+        _ => CompiledNlpInputRole::Parameter,
+    }
+}
+
 fn load_jit_inputs(
     function: &CompiledJitFunction,
     context: &mut JitExecutionContext,
@@ -1249,11 +1529,15 @@ fn load_jit_inputs(
     let mut parameter_index = 0;
     for (slot_index, slot) in function.lowered().inputs.iter().enumerate() {
         let input = context.input_mut(slot_index);
-        match slot.name.as_str() {
-            "x" => input.copy_from_slice(x),
-            "lambda_equalities" => input.copy_from_slice(equality_multipliers),
-            "lambda_inequalities" => input.copy_from_slice(inequality_multipliers),
-            _ => {
+        match compiled_nlp_input_role(&slot.name) {
+            CompiledNlpInputRole::DecisionVariables => input.copy_from_slice(x),
+            CompiledNlpInputRole::EqualityMultipliers => {
+                input.copy_from_slice(equality_multipliers)
+            }
+            CompiledNlpInputRole::InequalityMultipliers => {
+                input.copy_from_slice(inequality_multipliers)
+            }
+            CompiledNlpInputRole::Parameter => {
                 input.copy_from_slice(parameters[parameter_index].values);
                 parameter_index += 1;
             }

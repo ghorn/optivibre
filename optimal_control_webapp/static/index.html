@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Optimal Control Studio</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script>
+      window.MathJax = {
+        tex: {
+          inlineMath: [["\\(", "\\)"]],
+          displayMath: [["\\[", "\\]"]],
+        },
+        svg: {
+          fontCache: "global",
+        },
+        startup: {
+          ready() {
+            MathJax.startup.defaultReady();
+            window.dispatchEvent(new Event("mathjax-ready"));
+          },
+        },
+      };
+    </script>
+    <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+    <script defer src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  </head>
+  <body>
+    <div class="backdrop"></div>
+    <div class="gridlines"></div>
+    <div class="layout">
+      <aside class="sidebar panel">
+        <div class="eyebrow">typed OCP demos</div>
+        <h1>Optimal Control Studio</h1>
+        <p class="lede">
+          Pick a problem, tune the parameters, and inspect trajectories,
+          constraints, and problem-specific geometry after each solve.
+        </p>
+
+        <form id="controls-form" class="stack controls-form">
+          <div class="form-header">
+            <h2>Parameters</h2>
+          </div>
+          <div id="controls"></div>
+        </form>
+
+        <section class="stack">
+          <h2>Problems</h2>
+          <div id="problem-list" class="problem-list"></div>
+        </section>
+      </aside>
+
+      <main class="main panel">
+        <section class="hero">
+          <div class="hero-copy">
+            <div id="problem-name" class="hero-title"></div>
+            <p id="problem-description" class="hero-description"></p>
+          </div>
+          <div id="metrics" class="metrics empty"></div>
+        </section>
+
+        <section class="card solve-deck">
+          <div class="card-header">
+            <div>
+              <h2>Solver</h2>
+              <div class="card-subtitle">Live convergence trace and console transcript</div>
+            </div>
+          </div>
+          <div class="solve-grid">
+            <div class="solve-primary">
+              <div class="solve-actions">
+                <button id="solve-button" type="button" class="solve-button">
+                  Solve
+                </button>
+                <div id="status" class="status">Loading problem definitions...</div>
+              </div>
+              <div id="solver-summary" class="solver-summary"></div>
+            </div>
+            <div class="solve-console">
+              <div class="console-label">Console</div>
+              <pre id="solver-log" class="solver-log"></pre>
+            </div>
+            <div id="progress-plot" class="plot-surface solve-plot"></div>
+            <div class="solve-constraints">
+              <section class="constraint-panel">
+                <div class="constraint-panel-header">
+                  <h3>Equalities</h3>
+                  <div class="card-subtitle">Largest residual per semantic constraint</div>
+                </div>
+                <div id="eq-violations" class="constraint-panel-body"></div>
+              </section>
+              <section class="constraint-panel">
+                <div class="constraint-panel-header">
+                  <h3>Inequalities</h3>
+                  <div class="card-subtitle">Worst grouped bounds; inline limits show which side is active</div>
+                </div>
+                <div id="ineq-violations" class="constraint-panel-body"></div>
+              </section>
+            </div>
+          </div>
+        </section>
+
+        <section class="content-grid">
+          <div class="column">
+            <section class="card">
+              <div class="card-header">
+                <h2>Scene</h2>
+                <div id="scene-subtitle" class="card-subtitle"></div>
+              </div>
+              <div id="scene"></div>
+            </section>
+
+            <section class="card">
+              <div class="card-header">
+                <h2>Model</h2>
+                <div class="card-subtitle">States, control-states, and implemented ODEs</div>
+              </div>
+              <div id="model" class="model"></div>
+            </section>
+
+            <section class="card">
+              <div class="card-header">
+                <h2>Notes</h2>
+              </div>
+              <div id="notes" class="notes"></div>
+            </section>
+          </div>
+
+          <div class="column">
+            <section class="card">
+              <div class="card-header">
+                <h2>Charts</h2>
+                <div class="card-subtitle">States, controls, and constraint traces</div>
+              </div>
+              <div id="charts" class="charts"></div>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

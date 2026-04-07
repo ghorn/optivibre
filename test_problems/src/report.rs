@@ -495,7 +495,7 @@ fn format_status_short(status: RunStatus) -> &'static str {
 fn solver_display(solver: SolverKind) -> &'static str {
     match solver {
         SolverKind::Sqp => "sqp",
-        SolverKind::InteriorPoint => "ip",
+        SolverKind::Nlip => "nlip",
         #[cfg(feature = "ipopt")]
         SolverKind::Ipopt => "ipopt",
     }

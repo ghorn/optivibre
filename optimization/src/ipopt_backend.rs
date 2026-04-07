@@ -162,6 +162,7 @@ pub struct IpoptIterationTiming {
 pub struct IpoptIterationSnapshot {
     pub iteration: Index,
     pub phase: IpoptIterationPhase,
+    pub x: Vec<f64>,
     pub objective: f64,
     pub primal_inf: f64,
     pub dual_inf: f64,
@@ -426,6 +427,7 @@ where
         let snapshot = IpoptIterationSnapshot {
             iteration: data.iter_count as usize,
             phase: data.alg_mod.into(),
+            x: data.x.to_vec(),
             objective: data.obj_value,
             primal_inf: data.inf_pr,
             dual_inf: data.inf_du,
