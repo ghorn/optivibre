@@ -20,8 +20,9 @@ use optimal_control::{
 use optimal_control::{DirectCollocationIpoptSnapshot, MultipleShootingIpoptSnapshot};
 use optimization::{
     BackendTimingMetadata, ClarabelSqpOptions, ClarabelSqpSummary, ConstraintSatisfaction,
-    InteriorPointIterationSnapshot, InteriorPointOptions, InteriorPointSummary, NlpCompileStats,
-    SqpIterationEvent, SqpIterationPhase, SqpIterationSnapshot, Vectorize,
+    InteriorPointIterationSnapshot, InteriorPointOptions, InteriorPointSummary,
+    LlvmOptimizationLevel, NlpCompileStats, SqpIterationEvent, SqpIterationPhase,
+    SqpIterationSnapshot, Vectorize,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptOptions, IpoptRawStatus, IpoptSummary};
@@ -1127,6 +1128,13 @@ pub fn default_sqp_config() -> SqpConfig {
 
 pub fn default_solver_method() -> SolverMethod {
     SolverMethod::Sqp
+}
+
+pub const fn interactive_multiple_shooting_opt_level() -> LlvmOptimizationLevel {
+    // The interactive demos are dominated by cold-start latency here, and multiple-shooting
+    // kernels expand the RK4 dynamics directly into the NLP. Favor faster JIT over peak kernel
+    // throughput so the webapp actually becomes usable.
+    LlvmOptimizationLevel::O0
 }
 
 pub fn solver_running_label(method: SolverMethod) -> &'static str {

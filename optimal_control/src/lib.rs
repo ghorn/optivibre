@@ -2906,6 +2906,12 @@ where
         >,
     MsArcSampleOutputNum<X, U>: Vectorize<f64, Rebind<f64> = MsArcSampleOutputNum<X, U>>,
 {
+    // This helper is only used for post-solve/callback arc reconstruction, not for the
+    // compiled NLP itself, so prioritize JIT latency over per-call throughput.
+    let helper_opt_level = match opt_level {
+        LlvmOptimizationLevel::O3 => LlvmOptimizationLevel::O0,
+        other => other,
+    };
     let x = symbolic_value::<X>("x")?;
     let u = symbolic_value::<U>("u")?;
     let dudt = symbolic_value::<U>("dudt")?;
@@ -2927,7 +2933,7 @@ where
         inputs,
         vec![NamedMatrix::new("arc", symbolic_column(&outputs)?)?],
     )?;
-    let compiled = CompiledJitFunction::compile_function(&function, opt_level)?;
+    let compiled = CompiledJitFunction::compile_function(&function, helper_opt_level)?;
     let context = Mutex::new(compiled.create_context());
     Ok(CompiledMultipleShootingArc {
         function: compiled,

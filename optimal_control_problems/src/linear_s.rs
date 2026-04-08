@@ -4,13 +4,14 @@ use crate::common::{
     ScenePath, SolveArtifact, SolveStreamEvent, SolverMethod, SolverReport, SqpConfig,
     TranscriptionConfig, TranscriptionMethod, cached_compile_with_progress, chart,
     compile_progress_info, default_solver_method, default_sqp_config, default_transcription,
-    direct_collocation_compile_key as dc_compile_key, expect_finite, interval_arc_bound_series,
-    interval_arc_series, metric_with_key, numeric_metric_with_key, ocp_compile_progress_update,
-    problem_controls, problem_scientific_slider_control, problem_slider_control, problem_spec,
-    sample_or_default, segmented_bound_series, segmented_series,
-    solve_cached_direct_collocation_problem, solve_cached_direct_collocation_problem_with_progress,
-    solve_cached_multiple_shooting_problem, solve_cached_multiple_shooting_problem_with_progress,
-    solver_config_from_map, solver_method_from_map, transcription_from_map, transcription_metrics,
+    direct_collocation_compile_key as dc_compile_key, expect_finite,
+    interactive_multiple_shooting_opt_level, interval_arc_bound_series, interval_arc_series,
+    metric_with_key, numeric_metric_with_key, ocp_compile_progress_update, problem_controls,
+    problem_scientific_slider_control, problem_slider_control, problem_spec, sample_or_default,
+    segmented_bound_series, segmented_series, solve_cached_direct_collocation_problem,
+    solve_cached_direct_collocation_problem_with_progress, solve_cached_multiple_shooting_problem,
+    solve_cached_multiple_shooting_problem_with_progress, solver_config_from_map,
+    solver_method_from_map, transcription_from_map, transcription_metrics,
 };
 use anyhow::Result;
 use optimal_control::{
@@ -307,7 +308,8 @@ fn s_reference(x: f64, params: &Params) -> f64 {
 fn cached_multiple_shooting() -> Result<CachedCompile<MsCompiled<DEFAULT_INTERVALS>>> {
     MULTIPLE_SHOOTING_CACHE.with(|cache| {
         cache.borrow_mut().get_or_try_init(DEFAULT_INTERVALS, || {
-            Ok(model(MultipleShooting::<DEFAULT_INTERVALS, RK4_SUBSTEPS>).compile_jit()?)
+            Ok(model(MultipleShooting::<DEFAULT_INTERVALS, RK4_SUBSTEPS>)
+                .compile_jit_with_opt_level(interactive_multiple_shooting_opt_level())?)
         })
     })
 }
@@ -341,12 +343,15 @@ fn compile_multiple_shooting_with_progress(
             |on_compile_progress| {
                 let mut progress_state = OcpCompileProgressState::default();
                 Ok(model(MultipleShooting::<DEFAULT_INTERVALS, RK4_SUBSTEPS>)
-                    .compile_jit_with_progress_callback(|progress| {
-                        on_compile_progress(ocp_compile_progress_update(
-                            progress,
-                            &mut progress_state,
-                        ));
-                    })?)
+                    .compile_jit_with_opt_level_and_progress_callback(
+                        interactive_multiple_shooting_opt_level(),
+                        |progress| {
+                            on_compile_progress(ocp_compile_progress_update(
+                                progress,
+                                &mut progress_state,
+                            ));
+                        },
+                    )?)
             },
             |compiled| {
                 compile_progress_info(
