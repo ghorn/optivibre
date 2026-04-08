@@ -247,13 +247,14 @@ fn typed_symbolic_compile_callback_reports_full_pre_jit_symbolic_timing() {
         }
     })
     .expect("symbolic NLP should build");
-    let mut callback_timing = None;
+    let mut callback_metadata = None;
     let compiled = symbolic
-        .compile_jit_with_symbolic_callback(|timing| {
-            callback_timing = Some(timing);
+        .compile_jit_with_symbolic_callback(|metadata| {
+            callback_metadata = Some(metadata);
         })
         .expect("JIT compile should succeed");
-    let callback_timing = callback_timing.expect("callback timing should be captured");
+    let callback_metadata = callback_metadata.expect("callback timing should be captured");
+    let callback_timing = callback_metadata.timing;
     let final_timing = compiled.backend_timing_metadata();
 
     assert!(callback_timing.function_creation_time.is_some());
@@ -268,6 +269,10 @@ fn typed_symbolic_compile_callback_reports_full_pre_jit_symbolic_timing() {
         final_timing.derivative_generation_time
     );
     assert!(final_timing.jit_time.is_some());
+    assert_eq!(callback_metadata.stats.variable_count, 2);
+    assert_eq!(callback_metadata.stats.equality_count, 0);
+    assert_eq!(callback_metadata.stats.inequality_count, 0);
+    assert!(callback_metadata.stats.hessian_nnz > 0);
 }
 
 #[cfg(feature = "ipopt")]

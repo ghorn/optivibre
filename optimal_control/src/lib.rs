@@ -3,16 +3,18 @@ use optimization::{
     BackendTimingMetadata, ClarabelSqpError, ClarabelSqpOptions, ClarabelSqpSummary,
     ConstraintBoundSide, ConstraintSatisfaction, InteriorPointIterationSnapshot,
     InteriorPointOptions, InteriorPointSolveError, InteriorPointSummary, LlvmOptimizationLevel,
-    ScalarLeaf, SqpIterationSnapshot, SymbolicNlpBuildError, SymbolicNlpCompileError,
-    SymbolicNlpOutputs, TypedCompiledJitNlp, TypedRuntimeNlpBounds, Vectorize,
-    VectorizeLayoutError, classify_constraint_satisfaction, constraint_bound_side, flatten_value,
-    symbolic_column, symbolic_nlp, symbolic_value, unflatten_value, worst_bound_violation,
+    NlpCompileStats, ScalarLeaf, SqpIterationSnapshot, SymbolicCompileMetadata,
+    SymbolicNlpBuildError, SymbolicNlpCompileError, SymbolicNlpOutputs, TypedCompiledJitNlp,
+    TypedRuntimeNlpBounds, Vectorize, VectorizeLayoutError, classify_constraint_satisfaction,
+    constraint_bound_side, flatten_value, symbolic_column, symbolic_nlp, symbolic_value,
+    unflatten_value, worst_bound_violation,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptIterationSnapshot, IpoptOptions, IpoptSolveError, IpoptSummary};
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use sx_codegen_llvm::{CompiledJitFunction, JitExecutionContext};
 use sx_core::{NamedMatrix, NodeView, SX, SXFunction, SXMatrix, SxError};
 use thiserror::Error;
@@ -554,14 +556,8 @@ type DcVarsNum<X, U, const N: usize, const K: usize> = (
 );
 type DcIneqNum<C, Beq, Bineq, const N: usize, const K: usize> =
     (Numeric<Beq>, Numeric<Bineq>, IntervalGrid<Numeric<C>, N, K>);
-type MsArcOutput<X, U> = (
-    [X; MULTIPLE_SHOOTING_ARC_SAMPLES],
-    [U; MULTIPLE_SHOOTING_ARC_SAMPLES],
-);
-type MsArcOutputNum<X, U> = (
-    [Numeric<X>; MULTIPLE_SHOOTING_ARC_SAMPLES],
-    [Numeric<U>; MULTIPLE_SHOOTING_ARC_SAMPLES],
-);
+type MsArcSampleOutput<X, U> = (X, U);
+type MsArcSampleOutputNum<X, U> = (Numeric<X>, Numeric<U>);
 #[derive(Clone, Debug)]
 struct PromotionPlan {
     rows: Vec<RawInequalityRow>,
@@ -622,6 +618,27 @@ struct CompiledMultipleShootingArc<X, U, P, const RK4_SUBSTEPS: usize> {
     _marker: PhantomData<fn() -> (X, U, P)>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OcpCompileHelperKind {
+    Xdot,
+    MultipleShootingArc,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OcpCompileProgress {
+    SymbolicReady(SymbolicCompileMetadata),
+    HelperCompiled {
+        helper: OcpCompileHelperKind,
+        elapsed: Duration,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OcpHelperCompileStats {
+    pub xdot_helper_time: Option<Duration>,
+    pub multiple_shooting_arc_helper_time: Option<Duration>,
+}
+
 pub struct CompiledMultipleShootingOcp<
     X,
     U,
@@ -642,6 +659,7 @@ pub struct CompiledMultipleShootingOcp<
     promotion_offsets: PromotionOffsets<OcpParameters<P, Beq>>,
     xdot_helper: CompiledXdot<X, U, P>,
     rk4_arc_helper: CompiledMultipleShootingArc<X, U, P, RK4_SUBSTEPS>,
+    helper_compile_stats: OcpHelperCompileStats,
     _marker: PhantomData<fn() -> (C, Bineq)>,
 }
 
@@ -656,6 +674,7 @@ pub struct CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq, const N: usize, 
     promotion_offsets: PromotionOffsets<OcpParameters<P, Beq>>,
     xdot_helper: CompiledXdot<X, U, P>,
     coefficients: CollocationCoefficients,
+    helper_compile_stats: OcpHelperCompileStats,
     _marker: PhantomData<fn() -> (C, Bineq)>,
 }
 
@@ -799,7 +818,7 @@ where
         on_symbolic_ready: CB,
     ) -> Result<CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>, OcpCompileError>
     where
-        CB: FnMut(BackendTimingMetadata),
+        CB: FnMut(SymbolicCompileMetadata),
         Mesh<X, N>: Vectorize<SX, Rebind<SX> = Mesh<X, N>>,
         Mesh<U, N>: Vectorize<SX, Rebind<SX> = Mesh<U, N>>,
         [C; N]: Vectorize<SX, Rebind<SX> = [C; N]>,
@@ -823,6 +842,38 @@ where
         self.compile_jit_with_opt_level_and_symbolic_callback(
             LlvmOptimizationLevel::O3,
             on_symbolic_ready,
+        )
+    }
+
+    pub fn compile_jit_with_progress_callback<CB>(
+        &self,
+        on_progress: CB,
+    ) -> Result<CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>, OcpCompileError>
+    where
+        CB: FnMut(OcpCompileProgress),
+        Mesh<X, N>: Vectorize<SX, Rebind<SX> = Mesh<X, N>>,
+        Mesh<U, N>: Vectorize<SX, Rebind<SX> = Mesh<U, N>>,
+        [C; N]: Vectorize<SX, Rebind<SX> = [C; N]>,
+        [X; N]: Vectorize<SX, Rebind<SX> = [X; N]>,
+        [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,
+        MsVars<X, U, N>:
+            Vectorize<SX, Rebind<SX> = MsVars<X, U, N>, Rebind<f64> = MsVarsNum<X, U, N>>,
+        MsEqualities<X, U, N>: Vectorize<SX, Rebind<SX> = MsEqualities<X, U, N>>,
+        MsIneq<C, Beq, Bineq, N>: Vectorize<
+                SX,
+                Rebind<SX> = MsIneq<C, Beq, Bineq, N>,
+                Rebind<f64> = MsIneqNum<C, Beq, Bineq, N>,
+            >,
+        OcpParameters<P, Beq>: Vectorize<
+                SX,
+                Rebind<SX> = OcpParameters<P, Beq>,
+                Rebind<f64> = OcpParametersNum<P, Beq>,
+            >,
+        OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
+    {
+        self.compile_jit_with_opt_level_and_progress_callback(
+            LlvmOptimizationLevel::O3,
+            on_progress,
         )
     }
 
@@ -851,16 +902,50 @@ where
             >,
         OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
     {
-        self.compile_jit_with_opt_level_and_symbolic_callback(opt_level, |_| {})
+        self.compile_jit_with_opt_level_and_progress_callback(opt_level, |_| {})
     }
 
     pub fn compile_jit_with_opt_level_and_symbolic_callback<CB>(
         &self,
         opt_level: LlvmOptimizationLevel,
-        on_symbolic_ready: CB,
+        mut on_symbolic_ready: CB,
     ) -> Result<CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>, OcpCompileError>
     where
-        CB: FnMut(BackendTimingMetadata),
+        CB: FnMut(SymbolicCompileMetadata),
+        Mesh<X, N>: Vectorize<SX, Rebind<SX> = Mesh<X, N>>,
+        Mesh<U, N>: Vectorize<SX, Rebind<SX> = Mesh<U, N>>,
+        [C; N]: Vectorize<SX, Rebind<SX> = [C; N]>,
+        [X; N]: Vectorize<SX, Rebind<SX> = [X; N]>,
+        [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,
+        MsVars<X, U, N>:
+            Vectorize<SX, Rebind<SX> = MsVars<X, U, N>, Rebind<f64> = MsVarsNum<X, U, N>>,
+        MsEqualities<X, U, N>: Vectorize<SX, Rebind<SX> = MsEqualities<X, U, N>>,
+        MsIneq<C, Beq, Bineq, N>: Vectorize<
+                SX,
+                Rebind<SX> = MsIneq<C, Beq, Bineq, N>,
+                Rebind<f64> = MsIneqNum<C, Beq, Bineq, N>,
+            >,
+        OcpParameters<P, Beq>: Vectorize<
+                SX,
+                Rebind<SX> = OcpParameters<P, Beq>,
+                Rebind<f64> = OcpParametersNum<P, Beq>,
+            >,
+        OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
+    {
+        self.compile_jit_with_opt_level_and_progress_callback(opt_level, |progress| {
+            if let OcpCompileProgress::SymbolicReady(metadata) = progress {
+                on_symbolic_ready(metadata);
+            }
+        })
+    }
+
+    pub fn compile_jit_with_opt_level_and_progress_callback<CB>(
+        &self,
+        opt_level: LlvmOptimizationLevel,
+        mut on_progress: CB,
+    ) -> Result<CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>, OcpCompileError>
+    where
+        CB: FnMut(OcpCompileProgress),
         Mesh<X, N>: Vectorize<SX, Rebind<SX> = Mesh<X, N>>,
         Mesh<U, N>: Vectorize<SX, Rebind<SX> = Mesh<U, N>>,
         [C; N]: Vectorize<SX, Rebind<SX> = [C; N]>,
@@ -901,17 +986,35 @@ where
             self.transcribe_multiple_shooting(vars, params)
                 .expect("multiple shooting transcription should be infallible after validation")
         })?;
-        let compiled = symbolic
-            .compile_jit_with_opt_level_and_symbolic_callback(opt_level, on_symbolic_ready)?;
+        let compiled =
+            symbolic.compile_jit_with_opt_level_and_symbolic_callback(opt_level, |metadata| {
+                on_progress(OcpCompileProgress::SymbolicReady(metadata));
+            })?;
+        let xdot_started = Instant::now();
         let xdot_helper = compile_xdot_helper::<X, U, P>(&*self.ode, opt_level)?;
+        let xdot_helper_time = xdot_started.elapsed();
+        on_progress(OcpCompileProgress::HelperCompiled {
+            helper: OcpCompileHelperKind::Xdot,
+            elapsed: xdot_helper_time,
+        });
+        let rk4_arc_started = Instant::now();
         let rk4_arc_helper =
             compile_multiple_shooting_arc_helper::<X, U, P, RK4_SUBSTEPS>(&*self.ode, opt_level)?;
+        let multiple_shooting_arc_helper_time = rk4_arc_started.elapsed();
+        on_progress(OcpCompileProgress::HelperCompiled {
+            helper: OcpCompileHelperKind::MultipleShootingArc,
+            elapsed: multiple_shooting_arc_helper_time,
+        });
         Ok(CompiledMultipleShootingOcp {
             compiled,
             promotion_plan,
             promotion_offsets,
             xdot_helper,
             rk4_arc_helper,
+            helper_compile_stats: OcpHelperCompileStats {
+                xdot_helper_time: Some(xdot_helper_time),
+                multiple_shooting_arc_helper_time: Some(multiple_shooting_arc_helper_time),
+            },
             _marker: PhantomData,
         })
     }
@@ -1055,7 +1158,7 @@ where
         on_symbolic_ready: CB,
     ) -> Result<CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq, N, K>, OcpCompileError>
     where
-        CB: FnMut(BackendTimingMetadata),
+        CB: FnMut(SymbolicCompileMetadata),
         Mesh<X, N>: Vectorize<SX, Rebind<SX> = Mesh<X, N>>,
         Mesh<U, N>: Vectorize<SX, Rebind<SX> = Mesh<U, N>>,
         IntervalGrid<X, N, K>: Vectorize<SX, Rebind<SX> = IntervalGrid<X, N, K>>,
@@ -1081,6 +1184,40 @@ where
         self.compile_jit_with_opt_level_and_symbolic_callback(
             LlvmOptimizationLevel::O3,
             on_symbolic_ready,
+        )
+    }
+
+    pub fn compile_jit_with_progress_callback<CB>(
+        &self,
+        on_progress: CB,
+    ) -> Result<CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq, N, K>, OcpCompileError>
+    where
+        CB: FnMut(OcpCompileProgress),
+        Mesh<X, N>: Vectorize<SX, Rebind<SX> = Mesh<X, N>>,
+        Mesh<U, N>: Vectorize<SX, Rebind<SX> = Mesh<U, N>>,
+        IntervalGrid<X, N, K>: Vectorize<SX, Rebind<SX> = IntervalGrid<X, N, K>>,
+        IntervalGrid<U, N, K>: Vectorize<SX, Rebind<SX> = IntervalGrid<U, N, K>>,
+        IntervalGrid<C, N, K>: Vectorize<SX, Rebind<SX> = IntervalGrid<C, N, K>>,
+        DcVars<X, U, N, K>:
+            Vectorize<SX, Rebind<SX> = DcVars<X, U, N, K>, Rebind<f64> = DcVarsNum<X, U, N, K>>,
+        DcEqualities<X, U, N, K>: Vectorize<SX, Rebind<SX> = DcEqualities<X, U, N, K>>,
+        DcIneq<C, Beq, Bineq, N, K>: Vectorize<
+                SX,
+                Rebind<SX> = DcIneq<C, Beq, Bineq, N, K>,
+                Rebind<f64> = DcIneqNum<C, Beq, Bineq, N, K>,
+            >,
+        OcpParameters<P, Beq>: Vectorize<
+                SX,
+                Rebind<SX> = OcpParameters<P, Beq>,
+                Rebind<f64> = OcpParametersNum<P, Beq>,
+            >,
+        [X; N]: Vectorize<SX, Rebind<SX> = [X; N]>,
+        [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,
+        OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
+    {
+        self.compile_jit_with_opt_level_and_progress_callback(
+            LlvmOptimizationLevel::O3,
+            on_progress,
         )
     }
 
@@ -1111,16 +1248,52 @@ where
         [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,
         OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
     {
-        self.compile_jit_with_opt_level_and_symbolic_callback(opt_level, |_| {})
+        self.compile_jit_with_opt_level_and_progress_callback(opt_level, |_| {})
     }
 
     pub fn compile_jit_with_opt_level_and_symbolic_callback<CB>(
         &self,
         opt_level: LlvmOptimizationLevel,
-        on_symbolic_ready: CB,
+        mut on_symbolic_ready: CB,
     ) -> Result<CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq, N, K>, OcpCompileError>
     where
-        CB: FnMut(BackendTimingMetadata),
+        CB: FnMut(SymbolicCompileMetadata),
+        Mesh<X, N>: Vectorize<SX, Rebind<SX> = Mesh<X, N>>,
+        Mesh<U, N>: Vectorize<SX, Rebind<SX> = Mesh<U, N>>,
+        IntervalGrid<X, N, K>: Vectorize<SX, Rebind<SX> = IntervalGrid<X, N, K>>,
+        IntervalGrid<U, N, K>: Vectorize<SX, Rebind<SX> = IntervalGrid<U, N, K>>,
+        IntervalGrid<C, N, K>: Vectorize<SX, Rebind<SX> = IntervalGrid<C, N, K>>,
+        DcVars<X, U, N, K>:
+            Vectorize<SX, Rebind<SX> = DcVars<X, U, N, K>, Rebind<f64> = DcVarsNum<X, U, N, K>>,
+        DcEqualities<X, U, N, K>: Vectorize<SX, Rebind<SX> = DcEqualities<X, U, N, K>>,
+        DcIneq<C, Beq, Bineq, N, K>: Vectorize<
+                SX,
+                Rebind<SX> = DcIneq<C, Beq, Bineq, N, K>,
+                Rebind<f64> = DcIneqNum<C, Beq, Bineq, N, K>,
+            >,
+        OcpParameters<P, Beq>: Vectorize<
+                SX,
+                Rebind<SX> = OcpParameters<P, Beq>,
+                Rebind<f64> = OcpParametersNum<P, Beq>,
+            >,
+        [X; N]: Vectorize<SX, Rebind<SX> = [X; N]>,
+        [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,
+        OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
+    {
+        self.compile_jit_with_opt_level_and_progress_callback(opt_level, |progress| {
+            if let OcpCompileProgress::SymbolicReady(metadata) = progress {
+                on_symbolic_ready(metadata);
+            }
+        })
+    }
+
+    pub fn compile_jit_with_opt_level_and_progress_callback<CB>(
+        &self,
+        opt_level: LlvmOptimizationLevel,
+        mut on_progress: CB,
+    ) -> Result<CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq, N, K>, OcpCompileError>
+    where
+        CB: FnMut(OcpCompileProgress),
         Mesh<X, N>: Vectorize<SX, Rebind<SX> = Mesh<X, N>>,
         Mesh<U, N>: Vectorize<SX, Rebind<SX> = Mesh<U, N>>,
         IntervalGrid<X, N, K>: Vectorize<SX, Rebind<SX> = IntervalGrid<X, N, K>>,
@@ -1166,15 +1339,27 @@ where
             self.transcribe_direct_collocation(vars, params, &coefficients)
                 .expect("direct collocation transcription should be infallible after validation")
         })?;
-        let compiled = symbolic
-            .compile_jit_with_opt_level_and_symbolic_callback(opt_level, on_symbolic_ready)?;
+        let compiled =
+            symbolic.compile_jit_with_opt_level_and_symbolic_callback(opt_level, |metadata| {
+                on_progress(OcpCompileProgress::SymbolicReady(metadata));
+            })?;
+        let xdot_started = Instant::now();
         let xdot_helper = compile_xdot_helper::<X, U, P>(&*self.ode, opt_level)?;
+        let xdot_helper_time = xdot_started.elapsed();
+        on_progress(OcpCompileProgress::HelperCompiled {
+            helper: OcpCompileHelperKind::Xdot,
+            elapsed: xdot_helper_time,
+        });
         Ok(CompiledDirectCollocationOcp {
             compiled,
             promotion_plan,
             promotion_offsets,
             xdot_helper,
             coefficients,
+            helper_compile_stats: OcpHelperCompileStats {
+                xdot_helper_time: Some(xdot_helper_time),
+                multiple_shooting_arc_helper_time: None,
+            },
             _marker: PhantomData,
         })
     }
@@ -1369,6 +1554,18 @@ where
 {
     pub fn backend_timing_metadata(&self) -> BackendTimingMetadata {
         self.compiled.backend_timing_metadata()
+    }
+
+    pub fn nlp_compile_stats(&self) -> NlpCompileStats {
+        self.compiled.compile_stats()
+    }
+
+    pub fn helper_compile_stats(&self) -> OcpHelperCompileStats {
+        self.helper_compile_stats
+    }
+
+    pub const fn helper_kernel_count(&self) -> usize {
+        2
     }
 
     pub fn solve_sqp(
@@ -1654,9 +1851,12 @@ where
         parameters: &Numeric<P>,
     ) -> AnyResult<(Vec<IntervalArc<Numeric<X>>>, Vec<IntervalArc<Numeric<U>>>)>
     where
-        MsArcOutput<X, U>:
-            Vectorize<SX, Rebind<SX> = MsArcOutput<X, U>, Rebind<f64> = MsArcOutputNum<X, U>>,
-        MsArcOutputNum<X, U>: Vectorize<f64, Rebind<f64> = MsArcOutputNum<X, U>>,
+        MsArcSampleOutput<X, U>: Vectorize<
+                SX,
+                Rebind<SX> = MsArcSampleOutput<X, U>,
+                Rebind<f64> = MsArcSampleOutputNum<X, U>,
+            >,
+        MsArcSampleOutputNum<X, U>: Vectorize<f64, Rebind<f64> = MsArcSampleOutputNum<X, U>>,
     {
         let step = trajectories.tf / (N as f64);
         let time_grid = MultipleShootingTimeGrid {
@@ -1668,9 +1868,6 @@ where
             let start_x = &trajectories.x.nodes[interval];
             let start_u = &trajectories.u.nodes[interval];
             let rate = &trajectories.dudt[interval];
-            let (x_samples, u_samples) = self
-                .rk4_arc_helper
-                .eval(start_x, start_u, rate, parameters, step)?;
             let start_time = time_grid.nodes.nodes[interval];
             let mut times = Vec::with_capacity(MULTIPLE_SHOOTING_ARC_SAMPLES + 1);
             times.push(start_time);
@@ -1680,11 +1877,20 @@ where
 
             let mut x_values = Vec::with_capacity(MULTIPLE_SHOOTING_ARC_SAMPLES + 1);
             x_values.push(start_x.clone());
-            x_values.extend(x_samples.into_iter());
-
             let mut u_values = Vec::with_capacity(MULTIPLE_SHOOTING_ARC_SAMPLES + 1);
             u_values.push(start_u.clone());
-            u_values.extend(u_samples.into_iter());
+            for sample in 0..MULTIPLE_SHOOTING_ARC_SAMPLES {
+                let fraction = (sample + 1) as f64 / (MULTIPLE_SHOOTING_ARC_SAMPLES as f64);
+                let (x_sample, u_sample) = self.rk4_arc_helper.eval(
+                    start_x,
+                    start_u,
+                    rate,
+                    parameters,
+                    fraction * step,
+                )?;
+                x_values.push(x_sample);
+                u_values.push(u_sample);
+            }
 
             x_arcs.push(IntervalArc {
                 times: times.clone(),
@@ -1956,6 +2162,18 @@ where
 {
     pub fn backend_timing_metadata(&self) -> BackendTimingMetadata {
         self.compiled.backend_timing_metadata()
+    }
+
+    pub fn nlp_compile_stats(&self) -> NlpCompileStats {
+        self.compiled.compile_stats()
+    }
+
+    pub fn helper_compile_stats(&self) -> OcpHelperCompileStats {
+        self.helper_compile_stats
+    }
+
+    pub const fn helper_kernel_count(&self) -> usize {
+        1
     }
 
     pub fn solve_sqp(
@@ -2565,9 +2783,12 @@ where
     Numeric<X>: Vectorize<f64, Rebind<f64> = Numeric<X>>,
     Numeric<U>: Vectorize<f64, Rebind<f64> = Numeric<U>>,
     Numeric<P>: Vectorize<f64, Rebind<f64> = Numeric<P>>,
-    MsArcOutput<X, U>:
-        Vectorize<SX, Rebind<SX> = MsArcOutput<X, U>, Rebind<f64> = MsArcOutputNum<X, U>>,
-    MsArcOutputNum<X, U>: Vectorize<f64, Rebind<f64> = MsArcOutputNum<X, U>>,
+    MsArcSampleOutput<X, U>: Vectorize<
+            SX,
+            Rebind<SX> = MsArcSampleOutput<X, U>,
+            Rebind<f64> = MsArcSampleOutputNum<X, U>,
+        >,
+    MsArcSampleOutputNum<X, U>: Vectorize<f64, Rebind<f64> = MsArcSampleOutputNum<X, U>>,
 {
     fn eval(
         &self,
@@ -2576,7 +2797,7 @@ where
         dudt: &Numeric<U>,
         parameters: &Numeric<P>,
         dt: f64,
-    ) -> AnyResult<MsArcOutputNum<X, U>> {
+    ) -> AnyResult<MsArcSampleOutputNum<X, U>> {
         let flat_x = flatten_value(x);
         let flat_u = flatten_value(u);
         let flat_dudt = flatten_value(dudt);
@@ -2590,7 +2811,7 @@ where
         }
         context.input_mut(3 + usize::from(P::LEN > 0))[0] = dt;
         self.function.eval(&mut context);
-        unflatten_value::<MsArcOutputNum<X, U>, f64>(context.output(0)).map_err(Into::into)
+        unflatten_value::<MsArcSampleOutputNum<X, U>, f64>(context.output(0)).map_err(Into::into)
     }
 }
 
@@ -2678,24 +2899,20 @@ where
     Numeric<X>: Vectorize<f64, Rebind<f64> = Numeric<X>>,
     Numeric<U>: Vectorize<f64, Rebind<f64> = Numeric<U>>,
     Numeric<P>: Vectorize<f64, Rebind<f64> = Numeric<P>>,
-    MsArcOutput<X, U>:
-        Vectorize<SX, Rebind<SX> = MsArcOutput<X, U>, Rebind<f64> = MsArcOutputNum<X, U>>,
-    MsArcOutputNum<X, U>: Vectorize<f64, Rebind<f64> = MsArcOutputNum<X, U>>,
+    MsArcSampleOutput<X, U>: Vectorize<
+            SX,
+            Rebind<SX> = MsArcSampleOutput<X, U>,
+            Rebind<f64> = MsArcSampleOutputNum<X, U>,
+        >,
+    MsArcSampleOutputNum<X, U>: Vectorize<f64, Rebind<f64> = MsArcSampleOutputNum<X, U>>,
 {
     let x = symbolic_value::<X>("x")?;
     let u = symbolic_value::<U>("u")?;
     let dudt = symbolic_value::<U>("dudt")?;
     let p = symbolic_value::<P>("p")?;
     let dt = SX::sym("dt");
-    let samples: [(X, U); MULTIPLE_SHOOTING_ARC_SAMPLES] = std::array::from_fn(|index| {
-        let fraction = (index + 1) as f64 / (MULTIPLE_SHOOTING_ARC_SAMPLES as f64);
-        rk4_integrate_symbolic_state_only(&x, &u, &dudt, &p, fraction * dt, RK4_SUBSTEPS, ode)
-            .expect("symbolic RK4 arc generation should be infallible")
-    });
-    let outputs = (
-        std::array::from_fn(|index| samples[index].0.clone()),
-        std::array::from_fn(|index| samples[index].1.clone()),
-    );
+    let outputs = rk4_integrate_symbolic_state_only(&x, &u, &dudt, &p, dt, RK4_SUBSTEPS, ode)
+        .expect("symbolic RK4 arc generation should be infallible");
     let mut inputs = vec![
         NamedMatrix::new("x", symbolic_column(&x)?)?,
         NamedMatrix::new("u", symbolic_column(&u)?)?,

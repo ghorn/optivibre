@@ -1,4 +1,7 @@
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
+use std::hash::Hash;
+use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -10,15 +13,15 @@ use optimal_control::{
     DirectCollocationInteriorPointSnapshot, DirectCollocationRuntimeValues,
     DirectCollocationSqpSnapshot, DirectCollocationTimeGrid, DirectCollocationTrajectories,
     IntervalArc, MultipleShootingInteriorPointSnapshot, MultipleShootingRuntimeValues,
-    MultipleShootingSqpSnapshot, MultipleShootingTrajectories, OcpConstraintCategory,
-    OcpConstraintViolationReport,
+    MultipleShootingSqpSnapshot, MultipleShootingTrajectories, OcpCompileHelperKind,
+    OcpCompileProgress, OcpConstraintCategory, OcpConstraintViolationReport, OcpHelperCompileStats,
 };
 #[cfg(feature = "ipopt")]
 use optimal_control::{DirectCollocationIpoptSnapshot, MultipleShootingIpoptSnapshot};
 use optimization::{
     BackendTimingMetadata, ClarabelSqpOptions, ClarabelSqpSummary, ConstraintSatisfaction,
-    InteriorPointIterationSnapshot, InteriorPointOptions, InteriorPointSummary, SqpIterationEvent,
-    SqpIterationPhase, SqpIterationSnapshot, Vectorize,
+    InteriorPointIterationSnapshot, InteriorPointOptions, InteriorPointSummary, NlpCompileStats,
+    SqpIterationEvent, SqpIterationPhase, SqpIterationSnapshot, Vectorize,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptOptions, IpoptRawStatus, IpoptSummary};
@@ -154,6 +157,41 @@ pub struct ProblemSpec {
     pub controls: Vec<ControlSpec>,
     pub math_sections: Vec<LatexSection>,
     pub notes: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompileCacheState {
+    Cold,
+    Ready,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CompileCacheStatus {
+    pub problem_id: ProblemId,
+    pub problem_name: String,
+    pub variant_id: String,
+    pub variant_label: String,
+    pub state: CompileCacheState,
+    pub symbolic_setup_s: Option<f64>,
+    pub jit_s: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CompileCacheVariant<K> {
+    pub key: K,
+    pub variant_id: &'static str,
+    pub variant_label: &'static str,
+}
+
+impl<K> CompileCacheVariant<K> {
+    pub const fn new(key: K, variant_id: &'static str, variant_label: &'static str) -> Self {
+        Self {
+            key,
+            variant_id,
+            variant_label,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -580,6 +618,28 @@ pub enum SolverStatusKind {
     Info,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SolverPhaseDetail {
+    pub label: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct SolverPhaseDetails {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub symbolic_setup: Vec<SolverPhaseDetail>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jit: Vec<SolverPhaseDetail>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub solve: Vec<SolverPhaseDetail>,
+}
+
+impl SolverPhaseDetails {
+    pub fn is_empty(&self) -> bool {
+        self.symbolic_setup.is_empty() && self.jit.is_empty() && self.solve.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct SolverReport {
     pub completed: bool,
@@ -593,6 +653,10 @@ pub struct SolverReport {
     pub jit_s: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub solve_s: Option<f64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compile_cached: bool,
+    #[serde(default, skip_serializing_if = "SolverPhaseDetails::is_empty")]
+    pub phase_details: SolverPhaseDetails,
 }
 
 impl SolverReport {
@@ -605,6 +669,8 @@ impl SolverReport {
             symbolic_setup_s: None,
             jit_s: None,
             solve_s: None,
+            compile_cached: false,
+            phase_details: SolverPhaseDetails::default(),
         }
     }
 
@@ -617,6 +683,8 @@ impl SolverReport {
             symbolic_setup_s: None,
             jit_s: None,
             solve_s: None,
+            compile_cached: false,
+            phase_details: SolverPhaseDetails::default(),
         }
     }
 
@@ -635,6 +703,21 @@ impl SolverReport {
         if solve_s.is_finite() && solve_s >= 0.0 {
             self.solve_s = Some(solve_s);
         }
+        self
+    }
+
+    pub fn with_phase_details(mut self, phase_details: SolverPhaseDetails) -> Self {
+        self.phase_details = phase_details;
+        self
+    }
+
+    pub fn with_compile_cached(mut self, compile_cached: bool) -> Self {
+        self.compile_cached = compile_cached;
+        self
+    }
+
+    pub fn with_symbolic_phase_details(mut self, details: Vec<SolverPhaseDetail>) -> Self {
+        self.phase_details.symbolic_setup = details;
         self
     }
 }
@@ -683,6 +766,270 @@ impl SharedControlId {
 }
 
 type Numeric<T> = <T as Vectorize<SX>>::Rebind<f64>;
+
+pub struct SharedCompileCache<K, V> {
+    entries: HashMap<K, Rc<RefCell<V>>>,
+}
+
+pub struct CachedCompile<V> {
+    pub compiled: Rc<RefCell<V>>,
+    pub was_cached: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompileProgressUpdate {
+    pub timing: BackendTimingMetadata,
+    pub phase_details: SolverPhaseDetails,
+    pub compile_cached: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompileProgressInfo {
+    pub timing: BackendTimingMetadata,
+    pub compile_cached: bool,
+    pub phase_details: SolverPhaseDetails,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct OcpCompileProgressState {
+    timing: BackendTimingMetadata,
+    phase_details: SolverPhaseDetails,
+}
+
+impl<K, V> SharedCompileCache<K, V>
+where
+    K: Eq + Hash + Copy,
+{
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    pub fn get_or_try_init<F>(&mut self, key: K, build: F) -> Result<CachedCompile<V>>
+    where
+        F: FnOnce() -> Result<V>,
+    {
+        if let Some(compiled) = self.entries.get(&key) {
+            return Ok(CachedCompile {
+                compiled: compiled.clone(),
+                was_cached: true,
+            });
+        }
+
+        let compiled = Rc::new(RefCell::new(build()?));
+        self.entries.insert(key, compiled.clone());
+        Ok(CachedCompile {
+            compiled,
+            was_cached: false,
+        })
+    }
+
+    pub fn get(&self, key: K) -> Option<Rc<RefCell<V>>> {
+        self.entries.get(&key).cloned()
+    }
+}
+
+fn phase_detail(label: impl Into<String>, value: impl Into<String>) -> SolverPhaseDetail {
+    SolverPhaseDetail {
+        label: label.into(),
+        value: value.into(),
+    }
+}
+
+pub fn compile_cache_status(
+    problem_id: ProblemId,
+    problem_name: &str,
+    variant_id: &str,
+    variant_label: &str,
+    timing: Option<BackendTimingMetadata>,
+) -> CompileCacheStatus {
+    CompileCacheStatus {
+        problem_id,
+        problem_name: problem_name.to_string(),
+        variant_id: variant_id.to_string(),
+        variant_label: variant_label.to_string(),
+        state: if timing.is_some() {
+            CompileCacheState::Ready
+        } else {
+            CompileCacheState::Cold
+        },
+        symbolic_setup_s: timing.and_then(symbolic_setup_seconds),
+        jit_s: timing.and_then(|value| duration_seconds(value.jit_time)),
+    }
+}
+
+pub fn collect_compile_cache_statuses<K, V, F>(
+    problem_id: ProblemId,
+    problem_name: &str,
+    cache: &SharedCompileCache<K, V>,
+    variants: &[CompileCacheVariant<K>],
+    timing_of: F,
+) -> Vec<CompileCacheStatus>
+where
+    K: Eq + Hash + Copy,
+    F: Fn(&V) -> BackendTimingMetadata,
+{
+    variants
+        .iter()
+        .map(|variant| {
+            let timing = cache
+                .get(variant.key)
+                .map(|compiled| timing_of(&compiled.borrow()));
+            compile_cache_status(
+                problem_id,
+                problem_name,
+                variant.variant_id,
+                variant.variant_label,
+                timing,
+            )
+        })
+        .collect()
+}
+
+fn upsert_phase_detail(
+    details: &mut Vec<SolverPhaseDetail>,
+    label: impl Into<String>,
+    value: impl Into<String>,
+) {
+    let label = label.into();
+    let value = value.into();
+    if let Some(detail) = details.iter_mut().find(|detail| detail.label == label) {
+        detail.value = value;
+    } else {
+        details.push(phase_detail(label, value));
+    }
+}
+
+fn format_phase_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs_f64();
+    if seconds >= 10.0 {
+        format!("{seconds:.1} s")
+    } else if seconds >= 1.0 {
+        format!("{seconds:.2} s")
+    } else if seconds >= 0.1 {
+        format!("{:.0} ms", seconds * 1000.0)
+    } else {
+        format!("{:.1} ms", seconds * 1000.0)
+    }
+}
+
+fn symbolic_phase_details(stats: NlpCompileStats) -> Vec<SolverPhaseDetail> {
+    let total_jacobian_nnz = stats.equality_jacobian_nnz + stats.inequality_jacobian_nnz;
+    vec![
+        phase_detail("Vars", stats.variable_count.to_string()),
+        phase_detail("Params", stats.parameter_scalar_count.to_string()),
+        phase_detail("Eq", stats.equality_count.to_string()),
+        phase_detail("Ineq", stats.inequality_count.to_string()),
+        phase_detail("Jac NNZ", total_jacobian_nnz.to_string()),
+        phase_detail("Hess NNZ", stats.hessian_nnz.to_string()),
+    ]
+}
+
+fn jit_phase_details(stats: NlpCompileStats, helper_kernel_count: usize) -> Vec<SolverPhaseDetail> {
+    vec![
+        phase_detail("NLP Kernels", stats.jit_kernel_count.to_string()),
+        phase_detail("Helper Kernels", helper_kernel_count.to_string()),
+    ]
+}
+
+fn helper_compile_detail_label(helper: OcpCompileHelperKind) -> &'static str {
+    match helper {
+        OcpCompileHelperKind::Xdot => "Xdot Helper",
+        OcpCompileHelperKind::MultipleShootingArc => "RK4 Arc Helper",
+    }
+}
+
+fn helper_compile_phase_details(helper_stats: OcpHelperCompileStats) -> Vec<SolverPhaseDetail> {
+    let mut details = Vec::new();
+    if let Some(duration) = helper_stats.xdot_helper_time {
+        details.push(phase_detail("Xdot Helper", format_phase_duration(duration)));
+    }
+    if let Some(duration) = helper_stats.multiple_shooting_arc_helper_time {
+        details.push(phase_detail(
+            "RK4 Arc Helper",
+            format_phase_duration(duration),
+        ));
+    }
+    details
+}
+
+pub fn ocp_compile_progress_update(
+    progress: OcpCompileProgress,
+    state: &mut OcpCompileProgressState,
+) -> CompileProgressUpdate {
+    match progress {
+        OcpCompileProgress::SymbolicReady(metadata) => {
+            state.timing = metadata.timing;
+            state.phase_details.symbolic_setup = symbolic_phase_details(metadata.stats);
+            state.phase_details.jit = vec![phase_detail(
+                "NLP Kernels",
+                metadata.stats.jit_kernel_count.to_string(),
+            )];
+        }
+        OcpCompileProgress::HelperCompiled { helper, elapsed } => {
+            upsert_phase_detail(
+                &mut state.phase_details.jit,
+                helper_compile_detail_label(helper),
+                format_phase_duration(elapsed),
+            );
+        }
+    }
+    CompileProgressUpdate {
+        timing: state.timing,
+        phase_details: state.phase_details.clone(),
+        compile_cached: false,
+    }
+}
+
+pub fn compile_progress_info(
+    timing: BackendTimingMetadata,
+    stats: NlpCompileStats,
+    helper_kernel_count: usize,
+    helper_stats: OcpHelperCompileStats,
+) -> CompileProgressInfo {
+    let mut jit = jit_phase_details(stats, helper_kernel_count);
+    jit.extend(helper_compile_phase_details(helper_stats));
+    CompileProgressInfo {
+        timing,
+        compile_cached: false,
+        phase_details: SolverPhaseDetails {
+            symbolic_setup: symbolic_phase_details(stats),
+            jit,
+            solve: Vec::new(),
+        },
+    }
+}
+
+pub fn cached_compile_with_progress<K, V, Build, Timing>(
+    cache: &mut SharedCompileCache<K, V>,
+    key: K,
+    on_symbolic_ready: &mut dyn FnMut(CompileProgressUpdate),
+    build: Build,
+    timing_of: Timing,
+) -> Result<(Rc<RefCell<V>>, CompileProgressInfo)>
+where
+    K: Eq + Hash + Copy,
+    Build: FnOnce(&mut dyn FnMut(CompileProgressUpdate)) -> Result<V>,
+    Timing: Fn(&V) -> CompileProgressInfo,
+{
+    let cached = cache.get_or_try_init(key, || build(on_symbolic_ready))?;
+    let progress = timing_of(&cached.compiled.borrow());
+    if cached.was_cached {
+        on_symbolic_ready(CompileProgressUpdate {
+            timing: pre_jit_backend_timing(progress.timing),
+            phase_details: progress.phase_details.clone(),
+            compile_cached: true,
+        });
+    }
+    Ok((
+        cached.compiled,
+        CompileProgressInfo {
+            compile_cached: cached.was_cached,
+            ..progress
+        },
+    ))
+}
 
 pub fn default_transcription(intervals: usize) -> TranscriptionConfig {
     TranscriptionConfig {
@@ -737,21 +1084,26 @@ where
     ) -> Result<(Compiled, SolverReport)>
     where
         Compile: FnOnce(
-            &mut dyn FnMut(BackendTimingMetadata),
-        ) -> Result<(Compiled, BackendTimingMetadata)>,
+            &mut dyn FnMut(CompileProgressUpdate),
+        ) -> Result<(Compiled, CompileProgressInfo)>,
     {
         emit_symbolic_setup_status(&mut self.emit);
-        let mut on_symbolic_ready = |timing: BackendTimingMetadata| {
+        let mut on_symbolic_ready = |update: CompileProgressUpdate| {
             emit_solve_status(
                 &mut self.emit,
                 SolveStage::JitCompilation,
                 None,
-                SolverReport::in_progress("Compiling JIT...").with_backend_timing(timing),
+                SolverReport::in_progress("Compiling JIT...")
+                    .with_backend_timing(update.timing)
+                    .with_compile_cached(update.compile_cached)
+                    .with_phase_details(update.phase_details),
             );
         };
-        let (compiled, timing) = compile(&mut on_symbolic_ready)?;
+        let (compiled, progress) = compile(&mut on_symbolic_ready)?;
         let running_solver = SolverReport::in_progress(solver_running_label(self.solver_method))
-            .with_backend_timing(timing);
+            .with_backend_timing(progress.timing)
+            .with_compile_cached(progress.compile_cached)
+            .with_phase_details(progress.phase_details);
         Ok((compiled, running_solver))
     }
 
@@ -2462,9 +2814,9 @@ where
     }
 }
 
-pub fn compile_and_solve_multiple_shooting<Compiled, Compile, Build, const N: usize>(
-    compile: Compile,
-    runtime: MultipleShootingRuntimeValues<
+pub fn solve_cached_multiple_shooting_problem<Compiled, Build, const N: usize>(
+    compiled: &Rc<RefCell<Compiled>>,
+    runtime: &MultipleShootingRuntimeValues<
         Compiled::PNum,
         Compiled::CBounds,
         Compiled::BeqNum,
@@ -2479,17 +2831,16 @@ pub fn compile_and_solve_multiple_shooting<Compiled, Compile, Build, const N: us
 ) -> Result<SolveArtifact>
 where
     Compiled: MultipleShootingCompiled<N>,
-    Compile: FnOnce() -> Result<Compiled>,
     Build: FnMut(
         &MultipleShootingTrajectories<Compiled::XNum, Compiled::UNum, N>,
         &[IntervalArc<Compiled::XNum>],
         &[IntervalArc<Compiled::UNum>],
     ) -> SolveArtifact,
 {
-    let compiled = compile()?;
+    let compiled = compiled.borrow();
     solve_multiple_shooting_problem(
-        &compiled,
-        &runtime,
+        &*compiled,
+        runtime,
         solver_method,
         solver_config,
         build_artifact,
@@ -2575,14 +2926,14 @@ where
                                         line: format!(
                                             "[constraint violation report failed: {error}]"
                                         ),
-                                        level: SolveLogLevel::Warning,
+                                        level: SolveLogLevel::Info,
                                     });
                                 }
                                 submit.submit(SolveStreamEvent::Iteration { progress, artifact });
                             }
                             Err(error) => submit.submit(SolveStreamEvent::Log {
                                 line: format!("[iteration visualization failed: {error}]"),
-                                level: SolveLogLevel::Warning,
+                                level: SolveLogLevel::Info,
                             }),
                         },
                     )
@@ -2661,14 +3012,14 @@ where
                                         line: format!(
                                             "[constraint violation report failed: {error}]"
                                         ),
-                                        level: SolveLogLevel::Warning,
+                                        level: SolveLogLevel::Info,
                                     });
                                 }
                                 submit.submit(SolveStreamEvent::Iteration { progress, artifact });
                             }
                             Err(error) => submit.submit(SolveStreamEvent::Log {
                                 line: format!("[iteration visualization failed: {error}]"),
-                                level: SolveLogLevel::Warning,
+                                level: SolveLogLevel::Info,
                             }),
                         },
                     )
@@ -2748,14 +3099,14 @@ where
                                         line: format!(
                                             "[constraint violation report failed: {error}]"
                                         ),
-                                        level: SolveLogLevel::Warning,
+                                        level: SolveLogLevel::Info,
                                     });
                                 }
                                 submit.submit(SolveStreamEvent::Iteration { progress, artifact });
                             }
                             Err(error) => submit.submit(SolveStreamEvent::Log {
                                 line: format!("[iteration visualization failed: {error}]"),
-                                level: SolveLogLevel::Warning,
+                                level: SolveLogLevel::Info,
                             }),
                         },
                     )
@@ -2788,15 +3139,9 @@ where
     }
 }
 
-pub fn compile_and_solve_multiple_shooting_with_progress<
-    Compiled,
-    Compile,
-    Emit,
-    Build,
-    const N: usize,
->(
-    compile: Compile,
-    runtime: MultipleShootingRuntimeValues<
+pub fn solve_cached_multiple_shooting_problem_with_progress<Compiled, Emit, Build, const N: usize>(
+    compiled: &Rc<RefCell<Compiled>>,
+    runtime: &MultipleShootingRuntimeValues<
         Compiled::PNum,
         Compiled::CBounds,
         Compiled::BeqNum,
@@ -2808,13 +3153,11 @@ pub fn compile_and_solve_multiple_shooting_with_progress<
     solver_method: SolverMethod,
     solver_config: &SqpConfig,
     emit: Emit,
+    running_solver: SolverReport,
     build_artifact: Build,
 ) -> Result<SolveArtifact>
 where
     Compiled: MultipleShootingCompiled<N>,
-    Compile: FnOnce(
-        &mut dyn FnMut(BackendTimingMetadata),
-    ) -> Result<(Compiled, BackendTimingMetadata)>,
     Emit: FnMut(SolveStreamEvent) + Send,
     Build: FnMut(
         &MultipleShootingTrajectories<Compiled::XNum, Compiled::UNum, N>,
@@ -2822,14 +3165,13 @@ where
         &[IntervalArc<Compiled::UNum>],
     ) -> SolveArtifact,
 {
-    let mut lifecycle = SolveLifecycleReporter::new(emit, solver_method);
-    let (compiled, running_solver) = lifecycle.compile_with_progress(compile)?;
+    let compiled = compiled.borrow();
     solve_multiple_shooting_problem_with_progress(
-        &compiled,
-        &runtime,
+        &*compiled,
+        runtime,
         solver_method,
         solver_config,
-        lifecycle.into_emit(),
+        emit,
         running_solver,
         build_artifact,
     )
@@ -2906,9 +3248,9 @@ where
     }
 }
 
-pub fn compile_and_solve_direct_collocation<Compiled, Compile, Build, const N: usize, const K: usize>(
-    compile: Compile,
-    runtime: DirectCollocationRuntimeValues<
+pub fn solve_cached_direct_collocation_problem<Compiled, Build, const N: usize, const K: usize>(
+    compiled: &Rc<RefCell<Compiled>>,
+    runtime: &DirectCollocationRuntimeValues<
         Compiled::PNum,
         Compiled::CBounds,
         Compiled::BeqNum,
@@ -2924,16 +3266,15 @@ pub fn compile_and_solve_direct_collocation<Compiled, Compile, Build, const N: u
 ) -> Result<SolveArtifact>
 where
     Compiled: DirectCollocationCompiled<N, K>,
-    Compile: FnOnce() -> Result<Compiled>,
     Build: FnMut(
         &DirectCollocationTrajectories<Compiled::XNum, Compiled::UNum, N, K>,
         &DirectCollocationTimeGrid<N, K>,
     ) -> SolveArtifact,
 {
-    let compiled = compile()?;
+    let compiled = compiled.borrow();
     solve_direct_collocation_problem(
-        &compiled,
-        &runtime,
+        &*compiled,
+        runtime,
         solver_method,
         solver_config,
         build_artifact,
@@ -3020,7 +3361,7 @@ where
                             ) {
                                 submit.submit(SolveStreamEvent::Log {
                                     line: format!("[constraint violation report failed: {error}]"),
-                                    level: SolveLogLevel::Warning,
+                                    level: SolveLogLevel::Info,
                                 });
                             }
                             submit.submit(SolveStreamEvent::Iteration { progress, artifact });
@@ -3094,7 +3435,7 @@ where
                             ) {
                                 submit.submit(SolveStreamEvent::Log {
                                     line: format!("[constraint violation report failed: {error}]"),
-                                    level: SolveLogLevel::Warning,
+                                    level: SolveLogLevel::Info,
                                 });
                             }
                             submit.submit(SolveStreamEvent::Iteration { progress, artifact });
@@ -3169,7 +3510,7 @@ where
                             ) {
                                 submit.submit(SolveStreamEvent::Log {
                                     line: format!("[constraint violation report failed: {error}]"),
-                                    level: SolveLogLevel::Warning,
+                                    level: SolveLogLevel::Info,
                                 });
                             }
                             submit.submit(SolveStreamEvent::Iteration { progress, artifact });
@@ -3202,16 +3543,15 @@ where
     }
 }
 
-pub fn compile_and_solve_direct_collocation_with_progress<
+pub fn solve_cached_direct_collocation_problem_with_progress<
     Compiled,
-    Compile,
     Emit,
     Build,
     const N: usize,
     const K: usize,
 >(
-    compile: Compile,
-    runtime: DirectCollocationRuntimeValues<
+    compiled: &Rc<RefCell<Compiled>>,
+    runtime: &DirectCollocationRuntimeValues<
         Compiled::PNum,
         Compiled::CBounds,
         Compiled::BeqNum,
@@ -3224,27 +3564,24 @@ pub fn compile_and_solve_direct_collocation_with_progress<
     solver_method: SolverMethod,
     solver_config: &SqpConfig,
     emit: Emit,
+    running_solver: SolverReport,
     build_artifact: Build,
 ) -> Result<SolveArtifact>
 where
     Compiled: DirectCollocationCompiled<N, K>,
-    Compile: FnOnce(
-        &mut dyn FnMut(BackendTimingMetadata),
-    ) -> Result<(Compiled, BackendTimingMetadata)>,
     Emit: FnMut(SolveStreamEvent) + Send,
     Build: FnMut(
         &DirectCollocationTrajectories<Compiled::XNum, Compiled::UNum, N, K>,
         &DirectCollocationTimeGrid<N, K>,
     ) -> SolveArtifact,
 {
-    let mut lifecycle = SolveLifecycleReporter::new(emit, solver_method);
-    let (compiled, running_solver) = lifecycle.compile_with_progress(compile)?;
+    let compiled = compiled.borrow();
     solve_direct_collocation_problem_with_progress(
-        &compiled,
-        &runtime,
+        &*compiled,
+        runtime,
         solver_method,
         solver_config,
-        lifecycle.into_emit(),
+        emit,
         running_solver,
         build_artifact,
     )
@@ -3391,6 +3728,8 @@ pub fn sqp_solver_report(summary: &ClarabelSqpSummary) -> SolverReport {
         symbolic_setup_s: symbolic_setup_seconds(summary.profiling.backend_timing),
         jit_s: duration_seconds(summary.profiling.backend_timing.jit_time),
         solve_s: Some(summary.profiling.total_time.as_secs_f64()),
+        compile_cached: false,
+        phase_details: SolverPhaseDetails::default(),
     }
 }
 
@@ -3403,6 +3742,8 @@ pub fn nlip_solver_report(summary: &InteriorPointSummary) -> SolverReport {
         symbolic_setup_s: symbolic_setup_seconds(summary.profiling.backend_timing),
         jit_s: duration_seconds(summary.profiling.backend_timing.jit_time),
         solve_s: Some(summary.profiling.total_time.as_secs_f64()),
+        compile_cached: false,
+        phase_details: SolverPhaseDetails::default(),
     }
 }
 
@@ -3416,6 +3757,8 @@ pub fn ipopt_solver_report(summary: &IpoptSummary) -> SolverReport {
         symbolic_setup_s: symbolic_setup_seconds(summary.profiling.backend_timing),
         jit_s: duration_seconds(summary.profiling.backend_timing.jit_time),
         solve_s: Some(summary.profiling.total_time.as_secs_f64()),
+        compile_cached: false,
+        phase_details: SolverPhaseDetails::default(),
     }
 }
 
@@ -3462,6 +3805,14 @@ pub fn append_ipopt_termination_metric(artifact: &mut SolveArtifact, summary: &I
 
 fn duration_seconds(duration: Option<Duration>) -> Option<f64> {
     duration.map(|value| value.as_secs_f64())
+}
+
+pub fn pre_jit_backend_timing(timing: BackendTimingMetadata) -> BackendTimingMetadata {
+    BackendTimingMetadata {
+        function_creation_time: timing.function_creation_time,
+        derivative_generation_time: timing.derivative_generation_time,
+        jit_time: None,
+    }
 }
 
 fn symbolic_setup_seconds(timing: BackendTimingMetadata) -> Option<f64> {
@@ -3545,8 +3896,27 @@ mod tests {
                 SolveLifecycleReporter::new(|event| events.push(event), SolverMethod::Sqp);
             let result = reporter
                 .compile_with_progress(|on_symbolic_ready| {
-                    on_symbolic_ready(symbolic_timing);
-                    Ok::<_, anyhow::Error>(("compiled", compiled_timing))
+                    on_symbolic_ready(CompileProgressUpdate {
+                        timing: symbolic_timing,
+                        phase_details: SolverPhaseDetails {
+                            symbolic_setup: vec![phase_detail("Vars", "2")],
+                            jit: vec![phase_detail("NLP Kernels", "3")],
+                            solve: Vec::new(),
+                        },
+                        compile_cached: false,
+                    });
+                    Ok::<_, anyhow::Error>((
+                        "compiled",
+                        CompileProgressInfo {
+                            timing: compiled_timing,
+                            compile_cached: false,
+                            phase_details: SolverPhaseDetails {
+                                symbolic_setup: vec![phase_detail("Vars", "2")],
+                                jit: vec![phase_detail("NLP Kernels", "3")],
+                                solve: Vec::new(),
+                            },
+                        },
+                    ))
                 })
                 .expect("compile should succeed");
             let _ = reporter.into_emit();
@@ -3572,6 +3942,8 @@ mod tests {
                 assert_eq!(status.solver.status_label, "Compiling JIT...");
                 assert_close(status.solver.symbolic_setup_s, 0.75);
                 assert!(status.solver.jit_s.is_none());
+                assert!(!status.solver.compile_cached);
+                assert_eq!(status.solver.phase_details.symbolic_setup.len(), 1);
             }
             event => panic!("expected timed jit status, got {event:?}"),
         }
@@ -3581,6 +3953,53 @@ mod tests {
         assert_close(running_solver.jit_s, 2.0);
         assert!(running_solver.solve_s.is_none());
         assert!(running_solver.iterations.is_none());
+        assert!(!running_solver.compile_cached);
+        assert_eq!(running_solver.phase_details.symbolic_setup.len(), 1);
+        assert_eq!(running_solver.phase_details.jit.len(), 1);
+    }
+
+    #[test]
+    fn ocp_compile_progress_updates_include_helper_timings() {
+        let symbolic_timing = BackendTimingMetadata {
+            function_creation_time: Some(Duration::from_millis(250)),
+            derivative_generation_time: Some(Duration::from_millis(500)),
+            jit_time: None,
+        };
+        let mut state = OcpCompileProgressState::default();
+        let symbolic = ocp_compile_progress_update(
+            OcpCompileProgress::SymbolicReady(optimization::SymbolicCompileMetadata {
+                timing: symbolic_timing,
+                stats: NlpCompileStats {
+                    jit_kernel_count: 3,
+                    ..NlpCompileStats::default()
+                },
+            }),
+            &mut state,
+        );
+        assert_eq!(symbolic.phase_details.jit.len(), 1);
+        assert_eq!(symbolic.phase_details.jit[0].label, "NLP Kernels");
+
+        let xdot = ocp_compile_progress_update(
+            OcpCompileProgress::HelperCompiled {
+                helper: OcpCompileHelperKind::Xdot,
+                elapsed: Duration::from_millis(125),
+            },
+            &mut state,
+        );
+        assert_eq!(xdot.phase_details.jit.len(), 2);
+        assert_eq!(xdot.phase_details.jit[1].label, "Xdot Helper");
+        assert_eq!(xdot.phase_details.jit[1].value, "125 ms");
+
+        let arc = ocp_compile_progress_update(
+            OcpCompileProgress::HelperCompiled {
+                helper: OcpCompileHelperKind::MultipleShootingArc,
+                elapsed: Duration::from_secs_f64(4.5),
+            },
+            &mut state,
+        );
+        assert_eq!(arc.phase_details.jit.len(), 3);
+        assert_eq!(arc.phase_details.jit[2].label, "RK4 Arc Helper");
+        assert_eq!(arc.phase_details.jit[2].value, "4.50 s");
     }
 
     #[test]

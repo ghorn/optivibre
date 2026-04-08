@@ -1,24 +1,28 @@
 use crate::common::{
-    FromMap, LatexSection, MetricKey, PlotMode, ProblemId, ProblemSpec, Scene2D, SceneAnimation,
-    SceneArrow, SceneFrame, ScenePath, SolveArtifact, SolveStreamEvent, SolverMethod, SolverReport,
-    SqpConfig, TimeSeries, TranscriptionConfig, TranscriptionMethod, chart,
-    compile_and_solve_direct_collocation, compile_and_solve_direct_collocation_with_progress,
-    compile_and_solve_multiple_shooting, compile_and_solve_multiple_shooting_with_progress,
-    default_solver_method, default_sqp_config, default_transcription, deg_to_rad,
-    expect_finite, interval_arc_bound_series, interval_arc_series, metric_with_key, node_times,
-    numeric_metric_with_key, problem_controls, problem_scientific_slider_control,
-    problem_slider_control, problem_spec, rad_to_deg, sample_or_default, segmented_series,
-    solver_config_from_map, solver_method_from_map, transcription_from_map, transcription_metrics,
+    CachedCompile, CompileCacheStatus, CompileCacheVariant, FromMap, LatexSection, MetricKey,
+    OcpCompileProgressState, PlotMode, ProblemId, ProblemSpec, Scene2D, SceneAnimation, SceneArrow,
+    SceneFrame, ScenePath, SharedCompileCache, SolveArtifact, SolveStreamEvent, SolverMethod,
+    SolverReport, SqpConfig, TimeSeries, TranscriptionConfig, TranscriptionMethod,
+    cached_compile_with_progress, chart, collect_compile_cache_statuses, compile_progress_info,
+    default_solver_method, default_sqp_config, default_transcription, deg_to_rad, expect_finite,
+    interval_arc_bound_series, interval_arc_series, metric_with_key, node_times,
+    numeric_metric_with_key, ocp_compile_progress_update, problem_controls,
+    problem_scientific_slider_control, problem_slider_control, problem_spec, rad_to_deg,
+    sample_or_default, segmented_series, solve_cached_direct_collocation_problem,
+    solve_cached_direct_collocation_problem_with_progress, solve_cached_multiple_shooting_problem,
+    solve_cached_multiple_shooting_problem_with_progress, solver_config_from_map,
+    solver_method_from_map, transcription_from_map, transcription_metrics,
 };
 use anyhow::Result;
 use optimal_control::{
-    Bounds1D, DirectCollocation, DirectCollocationInitialGuess, DirectCollocationRuntimeValues,
-    DirectCollocationTimeGrid, DirectCollocationTrajectories, InterpolatedTrajectory, IntervalArc,
-    MultipleShooting, MultipleShootingInitialGuess, MultipleShootingRuntimeValues,
-    MultipleShootingTrajectories, Ocp, direct_collocation_root_arcs,
-    direct_collocation_state_like_arcs,
+    Bounds1D, CompiledDirectCollocationOcp, CompiledMultipleShootingOcp, DirectCollocation,
+    DirectCollocationInitialGuess, DirectCollocationRuntimeValues, DirectCollocationTimeGrid,
+    DirectCollocationTrajectories, InterpolatedTrajectory, IntervalArc, MultipleShooting,
+    MultipleShootingInitialGuess, MultipleShootingRuntimeValues, MultipleShootingTrajectories, Ocp,
+    direct_collocation_root_arcs, direct_collocation_state_like_arcs,
 };
 use serde::Serialize;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::f64::consts::PI;
 use sx_core::SX;
@@ -71,6 +75,53 @@ struct BoundaryEq<T> {
     x0: T,
     z0: T,
 }
+
+#[derive(Clone, Debug, PartialEq, optimization::Vectorize)]
+struct ModelParams<T> {
+    wind_speed: T,
+    omega_weight: T,
+    alpha_weight: T,
+    omega_rate_weight: T,
+    alpha_rate_weight: T,
+}
+
+type MsCompiled<const N: usize> = CompiledMultipleShootingOcp<
+    State<SX>,
+    Control<SX>,
+    ModelParams<SX>,
+    Path<SX>,
+    BoundaryEq<SX>,
+    (),
+    N,
+    RK4_SUBSTEPS,
+>;
+
+type DcCompiled<const N: usize, const K: usize> = CompiledDirectCollocationOcp<
+    State<SX>,
+    Control<SX>,
+    ModelParams<SX>,
+    Path<SX>,
+    BoundaryEq<SX>,
+    (),
+    N,
+    K,
+>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum DcCompileKey {
+    Legendre,
+    RadauIia,
+}
+
+thread_local! {
+    static MULTIPLE_SHOOTING_CACHE: RefCell<SharedCompileCache<usize, MsCompiled<DEFAULT_INTERVALS>>> =
+        RefCell::new(SharedCompileCache::new());
+    static DIRECT_COLLOCATION_CACHE: RefCell<
+        SharedCompileCache<DcCompileKey, DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>>
+    > = RefCell::new(SharedCompileCache::new());
+}
+
+const PROBLEM_NAME: &str = "Sailboat Symmetric Tack";
 
 #[derive(Clone, Debug)]
 pub struct Params {
@@ -410,7 +461,7 @@ struct SymbolicFlow {
     f_water_drag_z: SX,
 }
 
-fn sailboat_flow_sx(state: &State<SX>, control: &Control<SX>, wind_speed: f64) -> SymbolicFlow {
+fn sailboat_flow_sx(state: &State<SX>, control: &Control<SX>, wind_speed: SX) -> SymbolicFlow {
     let we_x = -wind_speed - state.vx;
     let we_z = -state.vz;
     let airspeed2 = we_x.sqr() + we_z.sqr() + SPEED_EPS2;
@@ -494,145 +545,163 @@ fn sailboat_flow_numeric(
     }
 }
 
-fn model_ms<const N: usize>(
-    params: &Params,
-) -> Ocp<State<SX>, Control<SX>, (), Path<SX>, BoundaryEq<SX>, (), MultipleShooting<N, RK4_SUBSTEPS>>
-{
-    let wind_speed = params.wind_speed_mps;
-    let omega_weight = params.omega_weight;
-    let alpha_weight = params.alpha_weight;
-    let omega_rate_weight = params.omega_rate_regularization;
-    let alpha_rate_weight = params.alpha_rate_regularization;
-    Ocp::new(
-        "sailboat_symmetric_tack",
-        MultipleShooting::<N, RK4_SUBSTEPS>,
-    )
-    .objective_lagrange(
-        move |_: &State<SX>, control: &Control<SX>, rate: &Control<SX>, _: &()| {
-            omega_weight * control.omega.sqr()
-                + alpha_weight * control.alpha.sqr()
-                + omega_rate_weight * rate.omega.sqr()
-                + alpha_rate_weight * rate.alpha.sqr()
-        },
-    )
-    .objective_mayer(
-        |_: &State<SX>, _: &Control<SX>, terminal: &State<SX>, _: &Control<SX>, _: &(), tf: &SX| {
-            -terminal.x / *tf
-        },
-    )
-    .ode(move |state: &State<SX>, control: &Control<SX>, _: &()| {
-        let flow = sailboat_flow_sx(state, control, wind_speed);
-        let fx = flow.f_air_lift_x + flow.f_air_drag_x + flow.f_water_lift_x + flow.f_water_drag_x;
-        let fz = flow.f_air_lift_z + flow.f_air_drag_z + flow.f_water_lift_z + flow.f_water_drag_z;
-        State {
-            gamma: control.omega,
-            x: state.vx,
-            z: state.vz,
-            vx: fx / BOAT_PLUS_SAILOR_MASS_KG,
-            vz: fz / BOAT_PLUS_SAILOR_MASS_KG,
-        }
-    })
-    .path_constraints(
-        |state: &State<SX>, control: &Control<SX>, _: &Control<SX>, _: &()| Path {
-            gamma: state.gamma,
-            z: state.z,
-            vx: state.vx,
-            vz: state.vz,
-            omega: control.omega,
-            alpha: control.alpha,
-        },
-    )
-    .boundary_equalities(
-        |initial: &State<SX>,
-         _: &Control<SX>,
-         terminal: &State<SX>,
-         _: &Control<SX>,
-         _: &(),
-         _: &SX| BoundaryEq {
-            periodic_gamma: initial.gamma + terminal.gamma,
-            periodic_z: initial.z - terminal.z,
-            periodic_vx: initial.vx - terminal.vx,
-            periodic_vz: initial.vz + terminal.vz,
-            x0: initial.x,
-            z0: initial.z,
-        },
-    )
-    .boundary_inequalities(
-        |_: &State<SX>, _: &Control<SX>, _: &State<SX>, _: &Control<SX>, _: &(), _: &SX| (),
-    )
-    .build()
-    .expect("sailboat model should build")
+fn dc_compile_key(family: optimal_control::CollocationFamily) -> DcCompileKey {
+    match family {
+        optimal_control::CollocationFamily::GaussLegendre => DcCompileKey::Legendre,
+        optimal_control::CollocationFamily::RadauIIA => DcCompileKey::RadauIia,
+    }
 }
 
-fn model_dc<const N: usize, const K: usize>(
-    params: &Params,
-) -> Ocp<State<SX>, Control<SX>, (), Path<SX>, BoundaryEq<SX>, (), DirectCollocation<N, K>> {
-    let wind_speed = params.wind_speed_mps;
-    let omega_weight = params.omega_weight;
-    let alpha_weight = params.alpha_weight;
-    let omega_rate_weight = params.omega_rate_regularization;
-    let alpha_rate_weight = params.alpha_rate_regularization;
-    Ocp::new(
-        "sailboat_symmetric_tack",
-        DirectCollocation::<N, K> {
-            family: params.transcription.collocation_family,
-        },
-    )
-    .objective_lagrange(
-        move |_: &State<SX>, control: &Control<SX>, rate: &Control<SX>, _: &()| {
-            omega_weight * control.omega.sqr()
-                + alpha_weight * control.alpha.sqr()
-                + omega_rate_weight * rate.omega.sqr()
-                + alpha_rate_weight * rate.alpha.sqr()
-        },
-    )
-    .objective_mayer(
-        |_: &State<SX>, _: &Control<SX>, terminal: &State<SX>, _: &Control<SX>, _: &(), tf: &SX| {
-            -terminal.x / *tf
-        },
-    )
-    .ode(move |state: &State<SX>, control: &Control<SX>, _: &()| {
-        let flow = sailboat_flow_sx(state, control, wind_speed);
-        let fx = flow.f_air_lift_x + flow.f_air_drag_x + flow.f_water_lift_x + flow.f_water_drag_x;
-        let fz = flow.f_air_lift_z + flow.f_air_drag_z + flow.f_water_lift_z + flow.f_water_drag_z;
-        State {
-            gamma: control.omega,
-            x: state.vx,
-            z: state.vz,
-            vx: fx / BOAT_PLUS_SAILOR_MASS_KG,
-            vz: fz / BOAT_PLUS_SAILOR_MASS_KG,
-        }
+fn cached_multiple_shooting() -> Result<CachedCompile<MsCompiled<DEFAULT_INTERVALS>>> {
+    MULTIPLE_SHOOTING_CACHE.with(|cache| {
+        cache.borrow_mut().get_or_try_init(DEFAULT_INTERVALS, || {
+            Ok(model(MultipleShooting::<DEFAULT_INTERVALS, RK4_SUBSTEPS>).compile_jit()?)
+        })
     })
-    .path_constraints(
-        |state: &State<SX>, control: &Control<SX>, _: &Control<SX>, _: &()| Path {
-            gamma: state.gamma,
-            z: state.z,
-            vx: state.vx,
-            vz: state.vz,
-            omega: control.omega,
-            alpha: control.alpha,
-        },
-    )
-    .boundary_equalities(
-        |initial: &State<SX>,
-         _: &Control<SX>,
-         terminal: &State<SX>,
-         _: &Control<SX>,
-         _: &(),
-         _: &SX| BoundaryEq {
-            periodic_gamma: initial.gamma + terminal.gamma,
-            periodic_z: initial.z - terminal.z,
-            periodic_vx: initial.vx - terminal.vx,
-            periodic_vz: initial.vz + terminal.vz,
-            x0: initial.x,
-            z0: initial.z,
-        },
-    )
-    .boundary_inequalities(
-        |_: &State<SX>, _: &Control<SX>, _: &State<SX>, _: &Control<SX>, _: &(), _: &SX| (),
-    )
-    .build()
-    .expect("sailboat model should build")
+}
+
+fn cached_direct_collocation(
+    family: optimal_control::CollocationFamily,
+) -> Result<CachedCompile<DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>>> {
+    DIRECT_COLLOCATION_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .get_or_try_init(dc_compile_key(family), || {
+                Ok(model(
+                    DirectCollocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE> { family },
+                )
+                .compile_jit()?)
+            })
+    })
+}
+
+pub fn prewarm(params: &Params) -> Result<()> {
+    match params.transcription.method {
+        TranscriptionMethod::MultipleShooting => cached_multiple_shooting().map(|_| ()),
+        TranscriptionMethod::DirectCollocation => {
+            cached_direct_collocation(params.transcription.collocation_family).map(|_| ())
+        }
+    }
+}
+
+pub fn compile_cache_statuses() -> Vec<CompileCacheStatus> {
+    let mut statuses = Vec::new();
+    MULTIPLE_SHOOTING_CACHE.with(|cache| {
+        let cache = cache.borrow();
+        statuses.extend(collect_compile_cache_statuses(
+            ProblemId::SailboatUpwind,
+            PROBLEM_NAME,
+            &cache,
+            &[CompileCacheVariant::new(
+                DEFAULT_INTERVALS,
+                "multiple_shooting",
+                "Multiple Shooting",
+            )],
+            |compiled| compiled.backend_timing_metadata(),
+        ));
+    });
+    DIRECT_COLLOCATION_CACHE.with(|cache| {
+        let cache = cache.borrow();
+        statuses.extend(collect_compile_cache_statuses(
+            ProblemId::SailboatUpwind,
+            PROBLEM_NAME,
+            &cache,
+            &[
+                CompileCacheVariant::new(
+                    DcCompileKey::Legendre,
+                    "direct_collocation_legendre",
+                    "Direct Collocation · Legendre",
+                ),
+                CompileCacheVariant::new(
+                    DcCompileKey::RadauIia,
+                    "direct_collocation_radau_iia",
+                    "Direct Collocation · Radau IIA",
+                ),
+            ],
+            |compiled| compiled.backend_timing_metadata(),
+        ));
+    });
+    statuses
+}
+
+fn model<Scheme>(
+    scheme: Scheme,
+) -> Ocp<State<SX>, Control<SX>, ModelParams<SX>, Path<SX>, BoundaryEq<SX>, (), Scheme> {
+    Ocp::new("sailboat_symmetric_tack", scheme)
+        .objective_lagrange(
+            |_: &State<SX>,
+             control: &Control<SX>,
+             rate: &Control<SX>,
+             runtime: &ModelParams<SX>| {
+                runtime.omega_weight * control.omega.sqr()
+                    + runtime.alpha_weight * control.alpha.sqr()
+                    + runtime.omega_rate_weight * rate.omega.sqr()
+                    + runtime.alpha_rate_weight * rate.alpha.sqr()
+            },
+        )
+        .objective_mayer(
+            |_: &State<SX>,
+             _: &Control<SX>,
+             terminal: &State<SX>,
+             _: &Control<SX>,
+             _: &ModelParams<SX>,
+             tf: &SX| { -terminal.x / *tf },
+        )
+        .ode(
+            |state: &State<SX>, control: &Control<SX>, runtime: &ModelParams<SX>| {
+                let flow = sailboat_flow_sx(state, control, runtime.wind_speed);
+                let fx = flow.f_air_lift_x
+                    + flow.f_air_drag_x
+                    + flow.f_water_lift_x
+                    + flow.f_water_drag_x;
+                let fz = flow.f_air_lift_z
+                    + flow.f_air_drag_z
+                    + flow.f_water_lift_z
+                    + flow.f_water_drag_z;
+                State {
+                    gamma: control.omega,
+                    x: state.vx,
+                    z: state.vz,
+                    vx: fx / BOAT_PLUS_SAILOR_MASS_KG,
+                    vz: fz / BOAT_PLUS_SAILOR_MASS_KG,
+                }
+            },
+        )
+        .path_constraints(
+            |state: &State<SX>, control: &Control<SX>, _: &Control<SX>, _: &ModelParams<SX>| Path {
+                gamma: state.gamma,
+                z: state.z,
+                vx: state.vx,
+                vz: state.vz,
+                omega: control.omega,
+                alpha: control.alpha,
+            },
+        )
+        .boundary_equalities(
+            |initial: &State<SX>,
+             _: &Control<SX>,
+             terminal: &State<SX>,
+             _: &Control<SX>,
+             _: &ModelParams<SX>,
+             _: &SX| BoundaryEq {
+                periodic_gamma: initial.gamma + terminal.gamma,
+                periodic_z: initial.z - terminal.z,
+                periodic_vx: initial.vx - terminal.vx,
+                periodic_vz: initial.vz + terminal.vz,
+                x0: initial.x,
+                z0: initial.z,
+            },
+        )
+        .boundary_inequalities(
+            |_: &State<SX>,
+             _: &Control<SX>,
+             _: &State<SX>,
+             _: &Control<SX>,
+             _: &ModelParams<SX>,
+             _: &SX| (),
+        )
+        .build()
+        .expect("sailboat model should build")
 }
 
 fn guess<const N: usize>(params: &Params) -> InterpolatedTrajectory<State<f64>, Control<f64>> {
@@ -682,12 +751,8 @@ fn guess<const N: usize>(params: &Params) -> InterpolatedTrajectory<State<f64>, 
 
 pub fn solve(params: &Params) -> Result<SolveArtifact> {
     match params.transcription.method {
-        TranscriptionMethod::MultipleShooting => {
-            solve_multiple_shooting::<DEFAULT_INTERVALS>(params)
-        }
-        TranscriptionMethod::DirectCollocation => {
-            solve_direct_collocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(params)
-        }
+        TranscriptionMethod::MultipleShooting => solve_multiple_shooting(params),
+        TranscriptionMethod::DirectCollocation => solve_direct_collocation(params),
     }
 }
 
@@ -697,12 +762,10 @@ where
 {
     match params.transcription.method {
         TranscriptionMethod::MultipleShooting => {
-            solve_multiple_shooting_with_progress::<DEFAULT_INTERVALS, F>(params, emit)
+            solve_multiple_shooting_with_progress(params, emit)
         }
         TranscriptionMethod::DirectCollocation => {
-            solve_direct_collocation_with_progress::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE, F>(
-                params, emit,
-            )
+            solve_direct_collocation_with_progress(params, emit)
         }
     }
 }
@@ -710,7 +773,7 @@ where
 fn ms_runtime<const N: usize>(
     params: &Params,
 ) -> MultipleShootingRuntimeValues<
-    (),
+    ModelParams<f64>,
     Path<Bounds1D>,
     BoundaryEq<f64>,
     (),
@@ -719,7 +782,13 @@ fn ms_runtime<const N: usize>(
     N,
 > {
     MultipleShootingRuntimeValues {
-        parameters: (),
+        parameters: ModelParams {
+            wind_speed: params.wind_speed_mps,
+            omega_weight: params.omega_weight,
+            alpha_weight: params.alpha_weight,
+            omega_rate_weight: params.omega_rate_regularization,
+            alpha_rate_weight: params.alpha_rate_regularization,
+        },
         beq: BoundaryEq {
             periodic_gamma: 0.0,
             periodic_z: 0.0,
@@ -766,7 +835,7 @@ fn ms_runtime<const N: usize>(
 fn dc_runtime<const N: usize, const K: usize>(
     params: &Params,
 ) -> DirectCollocationRuntimeValues<
-    (),
+    ModelParams<f64>,
     Path<Bounds1D>,
     BoundaryEq<f64>,
     (),
@@ -776,7 +845,13 @@ fn dc_runtime<const N: usize, const K: usize>(
     K,
 > {
     DirectCollocationRuntimeValues {
-        parameters: (),
+        parameters: ModelParams {
+            wind_speed: params.wind_speed_mps,
+            omega_weight: params.omega_weight,
+            alpha_weight: params.alpha_weight,
+            omega_rate_weight: params.omega_rate_regularization,
+            alpha_rate_weight: params.alpha_rate_regularization,
+        },
         beq: BoundaryEq {
             periodic_gamma: 0.0,
             periodic_z: 0.0,
@@ -820,10 +895,11 @@ fn dc_runtime<const N: usize, const K: usize>(
     }
 }
 
-fn solve_multiple_shooting<const N: usize>(params: &Params) -> Result<SolveArtifact> {
-    compile_and_solve_multiple_shooting(
-        || Ok(model_ms::<N>(params).compile_jit()?),
-        ms_runtime::<N>(params),
+fn solve_multiple_shooting(params: &Params) -> Result<SolveArtifact> {
+    let compiled = cached_multiple_shooting()?;
+    solve_cached_multiple_shooting_problem(
+        &compiled.compiled,
+        &ms_runtime::<DEFAULT_INTERVALS>(params),
         params.solver_method,
         &params.solver,
         |trajectories, x_arcs, u_arcs| {
@@ -832,59 +908,105 @@ fn solve_multiple_shooting<const N: usize>(params: &Params) -> Result<SolveArtif
     )
 }
 
-fn solve_direct_collocation<const N: usize, const K: usize>(
-    params: &Params,
-) -> Result<SolveArtifact> {
-    compile_and_solve_direct_collocation(
-        || Ok(model_dc::<N, K>(params).compile_jit()?),
-        dc_runtime::<N, K>(params),
+fn solve_direct_collocation(params: &Params) -> Result<SolveArtifact> {
+    let compiled = cached_direct_collocation(params.transcription.collocation_family)?;
+    solve_cached_direct_collocation_problem(
+        &compiled.compiled,
+        &dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(params),
         params.solver_method,
         &params.solver,
         |trajectories, time_grid| artifact_from_dc_trajectories(params, trajectories, time_grid),
     )
 }
 
-fn solve_multiple_shooting_with_progress<const N: usize, F>(
-    params: &Params,
-    emit: F,
-) -> Result<SolveArtifact>
+fn solve_multiple_shooting_with_progress<F>(params: &Params, emit: F) -> Result<SolveArtifact>
 where
     F: FnMut(SolveStreamEvent) + Send,
 {
-    compile_and_solve_multiple_shooting_with_progress(
-        |on_symbolic_ready| {
-            let compiled = model_ms::<N>(params).compile_jit_with_symbolic_callback(on_symbolic_ready)?;
-            let timing = compiled.backend_timing_metadata();
-            Ok((compiled, timing))
-        },
-        ms_runtime::<N>(params),
+    let mut lifecycle = crate::common::SolveLifecycleReporter::new(emit, params.solver_method);
+    let (compiled, running_solver) = lifecycle.compile_with_progress(|callback| {
+        MULTIPLE_SHOOTING_CACHE.with(|cache| {
+            cached_compile_with_progress(
+                &mut cache.borrow_mut(),
+                DEFAULT_INTERVALS,
+                callback,
+                |on_compile_progress| {
+                    let mut progress_state = OcpCompileProgressState::default();
+                    Ok(model(MultipleShooting::<DEFAULT_INTERVALS, RK4_SUBSTEPS>)
+                        .compile_jit_with_progress_callback(|progress| {
+                            on_compile_progress(ocp_compile_progress_update(
+                                progress,
+                                &mut progress_state,
+                            ));
+                        })?)
+                },
+                |compiled| {
+                    compile_progress_info(
+                        compiled.backend_timing_metadata(),
+                        compiled.nlp_compile_stats(),
+                        compiled.helper_kernel_count(),
+                        compiled.helper_compile_stats(),
+                    )
+                },
+            )
+        })
+    })?;
+    solve_cached_multiple_shooting_problem_with_progress(
+        &compiled,
+        &ms_runtime::<DEFAULT_INTERVALS>(params),
         params.solver_method,
         &params.solver,
-        emit,
+        lifecycle.into_emit(),
+        running_solver,
         |trajectories, x_arcs, u_arcs| {
             artifact_from_ms_trajectories(params, trajectories, x_arcs, u_arcs)
         },
     )
 }
 
-fn solve_direct_collocation_with_progress<const N: usize, const K: usize, F>(
-    params: &Params,
-    emit: F,
-) -> Result<SolveArtifact>
+fn solve_direct_collocation_with_progress<F>(params: &Params, emit: F) -> Result<SolveArtifact>
 where
     F: FnMut(SolveStreamEvent) + Send,
 {
-    compile_and_solve_direct_collocation_with_progress(
-        |on_symbolic_ready| {
-            let compiled =
-                model_dc::<N, K>(params).compile_jit_with_symbolic_callback(on_symbolic_ready)?;
-            let timing = compiled.backend_timing_metadata();
-            Ok((compiled, timing))
-        },
-        dc_runtime::<N, K>(params),
+    let mut lifecycle = crate::common::SolveLifecycleReporter::new(emit, params.solver_method);
+    let (compiled, running_solver) = lifecycle.compile_with_progress(|callback| {
+        DIRECT_COLLOCATION_CACHE.with(|cache| {
+            cached_compile_with_progress(
+                &mut cache.borrow_mut(),
+                dc_compile_key(params.transcription.collocation_family),
+                callback,
+                |on_compile_progress| {
+                    let mut progress_state = OcpCompileProgressState::default();
+                    Ok(model(
+                        DirectCollocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE> {
+                            family: params.transcription.collocation_family,
+                        },
+                    )
+                    .compile_jit_with_progress_callback(|progress| {
+                        on_compile_progress(ocp_compile_progress_update(
+                            progress,
+                            &mut progress_state,
+                        ));
+                    })?)
+                },
+                |compiled| {
+                    compile_progress_info(
+                        compiled.backend_timing_metadata(),
+                        compiled.nlp_compile_stats(),
+                        compiled.helper_kernel_count(),
+                        compiled.helper_compile_stats(),
+                    )
+                },
+            )
+        })
+    })?;
+    solve_cached_direct_collocation_problem_with_progress(
+        &compiled,
+        &dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(params),
         params.solver_method,
         &params.solver,
-        emit,
+        lifecycle.into_emit(),
+        running_solver,
         |trajectories, time_grid| artifact_from_dc_trajectories(params, trajectories, time_grid),
     )
 }

@@ -213,6 +213,24 @@ pub struct BackendTimingMetadata {
     pub jit_time: Option<Duration>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NlpCompileStats {
+    pub variable_count: Index,
+    pub parameter_scalar_count: Index,
+    pub equality_count: Index,
+    pub inequality_count: Index,
+    pub equality_jacobian_nnz: Index,
+    pub inequality_jacobian_nnz: Index,
+    pub hessian_nnz: Index,
+    pub jit_kernel_count: Index,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SymbolicCompileMetadata {
+    pub timing: BackendTimingMetadata,
+    pub stats: NlpCompileStats,
+}
+
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EvalTimingStat {

@@ -5,8 +5,8 @@ use std::io;
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::fd::{FromRawFd, RawFd};
+use std::sync::mpsc as std_mpsc;
 use std::sync::{Mutex, OnceLock};
-#[cfg(unix)]
 use std::thread;
 
 use anyhow::Result;
@@ -19,15 +19,17 @@ use axum::{
     routing::{get, post},
 };
 use optimal_control_problems::{
-    ProblemId, SolveLogLevel, SolveRequest, SolveStreamEvent, problem_specs, solve_problem,
+    CompileCacheStatus, ProblemId, SolveArtifact, SolveLogLevel, SolveRequest, SolveStreamEvent,
+    compile_cache_statuses, prewarm_problem, problem_specs, solve_problem,
     solve_problem_with_progress,
 };
 use optimization::{AnsiColorMode, set_ansi_color_mode};
 use serde::Serialize;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
 static SOLVE_STDIO_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static PROBLEM_BACKEND: OnceLock<ProblemBackend> = OnceLock::new();
 const TEXT_HTML_UTF8: &str = "text/html; charset=utf-8";
 const TEXT_JAVASCRIPT_UTF8: &str = "text/javascript; charset=utf-8";
 const TEXT_CSS_UTF8: &str = "text/css; charset=utf-8";
@@ -37,6 +39,31 @@ const GENERATED_APP_JS: &str = include_str!(concat!(env!("OUT_DIR"), "/app.js"))
 type ApiError = (StatusCode, Json<ErrorResponse>);
 type ApiResult<T> = Result<T, ApiError>;
 type StreamSender = mpsc::Sender<Result<Bytes, Infallible>>;
+
+struct ProblemBackend {
+    requests: std_mpsc::Sender<BackendRequest>,
+}
+
+enum BackendRequest {
+    CompileCacheStatus {
+        reply: oneshot::Sender<Result<Vec<CompileCacheStatus>, String>>,
+    },
+    Prewarm {
+        problem: ProblemId,
+        request: SolveRequest,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    Solve {
+        problem: ProblemId,
+        request: SolveRequest,
+        reply: oneshot::Sender<Result<SolveArtifact, String>>,
+    },
+    SolveStream {
+        problem: ProblemId,
+        request: SolveRequest,
+        sender: StreamSender,
+    },
+}
 
 struct AnsiColorModeGuard(AnsiColorMode);
 
@@ -65,6 +92,8 @@ async fn main() -> Result<()> {
         .route("/app.js", get(app_js))
         .route("/styles.css", get(styles_css))
         .route("/api/problems", get(problems))
+        .route("/api/prewarm_status", get(prewarm_status))
+        .route("/api/prewarm/{id}", post(prewarm))
         .route("/api/solve/{id}", post(solve))
         .route("/api/solve_stream/{id}", post(solve_stream));
 
@@ -95,13 +124,63 @@ async fn problems() -> Json<Vec<optimal_control_problems::ProblemSpec>> {
     Json(problem_specs())
 }
 
+async fn prewarm_status() -> ApiResult<Json<Vec<CompileCacheStatus>>> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    problem_backend()
+        .requests
+        .send(BackendRequest::CompileCacheStatus { reply: reply_tx })
+        .map_err(|error| internal_error(format!("backend worker unavailable: {error}")))?;
+    match reply_rx.await {
+        Ok(Ok(statuses)) => Ok(Json(statuses)),
+        Ok(Err(error)) => Err(internal_error(error)),
+        Err(error) => Err(internal_error(format!(
+            "backend worker dropped compile cache status response: {error}"
+        ))),
+    }
+}
+
+async fn prewarm(
+    Path(problem): Path<ProblemId>,
+    Json(request): Json<SolveRequest>,
+) -> ApiResult<StatusCode> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    problem_backend()
+        .requests
+        .send(BackendRequest::Prewarm {
+            problem,
+            request,
+            reply: reply_tx,
+        })
+        .map_err(|error| internal_error(format!("backend worker unavailable: {error}")))?;
+    match reply_rx.await {
+        Ok(Ok(())) => Ok(StatusCode::NO_CONTENT),
+        Ok(Err(error)) => Err(internal_error(error)),
+        Err(error) => Err(internal_error(format!(
+            "backend worker dropped prewarm response: {error}"
+        ))),
+    }
+}
+
 async fn solve(
     Path(problem): Path<ProblemId>,
     Json(request): Json<SolveRequest>,
 ) -> ApiResult<Json<optimal_control_problems::SolveArtifact>> {
-    solve_problem(problem, &request.values)
-        .map(Json)
-        .map_err(internal_error)
+    let (reply_tx, reply_rx) = oneshot::channel();
+    problem_backend()
+        .requests
+        .send(BackendRequest::Solve {
+            problem,
+            request,
+            reply: reply_tx,
+        })
+        .map_err(|error| internal_error(format!("backend worker unavailable: {error}")))?;
+    match reply_rx.await {
+        Ok(Ok(artifact)) => Ok(Json(artifact)),
+        Ok(Err(error)) => Err(internal_error(error)),
+        Err(error) => Err(internal_error(format!(
+            "backend worker dropped solve response: {error}"
+        ))),
+    }
 }
 
 async fn solve_stream(
@@ -110,13 +189,61 @@ async fn solve_stream(
 ) -> ApiResult<impl IntoResponse> {
     let (sender, receiver) = mpsc::channel::<Result<Bytes, Infallible>>(64);
 
-    spawn_solve_stream_worker(problem, request, sender);
+    problem_backend()
+        .requests
+        .send(BackendRequest::SolveStream {
+            problem,
+            request,
+            sender,
+        })
+        .map_err(|error| internal_error(format!("backend worker unavailable: {error}")))?;
 
     Ok(ndjson_stream_response(receiver))
 }
 
-fn spawn_solve_stream_worker(problem: ProblemId, request: SolveRequest, sender: StreamSender) {
-    tokio::task::spawn_blocking(move || run_solve_stream(problem, request, sender));
+fn problem_backend() -> &'static ProblemBackend {
+    PROBLEM_BACKEND.get_or_init(ProblemBackend::start)
+}
+
+impl ProblemBackend {
+    fn start() -> Self {
+        let (requests, receiver) = std_mpsc::channel();
+        thread::spawn(move || backend_worker_loop(receiver));
+        Self { requests }
+    }
+}
+
+fn backend_worker_loop(receiver: std_mpsc::Receiver<BackendRequest>) {
+    while let Ok(request) = receiver.recv() {
+        match request {
+            BackendRequest::CompileCacheStatus { reply } => {
+                let _ = reply.send(Ok(compile_cache_statuses()));
+            }
+            BackendRequest::Prewarm {
+                problem,
+                request,
+                reply,
+            } => {
+                let result =
+                    prewarm_problem(problem, &request.values).map_err(|error| error.to_string());
+                let _ = reply.send(result);
+            }
+            BackendRequest::Solve {
+                problem,
+                request,
+                reply,
+            } => {
+                let result =
+                    solve_problem(problem, &request.values).map_err(|error| error.to_string());
+                let _ = reply.send(result);
+            }
+            BackendRequest::SolveStream {
+                problem,
+                request,
+                sender,
+            } => run_solve_stream(problem, request, sender),
+        }
+    }
 }
 
 fn run_solve_stream(problem: ProblemId, request: SolveRequest, sender: StreamSender) {
@@ -213,7 +340,7 @@ impl StreamStdIoCapture {
             Err(error) => {
                 send_stream_log(
                     sender,
-                    SolveLogLevel::Warning,
+                    SolveLogLevel::Info,
                     format!("[stdout/stderr capture unavailable: {error}]"),
                 );
                 None

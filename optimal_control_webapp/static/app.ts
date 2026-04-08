@@ -263,6 +263,14 @@ const PROBLEM_ID_FROM_WIRE = Object.freeze({
   sailboat_upwind: PROBLEM_ID.sailboatUpwind,
   crane_transfer: PROBLEM_ID.craneTransfer,
 } as const);
+const COMPILE_CACHE_STATE = Object.freeze({
+  cold: 0,
+  ready: 1,
+} as const);
+const COMPILE_CACHE_STATE_FROM_WIRE = Object.freeze({
+  cold: COMPILE_CACHE_STATE.cold,
+  ready: COMPILE_CACHE_STATE.ready,
+} as const);
 
 type ControlSectionCode = EnumValue<typeof CONTROL_SECTION>;
 type ControlEditorCode = EnumValue<typeof CONTROL_EDITOR>;
@@ -280,6 +288,7 @@ type SolverMethodCode = EnumValue<typeof SOLVER_METHOD>;
 type SolveStageCode = EnumValue<typeof SOLVE_STAGE>;
 type StreamEventKindCode = EnumValue<typeof STREAM_EVENT_KIND>;
 type ProblemIdCode = EnumValue<typeof PROBLEM_ID>;
+type CompileCacheStateCode = EnumValue<typeof COMPILE_CACHE_STATE>;
 
 interface ControlChoice {
   value: number;
@@ -342,6 +351,27 @@ interface ProblemSpec {
   controls: ControlSpec[];
   math_sections: LatexSection[];
   notes: string[];
+}
+
+interface WireCompileCacheStatus {
+  problem_id: string | number;
+  problem_name: string;
+  variant_id: string;
+  variant_label: string;
+  state: string | number;
+  symbolic_setup_s?: number | null;
+  jit_s?: number | null;
+}
+
+interface CompileCacheStatus {
+  wire_problem_id: string;
+  problem_id: ProblemIdCode;
+  problem_name: string;
+  variant_id: string;
+  variant_label: string;
+  state: CompileCacheStateCode;
+  symbolic_setup_s: number | null;
+  jit_s: number | null;
 }
 
 interface Metric {
@@ -471,6 +501,17 @@ interface WireSolveProgress extends Omit<SolveProgress, "phase"> {
   phase: string | number;
 }
 
+interface SolverPhaseDetail {
+  label: string;
+  value: string;
+}
+
+interface SolverPhaseDetails {
+  symbolic_setup: SolverPhaseDetail[];
+  jit: SolverPhaseDetail[];
+  solve: SolverPhaseDetail[];
+}
+
 interface SolverReport {
   completed: boolean;
   status_label: string;
@@ -479,6 +520,8 @@ interface SolverReport {
   symbolic_setup_s?: number | null;
   jit_s?: number | null;
   solve_s?: number | null;
+  compile_cached: boolean;
+  phase_details: SolverPhaseDetails;
   failure_message?: string;
 }
 
@@ -618,6 +661,7 @@ interface FrontendState {
   specs: ProblemSpec[];
   selectedId: ProblemIdCode | null;
   values: Record<string, number>;
+  compileCacheStatuses: CompileCacheStatus[];
   collapsedControlSections: ControlSectionCollapseState;
   artifact: SolveArtifact | null;
   animationIndex: number;
@@ -640,6 +684,9 @@ interface FrontendState {
   linkedChartRange: NumericRange | null;
   linkedChartAutorange: boolean;
   linkingChartRange: boolean;
+  prewarmTimer: number | null;
+  lastPrewarmSignature: string | null;
+  prewarmInFlightSignature: string | null;
 }
 
 type PlotlyTrace = PlotlyObject;
@@ -677,6 +724,7 @@ interface StatusDisplay {
 
 const pendingMathRoots = new Set<Element>();
 let mathTypesetRetryHandle: number | null = null;
+const PREWARM_DELAY_MS = 200;
 
 function requiredElement<T extends Element>(selector: string): T {
   const element = document.querySelector<T>(selector);
@@ -888,6 +936,24 @@ function readWireProblemSpec(value: JsonValue | undefined, context: string): Wir
       readLatexSection(section, `${context}.math_sections[${index}]`)),
     notes: readOptionalJsonArray(readJsonValueAt(object, "notes"), `${context}.notes`)?.map((note, index) =>
       readJsonString(note, `${context}.notes[${index}]`)),
+  };
+}
+
+function readWireCompileCacheStatus(
+  value: JsonValue | undefined,
+  context: string,
+): WireCompileCacheStatus {
+  const object = readJsonObject(value, context);
+  return {
+    problem_id: readJsonStringOrNumber(readJsonValueAt(object, "problem_id"), `${context}.problem_id`),
+    problem_name: readJsonString(readJsonValueAt(object, "problem_name"), `${context}.problem_name`),
+    variant_id: readJsonString(readJsonValueAt(object, "variant_id"), `${context}.variant_id`),
+    variant_label: readJsonString(readJsonValueAt(object, "variant_label"), `${context}.variant_label`),
+    state: readJsonStringOrNumber(readJsonValueAt(object, "state"), `${context}.state`),
+    symbolic_setup_s:
+      readOptionalJsonNumber(readJsonValueAt(object, "symbolic_setup_s"), `${context}.symbolic_setup_s`) ??
+      null,
+    jit_s: readOptionalJsonNumber(readJsonValueAt(object, "jit_s"), `${context}.jit_s`) ?? null,
   };
 }
 
@@ -1104,6 +1170,34 @@ function readWireSolveProgress(value: JsonValue | undefined, context: string): W
   };
 }
 
+function readSolverPhaseDetail(value: JsonValue | undefined, context: string): SolverPhaseDetail {
+  const object = readJsonObject(value, context);
+  return {
+    label: readJsonString(readJsonValueAt(object, "label"), `${context}.label`),
+    value: readJsonString(readJsonValueAt(object, "value"), `${context}.value`),
+  };
+}
+
+function readSolverPhaseDetails(value: JsonValue | undefined, context: string): SolverPhaseDetails {
+  if (value == null) {
+    return emptySolverPhaseDetails();
+  }
+  const object = readJsonObject(value, context);
+  const symbolicSetup = readOptionalJsonArray(
+    readJsonValueAt(object, "symbolic_setup"),
+    `${context}.symbolic_setup`,
+  );
+  const jit = readOptionalJsonArray(readJsonValueAt(object, "jit"), `${context}.jit`);
+  const solve = readOptionalJsonArray(readJsonValueAt(object, "solve"), `${context}.solve`);
+  return {
+    symbolic_setup: (symbolicSetup ?? []).map((entry, index) =>
+      readSolverPhaseDetail(entry, `${context}.symbolic_setup[${index}]`)),
+    jit: (jit ?? []).map((entry, index) => readSolverPhaseDetail(entry, `${context}.jit[${index}]`)),
+    solve: (solve ?? []).map((entry, index) =>
+      readSolverPhaseDetail(entry, `${context}.solve[${index}]`)),
+  };
+}
+
 function readWireSolverReport(value: JsonValue | undefined, context: string): WireSolverReport {
   const object = readJsonObject(value, context);
   return {
@@ -1126,6 +1220,11 @@ function readWireSolverReport(value: JsonValue | undefined, context: string): Wi
       null,
     jit_s: readOptionalJsonNumber(readJsonValueAt(object, "jit_s"), `${context}.jit_s`) ?? null,
     solve_s: readOptionalJsonNumber(readJsonValueAt(object, "solve_s"), `${context}.solve_s`) ?? null,
+    compile_cached:
+      readOptionalJsonBoolean(readJsonValueAt(object, "compile_cached"), `${context}.compile_cached`) ??
+      false,
+    phase_details:
+      readSolverPhaseDetails(readJsonValueAt(object, "phase_details"), `${context}.phase_details`),
     failure_message:
       readOptionalJsonString(readJsonValueAt(object, "failure_message"), `${context}.failure_message`),
   };
@@ -1219,6 +1318,7 @@ const state: FrontendState = {
   specs: [],
   selectedId: null,
   values: {},
+  compileCacheStatuses: [],
   collapsedControlSections: {
     [CONTROL_SECTION.transcription]: false,
     [CONTROL_SECTION.solver]: false,
@@ -1245,6 +1345,9 @@ const state: FrontendState = {
   linkedChartRange: null,
   linkedChartAutorange: true,
   linkingChartRange: false,
+  prewarmTimer: null,
+  lastPrewarmSignature: null,
+  prewarmInFlightSignature: null,
 };
 
 const problemList = requiredElement<HTMLDivElement>("#problem-list");
@@ -1263,6 +1366,7 @@ const notesEl = requiredElement<HTMLDivElement>("#notes");
 const solverSummaryEl = requiredElement<HTMLDivElement>("#solver-summary");
 const progressPlotEl = requiredElement<PlotlyHostElement>("#progress-plot");
 const solverLogEl = requiredElement<HTMLPreElement>("#solver-log");
+const prewarmStatusEl = requiredElement<HTMLDivElement>("#prewarm-status");
 const eqViolationsEl = requiredElement<HTMLDivElement>("#eq-violations");
 const ineqViolationsEl = requiredElement<HTMLDivElement>("#ineq-violations");
 
@@ -1493,6 +1597,58 @@ function formatDuration(seconds: number | null | undefined): string {
   return `${(seconds * 1.0e6).toFixed(1)} us`;
 }
 
+function formatCompileDuration(seconds: number | null | undefined, compileCached: boolean): string {
+  const formatted = formatDuration(seconds);
+  if (!compileCached || formatted === "--") {
+    return formatted;
+  }
+  return `${formatted} (cached)`;
+}
+
+function emptySolverPhaseDetails(): SolverPhaseDetails {
+  return {
+    symbolic_setup: [],
+    jit: [],
+    solve: [],
+  };
+}
+
+function normalizeSolverPhaseDetails(
+  details: SolverPhaseDetails | null | undefined,
+): SolverPhaseDetails {
+  if (!details) {
+    return emptySolverPhaseDetails();
+  }
+  return {
+    symbolic_setup: details.symbolic_setup ?? [],
+    jit: details.jit ?? [],
+    solve: details.solve ?? [],
+  };
+}
+
+function selectSolverPhaseDetails(
+  primary: SolverPhaseDetail[] | null | undefined,
+  fallback: SolverPhaseDetail[] | null | undefined,
+): SolverPhaseDetail[] {
+  if (primary && primary.length > 0) {
+    return primary;
+  }
+  return fallback ?? [];
+}
+
+function mergeSolverPhaseDetails(
+  primary: SolverPhaseDetails | null | undefined,
+  fallback: SolverPhaseDetails | null | undefined,
+): SolverPhaseDetails {
+  const next = normalizeSolverPhaseDetails(primary);
+  const previous = normalizeSolverPhaseDetails(fallback);
+  return {
+    symbolic_setup: selectSolverPhaseDetails(next.symbolic_setup, previous.symbolic_setup),
+    jit: selectSolverPhaseDetails(next.jit, previous.jit),
+    solve: selectSolverPhaseDetails(next.solve, previous.solve),
+  };
+}
+
 function statusClass(kind: SolverStatusKindCode): StatusClassName {
   switch (kind) {
     case SOLVER_STATUS_KIND.success:
@@ -1587,6 +1743,8 @@ function buildStatusSolverReport(status: SolveStatus): SolverReport {
     symbolic_setup_s: nextSolver.symbolic_setup_s ?? liveSolver?.symbolic_setup_s ?? null,
     jit_s: nextSolver.jit_s ?? liveSolver?.jit_s ?? null,
     solve_s: nextSolver.solve_s ?? liveSolver?.solve_s ?? null,
+    compile_cached: nextSolver.compile_cached || liveSolver?.compile_cached === true,
+    phase_details: mergeSolverPhaseDetails(nextSolver.phase_details, liveSolver?.phase_details),
   };
 }
 
@@ -1600,7 +1758,25 @@ function buildFailureSolverReport(message: string): SolverReport {
     symbolic_setup_s: liveSolver?.symbolic_setup_s ?? null,
     jit_s: liveSolver?.jit_s ?? null,
     solve_s: liveSolver?.solve_s ?? null,
+    compile_cached: liveSolver?.compile_cached ?? false,
+    phase_details: normalizeSolverPhaseDetails(liveSolver?.phase_details),
     failure_message: message,
+  };
+}
+
+function mergeSolverReport(
+  next: SolverReport,
+  fallback: SolverReport | null | undefined,
+): SolverReport {
+  return {
+    ...next,
+    iterations: next.iterations ?? fallback?.iterations ?? null,
+    symbolic_setup_s: next.symbolic_setup_s ?? fallback?.symbolic_setup_s ?? null,
+    jit_s: next.jit_s ?? fallback?.jit_s ?? null,
+    solve_s: next.solve_s ?? fallback?.solve_s ?? null,
+    compile_cached: next.compile_cached || fallback?.compile_cached === true,
+    phase_details: mergeSolverPhaseDetails(next.phase_details, fallback?.phase_details),
+    failure_message: next.failure_message ?? fallback?.failure_message,
   };
 }
 
@@ -1692,6 +1868,59 @@ function renderLog(): void {
   solverLogEl.scrollTop = solverLogEl.scrollHeight;
 }
 
+function renderCompileCacheStatus(): void {
+  const rows = [...state.compileCacheStatuses].sort((left, right) => {
+    const problemOrder = left.problem_name.localeCompare(right.problem_name);
+    if (problemOrder !== 0) {
+      return problemOrder;
+    }
+    return left.variant_label.localeCompare(right.variant_label);
+  });
+
+  if (rows.length === 0) {
+    prewarmStatusEl.innerHTML = `<div class="placeholder">Compile cache status will appear here.</div>`;
+    return;
+  }
+
+  const table = document.createElement("div");
+  table.className = "compile-cache-table";
+
+  const header = document.createElement("div");
+  header.className = "compile-cache-row compile-cache-row-header";
+  header.innerHTML = `
+    <div>Problem</div>
+    <div>Variant</div>
+    <div>Symbolic</div>
+    <div>JIT</div>
+    <div>Status</div>
+  `;
+  table.appendChild(header);
+
+  for (const row of rows) {
+    const warming = isCompileWarmInProgress(row);
+    const statusLabel = warming
+      ? "warming"
+      : row.state === COMPILE_CACHE_STATE.ready
+        ? "ready"
+        : "cold";
+    const rowEl = document.createElement("div");
+    rowEl.className = [
+      "compile-cache-row",
+      isCompileTarget(row) ? "compile-cache-row-current" : "",
+    ].filter(Boolean).join(" ");
+    rowEl.innerHTML = `
+      <div class="compile-cache-problem">${escapeHtml(row.problem_name)}</div>
+      <div class="compile-cache-variant">${escapeHtml(row.variant_label)}</div>
+      <div>${escapeHtml(formatDuration(row.symbolic_setup_s))}</div>
+      <div>${escapeHtml(formatDuration(row.jit_s))}</div>
+      <div><span class="compile-cache-badge compile-cache-badge-${statusLabel}">${statusLabel}</span></div>
+    `;
+    table.appendChild(rowEl);
+  }
+
+  prewarmStatusEl.replaceChildren(table);
+}
+
 function decodeWireEnum<T extends number>(
   map: Readonly<Record<string, T>>,
   wireValue: string | number | null | undefined,
@@ -1738,6 +1967,17 @@ function normalizeProblemSpec(spec: WireProblemSpec): ProblemSpec {
   };
 }
 
+function normalizeCompileCacheStatus(status: WireCompileCacheStatus): CompileCacheStatus {
+  return {
+    ...status,
+    wire_problem_id: String(status.problem_id),
+    problem_id: decodeWireEnum(PROBLEM_ID_FROM_WIRE, status.problem_id, PROBLEM_ID.optimalDistanceGlider),
+    state: decodeWireEnum(COMPILE_CACHE_STATE_FROM_WIRE, status.state, COMPILE_CACHE_STATE.cold),
+    symbolic_setup_s: status.symbolic_setup_s ?? null,
+    jit_s: status.jit_s ?? null,
+  };
+}
+
 function normalizeSolverReport(solver: WireSolverReport): SolverReport {
   if (!solver) {
     throw new Error("Solver report missing from solve artifact.");
@@ -1749,6 +1989,8 @@ function normalizeSolverReport(solver: WireSolverReport): SolverReport {
       solver.status_kind,
       SOLVER_STATUS_KIND.info,
     ),
+    compile_cached: solver.compile_cached ?? false,
+    phase_details: normalizeSolverPhaseDetails(solver.phase_details),
   };
 }
 
@@ -1918,6 +2160,153 @@ function currentTranscriptionMethodValue(): number {
   return currentSharedControlValue(CONTROL_SEMANTIC.transcriptionMethod, 0);
 }
 
+function isStructuralControl(control: ControlSpec): boolean {
+  switch (control.semantic) {
+    case CONTROL_SEMANTIC.transcriptionMethod:
+    case CONTROL_SEMANTIC.transcriptionIntervals:
+    case CONTROL_SEMANTIC.collocationFamily:
+    case CONTROL_SEMANTIC.collocationDegree:
+      return true;
+    default:
+      return false;
+  }
+}
+
+function currentPrewarmSignature(): string | null {
+  const spec = currentSpec();
+  if (!spec) {
+    return null;
+  }
+  return JSON.stringify({
+    problem: spec.wire_id,
+    method: currentSharedControlValue(CONTROL_SEMANTIC.transcriptionMethod, 0),
+    intervals: currentSharedControlValue(CONTROL_SEMANTIC.transcriptionIntervals, 0),
+    family: currentSharedControlValue(CONTROL_SEMANTIC.collocationFamily, 0),
+    degree: currentSharedControlValue(CONTROL_SEMANTIC.collocationDegree, 0),
+  });
+}
+
+function currentCompileVariantId(): string | null {
+  if (!currentSpec()) {
+    return null;
+  }
+  if (currentTranscriptionMethodValue() !== DIRECT_COLLOCATION_VALUE) {
+    return "multiple_shooting";
+  }
+  return currentSharedControlValue(CONTROL_SEMANTIC.collocationFamily, 0) === 1
+    ? "direct_collocation_radau_iia"
+    : "direct_collocation_legendre";
+}
+
+function isCompileTarget(status: CompileCacheStatus): boolean {
+  const spec = currentSpec();
+  const variantId = currentCompileVariantId();
+  return spec != null
+    && variantId != null
+    && status.problem_id === spec.id
+    && status.variant_id === variantId;
+}
+
+function isCompileWarmInProgress(status: CompileCacheStatus): boolean {
+  if (!isCompileTarget(status) || status.state === COMPILE_CACHE_STATE.ready) {
+    return false;
+  }
+  if (state.prewarmInFlightSignature !== null) {
+    return true;
+  }
+  const stage = currentSolveStage();
+  return stage === SOLVE_STAGE.symbolicSetup || stage === SOLVE_STAGE.jitCompilation;
+}
+
+function clearScheduledPrewarm(): void {
+  if (state.prewarmTimer !== null) {
+    window.clearTimeout(state.prewarmTimer);
+    state.prewarmTimer = null;
+  }
+}
+
+async function refreshCompileCacheStatus(): Promise<void> {
+  try {
+    state.compileCacheStatuses = await fetchJson("/api/prewarm_status", (value) => {
+      const entries = readJsonArray(value, "/api/prewarm_status");
+      return entries.map((entry, index) =>
+        normalizeCompileCacheStatus(
+          readWireCompileCacheStatus(entry, `/api/prewarm_status[${index}]`),
+        ));
+    });
+    renderCompileCacheStatus();
+  } catch (error) {
+    console.warn("compile cache status refresh failed", error);
+  }
+}
+
+async function runPrewarm(expectedSignature: string): Promise<void> {
+  const spec = currentSpec();
+  if (!spec || currentPrewarmSignature() !== expectedSignature || state.solving) {
+    return;
+  }
+  state.prewarmInFlightSignature = expectedSignature;
+  try {
+    const response = await fetch(`/api/prewarm/${spec.wire_id}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ values: state.values }),
+    });
+    const payload = await readResponseJsonValue(response, `/api/prewarm/${spec.wire_id}`);
+    if (!response.ok) {
+      throw new Error(readOptionalErrorMessage(payload) ?? `Request failed with ${response.status}`);
+    }
+    if (currentPrewarmSignature() === expectedSignature) {
+      state.lastPrewarmSignature = expectedSignature;
+    }
+  } catch (error) {
+    console.warn("prewarm failed", error);
+  } finally {
+    if (state.prewarmInFlightSignature === expectedSignature) {
+      state.prewarmInFlightSignature = null;
+    }
+    void refreshCompileCacheStatus();
+    renderCompileCacheStatus();
+    const latestSignature = currentPrewarmSignature();
+    if (
+      latestSignature !== null
+      && latestSignature !== state.lastPrewarmSignature
+      && latestSignature !== state.prewarmInFlightSignature
+    ) {
+      schedulePrewarm();
+    }
+  }
+}
+
+function schedulePrewarm(): void {
+  if (state.solving) {
+    return;
+  }
+  const signature = currentPrewarmSignature();
+  if (
+    signature === null
+    || signature === state.lastPrewarmSignature
+    || signature === state.prewarmInFlightSignature
+  ) {
+    return;
+  }
+  clearScheduledPrewarm();
+  state.prewarmTimer = window.setTimeout(() => {
+    state.prewarmTimer = null;
+    void runPrewarm(signature);
+  }, PREWARM_DELAY_MS);
+}
+
+function handleControlUpdate(control: ControlSpec): void {
+  if (control.semantic === CONTROL_SEMANTIC.transcriptionMethod) {
+    renderControls();
+  }
+  if (isStructuralControl(control)) {
+    renderCompileCacheStatus();
+    schedulePrewarm();
+  }
+}
+
 function isControlVisible(control: ControlSpec): boolean {
   switch (control.visibility) {
     case CONTROL_VISIBILITY.directCollocationOnly:
@@ -2004,9 +2393,7 @@ function appendControl(wrapperParent: HTMLElement, control: ControlSpec): void {
       const numeric = Number(target.value);
       state.values[control.id] = numeric;
       pill.textContent = formatValue(numeric);
-      if (control.semantic === CONTROL_SEMANTIC.transcriptionMethod) {
-        renderControls();
-      }
+      handleControlUpdate(control);
     });
     wrapperParent.appendChild(wrapper);
     return;
@@ -2037,6 +2424,7 @@ function appendControl(wrapperParent: HTMLElement, control: ControlSpec): void {
       }
       state.values[control.id] = numeric;
       pill.textContent = formatValue(numeric);
+      handleControlUpdate(control);
     };
     textInput.addEventListener("input", (event) => {
       const target = readCurrentInputTarget(event, `${control.id} text input`);
@@ -2071,6 +2459,7 @@ function appendControl(wrapperParent: HTMLElement, control: ControlSpec): void {
     rangeInput.value = String(numeric);
     numberInput.value = String(numeric);
     pill.textContent = formatValue(numeric);
+    handleControlUpdate(control);
   };
   rangeInput.addEventListener("input", (event) => {
     const target = readCurrentInputTarget(event, `${control.id} range input`);
@@ -2381,7 +2770,7 @@ function updateScenePlot(view: SceneView): void {
       x: 0,
       font: { color: "#94b6bd", size: 11 },
     },
-    dragmode: "pan",
+    dragmode: "zoom",
     hovermode: "closest",
     shapes: sceneShapes(scene),
     annotations: sceneAnnotations(scene),
@@ -2409,7 +2798,9 @@ function updateScenePlot(view: SceneView): void {
   const config = {
     responsive: true,
     displaylogo: false,
-    displayModeBar: false,
+    displayModeBar: "hover",
+    scrollZoom: true,
+    modeBarButtonsToRemove: ["select2d", "lasso2d", "autoScale2d", "toImage"],
   };
   window.Plotly.react(view.plotEl, data, layout, config);
 }
@@ -2431,6 +2822,7 @@ function resetSolverPanel(): void {
   }
   progressPlotEl.innerHTML = `<div class="placeholder">Solve a problem to populate the live convergence history.</div>`;
   state.progressPlotReady = false;
+  renderCompileCacheStatus();
 }
 
 function selectProblem(problemId: ProblemIdCode): void {
@@ -2438,6 +2830,7 @@ function selectProblem(problemId: ProblemIdCode): void {
   if (!spec) {
     return;
   }
+  clearScheduledPrewarm();
   stopAnimation();
   state.selectedId = problemId;
   state.values = Object.fromEntries(spec.controls.map((control) => [control.id, control.default]));
@@ -2456,6 +2849,9 @@ function selectProblem(problemId: ProblemIdCode): void {
   renderModel(spec);
   renderNotes(spec.notes);
   setStatus("Ready to solve.", "success");
+  renderCompileCacheStatus();
+  schedulePrewarm();
+  void refreshCompileCacheStatus();
 }
 
 function renderProblemList(): void {
@@ -2551,12 +2947,12 @@ function renderMetrics(): void {
   const singleCards = [
     {
       label: "Symbolic Setup",
-      value: formatDuration(solver?.symbolic_setup_s ?? null),
+      value: formatCompileDuration(solver?.symbolic_setup_s ?? null, solver?.compile_cached ?? false),
       active: activeStage === SOLVE_STAGE.symbolicSetup,
     },
     {
       label: "JIT",
-      value: formatDuration(solver?.jit_s ?? null),
+      value: formatCompileDuration(solver?.jit_s ?? null, solver?.compile_cached ?? false),
       active: activeStage === SOLVE_STAGE.jitCompilation,
     },
   ];
@@ -2635,14 +3031,27 @@ function renderNotes(notes: string[]): void {
   notesEl.appendChild(list);
 }
 
-function renderSolverSummary(): void {
-  const progress = state.latestProgress;
-  const solver = currentSolverReport();
-  if (!progress && !solver) {
-    solverSummaryEl.innerHTML = `<div class="placeholder">Solve a problem to populate the latest iteration metrics.</div>`;
-    return;
-  }
+function createSolverSummaryChip(item: SolveSummaryItem): HTMLElement {
+  const chip = document.createElement("article");
+  chip.className = "solver-chip";
 
+  const label = document.createElement("div");
+  label.className = "solver-chip-label";
+  label.textContent = item.label;
+  chip.appendChild(label);
+
+  const value = document.createElement("div");
+  value.className = "solver-chip-value";
+  value.textContent = item.value;
+  chip.appendChild(value);
+
+  return chip;
+}
+
+function solveSummaryItems(
+  progress: SolveProgress | null,
+  solver: SolverReport | null,
+): SolveSummaryItem[] {
   const items: SolveSummaryItem[] = [];
   if (progress) {
     const tfMetric = findMetric(state.artifact, METRIC_KEY.finalTime);
@@ -2664,7 +3073,10 @@ function renderSolverSummary(): void {
       value: progress.step_inf == null ? "--" : progress.step_inf.toExponential(3),
     });
     items.push({ label: "α", value: progress.alpha == null ? "--" : progress.alpha.toExponential(3) });
-  } else if (solver?.iterations != null) {
+    return items;
+  }
+
+  if (solver?.iterations != null) {
     items.push({ label: "Iteration", value: `${solver.iterations}` });
     const tfMetric = findMetric(state.artifact, METRIC_KEY.finalTime);
     if (tfMetric) {
@@ -2672,23 +3084,159 @@ function renderSolverSummary(): void {
     }
   }
 
+  return items;
+}
+
+function createPhaseDetailsGrid(
+  details: SolverPhaseDetail[],
+  fallbackText: string,
+): HTMLElement {
+  if (details.length === 0) {
+    const note = document.createElement("div");
+    note.className = "solver-phase-note";
+    note.textContent = fallbackText;
+    return note;
+  }
+
+  const grid = document.createElement("div");
+  grid.className = "solver-phase-detail-grid";
+  for (const detail of details) {
+    const item = document.createElement("div");
+    item.className = "solver-phase-detail";
+
+    const label = document.createElement("div");
+    label.className = "solver-phase-detail-label";
+    label.textContent = detail.label;
+    item.appendChild(label);
+
+    const value = document.createElement("div");
+    value.className = "solver-phase-detail-value";
+    value.textContent = detail.value;
+    item.appendChild(value);
+
+    grid.appendChild(item);
+  }
+  return grid;
+}
+
+function createSolverPhaseCard(options: {
+  label: string;
+  value: string;
+  active: boolean;
+  details: SolverPhaseDetail[];
+  fallbackText: string;
+}): HTMLElement {
+  const card = document.createElement("article");
+  card.className = `solver-phase-card ${options.active ? "solver-phase-card-active" : ""}`.trim();
+
+  const head = document.createElement("div");
+  head.className = "solver-phase-head";
+
+  const label = document.createElement("div");
+  label.className = "solver-phase-label";
+  label.textContent = options.label;
+  head.appendChild(label);
+
+  const value = document.createElement("div");
+  value.className = `solver-phase-time ${options.active ? "solver-phase-time-active" : ""}`.trim();
+  if (options.active) {
+    const spinner = document.createElement("span");
+    spinner.className = "metric-spinner";
+    spinner.setAttribute("aria-hidden", "true");
+    value.appendChild(spinner);
+  }
+  value.append(document.createTextNode(options.value));
+  head.appendChild(value);
+
+  card.appendChild(head);
+  card.appendChild(createPhaseDetailsGrid(options.details, options.fallbackText));
+  return card;
+}
+
+function createSolverRunCard(
+  progress: SolveProgress | null,
+  solver: SolverReport,
+): HTMLElement {
+  const activeStage = currentSolveStage();
+  const card = document.createElement("article");
+  card.className = `solver-run-card ${activeStage === SOLVE_STAGE.solving ? "solver-phase-card-active" : ""}`.trim();
+
+  const head = document.createElement("div");
+  head.className = "solver-phase-head";
+
+  const label = document.createElement("div");
+  label.className = "solver-phase-label";
+  label.textContent = "Solve";
+  head.appendChild(label);
+
+  const value = document.createElement("div");
+  value.className = `solver-phase-time ${activeStage === SOLVE_STAGE.solving ? "solver-phase-time-active" : ""}`.trim();
+  if (activeStage === SOLVE_STAGE.solving) {
+    const spinner = document.createElement("span");
+    spinner.className = "metric-spinner";
+    spinner.setAttribute("aria-hidden", "true");
+    value.appendChild(spinner);
+  }
+  value.append(document.createTextNode(formatDuration(solver.solve_s ?? null)));
+  head.appendChild(value);
+  card.appendChild(head);
+
+  const items = solveSummaryItems(progress, solver);
   if (items.length === 0) {
-    solverSummaryEl.innerHTML = state.solving
-      ? `<div class="placeholder">Iteration diagnostics will appear once the nonlinear solve begins.</div>`
-      : `<div class="placeholder">No iteration diagnostics were produced for the last run.</div>`;
+    const note = document.createElement("div");
+    note.className = "solver-phase-note";
+    note.textContent = state.solving
+      ? "Iteration diagnostics will appear once the nonlinear solve begins."
+      : "No iteration diagnostics were produced for the last run.";
+    card.appendChild(note);
+    return card;
+  }
+
+  const grid = document.createElement("div");
+  grid.className = "solver-summary-grid";
+  for (const item of items) {
+    grid.appendChild(createSolverSummaryChip(item));
+  }
+  card.appendChild(grid);
+  return card;
+}
+
+function renderSolverPhaseSummary(solver: SolverReport): HTMLElement {
+  const activeStage = currentSolveStage();
+  const grid = document.createElement("div");
+  grid.className = "solver-phase-grid";
+  grid.append(
+    createSolverPhaseCard({
+      label: "Symbolic Setup",
+      value: formatCompileDuration(solver.symbolic_setup_s ?? null, solver.compile_cached),
+      active: activeStage === SOLVE_STAGE.symbolicSetup,
+      details: solver.phase_details.symbolic_setup,
+      fallbackText: "Building symbolic model and derivatives.",
+    }),
+    createSolverPhaseCard({
+      label: "JIT",
+      value: formatCompileDuration(solver.jit_s ?? null, solver.compile_cached),
+      active: activeStage === SOLVE_STAGE.jitCompilation,
+      details: solver.phase_details.jit,
+      fallbackText: "Compiling numeric evaluation kernels.",
+    }),
+  );
+  return grid;
+}
+
+function renderSolverSummary(): void {
+  const progress = state.latestProgress;
+  const solver = currentSolverReport();
+  if (!progress && !solver) {
+    solverSummaryEl.innerHTML = `<div class="placeholder">Solve a problem to populate solver diagnostics.</div>`;
     return;
   }
 
-  solverSummaryEl.innerHTML = items
-    .map(({ label, value }) => {
-      return `
-        <article class="solver-chip">
-          <div class="solver-chip-label">${label}</div>
-          <div class="solver-chip-value">${value}</div>
-        </article>
-      `;
-    })
-    .join("");
+  solverSummaryEl.innerHTML = "";
+  if (solver) {
+    solverSummaryEl.appendChild(renderSolverPhaseSummary(solver));
+    solverSummaryEl.appendChild(createSolverRunCard(progress, solver));
+  }
 }
 
 function formatConstraintValue(value: number | null | undefined): string {
@@ -2700,6 +3248,31 @@ function formatConstraintValue(value: number | null | undefined): string {
     return Number(value).toExponential(3);
   }
   return fmt(value, 3);
+}
+
+function formatConstraintSummaryValue(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) {
+    return "--";
+  }
+  const abs = Math.abs(value);
+  if (abs >= 1e3 || (abs > 0 && abs < 1e-2)) {
+    return Number(value).toExponential(1);
+  }
+  return fmt(value, 2);
+}
+
+function worstConstraintViolation(entries: ConstraintPanelEntry[]): number | null {
+  if (entries.length === 0) {
+    return null;
+  }
+  let worst = 0;
+  for (const entry of entries) {
+    const magnitude = Math.abs(entry.worst_violation);
+    if (magnitude > worst) {
+      worst = magnitude;
+    }
+  }
+  return worst;
 }
 
 function renderBoundToken(
@@ -2714,12 +3287,25 @@ function renderBoundToken(
 
 function renderConstraintPanel(
   target: HTMLElement,
+  allEntries: ConstraintPanelEntry[],
   entries: ConstraintPanelEntry[],
-  emptyText: string,
+  pendingText: string,
   kind: ConstraintPanelKind,
 ): void {
   if (!entries || entries.length === 0) {
-    target.innerHTML = `<div class="placeholder">${emptyText}</div>`;
+    const worstViolation = worstConstraintViolation(allEntries);
+    if (worstViolation == null) {
+      target.innerHTML = `<div class="placeholder">${pendingText}</div>`;
+      return;
+    }
+    target.innerHTML = `
+      <article class="constraint-entry constraint-entry-success constraint-entry-summary">
+        <div class="constraint-entry-inline">
+          <span class="constraint-inline-label">Worst Violation</span>
+          <span class="constraint-inline-value">${formatConstraintSummaryValue(worstViolation)}</span>
+        </div>
+      </article>
+    `;
     return;
   }
   target.innerHTML = entries
@@ -2756,24 +3342,28 @@ function renderConstraintPanel(
 
 function renderConstraintPanels(): void {
   const panels = state.artifact?.constraint_panels ?? { equalities: [], inequalities: [] };
-  const activeEqualities = panels.equalities.filter((entry) => entry.violating_instances > 0);
-  const activeInequalities = panels.inequalities.filter((entry) => entry.violating_instances > 0);
+  const allEqualities = panels.equalities;
+  const allInequalities = panels.inequalities;
+  const activeEqualities = allEqualities.filter((entry) => entry.violating_instances > 0);
+  const activeInequalities = allInequalities.filter((entry) => entry.violating_instances > 0);
   const toleranceText = formatSharedControlValue(
     CONTROL_SEMANTIC.solverConstraintTolerance,
   );
-  const emptyText = state.artifact == null && !state.solving
+  const pendingText = state.artifact == null && !state.solving
     ? `tol ${toleranceText}`
-    : `(all < ${toleranceText})`;
+    : "pending";
   renderConstraintPanel(
     eqViolationsEl,
+    allEqualities,
     activeEqualities,
-    emptyText,
+    pendingText,
     "eq",
   );
   renderConstraintPanel(
     ineqViolationsEl,
+    allInequalities,
     activeInequalities,
-    emptyText,
+    pendingText,
     "ineq",
   );
 }
@@ -3144,6 +3734,8 @@ function applySolveFailure(message: string): void {
   state.solveStartedAtMs = null;
   renderSolverSummary();
   renderMetrics();
+  renderCompileCacheStatus();
+  void refreshCompileCacheStatus();
   appendLogLine(`error: ${message}`, LOG_LEVEL.error);
   setStatusDisplay(statusDisplayForSolverReport(state.terminalSolver));
 }
@@ -3478,6 +4070,8 @@ function scheduleArtifactRender(): void {
 function handleSolveEvent(event: SolveEvent): void {
   switch (event.kind) {
     case STREAM_EVENT_KIND.status:
+      {
+        const previousStage = state.liveStatus?.stage ?? null;
       state.liveStatus = event.status;
       if (event.status.stage === SOLVE_STAGE.solving && state.solveStartedAtMs == null) {
         state.solveStartedAtMs = performance.now();
@@ -3487,9 +4081,14 @@ function handleSolveEvent(event: SolveEvent): void {
       }
       state.liveSolver = buildStatusSolverReport(event.status);
       renderSolverSummary();
+      renderCompileCacheStatus();
+      if (previousStage !== SOLVE_STAGE.solving && event.status.stage === SOLVE_STAGE.solving) {
+        void refreshCompileCacheStatus();
+      }
       renderMetrics();
       setStatusDisplay(statusDisplayForSolveStatus(event.status, state.latestProgress?.iteration ?? null));
       break;
+      }
     case STREAM_EVENT_KIND.log:
       appendLogLine(event.line, event.level ?? LOG_LEVEL.console);
       break;
@@ -3500,14 +4099,19 @@ function handleSolveEvent(event: SolveEvent): void {
     case STREAM_EVENT_KIND.final:
       state.pendingIterationEvent = null;
       state.liveStatus = null;
-      state.terminalSolver = event.artifact.solver;
+      state.terminalSolver = mergeSolverReport(event.artifact.solver, state.liveSolver);
       state.liveSolver = null;
       state.solveStartedAtMs = null;
-      state.artifact = event.artifact;
+      state.artifact = {
+        ...event.artifact,
+        solver: state.terminalSolver,
+      };
       state.animationIndex = 0;
       renderSolverSummary();
+      renderCompileCacheStatus();
+      void refreshCompileCacheStatus();
       scheduleArtifactRender();
-      setStatusDisplay(statusDisplayForSolverReport(event.artifact.solver));
+      setStatusDisplay(statusDisplayForSolverReport(state.terminalSolver));
       break;
     case STREAM_EVENT_KIND.error:
     default:
@@ -3556,6 +4160,7 @@ async function solveCurrentProblem(event?: Event): Promise<void> {
 
   try {
     state.solving = true;
+    clearScheduledPrewarm();
     solveButton.disabled = true;
     solveButton.setAttribute("aria-busy", "true");
     stopAnimation();
@@ -3574,11 +4179,14 @@ async function solveCurrentProblem(event?: Event): Promise<void> {
         symbolic_setup_s: null,
         jit_s: null,
         solve_s: null,
+        compile_cached: false,
+        phase_details: emptySolverPhaseDetails(),
       },
     };
     state.liveSolver = state.liveStatus.solver;
     state.solveStartedAtMs = null;
     renderMetrics();
+    renderCompileCacheStatus();
     renderScene();
     renderCharts();
     setStatusDisplay(statusDisplayForSolveStatus(state.liveStatus));
@@ -3605,6 +4213,7 @@ async function solveCurrentProblem(event?: Event): Promise<void> {
     state.solving = false;
     solveButton.disabled = false;
     solveButton.setAttribute("aria-busy", "false");
+    renderCompileCacheStatus();
   }
 }
 
@@ -3621,6 +4230,7 @@ async function init(): Promise<void> {
     controlsForm.addEventListener("submit", solveCurrentProblem);
     solveButton.addEventListener("click", solveCurrentProblem);
     selectProblem(state.specs[0].id);
+    void refreshCompileCacheStatus();
   } catch (error) {
     setStatus(error instanceof Error ? error.message : String(error), "error");
   }

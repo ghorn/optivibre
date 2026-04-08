@@ -580,18 +580,22 @@ select {
 
 .solve-primary {
   display: grid;
-  gap: 12px;
+  gap: 10px;
   align-content: start;
   grid-column: 1;
   grid-row: 1;
 }
 
 .solve-actions {
-  display: grid;
-  grid-template-columns: auto minmax(260px, 1fr);
+  display: flex;
   gap: 10px;
   align-items: center;
-  justify-items: start;
+  justify-content: flex-start;
+}
+
+.solver-overview {
+  display: grid;
+  gap: 10px;
 }
 
 .card-header {
@@ -648,14 +652,12 @@ select {
 }
 
 .solve-plot {
-  grid-column: 1;
-  grid-row: 2;
   min-height: 360px;
 }
 
 .solve-constraints {
   grid-column: 1;
-  grid-row: 3;
+  grid-row: 2;
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
@@ -704,6 +706,19 @@ select {
 
 .constraint-entry.constraint-entry-error {
   border-color: rgba(242, 95, 92, 0.32);
+}
+
+.constraint-entry.constraint-entry-success {
+  border-color: rgba(91, 209, 181, 0.32);
+}
+
+.constraint-entry.constraint-entry-summary {
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+
+.constraint-entry.constraint-entry-summary .constraint-entry-inline {
+  margin-top: 0;
 }
 
 .constraint-entry-label {
@@ -765,8 +780,102 @@ select {
 
 .solver-summary {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 10px;
+}
+
+.solver-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
   gap: 8px;
+}
+
+.solver-phase-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+}
+
+.solver-phase-card {
+  padding: 12px 13px;
+  border-radius: 16px;
+  background:
+    linear-gradient(140deg, rgba(124, 198, 254, 0.08), transparent 55%),
+    rgba(5, 20, 29, 0.75);
+  border: 1px solid rgba(177, 214, 222, 0.14);
+  display: grid;
+  gap: 10px;
+}
+
+.solver-phase-card-active {
+  border-color: rgba(247, 178, 103, 0.42);
+  box-shadow:
+    inset 0 0 0 1px rgba(247, 178, 103, 0.1),
+    0 0 0 1px rgba(247, 178, 103, 0.04);
+}
+
+.solver-phase-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.solver-phase-label {
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+.solver-phase-time {
+  font-family: Menlo, Monaco, Consolas, monospace;
+  font-size: 0.96rem;
+  white-space: nowrap;
+}
+
+.solver-phase-time-active {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.solver-phase-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
+  gap: 8px;
+}
+
+.solver-phase-detail {
+  padding: 8px 9px;
+  border-radius: 12px;
+  border: 1px solid rgba(177, 214, 222, 0.1);
+  background: rgba(4, 15, 22, 0.48);
+}
+
+.solver-phase-detail-label {
+  color: var(--muted);
+  font-size: 0.72rem;
+  margin-bottom: 5px;
+}
+
+.solver-phase-detail-value {
+  font-family: Menlo, Monaco, Consolas, monospace;
+  font-size: 0.82rem;
+}
+
+.solver-phase-note {
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.35;
+}
+
+.solver-run-card {
+  padding: 12px 13px;
+  border-radius: 16px;
+  background:
+    linear-gradient(140deg, rgba(124, 198, 254, 0.08), transparent 55%),
+    rgba(5, 20, 29, 0.75);
+  border: 1px solid rgba(177, 214, 222, 0.14);
+  display: grid;
+  gap: 10px;
 }
 
 .solver-chip {
@@ -805,7 +914,7 @@ select {
 
 .solve-console {
   display: grid;
-  grid-template-rows: auto 1fr;
+  grid-template-rows: auto 1fr auto auto;
   gap: 8px;
   min-width: 0;
   grid-column: 2;
@@ -861,6 +970,84 @@ select {
   font-size: 0.84rem;
   letter-spacing: 0.04em;
   text-transform: uppercase;
+}
+
+.prewarm-status {
+  max-height: 220px;
+  overflow: auto;
+  padding: 10px 12px;
+  border-radius: 16px;
+  border: 1px solid rgba(177, 214, 222, 0.12);
+  background: rgba(4, 15, 22, 0.82);
+}
+
+.compile-cache-table {
+  display: grid;
+  gap: 6px;
+}
+
+.compile-cache-row {
+  display: grid;
+  grid-template-columns: minmax(150px, 1.1fr) minmax(170px, 1.2fr) minmax(66px, auto) minmax(66px, auto) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 10px;
+  border-radius: 12px;
+  border: 1px solid rgba(177, 214, 222, 0.08);
+  background: rgba(8, 24, 35, 0.72);
+  font-size: 0.83rem;
+}
+
+.compile-cache-row-header {
+  border: 0;
+  background: transparent;
+  padding: 0 2px 4px;
+  color: var(--muted);
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.compile-cache-row-current {
+  border-color: rgba(247, 178, 103, 0.3);
+}
+
+.compile-cache-problem,
+.compile-cache-variant {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.compile-cache-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 72px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(177, 214, 222, 0.16);
+  background: rgba(177, 214, 222, 0.08);
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.compile-cache-badge-cold {
+  color: var(--muted);
+}
+
+.compile-cache-badge-ready {
+  color: var(--accent-2);
+  border-color: rgba(91, 209, 181, 0.28);
+  background: rgba(91, 209, 181, 0.1);
+}
+
+.compile-cache-badge-warming {
+  color: var(--accent);
+  border-color: rgba(247, 178, 103, 0.28);
+  background: rgba(247, 178, 103, 0.12);
 }
 
 .model-sections {
@@ -937,8 +1124,8 @@ select {
   }
 
   .solve-actions {
-    grid-template-columns: 1fr;
-    justify-items: stretch;
+    flex-direction: column;
+    align-items: stretch;
   }
 
   .solve-grid {
@@ -961,5 +1148,10 @@ select {
   .solve-plot {
     min-height: 300px;
     max-height: none;
+  }
+
+  .compile-cache-row {
+    grid-template-columns: minmax(110px, 1fr) minmax(140px, 1fr) auto auto auto;
+    font-size: 0.78rem;
   }
 }

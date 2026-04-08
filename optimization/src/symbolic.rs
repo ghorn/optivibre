@@ -10,11 +10,12 @@ use thiserror::Error;
 use crate::{
     BackendTimingMetadata, CCS, ClarabelSqpError, ClarabelSqpOptions, ClarabelSqpSummary,
     CompiledNlpProblem, Index, InteriorPointIterationSnapshot, InteriorPointOptions,
-    InteriorPointSolveError, InteriorPointSummary, NlpConstraintViolationReport,
+    InteriorPointSolveError, InteriorPointSummary, NlpCompileStats, NlpConstraintViolationReport,
     NlpEqualityViolation, NlpInequalitySource, NlpInequalityViolation, ParameterMatrix,
-    SqpAdapterTiming, Vectorize, classify_constraint_satisfaction, constraint_bound_side,
-    flatten_value, solve_nlp_interior_point, solve_nlp_interior_point_with_callback, solve_nlp_sqp,
-    solve_nlp_sqp_with_callback, symbolic_column, symbolic_value, worst_bound_violation,
+    SqpAdapterTiming, SymbolicCompileMetadata, Vectorize, classify_constraint_satisfaction,
+    constraint_bound_side, flatten_value, solve_nlp_interior_point,
+    solve_nlp_interior_point_with_callback, solve_nlp_sqp, solve_nlp_sqp_with_callback,
+    symbolic_column, symbolic_value, worst_bound_violation,
 };
 #[cfg(feature = "ipopt")]
 use crate::{
@@ -268,7 +269,7 @@ where
         on_symbolic_ready: CB,
     ) -> Result<TypedCompiledJitNlp<X, P, E, I>, SymbolicNlpCompileError>
     where
-        CB: FnMut(BackendTimingMetadata),
+        CB: FnMut(SymbolicCompileMetadata),
     {
         self.compile_jit_with_opt_level_and_symbolic_callback(
             LlvmOptimizationLevel::O3,
@@ -297,7 +298,7 @@ where
         on_symbolic_ready: CB,
     ) -> Result<TypedCompiledJitNlp<X, P, E, I>, SymbolicNlpCompileError>
     where
-        CB: FnMut(BackendTimingMetadata),
+        CB: FnMut(SymbolicCompileMetadata),
     {
         Ok(TypedCompiledJitNlp {
             inner: compile_symbolic_nlp_with_symbolic_callback(
@@ -359,18 +360,64 @@ where
 }
 
 impl CompiledJitNlp {
+    fn compile_stats(&self) -> NlpCompileStats {
+        NlpCompileStats {
+            variable_count: self.dimension(),
+            parameter_scalar_count: self.parameter_ccs.iter().map(CCS::nnz).sum(),
+            equality_count: self.equality_count(),
+            inequality_count: self.inequality_base_count(),
+            equality_jacobian_nnz: self.equality_jacobian_ccs().nnz(),
+            inequality_jacobian_nnz: self.inequality_base_jacobian_ccs().nnz(),
+            hessian_nnz: self.lagrangian_hessian_ccs().nnz(),
+            jit_kernel_count: 3
+                + 2 * usize::from(self.equality_values.is_some())
+                + 2 * usize::from(self.inequality_values.is_some()),
+        }
+    }
+
     fn from_symbolic(
         symbolic: &SymbolicNlp,
         opt_level: LlvmOptimizationLevel,
-        mut on_symbolic_ready: impl FnMut(BackendTimingMetadata),
+        mut on_symbolic_ready: impl FnMut(SymbolicCompileMetadata),
     ) -> Result<Self, SymbolicNlpCompileError> {
         let derivative_started = Instant::now();
         let functions = derive_symbolic_functions(symbolic)?;
         let derivative_generation_time = derivative_started.elapsed();
-        on_symbolic_ready(BackendTimingMetadata {
+        let symbolic_timing = BackendTimingMetadata {
             function_creation_time: symbolic.construction_time,
             derivative_generation_time: Some(derivative_generation_time),
             jit_time: None,
+        };
+        on_symbolic_ready(SymbolicCompileMetadata {
+            timing: symbolic_timing,
+            stats: NlpCompileStats {
+                variable_count: symbolic.variables.nnz(),
+                parameter_scalar_count: symbolic
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.matrix().ccs().nnz())
+                    .sum(),
+                equality_count: functions
+                    .equality_jacobian_values
+                    .as_ref()
+                    .map_or(0, |function| function_output_ccs(function).nrow),
+                inequality_count: functions
+                    .inequality_jacobian_values
+                    .as_ref()
+                    .map_or(0, |function| function_output_ccs(function).nrow),
+                equality_jacobian_nnz: functions
+                    .equality_jacobian_values
+                    .as_ref()
+                    .map_or(0, |function| function_output_ccs(function).nnz()),
+                inequality_jacobian_nnz: functions
+                    .inequality_jacobian_values
+                    .as_ref()
+                    .map_or(0, |function| function_output_ccs(function).nnz()),
+                hessian_nnz: function_output_ccs(&functions.lagrangian_hessian_values).nnz(),
+                jit_kernel_count: 3
+                    + 2 * usize::from(functions.equality_values.is_some())
+                    + 2 * usize::from(functions.inequality_values.is_some()),
+            },
         });
 
         let jit_started = Instant::now();
@@ -637,6 +684,10 @@ where
 {
     pub fn backend_timing_metadata(&self) -> BackendTimingMetadata {
         self.inner.backend_timing_metadata()
+    }
+
+    pub fn compile_stats(&self) -> NlpCompileStats {
+        self.inner.compile_stats()
     }
 
     pub fn evaluate_equalities_flat(
@@ -1012,7 +1063,7 @@ pub fn rank_nlp_constraint_violations(
 fn compile_symbolic_nlp_with_symbolic_callback(
     symbolic: &SymbolicNlp,
     opt_level: LlvmOptimizationLevel,
-    on_symbolic_ready: impl FnMut(BackendTimingMetadata),
+    on_symbolic_ready: impl FnMut(SymbolicCompileMetadata),
 ) -> Result<CompiledJitNlp, SymbolicNlpCompileError> {
     CompiledJitNlp::from_symbolic(symbolic, opt_level, on_symbolic_ready)
 }
