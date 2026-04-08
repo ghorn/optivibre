@@ -1,10 +1,10 @@
 use crate::common::{
-    CachedCompile, CompileCacheStatus, CompileCacheVariant, FromMap, LatexSection, MetricKey,
-    OcpCompileProgressState, PlotMode, ProblemId, ProblemSpec, Scene2D, ScenePath,
-    SharedCompileCache, SolveArtifact, SolveStreamEvent, SolverMethod, SolverReport, SqpConfig,
+    CachedCompile, CompileCacheStatus, CompileProgressInfo, CompileProgressUpdate, FromMap,
+    LatexSection, MetricKey, OcpCompileProgressState, PlotMode, ProblemId, ProblemSpec, Scene2D,
+    ScenePath, SolveArtifact, SolveStreamEvent, SolverMethod, SolverReport, SqpConfig,
     TranscriptionConfig, TranscriptionMethod, cached_compile_with_progress, chart,
-    collect_compile_cache_statuses, compile_progress_info, default_solver_method,
-    default_sqp_config, default_transcription, deg_to_rad, expect_finite,
+    compile_progress_info, default_solver_method, default_sqp_config, default_transcription,
+    deg_to_rad, direct_collocation_compile_key as dc_compile_key, expect_finite,
     interval_arc_bound_series, interval_arc_series, metric_with_key, node_times,
     numeric_metric_with_key, ocp_compile_progress_update, problem_controls,
     problem_scientific_slider_control, problem_slider_control, problem_spec, rad_to_deg,
@@ -25,6 +25,7 @@ use optimal_control::{
 use serde::Serialize;
 use std::cell::RefCell;
 use std::f64::consts::PI;
+use std::rc::Rc;
 use sx_core::SX;
 const RK4_SUBSTEPS: usize = 2;
 const DEFAULT_INTERVALS: usize = 30;
@@ -96,19 +97,10 @@ type DcCompiled<const N: usize, const K: usize> = CompiledDirectCollocationOcp<
     K,
 >;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum DcCompileKey {
-    Legendre,
-    RadauIia,
-}
-
-thread_local! {
-    static MULTIPLE_SHOOTING_CACHE: RefCell<SharedCompileCache<usize, MsCompiled<DEFAULT_INTERVALS>>> =
-        RefCell::new(SharedCompileCache::new());
-    static DIRECT_COLLOCATION_CACHE: RefCell<
-        SharedCompileCache<DcCompileKey, DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>>
-    > = RefCell::new(SharedCompileCache::new());
-}
+crate::standard_ocp_compile_caches!(
+    MULTIPLE_SHOOTING_CACHE: MsCompiled<DEFAULT_INTERVALS>,
+    DIRECT_COLLOCATION_CACHE: DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>
+);
 
 const PROBLEM_NAME: &str = "Optimal Distance Glider";
 #[derive(Clone, Debug)]
@@ -371,13 +363,6 @@ fn seed_launch_velocity(params: &Params) -> (f64, f64) {
     )
 }
 
-fn dc_compile_key(family: optimal_control::CollocationFamily) -> DcCompileKey {
-    match family {
-        optimal_control::CollocationFamily::GaussLegendre => DcCompileKey::Legendre,
-        optimal_control::CollocationFamily::RadauIIA => DcCompileKey::RadauIia,
-    }
-}
-
 fn cached_multiple_shooting() -> Result<CachedCompile<MsCompiled<DEFAULT_INTERVALS>>> {
     MULTIPLE_SHOOTING_CACHE.with(|cache| {
         cache.borrow_mut().get_or_try_init(DEFAULT_INTERVALS, || {
@@ -401,6 +386,72 @@ fn cached_direct_collocation(
     })
 }
 
+fn compile_multiple_shooting_with_progress(
+    callback: &mut dyn FnMut(CompileProgressUpdate),
+) -> Result<(
+    Rc<RefCell<MsCompiled<DEFAULT_INTERVALS>>>,
+    CompileProgressInfo,
+)> {
+    MULTIPLE_SHOOTING_CACHE.with(|cache| {
+        cached_compile_with_progress(
+            &mut cache.borrow_mut(),
+            DEFAULT_INTERVALS,
+            callback,
+            |on_compile_progress| {
+                let mut progress_state = OcpCompileProgressState::default();
+                Ok(model(MultipleShooting::<DEFAULT_INTERVALS, RK4_SUBSTEPS>)
+                    .compile_jit_with_progress_callback(|progress| {
+                        on_compile_progress(ocp_compile_progress_update(
+                            progress,
+                            &mut progress_state,
+                        ));
+                    })?)
+            },
+            |compiled| {
+                compile_progress_info(
+                    compiled.backend_timing_metadata(),
+                    compiled.nlp_compile_stats(),
+                    compiled.helper_kernel_count(),
+                    compiled.helper_compile_stats(),
+                )
+            },
+        )
+    })
+}
+
+fn compile_direct_collocation_with_progress(
+    family: optimal_control::CollocationFamily,
+    callback: &mut dyn FnMut(CompileProgressUpdate),
+) -> Result<(
+    Rc<RefCell<DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>>>,
+    CompileProgressInfo,
+)> {
+    DIRECT_COLLOCATION_CACHE.with(|cache| {
+        cached_compile_with_progress(
+            &mut cache.borrow_mut(),
+            dc_compile_key(family),
+            callback,
+            |on_compile_progress| {
+                let mut progress_state = OcpCompileProgressState::default();
+                Ok(model(
+                    DirectCollocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE> { family },
+                )
+                .compile_jit_with_progress_callback(|progress| {
+                    on_compile_progress(ocp_compile_progress_update(progress, &mut progress_state));
+                })?)
+            },
+            |compiled| {
+                compile_progress_info(
+                    compiled.backend_timing_metadata(),
+                    compiled.nlp_compile_stats(),
+                    compiled.helper_kernel_count(),
+                    compiled.helper_compile_stats(),
+                )
+            },
+        )
+    })
+}
+
 pub fn prewarm(params: &Params) -> Result<()> {
     match params.transcription.method {
         TranscriptionMethod::MultipleShooting => cached_multiple_shooting().map(|_| ()),
@@ -410,44 +461,36 @@ pub fn prewarm(params: &Params) -> Result<()> {
     }
 }
 
+pub fn prewarm_with_progress<F>(params: &Params, emit: F) -> Result<()>
+where
+    F: FnMut(SolveStreamEvent) + Send,
+{
+    match params.transcription.method {
+        TranscriptionMethod::MultipleShooting => {
+            let mut lifecycle =
+                crate::common::SolveLifecycleReporter::new(emit, params.solver_method);
+            lifecycle.prewarm_with_progress(compile_multiple_shooting_with_progress)
+        }
+        TranscriptionMethod::DirectCollocation => {
+            let mut lifecycle =
+                crate::common::SolveLifecycleReporter::new(emit, params.solver_method);
+            lifecycle.prewarm_with_progress(|callback| {
+                compile_direct_collocation_with_progress(
+                    params.transcription.collocation_family,
+                    callback,
+                )
+            })
+        }
+    }
+}
+
 pub fn compile_cache_statuses() -> Vec<CompileCacheStatus> {
-    let mut statuses = Vec::new();
-    MULTIPLE_SHOOTING_CACHE.with(|cache| {
-        let cache = cache.borrow();
-        statuses.extend(collect_compile_cache_statuses(
-            ProblemId::OptimalDistanceGlider,
-            PROBLEM_NAME,
-            &cache,
-            &[CompileCacheVariant::new(
-                DEFAULT_INTERVALS,
-                "multiple_shooting",
-                "Multiple Shooting",
-            )],
-            |compiled| compiled.backend_timing_metadata(),
-        ));
-    });
-    DIRECT_COLLOCATION_CACHE.with(|cache| {
-        let cache = cache.borrow();
-        statuses.extend(collect_compile_cache_statuses(
-            ProblemId::OptimalDistanceGlider,
-            PROBLEM_NAME,
-            &cache,
-            &[
-                CompileCacheVariant::new(
-                    DcCompileKey::Legendre,
-                    "direct_collocation_legendre",
-                    "Direct Collocation · Legendre",
-                ),
-                CompileCacheVariant::new(
-                    DcCompileKey::RadauIia,
-                    "direct_collocation_radau_iia",
-                    "Direct Collocation · Radau IIA",
-                ),
-            ],
-            |compiled| compiled.backend_timing_metadata(),
-        ));
-    });
-    statuses
+    crate::standard_ocp_compile_cache_statuses!(
+        ProblemId::OptimalDistanceGlider,
+        PROBLEM_NAME,
+        MULTIPLE_SHOOTING_CACHE,
+        DIRECT_COLLOCATION_CACHE
+    )
 }
 
 fn glide_slope_deg(vx: f64, vy: f64) -> f64 {
@@ -708,33 +751,8 @@ where
         TranscriptionMethod::MultipleShooting => {
             let mut lifecycle =
                 crate::common::SolveLifecycleReporter::new(emit, params.solver_method);
-            let (compiled, running_solver) = lifecycle.compile_with_progress(|callback| {
-                MULTIPLE_SHOOTING_CACHE.with(|cache| {
-                    cached_compile_with_progress(
-                        &mut cache.borrow_mut(),
-                        DEFAULT_INTERVALS,
-                        callback,
-                        |on_compile_progress| {
-                            let mut progress_state = OcpCompileProgressState::default();
-                            Ok(model(MultipleShooting::<DEFAULT_INTERVALS, RK4_SUBSTEPS>)
-                                .compile_jit_with_progress_callback(|progress| {
-                                    on_compile_progress(ocp_compile_progress_update(
-                                        progress,
-                                        &mut progress_state,
-                                    ));
-                                })?)
-                        },
-                        |compiled| {
-                            compile_progress_info(
-                                compiled.backend_timing_metadata(),
-                                compiled.nlp_compile_stats(),
-                                compiled.helper_kernel_count(),
-                                compiled.helper_compile_stats(),
-                            )
-                        },
-                    )
-                })
-            })?;
+            let (compiled, running_solver) =
+                lifecycle.compile_with_progress(compile_multiple_shooting_with_progress)?;
             solve_cached_multiple_shooting_problem_with_progress(
                 &compiled,
                 &ms_runtime::<DEFAULT_INTERVALS>(params),
@@ -750,39 +768,12 @@ where
         TranscriptionMethod::DirectCollocation => {
             let mut lifecycle =
                 crate::common::SolveLifecycleReporter::new(emit, params.solver_method);
-            let (compiled, running_solver) =
-                lifecycle.compile_with_progress(|callback| {
-                    DIRECT_COLLOCATION_CACHE.with(|cache| {
-                        cached_compile_with_progress(
-                            &mut cache.borrow_mut(),
-                            dc_compile_key(params.transcription.collocation_family),
-                            callback,
-                            |on_compile_progress| {
-                                let mut progress_state = OcpCompileProgressState::default();
-                                Ok(model(DirectCollocation::<
-                                    DEFAULT_INTERVALS,
-                                    DEFAULT_COLLOCATION_DEGREE,
-                                > {
-                                    family: params.transcription.collocation_family,
-                                })
-                                .compile_jit_with_progress_callback(|progress| {
-                                    on_compile_progress(ocp_compile_progress_update(
-                                        progress,
-                                        &mut progress_state,
-                                    ));
-                                })?)
-                            },
-                            |compiled| {
-                                compile_progress_info(
-                                    compiled.backend_timing_metadata(),
-                                    compiled.nlp_compile_stats(),
-                                    compiled.helper_kernel_count(),
-                                    compiled.helper_compile_stats(),
-                                )
-                            },
-                        )
-                    })
-                })?;
+            let (compiled, running_solver) = lifecycle.compile_with_progress(|callback| {
+                compile_direct_collocation_with_progress(
+                    params.transcription.collocation_family,
+                    callback,
+                )
+            })?;
             solve_cached_direct_collocation_problem_with_progress(
                 &compiled,
                 &dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(params),

@@ -115,7 +115,7 @@ pub struct LatexSection {
     pub entries: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProblemId {
     OptimalDistanceGlider,
@@ -162,7 +162,7 @@ pub struct ProblemSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompileCacheState {
-    Cold,
+    Warming,
     Ready,
 }
 
@@ -177,21 +177,10 @@ pub struct CompileCacheStatus {
     pub jit_s: Option<f64>,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct CompileCacheVariant<K> {
-    pub key: K,
-    pub variant_id: &'static str,
-    pub variant_label: &'static str,
-}
-
-impl<K> CompileCacheVariant<K> {
-    pub const fn new(key: K, variant_id: &'static str, variant_label: &'static str) -> Self {
-        Self {
-            key,
-            variant_id,
-            variant_label,
-        }
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DirectCollocationCompileKey {
+    Legendre,
+    RadauIia,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -825,9 +814,46 @@ where
         })
     }
 
-    pub fn get(&self, key: K) -> Option<Rc<RefCell<V>>> {
-        self.entries.get(&key).cloned()
+    pub fn cached_entries(&self) -> Vec<(K, Rc<RefCell<V>>)> {
+        self.entries
+            .iter()
+            .map(|(key, value)| (*key, value.clone()))
+            .collect()
     }
+}
+
+#[macro_export]
+macro_rules! standard_ocp_compile_caches {
+    ($multiple_shooting_cache:ident : $multiple_shooting_ty:ty, $direct_collocation_cache:ident : $direct_collocation_ty:ty) => {
+        thread_local! {
+            static $multiple_shooting_cache: std::cell::RefCell<$crate::common::SharedCompileCache<usize, $multiple_shooting_ty>> =
+                std::cell::RefCell::new($crate::common::SharedCompileCache::new());
+            static $direct_collocation_cache: std::cell::RefCell<
+                $crate::common::SharedCompileCache<$crate::common::DirectCollocationCompileKey, $direct_collocation_ty>
+            > = std::cell::RefCell::new($crate::common::SharedCompileCache::new());
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! standard_ocp_compile_cache_statuses {
+    ($problem_id:expr, $problem_name:expr, $multiple_shooting_cache:ident, $direct_collocation_cache:ident) => {{
+        let mut statuses = Vec::new();
+        $multiple_shooting_cache.with(|cache| {
+            $direct_collocation_cache.with(|dc_cache| {
+                $crate::common::append_standard_compile_cache_statuses(
+                    &mut statuses,
+                    $problem_id,
+                    $problem_name,
+                    &cache.borrow(),
+                    &dc_cache.borrow(),
+                    |compiled| compiled.backend_timing_metadata(),
+                    |compiled| compiled.backend_timing_metadata(),
+                );
+            });
+        });
+        statuses
+    }};
 }
 
 fn phase_detail(label: impl Into<String>, value: impl Into<String>) -> SolverPhaseDetail {
@@ -842,46 +868,96 @@ pub fn compile_cache_status(
     problem_name: &str,
     variant_id: &str,
     variant_label: &str,
-    timing: Option<BackendTimingMetadata>,
+    timing: BackendTimingMetadata,
 ) -> CompileCacheStatus {
     CompileCacheStatus {
         problem_id,
         problem_name: problem_name.to_string(),
         variant_id: variant_id.to_string(),
         variant_label: variant_label.to_string(),
-        state: if timing.is_some() {
-            CompileCacheState::Ready
-        } else {
-            CompileCacheState::Cold
-        },
-        symbolic_setup_s: timing.and_then(symbolic_setup_seconds),
-        jit_s: timing.and_then(|value| duration_seconds(value.jit_time)),
+        state: CompileCacheState::Ready,
+        symbolic_setup_s: symbolic_setup_seconds(timing),
+        jit_s: duration_seconds(timing.jit_time),
     }
 }
 
-pub fn collect_compile_cache_statuses<K, V, F>(
+pub fn multiple_shooting_variant() -> (&'static str, &'static str) {
+    ("multiple_shooting", "Multiple Shooting")
+}
+
+pub fn direct_collocation_compile_key(family: CollocationFamily) -> DirectCollocationCompileKey {
+    match family {
+        CollocationFamily::GaussLegendre => DirectCollocationCompileKey::Legendre,
+        CollocationFamily::RadauIIA => DirectCollocationCompileKey::RadauIia,
+    }
+}
+
+pub fn direct_collocation_variant(
+    key: DirectCollocationCompileKey,
+) -> (&'static str, &'static str) {
+    match key {
+        DirectCollocationCompileKey::Legendre => (
+            "direct_collocation_legendre",
+            "Direct Collocation · Legendre",
+        ),
+        DirectCollocationCompileKey::RadauIia => (
+            "direct_collocation_radau_iia",
+            "Direct Collocation · Radau IIA",
+        ),
+    }
+}
+
+pub fn append_standard_compile_cache_statuses<Ms, Dc, MsTiming, DcTiming>(
+    statuses: &mut Vec<CompileCacheStatus>,
+    problem_id: ProblemId,
+    problem_name: &str,
+    multiple_shooting_cache: &SharedCompileCache<usize, Ms>,
+    direct_collocation_cache: &SharedCompileCache<DirectCollocationCompileKey, Dc>,
+    multiple_shooting_timing_of: MsTiming,
+    direct_collocation_timing_of: DcTiming,
+) where
+    MsTiming: Fn(&Ms) -> BackendTimingMetadata,
+    DcTiming: Fn(&Dc) -> BackendTimingMetadata,
+{
+    statuses.extend(collect_compile_cache_statuses(
+        problem_id,
+        problem_name,
+        multiple_shooting_cache,
+        |_| multiple_shooting_variant(),
+        multiple_shooting_timing_of,
+    ));
+    statuses.extend(collect_compile_cache_statuses(
+        problem_id,
+        problem_name,
+        direct_collocation_cache,
+        direct_collocation_variant,
+        direct_collocation_timing_of,
+    ));
+}
+
+pub fn collect_compile_cache_statuses<K, V, F, G>(
     problem_id: ProblemId,
     problem_name: &str,
     cache: &SharedCompileCache<K, V>,
-    variants: &[CompileCacheVariant<K>],
+    describe_variant: G,
     timing_of: F,
 ) -> Vec<CompileCacheStatus>
 where
     K: Eq + Hash + Copy,
     F: Fn(&V) -> BackendTimingMetadata,
+    G: Fn(K) -> (&'static str, &'static str),
 {
-    variants
-        .iter()
-        .map(|variant| {
-            let timing = cache
-                .get(variant.key)
-                .map(|compiled| timing_of(&compiled.borrow()));
+    cache
+        .cached_entries()
+        .into_iter()
+        .map(|(key, compiled)| {
+            let (variant_id, variant_label) = describe_variant(key);
             compile_cache_status(
                 problem_id,
                 problem_name,
-                variant.variant_id,
-                variant.variant_label,
-                timing,
+                variant_id,
+                variant_label,
+                timing_of(&compiled.borrow()),
             )
         })
         .collect()
@@ -1105,6 +1181,16 @@ where
             .with_compile_cached(progress.compile_cached)
             .with_phase_details(progress.phase_details);
         Ok((compiled, running_solver))
+    }
+
+    pub fn prewarm_with_progress<Compiled, Compile>(&mut self, compile: Compile) -> Result<()>
+    where
+        Compile: FnOnce(
+            &mut dyn FnMut(CompileProgressUpdate),
+        ) -> Result<(Compiled, CompileProgressInfo)>,
+    {
+        let _ = self.compile_with_progress(compile)?;
+        Ok(())
     }
 
     pub fn into_emit(self) -> Emit {

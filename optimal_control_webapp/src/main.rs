@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::env;
 use std::io;
@@ -5,8 +6,7 @@ use std::io;
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::fd::{FromRawFd, RawFd};
-use std::sync::mpsc as std_mpsc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 
 use anyhow::Result;
@@ -19,9 +19,9 @@ use axum::{
     routing::{get, post},
 };
 use optimal_control_problems::{
-    CompileCacheStatus, ProblemId, SolveArtifact, SolveLogLevel, SolveRequest, SolveStreamEvent,
-    compile_cache_statuses, prewarm_problem, problem_specs, solve_problem,
-    solve_problem_with_progress,
+    CompileCacheState, CompileCacheStatus, ProblemId, SolveArtifact, SolveLogLevel, SolveRequest,
+    SolveStage, SolveStatus, SolveStreamEvent, compile_variant_for_problem,
+    prewarm_problem_with_progress, problem_specs, solve_problem, solve_problem_with_progress,
 };
 use optimization::{AnsiColorMode, set_ansi_color_mode};
 use serde::Serialize;
@@ -41,26 +41,52 @@ type ApiResult<T> = Result<T, ApiError>;
 type StreamSender = mpsc::Sender<Result<Bytes, Infallible>>;
 
 struct ProblemBackend {
-    requests: std_mpsc::Sender<BackendRequest>,
+    actors: Mutex<HashMap<CompileSignature, Arc<ProblemActor>>>,
 }
 
-enum BackendRequest {
-    CompileCacheStatus {
-        reply: oneshot::Sender<Result<Vec<CompileCacheStatus>, String>>,
-    },
-    Prewarm {
-        problem: ProblemId,
-        request: SolveRequest,
-        reply: oneshot::Sender<Result<(), String>>,
-    },
-    Solve {
-        problem: ProblemId,
-        request: SolveRequest,
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CompileSignature {
+    problem_id: ProblemId,
+    variant_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct CompileDescriptor {
+    signature: CompileSignature,
+    problem_name: String,
+    variant_label: String,
+    compile_values: BTreeMap<String, f64>,
+}
+
+type ActorShared = (Mutex<ProblemActorState>, Condvar);
+
+struct ProblemActor {
+    descriptor: CompileDescriptor,
+    shared: Arc<ActorShared>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerPhase {
+    Idle,
+    Warming,
+    Solving,
+}
+
+struct ProblemActorState {
+    phase: WorkerPhase,
+    ready: bool,
+    latest_compile_status: Option<SolveStatus>,
+    pending_prewarm_replies: Vec<oneshot::Sender<Result<(), String>>>,
+    pending_solves: VecDeque<PendingSolveJob>,
+}
+
+enum PendingSolveJob {
+    Sync {
+        values: BTreeMap<String, f64>,
         reply: oneshot::Sender<Result<SolveArtifact, String>>,
     },
-    SolveStream {
-        problem: ProblemId,
-        request: SolveRequest,
+    Stream {
+        values: BTreeMap<String, f64>,
         sender: StreamSender,
     },
 }
@@ -76,6 +102,11 @@ impl Drop for AnsiColorModeGuard {
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct CompileCacheSnapshot {
+    entries: Vec<CompileCacheStatus>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -124,39 +155,20 @@ async fn problems() -> Json<Vec<optimal_control_problems::ProblemSpec>> {
     Json(problem_specs())
 }
 
-async fn prewarm_status() -> ApiResult<Json<Vec<CompileCacheStatus>>> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    problem_backend()
-        .requests
-        .send(BackendRequest::CompileCacheStatus { reply: reply_tx })
-        .map_err(|error| internal_error(format!("backend worker unavailable: {error}")))?;
-    match reply_rx.await {
-        Ok(Ok(statuses)) => Ok(Json(statuses)),
-        Ok(Err(error)) => Err(internal_error(error)),
-        Err(error) => Err(internal_error(format!(
-            "backend worker dropped compile cache status response: {error}"
-        ))),
-    }
+async fn prewarm_status() -> ApiResult<Json<CompileCacheSnapshot>> {
+    Ok(Json(problem_backend().compile_snapshot()))
 }
 
 async fn prewarm(
     Path(problem): Path<ProblemId>,
     Json(request): Json<SolveRequest>,
 ) -> ApiResult<StatusCode> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    problem_backend()
-        .requests
-        .send(BackendRequest::Prewarm {
-            problem,
-            request,
-            reply: reply_tx,
-        })
-        .map_err(|error| internal_error(format!("backend worker unavailable: {error}")))?;
+    let reply_rx = problem_backend().prewarm(problem, request);
     match reply_rx.await {
         Ok(Ok(())) => Ok(StatusCode::NO_CONTENT),
         Ok(Err(error)) => Err(internal_error(error)),
         Err(error) => Err(internal_error(format!(
-            "backend worker dropped prewarm response: {error}"
+            "prewarm task dropped response: {error}"
         ))),
     }
 }
@@ -165,20 +177,12 @@ async fn solve(
     Path(problem): Path<ProblemId>,
     Json(request): Json<SolveRequest>,
 ) -> ApiResult<Json<optimal_control_problems::SolveArtifact>> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    problem_backend()
-        .requests
-        .send(BackendRequest::Solve {
-            problem,
-            request,
-            reply: reply_tx,
-        })
-        .map_err(|error| internal_error(format!("backend worker unavailable: {error}")))?;
+    let reply_rx = problem_backend().solve(problem, request);
     match reply_rx.await {
         Ok(Ok(artifact)) => Ok(Json(artifact)),
         Ok(Err(error)) => Err(internal_error(error)),
         Err(error) => Err(internal_error(format!(
-            "backend worker dropped solve response: {error}"
+            "solve task dropped response: {error}"
         ))),
     }
 }
@@ -188,16 +192,10 @@ async fn solve_stream(
     Json(request): Json<SolveRequest>,
 ) -> ApiResult<impl IntoResponse> {
     let (sender, receiver) = mpsc::channel::<Result<Bytes, Infallible>>(64);
-
-    problem_backend()
-        .requests
-        .send(BackendRequest::SolveStream {
-            problem,
-            request,
-            sender,
-        })
-        .map_err(|error| internal_error(format!("backend worker unavailable: {error}")))?;
-
+    let initial_status = problem_backend().solve_stream(problem, request, sender.clone());
+    if let Some(status) = initial_status {
+        send_stream_event_async(&sender, SolveStreamEvent::Status { status }).await;
+    }
     Ok(ndjson_stream_response(receiver))
 }
 
@@ -207,46 +205,283 @@ fn problem_backend() -> &'static ProblemBackend {
 
 impl ProblemBackend {
     fn start() -> Self {
-        let (requests, receiver) = std_mpsc::channel();
-        thread::spawn(move || backend_worker_loop(receiver));
-        Self { requests }
+        Self {
+            actors: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn compile_snapshot(&self) -> CompileCacheSnapshot {
+        let actors = self.actors.lock().expect("problem actor registry poisoned");
+        let mut entries = actors
+            .values()
+            .filter_map(|actor| actor.compile_status())
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            left.problem_name
+                .cmp(&right.problem_name)
+                .then(left.variant_label.cmp(&right.variant_label))
+        });
+        CompileCacheSnapshot { entries }
+    }
+
+    fn prewarm(
+        &self,
+        problem: ProblemId,
+        request: SolveRequest,
+    ) -> oneshot::Receiver<Result<(), String>> {
+        self.actor_for(problem, &request.values).enqueue_prewarm()
+    }
+
+    fn solve(
+        &self,
+        problem: ProblemId,
+        request: SolveRequest,
+    ) -> oneshot::Receiver<Result<SolveArtifact, String>> {
+        self.actor_for(problem, &request.values)
+            .enqueue_sync_solve(request.values)
+    }
+
+    fn solve_stream(
+        &self,
+        problem: ProblemId,
+        request: SolveRequest,
+        sender: StreamSender,
+    ) -> Option<SolveStatus> {
+        self.actor_for(problem, &request.values)
+            .enqueue_stream_solve(request.values, sender)
+    }
+
+    fn actor_for(&self, problem: ProblemId, values: &BTreeMap<String, f64>) -> Arc<ProblemActor> {
+        let descriptor = compile_descriptor(problem, values);
+        let mut actors = self.actors.lock().expect("problem actor registry poisoned");
+        if let Some(actor) = actors.get(&descriptor.signature) {
+            return actor.clone();
+        }
+        let actor = ProblemActor::spawn(problem, descriptor.clone());
+        actors.insert(descriptor.signature, actor.clone());
+        actor
     }
 }
 
-fn backend_worker_loop(receiver: std_mpsc::Receiver<BackendRequest>) {
-    while let Ok(request) = receiver.recv() {
-        match request {
-            BackendRequest::CompileCacheStatus { reply } => {
-                let _ = reply.send(Ok(compile_cache_statuses()));
-            }
-            BackendRequest::Prewarm {
-                problem,
-                request,
-                reply,
-            } => {
-                let result =
-                    prewarm_problem(problem, &request.values).map_err(|error| error.to_string());
-                let _ = reply.send(result);
-            }
-            BackendRequest::Solve {
-                problem,
-                request,
-                reply,
-            } => {
-                let result =
-                    solve_problem(problem, &request.values).map_err(|error| error.to_string());
-                let _ = reply.send(result);
-            }
-            BackendRequest::SolveStream {
-                problem,
-                request,
-                sender,
-            } => run_solve_stream(problem, request, sender),
+impl ProblemActor {
+    fn spawn(problem: ProblemId, descriptor: CompileDescriptor) -> Arc<Self> {
+        let shared = Arc::new((
+            Mutex::new(ProblemActorState {
+                phase: WorkerPhase::Idle,
+                ready: false,
+                latest_compile_status: None,
+                pending_prewarm_replies: Vec::new(),
+                pending_solves: VecDeque::new(),
+            }),
+            Condvar::new(),
+        ));
+        let worker_shared = shared.clone();
+        let worker_descriptor = descriptor.clone();
+        thread::spawn(move || actor_worker_loop(problem, worker_descriptor, worker_shared));
+        Arc::new(Self { descriptor, shared })
+    }
+
+    fn compile_status(&self) -> Option<CompileCacheStatus> {
+        let (lock, _) = &*self.shared;
+        let state = lock.lock().expect("problem actor state poisoned");
+        compile_status_from_state(&self.descriptor, &state)
+    }
+
+    fn enqueue_prewarm(&self) -> oneshot::Receiver<Result<(), String>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let (lock, cvar) = &*self.shared;
+        let mut state = lock.lock().expect("problem actor state poisoned");
+        if state.ready {
+            let _ = reply_tx.send(Ok(()));
+            return reply_rx;
+        }
+        state.pending_prewarm_replies.push(reply_tx);
+        cvar.notify_one();
+        reply_rx
+    }
+
+    fn enqueue_sync_solve(
+        &self,
+        values: BTreeMap<String, f64>,
+    ) -> oneshot::Receiver<Result<SolveArtifact, String>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let (lock, cvar) = &*self.shared;
+        let mut state = lock.lock().expect("problem actor state poisoned");
+        state.pending_solves.push_back(PendingSolveJob::Sync {
+            values,
+            reply: reply_tx,
+        });
+        cvar.notify_one();
+        reply_rx
+    }
+
+    fn enqueue_stream_solve(
+        &self,
+        values: BTreeMap<String, f64>,
+        sender: StreamSender,
+    ) -> Option<SolveStatus> {
+        {
+            let (lock, cvar) = &*self.shared;
+            let mut state = lock.lock().expect("problem actor state poisoned");
+            let initial_status = if state.phase == WorkerPhase::Warming {
+                state.latest_compile_status.clone()
+            } else if state.ready {
+                state
+                    .latest_compile_status
+                    .clone()
+                    .map(mark_compile_status_cached)
+            } else {
+                None
+            };
+            state.pending_solves.push_back(PendingSolveJob::Stream {
+                values,
+                sender: sender.clone(),
+            });
+            cvar.notify_one();
+            initial_status
         }
     }
 }
 
-fn run_solve_stream(problem: ProblemId, request: SolveRequest, sender: StreamSender) {
+fn actor_worker_loop(problem: ProblemId, descriptor: CompileDescriptor, shared: Arc<ActorShared>) {
+    loop {
+        let job = {
+            let (lock, cvar) = &*shared;
+            let mut state = lock.lock().expect("problem actor state poisoned");
+            loop {
+                if state.phase == WorkerPhase::Idle {
+                    if !state.ready {
+                        if !state.pending_prewarm_replies.is_empty()
+                            || !state.pending_solves.is_empty()
+                        {
+                            state.phase = WorkerPhase::Warming;
+                            state.latest_compile_status = None;
+                            break ActorJob::Compile;
+                        }
+                    } else if let Some(job) = state.pending_solves.pop_front() {
+                        state.phase = WorkerPhase::Solving;
+                        break ActorJob::Solve(job);
+                    }
+                }
+                state = cvar.wait(state).expect("problem actor state poisoned");
+            }
+        };
+
+        match job {
+            ActorJob::Compile => run_actor_compile(problem, &descriptor, &shared),
+            ActorJob::Solve(job) => run_actor_solve(problem, &shared, job),
+        }
+    }
+}
+
+enum ActorJob {
+    Compile,
+    Solve(PendingSolveJob),
+}
+
+fn run_actor_compile(
+    problem: ProblemId,
+    descriptor: &CompileDescriptor,
+    shared: &Arc<ActorShared>,
+) {
+    let result = prewarm_problem_with_progress(problem, &descriptor.compile_values, |event| {
+        forward_compile_event(shared, &event);
+    });
+
+    let (prewarm_replies, pending_solves) = {
+        let (lock, cvar) = &**shared;
+        let mut state = lock.lock().expect("problem actor state poisoned");
+        state.phase = WorkerPhase::Idle;
+        let prewarm_replies = std::mem::take(&mut state.pending_prewarm_replies);
+        let pending_solves = if result.is_err() {
+            state.ready = false;
+            state.latest_compile_status = None;
+            state.pending_solves.drain(..).collect::<Vec<_>>()
+        } else {
+            state.ready = true;
+            Vec::new()
+        };
+        cvar.notify_all();
+        (prewarm_replies, pending_solves)
+    };
+
+    match result {
+        Ok(()) => {
+            for reply in prewarm_replies {
+                let _ = reply.send(Ok(()));
+            }
+        }
+        Err(error) => {
+            let message = error.to_string();
+            for reply in prewarm_replies {
+                let _ = reply.send(Err(message.clone()));
+            }
+            for job in pending_solves {
+                match job {
+                    PendingSolveJob::Sync { reply, .. } => {
+                        let _ = reply.send(Err(message.clone()));
+                    }
+                    PendingSolveJob::Stream { sender, .. } => {
+                        send_stream_error(&sender, &message);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn run_actor_solve(problem: ProblemId, shared: &Arc<ActorShared>, job: PendingSolveJob) {
+    match job {
+        PendingSolveJob::Sync { values, reply } => {
+            let result = solve_problem(problem, &values).map_err(|error| error.to_string());
+            let _ = reply.send(result);
+        }
+        PendingSolveJob::Stream { values, sender } => {
+            run_solve_stream(problem, values, sender);
+        }
+    }
+
+    let (lock, cvar) = &**shared;
+    let mut state = lock.lock().expect("problem actor state poisoned");
+    state.phase = WorkerPhase::Idle;
+    cvar.notify_all();
+}
+
+fn forward_compile_event(shared: &Arc<ActorShared>, event: &SolveStreamEvent) {
+    let status = match event {
+        SolveStreamEvent::Status { status } if is_compile_stage(status.stage) => status.clone(),
+        SolveStreamEvent::Log { .. }
+        | SolveStreamEvent::Iteration { .. }
+        | SolveStreamEvent::Final { .. }
+        | SolveStreamEvent::Error { .. }
+        | SolveStreamEvent::Status { .. } => return,
+    };
+
+    let senders = {
+        let (lock, _) = &**shared;
+        let mut state = lock.lock().expect("problem actor state poisoned");
+        state.latest_compile_status = Some(status.clone());
+        state
+            .pending_solves
+            .iter()
+            .filter_map(|job| match job {
+                PendingSolveJob::Stream { sender, .. } => Some(sender.clone()),
+                PendingSolveJob::Sync { .. } => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for sender in senders {
+        send_stream_event(
+            &sender,
+            SolveStreamEvent::Status {
+                status: status.clone(),
+            },
+        );
+    }
+}
+
+fn run_solve_stream(problem: ProblemId, values: BTreeMap<String, f64>, sender: StreamSender) {
     let _capture_lock = solve_stdio_lock()
         .lock()
         .expect("stdio capture lock poisoned");
@@ -256,8 +491,10 @@ fn run_solve_stream(problem: ProblemId, request: SolveRequest, sender: StreamSen
     let capture_state = StreamStdIoCapture::start(&sender);
 
     let sender_for_progress = sender.clone();
-    let result = solve_problem_with_progress(problem, &request.values, |event| {
-        send_stream_event(&sender_for_progress, event);
+    let result = solve_problem_with_progress(problem, &values, |event| {
+        if should_forward_solve_event(&event) {
+            send_stream_event(&sender_for_progress, event);
+        }
     });
 
     #[cfg(unix)]
@@ -267,6 +504,81 @@ fn run_solve_stream(problem: ProblemId, request: SolveRequest, sender: StreamSen
 
     if let Err(error) = result {
         send_stream_error(&sender, error);
+    }
+}
+
+fn should_forward_solve_event(event: &SolveStreamEvent) -> bool {
+    !matches!(
+        event,
+        SolveStreamEvent::Status { status }
+            if matches!(status.stage, SolveStage::SymbolicSetup | SolveStage::JitCompilation)
+    )
+}
+
+fn compile_status_from_state(
+    descriptor: &CompileDescriptor,
+    state: &ProblemActorState,
+) -> Option<CompileCacheStatus> {
+    if state.phase == WorkerPhase::Warming {
+        Some(compile_cache_status_from_parts(
+            descriptor,
+            CompileCacheState::Warming,
+            state.latest_compile_status.as_ref(),
+        ))
+    } else if state.ready {
+        Some(compile_cache_status_from_parts(
+            descriptor,
+            CompileCacheState::Ready,
+            state.latest_compile_status.as_ref(),
+        ))
+    } else {
+        None
+    }
+}
+
+fn compile_cache_status_from_parts(
+    descriptor: &CompileDescriptor,
+    state: CompileCacheState,
+    status: Option<&SolveStatus>,
+) -> CompileCacheStatus {
+    CompileCacheStatus {
+        problem_id: descriptor.signature.problem_id,
+        problem_name: descriptor.problem_name.clone(),
+        variant_id: descriptor.signature.variant_id.clone(),
+        variant_label: descriptor.variant_label.clone(),
+        state,
+        symbolic_setup_s: status.and_then(|status| status.solver.symbolic_setup_s),
+        jit_s: status.and_then(|status| status.solver.jit_s),
+    }
+}
+
+fn mark_compile_status_cached(mut status: SolveStatus) -> SolveStatus {
+    status.solver.compile_cached = true;
+    status
+}
+
+fn is_compile_stage(stage: SolveStage) -> bool {
+    matches!(
+        stage,
+        SolveStage::SymbolicSetup | SolveStage::JitCompilation
+    )
+}
+
+fn compile_descriptor(problem: ProblemId, values: &BTreeMap<String, f64>) -> CompileDescriptor {
+    let spec = problem_specs()
+        .into_iter()
+        .find(|spec| spec.id == problem)
+        .expect("problem spec missing");
+    let (variant_id, variant_label) =
+        compile_variant_for_problem(problem, values).expect("compile variant missing");
+    CompileDescriptor {
+        signature: CompileSignature {
+            problem_id: problem,
+            variant_id,
+        },
+        problem_name: spec.name,
+        variant_label,
+        compile_values: values.clone(),
     }
 }
 
@@ -314,6 +626,13 @@ fn send_stream_event(sender: &StreamSender, event: SolveStreamEvent) {
     if let Ok(mut payload) = serde_json::to_vec(&event) {
         payload.push(b'\n');
         let _ = sender.blocking_send(Ok(Bytes::from(payload)));
+    }
+}
+
+async fn send_stream_event_async(sender: &StreamSender, event: SolveStreamEvent) {
+    if let Ok(mut payload) = serde_json::to_vec(&event) {
+        payload.push(b'\n');
+        let _ = sender.send(Ok(Bytes::from(payload))).await;
     }
 }
 

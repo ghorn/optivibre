@@ -264,11 +264,11 @@ const PROBLEM_ID_FROM_WIRE = Object.freeze({
   crane_transfer: PROBLEM_ID.craneTransfer,
 } as const);
 const COMPILE_CACHE_STATE = Object.freeze({
-  cold: 0,
+  warming: 0,
   ready: 1,
 } as const);
 const COMPILE_CACHE_STATE_FROM_WIRE = Object.freeze({
-  cold: COMPILE_CACHE_STATE.cold,
+  warming: COMPILE_CACHE_STATE.warming,
   ready: COMPILE_CACHE_STATE.ready,
 } as const);
 
@@ -361,6 +361,10 @@ interface WireCompileCacheStatus {
   state: string | number;
   symbolic_setup_s?: number | null;
   jit_s?: number | null;
+}
+
+interface WireCompileCacheSnapshot {
+  entries?: WireCompileCacheStatus[];
 }
 
 interface CompileCacheStatus {
@@ -676,7 +680,6 @@ interface FrontendState {
   latestProgress: SolveProgress | null;
   liveStatus: SolveStatus | null;
   liveSolver: SolverReport | null;
-  solveStartedAtMs: number | null;
   terminalSolver: SolverReport | null;
   pendingIterationEvent: IterationSolveEvent | null;
   iterationFlushScheduled: boolean;
@@ -685,8 +688,8 @@ interface FrontendState {
   linkedChartAutorange: boolean;
   linkingChartRange: boolean;
   prewarmTimer: number | null;
-  lastPrewarmSignature: string | null;
-  prewarmInFlightSignature: string | null;
+  prewarmInFlightCount: number;
+  compileStatusPollHandle: number | null;
 }
 
 type PlotlyTrace = PlotlyObject;
@@ -725,6 +728,7 @@ interface StatusDisplay {
 const pendingMathRoots = new Set<Element>();
 let mathTypesetRetryHandle: number | null = null;
 const PREWARM_DELAY_MS = 200;
+const COMPILE_STATUS_POLL_MS = 250;
 
 function requiredElement<T extends Element>(selector: string): T {
   const element = document.querySelector<T>(selector);
@@ -954,6 +958,18 @@ function readWireCompileCacheStatus(
       readOptionalJsonNumber(readJsonValueAt(object, "symbolic_setup_s"), `${context}.symbolic_setup_s`) ??
       null,
     jit_s: readOptionalJsonNumber(readJsonValueAt(object, "jit_s"), `${context}.jit_s`) ?? null,
+  };
+}
+
+function readWireCompileCacheSnapshot(
+  value: JsonValue | undefined,
+  context: string,
+): WireCompileCacheSnapshot {
+  const object = readJsonObject(value, context);
+  const entriesValue = readOptionalJsonArray(readJsonValueAt(object, "entries"), `${context}.entries`);
+  return {
+    entries: entriesValue?.map((entry, index) =>
+      readWireCompileCacheStatus(entry, `${context}.entries[${index}]`)),
   };
 }
 
@@ -1337,7 +1353,6 @@ const state: FrontendState = {
   latestProgress: null,
   liveStatus: null,
   liveSolver: null,
-  solveStartedAtMs: null,
   terminalSolver: null,
   pendingIterationEvent: null,
   iterationFlushScheduled: false,
@@ -1346,8 +1361,8 @@ const state: FrontendState = {
   linkedChartAutorange: true,
   linkingChartRange: false,
   prewarmTimer: null,
-  lastPrewarmSignature: null,
-  prewarmInFlightSignature: null,
+  prewarmInFlightCount: 0,
+  compileStatusPollHandle: null,
 };
 
 const problemList = requiredElement<HTMLDivElement>("#problem-list");
@@ -1489,6 +1504,16 @@ function statusDisplayForSolverReport(solver: SolverReport): StatusDisplay {
     detail: solver.failure_message ?? "",
     kind: statusClass(solver.status_kind),
     active: false,
+  };
+}
+
+function pendingSolveRequestStatusDisplay(): StatusDisplay {
+  return {
+    eyebrow: "Run Status",
+    title: "Starting solve",
+    detail: "Waiting for backend solver status.",
+    kind: "info",
+    active: true,
   };
 }
 
@@ -1701,42 +1726,22 @@ function logLevelClass(level: LogLevelCode): string {
   }
 }
 
-function solverWithLiveElapsed(solver: SolverReport | null | undefined): SolverReport | null {
-  if (!solver) {
-    return null;
-  }
-  if (solver.completed || state.solveStartedAtMs == null) {
-    return solver;
-  }
-  const elapsedSeconds = Math.max(0, (performance.now() - state.solveStartedAtMs) / 1000);
-  return {
-    ...solver,
-    solve_s: Math.max(solver.solve_s ?? 0, elapsedSeconds),
-  };
-}
-
 function currentSolverReport(): SolverReport | null {
   if (state.terminalSolver) {
     return state.terminalSolver;
   }
-  return solverWithLiveElapsed(state.liveSolver);
+  return state.liveSolver;
 }
 
 function currentSolveStage(): SolveStageCode | null {
   if (state.terminalSolver?.completed) {
     return null;
   }
-  if (state.liveStatus) {
-    return state.liveStatus.stage;
-  }
-  if (state.solving) {
-    return SOLVE_STAGE.symbolicSetup;
-  }
-  return null;
+  return state.liveStatus?.stage ?? null;
 }
 
 function buildStatusSolverReport(status: SolveStatus): SolverReport {
-  const liveSolver = solverWithLiveElapsed(state.liveSolver);
+  const liveSolver = state.liveSolver;
   const nextSolver = status.solver;
   return {
     ...nextSolver,
@@ -1749,7 +1754,7 @@ function buildStatusSolverReport(status: SolveStatus): SolverReport {
 }
 
 function buildFailureSolverReport(message: string): SolverReport {
-  const liveSolver = solverWithLiveElapsed(state.liveSolver);
+  const liveSolver = state.liveSolver;
   return {
     completed: true,
     status_label: "Failed",
@@ -1869,16 +1874,17 @@ function renderLog(): void {
 }
 
 function renderCompileCacheStatus(): void {
-  const rows = [...state.compileCacheStatuses].sort((left, right) => {
-    const problemOrder = left.problem_name.localeCompare(right.problem_name);
-    if (problemOrder !== 0) {
-      return problemOrder;
-    }
-    return left.variant_label.localeCompare(right.variant_label);
-  });
+  const rows = [...state.compileCacheStatuses];
+  rows.sort((left, right) => {
+      const problemOrder = left.problem_name.localeCompare(right.problem_name);
+      if (problemOrder !== 0) {
+        return problemOrder;
+      }
+      return left.variant_label.localeCompare(right.variant_label);
+    });
 
   if (rows.length === 0) {
-    prewarmStatusEl.innerHTML = `<div class="placeholder">Compile cache status will appear here.</div>`;
+    prewarmStatusEl.innerHTML = `<div class="placeholder">Warm compile entries will appear here.</div>`;
     return;
   }
 
@@ -1897,17 +1903,9 @@ function renderCompileCacheStatus(): void {
   table.appendChild(header);
 
   for (const row of rows) {
-    const warming = isCompileWarmInProgress(row);
-    const statusLabel = warming
-      ? "warming"
-      : row.state === COMPILE_CACHE_STATE.ready
-        ? "ready"
-        : "cold";
+    const statusLabel = row.state === COMPILE_CACHE_STATE.warming ? "warming" : "ready";
     const rowEl = document.createElement("div");
-    rowEl.className = [
-      "compile-cache-row",
-      isCompileTarget(row) ? "compile-cache-row-current" : "",
-    ].filter(Boolean).join(" ");
+    rowEl.className = "compile-cache-row";
     rowEl.innerHTML = `
       <div class="compile-cache-problem">${escapeHtml(row.problem_name)}</div>
       <div class="compile-cache-variant">${escapeHtml(row.variant_label)}</div>
@@ -1972,7 +1970,7 @@ function normalizeCompileCacheStatus(status: WireCompileCacheStatus): CompileCac
     ...status,
     wire_problem_id: String(status.problem_id),
     problem_id: decodeWireEnum(PROBLEM_ID_FROM_WIRE, status.problem_id, PROBLEM_ID.optimalDistanceGlider),
-    state: decodeWireEnum(COMPILE_CACHE_STATE_FROM_WIRE, status.state, COMPILE_CACHE_STATE.cold),
+    state: decodeWireEnum(COMPILE_CACHE_STATE_FROM_WIRE, status.state, COMPILE_CACHE_STATE.ready),
     symbolic_setup_s: status.symbolic_setup_s ?? null,
     jit_s: status.jit_s ?? null,
   };
@@ -2172,52 +2170,6 @@ function isStructuralControl(control: ControlSpec): boolean {
   }
 }
 
-function currentPrewarmSignature(): string | null {
-  const spec = currentSpec();
-  if (!spec) {
-    return null;
-  }
-  return JSON.stringify({
-    problem: spec.wire_id,
-    method: currentSharedControlValue(CONTROL_SEMANTIC.transcriptionMethod, 0),
-    intervals: currentSharedControlValue(CONTROL_SEMANTIC.transcriptionIntervals, 0),
-    family: currentSharedControlValue(CONTROL_SEMANTIC.collocationFamily, 0),
-    degree: currentSharedControlValue(CONTROL_SEMANTIC.collocationDegree, 0),
-  });
-}
-
-function currentCompileVariantId(): string | null {
-  if (!currentSpec()) {
-    return null;
-  }
-  if (currentTranscriptionMethodValue() !== DIRECT_COLLOCATION_VALUE) {
-    return "multiple_shooting";
-  }
-  return currentSharedControlValue(CONTROL_SEMANTIC.collocationFamily, 0) === 1
-    ? "direct_collocation_radau_iia"
-    : "direct_collocation_legendre";
-}
-
-function isCompileTarget(status: CompileCacheStatus): boolean {
-  const spec = currentSpec();
-  const variantId = currentCompileVariantId();
-  return spec != null
-    && variantId != null
-    && status.problem_id === spec.id
-    && status.variant_id === variantId;
-}
-
-function isCompileWarmInProgress(status: CompileCacheStatus): boolean {
-  if (!isCompileTarget(status) || status.state === COMPILE_CACHE_STATE.ready) {
-    return false;
-  }
-  if (state.prewarmInFlightSignature !== null) {
-    return true;
-  }
-  const stage = currentSolveStage();
-  return stage === SOLVE_STAGE.symbolicSetup || stage === SOLVE_STAGE.jitCompilation;
-}
-
 function clearScheduledPrewarm(): void {
   if (state.prewarmTimer !== null) {
     window.clearTimeout(state.prewarmTimer);
@@ -2225,27 +2177,42 @@ function clearScheduledPrewarm(): void {
   }
 }
 
+function syncCompileStatusPolling(): void {
+  const shouldPoll = state.solving || state.prewarmInFlightCount > 0;
+  if (shouldPoll) {
+    if (state.compileStatusPollHandle === null) {
+      state.compileStatusPollHandle = window.setInterval(() => {
+        void refreshCompileCacheStatus();
+      }, COMPILE_STATUS_POLL_MS);
+    }
+    return;
+  }
+  if (state.compileStatusPollHandle !== null) {
+    window.clearInterval(state.compileStatusPollHandle);
+    state.compileStatusPollHandle = null;
+  }
+}
+
 async function refreshCompileCacheStatus(): Promise<void> {
   try {
-    state.compileCacheStatuses = await fetchJson("/api/prewarm_status", (value) => {
-      const entries = readJsonArray(value, "/api/prewarm_status");
-      return entries.map((entry, index) =>
-        normalizeCompileCacheStatus(
-          readWireCompileCacheStatus(entry, `/api/prewarm_status[${index}]`),
-        ));
-    });
+    const snapshot = await fetchJson("/api/prewarm_status", (value) =>
+      readWireCompileCacheSnapshot(value, "/api/prewarm_status"),
+    );
+    state.compileCacheStatuses = (snapshot.entries ?? []).map(normalizeCompileCacheStatus);
     renderCompileCacheStatus();
   } catch (error) {
     console.warn("compile cache status refresh failed", error);
   }
 }
 
-async function runPrewarm(expectedSignature: string): Promise<void> {
+async function runPrewarm(): Promise<void> {
   const spec = currentSpec();
-  if (!spec || currentPrewarmSignature() !== expectedSignature || state.solving) {
+  if (!spec || state.solving) {
     return;
   }
-  state.prewarmInFlightSignature = expectedSignature;
+  state.prewarmInFlightCount += 1;
+  syncCompileStatusPolling();
+  void refreshCompileCacheStatus();
   try {
     const response = await fetch(`/api/prewarm/${spec.wire_id}`, {
       method: "POST",
@@ -2256,25 +2223,12 @@ async function runPrewarm(expectedSignature: string): Promise<void> {
     if (!response.ok) {
       throw new Error(readOptionalErrorMessage(payload) ?? `Request failed with ${response.status}`);
     }
-    if (currentPrewarmSignature() === expectedSignature) {
-      state.lastPrewarmSignature = expectedSignature;
-    }
   } catch (error) {
     console.warn("prewarm failed", error);
   } finally {
-    if (state.prewarmInFlightSignature === expectedSignature) {
-      state.prewarmInFlightSignature = null;
-    }
+    state.prewarmInFlightCount = Math.max(0, state.prewarmInFlightCount - 1);
+    syncCompileStatusPolling();
     void refreshCompileCacheStatus();
-    renderCompileCacheStatus();
-    const latestSignature = currentPrewarmSignature();
-    if (
-      latestSignature !== null
-      && latestSignature !== state.lastPrewarmSignature
-      && latestSignature !== state.prewarmInFlightSignature
-    ) {
-      schedulePrewarm();
-    }
   }
 }
 
@@ -2282,18 +2236,13 @@ function schedulePrewarm(): void {
   if (state.solving) {
     return;
   }
-  const signature = currentPrewarmSignature();
-  if (
-    signature === null
-    || signature === state.lastPrewarmSignature
-    || signature === state.prewarmInFlightSignature
-  ) {
+  if (!currentSpec()) {
     return;
   }
   clearScheduledPrewarm();
   state.prewarmTimer = window.setTimeout(() => {
     state.prewarmTimer = null;
-    void runPrewarm(signature);
+    void runPrewarm();
   }, PREWARM_DELAY_MS);
 }
 
@@ -2809,7 +2758,6 @@ function resetSolverPanel(): void {
   state.latestProgress = null;
   state.liveStatus = null;
   state.liveSolver = null;
-  state.solveStartedAtMs = null;
   state.terminalSolver = null;
   state.pendingIterationEvent = null;
   state.iterationFlushScheduled = false;
@@ -3731,7 +3679,6 @@ function applySolveFailure(message: string): void {
   state.liveStatus = null;
   state.terminalSolver = buildFailureSolverReport(message);
   state.liveSolver = null;
-  state.solveStartedAtMs = null;
   renderSolverSummary();
   renderMetrics();
   renderCompileCacheStatus();
@@ -4072,22 +4019,18 @@ function handleSolveEvent(event: SolveEvent): void {
     case STREAM_EVENT_KIND.status:
       {
         const previousStage = state.liveStatus?.stage ?? null;
-      state.liveStatus = event.status;
-      if (event.status.stage === SOLVE_STAGE.solving && state.solveStartedAtMs == null) {
-        state.solveStartedAtMs = performance.now();
-      }
-      if (event.status.stage !== SOLVE_STAGE.solving) {
-        state.solveStartedAtMs = null;
-      }
-      state.liveSolver = buildStatusSolverReport(event.status);
-      renderSolverSummary();
-      renderCompileCacheStatus();
-      if (previousStage !== SOLVE_STAGE.solving && event.status.stage === SOLVE_STAGE.solving) {
-        void refreshCompileCacheStatus();
-      }
-      renderMetrics();
-      setStatusDisplay(statusDisplayForSolveStatus(event.status, state.latestProgress?.iteration ?? null));
-      break;
+        state.liveStatus = event.status;
+        state.liveSolver = buildStatusSolverReport(event.status);
+        renderSolverSummary();
+        renderCompileCacheStatus();
+        if (previousStage !== SOLVE_STAGE.solving && event.status.stage === SOLVE_STAGE.solving) {
+          void refreshCompileCacheStatus();
+        }
+        renderMetrics();
+        setStatusDisplay(
+          statusDisplayForSolveStatus(event.status, state.latestProgress?.iteration ?? null),
+        );
+        break;
       }
     case STREAM_EVENT_KIND.log:
       appendLogLine(event.line, event.level ?? LOG_LEVEL.console);
@@ -4101,7 +4044,6 @@ function handleSolveEvent(event: SolveEvent): void {
       state.liveStatus = null;
       state.terminalSolver = mergeSolverReport(event.artifact.solver, state.liveSolver);
       state.liveSolver = null;
-      state.solveStartedAtMs = null;
       state.artifact = {
         ...event.artifact,
         solver: state.terminalSolver,
@@ -4160,6 +4102,7 @@ async function solveCurrentProblem(event?: Event): Promise<void> {
 
   try {
     state.solving = true;
+    syncCompileStatusPolling();
     clearScheduledPrewarm();
     solveButton.disabled = true;
     solveButton.setAttribute("aria-busy", "true");
@@ -4168,28 +4111,11 @@ async function solveCurrentProblem(event?: Event): Promise<void> {
     state.animationIndex = 0;
     state.sceneView = null;
     resetSolverPanel();
-    state.liveStatus = {
-      stage: SOLVE_STAGE.symbolicSetup,
-      solver_method: null,
-      solver: {
-        completed: false,
-        status_label: "Setting up symbolic model...",
-        status_kind: SOLVER_STATUS_KIND.info,
-        iterations: null,
-        symbolic_setup_s: null,
-        jit_s: null,
-        solve_s: null,
-        compile_cached: false,
-        phase_details: emptySolverPhaseDetails(),
-      },
-    };
-    state.liveSolver = state.liveStatus.solver;
-    state.solveStartedAtMs = null;
     renderMetrics();
     renderCompileCacheStatus();
     renderScene();
     renderCharts();
-    setStatusDisplay(statusDisplayForSolveStatus(state.liveStatus));
+    setStatusDisplay(pendingSolveRequestStatusDisplay());
 
     const response = await fetch(`/api/solve_stream/${spec.wire_id}`, {
       method: "POST",
@@ -4211,6 +4137,7 @@ async function solveCurrentProblem(event?: Event): Promise<void> {
     );
   } finally {
     state.solving = false;
+    syncCompileStatusPolling();
     solveButton.disabled = false;
     solveButton.setAttribute("aria-busy", "false");
     renderCompileCacheStatus();
