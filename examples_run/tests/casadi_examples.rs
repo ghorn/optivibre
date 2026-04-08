@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use anyhow::{Result as AnyResult, bail};
 use approx::assert_abs_diff_eq;
-use sx_codegen::{InstructionKind, LoweredFunction, ValueRef, lower_function};
+use sx_codegen::{Instruction, LoweredFunction, LoweredSubfunction, ValueRef, lower_function};
 use sx_codegen_llvm::{
     AotWrapperOptions, CompiledJitFunction, JitOptimizationLevel, LlvmOptimizationLevel,
     LlvmTarget, emit_object_bytes_lowered, generate_aot_wrapper_module,
@@ -163,23 +163,81 @@ fn lowered_eval_function(
         .map(|(slot, dense)| dense_value_to_slot(&slot.ccs, dense))
         .collect::<AnyResult<Vec<_>>>()?;
 
-    let mut temps = vec![0.0; lowered.instructions.len()];
-    for instruction in &lowered.instructions {
-        let value_ref = |value: ValueRef, temps: &[f64]| -> f64 {
+    fn eval_callable(
+        instructions: &[Instruction],
+        inputs: &[Vec<f64>],
+        subfunctions: &[LoweredSubfunction],
+    ) -> Vec<f64> {
+        let mut temps = vec![
+            0.0;
+            instructions
+                .iter()
+                .flat_map(Instruction::output_temps)
+                .copied()
+                .max()
+                .map_or(0, |max_temp| max_temp + 1)
+        ];
+        let value_ref = |value: ValueRef, temps: &[f64], inputs: &[Vec<f64>]| -> f64 {
             match value {
                 ValueRef::Const(value) => value,
                 ValueRef::Temp(temp) => temps[temp],
-                ValueRef::Input { slot, offset } => projected_inputs[slot][offset],
+                ValueRef::Input { slot, offset } => inputs[slot][offset],
             }
         };
 
-        temps[instruction.temp] = match instruction.kind {
-            InstructionKind::Unary { op, input } => eval_unary(op, value_ref(input, &temps)),
-            InstructionKind::Binary { op, lhs, rhs } => {
-                eval_binary(op, value_ref(lhs, &temps), value_ref(rhs, &temps))
+        for instruction in instructions {
+            match instruction {
+                Instruction::Unary { temp, op, input } => {
+                    temps[*temp] = eval_unary(*op, value_ref(*input, &temps, inputs));
+                }
+                Instruction::Binary { temp, op, lhs, rhs } => {
+                    temps[*temp] = eval_binary(
+                        *op,
+                        value_ref(*lhs, &temps, inputs),
+                        value_ref(*rhs, &temps, inputs),
+                    );
+                }
+                Instruction::Call {
+                    temps: output_temps,
+                    callee,
+                    inputs: call_inputs,
+                } => {
+                    let callee = &subfunctions[*callee];
+                    let mut callee_inputs = Vec::with_capacity(callee.inputs.len());
+                    let mut linear = 0usize;
+                    for slot in &callee.inputs {
+                        let nnz = slot.ccs.nnz();
+                        callee_inputs.push(
+                            call_inputs[linear..linear + nnz]
+                                .iter()
+                                .map(|value| value_ref(*value, &temps, inputs))
+                                .collect::<Vec<_>>(),
+                        );
+                        linear += nnz;
+                    }
+                    let callee_temps =
+                        eval_callable(&callee.instructions, &callee_inputs, subfunctions);
+                    let flattened_outputs = callee
+                        .output_values
+                        .iter()
+                        .flat_map(|values| {
+                            values.iter().map(|value| match *value {
+                                ValueRef::Const(value) => value,
+                                ValueRef::Temp(temp) => callee_temps[temp],
+                                ValueRef::Input { slot, offset } => callee_inputs[slot][offset],
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    for (temp, value) in output_temps.iter().copied().zip(flattened_outputs) {
+                        temps[temp] = value;
+                    }
+                }
             }
-        };
+        }
+        temps
     }
+
+    let temps = eval_callable(&lowered.instructions, &projected_inputs, &lowered.subfunctions);
 
     Ok(lowered
         .outputs
@@ -210,6 +268,13 @@ fn node_count(expr: SX) -> usize {
             NodeView::Binary { lhs, rhs, .. } => {
                 visit(lhs, seen);
                 visit(rhs, seen);
+            }
+            NodeView::Call { inputs, .. } => {
+                for input in inputs {
+                    for &value in input.nonzeros() {
+                        visit(value, seen);
+                    }
+                }
             }
         }
     }

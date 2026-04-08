@@ -519,7 +519,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
       return [
         `problem: ${{record.id}}`,
         `family: ${{record.descriptor.family}} / ${{record.descriptor.variant}}`,
-        `solver: ${{solverLabel(record.solver)}} / ${{record.options.jit_opt_level.toUpperCase()}}`,
+        `solver: ${{solverLabel(record.solver)}} / ${{record.options.jit_opt_level.toUpperCase()}} / ${{record.options.call_policy}}`,
         `status: ${{statusLabel(record.status)}}`,
         `expected: ${{record.expected}}`,
         `vars / dof: ${{record.descriptor.num_vars}} / ${{record.descriptor.dof}}`,
@@ -740,7 +740,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
               ${{rows.map((record) => `
                 <tr>
                   <td class="mono">${{problemCell(record)}}</td>
-                  <td class="solver-${{record.solver}}">${{solverLabel(record.solver)}} / ${{record.options.jit_opt_level.toUpperCase()}}</td>
+                  <td class="solver-${{record.solver}}">${{solverLabel(record.solver)}} / ${{record.options.jit_opt_level.toUpperCase()}} / ${{record.options.call_policy}}</td>
                   <td><span class="pill ${{statusClass(record.status)}}">${{htmlEscape(statusLabel(record.status))}}</span></td>
                   <td>${{intText(record.metrics.iterations)}}</td>
                   <td>${{htmlEscape(elasticText(record))}}</td>
@@ -870,7 +870,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
                   <td class="mono">${{problemCell(record)}}</td>
                   <td class="mono">${{htmlEscape(record.descriptor.family)}}</td>
                   <td class="solver-${{record.solver}}">${{solverLabel(record.solver)}}</td>
-                  <td>${{record.options.jit_opt_level.toUpperCase()}}</td>
+                  <td>${{record.options.jit_opt_level.toUpperCase()}} / ${{record.options.call_policy}}</td>
                   <td><span class="pill ${{statusClass(record.status)}}">${{htmlEscape(statusLabel(record.status))}}</span></td>
                   <td>${{htmlEscape(record.expected)}}</td>
                   <td>${{record.descriptor.num_vars}}</td>

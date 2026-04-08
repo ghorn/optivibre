@@ -16,8 +16,8 @@ use std::time::Instant;
 use optimization::{
     ClarabelSqpError, ClarabelSqpOptions, ClarabelSqpSummary, CompiledNlpProblem,
     InteriorPointIterationSnapshot, InteriorPointOptions, InteriorPointSolveError,
-    InteriorPointSummary, LlvmOptimizationLevel, SqpIterationSnapshot, SymbolicNlpOutputs,
-    TypedCompiledJitNlp, TypedRuntimeNlpBounds, Vectorize,
+    InteriorPointSummary, SqpIterationSnapshot, SymbolicNlpOutputs, TypedCompiledJitNlp,
+    TypedRuntimeNlpBounds, Vectorize,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptOptions, IpoptRawStatus, IpoptSolveError, IpoptSummary};
@@ -25,8 +25,9 @@ use sx_core::SX;
 
 use crate::manifest::KnownStatus;
 use crate::model::{
-    JitOptLevel, ProblemCase, ProblemDescriptor, ProblemRunOptions, ProblemRunRecord, RunStatus,
-    SolverKind, SolverMetrics, SolverTimingBreakdown, ValidationOutcome, ValidationTier,
+    CompileReportSummary, CompileStatsSummary, ProblemCase, ProblemDescriptor, ProblemRunOptions,
+    ProblemRunRecord, RunStatus, SetupProfileBreakdown, SolverKind, SolverMetrics,
+    SolverTimingBreakdown, ValidationOutcome, ValidationTier,
 };
 
 const STRICT_TERMINATION_TOL: f64 = 1e-9;
@@ -126,7 +127,7 @@ where
     F: FnOnce(&X, &P) -> SymbolicNlpOutputs<E, I>,
 {
     Ok(optimization::symbolic_nlp::<X, P, E, I, _>(name, model)?
-        .compile_jit_with_opt_level(to_llvm_opt_level(options.jit_opt_level))?)
+        .compile_jit_with_options(options.compile_options())?)
 }
 
 pub(crate) fn make_typed_case<X, P, E, I, Build, Validate>(
@@ -141,6 +142,7 @@ where
     I: Vectorize<SX, Rebind<SX> = I>,
     <X as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
     <P as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
+    <E as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
     <I as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
     Build: Fn(ProblemRunOptions) -> anyhow::Result<TypedProblemData<X, P, E, I>>
         + Send
@@ -185,6 +187,7 @@ where
     I: Vectorize<SX, Rebind<SX> = I>,
     <X as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
     <P as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
+    <E as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
     <I as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
     Build: Fn(ProblemRunOptions) -> anyhow::Result<TypedProblemData<X, P, E, I>>,
     Validate: Fn(&ProblemRunRecord) -> ValidationOutcome,
@@ -238,6 +241,7 @@ where
             },
             solver_thresholds: None,
             error: Some(err.to_string()),
+            compile_report: None,
             console_output: None,
             console_output_path: None,
         },
@@ -263,10 +267,12 @@ where
     I: Vectorize<SX, Rebind<SX> = I>,
     <X as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
     <P as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
+    <E as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
     <I as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
     Validate: Fn(&ProblemRunRecord) -> ValidationOutcome,
 {
     let backend_timing = data.compiled.backend_timing_metadata();
+    let compile_report = summarize_backend_compile_report(Some(data.compiled.backend_compile_report()));
     let bound_problem = match data.compiled.bind_runtime_bounds(&data.bounds) {
         Ok(problem) => problem,
         Err(err) => {
@@ -306,6 +312,7 @@ where
                 },
                 solver_thresholds: None,
                 error: Some(err.to_string()),
+                compile_report: compile_report.clone(),
                 console_output: None,
                 console_output_path: None,
             };
@@ -357,6 +364,7 @@ where
                         validation: ValidationOutcome::default(),
                         solver_thresholds: Some(solver_thresholds.clone()),
                         error: None,
+                        compile_report: compile_report.clone(),
                         console_output: None,
                         console_output_path: None,
                     };
@@ -398,6 +406,7 @@ where
                         },
                         solver_thresholds: Some(solver_thresholds),
                         error: Some(err.to_string()),
+                        compile_report: compile_report.clone(),
                         console_output: None,
                         console_output_path: None,
                     };
@@ -450,6 +459,7 @@ where
                         validation: ValidationOutcome::default(),
                         solver_thresholds: Some(solver_thresholds.clone()),
                         error: None,
+                        compile_report: compile_report.clone(),
                         console_output: None,
                         console_output_path: None,
                     };
@@ -491,6 +501,7 @@ where
                         },
                         solver_thresholds: Some(solver_thresholds),
                         error: Some(err.to_string()),
+                        compile_report: compile_report.clone(),
                         console_output: None,
                         console_output_path: None,
                     };
@@ -546,6 +557,7 @@ where
                         validation: ValidationOutcome::default(),
                         solver_thresholds: Some(solver_thresholds.clone()),
                         error: None,
+                        compile_report: compile_report.clone(),
                         console_output: None,
                         console_output_path: None,
                     };
@@ -583,6 +595,7 @@ where
                         },
                         solver_thresholds: Some(solver_thresholds),
                         error: Some(err.to_string()),
+                        compile_report: compile_report.clone(),
                         console_output: None,
                         console_output_path: None,
                     };
@@ -593,15 +606,6 @@ where
                 }
             }
         }
-    }
-}
-
-const fn to_llvm_opt_level(jit_opt_level: JitOptLevel) -> LlvmOptimizationLevel {
-    match jit_opt_level {
-        JitOptLevel::O0 => LlvmOptimizationLevel::O0,
-        JitOptLevel::O2 => LlvmOptimizationLevel::O2,
-        JitOptLevel::O3 => LlvmOptimizationLevel::O3,
-        JitOptLevel::Os => LlvmOptimizationLevel::Os,
     }
 }
 
@@ -619,6 +623,47 @@ fn timing_breakdown(
         solve_time,
         total_wall_time,
     }
+}
+
+fn summarize_backend_compile_report(
+    report: Option<&optimization::BackendCompileReport>,
+) -> Option<CompileReportSummary> {
+    report.map(|report| CompileReportSummary {
+        setup: SetupProfileBreakdown {
+            symbolic_construction_s: duration_seconds(report.setup_profile.symbolic_construction),
+            objective_gradient_s: duration_seconds(report.setup_profile.objective_gradient),
+            equality_jacobian_s: duration_seconds(report.setup_profile.equality_jacobian),
+            inequality_jacobian_s: duration_seconds(report.setup_profile.inequality_jacobian),
+            lagrangian_assembly_s: duration_seconds(report.setup_profile.lagrangian_assembly),
+            hessian_generation_s: duration_seconds(report.setup_profile.hessian_generation),
+            lowering_s: duration_seconds(report.setup_profile.lowering),
+            llvm_jit_s: duration_seconds(report.setup_profile.llvm_jit),
+        },
+        stats: CompileStatsSummary {
+            symbolic_function_count: report.stats.symbolic_function_count,
+            call_site_count: report.stats.call_site_count,
+            max_call_depth: report.stats.max_call_depth,
+            inline_at_call_policy_count: report.stats.inline_at_call_policy_count,
+            inline_at_lowering_policy_count: report.stats.inline_at_lowering_policy_count,
+            inline_in_llvm_policy_count: report.stats.inline_in_llvm_policy_count,
+            no_inline_llvm_policy_count: report.stats.no_inline_llvm_policy_count,
+            overrides_applied: report.stats.overrides_applied,
+            overrides_ignored: report.stats.overrides_ignored,
+            inlines_at_call: report.stats.inlines_at_call,
+            inlines_at_lowering: report.stats.inlines_at_lowering,
+            llvm_subfunctions_emitted: report.stats.llvm_subfunctions_emitted,
+            llvm_call_instructions_emitted: report.stats.llvm_call_instructions_emitted,
+        },
+        warnings: report
+            .warnings
+            .iter()
+            .map(|warning| warning.message.clone())
+            .collect(),
+    })
+}
+
+fn duration_seconds(duration: Option<std::time::Duration>) -> Option<f64> {
+    duration.map(|duration| duration.as_secs_f64())
 }
 
 fn format_sqp_thresholds(options: &ClarabelSqpOptions) -> String {
@@ -1186,6 +1231,7 @@ fn render_nlip_transcript(
             write_repeated_header(&mut out, &header);
         }
         let phase = match snapshot.phase {
+            optimization::InteriorPointIterationPhase::Initial => "start",
             optimization::InteriorPointIterationPhase::AcceptedStep => "accept",
             optimization::InteriorPointIterationPhase::Converged => "final",
         };

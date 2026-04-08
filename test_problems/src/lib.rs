@@ -13,8 +13,9 @@ pub use manifest::{
     manifest_entries, manifest_entry, manifest_entry_by_id, slow_manifest_entry,
 };
 pub use model::{
-    JitOptLevel, ProblemCase, ProblemDescriptor, ProblemRunOptions, ProblemRunRecord, RunArtifacts,
-    RunStatus, SolverKind, SolverMetrics, SolverTimingBreakdown, ValidationOutcome,
+    CallPolicyMode, JitOptLevel, ProblemCase, ProblemDescriptor, ProblemRunOptions,
+    ProblemRunRecord, RunArtifacts, RunStatus, SolverKind, SolverMetrics, SolverTimingBreakdown,
+    ValidationOutcome,
 };
 pub use registry::registry;
 pub use report::{

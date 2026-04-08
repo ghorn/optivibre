@@ -1,7 +1,8 @@
 use approx::assert_abs_diff_eq;
 use optimization::{
-    ClarabelSqpOptions, InteriorPointOptions, SymbolicNlpOutputs, TypedRuntimeNlpBounds, flat_view,
-    symbolic_nlp,
+    CallPolicy, CallPolicyConfig, ClarabelSqpOptions, FunctionCompileOptions,
+    InteriorPointOptions, LlvmOptimizationLevel, SymbolicNlpOutputs, TypedRuntimeNlpBounds,
+    flat_view, symbolic_nlp,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptOptions, IpoptRawStatus};
@@ -273,6 +274,38 @@ fn typed_symbolic_compile_callback_reports_full_pre_jit_symbolic_timing() {
     assert_eq!(callback_metadata.stats.equality_count, 0);
     assert_eq!(callback_metadata.stats.inequality_count, 0);
     assert!(callback_metadata.stats.hessian_nnz > 0);
+}
+
+#[test]
+fn typed_symbolic_compile_exposes_backend_compile_report() {
+    let symbolic = symbolic_nlp::<Pair<SX>, (), SX, SX, _>("timed_compile_report", |x, _| {
+        SymbolicNlpOutputs {
+            objective: (1.0 - x.x).sqr() + 100.0 * (x.y - x.x.sqr()).sqr(),
+            equalities: x.x + x.y,
+            inequalities: x.x.sqr() + x.y.sqr(),
+        }
+    })
+    .expect("symbolic NLP should build");
+    let compiled = symbolic
+        .compile_jit_with_options(FunctionCompileOptions {
+            opt_level: LlvmOptimizationLevel::O0,
+            call_policy: CallPolicyConfig {
+                default_policy: CallPolicy::InlineAtLowering,
+                respect_function_overrides: true,
+            },
+        })
+        .expect("JIT compile should succeed");
+    let report = compiled.backend_compile_report();
+
+    assert_eq!(report.timing, compiled.backend_timing_metadata());
+    assert!(report.setup_profile.symbolic_construction.is_some());
+    assert!(report.setup_profile.objective_gradient.is_some());
+    assert!(report.setup_profile.equality_jacobian.is_some());
+    assert!(report.setup_profile.inequality_jacobian.is_some());
+    assert!(report.setup_profile.lagrangian_assembly.is_some());
+    assert!(report.setup_profile.hessian_generation.is_some());
+    assert!(report.setup_profile.lowering.is_some());
+    assert!(report.setup_profile.llvm_jit.is_some());
 }
 
 #[cfg(feature = "ipopt")]

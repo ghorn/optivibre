@@ -19,10 +19,10 @@ use optimal_control::{
 #[cfg(feature = "ipopt")]
 use optimal_control::{DirectCollocationIpoptSnapshot, MultipleShootingIpoptSnapshot};
 use optimization::{
-    BackendTimingMetadata, ClarabelSqpOptions, ClarabelSqpSummary, ConstraintSatisfaction,
-    InteriorPointIterationSnapshot, InteriorPointOptions, InteriorPointSummary,
-    LlvmOptimizationLevel, NlpCompileStats, SqpIterationEvent, SqpIterationPhase,
-    SqpIterationSnapshot, Vectorize,
+    BackendCompileReport, BackendTimingMetadata, ClarabelSqpOptions, ClarabelSqpSummary,
+    ConstraintSatisfaction, InteriorPointIterationSnapshot, InteriorPointOptions,
+    InteriorPointSummary, LlvmOptimizationLevel, NlpCompileStats, SqpIterationEvent,
+    SqpIterationPhase, SqpIterationSnapshot, Vectorize,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptOptions, IpoptRawStatus, IpoptSummary};
@@ -319,6 +319,8 @@ pub struct SolveArtifact {
     pub title: String,
     pub summary: Vec<Metric>,
     pub solver: SolverReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compile_report: Option<CompileReportSummary>,
     #[serde(default)]
     pub constraint_panels: ConstraintPanels,
     pub charts: Vec<Chart>,
@@ -339,6 +341,7 @@ impl SolveArtifact {
             title: title.into(),
             summary,
             solver,
+            compile_report: None,
             constraint_panels: ConstraintPanels::default(),
             charts,
             scene,
@@ -649,6 +652,35 @@ pub struct SolverReport {
     pub phase_details: SolverPhaseDetails,
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct CompileReportSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbolic_construction_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub objective_gradient_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub equality_jacobian_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inequality_jacobian_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lagrangian_assembly_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hessian_generation_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lowering_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llvm_jit_s: Option<f64>,
+    pub symbolic_function_count: usize,
+    pub call_site_count: usize,
+    pub max_call_depth: usize,
+    pub inlines_at_call: usize,
+    pub inlines_at_lowering: usize,
+    pub llvm_subfunctions_emitted: usize,
+    pub llvm_call_instructions_emitted: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
 impl SolverReport {
     pub fn placeholder() -> Self {
         Self {
@@ -709,6 +741,31 @@ impl SolverReport {
     pub fn with_symbolic_phase_details(mut self, details: Vec<SolverPhaseDetail>) -> Self {
         self.phase_details.symbolic_setup = details;
         self
+    }
+}
+
+pub fn summarize_backend_compile_report(report: &BackendCompileReport) -> CompileReportSummary {
+    CompileReportSummary {
+        symbolic_construction_s: duration_seconds(report.setup_profile.symbolic_construction),
+        objective_gradient_s: duration_seconds(report.setup_profile.objective_gradient),
+        equality_jacobian_s: duration_seconds(report.setup_profile.equality_jacobian),
+        inequality_jacobian_s: duration_seconds(report.setup_profile.inequality_jacobian),
+        lagrangian_assembly_s: duration_seconds(report.setup_profile.lagrangian_assembly),
+        hessian_generation_s: duration_seconds(report.setup_profile.hessian_generation),
+        lowering_s: duration_seconds(report.setup_profile.lowering),
+        llvm_jit_s: duration_seconds(report.setup_profile.llvm_jit),
+        symbolic_function_count: report.stats.symbolic_function_count,
+        call_site_count: report.stats.call_site_count,
+        max_call_depth: report.stats.max_call_depth,
+        inlines_at_call: report.stats.inlines_at_call,
+        inlines_at_lowering: report.stats.inlines_at_lowering,
+        llvm_subfunctions_emitted: report.stats.llvm_subfunctions_emitted,
+        llvm_call_instructions_emitted: report.stats.llvm_call_instructions_emitted,
+        warnings: report
+            .warnings
+            .iter()
+            .map(|warning| warning.message.clone())
+            .collect(),
     }
 }
 
@@ -778,6 +835,7 @@ pub struct CompileProgressInfo {
     pub timing: BackendTimingMetadata,
     pub compile_cached: bool,
     pub phase_details: SolverPhaseDetails,
+    pub compile_report: Option<CompileReportSummary>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1064,6 +1122,7 @@ pub fn compile_progress_info(
     stats: NlpCompileStats,
     helper_kernel_count: usize,
     helper_stats: OcpHelperCompileStats,
+    compile_report: Option<CompileReportSummary>,
 ) -> CompileProgressInfo {
     let mut jit = jit_phase_details(stats, helper_kernel_count);
     jit.extend(helper_compile_phase_details(helper_stats));
@@ -1075,6 +1134,7 @@ pub fn compile_progress_info(
             jit,
             solve: Vec::new(),
         },
+        compile_report,
     }
 }
 
@@ -1189,7 +1249,7 @@ where
     pub fn compile_with_progress<Compiled, Compile>(
         &mut self,
         compile: Compile,
-    ) -> Result<(Compiled, SolverReport)>
+    ) -> Result<(Compiled, SolverReport, Option<CompileReportSummary>)>
     where
         Compile: FnOnce(
             &mut dyn FnMut(CompileProgressUpdate),
@@ -1200,7 +1260,7 @@ where
             .with_backend_timing(progress.timing)
             .with_compile_cached(progress.compile_cached)
             .with_phase_details(progress.phase_details);
-        Ok((compiled, running_solver))
+        Ok((compiled, running_solver, progress.compile_report))
     }
 
     pub fn prewarm_with_progress<Compiled, Compile>(&mut self, compile: Compile) -> Result<()>
@@ -4006,7 +4066,7 @@ mod tests {
             ..symbolic_timing
         };
         let mut events = Vec::new();
-        let (compiled, running_solver) = {
+        let (compiled, running_solver, compile_report) = {
             let mut reporter =
                 SolveLifecycleReporter::new(|event| events.push(event), SolverMethod::Sqp);
             let result = reporter
@@ -4030,6 +4090,7 @@ mod tests {
                                 jit: vec![phase_detail("NLP Kernels", "3")],
                                 solve: Vec::new(),
                             },
+                            compile_report: None,
                         },
                     ))
                 })
@@ -4039,6 +4100,7 @@ mod tests {
         };
 
         assert_eq!(compiled, "compiled");
+        assert!(compile_report.is_none());
         assert_eq!(events.len(), 2, "expected symbolic and timed jit statuses");
 
         match &events[0] {
@@ -4110,6 +4172,7 @@ mod tests {
                                 jit: vec![phase_detail("NLP Kernels", "3")],
                                 solve: Vec::new(),
                             },
+                            compile_report: None,
                         },
                     ))
                 })

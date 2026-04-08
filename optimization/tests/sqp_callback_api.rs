@@ -2,7 +2,7 @@ use approx::assert_abs_diff_eq;
 use optimization::{
     CCS, ClarabelSqpError, ClarabelSqpOptions, CompiledNlpProblem, NonFiniteCallbackStage,
     NonFiniteInputStage, ParameterMatrix, SqpConeKind, SqpFinalStateKind, SqpIterationEvent,
-    SqpIterationPhase, SqpQpFailureDiagnostics, SqpQpRawStatus, SqpTermination, SymbolicNlpOutputs,
+    SqpIterationPhase, SqpQpRawStatus, SqpTermination, SymbolicNlpOutputs,
     TypedRuntimeNlpBounds, solve_nlp_sqp, solve_nlp_sqp_with_callback, symbolic_nlp,
 };
 use rstest::rstest;

@@ -5,19 +5,22 @@ use std::path::Path;
 use std::ptr;
 use std::slice;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use llvm_sys::LLVMRealPredicate::{LLVMRealOGT, LLVMRealOLT};
 use llvm_sys::analysis::{LLVMVerifierFailureAction, LLVMVerifyModule};
 use llvm_sys::core::{
-    LLVMAddFunction, LLVMAppendBasicBlockInContext, LLVMBuildCall2, LLVMBuildFAdd, LLVMBuildFCmp,
-    LLVMBuildFDiv, LLVMBuildFMul, LLVMBuildFSub, LLVMBuildInBoundsGEP2, LLVMBuildLoad2,
-    LLVMBuildRetVoid, LLVMBuildSelect, LLVMBuildStore, LLVMConstInt, LLVMConstReal,
-    LLVMContextCreate, LLVMContextDispose, LLVMCreateBuilderInContext, LLVMDisposeBuilder,
+    LLVMAddAttributeAtIndex, LLVMAddFunction, LLVMAppendBasicBlockInContext, LLVMBuildAlloca,
+    LLVMBuildCall2, LLVMBuildFAdd, LLVMBuildFCmp, LLVMBuildFDiv, LLVMBuildFMul, LLVMBuildFSub,
+    LLVMBuildInBoundsGEP2, LLVMBuildLoad2, LLVMBuildRetVoid, LLVMBuildSelect, LLVMBuildStore,
+    LLVMConstInt, LLVMConstReal, LLVMContextCreate, LLVMContextDispose,
+    LLVMCreateBuilderInContext, LLVMCreateEnumAttribute, LLVMDisposeBuilder,
     LLVMDisposeMemoryBuffer, LLVMDisposeMessage, LLVMDoubleTypeInContext, LLVMFunctionType,
-    LLVMGetBufferSize, LLVMGetBufferStart, LLVMGetNamedFunction, LLVMGetParam,
-    LLVMGlobalGetValueType, LLVMInt64TypeInContext, LLVMModuleCreateWithNameInContext,
-    LLVMPointerType, LLVMPositionBuilderAtEnd, LLVMSetTarget, LLVMVoidTypeInContext,
+    LLVMGetBufferSize, LLVMGetBufferStart, LLVMGetEnumAttributeKindForName, LLVMGetNamedFunction,
+    LLVMGetParam, LLVMGlobalGetValueType, LLVMInt64TypeInContext,
+    LLVMModuleCreateWithNameInContext, LLVMPointerType, LLVMPositionBuilderAtEnd, LLVMSetTarget,
+    LLVMSetLinkage, LLVMVoidTypeInContext,
 };
 use llvm_sys::error::{LLVMDisposeErrorMessage, LLVMErrorRef, LLVMGetErrorMessage};
 use llvm_sys::orc2::LLVMOrcExecutorAddress;
@@ -31,6 +34,7 @@ use llvm_sys::orc2::{
 use llvm_sys::prelude::{
     LLVMBuilderRef, LLVMContextRef, LLVMMemoryBufferRef, LLVMModuleRef, LLVMTypeRef, LLVMValueRef,
 };
+use llvm_sys::{LLVMAttributeFunctionIndex, LLVMLinkage};
 use llvm_sys::target::{
     LLVM_InitializeNativeAsmPrinter, LLVM_InitializeNativeTarget, LLVMCreateTargetData,
     LLVMDisposeTargetData, LLVMSetModuleDataLayout,
@@ -47,10 +51,12 @@ use llvm_sys::transforms::pass_builder::{
     LLVMCreatePassBuilderOptions, LLVMDisposePassBuilderOptions, LLVMRunPasses,
 };
 use sx_codegen::{
-    InstructionKind, LoweredFunction, ValueRef, format_rust_source, lower_function, sanitize_ident,
-    to_pascal_case,
+    Instruction, LoweredFunction, LoweredSubfunction, ValueRef, format_rust_source,
+    lower_function_with_policies, sanitize_ident, to_pascal_case,
 };
-use sx_core::{BinaryOp, SXFunction, UnaryOp};
+use sx_core::{
+    BinaryOp, CallPolicy, CallPolicyConfig, CompileStats, CompileWarning, SXFunction, UnaryOp,
+};
 
 type RawKernelFn = unsafe extern "C" fn(*const *const f64, *const *mut f64);
 
@@ -118,9 +124,45 @@ pub struct AotWrapperOptions {
     pub emit_doc_comments: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FunctionCompileOptions {
+    pub opt_level: LlvmOptimizationLevel,
+    pub call_policy: CallPolicyConfig,
+}
+
+impl FunctionCompileOptions {
+    pub const fn new(opt_level: LlvmOptimizationLevel, call_policy: CallPolicyConfig) -> Self {
+        Self {
+            opt_level,
+            call_policy,
+        }
+    }
+}
+
+impl From<LlvmOptimizationLevel> for FunctionCompileOptions {
+    fn from(opt_level: LlvmOptimizationLevel) -> Self {
+        Self {
+            opt_level,
+            call_policy: CallPolicyConfig {
+                default_policy: CallPolicy::InlineAtLowering,
+                respect_function_overrides: true,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FunctionCompileReport {
+    pub lowering_time: Duration,
+    pub llvm_time: Duration,
+    pub stats: CompileStats,
+    pub warnings: Vec<CompileWarning>,
+}
+
 #[derive(Debug)]
 pub struct CompiledJitFunction {
     lowered: LoweredFunction,
+    compile_report: FunctionCompileReport,
     lljit: llvm_sys::orc2::lljit::LLVMOrcLLJITRef,
     function: RawKernelFn,
 }
@@ -144,21 +186,41 @@ impl CompiledJitFunction {
         function: &SXFunction,
         opt_level: LlvmOptimizationLevel,
     ) -> Result<Self> {
-        Self::compile_lowered(&lower_function(function)?, opt_level)
+        Self::compile_function_with_options(function, FunctionCompileOptions::from(opt_level))
+    }
+
+    pub fn compile_function_with_options(
+        function: &SXFunction,
+        options: FunctionCompileOptions,
+    ) -> Result<Self> {
+        let lowering_started = Instant::now();
+        let lowered = lower_function_with_policies(function, options.call_policy)?;
+        let lowering_time = lowering_started.elapsed();
+        Self::compile_lowered_with_report(&lowered, options.opt_level, lowering_time)
     }
 
     pub fn compile_lowered(
         lowered: &LoweredFunction,
         opt_level: LlvmOptimizationLevel,
     ) -> Result<Self> {
+        Self::compile_lowered_with_report(lowered, opt_level, Duration::ZERO)
+    }
+
+    fn compile_lowered_with_report(
+        lowered: &LoweredFunction,
+        opt_level: LlvmOptimizationLevel,
+        lowering_time: Duration,
+    ) -> Result<Self> {
         ensure_native_llvm_initialized()?;
 
+        let llvm_started = Instant::now();
         let object = build_object_buffer(
             lowered,
             opt_level,
             &LlvmTarget::Native,
             LlvmCompileMode::Jit,
         )?;
+        let llvm_time = llvm_started.elapsed();
         let lljit = create_lljit()?;
         let main_dylib = unsafe { LLVMOrcLLJITGetMainJITDylib(lljit) };
         let prefix = unsafe { LLVMOrcLLJITGetGlobalPrefix(lljit) };
@@ -176,6 +238,12 @@ impl CompiledJitFunction {
 
         Ok(Self {
             lowered: lowered.clone(),
+            compile_report: FunctionCompileReport {
+                lowering_time,
+                llvm_time,
+                stats: lowered.stats.clone(),
+                warnings: lowered.warnings.clone(),
+            },
             lljit,
             function,
         })
@@ -183,6 +251,10 @@ impl CompiledJitFunction {
 
     pub fn lowered(&self) -> &LoweredFunction {
         &self.lowered
+    }
+
+    pub fn compile_report(&self) -> &FunctionCompileReport {
+        &self.compile_report
     }
 
     pub fn create_context(&self) -> JitExecutionContext {
@@ -202,7 +274,21 @@ pub fn emit_object_file(
     opt_level: LlvmOptimizationLevel,
     target: &LlvmTarget,
 ) -> Result<()> {
-    emit_object_file_lowered(path, &lower_function(function)?, opt_level, target)
+    emit_object_file_with_options(path, function, FunctionCompileOptions::from(opt_level), target)
+}
+
+pub fn emit_object_file_with_options(
+    path: impl AsRef<Path>,
+    function: &SXFunction,
+    options: FunctionCompileOptions,
+    target: &LlvmTarget,
+) -> Result<()> {
+    emit_object_file_lowered(
+        path,
+        &lower_function_with_policies(function, options.call_policy)?,
+        options.opt_level,
+        target,
+    )
 }
 
 pub fn emit_object_file_lowered(
@@ -416,81 +502,54 @@ unsafe fn build_module(
             )
         };
         let function = unsafe { LLVMAddFunction(module, symbol_name.as_ptr(), function_ty) };
-        let entry = unsafe { LLVMAppendBasicBlockInContext(context, function, c"entry".as_ptr()) };
-        unsafe { LLVMPositionBuilderAtEnd(builder, entry) };
-
-        let inputs_param = unsafe { LLVMGetParam(function, 0) };
-        let outputs_param = unsafe { LLVMGetParam(function, 1) };
-        let mut temps = Vec::with_capacity(lowered.instructions.len());
-        for instruction in &lowered.instructions {
-            let temp = match instruction.kind {
-                InstructionKind::Unary { op, input } => {
-                    let input = unsafe {
-                        emit_value(
-                            builder,
-                            inputs_param,
-                            &temps,
-                            input,
-                            f64_ty,
-                            f64_ptr_ty,
-                            i64_ty,
-                        )
-                    };
-                    unsafe { emit_unary_op(builder, module, op, input, f64_ty) }
-                }
-                InstructionKind::Binary { op, lhs, rhs } => {
-                    let lhs = unsafe {
-                        emit_value(
-                            builder,
-                            inputs_param,
-                            &temps,
-                            lhs,
-                            f64_ty,
-                            f64_ptr_ty,
-                            i64_ty,
-                        )
-                    };
-                    let rhs = unsafe {
-                        emit_value(
-                            builder,
-                            inputs_param,
-                            &temps,
-                            rhs,
-                            f64_ty,
-                            f64_ptr_ty,
-                            i64_ty,
-                        )
-                    };
-                    unsafe { emit_binary_op(builder, module, op, lhs, rhs, f64_ty) }
-                }
-            };
-            if temps.len() != instruction.temp {
-                bail!("lowered temp order is not contiguous");
-            };
-            temps.push(temp);
-        }
-
-        for (slot_idx, values) in lowered.output_values.iter().enumerate() {
-            let output_ptr =
-                unsafe { load_slot_ptr(builder, outputs_param, slot_idx, f64_ptr_ty, i64_ty) };
-            for (offset, value) in values.iter().copied().enumerate() {
-                let value_ref = unsafe {
-                    emit_value(
-                        builder,
-                        inputs_param,
-                        &temps,
-                        value,
+        let subfunctions = lowered
+            .subfunctions
+            .iter()
+            .enumerate()
+            .map(|(index, subfunction)| {
+                unsafe {
+                    declare_subfunction(
+                        module,
+                        context,
+                        index,
+                        subfunction,
                         f64_ty,
                         f64_ptr_ty,
-                        i64_ty,
+                        void_ty,
                     )
-                };
-                let cell_ptr = unsafe { gep_f64_ptr(builder, output_ptr, offset, f64_ty, i64_ty) };
-                unsafe { LLVMBuildStore(builder, value_ref, cell_ptr) };
-            }
-        }
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-        unsafe { LLVMBuildRetVoid(builder) };
+        unsafe {
+            emit_root_callable(
+                builder,
+                module,
+                context,
+                function,
+                lowered,
+                &subfunctions,
+                f64_ty,
+                f64_ptr_ty,
+                i64_ty,
+            )?
+        };
+
+        for (index, subfunction) in lowered.subfunctions.iter().enumerate() {
+            unsafe {
+                emit_internal_callable(
+                    builder,
+                    module,
+                    context,
+                    subfunctions[index].function,
+                    subfunction,
+                    &subfunctions,
+                    f64_ty,
+                    f64_ptr_ty,
+                    i64_ty,
+                )?
+            };
+        }
         Ok(())
     })();
 
@@ -502,6 +561,230 @@ unsafe fn build_module(
             Err(error)
         }
     }
+}
+
+struct DeclaredSubfunction {
+    function: LLVMValueRef,
+    function_ty: LLVMTypeRef,
+}
+
+enum CallableAbi<'a> {
+    Root {
+        inputs_param: LLVMValueRef,
+    },
+    Internal {
+        function: LLVMValueRef,
+        input_offsets: &'a [usize],
+    },
+}
+
+unsafe fn declare_subfunction(
+    module: LLVMModuleRef,
+    context: LLVMContextRef,
+    index: usize,
+    subfunction: &LoweredSubfunction,
+    f64_ty: LLVMTypeRef,
+    f64_ptr_ty: LLVMTypeRef,
+    void_ty: LLVMTypeRef,
+) -> Result<DeclaredSubfunction> {
+    let input_count = subfunction.inputs.iter().map(|slot| slot.ccs.nnz()).sum::<usize>();
+    let output_count = subfunction.outputs.iter().map(|slot| slot.ccs.nnz()).sum::<usize>();
+    let mut params = vec![f64_ty; input_count];
+    params.extend((0..output_count).map(|_| f64_ptr_ty));
+    let function_ty =
+        unsafe { LLVMFunctionType(void_ty, params.as_mut_ptr(), params.len() as u32, 0) };
+    let name = CString::new(format!("__sx_internal_{}_{}", index, subfunction.name))?;
+    let function = unsafe { LLVMAddFunction(module, name.as_ptr(), function_ty) };
+    unsafe { LLVMSetLinkage(function, LLVMLinkage::LLVMInternalLinkage) };
+    if matches!(subfunction.call_policy, CallPolicy::NoInlineLLVM) {
+        unsafe { add_noinline_attribute(context, function)? };
+    }
+    Ok(DeclaredSubfunction {
+        function,
+        function_ty,
+    })
+}
+
+unsafe fn add_noinline_attribute(context: LLVMContextRef, function: LLVMValueRef) -> Result<()> {
+    let kind = unsafe { LLVMGetEnumAttributeKindForName(c"noinline".as_ptr(), 8) };
+    if kind == 0 {
+        bail!("LLVM could not resolve the noinline attribute kind");
+    }
+    let attr = unsafe { LLVMCreateEnumAttribute(context, kind, 0) };
+    unsafe { LLVMAddAttributeAtIndex(function, LLVMAttributeFunctionIndex, attr) };
+    Ok(())
+}
+
+unsafe fn emit_root_callable(
+    builder: LLVMBuilderRef,
+    module: LLVMModuleRef,
+    context: LLVMContextRef,
+    function: LLVMValueRef,
+    lowered: &LoweredFunction,
+    subfunctions: &[DeclaredSubfunction],
+    f64_ty: LLVMTypeRef,
+    f64_ptr_ty: LLVMTypeRef,
+    i64_ty: LLVMTypeRef,
+) -> Result<()> {
+    let entry = unsafe { LLVMAppendBasicBlockInContext(context, function, c"entry".as_ptr()) };
+    unsafe { LLVMPositionBuilderAtEnd(builder, entry) };
+    let abi = CallableAbi::Root {
+        inputs_param: unsafe { LLVMGetParam(function, 0) },
+    };
+    let outputs_param = unsafe { LLVMGetParam(function, 1) };
+    let temps = unsafe {
+        emit_instruction_sequence(
+            builder,
+            module,
+            &abi,
+            &lowered.instructions,
+            subfunctions,
+            f64_ty,
+            f64_ptr_ty,
+            i64_ty,
+        )?
+    };
+    for (slot_idx, values) in lowered.output_values.iter().enumerate() {
+        let output_ptr = unsafe { load_slot_ptr(builder, outputs_param, slot_idx, f64_ptr_ty, i64_ty) };
+        for (offset, value) in values.iter().copied().enumerate() {
+            let value_ref = unsafe {
+                emit_value(builder, &abi, &temps, value, f64_ty, f64_ptr_ty, i64_ty)
+            };
+            let cell_ptr = unsafe { gep_f64_ptr(builder, output_ptr, offset, f64_ty, i64_ty) };
+            unsafe { LLVMBuildStore(builder, value_ref, cell_ptr) };
+        }
+    }
+    unsafe { LLVMBuildRetVoid(builder) };
+    Ok(())
+}
+
+unsafe fn emit_internal_callable(
+    builder: LLVMBuilderRef,
+    module: LLVMModuleRef,
+    context: LLVMContextRef,
+    function: LLVMValueRef,
+    lowered: &LoweredSubfunction,
+    subfunctions: &[DeclaredSubfunction],
+    f64_ty: LLVMTypeRef,
+    f64_ptr_ty: LLVMTypeRef,
+    i64_ty: LLVMTypeRef,
+) -> Result<()> {
+    let entry = unsafe { LLVMAppendBasicBlockInContext(context, function, c"entry".as_ptr()) };
+    unsafe { LLVMPositionBuilderAtEnd(builder, entry) };
+    let input_offsets = lowered
+        .inputs
+        .iter()
+        .scan(0usize, |offset, slot| {
+            let current = *offset;
+            *offset += slot.ccs.nnz();
+            Some(current)
+        })
+        .collect::<Vec<_>>();
+    let abi = CallableAbi::Internal {
+        function,
+        input_offsets: &input_offsets,
+    };
+    let temps = unsafe {
+        emit_instruction_sequence(
+            builder,
+            module,
+            &abi,
+            &lowered.instructions,
+            subfunctions,
+            f64_ty,
+            f64_ptr_ty,
+            i64_ty,
+        )?
+    };
+    let output_param_base = lowered.inputs.iter().map(|slot| slot.ccs.nnz()).sum::<usize>();
+    let mut linear_output = 0usize;
+    for values in &lowered.output_values {
+        for value in values.iter().copied() {
+            let value_ref = unsafe {
+                emit_value(builder, &abi, &temps, value, f64_ty, f64_ptr_ty, i64_ty)
+            };
+            let output_ptr = unsafe { LLVMGetParam(function, (output_param_base + linear_output) as u32) };
+            unsafe { LLVMBuildStore(builder, value_ref, output_ptr) };
+            linear_output += 1;
+        }
+    }
+    unsafe { LLVMBuildRetVoid(builder) };
+    Ok(())
+}
+
+unsafe fn emit_instruction_sequence(
+    builder: LLVMBuilderRef,
+    module: LLVMModuleRef,
+    abi: &CallableAbi<'_>,
+    instructions: &[Instruction],
+    subfunctions: &[DeclaredSubfunction],
+    f64_ty: LLVMTypeRef,
+    f64_ptr_ty: LLVMTypeRef,
+    i64_ty: LLVMTypeRef,
+) -> Result<Vec<LLVMValueRef>> {
+    let mut temps = Vec::new();
+    for instruction in instructions {
+        match instruction {
+            Instruction::Unary { temp, op, input } => {
+                if temps.len() != *temp {
+                    bail!("lowered temp order is not contiguous");
+                }
+                let input =
+                    unsafe { emit_value(builder, abi, &temps, *input, f64_ty, f64_ptr_ty, i64_ty) };
+                temps.push(unsafe { emit_unary_op(builder, module, *op, input, f64_ty) });
+            }
+            Instruction::Binary { temp, op, lhs, rhs } => {
+                if temps.len() != *temp {
+                    bail!("lowered temp order is not contiguous");
+                }
+                let lhs =
+                    unsafe { emit_value(builder, abi, &temps, *lhs, f64_ty, f64_ptr_ty, i64_ty) };
+                let rhs =
+                    unsafe { emit_value(builder, abi, &temps, *rhs, f64_ty, f64_ptr_ty, i64_ty) };
+                temps.push(unsafe { emit_binary_op(builder, module, *op, lhs, rhs, f64_ty) });
+            }
+            Instruction::Call {
+                temps: output_temps,
+                callee,
+                inputs,
+            } => {
+                if output_temps
+                    .iter()
+                    .enumerate()
+                    .any(|(index, temp)| *temp != temps.len() + index)
+                {
+                    bail!("lowered call temp order is not contiguous");
+                }
+                let declared = &subfunctions[*callee];
+                let mut args = inputs
+                    .iter()
+                    .copied()
+                    .map(|value| unsafe {
+                        emit_value(builder, abi, &temps, value, f64_ty, f64_ptr_ty, i64_ty)
+                    })
+                    .collect::<Vec<_>>();
+                let mut output_ptrs = Vec::with_capacity(output_temps.len());
+                for _ in output_temps {
+                    output_ptrs.push(unsafe { LLVMBuildAlloca(builder, f64_ty, c"".as_ptr()) });
+                }
+                args.extend(output_ptrs.iter().copied());
+                unsafe {
+                    LLVMBuildCall2(
+                        builder,
+                        declared.function_ty,
+                        declared.function,
+                        args.as_mut_ptr(),
+                        args.len() as u32,
+                        c"".as_ptr(),
+                    )
+                };
+                for output_ptr in output_ptrs {
+                    temps.push(unsafe { LLVMBuildLoad2(builder, f64_ty, output_ptr, c"".as_ptr()) });
+                }
+            }
+        }
+    }
+    Ok(temps)
 }
 
 unsafe fn emit_unary_op(
@@ -646,7 +929,7 @@ unsafe fn llvm_data_layout_string(target_machine: LLVMTargetMachineRef) -> Resul
 
 unsafe fn emit_value(
     builder: LLVMBuilderRef,
-    inputs_param: LLVMValueRef,
+    abi: &CallableAbi<'_>,
     temps: &[LLVMValueRef],
     value: ValueRef,
     f64_ty: LLVMTypeRef,
@@ -656,12 +939,18 @@ unsafe fn emit_value(
     match value {
         ValueRef::Const(value) => unsafe { LLVMConstReal(f64_ty, value) },
         ValueRef::Temp(temp) => temps[temp],
-        ValueRef::Input { slot, offset } => {
-            let base_ptr =
-                unsafe { load_slot_ptr(builder, inputs_param, slot, f64_ptr_ty, i64_ty) };
-            let value_ptr = unsafe { gep_f64_ptr(builder, base_ptr, offset, f64_ty, i64_ty) };
-            unsafe { LLVMBuildLoad2(builder, f64_ty, value_ptr, c"".as_ptr()) }
-        }
+        ValueRef::Input { slot, offset } => match abi {
+            CallableAbi::Root { inputs_param } => {
+                let base_ptr =
+                    unsafe { load_slot_ptr(builder, *inputs_param, slot, f64_ptr_ty, i64_ty) };
+                let value_ptr = unsafe { gep_f64_ptr(builder, base_ptr, offset, f64_ty, i64_ty) };
+                unsafe { LLVMBuildLoad2(builder, f64_ty, value_ptr, c"".as_ptr()) }
+            }
+            CallableAbi::Internal {
+                function,
+                input_offsets,
+            } => unsafe { LLVMGetParam(*function, (input_offsets[slot] + offset) as u32) },
+        },
     }
 }
 
@@ -1095,24 +1384,43 @@ unsafe fn take_owned_message(message: *mut i8) -> Result<String> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::{
-        AotWrapperOptions, CompiledJitFunction, JitOptimizationLevel, LlvmTarget,
+        AotWrapperOptions, CompiledJitFunction, FunctionCompileOptions, JitOptimizationLevel,
+        LlvmTarget,
         emit_object_bytes_lowered, generate_aot_wrapper_module,
     };
-    use sx_codegen::lower_function;
-    use sx_core::{BinaryOp, NamedMatrix, SXFunction, SXMatrix, UnaryOp};
+    use sx_codegen::{Instruction, LoweredFunction, LoweredSubfunction, ValueRef, lower_function};
+    use sx_core::{
+        BinaryOp, CallPolicy, CallPolicyConfig, NamedMatrix, SXFunction, SXMatrix, UnaryOp,
+    };
 
-    fn eval_lowered(lowered: &sx_codegen::LoweredFunction, inputs: &[Vec<f64>]) -> Vec<Vec<f64>> {
-        let mut temps = vec![0.0; lowered.instructions.len()];
-        let resolve = |value: sx_codegen::ValueRef, temps: &[f64]| match value {
-            sx_codegen::ValueRef::Const(value) => value,
-            sx_codegen::ValueRef::Temp(temp) => temps[temp],
-            sx_codegen::ValueRef::Input { slot, offset } => inputs[slot][offset],
+    fn named(name: &str, matrix: SXMatrix) -> NamedMatrix {
+        NamedMatrix::new(name, matrix).expect("named matrix should be valid")
+    }
+
+    fn eval_instruction_sequence(
+        instructions: &[Instruction],
+        inputs: &[Vec<f64>],
+        subfunctions: &[LoweredSubfunction],
+    ) -> Vec<f64> {
+        let mut temps = vec![
+            0.0;
+            instructions
+                .iter()
+                .flat_map(Instruction::output_temps)
+                .copied()
+                .max()
+                .map_or(0, |max_temp| max_temp + 1)
+        ];
+        let resolve = |value: ValueRef, temps: &[f64], inputs: &[Vec<f64>]| match value {
+            ValueRef::Const(value) => value,
+            ValueRef::Temp(temp) => temps[temp],
+            ValueRef::Input { slot, offset } => inputs[slot][offset],
         };
-        for instruction in &lowered.instructions {
-            temps[instruction.temp] = match instruction.kind {
-                sx_codegen::InstructionKind::Unary { op, input } => {
-                    let input = resolve(input, &temps);
-                    match op {
+        for instruction in instructions {
+            match instruction {
+                Instruction::Unary { temp, op, input } => {
+                    let input = resolve(*input, &temps, inputs);
+                    temps[*temp] = match op {
                         UnaryOp::Abs => input.abs(),
                         UnaryOp::Sign => {
                             if input > 0.0 {
@@ -1142,12 +1450,12 @@ mod tests {
                         UnaryOp::Asinh => input.asinh(),
                         UnaryOp::Acosh => input.acosh(),
                         UnaryOp::Atanh => input.atanh(),
-                    }
+                    };
                 }
-                sx_codegen::InstructionKind::Binary { op, lhs, rhs } => {
-                    let lhs = resolve(lhs, &temps);
-                    let rhs = resolve(rhs, &temps);
-                    match op {
+                Instruction::Binary { temp, op, lhs, rhs } => {
+                    let lhs = resolve(*lhs, &temps, inputs);
+                    let rhs = resolve(*rhs, &temps, inputs);
+                    temps[*temp] = match op {
                         BinaryOp::Add => lhs + rhs,
                         BinaryOp::Sub => lhs - rhs,
                         BinaryOp::Mul => lhs * rhs,
@@ -1157,10 +1465,70 @@ mod tests {
                         BinaryOp::Hypot => lhs.hypot(rhs),
                         BinaryOp::Mod => lhs % rhs,
                         BinaryOp::Copysign => lhs.copysign(rhs),
+                    };
+                }
+                Instruction::Call {
+                    temps: output_temps,
+                    callee,
+                    inputs: call_inputs,
+                } => {
+                    let callee = &subfunctions[*callee];
+                    let mut callee_inputs = Vec::with_capacity(callee.inputs.len());
+                    let mut linear = 0usize;
+                    for slot in &callee.inputs {
+                        let nnz = slot.ccs.nnz();
+                        callee_inputs.push(
+                            call_inputs[linear..linear + nnz]
+                                .iter()
+                                .map(|value| resolve(*value, &temps, inputs))
+                                .collect::<Vec<_>>(),
+                        );
+                        linear += nnz;
+                    }
+                    let callee_outputs = eval_subfunction(callee, &callee_inputs, subfunctions);
+                    for (temp, value) in output_temps
+                        .iter()
+                        .copied()
+                        .zip(callee_outputs.into_iter().flatten())
+                    {
+                        temps[temp] = value;
                     }
                 }
-            };
+            }
         }
+        temps
+    }
+
+    fn eval_subfunction(
+        lowered: &LoweredSubfunction,
+        inputs: &[Vec<f64>],
+        subfunctions: &[LoweredSubfunction],
+    ) -> Vec<Vec<f64>> {
+        let temps = eval_instruction_sequence(&lowered.instructions, inputs, subfunctions);
+        let resolve = |value: ValueRef, temps: &[f64], inputs: &[Vec<f64>]| match value {
+            ValueRef::Const(value) => value,
+            ValueRef::Temp(temp) => temps[temp],
+            ValueRef::Input { slot, offset } => inputs[slot][offset],
+        };
+        lowered
+            .output_values
+            .iter()
+            .map(|slot| {
+                slot.iter()
+                    .copied()
+                    .map(|value| resolve(value, &temps, inputs))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    }
+
+    fn eval_lowered(lowered: &LoweredFunction, inputs: &[Vec<f64>]) -> Vec<Vec<f64>> {
+        let temps = eval_instruction_sequence(&lowered.instructions, inputs, &lowered.subfunctions);
+        let resolve = |value: ValueRef, temps: &[f64]| match value {
+            ValueRef::Const(value) => value,
+            ValueRef::Temp(temp) => temps[temp],
+            ValueRef::Input { slot, offset } => inputs[slot][offset],
+        };
         lowered
             .output_values
             .iter()
@@ -1171,6 +1539,64 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>()
+    }
+
+    fn build_policy_bundle_function() -> SXFunction {
+        let z = SXMatrix::sym_dense("z", 2, 1).expect("callee input should build");
+        let phi = SXMatrix::scalar(z.nz(0).sqr() + z.nz(1).sin() + z.nz(0) * z.nz(1));
+        let psi = SXMatrix::dense_column(vec![z.nz(0) * z.nz(1), z.nz(0) + z.nz(1)])
+            .expect("callee output should build");
+        let stage = SXFunction::new(
+            "stage_cost",
+            vec![named("z", z.clone())],
+            vec![named("phi", phi), named("psi", psi)],
+        )
+        .expect("callee should build");
+
+        let x = SXMatrix::sym_dense("x", 2, 1).expect("root input should build");
+        let stage_a = stage.call(&[x.clone()]).expect("first call should build");
+        let swapped = SXMatrix::dense_column(vec![x.nz(1), x.nz(0)]).expect("swap should build");
+        let stage_b = stage.call(&[swapped]).expect("second call should build");
+
+        let objective = SXMatrix::scalar(
+            stage_a[0].nz(0) + stage_b[0].nz(0) + stage_a[1].nz(0).sqr() + stage_b[1].nz(1),
+        );
+        let constraints = SXMatrix::dense_column(vec![
+            stage_a[1].nz(0) + stage_b[1].nz(1),
+            stage_a[1].nz(1) - stage_b[1].nz(0),
+        ])
+        .expect("constraint bundle should build");
+        let gradient = objective.gradient(&x).expect("gradient should build");
+        let jacobian = constraints.jacobian(&x).expect("jacobian should build");
+        let hessian = SXMatrix::scalar(objective.scalar_expr().expect("objective should be scalar"))
+            .hessian(&x)
+            .expect("hessian should build");
+
+        SXFunction::new(
+            "policy_bundle",
+            vec![named("x", x)],
+            vec![
+                named("objective", objective),
+                named("gradient", gradient),
+                named("jacobian", jacobian),
+                named("hessian", hessian),
+            ],
+        )
+        .expect("root function should build")
+    }
+
+    fn compile_with_policy(function: &SXFunction, policy: CallPolicy) -> CompiledJitFunction {
+        CompiledJitFunction::compile_function_with_options(
+            function,
+            FunctionCompileOptions {
+                opt_level: JitOptimizationLevel::O0,
+                call_policy: CallPolicyConfig {
+                    default_policy: policy,
+                    respect_function_overrides: true,
+                },
+            },
+        )
+        .expect("compilation should succeed")
     }
 
     #[test]
@@ -1328,6 +1754,76 @@ mod tests {
             for (lhs, rhs) in context.output(1).iter().zip(expected[1].iter()) {
                 assert!((lhs - rhs).abs() <= 1e-12);
             }
+        }
+    }
+
+    #[test]
+    fn llvm_call_policies_preserve_derivative_bundle_outputs() {
+        let function = build_policy_bundle_function();
+        let baseline = compile_with_policy(&function, CallPolicy::InlineAtCall);
+        let policies = [
+            CallPolicy::InlineAtCall,
+            CallPolicy::InlineAtLowering,
+            CallPolicy::InlineInLLVM,
+            CallPolicy::NoInlineLLVM,
+        ];
+
+        for point in [[1.7, 0.8], [0.9, 1.1], [2.3, 0.6]] {
+            let mut baseline_context = baseline.create_context();
+            baseline_context.input_mut(0).copy_from_slice(&point);
+            baseline.eval(&mut baseline_context);
+            let expected = (0..baseline.lowered().outputs.len())
+                .map(|slot| baseline_context.output(slot).to_vec())
+                .collect::<Vec<_>>();
+
+            for policy in policies {
+                let compiled = compile_with_policy(&function, policy);
+                let mut context = compiled.create_context();
+                context.input_mut(0).copy_from_slice(&point);
+                compiled.eval(&mut context);
+                for (slot, expected_slot) in expected.iter().enumerate() {
+                    assert_eq!(context.output(slot).len(), expected_slot.len());
+                    for (lhs, rhs) in context.output(slot).iter().zip(expected_slot.iter()) {
+                        assert!((lhs - rhs).abs() <= 1e-12, "policy={policy:?}, slot={slot}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn llvm_call_policy_stats_match_lowering_shape() {
+        let function = build_policy_bundle_function();
+
+        let inline_at_call = compile_with_policy(&function, CallPolicy::InlineAtCall);
+        assert!(inline_at_call.lowered().subfunctions.is_empty());
+        assert!(inline_at_call.lowered().stats.inlines_at_call >= 2);
+        assert_eq!(inline_at_call.lowered().stats.llvm_call_instructions_emitted, 0);
+
+        let inline_at_lowering = compile_with_policy(&function, CallPolicy::InlineAtLowering);
+        assert!(inline_at_lowering.lowered().subfunctions.is_empty());
+        assert!(inline_at_lowering.lowered().stats.inlines_at_lowering >= 2);
+        assert_eq!(
+            inline_at_lowering.lowered().stats.llvm_call_instructions_emitted,
+            0
+        );
+
+        for policy in [CallPolicy::InlineInLLVM, CallPolicy::NoInlineLLVM] {
+            let compiled = compile_with_policy(&function, policy);
+            assert!(!compiled.lowered().subfunctions.is_empty());
+            assert!(
+                compiled
+                    .lowered()
+                    .subfunctions
+                    .iter()
+                    .all(|subfunction| subfunction.call_policy == policy)
+            );
+            assert!(compiled.lowered().stats.call_site_count >= 2);
+            assert_eq!(
+                compiled.lowered().stats.llvm_subfunctions_emitted,
+                compiled.lowered().subfunctions.len()
+            );
+            assert!(compiled.lowered().stats.llvm_call_instructions_emitted >= 2);
         }
     }
 }

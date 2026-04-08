@@ -444,6 +444,10 @@ fn has_nonfinite_constant(expr: SX) -> bool {
         NodeView::Binary { lhs, rhs, .. } => {
             has_nonfinite_constant(lhs) || has_nonfinite_constant(rhs)
         }
+        NodeView::Call { inputs, .. } => inputs
+            .iter()
+            .flat_map(|input| input.nonzeros().iter().copied())
+            .any(has_nonfinite_constant),
     }
 }
 

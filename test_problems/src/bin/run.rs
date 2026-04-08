@@ -3,9 +3,9 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use test_problems::{
-    JitOptLevel, ProblemRunOptions, ProblemSpeed, RunRequest, SolverKind, render_markdown_report,
-    render_terminal_report, run_cases, write_dashboard, write_html_report, write_json_report,
-    write_transcript_artifacts,
+    CallPolicyMode, JitOptLevel, ProblemRunOptions, ProblemSpeed, RunRequest, SolverKind,
+    render_markdown_report, render_terminal_report, run_cases, write_dashboard,
+    write_html_report, write_json_report, write_transcript_artifacts,
 };
 
 fn main() -> Result<()> {
@@ -76,9 +76,53 @@ fn main() -> Result<()> {
                     "s" | "os" | "Os" | "OS" => vec![JitOptLevel::Os],
                     _ => bail!("unknown jit opt level: {value}"),
                 };
+                let call_policies = request
+                    .run_options
+                    .iter()
+                    .map(|options| options.call_policy)
+                    .collect::<Vec<_>>();
                 request.run_options = jit_opt_levels
                     .into_iter()
-                    .map(|jit_opt_level| ProblemRunOptions { jit_opt_level })
+                    .flat_map(|jit_opt_level| {
+                        call_policies.iter().copied().map(move |call_policy| ProblemRunOptions {
+                            jit_opt_level,
+                            call_policy,
+                        })
+                    })
+                    .collect();
+            }
+            "--call-policy" => {
+                let Some(value) = args.next() else {
+                    bail!(
+                        "--call-policy requires inline_at_call|inline_at_lowering|inline_in_llvm|no_inline_llvm|all"
+                    );
+                };
+                let call_policies = match value.as_str() {
+                    "all" => vec![
+                        CallPolicyMode::InlineAtCall,
+                        CallPolicyMode::InlineAtLowering,
+                        CallPolicyMode::InlineInLlvm,
+                        CallPolicyMode::NoInlineLlvm,
+                    ],
+                    "inline_at_call" => vec![CallPolicyMode::InlineAtCall],
+                    "inline_at_lowering" => vec![CallPolicyMode::InlineAtLowering],
+                    "inline_in_llvm" => vec![CallPolicyMode::InlineInLlvm],
+                    "no_inline_llvm" => vec![CallPolicyMode::NoInlineLlvm],
+                    _ => bail!("unknown call policy: {value}"),
+                };
+                let jit_opt_levels = request
+                    .run_options
+                    .iter()
+                    .map(|options| options.jit_opt_level)
+                    .collect::<Vec<_>>();
+                request.run_options = jit_opt_levels
+                    .into_iter()
+                    .flat_map(|jit_opt_level| {
+                        call_policies.iter().copied().map(move |call_policy| ProblemRunOptions {
+                            jit_opt_level,
+                            call_policy,
+                        })
+                    })
                     .collect();
             }
             "--output-dir" => {
@@ -132,6 +176,6 @@ fn main() -> Result<()> {
 
 fn print_help() {
     println!(
-        "Usage: cargo run --release -p test_problems -- [--problem ID]... [--solver sqp|nlip|ipopt|both|all] [--problem-set fast|slow|all] [--jit-opt 0|2|3|s|all] [--jobs N] [--output-dir DIR] [--include-skipped] [--no-progress]"
+        "Usage: cargo run --release -p test_problems -- [--problem ID]... [--solver sqp|nlip|ipopt|both|all] [--problem-set fast|slow|all] [--jit-opt 0|2|3|s|all] [--call-policy inline_at_call|inline_at_lowering|inline_in_llvm|no_inline_llvm|all] [--jobs N] [--output-dir DIR] [--include-skipped] [--no-progress]"
     );
 }

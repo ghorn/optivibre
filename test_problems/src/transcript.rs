@@ -18,7 +18,7 @@ pub fn write_transcript_artifacts(results: &mut RunResults, output_dir: &Path) -
             "{}__{}__{}",
             slugify(&record.id),
             slugify(record.solver.label()),
-            slugify(record.options.label()),
+            slugify(&record.options.label()),
         );
         let txt_filename = format!("{basename}.txt");
         let html_filename = format!("{basename}.html");
@@ -106,7 +106,7 @@ fn render_transcript_html(
 </html>"#,
         title = html_escape(&record.id),
         solver = html_escape(record.solver.label()),
-        jit = html_escape(record.options.label()),
+        jit = html_escape(&record.options.label()),
         txt_filename = html_escape(txt_filename),
         status_class = status_class,
         status_text = status_text,

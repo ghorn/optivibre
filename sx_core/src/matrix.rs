@@ -5,7 +5,7 @@ use crate::error::{Result, SxError};
 use crate::sx::{SX, depends_on, forward_directional, reverse_directional};
 use crate::{Index, checked_len_product};
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SXMatrix {
     ccs: CCS,
     nonzeros: Vec<SX>,

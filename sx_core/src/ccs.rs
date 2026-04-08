@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use crate::error::{Result, SxError};
 use crate::{Index, SignedIndex, checked_len_product};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CCS {
     nrow: Index,
     ncol: Index,

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use optimization::LlvmOptimizationLevel;
+use optimization::{CallPolicy, CallPolicyConfig, FunctionCompileOptions, LlvmOptimizationLevel};
 use serde::{Serialize, ser::SerializeStruct};
 
 use crate::manifest::KnownStatus;
@@ -58,11 +58,52 @@ impl JitOptLevel {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize)]
 pub struct ProblemRunOptions {
     pub jit_opt_level: JitOptLevel,
+    pub call_policy: CallPolicyMode,
 }
 
 impl ProblemRunOptions {
+    pub fn label(self) -> String {
+        format!("{} / {}", self.jit_opt_level.label(), self.call_policy.label())
+    }
+
+    pub const fn compile_options(self) -> FunctionCompileOptions {
+        FunctionCompileOptions {
+            opt_level: self.jit_opt_level.into_llvm(),
+            call_policy: CallPolicyConfig {
+                default_policy: self.call_policy.into_sx(),
+                respect_function_overrides: true,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallPolicyMode {
+    InlineAtCall,
+    #[default]
+    InlineAtLowering,
+    InlineInLlvm,
+    NoInlineLlvm,
+}
+
+impl CallPolicyMode {
     pub const fn label(self) -> &'static str {
-        self.jit_opt_level.label()
+        match self {
+            Self::InlineAtCall => "inline_at_call",
+            Self::InlineAtLowering => "inline_at_lowering",
+            Self::InlineInLlvm => "inline_in_llvm",
+            Self::NoInlineLlvm => "no_inline_llvm",
+        }
+    }
+
+    pub const fn into_sx(self) -> CallPolicy {
+        match self {
+            Self::InlineAtCall => CallPolicy::InlineAtCall,
+            Self::InlineAtLowering => CallPolicy::InlineAtLowering,
+            Self::InlineInLlvm => CallPolicy::InlineInLLVM,
+            Self::NoInlineLlvm => CallPolicy::NoInlineLLVM,
+        }
     }
 }
 
@@ -150,6 +191,51 @@ impl ValidationOutcome {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct SetupProfileBreakdown {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbolic_construction_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub objective_gradient_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub equality_jacobian_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inequality_jacobian_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lagrangian_assembly_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hessian_generation_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lowering_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llvm_jit_s: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct CompileStatsSummary {
+    pub symbolic_function_count: usize,
+    pub call_site_count: usize,
+    pub max_call_depth: usize,
+    pub inline_at_call_policy_count: usize,
+    pub inline_at_lowering_policy_count: usize,
+    pub inline_in_llvm_policy_count: usize,
+    pub no_inline_llvm_policy_count: usize,
+    pub overrides_applied: usize,
+    pub overrides_ignored: usize,
+    pub inlines_at_call: usize,
+    pub inlines_at_lowering: usize,
+    pub llvm_subfunctions_emitted: usize,
+    pub llvm_call_instructions_emitted: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct CompileReportSummary {
+    pub setup: SetupProfileBreakdown,
+    pub stats: CompileStatsSummary,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ProblemRunRecord {
     pub id: String,
@@ -165,6 +251,8 @@ pub struct ProblemRunRecord {
     pub validation: ValidationOutcome,
     pub solver_thresholds: Option<String>,
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compile_report: Option<CompileReportSummary>,
     #[serde(skip)]
     pub console_output: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -11,8 +11,8 @@ use crate::common::{
     rad_to_deg, sample_or_default, segmented_bound_series, segmented_series,
     solve_cached_direct_collocation_problem, solve_cached_direct_collocation_problem_with_progress,
     solve_cached_multiple_shooting_problem, solve_cached_multiple_shooting_problem_with_progress,
-    solver_config_from_map, solver_method_from_map, transcription_from_map, transcription_metrics,
-    trapezoid_integral,
+    solver_config_from_map, solver_method_from_map, summarize_backend_compile_report,
+    transcription_from_map, transcription_metrics, trapezoid_integral,
 };
 use anyhow::{Result, anyhow};
 use optimal_control::{
@@ -417,6 +417,7 @@ fn compile_multiple_shooting_with_progress(
                     compiled.nlp_compile_stats(),
                     compiled.helper_kernel_count(),
                     compiled.helper_compile_stats(),
+                    Some(summarize_backend_compile_report(compiled.backend_compile_report())),
                 )
             },
         )
@@ -450,6 +451,7 @@ fn compile_direct_collocation_with_progress(
                     compiled.nlp_compile_stats(),
                     compiled.helper_kernel_count(),
                     compiled.helper_compile_stats(),
+                    Some(summarize_backend_compile_report(compiled.backend_compile_report())),
                 )
             },
         )
@@ -755,9 +757,9 @@ where
         TranscriptionMethod::MultipleShooting => {
             let mut lifecycle =
                 crate::common::SolveLifecycleReporter::new(emit, params.solver_method);
-            let (compiled, running_solver) =
+            let (compiled, running_solver, compile_report) =
                 lifecycle.compile_with_progress(compile_multiple_shooting_with_progress)?;
-            solve_cached_multiple_shooting_problem_with_progress(
+            let mut artifact = solve_cached_multiple_shooting_problem_with_progress(
                 &compiled,
                 &ms_runtime::<DEFAULT_INTERVALS>(params),
                 params.solver_method,
@@ -767,18 +769,21 @@ where
                 |trajectories, x_arcs, u_arcs| {
                     artifact_from_ms_trajectories(params, trajectories, x_arcs, u_arcs)
                 },
-            )
+            )?;
+            artifact.compile_report = compile_report;
+            Ok(artifact)
         }
         TranscriptionMethod::DirectCollocation => {
             let mut lifecycle =
                 crate::common::SolveLifecycleReporter::new(emit, params.solver_method);
-            let (compiled, running_solver) = lifecycle.compile_with_progress(|callback| {
-                compile_direct_collocation_with_progress(
-                    params.transcription.collocation_family,
-                    callback,
-                )
-            })?;
-            solve_cached_direct_collocation_problem_with_progress(
+            let (compiled, running_solver, compile_report) =
+                lifecycle.compile_with_progress(|callback| {
+                    compile_direct_collocation_with_progress(
+                        params.transcription.collocation_family,
+                        callback,
+                    )
+                })?;
+            let mut artifact = solve_cached_direct_collocation_problem_with_progress(
                 &compiled,
                 &dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(params),
                 params.solver_method,
@@ -788,7 +793,9 @@ where
                 |trajectories, time_grid| {
                     artifact_from_dc_trajectories(params, trajectories, time_grid)
                 },
-            )
+            )?;
+            artifact.compile_report = compile_report;
+            Ok(artifact)
         }
     }
 }

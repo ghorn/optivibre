@@ -6,6 +6,10 @@ use std::ops::{
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use crate::error::{Result, SxError};
+use crate::function::{
+    FunctionId, dependency_profile, forward_helper, function_by_id, function_name, reverse_helper,
+};
+use crate::{Index, SXMatrix};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SX(u32);
@@ -54,6 +58,12 @@ enum NodeKind {
     Symbol { serial: usize, name: String },
     Unary { op: UnaryOp, arg: SX },
     Binary { op: BinaryOp, lhs: SX, rhs: SX },
+    Call {
+        function: FunctionId,
+        inputs: Vec<SXMatrix>,
+        output_slot: Index,
+        output_offset: Index,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -61,6 +71,12 @@ enum NodeKey {
     Constant(u64),
     Unary { op: UnaryOp, arg: SX },
     Binary { op: BinaryOp, lhs: SX, rhs: SX },
+    Call {
+        function: FunctionId,
+        inputs: Vec<SXMatrix>,
+        output_slot: Index,
+        output_offset: Index,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +99,13 @@ pub enum NodeView {
     Symbol { name: String, serial: usize },
     Unary { op: UnaryOp, arg: SX },
     Binary { op: BinaryOp, lhs: SX, rhs: SX },
+    Call {
+        function_id: FunctionId,
+        function_name: String,
+        inputs: Vec<SXMatrix>,
+        output_slot: Index,
+        output_offset: Index,
+    },
 }
 
 impl UnaryOp {
@@ -251,7 +274,10 @@ fn node_kind(sx: SX) -> NodeKind {
 fn constant_value(sx: SX) -> Option<f64> {
     match node_kind(sx) {
         NodeKind::Constant(value) => Some(value),
-        NodeKind::Symbol { .. } | NodeKind::Unary { .. } | NodeKind::Binary { .. } => None,
+        NodeKind::Symbol { .. }
+        | NodeKind::Unary { .. }
+        | NodeKind::Binary { .. }
+        | NodeKind::Call { .. } => None,
     }
 }
 
@@ -271,7 +297,8 @@ fn mul_constant_factor(sx: SX) -> Option<(f64, SX)> {
         NodeKind::Constant(_)
         | NodeKind::Symbol { .. }
         | NodeKind::Unary { .. }
-        | NodeKind::Binary { .. } => None,
+        | NodeKind::Binary { .. }
+        | NodeKind::Call { .. } => None,
     }
 }
 
@@ -391,7 +418,10 @@ fn rational_factors(expr: SX) -> RationalFactors {
                 denominators: Vec::new(),
             },
         ),
-        NodeKind::Symbol { .. } | NodeKind::Unary { .. } | NodeKind::Binary { .. } => {
+        NodeKind::Symbol { .. }
+        | NodeKind::Unary { .. }
+        | NodeKind::Binary { .. }
+        | NodeKind::Call { .. } => {
             RationalFactors {
                 coeff: 1.0,
                 numerators: vec![expr],
@@ -484,9 +514,42 @@ fn format_expression(expr: SX, interner: &Interner, memo: &mut HashMap<SX, Strin
                 format!("{}({lhs_rendered}, {rhs_rendered})", op.name())
             }
         }
+        NodeKind::Call {
+            function,
+            output_slot,
+            output_offset,
+            ..
+        } => {
+            let name = function_name(function).unwrap_or_else(|| format!("fn_{function}"));
+            format!("{name}(..)[{output_slot}:{output_offset}]")
+        }
     };
     memo.insert(expr, formatted.clone());
     formatted
+}
+
+pub(crate) fn call_output(
+    function: FunctionId,
+    inputs: Vec<SXMatrix>,
+    output_slot: Index,
+    output_offset: Index,
+) -> SX {
+    with_interner(|interner| {
+        interner.intern_keyed(
+            NodeKey::Call {
+                function,
+                inputs: inputs.clone(),
+                output_slot,
+                output_offset,
+            },
+            NodeKind::Call {
+                function,
+                inputs,
+                output_slot,
+                output_offset,
+            },
+        )
+    })
 }
 
 fn canonical_pair(lhs: SX, rhs: SX) -> (SX, SX) {
@@ -710,6 +773,14 @@ fn topo_visit(node: SX, seen: &mut HashSet<SX>, order: &mut Vec<SX>) {
             topo_visit(rhs, seen, order);
             order.push(node);
         }
+        NodeKind::Call { inputs, .. } => {
+            for input in inputs {
+                for expr in input.nonzeros().iter().copied() {
+                    topo_visit(expr, seen, order);
+                }
+            }
+            order.push(node);
+        }
         NodeKind::Constant(_) | NodeKind::Symbol { .. } => {}
     }
 }
@@ -801,6 +872,23 @@ fn directional_forward(expr: SX, seeds: &HashMap<SX, SX>, memo: &mut HashMap<SX,
                 dl * d_lhs + dr * d_rhs
             }
         },
+        NodeKind::Call {
+            function,
+            inputs,
+            output_slot,
+            output_offset,
+        } => {
+            let helper = forward_helper(function)
+                .expect("forward helper generation should succeed for a valid SXFunction");
+            let mut helper_inputs = inputs.clone();
+            for input in &inputs {
+                helper_inputs.push(input.map_nonzeros(|value| directional_forward(value, seeds, memo)));
+            }
+            let helper_outputs = helper
+                .call(&helper_inputs)
+                .expect("forward helper call should match its declared signature");
+            helper_outputs[output_slot].nz(output_offset)
+        }
     };
     memo.insert(expr, derivative);
     derivative
@@ -924,6 +1012,45 @@ pub(crate) fn reverse_directional(outputs: &[SX], vars: &[SX], seeds: &[SX]) -> 
                         .or_insert(rhs_contrib);
                 }
             },
+            NodeKind::Call {
+                function,
+                inputs,
+                output_slot,
+                output_offset,
+            } => {
+                let helper = reverse_helper(function)
+                    .expect("reverse helper generation should succeed for a valid SXFunction");
+                let callee = function_by_id(function)
+                    .expect("reverse helper generation should only reference known functions");
+                let mut helper_inputs = inputs.clone();
+                for (slot, output) in callee.outputs().iter().enumerate() {
+                    let seed = (0..output.matrix().nnz())
+                        .map(|offset| {
+                            if slot == output_slot && offset == output_offset {
+                                adj
+                            } else {
+                                SX::zero()
+                            }
+                        })
+                        .collect();
+                    helper_inputs.push(
+                        SXMatrix::new(output.matrix().ccs().clone(), seed)
+                            .expect("reverse seed should match output sparsity"),
+                    );
+                }
+                let helper_outputs = helper
+                    .call(&helper_inputs)
+                    .expect("reverse helper call should match its declared signature");
+                for (slot, input) in inputs.iter().enumerate() {
+                    for (offset, &expr) in input.nonzeros().iter().enumerate() {
+                        let contrib = helper_outputs[slot].nz(offset);
+                        adjoints
+                            .entry(expr)
+                            .and_modify(|entry| *entry += contrib)
+                            .or_insert(contrib);
+                    }
+                }
+            }
             NodeKind::Constant(_) | NodeKind::Symbol { .. } => {}
         }
     }
@@ -945,6 +1072,20 @@ pub(crate) fn depends_on(expr: SX, target: SX, memo: &mut HashMap<SX, bool>) -> 
         NodeKind::Unary { arg, .. } => depends_on(arg, target, memo),
         NodeKind::Binary { lhs, rhs, .. } => {
             depends_on(lhs, target, memo) || depends_on(rhs, target, memo)
+        }
+        NodeKind::Call {
+            function,
+            inputs,
+            output_slot,
+            output_offset,
+        } => {
+            let profile = dependency_profile(function);
+            inputs.iter().enumerate().any(|(slot, input)| {
+                input.nonzeros().iter().enumerate().any(|(offset, &value)| {
+                    profile.output_depends_on(output_slot, output_offset, slot, offset)
+                        && depends_on(value, target, memo)
+                })
+            })
         }
     };
     memo.insert(expr, answer);
@@ -1142,6 +1283,18 @@ impl SX {
             NodeKind::Symbol { name, serial } => NodeView::Symbol { name, serial },
             NodeKind::Unary { op, arg } => NodeView::Unary { op, arg },
             NodeKind::Binary { op, lhs, rhs } => NodeView::Binary { op, lhs, rhs },
+            NodeKind::Call {
+                function,
+                inputs,
+                output_slot,
+                output_offset,
+            } => NodeView::Call {
+                function_id: function,
+                function_name: function_name(function).unwrap_or_else(|| format!("fn_{function}")),
+                inputs,
+                output_slot,
+                output_offset,
+            },
         }
     }
 
@@ -1177,6 +1330,21 @@ impl SX {
                     stack.push(lhs);
                     stack.push(rhs);
                 }
+                NodeKind::Call {
+                    function,
+                    inputs,
+                    output_slot,
+                    output_offset,
+                } => {
+                    let profile = dependency_profile(function);
+                    for (slot, input) in inputs.iter().enumerate() {
+                        for (offset, &expr) in input.nonzeros().iter().enumerate() {
+                            if profile.output_depends_on(output_slot, output_offset, slot, offset) {
+                                stack.push(expr);
+                            }
+                        }
+                    }
+                }
             }
         }
         free
@@ -1185,7 +1353,10 @@ impl SX {
     pub fn symbol_name(self) -> Option<String> {
         match node_kind(self) {
             NodeKind::Symbol { name, .. } => Some(name),
-            NodeKind::Constant(_) | NodeKind::Unary { .. } | NodeKind::Binary { .. } => None,
+            NodeKind::Constant(_)
+            | NodeKind::Unary { .. }
+            | NodeKind::Binary { .. }
+            | NodeKind::Call { .. } => None,
         }
     }
 

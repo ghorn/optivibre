@@ -17,7 +17,8 @@ use std::sync::{
     atomic::{AtomicU8, Ordering},
 };
 use std::time::{Duration, Instant};
-pub use sx_codegen_llvm::LlvmOptimizationLevel;
+pub use sx_codegen_llvm::{FunctionCompileOptions, LlvmOptimizationLevel};
+pub use sx_core::{CallPolicy, CallPolicyConfig, CompileStats, CompileWarning};
 use thiserror::Error;
 
 mod interior_point;
@@ -231,6 +232,26 @@ pub struct SymbolicCompileMetadata {
     pub stats: NlpCompileStats,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SymbolicSetupProfile {
+    pub symbolic_construction: Option<Duration>,
+    pub objective_gradient: Option<Duration>,
+    pub equality_jacobian: Option<Duration>,
+    pub inequality_jacobian: Option<Duration>,
+    pub lagrangian_assembly: Option<Duration>,
+    pub hessian_generation: Option<Duration>,
+    pub lowering: Option<Duration>,
+    pub llvm_jit: Option<Duration>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BackendCompileReport {
+    pub timing: BackendTimingMetadata,
+    pub setup_profile: SymbolicSetupProfile,
+    pub stats: CompileStats,
+    pub warnings: Vec<CompileWarning>,
+}
+
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EvalTimingStat {
@@ -408,6 +429,9 @@ pub trait CompiledNlpProblem {
     }
     fn backend_timing_metadata(&self) -> BackendTimingMetadata {
         BackendTimingMetadata::default()
+    }
+    fn backend_compile_report(&self) -> Option<&BackendCompileReport> {
+        None
     }
     fn adapter_timing_snapshot(&self) -> Option<SolverAdapterTiming> {
         self.sqp_adapter_timing_snapshot()

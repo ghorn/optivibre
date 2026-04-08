@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use sx_core::{BinaryOp, NodeView, SX, UnaryOp};
+use sx_core::{BinaryOp, NodeView, SX, UnaryOp, lookup_function};
 
 pub fn eval(expr: SX, vars: &HashMap<u32, f64>) -> f64 {
     match expr.inspect() {
@@ -53,6 +53,26 @@ pub fn eval(expr: SX, vars: &HashMap<u32, f64>) -> f64 {
                 BinaryOp::Hypot => lhs.hypot(rhs),
                 BinaryOp::Mod => lhs % rhs,
                 BinaryOp::Copysign => lhs.copysign(rhs),
+            }
+        }
+        NodeView::Call {
+            function_id,
+            inputs,
+            output_slot,
+            output_offset,
+            ..
+        } => {
+            let function = lookup_function(function_id).expect("call should reference a function");
+            let evaluated_inputs = inputs
+                .iter()
+                .map(|input| input.map_nonzeros(|value| SX::from(eval(value, vars))))
+                .collect::<Vec<_>>();
+            let outputs = function
+                .call(&evaluated_inputs)
+                .expect("symbolic function call should evaluate");
+            match outputs[output_slot].nonzeros()[output_offset].inspect() {
+                NodeView::Constant(value) => value,
+                other => panic!("expected evaluated call output to be constant, got {other:?}"),
             }
         }
     }

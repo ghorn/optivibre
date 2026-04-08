@@ -5,8 +5,8 @@ use serde::Serialize;
 
 use crate::manifest::{KnownStatus, ProblemSpeed, manifest_entry_by_id};
 use crate::model::{
-    JitOptLevel, ProblemCase, ProblemDescriptor, ProblemRunOptions, ProblemRunRecord, RunStatus,
-    SolverKind, ValidationOutcome, ValidationTier,
+    CallPolicyMode, JitOptLevel, ProblemCase, ProblemDescriptor, ProblemRunOptions,
+    ProblemRunRecord, RunStatus, SolverKind, ValidationOutcome, ValidationTier,
 };
 use crate::registry::registry;
 
@@ -28,6 +28,7 @@ impl Default for RunRequest {
             solvers: vec![SolverKind::Sqp, SolverKind::Nlip],
             run_options: vec![ProblemRunOptions {
                 jit_opt_level: JitOptLevel::O3,
+                call_policy: CallPolicyMode::InlineAtLowering,
             }],
             jobs: None,
             include_skipped: false,
@@ -138,7 +139,7 @@ pub fn run_cases(request: &RunRequest) -> Result<RunResults> {
         left.id
             .cmp(&right.id)
             .then_with(|| left.solver.label().cmp(right.solver.label()))
-            .then_with(|| left.options.label().cmp(right.options.label()))
+            .then_with(|| left.options.label().cmp(&right.options.label()))
     });
 
     if let Some(progress) = progress {
@@ -215,6 +216,7 @@ fn skipped_record(
         },
         solver_thresholds: None,
         error: None,
+        compile_report: None,
         console_output: None,
         console_output_path: None,
     }
