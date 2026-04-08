@@ -1154,10 +1154,10 @@ where
         }
     }
 
-    pub fn compile_with_progress<Compiled, Compile>(
+    fn compile_progress<Compiled, Compile>(
         &mut self,
         compile: Compile,
-    ) -> Result<(Compiled, SolverReport)>
+    ) -> Result<(Compiled, CompileProgressInfo)>
     where
         Compile: FnOnce(
             &mut dyn FnMut(CompileProgressUpdate),
@@ -1175,7 +1175,19 @@ where
                     .with_phase_details(update.phase_details),
             );
         };
-        let (compiled, progress) = compile(&mut on_symbolic_ready)?;
+        compile(&mut on_symbolic_ready)
+    }
+
+    pub fn compile_with_progress<Compiled, Compile>(
+        &mut self,
+        compile: Compile,
+    ) -> Result<(Compiled, SolverReport)>
+    where
+        Compile: FnOnce(
+            &mut dyn FnMut(CompileProgressUpdate),
+        ) -> Result<(Compiled, CompileProgressInfo)>,
+    {
+        let (compiled, progress) = self.compile_progress(compile)?;
         let running_solver = SolverReport::in_progress(solver_running_label(self.solver_method))
             .with_backend_timing(progress.timing)
             .with_compile_cached(progress.compile_cached)
@@ -1189,7 +1201,16 @@ where
             &mut dyn FnMut(CompileProgressUpdate),
         ) -> Result<(Compiled, CompileProgressInfo)>,
     {
-        let _ = self.compile_with_progress(compile)?;
+        let (_, progress) = self.compile_progress(compile)?;
+        emit_solve_status(
+            &mut self.emit,
+            SolveStage::JitCompilation,
+            None,
+            SolverReport::in_progress("Compiling JIT...")
+                .with_backend_timing(progress.timing)
+                .with_compile_cached(progress.compile_cached)
+                .with_phase_details(progress.phase_details),
+        );
         Ok(())
     }
 
@@ -4042,6 +4063,68 @@ mod tests {
         assert!(!running_solver.compile_cached);
         assert_eq!(running_solver.phase_details.symbolic_setup.len(), 1);
         assert_eq!(running_solver.phase_details.jit.len(), 1);
+    }
+
+    #[test]
+    fn prewarm_with_progress_emits_final_jit_timing_status() {
+        let symbolic_timing = BackendTimingMetadata {
+            function_creation_time: Some(Duration::from_millis(250)),
+            derivative_generation_time: Some(Duration::from_millis(500)),
+            jit_time: None,
+        };
+        let compiled_timing = BackendTimingMetadata {
+            function_creation_time: Some(Duration::from_millis(250)),
+            derivative_generation_time: Some(Duration::from_millis(500)),
+            jit_time: Some(Duration::from_secs(2)),
+        };
+        let mut events = Vec::new();
+        {
+            let mut reporter =
+                SolveLifecycleReporter::new(|event| events.push(event), SolverMethod::Sqp);
+            reporter
+                .prewarm_with_progress(|on_symbolic_ready| {
+                    on_symbolic_ready(CompileProgressUpdate {
+                        timing: symbolic_timing,
+                        phase_details: SolverPhaseDetails {
+                            symbolic_setup: vec![phase_detail("Vars", "2")],
+                            jit: vec![phase_detail("NLP Kernels", "3")],
+                            solve: Vec::new(),
+                        },
+                        compile_cached: false,
+                    });
+                    Ok::<_, anyhow::Error>((
+                        "compiled",
+                        CompileProgressInfo {
+                            timing: compiled_timing,
+                            compile_cached: false,
+                            phase_details: SolverPhaseDetails {
+                                symbolic_setup: vec![phase_detail("Vars", "2")],
+                                jit: vec![phase_detail("NLP Kernels", "3")],
+                                solve: Vec::new(),
+                            },
+                        },
+                    ))
+                })
+                .expect("prewarm should succeed");
+        }
+
+        assert_eq!(
+            events.len(),
+            3,
+            "expected symbolic, in-progress jit, and final jit statuses"
+        );
+
+        match &events[2] {
+            SolveStreamEvent::Status { status } => {
+                assert_eq!(status.stage, SolveStage::JitCompilation);
+                assert_eq!(status.solver.status_label, "Compiling JIT...");
+                assert_close(status.solver.symbolic_setup_s, 0.75);
+                assert_close(status.solver.jit_s, 2.0);
+                assert!(!status.solver.compile_cached);
+                assert_eq!(status.solver.phase_details.jit.len(), 1);
+            }
+            event => panic!("expected final jit status, got {event:?}"),
+        }
     }
 
     #[test]
