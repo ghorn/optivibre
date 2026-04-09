@@ -1,10 +1,13 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crate::Index;
 use crate::error::{Result, SxError};
-use crate::sx::{call_output, depends_on, forward_directional, reverse_directional};
+use crate::sx::{
+    CallInputs, NodeKind, call_output, call_output_with_inputs, forward_directional,
+    forward_directional_batch, node_kind, reverse_directional,
+};
 use crate::{BinaryOp, NodeView, SX, SXMatrix, UnaryOp};
 
 pub type FunctionId = usize;
@@ -107,9 +110,10 @@ struct FunctionRegistry {
 
 #[derive(Default)]
 struct FunctionCaches {
-    dependency_profiles: HashMap<FunctionId, DependencyProfile>,
-    forward_helpers: HashMap<FunctionId, SXFunction>,
-    reverse_helpers: HashMap<FunctionId, SXFunction>,
+    dependency_profiles: HashMap<FunctionId, Arc<DependencyProfile>>,
+    forward_helpers: HashMap<FunctionId, Arc<SXFunction>>,
+    forward_batch_helpers: HashMap<(FunctionId, usize), Arc<SXFunction>>,
+    reverse_scalar_helpers: HashMap<(FunctionId, Index, Index), Arc<SXFunction>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,6 +137,14 @@ impl InlineStage {
 #[derive(Default)]
 struct RewriteState {
     warned_ignored_overrides: HashSet<FunctionId>,
+    resolved_call_policies: HashMap<RewrittenCallSiteKey, CallPolicy>,
+    expanded_calls: HashMap<RewrittenCallSiteKey, Vec<SXMatrix>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct RewrittenCallSiteKey {
+    function_id: FunctionId,
+    inputs: Vec<SXMatrix>,
 }
 
 static NEXT_FUNCTION_ID: AtomicUsize = AtomicUsize::new(1);
@@ -167,11 +179,7 @@ fn next_function_id() -> FunctionId {
     NEXT_FUNCTION_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-fn validate_function(
-    name: &str,
-    inputs: &[NamedMatrix],
-    outputs: &[NamedMatrix],
-) -> Result<()> {
+fn validate_function(name: &str, inputs: &[NamedMatrix], outputs: &[NamedMatrix]) -> Result<()> {
     if name.trim().is_empty() {
         return Err(SxError::Graph("function name cannot be empty".into()));
     }
@@ -206,18 +214,63 @@ fn validate_function(
                 output.name
             )));
         }
+    }
+
+    let mut missing_symbol_memo = HashMap::new();
+    for output in outputs {
         for &expr in output.matrix.nonzeros() {
-            for symbol in expr.free_symbols() {
-                if !input_symbols.contains(&symbol) {
-                    return Err(SxError::Graph(format!(
-                        "output {} references free symbol {symbol} not present in inputs",
-                        output.name
-                    )));
-                }
+            if let Some(symbol) =
+                first_non_input_symbol(expr, &input_symbols, &mut missing_symbol_memo)
+            {
+                return Err(SxError::Graph(format!(
+                    "output {} references free symbol {symbol} not present in inputs",
+                    output.name
+                )));
             }
         }
     }
     Ok(())
+}
+
+fn first_non_input_symbol(
+    expr: SX,
+    input_symbols: &HashSet<SX>,
+    memo: &mut HashMap<SX, Option<SX>>,
+) -> Option<SX> {
+    if let Some(existing) = memo.get(&expr) {
+        return *existing;
+    }
+
+    let missing = match node_kind(expr) {
+        NodeKind::Constant(_) => None,
+        NodeKind::Symbol { .. } => (!input_symbols.contains(&expr)).then_some(expr),
+        NodeKind::Unary { arg, .. } => first_non_input_symbol(arg, input_symbols, memo),
+        NodeKind::Binary { lhs, rhs, .. } => first_non_input_symbol(lhs, input_symbols, memo)
+            .or_else(|| first_non_input_symbol(rhs, input_symbols, memo)),
+        NodeKind::Call {
+            function,
+            inputs,
+            output_slot,
+            output_offset,
+        } => {
+            let profile = dependency_profile(function);
+            let mut missing = None;
+            'slots: for (slot, input) in inputs.iter().enumerate() {
+                for (offset, &value) in input.nonzeros().iter().enumerate() {
+                    if profile.output_depends_on(output_slot, output_offset, slot, offset) {
+                        if let Some(symbol) = first_non_input_symbol(value, input_symbols, memo) {
+                            missing = Some(symbol);
+                            break 'slots;
+                        }
+                    }
+                }
+            }
+            missing
+        }
+    };
+
+    memo.insert(expr, missing);
+    missing
 }
 
 pub(crate) fn function_by_id(id: FunctionId) -> Option<SXFunction> {
@@ -253,7 +306,7 @@ impl DependencyProfile {
     }
 }
 
-pub(crate) fn dependency_profile(function_id: FunctionId) -> DependencyProfile {
+pub(crate) fn dependency_profile(function_id: FunctionId) -> Arc<DependencyProfile> {
     if let Some(profile) = lock_caches().dependency_profiles.get(&function_id).cloned() {
         return profile;
     }
@@ -265,34 +318,95 @@ pub(crate) fn dependency_profile(function_id: FunctionId) -> DependencyProfile {
         input_offsets.push(flat_inputs.len());
         flat_inputs.extend(input.matrix().nonzeros().iter().copied());
     }
+    let input_index_by_symbol = flat_inputs
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, symbol)| (symbol, index))
+        .collect::<HashMap<_, _>>();
+    let mut memo = HashMap::<SX, Vec<bool>>::new();
 
     let mut output_offsets = Vec::with_capacity(function.outputs.len());
     let mut deps = Vec::new();
     for output in function.outputs() {
         output_offsets.push(deps.len());
         for &expr in output.matrix().nonzeros() {
-            deps.push(
-                flat_inputs
-                    .iter()
-                    .copied()
-                    .map(|symbol| depends_on(expr, symbol, &mut HashMap::new()))
-                    .collect(),
-            );
+            deps.push(expr_dependency_mask(
+                expr,
+                &input_index_by_symbol,
+                &mut memo,
+            ));
         }
     }
 
-    let profile = DependencyProfile {
+    let profile = Arc::new(DependencyProfile {
         input_offsets,
         output_offsets,
         deps,
-    };
+    });
     lock_caches()
         .dependency_profiles
         .insert(function_id, profile.clone());
     profile
 }
 
-pub(crate) fn forward_helper(function_id: FunctionId) -> Result<SXFunction> {
+fn expr_dependency_mask(
+    expr: SX,
+    input_index_by_symbol: &HashMap<SX, usize>,
+    memo: &mut HashMap<SX, Vec<bool>>,
+) -> Vec<bool> {
+    if let Some(existing) = memo.get(&expr) {
+        return existing.clone();
+    }
+
+    let input_count = input_index_by_symbol.len();
+    let deps = match node_kind(expr) {
+        NodeKind::Constant(_) => vec![false; input_count],
+        NodeKind::Symbol { .. } => {
+            let mut deps = vec![false; input_count];
+            if let Some(&index) = input_index_by_symbol.get(&expr) {
+                deps[index] = true;
+            }
+            deps
+        }
+        NodeKind::Unary { arg, .. } => expr_dependency_mask(arg, input_index_by_symbol, memo),
+        NodeKind::Binary { lhs, rhs, .. } => {
+            let mut deps = expr_dependency_mask(lhs, input_index_by_symbol, memo);
+            let rhs_deps = expr_dependency_mask(rhs, input_index_by_symbol, memo);
+            merge_dependency_masks(&mut deps, &rhs_deps);
+            deps
+        }
+        NodeKind::Call {
+            function,
+            inputs,
+            output_slot,
+            output_offset,
+        } => {
+            let profile = dependency_profile(function);
+            let mut deps = vec![false; input_count];
+            for (slot, input) in inputs.iter().enumerate() {
+                for (offset, &value) in input.nonzeros().iter().enumerate() {
+                    if profile.output_depends_on(output_slot, output_offset, slot, offset) {
+                        let value_deps = expr_dependency_mask(value, input_index_by_symbol, memo);
+                        merge_dependency_masks(&mut deps, &value_deps);
+                    }
+                }
+            }
+            deps
+        }
+    };
+
+    memo.insert(expr, deps.clone());
+    deps
+}
+
+fn merge_dependency_masks(dst: &mut [bool], src: &[bool]) {
+    for (dst_value, &src_value) in dst.iter_mut().zip(src.iter()) {
+        *dst_value |= src_value;
+    }
+}
+
+pub(crate) fn forward_helper(function_id: FunctionId) -> Result<Arc<SXFunction>> {
     if let Some(helper) = lock_caches().forward_helpers.get(&function_id).cloned() {
         return Ok(helper);
     }
@@ -324,42 +438,57 @@ pub(crate) fn forward_helper(function_id: FunctionId) -> Result<SXFunction> {
         .outputs()
         .iter()
         .map(|output| {
-            let directional =
-                forward_directional(output.matrix().nonzeros(), &vars, &seeds)?;
+            let directional = forward_directional(output.matrix().nonzeros(), &vars, &seeds)?;
             NamedMatrix::new(
                 format!("{}_directional", output.name()),
                 SXMatrix::new(output.matrix().ccs().clone(), directional)?,
             )
         })
         .collect::<Result<Vec<_>>>()?;
-    let helper = SXFunction::new(
+    let helper = Arc::new(SXFunction::from_parts(
         format!("{}_forward_helper", function.name()),
         helper_inputs,
         helper_outputs,
-    )?;
+        function.call_policy_override(),
+    )?);
     lock_caches()
         .forward_helpers
         .insert(function_id, helper.clone());
     Ok(helper)
 }
 
-pub(crate) fn reverse_helper(function_id: FunctionId) -> Result<SXFunction> {
-    if let Some(helper) = lock_caches().reverse_helpers.get(&function_id).cloned() {
+pub(crate) fn forward_batch_helper(
+    function_id: FunctionId,
+    directions: usize,
+) -> Result<Arc<SXFunction>> {
+    if directions <= 1 {
+        return forward_helper(function_id);
+    }
+    if let Some(helper) = lock_caches()
+        .forward_batch_helpers
+        .get(&(function_id, directions))
+        .cloned()
+    {
         return Ok(helper);
     }
+
     let function = function_by_id(function_id).expect("function id must be registered");
     let mut helper_inputs = function.inputs.clone();
-    let mut output_seeds = Vec::with_capacity(function.outputs.len());
-    for output in function.outputs() {
-        let seed_matrix = SXMatrix::sym(
-            format!("{}_seed_{}", function.name(), output.name()),
-            output.matrix().ccs().clone(),
-        )?;
-        output_seeds.push(seed_matrix.clone());
-        helper_inputs.push(NamedMatrix::new(
-            format!("seed_{}", output.name()),
-            seed_matrix,
-        )?);
+    let mut seed_inputs_by_direction = Vec::with_capacity(directions);
+    for direction in 0..directions {
+        let mut direction_seed_inputs = Vec::with_capacity(function.inputs.len());
+        for input in function.inputs() {
+            let seed_matrix = SXMatrix::sym(
+                format!("{}_seed_{}_{}", function.name(), direction, input.name()),
+                input.matrix().ccs().clone(),
+            )?;
+            direction_seed_inputs.push(seed_matrix.clone());
+            helper_inputs.push(NamedMatrix::new(
+                format!("seed_{}_{}", direction, input.name()),
+                seed_matrix,
+            )?);
+        }
+        seed_inputs_by_direction.push(direction_seed_inputs);
     }
 
     let vars = function
@@ -367,23 +496,68 @@ pub(crate) fn reverse_helper(function_id: FunctionId) -> Result<SXFunction> {
         .iter()
         .flat_map(|input| input.matrix().nonzeros().iter().copied())
         .collect::<Vec<_>>();
-    let outputs = function
-        .outputs()
+    let seeds_by_direction = seed_inputs_by_direction
         .iter()
-        .flat_map(|output| output.matrix().nonzeros().iter().copied())
+        .map(|direction_inputs| {
+            direction_inputs
+                .iter()
+                .flat_map(|seed| seed.nonzeros().iter().copied())
+                .collect::<Vec<_>>()
+        })
         .collect::<Vec<_>>();
-    let seeds = output_seeds
+
+    let mut helper_outputs = Vec::with_capacity(function.outputs.len() * directions);
+    for output in function.outputs() {
+        let directional_by_direction =
+            forward_directional_batch(output.matrix().nonzeros(), &vars, &seeds_by_direction)?;
+        for (direction, directional) in directional_by_direction.into_iter().enumerate() {
+            helper_outputs.push(NamedMatrix::new(
+                format!("{}_directional_{}", output.name(), direction),
+                SXMatrix::new(output.matrix().ccs().clone(), directional)?,
+            )?);
+        }
+    }
+
+    let helper = Arc::new(SXFunction::from_parts(
+        format!("{}_forward_batch_helper_{}", function.name(), directions),
+        helper_inputs,
+        helper_outputs,
+        function.call_policy_override(),
+    )?);
+    lock_caches()
+        .forward_batch_helpers
+        .insert((function_id, directions), helper.clone());
+    Ok(helper)
+}
+
+pub(crate) fn reverse_scalar_helper(
+    function_id: FunctionId,
+    output_slot: Index,
+    output_offset: Index,
+) -> Result<Arc<SXFunction>> {
+    if let Some(helper) = lock_caches()
+        .reverse_scalar_helpers
+        .get(&(function_id, output_slot, output_offset))
+        .cloned()
+    {
+        return Ok(helper);
+    }
+
+    let function = function_by_id(function_id).expect("function id must be registered");
+    let vars = function
+        .inputs()
         .iter()
-        .flat_map(|seed| seed.nonzeros().iter().copied())
+        .flat_map(|input| input.matrix().nonzeros().iter().copied())
         .collect::<Vec<_>>();
-    let adjoints = reverse_directional(&outputs, &vars, &seeds)?;
+    let selected_output = function.outputs()[output_slot].matrix().nz(output_offset);
+    let adjoints = reverse_directional(&[selected_output], &vars, &[SX::one()])?;
 
     let mut helper_outputs = Vec::with_capacity(function.inputs.len());
     let mut offset = 0;
     for input in function.inputs() {
         let next_offset = offset + input.matrix().nnz();
         helper_outputs.push(NamedMatrix::new(
-            format!("{}_adjoint", input.name()),
+            format!("{}_grad", input.name()),
             SXMatrix::new(
                 input.matrix().ccs().clone(),
                 adjoints[offset..next_offset].to_vec(),
@@ -392,14 +566,20 @@ pub(crate) fn reverse_helper(function_id: FunctionId) -> Result<SXFunction> {
         offset = next_offset;
     }
 
-    let helper = SXFunction::new(
-        format!("{}_reverse_helper", function.name()),
-        helper_inputs,
+    let helper = Arc::new(SXFunction::from_parts(
+        format!(
+            "{}_reverse_output_{}_{}_helper",
+            function.name(),
+            output_slot,
+            output_offset
+        ),
+        function.inputs.clone(),
         helper_outputs,
-    )?;
+        function.call_policy_override(),
+    )?);
     lock_caches()
-        .reverse_helpers
-        .insert(function_id, helper.clone());
+        .reverse_scalar_helpers
+        .insert((function_id, output_slot, output_offset), helper.clone());
     Ok(helper)
 }
 
@@ -482,6 +662,168 @@ fn record_policy(stats: &mut CompileStats, policy: CallPolicy) {
     }
 }
 
+fn scan_call_policy(
+    function: &SXFunction,
+    config: CallPolicyConfig,
+    stats: &mut CompileStats,
+    warnings: &mut Vec<CompileWarning>,
+    warned_ignored_overrides: &mut HashSet<FunctionId>,
+) -> CallPolicy {
+    match function.call_policy_override() {
+        Some(policy) if config.respect_function_overrides => {
+            stats.overrides_applied += 1;
+            policy
+        }
+        Some(policy) => {
+            stats.overrides_ignored += 1;
+            if warned_ignored_overrides.insert(function.id()) {
+                warnings.push(CompileWarning {
+                    message: format!(
+                        "ignored call policy override {:?} on {}; enforced global policy {:?}",
+                        policy,
+                        function.name(),
+                        config.default_policy
+                    ),
+                });
+            }
+            config.default_policy
+        }
+        None => config.default_policy,
+    }
+}
+
+fn scan_expr_for_stage(
+    expr: SX,
+    config: CallPolicyConfig,
+    stage: InlineStage,
+    seen_exprs: &mut HashSet<SX>,
+    seen_calls: &mut HashSet<RewrittenCallSiteKey>,
+    warned_ignored_overrides: &mut HashSet<FunctionId>,
+    stats: &mut CompileStats,
+    warnings: &mut Vec<CompileWarning>,
+    requires_inlining: &mut bool,
+    depth: usize,
+) -> Result<()> {
+    if !seen_exprs.insert(expr) {
+        return Ok(());
+    }
+    match expr.inspect() {
+        NodeView::Constant(_) | NodeView::Symbol { .. } => {}
+        NodeView::Unary { arg, .. } => {
+            scan_expr_for_stage(
+                arg,
+                config,
+                stage,
+                seen_exprs,
+                seen_calls,
+                warned_ignored_overrides,
+                stats,
+                warnings,
+                requires_inlining,
+                depth,
+            )?;
+        }
+        NodeView::Binary { lhs, rhs, .. } => {
+            scan_expr_for_stage(
+                lhs,
+                config,
+                stage,
+                seen_exprs,
+                seen_calls,
+                warned_ignored_overrides,
+                stats,
+                warnings,
+                requires_inlining,
+                depth,
+            )?;
+            scan_expr_for_stage(
+                rhs,
+                config,
+                stage,
+                seen_exprs,
+                seen_calls,
+                warned_ignored_overrides,
+                stats,
+                warnings,
+                requires_inlining,
+                depth,
+            )?;
+        }
+        NodeView::Call {
+            function_id,
+            inputs,
+            ..
+        } => {
+            let callee = function_by_id(function_id)
+                .ok_or_else(|| SxError::Graph(format!("unknown function id {function_id}")))?;
+            stats.max_call_depth = stats.max_call_depth.max(depth + 1);
+            let key = RewrittenCallSiteKey {
+                function_id,
+                inputs: inputs.clone(),
+            };
+            if seen_calls.insert(key) {
+                let policy =
+                    scan_call_policy(&callee, config, stats, warnings, warned_ignored_overrides);
+                record_policy(stats, policy);
+                if stage.should_inline(policy) {
+                    *requires_inlining = true;
+                    match stage {
+                        InlineStage::Call => stats.inlines_at_call += 1,
+                        InlineStage::Lowering => stats.inlines_at_lowering += 1,
+                    }
+                }
+            }
+            for input in &inputs {
+                for &value in input.nonzeros() {
+                    scan_expr_for_stage(
+                        value,
+                        config,
+                        stage,
+                        seen_exprs,
+                        seen_calls,
+                        warned_ignored_overrides,
+                        stats,
+                        warnings,
+                        requires_inlining,
+                        depth + 1,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn function_requires_rewrite_for_stage(
+    function: &SXFunction,
+    config: CallPolicyConfig,
+    stage: InlineStage,
+    stats: &mut CompileStats,
+    warnings: &mut Vec<CompileWarning>,
+) -> Result<bool> {
+    let mut seen_exprs = HashSet::new();
+    let mut seen_calls = HashSet::new();
+    let mut warned_ignored_overrides = HashSet::new();
+    let mut requires_inlining = false;
+    for output in function.outputs() {
+        for &expr in output.matrix().nonzeros() {
+            scan_expr_for_stage(
+                expr,
+                config,
+                stage,
+                &mut seen_exprs,
+                &mut seen_calls,
+                &mut warned_ignored_overrides,
+                stats,
+                warnings,
+                &mut requires_inlining,
+                0,
+            )?;
+        }
+    }
+    Ok(requires_inlining)
+}
+
 fn rewrite_expr(
     expr: SX,
     bindings: &HashMap<SX, SX>,
@@ -523,33 +865,56 @@ fn rewrite_expr(
         } => {
             let callee = function_by_id(function_id)
                 .ok_or_else(|| SxError::Graph(format!("unknown function id {function_id}")))?;
-            let policy = resolve_call_policy(&callee, config, stats, warnings, state);
-            record_policy(stats, policy);
             let rewritten_inputs = inputs
                 .iter()
                 .map(|input| {
                     rewrite_matrix(
-                        input, bindings, config, stage, stats, warnings, state, depth + 1,
+                        input,
+                        bindings,
+                        config,
+                        stage,
+                        stats,
+                        warnings,
+                        state,
+                        depth + 1,
                     )
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let key = RewrittenCallSiteKey {
+                function_id,
+                inputs: rewritten_inputs.clone(),
+            };
+            let policy = if let Some(existing) = state.resolved_call_policies.get(&key).copied() {
+                existing
+            } else {
+                let policy = resolve_call_policy(&callee, config, stats, warnings, state);
+                record_policy(stats, policy);
+                state.resolved_call_policies.insert(key.clone(), policy);
+                policy
+            };
             stats.max_call_depth = stats.max_call_depth.max(depth + 1);
             if stage.should_inline(policy) {
-                match stage {
-                    InlineStage::Call => stats.inlines_at_call += 1,
-                    InlineStage::Lowering => stats.inlines_at_lowering += 1,
+                if let Some(outputs) = state.expanded_calls.get(&key) {
+                    outputs[output_slot].nz(output_offset)
+                } else {
+                    match stage {
+                        InlineStage::Call => stats.inlines_at_call += 1,
+                        InlineStage::Lowering => stats.inlines_at_lowering += 1,
+                    }
+                    let outputs = rewrite_function_outputs(
+                        &callee,
+                        &rewritten_inputs,
+                        config,
+                        stage,
+                        stats,
+                        warnings,
+                        state,
+                        depth + 1,
+                    )?;
+                    let value = outputs[output_slot].nz(output_offset);
+                    state.expanded_calls.insert(key, outputs);
+                    value
                 }
-                rewrite_function_outputs(
-                    &callee,
-                    &rewritten_inputs,
-                    config,
-                    stage,
-                    stats,
-                    warnings,
-                    state,
-                    depth + 1,
-                )?[output_slot]
-                    .nz(output_offset)
             } else {
                 call_output(function_id, rewritten_inputs, output_slot, output_offset)
             }
@@ -557,6 +922,32 @@ fn rewrite_expr(
     };
     memo.insert(expr, rewritten);
     Ok(rewritten)
+}
+
+fn rewrite_matrix_with_memo(
+    matrix: &SXMatrix,
+    bindings: &HashMap<SX, SX>,
+    config: CallPolicyConfig,
+    stage: InlineStage,
+    mut memo: &mut HashMap<SX, SX>,
+    stats: &mut CompileStats,
+    warnings: &mut Vec<CompileWarning>,
+    state: &mut RewriteState,
+    depth: usize,
+) -> Result<SXMatrix> {
+    SXMatrix::new(
+        matrix.ccs().clone(),
+        matrix
+            .nonzeros()
+            .iter()
+            .copied()
+            .map(|expr| {
+                rewrite_expr(
+                    expr, bindings, config, stage, &mut memo, stats, warnings, state, depth,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?,
+    )
 }
 
 fn rewrite_matrix(
@@ -570,16 +961,8 @@ fn rewrite_matrix(
     depth: usize,
 ) -> Result<SXMatrix> {
     let mut memo = HashMap::new();
-    SXMatrix::new(
-        matrix.ccs().clone(),
-        matrix
-            .nonzeros()
-            .iter()
-            .copied()
-            .map(|expr| {
-                rewrite_expr(expr, bindings, config, stage, &mut memo, stats, warnings, state, depth)
-            })
-            .collect::<Result<Vec<_>>>()?,
+    rewrite_matrix_with_memo(
+        matrix, bindings, config, stage, &mut memo, stats, warnings, state, depth,
     )
 }
 
@@ -606,15 +989,17 @@ fn rewrite_function_outputs(
                 .zip(actual.nonzeros().iter().copied())
         })
         .collect::<HashMap<_, _>>();
+    let mut memo = HashMap::new();
     function
         .outputs()
         .iter()
         .map(|output| {
-            rewrite_matrix(
+            rewrite_matrix_with_memo(
                 output.matrix(),
                 &bindings,
                 config,
                 stage,
+                &mut memo,
                 stats,
                 warnings,
                 state,
@@ -631,7 +1016,15 @@ pub fn rewrite_function_for_stage(
     stats: &mut CompileStats,
     warnings: &mut Vec<CompileWarning>,
 ) -> Result<SXFunction> {
+    let stats_before = stats.clone();
+    let warnings_before = warnings.len();
+    if !function_requires_rewrite_for_stage(function, config, stage, stats, warnings)? {
+        return Ok(function.clone());
+    }
+    *stats = stats_before;
+    warnings.truncate(warnings_before);
     let mut state = RewriteState::default();
+    let mut memo = HashMap::new();
     let inputs = function.inputs.clone();
     let outputs = function
         .outputs()
@@ -639,11 +1032,12 @@ pub fn rewrite_function_for_stage(
         .map(|output| {
             Ok(NamedMatrix::new(
                 output.name(),
-                rewrite_matrix(
+                rewrite_matrix_with_memo(
                     output.matrix(),
                     &HashMap::new(),
                     config,
                     stage,
+                    &mut memo,
                     stats,
                     warnings,
                     &mut state,
@@ -736,13 +1130,15 @@ impl SXFunction {
     }
 
     pub fn with_call_policy_override(&self, policy: CallPolicy) -> Self {
-        Self::from_parts(
-            self.name.clone(),
-            self.inputs.clone(),
-            self.outputs.clone(),
-            Some(policy),
-        )
-        .expect("existing function definition should remain valid when adding a policy override")
+        let function = Self {
+            id: next_function_id(),
+            name: self.name.clone(),
+            inputs: self.inputs.clone(),
+            outputs: self.outputs.clone(),
+            call_policy_override: Some(policy),
+        };
+        register_function(function.clone());
+        function
     }
 
     pub fn size_in(&self, slot: Index) -> (Index, Index) {
@@ -796,12 +1192,15 @@ impl SXFunction {
                 )));
             }
         }
+        let call_inputs = CallInputs::from_slice(inputs);
         self.outputs
             .iter()
             .enumerate()
             .map(|(slot, output)| {
                 let nonzeros = (0..output.matrix().nnz())
-                    .map(|offset| call_output(self.id, inputs.to_vec(), slot, offset))
+                    .map(|offset| {
+                        call_output_with_inputs(self.id, call_inputs.clone(), slot, offset)
+                    })
                     .collect();
                 SXMatrix::new(output.matrix().ccs().clone(), nonzeros)
             })

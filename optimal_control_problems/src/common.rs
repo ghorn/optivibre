@@ -10,19 +10,24 @@ use std::time::Instant;
 use anyhow::{Result, anyhow};
 use optimal_control::{
     Bounds1D, CollocationFamily, CompiledDirectCollocationOcp, CompiledMultipleShootingOcp,
-    DirectCollocationInteriorPointSnapshot, DirectCollocationRuntimeValues,
-    DirectCollocationSqpSnapshot, DirectCollocationTimeGrid, DirectCollocationTrajectories,
-    IntervalArc, MultipleShootingInteriorPointSnapshot, MultipleShootingRuntimeValues,
-    MultipleShootingSqpSnapshot, MultipleShootingTrajectories, OcpCompileHelperKind,
-    OcpCompileProgress, OcpConstraintCategory, OcpConstraintViolationReport, OcpHelperCompileStats,
+    ControllerFn, DirectCollocationInitialGuess, DirectCollocationInteriorPointSnapshot,
+    DirectCollocationRuntimeValues, DirectCollocationSqpSnapshot, DirectCollocationTimeGrid,
+    DirectCollocationTrajectories, InterpolatedTrajectory, IntervalArc,
+    MultipleShootingInitialGuess, MultipleShootingInteriorPointSnapshot,
+    MultipleShootingRuntimeValues, MultipleShootingSqpSnapshot, MultipleShootingTrajectories,
+    OcpCompileHelperKind, OcpCompileOptions, OcpCompileProgress, OcpConstraintCategory,
+    OcpConstraintViolationReport, OcpHelperCompileStats, OcpKernelFunctionOptions,
+    OcpSymbolicFunctionOptions,
 };
 #[cfg(feature = "ipopt")]
 use optimal_control::{DirectCollocationIpoptSnapshot, MultipleShootingIpoptSnapshot};
 use optimization::{
-    BackendCompileReport, BackendTimingMetadata, ClarabelSqpOptions, ClarabelSqpSummary,
-    ConstraintSatisfaction, InteriorPointIterationSnapshot, InteriorPointOptions,
-    InteriorPointSummary, LlvmOptimizationLevel, NlpCompileStats, SqpIterationEvent,
-    SqpIterationPhase, SqpIterationSnapshot, Vectorize,
+    BackendCompileReport, BackendTimingMetadata, CallPolicy, CallPolicyConfig, ClarabelSqpOptions,
+    ClarabelSqpSummary, ConstraintSatisfaction, FunctionCompileOptions,
+    InteriorPointIterationSnapshot, InteriorPointOptions, InteriorPointSummary,
+    LlvmOptimizationLevel, NlpCompileStats, NlpEvaluationBenchmark, NlpEvaluationBenchmarkOptions,
+    NlpEvaluationKernelKind, SqpIterationEvent, SqpIterationPhase, SqpIterationSnapshot,
+    SymbolicSetupProfile, Vectorize,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptOptions, IpoptRawStatus, IpoptSummary};
@@ -44,6 +49,12 @@ pub enum ControlSection {
     Problem,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlPanel {
+    SxFunctions,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ControlEditor {
@@ -59,6 +70,7 @@ pub enum ControlVisibility {
     #[default]
     Always,
     DirectCollocationOnly,
+    MultipleShootingOnly,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -73,6 +85,7 @@ pub enum ControlSemantic {
     SolverDualTolerance,
     SolverConstraintTolerance,
     SolverComplementarityTolerance,
+    SxFunctionOption,
     #[default]
     ProblemParameter,
 }
@@ -98,6 +111,8 @@ pub struct ControlSpec {
     pub help: String,
     #[serde(default)]
     pub section: ControlSection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panel: Option<ControlPanel>,
     #[serde(default)]
     pub editor: ControlEditor,
     #[serde(default)]
@@ -783,12 +798,326 @@ pub struct TranscriptionConfig {
     pub collocation_family: CollocationFamily,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum OcpOverrideBehavior {
+    #[default]
+    RespectFunctionOverrides,
+    StrictGlobalPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum OcpKernelStrategy {
+    Inline,
+    #[default]
+    FunctionUseGlobalPolicy,
+    FunctionInlineAtCall,
+    FunctionInlineAtLowering,
+    FunctionInlineInLlvm,
+    FunctionNoInlineLlvm,
+}
+
+impl OcpKernelStrategy {
+    pub const fn to_kernel_options(self) -> OcpKernelFunctionOptions {
+        match self {
+            Self::Inline => OcpKernelFunctionOptions::inline(),
+            Self::FunctionUseGlobalPolicy => OcpKernelFunctionOptions::function(),
+            Self::FunctionInlineAtCall => {
+                OcpKernelFunctionOptions::function_with_call_policy(CallPolicy::InlineAtCall)
+            }
+            Self::FunctionInlineAtLowering => {
+                OcpKernelFunctionOptions::function_with_call_policy(CallPolicy::InlineAtLowering)
+            }
+            Self::FunctionInlineInLlvm => {
+                OcpKernelFunctionOptions::function_with_call_policy(CallPolicy::InlineInLLVM)
+            }
+            Self::FunctionNoInlineLlvm => {
+                OcpKernelFunctionOptions::function_with_call_policy(CallPolicy::NoInlineLLVM)
+            }
+        }
+    }
+
+    const fn short_label(self) -> &'static str {
+        match self {
+            Self::Inline => "inline",
+            Self::FunctionUseGlobalPolicy => "function/global",
+            Self::FunctionInlineAtCall => "function/call",
+            Self::FunctionInlineAtLowering => "function/lowering",
+            Self::FunctionInlineInLlvm => "function/llvm",
+            Self::FunctionNoInlineLlvm => "function/noinline",
+        }
+    }
+
+    const fn variant_token(self) -> &'static str {
+        match self {
+            Self::Inline => "inl",
+            Self::FunctionUseGlobalPolicy => "fng",
+            Self::FunctionInlineAtCall => "fnc",
+            Self::FunctionInlineAtLowering => "fnl",
+            Self::FunctionInlineInLlvm => "fni",
+            Self::FunctionNoInlineLlvm => "fnn",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct OcpSxFunctionConfig {
+    pub global_call_policy: CallPolicy,
+    pub override_behavior: OcpOverrideBehavior,
+    pub ode: OcpKernelStrategy,
+    pub objective_lagrange: OcpKernelStrategy,
+    pub objective_mayer: OcpKernelStrategy,
+    pub path_constraints: OcpKernelStrategy,
+    pub boundary_equalities: OcpKernelStrategy,
+    pub boundary_inequalities: OcpKernelStrategy,
+    pub multiple_shooting_integrator: OcpKernelStrategy,
+}
+
+impl OcpSxFunctionConfig {
+    pub const fn inline_all() -> Self {
+        Self {
+            global_call_policy: CallPolicy::InlineAtLowering,
+            override_behavior: OcpOverrideBehavior::RespectFunctionOverrides,
+            ode: OcpKernelStrategy::Inline,
+            objective_lagrange: OcpKernelStrategy::Inline,
+            objective_mayer: OcpKernelStrategy::Inline,
+            path_constraints: OcpKernelStrategy::Inline,
+            boundary_equalities: OcpKernelStrategy::Inline,
+            boundary_inequalities: OcpKernelStrategy::Inline,
+            multiple_shooting_integrator: OcpKernelStrategy::Inline,
+        }
+    }
+
+    pub const fn all_functions_with_global_policy(policy: CallPolicy) -> Self {
+        Self {
+            global_call_policy: policy,
+            override_behavior: OcpOverrideBehavior::RespectFunctionOverrides,
+            ode: OcpKernelStrategy::FunctionUseGlobalPolicy,
+            objective_lagrange: OcpKernelStrategy::FunctionUseGlobalPolicy,
+            objective_mayer: OcpKernelStrategy::FunctionUseGlobalPolicy,
+            path_constraints: OcpKernelStrategy::FunctionUseGlobalPolicy,
+            boundary_equalities: OcpKernelStrategy::FunctionUseGlobalPolicy,
+            boundary_inequalities: OcpKernelStrategy::FunctionUseGlobalPolicy,
+            multiple_shooting_integrator: OcpKernelStrategy::FunctionUseGlobalPolicy,
+        }
+    }
+
+    pub const fn call_policy_config(self) -> CallPolicyConfig {
+        CallPolicyConfig {
+            default_policy: self.global_call_policy,
+            respect_function_overrides: matches!(
+                self.override_behavior,
+                OcpOverrideBehavior::RespectFunctionOverrides
+            ),
+        }
+    }
+
+    pub const fn symbolic_functions(self) -> OcpSymbolicFunctionOptions {
+        OcpSymbolicFunctionOptions {
+            ode: self.ode.to_kernel_options(),
+            objective_lagrange: self.objective_lagrange.to_kernel_options(),
+            objective_mayer: self.objective_mayer.to_kernel_options(),
+            path_constraints: self.path_constraints.to_kernel_options(),
+            boundary_equalities: self.boundary_equalities.to_kernel_options(),
+            boundary_inequalities: self.boundary_inequalities.to_kernel_options(),
+            multiple_shooting_integrator: self.multiple_shooting_integrator.to_kernel_options(),
+        }
+    }
+
+    pub const fn compile_options(self, opt_level: LlvmOptimizationLevel) -> OcpCompileOptions {
+        OcpCompileOptions {
+            function_options: FunctionCompileOptions::new(opt_level, self.call_policy_config()),
+            symbolic_functions: self.symbolic_functions(),
+        }
+    }
+
+    pub fn variant_id_suffix(self) -> String {
+        format!(
+            "g{}_ov{}_ode{}_lag{}_may{}_path{}_beq{}_biq{}_msi{}",
+            call_policy_variant_token(self.global_call_policy),
+            match self.override_behavior {
+                OcpOverrideBehavior::RespectFunctionOverrides => "r",
+                OcpOverrideBehavior::StrictGlobalPolicy => "s",
+            },
+            self.ode.variant_token(),
+            self.objective_lagrange.variant_token(),
+            self.objective_mayer.variant_token(),
+            self.path_constraints.variant_token(),
+            self.boundary_equalities.variant_token(),
+            self.boundary_inequalities.variant_token(),
+            self.multiple_shooting_integrator.variant_token(),
+        )
+    }
+
+    pub fn variant_label_suffix(self) -> Option<String> {
+        if self == Self::default() {
+            None
+        } else if self == Self::inline_all() {
+            Some("SXF Inline All".to_string())
+        } else if self == Self::all_functions_with_global_policy(CallPolicy::InlineAtCall) {
+            Some("SXF All Functions / Inline At Call".to_string())
+        } else if self == Self::all_functions_with_global_policy(CallPolicy::InlineAtLowering) {
+            Some("SXF All Functions / Inline At Lowering".to_string())
+        } else if self == Self::all_functions_with_global_policy(CallPolicy::InlineInLLVM) {
+            Some("SXF All Functions / Inline In LLVM".to_string())
+        } else if self == Self::all_functions_with_global_policy(CallPolicy::NoInlineLLVM) {
+            Some("SXF All Functions / NoInline LLVM".to_string())
+        } else {
+            Some("SXF Custom".to_string())
+        }
+    }
+
+    pub fn delta_summary(self) -> Vec<String> {
+        let default = Self::default();
+        let mut deltas = Vec::new();
+        if self.global_call_policy != default.global_call_policy {
+            deltas.push(format!(
+                "Global {}",
+                call_policy_short_label(self.global_call_policy)
+            ));
+        }
+        if self.override_behavior != default.override_behavior {
+            deltas.push("Strict Global".to_string());
+        }
+        append_kernel_delta(&mut deltas, "ODE", self.ode, default.ode);
+        append_kernel_delta(
+            &mut deltas,
+            "Lagrange",
+            self.objective_lagrange,
+            default.objective_lagrange,
+        );
+        append_kernel_delta(
+            &mut deltas,
+            "Mayer",
+            self.objective_mayer,
+            default.objective_mayer,
+        );
+        append_kernel_delta(
+            &mut deltas,
+            "Path",
+            self.path_constraints,
+            default.path_constraints,
+        );
+        append_kernel_delta(
+            &mut deltas,
+            "BEq",
+            self.boundary_equalities,
+            default.boundary_equalities,
+        );
+        append_kernel_delta(
+            &mut deltas,
+            "BIneq",
+            self.boundary_inequalities,
+            default.boundary_inequalities,
+        );
+        append_kernel_delta(
+            &mut deltas,
+            "MS Integrator",
+            self.multiple_shooting_integrator,
+            default.multiple_shooting_integrator,
+        );
+        deltas
+    }
+}
+
+impl Default for OcpSxFunctionConfig {
+    fn default() -> Self {
+        Self {
+            global_call_policy: CallPolicy::InlineAtLowering,
+            override_behavior: OcpOverrideBehavior::RespectFunctionOverrides,
+            ode: OcpKernelStrategy::FunctionInlineInLlvm,
+            objective_lagrange: OcpKernelStrategy::FunctionInlineInLlvm,
+            objective_mayer: OcpKernelStrategy::Inline,
+            path_constraints: OcpKernelStrategy::FunctionInlineInLlvm,
+            boundary_equalities: OcpKernelStrategy::Inline,
+            boundary_inequalities: OcpKernelStrategy::Inline,
+            multiple_shooting_integrator: OcpKernelStrategy::Inline,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MultipleShootingCompileKey {
+    pub intervals: usize,
+    pub sx_functions: OcpSxFunctionConfig,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DirectCollocationCompileVariantKey {
+    pub family: DirectCollocationCompileKey,
+    pub sx_functions: OcpSxFunctionConfig,
+}
+
+pub const fn multiple_shooting_compile_key(
+    intervals: usize,
+    sx_functions: OcpSxFunctionConfig,
+) -> MultipleShootingCompileKey {
+    MultipleShootingCompileKey {
+        intervals,
+        sx_functions,
+    }
+}
+
+pub fn direct_collocation_compile_key_with_sx(
+    family: CollocationFamily,
+    sx_functions: OcpSxFunctionConfig,
+) -> DirectCollocationCompileVariantKey {
+    DirectCollocationCompileVariantKey {
+        family: direct_collocation_compile_key(family),
+        sx_functions,
+    }
+}
+
+pub fn ocp_compile_options(
+    opt_level: LlvmOptimizationLevel,
+    sx_functions: OcpSxFunctionConfig,
+) -> OcpCompileOptions {
+    sx_functions.compile_options(opt_level)
+}
+
+fn append_kernel_delta(
+    deltas: &mut Vec<String>,
+    label: &str,
+    value: OcpKernelStrategy,
+    default: OcpKernelStrategy,
+) {
+    if value != default {
+        deltas.push(format!("{label} {}", value.short_label()));
+    }
+}
+
+fn call_policy_short_label(policy: CallPolicy) -> &'static str {
+    match policy {
+        CallPolicy::InlineAtCall => "Inline At Call",
+        CallPolicy::InlineAtLowering => "Inline At Lowering",
+        CallPolicy::InlineInLLVM => "Inline In LLVM",
+        CallPolicy::NoInlineLLVM => "NoInline LLVM",
+    }
+}
+
+const fn call_policy_variant_token(policy: CallPolicy) -> &'static str {
+    match policy {
+        CallPolicy::InlineAtCall => "c",
+        CallPolicy::InlineAtLowering => "l",
+        CallPolicy::InlineInLLVM => "i",
+        CallPolicy::NoInlineLLVM => "n",
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SharedControlId {
     TranscriptionMethod,
     TranscriptionIntervals,
     CollocationFamily,
     CollocationDegree,
+    SxFunctionGlobalCallPolicy,
+    SxFunctionOverrideBehavior,
+    SxFunctionOde,
+    SxFunctionObjectiveLagrange,
+    SxFunctionObjectiveMayer,
+    SxFunctionPathConstraints,
+    SxFunctionBoundaryEqualities,
+    SxFunctionBoundaryInequalities,
+    SxFunctionMultipleShootingIntegrator,
     SolverMethod,
     SolverMaxIterations,
     SolverDualTolerance,
@@ -803,6 +1132,15 @@ impl SharedControlId {
             Self::TranscriptionIntervals => "transcription_intervals",
             Self::CollocationFamily => "collocation_family",
             Self::CollocationDegree => "collocation_degree",
+            Self::SxFunctionGlobalCallPolicy => "sxf_global_call_policy",
+            Self::SxFunctionOverrideBehavior => "sxf_override_behavior",
+            Self::SxFunctionOde => "sxf_ode",
+            Self::SxFunctionObjectiveLagrange => "sxf_objective_lagrange",
+            Self::SxFunctionObjectiveMayer => "sxf_objective_mayer",
+            Self::SxFunctionPathConstraints => "sxf_path_constraints",
+            Self::SxFunctionBoundaryEqualities => "sxf_boundary_equalities",
+            Self::SxFunctionBoundaryInequalities => "sxf_boundary_inequalities",
+            Self::SxFunctionMultipleShootingIntegrator => "sxf_multiple_shooting_integrator",
             Self::SolverMethod => "solver_method",
             Self::SolverMaxIterations => "solver_max_iters",
             Self::SolverDualTolerance => "solver_dual_tol",
@@ -813,6 +1151,104 @@ impl SharedControlId {
 }
 
 type Numeric<T> = <T as Vectorize<SX>>::Rebind<f64>;
+
+pub enum ContinuousInitialGuess<X, U, P> {
+    Interpolated(InterpolatedTrajectory<X, U>),
+    Rollout {
+        x0: X,
+        u0: U,
+        tf: f64,
+        controller: Box<ControllerFn<X, U, P>>,
+    },
+}
+
+pub struct OcpRuntimeSpec<P, C, Beq, Bineq, X, U> {
+    pub parameters: P,
+    pub beq: Beq,
+    pub bineq_bounds: Bineq,
+    pub path_bounds: C,
+    pub tf_bounds: Bounds1D,
+    pub initial_guess: ContinuousInitialGuess<X, U, P>,
+}
+
+impl<X, U, P> ContinuousInitialGuess<X, U, P> {
+    pub fn into_multiple_shooting<const N: usize>(
+        self,
+    ) -> MultipleShootingInitialGuess<X, U, P, N> {
+        match self {
+            Self::Interpolated(trajectory) => {
+                MultipleShootingInitialGuess::Interpolated(trajectory)
+            }
+            Self::Rollout {
+                x0,
+                u0,
+                tf,
+                controller,
+            } => MultipleShootingInitialGuess::Rollout {
+                x0,
+                u0,
+                tf,
+                controller,
+            },
+        }
+    }
+
+    pub fn into_direct_collocation<const N: usize, const K: usize>(
+        self,
+    ) -> DirectCollocationInitialGuess<X, U, P, N, K> {
+        match self {
+            Self::Interpolated(trajectory) => {
+                DirectCollocationInitialGuess::Interpolated(trajectory)
+            }
+            Self::Rollout {
+                x0,
+                u0,
+                tf,
+                controller,
+            } => DirectCollocationInitialGuess::Rollout {
+                x0,
+                u0,
+                tf,
+                controller,
+            },
+        }
+    }
+}
+
+pub fn multiple_shooting_runtime_from_spec<P, C, Beq, Bineq, X, U, const N: usize>(
+    spec: OcpRuntimeSpec<P, C, Beq, Bineq, X, U>,
+) -> MultipleShootingRuntimeValues<P, C, Beq, Bineq, X, U, N> {
+    MultipleShootingRuntimeValues {
+        parameters: spec.parameters,
+        beq: spec.beq,
+        bineq_bounds: spec.bineq_bounds,
+        path_bounds: spec.path_bounds,
+        tf_bounds: spec.tf_bounds,
+        initial_guess: spec.initial_guess.into_multiple_shooting(),
+    }
+}
+
+pub fn direct_collocation_runtime_from_spec<
+    P,
+    C,
+    Beq,
+    Bineq,
+    X,
+    U,
+    const N: usize,
+    const K: usize,
+>(
+    spec: OcpRuntimeSpec<P, C, Beq, Bineq, X, U>,
+) -> DirectCollocationRuntimeValues<P, C, Beq, Bineq, X, U, N, K> {
+    DirectCollocationRuntimeValues {
+        parameters: spec.parameters,
+        beq: spec.beq,
+        bineq_bounds: spec.bineq_bounds,
+        path_bounds: spec.path_bounds,
+        tf_bounds: spec.tf_bounds,
+        initial_guess: spec.initial_guess.into_direct_collocation(),
+    }
+}
 
 pub struct SharedCompileCache<K, V> {
     entries: HashMap<K, Rc<RefCell<V>>>,
@@ -881,38 +1317,473 @@ where
     }
 }
 
-#[macro_export]
-macro_rules! standard_ocp_compile_caches {
-    ($multiple_shooting_cache:ident : $multiple_shooting_ty:ty, $direct_collocation_cache:ident : $direct_collocation_ty:ty) => {
-        thread_local! {
-            static $multiple_shooting_cache: std::cell::RefCell<$crate::common::SharedCompileCache<usize, $multiple_shooting_ty>> =
-                std::cell::RefCell::new($crate::common::SharedCompileCache::new());
-            static $direct_collocation_cache: std::cell::RefCell<
-                $crate::common::SharedCompileCache<$crate::common::DirectCollocationCompileKey, $direct_collocation_ty>
-            > = std::cell::RefCell::new($crate::common::SharedCompileCache::new());
-        }
-    };
+pub fn compile_progress_info_from_compiled<Compiled>(compiled: &Compiled) -> CompileProgressInfo
+where
+    Compiled: CompiledOcpMetadata,
+{
+    compile_progress_info(
+        compiled.backend_timing_metadata(),
+        compiled.nlp_compile_stats(),
+        compiled.helper_kernel_count(),
+        compiled.helper_compile_stats(),
+        Some(summarize_backend_compile_report(
+            compiled.backend_compile_report(),
+        )),
+    )
 }
 
-#[macro_export]
-macro_rules! standard_ocp_compile_cache_statuses {
-    ($problem_id:expr, $problem_name:expr, $multiple_shooting_cache:ident, $direct_collocation_cache:ident) => {{
-        let mut statuses = Vec::new();
-        $multiple_shooting_cache.with(|cache| {
-            $direct_collocation_cache.with(|dc_cache| {
-                $crate::common::append_standard_compile_cache_statuses(
-                    &mut statuses,
-                    $problem_id,
-                    $problem_name,
-                    &cache.borrow(),
-                    &dc_cache.borrow(),
-                    |compiled| compiled.backend_timing_metadata(),
-                    |compiled| compiled.backend_timing_metadata(),
-                );
-            });
-        });
-        statuses
-    }};
+pub fn standard_ocp_compile_cache_statuses<Ms, Dc>(
+    problem_id: ProblemId,
+    problem_name: &str,
+    multiple_shooting_cache: &SharedCompileCache<MultipleShootingCompileKey, Ms>,
+    direct_collocation_cache: &SharedCompileCache<DirectCollocationCompileVariantKey, Dc>,
+) -> Vec<CompileCacheStatus>
+where
+    Ms: CompiledOcpMetadata,
+    Dc: CompiledOcpMetadata,
+{
+    let mut statuses = Vec::new();
+    append_standard_compile_cache_statuses(
+        &mut statuses,
+        problem_id,
+        problem_name,
+        multiple_shooting_cache,
+        direct_collocation_cache,
+        |compiled| compiled.backend_timing_metadata(),
+        |compiled| compiled.backend_timing_metadata(),
+    );
+    statuses
+}
+
+pub fn prewarm_standard_ocp<Params, MsCompiled, DcCompiled, CachedMs, CachedDc>(
+    params: &Params,
+    transcription: TranscriptionMethod,
+    collocation_family: CollocationFamily,
+    cached_multiple_shooting: CachedMs,
+    cached_direct_collocation: CachedDc,
+) -> Result<()>
+where
+    CachedMs: Fn(&Params) -> Result<CachedCompile<MsCompiled>>,
+    CachedDc: Fn(&Params, CollocationFamily) -> Result<CachedCompile<DcCompiled>>,
+{
+    match transcription {
+        TranscriptionMethod::MultipleShooting => cached_multiple_shooting(params).map(|_| ()),
+        TranscriptionMethod::DirectCollocation => {
+            cached_direct_collocation(params, collocation_family).map(|_| ())
+        }
+    }
+}
+
+pub fn prewarm_standard_ocp_with_progress<
+    Params,
+    Emit,
+    MsCompiled,
+    DcCompiled,
+    CompileMs,
+    CompileDc,
+>(
+    params: &Params,
+    transcription: TranscriptionMethod,
+    collocation_family: CollocationFamily,
+    solver_method: SolverMethod,
+    emit: Emit,
+    compile_multiple_shooting: CompileMs,
+    compile_direct_collocation: CompileDc,
+) -> Result<()>
+where
+    Emit: FnMut(SolveStreamEvent) + Send,
+    CompileMs: Fn(
+        &Params,
+        &mut dyn FnMut(CompileProgressUpdate),
+    ) -> Result<(Rc<RefCell<MsCompiled>>, CompileProgressInfo)>,
+    CompileDc: Fn(
+        &Params,
+        CollocationFamily,
+        &mut dyn FnMut(CompileProgressUpdate),
+    ) -> Result<(Rc<RefCell<DcCompiled>>, CompileProgressInfo)>,
+{
+    let mut lifecycle = SolveLifecycleReporter::new(emit, solver_method);
+    match transcription {
+        TranscriptionMethod::MultipleShooting => {
+            lifecycle.prewarm_with_progress(|callback| compile_multiple_shooting(params, callback))
+        }
+        TranscriptionMethod::DirectCollocation => lifecycle.prewarm_with_progress(|callback| {
+            compile_direct_collocation(params, collocation_family, callback)
+        }),
+    }
+}
+
+pub fn solve_standard_ocp<
+    Params,
+    MsCompiled,
+    DcCompiled,
+    CachedMs,
+    CachedDc,
+    MsRuntimeFn,
+    DcRuntimeFn,
+    MsArtifact,
+    DcArtifact,
+    const N: usize,
+    const K: usize,
+>(
+    params: &Params,
+    transcription: TranscriptionMethod,
+    collocation_family: CollocationFamily,
+    solver_method: SolverMethod,
+    solver_config: &SqpConfig,
+    cached_multiple_shooting: CachedMs,
+    cached_direct_collocation: CachedDc,
+    multiple_shooting_runtime: MsRuntimeFn,
+    direct_collocation_runtime: DcRuntimeFn,
+    multiple_shooting_artifact: MsArtifact,
+    direct_collocation_artifact: DcArtifact,
+) -> Result<SolveArtifact>
+where
+    MsCompiled: MultipleShootingCompiled<N>,
+    DcCompiled: DirectCollocationCompiled<N, K>,
+    CachedMs: Fn(&Params) -> Result<CachedCompile<MsCompiled>>,
+    CachedDc: Fn(&Params, CollocationFamily) -> Result<CachedCompile<DcCompiled>>,
+    MsRuntimeFn: Fn(
+        &Params,
+    ) -> MultipleShootingRuntimeValues<
+        MsCompiled::PNum,
+        MsCompiled::CBounds,
+        MsCompiled::BeqNum,
+        MsCompiled::BineqBounds,
+        MsCompiled::XNum,
+        MsCompiled::UNum,
+        N,
+    >,
+    DcRuntimeFn: Fn(
+        &Params,
+    ) -> DirectCollocationRuntimeValues<
+        DcCompiled::PNum,
+        DcCompiled::CBounds,
+        DcCompiled::BeqNum,
+        DcCompiled::BineqBounds,
+        DcCompiled::XNum,
+        DcCompiled::UNum,
+        N,
+        K,
+    >,
+    MsArtifact: FnMut(
+        &MultipleShootingTrajectories<MsCompiled::XNum, MsCompiled::UNum, N>,
+        &[IntervalArc<MsCompiled::XNum>],
+        &[IntervalArc<MsCompiled::UNum>],
+    ) -> SolveArtifact,
+    DcArtifact: FnMut(
+        &DirectCollocationTrajectories<DcCompiled::XNum, DcCompiled::UNum, N, K>,
+        &DirectCollocationTimeGrid<N, K>,
+    ) -> SolveArtifact,
+{
+    match transcription {
+        TranscriptionMethod::MultipleShooting => {
+            let compiled = cached_multiple_shooting(params)?;
+            solve_cached_multiple_shooting_problem(
+                &compiled.compiled,
+                &multiple_shooting_runtime(params),
+                solver_method,
+                solver_config,
+                multiple_shooting_artifact,
+            )
+        }
+        TranscriptionMethod::DirectCollocation => {
+            let compiled = cached_direct_collocation(params, collocation_family)?;
+            solve_cached_direct_collocation_problem(
+                &compiled.compiled,
+                &direct_collocation_runtime(params),
+                solver_method,
+                solver_config,
+                direct_collocation_artifact,
+            )
+        }
+    }
+}
+
+pub fn solve_standard_ocp_with_progress<
+    Params,
+    Emit,
+    MsCompiled,
+    DcCompiled,
+    CompileMs,
+    CompileDc,
+    MsRuntimeFn,
+    DcRuntimeFn,
+    MsArtifact,
+    DcArtifact,
+    const N: usize,
+    const K: usize,
+>(
+    params: &Params,
+    transcription: TranscriptionMethod,
+    collocation_family: CollocationFamily,
+    solver_method: SolverMethod,
+    solver_config: &SqpConfig,
+    emit: Emit,
+    compile_multiple_shooting: CompileMs,
+    compile_direct_collocation: CompileDc,
+    multiple_shooting_runtime: MsRuntimeFn,
+    direct_collocation_runtime: DcRuntimeFn,
+    multiple_shooting_artifact: MsArtifact,
+    direct_collocation_artifact: DcArtifact,
+) -> Result<SolveArtifact>
+where
+    Emit: FnMut(SolveStreamEvent) + Send,
+    MsCompiled: MultipleShootingCompiled<N>,
+    DcCompiled: DirectCollocationCompiled<N, K>,
+    CompileMs: Fn(
+        &Params,
+        &mut dyn FnMut(CompileProgressUpdate),
+    ) -> Result<(Rc<RefCell<MsCompiled>>, CompileProgressInfo)>,
+    CompileDc: Fn(
+        &Params,
+        CollocationFamily,
+        &mut dyn FnMut(CompileProgressUpdate),
+    ) -> Result<(Rc<RefCell<DcCompiled>>, CompileProgressInfo)>,
+    MsRuntimeFn: Fn(
+        &Params,
+    ) -> MultipleShootingRuntimeValues<
+        MsCompiled::PNum,
+        MsCompiled::CBounds,
+        MsCompiled::BeqNum,
+        MsCompiled::BineqBounds,
+        MsCompiled::XNum,
+        MsCompiled::UNum,
+        N,
+    >,
+    DcRuntimeFn: Fn(
+        &Params,
+    ) -> DirectCollocationRuntimeValues<
+        DcCompiled::PNum,
+        DcCompiled::CBounds,
+        DcCompiled::BeqNum,
+        DcCompiled::BineqBounds,
+        DcCompiled::XNum,
+        DcCompiled::UNum,
+        N,
+        K,
+    >,
+    MsArtifact: FnMut(
+        &MultipleShootingTrajectories<MsCompiled::XNum, MsCompiled::UNum, N>,
+        &[IntervalArc<MsCompiled::XNum>],
+        &[IntervalArc<MsCompiled::UNum>],
+    ) -> SolveArtifact,
+    DcArtifact: FnMut(
+        &DirectCollocationTrajectories<DcCompiled::XNum, DcCompiled::UNum, N, K>,
+        &DirectCollocationTimeGrid<N, K>,
+    ) -> SolveArtifact,
+{
+    let mut lifecycle = SolveLifecycleReporter::new(emit, solver_method);
+    match transcription {
+        TranscriptionMethod::MultipleShooting => {
+            let (compiled, running_solver, compile_report) = lifecycle
+                .compile_with_progress(|callback| compile_multiple_shooting(params, callback))?;
+            let mut artifact = solve_cached_multiple_shooting_problem_with_progress(
+                &compiled,
+                &multiple_shooting_runtime(params),
+                solver_method,
+                solver_config,
+                lifecycle.into_emit(),
+                running_solver,
+                multiple_shooting_artifact,
+            )?;
+            artifact.compile_report = compile_report;
+            Ok(artifact)
+        }
+        TranscriptionMethod::DirectCollocation => {
+            let (compiled, running_solver, compile_report) =
+                lifecycle.compile_with_progress(|callback| {
+                    compile_direct_collocation(params, collocation_family, callback)
+                })?;
+            let mut artifact = solve_cached_direct_collocation_problem_with_progress(
+                &compiled,
+                &direct_collocation_runtime(params),
+                solver_method,
+                solver_config,
+                lifecycle.into_emit(),
+                running_solver,
+                direct_collocation_artifact,
+            )?;
+            artifact.compile_report = compile_report;
+            Ok(artifact)
+        }
+    }
+}
+
+pub fn benchmark_standard_ocp_case_with_progress<
+    Params,
+    MsCompiled,
+    DcCompiled,
+    CompileMs,
+    CompileDc,
+    MsRuntimeFn,
+    DcRuntimeFn,
+    E,
+    const N: usize,
+    const K: usize,
+>(
+    problem_id: ProblemId,
+    problem_name: &str,
+    transcription: TranscriptionMethod,
+    preset: crate::benchmark_report::OcpBenchmarkPreset,
+    eval_options: NlpEvaluationBenchmarkOptions,
+    on_progress: &mut dyn FnMut(crate::benchmark_report::BenchmarkCaseProgress),
+    compile_multiple_shooting: CompileMs,
+    compile_direct_collocation: CompileDc,
+    multiple_shooting_runtime: MsRuntimeFn,
+    direct_collocation_runtime: DcRuntimeFn,
+) -> Result<crate::benchmark_report::OcpBenchmarkRecord>
+where
+    Params: Default + StandardOcpParams,
+    MsCompiled: MultipleShootingCompiled<N>,
+    DcCompiled: DirectCollocationCompiled<N, K>,
+    CompileMs: FnOnce(
+        OcpCompileOptions,
+        &mut dyn FnMut(OcpCompileProgress),
+    ) -> std::result::Result<MsCompiled, E>,
+    CompileDc: FnOnce(
+        CollocationFamily,
+        OcpCompileOptions,
+        &mut dyn FnMut(OcpCompileProgress),
+    ) -> std::result::Result<DcCompiled, E>,
+    MsRuntimeFn: Fn(
+        &Params,
+    ) -> MultipleShootingRuntimeValues<
+        MsCompiled::PNum,
+        MsCompiled::CBounds,
+        MsCompiled::BeqNum,
+        MsCompiled::BineqBounds,
+        MsCompiled::XNum,
+        MsCompiled::UNum,
+        N,
+    >,
+    DcRuntimeFn: Fn(
+        &Params,
+    ) -> DirectCollocationRuntimeValues<
+        DcCompiled::PNum,
+        DcCompiled::CBounds,
+        DcCompiled::BeqNum,
+        DcCompiled::BineqBounds,
+        DcCompiled::XNum,
+        DcCompiled::UNum,
+        N,
+        K,
+    >,
+    E: Into<anyhow::Error>,
+{
+    let mut params = Params::default();
+    params.transcription_mut().method = transcription;
+    let opt_level = crate::benchmark_report::opt_level_for_transcription(transcription);
+    let compile_options = preset.compile_options(opt_level);
+    match transcription {
+        TranscriptionMethod::MultipleShooting => {
+            let compiled = compile_multiple_shooting(compile_options, &mut |progress| {
+                on_progress(crate::benchmark_report::BenchmarkCaseProgress::Compile(
+                    progress,
+                ));
+            })
+            .map_err(Into::into)?;
+            let eval = compiled.benchmark_nlp_evaluations_with_progress(
+                &multiple_shooting_runtime(&params),
+                eval_options,
+                |kernel| {
+                    on_progress(
+                        crate::benchmark_report::BenchmarkCaseProgress::EvalKernelStarted(kernel),
+                    )
+                },
+            )?;
+            Ok(crate::benchmark_report::build_record(
+                problem_id,
+                problem_name,
+                transcription,
+                None,
+                preset,
+                opt_level,
+                summarize_backend_compile_report(compiled.backend_compile_report()),
+                compiled.helper_compile_stats(),
+                compiled.nlp_compile_stats(),
+                compiled.helper_kernel_count(),
+                eval,
+            ))
+        }
+        TranscriptionMethod::DirectCollocation => {
+            let family = params.transcription().collocation_family;
+            let compiled = compile_direct_collocation(family, compile_options, &mut |progress| {
+                on_progress(crate::benchmark_report::BenchmarkCaseProgress::Compile(
+                    progress,
+                ));
+            })
+            .map_err(Into::into)?;
+            let eval = compiled.benchmark_nlp_evaluations_with_progress(
+                &direct_collocation_runtime(&params),
+                eval_options,
+                |kernel| {
+                    on_progress(
+                        crate::benchmark_report::BenchmarkCaseProgress::EvalKernelStarted(kernel),
+                    )
+                },
+            )?;
+            Ok(crate::benchmark_report::build_record(
+                problem_id,
+                problem_name,
+                transcription,
+                Some(family),
+                preset,
+                opt_level,
+                summarize_backend_compile_report(compiled.backend_compile_report()),
+                compiled.helper_compile_stats(),
+                compiled.nlp_compile_stats(),
+                compiled.helper_kernel_count(),
+                eval,
+            ))
+        }
+    }
+}
+
+pub fn solve_from_value_map<Params, Solve>(
+    values: &BTreeMap<String, f64>,
+    solve: Solve,
+) -> Result<SolveArtifact>
+where
+    Params: FromMap,
+    Solve: FnOnce(&Params) -> Result<SolveArtifact>,
+{
+    solve(&Params::from_map(values)?)
+}
+
+pub fn prewarm_from_value_map<Params, Prewarm>(
+    values: &BTreeMap<String, f64>,
+    prewarm: Prewarm,
+) -> Result<()>
+where
+    Params: FromMap,
+    Prewarm: FnOnce(&Params) -> Result<()>,
+{
+    prewarm(&Params::from_map(values)?)
+}
+
+pub fn solve_with_progress_from_value_map<Params, Solve>(
+    values: &BTreeMap<String, f64>,
+    emit: Box<dyn FnMut(SolveStreamEvent) + Send>,
+    solve: Solve,
+) -> Result<SolveArtifact>
+where
+    Params: FromMap,
+    Solve: FnOnce(&Params, Box<dyn FnMut(SolveStreamEvent) + Send>) -> Result<SolveArtifact>,
+{
+    solve(&Params::from_map(values)?, emit)
+}
+
+pub fn prewarm_with_progress_from_value_map<Params, Prewarm>(
+    values: &BTreeMap<String, f64>,
+    emit: Box<dyn FnMut(SolveStreamEvent) + Send>,
+    prewarm: Prewarm,
+) -> Result<()>
+where
+    Params: FromMap,
+    Prewarm: FnOnce(&Params, Box<dyn FnMut(SolveStreamEvent) + Send>) -> Result<()>,
+{
+    prewarm(&Params::from_map(values)?, emit)
 }
 
 fn phase_detail(label: impl Into<String>, value: impl Into<String>) -> SolverPhaseDetail {
@@ -944,6 +1815,11 @@ pub fn multiple_shooting_variant() -> (&'static str, &'static str) {
     ("multiple_shooting", "Multiple Shooting")
 }
 
+pub fn multiple_shooting_variant_with_sx(key: MultipleShootingCompileKey) -> (String, String) {
+    let (base_id, base_label) = multiple_shooting_variant();
+    with_sx_variant_suffix(base_id, base_label, key.sx_functions)
+}
+
 pub fn direct_collocation_compile_key(family: CollocationFamily) -> DirectCollocationCompileKey {
     match family {
         CollocationFamily::GaussLegendre => DirectCollocationCompileKey::Legendre,
@@ -966,12 +1842,33 @@ pub fn direct_collocation_variant(
     }
 }
 
+pub fn direct_collocation_variant_with_sx(
+    key: DirectCollocationCompileVariantKey,
+) -> (String, String) {
+    let (base_id, base_label) = direct_collocation_variant(key.family);
+    with_sx_variant_suffix(base_id, base_label, key.sx_functions)
+}
+
+fn with_sx_variant_suffix(
+    base_id: &str,
+    base_label: &str,
+    sx_functions: OcpSxFunctionConfig,
+) -> (String, String) {
+    let variant_id = format!("{base_id}__{}", sx_functions.variant_id_suffix());
+    let variant_label = if let Some(suffix) = sx_functions.variant_label_suffix() {
+        format!("{base_label} · {suffix}")
+    } else {
+        base_label.to_string()
+    };
+    (variant_id, variant_label)
+}
+
 pub fn append_standard_compile_cache_statuses<Ms, Dc, MsTiming, DcTiming>(
     statuses: &mut Vec<CompileCacheStatus>,
     problem_id: ProblemId,
     problem_name: &str,
-    multiple_shooting_cache: &SharedCompileCache<usize, Ms>,
-    direct_collocation_cache: &SharedCompileCache<DirectCollocationCompileKey, Dc>,
+    multiple_shooting_cache: &SharedCompileCache<MultipleShootingCompileKey, Ms>,
+    direct_collocation_cache: &SharedCompileCache<DirectCollocationCompileVariantKey, Dc>,
     multiple_shooting_timing_of: MsTiming,
     direct_collocation_timing_of: DcTiming,
 ) where
@@ -982,14 +1879,14 @@ pub fn append_standard_compile_cache_statuses<Ms, Dc, MsTiming, DcTiming>(
         problem_id,
         problem_name,
         multiple_shooting_cache,
-        |_| multiple_shooting_variant(),
+        multiple_shooting_variant_with_sx,
         multiple_shooting_timing_of,
     ));
     statuses.extend(collect_compile_cache_statuses(
         problem_id,
         problem_name,
         direct_collocation_cache,
-        direct_collocation_variant,
+        direct_collocation_variant_with_sx,
         direct_collocation_timing_of,
     ));
 }
@@ -1004,7 +1901,7 @@ pub fn collect_compile_cache_statuses<K, V, F, G>(
 where
     K: Eq + Hash + Copy,
     F: Fn(&V) -> BackendTimingMetadata,
-    G: Fn(K) -> (&'static str, &'static str),
+    G: Fn(K) -> (String, String),
 {
     cache
         .cached_entries()
@@ -1014,8 +1911,8 @@ where
             compile_cache_status(
                 problem_id,
                 problem_name,
-                variant_id,
-                variant_label,
+                &variant_id,
+                &variant_label,
                 timing_of(&compiled.borrow()),
             )
         })
@@ -1049,16 +1946,58 @@ fn format_phase_duration(duration: Duration) -> String {
     }
 }
 
-fn symbolic_phase_details(stats: NlpCompileStats) -> Vec<SolverPhaseDetail> {
+fn symbolic_phase_details(
+    stats: NlpCompileStats,
+    setup_profile: Option<&SymbolicSetupProfile>,
+) -> Vec<SolverPhaseDetail> {
     let total_jacobian_nnz = stats.equality_jacobian_nnz + stats.inequality_jacobian_nnz;
-    vec![
+    let mut details = vec![
         phase_detail("Vars", stats.variable_count.to_string()),
         phase_detail("Params", stats.parameter_scalar_count.to_string()),
         phase_detail("Eq", stats.equality_count.to_string()),
         phase_detail("Ineq", stats.inequality_count.to_string()),
         phase_detail("Jac NNZ", total_jacobian_nnz.to_string()),
         phase_detail("Hess NNZ", stats.hessian_nnz.to_string()),
-    ]
+    ];
+    if let Some(profile) = setup_profile {
+        if let Some(duration) = profile.symbolic_construction {
+            details.push(phase_detail(
+                "Build Problem",
+                format_phase_duration(duration),
+            ));
+        }
+        if let Some(duration) = profile.objective_gradient {
+            details.push(phase_detail(
+                "Objective Gradient",
+                format_phase_duration(duration),
+            ));
+        }
+        if let Some(duration) = profile.equality_jacobian {
+            details.push(phase_detail(
+                "Equality Jacobian",
+                format_phase_duration(duration),
+            ));
+        }
+        if let Some(duration) = profile.inequality_jacobian {
+            details.push(phase_detail(
+                "Inequality Jacobian",
+                format_phase_duration(duration),
+            ));
+        }
+        if let Some(duration) = profile.lagrangian_assembly {
+            details.push(phase_detail(
+                "Lagrangian Assembly",
+                format_phase_duration(duration),
+            ));
+        }
+        if let Some(duration) = profile.hessian_generation {
+            details.push(phase_detail(
+                "Hessian Generation",
+                format_phase_duration(duration),
+            ));
+        }
+    }
+    details
 }
 
 fn jit_phase_details(stats: NlpCompileStats, helper_kernel_count: usize) -> Vec<SolverPhaseDetail> {
@@ -1094,9 +2033,17 @@ pub fn ocp_compile_progress_update(
     state: &mut OcpCompileProgressState,
 ) -> CompileProgressUpdate {
     match progress {
+        OcpCompileProgress::SymbolicStage(progress) => {
+            state.timing = progress.metadata.timing;
+            state.phase_details.symbolic_setup = symbolic_phase_details(
+                progress.metadata.stats,
+                Some(&progress.metadata.setup_profile),
+            );
+        }
         OcpCompileProgress::SymbolicReady(metadata) => {
             state.timing = metadata.timing;
-            state.phase_details.symbolic_setup = symbolic_phase_details(metadata.stats);
+            state.phase_details.symbolic_setup =
+                symbolic_phase_details(metadata.stats, Some(&metadata.setup_profile));
             state.phase_details.jit = vec![phase_detail(
                 "NLP Kernels",
                 metadata.stats.jit_kernel_count.to_string(),
@@ -1130,12 +2077,124 @@ pub fn compile_progress_info(
         timing,
         compile_cached: false,
         phase_details: SolverPhaseDetails {
-            symbolic_setup: symbolic_phase_details(stats),
+            symbolic_setup: symbolic_phase_details(stats, None),
             jit,
             solve: Vec::new(),
         },
         compile_report,
     }
+}
+
+pub fn cached_multiple_shooting_ocp_compile<Compiled, Build, E>(
+    cache: &mut SharedCompileCache<MultipleShootingCompileKey, Compiled>,
+    intervals: usize,
+    sx_functions: OcpSxFunctionConfig,
+    build: Build,
+) -> Result<CachedCompile<Compiled>>
+where
+    Build: FnOnce(OcpCompileOptions) -> std::result::Result<Compiled, E>,
+    E: Into<anyhow::Error>,
+{
+    cache.get_or_try_init(
+        multiple_shooting_compile_key(intervals, sx_functions),
+        || {
+            build(ocp_compile_options(
+                interactive_multiple_shooting_opt_level(),
+                sx_functions,
+            ))
+            .map_err(Into::into)
+        },
+    )
+}
+
+pub fn cached_direct_collocation_ocp_compile<Compiled, Build, E>(
+    cache: &mut SharedCompileCache<DirectCollocationCompileVariantKey, Compiled>,
+    family: CollocationFamily,
+    sx_functions: OcpSxFunctionConfig,
+    build: Build,
+) -> Result<CachedCompile<Compiled>>
+where
+    Build: FnOnce(OcpCompileOptions) -> std::result::Result<Compiled, E>,
+    E: Into<anyhow::Error>,
+{
+    cache.get_or_try_init(
+        direct_collocation_compile_key_with_sx(family, sx_functions),
+        || {
+            build(ocp_compile_options(
+                interactive_direct_collocation_opt_level(),
+                sx_functions,
+            ))
+            .map_err(Into::into)
+        },
+    )
+}
+
+pub fn cached_multiple_shooting_ocp_compile_with_progress<Compiled, Build, Summary, E>(
+    cache: &mut SharedCompileCache<MultipleShootingCompileKey, Compiled>,
+    intervals: usize,
+    sx_functions: OcpSxFunctionConfig,
+    on_symbolic_ready: &mut dyn FnMut(CompileProgressUpdate),
+    build: Build,
+    summary: Summary,
+) -> Result<(Rc<RefCell<Compiled>>, CompileProgressInfo)>
+where
+    Build: FnOnce(
+        OcpCompileOptions,
+        &mut dyn FnMut(OcpCompileProgress),
+    ) -> std::result::Result<Compiled, E>,
+    Summary: Fn(&Compiled) -> CompileProgressInfo,
+    E: Into<anyhow::Error>,
+{
+    cached_compile_with_progress(
+        cache,
+        multiple_shooting_compile_key(intervals, sx_functions),
+        on_symbolic_ready,
+        |on_compile_progress| {
+            let mut progress_state = OcpCompileProgressState::default();
+            build(
+                ocp_compile_options(interactive_multiple_shooting_opt_level(), sx_functions),
+                &mut |progress| {
+                    on_compile_progress(ocp_compile_progress_update(progress, &mut progress_state));
+                },
+            )
+            .map_err(Into::into)
+        },
+        summary,
+    )
+}
+
+pub fn cached_direct_collocation_ocp_compile_with_progress<Compiled, Build, Summary, E>(
+    cache: &mut SharedCompileCache<DirectCollocationCompileVariantKey, Compiled>,
+    family: CollocationFamily,
+    sx_functions: OcpSxFunctionConfig,
+    on_symbolic_ready: &mut dyn FnMut(CompileProgressUpdate),
+    build: Build,
+    summary: Summary,
+) -> Result<(Rc<RefCell<Compiled>>, CompileProgressInfo)>
+where
+    Build: FnOnce(
+        OcpCompileOptions,
+        &mut dyn FnMut(OcpCompileProgress),
+    ) -> std::result::Result<Compiled, E>,
+    Summary: Fn(&Compiled) -> CompileProgressInfo,
+    E: Into<anyhow::Error>,
+{
+    cached_compile_with_progress(
+        cache,
+        direct_collocation_compile_key_with_sx(family, sx_functions),
+        on_symbolic_ready,
+        |on_compile_progress| {
+            let mut progress_state = OcpCompileProgressState::default();
+            build(
+                ocp_compile_options(interactive_direct_collocation_opt_level(), sx_functions),
+                &mut |progress| {
+                    on_compile_progress(ocp_compile_progress_update(progress, &mut progress_state));
+                },
+            )
+            .map_err(Into::into)
+        },
+        summary,
+    )
 }
 
 pub fn cached_compile_with_progress<K, V, Build, Timing>(
@@ -1195,6 +2254,10 @@ pub const fn interactive_multiple_shooting_opt_level() -> LlvmOptimizationLevel 
     // kernels expand the RK4 dynamics directly into the NLP. Favor faster JIT over peak kernel
     // throughput so the webapp actually becomes usable.
     LlvmOptimizationLevel::O0
+}
+
+pub const fn interactive_direct_collocation_opt_level() -> LlvmOptimizationLevel {
+    LlvmOptimizationLevel::O3
 }
 
 pub fn solver_running_label(method: SolverMethod) -> &'static str {
@@ -1287,12 +2350,173 @@ where
     }
 }
 
+fn with_control_panel(mut control: ControlSpec, panel: ControlPanel) -> ControlSpec {
+    control.panel = Some(panel);
+    control
+}
+
+fn call_policy_control_choices() -> [(f64, &'static str); 4] {
+    [
+        (0.0, "Inline At Call"),
+        (1.0, "Inline At Lowering"),
+        (2.0, "Inline In LLVM"),
+        (3.0, "NoInline LLVM"),
+    ]
+}
+
+fn override_behavior_control_choices() -> [(f64, &'static str); 2] {
+    [(0.0, "Allow Overrides"), (1.0, "Strict Global")]
+}
+
+fn kernel_strategy_control_choices() -> [(f64, &'static str); 6] {
+    [
+        (0.0, "Inline"),
+        (1.0, "Function / Global Policy"),
+        (2.0, "Function / Inline At Call"),
+        (3.0, "Function / Inline At Lowering"),
+        (4.0, "Function / Inline In LLVM"),
+        (5.0, "Function / NoInline LLVM"),
+    ]
+}
+
+fn ocp_sx_function_controls(default: OcpSxFunctionConfig) -> Vec<ControlSpec> {
+    let panel = ControlPanel::SxFunctions;
+    vec![
+        with_control_panel(
+            select_control(
+                SharedControlId::SxFunctionGlobalCallPolicy.id(),
+                "Global Call Policy",
+                call_policy_choice_value(default.global_call_policy),
+                "",
+                "Default lowering/JIT policy for symbolic function calls when a kernel uses the global policy.",
+                &call_policy_control_choices(),
+                ControlSection::Transcription,
+                ControlVisibility::Always,
+                ControlSemantic::SxFunctionOption,
+            ),
+            panel,
+        ),
+        with_control_panel(
+            select_control(
+                SharedControlId::SxFunctionOverrideBehavior.id(),
+                "Override Behavior",
+                override_behavior_choice_value(default.override_behavior),
+                "",
+                "Allow per-kernel call-policy overrides, or force every function to use the global policy.",
+                &override_behavior_control_choices(),
+                ControlSection::Transcription,
+                ControlVisibility::Always,
+                ControlSemantic::SxFunctionOption,
+            ),
+            panel,
+        ),
+        with_control_panel(
+            select_control(
+                SharedControlId::SxFunctionOde.id(),
+                "ODE Kernel",
+                kernel_strategy_choice_value(default.ode),
+                "",
+                "Controls whether the dynamics RHS is emitted inline or through a reusable SXFunction.",
+                &kernel_strategy_control_choices(),
+                ControlSection::Transcription,
+                ControlVisibility::Always,
+                ControlSemantic::SxFunctionOption,
+            ),
+            panel,
+        ),
+        with_control_panel(
+            select_control(
+                SharedControlId::SxFunctionObjectiveLagrange.id(),
+                "Lagrange Objective",
+                kernel_strategy_choice_value(default.objective_lagrange),
+                "",
+                "Controls reuse/inlining for the repeated stage-cost kernel.",
+                &kernel_strategy_control_choices(),
+                ControlSection::Transcription,
+                ControlVisibility::Always,
+                ControlSemantic::SxFunctionOption,
+            ),
+            panel,
+        ),
+        with_control_panel(
+            select_control(
+                SharedControlId::SxFunctionObjectiveMayer.id(),
+                "Mayer Objective",
+                kernel_strategy_choice_value(default.objective_mayer),
+                "",
+                "Controls reuse/inlining for the terminal objective kernel.",
+                &kernel_strategy_control_choices(),
+                ControlSection::Transcription,
+                ControlVisibility::Always,
+                ControlSemantic::SxFunctionOption,
+            ),
+            panel,
+        ),
+        with_control_panel(
+            select_control(
+                SharedControlId::SxFunctionPathConstraints.id(),
+                "Path Constraints",
+                kernel_strategy_choice_value(default.path_constraints),
+                "",
+                "Controls reuse/inlining for repeated path-constraint evaluation.",
+                &kernel_strategy_control_choices(),
+                ControlSection::Transcription,
+                ControlVisibility::Always,
+                ControlSemantic::SxFunctionOption,
+            ),
+            panel,
+        ),
+        with_control_panel(
+            select_control(
+                SharedControlId::SxFunctionBoundaryEqualities.id(),
+                "Boundary Equalities",
+                kernel_strategy_choice_value(default.boundary_equalities),
+                "",
+                "Controls reuse/inlining for the boundary-equality kernel.",
+                &kernel_strategy_control_choices(),
+                ControlSection::Transcription,
+                ControlVisibility::Always,
+                ControlSemantic::SxFunctionOption,
+            ),
+            panel,
+        ),
+        with_control_panel(
+            select_control(
+                SharedControlId::SxFunctionBoundaryInequalities.id(),
+                "Boundary Inequalities",
+                kernel_strategy_choice_value(default.boundary_inequalities),
+                "",
+                "Controls reuse/inlining for the boundary-inequality kernel.",
+                &kernel_strategy_control_choices(),
+                ControlSection::Transcription,
+                ControlVisibility::Always,
+                ControlSemantic::SxFunctionOption,
+            ),
+            panel,
+        ),
+        with_control_panel(
+            select_control(
+                SharedControlId::SxFunctionMultipleShootingIntegrator.id(),
+                "MS Integrator",
+                kernel_strategy_choice_value(default.multiple_shooting_integrator),
+                "",
+                "Controls whether the RK4 multiple-shooting interval map is wrapped in a reusable SXFunction.",
+                &kernel_strategy_control_choices(),
+                ControlSection::Transcription,
+                ControlVisibility::MultipleShootingOnly,
+                ControlSemantic::SxFunctionOption,
+            ),
+            panel,
+        ),
+    ]
+}
+
 pub fn transcription_controls(
     default: TranscriptionConfig,
     supported_intervals: &[usize],
     supported_degrees: &[usize],
 ) -> Vec<ControlSpec> {
-    vec![
+    let mut controls = vec![
         select_control(
             SharedControlId::TranscriptionIntervals.id(),
             "Intervals",
@@ -1349,7 +2573,9 @@ pub fn transcription_controls(
             ControlVisibility::DirectCollocationOnly,
             ControlSemantic::CollocationDegree,
         ),
-    ]
+    ];
+    controls.extend(ocp_sx_function_controls(OcpSxFunctionConfig::default()));
+    controls
 }
 
 pub fn solver_controls(default_method: SolverMethod, default: SqpConfig) -> Vec<ControlSpec> {
@@ -1590,6 +2816,153 @@ pub fn transcription_from_map(
     })
 }
 
+fn parse_call_policy_choice(value: f64, key: SharedControlId) -> Result<CallPolicy> {
+    Ok(
+        match parse_enum_choice(value, key, &[0.0, 1.0, 2.0, 3.0])? {
+            0 => CallPolicy::InlineAtCall,
+            1 => CallPolicy::InlineAtLowering,
+            2 => CallPolicy::InlineInLLVM,
+            3 => CallPolicy::NoInlineLLVM,
+            _ => unreachable!("validated call policy choice index"),
+        },
+    )
+}
+
+fn parse_kernel_strategy_choice(value: f64, key: SharedControlId) -> Result<OcpKernelStrategy> {
+    Ok(
+        match parse_enum_choice(value, key, &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0])? {
+            0 => OcpKernelStrategy::Inline,
+            1 => OcpKernelStrategy::FunctionUseGlobalPolicy,
+            2 => OcpKernelStrategy::FunctionInlineAtCall,
+            3 => OcpKernelStrategy::FunctionInlineAtLowering,
+            4 => OcpKernelStrategy::FunctionInlineInLlvm,
+            5 => OcpKernelStrategy::FunctionNoInlineLlvm,
+            _ => unreachable!("validated kernel strategy choice index"),
+        },
+    )
+}
+
+pub fn ocp_sx_function_config_from_map(
+    values: &BTreeMap<String, f64>,
+    default: OcpSxFunctionConfig,
+) -> Result<OcpSxFunctionConfig> {
+    let global_call_policy = parse_call_policy_choice(
+        sample_shared_or_default(
+            values,
+            SharedControlId::SxFunctionGlobalCallPolicy,
+            call_policy_choice_value(default.global_call_policy),
+        ),
+        SharedControlId::SxFunctionGlobalCallPolicy,
+    )?;
+    let override_behavior = match parse_enum_choice(
+        sample_shared_or_default(
+            values,
+            SharedControlId::SxFunctionOverrideBehavior,
+            override_behavior_choice_value(default.override_behavior),
+        ),
+        SharedControlId::SxFunctionOverrideBehavior,
+        &[0.0, 1.0],
+    )? {
+        0 => OcpOverrideBehavior::RespectFunctionOverrides,
+        1 => OcpOverrideBehavior::StrictGlobalPolicy,
+        _ => unreachable!("validated override behavior choice index"),
+    };
+    Ok(OcpSxFunctionConfig {
+        global_call_policy,
+        override_behavior,
+        ode: parse_kernel_strategy_choice(
+            sample_shared_or_default(
+                values,
+                SharedControlId::SxFunctionOde,
+                kernel_strategy_choice_value(default.ode),
+            ),
+            SharedControlId::SxFunctionOde,
+        )?,
+        objective_lagrange: parse_kernel_strategy_choice(
+            sample_shared_or_default(
+                values,
+                SharedControlId::SxFunctionObjectiveLagrange,
+                kernel_strategy_choice_value(default.objective_lagrange),
+            ),
+            SharedControlId::SxFunctionObjectiveLagrange,
+        )?,
+        objective_mayer: parse_kernel_strategy_choice(
+            sample_shared_or_default(
+                values,
+                SharedControlId::SxFunctionObjectiveMayer,
+                kernel_strategy_choice_value(default.objective_mayer),
+            ),
+            SharedControlId::SxFunctionObjectiveMayer,
+        )?,
+        path_constraints: parse_kernel_strategy_choice(
+            sample_shared_or_default(
+                values,
+                SharedControlId::SxFunctionPathConstraints,
+                kernel_strategy_choice_value(default.path_constraints),
+            ),
+            SharedControlId::SxFunctionPathConstraints,
+        )?,
+        boundary_equalities: parse_kernel_strategy_choice(
+            sample_shared_or_default(
+                values,
+                SharedControlId::SxFunctionBoundaryEqualities,
+                kernel_strategy_choice_value(default.boundary_equalities),
+            ),
+            SharedControlId::SxFunctionBoundaryEqualities,
+        )?,
+        boundary_inequalities: parse_kernel_strategy_choice(
+            sample_shared_or_default(
+                values,
+                SharedControlId::SxFunctionBoundaryInequalities,
+                kernel_strategy_choice_value(default.boundary_inequalities),
+            ),
+            SharedControlId::SxFunctionBoundaryInequalities,
+        )?,
+        multiple_shooting_integrator: parse_kernel_strategy_choice(
+            sample_shared_or_default(
+                values,
+                SharedControlId::SxFunctionMultipleShootingIntegrator,
+                kernel_strategy_choice_value(default.multiple_shooting_integrator),
+            ),
+            SharedControlId::SxFunctionMultipleShootingIntegrator,
+        )?,
+    })
+}
+
+pub fn ocp_sx_function_config_from_map_lossy(
+    values: &BTreeMap<String, f64>,
+    default: OcpSxFunctionConfig,
+) -> OcpSxFunctionConfig {
+    ocp_sx_function_config_from_map(values, default).unwrap_or(default)
+}
+
+fn call_policy_choice_value(policy: CallPolicy) -> f64 {
+    match policy {
+        CallPolicy::InlineAtCall => 0.0,
+        CallPolicy::InlineAtLowering => 1.0,
+        CallPolicy::InlineInLLVM => 2.0,
+        CallPolicy::NoInlineLLVM => 3.0,
+    }
+}
+
+fn override_behavior_choice_value(behavior: OcpOverrideBehavior) -> f64 {
+    match behavior {
+        OcpOverrideBehavior::RespectFunctionOverrides => 0.0,
+        OcpOverrideBehavior::StrictGlobalPolicy => 1.0,
+    }
+}
+
+fn kernel_strategy_choice_value(strategy: OcpKernelStrategy) -> f64 {
+    match strategy {
+        OcpKernelStrategy::Inline => 0.0,
+        OcpKernelStrategy::FunctionUseGlobalPolicy => 1.0,
+        OcpKernelStrategy::FunctionInlineAtCall => 2.0,
+        OcpKernelStrategy::FunctionInlineAtLowering => 3.0,
+        OcpKernelStrategy::FunctionInlineInLlvm => 4.0,
+        OcpKernelStrategy::FunctionNoInlineLlvm => 5.0,
+    }
+}
+
 pub fn sqp_options(config: &SqpConfig) -> ClarabelSqpOptions {
     ClarabelSqpOptions {
         max_iters: config.max_iters,
@@ -1743,6 +3116,7 @@ pub fn select_control<S: AsRef<str>>(
         unit: unit.into(),
         help: help.into(),
         section,
+        panel: None,
         editor: ControlEditor::Select,
         visibility,
         semantic,
@@ -1770,6 +3144,7 @@ pub fn text_control(
         unit: unit.into(),
         help: help.into(),
         section: ControlSection::Solver,
+        panel: None,
         editor: ControlEditor::Text,
         visibility: ControlVisibility::Always,
         semantic,
@@ -1845,6 +3220,7 @@ fn problem_slider_control_with_display(
         unit: unit.into(),
         help: help.into(),
         section: ControlSection::Problem,
+        panel: None,
         editor: ControlEditor::Slider,
         visibility: ControlVisibility::Always,
         semantic: ControlSemantic::ProblemParameter,
@@ -2161,7 +3537,15 @@ where
     Ok(())
 }
 
-pub trait MultipleShootingCompiled<const N: usize> {
+pub trait CompiledOcpMetadata {
+    fn backend_timing_metadata(&self) -> BackendTimingMetadata;
+    fn nlp_compile_stats(&self) -> NlpCompileStats;
+    fn helper_compile_stats(&self) -> OcpHelperCompileStats;
+    fn helper_kernel_count(&self) -> usize;
+    fn backend_compile_report(&self) -> &BackendCompileReport;
+}
+
+pub trait MultipleShootingCompiled<const N: usize>: CompiledOcpMetadata {
     type PNum;
     type CBounds;
     type BeqNum;
@@ -2284,9 +3668,26 @@ pub trait MultipleShootingCompiled<const N: usize> {
         trajectories: &MultipleShootingTrajectories<Self::XNum, Self::UNum, N>,
         tolerance: f64,
     ) -> Result<OcpConstraintViolationReport>;
+
+    fn benchmark_nlp_evaluations_with_progress<CB>(
+        &self,
+        values: &MultipleShootingRuntimeValues<
+            Self::PNum,
+            Self::CBounds,
+            Self::BeqNum,
+            Self::BineqBounds,
+            Self::XNum,
+            Self::UNum,
+            N,
+        >,
+        options: NlpEvaluationBenchmarkOptions,
+        on_progress: CB,
+    ) -> Result<NlpEvaluationBenchmark>
+    where
+        CB: FnMut(NlpEvaluationKernelKind);
 }
 
-pub trait DirectCollocationCompiled<const N: usize, const K: usize> {
+pub trait DirectCollocationCompiled<const N: usize, const K: usize>: CompiledOcpMetadata {
     type PNum;
     type CBounds;
     type BeqNum;
@@ -2414,6 +3815,98 @@ pub trait DirectCollocationCompiled<const N: usize, const K: usize> {
         trajectories: &DirectCollocationTrajectories<Self::XNum, Self::UNum, N, K>,
         tolerance: f64,
     ) -> Result<OcpConstraintViolationReport>;
+
+    fn benchmark_nlp_evaluations_with_progress<CB>(
+        &self,
+        values: &DirectCollocationRuntimeValues<
+            Self::PNum,
+            Self::CBounds,
+            Self::BeqNum,
+            Self::BineqBounds,
+            Self::XNum,
+            Self::UNum,
+            N,
+            K,
+        >,
+        options: NlpEvaluationBenchmarkOptions,
+        on_progress: CB,
+    ) -> Result<NlpEvaluationBenchmark>
+    where
+        CB: FnMut(NlpEvaluationKernelKind);
+}
+
+impl<X, U, P, C, Beq, Bineq, const N: usize, const RK4_SUBSTEPS: usize> CompiledOcpMetadata
+    for CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>
+where
+    X: Vectorize<SX, Rebind<SX> = X> + Clone,
+    U: Vectorize<SX, Rebind<SX> = U> + Clone,
+    P: Vectorize<SX, Rebind<SX> = P>,
+    C: Vectorize<SX, Rebind<SX> = C>,
+    Beq: Vectorize<SX, Rebind<SX> = Beq>,
+    Bineq: Vectorize<SX, Rebind<SX> = Bineq>,
+    optimal_control::Mesh<X, N>: Vectorize<SX, Rebind<SX> = optimal_control::Mesh<X, N>>,
+    optimal_control::Mesh<U, N>: Vectorize<SX, Rebind<SX> = optimal_control::Mesh<U, N>>,
+    [C; N]: Vectorize<SX, Rebind<SX> = [C; N]>,
+    [X; N]: Vectorize<SX, Rebind<SX> = [X; N]>,
+    [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,
+    <([X; N], [U; N]) as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
+    (
+        optimal_control::Mesh<X, N>,
+        optimal_control::Mesh<U, N>,
+        [U; N],
+        SX,
+    ): Vectorize<
+            SX,
+            Rebind<SX> = (
+                optimal_control::Mesh<X, N>,
+                optimal_control::Mesh<U, N>,
+                [U; N],
+                SX,
+            ),
+            Rebind<f64> = (
+                optimal_control::Mesh<Numeric<X>, N>,
+                optimal_control::Mesh<Numeric<U>, N>,
+                [Numeric<U>; N],
+                f64,
+            ),
+        >,
+    ([X; N], [U; N]): Vectorize<SX, Rebind<SX> = ([X; N], [U; N])>,
+    (Beq, Bineq, [C; N]): Vectorize<
+            SX,
+            Rebind<SX> = (Beq, Bineq, [C; N]),
+            Rebind<f64> = (Numeric<Beq>, Numeric<Bineq>, [Numeric<C>; N]),
+        >,
+    (P, Beq): Vectorize<SX, Rebind<SX> = (P, Beq), Rebind<f64> = (Numeric<P>, Numeric<Beq>)>,
+    Numeric<X>: Vectorize<f64, Rebind<f64> = Numeric<X>> + Clone,
+    Numeric<U>: Vectorize<f64, Rebind<f64> = Numeric<U>> + Clone,
+    Numeric<P>: Vectorize<f64, Rebind<f64> = Numeric<P>> + Clone,
+    Numeric<Beq>: Vectorize<f64, Rebind<f64> = Numeric<Beq>> + Clone,
+    Numeric<Bineq>: Vectorize<f64, Rebind<f64> = Numeric<Bineq>>,
+    Numeric<C>: Vectorize<f64, Rebind<f64> = Numeric<C>>,
+    <C as Vectorize<SX>>::Rebind<Bounds1D>:
+        Vectorize<Bounds1D, Rebind<Bounds1D> = <C as Vectorize<SX>>::Rebind<Bounds1D>>,
+    <Bineq as Vectorize<SX>>::Rebind<Bounds1D>:
+        Vectorize<Bounds1D, Rebind<Bounds1D> = <Bineq as Vectorize<SX>>::Rebind<Bounds1D>>,
+{
+    fn backend_timing_metadata(&self) -> BackendTimingMetadata {
+        Self::backend_timing_metadata(self)
+    }
+
+    fn nlp_compile_stats(&self) -> NlpCompileStats {
+        Self::nlp_compile_stats(self)
+    }
+
+    fn helper_compile_stats(&self) -> OcpHelperCompileStats {
+        Self::helper_compile_stats(self)
+    }
+
+    fn helper_kernel_count(&self) -> usize {
+        Self::helper_kernel_count(self)
+    }
+
+    fn backend_compile_report(&self) -> &BackendCompileReport {
+        Self::backend_compile_report(self)
+    }
 }
 
 impl<X, U, P, C, Beq, Bineq, const N: usize, const RK4_SUBSTEPS: usize> MultipleShootingCompiled<N>
@@ -2650,6 +4143,137 @@ where
             tolerance,
         )
         .map_err(Into::into)
+    }
+
+    fn benchmark_nlp_evaluations_with_progress<CB>(
+        &self,
+        values: &MultipleShootingRuntimeValues<
+            Self::PNum,
+            Self::CBounds,
+            Self::BeqNum,
+            Self::BineqBounds,
+            Self::XNum,
+            Self::UNum,
+            N,
+        >,
+        options: NlpEvaluationBenchmarkOptions,
+        on_progress: CB,
+    ) -> Result<NlpEvaluationBenchmark>
+    where
+        CB: FnMut(NlpEvaluationKernelKind),
+    {
+        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::benchmark_nlp_evaluations_with_progress(
+            self,
+            values,
+            options,
+            on_progress,
+        )
+        .map_err(Into::into)
+    }
+}
+
+impl<X, U, P, C, Beq, Bineq, const N: usize, const K: usize> CompiledOcpMetadata
+    for CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq, N, K>
+where
+    X: Vectorize<SX, Rebind<SX> = X> + Clone,
+    U: Vectorize<SX, Rebind<SX> = U> + Clone,
+    P: Vectorize<SX, Rebind<SX> = P>,
+    C: Vectorize<SX, Rebind<SX> = C>,
+    Beq: Vectorize<SX, Rebind<SX> = Beq>,
+    Bineq: Vectorize<SX, Rebind<SX> = Bineq>,
+    optimal_control::Mesh<X, N>: Vectorize<SX, Rebind<SX> = optimal_control::Mesh<X, N>>,
+    optimal_control::Mesh<U, N>: Vectorize<SX, Rebind<SX> = optimal_control::Mesh<U, N>>,
+    optimal_control::IntervalGrid<X, N, K>:
+        Vectorize<SX, Rebind<SX> = optimal_control::IntervalGrid<X, N, K>>,
+    optimal_control::IntervalGrid<U, N, K>:
+        Vectorize<SX, Rebind<SX> = optimal_control::IntervalGrid<U, N, K>>,
+    optimal_control::IntervalGrid<C, N, K>:
+        Vectorize<SX, Rebind<SX> = optimal_control::IntervalGrid<C, N, K>>,
+    (
+        optimal_control::Mesh<X, N>,
+        optimal_control::Mesh<U, N>,
+        optimal_control::IntervalGrid<X, N, K>,
+        optimal_control::IntervalGrid<U, N, K>,
+        optimal_control::IntervalGrid<U, N, K>,
+        SX,
+    ): Vectorize<
+            SX,
+            Rebind<SX> = (
+                optimal_control::Mesh<X, N>,
+                optimal_control::Mesh<U, N>,
+                optimal_control::IntervalGrid<X, N, K>,
+                optimal_control::IntervalGrid<U, N, K>,
+                optimal_control::IntervalGrid<U, N, K>,
+                SX,
+            ),
+            Rebind<f64> = (
+                optimal_control::Mesh<Numeric<X>, N>,
+                optimal_control::Mesh<Numeric<U>, N>,
+                optimal_control::IntervalGrid<Numeric<X>, N, K>,
+                optimal_control::IntervalGrid<Numeric<U>, N, K>,
+                optimal_control::IntervalGrid<Numeric<U>, N, K>,
+                f64,
+            ),
+        >,
+    (
+        [X; N],
+        [U; N],
+        optimal_control::IntervalGrid<X, N, K>,
+        optimal_control::IntervalGrid<U, N, K>,
+    ): Vectorize<
+            SX,
+            Rebind<SX> = (
+                [X; N],
+                [U; N],
+                optimal_control::IntervalGrid<X, N, K>,
+                optimal_control::IntervalGrid<U, N, K>,
+            ),
+        >,
+    (Beq, Bineq, optimal_control::IntervalGrid<C, N, K>): Vectorize<
+            SX,
+            Rebind<SX> = (Beq, Bineq, optimal_control::IntervalGrid<C, N, K>),
+            Rebind<f64> = (
+                Numeric<Beq>,
+                Numeric<Bineq>,
+                optimal_control::IntervalGrid<Numeric<C>, N, K>,
+            ),
+        >,
+    (P, Beq): Vectorize<SX, Rebind<SX> = (P, Beq), Rebind<f64> = (Numeric<P>, Numeric<Beq>)>,
+    [X; N]: Vectorize<SX, Rebind<SX> = [X; N]>,
+    [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,
+    <optimal_control::IntervalGrid<X, N, K> as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
+    <optimal_control::IntervalGrid<U, N, K> as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
+    <[X; N] as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
+    <[U; N] as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
+    Numeric<X>: Vectorize<f64, Rebind<f64> = Numeric<X>> + Clone,
+    Numeric<U>: Vectorize<f64, Rebind<f64> = Numeric<U>> + Clone,
+    Numeric<P>: Vectorize<f64, Rebind<f64> = Numeric<P>> + Clone,
+    Numeric<Beq>: Vectorize<f64, Rebind<f64> = Numeric<Beq>> + Clone,
+    Numeric<Bineq>: Vectorize<f64, Rebind<f64> = Numeric<Bineq>>,
+    Numeric<C>: Vectorize<f64, Rebind<f64> = Numeric<C>>,
+    <C as Vectorize<SX>>::Rebind<Bounds1D>:
+        Vectorize<Bounds1D, Rebind<Bounds1D> = <C as Vectorize<SX>>::Rebind<Bounds1D>>,
+    <Bineq as Vectorize<SX>>::Rebind<Bounds1D>:
+        Vectorize<Bounds1D, Rebind<Bounds1D> = <Bineq as Vectorize<SX>>::Rebind<Bounds1D>>,
+{
+    fn backend_timing_metadata(&self) -> BackendTimingMetadata {
+        Self::backend_timing_metadata(self)
+    }
+
+    fn nlp_compile_stats(&self) -> NlpCompileStats {
+        Self::nlp_compile_stats(self)
+    }
+
+    fn helper_compile_stats(&self) -> OcpHelperCompileStats {
+        Self::helper_compile_stats(self)
+    }
+
+    fn helper_kernel_count(&self) -> usize {
+        Self::helper_kernel_count(self)
+    }
+
+    fn backend_compile_report(&self) -> &BackendCompileReport {
+        Self::backend_compile_report(self)
     }
 }
 
@@ -2907,6 +4531,33 @@ where
             values,
             trajectories,
             tolerance,
+        )
+        .map_err(Into::into)
+    }
+
+    fn benchmark_nlp_evaluations_with_progress<CB>(
+        &self,
+        values: &DirectCollocationRuntimeValues<
+            Self::PNum,
+            Self::CBounds,
+            Self::BeqNum,
+            Self::BineqBounds,
+            Self::XNum,
+            Self::UNum,
+            N,
+            K,
+        >,
+        options: NlpEvaluationBenchmarkOptions,
+        on_progress: CB,
+    ) -> Result<NlpEvaluationBenchmark>
+    where
+        CB: FnMut(NlpEvaluationKernelKind),
+    {
+        CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq, N, K>::benchmark_nlp_evaluations_with_progress(
+            self,
+            values,
+            options,
+            on_progress,
         )
         .map_err(Into::into)
     }
@@ -4001,6 +5652,11 @@ pub trait FromMap: Sized {
     fn from_map(values: &BTreeMap<String, f64>) -> Result<Self>;
 }
 
+pub trait StandardOcpParams {
+    fn transcription(&self) -> &TranscriptionConfig;
+    fn transcription_mut(&mut self) -> &mut TranscriptionConfig;
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SolveRequest {
     pub values: BTreeMap<String, f64>,
@@ -4209,6 +5865,7 @@ mod tests {
         let symbolic = ocp_compile_progress_update(
             OcpCompileProgress::SymbolicReady(optimization::SymbolicCompileMetadata {
                 timing: symbolic_timing,
+                setup_profile: SymbolicSetupProfile::default(),
                 stats: NlpCompileStats {
                     jit_kernel_count: 3,
                     ..NlpCompileStats::default()
@@ -4277,5 +5934,29 @@ mod tests {
         ];
 
         assert_shared_progress_lifecycle(&events);
+    }
+
+    #[test]
+    fn transcription_controls_include_collapsible_sx_function_panel() {
+        let controls = transcription_controls(default_transcription(30), &[30], &[3]);
+        let ode = controls
+            .iter()
+            .find(|control| control.id == "sxf_ode")
+            .expect("expected sx function ODE control");
+        assert_eq!(ode.section, ControlSection::Transcription);
+        assert_eq!(ode.panel, Some(ControlPanel::SxFunctions));
+        assert_eq!(ode.semantic, ControlSemantic::SxFunctionOption);
+    }
+
+    #[test]
+    fn sx_function_config_variant_suffix_changes_for_custom_settings() {
+        let default = OcpSxFunctionConfig::default();
+        let custom = OcpSxFunctionConfig {
+            global_call_policy: CallPolicy::NoInlineLLVM,
+            multiple_shooting_integrator: OcpKernelStrategy::FunctionUseGlobalPolicy,
+            ..default
+        };
+        assert_ne!(default.variant_id_suffix(), custom.variant_id_suffix());
+        assert_eq!(custom.variant_label_suffix().as_deref(), Some("SXF Custom"));
     }
 }

@@ -14,6 +14,7 @@ ipopt = ["optimization/ipopt"]
 
 [dependencies]
 anyhow.workspace = true
+clap.workspace = true
 indicatif = "0.18.2"
 optimization = { path = "../optimization" }
 rayon.workspace = true

@@ -220,16 +220,40 @@ pub struct NlpCompileStats {
     pub parameter_scalar_count: Index,
     pub equality_count: Index,
     pub inequality_count: Index,
+    pub objective_gradient_nnz: Index,
     pub equality_jacobian_nnz: Index,
     pub inequality_jacobian_nnz: Index,
     pub hessian_nnz: Index,
     pub jit_kernel_count: Index,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SymbolicCompileMetadata {
     pub timing: BackendTimingMetadata,
+    pub setup_profile: SymbolicSetupProfile,
     pub stats: NlpCompileStats,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SymbolicCompileStage {
+    BuildProblem,
+    ObjectiveGradient,
+    EqualityJacobian,
+    InequalityJacobian,
+    LagrangianAssembly,
+    HessianGeneration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SymbolicCompileStageProgress {
+    pub stage: SymbolicCompileStage,
+    pub metadata: SymbolicCompileMetadata,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SymbolicCompileProgress {
+    Stage(SymbolicCompileStageProgress),
+    Ready(SymbolicCompileMetadata),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -418,6 +442,119 @@ pub struct ParameterMatrix<'a> {
     pub values: &'a [f64],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NlpEvaluationBenchmarkOptions {
+    pub warmup_iterations: usize,
+    pub measured_iterations: usize,
+}
+
+impl Default for NlpEvaluationBenchmarkOptions {
+    fn default() -> Self {
+        Self {
+            warmup_iterations: 10,
+            measured_iterations: 100,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NlpEvaluationKernelKind {
+    ObjectiveValue,
+    ObjectiveGradient,
+    EqualityJacobianValues,
+    InequalityJacobianValues,
+    LagrangianHessianValues,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct KernelOutputSummary {
+    pub finite: bool,
+    pub nonzero_count: usize,
+    pub max_abs: f64,
+}
+
+impl KernelOutputSummary {
+    pub fn is_all_zero(&self) -> bool {
+        self.nonzero_count == 0
+    }
+}
+
+fn summarize_output(values: &[f64]) -> KernelOutputSummary {
+    let finite = values.iter().all(|value| value.is_finite());
+    let nonzero_count = values.iter().filter(|&&value| value != 0.0).count();
+    let max_abs = values
+        .iter()
+        .map(|value| value.abs())
+        .fold(0.0_f64, f64::max);
+    KernelOutputSummary {
+        finite,
+        nonzero_count,
+        max_abs,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct KernelBenchmarkStats {
+    pub output_len: usize,
+    pub iterations: usize,
+    pub total_time: Duration,
+    pub min_time: Option<Duration>,
+    pub max_time: Option<Duration>,
+    pub stddev_seconds_accumulator: f64,
+    pub preflight_output: KernelOutputSummary,
+}
+
+impl KernelBenchmarkStats {
+    pub fn average_time(&self) -> Option<Duration> {
+        (self.iterations > 0).then(|| self.total_time.div_f64(self.iterations as f64))
+    }
+
+    pub fn stddev_time(&self) -> Option<Duration> {
+        if self.iterations == 0 {
+            return None;
+        }
+        let mean_seconds = self.total_time.as_secs_f64() / self.iterations as f64;
+        let variance_seconds = (self.stddev_seconds_accumulator / self.iterations as f64)
+            - mean_seconds * mean_seconds;
+        Some(Duration::from_secs_f64(variance_seconds.max(0.0).sqrt()))
+    }
+
+    fn record_sample(&mut self, elapsed: Duration) {
+        self.iterations += 1;
+        self.total_time += elapsed;
+        let elapsed_seconds = elapsed.as_secs_f64();
+        self.stddev_seconds_accumulator += elapsed_seconds * elapsed_seconds;
+        self.min_time = Some(match self.min_time {
+            Some(current) => current.min(elapsed),
+            None => elapsed,
+        });
+        self.max_time = Some(match self.max_time {
+            Some(current) => current.max(elapsed),
+            None => elapsed,
+        });
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct NlpBenchmarkPointSummary {
+    pub decision_inf_norm: f64,
+    pub parameter_inf_norm: f64,
+    pub objective_value: f64,
+    pub objective_finite: bool,
+    pub equality_inf_norm: Option<f64>,
+    pub inequality_inf_norm: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NlpEvaluationBenchmark {
+    pub benchmark_point: NlpBenchmarkPointSummary,
+    pub objective_value: KernelBenchmarkStats,
+    pub objective_gradient: KernelBenchmarkStats,
+    pub equality_jacobian_values: Option<KernelBenchmarkStats>,
+    pub inequality_jacobian_values: Option<KernelBenchmarkStats>,
+    pub lagrangian_hessian_values: KernelBenchmarkStats,
+}
+
 pub trait CompiledNlpProblem {
     fn dimension(&self) -> Index;
     fn parameter_count(&self) -> Index;
@@ -468,6 +605,162 @@ pub trait CompiledNlpProblem {
         inequality_multipliers: &[f64],
         out: &mut [f64],
     );
+}
+
+fn benchmark_kernel(
+    output_len: usize,
+    preflight_output: KernelOutputSummary,
+    options: NlpEvaluationBenchmarkOptions,
+    mut eval: impl FnMut(),
+) -> KernelBenchmarkStats {
+    for _ in 0..options.warmup_iterations {
+        eval();
+    }
+    let mut stats = KernelBenchmarkStats {
+        output_len,
+        preflight_output,
+        ..KernelBenchmarkStats::default()
+    };
+    for _ in 0..options.measured_iterations {
+        let started = Instant::now();
+        eval();
+        stats.record_sample(started.elapsed());
+    }
+    stats
+}
+
+pub fn benchmark_compiled_nlp_problem(
+    problem: &impl CompiledNlpProblem,
+    x: &[f64],
+    parameters: &[ParameterMatrix<'_>],
+    options: NlpEvaluationBenchmarkOptions,
+) -> NlpEvaluationBenchmark {
+    benchmark_compiled_nlp_problem_with_progress(problem, x, parameters, options, |_| {})
+}
+
+pub fn benchmark_compiled_nlp_problem_with_progress(
+    problem: &impl CompiledNlpProblem,
+    x: &[f64],
+    parameters: &[ParameterMatrix<'_>],
+    options: NlpEvaluationBenchmarkOptions,
+    mut on_progress: impl FnMut(NlpEvaluationKernelKind),
+) -> NlpEvaluationBenchmark {
+    let mut gradient = vec![0.0; problem.dimension()];
+    let equality_value_len = problem.equality_count();
+    let mut equality_values = vec![0.0; equality_value_len];
+    let inequality_value_len = problem.inequality_count();
+    let mut inequality_values = vec![0.0; inequality_value_len];
+    let equality_jac_nnz = problem.equality_jacobian_ccs().nnz();
+    let mut equality_jacobian = vec![0.0; equality_jac_nnz];
+    let inequality_jac_nnz = problem.inequality_jacobian_ccs().nnz();
+    let mut inequality_jacobian = vec![0.0; inequality_jac_nnz];
+    let mut hessian = vec![0.0; problem.lagrangian_hessian_ccs().nnz()];
+    let equality_multipliers = vec![0.0; problem.equality_count()];
+    let inequality_multipliers = vec![0.0; problem.inequality_count()];
+
+    let objective_value_preflight = problem.objective_value(x, parameters);
+    problem.objective_gradient(x, parameters, &mut gradient);
+    if equality_value_len > 0 {
+        problem.equality_values(x, parameters, &mut equality_values);
+    }
+    if inequality_value_len > 0 {
+        problem.inequality_values(x, parameters, &mut inequality_values);
+    }
+    if equality_jac_nnz > 0 {
+        problem.equality_jacobian_values(x, parameters, &mut equality_jacobian);
+    }
+    if inequality_jac_nnz > 0 {
+        problem.inequality_jacobian_values(x, parameters, &mut inequality_jacobian);
+    }
+    problem.lagrangian_hessian_values(
+        x,
+        parameters,
+        &equality_multipliers,
+        &inequality_multipliers,
+        &mut hessian,
+    );
+    let benchmark_point = NlpBenchmarkPointSummary {
+        decision_inf_norm: x.iter().map(|value| value.abs()).fold(0.0_f64, f64::max),
+        parameter_inf_norm: parameters
+            .iter()
+            .flat_map(|parameter| parameter.values.iter())
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max),
+        objective_value: objective_value_preflight,
+        objective_finite: objective_value_preflight.is_finite(),
+        equality_inf_norm: (!equality_values.is_empty()).then(|| {
+            equality_values
+                .iter()
+                .map(|value| value.abs())
+                .fold(0.0_f64, f64::max)
+        }),
+        inequality_inf_norm: (!inequality_values.is_empty()).then(|| {
+            inequality_values
+                .iter()
+                .map(|value| value.abs())
+                .fold(0.0_f64, f64::max)
+        }),
+    };
+    let objective_preflight = summarize_output(&[objective_value_preflight]);
+    let gradient_preflight = summarize_output(&gradient);
+    let equality_jacobian_preflight = summarize_output(&equality_jacobian);
+    let inequality_jacobian_preflight = summarize_output(&inequality_jacobian);
+    let hessian_preflight = summarize_output(&hessian);
+
+    on_progress(NlpEvaluationKernelKind::ObjectiveValue);
+    let objective_value = benchmark_kernel(1, objective_preflight, options, || {
+        std::hint::black_box(problem.objective_value(x, parameters));
+    });
+    on_progress(NlpEvaluationKernelKind::ObjectiveGradient);
+    let objective_gradient = benchmark_kernel(gradient.len(), gradient_preflight, options, || {
+        problem.objective_gradient(x, parameters, &mut gradient);
+        std::hint::black_box(&gradient);
+    });
+    let equality_jacobian_values = (equality_jac_nnz > 0).then(|| {
+        on_progress(NlpEvaluationKernelKind::EqualityJacobianValues);
+        benchmark_kernel(
+            equality_jacobian.len(),
+            equality_jacobian_preflight,
+            options,
+            || {
+                problem.equality_jacobian_values(x, parameters, &mut equality_jacobian);
+                std::hint::black_box(&equality_jacobian);
+            },
+        )
+    });
+    let inequality_jacobian_values = (inequality_jac_nnz > 0).then(|| {
+        on_progress(NlpEvaluationKernelKind::InequalityJacobianValues);
+        benchmark_kernel(
+            inequality_jacobian.len(),
+            inequality_jacobian_preflight,
+            options,
+            || {
+                problem.inequality_jacobian_values(x, parameters, &mut inequality_jacobian);
+                std::hint::black_box(&inequality_jacobian);
+            },
+        )
+    });
+    on_progress(NlpEvaluationKernelKind::LagrangianHessianValues);
+    let lagrangian_hessian_values =
+        benchmark_kernel(hessian.len(), hessian_preflight, options, || {
+            problem.lagrangian_hessian_values(
+                x,
+                parameters,
+                &equality_multipliers,
+                &inequality_multipliers,
+                &mut hessian,
+            );
+            std::hint::black_box(&hessian);
+        });
+
+    NlpEvaluationBenchmark {
+        benchmark_point,
+        objective_value,
+        objective_gradient,
+        equality_jacobian_values,
+        inequality_jacobian_values,
+        lagrangian_hessian_values,
+    }
 }
 
 #[derive(Clone, Debug)]

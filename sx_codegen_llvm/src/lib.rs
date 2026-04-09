@@ -14,13 +14,12 @@ use llvm_sys::core::{
     LLVMAddAttributeAtIndex, LLVMAddFunction, LLVMAppendBasicBlockInContext, LLVMBuildAlloca,
     LLVMBuildCall2, LLVMBuildFAdd, LLVMBuildFCmp, LLVMBuildFDiv, LLVMBuildFMul, LLVMBuildFSub,
     LLVMBuildInBoundsGEP2, LLVMBuildLoad2, LLVMBuildRetVoid, LLVMBuildSelect, LLVMBuildStore,
-    LLVMConstInt, LLVMConstReal, LLVMContextCreate, LLVMContextDispose,
-    LLVMCreateBuilderInContext, LLVMCreateEnumAttribute, LLVMDisposeBuilder,
-    LLVMDisposeMemoryBuffer, LLVMDisposeMessage, LLVMDoubleTypeInContext, LLVMFunctionType,
-    LLVMGetBufferSize, LLVMGetBufferStart, LLVMGetEnumAttributeKindForName, LLVMGetNamedFunction,
-    LLVMGetParam, LLVMGlobalGetValueType, LLVMInt64TypeInContext,
-    LLVMModuleCreateWithNameInContext, LLVMPointerType, LLVMPositionBuilderAtEnd, LLVMSetTarget,
-    LLVMSetLinkage, LLVMVoidTypeInContext,
+    LLVMConstInt, LLVMConstReal, LLVMContextCreate, LLVMContextDispose, LLVMCreateBuilderInContext,
+    LLVMCreateEnumAttribute, LLVMDisposeBuilder, LLVMDisposeMemoryBuffer, LLVMDisposeMessage,
+    LLVMDoubleTypeInContext, LLVMFunctionType, LLVMGetBufferSize, LLVMGetBufferStart,
+    LLVMGetEnumAttributeKindForName, LLVMGetNamedFunction, LLVMGetParam, LLVMGlobalGetValueType,
+    LLVMInt64TypeInContext, LLVMModuleCreateWithNameInContext, LLVMPointerType,
+    LLVMPositionBuilderAtEnd, LLVMSetLinkage, LLVMSetTarget, LLVMVoidTypeInContext,
 };
 use llvm_sys::error::{LLVMDisposeErrorMessage, LLVMErrorRef, LLVMGetErrorMessage};
 use llvm_sys::orc2::LLVMOrcExecutorAddress;
@@ -34,7 +33,6 @@ use llvm_sys::orc2::{
 use llvm_sys::prelude::{
     LLVMBuilderRef, LLVMContextRef, LLVMMemoryBufferRef, LLVMModuleRef, LLVMTypeRef, LLVMValueRef,
 };
-use llvm_sys::{LLVMAttributeFunctionIndex, LLVMLinkage};
 use llvm_sys::target::{
     LLVM_InitializeNativeAsmPrinter, LLVM_InitializeNativeTarget, LLVMCreateTargetData,
     LLVMDisposeTargetData, LLVMSetModuleDataLayout,
@@ -50,6 +48,7 @@ use llvm_sys::target_machine::{
 use llvm_sys::transforms::pass_builder::{
     LLVMCreatePassBuilderOptions, LLVMDisposePassBuilderOptions, LLVMRunPasses,
 };
+use llvm_sys::{LLVMAttributeFunctionIndex, LLVMLinkage};
 use sx_codegen::{
     Instruction, LoweredFunction, LoweredSubfunction, ValueRef, format_rust_source,
     lower_function_with_policies, sanitize_ident, to_pascal_case,
@@ -274,7 +273,12 @@ pub fn emit_object_file(
     opt_level: LlvmOptimizationLevel,
     target: &LlvmTarget,
 ) -> Result<()> {
-    emit_object_file_with_options(path, function, FunctionCompileOptions::from(opt_level), target)
+    emit_object_file_with_options(
+        path,
+        function,
+        FunctionCompileOptions::from(opt_level),
+        target,
+    )
 }
 
 pub fn emit_object_file_with_options(
@@ -506,18 +510,16 @@ unsafe fn build_module(
             .subfunctions
             .iter()
             .enumerate()
-            .map(|(index, subfunction)| {
-                unsafe {
-                    declare_subfunction(
-                        module,
-                        context,
-                        index,
-                        subfunction,
-                        f64_ty,
-                        f64_ptr_ty,
-                        void_ty,
-                    )
-                }
+            .map(|(index, subfunction)| unsafe {
+                declare_subfunction(
+                    module,
+                    context,
+                    index,
+                    subfunction,
+                    f64_ty,
+                    f64_ptr_ty,
+                    void_ty,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -587,8 +589,16 @@ unsafe fn declare_subfunction(
     f64_ptr_ty: LLVMTypeRef,
     void_ty: LLVMTypeRef,
 ) -> Result<DeclaredSubfunction> {
-    let input_count = subfunction.inputs.iter().map(|slot| slot.ccs.nnz()).sum::<usize>();
-    let output_count = subfunction.outputs.iter().map(|slot| slot.ccs.nnz()).sum::<usize>();
+    let input_count = subfunction
+        .inputs
+        .iter()
+        .map(|slot| slot.ccs.nnz())
+        .sum::<usize>();
+    let output_count = subfunction
+        .outputs
+        .iter()
+        .map(|slot| slot.ccs.nnz())
+        .sum::<usize>();
     let mut params = vec![f64_ty; input_count];
     params.extend((0..output_count).map(|_| f64_ptr_ty));
     let function_ty =
@@ -645,11 +655,11 @@ unsafe fn emit_root_callable(
         )?
     };
     for (slot_idx, values) in lowered.output_values.iter().enumerate() {
-        let output_ptr = unsafe { load_slot_ptr(builder, outputs_param, slot_idx, f64_ptr_ty, i64_ty) };
+        let output_ptr =
+            unsafe { load_slot_ptr(builder, outputs_param, slot_idx, f64_ptr_ty, i64_ty) };
         for (offset, value) in values.iter().copied().enumerate() {
-            let value_ref = unsafe {
-                emit_value(builder, &abi, &temps, value, f64_ty, f64_ptr_ty, i64_ty)
-            };
+            let value_ref =
+                unsafe { emit_value(builder, &abi, &temps, value, f64_ty, f64_ptr_ty, i64_ty) };
             let cell_ptr = unsafe { gep_f64_ptr(builder, output_ptr, offset, f64_ty, i64_ty) };
             unsafe { LLVMBuildStore(builder, value_ref, cell_ptr) };
         }
@@ -696,14 +706,18 @@ unsafe fn emit_internal_callable(
             i64_ty,
         )?
     };
-    let output_param_base = lowered.inputs.iter().map(|slot| slot.ccs.nnz()).sum::<usize>();
+    let output_param_base = lowered
+        .inputs
+        .iter()
+        .map(|slot| slot.ccs.nnz())
+        .sum::<usize>();
     let mut linear_output = 0usize;
     for values in &lowered.output_values {
         for value in values.iter().copied() {
-            let value_ref = unsafe {
-                emit_value(builder, &abi, &temps, value, f64_ty, f64_ptr_ty, i64_ty)
-            };
-            let output_ptr = unsafe { LLVMGetParam(function, (output_param_base + linear_output) as u32) };
+            let value_ref =
+                unsafe { emit_value(builder, &abi, &temps, value, f64_ty, f64_ptr_ty, i64_ty) };
+            let output_ptr =
+                unsafe { LLVMGetParam(function, (output_param_base + linear_output) as u32) };
             unsafe { LLVMBuildStore(builder, value_ref, output_ptr) };
             linear_output += 1;
         }
@@ -779,7 +793,8 @@ unsafe fn emit_instruction_sequence(
                     )
                 };
                 for output_ptr in output_ptrs {
-                    temps.push(unsafe { LLVMBuildLoad2(builder, f64_ty, output_ptr, c"".as_ptr()) });
+                    temps
+                        .push(unsafe { LLVMBuildLoad2(builder, f64_ty, output_ptr, c"".as_ptr()) });
                 }
             }
         }
@@ -1385,8 +1400,7 @@ unsafe fn take_owned_message(message: *mut i8) -> Result<String> {
 mod tests {
     use super::{
         AotWrapperOptions, CompiledJitFunction, FunctionCompileOptions, JitOptimizationLevel,
-        LlvmTarget,
-        emit_object_bytes_lowered, generate_aot_wrapper_module,
+        LlvmTarget, emit_object_bytes_lowered, generate_aot_wrapper_module,
     };
     use sx_codegen::{Instruction, LoweredFunction, LoweredSubfunction, ValueRef, lower_function};
     use sx_core::{
@@ -1568,9 +1582,10 @@ mod tests {
         .expect("constraint bundle should build");
         let gradient = objective.gradient(&x).expect("gradient should build");
         let jacobian = constraints.jacobian(&x).expect("jacobian should build");
-        let hessian = SXMatrix::scalar(objective.scalar_expr().expect("objective should be scalar"))
-            .hessian(&x)
-            .expect("hessian should build");
+        let hessian =
+            SXMatrix::scalar(objective.scalar_expr().expect("objective should be scalar"))
+                .hessian(&x)
+                .expect("hessian should build");
 
         SXFunction::new(
             "policy_bundle",
@@ -1798,13 +1813,22 @@ mod tests {
         let inline_at_call = compile_with_policy(&function, CallPolicy::InlineAtCall);
         assert!(inline_at_call.lowered().subfunctions.is_empty());
         assert!(inline_at_call.lowered().stats.inlines_at_call >= 2);
-        assert_eq!(inline_at_call.lowered().stats.llvm_call_instructions_emitted, 0);
+        assert_eq!(
+            inline_at_call
+                .lowered()
+                .stats
+                .llvm_call_instructions_emitted,
+            0
+        );
 
         let inline_at_lowering = compile_with_policy(&function, CallPolicy::InlineAtLowering);
         assert!(inline_at_lowering.lowered().subfunctions.is_empty());
         assert!(inline_at_lowering.lowered().stats.inlines_at_lowering >= 2);
         assert_eq!(
-            inline_at_lowering.lowered().stats.llvm_call_instructions_emitted,
+            inline_at_lowering
+                .lowered()
+                .stats
+                .llvm_call_instructions_emitted,
             0
         );
 

@@ -1,33 +1,27 @@
 use crate::common::{
-    CachedCompile, CompileCacheStatus, CompileProgressInfo, CompileProgressUpdate, FromMap,
-    LatexSection, MetricKey, OcpCompileProgressState, PlotMode, ProblemId, ProblemSpec, Scene2D,
-    SceneAnimation, SceneArrow, SceneFrame, ScenePath, SolveArtifact, SolveStreamEvent,
-    SolverMethod, SolverReport, SqpConfig, TimeSeries, TranscriptionConfig, TranscriptionMethod,
-    cached_compile_with_progress, chart, compile_progress_info, default_solver_method,
-    default_sqp_config, default_transcription, deg_to_rad,
-    direct_collocation_compile_key as dc_compile_key, expect_finite,
-    interactive_multiple_shooting_opt_level, interval_arc_bound_series, interval_arc_series,
-    metric_with_key, node_times, numeric_metric_with_key, ocp_compile_progress_update,
-    problem_controls, problem_scientific_slider_control, problem_slider_control, problem_spec,
-    rad_to_deg, sample_or_default, segmented_series, solve_cached_direct_collocation_problem,
-    solve_cached_direct_collocation_problem_with_progress, solve_cached_multiple_shooting_problem,
-    solve_cached_multiple_shooting_problem_with_progress, solver_config_from_map,
-    solver_method_from_map, summarize_backend_compile_report, transcription_from_map,
-    transcription_metrics,
+    CompileCacheStatus, CompileProgressInfo, CompileProgressUpdate, ContinuousInitialGuess,
+    FromMap, LatexSection, MetricKey, OcpRuntimeSpec, OcpSxFunctionConfig, PlotMode, ProblemId,
+    ProblemSpec, Scene2D, SceneAnimation, SceneArrow, SceneFrame, ScenePath, SolveArtifact,
+    SolveStreamEvent, SolverMethod, SolverReport, SqpConfig, StandardOcpParams, TimeSeries,
+    TranscriptionConfig, chart, default_solver_method, default_sqp_config, default_transcription,
+    deg_to_rad, direct_collocation_runtime_from_spec, expect_finite, interval_arc_bound_series,
+    interval_arc_series, metric_with_key, multiple_shooting_runtime_from_spec, node_times,
+    numeric_metric_with_key, ocp_sx_function_config_from_map, problem_controls,
+    problem_scientific_slider_control, problem_slider_control, problem_spec, rad_to_deg,
+    sample_or_default, segmented_series, solver_config_from_map, solver_method_from_map,
+    transcription_from_map, transcription_metrics,
 };
 use anyhow::Result;
 use optimal_control::{
     Bounds1D, CompiledDirectCollocationOcp, CompiledMultipleShootingOcp, DirectCollocation,
-    DirectCollocationInitialGuess, DirectCollocationRuntimeValues, DirectCollocationTimeGrid,
-    DirectCollocationTrajectories, InterpolatedTrajectory, IntervalArc, MultipleShooting,
-    MultipleShootingInitialGuess, MultipleShootingRuntimeValues, MultipleShootingTrajectories, Ocp,
-    direct_collocation_root_arcs, direct_collocation_state_like_arcs,
+    DirectCollocationRuntimeValues, DirectCollocationTimeGrid, DirectCollocationTrajectories,
+    InterpolatedTrajectory, IntervalArc, MultipleShooting, MultipleShootingRuntimeValues,
+    MultipleShootingTrajectories, Ocp, direct_collocation_root_arcs,
+    direct_collocation_state_like_arcs,
 };
 use serde::Serialize;
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::f64::consts::PI;
-use std::rc::Rc;
 use sx_core::SX;
 
 const RK4_SUBSTEPS: usize = 2;
@@ -110,10 +104,17 @@ type DcCompiled<const N: usize, const K: usize> = CompiledDirectCollocationOcp<
     K,
 >;
 
-crate::standard_ocp_compile_caches!(
-    MULTIPLE_SHOOTING_CACHE: MsCompiled<DEFAULT_INTERVALS>,
-    DIRECT_COLLOCATION_CACHE: DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>
-);
+thread_local! {
+    static MULTIPLE_SHOOTING_CACHE: std::cell::RefCell<
+        crate::common::SharedCompileCache<crate::common::MultipleShootingCompileKey, MsCompiled<DEFAULT_INTERVALS>>
+    > = std::cell::RefCell::new(crate::common::SharedCompileCache::new());
+    static DIRECT_COLLOCATION_CACHE: std::cell::RefCell<
+        crate::common::SharedCompileCache<
+            crate::common::DirectCollocationCompileVariantKey,
+            DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+        >
+    > = std::cell::RefCell::new(crate::common::SharedCompileCache::new());
+}
 
 const PROBLEM_NAME: &str = "Sailboat Symmetric Tack";
 
@@ -134,6 +135,7 @@ pub struct Params {
     pub solver_method: SolverMethod,
     pub solver: SqpConfig,
     pub transcription: TranscriptionConfig,
+    pub sx_functions: OcpSxFunctionConfig,
 }
 
 impl Default for Params {
@@ -154,7 +156,18 @@ impl Default for Params {
             solver_method: default_solver_method(),
             solver: default_sqp_config(),
             transcription: default_transcription(DEFAULT_INTERVALS),
+            sx_functions: OcpSxFunctionConfig::default(),
         }
+    }
+}
+
+impl StandardOcpParams for Params {
+    fn transcription(&self) -> &TranscriptionConfig {
+        &self.transcription
+    }
+
+    fn transcription_mut(&mut self) -> &mut TranscriptionConfig {
+        &mut self.transcription
     }
 }
 
@@ -230,6 +243,7 @@ impl FromMap for Params {
                 &SUPPORTED_INTERVALS,
                 &SUPPORTED_DEGREES,
             )?,
+            sx_functions: ocp_sx_function_config_from_map(values, defaults.sx_functions)?,
         })
     }
 }
@@ -539,142 +553,6 @@ fn sailboat_flow_numeric(
     }
 }
 
-fn cached_multiple_shooting() -> Result<CachedCompile<MsCompiled<DEFAULT_INTERVALS>>> {
-    MULTIPLE_SHOOTING_CACHE.with(|cache| {
-        cache.borrow_mut().get_or_try_init(DEFAULT_INTERVALS, || {
-            Ok(model(MultipleShooting::<DEFAULT_INTERVALS, RK4_SUBSTEPS>)
-                .compile_jit_with_opt_level(interactive_multiple_shooting_opt_level())?)
-        })
-    })
-}
-
-fn cached_direct_collocation(
-    family: optimal_control::CollocationFamily,
-) -> Result<CachedCompile<DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>>> {
-    DIRECT_COLLOCATION_CACHE.with(|cache| {
-        cache
-            .borrow_mut()
-            .get_or_try_init(dc_compile_key(family), || {
-                Ok(model(
-                    DirectCollocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE> { family },
-                )
-                .compile_jit()?)
-            })
-    })
-}
-
-fn compile_multiple_shooting_with_progress(
-    callback: &mut dyn FnMut(CompileProgressUpdate),
-) -> Result<(
-    Rc<RefCell<MsCompiled<DEFAULT_INTERVALS>>>,
-    CompileProgressInfo,
-)> {
-    MULTIPLE_SHOOTING_CACHE.with(|cache| {
-        cached_compile_with_progress(
-            &mut cache.borrow_mut(),
-            DEFAULT_INTERVALS,
-            callback,
-            |on_compile_progress| {
-                let mut progress_state = OcpCompileProgressState::default();
-                Ok(model(MultipleShooting::<DEFAULT_INTERVALS, RK4_SUBSTEPS>)
-                    .compile_jit_with_opt_level_and_progress_callback(
-                        interactive_multiple_shooting_opt_level(),
-                        |progress| {
-                            on_compile_progress(ocp_compile_progress_update(
-                                progress,
-                                &mut progress_state,
-                            ));
-                        },
-                    )?)
-            },
-            |compiled| {
-                compile_progress_info(
-                    compiled.backend_timing_metadata(),
-                    compiled.nlp_compile_stats(),
-                    compiled.helper_kernel_count(),
-                    compiled.helper_compile_stats(),
-                    Some(summarize_backend_compile_report(compiled.backend_compile_report())),
-                )
-            },
-        )
-    })
-}
-
-fn compile_direct_collocation_with_progress(
-    family: optimal_control::CollocationFamily,
-    callback: &mut dyn FnMut(CompileProgressUpdate),
-) -> Result<(
-    Rc<RefCell<DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>>>,
-    CompileProgressInfo,
-)> {
-    DIRECT_COLLOCATION_CACHE.with(|cache| {
-        cached_compile_with_progress(
-            &mut cache.borrow_mut(),
-            dc_compile_key(family),
-            callback,
-            |on_compile_progress| {
-                let mut progress_state = OcpCompileProgressState::default();
-                Ok(model(
-                    DirectCollocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE> { family },
-                )
-                .compile_jit_with_progress_callback(|progress| {
-                    on_compile_progress(ocp_compile_progress_update(progress, &mut progress_state));
-                })?)
-            },
-            |compiled| {
-                compile_progress_info(
-                    compiled.backend_timing_metadata(),
-                    compiled.nlp_compile_stats(),
-                    compiled.helper_kernel_count(),
-                    compiled.helper_compile_stats(),
-                    Some(summarize_backend_compile_report(compiled.backend_compile_report())),
-                )
-            },
-        )
-    })
-}
-
-pub fn prewarm(params: &Params) -> Result<()> {
-    match params.transcription.method {
-        TranscriptionMethod::MultipleShooting => cached_multiple_shooting().map(|_| ()),
-        TranscriptionMethod::DirectCollocation => {
-            cached_direct_collocation(params.transcription.collocation_family).map(|_| ())
-        }
-    }
-}
-
-pub fn prewarm_with_progress<F>(params: &Params, emit: F) -> Result<()>
-where
-    F: FnMut(SolveStreamEvent) + Send,
-{
-    match params.transcription.method {
-        TranscriptionMethod::MultipleShooting => {
-            let mut lifecycle =
-                crate::common::SolveLifecycleReporter::new(emit, params.solver_method);
-            lifecycle.prewarm_with_progress(compile_multiple_shooting_with_progress)
-        }
-        TranscriptionMethod::DirectCollocation => {
-            let mut lifecycle =
-                crate::common::SolveLifecycleReporter::new(emit, params.solver_method);
-            lifecycle.prewarm_with_progress(|callback| {
-                compile_direct_collocation_with_progress(
-                    params.transcription.collocation_family,
-                    callback,
-                )
-            })
-        }
-    }
-}
-
-pub fn compile_cache_statuses() -> Vec<CompileCacheStatus> {
-    crate::standard_ocp_compile_cache_statuses!(
-        ProblemId::SailboatUpwind,
-        PROBLEM_NAME,
-        MULTIPLE_SHOOTING_CACHE,
-        DIRECT_COLLOCATION_CACHE
-    )
-}
-
 fn model<Scheme>(
     scheme: Scheme,
 ) -> Ocp<State<SX>, Control<SX>, ModelParams<SX>, Path<SX>, BoundaryEq<SX>, (), Scheme> {
@@ -755,8 +633,236 @@ fn model<Scheme>(
         .expect("sailboat model should build")
 }
 
-fn guess<const N: usize>(params: &Params) -> InterpolatedTrajectory<State<f64>, Control<f64>> {
-    let sample_count = 2 * N + 1;
+fn cached_multiple_shooting(
+    params: &Params,
+) -> Result<crate::common::CachedCompile<MsCompiled<DEFAULT_INTERVALS>>> {
+    MULTIPLE_SHOOTING_CACHE.with(|cache| {
+        crate::common::cached_multiple_shooting_ocp_compile(
+            &mut cache.borrow_mut(),
+            DEFAULT_INTERVALS,
+            params.sx_functions,
+            |options| {
+                model(MultipleShooting::<DEFAULT_INTERVALS, RK4_SUBSTEPS>)
+                    .compile_jit_with_ocp_options(options)
+            },
+        )
+    })
+}
+
+fn cached_direct_collocation(
+    params: &Params,
+    family: optimal_control::CollocationFamily,
+) -> Result<crate::common::CachedCompile<DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>>>
+{
+    DIRECT_COLLOCATION_CACHE.with(|cache| {
+        crate::common::cached_direct_collocation_ocp_compile(
+            &mut cache.borrow_mut(),
+            family,
+            params.sx_functions,
+            |options| {
+                model(DirectCollocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE> { family })
+                    .compile_jit_with_ocp_options(options)
+            },
+        )
+    })
+}
+
+fn compile_multiple_shooting_with_progress(
+    params: &Params,
+    callback: &mut dyn FnMut(CompileProgressUpdate),
+) -> Result<(
+    std::rc::Rc<std::cell::RefCell<MsCompiled<DEFAULT_INTERVALS>>>,
+    CompileProgressInfo,
+)> {
+    MULTIPLE_SHOOTING_CACHE.with(|cache| {
+        crate::common::cached_multiple_shooting_ocp_compile_with_progress(
+            &mut cache.borrow_mut(),
+            DEFAULT_INTERVALS,
+            params.sx_functions,
+            callback,
+            |options, on_progress| {
+                model(MultipleShooting::<DEFAULT_INTERVALS, RK4_SUBSTEPS>)
+                    .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
+            },
+            crate::common::compile_progress_info_from_compiled,
+        )
+    })
+}
+
+fn compile_direct_collocation_with_progress(
+    params: &Params,
+    family: optimal_control::CollocationFamily,
+    callback: &mut dyn FnMut(CompileProgressUpdate),
+) -> Result<(
+    std::rc::Rc<std::cell::RefCell<DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>>>,
+    CompileProgressInfo,
+)> {
+    DIRECT_COLLOCATION_CACHE.with(|cache| {
+        crate::common::cached_direct_collocation_ocp_compile_with_progress(
+            &mut cache.borrow_mut(),
+            family,
+            params.sx_functions,
+            callback,
+            |options, on_progress| {
+                model(DirectCollocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE> { family })
+                    .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
+            },
+            crate::common::compile_progress_info_from_compiled,
+        )
+    })
+}
+
+pub fn prewarm(params: &Params) -> Result<()> {
+    crate::common::prewarm_standard_ocp(
+        params,
+        params.transcription.method,
+        params.transcription.collocation_family,
+        cached_multiple_shooting,
+        cached_direct_collocation,
+    )
+}
+
+pub fn prewarm_with_progress<F>(params: &Params, emit: F) -> Result<()>
+where
+    F: FnMut(SolveStreamEvent) + Send,
+{
+    crate::common::prewarm_standard_ocp_with_progress(
+        params,
+        params.transcription.method,
+        params.transcription.collocation_family,
+        params.solver_method,
+        emit,
+        compile_multiple_shooting_with_progress,
+        compile_direct_collocation_with_progress,
+    )
+}
+
+pub fn compile_cache_statuses() -> Vec<CompileCacheStatus> {
+    MULTIPLE_SHOOTING_CACHE.with(|cache| {
+        DIRECT_COLLOCATION_CACHE.with(|dc_cache| {
+            crate::common::standard_ocp_compile_cache_statuses(
+                ProblemId::SailboatUpwind,
+                PROBLEM_NAME,
+                &cache.borrow(),
+                &dc_cache.borrow(),
+            )
+        })
+    })
+}
+
+pub(crate) fn benchmark_default_case_with_progress(
+    transcription: crate::common::TranscriptionMethod,
+    preset: crate::benchmark_report::OcpBenchmarkPreset,
+    eval_options: optimization::NlpEvaluationBenchmarkOptions,
+    on_progress: &mut dyn FnMut(crate::benchmark_report::BenchmarkCaseProgress),
+) -> Result<crate::benchmark_report::OcpBenchmarkRecord> {
+    crate::common::benchmark_standard_ocp_case_with_progress(
+        ProblemId::SailboatUpwind,
+        PROBLEM_NAME,
+        transcription,
+        preset,
+        eval_options,
+        on_progress,
+        |options, on_progress| {
+            model(MultipleShooting::<DEFAULT_INTERVALS, RK4_SUBSTEPS>)
+                .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
+        },
+        |family, options, on_progress| {
+            model(DirectCollocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE> { family })
+                .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
+        },
+        ms_runtime::<DEFAULT_INTERVALS>,
+        dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+    )
+}
+
+pub fn solve(params: &Params) -> Result<SolveArtifact> {
+    crate::common::solve_standard_ocp(
+        params,
+        params.transcription.method,
+        params.transcription.collocation_family,
+        params.solver_method,
+        &params.solver,
+        cached_multiple_shooting,
+        cached_direct_collocation,
+        ms_runtime::<DEFAULT_INTERVALS>,
+        dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+        |trajectories, x_arcs, u_arcs| {
+            artifact_from_ms_trajectories(params, trajectories, x_arcs, u_arcs)
+        },
+        |trajectories, time_grid| artifact_from_dc_trajectories(params, trajectories, time_grid),
+    )
+}
+
+pub fn solve_with_progress<F>(params: &Params, emit: F) -> Result<SolveArtifact>
+where
+    F: FnMut(SolveStreamEvent) + Send,
+{
+    crate::common::solve_standard_ocp_with_progress(
+        params,
+        params.transcription.method,
+        params.transcription.collocation_family,
+        params.solver_method,
+        &params.solver,
+        emit,
+        compile_multiple_shooting_with_progress,
+        compile_direct_collocation_with_progress,
+        ms_runtime::<DEFAULT_INTERVALS>,
+        dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+        |trajectories, x_arcs, u_arcs| {
+            artifact_from_ms_trajectories(params, trajectories, x_arcs, u_arcs)
+        },
+        |trajectories, time_grid| artifact_from_dc_trajectories(params, trajectories, time_grid),
+    )
+}
+
+pub(crate) fn solve_from_map(
+    values: &std::collections::BTreeMap<String, f64>,
+) -> Result<SolveArtifact> {
+    crate::common::solve_from_value_map::<Params, _>(values, solve)
+}
+
+pub(crate) fn prewarm_from_map(values: &std::collections::BTreeMap<String, f64>) -> Result<()> {
+    crate::common::prewarm_from_value_map::<Params, _>(values, prewarm)
+}
+
+pub(crate) fn solve_with_progress_boxed(
+    values: &std::collections::BTreeMap<String, f64>,
+    emit: Box<dyn FnMut(SolveStreamEvent) + Send>,
+) -> Result<SolveArtifact> {
+    crate::common::solve_with_progress_from_value_map::<Params, _>(values, emit, |params, emit| {
+        solve_with_progress(params, emit)
+    })
+}
+
+pub(crate) fn prewarm_with_progress_boxed(
+    values: &std::collections::BTreeMap<String, f64>,
+    emit: Box<dyn FnMut(SolveStreamEvent) + Send>,
+) -> Result<()> {
+    crate::common::prewarm_with_progress_from_value_map::<Params, _>(
+        values,
+        emit,
+        |params, emit| prewarm_with_progress(params, emit),
+    )
+}
+
+pub(crate) fn problem_entry() -> crate::ProblemEntry {
+    crate::ProblemEntry {
+        id: ProblemId::SailboatUpwind,
+        spec,
+        solve_from_map,
+        prewarm_from_map,
+        solve_with_progress_boxed,
+        prewarm_with_progress_boxed,
+        compile_cache_statuses,
+        benchmark_default_case_with_progress,
+    }
+}
+
+fn continuous_guess(
+    params: &Params,
+) -> ContinuousInitialGuess<State<f64>, Control<f64>, ModelParams<f64>> {
+    let sample_count = 2 * params.transcription.intervals + 1;
     let tf = params.initial_time_guess_s;
     let dt = tf / (sample_count as f64 - 1.0);
     let radius = params.cross_track_limit_m.max(12.0);
@@ -791,33 +897,67 @@ fn guess<const N: usize>(params: &Params) -> InterpolatedTrajectory<State<f64>, 
             alpha: 0.0,
         })
         .collect::<Vec<_>>();
-    InterpolatedTrajectory {
+    ContinuousInitialGuess::Interpolated(InterpolatedTrajectory {
         sample_times,
         x_samples,
         u_samples,
         dudt_samples,
         tf,
-    }
+    })
 }
 
-pub fn solve(params: &Params) -> Result<SolveArtifact> {
-    match params.transcription.method {
-        TranscriptionMethod::MultipleShooting => solve_multiple_shooting(params),
-        TranscriptionMethod::DirectCollocation => solve_direct_collocation(params),
-    }
-}
-
-pub fn solve_with_progress<F>(params: &Params, emit: F) -> Result<SolveArtifact>
-where
-    F: FnMut(SolveStreamEvent) + Send,
+fn runtime_spec(
+    params: &Params,
+) -> OcpRuntimeSpec<ModelParams<f64>, Path<Bounds1D>, BoundaryEq<f64>, (), State<f64>, Control<f64>>
 {
-    match params.transcription.method {
-        TranscriptionMethod::MultipleShooting => {
-            solve_multiple_shooting_with_progress(params, emit)
-        }
-        TranscriptionMethod::DirectCollocation => {
-            solve_direct_collocation_with_progress(params, emit)
-        }
+    OcpRuntimeSpec {
+        parameters: ModelParams {
+            wind_speed: params.wind_speed_mps,
+            omega_weight: params.omega_weight,
+            alpha_weight: params.alpha_weight,
+            omega_rate_weight: params.omega_rate_regularization,
+            alpha_rate_weight: params.alpha_rate_regularization,
+        },
+        beq: BoundaryEq {
+            periodic_gamma: 0.0,
+            periodic_z: 0.0,
+            periodic_vx: 0.0,
+            periodic_vz: 0.0,
+            x0: 0.0,
+            z0: 0.0,
+        },
+        bineq_bounds: (),
+        path_bounds: Path {
+            gamma: Bounds1D {
+                lower: Some(-deg_to_rad(params.gamma_limit_deg)),
+                upper: Some(deg_to_rad(params.gamma_limit_deg)),
+            },
+            z: Bounds1D {
+                lower: Some(-params.cross_track_limit_m),
+                upper: Some(params.cross_track_limit_m),
+            },
+            vx: Bounds1D {
+                lower: Some(-VELOCITY_LIMIT_MPS),
+                upper: Some(VELOCITY_LIMIT_MPS),
+            },
+            vz: Bounds1D {
+                lower: Some(-VELOCITY_LIMIT_MPS),
+                upper: Some(VELOCITY_LIMIT_MPS),
+            },
+            omega: Bounds1D {
+                lower: Some(-deg_to_rad(params.omega_limit_deg_s)),
+                upper: Some(deg_to_rad(params.omega_limit_deg_s)),
+            },
+            alpha: Bounds1D {
+                lower: Some(-deg_to_rad(params.alpha_limit_deg)),
+                upper: Some(deg_to_rad(params.alpha_limit_deg)),
+            },
+        },
+        tf_bounds: Bounds1D {
+            lower: Some(params.min_final_time_s),
+            upper: Some(params.max_final_time_s),
+        },
+        initial_guess: continuous_guess(params),
     }
 }
 
@@ -832,55 +972,7 @@ fn ms_runtime<const N: usize>(
     Control<f64>,
     N,
 > {
-    MultipleShootingRuntimeValues {
-        parameters: ModelParams {
-            wind_speed: params.wind_speed_mps,
-            omega_weight: params.omega_weight,
-            alpha_weight: params.alpha_weight,
-            omega_rate_weight: params.omega_rate_regularization,
-            alpha_rate_weight: params.alpha_rate_regularization,
-        },
-        beq: BoundaryEq {
-            periodic_gamma: 0.0,
-            periodic_z: 0.0,
-            periodic_vx: 0.0,
-            periodic_vz: 0.0,
-            x0: 0.0,
-            z0: 0.0,
-        },
-        bineq_bounds: (),
-        path_bounds: Path {
-            gamma: Bounds1D {
-                lower: Some(-deg_to_rad(params.gamma_limit_deg)),
-                upper: Some(deg_to_rad(params.gamma_limit_deg)),
-            },
-            z: Bounds1D {
-                lower: Some(-params.cross_track_limit_m),
-                upper: Some(params.cross_track_limit_m),
-            },
-            vx: Bounds1D {
-                lower: Some(-VELOCITY_LIMIT_MPS),
-                upper: Some(VELOCITY_LIMIT_MPS),
-            },
-            vz: Bounds1D {
-                lower: Some(-VELOCITY_LIMIT_MPS),
-                upper: Some(VELOCITY_LIMIT_MPS),
-            },
-            omega: Bounds1D {
-                lower: Some(-deg_to_rad(params.omega_limit_deg_s)),
-                upper: Some(deg_to_rad(params.omega_limit_deg_s)),
-            },
-            alpha: Bounds1D {
-                lower: Some(-deg_to_rad(params.alpha_limit_deg)),
-                upper: Some(deg_to_rad(params.alpha_limit_deg)),
-            },
-        },
-        tf_bounds: Bounds1D {
-            lower: Some(params.min_final_time_s),
-            upper: Some(params.max_final_time_s),
-        },
-        initial_guess: MultipleShootingInitialGuess::Interpolated(guess::<N>(params)),
-    }
+    multiple_shooting_runtime_from_spec(runtime_spec(params))
 }
 
 fn dc_runtime<const N: usize, const K: usize>(
@@ -895,122 +987,7 @@ fn dc_runtime<const N: usize, const K: usize>(
     N,
     K,
 > {
-    DirectCollocationRuntimeValues {
-        parameters: ModelParams {
-            wind_speed: params.wind_speed_mps,
-            omega_weight: params.omega_weight,
-            alpha_weight: params.alpha_weight,
-            omega_rate_weight: params.omega_rate_regularization,
-            alpha_rate_weight: params.alpha_rate_regularization,
-        },
-        beq: BoundaryEq {
-            periodic_gamma: 0.0,
-            periodic_z: 0.0,
-            periodic_vx: 0.0,
-            periodic_vz: 0.0,
-            x0: 0.0,
-            z0: 0.0,
-        },
-        bineq_bounds: (),
-        path_bounds: Path {
-            gamma: Bounds1D {
-                lower: Some(-deg_to_rad(params.gamma_limit_deg)),
-                upper: Some(deg_to_rad(params.gamma_limit_deg)),
-            },
-            z: Bounds1D {
-                lower: Some(-params.cross_track_limit_m),
-                upper: Some(params.cross_track_limit_m),
-            },
-            vx: Bounds1D {
-                lower: Some(-VELOCITY_LIMIT_MPS),
-                upper: Some(VELOCITY_LIMIT_MPS),
-            },
-            vz: Bounds1D {
-                lower: Some(-VELOCITY_LIMIT_MPS),
-                upper: Some(VELOCITY_LIMIT_MPS),
-            },
-            omega: Bounds1D {
-                lower: Some(-deg_to_rad(params.omega_limit_deg_s)),
-                upper: Some(deg_to_rad(params.omega_limit_deg_s)),
-            },
-            alpha: Bounds1D {
-                lower: Some(-deg_to_rad(params.alpha_limit_deg)),
-                upper: Some(deg_to_rad(params.alpha_limit_deg)),
-            },
-        },
-        tf_bounds: Bounds1D {
-            lower: Some(params.min_final_time_s),
-            upper: Some(params.max_final_time_s),
-        },
-        initial_guess: DirectCollocationInitialGuess::Interpolated(guess::<N>(params)),
-    }
-}
-
-fn solve_multiple_shooting(params: &Params) -> Result<SolveArtifact> {
-    let compiled = cached_multiple_shooting()?;
-    solve_cached_multiple_shooting_problem(
-        &compiled.compiled,
-        &ms_runtime::<DEFAULT_INTERVALS>(params),
-        params.solver_method,
-        &params.solver,
-        |trajectories, x_arcs, u_arcs| {
-            artifact_from_ms_trajectories(params, trajectories, x_arcs, u_arcs)
-        },
-    )
-}
-
-fn solve_direct_collocation(params: &Params) -> Result<SolveArtifact> {
-    let compiled = cached_direct_collocation(params.transcription.collocation_family)?;
-    solve_cached_direct_collocation_problem(
-        &compiled.compiled,
-        &dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(params),
-        params.solver_method,
-        &params.solver,
-        |trajectories, time_grid| artifact_from_dc_trajectories(params, trajectories, time_grid),
-    )
-}
-
-fn solve_multiple_shooting_with_progress<F>(params: &Params, emit: F) -> Result<SolveArtifact>
-where
-    F: FnMut(SolveStreamEvent) + Send,
-{
-    let mut lifecycle = crate::common::SolveLifecycleReporter::new(emit, params.solver_method);
-    let (compiled, running_solver, compile_report) =
-        lifecycle.compile_with_progress(compile_multiple_shooting_with_progress)?;
-    let mut artifact = solve_cached_multiple_shooting_problem_with_progress(
-        &compiled,
-        &ms_runtime::<DEFAULT_INTERVALS>(params),
-        params.solver_method,
-        &params.solver,
-        lifecycle.into_emit(),
-        running_solver,
-        |trajectories, x_arcs, u_arcs| {
-            artifact_from_ms_trajectories(params, trajectories, x_arcs, u_arcs)
-        },
-    )?;
-    artifact.compile_report = compile_report;
-    Ok(artifact)
-}
-
-fn solve_direct_collocation_with_progress<F>(params: &Params, emit: F) -> Result<SolveArtifact>
-where
-    F: FnMut(SolveStreamEvent) + Send,
-{
-    let mut lifecycle = crate::common::SolveLifecycleReporter::new(emit, params.solver_method);
-    let (compiled, running_solver, compile_report) = lifecycle.compile_with_progress(|callback| {
-        compile_direct_collocation_with_progress(params.transcription.collocation_family, callback)
-    })?;
-    let mut artifact = solve_cached_direct_collocation_problem_with_progress(
-        &compiled,
-        &dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(params),
-        params.solver_method,
-        &params.solver,
-        lifecycle.into_emit(),
-        running_solver,
-        |trajectories, time_grid| artifact_from_dc_trajectories(params, trajectories, time_grid),
-    )?;
-    artifact.compile_report = compile_report;
-    Ok(artifact)
+    direct_collocation_runtime_from_spec(runtime_spec(params))
 }
 
 fn point_frame(state: &State<f64>) -> SceneFrame {
@@ -1501,7 +1478,12 @@ mod tests {
 
     #[test]
     fn sailboat_initial_guess_is_symmetric() {
-        let guess = guess::<DEFAULT_INTERVALS>(&Params::default());
+        let guess = match continuous_guess(&Params::default()) {
+            ContinuousInitialGuess::Interpolated(guess) => guess,
+            ContinuousInitialGuess::Rollout { .. } => {
+                panic!("sailboat should use an interpolated continuous guess")
+            }
+        };
         let first = guess.x_samples.first().expect("first state");
         let last = guess.x_samples.last().expect("last state");
         assert!(first.x.abs() < 1.0e-9);
@@ -1536,20 +1518,21 @@ mod tests {
                 complementarity_tol: 1.0e-4,
             },
             transcription: TranscriptionConfig {
-                method: TranscriptionMethod::MultipleShooting,
+                method: crate::common::TranscriptionMethod::MultipleShooting,
                 ..default_transcription(DEFAULT_INTERVALS)
             },
+            sx_functions: OcpSxFunctionConfig::default(),
         };
         let mut events = Vec::new();
         let result = solve_with_progress(&params, |event| events.push(event));
         crate::common::assert_shared_progress_lifecycle(&events);
         let iteration_count = events
             .iter()
-            .filter(|event| matches!(event, SolveStreamEvent::Iteration { .. }))
+            .filter(|event| matches!(event, crate::common::SolveStreamEvent::Iteration { .. }))
             .count();
         let final_count = events
             .iter()
-            .filter(|event| matches!(event, SolveStreamEvent::Final { .. }))
+            .filter(|event| matches!(event, crate::common::SolveStreamEvent::Final { .. }))
             .count();
         assert!(
             iteration_count > 0 || final_count > 0 || result.is_err(),

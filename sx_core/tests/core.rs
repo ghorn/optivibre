@@ -234,6 +234,43 @@ fn jacobian_and_hessian_shapes() {
 }
 
 #[rstest]
+fn jacobian_sparsity_drops_identically_zero_derivatives() {
+    let x = SX::sym("jx");
+    let input = SXMatrix::dense_column(vec![x]).unwrap();
+    let output = SXMatrix::dense_column(vec![
+        x.sign(),
+        x.floor(),
+        x.ceil(),
+        x.round(),
+        x.trunc(),
+        x.powi(0),
+    ])
+    .unwrap();
+
+    let jacobian_ccs = output.jacobian_ccs(&input).unwrap();
+    let jacobian = output.jacobian(&input).unwrap();
+
+    assert_eq!(jacobian_ccs.nnz(), 0);
+    assert_eq!(jacobian.ccs().nnz(), 0);
+}
+
+#[rstest]
+fn jacobian_sparsity_tracks_only_nonzero_binary_partials() {
+    let x = SX::sym("bx");
+    let y = SX::sym("by");
+    let input = SXMatrix::dense_column(vec![x, y]).unwrap();
+    let output = SXMatrix::dense_column(vec![x.copysign(y)]).unwrap();
+
+    let jacobian_ccs = output.jacobian_ccs(&input).unwrap();
+    let jacobian = output.jacobian(&input).unwrap();
+
+    assert_eq!(jacobian_ccs.positions(), vec![(0, 0)]);
+    assert_eq!(jacobian.ccs().positions(), vec![(0, 0)]);
+    assert!(!jacobian.get(0, 0).is_zero());
+    assert!(jacobian.get(0, 1).is_zero());
+}
+
+#[rstest]
 fn hessian_strategies_match_on_rosenbrock() {
     let x0 = SX::sym("hx0");
     let x1 = SX::sym("hx1");

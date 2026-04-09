@@ -65,7 +65,10 @@ fn noinline_policy_preserves_subfunction_and_call_stats() {
     .expect("lowering should succeed");
 
     assert_eq!(lowered.subfunctions.len(), 1);
-    assert_eq!(lowered.subfunctions[0].call_policy, CallPolicy::NoInlineLLVM);
+    assert_eq!(
+        lowered.subfunctions[0].call_policy,
+        CallPolicy::NoInlineLLVM
+    );
     assert_eq!(lowered.stats.call_site_count, 2);
     assert_eq!(lowered.stats.overrides_applied, 4);
     assert_eq!(lowered.stats.llvm_subfunctions_emitted, 1);

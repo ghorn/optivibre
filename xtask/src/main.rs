@@ -1,13 +1,29 @@
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use bench_report::{MarkdownReportOptions, SuiteReport, render_markdown_report_with_options};
+use clap::{Parser, Subcommand};
 
 fn workspace_root() -> Result<PathBuf> {
-    env::current_dir().context("xtask must run from the workspace root")
+    std::env::current_dir().context("xtask must run from the workspace root")
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "xtask",
+    about = "Internal report and audit task runner for ad_codegen_rs."
+)]
+struct XtaskCli {
+    #[command(subcommand)]
+    command: Option<XtaskCommand>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum XtaskCommand {
+    AdCostReport,
+    CasadiParityReport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,10 +177,12 @@ fn generate_casadi_parity_report() -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    match env::args().nth(1).as_deref() {
-        Some("ad-cost-report") | None => generate_ad_cost_report(),
-        Some("casadi-parity-report") => generate_casadi_parity_report(),
-        Some(other) => bail!("unknown xtask command: {other}"),
+    match XtaskCli::parse()
+        .command
+        .unwrap_or(XtaskCommand::AdCostReport)
+    {
+        XtaskCommand::AdCostReport => generate_ad_cost_report(),
+        XtaskCommand::CasadiParityReport => generate_casadi_parity_report(),
     }
 }
 

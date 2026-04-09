@@ -63,7 +63,11 @@ pub struct ProblemRunOptions {
 
 impl ProblemRunOptions {
     pub fn label(self) -> String {
-        format!("{} / {}", self.jit_opt_level.label(), self.call_policy.label())
+        format!(
+            "{} / {}",
+            self.jit_opt_level.label(),
+            self.call_policy.label()
+        )
     }
 
     pub const fn compile_options(self) -> FunctionCompileOptions {

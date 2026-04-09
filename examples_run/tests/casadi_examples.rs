@@ -237,7 +237,11 @@ fn lowered_eval_function(
         temps
     }
 
-    let temps = eval_callable(&lowered.instructions, &projected_inputs, &lowered.subfunctions);
+    let temps = eval_callable(
+        &lowered.instructions,
+        &projected_inputs,
+        &lowered.subfunctions,
+    );
 
     Ok(lowered
         .outputs

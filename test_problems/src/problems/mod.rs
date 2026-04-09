@@ -272,7 +272,8 @@ where
     Validate: Fn(&ProblemRunRecord) -> ValidationOutcome,
 {
     let backend_timing = data.compiled.backend_timing_metadata();
-    let compile_report = summarize_backend_compile_report(Some(data.compiled.backend_compile_report()));
+    let compile_report =
+        summarize_backend_compile_report(Some(data.compiled.backend_compile_report()));
     let bound_problem = match data.compiled.bind_runtime_bounds(&data.bounds) {
         Ok(problem) => problem,
         Err(err) => {

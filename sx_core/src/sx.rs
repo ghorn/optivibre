@@ -1,13 +1,17 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::ops::{
     Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Rem, RemAssign, Sub, SubAssign,
 };
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
+use crate::ccs::CCS;
 use crate::error::{Result, SxError};
 use crate::function::{
-    FunctionId, dependency_profile, forward_helper, function_by_id, function_name, reverse_helper,
+    DependencyProfile, FunctionId, SXFunction, dependency_profile, forward_batch_helper,
+    forward_helper, function_name, reverse_scalar_helper,
 };
 use crate::{Index, SXMatrix};
 
@@ -53,14 +57,24 @@ pub enum BinaryOp {
 }
 
 #[derive(Clone, Debug)]
-enum NodeKind {
+pub(crate) enum NodeKind {
     Constant(f64),
-    Symbol { serial: usize, name: String },
-    Unary { op: UnaryOp, arg: SX },
-    Binary { op: BinaryOp, lhs: SX, rhs: SX },
+    Symbol {
+        serial: usize,
+        name: String,
+    },
+    Unary {
+        op: UnaryOp,
+        arg: SX,
+    },
+    Binary {
+        op: BinaryOp,
+        lhs: SX,
+        rhs: SX,
+    },
     Call {
         function: FunctionId,
-        inputs: Vec<SXMatrix>,
+        inputs: CallInputs,
         output_slot: Index,
         output_offset: Index,
     },
@@ -69,11 +83,18 @@ enum NodeKind {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum NodeKey {
     Constant(u64),
-    Unary { op: UnaryOp, arg: SX },
-    Binary { op: BinaryOp, lhs: SX, rhs: SX },
+    Unary {
+        op: UnaryOp,
+        arg: SX,
+    },
+    Binary {
+        op: BinaryOp,
+        lhs: SX,
+        rhs: SX,
+    },
     Call {
         function: FunctionId,
-        inputs: Vec<SXMatrix>,
+        inputs: CallInputs,
         output_slot: Index,
         output_offset: Index,
     },
@@ -96,9 +117,19 @@ static INTERNER: OnceLock<Mutex<Interner>> = OnceLock::new();
 #[derive(Clone, Debug, PartialEq)]
 pub enum NodeView {
     Constant(f64),
-    Symbol { name: String, serial: usize },
-    Unary { op: UnaryOp, arg: SX },
-    Binary { op: BinaryOp, lhs: SX, rhs: SX },
+    Symbol {
+        name: String,
+        serial: usize,
+    },
+    Unary {
+        op: UnaryOp,
+        arg: SX,
+    },
+    Binary {
+        op: BinaryOp,
+        lhs: SX,
+        rhs: SX,
+    },
     Call {
         function_id: FunctionId,
         function_name: String,
@@ -107,6 +138,200 @@ pub enum NodeView {
         output_offset: Index,
     },
 }
+
+#[derive(Clone, Debug)]
+pub(crate) struct CallInputs {
+    values: Arc<[SXMatrix]>,
+    hash: u64,
+    site_id: CallSiteId,
+}
+
+impl CallInputs {
+    pub(crate) fn new(inputs: Vec<SXMatrix>) -> Self {
+        let values: Arc<[SXMatrix]> = inputs.into();
+        let mut hasher = DefaultHasher::new();
+        values.hash(&mut hasher);
+        let hash = hasher.finish();
+        let site_id = CallSiteId {
+            ptr: values.as_ptr() as usize,
+            len: values.len(),
+        };
+        Self {
+            values,
+            hash,
+            site_id,
+        }
+    }
+
+    pub(crate) fn from_slice(inputs: &[SXMatrix]) -> Self {
+        Self::new(inputs.to_vec())
+    }
+
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, SXMatrix> {
+        self.values.iter()
+    }
+
+    pub(crate) fn as_slice(&self) -> &[SXMatrix] {
+        &self.values
+    }
+
+    pub(crate) fn to_vec(&self) -> Vec<SXMatrix> {
+        self.values.iter().cloned().collect()
+    }
+
+    pub(crate) fn site_id(&self) -> CallSiteId {
+        self.site_id
+    }
+}
+
+impl PartialEq for CallInputs {
+    fn eq(&self, other: &Self) -> bool {
+        self.values == other.values
+    }
+}
+
+impl Eq for CallInputs {}
+
+impl Hash for CallInputs {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct CallSiteId {
+    ptr: usize,
+    len: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ForwardCallCacheKey {
+    function: FunctionId,
+    site_id: CallSiteId,
+}
+
+#[derive(Default)]
+struct AdLocalCaches {
+    dependency_profiles: HashMap<FunctionId, Arc<DependencyProfile>>,
+    forward_helpers: HashMap<FunctionId, Arc<SXFunction>>,
+    forward_batch_helpers: HashMap<(FunctionId, usize), Arc<SXFunction>>,
+    reverse_scalar_helpers: HashMap<(FunctionId, Index, Index), Arc<SXFunction>>,
+}
+
+impl AdLocalCaches {
+    fn dependency_profile(&mut self, function_id: FunctionId) -> Arc<DependencyProfile> {
+        if let Some(profile) = self.dependency_profiles.get(&function_id) {
+            return Arc::clone(profile);
+        }
+        let profile = dependency_profile(function_id);
+        self.dependency_profiles
+            .insert(function_id, Arc::clone(&profile));
+        profile
+    }
+
+    fn forward_helper(&mut self, function_id: FunctionId) -> Result<Arc<SXFunction>> {
+        if let Some(helper) = self.forward_helpers.get(&function_id) {
+            return Ok(Arc::clone(helper));
+        }
+        let helper = forward_helper(function_id)?;
+        self.forward_helpers
+            .insert(function_id, Arc::clone(&helper));
+        Ok(helper)
+    }
+
+    fn forward_batch_helper(
+        &mut self,
+        function_id: FunctionId,
+        directions: usize,
+    ) -> Result<Arc<SXFunction>> {
+        let key = (function_id, directions);
+        if let Some(helper) = self.forward_batch_helpers.get(&key) {
+            return Ok(Arc::clone(helper));
+        }
+        let helper = forward_batch_helper(function_id, directions)?;
+        self.forward_batch_helpers.insert(key, Arc::clone(&helper));
+        Ok(helper)
+    }
+
+    fn reverse_scalar_helper(
+        &mut self,
+        function_id: FunctionId,
+        output_slot: Index,
+        output_offset: Index,
+    ) -> Result<Arc<SXFunction>> {
+        let key = (function_id, output_slot, output_offset);
+        if let Some(helper) = self.reverse_scalar_helpers.get(&key) {
+            return Ok(Arc::clone(helper));
+        }
+        let helper = reverse_scalar_helper(function_id, output_slot, output_offset)?;
+        self.reverse_scalar_helpers.insert(key, Arc::clone(&helper));
+        Ok(helper)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct JacobianStructureKey {
+    outputs: Vec<SX>,
+    vars: Vec<SX>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct JacobianStructure {
+    pub(crate) ccs: CCS,
+    pub(crate) forward_color_groups: Vec<Vec<Index>>,
+    pub(crate) reverse_color_groups: Vec<Vec<Index>>,
+    pub(crate) positions_by_row: Vec<Vec<(Index, Index)>>,
+}
+
+#[derive(Clone, Debug)]
+struct DependencyMask {
+    words: Vec<u64>,
+}
+
+impl DependencyMask {
+    fn new(bit_count: usize) -> Self {
+        Self {
+            words: vec![0; bit_count.div_ceil(64)],
+        }
+    }
+
+    fn singleton(bit_count: usize, index: usize) -> Self {
+        let mut mask = Self::new(bit_count);
+        mask.set(index);
+        mask
+    }
+
+    fn set(&mut self, index: usize) {
+        let word = index / 64;
+        let bit = index % 64;
+        self.words[word] |= 1_u64 << bit;
+    }
+
+    fn union_assign(&mut self, other: &Self) {
+        for (dst, src) in self.words.iter_mut().zip(other.words.iter()) {
+            *dst |= *src;
+        }
+    }
+
+    fn iter_ones(&self) -> impl Iterator<Item = Index> + '_ {
+        self.words
+            .iter()
+            .copied()
+            .enumerate()
+            .flat_map(|(word_index, mut word)| {
+                let mut bits = Vec::new();
+                while word != 0 {
+                    let bit = word.trailing_zeros() as usize;
+                    bits.push(word_index * 64 + bit);
+                    word &= word - 1;
+                }
+                bits.into_iter()
+            })
+    }
+}
+
+static JACOBIAN_STRUCTURE_CACHE: OnceLock<Mutex<HashMap<JacobianStructureKey, JacobianStructure>>> =
+    OnceLock::new();
 
 impl UnaryOp {
     pub fn name(self) -> &'static str {
@@ -234,6 +459,17 @@ fn lock_interner(mutex: &Mutex<Interner>) -> MutexGuard<'_, Interner> {
     }
 }
 
+fn lock_jacobian_structure_cache()
+-> MutexGuard<'static, HashMap<JacobianStructureKey, JacobianStructure>> {
+    match JACOBIAN_STRUCTURE_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 impl Interner {
     fn node(&self, sx: SX) -> &Node {
         &self.nodes[sx.0 as usize]
@@ -267,7 +503,7 @@ impl Interner {
     }
 }
 
-fn node_kind(sx: SX) -> NodeKind {
+pub(crate) fn node_kind(sx: SX) -> NodeKind {
     with_interner_ref(|interner| interner.node_kind(sx))
 }
 
@@ -421,13 +657,11 @@ fn rational_factors(expr: SX) -> RationalFactors {
         NodeKind::Symbol { .. }
         | NodeKind::Unary { .. }
         | NodeKind::Binary { .. }
-        | NodeKind::Call { .. } => {
-            RationalFactors {
-                coeff: 1.0,
-                numerators: vec![expr],
-                denominators: Vec::new(),
-            }
-        }
+        | NodeKind::Call { .. } => RationalFactors {
+            coeff: 1.0,
+            numerators: vec![expr],
+            denominators: Vec::new(),
+        },
     }
 }
 
@@ -531,6 +765,20 @@ fn format_expression(expr: SX, interner: &Interner, memo: &mut HashMap<SX, Strin
 pub(crate) fn call_output(
     function: FunctionId,
     inputs: Vec<SXMatrix>,
+    output_slot: Index,
+    output_offset: Index,
+) -> SX {
+    call_output_with_inputs(
+        function,
+        CallInputs::new(inputs),
+        output_slot,
+        output_offset,
+    )
+}
+
+pub(crate) fn call_output_with_inputs(
+    function: FunctionId,
+    inputs: CallInputs,
     output_slot: Index,
     output_offset: Index,
 ) -> SX {
@@ -774,7 +1022,7 @@ fn topo_visit(node: SX, seen: &mut HashSet<SX>, order: &mut Vec<SX>) {
             order.push(node);
         }
         NodeKind::Call { inputs, .. } => {
-            for input in inputs {
+            for input in inputs.iter() {
                 for expr in input.nonzeros().iter().copied() {
                     topo_visit(expr, seen, order);
                 }
@@ -835,7 +1083,157 @@ fn binary_partials(op: BinaryOp, lhs: SX, rhs: SX) -> (SX, SX) {
     }
 }
 
-fn directional_forward(expr: SX, seeds: &HashMap<SX, SX>, memo: &mut HashMap<SX, SX>) -> SX {
+fn greedy_color_disjoint(sets: &[Vec<Index>]) -> Vec<Vec<Index>> {
+    let mut color_unions = Vec::<BTreeSet<Index>>::new();
+    let mut color_members = Vec::<Vec<Index>>::new();
+    for (member, set) in sets.iter().enumerate() {
+        let color_idx = color_unions
+            .iter()
+            .position(|union| set.iter().all(|index| !union.contains(index)))
+            .unwrap_or_else(|| {
+                color_unions.push(BTreeSet::new());
+                color_members.push(Vec::new());
+                color_unions.len() - 1
+            });
+        for &index in set {
+            color_unions[color_idx].insert(index);
+        }
+        color_members[color_idx].push(member);
+    }
+    color_members
+}
+
+fn derivative_dependency_mask(
+    expr: SX,
+    var_index_by_symbol: &HashMap<SX, usize>,
+    memo: &mut HashMap<SX, DependencyMask>,
+) -> Result<DependencyMask> {
+    if let Some(existing) = memo.get(&expr) {
+        return Ok(existing.clone());
+    }
+
+    let var_count = var_index_by_symbol.len();
+    let mask = match node_kind(expr) {
+        NodeKind::Constant(_) => DependencyMask::new(var_count),
+        NodeKind::Symbol { .. } => match var_index_by_symbol.get(&expr).copied() {
+            Some(index) => DependencyMask::singleton(var_count, index),
+            None => DependencyMask::new(var_count),
+        },
+        NodeKind::Unary { op, arg } => {
+            if unary_derivative(op, arg).is_zero() {
+                DependencyMask::new(var_count)
+            } else {
+                derivative_dependency_mask(arg, var_index_by_symbol, memo)?
+            }
+        }
+        NodeKind::Binary { op, lhs, rhs } => {
+            let (d_lhs, d_rhs) = binary_partials(op, lhs, rhs);
+            let mut mask = DependencyMask::new(var_count);
+            if !d_lhs.is_zero() {
+                mask.union_assign(&derivative_dependency_mask(lhs, var_index_by_symbol, memo)?);
+            }
+            if !d_rhs.is_zero() {
+                mask.union_assign(&derivative_dependency_mask(rhs, var_index_by_symbol, memo)?);
+            }
+            mask
+        }
+        NodeKind::Call {
+            function,
+            inputs,
+            output_slot,
+            output_offset,
+        } => {
+            let helper = forward_helper(function)?;
+            let helper_profile = dependency_profile(helper.id());
+            let mut mask = DependencyMask::new(var_count);
+            let input_count = inputs.iter().len();
+            for (slot, input) in inputs.iter().enumerate() {
+                let seed_slot = input_count + slot;
+                for (offset, &value) in input.nonzeros().iter().enumerate() {
+                    if helper_profile.output_depends_on(
+                        output_slot,
+                        output_offset,
+                        seed_slot,
+                        offset,
+                    ) {
+                        mask.union_assign(&derivative_dependency_mask(
+                            value,
+                            var_index_by_symbol,
+                            memo,
+                        )?);
+                    }
+                }
+            }
+            mask
+        }
+    };
+
+    memo.insert(expr, mask.clone());
+    Ok(mask)
+}
+
+pub(crate) fn jacobian_structure(outputs: &[SX], vars: &[SX]) -> Result<JacobianStructure> {
+    let key = JacobianStructureKey {
+        outputs: outputs.to_vec(),
+        vars: vars.to_vec(),
+    };
+    if let Some(existing) = lock_jacobian_structure_cache().get(&key).cloned() {
+        return Ok(existing);
+    }
+
+    let var_index_by_symbol = vars
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, symbol)| (symbol, index))
+        .collect::<HashMap<_, _>>();
+    let mut memo = HashMap::<SX, DependencyMask>::new();
+    let mut rows_by_col = vec![Vec::<Index>::new(); vars.len()];
+    for (row, &output) in outputs.iter().enumerate() {
+        let mask = derivative_dependency_mask(output, &var_index_by_symbol, &mut memo)?;
+        for col in mask.iter_ones() {
+            rows_by_col[col].push(row);
+        }
+    }
+
+    let mut col_ptrs = Vec::with_capacity(vars.len() + 1);
+    let mut row_indices = Vec::new();
+    col_ptrs.push(0);
+    for rows in &rows_by_col {
+        row_indices.extend(rows.iter().copied());
+        col_ptrs.push(row_indices.len());
+    }
+    let ccs = CCS::new(outputs.len(), vars.len(), col_ptrs, row_indices)?;
+
+    let mut positions_by_row = vec![Vec::<(Index, Index)>::new(); outputs.len()];
+    for col in 0..vars.len() {
+        for nz_index in ccs.col_ptrs()[col]..ccs.col_ptrs()[col + 1] {
+            let row = ccs.row_indices()[nz_index];
+            positions_by_row[row].push((col, nz_index));
+        }
+    }
+    let row_columns = positions_by_row
+        .iter()
+        .map(|entries| entries.iter().map(|(col, _)| *col).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+
+    let structure = JacobianStructure {
+        ccs,
+        forward_color_groups: greedy_color_disjoint(&rows_by_col),
+        reverse_color_groups: greedy_color_disjoint(&row_columns),
+        positions_by_row,
+    };
+    lock_jacobian_structure_cache().insert(key, structure.clone());
+    Ok(structure)
+}
+
+fn directional_forward(
+    expr: SX,
+    seeds: &HashMap<SX, SX>,
+    memo: &mut HashMap<SX, SX>,
+    local_caches: &mut AdLocalCaches,
+    call_memo: &mut HashMap<ForwardCallCacheKey, Vec<SXMatrix>>,
+) -> SX {
     if let Some(existing) = memo.get(&expr) {
         return *existing;
     }
@@ -843,22 +1241,25 @@ fn directional_forward(expr: SX, seeds: &HashMap<SX, SX>, memo: &mut HashMap<SX,
         NodeKind::Constant(_) => SX::zero(),
         NodeKind::Symbol { .. } => seeds.get(&expr).copied().unwrap_or_else(SX::zero),
         NodeKind::Unary { op, arg } => {
-            directional_forward(arg, seeds, memo) * unary_derivative(op, arg)
+            directional_forward(arg, seeds, memo, local_caches, call_memo)
+                * unary_derivative(op, arg)
         }
         NodeKind::Binary { op, lhs, rhs } => match op {
             BinaryOp::Add => {
-                directional_forward(lhs, seeds, memo) + directional_forward(rhs, seeds, memo)
+                directional_forward(lhs, seeds, memo, local_caches, call_memo)
+                    + directional_forward(rhs, seeds, memo, local_caches, call_memo)
             }
             BinaryOp::Sub => {
-                directional_forward(lhs, seeds, memo) - directional_forward(rhs, seeds, memo)
+                directional_forward(lhs, seeds, memo, local_caches, call_memo)
+                    - directional_forward(rhs, seeds, memo, local_caches, call_memo)
             }
             BinaryOp::Mul => {
-                directional_forward(lhs, seeds, memo) * rhs
-                    + lhs * directional_forward(rhs, seeds, memo)
+                directional_forward(lhs, seeds, memo, local_caches, call_memo) * rhs
+                    + lhs * directional_forward(rhs, seeds, memo, local_caches, call_memo)
             }
             BinaryOp::Div => {
-                let dl = directional_forward(lhs, seeds, memo);
-                let dr = directional_forward(rhs, seeds, memo);
+                let dl = directional_forward(lhs, seeds, memo, local_caches, call_memo);
+                let dr = directional_forward(rhs, seeds, memo, local_caches, call_memo);
                 (dl * rhs - lhs * dr) / rhs.sqr()
             }
             BinaryOp::Pow
@@ -866,8 +1267,8 @@ fn directional_forward(expr: SX, seeds: &HashMap<SX, SX>, memo: &mut HashMap<SX,
             | BinaryOp::Hypot
             | BinaryOp::Mod
             | BinaryOp::Copysign => {
-                let dl = directional_forward(lhs, seeds, memo);
-                let dr = directional_forward(rhs, seeds, memo);
+                let dl = directional_forward(lhs, seeds, memo, local_caches, call_memo);
+                let dr = directional_forward(rhs, seeds, memo, local_caches, call_memo);
                 let (d_lhs, d_rhs) = binary_partials(op, lhs, rhs);
                 dl * d_lhs + dr * d_rhs
             }
@@ -878,16 +1279,54 @@ fn directional_forward(expr: SX, seeds: &HashMap<SX, SX>, memo: &mut HashMap<SX,
             output_slot,
             output_offset,
         } => {
-            let helper = forward_helper(function)
-                .expect("forward helper generation should succeed for a valid SXFunction");
-            let mut helper_inputs = inputs.clone();
-            for input in &inputs {
-                helper_inputs.push(input.map_nonzeros(|value| directional_forward(value, seeds, memo)));
+            let profile = local_caches.dependency_profile(function);
+            let mut seed_inputs = Vec::with_capacity(inputs.iter().len());
+            let mut has_relevant_seed = false;
+            for (slot, input) in inputs.iter().enumerate() {
+                let seed_input = input.map_nonzeros(|value| {
+                    directional_forward(value, seeds, memo, local_caches, call_memo)
+                });
+                if !has_relevant_seed {
+                    has_relevant_seed =
+                        seed_input
+                            .nonzeros()
+                            .iter()
+                            .enumerate()
+                            .any(|(offset, &value)| {
+                                !value.is_zero()
+                                    && profile.output_depends_on(
+                                        output_slot,
+                                        output_offset,
+                                        slot,
+                                        offset,
+                                    )
+                            });
+                }
+                seed_inputs.push(seed_input);
             }
-            let helper_outputs = helper
-                .call(&helper_inputs)
-                .expect("forward helper call should match its declared signature");
-            helper_outputs[output_slot].nz(output_offset)
+            if !has_relevant_seed {
+                SX::zero()
+            } else {
+                let key = ForwardCallCacheKey {
+                    function,
+                    site_id: inputs.site_id(),
+                };
+                if let Some(existing) = call_memo.get(&key) {
+                    existing[output_slot].nz(output_offset)
+                } else {
+                    let helper = local_caches
+                        .forward_helper(function)
+                        .expect("forward helper generation should succeed for a valid SXFunction");
+                    let mut helper_inputs = inputs.to_vec();
+                    helper_inputs.extend(seed_inputs);
+                    let helper_outputs = helper
+                        .call(&helper_inputs)
+                        .expect("forward helper call should match its declared signature");
+                    let selected = helper_outputs[output_slot].nz(output_offset);
+                    call_memo.insert(key, helper_outputs);
+                    selected
+                }
+            }
         }
     };
     memo.insert(expr, derivative);
@@ -908,11 +1347,312 @@ pub(crate) fn forward_directional(outputs: &[SX], vars: &[SX], seeds: &[SX]) -> 
         .zip(seeds.iter().copied())
         .collect::<HashMap<_, _>>();
     let mut memo = HashMap::new();
+    let mut local_caches = AdLocalCaches::default();
+    let mut call_memo = HashMap::new();
     Ok(outputs
         .iter()
         .copied()
-        .map(|output| directional_forward(output, &seed_map, &mut memo))
+        .map(|output| {
+            directional_forward(
+                output,
+                &seed_map,
+                &mut memo,
+                &mut local_caches,
+                &mut call_memo,
+            )
+        })
         .collect())
+}
+
+fn directional_forward_batch(
+    expr: SX,
+    var_index_by_symbol: &HashMap<SX, usize>,
+    seeds_by_direction: &[Vec<SX>],
+    memo: &mut HashMap<SX, Vec<SX>>,
+    local_caches: &mut AdLocalCaches,
+    call_memo: &mut HashMap<ForwardCallCacheKey, Vec<SXMatrix>>,
+) -> Result<Vec<SX>> {
+    if let Some(existing) = memo.get(&expr) {
+        return Ok(existing.clone());
+    }
+
+    let direction_count = seeds_by_direction.len();
+    let derivative = match node_kind(expr) {
+        NodeKind::Constant(_) => vec![SX::zero(); direction_count],
+        NodeKind::Symbol { .. } => match var_index_by_symbol.get(&expr).copied() {
+            Some(index) => seeds_by_direction
+                .iter()
+                .map(|seeds| seeds[index])
+                .collect::<Vec<_>>(),
+            None => vec![SX::zero(); direction_count],
+        },
+        NodeKind::Unary { op, arg } => {
+            let arg_deriv = directional_forward_batch(
+                arg,
+                var_index_by_symbol,
+                seeds_by_direction,
+                memo,
+                local_caches,
+                call_memo,
+            )?;
+            arg_deriv
+                .into_iter()
+                .map(|value| value * unary_derivative(op, arg))
+                .collect()
+        }
+        NodeKind::Binary { op, lhs, rhs } => match op {
+            BinaryOp::Add => {
+                let dl = directional_forward_batch(
+                    lhs,
+                    var_index_by_symbol,
+                    seeds_by_direction,
+                    memo,
+                    local_caches,
+                    call_memo,
+                )?;
+                let dr = directional_forward_batch(
+                    rhs,
+                    var_index_by_symbol,
+                    seeds_by_direction,
+                    memo,
+                    local_caches,
+                    call_memo,
+                )?;
+                dl.into_iter()
+                    .zip(dr)
+                    .map(|(lhs_value, rhs_value)| lhs_value + rhs_value)
+                    .collect()
+            }
+            BinaryOp::Sub => {
+                let dl = directional_forward_batch(
+                    lhs,
+                    var_index_by_symbol,
+                    seeds_by_direction,
+                    memo,
+                    local_caches,
+                    call_memo,
+                )?;
+                let dr = directional_forward_batch(
+                    rhs,
+                    var_index_by_symbol,
+                    seeds_by_direction,
+                    memo,
+                    local_caches,
+                    call_memo,
+                )?;
+                dl.into_iter()
+                    .zip(dr)
+                    .map(|(lhs_value, rhs_value)| lhs_value - rhs_value)
+                    .collect()
+            }
+            BinaryOp::Mul => {
+                let dl = directional_forward_batch(
+                    lhs,
+                    var_index_by_symbol,
+                    seeds_by_direction,
+                    memo,
+                    local_caches,
+                    call_memo,
+                )?;
+                let dr = directional_forward_batch(
+                    rhs,
+                    var_index_by_symbol,
+                    seeds_by_direction,
+                    memo,
+                    local_caches,
+                    call_memo,
+                )?;
+                dl.into_iter()
+                    .zip(dr)
+                    .map(|(lhs_value, rhs_value)| lhs_value * rhs + lhs * rhs_value)
+                    .collect()
+            }
+            BinaryOp::Div => {
+                let dl = directional_forward_batch(
+                    lhs,
+                    var_index_by_symbol,
+                    seeds_by_direction,
+                    memo,
+                    local_caches,
+                    call_memo,
+                )?;
+                let dr = directional_forward_batch(
+                    rhs,
+                    var_index_by_symbol,
+                    seeds_by_direction,
+                    memo,
+                    local_caches,
+                    call_memo,
+                )?;
+                dl.into_iter()
+                    .zip(dr)
+                    .map(|(lhs_value, rhs_value)| (lhs_value * rhs - lhs * rhs_value) / rhs.sqr())
+                    .collect()
+            }
+            BinaryOp::Pow
+            | BinaryOp::Atan2
+            | BinaryOp::Hypot
+            | BinaryOp::Mod
+            | BinaryOp::Copysign => {
+                let dl = directional_forward_batch(
+                    lhs,
+                    var_index_by_symbol,
+                    seeds_by_direction,
+                    memo,
+                    local_caches,
+                    call_memo,
+                )?;
+                let dr = directional_forward_batch(
+                    rhs,
+                    var_index_by_symbol,
+                    seeds_by_direction,
+                    memo,
+                    local_caches,
+                    call_memo,
+                )?;
+                let (d_lhs, d_rhs) = binary_partials(op, lhs, rhs);
+                dl.into_iter()
+                    .zip(dr)
+                    .map(|(lhs_value, rhs_value)| lhs_value * d_lhs + rhs_value * d_rhs)
+                    .collect()
+            }
+        },
+        NodeKind::Call {
+            function,
+            inputs,
+            output_slot,
+            output_offset,
+        } => {
+            let profile = local_caches.dependency_profile(function);
+            let input_count = inputs.iter().len();
+            let mut input_directionals = Vec::with_capacity(input_count);
+            for input in inputs.iter() {
+                let mut entry_directionals = Vec::with_capacity(input.nnz());
+                for &value in input.nonzeros().iter() {
+                    entry_directionals.push(directional_forward_batch(
+                        value,
+                        var_index_by_symbol,
+                        seeds_by_direction,
+                        memo,
+                        local_caches,
+                        call_memo,
+                    )?);
+                }
+                input_directionals.push(entry_directionals);
+            }
+
+            let mut seed_inputs_by_direction = Vec::with_capacity(direction_count);
+            let mut has_relevant_seed = false;
+            for direction in 0..direction_count {
+                let mut direction_seed_inputs = Vec::with_capacity(input_count);
+                for (slot, input) in inputs.iter().enumerate() {
+                    let seed_nonzeros = input_directionals[slot]
+                        .iter()
+                        .map(|values| values[direction])
+                        .collect::<Vec<_>>();
+                    if !has_relevant_seed {
+                        has_relevant_seed =
+                            seed_nonzeros.iter().enumerate().any(|(offset, &value)| {
+                                !value.is_zero()
+                                    && profile.output_depends_on(
+                                        output_slot,
+                                        output_offset,
+                                        slot,
+                                        offset,
+                                    )
+                            });
+                    }
+                    direction_seed_inputs.push(SXMatrix::new(input.ccs().clone(), seed_nonzeros)?);
+                }
+                seed_inputs_by_direction.push(direction_seed_inputs);
+            }
+
+            if !has_relevant_seed {
+                vec![SX::zero(); direction_count]
+            } else {
+                let key = ForwardCallCacheKey {
+                    function,
+                    site_id: inputs.site_id(),
+                };
+                if let Some(existing) = call_memo.get(&key) {
+                    (0..direction_count)
+                        .map(|direction| {
+                            existing[output_slot * direction_count + direction].nz(output_offset)
+                        })
+                        .collect()
+                } else {
+                    let helper = local_caches
+                        .forward_batch_helper(function, direction_count)
+                        .expect(
+                            "forward batch helper generation should succeed for a valid SXFunction",
+                        );
+                    let mut helper_inputs = inputs.to_vec();
+                    for direction_seed_inputs in &seed_inputs_by_direction {
+                        helper_inputs.extend(direction_seed_inputs.iter().cloned());
+                    }
+                    let helper_outputs = helper
+                        .call(&helper_inputs)
+                        .expect("forward batch helper call should match its declared signature");
+                    let selected = (0..direction_count)
+                        .map(|direction| {
+                            helper_outputs[output_slot * direction_count + direction]
+                                .nz(output_offset)
+                        })
+                        .collect::<Vec<_>>();
+                    call_memo.insert(key, helper_outputs);
+                    selected
+                }
+            }
+        }
+    };
+
+    memo.insert(expr, derivative.clone());
+    Ok(derivative)
+}
+
+pub(crate) fn forward_directional_batch(
+    outputs: &[SX],
+    vars: &[SX],
+    seeds_by_direction: &[Vec<SX>],
+) -> Result<Vec<Vec<SX>>> {
+    if seeds_by_direction.is_empty() {
+        return Ok(Vec::new());
+    }
+    if seeds_by_direction
+        .iter()
+        .any(|seeds| seeds.len() != vars.len())
+    {
+        return Err(SxError::Shape(format!(
+            "forward seed length(s) do not match variable length {}",
+            vars.len()
+        )));
+    }
+
+    let var_index_by_symbol = vars
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, symbol)| (symbol, index))
+        .collect::<HashMap<_, _>>();
+    let mut memo = HashMap::new();
+    let mut local_caches = AdLocalCaches::default();
+    let mut call_memo = HashMap::new();
+    let direction_count = seeds_by_direction.len();
+    let mut outputs_by_direction = vec![Vec::with_capacity(outputs.len()); direction_count];
+    for &output in outputs {
+        let values = directional_forward_batch(
+            output,
+            &var_index_by_symbol,
+            seeds_by_direction,
+            &mut memo,
+            &mut local_caches,
+            &mut call_memo,
+        )?;
+        for (direction, value) in values.into_iter().enumerate() {
+            outputs_by_direction[direction].push(value);
+        }
+    }
+    Ok(outputs_by_direction)
 }
 
 pub(crate) fn reverse_directional(outputs: &[SX], vars: &[SX], seeds: &[SX]) -> Result<Vec<SX>> {
@@ -930,6 +1670,7 @@ pub(crate) fn reverse_directional(outputs: &[SX], vars: &[SX], seeds: &[SX]) -> 
     }
 
     let mut adjoints = HashMap::<SX, SX>::new();
+    let mut local_caches = AdLocalCaches::default();
     for (output, seed) in outputs.iter().copied().zip(seeds.iter().copied()) {
         adjoints
             .entry(output)
@@ -1018,32 +1759,21 @@ pub(crate) fn reverse_directional(outputs: &[SX], vars: &[SX], seeds: &[SX]) -> 
                 output_slot,
                 output_offset,
             } => {
-                let helper = reverse_helper(function)
-                    .expect("reverse helper generation should succeed for a valid SXFunction");
-                let callee = function_by_id(function)
-                    .expect("reverse helper generation should only reference known functions");
-                let mut helper_inputs = inputs.clone();
-                for (slot, output) in callee.outputs().iter().enumerate() {
-                    let seed = (0..output.matrix().nnz())
-                        .map(|offset| {
-                            if slot == output_slot && offset == output_offset {
-                                adj
-                            } else {
-                                SX::zero()
-                            }
-                        })
-                        .collect();
-                    helper_inputs.push(
-                        SXMatrix::new(output.matrix().ccs().clone(), seed)
-                            .expect("reverse seed should match output sparsity"),
+                let profile = local_caches.dependency_profile(function);
+                let helper = local_caches
+                    .reverse_scalar_helper(function, output_slot, output_offset)
+                    .expect(
+                        "reverse scalar helper generation should succeed for a valid SXFunction",
                     );
-                }
                 let helper_outputs = helper
-                    .call(&helper_inputs)
-                    .expect("reverse helper call should match its declared signature");
+                    .call(inputs.as_slice())
+                    .expect("reverse scalar helper call should match its declared signature");
                 for (slot, input) in inputs.iter().enumerate() {
                     for (offset, &expr) in input.nonzeros().iter().enumerate() {
-                        let contrib = helper_outputs[slot].nz(offset);
+                        if !profile.output_depends_on(output_slot, output_offset, slot, offset) {
+                            continue;
+                        }
+                        let contrib = adj * helper_outputs[slot].nz(offset);
                         adjoints
                             .entry(expr)
                             .and_modify(|entry| *entry += contrib)
@@ -1062,6 +1792,200 @@ pub(crate) fn reverse_directional(outputs: &[SX], vars: &[SX], seeds: &[SX]) -> 
         .collect())
 }
 
+pub(crate) fn reverse_directional_batch(
+    outputs: &[SX],
+    vars: &[SX],
+    seeds_by_direction: &[Vec<SX>],
+) -> Result<Vec<Vec<SX>>> {
+    if seeds_by_direction.is_empty() {
+        return Ok(Vec::new());
+    }
+    if seeds_by_direction
+        .iter()
+        .any(|seeds| seeds.len() != outputs.len())
+    {
+        return Err(SxError::Shape(format!(
+            "reverse seed length(s) do not match output length {}",
+            outputs.len()
+        )));
+    }
+
+    let mut order = Vec::new();
+    let mut seen = HashSet::new();
+    for output in outputs.iter().copied() {
+        topo_visit(output, &mut seen, &mut order);
+    }
+
+    let direction_count = seeds_by_direction.len();
+    let mut adjoints = HashMap::<SX, Vec<SX>>::new();
+    let mut local_caches = AdLocalCaches::default();
+    for (output_index, output) in outputs.iter().copied().enumerate() {
+        let mut seeds = vec![SX::zero(); direction_count];
+        let mut has_seed = false;
+        for (direction, direction_seeds) in seeds_by_direction.iter().enumerate() {
+            let seed = direction_seeds[output_index];
+            if !seed.is_zero() {
+                has_seed = true;
+            }
+            seeds[direction] = seed;
+        }
+        if has_seed {
+            adjoints
+                .entry(output)
+                .and_modify(|entry| {
+                    for (current, seed) in entry.iter_mut().zip(seeds.iter().copied()) {
+                        *current += seed;
+                    }
+                })
+                .or_insert(seeds);
+        }
+    }
+
+    for node in order.into_iter().rev() {
+        let Some(adj) = adjoints.get(&node).cloned() else {
+            continue;
+        };
+        match node_kind(node) {
+            NodeKind::Unary { op, arg } => {
+                let contrib = adj
+                    .iter()
+                    .copied()
+                    .map(|value| value * unary_derivative(op, arg))
+                    .collect::<Vec<_>>();
+                adjoints
+                    .entry(arg)
+                    .and_modify(|entry| {
+                        for (current, value) in entry.iter_mut().zip(contrib.iter().copied()) {
+                            *current += value;
+                        }
+                    })
+                    .or_insert(contrib);
+            }
+            NodeKind::Binary { op, lhs, rhs } => {
+                let (lhs_contrib, rhs_contrib) = match op {
+                    BinaryOp::Add => (adj.clone(), adj.clone()),
+                    BinaryOp::Sub => (
+                        adj.clone(),
+                        adj.iter()
+                            .copied()
+                            .map(std::ops::Neg::neg)
+                            .collect::<Vec<_>>(),
+                    ),
+                    BinaryOp::Mul => (
+                        adj.iter()
+                            .copied()
+                            .map(|value| value * rhs)
+                            .collect::<Vec<_>>(),
+                        adj.iter()
+                            .copied()
+                            .map(|value| value * lhs)
+                            .collect::<Vec<_>>(),
+                    ),
+                    BinaryOp::Div => (
+                        adj.iter()
+                            .copied()
+                            .map(|value| value / rhs)
+                            .collect::<Vec<_>>(),
+                        adj.iter()
+                            .copied()
+                            .map(|value| -(value * lhs) / rhs.sqr())
+                            .collect::<Vec<_>>(),
+                    ),
+                    BinaryOp::Pow
+                    | BinaryOp::Atan2
+                    | BinaryOp::Hypot
+                    | BinaryOp::Mod
+                    | BinaryOp::Copysign => {
+                        let (d_lhs, d_rhs) = binary_partials(op, lhs, rhs);
+                        (
+                            adj.iter()
+                                .copied()
+                                .map(|value| value * d_lhs)
+                                .collect::<Vec<_>>(),
+                            adj.iter()
+                                .copied()
+                                .map(|value| value * d_rhs)
+                                .collect::<Vec<_>>(),
+                        )
+                    }
+                };
+
+                adjoints
+                    .entry(lhs)
+                    .and_modify(|entry| {
+                        for (current, value) in entry.iter_mut().zip(lhs_contrib.iter().copied()) {
+                            *current += value;
+                        }
+                    })
+                    .or_insert(lhs_contrib);
+                adjoints
+                    .entry(rhs)
+                    .and_modify(|entry| {
+                        for (current, value) in entry.iter_mut().zip(rhs_contrib.iter().copied()) {
+                            *current += value;
+                        }
+                    })
+                    .or_insert(rhs_contrib);
+            }
+            NodeKind::Call {
+                function,
+                inputs,
+                output_slot,
+                output_offset,
+            } => {
+                let profile = local_caches.dependency_profile(function);
+                let helper = local_caches
+                    .reverse_scalar_helper(function, output_slot, output_offset)
+                    .expect(
+                        "reverse scalar helper generation should succeed for a valid SXFunction",
+                    );
+                let helper_outputs = helper
+                    .call(inputs.as_slice())
+                    .expect("reverse scalar helper call should match its declared signature");
+                for (slot, input) in inputs.iter().enumerate() {
+                    for (offset, &expr) in input.nonzeros().iter().enumerate() {
+                        if !profile.output_depends_on(output_slot, output_offset, slot, offset) {
+                            continue;
+                        }
+                        let partial = helper_outputs[slot].nz(offset);
+                        let contrib = adj
+                            .iter()
+                            .copied()
+                            .map(|value| value * partial)
+                            .collect::<Vec<_>>();
+                        adjoints
+                            .entry(expr)
+                            .and_modify(|entry| {
+                                for (current, value) in
+                                    entry.iter_mut().zip(contrib.iter().copied())
+                                {
+                                    *current += value;
+                                }
+                            })
+                            .or_insert(contrib);
+                    }
+                }
+            }
+            NodeKind::Constant(_) | NodeKind::Symbol { .. } => {}
+        }
+    }
+
+    Ok((0..direction_count)
+        .map(|direction| {
+            vars.iter()
+                .copied()
+                .map(|var| {
+                    adjoints
+                        .get(&var)
+                        .map(|values| values[direction])
+                        .unwrap_or_else(SX::zero)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect())
+}
+
+#[allow(dead_code)]
 pub(crate) fn depends_on(expr: SX, target: SX, memo: &mut HashMap<SX, bool>) -> bool {
     if let Some(existing) = memo.get(&expr) {
         return *existing;
@@ -1291,7 +2215,7 @@ impl SX {
             } => NodeView::Call {
                 function_id: function,
                 function_name: function_name(function).unwrap_or_else(|| format!("fn_{function}")),
-                inputs,
+                inputs: inputs.to_vec(),
                 output_slot,
                 output_offset,
             },

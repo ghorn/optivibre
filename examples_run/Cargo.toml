@@ -20,6 +20,7 @@ ad-bench-artifacts = []
 [dependencies]
 anyhow.workspace = true
 bench_report = { path = "../bench_report" }
+clap.workspace = true
 examples_source = { path = "../examples_source" }
 serde.workspace = true
 serde_json.workspace = true

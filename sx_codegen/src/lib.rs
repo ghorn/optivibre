@@ -4,9 +4,8 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Result, anyhow, bail};
 use sx_core::{
-    BinaryOp, CCS, CallPolicy, CallPolicyConfig, CompileStats, CompileWarning, Index,
-    InlineStage, NodeView, SX, SXFunction, SXMatrix, UnaryOp, lookup_function,
-    rewrite_function_for_stage,
+    BinaryOp, CCS, CallPolicy, CallPolicyConfig, CompileStats, CompileWarning, Index, InlineStage,
+    NodeView, SX, SXFunction, SXMatrix, UnaryOp, lookup_function, rewrite_function_for_stage,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -217,7 +216,8 @@ impl CallableLoweringState<'_> {
                 let input = self.lower_expr(arg)?;
                 let temp = self.next_temp;
                 self.next_temp += 1;
-                self.instructions.push(Instruction::Unary { temp, op, input });
+                self.instructions
+                    .push(Instruction::Unary { temp, op, input });
                 ValueRef::Temp(temp)
             }
             NodeView::Binary { op, lhs, rhs } => {
@@ -225,7 +225,8 @@ impl CallableLoweringState<'_> {
                 let rhs = self.lower_expr(rhs)?;
                 let temp = self.next_temp;
                 self.next_temp += 1;
-                self.instructions.push(Instruction::Binary { temp, op, lhs, rhs });
+                self.instructions
+                    .push(Instruction::Binary { temp, op, lhs, rhs });
                 ValueRef::Temp(temp)
             }
             NodeView::Call {
@@ -240,12 +241,14 @@ impl CallableLoweringState<'_> {
                     inputs: inputs.clone(),
                 };
                 if let Some(temps) = self.call_outputs.get(&key) {
-                    ValueRef::Temp(temps[call_output_linear_index(
-                        &lookup_function(function_id)
-                            .expect("lowering should only reference known functions"),
-                        output_slot,
-                        output_offset,
-                    )])
+                    ValueRef::Temp(
+                        temps[call_output_linear_index(
+                            &lookup_function(function_id)
+                                .expect("lowering should only reference known functions"),
+                            output_slot,
+                            output_offset,
+                        )],
+                    )
                 } else {
                     if self.shared.counted_call_sites.insert(key.clone()) {
                         self.stats.call_site_count += 1;

@@ -1,31 +1,25 @@
 use crate::common::{
-    CachedCompile, CompileCacheStatus, CompileProgressInfo, CompileProgressUpdate, FromMap,
-    LatexSection, MetricKey, OcpCompileProgressState, PlotMode, ProblemId, ProblemSpec, Scene2D,
-    ScenePath, SolveArtifact, SolveStreamEvent, SolverMethod, SolverReport, SqpConfig,
-    TranscriptionConfig, TranscriptionMethod, cached_compile_with_progress, chart,
-    compile_progress_info, default_solver_method, default_sqp_config, default_transcription,
-    deg_to_rad, direct_collocation_compile_key as dc_compile_key, expect_finite,
-    interactive_multiple_shooting_opt_level, interval_arc_bound_series, interval_arc_series,
-    metric_with_key, node_times, numeric_metric_with_key, ocp_compile_progress_update,
-    problem_controls, problem_scientific_slider_control, problem_slider_control, problem_spec,
-    rad_to_deg, sample_or_default, segmented_bound_series, segmented_series,
-    solve_cached_direct_collocation_problem, solve_cached_direct_collocation_problem_with_progress,
-    solve_cached_multiple_shooting_problem, solve_cached_multiple_shooting_problem_with_progress,
-    solver_config_from_map, solver_method_from_map, summarize_backend_compile_report,
-    transcription_from_map, transcription_metrics, trapezoid_integral,
+    CompileCacheStatus, CompileProgressInfo, CompileProgressUpdate, ContinuousInitialGuess,
+    FromMap, LatexSection, MetricKey, OcpRuntimeSpec, OcpSxFunctionConfig, PlotMode, ProblemId,
+    ProblemSpec, Scene2D, ScenePath, SolveArtifact, SolveStreamEvent, SolverMethod, SolverReport,
+    SqpConfig, StandardOcpParams, TranscriptionConfig, chart, default_solver_method,
+    default_sqp_config, default_transcription, deg_to_rad, direct_collocation_runtime_from_spec,
+    expect_finite, interval_arc_bound_series, interval_arc_series, metric_with_key,
+    multiple_shooting_runtime_from_spec, node_times, numeric_metric_with_key,
+    ocp_sx_function_config_from_map, problem_controls, problem_scientific_slider_control,
+    problem_slider_control, problem_spec, rad_to_deg, sample_or_default, segmented_bound_series,
+    segmented_series, solver_config_from_map, solver_method_from_map, transcription_from_map,
+    transcription_metrics, trapezoid_integral,
 };
 use anyhow::{Result, anyhow};
 use optimal_control::{
     Bounds1D, CompiledDirectCollocationOcp, CompiledMultipleShootingOcp, DirectCollocation,
-    DirectCollocationInitialGuess, DirectCollocationRuntimeValues, DirectCollocationTimeGrid,
-    DirectCollocationTrajectories, IntervalArc, MultipleShooting, MultipleShootingInitialGuess,
-    MultipleShootingRuntimeValues, MultipleShootingTrajectories, Ocp, direct_collocation_root_arcs,
-    direct_collocation_state_like_arcs,
+    DirectCollocationRuntimeValues, DirectCollocationTimeGrid, DirectCollocationTrajectories,
+    IntervalArc, MultipleShooting, MultipleShootingRuntimeValues, MultipleShootingTrajectories,
+    Ocp, direct_collocation_root_arcs, direct_collocation_state_like_arcs,
 };
 use serde::Serialize;
-use std::cell::RefCell;
 use std::f64::consts::PI;
-use std::rc::Rc;
 use sx_core::SX;
 const RK4_SUBSTEPS: usize = 2;
 const DEFAULT_INTERVALS: usize = 30;
@@ -97,10 +91,17 @@ type DcCompiled<const N: usize, const K: usize> = CompiledDirectCollocationOcp<
     K,
 >;
 
-crate::standard_ocp_compile_caches!(
-    MULTIPLE_SHOOTING_CACHE: MsCompiled<DEFAULT_INTERVALS>,
-    DIRECT_COLLOCATION_CACHE: DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>
-);
+thread_local! {
+    static MULTIPLE_SHOOTING_CACHE: std::cell::RefCell<
+        crate::common::SharedCompileCache<crate::common::MultipleShootingCompileKey, MsCompiled<DEFAULT_INTERVALS>>
+    > = std::cell::RefCell::new(crate::common::SharedCompileCache::new());
+    static DIRECT_COLLOCATION_CACHE: std::cell::RefCell<
+        crate::common::SharedCompileCache<
+            crate::common::DirectCollocationCompileVariantKey,
+            DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+        >
+    > = std::cell::RefCell::new(crate::common::SharedCompileCache::new());
+}
 
 const PROBLEM_NAME: &str = "Optimal Distance Glider";
 #[derive(Clone, Debug)]
@@ -115,6 +116,7 @@ pub struct Params {
     pub solver_method: SolverMethod,
     pub solver: SqpConfig,
     pub transcription: TranscriptionConfig,
+    pub sx_functions: OcpSxFunctionConfig,
 }
 impl Default for Params {
     fn default() -> Self {
@@ -129,7 +131,18 @@ impl Default for Params {
             solver_method: default_solver_method(),
             solver: default_sqp_config(),
             transcription: default_transcription(DEFAULT_INTERVALS),
+            sx_functions: OcpSxFunctionConfig::default(),
         }
+    }
+}
+
+impl StandardOcpParams for Params {
+    fn transcription(&self) -> &TranscriptionConfig {
+        &self.transcription
+    }
+
+    fn transcription_mut(&mut self) -> &mut TranscriptionConfig {
+        &mut self.transcription
     }
 }
 impl FromMap for Params {
@@ -191,6 +204,7 @@ impl FromMap for Params {
                 &SUPPORTED_INTERVALS,
                 &SUPPORTED_DEGREES,
             )?,
+            sx_functions: ocp_sx_function_config_from_map(values, defaults.sx_functions)?,
         })
     }
 }
@@ -363,142 +377,6 @@ fn seed_launch_velocity(params: &Params) -> (f64, f64) {
     )
 }
 
-fn cached_multiple_shooting() -> Result<CachedCompile<MsCompiled<DEFAULT_INTERVALS>>> {
-    MULTIPLE_SHOOTING_CACHE.with(|cache| {
-        cache.borrow_mut().get_or_try_init(DEFAULT_INTERVALS, || {
-            Ok(model(MultipleShooting::<DEFAULT_INTERVALS, RK4_SUBSTEPS>)
-                .compile_jit_with_opt_level(interactive_multiple_shooting_opt_level())?)
-        })
-    })
-}
-
-fn cached_direct_collocation(
-    family: optimal_control::CollocationFamily,
-) -> Result<CachedCompile<DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>>> {
-    DIRECT_COLLOCATION_CACHE.with(|cache| {
-        cache
-            .borrow_mut()
-            .get_or_try_init(dc_compile_key(family), || {
-                Ok(model(
-                    DirectCollocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE> { family },
-                )
-                .compile_jit()?)
-            })
-    })
-}
-
-fn compile_multiple_shooting_with_progress(
-    callback: &mut dyn FnMut(CompileProgressUpdate),
-) -> Result<(
-    Rc<RefCell<MsCompiled<DEFAULT_INTERVALS>>>,
-    CompileProgressInfo,
-)> {
-    MULTIPLE_SHOOTING_CACHE.with(|cache| {
-        cached_compile_with_progress(
-            &mut cache.borrow_mut(),
-            DEFAULT_INTERVALS,
-            callback,
-            |on_compile_progress| {
-                let mut progress_state = OcpCompileProgressState::default();
-                Ok(model(MultipleShooting::<DEFAULT_INTERVALS, RK4_SUBSTEPS>)
-                    .compile_jit_with_opt_level_and_progress_callback(
-                        interactive_multiple_shooting_opt_level(),
-                        |progress| {
-                            on_compile_progress(ocp_compile_progress_update(
-                                progress,
-                                &mut progress_state,
-                            ));
-                        },
-                    )?)
-            },
-            |compiled| {
-                compile_progress_info(
-                    compiled.backend_timing_metadata(),
-                    compiled.nlp_compile_stats(),
-                    compiled.helper_kernel_count(),
-                    compiled.helper_compile_stats(),
-                    Some(summarize_backend_compile_report(compiled.backend_compile_report())),
-                )
-            },
-        )
-    })
-}
-
-fn compile_direct_collocation_with_progress(
-    family: optimal_control::CollocationFamily,
-    callback: &mut dyn FnMut(CompileProgressUpdate),
-) -> Result<(
-    Rc<RefCell<DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>>>,
-    CompileProgressInfo,
-)> {
-    DIRECT_COLLOCATION_CACHE.with(|cache| {
-        cached_compile_with_progress(
-            &mut cache.borrow_mut(),
-            dc_compile_key(family),
-            callback,
-            |on_compile_progress| {
-                let mut progress_state = OcpCompileProgressState::default();
-                Ok(model(
-                    DirectCollocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE> { family },
-                )
-                .compile_jit_with_progress_callback(|progress| {
-                    on_compile_progress(ocp_compile_progress_update(progress, &mut progress_state));
-                })?)
-            },
-            |compiled| {
-                compile_progress_info(
-                    compiled.backend_timing_metadata(),
-                    compiled.nlp_compile_stats(),
-                    compiled.helper_kernel_count(),
-                    compiled.helper_compile_stats(),
-                    Some(summarize_backend_compile_report(compiled.backend_compile_report())),
-                )
-            },
-        )
-    })
-}
-
-pub fn prewarm(params: &Params) -> Result<()> {
-    match params.transcription.method {
-        TranscriptionMethod::MultipleShooting => cached_multiple_shooting().map(|_| ()),
-        TranscriptionMethod::DirectCollocation => {
-            cached_direct_collocation(params.transcription.collocation_family).map(|_| ())
-        }
-    }
-}
-
-pub fn prewarm_with_progress<F>(params: &Params, emit: F) -> Result<()>
-where
-    F: FnMut(SolveStreamEvent) + Send,
-{
-    match params.transcription.method {
-        TranscriptionMethod::MultipleShooting => {
-            let mut lifecycle =
-                crate::common::SolveLifecycleReporter::new(emit, params.solver_method);
-            lifecycle.prewarm_with_progress(compile_multiple_shooting_with_progress)
-        }
-        TranscriptionMethod::DirectCollocation => {
-            let mut lifecycle =
-                crate::common::SolveLifecycleReporter::new(emit, params.solver_method);
-            lifecycle.prewarm_with_progress(|callback| {
-                compile_direct_collocation_with_progress(
-                    params.transcription.collocation_family,
-                    callback,
-                )
-            })
-        }
-    }
-}
-
-pub fn compile_cache_statuses() -> Vec<CompileCacheStatus> {
-    crate::standard_ocp_compile_cache_statuses!(
-        ProblemId::OptimalDistanceGlider,
-        PROBLEM_NAME,
-        MULTIPLE_SHOOTING_CACHE,
-        DIRECT_COLLOCATION_CACHE
-    )
-}
-
 fn glide_slope_deg(vx: f64, vy: f64) -> f64 {
     rad_to_deg(vy.atan2(vx))
 }
@@ -582,12 +460,239 @@ fn model<Scheme>(
         .build()
         .expect("glider model should build")
 }
-fn rollout_guess_ms<const N: usize>(
+
+fn cached_multiple_shooting(
     params: &Params,
-) -> MultipleShootingInitialGuess<State<f64>, Control<f64>, ModelParams<f64>, N> {
+) -> Result<crate::common::CachedCompile<MsCompiled<DEFAULT_INTERVALS>>> {
+    MULTIPLE_SHOOTING_CACHE.with(|cache| {
+        crate::common::cached_multiple_shooting_ocp_compile(
+            &mut cache.borrow_mut(),
+            DEFAULT_INTERVALS,
+            params.sx_functions,
+            |options| {
+                model(MultipleShooting::<DEFAULT_INTERVALS, RK4_SUBSTEPS>)
+                    .compile_jit_with_ocp_options(options)
+            },
+        )
+    })
+}
+
+fn cached_direct_collocation(
+    params: &Params,
+    family: optimal_control::CollocationFamily,
+) -> Result<crate::common::CachedCompile<DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>>>
+{
+    DIRECT_COLLOCATION_CACHE.with(|cache| {
+        crate::common::cached_direct_collocation_ocp_compile(
+            &mut cache.borrow_mut(),
+            family,
+            params.sx_functions,
+            |options| {
+                model(DirectCollocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE> { family })
+                    .compile_jit_with_ocp_options(options)
+            },
+        )
+    })
+}
+
+fn compile_multiple_shooting_with_progress(
+    params: &Params,
+    callback: &mut dyn FnMut(CompileProgressUpdate),
+) -> Result<(
+    std::rc::Rc<std::cell::RefCell<MsCompiled<DEFAULT_INTERVALS>>>,
+    CompileProgressInfo,
+)> {
+    MULTIPLE_SHOOTING_CACHE.with(|cache| {
+        crate::common::cached_multiple_shooting_ocp_compile_with_progress(
+            &mut cache.borrow_mut(),
+            DEFAULT_INTERVALS,
+            params.sx_functions,
+            callback,
+            |options, on_progress| {
+                model(MultipleShooting::<DEFAULT_INTERVALS, RK4_SUBSTEPS>)
+                    .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
+            },
+            crate::common::compile_progress_info_from_compiled,
+        )
+    })
+}
+
+fn compile_direct_collocation_with_progress(
+    params: &Params,
+    family: optimal_control::CollocationFamily,
+    callback: &mut dyn FnMut(CompileProgressUpdate),
+) -> Result<(
+    std::rc::Rc<std::cell::RefCell<DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>>>,
+    CompileProgressInfo,
+)> {
+    DIRECT_COLLOCATION_CACHE.with(|cache| {
+        crate::common::cached_direct_collocation_ocp_compile_with_progress(
+            &mut cache.borrow_mut(),
+            family,
+            params.sx_functions,
+            callback,
+            |options, on_progress| {
+                model(DirectCollocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE> { family })
+                    .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
+            },
+            crate::common::compile_progress_info_from_compiled,
+        )
+    })
+}
+
+pub fn prewarm(params: &Params) -> Result<()> {
+    crate::common::prewarm_standard_ocp(
+        params,
+        params.transcription.method,
+        params.transcription.collocation_family,
+        cached_multiple_shooting,
+        cached_direct_collocation,
+    )
+}
+
+pub fn prewarm_with_progress<F>(params: &Params, emit: F) -> Result<()>
+where
+    F: FnMut(SolveStreamEvent) + Send,
+{
+    crate::common::prewarm_standard_ocp_with_progress(
+        params,
+        params.transcription.method,
+        params.transcription.collocation_family,
+        params.solver_method,
+        emit,
+        compile_multiple_shooting_with_progress,
+        compile_direct_collocation_with_progress,
+    )
+}
+
+pub fn compile_cache_statuses() -> Vec<CompileCacheStatus> {
+    MULTIPLE_SHOOTING_CACHE.with(|cache| {
+        DIRECT_COLLOCATION_CACHE.with(|dc_cache| {
+            crate::common::standard_ocp_compile_cache_statuses(
+                ProblemId::OptimalDistanceGlider,
+                PROBLEM_NAME,
+                &cache.borrow(),
+                &dc_cache.borrow(),
+            )
+        })
+    })
+}
+
+pub(crate) fn benchmark_default_case_with_progress(
+    transcription: crate::common::TranscriptionMethod,
+    preset: crate::benchmark_report::OcpBenchmarkPreset,
+    eval_options: optimization::NlpEvaluationBenchmarkOptions,
+    on_progress: &mut dyn FnMut(crate::benchmark_report::BenchmarkCaseProgress),
+) -> Result<crate::benchmark_report::OcpBenchmarkRecord> {
+    crate::common::benchmark_standard_ocp_case_with_progress(
+        ProblemId::OptimalDistanceGlider,
+        PROBLEM_NAME,
+        transcription,
+        preset,
+        eval_options,
+        on_progress,
+        |options, on_progress| {
+            model(MultipleShooting::<DEFAULT_INTERVALS, RK4_SUBSTEPS>)
+                .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
+        },
+        |family, options, on_progress| {
+            model(DirectCollocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE> { family })
+                .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
+        },
+        ms_runtime::<DEFAULT_INTERVALS>,
+        dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+    )
+}
+
+pub fn solve(params: &Params) -> Result<SolveArtifact> {
+    crate::common::solve_standard_ocp(
+        params,
+        params.transcription.method,
+        params.transcription.collocation_family,
+        params.solver_method,
+        &params.solver,
+        cached_multiple_shooting,
+        cached_direct_collocation,
+        ms_runtime::<DEFAULT_INTERVALS>,
+        dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+        |trajectories, x_arcs, u_arcs| {
+            artifact_from_ms_trajectories(params, trajectories, x_arcs, u_arcs)
+        },
+        |trajectories, time_grid| artifact_from_dc_trajectories(params, trajectories, time_grid),
+    )
+}
+
+pub fn solve_with_progress<F>(params: &Params, emit: F) -> Result<SolveArtifact>
+where
+    F: FnMut(SolveStreamEvent) + Send,
+{
+    crate::common::solve_standard_ocp_with_progress(
+        params,
+        params.transcription.method,
+        params.transcription.collocation_family,
+        params.solver_method,
+        &params.solver,
+        emit,
+        compile_multiple_shooting_with_progress,
+        compile_direct_collocation_with_progress,
+        ms_runtime::<DEFAULT_INTERVALS>,
+        dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+        |trajectories, x_arcs, u_arcs| {
+            artifact_from_ms_trajectories(params, trajectories, x_arcs, u_arcs)
+        },
+        |trajectories, time_grid| artifact_from_dc_trajectories(params, trajectories, time_grid),
+    )
+}
+
+pub(crate) fn solve_from_map(
+    values: &std::collections::BTreeMap<String, f64>,
+) -> Result<SolveArtifact> {
+    crate::common::solve_from_value_map::<Params, _>(values, solve)
+}
+
+pub(crate) fn prewarm_from_map(values: &std::collections::BTreeMap<String, f64>) -> Result<()> {
+    crate::common::prewarm_from_value_map::<Params, _>(values, prewarm)
+}
+
+pub(crate) fn solve_with_progress_boxed(
+    values: &std::collections::BTreeMap<String, f64>,
+    emit: Box<dyn FnMut(SolveStreamEvent) + Send>,
+) -> Result<SolveArtifact> {
+    crate::common::solve_with_progress_from_value_map::<Params, _>(values, emit, |params, emit| {
+        solve_with_progress(params, emit)
+    })
+}
+
+pub(crate) fn prewarm_with_progress_boxed(
+    values: &std::collections::BTreeMap<String, f64>,
+    emit: Box<dyn FnMut(SolveStreamEvent) + Send>,
+) -> Result<()> {
+    crate::common::prewarm_with_progress_from_value_map::<Params, _>(
+        values,
+        emit,
+        |params, emit| prewarm_with_progress(params, emit),
+    )
+}
+
+pub(crate) fn problem_entry() -> crate::ProblemEntry {
+    crate::ProblemEntry {
+        id: ProblemId::OptimalDistanceGlider,
+        spec,
+        solve_from_map,
+        prewarm_from_map,
+        solve_with_progress_boxed,
+        prewarm_with_progress_boxed,
+        compile_cache_statuses,
+        benchmark_default_case_with_progress,
+    }
+}
+
+fn continuous_guess(
+    params: &Params,
+) -> ContinuousInitialGuess<State<f64>, Control<f64>, ModelParams<f64>> {
     let trim_alpha = best_glide_alpha().max(0.01);
     let (vx0, vy0) = seed_launch_velocity(params);
-    MultipleShootingInitialGuess::Rollout {
+    ContinuousInitialGuess::Rollout {
         x0: State {
             x: 0.0,
             altitude: INITIAL_ALTITUDE_M,
@@ -605,41 +710,11 @@ fn rollout_guess_ms<const N: usize>(
         }),
     }
 }
-fn rollout_guess_dc<const N: usize, const K: usize>(
+
+fn runtime_spec(
     params: &Params,
-) -> DirectCollocationInitialGuess<State<f64>, Control<f64>, ModelParams<f64>, N, K> {
-    let trim_alpha = best_glide_alpha().max(0.01);
-    let (vx0, vy0) = seed_launch_velocity(params);
-    DirectCollocationInitialGuess::Rollout {
-        x0: State {
-            x: 0.0,
-            altitude: INITIAL_ALTITUDE_M,
-            vx: vx0,
-            vy: vy0,
-        },
-        u0: Control {
-            alpha: deg_to_rad(params.initial_alpha_deg),
-        },
-        tf: params
-            .initial_time_guess_s
-            .clamp(params.min_time_bound_s, params.max_time_bound_s),
-        controller: Box::new(move |_, _, u, _| Control {
-            alpha: 1.5 * (trim_alpha - u.alpha),
-        }),
-    }
-}
-fn ms_runtime<const N: usize>(
-    params: &Params,
-) -> MultipleShootingRuntimeValues<
-    ModelParams<f64>,
-    Path<Bounds1D>,
-    Boundary<f64>,
-    (),
-    State<f64>,
-    Control<f64>,
-    N,
-> {
-    MultipleShootingRuntimeValues {
+) -> OcpRuntimeSpec<ModelParams<f64>, Path<Bounds1D>, Boundary<f64>, (), State<f64>, Control<f64>> {
+    OcpRuntimeSpec {
         parameters: ModelParams {
             alpha_rate_weight: params.alpha_rate_regularization,
         },
@@ -671,9 +746,24 @@ fn ms_runtime<const N: usize>(
             lower: Some(params.min_time_bound_s),
             upper: Some(params.max_time_bound_s),
         },
-        initial_guess: rollout_guess_ms(params),
+        initial_guess: continuous_guess(params),
     }
 }
+
+fn ms_runtime<const N: usize>(
+    params: &Params,
+) -> MultipleShootingRuntimeValues<
+    ModelParams<f64>,
+    Path<Bounds1D>,
+    Boundary<f64>,
+    (),
+    State<f64>,
+    Control<f64>,
+    N,
+> {
+    multiple_shooting_runtime_from_spec(runtime_spec(params))
+}
+
 fn dc_runtime<const N: usize, const K: usize>(
     params: &Params,
 ) -> DirectCollocationRuntimeValues<
@@ -686,118 +776,7 @@ fn dc_runtime<const N: usize, const K: usize>(
     N,
     K,
 > {
-    DirectCollocationRuntimeValues {
-        parameters: ModelParams {
-            alpha_rate_weight: params.alpha_rate_regularization,
-        },
-        beq: Boundary {
-            x0: 0.0,
-            altitude0: INITIAL_ALTITUDE_M,
-            speed_sq0: params.launch_speed_mps.powi(2),
-        },
-        bineq_bounds: (),
-        path_bounds: Path {
-            altitude: Bounds1D {
-                lower: Some(0.0),
-                upper: None,
-            },
-            vx: Bounds1D {
-                lower: Some(0.0),
-                upper: None,
-            },
-            cl: Bounds1D {
-                lower: Some(CL_LOWER_BOUND),
-                upper: Some(CL_UPPER_BOUND),
-            },
-            alpha_rate: Bounds1D {
-                lower: Some(-deg_to_rad(params.max_alpha_rate_deg_s)),
-                upper: Some(deg_to_rad(params.max_alpha_rate_deg_s)),
-            },
-        },
-        tf_bounds: Bounds1D {
-            lower: Some(params.min_time_bound_s),
-            upper: Some(params.max_time_bound_s),
-        },
-        initial_guess: rollout_guess_dc(params),
-    }
-}
-pub fn solve(params: &Params) -> Result<SolveArtifact> {
-    match params.transcription.method {
-        TranscriptionMethod::MultipleShooting => {
-            let compiled = cached_multiple_shooting()?;
-            solve_cached_multiple_shooting_problem(
-                &compiled.compiled,
-                &ms_runtime::<DEFAULT_INTERVALS>(params),
-                params.solver_method,
-                &params.solver,
-                |trajectories, x_arcs, u_arcs| {
-                    artifact_from_ms_trajectories(params, trajectories, x_arcs, u_arcs)
-                },
-            )
-        }
-        TranscriptionMethod::DirectCollocation => {
-            let compiled = cached_direct_collocation(params.transcription.collocation_family)?;
-            solve_cached_direct_collocation_problem(
-                &compiled.compiled,
-                &dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(params),
-                params.solver_method,
-                &params.solver,
-                |trajectories, time_grid| {
-                    artifact_from_dc_trajectories(params, trajectories, time_grid)
-                },
-            )
-        }
-    }
-}
-pub fn solve_with_progress<F>(params: &Params, emit: F) -> Result<SolveArtifact>
-where
-    F: FnMut(SolveStreamEvent) + Send,
-{
-    match params.transcription.method {
-        TranscriptionMethod::MultipleShooting => {
-            let mut lifecycle =
-                crate::common::SolveLifecycleReporter::new(emit, params.solver_method);
-            let (compiled, running_solver, compile_report) =
-                lifecycle.compile_with_progress(compile_multiple_shooting_with_progress)?;
-            let mut artifact = solve_cached_multiple_shooting_problem_with_progress(
-                &compiled,
-                &ms_runtime::<DEFAULT_INTERVALS>(params),
-                params.solver_method,
-                &params.solver,
-                lifecycle.into_emit(),
-                running_solver,
-                |trajectories, x_arcs, u_arcs| {
-                    artifact_from_ms_trajectories(params, trajectories, x_arcs, u_arcs)
-                },
-            )?;
-            artifact.compile_report = compile_report;
-            Ok(artifact)
-        }
-        TranscriptionMethod::DirectCollocation => {
-            let mut lifecycle =
-                crate::common::SolveLifecycleReporter::new(emit, params.solver_method);
-            let (compiled, running_solver, compile_report) =
-                lifecycle.compile_with_progress(|callback| {
-                    compile_direct_collocation_with_progress(
-                        params.transcription.collocation_family,
-                        callback,
-                    )
-                })?;
-            let mut artifact = solve_cached_direct_collocation_problem_with_progress(
-                &compiled,
-                &dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(params),
-                params.solver_method,
-                &params.solver,
-                lifecycle.into_emit(),
-                running_solver,
-                |trajectories, time_grid| {
-                    artifact_from_dc_trajectories(params, trajectories, time_grid)
-                },
-            )?;
-            artifact.compile_report = compile_report;
-            Ok(artifact)
-        }
-    }
+    direct_collocation_runtime_from_spec(runtime_spec(params))
 }
 fn artifact_summary(
     params: &Params,
@@ -835,60 +814,23 @@ fn artifact_summary(
     ]);
     summary
 }
-fn artifact_from_ms_trajectories<const N: usize>(
+fn artifact_from_interval_data(
     params: &Params,
-    trajectories: &MultipleShootingTrajectories<State<f64>, Control<f64>, N>,
+    tf: f64,
+    distance: f64,
+    terminal_ld: f64,
+    peak_altitude: f64,
+    trim_cost: f64,
     x_arcs: &[IntervalArc<State<f64>>],
     u_arcs: &[IntervalArc<Control<f64>>],
+    alpha_rate_series: Vec<crate::common::TimeSeries>,
+    x: Vec<f64>,
+    y: Vec<f64>,
+    notes: Vec<String>,
 ) -> SolveArtifact {
-    let tf = trajectories.tf;
-    let times = node_times::<N>(tf);
-    let mut altitude = Vec::with_capacity(N + 1);
-    let mut vx = Vec::with_capacity(N + 1);
-    let mut vy = Vec::with_capacity(N + 1);
-    let mut alpha_rate = Vec::with_capacity(N + 1);
-    let mut ld_ratio = Vec::with_capacity(N + 1);
-    let mut x = Vec::with_capacity(N + 1);
-    let mut y = Vec::with_capacity(N + 1);
-    for index in 0..N {
-        let state = &trajectories.x.nodes[index];
-        let control = &trajectories.u.nodes[index];
-        let rate = &trajectories.dudt[index];
-        altitude.push(state.altitude);
-        vx.push(state.vx);
-        vy.push(state.vy);
-        alpha_rate.push(rad_to_deg(rate.alpha));
-        ld_ratio.push(glide_ratio_numeric(control.alpha));
-        x.push(state.x);
-        y.push(state.altitude);
-    }
-    let terminal = &trajectories.x.terminal;
-    let terminal_control = &trajectories.u.terminal;
-    altitude.push(terminal.altitude);
-    vx.push(terminal.vx);
-    vy.push(terminal.vy);
-    alpha_rate.push(*alpha_rate.last().unwrap_or(&0.0));
-    ld_ratio.push(glide_ratio_numeric(terminal_control.alpha));
-    x.push(terminal.x);
-    y.push(terminal.altitude);
-    let distance = *x.last().unwrap_or(&0.0);
-    let trim_cost = trapezoid_integral(
-        &times,
-        &alpha_rate
-            .iter()
-            .map(|value| value * value)
-            .collect::<Vec<_>>(),
-    );
     SolveArtifact::new(
         "Optimal Distance Glider",
-        artifact_summary(
-            params,
-            tf,
-            distance,
-            *ld_ratio.last().unwrap_or(&0.0),
-            altitude.iter().fold(f64::NEG_INFINITY, |acc, value| acc.max(*value)),
-            trim_cost,
-        ),
+        artifact_summary(params, tf, distance, terminal_ld, peak_altitude, trim_cost),
         SolverReport::placeholder(),
         vec![
             chart(
@@ -896,48 +838,38 @@ fn artifact_from_ms_trajectories<const N: usize>(
                 "Downrange x (m)",
                 interval_arc_series("x (m)", x_arcs, PlotMode::LinesMarkers, |state| state.x),
             ),
-            chart(
-                "Altitude",
-                "Altitude (m)",
-                {
-                    let mut series_out = interval_arc_series(
-                        "Altitude (m)",
-                        x_arcs,
-                        PlotMode::LinesMarkers,
-                        |state| state.altitude,
-                    );
-                    series_out.extend(interval_arc_bound_series(
-                        x_arcs,
-                        Some(0.0),
-                        None,
-                        PlotMode::Lines,
-                    ));
-                    series_out
-                },
-            ),
-            chart(
-                "Horizontal Velocity",
-                "v_x (m/s)",
-                {
-                    let mut series_out = interval_arc_series(
-                        "v_x (m/s)",
-                        x_arcs,
-                        PlotMode::LinesMarkers,
-                        |state| state.vx,
-                    );
-                    series_out.extend(interval_arc_bound_series(
-                        x_arcs,
-                        Some(0.0),
-                        None,
-                        PlotMode::Lines,
-                    ));
-                    series_out
-                },
-            ),
+            chart("Altitude", "Altitude (m)", {
+                let mut series_out =
+                    interval_arc_series("Altitude (m)", x_arcs, PlotMode::LinesMarkers, |state| {
+                        state.altitude
+                    });
+                series_out.extend(interval_arc_bound_series(
+                    x_arcs,
+                    Some(0.0),
+                    None,
+                    PlotMode::Lines,
+                ));
+                series_out
+            }),
+            chart("Horizontal Velocity", "v_x (m/s)", {
+                let mut series_out =
+                    interval_arc_series("v_x (m/s)", x_arcs, PlotMode::LinesMarkers, |state| {
+                        state.vx
+                    });
+                series_out.extend(interval_arc_bound_series(
+                    x_arcs,
+                    Some(0.0),
+                    None,
+                    PlotMode::Lines,
+                ));
+                series_out
+            }),
             chart(
                 "Vertical Velocity",
                 "v_y (m/s)",
-                interval_arc_series("v_y (m/s)", x_arcs, PlotMode::LinesMarkers, |state| state.vy),
+                interval_arc_series("v_y (m/s)", x_arcs, PlotMode::LinesMarkers, |state| {
+                    state.vy
+                }),
             ),
             chart(
                 "Velocity Norm",
@@ -949,61 +881,37 @@ fn artifact_from_ms_trajectories<const N: usize>(
             chart(
                 "Glide Slope",
                 "Glide Slope (deg)",
-                interval_arc_series("Glide Slope (deg)", x_arcs, PlotMode::LinesMarkers, |state| {
-                    glide_slope_deg(state.vx, state.vy)
-                }),
+                interval_arc_series(
+                    "Glide Slope (deg)",
+                    x_arcs,
+                    PlotMode::LinesMarkers,
+                    |state| glide_slope_deg(state.vx, state.vy),
+                ),
             ),
-            chart(
-                "Lift Coefficient",
-                "C_L (-)",
-                {
-                    let mut series_out = interval_arc_series(
-                        "C_L (-)",
-                        u_arcs,
-                        PlotMode::LinesMarkers,
-                        |control| cl_numeric(control.alpha),
-                    );
-                    series_out.extend(interval_arc_bound_series(
-                        u_arcs,
-                        Some(CL_LOWER_BOUND),
-                        Some(CL_UPPER_BOUND),
-                        PlotMode::Lines,
-                    ));
-                    series_out
-                },
-            ),
+            chart("Lift Coefficient", "C_L (-)", {
+                let mut series_out =
+                    interval_arc_series("C_L (-)", u_arcs, PlotMode::LinesMarkers, |control| {
+                        cl_numeric(control.alpha)
+                    });
+                series_out.extend(interval_arc_bound_series(
+                    u_arcs,
+                    Some(CL_LOWER_BOUND),
+                    Some(CL_UPPER_BOUND),
+                    PlotMode::Lines,
+                ));
+                series_out
+            }),
             chart(
                 "Angle of Attack",
                 "Angle of Attack (deg)",
-                interval_arc_series(
-                    "AoA (deg)",
-                    u_arcs,
-                    PlotMode::LinesMarkers,
-                    |control| rad_to_deg(control.alpha),
-                ),
+                interval_arc_series("AoA (deg)", u_arcs, PlotMode::LinesMarkers, |control| {
+                    rad_to_deg(control.alpha)
+                }),
             ),
             chart(
                 "Angle of Attack Rate",
                 "AoA Rate (deg/s)",
-                {
-                    let mut series_out = segmented_series(
-                        "AoA Rate (deg/s)",
-                        x_arcs.iter().enumerate().map(|(interval, arc)| {
-                            (
-                                arc.times.clone(),
-                                vec![rad_to_deg(trajectories.dudt[interval].alpha); arc.times.len()],
-                            )
-                        }),
-                        PlotMode::LinesMarkers,
-                    );
-                    series_out.extend(segmented_bound_series(
-                        x_arcs.iter().map(|arc| arc.times.clone()),
-                        Some(-params.max_alpha_rate_deg_s),
-                        Some(params.max_alpha_rate_deg_s),
-                        PlotMode::Lines,
-                    ));
-                    series_out
-                },
+                alpha_rate_series,
             ),
         ],
         Scene2D {
@@ -1019,6 +927,73 @@ fn artifact_from_ms_trajectories<const N: usize>(
             arrows: Vec::new(),
             animation: None,
         },
+        notes,
+    )
+}
+
+fn artifact_from_ms_trajectories<const N: usize>(
+    params: &Params,
+    trajectories: &MultipleShootingTrajectories<State<f64>, Control<f64>, N>,
+    x_arcs: &[IntervalArc<State<f64>>],
+    u_arcs: &[IntervalArc<Control<f64>>],
+) -> SolveArtifact {
+    let tf = trajectories.tf;
+    let times = node_times::<N>(tf);
+    let mut altitude = Vec::with_capacity(N + 1);
+    let mut alpha_rate = Vec::with_capacity(N + 1);
+    let mut x = Vec::with_capacity(N + 1);
+    let mut y = Vec::with_capacity(N + 1);
+    for index in 0..N {
+        let state = &trajectories.x.nodes[index];
+        let control = &trajectories.u.nodes[index];
+        let rate = &trajectories.dudt[index];
+        altitude.push(state.altitude);
+        alpha_rate.push(rad_to_deg(rate.alpha));
+        x.push(state.x);
+        y.push(state.altitude);
+        let _ = control;
+    }
+    let terminal = &trajectories.x.terminal;
+    let terminal_control = &trajectories.u.terminal;
+    altitude.push(terminal.altitude);
+    alpha_rate.push(*alpha_rate.last().unwrap_or(&0.0));
+    x.push(terminal.x);
+    y.push(terminal.altitude);
+    let trim_cost = trapezoid_integral(
+        &times,
+        &alpha_rate
+            .iter()
+            .map(|value| value * value)
+            .collect::<Vec<_>>(),
+    );
+    let mut alpha_rate_series = segmented_series(
+        "AoA Rate (deg/s)",
+        x_arcs.iter().enumerate().map(|(interval, arc)| {
+            (
+                arc.times.clone(),
+                vec![rad_to_deg(trajectories.dudt[interval].alpha); arc.times.len()],
+            )
+        }),
+        PlotMode::LinesMarkers,
+    );
+    alpha_rate_series.extend(segmented_bound_series(
+        x_arcs.iter().map(|arc| arc.times.clone()),
+        Some(-params.max_alpha_rate_deg_s),
+        Some(params.max_alpha_rate_deg_s),
+        PlotMode::Lines,
+    ));
+    artifact_from_interval_data(
+        params,
+        tf,
+        terminal.x,
+        glide_ratio_numeric(terminal_control.alpha),
+        altitude.iter().fold(f64::NEG_INFINITY, |acc, value| acc.max(*value)),
+        trim_cost,
+        x_arcs,
+        u_arcs,
+        alpha_rate_series,
+        x,
+        y,
         vec![
             "The particle model uses velocity states directly, with drag aligned opposite motion and lift using the orthogonal direction (-v_y, v_x)/V.".to_string(),
             "Lift and drag are computed from dynamic pressure using rho = 1.15 kg/m^3, S_ref = 4.0 m^2, and mass = 30.0 kg.".to_string(),
@@ -1027,6 +1002,7 @@ fn artifact_from_ms_trajectories<const N: usize>(
         ],
     )
 }
+
 fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
     params: &Params,
     trajectories: &DirectCollocationTrajectories<State<f64>, Control<f64>, N, K>,
@@ -1072,142 +1048,30 @@ fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
     } else {
         0.0
     };
-    SolveArtifact::new(
-        "Optimal Distance Glider",
-        artifact_summary(
-            params,
-            trajectories.tf,
-            trajectories.x.terminal.x,
-            glide_ratio_numeric(trajectories.u.terminal.alpha),
-            peak_altitude,
-            trim_cost,
-        ),
-        SolverReport::placeholder(),
-        vec![
-            chart(
-                "Downrange x",
-                "Downrange x (m)",
-                interval_arc_series("x (m)", &x_arcs, PlotMode::LinesMarkers, |state| state.x),
-            ),
-            chart(
-                "Altitude",
-                "Altitude (m)",
-                {
-                    let mut series_out = interval_arc_series(
-                        "Altitude (m)",
-                        &x_arcs,
-                        PlotMode::LinesMarkers,
-                        |state| state.altitude,
-                    );
-                    series_out.extend(interval_arc_bound_series(
-                        &x_arcs,
-                        Some(0.0),
-                        None,
-                        PlotMode::Lines,
-                    ));
-                    series_out
-                },
-            ),
-            chart(
-                "Horizontal Velocity",
-                "v_x (m/s)",
-                {
-                    let mut series_out = interval_arc_series(
-                        "v_x (m/s)",
-                        &x_arcs,
-                        PlotMode::LinesMarkers,
-                        |state| state.vx,
-                    );
-                    series_out.extend(interval_arc_bound_series(
-                        &x_arcs,
-                        Some(0.0),
-                        None,
-                        PlotMode::Lines,
-                    ));
-                    series_out
-                },
-            ),
-            chart(
-                "Vertical Velocity",
-                "v_y (m/s)",
-                interval_arc_series("v_y (m/s)", &x_arcs, PlotMode::LinesMarkers, |state| state.vy),
-            ),
-            chart(
-                "Velocity Norm",
-                "‖v‖ (m/s)",
-                interval_arc_series("‖v‖ (m/s)", &x_arcs, PlotMode::LinesMarkers, |state| {
-                    (state.vx * state.vx + state.vy * state.vy).sqrt()
-                }),
-            ),
-            chart(
-                "Glide Slope",
-                "Glide Slope (deg)",
-                interval_arc_series("Glide Slope (deg)", &x_arcs, PlotMode::LinesMarkers, |state| {
-                    glide_slope_deg(state.vx, state.vy)
-                }),
-            ),
-            chart(
-                "Lift Coefficient",
-                "C_L (-)",
-                {
-                    let mut series_out = interval_arc_series(
-                        "C_L (-)",
-                        &u_arcs,
-                        PlotMode::LinesMarkers,
-                        |control| cl_numeric(control.alpha),
-                    );
-                    series_out.extend(interval_arc_bound_series(
-                        &u_arcs,
-                        Some(CL_LOWER_BOUND),
-                        Some(CL_UPPER_BOUND),
-                        PlotMode::Lines,
-                    ));
-                    series_out
-                },
-            ),
-            chart(
-                "Angle of Attack",
-                "Angle of Attack (deg)",
-                interval_arc_series(
-                    "AoA (deg)",
-                    &u_arcs,
-                    PlotMode::LinesMarkers,
-                    |control| rad_to_deg(control.alpha),
-                ),
-            ),
-            chart(
-                "Angle of Attack Rate",
-                "AoA Rate (deg/s)",
-                {
-                    let mut series_out = interval_arc_series(
-                        "AoA Rate (deg/s)",
-                        &dudt_arcs,
-                        PlotMode::LinesMarkers,
-                        |rate| rad_to_deg(rate.alpha),
-                    );
-                    series_out.extend(interval_arc_bound_series(
-                        &dudt_arcs,
-                        Some(-params.max_alpha_rate_deg_s),
-                        Some(params.max_alpha_rate_deg_s),
-                        PlotMode::Lines,
-                    ));
-                    series_out
-                },
-            ),
-        ],
-        Scene2D {
-            title: "Glide Path".to_string(),
-            x_label: "Downrange x (m)".to_string(),
-            y_label: "Altitude (m)".to_string(),
-            paths: vec![ScenePath {
-                name: "Trajectory".to_string(),
-                x,
-                y,
-            }],
-            circles: Vec::new(),
-            arrows: Vec::new(),
-            animation: None,
-        },
+    let mut alpha_rate_series = interval_arc_series(
+        "AoA Rate (deg/s)",
+        &dudt_arcs,
+        PlotMode::LinesMarkers,
+        |rate| rad_to_deg(rate.alpha),
+    );
+    alpha_rate_series.extend(interval_arc_bound_series(
+        &dudt_arcs,
+        Some(-params.max_alpha_rate_deg_s),
+        Some(params.max_alpha_rate_deg_s),
+        PlotMode::Lines,
+    ));
+    artifact_from_interval_data(
+        params,
+        trajectories.tf,
+        trajectories.x.terminal.x,
+        glide_ratio_numeric(trajectories.u.terminal.alpha),
+        peak_altitude,
+        trim_cost,
+        &x_arcs,
+        &u_arcs,
+        alpha_rate_series,
+        x,
+        y,
         vec![
             "The particle model uses velocity states directly, with drag aligned opposite motion and lift using the orthogonal direction (-v_y, v_x)/V.".to_string(),
             "Lift and drag are computed from dynamic pressure using rho = 1.15 kg/m^3, S_ref = 4.0 m^2, and mass = 30.0 kg.".to_string(),
@@ -1220,6 +1084,7 @@ fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn glider_converges_to_a_reasonable_glide() {
         let artifact = solve(&Params {
@@ -1244,5 +1109,55 @@ mod tests {
                 .contains(&final_time),
             "free final time should stay within the configured bounds"
         );
+    }
+
+    #[test]
+    #[ignore = "manual profiling helper"]
+    fn profile_reduced_direct_collocation_symbolic_setup() {
+        let family = optimal_control::CollocationFamily::RadauIIA;
+        let ocp = model(optimal_control::DirectCollocation::<6, 2> { family });
+        for (label, symbolic_functions) in [
+            (
+                "inline_all",
+                optimal_control::OcpSymbolicFunctionOptions::inline_all(),
+            ),
+            (
+                "default",
+                optimal_control::OcpSymbolicFunctionOptions::default(),
+            ),
+            (
+                "function_inline_at_call",
+                optimal_control::OcpSymbolicFunctionOptions::function_all_with_call_policy(
+                    optimization::CallPolicy::InlineAtCall,
+                ),
+            ),
+        ] {
+            let started = std::time::Instant::now();
+            let mut symbolic_metadata = None;
+            let compiled = ocp
+                .compile_jit_with_ocp_options_and_progress_callback(
+                    optimal_control::OcpCompileOptions {
+                        function_options: optimization::FunctionCompileOptions::from(
+                            optimization::LlvmOptimizationLevel::O0,
+                        ),
+                        symbolic_functions,
+                    },
+                    |progress| {
+                        if let optimal_control::OcpCompileProgress::SymbolicReady(metadata) =
+                            progress
+                        {
+                            symbolic_metadata = Some(metadata);
+                        }
+                    },
+                )
+                .expect("compile should succeed");
+            println!(
+                "{label}: total={:?} symbolic_ready={:?} setup_profile={:?} stats={:?}",
+                started.elapsed(),
+                symbolic_metadata,
+                compiled.backend_compile_report().setup_profile,
+                compiled.backend_compile_report().stats,
+            );
+        }
     }
 }

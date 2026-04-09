@@ -18,10 +18,14 @@ ipopt = ["optimal_control/ipopt", "optimization/ipopt"]
 
 [dependencies]
 anyhow.workspace = true
+clap.workspace = true
+crossterm = "0.28"
 optimal_control = { path = "../optimal_control" }
 optimization = { path = "../optimization" }
+ratatui = "0.29"
 serde.workspace = true
 serde_json.workspace = true
+signal-hook = "0.3"
 sx_core = { path = "../sx_core" }
 
 [dev-dependencies]

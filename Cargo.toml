@@ -28,6 +28,7 @@ version = "0.1.0"
 [workspace.dependencies]
 anyhow = "1.0.97"
 approx = "0.5.1"
+clap = { version = "4.5.49", features = ["derive", "env"] }
 clarabel = "0.11.1"
 criterion = { version = "0.5.1", features = ["html_reports"] }
 llvm-sys = { version = "221.0.0", features = ["prefer-dynamic", "strict-versioning"] }

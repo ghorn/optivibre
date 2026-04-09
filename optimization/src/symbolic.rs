@@ -13,12 +13,14 @@ use crate::{
     BackendCompileReport, BackendTimingMetadata, CCS, ClarabelSqpError, ClarabelSqpOptions,
     ClarabelSqpSummary, CompiledNlpProblem, Index, InteriorPointIterationSnapshot,
     InteriorPointOptions, InteriorPointSolveError, InteriorPointSummary, NlpCompileStats,
-    NlpConstraintViolationReport, NlpEqualityViolation, NlpInequalitySource,
+    NlpConstraintViolationReport, NlpEqualityViolation, NlpEvaluationBenchmark,
+    NlpEvaluationBenchmarkOptions, NlpEvaluationKernelKind, NlpInequalitySource,
     NlpInequalityViolation, ParameterMatrix, SqpAdapterTiming, SymbolicCompileMetadata,
-    SymbolicSetupProfile, Vectorize, classify_constraint_satisfaction, constraint_bound_side,
-    flatten_value, solve_nlp_interior_point, solve_nlp_interior_point_with_callback,
-    solve_nlp_sqp, solve_nlp_sqp_with_callback, symbolic_column, symbolic_value,
-    worst_bound_violation,
+    SymbolicCompileProgress, SymbolicCompileStage, SymbolicCompileStageProgress,
+    SymbolicSetupProfile, Vectorize, benchmark_compiled_nlp_problem_with_progress,
+    classify_constraint_satisfaction, constraint_bound_side, flatten_value,
+    solve_nlp_interior_point, solve_nlp_interior_point_with_callback, solve_nlp_sqp,
+    solve_nlp_sqp_with_callback, symbolic_column, symbolic_value, worst_bound_violation,
 };
 #[cfg(feature = "ipopt")]
 use crate::{
@@ -270,14 +272,18 @@ where
 
     pub fn compile_jit_with_symbolic_callback<CB>(
         &self,
-        on_symbolic_ready: CB,
+        mut on_symbolic_ready: CB,
     ) -> Result<TypedCompiledJitNlp<X, P, E, I>, SymbolicNlpCompileError>
     where
         CB: FnMut(SymbolicCompileMetadata),
     {
-        self.compile_jit_with_options_and_symbolic_callback(
+        self.compile_jit_with_options_and_symbolic_progress_callback(
             FunctionCompileOptions::from(LlvmOptimizationLevel::O3),
-            on_symbolic_ready,
+            |progress| {
+                if let SymbolicCompileProgress::Ready(metadata) = progress {
+                    on_symbolic_ready(metadata);
+                }
+            },
         )
     }
 
@@ -300,36 +306,55 @@ where
         &self,
         options: FunctionCompileOptions,
     ) -> Result<TypedCompiledJitNlp<X, P, E, I>, SymbolicNlpCompileError> {
-        self.compile_jit_with_options_and_symbolic_callback(options, |_| {})
+        self.compile_jit_with_options_and_symbolic_progress_callback(options, |_| {})
     }
 
     pub fn compile_jit_with_opt_level_and_symbolic_callback<CB>(
         &self,
         opt_level: LlvmOptimizationLevel,
-        on_symbolic_ready: CB,
+        mut on_symbolic_ready: CB,
     ) -> Result<TypedCompiledJitNlp<X, P, E, I>, SymbolicNlpCompileError>
     where
         CB: FnMut(SymbolicCompileMetadata),
     {
-        self.compile_jit_with_options_and_symbolic_callback(
+        self.compile_jit_with_options_and_symbolic_progress_callback(
             FunctionCompileOptions::from(opt_level),
-            on_symbolic_ready,
+            |progress| {
+                if let SymbolicCompileProgress::Ready(metadata) = progress {
+                    on_symbolic_ready(metadata);
+                }
+            },
         )
     }
 
     pub fn compile_jit_with_options_and_symbolic_callback<CB>(
         &self,
         options: FunctionCompileOptions,
-        on_symbolic_ready: CB,
+        mut on_symbolic_ready: CB,
     ) -> Result<TypedCompiledJitNlp<X, P, E, I>, SymbolicNlpCompileError>
     where
         CB: FnMut(SymbolicCompileMetadata),
     {
+        self.compile_jit_with_options_and_symbolic_progress_callback(options, |progress| {
+            if let SymbolicCompileProgress::Ready(metadata) = progress {
+                on_symbolic_ready(metadata);
+            }
+        })
+    }
+
+    pub fn compile_jit_with_options_and_symbolic_progress_callback<CB>(
+        &self,
+        options: FunctionCompileOptions,
+        on_symbolic_progress: CB,
+    ) -> Result<TypedCompiledJitNlp<X, P, E, I>, SymbolicNlpCompileError>
+    where
+        CB: FnMut(SymbolicCompileProgress),
+    {
         Ok(TypedCompiledJitNlp {
-            inner: compile_symbolic_nlp_with_symbolic_callback(
+            inner: compile_symbolic_nlp_with_symbolic_progress_callback(
                 &self.symbolic,
                 options,
-                on_symbolic_ready,
+                on_symbolic_progress,
             )?,
             _marker: PhantomData,
         })
@@ -391,6 +416,7 @@ impl CompiledJitNlp {
             parameter_scalar_count: self.parameter_ccs.iter().map(CCS::nnz).sum(),
             equality_count: self.equality_count(),
             inequality_count: self.inequality_base_count(),
+            objective_gradient_nnz: self.dimension(),
             equality_jacobian_nnz: self.equality_jacobian_ccs().nnz(),
             inequality_jacobian_nnz: self.inequality_base_jacobian_ccs().nnz(),
             hessian_nnz: self.lagrangian_hessian_ccs().nnz(),
@@ -403,47 +429,48 @@ impl CompiledJitNlp {
     fn from_symbolic(
         symbolic: &SymbolicNlp,
         options: FunctionCompileOptions,
-        mut on_symbolic_ready: impl FnMut(SymbolicCompileMetadata),
+        mut on_symbolic_progress: impl FnMut(SymbolicCompileProgress),
     ) -> Result<Self, SymbolicNlpCompileError> {
         let derivative_started = Instant::now();
-        let functions = derive_symbolic_functions(symbolic)?;
+        let mut emit_symbolic_stage =
+            |stage: SymbolicCompileStage,
+             setup_profile: &SymbolicSetupProfile,
+             stats: NlpCompileStats| {
+                on_symbolic_progress(SymbolicCompileProgress::Stage(
+                    SymbolicCompileStageProgress {
+                        stage,
+                        metadata: SymbolicCompileMetadata {
+                            timing: BackendTimingMetadata {
+                                function_creation_time: symbolic.construction_time,
+                                derivative_generation_time: Some(derivative_started.elapsed()),
+                                jit_time: None,
+                            },
+                            setup_profile: setup_profile.clone(),
+                            stats,
+                        },
+                    },
+                ));
+            };
+        emit_symbolic_stage(
+            SymbolicCompileStage::BuildProblem,
+            &SymbolicSetupProfile {
+                symbolic_construction: symbolic.construction_time,
+                ..SymbolicSetupProfile::default()
+            },
+            symbolic_compile_stats(symbolic, 0, 0, 0, 0),
+        );
+        let functions = derive_symbolic_functions(symbolic, &mut emit_symbolic_stage)?;
         let derivative_generation_time = derivative_started.elapsed();
         let timing = BackendTimingMetadata {
             function_creation_time: symbolic.construction_time,
             derivative_generation_time: Some(derivative_generation_time),
             jit_time: None,
         };
-        on_symbolic_ready(SymbolicCompileMetadata {
+        on_symbolic_progress(SymbolicCompileProgress::Ready(SymbolicCompileMetadata {
             timing,
-            stats: NlpCompileStats {
-                variable_count: symbolic.variables.nnz(),
-                parameter_scalar_count: symbolic
-                    .parameters
-                    .iter()
-                    .map(|parameter| parameter.matrix().ccs().nnz())
-                    .sum(),
-                equality_count: functions
-                    .equality_jacobian_values
-                    .as_ref()
-                    .map_or(0, |function| function_output_ccs(function).nrow),
-                inequality_count: functions
-                    .inequality_jacobian_values
-                    .as_ref()
-                    .map_or(0, |function| function_output_ccs(function).nrow),
-                equality_jacobian_nnz: functions
-                    .equality_jacobian_values
-                    .as_ref()
-                    .map_or(0, |function| function_output_ccs(function).nnz()),
-                inequality_jacobian_nnz: functions
-                    .inequality_jacobian_values
-                    .as_ref()
-                    .map_or(0, |function| function_output_ccs(function).nnz()),
-                hessian_nnz: function_output_ccs(&functions.lagrangian_hessian_values).nnz(),
-                jit_kernel_count: 3
-                    + 2 * usize::from(functions.equality_values.is_some())
-                    + 2 * usize::from(functions.inequality_values.is_some()),
-            },
-        });
+            setup_profile: functions.setup_profile.clone(),
+            stats: derived_symbolic_compile_stats(symbolic, &functions),
+        }));
 
         let jit_started = Instant::now();
         let objective_value = JitKernel::compile_with_options(&functions.objective_value, options)?;
@@ -804,6 +831,85 @@ where
         })
     }
 
+    pub fn benchmark_evaluations(
+        &self,
+        x: &<X as Vectorize<SX>>::Rebind<f64>,
+        parameters: &<P as Vectorize<SX>>::Rebind<f64>,
+        options: NlpEvaluationBenchmarkOptions,
+    ) -> NlpEvaluationBenchmark {
+        self.benchmark_evaluations_with_progress(x, parameters, options, |_| {})
+    }
+
+    pub fn benchmark_evaluations_with_progress<CB>(
+        &self,
+        x: &<X as Vectorize<SX>>::Rebind<f64>,
+        parameters: &<P as Vectorize<SX>>::Rebind<f64>,
+        options: NlpEvaluationBenchmarkOptions,
+        on_progress: CB,
+    ) -> NlpEvaluationBenchmark
+    where
+        CB: FnMut(NlpEvaluationKernelKind),
+    {
+        let x_values = flatten_value(x);
+        let parameter_values = flatten_value(parameters);
+        let parameter_storage = if P::LEN == 0 {
+            Vec::new()
+        } else {
+            vec![ParameterMatrix {
+                ccs: self.inner.parameter_ccs(0),
+                values: &parameter_values,
+            }]
+        };
+        benchmark_compiled_nlp_problem_with_progress(
+            &self.inner,
+            &x_values,
+            &parameter_storage,
+            options,
+            on_progress,
+        )
+    }
+
+    pub fn benchmark_bounded_evaluations(
+        &self,
+        x: &<X as Vectorize<SX>>::Rebind<f64>,
+        parameters: &<P as Vectorize<SX>>::Rebind<f64>,
+        bounds: &TypedRuntimeNlpBounds<X, I>,
+        options: NlpEvaluationBenchmarkOptions,
+    ) -> Result<NlpEvaluationBenchmark, RuntimeNlpBoundsError> {
+        self.benchmark_bounded_evaluations_with_progress(x, parameters, bounds, options, |_| {})
+    }
+
+    pub fn benchmark_bounded_evaluations_with_progress<CB>(
+        &self,
+        x: &<X as Vectorize<SX>>::Rebind<f64>,
+        parameters: &<P as Vectorize<SX>>::Rebind<f64>,
+        bounds: &TypedRuntimeNlpBounds<X, I>,
+        options: NlpEvaluationBenchmarkOptions,
+        on_progress: CB,
+    ) -> Result<NlpEvaluationBenchmark, RuntimeNlpBoundsError>
+    where
+        CB: FnMut(NlpEvaluationKernelKind),
+    {
+        let bound_problem = self.bind_runtime_bounds(bounds)?;
+        let x_values = flatten_value(x);
+        let parameter_values = flatten_value(parameters);
+        let parameter_storage = if P::LEN == 0 {
+            Vec::new()
+        } else {
+            vec![ParameterMatrix {
+                ccs: self.inner.parameter_ccs(0),
+                values: &parameter_values,
+            }]
+        };
+        Ok(benchmark_compiled_nlp_problem_with_progress(
+            &bound_problem,
+            &x_values,
+            &parameter_storage,
+            options,
+            on_progress,
+        ))
+    }
+
     pub fn solve_sqp(
         &self,
         x0: &<X as Vectorize<SX>>::Rebind<f64>,
@@ -1114,12 +1220,12 @@ pub fn rank_nlp_constraint_violations(
     Ok(report)
 }
 
-fn compile_symbolic_nlp_with_symbolic_callback(
+fn compile_symbolic_nlp_with_symbolic_progress_callback(
     symbolic: &SymbolicNlp,
     options: FunctionCompileOptions,
-    on_symbolic_ready: impl FnMut(SymbolicCompileMetadata),
+    on_symbolic_progress: impl FnMut(SymbolicCompileProgress),
 ) -> Result<CompiledJitNlp, SymbolicNlpCompileError> {
-    CompiledJitNlp::from_symbolic(symbolic, options, on_symbolic_ready)
+    CompiledJitNlp::from_symbolic(symbolic, options, on_symbolic_progress)
 }
 
 fn add_duration(total: &mut Option<Duration>, elapsed: Duration) {
@@ -1128,10 +1234,15 @@ fn add_duration(total: &mut Option<Duration>, elapsed: Duration) {
 
 fn absorb_kernel_compile_report(report: &mut BackendCompileReport, kernel: &JitKernel) {
     let compile_report = kernel.function.compile_report();
-    add_duration(&mut report.setup_profile.lowering, compile_report.lowering_time);
+    add_duration(
+        &mut report.setup_profile.lowering,
+        compile_report.lowering_time,
+    );
     add_duration(&mut report.setup_profile.llvm_jit, compile_report.llvm_time);
     report.stats.absorb(&compile_report.stats);
-    report.warnings.extend(compile_report.warnings.iter().cloned());
+    report
+        .warnings
+        .extend(compile_report.warnings.iter().cloned());
 }
 
 impl RuntimeBoundedJitNlp<'_> {
@@ -1560,8 +1671,54 @@ struct DerivedSymbolicFunctions {
     lagrangian_hessian_values: SXFunction,
 }
 
+fn symbolic_compile_stats(
+    symbolic: &SymbolicNlp,
+    objective_gradient_nnz: usize,
+    equality_jacobian_nnz: usize,
+    inequality_jacobian_nnz: usize,
+    hessian_nnz: usize,
+) -> NlpCompileStats {
+    NlpCompileStats {
+        variable_count: symbolic.variables.nnz(),
+        parameter_scalar_count: symbolic
+            .parameters
+            .iter()
+            .map(|matrix| matrix.matrix().nnz())
+            .sum(),
+        equality_count: symbolic.equalities.as_ref().map_or(0, SXMatrix::nnz),
+        inequality_count: symbolic.inequalities.as_ref().map_or(0, SXMatrix::nnz),
+        objective_gradient_nnz,
+        equality_jacobian_nnz,
+        inequality_jacobian_nnz,
+        hessian_nnz,
+        jit_kernel_count: 3
+            + 2 * usize::from(symbolic.equalities.is_some())
+            + 2 * usize::from(symbolic.inequalities.is_some()),
+    }
+}
+
+fn derived_symbolic_compile_stats(
+    symbolic: &SymbolicNlp,
+    functions: &DerivedSymbolicFunctions,
+) -> NlpCompileStats {
+    symbolic_compile_stats(
+        symbolic,
+        function_output_ccs(&functions.objective_gradient).nnz(),
+        functions
+            .equality_jacobian_values
+            .as_ref()
+            .map_or(0, |function| function_output_ccs(function).nnz()),
+        functions
+            .inequality_jacobian_values
+            .as_ref()
+            .map_or(0, |function| function_output_ccs(function).nnz()),
+        function_output_ccs(&functions.lagrangian_hessian_values).nnz(),
+    )
+}
+
 fn derive_symbolic_functions(
     symbolic: &SymbolicNlp,
+    on_symbolic_stage: &mut dyn FnMut(SymbolicCompileStage, &SymbolicSetupProfile, NlpCompileStats),
 ) -> Result<DerivedSymbolicFunctions, SymbolicNlpCompileError> {
     let base_inputs = symbolic_inputs(&symbolic.variables, &symbolic.parameters)?;
     let mut setup_profile = SymbolicSetupProfile {
@@ -1581,6 +1738,17 @@ fn derive_symbolic_functions(
         base_inputs.clone(),
         vec![NamedMatrix::new("gradient", gradient)?],
     )?;
+    on_symbolic_stage(
+        SymbolicCompileStage::ObjectiveGradient,
+        &setup_profile,
+        symbolic_compile_stats(
+            symbolic,
+            objective_gradient.outputs()[0].matrix().nnz(),
+            0,
+            0,
+            0,
+        ),
+    );
 
     let equality_values = symbolic
         .equalities
@@ -1607,6 +1775,19 @@ fn derive_symbolic_functions(
             )
         })
         .transpose()?;
+    on_symbolic_stage(
+        SymbolicCompileStage::EqualityJacobian,
+        &setup_profile,
+        symbolic_compile_stats(
+            symbolic,
+            objective_gradient.outputs()[0].matrix().nnz(),
+            equality_jacobian_values
+                .as_ref()
+                .map_or(0, |function| function.outputs()[0].matrix().nnz()),
+            0,
+            0,
+        ),
+    );
     let inequality_values = symbolic
         .inequalities
         .as_ref()
@@ -1632,6 +1813,21 @@ fn derive_symbolic_functions(
             )
         })
         .transpose()?;
+    on_symbolic_stage(
+        SymbolicCompileStage::InequalityJacobian,
+        &setup_profile,
+        symbolic_compile_stats(
+            symbolic,
+            objective_gradient.outputs()[0].matrix().nnz(),
+            equality_jacobian_values
+                .as_ref()
+                .map_or(0, |function| function.outputs()[0].matrix().nnz()),
+            inequality_jacobian_values
+                .as_ref()
+                .map_or(0, |function| function.outputs()[0].matrix().nnz()),
+            0,
+        ),
+    );
 
     let mut hessian_inputs = base_inputs.clone();
     let lagrangian_started = Instant::now();
@@ -1656,6 +1852,21 @@ fn derive_symbolic_functions(
         hessian_inputs.push(NamedMatrix::new("lambda_inequalities", lambda)?);
     }
     setup_profile.lagrangian_assembly = Some(lagrangian_started.elapsed());
+    on_symbolic_stage(
+        SymbolicCompileStage::LagrangianAssembly,
+        &setup_profile,
+        symbolic_compile_stats(
+            symbolic,
+            objective_gradient.outputs()[0].matrix().nnz(),
+            equality_jacobian_values
+                .as_ref()
+                .map_or(0, |function| function.outputs()[0].matrix().nnz()),
+            inequality_jacobian_values
+                .as_ref()
+                .map_or(0, |function| function.outputs()[0].matrix().nnz()),
+            0,
+        ),
+    );
     let hessian_started = Instant::now();
     let lagrangian_hessian = SXMatrix::scalar(lagrangian).hessian(&symbolic.variables)?;
     setup_profile.hessian_generation = Some(hessian_started.elapsed());
@@ -1664,6 +1875,21 @@ fn derive_symbolic_functions(
         hessian_inputs,
         vec![NamedMatrix::new("lagrangian_hessian", lagrangian_hessian)?],
     )?;
+    on_symbolic_stage(
+        SymbolicCompileStage::HessianGeneration,
+        &setup_profile,
+        symbolic_compile_stats(
+            symbolic,
+            objective_gradient.outputs()[0].matrix().nnz(),
+            equality_jacobian_values
+                .as_ref()
+                .map_or(0, |function| function.outputs()[0].matrix().nnz()),
+            inequality_jacobian_values
+                .as_ref()
+                .map_or(0, |function| function.outputs()[0].matrix().nnz()),
+            lagrangian_hessian_values.outputs()[0].matrix().nnz(),
+        ),
+    );
 
     Ok(DerivedSymbolicFunctions {
         setup_profile,

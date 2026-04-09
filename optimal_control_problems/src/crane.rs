@@ -1,32 +1,26 @@
 use crate::common::{
-    CachedCompile, CompileCacheStatus, CompileProgressInfo, CompileProgressUpdate, FromMap,
-    LatexSection, MetricKey, OcpCompileProgressState, PlotMode, ProblemId, ProblemSpec, Scene2D,
-    SceneAnimation, SceneFrame, ScenePath, SolveArtifact, SolveStreamEvent, SolverMethod,
-    SolverReport, SqpConfig, TranscriptionConfig, TranscriptionMethod,
-    cached_compile_with_progress, chart, compile_progress_info, default_solver_method,
-    default_sqp_config, default_transcription, deg_to_rad,
-    direct_collocation_compile_key as dc_compile_key, expect_finite,
-    interactive_multiple_shooting_opt_level, interval_arc_bound_series, interval_arc_series,
-    metric_with_key, node_times, numeric_metric_with_key, ocp_compile_progress_update,
-    problem_controls, problem_scientific_slider_control, problem_slider_control, problem_spec,
-    rad_to_deg, sample_or_default, segmented_bound_series, segmented_series,
-    solve_cached_direct_collocation_problem, solve_cached_direct_collocation_problem_with_progress,
-    solve_cached_multiple_shooting_problem, solve_cached_multiple_shooting_problem_with_progress,
-    solver_config_from_map, solver_method_from_map, summarize_backend_compile_report,
-    transcription_from_map, transcription_metrics,
+    CompileCacheStatus, CompileProgressInfo, CompileProgressUpdate, ContinuousInitialGuess,
+    FromMap, LatexSection, MetricKey, OcpRuntimeSpec, OcpSxFunctionConfig, PlotMode, ProblemId,
+    ProblemSpec, Scene2D, SceneAnimation, SceneFrame, ScenePath, SolveArtifact, SolveStreamEvent,
+    SolverMethod, SolverReport, SqpConfig, StandardOcpParams, TranscriptionConfig, chart,
+    default_solver_method, default_sqp_config, default_transcription, deg_to_rad,
+    direct_collocation_runtime_from_spec, expect_finite, interval_arc_bound_series,
+    interval_arc_series, metric_with_key, multiple_shooting_runtime_from_spec, node_times,
+    numeric_metric_with_key, ocp_sx_function_config_from_map, problem_controls,
+    problem_scientific_slider_control, problem_slider_control, problem_spec, rad_to_deg,
+    sample_or_default, segmented_bound_series, segmented_series, solver_config_from_map,
+    solver_method_from_map, transcription_from_map, transcription_metrics,
 };
 use anyhow::Result;
 use optimal_control::{
     Bounds1D, CompiledDirectCollocationOcp, CompiledMultipleShootingOcp, DirectCollocation,
-    DirectCollocationInitialGuess, DirectCollocationRuntimeValues, DirectCollocationTimeGrid,
-    DirectCollocationTrajectories, InterpolatedTrajectory, IntervalArc, MultipleShooting,
-    MultipleShootingInitialGuess, MultipleShootingRuntimeValues, MultipleShootingTrajectories, Ocp,
-    direct_collocation_root_arcs, direct_collocation_state_like_arcs,
+    DirectCollocationRuntimeValues, DirectCollocationTimeGrid, DirectCollocationTrajectories,
+    InterpolatedTrajectory, IntervalArc, MultipleShooting, MultipleShootingRuntimeValues,
+    MultipleShootingTrajectories, Ocp, direct_collocation_root_arcs,
+    direct_collocation_state_like_arcs,
 };
 use serde::Serialize;
-use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::rc::Rc;
 use sx_core::SX;
 const DEFAULT_INTERVALS: usize = 30;
 const DEFAULT_COLLOCATION_DEGREE: usize = 3;
@@ -97,10 +91,17 @@ type DcCompiled<const N: usize, const K: usize> = CompiledDirectCollocationOcp<
     K,
 >;
 
-crate::standard_ocp_compile_caches!(
-    MULTIPLE_SHOOTING_CACHE: MsCompiled<DEFAULT_INTERVALS>,
-    DIRECT_COLLOCATION_CACHE: DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>
-);
+thread_local! {
+    static MULTIPLE_SHOOTING_CACHE: std::cell::RefCell<
+        crate::common::SharedCompileCache<crate::common::MultipleShootingCompileKey, MsCompiled<DEFAULT_INTERVALS>>
+    > = std::cell::RefCell::new(crate::common::SharedCompileCache::new());
+    static DIRECT_COLLOCATION_CACHE: std::cell::RefCell<
+        crate::common::SharedCompileCache<
+            crate::common::DirectCollocationCompileVariantKey,
+            DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+        >
+    > = std::cell::RefCell::new(crate::common::SharedCompileCache::new());
+}
 
 const PROBLEM_NAME: &str = "Crane Load Transfer";
 #[derive(Clone, Debug)]
@@ -115,6 +116,7 @@ pub struct Params {
     pub solver_method: SolverMethod,
     pub solver: SqpConfig,
     pub transcription: TranscriptionConfig,
+    pub sx_functions: OcpSxFunctionConfig,
 }
 impl Default for Params {
     fn default() -> Self {
@@ -129,7 +131,18 @@ impl Default for Params {
             solver_method: default_solver_method(),
             solver: default_sqp_config(),
             transcription: default_transcription(DEFAULT_INTERVALS),
+            sx_functions: OcpSxFunctionConfig::default(),
         }
+    }
+}
+
+impl StandardOcpParams for Params {
+    fn transcription(&self) -> &TranscriptionConfig {
+        &self.transcription
+    }
+
+    fn transcription_mut(&mut self) -> &mut TranscriptionConfig {
+        &mut self.transcription
     }
 }
 impl FromMap for Params {
@@ -177,6 +190,7 @@ impl FromMap for Params {
                 &SUPPORTED_INTERVALS,
                 &SUPPORTED_DEGREES,
             )?,
+            sx_functions: ocp_sx_function_config_from_map(values, defaults.sx_functions)?,
         })
     }
 }
@@ -304,142 +318,6 @@ pub fn spec() -> ProblemSpec {
     )
 }
 
-fn cached_multiple_shooting() -> Result<CachedCompile<MsCompiled<DEFAULT_INTERVALS>>> {
-    MULTIPLE_SHOOTING_CACHE.with(|cache| {
-        cache.borrow_mut().get_or_try_init(DEFAULT_INTERVALS, || {
-            Ok(model(MultipleShooting::<DEFAULT_INTERVALS, 2>)
-                .compile_jit_with_opt_level(interactive_multiple_shooting_opt_level())?)
-        })
-    })
-}
-
-fn cached_direct_collocation(
-    family: optimal_control::CollocationFamily,
-) -> Result<CachedCompile<DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>>> {
-    DIRECT_COLLOCATION_CACHE.with(|cache| {
-        cache
-            .borrow_mut()
-            .get_or_try_init(dc_compile_key(family), || {
-                Ok(model(
-                    DirectCollocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE> { family },
-                )
-                .compile_jit()?)
-            })
-    })
-}
-
-fn compile_multiple_shooting_with_progress(
-    callback: &mut dyn FnMut(CompileProgressUpdate),
-) -> Result<(
-    Rc<RefCell<MsCompiled<DEFAULT_INTERVALS>>>,
-    CompileProgressInfo,
-)> {
-    MULTIPLE_SHOOTING_CACHE.with(|cache| {
-        cached_compile_with_progress(
-            &mut cache.borrow_mut(),
-            DEFAULT_INTERVALS,
-            callback,
-            |on_compile_progress| {
-                let mut progress_state = OcpCompileProgressState::default();
-                Ok(model(MultipleShooting::<DEFAULT_INTERVALS, 2>)
-                    .compile_jit_with_opt_level_and_progress_callback(
-                        interactive_multiple_shooting_opt_level(),
-                        |progress| {
-                            on_compile_progress(ocp_compile_progress_update(
-                                progress,
-                                &mut progress_state,
-                            ));
-                        },
-                    )?)
-            },
-            |compiled| {
-                compile_progress_info(
-                    compiled.backend_timing_metadata(),
-                    compiled.nlp_compile_stats(),
-                    compiled.helper_kernel_count(),
-                    compiled.helper_compile_stats(),
-                    Some(summarize_backend_compile_report(compiled.backend_compile_report())),
-                )
-            },
-        )
-    })
-}
-
-fn compile_direct_collocation_with_progress(
-    family: optimal_control::CollocationFamily,
-    callback: &mut dyn FnMut(CompileProgressUpdate),
-) -> Result<(
-    Rc<RefCell<DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>>>,
-    CompileProgressInfo,
-)> {
-    DIRECT_COLLOCATION_CACHE.with(|cache| {
-        cached_compile_with_progress(
-            &mut cache.borrow_mut(),
-            dc_compile_key(family),
-            callback,
-            |on_compile_progress| {
-                let mut progress_state = OcpCompileProgressState::default();
-                Ok(model(
-                    DirectCollocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE> { family },
-                )
-                .compile_jit_with_progress_callback(|progress| {
-                    on_compile_progress(ocp_compile_progress_update(progress, &mut progress_state));
-                })?)
-            },
-            |compiled| {
-                compile_progress_info(
-                    compiled.backend_timing_metadata(),
-                    compiled.nlp_compile_stats(),
-                    compiled.helper_kernel_count(),
-                    compiled.helper_compile_stats(),
-                    Some(summarize_backend_compile_report(compiled.backend_compile_report())),
-                )
-            },
-        )
-    })
-}
-
-pub fn prewarm(params: &Params) -> Result<()> {
-    match params.transcription.method {
-        TranscriptionMethod::MultipleShooting => cached_multiple_shooting().map(|_| ()),
-        TranscriptionMethod::DirectCollocation => {
-            cached_direct_collocation(params.transcription.collocation_family).map(|_| ())
-        }
-    }
-}
-
-pub fn prewarm_with_progress<F>(params: &Params, emit: F) -> Result<()>
-where
-    F: FnMut(SolveStreamEvent) + Send,
-{
-    match params.transcription.method {
-        TranscriptionMethod::MultipleShooting => {
-            let mut lifecycle =
-                crate::common::SolveLifecycleReporter::new(emit, params.solver_method);
-            lifecycle.prewarm_with_progress(compile_multiple_shooting_with_progress)
-        }
-        TranscriptionMethod::DirectCollocation => {
-            let mut lifecycle =
-                crate::common::SolveLifecycleReporter::new(emit, params.solver_method);
-            lifecycle.prewarm_with_progress(|callback| {
-                compile_direct_collocation_with_progress(
-                    params.transcription.collocation_family,
-                    callback,
-                )
-            })
-        }
-    }
-}
-
-pub fn compile_cache_statuses() -> Vec<CompileCacheStatus> {
-    crate::standard_ocp_compile_cache_statuses!(
-        ProblemId::CraneTransfer,
-        PROBLEM_NAME,
-        MULTIPLE_SHOOTING_CACHE,
-        DIRECT_COLLOCATION_CACHE
-    )
-}
-
 fn model<Scheme>(
     scheme: Scheme,
 ) -> Ocp<State<SX>, Control<SX>, ModelParams<SX>, Path<SX>, Boundary<SX>, (), Scheme> {
@@ -515,6 +393,232 @@ fn model<Scheme>(
         .build()
         .expect("crane model should build")
 }
+
+fn cached_multiple_shooting(
+    params: &Params,
+) -> Result<crate::common::CachedCompile<MsCompiled<DEFAULT_INTERVALS>>> {
+    MULTIPLE_SHOOTING_CACHE.with(|cache| {
+        crate::common::cached_multiple_shooting_ocp_compile(
+            &mut cache.borrow_mut(),
+            DEFAULT_INTERVALS,
+            params.sx_functions,
+            |options| {
+                model(MultipleShooting::<DEFAULT_INTERVALS, 2>)
+                    .compile_jit_with_ocp_options(options)
+            },
+        )
+    })
+}
+
+fn cached_direct_collocation(
+    params: &Params,
+    family: optimal_control::CollocationFamily,
+) -> Result<crate::common::CachedCompile<DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>>>
+{
+    DIRECT_COLLOCATION_CACHE.with(|cache| {
+        crate::common::cached_direct_collocation_ocp_compile(
+            &mut cache.borrow_mut(),
+            family,
+            params.sx_functions,
+            |options| {
+                model(DirectCollocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE> { family })
+                    .compile_jit_with_ocp_options(options)
+            },
+        )
+    })
+}
+
+fn compile_multiple_shooting_with_progress(
+    params: &Params,
+    callback: &mut dyn FnMut(CompileProgressUpdate),
+) -> Result<(
+    std::rc::Rc<std::cell::RefCell<MsCompiled<DEFAULT_INTERVALS>>>,
+    CompileProgressInfo,
+)> {
+    MULTIPLE_SHOOTING_CACHE.with(|cache| {
+        crate::common::cached_multiple_shooting_ocp_compile_with_progress(
+            &mut cache.borrow_mut(),
+            DEFAULT_INTERVALS,
+            params.sx_functions,
+            callback,
+            |options, on_progress| {
+                model(MultipleShooting::<DEFAULT_INTERVALS, 2>)
+                    .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
+            },
+            crate::common::compile_progress_info_from_compiled,
+        )
+    })
+}
+
+fn compile_direct_collocation_with_progress(
+    params: &Params,
+    family: optimal_control::CollocationFamily,
+    callback: &mut dyn FnMut(CompileProgressUpdate),
+) -> Result<(
+    std::rc::Rc<std::cell::RefCell<DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>>>,
+    CompileProgressInfo,
+)> {
+    DIRECT_COLLOCATION_CACHE.with(|cache| {
+        crate::common::cached_direct_collocation_ocp_compile_with_progress(
+            &mut cache.borrow_mut(),
+            family,
+            params.sx_functions,
+            callback,
+            |options, on_progress| {
+                model(DirectCollocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE> { family })
+                    .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
+            },
+            crate::common::compile_progress_info_from_compiled,
+        )
+    })
+}
+
+pub fn prewarm(params: &Params) -> Result<()> {
+    crate::common::prewarm_standard_ocp(
+        params,
+        params.transcription.method,
+        params.transcription.collocation_family,
+        cached_multiple_shooting,
+        cached_direct_collocation,
+    )
+}
+
+pub fn prewarm_with_progress<F>(params: &Params, emit: F) -> Result<()>
+where
+    F: FnMut(SolveStreamEvent) + Send,
+{
+    crate::common::prewarm_standard_ocp_with_progress(
+        params,
+        params.transcription.method,
+        params.transcription.collocation_family,
+        params.solver_method,
+        emit,
+        compile_multiple_shooting_with_progress,
+        compile_direct_collocation_with_progress,
+    )
+}
+
+pub fn compile_cache_statuses() -> Vec<CompileCacheStatus> {
+    MULTIPLE_SHOOTING_CACHE.with(|cache| {
+        DIRECT_COLLOCATION_CACHE.with(|dc_cache| {
+            crate::common::standard_ocp_compile_cache_statuses(
+                ProblemId::CraneTransfer,
+                PROBLEM_NAME,
+                &cache.borrow(),
+                &dc_cache.borrow(),
+            )
+        })
+    })
+}
+
+pub(crate) fn benchmark_default_case_with_progress(
+    transcription: crate::common::TranscriptionMethod,
+    preset: crate::benchmark_report::OcpBenchmarkPreset,
+    eval_options: optimization::NlpEvaluationBenchmarkOptions,
+    on_progress: &mut dyn FnMut(crate::benchmark_report::BenchmarkCaseProgress),
+) -> Result<crate::benchmark_report::OcpBenchmarkRecord> {
+    crate::common::benchmark_standard_ocp_case_with_progress(
+        ProblemId::CraneTransfer,
+        PROBLEM_NAME,
+        transcription,
+        preset,
+        eval_options,
+        on_progress,
+        |options, on_progress| {
+            model(MultipleShooting::<DEFAULT_INTERVALS, 2>)
+                .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
+        },
+        |family, options, on_progress| {
+            model(DirectCollocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE> { family })
+                .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
+        },
+        ms_runtime::<DEFAULT_INTERVALS>,
+        dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+    )
+}
+
+pub fn solve(params: &Params) -> Result<SolveArtifact> {
+    crate::common::solve_standard_ocp(
+        params,
+        params.transcription.method,
+        params.transcription.collocation_family,
+        params.solver_method,
+        &params.solver,
+        cached_multiple_shooting,
+        cached_direct_collocation,
+        ms_runtime::<DEFAULT_INTERVALS>,
+        dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+        |trajectories, x_arcs, u_arcs| {
+            artifact_from_ms_trajectories(params, trajectories, x_arcs, u_arcs)
+        },
+        |trajectories, time_grid| artifact_from_dc_trajectories(params, trajectories, time_grid),
+    )
+}
+
+pub fn solve_with_progress<F>(params: &Params, emit: F) -> Result<SolveArtifact>
+where
+    F: FnMut(SolveStreamEvent) + Send,
+{
+    crate::common::solve_standard_ocp_with_progress(
+        params,
+        params.transcription.method,
+        params.transcription.collocation_family,
+        params.solver_method,
+        &params.solver,
+        emit,
+        compile_multiple_shooting_with_progress,
+        compile_direct_collocation_with_progress,
+        ms_runtime::<DEFAULT_INTERVALS>,
+        dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+        |trajectories, x_arcs, u_arcs| {
+            artifact_from_ms_trajectories(params, trajectories, x_arcs, u_arcs)
+        },
+        |trajectories, time_grid| artifact_from_dc_trajectories(params, trajectories, time_grid),
+    )
+}
+
+pub(crate) fn solve_from_map(
+    values: &std::collections::BTreeMap<String, f64>,
+) -> Result<SolveArtifact> {
+    crate::common::solve_from_value_map::<Params, _>(values, solve)
+}
+
+pub(crate) fn prewarm_from_map(values: &std::collections::BTreeMap<String, f64>) -> Result<()> {
+    crate::common::prewarm_from_value_map::<Params, _>(values, prewarm)
+}
+
+pub(crate) fn solve_with_progress_boxed(
+    values: &std::collections::BTreeMap<String, f64>,
+    emit: Box<dyn FnMut(SolveStreamEvent) + Send>,
+) -> Result<SolveArtifact> {
+    crate::common::solve_with_progress_from_value_map::<Params, _>(values, emit, |params, emit| {
+        solve_with_progress(params, emit)
+    })
+}
+
+pub(crate) fn prewarm_with_progress_boxed(
+    values: &std::collections::BTreeMap<String, f64>,
+    emit: Box<dyn FnMut(SolveStreamEvent) + Send>,
+) -> Result<()> {
+    crate::common::prewarm_with_progress_from_value_map::<Params, _>(
+        values,
+        emit,
+        |params, emit| prewarm_with_progress(params, emit),
+    )
+}
+
+pub(crate) fn problem_entry() -> crate::ProblemEntry {
+    crate::ProblemEntry {
+        id: ProblemId::CraneTransfer,
+        spec,
+        solve_from_map,
+        prewarm_from_map,
+        solve_with_progress_boxed,
+        prewarm_with_progress_boxed,
+        compile_cache_statuses,
+        benchmark_default_case_with_progress,
+    }
+}
 fn smoothstep(s: f64) -> f64 {
     let clipped = s.clamp(0.0, 1.0);
     clipped * clipped * (3.0 - 2.0 * clipped)
@@ -555,8 +659,10 @@ fn finite_difference(values: &[f64], dt: f64) -> Vec<f64> {
         })
         .collect()
 }
-fn guess<const N: usize>(params: &Params) -> InterpolatedTrajectory<State<f64>, Control<f64>> {
-    let sample_count = 2 * N + 1;
+fn continuous_guess(
+    params: &Params,
+) -> ContinuousInitialGuess<State<f64>, Control<f64>, ModelParams<f64>> {
+    let sample_count = 2 * params.transcription.intervals + 1;
     let dt = params.tf_s / (sample_count as f64 - 1.0);
     let times = (0..sample_count)
         .map(|index| index as f64 * dt)
@@ -573,7 +679,7 @@ fn guess<const N: usize>(params: &Params) -> InterpolatedTrajectory<State<f64>, 
         .map(|(accel, v)| CART_MASS_KG * accel + CART_FRICTION_NSPM * v)
         .collect::<Vec<_>>();
     let force_rate = finite_difference(&force, dt);
-    InterpolatedTrajectory {
+    ContinuousInitialGuess::Interpolated(InterpolatedTrajectory {
         sample_times: times,
         x_samples: x
             .iter()
@@ -594,7 +700,7 @@ fn guess<const N: usize>(params: &Params) -> InterpolatedTrajectory<State<f64>, 
             .map(|force_rate| Control { force: *force_rate })
             .collect(),
         tf: params.tf_s,
-    }
+    })
 }
 fn load_position(state: &State<f64>, rope_length: f64) -> (f64, f64) {
     (
@@ -619,37 +725,10 @@ fn frame_for_state(state: &State<f64>, rope_length: f64) -> SceneFrame {
         ],
     }
 }
-pub fn solve(params: &Params) -> Result<SolveArtifact> {
-    match params.transcription.method {
-        TranscriptionMethod::MultipleShooting => solve_multiple_shooting(params),
-        TranscriptionMethod::DirectCollocation => solve_direct_collocation(params),
-    }
-}
-pub fn solve_with_progress<F>(params: &Params, emit: F) -> Result<SolveArtifact>
-where
-    F: FnMut(SolveStreamEvent) + Send,
-{
-    match params.transcription.method {
-        TranscriptionMethod::MultipleShooting => {
-            solve_multiple_shooting_with_progress(params, emit)
-        }
-        TranscriptionMethod::DirectCollocation => {
-            solve_direct_collocation_with_progress(params, emit)
-        }
-    }
-}
-fn ms_runtime<const N: usize>(
+fn runtime_spec(
     params: &Params,
-) -> MultipleShootingRuntimeValues<
-    ModelParams<f64>,
-    Path<Bounds1D>,
-    Boundary<f64>,
-    (),
-    State<f64>,
-    Control<f64>,
-    N,
-> {
-    MultipleShootingRuntimeValues {
+) -> OcpRuntimeSpec<ModelParams<f64>, Path<Bounds1D>, Boundary<f64>, (), State<f64>, Control<f64>> {
+    OcpRuntimeSpec {
         parameters: ModelParams {
             rope_length: params.rope_length_m,
             force_rate_weight: params.force_rate_regularization,
@@ -689,8 +768,22 @@ fn ms_runtime<const N: usize>(
             lower: Some(params.tf_s),
             upper: Some(params.tf_s),
         },
-        initial_guess: MultipleShootingInitialGuess::Interpolated(guess::<N>(params)),
+        initial_guess: continuous_guess(params),
     }
+}
+
+fn ms_runtime<const N: usize>(
+    params: &Params,
+) -> MultipleShootingRuntimeValues<
+    ModelParams<f64>,
+    Path<Bounds1D>,
+    Boundary<f64>,
+    (),
+    State<f64>,
+    Control<f64>,
+    N,
+> {
+    multiple_shooting_runtime_from_spec(runtime_spec(params))
 }
 fn dc_runtime<const N: usize, const K: usize>(
     params: &Params,
@@ -704,111 +797,7 @@ fn dc_runtime<const N: usize, const K: usize>(
     N,
     K,
 > {
-    DirectCollocationRuntimeValues {
-        parameters: ModelParams {
-            rope_length: params.rope_length_m,
-            force_rate_weight: params.force_rate_regularization,
-        },
-        beq: Boundary {
-            x0: 0.0,
-            v0: 0.0,
-            theta0: 0.0,
-            omega0: 0.0,
-            force0: 0.0,
-            x_t: params.target_x_m,
-            v_t: 0.0,
-            theta_t: 0.0,
-            omega_t: 0.0,
-            force_t: 0.0,
-        },
-        bineq_bounds: (),
-        path_bounds: Path {
-            x: Bounds1D {
-                lower: Some(0.0),
-                upper: Some(params.target_x_m),
-            },
-            theta: Bounds1D {
-                lower: Some(-deg_to_rad(params.swing_limit_deg)),
-                upper: Some(deg_to_rad(params.swing_limit_deg)),
-            },
-            force: Bounds1D {
-                lower: Some(-params.force_limit_n),
-                upper: Some(params.force_limit_n),
-            },
-            force_rate: Bounds1D {
-                lower: Some(-params.force_rate_limit_nps),
-                upper: Some(params.force_rate_limit_nps),
-            },
-        },
-        tf_bounds: Bounds1D {
-            lower: Some(params.tf_s),
-            upper: Some(params.tf_s),
-        },
-        initial_guess: DirectCollocationInitialGuess::Interpolated(guess::<N>(params)),
-    }
-}
-fn solve_multiple_shooting(params: &Params) -> Result<SolveArtifact> {
-    let compiled = cached_multiple_shooting()?;
-    solve_cached_multiple_shooting_problem(
-        &compiled.compiled,
-        &ms_runtime::<DEFAULT_INTERVALS>(params),
-        params.solver_method,
-        &params.solver,
-        |trajectories, x_arcs, u_arcs| {
-            artifact_from_ms_trajectories(params, trajectories, x_arcs, u_arcs)
-        },
-    )
-}
-fn solve_direct_collocation(params: &Params) -> Result<SolveArtifact> {
-    let compiled = cached_direct_collocation(params.transcription.collocation_family)?;
-    solve_cached_direct_collocation_problem(
-        &compiled.compiled,
-        &dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(params),
-        params.solver_method,
-        &params.solver,
-        |trajectories, time_grid| artifact_from_dc_trajectories(params, trajectories, time_grid),
-    )
-}
-fn solve_multiple_shooting_with_progress<F>(params: &Params, emit: F) -> Result<SolveArtifact>
-where
-    F: FnMut(SolveStreamEvent) + Send,
-{
-    let mut lifecycle = crate::common::SolveLifecycleReporter::new(emit, params.solver_method);
-    let (compiled, running_solver, compile_report) =
-        lifecycle.compile_with_progress(compile_multiple_shooting_with_progress)?;
-    let mut artifact = solve_cached_multiple_shooting_problem_with_progress(
-        &compiled,
-        &ms_runtime::<DEFAULT_INTERVALS>(params),
-        params.solver_method,
-        &params.solver,
-        lifecycle.into_emit(),
-        running_solver,
-        |trajectories, x_arcs, u_arcs| {
-            artifact_from_ms_trajectories(params, trajectories, x_arcs, u_arcs)
-        },
-    )?;
-    artifact.compile_report = compile_report;
-    Ok(artifact)
-}
-fn solve_direct_collocation_with_progress<F>(params: &Params, emit: F) -> Result<SolveArtifact>
-where
-    F: FnMut(SolveStreamEvent) + Send,
-{
-    let mut lifecycle = crate::common::SolveLifecycleReporter::new(emit, params.solver_method);
-    let (compiled, running_solver, compile_report) = lifecycle.compile_with_progress(|callback| {
-        compile_direct_collocation_with_progress(params.transcription.collocation_family, callback)
-    })?;
-    let mut artifact = solve_cached_direct_collocation_problem_with_progress(
-        &compiled,
-        &dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(params),
-        params.solver_method,
-        &params.solver,
-        lifecycle.into_emit(),
-        running_solver,
-        |trajectories, time_grid| artifact_from_dc_trajectories(params, trajectories, time_grid),
-    )?;
-    artifact.compile_report = compile_report;
-    Ok(artifact)
+    direct_collocation_runtime_from_spec(runtime_spec(params))
 }
 fn artifact_summary(
     params: &Params,
@@ -853,21 +842,124 @@ fn artifact_summary(
     ]);
     summary
 }
+fn artifact_from_interval_data(
+    params: &Params,
+    final_x: f64,
+    max_swing: f64,
+    max_force: f64,
+    max_force_rate: f64,
+    tf: f64,
+    animation_times: Vec<f64>,
+    frames: Vec<SceneFrame>,
+    trolley_x: Vec<f64>,
+    load_path_x: Vec<f64>,
+    load_path_y: Vec<f64>,
+    x_arcs: &[IntervalArc<State<f64>>],
+    u_arcs: &[IntervalArc<Control<f64>>],
+    force_rate_series: Vec<crate::common::TimeSeries>,
+    notes: Vec<String>,
+) -> SolveArtifact {
+    SolveArtifact::new(
+        "Crane Load Transfer",
+        artifact_summary(params, final_x, max_swing, max_force, max_force_rate, tf),
+        SolverReport::placeholder(),
+        vec![
+            chart("Trolley Position", "x (m)", {
+                let mut series_out =
+                    interval_arc_series("Trolley x (m)", x_arcs, PlotMode::LinesMarkers, |state| {
+                        state.x
+                    });
+                series_out.extend(interval_arc_bound_series(
+                    x_arcs,
+                    Some(0.0),
+                    Some(params.target_x_m),
+                    PlotMode::Lines,
+                ));
+                series_out
+            }),
+            chart(
+                "Trolley Velocity",
+                "v (m/s)",
+                interval_arc_series("Trolley v (m/s)", x_arcs, PlotMode::LinesMarkers, |state| {
+                    state.v
+                }),
+            ),
+            chart("Swing Angle", "theta (deg)", {
+                let mut series_out =
+                    interval_arc_series("Swing (deg)", x_arcs, PlotMode::LinesMarkers, |state| {
+                        rad_to_deg(state.theta)
+                    });
+                series_out.extend(interval_arc_bound_series(
+                    x_arcs,
+                    Some(-params.swing_limit_deg),
+                    Some(params.swing_limit_deg),
+                    PlotMode::Lines,
+                ));
+                series_out
+            }),
+            chart(
+                "Swing Rate",
+                "omega (deg/s)",
+                interval_arc_series(
+                    "Swing Rate (deg/s)",
+                    x_arcs,
+                    PlotMode::LinesMarkers,
+                    |state| rad_to_deg(state.omega),
+                ),
+            ),
+            chart("Cart Force", "Force (N)", {
+                let mut series_out =
+                    interval_arc_series("Force (N)", u_arcs, PlotMode::LinesMarkers, |control| {
+                        control.force
+                    });
+                series_out.extend(interval_arc_bound_series(
+                    u_arcs,
+                    Some(-params.force_limit_n),
+                    Some(params.force_limit_n),
+                    PlotMode::Lines,
+                ));
+                series_out
+            }),
+            chart("Force Rate", "Force Rate (N/s)", force_rate_series),
+        ],
+        Scene2D {
+            title: "Crane Geometry".to_string(),
+            x_label: "x (m)".to_string(),
+            y_label: "height (m)".to_string(),
+            paths: vec![
+                ScenePath {
+                    name: "Trolley".to_string(),
+                    x: trolley_x,
+                    y: vec![0.0; animation_times.len()],
+                },
+                ScenePath {
+                    name: "Load".to_string(),
+                    x: load_path_x,
+                    y: load_path_y,
+                },
+            ],
+            circles: Vec::new(),
+            arrows: Vec::new(),
+            animation: Some(SceneAnimation {
+                times: animation_times,
+                frames,
+            }),
+        },
+        notes,
+    )
+}
+
 fn artifact_from_ms_trajectories<const N: usize>(
     params: &Params,
     trajectories: &MultipleShootingTrajectories<State<f64>, Control<f64>, N>,
     x_arcs: &[IntervalArc<State<f64>>],
     u_arcs: &[IntervalArc<Control<f64>>],
 ) -> SolveArtifact {
-    let node_times = node_times::<N>(trajectories.tf);
+    let animation_times = node_times::<N>(trajectories.tf);
     let mut trolley_x = Vec::with_capacity(N + 1);
-    let mut trolley_v = Vec::with_capacity(N + 1);
     let mut swing_deg = Vec::with_capacity(N + 1);
-    let mut swing_rate_deg = Vec::with_capacity(N + 1);
     let mut force = Vec::with_capacity(N + 1);
     let mut force_rate = Vec::with_capacity(N + 1);
-    let mut load_x = Vec::with_capacity(N + 1);
-    let mut load_y = Vec::with_capacity(N + 1);
     let mut load_path_x = Vec::with_capacity(N + 1);
     let mut load_path_y = Vec::with_capacity(N + 1);
     let mut frames = Vec::with_capacity(N + 1);
@@ -877,27 +969,20 @@ fn artifact_from_ms_trajectories<const N: usize>(
         let rate = &trajectories.dudt[index];
         let (load_px, load_py) = load_position(state, params.rope_length_m);
         trolley_x.push(state.x);
-        trolley_v.push(state.v);
         swing_deg.push(rad_to_deg(state.theta));
-        swing_rate_deg.push(rad_to_deg(state.omega));
         force.push(control.force);
         force_rate.push(rate.force);
-        load_x.push(load_px);
-        load_y.push(load_py);
         load_path_x.push(load_px);
         load_path_y.push(load_py);
         frames.push(frame_for_state(state, params.rope_length_m));
     }
     let terminal = &trajectories.x.terminal;
+    let terminal_force = trajectories.u.terminal.force;
     let (load_px, load_py) = load_position(terminal, params.rope_length_m);
     trolley_x.push(terminal.x);
-    trolley_v.push(terminal.v);
     swing_deg.push(rad_to_deg(terminal.theta));
-    swing_rate_deg.push(rad_to_deg(terminal.omega));
-    force.push(trajectories.u.terminal.force);
+    force.push(terminal_force);
     force_rate.push(*force_rate.last().unwrap_or(&0.0));
-    load_x.push(load_px);
-    load_y.push(load_py);
     load_path_x.push(load_px);
     load_path_y.push(load_py);
     frames.push(frame_for_state(terminal, params.rope_length_m));
@@ -910,149 +995,50 @@ fn artifact_from_ms_trajectories<const N: usize>(
     let max_force_rate = force_rate
         .iter()
         .fold(0.0_f64, |acc, value| acc.max(value.abs()));
-    SolveArtifact::new(
-        "Crane Load Transfer",
-        artifact_summary(
-            params,
-            terminal.x,
-            max_swing,
-            max_force,
-            max_force_rate,
-            trajectories.tf,
-        ),
-        SolverReport::placeholder(),
-        vec![
-            chart(
-                "Trolley Position",
-                "x (m)",
-                {
-                    let mut series_out = interval_arc_series(
-                        "Trolley x (m)",
-                        x_arcs,
-                        PlotMode::LinesMarkers,
-                        |state| state.x,
-                    );
-                    series_out.extend(interval_arc_bound_series(
-                        x_arcs,
-                        Some(0.0),
-                        Some(params.target_x_m),
-                        PlotMode::Lines,
-                    ));
-                    series_out
-                },
-            ),
-            chart(
-                "Trolley Velocity",
-                "v (m/s)",
-                interval_arc_series("Trolley v (m/s)", x_arcs, PlotMode::LinesMarkers, |state| state.v),
-            ),
-            chart(
-                "Swing Angle",
-                "theta (deg)",
-                {
-                    let mut series_out = interval_arc_series(
-                        "Swing (deg)",
-                        x_arcs,
-                        PlotMode::LinesMarkers,
-                        |state| rad_to_deg(state.theta),
-                    );
-                    series_out.extend(interval_arc_bound_series(
-                        x_arcs,
-                        Some(-params.swing_limit_deg),
-                        Some(params.swing_limit_deg),
-                        PlotMode::Lines,
-                    ));
-                    series_out
-                },
-            ),
-            chart(
-                "Swing Rate",
-                "omega (deg/s)",
-                interval_arc_series(
-                    "Swing Rate (deg/s)",
-                    x_arcs,
-                    PlotMode::LinesMarkers,
-                    |state| rad_to_deg(state.omega),
-                ),
-            ),
-            chart(
-                "Cart Force",
-                "Force (N)",
-                {
-                    let mut series_out = interval_arc_series(
-                        "Force (N)",
-                        u_arcs,
-                        PlotMode::LinesMarkers,
-                        |control| control.force,
-                    );
-                    series_out.extend(interval_arc_bound_series(
-                        u_arcs,
-                        Some(-params.force_limit_n),
-                        Some(params.force_limit_n),
-                        PlotMode::Lines,
-                    ));
-                    series_out
-                },
-            ),
-            chart(
-                "Force Rate",
-                "Force Rate (N/s)",
-                {
-                    let mut series_out = segmented_series(
-                        "Force Rate (N/s)",
-                        x_arcs.iter().enumerate().map(|(interval, arc)| {
-                            (
-                                arc.times.clone(),
-                                vec![trajectories.dudt[interval].force; arc.times.len()],
-                            )
-                        }),
-                        PlotMode::LinesMarkers,
-                    );
-                    series_out.extend(segmented_bound_series(
-                        x_arcs.iter().map(|arc| arc.times.clone()),
-                        Some(-params.force_rate_limit_nps),
-                        Some(params.force_rate_limit_nps),
-                        PlotMode::Lines,
-                    ));
-                    series_out
-                },
-            ),
-        ],
-        Scene2D {
-            title: "Crane Geometry".to_string(),
-            x_label: "x (m)".to_string(),
-            y_label: "height (m)".to_string(),
-            paths: vec![
-                ScenePath {
-                    name: "Trolley".to_string(),
-                    x: trolley_x,
-                    y: vec![0.0; N + 1],
-                },
-                ScenePath {
-                    name: "Load".to_string(),
-                    x: load_path_x,
-                    y: load_path_y,
-                },
-            ],
-            circles: Vec::new(),
-            arrows: Vec::new(),
-            animation: Some(SceneAnimation {
-                times: node_times,
-                frames,
-            }),
-        },
+    let mut force_rate_series = segmented_series(
+        "Force Rate (N/s)",
+        x_arcs.iter().enumerate().map(|(interval, arc)| {
+            (
+                arc.times.clone(),
+                vec![trajectories.dudt[interval].force; arc.times.len()],
+            )
+        }),
+        PlotMode::LinesMarkers,
+    );
+    force_rate_series.extend(segmented_bound_series(
+        x_arcs.iter().map(|arc| arc.times.clone()),
+        Some(-params.force_rate_limit_nps),
+        Some(params.force_rate_limit_nps),
+        PlotMode::Lines,
+    ));
+    artifact_from_interval_data(
+        params,
+        terminal.x,
+        max_swing,
+        max_force,
+        max_force_rate,
+        trajectories.tf,
+        animation_times,
+        frames,
+        trolley_x,
+        load_path_x,
+        load_path_y,
+        x_arcs,
+        u_arcs,
+        force_rate_series,
         vec![
             "Cart force is the control-state and force rate is the true decision variable.".to_string(),
             "The multiple-shooting charts show RK4 interval arcs reconstructed from each mesh node with the same substepping used by the transcription.".to_string(),
         ],
     )
 }
+
 fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
     params: &Params,
     trajectories: &DirectCollocationTrajectories<State<f64>, Control<f64>, N, K>,
     time_grid: &DirectCollocationTimeGrid<N, K>,
 ) -> SolveArtifact {
-    let node_times = (0..N)
+    let animation_times = (0..N)
         .map(|index| time_grid.nodes.nodes[index])
         .chain(std::iter::once(time_grid.nodes.terminal))
         .collect::<Vec<_>>();
@@ -1064,9 +1050,6 @@ fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
             .expect("collocation control-state arcs should match trajectory layout");
     let dudt_arcs = direct_collocation_root_arcs(&trajectories.root_dudt, time_grid);
     let mut trolley_x = Vec::with_capacity(N + 1);
-    let mut trolley_v = Vec::with_capacity(N + 1);
-    let mut swing_deg = Vec::with_capacity(N + 1);
-    let mut swing_rate_deg = Vec::with_capacity(N + 1);
     let mut load_path_x = Vec::with_capacity(N + 1);
     let mut load_path_y = Vec::with_capacity(N + 1);
     let mut frames = Vec::with_capacity(N + 1);
@@ -1077,9 +1060,6 @@ fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
         let state = &trajectories.x.nodes[index];
         let (load_px, load_py) = load_position(state, params.rope_length_m);
         trolley_x.push(state.x);
-        trolley_v.push(state.v);
-        swing_deg.push(rad_to_deg(state.theta));
-        swing_rate_deg.push(rad_to_deg(state.omega));
         load_path_x.push(load_px);
         load_path_y.push(load_py);
         frames.push(frame_for_state(state, params.rope_length_m));
@@ -1088,9 +1068,6 @@ fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
     let terminal = &trajectories.x.terminal;
     let (load_px, load_py) = load_position(terminal, params.rope_length_m);
     trolley_x.push(terminal.x);
-    trolley_v.push(terminal.v);
-    swing_deg.push(rad_to_deg(terminal.theta));
-    swing_rate_deg.push(rad_to_deg(terminal.omega));
     load_path_x.push(load_px);
     load_path_y.push(load_py);
     frames.push(frame_for_state(terminal, params.rope_length_m));
@@ -1104,131 +1081,33 @@ fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
                 max_force_rate.max(trajectories.root_dudt.intervals[interval][root].force.abs());
         }
     }
-    SolveArtifact::new(
-        "Crane Load Transfer",
-        artifact_summary(
-            params,
-            terminal.x,
-            max_swing,
-            max_force,
-            max_force_rate,
-            trajectories.tf,
-        ),
-        SolverReport::placeholder(),
-        vec![
-            chart(
-                "Trolley Position",
-                "x (m)",
-                {
-                    let mut series_out =
-                        interval_arc_series("Trolley x (m)", &x_arcs, PlotMode::LinesMarkers, |state| {
-                            state.x
-                        });
-                    series_out.extend(interval_arc_bound_series(
-                        &x_arcs,
-                        Some(0.0),
-                        Some(params.target_x_m),
-                        PlotMode::Lines,
-                    ));
-                    series_out
-                },
-            ),
-            chart(
-                "Trolley Velocity",
-                "v (m/s)",
-                interval_arc_series("Trolley v (m/s)", &x_arcs, PlotMode::LinesMarkers, |state| state.v),
-            ),
-            chart(
-                "Swing Angle",
-                "theta (deg)",
-                {
-                    let mut series_out = interval_arc_series(
-                        "Swing (deg)",
-                        &x_arcs,
-                        PlotMode::LinesMarkers,
-                        |state| rad_to_deg(state.theta),
-                    );
-                    series_out.extend(interval_arc_bound_series(
-                        &x_arcs,
-                        Some(-params.swing_limit_deg),
-                        Some(params.swing_limit_deg),
-                        PlotMode::Lines,
-                    ));
-                    series_out
-                },
-            ),
-            chart(
-                "Swing Rate",
-                "omega (deg/s)",
-                interval_arc_series(
-                    "Swing Rate (deg/s)",
-                    &x_arcs,
-                    PlotMode::LinesMarkers,
-                    |state| rad_to_deg(state.omega),
-                ),
-            ),
-            chart(
-                "Cart Force",
-                "Force (N)",
-                {
-                    let mut series_out = interval_arc_series(
-                        "Force (N)",
-                        &u_arcs,
-                        PlotMode::LinesMarkers,
-                        |control| control.force,
-                    );
-                    series_out.extend(interval_arc_bound_series(
-                        &u_arcs,
-                        Some(-params.force_limit_n),
-                        Some(params.force_limit_n),
-                        PlotMode::Lines,
-                    ));
-                    series_out
-                },
-            ),
-            chart(
-                "Force Rate",
-                "Force Rate (N/s)",
-                {
-                    let mut series_out = interval_arc_series(
-                        "Force Rate (N/s)",
-                        &dudt_arcs,
-                        PlotMode::LinesMarkers,
-                        |force_rate| force_rate.force,
-                    );
-                    series_out.extend(interval_arc_bound_series(
-                        &dudt_arcs,
-                        Some(-params.force_rate_limit_nps),
-                        Some(params.force_rate_limit_nps),
-                        PlotMode::Lines,
-                    ));
-                    series_out
-                },
-            ),
-        ],
-        Scene2D {
-            title: "Crane Geometry".to_string(),
-            x_label: "x (m)".to_string(),
-            y_label: "height (m)".to_string(),
-            paths: vec![
-                ScenePath {
-                    name: "Trolley".to_string(),
-                    x: trolley_x,
-                    y: vec![0.0; N + 1],
-                },
-                ScenePath {
-                    name: "Load".to_string(),
-                    x: load_path_x,
-                    y: load_path_y,
-                },
-            ],
-            circles: Vec::new(),
-            arrows: Vec::new(),
-            animation: Some(SceneAnimation {
-                times: node_times,
-                frames,
-            }),
-        },
+    let mut force_rate_series = interval_arc_series(
+        "Force Rate (N/s)",
+        &dudt_arcs,
+        PlotMode::LinesMarkers,
+        |force_rate| force_rate.force,
+    );
+    force_rate_series.extend(interval_arc_bound_series(
+        &dudt_arcs,
+        Some(-params.force_rate_limit_nps),
+        Some(params.force_rate_limit_nps),
+        PlotMode::Lines,
+    ));
+    artifact_from_interval_data(
+        params,
+        terminal.x,
+        max_swing,
+        max_force,
+        max_force_rate,
+        trajectories.tf,
+        animation_times,
+        frames,
+        trolley_x,
+        load_path_x,
+        load_path_y,
+        &x_arcs,
+        &u_arcs,
+        force_rate_series,
         vec![
             "Cart force is the control-state and force rate is the true decision variable.".to_string(),
             "The collocation charts are interval-local: state-like quantities include the extrapolated interval endpoint, while force rate is only shown at collocation nodes.".to_string(),

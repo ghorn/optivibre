@@ -25,6 +25,12 @@ const CONTROL_SECTION_FROM_WIRE = Object.freeze({
   solver: CONTROL_SECTION.solver,
   problem: CONTROL_SECTION.problem,
 } as const);
+const CONTROL_PANEL = Object.freeze({
+  sxFunctions: 0,
+} as const);
+const CONTROL_PANEL_FROM_WIRE = Object.freeze({
+  sx_functions: CONTROL_PANEL.sxFunctions,
+} as const);
 const CONTROL_EDITOR = Object.freeze({
   slider: 0,
   select: 1,
@@ -45,7 +51,8 @@ const CONTROL_SEMANTIC = Object.freeze({
   solverDualTolerance: 6,
   solverConstraintTolerance: 7,
   solverComplementarityTolerance: 8,
-  problemParameter: 9,
+  sxFunctionOption: 9,
+  problemParameter: 10,
 } as const);
 const CONTROL_SEMANTIC_FROM_WIRE = Object.freeze({
   transcription_method: CONTROL_SEMANTIC.transcriptionMethod,
@@ -57,15 +64,18 @@ const CONTROL_SEMANTIC_FROM_WIRE = Object.freeze({
   solver_dual_tolerance: CONTROL_SEMANTIC.solverDualTolerance,
   solver_constraint_tolerance: CONTROL_SEMANTIC.solverConstraintTolerance,
   solver_complementarity_tolerance: CONTROL_SEMANTIC.solverComplementarityTolerance,
+  sx_function_option: CONTROL_SEMANTIC.sxFunctionOption,
   problem_parameter: CONTROL_SEMANTIC.problemParameter,
 } as const);
 const CONTROL_VISIBILITY = Object.freeze({
   always: 0,
   directCollocationOnly: 1,
+  multipleShootingOnly: 2,
 } as const);
 const CONTROL_VISIBILITY_FROM_WIRE = Object.freeze({
   always: CONTROL_VISIBILITY.always,
   direct_collocation_only: CONTROL_VISIBILITY.directCollocationOnly,
+  multiple_shooting_only: CONTROL_VISIBILITY.multipleShootingOnly,
 } as const);
 const CONTROL_VALUE_DISPLAY = Object.freeze({
   scalar: 0,
@@ -273,6 +283,7 @@ const COMPILE_CACHE_STATE_FROM_WIRE = Object.freeze({
 } as const);
 
 type ControlSectionCode = EnumValue<typeof CONTROL_SECTION>;
+type ControlPanelCode = EnumValue<typeof CONTROL_PANEL>;
 type ControlEditorCode = EnumValue<typeof CONTROL_EDITOR>;
 type ControlSemanticCode = EnumValue<typeof CONTROL_SEMANTIC>;
 type ControlVisibilityCode = EnumValue<typeof CONTROL_VISIBILITY>;
@@ -305,6 +316,7 @@ interface WireControlSpec {
   unit: string;
   help: string;
   section?: string | number;
+  panel?: string | number;
   editor?: string | number;
   visibility?: string | number;
   semantic?: string | number;
@@ -322,6 +334,7 @@ interface ControlSpec {
   unit: string;
   help: string;
   section: ControlSectionCode;
+  panel: ControlPanelCode | null;
   editor: ControlEditorCode;
   visibility: ControlVisibilityCode;
   semantic: ControlSemanticCode;
@@ -660,6 +673,14 @@ interface ControlSectionView {
 }
 
 type ControlSectionCollapseState = Record<ControlSectionCode, boolean>;
+type ControlPanelCollapseState = Record<ControlPanelCode, boolean>;
+
+interface ControlPanelView {
+  key: ControlPanelCode;
+  title: string;
+  subtitle: string;
+  controls: ControlSpec[];
+}
 
 interface FrontendState {
   specs: ProblemSpec[];
@@ -667,6 +688,7 @@ interface FrontendState {
   values: Record<string, number>;
   compileCacheStatuses: CompileCacheStatus[];
   collapsedControlSections: ControlSectionCollapseState;
+  collapsedControlPanels: ControlPanelCollapseState;
   artifact: SolveArtifact | null;
   animationIndex: number;
   playing: boolean;
@@ -897,6 +919,7 @@ function readWireControlSpec(value: JsonValue | undefined, context: string): Wir
     unit: readJsonString(readJsonValueAt(object, "unit"), `${context}.unit`),
     help: readJsonString(readJsonValueAt(object, "help"), `${context}.help`),
     section: readOptionalJsonStringOrNumber(readJsonValueAt(object, "section"), `${context}.section`),
+    panel: readOptionalJsonStringOrNumber(readJsonValueAt(object, "panel"), `${context}.panel`),
     editor: readOptionalJsonStringOrNumber(readJsonValueAt(object, "editor"), `${context}.editor`),
     visibility: readOptionalJsonStringOrNumber(
       readJsonValueAt(object, "visibility"),
@@ -1340,6 +1363,9 @@ const state: FrontendState = {
     [CONTROL_SECTION.solver]: false,
     [CONTROL_SECTION.problem]: false,
   },
+  collapsedControlPanels: {
+    [CONTROL_PANEL.sxFunctions]: true,
+  },
   artifact: null,
   animationIndex: 0,
   playing: false,
@@ -1402,6 +1428,13 @@ const SECTION_META: ReadonlyArray<Omit<ControlSectionView, "controls">> = [
     subtitle: "Problem-specific physical parameters and scenario settings.",
   },
 ];
+const CONTROL_PANEL_META: ReadonlyArray<Omit<ControlPanelView, "controls">> = [
+  {
+    key: CONTROL_PANEL.sxFunctions,
+    title: "SX Functions",
+    subtitle: "Reusable symbolic-function strategy for repeated OCP kernels, including global call policy and per-kernel overrides.",
+  },
+];
 const PHASE_LABEL = new Map<SolvePhaseCode, string>([
   [SOLVE_PHASE.initial, "initial"],
   [SOLVE_PHASE.acceptedStep, "accepted step"],
@@ -1411,6 +1444,7 @@ const PHASE_LABEL = new Map<SolvePhaseCode, string>([
   [SOLVE_PHASE.restoration, "restoration"],
 ]);
 const DIRECT_COLLOCATION_VALUE = 1;
+const MULTIPLE_SHOOTING_VALUE = 0;
 
 function setStatus(message: string, kind: StatusClassName = "info"): void {
   setStatusDisplay({
@@ -1894,11 +1928,11 @@ function renderCompileCacheStatus(): void {
   const header = document.createElement("div");
   header.className = "compile-cache-row compile-cache-row-header";
   header.innerHTML = `
-    <div>Problem</div>
-    <div>Variant</div>
-    <div>Symbolic</div>
-    <div>JIT</div>
-    <div>Status</div>
+    <div class="compile-cache-problem">Problem</div>
+    <div class="compile-cache-variant">Variant</div>
+    <div class="compile-cache-timing">Symbolic</div>
+    <div class="compile-cache-timing">JIT</div>
+    <div class="compile-cache-status">Status</div>
   `;
   table.appendChild(header);
 
@@ -1909,9 +1943,9 @@ function renderCompileCacheStatus(): void {
     rowEl.innerHTML = `
       <div class="compile-cache-problem">${escapeHtml(row.problem_name)}</div>
       <div class="compile-cache-variant">${escapeHtml(row.variant_label)}</div>
-      <div>${escapeHtml(formatDuration(row.symbolic_setup_s))}</div>
-      <div>${escapeHtml(formatDuration(row.jit_s))}</div>
-      <div><span class="compile-cache-badge compile-cache-badge-${statusLabel}">${statusLabel}</span></div>
+      <div class="compile-cache-timing">${escapeHtml(formatDuration(row.symbolic_setup_s))}</div>
+      <div class="compile-cache-timing">${escapeHtml(formatDuration(row.jit_s))}</div>
+      <div class="compile-cache-status"><span class="compile-cache-badge compile-cache-badge-${statusLabel}">${statusLabel}</span></div>
     `;
     table.appendChild(rowEl);
   }
@@ -1934,6 +1968,10 @@ function normalizeControl(control: WireControlSpec): ControlSpec {
   return {
     ...control,
     section: decodeWireEnum(CONTROL_SECTION_FROM_WIRE, control.section, CONTROL_SECTION.problem),
+    panel:
+      control.panel == null
+        ? null
+        : decodeWireEnum(CONTROL_PANEL_FROM_WIRE, control.panel, CONTROL_PANEL.sxFunctions),
     editor: decodeWireEnum(CONTROL_EDITOR_FROM_WIRE, control.editor, CONTROL_EDITOR.slider),
     visibility: decodeWireEnum(
       CONTROL_VISIBILITY_FROM_WIRE,
@@ -2164,6 +2202,7 @@ function isStructuralControl(control: ControlSpec): boolean {
     case CONTROL_SEMANTIC.transcriptionIntervals:
     case CONTROL_SEMANTIC.collocationFamily:
     case CONTROL_SEMANTIC.collocationDegree:
+    case CONTROL_SEMANTIC.sxFunctionOption:
       return true;
     default:
       return false;
@@ -2260,6 +2299,8 @@ function isControlVisible(control: ControlSpec): boolean {
   switch (control.visibility) {
     case CONTROL_VISIBILITY.directCollocationOnly:
       return currentTranscriptionMethodValue() === DIRECT_COLLOCATION_VALUE;
+    case CONTROL_VISIBILITY.multipleShootingOnly:
+      return currentTranscriptionMethodValue() === MULTIPLE_SHOOTING_VALUE;
     default:
       return true;
   }
@@ -2288,12 +2329,52 @@ function controlSections(spec: ProblemSpec): ControlSectionView[] {
   return sections.filter((section) => section.controls.length > 0);
 }
 
+function groupedControls(
+  controlsForSection: readonly ControlSpec[],
+): { ungrouped: ControlSpec[]; panels: ControlPanelView[] } {
+  const ungrouped: ControlSpec[] = [];
+  const panels: ControlPanelView[] = CONTROL_PANEL_META.map((meta) => ({
+    key: meta.key,
+    title: meta.title,
+    subtitle: meta.subtitle,
+    controls: [],
+  }));
+  const byKey = new Map<ControlPanelCode, ControlPanelView>(
+    panels.map((panel) => [panel.key, panel]),
+  );
+  for (const control of controlsForSection) {
+    if (control.panel == null) {
+      ungrouped.push(control);
+      continue;
+    }
+    const panel = byKey.get(control.panel);
+    if (panel) {
+      panel.controls.push(control);
+    } else {
+      ungrouped.push(control);
+    }
+  }
+  return {
+    ungrouped,
+    panels: panels.filter((panel) => panel.controls.length > 0),
+  };
+}
+
 function isControlSectionCollapsed(section: ControlSectionCode): boolean {
   return state.collapsedControlSections[section];
 }
 
 function toggleControlSection(section: ControlSectionCode): void {
   state.collapsedControlSections[section] = !state.collapsedControlSections[section];
+  renderControls();
+}
+
+function isControlPanelCollapsed(panel: ControlPanelCode): boolean {
+  return state.collapsedControlPanels[panel];
+}
+
+function toggleControlPanel(panel: ControlPanelCode): void {
+  state.collapsedControlPanels[panel] = !state.collapsedControlPanels[panel];
   renderControls();
 }
 
@@ -2419,6 +2500,54 @@ function appendControl(wrapperParent: HTMLElement, control: ControlSpec): void {
     sync(target.value);
   });
   wrapperParent.appendChild(wrapper);
+}
+
+function appendControlPanel(wrapperParent: HTMLElement, panel: ControlPanelView): void {
+  const shell = document.createElement("section");
+  shell.className = "control-panel";
+  const collapsed = isControlPanelCollapsed(panel.key);
+  shell.dataset.collapsed = collapsed ? "true" : "false";
+
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "control-panel-toggle";
+  toggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+
+  const text = document.createElement("div");
+  text.className = "control-panel-header-text";
+
+  const title = document.createElement("div");
+  title.className = "control-panel-title";
+  title.textContent = panel.title;
+
+  const help = document.createElement("div");
+  help.className = "control-panel-help";
+  help.textContent = panel.subtitle;
+
+  text.append(title, help);
+
+  const chevron = document.createElement("span");
+  chevron.className = "control-panel-chevron";
+  chevron.setAttribute("aria-hidden", "true");
+  chevron.textContent = "⌄";
+
+  toggle.append(text, chevron);
+
+  const body = document.createElement("div");
+  body.className = "control-panel-body";
+  body.id = `control-panel-body-${panel.key}`;
+  toggle.setAttribute("aria-controls", body.id);
+  toggle.addEventListener("click", () => {
+    toggleControlPanel(panel.key);
+  });
+
+  shell.append(toggle, body);
+  if (!collapsed) {
+    for (const control of panel.controls) {
+      appendControl(body, control);
+    }
+  }
+  wrapperParent.appendChild(shell);
 }
 
 function resetChartViews(): void {
@@ -2875,8 +3004,12 @@ function renderControls(): void {
     shell.append(header, body);
 
     if (!collapsed) {
-      for (const control of section.controls) {
+      const grouped = groupedControls(section.controls);
+      for (const control of grouped.ungrouped) {
         appendControl(body, control);
+      }
+      for (const panel of grouped.panels) {
+        appendControlPanel(body, panel);
       }
     }
     controls.appendChild(shell);

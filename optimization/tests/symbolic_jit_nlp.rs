@@ -1,8 +1,8 @@
 use approx::assert_abs_diff_eq;
 use optimization::{
-    CallPolicy, CallPolicyConfig, ClarabelSqpOptions, FunctionCompileOptions,
-    InteriorPointOptions, LlvmOptimizationLevel, SymbolicNlpOutputs, TypedRuntimeNlpBounds,
-    flat_view, symbolic_nlp,
+    CallPolicy, CallPolicyConfig, ClarabelSqpOptions, FunctionCompileOptions, InteriorPointOptions,
+    LlvmOptimizationLevel, SymbolicCompileProgress, SymbolicCompileStage, SymbolicNlpOutputs,
+    TypedRuntimeNlpBounds, flat_view, symbolic_nlp,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptOptions, IpoptRawStatus};
@@ -274,6 +274,46 @@ fn typed_symbolic_compile_callback_reports_full_pre_jit_symbolic_timing() {
     assert_eq!(callback_metadata.stats.equality_count, 0);
     assert_eq!(callback_metadata.stats.inequality_count, 0);
     assert!(callback_metadata.stats.hessian_nnz > 0);
+}
+
+#[test]
+fn typed_symbolic_compile_progress_reports_symbolic_stages_before_ready() {
+    let symbolic = symbolic_nlp::<Pair<SX>, (), SX, SX, _>("timed_stage_progress", |x, _| {
+        SymbolicNlpOutputs {
+            objective: (1.0 - x.x).sqr() + 100.0 * (x.y - x.x.sqr()).sqr(),
+            equalities: x.x + x.y,
+            inequalities: x.x.sqr() + x.y.sqr(),
+        }
+    })
+    .expect("symbolic NLP should build");
+
+    let mut stages = Vec::new();
+    let mut saw_ready = false;
+    symbolic
+        .compile_jit_with_options_and_symbolic_progress_callback(
+            FunctionCompileOptions::from(LlvmOptimizationLevel::O0),
+            |progress| match progress {
+                SymbolicCompileProgress::Stage(progress) => stages.push(progress.stage),
+                SymbolicCompileProgress::Ready(metadata) => {
+                    saw_ready = true;
+                    assert!(metadata.setup_profile.hessian_generation.is_some());
+                }
+            },
+        )
+        .expect("JIT compile should succeed");
+
+    assert_eq!(
+        stages,
+        vec![
+            SymbolicCompileStage::BuildProblem,
+            SymbolicCompileStage::ObjectiveGradient,
+            SymbolicCompileStage::EqualityJacobian,
+            SymbolicCompileStage::InequalityJacobian,
+            SymbolicCompileStage::LagrangianAssembly,
+            SymbolicCompileStage::HessianGeneration,
+        ]
+    );
+    assert!(saw_ready);
 }
 
 #[test]

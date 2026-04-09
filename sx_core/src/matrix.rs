@@ -1,9 +1,12 @@
 use std::collections::{BTreeSet, HashMap};
 
+use crate::Index;
 use crate::ccs::CCS;
 use crate::error::{Result, SxError};
-use crate::sx::{SX, depends_on, forward_directional, reverse_directional};
-use crate::{Index, checked_len_product};
+use crate::sx::{
+    JacobianStructure, SX, forward_directional, forward_directional_batch, jacobian_structure,
+    reverse_directional, reverse_directional_batch,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SXMatrix {
@@ -67,6 +70,8 @@ impl HessianOptions {
         Self { strategy }
     }
 }
+
+const JACOBIAN_BATCH_WIDTH: usize = 8;
 
 impl SXMatrix {
     fn build_lower_triangle(size: Index, columns: Vec<Vec<(Index, SX)>>) -> Result<SXMatrix> {
@@ -309,59 +314,107 @@ impl SXMatrix {
         SXMatrix::new(wrt.ccs.clone(), outputs)
     }
 
+    fn jacobian_forward_colored(
+        &self,
+        wrt: &SXMatrix,
+        structure: &JacobianStructure,
+    ) -> Result<Vec<SX>> {
+        let nvar = wrt.nnz();
+        let mut values = vec![SX::zero(); structure.ccs.nnz()];
+        for color_batch in structure.forward_color_groups.chunks(JACOBIAN_BATCH_WIDTH) {
+            let seeds_by_direction = color_batch
+                .iter()
+                .map(|columns| {
+                    let mut seed = vec![SX::zero(); nvar];
+                    for &col in columns {
+                        seed[col] = SX::one();
+                    }
+                    seed
+                })
+                .collect::<Vec<_>>();
+            let sensitivities =
+                forward_directional_batch(&self.nonzeros, &wrt.nonzeros, &seeds_by_direction)?;
+            for (direction, columns) in color_batch.iter().enumerate() {
+                let direction_sens = &sensitivities[direction];
+                for &col in columns {
+                    let start = structure.ccs.col_ptrs()[col];
+                    let end = structure.ccs.col_ptrs()[col + 1];
+                    for nz_index in start..end {
+                        values[nz_index] = direction_sens[structure.ccs.row_indices()[nz_index]];
+                    }
+                }
+            }
+        }
+        Ok(values)
+    }
+
+    fn jacobian_reverse_colored(
+        &self,
+        wrt: &SXMatrix,
+        structure: &JacobianStructure,
+    ) -> Result<Vec<SX>> {
+        let nout = self.nnz();
+        let mut values = vec![SX::zero(); structure.ccs.nnz()];
+        for color_batch in structure.reverse_color_groups.chunks(JACOBIAN_BATCH_WIDTH) {
+            let seeds_by_direction = color_batch
+                .iter()
+                .map(|rows| {
+                    let mut seed = vec![SX::zero(); nout];
+                    for &row in rows {
+                        seed[row] = SX::one();
+                    }
+                    seed
+                })
+                .collect::<Vec<_>>();
+            let sensitivities =
+                reverse_directional_batch(&self.nonzeros, &wrt.nonzeros, &seeds_by_direction)?;
+            for (direction, rows) in color_batch.iter().enumerate() {
+                let direction_sens = &sensitivities[direction];
+                for &row in rows {
+                    for &(col, nz_index) in &structure.positions_by_row[row] {
+                        values[nz_index] = direction_sens[col];
+                    }
+                }
+            }
+        }
+        Ok(values)
+    }
+
     pub fn jacobian(&self, wrt: &SXMatrix) -> Result<SXMatrix> {
         let nout = self.nnz();
         let nvar = wrt.nnz();
-        let Some(len) = checked_len_product(nout, nvar) else {
-            return Err(SxError::Shape("jacobian storage size overflow".into()));
-        };
-        let mut dense = vec![SX::zero(); len];
-
-        if nvar <= nout {
-            for var_idx in 0..nvar {
-                let mut seed = vec![SX::zero(); nvar];
-                seed[var_idx] = SX::one();
-                let sens = forward_directional(&self.nonzeros, &wrt.nonzeros, &seed)?;
-                for (row, value) in sens.into_iter().enumerate() {
-                    dense[row + var_idx * nout] = value;
-                }
-            }
+        let structure = jacobian_structure(&self.nonzeros, &wrt.nonzeros)?;
+        let forward_batches = structure
+            .forward_color_groups
+            .len()
+            .div_ceil(JACOBIAN_BATCH_WIDTH);
+        let reverse_batches = structure
+            .reverse_color_groups
+            .len()
+            .div_ceil(JACOBIAN_BATCH_WIDTH);
+        let values = if forward_batches <= reverse_batches {
+            self.jacobian_forward_colored(wrt, &structure)?
         } else {
-            for out_idx in 0..nout {
-                let mut seed = vec![SX::zero(); nout];
-                seed[out_idx] = SX::one();
-                let sens = reverse_directional(&self.nonzeros, &wrt.nonzeros, &seed)?;
-                for (col, value) in sens.into_iter().enumerate() {
-                    dense[out_idx + col * nout] = value;
-                }
-            }
-        }
+            self.jacobian_reverse_colored(wrt, &structure)?
+        };
 
-        let mut positions = Vec::new();
-        let mut values = Vec::new();
+        let mut positions = Vec::with_capacity(structure.ccs.nnz());
+        let mut filtered_values = Vec::with_capacity(structure.ccs.nnz());
         for col in 0..nvar {
-            for row in 0..nout {
-                let value = dense[row + col * nout];
+            for nz_index in structure.ccs.col_ptrs()[col]..structure.ccs.col_ptrs()[col + 1] {
+                let value = values[nz_index];
                 if !value.is_zero() {
-                    positions.push((row, col));
-                    values.push(value);
+                    positions.push((structure.ccs.row_indices()[nz_index], col));
+                    filtered_values.push(value);
                 }
             }
         }
-        let ccs = CCS::from_positions(nout, nvar, &positions)?;
-        SXMatrix::new(ccs, values)
+        let filtered_ccs = CCS::from_positions(nout, nvar, &positions)?;
+        SXMatrix::new(filtered_ccs, filtered_values)
     }
 
     pub fn jacobian_ccs(&self, wrt: &SXMatrix) -> Result<CCS> {
-        let mut positions = Vec::new();
-        for (col, &var) in wrt.nonzeros.iter().enumerate() {
-            for (row, &out) in self.nonzeros.iter().enumerate() {
-                if depends_on(out, var, &mut HashMap::new()) {
-                    positions.push((row, col));
-                }
-            }
-        }
-        CCS::from_positions(self.nnz(), wrt.nnz(), &positions)
+        Ok(jacobian_structure(&self.nonzeros, &wrt.nonzeros)?.ccs)
     }
 
     pub fn hessian(&self, wrt: &SXMatrix) -> Result<SXMatrix> {

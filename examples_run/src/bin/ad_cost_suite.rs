@@ -4,11 +4,12 @@ use std::hint::black_box;
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use bench_report::{
     CaseTimingStats, FunctionPairReportInput, HessianStrategyReport, PropertyStatus,
     PropertyVerdict, SuiteReport, TimingStats, suite_report_from_function_pairs,
 };
+use clap::Parser;
 use examples_source::{
     AD_HESSIAN_SIZE, AdCostCase, ad_cost_cases, build_forward_sweep_augmented_function,
     build_forward_sweep_original_function, build_hessian_augmented_function,
@@ -33,32 +34,47 @@ struct SuiteOptions {
     json: bool,
 }
 
-fn parse_args() -> Result<SuiteOptions> {
-    let mut samples = 12usize;
-    let mut target_ms = 30u64;
-    let mut json = false;
+#[derive(Debug, Parser)]
+#[command(
+    name = "ad_cost_suite",
+    about = "Benchmark AD code generation and LLVM setup costs."
+)]
+struct AdCostSuiteCli {
+    #[arg(long, default_value_t = 12, value_parser = parse_positive_usize)]
+    samples: usize,
+    #[arg(long = "target-ms", default_value_t = 30, value_parser = parse_positive_u64)]
+    target_ms: u64,
+    #[arg(long)]
+    json: bool,
+}
 
-    let mut args = env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--json" => json = true,
-            "--samples" => {
-                let value = args.next().context("missing value for --samples")?;
-                samples = value.parse().context("invalid --samples value")?;
-            }
-            "--target-ms" => {
-                let value = args.next().context("missing value for --target-ms")?;
-                target_ms = value.parse().context("invalid --target-ms value")?;
-            }
-            other => bail!("unknown argument: {other}"),
-        }
+fn parse_args() -> SuiteOptions {
+    let cli = AdCostSuiteCli::parse();
+    SuiteOptions {
+        samples: cli.samples,
+        target_ms: cli.target_ms,
+        json: cli.json,
     }
+}
 
-    Ok(SuiteOptions {
-        samples,
-        target_ms,
-        json,
-    })
+fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid positive integer `{value}`"))?;
+    if parsed == 0 {
+        return Err("value must be greater than zero".to_string());
+    }
+    Ok(parsed)
+}
+
+fn parse_positive_u64(value: &str) -> std::result::Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| format!("invalid positive integer `{value}`"))?;
+    if parsed == 0 {
+        return Err("value must be greater than zero".to_string());
+    }
+    Ok(parsed)
 }
 
 fn profile_name() -> &'static str {
@@ -597,7 +613,7 @@ fn collect_report(options: &SuiteOptions) -> SuiteReport {
 }
 
 fn main() -> Result<()> {
-    let options = parse_args()?;
+    let options = parse_args();
     let report = collect_report(&options);
     let _ = options.json;
     serde_json::to_writer_pretty(io::stdout(), &report)?;

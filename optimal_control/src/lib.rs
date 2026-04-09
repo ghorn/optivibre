@@ -1,10 +1,11 @@
 use anyhow::Result as AnyResult;
 use optimization::{
-    BackendCompileReport, BackendTimingMetadata, ClarabelSqpError, ClarabelSqpOptions,
+    BackendCompileReport, BackendTimingMetadata, CallPolicy, ClarabelSqpError, ClarabelSqpOptions,
     ClarabelSqpSummary, ConstraintBoundSide, ConstraintSatisfaction, FunctionCompileOptions,
     InteriorPointIterationSnapshot, InteriorPointOptions, InteriorPointSolveError,
-    InteriorPointSummary, LlvmOptimizationLevel, NlpCompileStats, ScalarLeaf,
-    SqpIterationSnapshot, SymbolicCompileMetadata,
+    InteriorPointSummary, LlvmOptimizationLevel, NlpCompileStats, NlpEvaluationBenchmark,
+    NlpEvaluationBenchmarkOptions, NlpEvaluationKernelKind, ScalarLeaf, SqpIterationSnapshot,
+    SymbolicCompileMetadata, SymbolicCompileProgress, SymbolicCompileStageProgress,
     SymbolicNlpBuildError, SymbolicNlpCompileError, SymbolicNlpOutputs, TypedCompiledJitNlp,
     TypedRuntimeNlpBounds, Vectorize, VectorizeLayoutError, classify_constraint_satisfaction,
     constraint_bound_side, flatten_value, symbolic_column, symbolic_nlp, symbolic_value,
@@ -486,6 +487,163 @@ pub enum OcpCompileError {
     InvalidConfiguration(String),
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OcpKernelMode {
+    Inline,
+    #[default]
+    Function,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OcpKernelFunctionOptions {
+    pub mode: OcpKernelMode,
+    pub call_policy_override: Option<CallPolicy>,
+}
+
+impl OcpKernelFunctionOptions {
+    pub const fn inline() -> Self {
+        Self {
+            mode: OcpKernelMode::Inline,
+            call_policy_override: None,
+        }
+    }
+
+    pub const fn function() -> Self {
+        Self {
+            mode: OcpKernelMode::Function,
+            call_policy_override: None,
+        }
+    }
+
+    pub const fn function_with_call_policy(policy: CallPolicy) -> Self {
+        Self {
+            mode: OcpKernelMode::Function,
+            call_policy_override: Some(policy),
+        }
+    }
+
+    pub const fn with_call_policy_override(self, policy: CallPolicy) -> Self {
+        Self {
+            call_policy_override: Some(policy),
+            ..self
+        }
+    }
+}
+
+impl Default for OcpKernelFunctionOptions {
+    fn default() -> Self {
+        Self::function()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OcpSymbolicFunctionOptions {
+    pub ode: OcpKernelFunctionOptions,
+    pub objective_lagrange: OcpKernelFunctionOptions,
+    pub objective_mayer: OcpKernelFunctionOptions,
+    pub path_constraints: OcpKernelFunctionOptions,
+    pub boundary_equalities: OcpKernelFunctionOptions,
+    pub boundary_inequalities: OcpKernelFunctionOptions,
+    pub multiple_shooting_integrator: OcpKernelFunctionOptions,
+}
+
+impl OcpSymbolicFunctionOptions {
+    pub const fn multiple_shooting_default() -> Self {
+        Self {
+            ode: OcpKernelFunctionOptions::function_with_call_policy(CallPolicy::InlineInLLVM),
+            objective_lagrange: OcpKernelFunctionOptions::function_with_call_policy(
+                CallPolicy::InlineInLLVM,
+            ),
+            objective_mayer: OcpKernelFunctionOptions::inline(),
+            path_constraints: OcpKernelFunctionOptions::function_with_call_policy(
+                CallPolicy::InlineInLLVM,
+            ),
+            boundary_equalities: OcpKernelFunctionOptions::inline(),
+            boundary_inequalities: OcpKernelFunctionOptions::inline(),
+            multiple_shooting_integrator: OcpKernelFunctionOptions::inline(),
+        }
+    }
+
+    pub const fn direct_collocation_default() -> Self {
+        Self::inline_all()
+    }
+
+    pub const fn function_all_with_call_policy(policy: CallPolicy) -> Self {
+        let function = OcpKernelFunctionOptions::function_with_call_policy(policy);
+        Self {
+            ode: function,
+            objective_lagrange: function,
+            objective_mayer: function,
+            path_constraints: function,
+            boundary_equalities: function,
+            boundary_inequalities: function,
+            multiple_shooting_integrator: function,
+        }
+    }
+
+    pub const fn inline_all() -> Self {
+        let inline = OcpKernelFunctionOptions::inline();
+        Self {
+            ode: inline,
+            objective_lagrange: inline,
+            objective_mayer: inline,
+            path_constraints: inline,
+            boundary_equalities: inline,
+            boundary_inequalities: inline,
+            multiple_shooting_integrator: inline,
+        }
+    }
+}
+
+impl Default for OcpSymbolicFunctionOptions {
+    fn default() -> Self {
+        Self::multiple_shooting_default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OcpCompileOptions {
+    pub function_options: FunctionCompileOptions,
+    pub symbolic_functions: OcpSymbolicFunctionOptions,
+}
+
+impl Default for OcpCompileOptions {
+    fn default() -> Self {
+        Self::from(FunctionCompileOptions::from(LlvmOptimizationLevel::O3))
+    }
+}
+
+impl OcpCompileOptions {
+    pub fn for_multiple_shooting(function_options: FunctionCompileOptions) -> Self {
+        Self {
+            function_options,
+            symbolic_functions: OcpSymbolicFunctionOptions::multiple_shooting_default(),
+        }
+    }
+
+    pub fn for_direct_collocation(function_options: FunctionCompileOptions) -> Self {
+        Self {
+            function_options,
+            symbolic_functions: OcpSymbolicFunctionOptions::direct_collocation_default(),
+        }
+    }
+}
+
+impl From<FunctionCompileOptions> for OcpCompileOptions {
+    fn from(function_options: FunctionCompileOptions) -> Self {
+        Self {
+            function_options,
+            symbolic_functions: OcpSymbolicFunctionOptions::default(),
+        }
+    }
+}
+
+impl From<LlvmOptimizationLevel> for OcpCompileOptions {
+    fn from(opt_level: LlvmOptimizationLevel) -> Self {
+        Self::from(FunctionCompileOptions::from(opt_level))
+    }
+}
+
 #[derive(Debug, Error)]
 enum GuessError {
     #[error("{0}")]
@@ -557,7 +715,6 @@ type DcVarsNum<X, U, const N: usize, const K: usize> = (
 );
 type DcIneqNum<C, Beq, Bineq, const N: usize, const K: usize> =
     (Numeric<Beq>, Numeric<Bineq>, IntervalGrid<Numeric<C>, N, K>);
-type MsArcSampleOutput<X, U> = (X, U);
 type MsArcSampleOutputNum<X, U> = (Numeric<X>, Numeric<U>);
 #[derive(Clone, Debug)]
 struct PromotionPlan {
@@ -619,14 +776,26 @@ struct CompiledMultipleShootingArc<X, U, P, const RK4_SUBSTEPS: usize> {
     _marker: PhantomData<fn() -> (X, U, P)>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct OcpSymbolicFunctionLibrary {
+    ode: Option<SXFunction>,
+    objective_lagrange: Option<SXFunction>,
+    objective_mayer: Option<SXFunction>,
+    path_constraints: Option<SXFunction>,
+    boundary_equalities: Option<SXFunction>,
+    boundary_inequalities: Option<SXFunction>,
+    multiple_shooting_integrator: Option<SXFunction>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OcpCompileHelperKind {
     Xdot,
     MultipleShootingArc,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OcpCompileProgress {
+    SymbolicStage(SymbolicCompileStageProgress),
     SymbolicReady(SymbolicCompileMetadata),
     HelperCompiled {
         helper: OcpCompileHelperKind,
@@ -773,6 +942,340 @@ impl<X, U, P, C, Beq, Bineq, Scheme> OcpBuilder<X, U, P, C, Beq, Bineq, Scheme> 
     }
 }
 
+impl<X, U, P, C, Beq, Bineq, Scheme> Ocp<X, U, P, C, Beq, Bineq, Scheme>
+where
+    X: Vectorize<SX, Rebind<SX> = X> + Clone,
+    U: Vectorize<SX, Rebind<SX> = U> + Clone,
+    P: Vectorize<SX, Rebind<SX> = P>,
+    C: Vectorize<SX, Rebind<SX> = C>,
+    Beq: Vectorize<SX, Rebind<SX> = Beq>,
+    Bineq: Vectorize<SX, Rebind<SX> = Bineq>,
+{
+    fn build_symbolic_function_library(
+        &self,
+        options: OcpSymbolicFunctionOptions,
+    ) -> Result<OcpSymbolicFunctionLibrary, SxError> {
+        Ok(OcpSymbolicFunctionLibrary {
+            ode: self.build_ode_symbolic_function(options.ode)?,
+            objective_lagrange: self
+                .build_objective_lagrange_symbolic_function(options.objective_lagrange)?,
+            objective_mayer: self
+                .build_objective_mayer_symbolic_function(options.objective_mayer)?,
+            path_constraints: self
+                .build_path_constraints_symbolic_function(options.path_constraints)?,
+            boundary_equalities: self
+                .build_boundary_equalities_symbolic_function(options.boundary_equalities)?,
+            boundary_inequalities: self
+                .build_boundary_inequalities_symbolic_function(options.boundary_inequalities)?,
+            multiple_shooting_integrator: None,
+        })
+    }
+
+    fn configured_symbolic_function(
+        &self,
+        options: OcpKernelFunctionOptions,
+        build: impl FnOnce() -> Result<SXFunction, SxError>,
+    ) -> Result<Option<SXFunction>, SxError> {
+        match options.mode {
+            OcpKernelMode::Inline => Ok(None),
+            OcpKernelMode::Function => {
+                let function = build()?;
+                Ok(Some(match options.call_policy_override {
+                    Some(policy) => function.with_call_policy_override(policy),
+                    None => function,
+                }))
+            }
+        }
+    }
+
+    fn build_ode_symbolic_function(
+        &self,
+        options: OcpKernelFunctionOptions,
+    ) -> Result<Option<SXFunction>, SxError> {
+        self.configured_symbolic_function(options, || {
+            let x = symbolic_value::<X>("x")?;
+            let u = symbolic_value::<U>("u")?;
+            let p = symbolic_value::<P>("p")?;
+            let xdot = (self.ode)(&x, &u, &p);
+            SXFunction::new(
+                format!("{}_ode", self.name),
+                vec![
+                    NamedMatrix::new("x", symbolic_column(&x)?)?,
+                    NamedMatrix::new("u", symbolic_column(&u)?)?,
+                    NamedMatrix::new("p", symbolic_column(&p)?)?,
+                ],
+                vec![NamedMatrix::new("xdot", symbolic_column(&xdot)?)?],
+            )
+        })
+    }
+
+    fn build_objective_lagrange_symbolic_function(
+        &self,
+        options: OcpKernelFunctionOptions,
+    ) -> Result<Option<SXFunction>, SxError> {
+        self.configured_symbolic_function(options, || {
+            let x = symbolic_value::<X>("x")?;
+            let u = symbolic_value::<U>("u")?;
+            let dudt = symbolic_value::<U>("dudt")?;
+            let p = symbolic_value::<P>("p")?;
+            let objective = (self.objective_lagrange)(&x, &u, &dudt, &p);
+            SXFunction::new(
+                format!("{}_objective_lagrange", self.name),
+                vec![
+                    NamedMatrix::new("x", symbolic_column(&x)?)?,
+                    NamedMatrix::new("u", symbolic_column(&u)?)?,
+                    NamedMatrix::new("dudt", symbolic_column(&dudt)?)?,
+                    NamedMatrix::new("p", symbolic_column(&p)?)?,
+                ],
+                vec![NamedMatrix::new("objective", SXMatrix::scalar(objective))?],
+            )
+        })
+    }
+
+    fn build_objective_mayer_symbolic_function(
+        &self,
+        options: OcpKernelFunctionOptions,
+    ) -> Result<Option<SXFunction>, SxError> {
+        self.configured_symbolic_function(options, || {
+            let x0 = symbolic_value::<X>("x0")?;
+            let u0 = symbolic_value::<U>("u0")?;
+            let xf = symbolic_value::<X>("xf")?;
+            let uf = symbolic_value::<U>("uf")?;
+            let p = symbolic_value::<P>("p")?;
+            let tf = SX::sym("tf");
+            let objective = (self.objective_mayer)(&x0, &u0, &xf, &uf, &p, &tf);
+            SXFunction::new(
+                format!("{}_objective_mayer", self.name),
+                vec![
+                    NamedMatrix::new("x0", symbolic_column(&x0)?)?,
+                    NamedMatrix::new("u0", symbolic_column(&u0)?)?,
+                    NamedMatrix::new("xf", symbolic_column(&xf)?)?,
+                    NamedMatrix::new("uf", symbolic_column(&uf)?)?,
+                    NamedMatrix::new("p", symbolic_column(&p)?)?,
+                    NamedMatrix::new("tf", SXMatrix::dense_column(vec![tf])?)?,
+                ],
+                vec![NamedMatrix::new("objective", SXMatrix::scalar(objective))?],
+            )
+        })
+    }
+
+    fn build_path_constraints_symbolic_function(
+        &self,
+        options: OcpKernelFunctionOptions,
+    ) -> Result<Option<SXFunction>, SxError> {
+        self.configured_symbolic_function(options, || {
+            let x = symbolic_value::<X>("x")?;
+            let u = symbolic_value::<U>("u")?;
+            let dudt = symbolic_value::<U>("dudt")?;
+            let p = symbolic_value::<P>("p")?;
+            let path = (self.path_constraints)(&x, &u, &dudt, &p);
+            SXFunction::new(
+                format!("{}_path_constraints", self.name),
+                vec![
+                    NamedMatrix::new("x", symbolic_column(&x)?)?,
+                    NamedMatrix::new("u", symbolic_column(&u)?)?,
+                    NamedMatrix::new("dudt", symbolic_column(&dudt)?)?,
+                    NamedMatrix::new("p", symbolic_column(&p)?)?,
+                ],
+                vec![NamedMatrix::new("path", symbolic_column(&path)?)?],
+            )
+        })
+    }
+
+    fn build_boundary_equalities_symbolic_function(
+        &self,
+        options: OcpKernelFunctionOptions,
+    ) -> Result<Option<SXFunction>, SxError> {
+        self.configured_symbolic_function(options, || {
+            let x0 = symbolic_value::<X>("x0")?;
+            let u0 = symbolic_value::<U>("u0")?;
+            let xf = symbolic_value::<X>("xf")?;
+            let uf = symbolic_value::<U>("uf")?;
+            let p = symbolic_value::<P>("p")?;
+            let tf = SX::sym("tf");
+            let values = (self.boundary_equalities)(&x0, &u0, &xf, &uf, &p, &tf);
+            SXFunction::new(
+                format!("{}_boundary_equalities", self.name),
+                vec![
+                    NamedMatrix::new("x0", symbolic_column(&x0)?)?,
+                    NamedMatrix::new("u0", symbolic_column(&u0)?)?,
+                    NamedMatrix::new("xf", symbolic_column(&xf)?)?,
+                    NamedMatrix::new("uf", symbolic_column(&uf)?)?,
+                    NamedMatrix::new("p", symbolic_column(&p)?)?,
+                    NamedMatrix::new("tf", SXMatrix::dense_column(vec![tf])?)?,
+                ],
+                vec![NamedMatrix::new("boundary_eq", symbolic_column(&values)?)?],
+            )
+        })
+    }
+
+    fn build_boundary_inequalities_symbolic_function(
+        &self,
+        options: OcpKernelFunctionOptions,
+    ) -> Result<Option<SXFunction>, SxError> {
+        self.configured_symbolic_function(options, || {
+            let x0 = symbolic_value::<X>("x0")?;
+            let u0 = symbolic_value::<U>("u0")?;
+            let xf = symbolic_value::<X>("xf")?;
+            let uf = symbolic_value::<U>("uf")?;
+            let p = symbolic_value::<P>("p")?;
+            let tf = SX::sym("tf");
+            let values = (self.boundary_inequalities)(&x0, &u0, &xf, &uf, &p, &tf);
+            SXFunction::new(
+                format!("{}_boundary_inequalities", self.name),
+                vec![
+                    NamedMatrix::new("x0", symbolic_column(&x0)?)?,
+                    NamedMatrix::new("u0", symbolic_column(&u0)?)?,
+                    NamedMatrix::new("xf", symbolic_column(&xf)?)?,
+                    NamedMatrix::new("uf", symbolic_column(&uf)?)?,
+                    NamedMatrix::new("p", symbolic_column(&p)?)?,
+                    NamedMatrix::new("tf", SXMatrix::dense_column(vec![tf])?)?,
+                ],
+                vec![NamedMatrix::new(
+                    "boundary_ineq",
+                    symbolic_column(&values)?,
+                )?],
+            )
+        })
+    }
+
+    fn eval_ode_symbolic(
+        &self,
+        library: &OcpSymbolicFunctionLibrary,
+        x: &X,
+        u: &U,
+        parameters: &P,
+    ) -> Result<X, SxError> {
+        match &library.ode {
+            Some(function) => call_typed_unary_output::<X>(
+                function,
+                vec![
+                    symbolic_column(x)?,
+                    symbolic_column(u)?,
+                    symbolic_column(parameters)?,
+                ],
+            ),
+            None => Ok((self.ode)(x, u, parameters)),
+        }
+    }
+
+    fn eval_objective_lagrange_symbolic(
+        &self,
+        library: &OcpSymbolicFunctionLibrary,
+        x: &X,
+        u: &U,
+        dudt: &U,
+        parameters: &P,
+    ) -> Result<SX, SxError> {
+        match &library.objective_lagrange {
+            Some(function) => function.call_scalar(&[
+                symbolic_column(x)?,
+                symbolic_column(u)?,
+                symbolic_column(dudt)?,
+                symbolic_column(parameters)?,
+            ]),
+            None => Ok((self.objective_lagrange)(x, u, dudt, parameters)),
+        }
+    }
+
+    fn eval_objective_mayer_symbolic(
+        &self,
+        library: &OcpSymbolicFunctionLibrary,
+        x0: &X,
+        u0: &U,
+        xf: &X,
+        uf: &U,
+        parameters: &P,
+        tf: &SX,
+    ) -> Result<SX, SxError> {
+        match &library.objective_mayer {
+            Some(function) => function.call_scalar(&[
+                symbolic_column(x0)?,
+                symbolic_column(u0)?,
+                symbolic_column(xf)?,
+                symbolic_column(uf)?,
+                symbolic_column(parameters)?,
+                SXMatrix::dense_column(vec![*tf])?,
+            ]),
+            None => Ok((self.objective_mayer)(x0, u0, xf, uf, parameters, tf)),
+        }
+    }
+
+    fn eval_path_constraints_symbolic(
+        &self,
+        library: &OcpSymbolicFunctionLibrary,
+        x: &X,
+        u: &U,
+        dudt: &U,
+        parameters: &P,
+    ) -> Result<C, SxError> {
+        match &library.path_constraints {
+            Some(function) => call_typed_unary_output::<C>(
+                function,
+                vec![
+                    symbolic_column(x)?,
+                    symbolic_column(u)?,
+                    symbolic_column(dudt)?,
+                    symbolic_column(parameters)?,
+                ],
+            ),
+            None => Ok((self.path_constraints)(x, u, dudt, parameters)),
+        }
+    }
+
+    fn eval_boundary_equalities_symbolic(
+        &self,
+        library: &OcpSymbolicFunctionLibrary,
+        x0: &X,
+        u0: &U,
+        xf: &X,
+        uf: &U,
+        parameters: &P,
+        tf: &SX,
+    ) -> Result<Beq, SxError> {
+        match &library.boundary_equalities {
+            Some(function) => call_typed_unary_output::<Beq>(
+                function,
+                vec![
+                    symbolic_column(x0)?,
+                    symbolic_column(u0)?,
+                    symbolic_column(xf)?,
+                    symbolic_column(uf)?,
+                    symbolic_column(parameters)?,
+                    SXMatrix::dense_column(vec![*tf])?,
+                ],
+            ),
+            None => Ok((self.boundary_equalities)(x0, u0, xf, uf, parameters, tf)),
+        }
+    }
+
+    fn eval_boundary_inequalities_symbolic(
+        &self,
+        library: &OcpSymbolicFunctionLibrary,
+        x0: &X,
+        u0: &U,
+        xf: &X,
+        uf: &U,
+        parameters: &P,
+        tf: &SX,
+    ) -> Result<Bineq, SxError> {
+        match &library.boundary_inequalities {
+            Some(function) => call_typed_unary_output::<Bineq>(
+                function,
+                vec![
+                    symbolic_column(x0)?,
+                    symbolic_column(u0)?,
+                    symbolic_column(xf)?,
+                    symbolic_column(uf)?,
+                    symbolic_column(parameters)?,
+                    SXMatrix::dense_column(vec![*tf])?,
+                ],
+            ),
+            None => Ok((self.boundary_inequalities)(x0, u0, xf, uf, parameters, tf)),
+        }
+    }
+}
+
 impl<X, U, P, C, Beq, Bineq, const N: usize, const RK4_SUBSTEPS: usize>
     Ocp<X, U, P, C, Beq, Bineq, MultipleShooting<N, RK4_SUBSTEPS>>
 where
@@ -787,6 +1290,97 @@ where
     Numeric<P>: Vectorize<f64, Rebind<f64> = Numeric<P>> + Clone,
     Numeric<Beq>: Vectorize<f64, Rebind<f64> = Numeric<Beq>> + Clone,
 {
+    fn build_multiple_shooting_symbolic_function_library(
+        &self,
+        options: OcpSymbolicFunctionOptions,
+    ) -> Result<OcpSymbolicFunctionLibrary, SxError> {
+        let mut library = self.build_symbolic_function_library(options)?;
+        library.multiple_shooting_integrator = self
+            .build_multiple_shooting_integrator_symbolic_function(
+                &library,
+                options.multiple_shooting_integrator,
+            )?;
+        Ok(library)
+    }
+
+    fn build_multiple_shooting_integrator_symbolic_function(
+        &self,
+        library: &OcpSymbolicFunctionLibrary,
+        options: OcpKernelFunctionOptions,
+    ) -> Result<Option<SXFunction>, SxError> {
+        self.configured_symbolic_function(options, || {
+            let x = symbolic_value::<X>("x")?;
+            let u = symbolic_value::<U>("u")?;
+            let dudt = symbolic_value::<U>("dudt")?;
+            let p = symbolic_value::<P>("p")?;
+            let dt = SX::sym("dt");
+            let (x_next, u_next, objective) = rk4_integrate_symbolic(
+                &x,
+                &u,
+                &dudt,
+                dt,
+                RK4_SUBSTEPS,
+                |x_eval, u_eval| self.eval_ode_symbolic(library, x_eval, u_eval, &p),
+                |x_eval, u_eval| {
+                    self.eval_objective_lagrange_symbolic(library, x_eval, u_eval, &dudt, &p)
+                },
+            )?;
+            SXFunction::new(
+                format!("{}_multiple_shooting_integrator", self.name),
+                vec![
+                    NamedMatrix::new("x", symbolic_column(&x)?)?,
+                    NamedMatrix::new("u", symbolic_column(&u)?)?,
+                    NamedMatrix::new("dudt", symbolic_column(&dudt)?)?,
+                    NamedMatrix::new("p", symbolic_column(&p)?)?,
+                    NamedMatrix::new("dt", SXMatrix::dense_column(vec![dt])?)?,
+                ],
+                vec![
+                    NamedMatrix::new("x_next", symbolic_column(&x_next)?)?,
+                    NamedMatrix::new("u_next", symbolic_column(&u_next)?)?,
+                    NamedMatrix::new("objective", SXMatrix::scalar(objective))?,
+                ],
+            )
+        })
+    }
+
+    fn eval_multiple_shooting_integrator_symbolic(
+        &self,
+        library: &OcpSymbolicFunctionLibrary,
+        x: &X,
+        u: &U,
+        dudt: &U,
+        parameters: &P,
+        dt: SX,
+    ) -> Result<(X, U, SX), SxError> {
+        match &library.multiple_shooting_integrator {
+            Some(function) => {
+                let outputs = function.call(&[
+                    symbolic_column(x)?,
+                    symbolic_column(u)?,
+                    symbolic_column(dudt)?,
+                    symbolic_column(parameters)?,
+                    SXMatrix::dense_column(vec![dt])?,
+                ])?;
+                Ok((
+                    unflatten_typed_output::<X>(&outputs[0])?,
+                    unflatten_typed_output::<U>(&outputs[1])?,
+                    outputs[2].scalar_expr()?,
+                ))
+            }
+            None => rk4_integrate_symbolic(
+                x,
+                u,
+                dudt,
+                dt,
+                RK4_SUBSTEPS,
+                |x_eval, u_eval| self.eval_ode_symbolic(library, x_eval, u_eval, parameters),
+                |x_eval, u_eval| {
+                    self.eval_objective_lagrange_symbolic(library, x_eval, u_eval, dudt, parameters)
+                },
+            ),
+        }
+    }
+
     pub fn compile_jit(
         &self,
     ) -> Result<CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>, OcpCompileError>
@@ -840,8 +1434,10 @@ where
             >,
         OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
     {
-        self.compile_jit_with_options_and_symbolic_callback(
-            FunctionCompileOptions::from(LlvmOptimizationLevel::O3),
+        self.compile_jit_with_ocp_options_and_symbolic_callback(
+            OcpCompileOptions::for_multiple_shooting(FunctionCompileOptions::from(
+                LlvmOptimizationLevel::O3,
+            )),
             on_symbolic_ready,
         )
     }
@@ -931,7 +1527,35 @@ where
             >,
         OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
     {
-        self.compile_jit_with_options_and_symbolic_callback(options, |_| {})
+        self.compile_jit_with_ocp_options(OcpCompileOptions::for_multiple_shooting(options))
+    }
+
+    pub fn compile_jit_with_ocp_options(
+        &self,
+        options: OcpCompileOptions,
+    ) -> Result<CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>, OcpCompileError>
+    where
+        Mesh<X, N>: Vectorize<SX, Rebind<SX> = Mesh<X, N>>,
+        Mesh<U, N>: Vectorize<SX, Rebind<SX> = Mesh<U, N>>,
+        [C; N]: Vectorize<SX, Rebind<SX> = [C; N]>,
+        [X; N]: Vectorize<SX, Rebind<SX> = [X; N]>,
+        [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,
+        MsVars<X, U, N>:
+            Vectorize<SX, Rebind<SX> = MsVars<X, U, N>, Rebind<f64> = MsVarsNum<X, U, N>>,
+        MsEqualities<X, U, N>: Vectorize<SX, Rebind<SX> = MsEqualities<X, U, N>>,
+        MsIneq<C, Beq, Bineq, N>: Vectorize<
+                SX,
+                Rebind<SX> = MsIneq<C, Beq, Bineq, N>,
+                Rebind<f64> = MsIneqNum<C, Beq, Bineq, N>,
+            >,
+        OcpParameters<P, Beq>: Vectorize<
+                SX,
+                Rebind<SX> = OcpParameters<P, Beq>,
+                Rebind<f64> = OcpParametersNum<P, Beq>,
+            >,
+        OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
+    {
+        self.compile_jit_with_ocp_options_and_symbolic_callback(options, |_| {})
     }
 
     pub fn compile_jit_with_opt_level_and_symbolic_callback<CB>(
@@ -995,8 +1619,8 @@ where
             >,
         OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
     {
-        self.compile_jit_with_options_and_progress_callback(
-            FunctionCompileOptions::from(opt_level),
+        self.compile_jit_with_ocp_options_and_progress_callback(
+            OcpCompileOptions::from(opt_level),
             on_progress,
         )
     }
@@ -1004,6 +1628,39 @@ where
     pub fn compile_jit_with_options_and_progress_callback<CB>(
         &self,
         options: FunctionCompileOptions,
+        on_progress: CB,
+    ) -> Result<CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>, OcpCompileError>
+    where
+        CB: FnMut(OcpCompileProgress),
+        Mesh<X, N>: Vectorize<SX, Rebind<SX> = Mesh<X, N>>,
+        Mesh<U, N>: Vectorize<SX, Rebind<SX> = Mesh<U, N>>,
+        [C; N]: Vectorize<SX, Rebind<SX> = [C; N]>,
+        [X; N]: Vectorize<SX, Rebind<SX> = [X; N]>,
+        [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,
+        MsVars<X, U, N>:
+            Vectorize<SX, Rebind<SX> = MsVars<X, U, N>, Rebind<f64> = MsVarsNum<X, U, N>>,
+        MsEqualities<X, U, N>: Vectorize<SX, Rebind<SX> = MsEqualities<X, U, N>>,
+        MsIneq<C, Beq, Bineq, N>: Vectorize<
+                SX,
+                Rebind<SX> = MsIneq<C, Beq, Bineq, N>,
+                Rebind<f64> = MsIneqNum<C, Beq, Bineq, N>,
+            >,
+        OcpParameters<P, Beq>: Vectorize<
+                SX,
+                Rebind<SX> = OcpParameters<P, Beq>,
+                Rebind<f64> = OcpParametersNum<P, Beq>,
+            >,
+        OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
+    {
+        self.compile_jit_with_ocp_options_and_progress_callback(
+            OcpCompileOptions::from(options),
+            on_progress,
+        )
+    }
+
+    pub fn compile_jit_with_ocp_options_and_progress_callback<CB>(
+        &self,
+        options: OcpCompileOptions,
         mut on_progress: CB,
     ) -> Result<CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>, OcpCompileError>
     where
@@ -1029,15 +1686,19 @@ where
         OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
     {
         validate_multiple_shooting::<N, RK4_SUBSTEPS>()?;
+        let symbolic_library =
+            self.build_multiple_shooting_symbolic_function_library(options.symbolic_functions)?;
         let symbolic_vars = symbolic_value::<MsVars<X, U, N>>("w")?;
         let symbolic_params = symbolic_value::<OcpParameters<P, Beq>>("runtime")?;
-        let outputs = self.transcribe_multiple_shooting(&symbolic_vars, &symbolic_params)?;
+        let outputs =
+            self.transcribe_multiple_shooting(&symbolic_vars, &symbolic_params, &symbolic_library)?;
         let promotion_plan = build_promotion_plan::<MsVars<X, U, N>, [C; N], Beq, Bineq>(
             &symbolic_vars,
             &outputs.inequalities,
         );
         let promotion_offsets =
-            compile_promotion_offsets(&promotion_plan, &symbolic_params, options)?;
+            compile_promotion_offsets(&promotion_plan, &symbolic_params, options.function_options)?;
+        let symbolic_library_for_nlp = symbolic_library.clone();
         let symbolic = symbolic_nlp::<
             MsVars<X, U, N>,
             OcpParameters<P, Beq>,
@@ -1045,23 +1706,37 @@ where
             MsIneq<C, Beq, Bineq, N>,
             _,
         >(self.name.clone(), |vars, params| {
-            self.transcribe_multiple_shooting(vars, params)
+            self.transcribe_multiple_shooting(vars, params, &symbolic_library_for_nlp)
                 .expect("multiple shooting transcription should be infallible after validation")
         })?;
-        let compiled =
-            symbolic.compile_jit_with_options_and_symbolic_callback(options, |metadata| {
-                on_progress(OcpCompileProgress::SymbolicReady(metadata));
-            })?;
+        let compiled = symbolic.compile_jit_with_options_and_symbolic_progress_callback(
+            options.function_options,
+            |progress| match progress {
+                SymbolicCompileProgress::Stage(progress) => {
+                    on_progress(OcpCompileProgress::SymbolicStage(progress));
+                }
+                SymbolicCompileProgress::Ready(metadata) => {
+                    on_progress(OcpCompileProgress::SymbolicReady(metadata));
+                }
+            },
+        )?;
         let xdot_started = Instant::now();
-        let xdot_helper = compile_xdot_helper::<X, U, P>(&*self.ode, options)?;
+        let xdot_helper = compile_xdot_helper::<X, U, P>(
+            &*self.ode,
+            symbolic_library.ode.as_ref(),
+            options.function_options,
+        )?;
         let xdot_helper_time = xdot_started.elapsed();
         on_progress(OcpCompileProgress::HelperCompiled {
             helper: OcpCompileHelperKind::Xdot,
             elapsed: xdot_helper_time,
         });
         let rk4_arc_started = Instant::now();
-        let rk4_arc_helper =
-            compile_multiple_shooting_arc_helper::<X, U, P, RK4_SUBSTEPS>(&*self.ode, options)?;
+        let rk4_arc_helper = compile_multiple_shooting_arc_helper::<X, U, P, RK4_SUBSTEPS>(
+            &*self.ode,
+            &symbolic_library,
+            options.function_options,
+        )?;
         let multiple_shooting_arc_helper_time = rk4_arc_started.elapsed();
         on_progress(OcpCompileProgress::HelperCompiled {
             helper: OcpCompileHelperKind::MultipleShootingArc,
@@ -1108,7 +1783,44 @@ where
             >,
         OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
     {
-        self.compile_jit_with_options_and_progress_callback(options, |progress| {
+        self.compile_jit_with_ocp_options_and_progress_callback(
+            OcpCompileOptions::from(options),
+            |progress| {
+                if let OcpCompileProgress::SymbolicReady(metadata) = progress {
+                    on_symbolic_ready(metadata);
+                }
+            },
+        )
+    }
+
+    pub fn compile_jit_with_ocp_options_and_symbolic_callback<CB>(
+        &self,
+        options: OcpCompileOptions,
+        mut on_symbolic_ready: CB,
+    ) -> Result<CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>, OcpCompileError>
+    where
+        CB: FnMut(SymbolicCompileMetadata),
+        Mesh<X, N>: Vectorize<SX, Rebind<SX> = Mesh<X, N>>,
+        Mesh<U, N>: Vectorize<SX, Rebind<SX> = Mesh<U, N>>,
+        [C; N]: Vectorize<SX, Rebind<SX> = [C; N]>,
+        [X; N]: Vectorize<SX, Rebind<SX> = [X; N]>,
+        [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,
+        MsVars<X, U, N>:
+            Vectorize<SX, Rebind<SX> = MsVars<X, U, N>, Rebind<f64> = MsVarsNum<X, U, N>>,
+        MsEqualities<X, U, N>: Vectorize<SX, Rebind<SX> = MsEqualities<X, U, N>>,
+        MsIneq<C, Beq, Bineq, N>: Vectorize<
+                SX,
+                Rebind<SX> = MsIneq<C, Beq, Bineq, N>,
+                Rebind<f64> = MsIneqNum<C, Beq, Bineq, N>,
+            >,
+        OcpParameters<P, Beq>: Vectorize<
+                SX,
+                Rebind<SX> = OcpParameters<P, Beq>,
+                Rebind<f64> = OcpParametersNum<P, Beq>,
+            >,
+        OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
+    {
+        self.compile_jit_with_ocp_options_and_progress_callback(options, |progress| {
             if let OcpCompileProgress::SymbolicReady(metadata) = progress {
                 on_symbolic_ready(metadata);
             }
@@ -1119,6 +1831,7 @@ where
         &self,
         vars: &MsVars<X, U, N>,
         params: &OcpParameters<P, Beq>,
+        symbolic_library: &OcpSymbolicFunctionLibrary,
     ) -> Result<SymbolicNlpOutputs<MsEqualities<X, U, N>, MsIneq<C, Beq, Bineq, N>>, SxError>
     where
         Mesh<X, N>: Vectorize<SX, Rebind<SX> = Mesh<X, N>>,
@@ -1140,23 +1853,34 @@ where
                 .expect("zero control should unflatten")
         });
         let mut path = std::array::from_fn(|_| {
-            (self.path_constraints)(&x_mesh.nodes[0], &u_mesh.nodes[0], &dudt[0], parameters)
+            self.eval_path_constraints_symbolic(
+                symbolic_library,
+                &x_mesh.nodes[0],
+                &u_mesh.nodes[0],
+                &dudt[0],
+                parameters,
+            )
+            .expect("path constraint call should be infallible after validation")
         });
 
         for interval in 0..N {
             let x_start = &x_mesh.nodes[interval];
             let u_start = &u_mesh.nodes[interval];
             let dudt_interval = &dudt[interval];
-            path[interval] = (self.path_constraints)(x_start, u_start, dudt_interval, parameters);
-            let (x_end, u_end, q_end) = rk4_integrate_symbolic(
+            path[interval] = self.eval_path_constraints_symbolic(
+                symbolic_library,
+                x_start,
+                u_start,
+                dudt_interval,
+                parameters,
+            )?;
+            let (x_end, u_end, q_end) = self.eval_multiple_shooting_integrator_symbolic(
+                symbolic_library,
                 x_start,
                 u_start,
                 dudt_interval,
                 parameters,
                 step,
-                RK4_SUBSTEPS,
-                &*self.ode,
-                &*self.objective_lagrange,
             )?;
             objective += q_end;
             let x_next = if interval + 1 < N {
@@ -1173,31 +1897,34 @@ where
             u_defects[interval] = subtract_vectorized(&u_next, &u_end)?;
         }
 
-        let boundary_eq_values = (self.boundary_equalities)(
+        let boundary_eq_values = self.eval_boundary_equalities_symbolic(
+            symbolic_library,
             &x_mesh.nodes[0],
             &u_mesh.nodes[0],
             &x_mesh.terminal,
             &u_mesh.terminal,
             parameters,
             tf,
-        );
+        )?;
         let boundary_eq_residual = subtract_vectorized(&boundary_eq_values, beq)?;
-        let boundary_ineq = (self.boundary_inequalities)(
+        let boundary_ineq = self.eval_boundary_inequalities_symbolic(
+            symbolic_library,
             &x_mesh.nodes[0],
             &u_mesh.nodes[0],
             &x_mesh.terminal,
             &u_mesh.terminal,
             parameters,
             tf,
-        );
-        objective += (self.objective_mayer)(
+        )?;
+        objective += self.eval_objective_mayer_symbolic(
+            symbolic_library,
             &x_mesh.nodes[0],
             &u_mesh.nodes[0],
             &x_mesh.terminal,
             &u_mesh.terminal,
             parameters,
             tf,
-        );
+        )?;
         Ok(SymbolicNlpOutputs {
             objective,
             equalities: (x_defects, u_defects),
@@ -1277,8 +2004,10 @@ where
         [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,
         OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
     {
-        self.compile_jit_with_options_and_symbolic_callback(
-            FunctionCompileOptions::from(LlvmOptimizationLevel::O3),
+        self.compile_jit_with_ocp_options_and_symbolic_callback(
+            OcpCompileOptions::for_direct_collocation(FunctionCompileOptions::from(
+                LlvmOptimizationLevel::O3,
+            )),
             on_symbolic_ready,
         )
     }
@@ -1374,7 +2103,37 @@ where
         [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,
         OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
     {
-        self.compile_jit_with_options_and_symbolic_callback(options, |_| {})
+        self.compile_jit_with_ocp_options(OcpCompileOptions::for_direct_collocation(options))
+    }
+
+    pub fn compile_jit_with_ocp_options(
+        &self,
+        options: OcpCompileOptions,
+    ) -> Result<CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq, N, K>, OcpCompileError>
+    where
+        Mesh<X, N>: Vectorize<SX, Rebind<SX> = Mesh<X, N>>,
+        Mesh<U, N>: Vectorize<SX, Rebind<SX> = Mesh<U, N>>,
+        IntervalGrid<X, N, K>: Vectorize<SX, Rebind<SX> = IntervalGrid<X, N, K>>,
+        IntervalGrid<U, N, K>: Vectorize<SX, Rebind<SX> = IntervalGrid<U, N, K>>,
+        IntervalGrid<C, N, K>: Vectorize<SX, Rebind<SX> = IntervalGrid<C, N, K>>,
+        DcVars<X, U, N, K>:
+            Vectorize<SX, Rebind<SX> = DcVars<X, U, N, K>, Rebind<f64> = DcVarsNum<X, U, N, K>>,
+        DcEqualities<X, U, N, K>: Vectorize<SX, Rebind<SX> = DcEqualities<X, U, N, K>>,
+        DcIneq<C, Beq, Bineq, N, K>: Vectorize<
+                SX,
+                Rebind<SX> = DcIneq<C, Beq, Bineq, N, K>,
+                Rebind<f64> = DcIneqNum<C, Beq, Bineq, N, K>,
+            >,
+        OcpParameters<P, Beq>: Vectorize<
+                SX,
+                Rebind<SX> = OcpParameters<P, Beq>,
+                Rebind<f64> = OcpParametersNum<P, Beq>,
+            >,
+        [X; N]: Vectorize<SX, Rebind<SX> = [X; N]>,
+        [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,
+        OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
+    {
+        self.compile_jit_with_ocp_options_and_symbolic_callback(options, |_| {})
     }
 
     pub fn compile_jit_with_opt_level_and_symbolic_callback<CB>(
@@ -1442,8 +2201,8 @@ where
         [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,
         OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
     {
-        self.compile_jit_with_options_and_progress_callback(
-            FunctionCompileOptions::from(opt_level),
+        self.compile_jit_with_ocp_options_and_progress_callback(
+            OcpCompileOptions::from(opt_level),
             on_progress,
         )
     }
@@ -1451,6 +2210,41 @@ where
     pub fn compile_jit_with_options_and_progress_callback<CB>(
         &self,
         options: FunctionCompileOptions,
+        on_progress: CB,
+    ) -> Result<CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq, N, K>, OcpCompileError>
+    where
+        CB: FnMut(OcpCompileProgress),
+        Mesh<X, N>: Vectorize<SX, Rebind<SX> = Mesh<X, N>>,
+        Mesh<U, N>: Vectorize<SX, Rebind<SX> = Mesh<U, N>>,
+        IntervalGrid<X, N, K>: Vectorize<SX, Rebind<SX> = IntervalGrid<X, N, K>>,
+        IntervalGrid<U, N, K>: Vectorize<SX, Rebind<SX> = IntervalGrid<U, N, K>>,
+        IntervalGrid<C, N, K>: Vectorize<SX, Rebind<SX> = IntervalGrid<C, N, K>>,
+        DcVars<X, U, N, K>:
+            Vectorize<SX, Rebind<SX> = DcVars<X, U, N, K>, Rebind<f64> = DcVarsNum<X, U, N, K>>,
+        DcEqualities<X, U, N, K>: Vectorize<SX, Rebind<SX> = DcEqualities<X, U, N, K>>,
+        DcIneq<C, Beq, Bineq, N, K>: Vectorize<
+                SX,
+                Rebind<SX> = DcIneq<C, Beq, Bineq, N, K>,
+                Rebind<f64> = DcIneqNum<C, Beq, Bineq, N, K>,
+            >,
+        OcpParameters<P, Beq>: Vectorize<
+                SX,
+                Rebind<SX> = OcpParameters<P, Beq>,
+                Rebind<f64> = OcpParametersNum<P, Beq>,
+            >,
+        [X; N]: Vectorize<SX, Rebind<SX> = [X; N]>,
+        [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,
+        OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
+    {
+        self.compile_jit_with_ocp_options_and_progress_callback(
+            OcpCompileOptions::from(options),
+            on_progress,
+        )
+    }
+
+    pub fn compile_jit_with_ocp_options_and_progress_callback<CB>(
+        &self,
+        options: OcpCompileOptions,
         mut on_progress: CB,
     ) -> Result<CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq, N, K>, OcpCompileError>
     where
@@ -1478,18 +2272,24 @@ where
         OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
     {
         validate_direct_collocation::<N, K>()?;
+        let symbolic_library = self.build_symbolic_function_library(options.symbolic_functions)?;
         let coefficients = collocation_coefficients(self.scheme.family, K)?;
         let symbolic_vars = symbolic_value::<DcVars<X, U, N, K>>("w")?;
         let symbolic_params = symbolic_value::<OcpParameters<P, Beq>>("runtime")?;
-        let outputs =
-            self.transcribe_direct_collocation(&symbolic_vars, &symbolic_params, &coefficients)?;
+        let outputs = self.transcribe_direct_collocation(
+            &symbolic_vars,
+            &symbolic_params,
+            &coefficients,
+            &symbolic_library,
+        )?;
         let promotion_plan =
             build_promotion_plan::<DcVars<X, U, N, K>, IntervalGrid<C, N, K>, Beq, Bineq>(
                 &symbolic_vars,
                 &outputs.inequalities,
             );
         let promotion_offsets =
-            compile_promotion_offsets(&promotion_plan, &symbolic_params, options)?;
+            compile_promotion_offsets(&promotion_plan, &symbolic_params, options.function_options)?;
+        let symbolic_library_for_nlp = symbolic_library.clone();
         let symbolic = symbolic_nlp::<
             DcVars<X, U, N, K>,
             OcpParameters<P, Beq>,
@@ -1497,15 +2297,31 @@ where
             DcIneq<C, Beq, Bineq, N, K>,
             _,
         >(self.name.clone(), |vars, params| {
-            self.transcribe_direct_collocation(vars, params, &coefficients)
-                .expect("direct collocation transcription should be infallible after validation")
+            self.transcribe_direct_collocation(
+                vars,
+                params,
+                &coefficients,
+                &symbolic_library_for_nlp,
+            )
+            .expect("direct collocation transcription should be infallible after validation")
         })?;
-        let compiled =
-            symbolic.compile_jit_with_options_and_symbolic_callback(options, |metadata| {
-                on_progress(OcpCompileProgress::SymbolicReady(metadata));
-            })?;
+        let compiled = symbolic.compile_jit_with_options_and_symbolic_progress_callback(
+            options.function_options,
+            |progress| match progress {
+                SymbolicCompileProgress::Stage(progress) => {
+                    on_progress(OcpCompileProgress::SymbolicStage(progress));
+                }
+                SymbolicCompileProgress::Ready(metadata) => {
+                    on_progress(OcpCompileProgress::SymbolicReady(metadata));
+                }
+            },
+        )?;
         let xdot_started = Instant::now();
-        let xdot_helper = compile_xdot_helper::<X, U, P>(&*self.ode, options)?;
+        let xdot_helper = compile_xdot_helper::<X, U, P>(
+            &*self.ode,
+            symbolic_library.ode.as_ref(),
+            options.function_options,
+        )?;
         let xdot_helper_time = xdot_started.elapsed();
         on_progress(OcpCompileProgress::HelperCompiled {
             helper: OcpCompileHelperKind::Xdot,
@@ -1554,7 +2370,46 @@ where
         [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,
         OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
     {
-        self.compile_jit_with_options_and_progress_callback(options, |progress| {
+        self.compile_jit_with_ocp_options_and_progress_callback(
+            OcpCompileOptions::from(options),
+            |progress| {
+                if let OcpCompileProgress::SymbolicReady(metadata) = progress {
+                    on_symbolic_ready(metadata);
+                }
+            },
+        )
+    }
+
+    pub fn compile_jit_with_ocp_options_and_symbolic_callback<CB>(
+        &self,
+        options: OcpCompileOptions,
+        mut on_symbolic_ready: CB,
+    ) -> Result<CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq, N, K>, OcpCompileError>
+    where
+        CB: FnMut(SymbolicCompileMetadata),
+        Mesh<X, N>: Vectorize<SX, Rebind<SX> = Mesh<X, N>>,
+        Mesh<U, N>: Vectorize<SX, Rebind<SX> = Mesh<U, N>>,
+        IntervalGrid<X, N, K>: Vectorize<SX, Rebind<SX> = IntervalGrid<X, N, K>>,
+        IntervalGrid<U, N, K>: Vectorize<SX, Rebind<SX> = IntervalGrid<U, N, K>>,
+        IntervalGrid<C, N, K>: Vectorize<SX, Rebind<SX> = IntervalGrid<C, N, K>>,
+        DcVars<X, U, N, K>:
+            Vectorize<SX, Rebind<SX> = DcVars<X, U, N, K>, Rebind<f64> = DcVarsNum<X, U, N, K>>,
+        DcEqualities<X, U, N, K>: Vectorize<SX, Rebind<SX> = DcEqualities<X, U, N, K>>,
+        DcIneq<C, Beq, Bineq, N, K>: Vectorize<
+                SX,
+                Rebind<SX> = DcIneq<C, Beq, Bineq, N, K>,
+                Rebind<f64> = DcIneqNum<C, Beq, Bineq, N, K>,
+            >,
+        OcpParameters<P, Beq>: Vectorize<
+                SX,
+                Rebind<SX> = OcpParameters<P, Beq>,
+                Rebind<f64> = OcpParametersNum<P, Beq>,
+            >,
+        [X; N]: Vectorize<SX, Rebind<SX> = [X; N]>,
+        [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,
+        OcpParametersNum<P, Beq>: Vectorize<f64, Rebind<f64> = OcpParametersNum<P, Beq>>,
+    {
+        self.compile_jit_with_ocp_options_and_progress_callback(options, |progress| {
             if let OcpCompileProgress::SymbolicReady(metadata) = progress {
                 on_symbolic_ready(metadata);
             }
@@ -1566,6 +2421,7 @@ where
         vars: &DcVars<X, U, N, K>,
         params: &OcpParameters<P, Beq>,
         coeffs: &CollocationCoefficients,
+        symbolic_library: &OcpSymbolicFunctionLibrary,
     ) -> Result<SymbolicNlpOutputs<DcEqualities<X, U, N, K>, DcIneq<C, Beq, Bineq, N, K>>, SxError>
     where
         Mesh<X, N>: Vectorize<SX, Rebind<SX> = Mesh<X, N>>,
@@ -1597,12 +2453,14 @@ where
         let mut path = IntervalGrid {
             intervals: std::array::from_fn(|interval| {
                 std::array::from_fn(|root| {
-                    (self.path_constraints)(
+                    self.eval_path_constraints_symbolic(
+                        symbolic_library,
                         &root_x.intervals[interval][root],
                         &root_u.intervals[interval][root],
                         &root_dudt.intervals[interval][root],
                         parameters,
                     )
+                    .expect("path constraint call should be infallible after validation")
                 })
             }),
         };
@@ -1627,17 +2485,19 @@ where
             basis_u.extend(root_u.intervals[interval].iter().cloned());
 
             for root in 0..K {
-                path.intervals[interval][root] = (self.path_constraints)(
+                path.intervals[interval][root] = self.eval_path_constraints_symbolic(
+                    symbolic_library,
                     &root_x.intervals[interval][root],
                     &root_u.intervals[interval][root],
                     &root_dudt.intervals[interval][root],
                     parameters,
-                );
-                let xdot = (self.ode)(
+                )?;
+                let xdot = self.eval_ode_symbolic(
+                    symbolic_library,
                     &root_x.intervals[interval][root],
                     &root_u.intervals[interval][root],
                     parameters,
-                );
+                )?;
                 let xpoly = weighted_sum_vectorized(&basis_x, &coeffs.c_matrix[root])?;
                 let upoly = weighted_sum_vectorized(&basis_u, &coeffs.c_matrix[root])?;
                 collocation_x[interval][root] =
@@ -1648,12 +2508,13 @@ where
                 )?;
                 objective += step
                     * coeffs.b_vector[root + 1]
-                    * (self.objective_lagrange)(
+                    * self.eval_objective_lagrange_symbolic(
+                        symbolic_library,
                         &root_x.intervals[interval][root],
                         &root_u.intervals[interval][root],
                         &root_dudt.intervals[interval][root],
                         parameters,
-                    );
+                    )?;
             }
 
             let x_end = weighted_sum_vectorized(&basis_x, &coeffs.d_vector)?;
@@ -1672,31 +2533,34 @@ where
             continuity_u[interval] = subtract_vectorized(&u_next, &u_end)?;
         }
 
-        let boundary_eq_values = (self.boundary_equalities)(
+        let boundary_eq_values = self.eval_boundary_equalities_symbolic(
+            symbolic_library,
             &x_mesh.nodes[0],
             &u_mesh.nodes[0],
             &x_mesh.terminal,
             &u_mesh.terminal,
             parameters,
             tf,
-        );
+        )?;
         let boundary_eq_residual = subtract_vectorized(&boundary_eq_values, beq)?;
-        let boundary_ineq = (self.boundary_inequalities)(
+        let boundary_ineq = self.eval_boundary_inequalities_symbolic(
+            symbolic_library,
             &x_mesh.nodes[0],
             &u_mesh.nodes[0],
             &x_mesh.terminal,
             &u_mesh.terminal,
             parameters,
             tf,
-        );
-        objective += (self.objective_mayer)(
+        )?;
+        objective += self.eval_objective_mayer_symbolic(
+            symbolic_library,
             &x_mesh.nodes[0],
             &u_mesh.nodes[0],
             &x_mesh.terminal,
             &u_mesh.terminal,
             parameters,
             tf,
-        );
+        )?;
 
         Ok(SymbolicNlpOutputs {
             objective,
@@ -1767,6 +2631,52 @@ where
 
     pub fn backend_compile_report(&self) -> &BackendCompileReport {
         self.compiled.backend_compile_report()
+    }
+
+    pub fn benchmark_nlp_evaluations(
+        &self,
+        values: &MultipleShootingRuntimeValues<
+            Numeric<P>,
+            BoundTemplate<C>,
+            Numeric<Beq>,
+            BoundTemplate<Bineq>,
+            Numeric<X>,
+            Numeric<U>,
+            N,
+        >,
+        options: NlpEvaluationBenchmarkOptions,
+    ) -> AnyResult<NlpEvaluationBenchmark> {
+        self.benchmark_nlp_evaluations_with_progress(values, options, |_| {})
+    }
+
+    pub fn benchmark_nlp_evaluations_with_progress<CB>(
+        &self,
+        values: &MultipleShootingRuntimeValues<
+            Numeric<P>,
+            BoundTemplate<C>,
+            Numeric<Beq>,
+            BoundTemplate<Bineq>,
+            Numeric<X>,
+            Numeric<U>,
+            N,
+        >,
+        options: NlpEvaluationBenchmarkOptions,
+        on_progress: CB,
+    ) -> AnyResult<NlpEvaluationBenchmark>
+    where
+        CB: FnMut(NlpEvaluationKernelKind),
+    {
+        let x0 = self.build_initial_guess(values)?;
+        let bounds = self.build_runtime_bounds(values)?;
+        let runtime_params: OcpParametersNum<P, Beq> =
+            (values.parameters.clone(), values.beq.clone());
+        Ok(self.compiled.benchmark_bounded_evaluations_with_progress(
+            &x0,
+            &runtime_params,
+            &bounds,
+            options,
+            on_progress,
+        )?)
     }
 
     pub fn solve_sqp(
@@ -2051,15 +2961,7 @@ where
         &self,
         trajectories: &MultipleShootingTrajectories<Numeric<X>, Numeric<U>, N>,
         parameters: &Numeric<P>,
-    ) -> AnyResult<(Vec<IntervalArc<Numeric<X>>>, Vec<IntervalArc<Numeric<U>>>)>
-    where
-        MsArcSampleOutput<X, U>: Vectorize<
-                SX,
-                Rebind<SX> = MsArcSampleOutput<X, U>,
-                Rebind<f64> = MsArcSampleOutputNum<X, U>,
-            >,
-        MsArcSampleOutputNum<X, U>: Vectorize<f64, Rebind<f64> = MsArcSampleOutputNum<X, U>>,
-    {
+    ) -> AnyResult<(Vec<IntervalArc<Numeric<X>>>, Vec<IntervalArc<Numeric<U>>>)> {
         let step = trajectories.tf / (N as f64);
         let time_grid = MultipleShootingTimeGrid {
             nodes: mesh_times::<N>(trajectories.tf),
@@ -2380,6 +3282,54 @@ where
 
     pub fn backend_compile_report(&self) -> &BackendCompileReport {
         self.compiled.backend_compile_report()
+    }
+
+    pub fn benchmark_nlp_evaluations(
+        &self,
+        values: &DirectCollocationRuntimeValues<
+            Numeric<P>,
+            BoundTemplate<C>,
+            Numeric<Beq>,
+            BoundTemplate<Bineq>,
+            Numeric<X>,
+            Numeric<U>,
+            N,
+            K,
+        >,
+        options: NlpEvaluationBenchmarkOptions,
+    ) -> AnyResult<NlpEvaluationBenchmark> {
+        self.benchmark_nlp_evaluations_with_progress(values, options, |_| {})
+    }
+
+    pub fn benchmark_nlp_evaluations_with_progress<CB>(
+        &self,
+        values: &DirectCollocationRuntimeValues<
+            Numeric<P>,
+            BoundTemplate<C>,
+            Numeric<Beq>,
+            BoundTemplate<Bineq>,
+            Numeric<X>,
+            Numeric<U>,
+            N,
+            K,
+        >,
+        options: NlpEvaluationBenchmarkOptions,
+        on_progress: CB,
+    ) -> AnyResult<NlpEvaluationBenchmark>
+    where
+        CB: FnMut(NlpEvaluationKernelKind),
+    {
+        let x0 = self.build_initial_guess(values)?;
+        let bounds = self.build_runtime_bounds(values)?;
+        let runtime_params: OcpParametersNum<P, Beq> =
+            (values.parameters.clone(), values.beq.clone());
+        Ok(self.compiled.benchmark_bounded_evaluations_with_progress(
+            &x0,
+            &runtime_params,
+            &bounds,
+            options,
+            on_progress,
+        )?)
     }
 
     pub fn solve_sqp(
@@ -2990,12 +3940,6 @@ where
     Numeric<X>: Vectorize<f64, Rebind<f64> = Numeric<X>>,
     Numeric<U>: Vectorize<f64, Rebind<f64> = Numeric<U>>,
     Numeric<P>: Vectorize<f64, Rebind<f64> = Numeric<P>>,
-    MsArcSampleOutput<X, U>: Vectorize<
-            SX,
-            Rebind<SX> = MsArcSampleOutput<X, U>,
-            Rebind<f64> = MsArcSampleOutputNum<X, U>,
-        >,
-    MsArcSampleOutputNum<X, U>: Vectorize<f64, Rebind<f64> = MsArcSampleOutputNum<X, U>>,
 {
     fn eval(
         &self,
@@ -3018,7 +3962,10 @@ where
         }
         context.input_mut(3 + usize::from(P::LEN > 0))[0] = dt;
         self.function.eval(&mut context);
-        unflatten_value::<MsArcSampleOutputNum<X, U>, f64>(context.output(0)).map_err(Into::into)
+        Ok((
+            unflatten_value::<Numeric<X>, f64>(context.output(0))?,
+            unflatten_value::<Numeric<U>, f64>(context.output(1))?,
+        ))
     }
 }
 
@@ -3060,6 +4007,7 @@ fn validate_direct_collocation<const N: usize, const K: usize>() -> Result<(), O
 
 fn compile_xdot_helper<X, U, P>(
     ode: &OdeFn<X, U, P>,
+    _symbolic_ode: Option<&SXFunction>,
     options: FunctionCompileOptions,
 ) -> Result<CompiledXdot<X, U, P>, OcpCompileError>
 where
@@ -3097,6 +4045,7 @@ where
 
 fn compile_multiple_shooting_arc_helper<X, U, P, const RK4_SUBSTEPS: usize>(
     ode: &OdeFn<X, U, P>,
+    _symbolic_library: &OcpSymbolicFunctionLibrary,
     options: FunctionCompileOptions,
 ) -> Result<CompiledMultipleShootingArc<X, U, P, RK4_SUBSTEPS>, OcpCompileError>
 where
@@ -3106,12 +4055,6 @@ where
     Numeric<X>: Vectorize<f64, Rebind<f64> = Numeric<X>>,
     Numeric<U>: Vectorize<f64, Rebind<f64> = Numeric<U>>,
     Numeric<P>: Vectorize<f64, Rebind<f64> = Numeric<P>>,
-    MsArcSampleOutput<X, U>: Vectorize<
-            SX,
-            Rebind<SX> = MsArcSampleOutput<X, U>,
-            Rebind<f64> = MsArcSampleOutputNum<X, U>,
-        >,
-    MsArcSampleOutputNum<X, U>: Vectorize<f64, Rebind<f64> = MsArcSampleOutputNum<X, U>>,
 {
     // This helper is only used for post-solve/callback arc reconstruction, not for the
     // compiled NLP itself, so prioritize JIT latency over per-call throughput.
@@ -3127,7 +4070,10 @@ where
     let dudt = symbolic_value::<U>("dudt")?;
     let p = symbolic_value::<P>("p")?;
     let dt = SX::sym("dt");
-    let outputs = rk4_integrate_symbolic_state_only(&x, &u, &dudt, &p, dt, RK4_SUBSTEPS, ode)
+    let outputs =
+        rk4_integrate_symbolic_state_only(&x, &u, &dudt, dt, RK4_SUBSTEPS, |x_eval, u_eval| {
+            Ok(ode(x_eval, u_eval, &p))
+        })
         .expect("symbolic RK4 arc generation should be infallible");
     let mut inputs = vec![
         NamedMatrix::new("x", symbolic_column(&x)?)?,
@@ -3141,7 +4087,10 @@ where
     let function = SXFunction::new(
         "ocp_multiple_shooting_arc",
         inputs,
-        vec![NamedMatrix::new("arc", symbolic_column(&outputs)?)?],
+        vec![
+            NamedMatrix::new("x_next", symbolic_column(&outputs.0)?)?,
+            NamedMatrix::new("u_next", symbolic_column(&outputs.1)?)?,
+        ],
     )?;
     let compiled = CompiledJitFunction::compile_function_with_options(&function, helper_options)?;
     let context = Mutex::new(compiled.create_context());
@@ -3214,6 +4163,7 @@ where
         .map(|(index, symbol)| (symbol, index))
         .collect::<HashMap<_, _>>();
     let decision_set = decision_symbols.iter().copied().collect::<HashSet<_>>();
+    let mut affine_memo = HashMap::new();
 
     let mut rows = Vec::new();
     let boundary_eq = inequalities.0.flatten_cloned();
@@ -3223,42 +4173,60 @@ where
     for expr in boundary_eq {
         rows.push(RawInequalityRow {
             kind: RawInequalityKind::BoundaryEquality,
-            promotion: classify_affine_row(expr, &decision_map, &decision_set, rows.len()),
+            promotion: classify_affine_row(
+                expr,
+                &decision_map,
+                &decision_set,
+                &mut affine_memo,
+                rows.len(),
+            ),
         });
     }
     for expr in boundary_ineq {
         rows.push(RawInequalityRow {
             kind: RawInequalityKind::BoundaryInequality,
-            promotion: classify_affine_row(expr, &decision_map, &decision_set, rows.len()),
+            promotion: classify_affine_row(
+                expr,
+                &decision_map,
+                &decision_set,
+                &mut affine_memo,
+                rows.len(),
+            ),
         });
     }
     for expr in path {
         rows.push(RawInequalityRow {
             kind: RawInequalityKind::Path,
-            promotion: classify_affine_row(expr, &decision_map, &decision_set, rows.len()),
+            promotion: classify_affine_row(
+                expr,
+                &decision_map,
+                &decision_set,
+                &mut affine_memo,
+                rows.len(),
+            ),
         });
     }
 
     PromotionPlan { rows }
 }
 
+#[derive(Clone)]
+struct AffineForm {
+    target: Option<SX>,
+    scale: f64,
+    offset: SX,
+}
+
 fn classify_affine_row(
     expr: SX,
     decision_map: &HashMap<SX, usize>,
     decision_set: &HashSet<SX>,
+    memo: &mut HashMap<SX, Option<AffineForm>>,
     offset_index: usize,
 ) -> Option<AffinePromotion> {
-    let free_symbols = expr.free_symbols();
-    let decision_symbols = free_symbols
-        .iter()
-        .filter(|symbol| decision_set.contains(symbol))
-        .copied()
-        .collect::<Vec<_>>();
-    if decision_symbols.len() != 1 {
-        return None;
-    }
-    let target = decision_symbols[0];
-    let (scale, _offset_expr) = affine_in_target(expr, target, decision_set)?;
+    let affine = affine_form(expr, decision_set, memo)?;
+    let target = affine.target?;
+    let scale = affine.scale;
     if !scale.is_finite() || scale == 0.0 {
         return None;
     }
@@ -3268,56 +4236,106 @@ fn classify_affine_row(
             .expect("target symbol should exist in decision map"),
         scale,
         offset_index,
-        offset_expr: _offset_expr,
+        offset_expr: affine.offset,
     })
 }
 
-fn affine_in_target(expr: SX, target: SX, decision_set: &HashSet<SX>) -> Option<(f64, SX)> {
-    match expr.inspect() {
-        NodeView::Constant(value) => Some((0.0, SX::from(value))),
-        NodeView::Symbol { .. } => {
-            if expr == target {
-                Some((1.0, SX::zero()))
-            } else if decision_set.contains(&expr) {
-                None
-            } else {
-                Some((0.0, expr))
+fn affine_form(
+    expr: SX,
+    decision_set: &HashSet<SX>,
+    memo: &mut HashMap<SX, Option<AffineForm>>,
+) -> Option<AffineForm> {
+    if let Some(existing) = memo.get(&expr) {
+        return existing.clone();
+    }
+
+    let affine = match expr.inspect() {
+        NodeView::Constant(value) => Some(AffineForm {
+            target: None,
+            scale: 0.0,
+            offset: SX::from(value),
+        }),
+        NodeView::Symbol { .. } => Some(if decision_set.contains(&expr) {
+            AffineForm {
+                target: Some(expr),
+                scale: 1.0,
+                offset: SX::zero(),
             }
-        }
+        } else {
+            AffineForm {
+                target: None,
+                scale: 0.0,
+                offset: expr,
+            }
+        }),
         NodeView::Unary { .. } => None,
         NodeView::Call { .. } => None,
         NodeView::Binary { op, lhs, rhs } => match op {
             sx_core::BinaryOp::Add => {
-                let (lhs_scale, lhs_offset) = affine_in_target(lhs, target, decision_set)?;
-                let (rhs_scale, rhs_offset) = affine_in_target(rhs, target, decision_set)?;
-                Some((lhs_scale + rhs_scale, lhs_offset + rhs_offset))
+                let lhs = affine_form(lhs, decision_set, memo)?;
+                let rhs = affine_form(rhs, decision_set, memo)?;
+                let target = combine_affine_targets(lhs.target, rhs.target)?;
+                Some(AffineForm {
+                    target,
+                    scale: lhs.scale + rhs.scale,
+                    offset: lhs.offset + rhs.offset,
+                })
             }
             sx_core::BinaryOp::Sub => {
-                let (lhs_scale, lhs_offset) = affine_in_target(lhs, target, decision_set)?;
-                let (rhs_scale, rhs_offset) = affine_in_target(rhs, target, decision_set)?;
-                Some((lhs_scale - rhs_scale, lhs_offset - rhs_offset))
+                let lhs = affine_form(lhs, decision_set, memo)?;
+                let rhs = affine_form(rhs, decision_set, memo)?;
+                let target = combine_affine_targets(lhs.target, rhs.target)?;
+                Some(AffineForm {
+                    target,
+                    scale: lhs.scale - rhs.scale,
+                    offset: lhs.offset - rhs.offset,
+                })
             }
             sx_core::BinaryOp::Mul => {
                 if let NodeView::Constant(value) = lhs.inspect() {
-                    let (scale, offset) = affine_in_target(rhs, target, decision_set)?;
-                    Some((value * scale, SX::from(value) * offset))
+                    let rhs = affine_form(rhs, decision_set, memo)?;
+                    Some(AffineForm {
+                        target: rhs.target,
+                        scale: value * rhs.scale,
+                        offset: SX::from(value) * rhs.offset,
+                    })
                 } else if let NodeView::Constant(value) = rhs.inspect() {
-                    let (scale, offset) = affine_in_target(lhs, target, decision_set)?;
-                    Some((value * scale, SX::from(value) * offset))
+                    let lhs = affine_form(lhs, decision_set, memo)?;
+                    Some(AffineForm {
+                        target: lhs.target,
+                        scale: value * lhs.scale,
+                        offset: SX::from(value) * lhs.offset,
+                    })
                 } else {
                     None
                 }
             }
             sx_core::BinaryOp::Div => {
                 if let NodeView::Constant(value) = rhs.inspect() {
-                    let (scale, offset) = affine_in_target(lhs, target, decision_set)?;
-                    Some((scale / value, offset / value))
+                    let lhs = affine_form(lhs, decision_set, memo)?;
+                    Some(AffineForm {
+                        target: lhs.target,
+                        scale: lhs.scale / value,
+                        offset: lhs.offset / value,
+                    })
                 } else {
                     None
                 }
             }
             _ => None,
         },
+    };
+
+    memo.insert(expr, affine.clone());
+    affine
+}
+
+fn combine_affine_targets(lhs: Option<SX>, rhs: Option<SX>) -> Option<Option<SX>> {
+    match (lhs, rhs) {
+        (None, None) => Some(None),
+        (Some(target), None) | (None, Some(target)) => Some(Some(target)),
+        (Some(lhs), Some(rhs)) if lhs == rhs => Some(Some(lhs)),
+        (Some(_), Some(_)) => None,
     }
 }
 
@@ -3737,15 +4755,29 @@ where
     unflatten_value::<S, SX>(&acc).map_err(|err| SxError::Graph(err.to_string()))
 }
 
-fn rk4_integrate_symbolic<X, U, P>(
+fn unflatten_typed_output<S>(output: &SXMatrix) -> Result<S, SxError>
+where
+    S: Vectorize<SX, Rebind<SX> = S>,
+{
+    unflatten_value::<S, SX>(output.nonzeros()).map_err(|err| SxError::Graph(err.to_string()))
+}
+
+fn call_typed_unary_output<S>(function: &SXFunction, inputs: Vec<SXMatrix>) -> Result<S, SxError>
+where
+    S: Vectorize<SX, Rebind<SX> = S>,
+{
+    let output = function.call_output(&inputs)?;
+    unflatten_typed_output(&output)
+}
+
+fn rk4_integrate_symbolic<X, U>(
     x0: &X,
     u0: &U,
     dudt: &U,
-    parameters: &P,
     dt: SX,
     substeps: usize,
-    ode: &OdeFn<X, U, P>,
-    lagrange: &ObjectiveLagrangeFn<X, U, P>,
+    mut ode: impl FnMut(&X, &U) -> Result<X, SxError>,
+    mut lagrange: impl FnMut(&X, &U) -> Result<SX, SxError>,
 ) -> Result<(X, U, SX), SxError>
 where
     X: Vectorize<SX, Rebind<SX> = X>,
@@ -3759,8 +4791,8 @@ where
     for _ in 0..substeps {
         let x = unflatten_value::<X, SX>(&x_flat).map_err(|err| SxError::Graph(err.to_string()))?;
         let u = unflatten_value::<U, SX>(&u_flat).map_err(|err| SxError::Graph(err.to_string()))?;
-        let k1 = ode(&x, &u, parameters).flatten_cloned();
-        let l1 = lagrange(&x, &u, dudt, parameters);
+        let k1 = ode(&x, &u)?.flatten_cloned();
+        let l1 = lagrange(&x, &u)?;
 
         let x_mid_1 = x_flat
             .iter()
@@ -3776,8 +4808,8 @@ where
             unflatten_value::<X, SX>(&x_mid_1).map_err(|err| SxError::Graph(err.to_string()))?;
         let u2 =
             unflatten_value::<U, SX>(&u_mid_1).map_err(|err| SxError::Graph(err.to_string()))?;
-        let k2 = ode(&x2, &u2, parameters).flatten_cloned();
-        let l2 = lagrange(&x2, &u2, dudt, parameters);
+        let k2 = ode(&x2, &u2)?.flatten_cloned();
+        let l2 = lagrange(&x2, &u2)?;
 
         let x_mid_2 = x_flat
             .iter()
@@ -3793,8 +4825,8 @@ where
             unflatten_value::<X, SX>(&x_mid_2).map_err(|err| SxError::Graph(err.to_string()))?;
         let u3 =
             unflatten_value::<U, SX>(&u_mid_2).map_err(|err| SxError::Graph(err.to_string()))?;
-        let k3 = ode(&x3, &u3, parameters).flatten_cloned();
-        let l3 = lagrange(&x3, &u3, dudt, parameters);
+        let k3 = ode(&x3, &u3)?.flatten_cloned();
+        let l3 = lagrange(&x3, &u3)?;
 
         let x_end = x_flat
             .iter()
@@ -3808,8 +4840,8 @@ where
             .collect::<Vec<_>>();
         let x4 = unflatten_value::<X, SX>(&x_end).map_err(|err| SxError::Graph(err.to_string()))?;
         let u4 = unflatten_value::<U, SX>(&u_end).map_err(|err| SxError::Graph(err.to_string()))?;
-        let k4 = ode(&x4, &u4, parameters).flatten_cloned();
-        let l4 = lagrange(&x4, &u4, dudt, parameters);
+        let k4 = ode(&x4, &u4)?.flatten_cloned();
+        let l4 = lagrange(&x4, &u4)?;
 
         for index in 0..X::LEN {
             x_flat[index] += h / 6.0 * (k1[index] + 2.0 * k2[index] + 2.0 * k3[index] + k4[index]);
@@ -3826,14 +4858,13 @@ where
     ))
 }
 
-fn rk4_integrate_symbolic_state_only<X, U, P>(
+fn rk4_integrate_symbolic_state_only<X, U>(
     x0: &X,
     u0: &U,
     dudt: &U,
-    parameters: &P,
     dt: SX,
     substeps: usize,
-    ode: &OdeFn<X, U, P>,
+    mut ode: impl FnMut(&X, &U) -> Result<X, SxError>,
 ) -> Result<(X, U), SxError>
 where
     X: Vectorize<SX, Rebind<SX> = X>,
@@ -3846,7 +4877,7 @@ where
     for _ in 0..substeps {
         let x = unflatten_value::<X, SX>(&x_flat).map_err(|err| SxError::Graph(err.to_string()))?;
         let u = unflatten_value::<U, SX>(&u_flat).map_err(|err| SxError::Graph(err.to_string()))?;
-        let k1 = ode(&x, &u, parameters).flatten_cloned();
+        let k1 = ode(&x, &u)?.flatten_cloned();
 
         let x_mid_1 = x_flat
             .iter()
@@ -3862,7 +4893,7 @@ where
             unflatten_value::<X, SX>(&x_mid_1).map_err(|err| SxError::Graph(err.to_string()))?;
         let u2 =
             unflatten_value::<U, SX>(&u_mid_1).map_err(|err| SxError::Graph(err.to_string()))?;
-        let k2 = ode(&x2, &u2, parameters).flatten_cloned();
+        let k2 = ode(&x2, &u2)?.flatten_cloned();
 
         let x_mid_2 = x_flat
             .iter()
@@ -3878,7 +4909,7 @@ where
             unflatten_value::<X, SX>(&x_mid_2).map_err(|err| SxError::Graph(err.to_string()))?;
         let u3 =
             unflatten_value::<U, SX>(&u_mid_2).map_err(|err| SxError::Graph(err.to_string()))?;
-        let k3 = ode(&x3, &u3, parameters).flatten_cloned();
+        let k3 = ode(&x3, &u3)?.flatten_cloned();
 
         let x_end = x_flat
             .iter()
@@ -3892,7 +4923,7 @@ where
             .collect::<Vec<_>>();
         let x4 = unflatten_value::<X, SX>(&x_end).map_err(|err| SxError::Graph(err.to_string()))?;
         let u4 = unflatten_value::<U, SX>(&u_end).map_err(|err| SxError::Graph(err.to_string()))?;
-        let k4 = ode(&x4, &u4, parameters).flatten_cloned();
+        let k4 = ode(&x4, &u4)?.flatten_cloned();
 
         for index in 0..X::LEN {
             x_flat[index] += h / 6.0 * (k1[index] + 2.0 * k2[index] + 2.0 * k3[index] + k4[index]);
@@ -4726,6 +5757,47 @@ mod tests {
             .expect("builder should succeed")
     }
 
+    fn lqr_ocp_dc<const N: usize, const K: usize>()
+    -> Ocp<State<SX>, Control<SX>, Params<SX>, (), State<SX>, (), DirectCollocation<N, K>> {
+        Ocp::new("lqr_dc", DirectCollocation::<N, K>::default())
+            .objective_lagrange(
+                |x: &State<SX>, u: &Control<SX>, dudt: &Control<SX>, _: &Params<SX>| {
+                    x.x.sqr() + x.v.sqr() + u.u.sqr() + 1e-3 * dudt.u.sqr()
+                },
+            )
+            .objective_mayer(
+                |_: &State<SX>,
+                 _: &Control<SX>,
+                 x_t: &State<SX>,
+                 _: &Control<SX>,
+                 _: &Params<SX>,
+                 _: &SX| { 10.0 * x_t.x.sqr() + 10.0 * x_t.v.sqr() },
+            )
+            .ode(|x: &State<SX>, u: &Control<SX>, _: &Params<SX>| State { x: x.v, v: u.u })
+            .path_constraints(|_: &State<SX>, _: &Control<SX>, _: &Control<SX>, _: &Params<SX>| ())
+            .boundary_equalities(
+                |x0: &State<SX>,
+                 u0: &Control<SX>,
+                 _: &State<SX>,
+                 _: &Control<SX>,
+                 p: &Params<SX>,
+                 tf: &SX| {
+                    let _ = (u0, p, tf);
+                    State { x: x0.x, v: x0.v }
+                },
+            )
+            .boundary_inequalities(
+                |_: &State<SX>,
+                 _: &Control<SX>,
+                 _: &State<SX>,
+                 _: &Control<SX>,
+                 _: &Params<SX>,
+                 _: &SX| (),
+            )
+            .build()
+            .expect("builder should succeed")
+    }
+
     #[test]
     fn tuple_vectorize_roundtrip_supports_internal_ocp_layouts() {
         let value = (
@@ -4759,6 +5831,107 @@ mod tests {
     fn multiple_shooting_builder_boxes_callbacks_under_the_hood() {
         let ocp = lqr_ocp_ms::<4, 2>();
         let _compiled = ocp.compile_jit().expect("compile should succeed");
+    }
+
+    #[test]
+    fn multiple_shooting_defaults_to_reused_symbolic_functions() {
+        let ocp = lqr_ocp_ms::<4, 2>();
+        let compiled = ocp
+            .compile_jit_with_ocp_options(OcpCompileOptions {
+                function_options: FunctionCompileOptions::from(LlvmOptimizationLevel::O0),
+                symbolic_functions: OcpSymbolicFunctionOptions::default(),
+            })
+            .expect("compile should succeed");
+        let stats = &compiled.backend_compile_report().stats;
+
+        assert!(stats.symbolic_function_count > 0);
+        assert!(stats.call_site_count > 0);
+    }
+
+    #[test]
+    fn multiple_shooting_integrator_can_be_built_as_symbolic_function() {
+        let ocp = lqr_ocp_ms::<4, 2>();
+        let options = OcpSymbolicFunctionOptions {
+            multiple_shooting_integrator: OcpKernelFunctionOptions::function_with_call_policy(
+                CallPolicy::NoInlineLLVM,
+            ),
+            ..OcpSymbolicFunctionOptions::default()
+        };
+        let library = ocp
+            .build_multiple_shooting_symbolic_function_library(options)
+            .expect("symbolic function library should build");
+        let integrator = library
+            .multiple_shooting_integrator
+            .expect("multiple shooting integrator function should be present");
+        assert_eq!(
+            integrator.call_policy_override(),
+            Some(CallPolicy::NoInlineLLVM)
+        );
+    }
+
+    #[test]
+    fn multiple_shooting_inline_symbolic_function_option_removes_call_sites() {
+        let ocp = lqr_ocp_ms::<4, 2>();
+        let compiled = ocp
+            .compile_jit_with_ocp_options(OcpCompileOptions {
+                function_options: FunctionCompileOptions::from(LlvmOptimizationLevel::O0),
+                symbolic_functions: OcpSymbolicFunctionOptions::inline_all(),
+            })
+            .expect("compile should succeed");
+
+        assert_eq!(compiled.backend_compile_report().stats.call_site_count, 0);
+    }
+
+    #[test]
+    fn direct_collocation_defaults_to_reused_symbolic_functions() {
+        let ocp = lqr_ocp_dc::<2, 1>();
+        let compiled = ocp
+            .compile_jit_with_ocp_options(OcpCompileOptions {
+                function_options: FunctionCompileOptions::from(LlvmOptimizationLevel::O0),
+                symbolic_functions: OcpSymbolicFunctionOptions::default(),
+            })
+            .expect("compile should succeed");
+        let stats = &compiled.backend_compile_report().stats;
+
+        assert!(stats.symbolic_function_count > 0);
+        assert!(stats.call_site_count > 0);
+    }
+
+    #[test]
+    #[ignore = "manual profiling helper"]
+    fn profile_small_direct_collocation_symbolic_setup() {
+        let ocp = lqr_ocp_dc::<8, 2>();
+        for (label, symbolic_functions) in [
+            ("inline_all", OcpSymbolicFunctionOptions::inline_all()),
+            ("default", OcpSymbolicFunctionOptions::default()),
+            (
+                "function_inline_at_call",
+                OcpSymbolicFunctionOptions::function_all_with_call_policy(CallPolicy::InlineAtCall),
+            ),
+        ] {
+            let started = Instant::now();
+            let mut symbolic_metadata = None;
+            let compiled = ocp
+                .compile_jit_with_ocp_options_and_progress_callback(
+                    OcpCompileOptions {
+                        function_options: FunctionCompileOptions::from(LlvmOptimizationLevel::O0),
+                        symbolic_functions,
+                    },
+                    |progress| {
+                        if let OcpCompileProgress::SymbolicReady(metadata) = progress {
+                            symbolic_metadata = Some(metadata);
+                        }
+                    },
+                )
+                .expect("compile should succeed");
+            println!(
+                "{label}: total={:?} symbolic_ready={:?} setup_profile={:?} stats={:?}",
+                started.elapsed(),
+                symbolic_metadata,
+                compiled.backend_compile_report().setup_profile,
+                compiled.backend_compile_report().stats,
+            );
+        }
     }
 
     #[test]

@@ -15,6 +15,7 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 axum = "0.8.6"
+clap.workspace = true
 libc.workspace = true
 optimization = { path = "../optimization" }
 optimal_control_problems = { path = "../optimal_control_problems" }

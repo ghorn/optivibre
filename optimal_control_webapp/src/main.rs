@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::Infallible;
-use std::env;
 use std::io;
 #[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
@@ -18,6 +17,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
+use clap::Parser;
 use optimal_control_problems::{
     CompileCacheState, CompileCacheStatus, ProblemId, SolveArtifact, SolveLogLevel, SolveRequest,
     SolveStage, SolveStatus, SolveStreamEvent, compile_variant_for_problem,
@@ -109,12 +109,20 @@ struct CompileCacheSnapshot {
     entries: Vec<CompileCacheStatus>,
 }
 
+#[derive(Debug, Parser)]
+#[command(
+    name = "optimal_control_webapp",
+    about = "Local interactive web app for optimal_control problem demos."
+)]
+struct WebappCli {
+    #[arg(long, env = "PORT", default_value_t = 3000)]
+    port: u16,
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let port = env::var("PORT")
-        .ok()
-        .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(3000);
+    let cli = WebappCli::parse();
+    let port = cli.port;
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     println!("optimal_control_webapp listening on http://127.0.0.1:{port}");
 
@@ -384,8 +392,9 @@ fn run_actor_compile(
     descriptor: &CompileDescriptor,
     shared: &Arc<ActorShared>,
 ) {
-    let result = prewarm_problem_with_progress(problem, &descriptor.compile_values, |event| {
-        forward_compile_event(shared, &event);
+    let shared_for_progress = Arc::clone(shared);
+    let result = prewarm_problem_with_progress(problem, &descriptor.compile_values, move |event| {
+        forward_compile_event(&shared_for_progress, &event);
     });
 
     let (prewarm_replies, pending_solves) = {
@@ -491,7 +500,7 @@ fn run_solve_stream(problem: ProblemId, values: BTreeMap<String, f64>, sender: S
     let capture_state = StreamStdIoCapture::start(&sender);
 
     let sender_for_progress = sender.clone();
-    let result = solve_problem_with_progress(problem, &values, |event| {
+    let result = solve_problem_with_progress(problem, &values, move |event| {
         if should_forward_solve_event(&event) {
             send_stream_event(&sender_for_progress, event);
         }
