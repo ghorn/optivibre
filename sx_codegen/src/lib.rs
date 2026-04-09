@@ -5,7 +5,8 @@ use std::process::{Command, Stdio};
 use anyhow::{Result, anyhow, bail};
 use sx_core::{
     BinaryOp, CCS, CallPolicy, CallPolicyConfig, CompileStats, CompileWarning, Index, InlineStage,
-    NodeView, SX, SXFunction, SXMatrix, UnaryOp, lookup_function, rewrite_function_for_stage,
+    NodeView, SX, SXFunction, SXMatrix, UnaryOp, lookup_function_ref,
+    rewrite_function_for_stage,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -243,7 +244,7 @@ impl CallableLoweringState<'_> {
                 if let Some(temps) = self.call_outputs.get(&key) {
                     ValueRef::Temp(
                         temps[call_output_linear_index(
-                            &lookup_function(function_id)
+                            &lookup_function_ref(function_id)
                                 .expect("lowering should only reference known functions"),
                             output_slot,
                             output_offset,
@@ -253,7 +254,7 @@ impl CallableLoweringState<'_> {
                     if self.shared.counted_call_sites.insert(key.clone()) {
                         self.stats.call_site_count += 1;
                     }
-                    let callee = lookup_function(function_id)
+                    let callee = lookup_function_ref(function_id)
                         .expect("lowering should only reference known functions");
                     let callee_policy = effective_call_policy(&callee, self.config);
                     let callee_index = if let Some(existing) =
@@ -303,9 +304,11 @@ impl CallableLoweringState<'_> {
                     });
                     self.call_outputs.insert(key, temps.clone());
                     self.stats.llvm_call_instructions_emitted += 1;
-                    ValueRef::Temp(
-                        temps[call_output_linear_index(&callee, output_slot, output_offset)],
-                    )
+                    ValueRef::Temp(temps[call_output_linear_index(
+                        &callee,
+                        output_slot,
+                        output_offset,
+                    )])
                 }
             }
         };

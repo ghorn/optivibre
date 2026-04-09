@@ -287,10 +287,10 @@ fn hessian_strategies_match_on_rosenbrock() {
     }
 
     let default_hessian = rosen.hessian(&x).unwrap();
-    let selected_outputs_hessian = rosen
-        .hessian_with_strategy(&x, HessianStrategy::LowerTriangleSelectedOutputs)
+    let colored_hessian = rosen
+        .hessian_with_strategy(&x, HessianStrategy::LowerTriangleColored)
         .unwrap();
-    assert_eq!(default_hessian, selected_outputs_hessian);
+    assert_eq!(default_hessian, colored_hessian);
 }
 
 #[rstest]

@@ -11,7 +11,7 @@ use crate::ccs::CCS;
 use crate::error::{Result, SxError};
 use crate::function::{
     DependencyProfile, FunctionId, SXFunction, dependency_profile, forward_batch_helper,
-    forward_helper, function_name, reverse_scalar_helper,
+    forward_helper, function_name, reverse_output_batch_helper, reverse_scalar_helper,
 };
 use crate::{Index, SXMatrix};
 
@@ -61,7 +61,7 @@ pub(crate) enum NodeKind {
     Constant(f64),
     Symbol {
         serial: usize,
-        name: String,
+        name: Arc<str>,
     },
     Unary {
         op: UnaryOp,
@@ -171,6 +171,7 @@ impl CallInputs {
         self.values.iter()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn as_slice(&self) -> &[SXMatrix] {
         &self.values
     }
@@ -216,6 +217,7 @@ struct AdLocalCaches {
     forward_helpers: HashMap<FunctionId, Arc<SXFunction>>,
     forward_batch_helpers: HashMap<(FunctionId, usize), Arc<SXFunction>>,
     reverse_scalar_helpers: HashMap<(FunctionId, Index, Index), Arc<SXFunction>>,
+    reverse_output_batch_helpers: HashMap<(FunctionId, Index, Index, usize), Arc<SXFunction>>,
 }
 
 impl AdLocalCaches {
@@ -267,12 +269,90 @@ impl AdLocalCaches {
         self.reverse_scalar_helpers.insert(key, Arc::clone(&helper));
         Ok(helper)
     }
+
+    fn reverse_output_batch_helper(
+        &mut self,
+        function_id: FunctionId,
+        output_slot: Index,
+        output_offset: Index,
+        directions: usize,
+    ) -> Result<Arc<SXFunction>> {
+        let key = (function_id, output_slot, output_offset, directions);
+        if let Some(helper) = self.reverse_output_batch_helpers.get(&key) {
+            return Ok(Arc::clone(helper));
+        }
+        let helper =
+            reverse_output_batch_helper(function_id, output_slot, output_offset, directions)?;
+        self.reverse_output_batch_helpers
+            .insert(key, Arc::clone(&helper));
+        Ok(helper)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct JacobianStructureKey {
     outputs: Vec<SX>,
     vars: Vec<SX>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ProgramKey {
+    outputs: Vec<SX>,
+}
+
+#[derive(Clone, Debug)]
+struct ProgramCallInput {
+    matrix: SXMatrix,
+    slots: Vec<usize>,
+    relevant_offsets: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+enum ProgramInstruction {
+    Unary {
+        result_slot: usize,
+        op: UnaryOp,
+        arg_slot: usize,
+        arg_expr: SX,
+    },
+    Binary {
+        result_slot: usize,
+        op: BinaryOp,
+        lhs_slot: usize,
+        rhs_slot: usize,
+        lhs_expr: SX,
+        rhs_expr: SX,
+    },
+    Call {
+        result_slot: usize,
+        function: FunctionId,
+        site_key: ForwardCallCacheKey,
+        output_slot: Index,
+        output_offset: Index,
+        inputs: Vec<ProgramCallInput>,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct SxProgram {
+    slot_exprs: Vec<SX>,
+    slot_by_node: HashMap<SX, usize>,
+    output_slots: Vec<usize>,
+    instructions: Vec<ProgramInstruction>,
+}
+
+#[derive(Default)]
+struct ProgramBuilder {
+    slot_exprs: Vec<SX>,
+    slot_by_node: HashMap<SX, usize>,
+    instructions: Vec<ProgramInstruction>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ForwardBatchCallCacheKey {
+    site_key: ForwardCallCacheKey,
+    direction_count: usize,
+    direction_mask: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -330,8 +410,20 @@ impl DependencyMask {
     }
 }
 
+fn iter_direction_bits(mask: u64) -> impl Iterator<Item = usize> {
+    let mut bits = Vec::new();
+    let mut word = mask;
+    while word != 0 {
+        let bit = word.trailing_zeros() as usize;
+        bits.push(bit);
+        word &= word - 1;
+    }
+    bits.into_iter()
+}
+
 static JACOBIAN_STRUCTURE_CACHE: OnceLock<Mutex<HashMap<JacobianStructureKey, JacobianStructure>>> =
     OnceLock::new();
+static PROGRAM_CACHE: OnceLock<Mutex<HashMap<ProgramKey, Arc<SxProgram>>>> = OnceLock::new();
 
 impl UnaryOp {
     pub fn name(self) -> &'static str {
@@ -470,13 +562,138 @@ fn lock_jacobian_structure_cache()
     }
 }
 
+fn lock_program_cache() -> MutexGuard<'static, HashMap<ProgramKey, Arc<SxProgram>>> {
+    match PROGRAM_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+impl ProgramBuilder {
+    fn alloc_slot(&mut self, expr: SX) -> usize {
+        if let Some(&slot) = self.slot_by_node.get(&expr) {
+            return slot;
+        }
+        let slot = self.slot_exprs.len();
+        self.slot_exprs.push(expr);
+        self.slot_by_node.insert(expr, slot);
+        slot
+    }
+
+    fn ensure_slot(&mut self, expr: SX) -> usize {
+        if let Some(&slot) = self.slot_by_node.get(&expr) {
+            return slot;
+        }
+
+        match node_kind(expr) {
+            NodeKind::Constant(_) | NodeKind::Symbol { .. } => self.alloc_slot(expr),
+            NodeKind::Unary { op, arg } => {
+                let arg_slot = self.ensure_slot(arg);
+                let result_slot = self.alloc_slot(expr);
+                self.instructions.push(ProgramInstruction::Unary {
+                    result_slot,
+                    op,
+                    arg_slot,
+                    arg_expr: arg,
+                });
+                result_slot
+            }
+            NodeKind::Binary { op, lhs, rhs } => {
+                let lhs_slot = self.ensure_slot(lhs);
+                let rhs_slot = self.ensure_slot(rhs);
+                let result_slot = self.alloc_slot(expr);
+                self.instructions.push(ProgramInstruction::Binary {
+                    result_slot,
+                    op,
+                    lhs_slot,
+                    rhs_slot,
+                    lhs_expr: lhs,
+                    rhs_expr: rhs,
+                });
+                result_slot
+            }
+            NodeKind::Call {
+                function,
+                inputs,
+                output_slot,
+                output_offset,
+            } => {
+                let profile = dependency_profile(function);
+                let call_inputs = inputs
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, input)| ProgramCallInput {
+                        matrix: input.clone(),
+                        slots: input
+                            .nonzeros()
+                            .iter()
+                            .copied()
+                            .map(|value| self.ensure_slot(value))
+                            .collect(),
+                        relevant_offsets: input
+                            .nonzeros()
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(offset, _)| {
+                                profile
+                                    .output_depends_on(output_slot, output_offset, slot, offset)
+                                    .then_some(offset)
+                            })
+                            .collect(),
+                    })
+                    .collect::<Vec<_>>();
+                let result_slot = self.alloc_slot(expr);
+                self.instructions.push(ProgramInstruction::Call {
+                    result_slot,
+                    function,
+                    site_key: ForwardCallCacheKey {
+                        function,
+                        site_id: inputs.site_id(),
+                    },
+                    output_slot,
+                    output_offset,
+                    inputs: call_inputs,
+                });
+                result_slot
+            }
+        }
+    }
+}
+
+fn program_for_outputs(outputs: &[SX]) -> Arc<SxProgram> {
+    let key = ProgramKey {
+        outputs: outputs.to_vec(),
+    };
+    if let Some(existing) = lock_program_cache().get(&key).cloned() {
+        return existing;
+    }
+
+    let mut builder = ProgramBuilder::default();
+    let output_slots = outputs
+        .iter()
+        .copied()
+        .map(|output| builder.ensure_slot(output))
+        .collect::<Vec<_>>();
+    let program = Arc::new(SxProgram {
+        slot_exprs: builder.slot_exprs,
+        slot_by_node: builder.slot_by_node,
+        output_slots,
+        instructions: builder.instructions,
+    });
+    lock_program_cache().insert(key, Arc::clone(&program));
+    program
+}
+
 impl Interner {
     fn node(&self, sx: SX) -> &Node {
         &self.nodes[sx.0 as usize]
     }
 
-    fn node_kind(&self, sx: SX) -> NodeKind {
-        self.node(sx).kind.clone()
+    fn node_kind_ref(&self, sx: SX) -> &NodeKind {
+        &self.node(sx).kind
     }
 
     fn fresh_symbol(&mut self, name: impl Into<String>) -> SX {
@@ -486,7 +703,7 @@ impl Interner {
         self.nodes.push(Node {
             kind: NodeKind::Symbol {
                 serial,
-                name: name.into(),
+                name: Arc::<str>::from(name.into()),
             },
         });
         id
@@ -504,12 +721,20 @@ impl Interner {
 }
 
 pub(crate) fn node_kind(sx: SX) -> NodeKind {
-    with_interner_ref(|interner| interner.node_kind(sx))
+    with_interner_ref(|interner| interner.node_kind_ref(sx).clone())
 }
 
-fn constant_value(sx: SX) -> Option<f64> {
-    match node_kind(sx) {
-        NodeKind::Constant(value) => Some(value),
+fn is_zero_kind(kind: &NodeKind) -> bool {
+    matches!(kind, NodeKind::Constant(value) if *value == 0.0)
+}
+
+fn is_one_kind(kind: &NodeKind) -> bool {
+    matches!(kind, NodeKind::Constant(value) if *value == 1.0)
+}
+
+fn constant_value_with_interner(interner: &Interner, sx: SX) -> Option<f64> {
+    match interner.node_kind_ref(sx) {
+        NodeKind::Constant(value) => Some(*value),
         NodeKind::Symbol { .. }
         | NodeKind::Unary { .. }
         | NodeKind::Binary { .. }
@@ -517,21 +742,21 @@ fn constant_value(sx: SX) -> Option<f64> {
     }
 }
 
-fn mul_constant_factor(sx: SX) -> Option<(f64, SX)> {
-    match node_kind(sx) {
+fn mul_constant_factor_with_interner(interner: &Interner, sx: SX) -> Option<(f64, SX)> {
+    match interner.node_kind_ref(sx) {
         NodeKind::Binary {
             op: BinaryOp::Mul,
             lhs,
             rhs,
         } => {
-            if let Some(value) = constant_value(lhs) {
-                Some((value, rhs))
+            if let Some(value) = constant_value_with_interner(interner, *lhs) {
+                Some((value, *rhs))
             } else {
-                constant_value(rhs).map(|value| (value, lhs))
+                constant_value_with_interner(interner, *rhs).map(|value| (value, *lhs))
             }
         }
-        NodeKind::Constant(_)
-        | NodeKind::Symbol { .. }
+        NodeKind::Constant(_value) => None,
+        NodeKind::Symbol { .. }
         | NodeKind::Unary { .. }
         | NodeKind::Binary { .. }
         | NodeKind::Call { .. } => None,
@@ -545,7 +770,14 @@ struct RationalFactors {
     denominators: Vec<SX>,
 }
 
-fn intern_binary(op: BinaryOp, lhs: SX, rhs: SX) -> SX {
+fn intern_constant_with_interner(interner: &mut Interner, value: f64) -> SX {
+    interner.intern_keyed(
+        NodeKey::Constant(value.to_bits()),
+        NodeKind::Constant(value),
+    )
+}
+
+fn intern_binary_with_interner(interner: &mut Interner, op: BinaryOp, lhs: SX, rhs: SX) -> SX {
     use NodeKey as K;
     use NodeKind as N;
 
@@ -554,9 +786,7 @@ fn intern_binary(op: BinaryOp, lhs: SX, rhs: SX) -> SX {
     } else {
         (lhs, rhs)
     };
-    with_interner(|interner| {
-        interner.intern_keyed(K::Binary { op, lhs, rhs }, N::Binary { op, lhs, rhs })
-    })
+    interner.intern_keyed(K::Binary { op, lhs, rhs }, N::Binary { op, lhs, rhs })
 }
 
 fn canonicalize_rational_factors(mut factors: RationalFactors) -> RationalFactors {
@@ -631,10 +861,10 @@ fn divide_rational_factors(lhs: RationalFactors, rhs: RationalFactors) -> Option
     }))
 }
 
-fn rational_factors(expr: SX) -> RationalFactors {
-    match node_kind(expr) {
+fn rational_factors_with_interner(interner: &Interner, expr: SX) -> RationalFactors {
+    match interner.node_kind_ref(expr) {
         NodeKind::Constant(value) => canonicalize_rational_factors(RationalFactors {
-            coeff: value,
+            coeff: *value,
             numerators: Vec::new(),
             denominators: Vec::new(),
         }),
@@ -642,18 +872,23 @@ fn rational_factors(expr: SX) -> RationalFactors {
             op: BinaryOp::Mul,
             lhs,
             rhs,
-        } => combine_rational_factors(rational_factors(lhs), rational_factors(rhs)),
+        } => combine_rational_factors(
+            rational_factors_with_interner(interner, *lhs),
+            rational_factors_with_interner(interner, *rhs),
+        ),
         NodeKind::Binary {
             op: BinaryOp::Div,
             lhs,
             rhs,
-        } => divide_rational_factors(rational_factors(lhs), rational_factors(rhs)).unwrap_or_else(
-            || RationalFactors {
-                coeff: 1.0,
-                numerators: vec![expr],
-                denominators: Vec::new(),
-            },
-        ),
+        } => divide_rational_factors(
+            rational_factors_with_interner(interner, *lhs),
+            rational_factors_with_interner(interner, *rhs),
+        )
+        .unwrap_or_else(|| RationalFactors {
+            coeff: 1.0,
+            numerators: vec![expr],
+            denominators: Vec::new(),
+        }),
         NodeKind::Symbol { .. }
         | NodeKind::Unary { .. }
         | NodeKind::Binary { .. }
@@ -665,32 +900,40 @@ fn rational_factors(expr: SX) -> RationalFactors {
     }
 }
 
-fn rebuild_rational_factors(factors: RationalFactors) -> SX {
+fn rebuild_rational_factors_with_interner(interner: &mut Interner, factors: RationalFactors) -> SX {
     if factors.coeff == 0.0 {
-        return SX::zero();
+        return intern_constant_with_interner(interner, 0.0);
     }
 
     let mut numerators = factors.numerators.into_iter();
     let mut expr = match numerators.next() {
         Some(first) if factors.coeff == 1.0 => first,
-        Some(first) => intern_binary(BinaryOp::Mul, SX::from(factors.coeff), first),
-        None => SX::from(factors.coeff),
+        Some(first) => {
+            let coeff = intern_constant_with_interner(interner, factors.coeff);
+            intern_binary_with_interner(interner, BinaryOp::Mul, coeff, first)
+        }
+        None => intern_constant_with_interner(interner, factors.coeff),
     };
 
     for numerator in numerators {
-        expr = intern_binary(BinaryOp::Mul, expr, numerator);
+        expr = intern_binary_with_interner(interner, BinaryOp::Mul, expr, numerator);
     }
 
     for denominator in factors.denominators {
-        expr = intern_binary(BinaryOp::Div, expr, denominator);
+        expr = intern_binary_with_interner(interner, BinaryOp::Div, expr, denominator);
     }
 
     expr
 }
 
-fn combine_like_terms(lhs: SX, rhs: SX, rhs_sign: f64) -> Option<SX> {
-    let lhs_factors = rational_factors(lhs);
-    let mut rhs_factors = rational_factors(rhs);
+fn combine_like_terms_with_interner(
+    interner: &mut Interner,
+    lhs: SX,
+    rhs: SX,
+    rhs_sign: f64,
+) -> Option<SX> {
+    let lhs_factors = rational_factors_with_interner(interner, lhs);
+    let mut rhs_factors = rational_factors_with_interner(interner, rhs);
     rhs_factors.coeff *= rhs_sign;
     rhs_factors = canonicalize_rational_factors(rhs_factors);
 
@@ -700,13 +943,238 @@ fn combine_like_terms(lhs: SX, rhs: SX, rhs_sign: f64) -> Option<SX> {
         return None;
     }
 
-    Some(rebuild_rational_factors(canonicalize_rational_factors(
+    Some(rebuild_rational_factors_with_interner(interner, canonicalize_rational_factors(
         RationalFactors {
             coeff: lhs_factors.coeff + rhs_factors.coeff,
             numerators: lhs_factors.numerators,
             denominators: lhs_factors.denominators,
         },
     )))
+}
+
+fn neg_with_interner(interner: &mut Interner, expr: SX) -> SX {
+    let minus_one = intern_constant_with_interner(interner, -1.0);
+    binary_with_interner(interner, BinaryOp::Mul, minus_one, expr)
+}
+
+fn unary_with_interner(interner: &mut Interner, op: UnaryOp, arg: SX) -> SX {
+    use NodeKey as K;
+    use NodeKind as N;
+
+    let arg_kind = interner.node_kind_ref(arg).clone();
+    if let Some(value) = constant_value_with_interner(interner, arg) {
+        return intern_constant_with_interner(interner, op.apply_constant(value));
+    }
+
+    match op {
+        UnaryOp::Abs => {
+            if is_zero_kind(&arg_kind) {
+                return intern_constant_with_interner(interner, 0.0);
+            }
+            if matches!(
+                arg_kind,
+                NodeKind::Unary {
+                    op: UnaryOp::Abs,
+                    ..
+                }
+            ) {
+                return arg;
+            }
+        }
+        UnaryOp::Sign => {
+            if is_zero_kind(&arg_kind) {
+                return intern_constant_with_interner(interner, 0.0);
+            }
+            if matches!(
+                arg_kind,
+                NodeKind::Unary {
+                    op: UnaryOp::Sign,
+                    ..
+                }
+            ) {
+                return arg;
+            }
+        }
+        UnaryOp::Floor
+        | UnaryOp::Ceil
+        | UnaryOp::Round
+        | UnaryOp::Trunc
+        | UnaryOp::Sin
+        | UnaryOp::Tan
+        | UnaryOp::Asin
+        | UnaryOp::Atan
+        | UnaryOp::Sinh
+        | UnaryOp::Tanh
+        | UnaryOp::Asinh => {
+            if is_zero_kind(&arg_kind) {
+                return intern_constant_with_interner(interner, 0.0);
+            }
+        }
+        UnaryOp::Sqrt => {
+            if is_zero_kind(&arg_kind) {
+                return intern_constant_with_interner(interner, 0.0);
+            }
+            if is_one_kind(&arg_kind) {
+                return intern_constant_with_interner(interner, 1.0);
+            }
+        }
+        UnaryOp::Exp | UnaryOp::Cos | UnaryOp::Cosh => {
+            if is_zero_kind(&arg_kind) {
+                return intern_constant_with_interner(interner, 1.0);
+            }
+        }
+        UnaryOp::Log => {
+            if is_one_kind(&arg_kind) {
+                return intern_constant_with_interner(interner, 0.0);
+            }
+        }
+        UnaryOp::Acos | UnaryOp::Acosh | UnaryOp::Atanh => {}
+    }
+
+    interner.intern_keyed(K::Unary { op, arg }, N::Unary { op, arg })
+}
+
+fn binary_with_interner(interner: &mut Interner, op: BinaryOp, lhs: SX, rhs: SX) -> SX {
+    use NodeKind as N;
+
+    let lhs_kind = interner.node_kind_ref(lhs).clone();
+    let rhs_kind = interner.node_kind_ref(rhs).clone();
+
+    if let (N::Constant(a), N::Constant(b)) = (&lhs_kind, &rhs_kind) {
+        return intern_constant_with_interner(interner, op.apply_constant(*a, *b));
+    }
+
+    match op {
+        BinaryOp::Add => {
+            if is_zero_kind(&lhs_kind) {
+                return rhs;
+            }
+            if is_zero_kind(&rhs_kind) {
+                return lhs;
+            }
+            if let Some(combined) = combine_like_terms_with_interner(interner, lhs, rhs, 1.0) {
+                return combined;
+            }
+        }
+        BinaryOp::Sub => {
+            if is_zero_kind(&lhs_kind) {
+                return neg_with_interner(interner, rhs);
+            }
+            if is_zero_kind(&rhs_kind) {
+                return lhs;
+            }
+            if lhs == rhs {
+                return intern_constant_with_interner(interner, 0.0);
+            }
+            if let Some(combined) = combine_like_terms_with_interner(interner, lhs, rhs, -1.0) {
+                return combined;
+            }
+        }
+        BinaryOp::Mul => {
+            if is_zero_kind(&lhs_kind) || is_zero_kind(&rhs_kind) {
+                return intern_constant_with_interner(interner, 0.0);
+            }
+            if is_one_kind(&lhs_kind) {
+                return rhs;
+            }
+            if is_one_kind(&rhs_kind) {
+                return lhs;
+            }
+            if let Some(lhs_value) = constant_value_with_interner(interner, lhs)
+                && let Some((rhs_value, factor)) = mul_constant_factor_with_interner(interner, rhs)
+            {
+                let scaled = intern_constant_with_interner(interner, lhs_value * rhs_value);
+                return binary_with_interner(
+                    interner,
+                    BinaryOp::Mul,
+                    scaled,
+                    factor,
+                );
+            }
+            if let Some(rhs_value) = constant_value_with_interner(interner, rhs)
+                && let Some((lhs_value, factor)) = mul_constant_factor_with_interner(interner, lhs)
+            {
+                let scaled = intern_constant_with_interner(interner, lhs_value * rhs_value);
+                return binary_with_interner(
+                    interner,
+                    BinaryOp::Mul,
+                    scaled,
+                    factor,
+                );
+            }
+            return rebuild_rational_factors_with_interner(
+                interner,
+                combine_rational_factors(
+                    rational_factors_with_interner(interner, lhs),
+                    rational_factors_with_interner(interner, rhs),
+                ),
+            );
+        }
+        BinaryOp::Div => {
+            if is_zero_kind(&lhs_kind) {
+                return intern_constant_with_interner(interner, 0.0);
+            }
+            if is_one_kind(&rhs_kind) {
+                return lhs;
+            }
+            if let Some(divided) = divide_rational_factors(
+                rational_factors_with_interner(interner, lhs),
+                rational_factors_with_interner(interner, rhs),
+            ) {
+                return rebuild_rational_factors_with_interner(interner, divided);
+            }
+        }
+        BinaryOp::Pow => {
+            if is_zero_kind(&rhs_kind) {
+                return intern_constant_with_interner(interner, 1.0);
+            }
+            if is_one_kind(&rhs_kind) {
+                return lhs;
+            }
+            if let Some(exponent) = constant_value_with_interner(interner, rhs) {
+                if exponent == 2.0 {
+                    return binary_with_interner(interner, BinaryOp::Mul, lhs, lhs);
+                }
+                if exponent == 0.5 {
+                    return unary_with_interner(interner, UnaryOp::Sqrt, lhs);
+                }
+                if is_zero_kind(&lhs_kind) && exponent > 0.0 {
+                    return intern_constant_with_interner(interner, 0.0);
+                }
+            }
+            if is_one_kind(&lhs_kind) {
+                return intern_constant_with_interner(interner, 1.0);
+            }
+        }
+        BinaryOp::Atan2 => {
+            if is_zero_kind(&lhs_kind) && is_one_kind(&rhs_kind) {
+                return intern_constant_with_interner(interner, 0.0);
+            }
+        }
+        BinaryOp::Hypot => {
+            if is_zero_kind(&lhs_kind) {
+                return unary_with_interner(interner, UnaryOp::Abs, rhs);
+            }
+            if is_zero_kind(&rhs_kind) {
+                return unary_with_interner(interner, UnaryOp::Abs, lhs);
+            }
+        }
+        BinaryOp::Mod => {
+            if is_zero_kind(&lhs_kind) {
+                return intern_constant_with_interner(interner, 0.0);
+            }
+        }
+        BinaryOp::Copysign => {
+            if is_zero_kind(&lhs_kind) {
+                return intern_constant_with_interner(interner, 0.0);
+            }
+            if is_zero_kind(&rhs_kind) {
+                return unary_with_interner(interner, UnaryOp::Abs, lhs);
+            }
+        }
+    }
+
+    intern_binary_with_interner(interner, op, lhs, rhs)
 }
 
 fn format_expression(expr: SX, interner: &Interner, memo: &mut HashMap<SX, String>) -> String {
@@ -721,7 +1189,7 @@ fn format_expression(expr: SX, interner: &Interner, memo: &mut HashMap<SX, Strin
                 format!("{v}")
             }
         }
-        NodeKind::Symbol { name, .. } => name,
+        NodeKind::Symbol { name, .. } => name.to_string(),
         NodeKind::Unary { op, arg } => {
             format!("{}({})", op.name(), format_expression(arg, interner, memo))
         }
@@ -805,285 +1273,202 @@ fn canonical_pair(lhs: SX, rhs: SX) -> (SX, SX) {
 }
 
 fn unary(op: UnaryOp, arg: SX) -> SX {
-    use NodeKey as K;
-    use NodeKind as N;
-
-    if let Some(value) = constant_value(arg) {
-        return SX::from(op.apply_constant(value));
-    }
-
-    match op {
-        UnaryOp::Abs => {
-            if arg.is_zero() {
-                return SX::zero();
-            }
-            if matches!(
-                node_kind(arg),
-                NodeKind::Unary {
-                    op: UnaryOp::Abs,
-                    ..
-                }
-            ) {
-                return arg;
-            }
-        }
-        UnaryOp::Sign => {
-            if arg.is_zero() {
-                return SX::zero();
-            }
-            if matches!(
-                node_kind(arg),
-                NodeKind::Unary {
-                    op: UnaryOp::Sign,
-                    ..
-                }
-            ) {
-                return arg;
-            }
-        }
-        UnaryOp::Floor
-        | UnaryOp::Ceil
-        | UnaryOp::Round
-        | UnaryOp::Trunc
-        | UnaryOp::Sin
-        | UnaryOp::Tan
-        | UnaryOp::Asin
-        | UnaryOp::Atan
-        | UnaryOp::Sinh
-        | UnaryOp::Tanh
-        | UnaryOp::Asinh => {
-            if arg.is_zero() {
-                return SX::zero();
-            }
-        }
-        UnaryOp::Sqrt => {
-            if arg.is_zero() {
-                return SX::zero();
-            }
-            if arg.is_one() {
-                return SX::one();
-            }
-        }
-        UnaryOp::Exp | UnaryOp::Cos | UnaryOp::Cosh => {
-            if arg.is_zero() {
-                return SX::one();
-            }
-        }
-        UnaryOp::Log => {
-            if arg.is_one() {
-                return SX::zero();
-            }
-        }
-        UnaryOp::Acos | UnaryOp::Acosh | UnaryOp::Atanh => {}
-    }
-
-    with_interner(|interner| interner.intern_keyed(K::Unary { op, arg }, N::Unary { op, arg }))
+    with_interner(|interner| unary_with_interner(interner, op, arg))
 }
 
 fn binary(op: BinaryOp, lhs: SX, rhs: SX) -> SX {
-    use NodeKind as N;
-
-    let lhs_kind = node_kind(lhs);
-    let rhs_kind = node_kind(rhs);
-
-    if let (N::Constant(a), N::Constant(b)) = (&lhs_kind, &rhs_kind) {
-        return SX::from(op.apply_constant(*a, *b));
-    }
-
-    match op {
-        BinaryOp::Add => {
-            if lhs.is_zero() {
-                return rhs;
-            }
-            if rhs.is_zero() {
-                return lhs;
-            }
-            if let Some(combined) = combine_like_terms(lhs, rhs, 1.0) {
-                return combined;
-            }
-        }
-        BinaryOp::Sub => {
-            if lhs.is_zero() {
-                return -rhs;
-            }
-            if rhs.is_zero() {
-                return lhs;
-            }
-            if lhs == rhs {
-                return SX::zero();
-            }
-            if let Some(combined) = combine_like_terms(lhs, rhs, -1.0) {
-                return combined;
-            }
-        }
-        BinaryOp::Mul => {
-            if lhs.is_zero() || rhs.is_zero() {
-                return SX::zero();
-            }
-            if lhs.is_one() {
-                return rhs;
-            }
-            if rhs.is_one() {
-                return lhs;
-            }
-            if let Some(lhs_value) = constant_value(lhs)
-                && let Some((rhs_value, factor)) = mul_constant_factor(rhs)
-            {
-                return SX::from(lhs_value * rhs_value) * factor;
-            }
-            if let Some(rhs_value) = constant_value(rhs)
-                && let Some((lhs_value, factor)) = mul_constant_factor(lhs)
-            {
-                return SX::from(lhs_value * rhs_value) * factor;
-            }
-            return rebuild_rational_factors(combine_rational_factors(
-                rational_factors(lhs),
-                rational_factors(rhs),
-            ));
-        }
-        BinaryOp::Div => {
-            if lhs.is_zero() {
-                return SX::zero();
-            }
-            if rhs.is_one() {
-                return lhs;
-            }
-            if let Some(divided) =
-                divide_rational_factors(rational_factors(lhs), rational_factors(rhs))
-            {
-                return rebuild_rational_factors(divided);
-            }
-        }
-        BinaryOp::Pow => {
-            if rhs.is_zero() {
-                return SX::one();
-            }
-            if rhs.is_one() {
-                return lhs;
-            }
-            if let Some(exponent) = constant_value(rhs) {
-                if exponent == 2.0 {
-                    return lhs.sqr();
-                }
-                if exponent == 0.5 {
-                    return lhs.sqrt();
-                }
-                if lhs.is_zero() && exponent > 0.0 {
-                    return SX::zero();
-                }
-            }
-            if lhs.is_one() {
-                return SX::one();
-            }
-        }
-        BinaryOp::Atan2 => {
-            if lhs.is_zero() && rhs.is_one() {
-                return SX::zero();
-            }
-        }
-        BinaryOp::Hypot => {
-            if lhs.is_zero() {
-                return rhs.abs();
-            }
-            if rhs.is_zero() {
-                return lhs.abs();
-            }
-        }
-        BinaryOp::Mod => {
-            if lhs.is_zero() {
-                return SX::zero();
-            }
-        }
-        BinaryOp::Copysign => {
-            if lhs.is_zero() {
-                return SX::zero();
-            }
-            if rhs.is_zero() {
-                return lhs.abs();
-            }
-        }
-    }
-
-    intern_binary(op, lhs, rhs)
-}
-
-fn topo_visit(node: SX, seen: &mut HashSet<SX>, order: &mut Vec<SX>) {
-    if !seen.insert(node) {
-        return;
-    }
-    match node_kind(node) {
-        NodeKind::Unary { arg, .. } => {
-            topo_visit(arg, seen, order);
-            order.push(node);
-        }
-        NodeKind::Binary { lhs, rhs, .. } => {
-            topo_visit(lhs, seen, order);
-            topo_visit(rhs, seen, order);
-            order.push(node);
-        }
-        NodeKind::Call { inputs, .. } => {
-            for input in inputs.iter() {
-                for expr in input.nonzeros().iter().copied() {
-                    topo_visit(expr, seen, order);
-                }
-            }
-            order.push(node);
-        }
-        NodeKind::Constant(_) | NodeKind::Symbol { .. } => {}
-    }
+    with_interner(|interner| binary_with_interner(interner, op, lhs, rhs))
 }
 
 fn unary_derivative(op: UnaryOp, arg: SX) -> SX {
+    with_interner(|interner| unary_derivative_with_interner(interner, op, arg))
+}
+
+fn unary_derivative_with_interner(interner: &mut Interner, op: UnaryOp, arg: SX) -> SX {
     match op {
-        UnaryOp::Abs => arg.sign(),
+        UnaryOp::Abs => unary_with_interner(interner, UnaryOp::Sign, arg),
         UnaryOp::Sign | UnaryOp::Floor | UnaryOp::Ceil | UnaryOp::Round | UnaryOp::Trunc => {
-            SX::zero()
+            intern_constant_with_interner(interner, 0.0)
         }
-        UnaryOp::Sqrt => 0.5 / arg.sqrt(),
-        UnaryOp::Exp => arg.exp(),
-        UnaryOp::Log => SX::one() / arg,
-        UnaryOp::Sin => arg.cos(),
-        UnaryOp::Cos => -arg.sin(),
-        UnaryOp::Tan => SX::one() / arg.cos().sqr(),
-        UnaryOp::Asin => SX::one() / (SX::one() - arg.sqr()).sqrt(),
-        UnaryOp::Acos => -SX::one() / (SX::one() - arg.sqr()).sqrt(),
-        UnaryOp::Atan => SX::one() / (SX::one() + arg.sqr()),
-        UnaryOp::Sinh => arg.cosh(),
-        UnaryOp::Cosh => arg.sinh(),
-        UnaryOp::Tanh => SX::one() / arg.cosh().sqr(),
-        UnaryOp::Asinh => SX::one() / (arg.sqr() + 1.0).sqrt(),
-        UnaryOp::Acosh => SX::one() / ((arg - 1.0).sqrt() * (arg + 1.0).sqrt()),
-        UnaryOp::Atanh => SX::one() / (SX::one() - arg.sqr()),
+        UnaryOp::Sqrt => {
+            let half = intern_constant_with_interner(interner, 0.5);
+            let sqrt = unary_with_interner(interner, UnaryOp::Sqrt, arg);
+            binary_with_interner(interner, BinaryOp::Div, half, sqrt)
+        }
+        UnaryOp::Exp => unary_with_interner(interner, UnaryOp::Exp, arg),
+        UnaryOp::Log => {
+            let one = intern_constant_with_interner(interner, 1.0);
+            binary_with_interner(interner, BinaryOp::Div, one, arg)
+        }
+        UnaryOp::Sin => unary_with_interner(interner, UnaryOp::Cos, arg),
+        UnaryOp::Cos => {
+            let sin = unary_with_interner(interner, UnaryOp::Sin, arg);
+            let neg_one = intern_constant_with_interner(interner, -1.0);
+            binary_with_interner(interner, BinaryOp::Mul, neg_one, sin)
+        }
+        UnaryOp::Tan => {
+            let cos = unary_with_interner(interner, UnaryOp::Cos, arg);
+            let cos_sq = binary_with_interner(interner, BinaryOp::Mul, cos, cos);
+            let one = intern_constant_with_interner(interner, 1.0);
+            binary_with_interner(interner, BinaryOp::Div, one, cos_sq)
+        }
+        UnaryOp::Asin => {
+            let arg_sq = binary_with_interner(interner, BinaryOp::Mul, arg, arg);
+            let one = intern_constant_with_interner(interner, 1.0);
+            let radicand = binary_with_interner(interner, BinaryOp::Sub, one, arg_sq);
+            let denom = unary_with_interner(interner, UnaryOp::Sqrt, radicand);
+            let one = intern_constant_with_interner(interner, 1.0);
+            binary_with_interner(interner, BinaryOp::Div, one, denom)
+        }
+        UnaryOp::Acos => {
+            let arg_sq = binary_with_interner(interner, BinaryOp::Mul, arg, arg);
+            let one = intern_constant_with_interner(interner, 1.0);
+            let radicand = binary_with_interner(interner, BinaryOp::Sub, one, arg_sq);
+            let denom = unary_with_interner(interner, UnaryOp::Sqrt, radicand);
+            let neg_one = intern_constant_with_interner(interner, -1.0);
+            binary_with_interner(
+                interner,
+                BinaryOp::Div,
+                neg_one,
+                denom,
+            )
+        }
+        UnaryOp::Atan => {
+            let arg_sq = binary_with_interner(interner, BinaryOp::Mul, arg, arg);
+            let one = intern_constant_with_interner(interner, 1.0);
+            let denom = binary_with_interner(interner, BinaryOp::Add, one, arg_sq);
+            let one = intern_constant_with_interner(interner, 1.0);
+            binary_with_interner(interner, BinaryOp::Div, one, denom)
+        }
+        UnaryOp::Sinh => unary_with_interner(interner, UnaryOp::Cosh, arg),
+        UnaryOp::Cosh => unary_with_interner(interner, UnaryOp::Sinh, arg),
+        UnaryOp::Tanh => {
+            let cosh = unary_with_interner(interner, UnaryOp::Cosh, arg);
+            let cosh_sq = binary_with_interner(interner, BinaryOp::Mul, cosh, cosh);
+            let one = intern_constant_with_interner(interner, 1.0);
+            binary_with_interner(interner, BinaryOp::Div, one, cosh_sq)
+        }
+        UnaryOp::Asinh => {
+            let arg_sq = binary_with_interner(interner, BinaryOp::Mul, arg, arg);
+            let one = intern_constant_with_interner(interner, 1.0);
+            let radicand = binary_with_interner(interner, BinaryOp::Add, arg_sq, one);
+            let denom = unary_with_interner(interner, UnaryOp::Sqrt, radicand);
+            let one = intern_constant_with_interner(interner, 1.0);
+            binary_with_interner(interner, BinaryOp::Div, one, denom)
+        }
+        UnaryOp::Acosh => {
+            let one = intern_constant_with_interner(interner, 1.0);
+            let arg_minus_one = binary_with_interner(interner, BinaryOp::Sub, arg, one);
+            let left = unary_with_interner(
+                interner,
+                UnaryOp::Sqrt,
+                arg_minus_one,
+            );
+            let one = intern_constant_with_interner(interner, 1.0);
+            let arg_plus_one = binary_with_interner(interner, BinaryOp::Add, arg, one);
+            let right = unary_with_interner(
+                interner,
+                UnaryOp::Sqrt,
+                arg_plus_one,
+            );
+            let denom = binary_with_interner(interner, BinaryOp::Mul, left, right);
+            let one = intern_constant_with_interner(interner, 1.0);
+            binary_with_interner(interner, BinaryOp::Div, one, denom)
+        }
+        UnaryOp::Atanh => {
+            let arg_sq = binary_with_interner(interner, BinaryOp::Mul, arg, arg);
+            let one = intern_constant_with_interner(interner, 1.0);
+            let denom = binary_with_interner(interner, BinaryOp::Sub, one, arg_sq);
+            let one = intern_constant_with_interner(interner, 1.0);
+            binary_with_interner(interner, BinaryOp::Div, one, denom)
+        }
     }
 }
 
 fn binary_partials(op: BinaryOp, lhs: SX, rhs: SX) -> (SX, SX) {
+    with_interner(|interner| binary_partials_with_interner(interner, op, lhs, rhs))
+}
+
+fn binary_partials_with_interner(
+    interner: &mut Interner,
+    op: BinaryOp,
+    lhs: SX,
+    rhs: SX,
+) -> (SX, SX) {
     match op {
-        BinaryOp::Add => (SX::one(), SX::one()),
-        BinaryOp::Sub => (SX::one(), -SX::one()),
+        BinaryOp::Add => (
+            intern_constant_with_interner(interner, 1.0),
+            intern_constant_with_interner(interner, 1.0),
+        ),
+        BinaryOp::Sub => (
+            intern_constant_with_interner(interner, 1.0),
+            intern_constant_with_interner(interner, -1.0),
+        ),
         BinaryOp::Mul => (rhs, lhs),
-        BinaryOp::Div => (SX::one() / rhs, -lhs / rhs.sqr()),
+        BinaryOp::Div => {
+            let one = intern_constant_with_interner(interner, 1.0);
+            let lhs_partial = binary_with_interner(interner, BinaryOp::Div, one, rhs);
+            let rhs_sq = binary_with_interner(interner, BinaryOp::Mul, rhs, rhs);
+            let neg_one = intern_constant_with_interner(interner, -1.0);
+            let neg_lhs = binary_with_interner(interner, BinaryOp::Mul, neg_one, lhs);
+            let rhs_partial = binary_with_interner(interner, BinaryOp::Div, neg_lhs, rhs_sq);
+            (lhs_partial, rhs_partial)
+        }
         BinaryOp::Pow => {
-            let pow = lhs.pow(rhs);
-            (rhs * lhs.pow(rhs - 1.0), pow * lhs.log())
+            let pow = binary_with_interner(interner, BinaryOp::Pow, lhs, rhs);
+            let one = intern_constant_with_interner(interner, 1.0);
+            let rhs_minus_one = binary_with_interner(interner, BinaryOp::Sub, rhs, one);
+            let lhs_pow = binary_with_interner(interner, BinaryOp::Pow, lhs, rhs_minus_one);
+            let lhs_partial = binary_with_interner(
+                interner,
+                BinaryOp::Mul,
+                rhs,
+                lhs_pow,
+            );
+            let lhs_log = unary_with_interner(interner, UnaryOp::Log, lhs);
+            let rhs_partial = binary_with_interner(interner, BinaryOp::Mul, pow, lhs_log);
+            (lhs_partial, rhs_partial)
         }
         BinaryOp::Atan2 => {
-            let denom = lhs.sqr() + rhs.sqr();
-            (rhs / denom, -lhs / denom)
+            let lhs_sq = binary_with_interner(interner, BinaryOp::Mul, lhs, lhs);
+            let rhs_sq = binary_with_interner(interner, BinaryOp::Mul, rhs, rhs);
+            let denom = binary_with_interner(interner, BinaryOp::Add, lhs_sq, rhs_sq);
+            let lhs_partial = binary_with_interner(interner, BinaryOp::Div, rhs, denom);
+            let neg_one = intern_constant_with_interner(interner, -1.0);
+            let neg_lhs = binary_with_interner(interner, BinaryOp::Mul, neg_one, lhs);
+            let rhs_partial = binary_with_interner(interner, BinaryOp::Div, neg_lhs, denom);
+            (lhs_partial, rhs_partial)
         }
         BinaryOp::Hypot => {
-            let hypot = lhs.hypot(rhs);
-            (lhs / hypot, rhs / hypot)
+            let hypot = binary_with_interner(interner, BinaryOp::Hypot, lhs, rhs);
+            let lhs_partial = binary_with_interner(interner, BinaryOp::Div, lhs, hypot);
+            let rhs_partial = binary_with_interner(interner, BinaryOp::Div, rhs, hypot);
+            (lhs_partial, rhs_partial)
         }
-        BinaryOp::Mod => (SX::one(), -(lhs / rhs).trunc()),
+        BinaryOp::Mod => {
+            let lhs_over_rhs = binary_with_interner(interner, BinaryOp::Div, lhs, rhs);
+            let trunc = unary_with_interner(interner, UnaryOp::Trunc, lhs_over_rhs);
+            let neg_one = intern_constant_with_interner(interner, -1.0);
+            let rhs_partial = binary_with_interner(interner, BinaryOp::Mul, neg_one, trunc);
+            let one = intern_constant_with_interner(interner, 1.0);
+            (one, rhs_partial)
+        }
         BinaryOp::Copysign => {
-            let rhs_sign = rhs.sign() + (SX::one() - rhs.sign().abs());
-            (lhs.sign() * rhs_sign, SX::zero())
+            let rhs_sign = unary_with_interner(interner, UnaryOp::Sign, rhs);
+            let rhs_sign_abs = unary_with_interner(interner, UnaryOp::Abs, rhs_sign);
+            let one = intern_constant_with_interner(interner, 1.0);
+            let rhs_sign_term = binary_with_interner(interner, BinaryOp::Sub, one, rhs_sign_abs);
+            let rhs_sign_full = binary_with_interner(interner, BinaryOp::Add, rhs_sign, rhs_sign_term);
+            let lhs_sign = unary_with_interner(interner, UnaryOp::Sign, lhs);
+            (
+                binary_with_interner(interner, BinaryOp::Mul, lhs_sign, rhs_sign_full),
+                intern_constant_with_interner(interner, 0.0),
+            )
         }
     }
 }
 
-fn greedy_color_disjoint(sets: &[Vec<Index>]) -> Vec<Vec<Index>> {
+pub(crate) fn greedy_color_disjoint(sets: &[Vec<Index>]) -> Vec<Vec<Index>> {
     let mut color_unions = Vec::<BTreeSet<Index>>::new();
     let mut color_members = Vec::<Vec<Index>>::new();
     for (member, set) in sets.iter().enumerate() {
@@ -1227,110 +1612,1104 @@ pub(crate) fn jacobian_structure(outputs: &[SX], vars: &[SX]) -> Result<Jacobian
     Ok(structure)
 }
 
-fn directional_forward(
-    expr: SX,
-    seeds: &HashMap<SX, SX>,
-    memo: &mut HashMap<SX, SX>,
-    local_caches: &mut AdLocalCaches,
-    call_memo: &mut HashMap<ForwardCallCacheKey, Vec<SXMatrix>>,
-) -> SX {
-    if let Some(existing) = memo.get(&expr) {
-        return *existing;
+fn execute_program_forward(
+    program: &SxProgram,
+    vars: &[SX],
+    seeds: &[SX],
+) -> Result<Vec<SX>> {
+    let mut derivative_slots = vec![SX::zero(); program.slot_exprs.len()];
+    for (var, seed) in vars.iter().copied().zip(seeds.iter().copied()) {
+        if let Some(&slot) = program.slot_by_node.get(&var) {
+            derivative_slots[slot] = seed;
+        }
     }
-    let derivative = match node_kind(expr) {
-        NodeKind::Constant(_) => SX::zero(),
-        NodeKind::Symbol { .. } => seeds.get(&expr).copied().unwrap_or_else(SX::zero),
-        NodeKind::Unary { op, arg } => {
-            directional_forward(arg, seeds, memo, local_caches, call_memo)
-                * unary_derivative(op, arg)
-        }
-        NodeKind::Binary { op, lhs, rhs } => match op {
-            BinaryOp::Add => {
-                directional_forward(lhs, seeds, memo, local_caches, call_memo)
-                    + directional_forward(rhs, seeds, memo, local_caches, call_memo)
-            }
-            BinaryOp::Sub => {
-                directional_forward(lhs, seeds, memo, local_caches, call_memo)
-                    - directional_forward(rhs, seeds, memo, local_caches, call_memo)
-            }
-            BinaryOp::Mul => {
-                directional_forward(lhs, seeds, memo, local_caches, call_memo) * rhs
-                    + lhs * directional_forward(rhs, seeds, memo, local_caches, call_memo)
-            }
-            BinaryOp::Div => {
-                let dl = directional_forward(lhs, seeds, memo, local_caches, call_memo);
-                let dr = directional_forward(rhs, seeds, memo, local_caches, call_memo);
-                (dl * rhs - lhs * dr) / rhs.sqr()
-            }
-            BinaryOp::Pow
-            | BinaryOp::Atan2
-            | BinaryOp::Hypot
-            | BinaryOp::Mod
-            | BinaryOp::Copysign => {
-                let dl = directional_forward(lhs, seeds, memo, local_caches, call_memo);
-                let dr = directional_forward(rhs, seeds, memo, local_caches, call_memo);
-                let (d_lhs, d_rhs) = binary_partials(op, lhs, rhs);
-                dl * d_lhs + dr * d_rhs
-            }
-        },
-        NodeKind::Call {
-            function,
-            inputs,
-            output_slot,
-            output_offset,
-        } => {
-            let profile = local_caches.dependency_profile(function);
-            let mut seed_inputs = Vec::with_capacity(inputs.iter().len());
-            let mut has_relevant_seed = false;
-            for (slot, input) in inputs.iter().enumerate() {
-                let seed_input = input.map_nonzeros(|value| {
-                    directional_forward(value, seeds, memo, local_caches, call_memo)
+
+    let mut local_caches = AdLocalCaches::default();
+    let mut call_memo = HashMap::<ForwardCallCacheKey, Vec<SXMatrix>>::new();
+    for instruction in &program.instructions {
+        match instruction {
+            ProgramInstruction::Unary {
+                result_slot,
+                op,
+                arg_slot,
+                arg_expr,
+            } => {
+                with_interner(|interner| {
+                    let derivative = unary_derivative_with_interner(interner, *op, *arg_expr);
+                    derivative_slots[*result_slot] = binary_with_interner(
+                        interner,
+                        BinaryOp::Mul,
+                        derivative_slots[*arg_slot],
+                        derivative,
+                    );
                 });
-                if !has_relevant_seed {
-                    has_relevant_seed =
-                        seed_input
-                            .nonzeros()
-                            .iter()
-                            .enumerate()
-                            .any(|(offset, &value)| {
-                                !value.is_zero()
-                                    && profile.output_depends_on(
-                                        output_slot,
-                                        output_offset,
-                                        slot,
-                                        offset,
-                                    )
-                            });
-                }
-                seed_inputs.push(seed_input);
             }
-            if !has_relevant_seed {
-                SX::zero()
-            } else {
-                let key = ForwardCallCacheKey {
-                    function,
-                    site_id: inputs.site_id(),
-                };
-                if let Some(existing) = call_memo.get(&key) {
-                    existing[output_slot].nz(output_offset)
+            ProgramInstruction::Binary {
+                result_slot,
+                op,
+                lhs_slot,
+                rhs_slot,
+                lhs_expr,
+                rhs_expr,
+            } => {
+                with_interner(|interner| {
+                    derivative_slots[*result_slot] = match op {
+                        BinaryOp::Add => binary_with_interner(
+                            interner,
+                            BinaryOp::Add,
+                            derivative_slots[*lhs_slot],
+                            derivative_slots[*rhs_slot],
+                        ),
+                        BinaryOp::Sub => binary_with_interner(
+                            interner,
+                            BinaryOp::Sub,
+                            derivative_slots[*lhs_slot],
+                            derivative_slots[*rhs_slot],
+                        ),
+                        BinaryOp::Mul => {
+                            let left = binary_with_interner(
+                                interner,
+                                BinaryOp::Mul,
+                                derivative_slots[*lhs_slot],
+                                *rhs_expr,
+                            );
+                            let right = binary_with_interner(
+                                interner,
+                                BinaryOp::Mul,
+                                *lhs_expr,
+                                derivative_slots[*rhs_slot],
+                            );
+                            binary_with_interner(interner, BinaryOp::Add, left, right)
+                        }
+                        BinaryOp::Div => {
+                            let left = binary_with_interner(
+                                interner,
+                                BinaryOp::Mul,
+                                derivative_slots[*lhs_slot],
+                                *rhs_expr,
+                            );
+                            let right = binary_with_interner(
+                                interner,
+                                BinaryOp::Mul,
+                                *lhs_expr,
+                                derivative_slots[*rhs_slot],
+                            );
+                            let numer = binary_with_interner(interner, BinaryOp::Sub, left, right);
+                            let rhs_sq =
+                                binary_with_interner(interner, BinaryOp::Mul, *rhs_expr, *rhs_expr);
+                            binary_with_interner(interner, BinaryOp::Div, numer, rhs_sq)
+                        }
+                        BinaryOp::Pow
+                        | BinaryOp::Atan2
+                        | BinaryOp::Hypot
+                        | BinaryOp::Mod
+                        | BinaryOp::Copysign => {
+                            let (d_lhs, d_rhs) =
+                                binary_partials_with_interner(interner, *op, *lhs_expr, *rhs_expr);
+                            let left = binary_with_interner(
+                                interner,
+                                BinaryOp::Mul,
+                                derivative_slots[*lhs_slot],
+                                d_lhs,
+                            );
+                            let right = binary_with_interner(
+                                interner,
+                                BinaryOp::Mul,
+                                derivative_slots[*rhs_slot],
+                                d_rhs,
+                            );
+                            binary_with_interner(interner, BinaryOp::Add, left, right)
+                        }
+                    };
+                });
+            }
+            ProgramInstruction::Call {
+                result_slot,
+                function,
+                site_key,
+                output_slot,
+                output_offset,
+                inputs,
+            } => {
+                let has_relevant_seed = inputs.iter().any(|input| {
+                    input
+                        .relevant_offsets
+                        .iter()
+                        .any(|&offset| !derivative_slots[input.slots[offset]].is_zero())
+                });
+
+                derivative_slots[*result_slot] = if !has_relevant_seed {
+                    SX::zero()
+                } else if let Some(existing) = call_memo.get(site_key) {
+                    existing[*output_slot].nz(*output_offset)
                 } else {
-                    let helper = local_caches
-                        .forward_helper(function)
-                        .expect("forward helper generation should succeed for a valid SXFunction");
-                    let mut helper_inputs = inputs.to_vec();
+                    let mut seed_inputs = Vec::with_capacity(inputs.len());
+                    for input in inputs {
+                        let mut seed_nonzeros = vec![SX::zero(); input.slots.len()];
+                        for &offset in &input.relevant_offsets {
+                            seed_nonzeros[offset] = derivative_slots[input.slots[offset]];
+                        }
+                        seed_inputs.push(SXMatrix::new(input.matrix.ccs().clone(), seed_nonzeros)?);
+                    }
+                    let helper = local_caches.forward_helper(*function)?;
+                    let mut helper_inputs =
+                        inputs.iter().map(|input| input.matrix.clone()).collect::<Vec<_>>();
                     helper_inputs.extend(seed_inputs);
-                    let helper_outputs = helper
-                        .call(&helper_inputs)
-                        .expect("forward helper call should match its declared signature");
-                    let selected = helper_outputs[output_slot].nz(output_offset);
-                    call_memo.insert(key, helper_outputs);
+                    let helper_outputs = helper.call(&helper_inputs)?;
+                    let selected = helper_outputs[*output_slot].nz(*output_offset);
+                    call_memo.insert(site_key.clone(), helper_outputs);
                     selected
+                };
+            }
+        }
+    }
+
+    Ok(program
+        .output_slots
+        .iter()
+        .map(|&slot| derivative_slots[slot])
+        .collect())
+}
+
+fn execute_program_forward_batch(
+    program: &SxProgram,
+    vars: &[SX],
+    seeds_by_direction: &[Vec<SX>],
+) -> Result<Vec<Vec<SX>>> {
+    let direction_count = seeds_by_direction.len();
+    let slot_count = program.slot_exprs.len();
+    let slot_base = |slot: usize| slot * direction_count;
+    let mut derivative_slots = vec![SX::zero(); slot_count * direction_count];
+    let mut active_masks = (direction_count <= 64).then(|| vec![0_u64; slot_count]);
+    for (var_index, var) in vars.iter().copied().enumerate() {
+        if let Some(&slot) = program.slot_by_node.get(&var) {
+            let base = slot_base(slot);
+            let mut slot_mask = 0_u64;
+            for (direction, seeds) in seeds_by_direction.iter().enumerate() {
+                let value = seeds[var_index];
+                derivative_slots[base + direction] = value;
+                if !value.is_zero() && direction < 64 {
+                    slot_mask |= 1_u64 << direction;
+                }
+            }
+            if let Some(masks) = active_masks.as_mut() {
+                masks[slot] = slot_mask;
+            }
+        }
+    }
+
+    execute_program_forward_batch_with_slots(
+        program,
+        derivative_slots,
+        active_masks,
+        direction_count,
+    )
+}
+
+fn execute_program_forward_basis_batch(
+    program: &SxProgram,
+    vars: &[SX],
+    active_var_groups: &[Vec<Index>],
+) -> Result<Vec<Vec<SX>>> {
+    let direction_count = active_var_groups.len();
+    let slot_count = program.slot_exprs.len();
+    let slot_base = |slot: usize| slot * direction_count;
+    let mut derivative_slots = vec![SX::zero(); slot_count * direction_count];
+    let mut active_masks = (direction_count <= 64).then(|| vec![0_u64; slot_count]);
+    for (direction, active_vars) in active_var_groups.iter().enumerate() {
+        for &var_index in active_vars {
+            if var_index >= vars.len() {
+                return Err(SxError::Shape(format!(
+                    "forward basis variable index {} out of range for variable length {}",
+                    var_index,
+                    vars.len()
+                )));
+            }
+            if let Some(&slot) = program.slot_by_node.get(&vars[var_index]) {
+                derivative_slots[slot_base(slot) + direction] = SX::one();
+                if let Some(masks) = active_masks.as_mut() {
+                    masks[slot] |= 1_u64 << direction;
                 }
             }
         }
-    };
-    memo.insert(expr, derivative);
-    derivative
+    }
+
+    execute_program_forward_batch_with_slots(
+        program,
+        derivative_slots,
+        active_masks,
+        direction_count,
+    )
+}
+
+fn execute_program_forward_batch_with_slots(
+    program: &SxProgram,
+    mut derivative_slots: Vec<SX>,
+    mut active_masks: Option<Vec<u64>>,
+    direction_count: usize,
+) -> Result<Vec<Vec<SX>>> {
+    let slot_base = |slot: usize| slot * direction_count;
+
+    let mut local_caches = AdLocalCaches::default();
+    let mut call_memo = HashMap::<ForwardBatchCallCacheKey, Vec<SXMatrix>>::new();
+    for instruction in &program.instructions {
+        match instruction {
+            ProgramInstruction::Unary {
+                result_slot,
+                op,
+                arg_slot,
+                arg_expr,
+            } => {
+                let result_base = slot_base(*result_slot);
+                let arg_base = slot_base(*arg_slot);
+                if let Some(masks) = active_masks.as_mut() {
+                    let arg_mask = masks[*arg_slot];
+                    masks[*result_slot] = arg_mask;
+                    if arg_mask == 0 {
+                        continue;
+                    }
+                    with_interner(|interner| {
+                        let derivative = unary_derivative_with_interner(interner, *op, *arg_expr);
+                        for direction in iter_direction_bits(arg_mask) {
+                            derivative_slots[result_base + direction] = binary_with_interner(
+                                interner,
+                                BinaryOp::Mul,
+                                derivative_slots[arg_base + direction],
+                                derivative,
+                            );
+                        }
+                    });
+                } else {
+                    with_interner(|interner| {
+                        let derivative = unary_derivative_with_interner(interner, *op, *arg_expr);
+                        for direction in 0..direction_count {
+                            derivative_slots[result_base + direction] = binary_with_interner(
+                                interner,
+                                BinaryOp::Mul,
+                                derivative_slots[arg_base + direction],
+                                derivative,
+                            );
+                        }
+                    });
+                }
+            }
+            ProgramInstruction::Binary {
+                result_slot,
+                op,
+                lhs_slot,
+                rhs_slot,
+                lhs_expr,
+                rhs_expr,
+            } => {
+                let result_base = slot_base(*result_slot);
+                let lhs_base = slot_base(*lhs_slot);
+                let rhs_base = slot_base(*rhs_slot);
+                if let Some(masks) = active_masks.as_mut() {
+                    let lhs_mask = masks[*lhs_slot];
+                    let rhs_mask = masks[*rhs_slot];
+                    let result_mask = lhs_mask | rhs_mask;
+                    masks[*result_slot] = result_mask;
+                    if result_mask == 0 {
+                        continue;
+                    }
+                    with_interner(|interner| match op {
+                        BinaryOp::Add => {
+                            for direction in iter_direction_bits(result_mask) {
+                                derivative_slots[result_base + direction] = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Add,
+                                    derivative_slots[lhs_base + direction],
+                                    derivative_slots[rhs_base + direction],
+                                );
+                            }
+                        }
+                        BinaryOp::Sub => {
+                            for direction in iter_direction_bits(result_mask) {
+                                derivative_slots[result_base + direction] = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Sub,
+                                    derivative_slots[lhs_base + direction],
+                                    derivative_slots[rhs_base + direction],
+                                );
+                            }
+                        }
+                        BinaryOp::Mul => {
+                            for direction in iter_direction_bits(result_mask) {
+                                let left = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Mul,
+                                    derivative_slots[lhs_base + direction],
+                                    *rhs_expr,
+                                );
+                                let right = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Mul,
+                                    *lhs_expr,
+                                    derivative_slots[rhs_base + direction],
+                                );
+                                derivative_slots[result_base + direction] =
+                                    binary_with_interner(interner, BinaryOp::Add, left, right);
+                            }
+                        }
+                        BinaryOp::Div => {
+                            let rhs_sq = binary_with_interner(
+                                interner,
+                                BinaryOp::Mul,
+                                *rhs_expr,
+                                *rhs_expr,
+                            );
+                            for direction in iter_direction_bits(result_mask) {
+                                let left = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Mul,
+                                    derivative_slots[lhs_base + direction],
+                                    *rhs_expr,
+                                );
+                                let right = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Mul,
+                                    *lhs_expr,
+                                    derivative_slots[rhs_base + direction],
+                                );
+                                let numer =
+                                    binary_with_interner(interner, BinaryOp::Sub, left, right);
+                                derivative_slots[result_base + direction] =
+                                    binary_with_interner(interner, BinaryOp::Div, numer, rhs_sq);
+                            }
+                        }
+                        BinaryOp::Pow
+                        | BinaryOp::Atan2
+                        | BinaryOp::Hypot
+                        | BinaryOp::Mod
+                        | BinaryOp::Copysign => {
+                            let (d_lhs, d_rhs) = binary_partials_with_interner(
+                                interner,
+                                *op,
+                                *lhs_expr,
+                                *rhs_expr,
+                            );
+                            for direction in iter_direction_bits(result_mask) {
+                                let left = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Mul,
+                                    derivative_slots[lhs_base + direction],
+                                    d_lhs,
+                                );
+                                let right = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Mul,
+                                    derivative_slots[rhs_base + direction],
+                                    d_rhs,
+                                );
+                                derivative_slots[result_base + direction] =
+                                    binary_with_interner(interner, BinaryOp::Add, left, right);
+                            }
+                        }
+                    });
+                } else {
+                    with_interner(|interner| match op {
+                        BinaryOp::Add => {
+                            for direction in 0..direction_count {
+                                derivative_slots[result_base + direction] = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Add,
+                                    derivative_slots[lhs_base + direction],
+                                    derivative_slots[rhs_base + direction],
+                                );
+                            }
+                        }
+                        BinaryOp::Sub => {
+                            for direction in 0..direction_count {
+                                derivative_slots[result_base + direction] = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Sub,
+                                    derivative_slots[lhs_base + direction],
+                                    derivative_slots[rhs_base + direction],
+                                );
+                            }
+                        }
+                        BinaryOp::Mul => {
+                            for direction in 0..direction_count {
+                                let left = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Mul,
+                                    derivative_slots[lhs_base + direction],
+                                    *rhs_expr,
+                                );
+                                let right = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Mul,
+                                    *lhs_expr,
+                                    derivative_slots[rhs_base + direction],
+                                );
+                                derivative_slots[result_base + direction] =
+                                    binary_with_interner(interner, BinaryOp::Add, left, right);
+                            }
+                        }
+                        BinaryOp::Div => {
+                            let rhs_sq = binary_with_interner(
+                                interner,
+                                BinaryOp::Mul,
+                                *rhs_expr,
+                                *rhs_expr,
+                            );
+                            for direction in 0..direction_count {
+                                let left = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Mul,
+                                    derivative_slots[lhs_base + direction],
+                                    *rhs_expr,
+                                );
+                                let right = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Mul,
+                                    *lhs_expr,
+                                    derivative_slots[rhs_base + direction],
+                                );
+                                let numer =
+                                    binary_with_interner(interner, BinaryOp::Sub, left, right);
+                                derivative_slots[result_base + direction] =
+                                    binary_with_interner(interner, BinaryOp::Div, numer, rhs_sq);
+                            }
+                        }
+                        BinaryOp::Pow
+                        | BinaryOp::Atan2
+                        | BinaryOp::Hypot
+                        | BinaryOp::Mod
+                        | BinaryOp::Copysign => {
+                            let (d_lhs, d_rhs) = binary_partials_with_interner(
+                                interner,
+                                *op,
+                                *lhs_expr,
+                                *rhs_expr,
+                            );
+                            for direction in 0..direction_count {
+                                let left = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Mul,
+                                    derivative_slots[lhs_base + direction],
+                                    d_lhs,
+                                );
+                                let right = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Mul,
+                                    derivative_slots[rhs_base + direction],
+                                    d_rhs,
+                                );
+                                derivative_slots[result_base + direction] =
+                                    binary_with_interner(interner, BinaryOp::Add, left, right);
+                            }
+                        }
+                    });
+                }
+            }
+            ProgramInstruction::Call {
+                result_slot,
+                function,
+                site_key,
+                output_slot,
+                output_offset,
+                inputs,
+            } => {
+                let result_base = slot_base(*result_slot);
+                let result_values = if let Some(masks) = active_masks.as_mut() {
+                    let mut direction_mask = 0_u64;
+                    for input in inputs {
+                        for &offset in &input.relevant_offsets {
+                            direction_mask |= masks[input.slots[offset]];
+                        }
+                    }
+                    masks[*result_slot] = direction_mask;
+                    if direction_mask == 0 {
+                        vec![SX::zero(); direction_count]
+                    } else {
+                        let active_directions =
+                            iter_direction_bits(direction_mask).collect::<Vec<_>>();
+                        let active_count = active_directions.len();
+                        let mut seed_inputs_by_direction = Vec::with_capacity(active_count);
+                        for &direction in &active_directions {
+                            let mut direction_seed_inputs = Vec::with_capacity(inputs.len());
+                            for input in inputs {
+                                let mut seed_nonzeros = vec![SX::zero(); input.slots.len()];
+                                for &offset in &input.relevant_offsets {
+                                    seed_nonzeros[offset] = derivative_slots
+                                        [slot_base(input.slots[offset]) + direction];
+                                }
+                                direction_seed_inputs.push(SXMatrix::new(
+                                    input.matrix.ccs().clone(),
+                                    seed_nonzeros,
+                                )?);
+                            }
+                            seed_inputs_by_direction.push(direction_seed_inputs);
+                        }
+                        let key = ForwardBatchCallCacheKey {
+                            site_key: site_key.clone(),
+                            direction_count: active_count,
+                            direction_mask,
+                        };
+                        if let Some(existing) = call_memo.get(&key) {
+                            let mut selected = vec![SX::zero(); direction_count];
+                            for (local_direction, &direction) in active_directions.iter().enumerate()
+                            {
+                                selected[direction] =
+                                    existing[*output_slot * active_count + local_direction]
+                                        .nz(*output_offset);
+                            }
+                            selected
+                        } else {
+                            let helper =
+                                local_caches.forward_batch_helper(*function, active_count)?;
+                            let mut helper_inputs = inputs
+                                .iter()
+                                .map(|input| input.matrix.clone())
+                                .collect::<Vec<_>>();
+                            for direction_seed_inputs in &seed_inputs_by_direction {
+                                helper_inputs.extend(direction_seed_inputs.iter().cloned());
+                            }
+                            let helper_outputs = helper.call(&helper_inputs)?;
+                            let mut selected = vec![SX::zero(); direction_count];
+                            for (local_direction, &direction) in
+                                active_directions.iter().enumerate()
+                            {
+                                selected[direction] =
+                                    helper_outputs[*output_slot * active_count + local_direction]
+                                        .nz(*output_offset);
+                            }
+                            call_memo.insert(key, helper_outputs);
+                            selected
+                        }
+                    }
+                } else {
+                    let has_relevant_seed = (0..direction_count).any(|direction| {
+                        inputs.iter().any(|input| {
+                            input.relevant_offsets.iter().any(|&offset| {
+                                !derivative_slots[slot_base(input.slots[offset]) + direction]
+                                    .is_zero()
+                            })
+                        })
+                    });
+                    if !has_relevant_seed {
+                        vec![SX::zero(); direction_count]
+                    } else {
+                        let mut seed_inputs_by_direction = Vec::with_capacity(direction_count);
+                        for direction in 0..direction_count {
+                            let mut direction_seed_inputs = Vec::with_capacity(inputs.len());
+                            for input in inputs {
+                                let mut seed_nonzeros = vec![SX::zero(); input.slots.len()];
+                                for &offset in &input.relevant_offsets {
+                                    seed_nonzeros[offset] = derivative_slots
+                                        [slot_base(input.slots[offset]) + direction];
+                                }
+                                direction_seed_inputs.push(SXMatrix::new(
+                                    input.matrix.ccs().clone(),
+                                    seed_nonzeros,
+                                )?);
+                            }
+                            seed_inputs_by_direction.push(direction_seed_inputs);
+                        }
+                        let key = ForwardBatchCallCacheKey {
+                            site_key: site_key.clone(),
+                            direction_count,
+                            direction_mask: u64::MAX,
+                        };
+                        if let Some(existing) = call_memo.get(&key) {
+                            (0..direction_count)
+                                .map(|direction| {
+                                    existing[*output_slot * direction_count + direction]
+                                        .nz(*output_offset)
+                                })
+                                .collect()
+                        } else {
+                            let helper =
+                                local_caches.forward_batch_helper(*function, direction_count)?;
+                            let mut helper_inputs = inputs
+                                .iter()
+                                .map(|input| input.matrix.clone())
+                                .collect::<Vec<_>>();
+                            for direction_seed_inputs in &seed_inputs_by_direction {
+                                helper_inputs.extend(direction_seed_inputs.iter().cloned());
+                            }
+                            let helper_outputs = helper.call(&helper_inputs)?;
+                            let selected = (0..direction_count)
+                                .map(|direction| {
+                                    helper_outputs[*output_slot * direction_count + direction]
+                                        .nz(*output_offset)
+                                })
+                                .collect::<Vec<_>>();
+                            call_memo.insert(key, helper_outputs);
+                            selected
+                        }
+                    }
+                };
+                for direction in 0..direction_count {
+                    derivative_slots[result_base + direction] = result_values[direction];
+                }
+            }
+        }
+    }
+
+    Ok((0..direction_count)
+        .map(|direction| {
+            program
+                .output_slots
+                .iter()
+                .map(|&slot| derivative_slots[slot_base(slot) + direction])
+                .collect::<Vec<_>>()
+        })
+        .collect())
+}
+
+fn execute_program_reverse(
+    program: &SxProgram,
+    vars: &[SX],
+    seeds: &[SX],
+) -> Result<Vec<SX>> {
+    let mut adjoint_slots = vec![SX::zero(); program.slot_exprs.len()];
+    for (slot, seed) in program
+        .output_slots
+        .iter()
+        .copied()
+        .zip(seeds.iter().copied())
+    {
+        adjoint_slots[slot] += seed;
+    }
+
+    let mut local_caches = AdLocalCaches::default();
+    let mut reverse_call_memo = HashMap::<usize, Vec<SXMatrix>>::new();
+    for instruction in program.instructions.iter().rev() {
+        match instruction {
+            ProgramInstruction::Unary {
+                result_slot,
+                op,
+                arg_slot,
+                arg_expr,
+            } => {
+                let adj = adjoint_slots[*result_slot];
+                if !adj.is_zero() {
+                    with_interner(|interner| {
+                        let derivative = unary_derivative_with_interner(interner, *op, *arg_expr);
+                        let contribution =
+                            binary_with_interner(interner, BinaryOp::Mul, adj, derivative);
+                        adjoint_slots[*arg_slot] = binary_with_interner(
+                            interner,
+                            BinaryOp::Add,
+                            adjoint_slots[*arg_slot],
+                            contribution,
+                        );
+                    });
+                }
+            }
+            ProgramInstruction::Binary {
+                result_slot,
+                op,
+                lhs_slot,
+                rhs_slot,
+                lhs_expr,
+                rhs_expr,
+            } => {
+                let adj = adjoint_slots[*result_slot];
+                if adj.is_zero() {
+                    continue;
+                }
+                with_interner(|interner| match op {
+                    BinaryOp::Add => {
+                        adjoint_slots[*lhs_slot] = binary_with_interner(
+                            interner,
+                            BinaryOp::Add,
+                            adjoint_slots[*lhs_slot],
+                            adj,
+                        );
+                        adjoint_slots[*rhs_slot] = binary_with_interner(
+                            interner,
+                            BinaryOp::Add,
+                            adjoint_slots[*rhs_slot],
+                            adj,
+                        );
+                    }
+                    BinaryOp::Sub => {
+                        adjoint_slots[*lhs_slot] = binary_with_interner(
+                            interner,
+                            BinaryOp::Add,
+                            adjoint_slots[*lhs_slot],
+                            adj,
+                        );
+                        adjoint_slots[*rhs_slot] = binary_with_interner(
+                            interner,
+                            BinaryOp::Sub,
+                            adjoint_slots[*rhs_slot],
+                            adj,
+                        );
+                    }
+                    BinaryOp::Mul => {
+                        let lhs_contrib =
+                            binary_with_interner(interner, BinaryOp::Mul, adj, *rhs_expr);
+                        let rhs_contrib =
+                            binary_with_interner(interner, BinaryOp::Mul, adj, *lhs_expr);
+                        adjoint_slots[*lhs_slot] = binary_with_interner(
+                            interner,
+                            BinaryOp::Add,
+                            adjoint_slots[*lhs_slot],
+                            lhs_contrib,
+                        );
+                        adjoint_slots[*rhs_slot] = binary_with_interner(
+                            interner,
+                            BinaryOp::Add,
+                            adjoint_slots[*rhs_slot],
+                            rhs_contrib,
+                        );
+                    }
+                    BinaryOp::Div => {
+                        let lhs_contrib =
+                            binary_with_interner(interner, BinaryOp::Div, adj, *rhs_expr);
+                        let neg_one = intern_constant_with_interner(interner, -1.0);
+                        let neg_adj = binary_with_interner(interner, BinaryOp::Mul, neg_one, adj);
+                        let numer =
+                            binary_with_interner(interner, BinaryOp::Mul, neg_adj, *lhs_expr);
+                        let rhs_sq =
+                            binary_with_interner(interner, BinaryOp::Mul, *rhs_expr, *rhs_expr);
+                        let rhs_contrib =
+                            binary_with_interner(interner, BinaryOp::Div, numer, rhs_sq);
+                        adjoint_slots[*lhs_slot] = binary_with_interner(
+                            interner,
+                            BinaryOp::Add,
+                            adjoint_slots[*lhs_slot],
+                            lhs_contrib,
+                        );
+                        adjoint_slots[*rhs_slot] = binary_with_interner(
+                            interner,
+                            BinaryOp::Add,
+                            adjoint_slots[*rhs_slot],
+                            rhs_contrib,
+                        );
+                    }
+                    BinaryOp::Pow
+                    | BinaryOp::Atan2
+                    | BinaryOp::Hypot
+                    | BinaryOp::Mod
+                    | BinaryOp::Copysign => {
+                        let (d_lhs, d_rhs) =
+                            binary_partials_with_interner(interner, *op, *lhs_expr, *rhs_expr);
+                        let lhs_contrib =
+                            binary_with_interner(interner, BinaryOp::Mul, adj, d_lhs);
+                        let rhs_contrib =
+                            binary_with_interner(interner, BinaryOp::Mul, adj, d_rhs);
+                        adjoint_slots[*lhs_slot] = binary_with_interner(
+                            interner,
+                            BinaryOp::Add,
+                            adjoint_slots[*lhs_slot],
+                            lhs_contrib,
+                        );
+                        adjoint_slots[*rhs_slot] = binary_with_interner(
+                            interner,
+                            BinaryOp::Add,
+                            adjoint_slots[*rhs_slot],
+                            rhs_contrib,
+                        );
+                    }
+                });
+            }
+            ProgramInstruction::Call {
+                result_slot,
+                function,
+                output_slot,
+                output_offset,
+                inputs,
+                ..
+            } => {
+                let adj = adjoint_slots[*result_slot];
+                if adj.is_zero() {
+                    continue;
+                }
+                let profile = local_caches.dependency_profile(*function);
+                let helper_outputs = if let Some(existing) = reverse_call_memo.get(result_slot) {
+                    existing
+                } else {
+                    let helper =
+                        local_caches.reverse_scalar_helper(*function, *output_slot, *output_offset)?;
+                    let helper_outputs =
+                        helper.call(&inputs.iter().map(|input| input.matrix.clone()).collect::<Vec<_>>())?;
+                    reverse_call_memo.insert(*result_slot, helper_outputs);
+                    reverse_call_memo.get(result_slot).expect("inserted reverse call helper output")
+                };
+                for (slot, input) in inputs.iter().enumerate() {
+                    for (offset, &input_slot) in input.slots.iter().enumerate() {
+                        if !profile.output_depends_on(*output_slot, *output_offset, slot, offset) {
+                            continue;
+                        }
+                        adjoint_slots[input_slot] += adj * helper_outputs[slot].nz(offset);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(vars
+        .iter()
+        .copied()
+        .map(|var| {
+            program
+                .slot_by_node
+                .get(&var)
+                .map(|&slot| adjoint_slots[slot])
+                .unwrap_or_else(SX::zero)
+        })
+        .collect())
+}
+
+fn execute_program_reverse_batch(
+    program: &SxProgram,
+    vars: &[SX],
+    seeds_by_direction: &[Vec<SX>],
+) -> Result<Vec<Vec<SX>>> {
+    let direction_count = seeds_by_direction.len();
+    let mut adjoint_slots = vec![vec![SX::zero(); direction_count]; program.slot_exprs.len()];
+    for (output_index, slot) in program.output_slots.iter().copied().enumerate() {
+        for (direction, seeds) in seeds_by_direction.iter().enumerate() {
+            adjoint_slots[slot][direction] += seeds[output_index];
+        }
+    }
+
+    let mut local_caches = AdLocalCaches::default();
+    for instruction in program.instructions.iter().rev() {
+        match instruction {
+            ProgramInstruction::Unary {
+                result_slot,
+                op,
+                arg_slot,
+                arg_expr,
+            } => {
+                let active_adjoints = adjoint_slots[*result_slot]
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter_map(|(direction, adj)| (!adj.is_zero()).then_some((direction, adj)))
+                    .collect::<Vec<_>>();
+                if active_adjoints.is_empty() {
+                    continue;
+                }
+                with_interner(|interner| {
+                    let derivative = unary_derivative_with_interner(interner, *op, *arg_expr);
+                    for (direction, adj) in &active_adjoints {
+                        let contribution =
+                            binary_with_interner(interner, BinaryOp::Mul, *adj, derivative);
+                        adjoint_slots[*arg_slot][*direction] = binary_with_interner(
+                            interner,
+                            BinaryOp::Add,
+                            adjoint_slots[*arg_slot][*direction],
+                            contribution,
+                        );
+                    }
+                });
+            }
+            ProgramInstruction::Binary {
+                result_slot,
+                op,
+                lhs_slot,
+                rhs_slot,
+                lhs_expr,
+                rhs_expr,
+            } => {
+                let active_adjoints = adjoint_slots[*result_slot]
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter_map(|(direction, adj)| (!adj.is_zero()).then_some((direction, adj)))
+                    .collect::<Vec<_>>();
+                if active_adjoints.is_empty() {
+                    continue;
+                }
+                with_interner(|interner| {
+                    let partials = match op {
+                        BinaryOp::Pow
+                        | BinaryOp::Atan2
+                        | BinaryOp::Hypot
+                        | BinaryOp::Mod
+                        | BinaryOp::Copysign => {
+                            Some(binary_partials_with_interner(interner, *op, *lhs_expr, *rhs_expr))
+                        }
+                        _ => None,
+                    };
+                    for (direction, adj) in &active_adjoints {
+                        match op {
+                            BinaryOp::Add => {
+                                adjoint_slots[*lhs_slot][*direction] = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Add,
+                                    adjoint_slots[*lhs_slot][*direction],
+                                    *adj,
+                                );
+                                adjoint_slots[*rhs_slot][*direction] = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Add,
+                                    adjoint_slots[*rhs_slot][*direction],
+                                    *adj,
+                                );
+                            }
+                            BinaryOp::Sub => {
+                                adjoint_slots[*lhs_slot][*direction] = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Add,
+                                    adjoint_slots[*lhs_slot][*direction],
+                                    *adj,
+                                );
+                                adjoint_slots[*rhs_slot][*direction] = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Sub,
+                                    adjoint_slots[*rhs_slot][*direction],
+                                    *adj,
+                                );
+                            }
+                            BinaryOp::Mul => {
+                                let lhs_contrib = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Mul,
+                                    *adj,
+                                    *rhs_expr,
+                                );
+                                let rhs_contrib = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Mul,
+                                    *adj,
+                                    *lhs_expr,
+                                );
+                                adjoint_slots[*lhs_slot][*direction] = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Add,
+                                    adjoint_slots[*lhs_slot][*direction],
+                                    lhs_contrib,
+                                );
+                                adjoint_slots[*rhs_slot][*direction] = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Add,
+                                    adjoint_slots[*rhs_slot][*direction],
+                                    rhs_contrib,
+                                );
+                            }
+                            BinaryOp::Div => {
+                                let lhs_contrib =
+                                    binary_with_interner(interner, BinaryOp::Div, *adj, *rhs_expr);
+                                let neg_one = intern_constant_with_interner(interner, -1.0);
+                                let neg_adj =
+                                    binary_with_interner(interner, BinaryOp::Mul, neg_one, *adj);
+                                let numer =
+                                    binary_with_interner(interner, BinaryOp::Mul, neg_adj, *lhs_expr);
+                                let rhs_sq = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Mul,
+                                    *rhs_expr,
+                                    *rhs_expr,
+                                );
+                                let rhs_contrib =
+                                    binary_with_interner(interner, BinaryOp::Div, numer, rhs_sq);
+                                adjoint_slots[*lhs_slot][*direction] = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Add,
+                                    adjoint_slots[*lhs_slot][*direction],
+                                    lhs_contrib,
+                                );
+                                adjoint_slots[*rhs_slot][*direction] = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Add,
+                                    adjoint_slots[*rhs_slot][*direction],
+                                    rhs_contrib,
+                                );
+                            }
+                            BinaryOp::Pow
+                            | BinaryOp::Atan2
+                            | BinaryOp::Hypot
+                            | BinaryOp::Mod
+                            | BinaryOp::Copysign => {
+                                let (d_lhs, d_rhs) = partials
+                                    .as_ref()
+                                    .expect("partials computed for nontrivial binary op");
+                                let lhs_contrib = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Mul,
+                                    *adj,
+                                    *d_lhs,
+                                );
+                                let rhs_contrib = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Mul,
+                                    *adj,
+                                    *d_rhs,
+                                );
+                                adjoint_slots[*lhs_slot][*direction] = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Add,
+                                    adjoint_slots[*lhs_slot][*direction],
+                                    lhs_contrib,
+                                );
+                                adjoint_slots[*rhs_slot][*direction] = binary_with_interner(
+                                    interner,
+                                    BinaryOp::Add,
+                                    adjoint_slots[*rhs_slot][*direction],
+                                    rhs_contrib,
+                                );
+                            }
+                        }
+                    }
+                });
+            }
+            ProgramInstruction::Call {
+                result_slot,
+                function,
+                output_slot,
+                output_offset,
+                inputs,
+                ..
+            } => {
+                let active_directions = adjoint_slots[*result_slot]
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(direction, adj)| (!adj.is_zero()).then_some(direction))
+                    .collect::<Vec<_>>();
+                if active_directions.is_empty() {
+                    continue;
+                }
+                let mut helper_inputs = inputs
+                    .iter()
+                    .map(|input| input.matrix.clone())
+                    .collect::<Vec<_>>();
+                helper_inputs.extend(
+                    active_directions
+                        .iter()
+                        .map(|&direction| SXMatrix::scalar(adjoint_slots[*result_slot][direction])),
+                );
+                let helper = local_caches.reverse_output_batch_helper(
+                    *function,
+                    *output_slot,
+                    *output_offset,
+                    active_directions.len(),
+                )?;
+                let helper_outputs = helper.call(&helper_inputs)?;
+                for (slot, input) in inputs.iter().enumerate() {
+                    for (active_index, &direction) in active_directions.iter().enumerate() {
+                        let helper_output = &helper_outputs[active_index * inputs.len() + slot];
+                        for &offset in &input.relevant_offsets {
+                            let input_slot = input.slots[offset];
+                            adjoint_slots[input_slot][direction] += helper_output.nz(offset);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((0..direction_count)
+        .map(|direction| {
+            vars.iter()
+                .copied()
+                .map(|var| {
+                    program
+                        .slot_by_node
+                        .get(&var)
+                        .map(|&slot| adjoint_slots[slot][direction])
+                        .unwrap_or_else(SX::zero)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect())
 }
 
 pub(crate) fn forward_directional(outputs: &[SX], vars: &[SX], seeds: &[SX]) -> Result<Vec<SX>> {
@@ -1341,273 +2720,8 @@ pub(crate) fn forward_directional(outputs: &[SX], vars: &[SX], seeds: &[SX]) -> 
             vars.len()
         )));
     }
-    let seed_map = vars
-        .iter()
-        .copied()
-        .zip(seeds.iter().copied())
-        .collect::<HashMap<_, _>>();
-    let mut memo = HashMap::new();
-    let mut local_caches = AdLocalCaches::default();
-    let mut call_memo = HashMap::new();
-    Ok(outputs
-        .iter()
-        .copied()
-        .map(|output| {
-            directional_forward(
-                output,
-                &seed_map,
-                &mut memo,
-                &mut local_caches,
-                &mut call_memo,
-            )
-        })
-        .collect())
-}
-
-fn directional_forward_batch(
-    expr: SX,
-    var_index_by_symbol: &HashMap<SX, usize>,
-    seeds_by_direction: &[Vec<SX>],
-    memo: &mut HashMap<SX, Vec<SX>>,
-    local_caches: &mut AdLocalCaches,
-    call_memo: &mut HashMap<ForwardCallCacheKey, Vec<SXMatrix>>,
-) -> Result<Vec<SX>> {
-    if let Some(existing) = memo.get(&expr) {
-        return Ok(existing.clone());
-    }
-
-    let direction_count = seeds_by_direction.len();
-    let derivative = match node_kind(expr) {
-        NodeKind::Constant(_) => vec![SX::zero(); direction_count],
-        NodeKind::Symbol { .. } => match var_index_by_symbol.get(&expr).copied() {
-            Some(index) => seeds_by_direction
-                .iter()
-                .map(|seeds| seeds[index])
-                .collect::<Vec<_>>(),
-            None => vec![SX::zero(); direction_count],
-        },
-        NodeKind::Unary { op, arg } => {
-            let arg_deriv = directional_forward_batch(
-                arg,
-                var_index_by_symbol,
-                seeds_by_direction,
-                memo,
-                local_caches,
-                call_memo,
-            )?;
-            arg_deriv
-                .into_iter()
-                .map(|value| value * unary_derivative(op, arg))
-                .collect()
-        }
-        NodeKind::Binary { op, lhs, rhs } => match op {
-            BinaryOp::Add => {
-                let dl = directional_forward_batch(
-                    lhs,
-                    var_index_by_symbol,
-                    seeds_by_direction,
-                    memo,
-                    local_caches,
-                    call_memo,
-                )?;
-                let dr = directional_forward_batch(
-                    rhs,
-                    var_index_by_symbol,
-                    seeds_by_direction,
-                    memo,
-                    local_caches,
-                    call_memo,
-                )?;
-                dl.into_iter()
-                    .zip(dr)
-                    .map(|(lhs_value, rhs_value)| lhs_value + rhs_value)
-                    .collect()
-            }
-            BinaryOp::Sub => {
-                let dl = directional_forward_batch(
-                    lhs,
-                    var_index_by_symbol,
-                    seeds_by_direction,
-                    memo,
-                    local_caches,
-                    call_memo,
-                )?;
-                let dr = directional_forward_batch(
-                    rhs,
-                    var_index_by_symbol,
-                    seeds_by_direction,
-                    memo,
-                    local_caches,
-                    call_memo,
-                )?;
-                dl.into_iter()
-                    .zip(dr)
-                    .map(|(lhs_value, rhs_value)| lhs_value - rhs_value)
-                    .collect()
-            }
-            BinaryOp::Mul => {
-                let dl = directional_forward_batch(
-                    lhs,
-                    var_index_by_symbol,
-                    seeds_by_direction,
-                    memo,
-                    local_caches,
-                    call_memo,
-                )?;
-                let dr = directional_forward_batch(
-                    rhs,
-                    var_index_by_symbol,
-                    seeds_by_direction,
-                    memo,
-                    local_caches,
-                    call_memo,
-                )?;
-                dl.into_iter()
-                    .zip(dr)
-                    .map(|(lhs_value, rhs_value)| lhs_value * rhs + lhs * rhs_value)
-                    .collect()
-            }
-            BinaryOp::Div => {
-                let dl = directional_forward_batch(
-                    lhs,
-                    var_index_by_symbol,
-                    seeds_by_direction,
-                    memo,
-                    local_caches,
-                    call_memo,
-                )?;
-                let dr = directional_forward_batch(
-                    rhs,
-                    var_index_by_symbol,
-                    seeds_by_direction,
-                    memo,
-                    local_caches,
-                    call_memo,
-                )?;
-                dl.into_iter()
-                    .zip(dr)
-                    .map(|(lhs_value, rhs_value)| (lhs_value * rhs - lhs * rhs_value) / rhs.sqr())
-                    .collect()
-            }
-            BinaryOp::Pow
-            | BinaryOp::Atan2
-            | BinaryOp::Hypot
-            | BinaryOp::Mod
-            | BinaryOp::Copysign => {
-                let dl = directional_forward_batch(
-                    lhs,
-                    var_index_by_symbol,
-                    seeds_by_direction,
-                    memo,
-                    local_caches,
-                    call_memo,
-                )?;
-                let dr = directional_forward_batch(
-                    rhs,
-                    var_index_by_symbol,
-                    seeds_by_direction,
-                    memo,
-                    local_caches,
-                    call_memo,
-                )?;
-                let (d_lhs, d_rhs) = binary_partials(op, lhs, rhs);
-                dl.into_iter()
-                    .zip(dr)
-                    .map(|(lhs_value, rhs_value)| lhs_value * d_lhs + rhs_value * d_rhs)
-                    .collect()
-            }
-        },
-        NodeKind::Call {
-            function,
-            inputs,
-            output_slot,
-            output_offset,
-        } => {
-            let profile = local_caches.dependency_profile(function);
-            let input_count = inputs.iter().len();
-            let mut input_directionals = Vec::with_capacity(input_count);
-            for input in inputs.iter() {
-                let mut entry_directionals = Vec::with_capacity(input.nnz());
-                for &value in input.nonzeros().iter() {
-                    entry_directionals.push(directional_forward_batch(
-                        value,
-                        var_index_by_symbol,
-                        seeds_by_direction,
-                        memo,
-                        local_caches,
-                        call_memo,
-                    )?);
-                }
-                input_directionals.push(entry_directionals);
-            }
-
-            let mut seed_inputs_by_direction = Vec::with_capacity(direction_count);
-            let mut has_relevant_seed = false;
-            for direction in 0..direction_count {
-                let mut direction_seed_inputs = Vec::with_capacity(input_count);
-                for (slot, input) in inputs.iter().enumerate() {
-                    let seed_nonzeros = input_directionals[slot]
-                        .iter()
-                        .map(|values| values[direction])
-                        .collect::<Vec<_>>();
-                    if !has_relevant_seed {
-                        has_relevant_seed =
-                            seed_nonzeros.iter().enumerate().any(|(offset, &value)| {
-                                !value.is_zero()
-                                    && profile.output_depends_on(
-                                        output_slot,
-                                        output_offset,
-                                        slot,
-                                        offset,
-                                    )
-                            });
-                    }
-                    direction_seed_inputs.push(SXMatrix::new(input.ccs().clone(), seed_nonzeros)?);
-                }
-                seed_inputs_by_direction.push(direction_seed_inputs);
-            }
-
-            if !has_relevant_seed {
-                vec![SX::zero(); direction_count]
-            } else {
-                let key = ForwardCallCacheKey {
-                    function,
-                    site_id: inputs.site_id(),
-                };
-                if let Some(existing) = call_memo.get(&key) {
-                    (0..direction_count)
-                        .map(|direction| {
-                            existing[output_slot * direction_count + direction].nz(output_offset)
-                        })
-                        .collect()
-                } else {
-                    let helper = local_caches
-                        .forward_batch_helper(function, direction_count)
-                        .expect(
-                            "forward batch helper generation should succeed for a valid SXFunction",
-                        );
-                    let mut helper_inputs = inputs.to_vec();
-                    for direction_seed_inputs in &seed_inputs_by_direction {
-                        helper_inputs.extend(direction_seed_inputs.iter().cloned());
-                    }
-                    let helper_outputs = helper
-                        .call(&helper_inputs)
-                        .expect("forward batch helper call should match its declared signature");
-                    let selected = (0..direction_count)
-                        .map(|direction| {
-                            helper_outputs[output_slot * direction_count + direction]
-                                .nz(output_offset)
-                        })
-                        .collect::<Vec<_>>();
-                    call_memo.insert(key, helper_outputs);
-                    selected
-                }
-            }
-        }
-    };
-
-    memo.insert(expr, derivative.clone());
-    Ok(derivative)
+    let program = program_for_outputs(outputs);
+    execute_program_forward(&program, vars, seeds)
 }
 
 pub(crate) fn forward_directional_batch(
@@ -1628,31 +2742,20 @@ pub(crate) fn forward_directional_batch(
         )));
     }
 
-    let var_index_by_symbol = vars
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(index, symbol)| (symbol, index))
-        .collect::<HashMap<_, _>>();
-    let mut memo = HashMap::new();
-    let mut local_caches = AdLocalCaches::default();
-    let mut call_memo = HashMap::new();
-    let direction_count = seeds_by_direction.len();
-    let mut outputs_by_direction = vec![Vec::with_capacity(outputs.len()); direction_count];
-    for &output in outputs {
-        let values = directional_forward_batch(
-            output,
-            &var_index_by_symbol,
-            seeds_by_direction,
-            &mut memo,
-            &mut local_caches,
-            &mut call_memo,
-        )?;
-        for (direction, value) in values.into_iter().enumerate() {
-            outputs_by_direction[direction].push(value);
-        }
+    let program = program_for_outputs(outputs);
+    execute_program_forward_batch(&program, vars, seeds_by_direction)
+}
+
+pub(crate) fn forward_directional_basis_batch(
+    outputs: &[SX],
+    vars: &[SX],
+    active_var_groups: &[Vec<Index>],
+) -> Result<Vec<Vec<SX>>> {
+    if active_var_groups.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(outputs_by_direction)
+    let program = program_for_outputs(outputs);
+    execute_program_forward_basis_batch(&program, vars, active_var_groups)
 }
 
 pub(crate) fn reverse_directional(outputs: &[SX], vars: &[SX], seeds: &[SX]) -> Result<Vec<SX>> {
@@ -1663,133 +2766,8 @@ pub(crate) fn reverse_directional(outputs: &[SX], vars: &[SX], seeds: &[SX]) -> 
             outputs.len()
         )));
     }
-    let mut order = Vec::new();
-    let mut seen = HashSet::new();
-    for output in outputs.iter().copied() {
-        topo_visit(output, &mut seen, &mut order);
-    }
-
-    let mut adjoints = HashMap::<SX, SX>::new();
-    let mut local_caches = AdLocalCaches::default();
-    for (output, seed) in outputs.iter().copied().zip(seeds.iter().copied()) {
-        adjoints
-            .entry(output)
-            .and_modify(|entry| *entry += seed)
-            .or_insert(seed);
-    }
-
-    for node in order.into_iter().rev() {
-        let Some(adj) = adjoints.get(&node).copied() else {
-            continue;
-        };
-        match node_kind(node) {
-            NodeKind::Unary { op, arg } => {
-                let contrib = adj * unary_derivative(op, arg);
-                adjoints
-                    .entry(arg)
-                    .and_modify(|entry| *entry += contrib)
-                    .or_insert(contrib);
-            }
-            NodeKind::Binary { op, lhs, rhs } => match op {
-                BinaryOp::Add => {
-                    adjoints
-                        .entry(lhs)
-                        .and_modify(|entry| *entry += adj)
-                        .or_insert(adj);
-                    adjoints
-                        .entry(rhs)
-                        .and_modify(|entry| *entry += adj)
-                        .or_insert(adj);
-                }
-                BinaryOp::Sub => {
-                    adjoints
-                        .entry(lhs)
-                        .and_modify(|entry| *entry += adj)
-                        .or_insert(adj);
-                    adjoints
-                        .entry(rhs)
-                        .and_modify(|entry| *entry -= adj)
-                        .or_insert(-adj);
-                }
-                BinaryOp::Mul => {
-                    let lhs_contrib = adj * rhs;
-                    let rhs_contrib = adj * lhs;
-                    adjoints
-                        .entry(lhs)
-                        .and_modify(|entry| *entry += lhs_contrib)
-                        .or_insert(lhs_contrib);
-                    adjoints
-                        .entry(rhs)
-                        .and_modify(|entry| *entry += rhs_contrib)
-                        .or_insert(rhs_contrib);
-                }
-                BinaryOp::Div => {
-                    let lhs_contrib = adj / rhs;
-                    let rhs_contrib = -(adj * lhs) / rhs.sqr();
-                    adjoints
-                        .entry(lhs)
-                        .and_modify(|entry| *entry += lhs_contrib)
-                        .or_insert(lhs_contrib);
-                    adjoints
-                        .entry(rhs)
-                        .and_modify(|entry| *entry += rhs_contrib)
-                        .or_insert(rhs_contrib);
-                }
-                BinaryOp::Pow
-                | BinaryOp::Atan2
-                | BinaryOp::Hypot
-                | BinaryOp::Mod
-                | BinaryOp::Copysign => {
-                    let (d_lhs, d_rhs) = binary_partials(op, lhs, rhs);
-                    let lhs_contrib = adj * d_lhs;
-                    let rhs_contrib = adj * d_rhs;
-                    adjoints
-                        .entry(lhs)
-                        .and_modify(|entry| *entry += lhs_contrib)
-                        .or_insert(lhs_contrib);
-                    adjoints
-                        .entry(rhs)
-                        .and_modify(|entry| *entry += rhs_contrib)
-                        .or_insert(rhs_contrib);
-                }
-            },
-            NodeKind::Call {
-                function,
-                inputs,
-                output_slot,
-                output_offset,
-            } => {
-                let profile = local_caches.dependency_profile(function);
-                let helper = local_caches
-                    .reverse_scalar_helper(function, output_slot, output_offset)
-                    .expect(
-                        "reverse scalar helper generation should succeed for a valid SXFunction",
-                    );
-                let helper_outputs = helper
-                    .call(inputs.as_slice())
-                    .expect("reverse scalar helper call should match its declared signature");
-                for (slot, input) in inputs.iter().enumerate() {
-                    for (offset, &expr) in input.nonzeros().iter().enumerate() {
-                        if !profile.output_depends_on(output_slot, output_offset, slot, offset) {
-                            continue;
-                        }
-                        let contrib = adj * helper_outputs[slot].nz(offset);
-                        adjoints
-                            .entry(expr)
-                            .and_modify(|entry| *entry += contrib)
-                            .or_insert(contrib);
-                    }
-                }
-            }
-            NodeKind::Constant(_) | NodeKind::Symbol { .. } => {}
-        }
-    }
-
-    Ok(vars
-        .iter()
-        .copied()
-        .map(|var| adjoints.get(&var).copied().unwrap_or_else(SX::zero))
-        .collect())
+    let program = program_for_outputs(outputs);
+    execute_program_reverse(&program, vars, seeds)
 }
 
 pub(crate) fn reverse_directional_batch(
@@ -1810,179 +2788,8 @@ pub(crate) fn reverse_directional_batch(
         )));
     }
 
-    let mut order = Vec::new();
-    let mut seen = HashSet::new();
-    for output in outputs.iter().copied() {
-        topo_visit(output, &mut seen, &mut order);
-    }
-
-    let direction_count = seeds_by_direction.len();
-    let mut adjoints = HashMap::<SX, Vec<SX>>::new();
-    let mut local_caches = AdLocalCaches::default();
-    for (output_index, output) in outputs.iter().copied().enumerate() {
-        let mut seeds = vec![SX::zero(); direction_count];
-        let mut has_seed = false;
-        for (direction, direction_seeds) in seeds_by_direction.iter().enumerate() {
-            let seed = direction_seeds[output_index];
-            if !seed.is_zero() {
-                has_seed = true;
-            }
-            seeds[direction] = seed;
-        }
-        if has_seed {
-            adjoints
-                .entry(output)
-                .and_modify(|entry| {
-                    for (current, seed) in entry.iter_mut().zip(seeds.iter().copied()) {
-                        *current += seed;
-                    }
-                })
-                .or_insert(seeds);
-        }
-    }
-
-    for node in order.into_iter().rev() {
-        let Some(adj) = adjoints.get(&node).cloned() else {
-            continue;
-        };
-        match node_kind(node) {
-            NodeKind::Unary { op, arg } => {
-                let contrib = adj
-                    .iter()
-                    .copied()
-                    .map(|value| value * unary_derivative(op, arg))
-                    .collect::<Vec<_>>();
-                adjoints
-                    .entry(arg)
-                    .and_modify(|entry| {
-                        for (current, value) in entry.iter_mut().zip(contrib.iter().copied()) {
-                            *current += value;
-                        }
-                    })
-                    .or_insert(contrib);
-            }
-            NodeKind::Binary { op, lhs, rhs } => {
-                let (lhs_contrib, rhs_contrib) = match op {
-                    BinaryOp::Add => (adj.clone(), adj.clone()),
-                    BinaryOp::Sub => (
-                        adj.clone(),
-                        adj.iter()
-                            .copied()
-                            .map(std::ops::Neg::neg)
-                            .collect::<Vec<_>>(),
-                    ),
-                    BinaryOp::Mul => (
-                        adj.iter()
-                            .copied()
-                            .map(|value| value * rhs)
-                            .collect::<Vec<_>>(),
-                        adj.iter()
-                            .copied()
-                            .map(|value| value * lhs)
-                            .collect::<Vec<_>>(),
-                    ),
-                    BinaryOp::Div => (
-                        adj.iter()
-                            .copied()
-                            .map(|value| value / rhs)
-                            .collect::<Vec<_>>(),
-                        adj.iter()
-                            .copied()
-                            .map(|value| -(value * lhs) / rhs.sqr())
-                            .collect::<Vec<_>>(),
-                    ),
-                    BinaryOp::Pow
-                    | BinaryOp::Atan2
-                    | BinaryOp::Hypot
-                    | BinaryOp::Mod
-                    | BinaryOp::Copysign => {
-                        let (d_lhs, d_rhs) = binary_partials(op, lhs, rhs);
-                        (
-                            adj.iter()
-                                .copied()
-                                .map(|value| value * d_lhs)
-                                .collect::<Vec<_>>(),
-                            adj.iter()
-                                .copied()
-                                .map(|value| value * d_rhs)
-                                .collect::<Vec<_>>(),
-                        )
-                    }
-                };
-
-                adjoints
-                    .entry(lhs)
-                    .and_modify(|entry| {
-                        for (current, value) in entry.iter_mut().zip(lhs_contrib.iter().copied()) {
-                            *current += value;
-                        }
-                    })
-                    .or_insert(lhs_contrib);
-                adjoints
-                    .entry(rhs)
-                    .and_modify(|entry| {
-                        for (current, value) in entry.iter_mut().zip(rhs_contrib.iter().copied()) {
-                            *current += value;
-                        }
-                    })
-                    .or_insert(rhs_contrib);
-            }
-            NodeKind::Call {
-                function,
-                inputs,
-                output_slot,
-                output_offset,
-            } => {
-                let profile = local_caches.dependency_profile(function);
-                let helper = local_caches
-                    .reverse_scalar_helper(function, output_slot, output_offset)
-                    .expect(
-                        "reverse scalar helper generation should succeed for a valid SXFunction",
-                    );
-                let helper_outputs = helper
-                    .call(inputs.as_slice())
-                    .expect("reverse scalar helper call should match its declared signature");
-                for (slot, input) in inputs.iter().enumerate() {
-                    for (offset, &expr) in input.nonzeros().iter().enumerate() {
-                        if !profile.output_depends_on(output_slot, output_offset, slot, offset) {
-                            continue;
-                        }
-                        let partial = helper_outputs[slot].nz(offset);
-                        let contrib = adj
-                            .iter()
-                            .copied()
-                            .map(|value| value * partial)
-                            .collect::<Vec<_>>();
-                        adjoints
-                            .entry(expr)
-                            .and_modify(|entry| {
-                                for (current, value) in
-                                    entry.iter_mut().zip(contrib.iter().copied())
-                                {
-                                    *current += value;
-                                }
-                            })
-                            .or_insert(contrib);
-                    }
-                }
-            }
-            NodeKind::Constant(_) | NodeKind::Symbol { .. } => {}
-        }
-    }
-
-    Ok((0..direction_count)
-        .map(|direction| {
-            vars.iter()
-                .copied()
-                .map(|var| {
-                    adjoints
-                        .get(&var)
-                        .map(|values| values[direction])
-                        .unwrap_or_else(SX::zero)
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect())
+    let program = program_for_outputs(outputs);
+    execute_program_reverse_batch(&program, vars, seeds_by_direction)
 }
 
 #[allow(dead_code)]
@@ -2204,7 +3011,10 @@ impl SX {
     pub fn inspect(self) -> NodeView {
         match node_kind(self) {
             NodeKind::Constant(v) => NodeView::Constant(v),
-            NodeKind::Symbol { name, serial } => NodeView::Symbol { name, serial },
+            NodeKind::Symbol { name, serial } => NodeView::Symbol {
+                name: name.to_string(),
+                serial,
+            },
             NodeKind::Unary { op, arg } => NodeView::Unary { op, arg },
             NodeKind::Binary { op, lhs, rhs } => NodeView::Binary { op, lhs, rhs },
             NodeKind::Call {
@@ -2276,7 +3086,7 @@ impl SX {
 
     pub fn symbol_name(self) -> Option<String> {
         match node_kind(self) {
-            NodeKind::Symbol { name, .. } => Some(name),
+            NodeKind::Symbol { name, .. } => Some(name.to_string()),
             NodeKind::Constant(_)
             | NodeKind::Unary { .. }
             | NodeKind::Binary { .. }

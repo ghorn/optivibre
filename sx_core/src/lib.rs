@@ -9,7 +9,7 @@ pub use ccs::CCS;
 pub use error::{Result, SxError};
 pub use function::{
     CallPolicy, CallPolicyConfig, CompileStats, CompileWarning, InlineStage, NamedMatrix,
-    SXFunction, lookup_function, rewrite_function_for_stage,
+    SXFunction, lookup_function, lookup_function_ref, rewrite_function_for_stage,
 };
 pub use matrix::{HessianOptions, HessianStrategy, SXMatrix};
 pub use sx::{BinaryOp, NodeView, SX, UnaryOp};

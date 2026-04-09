@@ -4,8 +4,8 @@ use crate::Index;
 use crate::ccs::CCS;
 use crate::error::{Result, SxError};
 use crate::sx::{
-    JacobianStructure, SX, forward_directional, forward_directional_batch, jacobian_structure,
-    reverse_directional, reverse_directional_batch,
+    JacobianStructure, SX, forward_directional, forward_directional_basis_batch,
+    jacobian_structure, reverse_directional, reverse_directional_batch,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -17,8 +17,8 @@ pub struct SXMatrix {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum HessianStrategy {
     LowerTriangleByColumn,
-    #[default]
     LowerTriangleSelectedOutputs,
+    #[default]
     LowerTriangleColored,
 }
 
@@ -89,44 +89,15 @@ impl SXMatrix {
         SXMatrix::new(ccs, values)
     }
 
-    fn hessian_lower_triangle_by_column(&self, wrt: &SXMatrix) -> Result<SXMatrix> {
-        let grad = self.gradient(wrt)?;
-        let n = wrt.nnz();
-        let mut columns = vec![Vec::new(); n];
-        for col in 0..n {
-            let mut seed = vec![SX::zero(); n];
-            seed[col] = SX::one();
-            let sens = forward_directional(&grad.nonzeros, &wrt.nonzeros, &seed)?;
-            for (row, value) in sens.iter().copied().enumerate().skip(col) {
-                columns[col].push((row, value));
-            }
-        }
-        Self::build_lower_triangle(n, columns)
-    }
-
-    fn hessian_lower_triangle_selected_outputs(&self, wrt: &SXMatrix) -> Result<SXMatrix> {
-        let grad = self.gradient(wrt)?;
-        let n = wrt.nnz();
-        let mut columns = vec![Vec::new(); n];
-        for col in 0..n {
-            let mut seed = vec![SX::zero(); n];
-            seed[col] = SX::one();
-            let outputs = &grad.nonzeros[col..];
-            let sens = forward_directional(outputs, &wrt.nonzeros, &seed)?;
-            for (offset, value) in sens.into_iter().enumerate() {
-                columns[col].push((col + offset, value));
-            }
-        }
-        Self::build_lower_triangle(n, columns)
-    }
-
-    fn hessian_lower_triangle_colored(&self, wrt: &SXMatrix) -> Result<SXMatrix> {
+    fn hessian_lower_triangle_program(&self, wrt: &SXMatrix) -> Result<SXMatrix> {
         let grad = self.gradient(wrt)?;
         let n = wrt.nnz();
         let full_ccs = grad.jacobian_ccs(wrt)?;
         let mut row_sets = vec![Vec::new(); n];
         for (row, col) in full_ccs.positions() {
-            row_sets[col].push(row);
+            if row >= col {
+                row_sets[col].push(row);
+            }
         }
 
         let mut color_unions = Vec::<BTreeSet<Index>>::new();
@@ -147,23 +118,51 @@ impl SXMatrix {
         }
 
         let mut columns = vec![Vec::new(); n];
-        for group in color_columns {
-            let mut seed = vec![SX::zero(); n];
-            for &col in &group {
-                seed[col] = SX::one();
-            }
-            let sens = forward_directional(&grad.nonzeros, &wrt.nonzeros, &seed)?;
-            for col in group {
-                for &row in &row_sets[col] {
-                    if row >= col {
-                        columns[col].push((row, sens[row]));
+        for group_batch in color_columns.chunks(JACOBIAN_BATCH_WIDTH) {
+            let selected_rows = group_batch
+                .iter()
+                .flat_map(|group| group.iter().copied())
+                .flat_map(|col| row_sets[col].iter().copied())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let selected_outputs = selected_rows
+                .iter()
+                .map(|&row| grad.nonzeros[row])
+                .collect::<Vec<_>>();
+            let selected_row_pos = selected_rows
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(pos, row)| (row, pos))
+                .collect::<HashMap<_, _>>();
+            let sensitivities =
+                forward_directional_basis_batch(&selected_outputs, &wrt.nonzeros, group_batch)?;
+            for (direction, group) in group_batch.iter().enumerate() {
+                let sens = &sensitivities[direction];
+                for &col in group {
+                    for &row in &row_sets[col] {
+                        let row_pos = selected_row_pos[&row];
+                        columns[col].push((row, sens[row_pos]));
                     }
                 }
             }
         }
-
         Self::build_lower_triangle(n, columns)
     }
+
+    fn hessian_lower_triangle_by_column(&self, wrt: &SXMatrix) -> Result<SXMatrix> {
+        self.hessian_lower_triangle_program(wrt)
+    }
+
+    fn hessian_lower_triangle_selected_outputs(&self, wrt: &SXMatrix) -> Result<SXMatrix> {
+        self.hessian_lower_triangle_program(wrt)
+    }
+
+    fn hessian_lower_triangle_colored(&self, wrt: &SXMatrix) -> Result<SXMatrix> {
+        self.hessian_lower_triangle_program(wrt)
+    }
+
 
     pub fn new(ccs: CCS, nonzeros: Vec<SX>) -> Result<Self> {
         if ccs.nnz() != nonzeros.len() {
@@ -319,21 +318,10 @@ impl SXMatrix {
         wrt: &SXMatrix,
         structure: &JacobianStructure,
     ) -> Result<Vec<SX>> {
-        let nvar = wrt.nnz();
         let mut values = vec![SX::zero(); structure.ccs.nnz()];
         for color_batch in structure.forward_color_groups.chunks(JACOBIAN_BATCH_WIDTH) {
-            let seeds_by_direction = color_batch
-                .iter()
-                .map(|columns| {
-                    let mut seed = vec![SX::zero(); nvar];
-                    for &col in columns {
-                        seed[col] = SX::one();
-                    }
-                    seed
-                })
-                .collect::<Vec<_>>();
             let sensitivities =
-                forward_directional_batch(&self.nonzeros, &wrt.nonzeros, &seeds_by_direction)?;
+                forward_directional_basis_batch(&self.nonzeros, &wrt.nonzeros, color_batch)?;
             for (direction, columns) in color_batch.iter().enumerate() {
                 let direction_sens = &sensitivities[direction];
                 for &col in columns {

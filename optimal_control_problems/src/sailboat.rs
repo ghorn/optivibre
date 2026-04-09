@@ -1549,4 +1549,30 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    #[ignore = "manual profiling helper"]
+    fn profile_direct_collocation_symbolic_setup() {
+        let family = Params::default().transcription.collocation_family;
+        let ocp = model(
+            optimal_control::DirectCollocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE> {
+                family,
+            },
+        );
+        let started = std::time::Instant::now();
+        let compiled = ocp
+            .compile_jit_with_ocp_options(optimal_control::OcpCompileOptions {
+                function_options: optimization::FunctionCompileOptions::from(
+                    optimization::LlvmOptimizationLevel::O0,
+                ),
+                symbolic_functions: optimal_control::OcpSymbolicFunctionOptions::default(),
+            })
+            .expect("compile should succeed");
+        println!(
+            "sailboat dc: total={:?} setup_profile={:?} stats={:?}",
+            started.elapsed(),
+            compiled.backend_compile_report().setup_profile,
+            compiled.backend_compile_report().stats,
+        );
+    }
 }
