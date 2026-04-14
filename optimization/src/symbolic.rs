@@ -77,6 +77,13 @@ pub struct TypedCompiledJitNlp<X, P, E, I> {
     _marker: TypedMarker<X, P, E, I>,
 }
 
+impl<X, P, E, I> TypedCompiledJitNlp<X, P, E, I> {
+    #[doc(hidden)]
+    pub fn backend_compile_report_untyped(&self) -> &BackendCompileReport {
+        self.inner.backend_compile_report()
+    }
+}
+
 type TypedMarker<X, P, E, I> = PhantomData<fn() -> (X, P, E, I)>;
 
 pub struct TypedRuntimeNlpBounds<X, I>

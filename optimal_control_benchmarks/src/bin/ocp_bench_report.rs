@@ -872,6 +872,19 @@ fn apply_progress_event(state: &mut ProgressState, event: OcpBenchmarkProgress) 
                         metadata.stats.hessian_nnz,
                     );
                 }
+                OcpCompileProgress::NlpKernelCompiled {
+                    elapsed,
+                    root_instructions,
+                    total_instructions,
+                } => {
+                    state.stage = "Compiling helper kernels".to_string();
+                    state.detail = format!(
+                        "nlp kernel ready in {} | root={} total={}",
+                        format_duration(*elapsed),
+                        compact_count(*root_instructions),
+                        compact_count(*total_instructions),
+                    );
+                }
                 OcpCompileProgress::HelperCompiled {
                     helper, elapsed, ..
                 } => {
@@ -1110,14 +1123,35 @@ fn render_overview(frame: &mut Frame, area: Rect, state: &ProgressState, spinner
         .filter(|cell| case_is_running(cell))
         .count();
     let queued_cases = state.total_cases.saturating_sub(state.started_cases);
+    let progress_status = format!(
+        "running {}   jobs {}   queued {}   warnings {}",
+        running_cases, state.jobs, queued_cases, state.warning_count
+    );
+    let progress_status_width = progress_status.chars().count() as u16 + 1;
+    let progress_row = if rows[1].width > progress_status_width.saturating_add(12) {
+        Layout::default()
+            .direction(ratatui::layout::Direction::Horizontal)
+            .constraints([
+                Constraint::Min(10),
+                Constraint::Length(progress_status_width),
+            ])
+            .split(rows[1])
+    } else {
+        Layout::default()
+            .direction(ratatui::layout::Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(0)])
+            .split(rows[1])
+    };
     let gauge = Gauge::default()
         .gauge_style(Style::default().fg(Color::Cyan))
-        .ratio(ratio)
-        .label(format!(
-            "running {}   jobs {}   queued {}   warnings {}",
-            running_cases, state.jobs, queued_cases, state.warning_count
-        ));
-    frame.render_widget(gauge, rows[1]);
+        .ratio(ratio);
+    frame.render_widget(gauge, progress_row[0]);
+    if progress_row[1].width > 0 {
+        frame.render_widget(
+            Paragraph::new(progress_status).style(Style::default().fg(Color::Cyan)),
+            progress_row[1],
+        );
+    }
 
     let avg_compile = average_metric_value(state, |cell| cell.compile_total_s);
     let avg_objective = average_metric_value(state, |cell| cell.objective_avg_s);
@@ -1862,10 +1896,15 @@ fn render_timing_section_panel(
     let label_available = inner
         .width
         .saturating_sub((data_width + column_spacing) as u16) as usize;
-    let row_label_detail = matrix_label_detail_from_available(label_available);
-    let row_label_width =
-        matrix_row_label_width_from_available(label_available, &state.presets, row_label_detail, section)
-            as u16;
+    let stage_label_detail = matrix_stage_label_detail_from_available(label_available);
+    let preset_label_detail = matrix_preset_label_detail_from_available(label_available);
+    let row_label_width = matrix_row_label_width_from_available(
+        label_available,
+        &state.presets,
+        preset_label_detail,
+        stage_label_detail,
+        section,
+    ) as u16;
 
     let sections = Layout::default()
         .direction(ratatui::layout::Direction::Vertical)
@@ -1922,7 +1961,7 @@ fn render_timing_section_panel(
                     std::iter::once(ratatui::widgets::Cell::from(
                         matrix_row_display_name_with_detail(
                             MatrixRow::Time(stage),
-                            row_label_detail,
+                            stage_label_detail,
                         ),
                     ))
                     .chain((0..data_column_count).map(|_| ratatui::widgets::Cell::from("")))
@@ -1938,7 +1977,7 @@ fn render_timing_section_panel(
                 let mut cells = vec![ratatui::widgets::Cell::from(Span::styled(
                     format!(
                         "  {}",
-                        preset_display_name_with_detail(preset, row_label_detail)
+                        preset_display_name_with_detail(preset, preset_label_detail)
                     ),
                     Style::default().fg(strategy_category_color()),
                 ))];
@@ -2382,12 +2421,7 @@ fn nnz_summary_detail_cell(
         .into_iter()
         .all(|metric| nnz_metric_complete(state, problem_id, transcription, metric));
     if all_complete {
-        (
-            "ok".to_string(),
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        )
+        (String::new(), Style::default())
     } else {
         ("pending".to_string(), Style::default().fg(Color::DarkGray))
     }
@@ -2664,11 +2698,13 @@ fn timing_section_fits_width(
     let Some(label_available) = inner_width.checked_sub(data_width + column_spacing) else {
         return false;
     };
-    let detail = matrix_label_detail_from_available(label_available);
+    let stage_detail = matrix_stage_label_detail_from_available(label_available);
+    let preset_detail = matrix_preset_label_detail_from_available(label_available);
     let row_label_width = matrix_row_label_width_from_available(
         label_available,
         &state.presets,
-        detail,
+        preset_detail,
+        stage_detail,
         section,
     );
     row_label_width <= label_available
@@ -2685,10 +2721,18 @@ fn timing_section_desired_height(
     (inner_rows + chrome_rows).min(u16::MAX as usize) as u16
 }
 
-fn matrix_label_detail_from_available(available: usize) -> LabelDetail {
-    if available >= 13 {
+fn matrix_stage_label_detail_from_available(available: usize) -> LabelDetail {
+    if available >= 14 {
         LabelDetail::Full
-    } else if available >= 10 {
+    } else if available >= 7 {
+        LabelDetail::Medium
+    } else {
+        LabelDetail::Short
+    }
+}
+
+fn matrix_preset_label_detail_from_available(available: usize) -> LabelDetail {
+    if available >= 12 {
         LabelDetail::Medium
     } else {
         LabelDetail::Short
@@ -2698,13 +2742,14 @@ fn matrix_label_detail_from_available(available: usize) -> LabelDetail {
 fn matrix_row_label_width_from_available(
     available: usize,
     presets: &[OcpBenchmarkPreset],
-    detail: LabelDetail,
+    preset_detail: LabelDetail,
+    stage_detail: LabelDetail,
     section: MatrixSection,
 ) -> usize {
     let longest_preset = presets
         .iter()
         .map(|&preset| {
-            preset_display_name_with_detail(preset, detail)
+            preset_display_name_with_detail(preset, preset_detail)
                 .chars()
                 .count()
         })
@@ -2713,7 +2758,7 @@ fn matrix_row_label_width_from_available(
     let longest_stage = section_matrix_rows(section)
         .iter()
         .map(|&stage| {
-            matrix_row_display_name_with_detail(MatrixRow::Time(stage), detail)
+            matrix_row_display_name_with_detail(MatrixRow::Time(stage), stage_detail)
                 .chars()
                 .count()
         })
@@ -2835,12 +2880,7 @@ fn stage_cell_widget(stage: &StageCell, is_best: bool) -> (String, Style) {
                 .fg(if is_best { Color::Green } else { Color::White })
                 .add_modifier(Modifier::BOLD),
         ),
-        StageCell::Done(None) => (
-            "ok".to_string(),
-            Style::default()
-                .fg(if is_best { Color::Green } else { Color::White })
-                .add_modifier(Modifier::BOLD),
-        ),
+        StageCell::Done(None) => ("--".to_string(), Style::default().fg(Color::DarkGray)),
         StageCell::Skipped => ("--".to_string(), Style::default().fg(Color::DarkGray)),
     }
 }
@@ -3354,6 +3394,16 @@ fn print_event_line(event: OcpBenchmarkProgress) {
                 metadata.stats.equality_count,
                 metadata.stats.inequality_count,
             ),
+            OcpCompileProgress::NlpKernelCompiled {
+                elapsed,
+                root_instructions,
+                total_instructions,
+            } => eprintln!(
+                "  nlp kernel ready: {} root={} total={}",
+                format_duration(elapsed),
+                compact_count(root_instructions),
+                compact_count(total_instructions),
+            ),
             OcpCompileProgress::HelperCompiled {
                 helper, elapsed, ..
             } => eprintln!(
@@ -3511,6 +3561,21 @@ fn update_case_compile_progress(
                 cell.symbolic = done_cell(symbolic_total);
                 cell.jit = StageCell::Running(now);
                 cell.nlp_jit = StageCell::Running(now);
+            }
+            OcpCompileProgress::NlpKernelCompiled {
+                elapsed,
+                root_instructions,
+                total_instructions,
+            } => {
+                finalize_running_stage(&mut cell.symbolic);
+                cell.active_symbolic_stage = None;
+                cell.compile_nlp_jit_s = Some(elapsed.as_secs_f64());
+                cell.llvm_root_instruction_count = Some(root_instructions);
+                cell.llvm_total_instruction_count = Some(total_instructions);
+                cell.nlp_jit = done_cell(cell.compile_nlp_jit_s);
+                if !matches!(cell.jit, StageCell::Done(_)) {
+                    cell.jit = StageCell::Running(now);
+                }
             }
             OcpCompileProgress::HelperCompiled {
                 helper,
@@ -3802,8 +3867,8 @@ fn case_is_running(cell: &CaseCell) -> bool {
 }
 
 fn finalize_running_stage(stage: &mut StageCell) {
-    if matches!(stage, StageCell::Running(_)) {
-        *stage = StageCell::Done(None);
+    if let StageCell::Running(started_at) = stage {
+        *stage = StageCell::Done(Some(started_at.elapsed().as_secs_f64()));
     }
 }
 

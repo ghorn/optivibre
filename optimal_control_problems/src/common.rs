@@ -2090,6 +2090,13 @@ pub fn ocp_compile_progress_update(
                 0,
             )];
         }
+        OcpCompileProgress::NlpKernelCompiled { elapsed, .. } => {
+            upsert_phase_detail(
+                &mut state.phase_details.jit,
+                "NLP Kernel JIT",
+                format_phase_duration(elapsed),
+            );
+        }
         OcpCompileProgress::HelperCompiled {
             helper, elapsed, ..
         } => {

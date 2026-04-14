@@ -797,6 +797,11 @@ pub enum OcpCompileHelperKind {
 pub enum OcpCompileProgress {
     SymbolicStage(SymbolicCompileStageProgress),
     SymbolicReady(SymbolicCompileMetadata),
+    NlpKernelCompiled {
+        elapsed: Duration,
+        root_instructions: usize,
+        total_instructions: usize,
+    },
     HelperCompiled {
         helper: OcpCompileHelperKind,
         elapsed: Duration,
@@ -1726,6 +1731,17 @@ where
                 }
             },
         )?;
+        let nlp_compile_report = compiled.backend_compile_report_untyped();
+        let nlp_jit_elapsed = nlp_compile_report
+            .setup_profile
+            .lowering
+            .unwrap_or_default()
+            + nlp_compile_report.setup_profile.llvm_jit.unwrap_or_default();
+        on_progress(OcpCompileProgress::NlpKernelCompiled {
+            elapsed: nlp_jit_elapsed,
+            root_instructions: nlp_compile_report.stats.llvm_root_instructions_emitted,
+            total_instructions: nlp_compile_report.stats.llvm_total_instructions_emitted,
+        });
         let xdot_started = Instant::now();
         let xdot_helper = compile_xdot_helper::<X, U, P>(
             &*self.ode,
@@ -2351,6 +2367,17 @@ where
                 }
             },
         )?;
+        let nlp_compile_report = compiled.backend_compile_report_untyped();
+        let nlp_jit_elapsed = nlp_compile_report
+            .setup_profile
+            .lowering
+            .unwrap_or_default()
+            + nlp_compile_report.setup_profile.llvm_jit.unwrap_or_default();
+        on_progress(OcpCompileProgress::NlpKernelCompiled {
+            elapsed: nlp_jit_elapsed,
+            root_instructions: nlp_compile_report.stats.llvm_root_instructions_emitted,
+            total_instructions: nlp_compile_report.stats.llvm_total_instructions_emitted,
+        });
         let xdot_started = Instant::now();
         let xdot_helper = compile_xdot_helper::<X, U, P>(
             &*self.ode,
