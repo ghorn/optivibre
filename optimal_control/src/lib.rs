@@ -801,6 +801,7 @@ pub enum OcpCompileProgress {
         helper: OcpCompileHelperKind,
         elapsed: Duration,
         root_instructions: usize,
+        total_instructions: usize,
     },
 }
 
@@ -809,7 +810,9 @@ pub struct OcpHelperCompileStats {
     pub xdot_helper_time: Option<Duration>,
     pub multiple_shooting_arc_helper_time: Option<Duration>,
     pub xdot_helper_root_instructions: Option<usize>,
+    pub xdot_helper_total_instructions: Option<usize>,
     pub multiple_shooting_arc_helper_root_instructions: Option<usize>,
+    pub multiple_shooting_arc_helper_total_instructions: Option<usize>,
 }
 
 pub struct CompiledMultipleShootingOcp<
@@ -1732,10 +1735,16 @@ where
         let xdot_helper_time = xdot_started.elapsed();
         let xdot_helper_root_instructions =
             xdot_helper.function.compile_report().stats.llvm_root_instructions_emitted;
+        let xdot_helper_total_instructions = xdot_helper
+            .function
+            .compile_report()
+            .stats
+            .llvm_total_instructions_emitted;
         on_progress(OcpCompileProgress::HelperCompiled {
             helper: OcpCompileHelperKind::Xdot,
             elapsed: xdot_helper_time,
             root_instructions: xdot_helper_root_instructions,
+            total_instructions: xdot_helper_total_instructions,
         });
         let rk4_arc_started = Instant::now();
         let rk4_arc_helper = compile_multiple_shooting_arc_helper::<X, U, P, RK4_SUBSTEPS>(
@@ -1749,10 +1758,16 @@ where
             .compile_report()
             .stats
             .llvm_root_instructions_emitted;
+        let multiple_shooting_arc_helper_total_instructions = rk4_arc_helper
+            .function
+            .compile_report()
+            .stats
+            .llvm_total_instructions_emitted;
         on_progress(OcpCompileProgress::HelperCompiled {
             helper: OcpCompileHelperKind::MultipleShootingArc,
             elapsed: multiple_shooting_arc_helper_time,
             root_instructions: multiple_shooting_arc_helper_root_instructions,
+            total_instructions: multiple_shooting_arc_helper_total_instructions,
         });
         Ok(CompiledMultipleShootingOcp {
             compiled,
@@ -1764,8 +1779,12 @@ where
                 xdot_helper_time: Some(xdot_helper_time),
                 multiple_shooting_arc_helper_time: Some(multiple_shooting_arc_helper_time),
                 xdot_helper_root_instructions: Some(xdot_helper_root_instructions),
+                xdot_helper_total_instructions: Some(xdot_helper_total_instructions),
                 multiple_shooting_arc_helper_root_instructions: Some(
                     multiple_shooting_arc_helper_root_instructions,
+                ),
+                multiple_shooting_arc_helper_total_instructions: Some(
+                    multiple_shooting_arc_helper_total_instructions,
                 ),
             },
             _marker: PhantomData,
@@ -2341,10 +2360,16 @@ where
         let xdot_helper_time = xdot_started.elapsed();
         let xdot_helper_root_instructions =
             xdot_helper.function.compile_report().stats.llvm_root_instructions_emitted;
+        let xdot_helper_total_instructions = xdot_helper
+            .function
+            .compile_report()
+            .stats
+            .llvm_total_instructions_emitted;
         on_progress(OcpCompileProgress::HelperCompiled {
             helper: OcpCompileHelperKind::Xdot,
             elapsed: xdot_helper_time,
             root_instructions: xdot_helper_root_instructions,
+            total_instructions: xdot_helper_total_instructions,
         });
         Ok(CompiledDirectCollocationOcp {
             compiled,
@@ -2356,7 +2381,9 @@ where
                 xdot_helper_time: Some(xdot_helper_time),
                 multiple_shooting_arc_helper_time: None,
                 xdot_helper_root_instructions: Some(xdot_helper_root_instructions),
+                xdot_helper_total_instructions: Some(xdot_helper_total_instructions),
                 multiple_shooting_arc_helper_root_instructions: None,
+                multiple_shooting_arc_helper_total_instructions: None,
             },
             _marker: PhantomData,
         })

@@ -1493,6 +1493,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "optimal_control_benchmarks"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "crossterm",
+ "libc",
+ "optimal_control",
+ "optimal_control_problems",
+ "optimization",
+ "ratatui",
+ "signal-hook",
+]
+
+[[package]]
 name = "optimal_control_problems"
 version = "0.1.0"
 dependencies = [

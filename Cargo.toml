@@ -7,6 +7,7 @@ members = [
     "optimization",
     "optimal_control",
     "optimal_control_problems",
+    "optimal_control_benchmarks",
     "optimal_control_webapp",
     "lqr_solvers",
     "optimization_derive",

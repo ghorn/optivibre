@@ -1,0 +1,24 @@
+[package]
+name = "optimal_control_benchmarks"
+version.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+description = "Benchmark dashboard binaries and reporting tools for the optimal_control problem suite."
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+crossterm = "0.28"
+libc.workspace = true
+optimal_control = { path = "../optimal_control" }
+optimal_control_problems = { path = "../optimal_control_problems" }
+optimization = { path = "../optimization" }
+ratatui = "0.29"
+signal-hook = "0.3"

@@ -264,7 +264,7 @@ where
 fn ensure_release_mode() -> Result<()> {
     if cfg!(debug_assertions) {
         bail!(
-            "ocp_bench_report must be run in release mode\n\ntry:\n  cargo run -p optimal_control_problems --release --bin ocp_bench_report -- --output target/ocp_bench_report.html --presets all"
+            "ocp_bench_report must be run in release mode\n\ntry:\n  cargo run -p optimal_control_benchmarks --release --bin ocp_bench_report -- --output target/ocp_bench_report.html --presets all"
         );
     }
     Ok(())
@@ -519,7 +519,9 @@ struct CaseCell {
     llvm_root_instruction_count: Option<usize>,
     llvm_total_instruction_count: Option<usize>,
     xdot_helper_root_instruction_count: Option<usize>,
+    xdot_helper_total_instruction_count: Option<usize>,
     multiple_shooting_arc_helper_root_instruction_count: Option<usize>,
+    multiple_shooting_arc_helper_total_instruction_count: Option<usize>,
     eval_samples: usize,
     sanity: SanityStatus,
     warnings: usize,
@@ -591,6 +593,12 @@ enum MatrixSection {
     Symbolic,
     Jit,
     Runtime,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DisplayedSizeMetric {
+    Root,
+    Total,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -672,7 +680,9 @@ impl TerminalProgress {
                     llvm_root_instruction_count: None,
                     llvm_total_instruction_count: None,
                     xdot_helper_root_instruction_count: None,
+                    xdot_helper_total_instruction_count: None,
                     multiple_shooting_arc_helper_root_instruction_count: None,
+                    multiple_shooting_arc_helper_total_instruction_count: None,
                     eval_samples: 0,
                     sanity: SanityStatus::Ok,
                     warnings: 0,
@@ -1032,21 +1042,17 @@ fn render_dashboard(frame: &mut Frame, state: &ProgressState, spinner: &str) {
     let sections = Layout::default()
         .direction(ratatui::layout::Direction::Vertical)
         .constraints([
-            Constraint::Length(14),
-            Constraint::Min(4),
             Constraint::Length(11),
+            Constraint::Min(4),
         ])
         .split(area);
 
     render_overview(frame, sections[0], state, spinner);
     render_matrix_bands(frame, sections[1], state);
-    render_bottom_summary_widgets(frame, sections[2], state);
 }
 
 fn render_overview(frame: &mut Frame, area: Rect, state: &ProgressState, spinner: &str) {
-    let block = panel_block("Overview", Color::Cyan);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = area;
     if inner.height < 8 {
         return;
     }
@@ -1718,45 +1724,94 @@ fn overview_preset_label(preset: OcpBenchmarkPreset, width: u16) -> &'static str
 }
 
 fn panel_block<'a>(title: &'a str, color: Color) -> Block<'a> {
+    panel_block_with_borders(title, color, Borders::ALL)
+}
+
+fn panel_block_with_borders<'a>(title: &'a str, color: Color, borders: Borders) -> Block<'a> {
     Block::default()
         .title(Span::styled(
             format!(" {title} "),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ))
-        .borders(Borders::ALL)
+        .borders(borders)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::DarkGray))
 }
 
 fn render_matrix_bands(frame: &mut Frame, area: Rect, state: &ProgressState) {
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::DarkGray));
-    let inner = outer.inner(area);
-    frame.render_widget(outer, area);
+    let inner = area;
     if inner.height < 4 || inner.width < 60 {
         return;
     }
 
-    let panel_areas = Layout::default()
+    let columns = Layout::default()
         .direction(ratatui::layout::Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
+            Constraint::Percentage(76),
+            Constraint::Percentage(24),
         ])
         .split(inner);
-    let section_specs = [
-        (MatrixSection::Symbolic, "Symbolic", Color::LightGreen),
-        (MatrixSection::Jit, "JIT", Color::LightBlue),
-        (MatrixSection::Runtime, "Eval", Color::LightMagenta),
-    ];
-    for ((section, title, color), panel_area) in
-        section_specs.into_iter().zip(panel_areas.iter().copied())
-    {
-        render_timing_section_panel(frame, panel_area, state, section, title, color);
-    }
+
+    let min_top_height = 12u16;
+    let jit_desired_height = timing_section_desired_height(
+        MatrixSection::Jit,
+        state.presets.len(),
+        Borders::ALL,
+    );
+    let max_jit_height = columns[0]
+        .height
+        .saturating_sub(min_top_height)
+        .max(8);
+    let jit_height = jit_desired_height.min(max_jit_height);
+    let rows = Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints([Constraint::Min(min_top_height), Constraint::Length(jit_height)])
+        .split(columns[0]);
+    let top_panels = Layout::default()
+        .direction(ratatui::layout::Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(68),
+            Constraint::Percentage(32),
+        ])
+        .split(rows[0]);
+
+    render_timing_section_panel(
+        frame,
+        top_panels[0],
+        state,
+        MatrixSection::Symbolic,
+        "Symbolic",
+        Color::LightGreen,
+        Borders::TOP | Borders::LEFT | Borders::RIGHT,
+    );
+    render_timing_section_panel(
+        frame,
+        top_panels[1],
+        state,
+        MatrixSection::Runtime,
+        "Eval",
+        Color::LightMagenta,
+        Borders::TOP | Borders::RIGHT,
+    );
+    render_timing_section_panel(
+        frame,
+        rows[1],
+        state,
+        MatrixSection::Jit,
+        "JIT",
+        Color::LightBlue,
+        Borders::ALL,
+    );
+
+    let sidebar = Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(52),
+            Constraint::Percentage(48),
+        ])
+        .split(columns[1]);
+    render_nnz_summary_widget(frame, sidebar[0], state);
+    render_best_summary_widget(frame, sidebar[1], state);
 }
 
 fn render_timing_section_panel(
@@ -1766,8 +1821,9 @@ fn render_timing_section_panel(
     section: MatrixSection,
     title: &'static str,
     title_color: Color,
+    borders: Borders,
 ) {
-    let block = panel_block(title, title_color);
+    let block = panel_block_with_borders(title, title_color, borders);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height < 3 {
@@ -1775,24 +1831,22 @@ fn render_timing_section_panel(
     }
 
     let case_count = state.row_keys.len();
-    let cell_width = transposed_matrix_cell_width(frame.area().width as usize, 3) as u16;
-    let count_cell_width = if section_has_size_column(section) {
-        symbolic_count_cell_width(frame.area().width as usize, 3) as u16
+    let size_metrics = section_size_metrics(section);
+    let size_metric_count = size_metrics.len();
+    let has_size_columns = size_metric_count > 0;
+    let cell_width = timing_section_cell_width(section, inner.width as usize) as u16;
+    let count_cell_width = if has_size_columns {
+        timing_section_count_cell_width(section, inner.width as usize) as u16
     } else {
         0
     };
     let column_spacing = 1usize;
-    let data_column_count = if section_has_size_column(section) {
-        case_count * 2
-    } else {
-        case_count
-    };
-    let data_width = if section_has_size_column(section) {
-        case_count * (cell_width as usize + count_cell_width as usize)
-            + data_column_count.saturating_sub(1) * column_spacing
-    } else {
-        case_count * cell_width as usize + case_count.saturating_sub(1) * column_spacing
-    };
+    let columns_per_case = 1 + size_metric_count;
+    let data_column_count = case_count * columns_per_case;
+    let case_group_width =
+        cell_width as usize + size_metric_count * (count_cell_width as usize + column_spacing);
+    let data_width = case_count * case_group_width
+        + case_count.saturating_sub(1) * column_spacing;
     let label_available = inner
         .width
         .saturating_sub((data_width + column_spacing) as u16) as usize;
@@ -1800,11 +1854,6 @@ fn render_timing_section_panel(
     let row_label_width =
         matrix_row_label_width_from_available(label_available, &state.presets, row_label_detail, section)
             as u16;
-    let case_group_width = if section_has_size_column(section) {
-        cell_width as usize + column_spacing + count_cell_width as usize
-    } else {
-        cell_width as usize
-    };
 
     let sections = Layout::default()
         .direction(ratatui::layout::Direction::Vertical)
@@ -1812,13 +1861,11 @@ fn render_timing_section_panel(
         .split(inner);
 
     let mut widths = vec![Constraint::Length(row_label_width)];
-    if section_has_size_column(section) {
-        for _ in 0..case_count {
-            widths.push(Constraint::Length(cell_width));
+    for _ in 0..case_count {
+        widths.push(Constraint::Length(cell_width));
+        for _ in size_metrics {
             widths.push(Constraint::Length(count_cell_width));
         }
-    } else {
-        widths.extend((0..case_count).map(|_| Constraint::Length(cell_width)));
     }
 
     frame.render_widget(
@@ -1844,9 +1891,9 @@ fn render_timing_section_panel(
                 .fg(transcription_category_color())
                 .add_modifier(Modifier::BOLD),
         )));
-        if section_has_size_column(section) {
+        for &metric in size_metrics {
             header.push(ratatui::widgets::Cell::from(Span::styled(
-                "#",
+                size_metric_label(section, metric),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -1896,8 +1943,9 @@ fn render_timing_section_panel(
                         .expect("matrix case should exist");
                     let (text, style) = timing_cell_widget(stage, cell, state);
                     cells.push(ratatui::widgets::Cell::from(text).style(style));
-                    if section_has_size_column(section) {
-                        let (text, style) = size_ratio_cell_widget(section, stage, cell, state);
+                    for &metric in size_metrics {
+                        let (text, style) =
+                            size_ratio_cell_widget(section, stage, metric, cell, state);
                         cells.push(ratatui::widgets::Cell::from(text).style(style));
                     }
                 }
@@ -1916,27 +1964,6 @@ fn render_timing_section_panel(
             ),
         );
     frame.render_widget(table, sections[1]);
-}
-
-fn render_bottom_summary_widgets(frame: &mut Frame, area: Rect, state: &ProgressState) {
-    if area.width >= 140 {
-        let sections = Layout::default()
-            .direction(ratatui::layout::Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(36),
-                Constraint::Percentage(64),
-            ])
-            .split(area);
-        render_nnz_summary_widget(frame, sections[0], state);
-        render_best_summary_widget(frame, sections[1], state);
-    } else {
-        let sections = Layout::default()
-            .direction(ratatui::layout::Direction::Vertical)
-            .constraints([Constraint::Length(8), Constraint::Min(4)])
-            .split(area);
-        render_nnz_summary_widget(frame, sections[0], state);
-        render_best_summary_widget(frame, sections[1], state);
-    }
 }
 
 fn strategy_category_color() -> Color {
@@ -2042,22 +2069,27 @@ fn render_best_summary_widget(frame: &mut Frame, area: Rect, state: &ProgressSta
         return;
     }
 
-    let case_count = state.row_keys.len();
-    let case_width = if case_count <= 4 {
-        16
-    } else if case_count <= 6 {
-        14
+    let case_width = 8u16;
+    let column_spacing = 1u16;
+    let metric_count = 4u16;
+    let available_for_metrics = inner
+        .width
+        .saturating_sub(case_width)
+        .saturating_sub(metric_count * column_spacing);
+    let metric_width = if metric_count == 0 {
+        10
     } else {
-        12
+        (available_for_metrics / metric_count).clamp(9, 14)
     };
     let table = Table::new(
-        best_case_matrix_rows(state, case_width),
-        std::iter::once(Constraint::Length(8))
-            .chain((0..case_count).map(|_| Constraint::Length(case_width)))
+        best_case_summary_rows(state, metric_width),
+        std::iter::once(Constraint::Length(case_width))
+            .chain((0..metric_count).map(|_| Constraint::Length(metric_width)))
             .collect::<Vec<_>>(),
     )
+    .column_spacing(column_spacing)
     .header(
-        Row::new(best_case_matrix_header(state))
+        Row::new(best_case_summary_header(case_width, metric_width))
         .style(
             Style::default()
                 .fg(Color::Gray)
@@ -2067,37 +2099,60 @@ fn render_best_summary_widget(frame: &mut Frame, area: Rect, state: &ProgressSta
     frame.render_widget(table, inner);
 }
 
-fn best_case_matrix_header(state: &ProgressState) -> Vec<ratatui::widgets::Cell<'static>> {
-    std::iter::once(ratatui::widgets::Cell::from("Goal"))
-        .chain(
-            state
-                .row_keys
-                .iter()
-                .map(|&(problem_id, transcription)| {
-                    ratatui::widgets::Cell::from(case_lane_label(problem_id, transcription))
-                }),
-        )
-        .collect()
-}
-
-fn best_case_matrix_rows(state: &ProgressState, case_width: u16) -> Vec<Row<'static>> {
+fn best_case_summary_header(
+    case_width: u16,
+    metric_width: u16,
+) -> Vec<ratatui::widgets::Cell<'static>> {
     [
-        ("Sym", WinnerMetric::Symbolic),
-        ("JIT", WinnerMetric::Jit),
-        ("Eval100", WinnerMetric::Eval100),
-        ("Total100", WinnerMetric::Overall100),
+        center_or_truncate("Case", case_width as usize),
+        center_or_truncate("Sym", metric_width as usize),
+        center_or_truncate("JIT", metric_width as usize),
+        center_or_truncate("Eval100", metric_width as usize),
+        center_or_truncate("Total100", metric_width as usize),
     ]
     .into_iter()
-    .map(|(label, metric)| {
-        Row::new(
-            std::iter::once(ratatui::widgets::Cell::from(label))
-                .chain(state.row_keys.iter().map(|&(problem_id, transcription)| {
-                    best_case_metric_cell(state, problem_id, transcription, metric, case_width)
-                }))
-                .collect::<Vec<_>>(),
-        )
-    })
+    .map(ratatui::widgets::Cell::from)
     .collect()
+}
+
+fn best_case_summary_rows(state: &ProgressState, metric_width: u16) -> Vec<Row<'static>> {
+    state
+        .row_keys
+        .iter()
+        .map(|&(problem_id, transcription)| {
+            Row::new(vec![
+                ratatui::widgets::Cell::from(nnz_case_label(problem_id, transcription)),
+                best_case_metric_cell(
+                    state,
+                    problem_id,
+                    transcription,
+                    WinnerMetric::Symbolic,
+                    metric_width,
+                ),
+                best_case_metric_cell(
+                    state,
+                    problem_id,
+                    transcription,
+                    WinnerMetric::Jit,
+                    metric_width,
+                ),
+                best_case_metric_cell(
+                    state,
+                    problem_id,
+                    transcription,
+                    WinnerMetric::Eval100,
+                    metric_width,
+                ),
+                best_case_metric_cell(
+                    state,
+                    problem_id,
+                    transcription,
+                    WinnerMetric::Overall100,
+                    metric_width,
+                ),
+            ])
+        })
+        .collect()
 }
 
 fn best_case_metric_cell(
@@ -2131,7 +2186,7 @@ fn best_case_metric_cell(
             ]))
         }
         None => ratatui::widgets::Cell::from(Span::styled(
-            format!("{:>width$}", "pending", width = case_width as usize),
+            center_or_truncate("pending", case_width as usize),
             Style::default().fg(Color::DarkGray),
         )),
     }
@@ -2156,14 +2211,6 @@ fn best_preset_for_case_metric(
                 .partial_cmp(&rhs.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
-}
-
-fn case_lane_label(problem_id: ProblemId, transcription: TranscriptionMethod) -> String {
-    format!(
-        "{}/{}",
-        short_problem_label(problem_id),
-        short_transcription_label(transcription)
-    )
 }
 
 fn winner_preset_label(preset: OcpBenchmarkPreset) -> &'static str {
@@ -2364,6 +2411,7 @@ fn nnz_metric_offender_groups(
 fn size_metric_distinct_values(
     section: MatrixSection,
     stage: MatrixStage,
+    metric: DisplayedSizeMetric,
     state: &ProgressState,
     problem_id: ProblemId,
     transcription: TranscriptionMethod,
@@ -2376,7 +2424,7 @@ fn size_metric_distinct_values(
                 && cell.case.transcription == transcription
                 && preset_applies_to_transcription(cell.case.preset, transcription)
         })
-        .filter_map(|cell| size_ratio_metric_value(section, stage, cell))
+        .filter_map(|cell| size_ratio_metric_value(section, stage, metric, cell))
         .collect::<Vec<_>>();
     values.sort_unstable();
     values.dedup();
@@ -2506,26 +2554,71 @@ fn overall100_total_for_cell(cell: &CaseCell) -> Option<f64> {
     Some(symbolic_total_for_cell(cell)? + jit_total_for_cell(cell)? + eval100_total_for_cell(cell)?)
 }
 
-fn transposed_matrix_cell_width(terminal_width: usize, panel_count: usize) -> usize {
-    let width_per_panel = terminal_width / panel_count.max(1);
-    if width_per_panel < 56 {
-        4
-    } else if width_per_panel < 72 {
-        5
-    } else {
-        6
+fn timing_section_cell_width(section: MatrixSection, panel_width: usize) -> usize {
+    match section {
+        MatrixSection::Symbolic => {
+            if panel_width < 90 {
+                4
+            } else if panel_width < 120 {
+                5
+            } else {
+                6
+            }
+        }
+        MatrixSection::Jit => {
+            if panel_width < 100 {
+                3
+            } else if panel_width < 132 {
+                4
+            } else {
+                5
+            }
+        }
+        MatrixSection::Runtime => {
+            if panel_width < 56 {
+                4
+            } else if panel_width < 72 {
+                5
+            } else {
+                6
+            }
+        }
     }
 }
 
-fn symbolic_count_cell_width(terminal_width: usize, panel_count: usize) -> usize {
-    let width_per_panel = terminal_width / panel_count.max(1);
-    if width_per_panel < 56 {
-        4
-    } else if width_per_panel < 72 {
-        5
-    } else {
-        6
+fn timing_section_count_cell_width(section: MatrixSection, panel_width: usize) -> usize {
+    match section {
+        MatrixSection::Symbolic => {
+            if panel_width < 90 {
+                4
+            } else if panel_width < 120 {
+                5
+            } else {
+                6
+            }
+        }
+        MatrixSection::Jit => {
+            if panel_width < 100 {
+                3
+            } else if panel_width < 132 {
+                4
+            } else {
+                5
+            }
+        }
+        MatrixSection::Runtime => 0,
     }
+}
+
+fn timing_section_desired_height(
+    section: MatrixSection,
+    preset_count: usize,
+    borders: Borders,
+) -> u16 {
+    let inner_rows = 1 + 1 + section_matrix_rows(section).len() * (1 + preset_count);
+    let chrome_rows = (borders.contains(Borders::TOP) as usize)
+        + (borders.contains(Borders::BOTTOM) as usize);
+    (inner_rows + chrome_rows).min(u16::MAX as usize) as u16
 }
 
 fn matrix_label_detail_from_available(available: usize) -> LabelDetail {
@@ -2705,25 +2798,45 @@ fn timing_cell_widget(
     }
 }
 
-fn section_has_size_column(section: MatrixSection) -> bool {
-    matches!(section, MatrixSection::Symbolic | MatrixSection::Jit)
+fn section_size_metrics(section: MatrixSection) -> &'static [DisplayedSizeMetric] {
+    const SYMBOLIC_METRICS: &[DisplayedSizeMetric] = &[DisplayedSizeMetric::Total];
+    const JIT_METRICS: &[DisplayedSizeMetric] =
+        &[DisplayedSizeMetric::Root, DisplayedSizeMetric::Total];
+    const NO_METRICS: &[DisplayedSizeMetric] = &[];
+    match section {
+        MatrixSection::Symbolic => SYMBOLIC_METRICS,
+        MatrixSection::Jit => JIT_METRICS,
+        MatrixSection::Runtime => NO_METRICS,
+    }
+}
+
+fn size_metric_label(section: MatrixSection, metric: DisplayedSizeMetric) -> &'static str {
+    match (section, metric) {
+        (MatrixSection::Symbolic, DisplayedSizeMetric::Total) => "#",
+        (MatrixSection::Jit, DisplayedSizeMetric::Root) => "R",
+        (MatrixSection::Jit, DisplayedSizeMetric::Total) => "T",
+        (MatrixSection::Runtime, _) => "",
+        _ => "#",
+    }
 }
 
 fn size_ratio_cell_widget(
     section: MatrixSection,
     stage: MatrixStage,
+    metric: DisplayedSizeMetric,
     cell: &CaseCell,
     state: &ProgressState,
 ) -> (String, Style) {
     if !preset_applies_to_transcription(cell.case.preset, cell.case.transcription) {
         return ("--".to_string(), Style::default().fg(Color::DarkGray));
     }
-    let Some(value) = size_ratio_metric_value(section, stage, cell) else {
+    let Some(value) = size_ratio_metric_value(section, stage, metric, cell) else {
         return ("..".to_string(), Style::default().fg(Color::DarkGray));
     };
     let text = match baseline_size_value(
         section,
         stage,
+        metric,
         state,
         cell.case.problem_id,
         cell.case.transcription,
@@ -2737,6 +2850,7 @@ fn size_ratio_cell_widget(
         size_ratio_metric_style(
             section,
             stage,
+            metric,
             state,
             cell.case.problem_id,
             cell.case.transcription,
@@ -2748,23 +2862,43 @@ fn size_ratio_cell_widget(
 fn size_ratio_metric_value(
     section: MatrixSection,
     stage: MatrixStage,
+    metric: DisplayedSizeMetric,
     cell: &CaseCell,
 ) -> Option<usize> {
-    match (section, stage) {
-        (MatrixSection::Symbolic, _) => cell.llvm_total_instruction_count,
-        (MatrixSection::Jit, MatrixStage::NlpJit) => cell.llvm_root_instruction_count,
-        (MatrixSection::Jit, MatrixStage::XdotHelperJit) => cell.xdot_helper_root_instruction_count,
-        (MatrixSection::Jit, MatrixStage::MultipleShootingArcHelperJit) => {
-            cell.multiple_shooting_arc_helper_root_instruction_count
+    match (section, stage, metric) {
+        (MatrixSection::Symbolic, _, DisplayedSizeMetric::Total) => cell.llvm_total_instruction_count,
+        (MatrixSection::Symbolic, _, DisplayedSizeMetric::Root) => None,
+        (MatrixSection::Jit, MatrixStage::NlpJit, DisplayedSizeMetric::Root) => {
+            cell.llvm_root_instruction_count
         }
-        (MatrixSection::Jit, _) => None,
-        (MatrixSection::Runtime, _) => None,
+        (MatrixSection::Jit, MatrixStage::NlpJit, DisplayedSizeMetric::Total) => {
+            cell.llvm_total_instruction_count
+        }
+        (MatrixSection::Jit, MatrixStage::XdotHelperJit, DisplayedSizeMetric::Root) => {
+            cell.xdot_helper_root_instruction_count
+        }
+        (MatrixSection::Jit, MatrixStage::XdotHelperJit, DisplayedSizeMetric::Total) => {
+            cell.xdot_helper_total_instruction_count
+        }
+        (
+            MatrixSection::Jit,
+            MatrixStage::MultipleShootingArcHelperJit,
+            DisplayedSizeMetric::Root,
+        ) => cell.multiple_shooting_arc_helper_root_instruction_count,
+        (
+            MatrixSection::Jit,
+            MatrixStage::MultipleShootingArcHelperJit,
+            DisplayedSizeMetric::Total,
+        ) => cell.multiple_shooting_arc_helper_total_instruction_count,
+        (MatrixSection::Jit, _, _) => None,
+        (MatrixSection::Runtime, _, _) => None,
     }
 }
 
 fn baseline_size_value(
     section: MatrixSection,
     stage: MatrixStage,
+    metric: DisplayedSizeMetric,
     state: &ProgressState,
     problem_id: ProblemId,
     transcription: TranscriptionMethod,
@@ -2777,12 +2911,13 @@ fn baseline_size_value(
                 && cell.case.transcription == transcription
                 && cell.case.preset == OcpBenchmarkPreset::Baseline
         })
-        .and_then(|cell| size_ratio_metric_value(section, stage, cell))
+        .and_then(|cell| size_ratio_metric_value(section, stage, metric, cell))
 }
 
 fn size_ratio_metric_style(
     section: MatrixSection,
     stage: MatrixStage,
+    metric: DisplayedSizeMetric,
     state: &ProgressState,
     problem_id: ProblemId,
     transcription: TranscriptionMethod,
@@ -2791,6 +2926,7 @@ fn size_ratio_metric_style(
     let values = size_metric_distinct_values(
         section,
         stage,
+        metric,
         state,
         problem_id,
         transcription,
@@ -3227,7 +3363,9 @@ fn update_case_started(state: &mut ProgressState, case: OcpBenchmarkCase) {
         cell.llvm_root_instruction_count = None;
         cell.llvm_total_instruction_count = None;
         cell.xdot_helper_root_instruction_count = None;
+        cell.xdot_helper_total_instruction_count = None;
         cell.multiple_shooting_arc_helper_root_instruction_count = None;
+        cell.multiple_shooting_arc_helper_total_instruction_count = None;
         cell.eval_samples = 0;
         cell.sanity = SanityStatus::Ok;
         cell.warnings = 0;
@@ -3314,6 +3452,7 @@ fn update_case_compile_progress(
                 helper,
                 elapsed,
                 root_instructions,
+                total_instructions,
             } => {
                 finalize_running_stage(&mut cell.symbolic);
                 cell.active_symbolic_stage = None;
@@ -3325,6 +3464,7 @@ fn update_case_compile_progress(
                         finalize_running_stage(&mut cell.nlp_jit);
                         cell.xdot_helper_compile_s = Some(elapsed.as_secs_f64());
                         cell.xdot_helper_root_instruction_count = Some(root_instructions);
+                        cell.xdot_helper_total_instruction_count = Some(total_instructions);
                         cell.xdot_helper_jit = done_cell(cell.xdot_helper_compile_s);
                         if matches!(case.transcription, TranscriptionMethod::MultipleShooting) {
                             cell.multiple_shooting_arc_helper_jit = StageCell::Running(now);
@@ -3334,6 +3474,8 @@ fn update_case_compile_progress(
                         cell.multiple_shooting_arc_helper_compile_s = Some(elapsed.as_secs_f64());
                         cell.multiple_shooting_arc_helper_root_instruction_count =
                             Some(root_instructions);
+                        cell.multiple_shooting_arc_helper_total_instruction_count =
+                            Some(total_instructions);
                         cell.multiple_shooting_arc_helper_jit =
                             done_cell(cell.multiple_shooting_arc_helper_compile_s);
                     }
@@ -3406,8 +3548,13 @@ fn update_case_finished(state: &mut ProgressState, record: &OcpBenchmarkRecord) 
         cell.multiple_shooting_arc_helper_compile_s =
             record.helper_compile.multiple_shooting_arc_helper_s;
         cell.xdot_helper_root_instruction_count = record.helper_compile.xdot_helper_root_instructions;
+        cell.xdot_helper_total_instruction_count =
+            record.helper_compile.xdot_helper_total_instructions;
         cell.multiple_shooting_arc_helper_root_instruction_count =
             record.helper_compile.multiple_shooting_arc_helper_root_instructions;
+        cell.multiple_shooting_arc_helper_total_instruction_count = record
+            .helper_compile
+            .multiple_shooting_arc_helper_total_instructions;
         cell.nlp_jit = done_cell(cell.compile_nlp_jit_s);
         cell.xdot_helper_jit = if jit_stage_applicable(cell, MatrixStage::XdotHelperJit) {
             done_cell(cell.xdot_helper_compile_s)

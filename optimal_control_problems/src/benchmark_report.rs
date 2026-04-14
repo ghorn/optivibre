@@ -227,7 +227,11 @@ pub struct OcpHelperCompileSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub xdot_helper_root_instructions: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub xdot_helper_total_instructions: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub multiple_shooting_arc_helper_root_instructions: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub multiple_shooting_arc_helper_total_instructions: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_s: Option<f64>,
 }
@@ -1705,8 +1709,11 @@ fn summarize_helper_compile(stats: OcpHelperCompileStats) -> OcpHelperCompileSum
         xdot_helper_s,
         multiple_shooting_arc_helper_s,
         xdot_helper_root_instructions: stats.xdot_helper_root_instructions,
+        xdot_helper_total_instructions: stats.xdot_helper_total_instructions,
         multiple_shooting_arc_helper_root_instructions: stats
             .multiple_shooting_arc_helper_root_instructions,
+        multiple_shooting_arc_helper_total_instructions: stats
+            .multiple_shooting_arc_helper_total_instructions,
         total_s: sum_options([xdot_helper_s, multiple_shooting_arc_helper_s]),
     }
 }

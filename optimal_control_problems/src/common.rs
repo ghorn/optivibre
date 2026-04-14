@@ -6341,6 +6341,7 @@ mod tests {
                 helper: OcpCompileHelperKind::Xdot,
                 elapsed: Duration::from_millis(125),
                 root_instructions: 42,
+                total_instructions: 42,
             },
             &mut state,
         );
@@ -6353,6 +6354,7 @@ mod tests {
                 helper: OcpCompileHelperKind::MultipleShootingArc,
                 elapsed: Duration::from_secs_f64(4.5),
                 root_instructions: 84,
+                total_instructions: 84,
             },
             &mut state,
         );
