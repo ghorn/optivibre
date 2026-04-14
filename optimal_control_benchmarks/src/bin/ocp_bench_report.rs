@@ -1744,11 +1744,23 @@ fn render_matrix_bands(frame: &mut Frame, area: Rect, state: &ProgressState) {
         return;
     }
 
+    let symbolic_borders = Borders::TOP | Borders::LEFT | Borders::RIGHT;
+    let eval_borders = Borders::TOP | Borders::RIGHT;
+    let jit_borders = Borders::ALL;
+    let symbolic_width =
+        timing_section_required_width(MatrixSection::Symbolic, state, symbolic_borders);
+    let eval_width = timing_section_required_width(MatrixSection::Runtime, state, eval_borders);
+    let jit_width = timing_section_required_width(MatrixSection::Jit, state, jit_borders);
+    let desired_left_width = symbolic_width
+        .saturating_add(eval_width)
+        .max(jit_width)
+        .min(inner.width.saturating_sub(30).max(30));
+
     let columns = Layout::default()
         .direction(ratatui::layout::Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(76),
-            Constraint::Percentage(24),
+            Constraint::Length(desired_left_width),
+            Constraint::Min(30),
         ])
         .split(inner);
 
@@ -1770,8 +1782,8 @@ fn render_matrix_bands(frame: &mut Frame, area: Rect, state: &ProgressState) {
     let top_panels = Layout::default()
         .direction(ratatui::layout::Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(68),
-            Constraint::Percentage(32),
+            Constraint::Length(symbolic_width),
+            Constraint::Min(eval_width),
         ])
         .split(rows[0]);
 
@@ -1782,7 +1794,7 @@ fn render_matrix_bands(frame: &mut Frame, area: Rect, state: &ProgressState) {
         MatrixSection::Symbolic,
         "Symbolic",
         Color::LightGreen,
-        Borders::TOP | Borders::LEFT | Borders::RIGHT,
+        symbolic_borders,
     );
     render_timing_section_panel(
         frame,
@@ -1791,7 +1803,7 @@ fn render_matrix_bands(frame: &mut Frame, area: Rect, state: &ProgressState) {
         MatrixSection::Runtime,
         "Eval",
         Color::LightMagenta,
-        Borders::TOP | Borders::RIGHT,
+        eval_borders,
     );
     render_timing_section_panel(
         frame,
@@ -1800,7 +1812,7 @@ fn render_matrix_bands(frame: &mut Frame, area: Rect, state: &ProgressState) {
         MatrixSection::Jit,
         "JIT",
         Color::LightBlue,
-        Borders::ALL,
+        jit_borders,
     );
 
     let sidebar = Layout::default()
@@ -2608,6 +2620,58 @@ fn timing_section_count_cell_width(section: MatrixSection, panel_width: usize) -
         }
         MatrixSection::Runtime => 0,
     }
+}
+
+fn timing_section_required_width(
+    section: MatrixSection,
+    state: &ProgressState,
+    borders: Borders,
+) -> u16 {
+    let horizontal_borders =
+        (borders.contains(Borders::LEFT) as usize) + (borders.contains(Borders::RIGHT) as usize);
+    let min_width = 24usize + horizontal_borders;
+    let max_width = 220usize + horizontal_borders;
+    for width in min_width..=max_width {
+        let inner_width = width.saturating_sub(horizontal_borders);
+        if timing_section_fits_width(section, state, inner_width) {
+            return width.min(u16::MAX as usize) as u16;
+        }
+    }
+    max_width.min(u16::MAX as usize) as u16
+}
+
+fn timing_section_fits_width(
+    section: MatrixSection,
+    state: &ProgressState,
+    inner_width: usize,
+) -> bool {
+    if inner_width < 8 {
+        return false;
+    }
+    let case_count = state.row_keys.len();
+    let size_metric_count = section_size_metrics(section).len();
+    let cell_width = timing_section_cell_width(section, inner_width);
+    let count_cell_width = if size_metric_count > 0 {
+        timing_section_count_cell_width(section, inner_width)
+    } else {
+        0
+    };
+    let column_spacing = 1usize;
+    let case_group_width =
+        cell_width + size_metric_count * (count_cell_width + column_spacing);
+    let data_width =
+        case_count * case_group_width + case_count.saturating_sub(1) * column_spacing;
+    let Some(label_available) = inner_width.checked_sub(data_width + column_spacing) else {
+        return false;
+    };
+    let detail = matrix_label_detail_from_available(label_available);
+    let row_label_width = matrix_row_label_width_from_available(
+        label_available,
+        &state.presets,
+        detail,
+        section,
+    );
+    row_label_width <= label_available
 }
 
 fn timing_section_desired_height(
