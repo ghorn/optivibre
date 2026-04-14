@@ -210,6 +210,7 @@ impl CompiledJitFunction {
         opt_level: LlvmOptimizationLevel,
         lowering_time: Duration,
     ) -> Result<Self> {
+        validate_lowered_output_shapes(lowered)?;
         ensure_native_llvm_initialized()?;
 
         let llvm_started = Instant::now();
@@ -265,6 +266,45 @@ impl CompiledJitFunction {
             (self.function)(context.input_ptrs.as_ptr(), context.output_ptrs.as_ptr());
         }
     }
+}
+
+fn validate_slot_output_shapes(
+    slots: &[sx_codegen::Slot],
+    output_values: &[Vec<ValueRef>],
+) -> Result<()> {
+    if slots.len() != output_values.len() {
+        bail!(
+            "lowered output slot/value arity mismatch: {} slots but {} output value groups",
+            slots.len(),
+            output_values.len()
+        );
+    }
+    for (slot_index, (slot, values)) in slots.iter().zip(output_values.iter()).enumerate() {
+        let expected = slot.ccs.nnz();
+        let actual = values.len();
+        if expected != actual {
+            bail!(
+                "lowered output slot {slot_index} ('{}') nnz mismatch: ccs.nnz()={expected}, lowered values={actual}",
+                slot.name
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_lowered_output_shapes(lowered: &LoweredFunction) -> Result<()> {
+    validate_slot_output_shapes(&lowered.outputs, &lowered.output_values)?;
+    for (sub_index, subfunction) in lowered.subfunctions.iter().enumerate() {
+        validate_slot_output_shapes(&subfunction.outputs, &subfunction.output_values).map_err(
+            |error| {
+                anyhow!(
+                    "subfunction {sub_index} ('{}') output shape invalid: {error}",
+                    subfunction.name
+                )
+            },
+        )?;
+    }
+    Ok(())
 }
 
 pub fn emit_object_file(

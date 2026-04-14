@@ -1165,11 +1165,12 @@ mod tests {
     #[ignore = "manual profiling helper"]
     fn profile_direct_collocation_symbolic_setup() {
         let family = Params::default().transcription.collocation_family;
-        let ocp = model(
-            optimal_control::DirectCollocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE> {
-                family,
-            },
-        );
+        let ocp = model(optimal_control::DirectCollocation::<
+            DEFAULT_INTERVALS,
+            DEFAULT_COLLOCATION_DEGREE,
+        > {
+            family,
+        });
         let started = std::time::Instant::now();
         let compiled = ocp
             .compile_jit_with_ocp_options(optimal_control::OcpCompileOptions {

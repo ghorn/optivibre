@@ -3,6 +3,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyhow::Result as AnyResult;
+use sx_codegen::LoweredFunction;
 use sx_codegen_llvm::{
     CompiledJitFunction, FunctionCompileOptions, JitExecutionContext, LlvmOptimizationLevel,
 };
@@ -759,6 +760,11 @@ where
     <E as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
     <I as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
 {
+    #[doc(hidden)]
+    pub fn debug_lagrangian_hessian_lowered(&self) -> &LoweredFunction {
+        self.inner.lagrangian_hessian_values.function.lowered()
+    }
+
     pub fn backend_timing_metadata(&self) -> BackendTimingMetadata {
         self.inner.backend_timing_metadata()
     }

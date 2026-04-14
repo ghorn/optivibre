@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::panic;
@@ -5,7 +6,7 @@ use std::path::PathBuf;
 use std::process;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -18,6 +19,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use libc::{SIGABRT, SIGBUS, SIGILL, SIGSEGV, SIGTRAP};
 use optimal_control::{OcpCompileHelperKind, OcpCompileProgress};
 use optimal_control_problems::{
     OcpBenchmarkCase, OcpBenchmarkPreset, OcpBenchmarkProgress, OcpBenchmarkRecord,
@@ -34,7 +36,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Gauge, Paragraph, Row, Table, Wrap},
 };
-use signal_hook::consts::signal::{SIGABRT, SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 use signal_hook::iterator::Signals;
 
 fn main() -> Result<()> {
@@ -58,9 +60,15 @@ fn main() -> Result<()> {
     }
 
     let mut progress = TerminalProgress::start(&config, &output);
-    let suite = run_ocp_benchmark_suite_with_progress(&config, |event| {
+    let suite = match run_ocp_benchmark_suite_with_progress(&config, |event| {
         progress.update(event);
-    })?;
+    }) {
+        Ok(suite) => suite,
+        Err(error) => {
+            progress.fail(error.to_string());
+            return Err(error);
+        }
+    };
     progress.set_stage(
         "Rendering HTML report",
         "Assembling final dashboard".to_string(),
@@ -282,6 +290,97 @@ struct TerminalCleanup {
     last_snapshot: Mutex<Option<String>>,
 }
 
+const CRASH_TERMINAL_RECOVERY_BYTES: &[u8] =
+    b"\r\n\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?25h";
+const CRASH_STATUS_PREFIX_BYTES: &[u8] = b"latest status: ";
+const MAX_CRASH_STATUS_BYTES: usize = 240;
+
+static LAST_CRASH_STATUS_PTR: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+static LAST_CRASH_STATUS_LEN: AtomicUsize = AtomicUsize::new(0);
+
+fn crash_signal_message(signal: libc::c_int) -> &'static [u8] {
+    match signal {
+        SIGSEGV => b"\r\nocp_bench_report crashed with SIGSEGV; terminal reset\r\n",
+        SIGTRAP => b"\r\nocp_bench_report crashed with SIGTRAP; terminal reset\r\n",
+        SIGBUS => b"\r\nocp_bench_report crashed with SIGBUS; terminal reset\r\n",
+        SIGILL => b"\r\nocp_bench_report crashed with SIGILL; terminal reset\r\n",
+        SIGABRT => b"\r\nocp_bench_report crashed with SIGABRT; terminal reset\r\n",
+        _ => b"\r\nocp_bench_report crashed; terminal reset\r\n",
+    }
+}
+
+unsafe extern "C" fn crash_terminal_signal_handler(signal: libc::c_int) {
+    // SAFETY: Async-signal-safe raw write of static bytes to stderr.
+    let _ = unsafe {
+        libc::write(
+            libc::STDERR_FILENO,
+            CRASH_TERMINAL_RECOVERY_BYTES.as_ptr().cast(),
+            CRASH_TERMINAL_RECOVERY_BYTES.len(),
+        )
+    };
+    let message = crash_signal_message(signal);
+    // SAFETY: Async-signal-safe raw write of static bytes to stderr.
+    let _ = unsafe { libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len()) };
+    let status_len = LAST_CRASH_STATUS_LEN.load(Ordering::Acquire);
+    let status_ptr = LAST_CRASH_STATUS_PTR.load(Ordering::Acquire);
+    if !status_ptr.is_null() && status_len > 0 {
+        // SAFETY: Async-signal-safe raw write of static bytes to stderr.
+        let _ = unsafe {
+            libc::write(
+                libc::STDERR_FILENO,
+                CRASH_STATUS_PREFIX_BYTES.as_ptr().cast(),
+                CRASH_STATUS_PREFIX_BYTES.len(),
+            )
+        };
+        // SAFETY: Pointer/length were published from leaked process-lifetime storage.
+        let _ = unsafe { libc::write(libc::STDERR_FILENO, status_ptr.cast(), status_len) };
+        // SAFETY: Async-signal-safe raw write of static bytes to stderr.
+        let _ = unsafe { libc::write(libc::STDERR_FILENO, b"\r\n".as_ptr().cast(), 2) };
+    }
+    // SAFETY: Async-signal-safe immediate process exit from a fatal signal handler.
+    unsafe { libc::_exit(128 + signal) };
+}
+
+fn truncate_to_boundary(message: &str, max_bytes: usize) -> &str {
+    if message.len() <= max_bytes {
+        return message;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    &message[..end]
+}
+
+fn publish_crash_status(status: &str) {
+    let status = truncate_to_boundary(status, MAX_CRASH_STATUS_BYTES);
+    let mut bytes = status.as_bytes().to_vec();
+    if bytes.is_empty() {
+        LAST_CRASH_STATUS_LEN.store(0, Ordering::Release);
+        LAST_CRASH_STATUS_PTR.store(std::ptr::null_mut(), Ordering::Release);
+        return;
+    }
+    let ptr = bytes.as_mut_ptr();
+    let len = bytes.len();
+    std::mem::forget(bytes);
+    LAST_CRASH_STATUS_PTR.store(ptr, Ordering::Release);
+    LAST_CRASH_STATUS_LEN.store(len, Ordering::Release);
+}
+
+fn install_terminal_crash_signal_handlers() {
+    for signal in [SIGABRT, SIGBUS, SIGILL, SIGSEGV, SIGTRAP] {
+        // SAFETY: The handler only writes static bytes to stderr and exits via `_exit`,
+        // which are async-signal-safe operations. The sigaction struct is fully initialized.
+        unsafe {
+            let mut action = std::mem::zeroed::<libc::sigaction>();
+            action.sa_sigaction = crash_terminal_signal_handler as *const () as libc::sighandler_t;
+            action.sa_flags = 0;
+            libc::sigemptyset(&mut action.sa_mask);
+            let _ = libc::sigaction(signal, &action, std::ptr::null_mut());
+        }
+    }
+}
+
 impl TerminalCleanup {
     fn new(done: Arc<AtomicBool>) -> Self {
         Self {
@@ -422,6 +521,8 @@ struct CaseCell {
     gradient_nnz: Option<usize>,
     jacobian_nnz: Option<usize>,
     hessian_nnz: Option<usize>,
+    llvm_root_instruction_count: Option<usize>,
+    llvm_total_instruction_count: Option<usize>,
     eval_samples: usize,
     sanity: SanityStatus,
     warnings: usize,
@@ -481,6 +582,12 @@ enum NnzMetric {
     Gradient,
     Jacobian,
     Hessian,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SizeMetric {
+    RootInstructions,
+    TotalInstructions,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -571,6 +678,8 @@ impl TerminalProgress {
                     gradient_nnz: None,
                     jacobian_nnz: None,
                     hessian_nnz: None,
+                    llvm_root_instruction_count: None,
+                    llvm_total_instruction_count: None,
                     eval_samples: 0,
                     sanity: SanityStatus::Ok,
                     warnings: 0,
@@ -598,12 +707,20 @@ impl TerminalProgress {
             final_message: None,
             warning_count: 0,
         }));
+        {
+            let state = match state.lock() {
+                Ok(guard) => guard,
+                Err(poison) => poison.into_inner(),
+            };
+            publish_crash_status(&format_crash_status(&state));
+        }
         let done = Arc::new(AtomicBool::new(false));
         let terminal = interactive.then(|| Arc::new(TerminalCleanup::new(Arc::clone(&done))));
         if let Some(terminal) = &terminal {
             install_terminal_signal_handlers(Arc::clone(terminal));
             install_terminal_panic_hook(Arc::clone(terminal));
         }
+        install_terminal_crash_signal_handlers();
         let worker = interactive.then(|| {
             let state = Arc::clone(&state);
             let terminal = Arc::clone(
@@ -626,6 +743,7 @@ impl TerminalProgress {
         if self.interactive {
             let mut state = self.lock_state();
             apply_progress_event(&mut state, event);
+            publish_crash_status(&format_crash_status(&state));
         } else {
             print_event_line(event);
         }
@@ -637,6 +755,7 @@ impl TerminalProgress {
             state.stage = stage.to_string();
             state.detail = detail;
             state.latest_event_started_at = Instant::now();
+            publish_crash_status(&format_crash_status(&state));
         } else {
             eprintln!("{stage}: {detail}");
         }
@@ -647,11 +766,31 @@ impl TerminalProgress {
             {
                 let mut state = self.lock_state();
                 state.final_message = Some(final_message);
+                publish_crash_status(&format_crash_status(&state));
             }
             self.done.store(true, Ordering::SeqCst);
             if let Some(worker) = self.worker.take() {
                 let _ = worker.join();
             }
+        }
+    }
+
+    fn fail(&mut self, error_message: String) {
+        if self.interactive {
+            {
+                let mut state = self.lock_state();
+                state.stage = "Failed".to_string();
+                state.detail = error_message;
+                state.final_message = Some(String::new());
+                state.latest_event_started_at = Instant::now();
+                publish_crash_status(&format_crash_status(&state));
+            }
+            self.done.store(true, Ordering::SeqCst);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        } else {
+            eprintln!("benchmark failed");
         }
     }
 
@@ -821,15 +960,26 @@ fn render_progress_loop(state: Arc<Mutex<ProgressState>>, terminal: Arc<Terminal
         }
 
         if terminal.done.load(Ordering::SeqCst) {
-            let final_message = snapshot
-                .final_message
-                .unwrap_or_else(|| "benchmark runner finished".to_string());
             drop(terminal_ui);
-            terminal.restore_terminal_with_message(&final_message);
+            terminal.restore_terminal();
             break;
         }
 
         thread::sleep(Duration::from_millis(120));
+    }
+}
+
+fn format_crash_status(state: &ProgressState) -> String {
+    match state.latest_case {
+        Some(case) => format!(
+            "{} / {} / {} | {} | {}",
+            case.problem_label(),
+            case.transcription_label(),
+            case.preset_label(),
+            state.stage,
+            state.detail
+        ),
+        None => format!("{} | {}", state.stage, state.detail),
     }
 }
 
@@ -908,6 +1058,7 @@ fn render_overview(frame: &mut Frame, area: Rect, state: &ProgressState, spinner
     let rows = Layout::default()
         .direction(ratatui::layout::Direction::Vertical)
         .constraints([
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -1039,7 +1190,8 @@ fn render_overview(frame: &mut Frame, area: Rect, state: &ProgressState, spinner
     ]);
     frame.render_widget(Paragraph::new(variance), rows[3]);
 
-    render_overview_details(frame, rows[4], state);
+    render_overview_status(frame, rows[4], state);
+    render_overview_details(frame, rows[5], state);
 }
 
 fn muted_label(text: &'static str) -> Span<'static> {
@@ -1123,6 +1275,35 @@ fn render_overview_details(frame: &mut Frame, area: Rect, state: &ProgressState)
     render_preset_legend_panel(frame, columns[1]);
 }
 
+fn render_overview_status(frame: &mut Frame, area: Rect, state: &ProgressState) {
+    if area.width < 20 {
+        return;
+    }
+    let status_style = if state.stage == "Failed" {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else if state
+        .final_message
+        .as_deref()
+        .is_some_and(|message| !message.is_empty())
+    {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    };
+    let line = Line::from(vec![
+        muted_label("Status"),
+        Span::raw(" "),
+        Span::styled(state.stage.clone(), status_style),
+        Span::raw("  "),
+        Span::styled(state.detail.clone(), Style::default().fg(Color::White)),
+    ]);
+    frame.render_widget(Paragraph::new(line).wrap(Wrap { trim: true }), area);
+}
+
 fn render_active_jobs_panel(frame: &mut Frame, area: Rect, state: &ProgressState) {
     let block = panel_block("Active Jobs", Color::Cyan);
     let inner = block.inner(area);
@@ -1134,8 +1315,11 @@ fn render_active_jobs_panel(frame: &mut Frame, area: Rect, state: &ProgressState
     let jobs = active_jobs(state);
     if jobs.is_empty() {
         frame.render_widget(
-            Paragraph::new("No active jobs")
-                .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+            Paragraph::new("No active jobs").style(
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
             inner,
         );
         return;
@@ -1171,7 +1355,9 @@ fn render_active_jobs_panel(frame: &mut Frame, area: Rect, state: &ProgressState
             ratatui::widgets::Cell::from(""),
             ratatui::widgets::Cell::from(Span::styled(
                 format!("+{hidden_count} more active jobs"),
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
             )),
         ]));
     }
@@ -1226,10 +1412,7 @@ fn active_job_for_cell(cell: &CaseCell) -> Option<ActiveJob> {
         Some(MatrixStage::Gradient)
     } else if matches!(cell.objective, StageCell::Running(_)) {
         Some(MatrixStage::Objective)
-    } else if matches!(
-        cell.multiple_shooting_arc_helper_jit,
-        StageCell::Running(_)
-    ) {
+    } else if matches!(cell.multiple_shooting_arc_helper_jit, StageCell::Running(_)) {
         Some(MatrixStage::MultipleShootingArcHelperJit)
     } else if matches!(cell.xdot_helper_jit, StageCell::Running(_)) {
         Some(MatrixStage::XdotHelperJit)
@@ -1259,8 +1442,7 @@ fn active_job_for_cell(cell: &CaseCell) -> Option<ActiveJob> {
             StageCell::Running(started_at) => *started_at,
             _ => return None,
         },
-        MatrixStage::MultipleShootingArcHelperJit => match &cell.multiple_shooting_arc_helper_jit
-        {
+        MatrixStage::MultipleShootingArcHelperJit => match &cell.multiple_shooting_arc_helper_jit {
             StageCell::Running(started_at) => *started_at,
             _ => return None,
         },
@@ -1312,7 +1494,10 @@ fn active_job_row(job: ActiveJob, detail: LabelDetail) -> Row<'static> {
             Span::styled(problem, Style::default().fg(problem_category_color())),
             Span::raw(" / "),
             Span::styled(
-                overview_transcription_label(case.transcription, panel_width_for_label_detail(detail)),
+                overview_transcription_label(
+                    case.transcription,
+                    panel_width_for_label_detail(detail),
+                ),
                 Style::default().fg(transcription_category_color()),
             ),
             Span::raw(" / "),
@@ -1653,16 +1838,26 @@ fn render_timing_section_panel(
             let stage_header = std::iter::once(
                 Row::new(
                     std::iter::once(ratatui::widgets::Cell::from(
-                        matrix_row_display_name_with_detail(MatrixRow::Time(stage), row_label_detail),
+                        matrix_row_display_name_with_detail(
+                            MatrixRow::Time(stage),
+                            row_label_detail,
+                        ),
                     ))
                     .chain((0..case_count).map(|_| ratatui::widgets::Cell::from("")))
                     .collect::<Vec<_>>(),
                 )
-                .style(Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)),
+                .style(
+                    Style::default()
+                        .fg(Color::Gray)
+                        .add_modifier(Modifier::BOLD),
+                ),
             );
             let preset_rows = state.presets.iter().copied().map(move |preset| {
                 let mut cells = vec![ratatui::widgets::Cell::from(Span::styled(
-                    format!("  {}", preset_display_name_with_detail(preset, row_label_detail)),
+                    format!(
+                        "  {}",
+                        preset_display_name_with_detail(preset, row_label_detail)
+                    ),
                     Style::default().fg(strategy_category_color()),
                 ))];
                 for &(problem_id, transcription) in &state.row_keys {
@@ -1676,7 +1871,7 @@ fn render_timing_section_panel(
                         .iter()
                         .find(|entry| entry.case == case)
                         .expect("matrix case should exist");
-                    let (text, style) = timing_cell_widget(stage, cell);
+                    let (text, style) = timing_cell_widget(stage, cell, state);
                     cells.push(ratatui::widgets::Cell::from(text).style(style));
                 }
                 Row::new(cells)
@@ -1697,21 +1892,44 @@ fn render_timing_section_panel(
 }
 
 fn render_bottom_summary_widgets(frame: &mut Frame, area: Rect, state: &ProgressState) {
-    if area.width >= 120 {
+    if area.width >= 180 {
+        let sections = Layout::default()
+            .direction(ratatui::layout::Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(33),
+                Constraint::Percentage(23),
+                Constraint::Percentage(44),
+            ])
+            .split(area);
+        render_size_summary_widget(frame, sections[0], state);
+        render_nnz_summary_widget(frame, sections[1], state);
+        render_best_summary_widget(frame, sections[2], state);
+    } else if area.width >= 120 {
         let sections = Layout::default()
             .direction(ratatui::layout::Direction::Horizontal)
             .constraints([Constraint::Percentage(56), Constraint::Percentage(44)])
             .split(area);
-        render_nnz_summary_widget(frame, sections[0], state);
+        let left_sections = Layout::default()
+            .direction(ratatui::layout::Direction::Vertical)
+            .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+            .split(sections[0]);
+        render_size_summary_widget(frame, left_sections[0], state);
+        render_nnz_summary_widget(frame, left_sections[1], state);
         render_best_summary_widget(frame, sections[1], state);
     } else {
-        let nnz_height = area.height.saturating_sub(6).max(5);
+        let size_height = area.height.saturating_sub(12).max(5);
+        let nnz_height = area.height.saturating_sub(size_height + 6).max(5);
         let sections = Layout::default()
             .direction(ratatui::layout::Direction::Vertical)
-            .constraints([Constraint::Length(nnz_height), Constraint::Min(4)])
+            .constraints([
+                Constraint::Length(size_height),
+                Constraint::Length(nnz_height),
+                Constraint::Min(4),
+            ])
             .split(area);
-        render_nnz_summary_widget(frame, sections[0], state);
-        render_best_summary_widget(frame, sections[1], state);
+        render_size_summary_widget(frame, sections[0], state);
+        render_nnz_summary_widget(frame, sections[1], state);
+        render_best_summary_widget(frame, sections[2], state);
     }
 }
 
@@ -1816,14 +2034,53 @@ fn render_best_summary_widget(frame: &mut Frame, area: Rect, state: &ProgressSta
     let block = panel_block("Best By Goal", Color::Green);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    if inner.height < 3 || inner.width < 20 {
+        return;
+    }
+
+    let panels = if inner.width >= 110 {
+        Layout::default()
+            .direction(ratatui::layout::Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(inner)
+    } else {
+        Layout::default()
+            .direction(ratatui::layout::Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(inner)
+    };
+    render_best_summary_transcription_panel(
+        frame,
+        panels[0],
+        state,
+        TranscriptionMethod::MultipleShooting,
+        "MS",
+    );
+    render_best_summary_transcription_panel(
+        frame,
+        panels[1],
+        state,
+        TranscriptionMethod::DirectCollocation,
+        "DC",
+    );
+}
+
+fn render_best_summary_transcription_panel(
+    frame: &mut Frame,
+    area: Rect,
+    state: &ProgressState,
+    transcription: TranscriptionMethod,
+    title: &'static str,
+) {
+    let block = panel_block(title, transcription_category_color());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
     if inner.height < 3 {
         return;
     }
 
-    let rows = best_summary_rows(state);
-
     let table = Table::new(
-        rows,
+        best_summary_rows(state, transcription),
         [
             Constraint::Length(12),
             Constraint::Length(20),
@@ -1851,7 +2108,10 @@ fn render_best_summary_widget(frame: &mut Frame, area: Rect, state: &ProgressSta
     frame.render_widget(table, inner);
 }
 
-fn best_summary_rows(state: &ProgressState) -> Vec<Row<'static>> {
+fn best_summary_rows(
+    state: &ProgressState,
+    transcription: TranscriptionMethod,
+) -> Vec<Row<'static>> {
     let metrics = [
         WinnerMetric::Symbolic,
         WinnerMetric::Jit,
@@ -1861,7 +2121,7 @@ fn best_summary_rows(state: &ProgressState) -> Vec<Row<'static>> {
     metrics
         .into_iter()
         .map(|metric| {
-            if let Some(cell) = best_case_for_metric(state, metric) {
+            if let Some(cell) = best_case_for_metric(state, transcription, metric) {
                 let symbolic = symbolic_total_for_cell(cell);
                 let jit = jit_total_for_cell(cell);
                 let eval = eval100_total_for_cell(cell);
@@ -1869,14 +2129,22 @@ fn best_summary_rows(state: &ProgressState) -> Vec<Row<'static>> {
                 Row::new(vec![
                     ratatui::widgets::Cell::from(winner_metric_label(metric)),
                     ratatui::widgets::Cell::from(winner_case_label(cell)),
-                    ratatui::widgets::Cell::from(compact_optional_cell_seconds(symbolic))
-                        .style(winner_metric_style(state, WinnerMetric::Symbolic, symbolic)),
-                    ratatui::widgets::Cell::from(compact_optional_cell_seconds(jit))
-                        .style(winner_metric_style(state, WinnerMetric::Jit, jit)),
-                    ratatui::widgets::Cell::from(compact_optional_cell_seconds(eval))
-                        .style(winner_metric_style(state, WinnerMetric::Eval100, eval)),
+                    ratatui::widgets::Cell::from(compact_optional_cell_seconds(symbolic)).style(
+                        winner_metric_style(state, transcription, WinnerMetric::Symbolic, symbolic),
+                    ),
+                    ratatui::widgets::Cell::from(compact_optional_cell_seconds(jit)).style(
+                        winner_metric_style(state, transcription, WinnerMetric::Jit, jit),
+                    ),
+                    ratatui::widgets::Cell::from(compact_optional_cell_seconds(eval)).style(
+                        winner_metric_style(state, transcription, WinnerMetric::Eval100, eval),
+                    ),
                     ratatui::widgets::Cell::from(compact_optional_cell_seconds(overall)).style(
-                        winner_metric_style(state, WinnerMetric::Overall100, overall),
+                        winner_metric_style(
+                            state,
+                            transcription,
+                            WinnerMetric::Overall100,
+                            overall,
+                        ),
                     ),
                 ])
             } else {
@@ -1922,17 +2190,165 @@ fn render_nnz_summary_widget(frame: &mut Frame, area: Rect, state: &ProgressStat
             Constraint::Length(10),
             Constraint::Length(10),
             Constraint::Length(10),
-            Constraint::Min(10),
+            Constraint::Min(28),
         ],
     )
     .header(
-        Row::new(vec!["Case", "Grad", "Jac", "Hess", "Status"]).style(
+        Row::new(vec!["Case", "Grad", "Jac", "Hess", "Details"]).style(
             Style::default()
                 .fg(Color::Gray)
                 .add_modifier(Modifier::BOLD),
         ),
     );
     frame.render_widget(table, inner);
+}
+
+fn render_size_summary_widget(frame: &mut Frame, area: Rect, state: &ProgressState) {
+    let has_large_spread = state.row_keys.iter().any(|&(problem_id, transcription)| {
+        size_case_has_large_spread(state, problem_id, transcription)
+    });
+    let block = panel_block(
+        "Pre-JIT Size",
+        if has_large_spread {
+            Color::Yellow
+        } else {
+            Color::LightBlue
+        },
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height < 3 {
+        return;
+    }
+
+    let table = Table::new(
+        size_summary_rows(state),
+        [
+            Constraint::Length(10),
+            Constraint::Length(18),
+            Constraint::Length(18),
+            Constraint::Min(36),
+        ],
+    )
+    .header(
+        Row::new(vec!["Case", "Root Inst", "Total Inst", "Details"]).style(
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
+        ),
+    );
+    frame.render_widget(table, inner);
+}
+
+fn size_summary_rows(state: &ProgressState) -> Vec<Row<'static>> {
+    state
+        .row_keys
+        .iter()
+        .map(|&(problem_id, transcription)| {
+            let root = size_summary_metric_cell(
+                state,
+                problem_id,
+                transcription,
+                SizeMetric::RootInstructions,
+            );
+            let total = size_summary_metric_cell(
+                state,
+                problem_id,
+                transcription,
+                SizeMetric::TotalInstructions,
+            );
+            let details = size_summary_detail_cell(state, problem_id, transcription);
+            Row::new(vec![
+                ratatui::widgets::Cell::from(nnz_case_label(problem_id, transcription)),
+                ratatui::widgets::Cell::from(root.0).style(root.1),
+                ratatui::widgets::Cell::from(total.0).style(total.1),
+                ratatui::widgets::Cell::from(details.0).style(details.1),
+            ])
+        })
+        .collect()
+}
+
+fn size_summary_metric_cell(
+    state: &ProgressState,
+    problem_id: ProblemId,
+    transcription: TranscriptionMethod,
+    metric: SizeMetric,
+) -> (String, Style) {
+    let values = size_metric_distinct_values(state, problem_id, transcription, metric);
+    let complete = size_metric_complete(state, problem_id, transcription, metric);
+    let style = size_metric_style(state, problem_id, transcription, metric);
+    match values.as_slice() {
+        [] => ("--".to_string(), Style::default().fg(Color::DarkGray)),
+        [value] => (
+            compact_count(*value),
+            if complete {
+                style.add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            },
+        ),
+        values => (summarize_size_spread(values), style),
+    }
+}
+
+fn size_summary_detail_cell(
+    state: &ProgressState,
+    problem_id: ProblemId,
+    transcription: TranscriptionMethod,
+) -> (String, Style) {
+    let mut details = Vec::new();
+    for (metric, label) in [
+        (SizeMetric::RootInstructions, "root"),
+        (SizeMetric::TotalInstructions, "total"),
+    ] {
+        let Some((min_value, min_presets, max_value, max_presets)) =
+            size_metric_min_max_offenders(state, problem_id, transcription, metric)
+        else {
+            continue;
+        };
+        let values = size_metric_distinct_values(state, problem_id, transcription, metric);
+        if values.len() > 1 {
+            details.push(format!(
+                "{} {}:{} -> {}:{}",
+                label,
+                compact_count(min_value),
+                summarize_offending_presets(state, &min_presets),
+                compact_count(max_value),
+                summarize_offending_presets(state, &max_presets)
+            ));
+        }
+    }
+
+    if !details.is_empty() {
+        let has_large_spread = size_case_has_large_spread(state, problem_id, transcription);
+        return (
+            details.join(" | "),
+            if has_large_spread {
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Red)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            },
+        );
+    }
+
+    let all_complete = [SizeMetric::RootInstructions, SizeMetric::TotalInstructions]
+        .into_iter()
+        .all(|metric| size_metric_complete(state, problem_id, transcription, metric));
+    if all_complete {
+        (
+            "ok".to_string(),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        ("pending".to_string(), Style::default().fg(Color::DarkGray))
+    }
 }
 
 fn nnz_summary_rows(state: &ProgressState) -> Vec<Row<'static>> {
@@ -1946,7 +2362,7 @@ fn nnz_summary_rows(state: &ProgressState) -> Vec<Row<'static>> {
                 nnz_summary_metric_cell(state, problem_id, transcription, NnzMetric::Jacobian);
             let hess =
                 nnz_summary_metric_cell(state, problem_id, transcription, NnzMetric::Hessian);
-            let status = nnz_summary_status_cell(state, problem_id, transcription);
+            let status = nnz_summary_detail_cell(state, problem_id, transcription);
             Row::new(vec![
                 ratatui::widgets::Cell::from(nnz_case_label(problem_id, transcription)),
                 ratatui::widgets::Cell::from(grad.0).style(grad.1),
@@ -1996,25 +2412,38 @@ fn nnz_summary_metric_cell(
     }
 }
 
-fn nnz_summary_status_cell(
+fn nnz_summary_detail_cell(
     state: &ProgressState,
     problem_id: ProblemId,
     transcription: TranscriptionMethod,
 ) -> (String, Style) {
-    let mismatch_metrics = [
+    let mismatch_details = [
         (NnzMetric::Gradient, "grad"),
         (NnzMetric::Jacobian, "jac"),
         (NnzMetric::Hessian, "hess"),
     ]
     .into_iter()
     .filter_map(|(metric, label)| {
-        (nnz_metric_distinct_values(state, problem_id, transcription, metric).len() > 1)
-            .then_some(label)
+        let offenders = nnz_metric_offender_groups(state, problem_id, transcription, metric);
+        (!offenders.is_empty()).then(|| {
+            let groups = offenders
+                .into_iter()
+                .map(|(value, presets)| {
+                    format!(
+                        "{} {}:{}",
+                        label,
+                        compact_nnz(value),
+                        summarize_offending_presets(state, &presets)
+                    )
+                })
+                .collect::<Vec<_>>();
+            groups.join("; ")
+        })
     })
     .collect::<Vec<_>>();
-    if !mismatch_metrics.is_empty() {
+    if !mismatch_details.is_empty() {
         return (
-            format!("ERROR {}", mismatch_metrics.join("/")),
+            mismatch_details.join(" | "),
             Style::default()
                 .fg(Color::White)
                 .bg(Color::Red)
@@ -2035,6 +2464,159 @@ fn nnz_summary_status_cell(
     } else {
         ("pending".to_string(), Style::default().fg(Color::DarkGray))
     }
+}
+
+fn nnz_metric_offender_groups(
+    state: &ProgressState,
+    problem_id: ProblemId,
+    transcription: TranscriptionMethod,
+    metric: NnzMetric,
+) -> Vec<(usize, Vec<OcpBenchmarkPreset>)> {
+    let values = state
+        .case_cells
+        .iter()
+        .filter(|cell| {
+            cell.case.problem_id == problem_id && cell.case.transcription == transcription
+        })
+        .filter_map(|cell| nnz_metric_value(cell, metric).map(|value| (cell.case.preset, value)))
+        .collect::<Vec<_>>();
+    let Some(min_value) = values.iter().map(|(_, value)| *value).min() else {
+        return Vec::new();
+    };
+
+    let mut offenders = BTreeMap::<usize, Vec<OcpBenchmarkPreset>>::new();
+    for (preset, value) in values {
+        if value != min_value {
+            offenders.entry(value).or_default().push(preset);
+        }
+    }
+    offenders.into_iter().collect()
+}
+
+fn size_metric_distinct_values(
+    state: &ProgressState,
+    problem_id: ProblemId,
+    transcription: TranscriptionMethod,
+    metric: SizeMetric,
+) -> Vec<usize> {
+    let mut values = state
+        .case_cells
+        .iter()
+        .filter(|cell| {
+            cell.case.problem_id == problem_id
+                && cell.case.transcription == transcription
+                && preset_applies_to_transcription(cell.case.preset, transcription)
+        })
+        .filter_map(|cell| size_metric_value(cell, metric))
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
+fn size_metric_complete(
+    state: &ProgressState,
+    problem_id: ProblemId,
+    transcription: TranscriptionMethod,
+    metric: SizeMetric,
+) -> bool {
+    let applicable = state
+        .presets
+        .iter()
+        .copied()
+        .filter(|preset| preset_applies_to_transcription(*preset, transcription))
+        .count();
+    state
+        .case_cells
+        .iter()
+        .filter(|cell| {
+            cell.case.problem_id == problem_id
+                && cell.case.transcription == transcription
+                && preset_applies_to_transcription(cell.case.preset, transcription)
+        })
+        .filter(|cell| size_metric_value(cell, metric).is_some())
+        .count()
+        == applicable
+}
+
+fn size_metric_min_max_offenders(
+    state: &ProgressState,
+    problem_id: ProblemId,
+    transcription: TranscriptionMethod,
+    metric: SizeMetric,
+) -> Option<(usize, Vec<OcpBenchmarkPreset>, usize, Vec<OcpBenchmarkPreset>)> {
+    let values = state
+        .case_cells
+        .iter()
+        .filter(|cell| {
+            cell.case.problem_id == problem_id
+                && cell.case.transcription == transcription
+                && preset_applies_to_transcription(cell.case.preset, transcription)
+        })
+        .filter_map(|cell| size_metric_value(cell, metric).map(|value| (cell.case.preset, value)))
+        .collect::<Vec<_>>();
+    let min_value = values.iter().map(|(_, value)| *value).min()?;
+    let max_value = values.iter().map(|(_, value)| *value).max()?;
+    let min_offenders = values
+        .iter()
+        .filter_map(|(preset, value)| (*value == min_value).then_some(*preset))
+        .collect::<Vec<_>>();
+    let max_offenders = values
+        .into_iter()
+        .filter_map(|(preset, value)| (value == max_value).then_some(preset))
+        .collect::<Vec<_>>();
+    Some((min_value, min_offenders, max_value, max_offenders))
+}
+
+fn size_metric_style(
+    state: &ProgressState,
+    problem_id: ProblemId,
+    transcription: TranscriptionMethod,
+    metric: SizeMetric,
+) -> Style {
+    let values = size_metric_distinct_values(state, problem_id, transcription, metric);
+    let Some(min_value) = values.first().copied() else {
+        return Style::default().fg(Color::DarkGray);
+    };
+    let max_value = *values.last().expect("non-empty values has last");
+    if min_value == max_value {
+        return Style::default().fg(Color::White);
+    }
+    if max_value >= min_value.saturating_mul(10) {
+        Style::default().fg(Color::White).bg(Color::Red)
+    } else {
+        Style::default().fg(Color::Yellow)
+    }
+}
+
+fn size_case_has_large_spread(
+    state: &ProgressState,
+    problem_id: ProblemId,
+    transcription: TranscriptionMethod,
+) -> bool {
+    [SizeMetric::RootInstructions, SizeMetric::TotalInstructions]
+        .into_iter()
+        .any(|metric| {
+            let values = size_metric_distinct_values(state, problem_id, transcription, metric);
+            match (values.first(), values.last()) {
+                (Some(min), Some(max)) => *max >= min.saturating_mul(10) && max != min,
+                _ => false,
+            }
+        })
+}
+
+fn summarize_offending_presets(state: &ProgressState, presets: &[OcpBenchmarkPreset]) -> String {
+    let mut labels = state
+        .presets
+        .iter()
+        .copied()
+        .filter(|preset| presets.contains(preset))
+        .map(preset_display_name)
+        .collect::<Vec<_>>();
+    if labels.is_empty() {
+        labels = presets.iter().copied().map(preset_display_name).collect();
+    }
+    labels.join(", ")
 }
 
 fn nnz_metric_distinct_values(
@@ -2089,13 +2671,30 @@ fn summarize_distinct_nnz(values: &[usize]) -> String {
     match values {
         [] => "--".to_string(),
         [value] => compact_nnz(*value),
-        [lhs, rhs] => format!("{}/{}", compact_nnz(*lhs), compact_nnz(*rhs)),
+        [lhs, rhs] => format!("{}, {}", compact_nnz(*lhs), compact_nnz(*rhs)),
         values => format!(
             "{}..{} ({})",
             compact_nnz(*values.first().unwrap()),
             compact_nnz(*values.last().unwrap()),
             values.len()
         ),
+    }
+}
+
+fn summarize_size_spread(values: &[usize]) -> String {
+    match values {
+        [] => "--".to_string(),
+        [value] => compact_count(*value),
+        values => {
+            let min = *values.first().unwrap();
+            let max = *values.last().unwrap();
+            format!(
+                "{}->{} ({})",
+                compact_count(min),
+                compact_count(max),
+                format_ratio(max, min)
+            )
+        }
     }
 }
 
@@ -2110,17 +2709,34 @@ fn winner_metric_label(metric: WinnerMetric) -> &'static str {
 
 fn winner_case_label(cell: &CaseCell) -> String {
     format!(
-        "{}/{}/{}",
+        "{}/{}",
         short_problem_label(cell.case.problem_id),
-        short_transcription_label(cell.case.transcription),
         preset_display_name(cell.case.preset),
     )
 }
 
-fn best_case_for_metric(state: &ProgressState, metric: WinnerMetric) -> Option<&CaseCell> {
+fn preset_applies_to_transcription(
+    preset: OcpBenchmarkPreset,
+    transcription: TranscriptionMethod,
+) -> bool {
+    match preset {
+        OcpBenchmarkPreset::BaselineWithMsIntegrator => {
+            matches!(transcription, TranscriptionMethod::MultipleShooting)
+        }
+        _ => true,
+    }
+}
+
+fn best_case_for_metric(
+    state: &ProgressState,
+    transcription: TranscriptionMethod,
+    metric: WinnerMetric,
+) -> Option<&CaseCell> {
     state
         .case_cells
         .iter()
+        .filter(|cell| cell.case.transcription == transcription)
+        .filter(|cell| preset_applies_to_transcription(cell.case.preset, transcription))
         .filter_map(|cell| winner_metric_value(cell, metric).map(|value| (cell, value)))
         .min_by(|lhs, rhs| {
             lhs.1
@@ -2130,15 +2746,25 @@ fn best_case_for_metric(state: &ProgressState, metric: WinnerMetric) -> Option<&
         .map(|(cell, _)| cell)
 }
 
-fn winner_metric_style(state: &ProgressState, metric: WinnerMetric, value: Option<f64>) -> Style {
+fn winner_metric_style(
+    state: &ProgressState,
+    transcription: TranscriptionMethod,
+    metric: WinnerMetric,
+    value: Option<f64>,
+) -> Style {
     let Some(value) = value else {
         return Style::default().fg(Color::DarkGray);
     };
     let values = state
         .case_cells
         .iter()
+        .filter(|cell| cell.case.transcription == transcription)
+        .filter(|cell| preset_applies_to_transcription(cell.case.preset, transcription))
         .filter_map(|cell| winner_metric_value(cell, metric))
         .collect::<Vec<_>>();
+    if values.is_empty() {
+        return Style::default().fg(Color::DarkGray);
+    }
     let Some(best) = values
         .iter()
         .copied()
@@ -2388,11 +3014,15 @@ fn stage_cell_widget(stage: &StageCell, is_best: bool) -> (String, Style) {
     }
 }
 
-fn timing_cell_widget(stage: MatrixStage, cell: &CaseCell) -> (String, Style) {
+fn timing_cell_widget(
+    stage: MatrixStage,
+    cell: &CaseCell,
+    state: &ProgressState,
+) -> (String, Style) {
     match timing_metric_value(cell, stage) {
         Some(value) => (
             compact_cell_seconds(value),
-            timing_metric_style(cell, stage, value),
+            timing_metric_style(state, cell, stage, value),
         ),
         None => match stage_cell(cell, stage) {
             StageCell::Skipped => ("--".to_string(), Style::default().fg(Color::DarkGray)),
@@ -2401,15 +3031,19 @@ fn timing_cell_widget(stage: MatrixStage, cell: &CaseCell) -> (String, Style) {
     }
 }
 
-fn timing_metric_style(cell: &CaseCell, stage: MatrixStage, value: f64) -> Style {
+fn timing_metric_style(
+    state: &ProgressState,
+    cell: &CaseCell,
+    stage: MatrixStage,
+    value: f64,
+) -> Style {
     let group = matrix_stage_heatmap_group(stage);
-    if !timing_heatmap_group_complete(cell, group) {
+    let values = timing_heatmap_values(state, cell.case.problem_id, cell.case.transcription, group);
+    if values.len() < 2 {
         return Style::default()
             .fg(Color::White)
             .add_modifier(Modifier::BOLD);
     }
-
-    let values = timing_heatmap_values(cell, group);
     let Some(best) = values
         .iter()
         .copied()
@@ -2466,6 +3100,31 @@ fn nnz_metric_value(cell: &CaseCell, metric: NnzMetric) -> Option<usize> {
     }
 }
 
+fn size_metric_value(cell: &CaseCell, metric: SizeMetric) -> Option<usize> {
+    match metric {
+        SizeMetric::RootInstructions => cell.llvm_root_instruction_count,
+        SizeMetric::TotalInstructions => cell.llvm_total_instruction_count,
+    }
+}
+
+fn compact_count(value: usize) -> String {
+    compact_nnz(value)
+}
+
+fn format_ratio(max: usize, min: usize) -> String {
+    if min == 0 {
+        return "infx".to_string();
+    }
+    let ratio = max as f64 / min as f64;
+    if ratio >= 100.0 {
+        format!("{ratio:.0}x")
+    } else if ratio >= 10.0 {
+        format!("{ratio:.1}x")
+    } else {
+        format!("{ratio:.2}x")
+    }
+}
+
 fn compact_nnz(value: usize) -> String {
     if value >= 10_000 {
         format!("{}k", value / 1_000)
@@ -2512,29 +3171,27 @@ fn matrix_stage_heatmap_group(stage: MatrixStage) -> MatrixHeatmapGroup {
     }
 }
 
-fn timing_heatmap_values(cell: &CaseCell, group: MatrixHeatmapGroup) -> Vec<f64> {
-    matrix_rows()
+fn timing_heatmap_values(
+    state: &ProgressState,
+    problem_id: ProblemId,
+    transcription: TranscriptionMethod,
+    group: MatrixHeatmapGroup,
+) -> Vec<f64> {
+    state
+        .case_cells
         .iter()
-        .filter_map(|row| match row {
-            MatrixRow::Time(stage) if matrix_stage_heatmap_group(*stage) == group => {
-                timing_metric_value(cell, *stage)
-            }
-            _ => None,
+        .filter(|cell| {
+            cell.case.problem_id == problem_id && cell.case.transcription == transcription
+        })
+        .flat_map(|cell| {
+            matrix_rows().iter().filter_map(move |row| match row {
+                MatrixRow::Time(stage) if matrix_stage_heatmap_group(*stage) == group => {
+                    timing_metric_value(cell, *stage)
+                }
+                _ => None,
+            })
         })
         .collect()
-}
-
-fn timing_heatmap_group_complete(cell: &CaseCell, group: MatrixHeatmapGroup) -> bool {
-    matrix_rows()
-        .iter()
-        .filter_map(|row| match row {
-            MatrixRow::Time(stage) if matrix_stage_heatmap_group(*stage) == group => Some(*stage),
-            _ => None,
-        })
-        .all(|stage| match stage_cell(cell, stage) {
-            StageCell::Done(_) | StageCell::Skipped => true,
-            StageCell::Pending | StageCell::Running(_) => false,
-        })
 }
 
 fn heatmap_color(normalized: f64) -> Color {
@@ -2779,6 +3436,8 @@ fn update_case_started(state: &mut ProgressState, case: OcpBenchmarkCase) {
         cell.gradient_nnz = None;
         cell.jacobian_nnz = None;
         cell.hessian_nnz = None;
+        cell.llvm_root_instruction_count = None;
+        cell.llvm_total_instruction_count = None;
         cell.eval_samples = 0;
         cell.sanity = SanityStatus::Ok;
         cell.warnings = 0;
@@ -3009,6 +3668,8 @@ fn update_case_finished(state: &mut ProgressState, record: &OcpBenchmarkRecord) 
         cell.jacobian_nnz =
             Some(record.nlp.equality_jacobian_nnz + record.nlp.inequality_jacobian_nnz);
         cell.hessian_nnz = Some(record.nlp.hessian_nnz);
+        cell.llvm_root_instruction_count = Some(record.compile.llvm_root_instructions_emitted);
+        cell.llvm_total_instruction_count = Some(record.compile.llvm_total_instructions_emitted);
         cell.eval_samples = record.eval.objective_value.iterations;
         cell.sanity = benchmark_sanity(record);
         cell.warnings = record.compile.warnings.len();

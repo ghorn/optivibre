@@ -1475,6 +1475,7 @@ fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sx_codegen_llvm::{AotWrapperOptions, generate_aot_wrapper_module};
 
     #[test]
     fn sailboat_initial_guess_is_symmetric() {
@@ -1554,11 +1555,12 @@ mod tests {
     #[ignore = "manual profiling helper"]
     fn profile_direct_collocation_symbolic_setup() {
         let family = Params::default().transcription.collocation_family;
-        let ocp = model(
-            optimal_control::DirectCollocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE> {
-                family,
-            },
-        );
+        let ocp = model(optimal_control::DirectCollocation::<
+            DEFAULT_INTERVALS,
+            DEFAULT_COLLOCATION_DEGREE,
+        > {
+            family,
+        });
         let started = std::time::Instant::now();
         let compiled = ocp
             .compile_jit_with_ocp_options(optimal_control::OcpCompileOptions {
@@ -1574,5 +1576,59 @@ mod tests {
             compiled.backend_compile_report().setup_profile,
             compiled.backend_compile_report().stats,
         );
+    }
+
+    #[test]
+    #[ignore = "manual debug helper"]
+    fn dump_multiple_shooting_inline_all_hessian_wrapper() {
+        let ocp = model(MultipleShooting::<DEFAULT_INTERVALS, RK4_SUBSTEPS>);
+        let compiled = ocp
+            .compile_jit_with_ocp_options(optimal_control::OcpCompileOptions {
+                function_options: optimization::FunctionCompileOptions::from(
+                    optimization::LlvmOptimizationLevel::O0,
+                ),
+                symbolic_functions: optimal_control::OcpSymbolicFunctionOptions::inline_all(),
+            })
+            .expect("compile should succeed");
+        let lowered = compiled.debug_lagrangian_hessian_lowered();
+        let wrapper = generate_aot_wrapper_module(
+            lowered,
+            &AotWrapperOptions {
+                emit_doc_comments: false,
+            },
+        )
+        .expect("wrapper generation should succeed");
+        let out_path =
+            std::path::PathBuf::from("target/sailboat_ms_inline_all_lagrangian_hessian_wrapper.rs");
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent).expect("target directory should exist");
+        }
+        std::fs::write(&out_path, wrapper).expect("wrapper write should succeed");
+        println!("wrote {}", out_path.display());
+        println!(
+            "outputs: {:?}",
+            lowered
+                .outputs
+                .iter()
+                .map(|slot| {
+                    (
+                        slot.name.as_str(),
+                        slot.ccs.nrow(),
+                        slot.ccs.ncol(),
+                        slot.ccs.nnz(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "output_value_lens: {:?}",
+            lowered
+                .output_values
+                .iter()
+                .map(std::vec::Vec::len)
+                .collect::<Vec<_>>()
+        );
+        println!("instructions: {}", lowered.instructions.len());
+        println!("subfunctions: {}", lowered.subfunctions.len());
     }
 }

@@ -1855,6 +1855,8 @@ fn render_shape_breakdown(record: &OcpBenchmarkRecord) -> String {
            <li><span>nlp kernels</span><span>{}</span></li>\
            <li><span>helper kernels</span><span>{}</span></li>\
            <li><span>call sites</span><span>{}</span></li>\
+           <li><span>root inst.</span><span>{}</span></li>\
+           <li><span>total inst.</span><span>{}</span></li>\
            <li><span>llvm subfunctions</span><span>{}</span></li>\
            <li><span>llvm call inst.</span><span>{}</span></li>\
          </ul>",
@@ -1869,6 +1871,8 @@ fn render_shape_breakdown(record: &OcpBenchmarkRecord) -> String {
         record.nlp.nlp_kernel_count,
         record.nlp.helper_kernel_count,
         record.compile.call_site_count,
+        record.compile.llvm_root_instructions_emitted,
+        record.compile.llvm_total_instructions_emitted,
         record.compile.llvm_subfunctions_emitted,
         record.compile.llvm_call_instructions_emitted,
     )
@@ -2117,10 +2121,7 @@ mod tests {
                 TranscriptionMethod::MultipleShooting,
                 TranscriptionMethod::DirectCollocation,
             ],
-            presets: vec![
-                OcpBenchmarkPreset::Baseline,
-                OcpBenchmarkPreset::InlineAll,
-            ],
+            presets: vec![OcpBenchmarkPreset::Baseline, OcpBenchmarkPreset::InlineAll],
             eval_options: NlpEvaluationBenchmarkOptions {
                 warmup_iterations: 0,
                 measured_iterations: 1,
@@ -2131,13 +2132,7 @@ mod tests {
         let cases = build_benchmark_cases(&config);
         let actual = cases
             .iter()
-            .map(|case| {
-                (
-                    case.problem_id,
-                    case.transcription,
-                    case.preset,
-                )
-            })
+            .map(|case| (case.problem_id, case.transcription, case.preset))
             .collect::<Vec<_>>();
         let expected = vec![
             (

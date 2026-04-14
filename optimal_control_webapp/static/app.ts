@@ -521,6 +521,7 @@ interface WireSolveProgress extends Omit<SolveProgress, "phase"> {
 interface SolverPhaseDetail {
   label: string;
   value: string;
+  count: number;
 }
 
 interface SolverPhaseDetails {
@@ -541,6 +542,7 @@ interface SolverReport {
   phase_details: SolverPhaseDetails;
   failure_message?: string;
 }
+
 
 interface WireSolverReport extends Omit<SolverReport, "status_kind"> {
   status_kind: string | number;
@@ -1214,6 +1216,7 @@ function readSolverPhaseDetail(value: JsonValue | undefined, context: string): S
   return {
     label: readJsonString(readJsonValueAt(object, "label"), `${context}.label`),
     value: readJsonString(readJsonValueAt(object, "value"), `${context}.value`),
+    count: readJsonNumber(readJsonValueAt(object, "count"), `${context}.count`),
   };
 }
 
@@ -1791,7 +1794,10 @@ function buildFailureSolverReport(message: string): SolverReport {
   const liveSolver = state.liveSolver;
   return {
     completed: true,
-    status_label: "Failed",
+    status_label:
+      liveSolver?.completed && liveSolver.status_kind === SOLVER_STATUS_KIND.error
+        ? liveSolver.status_label
+        : "Failed",
     status_kind: SOLVER_STATUS_KIND.error,
     iterations: state.latestProgress?.iteration ?? null,
     symbolic_setup_s: liveSolver?.symbolic_setup_s ?? null,
@@ -2877,7 +2883,7 @@ function updateScenePlot(view: SceneView): void {
     responsive: true,
     displaylogo: false,
     displayModeBar: "hover",
-    scrollZoom: true,
+    scrollZoom: false,
     modeBarButtonsToRemove: ["select2d", "lasso2d", "autoScale2d", "toImage"],
   };
   window.Plotly.react(view.plotEl, data, layout, config);
@@ -3129,6 +3135,111 @@ function createSolverSummaryChip(item: SolveSummaryItem): HTMLElement {
   return chip;
 }
 
+function parseDurationLabelToMs(value: string): number | null {
+  const match = value.trim().match(/^([0-9]+(?:\.[0-9]+)?)\s*(us|ms|s)$/i);
+  if (!match) {
+    return null;
+  }
+  const numeric = Number(match[1]);
+  if (!Number.isFinite(numeric)) {
+    return null;
+  }
+  switch ((match[2] ?? "").toLowerCase()) {
+    case "us":
+      return numeric / 1000;
+    case "ms":
+      return numeric;
+    case "s":
+      return numeric * 1000;
+    default:
+      return null;
+  }
+}
+
+function colorizeSolveProfilingTime(
+  value: string,
+  durationMs: number | null,
+  bestMs: number | null,
+  worstMs: number | null,
+): string {
+  if (durationMs == null || bestMs == null || worstMs == null) {
+    return value;
+  }
+  if (Math.abs(worstMs - bestMs) < 1e-12) {
+    return `\u001b[33m${value}\u001b[39m`;
+  }
+  if (Math.abs(durationMs - bestMs) < 1e-12) {
+    return `\u001b[32m${value}\u001b[39m`;
+  }
+  if (Math.abs(durationMs - worstMs) < 1e-12) {
+    return `\u001b[31m${value}\u001b[39m`;
+  }
+  return `\u001b[33m${value}\u001b[39m`;
+}
+
+function formatDurationFromMs(milliseconds: number | null | undefined): string {
+  if (milliseconds == null || !Number.isFinite(milliseconds)) {
+    return "--";
+  }
+  return formatDuration(milliseconds / 1000);
+}
+
+function appendSolveProfilingLog(details: SolverPhaseDetail[]): void {
+  if (details.length === 0) {
+    return;
+  }
+  const parsed = details.map((detail) => ({
+    label: detail.label,
+    value: detail.value,
+    count: detail.count,
+    durationMs: parseDurationLabelToMs(detail.value),
+  }));
+  const finiteDurations = parsed
+    .map((detail) => detail.durationMs)
+    .filter((value): value is number => value != null && Number.isFinite(value));
+  const bestMs =
+    finiteDurations.length > 0 ? finiteDurations.reduce((best, value) => Math.min(best, value)) : null;
+  const worstMs =
+    finiteDurations.length > 0 ? finiteDurations.reduce((worst, value) => Math.max(worst, value)) : null;
+  const timeWidth = parsed.reduce((width, detail) => Math.max(width, detail.value.length), 0);
+  const labelWidth = parsed.reduce((width, detail) => Math.max(width, detail.label.length), 0);
+  const countWidth = parsed.reduce((width, detail) => {
+    return Math.max(width, String(detail.count).length);
+  }, 0);
+  const avgWidth = parsed.reduce((width, detail) => {
+    const avgText =
+      detail.count > 0 && detail.durationMs != null
+        ? formatDurationFromMs(detail.durationMs / detail.count)
+        : "--";
+    return Math.max(width, avgText.length);
+  }, 0);
+  appendLogLine("solve profiling:", LOG_LEVEL.console);
+  for (const detail of parsed) {
+    const paddedTime = detail.value.padStart(timeWidth, " ");
+    const paddedLabel = detail.label.padEnd(labelWidth, " ");
+    const coloredTime = colorizeSolveProfilingTime(paddedTime, detail.durationMs, bestMs, worstMs);
+    const countText = String(detail.count).padStart(countWidth, " ");
+    const avgText =
+      (
+        detail.count > 0 && detail.durationMs != null
+          ? formatDurationFromMs(detail.durationMs / detail.count)
+          : "--"
+      ).padStart(avgWidth, " ");
+    appendLogLine(
+      `  ${coloredTime}  ${paddedLabel}  n=${countText}  avg=${avgText}`,
+      LOG_LEVEL.console,
+    );
+  }
+}
+
+function solverPhaseDetailValue(
+  solver: SolverReport | null | undefined,
+  label: string,
+): string | null {
+  const detail = solver?.phase_details.solve.find((entry) => entry.label === label);
+  return detail?.value ?? null;
+}
+
 function solveSummaryItems(
   progress: SolveProgress | null,
   solver: SolverReport | null,
@@ -3162,6 +3273,22 @@ function solveSummaryItems(
     const tfMetric = findMetric(state.artifact, METRIC_KEY.finalTime);
     if (tfMetric) {
       items.push({ label: "T", value: tfMetric.value });
+    }
+  }
+
+  if (solver?.status_kind === SOLVER_STATUS_KIND.error) {
+    const detailPairs: Array<[string, string]> = [
+      ["Grad", "Gradient"],
+      ["Eq Jac", "Equality Jacobian"],
+      ["Ineq Jac", "Inequality Jacobian"],
+      ["Hess", "Hessian"],
+      ["Linear", "Linear Solve"],
+    ];
+    for (const [chipLabel, detailLabel] of detailPairs) {
+      const value = solverPhaseDetailValue(solver, detailLabel);
+      if (value) {
+        items.push({ label: chipLabel, value });
+      }
     }
   }
 
@@ -3300,6 +3427,13 @@ function renderSolverPhaseSummary(solver: SolverReport): HTMLElement {
       active: activeStage === SOLVE_STAGE.jitCompilation,
       details: solver.phase_details.jit,
       fallbackText: "Compiling numeric evaluation kernels.",
+    }),
+    createSolverPhaseCard({
+      label: "Solve",
+      value: formatDuration(solver.solve_s ?? null),
+      active: activeStage === SOLVE_STAGE.solving,
+      details: solver.phase_details.solve,
+      fallbackText: "Running optimization iterations.",
     }),
   );
   return grid;
@@ -3816,6 +3950,7 @@ function applySolveFailure(message: string): void {
   renderMetrics();
   renderCompileCacheStatus();
   void refreshCompileCacheStatus();
+  appendSolveProfilingLog(state.terminalSolver.phase_details.solve);
   appendLogLine(`error: ${message}`, LOG_LEVEL.error);
   setStatusDisplay(statusDisplayForSolverReport(state.terminalSolver));
 }

@@ -12,7 +12,7 @@ mod symbolic_eval;
 
 use symbolic_eval::eval;
 
-fn eval_matrix(matrix: &SXMatrix, vars: &HashMap<u32, f64>) -> Vec<Vec<f64>> {
+fn eval_matrix(matrix: &SXMatrix, vars: &HashMap<u64, f64>) -> Vec<Vec<f64>> {
     let (nrow, ncol) = matrix.shape();
     let mut dense = vec![vec![0.0; ncol]; nrow];
     for col in 0..ncol {
@@ -162,7 +162,7 @@ fn assert_dense_matrix_close_with_epsilon(
     }
 }
 
-fn dense_matrix_bindings(matrix: &SXMatrix, values: &[Vec<f64>]) -> HashMap<u32, f64> {
+fn dense_matrix_bindings(matrix: &SXMatrix, values: &[Vec<f64>]) -> HashMap<u64, f64> {
     let (nrow, ncol) = matrix.shape();
     let mut bindings = HashMap::new();
     for col in 0..ncol {
@@ -645,7 +645,7 @@ fn expand_slot_jacobian(
     output: &SXMatrix,
     input: &SXMatrix,
     jacobian: &SXMatrix,
-    vars: &HashMap<u32, f64>,
+    vars: &HashMap<u64, f64>,
 ) -> Vec<Vec<f64>> {
     let (out_rows, out_cols) = output.shape();
     let (in_rows, in_cols) = input.shape();
@@ -1592,7 +1592,7 @@ fn assert_simplifies_to_identity(
     build: &(dyn Fn(SX, SX) -> SX + Send + Sync),
     x: SX,
     same_named_y: SX,
-    bindings: &HashMap<u32, f64>,
+    bindings: &HashMap<u64, f64>,
 ) {
     let expr = build(x, same_named_y);
     assert_abs_diff_eq!(eval(expr, bindings), 0.3, epsilon = 1e-10);

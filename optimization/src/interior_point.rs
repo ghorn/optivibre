@@ -108,6 +108,7 @@ pub struct InteriorPointProfiling {
     #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
     pub linear_solve_time: Duration,
     pub adapter_timing: Option<SolverAdapterTiming>,
+    pub preprocessing_steps: Index,
     #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
     pub preprocessing_time: Duration,
     #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
@@ -223,7 +224,10 @@ pub enum InteriorPointSolveError {
     #[error("invalid NLIP input: {0}")]
     InvalidInput(String),
     #[error("NLIP linear solve failed using {solver:?}")]
-    LinearSolve { solver: InteriorPointLinearSolver },
+    LinearSolve {
+        solver: InteriorPointLinearSolver,
+        profiling: Box<InteriorPointProfiling>,
+    },
     #[error(
         "NLIP line search failed (residual merit {merit}, mu {mu}, step inf-norm {step_inf_norm})"
     )]
@@ -231,9 +235,13 @@ pub enum InteriorPointSolveError {
         merit: f64,
         mu: f64,
         step_inf_norm: f64,
+        profiling: Box<InteriorPointProfiling>,
     },
     #[error("NLIP failed to converge in {iterations} iterations")]
-    MaxIterations { iterations: Index },
+    MaxIterations {
+        iterations: Index,
+        profiling: Box<InteriorPointProfiling>,
+    },
 }
 
 struct NewtonDirection {
@@ -672,7 +680,54 @@ fn solve_symmetric_system(
             }
         }
     };
-    result.ok_or(InteriorPointSolveError::LinearSolve { solver })
+    result.ok_or_else(|| InteriorPointSolveError::LinearSolve {
+        solver,
+        profiling: Box::new(InteriorPointProfiling::default()),
+    })
+}
+
+fn finalised_interior_point_failure_profiling(
+    profiling: &InteriorPointProfiling,
+    solve_started: Instant,
+) -> Box<InteriorPointProfiling> {
+    let mut profiling = profiling.clone();
+    finalise_interior_point_profiling(&mut profiling, solve_started);
+    Box::new(profiling)
+}
+
+fn with_interior_point_failure_profiling(
+    error: InteriorPointSolveError,
+    profiling: &InteriorPointProfiling,
+    solve_started: Instant,
+) -> InteriorPointSolveError {
+    match error {
+        InteriorPointSolveError::LinearSolve { solver, .. } => {
+            InteriorPointSolveError::LinearSolve {
+                solver,
+                profiling: finalised_interior_point_failure_profiling(profiling, solve_started),
+            }
+        }
+        InteriorPointSolveError::LineSearchFailed {
+            merit,
+            mu,
+            step_inf_norm,
+            ..
+        } => InteriorPointSolveError::LineSearchFailed {
+            merit,
+            mu,
+            step_inf_norm,
+            profiling: finalised_interior_point_failure_profiling(profiling, solve_started),
+        },
+        InteriorPointSolveError::MaxIterations { iterations, .. } => {
+            InteriorPointSolveError::MaxIterations {
+                iterations,
+                profiling: finalised_interior_point_failure_profiling(profiling, solve_started),
+            }
+        }
+        InteriorPointSolveError::InvalidInput(message) => {
+            InteriorPointSolveError::InvalidInput(message)
+        }
+    }
 }
 
 fn refine_multipliers_on_active_set(
@@ -1516,6 +1571,7 @@ where
         .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
     validate_parameter_inputs(problem, parameters)
         .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
+    profiling.preprocessing_steps += 1;
     profiling.preprocessing_time += validation_started.elapsed();
 
     let n = problem.dimension();
@@ -1551,6 +1607,7 @@ where
         &mut profiling,
         &mut setup_callback_time,
     );
+    profiling.preprocessing_steps += 1;
     profiling.preprocessing_time += setup_started.elapsed().saturating_sub(setup_callback_time);
     initialise_slack_and_multipliers(
         &initial_state.augmented_inequality_values,
@@ -1643,6 +1700,7 @@ where
         }
         return Err(InteriorPointSolveError::MaxIterations {
             iterations: options.max_iters,
+            profiling: finalised_interior_point_failure_profiling(&profiling, solve_started),
         });
     }
 
@@ -1904,6 +1962,7 @@ where
                         lower_bound_count,
                     );
                     nonlinear_inequality_multipliers = nonlinear;
+                    profiling.preprocessing_steps += 1;
                     profiling.preprocessing_time += iteration_started.elapsed().saturating_sub(
                         iteration_callback_time
                             + iteration_kkt_assembly_time
@@ -1995,7 +2054,8 @@ where
             r_cent: &r_cent,
             solver: options.linear_solver,
             regularization: options.regularization,
-        })?;
+        })
+        .map_err(|error| with_interior_point_failure_profiling(error, &profiling, solve_started))?;
         last_linear_solver = direction.solver_used;
         let linear_elapsed = linear_started.elapsed();
         profiling.linear_solves += 1;
@@ -2024,6 +2084,7 @@ where
                 ),
                 mu,
                 step_inf_norm: step_inf_norm(&direction.dx),
+                profiling: finalised_interior_point_failure_profiling(&profiling, solve_started),
             });
         }
 
@@ -2137,6 +2198,7 @@ where
                 merit: current_merit,
                 mu,
                 step_inf_norm: step_inf_norm(&direction.dx),
+                profiling: finalised_interior_point_failure_profiling(&profiling, solve_started),
             });
         };
 
@@ -2239,6 +2301,7 @@ where
             events,
         });
 
+        profiling.preprocessing_steps += 1;
         profiling.preprocessing_time += iteration_started.elapsed().saturating_sub(
             iteration_callback_time + iteration_kkt_assembly_time + iteration_linear_solve_time,
         );
@@ -2253,5 +2316,6 @@ where
 
     Err(InteriorPointSolveError::MaxIterations {
         iterations: options.max_iters,
+        profiling: finalised_interior_point_failure_profiling(&profiling, solve_started),
     })
 }

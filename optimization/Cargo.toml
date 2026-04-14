@@ -24,6 +24,7 @@ libc.workspace = true
 nalgebra.workspace = true
 optimization_derive = { path = "../optimization_derive" }
 serde = { workspace = true, optional = true }
+sx_codegen = { path = "../sx_codegen" }
 sx_codegen_llvm = { path = "../sx_codegen_llvm" }
 sx_core = { path = "../sx_core" }
 thiserror.workspace = true

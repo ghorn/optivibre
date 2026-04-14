@@ -863,7 +863,7 @@ fn metrics_from_nlip_summary(summary: &InteriorPointSummary) -> SolverMetrics {
 
 fn metrics_from_ip_error(error: &InteriorPointSolveError) -> SolverMetrics {
     match error {
-        InteriorPointSolveError::MaxIterations { iterations } => SolverMetrics {
+        InteriorPointSolveError::MaxIterations { iterations, .. } => SolverMetrics {
             iterations: Some(*iterations),
             ..SolverMetrics::default()
         },

@@ -5,7 +5,7 @@ use crate::ccs::CCS;
 use crate::error::{Result, SxError};
 use crate::sx::{
     JacobianStructure, SX, forward_directional, forward_directional_basis_batch,
-    jacobian_structure, reverse_directional, reverse_directional_batch,
+    jacobian_structure, reverse_directional, reverse_directional_batch, scalar_hessian_basis_batch,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -90,6 +90,7 @@ impl SXMatrix {
     }
 
     fn hessian_lower_triangle_program(&self, wrt: &SXMatrix) -> Result<SXMatrix> {
+        let expr = self.scalar_expr()?;
         let grad = self.gradient(wrt)?;
         let n = wrt.nnz();
         let full_ccs = grad.jacobian_ccs(wrt)?;
@@ -119,31 +120,12 @@ impl SXMatrix {
 
         let mut columns = vec![Vec::new(); n];
         for group_batch in color_columns.chunks(JACOBIAN_BATCH_WIDTH) {
-            let selected_rows = group_batch
-                .iter()
-                .flat_map(|group| group.iter().copied())
-                .flat_map(|col| row_sets[col].iter().copied())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>();
-            let selected_outputs = selected_rows
-                .iter()
-                .map(|&row| grad.nonzeros[row])
-                .collect::<Vec<_>>();
-            let selected_row_pos = selected_rows
-                .iter()
-                .copied()
-                .enumerate()
-                .map(|(pos, row)| (row, pos))
-                .collect::<HashMap<_, _>>();
-            let sensitivities =
-                forward_directional_basis_batch(&selected_outputs, &wrt.nonzeros, group_batch)?;
+            let sensitivities = scalar_hessian_basis_batch(expr, &wrt.nonzeros, group_batch)?;
             for (direction, group) in group_batch.iter().enumerate() {
                 let sens = &sensitivities[direction];
                 for &col in group {
                     for &row in &row_sets[col] {
-                        let row_pos = selected_row_pos[&row];
-                        columns[col].push((row, sens[row_pos]));
+                        columns[col].push((row, sens[row]));
                     }
                 }
             }
@@ -162,7 +144,6 @@ impl SXMatrix {
     fn hessian_lower_triangle_colored(&self, wrt: &SXMatrix) -> Result<SXMatrix> {
         self.hessian_lower_triangle_program(wrt)
     }
-
 
     pub fn new(ccs: CCS, nonzeros: Vec<SX>) -> Result<Self> {
         if ccs.nnz() != nonzeros.len() {

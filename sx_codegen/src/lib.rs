@@ -5,8 +5,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Result, anyhow, bail};
 use sx_core::{
     BinaryOp, CCS, CallPolicy, CallPolicyConfig, CompileStats, CompileWarning, Index, InlineStage,
-    NodeView, SX, SXFunction, SXMatrix, UnaryOp, lookup_function_ref,
-    rewrite_function_for_stage,
+    NodeView, SX, SXFunction, SXMatrix, UnaryOp, lookup_function_ref, rewrite_function_for_stage,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -304,11 +303,9 @@ impl CallableLoweringState<'_> {
                     });
                     self.call_outputs.insert(key, temps.clone());
                     self.stats.llvm_call_instructions_emitted += 1;
-                    ValueRef::Temp(temps[call_output_linear_index(
-                        &callee,
-                        output_slot,
-                        output_offset,
-                    )])
+                    ValueRef::Temp(
+                        temps[call_output_linear_index(&callee, output_slot, output_offset)],
+                    )
                 }
             }
         };
@@ -385,6 +382,13 @@ pub fn lower_function_with_policies(
         &mut stats,
         &mut warnings,
     )?;
+    stats.llvm_root_instructions_emitted = root.instructions.len();
+    stats.llvm_total_instructions_emitted = root.instructions.len()
+        + shared
+            .subfunctions
+            .iter()
+            .map(|subfunction| subfunction.instructions.len())
+            .sum::<usize>();
     Ok(LoweredFunction {
         name: root.name,
         inputs: root.inputs,

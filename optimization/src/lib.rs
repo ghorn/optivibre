@@ -334,13 +334,18 @@ pub struct ClarabelSqpProfiling {
     pub qp_setup_time: Duration,
     pub qp_solves: Index,
     pub qp_solve_time: Duration,
+    pub multiplier_estimations: Index,
     pub multiplier_estimation_time: Duration,
+    pub line_search_evaluations: Index,
     pub line_search_evaluation_time: Duration,
+    pub line_search_condition_checks: Index,
     pub line_search_condition_check_time: Duration,
+    pub convergence_checks: Index,
     pub convergence_check_time: Duration,
     pub elastic_recovery_activations: Index,
     pub elastic_recovery_qp_solves: Index,
     pub adapter_timing: Option<SqpAdapterTiming>,
+    pub preprocessing_steps: Index,
     #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
     pub preprocessing_time: Duration,
     #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
@@ -3278,6 +3283,7 @@ where
     validate_parameter_inputs(problem, parameters)
         .map_err(|err| ClarabelSqpError::InvalidInput(err.to_string()))?;
     validate_finite_inputs(x0, parameters)?;
+    profiling.preprocessing_steps += 1;
     profiling.preprocessing_time += validation_started.elapsed();
     let n = problem.dimension();
     if x0.len() != n {
@@ -3448,6 +3454,7 @@ where
             && dual_inf <= options.dual_tol
             && complementarity_inf <= options.complementarity_tol;
         let convergence_check_elapsed = convergence_check_started.elapsed();
+        profiling.convergence_checks += 1;
         iteration_convergence_check_time += convergence_check_elapsed;
         profiling.convergence_check_time += convergence_check_elapsed;
         let preprocess_duration = iteration_started
@@ -3505,6 +3512,7 @@ where
             });
         }
         if converged {
+            profiling.preprocessing_steps += 1;
             profiling.preprocessing_time += preprocess_duration;
             profiling.adapter_timing = problem.sqp_adapter_timing_snapshot();
             finalize_profiling(&mut profiling, solve_started);
@@ -3735,6 +3743,7 @@ where
             &candidate_all_inequality_multipliers,
         );
         let multiplier_estimation_elapsed = multiplier_estimation_started.elapsed();
+        profiling.multiplier_estimations += 1;
         iteration_multiplier_estimation_time += multiplier_estimation_elapsed;
         profiling.multiplier_estimation_time += multiplier_estimation_elapsed;
 
@@ -3743,6 +3752,7 @@ where
             && candidate_dual_inf <= options.dual_tol
             && candidate_complementarity_inf <= options.complementarity_tol;
         let convergence_check_elapsed = convergence_check_started.elapsed();
+        profiling.convergence_checks += 1;
         iteration_convergence_check_time += convergence_check_elapsed;
         profiling.convergence_check_time += convergence_check_elapsed;
 
@@ -3796,6 +3806,7 @@ where
             if options.verbose {
                 log_sqp_iteration(&post_convergence_state, options, &mut event_state);
             }
+            profiling.preprocessing_steps += 1;
             profiling.preprocessing_time += iteration_started.elapsed().saturating_sub(
                 iteration_callback_time + iteration_qp_setup_time + iteration_qp_solve_time,
             );
@@ -3972,6 +3983,7 @@ where
                     ),
                 })?;
             let line_search_eval_elapsed = line_search_eval_started.elapsed();
+            profiling.line_search_evaluations += 1;
             iteration_line_search_evaluation_time += line_search_eval_elapsed;
             profiling.line_search_evaluation_time += line_search_eval_elapsed;
 
@@ -3993,6 +4005,7 @@ where
             let violation_satisfied =
                 trial_eval.primal_inf <= primal_inf.max(options.constraint_tol);
             let line_search_check_elapsed = line_search_check_started.elapsed();
+            profiling.line_search_condition_checks += 1;
             iteration_line_search_condition_check_time += line_search_check_elapsed;
             profiling.line_search_condition_check_time += line_search_check_elapsed;
 
@@ -4049,6 +4062,7 @@ where
         };
         let accepted_primal_inf = accepted_eval.primal_inf;
 
+        profiling.preprocessing_steps += 1;
         profiling.preprocessing_time += iteration_started.elapsed().saturating_sub(
             iteration_callback_time + iteration_qp_setup_time + iteration_qp_solve_time,
         );
@@ -4255,6 +4269,7 @@ where
     if options.verbose {
         log_sqp_iteration(&final_snapshot, options, &mut event_state);
     }
+    profiling.preprocessing_steps += 1;
     profiling.preprocessing_time += iteration_started
         .elapsed()
         .saturating_sub(iteration_callback_time);

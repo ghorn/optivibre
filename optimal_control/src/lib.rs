@@ -2633,6 +2633,11 @@ where
         self.compiled.backend_compile_report()
     }
 
+    #[doc(hidden)]
+    pub fn debug_lagrangian_hessian_lowered(&self) -> &sx_codegen::LoweredFunction {
+        self.compiled.debug_lagrangian_hessian_lowered()
+    }
+
     pub fn benchmark_nlp_evaluations(
         &self,
         values: &MultipleShootingRuntimeValues<
@@ -3282,6 +3287,11 @@ where
 
     pub fn backend_compile_report(&self) -> &BackendCompileReport {
         self.compiled.backend_compile_report()
+    }
+
+    #[doc(hidden)]
+    pub fn debug_lagrangian_hessian_lowered(&self) -> &sx_codegen::LoweredFunction {
+        self.compiled.debug_lagrangian_hessian_lowered()
     }
 
     pub fn benchmark_nlp_evaluations(

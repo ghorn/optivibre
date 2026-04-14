@@ -22,15 +22,18 @@ use optimal_control::{
 #[cfg(feature = "ipopt")]
 use optimal_control::{DirectCollocationIpoptSnapshot, MultipleShootingIpoptSnapshot};
 use optimization::{
-    BackendCompileReport, BackendTimingMetadata, CallPolicy, CallPolicyConfig, ClarabelSqpOptions,
-    ClarabelSqpSummary, ConstraintSatisfaction, FunctionCompileOptions,
-    InteriorPointIterationSnapshot, InteriorPointOptions, InteriorPointSummary,
-    LlvmOptimizationLevel, NlpCompileStats, NlpEvaluationBenchmark, NlpEvaluationBenchmarkOptions,
+    BackendCompileReport, BackendTimingMetadata, CallPolicy, CallPolicyConfig, ClarabelSqpError,
+    ClarabelSqpOptions, ClarabelSqpProfiling, ClarabelSqpSummary, ConstraintSatisfaction,
+    FunctionCompileOptions, InteriorPointIterationSnapshot, InteriorPointOptions,
+    InteriorPointProfiling, InteriorPointSolveError, InteriorPointSummary, LlvmOptimizationLevel,
+    NlpCompileStats, NlpEvaluationBenchmark, NlpEvaluationBenchmarkOptions,
     NlpEvaluationKernelKind, SqpIterationEvent, SqpIterationPhase, SqpIterationSnapshot,
     SymbolicSetupProfile, Vectorize,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptOptions, IpoptRawStatus, IpoptSummary};
+#[cfg(feature = "ipopt")]
+use optimization::{IpoptProfiling, IpoptSolveError};
 use serde::{Deserialize, Serialize};
 use sx_core::SX;
 
@@ -600,6 +603,22 @@ where
     (*callback)(event);
 }
 
+fn emit_failure_status<F>(emit: &Arc<Mutex<F>>, solver_method: SolverMethod, solver: SolverReport)
+where
+    F: FnMut(SolveStreamEvent),
+{
+    emit_event(
+        emit,
+        SolveStreamEvent::Status {
+            status: SolveStatus {
+                stage: SolveStage::Solving,
+                solver_method: Some(solver_method),
+                solver,
+            },
+        },
+    );
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SqpConfig {
     pub max_iters: usize,
@@ -630,6 +649,7 @@ pub enum SolverStatusKind {
 pub struct SolverPhaseDetail {
     pub label: String,
     pub value: String,
+    pub count: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -690,6 +710,8 @@ pub struct CompileReportSummary {
     pub max_call_depth: usize,
     pub inlines_at_call: usize,
     pub inlines_at_lowering: usize,
+    pub llvm_root_instructions_emitted: usize,
+    pub llvm_total_instructions_emitted: usize,
     pub llvm_subfunctions_emitted: usize,
     pub llvm_call_instructions_emitted: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -774,6 +796,8 @@ pub fn summarize_backend_compile_report(report: &BackendCompileReport) -> Compil
         max_call_depth: report.stats.max_call_depth,
         inlines_at_call: report.stats.inlines_at_call,
         inlines_at_lowering: report.stats.inlines_at_lowering,
+        llvm_root_instructions_emitted: report.stats.llvm_root_instructions_emitted,
+        llvm_total_instructions_emitted: report.stats.llvm_total_instructions_emitted,
         llvm_subfunctions_emitted: report.stats.llvm_subfunctions_emitted,
         llvm_call_instructions_emitted: report.stats.llvm_call_instructions_emitted,
         warnings: report
@@ -1786,10 +1810,15 @@ where
     prewarm(&Params::from_map(values)?, emit)
 }
 
-fn phase_detail(label: impl Into<String>, value: impl Into<String>) -> SolverPhaseDetail {
+fn phase_detail(
+    label: impl Into<String>,
+    value: impl Into<String>,
+    count: usize,
+) -> SolverPhaseDetail {
     SolverPhaseDetail {
         label: label.into(),
         value: value.into(),
+        count,
     }
 }
 
@@ -1929,7 +1958,7 @@ fn upsert_phase_detail(
     if let Some(detail) = details.iter_mut().find(|detail| detail.label == label) {
         detail.value = value;
     } else {
-        details.push(phase_detail(label, value));
+        details.push(phase_detail(label, value, 0));
     }
 }
 
@@ -1952,48 +1981,54 @@ fn symbolic_phase_details(
 ) -> Vec<SolverPhaseDetail> {
     let total_jacobian_nnz = stats.equality_jacobian_nnz + stats.inequality_jacobian_nnz;
     let mut details = vec![
-        phase_detail("Vars", stats.variable_count.to_string()),
-        phase_detail("Params", stats.parameter_scalar_count.to_string()),
-        phase_detail("Eq", stats.equality_count.to_string()),
-        phase_detail("Ineq", stats.inequality_count.to_string()),
-        phase_detail("Jac NNZ", total_jacobian_nnz.to_string()),
-        phase_detail("Hess NNZ", stats.hessian_nnz.to_string()),
+        phase_detail("Vars", stats.variable_count.to_string(), 0),
+        phase_detail("Params", stats.parameter_scalar_count.to_string(), 0),
+        phase_detail("Eq", stats.equality_count.to_string(), 0),
+        phase_detail("Ineq", stats.inequality_count.to_string(), 0),
+        phase_detail("Jac NNZ", total_jacobian_nnz.to_string(), 0),
+        phase_detail("Hess NNZ", stats.hessian_nnz.to_string(), 0),
     ];
     if let Some(profile) = setup_profile {
         if let Some(duration) = profile.symbolic_construction {
             details.push(phase_detail(
                 "Build Problem",
                 format_phase_duration(duration),
+                0,
             ));
         }
         if let Some(duration) = profile.objective_gradient {
             details.push(phase_detail(
                 "Objective Gradient",
                 format_phase_duration(duration),
+                0,
             ));
         }
         if let Some(duration) = profile.equality_jacobian {
             details.push(phase_detail(
                 "Equality Jacobian",
                 format_phase_duration(duration),
+                0,
             ));
         }
         if let Some(duration) = profile.inequality_jacobian {
             details.push(phase_detail(
                 "Inequality Jacobian",
                 format_phase_duration(duration),
+                0,
             ));
         }
         if let Some(duration) = profile.lagrangian_assembly {
             details.push(phase_detail(
                 "Lagrangian Assembly",
                 format_phase_duration(duration),
+                0,
             ));
         }
         if let Some(duration) = profile.hessian_generation {
             details.push(phase_detail(
                 "Hessian Generation",
                 format_phase_duration(duration),
+                0,
             ));
         }
     }
@@ -2002,8 +2037,8 @@ fn symbolic_phase_details(
 
 fn jit_phase_details(stats: NlpCompileStats, helper_kernel_count: usize) -> Vec<SolverPhaseDetail> {
     vec![
-        phase_detail("NLP Kernels", stats.jit_kernel_count.to_string()),
-        phase_detail("Helper Kernels", helper_kernel_count.to_string()),
+        phase_detail("NLP Kernels", stats.jit_kernel_count.to_string(), 0),
+        phase_detail("Helper Kernels", helper_kernel_count.to_string(), 0),
     ]
 }
 
@@ -2017,12 +2052,17 @@ fn helper_compile_detail_label(helper: OcpCompileHelperKind) -> &'static str {
 fn helper_compile_phase_details(helper_stats: OcpHelperCompileStats) -> Vec<SolverPhaseDetail> {
     let mut details = Vec::new();
     if let Some(duration) = helper_stats.xdot_helper_time {
-        details.push(phase_detail("Xdot Helper", format_phase_duration(duration)));
+        details.push(phase_detail(
+            "Xdot Helper",
+            format_phase_duration(duration),
+            0,
+        ));
     }
     if let Some(duration) = helper_stats.multiple_shooting_arc_helper_time {
         details.push(phase_detail(
             "RK4 Arc Helper",
             format_phase_duration(duration),
+            0,
         ));
     }
     details
@@ -2047,6 +2087,7 @@ pub fn ocp_compile_progress_update(
             state.phase_details.jit = vec![phase_detail(
                 "NLP Kernels",
                 metadata.stats.jit_kernel_count.to_string(),
+                0,
             )];
         }
         OcpCompileProgress::HelperCompiled { helper, elapsed } => {
@@ -4716,8 +4757,8 @@ where
             );
             let emit_for_worker = emit.clone();
             let solve_started = started;
-            let running_solver = running_solver.clone();
-            let solved = with_latest_only_worker(
+            let running_solver_for_callback = running_solver.clone();
+            let solved = match with_latest_only_worker(
                 move |event| {
                     emit_event(&emit_for_worker, event);
                 },
@@ -4737,7 +4778,7 @@ where
                                     (*builder)(&snapshot.trajectories, &x_arcs, &u_arcs);
                                 drop(builder);
                                 let progress = sqp_progress(&snapshot.solver);
-                                artifact.solver = running_solver
+                                artifact.solver = running_solver_for_callback
                                     .clone()
                                     .with_iterations(progress.iteration)
                                     .with_solve_seconds(solve_started.elapsed().as_secs_f64());
@@ -4764,7 +4805,18 @@ where
                         },
                     )
                 },
-            )?;
+            ) {
+                Ok(solved) => solved,
+                Err(error) => {
+                    if let Some(report) = error
+                        .downcast_ref::<ClarabelSqpError>()
+                        .and_then(|typed| sqp_failure_solver_report(typed, &running_solver))
+                    {
+                        emit_failure_status(&emit, solver_method, report);
+                    }
+                    return Err(error.into());
+                }
+            };
             let (x_arcs, u_arcs) =
                 compiled.build_interval_arcs(&solved.trajectories, &runtime.parameters)?;
             let mut artifact = {
@@ -4802,8 +4854,8 @@ where
             );
             let emit_for_worker = emit.clone();
             let solve_started = started;
-            let running_solver = running_solver.clone();
-            let solved = with_latest_only_worker(
+            let running_solver_for_callback = running_solver.clone();
+            let solved = match with_latest_only_worker(
                 move |event| {
                     emit_event(&emit_for_worker, event);
                 },
@@ -4823,7 +4875,7 @@ where
                                     (*builder)(&snapshot.trajectories, &x_arcs, &u_arcs);
                                 drop(builder);
                                 let progress = nlip_progress(&snapshot.solver);
-                                artifact.solver = running_solver
+                                artifact.solver = running_solver_for_callback
                                     .clone()
                                     .with_iterations(progress.iteration)
                                     .with_solve_seconds(solve_started.elapsed().as_secs_f64());
@@ -4850,7 +4902,18 @@ where
                         },
                     )
                 },
-            )?;
+            ) {
+                Ok(solved) => solved,
+                Err(error) => {
+                    if let Some(report) = error
+                        .downcast_ref::<InteriorPointSolveError>()
+                        .and_then(|typed| nlip_failure_solver_report(typed, &running_solver))
+                    {
+                        emit_failure_status(&emit, solver_method, report);
+                    }
+                    return Err(error.into());
+                }
+            };
             let (x_arcs, u_arcs) =
                 compiled.build_interval_arcs(&solved.trajectories, &runtime.parameters)?;
             let mut artifact = {
@@ -4889,8 +4952,8 @@ where
             );
             let emit_for_worker = emit.clone();
             let solve_started = started;
-            let running_solver = running_solver.clone();
-            let solved = with_latest_only_worker(
+            let running_solver_for_callback = running_solver.clone();
+            let solved = match with_latest_only_worker(
                 move |event| {
                     emit_event(&emit_for_worker, event);
                 },
@@ -4910,7 +4973,7 @@ where
                                     (*builder)(&snapshot.trajectories, &x_arcs, &u_arcs);
                                 drop(builder);
                                 let progress = ipopt_progress(&snapshot.solver);
-                                artifact.solver = running_solver
+                                artifact.solver = running_solver_for_callback
                                     .clone()
                                     .with_iterations(progress.iteration)
                                     .with_solve_seconds(solve_started.elapsed().as_secs_f64());
@@ -4937,7 +5000,18 @@ where
                         },
                     )
                 },
-            )?;
+            ) {
+                Ok(solved) => solved,
+                Err(error) => {
+                    if let Some(report) = error
+                        .downcast_ref::<IpoptSolveError>()
+                        .and_then(|typed| ipopt_failure_solver_report(typed, &running_solver))
+                    {
+                        emit_failure_status(&emit, solver_method, report);
+                    }
+                    return Err(error.into());
+                }
+            };
             let (x_arcs, u_arcs) =
                 compiled.build_interval_arcs(&solved.trajectories, &runtime.parameters)?;
             let mut artifact = {
@@ -5156,8 +5230,8 @@ where
             );
             let emit_for_worker = emit.clone();
             let solve_started = started;
-            let running_solver = running_solver.clone();
-            let solved = with_latest_only_worker(
+            let running_solver_for_callback = running_solver.clone();
+            let solved = match with_latest_only_worker(
                 move |event| {
                     emit_event(&emit_for_worker, event);
                 },
@@ -5174,7 +5248,7 @@ where
                                 (*builder)(&snapshot.trajectories, &snapshot.time_grid)
                             };
                             let progress = sqp_progress(&snapshot.solver);
-                            artifact.solver = running_solver
+                            artifact.solver = running_solver_for_callback
                                 .clone()
                                 .with_iterations(progress.iteration)
                                 .with_solve_seconds(solve_started.elapsed().as_secs_f64());
@@ -5194,7 +5268,18 @@ where
                         },
                     )
                 },
-            )?;
+            ) {
+                Ok(solved) => solved,
+                Err(error) => {
+                    if let Some(report) = error
+                        .downcast_ref::<ClarabelSqpError>()
+                        .and_then(|typed| sqp_failure_solver_report(typed, &running_solver))
+                    {
+                        emit_failure_status(&emit, solver_method, report);
+                    }
+                    return Err(error.into());
+                }
+            };
             let mut artifact = {
                 let mut builder = build_artifact.lock().expect("artifact builder poisoned");
                 (*builder)(&solved.trajectories, &solved.time_grid)
@@ -5230,8 +5315,8 @@ where
             );
             let emit_for_worker = emit.clone();
             let solve_started = started;
-            let running_solver = running_solver.clone();
-            let solved = with_latest_only_worker(
+            let running_solver_for_callback = running_solver.clone();
+            let solved = match with_latest_only_worker(
                 move |event| {
                     emit_event(&emit_for_worker, event);
                 },
@@ -5248,7 +5333,7 @@ where
                                 (*builder)(&snapshot.trajectories, &snapshot.time_grid)
                             };
                             let progress = nlip_progress(&snapshot.solver);
-                            artifact.solver = running_solver
+                            artifact.solver = running_solver_for_callback
                                 .clone()
                                 .with_iterations(progress.iteration)
                                 .with_solve_seconds(solve_started.elapsed().as_secs_f64());
@@ -5268,7 +5353,18 @@ where
                         },
                     )
                 },
-            )?;
+            ) {
+                Ok(solved) => solved,
+                Err(error) => {
+                    if let Some(report) = error
+                        .downcast_ref::<InteriorPointSolveError>()
+                        .and_then(|typed| nlip_failure_solver_report(typed, &running_solver))
+                    {
+                        emit_failure_status(&emit, solver_method, report);
+                    }
+                    return Err(error.into());
+                }
+            };
             let mut artifact = {
                 let mut builder = build_artifact.lock().expect("artifact builder poisoned");
                 (*builder)(&solved.trajectories, &solved.time_grid)
@@ -5305,8 +5401,8 @@ where
             );
             let emit_for_worker = emit.clone();
             let solve_started = started;
-            let running_solver = running_solver.clone();
-            let solved = with_latest_only_worker(
+            let running_solver_for_callback = running_solver.clone();
+            let solved = match with_latest_only_worker(
                 move |event| {
                     emit_event(&emit_for_worker, event);
                 },
@@ -5323,7 +5419,7 @@ where
                                 (*builder)(&snapshot.trajectories, &snapshot.time_grid)
                             };
                             let progress = ipopt_progress(&snapshot.solver);
-                            artifact.solver = running_solver
+                            artifact.solver = running_solver_for_callback
                                 .clone()
                                 .with_iterations(progress.iteration)
                                 .with_solve_seconds(solve_started.elapsed().as_secs_f64());
@@ -5343,7 +5439,18 @@ where
                         },
                     )
                 },
-            )?;
+            ) {
+                Ok(solved) => solved,
+                Err(error) => {
+                    if let Some(report) = error
+                        .downcast_ref::<IpoptSolveError>()
+                        .and_then(|typed| ipopt_failure_solver_report(typed, &running_solver))
+                    {
+                        emit_failure_status(&emit, solver_method, report);
+                    }
+                    return Err(error.into());
+                }
+            };
             let mut artifact = {
                 let mut builder = build_artifact.lock().expect("artifact builder poisoned");
                 (*builder)(&solved.trajectories, &solved.time_grid)
@@ -5601,6 +5708,357 @@ pub fn attach_ipopt_solver_report(artifact: &mut SolveArtifact, summary: &IpoptS
     artifact.solver = ipopt_solver_report(summary);
 }
 
+fn push_eval_timing_detail(
+    details: &mut Vec<SolverPhaseDetail>,
+    label: &str,
+    calls: usize,
+    total_time: Duration,
+) {
+    if calls > 0 {
+        details.push(SolverPhaseDetail {
+            label: label.to_string(),
+            value: format_phase_duration(total_time),
+            count: calls,
+        });
+    }
+}
+
+fn push_optional_timing_detail(
+    details: &mut Vec<SolverPhaseDetail>,
+    label: &str,
+    count: usize,
+    duration: Duration,
+) {
+    if duration > Duration::ZERO {
+        details.push(phase_detail(label, format_phase_duration(duration), count));
+    }
+}
+
+fn sqp_solve_phase_details(profiling: &ClarabelSqpProfiling) -> Vec<SolverPhaseDetail> {
+    let mut details = Vec::new();
+    push_eval_timing_detail(
+        &mut details,
+        "Objective",
+        profiling.objective_value.calls,
+        profiling.objective_value.total_time,
+    );
+    push_eval_timing_detail(
+        &mut details,
+        "Gradient",
+        profiling.objective_gradient.calls,
+        profiling.objective_gradient.total_time,
+    );
+    push_eval_timing_detail(
+        &mut details,
+        "Equality Values",
+        profiling.equality_values.calls,
+        profiling.equality_values.total_time,
+    );
+    push_eval_timing_detail(
+        &mut details,
+        "Inequality Values",
+        profiling.inequality_values.calls,
+        profiling.inequality_values.total_time,
+    );
+    push_eval_timing_detail(
+        &mut details,
+        "Equality Jacobian",
+        profiling.equality_jacobian_values.calls,
+        profiling.equality_jacobian_values.total_time,
+    );
+    push_eval_timing_detail(
+        &mut details,
+        "Inequality Jacobian",
+        profiling.inequality_jacobian_values.calls,
+        profiling.inequality_jacobian_values.total_time,
+    );
+    push_eval_timing_detail(
+        &mut details,
+        "Hessian",
+        profiling.lagrangian_hessian_values.calls,
+        profiling.lagrangian_hessian_values.total_time,
+    );
+    push_optional_timing_detail(
+        &mut details,
+        "QP Setup",
+        profiling.qp_setups,
+        profiling.qp_setup_time,
+    );
+    push_optional_timing_detail(
+        &mut details,
+        "QP Solve",
+        profiling.qp_solves,
+        profiling.qp_solve_time,
+    );
+    push_optional_timing_detail(
+        &mut details,
+        "Multiplier Estimation",
+        profiling.multiplier_estimations,
+        profiling.multiplier_estimation_time,
+    );
+    push_optional_timing_detail(
+        &mut details,
+        "Line Search Eval",
+        profiling.line_search_evaluations,
+        profiling.line_search_evaluation_time,
+    );
+    push_optional_timing_detail(
+        &mut details,
+        "Line Search Check",
+        profiling.line_search_condition_checks,
+        profiling.line_search_condition_check_time,
+    );
+    push_optional_timing_detail(
+        &mut details,
+        "Convergence Check",
+        profiling.convergence_checks,
+        profiling.convergence_check_time,
+    );
+    details
+}
+
+fn nlip_solve_phase_details(profiling: &InteriorPointProfiling) -> Vec<SolverPhaseDetail> {
+    let mut details = Vec::new();
+    push_eval_timing_detail(
+        &mut details,
+        "Objective",
+        profiling.objective_value.calls,
+        profiling.objective_value.total_time,
+    );
+    push_eval_timing_detail(
+        &mut details,
+        "Gradient",
+        profiling.objective_gradient.calls,
+        profiling.objective_gradient.total_time,
+    );
+    push_eval_timing_detail(
+        &mut details,
+        "Equality Values",
+        profiling.equality_values.calls,
+        profiling.equality_values.total_time,
+    );
+    push_eval_timing_detail(
+        &mut details,
+        "Inequality Values",
+        profiling.inequality_values.calls,
+        profiling.inequality_values.total_time,
+    );
+    push_eval_timing_detail(
+        &mut details,
+        "Equality Jacobian",
+        profiling.equality_jacobian_values.calls,
+        profiling.equality_jacobian_values.total_time,
+    );
+    push_eval_timing_detail(
+        &mut details,
+        "Inequality Jacobian",
+        profiling.inequality_jacobian_values.calls,
+        profiling.inequality_jacobian_values.total_time,
+    );
+    push_eval_timing_detail(
+        &mut details,
+        "Hessian",
+        profiling.lagrangian_hessian_values.calls,
+        profiling.lagrangian_hessian_values.total_time,
+    );
+    push_optional_timing_detail(
+        &mut details,
+        "KKT Assembly",
+        profiling.kkt_assemblies,
+        profiling.kkt_assembly_time,
+    );
+    push_optional_timing_detail(
+        &mut details,
+        "Linear Solve",
+        profiling.linear_solves,
+        profiling.linear_solve_time,
+    );
+    push_optional_timing_detail(
+        &mut details,
+        "Preprocess",
+        profiling.preprocessing_steps,
+        profiling.preprocessing_time,
+    );
+    details
+}
+
+#[cfg(feature = "ipopt")]
+fn ipopt_solve_phase_details(profiling: &IpoptProfiling) -> Vec<SolverPhaseDetail> {
+    let mut details = Vec::new();
+    push_eval_timing_detail(
+        &mut details,
+        "Objective",
+        profiling.objective_value.calls,
+        profiling.objective_value.total_time,
+    );
+    push_eval_timing_detail(
+        &mut details,
+        "Gradient",
+        profiling.objective_gradient.calls,
+        profiling.objective_gradient.total_time,
+    );
+    push_eval_timing_detail(
+        &mut details,
+        "Constraints",
+        profiling.constraint_values.calls,
+        profiling.constraint_values.total_time,
+    );
+    push_eval_timing_detail(
+        &mut details,
+        "Jacobian",
+        profiling.constraint_jacobian_values.calls,
+        profiling.constraint_jacobian_values.total_time,
+    );
+    push_eval_timing_detail(
+        &mut details,
+        "Hessian",
+        profiling.hessian_values.calls,
+        profiling.hessian_values.total_time,
+    );
+    details
+}
+
+fn merge_failure_solver_report(
+    mut report: SolverReport,
+    fallback: &SolverReport,
+    solve_details: Vec<SolverPhaseDetail>,
+) -> SolverReport {
+    let mut phase_details = fallback.phase_details.clone();
+    phase_details.solve = solve_details;
+    report.symbolic_setup_s = report.symbolic_setup_s.or(fallback.symbolic_setup_s);
+    report.jit_s = report.jit_s.or(fallback.jit_s);
+    report.solve_s = report.solve_s.or(fallback.solve_s);
+    report.compile_cached = report.compile_cached || fallback.compile_cached;
+    report.phase_details = phase_details;
+    report
+}
+
+pub fn sqp_failure_solver_report(
+    error: &ClarabelSqpError,
+    fallback: &SolverReport,
+) -> Option<SolverReport> {
+    let context = match error {
+        ClarabelSqpError::MaxIterations { context, .. }
+        | ClarabelSqpError::QpSolve { context, .. }
+        | ClarabelSqpError::UnconstrainedStepSolve { context }
+        | ClarabelSqpError::LineSearchFailed { context, .. }
+        | ClarabelSqpError::Stalled { context, .. }
+        | ClarabelSqpError::NonFiniteCallbackOutput { context, .. } => context.as_ref(),
+        ClarabelSqpError::InvalidInput(_)
+        | ClarabelSqpError::NonFiniteInput { .. }
+        | ClarabelSqpError::Setup(_) => return None,
+    };
+    Some(merge_failure_solver_report(
+        SolverReport {
+            completed: true,
+            status_label: match context.termination {
+                optimization::SqpTermination::MaxIterations => {
+                    "Failed: maximum iterations reached".to_string()
+                }
+                optimization::SqpTermination::QpSolve => "Failed: QP solve".to_string(),
+                optimization::SqpTermination::LineSearchFailed => "Failed: line search".to_string(),
+                optimization::SqpTermination::Stalled => "Failed: stalled".to_string(),
+                optimization::SqpTermination::NonFiniteInput => {
+                    "Failed: non-finite input".to_string()
+                }
+                optimization::SqpTermination::NonFiniteCallbackOutput => {
+                    "Failed: non-finite callback output".to_string()
+                }
+                optimization::SqpTermination::Converged => "Failed".to_string(),
+            },
+            status_kind: SolverStatusKind::Error,
+            iterations: context
+                .final_state
+                .as_ref()
+                .map(|state| state.iteration as usize),
+            symbolic_setup_s: symbolic_setup_seconds(context.profiling.backend_timing),
+            jit_s: duration_seconds(context.profiling.backend_timing.jit_time),
+            solve_s: Some(context.profiling.total_time.as_secs_f64()),
+            compile_cached: false,
+            phase_details: SolverPhaseDetails::default(),
+        },
+        fallback,
+        sqp_solve_phase_details(&context.profiling),
+    ))
+}
+
+pub fn nlip_failure_solver_report(
+    error: &InteriorPointSolveError,
+    fallback: &SolverReport,
+) -> Option<SolverReport> {
+    let (status_label, iterations, profiling) = match error {
+        InteriorPointSolveError::InvalidInput(_) => return None,
+        InteriorPointSolveError::LinearSolve { solver, profiling } => (
+            format!("Failed: linear solve ({})", solver.label()),
+            None,
+            profiling.as_ref(),
+        ),
+        InteriorPointSolveError::LineSearchFailed { profiling, .. } => {
+            ("Failed: line search".to_string(), None, profiling.as_ref())
+        }
+        InteriorPointSolveError::MaxIterations {
+            iterations,
+            profiling,
+        } => (
+            "Failed: maximum iterations reached".to_string(),
+            Some(*iterations as usize),
+            profiling.as_ref(),
+        ),
+    };
+    Some(merge_failure_solver_report(
+        SolverReport {
+            completed: true,
+            status_label,
+            status_kind: SolverStatusKind::Error,
+            iterations,
+            symbolic_setup_s: symbolic_setup_seconds(profiling.backend_timing),
+            jit_s: duration_seconds(profiling.backend_timing.jit_time),
+            solve_s: Some(profiling.total_time.as_secs_f64()),
+            compile_cached: false,
+            phase_details: SolverPhaseDetails::default(),
+        },
+        fallback,
+        nlip_solve_phase_details(profiling),
+    ))
+}
+
+#[cfg(feature = "ipopt")]
+pub fn ipopt_failure_solver_report(
+    error: &IpoptSolveError,
+    fallback: &SolverReport,
+) -> Option<SolverReport> {
+    let (status_label, iterations, profiling) = match error {
+        IpoptSolveError::Solve {
+            status,
+            iterations,
+            profiling,
+            ..
+        } => (
+            ipopt_status_label(*status),
+            Some(*iterations as usize),
+            profiling.as_ref(),
+        ),
+        IpoptSolveError::InvalidInput(_)
+        | IpoptSolveError::Setup(_)
+        | IpoptSolveError::OptionRejected { .. } => return None,
+    };
+    Some(merge_failure_solver_report(
+        SolverReport {
+            completed: true,
+            status_label,
+            status_kind: SolverStatusKind::Error,
+            iterations,
+            symbolic_setup_s: symbolic_setup_seconds(profiling.backend_timing),
+            jit_s: duration_seconds(profiling.backend_timing.jit_time),
+            solve_s: Some(profiling.total_time.as_secs_f64()),
+            compile_cached: false,
+            phase_details: SolverPhaseDetails::default(),
+        },
+        fallback,
+        ipopt_solve_phase_details(profiling),
+    ))
+}
+
 pub fn append_termination_metric(artifact: &mut SolveArtifact, summary: &ClarabelSqpSummary) {
     artifact.summary.push(metric_with_key(
         MetricKey::Termination,
@@ -5730,8 +6188,8 @@ mod tests {
                     on_symbolic_ready(CompileProgressUpdate {
                         timing: symbolic_timing,
                         phase_details: SolverPhaseDetails {
-                            symbolic_setup: vec![phase_detail("Vars", "2")],
-                            jit: vec![phase_detail("NLP Kernels", "3")],
+                            symbolic_setup: vec![phase_detail("Vars", "2", 0)],
+                            jit: vec![phase_detail("NLP Kernels", "3", 0)],
                             solve: Vec::new(),
                         },
                         compile_cached: false,
@@ -5742,8 +6200,8 @@ mod tests {
                             timing: compiled_timing,
                             compile_cached: false,
                             phase_details: SolverPhaseDetails {
-                                symbolic_setup: vec![phase_detail("Vars", "2")],
-                                jit: vec![phase_detail("NLP Kernels", "3")],
+                                symbolic_setup: vec![phase_detail("Vars", "2", 0)],
+                                jit: vec![phase_detail("NLP Kernels", "3", 0)],
                                 solve: Vec::new(),
                             },
                             compile_report: None,
@@ -5812,8 +6270,8 @@ mod tests {
                     on_symbolic_ready(CompileProgressUpdate {
                         timing: symbolic_timing,
                         phase_details: SolverPhaseDetails {
-                            symbolic_setup: vec![phase_detail("Vars", "2")],
-                            jit: vec![phase_detail("NLP Kernels", "3")],
+                            symbolic_setup: vec![phase_detail("Vars", "2", 0)],
+                            jit: vec![phase_detail("NLP Kernels", "3", 0)],
                             solve: Vec::new(),
                         },
                         compile_cached: false,
@@ -5824,8 +6282,8 @@ mod tests {
                             timing: compiled_timing,
                             compile_cached: false,
                             phase_details: SolverPhaseDetails {
-                                symbolic_setup: vec![phase_detail("Vars", "2")],
-                                jit: vec![phase_detail("NLP Kernels", "3")],
+                                symbolic_setup: vec![phase_detail("Vars", "2", 0)],
+                                jit: vec![phase_detail("NLP Kernels", "3", 0)],
                                 solve: Vec::new(),
                             },
                             compile_report: None,
@@ -5958,5 +6416,112 @@ mod tests {
         };
         assert_ne!(default.variant_id_suffix(), custom.variant_id_suffix());
         assert_eq!(custom.variant_label_suffix().as_deref(), Some("SXF Custom"));
+    }
+
+    #[test]
+    fn nlip_failure_solver_report_preserves_timing_details() {
+        let profiling = optimization::InteriorPointProfiling {
+            objective_value: optimization::EvalTimingStat {
+                calls: 4,
+                total_time: Duration::from_millis(12),
+            },
+            objective_gradient: optimization::EvalTimingStat {
+                calls: 4,
+                total_time: Duration::from_millis(8),
+            },
+            equality_jacobian_values: optimization::EvalTimingStat {
+                calls: 4,
+                total_time: Duration::from_millis(21),
+            },
+            lagrangian_hessian_values: optimization::EvalTimingStat {
+                calls: 3,
+                total_time: Duration::from_millis(34),
+            },
+            kkt_assemblies: 3,
+            kkt_assembly_time: Duration::from_millis(55),
+            linear_solves: 6,
+            linear_solve_time: Duration::from_millis(89),
+            preprocessing_steps: 2,
+            preprocessing_time: Duration::from_millis(13),
+            total_time: Duration::from_secs_f64(0.321),
+            backend_timing: BackendTimingMetadata {
+                function_creation_time: Some(Duration::from_millis(150)),
+                derivative_generation_time: Some(Duration::from_millis(250)),
+                jit_time: Some(Duration::from_millis(500)),
+            },
+            ..optimization::InteriorPointProfiling::default()
+        };
+        let error = optimization::InteriorPointSolveError::LineSearchFailed {
+            merit: 1.0,
+            mu: 1.0e-3,
+            step_inf_norm: 0.25,
+            profiling: Box::new(profiling),
+        };
+        let fallback = SolverReport::in_progress("Running NLIP...")
+            .with_backend_timing(BackendTimingMetadata {
+                function_creation_time: Some(Duration::from_millis(150)),
+                derivative_generation_time: Some(Duration::from_millis(250)),
+                jit_time: Some(Duration::from_millis(500)),
+            })
+            .with_compile_cached(true)
+            .with_phase_details(SolverPhaseDetails {
+                symbolic_setup: vec![phase_detail("Vars", "10", 0)],
+                jit: vec![phase_detail("NLP Kernels", "3", 0)],
+                solve: Vec::new(),
+            });
+        let report =
+            nlip_failure_solver_report(&error, &fallback).expect("expected failure report");
+
+        assert!(report.completed);
+        assert_eq!(report.status_kind, SolverStatusKind::Error);
+        assert_eq!(report.status_label, "Failed: line search");
+        assert_eq!(report.symbolic_setup_s, Some(0.4));
+        assert_eq!(report.jit_s, Some(0.5));
+        assert_eq!(report.solve_s, Some(0.321));
+        assert!(report.compile_cached);
+        assert_eq!(report.phase_details.symbolic_setup.len(), 1);
+        assert_eq!(report.phase_details.jit.len(), 1);
+        assert!(
+            report
+                .phase_details
+                .solve
+                .iter()
+                .any(|detail| detail.label == "KKT Assembly")
+        );
+        assert!(
+            report
+                .phase_details
+                .solve
+                .iter()
+                .any(|detail| detail.label == "Linear Solve")
+        );
+        assert!(
+            report
+                .phase_details
+                .solve
+                .iter()
+                .any(|detail| detail.label == "Hessian")
+        );
+        assert!(
+            report
+                .phase_details
+                .solve
+                .iter()
+                .any(|detail| detail.label == "KKT Assembly" && detail.count == 3)
+        );
+        assert!(
+            report
+                .phase_details
+                .solve
+                .iter()
+                .any(|detail| detail.label == "Linear Solve" && detail.count == 6)
+        );
+        assert!(
+            report
+                .phase_details
+                .solve
+                .iter()
+                .any(|detail| detail.label == "Preprocess" && detail.count == 2)
+        );
     }
 }

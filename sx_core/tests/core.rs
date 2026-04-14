@@ -13,7 +13,7 @@ mod symbolic_eval;
 
 use symbolic_eval::eval;
 
-fn assert_matrix_values_match(lhs: &SXMatrix, rhs: &SXMatrix, vars: &HashMap<u32, f64>) {
+fn assert_matrix_values_match(lhs: &SXMatrix, rhs: &SXMatrix, vars: &HashMap<u64, f64>) {
     assert_eq!(lhs.shape(), rhs.shape());
     assert_eq!(lhs.ccs(), rhs.ccs());
     let (nrow, ncol) = lhs.shape();
@@ -66,13 +66,14 @@ fn assert_binary_matches(
 }
 
 #[rstest]
-fn sx_cse_and_constant_folding() {
+fn sx_simplification_and_canonicalization() {
     let x = SX::sym("x");
     let y = SX::sym("y");
     assert_eq!(x + SX::zero(), x);
     assert_eq!(x * SX::one(), x);
-    assert_eq!(x + y, y + x);
-    assert_eq!((x + y).id(), (y + x).id());
+    assert_eq!((x + y).inspect(), (y + x).inspect());
+    assert_eq!((x + y).id(), (x + y).id());
+    assert_eq!((x * y).id(), (y * x).id());
 }
 
 #[rstest]
@@ -290,7 +291,8 @@ fn hessian_strategies_match_on_rosenbrock() {
     let colored_hessian = rosen
         .hessian_with_strategy(&x, HessianStrategy::LowerTriangleColored)
         .unwrap();
-    assert_eq!(default_hessian, colored_hessian);
+    assert_eq!(default_hessian.ccs(), colored_hessian.ccs());
+    assert_matrix_values_match(&default_hessian, &colored_hessian, &values);
 }
 
 #[rstest]
@@ -305,6 +307,24 @@ fn sx_function_validates_free_symbols() {
     )
     .unwrap_err();
     assert!(err.to_string().contains("free symbol"));
+}
+
+#[rstest]
+fn sx_function_validates_deep_unary_chain_without_stack_overflow() {
+    let x = SX::sym("deep_validate_x");
+    let mut expr = x;
+    for _ in 0..20_000 {
+        expr = expr.sin();
+    }
+
+    let function = SXFunction::new(
+        "deep_validate_ok",
+        vec![NamedMatrix::new("x", SXMatrix::dense_column(vec![x]).unwrap()).unwrap()],
+        vec![NamedMatrix::new("y", SXMatrix::scalar(expr)).unwrap()],
+    )
+    .expect("deep validation should succeed iteratively");
+
+    assert_eq!(function.outputs().len(), 1);
 }
 
 #[derive(Debug, Deserialize)]

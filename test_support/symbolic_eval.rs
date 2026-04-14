@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use sx_core::{BinaryOp, NodeView, SX, UnaryOp, lookup_function};
 
-pub fn eval(expr: SX, vars: &HashMap<u32, f64>) -> f64 {
+pub fn eval(expr: SX, vars: &HashMap<u64, f64>) -> f64 {
     match expr.inspect() {
         NodeView::Constant(value) => value,
         NodeView::Symbol { .. } => vars[&expr.id()],
