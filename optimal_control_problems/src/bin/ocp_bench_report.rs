@@ -135,8 +135,6 @@ enum CliPresetSelection {
     FunctionInlineInLlvm,
     #[value(name = "function_noinline_llvm")]
     FunctionNoInlineLlvm,
-    #[value(name = "baseline_with_ms_integrator")]
-    BaselineWithMsIntegrator,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -205,9 +203,6 @@ fn expand_preset_selections(selections: &[CliPresetSelection]) -> Result<Vec<Ocp
             }
             CliPresetSelection::FunctionNoInlineLlvm => {
                 Some(OcpBenchmarkPreset::FunctionNoInlineLlvm)
-            }
-            CliPresetSelection::BaselineWithMsIntegrator => {
-                Some(OcpBenchmarkPreset::BaselineWithMsIntegrator)
             }
             CliPresetSelection::All => None,
         },
@@ -523,6 +518,8 @@ struct CaseCell {
     hessian_nnz: Option<usize>,
     llvm_root_instruction_count: Option<usize>,
     llvm_total_instruction_count: Option<usize>,
+    xdot_helper_root_instruction_count: Option<usize>,
+    multiple_shooting_arc_helper_root_instruction_count: Option<usize>,
     eval_samples: usize,
     sanity: SanityStatus,
     warnings: usize,
@@ -582,12 +579,6 @@ enum NnzMetric {
     Gradient,
     Jacobian,
     Hessian,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SizeMetric {
-    RootInstructions,
-    TotalInstructions,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -680,6 +671,8 @@ impl TerminalProgress {
                     hessian_nnz: None,
                     llvm_root_instruction_count: None,
                     llvm_total_instruction_count: None,
+                    xdot_helper_root_instruction_count: None,
+                    multiple_shooting_arc_helper_root_instruction_count: None,
                     eval_samples: 0,
                     sanity: SanityStatus::Ok,
                     warnings: 0,
@@ -869,7 +862,9 @@ fn apply_progress_event(state: &mut ProgressState, event: OcpBenchmarkProgress) 
                         metadata.stats.hessian_nnz,
                     );
                 }
-                OcpCompileProgress::HelperCompiled { helper, elapsed } => {
+                OcpCompileProgress::HelperCompiled {
+                    helper, elapsed, ..
+                } => {
                     state.stage = "Compiling helper kernels".to_string();
                     state.detail = format!(
                         "{} ready in {}",
@@ -1656,11 +1651,6 @@ fn preset_legend_entries() -> Vec<(OcpBenchmarkPreset, &'static str, &'static st
             "noinline",
             "preserve internal LLVM function calls",
         ),
-        (
-            OcpBenchmarkPreset::BaselineWithMsIntegrator,
-            "ms int",
-            "baseline plus reusable MS integrator",
-        ),
     ]
 }
 
@@ -1786,17 +1776,35 @@ fn render_timing_section_panel(
 
     let case_count = state.row_keys.len();
     let cell_width = transposed_matrix_cell_width(frame.area().width as usize, 3) as u16;
+    let count_cell_width = if section_has_size_column(section) {
+        symbolic_count_cell_width(frame.area().width as usize, 3) as u16
+    } else {
+        0
+    };
     let column_spacing = 1usize;
-    let row_label_detail = matrix_label_detail(inner.width as usize, case_count);
-    let row_label_width = matrix_row_label_width(
-        inner.width as usize,
-        case_count,
-        cell_width as usize,
-        column_spacing,
-        &state.presets,
-        row_label_detail,
-        section,
-    ) as u16;
+    let data_column_count = if section_has_size_column(section) {
+        case_count * 2
+    } else {
+        case_count
+    };
+    let data_width = if section_has_size_column(section) {
+        case_count * (cell_width as usize + count_cell_width as usize)
+            + data_column_count.saturating_sub(1) * column_spacing
+    } else {
+        case_count * cell_width as usize + case_count.saturating_sub(1) * column_spacing
+    };
+    let label_available = inner
+        .width
+        .saturating_sub((data_width + column_spacing) as u16) as usize;
+    let row_label_detail = matrix_label_detail_from_available(label_available);
+    let row_label_width =
+        matrix_row_label_width_from_available(label_available, &state.presets, row_label_detail, section)
+            as u16;
+    let case_group_width = if section_has_size_column(section) {
+        cell_width as usize + column_spacing + count_cell_width as usize
+    } else {
+        cell_width as usize
+    };
 
     let sections = Layout::default()
         .direction(ratatui::layout::Direction::Vertical)
@@ -1804,13 +1812,20 @@ fn render_timing_section_panel(
         .split(inner);
 
     let mut widths = vec![Constraint::Length(row_label_width)];
-    widths.extend((0..case_count).map(|_| Constraint::Length(cell_width)));
+    if section_has_size_column(section) {
+        for _ in 0..case_count {
+            widths.push(Constraint::Length(cell_width));
+            widths.push(Constraint::Length(count_cell_width));
+        }
+    } else {
+        widths.extend((0..case_count).map(|_| Constraint::Length(cell_width)));
+    }
 
     frame.render_widget(
         Paragraph::new(matrix_problem_group_header(
             &state.row_keys,
             row_label_width as usize,
-            cell_width as usize,
+            case_group_width,
             column_spacing,
         ))
         .style(
@@ -1829,6 +1844,14 @@ fn render_timing_section_panel(
                 .fg(transcription_category_color())
                 .add_modifier(Modifier::BOLD),
         )));
+        if section_has_size_column(section) {
+            header.push(ratatui::widgets::Cell::from(Span::styled(
+                "#",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
     }
 
     let table_rows = section_matrix_rows(section)
@@ -1843,7 +1866,7 @@ fn render_timing_section_panel(
                             row_label_detail,
                         ),
                     ))
-                    .chain((0..case_count).map(|_| ratatui::widgets::Cell::from("")))
+                    .chain((0..data_column_count).map(|_| ratatui::widgets::Cell::from("")))
                     .collect::<Vec<_>>(),
                 )
                 .style(
@@ -1873,6 +1896,10 @@ fn render_timing_section_panel(
                         .expect("matrix case should exist");
                     let (text, style) = timing_cell_widget(stage, cell, state);
                     cells.push(ratatui::widgets::Cell::from(text).style(style));
+                    if section_has_size_column(section) {
+                        let (text, style) = size_ratio_cell_widget(section, stage, cell, state);
+                        cells.push(ratatui::widgets::Cell::from(text).style(style));
+                    }
                 }
                 Row::new(cells)
             });
@@ -1892,56 +1919,23 @@ fn render_timing_section_panel(
 }
 
 fn render_bottom_summary_widgets(frame: &mut Frame, area: Rect, state: &ProgressState) {
-    if area.width >= 230 {
+    if area.width >= 140 {
         let sections = Layout::default()
             .direction(ratatui::layout::Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(44),
-                Constraint::Percentage(18),
-                Constraint::Percentage(38),
+                Constraint::Percentage(36),
+                Constraint::Percentage(64),
             ])
             .split(area);
-        render_size_summary_widget(frame, sections[0], state);
-        render_nnz_summary_widget(frame, sections[1], state);
-        render_best_summary_widget(frame, sections[2], state);
-    } else if area.width >= 180 {
-        let sections = Layout::default()
-            .direction(ratatui::layout::Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(40),
-                Constraint::Percentage(20),
-                Constraint::Percentage(40),
-            ])
-            .split(area);
-        render_size_summary_widget(frame, sections[0], state);
-        render_nnz_summary_widget(frame, sections[1], state);
-        render_best_summary_widget(frame, sections[2], state);
-    } else if area.width >= 120 {
-        let sections = Layout::default()
-            .direction(ratatui::layout::Direction::Horizontal)
-            .constraints([Constraint::Percentage(56), Constraint::Percentage(44)])
-            .split(area);
-        let left_sections = Layout::default()
-            .direction(ratatui::layout::Direction::Vertical)
-            .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
-            .split(sections[0]);
-        render_size_summary_widget(frame, left_sections[0], state);
-        render_nnz_summary_widget(frame, left_sections[1], state);
+        render_nnz_summary_widget(frame, sections[0], state);
         render_best_summary_widget(frame, sections[1], state);
     } else {
-        let size_height = area.height.saturating_sub(12).max(5);
-        let nnz_height = area.height.saturating_sub(size_height + 6).max(5);
         let sections = Layout::default()
             .direction(ratatui::layout::Direction::Vertical)
-            .constraints([
-                Constraint::Length(size_height),
-                Constraint::Length(nnz_height),
-                Constraint::Min(4),
-            ])
+            .constraints([Constraint::Length(8), Constraint::Min(4)])
             .split(area);
-        render_size_summary_widget(frame, sections[0], state);
-        render_nnz_summary_widget(frame, sections[1], state);
-        render_best_summary_widget(frame, sections[2], state);
+        render_nnz_summary_widget(frame, sections[0], state);
+        render_best_summary_widget(frame, sections[1], state);
     }
 }
 
@@ -1977,8 +1971,6 @@ fn preset_display_name_with_detail(
         (OcpBenchmarkPreset::FunctionNoInlineLlvm, LabelDetail::Short) => "NoInline",
         (OcpBenchmarkPreset::FunctionNoInlineLlvm, LabelDetail::Medium) => "No Inline",
         (OcpBenchmarkPreset::FunctionNoInlineLlvm, LabelDetail::Full) => "No Inline LLVM",
-        (OcpBenchmarkPreset::BaselineWithMsIntegrator, LabelDetail::Short) => "MS Int",
-        (OcpBenchmarkPreset::BaselineWithMsIntegrator, _) => "MS Integrator",
     }
 }
 
@@ -2043,74 +2035,29 @@ fn matrix_row_display_name_with_detail(row: MatrixRow, detail: LabelDetail) -> &
 }
 
 fn render_best_summary_widget(frame: &mut Frame, area: Rect, state: &ProgressState) {
-    let block = panel_block("Best By Goal", Color::Green);
+    let block = panel_block("Best Scheme By Case", Color::Green);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height < 3 || inner.width < 20 {
         return;
     }
 
-    let panels = if inner.width >= 110 {
-        Layout::default()
-            .direction(ratatui::layout::Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(inner)
+    let case_count = state.row_keys.len();
+    let case_width = if case_count <= 4 {
+        16
+    } else if case_count <= 6 {
+        14
     } else {
-        Layout::default()
-            .direction(ratatui::layout::Direction::Vertical)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(inner)
+        12
     };
-    render_best_summary_transcription_panel(
-        frame,
-        panels[0],
-        state,
-        TranscriptionMethod::MultipleShooting,
-        "MS",
-    );
-    render_best_summary_transcription_panel(
-        frame,
-        panels[1],
-        state,
-        TranscriptionMethod::DirectCollocation,
-        "DC",
-    );
-}
-
-fn render_best_summary_transcription_panel(
-    frame: &mut Frame,
-    area: Rect,
-    state: &ProgressState,
-    transcription: TranscriptionMethod,
-    title: &'static str,
-) {
-    let block = panel_block(title, transcription_category_color());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.height < 3 {
-        return;
-    }
-
     let table = Table::new(
-        best_summary_rows(state, transcription),
-        [
-            Constraint::Length(12),
-            Constraint::Length(20),
-            Constraint::Length(8),
-            Constraint::Length(8),
-            Constraint::Length(9),
-            Constraint::Length(10),
-        ],
+        best_case_matrix_rows(state, case_width),
+        std::iter::once(Constraint::Length(8))
+            .chain((0..case_count).map(|_| Constraint::Length(case_width)))
+            .collect::<Vec<_>>(),
     )
     .header(
-        Row::new(vec![
-            "Goal",
-            "Case",
-            "Symbolic",
-            "JIT",
-            "Eval100",
-            "Overall100",
-        ])
+        Row::new(best_case_matrix_header(state))
         .style(
             Style::default()
                 .fg(Color::Gray)
@@ -2120,57 +2067,114 @@ fn render_best_summary_transcription_panel(
     frame.render_widget(table, inner);
 }
 
-fn best_summary_rows(
-    state: &ProgressState,
-    transcription: TranscriptionMethod,
-) -> Vec<Row<'static>> {
-    let metrics = [
-        WinnerMetric::Symbolic,
-        WinnerMetric::Jit,
-        WinnerMetric::Eval100,
-        WinnerMetric::Overall100,
-    ];
-    metrics
-        .into_iter()
-        .map(|metric| {
-            if let Some(cell) = best_case_for_metric(state, transcription, metric) {
-                let symbolic = symbolic_total_for_cell(cell);
-                let jit = jit_total_for_cell(cell);
-                let eval = eval100_total_for_cell(cell);
-                let overall = overall100_total_for_cell(cell);
-                Row::new(vec![
-                    ratatui::widgets::Cell::from(winner_metric_label(metric)),
-                    ratatui::widgets::Cell::from(winner_case_label(cell)),
-                    ratatui::widgets::Cell::from(compact_optional_cell_seconds(symbolic)).style(
-                        winner_metric_style(state, transcription, WinnerMetric::Symbolic, symbolic),
-                    ),
-                    ratatui::widgets::Cell::from(compact_optional_cell_seconds(jit)).style(
-                        winner_metric_style(state, transcription, WinnerMetric::Jit, jit),
-                    ),
-                    ratatui::widgets::Cell::from(compact_optional_cell_seconds(eval)).style(
-                        winner_metric_style(state, transcription, WinnerMetric::Eval100, eval),
-                    ),
-                    ratatui::widgets::Cell::from(compact_optional_cell_seconds(overall)).style(
-                        winner_metric_style(
-                            state,
-                            transcription,
-                            WinnerMetric::Overall100,
-                            overall,
-                        ),
-                    ),
-                ])
-            } else {
-                Row::new(vec![
-                    ratatui::widgets::Cell::from(winner_metric_label(metric)),
-                    ratatui::widgets::Cell::from("pending"),
-                    ratatui::widgets::Cell::from("--"),
-                    ratatui::widgets::Cell::from("--"),
-                    ratatui::widgets::Cell::from("--"),
-                    ratatui::widgets::Cell::from("--"),
-                ])
-            }
-        })
+fn best_case_matrix_header(state: &ProgressState) -> Vec<ratatui::widgets::Cell<'static>> {
+    std::iter::once(ratatui::widgets::Cell::from("Goal"))
+        .chain(
+            state
+                .row_keys
+                .iter()
+                .map(|&(problem_id, transcription)| {
+                    ratatui::widgets::Cell::from(case_lane_label(problem_id, transcription))
+                }),
+        )
         .collect()
+}
+
+fn best_case_matrix_rows(state: &ProgressState, case_width: u16) -> Vec<Row<'static>> {
+    [
+        ("Sym", WinnerMetric::Symbolic),
+        ("JIT", WinnerMetric::Jit),
+        ("Eval100", WinnerMetric::Eval100),
+        ("Total100", WinnerMetric::Overall100),
+    ]
+    .into_iter()
+    .map(|(label, metric)| {
+        Row::new(
+            std::iter::once(ratatui::widgets::Cell::from(label))
+                .chain(state.row_keys.iter().map(|&(problem_id, transcription)| {
+                    best_case_metric_cell(state, problem_id, transcription, metric, case_width)
+                }))
+                .collect::<Vec<_>>(),
+        )
+    })
+    .collect()
+}
+
+fn best_case_metric_cell(
+    state: &ProgressState,
+    problem_id: ProblemId,
+    transcription: TranscriptionMethod,
+    metric: WinnerMetric,
+    case_width: u16,
+) -> ratatui::widgets::Cell<'static> {
+    match best_preset_for_case_metric(state, problem_id, transcription, metric) {
+        Some((cell, value)) => {
+            let preset_label = winner_preset_label(cell.case.preset);
+            let time_label = compact_cell_seconds(value);
+            let preset_width = 4usize.min(case_width.saturating_sub(1) as usize);
+            let total_width = case_width as usize;
+            let available_for_time = total_width.saturating_sub(preset_width + 1);
+            let padded_preset = format!("{preset_label:<preset_width$}");
+            let padded_time = format!("{time_label:>available_for_time$}");
+            ratatui::widgets::Cell::from(Line::from(vec![
+                Span::styled(
+                    padded_preset,
+                    Style::default().fg(strategy_category_color()),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    padded_time,
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]))
+        }
+        None => ratatui::widgets::Cell::from(Span::styled(
+            format!("{:>width$}", "pending", width = case_width as usize),
+            Style::default().fg(Color::DarkGray),
+        )),
+    }
+}
+
+fn best_preset_for_case_metric(
+    state: &ProgressState,
+    problem_id: ProblemId,
+    transcription: TranscriptionMethod,
+    metric: WinnerMetric,
+) -> Option<(&CaseCell, f64)> {
+    state
+        .case_cells
+        .iter()
+        .filter(|cell| {
+            cell.case.problem_id == problem_id && cell.case.transcription == transcription
+        })
+        .filter(|cell| preset_applies_to_transcription(cell.case.preset, transcription))
+        .filter_map(|cell| winner_metric_value(cell, metric).map(|value| (cell, value)))
+        .min_by(|lhs, rhs| {
+            lhs.1
+                .partial_cmp(&rhs.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
+fn case_lane_label(problem_id: ProblemId, transcription: TranscriptionMethod) -> String {
+    format!(
+        "{}/{}",
+        short_problem_label(problem_id),
+        short_transcription_label(transcription)
+    )
+}
+
+fn winner_preset_label(preset: OcpBenchmarkPreset) -> &'static str {
+    match preset {
+        OcpBenchmarkPreset::Baseline => "Base",
+        OcpBenchmarkPreset::InlineAll => "Inl",
+        OcpBenchmarkPreset::FunctionInlineAtCall => "Call",
+        OcpBenchmarkPreset::FunctionInlineAtLowering => "Low",
+        OcpBenchmarkPreset::FunctionInlineInLlvm => "LLVM",
+        OcpBenchmarkPreset::FunctionNoInlineLlvm => "NoIn",
+    }
 }
 
 fn render_nnz_summary_widget(frame: &mut Frame, area: Rect, state: &ProgressState) {
@@ -2213,154 +2217,6 @@ fn render_nnz_summary_widget(frame: &mut Frame, area: Rect, state: &ProgressStat
         ),
     );
     frame.render_widget(table, inner);
-}
-
-fn render_size_summary_widget(frame: &mut Frame, area: Rect, state: &ProgressState) {
-    let has_large_spread = state.row_keys.iter().any(|&(problem_id, transcription)| {
-        size_case_has_large_spread(state, problem_id, transcription)
-    });
-    let block = panel_block(
-        "Pre-JIT Size",
-        if has_large_spread {
-            Color::Yellow
-        } else {
-            Color::LightBlue
-        },
-    );
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.height < 3 {
-        return;
-    }
-
-    let table = Table::new(
-        size_summary_rows(state),
-        [
-            Constraint::Length(10),
-            Constraint::Length(18),
-            Constraint::Length(18),
-            Constraint::Min(36),
-        ],
-    )
-    .header(
-        Row::new(vec!["Case", "Root Inst", "Total Inst", "Details"]).style(
-            Style::default()
-                .fg(Color::Gray)
-                .add_modifier(Modifier::BOLD),
-        ),
-    );
-    frame.render_widget(table, inner);
-}
-
-fn size_summary_rows(state: &ProgressState) -> Vec<Row<'static>> {
-    state
-        .row_keys
-        .iter()
-        .map(|&(problem_id, transcription)| {
-            let root = size_summary_metric_cell(
-                state,
-                problem_id,
-                transcription,
-                SizeMetric::RootInstructions,
-            );
-            let total = size_summary_metric_cell(
-                state,
-                problem_id,
-                transcription,
-                SizeMetric::TotalInstructions,
-            );
-            let details = size_summary_detail_cell(state, problem_id, transcription);
-            Row::new(vec![
-                ratatui::widgets::Cell::from(nnz_case_label(problem_id, transcription)),
-                ratatui::widgets::Cell::from(root.0).style(root.1),
-                ratatui::widgets::Cell::from(total.0).style(total.1),
-                ratatui::widgets::Cell::from(details.0).style(details.1),
-            ])
-        })
-        .collect()
-}
-
-fn size_summary_metric_cell(
-    state: &ProgressState,
-    problem_id: ProblemId,
-    transcription: TranscriptionMethod,
-    metric: SizeMetric,
-) -> (String, Style) {
-    let values = size_metric_distinct_values(state, problem_id, transcription, metric);
-    let complete = size_metric_complete(state, problem_id, transcription, metric);
-    let style = size_metric_style(state, problem_id, transcription, metric);
-    match values.as_slice() {
-        [] => ("--".to_string(), Style::default().fg(Color::DarkGray)),
-        [value] => (
-            compact_count(*value),
-            if complete {
-                style.add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Gray)
-            },
-        ),
-        values => (summarize_size_spread(values), style),
-    }
-}
-
-fn size_summary_detail_cell(
-    state: &ProgressState,
-    problem_id: ProblemId,
-    transcription: TranscriptionMethod,
-) -> (String, Style) {
-    let mut details = Vec::new();
-    for (metric, label) in [
-        (SizeMetric::RootInstructions, "root"),
-        (SizeMetric::TotalInstructions, "total"),
-    ] {
-        let Some((min_value, min_presets, max_value, max_presets)) =
-            size_metric_min_max_offenders(state, problem_id, transcription, metric)
-        else {
-            continue;
-        };
-        let values = size_metric_distinct_values(state, problem_id, transcription, metric);
-        if values.len() > 1 {
-            details.push(format!(
-                "{} {}:{} -> {}:{}",
-                label,
-                compact_count(min_value),
-                summarize_offending_presets(state, &min_presets),
-                compact_count(max_value),
-                summarize_offending_presets(state, &max_presets)
-            ));
-        }
-    }
-
-    if !details.is_empty() {
-        let has_large_spread = size_case_has_large_spread(state, problem_id, transcription);
-        return (
-            details.join(" | "),
-            if has_large_spread {
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Red)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            },
-        );
-    }
-
-    let all_complete = [SizeMetric::RootInstructions, SizeMetric::TotalInstructions]
-        .into_iter()
-        .all(|metric| size_metric_complete(state, problem_id, transcription, metric));
-    if all_complete {
-        (
-            "ok".to_string(),
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        )
-    } else {
-        ("pending".to_string(), Style::default().fg(Color::DarkGray))
-    }
 }
 
 fn nnz_summary_rows(state: &ProgressState) -> Vec<Row<'static>> {
@@ -2506,10 +2362,11 @@ fn nnz_metric_offender_groups(
 }
 
 fn size_metric_distinct_values(
+    section: MatrixSection,
+    stage: MatrixStage,
     state: &ProgressState,
     problem_id: ProblemId,
     transcription: TranscriptionMethod,
-    metric: SizeMetric,
 ) -> Vec<usize> {
     let mut values = state
         .case_cells
@@ -2519,102 +2376,11 @@ fn size_metric_distinct_values(
                 && cell.case.transcription == transcription
                 && preset_applies_to_transcription(cell.case.preset, transcription)
         })
-        .filter_map(|cell| size_metric_value(cell, metric))
+        .filter_map(|cell| size_ratio_metric_value(section, stage, cell))
         .collect::<Vec<_>>();
     values.sort_unstable();
     values.dedup();
     values
-}
-
-fn size_metric_complete(
-    state: &ProgressState,
-    problem_id: ProblemId,
-    transcription: TranscriptionMethod,
-    metric: SizeMetric,
-) -> bool {
-    let applicable = state
-        .presets
-        .iter()
-        .copied()
-        .filter(|preset| preset_applies_to_transcription(*preset, transcription))
-        .count();
-    state
-        .case_cells
-        .iter()
-        .filter(|cell| {
-            cell.case.problem_id == problem_id
-                && cell.case.transcription == transcription
-                && preset_applies_to_transcription(cell.case.preset, transcription)
-        })
-        .filter(|cell| size_metric_value(cell, metric).is_some())
-        .count()
-        == applicable
-}
-
-fn size_metric_min_max_offenders(
-    state: &ProgressState,
-    problem_id: ProblemId,
-    transcription: TranscriptionMethod,
-    metric: SizeMetric,
-) -> Option<(usize, Vec<OcpBenchmarkPreset>, usize, Vec<OcpBenchmarkPreset>)> {
-    let values = state
-        .case_cells
-        .iter()
-        .filter(|cell| {
-            cell.case.problem_id == problem_id
-                && cell.case.transcription == transcription
-                && preset_applies_to_transcription(cell.case.preset, transcription)
-        })
-        .filter_map(|cell| size_metric_value(cell, metric).map(|value| (cell.case.preset, value)))
-        .collect::<Vec<_>>();
-    let min_value = values.iter().map(|(_, value)| *value).min()?;
-    let max_value = values.iter().map(|(_, value)| *value).max()?;
-    let min_offenders = values
-        .iter()
-        .filter_map(|(preset, value)| (*value == min_value).then_some(*preset))
-        .collect::<Vec<_>>();
-    let max_offenders = values
-        .into_iter()
-        .filter_map(|(preset, value)| (value == max_value).then_some(preset))
-        .collect::<Vec<_>>();
-    Some((min_value, min_offenders, max_value, max_offenders))
-}
-
-fn size_metric_style(
-    state: &ProgressState,
-    problem_id: ProblemId,
-    transcription: TranscriptionMethod,
-    metric: SizeMetric,
-) -> Style {
-    let values = size_metric_distinct_values(state, problem_id, transcription, metric);
-    let Some(min_value) = values.first().copied() else {
-        return Style::default().fg(Color::DarkGray);
-    };
-    let max_value = *values.last().expect("non-empty values has last");
-    if min_value == max_value {
-        return Style::default().fg(Color::White);
-    }
-    if max_value >= min_value.saturating_mul(10) {
-        Style::default().fg(Color::White).bg(Color::Red)
-    } else {
-        Style::default().fg(Color::Yellow)
-    }
-}
-
-fn size_case_has_large_spread(
-    state: &ProgressState,
-    problem_id: ProblemId,
-    transcription: TranscriptionMethod,
-) -> bool {
-    [SizeMetric::RootInstructions, SizeMetric::TotalInstructions]
-        .into_iter()
-        .any(|metric| {
-            let values = size_metric_distinct_values(state, problem_id, transcription, metric);
-            match (values.first(), values.last()) {
-                (Some(min), Some(max)) => *max >= min.saturating_mul(10) && max != min,
-                _ => false,
-            }
-        })
 }
 
 fn summarize_offending_presets(state: &ProgressState, presets: &[OcpBenchmarkPreset]) -> String {
@@ -2693,118 +2459,11 @@ fn summarize_distinct_nnz(values: &[usize]) -> String {
     }
 }
 
-fn summarize_size_spread(values: &[usize]) -> String {
-    match values {
-        [] => "--".to_string(),
-        [value] => compact_count(*value),
-        values => {
-            let min = *values.first().unwrap();
-            let max = *values.last().unwrap();
-            format!(
-                "{}->{} ({})",
-                compact_count(min),
-                compact_count(max),
-                format_ratio(max, min)
-            )
-        }
-    }
-}
-
-fn winner_metric_label(metric: WinnerMetric) -> &'static str {
-    match metric {
-        WinnerMetric::Symbolic => "Best Symbolic",
-        WinnerMetric::Jit => "Best JIT",
-        WinnerMetric::Eval100 => "Best Eval",
-        WinnerMetric::Overall100 => "Best Overall",
-    }
-}
-
-fn winner_case_label(cell: &CaseCell) -> String {
-    format!(
-        "{}/{}",
-        short_problem_label(cell.case.problem_id),
-        preset_display_name(cell.case.preset),
-    )
-}
-
 fn preset_applies_to_transcription(
-    preset: OcpBenchmarkPreset,
-    transcription: TranscriptionMethod,
+    _preset: OcpBenchmarkPreset,
+    _transcription: TranscriptionMethod,
 ) -> bool {
-    match preset {
-        OcpBenchmarkPreset::BaselineWithMsIntegrator => {
-            matches!(transcription, TranscriptionMethod::MultipleShooting)
-        }
-        _ => true,
-    }
-}
-
-fn best_case_for_metric(
-    state: &ProgressState,
-    transcription: TranscriptionMethod,
-    metric: WinnerMetric,
-) -> Option<&CaseCell> {
-    state
-        .case_cells
-        .iter()
-        .filter(|cell| cell.case.transcription == transcription)
-        .filter(|cell| preset_applies_to_transcription(cell.case.preset, transcription))
-        .filter_map(|cell| winner_metric_value(cell, metric).map(|value| (cell, value)))
-        .min_by(|lhs, rhs| {
-            lhs.1
-                .partial_cmp(&rhs.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|(cell, _)| cell)
-}
-
-fn winner_metric_style(
-    state: &ProgressState,
-    transcription: TranscriptionMethod,
-    metric: WinnerMetric,
-    value: Option<f64>,
-) -> Style {
-    let Some(value) = value else {
-        return Style::default().fg(Color::DarkGray);
-    };
-    let values = state
-        .case_cells
-        .iter()
-        .filter(|cell| cell.case.transcription == transcription)
-        .filter(|cell| preset_applies_to_transcription(cell.case.preset, transcription))
-        .filter_map(|cell| winner_metric_value(cell, metric))
-        .collect::<Vec<_>>();
-    if values.is_empty() {
-        return Style::default().fg(Color::DarkGray);
-    }
-    let Some(best) = values
-        .iter()
-        .copied()
-        .min_by(|lhs, rhs| lhs.partial_cmp(rhs).unwrap_or(std::cmp::Ordering::Equal))
-    else {
-        return Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD);
-    };
-    let Some(worst) = values
-        .iter()
-        .copied()
-        .max_by(|lhs, rhs| lhs.partial_cmp(rhs).unwrap_or(std::cmp::Ordering::Equal))
-    else {
-        return Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD);
-    };
-    let spread = worst - best;
-    if approximately_equal(best, worst) || spread <= f64::EPSILON {
-        return Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD);
-    }
-    let normalized = ((value - best) / spread).clamp(0.0, 1.0);
-    Style::default()
-        .fg(heatmap_color(normalized))
-        .add_modifier(Modifier::BOLD)
+    true
 }
 
 fn winner_metric_value(cell: &CaseCell, metric: WinnerMetric) -> Option<f64> {
@@ -2858,30 +2517,33 @@ fn transposed_matrix_cell_width(terminal_width: usize, panel_count: usize) -> us
     }
 }
 
-fn matrix_label_detail(panel_width: usize, case_count: usize) -> LabelDetail {
-    let cell_width = transposed_matrix_cell_width(panel_width, 1);
-    let base_available = panel_width.saturating_sub(case_count * (cell_width + 1));
-    if base_available >= 13 {
+fn symbolic_count_cell_width(terminal_width: usize, panel_count: usize) -> usize {
+    let width_per_panel = terminal_width / panel_count.max(1);
+    if width_per_panel < 56 {
+        4
+    } else if width_per_panel < 72 {
+        5
+    } else {
+        6
+    }
+}
+
+fn matrix_label_detail_from_available(available: usize) -> LabelDetail {
+    if available >= 13 {
         LabelDetail::Full
-    } else if base_available >= 10 {
+    } else if available >= 10 {
         LabelDetail::Medium
     } else {
         LabelDetail::Short
     }
 }
 
-fn matrix_row_label_width(
-    panel_width: usize,
-    case_count: usize,
-    cell_width: usize,
-    column_spacing: usize,
+fn matrix_row_label_width_from_available(
+    available: usize,
     presets: &[OcpBenchmarkPreset],
     detail: LabelDetail,
     section: MatrixSection,
 ) -> usize {
-    let available = panel_width
-        .saturating_sub(case_count * cell_width)
-        .saturating_sub(case_count * column_spacing);
     let longest_preset = presets
         .iter()
         .map(|&preset| {
@@ -3043,14 +2705,130 @@ fn timing_cell_widget(
     }
 }
 
+fn section_has_size_column(section: MatrixSection) -> bool {
+    matches!(section, MatrixSection::Symbolic | MatrixSection::Jit)
+}
+
+fn size_ratio_cell_widget(
+    section: MatrixSection,
+    stage: MatrixStage,
+    cell: &CaseCell,
+    state: &ProgressState,
+) -> (String, Style) {
+    if !preset_applies_to_transcription(cell.case.preset, cell.case.transcription) {
+        return ("--".to_string(), Style::default().fg(Color::DarkGray));
+    }
+    let Some(value) = size_ratio_metric_value(section, stage, cell) else {
+        return ("..".to_string(), Style::default().fg(Color::DarkGray));
+    };
+    let text = match baseline_size_value(
+        section,
+        stage,
+        state,
+        cell.case.problem_id,
+        cell.case.transcription,
+    ) {
+        Some(_) if cell.case.preset == OcpBenchmarkPreset::Baseline => compact_count(value),
+        Some(reference) => format_blowup_factor(value, reference),
+        None => compact_count(value),
+    };
+    (
+        text,
+        size_ratio_metric_style(
+            section,
+            stage,
+            state,
+            cell.case.problem_id,
+            cell.case.transcription,
+            value,
+        ),
+    )
+}
+
+fn size_ratio_metric_value(
+    section: MatrixSection,
+    stage: MatrixStage,
+    cell: &CaseCell,
+) -> Option<usize> {
+    match (section, stage) {
+        (MatrixSection::Symbolic, _) => cell.llvm_total_instruction_count,
+        (MatrixSection::Jit, MatrixStage::NlpJit) => cell.llvm_root_instruction_count,
+        (MatrixSection::Jit, MatrixStage::XdotHelperJit) => cell.xdot_helper_root_instruction_count,
+        (MatrixSection::Jit, MatrixStage::MultipleShootingArcHelperJit) => {
+            cell.multiple_shooting_arc_helper_root_instruction_count
+        }
+        (MatrixSection::Jit, _) => None,
+        (MatrixSection::Runtime, _) => None,
+    }
+}
+
+fn baseline_size_value(
+    section: MatrixSection,
+    stage: MatrixStage,
+    state: &ProgressState,
+    problem_id: ProblemId,
+    transcription: TranscriptionMethod,
+) -> Option<usize> {
+    state
+        .case_cells
+        .iter()
+        .find(|cell| {
+            cell.case.problem_id == problem_id
+                && cell.case.transcription == transcription
+                && cell.case.preset == OcpBenchmarkPreset::Baseline
+        })
+        .and_then(|cell| size_ratio_metric_value(section, stage, cell))
+}
+
+fn size_ratio_metric_style(
+    section: MatrixSection,
+    stage: MatrixStage,
+    state: &ProgressState,
+    problem_id: ProblemId,
+    transcription: TranscriptionMethod,
+    value: usize,
+) -> Style {
+    let values = size_metric_distinct_values(
+        section,
+        stage,
+        state,
+        problem_id,
+        transcription,
+    );
+    let Some(min_value) = values.first().copied() else {
+        return Style::default().fg(Color::DarkGray);
+    };
+    let max_value = *values.last().expect("non-empty values has last");
+    if min_value == max_value {
+        return Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD);
+    }
+    let best_blowup = 1.0_f64;
+    let worst_blowup = max_value as f64 / min_value as f64;
+    let blowup = value as f64 / min_value as f64;
+    let normalized = if approximately_equal(best_blowup, worst_blowup) {
+        0.0
+    } else {
+        ((blowup - best_blowup) / (worst_blowup - best_blowup)).clamp(0.0, 1.0)
+    };
+    Style::default()
+        .fg(heatmap_color(normalized))
+        .add_modifier(Modifier::BOLD)
+}
+
 fn timing_metric_style(
     state: &ProgressState,
     cell: &CaseCell,
     stage: MatrixStage,
     value: f64,
 ) -> Style {
-    let group = matrix_stage_heatmap_group(stage);
-    let values = timing_heatmap_values(state, cell.case.problem_id, cell.case.transcription, group);
+    let values = timing_heatmap_values_for_stage(
+        state,
+        cell.case.problem_id,
+        cell.case.transcription,
+        stage,
+    );
     if values.len() < 2 {
         return Style::default()
             .fg(Color::White)
@@ -3112,22 +2890,15 @@ fn nnz_metric_value(cell: &CaseCell, metric: NnzMetric) -> Option<usize> {
     }
 }
 
-fn size_metric_value(cell: &CaseCell, metric: SizeMetric) -> Option<usize> {
-    match metric {
-        SizeMetric::RootInstructions => cell.llvm_root_instruction_count,
-        SizeMetric::TotalInstructions => cell.llvm_total_instruction_count,
-    }
-}
-
 fn compact_count(value: usize) -> String {
     compact_nnz(value)
 }
 
-fn format_ratio(max: usize, min: usize) -> String {
-    if min == 0 {
+fn format_blowup_factor(value: usize, min_value: usize) -> String {
+    if min_value == 0 {
         return "infx".to_string();
     }
-    let ratio = max as f64 / min as f64;
+    let ratio = value as f64 / min_value as f64;
     if ratio >= 100.0 {
         format!("{ratio:.0}x")
     } else if ratio >= 10.0 {
@@ -3159,35 +2930,11 @@ fn approximately_equal(lhs: f64, rhs: f64) -> bool {
     (lhs - rhs).abs() <= 1.0e-12_f64.max(lhs.abs().max(rhs.abs()) * 1.0e-9)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MatrixHeatmapGroup {
-    PreEval,
-    Eval,
-}
-
-fn matrix_stage_heatmap_group(stage: MatrixStage) -> MatrixHeatmapGroup {
-    match stage {
-        MatrixStage::Objective
-        | MatrixStage::Gradient
-        | MatrixStage::Jacobian
-        | MatrixStage::Hessian => MatrixHeatmapGroup::Eval,
-        MatrixStage::Build
-        | MatrixStage::SymbolicGradient
-        | MatrixStage::EqualityJacobianBuild
-        | MatrixStage::InequalityJacobianBuild
-        | MatrixStage::LagrangianAssembly
-        | MatrixStage::HessianGeneration
-        | MatrixStage::NlpJit
-        | MatrixStage::XdotHelperJit
-        | MatrixStage::MultipleShootingArcHelperJit => MatrixHeatmapGroup::PreEval,
-    }
-}
-
-fn timing_heatmap_values(
+fn timing_heatmap_values_for_stage(
     state: &ProgressState,
     problem_id: ProblemId,
     transcription: TranscriptionMethod,
-    group: MatrixHeatmapGroup,
+    stage: MatrixStage,
 ) -> Vec<f64> {
     state
         .case_cells
@@ -3197,13 +2944,40 @@ fn timing_heatmap_values(
         })
         .flat_map(|cell| {
             matrix_rows().iter().filter_map(move |row| match row {
-                MatrixRow::Time(stage) if matrix_stage_heatmap_group(*stage) == group => {
-                    timing_metric_value(cell, *stage)
+                MatrixRow::Time(candidate)
+                    if stage_heatmap_bucket(*candidate) == stage_heatmap_bucket(stage) =>
+                {
+                    timing_metric_value(cell, *candidate)
                 }
                 _ => None,
             })
         })
         .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StageHeatmapBucket {
+    SymbolicColumn,
+    JitGroup(MatrixStage),
+    EvalColumn,
+}
+
+fn stage_heatmap_bucket(stage: MatrixStage) -> StageHeatmapBucket {
+    match stage {
+        MatrixStage::Build
+        | MatrixStage::SymbolicGradient
+        | MatrixStage::EqualityJacobianBuild
+        | MatrixStage::InequalityJacobianBuild
+        | MatrixStage::LagrangianAssembly
+        | MatrixStage::HessianGeneration => StageHeatmapBucket::SymbolicColumn,
+        MatrixStage::NlpJit
+        | MatrixStage::XdotHelperJit
+        | MatrixStage::MultipleShootingArcHelperJit => StageHeatmapBucket::JitGroup(stage),
+        MatrixStage::Objective
+        | MatrixStage::Gradient
+        | MatrixStage::Jacobian
+        | MatrixStage::Hessian => StageHeatmapBucket::EvalColumn,
+    }
 }
 
 fn heatmap_color(normalized: f64) -> Color {
@@ -3380,7 +3154,9 @@ fn print_event_line(event: OcpBenchmarkProgress) {
                 metadata.stats.equality_count,
                 metadata.stats.inequality_count,
             ),
-            OcpCompileProgress::HelperCompiled { helper, elapsed } => eprintln!(
+            OcpCompileProgress::HelperCompiled {
+                helper, elapsed, ..
+            } => eprintln!(
                 "  helper ready: {} in {}",
                 match helper {
                     optimal_control::OcpCompileHelperKind::Xdot => "xdot",
@@ -3450,6 +3226,8 @@ fn update_case_started(state: &mut ProgressState, case: OcpBenchmarkCase) {
         cell.hessian_nnz = None;
         cell.llvm_root_instruction_count = None;
         cell.llvm_total_instruction_count = None;
+        cell.xdot_helper_root_instruction_count = None;
+        cell.multiple_shooting_arc_helper_root_instruction_count = None;
         cell.eval_samples = 0;
         cell.sanity = SanityStatus::Ok;
         cell.warnings = 0;
@@ -3532,7 +3310,11 @@ fn update_case_compile_progress(
                 cell.jit = StageCell::Running(now);
                 cell.nlp_jit = StageCell::Running(now);
             }
-            OcpCompileProgress::HelperCompiled { helper, elapsed } => {
+            OcpCompileProgress::HelperCompiled {
+                helper,
+                elapsed,
+                root_instructions,
+            } => {
                 finalize_running_stage(&mut cell.symbolic);
                 cell.active_symbolic_stage = None;
                 if !matches!(cell.jit, StageCell::Done(_)) {
@@ -3542,6 +3324,7 @@ fn update_case_compile_progress(
                     OcpCompileHelperKind::Xdot => {
                         finalize_running_stage(&mut cell.nlp_jit);
                         cell.xdot_helper_compile_s = Some(elapsed.as_secs_f64());
+                        cell.xdot_helper_root_instruction_count = Some(root_instructions);
                         cell.xdot_helper_jit = done_cell(cell.xdot_helper_compile_s);
                         if matches!(case.transcription, TranscriptionMethod::MultipleShooting) {
                             cell.multiple_shooting_arc_helper_jit = StageCell::Running(now);
@@ -3549,6 +3332,8 @@ fn update_case_compile_progress(
                     }
                     OcpCompileHelperKind::MultipleShootingArc => {
                         cell.multiple_shooting_arc_helper_compile_s = Some(elapsed.as_secs_f64());
+                        cell.multiple_shooting_arc_helper_root_instruction_count =
+                            Some(root_instructions);
                         cell.multiple_shooting_arc_helper_jit =
                             done_cell(cell.multiple_shooting_arc_helper_compile_s);
                     }
@@ -3620,6 +3405,9 @@ fn update_case_finished(state: &mut ProgressState, record: &OcpBenchmarkRecord) 
         cell.xdot_helper_compile_s = record.helper_compile.xdot_helper_s;
         cell.multiple_shooting_arc_helper_compile_s =
             record.helper_compile.multiple_shooting_arc_helper_s;
+        cell.xdot_helper_root_instruction_count = record.helper_compile.xdot_helper_root_instructions;
+        cell.multiple_shooting_arc_helper_root_instruction_count =
+            record.helper_compile.multiple_shooting_arc_helper_root_instructions;
         cell.nlp_jit = done_cell(cell.compile_nlp_jit_s);
         cell.xdot_helper_jit = if jit_stage_applicable(cell, MatrixStage::XdotHelperJit) {
             done_cell(cell.xdot_helper_compile_s)
@@ -4005,12 +3793,6 @@ fn compact_cell_seconds(seconds: f64) -> String {
     } else {
         format!("{:.0}us", seconds * 1.0e6)
     }
-}
-
-fn compact_optional_cell_seconds(value: Option<f64>) -> String {
-    value
-        .map(compact_cell_seconds)
-        .unwrap_or_else(|| "--".to_string())
 }
 
 fn format_optional_seconds(value: Option<f64>) -> String {

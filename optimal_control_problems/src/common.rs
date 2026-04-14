@@ -2090,7 +2090,9 @@ pub fn ocp_compile_progress_update(
                 0,
             )];
         }
-        OcpCompileProgress::HelperCompiled { helper, elapsed } => {
+        OcpCompileProgress::HelperCompiled {
+            helper, elapsed, ..
+        } => {
             upsert_phase_detail(
                 &mut state.phase_details.jit,
                 helper_compile_detail_label(helper),
@@ -6338,6 +6340,7 @@ mod tests {
             OcpCompileProgress::HelperCompiled {
                 helper: OcpCompileHelperKind::Xdot,
                 elapsed: Duration::from_millis(125),
+                root_instructions: 42,
             },
             &mut state,
         );
@@ -6349,6 +6352,7 @@ mod tests {
             OcpCompileProgress::HelperCompiled {
                 helper: OcpCompileHelperKind::MultipleShootingArc,
                 elapsed: Duration::from_secs_f64(4.5),
+                root_instructions: 84,
             },
             &mut state,
         );

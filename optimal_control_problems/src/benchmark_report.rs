@@ -13,7 +13,7 @@ use std::time::Duration;
 use anyhow::Result;
 use optimal_control::{
     CollocationFamily, OcpCompileOptions, OcpCompileProgress, OcpHelperCompileStats,
-    OcpKernelFunctionOptions, OcpSymbolicFunctionOptions,
+    OcpSymbolicFunctionOptions,
 };
 use optimization::{
     CallPolicy, FunctionCompileOptions, KernelBenchmarkStats, LlvmOptimizationLevel,
@@ -33,7 +33,6 @@ pub enum OcpBenchmarkPreset {
     FunctionInlineAtLowering,
     FunctionInlineInLlvm,
     FunctionNoInlineLlvm,
-    BaselineWithMsIntegrator,
 }
 
 impl OcpBenchmarkPreset {
@@ -55,7 +54,6 @@ impl OcpBenchmarkPreset {
             Self::FunctionInlineAtLowering,
             Self::FunctionInlineInLlvm,
             Self::FunctionNoInlineLlvm,
-            Self::BaselineWithMsIntegrator,
         ]
     }
 
@@ -67,7 +65,6 @@ impl OcpBenchmarkPreset {
             Self::FunctionInlineAtLowering => "function_inline_at_lowering",
             Self::FunctionInlineInLlvm => "function_inline_in_llvm",
             Self::FunctionNoInlineLlvm => "function_noinline_llvm",
-            Self::BaselineWithMsIntegrator => "baseline_with_ms_integrator",
         }
     }
 
@@ -79,7 +76,6 @@ impl OcpBenchmarkPreset {
             Self::FunctionInlineAtLowering => "Functions / Inline At Lowering",
             Self::FunctionInlineInLlvm => "Functions / Inline In LLVM",
             Self::FunctionNoInlineLlvm => "Functions / NoInline LLVM",
-            Self::BaselineWithMsIntegrator => "Baseline + MS Integrator",
         }
     }
 
@@ -103,9 +99,6 @@ impl OcpBenchmarkPreset {
             Self::FunctionNoInlineLlvm => {
                 "Keep reusable call boundaries through lowering and preserve internal LLVM calls."
             }
-            Self::BaselineWithMsIntegrator => {
-                "Baseline defaults plus an explicit reusable multiple-shooting integrator symbolic function."
-            }
         }
     }
 
@@ -117,7 +110,6 @@ impl OcpBenchmarkPreset {
             "function_inline_at_lowering" => Some(Self::FunctionInlineAtLowering),
             "function_inline_in_llvm" => Some(Self::FunctionInlineInLlvm),
             "function_noinline_llvm" => Some(Self::FunctionNoInlineLlvm),
-            "baseline_with_ms_integrator" => Some(Self::BaselineWithMsIntegrator),
             _ => None,
         }
     }
@@ -140,12 +132,6 @@ impl OcpBenchmarkPreset {
             }
             Self::FunctionNoInlineLlvm => {
                 OcpSymbolicFunctionOptions::function_all_with_call_policy(CallPolicy::NoInlineLLVM)
-            }
-            Self::BaselineWithMsIntegrator => {
-                let mut symbolic_functions = OcpSymbolicFunctionOptions::default();
-                symbolic_functions.multiple_shooting_integrator =
-                    OcpKernelFunctionOptions::function_with_call_policy(CallPolicy::InlineInLLVM);
-                symbolic_functions
             }
         };
         OcpCompileOptions {
@@ -238,6 +224,10 @@ pub struct OcpHelperCompileSummary {
     pub xdot_helper_s: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub multiple_shooting_arc_helper_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xdot_helper_root_instructions: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub multiple_shooting_arc_helper_root_instructions: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_s: Option<f64>,
 }
@@ -1714,6 +1704,9 @@ fn summarize_helper_compile(stats: OcpHelperCompileStats) -> OcpHelperCompileSum
     OcpHelperCompileSummary {
         xdot_helper_s,
         multiple_shooting_arc_helper_s,
+        xdot_helper_root_instructions: stats.xdot_helper_root_instructions,
+        multiple_shooting_arc_helper_root_instructions: stats
+            .multiple_shooting_arc_helper_root_instructions,
         total_s: sum_options([xdot_helper_s, multiple_shooting_arc_helper_s]),
     }
 }

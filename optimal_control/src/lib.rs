@@ -800,6 +800,7 @@ pub enum OcpCompileProgress {
     HelperCompiled {
         helper: OcpCompileHelperKind,
         elapsed: Duration,
+        root_instructions: usize,
     },
 }
 
@@ -807,6 +808,8 @@ pub enum OcpCompileProgress {
 pub struct OcpHelperCompileStats {
     pub xdot_helper_time: Option<Duration>,
     pub multiple_shooting_arc_helper_time: Option<Duration>,
+    pub xdot_helper_root_instructions: Option<usize>,
+    pub multiple_shooting_arc_helper_root_instructions: Option<usize>,
 }
 
 pub struct CompiledMultipleShootingOcp<
@@ -1727,9 +1730,12 @@ where
             options.function_options,
         )?;
         let xdot_helper_time = xdot_started.elapsed();
+        let xdot_helper_root_instructions =
+            xdot_helper.function.compile_report().stats.llvm_root_instructions_emitted;
         on_progress(OcpCompileProgress::HelperCompiled {
             helper: OcpCompileHelperKind::Xdot,
             elapsed: xdot_helper_time,
+            root_instructions: xdot_helper_root_instructions,
         });
         let rk4_arc_started = Instant::now();
         let rk4_arc_helper = compile_multiple_shooting_arc_helper::<X, U, P, RK4_SUBSTEPS>(
@@ -1738,9 +1744,15 @@ where
             options.function_options,
         )?;
         let multiple_shooting_arc_helper_time = rk4_arc_started.elapsed();
+        let multiple_shooting_arc_helper_root_instructions = rk4_arc_helper
+            .function
+            .compile_report()
+            .stats
+            .llvm_root_instructions_emitted;
         on_progress(OcpCompileProgress::HelperCompiled {
             helper: OcpCompileHelperKind::MultipleShootingArc,
             elapsed: multiple_shooting_arc_helper_time,
+            root_instructions: multiple_shooting_arc_helper_root_instructions,
         });
         Ok(CompiledMultipleShootingOcp {
             compiled,
@@ -1751,6 +1763,10 @@ where
             helper_compile_stats: OcpHelperCompileStats {
                 xdot_helper_time: Some(xdot_helper_time),
                 multiple_shooting_arc_helper_time: Some(multiple_shooting_arc_helper_time),
+                xdot_helper_root_instructions: Some(xdot_helper_root_instructions),
+                multiple_shooting_arc_helper_root_instructions: Some(
+                    multiple_shooting_arc_helper_root_instructions,
+                ),
             },
             _marker: PhantomData,
         })
@@ -2323,9 +2339,12 @@ where
             options.function_options,
         )?;
         let xdot_helper_time = xdot_started.elapsed();
+        let xdot_helper_root_instructions =
+            xdot_helper.function.compile_report().stats.llvm_root_instructions_emitted;
         on_progress(OcpCompileProgress::HelperCompiled {
             helper: OcpCompileHelperKind::Xdot,
             elapsed: xdot_helper_time,
+            root_instructions: xdot_helper_root_instructions,
         });
         Ok(CompiledDirectCollocationOcp {
             compiled,
@@ -2336,6 +2355,8 @@ where
             helper_compile_stats: OcpHelperCompileStats {
                 xdot_helper_time: Some(xdot_helper_time),
                 multiple_shooting_arc_helper_time: None,
+                xdot_helper_root_instructions: Some(xdot_helper_root_instructions),
+                multiple_shooting_arc_helper_root_instructions: None,
             },
             _marker: PhantomData,
         })
