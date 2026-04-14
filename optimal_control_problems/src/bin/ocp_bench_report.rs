@@ -1892,13 +1892,25 @@ fn render_timing_section_panel(
 }
 
 fn render_bottom_summary_widgets(frame: &mut Frame, area: Rect, state: &ProgressState) {
-    if area.width >= 180 {
+    if area.width >= 230 {
         let sections = Layout::default()
             .direction(ratatui::layout::Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(33),
-                Constraint::Percentage(23),
                 Constraint::Percentage(44),
+                Constraint::Percentage(18),
+                Constraint::Percentage(38),
+            ])
+            .split(area);
+        render_size_summary_widget(frame, sections[0], state);
+        render_nnz_summary_widget(frame, sections[1], state);
+        render_best_summary_widget(frame, sections[2], state);
+    } else if area.width >= 180 {
+        let sections = Layout::default()
+            .direction(ratatui::layout::Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(40),
+                Constraint::Percentage(20),
+                Constraint::Percentage(40),
             ])
             .split(area);
         render_size_summary_widget(frame, sections[0], state);
