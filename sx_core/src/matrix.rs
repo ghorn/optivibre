@@ -1,11 +1,12 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use crate::Index;
 use crate::ccs::CCS;
 use crate::error::{Result, SxError};
 use crate::sx::{
     JacobianStructure, SX, forward_directional, forward_directional_basis_batch,
-    jacobian_structure, reverse_directional, reverse_directional_batch, scalar_hessian_basis_batch,
+    greedy_color_disjoint, jacobian_structure, reverse_directional, reverse_directional_batch,
+    scalar_hessian_basis_batch,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -89,34 +90,49 @@ impl SXMatrix {
         SXMatrix::new(ccs, values)
     }
 
-    fn hessian_lower_triangle_program(&self, wrt: &SXMatrix) -> Result<SXMatrix> {
+    fn hessian_row_supports(
+        &self,
+        wrt: &SXMatrix,
+    ) -> Result<(SX, Vec<Vec<Index>>, Vec<Vec<Index>>)> {
         let expr = self.scalar_expr()?;
         let grad = self.gradient(wrt)?;
         let n = wrt.nnz();
         let full_ccs = grad.jacobian_ccs(wrt)?;
-        let mut row_sets = vec![Vec::new(); n];
+        let mut full_row_sets = vec![Vec::new(); n];
+        let mut lower_row_sets = vec![Vec::new(); n];
         for (row, col) in full_ccs.positions() {
+            full_row_sets[col].push(row);
             if row >= col {
-                row_sets[col].push(row);
+                lower_row_sets[col].push(row);
             }
         }
+        Ok((expr, full_row_sets, lower_row_sets))
+    }
 
-        let mut color_unions = Vec::<BTreeSet<Index>>::new();
-        let mut color_columns = Vec::<Vec<Index>>::new();
-        for (col, rows) in row_sets.iter().enumerate() {
-            let color_idx = color_unions
-                .iter()
-                .position(|union| rows.iter().all(|row| !union.contains(row)))
-                .unwrap_or_else(|| {
-                    color_unions.push(BTreeSet::new());
-                    color_columns.push(Vec::new());
-                    color_unions.len() - 1
-                });
-            for &row in rows {
-                color_unions[color_idx].insert(row);
-            }
-            color_columns[color_idx].push(col);
-        }
+    fn hessian_lower_triangle_program(&self, wrt: &SXMatrix) -> Result<SXMatrix> {
+        let (expr, full_row_sets, lower_row_sets) = self.hessian_row_supports(wrt)?;
+        let n = wrt.nnz();
+        let active_columns = lower_row_sets
+            .iter()
+            .enumerate()
+            .filter_map(|(col, rows)| (!rows.is_empty()).then_some(col))
+            .collect::<Vec<_>>();
+        // Color against the full column support, not just the stored lower triangle.
+        // Otherwise an upper-triangular dependency from another active column can alias
+        // into the compressed Hessian-vector product for this column.
+        let active_full_row_sets = active_columns
+            .iter()
+            .map(|&col| full_row_sets[col].clone())
+            .collect::<Vec<_>>();
+        let color_columns = greedy_color_disjoint(&active_full_row_sets)
+            .into_iter()
+            .map(|group| {
+                group
+                    .into_iter()
+                    .map(|active_idx| active_columns[active_idx])
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
 
         let mut columns = vec![Vec::new(); n];
         for group_batch in color_columns.chunks(JACOBIAN_BATCH_WIDTH) {
@@ -124,7 +140,7 @@ impl SXMatrix {
             for (direction, group) in group_batch.iter().enumerate() {
                 let sens = &sensitivities[direction];
                 for &col in group {
-                    for &row in &row_sets[col] {
+                    for &row in &lower_row_sets[col] {
                         columns[col].push((row, sens[row]));
                     }
                 }
@@ -134,19 +150,16 @@ impl SXMatrix {
     }
 
     fn hessian_lower_triangle_by_column(&self, wrt: &SXMatrix) -> Result<SXMatrix> {
-        let expr = self.scalar_expr()?;
-        let grad = self.gradient(wrt)?;
+        let (expr, _, lower_row_sets) = self.hessian_row_supports(wrt)?;
         let n = wrt.nnz();
-        let full_ccs = grad.jacobian_ccs(wrt)?;
-        let mut row_sets = vec![Vec::new(); n];
-        for (row, col) in full_ccs.positions() {
-            if row >= col {
-                row_sets[col].push(row);
-            }
-        }
 
         let mut columns = vec![Vec::new(); n];
-        for column_batch in (0..n).collect::<Vec<_>>().chunks(JACOBIAN_BATCH_WIDTH) {
+        let active_columns = lower_row_sets
+            .iter()
+            .enumerate()
+            .filter_map(|(col, rows)| (!rows.is_empty()).then_some(col))
+            .collect::<Vec<_>>();
+        for column_batch in active_columns.chunks(JACOBIAN_BATCH_WIDTH) {
             let active_groups = column_batch
                 .iter()
                 .map(|&col| vec![col])
@@ -154,7 +167,7 @@ impl SXMatrix {
             let sensitivities = scalar_hessian_basis_batch(expr, &wrt.nonzeros, &active_groups)?;
             for (direction, &col) in column_batch.iter().enumerate() {
                 let sens = &sensitivities[direction];
-                for &row in &row_sets[col] {
+                for &row in &lower_row_sets[col] {
                     columns[col].push((row, sens[row]));
                 }
             }

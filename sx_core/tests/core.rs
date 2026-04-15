@@ -296,6 +296,36 @@ fn hessian_strategies_match_on_rosenbrock() {
 }
 
 #[rstest]
+fn hessian_coloring_does_not_alias_upper_triangle_columns() {
+    let x0 = SX::sym("cx0");
+    let x1 = SX::sym("cx1");
+    let x2 = SX::sym("cx2");
+    let x = SXMatrix::dense_column(vec![x0, x1, x2]).unwrap();
+    let expr = SXMatrix::scalar(x0 * x1 + x1 * x2);
+    let values = HashMap::from([(x0.id(), 0.2), (x1.id(), -0.3), (x2.id(), 0.4)]);
+
+    let reference = expr
+        .hessian_with_strategy(&x, HessianStrategy::LowerTriangleByColumn)
+        .unwrap();
+    let colored = expr
+        .hessian_with_strategy(&x, HessianStrategy::LowerTriangleColored)
+        .unwrap();
+    let selected_outputs = expr
+        .hessian_with_strategy(&x, HessianStrategy::LowerTriangleSelectedOutputs)
+        .unwrap();
+
+    assert_eq!(reference.ccs().positions(), vec![(1, 0), (2, 1)]);
+    assert_eq!(colored.ccs(), reference.ccs());
+    assert_eq!(selected_outputs.ccs(), reference.ccs());
+    assert_abs_diff_eq!(eval(reference.get(1, 0), &values), 1.0, epsilon = 1e-12);
+    assert_abs_diff_eq!(eval(reference.get(2, 1), &values), 1.0, epsilon = 1e-12);
+    assert_abs_diff_eq!(eval(colored.get(1, 0), &values), 1.0, epsilon = 1e-12);
+    assert_abs_diff_eq!(eval(colored.get(2, 1), &values), 1.0, epsilon = 1e-12);
+    assert_abs_diff_eq!(eval(selected_outputs.get(1, 0), &values), 1.0, epsilon = 1e-12);
+    assert_abs_diff_eq!(eval(selected_outputs.get(2, 1), &values), 1.0, epsilon = 1e-12);
+}
+
+#[rstest]
 fn sx_function_validates_free_symbols() {
     let x = SXMatrix::sym_dense("x", 2, 1).unwrap();
     let y = SX::sym("y");
