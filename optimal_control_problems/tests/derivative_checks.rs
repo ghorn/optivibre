@@ -1,14 +1,37 @@
 use std::collections::BTreeMap;
+use std::thread;
 
 use optimal_control_problems::{
-    DerivativeCheckRequest, ProblemDerivativeCheck, ProblemId, TranscriptionMethod, problem_specs,
-    validate_problem_derivatives,
+    DerivativeCheckOrder, DerivativeCheckRequest, OcpBenchmarkPreset, ProblemDerivativeCheck,
+    ProblemId, TranscriptionMethod, problem_specs, validate_problem_derivatives,
 };
 use optimization::{FiniteDifferenceValidationOptions, ValidationSummary, ValidationTolerances};
 
 const FIRST_ORDER_TOLERANCES: ValidationTolerances = ValidationTolerances::new(5.0e-5, 5.0e-4);
+const SECOND_ORDER_TOLERANCES: ValidationTolerances = ValidationTolerances::new(1.0e-4, 1.0e-3);
 
-fn request_for(transcription: TranscriptionMethod) -> DerivativeCheckRequest {
+fn require_release_mode_for_manual_derivative_sweeps() {
+    assert!(
+        !cfg!(debug_assertions),
+        "manual derivative sweeps must be run in release mode\n\ntry:\n  cargo test -p optimal_control_problems --release --test derivative_checks all_ocp_problems_policy_matrix_first_order_derivatives_stay_clean -- --ignored --nocapture"
+    );
+}
+
+fn run_manual_sweep_with_large_stack(task: impl FnOnce() + Send + 'static) {
+    let handle = thread::Builder::new()
+        .name("manual-derivative-sweep".to_string())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(task)
+        .expect("manual derivative sweep thread should spawn");
+    if let Err(payload) = handle.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+fn request_for(
+    transcription: TranscriptionMethod,
+    preset: Option<OcpBenchmarkPreset>,
+) -> DerivativeCheckRequest {
     let mut values = BTreeMap::new();
     values.insert(
         "transcription_method".to_string(),
@@ -24,6 +47,7 @@ fn request_for(transcription: TranscriptionMethod) -> DerivativeCheckRequest {
             second_order_step: 1.0e-4,
             zero_tolerance: 1.0e-7,
         },
+        sx_functions_override: preset.map(OcpBenchmarkPreset::sx_function_config),
         ..DerivativeCheckRequest::default()
     }
 }
@@ -43,8 +67,44 @@ fn summary_line(label: &str, summary: &ValidationSummary) -> String {
             )
         },
     );
+    let worst_missing = summary
+        .sparsity
+        .worst_missing_from_analytic
+        .as_ref()
+        .map_or_else(
+            || "worst_missing=none".to_string(),
+            |entry| {
+                format!(
+                    "worst_missing=({}, {}) analytic={:.3e} fd={:.3e} abs={:.3e} rel={:.3e}",
+                    entry.row,
+                    entry.col,
+                    entry.analytic,
+                    entry.finite_difference,
+                    entry.abs_error,
+                    entry.rel_error
+                )
+            },
+        );
+    let worst_extra = summary
+        .sparsity
+        .worst_extra_in_analytic
+        .as_ref()
+        .map_or_else(
+            || "worst_extra=none".to_string(),
+            |entry| {
+                format!(
+                    "worst_extra=({}, {}) analytic={:.3e} fd={:.3e} abs={:.3e} rel={:.3e}",
+                    entry.row,
+                    entry.col,
+                    entry.analytic,
+                    entry.finite_difference,
+                    entry.abs_error,
+                    entry.rel_error
+                )
+            },
+        );
     format!(
-        "{label}: max_abs={:.3e} max_rel={:.3e} rms_abs={:.3e} missing={} extra={} {worst}",
+        "{label}: max_abs={:.3e} max_rel={:.3e} rms_abs={:.3e} missing={} extra={} {worst} {worst_missing} {worst_extra}",
         summary.max_abs_error,
         summary.max_rel_error,
         summary.rms_abs_error,
@@ -89,7 +149,7 @@ fn format_check(check: &ProblemDerivativeCheck) -> String {
 fn glider_derivative_check_api_smoke() {
     let check = validate_problem_derivatives(
         ProblemId::OptimalDistanceGlider,
-        &request_for(TranscriptionMethod::MultipleShooting),
+        &request_for(TranscriptionMethod::MultipleShooting, None),
     )
     .expect("glider derivative check should compile and validate");
     assert!(
@@ -102,31 +162,133 @@ fn glider_derivative_check_api_smoke() {
 #[test]
 #[ignore = "manual full derivative sweep over all OCP problems and both transcriptions"]
 fn all_ocp_problems_first_order_derivatives_stay_clean() {
-    let mut failures = Vec::new();
-    for spec in problem_specs() {
-        for transcription in [
-            TranscriptionMethod::MultipleShooting,
-            TranscriptionMethod::DirectCollocation,
-        ] {
-            let check = match validate_problem_derivatives(spec.id, &request_for(transcription)) {
-                Ok(check) => check,
-                Err(err) => {
-                    failures.push(format!(
-                        "{} {:?}: derivative check failed to run: {err:#}",
-                        spec.name, transcription
-                    ));
-                    continue;
+    require_release_mode_for_manual_derivative_sweeps();
+    run_manual_sweep_with_large_stack(|| {
+        let mut failures = Vec::new();
+        for spec in problem_specs() {
+            for transcription in [
+                TranscriptionMethod::MultipleShooting,
+                TranscriptionMethod::DirectCollocation,
+            ] {
+                let check =
+                    match validate_problem_derivatives(spec.id, &request_for(transcription, None)) {
+                        Ok(check) => check,
+                        Err(err) => {
+                            failures.push(format!(
+                                "{} {:?}: derivative check failed to run: {err:#}",
+                                spec.name, transcription
+                            ));
+                            continue;
+                        }
+                    };
+                println!("{}", format_check(&check));
+                if !check.first_order_is_within_tolerances(FIRST_ORDER_TOLERANCES) {
+                    failures.push(format_check(&check));
                 }
-            };
-            println!("{}", format_check(&check));
-            if !check.first_order_is_within_tolerances(FIRST_ORDER_TOLERANCES) {
-                failures.push(format_check(&check));
             }
         }
-    }
-    assert!(
-        failures.is_empty(),
-        "first-order derivative failures:\n\n{}",
-        failures.join("\n\n"),
-    );
+        assert!(
+            failures.is_empty(),
+            "first-order derivative failures:\n\n{}",
+            failures.join("\n\n"),
+        );
+    });
+}
+
+#[test]
+#[ignore = "manual policy-matrix derivative sweep over all OCP problems"]
+fn all_ocp_problems_policy_matrix_first_order_derivatives_stay_clean() {
+    require_release_mode_for_manual_derivative_sweeps();
+    run_manual_sweep_with_large_stack(|| {
+        let mut failures = Vec::new();
+        for spec in problem_specs() {
+            for transcription in [
+                TranscriptionMethod::MultipleShooting,
+                TranscriptionMethod::DirectCollocation,
+            ] {
+                for preset in OcpBenchmarkPreset::all() {
+                    let request = request_for(transcription, Some(*preset));
+                    let check = match validate_problem_derivatives(spec.id, &request) {
+                        Ok(check) => check,
+                        Err(err) => {
+                            failures.push(format!(
+                                "{} {:?} {}: derivative check failed to run: {err:#}",
+                                spec.name,
+                                transcription,
+                                preset.id()
+                            ));
+                            continue;
+                        }
+                    };
+                    println!("preset={}\n{}", preset.id(), format_check(&check));
+                    if !check.order_is_within_tolerances(
+                        DerivativeCheckOrder::First,
+                        FIRST_ORDER_TOLERANCES,
+                        SECOND_ORDER_TOLERANCES,
+                    ) {
+                        failures.push(format!("preset={}\n{}", preset.id(), format_check(&check)));
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "policy-matrix first-order derivative failures:\n\n{}",
+            failures.join("\n\n"),
+        );
+    });
+}
+
+#[test]
+#[ignore = "manual Hessian policy-matrix sweep over all OCP problems"]
+fn all_ocp_problems_policy_matrix_second_order_derivatives_stay_clean() {
+    require_release_mode_for_manual_derivative_sweeps();
+    run_manual_sweep_with_large_stack(|| {
+        let mut execution_failures = Vec::new();
+        let mut tolerance_misses = Vec::new();
+        for spec in problem_specs() {
+            for transcription in [
+                TranscriptionMethod::MultipleShooting,
+                TranscriptionMethod::DirectCollocation,
+            ] {
+                for preset in OcpBenchmarkPreset::all() {
+                    let request = request_for(transcription, Some(*preset));
+                    let check = match validate_problem_derivatives(spec.id, &request) {
+                        Ok(check) => check,
+                        Err(err) => {
+                            execution_failures.push(format!(
+                                "{} {:?} {}: derivative check failed to run: {err:#}",
+                                spec.name,
+                                transcription,
+                                preset.id()
+                            ));
+                            continue;
+                        }
+                    };
+                    println!("preset={}\n{}", preset.id(), format_check(&check));
+                    if !check.order_is_within_tolerances(
+                        DerivativeCheckOrder::Second,
+                        FIRST_ORDER_TOLERANCES,
+                        SECOND_ORDER_TOLERANCES,
+                    ) {
+                        tolerance_misses.push(format!(
+                            "preset={}\n{}",
+                            preset.id(),
+                            format_check(&check)
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            execution_failures.is_empty(),
+            "second-order survey had execution failures:\n\n{}",
+            execution_failures.join("\n\n"),
+        );
+        assert!(
+            tolerance_misses.is_empty(),
+            "second-order derivative failures:\n\n{}",
+            tolerance_misses.join("\n\n"),
+        );
+    });
 }

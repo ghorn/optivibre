@@ -13,15 +13,15 @@ use std::time::Duration;
 use anyhow::Result;
 use optimal_control::{
     CollocationFamily, OcpCompileOptions, OcpCompileProgress, OcpHelperCompileStats,
-    OcpSymbolicFunctionOptions,
 };
 use optimization::{
-    CallPolicy, FunctionCompileOptions, KernelBenchmarkStats, LlvmOptimizationLevel,
-    NlpBenchmarkPointSummary, NlpCompileStats, NlpEvaluationBenchmark,
-    NlpEvaluationBenchmarkOptions, NlpEvaluationKernelKind,
+    CallPolicy, KernelBenchmarkStats, LlvmOptimizationLevel, NlpBenchmarkPointSummary,
+    NlpCompileStats, NlpEvaluationBenchmark, NlpEvaluationBenchmarkOptions,
+    NlpEvaluationKernelKind,
 };
 use serde::Serialize;
 
+use crate::OcpSxFunctionConfig;
 use crate::common::{CompileReportSummary, ProblemId, TranscriptionMethod};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
@@ -115,28 +115,25 @@ impl OcpBenchmarkPreset {
     }
 
     pub fn compile_options(self, opt_level: LlvmOptimizationLevel) -> OcpCompileOptions {
-        let function_options = FunctionCompileOptions::from(opt_level);
-        let symbolic_functions = match self {
-            Self::Baseline => OcpSymbolicFunctionOptions::default(),
-            Self::InlineAll => OcpSymbolicFunctionOptions::inline_all(),
+        self.sx_function_config().compile_options(opt_level)
+    }
+
+    pub fn sx_function_config(self) -> OcpSxFunctionConfig {
+        match self {
+            Self::Baseline => OcpSxFunctionConfig::default(),
+            Self::InlineAll => OcpSxFunctionConfig::inline_all(),
             Self::FunctionInlineAtCall => {
-                OcpSymbolicFunctionOptions::function_all_with_call_policy(CallPolicy::InlineAtCall)
+                OcpSxFunctionConfig::all_functions_with_global_policy(CallPolicy::InlineAtCall)
             }
             Self::FunctionInlineAtLowering => {
-                OcpSymbolicFunctionOptions::function_all_with_call_policy(
-                    CallPolicy::InlineAtLowering,
-                )
+                OcpSxFunctionConfig::all_functions_with_global_policy(CallPolicy::InlineAtLowering)
             }
             Self::FunctionInlineInLlvm => {
-                OcpSymbolicFunctionOptions::function_all_with_call_policy(CallPolicy::InlineInLLVM)
+                OcpSxFunctionConfig::all_functions_with_global_policy(CallPolicy::InlineInLLVM)
             }
             Self::FunctionNoInlineLlvm => {
-                OcpSymbolicFunctionOptions::function_all_with_call_policy(CallPolicy::NoInlineLLVM)
+                OcpSxFunctionConfig::all_functions_with_global_policy(CallPolicy::NoInlineLLVM)
             }
-        };
-        OcpCompileOptions {
-            function_options,
-            symbolic_functions,
         }
     }
 }

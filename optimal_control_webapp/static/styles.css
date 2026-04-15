@@ -61,8 +61,6 @@ body {
 
 .sidebar {
   padding: 18px;
-  position: sticky;
-  top: 16px;
   align-self: start;
 }
 

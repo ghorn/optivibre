@@ -1,0 +1,29 @@
+name: Derivative Stress
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * *"
+
+concurrency:
+  group: derivative-stress-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  derivative-stress:
+    runs-on: macos-14
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      LLVM_SYS_221_PREFIX: /opt/homebrew/opt/llvm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+      - name: Install LLVM
+        run: brew install llvm
+      - name: All-problem policy-matrix first-order derivative sweep
+        run: cargo test -p optimal_control_problems --release --test derivative_checks all_ocp_problems_policy_matrix_first_order_derivatives_stay_clean -- --ignored --nocapture
+      - name: Generated direct-collocation inequality stress
+        run: cargo test -p optimal_control --release generated_direct_collocation_inequality_stress -- --ignored --nocapture

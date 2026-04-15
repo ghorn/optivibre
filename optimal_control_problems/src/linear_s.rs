@@ -140,6 +140,13 @@ impl StandardOcpParams for Params {
         &mut self.transcription
     }
 }
+
+impl crate::common::HasOcpSxFunctionConfig for Params {
+    fn sx_functions_mut(&mut self) -> &mut OcpSxFunctionConfig {
+        &mut self.sx_functions
+    }
+}
+
 impl FromMap for Params {
     fn from_map(values: &std::collections::BTreeMap<String, f64>) -> Result<Self> {
         let defaults = Self::default();
@@ -624,7 +631,8 @@ pub fn validate_derivatives(
 pub(crate) fn validate_derivatives_from_request(
     request: &crate::common::DerivativeCheckRequest,
 ) -> Result<crate::common::ProblemDerivativeCheck> {
-    let params = Params::from_map(&request.values)?;
+    let mut params = Params::from_map(&request.values)?;
+    crate::common::apply_derivative_request_overrides(&mut params, request);
     validate_derivatives(&params, request)
 }
 

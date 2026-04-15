@@ -49,6 +49,7 @@ pub struct ValidationSummary {
     pub max_rel_error: f64,
     pub worst_entry: Option<ValidationWorstEntry>,
     pub sparsity: ValidationSparsitySummary,
+    pub pareto_frontier: Vec<ValidationWorstEntry>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -76,8 +77,10 @@ pub struct NlpDerivativeValidationReport {
 
 impl ValidationSummary {
     pub fn is_within_tolerances(&self, tolerances: ValidationTolerances) -> bool {
-        self.max_abs_error <= tolerances.max_abs_error
-            || self.max_rel_error <= tolerances.max_rel_error
+        !self.pareto_frontier.iter().any(|entry| {
+            entry.abs_error > tolerances.max_abs_error
+                && entry.rel_error > tolerances.max_rel_error
+        })
     }
 }
 
@@ -144,7 +147,9 @@ pub fn validate_compiled_nlp_problem_derivatives(
     }
 
     let gradient_analytic = analytic_objective_gradient(problem, x, parameters);
+    ensure_finite_vector("objective_gradient analytic", &gradient_analytic)?;
     let gradient_fd = finite_difference_objective_gradient(problem, x, parameters, options);
+    ensure_finite_vector("objective_gradient finite difference", &gradient_fd)?;
 
     let equality_jacobian = if problem.equality_count() > 0 {
         let analytic = analytic_sparse_matrix(
@@ -152,6 +157,7 @@ pub fn validate_compiled_nlp_problem_derivatives(
             |values| problem.equality_jacobian_values(x, parameters, values),
             false,
         );
+        ensure_finite_matrix("equality_jacobian analytic", &analytic)?;
         let fd = finite_difference_constraint_jacobian(
             problem,
             x,
@@ -159,6 +165,7 @@ pub fn validate_compiled_nlp_problem_derivatives(
             true,
             options.first_order_step,
         );
+        ensure_finite_matrix("equality_jacobian finite difference", &fd)?;
         Some(summarize_validation(&analytic, &fd, options.zero_tolerance))
     } else {
         None
@@ -170,6 +177,7 @@ pub fn validate_compiled_nlp_problem_derivatives(
             |values| problem.inequality_jacobian_values(x, parameters, values),
             false,
         );
+        ensure_finite_matrix("inequality_jacobian analytic", &analytic)?;
         let fd = finite_difference_constraint_jacobian(
             problem,
             x,
@@ -177,6 +185,7 @@ pub fn validate_compiled_nlp_problem_derivatives(
             false,
             options.first_order_step,
         );
+        ensure_finite_matrix("inequality_jacobian finite difference", &fd)?;
         Some(summarize_validation(&analytic, &fd, options.zero_tolerance))
     } else {
         None
@@ -195,6 +204,7 @@ pub fn validate_compiled_nlp_problem_derivatives(
         },
         true,
     );
+    ensure_finite_matrix("lagrangian_hessian analytic", &hessian_analytic)?;
     let hessian_fd = finite_difference_lagrangian_hessian(
         problem,
         x,
@@ -203,6 +213,7 @@ pub fn validate_compiled_nlp_problem_derivatives(
         inequality_multipliers,
         options.second_order_step,
     );
+    ensure_finite_matrix("lagrangian_hessian finite difference", &hessian_fd)?;
 
     Ok(NlpDerivativeValidationReport {
         objective_gradient: summarize_validation(
@@ -218,6 +229,27 @@ pub fn validate_compiled_nlp_problem_derivatives(
             options.zero_tolerance,
         ),
     })
+}
+
+fn ensure_finite_vector(label: &str, values: &DVector<f64>) -> Result<()> {
+    for (index, value) in values.iter().enumerate() {
+        if !value.is_finite() {
+            bail!("{label} contains non-finite value at index {index}: {value}");
+        }
+    }
+    Ok(())
+}
+
+fn ensure_finite_matrix(label: &str, values: &DMatrix<f64>) -> Result<()> {
+    for row in 0..values.nrows() {
+        for col in 0..values.ncols() {
+            let value = values[(row, col)];
+            if !value.is_finite() {
+                bail!("{label} contains non-finite value at ({row}, {col}): {value}");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn analytic_objective_gradient(
@@ -441,6 +473,7 @@ fn summarize_validation(
     let mut squared_error_sum = 0.0;
     let mut worst_entry = None;
     let mut sparsity = ValidationSparsitySummary::default();
+    let mut pareto_frontier = Vec::new();
     let count = analytic.nrows() * analytic.ncols();
 
     for row in 0..analytic.nrows() {
@@ -468,6 +501,17 @@ fn summarize_validation(
             } else {
                 max_rel_error = max_rel_error.max(rel_error);
             }
+            record_pareto_entry(
+                &mut pareto_frontier,
+                ValidationWorstEntry {
+                    row,
+                    col,
+                    analytic: analytic_value,
+                    finite_difference: fd_value,
+                    abs_error,
+                    rel_error,
+                },
+            );
 
             let analytic_nz = analytic_value.abs() > zero_tolerance;
             let fd_nz = fd_value.abs() > zero_tolerance;
@@ -519,5 +563,38 @@ fn summarize_validation(
         max_rel_error,
         worst_entry,
         sparsity,
+        pareto_frontier,
+    }
+}
+
+fn record_pareto_entry(frontier: &mut Vec<ValidationWorstEntry>, candidate: ValidationWorstEntry) {
+    if frontier.iter().any(|entry| {
+        entry.abs_error >= candidate.abs_error && entry.rel_error >= candidate.rel_error
+    }) {
+        return;
+    }
+    frontier.retain(|entry| {
+        !(candidate.abs_error >= entry.abs_error && candidate.rel_error >= entry.rel_error)
+    });
+    frontier.push(candidate);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tolerance_check_is_entrywise_not_maxwise() {
+        let analytic = DMatrix::from_row_slice(1, 2, &[10_000.0, 0.0]);
+        let finite_difference = DMatrix::from_row_slice(1, 2, &[10_000.018_65, 1.137e-5]);
+        let summary = summarize_validation(&analytic, &finite_difference, 1.0e-7);
+
+        assert!((summary.max_abs_error - 1.865e-2).abs() < 1.0e-12);
+        assert!((summary.max_rel_error - 1.0).abs() < 1.0e-12);
+        assert!(
+            summary.is_within_tolerances(ValidationTolerances::new(1.0e-4, 1.0e-3)),
+            "each entry should satisfy abs-or-rel tolerances: {:?}",
+            summary
+        );
     }
 }

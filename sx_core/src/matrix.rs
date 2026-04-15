@@ -16,9 +16,9 @@ pub struct SXMatrix {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum HessianStrategy {
+    #[default]
     LowerTriangleByColumn,
     LowerTriangleSelectedOutputs,
-    #[default]
     LowerTriangleColored,
 }
 
@@ -134,7 +134,32 @@ impl SXMatrix {
     }
 
     fn hessian_lower_triangle_by_column(&self, wrt: &SXMatrix) -> Result<SXMatrix> {
-        self.hessian_lower_triangle_program(wrt)
+        let expr = self.scalar_expr()?;
+        let grad = self.gradient(wrt)?;
+        let n = wrt.nnz();
+        let full_ccs = grad.jacobian_ccs(wrt)?;
+        let mut row_sets = vec![Vec::new(); n];
+        for (row, col) in full_ccs.positions() {
+            if row >= col {
+                row_sets[col].push(row);
+            }
+        }
+
+        let mut columns = vec![Vec::new(); n];
+        for column_batch in (0..n).collect::<Vec<_>>().chunks(JACOBIAN_BATCH_WIDTH) {
+            let active_groups = column_batch
+                .iter()
+                .map(|&col| vec![col])
+                .collect::<Vec<_>>();
+            let sensitivities = scalar_hessian_basis_batch(expr, &wrt.nonzeros, &active_groups)?;
+            for (direction, &col) in column_batch.iter().enumerate() {
+                let sens = &sensitivities[direction];
+                for &row in &row_sets[col] {
+                    columns[col].push((row, sens[row]));
+                }
+            }
+        }
+        Self::build_lower_triangle(n, columns)
     }
 
     fn hessian_lower_triangle_selected_outputs(&self, wrt: &SXMatrix) -> Result<SXMatrix> {

@@ -466,14 +466,23 @@ fn generated_jacobians_domain_ops_ci() {
     run_scenario(&DOMAIN_OPS_CI);
 }
 
+fn require_release_mode_for_manual_property_runs() {
+    assert!(
+        !cfg!(debug_assertions),
+        "manual Jacobian property stress runs must be executed in release mode\n\ntry:\n  cargo test -p sx_codegen_llvm --release --test generated_jacobian_props generated_jacobians_stress -- --ignored"
+    );
+}
+
 #[test]
 #[ignore = "manual property stress run"]
 fn generated_jacobians_stress() {
+    require_release_mode_for_manual_property_runs();
     run_scenario(&STRESS);
 }
 
 #[test]
 #[ignore = "manual property stress run"]
 fn generated_jacobians_call_heavy_stress() {
+    require_release_mode_for_manual_property_runs();
     run_scenario(&CALL_HEAVY_STRESS);
 }

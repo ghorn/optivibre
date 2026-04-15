@@ -21,6 +21,11 @@ struct Point<T> {
 }
 
 #[derive(Clone, optimization::Vectorize)]
+struct Scalar<T> {
+    x: T,
+}
+
+#[derive(Clone, optimization::Vectorize)]
 struct Chain<T, const N: usize> {
     points: [Point<T>; N],
 }
@@ -421,6 +426,37 @@ fn typed_symbolic_compiled_nlp_derivatives_match_finite_difference() {
     );
     assert_eq!(report.lagrangian_hessian.sparsity.missing_from_analytic, 0);
     assert_eq!(report.lagrangian_hessian.sparsity.extra_in_analytic, 0);
+}
+
+#[test]
+fn typed_symbolic_derivative_validation_rejects_nonfinite_derivatives() {
+    let symbolic = symbolic_nlp::<Scalar<SX>, (), (), (), _>("sqrt_singularity", |x, _| {
+        SymbolicNlpOutputs {
+            objective: x.x.sqrt(),
+            equalities: (),
+            inequalities: (),
+        }
+    })
+    .expect("symbolic NLP should build");
+    let compiled = symbolic.compile_jit().expect("JIT compile should succeed");
+    let error = compiled
+        .validate_derivatives(
+            &Scalar { x: 0.0 },
+            &(),
+            &(),
+            &(),
+            FiniteDifferenceValidationOptions {
+                first_order_step: 1.0e-6,
+                second_order_step: 1.0e-4,
+                zero_tolerance: 1.0e-7,
+            },
+        )
+        .expect_err("non-finite derivatives should be rejected");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("objective_gradient") && message.contains("non-finite"),
+        "unexpected validation error: {message}"
+    );
 }
 
 #[test]

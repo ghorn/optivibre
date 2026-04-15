@@ -6312,6 +6312,21 @@ pub trait StandardOcpParams {
     fn transcription_mut(&mut self) -> &mut TranscriptionConfig;
 }
 
+pub fn apply_derivative_request_overrides<Params>(
+    params: &mut Params,
+    request: &DerivativeCheckRequest,
+) where
+    Params: StandardOcpParams + HasOcpSxFunctionConfig,
+{
+    if let Some(sx_functions) = request.sx_functions_override {
+        *params.sx_functions_mut() = sx_functions;
+    }
+}
+
+pub trait HasOcpSxFunctionConfig {
+    fn sx_functions_mut(&mut self) -> &mut OcpSxFunctionConfig;
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SolveRequest {
     pub values: BTreeMap<String, f64>,
@@ -6323,6 +6338,7 @@ pub struct DerivativeCheckRequest {
     pub finite_difference: FiniteDifferenceValidationOptions,
     pub equality_multiplier_fill: f64,
     pub inequality_multiplier_fill: f64,
+    pub sx_functions_override: Option<OcpSxFunctionConfig>,
 }
 
 impl Default for DerivativeCheckRequest {
@@ -6332,8 +6348,17 @@ impl Default for DerivativeCheckRequest {
             finite_difference: FiniteDifferenceValidationOptions::default(),
             equality_multiplier_fill: 1.0,
             inequality_multiplier_fill: 1.0,
+            sx_functions_override: None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DerivativeCheckOrder {
+    First,
+    Second,
+    All,
 }
 
 #[derive(Clone, Debug)]
@@ -6359,6 +6384,22 @@ impl ProblemDerivativeCheck {
 
     pub fn all_orders_are_within_tolerances(&self, tolerances: ValidationTolerances) -> bool {
         self.report.all_orders_are_within_tolerances(tolerances)
+    }
+
+    pub fn order_is_within_tolerances(
+        &self,
+        order: DerivativeCheckOrder,
+        first_order: ValidationTolerances,
+        second_order: ValidationTolerances,
+    ) -> bool {
+        match order {
+            DerivativeCheckOrder::First => self.first_order_is_within_tolerances(first_order),
+            DerivativeCheckOrder::Second => self.second_order_is_within_tolerances(second_order),
+            DerivativeCheckOrder::All => {
+                self.first_order_is_within_tolerances(first_order)
+                    && self.second_order_is_within_tolerances(second_order)
+            }
+        }
     }
 }
 

@@ -145,6 +145,13 @@ impl StandardOcpParams for Params {
         &mut self.transcription
     }
 }
+
+impl crate::common::HasOcpSxFunctionConfig for Params {
+    fn sx_functions_mut(&mut self) -> &mut OcpSxFunctionConfig {
+        &mut self.sx_functions
+    }
+}
+
 impl FromMap for Params {
     fn from_map(values: &std::collections::BTreeMap<String, f64>) -> Result<Self> {
         let defaults = Self::default();
@@ -696,7 +703,8 @@ pub fn validate_derivatives(
 pub(crate) fn validate_derivatives_from_request(
     request: &crate::common::DerivativeCheckRequest,
 ) -> Result<crate::common::ProblemDerivativeCheck> {
-    let params = Params::from_map(&request.values)?;
+    let mut params = Params::from_map(&request.values)?;
+    crate::common::apply_derivative_request_overrides(&mut params, request);
     validate_derivatives(&params, request)
 }
 
@@ -1229,9 +1237,60 @@ mod tests {
         );
     }
 
+    fn require_release_mode_for_manual_policy_checks() {
+        assert!(
+            !cfg!(debug_assertions),
+            "manual reduced glider Jacobian policy checks must be run in release mode\n\ntry:\n  cargo test -p optimal_control_problems --release reduced_direct_collocation_jacobian_policies_stay_clean -- --ignored"
+        );
+    }
+
+    fn require_release_mode_for_manual_hessian_checks() {
+        assert!(
+            !cfg!(debug_assertions),
+            "manual glider Hessian policy checks must be run in release mode\n\ntry:\n  cargo test -p optimal_control_problems --release direct_collocation_hessian_policies_stay_clean -- --ignored --nocapture"
+        );
+    }
+
+    type DcDecisionLayout = (
+        optimal_control::Mesh<State<SX>, DEFAULT_INTERVALS>,
+        optimal_control::Mesh<Control<SX>, DEFAULT_INTERVALS>,
+        optimal_control::IntervalGrid<State<SX>, DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+        optimal_control::IntervalGrid<Control<SX>, DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+        optimal_control::IntervalGrid<Control<SX>, DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+        SX,
+    );
+
+    fn dc_decision_layout_names() -> Vec<String> {
+        let mut names = Vec::new();
+        <DcDecisionLayout as optimization::Vectorize<SX>>::flat_layout_names("w", &mut names);
+        names
+    }
+
+    fn named_hessian_entry(
+        names: &[String],
+        entry: &optimization::ValidationWorstEntry,
+    ) -> String {
+        let row_name = names
+            .get(entry.row)
+            .map_or("<row-oob>", std::string::String::as_str);
+        let col_name = names
+            .get(entry.col)
+            .map_or("<col-oob>", std::string::String::as_str);
+        format!(
+            "({}, {}) {row_name} vs {col_name}: analytic={:.6e} fd={:.6e} abs={:.6e} rel={:.6e}",
+            entry.row,
+            entry.col,
+            entry.analytic,
+            entry.finite_difference,
+            entry.abs_error,
+            entry.rel_error
+        )
+    }
+
     #[test]
     #[ignore = "manual reduced multiple-shooting Jacobian policy regression check"]
     fn reduced_multiple_shooting_jacobian_policies_stay_clean() {
+        require_release_mode_for_manual_policy_checks();
         const N: usize = 8;
         let params = Params::default();
         let runtime = ms_runtime::<N>(&params);
@@ -1303,6 +1362,7 @@ mod tests {
     #[test]
     #[ignore = "manual reduced direct-collocation Jacobian policy regression check"]
     fn reduced_direct_collocation_jacobian_policies_stay_clean() {
+        require_release_mode_for_manual_policy_checks();
         const N: usize = 8;
         const K: usize = DEFAULT_COLLOCATION_DEGREE;
         let params = Params::default();
@@ -1374,6 +1434,82 @@ mod tests {
                 .expect("direct-collocation inequality Jacobian summary should exist");
             assert_jacobian_clean(label, "equality", equality_jacobian);
             assert_jacobian_clean(label, "inequality", inequality_jacobian);
+        }
+    }
+
+    #[test]
+    #[ignore = "manual direct-collocation Hessian policy regression check"]
+    fn direct_collocation_hessian_policies_stay_clean() {
+        require_release_mode_for_manual_hessian_checks();
+        let names = dc_decision_layout_names();
+        for (label, symbolic_functions) in [
+            (
+                "baseline",
+                crate::benchmark_report::OcpBenchmarkPreset::Baseline.sx_function_config(),
+            ),
+            (
+                "inline_all",
+                crate::benchmark_report::OcpBenchmarkPreset::InlineAll.sx_function_config(),
+            ),
+            (
+                "at_call",
+                crate::benchmark_report::OcpBenchmarkPreset::FunctionInlineAtCall
+                    .sx_function_config(),
+            ),
+            (
+                "at_lowering",
+                crate::benchmark_report::OcpBenchmarkPreset::FunctionInlineAtLowering
+                    .sx_function_config(),
+            ),
+            (
+                "in_llvm",
+                crate::benchmark_report::OcpBenchmarkPreset::FunctionInlineInLlvm
+                    .sx_function_config(),
+            ),
+            (
+                "noinline_llvm",
+                crate::benchmark_report::OcpBenchmarkPreset::FunctionNoInlineLlvm
+                    .sx_function_config(),
+            ),
+        ] {
+            let mut values = std::collections::BTreeMap::new();
+            values.insert("transcription_method".to_string(), 1.0);
+            let request = crate::common::DerivativeCheckRequest {
+                values,
+                finite_difference: optimization::FiniteDifferenceValidationOptions {
+                    first_order_step: 1.0e-6,
+                    second_order_step: 1.0e-4,
+                    zero_tolerance: 1.0e-7,
+                },
+                sx_functions_override: Some(symbolic_functions),
+                ..crate::common::DerivativeCheckRequest::default()
+            };
+            let check =
+                validate_derivatives_from_request(&request).expect("derivative check should run");
+            let summary = &check.report.lagrangian_hessian;
+            let worst = summary
+                .worst_entry
+                .as_ref()
+                .map(|entry| named_hessian_entry(&names, entry))
+                .unwrap_or_else(|| "worst=none".to_string());
+            let worst_missing = summary
+                .sparsity
+                .worst_missing_from_analytic
+                .as_ref()
+                .map(|entry| named_hessian_entry(&names, entry))
+                .unwrap_or_else(|| "worst_missing=none".to_string());
+            let worst_extra = summary
+                .sparsity
+                .worst_extra_in_analytic
+                .as_ref()
+                .map(|entry| named_hessian_entry(&names, entry))
+                .unwrap_or_else(|| "worst_extra=none".to_string());
+            assert!(
+                summary.is_within_tolerances(optimization::ValidationTolerances::new(
+                    1.0e-4, 1.0e-3
+                )),
+                "{label} expected clean glider direct-collocation Hessian\nworst: {worst}\nworst_missing: {worst_missing}\nworst_extra: {worst_extra}\nsummary: {summary:?}"
+            );
         }
     }
 }

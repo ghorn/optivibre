@@ -18,15 +18,15 @@ pub use benchmark_report::{
 pub use common::{
     Chart, CompileCacheState, CompileCacheStatus, ControlChoice, ControlEditor, ControlPanel,
     ControlSection, ControlSemantic, ControlSpec, ControlValueDisplay, ControlVisibility,
-    DerivativeCheckRequest, DirectCollocationCompileKey, LatexSection, Metric, MetricKey,
-    OcpKernelStrategy, OcpOverrideBehavior, OcpSxFunctionConfig, PlotMode, ProblemDerivativeCheck,
-    ProblemId, ProblemSpec, Scene2D, SceneAnimation, SceneArrow, SceneCircle, SceneFrame,
-    ScenePath, SolveArtifact, SolveLogLevel, SolvePhase, SolveProgress, SolveRequest, SolveStage,
-    SolveStatus, SolveStreamEvent, SolverMethod, SolverReport, SolverStatusKind, TimeSeries,
-    TimeSeriesRole, TranscriptionConfig, TranscriptionMethod, direct_collocation_variant,
-    direct_collocation_variant_with_sx, find_metric, metric, metric_with_key,
-    multiple_shooting_variant, multiple_shooting_variant_with_sx, numeric_metric_with_key,
-    ocp_sx_function_config_from_map_lossy,
+    DerivativeCheckOrder, DerivativeCheckRequest, DirectCollocationCompileKey, LatexSection,
+    Metric, MetricKey, OcpKernelStrategy, OcpOverrideBehavior, OcpSxFunctionConfig, PlotMode,
+    ProblemDerivativeCheck, ProblemId, ProblemSpec, Scene2D, SceneAnimation, SceneArrow,
+    SceneCircle, SceneFrame, ScenePath, SolveArtifact, SolveLogLevel, SolvePhase, SolveProgress,
+    SolveRequest, SolveStage, SolveStatus, SolveStreamEvent, SolverMethod, SolverReport,
+    SolverStatusKind, TimeSeries, TimeSeriesRole, TranscriptionConfig, TranscriptionMethod,
+    direct_collocation_variant, direct_collocation_variant_with_sx, find_metric, metric,
+    metric_with_key, multiple_shooting_variant, multiple_shooting_variant_with_sx,
+    numeric_metric_with_key, ocp_sx_function_config_from_map_lossy,
 };
 
 pub(crate) struct ProblemEntry {

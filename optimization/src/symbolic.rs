@@ -7,7 +7,7 @@ use sx_codegen::LoweredFunction;
 use sx_codegen_llvm::{
     CompiledJitFunction, FunctionCompileOptions, JitExecutionContext, LlvmOptimizationLevel,
 };
-use sx_core::{CCS as CoreCcs, NamedMatrix, SX, SXFunction, SXMatrix, SxError};
+use sx_core::{CCS as CoreCcs, HessianStrategy, NamedMatrix, SX, SXFunction, SXMatrix, SxError};
 use thiserror::Error;
 
 use crate::{
@@ -1957,7 +1957,8 @@ fn derive_symbolic_functions(
         ),
     );
     let hessian_started = Instant::now();
-    let lagrangian_hessian = SXMatrix::scalar(lagrangian).hessian(&symbolic.variables)?;
+    let lagrangian_hessian = SXMatrix::scalar(lagrangian)
+        .hessian_with_strategy(&symbolic.variables, HessianStrategy::LowerTriangleByColumn)?;
     setup_profile.hessian_generation = Some(hessian_started.elapsed());
     let lagrangian_hessian_values = SXFunction::new(
         format!("{}_lagrangian_hessian", symbolic.name),

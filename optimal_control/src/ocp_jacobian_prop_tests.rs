@@ -88,6 +88,22 @@ static POLICY_DIFFERENTIAL_STRESS: PropertyScenario = PropertyScenario {
     },
 };
 
+static DIRECT_COLLOCATION_INEQUALITY_STRESS: PropertyScenario = PropertyScenario {
+    name: "dc_inequality_stress",
+    accepted_cases: 24,
+    max_global_rejects: 480,
+    operator_tier: OperatorTier::Tier2Domain,
+    generator: OCP_STRESS_CONFIG,
+    profile_mode: ProfileMode::ForceCallHeavy,
+    requirements: GeneratedCaseRequirements {
+        min_root_outputs: 4,
+        require_calls: true,
+        require_multi_output_helper: true,
+        require_repeated_helper_calls: true,
+        require_nested_helper_calls: true,
+    },
+};
+
 #[derive(Clone, Debug, PartialEq, Vectorize)]
 struct StageState<T> {
     x0: T,
@@ -342,10 +358,11 @@ fn generated_ms_ocp(
             let y0 = pick_output(&outputs, 0);
             let y1 = pick_output(&outputs, 1);
             let y2 = pick_output(&outputs, 2);
+            let y3 = pick_output(&outputs, 3);
             PathIneq {
-                c0: y0,
-                c1: y1,
-                c2: y0 + 0.25 * y2,
+                c0: y0 + 0.125 * y3,
+                c1: y1 - 0.2 * y0 + 0.1 * y2,
+                c2: y0 + 0.25 * y2 + 0.15 * y3,
             }
         },
     )
@@ -365,9 +382,13 @@ fn generated_ms_ocp(
               _: &(),
               _: &SX| {
             let outputs = generated_outputs(&bineq_case, &boundary_pool_sx(x0, xt));
+            let y0 = pick_output(&outputs, 0);
+            let y1 = pick_output(&outputs, 1);
+            let y2 = pick_output(&outputs, 2);
+            let y3 = pick_output(&outputs, 3);
             BoundaryIneq {
-                b0: pick_output(&outputs, 0),
-                b1: pick_output(&outputs, 1),
+                b0: y0 + 0.2 * y2,
+                b1: y1 - 0.1 * y0 + 0.1 * y3,
             }
         },
     )
@@ -1131,6 +1152,97 @@ fn run_policy_differential(scenario: &'static PropertyScenario) {
     }
 }
 
+fn require_release_mode_for_manual_property_runs() {
+    assert!(
+        !cfg!(debug_assertions),
+        "manual OCP Jacobian property stress runs must be executed in release mode\n\ntry:\n  cargo test -p optimal_control --release generated_direct_collocation_inequality_stress -- --ignored --nocapture"
+    );
+}
+
+fn run_direct_collocation_inequality_stress(scenario: &'static PropertyScenario) {
+    let strategy = case_seed_strategy(scenario);
+    let mut runner = TestRunner::new(Config {
+        cases: scenario.accepted_cases,
+        max_global_rejects: scenario.max_global_rejects,
+        ..Config::default()
+    });
+    let counters = RefCell::new(CoverageCounters::default());
+    let result = runner.run(&strategy, |seed| {
+        let seed_debug = format!("{seed:#?}");
+        let case = match generate_case_from_seed(scenario, &seed) {
+            Ok(case) => case,
+            Err(_) => {
+                counters.borrow_mut().static_rejects += 1;
+                return Err(TestCaseError::reject("static generation/certification reject"));
+            }
+        };
+
+        let inline = match evaluate_direct_collocation(
+            &case,
+            inline_options(),
+            "inline_all",
+            false,
+            scenario.generator.fd_step,
+        ) {
+            CaseEvaluation::Pass(artifact) => artifact,
+            CaseEvaluation::Reject(reason) => {
+                if reason == "finite_difference_nonfinite" {
+                    counters.borrow_mut().fd_nonfinite_rejects += 1;
+                } else {
+                    counters.borrow_mut().runtime_nonfinite_rejects += 1;
+                }
+                return Err(TestCaseError::reject(reason));
+            }
+            CaseEvaluation::Fail(message) => {
+                return Err(TestCaseError::fail(format!(
+                    "direct_collocation_inline_all\nseed={seed_debug}\ncoverage_before_failure={:?}\n{message}",
+                    counters.borrow().snapshot()
+                )));
+            }
+        };
+
+        let preserved = match evaluate_direct_collocation(
+            &case,
+            preserved_options(),
+            "noinline_llvm",
+            true,
+            scenario.generator.fd_step,
+        ) {
+            CaseEvaluation::Pass(artifact) => artifact,
+            CaseEvaluation::Reject(reason) => {
+                if reason == "finite_difference_nonfinite" {
+                    counters.borrow_mut().fd_nonfinite_rejects += 1;
+                } else {
+                    counters.borrow_mut().runtime_nonfinite_rejects += 1;
+                }
+                return Err(TestCaseError::reject(reason));
+            }
+            CaseEvaluation::Fail(message) => {
+                return Err(TestCaseError::fail(format!(
+                    "direct_collocation_preserved\nseed={seed_debug}\ncoverage_before_failure={:?}\n{message}",
+                    counters.borrow().snapshot()
+                )));
+            }
+        };
+
+        require_policy_consistency(&seed_debug, "direct_collocation", &case, &inline, &preserved)?;
+        counters.borrow_mut().record_accept(&case);
+        Ok(())
+    });
+    let counters = counters.into_inner();
+    if let Err(err) = result {
+        panic!(
+            "scenario={} failed: {err}\ncoverage: accepted={} static_rejects={} runtime_nonfinite_rejects={} fd_nonfinite_rejects={} profiles={:?}",
+            scenario.name,
+            counters.accepted_valid_cases,
+            counters.static_rejects,
+            counters.runtime_nonfinite_rejects,
+            counters.fd_nonfinite_rejects,
+            counters.accepted_by_profile
+        );
+    }
+}
+
 #[test]
 fn generated_ocp_assembly_inline_all_smoke() {
     run_inline_smoke(&INLINE_SMOKE);
@@ -1427,5 +1539,13 @@ fn diagnose_preserved_call_multiple_shooting_integrator_wrapper_forward_path() {
 #[test]
 #[ignore = "manual OCP assembly policy differential search"]
 fn generated_ocp_assembly_policy_differential_stress() {
+    require_release_mode_for_manual_property_runs();
     run_policy_differential(&POLICY_DIFFERENTIAL_STRESS);
+}
+
+#[test]
+#[ignore = "manual direct-collocation inequality stress search"]
+fn generated_direct_collocation_inequality_stress() {
+    require_release_mode_for_manual_property_runs();
+    run_direct_collocation_inequality_stress(&DIRECT_COLLOCATION_INEQUALITY_STRESS);
 }

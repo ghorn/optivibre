@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use approx::assert_abs_diff_eq;
-use sx_core::{CallPolicy, NamedMatrix, NodeView, SX, SXFunction, SXMatrix};
+use sx_core::{CallPolicy, HessianStrategy, NamedMatrix, NodeView, SX, SXFunction, SXMatrix};
 
 #[path = "../../test_support/symbolic_eval.rs"]
 mod symbolic_eval;
@@ -10,6 +10,43 @@ use symbolic_eval::eval;
 
 fn named(name: &str, matrix: SXMatrix) -> NamedMatrix {
     NamedMatrix::new(name, matrix).expect("named matrix should be valid")
+}
+
+fn eval_scalar(expr: SX, symbols: &[SX], point: &[f64]) -> f64 {
+    let vars = symbols
+        .iter()
+        .zip(point.iter().copied())
+        .map(|(symbol, value)| (symbol.id(), value))
+        .collect::<HashMap<_, _>>();
+    eval(expr, &vars)
+}
+
+fn central_hessian_entry(expr: SX, symbols: &[SX], point: &[f64], row: usize, col: usize, eps: f64) -> f64 {
+    let mut shifted = point.to_vec();
+    if row == col {
+        shifted[row] = point[row] + eps;
+        let forward = eval_scalar(expr, symbols, &shifted);
+        shifted[row] = point[row] - eps;
+        let backward = eval_scalar(expr, symbols, &shifted);
+        let center = eval_scalar(expr, symbols, point);
+        (forward - 2.0 * center + backward) / (eps * eps)
+    } else {
+        shifted[row] = point[row] + eps;
+        shifted[col] = point[col] + eps;
+        let pp = eval_scalar(expr, symbols, &shifted);
+
+        shifted[col] = point[col] - eps;
+        let pm = eval_scalar(expr, symbols, &shifted);
+
+        shifted[row] = point[row] - eps;
+        shifted[col] = point[col] + eps;
+        let mp = eval_scalar(expr, symbols, &shifted);
+
+        shifted[col] = point[col] - eps;
+        let mm = eval_scalar(expr, symbols, &shifted);
+
+        (pp - pm - mp + mm) / (4.0 * eps * eps)
+    }
 }
 
 #[test]
@@ -264,6 +301,86 @@ fn preserved_call_jacobian_keeps_direct_identity_terms_alongside_constant_helper
         "expected direct identity derivative to survive alongside constant helper calls: {:?}",
         jacobian.get(1, 1).inspect()
     );
+}
+
+#[test]
+fn preserved_call_hessian_matches_central_difference_for_nested_helpers() {
+    let z = SXMatrix::sym_dense("z", 2, 1).expect("inner input should build");
+    let inner = SXFunction::new(
+        "nested_inner_hessian",
+        vec![named("z", z.clone())],
+        vec![named(
+            "y",
+            SXMatrix::dense_column(vec![
+                z.nz(0) * z.nz(1) + z.nz(0).sin(),
+                z.nz(1).exp() + z.nz(0).sqr(),
+            ])
+            .expect("inner outputs should build"),
+        )],
+    )
+    .expect("inner should build")
+    .with_call_policy_override(CallPolicy::NoInlineLLVM);
+
+    let w = SXMatrix::sym_dense("w", 2, 1).expect("outer input should build");
+    let inner_called = inner
+        .call_output(&[w.clone()])
+        .expect("inner call should build");
+    let outer_scalar = SXMatrix::scalar(
+        inner_called.nz(0) * w.nz(0) + inner_called.nz(1).sin() + w.nz(1).sqr(),
+    );
+    let outer = SXFunction::new(
+        "nested_outer_hessian",
+        vec![named("w", w.clone())],
+        vec![named("y", outer_scalar)],
+    )
+    .expect("outer should build")
+    .with_call_policy_override(CallPolicy::NoInlineLLVM);
+
+    let x = SXMatrix::sym_dense("x", 3, 1).expect("root input should build");
+    let outer_input = SXMatrix::dense_column(vec![
+        x.nz(0) + x.nz(2),
+        x.nz(1) * x.nz(2) + x.nz(0).sin(),
+    ])
+    .expect("outer call input should build");
+    let scalar = SXMatrix::scalar(
+        outer
+            .call_output(&[outer_input])
+            .expect("outer call should build")
+            .nz(0)
+            + x.nz(0) * x.nz(1) * x.nz(2),
+    );
+
+    let default_hessian = scalar.hessian(&x).expect("default hessian should build");
+    let by_column = scalar
+        .hessian_with_strategy(&x, HessianStrategy::LowerTriangleByColumn)
+        .expect("by-column hessian should build");
+    assert_eq!(default_hessian.ccs(), by_column.ccs());
+
+    let symbols = [x.nz(0), x.nz(1), x.nz(2)];
+    let point = [0.2, -0.3, 0.4];
+    let vars = HashMap::from([
+        (symbols[0].id(), point[0]),
+        (symbols[1].id(), point[1]),
+        (symbols[2].id(), point[2]),
+    ]);
+    let eps = 1.0e-5;
+
+    for col in 0..3 {
+        for row in col..3 {
+            let analytic_default = eval(default_hessian.get(row, col), &vars);
+            let analytic_by_column = eval(by_column.get(row, col), &vars);
+            let finite_difference = central_hessian_entry(scalar.nz(0), &symbols, &point, row, col, eps);
+
+            assert!(
+                (analytic_default - analytic_by_column).abs() <= 1.0e-10,
+                "strategy mismatch at ({row}, {col}): default={analytic_default:.12e} by_column={analytic_by_column:.12e}",
+            );
+            assert!(
+                (analytic_default - finite_difference).abs() <= 2.0e-4,
+                "finite-difference mismatch at ({row}, {col}): analytic={analytic_default:.12e} fd={finite_difference:.12e}",
+            );
+        }
+    }
 }
 
 #[test]

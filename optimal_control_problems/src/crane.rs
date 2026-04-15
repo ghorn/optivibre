@@ -145,6 +145,13 @@ impl StandardOcpParams for Params {
         &mut self.transcription
     }
 }
+
+impl crate::common::HasOcpSxFunctionConfig for Params {
+    fn sx_functions_mut(&mut self) -> &mut OcpSxFunctionConfig {
+        &mut self.sx_functions
+    }
+}
+
 impl FromMap for Params {
     fn from_map(values: &BTreeMap<String, f64>) -> Result<Self> {
         let defaults = Self::default();
@@ -629,7 +636,8 @@ pub fn validate_derivatives(
 pub(crate) fn validate_derivatives_from_request(
     request: &crate::common::DerivativeCheckRequest,
 ) -> Result<crate::common::ProblemDerivativeCheck> {
-    let params = Params::from_map(&request.values)?;
+    let mut params = Params::from_map(&request.values)?;
+    crate::common::apply_derivative_request_overrides(&mut params, request);
     validate_derivatives(&params, request)
 }
 
@@ -1144,6 +1152,50 @@ fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn require_release_mode_for_manual_hessian_checks() {
+        assert!(
+            !cfg!(debug_assertions),
+            "manual crane Hessian policy checks must be run in release mode\n\ntry:\n  cargo test -p optimal_control_problems --release direct_collocation_hessian_policies_stay_clean -- --ignored --nocapture"
+        );
+    }
+
+    type DcDecisionLayout = (
+        optimal_control::Mesh<State<SX>, DEFAULT_INTERVALS>,
+        optimal_control::Mesh<Control<SX>, DEFAULT_INTERVALS>,
+        optimal_control::IntervalGrid<State<SX>, DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+        optimal_control::IntervalGrid<Control<SX>, DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+        optimal_control::IntervalGrid<Control<SX>, DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+        SX,
+    );
+
+    fn dc_decision_layout_names() -> Vec<String> {
+        let mut names = Vec::new();
+        <DcDecisionLayout as optimization::Vectorize<SX>>::flat_layout_names("w", &mut names);
+        names
+    }
+
+    fn named_hessian_entry(
+        names: &[String],
+        entry: &optimization::ValidationWorstEntry,
+    ) -> String {
+        let row_name = names
+            .get(entry.row)
+            .map_or("<row-oob>", std::string::String::as_str);
+        let col_name = names
+            .get(entry.col)
+            .map_or("<col-oob>", std::string::String::as_str);
+        format!(
+            "({}, {}) {row_name} vs {col_name}: analytic={:.6e} fd={:.6e} abs={:.6e} rel={:.6e}",
+            entry.row,
+            entry.col,
+            entry.analytic,
+            entry.finite_difference,
+            entry.abs_error,
+            entry.rel_error
+        )
+    }
+
     #[test]
     fn crane_reaches_target_with_bounded_swing() {
         let artifact = solve(&Params::default()).expect("crane solve should succeed");
@@ -1155,5 +1207,81 @@ mod tests {
             .expect("max swing should exist");
         assert!((final_x - Params::default().target_x_m).abs() < 0.2);
         assert!(max_swing < 10.0, "swing should remain controlled");
+    }
+
+    #[test]
+    #[ignore = "manual direct-collocation Hessian policy regression check"]
+    fn direct_collocation_hessian_policies_stay_clean() {
+        require_release_mode_for_manual_hessian_checks();
+        let names = dc_decision_layout_names();
+        for (label, symbolic_functions) in [
+            (
+                "baseline",
+                crate::benchmark_report::OcpBenchmarkPreset::Baseline.sx_function_config(),
+            ),
+            (
+                "inline_all",
+                crate::benchmark_report::OcpBenchmarkPreset::InlineAll.sx_function_config(),
+            ),
+            (
+                "at_call",
+                crate::benchmark_report::OcpBenchmarkPreset::FunctionInlineAtCall
+                    .sx_function_config(),
+            ),
+            (
+                "at_lowering",
+                crate::benchmark_report::OcpBenchmarkPreset::FunctionInlineAtLowering
+                    .sx_function_config(),
+            ),
+            (
+                "in_llvm",
+                crate::benchmark_report::OcpBenchmarkPreset::FunctionInlineInLlvm
+                    .sx_function_config(),
+            ),
+            (
+                "noinline_llvm",
+                crate::benchmark_report::OcpBenchmarkPreset::FunctionNoInlineLlvm
+                    .sx_function_config(),
+            ),
+        ] {
+            let mut values = std::collections::BTreeMap::new();
+            values.insert("transcription_method".to_string(), 1.0);
+            let request = crate::common::DerivativeCheckRequest {
+                values,
+                finite_difference: optimization::FiniteDifferenceValidationOptions {
+                    first_order_step: 1.0e-6,
+                    second_order_step: 1.0e-4,
+                    zero_tolerance: 1.0e-7,
+                },
+                sx_functions_override: Some(symbolic_functions),
+                ..crate::common::DerivativeCheckRequest::default()
+            };
+            let check =
+                validate_derivatives_from_request(&request).expect("derivative check should run");
+            let summary = &check.report.lagrangian_hessian;
+            let worst = summary
+                .worst_entry
+                .as_ref()
+                .map(|entry| named_hessian_entry(&names, entry))
+                .unwrap_or_else(|| "worst=none".to_string());
+            let worst_missing = summary
+                .sparsity
+                .worst_missing_from_analytic
+                .as_ref()
+                .map(|entry| named_hessian_entry(&names, entry))
+                .unwrap_or_else(|| "worst_missing=none".to_string());
+            let worst_extra = summary
+                .sparsity
+                .worst_extra_in_analytic
+                .as_ref()
+                .map(|entry| named_hessian_entry(&names, entry))
+                .unwrap_or_else(|| "worst_extra=none".to_string());
+            assert!(
+                summary.is_within_tolerances(optimization::ValidationTolerances::new(
+                    1.0e-4, 1.0e-3
+                )),
+                "{label} expected clean crane direct-collocation Hessian\nworst: {worst}\nworst_missing: {worst_missing}\nworst_extra: {worst_extra}\nsummary: {summary:?}"
+            );
+        }
     }
 }

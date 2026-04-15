@@ -473,14 +473,23 @@ fn generated_symbolic_nlp_call_heavy_ci() {
     run_scenario(&CALL_HEAVY_CI);
 }
 
+fn require_release_mode_for_manual_property_runs() {
+    assert!(
+        !cfg!(debug_assertions),
+        "manual symbolic NLP Jacobian stress runs must be executed in release mode\n\ntry:\n  cargo test -p optimization --release --test generated_symbolic_nlp_jacobian_props generated_symbolic_nlp_call_heavy_stress -- --ignored"
+    );
+}
+
 #[test]
 #[ignore = "manual property stress run"]
 fn generated_symbolic_nlp_domain_ops_stress() {
+    require_release_mode_for_manual_property_runs();
     run_scenario(&DOMAIN_OPS_STRESS);
 }
 
 #[test]
 #[ignore = "manual property stress run"]
 fn generated_symbolic_nlp_call_heavy_stress() {
+    require_release_mode_for_manual_property_runs();
     run_scenario(&CALL_HEAVY_STRESS);
 }
