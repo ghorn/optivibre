@@ -219,6 +219,14 @@ const SOLVE_PHASE = Object.freeze({
   regular: 4,
   restoration: 5,
 } as const);
+const FILTER_ACCEPTANCE_MODE = Object.freeze({
+  objectiveArmijo: 0,
+  violationReduction: 1,
+} as const);
+const FILTER_ACCEPTANCE_MODE_FROM_WIRE = Object.freeze({
+  objective_armijo: FILTER_ACCEPTANCE_MODE.objectiveArmijo,
+  violation_reduction: FILTER_ACCEPTANCE_MODE.violationReduction,
+} as const);
 const SOLVE_PHASE_FROM_WIRE = Object.freeze({
   initial: SOLVE_PHASE.initial,
   accepted_step: SOLVE_PHASE.acceptedStep,
@@ -501,6 +509,25 @@ interface WireConstraintPanels {
   inequalities?: WireConstraintPanelEntry[];
 }
 
+type FilterAcceptanceModeCode = EnumValue<typeof FILTER_ACCEPTANCE_MODE>;
+
+interface FilterEntry {
+  objective: number;
+  violation: number;
+}
+
+interface FilterInfo {
+  current: FilterEntry;
+  entries: FilterEntry[];
+  objective_label: string;
+  title: string;
+  accepted_mode?: FilterAcceptanceModeCode | null;
+}
+
+interface WireFilterInfo extends Omit<FilterInfo, "accepted_mode"> {
+  accepted_mode?: string | number | null;
+}
+
 interface SolveProgress {
   iteration: number;
   phase: SolvePhaseCode;
@@ -512,10 +539,12 @@ interface SolveProgress {
   penalty: number;
   alpha?: number | null;
   line_search_iterations?: number | null;
+  filter?: FilterInfo | null;
 }
 
-interface WireSolveProgress extends Omit<SolveProgress, "phase"> {
+interface WireSolveProgress extends Omit<SolveProgress, "phase" | "filter"> {
   phase: string | number;
+  filter?: WireFilterInfo | null;
 }
 
 interface SolverPhaseDetail {
@@ -700,6 +729,9 @@ interface FrontendState {
   chartViews: Map<string, ChartView>;
   chartLayoutKey: string;
   progressPlotReady: boolean;
+  filterPlotReady: boolean;
+  filterPath: FilterEntry[];
+  lastFilterPointKey: string | null;
   logLines: LogLine[];
   latestProgress: SolveProgress | null;
   liveStatus: SolveStatus | null;
@@ -1189,6 +1221,30 @@ function readWireConstraintPanels(value: JsonValue | undefined, context: string)
   };
 }
 
+function readFilterEntry(value: JsonValue | undefined, context: string): FilterEntry {
+  const object = readJsonObject(value, context);
+  return {
+    objective: readJsonNumber(readJsonValueAt(object, "objective"), `${context}.objective`),
+    violation: readJsonNumber(readJsonValueAt(object, "violation"), `${context}.violation`),
+  };
+}
+
+function readWireFilterInfo(value: JsonValue | undefined, context: string): WireFilterInfo {
+  const object = readJsonObject(value, context);
+  const entries = readOptionalJsonArray(readJsonValueAt(object, "entries"), `${context}.entries`);
+  return {
+    current: readFilterEntry(readJsonValueAt(object, "current"), `${context}.current`),
+    entries: entries?.map((entry, index) => readFilterEntry(entry, `${context}.entries[${index}]`)) ?? [],
+    objective_label: readJsonString(readJsonValueAt(object, "objective_label"), `${context}.objective_label`),
+    title: readJsonString(readJsonValueAt(object, "title"), `${context}.title`),
+    accepted_mode:
+      readOptionalJsonStringOrNumber(
+        readJsonValueAt(object, "accepted_mode"),
+        `${context}.accepted_mode`,
+      ) ?? null,
+  };
+}
+
 function readWireSolveProgress(value: JsonValue | undefined, context: string): WireSolveProgress {
   const object = readJsonObject(value, context);
   return {
@@ -1208,6 +1264,10 @@ function readWireSolveProgress(value: JsonValue | undefined, context: string): W
         readJsonValueAt(object, "line_search_iterations"),
         `${context}.line_search_iterations`,
       ) ?? null,
+    filter:
+      readJsonValueAt(object, "filter") == null
+        ? null
+        : readWireFilterInfo(readJsonValueAt(object, "filter"), `${context}.filter`),
   };
 }
 
@@ -1378,6 +1438,9 @@ const state: FrontendState = {
   chartViews: new Map<string, ChartView>(),
   chartLayoutKey: "",
   progressPlotReady: false,
+  filterPlotReady: false,
+  filterPath: [],
+  lastFilterPointKey: null,
   logLines: [],
   latestProgress: null,
   liveStatus: null,
@@ -1409,6 +1472,7 @@ const modelEl = requiredElement<HTMLDivElement>("#model");
 const notesEl = requiredElement<HTMLDivElement>("#notes");
 const solverSummaryEl = requiredElement<HTMLDivElement>("#solver-summary");
 const progressPlotEl = requiredElement<PlotlyHostElement>("#progress-plot");
+const filterPlotEl = requiredElement<PlotlyHostElement>("#filter-plot");
 const solverLogEl = requiredElement<HTMLPreElement>("#solver-log");
 const prewarmStatusEl = requiredElement<HTMLDivElement>("#prewarm-status");
 const eqViolationsEl = requiredElement<HTMLDivElement>("#eq-violations");
@@ -1904,13 +1968,24 @@ function ansiToHtml(raw: string): string {
 }
 
 function renderLog(): void {
+  const bottomSlackPx = 12;
+  const previousScrollTop = solverLogEl.scrollTop;
+  const previousScrollHeight = solverLogEl.scrollHeight;
+  const previousClientHeight = solverLogEl.clientHeight;
+  const shouldStickToBottom =
+    previousScrollHeight - (previousScrollTop + previousClientHeight) <= bottomSlackPx;
   solverLogEl.innerHTML = state.logLines
     .map((entry) => {
       const levelClass = logLevelClass(entry.level);
       return `<span class="log-line ${levelClass}">${ansiToHtml(entry.text) || "&nbsp;"}</span>`;
     })
     .join("");
-  solverLogEl.scrollTop = solverLogEl.scrollHeight;
+  if (shouldStickToBottom) {
+    solverLogEl.scrollTop = solverLogEl.scrollHeight;
+    return;
+  }
+  const maxScrollTop = Math.max(0, solverLogEl.scrollHeight - solverLogEl.clientHeight);
+  solverLogEl.scrollTop = Math.min(previousScrollTop, maxScrollTop);
 }
 
 function renderCompileCacheStatus(): void {
@@ -2103,6 +2178,20 @@ function normalizeProgress(progress: WireSolveProgress): SolveProgress {
   return {
     ...progress,
     phase: decodeWireEnum(SOLVE_PHASE_FROM_WIRE, progress.phase, SOLVE_PHASE.initial),
+    filter:
+      progress.filter == null
+        ? null
+        : {
+            ...progress.filter,
+            accepted_mode:
+              progress.filter.accepted_mode == null
+                ? null
+                : decodeWireEnum(
+                    FILTER_ACCEPTANCE_MODE_FROM_WIRE,
+                    progress.filter.accepted_mode,
+                    FILTER_ACCEPTANCE_MODE.objectiveArmijo,
+                  ),
+          },
   };
 }
 
@@ -2903,8 +2992,15 @@ function resetSolverPanel(): void {
   if (window.Plotly && state.progressPlotReady) {
     window.Plotly.purge(progressPlotEl);
   }
+  if (window.Plotly && state.filterPlotReady) {
+    window.Plotly.purge(filterPlotEl);
+  }
   progressPlotEl.innerHTML = `<div class="placeholder">Solve a problem to populate the live convergence history.</div>`;
+  filterPlotEl.innerHTML = `<div class="placeholder">SQP filter telemetry will appear here during the solve.</div>`;
   state.progressPlotReady = false;
+  state.filterPlotReady = false;
+  state.filterPath = [];
+  state.lastFilterPointKey = null;
   renderCompileCacheStatus();
 }
 
@@ -3156,25 +3252,60 @@ function parseDurationLabelToMs(value: string): number | null {
   }
 }
 
-function colorizeSolveProfilingTime(
-  value: string,
+function normalizeProfilingHeatScore(
   durationMs: number | null,
   bestMs: number | null,
   worstMs: number | null,
-): string {
+): number | null {
   if (durationMs == null || bestMs == null || worstMs == null) {
-    return value;
+    return null;
   }
   if (Math.abs(worstMs - bestMs) < 1e-12) {
-    return `\u001b[33m${value}\u001b[39m`;
+    return 0.6;
   }
-  if (Math.abs(durationMs - bestMs) < 1e-12) {
-    return `\u001b[32m${value}\u001b[39m`;
+  return Math.max(0, Math.min(1, (durationMs - bestMs) / (worstMs - bestMs)));
+}
+
+function deriveChildProfilingHeatScore(
+  parentScore: number | null,
+  parentDurationMs: number | null,
+  childDurationMs: number | null,
+): number | null {
+  if (parentScore == null) {
+    return null;
   }
-  if (Math.abs(durationMs - worstMs) < 1e-12) {
-    return `\u001b[31m${value}\u001b[39m`;
+  if (
+    childDurationMs == null ||
+    parentDurationMs == null ||
+    !Number.isFinite(childDurationMs) ||
+    !Number.isFinite(parentDurationMs) ||
+    parentDurationMs <= 1e-12
+  ) {
+    return parentScore;
   }
-  return `\u001b[33m${value}\u001b[39m`;
+  const share = Math.max(0, Math.min(1, childDurationMs / parentDurationMs));
+  return parentScore * share;
+}
+
+function profilingHeatColorCode(score: number | null): number | null {
+  if (score == null) {
+    return null;
+  }
+  if (score < 0.15) {
+    return 32;
+  }
+  if (score < 0.65) {
+    return 33;
+  }
+  return 31;
+}
+
+function colorizeSolveProfilingTime(value: string, heatScore: number | null): string {
+  const colorCode = profilingHeatColorCode(heatScore);
+  if (colorCode == null) {
+    return value;
+  }
+  return `\u001b[${colorCode}m${value}\u001b[39m`;
 }
 
 function formatDurationFromMs(milliseconds: number | null | undefined): string {
@@ -3184,49 +3315,344 @@ function formatDurationFromMs(milliseconds: number | null | undefined): string {
   return formatDuration(milliseconds / 1000);
 }
 
-function appendSolveProfilingLog(details: SolverPhaseDetail[]): void {
-  if (details.length === 0) {
-    return;
-  }
-  const parsed = details.map((detail) => ({
+interface ProfilingLeaf {
+  label: string;
+  value: string;
+  count: number;
+  durationMs: number | null;
+}
+
+interface ProfilingSection {
+  label: string;
+  value: string;
+  durationMs: number | null;
+  items: ProfilingLeaf[];
+  children: ProfilingSection[];
+}
+
+interface ProfilingRenderedLine {
+  label: string;
+  value: string;
+  share: string;
+  countText: string | null;
+  avgText: string | null;
+  heatScore: number | null;
+}
+
+function profilingLeaf(detail: SolverPhaseDetail): ProfilingLeaf {
+  return {
     label: detail.label,
     value: detail.value,
     count: detail.count,
     durationMs: parseDurationLabelToMs(detail.value),
-  }));
-  const finiteDurations = parsed
-    .map((detail) => detail.durationMs)
-    .filter((value): value is number => value != null && Number.isFinite(value));
-  const bestMs =
-    finiteDurations.length > 0 ? finiteDurations.reduce((best, value) => Math.min(best, value)) : null;
-  const worstMs =
-    finiteDurations.length > 0 ? finiteDurations.reduce((worst, value) => Math.max(worst, value)) : null;
-  const timeWidth = parsed.reduce((width, detail) => Math.max(width, detail.value.length), 0);
-  const labelWidth = parsed.reduce((width, detail) => Math.max(width, detail.label.length), 0);
-  const countWidth = parsed.reduce((width, detail) => {
-    return Math.max(width, String(detail.count).length);
-  }, 0);
-  const avgWidth = parsed.reduce((width, detail) => {
-    const avgText =
-      detail.count > 0 && detail.durationMs != null
-        ? formatDurationFromMs(detail.durationMs / detail.count)
-        : "--";
-    return Math.max(width, avgText.length);
-  }, 0);
+  };
+}
+
+function timedProfilingLeaves(details: SolverPhaseDetail[]): ProfilingLeaf[] {
+  return details.map(profilingLeaf).filter((detail) => detail.durationMs != null);
+}
+
+function takeProfilingLeaves(pool: ProfilingLeaf[], labels: readonly string[]): ProfilingLeaf[] {
+  const wanted = new Set(labels);
+  const taken: ProfilingLeaf[] = [];
+  for (let index = 0; index < pool.length; index += 1) {
+    const detail = pool[index];
+    if (!wanted.has(detail.label)) {
+      continue;
+    }
+    taken.push(detail);
+    pool.splice(index, 1);
+    index -= 1;
+  }
+  return taken;
+}
+
+function takeFirstProfilingLeaf(pool: ProfilingLeaf[], label: string): ProfilingLeaf | null {
+  const index = pool.findIndex((detail) => detail.label === label);
+  if (index < 0) {
+    return null;
+  }
+  const [detail] = pool.splice(index, 1);
+  return detail ?? null;
+}
+
+function sumProfilingDurations(items: readonly { durationMs: number | null }[]): number | null {
+  let total = 0;
+  let found = false;
+  for (const item of items) {
+    if (item.durationMs == null || !Number.isFinite(item.durationMs)) {
+      continue;
+    }
+    total += item.durationMs;
+    found = true;
+  }
+  return found ? total : null;
+}
+
+function createProfilingSection(
+  label: string,
+  explicitDurationMs: number | null,
+  items: ProfilingLeaf[] = [],
+  children: ProfilingSection[] = [],
+): ProfilingSection | null {
+  const filteredChildren = children.filter(
+    (child) => child.durationMs != null || child.items.length > 0 || child.children.length > 0,
+  );
+  const computedDurationMs =
+    explicitDurationMs ??
+    sumProfilingDurations([
+      ...items,
+      ...filteredChildren.map((child) => ({ durationMs: child.durationMs })),
+    ]);
+  if (computedDurationMs == null && items.length === 0 && filteredChildren.length === 0) {
+    return null;
+  }
+  return {
+    label,
+    value: formatDurationFromMs(computedDurationMs),
+    durationMs: computedDurationMs,
+    items,
+    children: filteredChildren,
+  };
+}
+
+function profilingTreePrefix(ancestorHasNext: readonly boolean[], isLast: boolean): string {
+  const stem = ancestorHasNext.map((hasNext) => (hasNext ? "|  " : "   ")).join("");
+  return `${stem}${isLast ? "`- " : "|- "}`;
+}
+
+function formatProfilingShare(
+  durationMs: number | null,
+  parentDurationMs: number | null,
+): string {
+  if (
+    durationMs == null ||
+    parentDurationMs == null ||
+    !Number.isFinite(durationMs) ||
+    !Number.isFinite(parentDurationMs) ||
+    parentDurationMs <= 1e-12
+  ) {
+    return "--";
+  }
+  const sharePercent = Math.max(0, Math.min(100, (durationMs / parentDurationMs) * 100));
+  if (sharePercent >= 99.95) {
+    return "100%";
+  }
+  if (sharePercent >= 10) {
+    return `${sharePercent.toFixed(0)}%`;
+  }
+  if (sharePercent >= 1) {
+    return `${sharePercent.toFixed(1)}%`;
+  }
+  return `${sharePercent.toFixed(2)}%`;
+}
+
+function flattenProfilingSection(
+  section: ProfilingSection,
+  ancestorHasNext: boolean[],
+  isLast: boolean,
+  sectionHeatScore: number | null,
+  parentDurationMs: number | null,
+): ProfilingRenderedLine[] {
+  const lines: ProfilingRenderedLine[] = [];
+  const prefix = profilingTreePrefix(ancestorHasNext, isLast);
+  lines.push({
+    label: `${prefix}${section.label}`,
+    value: section.value,
+    share: formatProfilingShare(section.durationMs, parentDurationMs),
+    countText: null,
+    avgText: null,
+    heatScore: sectionHeatScore,
+  });
+  const nextAncestors = [...ancestorHasNext, !isLast];
+  const children = [
+    ...section.children.map((child) => ({ kind: "section" as const, section: child })),
+    ...section.items.map((item) => ({ kind: "item" as const, item })),
+  ];
+  for (const [index, child] of children.entries()) {
+    const childIsLast = index === children.length - 1;
+    if (child.kind === "section") {
+      const childHeatScore = deriveChildProfilingHeatScore(
+        sectionHeatScore,
+        section.durationMs,
+        child.section.durationMs,
+      );
+      lines.push(
+        ...flattenProfilingSection(
+          child.section,
+          nextAncestors,
+          childIsLast,
+          childHeatScore,
+          section.durationMs,
+        ),
+      );
+      continue;
+    }
+    const item = child.item;
+    lines.push({
+      label: `${profilingTreePrefix(nextAncestors, childIsLast)}${item.label}`,
+      value: item.value,
+      share: formatProfilingShare(item.durationMs, section.durationMs),
+      countText: String(item.count),
+      avgText:
+        item.count > 0 && item.durationMs != null
+          ? formatDurationFromMs(item.durationMs / item.count)
+          : "--",
+      heatScore: deriveChildProfilingHeatScore(sectionHeatScore, section.durationMs, item.durationMs),
+    });
+  }
+  return lines;
+}
+
+function buildSolveProfilingSections(solver: SolverReport): ProfilingSection[] {
+  const setupSymbolicItems = timedProfilingLeaves(solver.phase_details.symbolic_setup);
+  const setupJitItems = timedProfilingLeaves(solver.phase_details.jit);
+  const solvePool = timedProfilingLeaves(solver.phase_details.solve);
+
+  const initializationItems = takeProfilingLeaves(solvePool, [
+    "Initial Guess Construction",
+    "Runtime Bounds Construction",
+  ]);
+  const evaluateTotal = takeFirstProfilingLeaf(solvePool, "Evaluate Functions");
+  const evaluateItems = takeProfilingLeaves(solvePool, [
+    "Objective",
+    "Gradient",
+    "Equality Values",
+    "Inequality Values",
+    "Constraints",
+    "Equality Jacobian",
+    "Inequality Jacobian",
+    "Jacobian",
+    "Hessian",
+    "Evaluate Other",
+  ]);
+  const adapterTotal = takeFirstProfilingLeaf(solvePool, "Adapter / Runtime Plumbing");
+  const adapterItems = takeProfilingLeaves(solvePool, [
+    "Adapter Callback",
+    "Adapter IO",
+    "Layout Projection",
+  ]);
+  const preprocessTotal = takeFirstProfilingLeaf(solvePool, "Preprocess");
+  const preprocessItems = takeProfilingLeaves(solvePool, [
+    "Jacobian Build",
+    "Hessian Build",
+    "Regularization",
+    "Subproblem Assembly",
+    "Preprocess Other",
+  ]);
+  const subproblemTotal = takeFirstProfilingLeaf(solvePool, "Subproblem Solve");
+  const subproblemItems = takeProfilingLeaves(solvePool, [
+    "QP Setup",
+    "QP Solve",
+    "Multiplier Estimation",
+    "KKT Assembly",
+    "Linear Solve",
+    "Subproblem Solve Other",
+  ]);
+  const lineSearchTotal = takeFirstProfilingLeaf(solvePool, "Line Search");
+  const lineSearchItems = takeProfilingLeaves(solvePool, [
+    "Line Search Eval",
+    "Line Search Check",
+    "Line Search Other",
+  ]);
+  const convergenceTotal = takeFirstProfilingLeaf(solvePool, "Convergence");
+  const convergenceItems = takeProfilingLeaves(solvePool, [
+    "Convergence Check",
+    "Convergence Other",
+  ]);
+  const accountingItems = takeProfilingLeaves(solvePool, ["Unaccounted"]);
+  const solveTotal = takeFirstProfilingLeaf(solvePool, "Total");
+  const otherSolveItems = solvePool;
+
+  const setupSections = [
+    createProfilingSection(
+      "Symbolics",
+      solver.symbolic_setup_s == null ? null : solver.symbolic_setup_s * 1000,
+      setupSymbolicItems,
+    ),
+    createProfilingSection("JIT", solver.jit_s == null ? null : solver.jit_s * 1000, setupJitItems),
+    createProfilingSection("Initialization", null, initializationItems),
+  ].filter((section): section is ProfilingSection => section != null);
+
+  const solveSections = [
+    createProfilingSection("Evaluate Functions", evaluateTotal?.durationMs ?? null, evaluateItems),
+    createProfilingSection("Adapter / Runtime Plumbing", adapterTotal?.durationMs ?? null, adapterItems),
+    createProfilingSection(
+      "Preprocess / Model Assembly",
+      preprocessTotal?.durationMs ?? null,
+      preprocessItems,
+    ),
+    createProfilingSection("Subproblem Solve", subproblemTotal?.durationMs ?? null, subproblemItems),
+    createProfilingSection("Line Search", lineSearchTotal?.durationMs ?? null, lineSearchItems),
+    createProfilingSection("Convergence", convergenceTotal?.durationMs ?? null, convergenceItems),
+    createProfilingSection("Accounting", null, accountingItems),
+    createProfilingSection("Other Solve Timing", null, otherSolveItems),
+  ].filter((section): section is ProfilingSection => section != null);
+
+  return [
+    createProfilingSection("Setup", null, [], setupSections),
+    createProfilingSection(
+      "Solve",
+      solver.solve_s == null ? solveTotal?.durationMs ?? null : solver.solve_s * 1000,
+      [],
+      solveSections,
+    ),
+  ].filter((section): section is ProfilingSection => section != null);
+}
+
+function appendSolveProfilingLog(solver: SolverReport | null | undefined): void {
+  if (!solver) {
+    return;
+  }
+  const sections = buildSolveProfilingSections(solver);
+  if (sections.length === 0) {
+    return;
+  }
+  const rootDurations = sections
+    .map((section) => section.durationMs)
+    .filter((durationMs): durationMs is number => durationMs != null && Number.isFinite(durationMs));
+  const rootBestMs =
+    rootDurations.length > 0 ? rootDurations.reduce((best, value) => Math.min(best, value)) : null;
+  const rootWorstMs =
+    rootDurations.length > 0 ? rootDurations.reduce((worst, value) => Math.max(worst, value)) : null;
+  const rootTotalDurationMs = sumProfilingDurations(sections);
+  const renderedLines = sections.flatMap((section, index) => {
+    const sectionHeatScore = normalizeProfilingHeatScore(section.durationMs, rootBestMs, rootWorstMs);
+    return flattenProfilingSection(
+      section,
+      [],
+      index === sections.length - 1,
+      sectionHeatScore,
+      rootTotalDurationMs,
+    );
+  });
+  const timeWidth = renderedLines.reduce((width, line) => Math.max(width, line.value.length), 0);
+  const labelWidth = renderedLines.reduce((width, line) => Math.max(width, line.label.length), 0);
+  const shareWidth = renderedLines.reduce((width, line) => Math.max(width, line.share.length), 0);
+  const countedLines = renderedLines.filter(
+    (line) => line.countText != null && line.avgText != null,
+  );
+  const countWidth = countedLines.reduce(
+    (width, line) => Math.max(width, (line.countText ?? "").length),
+    0,
+  );
+  const avgWidth = countedLines.reduce(
+    (width, line) => Math.max(width, (line.avgText ?? "").length),
+    0,
+  );
   appendLogLine("solve profiling:", LOG_LEVEL.console);
-  for (const detail of parsed) {
-    const paddedTime = detail.value.padStart(timeWidth, " ");
-    const paddedLabel = detail.label.padEnd(labelWidth, " ");
-    const coloredTime = colorizeSolveProfilingTime(paddedTime, detail.durationMs, bestMs, worstMs);
-    const countText = String(detail.count).padStart(countWidth, " ");
-    const avgText =
-      (
-        detail.count > 0 && detail.durationMs != null
-          ? formatDurationFromMs(detail.durationMs / detail.count)
-          : "--"
-      ).padStart(avgWidth, " ");
+  for (const line of renderedLines) {
+    const paddedLabel = line.label.padEnd(labelWidth, " ");
+    const paddedTime = line.value.padStart(timeWidth, " ");
+    const coloredTime = colorizeSolveProfilingTime(paddedTime, line.heatScore);
+    const shareText = line.share.padStart(shareWidth, " ");
+    const countText =
+      line.countText == null ? null : (line.countText ?? "").padStart(countWidth, " ");
+    const avgText = line.avgText == null ? null : (line.avgText ?? "").padStart(avgWidth, " ");
+    const suffix =
+      countText == null || avgText == null ? "" : `  n=${countText}  avg=${avgText}`;
     appendLogLine(
-      `  ${coloredTime}  ${paddedLabel}  n=${countText}  avg=${avgText}`,
+      `  ${paddedLabel}  ${coloredTime}  share=${shareText}${suffix}`,
       LOG_LEVEL.console,
     );
   }
@@ -3909,6 +4335,163 @@ function updateProgressPlot(progress: SolveProgress): void {
   updateProgressThresholds(progress);
 }
 
+function filterPointKey(progress: SolveProgress, filter: FilterInfo): string {
+  return [
+    progress.iteration,
+    progress.phase,
+    filter.current.violation.toExponential(6),
+    filter.current.objective.toExponential(6),
+  ].join(":");
+}
+
+function ensureFilterPlot(): void {
+  if (state.filterPlotReady || !window.Plotly) {
+    return;
+  }
+  filterPlotEl.innerHTML = "";
+  const data = [
+    {
+      type: "scatter",
+      mode: "lines+markers",
+      name: "Accepted path",
+      x: [],
+      y: [],
+      line: { color: PALETTE[0], width: 2.6 },
+      marker: { size: 5 },
+    },
+    {
+      type: "scatter",
+      mode: "lines+markers",
+      name: "Filter frontier",
+      x: [],
+      y: [],
+      line: { color: PALETTE[1], width: 2.4, dash: "dot" },
+      marker: { size: 7 },
+    },
+    {
+      type: "scatter",
+      mode: "markers",
+      name: "Current iterate",
+      x: [],
+      y: [],
+      marker: {
+        size: 12,
+        color: PALETTE[3],
+        line: { color: "rgba(229, 241, 244, 0.9)", width: 1.4 },
+      },
+    },
+  ];
+  const layout = {
+    paper_bgcolor: "rgba(0,0,0,0)",
+    plot_bgcolor: "rgba(4, 15, 22, 0.92)",
+    font: {
+      color: "#e5f1f4",
+      family: '"Avenir Next", Futura, "Trebuchet MS", sans-serif',
+      size: 12,
+    },
+    margin: { l: 74, r: 24, t: 18, b: 58 },
+    legend: {
+      orientation: "h",
+      y: -0.28,
+      x: 0,
+      font: { color: "#94b6bd", size: 11 },
+    },
+    xaxis: {
+      title: "Violation (∞-norm)",
+      type: "log",
+      gridcolor: "rgba(229, 241, 244, 0.08)",
+      linecolor: "rgba(177, 214, 222, 0.18)",
+      zeroline: false,
+      ticks: "outside",
+      titlefont: { color: "#94b6bd" },
+    },
+    yaxis: {
+      title: "Filter objective (-)",
+      gridcolor: "rgba(229, 241, 244, 0.08)",
+      linecolor: "rgba(177, 214, 222, 0.18)",
+      zeroline: false,
+      ticks: "outside",
+      titlefont: { color: "#94b6bd" },
+    },
+    annotations: [
+      {
+        text: "Filter frontier",
+        xref: "paper",
+        yref: "paper",
+        x: 0,
+        y: 1.12,
+        showarrow: false,
+        font: { color: "#94b6bd", size: 12 },
+      },
+    ],
+  };
+  const config = {
+    responsive: true,
+    displaylogo: false,
+    displayModeBar: false,
+  };
+  window.Plotly.newPlot(filterPlotEl, data, layout, config);
+  state.filterPlotReady = true;
+}
+
+function updateFilterPlot(progress: SolveProgress): void {
+  if (!window.Plotly) {
+    return;
+  }
+  const filter = progress.filter;
+  if (!filter) {
+    if (window.Plotly && state.filterPlotReady) {
+      window.Plotly.purge(filterPlotEl);
+    }
+    filterPlotEl.innerHTML = `<div class="placeholder">Filter telemetry will appear here when the active solver is using filter globalization.</div>`;
+    state.filterPlotReady = false;
+    state.filterPath = [];
+    state.lastFilterPointKey = null;
+    return;
+  }
+  ensureFilterPlot();
+  const pointKey = filterPointKey(progress, filter);
+  if (state.lastFilterPointKey !== pointKey) {
+    state.filterPath.push(filter.current);
+    state.lastFilterPointKey = pointKey;
+    window.Plotly.extendTraces(
+      filterPlotEl,
+      {
+        x: [[Math.max(filter.current.violation, 1e-14)]],
+        y: [[filter.current.objective]],
+      },
+      [0],
+      600,
+    );
+  }
+  const frontier = [...filter.entries].sort((lhs, rhs) => lhs.violation - rhs.violation);
+  const acceptanceLabel = filter.accepted_mode == null
+    ? "current frontier"
+    : filter.accepted_mode === FILTER_ACCEPTANCE_MODE.violationReduction
+      ? "accepted via violation reduction"
+      : "accepted via objective Armijo";
+  window.Plotly.restyle(
+    filterPlotEl,
+    {
+      x: [frontier.map((entry) => Math.max(entry.violation, 1e-14))],
+      y: [frontier.map((entry) => entry.objective)],
+    },
+    [1],
+  );
+  window.Plotly.restyle(
+    filterPlotEl,
+    {
+      x: [[Math.max(filter.current.violation, 1e-14)]],
+      y: [[filter.current.objective]],
+    },
+    [2],
+  );
+  window.Plotly.relayout(filterPlotEl, {
+    "annotations[0].text": `${filter.title} · ${acceptanceLabel}`,
+    "yaxis.title": `${filter.objective_label} (-)`,
+  });
+}
+
 function scheduleIterationUpdate(): void {
   if (state.iterationFlushScheduled) {
     return;
@@ -3931,6 +4514,7 @@ function applyIterationEvent(event: IterationSolveEvent, updateRunningStatus: bo
   state.artifact = event.artifact;
   renderSolverSummary();
   updateProgressPlot(event.progress);
+  updateFilterPlot(event.progress);
   scheduleArtifactRender();
   if (updateRunningStatus && state.liveStatus?.stage === SOLVE_STAGE.solving) {
     setStatusDisplay(statusDisplayForSolveStatus(state.liveStatus, event.progress.iteration));
@@ -3938,19 +4522,32 @@ function applyIterationEvent(event: IterationSolveEvent, updateRunningStatus: bo
 }
 
 function applySolveFailure(message: string): void {
+  const reportedFailureSolver =
+    state.liveSolver?.completed && state.liveSolver.status_kind === SOLVER_STATUS_KIND.error
+      ? state.liveSolver
+      : null;
   if (state.pendingIterationEvent) {
     const pendingEvent = state.pendingIterationEvent;
     state.pendingIterationEvent = null;
     applyIterationEvent(pendingEvent, false);
   }
   state.liveStatus = null;
-  state.terminalSolver = buildFailureSolverReport(message);
+  state.terminalSolver =
+    reportedFailureSolver == null
+      ? buildFailureSolverReport(message)
+      : mergeSolverReport(
+          {
+            ...reportedFailureSolver,
+            failure_message: message,
+          },
+          reportedFailureSolver,
+        );
   state.liveSolver = null;
   renderSolverSummary();
   renderMetrics();
   renderCompileCacheStatus();
   void refreshCompileCacheStatus();
-  appendSolveProfilingLog(state.terminalSolver.phase_details.solve);
+  appendSolveProfilingLog(state.terminalSolver);
   appendLogLine(`error: ${message}`, LOG_LEVEL.error);
   setStatusDisplay(statusDisplayForSolverReport(state.terminalSolver));
 }
@@ -4320,6 +4917,7 @@ function handleSolveEvent(event: SolveEvent): void {
       renderSolverSummary();
       renderCompileCacheStatus();
       void refreshCompileCacheStatus();
+      appendSolveProfilingLog(state.terminalSolver);
       scheduleArtifactRender();
       setStatusDisplay(statusDisplayForSolverReport(state.terminalSolver));
       break;
