@@ -24,11 +24,11 @@ use optimal_control::{DirectCollocationIpoptSnapshot, MultipleShootingIpoptSnaps
 use optimization::{
     BackendCompileReport, BackendTimingMetadata, CallPolicy, CallPolicyConfig, ClarabelSqpError,
     ClarabelSqpOptions, ClarabelSqpProfiling, ClarabelSqpSummary, ConstraintSatisfaction,
-    FunctionCompileOptions, InteriorPointIterationSnapshot, InteriorPointOptions,
-    InteriorPointProfiling, InteriorPointSolveError, InteriorPointSummary, LlvmOptimizationLevel,
-    NlpCompileStats, NlpEvaluationBenchmark, NlpEvaluationBenchmarkOptions,
-    NlpEvaluationKernelKind, SqpIterationEvent, SqpIterationPhase, SqpIterationSnapshot,
-    SymbolicSetupProfile, Vectorize,
+    FiniteDifferenceValidationOptions, FunctionCompileOptions, InteriorPointIterationSnapshot,
+    InteriorPointOptions, InteriorPointProfiling, InteriorPointSolveError, InteriorPointSummary,
+    LlvmOptimizationLevel, NlpCompileStats, NlpDerivativeValidationReport, NlpEvaluationBenchmark,
+    NlpEvaluationBenchmarkOptions, NlpEvaluationKernelKind, SqpIterationEvent, SqpIterationPhase,
+    SqpIterationSnapshot, SymbolicSetupProfile, ValidationTolerances, Vectorize,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptOptions, IpoptRawStatus, IpoptSummary};
@@ -1760,6 +1760,110 @@ where
                 compiled.helper_kernel_count(),
                 eval,
             ))
+        }
+    }
+}
+
+pub fn validate_standard_ocp_derivatives<
+    Params,
+    MsCompiled,
+    DcCompiled,
+    CachedMs,
+    CachedDc,
+    MsRuntimeFn,
+    DcRuntimeFn,
+    const N: usize,
+    const K: usize,
+>(
+    problem_id: ProblemId,
+    problem_name: &str,
+    params: &Params,
+    transcription: TranscriptionMethod,
+    collocation_family: CollocationFamily,
+    sx_functions: OcpSxFunctionConfig,
+    request: &DerivativeCheckRequest,
+    cached_multiple_shooting: CachedMs,
+    cached_direct_collocation: CachedDc,
+    multiple_shooting_runtime: MsRuntimeFn,
+    direct_collocation_runtime: DcRuntimeFn,
+) -> Result<ProblemDerivativeCheck>
+where
+    MsCompiled: MultipleShootingCompiled<N>,
+    DcCompiled: DirectCollocationCompiled<N, K>,
+    CachedMs: Fn(&Params) -> Result<CachedCompile<MsCompiled>>,
+    CachedDc: Fn(&Params, CollocationFamily) -> Result<CachedCompile<DcCompiled>>,
+    MsRuntimeFn: Fn(
+        &Params,
+    ) -> MultipleShootingRuntimeValues<
+        MsCompiled::PNum,
+        MsCompiled::CBounds,
+        MsCompiled::BeqNum,
+        MsCompiled::BineqBounds,
+        MsCompiled::XNum,
+        MsCompiled::UNum,
+        N,
+    >,
+    DcRuntimeFn: Fn(
+        &Params,
+    ) -> DirectCollocationRuntimeValues<
+        DcCompiled::PNum,
+        DcCompiled::CBounds,
+        DcCompiled::BeqNum,
+        DcCompiled::BineqBounds,
+        DcCompiled::XNum,
+        DcCompiled::UNum,
+        N,
+        K,
+    >,
+{
+    match transcription {
+        TranscriptionMethod::MultipleShooting => {
+            let compiled = cached_multiple_shooting(params)?;
+            let runtime = multiple_shooting_runtime(params);
+            let compiled_ref = compiled.compiled.borrow();
+            let stats = compiled_ref.nlp_compile_stats();
+            let report = compiled_ref.validate_nlp_derivatives(
+                &runtime,
+                &vec![request.equality_multiplier_fill; stats.equality_count],
+                &vec![request.inequality_multiplier_fill; stats.inequality_count],
+                request.finite_difference,
+            )?;
+            Ok(ProblemDerivativeCheck {
+                problem_id,
+                problem_name: problem_name.to_string(),
+                transcription,
+                collocation_family: None,
+                sx_functions,
+                compile_cached: compiled.was_cached,
+                compile_report: summarize_backend_compile_report(
+                    compiled_ref.backend_compile_report(),
+                ),
+                report,
+            })
+        }
+        TranscriptionMethod::DirectCollocation => {
+            let compiled = cached_direct_collocation(params, collocation_family)?;
+            let runtime = direct_collocation_runtime(params);
+            let compiled_ref = compiled.compiled.borrow();
+            let stats = compiled_ref.nlp_compile_stats();
+            let report = compiled_ref.validate_nlp_derivatives(
+                &runtime,
+                &vec![request.equality_multiplier_fill; stats.equality_count],
+                &vec![request.inequality_multiplier_fill; stats.inequality_count],
+                request.finite_difference,
+            )?;
+            Ok(ProblemDerivativeCheck {
+                problem_id,
+                problem_name: problem_name.to_string(),
+                transcription,
+                collocation_family: Some(collocation_family),
+                sx_functions,
+                compile_cached: compiled.was_cached,
+                compile_report: summarize_backend_compile_report(
+                    compiled_ref.backend_compile_report(),
+                ),
+                report,
+            })
         }
     }
 }
@@ -3719,6 +3823,22 @@ pub trait MultipleShootingCompiled<const N: usize>: CompiledOcpMetadata {
         tolerance: f64,
     ) -> Result<OcpConstraintViolationReport>;
 
+    fn validate_nlp_derivatives(
+        &self,
+        values: &MultipleShootingRuntimeValues<
+            Self::PNum,
+            Self::CBounds,
+            Self::BeqNum,
+            Self::BineqBounds,
+            Self::XNum,
+            Self::UNum,
+            N,
+        >,
+        equality_multipliers: &[f64],
+        inequality_multipliers: &[f64],
+        options: FiniteDifferenceValidationOptions,
+    ) -> Result<NlpDerivativeValidationReport>;
+
     fn benchmark_nlp_evaluations_with_progress<CB>(
         &self,
         values: &MultipleShootingRuntimeValues<
@@ -3865,6 +3985,23 @@ pub trait DirectCollocationCompiled<const N: usize, const K: usize>: CompiledOcp
         trajectories: &DirectCollocationTrajectories<Self::XNum, Self::UNum, N, K>,
         tolerance: f64,
     ) -> Result<OcpConstraintViolationReport>;
+
+    fn validate_nlp_derivatives(
+        &self,
+        values: &DirectCollocationRuntimeValues<
+            Self::PNum,
+            Self::CBounds,
+            Self::BeqNum,
+            Self::BineqBounds,
+            Self::XNum,
+            Self::UNum,
+            N,
+            K,
+        >,
+        equality_multipliers: &[f64],
+        inequality_multipliers: &[f64],
+        options: FiniteDifferenceValidationOptions,
+    ) -> Result<NlpDerivativeValidationReport>;
 
     fn benchmark_nlp_evaluations_with_progress<CB>(
         &self,
@@ -4191,6 +4328,31 @@ where
             values,
             trajectories,
             tolerance,
+        )
+        .map_err(Into::into)
+    }
+
+    fn validate_nlp_derivatives(
+        &self,
+        values: &MultipleShootingRuntimeValues<
+            Self::PNum,
+            Self::CBounds,
+            Self::BeqNum,
+            Self::BineqBounds,
+            Self::XNum,
+            Self::UNum,
+            N,
+        >,
+        equality_multipliers: &[f64],
+        inequality_multipliers: &[f64],
+        options: FiniteDifferenceValidationOptions,
+    ) -> Result<NlpDerivativeValidationReport> {
+        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::validate_nlp_derivatives(
+            self,
+            values,
+            equality_multipliers,
+            inequality_multipliers,
+            options,
         )
         .map_err(Into::into)
     }
@@ -4581,6 +4743,32 @@ where
             values,
             trajectories,
             tolerance,
+        )
+        .map_err(Into::into)
+    }
+
+    fn validate_nlp_derivatives(
+        &self,
+        values: &DirectCollocationRuntimeValues<
+            Self::PNum,
+            Self::CBounds,
+            Self::BeqNum,
+            Self::BineqBounds,
+            Self::XNum,
+            Self::UNum,
+            N,
+            K,
+        >,
+        equality_multipliers: &[f64],
+        inequality_multipliers: &[f64],
+        options: FiniteDifferenceValidationOptions,
+    ) -> Result<NlpDerivativeValidationReport> {
+        CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq, N, K>::validate_nlp_derivatives(
+            self,
+            values,
+            equality_multipliers,
+            inequality_multipliers,
+            options,
         )
         .map_err(Into::into)
     }
@@ -6127,6 +6315,51 @@ pub trait StandardOcpParams {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SolveRequest {
     pub values: BTreeMap<String, f64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DerivativeCheckRequest {
+    pub values: BTreeMap<String, f64>,
+    pub finite_difference: FiniteDifferenceValidationOptions,
+    pub equality_multiplier_fill: f64,
+    pub inequality_multiplier_fill: f64,
+}
+
+impl Default for DerivativeCheckRequest {
+    fn default() -> Self {
+        Self {
+            values: BTreeMap::new(),
+            finite_difference: FiniteDifferenceValidationOptions::default(),
+            equality_multiplier_fill: 1.0,
+            inequality_multiplier_fill: 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ProblemDerivativeCheck {
+    pub problem_id: ProblemId,
+    pub problem_name: String,
+    pub transcription: TranscriptionMethod,
+    pub collocation_family: Option<CollocationFamily>,
+    pub sx_functions: OcpSxFunctionConfig,
+    pub compile_cached: bool,
+    pub compile_report: CompileReportSummary,
+    pub report: NlpDerivativeValidationReport,
+}
+
+impl ProblemDerivativeCheck {
+    pub fn first_order_is_within_tolerances(&self, tolerances: ValidationTolerances) -> bool {
+        self.report.first_order_is_within_tolerances(tolerances)
+    }
+
+    pub fn second_order_is_within_tolerances(&self, tolerances: ValidationTolerances) -> bool {
+        self.report.second_order_is_within_tolerances(tolerances)
+    }
+
+    pub fn all_orders_are_within_tolerances(&self, tolerances: ValidationTolerances) -> bool {
+        self.report.all_orders_are_within_tolerances(tolerances)
+    }
 }
 
 #[cfg(test)]

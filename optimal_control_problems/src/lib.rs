@@ -18,14 +18,14 @@ pub use benchmark_report::{
 pub use common::{
     Chart, CompileCacheState, CompileCacheStatus, ControlChoice, ControlEditor, ControlPanel,
     ControlSection, ControlSemantic, ControlSpec, ControlValueDisplay, ControlVisibility,
-    DirectCollocationCompileKey, LatexSection, Metric, MetricKey, OcpKernelStrategy,
-    OcpOverrideBehavior, OcpSxFunctionConfig, PlotMode, ProblemId, ProblemSpec, Scene2D,
-    SceneAnimation, SceneArrow, SceneCircle, SceneFrame, ScenePath, SolveArtifact, SolveLogLevel,
-    SolvePhase, SolveProgress, SolveRequest, SolveStage, SolveStatus, SolveStreamEvent,
-    SolverMethod, SolverReport, SolverStatusKind, TimeSeries, TimeSeriesRole, TranscriptionConfig,
-    TranscriptionMethod, direct_collocation_variant, direct_collocation_variant_with_sx,
-    find_metric, metric, metric_with_key, multiple_shooting_variant,
-    multiple_shooting_variant_with_sx, numeric_metric_with_key,
+    DerivativeCheckRequest, DirectCollocationCompileKey, LatexSection, Metric, MetricKey,
+    OcpKernelStrategy, OcpOverrideBehavior, OcpSxFunctionConfig, PlotMode, ProblemDerivativeCheck,
+    ProblemId, ProblemSpec, Scene2D, SceneAnimation, SceneArrow, SceneCircle, SceneFrame,
+    ScenePath, SolveArtifact, SolveLogLevel, SolvePhase, SolveProgress, SolveRequest, SolveStage,
+    SolveStatus, SolveStreamEvent, SolverMethod, SolverReport, SolverStatusKind, TimeSeries,
+    TimeSeriesRole, TranscriptionConfig, TranscriptionMethod, direct_collocation_variant,
+    direct_collocation_variant_with_sx, find_metric, metric, metric_with_key,
+    multiple_shooting_variant, multiple_shooting_variant_with_sx, numeric_metric_with_key,
     ocp_sx_function_config_from_map_lossy,
 };
 
@@ -34,6 +34,8 @@ pub(crate) struct ProblemEntry {
     pub(crate) spec: fn() -> ProblemSpec,
     pub(crate) solve_from_map: fn(&BTreeMap<String, f64>) -> Result<SolveArtifact>,
     pub(crate) prewarm_from_map: fn(&BTreeMap<String, f64>) -> Result<()>,
+    pub(crate) validate_derivatives_from_request:
+        fn(&common::DerivativeCheckRequest) -> Result<common::ProblemDerivativeCheck>,
     pub(crate) solve_with_progress_boxed: fn(
         &BTreeMap<String, f64>,
         Box<dyn FnMut(SolveStreamEvent) + Send>,
@@ -81,6 +83,13 @@ pub fn solve_problem(id: ProblemId, values: &BTreeMap<String, f64>) -> Result<So
 
 pub fn prewarm_problem(id: ProblemId, values: &BTreeMap<String, f64>) -> Result<()> {
     (problem_entry(id).prewarm_from_map)(values)
+}
+
+pub fn validate_problem_derivatives(
+    id: ProblemId,
+    request: &DerivativeCheckRequest,
+) -> Result<ProblemDerivativeCheck> {
+    (problem_entry(id).validate_derivatives_from_request)(request)
 }
 
 pub fn prewarm_problem_with_progress<F>(

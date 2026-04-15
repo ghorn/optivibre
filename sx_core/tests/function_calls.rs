@@ -1,4 +1,12 @@
+use std::collections::HashMap;
+
+use approx::assert_abs_diff_eq;
 use sx_core::{CallPolicy, NamedMatrix, NodeView, SX, SXFunction, SXMatrix};
+
+#[path = "../../test_support/symbolic_eval.rs"]
+mod symbolic_eval;
+
+use symbolic_eval::eval;
 
 fn named(name: &str, matrix: SXMatrix) -> NamedMatrix {
     NamedMatrix::new(name, matrix).expect("named matrix should be valid")
@@ -190,4 +198,265 @@ fn call_aware_reverse_batch_helper_keeps_irrelevant_inputs_zero() {
     assert!(direction_1_free.contains(&helper_s1.nz(0)));
     assert!(!direction_1_free.contains(&helper_x.nz(1)));
     assert!(!direction_1_free.contains(&helper_s0.nz(0)));
+}
+
+#[test]
+fn preserved_call_jacobian_keeps_direct_identity_terms_alongside_constant_helpers() {
+    let z = SXMatrix::sym_dense("z", 1, 1).expect("symbolic input should build");
+    let helper0 = SXFunction::new(
+        "const_leaf",
+        vec![named("z", z.clone())],
+        vec![named(
+            "y",
+            SXMatrix::dense_column(vec![SX::from(0.0), SX::from(0.75)])
+                .expect("helper output should build"),
+        )],
+    )
+    .expect("helper0 should build")
+    .with_call_policy_override(CallPolicy::NoInlineLLVM);
+    let helper1 = SXFunction::new(
+        "const_mid",
+        vec![named("z", z.clone())],
+        vec![named(
+            "y",
+            SXMatrix::scalar(
+                helper0
+                    .call_output(&[z.clone()])
+                    .expect("helper0 call should build")
+                    .nz(0),
+            ),
+        )],
+    )
+    .expect("helper1 should build")
+    .with_call_policy_override(CallPolicy::NoInlineLLVM);
+    let helper2 = SXFunction::new(
+        "const_root",
+        vec![named("z", z.clone())],
+        vec![named(
+            "y",
+            SXMatrix::scalar(
+                helper1
+                    .call_output(&[z.clone()])
+                    .expect("helper1 call should build")
+                    .nz(0),
+            ),
+        )],
+    )
+    .expect("helper2 should build")
+    .with_call_policy_override(CallPolicy::NoInlineLLVM);
+
+    let x = SXMatrix::sym_dense("x", 2, 1).expect("symbolic input should build");
+    let helper_outputs = helper0
+        .call_output(&[SXMatrix::dense_column(vec![x.nz(0)]).expect("helper input should build")])
+        .expect("helper call should build");
+    let outputs = SXMatrix::dense_column(vec![
+        helper2
+            .call_output(&[SXMatrix::dense_column(vec![x.nz(0).sin()]).expect("nested input")])
+            .expect("nested helper call should build")
+            .nz(0),
+        x.nz(1) + helper_outputs.nz(1),
+    ])
+    .expect("outer outputs should build");
+
+    let jacobian = outputs.jacobian(&x).expect("jacobian should build");
+    assert!(
+        !jacobian.get(1, 1).is_zero(),
+        "expected direct identity derivative to survive alongside constant helper calls: {:?}",
+        jacobian.get(1, 1).inspect()
+    );
+}
+
+#[test]
+fn preserved_call_jacobian_keeps_identity_terms_through_called_function_boundary() {
+    let z = SXMatrix::sym_dense("z", 1, 1).expect("symbolic input should build");
+    let helper0 = SXFunction::new(
+        "const_leaf_boundary",
+        vec![named("z", z.clone())],
+        vec![named(
+            "y",
+            SXMatrix::dense_column(vec![SX::from(0.0), SX::from(0.75)])
+                .expect("helper output should build"),
+        )],
+    )
+    .expect("helper0 should build")
+    .with_call_policy_override(CallPolicy::NoInlineLLVM);
+    let helper1 = SXFunction::new(
+        "const_mid_boundary",
+        vec![named("z", z.clone())],
+        vec![named(
+            "y",
+            SXMatrix::scalar(
+                helper0
+                    .call_output(&[z.clone()])
+                    .expect("helper0 call should build")
+                    .nz(0),
+            ),
+        )],
+    )
+    .expect("helper1 should build")
+    .with_call_policy_override(CallPolicy::NoInlineLLVM);
+    let helper2 = SXFunction::new(
+        "const_root_boundary",
+        vec![named("z", z.clone())],
+        vec![named(
+            "y",
+            SXMatrix::scalar(
+                helper1
+                    .call_output(&[z.clone()])
+                    .expect("helper1 call should build")
+                    .nz(0),
+            ),
+        )],
+    )
+    .expect("helper2 should build")
+    .with_call_policy_override(CallPolicy::NoInlineLLVM);
+
+    let x_inner = SXMatrix::sym_dense("x_inner", 2, 1).expect("inner input should build");
+    let inner_outputs = SXMatrix::dense_column(vec![
+        helper2
+            .call_output(
+                &[SXMatrix::dense_column(vec![x_inner.nz(0).sin()]).expect("nested input")],
+            )
+            .expect("nested helper call should build")
+            .nz(0),
+        x_inner.nz(1)
+            + helper0
+                .call_output(&[
+                    SXMatrix::dense_column(vec![x_inner.nz(0)]).expect("helper input should build")
+                ])
+                .expect("helper call should build")
+                .nz(1),
+    ])
+    .expect("inner outputs should build");
+    let inner = SXFunction::new(
+        "integrator_like_boundary",
+        vec![named("x", x_inner)],
+        vec![named("y", inner_outputs)],
+    )
+    .expect("inner function should build")
+    .with_call_policy_override(CallPolicy::NoInlineLLVM);
+
+    let x = SXMatrix::sym_dense("x", 2, 1).expect("outer input should build");
+    let outer_outputs = inner
+        .call_output(&[x.clone()])
+        .expect("outer call should build");
+    let jacobian = outer_outputs.jacobian(&x).expect("jacobian should build");
+    assert!(
+        !jacobian.get(1, 1).is_zero(),
+        "expected called-function identity derivative to survive preserved call boundary: {:?}",
+        jacobian.get(1, 1).inspect()
+    );
+}
+
+#[test]
+fn preserved_call_jacobian_keeps_identity_terms_with_multi_input_called_function() {
+    let z = SXMatrix::sym_dense("z", 1, 1).expect("symbolic input should build");
+    let helper0 = SXFunction::new(
+        "const_leaf_multi_input",
+        vec![named("z", z.clone())],
+        vec![named(
+            "y",
+            SXMatrix::dense_column(vec![SX::from(0.0), SX::from(0.75)])
+                .expect("helper output should build"),
+        )],
+    )
+    .expect("helper0 should build")
+    .with_call_policy_override(CallPolicy::NoInlineLLVM);
+    let helper1 = SXFunction::new(
+        "const_mid_multi_input",
+        vec![named("z", z.clone())],
+        vec![named(
+            "y",
+            SXMatrix::scalar(
+                helper0
+                    .call_output(&[z.clone()])
+                    .expect("helper0 call should build")
+                    .nz(0),
+            ),
+        )],
+    )
+    .expect("helper1 should build")
+    .with_call_policy_override(CallPolicy::NoInlineLLVM);
+
+    let x_inner = SXMatrix::sym_dense("x_inner", 2, 1).expect("x input should build");
+    let u_inner = SXMatrix::sym_dense("u_inner", 2, 1).expect("u input should build");
+    let dudt_inner = SXMatrix::sym_dense("dudt_inner", 2, 1).expect("dudt input should build");
+    let dt_inner = SXMatrix::sym_dense("dt_inner", 1, 1).expect("dt input should build");
+    let inner_outputs = SXMatrix::dense_column(vec![
+        helper1
+            .call_output(&[SXMatrix::dense_column(vec![x_inner.nz(0).sin()])
+                .expect("nested input should build")])
+            .expect("nested helper call should build")
+            .nz(0),
+        x_inner.nz(1)
+            + dt_inner.nz(0)
+                * helper0
+                    .call_output(&[SXMatrix::dense_column(vec![
+                        x_inner.nz(0) + u_inner.nz(0) + dudt_inner.nz(0),
+                    ])
+                    .expect("helper input should build")])
+                    .expect("helper call should build")
+                    .nz(1),
+    ])
+    .expect("inner outputs should build");
+    let inner = SXFunction::new(
+        "integrator_like_multi_input",
+        vec![
+            named("x", x_inner),
+            named("u", u_inner),
+            named("dudt", dudt_inner),
+            named("dt", dt_inner),
+        ],
+        vec![named("y", inner_outputs)],
+    )
+    .expect("inner function should build")
+    .with_call_policy_override(CallPolicy::NoInlineLLVM);
+
+    let x = SXMatrix::sym_dense("x", 2, 1).expect("outer x input should build");
+    let outer_outputs = inner
+        .call_output(&[
+            x.clone(),
+            SXMatrix::dense_column(vec![SX::from(0.1), SX::from(0.2)]).expect("u const"),
+            SXMatrix::dense_column(vec![SX::from(0.3), SX::from(0.4)]).expect("dudt const"),
+            SXMatrix::dense_column(vec![SX::from(0.5)]).expect("dt const"),
+        ])
+        .expect("outer call should build");
+    let jacobian = outer_outputs.jacobian(&x).expect("jacobian should build");
+    assert!(
+        !jacobian.get(1, 1).is_zero(),
+        "expected called-function identity derivative to survive multi-input preserved call boundary: {:?}",
+        jacobian.get(1, 1).inspect()
+    );
+}
+
+#[test]
+fn preserved_call_forward_combined_seed_uses_seed_specific_call_memoization() {
+    let z = SXMatrix::sym_dense("z", 2, 1).expect("symbolic input should build");
+    let inner = SXFunction::new(
+        "identity_pair_seed_memo",
+        vec![named("z", z.clone())],
+        vec![named("y", z)],
+    )
+    .expect("inner function should build")
+    .with_call_policy_override(CallPolicy::NoInlineLLVM);
+
+    let x = SXMatrix::sym_dense("x", 2, 1).expect("outer input should build");
+    let called = inner
+        .call_output(&[x.clone()])
+        .expect("call output should build");
+    let combined_seed =
+        SXMatrix::dense_column(vec![SX::from(1.0), SX::from(1.0)]).expect("seed should build");
+    let forward = called
+        .forward(&x, &combined_seed)
+        .expect("combined forward should build");
+
+    let vars = HashMap::from([(x.nz(0).id(), 2.0), (x.nz(1).id(), 3.0)]);
+    assert_abs_diff_eq!(eval(forward.nz(0), &vars), 1.0, epsilon = 1e-12);
+    assert_abs_diff_eq!(eval(forward.nz(1), &vars), 1.0, epsilon = 1e-12);
+
+    let jacobian = called.jacobian(&x).expect("jacobian should build");
+    assert_abs_diff_eq!(eval(jacobian.get(0, 0), &vars), 1.0, epsilon = 1e-12);
+    assert_abs_diff_eq!(eval(jacobian.get(1, 1), &vars), 1.0, epsilon = 1e-12);
+    assert_abs_diff_eq!(eval(jacobian.get(0, 1), &vars), 0.0, epsilon = 1e-12);
+    assert_abs_diff_eq!(eval(jacobian.get(1, 0), &vars), 0.0, epsilon = 1e-12);
 }

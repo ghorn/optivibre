@@ -63,17 +63,21 @@ pub fn eval(expr: SX, vars: &HashMap<u64, f64>) -> f64 {
             ..
         } => {
             let function = lookup_function(function_id).expect("call should reference a function");
-            let evaluated_inputs = inputs
-                .iter()
-                .map(|input| input.map_nonzeros(|value| SX::from(eval(value, vars))))
-                .collect::<Vec<_>>();
-            let outputs = function
-                .call(&evaluated_inputs)
-                .expect("symbolic function call should evaluate");
-            match outputs[output_slot].nonzeros()[output_offset].inspect() {
-                NodeView::Constant(value) => value,
-                other => panic!("expected evaluated call output to be constant, got {other:?}"),
+            let mut call_vars = HashMap::new();
+            for (formal, actual) in function.inputs().iter().zip(inputs.iter()) {
+                for (&symbol, &expr) in formal
+                    .matrix()
+                    .nonzeros()
+                    .iter()
+                    .zip(actual.nonzeros().iter())
+                {
+                    call_vars.insert(symbol.id(), eval(expr, vars));
+                }
             }
+            eval(
+                function.outputs()[output_slot].matrix().nonzeros()[output_offset],
+                &call_vars,
+            )
         }
     }
 }

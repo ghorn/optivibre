@@ -507,21 +507,22 @@ fn diagnose_repeated_helper_call_derivatives_by_call_policy() {
     )
     .expect("helper function should build");
 
-    let symbolic = symbolic_nlp::<TinyMs<SX>, (), [SX; 2], [SX; 2], _>("mini_ms_helper_call", |v, _| {
-        let step0 = step
-            .call_output(&[SXMatrix::dense_column(vec![v.x0, v.u0]).expect("step0 input")])
-            .expect("step0 output should build");
-        let step1 = step
-            .call_output(&[SXMatrix::dense_column(vec![v.x1, v.u1]).expect("step1 input")])
-            .expect("step1 output should build");
+    let symbolic =
+        symbolic_nlp::<TinyMs<SX>, (), [SX; 2], [SX; 2], _>("mini_ms_helper_call", |v, _| {
+            let step0 = step
+                .call_output(&[SXMatrix::dense_column(vec![v.x0, v.u0]).expect("step0 input")])
+                .expect("step0 output should build");
+            let step1 = step
+                .call_output(&[SXMatrix::dense_column(vec![v.x1, v.u1]).expect("step1 input")])
+                .expect("step1 output should build");
 
-        SymbolicNlpOutputs {
-            objective: v.u0.sqr() + 0.5 * v.u1.sqr(),
-            equalities: [step0.nz(0) - v.x1, step1.nz(0) - v.x2],
-            inequalities: [step0.nz(1) - 0.1, step1.nz(1) - 0.2],
-        }
-    })
-    .expect("symbolic NLP should build");
+            SymbolicNlpOutputs {
+                objective: v.u0.sqr() + 0.5 * v.u1.sqr(),
+                equalities: [step0.nz(0) - v.x1, step1.nz(0) - v.x2],
+                inequalities: [step0.nz(1) - 0.1, step1.nz(1) - 0.2],
+            }
+        })
+        .expect("symbolic NLP should build");
 
     for (label, policy) in [
         ("inline_at_call", CallPolicy::InlineAtCall),

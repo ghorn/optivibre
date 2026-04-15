@@ -235,6 +235,12 @@ struct ForwardCallCacheKey {
     site_id: CallSiteId,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ForwardCallMemoKey {
+    site_key: ForwardCallCacheKey,
+    seed_inputs: CallInputs,
+}
+
 #[derive(Default)]
 struct AdLocalCaches {
     dependency_profiles: HashMap<FunctionId, Arc<DependencyProfile>>,
@@ -1725,6 +1731,7 @@ struct ForwardBatchCallCacheKey {
     site_key: ForwardCallCacheKey,
     direction_count: usize,
     direction_mask: u64,
+    seed_inputs: CallInputs,
 }
 
 #[derive(Clone, Debug)]
@@ -4063,7 +4070,7 @@ fn execute_program_forward(program: &SxProgram, vars: &[SX], seeds: &[SX]) -> Re
     }
 
     let mut local_caches = AdLocalCaches::default();
-    let mut call_memo = HashMap::<ForwardCallCacheKey, Vec<SXMatrix>>::new();
+    let mut call_memo = HashMap::<ForwardCallMemoKey, Vec<SXMatrix>>::new();
     for instruction in &program.instructions {
         match instruction {
             ProgramInstruction::Unary {
@@ -4178,8 +4185,6 @@ fn execute_program_forward(program: &SxProgram, vars: &[SX], seeds: &[SX]) -> Re
 
                 derivative_slots[*result_slot] = if !has_relevant_seed {
                     SX::zero()
-                } else if let Some(existing) = call_memo.get(site_key) {
-                    existing[*output_slot].nz(*output_offset)
                 } else {
                     let mut seed_inputs = Vec::with_capacity(inputs.len());
                     for input in inputs {
@@ -4189,16 +4194,24 @@ fn execute_program_forward(program: &SxProgram, vars: &[SX], seeds: &[SX]) -> Re
                         }
                         seed_inputs.push(SXMatrix::new(input.matrix.ccs().clone(), seed_nonzeros)?);
                     }
-                    let helper = local_caches.forward_helper(*function)?;
-                    let mut helper_inputs = inputs
-                        .iter()
-                        .map(|input| input.matrix.clone())
-                        .collect::<Vec<_>>();
-                    helper_inputs.extend(seed_inputs);
-                    let helper_outputs = helper.call(&helper_inputs)?;
-                    let selected = helper_outputs[*output_slot].nz(*output_offset);
-                    call_memo.insert(site_key.clone(), helper_outputs);
-                    selected
+                    let memo_key = ForwardCallMemoKey {
+                        site_key: site_key.clone(),
+                        seed_inputs: CallInputs::new(seed_inputs.clone()),
+                    };
+                    if let Some(existing) = call_memo.get(&memo_key) {
+                        existing[*output_slot].nz(*output_offset)
+                    } else {
+                        let helper = local_caches.forward_helper(*function)?;
+                        let mut helper_inputs = inputs
+                            .iter()
+                            .map(|input| input.matrix.clone())
+                            .collect::<Vec<_>>();
+                        helper_inputs.extend(seed_inputs);
+                        let helper_outputs = helper.call(&helper_inputs)?;
+                        let selected = helper_outputs[*output_slot].nz(*output_offset);
+                        call_memo.insert(memo_key, helper_outputs);
+                        selected
+                    }
                 };
             }
         }
@@ -4548,10 +4561,15 @@ fn execute_program_forward_batch_with_slots(
                             }
                             seed_inputs_by_direction.push(direction_seed_inputs);
                         }
+                        let memo_seed_inputs = seed_inputs_by_direction
+                            .iter()
+                            .flat_map(|direction_seed_inputs| direction_seed_inputs.iter().cloned())
+                            .collect::<Vec<_>>();
                         let key = ForwardBatchCallCacheKey {
                             site_key: site_key.clone(),
                             direction_count: active_count,
                             direction_mask,
+                            seed_inputs: CallInputs::new(memo_seed_inputs),
                         };
                         if let Some(existing) = call_memo.get(&key) {
                             let mut selected = vec![SX::zero(); direction_count];
@@ -4614,10 +4632,15 @@ fn execute_program_forward_batch_with_slots(
                             }
                             seed_inputs_by_direction.push(direction_seed_inputs);
                         }
+                        let memo_seed_inputs = seed_inputs_by_direction
+                            .iter()
+                            .flat_map(|direction_seed_inputs| direction_seed_inputs.iter().cloned())
+                            .collect::<Vec<_>>();
                         let key = ForwardBatchCallCacheKey {
                             site_key: site_key.clone(),
                             direction_count,
                             direction_mask: u64::MAX,
+                            seed_inputs: CallInputs::new(memo_seed_inputs),
                         };
                         if let Some(existing) = call_memo.get(&key) {
                             (0..direction_count)

@@ -50,7 +50,8 @@ pub use symbolic::{
 };
 pub use validation::{
     FiniteDifferenceValidationOptions, NlpDerivativeValidationReport, ValidationSparsitySummary,
-    ValidationSummary, ValidationWorstEntry, validate_compiled_nlp_problem_derivatives,
+    ValidationSummary, ValidationTolerances, ValidationWorstEntry,
+    validate_compiled_nlp_problem_derivatives,
 };
 pub use vectorize::{
     ScalarLeaf, Vectorize, VectorizeLayoutError, extend_layout_name, flat_view, flatten_value,

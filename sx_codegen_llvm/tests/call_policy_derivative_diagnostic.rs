@@ -138,8 +138,6 @@ fn diagnose_repeated_step_jacobian_by_call_policy() {
             .filter(|(lhs, rhs)| lhs.abs() <= 1.0e-7 && rhs.abs() > 1.0e-7)
             .count();
 
-        println!(
-            "{label}: max_abs_error={max_abs_error:.3e}, missing_nonzeros={missing_nonzeros}"
-        );
+        println!("{label}: max_abs_error={max_abs_error:.3e}, missing_nonzeros={missing_nonzeros}");
     }
 }

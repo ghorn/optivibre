@@ -51,12 +51,57 @@ pub struct ValidationSummary {
     pub sparsity: ValidationSparsitySummary,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ValidationTolerances {
+    pub max_abs_error: f64,
+    pub max_rel_error: f64,
+}
+
+impl ValidationTolerances {
+    pub const fn new(max_abs_error: f64, max_rel_error: f64) -> Self {
+        Self {
+            max_abs_error,
+            max_rel_error,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct NlpDerivativeValidationReport {
     pub objective_gradient: ValidationSummary,
     pub equality_jacobian: Option<ValidationSummary>,
     pub inequality_jacobian: Option<ValidationSummary>,
     pub lagrangian_hessian: ValidationSummary,
+}
+
+impl ValidationSummary {
+    pub fn is_within_tolerances(&self, tolerances: ValidationTolerances) -> bool {
+        self.max_abs_error <= tolerances.max_abs_error
+            || self.max_rel_error <= tolerances.max_rel_error
+    }
+}
+
+impl NlpDerivativeValidationReport {
+    pub fn first_order_is_within_tolerances(&self, tolerances: ValidationTolerances) -> bool {
+        self.objective_gradient.is_within_tolerances(tolerances)
+            && self
+                .equality_jacobian
+                .as_ref()
+                .is_none_or(|summary| summary.is_within_tolerances(tolerances))
+            && self
+                .inequality_jacobian
+                .as_ref()
+                .is_none_or(|summary| summary.is_within_tolerances(tolerances))
+    }
+
+    pub fn second_order_is_within_tolerances(&self, tolerances: ValidationTolerances) -> bool {
+        self.lagrangian_hessian.is_within_tolerances(tolerances)
+    }
+
+    pub fn all_orders_are_within_tolerances(&self, tolerances: ValidationTolerances) -> bool {
+        self.first_order_is_within_tolerances(tolerances)
+            && self.second_order_is_within_tolerances(tolerances)
+    }
 }
 
 pub fn validate_compiled_nlp_problem_derivatives(

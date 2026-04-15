@@ -674,12 +674,39 @@ pub(crate) fn prewarm_with_progress_boxed(
     )
 }
 
+pub fn validate_derivatives(
+    params: &Params,
+    request: &crate::common::DerivativeCheckRequest,
+) -> Result<crate::common::ProblemDerivativeCheck> {
+    crate::common::validate_standard_ocp_derivatives(
+        ProblemId::OptimalDistanceGlider,
+        PROBLEM_NAME,
+        params,
+        params.transcription.method,
+        params.transcription.collocation_family,
+        params.sx_functions,
+        request,
+        cached_multiple_shooting,
+        cached_direct_collocation,
+        ms_runtime::<DEFAULT_INTERVALS>,
+        dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+    )
+}
+
+pub(crate) fn validate_derivatives_from_request(
+    request: &crate::common::DerivativeCheckRequest,
+) -> Result<crate::common::ProblemDerivativeCheck> {
+    let params = Params::from_map(&request.values)?;
+    validate_derivatives(&params, request)
+}
+
 pub(crate) fn problem_entry() -> crate::ProblemEntry {
     crate::ProblemEntry {
         id: ProblemId::OptimalDistanceGlider,
         spec,
         solve_from_map,
         prewarm_from_map,
+        validate_derivatives_from_request,
         solve_with_progress_boxed,
         prewarm_with_progress_boxed,
         compile_cache_statuses,
@@ -1188,9 +1215,23 @@ mod tests {
         );
     }
 
+    fn jacobian_is_clean(summary: &optimization::ValidationSummary) -> bool {
+        summary.max_abs_error <= 5.0e-5
+            && summary.max_rel_error <= 5.0e-4
+            && summary.sparsity.missing_from_analytic == 0
+            && summary.sparsity.extra_in_analytic == 0
+    }
+
+    fn assert_jacobian_clean(label: &str, kind: &str, summary: &optimization::ValidationSummary) {
+        assert!(
+            jacobian_is_clean(summary),
+            "{label} expected clean {kind} Jacobian, got {summary:?}"
+        );
+    }
+
     #[test]
-    #[ignore = "manual diagnostic for MS sparsity mismatch"]
-    fn diagnose_reduced_multiple_shooting_sparsity_with_finite_difference() {
+    #[ignore = "manual reduced multiple-shooting Jacobian policy regression check"]
+    fn reduced_multiple_shooting_jacobian_policies_stay_clean() {
         const N: usize = 8;
         let params = Params::default();
         let runtime = ms_runtime::<N>(&params);
@@ -1251,19 +1292,17 @@ mod tests {
                     },
                 )
                 .expect("finite-difference validation should succeed");
-
-            println!(
-                "{label}: stats={stats:?}\n  eq_jac={:?}\n  ineq_jac={:?}\n  hess={:?}",
-                validation.equality_jacobian,
-                validation.inequality_jacobian,
-                validation.lagrangian_hessian
-            );
+            let equality_jacobian = validation
+                .equality_jacobian
+                .as_ref()
+                .expect("multiple-shooting equality Jacobian summary should exist");
+            assert_jacobian_clean(label, "equality", equality_jacobian);
         }
     }
 
     #[test]
-    #[ignore = "manual diagnostic for DC sparsity mismatch"]
-    fn diagnose_reduced_direct_collocation_sparsity_with_finite_difference() {
+    #[ignore = "manual reduced direct-collocation Jacobian policy regression check"]
+    fn reduced_direct_collocation_jacobian_policies_stay_clean() {
         const N: usize = 8;
         const K: usize = DEFAULT_COLLOCATION_DEGREE;
         let params = Params::default();
@@ -1325,13 +1364,16 @@ mod tests {
                     },
                 )
                 .expect("finite-difference validation should succeed");
-
-            println!(
-                "{label}: stats={stats:?}\n  eq_jac={:?}\n  ineq_jac={:?}\n  hess={:?}",
-                validation.equality_jacobian,
-                validation.inequality_jacobian,
-                validation.lagrangian_hessian
-            );
+            let equality_jacobian = validation
+                .equality_jacobian
+                .as_ref()
+                .expect("direct-collocation equality Jacobian summary should exist");
+            let inequality_jacobian = validation
+                .inequality_jacobian
+                .as_ref()
+                .expect("direct-collocation inequality Jacobian summary should exist");
+            assert_jacobian_clean(label, "equality", equality_jacobian);
+            assert_jacobian_clean(label, "inequality", inequality_jacobian);
         }
     }
 }

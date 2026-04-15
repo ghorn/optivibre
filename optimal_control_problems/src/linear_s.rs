@@ -602,12 +602,39 @@ pub(crate) fn prewarm_with_progress_boxed(
     )
 }
 
+pub fn validate_derivatives(
+    params: &Params,
+    request: &crate::common::DerivativeCheckRequest,
+) -> Result<crate::common::ProblemDerivativeCheck> {
+    crate::common::validate_standard_ocp_derivatives(
+        ProblemId::LinearSManeuver,
+        PROBLEM_NAME,
+        params,
+        params.transcription.method,
+        params.transcription.collocation_family,
+        params.sx_functions,
+        request,
+        cached_multiple_shooting,
+        cached_direct_collocation,
+        ms_runtime::<DEFAULT_INTERVALS>,
+        dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+    )
+}
+
+pub(crate) fn validate_derivatives_from_request(
+    request: &crate::common::DerivativeCheckRequest,
+) -> Result<crate::common::ProblemDerivativeCheck> {
+    let params = Params::from_map(&request.values)?;
+    validate_derivatives(&params, request)
+}
+
 pub(crate) fn problem_entry() -> crate::ProblemEntry {
     crate::ProblemEntry {
         id: ProblemId::LinearSManeuver,
         spec,
         solve_from_map,
         prewarm_from_map,
+        validate_derivatives_from_request,
         solve_with_progress_boxed,
         prewarm_with_progress_boxed,
         compile_cache_statuses,

@@ -27,3 +27,4 @@ thiserror.workspace = true
 [dev-dependencies]
 approx.workspace = true
 lqr_solvers = { path = "../lqr_solvers" }
+proptest.workspace = true

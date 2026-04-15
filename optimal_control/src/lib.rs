@@ -1,17 +1,16 @@
 use anyhow::Result as AnyResult;
 use optimization::{
     BackendCompileReport, BackendTimingMetadata, CallPolicy, ClarabelSqpError, ClarabelSqpOptions,
-    ClarabelSqpSummary, ConstraintBoundSide, ConstraintSatisfaction, FunctionCompileOptions,
-    FiniteDifferenceValidationOptions, InteriorPointIterationSnapshot, InteriorPointOptions,
-    InteriorPointSolveError, InteriorPointSummary, LlvmOptimizationLevel,
+    ClarabelSqpSummary, ConstraintBoundSide, ConstraintSatisfaction,
+    FiniteDifferenceValidationOptions, FunctionCompileOptions, InteriorPointIterationSnapshot,
+    InteriorPointOptions, InteriorPointSolveError, InteriorPointSummary, LlvmOptimizationLevel,
     NlpCompileStats, NlpDerivativeValidationReport, NlpEvaluationBenchmark,
-    NlpEvaluationBenchmarkOptions, NlpEvaluationKernelKind, ScalarLeaf,
-    SqpIterationSnapshot, SymbolicCompileMetadata, SymbolicCompileProgress,
-    SymbolicCompileStageProgress, SymbolicNlpBuildError, SymbolicNlpCompileError,
-    SymbolicNlpOutputs, TypedCompiledJitNlp, TypedRuntimeNlpBounds, Vectorize,
-    VectorizeLayoutError, classify_constraint_satisfaction, constraint_bound_side,
-    flatten_value, symbolic_column, symbolic_nlp, symbolic_value, unflatten_value,
-    worst_bound_violation,
+    NlpEvaluationBenchmarkOptions, NlpEvaluationKernelKind, ScalarLeaf, SqpIterationSnapshot,
+    SymbolicCompileMetadata, SymbolicCompileProgress, SymbolicCompileStageProgress,
+    SymbolicNlpBuildError, SymbolicNlpCompileError, SymbolicNlpOutputs, TypedCompiledJitNlp,
+    TypedRuntimeNlpBounds, Vectorize, VectorizeLayoutError, classify_constraint_satisfaction,
+    constraint_bound_side, flatten_value, symbolic_column, symbolic_nlp, symbolic_value,
+    unflatten_value, worst_bound_violation,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptIterationSnapshot, IpoptOptions, IpoptSolveError, IpoptSummary};
@@ -6100,3 +6099,11 @@ mod tests {
         assert_abs_diff_eq!(coeffs.nodes[1], 1.0, epsilon = 1e-12);
     }
 }
+
+#[cfg(test)]
+#[path = "../../test_support/jacobian_proptest/mod.rs"]
+mod jacobian_proptest;
+
+#[cfg(test)]
+#[path = "ocp_jacobian_prop_tests.rs"]
+mod ocp_jacobian_prop_tests;

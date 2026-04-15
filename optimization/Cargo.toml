@@ -33,5 +33,6 @@ thiserror.workspace = true
 approx.workspace = true
 examples_source = { path = "../examples_source" }
 examples_run = { path = "../examples_run" }
+proptest.workspace = true
 rstest.workspace = true
 serde_json.workspace = true
