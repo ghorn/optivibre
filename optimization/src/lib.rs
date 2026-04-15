@@ -25,6 +25,7 @@ mod interior_point;
 #[cfg(feature = "ipopt")]
 mod ipopt_backend;
 mod symbolic;
+mod validation;
 mod vectorize;
 
 pub use interior_point::{
@@ -46,6 +47,10 @@ pub use symbolic::{
     ConstraintBounds, RuntimeBoundedJitNlp, RuntimeNlpBounds, SymbolicNlpBuildError,
     SymbolicNlpCompileError, SymbolicNlpOutputs, TypedCompiledJitNlp, TypedRuntimeNlpBounds,
     TypedSymbolicNlp, symbolic_nlp,
+};
+pub use validation::{
+    FiniteDifferenceValidationOptions, NlpDerivativeValidationReport, ValidationSparsitySummary,
+    ValidationSummary, ValidationWorstEntry, validate_compiled_nlp_problem_derivatives,
 };
 pub use vectorize::{
     ScalarLeaf, Vectorize, VectorizeLayoutError, extend_layout_name, flat_view, flatten_value,
@@ -650,6 +655,47 @@ pub fn benchmark_compiled_nlp_problem_with_progress(
     options: NlpEvaluationBenchmarkOptions,
     mut on_progress: impl FnMut(NlpEvaluationKernelKind),
 ) -> NlpEvaluationBenchmark {
+    if options.warmup_iterations == 0 && options.measured_iterations == 0 {
+        return NlpEvaluationBenchmark {
+            benchmark_point: NlpBenchmarkPointSummary {
+                decision_inf_norm: x.iter().map(|value| value.abs()).fold(0.0_f64, f64::max),
+                parameter_inf_norm: parameters
+                    .iter()
+                    .flat_map(|parameter| parameter.values.iter())
+                    .map(|value| value.abs())
+                    .fold(0.0_f64, f64::max),
+                objective_value: f64::NAN,
+                objective_finite: false,
+                equality_inf_norm: None,
+                inequality_inf_norm: None,
+            },
+            objective_value: KernelBenchmarkStats {
+                output_len: 1,
+                ..KernelBenchmarkStats::default()
+            },
+            objective_gradient: KernelBenchmarkStats {
+                output_len: problem.dimension(),
+                ..KernelBenchmarkStats::default()
+            },
+            equality_jacobian_values: (problem.equality_count() > 0).then(|| {
+                KernelBenchmarkStats {
+                    output_len: problem.equality_jacobian_ccs().nnz(),
+                    ..KernelBenchmarkStats::default()
+                }
+            }),
+            inequality_jacobian_values: (problem.inequality_count() > 0).then(|| {
+                KernelBenchmarkStats {
+                    output_len: problem.inequality_jacobian_ccs().nnz(),
+                    ..KernelBenchmarkStats::default()
+                }
+            }),
+            lagrangian_hessian_values: KernelBenchmarkStats {
+                output_len: problem.lagrangian_hessian_ccs().nnz(),
+                ..KernelBenchmarkStats::default()
+            },
+        };
+    }
+
     let mut gradient = vec![0.0; problem.dimension()];
     let equality_value_len = problem.equality_count();
     let mut equality_values = vec![0.0; equality_value_len];

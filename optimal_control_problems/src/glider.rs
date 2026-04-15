@@ -1187,4 +1187,151 @@ mod tests {
             compiled.backend_compile_report().stats,
         );
     }
+
+    #[test]
+    #[ignore = "manual diagnostic for MS sparsity mismatch"]
+    fn diagnose_reduced_multiple_shooting_sparsity_with_finite_difference() {
+        const N: usize = 8;
+        let params = Params::default();
+        let runtime = ms_runtime::<N>(&params);
+
+        for (label, symbolic_functions) in [
+            (
+                "baseline",
+                optimal_control::OcpSymbolicFunctionOptions::default(),
+            ),
+            (
+                "inline_all",
+                optimal_control::OcpSymbolicFunctionOptions::inline_all(),
+            ),
+            (
+                "at_call",
+                optimal_control::OcpSymbolicFunctionOptions::function_all_with_call_policy(
+                    optimization::CallPolicy::InlineAtCall,
+                ),
+            ),
+            (
+                "at_lowering",
+                optimal_control::OcpSymbolicFunctionOptions::function_all_with_call_policy(
+                    optimization::CallPolicy::InlineAtLowering,
+                ),
+            ),
+            (
+                "in_llvm",
+                optimal_control::OcpSymbolicFunctionOptions::function_all_with_call_policy(
+                    optimization::CallPolicy::InlineInLLVM,
+                ),
+            ),
+            (
+                "noinline_llvm",
+                optimal_control::OcpSymbolicFunctionOptions::function_all_with_call_policy(
+                    optimization::CallPolicy::NoInlineLLVM,
+                ),
+            ),
+        ] {
+            let compiled = model(MultipleShooting::<N, RK4_SUBSTEPS>)
+                .compile_jit_with_ocp_options(optimal_control::OcpCompileOptions {
+                    function_options: optimization::FunctionCompileOptions::from(
+                        optimization::LlvmOptimizationLevel::O0,
+                    ),
+                    symbolic_functions,
+                })
+                .expect("compile should succeed");
+
+            let stats = compiled.nlp_compile_stats();
+            let validation = compiled
+                .validate_nlp_derivatives(
+                    &runtime,
+                    &vec![1.0; stats.equality_count],
+                    &vec![1.0; stats.inequality_count],
+                    optimization::FiniteDifferenceValidationOptions {
+                        first_order_step: 1.0e-6,
+                        second_order_step: 1.0e-4,
+                        zero_tolerance: 1.0e-7,
+                    },
+                )
+                .expect("finite-difference validation should succeed");
+
+            println!(
+                "{label}: stats={stats:?}\n  eq_jac={:?}\n  ineq_jac={:?}\n  hess={:?}",
+                validation.equality_jacobian,
+                validation.inequality_jacobian,
+                validation.lagrangian_hessian
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual diagnostic for DC sparsity mismatch"]
+    fn diagnose_reduced_direct_collocation_sparsity_with_finite_difference() {
+        const N: usize = 8;
+        const K: usize = DEFAULT_COLLOCATION_DEGREE;
+        let params = Params::default();
+        let runtime = dc_runtime::<N, K>(&params);
+
+        for (label, symbolic_functions) in [
+            (
+                "baseline",
+                optimal_control::OcpSymbolicFunctionOptions::direct_collocation_default(),
+            ),
+            (
+                "inline_all",
+                optimal_control::OcpSymbolicFunctionOptions::inline_all(),
+            ),
+            (
+                "at_call",
+                optimal_control::OcpSymbolicFunctionOptions::function_all_with_call_policy(
+                    optimization::CallPolicy::InlineAtCall,
+                ),
+            ),
+            (
+                "at_lowering",
+                optimal_control::OcpSymbolicFunctionOptions::function_all_with_call_policy(
+                    optimization::CallPolicy::InlineAtLowering,
+                ),
+            ),
+            (
+                "in_llvm",
+                optimal_control::OcpSymbolicFunctionOptions::function_all_with_call_policy(
+                    optimization::CallPolicy::InlineInLLVM,
+                ),
+            ),
+            (
+                "noinline_llvm",
+                optimal_control::OcpSymbolicFunctionOptions::function_all_with_call_policy(
+                    optimization::CallPolicy::NoInlineLLVM,
+                ),
+            ),
+        ] {
+            let compiled = model(DirectCollocation::<N, K>::default())
+                .compile_jit_with_ocp_options(optimal_control::OcpCompileOptions {
+                    function_options: optimization::FunctionCompileOptions::from(
+                        optimization::LlvmOptimizationLevel::O0,
+                    ),
+                    symbolic_functions,
+                })
+                .expect("compile should succeed");
+
+            let stats = compiled.nlp_compile_stats();
+            let validation = compiled
+                .validate_nlp_derivatives(
+                    &runtime,
+                    &vec![1.0; stats.equality_count],
+                    &vec![1.0; stats.inequality_count],
+                    optimization::FiniteDifferenceValidationOptions {
+                        first_order_step: 1.0e-6,
+                        second_order_step: 1.0e-4,
+                        zero_tolerance: 1.0e-7,
+                    },
+                )
+                .expect("finite-difference validation should succeed");
+
+            println!(
+                "{label}: stats={stats:?}\n  eq_jac={:?}\n  ineq_jac={:?}\n  hess={:?}",
+                validation.equality_jacobian,
+                validation.inequality_jacobian,
+                validation.lagrangian_hessian
+            );
+        }
+    }
 }

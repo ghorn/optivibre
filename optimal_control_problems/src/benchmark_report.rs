@@ -1154,9 +1154,9 @@ pub fn render_ocp_benchmark_report(suite: &OcpBenchmarkSuite) -> String {
         </div>
         <div class="summary-card">
           <span class="summary-label">Eval Loop</span>
-          <span class="summary-value">{measured_iterations}x</span>
+          <span class="summary-value">{eval_loop_label}</span>
           <span class="summary-subvalue">
-            {warmup_iterations} warmup iterations per kernel
+            {eval_loop_detail}
           </span>
         </div>
         <div class="summary-card">
@@ -1368,8 +1368,23 @@ pub fn render_ocp_benchmark_report(suite: &OcpBenchmarkSuite) -> String {
         problem_count = problem_values.len(),
         transcription_count = transcription_values.len(),
         preset_count = preset_values.len(),
-        measured_iterations = suite.eval_options.measured_iterations,
-        warmup_iterations = suite.eval_options.warmup_iterations,
+        eval_loop_label = if suite.eval_options.measured_iterations == 0
+            && suite.eval_options.warmup_iterations == 0
+        {
+            "compile only".to_string()
+        } else {
+            format!("{}x", suite.eval_options.measured_iterations)
+        },
+        eval_loop_detail = if suite.eval_options.measured_iterations == 0
+            && suite.eval_options.warmup_iterations == 0
+        {
+            "no eval warmup or timed iterations".to_string()
+        } else {
+            format!(
+                "{} warmup iterations per kernel",
+                suite.eval_options.warmup_iterations
+            )
+        },
         total_compile_sum = format_duration_seconds(Some(total_compile_sum), false),
         slowest_compile = format_summary_case("Slowest compile", slowest_compile, false),
         slowest_hessian = format_summary_case("Slowest hessian", slowest_hessian, true),

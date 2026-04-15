@@ -1475,7 +1475,46 @@ fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sx_codegen_llvm::{AotWrapperOptions, generate_aot_wrapper_module};
+    use sx_codegen_llvm::{
+        AotWrapperOptions, LlvmOptimizationLevel, LlvmTarget, emit_object_file_lowered,
+        generate_aot_wrapper_module,
+    };
+
+    fn repro_multiple_shooting_inline_all_hessian_preflight_for<const N: usize>() {
+        let compiled = model(MultipleShooting::<N, RK4_SUBSTEPS>)
+            .compile_jit_with_ocp_options(optimal_control::OcpCompileOptions {
+                function_options: optimization::FunctionCompileOptions::from(
+                    optimization::LlvmOptimizationLevel::O0,
+                ),
+                symbolic_functions: optimal_control::OcpSymbolicFunctionOptions::inline_all(),
+            })
+            .expect("compile should succeed");
+        let lowered = compiled.debug_lagrangian_hessian_lowered();
+        println!(
+            "N={N} lowered instructions={} subfunctions={} hessian_nnz={}",
+            lowered.instructions.len(),
+            lowered.subfunctions.len(),
+            lowered.outputs[0].ccs.nnz()
+        );
+        let mut params = Params::default();
+        params.transcription.intervals = N;
+        let values = ms_runtime::<N>(&params);
+        let benchmark = compiled
+            .benchmark_nlp_evaluations_with_progress(
+                &values,
+                optimization::NlpEvaluationBenchmarkOptions {
+                    warmup_iterations: 0,
+                    measured_iterations: 0,
+                },
+                |kernel| println!("kernel: {kernel:?}"),
+            )
+            .expect("benchmark preflight should succeed");
+        println!(
+            "N={N} hessian preflight finite={} max_abs={}",
+            benchmark.lagrangian_hessian_values.preflight_output.finite,
+            benchmark.lagrangian_hessian_values.preflight_output.max_abs
+        );
+    }
 
     #[test]
     fn sailboat_initial_guess_is_symmetric() {
@@ -1630,5 +1669,148 @@ mod tests {
         );
         println!("instructions: {}", lowered.instructions.len());
         println!("subfunctions: {}", lowered.subfunctions.len());
+    }
+
+    #[test]
+    #[ignore = "manual crash reproducer"]
+    fn repro_multiple_shooting_inline_all_hessian_preflight() {
+        repro_multiple_shooting_inline_all_hessian_preflight_for::<DEFAULT_INTERVALS>();
+    }
+
+    #[test]
+    #[ignore = "manual debug helper"]
+    fn dump_small_multiple_shooting_inline_all_hessian_wrapper() {
+        const SMALL_N: usize = 3;
+        let compiled = model(MultipleShooting::<SMALL_N, RK4_SUBSTEPS>)
+            .compile_jit_with_ocp_options(optimal_control::OcpCompileOptions {
+                function_options: optimization::FunctionCompileOptions::from(
+                    optimization::LlvmOptimizationLevel::O0,
+                ),
+                symbolic_functions: optimal_control::OcpSymbolicFunctionOptions::inline_all(),
+            })
+            .expect("compile should succeed");
+        let lowered = compiled.debug_lagrangian_hessian_lowered();
+        let wrapper = generate_aot_wrapper_module(
+            lowered,
+            &AotWrapperOptions {
+                emit_doc_comments: false,
+            },
+        )
+        .expect("wrapper generation should succeed");
+        let out_path = std::path::PathBuf::from(
+            "target/sailboat_ms3_inline_all_lagrangian_hessian_wrapper.rs",
+        );
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent).expect("target directory should exist");
+        }
+        std::fs::write(&out_path, wrapper).expect("wrapper write should succeed");
+        println!("wrote {}", out_path.display());
+        println!(
+            "outputs: {:?}",
+            lowered
+                .outputs
+                .iter()
+                .map(|slot| {
+                    (
+                        slot.name.as_str(),
+                        slot.ccs.nrow(),
+                        slot.ccs.ncol(),
+                        slot.ccs.nnz(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "output_value_lens: {:?}",
+            lowered
+                .output_values
+                .iter()
+                .map(std::vec::Vec::len)
+                .collect::<Vec<_>>()
+        );
+        println!("instructions: {}", lowered.instructions.len());
+        println!("subfunctions: {}", lowered.subfunctions.len());
+    }
+
+    fn dump_multiple_shooting_inline_all_hessian_object_for<const N: usize>(
+        opt_level: LlvmOptimizationLevel,
+    ) {
+        let compiled = model(MultipleShooting::<N, RK4_SUBSTEPS>)
+            .compile_jit_with_ocp_options(optimal_control::OcpCompileOptions {
+                function_options: optimization::FunctionCompileOptions::from(opt_level),
+                symbolic_functions: optimal_control::OcpSymbolicFunctionOptions::inline_all(),
+            })
+            .expect("compile should succeed");
+        let lowered = compiled.debug_lagrangian_hessian_lowered();
+        let out_path = std::path::PathBuf::from(format!(
+            "target/sailboat_ms{N}_inline_all_lagrangian_hessian_{}.o",
+            opt_level.label().to_ascii_lowercase()
+        ));
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent).expect("target directory should exist");
+        }
+        emit_object_file_lowered(&out_path, lowered, opt_level, &LlvmTarget::Native)
+            .expect("object emission should succeed");
+        println!("wrote {}", out_path.display());
+        println!("instructions: {}", lowered.instructions.len());
+        println!("subfunctions: {}", lowered.subfunctions.len());
+        println!("hessian_nnz: {}", lowered.outputs[0].ccs.nnz());
+        let object_size = std::fs::metadata(&out_path)
+            .expect("object metadata should exist")
+            .len();
+        println!("object_size: {object_size}");
+    }
+
+    macro_rules! define_ms_inline_all_preflight_repro {
+        ($name:ident, $n:expr) => {
+            #[test]
+            #[ignore = "manual crash size sweep"]
+            fn $name() {
+                repro_multiple_shooting_inline_all_hessian_preflight_for::<$n>();
+            }
+        };
+    }
+
+    define_ms_inline_all_preflight_repro!(repro_ms_inline_all_preflight_n3, 3);
+    define_ms_inline_all_preflight_repro!(repro_ms_inline_all_preflight_n5, 5);
+    define_ms_inline_all_preflight_repro!(repro_ms_inline_all_preflight_n8, 8);
+    define_ms_inline_all_preflight_repro!(repro_ms_inline_all_preflight_n10, 10);
+    define_ms_inline_all_preflight_repro!(repro_ms_inline_all_preflight_n12, 12);
+    define_ms_inline_all_preflight_repro!(repro_ms_inline_all_preflight_n15, 15);
+    define_ms_inline_all_preflight_repro!(repro_ms_inline_all_preflight_n20, 20);
+    define_ms_inline_all_preflight_repro!(repro_ms_inline_all_preflight_n24, 24);
+    define_ms_inline_all_preflight_repro!(repro_ms_inline_all_preflight_n26, 26);
+    define_ms_inline_all_preflight_repro!(repro_ms_inline_all_preflight_n27, 27);
+    define_ms_inline_all_preflight_repro!(repro_ms_inline_all_preflight_n28, 28);
+    define_ms_inline_all_preflight_repro!(repro_ms_inline_all_preflight_n29, 29);
+
+    #[test]
+    #[ignore = "manual object dump helper"]
+    fn dump_ms_inline_all_hessian_object_n29() {
+        dump_multiple_shooting_inline_all_hessian_object_for::<29>(LlvmOptimizationLevel::O0);
+    }
+
+    #[test]
+    #[ignore = "manual object dump helper"]
+    fn dump_ms_inline_all_hessian_object_n30() {
+        dump_multiple_shooting_inline_all_hessian_object_for::<DEFAULT_INTERVALS>(
+            LlvmOptimizationLevel::O0,
+        );
+    }
+
+    #[test]
+    #[ignore = "manual object dump helper"]
+    fn dump_ms_inline_all_hessian_object_n30_o2() {
+        dump_multiple_shooting_inline_all_hessian_object_for::<DEFAULT_INTERVALS>(
+            LlvmOptimizationLevel::O2,
+        );
+    }
+
+    #[test]
+    #[ignore = "manual object dump helper"]
+    fn dump_ms_inline_all_hessian_object_n30_os() {
+        dump_multiple_shooting_inline_all_hessian_object_for::<DEFAULT_INTERVALS>(
+            LlvmOptimizationLevel::Os,
+        );
     }
 }

@@ -1,12 +1,12 @@
 use approx::assert_abs_diff_eq;
 use optimization::{
-    CallPolicy, CallPolicyConfig, ClarabelSqpOptions, FunctionCompileOptions, InteriorPointOptions,
-    LlvmOptimizationLevel, SymbolicCompileProgress, SymbolicCompileStage, SymbolicNlpOutputs,
-    TypedRuntimeNlpBounds, flat_view, symbolic_nlp,
+    CallPolicy, CallPolicyConfig, ClarabelSqpOptions, FiniteDifferenceValidationOptions,
+    FunctionCompileOptions, InteriorPointOptions, LlvmOptimizationLevel, SymbolicCompileProgress,
+    SymbolicCompileStage, SymbolicNlpOutputs, TypedRuntimeNlpBounds, flat_view, symbolic_nlp,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptOptions, IpoptRawStatus};
-use sx_core::SX;
+use sx_core::{NamedMatrix, SX, SXFunction, SXMatrix};
 
 #[derive(Clone, optimization::Vectorize)]
 struct Pair<T> {
@@ -23,6 +23,19 @@ struct Point<T> {
 #[derive(Clone, optimization::Vectorize)]
 struct Chain<T, const N: usize> {
     points: [Point<T>; N],
+}
+
+fn named(name: &str, matrix: SXMatrix) -> NamedMatrix {
+    NamedMatrix::new(name, matrix).expect("named matrix should be valid")
+}
+
+#[derive(Clone, optimization::Vectorize)]
+struct TinyMs<T> {
+    x0: T,
+    x1: T,
+    x2: T,
+    u0: T,
+    u1: T,
 }
 
 #[test]
@@ -346,6 +359,210 @@ fn typed_symbolic_compile_exposes_backend_compile_report() {
     assert!(report.setup_profile.hessian_generation.is_some());
     assert!(report.setup_profile.lowering.is_some());
     assert!(report.setup_profile.llvm_jit.is_some());
+}
+
+#[test]
+fn typed_symbolic_compiled_nlp_derivatives_match_finite_difference() {
+    let symbolic =
+        symbolic_nlp::<Pair<SX>, (), SX, SX, _>("fd_validation", |x, _| SymbolicNlpOutputs {
+            objective: x.x.powi(3) + x.x * x.y + 2.0 * x.y.sqr(),
+            equalities: x.x + x.y - 0.5,
+            inequalities: x.x.sqr() - x.y + 0.25,
+        })
+        .expect("symbolic NLP should build");
+    let compiled = symbolic.compile_jit().expect("JIT compile should succeed");
+    let report = compiled
+        .validate_derivatives(
+            &Pair { x: 0.3, y: -0.2 },
+            &(),
+            &0.7,
+            &0.4,
+            FiniteDifferenceValidationOptions {
+                first_order_step: 1.0e-6,
+                second_order_step: 1.0e-4,
+                zero_tolerance: 1.0e-7,
+            },
+        )
+        .expect("finite-difference validation should succeed");
+
+    assert!(
+        report.objective_gradient.max_abs_error <= 1.0e-8,
+        "objective gradient max abs error too large: {:?}",
+        report.objective_gradient
+    );
+    let equality_jacobian = report
+        .equality_jacobian
+        .as_ref()
+        .expect("equality Jacobian report should exist");
+    assert!(
+        equality_jacobian.max_abs_error <= 1.0e-9,
+        "equality Jacobian max abs error too large: {:?}",
+        equality_jacobian
+    );
+    assert_eq!(equality_jacobian.sparsity.missing_from_analytic, 0);
+    assert_eq!(equality_jacobian.sparsity.extra_in_analytic, 0);
+
+    let inequality_jacobian = report
+        .inequality_jacobian
+        .as_ref()
+        .expect("inequality Jacobian report should exist");
+    assert!(
+        inequality_jacobian.max_abs_error <= 1.0e-7,
+        "inequality Jacobian max abs error too large: {:?}",
+        inequality_jacobian
+    );
+    assert_eq!(inequality_jacobian.sparsity.missing_from_analytic, 0);
+    assert_eq!(inequality_jacobian.sparsity.extra_in_analytic, 0);
+
+    assert!(
+        report.lagrangian_hessian.max_abs_error <= 5.0e-7,
+        "lagrangian Hessian max abs error too large: {:?}",
+        report.lagrangian_hessian
+    );
+    assert_eq!(report.lagrangian_hessian.sparsity.missing_from_analytic, 0);
+    assert_eq!(report.lagrangian_hessian.sparsity.extra_in_analytic, 0);
+}
+
+#[test]
+#[ignore = "manual diagnostic for helper-call derivative validation by call policy"]
+fn diagnose_helper_call_derivatives_by_call_policy() {
+    let z = SXMatrix::dense_column(vec![SX::sym("z0"), SX::sym("z1")]).expect("helper input");
+    let helper_outputs = SXMatrix::dense_column(vec![
+        z.nz(0).sin() + z.nz(1).powi(2),
+        z.nz(0) * z.nz(1) + z.nz(1).sin(),
+    ])
+    .expect("helper output");
+    let helper = SXFunction::new(
+        "pair_features",
+        vec![named("z", z)],
+        vec![named("y", helper_outputs)],
+    )
+    .expect("helper function should build");
+
+    let symbolic = symbolic_nlp::<Pair<SX>, (), SX, Pair<SX>, _>("helper_call_fd", |x, _| {
+        let input = SXMatrix::dense_column(vec![x.x, x.y]).expect("call input");
+        let called = helper
+            .call_output(&[input])
+            .expect("helper call output should build");
+        SymbolicNlpOutputs {
+            objective: x.x.sqr() + 2.0 * x.y.sqr(),
+            equalities: called.nz(0) + x.x,
+            inequalities: Pair {
+                x: called.nz(0) - 0.1,
+                y: called.nz(1) + x.x * x.y,
+            },
+        }
+    })
+    .expect("symbolic NLP should build");
+
+    for (label, policy) in [
+        ("inline_at_call", CallPolicy::InlineAtCall),
+        ("inline_at_lowering", CallPolicy::InlineAtLowering),
+        ("inline_in_llvm", CallPolicy::InlineInLLVM),
+        ("noinline_llvm", CallPolicy::NoInlineLLVM),
+    ] {
+        let compiled = symbolic
+            .compile_jit_with_options(FunctionCompileOptions {
+                opt_level: LlvmOptimizationLevel::O0,
+                call_policy: CallPolicyConfig {
+                    default_policy: policy,
+                    respect_function_overrides: true,
+                },
+            })
+            .expect("JIT compile should succeed");
+        let report = compiled
+            .validate_derivatives(
+                &Pair { x: 0.3, y: -0.2 },
+                &(),
+                &0.7,
+                &Pair { x: 0.4, y: -0.6 },
+                FiniteDifferenceValidationOptions {
+                    first_order_step: 1.0e-6,
+                    second_order_step: 1.0e-4,
+                    zero_tolerance: 1.0e-7,
+                },
+            )
+            .expect("finite-difference validation should succeed");
+
+        println!(
+            "{label}: eq={:?}\n  ineq={:?}\n  hess={:?}",
+            report.equality_jacobian, report.inequality_jacobian, report.lagrangian_hessian
+        );
+    }
+}
+
+#[test]
+#[ignore = "manual diagnostic for repeated helper-call derivative validation by call policy"]
+fn diagnose_repeated_helper_call_derivatives_by_call_policy() {
+    let z = SXMatrix::dense_column(vec![SX::sym("x"), SX::sym("u")]).expect("helper input");
+    let step_outputs = SXMatrix::dense_column(vec![
+        z.nz(0) + 0.3 * (z.nz(0).sin() + z.nz(1)),
+        z.nz(0) * z.nz(1) + z.nz(1).sin(),
+    ])
+    .expect("helper output");
+    let step = SXFunction::new(
+        "ms_step",
+        vec![named("z", z)],
+        vec![named("y", step_outputs)],
+    )
+    .expect("helper function should build");
+
+    let symbolic = symbolic_nlp::<TinyMs<SX>, (), [SX; 2], [SX; 2], _>("mini_ms_helper_call", |v, _| {
+        let step0 = step
+            .call_output(&[SXMatrix::dense_column(vec![v.x0, v.u0]).expect("step0 input")])
+            .expect("step0 output should build");
+        let step1 = step
+            .call_output(&[SXMatrix::dense_column(vec![v.x1, v.u1]).expect("step1 input")])
+            .expect("step1 output should build");
+
+        SymbolicNlpOutputs {
+            objective: v.u0.sqr() + 0.5 * v.u1.sqr(),
+            equalities: [step0.nz(0) - v.x1, step1.nz(0) - v.x2],
+            inequalities: [step0.nz(1) - 0.1, step1.nz(1) - 0.2],
+        }
+    })
+    .expect("symbolic NLP should build");
+
+    for (label, policy) in [
+        ("inline_at_call", CallPolicy::InlineAtCall),
+        ("inline_at_lowering", CallPolicy::InlineAtLowering),
+        ("inline_in_llvm", CallPolicy::InlineInLLVM),
+        ("noinline_llvm", CallPolicy::NoInlineLLVM),
+    ] {
+        let compiled = symbolic
+            .compile_jit_with_options(FunctionCompileOptions {
+                opt_level: LlvmOptimizationLevel::O0,
+                call_policy: CallPolicyConfig {
+                    default_policy: policy,
+                    respect_function_overrides: true,
+                },
+            })
+            .expect("JIT compile should succeed");
+        let report = compiled
+            .validate_derivatives(
+                &TinyMs {
+                    x0: 0.3,
+                    x1: -0.2,
+                    x2: 0.1,
+                    u0: 0.4,
+                    u1: -0.6,
+                },
+                &(),
+                &[0.7, -0.3],
+                &[0.4, -0.5],
+                FiniteDifferenceValidationOptions {
+                    first_order_step: 1.0e-6,
+                    second_order_step: 1.0e-4,
+                    zero_tolerance: 1.0e-7,
+                },
+            )
+            .expect("finite-difference validation should succeed");
+
+        println!(
+            "{label}: eq={:?}\n  ineq={:?}\n  hess={:?}",
+            report.equality_jacobian, report.inequality_jacobian, report.lagrangian_hessian
+        );
+    }
 }
 
 #[cfg(feature = "ipopt")]

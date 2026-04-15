@@ -93,7 +93,7 @@ fn main() -> Result<()> {
 struct OcpBenchCli {
     #[arg(long, default_value = "target/ocp_bench_report.html")]
     output: PathBuf,
-    #[arg(long = "eval-iterations", default_value_t = default_eval_iterations(), value_parser = parse_positive_usize)]
+    #[arg(long = "eval-iterations", default_value_t = default_eval_iterations())]
     eval_iterations: usize,
     #[arg(long = "warmup-iterations", default_value_t = default_warmup_iterations())]
     warmup_iterations: usize,
@@ -1054,10 +1054,7 @@ fn render_dashboard(frame: &mut Frame, state: &ProgressState, spinner: &str) {
 
     let sections = Layout::default()
         .direction(ratatui::layout::Direction::Vertical)
-        .constraints([
-            Constraint::Length(11),
-            Constraint::Min(4),
-        ])
+        .constraints([Constraint::Length(11), Constraint::Min(4)])
         .split(area);
 
     render_overview(frame, sections[0], state, spinner);
@@ -1792,26 +1789,20 @@ fn render_matrix_bands(frame: &mut Frame, area: Rect, state: &ProgressState) {
 
     let columns = Layout::default()
         .direction(ratatui::layout::Direction::Horizontal)
-        .constraints([
-            Constraint::Length(desired_left_width),
-            Constraint::Min(30),
-        ])
+        .constraints([Constraint::Length(desired_left_width), Constraint::Min(30)])
         .split(inner);
 
     let min_top_height = 12u16;
-    let jit_desired_height = timing_section_desired_height(
-        MatrixSection::Jit,
-        state.presets.len(),
-        Borders::ALL,
-    );
-    let max_jit_height = columns[0]
-        .height
-        .saturating_sub(min_top_height)
-        .max(8);
+    let jit_desired_height =
+        timing_section_desired_height(MatrixSection::Jit, state.presets.len(), Borders::ALL);
+    let max_jit_height = columns[0].height.saturating_sub(min_top_height).max(8);
     let jit_height = jit_desired_height.min(max_jit_height);
     let rows = Layout::default()
         .direction(ratatui::layout::Direction::Vertical)
-        .constraints([Constraint::Min(min_top_height), Constraint::Length(jit_height)])
+        .constraints([
+            Constraint::Min(min_top_height),
+            Constraint::Length(jit_height),
+        ])
         .split(columns[0]);
     let top_panels = Layout::default()
         .direction(ratatui::layout::Direction::Horizontal)
@@ -1851,10 +1842,7 @@ fn render_matrix_bands(frame: &mut Frame, area: Rect, state: &ProgressState) {
 
     let sidebar = Layout::default()
         .direction(ratatui::layout::Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(52),
-            Constraint::Percentage(48),
-        ])
+        .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
         .split(columns[1]);
     render_nnz_summary_widget(frame, sidebar[0], state);
     render_best_summary_widget(frame, sidebar[1], state);
@@ -1891,8 +1879,7 @@ fn render_timing_section_panel(
     let data_column_count = case_count * columns_per_case;
     let case_group_width =
         cell_width as usize + size_metric_count * (count_cell_width as usize + column_spacing);
-    let data_width = case_count * case_group_width
-        + case_count.saturating_sub(1) * column_spacing;
+    let data_width = case_count * case_group_width + case_count.saturating_sub(1) * column_spacing;
     let label_available = inner
         .width
         .saturating_sub((data_width + column_spacing) as u16) as usize;
@@ -2140,8 +2127,7 @@ fn render_best_summary_widget(frame: &mut Frame, area: Rect, state: &ProgressSta
     )
     .column_spacing(column_spacing)
     .header(
-        Row::new(best_case_summary_header(case_width, metric_width))
-        .style(
+        Row::new(best_case_summary_header(case_width, metric_width)).style(
             Style::default()
                 .fg(Color::Gray)
                 .add_modifier(Modifier::BOLD),
@@ -2691,10 +2677,8 @@ fn timing_section_fits_width(
         0
     };
     let column_spacing = 1usize;
-    let case_group_width =
-        cell_width + size_metric_count * (count_cell_width + column_spacing);
-    let data_width =
-        case_count * case_group_width + case_count.saturating_sub(1) * column_spacing;
+    let case_group_width = cell_width + size_metric_count * (count_cell_width + column_spacing);
+    let data_width = case_count * case_group_width + case_count.saturating_sub(1) * column_spacing;
     let Some(label_available) = inner_width.checked_sub(data_width + column_spacing) else {
         return false;
     };
@@ -2716,8 +2700,8 @@ fn timing_section_desired_height(
     borders: Borders,
 ) -> u16 {
     let inner_rows = 1 + 1 + section_matrix_rows(section).len() * (1 + preset_count);
-    let chrome_rows = (borders.contains(Borders::TOP) as usize)
-        + (borders.contains(Borders::BOTTOM) as usize);
+    let chrome_rows =
+        (borders.contains(Borders::TOP) as usize) + (borders.contains(Borders::BOTTOM) as usize);
     (inner_rows + chrome_rows).min(u16::MAX as usize) as u16
 }
 
@@ -2970,7 +2954,9 @@ fn size_ratio_metric_value(
     cell: &CaseCell,
 ) -> Option<usize> {
     match (section, stage, metric) {
-        (MatrixSection::Symbolic, _, DisplayedSizeMetric::Total) => cell.llvm_total_instruction_count,
+        (MatrixSection::Symbolic, _, DisplayedSizeMetric::Total) => {
+            cell.llvm_total_instruction_count
+        }
         (MatrixSection::Symbolic, _, DisplayedSizeMetric::Root) => None,
         (MatrixSection::Jit, MatrixStage::NlpJit, DisplayedSizeMetric::Root) => {
             cell.llvm_root_instruction_count
@@ -3027,14 +3013,8 @@ fn size_ratio_metric_style(
     transcription: TranscriptionMethod,
     value: usize,
 ) -> Style {
-    let values = size_metric_distinct_values(
-        section,
-        stage,
-        metric,
-        state,
-        problem_id,
-        transcription,
-    );
+    let values =
+        size_metric_distinct_values(section, stage, metric, state, problem_id, transcription);
     let Some(min_value) = values.first().copied() else {
         return Style::default().fg(Color::DarkGray);
     };
@@ -3676,11 +3656,13 @@ fn update_case_finished(state: &mut ProgressState, record: &OcpBenchmarkRecord) 
         cell.xdot_helper_compile_s = record.helper_compile.xdot_helper_s;
         cell.multiple_shooting_arc_helper_compile_s =
             record.helper_compile.multiple_shooting_arc_helper_s;
-        cell.xdot_helper_root_instruction_count = record.helper_compile.xdot_helper_root_instructions;
+        cell.xdot_helper_root_instruction_count =
+            record.helper_compile.xdot_helper_root_instructions;
         cell.xdot_helper_total_instruction_count =
             record.helper_compile.xdot_helper_total_instructions;
-        cell.multiple_shooting_arc_helper_root_instruction_count =
-            record.helper_compile.multiple_shooting_arc_helper_root_instructions;
+        cell.multiple_shooting_arc_helper_root_instruction_count = record
+            .helper_compile
+            .multiple_shooting_arc_helper_root_instructions;
         cell.multiple_shooting_arc_helper_total_instruction_count = record
             .helper_compile
             .multiple_shooting_arc_helper_total_instructions;

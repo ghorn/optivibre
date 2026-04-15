@@ -1539,7 +1539,11 @@ fn simplify_div_shallow(arena: &mut NodeArena, lhs: SX, rhs: SX) -> Option<SX> {
                 return Some(append_binary_in_arena(arena, BinaryOp::Div, one, div_rhs));
             }
         }
-        NodeKind::Constant(_) | NodeKind::Symbol { .. } | NodeKind::Unary { .. } | NodeKind::Binary { .. } | NodeKind::Call { .. } => {}
+        NodeKind::Constant(_)
+        | NodeKind::Symbol { .. }
+        | NodeKind::Unary { .. }
+        | NodeKind::Binary { .. }
+        | NodeKind::Call { .. } => {}
     }
 
     if let Some(lhs_value) = constant_value_with_arena(arena, lhs)

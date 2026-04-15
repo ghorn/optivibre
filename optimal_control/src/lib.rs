@@ -2,14 +2,16 @@ use anyhow::Result as AnyResult;
 use optimization::{
     BackendCompileReport, BackendTimingMetadata, CallPolicy, ClarabelSqpError, ClarabelSqpOptions,
     ClarabelSqpSummary, ConstraintBoundSide, ConstraintSatisfaction, FunctionCompileOptions,
-    InteriorPointIterationSnapshot, InteriorPointOptions, InteriorPointSolveError,
-    InteriorPointSummary, LlvmOptimizationLevel, NlpCompileStats, NlpEvaluationBenchmark,
-    NlpEvaluationBenchmarkOptions, NlpEvaluationKernelKind, ScalarLeaf, SqpIterationSnapshot,
-    SymbolicCompileMetadata, SymbolicCompileProgress, SymbolicCompileStageProgress,
-    SymbolicNlpBuildError, SymbolicNlpCompileError, SymbolicNlpOutputs, TypedCompiledJitNlp,
-    TypedRuntimeNlpBounds, Vectorize, VectorizeLayoutError, classify_constraint_satisfaction,
-    constraint_bound_side, flatten_value, symbolic_column, symbolic_nlp, symbolic_value,
-    unflatten_value, worst_bound_violation,
+    FiniteDifferenceValidationOptions, InteriorPointIterationSnapshot, InteriorPointOptions,
+    InteriorPointSolveError, InteriorPointSummary, LlvmOptimizationLevel,
+    NlpCompileStats, NlpDerivativeValidationReport, NlpEvaluationBenchmark,
+    NlpEvaluationBenchmarkOptions, NlpEvaluationKernelKind, ScalarLeaf,
+    SqpIterationSnapshot, SymbolicCompileMetadata, SymbolicCompileProgress,
+    SymbolicCompileStageProgress, SymbolicNlpBuildError, SymbolicNlpCompileError,
+    SymbolicNlpOutputs, TypedCompiledJitNlp, TypedRuntimeNlpBounds, Vectorize,
+    VectorizeLayoutError, classify_constraint_satisfaction, constraint_bound_side,
+    flatten_value, symbolic_column, symbolic_nlp, symbolic_value, unflatten_value,
+    worst_bound_violation,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptIterationSnapshot, IpoptOptions, IpoptSolveError, IpoptSummary};
@@ -1736,7 +1738,10 @@ where
             .setup_profile
             .lowering
             .unwrap_or_default()
-            + nlp_compile_report.setup_profile.llvm_jit.unwrap_or_default();
+            + nlp_compile_report
+                .setup_profile
+                .llvm_jit
+                .unwrap_or_default();
         on_progress(OcpCompileProgress::NlpKernelCompiled {
             elapsed: nlp_jit_elapsed,
             root_instructions: nlp_compile_report.stats.llvm_root_instructions_emitted,
@@ -1749,8 +1754,11 @@ where
             options.function_options,
         )?;
         let xdot_helper_time = xdot_started.elapsed();
-        let xdot_helper_root_instructions =
-            xdot_helper.function.compile_report().stats.llvm_root_instructions_emitted;
+        let xdot_helper_root_instructions = xdot_helper
+            .function
+            .compile_report()
+            .stats
+            .llvm_root_instructions_emitted;
         let xdot_helper_total_instructions = xdot_helper
             .function
             .compile_report()
@@ -2372,7 +2380,10 @@ where
             .setup_profile
             .lowering
             .unwrap_or_default()
-            + nlp_compile_report.setup_profile.llvm_jit.unwrap_or_default();
+            + nlp_compile_report
+                .setup_profile
+                .llvm_jit
+                .unwrap_or_default();
         on_progress(OcpCompileProgress::NlpKernelCompiled {
             elapsed: nlp_jit_elapsed,
             root_instructions: nlp_compile_report.stats.llvm_root_instructions_emitted,
@@ -2385,8 +2396,11 @@ where
             options.function_options,
         )?;
         let xdot_helper_time = xdot_started.elapsed();
-        let xdot_helper_root_instructions =
-            xdot_helper.function.compile_report().stats.llvm_root_instructions_emitted;
+        let xdot_helper_root_instructions = xdot_helper
+            .function
+            .compile_report()
+            .stats
+            .llvm_root_instructions_emitted;
         let xdot_helper_total_instructions = xdot_helper
             .function
             .compile_report()
@@ -2756,6 +2770,35 @@ where
             &bounds,
             options,
             on_progress,
+        )?)
+    }
+
+    pub fn validate_nlp_derivatives(
+        &self,
+        values: &MultipleShootingRuntimeValues<
+            Numeric<P>,
+            BoundTemplate<C>,
+            Numeric<Beq>,
+            BoundTemplate<Bineq>,
+            Numeric<X>,
+            Numeric<U>,
+            N,
+        >,
+        equality_multipliers: &[f64],
+        inequality_multipliers: &[f64],
+        options: FiniteDifferenceValidationOptions,
+    ) -> AnyResult<NlpDerivativeValidationReport> {
+        let x0 = self.build_initial_guess(values)?;
+        let runtime_params: OcpParametersNum<P, Beq> =
+            (values.parameters.clone(), values.beq.clone());
+        let x_values = flatten_value(&x0);
+        let param_values = flatten_value(&runtime_params);
+        Ok(self.compiled.validate_derivatives_flat_values(
+            &x_values,
+            &param_values,
+            equality_multipliers,
+            inequality_multipliers,
+            options,
         )?)
     }
 
@@ -3414,6 +3457,36 @@ where
             &bounds,
             options,
             on_progress,
+        )?)
+    }
+
+    pub fn validate_nlp_derivatives(
+        &self,
+        values: &DirectCollocationRuntimeValues<
+            Numeric<P>,
+            BoundTemplate<C>,
+            Numeric<Beq>,
+            BoundTemplate<Bineq>,
+            Numeric<X>,
+            Numeric<U>,
+            N,
+            K,
+        >,
+        equality_multipliers: &[f64],
+        inequality_multipliers: &[f64],
+        options: FiniteDifferenceValidationOptions,
+    ) -> AnyResult<NlpDerivativeValidationReport> {
+        let x0 = self.build_initial_guess(values)?;
+        let runtime_params: OcpParametersNum<P, Beq> =
+            (values.parameters.clone(), values.beq.clone());
+        let x_values = flatten_value(&x0);
+        let param_values = flatten_value(&runtime_params);
+        Ok(self.compiled.validate_derivatives_flat_values(
+            &x_values,
+            &param_values,
+            equality_multipliers,
+            inequality_multipliers,
+            options,
         )?)
     }
 

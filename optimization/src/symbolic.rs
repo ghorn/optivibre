@@ -12,16 +12,18 @@ use thiserror::Error;
 
 use crate::{
     BackendCompileReport, BackendTimingMetadata, CCS, ClarabelSqpError, ClarabelSqpOptions,
-    ClarabelSqpSummary, CompiledNlpProblem, Index, InteriorPointIterationSnapshot,
-    InteriorPointOptions, InteriorPointSolveError, InteriorPointSummary, NlpCompileStats,
-    NlpConstraintViolationReport, NlpEqualityViolation, NlpEvaluationBenchmark,
+    ClarabelSqpSummary, CompiledNlpProblem, FiniteDifferenceValidationOptions, Index,
+    InteriorPointIterationSnapshot, InteriorPointOptions, InteriorPointSolveError,
+    InteriorPointSummary, NlpCompileStats, NlpConstraintViolationReport,
+    NlpDerivativeValidationReport, NlpEqualityViolation, NlpEvaluationBenchmark,
     NlpEvaluationBenchmarkOptions, NlpEvaluationKernelKind, NlpInequalitySource,
     NlpInequalityViolation, ParameterMatrix, SqpAdapterTiming, SymbolicCompileMetadata,
     SymbolicCompileProgress, SymbolicCompileStage, SymbolicCompileStageProgress,
     SymbolicSetupProfile, Vectorize, benchmark_compiled_nlp_problem_with_progress,
     classify_constraint_satisfaction, constraint_bound_side, flatten_value,
     solve_nlp_interior_point, solve_nlp_interior_point_with_callback, solve_nlp_sqp,
-    solve_nlp_sqp_with_callback, symbolic_column, symbolic_value, worst_bound_violation,
+    solve_nlp_sqp_with_callback, symbolic_column, symbolic_value,
+    validate_compiled_nlp_problem_derivatives, worst_bound_violation,
 };
 #[cfg(feature = "ipopt")]
 use crate::{
@@ -921,6 +923,80 @@ where
             options,
             on_progress,
         ))
+    }
+
+    pub fn validate_derivatives(
+        &self,
+        x: &<X as Vectorize<SX>>::Rebind<f64>,
+        parameters: &<P as Vectorize<SX>>::Rebind<f64>,
+        equality_multipliers: &<E as Vectorize<SX>>::Rebind<f64>,
+        inequality_multipliers: &<I as Vectorize<SX>>::Rebind<f64>,
+        options: FiniteDifferenceValidationOptions,
+    ) -> AnyResult<NlpDerivativeValidationReport> {
+        let x_values = flatten_value(x);
+        let parameter_values = flatten_value(parameters);
+        let parameter_storage = if P::LEN == 0 {
+            Vec::new()
+        } else {
+            vec![ParameterMatrix {
+                ccs: self.inner.parameter_ccs(0),
+                values: &parameter_values,
+            }]
+        };
+        let equality_multiplier_values = flatten_value(equality_multipliers);
+        let inequality_multiplier_values = flatten_value(inequality_multipliers);
+        validate_compiled_nlp_problem_derivatives(
+            &self.inner,
+            &x_values,
+            &parameter_storage,
+            &equality_multiplier_values,
+            &inequality_multiplier_values,
+            options,
+        )
+    }
+
+    pub fn validate_derivatives_flat(
+        &self,
+        x: &[f64],
+        parameters: &[ParameterMatrix<'_>],
+        equality_multipliers: &[f64],
+        inequality_multipliers: &[f64],
+        options: FiniteDifferenceValidationOptions,
+    ) -> AnyResult<NlpDerivativeValidationReport> {
+        validate_compiled_nlp_problem_derivatives(
+            &self.inner,
+            x,
+            parameters,
+            equality_multipliers,
+            inequality_multipliers,
+            options,
+        )
+    }
+
+    pub fn validate_derivatives_flat_values(
+        &self,
+        x: &[f64],
+        parameter_values: &[f64],
+        equality_multipliers: &[f64],
+        inequality_multipliers: &[f64],
+        options: FiniteDifferenceValidationOptions,
+    ) -> AnyResult<NlpDerivativeValidationReport> {
+        let parameter_storage = if P::LEN == 0 {
+            Vec::new()
+        } else {
+            vec![ParameterMatrix {
+                ccs: self.inner.parameter_ccs(0),
+                values: parameter_values,
+            }]
+        };
+        validate_compiled_nlp_problem_derivatives(
+            &self.inner,
+            x,
+            &parameter_storage,
+            equality_multipliers,
+            inequality_multipliers,
+            options,
+        )
     }
 
     pub fn solve_sqp(
