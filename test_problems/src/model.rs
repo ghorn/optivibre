@@ -195,6 +195,31 @@ impl ValidationOutcome {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct FilterReplayPoint {
+    pub violation: f64,
+    pub objective: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct FilterReplayFrame {
+    pub iteration: usize,
+    pub phase: String,
+    pub current: FilterReplayPoint,
+    #[serde(default)]
+    pub frontier: Vec<FilterReplayPoint>,
+    #[serde(default)]
+    pub rejected_trials: Vec<FilterReplayPoint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accepted_mode: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct FilterReplay {
+    #[serde(default)]
+    pub frames: Vec<FilterReplayFrame>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct SetupProfileBreakdown {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -261,6 +286,8 @@ pub struct ProblemRunRecord {
     pub console_output: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub console_output_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter_replay: Option<FilterReplay>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

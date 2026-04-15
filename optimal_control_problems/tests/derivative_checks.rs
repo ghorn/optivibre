@@ -170,17 +170,19 @@ fn all_ocp_problems_first_order_derivatives_stay_clean() {
                 TranscriptionMethod::MultipleShooting,
                 TranscriptionMethod::DirectCollocation,
             ] {
-                let check =
-                    match validate_problem_derivatives(spec.id, &request_for(transcription, None)) {
-                        Ok(check) => check,
-                        Err(err) => {
-                            failures.push(format!(
-                                "{} {:?}: derivative check failed to run: {err:#}",
-                                spec.name, transcription
-                            ));
-                            continue;
-                        }
-                    };
+                let check = match validate_problem_derivatives(
+                    spec.id,
+                    &request_for(transcription, None),
+                ) {
+                    Ok(check) => check,
+                    Err(err) => {
+                        failures.push(format!(
+                            "{} {:?}: derivative check failed to run: {err:#}",
+                            spec.name, transcription
+                        ));
+                        continue;
+                    }
+                };
                 println!("{}", format_check(&check));
                 if !check.first_order_is_within_tolerances(FIRST_ORDER_TOLERANCES) {
                     failures.push(format_check(&check));

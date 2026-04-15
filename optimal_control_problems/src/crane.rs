@@ -1175,10 +1175,7 @@ mod tests {
         names
     }
 
-    fn named_hessian_entry(
-        names: &[String],
-        entry: &optimization::ValidationWorstEntry,
-    ) -> String {
+    fn named_hessian_entry(names: &[String], entry: &optimization::ValidationWorstEntry) -> String {
         let row_name = names
             .get(entry.row)
             .map_or("<row-oob>", std::string::String::as_str);
@@ -1277,9 +1274,8 @@ mod tests {
                 .map(|entry| named_hessian_entry(&names, entry))
                 .unwrap_or_else(|| "worst_extra=none".to_string());
             assert!(
-                summary.is_within_tolerances(optimization::ValidationTolerances::new(
-                    1.0e-4, 1.0e-3
-                )),
+                summary
+                    .is_within_tolerances(optimization::ValidationTolerances::new(1.0e-4, 1.0e-3)),
                 "{label} expected clean crane direct-collocation Hessian\nworst: {worst}\nworst_missing: {worst_missing}\nworst_extra: {worst_extra}\nsummary: {summary:?}"
             );
         }

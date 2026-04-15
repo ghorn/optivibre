@@ -15,7 +15,7 @@ pub struct SXMatrix {
     nonzeros: Vec<SX>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum HessianStrategy {
     #[default]
     LowerTriangleByColumn,

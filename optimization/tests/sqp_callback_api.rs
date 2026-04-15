@@ -35,6 +35,21 @@ fn empty_ccs_1d() -> &'static CCS {
     EMPTY.get_or_init(|| CCS::empty(0, 1))
 }
 
+fn empty_ccs_2d() -> &'static CCS {
+    static EMPTY: OnceLock<CCS> = OnceLock::new();
+    EMPTY.get_or_init(|| CCS::empty(0, 2))
+}
+
+fn single_row_two_column_ccs() -> &'static CCS {
+    static CCS_1X2: OnceLock<CCS> = OnceLock::new();
+    CCS_1X2.get_or_init(|| CCS::new(1, 2, vec![0, 1, 2], vec![0, 0]))
+}
+
+fn dense_lower_triangular_ccs_2d() -> &'static CCS {
+    static HESSIAN_CCS: OnceLock<CCS> = OnceLock::new();
+    HESSIAN_CCS.get_or_init(|| CCS::lower_triangular_dense(2))
+}
+
 fn unconstrained_rosenbrock_problem() -> optimization::TypedCompiledJitNlp<Pair<SX>, (), (), ()> {
     let symbolic = symbolic_nlp::<Pair<SX>, (), (), (), _>("telemetry_rosenbrock", |x, _| {
         SymbolicNlpOutputs {
@@ -199,6 +214,84 @@ impl CompiledNlpProblem for EqualityQuadraticProblem {
         out: &mut [f64],
     ) {
         out[0] = 2.0;
+    }
+}
+
+struct MaratosInequalityProblem;
+
+impl CompiledNlpProblem for MaratosInequalityProblem {
+    fn dimension(&self) -> usize {
+        2
+    }
+
+    fn parameter_count(&self) -> usize {
+        0
+    }
+
+    fn parameter_ccs(&self, _parameter_index: usize) -> &CCS {
+        unreachable!("Maratos inequality problem has no parameters")
+    }
+
+    fn equality_count(&self) -> usize {
+        0
+    }
+
+    fn inequality_count(&self) -> usize {
+        1
+    }
+
+    fn objective_value(&self, x: &[f64], _parameters: &[ParameterMatrix<'_>]) -> f64 {
+        x[1]
+    }
+
+    fn objective_gradient(&self, _x: &[f64], _parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
+        out.copy_from_slice(&[0.0, 1.0]);
+    }
+
+    fn equality_jacobian_ccs(&self) -> &CCS {
+        empty_ccs_2d()
+    }
+
+    fn equality_values(&self, _x: &[f64], _parameters: &[ParameterMatrix<'_>], _out: &mut [f64]) {}
+
+    fn equality_jacobian_values(
+        &self,
+        _x: &[f64],
+        _parameters: &[ParameterMatrix<'_>],
+        _out: &mut [f64],
+    ) {
+    }
+
+    fn inequality_jacobian_ccs(&self) -> &CCS {
+        single_row_two_column_ccs()
+    }
+
+    fn inequality_values(&self, x: &[f64], _parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
+        out[0] = x[0] * x[0] - x[1];
+    }
+
+    fn inequality_jacobian_values(
+        &self,
+        x: &[f64],
+        _parameters: &[ParameterMatrix<'_>],
+        out: &mut [f64],
+    ) {
+        out.copy_from_slice(&[2.0 * x[0], -1.0]);
+    }
+
+    fn lagrangian_hessian_ccs(&self) -> &CCS {
+        dense_lower_triangular_ccs_2d()
+    }
+
+    fn lagrangian_hessian_values(
+        &self,
+        _x: &[f64],
+        _parameters: &[ParameterMatrix<'_>],
+        _equality_multipliers: &[f64],
+        _inequality_multipliers: &[f64],
+        out: &mut [f64],
+    ) {
+        out.copy_from_slice(&[1.0, 0.0, 1.0]);
     }
 }
 
@@ -671,13 +764,72 @@ fn sqp_callback_rosenbrock_reports_line_search_telemetry() {
             assert!(line_search.armijo_satisfied);
             assert_eq!(
                 line_search.rejected_trials.len(),
-                line_search.backtrack_count
+                line_search.backtrack_count + usize::from(line_search.second_order_correction_used)
             );
             for trial in &line_search.rejected_trials {
                 assert!(!trial.armijo_satisfied || trial.wolfe_satisfied == Some(false));
             }
         }
     }
+}
+
+fn first_accepted_step_snapshot(
+    mut options: ClarabelSqpOptions,
+) -> optimization::SqpIterationSnapshot {
+    options.verbose = false;
+    options.max_iters = 1;
+    options.filter_method = false;
+    let mut snapshots = Vec::new();
+    let error = solve_nlp_sqp_with_callback(
+        &MaratosInequalityProblem,
+        &[1.0, 1.0],
+        &[],
+        &options,
+        |snapshot| snapshots.push(snapshot.clone()),
+    )
+    .expect_err("single-step SOC probe should terminate at the max-iteration guard");
+    assert!(matches!(error, ClarabelSqpError::MaxIterations { .. }));
+    snapshots
+        .into_iter()
+        .find(|snapshot| snapshot.phase == SqpIterationPhase::AcceptedStep)
+        .expect("probe should produce one accepted-step snapshot")
+}
+
+#[test]
+fn sqp_callback_uses_second_order_correction_before_backtracking() {
+    let without_soc = first_accepted_step_snapshot(ClarabelSqpOptions {
+        second_order_correction: false,
+        ..quiet_options()
+    });
+    let with_soc = first_accepted_step_snapshot(quiet_options());
+
+    let without_soc_line_search = without_soc
+        .line_search
+        .as_ref()
+        .expect("accepted step should include line search telemetry");
+    let with_soc_line_search = with_soc
+        .line_search
+        .as_ref()
+        .expect("accepted step should include line search telemetry");
+
+    assert!(without_soc_line_search.accepted_alpha < 1.0);
+    assert!(without_soc_line_search.backtrack_count > 0);
+    assert!(!without_soc_line_search.second_order_correction_used);
+    assert!(
+        !without_soc
+            .events
+            .contains(&SqpIterationEvent::SecondOrderCorrectionUsed)
+    );
+
+    assert_abs_diff_eq!(with_soc_line_search.accepted_alpha, 1.0, epsilon = 1e-15);
+    assert_eq!(with_soc_line_search.backtrack_count, 0);
+    assert!(with_soc_line_search.second_order_correction_used);
+    assert_eq!(with_soc_line_search.rejected_trials.len(), 1);
+    assert!(
+        with_soc
+            .events
+            .contains(&SqpIterationEvent::SecondOrderCorrectionUsed)
+    );
 }
 
 #[test]
@@ -701,6 +853,7 @@ fn sqp_callback_exposes_wolfe_status_when_enabled() {
         .expect("final state should include the accepted line search");
     assert_eq!(line_search.wolfe_satisfied, Some(true));
     assert!(line_search.armijo_satisfied);
+    assert!(!line_search.second_order_correction_used);
     assert!(line_search.violation_satisfied);
     assert!(line_search.rejected_trials.is_empty());
     assert!(snapshots.iter().all(|snapshot| {
@@ -709,6 +862,59 @@ fn sqp_callback_exposes_wolfe_status_when_enabled() {
             .as_ref()
             .is_none_or(|line_search| line_search.wolfe_satisfied.is_some())
     }));
+}
+
+#[test]
+fn sqp_filter_accepts_feasibility_improving_step_and_surfaces_frontier() {
+    let problem = EqualityQuadraticProblem;
+    let mut snapshots = Vec::new();
+    let summary =
+        solve_nlp_sqp_with_callback(&problem, &[0.0], &[], &quiet_options(), |snapshot| {
+            snapshots.push(snapshot.clone());
+        })
+        .expect("solve should succeed");
+
+    let accepted = snapshots
+        .iter()
+        .find(|snapshot| snapshot.phase == SqpIterationPhase::AcceptedStep)
+        .expect("accepted snapshot should exist");
+    let line_search = accepted
+        .line_search
+        .as_ref()
+        .expect("accepted step should include line search telemetry");
+    assert_eq!(
+        line_search.filter_acceptance_mode,
+        Some(optimization::SqpFilterAcceptanceMode::ViolationReduction)
+    );
+    assert_eq!(line_search.filter_acceptable, Some(true));
+    assert_eq!(line_search.filter_dominated, Some(false));
+    assert_eq!(
+        line_search.filter_sufficient_objective_reduction,
+        Some(false)
+    );
+    assert_eq!(
+        line_search.filter_sufficient_violation_reduction,
+        Some(true)
+    );
+    assert!(accepted.events.contains(&SqpIterationEvent::FilterAccepted));
+
+    let filter = summary
+        .last_accepted_state
+        .as_ref()
+        .expect("last accepted state should exist")
+        .filter
+        .as_ref()
+        .expect("accepted snapshot should carry filter state");
+    assert_eq!(
+        filter.accepted_mode,
+        Some(optimization::SqpFilterAcceptanceMode::ViolationReduction)
+    );
+    assert!(
+        filter
+            .entries
+            .iter()
+            .any(|entry| entry.violation <= 1e-12 && (entry.objective - 4.0).abs() <= 1e-12)
+    );
 }
 
 #[test]
@@ -776,6 +982,7 @@ fn sqp_marks_armijo_tolerance_adjusted_acceptance() {
         dual_tol: 1e-9,
         constraint_tol: 1e-9,
         complementarity_tol: 1e-9,
+        filter_method: false,
         verbose: false,
         ..ClarabelSqpOptions::default()
     };

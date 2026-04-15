@@ -157,6 +157,7 @@ fn interior_point_handwritten_problem_leaves_adapter_timing_unavailable() {
         &[0.0, 0.0],
         &[],
         &InteriorPointOptions {
+            filter_method: true,
             verbose: false,
             ..InteriorPointOptions::default()
         },
@@ -170,6 +171,46 @@ fn interior_point_handwritten_problem_leaves_adapter_timing_unavailable() {
             .iter()
             .all(|snapshot| snapshot.timing.adapter_timing.is_none())
     );
+}
+
+#[test]
+fn interior_point_filter_frontier_is_exposed_in_snapshots() {
+    let mut snapshots = Vec::new();
+    solve_nlp_interior_point_with_callback(
+        &BoundConstrainedQuadraticProblem,
+        &[0.0, 0.0],
+        &[],
+        &InteriorPointOptions {
+            filter_method: true,
+            verbose: false,
+            ..InteriorPointOptions::default()
+        },
+        |snapshot| snapshots.push(snapshot.clone()),
+    )
+    .expect("interior-point solve should succeed");
+
+    let accepted_snapshots = snapshots
+        .iter()
+        .filter(|snapshot| {
+            matches!(
+                snapshot.phase,
+                optimization::InteriorPointIterationPhase::AcceptedStep
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(!accepted_snapshots.is_empty());
+    assert!(accepted_snapshots.iter().all(|snapshot| {
+        snapshot
+            .filter
+            .as_ref()
+            .is_some_and(|filter| !filter.entries.is_empty())
+    }));
+    assert!(accepted_snapshots.iter().any(|snapshot| {
+        snapshot
+            .filter
+            .as_ref()
+            .is_some_and(|filter| filter.accepted_mode.is_some())
+    }));
 }
 
 #[cfg(feature = "serde")]

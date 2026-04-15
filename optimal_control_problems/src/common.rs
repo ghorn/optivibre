@@ -24,18 +24,19 @@ use optimal_control::{DirectCollocationIpoptSnapshot, MultipleShootingIpoptSnaps
 use optimization::{
     BackendCompileReport, BackendTimingMetadata, CallPolicy, CallPolicyConfig, ClarabelSqpError,
     ClarabelSqpOptions, ClarabelSqpProfiling, ClarabelSqpSummary, ConstraintSatisfaction,
-    FiniteDifferenceValidationOptions, FunctionCompileOptions, InteriorPointIterationSnapshot,
-    InteriorPointOptions, InteriorPointProfiling, InteriorPointSolveError, InteriorPointSummary,
-    LlvmOptimizationLevel, NlpCompileStats, NlpDerivativeValidationReport, NlpEvaluationBenchmark,
-    NlpEvaluationBenchmarkOptions, NlpEvaluationKernelKind, SqpIterationEvent, SqpIterationPhase,
-    SqpIterationSnapshot, SymbolicSetupProfile, ValidationTolerances, Vectorize,
+    FilterAcceptanceMode, FiniteDifferenceValidationOptions, FunctionCompileOptions,
+    InteriorPointIterationSnapshot, InteriorPointOptions, InteriorPointProfiling,
+    InteriorPointSolveError, InteriorPointSummary, LlvmOptimizationLevel, NlpCompileStats,
+    NlpDerivativeValidationReport, NlpEvaluationBenchmark, NlpEvaluationBenchmarkOptions,
+    NlpEvaluationKernelKind, SqpIterationEvent, SqpIterationPhase, SqpIterationSnapshot,
+    SymbolicSetupProfile, ValidationTolerances, Vectorize,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptOptions, IpoptRawStatus, IpoptSummary};
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptProfiling, IpoptSolveError};
 use serde::{Deserialize, Serialize};
-use sx_core::SX;
+use sx_core::{HessianStrategy, SX};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ControlChoice {
@@ -437,6 +438,29 @@ pub enum SolveLogLevel {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct SolveFilterPoint {
+    pub objective: f64,
+    pub violation: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SolveFilterAcceptanceMode {
+    ObjectiveArmijo,
+    ViolationReduction,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SolveFilterInfo {
+    pub current: SolveFilterPoint,
+    pub entries: Vec<SolveFilterPoint>,
+    pub objective_label: &'static str,
+    pub title: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accepted_mode: Option<SolveFilterAcceptanceMode>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct SolveProgress {
     pub iteration: usize,
     pub phase: SolvePhase,
@@ -448,6 +472,8 @@ pub struct SolveProgress {
     pub penalty: f64,
     pub alpha: Option<f64>,
     pub line_search_iterations: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter: Option<SolveFilterInfo>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -887,6 +913,7 @@ impl OcpKernelStrategy {
 pub struct OcpSxFunctionConfig {
     pub global_call_policy: CallPolicy,
     pub override_behavior: OcpOverrideBehavior,
+    pub hessian_strategy: HessianStrategy,
     pub ode: OcpKernelStrategy,
     pub objective_lagrange: OcpKernelStrategy,
     pub objective_mayer: OcpKernelStrategy,
@@ -901,6 +928,7 @@ impl OcpSxFunctionConfig {
         Self {
             global_call_policy: CallPolicy::InlineAtLowering,
             override_behavior: OcpOverrideBehavior::RespectFunctionOverrides,
+            hessian_strategy: HessianStrategy::LowerTriangleByColumn,
             ode: OcpKernelStrategy::Inline,
             objective_lagrange: OcpKernelStrategy::Inline,
             objective_mayer: OcpKernelStrategy::Inline,
@@ -915,6 +943,7 @@ impl OcpSxFunctionConfig {
         Self {
             global_call_policy: policy,
             override_behavior: OcpOverrideBehavior::RespectFunctionOverrides,
+            hessian_strategy: HessianStrategy::LowerTriangleByColumn,
             ode: OcpKernelStrategy::FunctionUseGlobalPolicy,
             objective_lagrange: OcpKernelStrategy::FunctionUseGlobalPolicy,
             objective_mayer: OcpKernelStrategy::FunctionUseGlobalPolicy,
@@ -951,17 +980,19 @@ impl OcpSxFunctionConfig {
         OcpCompileOptions {
             function_options: FunctionCompileOptions::new(opt_level, self.call_policy_config()),
             symbolic_functions: self.symbolic_functions(),
+            hessian_strategy: self.hessian_strategy,
         }
     }
 
     pub fn variant_id_suffix(self) -> String {
         format!(
-            "g{}_ov{}_ode{}_lag{}_may{}_path{}_beq{}_biq{}_msi{}",
+            "g{}_ov{}_h{}_ode{}_lag{}_may{}_path{}_beq{}_biq{}_msi{}",
             call_policy_variant_token(self.global_call_policy),
             match self.override_behavior {
                 OcpOverrideBehavior::RespectFunctionOverrides => "r",
                 OcpOverrideBehavior::StrictGlobalPolicy => "s",
             },
+            hessian_strategy_variant_token(self.hessian_strategy),
             self.ode.variant_token(),
             self.objective_lagrange.variant_token(),
             self.objective_mayer.variant_token(),
@@ -1001,6 +1032,12 @@ impl OcpSxFunctionConfig {
         }
         if self.override_behavior != default.override_behavior {
             deltas.push("Strict Global".to_string());
+        }
+        if self.hessian_strategy != default.hessian_strategy {
+            deltas.push(format!(
+                "Hessian {}",
+                hessian_strategy_short_label(self.hessian_strategy)
+            ));
         }
         append_kernel_delta(&mut deltas, "ODE", self.ode, default.ode);
         append_kernel_delta(
@@ -1048,6 +1085,7 @@ impl Default for OcpSxFunctionConfig {
         Self {
             global_call_policy: CallPolicy::InlineAtLowering,
             override_behavior: OcpOverrideBehavior::RespectFunctionOverrides,
+            hessian_strategy: HessianStrategy::LowerTriangleByColumn,
             ode: OcpKernelStrategy::FunctionInlineInLlvm,
             objective_lagrange: OcpKernelStrategy::FunctionInlineInLlvm,
             objective_mayer: OcpKernelStrategy::Inline,
@@ -1118,6 +1156,22 @@ fn call_policy_short_label(policy: CallPolicy) -> &'static str {
     }
 }
 
+fn hessian_strategy_short_label(strategy: HessianStrategy) -> &'static str {
+    match strategy {
+        HessianStrategy::LowerTriangleByColumn => "By Column",
+        HessianStrategy::LowerTriangleSelectedOutputs => "Selected Outputs",
+        HessianStrategy::LowerTriangleColored => "Colored",
+    }
+}
+
+const fn hessian_strategy_variant_token(strategy: HessianStrategy) -> &'static str {
+    match strategy {
+        HessianStrategy::LowerTriangleByColumn => "c",
+        HessianStrategy::LowerTriangleSelectedOutputs => "s",
+        HessianStrategy::LowerTriangleColored => "k",
+    }
+}
+
 const fn call_policy_variant_token(policy: CallPolicy) -> &'static str {
     match policy {
         CallPolicy::InlineAtCall => "c",
@@ -1135,6 +1189,7 @@ enum SharedControlId {
     CollocationDegree,
     SxFunctionGlobalCallPolicy,
     SxFunctionOverrideBehavior,
+    SxFunctionHessianStrategy,
     SxFunctionOde,
     SxFunctionObjectiveLagrange,
     SxFunctionObjectiveMayer,
@@ -1158,6 +1213,7 @@ impl SharedControlId {
             Self::CollocationDegree => "collocation_degree",
             Self::SxFunctionGlobalCallPolicy => "sxf_global_call_policy",
             Self::SxFunctionOverrideBehavior => "sxf_override_behavior",
+            Self::SxFunctionHessianStrategy => "sxf_hessian_strategy",
             Self::SxFunctionOde => "sxf_ode",
             Self::SxFunctionObjectiveLagrange => "sxf_objective_lagrange",
             Self::SxFunctionObjectiveMayer => "sxf_objective_mayer",
@@ -2066,6 +2122,42 @@ fn upsert_phase_detail(
     }
 }
 
+fn upsert_timing_phase_detail(
+    details: &mut Vec<SolverPhaseDetail>,
+    label: &str,
+    count: usize,
+    duration: Duration,
+) {
+    if duration <= Duration::ZERO {
+        return;
+    }
+    let value = format_phase_duration(duration);
+    if let Some(detail) = details.iter_mut().find(|detail| detail.label == label) {
+        detail.value = value;
+        detail.count = count;
+    } else {
+        details.push(phase_detail(label, value, count));
+    }
+}
+
+fn append_ocp_setup_timing_details(
+    solver: &mut SolverReport,
+    timing: optimal_control::OcpSolveSetupTiming,
+) {
+    upsert_timing_phase_detail(
+        &mut solver.phase_details.solve,
+        "Initial Guess Construction",
+        usize::from(timing.initial_guess > Duration::ZERO),
+        timing.initial_guess,
+    );
+    upsert_timing_phase_detail(
+        &mut solver.phase_details.solve,
+        "Runtime Bounds Construction",
+        usize::from(timing.runtime_bounds > Duration::ZERO),
+        timing.runtime_bounds,
+    );
+}
+
 fn format_phase_duration(duration: Duration) -> String {
     let seconds = duration.as_secs_f64();
     if seconds >= 10.0 {
@@ -2522,6 +2614,14 @@ fn override_behavior_control_choices() -> [(f64, &'static str); 2] {
     [(0.0, "Allow Overrides"), (1.0, "Strict Global")]
 }
 
+fn hessian_strategy_control_choices() -> [(f64, &'static str); 3] {
+    [
+        (0.0, "By Column"),
+        (1.0, "Selected Outputs"),
+        (2.0, "Colored"),
+    ]
+}
+
 fn kernel_strategy_control_choices() -> [(f64, &'static str); 6] {
     [
         (0.0, "Inline"),
@@ -2558,6 +2658,20 @@ fn ocp_sx_function_controls(default: OcpSxFunctionConfig) -> Vec<ControlSpec> {
                 "",
                 "Allow per-kernel call-policy overrides, or force every function to use the global policy.",
                 &override_behavior_control_choices(),
+                ControlSection::Transcription,
+                ControlVisibility::Always,
+                ControlSemantic::SxFunctionOption,
+            ),
+            panel,
+        ),
+        with_control_panel(
+            select_control(
+                SharedControlId::SxFunctionHessianStrategy.id(),
+                "Hessian Strategy",
+                hessian_strategy_choice_value(default.hessian_strategy),
+                "",
+                "Controls how the lower-triangle Lagrangian Hessian is generated before JIT compilation.",
+                &hessian_strategy_control_choices(),
                 ControlSection::Transcription,
                 ControlVisibility::Always,
                 ControlSemantic::SxFunctionOption,
@@ -2996,6 +3110,15 @@ fn parse_kernel_strategy_choice(value: f64, key: SharedControlId) -> Result<OcpK
     )
 }
 
+fn parse_hessian_strategy_choice(value: f64, key: SharedControlId) -> Result<HessianStrategy> {
+    Ok(match parse_enum_choice(value, key, &[0.0, 1.0, 2.0])? {
+        0 => HessianStrategy::LowerTriangleByColumn,
+        1 => HessianStrategy::LowerTriangleSelectedOutputs,
+        2 => HessianStrategy::LowerTriangleColored,
+        _ => unreachable!("validated Hessian strategy choice index"),
+    })
+}
+
 pub fn ocp_sx_function_config_from_map(
     values: &BTreeMap<String, f64>,
     default: OcpSxFunctionConfig,
@@ -3024,6 +3147,14 @@ pub fn ocp_sx_function_config_from_map(
     Ok(OcpSxFunctionConfig {
         global_call_policy,
         override_behavior,
+        hessian_strategy: parse_hessian_strategy_choice(
+            sample_shared_or_default(
+                values,
+                SharedControlId::SxFunctionHessianStrategy,
+                hessian_strategy_choice_value(default.hessian_strategy),
+            ),
+            SharedControlId::SxFunctionHessianStrategy,
+        )?,
         ode: parse_kernel_strategy_choice(
             sample_shared_or_default(
                 values,
@@ -3103,6 +3234,14 @@ fn override_behavior_choice_value(behavior: OcpOverrideBehavior) -> f64 {
     match behavior {
         OcpOverrideBehavior::RespectFunctionOverrides => 0.0,
         OcpOverrideBehavior::StrictGlobalPolicy => 1.0,
+    }
+}
+
+fn hessian_strategy_choice_value(strategy: HessianStrategy) -> f64 {
+    match strategy {
+        HessianStrategy::LowerTriangleByColumn => 0.0,
+        HessianStrategy::LowerTriangleSelectedOutputs => 1.0,
+        HessianStrategy::LowerTriangleColored => 2.0,
     }
 }
 
@@ -4840,6 +4979,7 @@ where
             );
             append_termination_metric(&mut artifact, &solved.solver);
             attach_sqp_solver_report(&mut artifact, &solved.solver);
+            append_ocp_setup_timing_details(&mut artifact.solver, solved.setup_timing);
             Ok(with_solve_time(artifact, started))
         }
         SolverMethod::Nlip => {
@@ -4856,6 +4996,7 @@ where
             );
             append_nlip_termination_metric(&mut artifact, &solved.solver);
             attach_nlip_solver_report(&mut artifact, &solved.solver);
+            append_ocp_setup_timing_details(&mut artifact.solver, solved.setup_timing);
             Ok(with_solve_time(artifact, started))
         }
         #[cfg(feature = "ipopt")]
@@ -4873,6 +5014,7 @@ where
             );
             append_ipopt_termination_metric(&mut artifact, &solved.solver);
             attach_ipopt_solver_report(&mut artifact, &solved.solver);
+            append_ocp_setup_timing_details(&mut artifact.solver, solved.setup_timing);
             Ok(with_solve_time(artifact, started))
         }
     }
@@ -5029,6 +5171,7 @@ where
             );
             append_termination_metric(&mut artifact, &solved.solver);
             attach_sqp_solver_report(&mut artifact, &solved.solver);
+            append_ocp_setup_timing_details(&mut artifact.solver, solved.setup_timing);
             let artifact = with_solve_time(artifact, started);
             emit_event(
                 &emit,
@@ -5126,6 +5269,7 @@ where
             );
             append_nlip_termination_metric(&mut artifact, &solved.solver);
             attach_nlip_solver_report(&mut artifact, &solved.solver);
+            append_ocp_setup_timing_details(&mut artifact.solver, solved.setup_timing);
             let artifact = with_solve_time(artifact, started);
             emit_event(
                 &emit,
@@ -5224,6 +5368,7 @@ where
             );
             append_ipopt_termination_metric(&mut artifact, &solved.solver);
             attach_ipopt_solver_report(&mut artifact, &solved.solver);
+            append_ocp_setup_timing_details(&mut artifact.solver, solved.setup_timing);
             let artifact = with_solve_time(artifact, started);
             emit_event(
                 &emit,
@@ -5311,6 +5456,7 @@ where
             );
             append_termination_metric(&mut artifact, &solved.solver);
             attach_sqp_solver_report(&mut artifact, &solved.solver);
+            append_ocp_setup_timing_details(&mut artifact.solver, solved.setup_timing);
             Ok(with_solve_time(artifact, started))
         }
         SolverMethod::Nlip => {
@@ -5325,6 +5471,7 @@ where
             );
             append_nlip_termination_metric(&mut artifact, &solved.solver);
             attach_nlip_solver_report(&mut artifact, &solved.solver);
+            append_ocp_setup_timing_details(&mut artifact.solver, solved.setup_timing);
             Ok(with_solve_time(artifact, started))
         }
         #[cfg(feature = "ipopt")]
@@ -5340,6 +5487,7 @@ where
             );
             append_ipopt_termination_metric(&mut artifact, &solved.solver);
             attach_ipopt_solver_report(&mut artifact, &solved.solver);
+            append_ocp_setup_timing_details(&mut artifact.solver, solved.setup_timing);
             Ok(with_solve_time(artifact, started))
         }
     }
@@ -5490,6 +5638,7 @@ where
             );
             append_termination_metric(&mut artifact, &solved.solver);
             attach_sqp_solver_report(&mut artifact, &solved.solver);
+            append_ocp_setup_timing_details(&mut artifact.solver, solved.setup_timing);
             let artifact = with_solve_time(artifact, started);
             emit_event(
                 &emit,
@@ -5575,6 +5724,7 @@ where
             );
             append_nlip_termination_metric(&mut artifact, &solved.solver);
             attach_nlip_solver_report(&mut artifact, &solved.solver);
+            append_ocp_setup_timing_details(&mut artifact.solver, solved.setup_timing);
             let artifact = with_solve_time(artifact, started);
             emit_event(
                 &emit,
@@ -5661,6 +5811,7 @@ where
             );
             append_ipopt_termination_metric(&mut artifact, &solved.solver);
             attach_ipopt_solver_report(&mut artifact, &solved.solver);
+            append_ocp_setup_timing_details(&mut artifact.solver, solved.setup_timing);
             let artifact = with_solve_time(artifact, started);
             emit_event(
                 &emit,
@@ -5739,6 +5890,28 @@ pub fn sqp_progress(snapshot: &SqpIterationSnapshot) -> SolveProgress {
             .line_search
             .as_ref()
             .map(|info| info.backtrack_count),
+        filter: snapshot.filter.as_ref().map(|filter| SolveFilterInfo {
+            current: SolveFilterPoint {
+                objective: filter.current.objective,
+                violation: filter.current.violation,
+            },
+            entries: filter
+                .entries
+                .iter()
+                .map(|entry| SolveFilterPoint {
+                    objective: entry.objective,
+                    violation: entry.violation,
+                })
+                .collect(),
+            objective_label: "Objective",
+            title: "SQP filter frontier",
+            accepted_mode: filter.accepted_mode.map(|mode| match mode {
+                FilterAcceptanceMode::ObjectiveArmijo => SolveFilterAcceptanceMode::ObjectiveArmijo,
+                FilterAcceptanceMode::ViolationReduction => {
+                    SolveFilterAcceptanceMode::ViolationReduction
+                }
+            }),
+        }),
     }
 }
 
@@ -5758,6 +5931,28 @@ pub fn nlip_progress(snapshot: &InteriorPointIterationSnapshot) -> SolveProgress
         penalty: snapshot.barrier_parameter.unwrap_or(0.0),
         alpha: snapshot.alpha,
         line_search_iterations: snapshot.line_search_iterations.map(|value| value as usize),
+        filter: snapshot.filter.as_ref().map(|filter| SolveFilterInfo {
+            current: SolveFilterPoint {
+                objective: filter.current.objective,
+                violation: filter.current.violation,
+            },
+            entries: filter
+                .entries
+                .iter()
+                .map(|entry| SolveFilterPoint {
+                    objective: entry.objective,
+                    violation: entry.violation,
+                })
+                .collect(),
+            objective_label: "Objective",
+            title: "NLIP filter frontier",
+            accepted_mode: filter.accepted_mode.map(|mode| match mode {
+                FilterAcceptanceMode::ObjectiveArmijo => SolveFilterAcceptanceMode::ObjectiveArmijo,
+                FilterAcceptanceMode::ViolationReduction => {
+                    SolveFilterAcceptanceMode::ViolationReduction
+                }
+            }),
+        }),
     }
 }
 
@@ -5778,6 +5973,7 @@ pub fn ipopt_progress(snapshot: &optimization::IpoptIterationSnapshot) -> SolveP
         penalty: snapshot.barrier_parameter,
         alpha: Some(snapshot.alpha_pr),
         line_search_iterations: Some(snapshot.line_search_trials as usize),
+        filter: None,
     }
 }
 
@@ -5859,7 +6055,10 @@ pub fn sqp_solver_report(summary: &ClarabelSqpSummary) -> SolverReport {
         jit_s: duration_seconds(summary.profiling.backend_timing.jit_time),
         solve_s: Some(summary.profiling.total_time.as_secs_f64()),
         compile_cached: false,
-        phase_details: SolverPhaseDetails::default(),
+        phase_details: SolverPhaseDetails {
+            solve: sqp_solve_phase_details(&summary.profiling),
+            ..SolverPhaseDetails::default()
+        },
     }
 }
 
@@ -5873,7 +6072,10 @@ pub fn nlip_solver_report(summary: &InteriorPointSummary) -> SolverReport {
         jit_s: duration_seconds(summary.profiling.backend_timing.jit_time),
         solve_s: Some(summary.profiling.total_time.as_secs_f64()),
         compile_cached: false,
-        phase_details: SolverPhaseDetails::default(),
+        phase_details: SolverPhaseDetails {
+            solve: nlip_solve_phase_details(&summary.profiling),
+            ..SolverPhaseDetails::default()
+        },
     }
 }
 
@@ -5888,7 +6090,10 @@ pub fn ipopt_solver_report(summary: &IpoptSummary) -> SolverReport {
         jit_s: duration_seconds(summary.profiling.backend_timing.jit_time),
         solve_s: Some(summary.profiling.total_time.as_secs_f64()),
         compile_cached: false,
-        phase_details: SolverPhaseDetails::default(),
+        phase_details: SolverPhaseDetails {
+            solve: ipopt_solve_phase_details(&summary.profiling),
+            ..SolverPhaseDetails::default()
+        },
     }
 }
 
@@ -5931,8 +6136,69 @@ fn push_optional_timing_detail(
     }
 }
 
+fn push_adapter_timing_details(
+    details: &mut Vec<SolverPhaseDetail>,
+    timing: Option<optimization::SolverAdapterTiming>,
+) {
+    if let Some(timing) = timing {
+        push_optional_timing_detail(details, "Adapter Callback", 0, timing.callback_evaluation);
+        push_optional_timing_detail(details, "Adapter IO", 0, timing.output_marshalling);
+        push_optional_timing_detail(details, "Layout Projection", 0, timing.layout_projection);
+    }
+}
+
+fn adapter_total_time(timing: Option<optimization::SolverAdapterTiming>) -> Duration {
+    timing.map_or(Duration::ZERO, |timing| {
+        timing.callback_evaluation + timing.output_marshalling + timing.layout_projection
+    })
+}
+
+fn sqp_evaluation_other_time(profiling: &ClarabelSqpProfiling) -> Duration {
+    let callback_total = profiling.objective_value.total_time
+        + profiling.objective_gradient.total_time
+        + profiling.equality_values.total_time
+        + profiling.inequality_values.total_time
+        + profiling.equality_jacobian_values.total_time
+        + profiling.inequality_jacobian_values.total_time
+        + profiling.lagrangian_hessian_values.total_time;
+    profiling.evaluation_time.saturating_sub(callback_total)
+}
+
+fn sqp_preprocess_other_time(profiling: &ClarabelSqpProfiling) -> Duration {
+    profiling.preprocessing_time.saturating_sub(
+        profiling.jacobian_assembly_time
+            + profiling.hessian_assembly_time
+            + profiling.regularization_time
+            + profiling.subproblem_assembly_time,
+    )
+}
+
+fn sqp_subproblem_solve_other_time(profiling: &ClarabelSqpProfiling) -> Duration {
+    profiling.subproblem_solve_time.saturating_sub(
+        profiling.qp_setup_time + profiling.qp_solve_time + profiling.multiplier_estimation_time,
+    )
+}
+
+fn sqp_line_search_other_time(profiling: &ClarabelSqpProfiling) -> Duration {
+    profiling.line_search_time.saturating_sub(
+        profiling.line_search_evaluation_time + profiling.line_search_condition_check_time,
+    )
+}
+
+fn sqp_convergence_other_time(profiling: &ClarabelSqpProfiling) -> Duration {
+    profiling
+        .convergence_time
+        .saturating_sub(profiling.convergence_check_time)
+}
+
 fn sqp_solve_phase_details(profiling: &ClarabelSqpProfiling) -> Vec<SolverPhaseDetail> {
     let mut details = Vec::new();
+    push_optional_timing_detail(
+        &mut details,
+        "Evaluate Functions",
+        0,
+        profiling.evaluation_time,
+    );
     push_eval_timing_detail(
         &mut details,
         "Objective",
@@ -5977,6 +6243,56 @@ fn sqp_solve_phase_details(profiling: &ClarabelSqpProfiling) -> Vec<SolverPhaseD
     );
     push_optional_timing_detail(
         &mut details,
+        "Evaluate Other",
+        0,
+        sqp_evaluation_other_time(profiling),
+    );
+    push_optional_timing_detail(
+        &mut details,
+        "Adapter / Runtime Plumbing",
+        0,
+        adapter_total_time(profiling.adapter_timing),
+    );
+    push_adapter_timing_details(&mut details, profiling.adapter_timing);
+    push_optional_timing_detail(&mut details, "Preprocess", 0, profiling.preprocessing_time);
+    push_optional_timing_detail(
+        &mut details,
+        "Jacobian Build",
+        profiling.jacobian_assembly_steps,
+        profiling.jacobian_assembly_time,
+    );
+    push_optional_timing_detail(
+        &mut details,
+        "Hessian Build",
+        profiling.hessian_assembly_steps,
+        profiling.hessian_assembly_time,
+    );
+    push_optional_timing_detail(
+        &mut details,
+        "Regularization",
+        profiling.regularization_steps,
+        profiling.regularization_time,
+    );
+    push_optional_timing_detail(
+        &mut details,
+        "Subproblem Assembly",
+        profiling.subproblem_assembly_steps,
+        profiling.subproblem_assembly_time,
+    );
+    push_optional_timing_detail(
+        &mut details,
+        "Preprocess Other",
+        0,
+        sqp_preprocess_other_time(profiling),
+    );
+    push_optional_timing_detail(
+        &mut details,
+        "Subproblem Solve",
+        0,
+        profiling.subproblem_solve_time,
+    );
+    push_optional_timing_detail(
+        &mut details,
         "QP Setup",
         profiling.qp_setups,
         profiling.qp_setup_time,
@@ -5995,6 +6311,13 @@ fn sqp_solve_phase_details(profiling: &ClarabelSqpProfiling) -> Vec<SolverPhaseD
     );
     push_optional_timing_detail(
         &mut details,
+        "Subproblem Solve Other",
+        0,
+        sqp_subproblem_solve_other_time(profiling),
+    );
+    push_optional_timing_detail(&mut details, "Line Search", 0, profiling.line_search_time);
+    push_optional_timing_detail(
+        &mut details,
         "Line Search Eval",
         profiling.line_search_evaluations,
         profiling.line_search_evaluation_time,
@@ -6007,10 +6330,25 @@ fn sqp_solve_phase_details(profiling: &ClarabelSqpProfiling) -> Vec<SolverPhaseD
     );
     push_optional_timing_detail(
         &mut details,
+        "Line Search Other",
+        0,
+        sqp_line_search_other_time(profiling),
+    );
+    push_optional_timing_detail(&mut details, "Convergence", 0, profiling.convergence_time);
+    push_optional_timing_detail(
+        &mut details,
         "Convergence Check",
         profiling.convergence_checks,
         profiling.convergence_check_time,
     );
+    push_optional_timing_detail(
+        &mut details,
+        "Convergence Other",
+        0,
+        sqp_convergence_other_time(profiling),
+    );
+    push_optional_timing_detail(&mut details, "Unaccounted", 0, profiling.unaccounted_time);
+    push_optional_timing_detail(&mut details, "Total", 0, profiling.total_time);
     details
 }
 
@@ -6058,6 +6396,13 @@ fn nlip_solve_phase_details(profiling: &InteriorPointProfiling) -> Vec<SolverPha
         profiling.lagrangian_hessian_values.calls,
         profiling.lagrangian_hessian_values.total_time,
     );
+    push_adapter_timing_details(&mut details, profiling.adapter_timing);
+    push_optional_timing_detail(
+        &mut details,
+        "Preprocess",
+        profiling.preprocessing_steps,
+        profiling.preprocessing_time,
+    );
     push_optional_timing_detail(
         &mut details,
         "KKT Assembly",
@@ -6070,12 +6415,8 @@ fn nlip_solve_phase_details(profiling: &InteriorPointProfiling) -> Vec<SolverPha
         profiling.linear_solves,
         profiling.linear_solve_time,
     );
-    push_optional_timing_detail(
-        &mut details,
-        "Preprocess",
-        profiling.preprocessing_steps,
-        profiling.preprocessing_time,
-    );
+    push_optional_timing_detail(&mut details, "Unaccounted", 0, profiling.unaccounted_time);
+    push_optional_timing_detail(&mut details, "Total", 0, profiling.total_time);
     details
 }
 
@@ -6112,6 +6453,8 @@ fn ipopt_solve_phase_details(profiling: &IpoptProfiling) -> Vec<SolverPhaseDetai
         profiling.hessian_values.calls,
         profiling.hessian_values.total_time,
     );
+    push_adapter_timing_details(&mut details, profiling.adapter_timing);
+    push_optional_timing_detail(&mut details, "Total", 0, profiling.total_time);
     details
 }
 
@@ -6688,9 +7031,16 @@ mod tests {
             .iter()
             .find(|control| control.id == "sxf_ode")
             .expect("expected sx function ODE control");
+        let hessian = controls
+            .iter()
+            .find(|control| control.id == "sxf_hessian_strategy")
+            .expect("expected sx function Hessian strategy control");
         assert_eq!(ode.section, ControlSection::Transcription);
         assert_eq!(ode.panel, Some(ControlPanel::SxFunctions));
         assert_eq!(ode.semantic, ControlSemantic::SxFunctionOption);
+        assert_eq!(hessian.section, ControlSection::Transcription);
+        assert_eq!(hessian.panel, Some(ControlPanel::SxFunctions));
+        assert_eq!(hessian.semantic, ControlSemantic::SxFunctionOption);
     }
 
     #[test]
@@ -6698,11 +7048,75 @@ mod tests {
         let default = OcpSxFunctionConfig::default();
         let custom = OcpSxFunctionConfig {
             global_call_policy: CallPolicy::NoInlineLLVM,
+            hessian_strategy: HessianStrategy::LowerTriangleColored,
             multiple_shooting_integrator: OcpKernelStrategy::FunctionUseGlobalPolicy,
             ..default
         };
         assert_ne!(default.variant_id_suffix(), custom.variant_id_suffix());
         assert_eq!(custom.variant_label_suffix().as_deref(), Some("SXF Custom"));
+    }
+
+    #[test]
+    fn sqp_solve_phase_details_break_out_regularization_and_preprocess() {
+        let profiling = optimization::ClarabelSqpProfiling {
+            objective_value: optimization::EvalTimingStat {
+                calls: 5,
+                total_time: Duration::from_millis(10),
+            },
+            objective_gradient: optimization::EvalTimingStat {
+                calls: 5,
+                total_time: Duration::from_millis(12),
+            },
+            lagrangian_hessian_values: optimization::EvalTimingStat {
+                calls: 4,
+                total_time: Duration::from_millis(18),
+            },
+            jacobian_assembly_steps: 5,
+            jacobian_assembly_time: Duration::from_millis(20),
+            hessian_assembly_steps: 4,
+            hessian_assembly_time: Duration::from_millis(22),
+            regularization_steps: 4,
+            regularization_time: Duration::from_millis(44),
+            preprocessing_other_steps: 5,
+            preprocessing_other_time: Duration::from_millis(16),
+            preprocessing_steps: 5,
+            preprocessing_time: Duration::from_millis(102),
+            evaluation_time: Duration::from_millis(45),
+            ..optimization::ClarabelSqpProfiling::default()
+        };
+
+        let details = sqp_solve_phase_details(&profiling);
+
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.label == "Jacobian Build" && detail.count == 5)
+        );
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.label == "Hessian Build" && detail.count == 4)
+        );
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.label == "Regularization" && detail.count == 4)
+        );
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.label == "Preprocess Other" && detail.count == 0)
+        );
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.label == "Preprocess" && detail.count == 0)
+        );
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.label == "Evaluate Functions" && detail.count == 0)
+        );
     }
 
     #[test]

@@ -681,6 +681,7 @@ fn inline_options() -> OcpCompileOptions {
     OcpCompileOptions {
         function_options: FunctionCompileOptions::from(LlvmOptimizationLevel::O0),
         symbolic_functions: OcpSymbolicFunctionOptions::inline_all(),
+        hessian_strategy: sx_core::HessianStrategy::LowerTriangleByColumn,
     }
 }
 
@@ -690,6 +691,7 @@ fn preserved_options() -> OcpCompileOptions {
         symbolic_functions: OcpSymbolicFunctionOptions::function_all_with_call_policy(
             CallPolicy::NoInlineLLVM,
         ),
+        hessian_strategy: sx_core::HessianStrategy::LowerTriangleByColumn,
     }
 }
 

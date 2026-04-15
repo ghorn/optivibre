@@ -78,8 +78,7 @@ pub struct NlpDerivativeValidationReport {
 impl ValidationSummary {
     pub fn is_within_tolerances(&self, tolerances: ValidationTolerances) -> bool {
         !self.pareto_frontier.iter().any(|entry| {
-            entry.abs_error > tolerances.max_abs_error
-                && entry.rel_error > tolerances.max_rel_error
+            entry.abs_error > tolerances.max_abs_error && entry.rel_error > tolerances.max_rel_error
         })
     }
 }

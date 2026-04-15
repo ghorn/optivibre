@@ -430,14 +430,13 @@ fn typed_symbolic_compiled_nlp_derivatives_match_finite_difference() {
 
 #[test]
 fn typed_symbolic_derivative_validation_rejects_nonfinite_derivatives() {
-    let symbolic = symbolic_nlp::<Scalar<SX>, (), (), (), _>("sqrt_singularity", |x, _| {
-        SymbolicNlpOutputs {
+    let symbolic =
+        symbolic_nlp::<Scalar<SX>, (), (), (), _>("sqrt_singularity", |x, _| SymbolicNlpOutputs {
             objective: x.x.sqrt(),
             equalities: (),
             inequalities: (),
-        }
-    })
-    .expect("symbolic NLP should build");
+        })
+        .expect("symbolic NLP should build");
     let compiled = symbolic.compile_jit().expect("JIT compile should succeed");
     let error = compiled
         .validate_derivatives(

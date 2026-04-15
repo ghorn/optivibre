@@ -8,10 +8,8 @@ use thiserror::Error;
 
 use super::{
     BackendTimingMetadata, BoundConstraints, CompiledNlpProblem, DUAL_INF_LABEL, EQ_INF_LABEL,
-    EvalTimingStat, INEQ_INF_LABEL, Index, PRIMAL_INF_LABEL, ParameterMatrix,
-    SQP_EVENT_SEEN_LINE_SEARCH, SQP_EVENT_SEEN_MAX_ITER, SQP_EVENT_SEEN_PENALTY,
-    SQP_LOG_HAS_EQUALITIES, SQP_LOG_HAS_INEQUALITIES, SQP_LOG_ITERATION_LIMIT_REACHED,
-    SQP_LOG_PENALTY_UPDATED, SolverAdapterTiming, SqpEventLegendState, augment_inequality_values,
+    EvalTimingStat, FilterAcceptanceMode, FilterInfo, INEQ_INF_LABEL, Index, PRIMAL_INF_LABEL,
+    ParameterMatrix, SolverAdapterTiming, SqpEventLegendState, augment_inequality_values,
     boxed_line, build_bound_jacobian, ccs_to_dense, choose_summary_duration_unit,
     collect_bound_constraints, compact_duration_text, complementarity_inf_norm,
     declared_box_constraint_count, dense_fill_percent, fmt_duration_in_unit,
@@ -25,8 +23,6 @@ use super::{
 
 const IP_COMP_INF_LABEL: &str = "‖s∘z‖∞";
 
-const IP_LOG_LINEAR_FALLBACK: u8 = 1 << 4;
-const IP_EVENT_SEEN_LINEAR_FALLBACK: u8 = 1 << 4;
 const AUTO_SPARSE_QDLDL_MIN_DIM: usize = 10;
 const LINEAR_SOLUTION_MAX_RELATIVE_INF_NORM: f64 = 1e12;
 const LINEAR_SOLUTION_MAX_RELATIVE_RESIDUAL: f64 = 1e-7;
@@ -62,6 +58,9 @@ pub struct InteriorPointOptions {
     pub line_search_beta: f64,
     pub line_search_c1: f64,
     pub min_step: f64,
+    pub filter_method: bool,
+    pub filter_gamma_objective: f64,
+    pub filter_gamma_violation: f64,
     pub regularization: f64,
     pub sigma_min: f64,
     pub sigma_max: f64,
@@ -81,6 +80,9 @@ impl Default for InteriorPointOptions {
             line_search_beta: 0.5,
             line_search_c1: 1e-4,
             min_step: 1e-8,
+            filter_method: true,
+            filter_gamma_objective: 1e-4,
+            filter_gamma_violation: 1e-4,
             regularization: 1e-6,
             sigma_min: 1e-4,
             sigma_max: 1.0,
@@ -174,6 +176,7 @@ pub enum InteriorPointIterationPhase {
 pub enum InteriorPointIterationEvent {
     SigmaAdjusted,
     LongLineSearch,
+    FilterAccepted,
     LinearSolverFallback,
     MaxIterationsReached,
 }
@@ -214,6 +217,8 @@ pub struct InteriorPointIterationSnapshot {
         serde(with = "crate::option_duration_seconds_serde")
     )]
     pub linear_solve_time: Option<Duration>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub filter: Option<FilterInfo>,
     pub timing: InteriorPointIterationTiming,
     pub events: Vec<InteriorPointIterationEvent>,
 }
@@ -257,6 +262,21 @@ struct ActiveSetPolishDirection {
     d_lambda: Vec<f64>,
     d_z: Vec<f64>,
     active_indices: Vec<Index>,
+}
+
+struct AcceptedInteriorPointTrial {
+    x: Vec<f64>,
+    lambda: Vec<f64>,
+    slack: Vec<f64>,
+    z: Vec<f64>,
+    objective: f64,
+    equality_inf: f64,
+    inequality_inf: f64,
+    dual_inf: f64,
+    complementarity_inf: f64,
+    mu: f64,
+    filter_entry: super::FilterEntry,
+    filter_acceptance_mode: Option<FilterAcceptanceMode>,
 }
 
 struct ActiveSetPolishSystem<'a> {
@@ -313,6 +333,17 @@ fn barrier_objective_value(objective_value: f64, slack: &[f64], barrier_paramete
         return objective_value;
     }
     objective_value - barrier_parameter * slack.iter().map(|value| value.ln()).sum::<f64>()
+}
+
+fn interior_point_filter_parameters(
+    options: &InteriorPointOptions,
+) -> super::filter::FilterParameters {
+    super::filter::FilterParameters {
+        gamma_objective: options.filter_gamma_objective,
+        gamma_violation: options.filter_gamma_violation,
+        armijo_c1: options.line_search_c1,
+        violation_tol: options.constraint_tol,
+    }
 }
 
 fn step_inf_norm(step: &[f64]) -> f64 {
@@ -1033,7 +1064,7 @@ fn style_ip_line_search_cell(iterations: Option<Index>) -> String {
 struct InteriorPointIterationLog {
     iteration: Index,
     phase: InteriorPointIterationPhase,
-    flags: u8,
+    flags: InteriorPointIterationLogFlags,
     objective_value: f64,
     equality_inf: f64,
     inequality_inf: f64,
@@ -1048,18 +1079,31 @@ struct InteriorPointIterationLog {
     complementarity_tol: f64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct InteriorPointIterationLogFlags {
+    has_equalities: bool,
+    has_inequalities: bool,
+    penalty_updated: bool,
+    filter_accepted: bool,
+    linear_fallback: bool,
+    iteration_limit_reached: bool,
+}
+
 fn fmt_ip_event_codes(log: &InteriorPointIterationLog) -> String {
     let mut codes = String::new();
-    if log.flags & SQP_LOG_PENALTY_UPDATED != 0 {
+    if log.flags.penalty_updated {
         codes.push('P');
     }
     if matches!(log.line_search_iterations, Some(iterations) if iterations >= 4) {
         codes.push('L');
     }
-    if log.flags & IP_LOG_LINEAR_FALLBACK != 0 {
+    if log.flags.filter_accepted {
         codes.push('F');
     }
-    if log.flags & SQP_LOG_ITERATION_LIMIT_REACHED != 0 {
+    if log.flags.linear_fallback {
+        codes.push('U');
+    }
+    if log.flags.iteration_limit_reached {
         codes.push('M');
     }
     codes
@@ -1070,7 +1114,7 @@ fn style_ip_event_cell(log: &InteriorPointIterationLog) -> String {
     let cell = format!("{:>4}", codes);
     if codes.is_empty() {
         cell
-    } else if log.flags & SQP_LOG_ITERATION_LIMIT_REACHED != 0 {
+    } else if log.flags.iteration_limit_reached {
         style_red_bold(&cell)
     } else {
         style_yellow_bold(&cell)
@@ -1079,20 +1123,21 @@ fn style_ip_event_cell(log: &InteriorPointIterationLog) -> String {
 
 fn ip_event_suffix(log: &InteriorPointIterationLog, state: &mut SqpEventLegendState) -> String {
     let mut parts = Vec::new();
-    if log.flags & SQP_LOG_PENALTY_UPDATED != 0 && state.mark_if_new(SQP_EVENT_SEEN_PENALTY) {
+    if log.flags.penalty_updated && state.mark_penalty_if_new() {
         parts.push("P=sigma clipped or barrier safeguard engaged");
     }
     if matches!(log.line_search_iterations, Some(iterations) if iterations >= 4)
-        && state.mark_if_new(SQP_EVENT_SEEN_LINE_SEARCH)
+        && state.mark_line_search_if_new()
     {
         parts.push("L=line search backtracked >=4 times");
     }
-    if log.flags & IP_LOG_LINEAR_FALLBACK != 0 && state.mark_if_new(IP_EVENT_SEEN_LINEAR_FALLBACK) {
-        parts.push("F=linear solver fell back to LU");
+    if log.flags.filter_accepted && state.mark_filter_if_new() {
+        parts.push("F=filter accepted a feasibility-improving step without objective Armijo");
     }
-    if log.flags & SQP_LOG_ITERATION_LIMIT_REACHED != 0
-        && state.mark_if_new(SQP_EVENT_SEEN_MAX_ITER)
-    {
+    if log.flags.linear_fallback && state.mark_ip_linear_fallback_if_new() {
+        parts.push("U=linear solver fell back to LU");
+    }
+    if log.flags.iteration_limit_reached && state.mark_max_iter_if_new() {
         parts.push("M=maximum NLIP iterations reached");
     }
     if parts.is_empty() {
@@ -1129,26 +1174,23 @@ fn log_interior_point_iteration(
         InteriorPointIterationPhase::Converged => "post".to_string(),
     };
     let row = [
-        style_iteration_label_cell(
-            &iteration_label,
-            log.flags & SQP_LOG_ITERATION_LIMIT_REACHED != 0,
-        ),
+        style_iteration_label_cell(&iteration_label, log.flags.iteration_limit_reached),
         format!("{:>9}", sci_text(log.objective_value)),
         style_ip_residual_cell(
             log.equality_inf,
             log.constraint_tol,
-            log.flags & SQP_LOG_HAS_EQUALITIES != 0,
+            log.flags.has_equalities,
         ),
         style_ip_residual_cell(
             log.inequality_inf,
             log.constraint_tol,
-            log.flags & SQP_LOG_HAS_INEQUALITIES != 0,
+            log.flags.has_inequalities,
         ),
         style_ip_residual_cell(log.dual_inf, log.dual_tol, true),
         style_ip_residual_cell(
             log.complementarity_inf,
             log.complementarity_tol,
-            log.flags & SQP_LOG_HAS_INEQUALITIES != 0,
+            log.flags.has_inequalities,
         ),
         format!("{:>9}", sci_text(log.barrier_parameter)),
         fmt_optional_ip_sci(log.alpha),
@@ -1216,11 +1258,20 @@ fn log_interior_point_problem_header<P>(
         boxed_line(
             "line search",
             format!(
-                "beta={}  c1={}  min_step={}  fraction_to_boundary={}",
+                "beta={}  c1={}  min_step={}  fraction_to_boundary={}  filter={}",
                 sci_text(options.line_search_beta),
                 sci_text(options.line_search_c1),
                 sci_text(options.min_step),
                 sci_text(options.fraction_to_boundary),
+                if options.filter_method { "on" } else { "off" },
+            ),
+        ),
+        boxed_line(
+            "filter",
+            format!(
+                "gamma_obj={}  gamma_violation={}",
+                sci_text(options.filter_gamma_objective),
+                sci_text(options.filter_gamma_violation),
             ),
         ),
         boxed_line(
@@ -1621,6 +1672,7 @@ where
 
     let mut nonlinear_inequality_multipliers = vec![0.0; inequality_count];
     let mut last_linear_solver = options.linear_solver;
+    let mut filter_entries = Vec::new();
 
     if options.max_iters == 0 {
         let equality_inf = inf_norm(&initial_state.equality_values);
@@ -1638,6 +1690,13 @@ where
             0.0
         };
         let mu = barrier_parameter(&slack, &z);
+        let current_filter_entry = super::filter::entry(
+            initial_state.objective_value,
+            equality_inf.max(inequality_inf),
+        );
+        if options.filter_method && filter_entries.is_empty() {
+            super::filter::update_frontier(&mut filter_entries, current_filter_entry.clone());
+        }
         let snapshot = InteriorPointIterationSnapshot {
             iteration: 0,
             phase: InteriorPointIterationPhase::Initial,
@@ -1652,6 +1711,11 @@ where
             line_search_iterations: None,
             linear_solver: last_linear_solver,
             linear_solve_time: None,
+            filter: options.filter_method.then(|| FilterInfo {
+                current: current_filter_entry,
+                entries: filter_entries.clone(),
+                accepted_mode: None,
+            }),
             timing: InteriorPointIterationTiming {
                 adapter_timing: profiling.adapter_timing,
                 callback: setup_callback_time,
@@ -1664,15 +1728,12 @@ where
         };
         callback(&snapshot);
         if options.verbose {
-            let flags = (if equality_count > 0 {
-                SQP_LOG_HAS_EQUALITIES
-            } else {
-                0
-            }) | (if augmented_inequality_count > 0 {
-                SQP_LOG_HAS_INEQUALITIES
-            } else {
-                0
-            }) | SQP_LOG_ITERATION_LIMIT_REACHED;
+            let flags = InteriorPointIterationLogFlags {
+                has_equalities: equality_count > 0,
+                has_inequalities: augmented_inequality_count > 0,
+                iteration_limit_reached: true,
+                ..InteriorPointIterationLogFlags::default()
+            };
             log_interior_point_iteration(
                 &InteriorPointIterationLog {
                     iteration: 0,
@@ -1762,6 +1823,13 @@ where
             }
         }
         let mu = barrier_parameter(&slack, &z);
+        let barrier_objective_parameter = mu.max(options.mu_min);
+        let current_barrier_objective =
+            barrier_objective_value(state.objective_value, &slack, barrier_objective_parameter);
+        let current_filter_entry = super::filter::entry(state.objective_value, primal_inf);
+        if options.filter_method && filter_entries.is_empty() {
+            super::filter::update_frontier(&mut filter_entries, current_filter_entry.clone());
+        }
 
         if primal_inf <= options.constraint_tol
             && dual_inf <= options.dual_tol
@@ -1787,6 +1855,11 @@ where
                 line_search_iterations: None,
                 linear_solver: last_linear_solver,
                 linear_solve_time: None,
+                filter: options.filter_method.then(|| FilterInfo {
+                    current: current_filter_entry,
+                    entries: filter_entries.clone(),
+                    accepted_mode: None,
+                }),
                 timing: InteriorPointIterationTiming {
                     adapter_timing,
                     callback: iteration_callback_time,
@@ -1825,15 +1898,11 @@ where
                     &InteriorPointIterationLog {
                         iteration,
                         phase: InteriorPointIterationPhase::Converged,
-                        flags: (if equality_count > 0 {
-                            SQP_LOG_HAS_EQUALITIES
-                        } else {
-                            0
-                        }) | (if augmented_inequality_count > 0 {
-                            SQP_LOG_HAS_INEQUALITIES
-                        } else {
-                            0
-                        }),
+                        flags: InteriorPointIterationLogFlags {
+                            has_equalities: equality_count > 0,
+                            has_inequalities: augmented_inequality_count > 0,
+                            ..InteriorPointIterationLogFlags::default()
+                        },
                         objective_value: state.objective_value,
                         equality_inf,
                         inequality_inf,
@@ -2096,8 +2165,7 @@ where
             mu,
         );
         let current_primal_inf = primal_inf;
-        let current_barrier_objective =
-            barrier_objective_value(state.objective_value, &slack, mu.max(options.mu_min));
+        let filter_parameters = interior_point_filter_parameters(options);
         let mut line_search_iterations = 0;
         let mut accepted = None;
         let mut best_feasible = None;
@@ -2166,34 +2234,83 @@ where
             let trial_barrier_objective = barrier_objective_value(
                 trial_state.objective_value,
                 &trial_slack,
-                mu.max(options.mu_min),
+                barrier_objective_parameter,
             );
-            if trial_merit < best_feasible_merit {
+            let trial_filter_entry =
+                super::filter::entry(trial_state.objective_value, trial_primal_inf);
+            if !options.filter_method && trial_merit < best_feasible_merit {
                 best_feasible_merit = trial_merit;
-                best_feasible = Some((
-                    trial_x.clone(),
-                    trial_lambda.clone(),
-                    trial_slack.clone(),
-                    trial_z.clone(),
-                ));
+                best_feasible = Some(AcceptedInteriorPointTrial {
+                    x: trial_x.clone(),
+                    lambda: trial_lambda.clone(),
+                    slack: trial_slack.clone(),
+                    z: trial_z.clone(),
+                    objective: trial_state.objective_value,
+                    equality_inf: trial_eq_inf,
+                    inequality_inf: trial_ineq_inf,
+                    dual_inf: trial_dual_inf,
+                    complementarity_inf: trial_comp_inf,
+                    mu: trial_mu,
+                    filter_entry: trial_filter_entry.clone(),
+                    filter_acceptance_mode: None,
+                });
             }
             let residual_accept = trial_merit
                 <= (1.0 - options.line_search_c1 * alpha) * current_merit
                 || trial_merit < current_merit;
-            let filter_accept = trial_primal_inf
+            let local_filter_accept = trial_primal_inf
                 <= (1.0 - options.line_search_c1 * alpha) * current_primal_inf
                 || trial_barrier_objective
                     <= current_barrier_objective
                         - options.line_search_c1 * alpha * current_primal_inf.max(1.0);
-            if residual_accept || filter_accept {
-                accepted = Some((trial_x, trial_lambda, trial_slack, trial_z));
+            let filter_assessment = options.filter_method.then(|| {
+                let objective_target = current_filter_entry.objective
+                    - options.line_search_c1 * alpha * current_primal_inf.max(1.0);
+                let (objective_satisfied, objective_tolerance_adjusted) =
+                    super::filter::reduction_assessment(
+                        current_filter_entry.objective,
+                        trial_filter_entry.objective,
+                        objective_target,
+                    );
+                super::filter::assess_trial_with_objective_status(
+                    &filter_entries,
+                    &current_filter_entry,
+                    &trial_filter_entry,
+                    objective_satisfied,
+                    objective_tolerance_adjusted,
+                    filter_parameters,
+                )
+            });
+            let filter_acceptance_mode =
+                filter_assessment.and_then(|assessment| assessment.acceptance_mode);
+            if (options.filter_method && (residual_accept || filter_acceptance_mode.is_some()))
+                || (!options.filter_method && (residual_accept || local_filter_accept))
+            {
+                accepted = Some(AcceptedInteriorPointTrial {
+                    x: trial_x,
+                    lambda: trial_lambda,
+                    slack: trial_slack,
+                    z: trial_z,
+                    objective: trial_state.objective_value,
+                    equality_inf: trial_eq_inf,
+                    inequality_inf: trial_ineq_inf,
+                    dual_inf: trial_dual_inf,
+                    complementarity_inf: trial_comp_inf,
+                    mu: trial_mu,
+                    filter_entry: trial_filter_entry,
+                    filter_acceptance_mode,
+                });
                 break;
             }
             alpha *= options.line_search_beta;
             line_search_iterations += 1;
         }
-        let accepted = accepted.or(best_feasible);
-        let Some((trial_x, trial_lambda, trial_slack, trial_z)) = accepted else {
+        let accepted = if options.filter_method {
+            accepted
+        } else {
+            accepted.or(best_feasible)
+        };
+        let Some(accepted_trial) = accepted else {
             return Err(InteriorPointSolveError::LineSearchFailed {
                 merit: current_merit,
                 mu,
@@ -2205,39 +2322,27 @@ where
         if options.verbose {
             let solver_fell_back = options.linear_solver != InteriorPointLinearSolver::Auto
                 && direction.solver_used != options.linear_solver;
-            let flags = (if equality_count > 0 {
-                SQP_LOG_HAS_EQUALITIES
-            } else {
-                0
-            }) | (if augmented_inequality_count > 0 {
-                SQP_LOG_HAS_INEQUALITIES
-            } else {
-                0
-            }) | (if sigma_adjusted {
-                SQP_LOG_PENALTY_UPDATED
-            } else {
-                0
-            }) | (if solver_fell_back {
-                IP_LOG_LINEAR_FALLBACK
-            } else {
-                0
-            }) | (if iteration + 1 == options.max_iters {
-                SQP_LOG_ITERATION_LIMIT_REACHED
-            } else {
-                0
-            });
+            let flags = InteriorPointIterationLogFlags {
+                has_equalities: equality_count > 0,
+                has_inequalities: augmented_inequality_count > 0,
+                penalty_updated: sigma_adjusted,
+                filter_accepted: accepted_trial.filter_acceptance_mode
+                    == Some(FilterAcceptanceMode::ViolationReduction),
+                linear_fallback: solver_fell_back,
+                iteration_limit_reached: iteration + 1 == options.max_iters,
+            };
             log_interior_point_iteration(
                 &InteriorPointIterationLog {
                     iteration,
                     phase: InteriorPointIterationPhase::AcceptedStep,
                     flags,
-                    objective_value: state.objective_value,
-                    equality_inf,
-                    inequality_inf,
-                    dual_inf,
-                    complementarity_inf,
+                    objective_value: accepted_trial.objective,
+                    equality_inf: accepted_trial.equality_inf,
+                    inequality_inf: accepted_trial.inequality_inf,
+                    dual_inf: accepted_trial.dual_inf,
+                    complementarity_inf: accepted_trial.complementarity_inf,
                     barrier_parameter: if augmented_inequality_count > 0 {
-                        mu.max(options.mu_min)
+                        accepted_trial.mu.max(options.mu_min)
                     } else {
                         0.0
                     },
@@ -2264,6 +2369,9 @@ where
         if line_search_iterations >= 4 {
             events.push(InteriorPointIterationEvent::LongLineSearch);
         }
+        if accepted_trial.filter_acceptance_mode == Some(FilterAcceptanceMode::ViolationReduction) {
+            events.push(InteriorPointIterationEvent::FilterAccepted);
+        }
         if solver_fell_back {
             events.push(InteriorPointIterationEvent::LinearSolverFallback);
         }
@@ -2276,20 +2384,33 @@ where
         let iteration_preprocess = iteration_total.saturating_sub(
             iteration_callback_time + iteration_kkt_assembly_time + iteration_linear_solve_time,
         );
+        if options.filter_method {
+            super::filter::update_frontier(
+                &mut filter_entries,
+                accepted_trial.filter_entry.clone(),
+            );
+        }
         callback(&InteriorPointIterationSnapshot {
             iteration,
             phase: InteriorPointIterationPhase::AcceptedStep,
-            x: x.clone(),
-            objective: state.objective_value,
-            eq_inf: (equality_count > 0).then_some(equality_inf),
-            ineq_inf: (augmented_inequality_count > 0).then_some(inequality_inf),
-            dual_inf,
-            comp_inf: (augmented_inequality_count > 0).then_some(complementarity_inf),
-            barrier_parameter: (augmented_inequality_count > 0).then_some(mu.max(options.mu_min)),
+            x: accepted_trial.x.clone(),
+            objective: accepted_trial.objective,
+            eq_inf: (equality_count > 0).then_some(accepted_trial.equality_inf),
+            ineq_inf: (augmented_inequality_count > 0).then_some(accepted_trial.inequality_inf),
+            dual_inf: accepted_trial.dual_inf,
+            comp_inf: (augmented_inequality_count > 0)
+                .then_some(accepted_trial.complementarity_inf),
+            barrier_parameter: (augmented_inequality_count > 0)
+                .then_some(accepted_trial.mu.max(options.mu_min)),
             alpha: Some(alpha),
             line_search_iterations: Some(line_search_iterations),
             linear_solver: direction.solver_used,
             linear_solve_time: Some(iteration_linear_solve_time),
+            filter: options.filter_method.then(|| FilterInfo {
+                current: accepted_trial.filter_entry.clone(),
+                entries: filter_entries.clone(),
+                accepted_mode: accepted_trial.filter_acceptance_mode,
+            }),
             timing: InteriorPointIterationTiming {
                 adapter_timing,
                 callback: iteration_callback_time,
@@ -2305,10 +2426,10 @@ where
         profiling.preprocessing_time += iteration_started.elapsed().saturating_sub(
             iteration_callback_time + iteration_kkt_assembly_time + iteration_linear_solve_time,
         );
-        x = trial_x;
-        lambda_eq = trial_lambda;
-        slack = trial_slack;
-        z = trial_z;
+        x = accepted_trial.x;
+        lambda_eq = accepted_trial.lambda;
+        slack = accepted_trial.slack;
+        z = accepted_trial.z;
         let (nonlinear, _, _) =
             split_augmented_inequality_multipliers(&z, inequality_count, lower_bound_count);
         nonlinear_inequality_multipliers = nonlinear;

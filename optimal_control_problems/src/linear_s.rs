@@ -1136,6 +1136,7 @@ mod tests {
                     optimization::LlvmOptimizationLevel::O0,
                 ),
                 symbolic_functions: optimal_control::OcpSymbolicFunctionOptions::default(),
+                hessian_strategy: sx_core::HessianStrategy::LowerTriangleByColumn,
             })
             .expect("compile should succeed");
         println!(

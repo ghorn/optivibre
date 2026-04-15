@@ -321,8 +321,16 @@ fn hessian_coloring_does_not_alias_upper_triangle_columns() {
     assert_abs_diff_eq!(eval(reference.get(2, 1), &values), 1.0, epsilon = 1e-12);
     assert_abs_diff_eq!(eval(colored.get(1, 0), &values), 1.0, epsilon = 1e-12);
     assert_abs_diff_eq!(eval(colored.get(2, 1), &values), 1.0, epsilon = 1e-12);
-    assert_abs_diff_eq!(eval(selected_outputs.get(1, 0), &values), 1.0, epsilon = 1e-12);
-    assert_abs_diff_eq!(eval(selected_outputs.get(2, 1), &values), 1.0, epsilon = 1e-12);
+    assert_abs_diff_eq!(
+        eval(selected_outputs.get(1, 0), &values),
+        1.0,
+        epsilon = 1e-12
+    );
+    assert_abs_diff_eq!(
+        eval(selected_outputs.get(2, 1), &values),
+        1.0,
+        epsilon = 1e-12
+    );
 }
 
 #[rstest]

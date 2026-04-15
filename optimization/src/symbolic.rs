@@ -79,6 +79,33 @@ pub struct TypedCompiledJitNlp<X, P, E, I> {
     _marker: TypedMarker<X, P, E, I>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SymbolicNlpCompileOptions {
+    pub function_options: FunctionCompileOptions,
+    pub hessian_strategy: HessianStrategy,
+}
+
+impl Default for SymbolicNlpCompileOptions {
+    fn default() -> Self {
+        Self::from(FunctionCompileOptions::from(LlvmOptimizationLevel::O3))
+    }
+}
+
+impl From<FunctionCompileOptions> for SymbolicNlpCompileOptions {
+    fn from(function_options: FunctionCompileOptions) -> Self {
+        Self {
+            function_options,
+            hessian_strategy: HessianStrategy::LowerTriangleByColumn,
+        }
+    }
+}
+
+impl From<LlvmOptimizationLevel> for SymbolicNlpCompileOptions {
+    fn from(opt_level: LlvmOptimizationLevel) -> Self {
+        Self::from(FunctionCompileOptions::from(opt_level))
+    }
+}
+
 impl<X, P, E, I> TypedCompiledJitNlp<X, P, E, I> {
     #[doc(hidden)]
     pub fn backend_compile_report_untyped(&self) -> &BackendCompileReport {
@@ -316,7 +343,7 @@ where
         &self,
         options: FunctionCompileOptions,
     ) -> Result<TypedCompiledJitNlp<X, P, E, I>, SymbolicNlpCompileError> {
-        self.compile_jit_with_options_and_symbolic_progress_callback(options, |_| {})
+        self.compile_jit_with_compile_options(SymbolicNlpCompileOptions::from(options))
     }
 
     pub fn compile_jit_with_opt_level_and_symbolic_callback<CB>(
@@ -345,7 +372,32 @@ where
     where
         CB: FnMut(SymbolicCompileMetadata),
     {
-        self.compile_jit_with_options_and_symbolic_progress_callback(options, |progress| {
+        self.compile_jit_with_compile_options_and_symbolic_progress_callback(
+            SymbolicNlpCompileOptions::from(options),
+            |progress| {
+                if let SymbolicCompileProgress::Ready(metadata) = progress {
+                    on_symbolic_ready(metadata);
+                }
+            },
+        )
+    }
+
+    pub fn compile_jit_with_compile_options(
+        &self,
+        options: SymbolicNlpCompileOptions,
+    ) -> Result<TypedCompiledJitNlp<X, P, E, I>, SymbolicNlpCompileError> {
+        self.compile_jit_with_compile_options_and_symbolic_progress_callback(options, |_| {})
+    }
+
+    pub fn compile_jit_with_compile_options_and_symbolic_callback<CB>(
+        &self,
+        options: SymbolicNlpCompileOptions,
+        mut on_symbolic_ready: CB,
+    ) -> Result<TypedCompiledJitNlp<X, P, E, I>, SymbolicNlpCompileError>
+    where
+        CB: FnMut(SymbolicCompileMetadata),
+    {
+        self.compile_jit_with_compile_options_and_symbolic_progress_callback(options, |progress| {
             if let SymbolicCompileProgress::Ready(metadata) = progress {
                 on_symbolic_ready(metadata);
             }
@@ -355,6 +407,20 @@ where
     pub fn compile_jit_with_options_and_symbolic_progress_callback<CB>(
         &self,
         options: FunctionCompileOptions,
+        on_symbolic_progress: CB,
+    ) -> Result<TypedCompiledJitNlp<X, P, E, I>, SymbolicNlpCompileError>
+    where
+        CB: FnMut(SymbolicCompileProgress),
+    {
+        self.compile_jit_with_compile_options_and_symbolic_progress_callback(
+            SymbolicNlpCompileOptions::from(options),
+            on_symbolic_progress,
+        )
+    }
+
+    pub fn compile_jit_with_compile_options_and_symbolic_progress_callback<CB>(
+        &self,
+        options: SymbolicNlpCompileOptions,
         on_symbolic_progress: CB,
     ) -> Result<TypedCompiledJitNlp<X, P, E, I>, SymbolicNlpCompileError>
     where
@@ -438,7 +504,7 @@ impl CompiledJitNlp {
 
     fn from_symbolic(
         symbolic: &SymbolicNlp,
-        options: FunctionCompileOptions,
+        options: SymbolicNlpCompileOptions,
         mut on_symbolic_progress: impl FnMut(SymbolicCompileProgress),
     ) -> Result<Self, SymbolicNlpCompileError> {
         let derivative_started = Instant::now();
@@ -469,7 +535,11 @@ impl CompiledJitNlp {
             },
             symbolic_compile_stats(symbolic, 0, 0, 0, 0),
         );
-        let functions = derive_symbolic_functions(symbolic, &mut emit_symbolic_stage)?;
+        let functions = derive_symbolic_functions(
+            symbolic,
+            options.hessian_strategy,
+            &mut emit_symbolic_stage,
+        )?;
         let derivative_generation_time = derivative_started.elapsed();
         let timing = BackendTimingMetadata {
             function_creation_time: symbolic.construction_time,
@@ -483,31 +553,36 @@ impl CompiledJitNlp {
         }));
 
         let jit_started = Instant::now();
-        let objective_value = JitKernel::compile_with_options(&functions.objective_value, options)?;
-        let objective_gradient =
-            JitKernel::compile_with_options(&functions.objective_gradient, options)?;
+        let objective_value =
+            JitKernel::compile_with_options(&functions.objective_value, options.function_options)?;
+        let objective_gradient = JitKernel::compile_with_options(
+            &functions.objective_gradient,
+            options.function_options,
+        )?;
         let equality_values = functions
             .equality_values
             .as_ref()
-            .map(|function| JitKernel::compile_with_options(function, options))
+            .map(|function| JitKernel::compile_with_options(function, options.function_options))
             .transpose()?;
         let equality_jacobian_values = functions
             .equality_jacobian_values
             .as_ref()
-            .map(|function| JitKernel::compile_with_options(function, options))
+            .map(|function| JitKernel::compile_with_options(function, options.function_options))
             .transpose()?;
         let inequality_values = functions
             .inequality_values
             .as_ref()
-            .map(|function| JitKernel::compile_with_options(function, options))
+            .map(|function| JitKernel::compile_with_options(function, options.function_options))
             .transpose()?;
         let inequality_jacobian_values = functions
             .inequality_jacobian_values
             .as_ref()
-            .map(|function| JitKernel::compile_with_options(function, options))
+            .map(|function| JitKernel::compile_with_options(function, options.function_options))
             .transpose()?;
-        let lagrangian_hessian_values =
-            JitKernel::compile_with_options(&functions.lagrangian_hessian_values, options)?;
+        let lagrangian_hessian_values = JitKernel::compile_with_options(
+            &functions.lagrangian_hessian_values,
+            options.function_options,
+        )?;
         let jit_time = jit_started.elapsed();
         let mut backend_compile_report = BackendCompileReport {
             timing: BackendTimingMetadata {
@@ -1311,7 +1386,7 @@ pub fn rank_nlp_constraint_violations(
 
 fn compile_symbolic_nlp_with_symbolic_progress_callback(
     symbolic: &SymbolicNlp,
-    options: FunctionCompileOptions,
+    options: SymbolicNlpCompileOptions,
     on_symbolic_progress: impl FnMut(SymbolicCompileProgress),
 ) -> Result<CompiledJitNlp, SymbolicNlpCompileError> {
     CompiledJitNlp::from_symbolic(symbolic, options, on_symbolic_progress)
@@ -1807,6 +1882,7 @@ fn derived_symbolic_compile_stats(
 
 fn derive_symbolic_functions(
     symbolic: &SymbolicNlp,
+    hessian_strategy: HessianStrategy,
     on_symbolic_stage: &mut dyn FnMut(SymbolicCompileStage, &SymbolicSetupProfile, NlpCompileStats),
 ) -> Result<DerivedSymbolicFunctions, SymbolicNlpCompileError> {
     let base_inputs = symbolic_inputs(&symbolic.variables, &symbolic.parameters)?;
@@ -1958,7 +2034,7 @@ fn derive_symbolic_functions(
     );
     let hessian_started = Instant::now();
     let lagrangian_hessian = SXMatrix::scalar(lagrangian)
-        .hessian_with_strategy(&symbolic.variables, HessianStrategy::LowerTriangleByColumn)?;
+        .hessian_with_strategy(&symbolic.variables, hessian_strategy)?;
     setup_profile.hessian_generation = Some(hessian_started.elapsed());
     let lagrangian_hessian_values = SXFunction::new(
         format!("{}_lagrangian_hessian", symbolic.name),

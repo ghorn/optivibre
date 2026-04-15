@@ -1521,6 +1521,7 @@ mod tests {
                     optimization::LlvmOptimizationLevel::O0,
                 ),
                 symbolic_functions: optimal_control::OcpSymbolicFunctionOptions::inline_all(),
+                hessian_strategy: sx_core::HessianStrategy::LowerTriangleByColumn,
             })
             .expect("compile should succeed");
         let lowered = compiled.debug_lagrangian_hessian_lowered();
@@ -1641,6 +1642,7 @@ mod tests {
                     optimization::LlvmOptimizationLevel::O0,
                 ),
                 symbolic_functions: optimal_control::OcpSymbolicFunctionOptions::default(),
+                hessian_strategy: sx_core::HessianStrategy::LowerTriangleByColumn,
             })
             .expect("compile should succeed");
         println!(
@@ -1661,6 +1663,7 @@ mod tests {
                     optimization::LlvmOptimizationLevel::O0,
                 ),
                 symbolic_functions: optimal_control::OcpSymbolicFunctionOptions::inline_all(),
+                hessian_strategy: sx_core::HessianStrategy::LowerTriangleByColumn,
             })
             .expect("compile should succeed");
         let lowered = compiled.debug_lagrangian_hessian_lowered();
@@ -1721,6 +1724,7 @@ mod tests {
                     optimization::LlvmOptimizationLevel::O0,
                 ),
                 symbolic_functions: optimal_control::OcpSymbolicFunctionOptions::inline_all(),
+                hessian_strategy: sx_core::HessianStrategy::LowerTriangleByColumn,
             })
             .expect("compile should succeed");
         let lowered = compiled.debug_lagrangian_hessian_lowered();
@@ -1773,6 +1777,7 @@ mod tests {
             .compile_jit_with_ocp_options(optimal_control::OcpCompileOptions {
                 function_options: optimization::FunctionCompileOptions::from(opt_level),
                 symbolic_functions: optimal_control::OcpSymbolicFunctionOptions::inline_all(),
+                hessian_strategy: sx_core::HessianStrategy::LowerTriangleByColumn,
             })
             .expect("compile should succeed");
         let lowered = compiled.debug_lagrangian_hessian_lowered();

@@ -7,10 +7,10 @@ use optimization::{
     NlpCompileStats, NlpDerivativeValidationReport, NlpEvaluationBenchmark,
     NlpEvaluationBenchmarkOptions, NlpEvaluationKernelKind, ScalarLeaf, SqpIterationSnapshot,
     SymbolicCompileMetadata, SymbolicCompileProgress, SymbolicCompileStageProgress,
-    SymbolicNlpBuildError, SymbolicNlpCompileError, SymbolicNlpOutputs, TypedCompiledJitNlp,
-    TypedRuntimeNlpBounds, Vectorize, VectorizeLayoutError, classify_constraint_satisfaction,
-    constraint_bound_side, flatten_value, symbolic_column, symbolic_nlp, symbolic_value,
-    unflatten_value, worst_bound_violation,
+    SymbolicNlpBuildError, SymbolicNlpCompileError, SymbolicNlpCompileOptions, SymbolicNlpOutputs,
+    TypedCompiledJitNlp, TypedRuntimeNlpBounds, Vectorize, VectorizeLayoutError,
+    classify_constraint_satisfaction, constraint_bound_side, flatten_value, symbolic_column,
+    symbolic_nlp, symbolic_value, unflatten_value, worst_bound_violation,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptIterationSnapshot, IpoptOptions, IpoptSolveError, IpoptSummary};
@@ -19,7 +19,7 @@ use std::marker::PhantomData;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use sx_codegen_llvm::{CompiledJitFunction, JitExecutionContext};
-use sx_core::{NamedMatrix, NodeView, SX, SXFunction, SXMatrix, SxError};
+use sx_core::{HessianStrategy, NamedMatrix, NodeView, SX, SXFunction, SXMatrix, SxError};
 use thiserror::Error;
 
 const NLP_BOUND_INF: f64 = 1e20;
@@ -338,6 +338,7 @@ pub struct MultipleShootingSqpSolveResult<X, U, const N: usize> {
     pub trajectories: MultipleShootingTrajectories<X, U, N>,
     pub time_grid: MultipleShootingTimeGrid<N>,
     pub solver: ClarabelSqpSummary,
+    pub setup_timing: OcpSolveSetupTiming,
 }
 
 #[derive(Clone, Debug)]
@@ -345,6 +346,7 @@ pub struct DirectCollocationSqpSolveResult<X, U, const N: usize, const K: usize>
     pub trajectories: DirectCollocationTrajectories<X, U, N, K>,
     pub time_grid: DirectCollocationTimeGrid<N, K>,
     pub solver: ClarabelSqpSummary,
+    pub setup_timing: OcpSolveSetupTiming,
 }
 
 #[derive(Clone, Debug)]
@@ -352,6 +354,7 @@ pub struct MultipleShootingInteriorPointSolveResult<X, U, const N: usize> {
     pub trajectories: MultipleShootingTrajectories<X, U, N>,
     pub time_grid: MultipleShootingTimeGrid<N>,
     pub solver: InteriorPointSummary,
+    pub setup_timing: OcpSolveSetupTiming,
 }
 
 #[derive(Clone, Debug)]
@@ -359,6 +362,7 @@ pub struct DirectCollocationInteriorPointSolveResult<X, U, const N: usize, const
     pub trajectories: DirectCollocationTrajectories<X, U, N, K>,
     pub time_grid: DirectCollocationTimeGrid<N, K>,
     pub solver: InteriorPointSummary,
+    pub setup_timing: OcpSolveSetupTiming,
 }
 
 #[cfg(feature = "ipopt")]
@@ -367,6 +371,7 @@ pub struct MultipleShootingIpoptSolveResult<X, U, const N: usize> {
     pub trajectories: MultipleShootingTrajectories<X, U, N>,
     pub time_grid: MultipleShootingTimeGrid<N>,
     pub solver: IpoptSummary,
+    pub setup_timing: OcpSolveSetupTiming,
 }
 
 #[cfg(feature = "ipopt")]
@@ -383,6 +388,13 @@ pub struct DirectCollocationIpoptSolveResult<X, U, const N: usize, const K: usiz
     pub trajectories: DirectCollocationTrajectories<X, U, N, K>,
     pub time_grid: DirectCollocationTimeGrid<N, K>,
     pub solver: IpoptSummary,
+    pub setup_timing: OcpSolveSetupTiming,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OcpSolveSetupTiming {
+    pub initial_guess: Duration,
+    pub runtime_bounds: Duration,
 }
 
 #[cfg(feature = "ipopt")]
@@ -606,6 +618,7 @@ impl Default for OcpSymbolicFunctionOptions {
 pub struct OcpCompileOptions {
     pub function_options: FunctionCompileOptions,
     pub symbolic_functions: OcpSymbolicFunctionOptions,
+    pub hessian_strategy: HessianStrategy,
 }
 
 impl Default for OcpCompileOptions {
@@ -619,6 +632,7 @@ impl OcpCompileOptions {
         Self {
             function_options,
             symbolic_functions: OcpSymbolicFunctionOptions::multiple_shooting_default(),
+            hessian_strategy: HessianStrategy::LowerTriangleByColumn,
         }
     }
 
@@ -626,6 +640,7 @@ impl OcpCompileOptions {
         Self {
             function_options,
             symbolic_functions: OcpSymbolicFunctionOptions::direct_collocation_default(),
+            hessian_strategy: HessianStrategy::LowerTriangleByColumn,
         }
     }
 }
@@ -635,6 +650,7 @@ impl From<FunctionCompileOptions> for OcpCompileOptions {
         Self {
             function_options,
             symbolic_functions: OcpSymbolicFunctionOptions::default(),
+            hessian_strategy: HessianStrategy::LowerTriangleByColumn,
         }
     }
 }
@@ -1721,8 +1737,11 @@ where
             self.transcribe_multiple_shooting(vars, params, &symbolic_library_for_nlp)
                 .expect("multiple shooting transcription should be infallible after validation")
         })?;
-        let compiled = symbolic.compile_jit_with_options_and_symbolic_progress_callback(
-            options.function_options,
+        let compiled = symbolic.compile_jit_with_compile_options_and_symbolic_progress_callback(
+            SymbolicNlpCompileOptions {
+                function_options: options.function_options,
+                hessian_strategy: options.hessian_strategy,
+            },
             |progress| match progress {
                 SymbolicCompileProgress::Stage(progress) => {
                     on_progress(OcpCompileProgress::SymbolicStage(progress));
@@ -2363,8 +2382,11 @@ where
             )
             .expect("direct collocation transcription should be infallible after validation")
         })?;
-        let compiled = symbolic.compile_jit_with_options_and_symbolic_progress_callback(
-            options.function_options,
+        let compiled = symbolic.compile_jit_with_compile_options_and_symbolic_progress_callback(
+            SymbolicNlpCompileOptions {
+                function_options: options.function_options,
+                hessian_strategy: options.hessian_strategy,
+            },
             |progress| match progress {
                 SymbolicCompileProgress::Stage(progress) => {
                     on_progress(OcpCompileProgress::SymbolicStage(progress));
@@ -2814,12 +2836,20 @@ where
         >,
         options: &ClarabelSqpOptions,
     ) -> Result<MultipleShootingSqpSolveResult<Numeric<X>, Numeric<U>, N>, ClarabelSqpError> {
+        let initial_guess_started = Instant::now();
         let x0 = self
             .build_initial_guess(values)
             .map_err(|err| ClarabelSqpError::InvalidInput(err.to_string()))?;
+        let initial_guess_time = initial_guess_started.elapsed();
+        let runtime_bounds_started = Instant::now();
         let bounds = self
             .build_runtime_bounds(values)
             .map_err(|err| ClarabelSqpError::InvalidInput(err.to_string()))?;
+        let runtime_bounds_time = runtime_bounds_started.elapsed();
+        let setup_timing = OcpSolveSetupTiming {
+            initial_guess: initial_guess_time,
+            runtime_bounds: runtime_bounds_time,
+        };
         let runtime_params: OcpParametersNum<P, Beq> =
             (values.parameters.clone(), values.beq.clone());
         let summary = self
@@ -2834,6 +2864,7 @@ where
             trajectories,
             time_grid,
             solver: summary,
+            setup_timing,
         })
     }
 
@@ -2854,12 +2885,20 @@ where
     where
         CB: FnMut(&MultipleShootingSqpSnapshot<Numeric<X>, Numeric<U>, N>),
     {
+        let initial_guess_started = Instant::now();
         let x0 = self
             .build_initial_guess(values)
             .map_err(|err| ClarabelSqpError::InvalidInput(err.to_string()))?;
+        let initial_guess_time = initial_guess_started.elapsed();
+        let runtime_bounds_started = Instant::now();
         let bounds = self
             .build_runtime_bounds(values)
             .map_err(|err| ClarabelSqpError::InvalidInput(err.to_string()))?;
+        let runtime_bounds_time = runtime_bounds_started.elapsed();
+        let setup_timing = OcpSolveSetupTiming {
+            initial_guess: initial_guess_time,
+            runtime_bounds: runtime_bounds_time,
+        };
         let runtime_params: OcpParametersNum<P, Beq> =
             (values.parameters.clone(), values.beq.clone());
         let summary = self.compiled.solve_sqp_with_callback(
@@ -2888,6 +2927,7 @@ where
             trajectories,
             time_grid,
             solver: summary,
+            setup_timing,
         })
     }
 
@@ -2907,12 +2947,20 @@ where
         MultipleShootingInteriorPointSolveResult<Numeric<X>, Numeric<U>, N>,
         InteriorPointSolveError,
     > {
+        let initial_guess_started = Instant::now();
         let x0 = self
             .build_initial_guess(values)
             .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
+        let initial_guess_time = initial_guess_started.elapsed();
+        let runtime_bounds_started = Instant::now();
         let bounds = self
             .build_runtime_bounds(values)
             .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
+        let runtime_bounds_time = runtime_bounds_started.elapsed();
+        let setup_timing = OcpSolveSetupTiming {
+            initial_guess: initial_guess_time,
+            runtime_bounds: runtime_bounds_time,
+        };
         let runtime_params: OcpParametersNum<P, Beq> =
             (values.parameters.clone(), values.beq.clone());
         let summary = self
@@ -2927,6 +2975,7 @@ where
             trajectories,
             time_grid,
             solver: summary,
+            setup_timing,
         })
     }
 
@@ -2950,12 +2999,20 @@ where
     where
         CB: FnMut(&MultipleShootingInteriorPointSnapshot<Numeric<X>, Numeric<U>, N>),
     {
+        let initial_guess_started = Instant::now();
         let x0 = self
             .build_initial_guess(values)
             .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
+        let initial_guess_time = initial_guess_started.elapsed();
+        let runtime_bounds_started = Instant::now();
         let bounds = self
             .build_runtime_bounds(values)
             .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
+        let runtime_bounds_time = runtime_bounds_started.elapsed();
+        let setup_timing = OcpSolveSetupTiming {
+            initial_guess: initial_guess_time,
+            runtime_bounds: runtime_bounds_time,
+        };
         let runtime_params: OcpParametersNum<P, Beq> =
             (values.parameters.clone(), values.beq.clone());
         let summary = self.compiled.solve_interior_point_with_callback(
@@ -2984,6 +3041,7 @@ where
             trajectories,
             time_grid,
             solver: summary,
+            setup_timing,
         })
     }
 
@@ -3001,12 +3059,20 @@ where
         >,
         options: &IpoptOptions,
     ) -> Result<MultipleShootingIpoptSolveResult<Numeric<X>, Numeric<U>, N>, IpoptSolveError> {
+        let initial_guess_started = Instant::now();
         let x0 = self
             .build_initial_guess(values)
             .map_err(|err| IpoptSolveError::InvalidInput(err.to_string()))?;
+        let initial_guess_time = initial_guess_started.elapsed();
+        let runtime_bounds_started = Instant::now();
         let bounds = self
             .build_runtime_bounds(values)
             .map_err(|err| IpoptSolveError::InvalidInput(err.to_string()))?;
+        let runtime_bounds_time = runtime_bounds_started.elapsed();
+        let setup_timing = OcpSolveSetupTiming {
+            initial_guess: initial_guess_time,
+            runtime_bounds: runtime_bounds_time,
+        };
         let runtime_params: OcpParametersNum<P, Beq> =
             (values.parameters.clone(), values.beq.clone());
         let summary = self
@@ -3021,6 +3087,7 @@ where
             trajectories,
             time_grid,
             solver: summary,
+            setup_timing,
         })
     }
 
@@ -3042,12 +3109,20 @@ where
     where
         CB: FnMut(&MultipleShootingIpoptSnapshot<Numeric<X>, Numeric<U>, N>),
     {
+        let initial_guess_started = Instant::now();
         let x0 = self
             .build_initial_guess(values)
             .map_err(|err| IpoptSolveError::InvalidInput(err.to_string()))?;
+        let initial_guess_time = initial_guess_started.elapsed();
+        let runtime_bounds_started = Instant::now();
         let bounds = self
             .build_runtime_bounds(values)
             .map_err(|err| IpoptSolveError::InvalidInput(err.to_string()))?;
+        let runtime_bounds_time = runtime_bounds_started.elapsed();
+        let setup_timing = OcpSolveSetupTiming {
+            initial_guess: initial_guess_time,
+            runtime_bounds: runtime_bounds_time,
+        };
         let runtime_params: OcpParametersNum<P, Beq> =
             (values.parameters.clone(), values.beq.clone());
         let summary = self.compiled.solve_ipopt_with_callback(
@@ -3076,6 +3151,7 @@ where
             trajectories,
             time_grid,
             solver: summary,
+            setup_timing,
         })
     }
 
@@ -3504,12 +3580,20 @@ where
         options: &ClarabelSqpOptions,
     ) -> Result<DirectCollocationSqpSolveResult<Numeric<X>, Numeric<U>, N, K>, ClarabelSqpError>
     {
+        let initial_guess_started = Instant::now();
         let x0 = self
             .build_initial_guess(values)
             .map_err(|err| ClarabelSqpError::InvalidInput(err.to_string()))?;
+        let initial_guess_time = initial_guess_started.elapsed();
+        let runtime_bounds_started = Instant::now();
         let bounds = self
             .build_runtime_bounds(values)
             .map_err(|err| ClarabelSqpError::InvalidInput(err.to_string()))?;
+        let runtime_bounds_time = runtime_bounds_started.elapsed();
+        let setup_timing = OcpSolveSetupTiming {
+            initial_guess: initial_guess_time,
+            runtime_bounds: runtime_bounds_time,
+        };
         let runtime_params: OcpParametersNum<P, Beq> =
             (values.parameters.clone(), values.beq.clone());
         let summary = self
@@ -3522,6 +3606,7 @@ where
             trajectories,
             time_grid,
             solver: summary,
+            setup_timing,
         })
     }
 
@@ -3543,12 +3628,20 @@ where
     where
         CB: FnMut(&DirectCollocationSqpSnapshot<Numeric<X>, Numeric<U>, N, K>),
     {
+        let initial_guess_started = Instant::now();
         let x0 = self
             .build_initial_guess(values)
             .map_err(|err| ClarabelSqpError::InvalidInput(err.to_string()))?;
+        let initial_guess_time = initial_guess_started.elapsed();
+        let runtime_bounds_started = Instant::now();
         let bounds = self
             .build_runtime_bounds(values)
             .map_err(|err| ClarabelSqpError::InvalidInput(err.to_string()))?;
+        let runtime_bounds_time = runtime_bounds_started.elapsed();
+        let setup_timing = OcpSolveSetupTiming {
+            initial_guess: initial_guess_time,
+            runtime_bounds: runtime_bounds_time,
+        };
         let runtime_params: OcpParametersNum<P, Beq> =
             (values.parameters.clone(), values.beq.clone());
         let summary = self.compiled.solve_sqp_with_callback(
@@ -3576,6 +3669,7 @@ where
             trajectories,
             time_grid,
             solver: summary,
+            setup_timing,
         })
     }
 
@@ -3596,12 +3690,20 @@ where
         DirectCollocationInteriorPointSolveResult<Numeric<X>, Numeric<U>, N, K>,
         InteriorPointSolveError,
     > {
+        let initial_guess_started = Instant::now();
         let x0 = self
             .build_initial_guess(values)
             .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
+        let initial_guess_time = initial_guess_started.elapsed();
+        let runtime_bounds_started = Instant::now();
         let bounds = self
             .build_runtime_bounds(values)
             .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
+        let runtime_bounds_time = runtime_bounds_started.elapsed();
+        let setup_timing = OcpSolveSetupTiming {
+            initial_guess: initial_guess_time,
+            runtime_bounds: runtime_bounds_time,
+        };
         let runtime_params: OcpParametersNum<P, Beq> =
             (values.parameters.clone(), values.beq.clone());
         let summary = self
@@ -3614,6 +3716,7 @@ where
             trajectories,
             time_grid,
             solver: summary,
+            setup_timing,
         })
     }
 
@@ -3638,12 +3741,20 @@ where
     where
         CB: FnMut(&DirectCollocationInteriorPointSnapshot<Numeric<X>, Numeric<U>, N, K>),
     {
+        let initial_guess_started = Instant::now();
         let x0 = self
             .build_initial_guess(values)
             .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
+        let initial_guess_time = initial_guess_started.elapsed();
+        let runtime_bounds_started = Instant::now();
         let bounds = self
             .build_runtime_bounds(values)
             .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
+        let runtime_bounds_time = runtime_bounds_started.elapsed();
+        let setup_timing = OcpSolveSetupTiming {
+            initial_guess: initial_guess_time,
+            runtime_bounds: runtime_bounds_time,
+        };
         let runtime_params: OcpParametersNum<P, Beq> =
             (values.parameters.clone(), values.beq.clone());
         let summary = self.compiled.solve_interior_point_with_callback(
@@ -3671,6 +3782,7 @@ where
             trajectories,
             time_grid,
             solver: summary,
+            setup_timing,
         })
     }
 
@@ -3690,12 +3802,20 @@ where
         options: &IpoptOptions,
     ) -> Result<DirectCollocationIpoptSolveResult<Numeric<X>, Numeric<U>, N, K>, IpoptSolveError>
     {
+        let initial_guess_started = Instant::now();
         let x0 = self
             .build_initial_guess(values)
             .map_err(|err| IpoptSolveError::InvalidInput(err.to_string()))?;
+        let initial_guess_time = initial_guess_started.elapsed();
+        let runtime_bounds_started = Instant::now();
         let bounds = self
             .build_runtime_bounds(values)
             .map_err(|err| IpoptSolveError::InvalidInput(err.to_string()))?;
+        let runtime_bounds_time = runtime_bounds_started.elapsed();
+        let setup_timing = OcpSolveSetupTiming {
+            initial_guess: initial_guess_time,
+            runtime_bounds: runtime_bounds_time,
+        };
         let runtime_params: OcpParametersNum<P, Beq> =
             (values.parameters.clone(), values.beq.clone());
         let summary = self
@@ -3708,6 +3828,7 @@ where
             trajectories,
             time_grid,
             solver: summary,
+            setup_timing,
         })
     }
 
@@ -3730,12 +3851,20 @@ where
     where
         CB: FnMut(&DirectCollocationIpoptSnapshot<Numeric<X>, Numeric<U>, N, K>),
     {
+        let initial_guess_started = Instant::now();
         let x0 = self
             .build_initial_guess(values)
             .map_err(|err| IpoptSolveError::InvalidInput(err.to_string()))?;
+        let initial_guess_time = initial_guess_started.elapsed();
+        let runtime_bounds_started = Instant::now();
         let bounds = self
             .build_runtime_bounds(values)
             .map_err(|err| IpoptSolveError::InvalidInput(err.to_string()))?;
+        let runtime_bounds_time = runtime_bounds_started.elapsed();
+        let setup_timing = OcpSolveSetupTiming {
+            initial_guess: initial_guess_time,
+            runtime_bounds: runtime_bounds_time,
+        };
         let runtime_params: OcpParametersNum<P, Beq> =
             (values.parameters.clone(), values.beq.clone());
         let summary = self.compiled.solve_ipopt_with_callback(
@@ -3763,6 +3892,7 @@ where
             trajectories,
             time_grid,
             solver: summary,
+            setup_timing,
         })
     }
 
@@ -5997,6 +6127,7 @@ mod tests {
             .compile_jit_with_ocp_options(OcpCompileOptions {
                 function_options: FunctionCompileOptions::from(LlvmOptimizationLevel::O0),
                 symbolic_functions: OcpSymbolicFunctionOptions::default(),
+                hessian_strategy: HessianStrategy::LowerTriangleByColumn,
             })
             .expect("compile should succeed");
         let stats = &compiled.backend_compile_report().stats;
@@ -6033,6 +6164,7 @@ mod tests {
             .compile_jit_with_ocp_options(OcpCompileOptions {
                 function_options: FunctionCompileOptions::from(LlvmOptimizationLevel::O0),
                 symbolic_functions: OcpSymbolicFunctionOptions::inline_all(),
+                hessian_strategy: HessianStrategy::LowerTriangleByColumn,
             })
             .expect("compile should succeed");
 
@@ -6046,6 +6178,7 @@ mod tests {
             .compile_jit_with_ocp_options(OcpCompileOptions {
                 function_options: FunctionCompileOptions::from(LlvmOptimizationLevel::O0),
                 symbolic_functions: OcpSymbolicFunctionOptions::default(),
+                hessian_strategy: HessianStrategy::LowerTriangleByColumn,
             })
             .expect("compile should succeed");
         let stats = &compiled.backend_compile_report().stats;
@@ -6073,6 +6206,7 @@ mod tests {
                     OcpCompileOptions {
                         function_options: FunctionCompileOptions::from(LlvmOptimizationLevel::O0),
                         symbolic_functions,
+                        hessian_strategy: HessianStrategy::LowerTriangleByColumn,
                     },
                     |progress| {
                         if let OcpCompileProgress::SymbolicReady(metadata) = progress {

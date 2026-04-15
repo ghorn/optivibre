@@ -219,6 +219,7 @@ fn skipped_record(
         compile_report: None,
         console_output: None,
         console_output_path: None,
+        filter_replay: None,
     }
 }
 

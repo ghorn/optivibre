@@ -366,21 +366,11 @@ fn sqp_reports_profiling_breakdown(
     );
     let profiling = &summary.profiling;
     let snapshot_count = summary.final_state.iteration + 1;
-    let callback_total_time = profiling.objective_value.total_time
-        + profiling.objective_gradient.total_time
-        + profiling.equality_values.total_time
-        + profiling.inequality_values.total_time
-        + profiling.equality_jacobian_values.total_time
-        + profiling.inequality_jacobian_values.total_time
-        + profiling.lagrangian_hessian_values.total_time;
-    let accounted_without_unaccounted = callback_total_time
-        + profiling.qp_setup_time
-        + profiling.qp_solve_time
-        + profiling.multiplier_estimation_time
-        + profiling.line_search_evaluation_time
-        + profiling.line_search_condition_check_time
-        + profiling.convergence_check_time
-        + profiling.preprocessing_time;
+    let accounted_without_unaccounted = profiling.evaluation_time
+        + profiling.preprocessing_time
+        + profiling.subproblem_solve_time
+        + profiling.line_search_time
+        + profiling.convergence_time;
 
     assert!(profiling.objective_value.calls >= snapshot_count);
     assert_eq!(profiling.objective_gradient.calls, snapshot_count);
@@ -392,9 +382,12 @@ fn sqp_reports_profiling_breakdown(
         profiling.qp_setups
     );
     assert!(profiling.multiplier_estimation_time >= Duration::ZERO);
+    assert!(profiling.subproblem_solve_time >= Duration::ZERO);
     assert!(profiling.line_search_evaluation_time >= Duration::ZERO);
     assert!(profiling.line_search_condition_check_time >= Duration::ZERO);
+    assert!(profiling.line_search_time >= Duration::ZERO);
     assert!(profiling.convergence_check_time >= Duration::ZERO);
+    assert!(profiling.convergence_time >= Duration::ZERO);
     assert!(profiling.qp_setups <= snapshot_count);
     assert!(profiling.qp_setups + 1 >= snapshot_count);
     assert_eq!(

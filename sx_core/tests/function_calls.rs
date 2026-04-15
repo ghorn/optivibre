@@ -21,7 +21,14 @@ fn eval_scalar(expr: SX, symbols: &[SX], point: &[f64]) -> f64 {
     eval(expr, &vars)
 }
 
-fn central_hessian_entry(expr: SX, symbols: &[SX], point: &[f64], row: usize, col: usize, eps: f64) -> f64 {
+fn central_hessian_entry(
+    expr: SX,
+    symbols: &[SX],
+    point: &[f64],
+    row: usize,
+    col: usize,
+    eps: f64,
+) -> f64 {
     let mut shifted = point.to_vec();
     if row == col {
         shifted[row] = point[row] + eps;
@@ -325,9 +332,8 @@ fn preserved_call_hessian_matches_central_difference_for_nested_helpers() {
     let inner_called = inner
         .call_output(&[w.clone()])
         .expect("inner call should build");
-    let outer_scalar = SXMatrix::scalar(
-        inner_called.nz(0) * w.nz(0) + inner_called.nz(1).sin() + w.nz(1).sqr(),
-    );
+    let outer_scalar =
+        SXMatrix::scalar(inner_called.nz(0) * w.nz(0) + inner_called.nz(1).sin() + w.nz(1).sqr());
     let outer = SXFunction::new(
         "nested_outer_hessian",
         vec![named("w", w.clone())],
@@ -337,11 +343,9 @@ fn preserved_call_hessian_matches_central_difference_for_nested_helpers() {
     .with_call_policy_override(CallPolicy::NoInlineLLVM);
 
     let x = SXMatrix::sym_dense("x", 3, 1).expect("root input should build");
-    let outer_input = SXMatrix::dense_column(vec![
-        x.nz(0) + x.nz(2),
-        x.nz(1) * x.nz(2) + x.nz(0).sin(),
-    ])
-    .expect("outer call input should build");
+    let outer_input =
+        SXMatrix::dense_column(vec![x.nz(0) + x.nz(2), x.nz(1) * x.nz(2) + x.nz(0).sin()])
+            .expect("outer call input should build");
     let scalar = SXMatrix::scalar(
         outer
             .call_output(&[outer_input])
@@ -369,7 +373,8 @@ fn preserved_call_hessian_matches_central_difference_for_nested_helpers() {
         for row in col..3 {
             let analytic_default = eval(default_hessian.get(row, col), &vars);
             let analytic_by_column = eval(by_column.get(row, col), &vars);
-            let finite_difference = central_hessian_entry(scalar.nz(0), &symbols, &point, row, col, eps);
+            let finite_difference =
+                central_hessian_entry(scalar.nz(0), &symbols, &point, row, col, eps);
 
             assert!(
                 (analytic_default - analytic_by_column).abs() <= 1.0e-10,

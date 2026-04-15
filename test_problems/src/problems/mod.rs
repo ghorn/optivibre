@@ -15,9 +15,9 @@ use std::time::Instant;
 
 use optimization::{
     ClarabelSqpError, ClarabelSqpOptions, ClarabelSqpSummary, CompiledNlpProblem,
-    InteriorPointIterationSnapshot, InteriorPointOptions, InteriorPointSolveError,
-    InteriorPointSummary, SqpIterationSnapshot, SymbolicNlpOutputs, TypedCompiledJitNlp,
-    TypedRuntimeNlpBounds, Vectorize,
+    FilterAcceptanceMode, InteriorPointIterationSnapshot, InteriorPointOptions,
+    InteriorPointSolveError, InteriorPointSummary, SqpIterationSnapshot, SymbolicNlpOutputs,
+    TypedCompiledJitNlp, TypedRuntimeNlpBounds, Vectorize,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptOptions, IpoptRawStatus, IpoptSolveError, IpoptSummary};
@@ -25,9 +25,10 @@ use sx_core::SX;
 
 use crate::manifest::KnownStatus;
 use crate::model::{
-    CompileReportSummary, CompileStatsSummary, ProblemCase, ProblemDescriptor, ProblemRunOptions,
-    ProblemRunRecord, RunStatus, SetupProfileBreakdown, SolverKind, SolverMetrics,
-    SolverTimingBreakdown, ValidationOutcome, ValidationTier,
+    CompileReportSummary, CompileStatsSummary, FilterReplay, FilterReplayFrame, FilterReplayPoint,
+    ProblemCase, ProblemDescriptor, ProblemRunOptions, ProblemRunRecord, RunStatus,
+    SetupProfileBreakdown, SolverKind, SolverMetrics, SolverTimingBreakdown, ValidationOutcome,
+    ValidationTier,
 };
 
 const STRICT_TERMINATION_TOL: f64 = 1e-9;
@@ -244,6 +245,7 @@ where
             compile_report: None,
             console_output: None,
             console_output_path: None,
+            filter_replay: None,
         },
     }
 }
@@ -316,6 +318,7 @@ where
                 compile_report: compile_report.clone(),
                 console_output: None,
                 console_output_path: None,
+                filter_replay: None,
             };
         }
     };
@@ -368,6 +371,7 @@ where
                         compile_report: compile_report.clone(),
                         console_output: None,
                         console_output_path: None,
+                        filter_replay: None,
                     };
                     record.validation = validate(&record);
                     if !record.validation.passed() {
@@ -381,6 +385,7 @@ where
                         Some(&summary),
                         None,
                     ));
+                    record.filter_replay = sqp_filter_replay_from_snapshots(&snapshots);
                     record
                 }
                 Err(err) => {
@@ -410,10 +415,12 @@ where
                         compile_report: compile_report.clone(),
                         console_output: None,
                         console_output_path: None,
+                        filter_replay: None,
                     };
                     promote_solve_error_if_reduced_accuracy(&mut record, REDUCED_TERMINATION_TOL);
                     record.console_output =
                         Some(render_sqp_transcript(&record, &snapshots, None, Some(&err)));
+                    record.filter_replay = sqp_filter_replay_from_snapshots(&snapshots);
                     record
                 }
             }
@@ -463,6 +470,7 @@ where
                         compile_report: compile_report.clone(),
                         console_output: None,
                         console_output_path: None,
+                        filter_replay: None,
                     };
                     record.validation = validate(&record);
                     if !record.validation.passed() {
@@ -476,6 +484,7 @@ where
                         Some(&summary),
                         None,
                     ));
+                    record.filter_replay = nlip_filter_replay_from_snapshots(&snapshots);
                     record
                 }
                 Err(err) => {
@@ -505,6 +514,7 @@ where
                         compile_report: compile_report.clone(),
                         console_output: None,
                         console_output_path: None,
+                        filter_replay: None,
                     };
                     promote_solve_error_if_reduced_accuracy(&mut record, REDUCED_TERMINATION_TOL);
                     record.console_output = Some(render_nlip_transcript(
@@ -513,6 +523,7 @@ where
                         None,
                         Some(&err),
                     ));
+                    record.filter_replay = nlip_filter_replay_from_snapshots(&snapshots);
                     record
                 }
             }
@@ -561,6 +572,7 @@ where
                         compile_report: compile_report.clone(),
                         console_output: None,
                         console_output_path: None,
+                        filter_replay: None,
                     };
                     record.validation = validate(&record);
                     if !record.validation.passed() {
@@ -599,6 +611,7 @@ where
                         compile_report: compile_report.clone(),
                         console_output: None,
                         console_output_path: None,
+                        filter_replay: None,
                     };
                     promote_solve_error_if_reduced_accuracy(&mut record, REDUCED_TERMINATION_TOL);
                     record.console_output =
@@ -793,6 +806,94 @@ fn metrics_from_sqp_summary(summary: &ClarabelSqpSummary) -> SolverMetrics {
         elastic_recovery_activations: Some(summary.profiling.elastic_recovery_activations),
         elastic_recovery_qp_solves: Some(summary.profiling.elastic_recovery_qp_solves),
     }
+}
+
+fn filter_acceptance_mode_label(mode: FilterAcceptanceMode) -> String {
+    match mode {
+        FilterAcceptanceMode::ObjectiveArmijo => "objective_armijo".to_string(),
+        FilterAcceptanceMode::ViolationReduction => "violation_reduction".to_string(),
+    }
+}
+
+fn sqp_filter_replay_from_snapshots(snapshots: &[SqpIterationSnapshot]) -> Option<FilterReplay> {
+    let frames = snapshots
+        .iter()
+        .filter_map(|snapshot| {
+            let filter = snapshot.filter.as_ref()?;
+            let phase = match snapshot.phase {
+                optimization::SqpIterationPhase::Initial => "initial",
+                optimization::SqpIterationPhase::AcceptedStep => "accepted_step",
+                optimization::SqpIterationPhase::PostConvergence => "post_convergence",
+            };
+            let accepted_mode = filter.accepted_mode.map(filter_acceptance_mode_label);
+            Some(FilterReplayFrame {
+                iteration: snapshot.iteration,
+                phase: phase.to_string(),
+                current: FilterReplayPoint {
+                    violation: filter.current.violation,
+                    objective: filter.current.objective,
+                },
+                frontier: filter
+                    .entries
+                    .iter()
+                    .map(|entry| FilterReplayPoint {
+                        violation: entry.violation,
+                        objective: entry.objective,
+                    })
+                    .collect(),
+                rejected_trials: snapshot
+                    .line_search
+                    .as_ref()
+                    .map(|info| {
+                        info.rejected_trials
+                            .iter()
+                            .map(|trial| FilterReplayPoint {
+                                violation: trial.primal_inf,
+                                objective: trial.objective,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                accepted_mode,
+            })
+        })
+        .collect::<Vec<_>>();
+    (!frames.is_empty()).then_some(FilterReplay { frames })
+}
+
+fn nlip_filter_replay_from_snapshots(
+    snapshots: &[InteriorPointIterationSnapshot],
+) -> Option<FilterReplay> {
+    let frames = snapshots
+        .iter()
+        .filter_map(|snapshot| {
+            let filter = snapshot.filter.as_ref()?;
+            let phase = match snapshot.phase {
+                optimization::InteriorPointIterationPhase::Initial => "initial",
+                optimization::InteriorPointIterationPhase::AcceptedStep => "accepted_step",
+                optimization::InteriorPointIterationPhase::Converged => "converged",
+            };
+            Some(FilterReplayFrame {
+                iteration: snapshot.iteration,
+                phase: phase.to_string(),
+                current: FilterReplayPoint {
+                    violation: filter.current.violation,
+                    objective: filter.current.objective,
+                },
+                frontier: filter
+                    .entries
+                    .iter()
+                    .map(|entry| FilterReplayPoint {
+                        violation: entry.violation,
+                        objective: entry.objective,
+                    })
+                    .collect(),
+                rejected_trials: Vec::new(),
+                accepted_mode: filter.accepted_mode.map(filter_acceptance_mode_label),
+            })
+        })
+        .collect::<Vec<_>>();
+    (!frames.is_empty()).then_some(FilterReplay { frames })
 }
 
 fn metrics_from_sqp_error(error: &ClarabelSqpError) -> SolverMetrics {
@@ -1073,8 +1174,11 @@ fn render_sqp_transcript(
                 .iter()
                 .map(|event| match event {
                     optimization::SqpIterationEvent::PenaltyUpdated => 'P',
+                    optimization::SqpIterationEvent::HessianShifted => 'H',
                     optimization::SqpIterationEvent::LongLineSearch => 'L',
                     optimization::SqpIterationEvent::ArmijoToleranceAdjusted => 'A',
+                    optimization::SqpIterationEvent::SecondOrderCorrectionUsed => 'S',
+                    optimization::SqpIterationEvent::FilterAccepted => 'F',
                     optimization::SqpIterationEvent::QpReducedAccuracy => 'R',
                     optimization::SqpIterationEvent::ElasticRecoveryUsed => 'E',
                     optimization::SqpIterationEvent::WolfeRejectedTrial => 'W',
@@ -1121,28 +1225,46 @@ fn render_sqp_transcript(
         for (snapshot, info) in detailed_line_search {
             let _ = writeln!(
                 out,
-                "iter {}: accepted alpha={} armijo={} armijo_adj={} wolfe={} violation={} rejected={}",
+                "iter {}: accepted alpha={} armijo={} armijo_adj={} obj_armijo={} obj_armijo_adj={} soc={} wolfe={} violation={} filter_mode={} filter_ok={} filter_dom={} filter_obj={} filter_violation={} rejected={}",
                 snapshot.iteration,
                 fmt_sci(info.accepted_alpha),
                 fmt_bool(info.armijo_satisfied),
                 fmt_bool(info.armijo_tolerance_adjusted),
+                fmt_opt_bool(info.objective_armijo_satisfied),
+                fmt_opt_bool(info.objective_armijo_tolerance_adjusted),
+                fmt_bool(info.second_order_correction_used),
                 fmt_opt_bool(info.wolfe_satisfied),
                 fmt_bool(info.violation_satisfied),
+                info.filter_acceptance_mode.map_or("--", |mode| match mode {
+                    optimization::SqpFilterAcceptanceMode::ObjectiveArmijo => "objective",
+                    optimization::SqpFilterAcceptanceMode::ViolationReduction => "violation",
+                }),
+                fmt_opt_bool(info.filter_acceptable),
+                fmt_opt_bool(info.filter_dominated),
+                fmt_opt_bool(info.filter_sufficient_objective_reduction),
+                fmt_opt_bool(info.filter_sufficient_violation_reduction),
                 info.rejected_trials.len(),
             );
             for trial in &info.rejected_trials {
                 let _ = writeln!(
                     out,
-                    "  reject alpha={} merit={} obj={} eq_inf={} ineq_inf={} armijo={} armijo_adj={} wolfe={} violation={}",
+                    "  reject alpha={} merit={} obj={} primal={} eq_inf={} ineq_inf={} armijo={} armijo_adj={} obj_armijo={} obj_armijo_adj={} wolfe={} violation={} filter_ok={} filter_dom={} filter_obj={} filter_violation={}",
                     fmt_sci(trial.alpha),
                     fmt_sci(trial.merit),
                     fmt_sci(trial.objective),
+                    fmt_sci(trial.primal_inf),
                     fmt_opt_sci(trial.eq_inf),
                     fmt_opt_sci(trial.ineq_inf),
                     fmt_bool(trial.armijo_satisfied),
                     fmt_bool(trial.armijo_tolerance_adjusted),
+                    fmt_opt_bool(trial.objective_armijo_satisfied),
+                    fmt_opt_bool(trial.objective_armijo_tolerance_adjusted),
                     fmt_opt_bool(trial.wolfe_satisfied),
                     fmt_bool(trial.violation_satisfied),
+                    fmt_opt_bool(trial.filter_acceptable),
+                    fmt_opt_bool(trial.filter_dominated),
+                    fmt_opt_bool(trial.filter_sufficient_objective_reduction),
+                    fmt_opt_bool(trial.filter_sufficient_violation_reduction),
                 );
             }
         }
@@ -1245,7 +1367,8 @@ fn render_nlip_transcript(
                 .map(|event| match event {
                     optimization::InteriorPointIterationEvent::SigmaAdjusted => 'P',
                     optimization::InteriorPointIterationEvent::LongLineSearch => 'L',
-                    optimization::InteriorPointIterationEvent::LinearSolverFallback => 'F',
+                    optimization::InteriorPointIterationEvent::FilterAccepted => 'F',
+                    optimization::InteriorPointIterationEvent::LinearSolverFallback => 'U',
                     optimization::InteriorPointIterationEvent::MaxIterationsReached => 'M',
                 })
                 .collect()
