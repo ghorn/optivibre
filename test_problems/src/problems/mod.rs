@@ -902,6 +902,7 @@ fn metrics_from_sqp_error(error: &ClarabelSqpError) -> SolverMetrics {
         | ClarabelSqpError::QpSolve { context, .. }
         | ClarabelSqpError::UnconstrainedStepSolve { context }
         | ClarabelSqpError::LineSearchFailed { context, .. }
+        | ClarabelSqpError::RestorationFailed { context, .. }
         | ClarabelSqpError::Stalled { context, .. }
         | ClarabelSqpError::NonFiniteCallbackOutput { context, .. } => Some(context.as_ref()),
         ClarabelSqpError::InvalidInput(_)
@@ -940,6 +941,7 @@ fn solve_time_from_sqp_error(error: &ClarabelSqpError) -> Option<std::time::Dura
         | ClarabelSqpError::QpSolve { context, .. }
         | ClarabelSqpError::UnconstrainedStepSolve { context }
         | ClarabelSqpError::LineSearchFailed { context, .. }
+        | ClarabelSqpError::RestorationFailed { context, .. }
         | ClarabelSqpError::Stalled { context, .. }
         | ClarabelSqpError::NonFiniteCallbackOutput { context, .. } => Some(context.as_ref()),
         ClarabelSqpError::InvalidInput(_)
@@ -1167,9 +1169,35 @@ fn render_sqp_transcript(
             },
         );
         let events = if snapshot.events.is_empty() {
-            "--".to_string()
+            let mut codes = String::new();
+            if snapshot
+                .line_search
+                .as_ref()
+                .is_some_and(|info| info.second_order_correction_attempted)
+            {
+                codes.push('s');
+            }
+            if snapshot
+                .line_search
+                .as_ref()
+                .is_some_and(|info| info.restoration_attempted)
+            {
+                codes.push('t');
+            }
+            if snapshot
+                .line_search
+                .as_ref()
+                .is_some_and(|info| info.elastic_recovery_attempted)
+            {
+                codes.push('e');
+            }
+            if codes.is_empty() {
+                "--".to_string()
+            } else {
+                codes
+            }
         } else {
-            snapshot
+            let mut codes = snapshot
                 .events
                 .iter()
                 .map(|event| match event {
@@ -1179,12 +1207,44 @@ fn render_sqp_transcript(
                     optimization::SqpIterationEvent::ArmijoToleranceAdjusted => 'A',
                     optimization::SqpIterationEvent::SecondOrderCorrectionUsed => 'S',
                     optimization::SqpIterationEvent::FilterAccepted => 'F',
+                    optimization::SqpIterationEvent::RestorationStepAccepted => 'T',
                     optimization::SqpIterationEvent::QpReducedAccuracy => 'R',
                     optimization::SqpIterationEvent::ElasticRecoveryUsed => 'E',
                     optimization::SqpIterationEvent::WolfeRejectedTrial => 'W',
                     optimization::SqpIterationEvent::MaxIterationsReached => 'M',
                 })
-                .collect()
+                .collect::<String>();
+            if !snapshot
+                .events
+                .contains(&optimization::SqpIterationEvent::SecondOrderCorrectionUsed)
+                && snapshot
+                    .line_search
+                    .as_ref()
+                    .is_some_and(|info| info.second_order_correction_attempted)
+            {
+                codes.push('s');
+            }
+            if !snapshot
+                .events
+                .contains(&optimization::SqpIterationEvent::RestorationStepAccepted)
+                && snapshot
+                    .line_search
+                    .as_ref()
+                    .is_some_and(|info| info.restoration_attempted)
+            {
+                codes.push('t');
+            }
+            if !snapshot
+                .events
+                .contains(&optimization::SqpIterationEvent::ElasticRecoveryUsed)
+                && snapshot
+                    .line_search
+                    .as_ref()
+                    .is_some_and(|info| info.elastic_recovery_attempted)
+            {
+                codes.push('e');
+            }
+            codes
         };
         let _ = writeln!(
             out,
@@ -1552,6 +1612,7 @@ fn sqp_error_code(error: &ClarabelSqpError) -> &'static str {
         ClarabelSqpError::QpSolve { .. } => "qp_solve",
         ClarabelSqpError::UnconstrainedStepSolve { .. } => "unconstrained_step",
         ClarabelSqpError::LineSearchFailed { .. } => "line_search",
+        ClarabelSqpError::RestorationFailed { .. } => "restoration",
         ClarabelSqpError::Stalled { .. } => "stalled",
         ClarabelSqpError::NonFiniteCallbackOutput { .. } => "non_finite_callback",
     }

@@ -30,6 +30,7 @@ pub(crate) struct FilterParameters {
     pub gamma_violation: f64,
     pub armijo_c1: f64,
     pub violation_tol: f64,
+    pub theta_max: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,8 +40,10 @@ pub(crate) struct FilterTrialAssessment {
     pub objective_armijo_tolerance_adjusted: bool,
     pub filter_acceptable: bool,
     pub filter_dominated: bool,
+    pub filter_theta_acceptable: bool,
     pub filter_sufficient_objective_reduction: bool,
     pub filter_sufficient_violation_reduction: bool,
+    pub switching_condition_satisfied: bool,
 }
 
 fn absolute_tolerance(value: f64) -> f64 {
@@ -92,6 +95,10 @@ fn sufficient_violation_reduction(
     trial_violation <= target + absolute_tolerance(current_violation)
 }
 
+fn theta_acceptable(trial_violation: f64, theta_max: f64) -> bool {
+    trial_violation <= theta_max + absolute_tolerance(theta_max)
+}
+
 fn dominates_trial(
     entry: &FilterEntry,
     trial: &FilterEntry,
@@ -102,17 +109,6 @@ fn dominates_trial(
     let objective_barrier = entry.objective - gamma_objective * trial.violation.max(1e-12);
     trial.violation >= violation_barrier - absolute_tolerance(entry.violation)
         && trial.objective >= objective_barrier - absolute_tolerance(entry.objective)
-}
-
-fn is_acceptable(
-    entries: &[FilterEntry],
-    trial: &FilterEntry,
-    gamma_objective: f64,
-    gamma_violation: f64,
-) -> bool {
-    !entries
-        .iter()
-        .any(|entry| dominates_trial(entry, trial, gamma_objective, gamma_violation))
 }
 
 fn entries_match(lhs: &FilterEntry, rhs: &FilterEntry) -> bool {
@@ -139,18 +135,25 @@ pub(crate) fn assess_trial_with_objective_status(
     trial: &FilterEntry,
     objective_satisfied: bool,
     objective_tolerance_adjusted: bool,
+    switching_condition_satisfied: bool,
     parameters: FilterParameters,
 ) -> FilterTrialAssessment {
     let near_feasible_nonworsening = current.violation <= parameters.violation_tol
         && trial.violation <= current.violation + absolute_tolerance(current.violation)
         && trial.objective <= current.objective + absolute_tolerance(current.objective);
-    let filter_acceptable = near_feasible_nonworsening
-        || is_acceptable(
-            entries,
-            trial,
-            parameters.gamma_objective,
-            parameters.gamma_violation,
-        );
+    let filter_theta_acceptable =
+        near_feasible_nonworsening || theta_acceptable(trial.violation, parameters.theta_max);
+    let filter_dominated = !near_feasible_nonworsening
+        && entries.iter().any(|entry| {
+            dominates_trial(
+                entry,
+                trial,
+                parameters.gamma_objective,
+                parameters.gamma_violation,
+            )
+        });
+    let filter_acceptable =
+        near_feasible_nonworsening || (filter_theta_acceptable && !filter_dominated);
     let filter_sufficient_violation_reduction = sufficient_violation_reduction(
         current.violation,
         trial.violation,
@@ -159,7 +162,9 @@ pub(crate) fn assess_trial_with_objective_status(
     let filter_sufficient_objective_reduction = objective_satisfied || near_feasible_nonworsening;
     let acceptance_mode = if !filter_acceptable {
         None
-    } else if filter_sufficient_objective_reduction {
+    } else if filter_sufficient_objective_reduction
+        && (switching_condition_satisfied || near_feasible_nonworsening)
+    {
         Some(FilterAcceptanceMode::ObjectiveArmijo)
     } else if filter_sufficient_violation_reduction {
         Some(FilterAcceptanceMode::ViolationReduction)
@@ -171,9 +176,11 @@ pub(crate) fn assess_trial_with_objective_status(
         objective_armijo_satisfied: objective_satisfied,
         objective_armijo_tolerance_adjusted: objective_tolerance_adjusted,
         filter_acceptable,
-        filter_dominated: !filter_acceptable,
+        filter_dominated,
+        filter_theta_acceptable,
         filter_sufficient_objective_reduction,
         filter_sufficient_violation_reduction,
+        switching_condition_satisfied,
     }
 }
 
@@ -183,6 +190,7 @@ pub(crate) fn assess_trial(
     trial: &FilterEntry,
     alpha: f64,
     objective_directional_derivative: f64,
+    switching_condition_satisfied: bool,
     parameters: FilterParameters,
 ) -> FilterTrialAssessment {
     let (objective_armijo_satisfied, objective_armijo_tolerance_adjusted) =
@@ -199,6 +207,82 @@ pub(crate) fn assess_trial(
         trial,
         objective_armijo_satisfied,
         objective_armijo_tolerance_adjusted,
+        switching_condition_satisfied,
         parameters,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params(theta_max: f64, violation_tol: f64) -> FilterParameters {
+        FilterParameters {
+            gamma_objective: 1.0e-4,
+            gamma_violation: 0.1,
+            armijo_c1: 1.0e-4,
+            violation_tol,
+            theta_max,
+        }
+    }
+
+    #[test]
+    fn switching_condition_blocks_objective_acceptance_far_from_feasibility() {
+        let current = entry(0.0, 10.0);
+        let trial = entry(-1.0, 11.0);
+        let assessment = assess_trial_with_objective_status(
+            std::slice::from_ref(&current),
+            &current,
+            &trial,
+            true,
+            false,
+            false,
+            params(20.0, 1.0e-8),
+        );
+        assert!(assessment.filter_acceptable);
+        assert!(!assessment.filter_dominated);
+        assert!(assessment.filter_theta_acceptable);
+        assert_eq!(assessment.acceptance_mode, None);
+    }
+
+    #[test]
+    fn feasibility_reducing_h_step_is_accepted() {
+        let current = entry(0.0, 10.0);
+        let trial = entry(1.0, 5.0);
+        let assessment = assess_trial_with_objective_status(
+            std::slice::from_ref(&current),
+            &current,
+            &trial,
+            false,
+            false,
+            false,
+            params(20.0, 1.0e-8),
+        );
+        assert!(assessment.filter_acceptable);
+        assert!(assessment.filter_sufficient_violation_reduction);
+        assert_eq!(
+            assessment.acceptance_mode,
+            Some(FilterAcceptanceMode::ViolationReduction)
+        );
+    }
+
+    #[test]
+    fn near_feasible_nonworsening_objective_step_still_accepts() {
+        let current = entry(5.0, 1.0e-9);
+        let trial = entry(4.0, 5.0e-10);
+        let assessment = assess_trial_with_objective_status(
+            std::slice::from_ref(&current),
+            &current,
+            &trial,
+            false,
+            false,
+            false,
+            params(1.0, 1.0e-8),
+        );
+        assert!(assessment.filter_acceptable);
+        assert_eq!(
+            assessment.acceptance_mode,
+            Some(FilterAcceptanceMode::ObjectiveArmijo)
+        );
+    }
 }

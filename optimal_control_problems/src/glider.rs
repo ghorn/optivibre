@@ -127,7 +127,7 @@ impl Default for Params {
             min_time_bound_s: MIN_FLIGHT_TIME_S,
             max_time_bound_s: MAX_FLIGHT_TIME_S,
             max_alpha_rate_deg_s: 25.0,
-            alpha_rate_regularization: 5.0e-3,
+            alpha_rate_regularization: 5.0e-1,
             solver_method: default_solver_method(),
             solver: default_sqp_config(),
             transcription: default_transcription(DEFAULT_INTERVALS),
@@ -292,7 +292,7 @@ pub fn spec() -> ProblemSpec {
                     "alpha_rate_regularization",
                     "AoA Rate Weight",
                     0.0,
-                    5.0e-2,
+                    1.0,
                     5.0e-4,
                     defaults.alpha_rate_regularization,
                     "",
@@ -1143,6 +1143,202 @@ mod tests {
             (Params::default().min_time_bound_s..=Params::default().max_time_bound_s)
                 .contains(&final_time),
             "free final time should stay within the configured bounds"
+        );
+    }
+
+    #[test]
+    fn glider_sqp_filter_restoration_avoids_catastrophic_early_steps() {
+        const N: usize = 8;
+        const K: usize = DEFAULT_COLLOCATION_DEGREE;
+        let params = Params {
+            launch_speed_mps: 30.0,
+            initial_alpha_deg: 6.0,
+            max_alpha_rate_deg_s: 12.0,
+            ..Params::default()
+        };
+        let family = params.transcription.collocation_family;
+        let runtime = dc_runtime::<N, K>(&params);
+        let compiled = model(optimal_control::DirectCollocation::<N, K> { family })
+            .compile_jit_with_ocp_options(crate::common::ocp_compile_options(
+                crate::common::interactive_direct_collocation_opt_level(),
+                params.sx_functions,
+            ))
+            .expect("reduced glider direct collocation should compile");
+
+        let mut sqp_options = crate::common::sqp_options(&params.solver);
+        sqp_options.verbose = false;
+        sqp_options.max_iters = 6;
+
+        let mut snapshots = Vec::new();
+        let result = compiled.solve_sqp_with_callback(&runtime, &sqp_options, |snapshot| {
+            snapshots.push(snapshot.solver.clone());
+        });
+
+        match result {
+            Ok(_) => {}
+            Err(optimization::ClarabelSqpError::MaxIterations { .. }) => {}
+            Err(other) => {
+                panic!("glider SQP should progress past the old early failure, got {other:?}")
+            }
+        }
+
+        let accepted_steps = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.phase == optimization::SqpIterationPhase::AcceptedStep)
+            .filter(|snapshot| snapshot.line_search.is_some())
+            .collect::<Vec<_>>();
+        assert!(
+            accepted_steps.len() >= 3,
+            "expected at least 3 accepted SQP iterates, got {}",
+            accepted_steps.len()
+        );
+        for snapshot in accepted_steps.iter().take(2) {
+            let primal_inf = snapshot
+                .eq_inf
+                .into_iter()
+                .chain(snapshot.ineq_inf)
+                .fold(0.0_f64, f64::max);
+            assert!(
+                primal_inf < 1.0,
+                "early SQP iterate left the sane feasibility neighborhood: {snapshot:?}"
+            );
+            assert!(
+                snapshot.line_search.as_ref().is_some_and(
+                    |info| info.step_kind != Some(optimization::SqpStepKind::Objective)
+                ),
+                "early SQP iterate should not be accepted as an objective step far from feasibility: {snapshot:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual failure diagnostics helper"]
+    fn print_current_glider_solver_failures() {
+        for solver_method in [SolverMethod::Sqp, SolverMethod::Nlip] {
+            let mut log_lines = Vec::new();
+            let result = solve_with_progress(
+                &Params {
+                    launch_speed_mps: 30.0,
+                    initial_alpha_deg: 6.0,
+                    max_alpha_rate_deg_s: 12.0,
+                    solver_method,
+                    ..Params::default()
+                },
+                |event| match event {
+                    crate::common::SolveStreamEvent::Status { status } => {
+                        log_lines.push(format!(
+                            "[status {:?}] {}",
+                            status.solver_method, status.solver.status_label
+                        ));
+                    }
+                    crate::common::SolveStreamEvent::Log { line, .. } => log_lines.push(line),
+                    crate::common::SolveStreamEvent::Error { message } => {
+                        log_lines.push(format!("error: {message}"));
+                    }
+                    crate::common::SolveStreamEvent::Iteration { progress, .. } => {
+                        log_lines.push(format!(
+                            "[iteration {} {:?}] obj={:.3e} eq_inf={:?} ineq_inf={:?} dual_inf={:.3e}",
+                            progress.iteration,
+                            progress.phase,
+                            progress.objective,
+                            progress.eq_inf,
+                            progress.ineq_inf,
+                            progress.dual_inf
+                        ));
+                    }
+                    crate::common::SolveStreamEvent::Final { artifact } => {
+                        log_lines.push(format!("[final] {}", artifact.solver.status_label));
+                    }
+                },
+            );
+            println!("\n=== glider {solver_method:?} ===");
+            for line in &log_lines {
+                println!("{line}");
+            }
+            println!(
+                "result: {:?}",
+                result.as_ref().map(|_| ()).map_err(|err| err.to_string())
+            );
+        }
+
+        let params = Params {
+            launch_speed_mps: 30.0,
+            initial_alpha_deg: 6.0,
+            max_alpha_rate_deg_s: 12.0,
+            ..Params::default()
+        };
+        let runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+        let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
+            .expect("glider direct collocation should compile");
+        let compiled = compiled.compiled.borrow();
+
+        let mut sqp_options = crate::common::sqp_options(&params.solver);
+        sqp_options.filter_method = false;
+        sqp_options.verbose = false;
+        sqp_options.max_iters = 4;
+        let mut sqp_iterations = Vec::new();
+        let sqp_result = compiled.solve_sqp_with_callback(&runtime, &sqp_options, |snapshot| {
+            sqp_iterations.push(snapshot.solver.clone());
+        });
+        println!("\n=== glider SQP filter=off ===");
+        for snapshot in &sqp_iterations {
+            println!(
+                "iter={} phase={:?} obj={:.3e} eq_inf={:?} ineq_inf={:?} dual_inf={:.3e} step_inf={:?} alpha={:?} ls_it={:?}",
+                snapshot.iteration,
+                snapshot.phase,
+                snapshot.objective,
+                snapshot.eq_inf,
+                snapshot.ineq_inf,
+                snapshot.dual_inf,
+                snapshot.step_inf,
+                snapshot
+                    .line_search
+                    .as_ref()
+                    .map(|info| info.accepted_alpha),
+                snapshot
+                    .line_search
+                    .as_ref()
+                    .map(|info| info.backtrack_count),
+            );
+        }
+        println!(
+            "result: {:?}",
+            sqp_result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|err| err.to_string())
+        );
+
+        let mut nlip_options = crate::common::nlip_options(&params.solver);
+        nlip_options.filter_method = false;
+        nlip_options.verbose = false;
+        nlip_options.max_iters = 4;
+        let mut nlip_iterations = Vec::new();
+        let nlip_result =
+            compiled.solve_interior_point_with_callback(&runtime, &nlip_options, |snapshot| {
+                nlip_iterations.push(snapshot.solver.clone());
+            });
+        println!("\n=== glider NLIP filter=off ===");
+        for snapshot in &nlip_iterations {
+            println!(
+                "iter={} phase={:?} obj={:.3e} eq_inf={:?} ineq_inf={:?} dual_inf={:.3e} step_inf={:?} alpha={:?} ls_it={:?}",
+                snapshot.iteration,
+                snapshot.phase,
+                snapshot.objective,
+                snapshot.eq_inf,
+                snapshot.ineq_inf,
+                snapshot.dual_inf,
+                snapshot.step_inf,
+                snapshot.alpha,
+                snapshot.line_search_iterations,
+            );
+        }
+        println!(
+            "result: {:?}",
+            nlip_result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|err| err.to_string())
         );
     }
 

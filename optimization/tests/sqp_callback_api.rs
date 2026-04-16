@@ -2,8 +2,8 @@ use approx::assert_abs_diff_eq;
 use optimization::{
     CCS, ClarabelSqpError, ClarabelSqpOptions, CompiledNlpProblem, NonFiniteCallbackStage,
     NonFiniteInputStage, ParameterMatrix, SqpConeKind, SqpFinalStateKind, SqpIterationEvent,
-    SqpIterationPhase, SqpQpRawStatus, SqpTermination, SymbolicNlpOutputs, TypedRuntimeNlpBounds,
-    solve_nlp_sqp, solve_nlp_sqp_with_callback, symbolic_nlp,
+    SqpIterationPhase, SqpQpRawStatus, SqpStepKind, SqpTermination, SymbolicNlpOutputs,
+    TypedRuntimeNlpBounds, solve_nlp_sqp, solve_nlp_sqp_with_callback, symbolic_nlp,
 };
 use rstest::rstest;
 use std::sync::OnceLock;
@@ -1093,6 +1093,49 @@ fn sqp_elastic_recovery_handles_primal_infeasible_linearization() {
             .events
             .contains(&SqpIterationEvent::ElasticRecoveryUsed)
     }));
+    assert!(snapshots.iter().any(|snapshot| {
+        snapshot
+            .events
+            .contains(&SqpIterationEvent::RestorationStepAccepted)
+    }));
+    assert!(snapshots.iter().any(|snapshot| {
+        snapshot
+            .line_search
+            .as_ref()
+            .is_some_and(|info| info.step_kind == Some(SqpStepKind::Restoration))
+    }));
+}
+
+#[test]
+fn sqp_restoration_failure_surfaces_explicit_termination() {
+    let error = solve_nlp_sqp(
+        &InfeasibleLinearizedEqualityProblem,
+        &[0.0],
+        &[],
+        &ClarabelSqpOptions {
+            verbose: false,
+            max_iters: 5,
+            filter_method: true,
+            restoration_phase: true,
+            elastic_mode: true,
+            ..ClarabelSqpOptions::default()
+        },
+    )
+    .expect_err("restoration should fail on an irrecoverable linearization");
+
+    match error {
+        ClarabelSqpError::RestorationFailed { context, .. } => {
+            assert_eq!(context.termination, SqpTermination::RestorationFailed);
+            assert!(context.failed_line_search.is_some());
+            assert!(
+                context
+                    .failed_step_diagnostics
+                    .as_ref()
+                    .is_some_and(|diagnostics| diagnostics.restoration_phase)
+            );
+        }
+        other => panic!("expected RestorationFailed error, got {other:?}"),
+    }
 }
 
 #[test]

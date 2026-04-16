@@ -262,6 +262,13 @@ const STREAM_EVENT_KIND = Object.freeze({
   final: 3,
   error: 4,
 } as const);
+const FILTER_TRACE = Object.freeze({
+  history: 0,
+  recent: 1,
+  frontier: 2,
+  current: 3,
+} as const);
+const FILTER_RECENT_POINT_LIMIT = 48;
 const STREAM_EVENT_KIND_FROM_WIRE = Object.freeze({
   status: STREAM_EVENT_KIND.status,
   log: STREAM_EVENT_KIND.log,
@@ -730,7 +737,7 @@ interface FrontendState {
   chartLayoutKey: string;
   progressPlotReady: boolean;
   filterPlotReady: boolean;
-  filterPath: FilterEntry[];
+  filterRecentPath: FilterEntry[];
   lastFilterPointKey: string | null;
   logLines: LogLine[];
   latestProgress: SolveProgress | null;
@@ -743,6 +750,7 @@ interface FrontendState {
   linkedChartRange: NumericRange | null;
   linkedChartAutorange: boolean;
   linkingChartRange: boolean;
+  artifactRenderFrameHandle: number | null;
   prewarmTimer: number | null;
   prewarmInFlightCount: number;
   compileStatusPollHandle: number | null;
@@ -1439,7 +1447,7 @@ const state: FrontendState = {
   chartLayoutKey: "",
   progressPlotReady: false,
   filterPlotReady: false,
-  filterPath: [],
+  filterRecentPath: [],
   lastFilterPointKey: null,
   logLines: [],
   latestProgress: null,
@@ -1452,6 +1460,7 @@ const state: FrontendState = {
   linkedChartRange: null,
   linkedChartAutorange: true,
   linkingChartRange: false,
+  artifactRenderFrameHandle: null,
   prewarmTimer: null,
   prewarmInFlightCount: 0,
   compileStatusPollHandle: null,
@@ -1967,19 +1976,26 @@ function ansiToHtml(raw: string): string {
   return parts.join("");
 }
 
-function renderLog(): void {
+function shouldConsoleStickToBottom(): boolean {
   const bottomSlackPx = 12;
+  return solverLogEl.scrollHeight - (solverLogEl.scrollTop + solverLogEl.clientHeight) <= bottomSlackPx;
+}
+
+function buildLogLineElements(entries: readonly LogLine[]): DocumentFragment {
+  const fragment = document.createDocumentFragment();
+  for (const entry of entries) {
+    const lineEl = document.createElement("span");
+    lineEl.className = `log-line ${logLevelClass(entry.level)}`;
+    lineEl.innerHTML = ansiToHtml(entry.text) || "&nbsp;";
+    fragment.appendChild(lineEl);
+  }
+  return fragment;
+}
+
+function renderLog(): void {
   const previousScrollTop = solverLogEl.scrollTop;
-  const previousScrollHeight = solverLogEl.scrollHeight;
-  const previousClientHeight = solverLogEl.clientHeight;
-  const shouldStickToBottom =
-    previousScrollHeight - (previousScrollTop + previousClientHeight) <= bottomSlackPx;
-  solverLogEl.innerHTML = state.logLines
-    .map((entry) => {
-      const levelClass = logLevelClass(entry.level);
-      return `<span class="log-line ${levelClass}">${ansiToHtml(entry.text) || "&nbsp;"}</span>`;
-    })
-    .join("");
+  const shouldStickToBottom = shouldConsoleStickToBottom();
+  solverLogEl.replaceChildren(buildLogLineElements(state.logLines));
   if (shouldStickToBottom) {
     solverLogEl.scrollTop = solverLogEl.scrollHeight;
     return;
@@ -2572,27 +2588,86 @@ function appendControl(wrapperParent: HTMLElement, control: ControlSpec): void {
     </div>
     <div class="control-inputs">
       <input type="range" min="${control.min}" max="${control.max}" step="${control.step}" value="${value}" />
-      <input type="number" min="${control.min}" max="${control.max}" step="${control.step}" value="${value}" />
+      <input
+        class="control-number-input"
+        type="text"
+        inputmode="decimal"
+        value="${value}"
+        placeholder="${control.default}"
+        spellcheck="false"
+      />
     </div>
   `;
   const rangeInput = requiredChild<HTMLInputElement>(wrapper, 'input[type="range"]');
-  const numberInput = requiredChild<HTMLInputElement>(wrapper, 'input[type="number"]');
+  const numberInput = requiredChild<HTMLInputElement>(wrapper, ".control-number-input");
   const pill = requiredChild<HTMLDivElement>(wrapper, ".value-pill");
-  const sync = (raw: string): void => {
-    const numeric = Number(raw);
+
+  const parseBufferedNumeric = (raw: string): number | null => {
+    const trimmed = raw.trim();
+    if (trimmed.length === 0) {
+      return null;
+    }
+    const numeric = Number(trimmed);
+    if (!Number.isFinite(numeric)) {
+      return null;
+    }
+    if (Number.isFinite(control.min) && numeric < control.min) {
+      return null;
+    }
+    if (Number.isFinite(control.max) && numeric > control.max) {
+      return null;
+    }
+    return numeric;
+  };
+
+  const syncCommittedValue = (numeric: number, writeNumberInput = true): void => {
     state.values[control.id] = numeric;
     rangeInput.value = String(numeric);
-    numberInput.value = String(numeric);
+    if (writeNumberInput) {
+      numberInput.value = String(numeric);
+    }
     pill.textContent = formatValue(numeric);
     handleControlUpdate(control);
   };
+
   rangeInput.addEventListener("input", (event) => {
     const target = readCurrentInputTarget(event, `${control.id} range input`);
-    sync(target.value);
+    syncCommittedValue(Number(target.value));
   });
+
   numberInput.addEventListener("input", (event) => {
     const target = readCurrentInputTarget(event, `${control.id} number input`);
-    sync(target.value);
+    const numeric = parseBufferedNumeric(target.value);
+    if (numeric == null) {
+      return;
+    }
+    syncCommittedValue(numeric, false);
+  });
+
+  const normalizeNumberInput = (): void => {
+    numberInput.value = String(state.values[control.id]);
+  };
+
+  numberInput.addEventListener("blur", () => {
+    const numeric = parseBufferedNumeric(numberInput.value);
+    if (numeric != null) {
+      syncCommittedValue(numeric);
+      return;
+    }
+    normalizeNumberInput();
+  });
+
+  numberInput.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") {
+      return;
+    }
+    const numeric = parseBufferedNumeric(numberInput.value);
+    if (numeric != null) {
+      syncCommittedValue(numeric);
+    } else {
+      normalizeNumberInput();
+    }
+    numberInput.blur();
   });
   wrapperParent.appendChild(wrapper);
 }
@@ -2979,6 +3054,8 @@ function updateScenePlot(view: SceneView): void {
 }
 
 function resetSolverPanel(): void {
+  clearScheduledArtifactRender();
+  state.renderScheduled = false;
   state.latestProgress = null;
   state.liveStatus = null;
   state.liveSolver = null;
@@ -2988,7 +3065,7 @@ function resetSolverPanel(): void {
   state.logLines = [];
   renderSolverSummary();
   renderConstraintPanels();
-  renderLog();
+  solverLogEl.replaceChildren();
   if (window.Plotly && state.progressPlotReady) {
     window.Plotly.purge(progressPlotEl);
   }
@@ -2999,8 +3076,8 @@ function resetSolverPanel(): void {
   filterPlotEl.innerHTML = `<div class="placeholder">SQP filter telemetry will appear here during the solve.</div>`;
   state.progressPlotReady = false;
   state.filterPlotReady = false;
-  state.filterPath = [];
   state.lastFilterPointKey = null;
+  state.filterRecentPath = [];
   renderCompileCacheStatus();
 }
 
@@ -3333,9 +3410,7 @@ interface ProfilingSection {
 interface ProfilingRenderedLine {
   label: string;
   value: string;
-  share: string;
-  countText: string | null;
-  avgText: string | null;
+  metadata: string | null;
   heatScore: number | null;
 }
 
@@ -3424,7 +3499,7 @@ function profilingTreePrefix(ancestorHasNext: readonly boolean[], isLast: boolea
 function formatProfilingShare(
   durationMs: number | null,
   parentDurationMs: number | null,
-): string {
+): string | null {
   if (
     durationMs == null ||
     parentDurationMs == null ||
@@ -3432,7 +3507,7 @@ function formatProfilingShare(
     !Number.isFinite(parentDurationMs) ||
     parentDurationMs <= 1e-12
   ) {
-    return "--";
+    return null;
   }
   const sharePercent = Math.max(0, Math.min(100, (durationMs / parentDurationMs) * 100));
   if (sharePercent >= 99.95) {
@@ -3447,24 +3522,36 @@ function formatProfilingShare(
   return `${sharePercent.toFixed(2)}%`;
 }
 
+function formatProfilingLeafMetadata(item: ProfilingLeaf): string | null {
+  if (item.count <= 0) {
+    return null;
+  }
+  if (item.durationMs == null || !Number.isFinite(item.durationMs)) {
+    return `${item.count}x`;
+  }
+  return `${item.count}x @ ${formatDurationFromMs(item.durationMs / item.count)}`;
+}
+
 function flattenProfilingSection(
   section: ProfilingSection,
   ancestorHasNext: boolean[],
   isLast: boolean,
   sectionHeatScore: number | null,
   parentDurationMs: number | null,
+  root = false,
 ): ProfilingRenderedLine[] {
   const lines: ProfilingRenderedLine[] = [];
-  const prefix = profilingTreePrefix(ancestorHasNext, isLast);
+  const prefix = root ? "" : profilingTreePrefix(ancestorHasNext, isLast);
   lines.push({
     label: `${prefix}${section.label}`,
     value: section.value,
-    share: formatProfilingShare(section.durationMs, parentDurationMs),
-    countText: null,
-    avgText: null,
+    metadata: root ? null : (() => {
+      const share = formatProfilingShare(section.durationMs, parentDurationMs);
+      return share == null ? null : `(${share})`;
+    })(),
     heatScore: sectionHeatScore,
   });
-  const nextAncestors = [...ancestorHasNext, !isLast];
+  const nextAncestors = root ? [] : [...ancestorHasNext, !isLast];
   const children = [
     ...section.children.map((child) => ({ kind: "section" as const, section: child })),
     ...section.items.map((item) => ({ kind: "item" as const, item })),
@@ -3492,16 +3579,25 @@ function flattenProfilingSection(
     lines.push({
       label: `${profilingTreePrefix(nextAncestors, childIsLast)}${item.label}`,
       value: item.value,
-      share: formatProfilingShare(item.durationMs, section.durationMs),
-      countText: String(item.count),
-      avgText:
-        item.count > 0 && item.durationMs != null
-          ? formatDurationFromMs(item.durationMs / item.count)
-          : "--",
+      metadata: formatProfilingLeafMetadata(item),
       heatScore: deriveChildProfilingHeatScore(sectionHeatScore, section.durationMs, item.durationMs),
     });
   }
   return lines;
+}
+
+function chooseExplicitProfilingDuration(
+  explicitDurationMs: number | null,
+  fallbackDurationMs: number | null,
+): number | null {
+  if (
+    explicitDurationMs == null ||
+    !Number.isFinite(explicitDurationMs) ||
+    explicitDurationMs <= 1e-12
+  ) {
+    return fallbackDurationMs;
+  }
+  return explicitDurationMs;
 }
 
 function buildSolveProfilingSections(solver: SolverReport): ProfilingSection[] {
@@ -3593,7 +3689,10 @@ function buildSolveProfilingSections(solver: SolverReport): ProfilingSection[] {
     createProfilingSection("Setup", null, [], setupSections),
     createProfilingSection(
       "Solve",
-      solver.solve_s == null ? solveTotal?.durationMs ?? null : solver.solve_s * 1000,
+      chooseExplicitProfilingDuration(
+        solver.solve_s == null ? null : solver.solve_s * 1000,
+        solveTotal?.durationMs ?? null,
+      ),
       [],
       solveSections,
     ),
@@ -3615,46 +3714,37 @@ function appendSolveProfilingLog(solver: SolverReport | null | undefined): void 
     rootDurations.length > 0 ? rootDurations.reduce((best, value) => Math.min(best, value)) : null;
   const rootWorstMs =
     rootDurations.length > 0 ? rootDurations.reduce((worst, value) => Math.max(worst, value)) : null;
-  const rootTotalDurationMs = sumProfilingDurations(sections);
-  const renderedLines = sections.flatMap((section, index) => {
+  const renderedBlocks = sections.map((section, index) => {
     const sectionHeatScore = normalizeProfilingHeatScore(section.durationMs, rootBestMs, rootWorstMs);
     return flattenProfilingSection(
       section,
       [],
       index === sections.length - 1,
       sectionHeatScore,
-      rootTotalDurationMs,
+      null,
+      true,
     );
   });
+  const renderedLines = renderedBlocks.flat();
   const timeWidth = renderedLines.reduce((width, line) => Math.max(width, line.value.length), 0);
   const labelWidth = renderedLines.reduce((width, line) => Math.max(width, line.label.length), 0);
-  const shareWidth = renderedLines.reduce((width, line) => Math.max(width, line.share.length), 0);
-  const countedLines = renderedLines.filter(
-    (line) => line.countText != null && line.avgText != null,
-  );
-  const countWidth = countedLines.reduce(
-    (width, line) => Math.max(width, (line.countText ?? "").length),
-    0,
-  );
-  const avgWidth = countedLines.reduce(
-    (width, line) => Math.max(width, (line.avgText ?? "").length),
+  const metadataWidth = renderedLines.reduce(
+    (width, line) => Math.max(width, (line.metadata ?? "").length),
     0,
   );
   appendLogLine("solve profiling:", LOG_LEVEL.console);
-  for (const line of renderedLines) {
-    const paddedLabel = line.label.padEnd(labelWidth, " ");
-    const paddedTime = line.value.padStart(timeWidth, " ");
-    const coloredTime = colorizeSolveProfilingTime(paddedTime, line.heatScore);
-    const shareText = line.share.padStart(shareWidth, " ");
-    const countText =
-      line.countText == null ? null : (line.countText ?? "").padStart(countWidth, " ");
-    const avgText = line.avgText == null ? null : (line.avgText ?? "").padStart(avgWidth, " ");
-    const suffix =
-      countText == null || avgText == null ? "" : `  n=${countText}  avg=${avgText}`;
-    appendLogLine(
-      `  ${paddedLabel}  ${coloredTime}  share=${shareText}${suffix}`,
-      LOG_LEVEL.console,
-    );
+  for (const [blockIndex, block] of renderedBlocks.entries()) {
+    if (blockIndex > 0) {
+      appendLogLine("", LOG_LEVEL.console);
+    }
+    for (const line of block) {
+      const paddedLabel = line.label.padEnd(labelWidth, " ");
+      const paddedTime = line.value.padStart(timeWidth, " ");
+      const coloredTime = colorizeSolveProfilingTime(paddedTime, line.heatScore);
+      const metadata =
+        line.metadata == null ? "" : `  ${line.metadata.padStart(metadataWidth, " ")}`;
+      appendLogLine(`  ${paddedLabel}  ${coloredTime}${metadata}`, LOG_LEVEL.console);
+    }
   }
 }
 
@@ -4018,16 +4108,72 @@ function appendLogLine(line: string, level: LogLevelCode = LOG_LEVEL.console): v
   if (parts.length === 0) {
     parts.push("");
   }
-  state.logLines.push(...parts.map((textPart) => ({ text: textPart, level })));
-  if (state.logLines.length > 240) {
-    state.logLines.splice(0, state.logLines.length - 240);
+  const entries = parts.map((textPart) => ({ text: textPart, level }));
+  state.logLines.push(...entries);
+  const shouldStickToBottom = shouldConsoleStickToBottom();
+  solverLogEl.appendChild(buildLogLineElements(entries));
+  if (shouldStickToBottom) {
+    solverLogEl.scrollTop = solverLogEl.scrollHeight;
   }
-  renderLog();
 }
 
 function positiveFiniteOrNull(value: number | null | undefined): number | null {
   const numericValue = value ?? Number.NaN;
   return Number.isFinite(numericValue) && numericValue > 0 ? numericValue : null;
+}
+
+function hexToRgba(hex: string, alpha: number): string {
+  const normalized = hex.trim();
+  if (!/^#[0-9a-fA-F]{6}$/.test(normalized)) {
+    return hex;
+  }
+  const red = Number.parseInt(normalized.slice(1, 3), 16);
+  const green = Number.parseInt(normalized.slice(3, 5), 16);
+  const blue = Number.parseInt(normalized.slice(5, 7), 16);
+  return `rgba(${red}, ${green}, ${blue}, ${alpha})`;
+}
+
+function filterPathMarkerColors(length: number): string[] {
+  if (length <= 0) {
+    return [];
+  }
+  if (length === 1) {
+    return [hexToRgba(PALETTE[0], 0.9)];
+  }
+  return Array.from({ length }, (_, index) => {
+    const t = index / (length - 1);
+    const alpha = 0.08 + 0.72 * t;
+    return hexToRgba(PALETTE[0], alpha);
+  });
+}
+
+function filterPlotRanges(points: readonly FilterEntry[]): {
+  xRange: NumericRange;
+  yRange: NumericRange;
+} {
+  const positiveViolations = points
+    .map((point) => Math.max(point.violation, 1e-14))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  const objectives = points
+    .map((point) => point.objective)
+    .filter((value) => Number.isFinite(value));
+
+  const minViolation = positiveViolations.length > 0 ? Math.min(...positiveViolations) : 1e-14;
+  const maxViolation = positiveViolations.length > 0 ? Math.max(...positiveViolations) : 1;
+  const minLogViolation = Math.log10(minViolation);
+  const maxLogViolation = Math.log10(maxViolation);
+  const logSpan = Math.max(maxLogViolation - minLogViolation, 0.35);
+  const logPad = 0.14 * logSpan + 0.08;
+
+  const minObjective = objectives.length > 0 ? Math.min(...objectives) : -1;
+  const maxObjective = objectives.length > 0 ? Math.max(...objectives) : 1;
+  const objectiveSpan = Math.max(maxObjective - minObjective, 1e-6);
+  const objectivePad = 0.12 * objectiveSpan + 1e-6;
+
+  return {
+    xRange: [minLogViolation - logPad, maxLogViolation + logPad],
+    yRange: [minObjective - objectivePad, maxObjective + objectivePad],
+  };
 }
 
 const PROGRESS_TRACE = Object.freeze({
@@ -4330,7 +4476,6 @@ function updateProgressPlot(progress: SolveProgress): void {
       ],
     },
     [0, 1, 2, 3],
-    300,
   );
   updateProgressThresholds(progress);
 }
@@ -4352,12 +4497,26 @@ function ensureFilterPlot(): void {
   const data = [
     {
       type: "scatter",
-      mode: "lines+markers",
+      mode: "markers",
+      name: "Accepted history",
+      showlegend: false,
+      x: [],
+      y: [],
+      marker: {
+        size: 2,
+        color: hexToRgba(PALETTE[0], 0.14),
+      },
+    },
+    {
+      type: "scatter",
+      mode: "markers",
       name: "Accepted path",
       x: [],
       y: [],
-      line: { color: PALETTE[0], width: 2.6 },
-      marker: { size: 5 },
+      marker: {
+        size: 2,
+        color: [],
+      },
     },
     {
       type: "scatter",
@@ -4365,8 +4524,12 @@ function ensureFilterPlot(): void {
       name: "Filter frontier",
       x: [],
       y: [],
-      line: { color: PALETTE[1], width: 2.4, dash: "dot" },
-      marker: { size: 7 },
+      line: { color: PALETTE[1], width: 1.5, dash: "solid" },
+      marker: {
+        size: 3,
+        color: "#2f9f89",
+        line: { width: 0 },
+      },
     },
     {
       type: "scatter",
@@ -4375,9 +4538,9 @@ function ensureFilterPlot(): void {
       x: [],
       y: [],
       marker: {
-        size: 12,
+        size: 4,
         color: PALETTE[3],
-        line: { color: "rgba(229, 241, 244, 0.9)", width: 1.4 },
+        line: { width: 0 },
       },
     },
   ];
@@ -4445,25 +4608,43 @@ function updateFilterPlot(progress: SolveProgress): void {
     }
     filterPlotEl.innerHTML = `<div class="placeholder">Filter telemetry will appear here when the active solver is using filter globalization.</div>`;
     state.filterPlotReady = false;
-    state.filterPath = [];
+    state.filterRecentPath = [];
     state.lastFilterPointKey = null;
     return;
   }
   ensureFilterPlot();
   const pointKey = filterPointKey(progress, filter);
   if (state.lastFilterPointKey !== pointKey) {
-    state.filterPath.push(filter.current);
+    const acceptedPoint = {
+      violation: Math.max(filter.current.violation, 1e-14),
+      objective: filter.current.objective,
+    };
+    state.filterRecentPath.push(acceptedPoint);
+    if (state.filterRecentPath.length > FILTER_RECENT_POINT_LIMIT) {
+      state.filterRecentPath.shift();
+    }
     state.lastFilterPointKey = pointKey;
     window.Plotly.extendTraces(
       filterPlotEl,
       {
-        x: [[Math.max(filter.current.violation, 1e-14)]],
-        y: [[filter.current.objective]],
+        x: [[acceptedPoint.violation]],
+        y: [[acceptedPoint.objective]],
       },
-      [0],
-      600,
+      [FILTER_TRACE.history],
     );
   }
+  const recentPathX = state.filterRecentPath.map((entry) => entry.violation);
+  const recentPathY = state.filterRecentPath.map((entry) => entry.objective);
+  const acceptedPathColors = filterPathMarkerColors(state.filterRecentPath.length);
+  window.Plotly.restyle(
+    filterPlotEl,
+    {
+      x: [recentPathX],
+      y: [recentPathY],
+      "marker.color": [acceptedPathColors],
+    },
+    [FILTER_TRACE.recent],
+  );
   const frontier = [...filter.entries].sort((lhs, rhs) => lhs.violation - rhs.violation);
   const acceptanceLabel = filter.accepted_mode == null
     ? "current frontier"
@@ -4476,7 +4657,7 @@ function updateFilterPlot(progress: SolveProgress): void {
       x: [frontier.map((entry) => Math.max(entry.violation, 1e-14))],
       y: [frontier.map((entry) => entry.objective)],
     },
-    [1],
+    [FILTER_TRACE.frontier],
   );
   window.Plotly.restyle(
     filterPlotEl,
@@ -4484,11 +4665,16 @@ function updateFilterPlot(progress: SolveProgress): void {
       x: [[Math.max(filter.current.violation, 1e-14)]],
       y: [[filter.current.objective]],
     },
-    [2],
+    [FILTER_TRACE.current],
   );
+  const ranges = filterPlotRanges([...frontier, filter.current]);
   window.Plotly.relayout(filterPlotEl, {
     "annotations[0].text": `${filter.title} · ${acceptanceLabel}`,
     "yaxis.title": `${filter.objective_label} (-)`,
+    "xaxis.autorange": false,
+    "xaxis.range": ranges.xRange,
+    "yaxis.autorange": false,
+    "yaxis.range": ranges.yRange,
   });
 }
 
@@ -4864,12 +5050,24 @@ function startAnimation(): void {
   }, 140);
 }
 
-function scheduleArtifactRender(): void {
-  if (state.renderScheduled) {
+function clearScheduledArtifactRender(): void {
+  if (state.artifactRenderFrameHandle !== null) {
+    window.cancelAnimationFrame(state.artifactRenderFrameHandle);
+    state.artifactRenderFrameHandle = null;
+  }
+  state.renderScheduled = false;
+}
+
+function requestArtifactRenderFrame(): void {
+  if (state.artifactRenderFrameHandle !== null) {
     return;
   }
   state.renderScheduled = true;
-  requestAnimationFrame(() => {
+  state.artifactRenderFrameHandle = requestAnimationFrame(() => {
+    state.artifactRenderFrameHandle = null;
+    if (!state.renderScheduled) {
+      return;
+    }
     state.renderScheduled = false;
     renderMetrics();
     renderConstraintPanels();
@@ -4877,6 +5075,13 @@ function scheduleArtifactRender(): void {
     renderCharts();
     renderNotes(state.artifact?.notes ?? currentSpec()?.notes ?? []);
   });
+}
+
+function scheduleArtifactRender(force = false): void {
+  if (force) {
+    clearScheduledArtifactRender();
+  }
+  requestArtifactRenderFrame();
 }
 
 function handleSolveEvent(event: SolveEvent): void {
@@ -4918,7 +5123,7 @@ function handleSolveEvent(event: SolveEvent): void {
       renderCompileCacheStatus();
       void refreshCompileCacheStatus();
       appendSolveProfilingLog(state.terminalSolver);
-      scheduleArtifactRender();
+      scheduleArtifactRender(true);
       setStatusDisplay(statusDisplayForSolverReport(state.terminalSolver));
       break;
     case STREAM_EVENT_KIND.error:

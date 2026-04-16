@@ -209,8 +209,13 @@ pub struct InteriorPointIterationSnapshot {
     pub dual_inf: f64,
     pub comp_inf: Option<f64>,
     pub barrier_parameter: Option<f64>,
+    pub step_inf: Option<f64>,
     pub alpha: Option<f64>,
     pub line_search_iterations: Option<Index>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub line_search: Option<InteriorPointLineSearchInfo>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub direction_diagnostics: Option<InteriorPointDirectionDiagnostics>,
     pub linear_solver: InteriorPointLinearSolver,
     #[cfg_attr(
         feature = "serde",
@@ -224,6 +229,80 @@ pub struct InteriorPointIterationSnapshot {
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct InteriorPointBoundaryLimiter {
+    pub index: Index,
+    pub value: f64,
+    pub direction: f64,
+    pub alpha: f64,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct InteriorPointDirectionDiagnostics {
+    pub dx_inf: f64,
+    pub d_lambda_inf: f64,
+    pub ds_inf: f64,
+    pub dz_inf: f64,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub alpha_pr_limiter: Option<InteriorPointBoundaryLimiter>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub alpha_du_limiter: Option<InteriorPointBoundaryLimiter>,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct InteriorPointLineSearchTrial {
+    pub alpha: f64,
+    pub slack_positive: bool,
+    pub multipliers_positive: bool,
+    pub objective: Option<f64>,
+    pub barrier_objective: Option<f64>,
+    pub merit: Option<f64>,
+    pub eq_inf: Option<f64>,
+    pub ineq_inf: Option<f64>,
+    pub primal_inf: Option<f64>,
+    pub dual_inf: Option<f64>,
+    pub comp_inf: Option<f64>,
+    pub mu: Option<f64>,
+    pub residual_acceptable: Option<bool>,
+    pub local_filter_acceptable: Option<bool>,
+    pub filter_acceptable: Option<bool>,
+    pub filter_dominated: Option<bool>,
+    pub filter_sufficient_objective_reduction: Option<bool>,
+    pub filter_sufficient_violation_reduction: Option<bool>,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct InteriorPointLineSearchInfo {
+    pub initial_alpha_pr: f64,
+    pub initial_alpha_du: f64,
+    pub accepted_alpha: Option<f64>,
+    pub last_tried_alpha: f64,
+    pub backtrack_count: Index,
+    pub sigma: f64,
+    pub current_merit: f64,
+    pub current_barrier_objective: f64,
+    pub current_primal_inf: f64,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub filter_acceptance_mode: Option<FilterAcceptanceMode>,
+    pub rejected_trials: Vec<InteriorPointLineSearchTrial>,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug)]
+pub struct InteriorPointFailureContext {
+    pub final_state: Option<InteriorPointIterationSnapshot>,
+    pub last_accepted_state: Option<InteriorPointIterationSnapshot>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub failed_line_search: Option<InteriorPointLineSearchInfo>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub failed_direction_diagnostics: Option<InteriorPointDirectionDiagnostics>,
+    pub profiling: InteriorPointProfiling,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Error)]
 pub enum InteriorPointSolveError {
     #[error("invalid NLIP input: {0}")]
@@ -231,7 +310,7 @@ pub enum InteriorPointSolveError {
     #[error("NLIP linear solve failed using {solver:?}")]
     LinearSolve {
         solver: InteriorPointLinearSolver,
-        profiling: Box<InteriorPointProfiling>,
+        context: Box<InteriorPointFailureContext>,
     },
     #[error(
         "NLIP line search failed (residual merit {merit}, mu {mu}, step inf-norm {step_inf_norm})"
@@ -240,12 +319,12 @@ pub enum InteriorPointSolveError {
         merit: f64,
         mu: f64,
         step_inf_norm: f64,
-        profiling: Box<InteriorPointProfiling>,
+        context: Box<InteriorPointFailureContext>,
     },
     #[error("NLIP failed to converge in {iterations} iterations")]
     MaxIterations {
         iterations: Index,
-        profiling: Box<InteriorPointProfiling>,
+        context: Box<InteriorPointFailureContext>,
     },
 }
 
@@ -343,6 +422,7 @@ fn interior_point_filter_parameters(
         gamma_violation: options.filter_gamma_violation,
         armijo_c1: options.line_search_c1,
         violation_tol: options.constraint_tol,
+        theta_max: f64::INFINITY,
     }
 }
 
@@ -351,13 +431,46 @@ fn step_inf_norm(step: &[f64]) -> f64 {
 }
 
 fn fraction_to_boundary(current: &[f64], direction: &[f64], tau: f64) -> f64 {
+    fraction_to_boundary_with_limiter(current, direction, tau).0
+}
+
+fn fraction_to_boundary_with_limiter(
+    current: &[f64],
+    direction: &[f64],
+    tau: f64,
+) -> (f64, Option<InteriorPointBoundaryLimiter>) {
     let mut alpha = 1.0_f64;
-    for (&value, &delta) in current.iter().zip(direction.iter()) {
+    let mut limiter = None;
+    for (idx, (&value, &delta)) in current.iter().zip(direction.iter()).enumerate() {
         if delta < 0.0 {
-            alpha = alpha.min(-tau * value / delta);
+            let candidate = (-tau * value / delta).clamp(0.0, 1.0);
+            if candidate < alpha {
+                alpha = candidate;
+                limiter = Some(InteriorPointBoundaryLimiter {
+                    index: idx,
+                    value,
+                    direction: delta,
+                    alpha: candidate,
+                });
+            }
         }
     }
-    alpha.clamp(0.0, 1.0)
+    (alpha.clamp(0.0, 1.0), limiter)
+}
+
+fn interior_point_direction_diagnostics(
+    direction: &NewtonDirection,
+    alpha_pr_limiter: Option<InteriorPointBoundaryLimiter>,
+    alpha_du_limiter: Option<InteriorPointBoundaryLimiter>,
+) -> InteriorPointDirectionDiagnostics {
+    InteriorPointDirectionDiagnostics {
+        dx_inf: step_inf_norm(&direction.dx),
+        d_lambda_inf: step_inf_norm(&direction.d_lambda),
+        ds_inf: step_inf_norm(&direction.ds),
+        dz_inf: step_inf_norm(&direction.dz),
+        alpha_pr_limiter,
+        alpha_du_limiter,
+    }
 }
 
 fn barrier_parameter(slack: &[f64], multipliers: &[f64]) -> f64 {
@@ -713,48 +826,95 @@ fn solve_symmetric_system(
     };
     result.ok_or_else(|| InteriorPointSolveError::LinearSolve {
         solver,
-        profiling: Box::new(InteriorPointProfiling::default()),
+        context: Box::new(InteriorPointFailureContext {
+            final_state: None,
+            last_accepted_state: None,
+            failed_line_search: None,
+            failed_direction_diagnostics: None,
+            profiling: InteriorPointProfiling::default(),
+        }),
     })
 }
 
 fn finalised_interior_point_failure_profiling(
     profiling: &InteriorPointProfiling,
     solve_started: Instant,
-) -> Box<InteriorPointProfiling> {
+) -> InteriorPointProfiling {
     let mut profiling = profiling.clone();
     finalise_interior_point_profiling(&mut profiling, solve_started);
-    Box::new(profiling)
+    profiling
+}
+
+fn interior_point_failure_context(
+    final_state: Option<InteriorPointIterationSnapshot>,
+    last_accepted_state: Option<InteriorPointIterationSnapshot>,
+    failed_line_search: Option<InteriorPointLineSearchInfo>,
+    failed_direction_diagnostics: Option<InteriorPointDirectionDiagnostics>,
+    profiling: &InteriorPointProfiling,
+    solve_started: Instant,
+) -> Box<InteriorPointFailureContext> {
+    Box::new(InteriorPointFailureContext {
+        final_state,
+        last_accepted_state,
+        failed_line_search,
+        failed_direction_diagnostics,
+        profiling: finalised_interior_point_failure_profiling(profiling, solve_started),
+    })
 }
 
 fn with_interior_point_failure_profiling(
     error: InteriorPointSolveError,
+    final_state: Option<InteriorPointIterationSnapshot>,
+    last_accepted_state: Option<InteriorPointIterationSnapshot>,
     profiling: &InteriorPointProfiling,
     solve_started: Instant,
 ) -> InteriorPointSolveError {
     match error {
-        InteriorPointSolveError::LinearSolve { solver, .. } => {
+        InteriorPointSolveError::LinearSolve { solver, context } => {
             InteriorPointSolveError::LinearSolve {
                 solver,
-                profiling: finalised_interior_point_failure_profiling(profiling, solve_started),
+                context: interior_point_failure_context(
+                    final_state.or(context.final_state),
+                    last_accepted_state.or(context.last_accepted_state),
+                    context.failed_line_search,
+                    context.failed_direction_diagnostics,
+                    profiling,
+                    solve_started,
+                ),
             }
         }
         InteriorPointSolveError::LineSearchFailed {
             merit,
             mu,
             step_inf_norm,
-            ..
+            context,
         } => InteriorPointSolveError::LineSearchFailed {
             merit,
             mu,
             step_inf_norm,
-            profiling: finalised_interior_point_failure_profiling(profiling, solve_started),
+            context: interior_point_failure_context(
+                final_state.or(context.final_state),
+                last_accepted_state.or(context.last_accepted_state),
+                context.failed_line_search,
+                context.failed_direction_diagnostics,
+                profiling,
+                solve_started,
+            ),
         },
-        InteriorPointSolveError::MaxIterations { iterations, .. } => {
-            InteriorPointSolveError::MaxIterations {
-                iterations,
-                profiling: finalised_interior_point_failure_profiling(profiling, solve_started),
-            }
-        }
+        InteriorPointSolveError::MaxIterations {
+            iterations,
+            context,
+        } => InteriorPointSolveError::MaxIterations {
+            iterations,
+            context: interior_point_failure_context(
+                final_state.or(context.final_state),
+                last_accepted_state.or(context.last_accepted_state),
+                context.failed_line_search,
+                context.failed_direction_diagnostics,
+                profiling,
+                solve_started,
+            ),
+        },
         InteriorPointSolveError::InvalidInput(message) => {
             InteriorPointSolveError::InvalidInput(message)
         }
@@ -1673,6 +1833,7 @@ where
     let mut nonlinear_inequality_multipliers = vec![0.0; inequality_count];
     let mut last_linear_solver = options.linear_solver;
     let mut filter_entries = Vec::new();
+    let mut last_accepted_state: Option<InteriorPointIterationSnapshot> = None;
 
     if options.max_iters == 0 {
         let equality_inf = inf_norm(&initial_state.equality_values);
@@ -1707,8 +1868,11 @@ where
             dual_inf,
             comp_inf: (augmented_inequality_count > 0).then_some(complementarity_inf),
             barrier_parameter: (augmented_inequality_count > 0).then_some(mu),
+            step_inf: None,
             alpha: None,
             line_search_iterations: None,
+            line_search: None,
+            direction_diagnostics: None,
             linear_solver: last_linear_solver,
             linear_solve_time: None,
             filter: options.filter_method.then(|| FilterInfo {
@@ -1761,7 +1925,14 @@ where
         }
         return Err(InteriorPointSolveError::MaxIterations {
             iterations: options.max_iters,
-            profiling: finalised_interior_point_failure_profiling(&profiling, solve_started),
+            context: interior_point_failure_context(
+                Some(snapshot),
+                last_accepted_state.clone(),
+                None,
+                None,
+                &profiling,
+                solve_started,
+            ),
         });
     }
 
@@ -1830,6 +2001,35 @@ where
         if options.filter_method && filter_entries.is_empty() {
             super::filter::update_frontier(&mut filter_entries, current_filter_entry.clone());
         }
+        let current_snapshot = InteriorPointIterationSnapshot {
+            iteration,
+            phase: if iteration == 0 {
+                InteriorPointIterationPhase::Initial
+            } else {
+                InteriorPointIterationPhase::AcceptedStep
+            },
+            x: x.clone(),
+            objective: state.objective_value,
+            eq_inf: (equality_count > 0).then_some(equality_inf),
+            ineq_inf: (augmented_inequality_count > 0).then_some(inequality_inf),
+            dual_inf,
+            comp_inf: (augmented_inequality_count > 0).then_some(complementarity_inf),
+            barrier_parameter: (augmented_inequality_count > 0).then_some(mu),
+            step_inf: None,
+            alpha: None,
+            line_search_iterations: None,
+            line_search: None,
+            direction_diagnostics: None,
+            linear_solver: last_linear_solver,
+            linear_solve_time: None,
+            filter: options.filter_method.then(|| FilterInfo {
+                current: current_filter_entry.clone(),
+                entries: filter_entries.clone(),
+                accepted_mode: None,
+            }),
+            timing: InteriorPointIterationTiming::default(),
+            events: Vec::new(),
+        };
 
         if primal_inf <= options.constraint_tol
             && dual_inf <= options.dual_tol
@@ -1851,8 +2051,11 @@ where
                 dual_inf,
                 comp_inf: (augmented_inequality_count > 0).then_some(complementarity_inf),
                 barrier_parameter: (augmented_inequality_count > 0).then_some(mu),
+                step_inf: None,
                 alpha: None,
                 line_search_iterations: None,
+                line_search: None,
+                direction_diagnostics: None,
                 linear_solver: last_linear_solver,
                 linear_solve_time: None,
                 filter: options.filter_method.then(|| FilterInfo {
@@ -2124,23 +2327,36 @@ where
             solver: options.linear_solver,
             regularization: options.regularization,
         })
-        .map_err(|error| with_interior_point_failure_profiling(error, &profiling, solve_started))?;
+        .map_err(|error| {
+            with_interior_point_failure_profiling(
+                error,
+                Some(current_snapshot.clone()),
+                last_accepted_state.clone(),
+                &profiling,
+                solve_started,
+            )
+        })?;
         last_linear_solver = direction.solver_used;
         let linear_elapsed = linear_started.elapsed();
         profiling.linear_solves += 1;
         profiling.linear_solve_time += linear_elapsed;
         iteration_linear_solve_time += linear_elapsed;
 
-        let alpha_pr = if augmented_inequality_count > 0 {
-            fraction_to_boundary(&slack, &direction.ds, options.fraction_to_boundary)
+        let (alpha_pr, alpha_pr_limiter) = if augmented_inequality_count > 0 {
+            fraction_to_boundary_with_limiter(&slack, &direction.ds, options.fraction_to_boundary)
         } else {
-            1.0
+            (1.0, None)
         };
-        let alpha_du = if augmented_inequality_count > 0 {
-            fraction_to_boundary(&z, &direction.dz, options.fraction_to_boundary)
+        let (alpha_du, alpha_du_limiter) = if augmented_inequality_count > 0 {
+            fraction_to_boundary_with_limiter(&z, &direction.dz, options.fraction_to_boundary)
         } else {
-            1.0
+            (1.0, None)
         };
+        let current_direction_diagnostics = Some(interior_point_direction_diagnostics(
+            &direction,
+            alpha_pr_limiter.clone(),
+            alpha_du_limiter.clone(),
+        ));
         let mut alpha = alpha_pr.min(alpha_du).clamp(0.0, 1.0);
         if alpha <= 0.0 {
             return Err(InteriorPointSolveError::LineSearchFailed {
@@ -2153,7 +2369,32 @@ where
                 ),
                 mu,
                 step_inf_norm: step_inf_norm(&direction.dx),
-                profiling: finalised_interior_point_failure_profiling(&profiling, solve_started),
+                context: interior_point_failure_context(
+                    Some(current_snapshot.clone()),
+                    last_accepted_state.clone(),
+                    Some(InteriorPointLineSearchInfo {
+                        initial_alpha_pr: alpha_pr,
+                        initial_alpha_du: alpha_du,
+                        accepted_alpha: None,
+                        last_tried_alpha: 0.0,
+                        backtrack_count: 0,
+                        sigma,
+                        current_merit: merit_residual(
+                            equality_inf,
+                            inequality_inf,
+                            dual_inf,
+                            complementarity_inf,
+                            mu,
+                        ),
+                        current_barrier_objective,
+                        current_primal_inf: primal_inf,
+                        filter_acceptance_mode: None,
+                        rejected_trials: Vec::new(),
+                    }),
+                    current_direction_diagnostics.clone(),
+                    &profiling,
+                    solve_started,
+                ),
             });
         }
 
@@ -2170,7 +2411,10 @@ where
         let mut accepted = None;
         let mut best_feasible = None;
         let mut best_feasible_merit = f64::INFINITY;
+        let mut last_tried_alpha = alpha;
+        let mut rejected_trials = Vec::new();
         while alpha >= options.min_step {
+            last_tried_alpha = alpha;
             let trial_x = x
                 .iter()
                 .zip(direction.dx.iter())
@@ -2194,6 +2438,26 @@ where
             if trial_slack.iter().any(|value| *value <= 0.0)
                 || trial_z.iter().any(|value| *value <= 0.0)
             {
+                rejected_trials.push(InteriorPointLineSearchTrial {
+                    alpha,
+                    slack_positive: trial_slack.iter().all(|value| *value > 0.0),
+                    multipliers_positive: trial_z.iter().all(|value| *value > 0.0),
+                    objective: None,
+                    barrier_objective: None,
+                    merit: None,
+                    eq_inf: None,
+                    ineq_inf: None,
+                    primal_inf: None,
+                    dual_inf: None,
+                    comp_inf: None,
+                    mu: None,
+                    residual_acceptable: None,
+                    local_filter_acceptable: None,
+                    filter_acceptable: None,
+                    filter_dominated: None,
+                    filter_sufficient_objective_reduction: None,
+                    filter_sufficient_violation_reduction: None,
+                });
                 alpha *= options.line_search_beta;
                 line_search_iterations += 1;
                 continue;
@@ -2278,6 +2542,7 @@ where
                     &trial_filter_entry,
                     objective_satisfied,
                     objective_tolerance_adjusted,
+                    true,
                     filter_parameters,
                 )
             });
@@ -2302,6 +2567,28 @@ where
                 });
                 break;
             }
+            rejected_trials.push(InteriorPointLineSearchTrial {
+                alpha,
+                slack_positive: true,
+                multipliers_positive: true,
+                objective: Some(trial_state.objective_value),
+                barrier_objective: Some(trial_barrier_objective),
+                merit: Some(trial_merit),
+                eq_inf: Some(trial_eq_inf),
+                ineq_inf: Some(trial_ineq_inf),
+                primal_inf: Some(trial_primal_inf),
+                dual_inf: Some(trial_dual_inf),
+                comp_inf: Some(trial_comp_inf),
+                mu: Some(trial_mu),
+                residual_acceptable: Some(residual_accept),
+                local_filter_acceptable: Some(local_filter_accept),
+                filter_acceptable: filter_assessment.map(|assessment| assessment.filter_acceptable),
+                filter_dominated: filter_assessment.map(|assessment| assessment.filter_dominated),
+                filter_sufficient_objective_reduction: filter_assessment
+                    .map(|assessment| assessment.filter_sufficient_objective_reduction),
+                filter_sufficient_violation_reduction: filter_assessment
+                    .map(|assessment| assessment.filter_sufficient_violation_reduction),
+            });
             alpha *= options.line_search_beta;
             line_search_iterations += 1;
         }
@@ -2315,8 +2602,40 @@ where
                 merit: current_merit,
                 mu,
                 step_inf_norm: step_inf_norm(&direction.dx),
-                profiling: finalised_interior_point_failure_profiling(&profiling, solve_started),
+                context: interior_point_failure_context(
+                    Some(current_snapshot.clone()),
+                    last_accepted_state.clone(),
+                    Some(InteriorPointLineSearchInfo {
+                        initial_alpha_pr: alpha_pr,
+                        initial_alpha_du: alpha_du,
+                        accepted_alpha: None,
+                        last_tried_alpha,
+                        backtrack_count: line_search_iterations,
+                        sigma,
+                        current_merit,
+                        current_barrier_objective,
+                        current_primal_inf,
+                        filter_acceptance_mode: None,
+                        rejected_trials,
+                    }),
+                    current_direction_diagnostics.clone(),
+                    &profiling,
+                    solve_started,
+                ),
             });
+        };
+        let line_search_info = InteriorPointLineSearchInfo {
+            initial_alpha_pr: alpha_pr,
+            initial_alpha_du: alpha_du,
+            accepted_alpha: Some(alpha),
+            last_tried_alpha,
+            backtrack_count: line_search_iterations,
+            sigma,
+            current_merit,
+            current_barrier_objective,
+            current_primal_inf,
+            filter_acceptance_mode: accepted_trial.filter_acceptance_mode,
+            rejected_trials,
         };
 
         if options.verbose {
@@ -2402,8 +2721,45 @@ where
                 .then_some(accepted_trial.complementarity_inf),
             barrier_parameter: (augmented_inequality_count > 0)
                 .then_some(accepted_trial.mu.max(options.mu_min)),
+            step_inf: Some(step_inf_norm(&direction.dx)),
             alpha: Some(alpha),
             line_search_iterations: Some(line_search_iterations),
+            line_search: Some(line_search_info.clone()),
+            direction_diagnostics: current_direction_diagnostics.clone(),
+            linear_solver: direction.solver_used,
+            linear_solve_time: Some(iteration_linear_solve_time),
+            filter: options.filter_method.then(|| FilterInfo {
+                current: accepted_trial.filter_entry.clone(),
+                entries: filter_entries.clone(),
+                accepted_mode: accepted_trial.filter_acceptance_mode,
+            }),
+            timing: InteriorPointIterationTiming {
+                adapter_timing,
+                callback: iteration_callback_time,
+                kkt_assembly: iteration_kkt_assembly_time,
+                linear_solve: iteration_linear_solve_time,
+                preprocess: iteration_preprocess,
+                total: iteration_total,
+            },
+            events: events.clone(),
+        });
+        last_accepted_state = Some(InteriorPointIterationSnapshot {
+            iteration,
+            phase: InteriorPointIterationPhase::AcceptedStep,
+            x: accepted_trial.x.clone(),
+            objective: accepted_trial.objective,
+            eq_inf: (equality_count > 0).then_some(accepted_trial.equality_inf),
+            ineq_inf: (augmented_inequality_count > 0).then_some(accepted_trial.inequality_inf),
+            dual_inf: accepted_trial.dual_inf,
+            comp_inf: (augmented_inequality_count > 0)
+                .then_some(accepted_trial.complementarity_inf),
+            barrier_parameter: (augmented_inequality_count > 0)
+                .then_some(accepted_trial.mu.max(options.mu_min)),
+            step_inf: Some(step_inf_norm(&direction.dx)),
+            alpha: Some(alpha),
+            line_search_iterations: Some(line_search_iterations),
+            line_search: Some(line_search_info),
+            direction_diagnostics: current_direction_diagnostics,
             linear_solver: direction.solver_used,
             linear_solve_time: Some(iteration_linear_solve_time),
             filter: options.filter_method.then(|| FilterInfo {
@@ -2437,6 +2793,13 @@ where
 
     Err(InteriorPointSolveError::MaxIterations {
         iterations: options.max_iters,
-        profiling: finalised_interior_point_failure_profiling(&profiling, solve_started),
+        context: interior_point_failure_context(
+            last_accepted_state.clone(),
+            last_accepted_state.clone(),
+            None,
+            None,
+            &profiling,
+            solve_started,
+        ),
     })
 }

@@ -386,7 +386,8 @@ input[type="range"] {
   accent-color: var(--accent);
 }
 
-input[type="number"] {
+input[type="number"],
+.control-number-input {
   width: 100%;
   border-radius: 12px;
   border: 1px solid var(--line);

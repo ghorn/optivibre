@@ -645,6 +645,584 @@ where
     );
 }
 
+fn emit_log_lines<F>(emit: &Arc<Mutex<F>>, lines: impl IntoIterator<Item = String>)
+where
+    F: FnMut(SolveStreamEvent),
+{
+    for line in lines {
+        emit_event(
+            emit,
+            SolveStreamEvent::Log {
+                line,
+                level: SolveLogLevel::Console,
+            },
+        );
+    }
+}
+
+fn fmt_diag_sci(value: f64) -> String {
+    if value.is_finite() {
+        format!("{value:.3e}")
+    } else if value.is_nan() {
+        "NaN".to_string()
+    } else if value.is_sign_positive() {
+        "inf".to_string()
+    } else {
+        "-inf".to_string()
+    }
+}
+
+fn fmt_diag_opt_sci(value: Option<f64>) -> String {
+    value.map_or_else(|| "--".to_string(), fmt_diag_sci)
+}
+
+fn fmt_diag_opt_bool(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "--",
+    }
+}
+
+fn fmt_sqp_phase(phase: SqpIterationPhase) -> &'static str {
+    match phase {
+        SqpIterationPhase::Initial => "initial",
+        SqpIterationPhase::AcceptedStep => "accepted_step",
+        SqpIterationPhase::PostConvergence => "post_convergence",
+    }
+}
+
+fn fmt_nlip_phase(phase: optimization::InteriorPointIterationPhase) -> &'static str {
+    match phase {
+        optimization::InteriorPointIterationPhase::Initial => "initial",
+        optimization::InteriorPointIterationPhase::AcceptedStep => "accepted_step",
+        optimization::InteriorPointIterationPhase::Converged => "converged",
+    }
+}
+
+fn fmt_filter_mode(mode: Option<FilterAcceptanceMode>) -> &'static str {
+    match mode {
+        Some(FilterAcceptanceMode::ObjectiveArmijo) => "objective_armijo",
+        Some(FilterAcceptanceMode::ViolationReduction) => "violation_reduction",
+        None => "--",
+    }
+}
+
+fn fmt_sqp_step_kind(kind: Option<optimization::SqpStepKind>) -> &'static str {
+    match kind {
+        Some(optimization::SqpStepKind::Objective) => "f-step",
+        Some(optimization::SqpStepKind::Feasibility) => "h-step",
+        Some(optimization::SqpStepKind::Restoration) => "restoration",
+        None => "--",
+    }
+}
+
+fn append_filter_frontier_lines(lines: &mut Vec<String>, filter: &optimization::FilterInfo) {
+    let entries = &filter.entries;
+    if entries.is_empty() {
+        lines.push("    frontier is empty".to_string());
+        return;
+    }
+
+    let min_objective = entries
+        .iter()
+        .map(|entry| entry.objective)
+        .fold(f64::INFINITY, f64::min);
+    let max_objective = entries
+        .iter()
+        .map(|entry| entry.objective)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let min_violation = entries
+        .iter()
+        .map(|entry| entry.violation)
+        .fold(f64::INFINITY, f64::min);
+    let max_violation = entries
+        .iter()
+        .map(|entry| entry.violation)
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    let nearest_idx = entries
+        .iter()
+        .enumerate()
+        .min_by(|(_, lhs), (_, rhs)| {
+            let lhs_delta = (lhs.violation - filter.current.violation).abs();
+            let rhs_delta = (rhs.violation - filter.current.violation).abs();
+            lhs_delta
+                .partial_cmp(&rhs_delta)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    let nearest = &entries[nearest_idx];
+
+    lines.push(format!(
+        "    frontier span obj=[{}, {}] violation=[{}, {}]",
+        fmt_diag_sci(min_objective),
+        fmt_diag_sci(max_objective),
+        fmt_diag_sci(min_violation),
+        fmt_diag_sci(max_violation),
+    ));
+    lines.push(format!(
+        "    frontier nearest idx={} obj={} violation={} delta_obj={} delta_violation={}",
+        nearest_idx,
+        fmt_diag_sci(nearest.objective),
+        fmt_diag_sci(nearest.violation),
+        fmt_diag_sci(filter.current.objective - nearest.objective),
+        fmt_diag_sci(filter.current.violation - nearest.violation),
+    ));
+
+    if entries.len() <= 8 {
+        for (idx, entry) in entries.iter().enumerate() {
+            lines.push(format!(
+                "    frontier[{idx}] obj={} violation={}",
+                fmt_diag_sci(entry.objective),
+                fmt_diag_sci(entry.violation),
+            ));
+        }
+        return;
+    }
+
+    let mut sample_indices = vec![0, entries.len() / 2, entries.len() - 1];
+    if nearest_idx > 0 {
+        sample_indices.push(nearest_idx - 1);
+    }
+    sample_indices.push(nearest_idx);
+    if nearest_idx + 1 < entries.len() {
+        sample_indices.push(nearest_idx + 1);
+    }
+    sample_indices.sort_unstable();
+    sample_indices.dedup();
+
+    lines.push(format!(
+        "    frontier samples ({} omitted):",
+        entries.len().saturating_sub(sample_indices.len())
+    ));
+    for idx in sample_indices {
+        let entry = &entries[idx];
+        lines.push(format!(
+            "      [{idx}] obj={} violation={}",
+            fmt_diag_sci(entry.objective),
+            fmt_diag_sci(entry.violation),
+        ));
+    }
+}
+
+fn append_sqp_step_diagnostics_lines(
+    lines: &mut Vec<String>,
+    diagnostics: &optimization::SqpStepDiagnostics,
+) {
+    lines.push(format!(
+        "  step model obj_dir={} merit_dir={} qp_model={} linear_eq_inf={} linear_ineq_inf={} linear_primal={}",
+        fmt_diag_sci(diagnostics.objective_directional_derivative),
+        fmt_diag_sci(diagnostics.exact_merit_directional_derivative),
+        fmt_diag_sci(diagnostics.qp_model_change),
+        fmt_diag_opt_sci(diagnostics.linearized_eq_inf),
+        fmt_diag_opt_sci(diagnostics.linearized_ineq_inf),
+        fmt_diag_sci(diagnostics.linearized_primal_inf),
+    ));
+    lines.push(format!(
+        "  filter current_theta={} theta_max={} switching={} restoration={} elastic_recovery={}",
+        fmt_diag_sci(diagnostics.current_violation),
+        fmt_diag_sci(diagnostics.theta_max),
+        diagnostics.switching_condition_satisfied,
+        diagnostics.restoration_phase,
+        diagnostics.elastic_recovery_used,
+    ));
+    lines.push(format!(
+        "  regularization min_eig={} shift={} shifted_by_analysis={}",
+        fmt_diag_sci(diagnostics.regularization.min_eigenvalue),
+        fmt_diag_sci(diagnostics.regularization.applied_shift),
+        diagnostics.regularization.shifted_by_analysis,
+    ));
+}
+
+fn append_nlip_direction_diagnostics_lines(
+    lines: &mut Vec<String>,
+    diagnostics: &optimization::InteriorPointDirectionDiagnostics,
+) {
+    lines.push(format!(
+        "  direction dx_inf={} dlambda_inf={} ds_inf={} dz_inf={}",
+        fmt_diag_sci(diagnostics.dx_inf),
+        fmt_diag_sci(diagnostics.d_lambda_inf),
+        fmt_diag_sci(diagnostics.ds_inf),
+        fmt_diag_sci(diagnostics.dz_inf),
+    ));
+    if let Some(limiter) = &diagnostics.alpha_pr_limiter {
+        lines.push(format!(
+            "  alpha_pr limiter idx={} value={} delta={} alpha={}",
+            limiter.index,
+            fmt_diag_sci(limiter.value),
+            fmt_diag_sci(limiter.direction),
+            fmt_diag_sci(limiter.alpha),
+        ));
+    }
+    if let Some(limiter) = &diagnostics.alpha_du_limiter {
+        lines.push(format!(
+            "  alpha_du limiter idx={} value={} delta={} alpha={}",
+            limiter.index,
+            fmt_diag_sci(limiter.value),
+            fmt_diag_sci(limiter.direction),
+            fmt_diag_sci(limiter.alpha),
+        ));
+    }
+}
+
+fn append_sqp_snapshot_lines(
+    lines: &mut Vec<String>,
+    heading: &str,
+    snapshot: &SqpIterationSnapshot,
+) {
+    lines.push(format!("{heading}:"));
+    lines.push(format!(
+        "  iter={} phase={} obj={} eq_inf={} ineq_inf={} dual_inf={} comp_inf={} step_inf={} penalty={}",
+        snapshot.iteration,
+        fmt_sqp_phase(snapshot.phase),
+        fmt_diag_sci(snapshot.objective),
+        fmt_diag_opt_sci(snapshot.eq_inf),
+        fmt_diag_opt_sci(snapshot.ineq_inf),
+        fmt_diag_sci(snapshot.dual_inf),
+        fmt_diag_opt_sci(snapshot.comp_inf),
+        fmt_diag_opt_sci(snapshot.step_inf),
+        fmt_diag_sci(snapshot.penalty),
+    ));
+    if let Some(filter) = &snapshot.filter {
+        lines.push(format!(
+            "  filter current_obj={} current_violation={} frontier_entries={} accepted_mode={}",
+            fmt_diag_sci(filter.current.objective),
+            fmt_diag_sci(filter.current.violation),
+            filter.entries.len(),
+            fmt_filter_mode(filter.accepted_mode),
+        ));
+        append_filter_frontier_lines(lines, filter);
+    }
+    if let Some(line_search) = &snapshot.line_search {
+        lines.push(format!(
+            "  accepted line search alpha={} ls_it={} armijo={} obj_armijo={} wolfe={} violation={} filter_mode={} step_kind={} theta_ok={} switching={} soc={} soc_attempted={} restoration_attempted={} elastic_attempted={}",
+            fmt_diag_sci(line_search.accepted_alpha),
+            line_search.backtrack_count,
+            line_search.armijo_satisfied,
+            fmt_diag_opt_bool(line_search.objective_armijo_satisfied),
+            fmt_diag_opt_bool(line_search.wolfe_satisfied),
+            line_search.violation_satisfied,
+            fmt_filter_mode(line_search.filter_acceptance_mode),
+            fmt_sqp_step_kind(line_search.step_kind),
+            fmt_diag_opt_bool(line_search.filter_theta_acceptable),
+            fmt_diag_opt_bool(line_search.switching_condition_satisfied),
+            line_search.second_order_correction_used,
+            line_search.second_order_correction_attempted,
+            line_search.restoration_attempted,
+            line_search.elastic_recovery_attempted,
+        ));
+    }
+    if let Some(diagnostics) = &snapshot.step_diagnostics {
+        append_sqp_step_diagnostics_lines(lines, diagnostics);
+    }
+    if let Some(qp) = &snapshot.qp {
+        lines.push(format!(
+            "  qp status={:?} raw_status={} iters={} solve_time={} setup_time={}",
+            qp.status,
+            qp.raw_status,
+            qp.iteration_count,
+            fmt_diag_sci(qp.solve_time.as_secs_f64()),
+            fmt_diag_sci(qp.setup_time.as_secs_f64()),
+        ));
+    }
+}
+
+fn append_sqp_line_search_failure_lines(
+    lines: &mut Vec<String>,
+    error: &ClarabelSqpError,
+    info: &optimization::SqpLineSearchInfo,
+) {
+    let (directional_derivative, step_inf_norm, penalty) = match error {
+        ClarabelSqpError::LineSearchFailed {
+            directional_derivative,
+            step_inf_norm,
+            penalty,
+            ..
+        } => (*directional_derivative, *step_inf_norm, *penalty),
+        ClarabelSqpError::RestorationFailed { step_inf_norm, .. } => {
+            (f64::NAN, *step_inf_norm, f64::NAN)
+        }
+        _ => return,
+    };
+    let armijo_rejects = info
+        .rejected_trials
+        .iter()
+        .filter(|trial| !trial.armijo_satisfied)
+        .count();
+    let filter_rejects = info
+        .rejected_trials
+        .iter()
+        .filter(|trial| trial.filter_acceptable == Some(false))
+        .count();
+    let wolfe_rejects = info
+        .rejected_trials
+        .iter()
+        .filter(|trial| trial.wolfe_satisfied == Some(false))
+        .count();
+    let violation_rejects = info
+        .rejected_trials
+        .iter()
+        .filter(|trial| !trial.violation_satisfied)
+        .count();
+    lines.push("line search failure:".to_string());
+    lines.push(format!(
+        "  directional_derivative={} step_inf={} penalty={} last_alpha={} rejected={} armijo_rejects={} filter_rejects={} wolfe_rejects={} violation_rejects={} step_kind={} switching={} soc_attempted={} restoration_attempted={} elastic_attempted={}",
+        fmt_diag_sci(directional_derivative),
+        fmt_diag_sci(step_inf_norm),
+        fmt_diag_sci(penalty),
+        fmt_diag_sci(info.last_tried_alpha),
+        info.rejected_trials.len(),
+        armijo_rejects,
+        filter_rejects,
+        wolfe_rejects,
+        violation_rejects,
+        fmt_sqp_step_kind(info.step_kind),
+        fmt_diag_opt_bool(info.switching_condition_satisfied),
+        info.second_order_correction_attempted,
+        info.restoration_attempted,
+        info.elastic_recovery_attempted,
+    ));
+    if let ClarabelSqpError::LineSearchFailed { context, .. }
+    | ClarabelSqpError::RestorationFailed { context, .. } = error
+    {
+        if let Some(diagnostics) = &context.failed_step_diagnostics {
+            append_sqp_step_diagnostics_lines(lines, diagnostics);
+        }
+    }
+    for trial in &info.rejected_trials {
+        lines.push(format!(
+            "  reject alpha={} merit={} obj={} primal={} eq_inf={} ineq_inf={} armijo={} obj_armijo={} wolfe={} violation={} filter_ok={} filter_dom={} theta_ok={} switching={} filter_obj={} filter_violation={}",
+            fmt_diag_sci(trial.alpha),
+            fmt_diag_sci(trial.merit),
+            fmt_diag_sci(trial.objective),
+            fmt_diag_sci(trial.primal_inf),
+            fmt_diag_opt_sci(trial.eq_inf),
+            fmt_diag_opt_sci(trial.ineq_inf),
+            trial.armijo_satisfied,
+            fmt_diag_opt_bool(trial.objective_armijo_satisfied),
+            fmt_diag_opt_bool(trial.wolfe_satisfied),
+            trial.violation_satisfied,
+            fmt_diag_opt_bool(trial.filter_acceptable),
+            fmt_diag_opt_bool(trial.filter_dominated),
+            fmt_diag_opt_bool(trial.filter_theta_acceptable),
+            fmt_diag_opt_bool(trial.switching_condition_satisfied),
+            fmt_diag_opt_bool(trial.filter_sufficient_objective_reduction),
+            fmt_diag_opt_bool(trial.filter_sufficient_violation_reduction),
+        ));
+    }
+}
+
+fn sqp_failure_diagnostic_lines(error: &ClarabelSqpError) -> Vec<String> {
+    let context = match error {
+        ClarabelSqpError::MaxIterations { context, .. }
+        | ClarabelSqpError::QpSolve { context, .. }
+        | ClarabelSqpError::UnconstrainedStepSolve { context }
+        | ClarabelSqpError::LineSearchFailed { context, .. }
+        | ClarabelSqpError::RestorationFailed { context, .. }
+        | ClarabelSqpError::Stalled { context, .. }
+        | ClarabelSqpError::NonFiniteCallbackOutput { context, .. } => context.as_ref(),
+        ClarabelSqpError::InvalidInput(_)
+        | ClarabelSqpError::NonFiniteInput { .. }
+        | ClarabelSqpError::Setup(_) => return Vec::new(),
+    };
+    let mut lines = vec![
+        String::new(),
+        "failure diagnostics (SQP):".to_string(),
+        format!("  termination={:?}", context.termination),
+    ];
+    if let Some(snapshot) = &context.final_state {
+        append_sqp_snapshot_lines(&mut lines, "current iterate", snapshot);
+    }
+    if let Some(snapshot) = &context.last_accepted_state {
+        append_sqp_snapshot_lines(&mut lines, "last accepted iterate", snapshot);
+    }
+    if let Some(info) = &context.failed_line_search {
+        append_sqp_line_search_failure_lines(&mut lines, error, info);
+    }
+    if let Some(qp_failure) = &context.qp_failure {
+        lines.push("qp failure:".to_string());
+        lines.push(format!(
+            "  vars={} constraints={} lin_obj_inf={} rhs_inf={} hdiag_min={} hdiag_max={} elastic_recovery={} cones={}",
+            qp_failure.variable_count,
+            qp_failure.constraint_count,
+            fmt_diag_sci(qp_failure.linear_objective_inf_norm),
+            fmt_diag_sci(qp_failure.rhs_inf_norm),
+            fmt_diag_sci(qp_failure.hessian_diag_min),
+            fmt_diag_sci(qp_failure.hessian_diag_max),
+            qp_failure.elastic_recovery,
+            qp_failure
+                .cones
+                .iter()
+                .map(|cone| format!("{}:{}", cone.kind, cone.dim))
+                .collect::<Vec<_>>()
+                .join(","),
+        ));
+    }
+    lines
+}
+
+fn append_nlip_snapshot_lines(
+    lines: &mut Vec<String>,
+    heading: &str,
+    snapshot: &InteriorPointIterationSnapshot,
+) {
+    lines.push(format!("{heading}:"));
+    lines.push(format!(
+        "  iter={} phase={} obj={} eq_inf={} ineq_inf={} dual_inf={} comp_inf={} mu={} step_inf={} alpha={} ls_it={}",
+        snapshot.iteration,
+        fmt_nlip_phase(snapshot.phase),
+        fmt_diag_sci(snapshot.objective),
+        fmt_diag_opt_sci(snapshot.eq_inf),
+        fmt_diag_opt_sci(snapshot.ineq_inf),
+        fmt_diag_sci(snapshot.dual_inf),
+        fmt_diag_opt_sci(snapshot.comp_inf),
+        fmt_diag_opt_sci(snapshot.barrier_parameter),
+        fmt_diag_opt_sci(snapshot.step_inf),
+        fmt_diag_opt_sci(snapshot.alpha),
+        snapshot
+            .line_search_iterations
+            .map_or_else(|| "--".to_string(), |value| value.to_string()),
+    ));
+    if let Some(filter) = &snapshot.filter {
+        lines.push(format!(
+            "  filter current_obj={} current_violation={} frontier_entries={} accepted_mode={}",
+            fmt_diag_sci(filter.current.objective),
+            fmt_diag_sci(filter.current.violation),
+            filter.entries.len(),
+            fmt_filter_mode(filter.accepted_mode),
+        ));
+        append_filter_frontier_lines(lines, filter);
+    }
+    if let Some(line_search) = &snapshot.line_search {
+        lines.push(format!(
+            "  accepted line search alpha={} alpha_pr={} alpha_du={} sigma={} ls_it={} filter_mode={} rejected={}",
+            fmt_diag_opt_sci(line_search.accepted_alpha),
+            fmt_diag_sci(line_search.initial_alpha_pr),
+            fmt_diag_sci(line_search.initial_alpha_du),
+            fmt_diag_sci(line_search.sigma),
+            line_search.backtrack_count,
+            fmt_filter_mode(line_search.filter_acceptance_mode),
+            line_search.rejected_trials.len(),
+        ));
+    }
+    if let Some(diagnostics) = &snapshot.direction_diagnostics {
+        append_nlip_direction_diagnostics_lines(lines, diagnostics);
+    }
+}
+
+fn append_nlip_line_search_failure_lines(
+    lines: &mut Vec<String>,
+    error: &InteriorPointSolveError,
+    info: &optimization::InteriorPointLineSearchInfo,
+) {
+    let (merit, mu, step_inf_norm) = match error {
+        InteriorPointSolveError::LineSearchFailed {
+            merit,
+            mu,
+            step_inf_norm,
+            ..
+        } => (*merit, *mu, *step_inf_norm),
+        _ => return,
+    };
+    let positivity_rejects = info
+        .rejected_trials
+        .iter()
+        .filter(|trial| !trial.slack_positive || !trial.multipliers_positive)
+        .count();
+    let residual_rejects = info
+        .rejected_trials
+        .iter()
+        .filter(|trial| trial.residual_acceptable == Some(false))
+        .count();
+    let filter_rejects = info
+        .rejected_trials
+        .iter()
+        .filter(|trial| trial.filter_acceptable == Some(false))
+        .count();
+    lines.push("line search failure:".to_string());
+    lines.push(format!(
+        "  merit={} mu={} step_inf={} alpha_pr={} alpha_du={} last_alpha={} sigma={} rejected={} positivity_rejects={} residual_rejects={} filter_rejects={} filter_mode={}",
+        fmt_diag_sci(merit),
+        fmt_diag_sci(mu),
+        fmt_diag_sci(step_inf_norm),
+        fmt_diag_sci(info.initial_alpha_pr),
+        fmt_diag_sci(info.initial_alpha_du),
+        fmt_diag_sci(info.last_tried_alpha),
+        fmt_diag_sci(info.sigma),
+        info.rejected_trials.len(),
+        positivity_rejects,
+        residual_rejects,
+        filter_rejects,
+        fmt_filter_mode(info.filter_acceptance_mode),
+    ));
+    lines.push(format!(
+        "  current_merit={} current_barrier_obj={} current_primal_inf={}",
+        fmt_diag_sci(info.current_merit),
+        fmt_diag_sci(info.current_barrier_objective),
+        fmt_diag_sci(info.current_primal_inf),
+    ));
+    if let InteriorPointSolveError::LineSearchFailed { context, .. } = error {
+        if let Some(diagnostics) = &context.failed_direction_diagnostics {
+            append_nlip_direction_diagnostics_lines(lines, diagnostics);
+        }
+    }
+    for trial in &info.rejected_trials {
+        lines.push(format!(
+            "  reject alpha={} slack_positive={} multipliers_positive={} merit={} barrier_obj={} primal={} dual={} comp={} mu={} residual={} local_filter={} filter_ok={} filter_dom={} filter_obj={} filter_violation={}",
+            fmt_diag_sci(trial.alpha),
+            trial.slack_positive,
+            trial.multipliers_positive,
+            fmt_diag_opt_sci(trial.merit),
+            fmt_diag_opt_sci(trial.barrier_objective),
+            fmt_diag_opt_sci(trial.primal_inf),
+            fmt_diag_opt_sci(trial.dual_inf),
+            fmt_diag_opt_sci(trial.comp_inf),
+            fmt_diag_opt_sci(trial.mu),
+            fmt_diag_opt_bool(trial.residual_acceptable),
+            fmt_diag_opt_bool(trial.local_filter_acceptable),
+            fmt_diag_opt_bool(trial.filter_acceptable),
+            fmt_diag_opt_bool(trial.filter_dominated),
+            fmt_diag_opt_bool(trial.filter_sufficient_objective_reduction),
+            fmt_diag_opt_bool(trial.filter_sufficient_violation_reduction),
+        ));
+    }
+}
+
+fn nlip_failure_diagnostic_lines(error: &InteriorPointSolveError) -> Vec<String> {
+    let context = match error {
+        InteriorPointSolveError::InvalidInput(_) => return Vec::new(),
+        InteriorPointSolveError::LinearSolve { context, .. }
+        | InteriorPointSolveError::LineSearchFailed { context, .. }
+        | InteriorPointSolveError::MaxIterations { context, .. } => context.as_ref(),
+    };
+    let mut lines = vec![String::new(), "failure diagnostics (NLIP):".to_string()];
+    match error {
+        InteriorPointSolveError::LinearSolve { solver, .. } => lines.push(format!(
+            "  termination=linear_solve solver={}",
+            solver.label()
+        )),
+        InteriorPointSolveError::LineSearchFailed { .. } => {
+            lines.push("  termination=line_search".to_string())
+        }
+        InteriorPointSolveError::MaxIterations { iterations, .. } => {
+            lines.push(format!("  termination=max_iterations limit={iterations}"))
+        }
+        InteriorPointSolveError::InvalidInput(_) => {}
+    }
+    if let Some(snapshot) = &context.final_state {
+        append_nlip_snapshot_lines(&mut lines, "current iterate", snapshot);
+    }
+    if let Some(snapshot) = &context.last_accepted_state {
+        append_nlip_snapshot_lines(&mut lines, "last accepted iterate", snapshot);
+    }
+    if let Some(info) = &context.failed_line_search {
+        append_nlip_line_search_failure_lines(&mut lines, error, info);
+    }
+    lines
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SqpConfig {
     pub max_iters: usize,
@@ -2485,7 +3063,7 @@ pub fn default_transcription(intervals: usize) -> TranscriptionConfig {
 pub fn default_sqp_config() -> SqpConfig {
     SqpConfig {
         max_iters: 200,
-        dual_tol: 5.0e-2,
+        dual_tol: 1.0e-6,
         constraint_tol: 1.0e-8,
         complementarity_tol: 1.0e-6,
     }
@@ -5147,11 +5725,11 @@ where
             ) {
                 Ok(solved) => solved,
                 Err(error) => {
-                    if let Some(report) = error
-                        .downcast_ref::<ClarabelSqpError>()
-                        .and_then(|typed| sqp_failure_solver_report(typed, &running_solver))
-                    {
-                        emit_failure_status(&emit, solver_method, report);
+                    if let Some(typed) = error.downcast_ref::<ClarabelSqpError>() {
+                        emit_log_lines(&emit, sqp_failure_diagnostic_lines(typed));
+                        if let Some(report) = sqp_failure_solver_report(typed, &running_solver) {
+                            emit_failure_status(&emit, solver_method, report);
+                        }
                     }
                     return Err(error.into());
                 }
@@ -5245,11 +5823,11 @@ where
             ) {
                 Ok(solved) => solved,
                 Err(error) => {
-                    if let Some(report) = error
-                        .downcast_ref::<InteriorPointSolveError>()
-                        .and_then(|typed| nlip_failure_solver_report(typed, &running_solver))
-                    {
-                        emit_failure_status(&emit, solver_method, report);
+                    if let Some(typed) = error.downcast_ref::<InteriorPointSolveError>() {
+                        emit_log_lines(&emit, nlip_failure_diagnostic_lines(typed));
+                        if let Some(report) = nlip_failure_solver_report(typed, &running_solver) {
+                            emit_failure_status(&emit, solver_method, report);
+                        }
                     }
                     return Err(error.into());
                 }
@@ -5616,11 +6194,11 @@ where
             ) {
                 Ok(solved) => solved,
                 Err(error) => {
-                    if let Some(report) = error
-                        .downcast_ref::<ClarabelSqpError>()
-                        .and_then(|typed| sqp_failure_solver_report(typed, &running_solver))
-                    {
-                        emit_failure_status(&emit, solver_method, report);
+                    if let Some(typed) = error.downcast_ref::<ClarabelSqpError>() {
+                        emit_log_lines(&emit, sqp_failure_diagnostic_lines(typed));
+                        if let Some(report) = sqp_failure_solver_report(typed, &running_solver) {
+                            emit_failure_status(&emit, solver_method, report);
+                        }
                     }
                     return Err(error.into());
                 }
@@ -5702,11 +6280,11 @@ where
             ) {
                 Ok(solved) => solved,
                 Err(error) => {
-                    if let Some(report) = error
-                        .downcast_ref::<InteriorPointSolveError>()
-                        .and_then(|typed| nlip_failure_solver_report(typed, &running_solver))
-                    {
-                        emit_failure_status(&emit, solver_method, report);
+                    if let Some(typed) = error.downcast_ref::<InteriorPointSolveError>() {
+                        emit_log_lines(&emit, nlip_failure_diagnostic_lines(typed));
+                        if let Some(report) = nlip_failure_solver_report(typed, &running_solver) {
+                            emit_failure_status(&emit, solver_method, report);
+                        }
                     }
                     return Err(error.into());
                 }
@@ -5927,7 +6505,7 @@ pub fn nlip_progress(snapshot: &InteriorPointIterationSnapshot) -> SolveProgress
         eq_inf: snapshot.eq_inf,
         ineq_inf: snapshot.ineq_inf,
         dual_inf: snapshot.dual_inf,
-        step_inf: None,
+        step_inf: snapshot.step_inf,
         penalty: snapshot.barrier_parameter.unwrap_or(0.0),
         alpha: snapshot.alpha,
         line_search_iterations: snapshot.line_search_iterations.map(|value| value as usize),
@@ -5996,6 +6574,7 @@ pub fn sqp_termination_label(summary: &ClarabelSqpSummary) -> String {
         }
         (optimization::SqpTermination::QpSolve, _) => "Failed: QP solve".to_string(),
         (optimization::SqpTermination::LineSearchFailed, _) => "Failed: line search".to_string(),
+        (optimization::SqpTermination::RestorationFailed, _) => "Failed: restoration".to_string(),
         (optimization::SqpTermination::Stalled, _) => "Failed: stalled".to_string(),
         (optimization::SqpTermination::NonFiniteInput, _) => "Failed: non-finite input".to_string(),
         (optimization::SqpTermination::NonFiniteCallbackOutput, _) => {
@@ -6482,6 +7061,7 @@ pub fn sqp_failure_solver_report(
         | ClarabelSqpError::QpSolve { context, .. }
         | ClarabelSqpError::UnconstrainedStepSolve { context }
         | ClarabelSqpError::LineSearchFailed { context, .. }
+        | ClarabelSqpError::RestorationFailed { context, .. }
         | ClarabelSqpError::Stalled { context, .. }
         | ClarabelSqpError::NonFiniteCallbackOutput { context, .. } => context.as_ref(),
         ClarabelSqpError::InvalidInput(_)
@@ -6497,6 +7077,9 @@ pub fn sqp_failure_solver_report(
                 }
                 optimization::SqpTermination::QpSolve => "Failed: QP solve".to_string(),
                 optimization::SqpTermination::LineSearchFailed => "Failed: line search".to_string(),
+                optimization::SqpTermination::RestorationFailed => {
+                    "Failed: restoration".to_string()
+                }
                 optimization::SqpTermination::Stalled => "Failed: stalled".to_string(),
                 optimization::SqpTermination::NonFiniteInput => {
                     "Failed: non-finite input".to_string()
@@ -6528,21 +7111,35 @@ pub fn nlip_failure_solver_report(
 ) -> Option<SolverReport> {
     let (status_label, iterations, profiling) = match error {
         InteriorPointSolveError::InvalidInput(_) => return None,
-        InteriorPointSolveError::LinearSolve { solver, profiling } => (
+        InteriorPointSolveError::LinearSolve { solver, context } => (
             format!("Failed: linear solve ({})", solver.label()),
-            None,
-            profiling.as_ref(),
+            context
+                .final_state
+                .as_ref()
+                .map(|state| state.iteration as usize),
+            &context.profiling,
         ),
-        InteriorPointSolveError::LineSearchFailed { profiling, .. } => {
-            ("Failed: line search".to_string(), None, profiling.as_ref())
-        }
+        InteriorPointSolveError::LineSearchFailed { context, .. } => (
+            "Failed: line search".to_string(),
+            context
+                .final_state
+                .as_ref()
+                .map(|state| state.iteration as usize),
+            &context.profiling,
+        ),
         InteriorPointSolveError::MaxIterations {
             iterations,
-            profiling,
+            context,
         } => (
             "Failed: maximum iterations reached".to_string(),
-            Some(*iterations as usize),
-            profiling.as_ref(),
+            Some(
+                context
+                    .final_state
+                    .as_ref()
+                    .map(|state| state.iteration as usize)
+                    .unwrap_or(*iterations as usize),
+            ),
+            &context.profiling,
         ),
     };
     Some(merge_failure_solver_report(
@@ -7156,7 +7753,13 @@ mod tests {
             merit: 1.0,
             mu: 1.0e-3,
             step_inf_norm: 0.25,
-            profiling: Box::new(profiling),
+            context: Box::new(optimization::InteriorPointFailureContext {
+                final_state: None,
+                last_accepted_state: None,
+                failed_line_search: None,
+                failed_direction_diagnostics: None,
+                profiling,
+            }),
         };
         let fallback = SolverReport::in_progress("Running NLIP...")
             .with_backend_timing(BackendTimingMetadata {
