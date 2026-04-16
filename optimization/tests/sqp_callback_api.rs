@@ -855,11 +855,15 @@ fn sqp_callback_disabling_hessian_regularization_skips_regularization_telemetry(
         hessian_regularization_enabled: false,
         ..quiet_options()
     };
-    let summary = solve_nlp_sqp_with_callback(&OneDimQuadraticProblem, &[0.0], &[], &options, |_| {})
-    .expect("solve should succeed without Hessian regularization");
+    let summary =
+        solve_nlp_sqp_with_callback(&OneDimQuadraticProblem, &[0.0], &[], &options, |_| {})
+            .expect("solve should succeed without Hessian regularization");
 
     assert_eq!(summary.profiling.regularization_steps, 0);
-    assert_eq!(summary.profiling.regularization_time, std::time::Duration::ZERO);
+    assert_eq!(
+        summary.profiling.regularization_time,
+        std::time::Duration::ZERO
+    );
     let accepted = first_accepted_step_snapshot(options);
     let regularization = &accepted
         .step_diagnostics
@@ -870,11 +874,7 @@ fn sqp_callback_disabling_hessian_regularization_skips_regularization_telemetry(
     assert!(regularization.min_eigenvalue.is_nan());
     assert_eq!(regularization.applied_shift, 0.0);
     assert!(!regularization.shifted_by_analysis);
-    assert!(
-        !accepted
-            .events
-            .contains(&SqpIterationEvent::HessianShifted)
-    );
+    assert!(!accepted.events.contains(&SqpIterationEvent::HessianShifted));
 }
 
 #[test]
@@ -884,8 +884,9 @@ fn sqp_callback_enabled_hessian_regularization_reports_unshifted_pd_case() {
         ..quiet_options()
     };
     let regularization_floor = options.regularization;
-    let summary = solve_nlp_sqp_with_callback(&OneDimQuadraticProblem, &[0.0], &[], &options, |_| {})
-    .expect("solve should succeed with Hessian regularization enabled");
+    let summary =
+        solve_nlp_sqp_with_callback(&OneDimQuadraticProblem, &[0.0], &[], &options, |_| {})
+            .expect("solve should succeed with Hessian regularization enabled");
 
     assert!(summary.profiling.regularization_steps > 0);
     assert!(summary.profiling.regularization_time > std::time::Duration::ZERO);
@@ -903,11 +904,7 @@ fn sqp_callback_enabled_hessian_regularization_reports_unshifted_pd_case() {
         epsilon = 1e-12
     );
     assert!(!regularization.shifted_by_analysis);
-    assert!(
-        !accepted
-            .events
-            .contains(&SqpIterationEvent::HessianShifted)
-    );
+    assert!(!accepted.events.contains(&SqpIterationEvent::HessianShifted));
 }
 
 #[test]
@@ -1039,11 +1036,10 @@ fn sqp_filter_accepts_feasibility_improving_step_and_surfaces_frontier() {
         hessian_regularization_enabled: true,
         ..quiet_options()
     };
-    let summary =
-        solve_nlp_sqp_with_callback(&problem, &[0.0], &[], &options, |snapshot| {
-            snapshots.push(snapshot.clone());
-        })
-        .expect("solve should succeed");
+    let summary = solve_nlp_sqp_with_callback(&problem, &[0.0], &[], &options, |snapshot| {
+        snapshots.push(snapshot.clone());
+    })
+    .expect("solve should succeed");
 
     let accepted = snapshots
         .iter()

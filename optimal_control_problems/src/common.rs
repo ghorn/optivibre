@@ -1049,6 +1049,22 @@ fn sqp_failure_diagnostic_lines(error: &ClarabelSqpError) -> Vec<String> {
     if let Some(qp_failure) = &context.qp_failure {
         lines.push("qp failure:".to_string());
         lines.push(format!(
+            "  failed while solving the next {}SQP subproblem",
+            if qp_failure.elastic_recovery {
+                "elastic-recovery "
+            } else {
+                ""
+            },
+        ));
+        lines.push(format!(
+            "  failed_qp status={:?} raw_status={} iters={} solve_time={} setup_time={}",
+            qp_failure.qp_info.status,
+            qp_failure.qp_info.raw_status,
+            qp_failure.qp_info.iteration_count,
+            fmt_diag_sci(qp_failure.qp_info.solve_time.as_secs_f64()),
+            fmt_diag_sci(qp_failure.qp_info.setup_time.as_secs_f64()),
+        ));
+        lines.push(format!(
             "  vars={} constraints={} lin_obj_inf={} rhs_inf={} hdiag_min={} hdiag_max={} elastic_recovery={} cones={}",
             qp_failure.variable_count,
             qp_failure.constraint_count,
@@ -1064,6 +1080,13 @@ fn sqp_failure_diagnostic_lines(error: &ClarabelSqpError) -> Vec<String> {
                 .collect::<Vec<_>>()
                 .join(","),
         ));
+        if let Some(transcript) = &qp_failure.transcript {
+            let transcript = transcript.trim_end();
+            if !transcript.is_empty() {
+                lines.push("clarabel qp transcript:".to_string());
+                lines.extend(transcript.lines().map(str::to_owned));
+            }
+        }
     }
     lines
 }
@@ -7516,6 +7539,54 @@ mod tests {
     }
 
     #[test]
+    fn sqp_failure_diagnostics_print_failing_qp_status_explicitly() {
+        let error = ClarabelSqpError::QpSolve {
+            status: optimization::SqpQpRawStatus::NumericalError,
+            context: Box::new(optimization::SqpFailureContext {
+                termination: optimization::SqpTermination::QpSolve,
+                final_state: None,
+                final_state_kind: None,
+                last_accepted_state: None,
+                failed_line_search: None,
+                failed_step_diagnostics: None,
+                qp_failure: Some(optimization::SqpQpFailureDiagnostics {
+                    qp_info: optimization::SqpQpInfo {
+                        status: optimization::SqpQpStatus::Failed,
+                        raw_status: optimization::SqpQpRawStatus::NumericalError,
+                        setup_time: Duration::from_micros(750),
+                        solve_time: Duration::from_millis(12),
+                        iteration_count: 17,
+                    },
+                    variable_count: 12,
+                    constraint_count: 24,
+                    linear_objective_inf_norm: 1.0,
+                    rhs_inf_norm: 2.0,
+                    hessian_diag_min: -3.0,
+                    hessian_diag_max: 4.0,
+                    elastic_recovery: false,
+                    cones: vec![optimization::SqpConeSummary {
+                        kind: optimization::SqpConeKind::Zero,
+                        dim: 24,
+                    }],
+                    transcript: Some(
+                        "iter    pcost        dcost\n0   1.0e0   2.0e0\nstatus: NumericalError"
+                            .to_string(),
+                    ),
+                }),
+                profiling: ClarabelSqpProfiling::default(),
+            }),
+        };
+
+        let lines = sqp_failure_diagnostic_lines(&error);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("termination=QpSolve"));
+        assert!(rendered.contains("failed while solving the next SQP subproblem"));
+        assert!(rendered.contains("failed_qp status=Failed raw_status=NumericalError iters=17"));
+        assert!(rendered.contains("clarabel qp transcript:"));
+        assert!(rendered.contains("status: NumericalError"));
+    }
+
+    #[test]
     fn prewarm_with_progress_emits_final_jit_timing_status() {
         let symbolic_timing = BackendTimingMetadata {
             function_creation_time: Some(Duration::from_millis(250)),
@@ -7691,7 +7762,10 @@ mod tests {
             .find(|control| control.id == "solver_hessian_regularization")
             .expect("expected SQP Hessian regularization control");
         assert_eq!(toggle.section, ControlSection::Solver);
-        assert_eq!(toggle.semantic, ControlSemantic::SolverHessianRegularization);
+        assert_eq!(
+            toggle.semantic,
+            ControlSemantic::SolverHessianRegularization
+        );
         assert_eq!(toggle.editor, ControlEditor::Select);
         assert_eq!(toggle.default, 0.0);
         assert_eq!(toggle.choices.len(), 2);
@@ -7703,8 +7777,8 @@ mod tests {
     fn solver_config_from_map_parses_hessian_regularization_toggle() {
         let mut values = BTreeMap::new();
         values.insert("solver_hessian_regularization".to_string(), 1.0);
-        let parsed =
-            solver_config_from_map(&values, default_sqp_config()).expect("solver config should parse");
+        let parsed = solver_config_from_map(&values, default_sqp_config())
+            .expect("solver config should parse");
         assert!(parsed.hessian_regularization_enabled);
     }
 
