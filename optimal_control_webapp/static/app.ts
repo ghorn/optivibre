@@ -48,11 +48,12 @@ const CONTROL_SEMANTIC = Object.freeze({
   collocationDegree: 3,
   solverMethod: 4,
   solverMaxIterations: 5,
-  solverDualTolerance: 6,
-  solverConstraintTolerance: 7,
-  solverComplementarityTolerance: 8,
-  sxFunctionOption: 9,
-  problemParameter: 10,
+  solverHessianRegularization: 6,
+  solverDualTolerance: 7,
+  solverConstraintTolerance: 8,
+  solverComplementarityTolerance: 9,
+  sxFunctionOption: 10,
+  problemParameter: 11,
 } as const);
 const CONTROL_SEMANTIC_FROM_WIRE = Object.freeze({
   transcription_method: CONTROL_SEMANTIC.transcriptionMethod,
@@ -61,6 +62,7 @@ const CONTROL_SEMANTIC_FROM_WIRE = Object.freeze({
   collocation_degree: CONTROL_SEMANTIC.collocationDegree,
   solver_method: CONTROL_SEMANTIC.solverMethod,
   solver_max_iterations: CONTROL_SEMANTIC.solverMaxIterations,
+  solver_hessian_regularization: CONTROL_SEMANTIC.solverHessianRegularization,
   solver_dual_tolerance: CONTROL_SEMANTIC.solverDualTolerance,
   solver_constraint_tolerance: CONTROL_SEMANTIC.solverConstraintTolerance,
   solver_complementarity_tolerance: CONTROL_SEMANTIC.solverComplementarityTolerance,
@@ -740,6 +742,7 @@ interface FrontendState {
   filterRecentPath: FilterEntry[];
   lastFilterPointKey: string | null;
   logLines: LogLine[];
+  followSolverLog: boolean;
   latestProgress: SolveProgress | null;
   liveStatus: SolveStatus | null;
   liveSolver: SolverReport | null;
@@ -1450,6 +1453,7 @@ const state: FrontendState = {
   filterRecentPath: [],
   lastFilterPointKey: null,
   logLines: [],
+  followSolverLog: true,
   latestProgress: null,
   liveStatus: null,
   liveSolver: null,
@@ -1981,6 +1985,15 @@ function shouldConsoleStickToBottom(): boolean {
   return solverLogEl.scrollHeight - (solverLogEl.scrollTop + solverLogEl.clientHeight) <= bottomSlackPx;
 }
 
+function syncConsoleFollowState(): void {
+  state.followSolverLog = shouldConsoleStickToBottom();
+}
+
+function scrollConsoleToBottom(): void {
+  solverLogEl.scrollTop = solverLogEl.scrollHeight;
+  state.followSolverLog = true;
+}
+
 function buildLogLineElements(entries: readonly LogLine[]): DocumentFragment {
   const fragment = document.createDocumentFragment();
   for (const entry of entries) {
@@ -1994,10 +2007,10 @@ function buildLogLineElements(entries: readonly LogLine[]): DocumentFragment {
 
 function renderLog(): void {
   const previousScrollTop = solverLogEl.scrollTop;
-  const shouldStickToBottom = shouldConsoleStickToBottom();
+  const shouldStickToBottom = state.followSolverLog || shouldConsoleStickToBottom();
   solverLogEl.replaceChildren(buildLogLineElements(state.logLines));
   if (shouldStickToBottom) {
-    solverLogEl.scrollTop = solverLogEl.scrollHeight;
+    scrollConsoleToBottom();
     return;
   }
   const maxScrollTop = Math.max(0, solverLogEl.scrollHeight - solverLogEl.clientHeight);
@@ -2307,6 +2320,10 @@ function currentTranscriptionMethodValue(): number {
   return currentSharedControlValue(CONTROL_SEMANTIC.transcriptionMethod, 0);
 }
 
+function currentSolverMethodValue(): number {
+  return currentSharedControlValue(CONTROL_SEMANTIC.solverMethod, SOLVER_METHOD.sqp);
+}
+
 function isStructuralControl(control: ControlSpec): boolean {
   switch (control.semantic) {
     case CONTROL_SEMANTIC.transcriptionMethod:
@@ -2397,7 +2414,10 @@ function schedulePrewarm(): void {
 }
 
 function handleControlUpdate(control: ControlSpec): void {
-  if (control.semantic === CONTROL_SEMANTIC.transcriptionMethod) {
+  if (
+    control.semantic === CONTROL_SEMANTIC.transcriptionMethod
+    || control.semantic === CONTROL_SEMANTIC.solverMethod
+  ) {
     renderControls();
   }
   if (isStructuralControl(control)) {
@@ -2407,6 +2427,9 @@ function handleControlUpdate(control: ControlSpec): void {
 }
 
 function isControlVisible(control: ControlSpec): boolean {
+  if (control.semantic === CONTROL_SEMANTIC.solverHessianRegularization) {
+    return currentSolverMethodValue() === SOLVER_METHOD.sqp;
+  }
   switch (control.visibility) {
     case CONTROL_VISIBILITY.directCollocationOnly:
       return currentTranscriptionMethodValue() === DIRECT_COLLOCATION_VALUE;
@@ -3063,6 +3086,7 @@ function resetSolverPanel(): void {
   state.pendingIterationEvent = null;
   state.iterationFlushScheduled = false;
   state.logLines = [];
+  state.followSolverLog = true;
   renderSolverSummary();
   renderConstraintPanels();
   solverLogEl.replaceChildren();
@@ -4110,10 +4134,10 @@ function appendLogLine(line: string, level: LogLevelCode = LOG_LEVEL.console): v
   }
   const entries = parts.map((textPart) => ({ text: textPart, level }));
   state.logLines.push(...entries);
-  const shouldStickToBottom = shouldConsoleStickToBottom();
+  const shouldStickToBottom = state.followSolverLog || shouldConsoleStickToBottom();
   solverLogEl.appendChild(buildLogLineElements(entries));
   if (shouldStickToBottom) {
-    solverLogEl.scrollTop = solverLogEl.scrollHeight;
+    scrollConsoleToBottom();
   }
 }
 
@@ -5227,6 +5251,7 @@ async function init(): Promise<void> {
     }
     controlsForm.addEventListener("submit", solveCurrentProblem);
     solveButton.addEventListener("click", solveCurrentProblem);
+    solverLogEl.addEventListener("scroll", syncConsoleFollowState);
     selectProblem(state.specs[0].id);
     void refreshCompileCacheStatus();
   } catch (error) {

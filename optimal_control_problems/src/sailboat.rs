@@ -1588,6 +1588,7 @@ mod tests {
             solver_method: SolverMethod::Sqp,
             solver: SqpConfig {
                 max_iters: 8,
+                hessian_regularization_enabled: false,
                 dual_tol: 1.0e-1,
                 constraint_tol: 1.0e-4,
                 complementarity_tol: 1.0e-4,

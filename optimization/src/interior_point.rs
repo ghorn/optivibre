@@ -1281,7 +1281,27 @@ fn style_ip_event_cell(log: &InteriorPointIterationLog) -> String {
     }
 }
 
-fn ip_event_suffix(log: &InteriorPointIterationLog, state: &mut SqpEventLegendState) -> String {
+fn ip_event_legend_prefix() -> String {
+    [
+        format!("{:>4}", ""),
+        format!("{:>9}", ""),
+        format!("{:>9}", ""),
+        format!("{:>9}", ""),
+        format!("{:>9}", ""),
+        format!("{:>9}", ""),
+        format!("{:>9}", ""),
+        format!("{:>9}", ""),
+        format!("{:>5}", ""),
+        format!("{:>4}", ""),
+        format!("{:>7}", ""),
+    ]
+    .join("  ")
+}
+
+fn ip_event_legend_lines(
+    log: &InteriorPointIterationLog,
+    state: &mut SqpEventLegendState,
+) -> Vec<String> {
     let mut parts = Vec::new();
     if log.flags.penalty_updated && state.mark_penalty_if_new() {
         parts.push("P=sigma clipped or barrier safeguard engaged");
@@ -1300,11 +1320,12 @@ fn ip_event_suffix(log: &InteriorPointIterationLog, state: &mut SqpEventLegendSt
     if log.flags.iteration_limit_reached && state.mark_max_iter_if_new() {
         parts.push("M=maximum NLIP iterations reached");
     }
-    if parts.is_empty() {
-        String::new()
-    } else {
-        format!("  {}", parts.join("  "))
-    }
+
+    let prefix = ip_event_legend_prefix();
+    parts
+        .into_iter()
+        .map(|part| format!("{prefix}  {part}"))
+        .collect()
 }
 
 fn log_interior_point_iteration(
@@ -1327,6 +1348,9 @@ fn log_interior_point_iteration(
             format!("{:>7}", "lin_t"),
         ];
         eprintln!("{}", style_bold(&header.join("  ")));
+    }
+    for legend_line in ip_event_legend_lines(log, event_state) {
+        eprintln!("{legend_line}");
     }
     let iteration_label = match log.phase {
         InteriorPointIterationPhase::Initial => "pre".to_string(),
@@ -1361,9 +1385,7 @@ fn log_interior_point_iteration(
             None => format!("{:>7}", "--"),
         },
     ];
-    let mut rendered = row.join("  ");
-    rendered.push_str(&ip_event_suffix(log, event_state));
-    eprintln!("{rendered}");
+    eprintln!("{}", row.join("  "));
 }
 
 fn log_interior_point_problem_header<P>(

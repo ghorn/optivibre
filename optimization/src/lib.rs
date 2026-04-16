@@ -853,6 +853,7 @@ pub struct ClarabelSqpOptions {
     pub constraint_tol: f64,
     pub complementarity_tol: f64,
     pub merit_penalty: f64,
+    pub hessian_regularization_enabled: bool,
     pub regularization: f64,
     pub armijo_c1: f64,
     pub wolfe_c2: Option<f64>,
@@ -888,6 +889,7 @@ impl Default for ClarabelSqpOptions {
             constraint_tol: 1e-6,
             complementarity_tol: 1e-6,
             merit_penalty: 10.0,
+            hessian_regularization_enabled: false,
             regularization: 1e-6,
             armijo_c1: 1e-4,
             wolfe_c2: None,
@@ -1144,6 +1146,7 @@ pub struct SqpLineSearchInfo {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct SqpRegularizationInfo {
+    pub enabled: bool,
     pub min_eigenvalue: f64,
     pub applied_shift: f64,
     pub shifted_by_analysis: bool,
@@ -1818,9 +1821,19 @@ fn regularize_hessian(hessian: &mut DMatrix<f64>, regularization: f64) -> SqpReg
         hessian[(idx, idx)] += shift;
     }
     SqpRegularizationInfo {
+        enabled: true,
         min_eigenvalue: min_eig,
         applied_shift: shift,
         shifted_by_analysis,
+    }
+}
+
+fn disabled_hessian_regularization_info() -> SqpRegularizationInfo {
+    SqpRegularizationInfo {
+        enabled: false,
+        min_eigenvalue: f64::NAN,
+        applied_shift: 0.0,
+        shifted_by_analysis: false,
     }
 }
 
@@ -3609,9 +3622,14 @@ fn log_sqp_problem_header<P>(
         boxed_line(
             "globalize",
             format!(
-                "filter={}  penalty0={}  regularization={}  soc={}  elastic={}",
+                "filter={}  penalty0={}  regularization={}({})  soc={}  elastic={}",
                 if options.filter_method { "on" } else { "off" },
                 sci_text(options.merit_penalty),
+                if options.hessian_regularization_enabled {
+                    "on"
+                } else {
+                    "off"
+                },
                 sci_text(options.regularization),
                 if options.second_order_correction {
                     "on"
@@ -3888,6 +3906,9 @@ fn log_sqp_iteration(
         ];
         eprintln!("{}", style_bold(&header.join("  ")));
     }
+    for legend_line in event_legend_lines(snapshot, event_state) {
+        eprintln!("{legend_line}");
+    }
     let line_search = snapshot.line_search.as_ref();
     let qp = snapshot.qp.as_ref();
     let row = [
@@ -3918,9 +3939,6 @@ fn log_sqp_iteration(
         fmt_qp_time(qp.map(|info| info.solve_time.as_secs_f64())),
     ];
     eprintln!("{}", row.join("  "));
-    for legend_line in event_legend_lines(snapshot, event_state) {
-        eprintln!("{legend_line}");
-    }
 }
 
 fn validate_finite_inputs(
@@ -4743,15 +4761,19 @@ where
                 &mut profiling.hessian_assembly_time,
                 hessian_assembly_elapsed,
             );
-            let regularization_started = Instant::now();
-            regularization_info = regularize_hessian(&mut hessian, options.regularization);
-            let regularization_elapsed = regularization_started.elapsed();
-            iteration_regularization_time += regularization_elapsed;
-            record_iteration_duration(
-                &mut profiling.regularization_steps,
-                &mut profiling.regularization_time,
-                regularization_elapsed,
-            );
+            if options.hessian_regularization_enabled {
+                let regularization_started = Instant::now();
+                regularization_info = regularize_hessian(&mut hessian, options.regularization);
+                let regularization_elapsed = regularization_started.elapsed();
+                iteration_regularization_time += regularization_elapsed;
+                record_iteration_duration(
+                    &mut profiling.regularization_steps,
+                    &mut profiling.regularization_time,
+                    regularization_elapsed,
+                );
+            } else {
+                regularization_info = disabled_hessian_regularization_info();
+            }
 
             assembled_subproblem = if total_constraint_count == 0 {
                 None

@@ -138,6 +138,82 @@ impl CompiledNlpProblem for OneDimQuadraticProblem {
     }
 }
 
+struct ConcaveQuadraticProblem;
+
+impl CompiledNlpProblem for ConcaveQuadraticProblem {
+    fn dimension(&self) -> usize {
+        1
+    }
+
+    fn parameter_count(&self) -> usize {
+        0
+    }
+
+    fn parameter_ccs(&self, _parameter_index: usize) -> &CCS {
+        unreachable!("concave quadratic has no parameters")
+    }
+
+    fn equality_count(&self) -> usize {
+        0
+    }
+
+    fn inequality_count(&self) -> usize {
+        0
+    }
+
+    fn objective_value(&self, x: &[f64], _parameters: &[ParameterMatrix<'_>]) -> f64 {
+        -x[0].powi(2)
+    }
+
+    fn objective_gradient(&self, x: &[f64], _parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
+        out[0] = -2.0 * x[0];
+    }
+
+    fn equality_jacobian_ccs(&self) -> &CCS {
+        empty_ccs_1d()
+    }
+
+    fn equality_values(&self, _x: &[f64], _parameters: &[ParameterMatrix<'_>], _out: &mut [f64]) {}
+
+    fn equality_jacobian_values(
+        &self,
+        _x: &[f64],
+        _parameters: &[ParameterMatrix<'_>],
+        _out: &mut [f64],
+    ) {
+    }
+
+    fn inequality_jacobian_ccs(&self) -> &CCS {
+        empty_ccs_1d()
+    }
+
+    fn inequality_values(&self, _x: &[f64], _parameters: &[ParameterMatrix<'_>], _out: &mut [f64]) {
+    }
+
+    fn inequality_jacobian_values(
+        &self,
+        _x: &[f64],
+        _parameters: &[ParameterMatrix<'_>],
+        _out: &mut [f64],
+    ) {
+    }
+
+    fn lagrangian_hessian_ccs(&self) -> &CCS {
+        scalar_ccs()
+    }
+
+    fn lagrangian_hessian_values(
+        &self,
+        _x: &[f64],
+        _parameters: &[ParameterMatrix<'_>],
+        _equality_multipliers: &[f64],
+        _inequality_multipliers: &[f64],
+        out: &mut [f64],
+    ) {
+        out[0] = -2.0;
+    }
+}
+
 struct EqualityQuadraticProblem;
 
 impl CompiledNlpProblem for EqualityQuadraticProblem {
@@ -773,6 +849,97 @@ fn sqp_callback_rosenbrock_reports_line_search_telemetry() {
     }
 }
 
+#[test]
+fn sqp_callback_disabling_hessian_regularization_skips_regularization_telemetry() {
+    let options = ClarabelSqpOptions {
+        hessian_regularization_enabled: false,
+        ..quiet_options()
+    };
+    let summary = solve_nlp_sqp_with_callback(&OneDimQuadraticProblem, &[0.0], &[], &options, |_| {})
+    .expect("solve should succeed without Hessian regularization");
+
+    assert_eq!(summary.profiling.regularization_steps, 0);
+    assert_eq!(summary.profiling.regularization_time, std::time::Duration::ZERO);
+    let accepted = first_accepted_step_snapshot(options);
+    let regularization = &accepted
+        .step_diagnostics
+        .as_ref()
+        .expect("accepted step should include diagnostics")
+        .regularization;
+    assert!(!regularization.enabled);
+    assert!(regularization.min_eigenvalue.is_nan());
+    assert_eq!(regularization.applied_shift, 0.0);
+    assert!(!regularization.shifted_by_analysis);
+    assert!(
+        !accepted
+            .events
+            .contains(&SqpIterationEvent::HessianShifted)
+    );
+}
+
+#[test]
+fn sqp_callback_enabled_hessian_regularization_reports_unshifted_pd_case() {
+    let options = ClarabelSqpOptions {
+        hessian_regularization_enabled: true,
+        ..quiet_options()
+    };
+    let regularization_floor = options.regularization;
+    let summary = solve_nlp_sqp_with_callback(&OneDimQuadraticProblem, &[0.0], &[], &options, |_| {})
+    .expect("solve should succeed with Hessian regularization enabled");
+
+    assert!(summary.profiling.regularization_steps > 0);
+    assert!(summary.profiling.regularization_time > std::time::Duration::ZERO);
+    let accepted = first_accepted_step_snapshot(options);
+    let regularization = &accepted
+        .step_diagnostics
+        .as_ref()
+        .expect("accepted step should include diagnostics")
+        .regularization;
+    assert!(regularization.enabled);
+    assert_abs_diff_eq!(regularization.min_eigenvalue, 1.0, epsilon = 1e-12);
+    assert_abs_diff_eq!(
+        regularization.applied_shift,
+        regularization_floor,
+        epsilon = 1e-12
+    );
+    assert!(!regularization.shifted_by_analysis);
+    assert!(
+        !accepted
+            .events
+            .contains(&SqpIterationEvent::HessianShifted)
+    );
+}
+
+#[test]
+fn sqp_callback_enabled_hessian_regularization_surfaces_analysis_shift() {
+    let problem = ConcaveQuadraticProblem;
+    let mut snapshots = Vec::new();
+    let options = ClarabelSqpOptions {
+        hessian_regularization_enabled: true,
+        max_iters: 1,
+        ..quiet_options()
+    };
+    let error = solve_nlp_sqp_with_callback(&problem, &[1.0], &[], &options, |snapshot| {
+        snapshots.push(snapshot.clone());
+    })
+    .expect_err("single-step concave probe should hit the max-iteration guard");
+    assert!(matches!(error, ClarabelSqpError::MaxIterations { .. }));
+    let accepted = snapshots
+        .iter()
+        .find(|snapshot| snapshot.phase == SqpIterationPhase::AcceptedStep)
+        .expect("accepted snapshot should exist");
+    let regularization = &accepted
+        .step_diagnostics
+        .as_ref()
+        .expect("accepted step should include diagnostics")
+        .regularization;
+    assert!(regularization.enabled);
+    assert_abs_diff_eq!(regularization.min_eigenvalue, -2.0, epsilon = 1e-12);
+    assert!(regularization.applied_shift > 1.0);
+    assert!(regularization.shifted_by_analysis);
+    assert!(accepted.events.contains(&SqpIterationEvent::HessianShifted));
+}
+
 fn first_accepted_step_snapshot(
     mut options: ClarabelSqpOptions,
 ) -> optimization::SqpIterationSnapshot {
@@ -868,8 +1035,12 @@ fn sqp_callback_exposes_wolfe_status_when_enabled() {
 fn sqp_filter_accepts_feasibility_improving_step_and_surfaces_frontier() {
     let problem = EqualityQuadraticProblem;
     let mut snapshots = Vec::new();
+    let options = ClarabelSqpOptions {
+        hessian_regularization_enabled: true,
+        ..quiet_options()
+    };
     let summary =
-        solve_nlp_sqp_with_callback(&problem, &[0.0], &[], &quiet_options(), |snapshot| {
+        solve_nlp_sqp_with_callback(&problem, &[0.0], &[], &options, |snapshot| {
             snapshots.push(snapshot.clone());
         })
         .expect("solve should succeed");
@@ -982,6 +1153,7 @@ fn sqp_marks_armijo_tolerance_adjusted_acceptance() {
         dual_tol: 1e-9,
         constraint_tol: 1e-9,
         complementarity_tol: 1e-9,
+        hessian_regularization_enabled: true,
         filter_method: false,
         verbose: false,
         ..ClarabelSqpOptions::default()

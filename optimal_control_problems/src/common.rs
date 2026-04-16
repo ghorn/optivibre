@@ -86,6 +86,7 @@ pub enum ControlSemantic {
     CollocationDegree,
     SolverMethod,
     SolverMaxIterations,
+    SolverHessianRegularization,
     SolverDualTolerance,
     SolverConstraintTolerance,
     SolverComplementarityTolerance,
@@ -828,12 +829,16 @@ fn append_sqp_step_diagnostics_lines(
         diagnostics.restoration_phase,
         diagnostics.elastic_recovery_used,
     ));
-    lines.push(format!(
-        "  regularization min_eig={} shift={} shifted_by_analysis={}",
-        fmt_diag_sci(diagnostics.regularization.min_eigenvalue),
-        fmt_diag_sci(diagnostics.regularization.applied_shift),
-        diagnostics.regularization.shifted_by_analysis,
-    ));
+    if diagnostics.regularization.enabled {
+        lines.push(format!(
+            "  regularization min_eig={} shift={} shifted_by_analysis={}",
+            fmt_diag_sci(diagnostics.regularization.min_eigenvalue),
+            fmt_diag_sci(diagnostics.regularization.applied_shift),
+            diagnostics.regularization.shifted_by_analysis,
+        ));
+    } else {
+        lines.push("  regularization disabled".to_string());
+    }
 }
 
 fn append_nlip_direction_diagnostics_lines(
@@ -1226,6 +1231,7 @@ fn nlip_failure_diagnostic_lines(error: &InteriorPointSolveError) -> Vec<String>
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SqpConfig {
     pub max_iters: usize,
+    pub hessian_regularization_enabled: bool,
     pub dual_tol: f64,
     pub constraint_tol: f64,
     pub complementarity_tol: f64,
@@ -1777,6 +1783,7 @@ enum SharedControlId {
     SxFunctionMultipleShootingIntegrator,
     SolverMethod,
     SolverMaxIterations,
+    SolverHessianRegularization,
     SolverDualTolerance,
     SolverConstraintTolerance,
     SolverComplementarityTolerance,
@@ -1801,6 +1808,7 @@ impl SharedControlId {
             Self::SxFunctionMultipleShootingIntegrator => "sxf_multiple_shooting_integrator",
             Self::SolverMethod => "solver_method",
             Self::SolverMaxIterations => "solver_max_iters",
+            Self::SolverHessianRegularization => "solver_hessian_regularization",
             Self::SolverDualTolerance => "solver_dual_tol",
             Self::SolverConstraintTolerance => "solver_constraint_tol",
             Self::SolverComplementarityTolerance => "solver_complementarity_tol",
@@ -3063,6 +3071,7 @@ pub fn default_transcription(intervals: usize) -> TranscriptionConfig {
 pub fn default_sqp_config() -> SqpConfig {
     SqpConfig {
         max_iters: 200,
+        hessian_regularization_enabled: false,
         dual_tol: 1.0e-6,
         constraint_tol: 1.0e-8,
         complementarity_tol: 1.0e-6,
@@ -3451,6 +3460,21 @@ pub fn solver_controls(default_method: SolverMethod, default: SqpConfig) -> Vec<
             ControlSemantic::SolverMaxIterations,
             ControlValueDisplay::Integer,
         ),
+        select_control(
+            SharedControlId::SolverHessianRegularization.id(),
+            "Hessian Regularization",
+            if default.hessian_regularization_enabled {
+                1.0
+            } else {
+                0.0
+            },
+            "",
+            "Whether SQP should diagonally regularize the Hessian before solving the QP subproblem.",
+            &[(0.0, "Off"), (1.0, "On")],
+            ControlSection::Solver,
+            ControlVisibility::Always,
+            ControlSemantic::SolverHessianRegularization,
+        ),
         text_control(
             SharedControlId::SolverDualTolerance.id(),
             "Dual Tolerance",
@@ -3519,6 +3543,23 @@ pub fn solver_config_from_map(
         SharedControlId::SolverMaxIterations.id(),
     )?
     .round() as usize;
+    let hessian_regularization_enabled = match parse_enum_choice(
+        sample_shared_or_default(
+            values,
+            SharedControlId::SolverHessianRegularization,
+            if default.hessian_regularization_enabled {
+                1.0
+            } else {
+                0.0
+            },
+        ),
+        SharedControlId::SolverHessianRegularization,
+        &[0.0, 1.0],
+    )? {
+        0 => false,
+        1 => true,
+        _ => unreachable!("validated Hessian regularization toggle"),
+    };
     let dual_tol = expect_positive_finite(
         sample_shared_or_default(
             values,
@@ -3545,6 +3586,7 @@ pub fn solver_config_from_map(
     )?;
     Ok(SqpConfig {
         max_iters,
+        hessian_regularization_enabled,
         dual_tol,
         constraint_tol,
         complementarity_tol,
@@ -3837,6 +3879,7 @@ fn kernel_strategy_choice_value(strategy: OcpKernelStrategy) -> f64 {
 pub fn sqp_options(config: &SqpConfig) -> ClarabelSqpOptions {
     ClarabelSqpOptions {
         max_iters: config.max_iters,
+        hessian_regularization_enabled: config.hessian_regularization_enabled,
         dual_tol: config.dual_tol,
         constraint_tol: config.constraint_tol,
         complementarity_tol: config.complementarity_tol,
@@ -7638,6 +7681,31 @@ mod tests {
         assert_eq!(hessian.section, ControlSection::Transcription);
         assert_eq!(hessian.panel, Some(ControlPanel::SxFunctions));
         assert_eq!(hessian.semantic, ControlSemantic::SxFunctionOption);
+    }
+
+    #[test]
+    fn solver_controls_include_sqp_hessian_regularization_toggle() {
+        let controls = solver_controls(default_solver_method(), default_sqp_config());
+        let toggle = controls
+            .iter()
+            .find(|control| control.id == "solver_hessian_regularization")
+            .expect("expected SQP Hessian regularization control");
+        assert_eq!(toggle.section, ControlSection::Solver);
+        assert_eq!(toggle.semantic, ControlSemantic::SolverHessianRegularization);
+        assert_eq!(toggle.editor, ControlEditor::Select);
+        assert_eq!(toggle.default, 0.0);
+        assert_eq!(toggle.choices.len(), 2);
+        assert_eq!(toggle.choices[0].label, "Off");
+        assert_eq!(toggle.choices[1].label, "On");
+    }
+
+    #[test]
+    fn solver_config_from_map_parses_hessian_regularization_toggle() {
+        let mut values = BTreeMap::new();
+        values.insert("solver_hessian_regularization".to_string(), 1.0);
+        let parsed =
+            solver_config_from_map(&values, default_sqp_config()).expect("solver config should parse");
+        assert!(parsed.hessian_regularization_enabled);
     }
 
     #[test]
