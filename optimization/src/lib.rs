@@ -3710,83 +3710,87 @@ fn has_event(snapshot: &SqpIterationSnapshot, event: SqpIterationEvent) -> bool 
     snapshot.events.contains(&event)
 }
 
-fn fmt_event_codes(snapshot: &SqpIterationSnapshot) -> String {
-    let mut codes = String::new();
+const SQP_EVENT_COLUMN_WIDTH: usize = 11;
+
+fn sqp_event_slot_chars(snapshot: &SqpIterationSnapshot) -> [char; SQP_EVENT_COLUMN_WIDTH] {
     let line_search = snapshot.line_search.as_ref();
-    if has_event(snapshot, SqpIterationEvent::PenaltyUpdated) {
-        codes.push('P');
-    }
-    if has_event(snapshot, SqpIterationEvent::HessianShifted) {
-        codes.push('H');
-    }
-    if has_event(snapshot, SqpIterationEvent::LongLineSearch) {
-        codes.push('L');
-    }
-    if has_event(snapshot, SqpIterationEvent::ArmijoToleranceAdjusted) {
-        codes.push('A');
-    }
-    if has_event(snapshot, SqpIterationEvent::SecondOrderCorrectionUsed) {
-        codes.push('S');
-    } else if line_search.is_some_and(|info| info.second_order_correction_attempted) {
-        codes.push('s');
-    }
-    if has_event(snapshot, SqpIterationEvent::FilterAccepted) {
-        codes.push('F');
-    }
-    if has_event(snapshot, SqpIterationEvent::RestorationStepAccepted) {
-        codes.push('T');
-    } else if line_search.is_some_and(|info| info.restoration_attempted) {
-        codes.push('t');
-    }
-    if has_event(snapshot, SqpIterationEvent::QpReducedAccuracy) {
-        codes.push('R');
-    }
-    if has_event(snapshot, SqpIterationEvent::WolfeRejectedTrial) {
-        codes.push('W');
-    }
-    if has_event(snapshot, SqpIterationEvent::ElasticRecoveryUsed) {
-        codes.push('E');
-    } else if line_search.is_some_and(|info| info.elastic_recovery_attempted) {
-        codes.push('e');
-    }
-    if has_event(snapshot, SqpIterationEvent::MaxIterationsReached) {
-        codes.push('M');
-    }
-    codes
+    [
+        if has_event(snapshot, SqpIterationEvent::PenaltyUpdated) {
+            'P'
+        } else {
+            ' '
+        },
+        if has_event(snapshot, SqpIterationEvent::HessianShifted) {
+            'H'
+        } else {
+            ' '
+        },
+        if has_event(snapshot, SqpIterationEvent::LongLineSearch) {
+            'L'
+        } else {
+            ' '
+        },
+        if has_event(snapshot, SqpIterationEvent::ArmijoToleranceAdjusted) {
+            'A'
+        } else {
+            ' '
+        },
+        if has_event(snapshot, SqpIterationEvent::SecondOrderCorrectionUsed) {
+            'S'
+        } else if line_search.is_some_and(|info| info.second_order_correction_attempted) {
+            's'
+        } else {
+            ' '
+        },
+        if has_event(snapshot, SqpIterationEvent::FilterAccepted) {
+            'F'
+        } else {
+            ' '
+        },
+        if has_event(snapshot, SqpIterationEvent::RestorationStepAccepted) {
+            'T'
+        } else if line_search.is_some_and(|info| info.restoration_attempted) {
+            't'
+        } else {
+            ' '
+        },
+        if has_event(snapshot, SqpIterationEvent::QpReducedAccuracy) {
+            'R'
+        } else {
+            ' '
+        },
+        if has_event(snapshot, SqpIterationEvent::WolfeRejectedTrial) {
+            'W'
+        } else {
+            ' '
+        },
+        if has_event(snapshot, SqpIterationEvent::ElasticRecoveryUsed) {
+            'E'
+        } else if line_search.is_some_and(|info| info.elastic_recovery_attempted) {
+            'e'
+        } else {
+            ' '
+        },
+        if has_event(snapshot, SqpIterationEvent::MaxIterationsReached) {
+            'M'
+        } else {
+            ' '
+        },
+    ]
 }
 
 fn style_event_cell(snapshot: &SqpIterationSnapshot) -> String {
-    let codes = fmt_event_codes(snapshot);
-    let cell = format!("{:>4}", codes);
-    if codes.is_empty() {
-        return cell;
-    }
-    let attempted_only = snapshot.line_search.as_ref().is_some_and(|info| {
-        (info.second_order_correction_attempted
-            && !has_event(snapshot, SqpIterationEvent::SecondOrderCorrectionUsed))
-            || (info.restoration_attempted
-                && !has_event(snapshot, SqpIterationEvent::RestorationStepAccepted))
-            || (info.elastic_recovery_attempted
-                && !has_event(snapshot, SqpIterationEvent::ElasticRecoveryUsed))
-    });
-    if has_event(snapshot, SqpIterationEvent::MaxIterationsReached) {
-        style_red_bold(&cell)
-    } else if has_event(snapshot, SqpIterationEvent::PenaltyUpdated)
-        || has_event(snapshot, SqpIterationEvent::HessianShifted)
-        || has_event(snapshot, SqpIterationEvent::LongLineSearch)
-        || has_event(snapshot, SqpIterationEvent::ArmijoToleranceAdjusted)
-        || has_event(snapshot, SqpIterationEvent::SecondOrderCorrectionUsed)
-        || has_event(snapshot, SqpIterationEvent::FilterAccepted)
-        || has_event(snapshot, SqpIterationEvent::RestorationStepAccepted)
-        || has_event(snapshot, SqpIterationEvent::QpReducedAccuracy)
-        || has_event(snapshot, SqpIterationEvent::WolfeRejectedTrial)
-        || has_event(snapshot, SqpIterationEvent::ElasticRecoveryUsed)
-        || attempted_only
-    {
-        style_yellow_bold(&cell)
-    } else {
-        cell
-    }
+    sqp_event_slot_chars(snapshot)
+        .into_iter()
+        .map(|code| match code {
+            's' | 't' | 'e' | 'M' => style_red_bold(&code.to_string()),
+            'P' | 'H' | 'L' | 'A' | 'S' | 'F' | 'T' | 'R' | 'W' | 'E' => {
+                style_yellow_bold(&code.to_string())
+            }
+            _ => " ".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn sqp_event_legend_prefix() -> String {
@@ -3801,7 +3805,7 @@ fn sqp_event_legend_prefix() -> String {
         format!("{:>9}", ""),
         format!("{:>9}", ""),
         format!("{:>5}", ""),
-        format!("{:>4}", ""),
+        format!("{:>width$}", "", width = SQP_EVENT_COLUMN_WIDTH),
         format!("{:>5}", ""),
         format!("{:>7}", ""),
     ]
@@ -3900,14 +3904,11 @@ fn log_sqp_iteration(
             format!("{:>9}", "penalty"),
             format!("{:>9}", "α"),
             format!("{:>5}", "ls_it"),
-            format!("{:>4}", "evt"),
+            format!("{:>width$}", "evt", width = SQP_EVENT_COLUMN_WIDTH),
             format!("{:>5}", "qp_it"),
             format!("{:>7}", "qp_time"),
         ];
         eprintln!("{}", style_bold(&header.join("  ")));
-    }
-    for legend_line in event_legend_lines(snapshot, event_state) {
-        eprintln!("{legend_line}");
     }
     let line_search = snapshot.line_search.as_ref();
     let qp = snapshot.qp.as_ref();
@@ -3939,6 +3940,9 @@ fn log_sqp_iteration(
         fmt_qp_time(qp.map(|info| info.solve_time.as_secs_f64())),
     ];
     eprintln!("{}", row.join("  "));
+    for legend_line in event_legend_lines(snapshot, event_state) {
+        eprintln!("{legend_line}");
+    }
 }
 
 fn validate_finite_inputs(
@@ -4137,7 +4141,9 @@ fn should_try_elastic_recovery(
         && (equality_count > 0 || nonlinear_inequality_count > 0)
         && matches!(
             status,
-            SolverStatus::PrimalInfeasible | SolverStatus::AlmostPrimalInfeasible
+            SolverStatus::PrimalInfeasible
+                | SolverStatus::AlmostPrimalInfeasible
+                | SolverStatus::InsufficientProgress
         )
 }
 

@@ -1119,6 +1119,8 @@ fn render_sqp_transcript(
     summary: Option<&ClarabelSqpSummary>,
     error: Option<&ClarabelSqpError>,
 ) -> String {
+    const SQP_EVENT_COLUMN_WIDTH: usize = 11;
+
     fn fmt_bool(value: bool) -> &'static str {
         if value { "yes" } else { "no" }
     }
@@ -1131,10 +1133,112 @@ fn render_sqp_transcript(
         }
     }
 
+    fn sqp_event_codes(snapshot: &SqpIterationSnapshot) -> String {
+        let line_search = snapshot.line_search.as_ref();
+        [
+            if snapshot
+                .events
+                .contains(&optimization::SqpIterationEvent::PenaltyUpdated)
+            {
+                'P'
+            } else {
+                ' '
+            },
+            if snapshot
+                .events
+                .contains(&optimization::SqpIterationEvent::HessianShifted)
+            {
+                'H'
+            } else {
+                ' '
+            },
+            if snapshot
+                .events
+                .contains(&optimization::SqpIterationEvent::LongLineSearch)
+            {
+                'L'
+            } else {
+                ' '
+            },
+            if snapshot
+                .events
+                .contains(&optimization::SqpIterationEvent::ArmijoToleranceAdjusted)
+            {
+                'A'
+            } else {
+                ' '
+            },
+            if snapshot
+                .events
+                .contains(&optimization::SqpIterationEvent::SecondOrderCorrectionUsed)
+            {
+                'S'
+            } else if line_search.is_some_and(|info| info.second_order_correction_attempted) {
+                's'
+            } else {
+                ' '
+            },
+            if snapshot
+                .events
+                .contains(&optimization::SqpIterationEvent::FilterAccepted)
+            {
+                'F'
+            } else {
+                ' '
+            },
+            if snapshot
+                .events
+                .contains(&optimization::SqpIterationEvent::RestorationStepAccepted)
+            {
+                'T'
+            } else if line_search.is_some_and(|info| info.restoration_attempted) {
+                't'
+            } else {
+                ' '
+            },
+            if snapshot
+                .events
+                .contains(&optimization::SqpIterationEvent::QpReducedAccuracy)
+            {
+                'R'
+            } else {
+                ' '
+            },
+            if snapshot
+                .events
+                .contains(&optimization::SqpIterationEvent::WolfeRejectedTrial)
+            {
+                'W'
+            } else {
+                ' '
+            },
+            if snapshot
+                .events
+                .contains(&optimization::SqpIterationEvent::ElasticRecoveryUsed)
+            {
+                'E'
+            } else if line_search.is_some_and(|info| info.elastic_recovery_attempted) {
+                'e'
+            } else {
+                ' '
+            },
+            if snapshot
+                .events
+                .contains(&optimization::SqpIterationEvent::MaxIterationsReached)
+            {
+                'M'
+            } else {
+                ' '
+            },
+        ]
+        .into_iter()
+        .collect()
+    }
+
     let mut out = render_problem_header(record);
     out.push_str("solver_log\n\n");
     let header = format!(
-        "{:>4}  {:<6}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>7}  {:>5}  {:>5}  {:>5}",
+        "{:>4}  {:<6}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>7}  {:>5}  {:>5}  {:>width$}",
         "iter",
         "phase",
         "f",
@@ -1147,7 +1251,8 @@ fn render_sqp_transcript(
         "alpha",
         "ls",
         "qp",
-        "evt"
+        "evt",
+        width = SQP_EVENT_COLUMN_WIDTH,
     );
     write_repeated_header(&mut out, &header);
     for (idx, snapshot) in snapshots.iter().enumerate() {
@@ -1168,87 +1273,10 @@ fn render_sqp_transcript(
                 optimization::SqpQpStatus::Failed => "fail".to_string(),
             },
         );
-        let events = if snapshot.events.is_empty() {
-            let mut codes = String::new();
-            if snapshot
-                .line_search
-                .as_ref()
-                .is_some_and(|info| info.second_order_correction_attempted)
-            {
-                codes.push('s');
-            }
-            if snapshot
-                .line_search
-                .as_ref()
-                .is_some_and(|info| info.restoration_attempted)
-            {
-                codes.push('t');
-            }
-            if snapshot
-                .line_search
-                .as_ref()
-                .is_some_and(|info| info.elastic_recovery_attempted)
-            {
-                codes.push('e');
-            }
-            if codes.is_empty() {
-                "--".to_string()
-            } else {
-                codes
-            }
-        } else {
-            let mut codes = snapshot
-                .events
-                .iter()
-                .map(|event| match event {
-                    optimization::SqpIterationEvent::PenaltyUpdated => 'P',
-                    optimization::SqpIterationEvent::HessianShifted => 'H',
-                    optimization::SqpIterationEvent::LongLineSearch => 'L',
-                    optimization::SqpIterationEvent::ArmijoToleranceAdjusted => 'A',
-                    optimization::SqpIterationEvent::SecondOrderCorrectionUsed => 'S',
-                    optimization::SqpIterationEvent::FilterAccepted => 'F',
-                    optimization::SqpIterationEvent::RestorationStepAccepted => 'T',
-                    optimization::SqpIterationEvent::QpReducedAccuracy => 'R',
-                    optimization::SqpIterationEvent::ElasticRecoveryUsed => 'E',
-                    optimization::SqpIterationEvent::WolfeRejectedTrial => 'W',
-                    optimization::SqpIterationEvent::MaxIterationsReached => 'M',
-                })
-                .collect::<String>();
-            if !snapshot
-                .events
-                .contains(&optimization::SqpIterationEvent::SecondOrderCorrectionUsed)
-                && snapshot
-                    .line_search
-                    .as_ref()
-                    .is_some_and(|info| info.second_order_correction_attempted)
-            {
-                codes.push('s');
-            }
-            if !snapshot
-                .events
-                .contains(&optimization::SqpIterationEvent::RestorationStepAccepted)
-                && snapshot
-                    .line_search
-                    .as_ref()
-                    .is_some_and(|info| info.restoration_attempted)
-            {
-                codes.push('t');
-            }
-            if !snapshot
-                .events
-                .contains(&optimization::SqpIterationEvent::ElasticRecoveryUsed)
-                && snapshot
-                    .line_search
-                    .as_ref()
-                    .is_some_and(|info| info.elastic_recovery_attempted)
-            {
-                codes.push('e');
-            }
-            codes
-        };
+        let events = sqp_event_codes(snapshot);
         let _ = writeln!(
             out,
-            "{:>4}  {:<6}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>7}  {:>5}  {:>5}  {:>5}",
+            "{:>4}  {:<6}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>7}  {:>5}  {:>5}  {:>width$}",
             snapshot.iteration,
             phase,
             fmt_sci(snapshot.objective),
@@ -1268,6 +1296,7 @@ fn render_sqp_transcript(
                 .map_or_else(|| "--".to_string(), |ls| ls.backtrack_count.to_string()),
             qp,
             events,
+            width = SQP_EVENT_COLUMN_WIDTH,
         );
     }
     let detailed_line_search = snapshots
