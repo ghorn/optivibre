@@ -1,8 +1,8 @@
 use approx::assert_abs_diff_eq;
 use optimization::{
     CallPolicy, CallPolicyConfig, ClarabelSqpOptions, FiniteDifferenceValidationOptions,
-    FunctionCompileOptions, InteriorPointOptions, LlvmOptimizationLevel, SymbolicCompileProgress,
-    SymbolicCompileStage, SymbolicNlpOutputs, SqpGlobalization, TypedNlpScaling,
+    FunctionCompileOptions, InteriorPointOptions, LlvmOptimizationLevel, SqpGlobalization,
+    SymbolicCompileProgress, SymbolicCompileStage, SymbolicNlpOutputs, TypedNlpScaling,
     TypedRuntimeNlpBounds, flat_view, symbolic_nlp,
 };
 #[cfg(feature = "ipopt")]
@@ -294,11 +294,13 @@ fn typed_symbolic_scaling_keeps_callbacks_in_original_units() {
     assert_abs_diff_eq!(snapshot.x[1], 0.1, epsilon = 1e-12);
     assert_abs_diff_eq!(snapshot.objective, 0.845, epsilon = 1e-12);
     assert_abs_diff_eq!(
-        snapshot.eq_inf.expect("equality residual should be present"),
-        10.0,
+        snapshot
+            .eq_inf
+            .expect("equality residual should be present"),
+        0.1,
         epsilon = 1e-12
     );
-    assert!(snapshot.overall_inf >= 10.0);
+    assert!(snapshot.overall_inf >= 0.1);
 
     assert_abs_diff_eq!(summary.x[0], -0.25, epsilon = 1e-6);
     assert_abs_diff_eq!(summary.x[1], 0.25, epsilon = 1e-6);

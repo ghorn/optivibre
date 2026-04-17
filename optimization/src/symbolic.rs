@@ -18,8 +18,8 @@ use crate::{
     NlpDerivativeValidationReport, NlpEqualityViolation, NlpEvaluationBenchmark,
     NlpEvaluationBenchmarkOptions, NlpEvaluationKernelKind, NlpInequalitySource,
     NlpInequalityViolation, ParameterMatrix, SqpAdapterTiming, SqpFailureContext,
-    SqpIterationSnapshot, SymbolicCompileMetadata, SymbolicCompileProgress,
-    SymbolicCompileStage, SymbolicCompileStageProgress, SymbolicSetupProfile, Vectorize,
+    SqpIterationSnapshot, SymbolicCompileMetadata, SymbolicCompileProgress, SymbolicCompileStage,
+    SymbolicCompileStageProgress, SymbolicSetupProfile, Vectorize,
     benchmark_compiled_nlp_problem_with_progress, classify_constraint_satisfaction,
     constraint_bound_side, flatten_value, solve_nlp_interior_point,
     solve_nlp_interior_point_with_callback, solve_nlp_sqp, solve_nlp_sqp_with_callback,
@@ -107,6 +107,9 @@ impl From<LlvmOptimizationLevel> for SymbolicNlpCompileOptions {
     }
 }
 
+/// User-facing NLP reference scales in the original problem units.
+///
+/// The solver internally normalizes with `q' = q / q_scale`.
 pub struct TypedNlpScaling<X>
 where
     X: Vectorize<SX>,
@@ -273,7 +276,9 @@ pub enum RuntimeNlpBoundsError {
     VariableScalingLengthMismatch { expected: Index, actual: Index },
     #[error("constraint scaling length mismatch: expected {expected}, got {actual}")]
     ConstraintScalingLengthMismatch { expected: Index, actual: Index },
-    #[error("invalid variable scaling at index {index}: expected positive finite value, got {value}")]
+    #[error(
+        "invalid variable scaling at index {index}: expected positive finite value, got {value}"
+    )]
     InvalidVariableScaling { index: Index, value: f64 },
     #[error(
         "invalid constraint scaling at index {index}: expected positive finite value, got {value}"
@@ -959,7 +964,8 @@ where
         &self,
         bounds: &TypedRuntimeNlpBounds<X, I>,
     ) -> Result<RuntimeBoundedJitNlp<'_>, RuntimeNlpBoundsError> {
-        self.inner.bind_runtime_bounds(self.flatten_runtime_bounds(bounds))
+        self.inner
+            .bind_runtime_bounds(self.flatten_runtime_bounds(bounds))
     }
 
     fn flatten_runtime_bounds(&self, bounds: &TypedRuntimeNlpBounds<X, I>) -> RuntimeNlpBounds {
@@ -994,13 +1000,26 @@ where
         let Some(scaling) = bounds.scaling.as_ref() else {
             return Ok(None);
         };
-        let variable = validate_scaling_vector(X::LEN, flatten_value(&scaling.variable), true)?;
-        let constraint = validate_scaling_vector(E::LEN + I::LEN, scaling.constraints.clone(), false)?;
+        let variable = invert_scaling_vector(validate_scaling_vector(
+            X::LEN,
+            flatten_value(&scaling.variable),
+            true,
+        )?);
+        let constraint = invert_scaling_vector(validate_scaling_vector(
+            E::LEN + I::LEN,
+            scaling.constraints.clone(),
+            false,
+        )?);
+        if !scaling.objective.is_finite() || scaling.objective <= 0.0 {
+            return Err(RuntimeNlpBoundsError::InvalidObjectiveScaling {
+                value: scaling.objective,
+            });
+        }
         let flat = FlatNlpScaling {
             variable,
             equality: constraint[..E::LEN].to_vec(),
             inequality: constraint[E::LEN..].to_vec(),
-            objective: scaling.objective,
+            objective: 1.0 / scaling.objective,
         };
         AppliedNlpScaling::from_runtime_problem(problem, flat).map(Some)
     }
@@ -1012,13 +1031,16 @@ where
     ) -> ClarabelSqpError {
         match error {
             ClarabelSqpError::InvalidInput(message) => ClarabelSqpError::InvalidInput(message),
-            ClarabelSqpError::NonFiniteInput { stage } => ClarabelSqpError::NonFiniteInput { stage },
-            ClarabelSqpError::MaxIterations { iterations, context } => {
-                ClarabelSqpError::MaxIterations {
-                    iterations,
-                    context: Box::new(scaling.transform_sqp_context(&context)),
-                }
+            ClarabelSqpError::NonFiniteInput { stage } => {
+                ClarabelSqpError::NonFiniteInput { stage }
             }
+            ClarabelSqpError::MaxIterations {
+                iterations,
+                context,
+            } => ClarabelSqpError::MaxIterations {
+                iterations,
+                context: Box::new(scaling.transform_sqp_context(&context)),
+            },
             ClarabelSqpError::Setup(message) => ClarabelSqpError::Setup(message),
             ClarabelSqpError::QpSolve { status, context } => ClarabelSqpError::QpSolve {
                 status,
@@ -1693,6 +1715,10 @@ fn validate_scaling_vector(
     Ok(values)
 }
 
+fn invert_scaling_vector(values: Vec<f64>) -> Vec<f64> {
+    values.into_iter().map(|value| 1.0 / value).collect()
+}
+
 fn scaled_jacobian_factors(ccs: &CCS, row_scale: &[f64], variable_inverse: &[f64]) -> Vec<f64> {
     let mut factors = Vec::with_capacity(ccs.nnz());
     for col in 0..ccs.ncol {
@@ -1726,8 +1752,7 @@ impl AppliedNlpScaling {
             });
         }
         let variable = validate_scaling_vector(problem.dimension(), scaling.variable, true)?;
-        let equality =
-            validate_scaling_vector(problem.equality_count(), scaling.equality, false)?;
+        let equality = validate_scaling_vector(problem.equality_count(), scaling.equality, false)?;
         let raw_inequality = validate_scaling_vector(
             problem.base.inequality_base_count(),
             scaling.inequality,
@@ -1743,8 +1768,11 @@ impl AppliedNlpScaling {
             .iter()
             .map(|row| raw_inequality[row.source_index])
             .collect::<Vec<_>>();
-        let equality_jacobian_factors =
-            scaled_jacobian_factors(problem.equality_jacobian_ccs(), &equality, &variable_inverse);
+        let equality_jacobian_factors = scaled_jacobian_factors(
+            problem.equality_jacobian_ccs(),
+            &equality,
+            &variable_inverse,
+        );
         let inequality_jacobian_factors = scaled_jacobian_factors(
             problem.inequality_jacobian_ccs(),
             &inequality,
@@ -1899,7 +1927,10 @@ impl AppliedNlpScaling {
         snapshot
     }
 
-    fn transform_interior_point_summary(&self, summary: &InteriorPointSummary) -> InteriorPointSummary {
+    fn transform_interior_point_summary(
+        &self,
+        summary: &InteriorPointSummary,
+    ) -> InteriorPointSummary {
         InteriorPointSummary {
             x: self.unscale_x(&summary.x),
             equality_multipliers: self.unscale_equality_multipliers(&summary.equality_multipliers),
@@ -1925,7 +1956,10 @@ impl AppliedNlpScaling {
     }
 
     #[cfg(feature = "ipopt")]
-    fn transform_ipopt_snapshot(&self, snapshot: &IpoptIterationSnapshot) -> IpoptIterationSnapshot {
+    fn transform_ipopt_snapshot(
+        &self,
+        snapshot: &IpoptIterationSnapshot,
+    ) -> IpoptIterationSnapshot {
         let mut snapshot = snapshot.clone();
         snapshot.x = self.unscale_x(&snapshot.x);
         snapshot.objective = self.unscale_objective(snapshot.objective);
@@ -2048,7 +2082,10 @@ where
         let unscaled_x = self.scaling.unscale_x(x);
         self.base
             .equality_jacobian_values(&unscaled_x, parameters, out);
-        for (value, factor) in out.iter_mut().zip(self.scaling.equality_jacobian_factors.iter()) {
+        for (value, factor) in out
+            .iter_mut()
+            .zip(self.scaling.equality_jacobian_factors.iter())
+        {
             *value *= factor;
         }
     }
@@ -2095,10 +2132,12 @@ where
         out: &mut [f64],
     ) {
         let unscaled_x = self.scaling.unscale_x(x);
-        let base_equality_multipliers =
-            self.scaling.scale_hessian_equality_multipliers(equality_multipliers);
-        let base_inequality_multipliers =
-            self.scaling.scale_hessian_inequality_multipliers(inequality_multipliers);
+        let base_equality_multipliers = self
+            .scaling
+            .scale_hessian_equality_multipliers(equality_multipliers);
+        let base_inequality_multipliers = self
+            .scaling
+            .scale_hessian_inequality_multipliers(inequality_multipliers);
         self.base.lagrangian_hessian_values(
             &unscaled_x,
             parameters,

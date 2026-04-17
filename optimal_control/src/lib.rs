@@ -8,8 +8,7 @@ use optimization::{
     NlpEvaluationBenchmarkOptions, NlpEvaluationKernelKind, ScalarLeaf, SqpIterationSnapshot,
     SymbolicCompileMetadata, SymbolicCompileProgress, SymbolicCompileStageProgress,
     SymbolicNlpBuildError, SymbolicNlpCompileError, SymbolicNlpCompileOptions, SymbolicNlpOutputs,
-    TypedCompiledJitNlp, TypedNlpScaling, TypedRuntimeNlpBounds, Vectorize,
-    VectorizeLayoutError,
+    TypedCompiledJitNlp, TypedNlpScaling, TypedRuntimeNlpBounds, Vectorize, VectorizeLayoutError,
     classify_constraint_satisfaction, constraint_bound_side, flatten_value, symbolic_column,
     symbolic_nlp, symbolic_value, unflatten_value, worst_bound_violation,
 };
@@ -290,6 +289,9 @@ pub enum DirectCollocationInitialGuess<X, U, P, const N: usize, const K: usize> 
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct OcpScaling<P, X, U> {
+    /// User-facing OCP reference scales in the original problem units.
+    ///
+    /// The transcribed NLP is normalized internally with `q' = q / q_scale`.
     pub objective: f64,
     pub state: X,
     pub control: U,
@@ -3488,7 +3490,8 @@ where
 
         let state_scale = flatten_value(&scaling.state);
         let control_scale = flatten_value(&scaling.control);
-        let mut constraints = Vec::with_capacity(MsEqualities::<X, U, N>::LEN + MsIneq::<C, Beq, Bineq, N>::LEN);
+        let mut constraints =
+            Vec::with_capacity(MsEqualities::<X, U, N>::LEN + MsIneq::<C, Beq, Bineq, N>::LEN);
         for _ in 0..N {
             constraints.extend_from_slice(&state_scale);
         }
@@ -4285,9 +4288,7 @@ where
                 terminal: scaling.control.clone(),
             },
             IntervalGrid {
-                intervals: std::array::from_fn(|_| {
-                    std::array::from_fn(|_| scaling.state.clone())
-                }),
+                intervals: std::array::from_fn(|_| std::array::from_fn(|_| scaling.state.clone())),
             },
             IntervalGrid {
                 intervals: std::array::from_fn(|_| {
@@ -4304,8 +4305,9 @@ where
 
         let state_scale = flatten_value(&scaling.state);
         let control_scale = flatten_value(&scaling.control);
-        let mut constraints =
-            Vec::with_capacity(DcEqualities::<X, U, N, K>::LEN + DcIneq::<C, Beq, Bineq, N, K>::LEN);
+        let mut constraints = Vec::with_capacity(
+            DcEqualities::<X, U, N, K>::LEN + DcIneq::<C, Beq, Bineq, N, K>::LEN,
+        );
         for _ in 0..(N * K) {
             constraints.extend_from_slice(&state_scale);
         }
@@ -6300,7 +6302,9 @@ mod tests {
         let bounds = compiled
             .build_runtime_bounds(&runtime)
             .expect("runtime bounds should build");
-        let scaling = bounds.scaling.expect("runtime scaling should map into NLP scaling");
+        let scaling = bounds
+            .scaling
+            .expect("runtime scaling should map into NLP scaling");
 
         assert_eq!(
             flatten_value(&scaling.variable),
@@ -6354,20 +6358,22 @@ mod tests {
         let bounds = compiled
             .build_runtime_bounds(&runtime)
             .expect("runtime bounds should build");
-        let scaling = bounds.scaling.expect("runtime scaling should map into NLP scaling");
+        let scaling = bounds
+            .scaling
+            .expect("runtime scaling should map into NLP scaling");
 
         assert_eq!(
             flatten_value(&scaling.variable),
             vec![
-                2.0, 3.0, 2.0, 3.0, 2.0, 3.0, 5.0, 5.0, 5.0, 2.0, 3.0, 2.0, 3.0, 2.0, 3.0,
-                2.0, 3.0, 5.0, 5.0, 5.0, 5.0, 11.0, 11.0, 11.0, 11.0, 13.0,
+                2.0, 3.0, 2.0, 3.0, 2.0, 3.0, 5.0, 5.0, 5.0, 2.0, 3.0, 2.0, 3.0, 2.0, 3.0, 2.0,
+                3.0, 5.0, 5.0, 5.0, 5.0, 11.0, 11.0, 11.0, 11.0, 13.0,
             ]
         );
         assert_eq!(
             scaling.constraints,
             vec![
-                2.0, 3.0, 2.0, 3.0, 2.0, 3.0, 2.0, 3.0, 5.0, 5.0, 5.0, 5.0, 2.0, 3.0, 2.0,
-                3.0, 5.0, 5.0, 19.0, 23.0,
+                2.0, 3.0, 2.0, 3.0, 2.0, 3.0, 2.0, 3.0, 5.0, 5.0, 5.0, 5.0, 2.0, 3.0, 2.0, 3.0,
+                5.0, 5.0, 19.0, 23.0,
             ]
         );
         assert_abs_diff_eq!(scaling.objective, 7.0, epsilon = 1e-12);
