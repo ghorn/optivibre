@@ -3,8 +3,6 @@ const EQ_INF_LABEL = "‖eq‖∞";
 const INEQ_INF_LABEL = "‖ineq₊‖∞";
 const DUAL_INF_LABEL = "‖∇L‖∞";
 const TRUST_REGION_RADIUS_LABEL = "TR radius";
-const ACCEPTED_STEP_NORM_LABEL = "Accepted step (2-norm)";
-const ATTEMPTED_STEP_NORM_LABEL = "Largest attempted step (2-norm)";
 const STEP_INF_LABEL = "‖Δx‖∞";
 
 type EnumValue<T extends Record<string, number>> = T[keyof T];
@@ -4452,8 +4450,8 @@ const PROGRESS_TRACE = Object.freeze({
 
 const TRUST_REGION_TRACE = Object.freeze({
   radius: 0,
-  acceptedStepNorm: 1,
-  attemptedStepNorm: 2,
+  boundaryOff: 1,
+  boundaryOn: 2,
 });
 
 function toleranceSeverity(
@@ -4757,14 +4755,21 @@ function updateProgressPlot(progress: SolveProgress): void {
 function trustRegionHoverText(
   progress: SolveProgress,
   trustRegion: SolveTrustRegionInfo,
-  label: string,
-  value: number | null,
-  includeStepInf = false,
 ): string {
+  const acceptedStepNorm = positiveLogValue(trustRegion.step_norm);
+  const attemptedStepNorm = positiveLogValue(trustRegion.largest_attempted_step_norm);
+  const stepInf = positiveLogValue(progress.step_inf);
+  const acceptedRatio =
+    acceptedStepNorm != null && trustRegion.radius > 0
+      ? Math.min(Math.max(acceptedStepNorm / trustRegion.radius, 0), 1)
+      : null;
   const lines = [
-    label,
+    TRUST_REGION_RADIUS_LABEL,
     `iter=${progress.iteration}`,
-    `value=${value == null ? "--" : value.toExponential(3)}`,
+    `radius=${trustRegion.radius.toExponential(3)}`,
+    `accepted step=${acceptedStepNorm == null ? "--" : acceptedStepNorm.toExponential(3)}`,
+    `largest attempted=${attemptedStepNorm == null ? "--" : attemptedStepNorm.toExponential(3)}`,
+    `accepted / radius=${acceptedRatio == null ? "--" : acceptedRatio.toFixed(2)}`,
     `attempted radius=${trustRegion.attempted_radius.toExponential(3)}`,
     `contractions=${trustRegion.contraction_count}`,
     `qp retries=${trustRegion.qp_failure_retries}`,
@@ -4772,10 +4777,29 @@ function trustRegionHoverText(
     `restoration=${trustRegion.restoration_attempted ? "yes" : "no"}`,
     `elastic recovery=${trustRegion.elastic_recovery_attempted ? "yes" : "no"}`,
   ];
-  if (includeStepInf && progress.step_inf != null && Number.isFinite(progress.step_inf)) {
-    lines.push(`step inf=${progress.step_inf.toExponential(3)}`);
+  if (stepInf != null) {
+    lines.push(`step inf=${stepInf.toExponential(3)}`);
   }
   return lines.join("<br>");
+}
+
+function trustRegionMarkerSymbol(trustRegion: SolveTrustRegionInfo): string {
+  if (trustRegion.elastic_recovery_attempted) {
+    return "x";
+  }
+  if (trustRegion.restoration_attempted) {
+    return "diamond";
+  }
+  return "circle";
+}
+
+function trustRegionMarkerSize(trustRegion: SolveTrustRegionInfo): number {
+  const acceptedStepNorm = positiveLogValue(trustRegion.step_norm);
+  if (acceptedStepNorm == null || !Number.isFinite(trustRegion.radius) || trustRegion.radius <= 0) {
+    return 7;
+  }
+  const ratio = Math.min(Math.max(acceptedStepNorm / trustRegion.radius, 0), 1);
+  return 6 + 8 * ratio;
 }
 
 function ensureTrustRegionPlot(): void {
@@ -4786,35 +4810,41 @@ function ensureTrustRegionPlot(): void {
   const data = [
     {
       type: "scatter",
-      mode: "lines+markers",
+      mode: "lines",
       name: TRUST_REGION_RADIUS_LABEL,
       x: [],
       y: [],
+      line: { color: PALETTE[0], width: 2.8 },
+      hoverinfo: "skip",
+    },
+    {
+      type: "scatter",
+      mode: "markers",
+      name: "Boundary off",
+      x: [],
+      y: [],
       text: [],
-      line: { color: PALETTE[0], width: 2.6 },
-      marker: { size: 5 },
+      marker: {
+        size: [],
+        symbol: [],
+        color: PALETTE[1],
+        line: { color: "rgba(229, 241, 244, 0.22)", width: 1.1 },
+      },
       hovertemplate: "%{text}<extra></extra>",
     },
     {
       type: "scatter",
-      mode: "lines+markers",
-      name: ACCEPTED_STEP_NORM_LABEL,
+      mode: "markers",
+      name: "Boundary on",
       x: [],
       y: [],
       text: [],
-      line: { color: PALETTE[1], width: 2.4 },
-      marker: { size: 5 },
-      hovertemplate: "%{text}<extra></extra>",
-    },
-    {
-      type: "scatter",
-      mode: "lines+markers",
-      name: ATTEMPTED_STEP_NORM_LABEL,
-      x: [],
-      y: [],
-      text: [],
-      line: { color: PALETTE[2], width: 2.2, dash: "dash" },
-      marker: { size: 5 },
+      marker: {
+        size: [],
+        symbol: [],
+        color: PALETTE[3],
+        line: { color: "rgba(229, 241, 244, 0.22)", width: 1.1 },
+      },
       hovertemplate: "%{text}<extra></extra>",
     },
   ];
@@ -4852,7 +4882,7 @@ function ensureTrustRegionPlot(): void {
     },
     annotations: [
       {
-        text: "Trust-region radius and step size",
+        text: "Radius line · color = boundary · size = accepted/radius · diamond/x = restoration/elastic",
         xref: "paper",
         yref: "paper",
         x: 0,
@@ -4882,36 +4912,23 @@ function updateTrustRegionPlot(progress: SolveProgress): void {
   ensureTrustRegionPlot();
   const iteration = progress.iteration;
   const radius = positiveLogValue(trustRegion.radius);
-  const acceptedStepNorm = positiveLogValue(trustRegion.step_norm);
-  const attemptedStepNorm = positiveLogValue(trustRegion.largest_attempted_step_norm);
+  const boundaryTrace = trustRegion.boundary_active
+    ? TRUST_REGION_TRACE.boundaryOn
+    : TRUST_REGION_TRACE.boundaryOff;
+  window.Plotly.extendTraces(trustRegionPlotEl, {
+    x: [[iteration]],
+    y: [[radius]],
+  }, [TRUST_REGION_TRACE.radius]);
   window.Plotly.extendTraces(
     trustRegionPlotEl,
     {
-      x: [[iteration], [iteration], [iteration]],
-      y: [
-        [radius],
-        [acceptedStepNorm],
-        [attemptedStepNorm],
-      ],
-      text: [[
-        trustRegionHoverText(progress, trustRegion, TRUST_REGION_RADIUS_LABEL, radius),
-      ], [
-        trustRegionHoverText(
-          progress,
-          trustRegion,
-          ACCEPTED_STEP_NORM_LABEL,
-          acceptedStepNorm,
-          true,
-        ),
-      ], [
-        trustRegionHoverText(progress, trustRegion, ATTEMPTED_STEP_NORM_LABEL, attemptedStepNorm),
-      ]],
+      x: [[iteration]],
+      y: [[radius]],
+      text: [[trustRegionHoverText(progress, trustRegion)]],
+      "marker.size": [[trustRegionMarkerSize(trustRegion)]],
+      "marker.symbol": [[trustRegionMarkerSymbol(trustRegion)]],
     },
-    [
-      TRUST_REGION_TRACE.radius,
-      TRUST_REGION_TRACE.acceptedStepNorm,
-      TRUST_REGION_TRACE.attemptedStepNorm,
-    ],
+    [boundaryTrace],
   );
 }
 
