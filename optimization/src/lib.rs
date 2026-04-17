@@ -39,7 +39,8 @@ pub use interior_point::{
     InteriorPointIterationEvent, InteriorPointIterationPhase, InteriorPointIterationSnapshot,
     InteriorPointIterationTiming, InteriorPointLineSearchInfo, InteriorPointLineSearchTrial,
     InteriorPointLinearSolver, InteriorPointOptions, InteriorPointProfiling,
-    InteriorPointSolveError, InteriorPointSummary, solve_nlp_interior_point,
+    InteriorPointSolveError, InteriorPointSummary, format_nlip_settings_summary,
+    nlip_event_codes, nlip_event_legend_entries, solve_nlp_interior_point,
     solve_nlp_interior_point_with_callback,
 };
 #[cfg(feature = "ipopt")]
@@ -47,8 +48,8 @@ pub use ipopt::SolveStatus as IpoptSolveStatus;
 #[cfg(feature = "ipopt")]
 pub use ipopt_backend::{
     IpoptIterationPhase, IpoptIterationSnapshot, IpoptIterationTiming, IpoptMuStrategy,
-    IpoptOptions, IpoptProfiling, IpoptRawStatus, IpoptSolveError, IpoptSummary, solve_nlp_ipopt,
-    solve_nlp_ipopt_with_callback,
+    IpoptOptions, IpoptProfiling, IpoptRawStatus, IpoptSolveError, IpoptSummary,
+    format_ipopt_settings_summary, solve_nlp_ipopt, solve_nlp_ipopt_with_callback,
 };
 pub use optimization_derive::Vectorize;
 pub use symbolic::{
@@ -876,6 +877,17 @@ pub enum SqpGlobalizationKind {
     TrustRegionFilter,
 }
 
+impl SqpGlobalizationKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::LineSearchMerit => "ls_merit",
+            Self::LineSearchFilter => "ls_filter",
+            Self::TrustRegionMerit => "tr_merit",
+            Self::TrustRegionFilter => "tr_filter",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SqpLineSearchOptions {
     pub armijo_c1: f64,
@@ -883,6 +895,113 @@ pub struct SqpLineSearchOptions {
     pub beta: f64,
     pub max_steps: Index,
     pub min_step: f64,
+}
+
+impl SqpGlobalization {
+    pub const fn kind(&self) -> SqpGlobalizationKind {
+        match self {
+            Self::LineSearchMerit(_) => SqpGlobalizationKind::LineSearchMerit,
+            Self::LineSearchFilter(_) => SqpGlobalizationKind::LineSearchFilter,
+            Self::TrustRegionMerit(_) => SqpGlobalizationKind::TrustRegionMerit,
+            Self::TrustRegionFilter(_) => SqpGlobalizationKind::TrustRegionFilter,
+        }
+    }
+}
+
+pub fn format_sqp_settings_summary(options: &ClarabelSqpOptions) -> String {
+    let globalization = match &options.globalization {
+        SqpGlobalization::LineSearchMerit(globalization) => format!(
+            "globalization={} armijo={} wolfe={} beta={} max_ls={} min_step={} penalty={}x{}",
+            options.globalization.kind().label(),
+            sci_text(globalization.line_search.armijo_c1),
+            globalization
+                .line_search
+                .wolfe_c2
+                .map(sci_text)
+                .unwrap_or_else(|| "off".to_string()),
+            sci_text(globalization.line_search.beta),
+            globalization.line_search.max_steps,
+            sci_text(globalization.line_search.min_step),
+            sci_text(globalization.exact_merit_penalty),
+            globalization.penalty_increase_factor,
+        ),
+        SqpGlobalization::LineSearchFilter(globalization) => format!(
+            "globalization={} armijo={} wolfe={} beta={} max_ls={} min_step={} filter_gamma=({}, {}) switching=({}, {}, {}) penalty={}",
+            options.globalization.kind().label(),
+            sci_text(globalization.line_search.armijo_c1),
+            globalization
+                .line_search
+                .wolfe_c2
+                .map(sci_text)
+                .unwrap_or_else(|| "off".to_string()),
+            sci_text(globalization.line_search.beta),
+            globalization.line_search.max_steps,
+            sci_text(globalization.line_search.min_step),
+            sci_text(globalization.filter.gamma_objective),
+            sci_text(globalization.filter.gamma_violation),
+            sci_text(globalization.filter.switching_reference_min),
+            sci_text(globalization.filter.switching_violation_factor),
+            sci_text(globalization.filter.switching_linearized_reduction_factor),
+            sci_text(globalization.exact_merit_penalty),
+        ),
+        SqpGlobalization::TrustRegionMerit(globalization) => format!(
+            "globalization={} radius=({}->{}, min={}) shrink={} grow={} rho=({},{}) boundary={} max_contract={} penalty={} fixed={}",
+            options.globalization.kind().label(),
+            sci_text(globalization.trust_region.initial_radius),
+            sci_text(globalization.trust_region.max_radius),
+            sci_text(globalization.trust_region.min_radius),
+            sci_text(globalization.trust_region.shrink_factor),
+            sci_text(globalization.trust_region.grow_factor),
+            sci_text(globalization.trust_region.accept_ratio),
+            sci_text(globalization.trust_region.expand_ratio),
+            sci_text(globalization.trust_region.boundary_fraction),
+            globalization.trust_region.max_radius_contractions,
+            sci_text(globalization.exact_merit_penalty),
+            if globalization.fixed_penalty {
+                "on"
+            } else {
+                "off"
+            },
+        ),
+        SqpGlobalization::TrustRegionFilter(globalization) => format!(
+            "globalization={} radius=({}->{}, min={}) shrink={} grow={} rho=({},{}) boundary={} max_contract={} filter_gamma=({}, {}) switching=({}, {}, {}) penalty={}",
+            options.globalization.kind().label(),
+            sci_text(globalization.trust_region.initial_radius),
+            sci_text(globalization.trust_region.max_radius),
+            sci_text(globalization.trust_region.min_radius),
+            sci_text(globalization.trust_region.shrink_factor),
+            sci_text(globalization.trust_region.grow_factor),
+            sci_text(globalization.trust_region.accept_ratio),
+            sci_text(globalization.trust_region.expand_ratio),
+            sci_text(globalization.trust_region.boundary_fraction),
+            globalization.trust_region.max_radius_contractions,
+            sci_text(globalization.filter.gamma_objective),
+            sci_text(globalization.filter.gamma_violation),
+            sci_text(globalization.filter.switching_reference_min),
+            sci_text(globalization.filter.switching_violation_factor),
+            sci_text(globalization.filter.switching_linearized_reduction_factor),
+            sci_text(globalization.exact_merit_penalty),
+        ),
+    };
+    format!(
+        "{globalization}; hessian_regularization={}; soc={}; restoration={}; elastic={}",
+        if options.hessian_regularization_enabled {
+            format!("on({})", sci_text(options.regularization))
+        } else {
+            "off".to_string()
+        },
+        if options.second_order_correction {
+            "on"
+        } else {
+            "off"
+        },
+        if options.restoration_phase {
+            "on"
+        } else {
+            "off"
+        },
+        if options.elastic_mode { "on" } else { "off" },
+    )
 }
 
 impl Default for SqpLineSearchOptions {
@@ -1081,6 +1200,95 @@ pub enum SqpIterationEvent {
     ElasticRecoveryUsed,
     WolfeRejectedTrial,
     MaxIterationsReached,
+}
+
+pub fn sqp_event_legend_entries(snapshot: &SqpIterationSnapshot) -> Vec<(char, &'static str)> {
+    let mut entries = Vec::new();
+    if snapshot.events.contains(&SqpIterationEvent::PenaltyUpdated) {
+        entries.push(('P', "P=merit penalty increased"));
+    }
+    if snapshot.events.contains(&SqpIterationEvent::HessianShifted) {
+        entries.push(('H', "H=Hessian shifted beyond baseline regularization"));
+    }
+    if snapshot.events.contains(&SqpIterationEvent::LongLineSearch) {
+        entries.push(('L', "L=line search backtracked >=4 times"));
+    }
+    if snapshot
+        .events
+        .contains(&SqpIterationEvent::ArmijoToleranceAdjusted)
+    {
+        entries.push(('A', "A=Armijo accepted using numerical tolerance slack"));
+    }
+    if snapshot
+        .events
+        .contains(&SqpIterationEvent::SecondOrderCorrectionUsed)
+    {
+        entries.push(('S', "S=accepted full step after second-order correction"));
+    } else if snapshot
+        .line_search
+        .as_ref()
+        .is_some_and(|info| info.second_order_correction_attempted)
+    {
+        entries.push(('s', "s=second-order correction attempted but not accepted"));
+    }
+    if snapshot.events.contains(&SqpIterationEvent::FilterAccepted) {
+        entries.push((
+            'F',
+            "F=filter accepted a feasibility-improving step without objective Armijo",
+        ));
+    }
+    if snapshot
+        .events
+        .contains(&SqpIterationEvent::QpReducedAccuracy)
+    {
+        entries.push(('R', "R=QP solved to reduced accuracy"));
+    }
+    if snapshot
+        .events
+        .contains(&SqpIterationEvent::WolfeRejectedTrial)
+    {
+        entries.push(('W', "W=rejected trial failed Wolfe curvature condition"));
+    }
+    if snapshot
+        .events
+        .contains(&SqpIterationEvent::ElasticRecoveryUsed)
+    {
+        entries.push((
+            'E',
+            "E=elastic recovery QP used after primal-infeasible linearization",
+        ));
+    } else if snapshot
+        .line_search
+        .as_ref()
+        .is_some_and(|info| info.elastic_recovery_attempted)
+    {
+        entries.push(('e', "e=elastic recovery QP attempted but not accepted"));
+    }
+    if snapshot
+        .events
+        .contains(&SqpIterationEvent::MaxIterationsReached)
+    {
+        entries.push(('M', "M=maximum SQP iterations reached"));
+    }
+    entries
+}
+
+pub fn sqp_iteration_label(snapshot: &SqpIterationSnapshot) -> String {
+    match snapshot.phase {
+        SqpIterationPhase::Initial => "pre".to_string(),
+        SqpIterationPhase::AcceptedStep => {
+            if accepted_step_kind(
+                snapshot.line_search.as_ref(),
+                snapshot.trust_region.as_ref(),
+            ) == Some(SqpStepKind::Restoration)
+            {
+                format!("{}r", snapshot.iteration)
+            } else {
+                snapshot.iteration.to_string()
+            }
+        }
+        SqpIterationPhase::PostConvergence => "post".to_string(),
+    }
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -4182,19 +4390,7 @@ pub(crate) fn style_iteration_label_cell(label: &str, iteration_limit_reached: b
 }
 
 fn style_iteration_cell(snapshot: &SqpIterationSnapshot) -> String {
-    let label = match snapshot.phase {
-        SqpIterationPhase::Initial => "pre".to_string(),
-        SqpIterationPhase::AcceptedStep => {
-            if accepted_step_kind(snapshot.line_search.as_ref(), snapshot.trust_region.as_ref())
-                == Some(SqpStepKind::Restoration)
-            {
-                format!("{}r", snapshot.iteration)
-            } else {
-                snapshot.iteration.to_string()
-            }
-        }
-        SqpIterationPhase::PostConvergence => "post".to_string(),
-    };
+    let label = sqp_iteration_label(snapshot);
     style_iteration_label_cell(
         &label,
         has_event(snapshot, SqpIterationEvent::MaxIterationsReached),
@@ -4686,16 +4882,12 @@ fn log_sqp_problem_header<P>(
                 sci_text(options.complementarity_tol),
             ),
         ),
+        boxed_line("summary", format_sqp_settings_summary(options)),
         boxed_line(
             "globalize",
             format!(
                 "mode={}  filter={}  penalty0={}  regularization={}({})  soc={}  elastic={}",
-                match globalization_kind {
-                    SqpGlobalizationKind::LineSearchMerit => "ls-merit",
-                    SqpGlobalizationKind::LineSearchFilter => "ls-filter",
-                    SqpGlobalizationKind::TrustRegionMerit => "tr-merit",
-                    SqpGlobalizationKind::TrustRegionFilter => "tr-filter",
-                },
+                globalization_kind.label(),
                 if uses_filter { "on" } else { "off" },
                 sci_text(exact_merit_penalty),
                 if options.hessian_regularization_enabled {
@@ -4841,7 +5033,7 @@ fn has_event(snapshot: &SqpIterationSnapshot, event: SqpIterationEvent) -> bool 
 
 const SQP_EVENT_COLUMN_WIDTH: usize = 10;
 
-fn sqp_event_slot_chars(snapshot: &SqpIterationSnapshot) -> [char; SQP_EVENT_COLUMN_WIDTH] {
+pub fn sqp_event_codes(snapshot: &SqpIterationSnapshot) -> String {
     let line_search = snapshot.line_search.as_ref();
     [
         if has_event(snapshot, SqpIterationEvent::PenaltyUpdated) {
@@ -4899,11 +5091,13 @@ fn sqp_event_slot_chars(snapshot: &SqpIterationSnapshot) -> [char; SQP_EVENT_COL
             ' '
         },
     ]
+    .into_iter()
+    .collect()
 }
 
 fn style_event_cell(snapshot: &SqpIterationSnapshot) -> String {
-    sqp_event_slot_chars(snapshot)
-        .into_iter()
+    sqp_event_codes(snapshot)
+        .chars()
         .map(|code| match code {
             's' | 'e' | 'M' => style_red_bold(&code.to_string()),
             'P' | 'H' | 'L' | 'A' | 'S' | 'F' | 'R' | 'W' | 'E' => {
@@ -4939,54 +5133,25 @@ fn event_legend_lines(
     state: &mut SqpEventLegendState,
 ) -> Vec<String> {
     let mut parts = Vec::new();
-
-    if has_event(snapshot, SqpIterationEvent::PenaltyUpdated) && state.mark_penalty_if_new() {
-        parts.push("P=merit penalty increased");
-    }
-    if has_event(snapshot, SqpIterationEvent::HessianShifted) && state.mark_hessian_shift_if_new() {
-        parts.push("H=Hessian shifted beyond baseline regularization");
-    }
-    if has_event(snapshot, SqpIterationEvent::LongLineSearch) && state.mark_line_search_if_new() {
-        parts.push("L=line search backtracked >=4 times");
-    }
-    if has_event(snapshot, SqpIterationEvent::ArmijoToleranceAdjusted)
-        && state.mark_armijo_adjust_if_new()
-    {
-        parts.push("A=Armijo accepted using numerical tolerance slack");
-    }
-    if has_event(snapshot, SqpIterationEvent::SecondOrderCorrectionUsed) && state.mark_soc_if_new()
-    {
-        parts.push("S=accepted full step after second-order correction");
-    } else if snapshot
-        .line_search
-        .as_ref()
-        .is_some_and(|info| info.second_order_correction_attempted)
-        && state.mark_soc_attempted_if_new()
-    {
-        parts.push("s=second-order correction attempted but not accepted");
-    }
-    if has_event(snapshot, SqpIterationEvent::FilterAccepted) && state.mark_filter_if_new() {
-        parts.push("F=filter accepted a feasibility-improving step without objective Armijo");
-    }
-    if has_event(snapshot, SqpIterationEvent::QpReducedAccuracy) && state.mark_qp_if_new() {
-        parts.push("R=QP solved to reduced accuracy");
-    }
-    if has_event(snapshot, SqpIterationEvent::WolfeRejectedTrial) && state.mark_wolfe_if_new() {
-        parts.push("W=rejected trial failed Wolfe curvature condition");
-    }
-    if has_event(snapshot, SqpIterationEvent::ElasticRecoveryUsed) && state.mark_elastic_if_new() {
-        parts.push("E=elastic recovery QP used after primal-infeasible linearization");
-    } else if snapshot
-        .line_search
-        .as_ref()
-        .is_some_and(|info| info.elastic_recovery_attempted)
-        && state.mark_elastic_attempted_if_new()
-    {
-        parts.push("e=elastic recovery QP attempted but not accepted");
-    }
-    if has_event(snapshot, SqpIterationEvent::MaxIterationsReached) && state.mark_max_iter_if_new()
-    {
-        parts.push("M=maximum SQP iterations reached");
+    for (code, description) in sqp_event_legend_entries(snapshot) {
+        let is_new = match code {
+            'P' => state.mark_penalty_if_new(),
+            'H' => state.mark_hessian_shift_if_new(),
+            'L' => state.mark_line_search_if_new(),
+            'A' => state.mark_armijo_adjust_if_new(),
+            'S' => state.mark_soc_if_new(),
+            's' => state.mark_soc_attempted_if_new(),
+            'F' => state.mark_filter_if_new(),
+            'R' => state.mark_qp_if_new(),
+            'W' => state.mark_wolfe_if_new(),
+            'E' => state.mark_elastic_if_new(),
+            'e' => state.mark_elastic_attempted_if_new(),
+            'M' => state.mark_max_iter_if_new(),
+            _ => false,
+        };
+        if is_new {
+            parts.push(description);
+        }
     }
 
     let prefix = sqp_event_legend_prefix();

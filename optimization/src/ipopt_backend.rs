@@ -65,6 +65,19 @@ impl Default for IpoptOptions {
     }
 }
 
+pub fn format_ipopt_settings_summary(options: &IpoptOptions) -> String {
+    format!(
+        "mu_strategy={}; acceptable_tol={}; print_level={}; banner={}",
+        options.mu_strategy.as_str(),
+        options
+            .acceptable_tol
+            .map(|value| format!("{value:.3e}"))
+            .unwrap_or_else(|| "off".to_string()),
+        options.print_level,
+        if options.suppress_banner { "off" } else { "on" },
+    )
+}
+
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IpoptIterationPhase {

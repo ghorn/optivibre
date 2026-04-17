@@ -215,6 +215,7 @@ fn skipped_record(
             detail: "skipped by manifest".to_string(),
         },
         solver_thresholds: None,
+        solver_settings: None,
         error: None,
         compile_report: None,
         console_output: None,

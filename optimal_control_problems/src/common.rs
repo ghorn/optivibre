@@ -31,10 +31,10 @@ use optimization::{
     NlpEvaluationBenchmarkOptions, NlpEvaluationKernelKind, SqpFilterOptions, SqpGlobalization,
     SqpIterationEvent, SqpIterationPhase, SqpIterationSnapshot, SqpLineSearchOptions,
     SqpTrustRegionOptions, SymbolicSetupProfile, TrustRegionFilterOptions, TrustRegionMeritOptions,
-    ValidationTolerances, Vectorize,
+    ValidationTolerances, Vectorize, format_nlip_settings_summary, format_sqp_settings_summary,
 };
 #[cfg(feature = "ipopt")]
-use optimization::{IpoptOptions, IpoptRawStatus, IpoptSummary};
+use optimization::{IpoptOptions, IpoptRawStatus, IpoptSummary, format_ipopt_settings_summary};
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptProfiling, IpoptSolveError};
 use serde::{Deserialize, Serialize};
@@ -759,12 +759,7 @@ fn fmt_sqp_step_kind(kind: Option<optimization::SqpStepKind>) -> &'static str {
 }
 
 fn fmt_sqp_globalization(kind: optimization::SqpGlobalizationKind) -> &'static str {
-    match kind {
-        optimization::SqpGlobalizationKind::LineSearchMerit => "ls_merit",
-        optimization::SqpGlobalizationKind::LineSearchFilter => "ls_filter",
-        optimization::SqpGlobalizationKind::TrustRegionMerit => "tr_merit",
-        optimization::SqpGlobalizationKind::TrustRegionFilter => "tr_filter",
-    }
+    kind.label()
 }
 
 fn append_filter_frontier_lines(lines: &mut Vec<String>, filter: &optimization::FilterInfo) {
@@ -2824,6 +2819,14 @@ fn phase_detail(
         value: value.into(),
         count,
     }
+}
+
+fn prepend_solver_settings_detail(
+    mut details: Vec<SolverPhaseDetail>,
+    settings: String,
+) -> Vec<SolverPhaseDetail> {
+    details.insert(0, phase_detail("Settings", settings, 0));
+    details
 }
 
 pub fn compile_cache_status(
@@ -6732,7 +6735,8 @@ where
     let started = Instant::now();
     match solver_method {
         SolverMethod::Sqp => {
-            let solved = compiled.run_sqp(runtime, &sqp_options(solver_config))?;
+            let options = sqp_options(solver_config);
+            let solved = compiled.run_sqp(runtime, &options)?;
             let (x_arcs, u_arcs) =
                 compiled.build_interval_arcs(&solved.trajectories, &runtime.parameters)?;
             let mut artifact = build_artifact(&solved.trajectories, &x_arcs, &u_arcs);
@@ -6744,12 +6748,13 @@ where
                 solver_config.constraint_tol,
             );
             append_termination_metric(&mut artifact, &solved.solver);
-            attach_sqp_solver_report(&mut artifact, &solved.solver);
+            attach_sqp_solver_report(&mut artifact, &solved.solver, &options);
             append_ocp_setup_timing_details(&mut artifact.solver, solved.setup_timing);
             Ok(with_solve_time(artifact, started))
         }
         SolverMethod::Nlip => {
-            let solved = compiled.run_nlip(runtime, &nlip_options(solver_config))?;
+            let options = nlip_options(solver_config);
+            let solved = compiled.run_nlip(runtime, &options)?;
             let (x_arcs, u_arcs) =
                 compiled.build_interval_arcs(&solved.trajectories, &runtime.parameters)?;
             let mut artifact = build_artifact(&solved.trajectories, &x_arcs, &u_arcs);
@@ -6761,13 +6766,14 @@ where
                 solver_config.constraint_tol,
             );
             append_nlip_termination_metric(&mut artifact, &solved.solver);
-            attach_nlip_solver_report(&mut artifact, &solved.solver);
+            attach_nlip_solver_report(&mut artifact, &solved.solver, &options);
             append_ocp_setup_timing_details(&mut artifact.solver, solved.setup_timing);
             Ok(with_solve_time(artifact, started))
         }
         #[cfg(feature = "ipopt")]
         SolverMethod::Ipopt => {
-            let solved = compiled.run_ipopt(runtime, &ipopt_options(solver_config))?;
+            let options = ipopt_options(solver_config);
+            let solved = compiled.run_ipopt(runtime, &options)?;
             let (x_arcs, u_arcs) =
                 compiled.build_interval_arcs(&solved.trajectories, &runtime.parameters)?;
             let mut artifact = build_artifact(&solved.trajectories, &x_arcs, &u_arcs);
@@ -6779,7 +6785,7 @@ where
                 solver_config.constraint_tol,
             );
             append_ipopt_termination_metric(&mut artifact, &solved.solver);
-            attach_ipopt_solver_report(&mut artifact, &solved.solver);
+            attach_ipopt_solver_report(&mut artifact, &solved.solver, &options);
             append_ocp_setup_timing_details(&mut artifact.solver, solved.setup_timing);
             Ok(with_solve_time(artifact, started))
         }
@@ -6850,6 +6856,7 @@ where
     let build_artifact = Arc::new(Mutex::new(build_artifact));
     match solver_method {
         SolverMethod::Sqp => {
+            let options = sqp_options(solver_config);
             emit_event(
                 &emit,
                 SolveStreamEvent::Status {
@@ -6869,9 +6876,10 @@ where
                 },
                 |submit| {
                     let build_for_callback = build_artifact.clone();
+                    let options_for_callback = options.clone();
                     compiled.run_sqp_with_callback(
                         runtime,
-                        &sqp_options(solver_config),
+                        &options_for_callback,
                         move |snapshot| match compiled
                             .build_interval_arcs(&snapshot.trajectories, &runtime.parameters)
                         {
@@ -6915,7 +6923,9 @@ where
                 Err(error) => {
                     if let Some(typed) = error.downcast_ref::<ClarabelSqpError>() {
                         emit_log_lines(&emit, sqp_failure_diagnostic_lines(typed));
-                        if let Some(report) = sqp_failure_solver_report(typed, &running_solver) {
+                        if let Some(report) =
+                            sqp_failure_solver_report(typed, &running_solver, &options)
+                        {
                             emit_failure_status(&emit, solver_method, report);
                         }
                     }
@@ -6936,7 +6946,7 @@ where
                 solver_config.constraint_tol,
             );
             append_termination_metric(&mut artifact, &solved.solver);
-            attach_sqp_solver_report(&mut artifact, &solved.solver);
+            attach_sqp_solver_report(&mut artifact, &solved.solver, &options);
             append_ocp_setup_timing_details(&mut artifact.solver, solved.setup_timing);
             let artifact = with_solve_time(artifact, started);
             emit_event(
@@ -6948,6 +6958,7 @@ where
             Ok(artifact)
         }
         SolverMethod::Nlip => {
+            let options = nlip_options(solver_config);
             emit_event(
                 &emit,
                 SolveStreamEvent::Status {
@@ -6967,9 +6978,10 @@ where
                 },
                 |submit| {
                     let build_for_callback = build_artifact.clone();
+                    let options_for_callback = options.clone();
                     compiled.run_nlip_with_callback(
                         runtime,
-                        &nlip_options(solver_config),
+                        &options_for_callback,
                         move |snapshot| match compiled
                             .build_interval_arcs(&snapshot.trajectories, &runtime.parameters)
                         {
@@ -7013,7 +7025,9 @@ where
                 Err(error) => {
                     if let Some(typed) = error.downcast_ref::<InteriorPointSolveError>() {
                         emit_log_lines(&emit, nlip_failure_diagnostic_lines(typed));
-                        if let Some(report) = nlip_failure_solver_report(typed, &running_solver) {
+                        if let Some(report) =
+                            nlip_failure_solver_report(typed, &running_solver, &options)
+                        {
                             emit_failure_status(&emit, solver_method, report);
                         }
                     }
@@ -7034,7 +7048,7 @@ where
                 solver_config.constraint_tol,
             );
             append_nlip_termination_metric(&mut artifact, &solved.solver);
-            attach_nlip_solver_report(&mut artifact, &solved.solver);
+            attach_nlip_solver_report(&mut artifact, &solved.solver, &options);
             append_ocp_setup_timing_details(&mut artifact.solver, solved.setup_timing);
             let artifact = with_solve_time(artifact, started);
             emit_event(
@@ -7047,6 +7061,7 @@ where
         }
         #[cfg(feature = "ipopt")]
         SolverMethod::Ipopt => {
+            let options = ipopt_options(solver_config);
             emit_event(
                 &emit,
                 SolveStreamEvent::Status {
@@ -7110,9 +7125,10 @@ where
             ) {
                 Ok(solved) => solved,
                 Err(error) => {
-                    if let Some(report) = error
-                        .downcast_ref::<IpoptSolveError>()
-                        .and_then(|typed| ipopt_failure_solver_report(typed, &running_solver))
+                    if let Some(report) =
+                        error.downcast_ref::<IpoptSolveError>().and_then(|typed| {
+                            ipopt_failure_solver_report(typed, &running_solver, &options)
+                        })
                     {
                         emit_failure_status(&emit, solver_method, report);
                     }
@@ -7133,7 +7149,7 @@ where
                 solver_config.constraint_tol,
             );
             append_ipopt_termination_metric(&mut artifact, &solved.solver);
-            attach_ipopt_solver_report(&mut artifact, &solved.solver);
+            attach_ipopt_solver_report(&mut artifact, &solved.solver, &options);
             append_ocp_setup_timing_details(&mut artifact.solver, solved.setup_timing);
             let artifact = with_solve_time(artifact, started);
             emit_event(
@@ -7211,7 +7227,8 @@ where
     let started = Instant::now();
     match solver_method {
         SolverMethod::Sqp => {
-            let solved = compiled.run_sqp(runtime, &sqp_options(solver_config))?;
+            let options = sqp_options(solver_config);
+            let solved = compiled.run_sqp(runtime, &options)?;
             let mut artifact = build_artifact(&solved.trajectories, &solved.time_grid);
             let _ = try_attach_direct_collocation_constraint_panels(
                 &mut artifact,
@@ -7221,12 +7238,13 @@ where
                 solver_config.constraint_tol,
             );
             append_termination_metric(&mut artifact, &solved.solver);
-            attach_sqp_solver_report(&mut artifact, &solved.solver);
+            attach_sqp_solver_report(&mut artifact, &solved.solver, &options);
             append_ocp_setup_timing_details(&mut artifact.solver, solved.setup_timing);
             Ok(with_solve_time(artifact, started))
         }
         SolverMethod::Nlip => {
-            let solved = compiled.run_nlip(runtime, &nlip_options(solver_config))?;
+            let options = nlip_options(solver_config);
+            let solved = compiled.run_nlip(runtime, &options)?;
             let mut artifact = build_artifact(&solved.trajectories, &solved.time_grid);
             let _ = try_attach_direct_collocation_constraint_panels(
                 &mut artifact,
@@ -7236,13 +7254,14 @@ where
                 solver_config.constraint_tol,
             );
             append_nlip_termination_metric(&mut artifact, &solved.solver);
-            attach_nlip_solver_report(&mut artifact, &solved.solver);
+            attach_nlip_solver_report(&mut artifact, &solved.solver, &options);
             append_ocp_setup_timing_details(&mut artifact.solver, solved.setup_timing);
             Ok(with_solve_time(artifact, started))
         }
         #[cfg(feature = "ipopt")]
         SolverMethod::Ipopt => {
-            let solved = compiled.run_ipopt(runtime, &ipopt_options(solver_config))?;
+            let options = ipopt_options(solver_config);
+            let solved = compiled.run_ipopt(runtime, &options)?;
             let mut artifact = build_artifact(&solved.trajectories, &solved.time_grid);
             let _ = try_attach_direct_collocation_constraint_panels(
                 &mut artifact,
@@ -7252,7 +7271,7 @@ where
                 solver_config.constraint_tol,
             );
             append_ipopt_termination_metric(&mut artifact, &solved.solver);
-            attach_ipopt_solver_report(&mut artifact, &solved.solver);
+            attach_ipopt_solver_report(&mut artifact, &solved.solver, &options);
             append_ocp_setup_timing_details(&mut artifact.solver, solved.setup_timing);
             Ok(with_solve_time(artifact, started))
         }
@@ -7329,6 +7348,7 @@ where
     let build_artifact = Arc::new(Mutex::new(build_artifact));
     match solver_method {
         SolverMethod::Sqp => {
+            let options = sqp_options(solver_config);
             emit_event(
                 &emit,
                 SolveStreamEvent::Status {
@@ -7348,9 +7368,10 @@ where
                 },
                 |submit| {
                     let build_for_callback = build_artifact.clone();
+                    let options_for_callback = options.clone();
                     compiled.run_sqp_with_callback(
                         runtime,
-                        &sqp_options(solver_config),
+                        &options_for_callback,
                         move |snapshot| {
                             let mut artifact = {
                                 let mut builder = build_for_callback
@@ -7384,7 +7405,9 @@ where
                 Err(error) => {
                     if let Some(typed) = error.downcast_ref::<ClarabelSqpError>() {
                         emit_log_lines(&emit, sqp_failure_diagnostic_lines(typed));
-                        if let Some(report) = sqp_failure_solver_report(typed, &running_solver) {
+                        if let Some(report) =
+                            sqp_failure_solver_report(typed, &running_solver, &options)
+                        {
                             emit_failure_status(&emit, solver_method, report);
                         }
                     }
@@ -7403,7 +7426,7 @@ where
                 solver_config.constraint_tol,
             );
             append_termination_metric(&mut artifact, &solved.solver);
-            attach_sqp_solver_report(&mut artifact, &solved.solver);
+            attach_sqp_solver_report(&mut artifact, &solved.solver, &options);
             append_ocp_setup_timing_details(&mut artifact.solver, solved.setup_timing);
             let artifact = with_solve_time(artifact, started);
             emit_event(
@@ -7415,6 +7438,7 @@ where
             Ok(artifact)
         }
         SolverMethod::Nlip => {
+            let options = nlip_options(solver_config);
             emit_event(
                 &emit,
                 SolveStreamEvent::Status {
@@ -7434,9 +7458,10 @@ where
                 },
                 |submit| {
                     let build_for_callback = build_artifact.clone();
+                    let options_for_callback = options.clone();
                     compiled.run_nlip_with_callback(
                         runtime,
-                        &nlip_options(solver_config),
+                        &options_for_callback,
                         move |snapshot| {
                             let mut artifact = {
                                 let mut builder = build_for_callback
@@ -7470,7 +7495,9 @@ where
                 Err(error) => {
                     if let Some(typed) = error.downcast_ref::<InteriorPointSolveError>() {
                         emit_log_lines(&emit, nlip_failure_diagnostic_lines(typed));
-                        if let Some(report) = nlip_failure_solver_report(typed, &running_solver) {
+                        if let Some(report) =
+                            nlip_failure_solver_report(typed, &running_solver, &options)
+                        {
                             emit_failure_status(&emit, solver_method, report);
                         }
                     }
@@ -7489,7 +7516,7 @@ where
                 solver_config.constraint_tol,
             );
             append_nlip_termination_metric(&mut artifact, &solved.solver);
-            attach_nlip_solver_report(&mut artifact, &solved.solver);
+            attach_nlip_solver_report(&mut artifact, &solved.solver, &options);
             append_ocp_setup_timing_details(&mut artifact.solver, solved.setup_timing);
             let artifact = with_solve_time(artifact, started);
             emit_event(
@@ -7502,6 +7529,7 @@ where
         }
         #[cfg(feature = "ipopt")]
         SolverMethod::Ipopt => {
+            let options = ipopt_options(solver_config);
             emit_event(
                 &emit,
                 SolveStreamEvent::Status {
@@ -7521,9 +7549,10 @@ where
                 },
                 |submit| {
                     let build_for_callback = build_artifact.clone();
+                    let options_for_callback = options.clone();
                     compiled.run_ipopt_with_callback(
                         runtime,
-                        &ipopt_options(solver_config),
+                        &options_for_callback,
                         move |snapshot| {
                             let mut artifact = {
                                 let mut builder = build_for_callback
@@ -7555,9 +7584,10 @@ where
             ) {
                 Ok(solved) => solved,
                 Err(error) => {
-                    if let Some(report) = error
-                        .downcast_ref::<IpoptSolveError>()
-                        .and_then(|typed| ipopt_failure_solver_report(typed, &running_solver))
+                    if let Some(report) =
+                        error.downcast_ref::<IpoptSolveError>().and_then(|typed| {
+                            ipopt_failure_solver_report(typed, &running_solver, &options)
+                        })
                     {
                         emit_failure_status(&emit, solver_method, report);
                     }
@@ -7576,7 +7606,7 @@ where
                 solver_config.constraint_tol,
             );
             append_ipopt_termination_metric(&mut artifact, &solved.solver);
-            attach_ipopt_solver_report(&mut artifact, &solved.solver);
+            attach_ipopt_solver_report(&mut artifact, &solved.solver, &options);
             append_ocp_setup_timing_details(&mut artifact.solver, solved.setup_timing);
             let artifact = with_solve_time(artifact, started);
             emit_event(
@@ -7812,7 +7842,10 @@ pub fn ipopt_status_kind(status: IpoptRawStatus) -> SolverStatusKind {
     }
 }
 
-pub fn sqp_solver_report(summary: &ClarabelSqpSummary) -> SolverReport {
+pub fn sqp_solver_report(
+    summary: &ClarabelSqpSummary,
+    options: &ClarabelSqpOptions,
+) -> SolverReport {
     SolverReport {
         completed: true,
         status_label: sqp_termination_label(summary),
@@ -7823,13 +7856,19 @@ pub fn sqp_solver_report(summary: &ClarabelSqpSummary) -> SolverReport {
         solve_s: Some(summary.profiling.total_time.as_secs_f64()),
         compile_cached: false,
         phase_details: SolverPhaseDetails {
-            solve: sqp_solve_phase_details(&summary.profiling),
+            solve: prepend_solver_settings_detail(
+                sqp_solve_phase_details(&summary.profiling),
+                format_sqp_settings_summary(options),
+            ),
             ..SolverPhaseDetails::default()
         },
     }
 }
 
-pub fn nlip_solver_report(summary: &InteriorPointSummary) -> SolverReport {
+pub fn nlip_solver_report(
+    summary: &InteriorPointSummary,
+    options: &InteriorPointOptions,
+) -> SolverReport {
     SolverReport {
         completed: true,
         status_label: "Converged".to_string(),
@@ -7840,14 +7879,17 @@ pub fn nlip_solver_report(summary: &InteriorPointSummary) -> SolverReport {
         solve_s: Some(summary.profiling.total_time.as_secs_f64()),
         compile_cached: false,
         phase_details: SolverPhaseDetails {
-            solve: nlip_solve_phase_details(&summary.profiling),
+            solve: prepend_solver_settings_detail(
+                nlip_solve_phase_details(&summary.profiling),
+                format_nlip_settings_summary(options),
+            ),
             ..SolverPhaseDetails::default()
         },
     }
 }
 
 #[cfg(feature = "ipopt")]
-pub fn ipopt_solver_report(summary: &IpoptSummary) -> SolverReport {
+pub fn ipopt_solver_report(summary: &IpoptSummary, options: &IpoptOptions) -> SolverReport {
     SolverReport {
         completed: true,
         status_label: ipopt_status_label(summary.status),
@@ -7858,23 +7900,38 @@ pub fn ipopt_solver_report(summary: &IpoptSummary) -> SolverReport {
         solve_s: Some(summary.profiling.total_time.as_secs_f64()),
         compile_cached: false,
         phase_details: SolverPhaseDetails {
-            solve: ipopt_solve_phase_details(&summary.profiling),
+            solve: prepend_solver_settings_detail(
+                ipopt_solve_phase_details(&summary.profiling),
+                format_ipopt_settings_summary(options),
+            ),
             ..SolverPhaseDetails::default()
         },
     }
 }
 
-pub fn attach_sqp_solver_report(artifact: &mut SolveArtifact, summary: &ClarabelSqpSummary) {
-    artifact.solver = sqp_solver_report(summary);
+pub fn attach_sqp_solver_report(
+    artifact: &mut SolveArtifact,
+    summary: &ClarabelSqpSummary,
+    options: &ClarabelSqpOptions,
+) {
+    artifact.solver = sqp_solver_report(summary, options);
 }
 
-pub fn attach_nlip_solver_report(artifact: &mut SolveArtifact, summary: &InteriorPointSummary) {
-    artifact.solver = nlip_solver_report(summary);
+pub fn attach_nlip_solver_report(
+    artifact: &mut SolveArtifact,
+    summary: &InteriorPointSummary,
+    options: &InteriorPointOptions,
+) {
+    artifact.solver = nlip_solver_report(summary, options);
 }
 
 #[cfg(feature = "ipopt")]
-pub fn attach_ipopt_solver_report(artifact: &mut SolveArtifact, summary: &IpoptSummary) {
-    artifact.solver = ipopt_solver_report(summary);
+pub fn attach_ipopt_solver_report(
+    artifact: &mut SolveArtifact,
+    summary: &IpoptSummary,
+    options: &IpoptOptions,
+) {
+    artifact.solver = ipopt_solver_report(summary, options);
 }
 
 fn push_eval_timing_detail(
@@ -8243,6 +8300,7 @@ fn merge_failure_solver_report(
 pub fn sqp_failure_solver_report(
     error: &ClarabelSqpError,
     fallback: &SolverReport,
+    options: &ClarabelSqpOptions,
 ) -> Option<SolverReport> {
     let context = match error {
         ClarabelSqpError::MaxIterations { context, .. }
@@ -8289,13 +8347,17 @@ pub fn sqp_failure_solver_report(
             phase_details: SolverPhaseDetails::default(),
         },
         fallback,
-        sqp_solve_phase_details(&context.profiling),
+        prepend_solver_settings_detail(
+            sqp_solve_phase_details(&context.profiling),
+            format_sqp_settings_summary(options),
+        ),
     ))
 }
 
 pub fn nlip_failure_solver_report(
     error: &InteriorPointSolveError,
     fallback: &SolverReport,
+    options: &InteriorPointOptions,
 ) -> Option<SolverReport> {
     let (status_label, iterations, profiling) = match error {
         InteriorPointSolveError::InvalidInput(_) => return None,
@@ -8343,7 +8405,10 @@ pub fn nlip_failure_solver_report(
             phase_details: SolverPhaseDetails::default(),
         },
         fallback,
-        nlip_solve_phase_details(profiling),
+        prepend_solver_settings_detail(
+            nlip_solve_phase_details(profiling),
+            format_nlip_settings_summary(options),
+        ),
     ))
 }
 
@@ -8351,6 +8416,7 @@ pub fn nlip_failure_solver_report(
 pub fn ipopt_failure_solver_report(
     error: &IpoptSolveError,
     fallback: &SolverReport,
+    options: &IpoptOptions,
 ) -> Option<SolverReport> {
     let (status_label, iterations, profiling) = match error {
         IpoptSolveError::Solve {
@@ -8380,7 +8446,10 @@ pub fn ipopt_failure_solver_report(
             phase_details: SolverPhaseDetails::default(),
         },
         fallback,
-        ipopt_solve_phase_details(profiling),
+        prepend_solver_settings_detail(
+            ipopt_solve_phase_details(profiling),
+            format_ipopt_settings_summary(options),
+        ),
     ))
 }
 
@@ -9038,7 +9107,8 @@ mod tests {
                 solve: Vec::new(),
             });
         let report =
-            nlip_failure_solver_report(&error, &fallback).expect("expected failure report");
+            nlip_failure_solver_report(&error, &fallback, &InteriorPointOptions::default())
+                .expect("expected failure report");
 
         assert!(report.completed);
         assert_eq!(report.status_kind, SolverStatusKind::Error);

@@ -279,6 +279,7 @@ pub struct ProblemRunRecord {
     pub timing: SolverTimingBreakdown,
     pub validation: ValidationOutcome,
     pub solver_thresholds: Option<String>,
+    pub solver_settings: Option<String>,
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compile_report: Option<CompileReportSummary>,

@@ -10,6 +10,7 @@ mod powell_singular;
 mod trigonometric;
 mod wood;
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::time::Instant;
 
@@ -17,10 +18,14 @@ use optimization::{
     ClarabelSqpError, ClarabelSqpOptions, ClarabelSqpSummary, CompiledNlpProblem,
     FilterAcceptanceMode, InteriorPointIterationSnapshot, InteriorPointOptions,
     InteriorPointSolveError, InteriorPointSummary, SqpIterationSnapshot, SymbolicNlpOutputs,
-    TypedCompiledJitNlp, TypedRuntimeNlpBounds, Vectorize,
+    TypedCompiledJitNlp, TypedRuntimeNlpBounds, Vectorize, format_nlip_settings_summary,
+    format_sqp_settings_summary, nlip_event_codes, nlip_event_legend_entries, sqp_event_codes,
+    sqp_event_legend_entries, sqp_iteration_label,
 };
 #[cfg(feature = "ipopt")]
-use optimization::{IpoptOptions, IpoptRawStatus, IpoptSolveError, IpoptSummary};
+use optimization::{
+    IpoptOptions, IpoptRawStatus, IpoptSolveError, IpoptSummary, format_ipopt_settings_summary,
+};
 use sx_core::SX;
 
 use crate::manifest::KnownStatus;
@@ -241,6 +246,7 @@ where
                 detail: "build failed".to_string(),
             },
             solver_thresholds: None,
+            solver_settings: None,
             error: Some(err.to_string()),
             compile_report: None,
             console_output: None,
@@ -314,6 +320,7 @@ where
                     detail: "runtime bounds invalid".to_string(),
                 },
                 solver_thresholds: None,
+                solver_settings: None,
                 error: Some(err.to_string()),
                 compile_report: compile_report.clone(),
                 console_output: None,
@@ -336,6 +343,7 @@ where
                 ..ClarabelSqpOptions::default()
             };
             let solver_thresholds = format_sqp_thresholds(&sqp_options);
+            let solver_settings = format_sqp_settings_summary(&sqp_options);
             let solve_started = Instant::now();
             let mut snapshots = Vec::new();
             let result = data.compiled.solve_sqp_with_callback(
@@ -367,6 +375,7 @@ where
                         ),
                         validation: ValidationOutcome::default(),
                         solver_thresholds: Some(solver_thresholds.clone()),
+                        solver_settings: Some(solver_settings.clone()),
                         error: None,
                         compile_report: compile_report.clone(),
                         console_output: None,
@@ -411,6 +420,7 @@ where
                             detail: "SQP solve failed".to_string(),
                         },
                         solver_thresholds: Some(solver_thresholds),
+                        solver_settings: Some(solver_settings),
                         error: Some(err.to_string()),
                         compile_report: compile_report.clone(),
                         console_output: None,
@@ -435,6 +445,7 @@ where
                 ..InteriorPointOptions::default()
             };
             let solver_thresholds = format_nlip_thresholds(&nlip_options);
+            let solver_settings = format_nlip_settings_summary(&nlip_options);
             let solve_started = Instant::now();
             let mut snapshots = Vec::new();
             let result = data.compiled.solve_interior_point_with_callback(
@@ -466,6 +477,7 @@ where
                         ),
                         validation: ValidationOutcome::default(),
                         solver_thresholds: Some(solver_thresholds.clone()),
+                        solver_settings: Some(solver_settings.clone()),
                         error: None,
                         compile_report: compile_report.clone(),
                         console_output: None,
@@ -510,6 +522,7 @@ where
                             detail: "NLIP solve failed".to_string(),
                         },
                         solver_thresholds: Some(solver_thresholds),
+                        solver_settings: Some(solver_settings),
                         error: Some(err.to_string()),
                         compile_report: compile_report.clone(),
                         console_output: None,
@@ -542,6 +555,7 @@ where
                 ..IpoptOptions::default()
             };
             let solver_thresholds = format_ipopt_thresholds(&ipopt_options);
+            let solver_settings = format_ipopt_settings_summary(&ipopt_options);
             let solve_started = Instant::now();
             let result =
                 data.compiled
@@ -568,6 +582,7 @@ where
                         ),
                         validation: ValidationOutcome::default(),
                         solver_thresholds: Some(solver_thresholds.clone()),
+                        solver_settings: Some(solver_settings.clone()),
                         error: None,
                         compile_report: compile_report.clone(),
                         console_output: None,
@@ -607,6 +622,7 @@ where
                             detail: "ipopt solve failed".to_string(),
                         },
                         solver_thresholds: Some(solver_thresholds),
+                        solver_settings: Some(solver_settings),
                         error: Some(err.to_string()),
                         compile_report: compile_report.clone(),
                         console_output: None,
@@ -1031,6 +1047,9 @@ fn render_problem_header(record: &ProblemRunRecord) -> String {
         record.solver.label(),
         record.options.label()
     );
+    if let Some(settings) = &record.solver_settings {
+        let _ = writeln!(out, "solver_settings: {settings}");
+    }
     let _ = writeln!(
         out,
         "expected: {}",
@@ -1134,118 +1153,6 @@ fn render_sqp_transcript(
         }
     }
 
-    fn iteration_label(snapshot: &SqpIterationSnapshot) -> String {
-        match snapshot.phase {
-            optimization::SqpIterationPhase::Initial => "pre".to_string(),
-            optimization::SqpIterationPhase::AcceptedStep => {
-                let restoration = snapshot
-                    .line_search
-                    .as_ref()
-                    .and_then(|info| info.step_kind)
-                    .or_else(|| snapshot.trust_region.as_ref().and_then(|info| info.step_kind))
-                    == Some(optimization::SqpStepKind::Restoration);
-                if restoration {
-                    format!("{}r", snapshot.iteration)
-                } else {
-                    snapshot.iteration.to_string()
-                }
-            }
-            optimization::SqpIterationPhase::PostConvergence => "post".to_string(),
-        }
-    }
-
-    fn sqp_event_codes(snapshot: &SqpIterationSnapshot) -> String {
-        let line_search = snapshot.line_search.as_ref();
-        [
-            if snapshot
-                .events
-                .contains(&optimization::SqpIterationEvent::PenaltyUpdated)
-            {
-                'P'
-            } else {
-                ' '
-            },
-            if snapshot
-                .events
-                .contains(&optimization::SqpIterationEvent::HessianShifted)
-            {
-                'H'
-            } else {
-                ' '
-            },
-            if snapshot
-                .events
-                .contains(&optimization::SqpIterationEvent::LongLineSearch)
-            {
-                'L'
-            } else {
-                ' '
-            },
-            if snapshot
-                .events
-                .contains(&optimization::SqpIterationEvent::ArmijoToleranceAdjusted)
-            {
-                'A'
-            } else {
-                ' '
-            },
-            if snapshot
-                .events
-                .contains(&optimization::SqpIterationEvent::SecondOrderCorrectionUsed)
-            {
-                'S'
-            } else if line_search.is_some_and(|info| info.second_order_correction_attempted) {
-                's'
-            } else {
-                ' '
-            },
-            if snapshot
-                .events
-                .contains(&optimization::SqpIterationEvent::FilterAccepted)
-            {
-                'F'
-            } else {
-                ' '
-            },
-            if snapshot
-                .events
-                .contains(&optimization::SqpIterationEvent::QpReducedAccuracy)
-            {
-                'R'
-            } else {
-                ' '
-            },
-            if snapshot
-                .events
-                .contains(&optimization::SqpIterationEvent::WolfeRejectedTrial)
-            {
-                'W'
-            } else {
-                ' '
-            },
-            if snapshot
-                .events
-                .contains(&optimization::SqpIterationEvent::ElasticRecoveryUsed)
-            {
-                'E'
-            } else if line_search.is_some_and(|info| info.elastic_recovery_attempted) {
-                'e'
-            } else {
-                ' '
-            },
-            if snapshot
-                .events
-                .contains(&optimization::SqpIterationEvent::MaxIterationsReached)
-            {
-                'M'
-            } else {
-                ' '
-            },
-        ]
-        .into_iter()
-        .collect()
-    }
-
     let mut out = render_problem_header(record);
     out.push_str("solver_log\n\n");
     let header = format!(
@@ -1266,6 +1173,25 @@ fn render_sqp_transcript(
         width_iter = SQP_ITERATION_LABEL_WIDTH,
         width_evt = SQP_EVENT_COLUMN_WIDTH,
     );
+    let legend_prefix = format!(
+        "{:>width_iter$}  {:<6}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>7}  {:>5}  {:>5}  {:>width_evt$}",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        width_iter = SQP_ITERATION_LABEL_WIDTH,
+        width_evt = SQP_EVENT_COLUMN_WIDTH,
+    );
+    let mut seen_event_codes = HashSet::new();
     write_repeated_header(&mut out, &header);
     for (idx, snapshot) in snapshots.iter().enumerate() {
         if idx > 0 && idx.is_multiple_of(10) {
@@ -1289,7 +1215,7 @@ fn render_sqp_transcript(
         let _ = writeln!(
             out,
             "{:>width_iter$}  {:<6}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>7}  {:>5}  {:>5}  {:>width_evt$}",
-            iteration_label(snapshot),
+            sqp_iteration_label(snapshot),
             phase,
             fmt_sci(snapshot.objective),
             fmt_opt_sci(snapshot.eq_inf),
@@ -1310,6 +1236,12 @@ fn render_sqp_transcript(
             events,
             width_iter = SQP_ITERATION_LABEL_WIDTH,
             width_evt = SQP_EVENT_COLUMN_WIDTH,
+        );
+        append_new_event_legend_lines(
+            &mut out,
+            &legend_prefix,
+            &mut seen_event_codes,
+            sqp_event_legend_entries(snapshot),
         );
     }
     let detailed_line_search = snapshots
@@ -1449,6 +1381,11 @@ fn render_nlip_transcript(
         "lin_t",
         "evt"
     );
+    let legend_prefix = format!(
+        "{:>4}  {:<7}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>7}  {:>5}  {:>8}  {:>8}  {:>5}",
+        "", "", "", "", "", "", "", "", "", "", "", "", ""
+    );
+    let mut seen_event_codes = HashSet::new();
     write_repeated_header(&mut out, &header);
     for (idx, snapshot) in snapshots.iter().enumerate() {
         if idx > 0 && idx.is_multiple_of(10) {
@@ -1463,17 +1400,7 @@ fn render_nlip_transcript(
         let events = if snapshot.events.is_empty() {
             "--".to_string()
         } else {
-            snapshot
-                .events
-                .iter()
-                .map(|event| match event {
-                    optimization::InteriorPointIterationEvent::SigmaAdjusted => 'P',
-                    optimization::InteriorPointIterationEvent::LongLineSearch => 'L',
-                    optimization::InteriorPointIterationEvent::FilterAccepted => 'F',
-                    optimization::InteriorPointIterationEvent::LinearSolverFallback => 'U',
-                    optimization::InteriorPointIterationEvent::MaxIterationsReached => 'M',
-                })
-                .collect()
+            nlip_event_codes(snapshot)
         };
         let _ = writeln!(
             out,
@@ -1493,6 +1420,12 @@ fn render_nlip_transcript(
                 .linear_solve_time
                 .map_or_else(|| "--".to_string(), crate::report::format_duration),
             events,
+        );
+        append_new_event_legend_lines(
+            &mut out,
+            &legend_prefix,
+            &mut seen_event_codes,
+            nlip_event_legend_entries(snapshot),
         );
     }
     if let Some(summary) = summary {
@@ -1612,6 +1545,19 @@ fn render_ipopt_transcript(
 
 fn write_repeated_header(out: &mut String, header: &str) {
     let _ = writeln!(out, "{header}");
+}
+
+fn append_new_event_legend_lines(
+    out: &mut String,
+    prefix: &str,
+    seen_codes: &mut HashSet<char>,
+    entries: Vec<(char, &'static str)>,
+) {
+    for (code, description) in entries {
+        if seen_codes.insert(code) {
+            let _ = writeln!(out, "{prefix}  {description}");
+        }
+    }
 }
 
 #[cfg(feature = "ipopt")]

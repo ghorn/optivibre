@@ -93,6 +93,22 @@ impl Default for InteriorPointOptions {
     }
 }
 
+pub fn format_nlip_settings_summary(options: &InteriorPointOptions) -> String {
+    format!(
+        "filter={}; linear_solver={}; beta={}; c1={}; min_step={}; tau={}; regularization={}; sigma=[{}, {}]; mu_min={}",
+        if options.filter_method { "on" } else { "off" },
+        options.linear_solver.label(),
+        sci_text(options.line_search_beta),
+        sci_text(options.line_search_c1),
+        sci_text(options.min_step),
+        sci_text(options.fraction_to_boundary),
+        sci_text(options.regularization),
+        sci_text(options.sigma_min),
+        sci_text(options.sigma_max),
+        sci_text(options.mu_min),
+    )
+}
+
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InteriorPointProfiling {
@@ -179,6 +195,40 @@ pub enum InteriorPointIterationEvent {
     FilterAccepted,
     LinearSolverFallback,
     MaxIterationsReached,
+}
+
+pub fn nlip_event_legend_entries(
+    snapshot: &InteriorPointIterationSnapshot,
+) -> Vec<(char, &'static str)> {
+    let mut entries = Vec::new();
+    for event in &snapshot.events {
+        match event {
+            InteriorPointIterationEvent::SigmaAdjusted => {
+                entries.push(('P', "P=sigma clipped or barrier safeguard engaged"))
+            }
+            InteriorPointIterationEvent::LongLineSearch => {
+                entries.push(('L', "L=line search backtracked >=4 times"))
+            }
+            InteriorPointIterationEvent::FilterAccepted => entries.push((
+                'F',
+                "F=filter accepted a feasibility-improving step without objective Armijo",
+            )),
+            InteriorPointIterationEvent::LinearSolverFallback => {
+                entries.push(('U', "U=linear solver fell back to LU"))
+            }
+            InteriorPointIterationEvent::MaxIterationsReached => {
+                entries.push(('M', "M=maximum NLIP iterations reached"))
+            }
+        }
+    }
+    entries
+}
+
+pub fn nlip_event_codes(snapshot: &InteriorPointIterationSnapshot) -> String {
+    nlip_event_legend_entries(snapshot)
+        .into_iter()
+        .map(|(code, _)| code)
+        .collect()
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -1249,24 +1299,58 @@ struct InteriorPointIterationLogFlags {
     iteration_limit_reached: bool,
 }
 
-fn fmt_ip_event_codes(log: &InteriorPointIterationLog) -> String {
-    let mut codes = String::new();
+fn nlip_log_snapshot(log: &InteriorPointIterationLog) -> InteriorPointIterationSnapshot {
+    let mut snapshot = InteriorPointIterationSnapshot {
+        iteration: log.iteration,
+        phase: log.phase,
+        x: Vec::new(),
+        objective: log.objective_value,
+        eq_inf: Some(log.equality_inf),
+        ineq_inf: Some(log.inequality_inf),
+        dual_inf: log.dual_inf,
+        comp_inf: Some(log.complementarity_inf),
+        barrier_parameter: Some(log.barrier_parameter),
+        step_inf: None,
+        alpha: log.alpha,
+        line_search_iterations: log.line_search_iterations,
+        line_search: None,
+        direction_diagnostics: None,
+        linear_solver: InteriorPointLinearSolver::Auto,
+        linear_solve_time: log.linear_time_secs.map(Duration::from_secs_f64),
+        filter: None,
+        events: Vec::new(),
+        timing: InteriorPointIterationTiming::default(),
+    };
     if log.flags.penalty_updated {
-        codes.push('P');
+        snapshot
+            .events
+            .push(InteriorPointIterationEvent::SigmaAdjusted);
     }
     if matches!(log.line_search_iterations, Some(iterations) if iterations >= 4) {
-        codes.push('L');
+        snapshot
+            .events
+            .push(InteriorPointIterationEvent::LongLineSearch);
     }
     if log.flags.filter_accepted {
-        codes.push('F');
+        snapshot
+            .events
+            .push(InteriorPointIterationEvent::FilterAccepted);
     }
     if log.flags.linear_fallback {
-        codes.push('U');
+        snapshot
+            .events
+            .push(InteriorPointIterationEvent::LinearSolverFallback);
     }
     if log.flags.iteration_limit_reached {
-        codes.push('M');
+        snapshot
+            .events
+            .push(InteriorPointIterationEvent::MaxIterationsReached);
     }
-    codes
+    snapshot
+}
+
+fn fmt_ip_event_codes(log: &InteriorPointIterationLog) -> String {
+    nlip_event_codes(&nlip_log_snapshot(log))
 }
 
 fn style_ip_event_cell(log: &InteriorPointIterationLog) -> String {
@@ -1303,22 +1387,19 @@ fn ip_event_legend_lines(
     state: &mut SqpEventLegendState,
 ) -> Vec<String> {
     let mut parts = Vec::new();
-    if log.flags.penalty_updated && state.mark_penalty_if_new() {
-        parts.push("P=sigma clipped or barrier safeguard engaged");
-    }
-    if matches!(log.line_search_iterations, Some(iterations) if iterations >= 4)
-        && state.mark_line_search_if_new()
-    {
-        parts.push("L=line search backtracked >=4 times");
-    }
-    if log.flags.filter_accepted && state.mark_filter_if_new() {
-        parts.push("F=filter accepted a feasibility-improving step without objective Armijo");
-    }
-    if log.flags.linear_fallback && state.mark_ip_linear_fallback_if_new() {
-        parts.push("U=linear solver fell back to LU");
-    }
-    if log.flags.iteration_limit_reached && state.mark_max_iter_if_new() {
-        parts.push("M=maximum NLIP iterations reached");
+    let snapshot = nlip_log_snapshot(log);
+    for (code, description) in nlip_event_legend_entries(&snapshot) {
+        let is_new = match code {
+            'P' => state.mark_penalty_if_new(),
+            'L' => state.mark_line_search_if_new(),
+            'F' => state.mark_filter_if_new(),
+            'U' => state.mark_ip_linear_fallback_if_new(),
+            'M' => state.mark_max_iter_if_new(),
+            _ => false,
+        };
+        if is_new {
+            parts.push(description);
+        }
     }
 
     let prefix = ip_event_legend_prefix();
@@ -1437,6 +1518,7 @@ fn log_interior_point_problem_header<P>(
                 sci_text(options.complementarity_tol),
             ),
         ),
+        boxed_line("summary", format_nlip_settings_summary(options)),
         boxed_line(
             "line search",
             format!(
