@@ -489,6 +489,20 @@ pub struct SolveFilterInfo {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct SolveTrustRegionInfo {
+    pub radius: f64,
+    pub attempted_radius: f64,
+    pub step_norm: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub largest_attempted_step_norm: Option<f64>,
+    pub contraction_count: usize,
+    pub qp_failure_retries: usize,
+    pub boundary_active: bool,
+    pub restoration_attempted: bool,
+    pub elastic_recovery_attempted: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct SolveProgress {
     pub iteration: usize,
     pub phase: SolvePhase,
@@ -502,6 +516,8 @@ pub struct SolveProgress {
     pub line_search_iterations: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<SolveFilterInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_region: Option<SolveTrustRegionInfo>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -7744,6 +7760,26 @@ pub fn sqp_progress(snapshot: &SqpIterationSnapshot) -> SolveProgress {
                 }
             }),
         }),
+        trust_region: snapshot
+            .trust_region
+            .as_ref()
+            .map(|trust_region| SolveTrustRegionInfo {
+                radius: trust_region.radius,
+                attempted_radius: trust_region.attempted_radius,
+                step_norm: trust_region.step_norm,
+                largest_attempted_step_norm: trust_region
+                    .rejected_trials
+                    .iter()
+                    .map(|trial| trial.step_norm)
+                    .chain(std::iter::once(trust_region.step_norm))
+                    .filter(|value| value.is_finite() && *value > 0.0)
+                    .reduce(f64::max),
+                contraction_count: trust_region.contraction_count,
+                qp_failure_retries: trust_region.qp_failure_retries,
+                boundary_active: trust_region.boundary_active,
+                restoration_attempted: trust_region.restoration_attempted,
+                elastic_recovery_attempted: trust_region.elastic_recovery_attempted,
+            }),
     }
 }
 
@@ -7785,6 +7821,7 @@ pub fn nlip_progress(snapshot: &InteriorPointIterationSnapshot) -> SolveProgress
                 }
             }),
         }),
+        trust_region: None,
     }
 }
 
@@ -7806,6 +7843,7 @@ pub fn ipopt_progress(snapshot: &optimization::IpoptIterationSnapshot) -> SolveP
         alpha: Some(snapshot.alpha_pr),
         line_search_iterations: Some(snapshot.line_search_trials as usize),
         filter: None,
+        trust_region: None,
     }
 }
 

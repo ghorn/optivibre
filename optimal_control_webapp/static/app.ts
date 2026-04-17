@@ -2,6 +2,9 @@ const PALETTE = ["#f7b267", "#5bd1b5", "#7cc6fe", "#f25f5c", "#d7aefb", "#b8f2e6
 const EQ_INF_LABEL = "‖eq‖∞";
 const INEQ_INF_LABEL = "‖ineq₊‖∞";
 const DUAL_INF_LABEL = "‖∇L‖∞";
+const TRUST_REGION_RADIUS_LABEL = "TR radius";
+const ACCEPTED_STEP_NORM_LABEL = "Accepted step (2-norm)";
+const ATTEMPTED_STEP_NORM_LABEL = "Largest attempted step (2-norm)";
 const STEP_INF_LABEL = "‖Δx‖∞";
 
 type EnumValue<T extends Record<string, number>> = T[keyof T];
@@ -595,6 +598,20 @@ interface WireFilterInfo extends Omit<FilterInfo, "accepted_mode"> {
   accepted_mode?: string | number | null;
 }
 
+interface SolveTrustRegionInfo {
+  radius: number;
+  attempted_radius: number;
+  step_norm: number;
+  largest_attempted_step_norm?: number | null;
+  contraction_count: number;
+  qp_failure_retries: number;
+  boundary_active: boolean;
+  restoration_attempted: boolean;
+  elastic_recovery_attempted: boolean;
+}
+
+interface WireSolveTrustRegionInfo extends Omit<SolveTrustRegionInfo, never> {}
+
 interface SolveProgress {
   iteration: number;
   phase: SolvePhaseCode;
@@ -607,11 +624,13 @@ interface SolveProgress {
   alpha?: number | null;
   line_search_iterations?: number | null;
   filter?: FilterInfo | null;
+  trust_region?: SolveTrustRegionInfo | null;
 }
 
-interface WireSolveProgress extends Omit<SolveProgress, "phase" | "filter"> {
+interface WireSolveProgress extends Omit<SolveProgress, "phase" | "filter" | "trust_region"> {
   phase: string | number;
   filter?: WireFilterInfo | null;
+  trust_region?: WireSolveTrustRegionInfo | null;
 }
 
 interface SolverPhaseDetail {
@@ -797,6 +816,7 @@ interface FrontendState {
   chartLayoutKey: string;
   progressPlotReady: boolean;
   filterPlotReady: boolean;
+  trustRegionPlotReady: boolean;
   filterRecentPath: FilterEntry[];
   lastFilterPointKey: string | null;
   logLines: LogLine[];
@@ -1337,6 +1357,53 @@ function readWireSolveProgress(value: JsonValue | undefined, context: string): W
       readJsonValueAt(object, "filter") == null
         ? null
         : readWireFilterInfo(readJsonValueAt(object, "filter"), `${context}.filter`),
+    trust_region:
+      readJsonValueAt(object, "trust_region") == null
+        ? null
+        : readWireSolveTrustRegionInfo(
+            readJsonValueAt(object, "trust_region"),
+            `${context}.trust_region`,
+          ),
+  };
+}
+
+function readWireSolveTrustRegionInfo(
+  value: JsonValue | undefined,
+  context: string,
+): WireSolveTrustRegionInfo {
+  const object = readJsonObject(value, context);
+  return {
+    radius: readJsonNumber(readJsonValueAt(object, "radius"), `${context}.radius`),
+    attempted_radius: readJsonNumber(
+      readJsonValueAt(object, "attempted_radius"),
+      `${context}.attempted_radius`,
+    ),
+    step_norm: readJsonNumber(readJsonValueAt(object, "step_norm"), `${context}.step_norm`),
+    largest_attempted_step_norm:
+      readOptionalJsonNumber(
+        readJsonValueAt(object, "largest_attempted_step_norm"),
+        `${context}.largest_attempted_step_norm`,
+      ) ?? null,
+    contraction_count: readJsonNumber(
+      readJsonValueAt(object, "contraction_count"),
+      `${context}.contraction_count`,
+    ),
+    qp_failure_retries: readJsonNumber(
+      readJsonValueAt(object, "qp_failure_retries"),
+      `${context}.qp_failure_retries`,
+    ),
+    boundary_active: readOptionalJsonBoolean(
+      readJsonValueAt(object, "boundary_active"),
+      `${context}.boundary_active`,
+    ) ?? false,
+    restoration_attempted: readOptionalJsonBoolean(
+      readJsonValueAt(object, "restoration_attempted"),
+      `${context}.restoration_attempted`,
+    ) ?? false,
+    elastic_recovery_attempted: readOptionalJsonBoolean(
+      readJsonValueAt(object, "elastic_recovery_attempted"),
+      `${context}.elastic_recovery_attempted`,
+    ) ?? false,
   };
 }
 
@@ -1508,6 +1575,7 @@ const state: FrontendState = {
   chartLayoutKey: "",
   progressPlotReady: false,
   filterPlotReady: false,
+  trustRegionPlotReady: false,
   filterRecentPath: [],
   lastFilterPointKey: null,
   logLines: [],
@@ -1544,6 +1612,7 @@ const notesEl = requiredElement<HTMLDivElement>("#notes");
 const solverSummaryEl = requiredElement<HTMLDivElement>("#solver-summary");
 const progressPlotEl = requiredElement<PlotlyHostElement>("#progress-plot");
 const filterPlotEl = requiredElement<PlotlyHostElement>("#filter-plot");
+const trustRegionPlotEl = requiredElement<PlotlyHostElement>("#trust-region-plot");
 const solverLogEl = requiredElement<HTMLPreElement>("#solver-log");
 const prewarmStatusEl = requiredElement<HTMLDivElement>("#prewarm-status");
 const eqViolationsEl = requiredElement<HTMLDivElement>("#eq-violations");
@@ -2279,6 +2348,7 @@ function normalizeProgress(progress: WireSolveProgress): SolveProgress {
                     FILTER_ACCEPTANCE_MODE.objectiveArmijo,
                   ),
           },
+    trust_region: progress.trust_region ?? null,
   };
 }
 
@@ -3260,10 +3330,16 @@ function resetSolverPanel(): void {
   if (window.Plotly && state.filterPlotReady) {
     window.Plotly.purge(filterPlotEl);
   }
+  if (window.Plotly && state.trustRegionPlotReady) {
+    window.Plotly.purge(trustRegionPlotEl);
+  }
   progressPlotEl.innerHTML = `<div class="placeholder">Solve a problem to populate the live convergence history.</div>`;
   filterPlotEl.innerHTML = `<div class="placeholder">SQP filter telemetry will appear here during the solve.</div>`;
+  trustRegionPlotEl.innerHTML =
+    `<div class="placeholder">Trust-region telemetry will appear here during trust-region SQP solves.</div>`;
   state.progressPlotReady = false;
   state.filterPlotReady = false;
+  state.trustRegionPlotReady = false;
   state.lastFilterPointKey = null;
   state.filterRecentPath = [];
   renderCompileCacheStatus();
@@ -4374,6 +4450,12 @@ const PROGRESS_TRACE = Object.freeze({
   dualTol: 6,
 });
 
+const TRUST_REGION_TRACE = Object.freeze({
+  radius: 0,
+  acceptedStepNorm: 1,
+  attemptedStepNorm: 2,
+});
+
 function toleranceSeverity(
   value: number | null | undefined,
   tolerance: number | null | undefined,
@@ -4639,11 +4721,15 @@ function ensureProgressPlot(): void {
   state.progressPlotReady = true;
 }
 
-function residualValue(value: number | null | undefined): number | null {
+function positiveLogValue(value: number | null | undefined): number | null {
   if (value == null || !Number.isFinite(value)) {
     return null;
   }
   return Math.max(value, 1.0e-14);
+}
+
+function residualValue(value: number | null | undefined): number | null {
+  return positiveLogValue(value);
 }
 
 function updateProgressPlot(progress: SolveProgress): void {
@@ -4666,6 +4752,167 @@ function updateProgressPlot(progress: SolveProgress): void {
     [0, 1, 2, 3],
   );
   updateProgressThresholds(progress);
+}
+
+function trustRegionHoverText(
+  progress: SolveProgress,
+  trustRegion: SolveTrustRegionInfo,
+  label: string,
+  value: number | null,
+  includeStepInf = false,
+): string {
+  const lines = [
+    label,
+    `iter=${progress.iteration}`,
+    `value=${value == null ? "--" : value.toExponential(3)}`,
+    `attempted radius=${trustRegion.attempted_radius.toExponential(3)}`,
+    `contractions=${trustRegion.contraction_count}`,
+    `qp retries=${trustRegion.qp_failure_retries}`,
+    `boundary=${trustRegion.boundary_active ? "yes" : "no"}`,
+    `restoration=${trustRegion.restoration_attempted ? "yes" : "no"}`,
+    `elastic recovery=${trustRegion.elastic_recovery_attempted ? "yes" : "no"}`,
+  ];
+  if (includeStepInf && progress.step_inf != null && Number.isFinite(progress.step_inf)) {
+    lines.push(`step inf=${progress.step_inf.toExponential(3)}`);
+  }
+  return lines.join("<br>");
+}
+
+function ensureTrustRegionPlot(): void {
+  if (state.trustRegionPlotReady || !window.Plotly) {
+    return;
+  }
+  trustRegionPlotEl.innerHTML = "";
+  const data = [
+    {
+      type: "scatter",
+      mode: "lines+markers",
+      name: TRUST_REGION_RADIUS_LABEL,
+      x: [],
+      y: [],
+      text: [],
+      line: { color: PALETTE[0], width: 2.6 },
+      marker: { size: 5 },
+      hovertemplate: "%{text}<extra></extra>",
+    },
+    {
+      type: "scatter",
+      mode: "lines+markers",
+      name: ACCEPTED_STEP_NORM_LABEL,
+      x: [],
+      y: [],
+      text: [],
+      line: { color: PALETTE[1], width: 2.4 },
+      marker: { size: 5 },
+      hovertemplate: "%{text}<extra></extra>",
+    },
+    {
+      type: "scatter",
+      mode: "lines+markers",
+      name: ATTEMPTED_STEP_NORM_LABEL,
+      x: [],
+      y: [],
+      text: [],
+      line: { color: PALETTE[2], width: 2.2, dash: "dash" },
+      marker: { size: 5 },
+      hovertemplate: "%{text}<extra></extra>",
+    },
+  ];
+  const layout = {
+    paper_bgcolor: "rgba(0,0,0,0)",
+    plot_bgcolor: "rgba(4, 15, 22, 0.92)",
+    font: {
+      color: "#e5f1f4",
+      family: '"Avenir Next", Futura, "Trebuchet MS", sans-serif',
+      size: 12,
+    },
+    margin: { l: 74, r: 24, t: 18, b: 58 },
+    legend: {
+      orientation: "h",
+      y: -0.28,
+      x: 0,
+      font: { color: "#94b6bd", size: 11 },
+    },
+    xaxis: {
+      title: "Iteration (-)",
+      gridcolor: "rgba(229, 241, 244, 0.08)",
+      linecolor: "rgba(177, 214, 222, 0.18)",
+      zeroline: false,
+      ticks: "outside",
+      titlefont: { color: "#94b6bd" },
+    },
+    yaxis: {
+      title: "Radius / step size (2-norm)",
+      type: "log",
+      gridcolor: "rgba(229, 241, 244, 0.08)",
+      linecolor: "rgba(177, 214, 222, 0.18)",
+      zeroline: false,
+      ticks: "outside",
+      titlefont: { color: "#94b6bd" },
+    },
+    annotations: [
+      {
+        text: "Trust-region radius and step size",
+        xref: "paper",
+        yref: "paper",
+        x: 0,
+        y: 1.12,
+        showarrow: false,
+        font: { color: "#94b6bd", size: 12 },
+      },
+    ],
+  };
+  const config = {
+    responsive: true,
+    displaylogo: false,
+    displayModeBar: false,
+  };
+  window.Plotly.newPlot(trustRegionPlotEl, data, layout, config);
+  state.trustRegionPlotReady = true;
+}
+
+function updateTrustRegionPlot(progress: SolveProgress): void {
+  if (!window.Plotly) {
+    return;
+  }
+  const trustRegion = progress.trust_region;
+  if (!trustRegion) {
+    return;
+  }
+  ensureTrustRegionPlot();
+  const iteration = progress.iteration;
+  const radius = positiveLogValue(trustRegion.radius);
+  const acceptedStepNorm = positiveLogValue(trustRegion.step_norm);
+  const attemptedStepNorm = positiveLogValue(trustRegion.largest_attempted_step_norm);
+  window.Plotly.extendTraces(
+    trustRegionPlotEl,
+    {
+      x: [[iteration], [iteration], [iteration]],
+      y: [
+        [radius],
+        [acceptedStepNorm],
+        [attemptedStepNorm],
+      ],
+      text: [[
+        trustRegionHoverText(progress, trustRegion, TRUST_REGION_RADIUS_LABEL, radius),
+      ], [
+        trustRegionHoverText(
+          progress,
+          trustRegion,
+          ACCEPTED_STEP_NORM_LABEL,
+          acceptedStepNorm,
+          true,
+        ),
+      ], [
+        trustRegionHoverText(progress, trustRegion, ATTEMPTED_STEP_NORM_LABEL, attemptedStepNorm),
+      ]],
+    },
+    [
+      TRUST_REGION_TRACE.radius,
+      TRUST_REGION_TRACE.acceptedStepNorm,
+      TRUST_REGION_TRACE.attemptedStepNorm,
+    ],
+  );
 }
 
 function filterPointKey(progress: SolveProgress, filter: FilterInfo): string {
@@ -4888,6 +5135,7 @@ function applyIterationEvent(event: IterationSolveEvent, updateRunningStatus: bo
   state.artifact = event.artifact;
   renderSolverSummary();
   updateProgressPlot(event.progress);
+  updateTrustRegionPlot(event.progress);
   updateFilterPlot(event.progress);
   scheduleArtifactRender();
   if (updateRunningStatus && state.liveStatus?.stage === SOLVE_STAGE.solving) {

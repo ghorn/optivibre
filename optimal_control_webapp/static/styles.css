@@ -738,6 +738,10 @@ select {
   min-height: 360px;
 }
 
+.solve-trust-region-plot {
+  min-height: 300px;
+}
+
 .solve-filter-plot {
   min-height: 300px;
 }
@@ -1243,6 +1247,7 @@ select {
   .solve-primary,
   .solve-console,
   .solve-plot,
+  .solve-trust-region-plot,
   .solve-constraints {
     grid-column: auto;
     grid-row: auto;
@@ -1253,7 +1258,9 @@ select {
   }
 
   .solver-log,
-  .solve-plot {
+  .solve-plot,
+  .solve-trust-region-plot,
+  .solve-filter-plot {
     min-height: 300px;
     max-height: none;
   }
