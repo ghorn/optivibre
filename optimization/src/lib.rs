@@ -62,12 +62,12 @@ pub use validation::{
     validate_compiled_nlp_problem_derivatives,
 };
 pub use vectorize::{
-    ScalarLeaf, Vectorize, VectorizeLayoutError, extend_layout_name, flat_view, flatten_value,
-    symbolic_column, symbolic_value, unflatten_value,
+    ScalarLeaf, Vectorize, VectorizeLayoutError, extend_layout_name, flat_view,
+    flatten_optional_value, flatten_value, rebind_from_flat, symbolic_column, symbolic_value,
+    unflatten_value,
 };
 
 pub type Index = usize;
-pub(crate) const NLP_INF: f64 = 1e20;
 const BOX_LABEL_WIDTH: usize = 13;
 pub(crate) const EQ_INF_LABEL: &str = "‖eq‖∞";
 pub(crate) const INEQ_INF_LABEL: &str = "‖ineq₊‖∞";
@@ -602,10 +602,8 @@ pub trait CompiledNlpProblem {
     fn dimension(&self) -> Index;
     fn parameter_count(&self) -> Index;
     fn parameter_ccs(&self, parameter_index: Index) -> &CCS;
-    fn variable_bounds(&self, lower: &mut [f64], upper: &mut [f64]) -> bool {
-        lower.fill(-NLP_INF);
-        upper.fill(NLP_INF);
-        true
+    fn variable_bounds(&self) -> Option<ConstraintBounds> {
+        None
     }
     fn backend_timing_metadata(&self) -> BackendTimingMetadata {
         BackendTimingMetadata::default()
@@ -1909,28 +1907,31 @@ fn collect_bound_constraints<P>(
 where
     P: CompiledNlpProblem,
 {
-    let dimension = problem.dimension();
-    let mut lower = vec![0.0; dimension];
-    let mut upper = vec![0.0; dimension];
-    if !problem.variable_bounds(&mut lower, &mut upper) {
+    let Some(bounds_view) = problem.variable_bounds() else {
         return Ok(BoundConstraints::default());
-    }
+    };
+    let dimension = problem.dimension();
+    let lower = bounds_view.lower.unwrap_or_default();
+    let upper = bounds_view.upper.unwrap_or_default();
 
     let mut bounds = BoundConstraints::default();
     for idx in 0..dimension {
-        if lower[idx] > upper[idx] {
-            return Err(ClarabelSqpError::InvalidInput(format!(
-                "variable bound interval is empty at index {idx}: lower={} > upper={}",
-                lower[idx], upper[idx]
-            )));
+        let lower_bound = lower.get(idx).copied().flatten();
+        let upper_bound = upper.get(idx).copied().flatten();
+        if let (Some(lower_bound), Some(upper_bound)) = (lower_bound, upper_bound) {
+            if lower_bound > upper_bound {
+                return Err(ClarabelSqpError::InvalidInput(format!(
+                    "variable bound interval is empty at index {idx}: lower={lower_bound} > upper={upper_bound}"
+                )));
+            }
         }
-        if lower[idx] > -NLP_INF {
+        if let Some(lower_bound) = lower_bound {
             bounds.lower_indices.push(idx);
-            bounds.lower_values.push(lower[idx]);
+            bounds.lower_values.push(lower_bound);
         }
-        if upper[idx] < NLP_INF {
+        if let Some(upper_bound) = upper_bound {
             bounds.upper_indices.push(idx);
-            bounds.upper_values.push(upper[idx]);
+            bounds.upper_values.push(upper_bound);
         }
     }
     Ok(bounds)
@@ -4502,13 +4503,21 @@ fn declared_box_constraint_count<P>(problem: &P) -> Index
 where
     P: CompiledNlpProblem,
 {
-    let mut lower = vec![0.0; problem.dimension()];
-    let mut upper = vec![0.0; problem.dimension()];
-    if !problem.variable_bounds(&mut lower, &mut upper) {
+    let Some(bounds) = problem.variable_bounds() else {
         return 0;
-    }
-    lower.iter().filter(|&&bound| bound > -NLP_INF).count()
-        + upper.iter().filter(|&&bound| bound < NLP_INF).count()
+    };
+    bounds
+        .lower
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|bound| bound.is_some())
+        .count()
+        + bounds
+            .upper
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|bound| bound.is_some())
+            .count()
 }
 
 fn visible_len(text: &str) -> usize {

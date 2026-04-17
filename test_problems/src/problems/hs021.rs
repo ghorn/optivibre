@@ -30,10 +30,16 @@ pub(crate) fn case() -> ProblemCase {
                 x0: Pair { x: 2.0, y: 2.0 },
                 parameters: (),
                 bounds: TypedRuntimeNlpBounds {
-                    variable_lower: Some(Pair { x: 2.0, y: -50.0 }),
-                    variable_upper: Some(Pair { x: 50.0, y: 50.0 }),
-                    inequality_lower: Some(-f64::INFINITY),
-                    inequality_upper: Some(0.0),
+                    variable_lower: Some(Pair {
+                        x: Some(2.0),
+                        y: Some(-50.0),
+                    }),
+                    variable_upper: Some(Pair {
+                        x: Some(50.0),
+                        y: Some(50.0),
+                    }),
+                    inequality_lower: Some(None),
+                    inequality_upper: Some(Some(0.0)),
                     scaling: None,
                 },
             })

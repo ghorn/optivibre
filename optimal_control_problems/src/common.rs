@@ -5967,12 +5967,19 @@ where
                 f64,
             ),
         >,
+    <(
+        optimal_control::Mesh<X, N>,
+        optimal_control::Mesh<U, N>,
+        [U; N],
+        SX,
+    ) as Vectorize<SX>>::Rebind<Option<f64>>: Vectorize<Option<f64>>,
     ([X; N], [U; N]): Vectorize<SX, Rebind<SX> = ([X; N], [U; N])>,
     (Beq, Bineq, [C; N]): Vectorize<
             SX,
             Rebind<SX> = (Beq, Bineq, [C; N]),
             Rebind<f64> = (Numeric<Beq>, Numeric<Bineq>, [Numeric<C>; N]),
         >,
+    <(Beq, Bineq, [C; N]) as Vectorize<SX>>::Rebind<Option<f64>>: Vectorize<Option<f64>>,
     (P, Beq): Vectorize<SX, Rebind<SX> = (P, Beq), Rebind<f64> = (Numeric<P>, Numeric<Beq>)>,
     Numeric<X>: Vectorize<f64, Rebind<f64> = Numeric<X>> + Clone,
     Numeric<U>: Vectorize<f64, Rebind<f64> = Numeric<U>> + Clone,
@@ -5986,23 +5993,23 @@ where
         Vectorize<Bounds1D, Rebind<Bounds1D> = <Bineq as Vectorize<SX>>::Rebind<Bounds1D>>,
 {
     fn backend_timing_metadata(&self) -> BackendTimingMetadata {
-        Self::backend_timing_metadata(self)
+        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::backend_timing_metadata(self)
     }
 
     fn nlp_compile_stats(&self) -> NlpCompileStats {
-        Self::nlp_compile_stats(self)
+        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::nlp_compile_stats(self)
     }
 
     fn helper_compile_stats(&self) -> OcpHelperCompileStats {
-        Self::helper_compile_stats(self)
+        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::helper_compile_stats(self)
     }
 
     fn helper_kernel_count(&self) -> usize {
-        Self::helper_kernel_count(self)
+        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::helper_kernel_count(self)
     }
 
     fn backend_compile_report(&self) -> &BackendCompileReport {
-        Self::backend_compile_report(self)
+        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::backend_compile_report(self)
     }
 }
 
@@ -6041,12 +6048,19 @@ where
                 f64,
             ),
         >,
+    <(
+        optimal_control::Mesh<X, N>,
+        optimal_control::Mesh<U, N>,
+        [U; N],
+        SX,
+    ) as Vectorize<SX>>::Rebind<Option<f64>>: Vectorize<Option<f64>>,
     ([X; N], [U; N]): Vectorize<SX, Rebind<SX> = ([X; N], [U; N])>,
     (Beq, Bineq, [C; N]): Vectorize<
             SX,
             Rebind<SX> = (Beq, Bineq, [C; N]),
             Rebind<f64> = (Numeric<Beq>, Numeric<Bineq>, [Numeric<C>; N]),
         >,
+    <(Beq, Bineq, [C; N]) as Vectorize<SX>>::Rebind<Option<f64>>: Vectorize<Option<f64>>,
     (P, Beq): Vectorize<SX, Rebind<SX> = (P, Beq), Rebind<f64> = (Numeric<P>, Numeric<Beq>)>,
     Numeric<X>: Vectorize<f64, Rebind<f64> = Numeric<X>> + Clone,
     Numeric<U>: Vectorize<f64, Rebind<f64> = Numeric<U>> + Clone,
@@ -6337,6 +6351,14 @@ where
                 f64,
             ),
         >,
+    <(
+        optimal_control::Mesh<X, N>,
+        optimal_control::Mesh<U, N>,
+        optimal_control::IntervalGrid<X, N, K>,
+        optimal_control::IntervalGrid<U, N, K>,
+        optimal_control::IntervalGrid<U, N, K>,
+        SX,
+    ) as Vectorize<SX>>::Rebind<Option<f64>>: Vectorize<Option<f64>>,
     (
         [X; N],
         [U; N],
@@ -6360,6 +6382,8 @@ where
                 optimal_control::IntervalGrid<Numeric<C>, N, K>,
             ),
         >,
+    <(Beq, Bineq, optimal_control::IntervalGrid<C, N, K>) as Vectorize<SX>>::Rebind<Option<f64>>:
+        Vectorize<Option<f64>>,
     (P, Beq): Vectorize<SX, Rebind<SX> = (P, Beq), Rebind<f64> = (Numeric<P>, Numeric<Beq>)>,
     [X; N]: Vectorize<SX, Rebind<SX> = [X; N]>,
     [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,
@@ -6379,23 +6403,23 @@ where
         Vectorize<Bounds1D, Rebind<Bounds1D> = <Bineq as Vectorize<SX>>::Rebind<Bounds1D>>,
 {
     fn backend_timing_metadata(&self) -> BackendTimingMetadata {
-        Self::backend_timing_metadata(self)
+        CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq, N, K>::backend_timing_metadata(self)
     }
 
     fn nlp_compile_stats(&self) -> NlpCompileStats {
-        Self::nlp_compile_stats(self)
+        CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq, N, K>::nlp_compile_stats(self)
     }
 
     fn helper_compile_stats(&self) -> OcpHelperCompileStats {
-        Self::helper_compile_stats(self)
+        CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq, N, K>::helper_compile_stats(self)
     }
 
     fn helper_kernel_count(&self) -> usize {
-        Self::helper_kernel_count(self)
+        CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq, N, K>::helper_kernel_count(self)
     }
 
     fn backend_compile_report(&self) -> &BackendCompileReport {
-        Self::backend_compile_report(self)
+        CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq, N, K>::backend_compile_report(self)
     }
 }
 
@@ -6442,6 +6466,14 @@ where
                 f64,
             ),
         >,
+    <(
+        optimal_control::Mesh<X, N>,
+        optimal_control::Mesh<U, N>,
+        optimal_control::IntervalGrid<X, N, K>,
+        optimal_control::IntervalGrid<U, N, K>,
+        optimal_control::IntervalGrid<U, N, K>,
+        SX,
+    ) as Vectorize<SX>>::Rebind<Option<f64>>: Vectorize<Option<f64>>,
     (
         [X; N],
         [U; N],
@@ -6465,6 +6497,8 @@ where
                 optimal_control::IntervalGrid<Numeric<C>, N, K>,
             ),
         >,
+    <(Beq, Bineq, optimal_control::IntervalGrid<C, N, K>) as Vectorize<SX>>::Rebind<Option<f64>>:
+        Vectorize<Option<f64>>,
     (P, Beq): Vectorize<SX, Rebind<SX> = (P, Beq), Rebind<f64> = (Numeric<P>, Numeric<Beq>)>,
     [X; N]: Vectorize<SX, Rebind<SX> = [X; N]>,
     [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,

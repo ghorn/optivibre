@@ -1,7 +1,7 @@
 use approx::assert_abs_diff_eq;
 use optimization::{
-    CCS, ClarabelSqpOptions, CompiledNlpProblem, ParameterMatrix, solve_nlp_sqp,
-    validate_nlp_problem_shapes, validate_parameter_inputs,
+    CCS, ClarabelSqpOptions, CompiledNlpProblem, ConstraintBounds, ParameterMatrix,
+    solve_nlp_sqp, validate_nlp_problem_shapes, validate_parameter_inputs,
 };
 use rstest::rstest;
 use std::time::Duration;
@@ -31,10 +31,11 @@ impl CompiledNlpProblem for BoundConstrainedQuadraticProblem {
         unreachable!("bound constrained quadratic problem has no parameters")
     }
 
-    fn variable_bounds(&self, lower: &mut [f64], upper: &mut [f64]) -> bool {
-        lower.copy_from_slice(&[2.0, f64::NEG_INFINITY]);
-        upper.copy_from_slice(&[f64::INFINITY, -3.0]);
-        true
+    fn variable_bounds(&self) -> Option<ConstraintBounds> {
+        Some(ConstraintBounds {
+            lower: Some(vec![Some(2.0), None]),
+            upper: Some(vec![None, Some(-3.0)]),
+        })
     }
 
     fn equality_count(&self) -> usize {

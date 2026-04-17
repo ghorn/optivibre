@@ -10,7 +10,7 @@ use optimization::{
     SymbolicNlpBuildError, SymbolicNlpCompileError, SymbolicNlpCompileOptions, SymbolicNlpOutputs,
     TypedCompiledJitNlp, TypedNlpScaling, TypedRuntimeNlpBounds, Vectorize, VectorizeLayoutError,
     classify_constraint_satisfaction, constraint_bound_side, flatten_value, symbolic_column,
-    symbolic_nlp, symbolic_value, unflatten_value, worst_bound_violation,
+    symbolic_nlp, symbolic_value, rebind_from_flat, unflatten_value, worst_bound_violation,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptIterationSnapshot, IpoptOptions, IpoptSolveError, IpoptSummary};
@@ -22,7 +22,6 @@ use sx_codegen_llvm::{CompiledJitFunction, JitExecutionContext};
 use sx_core::{HessianStrategy, NamedMatrix, NodeView, SX, SXFunction, SXMatrix, SxError};
 use thiserror::Error;
 
-const NLP_BOUND_INF: f64 = 1e20;
 pub const MULTIPLE_SHOOTING_ARC_SAMPLES: usize = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2722,6 +2721,7 @@ where
     [X; N]: Vectorize<SX, Rebind<SX> = [X; N]>,
     [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,
     MsVars<X, U, N>: Vectorize<SX, Rebind<SX> = MsVars<X, U, N>, Rebind<f64> = MsVarsNum<X, U, N>>,
+    <MsVars<X, U, N> as Vectorize<SX>>::Rebind<Option<f64>>: Vectorize<Option<f64>>,
     MsEqualities<X, U, N>: Vectorize<SX, Rebind<SX> = MsEqualities<X, U, N>>,
     <MsEqualities<X, U, N> as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
     MsIneq<C, Beq, Bineq, N>: Vectorize<
@@ -2729,6 +2729,7 @@ where
             Rebind<SX> = MsIneq<C, Beq, Bineq, N>,
             Rebind<f64> = MsIneqNum<C, Beq, Bineq, N>,
         >,
+    <MsIneq<C, Beq, Bineq, N> as Vectorize<SX>>::Rebind<Option<f64>>: Vectorize<Option<f64>>,
     OcpParameters<P, Beq>:
         Vectorize<SX, Rebind<SX> = OcpParameters<P, Beq>, Rebind<f64> = OcpParametersNum<P, Beq>>,
     Numeric<X>: Vectorize<f64, Rebind<f64> = Numeric<X>> + Clone,
@@ -3427,9 +3428,13 @@ where
             .map(|scaling| self.build_nlp_scaling(scaling))
             .transpose()?;
         Ok(TypedRuntimeNlpBounds {
-            variable_lower: Some(unflatten_value::<MsVarsNum<X, U, N>, f64>(&lower)?),
-            variable_upper: Some(unflatten_value::<MsVarsNum<X, U, N>, f64>(&upper)?),
-            inequality_lower: Some(unflatten_value::<MsIneqNum<C, Beq, Bineq, N>, f64>(
+            variable_lower: Some(rebind_from_flat::<MsVars<X, U, N>, SX, Option<f64>>(
+                &lower,
+            )?),
+            variable_upper: Some(rebind_from_flat::<MsVars<X, U, N>, SX, Option<f64>>(
+                &upper,
+            )?),
+            inequality_lower: Some(rebind_from_flat::<MsIneq<C, Beq, Bineq, N>, SX, Option<f64>>(
                 &build_inequality_lower::<C, Beq, Bineq>(
                     &self.promotion_plan,
                     &offsets,
@@ -3437,7 +3442,7 @@ where
                     &values.bineq_bounds,
                 )?,
             )?),
-            inequality_upper: Some(unflatten_value::<MsIneqNum<C, Beq, Bineq, N>, f64>(
+            inequality_upper: Some(rebind_from_flat::<MsIneq<C, Beq, Bineq, N>, SX, Option<f64>>(
                 &build_inequality_upper::<C, Beq, Bineq>(
                     &self.promotion_plan,
                     &offsets,
@@ -3529,6 +3534,7 @@ where
     IntervalGrid<U, N, K>: Vectorize<SX, Rebind<SX> = IntervalGrid<U, N, K>>,
     DcVars<X, U, N, K>:
         Vectorize<SX, Rebind<SX> = DcVars<X, U, N, K>, Rebind<f64> = DcVarsNum<X, U, N, K>>,
+    <DcVars<X, U, N, K> as Vectorize<SX>>::Rebind<Option<f64>>: Vectorize<Option<f64>>,
     DcEqualities<X, U, N, K>: Vectorize<SX, Rebind<SX> = DcEqualities<X, U, N, K>>,
     <DcEqualities<X, U, N, K> as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
     DcIneq<C, Beq, Bineq, N, K>: Vectorize<
@@ -3536,6 +3542,8 @@ where
             Rebind<SX> = DcIneq<C, Beq, Bineq, N, K>,
             Rebind<f64> = DcIneqNum<C, Beq, Bineq, N, K>,
         >,
+    <DcIneq<C, Beq, Bineq, N, K> as Vectorize<SX>>::Rebind<Option<f64>>:
+        Vectorize<Option<f64>>,
     OcpParameters<P, Beq>:
         Vectorize<SX, Rebind<SX> = OcpParameters<P, Beq>, Rebind<f64> = OcpParametersNum<P, Beq>>,
     [X; N]: Vectorize<SX, Rebind<SX> = [X; N]>,
@@ -4230,9 +4238,17 @@ where
             .map(|scaling| self.build_nlp_scaling(scaling))
             .transpose()?;
         Ok(TypedRuntimeNlpBounds {
-            variable_lower: Some(unflatten_value::<DcVarsNum<X, U, N, K>, f64>(&lower)?),
-            variable_upper: Some(unflatten_value::<DcVarsNum<X, U, N, K>, f64>(&upper)?),
-            inequality_lower: Some(unflatten_value::<DcIneqNum<C, Beq, Bineq, N, K>, f64>(
+            variable_lower: Some(rebind_from_flat::<DcVars<X, U, N, K>, SX, Option<f64>>(
+                &lower,
+            )?),
+            variable_upper: Some(rebind_from_flat::<DcVars<X, U, N, K>, SX, Option<f64>>(
+                &upper,
+            )?),
+            inequality_lower: Some(rebind_from_flat::<
+                DcIneq<C, Beq, Bineq, N, K>,
+                SX,
+                Option<f64>,
+            >(
                 &build_inequality_lower::<C, Beq, Bineq>(
                     &self.promotion_plan,
                     &offsets,
@@ -4240,7 +4256,11 @@ where
                     &values.bineq_bounds,
                 )?,
             )?),
-            inequality_upper: Some(unflatten_value::<DcIneqNum<C, Beq, Bineq, N, K>, f64>(
+            inequality_upper: Some(rebind_from_flat::<
+                DcIneq<C, Beq, Bineq, N, K>,
+                SX,
+                Option<f64>,
+            >(
                 &build_inequality_upper::<C, Beq, Bineq>(
                     &self.promotion_plan,
                     &offsets,
@@ -4811,7 +4831,7 @@ fn build_raw_bounds<C, Beq, Bineq>(
     bineq_bounds: &BoundTemplate<Bineq>,
     tf_bounds: Bounds1D,
     variable_count: usize,
-) -> Result<(Vec<f64>, Vec<f64>), GuessError>
+) -> Result<(Vec<Option<f64>>, Vec<Option<f64>>), GuessError>
 where
     C: Vectorize<SX>,
     Bineq: Vectorize<SX>,
@@ -4819,8 +4839,8 @@ where
     BoundTemplate<C>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<C>>,
     BoundTemplate<Bineq>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<Bineq>>,
 {
-    let mut variable_lower = vec![-NLP_BOUND_INF; variable_count];
-    let mut variable_upper = vec![NLP_BOUND_INF; variable_count];
+    let mut variable_lower = vec![None; variable_count];
+    let mut variable_upper = vec![None; variable_count];
     let tf_index = variable_count - 1;
     apply_bounds_to_coordinate(
         &mut variable_lower,
@@ -4881,7 +4901,7 @@ fn build_inequality_lower<C, Beq, Bineq>(
     _offsets: &[f64],
     path_bounds: &BoundTemplate<C>,
     bineq_bounds: &BoundTemplate<Bineq>,
-) -> Result<Vec<f64>, GuessError>
+) -> Result<Vec<Option<f64>>, GuessError>
 where
     C: Vectorize<SX>,
     Bineq: Vectorize<SX>,
@@ -4896,19 +4916,19 @@ where
     let mut lower = Vec::with_capacity(plan.rows.len());
     for row in &plan.rows {
         if row.promotion.is_some() {
-            lower.push(-NLP_BOUND_INF);
+            lower.push(None);
             continue;
         }
         match row.kind {
-            RawInequalityKind::BoundaryEquality => lower.push(0.0),
+            RawInequalityKind::BoundaryEquality => lower.push(Some(0.0)),
             RawInequalityKind::BoundaryInequality => {
                 let bound = &boundary_ineq[boundary_ineq_index];
-                lower.push(bound.lower.unwrap_or(-NLP_BOUND_INF));
+                lower.push(bound.lower);
                 boundary_ineq_index += 1;
             }
             RawInequalityKind::Path => {
                 let bound = &path[path_index % path.len()];
-                lower.push(bound.lower.unwrap_or(-NLP_BOUND_INF));
+                lower.push(bound.lower);
                 path_index += 1;
             }
         }
@@ -4921,7 +4941,7 @@ fn build_inequality_upper<C, Beq, Bineq>(
     _offsets: &[f64],
     path_bounds: &BoundTemplate<C>,
     bineq_bounds: &BoundTemplate<Bineq>,
-) -> Result<Vec<f64>, GuessError>
+) -> Result<Vec<Option<f64>>, GuessError>
 where
     C: Vectorize<SX>,
     Bineq: Vectorize<SX>,
@@ -4936,19 +4956,19 @@ where
     let mut upper = Vec::with_capacity(plan.rows.len());
     for row in &plan.rows {
         if row.promotion.is_some() {
-            upper.push(NLP_BOUND_INF);
+            upper.push(None);
             continue;
         }
         match row.kind {
-            RawInequalityKind::BoundaryEquality => upper.push(0.0),
+            RawInequalityKind::BoundaryEquality => upper.push(Some(0.0)),
             RawInequalityKind::BoundaryInequality => {
                 let bound = &boundary_ineq[boundary_ineq_index];
-                upper.push(bound.upper.unwrap_or(NLP_BOUND_INF));
+                upper.push(bound.upper);
                 boundary_ineq_index += 1;
             }
             RawInequalityKind::Path => {
                 let bound = &path[path_index % path.len()];
-                upper.push(bound.upper.unwrap_or(NLP_BOUND_INF));
+                upper.push(bound.upper);
                 path_index += 1;
             }
         }
@@ -5142,8 +5162,8 @@ fn add_repeated_inequalities(
 }
 
 fn apply_bounds_to_coordinate(
-    variable_lower: &mut [f64],
-    variable_upper: &mut [f64],
+    variable_lower: &mut [Option<f64>],
+    variable_upper: &mut [Option<f64>],
     index: usize,
     scale: f64,
     offset: f64,
@@ -5162,15 +5182,23 @@ fn apply_bounds_to_coordinate(
         )
     };
     if let Some(value) = candidate_lower {
-        variable_lower[index] = variable_lower[index].max(value);
+        variable_lower[index] = Some(match variable_lower[index] {
+            Some(current) => current.max(value),
+            None => value,
+        });
     }
     if let Some(value) = candidate_upper {
-        variable_upper[index] = variable_upper[index].min(value);
+        variable_upper[index] = Some(match variable_upper[index] {
+            Some(current) => current.min(value),
+            None => value,
+        });
     }
-    if variable_lower[index] > variable_upper[index] {
-        return Err(GuessError::Invalid(format!(
-            "promoted box bounds are inconsistent at variable index {index}"
-        )));
+    if let (Some(lower), Some(upper)) = (variable_lower[index], variable_upper[index]) {
+        if lower > upper {
+            return Err(GuessError::Invalid(format!(
+                "promoted box bounds are inconsistent at variable index {index}"
+            )));
+        }
     }
     Ok(())
 }

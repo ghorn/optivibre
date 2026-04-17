@@ -39,13 +39,13 @@ pub(crate) fn case() -> ProblemCase {
                 parameters: (),
                 bounds: TypedRuntimeNlpBounds {
                     variable_lower: Some(VecN {
-                        values: [1.0, 1.0, 1.0, 1.0],
+                        values: [Some(1.0), Some(1.0), Some(1.0), Some(1.0)],
                     }),
                     variable_upper: Some(VecN {
-                        values: [5.0, 5.0, 5.0, 5.0],
+                        values: [Some(5.0), Some(5.0), Some(5.0), Some(5.0)],
                     }),
-                    inequality_lower: Some(-f64::INFINITY),
-                    inequality_upper: Some(0.0),
+                    inequality_lower: Some(None),
+                    inequality_upper: Some(Some(0.0)),
                     scaling: None,
                 },
             })

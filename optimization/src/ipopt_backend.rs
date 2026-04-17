@@ -493,7 +493,25 @@ where
     }
 
     fn bounds(&self, x_l: &mut [Number], x_u: &mut [Number]) -> bool {
-        self.problem.variable_bounds(x_l, x_u)
+        x_l.fill(-IPOPT_INF);
+        x_u.fill(IPOPT_INF);
+        if let Some(bounds) = self.problem.variable_bounds() {
+            if let Some(lower) = bounds.lower {
+                for (slot, bound) in x_l.iter_mut().zip(lower.into_iter()) {
+                    if let Some(bound) = bound {
+                        *slot = bound;
+                    }
+                }
+            }
+            if let Some(upper) = bounds.upper {
+                for (slot, bound) in x_u.iter_mut().zip(upper.into_iter()) {
+                    if let Some(bound) = bound {
+                        *slot = bound;
+                    }
+                }
+            }
+        }
+        true
     }
 
     fn initial_point(&self, x: &mut [Number]) -> bool {

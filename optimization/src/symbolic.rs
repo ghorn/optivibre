@@ -21,7 +21,7 @@ use crate::{
     SqpIterationSnapshot, SymbolicCompileMetadata, SymbolicCompileProgress, SymbolicCompileStage,
     SymbolicCompileStageProgress, SymbolicSetupProfile, Vectorize,
     benchmark_compiled_nlp_problem_with_progress, classify_constraint_satisfaction,
-    constraint_bound_side, flatten_value, solve_nlp_interior_point,
+    constraint_bound_side, flatten_optional_value, flatten_value, solve_nlp_interior_point,
     solve_nlp_interior_point_with_callback, solve_nlp_sqp, solve_nlp_sqp_with_callback,
     symbolic_column, symbolic_value, validate_compiled_nlp_problem_derivatives,
     worst_bound_violation,
@@ -133,10 +133,10 @@ where
     X: Vectorize<SX>,
     I: Vectorize<SX>,
 {
-    pub variable_lower: Option<<X as Vectorize<SX>>::Rebind<f64>>,
-    pub variable_upper: Option<<X as Vectorize<SX>>::Rebind<f64>>,
-    pub inequality_lower: Option<<I as Vectorize<SX>>::Rebind<f64>>,
-    pub inequality_upper: Option<<I as Vectorize<SX>>::Rebind<f64>>,
+    pub variable_lower: Option<<X as Vectorize<SX>>::Rebind<Option<f64>>>,
+    pub variable_upper: Option<<X as Vectorize<SX>>::Rebind<Option<f64>>>,
+    pub inequality_lower: Option<<I as Vectorize<SX>>::Rebind<Option<f64>>>,
+    pub inequality_upper: Option<<I as Vectorize<SX>>::Rebind<Option<f64>>>,
     pub scaling: Option<TypedNlpScaling<X>>,
 }
 
@@ -184,8 +184,8 @@ struct ScaledNlpProblem<'a, P> {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ConstraintBounds {
-    pub lower: Option<Vec<f64>>,
-    pub upper: Option<Vec<f64>>,
+    pub lower: Option<Vec<Option<f64>>>,
+    pub upper: Option<Vec<Option<f64>>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -959,7 +959,21 @@ where
             .inequality_values_timed(&x_values, &parameter_storage, &mut values);
         values
     }
+}
 
+impl<X, P, E, I> TypedCompiledJitNlp<X, P, E, I>
+where
+    X: Vectorize<SX, Rebind<SX> = X>,
+    P: Vectorize<SX, Rebind<SX> = P>,
+    E: Vectorize<SX, Rebind<SX> = E>,
+    I: Vectorize<SX, Rebind<SX> = I>,
+    <X as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
+    <X as Vectorize<SX>>::Rebind<Option<f64>>: Vectorize<Option<f64>>,
+    <P as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
+    <E as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
+    <I as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
+    <I as Vectorize<SX>>::Rebind<Option<f64>>: Vectorize<Option<f64>>,
+{
     pub fn bind_runtime_bounds(
         &self,
         bounds: &TypedRuntimeNlpBounds<X, I>,
@@ -971,12 +985,12 @@ where
     fn flatten_runtime_bounds(&self, bounds: &TypedRuntimeNlpBounds<X, I>) -> RuntimeNlpBounds {
         RuntimeNlpBounds {
             variables: ConstraintBounds {
-                lower: bounds.variable_lower.as_ref().map(flatten_value),
-                upper: bounds.variable_upper.as_ref().map(flatten_value),
+                lower: bounds.variable_lower.as_ref().map(flatten_optional_value),
+                upper: bounds.variable_upper.as_ref().map(flatten_optional_value),
             },
             inequalities: ConstraintBounds {
-                lower: bounds.inequality_lower.as_ref().map(flatten_value),
-                upper: bounds.inequality_upper.as_ref().map(flatten_value),
+                lower: bounds.inequality_lower.as_ref().map(flatten_optional_value),
+                upper: bounds.inequality_upper.as_ref().map(flatten_optional_value),
             },
         }
     }
@@ -1541,12 +1555,12 @@ where
             &parameter_storage,
             &RuntimeNlpBounds {
                 variables: ConstraintBounds {
-                    lower: bounds.variable_lower.as_ref().map(flatten_value),
-                    upper: bounds.variable_upper.as_ref().map(flatten_value),
+                    lower: bounds.variable_lower.as_ref().map(flatten_optional_value),
+                    upper: bounds.variable_upper.as_ref().map(flatten_optional_value),
                 },
                 inequalities: ConstraintBounds {
-                    lower: bounds.inequality_lower.as_ref().map(flatten_value),
-                    upper: bounds.inequality_upper.as_ref().map(flatten_value),
+                    lower: bounds.inequality_lower.as_ref().map(flatten_optional_value),
+                    upper: bounds.inequality_upper.as_ref().map(flatten_optional_value),
                 },
             },
             tolerance,
@@ -1596,8 +1610,8 @@ pub fn rank_nlp_constraint_violations(
     let inequality_lower = inequality_bounds.lower.unwrap_or_default();
     let inequality_upper = inequality_bounds.upper.unwrap_or_default();
     for (row, value) in inequalities.into_iter().enumerate() {
-        let lower_bound = inequality_lower.get(row).copied();
-        let upper_bound = inequality_upper.get(row).copied();
+        let lower_bound = inequality_lower.get(row).copied().flatten();
+        let upper_bound = inequality_upper.get(row).copied().flatten();
         if lower_bound.is_none() && upper_bound.is_none() {
             continue;
         }
@@ -1620,8 +1634,8 @@ pub fn rank_nlp_constraint_violations(
     let variable_lower = variable_bounds.lower.unwrap_or_default();
     let variable_upper = variable_bounds.upper.unwrap_or_default();
     for (index, &value) in x.iter().enumerate() {
-        let lower_bound = variable_lower.get(index).copied();
-        let upper_bound = variable_upper.get(index).copied();
+        let lower_bound = variable_lower.get(index).copied().flatten();
+        let upper_bound = variable_upper.get(index).copied().flatten();
         if lower_bound.is_none() && upper_bound.is_none() {
             continue;
         }
@@ -1854,10 +1868,20 @@ impl AppliedNlpScaling {
             .collect()
     }
 
-    fn scale_variable_bounds(&self, lower: &mut [f64], upper: &mut [f64]) {
-        for index in 0..lower.len() {
-            lower[index] *= self.variable[index];
-            upper[index] *= self.variable[index];
+    fn scale_variable_bounds(&self, bounds: &mut ConstraintBounds) {
+        if let Some(lower) = bounds.lower.as_mut() {
+            for (bound, scale) in lower.iter_mut().zip(self.variable.iter().copied()) {
+                if let Some(value) = bound.as_mut() {
+                    *value *= scale;
+                }
+            }
+        }
+        if let Some(upper) = bounds.upper.as_mut() {
+            for (bound, scale) in upper.iter_mut().zip(self.variable.iter().copied()) {
+                if let Some(value) = bound.as_mut() {
+                    *value *= scale;
+                }
+            }
         }
     }
 
@@ -2012,12 +2036,10 @@ where
         self.base.parameter_ccs(parameter_index)
     }
 
-    fn variable_bounds(&self, lower: &mut [f64], upper: &mut [f64]) -> bool {
-        if !self.base.variable_bounds(lower, upper) {
-            return false;
-        }
-        self.scaling.scale_variable_bounds(lower, upper);
-        true
+    fn variable_bounds(&self) -> Option<ConstraintBounds> {
+        let mut bounds = self.base.variable_bounds()?;
+        self.scaling.scale_variable_bounds(&mut bounds);
+        Some(bounds)
     }
 
     fn backend_timing_metadata(&self) -> BackendTimingMetadata {
@@ -2257,18 +2279,11 @@ impl CompiledNlpProblem for RuntimeBoundedJitNlp<'_> {
         self.base.parameter_ccs(parameter_index)
     }
 
-    fn variable_bounds(&self, lower: &mut [f64], upper: &mut [f64]) -> bool {
+    fn variable_bounds(&self) -> Option<ConstraintBounds> {
         let started = Instant::now();
-        lower.fill(-crate::NLP_INF);
-        upper.fill(crate::NLP_INF);
-        if let Some(bounds) = &self.variable_bounds.lower {
-            lower.copy_from_slice(bounds);
-        }
-        if let Some(bounds) = &self.variable_bounds.upper {
-            upper.copy_from_slice(bounds);
-        }
+        let bounds = self.variable_bounds.clone();
         self.record_layout_projection(started.elapsed());
-        true
+        Some(bounds)
     }
 
     fn backend_timing_metadata(&self) -> BackendTimingMetadata {
@@ -2402,8 +2417,6 @@ impl CompiledNlpProblem for RuntimeBoundedJitNlp<'_> {
 
 impl InequalityMapping {
     fn from_runtime_bounds(base_ccs: &CCS, bounds: &ConstraintBounds) -> Self {
-        let lower = bounds.lower.as_deref().unwrap_or(&[]).to_vec();
-        let upper = bounds.upper.as_deref().unwrap_or(&[]).to_vec();
         let count = base_ccs.nrow;
         let mut inequality_rows = Vec::new();
         let mut inequality_by_source = vec![Vec::<(Index, f64)>::new(); count];
@@ -2411,12 +2424,22 @@ impl InequalityMapping {
         for (source_index, rows_for_source) in
             inequality_by_source.iter_mut().enumerate().take(count)
         {
-            let lower_bound = lower.get(source_index).copied().unwrap_or(-crate::NLP_INF);
-            let upper_bound = upper.get(source_index).copied().unwrap_or(crate::NLP_INF);
-            if lower_bound == -crate::NLP_INF && upper_bound == crate::NLP_INF {
+            let lower_bound = bounds
+                .lower
+                .as_ref()
+                .and_then(|values| values.get(source_index))
+                .copied()
+                .flatten();
+            let upper_bound = bounds
+                .upper
+                .as_ref()
+                .and_then(|values| values.get(source_index))
+                .copied()
+                .flatten();
+            if lower_bound.is_none() && upper_bound.is_none() {
                 continue;
             }
-            if lower_bound > -crate::NLP_INF {
+            if let Some(lower_bound) = lower_bound {
                 let row = inequality_rows.len();
                 inequality_rows.push(ConstraintTransform {
                     source_index,
@@ -2425,7 +2448,7 @@ impl InequalityMapping {
                 });
                 rows_for_source.push((row, -1.0));
             }
-            if upper_bound < crate::NLP_INF {
+            if let Some(upper_bound) = upper_bound {
                 let row = inequality_rows.len();
                 inequality_rows.push(ConstraintTransform {
                     source_index,
@@ -2891,20 +2914,22 @@ fn validate_bound_vectors(
 
     if let (Some(lower), Some(upper)) = (&bounds.lower, &bounds.upper) {
         for (index, (&lower, &upper)) in lower.iter().zip(upper.iter()).enumerate() {
-            if lower > upper {
-                return Err(if is_variable {
-                    RuntimeNlpBoundsError::InvalidVariableBounds {
-                        index,
-                        lower,
-                        upper,
-                    }
-                } else {
-                    RuntimeNlpBoundsError::InvalidConstraintBounds {
-                        index,
-                        lower,
-                        upper,
-                    }
-                });
+            if let (Some(lower), Some(upper)) = (lower, upper) {
+                if lower > upper {
+                    return Err(if is_variable {
+                        RuntimeNlpBoundsError::InvalidVariableBounds {
+                            index,
+                            lower,
+                            upper,
+                        }
+                    } else {
+                        RuntimeNlpBoundsError::InvalidConstraintBounds {
+                            index,
+                            lower,
+                            upper,
+                        }
+                    });
+                }
             }
         }
     }

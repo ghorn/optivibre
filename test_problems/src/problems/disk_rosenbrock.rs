@@ -32,11 +32,11 @@ pub(crate) fn case() -> ProblemCase {
                 bounds: TypedRuntimeNlpBounds {
                     variable_lower: None,
                     variable_upper: Some(Pair {
-                        x: f64::INFINITY,
-                        y: 2.0,
+                        x: None,
+                        y: Some(2.0),
                     }),
-                    inequality_lower: Some(-f64::INFINITY),
-                    inequality_upper: Some(1.5),
+                    inequality_lower: Some(None),
+                    inequality_upper: Some(Some(1.5)),
                     scaling: None,
                 },
             })

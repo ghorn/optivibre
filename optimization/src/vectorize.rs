@@ -11,6 +11,7 @@ pub trait ScalarLeaf: Clone {}
 
 impl ScalarLeaf for SX {}
 impl ScalarLeaf for f64 {}
+impl ScalarLeaf for Option<f64> {}
 impl ScalarLeaf for String {}
 
 #[doc(hidden)]
@@ -620,12 +621,39 @@ where
     value.flatten_cloned()
 }
 
+pub fn flatten_optional_value<T>(value: &T) -> Vec<Option<f64>>
+where
+    T: Vectorize<Option<f64>>,
+{
+    value.flatten_cloned()
+}
+
 pub fn unflatten_value<S, T>(values: &[T]) -> Result<S::Rebind<T>, VectorizeLayoutError>
 where
     S: Vectorize<T>,
     T: ScalarLeaf + Clone,
 {
     S::from_flat_slice(values)
+}
+
+pub fn rebind_from_flat<S, T, U>(values: &[U]) -> Result<S::Rebind<U>, VectorizeLayoutError>
+where
+    S: Vectorize<T>,
+    T: ScalarLeaf,
+    U: ScalarLeaf + Clone,
+{
+    if values.len() != S::LEN {
+        return Err(VectorizeLayoutError::LengthMismatch {
+            expected: S::LEN,
+            got: values.len(),
+        });
+    }
+    let mut index = 0usize;
+    Ok(S::from_flat_fn(&mut || {
+        let value = values[index].clone();
+        index += 1;
+        value
+    }))
 }
 
 pub fn flat_view<'a, S, T>(values: &'a [T]) -> Result<S::View<'a>, VectorizeLayoutError>

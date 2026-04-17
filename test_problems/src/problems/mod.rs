@@ -147,9 +147,13 @@ where
     E: Vectorize<SX, Rebind<SX> = E>,
     I: Vectorize<SX, Rebind<SX> = I>,
     <X as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
+    <X as Vectorize<SX>>::Rebind<Option<f64>>:
+        Vectorize<Option<f64>> + Clone + Send + Sync + 'static,
     <P as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
     <E as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
     <I as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
+    <I as Vectorize<SX>>::Rebind<Option<f64>>:
+        Vectorize<Option<f64>> + Clone + Send + Sync + 'static,
     Build: Fn(ProblemRunOptions) -> anyhow::Result<TypedProblemData<X, P, E, I>>
         + Send
         + Sync
@@ -192,9 +196,13 @@ where
     E: Vectorize<SX, Rebind<SX> = E>,
     I: Vectorize<SX, Rebind<SX> = I>,
     <X as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
+    <X as Vectorize<SX>>::Rebind<Option<f64>>:
+        Vectorize<Option<f64>> + Clone + Send + Sync + 'static,
     <P as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
     <E as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
     <I as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
+    <I as Vectorize<SX>>::Rebind<Option<f64>>:
+        Vectorize<Option<f64>> + Clone + Send + Sync + 'static,
     Build: Fn(ProblemRunOptions) -> anyhow::Result<TypedProblemData<X, P, E, I>>,
     Validate: Fn(&ProblemRunRecord) -> ValidationOutcome,
 {
@@ -274,9 +282,13 @@ where
     E: Vectorize<SX, Rebind<SX> = E>,
     I: Vectorize<SX, Rebind<SX> = I>,
     <X as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
+    <X as Vectorize<SX>>::Rebind<Option<f64>>:
+        Vectorize<Option<f64>> + Clone + Send + Sync + 'static,
     <P as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
     <E as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
     <I as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
+    <I as Vectorize<SX>>::Rebind<Option<f64>>:
+        Vectorize<Option<f64>> + Clone + Send + Sync + 'static,
     Validate: Fn(&ProblemRunRecord) -> ValidationOutcome,
 {
     let backend_timing = data.compiled.backend_timing_metadata();
@@ -744,7 +756,9 @@ where
     X: Vectorize<SX, Rebind<SX> = X>,
     I: Vectorize<SX, Rebind<SX> = I>,
     <X as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
+    <X as Vectorize<SX>>::Rebind<Option<f64>>: Vectorize<Option<f64>>,
     <I as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
+    <I as Vectorize<SX>>::Rebind<Option<f64>>: Vectorize<Option<f64>>,
 {
     let num_vars = problem.dimension();
     let num_eq = problem.equality_count();
@@ -771,16 +785,16 @@ fn box_counts<X, I>(bounds: &TypedRuntimeNlpBounds<X, I>) -> (usize, usize)
 where
     X: Vectorize<SX, Rebind<SX> = X>,
     I: Vectorize<SX, Rebind<SX> = I>,
-    <X as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
+    <X as Vectorize<SX>>::Rebind<Option<f64>>: Vectorize<Option<f64>>,
 {
     let lower = bounds
         .variable_lower
         .as_ref()
-        .map(optimization::flatten_value);
+        .map(optimization::flatten_optional_value);
     let upper = bounds
         .variable_upper
         .as_ref()
-        .map(optimization::flatten_value);
+        .map(optimization::flatten_optional_value);
     let len = lower
         .as_ref()
         .map_or_else(|| upper.as_ref().map_or(0, Vec::len), Vec::len);
@@ -791,19 +805,19 @@ where
             .as_ref()
             .and_then(|values| values.get(idx))
             .copied()
-            .unwrap_or(f64::NEG_INFINITY);
+            .flatten();
         let upper_value = upper
             .as_ref()
             .and_then(|values| values.get(idx))
             .copied()
-            .unwrap_or(f64::INFINITY);
-        if lower_value.is_finite() {
+            .flatten();
+        if lower_value.is_some() {
             num_box += 1;
         }
-        if upper_value.is_finite() {
+        if upper_value.is_some() {
             num_box += 1;
         }
-        if lower_value.is_finite() && upper_value.is_finite() && lower_value == upper_value {
+        if lower_value.is_some() && upper_value.is_some() && lower_value == upper_value {
             fixed_box += 1;
         }
     }

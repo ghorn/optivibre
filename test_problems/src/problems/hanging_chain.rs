@@ -244,11 +244,13 @@ fn case_for<const N: usize, const LINKS: usize>(
                             variable_upper: None,
                             inequality_lower: Some(
                                 <VecN<SX, LINKS> as Vectorize<SX>>::from_flat_fn(&mut || {
-                                    f64::NEG_INFINITY
+                                    None
                                 }),
                             ),
                             inequality_upper: Some(
-                                <VecN<SX, LINKS> as Vectorize<SX>>::from_flat_fn(&mut || 0.0),
+                                <VecN<SX, LINKS> as Vectorize<SX>>::from_flat_fn(&mut || {
+                                    Some(0.0)
+                                }),
                             ),
                             scaling: None,
                         },

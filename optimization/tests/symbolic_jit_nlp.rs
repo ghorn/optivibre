@@ -111,10 +111,13 @@ fn typed_symbolic_disk_constrained_rosenbrock_solves_with_runtime_constraint_bou
                 variable_lower: None,
                 variable_upper: None,
                 inequality_lower: Some(Pair {
-                    x: -f64::INFINITY,
-                    y: -f64::INFINITY,
+                    x: None,
+                    y: None,
                 }),
-                inequality_upper: Some(Pair { x: 1.5, y: 2.0 }),
+                inequality_upper: Some(Pair {
+                    x: Some(1.5),
+                    y: Some(2.0),
+                }),
                 scaling: None,
             },
             &ClarabelSqpOptions {
@@ -727,10 +730,13 @@ fn typed_symbolic_inequality_only_problem_solves_with_ipopt_without_box_bounds()
                 variable_lower: None,
                 variable_upper: None,
                 inequality_lower: Some(Pair {
-                    x: -f64::INFINITY,
-                    y: -f64::INFINITY,
+                    x: None,
+                    y: None,
                 }),
-                inequality_upper: Some(Pair { x: 1.5, y: 2.0 }),
+                inequality_upper: Some(Pair {
+                    x: Some(1.5),
+                    y: Some(2.0),
+                }),
                 scaling: None,
             },
             &IpoptOptions {
