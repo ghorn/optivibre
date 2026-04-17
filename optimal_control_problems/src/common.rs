@@ -8740,6 +8740,7 @@ mod tests {
                 final_state: None,
                 final_state_kind: None,
                 last_accepted_state: None,
+                failed_trust_region: None,
                 failed_line_search: None,
                 failed_step_diagnostics: None,
                 qp_failure: Some(optimization::SqpQpFailureDiagnostics {

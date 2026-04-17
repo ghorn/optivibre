@@ -39,9 +39,8 @@ pub use interior_point::{
     InteriorPointIterationEvent, InteriorPointIterationPhase, InteriorPointIterationSnapshot,
     InteriorPointIterationTiming, InteriorPointLineSearchInfo, InteriorPointLineSearchTrial,
     InteriorPointLinearSolver, InteriorPointOptions, InteriorPointProfiling,
-    InteriorPointSolveError, InteriorPointSummary, format_nlip_settings_summary,
-    nlip_event_codes, nlip_event_legend_entries, solve_nlp_interior_point,
-    solve_nlp_interior_point_with_callback,
+    InteriorPointSolveError, InteriorPointSummary, format_nlip_settings_summary, nlip_event_codes,
+    nlip_event_legend_entries, solve_nlp_interior_point, solve_nlp_interior_point_with_callback,
 };
 #[cfg(feature = "ipopt")]
 pub use ipopt::SolveStatus as IpoptSolveStatus;

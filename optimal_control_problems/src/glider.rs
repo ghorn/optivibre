@@ -8,15 +8,15 @@ use crate::common::{
     multiple_shooting_runtime_from_spec, node_times, numeric_metric_with_key,
     ocp_sx_function_config_from_map, problem_controls, problem_scientific_slider_control,
     problem_slider_control, problem_spec, rad_to_deg, sample_or_default, segmented_bound_series,
-    segmented_series, solver_config_from_map, solver_method_from_map, transcription_from_map,
-    transcription_metrics, trapezoid_integral,
+    segmented_series, select_control, solver_config_from_map, solver_method_from_map,
+    transcription_from_map, transcription_metrics, trapezoid_integral,
 };
 use anyhow::{Result, anyhow};
 use optimal_control::{
     Bounds1D, CompiledDirectCollocationOcp, CompiledMultipleShootingOcp, DirectCollocation,
     DirectCollocationRuntimeValues, DirectCollocationTimeGrid, DirectCollocationTrajectories,
     IntervalArc, MultipleShooting, MultipleShootingRuntimeValues, MultipleShootingTrajectories,
-    Ocp, direct_collocation_root_arcs, direct_collocation_state_like_arcs,
+    Ocp, OcpScaling, direct_collocation_root_arcs, direct_collocation_state_like_arcs,
 };
 use serde::Serialize;
 use std::f64::consts::PI;
@@ -40,6 +40,14 @@ const INITIAL_ALTITUDE_M: f64 = 1.0;
 const LAUNCH_PATH_SEED_DEG: f64 = 12.0;
 const MIN_FLIGHT_TIME_S: f64 = 1.0;
 const MAX_FLIGHT_TIME_S: f64 = 500.0;
+const GLIDER_OBJECTIVE_SCALE: f64 = 100.0;
+const GLIDER_X_SCALE_M: f64 = 300.0;
+const GLIDER_ALTITUDE_SCALE_M: f64 = 50.0;
+const GLIDER_ALPHA_SCALE_DEG: f64 = 5.0;
+const GLIDER_ALPHA_RATE_SCALE_DEG_S: f64 = 4.0;
+const GLIDER_FINAL_TIME_SCALE_S: f64 = 100.0;
+const GLIDER_CL_SCALE: f64 = 1.0;
+const GLIDER_X0_SCALE_M: f64 = 1.0;
 #[derive(Clone, Debug, PartialEq, Serialize, optimization::Vectorize)]
 pub struct State<T> {
     pub x: T,
@@ -113,6 +121,7 @@ pub struct Params {
     pub max_time_bound_s: f64,
     pub max_alpha_rate_deg_s: f64,
     pub alpha_rate_regularization: f64,
+    pub scaling_enabled: bool,
     pub solver_method: SolverMethod,
     pub solver: SqpConfig,
     pub transcription: TranscriptionConfig,
@@ -128,6 +137,7 @@ impl Default for Params {
             max_time_bound_s: MAX_FLIGHT_TIME_S,
             max_alpha_rate_deg_s: 25.0,
             alpha_rate_regularization: 5.0e-1,
+            scaling_enabled: true,
             solver_method: default_solver_method(),
             solver: default_sqp_config(),
             transcription: default_transcription(DEFAULT_INTERVALS),
@@ -168,6 +178,19 @@ impl FromMap for Params {
                 "min_time_bound_s must be less than or equal to max_time_bound_s"
             ));
         }
+        let scaling_enabled = match sample_or_default(
+            values,
+            "scaling_enabled",
+            if defaults.scaling_enabled { 1.0 } else { 0.0 },
+        ) {
+            value if (value - 1.0).abs() <= 1.0e-9 => true,
+            value if value.abs() <= 1.0e-9 => false,
+            value => {
+                return Err(anyhow!(
+                    "scaling_enabled must be either 0 (Off) or 1 (On), got {value}"
+                ));
+            }
+        };
         Ok(Self {
             launch_speed_mps: expect_finite(
                 sample_or_default(values, "launch_speed_mps", defaults.launch_speed_mps),
@@ -203,6 +226,7 @@ impl FromMap for Params {
                 ),
                 "alpha_rate_regularization",
             )?,
+            scaling_enabled,
             solver_method: solver_method_from_map(values, defaults.solver_method)?,
             solver: solver_config_from_map(values, defaults.solver)?,
             transcription: transcription_from_map(
@@ -297,6 +321,17 @@ pub fn spec() -> ProblemSpec {
                     defaults.alpha_rate_regularization,
                     "",
                     "Quadratic stage-cost weight on angle-of-attack rate.",
+                ),
+                select_control(
+                    "scaling_enabled",
+                    "Scaling",
+                    if defaults.scaling_enabled { 1.0 } else { 0.0 },
+                    "",
+                    "Enable glider-specific NLP/OCP scaling in the solver while keeping the UI in physical units.",
+                    &[(1.0, "On"), (0.0, "Off")],
+                    crate::common::ControlSection::Problem,
+                    crate::common::ControlVisibility::Always,
+                    crate::common::ControlSemantic::ProblemParameter,
                 ),
             ],
         ),
@@ -785,6 +820,40 @@ fn runtime_spec(
     }
 }
 
+fn glider_scaling(params: &Params) -> OcpScaling<ModelParams<f64>, State<f64>, Control<f64>> {
+    OcpScaling {
+        objective: GLIDER_OBJECTIVE_SCALE,
+        state: State {
+            x: GLIDER_X_SCALE_M,
+            altitude: GLIDER_ALTITUDE_SCALE_M,
+            vx: params.launch_speed_mps,
+            vy: params.launch_speed_mps,
+        },
+        control: Control {
+            alpha: deg_to_rad(GLIDER_ALPHA_SCALE_DEG),
+        },
+        control_rate: Control {
+            alpha: deg_to_rad(GLIDER_ALPHA_RATE_SCALE_DEG_S),
+        },
+        final_time: GLIDER_FINAL_TIME_SCALE_S,
+        parameters: ModelParams {
+            alpha_rate_weight: 1.0,
+        },
+        path: vec![
+            GLIDER_ALTITUDE_SCALE_M,
+            params.launch_speed_mps,
+            GLIDER_CL_SCALE,
+            deg_to_rad(GLIDER_ALPHA_RATE_SCALE_DEG_S),
+        ],
+        boundary_equalities: vec![
+            GLIDER_X0_SCALE_M,
+            INITIAL_ALTITUDE_M,
+            params.launch_speed_mps.powi(2),
+        ],
+        boundary_inequalities: Vec::new(),
+    }
+}
+
 fn ms_runtime<const N: usize>(
     params: &Params,
 ) -> MultipleShootingRuntimeValues<
@@ -796,7 +865,9 @@ fn ms_runtime<const N: usize>(
     Control<f64>,
     N,
 > {
-    multiple_shooting_runtime_from_spec(runtime_spec(params))
+    let mut runtime = multiple_shooting_runtime_from_spec(runtime_spec(params));
+    runtime.scaling = params.scaling_enabled.then(|| glider_scaling(params));
+    runtime
 }
 
 fn dc_runtime<const N: usize, const K: usize>(
@@ -811,7 +882,9 @@ fn dc_runtime<const N: usize, const K: usize>(
     N,
     K,
 > {
-    direct_collocation_runtime_from_spec(runtime_spec(params))
+    let mut runtime = direct_collocation_runtime_from_spec(runtime_spec(params));
+    runtime.scaling = params.scaling_enabled.then(|| glider_scaling(params));
+    runtime
 }
 fn artifact_summary(
     params: &Params,
@@ -1120,6 +1193,68 @@ fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use approx::assert_abs_diff_eq;
+
+    #[test]
+    fn glider_runtime_scaling_defaults_match_problem_tuning() {
+        let params = Params::default();
+        let runtime = ms_runtime::<2>(&params);
+        let scaling = runtime
+            .scaling
+            .expect("glider scaling should be enabled by default");
+
+        assert_abs_diff_eq!(scaling.objective, GLIDER_OBJECTIVE_SCALE, epsilon = 1e-12);
+        assert_abs_diff_eq!(scaling.state.x, GLIDER_X_SCALE_M, epsilon = 1e-12);
+        assert_abs_diff_eq!(
+            scaling.state.altitude,
+            GLIDER_ALTITUDE_SCALE_M,
+            epsilon = 1e-12
+        );
+        assert_abs_diff_eq!(scaling.state.vx, params.launch_speed_mps, epsilon = 1e-12);
+        assert_abs_diff_eq!(scaling.state.vy, params.launch_speed_mps, epsilon = 1e-12);
+        assert_abs_diff_eq!(
+            scaling.control.alpha,
+            deg_to_rad(GLIDER_ALPHA_SCALE_DEG),
+            epsilon = 1e-12
+        );
+        assert_abs_diff_eq!(
+            scaling.control_rate.alpha,
+            deg_to_rad(GLIDER_ALPHA_RATE_SCALE_DEG_S),
+            epsilon = 1e-12
+        );
+        assert_abs_diff_eq!(
+            scaling.final_time,
+            GLIDER_FINAL_TIME_SCALE_S,
+            epsilon = 1e-12
+        );
+        assert_eq!(
+            scaling.path,
+            vec![
+                GLIDER_ALTITUDE_SCALE_M,
+                params.launch_speed_mps,
+                GLIDER_CL_SCALE,
+                deg_to_rad(GLIDER_ALPHA_RATE_SCALE_DEG_S),
+            ]
+        );
+        assert_eq!(
+            scaling.boundary_equalities,
+            vec![
+                GLIDER_X0_SCALE_M,
+                INITIAL_ALTITUDE_M,
+                params.launch_speed_mps.powi(2),
+            ]
+        );
+        assert!(scaling.boundary_inequalities.is_empty());
+    }
+
+    #[test]
+    fn glider_runtime_scaling_can_be_disabled() {
+        let runtime = ms_runtime::<2>(&Params {
+            scaling_enabled: false,
+            ..Params::default()
+        });
+        assert!(runtime.scaling.is_none());
+    }
 
     #[test]
     fn glider_converges_to_a_reasonable_glide() {
@@ -1274,7 +1409,10 @@ mod tests {
         let compiled = compiled.compiled.borrow();
 
         let mut sqp_options = crate::common::sqp_options(&params.solver);
-        sqp_options.filter_method = false;
+        sqp_options.globalization =
+            optimization::SqpGlobalization::LineSearchMerit(
+                optimization::LineSearchMeritOptions::default(),
+            );
         sqp_options.verbose = false;
         sqp_options.max_iters = 4;
         let mut sqp_iterations = Vec::new();
