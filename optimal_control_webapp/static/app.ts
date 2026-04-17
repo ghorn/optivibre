@@ -47,13 +47,38 @@ const CONTROL_SEMANTIC = Object.freeze({
   collocationFamily: 2,
   collocationDegree: 3,
   solverMethod: 4,
-  solverMaxIterations: 5,
-  solverHessianRegularization: 6,
-  solverDualTolerance: 7,
-  solverConstraintTolerance: 8,
-  solverComplementarityTolerance: 9,
-  sxFunctionOption: 10,
-  problemParameter: 11,
+  solverGlobalization: 5,
+  solverMaxIterations: 6,
+  solverHessianRegularization: 7,
+  solverDualTolerance: 8,
+  solverConstraintTolerance: 9,
+  solverComplementarityTolerance: 10,
+  solverExactMeritPenalty: 11,
+  solverPenaltyIncreaseFactor: 12,
+  solverMaxPenaltyUpdates: 13,
+  solverArmijoC1: 14,
+  solverWolfeC2: 15,
+  solverLineSearchBeta: 16,
+  solverLineSearchMaxSteps: 17,
+  solverMinStep: 18,
+  solverFilterGammaObjective: 19,
+  solverFilterGammaViolation: 20,
+  solverFilterThetaMaxFactor: 21,
+  solverFilterSwitchingReferenceMin: 22,
+  solverFilterSwitchingViolationFactor: 23,
+  solverFilterSwitchingLinearizedReductionFactor: 24,
+  solverTrustRegionInitialRadius: 25,
+  solverTrustRegionMaxRadius: 26,
+  solverTrustRegionMinRadius: 27,
+  solverTrustRegionShrinkFactor: 28,
+  solverTrustRegionGrowFactor: 29,
+  solverTrustRegionAcceptRatio: 30,
+  solverTrustRegionExpandRatio: 31,
+  solverTrustRegionBoundaryFraction: 32,
+  solverTrustRegionMaxContractions: 33,
+  solverTrustRegionFixedPenalty: 34,
+  sxFunctionOption: 35,
+  problemParameter: 36,
 } as const);
 const CONTROL_SEMANTIC_FROM_WIRE = Object.freeze({
   transcription_method: CONTROL_SEMANTIC.transcriptionMethod,
@@ -61,11 +86,38 @@ const CONTROL_SEMANTIC_FROM_WIRE = Object.freeze({
   collocation_family: CONTROL_SEMANTIC.collocationFamily,
   collocation_degree: CONTROL_SEMANTIC.collocationDegree,
   solver_method: CONTROL_SEMANTIC.solverMethod,
+  solver_globalization: CONTROL_SEMANTIC.solverGlobalization,
   solver_max_iterations: CONTROL_SEMANTIC.solverMaxIterations,
   solver_hessian_regularization: CONTROL_SEMANTIC.solverHessianRegularization,
   solver_dual_tolerance: CONTROL_SEMANTIC.solverDualTolerance,
   solver_constraint_tolerance: CONTROL_SEMANTIC.solverConstraintTolerance,
   solver_complementarity_tolerance: CONTROL_SEMANTIC.solverComplementarityTolerance,
+  solver_exact_merit_penalty: CONTROL_SEMANTIC.solverExactMeritPenalty,
+  solver_penalty_increase_factor: CONTROL_SEMANTIC.solverPenaltyIncreaseFactor,
+  solver_max_penalty_updates: CONTROL_SEMANTIC.solverMaxPenaltyUpdates,
+  solver_armijo_c1: CONTROL_SEMANTIC.solverArmijoC1,
+  solver_wolfe_c2: CONTROL_SEMANTIC.solverWolfeC2,
+  solver_line_search_beta: CONTROL_SEMANTIC.solverLineSearchBeta,
+  solver_line_search_max_steps: CONTROL_SEMANTIC.solverLineSearchMaxSteps,
+  solver_min_step: CONTROL_SEMANTIC.solverMinStep,
+  solver_filter_gamma_objective: CONTROL_SEMANTIC.solverFilterGammaObjective,
+  solver_filter_gamma_violation: CONTROL_SEMANTIC.solverFilterGammaViolation,
+  solver_filter_theta_max_factor: CONTROL_SEMANTIC.solverFilterThetaMaxFactor,
+  solver_filter_switching_reference_min: CONTROL_SEMANTIC.solverFilterSwitchingReferenceMin,
+  solver_filter_switching_violation_factor:
+    CONTROL_SEMANTIC.solverFilterSwitchingViolationFactor,
+  solver_filter_switching_linearized_reduction_factor:
+    CONTROL_SEMANTIC.solverFilterSwitchingLinearizedReductionFactor,
+  solver_trust_region_initial_radius: CONTROL_SEMANTIC.solverTrustRegionInitialRadius,
+  solver_trust_region_max_radius: CONTROL_SEMANTIC.solverTrustRegionMaxRadius,
+  solver_trust_region_min_radius: CONTROL_SEMANTIC.solverTrustRegionMinRadius,
+  solver_trust_region_shrink_factor: CONTROL_SEMANTIC.solverTrustRegionShrinkFactor,
+  solver_trust_region_grow_factor: CONTROL_SEMANTIC.solverTrustRegionGrowFactor,
+  solver_trust_region_accept_ratio: CONTROL_SEMANTIC.solverTrustRegionAcceptRatio,
+  solver_trust_region_expand_ratio: CONTROL_SEMANTIC.solverTrustRegionExpandRatio,
+  solver_trust_region_boundary_fraction: CONTROL_SEMANTIC.solverTrustRegionBoundaryFraction,
+  solver_trust_region_max_contractions: CONTROL_SEMANTIC.solverTrustRegionMaxContractions,
+  solver_trust_region_fixed_penalty: CONTROL_SEMANTIC.solverTrustRegionFixedPenalty,
   sx_function_option: CONTROL_SEMANTIC.sxFunctionOption,
   problem_parameter: CONTROL_SEMANTIC.problemParameter,
 } as const);
@@ -246,6 +298,12 @@ const SOLVER_METHOD_FROM_WIRE = Object.freeze({
   sqp: SOLVER_METHOD.sqp,
   nlip: SOLVER_METHOD.nlip,
   ipopt: SOLVER_METHOD.ipopt,
+} as const);
+const SQP_GLOBALIZATION = Object.freeze({
+  lineSearchFilter: 0,
+  lineSearchMerit: 1,
+  trustRegionFilter: 2,
+  trustRegionMerit: 3,
 } as const);
 const SOLVE_STAGE = Object.freeze({
   symbolicSetup: 0,
@@ -2324,6 +2382,36 @@ function currentSolverMethodValue(): number {
   return currentSharedControlValue(CONTROL_SEMANTIC.solverMethod, SOLVER_METHOD.sqp);
 }
 
+function currentSqpGlobalizationValue(): number {
+  return currentSharedControlValue(
+    CONTROL_SEMANTIC.solverGlobalization,
+    SQP_GLOBALIZATION.lineSearchFilter,
+  );
+}
+
+function isLineSearchGlobalizationSelected(): boolean {
+  const value = currentSqpGlobalizationValue();
+  return value === SQP_GLOBALIZATION.lineSearchFilter || value === SQP_GLOBALIZATION.lineSearchMerit;
+}
+
+function isFilterGlobalizationSelected(): boolean {
+  const value = currentSqpGlobalizationValue();
+  return value === SQP_GLOBALIZATION.lineSearchFilter || value === SQP_GLOBALIZATION.trustRegionFilter;
+}
+
+function isTrustRegionGlobalizationSelected(): boolean {
+  const value = currentSqpGlobalizationValue();
+  return value === SQP_GLOBALIZATION.trustRegionFilter || value === SQP_GLOBALIZATION.trustRegionMerit;
+}
+
+function isTrustRegionMeritSelected(): boolean {
+  return currentSqpGlobalizationValue() === SQP_GLOBALIZATION.trustRegionMerit;
+}
+
+function isLineSearchMeritSelected(): boolean {
+  return currentSqpGlobalizationValue() === SQP_GLOBALIZATION.lineSearchMerit;
+}
+
 function isStructuralControl(control: ControlSpec): boolean {
   switch (control.semantic) {
     case CONTROL_SEMANTIC.transcriptionMethod:
@@ -2417,6 +2505,7 @@ function handleControlUpdate(control: ControlSpec): void {
   if (
     control.semantic === CONTROL_SEMANTIC.transcriptionMethod
     || control.semantic === CONTROL_SEMANTIC.solverMethod
+    || control.semantic === CONTROL_SEMANTIC.solverGlobalization
   ) {
     renderControls();
   }
@@ -2427,8 +2516,83 @@ function handleControlUpdate(control: ControlSpec): void {
 }
 
 function isControlVisible(control: ControlSpec): boolean {
-  if (control.semantic === CONTROL_SEMANTIC.solverHessianRegularization) {
+  if (
+    control.semantic === CONTROL_SEMANTIC.solverHessianRegularization
+    || control.semantic === CONTROL_SEMANTIC.solverGlobalization
+  ) {
     return currentSolverMethodValue() === SOLVER_METHOD.sqp;
+  }
+  if (
+    control.semantic === CONTROL_SEMANTIC.solverExactMeritPenalty
+    || control.semantic === CONTROL_SEMANTIC.solverTrustRegionFixedPenalty
+    || control.semantic === CONTROL_SEMANTIC.solverPenaltyIncreaseFactor
+    || control.semantic === CONTROL_SEMANTIC.solverMaxPenaltyUpdates
+    || control.semantic === CONTROL_SEMANTIC.solverArmijoC1
+    || control.semantic === CONTROL_SEMANTIC.solverWolfeC2
+    || control.semantic === CONTROL_SEMANTIC.solverLineSearchBeta
+    || control.semantic === CONTROL_SEMANTIC.solverLineSearchMaxSteps
+    || control.semantic === CONTROL_SEMANTIC.solverMinStep
+    || control.semantic === CONTROL_SEMANTIC.solverFilterGammaObjective
+    || control.semantic === CONTROL_SEMANTIC.solverFilterGammaViolation
+    || control.semantic === CONTROL_SEMANTIC.solverFilterThetaMaxFactor
+    || control.semantic === CONTROL_SEMANTIC.solverFilterSwitchingReferenceMin
+    || control.semantic === CONTROL_SEMANTIC.solverFilterSwitchingViolationFactor
+    || control.semantic === CONTROL_SEMANTIC.solverFilterSwitchingLinearizedReductionFactor
+    || control.semantic === CONTROL_SEMANTIC.solverTrustRegionInitialRadius
+    || control.semantic === CONTROL_SEMANTIC.solverTrustRegionMaxRadius
+    || control.semantic === CONTROL_SEMANTIC.solverTrustRegionMinRadius
+    || control.semantic === CONTROL_SEMANTIC.solverTrustRegionShrinkFactor
+    || control.semantic === CONTROL_SEMANTIC.solverTrustRegionGrowFactor
+    || control.semantic === CONTROL_SEMANTIC.solverTrustRegionAcceptRatio
+    || control.semantic === CONTROL_SEMANTIC.solverTrustRegionExpandRatio
+    || control.semantic === CONTROL_SEMANTIC.solverTrustRegionBoundaryFraction
+    || control.semantic === CONTROL_SEMANTIC.solverTrustRegionMaxContractions
+  ) {
+    if (currentSolverMethodValue() !== SOLVER_METHOD.sqp) {
+      return false;
+    }
+    if (
+      control.semantic === CONTROL_SEMANTIC.solverPenaltyIncreaseFactor
+      || control.semantic === CONTROL_SEMANTIC.solverMaxPenaltyUpdates
+    ) {
+      return isLineSearchMeritSelected();
+    }
+    if (
+      control.semantic === CONTROL_SEMANTIC.solverArmijoC1
+      || control.semantic === CONTROL_SEMANTIC.solverWolfeC2
+      || control.semantic === CONTROL_SEMANTIC.solverLineSearchBeta
+      || control.semantic === CONTROL_SEMANTIC.solverLineSearchMaxSteps
+      || control.semantic === CONTROL_SEMANTIC.solverMinStep
+    ) {
+      return isLineSearchGlobalizationSelected();
+    }
+    if (
+      control.semantic === CONTROL_SEMANTIC.solverFilterGammaObjective
+      || control.semantic === CONTROL_SEMANTIC.solverFilterGammaViolation
+      || control.semantic === CONTROL_SEMANTIC.solverFilterThetaMaxFactor
+      || control.semantic === CONTROL_SEMANTIC.solverFilterSwitchingReferenceMin
+      || control.semantic === CONTROL_SEMANTIC.solverFilterSwitchingViolationFactor
+      || control.semantic === CONTROL_SEMANTIC.solverFilterSwitchingLinearizedReductionFactor
+    ) {
+      return isFilterGlobalizationSelected();
+    }
+    if (
+      control.semantic === CONTROL_SEMANTIC.solverTrustRegionInitialRadius
+      || control.semantic === CONTROL_SEMANTIC.solverTrustRegionMaxRadius
+      || control.semantic === CONTROL_SEMANTIC.solverTrustRegionMinRadius
+      || control.semantic === CONTROL_SEMANTIC.solverTrustRegionShrinkFactor
+      || control.semantic === CONTROL_SEMANTIC.solverTrustRegionGrowFactor
+      || control.semantic === CONTROL_SEMANTIC.solverTrustRegionAcceptRatio
+      || control.semantic === CONTROL_SEMANTIC.solverTrustRegionExpandRatio
+      || control.semantic === CONTROL_SEMANTIC.solverTrustRegionBoundaryFraction
+      || control.semantic === CONTROL_SEMANTIC.solverTrustRegionMaxContractions
+    ) {
+      return isTrustRegionGlobalizationSelected();
+    }
+    if (control.semantic === CONTROL_SEMANTIC.solverTrustRegionFixedPenalty) {
+      return isTrustRegionMeritSelected();
+    }
+    return true;
   }
   switch (control.visibility) {
     case CONTROL_VISIBILITY.directCollocationOnly:

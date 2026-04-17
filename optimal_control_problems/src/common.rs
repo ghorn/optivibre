@@ -26,10 +26,12 @@ use optimization::{
     ClarabelSqpOptions, ClarabelSqpProfiling, ClarabelSqpSummary, ConstraintSatisfaction,
     FilterAcceptanceMode, FiniteDifferenceValidationOptions, FunctionCompileOptions,
     InteriorPointIterationSnapshot, InteriorPointOptions, InteriorPointProfiling,
-    InteriorPointSolveError, InteriorPointSummary, LlvmOptimizationLevel, NlpCompileStats,
-    NlpDerivativeValidationReport, NlpEvaluationBenchmark, NlpEvaluationBenchmarkOptions,
-    NlpEvaluationKernelKind, SqpIterationEvent, SqpIterationPhase, SqpIterationSnapshot,
-    SymbolicSetupProfile, ValidationTolerances, Vectorize,
+    InteriorPointSolveError, InteriorPointSummary, LineSearchFilterOptions, LineSearchMeritOptions,
+    LlvmOptimizationLevel, NlpCompileStats, NlpDerivativeValidationReport, NlpEvaluationBenchmark,
+    NlpEvaluationBenchmarkOptions, NlpEvaluationKernelKind, SqpFilterOptions, SqpGlobalization,
+    SqpIterationEvent, SqpIterationPhase, SqpIterationSnapshot, SqpLineSearchOptions,
+    SqpTrustRegionOptions, SymbolicSetupProfile, TrustRegionFilterOptions, TrustRegionMeritOptions,
+    ValidationTolerances, Vectorize,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptOptions, IpoptRawStatus, IpoptSummary};
@@ -85,11 +87,36 @@ pub enum ControlSemantic {
     CollocationFamily,
     CollocationDegree,
     SolverMethod,
+    SolverGlobalization,
     SolverMaxIterations,
     SolverHessianRegularization,
     SolverDualTolerance,
     SolverConstraintTolerance,
     SolverComplementarityTolerance,
+    SolverExactMeritPenalty,
+    SolverPenaltyIncreaseFactor,
+    SolverMaxPenaltyUpdates,
+    SolverArmijoC1,
+    SolverWolfeC2,
+    SolverLineSearchBeta,
+    SolverLineSearchMaxSteps,
+    SolverMinStep,
+    SolverFilterGammaObjective,
+    SolverFilterGammaViolation,
+    SolverFilterThetaMaxFactor,
+    SolverFilterSwitchingReferenceMin,
+    SolverFilterSwitchingViolationFactor,
+    SolverFilterSwitchingLinearizedReductionFactor,
+    SolverTrustRegionInitialRadius,
+    SolverTrustRegionMaxRadius,
+    SolverTrustRegionMinRadius,
+    SolverTrustRegionShrinkFactor,
+    SolverTrustRegionGrowFactor,
+    SolverTrustRegionAcceptRatio,
+    SolverTrustRegionExpandRatio,
+    SolverTrustRegionBoundaryFraction,
+    SolverTrustRegionMaxContractions,
+    SolverTrustRegionFixedPenalty,
     SxFunctionOption,
     #[default]
     ProblemParameter,
@@ -685,6 +712,19 @@ fn fmt_diag_opt_bool(value: Option<bool>) -> &'static str {
     }
 }
 
+fn fmt_diag_opt_qp_status(value: Option<optimization::SqpQpStatus>) -> &'static str {
+    match value {
+        Some(optimization::SqpQpStatus::Solved) => "Solved",
+        Some(optimization::SqpQpStatus::ReducedAccuracy) => "ReducedAccuracy",
+        Some(optimization::SqpQpStatus::Failed) => "Failed",
+        None => "--",
+    }
+}
+
+fn fmt_diag_opt_qp_raw_status(value: Option<&optimization::SqpQpRawStatus>) -> String {
+    value.map_or_else(|| "--".to_string(), |status| status.to_string())
+}
+
 fn fmt_sqp_phase(phase: SqpIterationPhase) -> &'static str {
     match phase {
         SqpIterationPhase::Initial => "initial",
@@ -715,6 +755,15 @@ fn fmt_sqp_step_kind(kind: Option<optimization::SqpStepKind>) -> &'static str {
         Some(optimization::SqpStepKind::Feasibility) => "h-step",
         Some(optimization::SqpStepKind::Restoration) => "restoration",
         None => "--",
+    }
+}
+
+fn fmt_sqp_globalization(kind: optimization::SqpGlobalizationKind) -> &'static str {
+    match kind {
+        optimization::SqpGlobalizationKind::LineSearchMerit => "ls_merit",
+        optimization::SqpGlobalizationKind::LineSearchFilter => "ls_filter",
+        optimization::SqpGlobalizationKind::TrustRegionMerit => "tr_merit",
+        optimization::SqpGlobalizationKind::TrustRegionFilter => "tr_filter",
     }
 }
 
@@ -879,9 +928,10 @@ fn append_sqp_snapshot_lines(
 ) {
     lines.push(format!("{heading}:"));
     lines.push(format!(
-        "  iter={} phase={} obj={} eq_inf={} ineq_inf={} dual_inf={} comp_inf={} step_inf={} penalty={}",
+        "  iter={} phase={} globalization={} obj={} eq_inf={} ineq_inf={} dual_inf={} comp_inf={} step_inf={} penalty={}",
         snapshot.iteration,
         fmt_sqp_phase(snapshot.phase),
+        fmt_sqp_globalization(snapshot.globalization),
         fmt_diag_sci(snapshot.objective),
         fmt_diag_opt_sci(snapshot.eq_inf),
         fmt_diag_opt_sci(snapshot.ineq_inf),
@@ -919,6 +969,24 @@ fn append_sqp_snapshot_lines(
             line_search.elastic_recovery_attempted,
         ));
     }
+    if let Some(trust_region) = &snapshot.trust_region {
+        lines.push(format!(
+            "  trust_region radius={} attempted_radius={} contractions={} qp_retries={} step_norm={} boundary={} ared={} pred={} rho={} step_kind={} filter_mode={} restoration_attempted={} elastic_attempted={}",
+            fmt_diag_sci(trust_region.radius),
+            fmt_diag_sci(trust_region.attempted_radius),
+            trust_region.contraction_count,
+            trust_region.qp_failure_retries,
+            fmt_diag_sci(trust_region.step_norm),
+            trust_region.boundary_active,
+            fmt_diag_sci(trust_region.actual_reduction),
+            fmt_diag_sci(trust_region.predicted_reduction),
+            fmt_diag_opt_sci(trust_region.ratio),
+            fmt_sqp_step_kind(trust_region.step_kind),
+            fmt_filter_mode(trust_region.filter_acceptance_mode),
+            trust_region.restoration_attempted,
+            trust_region.elastic_recovery_attempted,
+        ));
+    }
     if let Some(diagnostics) = &snapshot.step_diagnostics {
         append_sqp_step_diagnostics_lines(lines, diagnostics);
     }
@@ -930,6 +998,50 @@ fn append_sqp_snapshot_lines(
             qp.iteration_count,
             fmt_diag_sci(qp.solve_time.as_secs_f64()),
             fmt_diag_sci(qp.setup_time.as_secs_f64()),
+        ));
+    }
+}
+
+fn append_sqp_trust_region_failure_lines(
+    lines: &mut Vec<String>,
+    info: &optimization::SqpTrustRegionInfo,
+) {
+    lines.push("trust region failure:".to_string());
+    lines.push(format!(
+        "  radius={} attempted_radius={} contractions={} qp_retries={} step_norm={} boundary={} ared={} pred={} rho={} step_kind={} filter_mode={} restoration_attempted={} elastic_attempted={}",
+        fmt_diag_sci(info.radius),
+        fmt_diag_sci(info.attempted_radius),
+        info.contraction_count,
+        info.qp_failure_retries,
+        fmt_diag_sci(info.step_norm),
+        info.boundary_active,
+        fmt_diag_sci(info.actual_reduction),
+        fmt_diag_sci(info.predicted_reduction),
+        fmt_diag_opt_sci(info.ratio),
+        fmt_sqp_step_kind(info.step_kind),
+        fmt_filter_mode(info.filter_acceptance_mode),
+        info.restoration_attempted,
+        info.elastic_recovery_attempted,
+    ));
+    for trial in &info.rejected_trials {
+        lines.push(format!(
+            "  reject radius={} step_norm={} boundary={} ared={} pred={} rho={} filter_ok={} filter_dom={} theta_ok={} switching={} filter_obj={} filter_violation={} qp_status={} qp_raw={} restoration={} elastic_attempted={}",
+            fmt_diag_sci(trial.radius),
+            fmt_diag_sci(trial.step_norm),
+            trial.boundary_active,
+            fmt_diag_sci(trial.actual_reduction),
+            fmt_diag_sci(trial.predicted_reduction),
+            fmt_diag_opt_sci(trial.ratio),
+            fmt_diag_opt_bool(trial.filter_acceptable),
+            fmt_diag_opt_bool(trial.filter_dominated),
+            fmt_diag_opt_bool(trial.filter_theta_acceptable),
+            fmt_diag_opt_bool(trial.switching_condition_satisfied),
+            fmt_diag_opt_bool(trial.filter_sufficient_objective_reduction),
+            fmt_diag_opt_bool(trial.filter_sufficient_violation_reduction),
+            fmt_diag_opt_qp_status(trial.qp_status),
+            fmt_diag_opt_qp_raw_status(trial.qp_raw_status.as_ref()),
+            trial.restoration_phase,
+            trial.elastic_recovery_attempted,
         ));
     }
 }
@@ -1045,6 +1157,9 @@ fn sqp_failure_diagnostic_lines(error: &ClarabelSqpError) -> Vec<String> {
     }
     if let Some(info) = &context.failed_line_search {
         append_sqp_line_search_failure_lines(&mut lines, error, info);
+    }
+    if let Some(info) = &context.failed_trust_region {
+        append_sqp_trust_region_failure_lines(&mut lines, info);
     }
     if let Some(qp_failure) = &context.qp_failure {
         lines.push("qp failure:".to_string());
@@ -1258,6 +1373,72 @@ pub struct SqpConfig {
     pub dual_tol: f64,
     pub constraint_tol: f64,
     pub complementarity_tol: f64,
+    pub globalization: SqpGlobalizationConfig,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SqpGlobalizationMode {
+    LineSearchFilter,
+    LineSearchMerit,
+    TrustRegionFilter,
+    TrustRegionMerit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SqpLineSearchConfig {
+    pub armijo_c1: f64,
+    pub wolfe_c2: Option<f64>,
+    pub beta: f64,
+    pub max_steps: usize,
+    pub min_step: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SqpFilterConfig {
+    pub gamma_objective: f64,
+    pub gamma_violation: f64,
+    pub theta_max_factor: f64,
+    pub switching_reference_min: f64,
+    pub switching_violation_factor: f64,
+    pub switching_linearized_reduction_factor: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SqpTrustRegionConfig {
+    pub initial_radius: f64,
+    pub max_radius: f64,
+    pub min_radius: f64,
+    pub shrink_factor: f64,
+    pub grow_factor: f64,
+    pub accept_ratio: f64,
+    pub expand_ratio: f64,
+    pub boundary_fraction: f64,
+    pub max_radius_contractions: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SqpGlobalizationConfig {
+    LineSearchFilter {
+        line_search: SqpLineSearchConfig,
+        filter: SqpFilterConfig,
+        exact_merit_penalty: f64,
+    },
+    LineSearchMerit {
+        line_search: SqpLineSearchConfig,
+        exact_merit_penalty: f64,
+        penalty_increase_factor: f64,
+        max_penalty_updates: usize,
+    },
+    TrustRegionFilter {
+        trust_region: SqpTrustRegionConfig,
+        filter: SqpFilterConfig,
+        exact_merit_penalty: f64,
+    },
+    TrustRegionMerit {
+        trust_region: SqpTrustRegionConfig,
+        exact_merit_penalty: f64,
+        fixed_penalty: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -1805,11 +1986,36 @@ enum SharedControlId {
     SxFunctionBoundaryInequalities,
     SxFunctionMultipleShootingIntegrator,
     SolverMethod,
+    SolverGlobalization,
     SolverMaxIterations,
     SolverHessianRegularization,
     SolverDualTolerance,
     SolverConstraintTolerance,
     SolverComplementarityTolerance,
+    SolverExactMeritPenalty,
+    SolverPenaltyIncreaseFactor,
+    SolverMaxPenaltyUpdates,
+    SolverArmijoC1,
+    SolverWolfeC2,
+    SolverLineSearchBeta,
+    SolverLineSearchMaxSteps,
+    SolverMinStep,
+    SolverFilterGammaObjective,
+    SolverFilterGammaViolation,
+    SolverFilterThetaMaxFactor,
+    SolverFilterSwitchingReferenceMin,
+    SolverFilterSwitchingViolationFactor,
+    SolverFilterSwitchingLinearizedReductionFactor,
+    SolverTrustRegionInitialRadius,
+    SolverTrustRegionMaxRadius,
+    SolverTrustRegionMinRadius,
+    SolverTrustRegionShrinkFactor,
+    SolverTrustRegionGrowFactor,
+    SolverTrustRegionAcceptRatio,
+    SolverTrustRegionExpandRatio,
+    SolverTrustRegionBoundaryFraction,
+    SolverTrustRegionMaxContractions,
+    SolverTrustRegionFixedPenalty,
 }
 
 impl SharedControlId {
@@ -1830,11 +2036,40 @@ impl SharedControlId {
             Self::SxFunctionBoundaryInequalities => "sxf_boundary_inequalities",
             Self::SxFunctionMultipleShootingIntegrator => "sxf_multiple_shooting_integrator",
             Self::SolverMethod => "solver_method",
+            Self::SolverGlobalization => "solver_globalization",
             Self::SolverMaxIterations => "solver_max_iters",
             Self::SolverHessianRegularization => "solver_hessian_regularization",
             Self::SolverDualTolerance => "solver_dual_tol",
             Self::SolverConstraintTolerance => "solver_constraint_tol",
             Self::SolverComplementarityTolerance => "solver_complementarity_tol",
+            Self::SolverExactMeritPenalty => "solver_exact_merit_penalty",
+            Self::SolverPenaltyIncreaseFactor => "solver_penalty_increase_factor",
+            Self::SolverMaxPenaltyUpdates => "solver_max_penalty_updates",
+            Self::SolverArmijoC1 => "solver_armijo_c1",
+            Self::SolverWolfeC2 => "solver_wolfe_c2",
+            Self::SolverLineSearchBeta => "solver_line_search_beta",
+            Self::SolverLineSearchMaxSteps => "solver_line_search_max_steps",
+            Self::SolverMinStep => "solver_min_step",
+            Self::SolverFilterGammaObjective => "solver_filter_gamma_objective",
+            Self::SolverFilterGammaViolation => "solver_filter_gamma_violation",
+            Self::SolverFilterThetaMaxFactor => "solver_filter_theta_max_factor",
+            Self::SolverFilterSwitchingReferenceMin => "solver_filter_switching_reference_min",
+            Self::SolverFilterSwitchingViolationFactor => {
+                "solver_filter_switching_violation_factor"
+            }
+            Self::SolverFilterSwitchingLinearizedReductionFactor => {
+                "solver_filter_switching_linearized_reduction_factor"
+            }
+            Self::SolverTrustRegionInitialRadius => "solver_trust_region_initial_radius",
+            Self::SolverTrustRegionMaxRadius => "solver_trust_region_max_radius",
+            Self::SolverTrustRegionMinRadius => "solver_trust_region_min_radius",
+            Self::SolverTrustRegionShrinkFactor => "solver_trust_region_shrink_factor",
+            Self::SolverTrustRegionGrowFactor => "solver_trust_region_grow_factor",
+            Self::SolverTrustRegionAcceptRatio => "solver_trust_region_accept_ratio",
+            Self::SolverTrustRegionExpandRatio => "solver_trust_region_expand_ratio",
+            Self::SolverTrustRegionBoundaryFraction => "solver_trust_region_boundary_fraction",
+            Self::SolverTrustRegionMaxContractions => "solver_trust_region_max_contractions",
+            Self::SolverTrustRegionFixedPenalty => "solver_trust_region_fixed_penalty",
         }
     }
 }
@@ -3091,6 +3326,41 @@ pub fn default_transcription(intervals: usize) -> TranscriptionConfig {
     }
 }
 
+pub fn default_sqp_line_search_config() -> SqpLineSearchConfig {
+    SqpLineSearchConfig {
+        armijo_c1: 1.0e-4,
+        wolfe_c2: None,
+        beta: 5.0e-1,
+        max_steps: 32,
+        min_step: 1.0e-8,
+    }
+}
+
+pub fn default_sqp_filter_config() -> SqpFilterConfig {
+    SqpFilterConfig {
+        gamma_objective: 1.0e-4,
+        gamma_violation: 1.0e-4,
+        theta_max_factor: 1.0e3,
+        switching_reference_min: 1.0e-3,
+        switching_violation_factor: 10.0,
+        switching_linearized_reduction_factor: 5.0e-1,
+    }
+}
+
+pub fn default_sqp_trust_region_config() -> SqpTrustRegionConfig {
+    SqpTrustRegionConfig {
+        initial_radius: 1.0,
+        max_radius: 100.0,
+        min_radius: 1.0e-8,
+        shrink_factor: 2.5e-1,
+        grow_factor: 2.0,
+        accept_ratio: 1.0e-1,
+        expand_ratio: 7.5e-1,
+        boundary_fraction: 8.0e-1,
+        max_radius_contractions: 8,
+    }
+}
+
 pub fn default_sqp_config() -> SqpConfig {
     SqpConfig {
         max_iters: 200,
@@ -3098,11 +3368,106 @@ pub fn default_sqp_config() -> SqpConfig {
         dual_tol: 1.0e-6,
         constraint_tol: 1.0e-8,
         complementarity_tol: 1.0e-6,
+        globalization: SqpGlobalizationConfig::TrustRegionFilter {
+            trust_region: default_sqp_trust_region_config(),
+            filter: default_sqp_filter_config(),
+            exact_merit_penalty: 10.0,
+        },
     }
 }
 
 pub fn default_solver_method() -> SolverMethod {
     SolverMethod::Sqp
+}
+
+fn sqp_globalization_mode(config: &SqpConfig) -> SqpGlobalizationMode {
+    match config.globalization {
+        SqpGlobalizationConfig::LineSearchFilter { .. } => SqpGlobalizationMode::LineSearchFilter,
+        SqpGlobalizationConfig::LineSearchMerit { .. } => SqpGlobalizationMode::LineSearchMerit,
+        SqpGlobalizationConfig::TrustRegionFilter { .. } => SqpGlobalizationMode::TrustRegionFilter,
+        SqpGlobalizationConfig::TrustRegionMerit { .. } => SqpGlobalizationMode::TrustRegionMerit,
+    }
+}
+
+fn sqp_globalization_mode_value(mode: SqpGlobalizationMode) -> f64 {
+    match mode {
+        SqpGlobalizationMode::LineSearchFilter => 0.0,
+        SqpGlobalizationMode::LineSearchMerit => 1.0,
+        SqpGlobalizationMode::TrustRegionFilter => 2.0,
+        SqpGlobalizationMode::TrustRegionMerit => 3.0,
+    }
+}
+
+fn config_line_search(config: &SqpConfig) -> SqpLineSearchConfig {
+    match config.globalization {
+        SqpGlobalizationConfig::LineSearchFilter { line_search, .. }
+        | SqpGlobalizationConfig::LineSearchMerit { line_search, .. } => line_search,
+        _ => default_sqp_line_search_config(),
+    }
+}
+
+fn config_filter(config: &SqpConfig) -> SqpFilterConfig {
+    match config.globalization {
+        SqpGlobalizationConfig::LineSearchFilter { filter, .. }
+        | SqpGlobalizationConfig::TrustRegionFilter { filter, .. } => filter,
+        _ => default_sqp_filter_config(),
+    }
+}
+
+fn config_trust_region(config: &SqpConfig) -> SqpTrustRegionConfig {
+    match config.globalization {
+        SqpGlobalizationConfig::TrustRegionFilter { trust_region, .. }
+        | SqpGlobalizationConfig::TrustRegionMerit { trust_region, .. } => trust_region,
+        _ => default_sqp_trust_region_config(),
+    }
+}
+
+fn config_exact_merit_penalty(config: &SqpConfig) -> f64 {
+    match config.globalization {
+        SqpGlobalizationConfig::LineSearchFilter {
+            exact_merit_penalty,
+            ..
+        }
+        | SqpGlobalizationConfig::LineSearchMerit {
+            exact_merit_penalty,
+            ..
+        }
+        | SqpGlobalizationConfig::TrustRegionFilter {
+            exact_merit_penalty,
+            ..
+        }
+        | SqpGlobalizationConfig::TrustRegionMerit {
+            exact_merit_penalty,
+            ..
+        } => exact_merit_penalty,
+    }
+}
+
+fn config_penalty_increase_factor(config: &SqpConfig) -> f64 {
+    match config.globalization {
+        SqpGlobalizationConfig::LineSearchMerit {
+            penalty_increase_factor,
+            ..
+        } => penalty_increase_factor,
+        _ => LineSearchMeritOptions::default().penalty_increase_factor,
+    }
+}
+
+fn config_max_penalty_updates(config: &SqpConfig) -> usize {
+    match config.globalization {
+        SqpGlobalizationConfig::LineSearchMerit {
+            max_penalty_updates,
+            ..
+        } => max_penalty_updates,
+        _ => LineSearchMeritOptions::default().max_penalty_updates,
+    }
+}
+
+fn config_trust_region_fixed_penalty(config: &SqpConfig) -> bool {
+    match config.globalization {
+        SqpGlobalizationConfig::TrustRegionMerit { fixed_penalty, .. } => fixed_penalty,
+        _ => TrustRegionMeritOptions::default().fixed_penalty,
+    }
 }
 
 pub const fn interactive_multiple_shooting_opt_level() -> LlvmOptimizationLevel {
@@ -3457,6 +3822,14 @@ pub fn transcription_controls(
 }
 
 pub fn solver_controls(default_method: SolverMethod, default: SqpConfig) -> Vec<ControlSpec> {
+    let default_line_search = config_line_search(&default);
+    let default_filter = config_filter(&default);
+    let default_trust_region = config_trust_region(&default);
+    let default_globalization = sqp_globalization_mode(&default);
+    let default_exact_merit_penalty = config_exact_merit_penalty(&default);
+    let default_penalty_increase_factor = config_penalty_increase_factor(&default);
+    let default_max_penalty_updates = config_max_penalty_updates(&default);
+    let default_fixed_penalty = config_trust_region_fixed_penalty(&default);
     vec![
         select_control(
             SharedControlId::SolverMethod.id(),
@@ -3473,6 +3846,17 @@ pub fn solver_controls(default_method: SolverMethod, default: SqpConfig) -> Vec<
             ControlSection::Solver,
             ControlVisibility::Always,
             ControlSemantic::SolverMethod,
+        ),
+        select_control(
+            SharedControlId::SolverGlobalization.id(),
+            "SQP Globalization",
+            sqp_globalization_mode_value(default_globalization),
+            "",
+            "Choose the SQP globalization strategy and acceptance model.",
+            &solver_globalization_choices(),
+            ControlSection::Solver,
+            ControlVisibility::Always,
+            ControlSemantic::SolverGlobalization,
         ),
         text_control(
             SharedControlId::SolverMaxIterations.id(),
@@ -3525,6 +3909,224 @@ pub fn solver_controls(default_method: SolverMethod, default: SqpConfig) -> Vec<
             ControlSemantic::SolverComplementarityTolerance,
             ControlValueDisplay::Scientific,
         ),
+        text_control(
+            SharedControlId::SolverExactMeritPenalty.id(),
+            "Exact Merit Penalty",
+            default_exact_merit_penalty,
+            "",
+            "Exact-penalty weight used in merit globalization and trust-region model quality.",
+            ControlSemantic::SolverExactMeritPenalty,
+            ControlValueDisplay::Scientific,
+        ),
+        text_control(
+            SharedControlId::SolverArmijoC1.id(),
+            "Armijo c1",
+            default_line_search.armijo_c1,
+            "",
+            "Armijo sufficient-decrease coefficient for line-search globalization.",
+            ControlSemantic::SolverArmijoC1,
+            ControlValueDisplay::Scientific,
+        ),
+        text_control(
+            SharedControlId::SolverWolfeC2.id(),
+            "Wolfe c2 (Adv)",
+            default_line_search.wolfe_c2.unwrap_or(0.9),
+            "",
+            "Wolfe curvature coefficient for line-search globalization. Positive values enable Wolfe; non-positive disables it.",
+            ControlSemantic::SolverWolfeC2,
+            ControlValueDisplay::Scientific,
+        ),
+        text_control(
+            SharedControlId::SolverLineSearchBeta.id(),
+            "LS Backtrack Beta",
+            default_line_search.beta,
+            "",
+            "Backtracking contraction factor for line search.",
+            ControlSemantic::SolverLineSearchBeta,
+            ControlValueDisplay::Scientific,
+        ),
+        text_control(
+            SharedControlId::SolverLineSearchMaxSteps.id(),
+            "LS Max Steps",
+            default_line_search.max_steps as f64,
+            "",
+            "Maximum number of backtracking reductions per line-search attempt.",
+            ControlSemantic::SolverLineSearchMaxSteps,
+            ControlValueDisplay::Integer,
+        ),
+        text_control(
+            SharedControlId::SolverMinStep.id(),
+            "LS Min Step",
+            default_line_search.min_step,
+            "",
+            "Minimum accepted step scale in line-search globalization.",
+            ControlSemantic::SolverMinStep,
+            ControlValueDisplay::Scientific,
+        ),
+        text_control(
+            SharedControlId::SolverPenaltyIncreaseFactor.id(),
+            "Penalty Increase Factor (Adv)",
+            default_penalty_increase_factor,
+            "",
+            "Multiplier applied when merit line search needs a larger exact-penalty weight.",
+            ControlSemantic::SolverPenaltyIncreaseFactor,
+            ControlValueDisplay::Scientific,
+        ),
+        text_control(
+            SharedControlId::SolverMaxPenaltyUpdates.id(),
+            "Max Penalty Updates (Adv)",
+            default_max_penalty_updates as f64,
+            "",
+            "Maximum penalty updates before a merit line-search step is rejected.",
+            ControlSemantic::SolverMaxPenaltyUpdates,
+            ControlValueDisplay::Integer,
+        ),
+        text_control(
+            SharedControlId::SolverFilterGammaObjective.id(),
+            "Filter Gamma Objective",
+            default_filter.gamma_objective,
+            "",
+            "Sufficient objective reduction threshold for filter globalization.",
+            ControlSemantic::SolverFilterGammaObjective,
+            ControlValueDisplay::Scientific,
+        ),
+        text_control(
+            SharedControlId::SolverFilterGammaViolation.id(),
+            "Filter Gamma Violation",
+            default_filter.gamma_violation,
+            "",
+            "Sufficient feasibility reduction threshold for filter globalization.",
+            ControlSemantic::SolverFilterGammaViolation,
+            ControlValueDisplay::Scientific,
+        ),
+        text_control(
+            SharedControlId::SolverFilterThetaMaxFactor.id(),
+            "Filter Theta Max Factor (Adv)",
+            default_filter.theta_max_factor,
+            "",
+            "Maximum filter violation envelope as a multiple of the switching reference.",
+            ControlSemantic::SolverFilterThetaMaxFactor,
+            ControlValueDisplay::Scientific,
+        ),
+        text_control(
+            SharedControlId::SolverFilterSwitchingReferenceMin.id(),
+            "Filter Ref Min (Adv)",
+            default_filter.switching_reference_min,
+            "",
+            "Minimum switching-condition reference violation.",
+            ControlSemantic::SolverFilterSwitchingReferenceMin,
+            ControlValueDisplay::Scientific,
+        ),
+        text_control(
+            SharedControlId::SolverFilterSwitchingViolationFactor.id(),
+            "Filter Switching Violation (Adv)",
+            default_filter.switching_violation_factor,
+            "",
+            "Switching-condition multiplier on current violation.",
+            ControlSemantic::SolverFilterSwitchingViolationFactor,
+            ControlValueDisplay::Scientific,
+        ),
+        text_control(
+            SharedControlId::SolverFilterSwitchingLinearizedReductionFactor.id(),
+            "Filter Switching Linearized (Adv)",
+            default_filter.switching_linearized_reduction_factor,
+            "",
+            "Switching-condition factor on predicted linearized feasibility reduction.",
+            ControlSemantic::SolverFilterSwitchingLinearizedReductionFactor,
+            ControlValueDisplay::Scientific,
+        ),
+        text_control(
+            SharedControlId::SolverTrustRegionInitialRadius.id(),
+            "TR Initial Radius",
+            default_trust_region.initial_radius,
+            "",
+            "Initial trust-region radius.",
+            ControlSemantic::SolverTrustRegionInitialRadius,
+            ControlValueDisplay::Scientific,
+        ),
+        text_control(
+            SharedControlId::SolverTrustRegionMaxRadius.id(),
+            "TR Max Radius",
+            default_trust_region.max_radius,
+            "",
+            "Maximum trust-region radius.",
+            ControlSemantic::SolverTrustRegionMaxRadius,
+            ControlValueDisplay::Scientific,
+        ),
+        text_control(
+            SharedControlId::SolverTrustRegionMinRadius.id(),
+            "TR Min Radius",
+            default_trust_region.min_radius,
+            "",
+            "Minimum trust-region radius before restoration/failure.",
+            ControlSemantic::SolverTrustRegionMinRadius,
+            ControlValueDisplay::Scientific,
+        ),
+        text_control(
+            SharedControlId::SolverTrustRegionShrinkFactor.id(),
+            "TR Shrink Factor",
+            default_trust_region.shrink_factor,
+            "",
+            "Radius contraction factor after a rejected trust-region trial.",
+            ControlSemantic::SolverTrustRegionShrinkFactor,
+            ControlValueDisplay::Scientific,
+        ),
+        text_control(
+            SharedControlId::SolverTrustRegionGrowFactor.id(),
+            "TR Grow Factor",
+            default_trust_region.grow_factor,
+            "",
+            "Radius expansion factor after a high-quality boundary step.",
+            ControlSemantic::SolverTrustRegionGrowFactor,
+            ControlValueDisplay::Scientific,
+        ),
+        text_control(
+            SharedControlId::SolverTrustRegionAcceptRatio.id(),
+            "TR Accept Ratio",
+            default_trust_region.accept_ratio,
+            "",
+            "Minimum actual/predicted reduction ratio for a trust-region step to be accepted.",
+            ControlSemantic::SolverTrustRegionAcceptRatio,
+            ControlValueDisplay::Scientific,
+        ),
+        text_control(
+            SharedControlId::SolverTrustRegionExpandRatio.id(),
+            "TR Expand Ratio",
+            default_trust_region.expand_ratio,
+            "",
+            "Ratio threshold for expanding the trust-region radius.",
+            ControlSemantic::SolverTrustRegionExpandRatio,
+            ControlValueDisplay::Scientific,
+        ),
+        text_control(
+            SharedControlId::SolverTrustRegionBoundaryFraction.id(),
+            "TR Boundary Fraction (Adv)",
+            default_trust_region.boundary_fraction,
+            "",
+            "Fraction of the radius used to classify a step as boundary-active.",
+            ControlSemantic::SolverTrustRegionBoundaryFraction,
+            ControlValueDisplay::Scientific,
+        ),
+        text_control(
+            SharedControlId::SolverTrustRegionMaxContractions.id(),
+            "TR Max Contractions",
+            default_trust_region.max_radius_contractions as f64,
+            "",
+            "Maximum trust-region radius contractions within one SQP iteration.",
+            ControlSemantic::SolverTrustRegionMaxContractions,
+            ControlValueDisplay::Integer,
+        ),
+        select_control(
+            SharedControlId::SolverTrustRegionFixedPenalty.id(),
+            "TR Fixed Penalty",
+            if default_fixed_penalty { 1.0 } else { 0.0 },
+            "",
+            "Whether trust-region merit mode keeps the exact-penalty weight fixed instead of updating it from multipliers.",
+            &[(1.0, "On"), (0.0, "Off")],
+            ControlSection::Solver,
+            ControlVisibility::Always,
+            ControlSemantic::SolverTrustRegionFixedPenalty,
+        ),
     ]
 }
 
@@ -3533,6 +4135,15 @@ fn solver_method_choices() -> Vec<(f64, &'static str)> {
     #[cfg(feature = "ipopt")]
     out.push((2.0, "IPOPT"));
     out
+}
+
+fn solver_globalization_choices() -> Vec<(f64, &'static str)> {
+    vec![
+        (0.0, "LS Filter"),
+        (1.0, "LS Merit"),
+        (2.0, "TR Filter"),
+        (3.0, "TR Merit"),
+    ]
 }
 
 fn sample_shared_or_default(
@@ -3557,6 +4168,9 @@ pub fn solver_config_from_map(
     values: &BTreeMap<String, f64>,
     default: SqpConfig,
 ) -> Result<SqpConfig> {
+    let default_line_search = config_line_search(&default);
+    let default_filter = config_filter(&default);
+    let default_trust_region = config_trust_region(&default);
     let max_iters = expect_nonnegative_finite(
         sample_shared_or_default(
             values,
@@ -3607,12 +4221,430 @@ pub fn solver_config_from_map(
         ),
         SharedControlId::SolverComplementarityTolerance.id(),
     )?;
+    let globalization = match parse_enum_choice(
+        sample_shared_or_default(
+            values,
+            SharedControlId::SolverGlobalization,
+            sqp_globalization_mode_value(sqp_globalization_mode(&default)),
+        ),
+        SharedControlId::SolverGlobalization,
+        &[0.0, 1.0, 2.0, 3.0],
+    )? {
+        0 => SqpGlobalizationConfig::LineSearchFilter {
+            line_search: SqpLineSearchConfig {
+                armijo_c1: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverArmijoC1,
+                        default_line_search.armijo_c1,
+                    ),
+                    SharedControlId::SolverArmijoC1.id(),
+                )?,
+                wolfe_c2: {
+                    let value = sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverWolfeC2,
+                        default_line_search.wolfe_c2.unwrap_or(0.0),
+                    );
+                    (value > 0.0).then_some(value)
+                },
+                beta: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverLineSearchBeta,
+                        default_line_search.beta,
+                    ),
+                    SharedControlId::SolverLineSearchBeta.id(),
+                )?,
+                max_steps: expect_nonnegative_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverLineSearchMaxSteps,
+                        default_line_search.max_steps as f64,
+                    ),
+                    SharedControlId::SolverLineSearchMaxSteps.id(),
+                )?
+                .round() as usize,
+                min_step: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverMinStep,
+                        default_line_search.min_step,
+                    ),
+                    SharedControlId::SolverMinStep.id(),
+                )?,
+            },
+            filter: SqpFilterConfig {
+                gamma_objective: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverFilterGammaObjective,
+                        default_filter.gamma_objective,
+                    ),
+                    SharedControlId::SolverFilterGammaObjective.id(),
+                )?,
+                gamma_violation: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverFilterGammaViolation,
+                        default_filter.gamma_violation,
+                    ),
+                    SharedControlId::SolverFilterGammaViolation.id(),
+                )?,
+                theta_max_factor: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverFilterThetaMaxFactor,
+                        default_filter.theta_max_factor,
+                    ),
+                    SharedControlId::SolverFilterThetaMaxFactor.id(),
+                )?,
+                switching_reference_min: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverFilterSwitchingReferenceMin,
+                        default_filter.switching_reference_min,
+                    ),
+                    SharedControlId::SolverFilterSwitchingReferenceMin.id(),
+                )?,
+                switching_violation_factor: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverFilterSwitchingViolationFactor,
+                        default_filter.switching_violation_factor,
+                    ),
+                    SharedControlId::SolverFilterSwitchingViolationFactor.id(),
+                )?,
+                switching_linearized_reduction_factor: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverFilterSwitchingLinearizedReductionFactor,
+                        default_filter.switching_linearized_reduction_factor,
+                    ),
+                    SharedControlId::SolverFilterSwitchingLinearizedReductionFactor.id(),
+                )?,
+            },
+            exact_merit_penalty: expect_positive_finite(
+                sample_shared_or_default(
+                    values,
+                    SharedControlId::SolverExactMeritPenalty,
+                    config_exact_merit_penalty(&default),
+                ),
+                SharedControlId::SolverExactMeritPenalty.id(),
+            )?,
+        },
+        1 => SqpGlobalizationConfig::LineSearchMerit {
+            line_search: SqpLineSearchConfig {
+                armijo_c1: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverArmijoC1,
+                        default_line_search.armijo_c1,
+                    ),
+                    SharedControlId::SolverArmijoC1.id(),
+                )?,
+                wolfe_c2: {
+                    let value = sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverWolfeC2,
+                        default_line_search.wolfe_c2.unwrap_or(0.0),
+                    );
+                    (value > 0.0).then_some(value)
+                },
+                beta: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverLineSearchBeta,
+                        default_line_search.beta,
+                    ),
+                    SharedControlId::SolverLineSearchBeta.id(),
+                )?,
+                max_steps: expect_nonnegative_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverLineSearchMaxSteps,
+                        default_line_search.max_steps as f64,
+                    ),
+                    SharedControlId::SolverLineSearchMaxSteps.id(),
+                )?
+                .round() as usize,
+                min_step: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverMinStep,
+                        default_line_search.min_step,
+                    ),
+                    SharedControlId::SolverMinStep.id(),
+                )?,
+            },
+            exact_merit_penalty: expect_positive_finite(
+                sample_shared_or_default(
+                    values,
+                    SharedControlId::SolverExactMeritPenalty,
+                    config_exact_merit_penalty(&default),
+                ),
+                SharedControlId::SolverExactMeritPenalty.id(),
+            )?,
+            penalty_increase_factor: expect_positive_finite(
+                sample_shared_or_default(
+                    values,
+                    SharedControlId::SolverPenaltyIncreaseFactor,
+                    config_penalty_increase_factor(&default),
+                ),
+                SharedControlId::SolverPenaltyIncreaseFactor.id(),
+            )?,
+            max_penalty_updates: expect_nonnegative_finite(
+                sample_shared_or_default(
+                    values,
+                    SharedControlId::SolverMaxPenaltyUpdates,
+                    config_max_penalty_updates(&default) as f64,
+                ),
+                SharedControlId::SolverMaxPenaltyUpdates.id(),
+            )?
+            .round() as usize,
+        },
+        2 => SqpGlobalizationConfig::TrustRegionFilter {
+            trust_region: SqpTrustRegionConfig {
+                initial_radius: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverTrustRegionInitialRadius,
+                        default_trust_region.initial_radius,
+                    ),
+                    SharedControlId::SolverTrustRegionInitialRadius.id(),
+                )?,
+                max_radius: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverTrustRegionMaxRadius,
+                        default_trust_region.max_radius,
+                    ),
+                    SharedControlId::SolverTrustRegionMaxRadius.id(),
+                )?,
+                min_radius: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverTrustRegionMinRadius,
+                        default_trust_region.min_radius,
+                    ),
+                    SharedControlId::SolverTrustRegionMinRadius.id(),
+                )?,
+                shrink_factor: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverTrustRegionShrinkFactor,
+                        default_trust_region.shrink_factor,
+                    ),
+                    SharedControlId::SolverTrustRegionShrinkFactor.id(),
+                )?,
+                grow_factor: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverTrustRegionGrowFactor,
+                        default_trust_region.grow_factor,
+                    ),
+                    SharedControlId::SolverTrustRegionGrowFactor.id(),
+                )?,
+                accept_ratio: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverTrustRegionAcceptRatio,
+                        default_trust_region.accept_ratio,
+                    ),
+                    SharedControlId::SolverTrustRegionAcceptRatio.id(),
+                )?,
+                expand_ratio: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverTrustRegionExpandRatio,
+                        default_trust_region.expand_ratio,
+                    ),
+                    SharedControlId::SolverTrustRegionExpandRatio.id(),
+                )?,
+                boundary_fraction: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverTrustRegionBoundaryFraction,
+                        default_trust_region.boundary_fraction,
+                    ),
+                    SharedControlId::SolverTrustRegionBoundaryFraction.id(),
+                )?,
+                max_radius_contractions: expect_nonnegative_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverTrustRegionMaxContractions,
+                        default_trust_region.max_radius_contractions as f64,
+                    ),
+                    SharedControlId::SolverTrustRegionMaxContractions.id(),
+                )?
+                .round() as usize,
+            },
+            filter: SqpFilterConfig {
+                gamma_objective: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverFilterGammaObjective,
+                        default_filter.gamma_objective,
+                    ),
+                    SharedControlId::SolverFilterGammaObjective.id(),
+                )?,
+                gamma_violation: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverFilterGammaViolation,
+                        default_filter.gamma_violation,
+                    ),
+                    SharedControlId::SolverFilterGammaViolation.id(),
+                )?,
+                theta_max_factor: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverFilterThetaMaxFactor,
+                        default_filter.theta_max_factor,
+                    ),
+                    SharedControlId::SolverFilterThetaMaxFactor.id(),
+                )?,
+                switching_reference_min: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverFilterSwitchingReferenceMin,
+                        default_filter.switching_reference_min,
+                    ),
+                    SharedControlId::SolverFilterSwitchingReferenceMin.id(),
+                )?,
+                switching_violation_factor: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverFilterSwitchingViolationFactor,
+                        default_filter.switching_violation_factor,
+                    ),
+                    SharedControlId::SolverFilterSwitchingViolationFactor.id(),
+                )?,
+                switching_linearized_reduction_factor: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverFilterSwitchingLinearizedReductionFactor,
+                        default_filter.switching_linearized_reduction_factor,
+                    ),
+                    SharedControlId::SolverFilterSwitchingLinearizedReductionFactor.id(),
+                )?,
+            },
+            exact_merit_penalty: expect_positive_finite(
+                sample_shared_or_default(
+                    values,
+                    SharedControlId::SolverExactMeritPenalty,
+                    config_exact_merit_penalty(&default),
+                ),
+                SharedControlId::SolverExactMeritPenalty.id(),
+            )?,
+        },
+        3 => SqpGlobalizationConfig::TrustRegionMerit {
+            trust_region: SqpTrustRegionConfig {
+                initial_radius: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverTrustRegionInitialRadius,
+                        default_trust_region.initial_radius,
+                    ),
+                    SharedControlId::SolverTrustRegionInitialRadius.id(),
+                )?,
+                max_radius: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverTrustRegionMaxRadius,
+                        default_trust_region.max_radius,
+                    ),
+                    SharedControlId::SolverTrustRegionMaxRadius.id(),
+                )?,
+                min_radius: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverTrustRegionMinRadius,
+                        default_trust_region.min_radius,
+                    ),
+                    SharedControlId::SolverTrustRegionMinRadius.id(),
+                )?,
+                shrink_factor: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverTrustRegionShrinkFactor,
+                        default_trust_region.shrink_factor,
+                    ),
+                    SharedControlId::SolverTrustRegionShrinkFactor.id(),
+                )?,
+                grow_factor: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverTrustRegionGrowFactor,
+                        default_trust_region.grow_factor,
+                    ),
+                    SharedControlId::SolverTrustRegionGrowFactor.id(),
+                )?,
+                accept_ratio: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverTrustRegionAcceptRatio,
+                        default_trust_region.accept_ratio,
+                    ),
+                    SharedControlId::SolverTrustRegionAcceptRatio.id(),
+                )?,
+                expand_ratio: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverTrustRegionExpandRatio,
+                        default_trust_region.expand_ratio,
+                    ),
+                    SharedControlId::SolverTrustRegionExpandRatio.id(),
+                )?,
+                boundary_fraction: expect_positive_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverTrustRegionBoundaryFraction,
+                        default_trust_region.boundary_fraction,
+                    ),
+                    SharedControlId::SolverTrustRegionBoundaryFraction.id(),
+                )?,
+                max_radius_contractions: expect_nonnegative_finite(
+                    sample_shared_or_default(
+                        values,
+                        SharedControlId::SolverTrustRegionMaxContractions,
+                        default_trust_region.max_radius_contractions as f64,
+                    ),
+                    SharedControlId::SolverTrustRegionMaxContractions.id(),
+                )?
+                .round() as usize,
+            },
+            exact_merit_penalty: expect_positive_finite(
+                sample_shared_or_default(
+                    values,
+                    SharedControlId::SolverExactMeritPenalty,
+                    config_exact_merit_penalty(&default),
+                ),
+                SharedControlId::SolverExactMeritPenalty.id(),
+            )?,
+            fixed_penalty: parse_enum_choice(
+                sample_shared_or_default(
+                    values,
+                    SharedControlId::SolverTrustRegionFixedPenalty,
+                    if config_trust_region_fixed_penalty(&default) {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                ),
+                SharedControlId::SolverTrustRegionFixedPenalty,
+                &[0.0, 1.0],
+            )? == 1,
+        },
+        _ => unreachable!("validated SQP globalization choice"),
+    };
     Ok(SqpConfig {
         max_iters,
         hessian_regularization_enabled,
         dual_tol,
         constraint_tol,
         complementarity_tol,
+        globalization,
     })
 }
 
@@ -3906,6 +4938,96 @@ pub fn sqp_options(config: &SqpConfig) -> ClarabelSqpOptions {
         dual_tol: config.dual_tol,
         constraint_tol: config.constraint_tol,
         complementarity_tol: config.complementarity_tol,
+        globalization: match config.globalization {
+            SqpGlobalizationConfig::LineSearchFilter {
+                line_search,
+                filter,
+                exact_merit_penalty,
+            } => SqpGlobalization::LineSearchFilter(LineSearchFilterOptions {
+                line_search: SqpLineSearchOptions {
+                    armijo_c1: line_search.armijo_c1,
+                    wolfe_c2: line_search.wolfe_c2,
+                    beta: line_search.beta,
+                    max_steps: line_search.max_steps,
+                    min_step: line_search.min_step,
+                },
+                filter: SqpFilterOptions {
+                    armijo_c1: line_search.armijo_c1,
+                    gamma_objective: filter.gamma_objective,
+                    gamma_violation: filter.gamma_violation,
+                    theta_max_factor: filter.theta_max_factor,
+                    switching_reference_min: filter.switching_reference_min,
+                    switching_violation_factor: filter.switching_violation_factor,
+                    switching_linearized_reduction_factor: filter
+                        .switching_linearized_reduction_factor,
+                },
+                exact_merit_penalty,
+            }),
+            SqpGlobalizationConfig::LineSearchMerit {
+                line_search,
+                exact_merit_penalty,
+                penalty_increase_factor,
+                max_penalty_updates,
+            } => SqpGlobalization::LineSearchMerit(LineSearchMeritOptions {
+                line_search: SqpLineSearchOptions {
+                    armijo_c1: line_search.armijo_c1,
+                    wolfe_c2: line_search.wolfe_c2,
+                    beta: line_search.beta,
+                    max_steps: line_search.max_steps,
+                    min_step: line_search.min_step,
+                },
+                exact_merit_penalty,
+                penalty_increase_factor,
+                max_penalty_updates,
+            }),
+            SqpGlobalizationConfig::TrustRegionFilter {
+                trust_region,
+                filter,
+                exact_merit_penalty,
+            } => SqpGlobalization::TrustRegionFilter(TrustRegionFilterOptions {
+                trust_region: SqpTrustRegionOptions {
+                    initial_radius: trust_region.initial_radius,
+                    max_radius: trust_region.max_radius,
+                    min_radius: trust_region.min_radius,
+                    shrink_factor: trust_region.shrink_factor,
+                    grow_factor: trust_region.grow_factor,
+                    accept_ratio: trust_region.accept_ratio,
+                    expand_ratio: trust_region.expand_ratio,
+                    boundary_fraction: trust_region.boundary_fraction,
+                    max_radius_contractions: trust_region.max_radius_contractions,
+                },
+                filter: SqpFilterOptions {
+                    armijo_c1: default_sqp_line_search_config().armijo_c1,
+                    gamma_objective: filter.gamma_objective,
+                    gamma_violation: filter.gamma_violation,
+                    theta_max_factor: filter.theta_max_factor,
+                    switching_reference_min: filter.switching_reference_min,
+                    switching_violation_factor: filter.switching_violation_factor,
+                    switching_linearized_reduction_factor: filter
+                        .switching_linearized_reduction_factor,
+                },
+                exact_merit_penalty,
+            }),
+            SqpGlobalizationConfig::TrustRegionMerit {
+                trust_region,
+                exact_merit_penalty,
+                fixed_penalty,
+            } => SqpGlobalization::TrustRegionMerit(TrustRegionMeritOptions {
+                trust_region: SqpTrustRegionOptions {
+                    initial_radius: trust_region.initial_radius,
+                    max_radius: trust_region.max_radius,
+                    min_radius: trust_region.min_radius,
+                    shrink_factor: trust_region.shrink_factor,
+                    grow_factor: trust_region.grow_factor,
+                    accept_ratio: trust_region.accept_ratio,
+                    expand_ratio: trust_region.expand_ratio,
+                    boundary_fraction: trust_region.boundary_fraction,
+                    max_radius_contractions: trust_region.max_radius_contractions,
+                },
+                exact_merit_penalty,
+                fixed_penalty,
+            }),
+        },
         ..ClarabelSqpOptions::default()
     }
 }

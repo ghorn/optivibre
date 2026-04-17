@@ -22,7 +22,7 @@ use serde::Serialize;
 use std::f64::consts::PI;
 use sx_core::SX;
 const RK4_SUBSTEPS: usize = 2;
-const DEFAULT_INTERVALS: usize = 30;
+const DEFAULT_INTERVALS: usize = 100;
 const DEFAULT_COLLOCATION_DEGREE: usize = 3;
 const SUPPORTED_INTERVALS: [usize; 1] = [DEFAULT_INTERVALS];
 const SUPPORTED_DEGREES: [usize; 1] = [DEFAULT_COLLOCATION_DEGREE];
@@ -329,7 +329,7 @@ pub fn spec() -> ProblemSpec {
                 title: "Boundary and Path Constraints".to_string(),
                 entries: vec![
                     r"x(0) = 0, \qquad h(0) = 1, \qquad v_x(0)^2 + v_y(0)^2 = V_{\mathrm{launch}}^2".to_string(),
-                    r"h(t) \ge 0, \qquad v_x(t) \ge 0, \qquad -0.5 \le C_L \le 1.5, \qquad |\nu_\alpha| \le \nu_{\alpha,\max}".to_string(),
+                    r"h(t) \ge 0, \qquad v_x(t) \ge 1, \qquad -0.5 \le C_L \le 1.5, \qquad |\nu_\alpha| \le \nu_{\alpha,\max}".to_string(),
                     r"T_{\min} \le T \le T_{\max}".to_string(),
                 ],
             },
@@ -765,7 +765,7 @@ fn runtime_spec(
                 upper: None,
             },
             vx: Bounds1D {
-                lower: Some(0.0),
+                lower: Some(1.0),
                 upper: None,
             },
             cl: Bounds1D {
@@ -863,6 +863,7 @@ fn artifact_from_interval_data(
     y: Vec<f64>,
     notes: Vec<String>,
 ) -> SolveArtifact {
+    let path_bounds = runtime_spec(params).path_bounds;
     SolveArtifact::new(
         "Optimal Distance Glider",
         artifact_summary(params, tf, distance, terminal_ld, peak_altitude, trim_cost),
@@ -880,8 +881,8 @@ fn artifact_from_interval_data(
                     });
                 series_out.extend(interval_arc_bound_series(
                     x_arcs,
-                    Some(0.0),
-                    None,
+                    path_bounds.altitude.lower,
+                    path_bounds.altitude.upper,
                     PlotMode::Lines,
                 ));
                 series_out
@@ -893,8 +894,8 @@ fn artifact_from_interval_data(
                     });
                 series_out.extend(interval_arc_bound_series(
                     x_arcs,
-                    Some(0.0),
-                    None,
+                    path_bounds.vx.lower,
+                    path_bounds.vx.upper,
                     PlotMode::Lines,
                 ));
                 series_out
@@ -1033,7 +1034,7 @@ fn artifact_from_ms_trajectories<const N: usize>(
             "The particle model uses velocity states directly, with drag aligned opposite motion and lift using the orthogonal direction (-v_y, v_x)/V.".to_string(),
             "Lift and drag are computed from dynamic pressure using rho = 1.15 kg/m^3, S_ref = 4.0 m^2, and mass = 30.0 kg.".to_string(),
             "The bounded aerodynamic path constraint is applied directly to lift coefficient, with -0.5 <= C_L <= 1.5 rendered as red overlays.".to_string(),
-            "Altitude and forward speed are constrained as h(t) >= 0 and v_x(t) >= 0 throughout the trajectory, with free final time 1 <= T <= 500 s.".to_string(),
+            "Altitude and forward speed are constrained as h(t) >= 0 and v_x(t) >= 1 throughout the trajectory, with free final time 1 <= T <= 500 s.".to_string(),
         ],
     )
 }
@@ -1112,7 +1113,7 @@ fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
             "Lift and drag are computed from dynamic pressure using rho = 1.15 kg/m^3, S_ref = 4.0 m^2, and mass = 30.0 kg.".to_string(),
             "Each collocation interval is rendered as its own start-root-end arc, while the AoA-rate decision variable is only shown at collocation nodes.".to_string(),
             "The bounded aerodynamic path constraint is applied directly to lift coefficient, with -0.5 <= C_L <= 1.5 rendered as red overlays.".to_string(),
-            "Altitude and forward speed are constrained as h(t) >= 0 and v_x(t) >= 0 throughout the trajectory, with free final time 1 <= T <= 500 s.".to_string(),
+            "Altitude and forward speed are constrained as h(t) >= 0 and v_x(t) >= 1 throughout the trajectory, with free final time 1 <= T <= 500 s.".to_string(),
         ],
     )
 }

@@ -1592,6 +1592,7 @@ mod tests {
                 dual_tol: 1.0e-1,
                 constraint_tol: 1.0e-4,
                 complementarity_tol: 1.0e-4,
+                globalization: crate::common::default_sqp_config().globalization,
             },
             transcription: TranscriptionConfig {
                 method: crate::common::TranscriptionMethod::MultipleShooting,

@@ -1,9 +1,10 @@
 use approx::assert_abs_diff_eq;
 use optimization::{
-    CCS, ClarabelSqpError, ClarabelSqpOptions, CompiledNlpProblem, NonFiniteCallbackStage,
-    NonFiniteInputStage, ParameterMatrix, SqpConeKind, SqpFinalStateKind, SqpIterationEvent,
-    SqpIterationPhase, SqpQpRawStatus, SqpStepKind, SqpTermination, SymbolicNlpOutputs,
-    TypedRuntimeNlpBounds, solve_nlp_sqp, solve_nlp_sqp_with_callback, symbolic_nlp,
+    CCS, ClarabelSqpError, ClarabelSqpOptions, CompiledNlpProblem, LineSearchFilterOptions,
+    LineSearchMeritOptions, NonFiniteCallbackStage, NonFiniteInputStage, ParameterMatrix,
+    SqpConeKind, SqpFinalStateKind, SqpGlobalization, SqpIterationEvent, SqpIterationPhase,
+    SqpQpRawStatus, SqpStepKind, SqpTermination, SymbolicNlpOutputs, TypedRuntimeNlpBounds,
+    solve_nlp_sqp, solve_nlp_sqp_with_callback, symbolic_nlp,
 };
 use rstest::rstest;
 use std::sync::OnceLock;
@@ -942,7 +943,7 @@ fn first_accepted_step_snapshot(
 ) -> optimization::SqpIterationSnapshot {
     options.verbose = false;
     options.max_iters = 1;
-    options.filter_method = false;
+    options.globalization = SqpGlobalization::LineSearchMerit(LineSearchMeritOptions::default());
     let mut snapshots = Vec::new();
     let error = solve_nlp_sqp_with_callback(
         &MaratosInequalityProblem,
@@ -1000,11 +1001,17 @@ fn sqp_callback_uses_second_order_correction_before_backtracking() {
 fn sqp_callback_exposes_wolfe_status_when_enabled() {
     let problem = OneDimQuadraticProblem;
     let mut snapshots = Vec::new();
-    let options = ClarabelSqpOptions {
+    let mut options = ClarabelSqpOptions {
         verbose: false,
-        wolfe_c2: Some(0.9),
         ..ClarabelSqpOptions::default()
     };
+    options.globalization = SqpGlobalization::LineSearchMerit(LineSearchMeritOptions {
+        line_search: optimization::SqpLineSearchOptions {
+            wolfe_c2: Some(0.9),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
     let summary = solve_nlp_sqp_with_callback(&problem, &[0.0], &[], &options, |snapshot| {
         snapshots.push(snapshot.clone());
     })
@@ -1085,6 +1092,96 @@ fn sqp_filter_accepts_feasibility_improving_step_and_surfaces_frontier() {
 }
 
 #[test]
+fn sqp_trust_region_merit_limits_step_with_soc_cone() {
+    let mut snapshots = Vec::new();
+    let options = ClarabelSqpOptions {
+        verbose: false,
+        max_iters: 1,
+        globalization: SqpGlobalization::TrustRegionMerit(optimization::TrustRegionMeritOptions {
+            trust_region: optimization::SqpTrustRegionOptions {
+                initial_radius: 0.25,
+                max_radius: 1.0,
+                min_radius: 1.0e-8,
+                ..Default::default()
+            },
+            exact_merit_penalty: 10.0,
+            fixed_penalty: true,
+        }),
+        ..ClarabelSqpOptions::default()
+    };
+    let error =
+        solve_nlp_sqp_with_callback(&OneDimQuadraticProblem, &[0.0], &[], &options, |snapshot| {
+            snapshots.push(snapshot.clone());
+        })
+        .expect_err("single-step trust-region probe should terminate at the max-iteration guard");
+    assert!(matches!(error, ClarabelSqpError::MaxIterations { .. }));
+
+    let accepted = snapshots
+        .into_iter()
+        .find(|snapshot| snapshot.phase == SqpIterationPhase::AcceptedStep)
+        .expect("accepted trust-region step should be reported");
+    let trust_region = accepted
+        .trust_region
+        .as_ref()
+        .expect("accepted trust-region step should carry trust-region telemetry");
+    assert_abs_diff_eq!(trust_region.radius, 0.25, epsilon = 1.0e-12);
+    assert!(trust_region.boundary_active);
+    assert_abs_diff_eq!(accepted.x[0], 0.25, epsilon = 1.0e-8);
+    assert!(trust_region.predicted_reduction > 0.0);
+    assert!(trust_region.ratio.is_some_and(|rho| rho > 0.0));
+}
+
+#[test]
+fn sqp_trust_region_filter_surfaces_filter_acceptance_mode() {
+    let problem = EqualityQuadraticProblem;
+    let mut snapshots = Vec::new();
+    let options = ClarabelSqpOptions {
+        verbose: false,
+        hessian_regularization_enabled: true,
+        globalization: SqpGlobalization::TrustRegionFilter(
+            optimization::TrustRegionFilterOptions {
+                trust_region: optimization::SqpTrustRegionOptions {
+                    initial_radius: 0.5,
+                    max_radius: 2.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ),
+        ..ClarabelSqpOptions::default()
+    };
+    let summary = solve_nlp_sqp_with_callback(&problem, &[0.0], &[], &options, |snapshot| {
+        snapshots.push(snapshot.clone());
+    })
+    .expect("trust-region filter solve should succeed");
+
+    let accepted = snapshots
+        .iter()
+        .find(|snapshot| snapshot.phase == SqpIterationPhase::AcceptedStep)
+        .expect("accepted snapshot should exist");
+    let trust_region = accepted
+        .trust_region
+        .as_ref()
+        .expect("accepted step should include trust-region telemetry");
+    assert_eq!(
+        trust_region.filter_acceptance_mode,
+        Some(optimization::SqpFilterAcceptanceMode::ViolationReduction)
+    );
+    assert!(trust_region.ratio.is_some());
+    let filter = summary
+        .last_accepted_state
+        .as_ref()
+        .expect("last accepted state should exist")
+        .filter
+        .as_ref()
+        .expect("accepted snapshot should carry filter state");
+    assert_eq!(
+        filter.accepted_mode,
+        Some(optimization::SqpFilterAcceptanceMode::ViolationReduction)
+    );
+}
+
+#[test]
 fn sqp_callback_honors_max_line_search_steps() {
     let compiled = unconstrained_rosenbrock_problem();
     let problem = compiled
@@ -1096,7 +1193,13 @@ fn sqp_callback_honors_max_line_search_steps() {
         &[],
         &ClarabelSqpOptions {
             verbose: false,
-            max_line_search_steps: 0,
+            globalization: SqpGlobalization::LineSearchFilter(LineSearchFilterOptions {
+                line_search: optimization::SqpLineSearchOptions {
+                    max_steps: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
             ..ClarabelSqpOptions::default()
         },
     )
@@ -1150,7 +1253,7 @@ fn sqp_marks_armijo_tolerance_adjusted_acceptance() {
         constraint_tol: 1e-9,
         complementarity_tol: 1e-9,
         hessian_regularization_enabled: true,
-        filter_method: false,
+        globalization: SqpGlobalization::LineSearchMerit(LineSearchMeritOptions::default()),
         verbose: false,
         ..ClarabelSqpOptions::default()
     };
@@ -1283,7 +1386,7 @@ fn sqp_restoration_failure_surfaces_explicit_termination() {
         &ClarabelSqpOptions {
             verbose: false,
             max_iters: 5,
-            filter_method: true,
+            globalization: SqpGlobalization::LineSearchFilter(LineSearchFilterOptions::default()),
             restoration_phase: true,
             elastic_mode: true,
             ..ClarabelSqpOptions::default()

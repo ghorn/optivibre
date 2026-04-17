@@ -1119,7 +1119,8 @@ fn render_sqp_transcript(
     summary: Option<&ClarabelSqpSummary>,
     error: Option<&ClarabelSqpError>,
 ) -> String {
-    const SQP_EVENT_COLUMN_WIDTH: usize = 11;
+    const SQP_ITERATION_LABEL_WIDTH: usize = 5;
+    const SQP_EVENT_COLUMN_WIDTH: usize = 10;
 
     fn fmt_bool(value: bool) -> &'static str {
         if value { "yes" } else { "no" }
@@ -1130,6 +1131,26 @@ fn render_sqp_transcript(
             Some(true) => "yes",
             Some(false) => "no",
             None => "--",
+        }
+    }
+
+    fn iteration_label(snapshot: &SqpIterationSnapshot) -> String {
+        match snapshot.phase {
+            optimization::SqpIterationPhase::Initial => "pre".to_string(),
+            optimization::SqpIterationPhase::AcceptedStep => {
+                let restoration = snapshot
+                    .line_search
+                    .as_ref()
+                    .and_then(|info| info.step_kind)
+                    .or_else(|| snapshot.trust_region.as_ref().and_then(|info| info.step_kind))
+                    == Some(optimization::SqpStepKind::Restoration);
+                if restoration {
+                    format!("{}r", snapshot.iteration)
+                } else {
+                    snapshot.iteration.to_string()
+                }
+            }
+            optimization::SqpIterationPhase::PostConvergence => "post".to_string(),
         }
     }
 
@@ -1188,16 +1209,6 @@ fn render_sqp_transcript(
             },
             if snapshot
                 .events
-                .contains(&optimization::SqpIterationEvent::RestorationStepAccepted)
-            {
-                'T'
-            } else if line_search.is_some_and(|info| info.restoration_attempted) {
-                't'
-            } else {
-                ' '
-            },
-            if snapshot
-                .events
                 .contains(&optimization::SqpIterationEvent::QpReducedAccuracy)
             {
                 'R'
@@ -1238,7 +1249,7 @@ fn render_sqp_transcript(
     let mut out = render_problem_header(record);
     out.push_str("solver_log\n\n");
     let header = format!(
-        "{:>4}  {:<6}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>7}  {:>5}  {:>5}  {:>width$}",
+        "{:>width_iter$}  {:<6}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>7}  {:>5}  {:>5}  {:>width_evt$}",
         "iter",
         "phase",
         "f",
@@ -1252,7 +1263,8 @@ fn render_sqp_transcript(
         "ls",
         "qp",
         "evt",
-        width = SQP_EVENT_COLUMN_WIDTH,
+        width_iter = SQP_ITERATION_LABEL_WIDTH,
+        width_evt = SQP_EVENT_COLUMN_WIDTH,
     );
     write_repeated_header(&mut out, &header);
     for (idx, snapshot) in snapshots.iter().enumerate() {
@@ -1276,8 +1288,8 @@ fn render_sqp_transcript(
         let events = sqp_event_codes(snapshot);
         let _ = writeln!(
             out,
-            "{:>4}  {:<6}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>7}  {:>5}  {:>5}  {:>width$}",
-            snapshot.iteration,
+            "{:>width_iter$}  {:<6}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>7}  {:>5}  {:>5}  {:>width_evt$}",
+            iteration_label(snapshot),
             phase,
             fmt_sci(snapshot.objective),
             fmt_opt_sci(snapshot.eq_inf),
@@ -1296,7 +1308,8 @@ fn render_sqp_transcript(
                 .map_or_else(|| "--".to_string(), |ls| ls.backtrack_count.to_string()),
             qp,
             events,
-            width = SQP_EVENT_COLUMN_WIDTH,
+            width_iter = SQP_ITERATION_LABEL_WIDTH,
+            width_evt = SQP_EVENT_COLUMN_WIDTH,
         );
     }
     let detailed_line_search = snapshots
