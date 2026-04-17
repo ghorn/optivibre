@@ -110,10 +110,7 @@ fn typed_symbolic_disk_constrained_rosenbrock_solves_with_runtime_constraint_bou
             &TypedRuntimeNlpBounds {
                 variable_lower: None,
                 variable_upper: None,
-                inequality_lower: Some(Pair {
-                    x: None,
-                    y: None,
-                }),
+                inequality_lower: Some(Pair { x: None, y: None }),
                 inequality_upper: Some(Pair {
                     x: Some(1.5),
                     y: Some(2.0),
@@ -729,10 +726,7 @@ fn typed_symbolic_inequality_only_problem_solves_with_ipopt_without_box_bounds()
             &TypedRuntimeNlpBounds {
                 variable_lower: None,
                 variable_upper: None,
-                inequality_lower: Some(Pair {
-                    x: None,
-                    y: None,
-                }),
+                inequality_lower: Some(Pair { x: None, y: None }),
                 inequality_upper: Some(Pair {
                     x: Some(1.5),
                     y: Some(2.0),

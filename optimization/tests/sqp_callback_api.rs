@@ -3,8 +3,9 @@ use optimization::{
     CCS, ClarabelSqpError, ClarabelSqpOptions, CompiledNlpProblem, LineSearchFilterOptions,
     LineSearchMeritOptions, NonFiniteCallbackStage, NonFiniteInputStage, ParameterMatrix,
     SqpConeKind, SqpFinalStateKind, SqpGlobalization, SqpIterationEvent, SqpIterationPhase,
-    SqpQpRawStatus, SqpStepKind, SqpTermination, SymbolicNlpOutputs, TypedRuntimeNlpBounds,
-    solve_nlp_sqp, solve_nlp_sqp_with_callback, symbolic_nlp,
+    SqpQpRawStatus, SqpStepKind, SqpTermination, SqpTrustRegionOptions, SymbolicNlpOutputs,
+    TrustRegionFilterOptions, TypedRuntimeNlpBounds, solve_nlp_sqp, solve_nlp_sqp_with_callback,
+    symbolic_nlp,
 };
 use rstest::rstest;
 use std::sync::OnceLock;
@@ -1374,6 +1375,55 @@ fn sqp_elastic_recovery_handles_primal_infeasible_linearization() {
             .line_search
             .as_ref()
             .is_some_and(|info| info.step_kind == Some(SqpStepKind::Restoration))
+    }));
+}
+
+#[test]
+fn sqp_trust_region_restoration_handles_primal_infeasible_linearization() {
+    let problem = RecoverableElasticEqualityProblem;
+    let mut snapshots = Vec::new();
+    let summary = solve_nlp_sqp_with_callback(
+        &problem,
+        &[0.0],
+        &[],
+        &ClarabelSqpOptions {
+            verbose: false,
+            max_iters: 20,
+            globalization: SqpGlobalization::TrustRegionFilter(TrustRegionFilterOptions {
+                trust_region: SqpTrustRegionOptions {
+                    initial_radius: 0.5,
+                    max_radius: 1.0,
+                    min_radius: 1.0e-6,
+                    max_radius_contractions: 4,
+                    ..SqpTrustRegionOptions::default()
+                },
+                ..TrustRegionFilterOptions::default()
+            }),
+            restoration_phase: true,
+            elastic_mode: true,
+            elastic_weight: 100.0,
+            ..ClarabelSqpOptions::default()
+        },
+        |snapshot| {
+            snapshots.push(snapshot.clone());
+        },
+    )
+    .expect("trust-region restoration should rescue the infeasible linearization");
+
+    assert_abs_diff_eq!(summary.x[0].abs(), 1.0, epsilon = 1e-6);
+    assert!(summary.equality_inf_norm.is_some_and(|value| value <= 1e-6));
+    assert!(summary.dual_inf_norm <= 1e-6);
+    assert!(summary.profiling.elastic_recovery_activations >= 1);
+    assert!(snapshots.iter().any(|snapshot| {
+        snapshot
+            .events
+            .contains(&SqpIterationEvent::RestorationStepAccepted)
+    }));
+    assert!(snapshots.iter().any(|snapshot| {
+        snapshot
+            .trust_region
+            .as_ref()
+            .is_some_and(|info| info.elastic_recovery_attempted)
     }));
 }
 

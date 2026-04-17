@@ -3541,35 +3541,11 @@ where
         });
 
         if solution.elastic_recovery_used {
-            let trust_region_info = SqpTrustRegionInfo {
-                radius,
-                attempted_radius: radius,
-                contraction_count: contraction,
-                qp_failure_retries: trust_region_qp_failure_retries(&rejected_trials),
-                step_norm,
-                boundary_active,
-                actual_reduction,
-                predicted_reduction,
-                ratio,
-                restoration_attempted: true,
-                elastic_recovery_attempted: true,
-                step_kind: Some(SqpStepKind::Restoration),
-                filter_acceptance_mode,
-                rejected_trials,
-            };
-            return Err(ClarabelSqpError::RestorationFailed {
-                step_inf_norm,
-                context: failure_context_with_qp_failure(
-                    SqpTermination::RestorationFailed,
-                    Some(current_snapshot.clone()),
-                    last_accepted_state.clone(),
-                    None,
-                    Some(trust_region_info),
-                    Some(step_diagnostics),
-                    None,
-                    profiling,
-                ),
-            });
+            radius *= trust_region.shrink_factor;
+            if radius < trust_region.min_radius {
+                break;
+            }
+            continue;
         }
 
         radius *= trust_region.shrink_factor;

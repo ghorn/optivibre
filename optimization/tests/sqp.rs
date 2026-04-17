@@ -1,7 +1,7 @@
 use approx::assert_abs_diff_eq;
 use optimization::{
-    CCS, ClarabelSqpOptions, CompiledNlpProblem, ConstraintBounds, ParameterMatrix,
-    solve_nlp_sqp, validate_nlp_problem_shapes, validate_parameter_inputs,
+    CCS, ClarabelSqpOptions, CompiledNlpProblem, ConstraintBounds, ParameterMatrix, solve_nlp_sqp,
+    validate_nlp_problem_shapes, validate_parameter_inputs,
 };
 use rstest::rstest;
 use std::time::Duration;

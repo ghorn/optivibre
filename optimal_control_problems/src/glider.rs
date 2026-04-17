@@ -1277,10 +1277,9 @@ mod tests {
             .expect("reduced glider direct collocation should compile");
 
         let mut sqp_options = crate::common::sqp_options(&params.solver);
-        sqp_options.globalization =
-            optimization::SqpGlobalization::LineSearchMerit(
-                optimization::LineSearchMeritOptions::default(),
-            );
+        sqp_options.globalization = optimization::SqpGlobalization::LineSearchMerit(
+            optimization::LineSearchMeritOptions::default(),
+        );
         sqp_options.verbose = false;
         sqp_options.max_iters = 6;
 
@@ -1316,10 +1315,9 @@ mod tests {
             .expect("reduced glider direct collocation should compile");
 
         let mut sqp_options = crate::common::sqp_options(&params.solver);
-        sqp_options.globalization =
-            optimization::SqpGlobalization::LineSearchMerit(
-                optimization::LineSearchMeritOptions::default(),
-            );
+        sqp_options.globalization = optimization::SqpGlobalization::LineSearchMerit(
+            optimization::LineSearchMeritOptions::default(),
+        );
         sqp_options.verbose = false;
         sqp_options.max_iters = 20;
 
@@ -1374,10 +1372,9 @@ mod tests {
             .expect("reduced glider direct collocation should compile");
 
         let mut sqp_options = crate::common::sqp_options(&params.solver);
-        sqp_options.globalization =
-            optimization::SqpGlobalization::LineSearchFilter(
-                optimization::LineSearchFilterOptions::default(),
-            );
+        sqp_options.globalization = optimization::SqpGlobalization::LineSearchFilter(
+            optimization::LineSearchFilterOptions::default(),
+        );
         sqp_options.verbose = false;
         sqp_options.max_iters = 6;
 
@@ -1489,10 +1486,9 @@ mod tests {
         let compiled = compiled.compiled.borrow();
 
         let mut sqp_options = crate::common::sqp_options(&params.solver);
-        sqp_options.globalization =
-            optimization::SqpGlobalization::LineSearchMerit(
-                optimization::LineSearchMeritOptions::default(),
-            );
+        sqp_options.globalization = optimization::SqpGlobalization::LineSearchMerit(
+            optimization::LineSearchMeritOptions::default(),
+        );
         sqp_options.verbose = false;
         sqp_options.max_iters = 4;
         let mut sqp_iterations = Vec::new();

@@ -9,8 +9,8 @@ use optimization::{
     SymbolicCompileMetadata, SymbolicCompileProgress, SymbolicCompileStageProgress,
     SymbolicNlpBuildError, SymbolicNlpCompileError, SymbolicNlpCompileOptions, SymbolicNlpOutputs,
     TypedCompiledJitNlp, TypedNlpScaling, TypedRuntimeNlpBounds, Vectorize, VectorizeLayoutError,
-    classify_constraint_satisfaction, constraint_bound_side, flatten_value, symbolic_column,
-    symbolic_nlp, symbolic_value, rebind_from_flat, unflatten_value, worst_bound_violation,
+    classify_constraint_satisfaction, constraint_bound_side, flatten_value, rebind_from_flat,
+    symbolic_column, symbolic_nlp, symbolic_value, unflatten_value, worst_bound_violation,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptIterationSnapshot, IpoptOptions, IpoptSolveError, IpoptSummary};
@@ -3434,22 +3434,26 @@ where
             variable_upper: Some(rebind_from_flat::<MsVars<X, U, N>, SX, Option<f64>>(
                 &upper,
             )?),
-            inequality_lower: Some(rebind_from_flat::<MsIneq<C, Beq, Bineq, N>, SX, Option<f64>>(
-                &build_inequality_lower::<C, Beq, Bineq>(
-                    &self.promotion_plan,
-                    &offsets,
-                    &values.path_bounds,
-                    &values.bineq_bounds,
+            inequality_lower: Some(
+                rebind_from_flat::<MsIneq<C, Beq, Bineq, N>, SX, Option<f64>>(
+                    &build_inequality_lower::<C, Beq, Bineq>(
+                        &self.promotion_plan,
+                        &offsets,
+                        &values.path_bounds,
+                        &values.bineq_bounds,
+                    )?,
                 )?,
-            )?),
-            inequality_upper: Some(rebind_from_flat::<MsIneq<C, Beq, Bineq, N>, SX, Option<f64>>(
-                &build_inequality_upper::<C, Beq, Bineq>(
-                    &self.promotion_plan,
-                    &offsets,
-                    &values.path_bounds,
-                    &values.bineq_bounds,
+            ),
+            inequality_upper: Some(
+                rebind_from_flat::<MsIneq<C, Beq, Bineq, N>, SX, Option<f64>>(
+                    &build_inequality_upper::<C, Beq, Bineq>(
+                        &self.promotion_plan,
+                        &offsets,
+                        &values.path_bounds,
+                        &values.bineq_bounds,
+                    )?,
                 )?,
-            )?),
+            ),
             scaling,
         })
     }
@@ -3542,8 +3546,7 @@ where
             Rebind<SX> = DcIneq<C, Beq, Bineq, N, K>,
             Rebind<f64> = DcIneqNum<C, Beq, Bineq, N, K>,
         >,
-    <DcIneq<C, Beq, Bineq, N, K> as Vectorize<SX>>::Rebind<Option<f64>>:
-        Vectorize<Option<f64>>,
+    <DcIneq<C, Beq, Bineq, N, K> as Vectorize<SX>>::Rebind<Option<f64>>: Vectorize<Option<f64>>,
     OcpParameters<P, Beq>:
         Vectorize<SX, Rebind<SX> = OcpParameters<P, Beq>, Rebind<f64> = OcpParametersNum<P, Beq>>,
     [X; N]: Vectorize<SX, Rebind<SX> = [X; N]>,
@@ -4248,26 +4251,22 @@ where
                 DcIneq<C, Beq, Bineq, N, K>,
                 SX,
                 Option<f64>,
-            >(
-                &build_inequality_lower::<C, Beq, Bineq>(
-                    &self.promotion_plan,
-                    &offsets,
-                    &values.path_bounds,
-                    &values.bineq_bounds,
-                )?,
-            )?),
+            >(&build_inequality_lower::<C, Beq, Bineq>(
+                &self.promotion_plan,
+                &offsets,
+                &values.path_bounds,
+                &values.bineq_bounds,
+            )?)?),
             inequality_upper: Some(rebind_from_flat::<
                 DcIneq<C, Beq, Bineq, N, K>,
                 SX,
                 Option<f64>,
-            >(
-                &build_inequality_upper::<C, Beq, Bineq>(
-                    &self.promotion_plan,
-                    &offsets,
-                    &values.path_bounds,
-                    &values.bineq_bounds,
-                )?,
-            )?),
+            >(&build_inequality_upper::<C, Beq, Bineq>(
+                &self.promotion_plan,
+                &offsets,
+                &values.path_bounds,
+                &values.bineq_bounds,
+            )?)?),
             scaling,
         })
     }
