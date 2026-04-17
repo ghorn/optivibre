@@ -55,7 +55,7 @@ pub use optimization_derive::Vectorize;
 pub use symbolic::{
     ConstraintBounds, RuntimeBoundedJitNlp, RuntimeNlpBounds, SymbolicNlpBuildError,
     SymbolicNlpCompileError, SymbolicNlpCompileOptions, SymbolicNlpOutputs, TypedCompiledJitNlp,
-    TypedRuntimeNlpBounds, TypedSymbolicNlp, symbolic_nlp,
+    TypedNlpScaling, TypedRuntimeNlpBounds, TypedSymbolicNlp, symbolic_nlp,
 };
 pub use validation::{
     FiniteDifferenceValidationOptions, NlpDerivativeValidationReport, ValidationSparsitySummary,
@@ -74,6 +74,7 @@ pub(crate) const EQ_INF_LABEL: &str = "‖eq‖∞";
 pub(crate) const INEQ_INF_LABEL: &str = "‖ineq₊‖∞";
 pub(crate) const DUAL_INF_LABEL: &str = "‖∇L‖∞";
 pub(crate) const SQP_COMP_INF_LABEL: &str = "‖g∘λ‖∞";
+pub(crate) const OVERALL_INF_LABEL: &str = "‖overall‖∞";
 pub(crate) const STEP_INF_LABEL: &str = "‖Δx‖∞";
 pub(crate) const PRIMAL_INF_LABEL: &str = "max(‖eq‖∞, ‖ineq₊‖∞)";
 
@@ -616,6 +617,9 @@ pub trait CompiledNlpProblem {
     fn adapter_timing_snapshot(&self) -> Option<SolverAdapterTiming> {
         self.sqp_adapter_timing_snapshot()
     }
+    fn ipopt_nlp_scaling_method(&self) -> Option<&'static str> {
+        None
+    }
     fn sqp_adapter_timing_snapshot(&self) -> Option<SqpAdapterTiming> {
         None
     }
@@ -853,6 +857,9 @@ pub struct ClarabelSqpOptions {
     pub dual_tol: f64,
     pub constraint_tol: f64,
     pub complementarity_tol: f64,
+    pub overall_tol: f64,
+    pub overall_scale_max: f64,
+    pub merit_penalty: f64,
     pub hessian_regularization_enabled: bool,
     pub regularization: f64,
     pub globalization: SqpGlobalization,
@@ -1161,6 +1168,9 @@ impl Default for ClarabelSqpOptions {
             dual_tol: 1e-6,
             constraint_tol: 1e-6,
             complementarity_tol: 1e-6,
+            overall_tol: 1e-6,
+            overall_scale_max: 100.0,
+            merit_penalty: 10.0,
             hessian_regularization_enabled: false,
             regularization: 1e-6,
             globalization: SqpGlobalization::default(),
@@ -1175,6 +1185,26 @@ impl Default for ClarabelSqpOptions {
             elastic_restore_max_iters: 5,
             verbose: true,
         }
+    }
+}
+
+fn sqp_globalization_exact_merit_penalty(options: &ClarabelSqpOptions) -> f64 {
+    match &options.globalization {
+        SqpGlobalization::LineSearchMerit(globalization) => globalization.exact_merit_penalty,
+        SqpGlobalization::LineSearchFilter(globalization) => globalization.exact_merit_penalty,
+        SqpGlobalization::TrustRegionMerit(globalization) => globalization.exact_merit_penalty,
+        SqpGlobalization::TrustRegionFilter(globalization) => globalization.exact_merit_penalty,
+    }
+}
+
+fn sqp_effective_exact_merit_penalty(options: &ClarabelSqpOptions) -> f64 {
+    let globalization_penalty = sqp_globalization_exact_merit_penalty(options);
+    if (options.merit_penalty - ClarabelSqpOptions::default().merit_penalty).abs() > f64::EPSILON
+        && (globalization_penalty - 10.0).abs() <= f64::EPSILON
+    {
+        options.merit_penalty
+    } else {
+        globalization_penalty
     }
 }
 
@@ -1668,6 +1698,7 @@ pub struct SqpIterationSnapshot {
     pub ineq_inf: Option<f64>,
     pub dual_inf: f64,
     pub comp_inf: Option<f64>,
+    pub overall_inf: f64,
     pub step_inf: Option<f64>,
     pub penalty: f64,
     pub line_search: Option<SqpLineSearchInfo>,
@@ -1697,6 +1728,7 @@ pub struct ClarabelSqpSummary {
     pub primal_inf_norm: f64,
     pub dual_inf_norm: f64,
     pub complementarity_inf_norm: Option<f64>,
+    pub overall_inf_norm: f64,
     pub termination: SqpTermination,
     pub final_state: SqpIterationSnapshot,
     pub final_state_kind: SqpFinalStateKind,
@@ -1954,6 +1986,14 @@ fn inf_norm(values: &[f64]) -> f64 {
     values.iter().fold(0.0, |acc, value| acc.max(value.abs()))
 }
 
+fn average_abs(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        0.0
+    } else {
+        values.iter().map(|value| value.abs()).sum::<f64>() / values.len() as f64
+    }
+}
+
 fn positive_part(value: f64) -> f64 {
     value.max(0.0)
 }
@@ -2058,6 +2098,21 @@ fn second_order_correction_step(
     let correction = correction.column(0).iter().copied().collect::<Vec<_>>();
     (inf_norm(&correction) > 0.0 && correction.iter().all(|value| value.is_finite()))
         .then_some(correction)
+}
+
+pub(crate) fn scaled_overall_inf_norm(
+    primal_inf: f64,
+    dual_inf: f64,
+    complementarity_inf: f64,
+    all_dual_multipliers: &[f64],
+    complementarity_multipliers: &[f64],
+    scale_max: f64,
+) -> f64 {
+    let dual_scale = (average_abs(all_dual_multipliers) / scale_max).max(1.0);
+    let complementarity_scale = (average_abs(complementarity_multipliers) / scale_max).max(1.0);
+    primal_inf
+        .max(dual_inf / dual_scale)
+        .max(complementarity_inf / complementarity_scale)
 }
 
 fn dot(lhs: &[f64], rhs: &[f64]) -> f64 {
@@ -4605,12 +4660,14 @@ fn log_sqp_status_summary(summary: &ClarabelSqpSummary, options: &ClarabelSqpOpt
         boxed_line(
             "result",
             format!(
-                "objective={}  {}={}  {}={}",
+                "objective={}  {}={}  {}={}  {}={}",
                 sci_text(summary.objective),
                 PRIMAL_INF_LABEL,
                 style_residual_text(summary.primal_inf_norm, options.constraint_tol),
                 DUAL_INF_LABEL,
                 style_residual_text(summary.dual_inf_norm, options.dual_tol),
+                OVERALL_INF_LABEL,
+                style_residual_text(summary.overall_inf_norm, options.overall_tol),
             ),
         ),
         boxed_line(
@@ -4797,7 +4854,6 @@ fn log_sqp_problem_header<P>(
         trust_region,
         filter_options,
         penalty_settings,
-        exact_merit_penalty,
         uses_filter,
     ) = match &options.globalization {
         SqpGlobalization::LineSearchMerit(globalization) => (
@@ -4809,7 +4865,6 @@ fn log_sqp_problem_header<P>(
                 globalization.penalty_increase_factor,
                 globalization.max_penalty_updates,
             )),
-            globalization.exact_merit_penalty,
             false,
         ),
         SqpGlobalization::LineSearchFilter(globalization) => (
@@ -4818,7 +4873,6 @@ fn log_sqp_problem_header<P>(
             None,
             Some(&globalization.filter),
             None,
-            globalization.exact_merit_penalty,
             true,
         ),
         SqpGlobalization::TrustRegionMerit(globalization) => (
@@ -4827,7 +4881,6 @@ fn log_sqp_problem_header<P>(
             Some(&globalization.trust_region),
             None,
             None,
-            globalization.exact_merit_penalty,
             false,
         ),
         SqpGlobalization::TrustRegionFilter(globalization) => (
@@ -4836,10 +4889,10 @@ fn log_sqp_problem_header<P>(
             Some(&globalization.trust_region),
             Some(&globalization.filter),
             None,
-            globalization.exact_merit_penalty,
             true,
         ),
     };
+    let exact_merit_penalty = sqp_effective_exact_merit_penalty(options);
     let n = problem.dimension();
     let equality_count = problem.equality_count();
     let inequality_count = problem.inequality_count();
@@ -4876,10 +4929,12 @@ fn log_sqp_problem_header<P>(
         boxed_line(
             "tolerances",
             format!(
-                "dual={}  constraint={}  complementarity={}",
+                "dual={}  constraint={}  complementarity={}  overall={}  s_max={}",
                 sci_text(options.dual_tol),
                 sci_text(options.constraint_tol),
                 sci_text(options.complementarity_tol),
+                sci_text(options.overall_tol),
+                sci_text(options.overall_scale_max),
             ),
         ),
         boxed_line("summary", format_sqp_settings_summary(options)),
@@ -5175,6 +5230,7 @@ fn log_sqp_iteration(
             format!("{:>9}", INEQ_INF_LABEL),
             format!("{:>9}", DUAL_INF_LABEL),
             format!("{:>9}", SQP_COMP_INF_LABEL),
+            format!("{:>9}", OVERALL_INF_LABEL),
             format!("{:>9}", STEP_INF_LABEL),
             format!("{:>9}", "penalty"),
             format!("{:>9}", "α"),
@@ -5206,6 +5262,7 @@ fn log_sqp_iteration(
             options.complementarity_tol,
             snapshot.comp_inf.is_some(),
         ),
+        style_residual_cell(snapshot.overall_inf, options.overall_tol, true),
         fmt_optional_sci(snapshot.step_inf),
         fmt_sci(snapshot.penalty),
         fmt_alpha(line_search.map(|info| info.accepted_alpha)),
@@ -5235,6 +5292,22 @@ fn validate_finite_inputs(
                 stage: NonFiniteInputStage::ParameterValues { parameter_index },
             });
         }
+    }
+    Ok(())
+}
+
+fn validate_sqp_options(options: &ClarabelSqpOptions) -> std::result::Result<(), ClarabelSqpError> {
+    if !options.overall_tol.is_finite() || options.overall_tol < 0.0 {
+        return Err(ClarabelSqpError::InvalidInput(format!(
+            "overall_tol must be finite and non-negative, got {}",
+            options.overall_tol
+        )));
+    }
+    if !options.overall_scale_max.is_finite() || options.overall_scale_max <= 0.0 {
+        return Err(ClarabelSqpError::InvalidInput(format!(
+            "overall_scale_max must be finite and positive, got {}",
+            options.overall_scale_max
+        )));
     }
     Ok(())
 }
@@ -5831,6 +5904,7 @@ where
         .map_err(|err| ClarabelSqpError::InvalidInput(err.to_string()))?;
     validate_parameter_inputs(problem, parameters)
         .map_err(|err| ClarabelSqpError::InvalidInput(err.to_string()))?;
+    validate_sqp_options(options)?;
     validate_finite_inputs(x0, parameters)?;
     let validation_elapsed = validation_started.elapsed();
     profiling.preprocessing_steps += 1;
@@ -5898,12 +5972,7 @@ where
         )),
         _ => None,
     };
-    let exact_merit_penalty = match &options.globalization {
-        SqpGlobalization::LineSearchMerit(globalization) => globalization.exact_merit_penalty,
-        SqpGlobalization::LineSearchFilter(globalization) => globalization.exact_merit_penalty,
-        SqpGlobalization::TrustRegionMerit(globalization) => globalization.exact_merit_penalty,
-        SqpGlobalization::TrustRegionFilter(globalization) => globalization.exact_merit_penalty,
-    };
+    let exact_merit_penalty = sqp_effective_exact_merit_penalty(options);
     let uses_filter = filter_settings.is_some();
     let is_trust_region = trust_region_options.is_some();
     let min_line_search_step = line_search_options.map(|line_search| line_search.min_step);
@@ -6046,6 +6115,7 @@ where
             current_filter_entry,
             dual_inf,
             complementarity_inf,
+            overall_inf,
         );
         {
             let preprocess_started = Instant::now();
@@ -6079,6 +6149,11 @@ where
                 upper_bound_multipliers.as_slice(),
             ]
             .concat();
+            let all_dual_multipliers = [
+                equality_multipliers.as_slice(),
+                all_inequality_multipliers.as_slice(),
+            ]
+            .concat();
             let dual_residual = lagrangian_gradient(
                 &gradient,
                 &equality_jacobian,
@@ -6089,6 +6164,14 @@ where
             dual_inf = inf_norm(&dual_residual);
             complementarity_inf =
                 complementarity_inf_norm(&augmented_inequality_values, &all_inequality_multipliers);
+            overall_inf = scaled_overall_inf_norm(
+                primal_inf,
+                dual_inf,
+                complementarity_inf,
+                &all_dual_multipliers,
+                &all_inequality_multipliers,
+                options.overall_scale_max,
+            );
             let preprocess_elapsed = preprocess_started.elapsed();
             iteration_preprocess_time += preprocess_elapsed;
             profiling.preprocessing_time += preprocess_elapsed;
@@ -6097,7 +6180,8 @@ where
         {
             let convergence_started = Instant::now();
             let convergence_check_started = Instant::now();
-            converged = primal_inf <= options.constraint_tol
+            converged = overall_inf <= options.overall_tol
+                && primal_inf <= options.constraint_tol
                 && dual_inf <= options.dual_tol
                 && complementarity_inf <= options.complementarity_tol;
             let convergence_check_elapsed = convergence_check_started.elapsed();
@@ -6131,6 +6215,7 @@ where
             ineq_inf: (augmented_inequality_count > 0).then_some(inequality_inf),
             dual_inf,
             comp_inf: (augmented_inequality_count > 0).then_some(complementarity_inf),
+            overall_inf,
             step_inf: previous_step_inf,
             penalty: merit_penalty,
             line_search: previous_line_search.clone(),
@@ -6199,6 +6284,7 @@ where
                 dual_inf_norm: dual_inf,
                 complementarity_inf_norm: (augmented_inequality_count > 0)
                     .then_some(complementarity_inf),
+                overall_inf_norm: overall_inf,
                 termination: SqpTermination::Converged,
                 final_state: current_snapshot.clone(),
                 final_state_kind: final_state_kind(&current_snapshot),
@@ -6452,8 +6538,10 @@ where
         let current_qp = (total_constraint_count > 0).then_some(current_qp_info.clone());
 
         let candidate_all_inequality_multipliers;
+        let candidate_all_dual_multipliers;
         let candidate_dual_inf;
         let candidate_complementarity_inf;
+        let candidate_overall_inf;
         {
             let multiplier_estimation_started_all = Instant::now();
             let multiplier_estimation_started = Instant::now();
@@ -6461,6 +6549,11 @@ where
                 candidate_inequality_multipliers.as_slice(),
                 candidate_lower_bound_multipliers.as_slice(),
                 candidate_upper_bound_multipliers.as_slice(),
+            ]
+            .concat();
+            candidate_all_dual_multipliers = [
+                candidate_equality_multipliers.as_slice(),
+                candidate_all_inequality_multipliers.as_slice(),
             ]
             .concat();
             candidate_dual_inf = inf_norm(&lagrangian_gradient(
@@ -6474,6 +6567,14 @@ where
                 &augmented_inequality_values,
                 &candidate_all_inequality_multipliers,
             );
+            candidate_overall_inf = scaled_overall_inf_norm(
+                primal_inf,
+                candidate_dual_inf,
+                candidate_complementarity_inf,
+                &candidate_all_dual_multipliers,
+                &candidate_all_inequality_multipliers,
+                options.overall_scale_max,
+            );
             let multiplier_estimation_elapsed = multiplier_estimation_started.elapsed();
             profiling.multiplier_estimations += 1;
             iteration_multiplier_estimation_time += multiplier_estimation_elapsed;
@@ -6485,7 +6586,8 @@ where
         {
             let convergence_started = Instant::now();
             let convergence_check_started = Instant::now();
-            candidate_converged = primal_inf <= options.constraint_tol
+            candidate_converged = candidate_overall_inf <= options.overall_tol
+                && primal_inf <= options.constraint_tol
                 && candidate_dual_inf <= options.dual_tol
                 && candidate_complementarity_inf <= options.complementarity_tol;
             let convergence_check_elapsed = convergence_check_started.elapsed();
@@ -6513,6 +6615,7 @@ where
                 ineq_inf: (augmented_inequality_count > 0).then_some(inequality_inf),
                 dual_inf: candidate_dual_inf,
                 comp_inf: (augmented_inequality_count > 0).then_some(candidate_complementarity_inf),
+                overall_inf: candidate_overall_inf,
                 step_inf: None,
                 penalty: merit_penalty,
                 line_search: None,
@@ -6596,6 +6699,7 @@ where
                 dual_inf_norm: candidate_dual_inf,
                 complementarity_inf_norm: (augmented_inequality_count > 0)
                     .then_some(candidate_complementarity_inf),
+                overall_inf_norm: candidate_overall_inf,
                 termination: SqpTermination::Converged,
                 final_state: post_convergence_state.clone(),
                 final_state_kind: final_state_kind(&post_convergence_state),
@@ -7220,11 +7324,30 @@ where
         final_iteration_preprocess_time += final_preprocess_elapsed;
         profiling.preprocessing_time += final_preprocess_elapsed;
     }
-    let _final_primal_inf = equality_inf.max(inequality_inf);
+    let final_primal_inf = equality_inf.max(inequality_inf);
     let final_iteration_elapsed = iteration_started.elapsed();
     let final_iteration_subproblem_assembly_time = Duration::ZERO;
     let iteration_preprocess_other_time = final_iteration_preprocess_time.saturating_sub(
         iteration_jacobian_assembly_time + final_iteration_subproblem_assembly_time,
+    );
+    let all_inequality_multipliers = [
+        inequality_multipliers.as_slice(),
+        lower_bound_multipliers.as_slice(),
+        upper_bound_multipliers.as_slice(),
+    ]
+    .concat();
+    let all_dual_multipliers = [
+        equality_multipliers.as_slice(),
+        all_inequality_multipliers.as_slice(),
+    ]
+    .concat();
+    let overall_inf = scaled_overall_inf_norm(
+        final_primal_inf,
+        dual_inf,
+        complementarity_inf,
+        &all_dual_multipliers,
+        &all_inequality_multipliers,
+        options.overall_scale_max,
     );
     let final_snapshot = SqpIterationSnapshot {
         iteration: max_iteration,
@@ -7236,6 +7359,7 @@ where
         ineq_inf: (augmented_inequality_count > 0).then_some(inequality_inf),
         dual_inf,
         comp_inf: (augmented_inequality_count > 0).then_some(complementarity_inf),
+        overall_inf,
         step_inf: previous_step_inf,
         penalty: merit_penalty,
         line_search: previous_line_search.clone(),

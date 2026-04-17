@@ -34,6 +34,7 @@ pub(crate) fn case() -> ProblemCase {
                     variable_upper: Some(Pair { x: 50.0, y: 50.0 }),
                     inequality_lower: Some(-f64::INFINITY),
                     inequality_upper: Some(0.0),
+                    scaling: None,
                 },
             })
         },

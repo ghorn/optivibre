@@ -370,6 +370,7 @@ fn sqp_options() -> ClarabelSqpOptions {
         dual_tol: 5.0e-2,
         constraint_tol: 1.0e-8,
         complementarity_tol: 1.0e-6,
+        overall_tol: 5.0e-2,
         ..ClarabelSqpOptions::default()
     }
 }
@@ -399,6 +400,7 @@ fn multiple_shooting_tracks_finite_horizon_lqr_reference_and_emits_structured_ca
             upper: Some(TF),
         },
         initial_guess: MultipleShootingInitialGuess::Interpolated(ms_interpolated_guess::<N>()),
+        scaling: None,
     };
     let options = sqp_options();
     let mut callback_count = 0usize;
@@ -440,6 +442,7 @@ fn direct_collocation_tracks_finite_horizon_lqr_reference() {
             upper: Some(TF),
         },
         initial_guess: DirectCollocationInitialGuess::Explicit(dc_explicit_guess::<N, K>()),
+        scaling: None,
     };
     let options = sqp_options();
     let result = compiled
@@ -494,6 +497,7 @@ fn rollout_initial_guess_from_steady_state_lqr_gain_converges() {
                     + gain[(0, 2)] * u.acceleration),
             }),
         },
+        scaling: None,
     };
     let options = sqp_options();
     let result = compiled

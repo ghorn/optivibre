@@ -759,6 +759,9 @@ where
         if let Some(value) = options.dual_tol {
             set_ipopt_option(&mut solver, "dual_inf_tol", value)?;
         }
+        if let Some(method) = problem.ipopt_nlp_scaling_method() {
+            set_ipopt_option(&mut solver, "nlp_scaling_method", method)?;
+        }
         set_ipopt_option(&mut solver, "mu_strategy", options.mu_strategy.as_str())?;
         set_ipopt_option(&mut solver, "print_level", options.print_level)?;
         if options.suppress_banner {
@@ -830,6 +833,9 @@ where
     }
     if let Some(value) = options.dual_tol {
         set_ipopt_option(&mut solver, "dual_inf_tol", value)?;
+    }
+    if let Some(method) = problem.ipopt_nlp_scaling_method() {
+        set_ipopt_option(&mut solver, "nlp_scaling_method", method)?;
     }
     set_ipopt_option(&mut solver, "mu_strategy", options.mu_strategy.as_str())?;
     set_ipopt_option(&mut solver, "print_level", options.print_level)?;

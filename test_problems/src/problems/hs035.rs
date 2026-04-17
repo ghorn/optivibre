@@ -48,6 +48,7 @@ pub(crate) fn case() -> ProblemCase {
                     variable_upper: None,
                     inequality_lower: Some(-f64::INFINITY),
                     inequality_upper: Some(0.0),
+                    scaling: None,
                 },
             })
         },

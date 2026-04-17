@@ -8,14 +8,16 @@ use thiserror::Error;
 
 use super::{
     BackendTimingMetadata, BoundConstraints, CompiledNlpProblem, DUAL_INF_LABEL, EQ_INF_LABEL,
-    EvalTimingStat, FilterAcceptanceMode, FilterInfo, INEQ_INF_LABEL, Index, PRIMAL_INF_LABEL,
-    ParameterMatrix, SolverAdapterTiming, SqpEventLegendState, augment_inequality_values,
+    EvalTimingStat, FilterAcceptanceMode, FilterInfo, INEQ_INF_LABEL, Index, OVERALL_INF_LABEL,
+    PRIMAL_INF_LABEL, ParameterMatrix, SolverAdapterTiming, SqpEventLegendState,
+    augment_inequality_values,
     boxed_line, build_bound_jacobian, ccs_to_dense, choose_summary_duration_unit,
     collect_bound_constraints, compact_duration_text, complementarity_inf_norm,
     declared_box_constraint_count, dense_fill_percent, fmt_duration_in_unit,
     fmt_optional_duration_in_unit, inf_norm, lagrangian_gradient, log_boxed_section,
     lower_tri_fill_percent, lower_triangle_to_symmetric_dense, positive_part_inf_norm,
-    regularize_hessian, sci_text, split_augmented_inequality_multipliers, style_bold,
+    regularize_hessian, scaled_overall_inf_norm, sci_text,
+    split_augmented_inequality_multipliers, style_bold,
     style_cyan_bold, style_green_bold, style_iteration_label_cell, style_metric_against_tolerance,
     style_red_bold, style_yellow_bold, time_callback, validate_nlp_problem_shapes,
     validate_parameter_inputs,
@@ -54,6 +56,8 @@ pub struct InteriorPointOptions {
     pub dual_tol: f64,
     pub constraint_tol: f64,
     pub complementarity_tol: f64,
+    pub overall_tol: f64,
+    pub overall_scale_max: f64,
     pub fraction_to_boundary: f64,
     pub line_search_beta: f64,
     pub line_search_c1: f64,
@@ -76,6 +80,8 @@ impl Default for InteriorPointOptions {
             dual_tol: 2e-6,
             constraint_tol: 1e-6,
             complementarity_tol: 1e-6,
+            overall_tol: 1e-6,
+            overall_scale_max: 100.0,
             fraction_to_boundary: 0.995,
             line_search_beta: 0.5,
             line_search_c1: 1e-4,
@@ -174,6 +180,7 @@ pub struct InteriorPointSummary {
     pub primal_inf_norm: f64,
     pub dual_inf_norm: f64,
     pub complementarity_inf_norm: f64,
+    pub overall_inf_norm: f64,
     pub barrier_parameter: f64,
     pub profiling: InteriorPointProfiling,
     pub linear_solver: InteriorPointLinearSolver,
@@ -258,6 +265,7 @@ pub struct InteriorPointIterationSnapshot {
     pub ineq_inf: Option<f64>,
     pub dual_inf: f64,
     pub comp_inf: Option<f64>,
+    pub overall_inf: f64,
     pub barrier_parameter: Option<f64>,
     pub step_inf: Option<f64>,
     pub alpha: Option<f64>,
@@ -403,6 +411,7 @@ struct AcceptedInteriorPointTrial {
     inequality_inf: f64,
     dual_inf: f64,
     complementarity_inf: f64,
+    overall_inf: f64,
     mu: f64,
     filter_entry: super::FilterEntry,
     filter_acceptance_mode: Option<FilterAcceptanceMode>,
@@ -1280,6 +1289,7 @@ struct InteriorPointIterationLog {
     inequality_inf: f64,
     dual_inf: f64,
     complementarity_inf: f64,
+    overall_inf: f64,
     barrier_parameter: f64,
     alpha: Option<f64>,
     line_search_iterations: Option<Index>,
@@ -1287,6 +1297,7 @@ struct InteriorPointIterationLog {
     constraint_tol: f64,
     dual_tol: f64,
     complementarity_tol: f64,
+    overall_tol: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1422,6 +1433,7 @@ fn log_interior_point_iteration(
             format!("{:>9}", INEQ_INF_LABEL),
             format!("{:>9}", DUAL_INF_LABEL),
             format!("{:>9}", IP_COMP_INF_LABEL),
+            format!("{:>9}", OVERALL_INF_LABEL),
             format!("{:>9}", "mu"),
             format!("{:>9}", "α"),
             format!("{:>5}", "ls_it"),
@@ -1457,6 +1469,7 @@ fn log_interior_point_iteration(
             log.complementarity_tol,
             log.flags.has_inequalities,
         ),
+        style_ip_residual_cell(log.overall_inf, log.overall_tol, true),
         format!("{:>9}", sci_text(log.barrier_parameter)),
         fmt_optional_ip_sci(log.alpha),
         style_ip_line_search_cell(log.line_search_iterations),
@@ -1512,10 +1525,12 @@ fn log_interior_point_problem_header<P>(
         boxed_line(
             "tolerances",
             format!(
-                "dual={}  constraint={}  complementarity={}",
+                "dual={}  constraint={}  complementarity={}  overall={}  s_max={}",
                 sci_text(options.dual_tol),
                 sci_text(options.constraint_tol),
                 sci_text(options.complementarity_tol),
+                sci_text(options.overall_tol),
+                sci_text(options.overall_scale_max),
             ),
         ),
         boxed_line("summary", format_nlip_settings_summary(options)),
@@ -1674,12 +1689,14 @@ fn log_interior_point_status_summary(
         boxed_line(
             "result",
             format!(
-                "objective={}  {}={}  {}={}  mu={}",
+                "objective={}  {}={}  {}={}  {}={}  mu={}",
                 sci_text(summary.objective),
                 PRIMAL_INF_LABEL,
                 style_ip_residual_text(summary.primal_inf_norm, options.constraint_tol, true),
                 DUAL_INF_LABEL,
                 style_ip_residual_text(summary.dual_inf_norm, options.dual_tol, true),
+                OVERALL_INF_LABEL,
+                style_ip_residual_text(summary.overall_inf_norm, options.overall_tol, true),
                 sci_text(summary.barrier_parameter),
             ),
         ),
@@ -1853,6 +1870,24 @@ fn finalise_interior_point_profiling(
     );
 }
 
+fn validate_interior_point_options(
+    options: &InteriorPointOptions,
+) -> std::result::Result<(), InteriorPointSolveError> {
+    if !options.overall_tol.is_finite() || options.overall_tol < 0.0 {
+        return Err(InteriorPointSolveError::InvalidInput(format!(
+            "overall_tol must be finite and non-negative, got {}",
+            options.overall_tol
+        )));
+    }
+    if !options.overall_scale_max.is_finite() || options.overall_scale_max <= 0.0 {
+        return Err(InteriorPointSolveError::InvalidInput(format!(
+            "overall_scale_max must be finite and positive, got {}",
+            options.overall_scale_max
+        )));
+    }
+    Ok(())
+}
+
 pub fn solve_nlp_interior_point<P>(
     problem: &P,
     x0: &[f64],
@@ -1886,6 +1921,7 @@ where
         .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
     validate_parameter_inputs(problem, parameters)
         .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
+    validate_interior_point_options(options)?;
     profiling.preprocessing_steps += 1;
     profiling.preprocessing_time += validation_started.elapsed();
 
@@ -1962,6 +1998,15 @@ where
         if options.filter_method && filter_entries.is_empty() {
             super::filter::update_frontier(&mut filter_entries, current_filter_entry.clone());
         }
+        let all_dual_multipliers = [lambda_eq.as_slice(), z.as_slice()].concat();
+        let overall_inf = scaled_overall_inf_norm(
+            equality_inf.max(inequality_inf),
+            dual_inf,
+            complementarity_inf,
+            &all_dual_multipliers,
+            &z,
+            options.overall_scale_max,
+        );
         let snapshot = InteriorPointIterationSnapshot {
             iteration: 0,
             phase: InteriorPointIterationPhase::Initial,
@@ -1971,6 +2016,7 @@ where
             ineq_inf: (augmented_inequality_count > 0).then_some(inequality_inf),
             dual_inf,
             comp_inf: (augmented_inequality_count > 0).then_some(complementarity_inf),
+            overall_inf,
             barrier_parameter: (augmented_inequality_count > 0).then_some(mu),
             step_inf: None,
             alpha: None,
@@ -2012,6 +2058,7 @@ where
                     inequality_inf,
                     dual_inf,
                     complementarity_inf,
+                    overall_inf,
                     barrier_parameter: if augmented_inequality_count > 0 {
                         mu.max(options.mu_min)
                     } else {
@@ -2023,6 +2070,7 @@ where
                     constraint_tol: options.constraint_tol,
                     dual_tol: options.dual_tol,
                     complementarity_tol: options.complementarity_tol,
+                    overall_tol: options.overall_tol,
                 },
                 &mut event_state,
             );
@@ -2069,6 +2117,15 @@ where
         } else {
             0.0
         };
+        let all_dual_multipliers = [lambda_eq.as_slice(), z.as_slice()].concat();
+        let overall_inf = scaled_overall_inf_norm(
+            primal_inf,
+            dual_inf,
+            complementarity_inf,
+            &all_dual_multipliers,
+            &z,
+            options.overall_scale_max,
+        );
         if augmented_inequality_count > 0
             && primal_inf <= (100.0 * options.constraint_tol).max(1e-6)
             && complementarity_inf <= (100.0 * options.complementarity_tol).max(1e-8)
@@ -2118,6 +2175,7 @@ where
             ineq_inf: (augmented_inequality_count > 0).then_some(inequality_inf),
             dual_inf,
             comp_inf: (augmented_inequality_count > 0).then_some(complementarity_inf),
+            overall_inf,
             barrier_parameter: (augmented_inequality_count > 0).then_some(mu),
             step_inf: None,
             alpha: None,
@@ -2135,7 +2193,8 @@ where
             events: Vec::new(),
         };
 
-        if primal_inf <= options.constraint_tol
+        if overall_inf <= options.overall_tol
+            && primal_inf <= options.constraint_tol
             && dual_inf <= options.dual_tol
             && complementarity_inf <= options.complementarity_tol
         {
@@ -2154,6 +2213,7 @@ where
                 ineq_inf: (augmented_inequality_count > 0).then_some(inequality_inf),
                 dual_inf,
                 comp_inf: (augmented_inequality_count > 0).then_some(complementarity_inf),
+                overall_inf,
                 barrier_parameter: (augmented_inequality_count > 0).then_some(mu),
                 step_inf: None,
                 alpha: None,
@@ -2194,6 +2254,7 @@ where
                 primal_inf_norm: primal_inf,
                 dual_inf_norm: dual_inf,
                 complementarity_inf_norm: complementarity_inf,
+                overall_inf_norm: overall_inf,
                 barrier_parameter: mu,
                 profiling,
                 linear_solver: last_linear_solver,
@@ -2215,6 +2276,7 @@ where
                         inequality_inf,
                         dual_inf,
                         complementarity_inf,
+                        overall_inf,
                         barrier_parameter: mu,
                         alpha: None,
                         line_search_iterations: None,
@@ -2222,6 +2284,7 @@ where
                         constraint_tol: options.constraint_tol,
                         dual_tol: options.dual_tol,
                         complementarity_tol: options.complementarity_tol,
+                        overall_tol: options.overall_tol,
                     },
                     &mut event_state,
                 );
@@ -2599,6 +2662,15 @@ where
                 trial_mu,
             );
             let trial_primal_inf = trial_eq_inf.max(trial_ineq_inf);
+            let trial_all_dual_multipliers = [trial_lambda.as_slice(), trial_z.as_slice()].concat();
+            let trial_overall_inf = scaled_overall_inf_norm(
+                trial_primal_inf,
+                trial_dual_inf,
+                trial_comp_inf,
+                &trial_all_dual_multipliers,
+                &trial_z,
+                options.overall_scale_max,
+            );
             let trial_barrier_objective = barrier_objective_value(
                 trial_state.objective_value,
                 &trial_slack,
@@ -2618,6 +2690,7 @@ where
                     inequality_inf: trial_ineq_inf,
                     dual_inf: trial_dual_inf,
                     complementarity_inf: trial_comp_inf,
+                    overall_inf: trial_overall_inf,
                     mu: trial_mu,
                     filter_entry: trial_filter_entry.clone(),
                     filter_acceptance_mode: None,
@@ -2665,6 +2738,7 @@ where
                     inequality_inf: trial_ineq_inf,
                     dual_inf: trial_dual_inf,
                     complementarity_inf: trial_comp_inf,
+                    overall_inf: trial_overall_inf,
                     mu: trial_mu,
                     filter_entry: trial_filter_entry,
                     filter_acceptance_mode,
@@ -2764,6 +2838,7 @@ where
                     inequality_inf: accepted_trial.inequality_inf,
                     dual_inf: accepted_trial.dual_inf,
                     complementarity_inf: accepted_trial.complementarity_inf,
+                    overall_inf: accepted_trial.overall_inf,
                     barrier_parameter: if augmented_inequality_count > 0 {
                         accepted_trial.mu.max(options.mu_min)
                     } else {
@@ -2778,6 +2853,7 @@ where
                     constraint_tol: options.constraint_tol,
                     dual_tol: options.dual_tol,
                     complementarity_tol: options.complementarity_tol,
+                    overall_tol: options.overall_tol,
                 },
                 &mut event_state,
             );
@@ -2823,6 +2899,7 @@ where
             dual_inf: accepted_trial.dual_inf,
             comp_inf: (augmented_inequality_count > 0)
                 .then_some(accepted_trial.complementarity_inf),
+            overall_inf: accepted_trial.overall_inf,
             barrier_parameter: (augmented_inequality_count > 0)
                 .then_some(accepted_trial.mu.max(options.mu_min)),
             step_inf: Some(step_inf_norm(&direction.dx)),
@@ -2857,6 +2934,7 @@ where
             dual_inf: accepted_trial.dual_inf,
             comp_inf: (augmented_inequality_count > 0)
                 .then_some(accepted_trial.complementarity_inf),
+            overall_inf: accepted_trial.overall_inf,
             barrier_parameter: (augmented_inequality_count > 0)
                 .then_some(accepted_trial.mu.max(options.mu_min)),
             step_inf: Some(step_inf_norm(&direction.dx)),

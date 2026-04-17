@@ -250,6 +250,7 @@ fn case_for<const N: usize, const LINKS: usize>(
                             inequality_upper: Some(
                                 <VecN<SX, LINKS> as Vectorize<SX>>::from_flat_fn(&mut || 0.0),
                             ),
+                            scaling: None,
                         },
                     })
                 },

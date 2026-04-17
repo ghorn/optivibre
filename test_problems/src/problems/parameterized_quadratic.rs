@@ -34,6 +34,7 @@ pub(crate) fn case() -> ProblemCase {
                     variable_upper: None,
                     inequality_lower: None,
                     inequality_upper: None,
+                    scaling: None,
                 },
             })
         },

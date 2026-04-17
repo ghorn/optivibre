@@ -2,7 +2,8 @@ use approx::assert_abs_diff_eq;
 use optimization::{
     CallPolicy, CallPolicyConfig, ClarabelSqpOptions, FiniteDifferenceValidationOptions,
     FunctionCompileOptions, InteriorPointOptions, LlvmOptimizationLevel, SymbolicCompileProgress,
-    SymbolicCompileStage, SymbolicNlpOutputs, TypedRuntimeNlpBounds, flat_view, symbolic_nlp,
+    SymbolicCompileStage, SymbolicNlpOutputs, SqpGlobalization, TypedNlpScaling,
+    TypedRuntimeNlpBounds, flat_view, symbolic_nlp,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptOptions, IpoptRawStatus};
@@ -114,6 +115,7 @@ fn typed_symbolic_disk_constrained_rosenbrock_solves_with_runtime_constraint_bou
                     y: -f64::INFINITY,
                 }),
                 inequality_upper: Some(Pair { x: 1.5, y: 2.0 }),
+                scaling: None,
             },
             &ClarabelSqpOptions {
                 max_iters: 80,
@@ -183,6 +185,7 @@ fn typed_symbolic_hanging_chain_solves_end_to_end() {
                 variable_upper: None,
                 inequality_lower: None,
                 inequality_upper: None,
+                scaling: None,
             },
             &ClarabelSqpOptions {
                 max_iters: 120,
@@ -225,8 +228,13 @@ fn typed_symbolic_parameterized_nlp_solves_end_to_end() {
                 variable_upper: None,
                 inequality_lower: None,
                 inequality_upper: None,
+                scaling: None,
             },
             &ClarabelSqpOptions {
+                dual_tol: 1e-3,
+                complementarity_tol: 1e-5,
+                overall_tol: 1e-3,
+                globalization: SqpGlobalization::LineSearchMerit(Default::default()),
                 verbose: false,
                 ..ClarabelSqpOptions::default()
             },
@@ -237,6 +245,68 @@ fn typed_symbolic_parameterized_nlp_solves_end_to_end() {
     assert_abs_diff_eq!(summary.x[1], 0.25, epsilon = 1e-6);
     assert_abs_diff_eq!(summary.objective, 0.5, epsilon = 1e-9);
     assert!(summary.equality_inf_norm.is_some_and(|value| value <= 1e-8));
+}
+
+#[test]
+fn typed_symbolic_scaling_keeps_callbacks_in_original_units() {
+    let symbolic =
+        symbolic_nlp::<Pair<SX>, Pair<SX>, SX, (), _>("parameterized_quadratic_scaled", |x, p| {
+            SymbolicNlpOutputs {
+                objective: (x.x - p.x).sqr() + (x.y - p.y).sqr(),
+                equalities: x.x + x.y,
+                inequalities: (),
+            }
+        })
+        .expect("symbolic NLP should build");
+    let compiled = symbolic.compile_jit().expect("JIT compile should succeed");
+    let mut first_snapshot = None;
+    let summary = compiled
+        .solve_sqp_with_callback(
+            &Pair { x: 0.9, y: 0.1 },
+            &Pair { x: 0.25, y: 0.75 },
+            &TypedRuntimeNlpBounds {
+                variable_lower: None,
+                variable_upper: None,
+                inequality_lower: None,
+                inequality_upper: None,
+                scaling: Some(TypedNlpScaling {
+                    variable: Pair { x: 2.0, y: 0.5 },
+                    constraints: vec![10.0],
+                    objective: 100.0,
+                }),
+            },
+            &ClarabelSqpOptions {
+                dual_tol: 1e-3,
+                complementarity_tol: 1e-5,
+                overall_tol: 1e-3,
+                globalization: SqpGlobalization::LineSearchMerit(Default::default()),
+                verbose: false,
+                ..ClarabelSqpOptions::default()
+            },
+            |snapshot| {
+                first_snapshot.get_or_insert_with(|| snapshot.clone());
+            },
+        )
+        .expect("scaled SQP solve should succeed");
+
+    let snapshot = first_snapshot.expect("callback should see at least one iterate");
+    assert_abs_diff_eq!(snapshot.x[0], 0.9, epsilon = 1e-12);
+    assert_abs_diff_eq!(snapshot.x[1], 0.1, epsilon = 1e-12);
+    assert_abs_diff_eq!(snapshot.objective, 0.845, epsilon = 1e-12);
+    assert_abs_diff_eq!(
+        snapshot.eq_inf.expect("equality residual should be present"),
+        10.0,
+        epsilon = 1e-12
+    );
+    assert!(snapshot.overall_inf >= 10.0);
+
+    assert_abs_diff_eq!(summary.x[0], -0.25, epsilon = 1e-6);
+    assert_abs_diff_eq!(summary.x[1], 0.25, epsilon = 1e-6);
+    assert_abs_diff_eq!(summary.objective, 0.5, epsilon = 1e-9);
+    assert!(summary.equality_inf_norm.is_some_and(|value| value <= 1e-8));
+    assert!(summary.overall_inf_norm <= 1e-3);
+    assert_abs_diff_eq!(summary.final_state.x[0], -0.25, epsilon = 1e-6);
+    assert_abs_diff_eq!(summary.final_state.x[1], 0.25, epsilon = 1e-6);
 }
 
 #[test]
@@ -659,6 +729,7 @@ fn typed_symbolic_inequality_only_problem_solves_with_ipopt_without_box_bounds()
                     y: -f64::INFINITY,
                 }),
                 inequality_upper: Some(Pair { x: 1.5, y: 2.0 }),
+                scaling: None,
             },
             &IpoptOptions {
                 max_iters: 200,

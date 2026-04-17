@@ -2144,6 +2144,7 @@ pub fn multiple_shooting_runtime_from_spec<P, C, Beq, Bineq, X, U, const N: usiz
         path_bounds: spec.path_bounds,
         tf_bounds: spec.tf_bounds,
         initial_guess: spec.initial_guess.into_multiple_shooting(),
+        scaling: None,
     }
 }
 
@@ -2166,6 +2167,7 @@ pub fn direct_collocation_runtime_from_spec<
         path_bounds: spec.path_bounds,
         tf_bounds: spec.tf_bounds,
         initial_guess: spec.initial_guess.into_direct_collocation(),
+        scaling: None,
     }
 }
 
