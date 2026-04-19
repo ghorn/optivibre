@@ -1,3 +1,5 @@
+#![allow(clippy::large_enum_variant)]
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -141,9 +143,14 @@ fn dense_from_optimization_ccs(ccs: &optimization::CCS, values: &[f64]) -> Dense
     assert_eq!(ccs.nnz(), values.len());
     let mut dense = DenseMatrix::zeros(ccs.nrow, ccs.ncol);
     for col in 0..ccs.ncol {
-        for index in ccs.col_ptrs[col]..ccs.col_ptrs[col + 1] {
+        for (index, value) in values
+            .iter()
+            .enumerate()
+            .take(ccs.col_ptrs[col + 1])
+            .skip(ccs.col_ptrs[col])
+        {
             let row = ccs.row_indices[index];
-            dense.set(row, col, values[index]);
+            dense.set(row, col, *value);
         }
     }
     dense
@@ -474,8 +481,8 @@ fn generated_symbolic_nlp_call_heavy_ci() {
 }
 
 fn require_release_mode_for_manual_property_runs() {
-    assert!(
-        !cfg!(debug_assertions),
+    #[cfg(debug_assertions)]
+    panic!(
         "manual symbolic NLP Jacobian stress runs must be executed in release mode\n\ntry:\n  cargo test -p optimization --release --test generated_symbolic_nlp_jacobian_props generated_symbolic_nlp_call_heavy_stress -- --ignored"
     );
 }

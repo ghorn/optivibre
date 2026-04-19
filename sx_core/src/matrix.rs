@@ -74,6 +74,8 @@ impl HessianOptions {
 
 const JACOBIAN_BATCH_WIDTH: usize = 8;
 
+type HessianRowSupports = (SX, Vec<Vec<Index>>, Vec<Vec<Index>>);
+
 impl SXMatrix {
     fn build_lower_triangle(size: Index, columns: Vec<Vec<(Index, SX)>>) -> Result<SXMatrix> {
         let mut positions = Vec::new();
@@ -90,10 +92,7 @@ impl SXMatrix {
         SXMatrix::new(ccs, values)
     }
 
-    fn hessian_row_supports(
-        &self,
-        wrt: &SXMatrix,
-    ) -> Result<(SX, Vec<Vec<Index>>, Vec<Vec<Index>>)> {
+    fn hessian_row_supports(&self, wrt: &SXMatrix) -> Result<HessianRowSupports> {
         let expr = self.scalar_expr()?;
         let grad = self.gradient(wrt)?;
         let n = wrt.nnz();
@@ -408,8 +407,12 @@ impl SXMatrix {
         let mut positions = Vec::with_capacity(structure.ccs.nnz());
         let mut filtered_values = Vec::with_capacity(structure.ccs.nnz());
         for col in 0..nvar {
-            for nz_index in structure.ccs.col_ptrs()[col]..structure.ccs.col_ptrs()[col + 1] {
-                let value = values[nz_index];
+            for (nz_index, &value) in values
+                .iter()
+                .enumerate()
+                .take(structure.ccs.col_ptrs()[col + 1])
+                .skip(structure.ccs.col_ptrs()[col])
+            {
                 if !value.is_zero() {
                     positions.push((structure.ccs.row_indices()[nz_index], col));
                     filtered_values.push(value);

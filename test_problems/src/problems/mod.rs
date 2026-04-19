@@ -17,10 +17,10 @@ use std::time::Instant;
 use optimization::{
     ClarabelSqpError, ClarabelSqpOptions, ClarabelSqpSummary, CompiledNlpProblem,
     FilterAcceptanceMode, InteriorPointIterationSnapshot, InteriorPointOptions,
-    InteriorPointSolveError, InteriorPointSummary, SqpIterationSnapshot, SymbolicNlpOutputs,
-    TypedCompiledJitNlp, TypedRuntimeNlpBounds, Vectorize, format_nlip_settings_summary,
-    format_sqp_settings_summary, nlip_event_codes, nlip_event_legend_entries, sqp_event_codes,
-    sqp_event_legend_entries, sqp_iteration_label,
+    InteriorPointSolveError, InteriorPointSummary, LineSearchFilterOptions, SqpGlobalization,
+    SqpIterationSnapshot, SymbolicNlpOutputs, TypedCompiledJitNlp, TypedRuntimeNlpBounds,
+    Vectorize, format_nlip_settings_summary, format_sqp_settings_summary, nlip_event_codes,
+    nlip_event_legend_entries, sqp_event_codes, sqp_event_legend_entries, sqp_iteration_label,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{
@@ -351,6 +351,13 @@ where
                 dual_tol: STRICT_TERMINATION_TOL,
                 constraint_tol: STRICT_TERMINATION_TOL,
                 complementarity_tol: STRICT_TERMINATION_TOL,
+                merit_penalty: if descriptor.constrained { 50.0 } else { 10.0 },
+                hessian_regularization_enabled: true,
+                globalization: if descriptor.constrained {
+                    SqpGlobalization::default()
+                } else {
+                    SqpGlobalization::LineSearchFilter(LineSearchFilterOptions::default())
+                },
                 verbose: false,
                 ..ClarabelSqpOptions::default()
             };
@@ -418,7 +425,7 @@ where
                         max_iters_limit,
                         status: RunStatus::SolveError,
                         descriptor,
-                        solution: None,
+                        solution: solution_from_sqp_error(&err),
                         metrics: metrics_from_sqp_error(&err),
                         timing: timing_breakdown(
                             backend_timing,
@@ -440,6 +447,7 @@ where
                         filter_replay: None,
                     };
                     promote_solve_error_if_reduced_accuracy(&mut record, REDUCED_TERMINATION_TOL);
+                    promote_solve_error_if_validation_accepts(&mut record, validate);
                     record.console_output =
                         Some(render_sqp_transcript(&record, &snapshots, None, Some(&err)));
                     record.filter_replay = sqp_filter_replay_from_snapshots(&snapshots);
@@ -979,6 +987,29 @@ fn metrics_from_sqp_error(error: &ClarabelSqpError) -> SolverMetrics {
         elastic_recovery_activations: Some(context.profiling.elastic_recovery_activations),
         elastic_recovery_qp_solves: Some(context.profiling.elastic_recovery_qp_solves),
     }
+}
+
+fn solution_from_sqp_error(error: &ClarabelSqpError) -> Option<Vec<f64>> {
+    let context = match error {
+        ClarabelSqpError::MaxIterations { context, .. }
+        | ClarabelSqpError::QpSolve { context, .. }
+        | ClarabelSqpError::UnconstrainedStepSolve { context }
+        | ClarabelSqpError::LineSearchFailed { context, .. }
+        | ClarabelSqpError::RestorationFailed { context, .. }
+        | ClarabelSqpError::Stalled { context, .. }
+        | ClarabelSqpError::NonFiniteCallbackOutput { context, .. } => Some(context.as_ref()),
+        ClarabelSqpError::InvalidInput(_)
+        | ClarabelSqpError::NonFiniteInput { .. }
+        | ClarabelSqpError::Setup(_) => None,
+    };
+    context
+        .and_then(|context| {
+            context
+                .final_state
+                .as_ref()
+                .or(context.last_accepted_state.as_ref())
+        })
+        .map(|snapshot| snapshot.x.clone())
 }
 
 fn solve_time_from_sqp_error(error: &ClarabelSqpError) -> Option<std::time::Duration> {
@@ -2009,6 +2040,36 @@ fn promote_solve_error_if_reduced_accuracy(record: &mut ProblemRunRecord, tol: f
             fmt_opt_sci(record.metrics.primal_inf),
             fmt_opt_sci(record.metrics.dual_inf),
             fmt_opt_sci(record.metrics.complementarity_inf),
+        ),
+    };
+}
+
+fn promote_solve_error_if_validation_accepts<Validate>(
+    record: &mut ProblemRunRecord,
+    validate: &Validate,
+) where
+    Validate: Fn(&ProblemRunRecord) -> ValidationOutcome,
+{
+    if record.error.is_none() || record.status.accepted() {
+        return;
+    }
+
+    let mut candidate = record.clone();
+    candidate.status = RunStatus::Passed;
+    candidate.error = None;
+    let candidate_validation = validate(&candidate);
+    if !candidate_validation.passed() {
+        return;
+    }
+
+    let error = record.error.as_deref().unwrap_or("solve error");
+    record.status = RunStatus::ReducedAccuracy;
+    record.validation = ValidationOutcome {
+        tier: ValidationTier::ReducedAccuracy,
+        tolerance: candidate_validation.tolerance,
+        detail: format!(
+            "solver reported '{error}', but final metrics satisfied the case validator ({})",
+            candidate_validation.detail
         ),
     };
 }

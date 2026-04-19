@@ -82,9 +82,14 @@ pub fn dense_from_sx_ccs_values(ccs: &CCS, values: &[f64]) -> DenseMatrix {
     assert_eq!(ccs.nnz(), values.len());
     let mut dense = DenseMatrix::zeros(ccs.nrow(), ccs.ncol());
     for col in 0..ccs.ncol() {
-        for index in ccs.col_ptrs()[col]..ccs.col_ptrs()[col + 1] {
+        for (index, value) in values
+            .iter()
+            .enumerate()
+            .take(ccs.col_ptrs()[col + 1])
+            .skip(ccs.col_ptrs()[col])
+        {
             let row = ccs.row_indices()[index];
-            dense.set(row, col, values[index]);
+            dense.set(row, col, *value);
         }
     }
     dense

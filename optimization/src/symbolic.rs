@@ -1589,20 +1589,22 @@ pub fn rank_nlp_constraint_violations(
     let mut inequalities = vec![0.0; problem.inequality_count()];
     problem.inequality_values(x, parameters, &mut inequalities);
 
-    let mut report = NlpConstraintViolationReport::default();
-    report.equalities = equalities
-        .into_iter()
-        .enumerate()
-        .map(|(row, value)| {
-            let abs_violation = value.abs();
-            NlpEqualityViolation {
-                row,
-                value,
-                abs_violation,
-                satisfaction: classify_constraint_satisfaction(abs_violation, tolerance),
-            }
-        })
-        .collect();
+    let mut report = NlpConstraintViolationReport {
+        equalities: equalities
+            .into_iter()
+            .enumerate()
+            .map(|(row, value)| {
+                let abs_violation = value.abs();
+                NlpEqualityViolation {
+                    row,
+                    value,
+                    abs_violation,
+                    satisfaction: classify_constraint_satisfaction(abs_violation, tolerance),
+                }
+            })
+            .collect(),
+        ..NlpConstraintViolationReport::default()
+    };
     report
         .equalities
         .sort_by(|lhs, rhs| rhs.abs_violation.total_cmp(&lhs.abs_violation));
@@ -1735,10 +1737,10 @@ fn invert_scaling_vector(values: Vec<f64>) -> Vec<f64> {
 
 fn scaled_jacobian_factors(ccs: &CCS, row_scale: &[f64], variable_inverse: &[f64]) -> Vec<f64> {
     let mut factors = Vec::with_capacity(ccs.nnz());
-    for col in 0..ccs.ncol {
+    for (col, &inverse) in variable_inverse.iter().enumerate().take(ccs.ncol) {
         for index in ccs.col_ptrs[col]..ccs.col_ptrs[col + 1] {
             let row = ccs.row_indices[index];
-            factors.push(row_scale[row] * variable_inverse[col]);
+            factors.push(row_scale[row] * inverse);
         }
     }
     factors
@@ -2926,22 +2928,22 @@ fn validate_bound_vectors(
 
     if let (Some(lower), Some(upper)) = (&bounds.lower, &bounds.upper) {
         for (index, (&lower, &upper)) in lower.iter().zip(upper.iter()).enumerate() {
-            if let (Some(lower), Some(upper)) = (lower, upper) {
-                if lower > upper {
-                    return Err(if is_variable {
-                        RuntimeNlpBoundsError::InvalidVariableBounds {
-                            index,
-                            lower,
-                            upper,
-                        }
-                    } else {
-                        RuntimeNlpBoundsError::InvalidConstraintBounds {
-                            index,
-                            lower,
-                            upper,
-                        }
-                    });
-                }
+            if let (Some(lower), Some(upper)) = (lower, upper)
+                && lower > upper
+            {
+                return Err(if is_variable {
+                    RuntimeNlpBoundsError::InvalidVariableBounds {
+                        index,
+                        lower,
+                        upper,
+                    }
+                } else {
+                    RuntimeNlpBoundsError::InvalidConstraintBounds {
+                        index,
+                        lower,
+                        upper,
+                    }
+                });
             }
         }
     }

@@ -1,0 +1,36 @@
+[package]
+name = "metis_ordering-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+metis_ordering = { path = ".." }
+
+[[bin]]
+name = "csr_new"
+path = "fuzz_targets/csr_new.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "from_symmetric_csc"
+path = "fuzz_targets/from_symmetric_csc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nested_dissection_order"
+path = "fuzz_targets/nested_dissection_order.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

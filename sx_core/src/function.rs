@@ -13,18 +13,13 @@ use crate::{BinaryOp, NodeView, SX, SXMatrix, UnaryOp};
 
 pub type FunctionId = usize;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum CallPolicy {
     InlineAtCall,
+    #[default]
     InlineAtLowering,
     InlineInLLVM,
     NoInlineLLVM,
-}
-
-impl Default for CallPolicy {
-    fn default() -> Self {
-        Self::InlineAtLowering
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -370,11 +365,10 @@ fn first_non_input_symbol(
                                     output_offset,
                                     slot,
                                     offset,
-                                ) {
-                                    if let Some(symbol) = memo.get(&value).copied().flatten() {
-                                        missing = Some(symbol);
-                                        break 'slots;
-                                    }
+                                ) && let Some(symbol) = memo.get(&value).copied().flatten()
+                                {
+                                    missing = Some(symbol);
+                                    break 'slots;
                                 }
                             }
                         }
@@ -987,6 +981,10 @@ struct ScanStageResult {
     warnings: Vec<CompileWarning>,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stage scanning threads explicit mutable traversal state to avoid extra allocation indirection"
+)]
 fn scan_expr_for_stage(
     expr: SX,
     config: CallPolicyConfig,
@@ -1093,6 +1091,10 @@ fn scan_function_for_stage(
     Ok(scan)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stage rewriting needs explicit rewrite state, memo, and recursion metadata"
+)]
 fn rewrite_expr(
     expr: SX,
     bindings: &HashMap<SX, SX>,
@@ -1309,12 +1311,16 @@ fn rewrite_expr(
         .ok_or_else(|| SxError::Graph("failed to rewrite expression".into()))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "matrix rewrite is a thin adapter over expression rewrite and forwards the same explicit state"
+)]
 fn rewrite_matrix_with_memo(
     matrix: &SXMatrix,
     bindings: &HashMap<SX, SX>,
     config: CallPolicyConfig,
     stage: InlineStage,
-    mut memo: &mut HashMap<SX, SX>,
+    memo: &mut HashMap<SX, SX>,
     stats: &mut CompileStats,
     warnings: &mut Vec<CompileWarning>,
     state: &mut RewriteState,
@@ -1333,7 +1339,7 @@ fn rewrite_matrix_with_memo(
                     bindings,
                     config,
                     stage,
-                    &mut memo,
+                    memo,
                     stats,
                     warnings,
                     state,
@@ -1345,6 +1351,10 @@ fn rewrite_matrix_with_memo(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "function output rewrite keeps stats, warnings, and rewrite state explicit at call boundaries"
+)]
 fn rewrite_function_outputs(
     function: &SXFunction,
     inputs: &[SXMatrix],
@@ -1423,7 +1433,7 @@ pub fn rewrite_function_for_stage(
             .outputs()
             .iter()
             .map(|output| {
-                Ok(NamedMatrix::new(
+                NamedMatrix::new(
                     output.name(),
                     rewrite_matrix_with_memo(
                         output.matrix(),
@@ -1437,7 +1447,7 @@ pub fn rewrite_function_for_stage(
                         0,
                         0,
                     )?,
-                )?)
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         SXFunction::from_parts(

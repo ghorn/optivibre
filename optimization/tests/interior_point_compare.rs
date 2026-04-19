@@ -131,6 +131,17 @@ fn native_options() -> InteriorPointOptions {
     }
 }
 
+fn hs071_native_options() -> InteriorPointOptions {
+    InteriorPointOptions {
+        max_iters: 300,
+        dual_tol: 1.0e-5,
+        overall_tol: 1.0e-5,
+        filter_method: false,
+        verbose: compare_verbose_requested(),
+        ..InteriorPointOptions::default()
+    }
+}
+
 fn ipopt_options() -> IpoptOptions {
     let verbose = compare_verbose_requested();
     IpoptOptions {
@@ -204,7 +215,16 @@ fn solve_native_ok<P: CompiledNlpProblem>(
     x0: &[f64],
     parameters: &[ParameterMatrix<'_>],
 ) -> optimization::InteriorPointSummary {
-    let solve_result = solve_nlp_interior_point(problem, x0, parameters, &native_options());
+    solve_native_with_options_ok(problem, x0, parameters, native_options())
+}
+
+fn solve_native_with_options_ok<P: CompiledNlpProblem>(
+    problem: &P,
+    x0: &[f64],
+    parameters: &[ParameterMatrix<'_>],
+    options: InteriorPointOptions,
+) -> optimization::InteriorPointSummary {
+    let solve_result = solve_nlp_interior_point(problem, x0, parameters, &options);
     assert!(
         solve_result.is_ok(),
         "native IP solve failed: {solve_result:?}"
@@ -297,7 +317,8 @@ fn compare_native_and_ipopt_on_hs071(
     #[values(CallbackBackend::Aot, CallbackBackend::Jit)] backend: CallbackBackend,
 ) {
     let problem = build_problem_ok(hs071_problem(backend), backend);
-    let native = solve_native_ok(&problem, &[1.0, 5.0, 5.0, 1.0], &[]);
+    let native =
+        solve_native_with_options_ok(&problem, &[1.0, 5.0, 5.0, 1.0], &[], hs071_native_options());
     let ipopt = solve_ipopt_ok(&problem, &[1.0, 5.0, 5.0, 1.0], &[]);
     assert_native_matches_ipopt("hs071", Some(backend), &native, &ipopt, 5e-3, 1e-4);
 }

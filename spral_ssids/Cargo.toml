@@ -1,0 +1,28 @@
+[package]
+name = "spral_ssids"
+version.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+description = "Initial pure-Rust symbolic and numeric SSIDS-style solver stack for ad_codegen_rs."
+
+[dependencies]
+libloading = "0.8.9"
+metis_ordering = { path = "../metis_ordering" }
+rayon.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+approx.workspace = true
+criterion.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "symbolic_validation"
+harness = false

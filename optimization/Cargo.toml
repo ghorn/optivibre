@@ -36,3 +36,5 @@ examples_run = { path = "../examples_run" }
 proptest.workspace = true
 rstest.workspace = true
 serde_json.workspace = true
+spral_ssids = { path = "../spral_ssids" }
+sparse_validation = { path = "../sparse_validation" }

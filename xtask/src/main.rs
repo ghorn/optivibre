@@ -4,7 +4,12 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use bench_report::{MarkdownReportOptions, SuiteReport, render_markdown_report_with_options};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use sparse_validation::{
+    ValidationRunConfig, ValidationSuiteReport, ValidationTier, apply_baseline_summary,
+    corpus_download_target_path, downloaded_public_corpus_specs, extract_downloaded_corpus_archive,
+    render_html_report, render_markdown_report, run_validation_suite,
+};
 
 fn workspace_root() -> Result<PathBuf> {
     std::env::current_dir().context("xtask must run from the workspace root")
@@ -24,6 +29,40 @@ struct XtaskCli {
 enum XtaskCommand {
     AdCostReport,
     CasadiParityReport,
+    SparseValidation(SparseValidationArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct SparseValidationArgs {
+    #[arg(long, value_enum, default_value_t = SparseValidationTierArg::Pr)]
+    tier: SparseValidationTierArg,
+    #[arg(long)]
+    with_native_metis: bool,
+    #[arg(long)]
+    with_native_spral: bool,
+    #[arg(long)]
+    download_corpus: bool,
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+    #[arg(long)]
+    baseline_json: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SparseValidationTierArg {
+    Pr,
+    Scheduled,
+    Local,
+}
+
+impl From<SparseValidationTierArg> for ValidationTier {
+    fn from(value: SparseValidationTierArg) -> Self {
+        match value {
+            SparseValidationTierArg::Pr => ValidationTier::Pr,
+            SparseValidationTierArg::Scheduled => ValidationTier::Scheduled,
+            SparseValidationTierArg::Local => ValidationTier::Local,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +78,14 @@ struct ParityReportPaths {
     dir: PathBuf,
     markdown: PathBuf,
     json: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SparseValidationReportPaths {
+    dir: PathBuf,
+    json: PathBuf,
+    markdown: PathBuf,
+    html: PathBuf,
 }
 
 fn report_paths(root: &Path) -> ReportPaths {
@@ -58,6 +105,27 @@ fn parity_report_paths(root: &Path) -> ParityReportPaths {
         json: dir.join("casadi_parity_audit.json"),
         dir,
     }
+}
+
+fn sparse_validation_paths(
+    root: &Path,
+    output_dir: Option<&Path>,
+    tier: ValidationTier,
+) -> SparseValidationReportPaths {
+    let dir = output_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| root.join("target/reports/sparse_validation"));
+    let stem = format!("sparse_validation_{}", tier.label());
+    SparseValidationReportPaths {
+        json: dir.join(format!("{stem}.json")),
+        markdown: dir.join(format!("{stem}.md")),
+        html: dir.join(format!("{stem}.html")),
+        dir,
+    }
+}
+
+fn sparse_validation_corpus_root(root: &Path) -> PathBuf {
+    root.join("target/validation_corpus")
 }
 
 fn ad_cost_suite_args(release: bool) -> Vec<&'static str> {
@@ -176,6 +244,131 @@ fn generate_casadi_parity_report() -> Result<()> {
     Ok(())
 }
 
+fn generate_sparse_validation_report(args: &SparseValidationArgs) -> Result<()> {
+    let root = workspace_root()?;
+    let tier = ValidationTier::from(args.tier);
+    let paths = sparse_validation_paths(&root, args.output_dir.as_deref(), tier);
+    let corpus_root = sparse_validation_corpus_root(&root);
+    fs::create_dir_all(&paths.dir)?;
+
+    if args.download_corpus {
+        download_sparse_validation_corpus(&corpus_root)?;
+    }
+
+    let config = ValidationRunConfig {
+        tier,
+        corpus_root,
+        with_native_metis: args.with_native_metis,
+        with_native_spral: args.with_native_spral,
+    };
+    let mut report = run_validation_suite(&config)?;
+    if let Some(path) = &args.baseline_json {
+        let bytes = fs::read(path).with_context(|| {
+            format!(
+                "failed to read sparse-validation baseline {}",
+                path.display()
+            )
+        })?;
+        let previous: ValidationSuiteReport =
+            serde_json::from_slice(&bytes).with_context(|| {
+                format!(
+                    "failed to parse sparse-validation baseline {}",
+                    path.display()
+                )
+            })?;
+        apply_baseline_summary(&mut report, &previous);
+    }
+
+    fs::write(&paths.json, serde_json::to_vec_pretty(&report)?)?;
+    fs::write(&paths.markdown, render_markdown_report(&report))?;
+    fs::write(&paths.html, render_html_report(&report))?;
+    ensure_sparse_validation_gates(&report)?;
+    println!("{}", paths.markdown.display());
+    Ok(())
+}
+
+fn download_sparse_validation_corpus(corpus_root: &Path) -> Result<()> {
+    fs::create_dir_all(corpus_root)?;
+    for spec in downloaded_public_corpus_specs() {
+        let target = corpus_download_target_path(corpus_root, spec);
+        if target.exists() {
+            continue;
+        }
+        let archive = corpus_root.join(format!("{}.tar.gz", spec.id));
+        let status = Command::new("curl")
+            .args([
+                "--fail",
+                "--location",
+                "--silent",
+                "--show-error",
+                spec.url,
+                "--output",
+            ])
+            .arg(&archive)
+            .status()
+            .with_context(|| format!("failed to invoke curl for {}", spec.url))?;
+        if !status.success() {
+            bail!(
+                "curl failed while downloading {} with status {status}",
+                spec.url
+            );
+        }
+        extract_downloaded_corpus_archive(&archive, corpus_root, spec).with_context(|| {
+            format!(
+                "failed to extract sparse validation archive {}",
+                archive.display()
+            )
+        })?;
+        fs::remove_file(&archive)
+            .with_context(|| format!("failed to remove temporary archive {}", archive.display()))?;
+    }
+    Ok(())
+}
+
+fn ensure_sparse_validation_gates(report: &ValidationSuiteReport) -> Result<()> {
+    let mut failures = Vec::new();
+    if report.summary.failed_ordering_results > 0 {
+        failures.push(format!(
+            "ordering failures: {}",
+            report.summary.failed_ordering_results
+        ));
+    }
+    if report.summary.failed_symbolic_results > 0 {
+        failures.push(format!(
+            "symbolic failures: {}",
+            report.summary.failed_symbolic_results
+        ));
+    }
+    if report.summary.failed_numeric_results > 0 {
+        failures.push(format!(
+            "numeric failures: {}",
+            report.summary.failed_numeric_results
+        ));
+    }
+    if report.summary.failed_robustness_results > 0 {
+        failures.push(format!(
+            "robustness failures: {}",
+            report.summary.failed_robustness_results
+        ));
+    }
+    for case in &report.cases {
+        if !case.failures.is_empty() {
+            failures.push(format!(
+                "{}: {}",
+                case.case.case_id,
+                case.failures.join("; ")
+            ));
+        }
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "sparse validation reported failures:\n{}",
+        failures.join("\n")
+    )
+}
+
 fn main() -> Result<()> {
     match XtaskCli::parse()
         .command
@@ -183,6 +376,7 @@ fn main() -> Result<()> {
     {
         XtaskCommand::AdCostReport => generate_ad_cost_report(),
         XtaskCommand::CasadiParityReport => generate_casadi_parity_report(),
+        XtaskCommand::SparseValidation(args) => generate_sparse_validation_report(&args),
     }
 }
 
@@ -236,6 +430,43 @@ mod tests {
     }
 
     #[test]
+    fn sparse_validation_paths_default_under_target_reports() {
+        let root = Path::new("/tmp/workspace");
+        let paths = sparse_validation_paths(root, None, ValidationTier::Scheduled);
+        assert_eq!(
+            paths.dir,
+            PathBuf::from("/tmp/workspace/target/reports/sparse_validation")
+        );
+        assert_eq!(
+            paths.json,
+            PathBuf::from(
+                "/tmp/workspace/target/reports/sparse_validation/sparse_validation_scheduled.json"
+            )
+        );
+        assert_eq!(
+            paths.markdown,
+            PathBuf::from(
+                "/tmp/workspace/target/reports/sparse_validation/sparse_validation_scheduled.md"
+            )
+        );
+        assert_eq!(
+            paths.html,
+            PathBuf::from(
+                "/tmp/workspace/target/reports/sparse_validation/sparse_validation_scheduled.html"
+            )
+        );
+    }
+
+    #[test]
+    fn sparse_validation_corpus_root_lives_under_target() {
+        let root = Path::new("/tmp/workspace");
+        assert_eq!(
+            sparse_validation_corpus_root(root),
+            PathBuf::from("/tmp/workspace/target/validation_corpus")
+        );
+    }
+
+    #[test]
     fn ad_cost_suite_args_match_expected_debug_and_release_invocations() {
         let debug = ad_cost_suite_args(false);
         let release = ad_cost_suite_args(true);
@@ -259,5 +490,21 @@ mod tests {
         if let Err(err) = result {
             assert!(err.to_string().contains("unexpected suite profiles"));
         }
+    }
+
+    #[test]
+    fn sparse_validation_tier_arg_maps_to_validation_tier() {
+        assert_eq!(
+            ValidationTier::from(SparseValidationTierArg::Pr),
+            ValidationTier::Pr
+        );
+        assert_eq!(
+            ValidationTier::from(SparseValidationTierArg::Scheduled),
+            ValidationTier::Scheduled
+        );
+        assert_eq!(
+            ValidationTier::from(SparseValidationTierArg::Local),
+            ValidationTier::Local
+        );
     }
 }

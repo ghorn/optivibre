@@ -1,6 +1,9 @@
 [workspace]
 members = [
     "bench_report",
+    "metis_ordering",
+    "sparse_validation",
+    "spral_ssids",
     "sx_core",
     "sx_codegen",
     "sx_codegen_llvm",
@@ -27,6 +30,7 @@ rust-version = "1.94"
 version = "0.1.0"
 
 [workspace.dependencies]
+amd = "0.2.2"
 anyhow = "1.0.97"
 approx = "0.5.1"
 clap = { version = "4.5.49", features = ["derive", "env"] }

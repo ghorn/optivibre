@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::hash_map::DefaultHasher;
+use std::collections::hash_map::{DefaultHasher, Entry};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -463,6 +463,26 @@ struct FunctionAdExprArenaPlan {
     output_nnz: Vec<usize>,
 }
 
+fn ensure_function_adexpr_arena_plan(
+    function_id: FunctionId,
+    arena: &mut AdExprArena,
+    lower_memo: &mut HashMap<SX, AdExpr>,
+    function_plan_cache: &mut HashMap<FunctionId, FunctionAdExprArenaPlan>,
+) -> Result<()> {
+    if let Entry::Vacant(entry) = function_plan_cache.entry(function_id) {
+        let plan = function_program_plan(function_id)?;
+        let arena_plan = FunctionAdExprArenaPlan {
+            program: Arc::clone(&plan.program),
+            slot_exprs: arena.lower_sx_collection_with_memo(&plan.program.slot_exprs, lower_memo),
+            input_slots: plan.input_slots.clone(),
+            output_ccs: plan.output_ccs.clone(),
+            output_nnz: plan.output_nnz.clone(),
+        };
+        entry.insert(arena_plan);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct AdExpr(u32);
 
@@ -600,7 +620,7 @@ impl AdExprArena {
         if lhs <= rhs { (lhs, rhs) } else { (rhs, lhs) }
     }
 
-    fn from_sx_with_memo(&mut self, expr: SX, memo: &mut HashMap<SX, AdExpr>) -> AdExpr {
+    fn lower_sx_expr_with_memo(&mut self, expr: SX, memo: &mut HashMap<SX, AdExpr>) -> AdExpr {
         if let Some(&existing) = memo.get(&expr) {
             return existing;
         }
@@ -613,7 +633,7 @@ impl AdExprArena {
                 },
             ),
             NodeView::Unary { op, arg } => {
-                let lowered_arg = self.from_sx_with_memo(arg, memo);
+                let lowered_arg = self.lower_sx_expr_with_memo(arg, memo);
                 self.push(
                     Some(expr),
                     AdExprKind::Unary {
@@ -623,8 +643,8 @@ impl AdExprArena {
                 )
             }
             NodeView::Binary { op, lhs, rhs } => {
-                let lowered_lhs = self.from_sx_with_memo(lhs, memo);
-                let lowered_rhs = self.from_sx_with_memo(rhs, memo);
+                let lowered_lhs = self.lower_sx_expr_with_memo(lhs, memo);
+                let lowered_rhs = self.lower_sx_expr_with_memo(rhs, memo);
                 self.push(
                     Some(expr),
                     AdExprKind::Binary {
@@ -643,7 +663,7 @@ impl AdExprArena {
             } => {
                 let lowered_inputs = inputs
                     .into_iter()
-                    .map(|input| self.from_sx_matrix_with_memo(&input, memo))
+                    .map(|input| self.lower_sx_matrix_with_memo(&input, memo))
                     .collect();
                 self.push(
                     Some(expr),
@@ -660,7 +680,7 @@ impl AdExprArena {
         lowered
     }
 
-    fn from_sx_matrix_with_memo(
+    fn lower_sx_matrix_with_memo(
         &mut self,
         matrix: &SXMatrix,
         memo: &mut HashMap<SX, AdExpr>,
@@ -671,7 +691,7 @@ impl AdExprArena {
                 .nonzeros()
                 .iter()
                 .copied()
-                .map(|expr| self.from_sx_with_memo(expr, memo))
+                .map(|expr| self.lower_sx_expr_with_memo(expr, memo))
                 .collect(),
         }
     }
@@ -684,7 +704,7 @@ impl AdExprArena {
         values
             .iter()
             .copied()
-            .map(|value| self.from_sx_with_memo(value, memo))
+            .map(|value| self.lower_sx_expr_with_memo(value, memo))
             .collect()
     }
 
@@ -1497,31 +1517,92 @@ fn combine_like_terms_shallow(
     }
 
     let coeff_expr = append_constant_in_arena(arena, coeff);
-    Some(append_binary_in_arena(
-        arena,
-        BinaryOp::Mul,
-        coeff_expr,
-        lhs_term,
-    ))
+    Some(binary_in_arena(arena, BinaryOp::Mul, coeff_expr, lhs_term))
 }
 
 fn simplify_mul_shallow(arena: &mut NodeArena, lhs: SX, rhs: SX) -> Option<SX> {
+    if let Some((lhs_scale, lhs_factor)) = mul_constant_factor_with_arena(arena, lhs)
+        && let Some((rhs_numerator, rhs_divisor)) = div_constant_numerator_with_arena(arena, rhs)
+        && lhs_factor == rhs_divisor
+    {
+        return Some(append_constant_in_arena(arena, lhs_scale * rhs_numerator));
+    }
+    if let Some((rhs_scale, rhs_factor)) = mul_constant_factor_with_arena(arena, rhs)
+        && let Some((lhs_numerator, lhs_divisor)) = div_constant_numerator_with_arena(arena, lhs)
+        && rhs_factor == lhs_divisor
+    {
+        return Some(append_constant_in_arena(arena, rhs_scale * lhs_numerator));
+    }
+    if let Some((numerator, divisor)) = div_constant_numerator_with_arena(arena, rhs)
+        && divisor == lhs
+    {
+        return Some(append_constant_in_arena(arena, numerator));
+    }
+    if let Some((numerator, divisor)) = div_constant_numerator_with_arena(arena, lhs)
+        && divisor == rhs
+    {
+        return Some(append_constant_in_arena(arena, numerator));
+    }
+    if let Some(lhs_value) = constant_value_with_arena(arena, lhs)
+        && let Some((numerator, denominator)) = div_constant_factor_with_arena(arena, rhs)
+        && denominator != 0.0
+    {
+        let scaled = lhs_value / denominator;
+        if scaled == 0.0 {
+            return Some(append_constant_in_arena(arena, 0.0));
+        }
+        if scaled == 1.0 {
+            return Some(numerator);
+        }
+        if scaled == -1.0 {
+            return Some(neg_in_arena(arena, numerator));
+        }
+        let scaled = append_constant_in_arena(arena, scaled);
+        return Some(binary_in_arena(arena, BinaryOp::Mul, scaled, numerator));
+    }
+    if let Some(rhs_value) = constant_value_with_arena(arena, rhs)
+        && let Some((numerator, denominator)) = div_constant_factor_with_arena(arena, lhs)
+        && denominator != 0.0
+    {
+        let scaled = rhs_value / denominator;
+        if scaled == 0.0 {
+            return Some(append_constant_in_arena(arena, 0.0));
+        }
+        if scaled == 1.0 {
+            return Some(numerator);
+        }
+        if scaled == -1.0 {
+            return Some(neg_in_arena(arena, numerator));
+        }
+        let scaled = append_constant_in_arena(arena, scaled);
+        return Some(binary_in_arena(arena, BinaryOp::Mul, scaled, numerator));
+    }
     if let Some(lhs_value) = constant_value_with_arena(arena, lhs)
         && let Some((rhs_value, factor)) = mul_constant_factor_with_arena(arena, rhs)
     {
         let scaled = append_constant_in_arena(arena, lhs_value * rhs_value);
-        return Some(append_binary_in_arena(arena, BinaryOp::Mul, scaled, factor));
+        return Some(binary_in_arena(arena, BinaryOp::Mul, scaled, factor));
     }
     if let Some(rhs_value) = constant_value_with_arena(arena, rhs)
         && let Some((lhs_value, factor)) = mul_constant_factor_with_arena(arena, lhs)
     {
         let scaled = append_constant_in_arena(arena, lhs_value * rhs_value);
-        return Some(append_binary_in_arena(arena, BinaryOp::Mul, scaled, factor));
+        return Some(binary_in_arena(arena, BinaryOp::Mul, scaled, factor));
     }
     None
 }
 
 fn simplify_div_shallow(arena: &mut NodeArena, lhs: SX, rhs: SX) -> Option<SX> {
+    if lhs == rhs {
+        return Some(append_constant_in_arena(arena, 1.0));
+    }
+    if let Some((lhs_value, lhs_factor)) = mul_constant_factor_with_arena(arena, lhs)
+        && let Some((rhs_value, rhs_factor)) = mul_constant_factor_with_arena(arena, rhs)
+        && rhs_value != 0.0
+        && lhs_factor == rhs_factor
+    {
+        return Some(append_constant_in_arena(arena, lhs_value / rhs_value));
+    }
     match arena.node_kind_ref(lhs).clone() {
         NodeKind::Binary {
             op: BinaryOp::Mul,
@@ -1557,7 +1638,45 @@ fn simplify_div_shallow(arena: &mut NodeArena, lhs: SX, rhs: SX) -> Option<SX> {
         && rhs_value != 0.0
     {
         let scaled = append_constant_in_arena(arena, lhs_value / rhs_value);
-        return Some(append_binary_in_arena(arena, BinaryOp::Div, scaled, factor));
+        return Some(binary_in_arena(arena, BinaryOp::Div, scaled, factor));
+    }
+    if let Some(rhs_value) = constant_value_with_arena(arena, rhs)
+        && rhs_value != 0.0
+        && let Some((lhs_value, factor)) = mul_constant_factor_with_arena(arena, lhs)
+    {
+        let scaled = lhs_value / rhs_value;
+        if scaled == 0.0 {
+            return Some(append_constant_in_arena(arena, 0.0));
+        }
+        if scaled == 1.0 {
+            return Some(factor);
+        }
+        if scaled == -1.0 {
+            return Some(neg_in_arena(arena, factor));
+        }
+        let scaled = append_constant_in_arena(arena, scaled);
+        return Some(binary_in_arena(arena, BinaryOp::Mul, scaled, factor));
+    }
+    if let Some((rhs_value, factor)) = mul_constant_factor_with_arena(arena, rhs)
+        && rhs_value != 0.0
+        && factor == lhs
+    {
+        return Some(append_constant_in_arena(arena, 1.0 / rhs_value));
+    }
+    if let Some(rhs_value) = constant_value_with_arena(arena, rhs)
+        && let Some((numerator, denominator)) = div_constant_factor_with_arena(arena, lhs)
+    {
+        let scaled_denominator = denominator * rhs_value;
+        if scaled_denominator == 1.0 {
+            return Some(numerator);
+        }
+        let scaled_denominator = append_constant_in_arena(arena, scaled_denominator);
+        return Some(binary_in_arena(
+            arena,
+            BinaryOp::Div,
+            numerator,
+            scaled_denominator,
+        ));
     }
 
     None
@@ -1608,6 +1727,12 @@ fn binary_in_arena_with_simplify_depth(
         BinaryOp::Mul => {
             if is_zero_kind(&lhs_kind) || is_zero_kind(&rhs_kind) {
                 return append_constant_in_arena(arena, 0.0);
+            }
+            if is_neg_one_kind(&lhs_kind) {
+                return neg_in_arena(arena, rhs);
+            }
+            if is_neg_one_kind(&rhs_kind) {
+                return neg_in_arena(arena, lhs);
             }
             if is_one_kind(&lhs_kind) {
                 return rhs;
@@ -2519,17 +2644,7 @@ fn execute_function_symbolically_adexpr_by_id(
         }
     }
 
-    if !function_plan_cache.contains_key(&function_id) {
-        let plan = function_program_plan(function_id)?;
-        let arena_plan = FunctionAdExprArenaPlan {
-            program: Arc::clone(&plan.program),
-            slot_exprs: arena.lower_sx_collection_with_memo(&plan.program.slot_exprs, lower_memo),
-            input_slots: plan.input_slots.clone(),
-            output_ccs: plan.output_ccs.clone(),
-            output_nnz: plan.output_nnz.clone(),
-        };
-        function_plan_cache.insert(function_id, arena_plan);
-    }
+    ensure_function_adexpr_arena_plan(function_id, arena, lower_memo, function_plan_cache)?;
     let plan = function_plan_cache
         .get(&function_id)
         .expect("function plan inserted");
@@ -2583,17 +2698,7 @@ fn execute_function_symbolically_adexpr_flat_by_id(
         )));
     }
 
-    if !function_plan_cache.contains_key(&function_id) {
-        let plan = function_program_plan(function_id)?;
-        let arena_plan = FunctionAdExprArenaPlan {
-            program: Arc::clone(&plan.program),
-            slot_exprs: arena.lower_sx_collection_with_memo(&plan.program.slot_exprs, lower_memo),
-            input_slots: plan.input_slots.clone(),
-            output_ccs: plan.output_ccs.clone(),
-            output_nnz: plan.output_nnz.clone(),
-        };
-        function_plan_cache.insert(function_id, arena_plan);
-    }
+    ensure_function_adexpr_arena_plan(function_id, arena, lower_memo, function_plan_cache)?;
     let plan = function_plan_cache
         .get(&function_id)
         .expect("function plan inserted");
@@ -2634,6 +2739,10 @@ fn execute_function_symbolically_adexpr_flat_by_id(
     Ok(collect_adexpr_output_vectors(&flat_values, &output_nnz))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "forward batch AD keeps hot-path scratch buffers and caches explicit"
+)]
 fn execute_program_forward_batch_adexpr_with_slots(
     program: &SxProgram,
     slot_values: &[AdExpr],
@@ -2860,17 +2969,7 @@ fn execute_function_forward_batch_adexpr_by_id(
         }
     }
 
-    if !function_plan_cache.contains_key(&function_id) {
-        let plan = function_program_plan(function_id)?;
-        let arena_plan = FunctionAdExprArenaPlan {
-            program: Arc::clone(&plan.program),
-            slot_exprs: arena.lower_sx_collection_with_memo(&plan.program.slot_exprs, lower_memo),
-            input_slots: plan.input_slots.clone(),
-            output_ccs: plan.output_ccs.clone(),
-            output_nnz: plan.output_nnz.clone(),
-        };
-        function_plan_cache.insert(function_id, arena_plan);
-    }
+    ensure_function_adexpr_arena_plan(function_id, arena, lower_memo, function_plan_cache)?;
     let plan = function_plan_cache
         .get(&function_id)
         .expect("function plan inserted");
@@ -2915,10 +3014,10 @@ fn execute_function_forward_batch_adexpr_by_id(
             for (actual_nz, slot) in actual.nonzeros.iter().copied().zip(input_slots.iter()) {
                 if let Some(slot) = slot {
                     derivative_slots[slot_base(*slot) + direction] = actual_nz;
-                    if let Some(masks) = active_masks.as_mut() {
-                        if !arena.is_zero(actual_nz) {
-                            masks[*slot] |= 1_u64 << direction;
-                        }
+                    if let Some(masks) = active_masks.as_mut()
+                        && !arena.is_zero(actual_nz)
+                    {
+                        masks[*slot] |= 1_u64 << direction;
                     }
                 }
             }
@@ -2976,17 +3075,7 @@ fn execute_function_forward_batch_adexpr_flat_by_id(
         )));
     }
 
-    if !function_plan_cache.contains_key(&function_id) {
-        let plan = function_program_plan(function_id)?;
-        let arena_plan = FunctionAdExprArenaPlan {
-            program: Arc::clone(&plan.program),
-            slot_exprs: arena.lower_sx_collection_with_memo(&plan.program.slot_exprs, lower_memo),
-            input_slots: plan.input_slots.clone(),
-            output_ccs: plan.output_ccs.clone(),
-            output_nnz: plan.output_nnz.clone(),
-        };
-        function_plan_cache.insert(function_id, arena_plan);
-    }
+    ensure_function_adexpr_arena_plan(function_id, arena, lower_memo, function_plan_cache)?;
     let plan = function_plan_cache
         .get(&function_id)
         .expect("function plan inserted");
@@ -3056,10 +3145,10 @@ fn execute_function_forward_batch_adexpr_flat_by_id(
             for (actual_nz, slot) in actual.iter().copied().zip(input_slots.iter()) {
                 if let Some(slot) = slot {
                     derivative_slots[slot_base(*slot) + direction] = actual_nz;
-                    if let Some(masks) = active_masks.as_mut() {
-                        if !arena.is_zero(actual_nz) {
-                            masks[*slot] |= 1_u64 << direction;
-                        }
+                    if let Some(masks) = active_masks.as_mut()
+                        && !arena.is_zero(actual_nz)
+                    {
+                        masks[*slot] |= 1_u64 << direction;
                     }
                 }
             }
@@ -3096,6 +3185,10 @@ fn execute_function_forward_batch_adexpr_flat_by_id(
         .collect())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "callee forward propagation needs explicit caller and callee tangent metadata"
+)]
 fn execute_function_forward_batch_adexpr_from_call_by_id(
     function_id: FunctionId,
     inputs: &[Vec<AdExpr>],
@@ -3120,17 +3213,7 @@ fn execute_function_forward_batch_adexpr_from_call_by_id(
         )));
     }
 
-    if !function_plan_cache.contains_key(&function_id) {
-        let plan = function_program_plan(function_id)?;
-        let arena_plan = FunctionAdExprArenaPlan {
-            program: Arc::clone(&plan.program),
-            slot_exprs: arena.lower_sx_collection_with_memo(&plan.program.slot_exprs, lower_memo),
-            input_slots: plan.input_slots.clone(),
-            output_ccs: plan.output_ccs.clone(),
-            output_nnz: plan.output_nnz.clone(),
-        };
-        function_plan_cache.insert(function_id, arena_plan);
-    }
+    ensure_function_adexpr_arena_plan(function_id, arena, lower_memo, function_plan_cache)?;
     let plan = function_plan_cache
         .get(&function_id)
         .expect("function plan inserted");
@@ -3199,10 +3282,10 @@ fn execute_function_forward_batch_adexpr_from_call_by_id(
                     let tangent = caller_tangent_slots
                         [caller_slot_base(call_input.slots[offset]) + direction];
                     derivative_slots[callee_slot_base(slot) + local_direction] = tangent;
-                    if let Some(masks) = active_masks.as_mut() {
-                        if !arena.is_zero(tangent) {
-                            masks[slot] |= 1_u64 << local_direction;
-                        }
+                    if let Some(masks) = active_masks.as_mut()
+                        && !arena.is_zero(tangent)
+                    {
+                        masks[slot] |= 1_u64 << local_direction;
                     }
                 }
             }
@@ -3331,6 +3414,10 @@ fn is_one_kind(kind: &NodeKind) -> bool {
     matches!(kind, NodeKind::Constant(value) if *value == 1.0)
 }
 
+fn is_neg_one_kind(kind: &NodeKind) -> bool {
+    matches!(kind, NodeKind::Constant(value) if *value == -1.0)
+}
+
 fn constant_value_with_arena(arena: &NodeArena, sx: SX) -> Option<f64> {
     match arena.node_kind_ref(sx) {
         NodeKind::Constant(value) => Some(*value),
@@ -3362,6 +3449,36 @@ fn mul_constant_factor_with_arena(arena: &NodeArena, sx: SX) -> Option<(f64, SX)
     }
 }
 
+fn div_constant_factor_with_arena(arena: &NodeArena, sx: SX) -> Option<(SX, f64)> {
+    match arena.node_kind_ref(sx) {
+        NodeKind::Binary {
+            op: BinaryOp::Div,
+            lhs,
+            rhs,
+        } => constant_value_with_arena(arena, *rhs).map(|value| (*lhs, value)),
+        NodeKind::Constant(_)
+        | NodeKind::Symbol { .. }
+        | NodeKind::Unary { .. }
+        | NodeKind::Binary { .. }
+        | NodeKind::Call { .. } => None,
+    }
+}
+
+fn div_constant_numerator_with_arena(arena: &NodeArena, sx: SX) -> Option<(f64, SX)> {
+    match arena.node_kind_ref(sx) {
+        NodeKind::Binary {
+            op: BinaryOp::Div,
+            lhs,
+            rhs,
+        } => constant_value_with_arena(arena, *lhs).map(|value| (value, *rhs)),
+        NodeKind::Constant(_)
+        | NodeKind::Symbol { .. }
+        | NodeKind::Unary { .. }
+        | NodeKind::Binary { .. }
+        | NodeKind::Call { .. } => None,
+    }
+}
+
 fn append_constant_in_arena(arena: &mut NodeArena, value: f64) -> SX {
     arena.intern_node(NodeKind::Constant(value))
 }
@@ -3376,8 +3493,16 @@ fn append_binary_in_arena(arena: &mut NodeArena, op: BinaryOp, lhs: SX, rhs: SX)
 }
 
 fn neg_in_arena(arena: &mut NodeArena, expr: SX) -> SX {
+    if let Some(value) = constant_value_with_arena(arena, expr) {
+        return append_constant_in_arena(arena, -value);
+    }
+    if let Some((value, factor)) = mul_constant_factor_with_arena(arena, expr)
+        && value == -1.0
+    {
+        return factor;
+    }
     let minus_one = append_constant_in_arena(arena, -1.0);
-    binary_in_arena(arena, BinaryOp::Mul, minus_one, expr)
+    append_binary_in_arena(arena, BinaryOp::Mul, minus_one, expr)
 }
 
 fn unary_in_arena(arena: &mut NodeArena, op: UnaryOp, arg: SX) -> SX {
@@ -3493,6 +3618,12 @@ fn binary_in_arena(arena: &mut NodeArena, op: BinaryOp, lhs: SX, rhs: SX) -> SX 
         BinaryOp::Mul => {
             if is_zero_kind(&lhs_kind) || is_zero_kind(&rhs_kind) {
                 return append_constant_in_arena(arena, 0.0);
+            }
+            if is_neg_one_kind(&lhs_kind) {
+                return neg_in_arena(arena, rhs);
+            }
+            if is_neg_one_kind(&rhs_kind) {
+                return neg_in_arena(arena, lhs);
             }
             if is_one_kind(&lhs_kind) {
                 return rhs;
@@ -4671,9 +4802,8 @@ fn execute_program_forward_batch_with_slots(
                         }
                     }
                 };
-                for direction in 0..direction_count {
-                    derivative_slots[result_base + direction] = result_values[direction];
-                }
+                derivative_slots[result_base..(direction_count + result_base)]
+                    .copy_from_slice(&result_values[..direction_count]);
             }
         }
     }
@@ -5397,6 +5527,10 @@ fn execute_program_reverse_batch(
         .collect())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "binary Hessian accumulation keeps derivative buffers explicit for allocation-free updates"
+)]
 fn accumulate_binary_hessian_from_partials<F>(
     expr_arena: &mut AdExprArena,
     direction_count: usize,
@@ -6475,6 +6609,12 @@ impl SXContext {
 
     pub fn make_sym(self, name: impl Into<String>) -> SX {
         self.scoped(|| SX::sym(name))
+    }
+}
+
+impl Default for SXContext {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

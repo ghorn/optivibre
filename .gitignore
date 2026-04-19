@@ -1,4 +1,7 @@
 /target
+**/fuzz/artifacts
+**/fuzz/coverage
+**/fuzz/target
 **/node_modules
 optimal_control_webapp/dist
 **/*.rs.bk

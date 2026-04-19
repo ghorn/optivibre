@@ -1,0 +1,29 @@
+[package]
+name = "sparse_validation"
+version.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+description = "Validation corpus, metrics, reference adapters, and report rendering for sparse ordering and symbolic-analysis ports."
+
+[dependencies]
+amd.workspace = true
+anyhow.workspace = true
+flate2 = "1.1.0"
+libloading = "0.8.9"
+metis_ordering = { path = "../metis_ordering" }
+nalgebra.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+spral_ssids = { path = "../spral_ssids" }
+tar = "0.4.44"
+thiserror.workspace = true
+
+[dev-dependencies]
+approx.workspace = true
+
+[lints]
+workspace = true

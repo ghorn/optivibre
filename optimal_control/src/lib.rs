@@ -1,3 +1,8 @@
+#![allow(clippy::type_complexity)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::new_ret_no_self)]
+#![allow(clippy::extra_unused_type_parameters)]
+
 use anyhow::Result as AnyResult;
 use optimization::{
     BackendCompileReport, BackendTimingMetadata, CallPolicy, ClarabelSqpError, ClarabelSqpOptions,
@@ -46,19 +51,10 @@ impl<const N: usize, const K: usize> Default for DirectCollocation<N, K> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Bounds1D {
     pub lower: Option<f64>,
     pub upper: Option<f64>,
-}
-
-impl Default for Bounds1D {
-    fn default() -> Self {
-        Self {
-            lower: None,
-            upper: None,
-        }
-    }
 }
 
 impl ScalarLeaf for Bounds1D {}
@@ -2833,13 +2829,13 @@ where
             (values.parameters.clone(), values.beq.clone());
         let x_values = flatten_value(&x0);
         let param_values = flatten_value(&runtime_params);
-        Ok(self.compiled.validate_derivatives_flat_values(
+        self.compiled.validate_derivatives_flat_values(
             &x_values,
             &param_values,
             equality_multipliers,
             inequality_multipliers,
             options,
-        )?)
+        )
     }
 
     pub fn solve_sqp(
@@ -3277,14 +3273,14 @@ where
 
         add_repeated_equalities(
             &mut equality_groups,
-            &continuity_x_values,
+            continuity_x_values,
             &continuity_x_labels,
             OcpConstraintCategory::ContinuityState,
             tolerance,
         );
         add_repeated_equalities(
             &mut equality_groups,
-            &continuity_u_values,
+            continuity_u_values,
             &continuity_u_labels,
             OcpConstraintCategory::ContinuityControl,
             tolerance,
@@ -3303,7 +3299,7 @@ where
         let path_bounds = flatten_bounds(&values.path_bounds);
         add_repeated_inequalities(
             &mut inequality_groups,
-            &boundary_ineq_values,
+            boundary_ineq_values,
             &boundary_ineq_labels,
             &boundary_ineq_bounds,
             OcpConstraintCategory::BoundaryInequality,
@@ -3311,7 +3307,7 @@ where
         );
         add_repeated_inequalities(
             &mut inequality_groups,
-            &path_values,
+            path_values,
             &path_labels,
             &path_bounds,
             OcpConstraintCategory::Path,
@@ -3655,13 +3651,13 @@ where
             (values.parameters.clone(), values.beq.clone());
         let x_values = flatten_value(&x0);
         let param_values = flatten_value(&runtime_params);
-        Ok(self.compiled.validate_derivatives_flat_values(
+        self.compiled.validate_derivatives_flat_values(
             &x_values,
             &param_values,
             equality_multipliers,
             inequality_multipliers,
             options,
-        )?)
+        )
     }
 
     pub fn solve_sqp(
@@ -4060,28 +4056,28 @@ where
 
         add_repeated_equalities(
             &mut equality_groups,
-            &collocation_x_values,
+            collocation_x_values,
             &collocation_x_labels,
             OcpConstraintCategory::CollocationState,
             tolerance,
         );
         add_repeated_equalities(
             &mut equality_groups,
-            &collocation_u_values,
+            collocation_u_values,
             &collocation_u_labels,
             OcpConstraintCategory::CollocationControl,
             tolerance,
         );
         add_repeated_equalities(
             &mut equality_groups,
-            &continuity_x_values,
+            continuity_x_values,
             &continuity_x_labels,
             OcpConstraintCategory::ContinuityState,
             tolerance,
         );
         add_repeated_equalities(
             &mut equality_groups,
-            &continuity_u_values,
+            continuity_u_values,
             &continuity_u_labels,
             OcpConstraintCategory::ContinuityControl,
             tolerance,
@@ -4100,7 +4096,7 @@ where
         let path_bounds = flatten_bounds(&values.path_bounds);
         add_repeated_inequalities(
             &mut inequality_groups,
-            &boundary_ineq_values,
+            boundary_ineq_values,
             &boundary_ineq_labels,
             &boundary_ineq_bounds,
             OcpConstraintCategory::BoundaryInequality,
@@ -4108,7 +4104,7 @@ where
         );
         add_repeated_inequalities(
             &mut inequality_groups,
-            &path_values,
+            path_values,
             &path_labels,
             &path_bounds,
             OcpConstraintCategory::Path,
@@ -5188,12 +5184,12 @@ fn apply_bounds_to_coordinate(
             None => value,
         });
     }
-    if let (Some(lower), Some(upper)) = (variable_lower[index], variable_upper[index]) {
-        if lower > upper {
-            return Err(GuessError::Invalid(format!(
-                "promoted box bounds are inconsistent at variable index {index}"
-            )));
-        }
+    if let (Some(lower), Some(upper)) = (variable_lower[index], variable_upper[index])
+        && lower > upper
+    {
+        return Err(GuessError::Invalid(format!(
+            "promoted box bounds are inconsistent at variable index {index}"
+        )));
     }
     Ok(())
 }

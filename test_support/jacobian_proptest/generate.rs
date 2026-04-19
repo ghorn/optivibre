@@ -335,6 +335,10 @@ fn build_function_ast(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "generator state is kept explicit so property-case assembly stays transparent"
+)]
 fn build_family_expr(
     seed: &ExprSeed,
     family: Family,

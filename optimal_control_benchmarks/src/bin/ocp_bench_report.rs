@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::panic;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::{
     Arc, Mutex,
@@ -73,10 +73,10 @@ fn main() -> Result<()> {
         "Rendering HTML report",
         "Assembling final dashboard".to_string(),
     );
-    if let Some(parent) = output.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
     }
     progress.set_stage("Writing output", output.display().to_string());
     write_ocp_benchmark_report(&output, &suite)?;
@@ -249,10 +249,10 @@ where
 
     let mut values = Vec::new();
     for selection in selections.iter().copied() {
-        if let Some(value) = map(selection) {
-            if !values.contains(&value) {
-                values.push(value);
-            }
+        if let Some(value) = map(selection)
+            && !values.contains(&value)
+        {
+            values.push(value);
         }
     }
     if values.is_empty() {
@@ -618,7 +618,7 @@ struct SnapshotCellStyle {
 impl TerminalProgress {
     fn start(
         config: &optimal_control_problems::OcpBenchmarkSuiteConfig,
-        output_path: &PathBuf,
+        output_path: &Path,
     ) -> Self {
         let interactive = io::stderr().is_terminal();
         let row_keys = config
@@ -703,7 +703,7 @@ impl TerminalProgress {
             completed_cases: 0,
             started_at: Instant::now(),
             latest_event_started_at: Instant::now(),
-            output_path: output_path.clone(),
+            output_path: output_path.to_path_buf(),
             eval_iterations: config.eval_options.measured_iterations,
             warmup_iterations: config.eval_options.warmup_iterations,
             jobs: config.jobs,

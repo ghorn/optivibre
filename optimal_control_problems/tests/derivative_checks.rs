@@ -11,18 +11,18 @@ const FIRST_ORDER_TOLERANCES: ValidationTolerances = ValidationTolerances::new(5
 const SECOND_ORDER_TOLERANCES: ValidationTolerances = ValidationTolerances::new(1.0e-4, 1.0e-3);
 
 fn require_release_mode_for_manual_derivative_sweeps() {
-    assert!(
-        !cfg!(debug_assertions),
+    #[cfg(debug_assertions)]
+    panic!(
         "manual derivative sweeps must be run in release mode\n\ntry:\n  cargo test -p optimal_control_problems --release --test derivative_checks all_ocp_problems_policy_matrix_first_order_derivatives_stay_clean -- --ignored --nocapture"
     );
 }
 
-fn run_manual_sweep_with_large_stack(task: impl FnOnce() + Send + 'static) {
+fn run_with_large_stack(name: &str, task: impl FnOnce() + Send + 'static) {
     let handle = thread::Builder::new()
-        .name("manual-derivative-sweep".to_string())
+        .name(name.to_string())
         .stack_size(64 * 1024 * 1024)
         .spawn(task)
-        .expect("manual derivative sweep thread should spawn");
+        .expect("large-stack derivative-check thread should spawn");
     if let Err(payload) = handle.join() {
         std::panic::resume_unwind(payload);
     }
@@ -147,23 +147,25 @@ fn format_check(check: &ProblemDerivativeCheck) -> String {
 
 #[test]
 fn glider_derivative_check_api_smoke() {
-    let check = validate_problem_derivatives(
-        ProblemId::OptimalDistanceGlider,
-        &request_for(TranscriptionMethod::MultipleShooting, None),
-    )
-    .expect("glider derivative check should compile and validate");
-    assert!(
-        check.first_order_is_within_tolerances(FIRST_ORDER_TOLERANCES),
-        "glider first-order derivative check failed\n{}",
-        format_check(&check),
-    );
+    run_with_large_stack("glider-derivative-check-smoke", || {
+        let check = validate_problem_derivatives(
+            ProblemId::OptimalDistanceGlider,
+            &request_for(TranscriptionMethod::MultipleShooting, None),
+        )
+        .expect("glider derivative check should compile and validate");
+        assert!(
+            check.first_order_is_within_tolerances(FIRST_ORDER_TOLERANCES),
+            "glider first-order derivative check failed\n{}",
+            format_check(&check),
+        );
+    });
 }
 
 #[test]
 #[ignore = "manual full derivative sweep over all OCP problems and both transcriptions"]
 fn all_ocp_problems_first_order_derivatives_stay_clean() {
     require_release_mode_for_manual_derivative_sweeps();
-    run_manual_sweep_with_large_stack(|| {
+    run_with_large_stack("manual-derivative-sweep", || {
         let mut failures = Vec::new();
         for spec in problem_specs() {
             for transcription in [
@@ -201,7 +203,7 @@ fn all_ocp_problems_first_order_derivatives_stay_clean() {
 #[ignore = "manual policy-matrix derivative sweep over all OCP problems"]
 fn all_ocp_problems_policy_matrix_first_order_derivatives_stay_clean() {
     require_release_mode_for_manual_derivative_sweeps();
-    run_manual_sweep_with_large_stack(|| {
+    run_with_large_stack("manual-derivative-sweep", || {
         let mut failures = Vec::new();
         for spec in problem_specs() {
             for transcription in [
@@ -245,7 +247,7 @@ fn all_ocp_problems_policy_matrix_first_order_derivatives_stay_clean() {
 #[ignore = "manual Hessian policy-matrix sweep over all OCP problems"]
 fn all_ocp_problems_policy_matrix_second_order_derivatives_stay_clean() {
     require_release_mode_for_manual_derivative_sweeps();
-    run_manual_sweep_with_large_stack(|| {
+    run_with_large_stack("manual-derivative-sweep", || {
         let mut execution_failures = Vec::new();
         let mut tolerance_misses = Vec::new();
         for spec in problem_specs() {

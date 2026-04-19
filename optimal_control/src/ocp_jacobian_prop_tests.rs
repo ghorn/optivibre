@@ -1,3 +1,6 @@
+#![allow(clippy::large_enum_variant)]
+#![allow(clippy::type_complexity)]
+
 use std::cell::RefCell;
 
 use optimization::{
@@ -588,9 +591,14 @@ fn dense_from_optimization_ccs(ccs: &optimization::CCS, values: &[f64]) -> Dense
     assert_eq!(ccs.nnz(), values.len());
     let mut dense = DenseMatrix::zeros(ccs.nrow, ccs.ncol);
     for col in 0..ccs.ncol {
-        for index in ccs.col_ptrs[col]..ccs.col_ptrs[col + 1] {
+        for (index, value) in values
+            .iter()
+            .enumerate()
+            .take(ccs.col_ptrs[col + 1])
+            .skip(ccs.col_ptrs[col])
+        {
             let row = ccs.row_indices[index];
-            dense.set(row, col, values[index]);
+            dense.set(row, col, *value);
         }
     }
     dense
@@ -1157,8 +1165,8 @@ fn run_policy_differential(scenario: &'static PropertyScenario) {
 }
 
 fn require_release_mode_for_manual_property_runs() {
-    assert!(
-        !cfg!(debug_assertions),
+    #[cfg(debug_assertions)]
+    panic!(
         "manual OCP Jacobian property stress runs must be executed in release mode\n\ntry:\n  cargo test -p optimal_control --release generated_direct_collocation_inequality_stress -- --ignored --nocapture"
     );
 }

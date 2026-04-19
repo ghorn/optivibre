@@ -72,28 +72,28 @@ pub fn ad_cost_expectations(scenario: AdCostScenario) -> AdCostExpectations {
         AdCostScenario::ReverseGradient => AdCostExpectations {
             description: "Scalar primal; reverse AD returns value plus gradient.",
             exact_original_ops: 952,
-            exact_augmented_ops: 2658,
+            exact_augmented_ops: 2376,
             directional_ratio_limit: Some(5.0),
             normalized_ratio_limit: None,
         },
         AdCostScenario::ForwardSweep => AdCostExpectations {
             description: "Vector primal; one forward sweep returns primal plus directional.",
             exact_original_ops: 1281,
-            exact_augmented_ops: 3040,
+            exact_augmented_ops: 2880,
             directional_ratio_limit: Some(5.0),
             normalized_ratio_limit: None,
         },
         AdCostScenario::Jacobian => AdCostExpectations {
             description: "Vector primal; full Jacobian cost normalized by sweep count.",
-            exact_original_ops: 321,
-            exact_augmented_ops: 5228,
+            exact_original_ops: 322,
+            exact_augmented_ops: 4081,
             directional_ratio_limit: None,
             normalized_ratio_limit: Some(8.0),
         },
         AdCostScenario::Hessian => AdCostExpectations {
             description: "Scalar primal; Hessian cost normalized by sweep count.",
             exact_original_ops: 232,
-            exact_augmented_ops: 14037,
+            exact_augmented_ops: 11159,
             directional_ratio_limit: None,
             normalized_ratio_limit: Some(8.0),
         },
@@ -958,7 +958,7 @@ pub fn hessian_strategy_expectation(strategy: HessianStrategy) -> HessianStrateg
     match strategy {
         HessianStrategy::LowerTriangleByColumn
         | HessianStrategy::LowerTriangleSelectedOutputs
-        | HessianStrategy::LowerTriangleColored => HessianStrategyExpectation { exact_ops: 14_037 },
+        | HessianStrategy::LowerTriangleColored => HessianStrategyExpectation { exact_ops: 11_159 },
     }
 }
 

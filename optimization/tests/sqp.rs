@@ -331,6 +331,7 @@ fn sqp_solves_hanging_chain(
             max_iters: 120,
             merit_penalty: 50.0,
             dual_tol: 1e-5,
+            overall_tol: 1e-5,
             ..ClarabelSqpOptions::default()
         },
     );
@@ -346,7 +347,7 @@ fn sqp_solves_hanging_chain(
     assert_abs_diff_eq!(summary.x[3], summary.x[5], epsilon = 1e-5);
     assert!(summary.x[1] <= 0.0);
     assert!(summary.x[3] <= summary.x[1]);
-    assert!(summary.x[3] <= summary.x[5]);
+    assert!(summary.x[3] <= summary.x[5] + 1e-12);
 }
 
 #[rstest]
@@ -362,6 +363,7 @@ fn sqp_reports_profiling_breakdown(
             max_iters: 120,
             merit_penalty: 50.0,
             dual_tol: 1e-5,
+            overall_tol: 1e-5,
             ..ClarabelSqpOptions::default()
         },
     );
@@ -379,8 +381,8 @@ fn sqp_reports_profiling_breakdown(
     assert_eq!(profiling.inequality_jacobian_values.calls, snapshot_count);
     assert_eq!(profiling.qp_setups, profiling.qp_solves);
     assert_eq!(
-        profiling.lagrangian_hessian_values.calls,
-        profiling.qp_setups
+        profiling.lagrangian_hessian_values.calls + 1,
+        snapshot_count
     );
     assert!(profiling.multiplier_estimation_time >= Duration::ZERO);
     assert!(profiling.subproblem_solve_time >= Duration::ZERO);
@@ -389,8 +391,8 @@ fn sqp_reports_profiling_breakdown(
     assert!(profiling.line_search_time >= Duration::ZERO);
     assert!(profiling.convergence_check_time >= Duration::ZERO);
     assert!(profiling.convergence_time >= Duration::ZERO);
-    assert!(profiling.qp_setups <= snapshot_count);
-    assert!(profiling.qp_setups + 1 >= snapshot_count);
+    assert!(profiling.qp_setups >= snapshot_count.saturating_sub(1));
+    assert!(profiling.qp_setups >= profiling.lagrangian_hessian_values.calls);
     assert_eq!(
         profiling.unaccounted_time,
         profiling

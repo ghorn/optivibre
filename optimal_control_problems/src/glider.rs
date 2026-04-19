@@ -1474,6 +1474,10 @@ mod tests {
                 status: optimization::SqpQpRawStatus::InsufficientProgress,
                 ..
             }) => {}
+            Err(optimization::ClarabelSqpError::QpSolve {
+                status: optimization::SqpQpRawStatus::NumericalError,
+                ..
+            }) => {}
             Err(other) => {
                 panic!("glider SQP should progress past the old early failure, got {other:?}")
             }

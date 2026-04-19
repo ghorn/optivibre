@@ -1,3 +1,5 @@
+#![allow(clippy::large_enum_variant)]
+
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
@@ -685,10 +687,10 @@ where
 
     let mut values = Vec::new();
     for selection in selections.iter().copied() {
-        if let Some(value) = map(selection) {
-            if !values.contains(&value) {
-                values.push(value);
-            }
+        if let Some(value) = map(selection)
+            && !values.contains(&value)
+        {
+            values.push(value);
         }
     }
     if values.is_empty() {

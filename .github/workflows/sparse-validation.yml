@@ -1,0 +1,51 @@
+name: Sparse Validation
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 10 * * 1"
+
+concurrency:
+  group: sparse-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sparse-validation:
+    runs-on: macos-14
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      LLVM_SYS_221_PREFIX: /opt/homebrew/opt/llvm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+      - name: Install LLVM and METIS
+        run: brew install llvm metis
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@cargo-fuzz
+      - name: Run sparse validation (scheduled tier)
+        run: cargo run -p xtask -- sparse-validation --tier scheduled --download-corpus --with-native-metis
+      - name: Run Criterion ordering smoke
+        run: cargo bench -p metis_ordering --bench ordering_validation -- --quick --noplot
+      - name: Run Criterion symbolic smoke
+        run: cargo bench -p spral_ssids --bench symbolic_validation -- --quick --noplot
+      - name: Run metis_ordering fuzz smoke
+        working-directory: metis_ordering/fuzz
+        run: |
+          cargo fuzz run csr_new -- -max_total_time=10
+          cargo fuzz run from_symmetric_csc -- -max_total_time=10
+          cargo fuzz run nested_dissection_order -- -max_total_time=10
+      - name: Run spral_ssids fuzz smoke
+        working-directory: spral_ssids/fuzz
+        run: |
+          cargo fuzz run symmetric_csc_new -- -max_total_time=10
+          cargo fuzz run analyse -- -max_total_time=10
+      - name: Upload sparse validation artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sparse-validation-scheduled
+          path: |
+            target/reports/sparse_validation
+            target/criterion

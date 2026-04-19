@@ -191,6 +191,7 @@ fn typed_symbolic_hanging_chain_solves_end_to_end() {
                 max_iters: 120,
                 merit_penalty: 50.0,
                 dual_tol: 1e-5,
+                overall_tol: 1e-5,
                 verbose: false,
                 ..ClarabelSqpOptions::default()
             },

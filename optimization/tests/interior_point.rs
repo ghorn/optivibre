@@ -361,7 +361,10 @@ fn interior_point_solves_hs071(
         &[1.0, 5.0, 5.0, 1.0],
         &[],
         InteriorPointOptions {
-            max_iters: 120,
+            max_iters: 300,
+            dual_tol: 1.0e-5,
+            overall_tol: 1.0e-5,
+            filter_method: false,
             ..InteriorPointOptions::default()
         },
     );

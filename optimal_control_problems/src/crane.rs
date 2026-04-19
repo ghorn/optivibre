@@ -120,6 +120,12 @@ pub struct Params {
 }
 impl Default for Params {
     fn default() -> Self {
+        let mut solver = default_sqp_config();
+        solver.globalization = crate::common::SqpGlobalizationConfig::LineSearchFilter {
+            line_search: crate::common::default_sqp_line_search_config(),
+            filter: crate::common::default_sqp_filter_config(),
+            exact_merit_penalty: 10.0,
+        };
         Self {
             target_x_m: 10.0,
             tf_s: 7.5,
@@ -129,7 +135,7 @@ impl Default for Params {
             force_rate_regularization: 5.0e-4,
             swing_limit_deg: 15.0,
             solver_method: default_solver_method(),
-            solver: default_sqp_config(),
+            solver,
             transcription: default_transcription(DEFAULT_INTERVALS),
             sx_functions: OcpSxFunctionConfig::default(),
         }

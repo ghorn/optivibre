@@ -275,12 +275,16 @@ fn dense_from_ccs(ccs: &CCS, values: &[f64], symmetric: bool) -> DMatrix<f64> {
     assert_eq!(values.len(), ccs.nnz());
     let mut dense = DMatrix::<f64>::zeros(ccs.nrow, ccs.ncol);
     for col in 0..ccs.ncol {
-        for idx in ccs.col_ptrs[col]..ccs.col_ptrs[col + 1] {
+        for (idx, value) in values
+            .iter()
+            .enumerate()
+            .take(ccs.col_ptrs[col + 1])
+            .skip(ccs.col_ptrs[col])
+        {
             let row = ccs.row_indices[idx];
-            let value = values[idx];
-            dense[(row, col)] = value;
+            dense[(row, col)] = *value;
             if symmetric && row != col {
-                dense[(col, row)] = value;
+                dense[(col, row)] = *value;
             }
         }
     }

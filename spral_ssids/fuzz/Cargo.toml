@@ -1,0 +1,36 @@
+[package]
+name = "spral_ssids-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+spral_ssids = { path = ".." }
+
+[[bin]]
+name = "symmetric_csc_new"
+path = "fuzz_targets/symmetric_csc_new.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "analyse"
+path = "fuzz_targets/analyse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "factorize"
+path = "fuzz_targets/factorize.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

@@ -665,6 +665,10 @@ unsafe fn add_noinline_attribute(context: LLVMContextRef, function: LLVMValueRef
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "LLVM IR emission threads raw builder/module/type handles explicitly"
+)]
 unsafe fn emit_root_callable(
     builder: LLVMBuilderRef,
     module: LLVMModuleRef,
@@ -708,6 +712,10 @@ unsafe fn emit_root_callable(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "LLVM IR emission threads raw builder/module/type handles explicitly"
+)]
 unsafe fn emit_internal_callable(
     builder: LLVMBuilderRef,
     module: LLVMModuleRef,
@@ -766,6 +774,10 @@ unsafe fn emit_internal_callable(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "instruction lowering threads raw LLVM handles explicitly in the hot path"
+)]
 unsafe fn emit_instruction_sequence(
     builder: LLVMBuilderRef,
     module: LLVMModuleRef,
@@ -1608,7 +1620,9 @@ mod tests {
         .expect("callee should build");
 
         let x = SXMatrix::sym_dense("x", 2, 1).expect("root input should build");
-        let stage_a = stage.call(&[x.clone()]).expect("first call should build");
+        let stage_a = stage
+            .call(std::slice::from_ref(&x))
+            .expect("first call should build");
         let swapped = SXMatrix::dense_column(vec![x.nz(1), x.nz(0)]).expect("swap should build");
         let stage_b = stage.call(&[swapped]).expect("second call should build");
 

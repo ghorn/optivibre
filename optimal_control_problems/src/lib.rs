@@ -1,3 +1,12 @@
+#![allow(clippy::type_complexity)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::large_enum_variant)]
+#![allow(clippy::redundant_closure)]
+#![allow(clippy::assertions_on_constants)]
+#![allow(clippy::useless_conversion)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::collapsible_if)]
+
 mod benchmark_report;
 mod common;
 pub mod crane;

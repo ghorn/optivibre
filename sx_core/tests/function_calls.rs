@@ -133,7 +133,7 @@ fn call_aware_derivatives_keep_irrelevant_inputs_zero() {
 
     let x = SXMatrix::sym_dense("x", 2, 1).expect("symbolic call input should build");
     let called = function
-        .call_output(&[x.clone()])
+        .call_output(std::slice::from_ref(&x))
         .expect("call output should succeed");
 
     let jacobian = called.jacobian(&x).expect("jacobian should build");
@@ -166,7 +166,7 @@ fn call_aware_jacobian_drops_zero_seed_reverse_entries() {
     let x = SXMatrix::sym_dense("x", 2, 1).expect("symbolic call input should build");
     let first_output = SXMatrix::scalar(
         function
-            .call_output(&[x.clone()])
+            .call_output(std::slice::from_ref(&x))
             .expect("call output should succeed")
             .nz(0),
     );
@@ -206,7 +206,7 @@ fn call_aware_reverse_batch_helper_keeps_irrelevant_inputs_zero() {
 
     let x = SXMatrix::sym_dense("x", 2, 1).expect("symbolic input should build");
     let outer_output = inner
-        .call_output(&[x.clone()])
+        .call_output(std::slice::from_ref(&x))
         .expect("nested call output should build");
     let outer = SXFunction::new(
         "outer",
@@ -265,7 +265,7 @@ fn preserved_call_jacobian_keeps_direct_identity_terms_alongside_constant_helper
             "y",
             SXMatrix::scalar(
                 helper0
-                    .call_output(&[z.clone()])
+                    .call_output(std::slice::from_ref(&z))
                     .expect("helper0 call should build")
                     .nz(0),
             ),
@@ -280,7 +280,7 @@ fn preserved_call_jacobian_keeps_direct_identity_terms_alongside_constant_helper
             "y",
             SXMatrix::scalar(
                 helper1
-                    .call_output(&[z.clone()])
+                    .call_output(std::slice::from_ref(&z))
                     .expect("helper1 call should build")
                     .nz(0),
             ),
@@ -330,7 +330,7 @@ fn preserved_call_hessian_matches_central_difference_for_nested_helpers() {
 
     let w = SXMatrix::sym_dense("w", 2, 1).expect("outer input should build");
     let inner_called = inner
-        .call_output(&[w.clone()])
+        .call_output(std::slice::from_ref(&w))
         .expect("inner call should build");
     let outer_scalar =
         SXMatrix::scalar(inner_called.nz(0) * w.nz(0) + inner_called.nz(1).sin() + w.nz(1).sqr());
@@ -409,7 +409,7 @@ fn preserved_call_jacobian_keeps_identity_terms_through_called_function_boundary
             "y",
             SXMatrix::scalar(
                 helper0
-                    .call_output(&[z.clone()])
+                    .call_output(std::slice::from_ref(&z))
                     .expect("helper0 call should build")
                     .nz(0),
             ),
@@ -424,7 +424,7 @@ fn preserved_call_jacobian_keeps_identity_terms_through_called_function_boundary
             "y",
             SXMatrix::scalar(
                 helper1
-                    .call_output(&[z.clone()])
+                    .call_output(std::slice::from_ref(&z))
                     .expect("helper1 call should build")
                     .nz(0),
             ),
@@ -460,7 +460,7 @@ fn preserved_call_jacobian_keeps_identity_terms_through_called_function_boundary
 
     let x = SXMatrix::sym_dense("x", 2, 1).expect("outer input should build");
     let outer_outputs = inner
-        .call_output(&[x.clone()])
+        .call_output(std::slice::from_ref(&x))
         .expect("outer call should build");
     let jacobian = outer_outputs.jacobian(&x).expect("jacobian should build");
     assert!(
@@ -491,7 +491,7 @@ fn preserved_call_jacobian_keeps_identity_terms_with_multi_input_called_function
             "y",
             SXMatrix::scalar(
                 helper0
-                    .call_output(&[z.clone()])
+                    .call_output(std::slice::from_ref(&z))
                     .expect("helper0 call should build")
                     .nz(0),
             ),
@@ -564,7 +564,7 @@ fn preserved_call_forward_combined_seed_uses_seed_specific_call_memoization() {
 
     let x = SXMatrix::sym_dense("x", 2, 1).expect("outer input should build");
     let called = inner
-        .call_output(&[x.clone()])
+        .call_output(std::slice::from_ref(&x))
         .expect("call output should build");
     let combined_seed =
         SXMatrix::dense_column(vec![SX::from(1.0), SX::from(1.0)]).expect("seed should build");

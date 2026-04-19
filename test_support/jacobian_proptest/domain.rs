@@ -1,6 +1,10 @@
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "variant suffixes encode the shared finiteness contract for generator families"
+)]
 pub enum InputBoxFamily {
     SymmetricFinite,
     PositiveFinite,

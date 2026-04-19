@@ -18,3 +18,4 @@ bench_report = { path = "../bench_report" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sparse_validation = { path = "../sparse_validation" }
