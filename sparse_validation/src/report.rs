@@ -288,12 +288,12 @@ pub fn render_markdown_report(report: &ValidationSuiteReport) -> String {
         }
         out.push('\n');
         out.push_str("### Numeric Factorization\n\n");
-        out.push_str("| strategy | outcome | factor_ms | solve_ms | refactor_ms | refactor_speedup | residual | solution_error | stored_nnz | supernodes | max_width | inertia_match | regularized_pivots | two_by_two_pivots | delayed_pivots |\n");
-        out.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+        out.push_str("| strategy | outcome | factor_ms | solve_ms | refactor_ms | refactor_speedup | residual | solution_error | stored_nnz | supernodes | max_width | fronts | max_front | contrib_bytes | delayed_fronts | reused_symbolic | inertia_match | regularized_pivots | two_by_two_pivots | delayed_pivots |\n");
+        out.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
         for result in &case.numeric {
             let metrics = result.metrics.as_ref();
             out.push_str(&format!(
-                "| `{:?}` | `{:?}` | {:.3} | {:.3} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                "| `{:?}` | `{:?}` | {:.3} | {:.3} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                 result.strategy,
                 result.outcome,
                 result.factor_elapsed_ms,
@@ -320,6 +320,21 @@ pub fn render_markdown_report(report: &ValidationSuiteReport) -> String {
                     .unwrap_or_else(|| "n/a".into()),
                 metrics
                     .map(|value| value.max_supernode_width.to_string())
+                    .unwrap_or_else(|| "n/a".into()),
+                metrics
+                    .map(|value| value.front_count.to_string())
+                    .unwrap_or_else(|| "n/a".into()),
+                metrics
+                    .map(|value| value.max_front_size.to_string())
+                    .unwrap_or_else(|| "n/a".into()),
+                metrics
+                    .map(|value| value.contribution_storage_bytes.to_string())
+                    .unwrap_or_else(|| "n/a".into()),
+                metrics
+                    .map(|value| value.delayed_front_propagations.to_string())
+                    .unwrap_or_else(|| "n/a".into()),
+                metrics
+                    .map(|value| value.reused_symbolic_structure.to_string())
                     .unwrap_or_else(|| "n/a".into()),
                 metrics
                     .and_then(|value| value.inertia_match)

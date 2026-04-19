@@ -551,6 +551,14 @@ fn validate_numeric_strategy(
     };
 
     let mut notes = vec![format!("ordering_kind={}", info.ordering_kind)];
+    notes.push(format!(
+        "backend={}",
+        if factor.uses_multifrontal_backend() {
+            "multifrontal"
+        } else {
+            "prototype"
+        }
+    ));
     if case.matrix.dimension() > NUMERIC_EXACT_INERTIA_MAX_DIM {
         notes.push(format!(
             "exact dense inertia oracle skipped above dimension {NUMERIC_EXACT_INERTIA_MAX_DIM}"
@@ -578,6 +586,11 @@ fn validate_numeric_strategy(
             factor_storage_bytes: factor.factor_bytes(),
             supernode_count: factor.supernode_count(),
             max_supernode_width: factor.max_supernode_width(),
+            front_count: factor.front_count(),
+            max_front_size: factor.max_front_size(),
+            contribution_storage_bytes: factor.contribution_storage_bytes(),
+            delayed_front_propagations: factor.delayed_front_propagations(),
+            reused_symbolic_structure: factor.reused_symbolic_structure(),
             regularized_pivots: factor.pivot_stats().regularized_pivots,
             two_by_two_pivots: factor.pivot_stats().two_by_two_pivots,
             delayed_pivots: factor.pivot_stats().delayed_pivots,
@@ -831,6 +844,138 @@ fn run_robustness_suite() -> Vec<RobustnessCaseResult> {
                     .map_err(|error| error.to_string())
             },
         ),
+        robustness_expect_error(
+            "numeric_solve_dimension_mismatch",
+            "spral_ssids::NumericFactor::solve_in_place",
+            || {
+                let col_ptrs = vec![0, 2, 4, 5];
+                let row_indices = vec![0, 1, 1, 2, 2];
+                let values = vec![3.0, 0.1, -2.0, 0.2, 1.5];
+                let matrix = SymmetricCscMatrix::new(3, &col_ptrs, &row_indices, Some(&values))
+                    .map_err(|error| error.to_string())?;
+                let (symbolic, _) =
+                    analyse(matrix, &SsidsOptions::default()).map_err(|error| error.to_string())?;
+                let (factor, _) = factorize(matrix, &symbolic, &NumericFactorOptions::default())
+                    .map_err(|error| error.to_string())?;
+                let mut rhs = vec![1.0, -2.0];
+                factor
+                    .solve_in_place(&mut rhs)
+                    .map_err(|error| error.to_string())
+            },
+        ),
+        robustness_expect_error(
+            "numeric_refactorize_pattern_mismatch",
+            "spral_ssids::NumericFactor::refactorize",
+            || {
+                let original_col_ptrs = vec![0, 2, 4, 6, 7];
+                let original_row_indices = vec![0, 1, 1, 2, 2, 3, 3];
+                let original_values = vec![4.0, -1.0, 4.0, -1.0, 4.0, -1.0, 3.0];
+                let matrix = SymmetricCscMatrix::new(
+                    4,
+                    &original_col_ptrs,
+                    &original_row_indices,
+                    Some(&original_values),
+                )
+                .map_err(|error| error.to_string())?;
+                let (symbolic, _) =
+                    analyse(matrix, &SsidsOptions::default()).map_err(|error| error.to_string())?;
+                let (mut factor, _) =
+                    factorize(matrix, &symbolic, &NumericFactorOptions::default())
+                        .map_err(|error| error.to_string())?;
+
+                let changed_col_ptrs = vec![0, 2, 5, 7, 8];
+                let changed_row_indices = vec![0, 1, 1, 2, 3, 2, 3, 3];
+                let changed_values = vec![4.0, -1.0, 4.0, -1.0, 0.25, 4.0, -1.0, 3.0];
+                let changed_matrix = SymmetricCscMatrix::new(
+                    4,
+                    &changed_col_ptrs,
+                    &changed_row_indices,
+                    Some(&changed_values),
+                )
+                .map_err(|error| error.to_string())?;
+                factor
+                    .refactorize(changed_matrix)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            },
+        ),
+        robustness_expect_success(
+            "numeric_refactorize_repeated_delayed_chain",
+            "spral_ssids::NumericFactor::refactorize",
+            || {
+                let col_ptrs = vec![0, 2, 4, 6, 8, 10, 11];
+                let row_indices = vec![0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5];
+                let base_values = delayed_chain_values(0.0);
+                let matrix =
+                    SymmetricCscMatrix::new(6, &col_ptrs, &row_indices, Some(&base_values))
+                        .map_err(|error| error.to_string())?;
+                let (symbolic, _) = analyse(
+                    matrix,
+                    &SsidsOptions {
+                        ordering: OrderingStrategy::Natural,
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+                let options = NumericFactorOptions {
+                    pivot_regularization: 1e-6,
+                    ..NumericFactorOptions::default()
+                };
+                let (mut factor, _) =
+                    factorize(matrix, &symbolic, &options).map_err(|error| error.to_string())?;
+                for shift in [0.08, -0.05, 0.14, -0.09, 0.2] {
+                    let updated_values = delayed_chain_values(shift);
+                    let updated_matrix =
+                        SymmetricCscMatrix::new(6, &col_ptrs, &row_indices, Some(&updated_values))
+                            .map_err(|error| error.to_string())?;
+                    factor
+                        .refactorize(updated_matrix)
+                        .map_err(|error| error.to_string())?;
+                    if !factor.reused_symbolic_structure()
+                        || factor.delayed_front_propagations() == 0
+                    {
+                        return Err(
+                            "multifrontal refactorization lost reuse or delayed propagation".into(),
+                        );
+                    }
+                    let expected = (0..6)
+                        .map(|index| 0.75 + index as f64 * 0.15)
+                        .collect::<Vec<_>>();
+                    let rhs =
+                        lower_csc_matvec(6, &col_ptrs, &row_indices, &updated_values, &expected);
+                    let solution = factor.solve(&rhs).map_err(|error| error.to_string())?;
+                    let residual = lower_csc_residual_inf_norm(
+                        6,
+                        &col_ptrs,
+                        &row_indices,
+                        &updated_values,
+                        &solution,
+                        &rhs,
+                    );
+                    if residual > 1e-7 {
+                        return Err(format!(
+                            "refactorized solve residual {residual:e} exceeded tolerance"
+                        ));
+                    }
+                }
+                Ok(())
+            },
+        ),
+    ]
+}
+
+fn delayed_chain_values(shift: f64) -> Vec<f64> {
+    vec![
+        1e-8 * (1.0 + 0.25 * shift),
+        1.0 - 0.05 * shift,
+        2.0 + 0.15 * shift,
+        0.25 + 0.04 * shift,
+        3.0 - 0.1 * shift,
+        -0.5 + 0.03 * shift,
+        2.5 + 0.12 * shift,
+        0.2 - 0.02 * shift,
+        1.75 + 0.08 * shift,
+        -0.4 + 0.01 * shift,
+        1.5 - 0.06 * shift,
     ]
 }
 
@@ -928,6 +1073,9 @@ fn synthetic_numeric_values(case: &LoadedCorpusCase) -> Vec<f64> {
         .iter()
         .any(|tag| matches!(tag, crate::model::CorpusTag::DelayedPivot))
     {
+        if case.matrix.dimension() == 6 {
+            return vec![1e-8, 1.0, 2.0, 0.25, 3.0, -0.5, 2.5, 0.2, 1.75, -0.4, 1.5];
+        }
         return vec![1e-4, 1e-4, 1.0, 1e-4, 0.5, 0.0];
     }
     let dimension = case.matrix.dimension();

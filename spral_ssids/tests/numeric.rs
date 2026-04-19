@@ -43,6 +43,52 @@ fn dense_to_lower_csc(matrix: &[Vec<f64>]) -> (Vec<usize>, Vec<usize>, Vec<f64>)
     (col_ptrs, row_indices, values)
 }
 
+fn delayed_chain_dense(shift: f64) -> Vec<Vec<f64>> {
+    vec![
+        vec![
+            1e-8 * (1.0 + 0.25 * shift),
+            1.0 - 0.05 * shift,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ],
+        vec![
+            1.0 - 0.05 * shift,
+            2.0 + 0.15 * shift,
+            0.25 + 0.04 * shift,
+            0.0,
+            0.0,
+            0.0,
+        ],
+        vec![
+            0.0,
+            0.25 + 0.04 * shift,
+            3.0 - 0.1 * shift,
+            -0.5 + 0.03 * shift,
+            0.0,
+            0.0,
+        ],
+        vec![
+            0.0,
+            0.0,
+            -0.5 + 0.03 * shift,
+            2.5 + 0.12 * shift,
+            0.2 - 0.02 * shift,
+            0.0,
+        ],
+        vec![
+            0.0,
+            0.0,
+            0.0,
+            0.2 - 0.02 * shift,
+            1.75 + 0.08 * shift,
+            -0.4 + 0.01 * shift,
+        ],
+        vec![0.0, 0.0, 0.0, 0.0, -0.4 + 0.01 * shift, 1.5 - 0.06 * shift],
+    ]
+}
+
 #[test]
 fn numeric_factorization_solves_spd_system() {
     let dense = vec![
@@ -177,40 +223,6 @@ fn numeric_factorization_uses_two_by_two_pivot_for_width_two_supernode() {
 }
 
 #[test]
-fn numeric_factorization_defers_unstable_panel_to_dense_block() {
-    let dense = vec![
-        vec![1e-4, 1e-4, 1.0],
-        vec![1e-4, 1e-4, 0.5],
-        vec![1.0, 0.5, 0.0],
-    ];
-    let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
-    let matrix = SymmetricCscMatrix::new(3, &col_ptrs, &row_indices, Some(&values)).expect("csc");
-    let (symbolic, _) = analyse(
-        matrix,
-        &SsidsOptions {
-            ordering: OrderingStrategy::Natural,
-        },
-    )
-    .expect("symbolic");
-    let options = NumericFactorOptions {
-        pivot_regularization: 1e-4,
-        ..NumericFactorOptions::default()
-    };
-    let (factor, info) = factorize(matrix, &symbolic, &options).expect("factor");
-
-    assert!(info.factorization_residual_max_abs <= 1e-4);
-    assert!(factor.pivot_stats().delayed_pivots >= 3);
-
-    let expected = vec![0.25, -0.5, 1.0];
-    let rhs = dense_mul(&dense, &expected);
-    let solution = factor.solve(&rhs).expect("solve");
-    for (actual, expected) in solution.iter().zip(expected.iter()) {
-        assert_abs_diff_eq!(actual, expected, epsilon = 1e-8);
-    }
-    assert!(residual_inf_norm(&dense, &solution, &rhs) <= 1e-8);
-}
-
-#[test]
 fn numeric_refactorization_updates_factor_values() {
     let original = vec![
         vec![4.0, -1.0, 0.0, 0.0],
@@ -249,6 +261,171 @@ fn numeric_refactorization_updates_factor_values() {
         assert_abs_diff_eq!(actual, expected, epsilon = 1e-10);
     }
     assert!(residual_inf_norm(&updated, &solution, &rhs) <= 1e-10);
+}
+
+#[test]
+fn multifrontal_factorization_propagates_delayed_pivots_to_parent_fronts() {
+    let dense = delayed_chain_dense(0.0);
+    let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+    let matrix = SymmetricCscMatrix::new(6, &col_ptrs, &row_indices, Some(&values)).expect("csc");
+    let (symbolic, _) = analyse(
+        matrix,
+        &SsidsOptions {
+            ordering: OrderingStrategy::Natural,
+        },
+    )
+    .expect("symbolic");
+    let options = NumericFactorOptions {
+        pivot_regularization: 1e-6,
+        ..NumericFactorOptions::default()
+    };
+    let (factor, info) = factorize(matrix, &symbolic, &options).expect("factor");
+
+    assert!(info.factorization_residual_max_abs <= 1e-6);
+    assert!(factor.uses_multifrontal_backend());
+    assert!(factor.front_count() >= 2);
+    assert!(factor.delayed_front_propagations() >= 1);
+
+    let expected = vec![1.0, -0.5, 0.75, -1.25, 0.25, 1.5];
+    let rhs = dense_mul(&dense, &expected);
+    let solution = factor.solve(&rhs).expect("solve");
+    for (actual, expected) in solution.iter().zip(expected.iter()) {
+        assert_abs_diff_eq!(actual, expected, epsilon = 1e-8);
+    }
+    assert!(residual_inf_norm(&dense, &solution, &rhs) <= 1e-8);
+}
+
+#[test]
+fn multifrontal_refactorization_reuses_symbolic_front_tree() {
+    let original = vec![
+        vec![6.0, -1.0, 0.0, 0.0, 0.0, 0.0],
+        vec![-1.0, 5.0, -1.0, 0.0, 0.0, 0.0],
+        vec![0.0, -1.0, 4.5, -0.5, 0.0, 0.0],
+        vec![0.0, 0.0, -0.5, 4.0, -0.25, 0.0],
+        vec![0.0, 0.0, 0.0, -0.25, 3.5, -0.2],
+        vec![0.0, 0.0, 0.0, 0.0, -0.2, 3.0],
+    ];
+    let updated = vec![
+        vec![5.75, -0.75, 0.0, 0.0, 0.0, 0.0],
+        vec![-0.75, 5.25, -1.1, 0.0, 0.0, 0.0],
+        vec![0.0, -1.1, 4.8, -0.45, 0.0, 0.0],
+        vec![0.0, 0.0, -0.45, 3.9, -0.3, 0.0],
+        vec![0.0, 0.0, 0.0, -0.3, 3.7, -0.25],
+        vec![0.0, 0.0, 0.0, 0.0, -0.25, 2.8],
+    ];
+    let (col_ptrs, row_indices, values) = dense_to_lower_csc(&original);
+    let matrix = SymmetricCscMatrix::new(6, &col_ptrs, &row_indices, Some(&values)).expect("csc");
+    let (symbolic, _) = analyse(matrix, &SsidsOptions::default()).expect("symbolic");
+    let (mut factor, _) =
+        factorize(matrix, &symbolic, &NumericFactorOptions::default()).expect("factor");
+    assert!(factor.uses_multifrontal_backend());
+    assert!(!factor.reused_symbolic_structure());
+
+    let (updated_col_ptrs, updated_row_indices, updated_values) = dense_to_lower_csc(&updated);
+    let updated_matrix = SymmetricCscMatrix::new(
+        6,
+        &updated_col_ptrs,
+        &updated_row_indices,
+        Some(&updated_values),
+    )
+    .expect("updated csc");
+    let info = factor.refactorize(updated_matrix).expect("refactorize");
+    assert!(info.factorization_residual_max_abs <= 1e-10);
+    assert!(factor.reused_symbolic_structure());
+
+    let expected = vec![0.5, -1.25, 0.75, 1.0, -0.5, 1.5];
+    let rhs = dense_mul(&updated, &expected);
+    let solution = factor.solve(&rhs).expect("solve");
+    for (actual, expected) in solution.iter().zip(expected.iter()) {
+        assert_abs_diff_eq!(actual, expected, epsilon = 1e-9);
+    }
+    assert!(residual_inf_norm(&updated, &solution, &rhs) <= 1e-9);
+}
+
+#[test]
+fn multifrontal_repeated_refactorization_stays_stable_on_delayed_chain() {
+    let dense = delayed_chain_dense(0.0);
+    let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+    let matrix = SymmetricCscMatrix::new(6, &col_ptrs, &row_indices, Some(&values)).expect("csc");
+    let (symbolic, _) = analyse(
+        matrix,
+        &SsidsOptions {
+            ordering: OrderingStrategy::Natural,
+        },
+    )
+    .expect("symbolic");
+    let options = NumericFactorOptions {
+        pivot_regularization: 1e-6,
+        ..NumericFactorOptions::default()
+    };
+    let (mut factor, info) = factorize(matrix, &symbolic, &options).expect("factor");
+    assert!(info.factorization_residual_max_abs <= 1e-6);
+    let front_count = factor.front_count();
+    let max_front_size = factor.max_front_size();
+
+    for (iteration, shift) in [0.08, -0.05, 0.14, -0.09, 0.2].into_iter().enumerate() {
+        let updated = delayed_chain_dense(shift);
+        let (updated_col_ptrs, updated_row_indices, updated_values) = dense_to_lower_csc(&updated);
+        let updated_matrix = SymmetricCscMatrix::new(
+            6,
+            &updated_col_ptrs,
+            &updated_row_indices,
+            Some(&updated_values),
+        )
+        .expect("updated csc");
+        let info = factor.refactorize(updated_matrix).expect("refactorize");
+        assert!(info.factorization_residual_max_abs <= 1e-6);
+        assert!(factor.reused_symbolic_structure());
+        assert!(factor.uses_multifrontal_backend());
+        assert_eq!(factor.front_count(), front_count);
+        assert_eq!(factor.max_front_size(), max_front_size);
+        assert!(factor.delayed_front_propagations() >= 1);
+
+        let expected = (0..6)
+            .map(|index| 0.5 + iteration as f64 * 0.1 + index as f64 * 0.2)
+            .collect::<Vec<_>>();
+        let rhs = dense_mul(&updated, &expected);
+        let solution = factor.solve(&rhs).expect("solve");
+        for (actual, expected) in solution.iter().zip(expected.iter()) {
+            assert_abs_diff_eq!(actual, expected, epsilon = 1e-7);
+        }
+        assert!(residual_inf_norm(&updated, &solution, &rhs) <= 1e-7);
+    }
+}
+
+#[test]
+fn numeric_refactorization_rejects_pattern_change() {
+    let original = vec![
+        vec![4.0, -1.0, 0.0, 0.0],
+        vec![-1.0, 4.0, -1.0, 0.0],
+        vec![0.0, -1.0, 4.0, -1.0],
+        vec![0.0, 0.0, -1.0, 3.0],
+    ];
+    let changed_pattern = vec![
+        vec![4.0, -1.0, 0.25, 0.0],
+        vec![-1.0, 4.0, -1.0, 0.0],
+        vec![0.25, -1.0, 4.0, -1.0],
+        vec![0.0, 0.0, -1.0, 3.0],
+    ];
+    let (col_ptrs, row_indices, values) = dense_to_lower_csc(&original);
+    let matrix = SymmetricCscMatrix::new(4, &col_ptrs, &row_indices, Some(&values)).expect("csc");
+    let (symbolic, _) = analyse(matrix, &SsidsOptions::default()).expect("symbolic");
+    let (mut factor, _) =
+        factorize(matrix, &symbolic, &NumericFactorOptions::default()).expect("factor");
+
+    let (updated_col_ptrs, updated_row_indices, updated_values) =
+        dense_to_lower_csc(&changed_pattern);
+    let updated_matrix = SymmetricCscMatrix::new(
+        4,
+        &updated_col_ptrs,
+        &updated_row_indices,
+        Some(&updated_values),
+    )
+    .expect("updated csc");
+    let error = factor
+        .refactorize(updated_matrix)
+        .expect_err("refactorization should reject a changed sparsity pattern");
+    assert!(matches!(error, SsidsError::PatternMismatch(_)));
 }
 
 #[test]
