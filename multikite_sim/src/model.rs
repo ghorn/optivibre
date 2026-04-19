@@ -54,6 +54,13 @@ fn blank_kite_diag<T: Scalar>() -> KiteDiagnostics<T> {
         orbit_radius: T::zero(),
         curvature_y_b: T::zero(),
         curvature_y_ref: T::zero(),
+        curvature_y_est: T::zero(),
+        omega_world_z_ref: T::zero(),
+        omega_world_z: T::zero(),
+        beta_ref: T::zero(),
+        roll_ref: T::zero(),
+        roll_ff: T::zero(),
+        pitch_ref: T::zero(),
         curvature_z_b: T::zero(),
         curvature_z_ref: T::zero(),
         motor_force: T::zero(),
@@ -152,6 +159,19 @@ fn compute_tether<T: Scalar, const N: usize>(
     gravity: T,
     nodes: &[TetherNode<T>; N],
 ) -> TetherOutputs<T, N> {
+    if N == 0 {
+        return TetherOutputs {
+            node_ddt: std::array::from_fn(|_| TetherNode {
+                pos_n: zero_vec(),
+                vel_n: zero_vec(),
+            }),
+            force_on_top_n: zero_vec(),
+            force_on_bottom_n: zero_vec(),
+            top_tension: T::zero(),
+            strain_energy: T::zero(),
+        };
+    }
+
     let masses = params.total_mass / T::from_f64(N as f64);
     let segment_length = params.natural_length / T::from_f64(N as f64);
     let mut node_ddt = std::array::from_fn(|_| TetherNode {
@@ -253,16 +273,21 @@ fn compute_tether<T: Scalar, const N: usize>(
         strain_energy = strain_energy + spring_energy(params.ea, upper_natural, upper_length);
     }
 
+    let force_on_top_n = upper_spring_forces
+        .last()
+        .zip(upper_damping_forces.last())
+        .map(|(spring, damping)| scale(&add(spring, damping), -T::one()))
+        .unwrap_or_else(zero_vec);
+    let force_on_bottom_n = lower_spring_forces
+        .first()
+        .zip(lower_damping_forces.first())
+        .map(|(spring, damping)| scale(&add(spring, damping), -T::one()))
+        .unwrap_or_else(zero_vec);
+
     TetherOutputs {
         node_ddt,
-        force_on_top_n: scale(
-            &add(&upper_spring_forces[N - 1], &upper_damping_forces[N - 1]),
-            -T::one(),
-        ),
-        force_on_bottom_n: scale(
-            &add(&lower_spring_forces[0], &lower_damping_forces[0]),
-            -T::one(),
-        ),
+        force_on_top_n,
+        force_on_bottom_n,
         top_tension,
         strain_energy,
     }
@@ -333,7 +358,11 @@ pub(crate) fn compute_bridle_node<const N_UPPER: usize>(
     kite: &KiteState<f64, N_UPPER>,
     params: &KiteParams<f64>,
 ) -> TetherNode<f64> {
-    let last_node = &kite.tether[N_UPPER - 1];
+    let fallback_node = TetherNode {
+        pos_n: kite.body.pos_n,
+        vel_n: rotate_body_to_nav(&kite.body.quat_n2b, &kite.body.vel_b),
+    };
+    let last_node = kite.tether.last().unwrap_or(&fallback_node);
     let (bridle_pos_n, bridle_vel_n, _) = bridle_geometry(
         &kite.body,
         &params.rigid_body.cad_offset_b,
@@ -406,7 +435,7 @@ fn compute_kite<T: Scalar, const N_UPPER: usize>(
     common_params: &Params<T, 1>,
     splitter: &TetherNode<T>,
 ) -> (KiteState<T, N_UPPER>, KiteDiagnostics<T>, Vector3<T>) {
-    let last_node = &kite.tether[N_UPPER - 1];
+    let last_node = kite.tether.last().unwrap_or(splitter);
     let (bridle_pos_n, bridle_vel_n, bridle_offset_b) = bridle_geometry(
         &kite.body,
         &params.rigid_body.cad_offset_b,
@@ -588,6 +617,13 @@ fn compute_kite<T: Scalar, const N_UPPER: usize>(
             orbit_radius,
             curvature_y_b: inertial_accel_b[1] / speed_sq,
             curvature_y_ref: T::zero(),
+            curvature_y_est: T::zero(),
+            omega_world_z_ref: T::zero(),
+            omega_world_z: T::zero(),
+            beta_ref: T::zero(),
+            roll_ref: T::zero(),
+            roll_ff: T::zero(),
+            pitch_ref: T::zero(),
             curvature_z_b: inertial_accel_b[2] / speed_sq,
             curvature_z_ref: T::zero(),
             motor_force,
@@ -715,14 +751,21 @@ pub fn evaluate_rhs<T: Scalar, const NK: usize, const N_COMMON: usize, const N_U
         &splitter_force_n,
     );
 
-    let payload_ddt = TetherNode {
-        pos_n: state.payload.vel_n,
-        vel_n: add(
-            &scale(&total_payload_force_n, T::one() / params.payload_mass),
-            &Vector3::new(T::zero(), T::zero(), params.environment.g),
-        ),
+    let payload_ddt = if N_COMMON == 0 {
+        TetherNode {
+            pos_n: zero_vec(),
+            vel_n: zero_vec(),
+        }
+    } else {
+        TetherNode {
+            pos_n: state.payload.vel_n,
+            vel_n: add(
+                &scale(&total_payload_force_n, T::one() / params.payload_mass),
+                &Vector3::new(T::zero(), T::zero(), params.environment.g),
+            ),
+        }
     };
-    let splitter_ddt = if NK == 0 {
+    let splitter_ddt = if NK == 0 || N_COMMON == 0 {
         TetherNode {
             pos_n: zero_vec(),
             vel_n: zero_vec(),

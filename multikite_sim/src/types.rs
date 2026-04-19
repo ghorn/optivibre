@@ -12,6 +12,8 @@ pub enum PhaseMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Preset {
+    FreeFlight1,
+    Star1,
     Y2,
     Star3,
     Star4,
@@ -295,6 +297,13 @@ pub struct KiteDiagnostics<T> {
     pub orbit_radius: T,
     pub curvature_y_b: T,
     pub curvature_y_ref: T,
+    pub curvature_y_est: T,
+    pub omega_world_z_ref: T,
+    pub omega_world_z: T,
+    pub beta_ref: T,
+    pub roll_ref: T,
+    pub roll_ff: T,
+    pub pitch_ref: T,
     pub curvature_z_b: T,
     pub curvature_z_ref: T,
     pub motor_force: T,

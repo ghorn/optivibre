@@ -135,11 +135,51 @@ form {
   gap: 12px;
 }
 
+.form-section {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 14px;
+  background: rgba(8, 16, 24, 0.46);
+  border: 1px solid rgba(115, 146, 168, 0.14);
+}
+
+.form-section-title {
+  font-size: 0.76rem;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: #8fc3ac;
+}
+
 label {
   display: grid;
   gap: 6px;
   font-size: 0.95rem;
   color: var(--muted);
+}
+
+.checkbox-label {
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 10px;
+  color: #d8e6f2;
+  font-size: 0.9rem;
+}
+
+.checkbox-label input {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  padding: 0;
+}
+
+.checkbox-label span {
+  line-height: 1.3;
+}
+
+.checkbox-label.disabled {
+  opacity: 0.5;
 }
 
 select,

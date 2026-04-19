@@ -2,8 +2,9 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
 type PhaseMode = "adaptive" | "open_loop";
-type Preset = "y2" | "star3" | "star4" | "simple_tether";
+type Preset = "free_flight1" | "star1" | "y2" | "star3" | "star4" | "simple_tether";
 type TimeDilationPreset = "fast" | "1" | "0.5" | "0.1";
+type CameraFollowTarget = "manual" | "disk_center" | `kite:${number}`;
 
 type PlotlyDatum = Record<string, unknown>;
 
@@ -126,6 +127,13 @@ interface ApiFrame {
   rabbit_radius: number[];
   curvature_y_b: number[];
   curvature_y_ref: number[];
+  curvature_y_est: number[];
+  omega_world_z_ref: number[];
+  omega_world_z: number[];
+  beta_ref_deg: number[];
+  roll_ref_deg: number[];
+  roll_ff_deg: number[];
+  pitch_ref_deg: number[];
   curvature_z_b: number[];
   curvature_z_ref: number[];
   top_tension: number[];
@@ -217,6 +225,9 @@ const phaseModeSelect = document.querySelector<HTMLSelectElement>("#phase-mode")
 const payloadInput = document.querySelector<HTMLInputElement>("#payload-mass")!;
 const windInput = document.querySelector<HTMLInputElement>("#wind-speed")!;
 const timeDilationSelect = document.querySelector<HTMLSelectElement>("#time-dilation")!;
+const cameraFollowTargetSelect = document.querySelector<HTMLSelectElement>("#camera-follow-target")!;
+const cameraFollowYawInput = document.querySelector<HTMLInputElement>("#camera-follow-yaw")!;
+const cameraFollowYawLabel = cameraFollowYawInput.closest<HTMLLabelElement>(".checkbox-label")!;
 const summaryNode = document.querySelector<HTMLElement>("#summary")!;
 const failureNode = document.querySelector<HTMLElement>("#failure-pill")!;
 const plotsNode = document.querySelector<HTMLElement>("#plots")!;
@@ -297,6 +308,15 @@ orbitTargetMarker.add(orbitTargetCore);
 orbitTargetMarker.add(orbitTargetHalo);
 orbitTargetMarker.visible = false;
 scene.add(orbitTargetMarker);
+
+const ORBIT_TARGET_CORE_RADIUS_WORLD = 1.0;
+const ORBIT_TARGET_HALO_RADIUS_WORLD = 2.2;
+const ORBIT_TARGET_CORE_PIXELS = 14;
+const ORBIT_TARGET_HALO_PIXELS = 34;
+const ORBIT_TARGET_CORE_RADIUS_MIN = 0.2;
+const ORBIT_TARGET_CORE_RADIUS_MAX = 2.4;
+const ORBIT_TARGET_HALO_RADIUS_MIN = 0.55;
+const ORBIT_TARGET_HALO_RADIUS_MAX = 6.0;
 
 const controlRingLine = new THREE.LineLoop(
   new THREE.BufferGeometry(),
@@ -555,11 +575,14 @@ const ambientAirColorHigh = new THREE.Color("#b8f7ff");
 const gustAirColorLow = new THREE.Color("#55c5ff");
 const gustAirColorMid = new THREE.Color("#ffbf72");
 const gustAirColorHigh = new THREE.Color("#ff5b78");
+const SUMMARY_REFRESH_MIN_INTERVAL_MS = 125;
+const MAX_FRAMES_PER_ANIMATION_TICK = 6;
 
 let consoleLines: string[] = [];
 let framesReceived = 0;
 let framesRendered = 0;
 let pendingFrames: ApiFrame[] = [];
+let pendingPlotFrame: ApiFrame | null = null;
 let pendingSummary: RunSummary | null = null;
 let latestProgressState: SimulationProgress | null = null;
 let activeSummaryRequest: { preset: string; phase_mode: PhaseMode } | null = null;
@@ -568,7 +591,16 @@ let currentPlaybackLabel = "Fast as possible";
 let playbackStartWallTimeMs: number | null = null;
 let playbackStartSimTime = 0;
 let shouldSnapOrbitTargetToFrame = true;
+let lastRenderedFrame: ApiFrame | null = null;
+let lastCameraFollowHeadingRad: number | null = null;
+let lastCameraFollowTarget: CameraFollowTarget | null = null;
 let lastAirflowFrameTime: number | null = null;
+let airflowUpdatesEnabled = true;
+let plotUpdatesEnabled = true;
+let plotFlushInFlight = false;
+let lastSummaryRefreshWallTimeMs = 0;
+let summaryRefreshPending = false;
+let lastSummaryHtml = "";
 const pendingMathRoots = new Set<Element>();
 let mathTypesetRetryHandle: number | null = null;
 const pendingMermaidRoots = new Set<Element>();
@@ -809,15 +841,16 @@ function controllerDocsHtml(phaseMode: PhaseMode): string {
   const innerLoopDiagram = String.raw`flowchart LR
     A["Rabbit target<br/>p_i^r"] --> B["Guidance block<br/>body-frame curvature references κ_y^*, κ_z^*"]
     S["Measured state<br/>position, curvature, body rates"] --> B
-    B --> C["Lateral actuator law<br/>curvature error + I_y + rate damping"]
-    B --> D["Vertical actuator law<br/>curvature error + I_z + rate damping"]
-    P["AOA backoff"] --> C
-    P --> D
-    C --> E["Aileron<br/>δ_a"]
-    C --> F["Rudder<br/>δ_r"]
-    D --> G["Elevator<br/>δ_e"]
-    D --> H["Flap<br/>δ_f"]
-    W["Winglet"] --> I["Trim only<br/>δ_w = δ_{w,0}"]
+    B --> C["Roll-reference loop<br/>κ_y^* - κ̂_y → φ^*"]
+    C --> D["Roll inner loop<br/>φ^* - φ, p → δ_a"]
+    B --> E["Vertical actuator law<br/>curvature error + I_z + rate damping"]
+    B --> F["Rudder coordination loop<br/>β and r damping"]
+    P["AOA backoff"] --> E
+    D --> G["Aileron<br/>δ_a"]
+    F --> H["Rudder<br/>δ_r"]
+    E --> I["Elevator<br/>δ_e"]
+    E --> J["Flap<br/>δ_f"]
+    W["Winglet"] --> K["Trim only<br/>δ_w = δ_{w,0}"]
     classDef block fill:#112231,stroke:#66b8ff,color:#edf6ff;`;
 
   return `
@@ -831,8 +864,8 @@ function controllerDocsHtml(phaseMode: PhaseMode): string {
           <div class="docs-prose">
             <div class="docs-phase-pill">Active UI phase mode <strong>${modeLabel}</strong></div>
             <p>The propulsion loop regulates <strong>inertial speed</strong>, not airspeed.</p>
-            <p>The controller is naturally read as a cascade: phase scheduling and rabbit geometry, then body-frame curvature guidance, then surface and torque commands.</p>
-            <p><strong>This is not a roll-angle or pitch-angle hold controller.</strong> The implementation does not introduce an intermediate commanded roll moment, roll acceleration, pitch moment, or pitch acceleration state.</p>
+            <p>The controller is naturally read as a cascade: phase scheduling and rabbit geometry, then body-frame curvature guidance, then roll-reference generation for the aileron channel, then the remaining surface and torque commands.</p>
+            <p><strong>The lateral aileron path now introduces a desired roll angle.</strong> Rudder is now used as a beta/yaw-damper coordination loop, while the vertical channel remains curvature-based rather than pitch-angle hold.</p>
             <p>The winglet command is fixed at trim, and the motor torque proportional term is referenced to <span class="docs-inline-math">\(v_{\mathrm{ref}}\)</span> while the integral state is driven by the scheduled speed <span class="docs-inline-math">\(v_i^\star\)</span>.</p>
           </div>
           <div class="docs-kv">
@@ -873,11 +906,11 @@ function controllerDocsHtml(phaseMode: PhaseMode): string {
       </div>
       <div class="docs-card-body">
         <div class="docs-note-list">
-          <div class="docs-note-item"><strong>Core structure matches closely.</strong> Both controllers use rabbit-point geometry, first-order rabbit filters, body-frame curvature references \\(\\kappa_y^\\star,\\kappa_z^\\star\\), separate lateral and vertical curvature integrators, and direct surface laws with body-rate damping.</div>
-          <div class="docs-note-item"><strong>The headline gains match.</strong> The Haskell laws use the same visible coefficients that are in the Rust controller today: aileron \\(-2\\,\\mathrm{sat}(\\kappa_y^\\star)-0.25\\,k_y^b + k_{a,\\omega}\\omega_x\\), rudder \\(2\\,\\tilde\\kappa_y + k_{r,i} I_y + k_{r,\\omega}\\omega_z\\), elevator \\(-\\tilde\\kappa_z - k_{e,i} I_z + k_{e,\\omega}\\omega_y\\), and flap \\(0.3\\,\\tilde\\kappa_z - k_{f,i} I_z\\).</div>
+          <div class="docs-note-item"><strong>Most of the controller still matches closely.</strong> Both controllers use rabbit-point geometry, body-frame curvature references \\(\\kappa_y^\\star,\\kappa_z^\\star\\), and inertial-speed PI to motor torque.</div>
+          <div class="docs-note-item"><strong>The lateral channel is now the deliberate divergence.</strong> The flown Haskell controller drove both aileron and rudder directly from lateral-curvature terms, whereas the current Rust controller maps lateral-curvature error into a desired roll angle for aileron and uses rudder as a beta/yaw-damper coordination loop.</div>
           <div class="docs-note-item"><strong>The propulsion loop also matches in form.</strong> Haskell used a proportional torque term on inertial speed against \\(v_{\\mathrm{ref}}\\) and a separate integral state driven by the phase-scheduled speed target \\(v_i^\\star\\). The current Rust controller keeps that same split.</div>
           <div class="docs-note-item"><strong>Main implementation differences are wrapper-level.</strong> Rust computes phase error internally instead of consuming an external <code>phaseLag</code> signal, uses hard clamps where Haskell used <code>smoothSaturate</code>, and omits the Haskell RC/enable mixing path. Rust also exposes an open-loop phase mode that was not part of the flown Haskell path.</div>
-          <div class="docs-note-item"><strong>There is still no hidden roll-reference layer.</strong> The Haskell controller had a commented roll-angle idea, but the active flown law was curvature-based there as well. So the Rust controller is not missing a suppressed roll-reference or roll-moment loop from that controller family.</div>
+          <div class="docs-note-item"><strong>There was no hidden roll-reference layer in the flown Haskell controller.</strong> The old Haskell code had only a commented roll-angle idea. So this new roll cascade is an intentional modernization, not a recovery of a missing historical layer.</div>
         </div>
       </div>
     </section>
@@ -894,17 +927,21 @@ function controllerDocsHtml(phaseMode: PhaseMode): string {
           p_i^r
           &\\rightarrow q_i^b
           \\rightarrow \\left(\\kappa_{y,i}^{\\star}, \\kappa_{z,i}^{\\star}\\right),\\\\[0.35em]
-          \\left(\\kappa_{y,i}^{\\star}, \\kappa_{y,i}, I_{y,i}, k_{i,y}^{b}, \\omega_{x,i}, \\omega_{z,i}\\right)
-          &\\rightarrow \\left(\\delta_{a,i}, \\delta_{r,i}\\right),\\\\[0.35em]
+          \\left(\\kappa_{y,i}^{\\star}, \\hat\\kappa_{y,i}\\right)
+          &\\rightarrow \\phi_i^{\\star},\\\\[0.35em]
+          \\left(\\phi_i^{\\star}, \\phi_i, \\omega_{x,i}\\right)
+          &\\rightarrow \\delta_{a,i},\\\\[0.35em]
+          \\left(\\beta_i, \\omega_{z,i}\\right)
+          &\\rightarrow \\delta_{r,i},\\\\[0.35em]
           \\left(\\kappa_{z,i}^{\\star}, \\kappa_{z,i}, I_{z,i}, \\omega_{y,i}\\right)
           &\\rightarrow \\left(\\delta_{e,i}, \\delta_{f,i}\\right).
           \\end{aligned}
           \\]
         </div>
         <div class="docs-note-list">
-          <div class="docs-note-item">There is no explicit commanded roll angle <span class="docs-inline-math">\\(\\phi_i^{\\star}\\)</span>, pitch angle <span class="docs-inline-math">\\(\\theta_i^{\\star}\\)</span>, commanded angular acceleration, or commanded aerodynamic moment in the current implementation.</div>
-          <div class="docs-note-item">The most relevant “desired versus actual” inner-loop quantities are therefore the curvature references <span class="docs-inline-math">\\(\\kappa_y^{\\star}, \\kappa_z^{\\star}\\)</span> and the measured curvatures <span class="docs-inline-math">\\(\\kappa_y, \\kappa_z\\)</span>, which are already plotted.</div>
-          <div class="docs-note-item">Roll and pitch should be interpreted as plant-response plots. They are useful for understanding the airframe motion, but not as tracking-error plots against a hidden angle command.</div>
+          <div class="docs-note-item">The aileron channel now has an explicit commanded roll angle <span class="docs-inline-math">\\(\\phi_i^{\\star}\\)</span>, generated from lateral-curvature error.</div>
+          <div class="docs-note-item">The vertical channel still has no explicit commanded pitch angle <span class="docs-inline-math">\\(\\theta_i^{\\star}\\)</span>, commanded angular acceleration, or commanded aerodynamic moment state.</div>
+          <div class="docs-note-item">The most relevant “desired versus actual” lateral quantities are now <span class="docs-inline-math">\\(\\kappa_y^{\\star}\\)</span> versus <span class="docs-inline-math">\\(\\hat\\kappa_y\\)</span>, and <span class="docs-inline-math">\\(\\phi^{\\star}\\)</span> versus <span class="docs-inline-math">\\(\\phi\\)</span>.</div>
         </div>
       </div>
     </section>
@@ -986,6 +1023,9 @@ function controllerDocsHtml(phaseMode: PhaseMode): string {
           k_i^n &= m_i\\,\\frac{\\lVert m_i \\rVert}{L_i},\\\\
           k_i^b &= R_{n\\to b} k_i^n,\\\\[0.35em]
           I_{v,i}^{+} &= I_{v,i} + \\Delta t\\left(\\lVert v_i^{\\mathrm{cad}} \\rVert - v_i^{\\star}\\right),\\\\
+          \\hat\\kappa_{y,i} &= \\frac{\\omega_{n,z,i}}{\\lVert v_i^{\\mathrm{cad}} \\rVert},\\\\
+          I_{\\kappa\\phi,i}^{+} &= I_{\\kappa\\phi,i} + \\Delta t\\left(\\kappa_{y,i}^{\\star} - \\hat\\kappa_{y,i}\\right),\\\\
+          \\phi_i^{\\star} &= k_{\\phi\\kappa,p}\\left(\\kappa_{y,i}^{\\star} - \\hat\\kappa_{y,i}\\right) + k_{\\phi\\kappa,i} I_{\\kappa\\phi,i},\\\\
           I_{y,i}^{+} &= I_{y,i} + \\Delta t\\,\\tilde\\kappa_{y,i} - b_{\\alpha,y}\\,\\alpha_i^{+},\\\\
           I_{z,i}^{+} &= I_{z,i} + \\Delta t\\,\\tilde\\kappa_{z,i} - b_{\\alpha,z}\\,\\alpha_i^{+}.
           \\end{aligned}
@@ -1003,11 +1043,11 @@ function controllerDocsHtml(phaseMode: PhaseMode): string {
           <div class="docs-equation-caption">Nominal surface and torque commands</div>
           \\[
           \\begin{aligned}
-          \\delta_{a,i} &= \\delta_{a,0} - k_{a,p}\\,\\bar\\kappa_{y,i}^{\\star} - k_{a,d}\\,k_{i,y}^{b} + k_{a,\\omega}\\,\\omega_{x,i},\\\\
+          \\delta_{a,i} &= \\delta_{a,0} + k_{a,\\phi}\\left(\\phi_i^{\\star} - \\phi_i\\right) - k_{a,p}\\,\\omega_{x,i},\\\\
           \\delta_{f,i} &= \\delta_{f,0} + k_{f,p}\\,\\tilde\\kappa_{z,i} - k_{f,i} I_{z,i},\\\\
           \\delta_{w,i} &= \\delta_{w,0},\\\\
           \\delta_{e,i} &= \\delta_{e,0} - k_{e,p}\\,\\tilde\\kappa_{z,i} - k_{e,i} I_{z,i} + k_{e,\\omega}\\,\\omega_{y,i},\\\\
-          \\delta_{r,i} &= \\delta_{r,0} + k_{r,p}\\,\\tilde\\kappa_{y,i} + k_{r,i} I_{y,i} + k_{r,\\omega}\\,\\omega_{z,i},\\\\
+          \\delta_{r,i} &= \\delta_{r,0} - k_{r,\\beta}\\,\\beta_i - k_{r,\\omega}\\,\\omega_{z,i},\\\\
           \\tau_i &= \\tau_0 - k_{\\tau,p}\\left(\\lVert v_i^{\\mathrm{cad}} \\rVert - v_{\\mathrm{ref}}\\right) - k_{\\tau,i} I_{v,i}.
           \\end{aligned}
           \\]
@@ -1029,19 +1069,29 @@ function controllerDocsHtml(phaseMode: PhaseMode): string {
             <div>Rabbit lead distance, phase-to-radius gain, and vertical-velocity height shaping.</div>
           </div>
           <div class="docs-gain-row">
-            <div><span class="docs-inline-math">\(k_{a,p},\;k_{a,d}\)</span></div>
-            <div><code>2.0</code>, <code>0.25</code></div>
-            <div>Aileron proportional curvature term and filtered-rabbit shaping term.</div>
+            <div><span class="docs-inline-math">\(k_{\phi\kappa,p},\;k_{\phi\kappa,i}\)</span></div>
+            <div><code>30.0</code>, <code>8.0</code></div>
+            <div>Outer-loop gains that map lateral-curvature tracking error into desired roll angle.</div>
           </div>
           <div class="docs-gain-row">
-            <div><span class="docs-inline-math">\(k_{f,p},\;k_{e,p},\;k_{r,p}\)</span></div>
-            <div><code>0.3</code>, <code>1.0</code>, <code>2.0</code></div>
-            <div>Flap, elevator, and rudder proportional curvature gains.</div>
+            <div><span class="docs-inline-math">\(k_{a,\phi},\;k_{a,p}\)</span></div>
+            <div><code>0.5</code>, <code>0.18</code></div>
+            <div>Inner roll loop gains from roll-angle error and roll rate to aileron command.</div>
           </div>
           <div class="docs-gain-row">
-            <div><span class="docs-inline-math">\(k_{f,i}=k_{e,i},\;k_{r,i}\)</span></div>
-            <div><code>gain_int_z</code>, <code>gain_int_y</code></div>
-            <div>Vertical and lateral integral gains.</div>
+            <div><span class="docs-inline-math">\(k_{f,p},\;k_{e,p}\)</span></div>
+            <div><code>0.3</code>, <code>1.0</code></div>
+            <div>Flap and elevator proportional curvature gains.</div>
+          </div>
+          <div class="docs-gain-row">
+            <div><span class="docs-inline-math">\(k_{f,i}=k_{e,i}\)</span></div>
+            <div><code>gain_int_z</code></div>
+            <div>Vertical integral gain.</div>
+          </div>
+          <div class="docs-gain-row">
+            <div><span class="docs-inline-math">\(k_{r,\beta},\;k_{r,\omega}\)</span></div>
+            <div><code>1.25</code>, <code>0.45</code></div>
+            <div>Rudder beta feedback and yaw-rate damping gains for coordinated-turn control.</div>
           </div>
           <div class="docs-gain-row">
             <div><span class="docs-inline-math">\(k_{a,\omega},\;k_{e,\omega},\;k_{r,\omega}\)</span></div>
@@ -1096,8 +1146,21 @@ function renderControllerDocs(): void {
 function syncOrbitTargetMarker(): void {
   orbitTargetMarker.position.copy(controls.target);
   const distance = camera.position.distanceTo(controls.target);
-  const scale = Math.min(9, Math.max(1.5, distance * 0.014));
-  orbitTargetMarker.scale.setScalar(scale);
+  const viewportHeight = Math.max(1, viewport.clientHeight);
+  const worldPerPixel =
+    (2 * distance * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2)) / viewportHeight;
+  const coreRadius = THREE.MathUtils.clamp(
+    worldPerPixel * ORBIT_TARGET_CORE_PIXELS,
+    ORBIT_TARGET_CORE_RADIUS_MIN,
+    ORBIT_TARGET_CORE_RADIUS_MAX
+  );
+  const haloRadius = THREE.MathUtils.clamp(
+    worldPerPixel * ORBIT_TARGET_HALO_PIXELS,
+    ORBIT_TARGET_HALO_RADIUS_MIN,
+    ORBIT_TARGET_HALO_RADIUS_MAX
+  );
+  orbitTargetCore.scale.setScalar(coreRadius / ORBIT_TARGET_CORE_RADIUS_WORLD);
+  orbitTargetHalo.scale.setScalar(haloRadius / ORBIT_TARGET_HALO_RADIUS_WORLD);
 }
 
 function setOrbitTargetMarkerVisible(visible: boolean): void {
@@ -1153,6 +1216,10 @@ function setFailure(failure: SimulationFailure | null): void {
 
 function presetKiteCount(preset: Preset): number {
   switch (preset) {
+    case "free_flight1":
+      return 1;
+    case "star1":
+      return 1;
     case "y2":
       return 2;
     case "star3":
@@ -1209,6 +1276,7 @@ function resetPlaybackState(label: string, rate: number | null): void {
   framesReceived = 0;
   framesRendered = 0;
   pendingFrames = [];
+  pendingPlotFrame = null;
   pendingSummary = null;
   latestProgressState = null;
   currentPlaybackLabel = label;
@@ -1216,7 +1284,15 @@ function resetPlaybackState(label: string, rate: number | null): void {
   playbackStartWallTimeMs = null;
   playbackStartSimTime = 0;
   shouldSnapOrbitTargetToFrame = true;
+  lastRenderedFrame = null;
+  resetCameraFollowState();
   lastAirflowFrameTime = null;
+  airflowUpdatesEnabled = true;
+  plotUpdatesEnabled = true;
+  plotFlushInFlight = false;
+  lastSummaryRefreshWallTimeMs = 0;
+  summaryRefreshPending = false;
+  lastSummaryHtml = "";
   ambientParticleCloud.visible = false;
   gustParticleCloud.visible = false;
   wingtipTrailCloud.visible = false;
@@ -1367,20 +1443,41 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
     {
       title: "Controller / 1. Lateral Inner Loop",
       description:
-        "Innermost lateral channel first. This loop tracks body curvature Y with body-rate damping; roll is shown only as the resulting airframe response. There is no desired roll angle, roll acceleration, or roll moment state in this implementation. Aileron and rudder are commanded directly here.",
+        "Innermost lateral channel first. Desired path curvature is turned into a coordinated-turn roll feedforward plus a smaller curvature-error PI correction; the aileron then closes roll with body-rate damping. Rudder now closes a coordinated-turn / sideslip loop using desired world-Z turn rate together with beta regulation.",
       groups: [
         buildPerKiteGroup(
           kiteCount,
-          "Curvature Y Desired vs Actual (1/m)",
+          "Curvature Y Desired vs Estimated (1/m)",
           "1/m",
-          (frame, kiteIndex) => frame.curvature_y_b[kiteIndex] ?? 0,
+          (frame, kiteIndex) => frame.curvature_y_est[kiteIndex] ?? 0,
           (frame, kiteIndex) => frame.curvature_y_ref[kiteIndex] ?? 0
         ),
         buildPerKiteGroup(
           kiteCount,
-          "Roll Angle Response (deg)",
+          "Desired Roll vs Actual (deg)",
           "deg",
-          (frame, kiteIndex) => frame.kite_attitudes_rpy_deg[kiteIndex]?.[0] ?? 0
+          (frame, kiteIndex) => frame.kite_attitudes_rpy_deg[kiteIndex]?.[0] ?? 0,
+          (frame, kiteIndex) => frame.roll_ref_deg[kiteIndex] ?? 0
+        ),
+        buildPerKiteGroup(
+          kiteCount,
+          "Roll Feedforward (deg)",
+          "deg",
+          (frame, kiteIndex) => frame.roll_ff_deg[kiteIndex] ?? 0
+        ),
+        buildPerKiteGroup(
+          kiteCount,
+          "World Z Angular Velocity Desired vs Actual (rad/s)",
+          "rad/s",
+          (frame, kiteIndex) => frame.omega_world_z[kiteIndex] ?? 0,
+          (frame, kiteIndex) => frame.omega_world_z_ref[kiteIndex] ?? 0
+        ),
+        buildPerKiteGroup(
+          kiteCount,
+          "Sideslip Beta (deg)",
+          "deg",
+          (frame, kiteIndex) => frame.beta_deg[kiteIndex] ?? 0,
+          (frame, kiteIndex) => frame.beta_ref_deg[kiteIndex] ?? 0
         ),
         buildPerKiteGroup(
           kiteCount,
@@ -1469,7 +1566,7 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
     {
       title: "Controller / 4. Vertical Inner Loop",
       description:
-        "The vertical channel is also curvature-based rather than pitch-angle hold. Curvature Z is the controlled quantity; pitch is shown only as the plant response. There is no desired pitch angle, pitch acceleration, or pitch moment state in this implementation. Elevator and flap are commanded directly here.",
+        "The vertical path now follows the same sequential pattern as roll: desired vertical curvature is mapped into a desired pitch angle, and the elevator then closes pitch with q damping. Flap is held at trim for now so the elevator loop can be tuned in isolation.",
       groups: [
         buildPerKiteGroup(
           kiteCount,
@@ -1480,9 +1577,10 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
         ),
         buildPerKiteGroup(
           kiteCount,
-          "Pitch Angle Response (deg)",
+          "Desired Pitch vs Actual (deg)",
           "deg",
-          (frame, kiteIndex) => frame.kite_attitudes_rpy_deg[kiteIndex]?.[1] ?? 0
+          (frame, kiteIndex) => frame.kite_attitudes_rpy_deg[kiteIndex]?.[1] ?? 0,
+          (frame, kiteIndex) => frame.pitch_ref_deg[kiteIndex] ?? 0
         ),
         buildPerKiteGroup(
           kiteCount,
@@ -1891,6 +1989,66 @@ function applyPresetDefaults(): void {
   }
 }
 
+function wrapAngleRad(angle: number): number {
+  let wrapped = angle;
+  while (wrapped > Math.PI) {
+    wrapped -= 2 * Math.PI;
+  }
+  while (wrapped < -Math.PI) {
+    wrapped += 2 * Math.PI;
+  }
+  return wrapped;
+}
+
+function currentCameraFollowTarget(): CameraFollowTarget {
+  return cameraFollowTargetSelect.value as CameraFollowTarget;
+}
+
+function currentCameraFollowKiteIndex(): number | null {
+  const selection = currentCameraFollowTarget();
+  if (!selection.startsWith("kite:")) {
+    return null;
+  }
+  const index = Number(selection.slice("kite:".length));
+  return Number.isInteger(index) && index >= 0 ? index : null;
+}
+
+function updateCameraFollowUiState(): void {
+  const followKite = currentCameraFollowKiteIndex() !== null;
+  cameraFollowYawInput.disabled = !followKite;
+  cameraFollowYawLabel.classList.toggle("disabled", !followKite);
+}
+
+function updateCameraFollowOptions(kiteCount: number): void {
+  const previousValue = currentCameraFollowTarget();
+  cameraFollowTargetSelect.innerHTML = "";
+
+  const options: Array<{ value: CameraFollowTarget; label: string }> = [
+    { value: "manual", label: "Manual" },
+    { value: "disk_center", label: "Disk Center" }
+  ];
+
+  for (let index = 0; index < kiteCount; index += 1) {
+    options.push({
+      value: `kite:${index}`,
+      label: `Kite ${index + 1}`
+    });
+  }
+
+  options.forEach((optionDef) => {
+    const option = document.createElement("option");
+    option.value = optionDef.value;
+    option.textContent = optionDef.label;
+    cameraFollowTargetSelect.append(option);
+  });
+
+  const nextValue = options.some((optionDef) => optionDef.value === previousValue)
+    ? previousValue
+    : "disk_center";
+  cameraFollowTargetSelect.value = nextValue;
+  updateCameraFollowUiState();
+}
+
 function makeTetherMaterial(color = 0x66b8ff): THREE.MeshStandardMaterial {
   return new THREE.MeshStandardMaterial({
     color,
@@ -1955,6 +2113,89 @@ function airflowLongitudinalSpan(frame: ApiFrame): number {
 
 function airflowCrossSpan(frame: ApiFrame): number {
   return Math.max(55, frame.control_ring_radius * 1.2);
+}
+
+function cameraFollowTargetPosition(frame: ApiFrame): THREE.Vector3 | null {
+  const selection = currentCameraFollowTarget();
+  if (selection === "manual") {
+    return null;
+  }
+  if (selection === "disk_center") {
+    if (frame.kite_positions_n.length > 0 && frame.control_ring_radius > 1.0e-6) {
+      return toThree(frame.control_ring_center_n);
+    }
+    return toThree(frame.splitter_position_n);
+  }
+  const kiteIndex = currentCameraFollowKiteIndex();
+  const kitePosition = kiteIndex === null ? null : frame.kite_positions_n[kiteIndex];
+  return kitePosition ? toThree(kitePosition) : null;
+}
+
+function kiteHeadingRad(frame: ApiFrame, kiteIndex: number): number | null {
+  const quaternionN2B = frame.kite_quaternions_n2b[kiteIndex];
+  if (!quaternionN2B) {
+    return null;
+  }
+  const orientation = kiteQuaternionToThree(quaternionN2B);
+  const noseDirection = new THREE.Vector3(1, 0, 0).applyQuaternion(orientation);
+  noseDirection.z = 0;
+  if (noseDirection.lengthSq() < 1.0e-9) {
+    return null;
+  }
+  noseDirection.normalize();
+  return Math.atan2(noseDirection.y, noseDirection.x);
+}
+
+function resetCameraFollowState(): void {
+  lastCameraFollowHeadingRad = null;
+  lastCameraFollowTarget = null;
+}
+
+function snapCameraTargetToFrame(frame: ApiFrame): void {
+  const target =
+    cameraFollowTargetPosition(frame) ??
+    (frame.kite_positions_n.length > 0 && frame.control_ring_radius > 1.0e-6
+      ? toThree(frame.control_ring_center_n)
+      : toThree(frame.splitter_position_n));
+  const targetDelta = target.clone().sub(controls.target);
+  camera.position.add(targetDelta);
+  controls.target.copy(target);
+  controls.update();
+}
+
+function applyCameraFollow(frame: ApiFrame): void {
+  const selection = currentCameraFollowTarget();
+  const target = cameraFollowTargetPosition(frame);
+  if (!target) {
+    resetCameraFollowState();
+    return;
+  }
+
+  const currentOffset = camera.position.clone().sub(controls.target);
+  let nextOffset = currentOffset;
+  const kiteIndex = currentCameraFollowKiteIndex();
+  const yawFollowEnabled = kiteIndex !== null && cameraFollowYawInput.checked;
+  let currentHeading: number | null = null;
+
+  if (kiteIndex !== null) {
+    currentHeading = kiteHeadingRad(frame, kiteIndex);
+    if (
+      yawFollowEnabled &&
+      currentHeading !== null &&
+      lastCameraFollowTarget === selection &&
+      lastCameraFollowHeadingRad !== null
+    ) {
+      const deltaYaw = wrapAngleRad(currentHeading - lastCameraFollowHeadingRad);
+      nextOffset = currentOffset.clone().applyAxisAngle(new THREE.Vector3(0, 0, 1), deltaYaw);
+    }
+  }
+
+  camera.position.copy(target.clone().add(nextOffset));
+  controls.target.copy(target);
+  controls.update();
+
+  lastCameraFollowTarget = selection;
+  lastCameraFollowHeadingRad = currentHeading;
 }
 
 function setParticleArrayEntry(
@@ -2455,31 +2696,33 @@ function updateNodeMesh(mesh: THREE.Mesh, point: [number, number, number], tensi
 }
 
 function renderTether(
-  points: [number, number, number][],
-  tensions: number[],
+  points: [number, number, number][] | undefined,
+  tensions: number[] | undefined,
   segmentMeshes: THREE.Mesh[],
   nodeMeshes: THREE.Mesh[],
   segmentRadius: number,
   nodeRadius: number
 ): void {
-  const segmentCount = Math.max(0, points.length - 1);
-  const nodeCount = Math.max(0, points.length - 2);
+  const safePoints = points ?? [];
+  const safeTensions = tensions ?? [];
+  const segmentCount = Math.max(0, safePoints.length - 1);
+  const nodeCount = Math.max(0, safePoints.length - 2);
   ensureMeshCount(segmentCount, segmentMeshes, () => makeTetherSegmentMesh(segmentRadius));
   ensureMeshCount(nodeCount, nodeMeshes, () => makeTetherNodeMesh(nodeRadius));
 
   for (let index = 0; index < segmentCount; index += 1) {
     updateSegmentMesh(
       segmentMeshes[index],
-      points[index],
-      points[index + 1],
-      tensions[index] ?? 0
+      safePoints[index],
+      safePoints[index + 1],
+      safeTensions[index] ?? 0
     );
   }
 
   for (let index = 0; index < nodeCount; index += 1) {
-    const leftTension = tensions[index] ?? 0;
-    const rightTension = tensions[index + 1] ?? leftTension;
-    updateNodeMesh(nodeMeshes[index], points[index + 1], 0.5 * (leftTension + rightTension));
+    const leftTension = safeTensions[index] ?? 0;
+    const rightTension = safeTensions[index + 1] ?? leftTension;
+    updateNodeMesh(nodeMeshes[index], safePoints[index + 1], 0.5 * (leftTension + rightTension));
   }
 }
 
@@ -2786,21 +3029,16 @@ function ensureKites(count: number, frame: ApiFrame): void {
 }
 
 function renderFrame(frame: ApiFrame): void {
+  lastRenderedFrame = frame;
   ensureKites(frame.kite_positions_n.length, frame);
   payloadMesh.position.copy(toThree(frame.payload_position_n));
   const splitterPosition = toThree(frame.splitter_position_n);
   splitterMesh.position.copy(splitterPosition);
   if (shouldSnapOrbitTargetToFrame) {
-    const initialTarget =
-      frame.kite_positions_n.length > 0 && frame.control_ring_radius > 1.0e-6
-        ? toThree(frame.control_ring_center_n)
-        : splitterPosition;
-    const targetDelta = initialTarget.clone().sub(controls.target);
-    camera.position.add(targetDelta);
-    controls.target.copy(initialTarget);
-    controls.update();
+    snapCameraTargetToFrame(frame);
     shouldSnapOrbitTargetToFrame = false;
   }
+  applyCameraFollow(frame);
   updateControlRing(frame);
   renderTether(
     frame.common_tether,
@@ -2813,38 +3051,56 @@ function renderFrame(frame: ApiFrame): void {
 
   frame.kite_positions_n.forEach((position, index) => {
     const mesh = kiteMeshes[index];
+    const rabbitMesh = rabbitMeshes[index];
+    const projectedPhaseMesh = projectedPhaseMeshes[index];
+    const guidanceLine = guidanceLines[index];
+    const upperSegments = upperSegmentMeshes[index];
+    const upperNodes = upperNodeMeshes[index];
+    const quatData = frame.kite_quaternions_n2b[index];
+    if (
+      !mesh ||
+      !rabbitMesh ||
+      !projectedPhaseMesh ||
+      !guidanceLine ||
+      !upperSegments ||
+      !upperNodes ||
+      !quatData
+    ) {
+      return;
+    }
     const kitePosition = toThree(position);
     mesh.position.copy(kitePosition);
-    const quat = kiteQuaternionToThree(frame.kite_quaternions_n2b[index]);
+    const quat = kiteQuaternionToThree(quatData);
     mesh.setRotationFromQuaternion(quat);
-    const rabbitPosition = toThree(frame.rabbit_targets_n[index]);
+    const rabbitTarget = frame.rabbit_targets_n[index] ?? position;
+    const rabbitPosition = toThree(rabbitTarget);
     const phaseColor = phaseErrorColor(frame.phase_error[index] ?? 0);
     const projectedPhaseColor = new THREE.Color(kiteColor(index)).lerp(phaseColor, 0.4);
 
-    rabbitMeshes[index].position.copy(rabbitPosition);
-    setMaterialColor(rabbitMeshes[index].material, phaseColor, 0.3);
+    rabbitMesh.position.copy(rabbitPosition);
+    setMaterialColor(rabbitMesh.material, phaseColor, 0.3);
 
     const controlCenter = frame.control_ring_center_n;
     const dx = position[0] - controlCenter[0];
     const dy = position[1] - controlCenter[1];
     const phaseAngle = Math.atan2(dy, dx);
     const orbitRadius = frame.orbit_radius[index] ?? Math.hypot(dx, dy);
-    projectedPhaseMeshes[index].position.copy(
+    projectedPhaseMesh.position.copy(
       toThree([
         controlCenter[0] + orbitRadius * Math.cos(phaseAngle),
         controlCenter[1] + orbitRadius * Math.sin(phaseAngle),
         controlCenter[2]
       ])
     );
-    setMaterialColor(projectedPhaseMeshes[index].material, projectedPhaseColor, 0.28);
+    setMaterialColor(projectedPhaseMesh.material, projectedPhaseColor, 0.28);
 
-    updateLine(guidanceLines[index], kitePosition, rabbitPosition, phaseColor, 0.68);
+    updateLine(guidanceLine, kitePosition, rabbitPosition, phaseColor, 0.68);
 
     renderTether(
       frame.upper_tethers[index],
       frame.upper_tether_tensions[index] ?? [],
-      upperSegmentMeshes[index],
-      upperNodeMeshes[index],
+      upperSegments,
+      upperNodes,
       UPPER_SEGMENT_RADIUS,
       UPPER_NODE_RADIUS
     );
@@ -2855,7 +3111,12 @@ function refreshProgressSummary(): void {
   if (!activeSummaryRequest || !latestProgressState) {
     return;
   }
-  summaryNode.innerHTML = formatProgressSummary(
+  const now = performance.now();
+  if (now - lastSummaryRefreshWallTimeMs < SUMMARY_REFRESH_MIN_INTERVAL_MS) {
+    summaryRefreshPending = true;
+    return;
+  }
+  const html = formatProgressSummary(
     activeSummaryRequest,
     latestProgressState,
     framesReceived,
@@ -2863,6 +3124,12 @@ function refreshProgressSummary(): void {
     pendingFrames.length,
     currentPlaybackLabel
   );
+  if (html !== lastSummaryHtml) {
+    summaryNode.innerHTML = html;
+    lastSummaryHtml = html;
+  }
+  lastSummaryRefreshWallTimeMs = now;
+  summaryRefreshPending = false;
 }
 
 function renderFrameBatch(frames: ApiFrame[]): void {
@@ -2870,10 +3137,28 @@ function renderFrameBatch(frames: ApiFrame[]): void {
     return;
   }
   framesRendered += frames.length;
-  frames.forEach((frame) => {
-    advanceAirflowParticlesToFrame(frame);
-  });
-  renderFrame(frames[frames.length - 1]);
+  if (airflowUpdatesEnabled) {
+    try {
+      frames.forEach((frame) => {
+        advanceAirflowParticlesToFrame(frame);
+      });
+    } catch (error) {
+      airflowUpdatesEnabled = false;
+      ambientParticleCloud.visible = false;
+      gustParticleCloud.visible = false;
+      wingtipTrailCloud.visible = false;
+      const message = error instanceof Error ? error.message : String(error);
+      appendConsole(`airflow rendering disabled after error: ${message}`);
+    }
+  }
+  try {
+    renderFrame(frames[frames.length - 1]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    appendConsole(`3D render error: ${message}`);
+    refreshProgressSummary();
+    return;
+  }
   appendPlotFrames(frames);
   refreshProgressSummary();
 }
@@ -2884,7 +3169,7 @@ function drainPendingFrames(timestamp: number): void {
   }
 
   if (currentPlaybackRate === null) {
-    const batch = pendingFrames.splice(0, pendingFrames.length);
+    const batch = pendingFrames.splice(0, Math.min(pendingFrames.length, MAX_FRAMES_PER_ANIMATION_TICK));
     renderFrameBatch(batch);
     return;
   }
@@ -2903,14 +3188,65 @@ function drainPendingFrames(timestamp: number): void {
   }
 
   if (consumeCount > 0) {
-    const batch = pendingFrames.splice(0, consumeCount);
+    const batch = pendingFrames.splice(0, Math.min(consumeCount, MAX_FRAMES_PER_ANIMATION_TICK));
     renderFrameBatch(batch);
   }
+}
+
+function flushPendingPlotFrame(): void {
+  if (
+    pendingPlotFrame === null ||
+    activePlotSections.length === 0 ||
+    !plotUpdatesEnabled ||
+    plotFlushInFlight
+  ) {
+    return;
+  }
+
+  const frame = pendingPlotFrame;
+  pendingPlotFrame = null;
+  plotFlushInFlight = true;
+
+  const updates = activePlotSections.map((section) =>
+    Plotly.extendTraces(
+      section.plot,
+      {
+        x: section.definition.groups.flatMap((group) =>
+          group.traces.map(() => [frame.time])
+        ),
+        y: section.definition.groups.flatMap((group) =>
+          group.traces.map((trace) => [trace.value(frame)])
+        )
+      },
+      section.traceIndices,
+      plotMaxPoints
+    )
+  );
+
+  void Promise.all(updates)
+    .catch((error: unknown) => {
+      if (!plotUpdatesEnabled) {
+        return;
+      }
+      plotUpdatesEnabled = false;
+      const message = error instanceof Error ? error.message : String(error);
+      appendConsole(`plot updates disabled after error: ${message}`);
+    })
+    .finally(() => {
+      plotFlushInFlight = false;
+      if (pendingPlotFrame !== null) {
+        flushPendingPlotFrame();
+      }
+    });
 }
 
 function animate(timestamp: number): void {
   requestAnimationFrame(animate);
   drainPendingFrames(timestamp);
+  flushPendingPlotFrame();
+  if (summaryRefreshPending) {
+    refreshProgressSummary();
+  }
   syncOrbitTargetMarker();
   renderer.render(scene, camera);
 }
@@ -2932,7 +3268,7 @@ function sectionPlotColumns(groupCount: number, maxColumns?: number): number {
 function sectionPlotData(groups: PlotGroupDefinition[]): PlotlyDatum[] {
   return groups.flatMap((group, groupIndex) =>
     group.traces.map((trace) => ({
-      type: "scattergl",
+      type: "scatter",
       mode: "lines",
       name: trace.name,
       x: [] as number[],
@@ -3074,24 +3410,11 @@ async function resetPlots(kiteCount: number): Promise<void> {
 }
 
 function appendPlotFrames(frames: ApiFrame[]): void {
-  if (frames.length === 0 || activePlotSections.length === 0) {
+  if (frames.length === 0 || activePlotSections.length === 0 || !plotUpdatesEnabled) {
     return;
   }
-  activePlotSections.forEach((section) => {
-    void Plotly.extendTraces(
-      section.plot,
-      {
-        x: section.definition.groups.flatMap((group) =>
-          group.traces.map(() => frames.map((frame) => frame.time))
-        ),
-        y: section.definition.groups.flatMap((group) =>
-          group.traces.map((trace) => frames.map((frame) => trace.value(frame)))
-        )
-      },
-      section.traceIndices,
-      plotMaxPoints
-    );
-  });
+  pendingPlotFrame = frames[frames.length - 1];
+  flushPendingPlotFrame();
 }
 
 function queueFrame(frame: ApiFrame): void {
@@ -3136,6 +3459,7 @@ async function loadPresets(): Promise<void> {
     option.textContent = `${preset.name} — ${preset.description}`;
     presetSelect.append(option);
   });
+  updateCameraFollowOptions(presetKiteCount(presetSelect.value as Preset));
 }
 
 async function runSimulation(): Promise<void> {
@@ -3180,7 +3504,11 @@ async function runSimulation(): Promise<void> {
   );
 
   try {
-    await resetPlots(presetKiteCount(request.preset as Preset));
+    void resetPlots(presetKiteCount(request.preset as Preset)).catch((error: unknown) => {
+      plotUpdatesEnabled = false;
+      const message = error instanceof Error ? error.message : String(error);
+      appendConsole(`plot initialization failed: ${message}`);
+    });
     const response = await fetch("/api/run_stream", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -3292,10 +3620,27 @@ runForm.addEventListener("submit", (event) => {
 
 presetSelect.addEventListener("change", () => {
   applyPresetDefaults();
+  updateCameraFollowOptions(presetKiteCount(presetSelect.value as Preset));
+  shouldSnapOrbitTargetToFrame = true;
+  resetCameraFollowState();
 });
 
 phaseModeSelect.addEventListener("change", () => {
   renderControllerDocs();
+});
+
+cameraFollowTargetSelect.addEventListener("change", () => {
+  updateCameraFollowUiState();
+  shouldSnapOrbitTargetToFrame = true;
+  resetCameraFollowState();
+  if (lastRenderedFrame) {
+    snapCameraTargetToFrame(lastRenderedFrame);
+    applyCameraFollow(lastRenderedFrame);
+  }
+});
+
+cameraFollowYawInput.addEventListener("change", () => {
+  resetCameraFollowState();
 });
 
 window.addEventListener("mathjax-ready", () => {
@@ -3321,6 +3666,7 @@ window.addEventListener("resize", () => {
   renderer.setSize(viewport.clientWidth, viewport.clientHeight);
   camera.aspect = viewport.clientWidth / viewport.clientHeight;
   camera.updateProjectionMatrix();
+  syncOrbitTargetMarker();
   activePlotSections.forEach((section) => {
     Plotly.Plots?.resize(section.plot);
   });

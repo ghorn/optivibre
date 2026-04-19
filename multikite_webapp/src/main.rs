@@ -9,9 +9,12 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use multikite_sim::{
-    COMMON_NODES, InitRequest, PhaseMode, Preset, RunSummary, SimulationConfig, SimulationFrame,
-    SimulationProgress, UPPER_NODES, available_presets, simulate_simple_tether_with_callbacks,
-    simulate_simple_tether_with_progress, simulate_star3_with_callbacks,
+    COMMON_NODES, FREE_COMMON_NODES, FREE_UPPER_NODES, InitRequest, PhaseMode, Preset,
+    RunSummary, SimulationConfig, SimulationFrame, SimulationProgress, UPPER_NODES,
+    available_presets, simulate_free_flight1_with_callbacks, simulate_free_flight1_with_progress,
+    simulate_simple_tether_with_callbacks, simulate_simple_tether_with_progress,
+    simulate_star1_with_callbacks,
+    simulate_star1_with_progress, simulate_star3_with_callbacks,
     simulate_star3_with_progress, simulate_star4_with_callbacks, simulate_star4_with_progress,
     simulate_y2_with_callbacks, simulate_y2_with_progress,
 };
@@ -89,6 +92,13 @@ struct ApiFrame {
     rabbit_radius: Vec<f64>,
     curvature_y_b: Vec<f64>,
     curvature_y_ref: Vec<f64>,
+    curvature_y_est: Vec<f64>,
+    omega_world_z_ref: Vec<f64>,
+    omega_world_z: Vec<f64>,
+    beta_ref_deg: Vec<f64>,
+    roll_ref_deg: Vec<f64>,
+    roll_ff_deg: Vec<f64>,
+    pitch_ref_deg: Vec<f64>,
     curvature_z_b: Vec<f64>,
     curvature_z_ref: Vec<f64>,
     top_tension: Vec<f64>,
@@ -229,8 +239,8 @@ fn config_from_request(request: &RunRequest) -> (InitRequest, SimulationConfig) 
     )
 }
 
-fn to_api_frame<const NK: usize>(
-    frame: &SimulationFrame<f64, NK, COMMON_NODES, UPPER_NODES>,
+fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
+    frame: &SimulationFrame<f64, NK, N_COMMON, N_UPPER>,
 ) -> ApiFrame {
     let payload_position_n = vec3(frame.state.payload.pos_n);
     let splitter_position_n = vec3(frame.state.splitter.pos_n);
@@ -385,6 +395,48 @@ fn to_api_frame<const NK: usize>(
             .kites
             .iter()
             .map(|diag| diag.curvature_y_ref)
+            .collect(),
+        curvature_y_est: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.curvature_y_est)
+            .collect(),
+        omega_world_z_ref: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.omega_world_z_ref)
+            .collect(),
+        omega_world_z: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.omega_world_z)
+            .collect(),
+        beta_ref_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.beta_ref.to_degrees())
+            .collect(),
+        roll_ref_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.roll_ref.to_degrees())
+            .collect(),
+        roll_ff_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.roll_ff.to_degrees())
+            .collect(),
+        pitch_ref_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.pitch_ref.to_degrees())
             .collect(),
         curvature_z_b: frame
             .diagnostics
@@ -703,6 +755,26 @@ fn run_preset_with_progress<F: FnMut(SimulationProgress)>(
 ) -> Result<ApiRunResponse> {
     let (init, config) = config_from_request(request);
     let (summary, frames) = match request.preset {
+        Preset::FreeFlight1 => {
+            let run = simulate_free_flight1_with_progress(&init, &config, progress_cb)?;
+            (
+                run.summary,
+                run.frames
+                    .into_iter()
+                    .map(|frame| to_api_frame(&frame))
+                    .collect(),
+            )
+        }
+        Preset::Star1 => {
+            let run = simulate_star1_with_progress(&init, &config, progress_cb)?;
+            (
+                run.summary,
+                run.frames
+                    .into_iter()
+                    .map(|frame| to_api_frame(&frame))
+                    .collect(),
+            )
+        }
         Preset::Y2 => {
             let run = simulate_y2_with_progress(&init, &config, progress_cb)?;
             (
@@ -863,6 +935,20 @@ fn run_preset_streaming<P: FnMut(SimulationProgress), G: FnMut(ApiFrame)>(
 ) -> Result<RunSummary> {
     let (init, config) = config_from_request(request);
     let summary = match request.preset {
+        Preset::FreeFlight1 => {
+            let mut send_frame =
+                |frame: SimulationFrame<f64, 1, FREE_COMMON_NODES, FREE_UPPER_NODES>| {
+                    frame_cb(to_api_frame(&frame));
+                };
+            simulate_free_flight1_with_callbacks(&init, &config, progress_cb, &mut send_frame)?
+                .summary
+        }
+        Preset::Star1 => {
+            let mut send_frame = |frame: SimulationFrame<f64, 1, COMMON_NODES, UPPER_NODES>| {
+                frame_cb(to_api_frame(&frame));
+            };
+            simulate_star1_with_callbacks(&init, &config, progress_cb, &mut send_frame)?.summary
+        }
         Preset::Y2 => {
             let mut send_frame = |frame: SimulationFrame<f64, 2, COMMON_NODES, UPPER_NODES>| {
                 frame_cb(to_api_frame(&frame));

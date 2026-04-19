@@ -8,9 +8,13 @@ mod types;
 
 pub use assets::{AssetManifest, ReferenceExport, asset_manifest, reference_export};
 pub use runtime::{
-    COMMON_NODES, UPPER_NODES, available_presets, simple_tether_configuration,
+    COMMON_NODES, FREE_COMMON_NODES, FREE_UPPER_NODES, UPPER_NODES, available_presets,
+    free_flight_configuration, simple_tether_configuration,
+    simulate_free_flight1, simulate_free_flight1_with_callbacks,
+    simulate_free_flight1_with_progress,
     simulate_simple_tether, simulate_simple_tether_with_callbacks,
-    simulate_simple_tether_with_progress, simulate_star3, simulate_star3_with_callbacks,
+    simulate_simple_tether_with_progress, simulate_star1, simulate_star1_with_callbacks,
+    simulate_star1_with_progress, simulate_star3, simulate_star3_with_callbacks,
     simulate_star3_with_progress, simulate_star4, simulate_star4_with_callbacks,
     simulate_star4_with_progress, simulate_y2, simulate_y2_with_callbacks,
     simulate_y2_with_progress, star_configuration, y_configuration,

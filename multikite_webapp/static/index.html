@@ -76,6 +76,20 @@
               <option value="0.1">0.1x</option>
             </select>
           </label>
+          <div class="form-section">
+            <div class="form-section-title">View Follow</div>
+            <label>
+              Camera Target
+              <select id="camera-follow-target">
+                <option value="manual">Manual</option>
+                <option value="disk_center">Disk Center</option>
+              </select>
+            </label>
+            <label class="checkbox-label">
+              <input id="camera-follow-yaw" type="checkbox" />
+              <span>Follow Kite Yaw</span>
+            </label>
+          </div>
           <button id="run-button" type="submit">Run</button>
         </form>
         <div id="failure-pill" class="failure-pill"></div>

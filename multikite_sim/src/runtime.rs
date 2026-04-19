@@ -16,6 +16,8 @@ use std::array::from_fn;
 
 pub const COMMON_NODES: usize = 5;
 pub const UPPER_NODES: usize = 5;
+pub const FREE_COMMON_NODES: usize = 0;
+pub const FREE_UPPER_NODES: usize = 0;
 
 fn vec3(values: [f64; 3]) -> Vector3<f64> {
     Vector3::new(values[0], values[1], values[2])
@@ -219,6 +221,39 @@ pub fn y_configuration<const N_COMMON: usize, const N_UPPER: usize>(
     params: &Params<f64, 2>,
 ) -> State<f64, 2, N_COMMON, N_UPPER> {
     star_configuration(params)
+}
+
+pub fn free_flight_configuration<const N_COMMON: usize, const N_UPPER: usize>(
+    params: &Params<f64, 1>,
+) -> State<f64, 1, N_COMMON, N_UPPER> {
+    let body = BodyState {
+        pos_n: Vector3::new(0.0, 0.0, -120.0),
+        vel_b: Vector3::new(params.controller.speed_ref, 0.0, 0.0),
+        quat_n2b: yaw_quaternion_n2b(0.0),
+        omega_b: Vector3::zeros(),
+    };
+    State {
+        kites: [KiteState {
+            body,
+            tether: std::array::from_fn(|_| TetherNode {
+                pos_n: Vector3::zeros(),
+                vel_n: Vector3::zeros(),
+            }),
+        }],
+        splitter: TetherNode {
+            pos_n: Vector3::zeros(),
+            vel_n: Vector3::zeros(),
+        },
+        common_tether: std::array::from_fn(|_| TetherNode {
+            pos_n: Vector3::zeros(),
+            vel_n: Vector3::zeros(),
+        }),
+        payload: TetherNode {
+            pos_n: Vector3::zeros(),
+            vel_n: Vector3::zeros(),
+        },
+        total_work: 0.0,
+    }
 }
 
 pub fn simple_tether_configuration<const N_COMMON: usize, const N_UPPER: usize>(
@@ -760,6 +795,22 @@ fn simulate_passive<
 pub fn available_presets() -> Vec<PresetInfo> {
     vec![
         PresetInfo {
+            preset: Preset::FreeFlight1,
+            name: "FreeFlight1",
+            description: "Single-kite free-flight bring-up harness with direct roll, pitch, and airspeed references.",
+            kites: 1,
+            common_nodes: FREE_COMMON_NODES,
+            upper_nodes: FREE_UPPER_NODES,
+        },
+        PresetInfo {
+            preset: Preset::Star1,
+            name: "Star1",
+            description: "Single-kite star/orbit preset for controller bring-up.",
+            kites: 1,
+            common_nodes: COMMON_NODES,
+            upper_nodes: UPPER_NODES,
+        },
+        PresetInfo {
             preset: Preset::Y2,
             name: "Y2",
             description: "Two-kite Y preset tuned for milestone-one circle following.",
@@ -792,6 +843,102 @@ pub fn available_presets() -> Vec<PresetInfo> {
             upper_nodes: 0,
         },
     ]
+}
+
+pub fn simulate_star1(
+    init: &InitRequest,
+    config: &SimulationConfig,
+) -> Result<RunResult<1, COMMON_NODES, UPPER_NODES>> {
+    let mut progress_cb = |_| {};
+    let mut frame_cb = |_| {};
+    simulate::<1, COMMON_NODES, UPPER_NODES, _, _>(
+        init,
+        config,
+        star_configuration::<1, COMMON_NODES, UPPER_NODES>,
+        &mut progress_cb,
+        &mut frame_cb,
+    )
+}
+
+pub fn simulate_free_flight1(
+    init: &InitRequest,
+    config: &SimulationConfig,
+) -> Result<RunResult<1, FREE_COMMON_NODES, FREE_UPPER_NODES>> {
+    let mut progress_cb = |_| {};
+    let mut frame_cb = |_| {};
+    simulate::<1, FREE_COMMON_NODES, FREE_UPPER_NODES, _, _>(
+        init,
+        config,
+        free_flight_configuration::<FREE_COMMON_NODES, FREE_UPPER_NODES>,
+        &mut progress_cb,
+        &mut frame_cb,
+    )
+}
+
+pub fn simulate_free_flight1_with_progress<F: FnMut(SimulationProgress)>(
+    init: &InitRequest,
+    config: &SimulationConfig,
+    progress_cb: &mut F,
+) -> Result<RunResult<1, FREE_COMMON_NODES, FREE_UPPER_NODES>> {
+    let mut frame_cb = |_| {};
+    simulate::<1, FREE_COMMON_NODES, FREE_UPPER_NODES, _, _>(
+        init,
+        config,
+        free_flight_configuration::<FREE_COMMON_NODES, FREE_UPPER_NODES>,
+        progress_cb,
+        &mut frame_cb,
+    )
+}
+
+pub fn simulate_free_flight1_with_callbacks<
+    P: FnMut(SimulationProgress),
+    G: FnMut(SimulationFrame<f64, 1, FREE_COMMON_NODES, FREE_UPPER_NODES>),
+>(
+    init: &InitRequest,
+    config: &SimulationConfig,
+    progress_cb: &mut P,
+    frame_cb: &mut G,
+) -> Result<RunResult<1, FREE_COMMON_NODES, FREE_UPPER_NODES>> {
+    simulate::<1, FREE_COMMON_NODES, FREE_UPPER_NODES, _, _>(
+        init,
+        config,
+        free_flight_configuration::<FREE_COMMON_NODES, FREE_UPPER_NODES>,
+        progress_cb,
+        frame_cb,
+    )
+}
+
+pub fn simulate_star1_with_progress<F: FnMut(SimulationProgress)>(
+    init: &InitRequest,
+    config: &SimulationConfig,
+    progress_cb: &mut F,
+) -> Result<RunResult<1, COMMON_NODES, UPPER_NODES>> {
+    let mut frame_cb = |_| {};
+    simulate::<1, COMMON_NODES, UPPER_NODES, _, _>(
+        init,
+        config,
+        star_configuration::<1, COMMON_NODES, UPPER_NODES>,
+        progress_cb,
+        &mut frame_cb,
+    )
+}
+
+pub fn simulate_star1_with_callbacks<
+    P: FnMut(SimulationProgress),
+    G: FnMut(SimulationFrame<f64, 1, COMMON_NODES, UPPER_NODES>),
+>(
+    init: &InitRequest,
+    config: &SimulationConfig,
+    progress_cb: &mut P,
+    frame_cb: &mut G,
+) -> Result<RunResult<1, COMMON_NODES, UPPER_NODES>> {
+    simulate::<1, COMMON_NODES, UPPER_NODES, _, _>(
+        init,
+        config,
+        star_configuration::<1, COMMON_NODES, UPPER_NODES>,
+        progress_cb,
+        frame_cb,
+    )
 }
 
 pub fn simulate_y2(
