@@ -1,3 +1,4 @@
+use nalgebra::{Quaternion, Vector3};
 use sx_core::{SX, SXMatrix, SxError};
 use thiserror::Error;
 
@@ -199,6 +200,112 @@ where
         for index in 0..N {
             let component = format!("[{index}]");
             V::flat_layout_names(&extend_layout_name(prefix, &component), out);
+        }
+    }
+}
+
+impl<T> Vectorize<T> for Vector3<T>
+where
+    T: ScalarLeaf,
+{
+    type Rebind<U: ScalarLeaf> = Vector3<U>;
+    type View<'a>
+        = Vector3<&'a T>
+    where
+        T: 'a;
+
+    const LEN: usize = 3;
+
+    fn flatten_refs<'a>(&'a self, out: &mut Vec<&'a T>) {
+        out.push(&self[0]);
+        out.push(&self[1]);
+        out.push(&self[2]);
+    }
+
+    fn from_flat_fn<U: ScalarLeaf>(f: &mut impl FnMut() -> U) -> Self::Rebind<U> {
+        Vector3::new(f(), f(), f())
+    }
+
+    fn view<'a>(&'a self) -> Self::View<'a>
+    where
+        T: 'a,
+    {
+        Vector3::new(&self[0], &self[1], &self[2])
+    }
+
+    fn view_from_flat_slice<'a>(slice: &'a [T], index: &mut usize) -> Self::View<'a>
+    where
+        T: 'a,
+    {
+        let x = &slice[*index];
+        *index += 1;
+        let y = &slice[*index];
+        *index += 1;
+        let z = &slice[*index];
+        *index += 1;
+        Vector3::new(x, y, z)
+    }
+
+    fn flat_layout_names(prefix: &str, out: &mut Vec<String>) {
+        for component in ["x", "y", "z"] {
+            out.push(extend_layout_name(prefix, component));
+        }
+    }
+}
+
+impl<T> Vectorize<T> for Quaternion<T>
+where
+    T: ScalarLeaf,
+{
+    type Rebind<U: ScalarLeaf> = Quaternion<U>;
+    type View<'a>
+        = Quaternion<&'a T>
+    where
+        T: 'a;
+
+    const LEN: usize = 4;
+
+    fn flatten_refs<'a>(&'a self, out: &mut Vec<&'a T>) {
+        out.push(&self.coords[3]);
+        out.push(&self.coords[0]);
+        out.push(&self.coords[1]);
+        out.push(&self.coords[2]);
+    }
+
+    fn from_flat_fn<U: ScalarLeaf>(f: &mut impl FnMut() -> U) -> Self::Rebind<U> {
+        Quaternion::new(f(), f(), f(), f())
+    }
+
+    fn view<'a>(&'a self) -> Self::View<'a>
+    where
+        T: 'a,
+    {
+        Quaternion::new(
+            &self.coords[3],
+            &self.coords[0],
+            &self.coords[1],
+            &self.coords[2],
+        )
+    }
+
+    fn view_from_flat_slice<'a>(slice: &'a [T], index: &mut usize) -> Self::View<'a>
+    where
+        T: 'a,
+    {
+        let w = &slice[*index];
+        *index += 1;
+        let i = &slice[*index];
+        *index += 1;
+        let j = &slice[*index];
+        *index += 1;
+        let k = &slice[*index];
+        *index += 1;
+        Quaternion::new(w, i, j, k)
+    }
+
+    fn flat_layout_names(prefix: &str, out: &mut Vec<String>) {
+        for component in ["w", "i", "j", "k"] {
+            out.push(extend_layout_name(prefix, component));
         }
     }
 }

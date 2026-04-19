@@ -1,0 +1,105 @@
+{
+  "name": "Reference Multikite Export",
+  "source_paths": [
+    "kittybutt/core/src/Kitty/Config/Reference.hs@e18990d54",
+    "kittybutt/core/src/Kitty/Config/TwinReferences.hs@e18990d54",
+    "kittybutt/control/src/Kitty/Config/ControlConfig.hs@e18990d54",
+    "kittybutt/sims/src/Kitty/Sims/MultiKiteSim.hs@e18990d54"
+  ],
+  "rigid_body": {
+    "mass": 20.0,
+    "inertia_diagonal": [4.647, 18.025, 22.743],
+    "cad_offset_b": [-0.02, 0.0, 0.0]
+  },
+  "aero": {
+    "ref_area": 1.6,
+    "ref_span": 3.1,
+    "ref_chord": 0.5167,
+    "cl0": 0.24,
+    "cl_alpha": 4.4,
+    "cl_elevator": 1.15,
+    "cl_flap": 0.65,
+    "cd0": 0.055,
+    "cd_induced": 0.11,
+    "cd_surface_abs": 0.035,
+    "cy_beta": -0.72,
+    "cy_rudder": 0.26,
+    "roll_beta": -0.10,
+    "roll_p": -0.48,
+    "roll_r": 0.10,
+    "roll_aileron": 0.36,
+    "pitch0": 0.02,
+    "pitch_alpha": -1.08,
+    "pitch_q": -6.2,
+    "pitch_elevator": -1.45,
+    "pitch_flap": -0.30,
+    "yaw_beta": 0.15,
+    "yaw_p": -0.02,
+    "yaw_r": -0.28,
+    "yaw_rudder": -0.33
+  },
+  "rotor": {
+    "axis_b": [1.0, 0.0, 0.0],
+    "radius": 0.07,
+    "torque_to_force": 3.6,
+    "force_to_power": 18.0
+  },
+  "bridle": {
+    "pivot_b": [0.05, 0.0, 0.2],
+    "radius": 0.05
+  },
+  "tethers": {
+    "upper": {
+      "natural_length": 120.0,
+      "total_mass": 0.5,
+      "ea": 157079.63267948964,
+      "viscous_damping_coeff": 3.0,
+      "cd_phi": 1.2,
+      "diameter": 0.002,
+      "contact": {
+        "zeta": 0.7071067811865476,
+        "enable_length": 0.2,
+        "ground_altitude": 0.0
+      }
+    },
+    "common": {
+      "natural_length": 150.0,
+      "total_mass": 0.5,
+      "ea": 157079.63267948964,
+      "viscous_damping_coeff": 3.0,
+      "cd_phi": 1.2,
+      "diameter": 0.002,
+      "contact": {
+        "zeta": 0.7071067811865476,
+        "enable_length": 0.2,
+        "ground_altitude": 0.0
+      }
+    }
+  },
+  "controller": {
+    "trim_aileron": 0.0,
+    "trim_flap": 0.0,
+    "trim_winglet": 0.0,
+    "trim_elevator": 0.0,
+    "trim_rudder": -0.05,
+    "trim_motor_torque": 2.0,
+    "wx_to_ail": 0.1,
+    "wy_to_elev": 0.2,
+    "wz_to_rudder": 0.1,
+    "speed_to_torque_p": 0.7,
+    "speed_to_torque_i": 0.001,
+    "rabbit_distance": 50.0,
+    "phase_lag_to_radius": 2.0,
+    "vert_vel_to_rabbit_height": 0.0,
+    "gain_int_y": 0.0001,
+    "gain_int_z": 0.0001,
+    "speed_ref": 25.0,
+    "disk_center_n": [0.0, 0.0, -200.0],
+    "disk_radius": 70.0
+  },
+  "environment": {
+    "rho": 1.225,
+    "g": 9.81,
+    "wind_n": [5.0, 0.0, 0.0]
+  }
+}

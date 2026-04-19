@@ -6013,15 +6013,21 @@ where
     }
 
     fn nlp_compile_stats(&self) -> NlpCompileStats {
-        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::nlp_compile_stats(self)
+        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::nlp_compile_stats(
+            self,
+        )
     }
 
     fn helper_compile_stats(&self) -> OcpHelperCompileStats {
-        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::helper_compile_stats(self)
+        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::helper_compile_stats(
+            self,
+        )
     }
 
     fn helper_kernel_count(&self) -> usize {
-        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::helper_kernel_count(self)
+        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::helper_kernel_count(
+            self,
+        )
     }
 
     fn backend_compile_report(&self) -> &BackendCompileReport {

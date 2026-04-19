@@ -1,0 +1,13 @@
+{
+  "name": "multikite_webapp",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.json --outDir dist",
+    "check": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/three": "^0.184.0",
+    "three": "0.179.1",
+    "typescript": "6.0.2"
+  }
+}

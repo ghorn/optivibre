@@ -9,6 +9,8 @@ members = [
     "optimal_control_problems",
     "optimal_control_benchmarks",
     "optimal_control_webapp",
+    "multikite_sim",
+    "multikite_webapp",
     "lqr_solvers",
     "optimization_derive",
     "test_problems",
@@ -36,6 +38,8 @@ llvm-sys = { version = "221.0.0", features = ["prefer-dynamic", "strict-versioni
 nalgebra = { version = "0.33.2", default-features = false, features = ["std"] }
 libc = "0.2.172"
 proptest = "1.7.0"
+rand = "0.9.2"
+rand_distr = "0.5.1"
 rstest = "0.25.0"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"

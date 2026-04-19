@@ -1,0 +1,27 @@
+[package]
+name = "multikite_sim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+nalgebra.workspace = true
+optimization = { path = "../optimization", features = ["serde"] }
+rand.workspace = true
+rand_distr.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sx_codegen_llvm = { path = "../sx_codegen_llvm" }
+sx_core = { path = "../sx_core" }
+
+[dev-dependencies]
+approx.workspace = true
+
+[lints]
+workspace = true
