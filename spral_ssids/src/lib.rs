@@ -16,6 +16,10 @@ pub struct SymmetricCscMatrix<'a> {
 }
 
 impl<'a> SymmetricCscMatrix<'a> {
+    /// Construct a symmetric lower-triangular CSC view.
+    ///
+    /// The structure must contain diagonal entries and only rows `>= col`
+    /// within each column.
     pub fn new(
         dimension: usize,
         col_ptrs: &'a [usize],
@@ -107,6 +111,8 @@ pub enum OrderingStrategy {
     Natural,
     ApproximateMinimumDegree,
     NestedDissection(NestedDissectionOptions),
+    /// Choose the ordering with the lowest estimated symbolic fill among
+    /// natural, AMD, and Rust nested dissection.
     Auto(NestedDissectionOptions),
 }
 
@@ -240,10 +246,6 @@ struct ContributionBlock {
 
 #[derive(Clone, Debug, PartialEq)]
 struct MultifrontalFactorizationOutcome {
-    factor_order: Vec<usize>,
-    factor_inverse: Vec<usize>,
-    dense_lower: Vec<f64>,
-    diagonal_blocks: Vec<DiagonalBlockValue>,
     pivot_stats: PivotStats,
     factorization_residual_max_abs: f64,
     front_count: usize,
@@ -282,6 +284,14 @@ struct DenseFrontFactorization {
     delayed_front_propagations: usize,
 }
 
+struct NumericFactorBuffers<'a> {
+    factor_order: &'a mut Vec<usize>,
+    factor_inverse: &'a mut Vec<usize>,
+    dense_lower: &'a mut Vec<f64>,
+    diagonal_blocks: &'a mut Vec<DiagonalBlockValue>,
+    dense_matrix_scratch: &'a mut Vec<f64>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct NumericFactor {
     dimension: usize,
@@ -295,7 +305,8 @@ pub struct NumericFactor {
     factor_order: Vec<usize>,
     factor_inverse: Vec<usize>,
     dense_lower: Vec<f64>,
-    symbolic_front_tree: Vec<SymbolicFront>,
+    symbolic_front_tree: SymbolicFrontTree,
+    dense_matrix_scratch: Vec<f64>,
     front_count_cached: usize,
     max_front_size_cached: usize,
     contribution_storage_bytes_cached: usize,
@@ -370,6 +381,8 @@ impl NumericFactor {
         Ok(solution)
     }
 
+    /// Solve `Ax = rhs` in place for the factorized matrix. The slice length
+    /// must match the factor dimension exactly.
     pub fn solve_in_place(&self, rhs: &mut [f64]) -> Result<(), SsidsError> {
         if rhs.len() != self.dimension {
             return Err(SsidsError::SolveDimensionMismatch {
@@ -445,6 +458,10 @@ impl NumericFactor {
         Ok(())
     }
 
+    /// Reuse the analysed symbolic front tree for a new numeric factorization.
+    ///
+    /// The replacement matrix must have the same dimension and identical CSC
+    /// sparsity structure as the original factorization.
     pub fn refactorize(
         &mut self,
         matrix: SymmetricCscMatrix<'_>,
@@ -462,31 +479,39 @@ impl NumericFactor {
                 "refactorization requires identical CSC sparsity structure".into(),
             ));
         }
+        self.refactorize_with_cached_symbolic(matrix, true)
+    }
+
+    fn refactorize_with_cached_symbolic(
+        &mut self,
+        matrix: SymmetricCscMatrix<'_>,
+        reused_symbolic: bool,
+    ) -> Result<FactorInfo, SsidsError> {
         let factorization = multifrontal_factorize_with_tree(
             matrix,
             &self.permutation,
-            &SymbolicFrontTree {
-                fronts: self.symbolic_front_tree.clone(),
-                roots: collect_root_fronts(&self.symbolic_front_tree),
-            },
+            &self.symbolic_front_tree,
             self.options,
+            NumericFactorBuffers {
+                factor_order: &mut self.factor_order,
+                factor_inverse: &mut self.factor_inverse,
+                dense_lower: &mut self.dense_lower,
+                diagonal_blocks: &mut self.diagonal_blocks,
+                dense_matrix_scratch: &mut self.dense_matrix_scratch,
+            },
         )?;
         let info = FactorInfo {
             factorization_residual_max_abs: factorization.factorization_residual_max_abs,
             regularized_pivots: factorization.pivot_stats.regularized_pivots,
         };
-        self.diagonal_blocks = factorization.diagonal_blocks;
         self.inertia =
             inertia_from_blocks(&[], &self.diagonal_blocks, self.options.inertia_zero_tol);
         self.pivot_stats = factorization.pivot_stats;
-        self.factor_order = factorization.factor_order;
-        self.factor_inverse = factorization.factor_inverse;
-        self.dense_lower = factorization.dense_lower;
         self.front_count_cached = factorization.front_count;
         self.max_front_size_cached = factorization.max_front_size;
         self.contribution_storage_bytes_cached = factorization.contribution_storage_bytes;
         self.delayed_front_propagations_cached = factorization.delayed_front_propagations;
-        self.symbolic_reuse_cached = true;
+        self.symbolic_reuse_cached = reused_symbolic;
         self.stored_nnz_cached = factorization.stored_nnz;
         self.factor_bytes_cached = factorization.factor_bytes;
         Ok(info)
@@ -599,6 +624,8 @@ pub fn analyse(
     }
 }
 
+/// Perform a numeric multifrontal LDL^T factorization for a previously
+/// analyzed symmetric CSC matrix.
 pub fn factorize(
     matrix: SymmetricCscMatrix<'_>,
     symbolic: &SymbolicFactor,
@@ -611,34 +638,37 @@ pub fn factorize(
         });
     }
     let front_tree = build_symbolic_front_tree(symbolic);
-    let factorization =
-        multifrontal_factorize_with_tree(matrix, &symbolic.permutation, &front_tree, *options)?;
-    let diagonal_blocks = factorization.diagonal_blocks;
-    let inertia = inertia_from_blocks(&[], &diagonal_blocks, options.inertia_zero_tol);
-    let info = FactorInfo {
-        factorization_residual_max_abs: factorization.factorization_residual_max_abs,
-        regularized_pivots: factorization.pivot_stats.regularized_pivots,
-    };
-    let factor = NumericFactor {
+    let mut factor = NumericFactor {
         dimension: matrix.dimension(),
         permutation: symbolic.permutation.clone(),
         pattern_col_ptrs: matrix.col_ptrs().to_vec(),
         pattern_row_indices: matrix.row_indices().to_vec(),
-        diagonal_blocks,
-        inertia,
-        pivot_stats: factorization.pivot_stats,
+        diagonal_blocks: Vec::new(),
+        inertia: Inertia {
+            positive: 0,
+            negative: 0,
+            zero: 0,
+        },
+        pivot_stats: PivotStats {
+            regularized_pivots: 0,
+            two_by_two_pivots: 0,
+            delayed_pivots: 0,
+            min_abs_pivot: 0.0,
+            max_abs_pivot: 0.0,
+        },
         options: *options,
-        factor_order: factorization.factor_order,
-        factor_inverse: factorization.factor_inverse,
-        dense_lower: factorization.dense_lower,
-        symbolic_front_tree: front_tree.fronts,
-        front_count_cached: factorization.front_count,
-        max_front_size_cached: factorization.max_front_size,
-        contribution_storage_bytes_cached: factorization.contribution_storage_bytes,
-        delayed_front_propagations_cached: factorization.delayed_front_propagations,
+        factor_order: Vec::with_capacity(matrix.dimension()),
+        factor_inverse: Vec::with_capacity(matrix.dimension()),
+        dense_lower: Vec::with_capacity(matrix.dimension() * matrix.dimension()),
+        symbolic_front_tree: front_tree,
+        dense_matrix_scratch: Vec::with_capacity(matrix.dimension() * matrix.dimension()),
+        front_count_cached: 0,
+        max_front_size_cached: 0,
+        contribution_storage_bytes_cached: 0,
+        delayed_front_propagations_cached: 0,
         symbolic_reuse_cached: false,
-        stored_nnz_cached: factorization.stored_nnz,
-        factor_bytes_cached: factorization.factor_bytes,
+        stored_nnz_cached: 0,
+        factor_bytes_cached: 0,
         symbolic_supernode_count_cached: symbolic.supernodes.len(),
         symbolic_max_supernode_width_cached: symbolic
             .supernodes
@@ -647,6 +677,7 @@ pub fn factorize(
             .max()
             .unwrap_or(0),
     };
+    let info = factor.refactorize_with_cached_symbolic(matrix, false)?;
     Ok((factor, info))
 }
 
@@ -818,14 +849,16 @@ fn collect_root_fronts(fronts: &[SymbolicFront]) -> Vec<usize> {
         .collect()
 }
 
-fn permuted_dense_matrix_from_csc(
+fn fill_permuted_dense_matrix_from_csc(
     matrix: SymmetricCscMatrix<'_>,
     permutation: &Permutation,
-) -> Result<Vec<f64>, SsidsError> {
+    dense: &mut Vec<f64>,
+) -> Result<(), SsidsError> {
     let values = matrix.values().ok_or(SsidsError::MissingValues)?;
     let dimension = matrix.dimension();
     let inverse = permutation.inverse();
-    let mut dense = vec![0.0; dimension * dimension];
+    dense.clear();
+    dense.resize(dimension * dimension, 0.0);
     for col in 0..dimension {
         let start = matrix.col_ptrs()[col];
         let end = matrix.col_ptrs()[col + 1];
@@ -846,7 +879,7 @@ fn permuted_dense_matrix_from_csc(
             }
         }
     }
-    Ok(dense)
+    Ok(())
 }
 
 fn dense_symmetric_swap(matrix: &mut [f64], size: usize, lhs: usize, rhs: usize) {
@@ -1313,14 +1346,16 @@ fn multifrontal_factorize_with_tree(
     permutation: &Permutation,
     tree: &SymbolicFrontTree,
     options: NumericFactorOptions,
+    buffers: NumericFactorBuffers<'_>,
 ) -> Result<MultifrontalFactorizationOutcome, SsidsError> {
     let dimension = matrix.dimension();
-    let dense_matrix = permuted_dense_matrix_from_csc(matrix, permutation)?;
+    fill_permuted_dense_matrix_from_csc(matrix, permutation, buffers.dense_matrix_scratch)?;
+    let dense_matrix = buffers.dense_matrix_scratch.as_slice();
     let root_results = if tree.roots.len() >= 2 && dimension >= 64 {
         let raw = tree
             .roots
             .par_iter()
-            .map(|&root| factor_front_recursive(root, tree, &dense_matrix, dimension, options))
+            .map(|&root| factor_front_recursive(root, tree, dense_matrix, dimension, options))
             .collect::<Vec<_>>();
         let mut collected = Vec::with_capacity(raw.len());
         for result in raw {
@@ -1333,7 +1368,7 @@ fn multifrontal_factorize_with_tree(
             collected.push(factor_front_recursive(
                 root,
                 tree,
-                &dense_matrix,
+                dense_matrix,
                 dimension,
                 options,
             )?);
@@ -1423,41 +1458,47 @@ fn multifrontal_factorize_with_tree(
         });
     }
 
-    let mut factor_inverse = vec![usize::MAX; dimension];
-    for (position, &ordered_index) in factor_order.iter().enumerate() {
-        factor_inverse[ordered_index] = position;
+    buffers.factor_order.clear();
+    buffers.factor_order.extend(factor_order);
+
+    buffers.factor_inverse.clear();
+    buffers.factor_inverse.resize(dimension, usize::MAX);
+    for (position, &ordered_index) in buffers.factor_order.iter().enumerate() {
+        buffers.factor_inverse[ordered_index] = position;
     }
-    let mut dense_lower = vec![0.0; dimension * dimension];
+    buffers.dense_lower.clear();
+    buffers.dense_lower.resize(dimension * dimension, 0.0);
     for (column_position, column) in factor_columns.iter().enumerate() {
-        if column.global_column != factor_order[column_position] {
+        if column.global_column != buffers.factor_order[column_position] {
             return Err(SsidsError::NumericalBreakdown {
                 pivot: column_position,
                 detail: "factor column order drifted away from factor elimination order".into(),
             });
         }
         for &(row, value) in &column.entries {
-            let row_position = factor_inverse[row];
+            let row_position = buffers.factor_inverse[row];
             if row_position == usize::MAX || row_position <= column_position {
                 return Err(SsidsError::NumericalBreakdown {
                     pivot: column_position,
                     detail: "factor column referenced an invalid trailing row".into(),
                 });
             }
-            dense_lower[row_position * dimension + column_position] = value;
+            buffers.dense_lower[row_position * dimension + column_position] = value;
         }
     }
 
-    let mut diagonal_blocks = Vec::new();
+    buffers.diagonal_blocks.clear();
     let mut start = 0;
     for block in block_records {
-        diagonal_blocks.push(DiagonalBlockValue {
+        buffers.diagonal_blocks.push(DiagonalBlockValue {
             block: DiagonalBlock {
                 start,
                 size: block.size,
             },
             values: block.values,
         });
-        start += diagonal_blocks
+        start += buffers
+            .diagonal_blocks
             .last()
             .map(|block| block.block.size)
             .unwrap_or(0);
@@ -1468,19 +1509,21 @@ fn multifrontal_factorize_with_tree(
             .iter()
             .map(|column| column.entries.len())
             .sum::<usize>()
-        + diagonal_blocks
+        + buffers
+            .diagonal_blocks
             .iter()
             .map(|block| block.values.len().saturating_sub(block.block.size))
             .sum::<usize>();
     let factor_bytes = std::mem::size_of::<f64>()
-        * (dense_lower.len()
-            + diagonal_blocks
+        * (buffers.dense_lower.len()
+            + buffers
+                .diagonal_blocks
                 .iter()
                 .map(|block| block.values.len())
                 .sum::<usize>())
         + std::mem::size_of::<usize>()
-            * (factor_order.len()
-                + factor_inverse.len()
+            * (buffers.factor_order.len()
+                + buffers.factor_inverse.len()
                 + tree
                     .fronts
                     .iter()
@@ -1488,10 +1531,6 @@ fn multifrontal_factorize_with_tree(
                     .sum::<usize>());
 
     Ok(MultifrontalFactorizationOutcome {
-        factor_order,
-        factor_inverse,
-        dense_lower,
-        diagonal_blocks,
         pivot_stats: PivotStats {
             regularized_pivots: stats.regularized_pivots,
             two_by_two_pivots: stats.two_by_two_pivots,

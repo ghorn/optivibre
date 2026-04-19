@@ -89,6 +89,91 @@ fn delayed_chain_dense(shift: f64) -> Vec<Vec<f64>> {
     ]
 }
 
+fn saddle_kkt_dense(shift: f64) -> Vec<Vec<f64>> {
+    vec![
+        vec![
+            4.0 + 0.1 * shift,
+            -1.0 + 0.02 * shift,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+        ],
+        vec![
+            -1.0 + 0.02 * shift,
+            4.0 - 0.05 * shift,
+            -1.0 + 0.03 * shift,
+            0.0,
+            0.0,
+            -0.25 + 0.01 * shift,
+            0.0,
+            0.5 - 0.02 * shift,
+        ],
+        vec![
+            0.0,
+            -1.0 + 0.03 * shift,
+            3.5 + 0.04 * shift,
+            -0.5 + 0.02 * shift,
+            0.0,
+            0.0,
+            0.75 - 0.03 * shift,
+            0.0,
+        ],
+        vec![
+            0.0,
+            0.0,
+            -0.5 + 0.02 * shift,
+            3.25 - 0.06 * shift,
+            -0.75 + 0.01 * shift,
+            0.0,
+            -1.0 + 0.04 * shift,
+            0.0,
+        ],
+        vec![
+            0.0,
+            0.0,
+            0.0,
+            -0.75 + 0.01 * shift,
+            2.75 + 0.05 * shift,
+            0.0,
+            0.0,
+            0.8 - 0.03 * shift,
+        ],
+        vec![
+            1.0,
+            -0.25 + 0.01 * shift,
+            0.0,
+            0.0,
+            0.0,
+            -0.1 - 0.01 * shift,
+            0.0,
+            0.0,
+        ],
+        vec![
+            0.0,
+            0.0,
+            0.75 - 0.03 * shift,
+            -1.0 + 0.04 * shift,
+            0.0,
+            0.0,
+            -0.15 - 0.01 * shift,
+            0.0,
+        ],
+        vec![
+            0.0,
+            0.5 - 0.02 * shift,
+            0.0,
+            0.0,
+            0.8 - 0.03 * shift,
+            0.0,
+            0.0,
+            -0.2 - 0.02 * shift,
+        ],
+    ]
+}
+
 #[test]
 fn numeric_factorization_solves_spd_system() {
     let dense = vec![
@@ -220,6 +305,29 @@ fn numeric_factorization_uses_two_by_two_pivot_for_width_two_supernode() {
         assert_abs_diff_eq!(actual, expected, epsilon = 1e-10);
     }
     assert!(residual_inf_norm(&dense, &solution, &rhs) <= 1e-10);
+}
+
+#[test]
+fn numeric_factorization_solves_saddle_point_kkt_system() {
+    let dense = saddle_kkt_dense(0.0);
+    let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+    let matrix = SymmetricCscMatrix::new(8, &col_ptrs, &row_indices, Some(&values)).expect("csc");
+    let (symbolic, _) = analyse(matrix, &SsidsOptions::default()).expect("symbolic");
+    let (factor, info) =
+        factorize(matrix, &symbolic, &NumericFactorOptions::default()).expect("factor");
+
+    assert!(info.factorization_residual_max_abs <= 1e-10);
+    assert!(factor.inertia().positive > 0);
+    assert!(factor.inertia().negative > 0);
+    assert_eq!(factor.inertia().zero, 0);
+
+    let expected = vec![1.0, -0.5, 0.75, -1.25, 0.5, 0.25, -0.75, 1.5];
+    let rhs = dense_mul(&dense, &expected);
+    let solution = factor.solve(&rhs).expect("solve");
+    for (actual, expected) in solution.iter().zip(expected.iter()) {
+        assert_abs_diff_eq!(actual, expected, epsilon = 1e-9);
+    }
+    assert!(residual_inf_norm(&dense, &solution, &rhs) <= 1e-9);
 }
 
 #[test]
@@ -390,6 +498,44 @@ fn multifrontal_repeated_refactorization_stays_stable_on_delayed_chain() {
             assert_abs_diff_eq!(actual, expected, epsilon = 1e-7);
         }
         assert!(residual_inf_norm(&updated, &solution, &rhs) <= 1e-7);
+    }
+}
+
+#[test]
+fn multifrontal_factorization_is_deterministic_on_saddle_kkt() {
+    let dense = saddle_kkt_dense(0.0);
+    let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+    let matrix = SymmetricCscMatrix::new(8, &col_ptrs, &row_indices, Some(&values)).expect("csc");
+    let (symbolic, _) = analyse(matrix, &SsidsOptions::default()).expect("symbolic");
+    let expected = vec![0.75, -0.25, 1.0, -1.5, 0.5, 0.25, -0.5, 1.25];
+    let rhs = dense_mul(&dense, &expected);
+
+    let mut baseline_solution: Option<Vec<f64>> = None;
+    let mut baseline_stats = None;
+    for _ in 0..3 {
+        let (factor, info) =
+            factorize(matrix, &symbolic, &NumericFactorOptions::default()).expect("factor");
+        assert!(info.factorization_residual_max_abs <= 1e-10);
+        let solution = factor.solve(&rhs).expect("solve");
+        assert!(residual_inf_norm(&dense, &solution, &rhs) <= 1e-9);
+
+        let stats = (
+            factor.inertia(),
+            factor.pivot_stats(),
+            factor.front_count(),
+            factor.max_front_size(),
+            factor.stored_nnz(),
+            factor.factor_bytes(),
+        );
+        if let Some(reference) = &baseline_solution {
+            assert_eq!(baseline_stats, Some(stats));
+            for (actual, expected) in solution.iter().zip(reference.iter()) {
+                assert_abs_diff_eq!(actual, expected, epsilon = 1e-12);
+            }
+        } else {
+            baseline_stats = Some(stats);
+            baseline_solution = Some(solution);
+        }
     }
 }
 

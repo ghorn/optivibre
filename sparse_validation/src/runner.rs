@@ -960,6 +960,63 @@ fn run_robustness_suite() -> Vec<RobustnessCaseResult> {
                 Ok(())
             },
         ),
+        robustness_expect_success(
+            "numeric_factorize_deterministic_saddle_kkt",
+            "spral_ssids::factorize",
+            || {
+                let col_ptrs = vec![0, 3, 7, 10, 13, 15, 16, 17, 18];
+                let row_indices = vec![0, 1, 5, 1, 2, 5, 7, 2, 3, 6, 3, 4, 6, 4, 7, 5, 6, 7];
+                let values = saddle_kkt_values(0.0);
+                let matrix = SymmetricCscMatrix::new(8, &col_ptrs, &row_indices, Some(&values))
+                    .map_err(|error| error.to_string())?;
+                let (symbolic, _) =
+                    analyse(matrix, &SsidsOptions::default()).map_err(|error| error.to_string())?;
+                let rhs_expected = synthetic_expected_solution(8);
+                let rhs = lower_csc_matvec(8, &col_ptrs, &row_indices, &values, &rhs_expected);
+
+                let mut baseline = None;
+                for _ in 0..3 {
+                    let (factor, info) =
+                        factorize(matrix, &symbolic, &NumericFactorOptions::default())
+                            .map_err(|error| error.to_string())?;
+                    let solution = factor.solve(&rhs).map_err(|error| error.to_string())?;
+                    let residual = lower_csc_residual_inf_norm(
+                        8,
+                        &col_ptrs,
+                        &row_indices,
+                        &values,
+                        &solution,
+                        &rhs,
+                    );
+                    if residual > 1e-8 || info.factorization_residual_max_abs > 1e-8 {
+                        return Err(format!(
+                            "deterministic KKT solve residuals exceeded tolerance: factor={:.3e} solve={residual:.3e}",
+                            info.factorization_residual_max_abs
+                        ));
+                    }
+                    let snapshot = (
+                        factor.inertia(),
+                        factor.pivot_stats(),
+                        factor.front_count(),
+                        factor.max_front_size(),
+                        factor.stored_nnz(),
+                        factor.factor_bytes(),
+                        solution,
+                    );
+                    if let Some(reference) = &baseline {
+                        if &snapshot != reference {
+                            return Err(
+                                "repeated KKT factorization changed observable numeric state"
+                                    .into(),
+                            );
+                        }
+                    } else {
+                        baseline = Some(snapshot);
+                    }
+                }
+                Ok(())
+            },
+        ),
     ]
 }
 
@@ -977,6 +1034,77 @@ fn delayed_chain_values(shift: f64) -> Vec<f64> {
         -0.4 + 0.01 * shift,
         1.5 - 0.06 * shift,
     ]
+}
+
+fn saddle_kkt_values(shift: f64) -> Vec<f64> {
+    vec![
+        4.0 + 0.1 * shift,
+        -1.0 + 0.02 * shift,
+        1.0,
+        4.0 - 0.05 * shift,
+        -1.0 + 0.03 * shift,
+        -0.25 + 0.01 * shift,
+        0.5 - 0.02 * shift,
+        3.5 + 0.04 * shift,
+        -0.5 + 0.02 * shift,
+        0.75 - 0.03 * shift,
+        3.25 - 0.06 * shift,
+        -0.75 + 0.01 * shift,
+        -1.0 + 0.04 * shift,
+        2.75 + 0.05 * shift,
+        0.8 - 0.03 * shift,
+        -0.1 - 0.01 * shift,
+        -0.15 - 0.01 * shift,
+        -0.2 - 0.02 * shift,
+    ]
+}
+
+fn synthetic_kkt_values(case: &LoadedCorpusCase, primal_dimension: usize, shift: f64) -> Vec<f64> {
+    let dimension = case.matrix.dimension();
+    let col_ptrs = case.matrix.col_ptrs();
+    let row_indices = case.matrix.row_indices();
+    let mut row_abs_sums = vec![0.0; dimension];
+    let mut values = vec![0.0; row_indices.len()];
+    for col in 0..dimension {
+        let start = col_ptrs[col];
+        let end = col_ptrs[col + 1];
+        for (&row, value_slot) in row_indices[start..end]
+            .iter()
+            .zip(values[start..end].iter_mut())
+        {
+            if row == col {
+                continue;
+            }
+            let primal_primal = row < primal_dimension && col < primal_dimension;
+            let value = if primal_primal {
+                -(0.2 + 0.025 * ((row + col) % 4) as f64) * (1.0 + 0.1 * shift)
+            } else {
+                let coupling_sign = if ((row + col) & 1) == 0 { 1.0 } else { -1.0 };
+                coupling_sign * (0.55 + 0.1 * ((row + 2 * col) % 3) as f64) * (1.0 + 0.05 * shift)
+            };
+            *value_slot = value;
+            row_abs_sums[row] += value.abs();
+            row_abs_sums[col] += value.abs();
+        }
+    }
+    for col in 0..dimension {
+        let start = col_ptrs[col];
+        let end = col_ptrs[col + 1];
+        for (&row, value_slot) in row_indices[start..end]
+            .iter()
+            .zip(values[start..end].iter_mut())
+        {
+            if row == col {
+                *value_slot = if col < primal_dimension {
+                    row_abs_sums[col] + 1.25 + col as f64 * 0.05 + 0.1 * shift
+                } else {
+                    -(0.08 + 0.03 * (col - primal_dimension) as f64) * (1.0 + 0.1 * shift)
+                };
+                break;
+            }
+        }
+    }
+    values
 }
 
 fn robustness_expect_error(
@@ -1077,6 +1205,11 @@ fn synthetic_numeric_values(case: &LoadedCorpusCase) -> Vec<f64> {
             return vec![1e-8, 1.0, 2.0, 0.25, 3.0, -0.5, 2.5, 0.2, 1.75, -0.4, 1.5];
         }
         return vec![1e-4, 1e-4, 1.0, 1e-4, 0.5, 0.0];
+    }
+    match case.metadata.case_id.as_str() {
+        "saddle_kkt_8" => return saddle_kkt_values(0.0),
+        "banded_kkt_12" => return synthetic_kkt_values(case, 8, 0.0),
+        _ => {}
     }
     let dimension = case.matrix.dimension();
     let col_ptrs = case.matrix.col_ptrs();

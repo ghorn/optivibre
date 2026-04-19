@@ -345,6 +345,32 @@ fn generated_specs() -> Vec<CorpusSpec> {
             true,
         ),
         generated_case(
+            "saddle_kkt_8",
+            "Eight-node saddle-point KKT structure with three constraints",
+            vec![
+                CorpusTag::ArrowKkt,
+                CorpusTag::Structural,
+                CorpusTag::TinyExact,
+            ],
+            saddle_kkt_edges(),
+            8,
+            true,
+            true,
+        ),
+        generated_case(
+            "banded_kkt_12",
+            "Twelve-node banded KKT structure with four constraints",
+            vec![
+                CorpusTag::ArrowKkt,
+                CorpusTag::Structural,
+                CorpusTag::TinyExact,
+            ],
+            banded_kkt_edges(),
+            12,
+            true,
+            true,
+        ),
+        generated_case(
             "coupled_indefinite_3",
             "Three-node coupled indefinite panel requiring a 2x2 pivot",
             vec![
@@ -452,6 +478,51 @@ fn banded_edges(size: usize, bandwidth: usize) -> Vec<(usize, usize)> {
 fn arrow_edges(size: usize) -> Vec<(usize, usize)> {
     let hub = size - 1;
     (0..hub).map(|index| (index, hub)).collect()
+}
+
+fn saddle_kkt_edges() -> Vec<(usize, usize)> {
+    vec![
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 4),
+        (0, 5),
+        (1, 5),
+        (2, 6),
+        (3, 6),
+        (1, 7),
+        (4, 7),
+    ]
+}
+
+fn banded_kkt_edges() -> Vec<(usize, usize)> {
+    vec![
+        (0, 1),
+        (0, 2),
+        (1, 2),
+        (1, 3),
+        (2, 3),
+        (2, 4),
+        (3, 4),
+        (3, 5),
+        (4, 5),
+        (4, 6),
+        (5, 6),
+        (5, 7),
+        (6, 7),
+        (0, 8),
+        (1, 8),
+        (2, 8),
+        (2, 9),
+        (3, 9),
+        (4, 9),
+        (4, 10),
+        (5, 10),
+        (6, 10),
+        (1, 11),
+        (6, 11),
+        (7, 11),
+    ]
 }
 
 fn ladder_edges(rungs: usize) -> Vec<(usize, usize)> {
