@@ -158,7 +158,6 @@ fn interior_point_handwritten_problem_leaves_adapter_timing_unavailable() {
         &[0.0, 0.0],
         &[],
         &InteriorPointOptions {
-            filter_method: true,
             verbose: false,
             ..InteriorPointOptions::default()
         },
@@ -182,7 +181,6 @@ fn interior_point_filter_frontier_is_exposed_in_snapshots() {
         &[0.0, 0.0],
         &[],
         &InteriorPointOptions {
-            filter_method: true,
             verbose: false,
             ..InteriorPointOptions::default()
         },
@@ -200,12 +198,11 @@ fn interior_point_filter_frontier_is_exposed_in_snapshots() {
         })
         .collect::<Vec<_>>();
     assert!(!accepted_snapshots.is_empty());
-    assert!(accepted_snapshots.iter().all(|snapshot| {
-        snapshot
-            .filter
-            .as_ref()
-            .is_some_and(|filter| !filter.entries.is_empty())
-    }));
+    assert!(
+        accepted_snapshots
+            .iter()
+            .all(|snapshot| { snapshot.filter.is_some() })
+    );
     assert!(accepted_snapshots.iter().any(|snapshot| {
         snapshot
             .filter
@@ -234,6 +231,29 @@ fn interior_point_summary_serializes_with_duration_seconds() {
     let roundtrip: optimization::InteriorPointSummary =
         serde_json::from_value(json).expect("summary should deserialize");
     assert_eq!(roundtrip.iterations, summary.iterations);
+    assert_eq!(roundtrip.termination, summary.termination);
+    assert_eq!(roundtrip.status_kind, summary.status_kind);
+    assert_eq!(roundtrip.snapshots.len(), summary.snapshots.len());
+}
+
+#[test]
+fn interior_point_summary_exposes_final_and_last_accepted_states() {
+    let summary = solve_ok(
+        &BoundConstrainedQuadraticProblem,
+        &[0.0, 0.0],
+        &[],
+        InteriorPointOptions {
+            verbose: false,
+            ..InteriorPointOptions::default()
+        },
+    );
+
+    assert!(!summary.snapshots.is_empty());
+    assert_eq!(
+        summary.final_state.phase,
+        optimization::InteriorPointIterationPhase::Converged
+    );
+    assert!(summary.last_accepted_state.is_some());
 }
 
 #[test]
@@ -437,7 +457,7 @@ fn interior_point_reports_profiling_breakdown(
 }
 
 #[test]
-fn interior_point_auto_prefers_sparse_qdldl_on_hanging_chain() {
+fn interior_point_auto_uses_sparse_qdldl_on_small_hanging_chain() {
     let problem = build_problem_ok(
         hanging_chain_problem(CallbackBackend::Aot),
         CallbackBackend::Aot,
@@ -455,18 +475,19 @@ fn interior_point_auto_prefers_sparse_qdldl_on_hanging_chain() {
 }
 
 #[test]
-fn interior_point_auto_prefers_dense_ldl_on_small_kkt_system() {
+fn interior_point_auto_uses_sparse_qdldl_on_small_kkt_system() {
     let problem = build_problem_ok(hs021_problem(CallbackBackend::Aot), CallbackBackend::Aot);
     let summary = solve_ok(&problem, &[2.0, 2.0], &[], InteriorPointOptions::default());
     assert_eq!(
         summary.linear_solver,
-        InteriorPointLinearSolver::DenseRegularizedLdl,
+        InteriorPointLinearSolver::SparseQdldl,
     );
 }
 
 #[test]
-fn interior_point_linear_solver_variants_match() {
+fn interior_point_auto_and_sparse_solver_match() {
     let problem = build_problem_ok(hs021_problem(CallbackBackend::Aot), CallbackBackend::Aot);
+    let auto = solve_ok(&problem, &[2.0, 2.0], &[], InteriorPointOptions::default());
     let sparse = solve_ok(
         &problem,
         &[2.0, 2.0],
@@ -476,35 +497,10 @@ fn interior_point_linear_solver_variants_match() {
             ..InteriorPointOptions::default()
         },
     );
-    let dense_ldl = solve_ok(
-        &problem,
-        &[2.0, 2.0],
-        &[],
-        InteriorPointOptions {
-            linear_solver: InteriorPointLinearSolver::DenseRegularizedLdl,
-            ..InteriorPointOptions::default()
-        },
-    );
-    let dense_lu = solve_ok(
-        &problem,
-        &[2.0, 2.0],
-        &[],
-        InteriorPointOptions {
-            linear_solver: InteriorPointLinearSolver::DenseLu,
-            ..InteriorPointOptions::default()
-        },
-    );
 
+    assert_eq!(auto.linear_solver, InteriorPointLinearSolver::SparseQdldl);
     assert_eq!(sparse.linear_solver, InteriorPointLinearSolver::SparseQdldl);
-    assert_eq!(
-        dense_ldl.linear_solver,
-        InteriorPointLinearSolver::DenseRegularizedLdl,
-    );
-    assert_eq!(dense_lu.linear_solver, InteriorPointLinearSolver::DenseLu);
-    assert_abs_diff_eq!(sparse.x[0], dense_ldl.x[0], epsilon = 1e-6);
-    assert_abs_diff_eq!(sparse.x[1], dense_ldl.x[1], epsilon = 1e-6);
-    assert_abs_diff_eq!(sparse.x[0], dense_lu.x[0], epsilon = 1e-6);
-    assert_abs_diff_eq!(sparse.x[1], dense_lu.x[1], epsilon = 1e-6);
-    assert_abs_diff_eq!(sparse.objective, dense_ldl.objective, epsilon = 1e-8);
-    assert_abs_diff_eq!(sparse.objective, dense_lu.objective, epsilon = 1e-8);
+    assert_abs_diff_eq!(auto.x[0], sparse.x[0], epsilon = 1e-6);
+    assert_abs_diff_eq!(auto.x[1], sparse.x[1], epsilon = 1e-6);
+    assert_abs_diff_eq!(auto.objective, sparse.objective, epsilon = 1e-8);
 }

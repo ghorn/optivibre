@@ -15,14 +15,15 @@ use anyhow::{Result, anyhow};
 use optimal_control::{
     Bounds1D, CompiledDirectCollocationOcp, CompiledMultipleShootingOcp, DirectCollocation,
     DirectCollocationRuntimeValues, DirectCollocationTimeGrid, DirectCollocationTrajectories,
-    IntervalArc, MultipleShooting, MultipleShootingRuntimeValues, MultipleShootingTrajectories,
-    Ocp, OcpScaling, direct_collocation_root_arcs, direct_collocation_state_like_arcs,
+    InterpolatedTrajectory, IntervalArc, MultipleShooting, MultipleShootingRuntimeValues,
+    MultipleShootingTrajectories, Ocp, OcpScaling, direct_collocation_root_arcs,
+    direct_collocation_state_like_arcs,
 };
 use serde::Serialize;
 use std::f64::consts::PI;
 use sx_core::SX;
 const RK4_SUBSTEPS: usize = 2;
-const DEFAULT_INTERVALS: usize = 100;
+const DEFAULT_INTERVALS: usize = 50;
 const DEFAULT_COLLOCATION_DEGREE: usize = 3;
 const SUPPORTED_INTERVALS: [usize; 1] = [DEFAULT_INTERVALS];
 const SUPPORTED_DEGREES: [usize; 1] = [DEFAULT_COLLOCATION_DEGREE];
@@ -37,7 +38,6 @@ const REFERENCE_AREA: f64 = 4.0;
 const GLIDER_MASS: f64 = 30.0;
 const SPEED_EPS: f64 = 1.0e-3;
 const INITIAL_ALTITUDE_M: f64 = 1.0;
-const LAUNCH_PATH_SEED_DEG: f64 = 12.0;
 const MIN_FLIGHT_TIME_S: f64 = 1.0;
 const MAX_FLIGHT_TIME_S: f64 = 500.0;
 const GLIDER_OBJECTIVE_SCALE: f64 = 100.0;
@@ -411,16 +411,33 @@ fn glide_ratio_numeric(alpha: f64) -> f64 {
     let cd_value = cd_numeric(alpha);
     cl_value / cd_value.max(1.0e-6)
 }
-fn seed_launch_velocity(params: &Params) -> (f64, f64) {
-    let path = deg_to_rad(LAUNCH_PATH_SEED_DEG);
-    (
-        params.launch_speed_mps * path.cos(),
-        params.launch_speed_mps * path.sin(),
-    )
-}
-
 fn glide_slope_deg(vx: f64, vy: f64) -> f64 {
     rad_to_deg(vy.atan2(vx))
+}
+
+fn smoothstep(s: f64) -> f64 {
+    let t = s.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn finite_difference(values: &[f64], dt: f64) -> Vec<f64> {
+    (0..values.len())
+        .map(|index| {
+            if index == 0 {
+                (values[1] - values[0]) / dt
+            } else if index + 1 == values.len() {
+                (values[index] - values[index - 1]) / dt
+            } else {
+                (values[index + 1] - values[index - 1]) / (2.0 * dt)
+            }
+        })
+        .collect()
+}
+
+fn level_flight_alpha(speed: f64) -> f64 {
+    let dynamic_pressure = 0.5 * AIR_DENSITY * REFERENCE_AREA * speed.max(1.0).powi(2);
+    let required_cl = (GLIDER_MASS * GRAVITY) / dynamic_pressure.max(1.0);
+    (required_cl / CL_SLOPE).clamp(CL_LOWER_BOUND / CL_SLOPE, CL_UPPER_BOUND / CL_SLOPE)
 }
 fn aerodynamic_acceleration_sx(state: &State<SX>, control: &Control<SX>) -> (SX, SX) {
     let speed = (state.vx.sqr() + state.vy.sqr() + SPEED_EPS * SPEED_EPS).sqrt();
@@ -760,25 +777,92 @@ pub(crate) fn problem_entry() -> crate::ProblemEntry {
 fn continuous_guess(
     params: &Params,
 ) -> ContinuousInitialGuess<State<f64>, Control<f64>, ModelParams<f64>> {
-    let trim_alpha = best_glide_alpha().max(0.01);
-    let (vx0, vy0) = seed_launch_velocity(params);
-    ContinuousInitialGuess::Rollout {
-        x0: State {
-            x: 0.0,
-            altitude: INITIAL_ALTITUDE_M,
-            vx: vx0,
-            vy: vy0,
-        },
-        u0: Control {
-            alpha: deg_to_rad(params.initial_alpha_deg),
-        },
-        tf: params
-            .initial_time_guess_s
-            .clamp(params.min_time_bound_s, params.max_time_bound_s),
-        controller: Box::new(move |_, _, u, _| Control {
-            alpha: 1.5 * (trim_alpha - u.alpha),
-        }),
+    let tf = params
+        .initial_time_guess_s
+        .clamp(params.min_time_bound_s, params.max_time_bound_s);
+    let sample_count = 2 * params.transcription.intervals + 1;
+    let dt = tf / (sample_count as f64 - 1.0);
+    let times = (0..sample_count)
+        .map(|index| index as f64 * dt)
+        .collect::<Vec<_>>();
+    let launch_angle = deg_to_rad(2.5);
+    let vx0 = params.launch_speed_mps * launch_angle.cos();
+    let vy0 = params.launch_speed_mps * launch_angle.sin();
+    let touchdown_time = (0.25 * tf).clamp(20.0, 40.0).min(tf);
+    let touchdown_vx = 24.0_f64.min(vx0.max(12.0));
+    let terminal_vx = 8.0;
+    let altitude = times
+        .iter()
+        .map(|time| {
+            if *time >= touchdown_time {
+                0.0
+            } else {
+                let tau = *time / touchdown_time.max(f64::MIN_POSITIVE);
+                let h00 = 2.0 * tau.powi(3) - 3.0 * tau.powi(2) + 1.0;
+                let h10 = tau.powi(3) - 2.0 * tau.powi(2) + tau;
+                let h01 = -2.0 * tau.powi(3) + 3.0 * tau.powi(2);
+                let h11 = tau.powi(3) - tau.powi(2);
+                let height =
+                    h00 * INITIAL_ALTITUDE_M + h10 * touchdown_time * vy0 + h01 * 0.0 + h11 * 0.0;
+                height.max(0.0)
+            }
+        })
+        .collect::<Vec<_>>();
+    let vy = finite_difference(&altitude, dt);
+    let vx = times
+        .iter()
+        .map(|time| {
+            if *time <= touchdown_time {
+                let tau = *time / touchdown_time.max(f64::MIN_POSITIVE);
+                vx0 + (touchdown_vx - vx0) * smoothstep(tau)
+            } else {
+                let tau = (*time - touchdown_time) / (tf - touchdown_time).max(f64::MIN_POSITIVE);
+                touchdown_vx + (terminal_vx - touchdown_vx) * smoothstep(tau)
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut x = vec![0.0; sample_count];
+    for index in 1..sample_count {
+        x[index] = x[index - 1] + 0.5 * dt * (vx[index - 1] + vx[index]);
     }
+    let alpha_values = times
+        .iter()
+        .zip(vx.iter())
+        .map(|(time, vx)| {
+            if *time <= touchdown_time {
+                let tau = *time / touchdown_time.max(f64::MIN_POSITIVE);
+                deg_to_rad(params.initial_alpha_deg)
+                    + (best_glide_alpha() - deg_to_rad(params.initial_alpha_deg)) * smoothstep(tau)
+            } else {
+                level_flight_alpha(*vx)
+            }
+        })
+        .collect::<Vec<_>>();
+    let alpha_rate = finite_difference(&alpha_values, dt);
+    ContinuousInitialGuess::Interpolated(InterpolatedTrajectory {
+        sample_times: times,
+        x_samples: x
+            .iter()
+            .zip(altitude.iter())
+            .zip(vx.iter())
+            .zip(vy.iter())
+            .map(|(((x, altitude), vx), vy)| State {
+                x: *x,
+                altitude: *altitude,
+                vx: *vx,
+                vy: *vy,
+            })
+            .collect(),
+        u_samples: alpha_values
+            .iter()
+            .map(|alpha| Control { alpha: *alpha })
+            .collect(),
+        dudt_samples: alpha_rate
+            .iter()
+            .map(|alpha| Control { alpha: *alpha })
+            .collect(),
+        tf,
+    })
 }
 
 fn runtime_spec(
@@ -1525,7 +1609,6 @@ mod tests {
         );
 
         let mut nlip_options = crate::common::nlip_options(&params.solver);
-        nlip_options.filter_method = false;
         nlip_options.verbose = false;
         nlip_options.max_iters = 4;
         let mut nlip_iterations = Vec::new();
@@ -1533,7 +1616,7 @@ mod tests {
             compiled.solve_interior_point_with_callback(&runtime, &nlip_options, |snapshot| {
                 nlip_iterations.push(snapshot.solver.clone());
             });
-        println!("\n=== glider NLIP filter=off ===");
+        println!("\n=== glider NLIP filter ===");
         for snapshot in &nlip_iterations {
             println!(
                 "iter={} phase={:?} obj={:.3e} eq_inf={:?} ineq_inf={:?} dual_inf={:.3e} step_inf={:?} alpha={:?} ls_it={:?}",
@@ -1555,6 +1638,607 @@ mod tests {
                 .map(|_| ())
                 .map_err(|err| err.to_string())
         );
+    }
+
+    #[test]
+    #[ignore = "manual NLIP-only diagnostics helper"]
+    fn print_current_glider_nlip_failure() {
+        let mut log_lines = Vec::new();
+        let mut params = Params {
+            launch_speed_mps: 30.0,
+            initial_alpha_deg: 6.0,
+            initial_time_guess_s: 140.0,
+            max_alpha_rate_deg_s: 12.0,
+            solver_method: SolverMethod::Nlip,
+            ..Params::default()
+        };
+        params.solver.max_iters = 400;
+        let result = solve_with_progress(&params, |event| match event {
+            crate::common::SolveStreamEvent::Status { status } => {
+                log_lines.push(format!(
+                    "[status {:?}] {}",
+                    status.solver_method, status.solver.status_label
+                ));
+            }
+            crate::common::SolveStreamEvent::Log { line, .. } => log_lines.push(line),
+            crate::common::SolveStreamEvent::Error { message } => {
+                log_lines.push(format!("error: {message}"));
+            }
+            crate::common::SolveStreamEvent::Iteration { progress, .. } => {
+                log_lines.push(format!(
+                    "[iteration {} {:?}] obj={:.3e} eq_inf={:?} ineq_inf={:?} dual_inf={:.3e}",
+                    progress.iteration,
+                    progress.phase,
+                    progress.objective,
+                    progress.eq_inf,
+                    progress.ineq_inf,
+                    progress.dual_inf
+                ));
+            }
+            crate::common::SolveStreamEvent::Final { artifact } => {
+                log_lines.push(format!("[final] {}", artifact.solver.status_label));
+            }
+        });
+        println!("\n=== glider Nlip only ===");
+        for line in &log_lines {
+            println!("{line}");
+        }
+        match &result {
+            Ok(_) => println!("result: Ok(())"),
+            Err(err) => {
+                println!("result: Err({err})");
+                if let Some(optimization::InteriorPointSolveError::LineSearchFailed {
+                    context, ..
+                }) = err.downcast_ref::<optimization::InteriorPointSolveError>()
+                    && let Some(line_search) = &context.failed_line_search
+                {
+                    println!(
+                        "line_search: merit={:.3e} current_barrier_obj={:.3e} current_primal={:.3e} alpha_min={:.3e} rejected={} backtracks={} soc_attempted={} watchdog_active={}",
+                        line_search.current_merit,
+                        line_search.current_barrier_objective,
+                        line_search.current_primal_inf,
+                        line_search.alpha_min,
+                        line_search.rejected_trials.len(),
+                        line_search.backtrack_count,
+                        line_search.second_order_correction_attempted,
+                        line_search.watchdog_active,
+                    );
+                    for (idx, trial) in line_search.rejected_trials.iter().take(8).enumerate() {
+                        println!(
+                            "  reject[{idx}] alpha={:.3e} alpha_du={:?} merit={:?} barrier_obj={:?} primal={:?} dual={:?} comp={:?} filter={:?} dominated={:?} obj_red={:?} viol_red={:?} switch={:?}",
+                            trial.alpha,
+                            trial.alpha_du,
+                            trial.merit,
+                            trial.barrier_objective,
+                            trial.primal_inf,
+                            trial.dual_inf,
+                            trial.comp_inf,
+                            trial.filter_acceptable,
+                            trial.filter_dominated,
+                            trial.filter_sufficient_objective_reduction,
+                            trial.filter_sufficient_violation_reduction,
+                            trial.switching_condition_satisfied,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual NLIP strict-convergence diagnostics helper"]
+    fn print_current_glider_nlip_strict_repro() {
+        let params = Params {
+            launch_speed_mps: 30.0,
+            initial_alpha_deg: 6.0,
+            max_alpha_rate_deg_s: 12.0,
+            solver_method: SolverMethod::Nlip,
+            ..Params::default()
+        };
+        let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
+            .expect("glider direct collocation should compile");
+        let compiled = compiled.compiled.borrow();
+        let strict_runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+        let mut options = crate::common::nlip_options(&params.solver);
+        options.max_iters = 400;
+        options.acceptable_iter = 0;
+        options.verbose = false;
+
+        let mut iterations = Vec::new();
+        let mut last_tf = None;
+        let mut last_x = None;
+        let result =
+            compiled.solve_interior_point_with_callback(&strict_runtime, &options, |snapshot| {
+                let solver = snapshot.solver.clone();
+                last_tf = Some(snapshot.trajectories.tf);
+                last_x = Some(snapshot.trajectories.x.terminal.x);
+                if solver.iteration % 10 == 0 {
+                    println!(
+                        "iter={} phase={:?} obj={:.3e} tf={:.3e} x_T={:.3e} eq_inf={:?} ineq_inf={:?} dual_inf={:.3e} comp_inf={:?} overall={:.3e} alpha={:?} ls_it={:?} step_kind={:?} step_tag={:?}",
+                        solver.iteration,
+                        solver.phase,
+                        solver.objective,
+                        snapshot.trajectories.tf,
+                        snapshot.trajectories.x.terminal.x,
+                        solver.eq_inf,
+                        solver.ineq_inf,
+                        solver.dual_inf,
+                        solver.comp_inf,
+                        solver.overall_inf,
+                        solver.alpha,
+                        solver.line_search_iterations,
+                        solver.step_kind,
+                        solver.step_tag,
+                    );
+                    if let Some(line_search) = &solver.line_search {
+                        println!(
+                            "  line_search alpha_pr={:.3e} alpha_du={:?} accepted={:?} sigma={:.3e} current_merit={:.3e} current_barrier_obj={:.3e} current_primal_inf={:.3e} alpha_min={:.3e} rejected={} soc_attempted={} soc_used={} watchdog_active={} watchdog_accepted={}",
+                            line_search.initial_alpha_pr,
+                            line_search.initial_alpha_du,
+                            line_search.accepted_alpha,
+                            line_search.sigma,
+                            line_search.current_merit,
+                            line_search.current_barrier_objective,
+                            line_search.current_primal_inf,
+                            line_search.alpha_min,
+                            line_search.rejected_trials.len(),
+                            line_search.second_order_correction_attempted,
+                            line_search.second_order_correction_used,
+                            line_search.watchdog_active,
+                            line_search.watchdog_accepted,
+                        );
+                        for (index, trial) in line_search.rejected_trials.iter().enumerate().take(8)
+                        {
+                            println!(
+                                "    reject[{index}] alpha={:.3e} alpha_du={:?} merit={:?} barrier_obj={:?} primal={:?} dual={:?} comp={:?} local_filter={:?} filter={:?} dominated={:?} obj_red={:?} viol_red={:?} switch={:?}",
+                                trial.alpha,
+                                trial.alpha_du,
+                                trial.merit,
+                                trial.barrier_objective,
+                                trial.primal_inf,
+                                trial.dual_inf,
+                                trial.comp_inf,
+                                trial.local_filter_acceptable,
+                                trial.filter_acceptable,
+                                trial.filter_dominated,
+                                trial.filter_sufficient_objective_reduction,
+                                trial.filter_sufficient_violation_reduction,
+                                trial.switching_condition_satisfied,
+                            );
+                        }
+                    }
+                }
+                iterations.push(solver);
+            });
+
+        println!("\n=== glider NLIP strict repro ===");
+        if let Some(last) = iterations.last() {
+            println!(
+                "last iter={} phase={:?} obj={:.3e} tf={:?} x_T={:?} eq_inf={:?} ineq_inf={:?} dual_inf={:.3e} comp_inf={:?} overall={:.3e}",
+                last.iteration,
+                last.phase,
+                last.objective,
+                last_tf,
+                last_x,
+                last.eq_inf,
+                last.ineq_inf,
+                last.dual_inf,
+                last.comp_inf,
+                last.overall_inf,
+            );
+        }
+        if let Err(err) = &result {
+            match err {
+                optimization::InteriorPointSolveError::LineSearchFailed {
+                    merit,
+                    mu,
+                    step_inf_norm,
+                    context,
+                } => {
+                    println!(
+                        "line_search_failure merit={merit:.6e} mu={mu:.6e} step_inf={step_inf_norm:.6e}"
+                    );
+                    if let Some(info) = &context.failed_line_search {
+                        println!(
+                            "  ls current_merit={:.6e} current_barrier_obj={:.6e} current_primal_inf={:.6e} alpha_min={:.6e} rejected={}",
+                            info.current_merit,
+                            info.current_barrier_objective,
+                            info.current_primal_inf,
+                            info.alpha_min,
+                            info.rejected_trials.len(),
+                        );
+                        for (index, trial) in info.rejected_trials.iter().enumerate().take(8) {
+                            println!(
+                                "    reject[{index}] alpha={:.6e} alpha_du={:?} merit={:?} barrier_obj={:?} primal={:?} dual={:?} comp={:?} local_filter={:?} filter={:?} dominated={:?} obj_red={:?} viol_red={:?} switch={:?}",
+                                trial.alpha,
+                                trial.alpha_du,
+                                trial.merit,
+                                trial.barrier_objective,
+                                trial.primal_inf,
+                                trial.dual_inf,
+                                trial.comp_inf,
+                                trial.local_filter_acceptable,
+                                trial.filter_acceptable,
+                                trial.filter_dominated,
+                                trial.filter_sufficient_objective_reduction,
+                                trial.filter_sufficient_violation_reduction,
+                                trial.switching_condition_satisfied,
+                            );
+                        }
+                    }
+                }
+                optimization::InteriorPointSolveError::LinearSolve { context, .. } => {
+                    if let Some(info) = &context.failed_linear_solve {
+                        println!(
+                            "linear_solve_failure preferred={:?} dim={} attempts={}",
+                            info.preferred_solver,
+                            info.matrix_dimension,
+                            info.attempts.len(),
+                        );
+                        for (index, attempt) in info.attempts.iter().enumerate() {
+                            println!(
+                                "  attempt[{index}] solver={:?} reg={:.6e} kind={:?} sol_inf={:?} sol_lim={:?} res_inf={:?} res_lim={:?}",
+                                attempt.solver,
+                                attempt.regularization,
+                                attempt.failure_kind,
+                                attempt.solution_inf,
+                                attempt.solution_inf_limit,
+                                attempt.residual_inf,
+                                attempt.residual_inf_limit,
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        println!(
+            "result: {:?}",
+            result.as_ref().map(|_| ()).map_err(|err| err.to_string())
+        );
+    }
+
+    #[test]
+    #[ignore = "manual NLIP strict-convergence diagnostics helper without watchdog"]
+    fn print_current_glider_nlip_strict_repro_no_watchdog() {
+        let params = Params {
+            launch_speed_mps: 30.0,
+            initial_alpha_deg: 6.0,
+            max_alpha_rate_deg_s: 12.0,
+            solver_method: SolverMethod::Nlip,
+            ..Params::default()
+        };
+        let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
+            .expect("glider direct collocation should compile");
+        let compiled = compiled.compiled.borrow();
+        let strict_runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+        let mut options = crate::common::nlip_options(&params.solver);
+        options.max_iters = 400;
+        options.acceptable_iter = 0;
+        options.watchdog_shortened_iter_trigger = 0;
+        options.watchdog_trial_iter_max = 0;
+        options.verbose = false;
+
+        let mut iterations = Vec::new();
+        let mut last_tf = None;
+        let mut last_x = None;
+        let result =
+            compiled.solve_interior_point_with_callback(&strict_runtime, &options, |snapshot| {
+                let solver = snapshot.solver.clone();
+                last_tf = Some(snapshot.trajectories.tf);
+                last_x = Some(snapshot.trajectories.x.terminal.x);
+                if solver.iteration % 10 == 0 {
+                    println!(
+                        "iter={} phase={:?} obj={:.3e} tf={:.3e} x_T={:.3e} eq_inf={:?} ineq_inf={:?} dual_inf={:.3e} comp_inf={:?} overall={:.3e} alpha={:?} ls_it={:?} step_kind={:?} step_tag={:?}",
+                        solver.iteration,
+                        solver.phase,
+                        solver.objective,
+                        snapshot.trajectories.tf,
+                        snapshot.trajectories.x.terminal.x,
+                        solver.eq_inf,
+                        solver.ineq_inf,
+                        solver.dual_inf,
+                        solver.comp_inf,
+                        solver.overall_inf,
+                        solver.alpha,
+                        solver.line_search_iterations,
+                        solver.step_kind,
+                        solver.step_tag,
+                    );
+                    if let Some(line_search) = &solver.line_search {
+                        println!(
+                            "  line_search alpha_pr={:.3e} alpha_du={:?} accepted={:?} sigma={:.3e} current_merit={:.3e} current_barrier_obj={:.3e} current_primal_inf={:.3e} alpha_min={:.3e} rejected={} soc_attempted={} soc_used={} watchdog_active={} watchdog_accepted={}",
+                            line_search.initial_alpha_pr,
+                            line_search.initial_alpha_du,
+                            line_search.accepted_alpha,
+                            line_search.sigma,
+                            line_search.current_merit,
+                            line_search.current_barrier_objective,
+                            line_search.current_primal_inf,
+                            line_search.alpha_min,
+                            line_search.rejected_trials.len(),
+                            line_search.second_order_correction_attempted,
+                            line_search.second_order_correction_used,
+                            line_search.watchdog_active,
+                            line_search.watchdog_accepted,
+                        );
+                    }
+                }
+                iterations.push(solver);
+            });
+
+        println!("\n=== glider NLIP strict repro (no watchdog) ===");
+        if let Some(last) = iterations.last() {
+            println!(
+                "last iter={} phase={:?} obj={:.3e} tf={:?} x_T={:?} eq_inf={:?} ineq_inf={:?} dual_inf={:.3e} comp_inf={:?} overall={:.3e}",
+                last.iteration,
+                last.phase,
+                last.objective,
+                last_tf,
+                last_x,
+                last.eq_inf,
+                last.ineq_inf,
+                last.dual_inf,
+                last.comp_inf,
+                last.overall_inf,
+            );
+        }
+        if let Err(optimization::InteriorPointSolveError::LinearSolve { context, .. }) = &result
+            && let Some(info) = &context.failed_linear_solve
+        {
+            println!(
+                "linear_solve_failure preferred={:?} dim={} attempts={}",
+                info.preferred_solver,
+                info.matrix_dimension,
+                info.attempts.len(),
+            );
+            for (index, attempt) in info.attempts.iter().enumerate() {
+                println!(
+                    "  attempt[{index}] solver={:?} reg={:.6e} kind={:?} sol_inf={:?} sol_lim={:?} res_inf={:?} res_lim={:?}",
+                    attempt.solver,
+                    attempt.regularization,
+                    attempt.failure_kind,
+                    attempt.solution_inf,
+                    attempt.solution_inf_limit,
+                    attempt.residual_inf,
+                    attempt.residual_inf_limit,
+                );
+            }
+        }
+        println!(
+            "result: {:?}",
+            result.as_ref().map(|_| ()).map_err(|err| err.to_string())
+        );
+    }
+
+    #[test]
+    #[ignore = "manual IPOPT diagnostics helper"]
+    fn print_current_glider_ipopt_repro() {
+        let params = Params {
+            launch_speed_mps: 30.0,
+            initial_alpha_deg: 6.0,
+            max_alpha_rate_deg_s: 12.0,
+            solver_method: SolverMethod::Ipopt,
+            ..Params::default()
+        };
+        let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
+            .expect("glider direct collocation should compile");
+        let compiled = compiled.compiled.borrow();
+        let runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+        let options = crate::common::ipopt_options(&params.solver);
+        let mut last = None;
+        let result = compiled.solve_ipopt_with_callback(&runtime, &options, |snapshot| {
+            if snapshot.solver.iteration % 10 == 0 {
+                println!(
+                    "iter={} phase={:?} obj={:.3e} inf_pr={:.3e} inf_du={:.3e} mu={:.3e} alpha_pr={:.3e} alpha_du={:.3e}",
+                    snapshot.solver.iteration,
+                    snapshot.solver.phase,
+                    snapshot.solver.objective,
+                    snapshot.solver.primal_inf,
+                    snapshot.solver.dual_inf,
+                    snapshot.solver.barrier_parameter,
+                    snapshot.solver.alpha_pr,
+                    snapshot.solver.alpha_du,
+                );
+            }
+            last = Some(snapshot.solver.clone());
+        });
+
+        println!("\n=== glider IPOPT repro ===");
+        if let Some(last) = last {
+            println!(
+                "last iter={} phase={:?} obj={:.3e} inf_pr={:.3e} inf_du={:.3e} mu={:.3e} alpha_pr={:.3e} alpha_du={:.3e}",
+                last.iteration,
+                last.phase,
+                last.objective,
+                last.primal_inf,
+                last.dual_inf,
+                last.barrier_parameter,
+                last.alpha_pr,
+                last.alpha_du,
+            );
+        }
+        println!(
+            "result: {:?}",
+            result.as_ref().map(|_| ()).map_err(|err| err.to_string())
+        );
+    }
+
+    #[test]
+    #[ignore = "manual NLIP strict summary helper without per-iteration callbacks"]
+    fn print_current_glider_nlip_strict_fast() {
+        let params = Params {
+            launch_speed_mps: 30.0,
+            initial_alpha_deg: 6.0,
+            max_alpha_rate_deg_s: 12.0,
+            solver_method: SolverMethod::Nlip,
+            ..Params::default()
+        };
+        let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
+            .expect("glider direct collocation should compile");
+        let compiled = compiled.compiled.borrow();
+        let runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+        let mut options = crate::common::nlip_options(&params.solver);
+        options.max_iters = 400;
+        options.acceptable_iter = 0;
+        options.verbose = false;
+
+        let started = std::time::Instant::now();
+        let result = compiled.solve_interior_point(&runtime, &options);
+        let elapsed = started.elapsed();
+
+        println!("\n=== glider NLIP strict fast ===");
+        match result {
+            Ok(summary) => {
+                println!(
+                    "ok iter={} term={:?} obj={:.6e} eq_inf={:.6e} ineq_inf={:.6e} dual_inf={:.6e} comp_inf={:.6e} overall={:.6e} tf={:.6e} x_T={:.6e} elapsed={:.3?}",
+                    summary.solver.iterations,
+                    summary.solver.termination,
+                    summary.solver.objective,
+                    summary.solver.equality_inf_norm,
+                    summary.solver.inequality_inf_norm,
+                    summary.solver.dual_inf_norm,
+                    summary.solver.complementarity_inf_norm,
+                    summary.solver.overall_inf_norm,
+                    summary.trajectories.tf,
+                    summary.trajectories.x.terminal.x,
+                    elapsed,
+                );
+            }
+            Err(err) => {
+                match &err {
+                    optimization::InteriorPointSolveError::MaxIterations { context, .. } => {
+                        if let Some(state) = context.final_state.as_ref() {
+                            println!(
+                                "max_iters iter={} phase={:?} obj={:.6e} eq_inf={:?} ineq_inf={:?} dual_inf={:.6e} comp_inf={:?} overall={:.6e} step_kind={:?} step_tag={:?}",
+                                state.iteration,
+                                state.phase,
+                                state.objective,
+                                state.eq_inf,
+                                state.ineq_inf,
+                                state.dual_inf,
+                                state.comp_inf,
+                                state.overall_inf,
+                                state.step_kind,
+                                state.step_tag,
+                            );
+                        }
+                        if let Some(last) = context.last_accepted_state.as_ref() {
+                            println!(
+                                "last_accepted iter={} phase={:?} obj={:.6e} eq_inf={:?} ineq_inf={:?} dual_inf={:.6e} comp_inf={:?} overall={:.6e} step_kind={:?} step_tag={:?}",
+                                last.iteration,
+                                last.phase,
+                                last.objective,
+                                last.eq_inf,
+                                last.ineq_inf,
+                                last.dual_inf,
+                                last.comp_inf,
+                                last.overall_inf,
+                                last.step_kind,
+                                last.step_tag,
+                            );
+                        }
+                        if let Some(line_search) = context.failed_line_search.as_ref() {
+                            println!(
+                                "failed_line_search merit={:.6e} barrier_obj={:.6e} primal={:.6e} alpha_min={:.6e} rejected={} watchdog_active={} watchdog_accepted={} tiny_step={}",
+                                line_search.current_merit,
+                                line_search.current_barrier_objective,
+                                line_search.current_primal_inf,
+                                line_search.alpha_min,
+                                line_search.rejected_trials.len(),
+                                line_search.watchdog_active,
+                                line_search.watchdog_accepted,
+                                line_search.tiny_step,
+                            );
+                        }
+                        if let Some(direction) = context.failed_direction_diagnostics.as_ref() {
+                            println!(
+                                "failed_direction dx_inf={:.6e} dlambda_inf={:.6e} ds_inf={:.6e} dz_inf={:.6e} alpha_pr_limiter={:?} alpha_du_limiter={:?}",
+                                direction.dx_inf,
+                                direction.d_lambda_inf,
+                                direction.ds_inf,
+                                direction.dz_inf,
+                                direction.alpha_pr_limiter,
+                                direction.alpha_du_limiter,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+                println!("err={err}");
+                println!("elapsed={elapsed:.3?}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual NLIP strict summary helper without watchdog or per-iteration callbacks"]
+    fn print_current_glider_nlip_strict_fast_no_watchdog() {
+        let params = Params {
+            launch_speed_mps: 30.0,
+            initial_alpha_deg: 6.0,
+            max_alpha_rate_deg_s: 12.0,
+            solver_method: SolverMethod::Nlip,
+            ..Params::default()
+        };
+        let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
+            .expect("glider direct collocation should compile");
+        let compiled = compiled.compiled.borrow();
+        let runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+        let mut options = crate::common::nlip_options(&params.solver);
+        options.max_iters = 400;
+        options.acceptable_iter = 0;
+        options.watchdog_shortened_iter_trigger = 0;
+        options.watchdog_trial_iter_max = 0;
+        options.verbose = false;
+
+        let started = std::time::Instant::now();
+        let result = compiled.solve_interior_point(&runtime, &options);
+        let elapsed = started.elapsed();
+
+        println!("\n=== glider NLIP strict fast (no watchdog) ===");
+        match result {
+            Ok(summary) => {
+                println!(
+                    "ok iter={} term={:?} obj={:.6e} eq_inf={:.6e} ineq_inf={:.6e} dual_inf={:.6e} comp_inf={:.6e} overall={:.6e} tf={:.6e} x_T={:.6e} elapsed={:.3?}",
+                    summary.solver.iterations,
+                    summary.solver.termination,
+                    summary.solver.objective,
+                    summary.solver.equality_inf_norm,
+                    summary.solver.inequality_inf_norm,
+                    summary.solver.dual_inf_norm,
+                    summary.solver.complementarity_inf_norm,
+                    summary.solver.overall_inf_norm,
+                    summary.trajectories.tf,
+                    summary.trajectories.x.terminal.x,
+                    elapsed,
+                );
+            }
+            Err(err) => {
+                match &err {
+                    optimization::InteriorPointSolveError::MaxIterations { context, .. } => {
+                        if let Some(state) = context.final_state.as_ref() {
+                            println!(
+                                "max_iters iter={} phase={:?} obj={:.6e} eq_inf={:?} ineq_inf={:?} dual_inf={:.6e} comp_inf={:?} overall={:.6e} step_kind={:?} step_tag={:?}",
+                                state.iteration,
+                                state.phase,
+                                state.objective,
+                                state.eq_inf,
+                                state.ineq_inf,
+                                state.dual_inf,
+                                state.comp_inf,
+                                state.overall_inf,
+                                state.step_kind,
+                                state.step_tag,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+                println!("err={err}");
+                println!("elapsed={elapsed:.3?}");
+            }
+        }
     }
 
     #[test]

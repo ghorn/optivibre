@@ -774,6 +774,14 @@ fn fmt_sqp_step_kind(kind: Option<optimization::SqpStepKind>) -> &'static str {
     }
 }
 
+fn fmt_nlip_step_kind(kind: Option<optimization::InteriorPointStepKind>) -> &'static str {
+    match kind {
+        Some(optimization::InteriorPointStepKind::Objective) => "f-step",
+        Some(optimization::InteriorPointStepKind::Feasibility) => "h-step",
+        None => "--",
+    }
+}
+
 fn fmt_sqp_globalization(kind: optimization::SqpGlobalizationKind) -> &'static str {
     kind.label()
 }
@@ -1224,7 +1232,7 @@ fn append_nlip_snapshot_lines(
 ) {
     lines.push(format!("{heading}:"));
     lines.push(format!(
-        "  iter={} phase={} obj={} eq_inf={} ineq_inf={} dual_inf={} comp_inf={} mu={} step_inf={} alpha={} ls_it={}",
+        "  iter={} phase={} obj={} eq_inf={} ineq_inf={} dual_inf={} comp_inf={} mu={} step_inf={} alpha={} ls_it={} step_kind={} step_tag={} watchdog_active={} linear_solver={}",
         snapshot.iteration,
         fmt_nlip_phase(snapshot.phase),
         fmt_diag_sci(snapshot.objective),
@@ -1238,7 +1246,20 @@ fn append_nlip_snapshot_lines(
         snapshot
             .line_search_iterations
             .map_or_else(|| "--".to_string(), |value| value.to_string()),
+        fmt_nlip_step_kind(snapshot.step_kind),
+        snapshot
+            .step_tag
+            .map(|tag| tag.to_string())
+            .unwrap_or_else(|| "--".to_string()),
+        snapshot.watchdog_active,
+        snapshot.linear_solver.label(),
     ));
+    if !snapshot.events.is_empty() {
+        lines.push(format!(
+            "  events={}",
+            optimization::nlip_event_codes_for_events(&snapshot.events),
+        ));
+    }
     if let Some(filter) = &snapshot.filter {
         lines.push(format!(
             "  filter current_obj={} current_violation={} frontier_entries={} accepted_mode={}",
@@ -1251,13 +1272,19 @@ fn append_nlip_snapshot_lines(
     }
     if let Some(line_search) = &snapshot.line_search {
         lines.push(format!(
-            "  accepted line search alpha={} alpha_pr={} alpha_du={} sigma={} ls_it={} filter_mode={} rejected={}",
+            "  accepted line search alpha={} alpha_pr={} alpha_du={} sigma={} ls_it={} filter_mode={} step_kind={} soc={} soc_attempted={} watchdog_active={} watchdog_accepted={} tiny_step={} rejected={}",
             fmt_diag_opt_sci(line_search.accepted_alpha),
             fmt_diag_sci(line_search.initial_alpha_pr),
-            fmt_diag_sci(line_search.initial_alpha_du),
+            fmt_diag_opt_sci(line_search.initial_alpha_du),
             fmt_diag_sci(line_search.sigma),
             line_search.backtrack_count,
             fmt_filter_mode(line_search.filter_acceptance_mode),
+            fmt_nlip_step_kind(line_search.step_kind),
+            line_search.second_order_correction_used,
+            line_search.second_order_correction_attempted,
+            line_search.watchdog_active,
+            line_search.watchdog_accepted,
+            line_search.tiny_step,
             line_search.rejected_trials.len(),
         ));
     }
@@ -1271,24 +1298,19 @@ fn append_nlip_line_search_failure_lines(
     error: &InteriorPointSolveError,
     info: &optimization::InteriorPointLineSearchInfo,
 ) {
-    let (merit, mu, step_inf_norm) = match error {
-        InteriorPointSolveError::LineSearchFailed {
-            merit,
-            mu,
-            step_inf_norm,
-            ..
-        } => (*merit, *mu, *step_inf_norm),
-        _ => return,
+    let InteriorPointSolveError::LineSearchFailed {
+        merit,
+        mu,
+        step_inf_norm,
+        ..
+    } = error
+    else {
+        return;
     };
     let positivity_rejects = info
         .rejected_trials
         .iter()
         .filter(|trial| !trial.slack_positive || !trial.multipliers_positive)
-        .count();
-    let residual_rejects = info
-        .rejected_trials
-        .iter()
-        .filter(|trial| trial.residual_acceptable == Some(false))
         .count();
     let filter_rejects = info
         .rejected_trials
@@ -1297,34 +1319,47 @@ fn append_nlip_line_search_failure_lines(
         .count();
     lines.push("line search failure:".to_string());
     lines.push(format!(
-        "  merit={} mu={} step_inf={} alpha_pr={} alpha_du={} last_alpha={} sigma={} rejected={} positivity_rejects={} residual_rejects={} filter_rejects={} filter_mode={}",
-        fmt_diag_sci(merit),
-        fmt_diag_sci(mu),
-        fmt_diag_sci(step_inf_norm),
+        "  merit={} mu={} step_inf={} alpha_pr={} alpha_du={} last_alpha={} sigma={} rejected={} positivity_rejects={} filter_rejects={} filter_mode={} soc={} soc_attempted={} watchdog_active={} watchdog_accepted={} tiny_step={}",
+        fmt_diag_sci(*merit),
+        fmt_diag_sci(*mu),
+        fmt_diag_sci(*step_inf_norm),
         fmt_diag_sci(info.initial_alpha_pr),
-        fmt_diag_sci(info.initial_alpha_du),
+        fmt_diag_opt_sci(info.initial_alpha_du),
         fmt_diag_sci(info.last_tried_alpha),
         fmt_diag_sci(info.sigma),
         info.rejected_trials.len(),
         positivity_rejects,
-        residual_rejects,
         filter_rejects,
         fmt_filter_mode(info.filter_acceptance_mode),
+        info.second_order_correction_used,
+        info.second_order_correction_attempted,
+        info.watchdog_active,
+        info.watchdog_accepted,
+        info.tiny_step,
     ));
+    let InteriorPointSolveError::LineSearchFailed { context, .. } = error else {
+        return;
+    };
+    if let Some(snapshot) = &context.final_state
+        && !snapshot.events.is_empty()
+    {
+        lines.push(format!(
+            "  events={}",
+            optimization::nlip_event_codes_for_events(&snapshot.events),
+        ));
+    }
     lines.push(format!(
         "  current_merit={} current_barrier_obj={} current_primal_inf={}",
         fmt_diag_sci(info.current_merit),
         fmt_diag_sci(info.current_barrier_objective),
         fmt_diag_sci(info.current_primal_inf),
     ));
-    if let InteriorPointSolveError::LineSearchFailed { context, .. } = error {
-        if let Some(diagnostics) = &context.failed_direction_diagnostics {
-            append_nlip_direction_diagnostics_lines(lines, diagnostics);
-        }
+    if let Some(diagnostics) = &context.failed_direction_diagnostics {
+        append_nlip_direction_diagnostics_lines(lines, diagnostics);
     }
     for trial in &info.rejected_trials {
         lines.push(format!(
-            "  reject alpha={} slack_positive={} multipliers_positive={} merit={} barrier_obj={} primal={} dual={} comp={} mu={} residual={} local_filter={} filter_ok={} filter_dom={} filter_obj={} filter_violation={}",
+            "  reject alpha={} slack_positive={} multipliers_positive={} merit={} barrier_obj={} primal={} dual={} comp={} mu={} local_filter={} filter_ok={} filter_dom={} filter_obj={} filter_violation={}",
             fmt_diag_sci(trial.alpha),
             trial.slack_positive,
             trial.multipliers_positive,
@@ -1334,12 +1369,36 @@ fn append_nlip_line_search_failure_lines(
             fmt_diag_opt_sci(trial.dual_inf),
             fmt_diag_opt_sci(trial.comp_inf),
             fmt_diag_opt_sci(trial.mu),
-            fmt_diag_opt_bool(trial.residual_acceptable),
             fmt_diag_opt_bool(trial.local_filter_acceptable),
             fmt_diag_opt_bool(trial.filter_acceptable),
             fmt_diag_opt_bool(trial.filter_dominated),
             fmt_diag_opt_bool(trial.filter_sufficient_objective_reduction),
             fmt_diag_opt_bool(trial.filter_sufficient_violation_reduction),
+        ));
+    }
+}
+
+fn append_nlip_linear_solve_failure_lines(
+    lines: &mut Vec<String>,
+    diagnostics: &optimization::InteriorPointLinearSolveDiagnostics,
+) {
+    lines.push("linear solve failure:".to_string());
+    lines.push(format!(
+        "  preferred_solver={} matrix_dim={} attempts={}",
+        diagnostics.preferred_solver.label(),
+        diagnostics.matrix_dimension,
+        diagnostics.attempts.len(),
+    ));
+    for attempt in &diagnostics.attempts {
+        lines.push(format!(
+            "  attempt solver={} regularization={} failure={} solution_inf={} solution_limit={} residual_inf={} residual_limit={}",
+            attempt.solver.label(),
+            fmt_diag_sci(attempt.regularization),
+            attempt.failure_kind.label(),
+            fmt_diag_opt_sci(attempt.solution_inf),
+            fmt_diag_opt_sci(attempt.solution_inf_limit),
+            fmt_diag_opt_sci(attempt.residual_inf),
+            fmt_diag_opt_sci(attempt.residual_inf_limit),
         ));
     }
 }
@@ -1370,6 +1429,9 @@ fn nlip_failure_diagnostic_lines(error: &InteriorPointSolveError) -> Vec<String>
     }
     if let Some(snapshot) = &context.last_accepted_state {
         append_nlip_snapshot_lines(&mut lines, "last accepted iterate", snapshot);
+    }
+    if let Some(diagnostics) = &context.failed_linear_solve {
+        append_nlip_linear_solve_failure_lines(&mut lines, diagnostics);
     }
     if let Some(info) = &context.failed_line_search {
         append_nlip_line_search_failure_lines(&mut lines, error, info);
@@ -2089,6 +2151,7 @@ type Numeric<T> = <T as Vectorize<SX>>::Rebind<f64>;
 
 pub enum ContinuousInitialGuess<X, U, P> {
     Interpolated(InterpolatedTrajectory<X, U>),
+    #[allow(dead_code)]
     Rollout {
         x0: X,
         u0: U,
@@ -3398,7 +3461,7 @@ pub fn default_sqp_config() -> SqpConfig {
 }
 
 pub fn default_solver_method() -> SolverMethod {
-    SolverMethod::Sqp
+    SolverMethod::Nlip
 }
 
 fn sqp_globalization_mode(config: &SqpConfig) -> SqpGlobalizationMode {
@@ -4152,7 +4215,10 @@ pub fn solver_controls(default_method: SolverMethod, default: SqpConfig) -> Vec<
 }
 
 fn solver_method_choices() -> Vec<(f64, &'static str)> {
+    #[cfg(feature = "ipopt")]
     let mut out = vec![(0.0, "SQP"), (1.0, "NLIP")];
+    #[cfg(not(feature = "ipopt"))]
+    let out = vec![(0.0, "SQP"), (1.0, "NLIP")];
     #[cfg(feature = "ipopt")]
     out.push((2.0, "IPOPT"));
     out
@@ -5054,11 +5120,21 @@ pub fn sqp_options(config: &SqpConfig) -> ClarabelSqpOptions {
 }
 
 pub fn nlip_options(config: &SqpConfig) -> InteriorPointOptions {
+    let tol = config
+        .dual_tol
+        .min(config.constraint_tol)
+        .min(config.complementarity_tol);
     InteriorPointOptions {
         max_iters: config.max_iters,
         dual_tol: config.dual_tol,
         constraint_tol: config.constraint_tol,
         complementarity_tol: config.complementarity_tol,
+        acceptable_tol: tol,
+        acceptable_iter: 0,
+        acceptable_dual_inf_tol: config.dual_tol,
+        acceptable_constr_viol_tol: config.constraint_tol,
+        acceptable_compl_inf_tol: config.complementarity_tol,
+        acceptable_obj_change_tol: 1e20,
         ..InteriorPointOptions::default()
     }
 }
@@ -6013,15 +6089,21 @@ where
     }
 
     fn nlp_compile_stats(&self) -> NlpCompileStats {
-        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::nlp_compile_stats(self)
+        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::nlp_compile_stats(
+            self,
+        )
     }
 
     fn helper_compile_stats(&self) -> OcpHelperCompileStats {
-        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::helper_compile_stats(self)
+        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::helper_compile_stats(
+            self,
+        )
     }
 
     fn helper_kernel_count(&self) -> usize {
-        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::helper_kernel_count(self)
+        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::helper_kernel_count(
+            self,
+        )
     }
 
     fn backend_compile_report(&self) -> &BackendCompileReport {
@@ -7891,8 +7973,20 @@ pub fn sqp_status_kind(summary: &ClarabelSqpSummary) -> SolverStatusKind {
     }
 }
 
-pub fn nlip_termination_label(_: &InteriorPointSummary) -> String {
-    "Converged".to_string()
+pub fn nlip_termination_label(summary: &InteriorPointSummary) -> String {
+    match summary.termination {
+        optimization::InteriorPointTermination::Converged => "Converged".to_string(),
+        optimization::InteriorPointTermination::Acceptable => {
+            "Converged to acceptable level".to_string()
+        }
+    }
+}
+
+pub fn nlip_status_kind(summary: &InteriorPointSummary) -> SolverStatusKind {
+    match summary.status_kind {
+        optimization::InteriorPointStatusKind::Success => SolverStatusKind::Success,
+        optimization::InteriorPointStatusKind::Warning => SolverStatusKind::Warning,
+    }
 }
 
 #[cfg(feature = "ipopt")]
@@ -7945,8 +8039,8 @@ pub fn nlip_solver_report(
 ) -> SolverReport {
     SolverReport {
         completed: true,
-        status_label: "Converged".to_string(),
-        status_kind: SolverStatusKind::Success,
+        status_label: nlip_termination_label(summary),
+        status_kind: nlip_status_kind(summary),
         iterations: Some(summary.iterations),
         symbolic_setup_s: symbolic_setup_seconds(summary.profiling.backend_timing),
         jit_s: duration_seconds(summary.profiling.backend_timing.jit_time),
@@ -9164,6 +9258,7 @@ mod tests {
             context: Box::new(optimization::InteriorPointFailureContext {
                 final_state: None,
                 last_accepted_state: None,
+                failed_linear_solve: None,
                 failed_line_search: None,
                 failed_direction_diagnostics: None,
                 profiling,

@@ -38,9 +38,13 @@ pub use interior_point::{
     InteriorPointBoundaryLimiter, InteriorPointDirectionDiagnostics, InteriorPointFailureContext,
     InteriorPointIterationEvent, InteriorPointIterationPhase, InteriorPointIterationSnapshot,
     InteriorPointIterationTiming, InteriorPointLineSearchInfo, InteriorPointLineSearchTrial,
-    InteriorPointLinearSolver, InteriorPointOptions, InteriorPointProfiling,
-    InteriorPointSolveError, InteriorPointSummary, format_nlip_settings_summary, nlip_event_codes,
-    nlip_event_legend_entries, solve_nlp_interior_point, solve_nlp_interior_point_with_callback,
+    InteriorPointLinearSolveAttempt, InteriorPointLinearSolveDiagnostics,
+    InteriorPointLinearSolveFailureKind, InteriorPointLinearSolver, InteriorPointOptions,
+    InteriorPointProfiling, InteriorPointSolveError, InteriorPointStatusKind,
+    InteriorPointStepKind, InteriorPointSummary, InteriorPointTermination,
+    format_nlip_settings_summary, nlip_event_codes, nlip_event_codes_for_events,
+    nlip_event_legend_entries, nlip_event_legend_entries_for_events, solve_nlp_interior_point,
+    solve_nlp_interior_point_with_callback,
 };
 #[cfg(feature = "ipopt")]
 pub use ipopt::SolveStatus as IpoptSolveStatus;
@@ -2031,7 +2035,7 @@ fn should_include_soc_inequality_row(
             && trial_value >= -soc_active_slack_tolerance(constraint_tol))
 }
 
-fn second_order_correction_step(
+pub(crate) fn second_order_correction_step(
     equality_jacobian: &DMatrix<f64>,
     inequality_jacobian: &DMatrix<f64>,
     trial_equality_values: &[f64],
@@ -2284,10 +2288,9 @@ fn sqp_filter_parameters(options: &ClarabelSqpOptions, theta_max: f64) -> filter
         _ => panic!("filter settings required"),
     };
     filter::FilterParameters {
-        gamma_objective: filter.gamma_objective,
-        gamma_violation: filter.gamma_violation,
-        armijo_c1: filter.armijo_c1,
-        violation_tol: options.constraint_tol,
+        gamma_phi: filter.gamma_objective,
+        gamma_theta: filter.gamma_violation,
+        eta_phi: filter.armijo_c1,
         theta_max,
     }
 }
@@ -2919,6 +2922,7 @@ where
                 alpha,
                 objective_directional_derivative,
                 switching_condition_satisfied,
+                switching_condition_satisfied,
                 sqp_filter_parameters(options, filter_theta_max),
             )
         });
@@ -3068,6 +3072,7 @@ where
                         &filter::entry(corrected_eval.objective, corrected_eval.primal_inf),
                         alpha,
                         objective_directional_derivative,
+                        switching_condition_satisfied,
                         switching_condition_satisfied,
                         sqp_filter_parameters(options, filter_theta_max),
                     )
@@ -3428,6 +3433,7 @@ where
                 1.0,
                 objective_directional_derivative,
                 switching_condition_satisfied,
+                switching_condition_satisfied,
                 sqp_filter_parameters(options, filter_theta_max),
             )
         });
@@ -3722,6 +3728,7 @@ where
                 &filter::entry(trial_eval.objective, trial_eval.primal_inf),
                 1.0,
                 restoration_objective_directional_derivative,
+                restoration_switching_condition,
                 restoration_switching_condition,
                 sqp_filter_parameters(options, filter_theta_max),
             )
@@ -4110,6 +4117,7 @@ struct SqpEventLegendState {
     hessian_shift: bool,
     line_search: bool,
     filter: bool,
+    filter_reset: bool,
     soc_attempted: bool,
     elastic_attempted: bool,
     qp: bool,
@@ -4118,7 +4126,12 @@ struct SqpEventLegendState {
     wolfe: bool,
     armijo_adjust: bool,
     soc: bool,
-    ip_linear_fallback: bool,
+    watchdog_armed: bool,
+    watchdog: bool,
+    bound_multiplier_safeguard: bool,
+    barrier_update: bool,
+    adaptive_regularization: bool,
+    tiny_step: bool,
 }
 
 impl SqpEventLegendState {
@@ -4142,6 +4155,10 @@ impl SqpEventLegendState {
 
     fn mark_filter_if_new(&mut self) -> bool {
         Self::mark_new(&mut self.filter)
+    }
+
+    fn mark_filter_reset_if_new(&mut self) -> bool {
+        Self::mark_new(&mut self.filter_reset)
     }
 
     fn mark_soc_attempted_if_new(&mut self) -> bool {
@@ -4176,8 +4193,28 @@ impl SqpEventLegendState {
         Self::mark_new(&mut self.soc)
     }
 
-    fn mark_ip_linear_fallback_if_new(&mut self) -> bool {
-        Self::mark_new(&mut self.ip_linear_fallback)
+    fn mark_watchdog_armed_if_new(&mut self) -> bool {
+        Self::mark_new(&mut self.watchdog_armed)
+    }
+
+    fn mark_watchdog_if_new(&mut self) -> bool {
+        Self::mark_new(&mut self.watchdog)
+    }
+
+    fn mark_bound_multiplier_safeguard_if_new(&mut self) -> bool {
+        Self::mark_new(&mut self.bound_multiplier_safeguard)
+    }
+
+    fn mark_barrier_update_if_new(&mut self) -> bool {
+        Self::mark_new(&mut self.barrier_update)
+    }
+
+    fn mark_adaptive_regularization_if_new(&mut self) -> bool {
+        Self::mark_new(&mut self.adaptive_regularization)
+    }
+
+    fn mark_tiny_step_if_new(&mut self) -> bool {
+        Self::mark_new(&mut self.tiny_step)
     }
 }
 
@@ -4497,26 +4534,21 @@ where
 }
 
 fn visible_len(text: &str) -> usize {
-    let bytes = text.as_bytes();
-    let mut idx = 0;
+    let mut chars = text.chars().peekable();
     let mut len = 0;
-    while idx < bytes.len() {
-        if bytes[idx] == b'\x1b' {
-            idx += 1;
-            if idx < bytes.len() && bytes[idx] == b'[' {
-                idx += 1;
-                while idx < bytes.len() {
-                    let byte = bytes[idx];
-                    idx += 1;
-                    if ('@'..='~').contains(&(byte as char)) {
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if matches!(chars.peek(), Some('[')) {
+                chars.next();
+                while let Some(control) = chars.next() {
+                    if ('@'..='~').contains(&control) {
                         break;
                     }
                 }
             }
-        } else {
-            len += 1;
-            idx += 1;
+            continue;
         }
+        len += 1;
     }
     len
 }
@@ -4529,9 +4561,9 @@ fn log_boxed_section(title: &str, lines: &[String], title_style: fn(&str) -> Str
     let width = lines
         .iter()
         .map(|line| visible_len(line))
-        .chain(std::iter::once(title.len()))
+        .chain(std::iter::once(visible_len(title)))
         .max()
-        .unwrap_or(title.len());
+        .unwrap_or_else(|| visible_len(title));
     let border = format!("+{}+", "-".repeat(width + 2));
     eprintln!();
     eprintln!("{border}");
@@ -4543,6 +4575,17 @@ fn log_boxed_section(title: &str, lines: &[String], title_style: fn(&str) -> Str
         eprintln!("| {line}{padding} |");
     }
     eprintln!("{border}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::visible_len;
+
+    #[test]
+    fn visible_len_ignores_ansi_and_counts_unicode_chars() {
+        let styled = "\u{1b}[1m‖ineq₊‖∞=1.70e-08\u{1b}[0m";
+        assert_eq!(visible_len(styled), "‖ineq₊‖∞=1.70e-08".chars().count());
+    }
 }
 
 fn log_sqp_status_summary(summary: &ClarabelSqpSummary, options: &ClarabelSqpOptions) {
