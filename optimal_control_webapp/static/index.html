@@ -82,7 +82,17 @@
               </div>
             </div>
             <div class="solve-console">
-              <div class="console-label">Console</div>
+              <div class="console-toolbar">
+                <div class="console-label">Console</div>
+                <button
+                  id="copy-console-button"
+                  type="button"
+                  class="mini-button console-copy-button"
+                  disabled
+                >
+                  Copy to Clipboard
+                </button>
+              </div>
               <pre id="solver-log" class="solver-log"></pre>
               <div class="console-label">Compile Cache</div>
               <div id="prewarm-status" class="prewarm-status"></div>

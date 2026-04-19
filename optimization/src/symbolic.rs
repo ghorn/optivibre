@@ -1974,6 +1974,18 @@ impl AppliedNlpScaling {
             complementarity_inf_norm: summary.complementarity_inf_norm,
             overall_inf_norm: summary.overall_inf_norm,
             barrier_parameter: summary.barrier_parameter,
+            termination: summary.termination,
+            status_kind: summary.status_kind,
+            snapshots: summary
+                .snapshots
+                .iter()
+                .map(|snapshot| self.transform_interior_point_snapshot(snapshot))
+                .collect(),
+            final_state: self.transform_interior_point_snapshot(&summary.final_state),
+            last_accepted_state: summary
+                .last_accepted_state
+                .as_ref()
+                .map(|snapshot| self.transform_interior_point_snapshot(snapshot)),
             profiling: summary.profiling.clone(),
             linear_solver: summary.linear_solver,
         }

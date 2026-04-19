@@ -901,6 +901,7 @@ fn nlip_filter_replay_from_snapshots(
             let phase = match snapshot.phase {
                 optimization::InteriorPointIterationPhase::Initial => "initial",
                 optimization::InteriorPointIterationPhase::AcceptedStep => "accepted_step",
+                optimization::InteriorPointIterationPhase::Restoration => "restoration",
                 optimization::InteriorPointIterationPhase::Converged => "converged",
             };
             Some(FilterReplayFrame {
@@ -918,7 +919,22 @@ fn nlip_filter_replay_from_snapshots(
                         objective: entry.objective,
                     })
                     .collect(),
-                rejected_trials: Vec::new(),
+                rejected_trials: snapshot
+                    .line_search
+                    .as_ref()
+                    .map(|line_search| {
+                        line_search
+                            .rejected_trials
+                            .iter()
+                            .filter_map(|trial| {
+                                Some(FilterReplayPoint {
+                                    violation: trial.primal_inf?,
+                                    objective: trial.barrier_objective.or(trial.objective)?,
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 accepted_mode: filter.accepted_mode.map(filter_acceptance_mode_label),
             })
         })
@@ -995,14 +1011,36 @@ fn metrics_from_nlip_summary(summary: &InteriorPointSummary) -> SolverMetrics {
 }
 
 fn metrics_from_ip_error(error: &InteriorPointSolveError) -> SolverMetrics {
-    match error {
-        InteriorPointSolveError::MaxIterations { iterations, .. } => SolverMetrics {
-            iterations: Some(*iterations),
-            ..SolverMetrics::default()
-        },
-        InteriorPointSolveError::InvalidInput(_)
-        | InteriorPointSolveError::LinearSolve { .. }
-        | InteriorPointSolveError::LineSearchFailed { .. } => SolverMetrics::default(),
+    let context = match error {
+        InteriorPointSolveError::InvalidInput(_) => return SolverMetrics::default(),
+        InteriorPointSolveError::LinearSolve { context, .. }
+        | InteriorPointSolveError::LineSearchFailed { context, .. }
+        | InteriorPointSolveError::RestorationFailed { context, .. }
+        | InteriorPointSolveError::MaxIterations { context, .. } => context.as_ref(),
+    };
+    let snapshot = context
+        .final_state
+        .as_ref()
+        .or(context.last_accepted_state.as_ref());
+    let iterations = snapshot.map(|state| state.iteration).or(match error {
+        InteriorPointSolveError::MaxIterations { iterations, .. } => Some(*iterations),
+        _ => None,
+    });
+    SolverMetrics {
+        iterations,
+        objective: snapshot.map(|state| state.objective),
+        equality_inf: snapshot.and_then(|state| state.eq_inf),
+        inequality_inf: snapshot.and_then(|state| state.ineq_inf),
+        primal_inf: snapshot.map(|state| {
+            state
+                .eq_inf
+                .into_iter()
+                .chain(state.ineq_inf)
+                .fold(0.0_f64, f64::max)
+        }),
+        dual_inf: snapshot.map(|state| state.dual_inf),
+        complementarity_inf: snapshot.and_then(|state| state.comp_inf),
+        ..SolverMetrics::default()
     }
 }
 
@@ -1380,7 +1418,7 @@ fn render_nlip_transcript(
     let mut out = render_problem_header(record);
     out.push_str("solver_log\n\n");
     let header = format!(
-        "{:>4}  {:<7}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>7}  {:>5}  {:>8}  {:>8}  {:>5}",
+        "{:>4}  {:<7}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>8}  {:>8}  {:>4}  {:>5}  {:>8}  {:>8}  {:>5}",
         "iter",
         "phase",
         "f",
@@ -1389,15 +1427,17 @@ fn render_nlip_transcript(
         "dual_inf",
         "comp_inf",
         "mu",
-        "alpha",
+        "alpha_pr",
+        "alpha_du",
+        "tag",
         "ls",
         "linear",
         "lin_t",
         "evt"
     );
     let legend_prefix = format!(
-        "{:>4}  {:<7}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>7}  {:>5}  {:>8}  {:>8}  {:>5}",
-        "", "", "", "", "", "", "", "", "", "", "", "", ""
+        "{:>4}  {:<7}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>8}  {:>8}  {:>4}  {:>5}  {:>8}  {:>8}  {:>5}",
+        "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""
     );
     let mut seen_event_codes = HashSet::new();
     write_repeated_header(&mut out, &header);
@@ -1409,6 +1449,7 @@ fn render_nlip_transcript(
         let phase = match snapshot.phase {
             optimization::InteriorPointIterationPhase::Initial => "start",
             optimization::InteriorPointIterationPhase::AcceptedStep => "accept",
+            optimization::InteriorPointIterationPhase::Restoration => "restore",
             optimization::InteriorPointIterationPhase::Converged => "final",
         };
         let events = if snapshot.events.is_empty() {
@@ -1418,7 +1459,7 @@ fn render_nlip_transcript(
         };
         let _ = writeln!(
             out,
-            "{:>4}  {:<7}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>7}  {:>5}  {:>8}  {:>8}  {:>5}",
+            "{:>4}  {:<7}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>8}  {:>8}  {:>4}  {:>5}  {:>8}  {:>8}  {:>5}",
             snapshot.iteration,
             phase,
             fmt_sci(snapshot.objective),
@@ -1427,7 +1468,12 @@ fn render_nlip_transcript(
             fmt_sci(snapshot.dual_inf),
             fmt_opt_sci(snapshot.comp_inf),
             fmt_opt_sci(snapshot.barrier_parameter),
-            fmt_opt_sci(snapshot.alpha),
+            fmt_opt_sci(snapshot.alpha_pr.or(snapshot.alpha)),
+            fmt_opt_sci(snapshot.alpha_du.or(snapshot.alpha)),
+            snapshot
+                .step_tag
+                .map(|tag| format!("{tag:>4}"))
+                .unwrap_or_else(|| format!("{:>4}", "--")),
             fmt_opt_usize(snapshot.line_search_iterations),
             snapshot.linear_solver.label(),
             snapshot
@@ -1443,12 +1489,82 @@ fn render_nlip_transcript(
         );
     }
     if let Some(summary) = summary {
-        let _ = writeln!(out, "\ntermination: converged");
+        let termination = match summary.termination {
+            optimization::InteriorPointTermination::Converged => "converged",
+            optimization::InteriorPointTermination::Acceptable => "acceptable",
+        };
+        let _ = writeln!(out, "\ntermination: {termination}");
         let _ = writeln!(out, "linear_solver: {}", summary.linear_solver.label());
     }
     if let Some(error) = error {
         let _ = writeln!(out, "\ntermination: error");
         let _ = writeln!(out, "error_kind: {}", nlip_error_code(error));
+        let context = match error {
+            InteriorPointSolveError::InvalidInput(_) => None,
+            InteriorPointSolveError::LinearSolve { context, .. }
+            | InteriorPointSolveError::LineSearchFailed { context, .. }
+            | InteriorPointSolveError::RestorationFailed { context, .. }
+            | InteriorPointSolveError::MaxIterations { context, .. } => Some(context.as_ref()),
+        };
+        if let Some(context) = context {
+            if let Some(snapshot) = context
+                .final_state
+                .as_ref()
+                .or(context.last_accepted_state.as_ref())
+            {
+                let _ = writeln!(
+                    out,
+                    "final_metrics: objective={} primal={} dual={} comp={} iter={}",
+                    fmt_sci(snapshot.objective),
+                    fmt_sci(
+                        snapshot
+                            .eq_inf
+                            .into_iter()
+                            .chain(snapshot.ineq_inf)
+                            .fold(0.0_f64, f64::max)
+                    ),
+                    fmt_sci(snapshot.dual_inf),
+                    fmt_opt_sci(snapshot.comp_inf),
+                    snapshot.iteration,
+                );
+            }
+            if let Some(info) = &context.failed_line_search {
+                let _ = writeln!(
+                    out,
+                    "line_search: alpha_pr={} alpha_du={} last_alpha_pr={} last_alpha_du={} alpha_min={} sigma={} rejected={} tag={}",
+                    fmt_sci(info.initial_alpha_pr),
+                    fmt_opt_sci(info.initial_alpha_du),
+                    fmt_sci(info.last_tried_alpha),
+                    fmt_opt_sci(info.last_tried_alpha_du),
+                    fmt_sci(info.alpha_min),
+                    fmt_sci(info.sigma),
+                    info.rejected_trials.len(),
+                    info.step_tag
+                        .map(|tag| tag.to_string())
+                        .unwrap_or_else(|| "--".to_string()),
+                );
+                for (idx, trial) in info.rejected_trials.iter().take(8).enumerate() {
+                    let _ = writeln!(
+                        out,
+                        "  reject[{idx}]: alpha_pr={} alpha_du={} barr={} primal={} dual={} comp={} filter_ok={} dominated={}",
+                        fmt_sci(trial.alpha),
+                        fmt_opt_sci(trial.alpha_du),
+                        fmt_opt_sci(trial.barrier_objective),
+                        fmt_opt_sci(trial.primal_inf),
+                        fmt_opt_sci(trial.dual_inf),
+                        fmt_opt_sci(trial.comp_inf),
+                        trial
+                            .filter_acceptable
+                            .map(|value| if value { "true" } else { "false" })
+                            .unwrap_or("--"),
+                        trial
+                            .filter_dominated
+                            .map(|value| if value { "true" } else { "false" })
+                            .unwrap_or("--"),
+                    );
+                }
+            }
+        }
     }
     out.push_str(&render_problem_footer(record));
     out
@@ -1625,6 +1741,7 @@ fn nlip_error_code(error: &InteriorPointSolveError) -> &'static str {
         InteriorPointSolveError::InvalidInput(_) => "invalid_input",
         InteriorPointSolveError::LinearSolve { .. } => "linear_solve",
         InteriorPointSolveError::LineSearchFailed { .. } => "line_search",
+        InteriorPointSolveError::RestorationFailed { .. } => "restoration",
         InteriorPointSolveError::MaxIterations { .. } => "max_iters",
     }
 }

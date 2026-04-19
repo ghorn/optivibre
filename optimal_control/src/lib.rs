@@ -4322,24 +4322,20 @@ where
             scaling.final_time,
         );
 
-        let state_scale = flatten_value(&scaling.state);
-        let control_scale = flatten_value(&scaling.control);
         let mut constraints = Vec::with_capacity(
             DcEqualities::<X, U, N, K>::LEN + DcIneq::<C, Beq, Bineq, N, K>::LEN,
         );
         for _ in 0..(N * K) {
-            constraints.extend_from_slice(&state_scale);
+            constraints.extend_from_slice(&flatten_value(&scaling.state));
         }
         for _ in 0..(N * K) {
-            constraints.extend_from_slice(&control_scale);
+            constraints.extend_from_slice(&flatten_value(&scaling.control));
         }
-        // TODO: add dedicated continuity scaling when nonlinear continuity constraints are supported.
         for _ in 0..N {
-            constraints.extend_from_slice(&state_scale);
+            constraints.extend_from_slice(&flatten_value(&scaling.state));
         }
-        // TODO: add dedicated continuity scaling when nonlinear continuity constraints are supported.
         for _ in 0..N {
-            constraints.extend_from_slice(&control_scale);
+            constraints.extend_from_slice(&flatten_value(&scaling.control));
         }
         constraints.extend_from_slice(&scaling.boundary_equalities);
         constraints.extend_from_slice(&scaling.boundary_inequalities);

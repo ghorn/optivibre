@@ -870,8 +870,11 @@ interface StatusDisplay {
 
 const pendingMathRoots = new Set<Element>();
 let mathTypesetRetryHandle: number | null = null;
+let copyConsoleFeedbackHandle: number | null = null;
 const PREWARM_DELAY_MS = 200;
 const COMPILE_STATUS_POLL_MS = 250;
+const COPY_CONSOLE_DEFAULT_LABEL = "Copy to Clipboard";
+const COPY_CONSOLE_FEEDBACK_MS = 1400;
 
 function requiredElement<T extends Element>(selector: string): T {
   const element = document.querySelector<T>(selector);
@@ -1611,6 +1614,7 @@ const solverSummaryEl = requiredElement<HTMLDivElement>("#solver-summary");
 const progressPlotEl = requiredElement<PlotlyHostElement>("#progress-plot");
 const filterPlotEl = requiredElement<PlotlyHostElement>("#filter-plot");
 const trustRegionPlotEl = requiredElement<PlotlyHostElement>("#trust-region-plot");
+const copyConsoleButton = requiredElement<HTMLButtonElement>("#copy-console-button");
 const solverLogEl = requiredElement<HTMLPreElement>("#solver-log");
 const prewarmStatusEl = requiredElement<HTMLDivElement>("#prewarm-status");
 const eqViolationsEl = requiredElement<HTMLDivElement>("#eq-violations");
@@ -2110,6 +2114,100 @@ function shouldConsoleStickToBottom(): boolean {
   return solverLogEl.scrollHeight - (solverLogEl.scrollTop + solverLogEl.clientHeight) <= bottomSlackPx;
 }
 
+function clearCopyConsoleFeedbackTimer(): void {
+  if (copyConsoleFeedbackHandle != null) {
+    window.clearTimeout(copyConsoleFeedbackHandle);
+    copyConsoleFeedbackHandle = null;
+  }
+}
+
+function hasCopyableConsoleTranscript(): boolean {
+  return state.logLines.some((entry) => entry.text.length > 0);
+}
+
+function solverConsoleTranscriptText(): string {
+  return state.logLines.map((entry) => entry.text).join("\n");
+}
+
+function setCopyConsoleButtonState(
+  label: string,
+  stateValue: "idle" | "success" | "error" = "idle",
+): void {
+  copyConsoleButton.textContent = label;
+  if (stateValue === "idle") {
+    delete copyConsoleButton.dataset.copyState;
+  } else {
+    copyConsoleButton.dataset.copyState = stateValue;
+  }
+}
+
+function syncCopyConsoleButtonAvailability(): void {
+  copyConsoleButton.disabled = !hasCopyableConsoleTranscript();
+}
+
+function resetCopyConsoleButton(): void {
+  clearCopyConsoleFeedbackTimer();
+  setCopyConsoleButtonState(COPY_CONSOLE_DEFAULT_LABEL);
+  syncCopyConsoleButtonAvailability();
+}
+
+async function writeClipboardText(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch (error) {
+      console.warn("clipboard writeText failed; falling back to execCommand copy", error);
+    }
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.top = "0";
+  textarea.style.left = "-9999px";
+  textarea.style.opacity = "0";
+  textarea.style.pointerEvents = "none";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  textarea.setSelectionRange(0, textarea.value.length);
+
+  try {
+    if (!document.execCommand("copy")) {
+      throw new Error("document.execCommand('copy') returned false");
+    }
+  } finally {
+    document.body.removeChild(textarea);
+  }
+}
+
+async function copyConsoleTranscript(): Promise<void> {
+  const text = solverConsoleTranscriptText();
+  if (!text.trim()) {
+    resetCopyConsoleButton();
+    return;
+  }
+
+  clearCopyConsoleFeedbackTimer();
+  copyConsoleButton.disabled = true;
+  setCopyConsoleButtonState("Copying...");
+
+  try {
+    await writeClipboardText(text);
+    setCopyConsoleButtonState("Copied", "success");
+  } catch (error) {
+    console.warn("copy console transcript failed", error);
+    setCopyConsoleButtonState("Copy Failed", "error");
+  } finally {
+    copyConsoleFeedbackHandle = window.setTimeout(() => {
+      copyConsoleFeedbackHandle = null;
+      resetCopyConsoleButton();
+    }, COPY_CONSOLE_FEEDBACK_MS);
+  }
+}
+
 function syncConsoleFollowState(): void {
   state.followSolverLog = shouldConsoleStickToBottom();
 }
@@ -2134,6 +2232,7 @@ function renderLog(): void {
   const previousScrollTop = solverLogEl.scrollTop;
   const shouldStickToBottom = state.followSolverLog || shouldConsoleStickToBottom();
   solverLogEl.replaceChildren(buildLogLineElements(state.logLines));
+  syncCopyConsoleButtonAvailability();
   if (shouldStickToBottom) {
     scrollConsoleToBottom();
     return;
@@ -2356,7 +2455,7 @@ function normalizeSolveStatus(status: WireSolveStatus): SolveStatus {
     solver_method:
       status.solver_method == null
         ? null
-        : decodeWireEnum(SOLVER_METHOD_FROM_WIRE, status.solver_method, SOLVER_METHOD.sqp),
+        : decodeWireEnum(SOLVER_METHOD_FROM_WIRE, status.solver_method, SOLVER_METHOD.nlip),
     solver: normalizeSolverReport(status.solver),
   };
 }
@@ -2447,7 +2546,7 @@ function currentTranscriptionMethodValue(): number {
 }
 
 function currentSolverMethodValue(): number {
-  return currentSharedControlValue(CONTROL_SEMANTIC.solverMethod, SOLVER_METHOD.sqp);
+  return currentSharedControlValue(CONTROL_SEMANTIC.solverMethod, SOLVER_METHOD.nlip);
 }
 
 function currentSqpGlobalizationValue(): number {
@@ -3322,6 +3421,7 @@ function resetSolverPanel(): void {
   renderSolverSummary();
   renderConstraintPanels();
   solverLogEl.replaceChildren();
+  resetCopyConsoleButton();
   if (window.Plotly && state.progressPlotReady) {
     window.Plotly.purge(progressPlotEl);
   }
@@ -4374,6 +4474,7 @@ function appendLogLine(line: string, level: LogLevelCode = LOG_LEVEL.console): v
   state.logLines.push(...entries);
   const shouldStickToBottom = state.followSolverLog || shouldConsoleStickToBottom();
   solverLogEl.appendChild(buildLogLineElements(entries));
+  syncCopyConsoleButtonAvailability();
   if (shouldStickToBottom) {
     scrollConsoleToBottom();
   }
@@ -5680,7 +5781,11 @@ async function init(): Promise<void> {
     }
     controlsForm.addEventListener("submit", solveCurrentProblem);
     solveButton.addEventListener("click", solveCurrentProblem);
+    copyConsoleButton.addEventListener("click", () => {
+      void copyConsoleTranscript();
+    });
     solverLogEl.addEventListener("scroll", syncConsoleFollowState);
+    resetCopyConsoleButton();
     selectProblem(state.specs[0].id);
     void refreshCompileCacheStatus();
   } catch (error) {

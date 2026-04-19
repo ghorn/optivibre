@@ -1012,6 +1012,13 @@ select {
   grid-row: 1 / span 2;
 }
 
+.console-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .solver-log .log-line {
   display: block;
 }
@@ -1061,6 +1068,31 @@ select {
   font-size: 0.84rem;
   letter-spacing: 0.04em;
   text-transform: uppercase;
+}
+
+.console-copy-button {
+  padding: 6px 12px;
+  font-size: 0.76rem;
+  line-height: 1.1;
+  white-space: nowrap;
+}
+
+.console-copy-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+  transform: none;
+  filter: none;
+}
+
+.console-copy-button[data-copy-state="success"] {
+  background:
+    linear-gradient(135deg, var(--accent-2), color-mix(in srgb, var(--accent-2) 72%, white));
+}
+
+.console-copy-button[data-copy-state="error"] {
+  background:
+    linear-gradient(135deg, var(--accent-3), color-mix(in srgb, var(--accent-3) 72%, white));
+  color: #fff3f3;
 }
 
 .prewarm-status {

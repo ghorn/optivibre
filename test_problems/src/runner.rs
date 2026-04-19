@@ -25,7 +25,7 @@ impl Default for RunRequest {
     fn default() -> Self {
         Self {
             problem_ids: None,
-            solvers: vec![SolverKind::Sqp, SolverKind::Nlip],
+            solvers: vec![SolverKind::Nlip],
             run_options: vec![ProblemRunOptions {
                 jit_opt_level: JitOptLevel::O3,
                 call_policy: CallPolicyMode::InlineAtLowering,
