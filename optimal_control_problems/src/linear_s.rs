@@ -1,10 +1,10 @@
 use crate::common::{
     CompileCacheStatus, CompileProgressInfo, CompileProgressUpdate, ContinuousInitialGuess,
     FromMap, LatexSection, MetricKey, OcpRuntimeSpec, OcpSxFunctionConfig, PlotMode, ProblemId,
-    ProblemSpec, Scene2D, ScenePath, SolveArtifact, SolveStreamEvent, SolverMethod, SolverReport,
-    SolverConfig, StandardOcpParams, TranscriptionConfig, chart, default_solver_config,
-    default_solver_method, default_transcription, direct_collocation_runtime_from_spec, expect_finite,
-    interval_arc_bound_series, interval_arc_series, metric_with_key,
+    ProblemSpec, Scene2D, ScenePath, SolveArtifact, SolveStreamEvent, SolverConfig, SolverMethod,
+    SolverReport, StandardOcpParams, TranscriptionConfig, chart, default_solver_config,
+    default_solver_method, default_transcription, direct_collocation_runtime_from_spec,
+    expect_finite, interval_arc_bound_series, interval_arc_series, metric_with_key,
     multiple_shooting_runtime_from_spec, numeric_metric_with_key, ocp_sx_function_config_from_map,
     problem_controls, problem_scientific_slider_control, problem_slider_control, problem_spec,
     sample_or_default, segmented_bound_series, segmented_series, solver_config_from_map,
@@ -1112,6 +1112,17 @@ fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    use tempfile::TempDir;
+
+    fn cache_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("cache env lock")
+    }
+
     #[test]
     fn s_maneuver_reaches_target_and_weaves() {
         let params = Params {
@@ -1127,6 +1138,41 @@ mod tests {
             .expect("min y metric should exist");
         assert!(max_y > 0.5);
         assert!(min_y < -0.5);
+    }
+
+    #[test]
+    fn repeated_multiple_shooting_compile_uses_llvm_disk_cache_for_nlp_and_helpers() {
+        let _guard = cache_env_lock();
+        let cache_root = TempDir::new().expect("temp cache root");
+        unsafe { std::env::set_var("OPTIVIBRE_JIT_CACHE_DIR", cache_root.path()) };
+        optimization::clear_optivibre_jit_cache().expect("clear temp cache");
+
+        let options = crate::common::ocp_compile_options(
+            optimization::LlvmOptimizationLevel::O0,
+            Params::default().sx_functions,
+        );
+
+        let first = model(MultipleShooting::<8, RK4_SUBSTEPS>)
+            .compile_jit_with_ocp_options(options)
+            .expect("first compile should succeed");
+        let first_report = first.backend_compile_report();
+        let first_helpers = first.helper_compile_stats();
+        assert!(first_report.llvm_jit_cache.misses > 0);
+        assert_eq!(first_report.llvm_jit_cache.hits, 0);
+        assert!(first_helpers.llvm_cache_misses > 0);
+        assert_eq!(first_helpers.llvm_cache_hits, 0);
+
+        let second = model(MultipleShooting::<8, RK4_SUBSTEPS>)
+            .compile_jit_with_ocp_options(options)
+            .expect("second compile should succeed");
+        let second_report = second.backend_compile_report();
+        let second_helpers = second.helper_compile_stats();
+        assert!(second_report.llvm_jit_cache.hits > 0);
+        assert_eq!(second_report.llvm_jit_cache.misses, 0);
+        assert!(second_helpers.llvm_cache_hits > 0);
+        assert_eq!(second_helpers.llvm_cache_misses, 0);
+
+        unsafe { std::env::remove_var("OPTIVIBRE_JIT_CACHE_DIR") };
     }
 
     #[test]

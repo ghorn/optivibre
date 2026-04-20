@@ -15,11 +15,12 @@ use llvm_sys::core::{
     LLVMBuildCall2, LLVMBuildFAdd, LLVMBuildFCmp, LLVMBuildFDiv, LLVMBuildFMul, LLVMBuildFSub,
     LLVMBuildInBoundsGEP2, LLVMBuildLoad2, LLVMBuildRetVoid, LLVMBuildSelect, LLVMBuildStore,
     LLVMConstInt, LLVMConstReal, LLVMContextCreate, LLVMContextDispose, LLVMCreateBuilderInContext,
-    LLVMCreateEnumAttribute, LLVMDisposeBuilder, LLVMDisposeMemoryBuffer, LLVMDisposeMessage,
-    LLVMDoubleTypeInContext, LLVMFunctionType, LLVMGetBufferSize, LLVMGetBufferStart,
-    LLVMGetEnumAttributeKindForName, LLVMGetNamedFunction, LLVMGetParam, LLVMGlobalGetValueType,
-    LLVMInt64TypeInContext, LLVMModuleCreateWithNameInContext, LLVMPointerType,
-    LLVMPositionBuilderAtEnd, LLVMSetLinkage, LLVMSetTarget, LLVMVoidTypeInContext,
+    LLVMCreateEnumAttribute, LLVMCreateMemoryBufferWithMemoryRangeCopy, LLVMDisposeBuilder,
+    LLVMDisposeMemoryBuffer, LLVMDisposeMessage, LLVMDoubleTypeInContext, LLVMFunctionType,
+    LLVMGetBufferSize, LLVMGetBufferStart, LLVMGetEnumAttributeKindForName, LLVMGetNamedFunction,
+    LLVMGetParam, LLVMGlobalGetValueType, LLVMInt64TypeInContext,
+    LLVMModuleCreateWithNameInContext, LLVMPointerType, LLVMPositionBuilderAtEnd, LLVMSetLinkage,
+    LLVMSetTarget, LLVMVoidTypeInContext,
 };
 use llvm_sys::error::{LLVMDisposeErrorMessage, LLVMErrorRef, LLVMGetErrorMessage};
 use llvm_sys::orc2::LLVMOrcExecutorAddress;
@@ -57,7 +58,12 @@ use sx_core::{
     BinaryOp, CallPolicy, CallPolicyConfig, CompileStats, CompileWarning, SXFunction, UnaryOp,
 };
 
+mod jit_cache;
+
+use jit_cache::JitCacheReport;
+
 type RawKernelFn = unsafe extern "C" fn(*const *const f64, *const *mut f64);
+pub use jit_cache::clear_optivibre_jit_cache;
 
 fn kernel_symbol_name(name: &str) -> String {
     format!("__sx_codegen_llvm_{}", sanitize_ident(name))
@@ -154,6 +160,7 @@ impl From<LlvmOptimizationLevel> for FunctionCompileOptions {
 pub struct FunctionCompileReport {
     pub lowering_time: Duration,
     pub llvm_time: Duration,
+    pub cache: JitCacheReport,
     pub stats: CompileStats,
     pub warnings: Vec<CompileWarning>,
 }
@@ -192,55 +199,90 @@ impl CompiledJitFunction {
         function: &SXFunction,
         options: FunctionCompileOptions,
     ) -> Result<Self> {
+        ensure_native_llvm_initialized()?;
+        let (target_triple, cpu_name, cpu_features) =
+            native_cache_target_info(&LlvmTarget::Native)?;
+        let cache_metadata = jit_cache::cache_key_metadata_for_function(
+            function,
+            options.call_policy,
+            options.opt_level,
+            target_triple,
+            cpu_name,
+            cpu_features,
+        );
         let lowering_started = Instant::now();
         let lowered = lower_function_with_policies(function, options.call_policy)?;
         let lowering_time = lowering_started.elapsed();
-        Self::compile_lowered_with_report(&lowered, options.opt_level, lowering_time)
+        Self::compile_lowered_with_report(
+            &lowered,
+            options.opt_level,
+            lowering_time,
+            Some(cache_metadata),
+        )
     }
 
     pub fn compile_lowered(
         lowered: &LoweredFunction,
         opt_level: LlvmOptimizationLevel,
     ) -> Result<Self> {
-        Self::compile_lowered_with_report(lowered, opt_level, Duration::ZERO)
+        Self::compile_lowered_with_report(lowered, opt_level, Duration::ZERO, None)
     }
 
     fn compile_lowered_with_report(
         lowered: &LoweredFunction,
         opt_level: LlvmOptimizationLevel,
         lowering_time: Duration,
+        cache_metadata: Option<jit_cache::CacheKeyMetadata>,
     ) -> Result<Self> {
         validate_lowered_output_shapes(lowered)?;
         ensure_native_llvm_initialized()?;
+        let target = LlvmTarget::Native;
+        let metadata = match cache_metadata {
+            Some(metadata) => metadata,
+            None => host_cache_metadata(lowered, opt_level)?,
+        };
 
-        let llvm_started = Instant::now();
-        let object = build_object_buffer(
-            lowered,
-            opt_level,
-            &LlvmTarget::Native,
-            LlvmCompileMode::Jit,
-        )?;
-        let llvm_time = llvm_started.elapsed();
-        let lljit = create_lljit()?;
-        let main_dylib = unsafe { LLVMOrcLLJITGetMainJITDylib(lljit) };
-        let prefix = unsafe { LLVMOrcLLJITGetGlobalPrefix(lljit) };
-        attach_current_process_symbols(main_dylib, prefix)?;
-        let add_error = unsafe { LLVMOrcLLJITAddObjectFile(lljit, main_dylib, object) };
-        if let Err(error) = consume_llvm_error(add_error) {
-            let _ = unsafe { LLVMOrcDisposeLLJIT(lljit) };
-            return Err(error.context("failed to add object file to LLJIT"));
+        let cache_started = Instant::now();
+        if let Some(cached) = jit_cache::try_load_cached_object(&metadata) {
+            match load_jit_function_from_object_bytes(&cached.object_bytes, &lowered.name) {
+                Ok((lljit, function)) => {
+                    let llvm_time = cache_started.elapsed();
+                    return Ok(Self {
+                        lowered: lowered.clone(),
+                        compile_report: FunctionCompileReport {
+                            lowering_time,
+                            llvm_time,
+                            cache: JitCacheReport {
+                                hit: true,
+                                load_time: llvm_time,
+                            },
+                            stats: lowered.stats.clone(),
+                            warnings: lowered.warnings.clone(),
+                        },
+                        lljit,
+                        function,
+                    });
+                }
+                Err(_) => {
+                    jit_cache::remove_cached_entry(&cached.entry_dir);
+                }
+            }
         }
 
-        let address = lookup_symbol_address(lljit, &kernel_symbol_name(&lowered.name))?;
-        let addr = usize::try_from(address)
-            .map_err(|_| anyhow!("JIT symbol address does not fit into usize"))?;
-        let function = unsafe { mem::transmute::<usize, RawKernelFn>(addr) };
+        let llvm_started = Instant::now();
+        let object = build_object_buffer(lowered, opt_level, &target, LlvmCompileMode::Jit)?;
+        let object_bytes = unsafe { memory_buffer_to_bytes(object) }?;
+        unsafe { LLVMDisposeMemoryBuffer(object) };
+        let _ = jit_cache::write_cached_object(&metadata, &object_bytes);
+        let (lljit, function) = load_jit_function_from_object_bytes(&object_bytes, &lowered.name)?;
+        let llvm_time = llvm_started.elapsed();
 
         Ok(Self {
             lowered: lowered.clone(),
             compile_report: FunctionCompileReport {
                 lowering_time,
                 llvm_time,
+                cache: JitCacheReport::default(),
                 stats: lowered.stats.clone(),
                 warnings: lowered.warnings.clone(),
             },
@@ -266,6 +308,65 @@ impl CompiledJitFunction {
             (self.function)(context.input_ptrs.as_ptr(), context.output_ptrs.as_ptr());
         }
     }
+}
+
+fn host_cache_metadata(
+    lowered: &LoweredFunction,
+    opt_level: LlvmOptimizationLevel,
+) -> Result<jit_cache::CacheKeyMetadata> {
+    let (target_triple, cpu_name, cpu_features) = native_cache_target_info(&LlvmTarget::Native)?;
+    Ok(jit_cache::cache_key_metadata(
+        lowered,
+        opt_level,
+        target_triple,
+        cpu_name,
+        cpu_features,
+    ))
+}
+
+fn native_cache_target_info(target: &LlvmTarget) -> Result<(String, String, String)> {
+    let host_triple = unsafe { take_llvm_message(LLVMGetDefaultTargetTriple()) }?;
+    let use_host_cpu = match target {
+        LlvmTarget::Native => true,
+        LlvmTarget::Triple(target_triple) => target_triple == &host_triple,
+    };
+    let target_triple = match target {
+        LlvmTarget::Native => host_triple.clone(),
+        LlvmTarget::Triple(target_triple) => target_triple.clone(),
+    };
+    let cpu_name = if use_host_cpu {
+        unsafe { take_llvm_message(LLVMGetHostCPUName()) }?
+    } else {
+        "generic".to_string()
+    };
+    let cpu_features = if use_host_cpu {
+        unsafe { take_llvm_message(LLVMGetHostCPUFeatures()) }?
+    } else {
+        String::new()
+    };
+    Ok((target_triple, cpu_name, cpu_features))
+}
+
+fn load_jit_function_from_object_bytes(
+    object_bytes: &[u8],
+    lowered_name: &str,
+) -> Result<(llvm_sys::orc2::lljit::LLVMOrcLLJITRef, RawKernelFn)> {
+    let lljit = create_lljit()?;
+    let object = memory_buffer_from_bytes(object_bytes)?;
+    let main_dylib = unsafe { LLVMOrcLLJITGetMainJITDylib(lljit) };
+    let prefix = unsafe { LLVMOrcLLJITGetGlobalPrefix(lljit) };
+    attach_current_process_symbols(main_dylib, prefix)?;
+    let add_error = unsafe { LLVMOrcLLJITAddObjectFile(lljit, main_dylib, object) };
+    if let Err(error) = consume_llvm_error(add_error) {
+        let _ = unsafe { LLVMOrcDisposeLLJIT(lljit) };
+        return Err(error.context("failed to add object file to LLJIT"));
+    }
+
+    let address = lookup_symbol_address(lljit, &kernel_symbol_name(lowered_name))?;
+    let addr = usize::try_from(address)
+        .map_err(|_| anyhow!("JIT symbol address does not fit into usize"))?;
+    let function = unsafe { mem::transmute::<usize, RawKernelFn>(addr) };
+    Ok((lljit, function))
 }
 
 fn validate_slot_output_shapes(
@@ -455,25 +556,7 @@ unsafe fn create_target_machine(
     target: &LlvmTarget,
     compile_mode: LlvmCompileMode,
 ) -> Result<(LLVMTargetMachineRef, CString)> {
-    let host_triple = unsafe { take_llvm_message(LLVMGetDefaultTargetTriple()) }?;
-    let triple = match target {
-        LlvmTarget::Native => host_triple.clone(),
-        LlvmTarget::Triple(triple) => triple.clone(),
-    };
-    let use_host_cpu = match target {
-        LlvmTarget::Native => true,
-        LlvmTarget::Triple(target_triple) => target_triple == &host_triple,
-    };
-    let cpu = if use_host_cpu {
-        unsafe { take_llvm_message(LLVMGetHostCPUName()) }?
-    } else {
-        "generic".to_string()
-    };
-    let features = if use_host_cpu {
-        unsafe { take_llvm_message(LLVMGetHostCPUFeatures()) }?
-    } else {
-        String::new()
-    };
+    let (triple, cpu, features) = native_cache_target_info(target)?;
     let triple_c = CString::new(triple)?;
     let cpu_c = CString::new(cpu)?;
     let features_c = CString::new(features)?;
@@ -1106,6 +1189,21 @@ unsafe fn memory_buffer_to_bytes(buffer: LLVMMemoryBufferRef) -> Result<Vec<u8>>
     let size = unsafe { LLVMGetBufferSize(buffer) };
     let bytes = unsafe { slice::from_raw_parts(start.cast::<u8>(), size) };
     Ok(bytes.to_vec())
+}
+
+fn memory_buffer_from_bytes(bytes: &[u8]) -> Result<LLVMMemoryBufferRef> {
+    let name = CString::new("optivibre_jit_cache_object")?;
+    let buffer = unsafe {
+        LLVMCreateMemoryBufferWithMemoryRangeCopy(
+            bytes.as_ptr().cast::<i8>(),
+            bytes.len(),
+            name.as_ptr(),
+        )
+    };
+    if buffer.is_null() {
+        bail!("LLVMCreateMemoryBufferWithMemoryRangeCopy returned null");
+    }
+    Ok(buffer)
 }
 
 pub fn generate_aot_wrapper_module(

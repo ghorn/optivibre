@@ -1681,6 +1681,12 @@ fn absorb_kernel_compile_report(report: &mut BackendCompileReport, kernel: &JitK
         compile_report.lowering_time,
     );
     add_duration(&mut report.setup_profile.llvm_jit, compile_report.llvm_time);
+    if compile_report.cache.hit {
+        report.llvm_jit_cache.hits += 1;
+        report.llvm_jit_cache.load_time += compile_report.cache.load_time;
+    } else {
+        report.llvm_jit_cache.misses += 1;
+    }
     report.stats.absorb(&compile_report.stats);
     report
         .warnings

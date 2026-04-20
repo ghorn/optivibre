@@ -1,13 +1,17 @@
 use approx::assert_abs_diff_eq;
+use std::path::Path;
+use std::sync::{Mutex, OnceLock};
+
 use optimization::{
     CallPolicy, CallPolicyConfig, ClarabelSqpOptions, FiniteDifferenceValidationOptions,
-    FunctionCompileOptions, InteriorPointOptions, LlvmOptimizationLevel, SqpGlobalization,
-    SymbolicCompileProgress, SymbolicCompileStage, SymbolicNlpOutputs, TypedNlpScaling,
-    TypedRuntimeNlpBounds, flat_view, symbolic_nlp,
+    FunctionCompileOptions, InteriorPointLinearSolver, InteriorPointOptions, LlvmOptimizationLevel,
+    SqpGlobalization, SymbolicCompileProgress, SymbolicCompileStage, SymbolicNlpOutputs,
+    TypedNlpScaling, TypedRuntimeNlpBounds, clear_optivibre_jit_cache, flat_view, symbolic_nlp,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptOptions, IpoptRawStatus};
 use sx_core::{NamedMatrix, SX, SXFunction, SXMatrix};
+use tempfile::TempDir;
 
 #[derive(Clone, optimization::Vectorize)]
 struct Pair<T> {
@@ -439,6 +443,97 @@ fn typed_symbolic_compile_exposes_backend_compile_report() {
     assert!(report.setup_profile.llvm_jit.is_some());
 }
 
+fn cache_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("cache env lock")
+}
+
+fn collect_cache_manifests(root: &Path) -> Vec<String> {
+    fn visit(dir: &Path, manifests: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                visit(&path, manifests);
+            } else if path.file_name().and_then(|name| name.to_str()) == Some("manifest.json") {
+                let manifest = std::fs::read_to_string(&path).expect("read manifest");
+                manifests.push(manifest);
+            }
+        }
+    }
+
+    let mut manifests = Vec::new();
+    visit(root, &mut manifests);
+    manifests.sort();
+    manifests
+}
+
+fn collect_cache_manifests_with_prefix(root: &Path, lowered_name_prefix: &str) -> Vec<String> {
+    let needle = format!("\"lowered_name\": \"{lowered_name_prefix}");
+    collect_cache_manifests(root)
+        .into_iter()
+        .filter(|manifest| manifest.contains(&needle))
+        .collect()
+}
+
+#[test]
+fn typed_symbolic_compile_reports_llvm_disk_cache_hits_on_second_compile() {
+    let _guard = cache_env_lock();
+    let cache_root = TempDir::new().expect("temp cache root");
+    unsafe { std::env::set_var("OPTIVIBRE_JIT_CACHE_DIR", cache_root.path()) };
+    clear_optivibre_jit_cache().expect("clear temp cache");
+
+    let symbolic = symbolic_nlp::<Pair<SX>, (), SX, SX, _>("timed_compile_cache_report", |x, _| {
+        SymbolicNlpOutputs {
+            objective: (1.0 - x.x).sqr() + 100.0 * (x.y - x.x.sqr()).sqr(),
+            equalities: x.x + x.y,
+            inequalities: x.x.sqr() + x.y.sqr(),
+        }
+    })
+    .expect("symbolic NLP should build");
+
+    let options = FunctionCompileOptions {
+        opt_level: LlvmOptimizationLevel::O0,
+        call_policy: CallPolicyConfig {
+            default_policy: CallPolicy::InlineAtLowering,
+            respect_function_overrides: true,
+        },
+    };
+
+    let first = symbolic
+        .compile_jit_with_options(options)
+        .expect("first JIT compile should succeed");
+    let first_report = first.backend_compile_report();
+    assert_eq!(first_report.llvm_jit_cache.hits, 0);
+    assert!(first_report.llvm_jit_cache.misses > 0);
+    let manifests_after_first =
+        collect_cache_manifests_with_prefix(cache_root.path(), "timed_compile_cache_report");
+
+    let second = symbolic
+        .compile_jit_with_options(options)
+        .expect("second JIT compile should succeed");
+    let second_report = second.backend_compile_report();
+    assert!(second_report.llvm_jit_cache.hits > 0);
+    let manifests_after_second =
+        collect_cache_manifests_with_prefix(cache_root.path(), "timed_compile_cache_report");
+    assert_eq!(
+        manifests_after_second, manifests_after_first,
+        "second compile should not create new cache entries"
+    );
+    assert_eq!(
+        second_report.llvm_jit_cache.hits,
+        manifests_after_first.len(),
+        "all cached kernels should be reused on the second compile"
+    );
+    assert_eq!(second_report.llvm_jit_cache.misses, 0);
+
+    unsafe { std::env::remove_var("OPTIVIBRE_JIT_CACHE_DIR") };
+}
+
 #[test]
 fn typed_symbolic_compiled_nlp_derivatives_match_finite_difference() {
     let symbolic =
@@ -768,6 +863,7 @@ fn typed_symbolic_problem_reports_adapter_timing_with_interior_point() {
             &InteriorPointOptions {
                 max_iters: 120,
                 dual_tol: 1e-6,
+                linear_solver: InteriorPointLinearSolver::Auto,
                 verbose: false,
                 ..InteriorPointOptions::default()
             },

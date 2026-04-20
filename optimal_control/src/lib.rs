@@ -848,6 +848,20 @@ pub struct OcpHelperCompileStats {
     pub xdot_helper_total_instructions: Option<usize>,
     pub multiple_shooting_arc_helper_root_instructions: Option<usize>,
     pub multiple_shooting_arc_helper_total_instructions: Option<usize>,
+    pub llvm_cache_hits: usize,
+    pub llvm_cache_misses: usize,
+    pub llvm_cache_load_time: Duration,
+}
+
+impl OcpHelperCompileStats {
+    fn record_compile_report(&mut self, report: &sx_codegen_llvm::FunctionCompileReport) {
+        if report.cache.hit {
+            self.llvm_cache_hits += 1;
+            self.llvm_cache_load_time += report.cache.load_time;
+        } else {
+            self.llvm_cache_misses += 1;
+        }
+    }
 }
 
 pub struct CompiledMultipleShootingOcp<
@@ -1739,6 +1753,10 @@ where
         );
         let promotion_offsets =
             compile_promotion_offsets(&promotion_plan, &symbolic_params, options.function_options)?;
+        let mut helper_compile_stats = OcpHelperCompileStats::default();
+        if let Some(function) = &promotion_offsets.function {
+            helper_compile_stats.record_compile_report(function.function.compile_report());
+        }
         let symbolic_library_for_nlp = symbolic_library.clone();
         let symbolic = symbolic_nlp::<
             MsVars<X, U, N>,
@@ -1795,6 +1813,7 @@ where
             .compile_report()
             .stats
             .llvm_total_instructions_emitted;
+        helper_compile_stats.record_compile_report(xdot_helper.function.compile_report());
         on_progress(OcpCompileProgress::HelperCompiled {
             helper: OcpCompileHelperKind::Xdot,
             elapsed: xdot_helper_time,
@@ -1818,6 +1837,7 @@ where
             .compile_report()
             .stats
             .llvm_total_instructions_emitted;
+        helper_compile_stats.record_compile_report(rk4_arc_helper.function.compile_report());
         on_progress(OcpCompileProgress::HelperCompiled {
             helper: OcpCompileHelperKind::MultipleShootingArc,
             elapsed: multiple_shooting_arc_helper_time,
@@ -1841,6 +1861,9 @@ where
                 multiple_shooting_arc_helper_total_instructions: Some(
                     multiple_shooting_arc_helper_total_instructions,
                 ),
+                llvm_cache_hits: helper_compile_stats.llvm_cache_hits,
+                llvm_cache_misses: helper_compile_stats.llvm_cache_misses,
+                llvm_cache_load_time: helper_compile_stats.llvm_cache_load_time,
             },
             _marker: PhantomData,
         })
@@ -2379,6 +2402,10 @@ where
             );
         let promotion_offsets =
             compile_promotion_offsets(&promotion_plan, &symbolic_params, options.function_options)?;
+        let mut helper_compile_stats = OcpHelperCompileStats::default();
+        if let Some(function) = &promotion_offsets.function {
+            helper_compile_stats.record_compile_report(function.function.compile_report());
+        }
         let symbolic_library_for_nlp = symbolic_library.clone();
         let symbolic = symbolic_nlp::<
             DcVars<X, U, N, K>,
@@ -2440,6 +2467,7 @@ where
             .compile_report()
             .stats
             .llvm_total_instructions_emitted;
+        helper_compile_stats.record_compile_report(xdot_helper.function.compile_report());
         on_progress(OcpCompileProgress::HelperCompiled {
             helper: OcpCompileHelperKind::Xdot,
             elapsed: xdot_helper_time,
@@ -2459,6 +2487,9 @@ where
                 xdot_helper_total_instructions: Some(xdot_helper_total_instructions),
                 multiple_shooting_arc_helper_root_instructions: None,
                 multiple_shooting_arc_helper_total_instructions: None,
+                llvm_cache_hits: helper_compile_stats.llvm_cache_hits,
+                llvm_cache_misses: helper_compile_stats.llvm_cache_misses,
+                llvm_cache_load_time: helper_compile_stats.llvm_cache_load_time,
             },
             _marker: PhantomData,
         })

@@ -28,3 +28,4 @@ sx_core = { path = "../sx_core" }
 [dev-dependencies]
 approx.workspace = true
 sx_codegen_llvm = { path = "../sx_codegen_llvm" }
+tempfile.workspace = true

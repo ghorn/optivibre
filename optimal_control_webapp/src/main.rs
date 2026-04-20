@@ -165,6 +165,7 @@ async fn main() -> Result<()> {
         .route("/api/problems", get(problems))
         .route("/api/prewarm_status", get(prewarm_status))
         .route("/api/prewarm/{id}", post(prewarm))
+        .route("/api/clear_jit_cache", post(clear_jit_cache))
         .route("/api/solve/{id}", post(solve))
         .route("/api/solve_stream/{id}", post(solve_stream));
 
@@ -197,6 +198,12 @@ async fn problems() -> Json<Vec<optimal_control_problems::ProblemSpec>> {
 
 async fn prewarm_status() -> ApiResult<Json<CompileCacheSnapshot>> {
     Ok(Json(problem_backend().compile_snapshot()))
+}
+
+async fn clear_jit_cache() -> ApiResult<StatusCode> {
+    optimization::clear_optivibre_jit_cache()
+        .map_err(|error| internal_error(format!("failed to clear LLVM JIT cache: {error}")))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn prewarm(
@@ -238,10 +245,13 @@ async fn solve_stream(
         send_stream_event_async(&sender, SolveStreamEvent::Status { status }).await;
     }
     if let Some((line, level)) = context.initial_notice() {
-        send_stream_event_async(&sender, SolveStreamEvent::Log {
-            line: line.to_string(),
-            level,
-        })
+        send_stream_event_async(
+            &sender,
+            SolveStreamEvent::Log {
+                line: line.to_string(),
+                level,
+            },
+        )
         .await;
     }
     Ok(ndjson_stream_response(receiver))
@@ -600,25 +610,20 @@ fn compile_cache_status_from_parts(
         state,
         symbolic_setup_s: status.and_then(|status| status.solver.symbolic_setup_s),
         jit_s: status.and_then(|status| status.solver.jit_s),
+        jit_disk_cache_hit: status
+            .is_some_and(|status| status.solver.jit_disk_cache_hit || status.solver.compile_cached),
     }
-}
-
-fn mark_compile_status_cached(mut status: SolveStatus) -> SolveStatus {
-    status.solver.compile_cached = true;
-    status
 }
 
 fn ready_solve_status(
     latest_compile_status: Option<SolveStatus>,
     solver_method: Option<SolverMethod>,
 ) -> SolveStatus {
-    let mut status = latest_compile_status
-        .map(mark_compile_status_cached)
-        .unwrap_or_else(|| SolveStatus {
-            stage: SolveStage::Solving,
-            solver_method,
-            solver: SolverReport::in_progress(solver_running_label(solver_method)),
-        });
+    let mut status = latest_compile_status.unwrap_or_else(|| SolveStatus {
+        stage: SolveStage::Solving,
+        solver_method,
+        solver: SolverReport::in_progress(solver_running_label(solver_method)),
+    });
     status.stage = SolveStage::Solving;
     status.solver_method = solver_method;
     status.solver.status_label = solver_running_label(solver_method).to_string();
@@ -640,8 +645,13 @@ fn control_value_for_semantic(
     values: &BTreeMap<String, f64>,
     semantic: ControlSemantic,
 ) -> Option<f64> {
-    let spec = problem_specs().into_iter().find(|spec| spec.id == problem)?;
-    let control = spec.controls.iter().find(|control| control.semantic == semantic)?;
+    let spec = problem_specs()
+        .into_iter()
+        .find(|spec| spec.id == problem)?;
+    let control = spec
+        .controls
+        .iter()
+        .find(|control| control.semantic == semantic)?;
     Some(values.get(&control.id).copied().unwrap_or(control.default))
 }
 
@@ -914,4 +924,44 @@ fn spawn_stdio_reader(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    use tempfile::TempDir;
+
+    fn cache_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("cache env lock")
+    }
+
+    #[test]
+    fn clear_jit_cache_endpoint_removes_disk_cache_contents() {
+        let _guard = cache_env_lock();
+        let cache_root = TempDir::new().expect("temp cache root");
+        unsafe { std::env::set_var("OPTIVIBRE_JIT_CACHE_DIR", cache_root.path()) };
+
+        let nested = cache_root.path().join("v1/test/object.o");
+        std::fs::create_dir_all(nested.parent().expect("nested parent"))
+            .expect("create nested cache dir");
+        std::fs::write(&nested, b"cached-object").expect("write cached object");
+        assert!(nested.exists());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let status = runtime
+            .block_on(clear_jit_cache())
+            .expect("clear cache handler should succeed");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(!cache_root.path().exists());
+
+        unsafe { std::env::remove_var("OPTIVIBRE_JIT_CACHE_DIR") };
+    }
 }

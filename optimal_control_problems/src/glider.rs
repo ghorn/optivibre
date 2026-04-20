@@ -1,10 +1,9 @@
 use crate::common::{
     CompileCacheStatus, CompileProgressInfo, CompileProgressUpdate, ContinuousInitialGuess,
     FromMap, LatexSection, MetricKey, OcpRuntimeSpec, OcpSxFunctionConfig, PlotMode, ProblemId,
-    ProblemSpec, Scene2D, ScenePath, SolveArtifact, SolveStreamEvent, SolverMethod, SolverReport,
-    SolverConfig, StandardOcpParams, TranscriptionConfig, chart, default_solver_method,
-    default_solver_config, default_transcription, deg_to_rad,
-    direct_collocation_runtime_from_spec,
+    ProblemSpec, Scene2D, ScenePath, SolveArtifact, SolveStreamEvent, SolverConfig, SolverMethod,
+    SolverReport, StandardOcpParams, TranscriptionConfig, chart, default_solver_config,
+    default_solver_method, default_transcription, deg_to_rad, direct_collocation_runtime_from_spec,
     expect_finite, interval_arc_bound_series, interval_arc_series, metric_with_key,
     multiple_shooting_runtime_from_spec, node_times, numeric_metric_with_key,
     ocp_sx_function_config_from_map, problem_controls, problem_scientific_slider_control,

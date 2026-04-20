@@ -25,13 +25,14 @@ use optimization::{
     BackendCompileReport, BackendTimingMetadata, CallPolicy, CallPolicyConfig, ClarabelSqpError,
     ClarabelSqpOptions, ClarabelSqpProfiling, ClarabelSqpSummary, ConstraintSatisfaction,
     FilterAcceptanceMode, FiniteDifferenceValidationOptions, FunctionCompileOptions,
-    InteriorPointIterationSnapshot, InteriorPointLinearSolver, InteriorPointOptions, InteriorPointProfiling,
-    InteriorPointSolveError, InteriorPointSummary, LineSearchFilterOptions, LineSearchMeritOptions,
-    LlvmOptimizationLevel, NlpCompileStats, NlpDerivativeValidationReport, NlpEvaluationBenchmark,
-    NlpEvaluationBenchmarkOptions, NlpEvaluationKernelKind, SqpFilterOptions, SqpGlobalization,
-    SqpIterationEvent, SqpIterationPhase, SqpIterationSnapshot, SqpLineSearchOptions,
-    SqpTrustRegionOptions, SymbolicSetupProfile, TrustRegionFilterOptions, TrustRegionMeritOptions,
-    ValidationTolerances, Vectorize, format_nlip_settings_summary, format_sqp_settings_summary,
+    InteriorPointIterationSnapshot, InteriorPointLinearSolver, InteriorPointOptions,
+    InteriorPointProfiling, InteriorPointSolveError, InteriorPointSummary, LineSearchFilterOptions,
+    LineSearchMeritOptions, LlvmOptimizationLevel, NlpCompileStats, NlpDerivativeValidationReport,
+    NlpEvaluationBenchmark, NlpEvaluationBenchmarkOptions, NlpEvaluationKernelKind,
+    SqpFilterOptions, SqpGlobalization, SqpIterationEvent, SqpIterationPhase, SqpIterationSnapshot,
+    SqpLineSearchOptions, SqpTrustRegionOptions, SymbolicSetupProfile, TrustRegionFilterOptions,
+    TrustRegionMeritOptions, ValidationTolerances, Vectorize, format_nlip_settings_summary,
+    format_sqp_settings_summary,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptOptions, IpoptRawStatus, IpoptSummary, format_ipopt_settings_summary};
@@ -224,6 +225,8 @@ pub struct CompileCacheStatus {
     pub state: CompileCacheState,
     pub symbolic_setup_s: Option<f64>,
     pub jit_s: Option<f64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub jit_disk_cache_hit: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1582,6 +1585,8 @@ pub struct SolverReport {
     pub solve_s: Option<f64>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub compile_cached: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub jit_disk_cache_hit: bool,
     #[serde(default, skip_serializing_if = "SolverPhaseDetails::is_empty")]
     pub phase_details: SolverPhaseDetails,
 }
@@ -1604,6 +1609,10 @@ pub struct CompileReportSummary {
     pub lowering_s: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llvm_jit_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llvm_cache_load_s: Option<f64>,
+    pub llvm_cache_hits: usize,
+    pub llvm_cache_misses: usize,
     pub symbolic_function_count: usize,
     pub call_site_count: usize,
     pub max_call_depth: usize,
@@ -1628,6 +1637,7 @@ impl SolverReport {
             jit_s: None,
             solve_s: None,
             compile_cached: false,
+            jit_disk_cache_hit: false,
             phase_details: SolverPhaseDetails::default(),
         }
     }
@@ -1642,6 +1652,7 @@ impl SolverReport {
             jit_s: None,
             solve_s: None,
             compile_cached: false,
+            jit_disk_cache_hit: false,
             phase_details: SolverPhaseDetails::default(),
         }
     }
@@ -1671,6 +1682,7 @@ impl SolverReport {
 
     pub fn with_compile_cached(mut self, compile_cached: bool) -> Self {
         self.compile_cached = compile_cached;
+        self.jit_disk_cache_hit = compile_cached;
         self
     }
 
@@ -1690,6 +1702,9 @@ pub fn summarize_backend_compile_report(report: &BackendCompileReport) -> Compil
         hessian_generation_s: duration_seconds(report.setup_profile.hessian_generation),
         lowering_s: duration_seconds(report.setup_profile.lowering),
         llvm_jit_s: duration_seconds(report.setup_profile.llvm_jit),
+        llvm_cache_load_s: duration_seconds(Some(report.llvm_jit_cache.load_time)),
+        llvm_cache_hits: report.llvm_jit_cache.hits,
+        llvm_cache_misses: report.llvm_jit_cache.misses,
         symbolic_function_count: report.stats.symbolic_function_count,
         call_site_count: report.stats.call_site_count,
         max_call_depth: report.stats.max_call_depth,
@@ -2363,8 +2378,6 @@ where
         problem_name,
         multiple_shooting_cache,
         direct_collocation_cache,
-        |compiled| compiled.backend_timing_metadata(),
-        |compiled| compiled.backend_timing_metadata(),
     );
     statuses
 }
@@ -2824,7 +2837,12 @@ where
                 transcription,
                 collocation_family: None,
                 sx_functions,
-                compile_cached: compiled.was_cached,
+                compile_cached: compile_is_fully_disk_cached(
+                    Some(&summarize_backend_compile_report(
+                        compiled_ref.backend_compile_report(),
+                    )),
+                    compiled_ref.helper_compile_stats(),
+                ),
                 compile_report: summarize_backend_compile_report(
                     compiled_ref.backend_compile_report(),
                 ),
@@ -2848,7 +2866,12 @@ where
                 transcription,
                 collocation_family: Some(collocation_family),
                 sx_functions,
-                compile_cached: compiled.was_cached,
+                compile_cached: compile_is_fully_disk_cached(
+                    Some(&summarize_backend_compile_report(
+                        compiled_ref.backend_compile_report(),
+                    )),
+                    compiled_ref.helper_compile_stats(),
+                ),
                 compile_report: summarize_backend_compile_report(
                     compiled_ref.backend_compile_report(),
                 ),
@@ -2930,6 +2953,7 @@ pub fn compile_cache_status(
     variant_id: &str,
     variant_label: &str,
     timing: BackendTimingMetadata,
+    jit_disk_cache_hit: bool,
 ) -> CompileCacheStatus {
     CompileCacheStatus {
         problem_id,
@@ -2939,6 +2963,7 @@ pub fn compile_cache_status(
         state: CompileCacheState::Ready,
         symbolic_setup_s: symbolic_setup_seconds(timing),
         jit_s: duration_seconds(timing.jit_time),
+        jit_disk_cache_hit,
     }
 }
 
@@ -2994,44 +3019,39 @@ fn with_sx_variant_suffix(
     (variant_id, variant_label)
 }
 
-pub fn append_standard_compile_cache_statuses<Ms, Dc, MsTiming, DcTiming>(
+pub fn append_standard_compile_cache_statuses<Ms, Dc>(
     statuses: &mut Vec<CompileCacheStatus>,
     problem_id: ProblemId,
     problem_name: &str,
     multiple_shooting_cache: &SharedCompileCache<MultipleShootingCompileKey, Ms>,
     direct_collocation_cache: &SharedCompileCache<DirectCollocationCompileVariantKey, Dc>,
-    multiple_shooting_timing_of: MsTiming,
-    direct_collocation_timing_of: DcTiming,
 ) where
-    MsTiming: Fn(&Ms) -> BackendTimingMetadata,
-    DcTiming: Fn(&Dc) -> BackendTimingMetadata,
+    Ms: CompiledOcpMetadata,
+    Dc: CompiledOcpMetadata,
 {
     statuses.extend(collect_compile_cache_statuses(
         problem_id,
         problem_name,
         multiple_shooting_cache,
         multiple_shooting_variant_with_sx,
-        multiple_shooting_timing_of,
     ));
     statuses.extend(collect_compile_cache_statuses(
         problem_id,
         problem_name,
         direct_collocation_cache,
         direct_collocation_variant_with_sx,
-        direct_collocation_timing_of,
     ));
 }
 
-pub fn collect_compile_cache_statuses<K, V, F, G>(
+pub fn collect_compile_cache_statuses<K, V, G>(
     problem_id: ProblemId,
     problem_name: &str,
     cache: &SharedCompileCache<K, V>,
     describe_variant: G,
-    timing_of: F,
 ) -> Vec<CompileCacheStatus>
 where
     K: Eq + Hash + Copy,
-    F: Fn(&V) -> BackendTimingMetadata,
+    V: CompiledOcpMetadata,
     G: Fn(K) -> (String, String),
 {
     cache
@@ -3039,12 +3059,19 @@ where
         .into_iter()
         .map(|(key, compiled)| {
             let (variant_id, variant_label) = describe_variant(key);
+            let compiled = compiled.borrow();
             compile_cache_status(
                 problem_id,
                 problem_name,
                 &variant_id,
                 &variant_label,
-                timing_of(&compiled.borrow()),
+                compiled.backend_timing_metadata(),
+                compile_is_fully_disk_cached(
+                    Some(&summarize_backend_compile_report(
+                        compiled.backend_compile_report(),
+                    )),
+                    compiled.helper_compile_stats(),
+                ),
             )
         })
         .collect()
@@ -3206,6 +3233,67 @@ fn helper_compile_phase_details(helper_stats: OcpHelperCompileStats) -> Vec<Solv
     details
 }
 
+fn total_llvm_cache_hits(
+    compile_report: Option<&CompileReportSummary>,
+    helper_stats: OcpHelperCompileStats,
+) -> usize {
+    compile_report.map_or(0, |report| report.llvm_cache_hits) + helper_stats.llvm_cache_hits
+}
+
+fn total_llvm_cache_misses(
+    compile_report: Option<&CompileReportSummary>,
+    helper_stats: OcpHelperCompileStats,
+) -> usize {
+    compile_report.map_or(0, |report| report.llvm_cache_misses) + helper_stats.llvm_cache_misses
+}
+
+fn llvm_cache_load_seconds(
+    compile_report: Option<&CompileReportSummary>,
+    helper_stats: OcpHelperCompileStats,
+) -> Option<f64> {
+    let nlp = compile_report
+        .and_then(|report| report.llvm_cache_load_s)
+        .unwrap_or(0.0);
+    let helper = duration_seconds(Some(helper_stats.llvm_cache_load_time)).unwrap_or(0.0);
+    let total = nlp + helper;
+    (total > 0.0).then_some(total)
+}
+
+fn compile_is_fully_disk_cached(
+    compile_report: Option<&CompileReportSummary>,
+    helper_stats: OcpHelperCompileStats,
+) -> bool {
+    let hits = total_llvm_cache_hits(compile_report, helper_stats);
+    let misses = total_llvm_cache_misses(compile_report, helper_stats);
+    hits > 0 && misses == 0
+}
+
+fn llvm_cache_phase_details(
+    compile_report: Option<&CompileReportSummary>,
+    helper_stats: OcpHelperCompileStats,
+) -> Vec<SolverPhaseDetail> {
+    let hits = total_llvm_cache_hits(compile_report, helper_stats);
+    let misses = total_llvm_cache_misses(compile_report, helper_stats);
+    if hits == 0 && misses == 0 {
+        return Vec::new();
+    }
+
+    let mut details = vec![
+        phase_detail("LLVM Cache Hits", hits.to_string(), 0),
+        phase_detail("LLVM Cache Misses", misses.to_string(), 0),
+    ];
+    if let Some(load_s) = llvm_cache_load_seconds(compile_report, helper_stats) {
+        if load_s > 0.0 {
+            details.push(phase_detail(
+                "LLVM Cache Load",
+                format_phase_duration(Duration::from_secs_f64(load_s)),
+                0,
+            ));
+        }
+    }
+    details
+}
+
 pub fn ocp_compile_progress_update(
     progress: OcpCompileProgress,
     state: &mut OcpCompileProgressState,
@@ -3261,9 +3349,13 @@ pub fn compile_progress_info(
 ) -> CompileProgressInfo {
     let mut jit = jit_phase_details(stats, helper_kernel_count);
     jit.extend(helper_compile_phase_details(helper_stats));
+    jit.extend(llvm_cache_phase_details(
+        compile_report.as_ref(),
+        helper_stats,
+    ));
     CompileProgressInfo {
         timing,
-        compile_cached: false,
+        compile_cached: compile_is_fully_disk_cached(compile_report.as_ref(), helper_stats),
         phase_details: SolverPhaseDetails {
             symbolic_setup: symbolic_phase_details(stats, None),
             jit,
@@ -3403,13 +3495,13 @@ where
         on_symbolic_ready(CompileProgressUpdate {
             timing: pre_jit_backend_timing(progress.timing),
             phase_details: progress.phase_details.clone(),
-            compile_cached: true,
+            compile_cached: progress.compile_cached,
         });
     }
     Ok((
         cached.compiled,
         CompileProgressInfo {
-            compile_cached: cached.was_cached,
+            compile_cached: progress.compile_cached,
             ..progress
         },
     ))
@@ -8093,6 +8185,7 @@ pub fn sqp_solver_report(
         jit_s: duration_seconds(summary.profiling.backend_timing.jit_time),
         solve_s: Some(summary.profiling.total_time.as_secs_f64()),
         compile_cached: false,
+        jit_disk_cache_hit: false,
         phase_details: SolverPhaseDetails {
             solve: prepend_solver_settings_detail(
                 sqp_solve_phase_details(&summary.profiling),
@@ -8116,6 +8209,7 @@ pub fn nlip_solver_report(
         jit_s: duration_seconds(summary.profiling.backend_timing.jit_time),
         solve_s: Some(summary.profiling.total_time.as_secs_f64()),
         compile_cached: false,
+        jit_disk_cache_hit: false,
         phase_details: SolverPhaseDetails {
             solve: prepend_solver_settings_detail(
                 nlip_solve_phase_details(&summary.profiling),
@@ -8137,6 +8231,7 @@ pub fn ipopt_solver_report(summary: &IpoptSummary, options: &IpoptOptions) -> So
         jit_s: duration_seconds(summary.profiling.backend_timing.jit_time),
         solve_s: Some(summary.profiling.total_time.as_secs_f64()),
         compile_cached: false,
+        jit_disk_cache_hit: false,
         phase_details: SolverPhaseDetails {
             solve: prepend_solver_settings_detail(
                 ipopt_solve_phase_details(&summary.profiling),
@@ -8531,6 +8626,7 @@ fn merge_failure_solver_report(
     report.jit_s = report.jit_s.or(fallback.jit_s);
     report.solve_s = report.solve_s.or(fallback.solve_s);
     report.compile_cached = report.compile_cached || fallback.compile_cached;
+    report.jit_disk_cache_hit = report.jit_disk_cache_hit || fallback.jit_disk_cache_hit;
     report.phase_details = phase_details;
     report
 }
@@ -8582,6 +8678,7 @@ pub fn sqp_failure_solver_report(
             jit_s: duration_seconds(context.profiling.backend_timing.jit_time),
             solve_s: Some(context.profiling.total_time.as_secs_f64()),
             compile_cached: false,
+            jit_disk_cache_hit: false,
             phase_details: SolverPhaseDetails::default(),
         },
         fallback,
@@ -8640,6 +8737,7 @@ pub fn nlip_failure_solver_report(
             jit_s: duration_seconds(profiling.backend_timing.jit_time),
             solve_s: Some(profiling.total_time.as_secs_f64()),
             compile_cached: false,
+            jit_disk_cache_hit: false,
             phase_details: SolverPhaseDetails::default(),
         },
         fallback,
@@ -8681,6 +8779,7 @@ pub fn ipopt_failure_solver_report(
             jit_s: duration_seconds(profiling.backend_timing.jit_time),
             solve_s: Some(profiling.total_time.as_secs_f64()),
             compile_cached: false,
+            jit_disk_cache_hit: false,
             phase_details: SolverPhaseDetails::default(),
         },
         fallback,
@@ -9218,7 +9317,10 @@ mod tests {
         values.insert("solver_nlip_linear_solver".to_string(), 1.0);
         let parsed = solver_config_from_map(&values, default_solver_config())
             .expect("solver config should parse");
-        assert_eq!(parsed.nlip.linear_solver, InteriorPointLinearSolver::SparseQdldl);
+        assert_eq!(
+            parsed.nlip.linear_solver,
+            InteriorPointLinearSolver::SparseQdldl
+        );
     }
 
     #[test]

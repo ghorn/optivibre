@@ -17,7 +17,9 @@ use std::sync::{
     atomic::{AtomicU8, Ordering},
 };
 use std::time::{Duration, Instant};
-pub use sx_codegen_llvm::{FunctionCompileOptions, LlvmOptimizationLevel};
+pub use sx_codegen_llvm::{
+    FunctionCompileOptions, LlvmOptimizationLevel, clear_optivibre_jit_cache,
+};
 pub use sx_core::{CallPolicy, CallPolicyConfig, CompileStats, CompileWarning};
 use thiserror::Error;
 
@@ -291,8 +293,17 @@ pub struct SymbolicSetupProfile {
 pub struct BackendCompileReport {
     pub timing: BackendTimingMetadata,
     pub setup_profile: SymbolicSetupProfile,
+    pub llvm_jit_cache: LlvmJitCacheStats,
     pub stats: CompileStats,
     pub warnings: Vec<CompileWarning>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LlvmJitCacheStats {
+    pub hits: Index,
+    pub misses: Index,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
+    pub load_time: Duration,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]

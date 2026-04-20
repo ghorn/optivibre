@@ -16,11 +16,12 @@ use std::time::Instant;
 
 use optimization::{
     ClarabelSqpError, ClarabelSqpOptions, ClarabelSqpSummary, CompiledNlpProblem,
-    FilterAcceptanceMode, InteriorPointIterationSnapshot, InteriorPointOptions,
-    InteriorPointSolveError, InteriorPointSummary, LineSearchFilterOptions, SqpGlobalization,
-    SqpIterationSnapshot, SymbolicNlpOutputs, TypedCompiledJitNlp, TypedRuntimeNlpBounds,
-    Vectorize, format_nlip_settings_summary, format_sqp_settings_summary, nlip_event_codes,
-    nlip_event_legend_entries, sqp_event_codes, sqp_event_legend_entries, sqp_iteration_label,
+    FilterAcceptanceMode, InteriorPointIterationSnapshot, InteriorPointLinearSolver,
+    InteriorPointOptions, InteriorPointSolveError, InteriorPointSummary, LineSearchFilterOptions,
+    SqpGlobalization, SqpIterationSnapshot, SymbolicNlpOutputs, TypedCompiledJitNlp,
+    TypedRuntimeNlpBounds, Vectorize, format_nlip_settings_summary, format_sqp_settings_summary,
+    nlip_event_codes, nlip_event_legend_entries, sqp_event_codes, sqp_event_legend_entries,
+    sqp_iteration_label,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{
@@ -461,6 +462,7 @@ where
                 dual_tol: STRICT_TERMINATION_TOL,
                 constraint_tol: STRICT_TERMINATION_TOL,
                 complementarity_tol: STRICT_TERMINATION_TOL,
+                linear_solver: InteriorPointLinearSolver::Auto,
                 verbose: false,
                 ..InteriorPointOptions::default()
             };

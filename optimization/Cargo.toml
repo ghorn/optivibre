@@ -38,3 +38,4 @@ proptest.workspace = true
 rstest.workspace = true
 serde_json.workspace = true
 sparse_validation = { path = "../sparse_validation" }
+tempfile.workspace = true

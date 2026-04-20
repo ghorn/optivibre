@@ -452,6 +452,7 @@ interface WireCompileCacheStatus {
   state: string | number;
   symbolic_setup_s?: number | null;
   jit_s?: number | null;
+  jit_disk_cache_hit?: boolean;
 }
 
 interface WireCompileCacheSnapshot {
@@ -467,6 +468,7 @@ interface CompileCacheStatus {
   state: CompileCacheStateCode;
   symbolic_setup_s: number | null;
   jit_s: number | null;
+  jit_disk_cache_hit: boolean;
 }
 
 interface Metric {
@@ -654,6 +656,7 @@ interface SolverReport {
   jit_s?: number | null;
   solve_s?: number | null;
   compile_cached: boolean;
+  jit_disk_cache_hit: boolean;
   phase_details: SolverPhaseDetails;
   failure_message?: string;
 }
@@ -1107,6 +1110,11 @@ function readWireCompileCacheStatus(
       readOptionalJsonNumber(readJsonValueAt(object, "symbolic_setup_s"), `${context}.symbolic_setup_s`) ??
       null,
     jit_s: readOptionalJsonNumber(readJsonValueAt(object, "jit_s"), `${context}.jit_s`) ?? null,
+    jit_disk_cache_hit:
+      readOptionalJsonBoolean(
+        readJsonValueAt(object, "jit_disk_cache_hit"),
+        `${context}.jit_disk_cache_hit`,
+      ) ?? false,
   };
 }
 
@@ -1464,6 +1472,12 @@ function readWireSolverReport(value: JsonValue | undefined, context: string): Wi
     compile_cached:
       readOptionalJsonBoolean(readJsonValueAt(object, "compile_cached"), `${context}.compile_cached`) ??
       false,
+    jit_disk_cache_hit:
+      readOptionalJsonBoolean(
+        readJsonValueAt(object, "jit_disk_cache_hit"),
+        `${context}.jit_disk_cache_hit`,
+      ) ??
+      false,
     phase_details:
       readSolverPhaseDetails(readJsonValueAt(object, "phase_details"), `${context}.phase_details`),
     failure_message:
@@ -1617,6 +1631,7 @@ const progressPlotEl = requiredElement<PlotlyHostElement>("#progress-plot");
 const filterPlotEl = requiredElement<PlotlyHostElement>("#filter-plot");
 const trustRegionPlotEl = requiredElement<PlotlyHostElement>("#trust-region-plot");
 const copyConsoleButton = requiredElement<HTMLButtonElement>("#copy-console-button");
+const clearJitCacheButton = requiredElement<HTMLButtonElement>("#clear-jit-cache-button");
 const solverLogEl = requiredElement<HTMLPreElement>("#solver-log");
 const prewarmStatusEl = requiredElement<HTMLDivElement>("#prewarm-status");
 const eqViolationsEl = requiredElement<HTMLDivElement>("#eq-violations");
@@ -1867,12 +1882,19 @@ function formatDuration(seconds: number | null | undefined): string {
   return `${(seconds * 1.0e6).toFixed(1)} us`;
 }
 
-function formatCompileDuration(seconds: number | null | undefined, compileCached: boolean): string {
+function formatCompileDuration(seconds: number | null | undefined): string {
+  return formatDuration(seconds);
+}
+
+function formatJitDuration(
+  seconds: number | null | undefined,
+  jitDiskCacheHit: boolean,
+): string {
   const formatted = formatDuration(seconds);
-  if (!compileCached || formatted === "--") {
+  if (formatted === "--") {
     return formatted;
   }
-  return `${formatted} (cached)`;
+  return `${formatted} (${jitDiskCacheHit ? "disk hit" : "disk miss"})`;
 }
 
 function emptySolverPhaseDetails(): SolverPhaseDetails {
@@ -1994,6 +2016,8 @@ function buildStatusSolverReport(status: SolveStatus): SolverReport {
     jit_s: nextSolver.jit_s ?? liveSolver?.jit_s ?? null,
     solve_s: nextSolver.solve_s ?? liveSolver?.solve_s ?? null,
     compile_cached: nextSolver.compile_cached || liveSolver?.compile_cached === true,
+    jit_disk_cache_hit:
+      nextSolver.jit_disk_cache_hit || liveSolver?.jit_disk_cache_hit === true,
     phase_details: mergeSolverPhaseDetails(nextSolver.phase_details, liveSolver?.phase_details),
   };
 }
@@ -2012,6 +2036,7 @@ function buildFailureSolverReport(message: string): SolverReport {
     jit_s: liveSolver?.jit_s ?? null,
     solve_s: liveSolver?.solve_s ?? null,
     compile_cached: liveSolver?.compile_cached ?? false,
+    jit_disk_cache_hit: liveSolver?.jit_disk_cache_hit ?? false,
     phase_details: normalizeSolverPhaseDetails(liveSolver?.phase_details),
     failure_message: message,
   };
@@ -2028,6 +2053,7 @@ function mergeSolverReport(
     jit_s: next.jit_s ?? fallback?.jit_s ?? null,
     solve_s: next.solve_s ?? fallback?.solve_s ?? null,
     compile_cached: next.compile_cached || fallback?.compile_cached === true,
+    jit_disk_cache_hit: next.jit_disk_cache_hit || fallback?.jit_disk_cache_hit === true,
     phase_details: mergeSolverPhaseDetails(next.phase_details, fallback?.phase_details),
     failure_message: next.failure_message ?? fallback?.failure_message,
   };
@@ -2279,8 +2305,8 @@ function renderCompileCacheStatus(): void {
     rowEl.innerHTML = `
       <div class="compile-cache-problem">${escapeHtml(row.problem_name)}</div>
       <div class="compile-cache-variant">${escapeHtml(row.variant_label)}</div>
-      <div class="compile-cache-timing">${escapeHtml(formatDuration(row.symbolic_setup_s))}</div>
-      <div class="compile-cache-timing">${escapeHtml(formatDuration(row.jit_s))}</div>
+      <div class="compile-cache-timing">${escapeHtml(formatCompileDuration(row.symbolic_setup_s))}</div>
+      <div class="compile-cache-timing">${escapeHtml(formatJitDuration(row.jit_s, row.jit_disk_cache_hit))}</div>
       <div class="compile-cache-status"><span class="compile-cache-badge compile-cache-badge-${statusLabel}">${statusLabel}</span></div>
     `;
     table.appendChild(rowEl);
@@ -2347,6 +2373,7 @@ function normalizeCompileCacheStatus(status: WireCompileCacheStatus): CompileCac
     state: decodeWireEnum(COMPILE_CACHE_STATE_FROM_WIRE, status.state, COMPILE_CACHE_STATE.ready),
     symbolic_setup_s: status.symbolic_setup_s ?? null,
     jit_s: status.jit_s ?? null,
+    jit_disk_cache_hit: status.jit_disk_cache_hit ?? false,
   };
 }
 
@@ -2362,6 +2389,7 @@ function normalizeSolverReport(solver: WireSolverReport): SolverReport {
       SOLVER_STATUS_KIND.info,
     ),
     compile_cached: solver.compile_cached ?? false,
+    jit_disk_cache_hit: solver.jit_disk_cache_hit ?? solver.compile_cached ?? false,
     phase_details: normalizeSolverPhaseDetails(solver.phase_details),
   };
 }
@@ -2626,6 +2654,25 @@ async function refreshCompileCacheStatus(): Promise<void> {
     renderCompileCacheStatus();
   } catch (error) {
     console.warn("compile cache status refresh failed", error);
+  }
+}
+
+async function clearJitCache(): Promise<void> {
+  clearJitCacheButton.disabled = true;
+  try {
+    const response = await fetch("/api/clear_jit_cache", { method: "POST" });
+    const payload = await readResponseJsonValue(response, "/api/clear_jit_cache");
+    if (!response.ok) {
+      throw new Error(readOptionalErrorMessage(payload) ?? `Request failed with ${response.status}`);
+    }
+    appendLogLine("Cleared on-disk LLVM JIT cache.", LOG_LEVEL.info);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn("failed to clear LLVM JIT cache", error);
+    appendLogLine(`Failed to clear LLVM JIT cache: ${message}`, LOG_LEVEL.error);
+  } finally {
+    clearJitCacheButton.disabled = false;
+    void refreshCompileCacheStatus();
   }
 }
 
@@ -3574,12 +3621,15 @@ function renderMetrics(): void {
   const singleCards = [
     {
       label: "Symbolic Setup",
-      value: formatCompileDuration(solver?.symbolic_setup_s ?? null, solver?.compile_cached ?? false),
+      value: formatCompileDuration(solver?.symbolic_setup_s ?? null),
       active: activeStage === SOLVE_STAGE.symbolicSetup,
     },
     {
       label: "JIT",
-      value: formatCompileDuration(solver?.jit_s ?? null, solver?.compile_cached ?? false),
+      value: formatJitDuration(
+        solver?.jit_s ?? null,
+        solver?.jit_disk_cache_hit ?? solver?.compile_cached ?? false,
+      ),
       active: activeStage === SOLVE_STAGE.jitCompilation,
     },
   ];
@@ -4299,14 +4349,17 @@ function renderSolverPhaseSummary(solver: SolverReport): HTMLElement {
   grid.append(
     createSolverPhaseCard({
       label: "Symbolic Setup",
-      value: formatCompileDuration(solver.symbolic_setup_s ?? null, solver.compile_cached),
+      value: formatCompileDuration(solver.symbolic_setup_s ?? null),
       active: activeStage === SOLVE_STAGE.symbolicSetup,
       details: solver.phase_details.symbolic_setup,
       fallbackText: "Building symbolic model and derivatives.",
     }),
     createSolverPhaseCard({
       label: "JIT",
-      value: formatCompileDuration(solver.jit_s ?? null, solver.compile_cached),
+      value: formatJitDuration(
+        solver.jit_s ?? null,
+        solver.jit_disk_cache_hit || solver.compile_cached,
+      ),
       active: activeStage === SOLVE_STAGE.jitCompilation,
       details: solver.phase_details.jit,
       fallbackText: "Compiling numeric evaluation kernels.",
@@ -5788,6 +5841,9 @@ async function init(): Promise<void> {
     solveButton.addEventListener("click", solveCurrentProblem);
     copyConsoleButton.addEventListener("click", () => {
       void copyConsoleTranscript();
+    });
+    clearJitCacheButton.addEventListener("click", () => {
+      void clearJitCache();
     });
     solverLogEl.addEventListener("scroll", syncConsoleFollowState);
     resetCopyConsoleButton();
