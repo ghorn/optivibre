@@ -1,4 +1,8 @@
+use std::cmp::Reverse;
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use metis_ordering::{
     CsrGraph, NestedDissectionOptions, OrderingError, Permutation,
@@ -168,6 +172,76 @@ pub struct FactorInfo {
     pub regularized_pivots: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FactorizationProgressSnapshot {
+    pub total_fronts: usize,
+    pub completed_fronts: usize,
+    pub total_pivots: usize,
+    pub completed_pivots: usize,
+    pub total_weight: u64,
+    pub completed_weight: u64,
+    pub total_roots: usize,
+    pub completed_roots: usize,
+    pub total_root_delayed_blocks: usize,
+    pub completed_root_delayed_blocks: usize,
+    pub current_root_delayed_block: usize,
+    pub current_root_delayed_block_size: usize,
+    pub current_root_delayed_inverse_column: usize,
+    pub root_delayed_stage: RootDelayedBlockStage,
+}
+
+impl FactorizationProgressSnapshot {
+    pub fn weighted_percent(self) -> f64 {
+        if self.total_weight == 0 {
+            100.0
+        } else {
+            100.0 * self.completed_weight as f64 / self.total_weight as f64
+        }
+    }
+
+    pub fn pivot_percent(self) -> f64 {
+        if self.total_pivots == 0 {
+            100.0
+        } else {
+            100.0 * self.completed_pivots as f64 / self.total_pivots as f64
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootDelayedBlockStage {
+    Idle,
+    Packing,
+    Factoring,
+    Inverting,
+    Eigenvalues,
+    Emitting,
+}
+
+impl RootDelayedBlockStage {
+    fn from_usize(value: usize) -> Self {
+        match value {
+            1 => Self::Packing,
+            2 => Self::Factoring,
+            3 => Self::Inverting,
+            4 => Self::Eigenvalues,
+            5 => Self::Emitting,
+            _ => Self::Idle,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Packing => "packing",
+            Self::Factoring => "factoring",
+            Self::Inverting => "inverting",
+            Self::Eigenvalues => "eigenvalues",
+            Self::Emitting => "emitting",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AnalyseInfo {
     pub estimated_fill_nnz: usize,
@@ -188,6 +262,8 @@ impl Supernode {
         self.end_column - self.start_column
     }
 }
+
+const RELAXED_NODE_AMALGAMATION_NEMIN: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SymbolicFactor {
@@ -212,8 +288,7 @@ struct DiagonalBlockValue {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SymbolicFront {
-    start_column: usize,
-    end_column: usize,
+    columns: Vec<usize>,
     interface_rows: Vec<usize>,
     parent: Option<usize>,
     children: Vec<usize>,
@@ -221,7 +296,11 @@ struct SymbolicFront {
 
 impl SymbolicFront {
     fn width(&self) -> usize {
-        self.end_column - self.start_column
+        self.columns.len()
+    }
+
+    fn first_column(&self) -> usize {
+        self.columns.first().copied().unwrap_or(usize::MAX)
     }
 }
 
@@ -229,6 +308,119 @@ impl SymbolicFront {
 struct SymbolicFrontTree {
     fronts: Vec<SymbolicFront>,
     roots: Vec<usize>,
+}
+
+#[derive(Debug)]
+struct FactorizationProgressShared {
+    total_fronts: usize,
+    total_pivots: usize,
+    total_weight: u64,
+    total_roots: usize,
+    total_root_delayed_blocks: AtomicUsize,
+    completed_fronts: AtomicUsize,
+    completed_pivots: AtomicUsize,
+    completed_weight: AtomicU64,
+    completed_roots: AtomicUsize,
+    completed_root_delayed_blocks: AtomicUsize,
+    current_root_delayed_block: AtomicUsize,
+    current_root_delayed_block_size: AtomicUsize,
+    current_root_delayed_inverse_column: AtomicUsize,
+    root_delayed_stage: AtomicUsize,
+}
+
+impl FactorizationProgressShared {
+    fn snapshot(&self) -> FactorizationProgressSnapshot {
+        FactorizationProgressSnapshot {
+            total_fronts: self.total_fronts,
+            completed_fronts: self.completed_fronts.load(Ordering::Relaxed),
+            total_pivots: self.total_pivots,
+            completed_pivots: self.completed_pivots.load(Ordering::Relaxed),
+            total_weight: self.total_weight,
+            completed_weight: self.completed_weight.load(Ordering::Relaxed),
+            total_roots: self.total_roots,
+            completed_roots: self.completed_roots.load(Ordering::Relaxed),
+            total_root_delayed_blocks: self.total_root_delayed_blocks.load(Ordering::Relaxed),
+            completed_root_delayed_blocks: self
+                .completed_root_delayed_blocks
+                .load(Ordering::Relaxed),
+            current_root_delayed_block: self.current_root_delayed_block.load(Ordering::Relaxed),
+            current_root_delayed_block_size: self
+                .current_root_delayed_block_size
+                .load(Ordering::Relaxed),
+            current_root_delayed_inverse_column: self
+                .current_root_delayed_inverse_column
+                .load(Ordering::Relaxed),
+            root_delayed_stage: RootDelayedBlockStage::from_usize(
+                self.root_delayed_stage.load(Ordering::Relaxed),
+            ),
+        }
+    }
+
+    fn begin_root_delayed_block(&self, block_index: usize, size: usize) {
+        self.current_root_delayed_block
+            .store(block_index, Ordering::Relaxed);
+        self.current_root_delayed_block_size
+            .store(size, Ordering::Relaxed);
+        self.current_root_delayed_inverse_column
+            .store(0, Ordering::Relaxed);
+        self.root_delayed_stage
+            .store(RootDelayedBlockStage::Packing as usize, Ordering::Relaxed);
+    }
+
+    fn set_root_delayed_stage(&self, stage: RootDelayedBlockStage) {
+        self.root_delayed_stage
+            .store(stage as usize, Ordering::Relaxed);
+    }
+
+    fn set_root_delayed_inverse_column(&self, column: usize) {
+        self.current_root_delayed_inverse_column
+            .store(column, Ordering::Relaxed);
+    }
+
+    fn finish_root_delayed_block(&self) {
+        self.completed_root_delayed_blocks
+            .fetch_add(1, Ordering::Relaxed);
+        self.current_root_delayed_block.store(0, Ordering::Relaxed);
+        self.current_root_delayed_block_size
+            .store(0, Ordering::Relaxed);
+        self.current_root_delayed_inverse_column
+            .store(0, Ordering::Relaxed);
+        self.root_delayed_stage
+            .store(RootDelayedBlockStage::Idle as usize, Ordering::Relaxed);
+    }
+}
+
+static FACTORIZATION_PROGRESS: OnceLock<Mutex<Option<Arc<FactorizationProgressShared>>>> =
+    OnceLock::new();
+
+fn factorization_progress_slot() -> &'static Mutex<Option<Arc<FactorizationProgressShared>>> {
+    FACTORIZATION_PROGRESS.get_or_init(|| Mutex::new(None))
+}
+
+struct FactorizationProgressGuard;
+
+impl Drop for FactorizationProgressGuard {
+    fn drop(&mut self) {
+        *factorization_progress_slot()
+            .lock()
+            .expect("factorization progress slot poisoned") = None;
+    }
+}
+
+fn install_factorization_progress(
+    progress: Arc<FactorizationProgressShared>,
+) -> FactorizationProgressGuard {
+    *factorization_progress_slot()
+        .lock()
+        .expect("factorization progress slot poisoned") = Some(progress);
+    FactorizationProgressGuard
+}
+
+pub fn current_factorization_progress() -> Option<FactorizationProgressSnapshot> {
+    factorization_progress_slot()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().map(|progress| progress.snapshot()))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -536,89 +728,178 @@ pub enum SsidsError {
     NumericalBreakdown { pivot: usize, detail: String },
 }
 
+fn analyse_debug_enabled() -> bool {
+    std::env::var_os("SPRAL_SSIDS_DEBUG_ANALYSE").is_some()
+}
+
+fn analyse_debug_log(message: impl AsRef<str>) {
+    if analyse_debug_enabled() {
+        eprintln!("{}", message.as_ref());
+    }
+}
+
 pub fn analyse(
     matrix: SymmetricCscMatrix<'_>,
     options: &SsidsOptions,
 ) -> Result<(SymbolicFactor, AnalyseInfo), SsidsError> {
     let graph =
         CsrGraph::from_symmetric_csc(matrix.dimension(), matrix.col_ptrs(), matrix.row_indices())?;
+    let analyse_started = Instant::now();
     match options.ordering {
         OrderingStrategy::Natural => {
+            analyse_debug_log(format!(
+                "[spral_ssids::analyse] strategy=natural dim={} nnz={}",
+                matrix.dimension(),
+                matrix.row_indices().len(),
+            ));
             let permutation = Permutation::identity(matrix.dimension());
             let (elimination_tree, column_counts, column_pattern) = symbolic_factor_pattern(&graph);
-            Ok(build_symbolic_result(
+            let result = build_symbolic_result(
                 permutation,
                 elimination_tree,
                 column_counts,
                 column_pattern,
                 "natural",
-            ))
+            );
+            analyse_debug_log(format!(
+                "[spral_ssids::analyse] strategy=natural done in {:.3}s fill={} supernodes={}",
+                analyse_started.elapsed().as_secs_f64(),
+                result.1.estimated_fill_nnz,
+                result.1.supernode_count,
+            ));
+            Ok(result)
         }
         OrderingStrategy::ApproximateMinimumDegree => {
+            analyse_debug_log(format!(
+                "[spral_ssids::analyse] strategy=amd dim={} nnz={} start",
+                matrix.dimension(),
+                matrix.row_indices().len(),
+            ));
             let summary = approximate_minimum_degree_order(&graph)?;
             let permuted_graph = permute_graph(&graph, &summary.permutation);
             let (elimination_tree, column_counts, column_pattern) =
                 symbolic_factor_pattern(&permuted_graph);
-            Ok(build_symbolic_result(
+            let result = build_symbolic_result(
                 summary.permutation,
                 elimination_tree,
                 column_counts,
                 column_pattern,
                 "approximate_minimum_degree",
-            ))
+            );
+            analyse_debug_log(format!(
+                "[spral_ssids::analyse] strategy=amd done in {:.3}s fill={} supernodes={}",
+                analyse_started.elapsed().as_secs_f64(),
+                result.1.estimated_fill_nnz,
+                result.1.supernode_count,
+            ));
+            Ok(result)
         }
         OrderingStrategy::NestedDissection(ordering_options) => {
+            analyse_debug_log(format!(
+                "[spral_ssids::analyse] strategy=nested_dissection dim={} nnz={} start",
+                matrix.dimension(),
+                matrix.row_indices().len(),
+            ));
             let summary = nested_dissection_order(&graph, &ordering_options)?;
             let permuted_graph = permute_graph(&graph, &summary.permutation);
             let (elimination_tree, column_counts, column_pattern) =
                 symbolic_factor_pattern(&permuted_graph);
-            Ok(build_symbolic_result(
+            let result = build_symbolic_result(
                 summary.permutation,
                 elimination_tree,
                 column_counts,
                 column_pattern,
                 "nested_dissection",
-            ))
+            );
+            analyse_debug_log(format!(
+                "[spral_ssids::analyse] strategy=nested_dissection done in {:.3}s fill={} supernodes={}",
+                analyse_started.elapsed().as_secs_f64(),
+                result.1.estimated_fill_nnz,
+                result.1.supernode_count,
+            ));
+            Ok(result)
         }
         OrderingStrategy::Auto(ordering_options) => {
+            analyse_debug_log(format!(
+                "[spral_ssids::analyse] strategy=auto dim={} nnz={} start",
+                matrix.dimension(),
+                matrix.row_indices().len(),
+            ));
             let natural_permutation = Permutation::identity(matrix.dimension());
+            analyse_debug_log("[spral_ssids::analyse] auto natural symbolic start");
             let (natural_tree, natural_counts, natural_pattern) = symbolic_factor_pattern(&graph);
             let natural_fill = natural_counts.iter().sum::<usize>();
+            analyse_debug_log(format!(
+                "[spral_ssids::analyse] auto natural symbolic done fill={} elapsed={:.3}s",
+                natural_fill,
+                analyse_started.elapsed().as_secs_f64(),
+            ));
 
+            let amd_started = Instant::now();
+            analyse_debug_log("[spral_ssids::analyse] auto amd start");
             let amd_summary = approximate_minimum_degree_order(&graph)?;
             let amd_graph = permute_graph(&graph, &amd_summary.permutation);
             let (amd_tree, amd_counts, amd_pattern) = symbolic_factor_pattern(&amd_graph);
             let amd_fill = amd_counts.iter().sum::<usize>();
+            analyse_debug_log(format!(
+                "[spral_ssids::analyse] auto amd done fill={} elapsed={:.3}s total={:.3}s",
+                amd_fill,
+                amd_started.elapsed().as_secs_f64(),
+                analyse_started.elapsed().as_secs_f64(),
+            ));
 
+            let nd_started = Instant::now();
+            analyse_debug_log("[spral_ssids::analyse] auto nested dissection start");
             let summary = nested_dissection_order(&graph, &ordering_options)?;
             let permuted_graph = permute_graph(&graph, &summary.permutation);
             let (nd_tree, nd_counts, nd_pattern) = symbolic_factor_pattern(&permuted_graph);
             let nd_fill = nd_counts.iter().sum::<usize>();
+            analyse_debug_log(format!(
+                "[spral_ssids::analyse] auto nested dissection done fill={} elapsed={:.3}s total={:.3}s",
+                nd_fill,
+                nd_started.elapsed().as_secs_f64(),
+                analyse_started.elapsed().as_secs_f64(),
+            ));
 
             if amd_fill <= natural_fill && amd_fill <= nd_fill {
-                Ok(build_symbolic_result(
+                let result = build_symbolic_result(
                     amd_summary.permutation,
                     amd_tree,
                     amd_counts,
                     amd_pattern,
                     "auto_approximate_minimum_degree",
-                ))
+                );
+                analyse_debug_log(format!(
+                    "[spral_ssids::analyse] auto selected=amd total={:.3}s",
+                    analyse_started.elapsed().as_secs_f64(),
+                ));
+                Ok(result)
             } else if nd_fill <= natural_fill {
-                Ok(build_symbolic_result(
+                let result = build_symbolic_result(
                     summary.permutation,
                     nd_tree,
                     nd_counts,
                     nd_pattern,
                     "auto_nested_dissection",
-                ))
+                );
+                analyse_debug_log(format!(
+                    "[spral_ssids::analyse] auto selected=nested_dissection total={:.3}s",
+                    analyse_started.elapsed().as_secs_f64(),
+                ));
+                Ok(result)
             } else {
-                Ok(build_symbolic_result(
+                let result = build_symbolic_result(
                     natural_permutation,
                     natural_tree,
                     natural_counts,
                     natural_pattern,
                     "auto_natural",
-                ))
+                );
+                analyse_debug_log(format!(
+                    "[spral_ssids::analyse] auto selected=natural total={:.3}s",
+                    analyse_started.elapsed().as_secs_f64(),
+                ));
+                Ok(result)
             }
         }
     }
@@ -808,8 +1089,7 @@ fn build_symbolic_front_tree(symbolic: &SymbolicFactor) -> SymbolicFrontTree {
                 *slot = index;
             }
             SymbolicFront {
-                start_column: supernode.start_column,
-                end_column: supernode.end_column,
+                columns: (supernode.start_column..supernode.end_column).collect(),
                 interface_rows: supernode.trailing_rows.clone(),
                 parent: None,
                 children: Vec::new(),
@@ -832,13 +1112,110 @@ fn build_symbolic_front_tree(symbolic: &SymbolicFactor) -> SymbolicFrontTree {
     }
     let start_columns = fronts
         .iter()
-        .map(|front| front.start_column)
+        .map(SymbolicFront::first_column)
         .collect::<Vec<_>>();
     for front in &mut fronts {
         front.children.sort_by_key(|&child| start_columns[child]);
     }
-    let roots = collect_root_fronts(&fronts);
-    SymbolicFrontTree { fronts, roots }
+    relax_symbolic_fronts(fronts)
+}
+
+fn front_work_weight(width: usize, interface_len: usize) -> u64 {
+    let front_dim = width.saturating_add(interface_len) as u64;
+    let width = width as u64;
+    width.saturating_mul(front_dim).saturating_mul(front_dim)
+}
+
+fn sort_and_dedup(values: &mut Vec<usize>) {
+    values.sort_unstable();
+    values.dedup();
+}
+
+fn should_relax_merge(child: &SymbolicFront, parent: &SymbolicFront) -> bool {
+    child.width() < RELAXED_NODE_AMALGAMATION_NEMIN
+        && parent.width() < RELAXED_NODE_AMALGAMATION_NEMIN
+}
+
+fn relax_symbolic_fronts(mut fronts: Vec<SymbolicFront>) -> SymbolicFrontTree {
+    for parent_idx in 0..fronts.len() {
+        if fronts[parent_idx].columns.is_empty() {
+            continue;
+        }
+        let mut pending = fronts[parent_idx].children.clone();
+        pending.sort_by_key(|&child| {
+            Reverse(
+                fronts[child]
+                    .width()
+                    .saturating_add(fronts[child].interface_rows.len()),
+            )
+        });
+        let mut retained = Vec::new();
+        while let Some(child_idx) = pending.pop() {
+            if fronts[child_idx].columns.is_empty() {
+                continue;
+            }
+            if should_relax_merge(&fronts[child_idx], &fronts[parent_idx]) {
+                let child_columns = std::mem::take(&mut fronts[child_idx].columns);
+                let child_interface = std::mem::take(&mut fronts[child_idx].interface_rows);
+                let child_children = std::mem::take(&mut fronts[child_idx].children);
+                fronts[parent_idx].columns.extend(child_columns);
+                fronts[parent_idx].interface_rows.extend(child_interface);
+                sort_and_dedup(&mut fronts[parent_idx].columns);
+                sort_and_dedup(&mut fronts[parent_idx].interface_rows);
+                for grandchild in child_children {
+                    fronts[grandchild].parent = Some(parent_idx);
+                    pending.push(grandchild);
+                }
+                pending.sort_by_key(|&child| {
+                    Reverse(
+                        fronts[child]
+                            .width()
+                            .saturating_add(fronts[child].interface_rows.len()),
+                    )
+                });
+            } else {
+                retained.push(child_idx);
+            }
+        }
+        retained.sort_by_key(|&child| fronts[child].first_column());
+        fronts[parent_idx].children = retained;
+        let parent_columns = fronts[parent_idx].columns.clone();
+        fronts[parent_idx]
+            .interface_rows
+            .retain(|row| parent_columns.binary_search(row).is_err());
+    }
+
+    let active = fronts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, front)| (!front.columns.is_empty()).then_some(index))
+        .collect::<Vec<_>>();
+    let mut remap = vec![usize::MAX; fronts.len()];
+    for (new_index, &old_index) in active.iter().enumerate() {
+        remap[old_index] = new_index;
+    }
+    let mut merged = Vec::with_capacity(active.len());
+    for &old_index in &active {
+        let mut front = fronts[old_index].clone();
+        sort_and_dedup(&mut front.columns);
+        sort_and_dedup(&mut front.interface_rows);
+        front
+            .interface_rows
+            .retain(|row| front.columns.binary_search(row).is_err());
+        front.parent = front.parent.map(|parent| remap[parent]);
+        front.children = front
+            .children
+            .into_iter()
+            .filter(|&child| remap[child] != usize::MAX)
+            .map(|child| remap[child])
+            .collect();
+        merged.push(front);
+    }
+    let roots = collect_root_fronts(&merged);
+    SymbolicFrontTree {
+        fronts: merged,
+        roots,
+    }
 }
 
 fn collect_root_fronts(fronts: &[SymbolicFront]) -> Vec<usize> {
@@ -1033,10 +1410,12 @@ fn dense_factor_two_by_two(
         matrix[(pivot + 1) * size + pivot],
         matrix[(pivot + 1) * size + pivot + 1],
     ];
-    let (inverse, regularized, max_shift) = stabilized_dense_block_inverse(&mut values, 2, options)
-        .map_err(|detail| SsidsError::NumericalBreakdown {
-            pivot: rows[pivot],
-            detail,
+    let (inverse, regularized, max_shift) =
+        stabilized_dense_block_inverse(&mut values, 2, options, None).map_err(|detail| {
+            SsidsError::NumericalBreakdown {
+                pivot: rows[pivot],
+                detail,
+            }
         })?;
     stats.regularized_pivots += regularized;
     stats.two_by_two_pivots += 1;
@@ -1212,6 +1591,7 @@ fn factor_front_recursive(
     dense_matrix: &[f64],
     dimension: usize,
     options: NumericFactorOptions,
+    progress: Option<&FactorizationProgressShared>,
 ) -> Result<FrontFactorizationResult, SsidsError> {
     let front = &tree.fronts[front_id];
     let child_results =
@@ -1219,7 +1599,9 @@ fn factor_front_recursive(
             let raw = front
                 .children
                 .par_iter()
-                .map(|&child| factor_front_recursive(child, tree, dense_matrix, dimension, options))
+                .map(|&child| {
+                    factor_front_recursive(child, tree, dense_matrix, dimension, options, progress)
+                })
                 .collect::<Vec<_>>();
             let mut collected = Vec::with_capacity(raw.len());
             for result in raw {
@@ -1235,6 +1617,7 @@ fn factor_front_recursive(
                     dense_matrix,
                     dimension,
                     options,
+                    progress,
                 )?);
             }
             collected
@@ -1263,7 +1646,7 @@ fn factor_front_recursive(
         delayed_front_propagations += child.delayed_front_propagations;
     }
 
-    let mut candidate_rows = (front.start_column..front.end_column).collect::<Vec<_>>();
+    let mut candidate_rows = front.columns.clone();
     let mut all_rows = candidate_rows.iter().copied().collect::<BTreeSet<_>>();
     for &row in &front.interface_rows {
         all_rows.insert(row);
@@ -1292,7 +1675,7 @@ fn factor_front_recursive(
     for (position, &row) in local_rows.iter().enumerate() {
         local_positions[row] = position;
     }
-    for column in front.start_column..front.end_column {
+    for &column in &front.columns {
         let local_column = local_positions[column];
         for &row in &local_rows {
             if row < column {
@@ -1322,6 +1705,19 @@ fn factor_front_recursive(
     }
 
     let local = factorize_dense_front(local_rows, front.width(), local_dense, options)?;
+    if let Some(progress) = progress {
+        progress.completed_fronts.fetch_add(1, Ordering::Relaxed);
+        progress
+            .completed_pivots
+            .fetch_add(local.factor_order.len(), Ordering::Relaxed);
+        progress.completed_weight.fetch_add(
+            front_work_weight(front.width(), front.interface_rows.len()),
+            Ordering::Relaxed,
+        );
+        if front.parent.is_none() {
+            progress.completed_roots.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     factor_order.extend(local.factor_order);
     factor_columns.extend(local.factor_columns);
     block_records.extend(local.block_records);
@@ -1351,11 +1747,41 @@ fn multifrontal_factorize_with_tree(
     let dimension = matrix.dimension();
     fill_permuted_dense_matrix_from_csc(matrix, permutation, buffers.dense_matrix_scratch)?;
     let dense_matrix = buffers.dense_matrix_scratch.as_slice();
+    let progress = Arc::new(FactorizationProgressShared {
+        total_fronts: tree.fronts.len(),
+        total_pivots: dimension,
+        total_weight: tree
+            .fronts
+            .iter()
+            .map(|front| front_work_weight(front.width(), front.interface_rows.len()))
+            .sum(),
+        total_roots: tree.roots.len(),
+        total_root_delayed_blocks: AtomicUsize::new(0),
+        completed_fronts: AtomicUsize::new(0),
+        completed_pivots: AtomicUsize::new(0),
+        completed_weight: AtomicU64::new(0),
+        completed_roots: AtomicUsize::new(0),
+        completed_root_delayed_blocks: AtomicUsize::new(0),
+        current_root_delayed_block: AtomicUsize::new(0),
+        current_root_delayed_block_size: AtomicUsize::new(0),
+        current_root_delayed_inverse_column: AtomicUsize::new(0),
+        root_delayed_stage: AtomicUsize::new(RootDelayedBlockStage::Idle as usize),
+    });
+    let _progress_guard = install_factorization_progress(Arc::clone(&progress));
     let root_results = if tree.roots.len() >= 2 && dimension >= 64 {
         let raw = tree
             .roots
             .par_iter()
-            .map(|&root| factor_front_recursive(root, tree, dense_matrix, dimension, options))
+            .map(|&root| {
+                factor_front_recursive(
+                    root,
+                    tree,
+                    dense_matrix,
+                    dimension,
+                    options,
+                    Some(&progress),
+                )
+            })
             .collect::<Vec<_>>();
         let mut collected = Vec::with_capacity(raw.len());
         for result in raw {
@@ -1371,6 +1797,7 @@ fn multifrontal_factorize_with_tree(
                 dense_matrix,
                 dimension,
                 options,
+                Some(&progress),
             )?);
         }
         collected
@@ -1398,41 +1825,84 @@ fn multifrontal_factorize_with_tree(
         delayed_front_propagations += result.delayed_front_propagations;
     }
 
+    let delayed_block_total = pending_root_contributions
+        .iter()
+        .filter(|contribution| !contribution.row_ids.is_empty())
+        .count();
+    progress
+        .total_root_delayed_blocks
+        .store(delayed_block_total, Ordering::Relaxed);
+    let mut delayed_block_index = 0;
     for contribution in pending_root_contributions {
         if contribution.row_ids.is_empty() {
             continue;
         }
+        delayed_block_index += 1;
         let size = contribution.row_ids.len();
-        let mut values = dense_block_to_packed_lower(&contribution.dense, size);
+        progress.begin_root_delayed_block(delayed_block_index, size);
+        progress.set_root_delayed_stage(RootDelayedBlockStage::Factoring);
+        let delayed_local = factorize_dense_front(
+            contribution.row_ids.clone(),
+            size,
+            contribution.dense.clone(),
+            options,
+        )?;
+        let fully_eliminated = size - delayed_local.contribution.row_ids.len();
+        factor_order.extend(delayed_local.factor_order);
+        factor_columns.extend(delayed_local.factor_columns);
+        block_records.extend(delayed_local.block_records);
+        aggregate_panel_stats(&mut stats, delayed_local.stats);
+        delayed_front_propagations += delayed_local.delayed_front_propagations;
+        progress
+            .completed_pivots
+            .fetch_add(fully_eliminated, Ordering::Relaxed);
+
+        if delayed_local.contribution.row_ids.is_empty() {
+            progress.finish_root_delayed_block();
+            continue;
+        }
+
+        let fallback = delayed_local.contribution;
+        let fallback_size = fallback.row_ids.len();
+        let mut values = dense_block_to_packed_lower(&fallback.dense, fallback_size);
+        progress.set_root_delayed_stage(RootDelayedBlockStage::Inverting);
         let (_, regularized, max_shift) =
-            stabilized_dense_block_inverse(&mut values, size, options).map_err(|detail| {
-                SsidsError::NumericalBreakdown {
-                    pivot: contribution.row_ids[0],
+            stabilized_dense_block_inverse(&mut values, fallback_size, options, Some(&progress))
+                .map_err(|detail| SsidsError::NumericalBreakdown {
+                    pivot: fallback.row_ids[0],
                     detail,
-                }
-            })?;
+                })?;
         stats.regularized_pivots += regularized;
         stats.max_residual = stats.max_residual.max(max_shift);
-        if size == 1 {
+        if fallback_size == 1 {
             let abs_pivot = values[0].abs();
             stats.min_abs_pivot = stats.min_abs_pivot.min(abs_pivot);
             stats.max_abs_pivot = stats.max_abs_pivot.max(abs_pivot);
         } else {
-            stats.delayed_pivots += size;
-            for eigenvalue in jacobi_eigenvalues(&values, size) {
+            stats.delayed_pivots += fallback_size;
+            progress.set_root_delayed_stage(RootDelayedBlockStage::Eigenvalues);
+            for eigenvalue in jacobi_eigenvalues(&values, fallback_size) {
                 let abs_pivot = eigenvalue.abs();
                 stats.min_abs_pivot = stats.min_abs_pivot.min(abs_pivot);
                 stats.max_abs_pivot = stats.max_abs_pivot.max(abs_pivot);
             }
         }
-        for &row in &contribution.row_ids {
+        progress.set_root_delayed_stage(RootDelayedBlockStage::Emitting);
+        for &row in &fallback.row_ids {
             factor_order.push(row);
             factor_columns.push(FactorColumn {
                 global_column: row,
                 entries: Vec::new(),
             });
         }
-        block_records.push(FactorBlockRecord { size, values });
+        block_records.push(FactorBlockRecord {
+            size: fallback_size,
+            values,
+        });
+        progress
+            .completed_pivots
+            .fetch_add(fallback_size, Ordering::Relaxed);
+        progress.finish_root_delayed_block();
     }
 
     if stats.min_abs_pivot == f64::INFINITY {
@@ -1625,17 +2095,27 @@ fn solve_dense_block_in_place(values: &[f64], size: usize, rhs: &mut [f64]) -> R
     solve_dense_matrix_in_place(&dense_matrix_from_diagonal_block(values, size), size, rhs)
 }
 
-fn invert_dense_block(values: &[f64], size: usize) -> Result<Vec<f64>, String> {
+fn invert_dense_block(
+    values: &[f64],
+    size: usize,
+    progress: Option<&FactorizationProgressShared>,
+) -> Result<Vec<f64>, String> {
     let dense = dense_matrix_from_diagonal_block(values, size);
     let mut inverse = vec![0.0; size * size];
     let mut rhs = vec![0.0; size];
     for col in 0..size {
+        if let Some(progress) = progress {
+            progress.set_root_delayed_inverse_column(col + 1);
+        }
         rhs.fill(0.0);
         rhs[col] = 1.0;
         solve_dense_matrix_in_place(&dense, size, &mut rhs)?;
         for row in 0..size {
             inverse[row * size + col] = rhs[row];
         }
+    }
+    if let Some(progress) = progress {
+        progress.set_root_delayed_inverse_column(size);
     }
     Ok(inverse)
 }
@@ -1644,6 +2124,7 @@ fn stabilized_dense_block_inverse(
     values: &mut [f64],
     size: usize,
     options: NumericFactorOptions,
+    progress: Option<&FactorizationProgressShared>,
 ) -> Result<(Vec<f64>, usize, f64), String> {
     if size == 0 {
         return Ok((Vec::new(), 0, 0.0));
@@ -1651,7 +2132,11 @@ fn stabilized_dense_block_inverse(
     let mut applied_regularization = false;
     let mut max_shift = 0.0_f64;
     for attempt in 0..6 {
-        if let Ok(inverse) = invert_dense_block(values, size) {
+        if let Some(progress) = progress {
+            progress.set_root_delayed_stage(RootDelayedBlockStage::Inverting);
+            progress.set_root_delayed_inverse_column(0);
+        }
+        if let Ok(inverse) = invert_dense_block(values, size, progress) {
             return Ok((
                 inverse,
                 if applied_regularization { size } else { 0 },

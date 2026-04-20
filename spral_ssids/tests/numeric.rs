@@ -216,6 +216,41 @@ fn numeric_factorization_solves_spd_system() {
 }
 
 #[test]
+fn numeric_factorization_relaxes_singleton_fronts_into_larger_multifrontal_nodes() {
+    let dimension = 64;
+    let mut dense = vec![vec![0.0; dimension]; dimension];
+    for idx in 0..dimension {
+        dense[idx][idx] = 4.0;
+        if idx + 1 < dimension {
+            dense[idx][idx + 1] = -1.0;
+            dense[idx + 1][idx] = -1.0;
+        }
+    }
+    let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+    let matrix =
+        SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values)).expect("csc");
+    let (symbolic, _) = analyse(
+        matrix,
+        &SsidsOptions {
+            ordering: OrderingStrategy::Natural,
+        },
+    )
+    .expect("symbolic");
+    let (factor, _) =
+        factorize(matrix, &symbolic, &NumericFactorOptions::default()).expect("factor");
+
+    assert!(factor.supernode_count() >= dimension - 1);
+    assert!(
+        factor.front_count() < factor.supernode_count(),
+        "relaxed multifrontal analysis should merge singleton supernodes into larger fronts"
+    );
+    assert!(
+        factor.max_front_size() > factor.max_supernode_width(),
+        "merged fronts should be wider than the exact symbolic supernodes"
+    );
+}
+
+#[test]
 fn numeric_factorization_reports_indefinite_inertia() {
     let dense = vec![
         vec![3.0, 0.1, 0.0, 0.2],
@@ -372,7 +407,7 @@ fn numeric_refactorization_updates_factor_values() {
 }
 
 #[test]
-fn multifrontal_factorization_propagates_delayed_pivots_to_parent_fronts() {
+fn multifrontal_factorization_handles_delayed_chain_with_relaxed_amalgamation() {
     let dense = delayed_chain_dense(0.0);
     let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
     let matrix = SymmetricCscMatrix::new(6, &col_ptrs, &row_indices, Some(&values)).expect("csc");
@@ -391,9 +426,6 @@ fn multifrontal_factorization_propagates_delayed_pivots_to_parent_fronts() {
 
     assert!(info.factorization_residual_max_abs <= 1e-6);
     assert!(factor.uses_multifrontal_backend());
-    assert!(factor.front_count() >= 2);
-    assert!(factor.delayed_front_propagations() >= 1);
-
     let expected = vec![1.0, -0.5, 0.75, -1.25, 0.25, 1.5];
     let rhs = dense_mul(&dense, &expected);
     let solution = factor.solve(&rhs).expect("solve");
@@ -451,7 +483,7 @@ fn multifrontal_refactorization_reuses_symbolic_front_tree() {
 }
 
 #[test]
-fn multifrontal_repeated_refactorization_stays_stable_on_delayed_chain() {
+fn multifrontal_repeated_refactorization_stays_stable_on_relaxed_delayed_chain() {
     let dense = delayed_chain_dense(0.0);
     let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
     let matrix = SymmetricCscMatrix::new(6, &col_ptrs, &row_indices, Some(&values)).expect("csc");
@@ -487,8 +519,6 @@ fn multifrontal_repeated_refactorization_stays_stable_on_delayed_chain() {
         assert!(factor.uses_multifrontal_backend());
         assert_eq!(factor.front_count(), front_count);
         assert_eq!(factor.max_front_size(), max_front_size);
-        assert!(factor.delayed_front_propagations() >= 1);
-
         let expected = (0..6)
             .map(|index| 0.5 + iteration as f64 * 0.1 + index as f64 * 0.2)
             .collect::<Vec<_>>();

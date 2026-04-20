@@ -3,13 +3,17 @@ use clarabel::qdldl::{QDLDLFactorisation, QDLDLSettings};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use spral_ssids::{
-    Inertia as SpralInertia, NumericFactor as SpralNumericFactor,
-    NumericFactorOptions as SpralNumericFactorOptions, SsidsOptions as SpralSsidsOptions,
-    SymbolicFactor as SpralSymbolicFactor, SymmetricCscMatrix as SpralSymmetricCscMatrix,
-    analyse as spral_analyse, factorize as spral_factorize,
+    AnalyseInfo as SpralAnalyseInfo, Inertia as SpralInertia, NumericFactor as SpralNumericFactor,
+    NumericFactorOptions as SpralNumericFactorOptions, OrderingStrategy as SpralOrderingStrategy,
+    SsidsOptions as SpralSsidsOptions, SymbolicFactor as SpralSymbolicFactor,
+    SymmetricCscMatrix as SpralSymmetricCscMatrix, analyse as spral_analyse,
+    current_factorization_progress as spral_current_factorization_progress,
+    factorize as spral_factorize,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -901,7 +905,7 @@ impl SpralAugmentedKktWorkspace {
         hessian_structure: &CCS,
         equality_jacobian: &SparseMatrixStructure,
         inequality_jacobian: &SparseMatrixStructure,
-    ) -> std::result::Result<Self, InteriorPointSolveError> {
+    ) -> std::result::Result<(Self, SpralAnalyseInfo), InteriorPointSolveError> {
         let pattern = build_spral_augmented_kkt_pattern(
             hessian_structure,
             equality_jacobian,
@@ -918,22 +922,149 @@ impl SpralAugmentedKktWorkspace {
                 "invalid sparse KKT structure for spral_ssids: {error}"
             ))
         })?;
-        let (symbolic, _) =
-            spral_analyse(matrix, &SpralSsidsOptions::default()).map_err(|error| {
-                InteriorPointSolveError::InvalidInput(format!(
-                    "failed to analyse sparse KKT structure for spral_ssids: {error}"
-                ))
-            })?;
+        let (symbolic, info) = spral_analyse(
+            matrix,
+            &SpralSsidsOptions {
+                // Large NLP KKT systems can spend a long time estimating natural-order fill
+                // inside `Auto`; AMD is a safer sparse default for this integration seam.
+                ordering: SpralOrderingStrategy::ApproximateMinimumDegree,
+            },
+        )
+        .map_err(|error| {
+            InteriorPointSolveError::InvalidInput(format!(
+                "failed to analyse sparse KKT structure for spral_ssids: {error}"
+            ))
+        })?;
         let values = vec![0.0; pattern.ccs.nnz()];
-        Ok(Self {
-            pattern,
-            values,
-            symbolic,
-            factor: None,
-            factor_regularization: None,
-            auto_fallback_disabled: false,
-        })
+        Ok((
+            Self {
+                pattern,
+                values,
+                symbolic,
+                factor: None,
+                factor_regularization: None,
+                auto_fallback_disabled: false,
+            },
+            info,
+        ))
     }
+}
+
+fn prepare_spral_workspace(
+    hessian_structure: &CCS,
+    equality_jacobian: &SparseMatrixStructure,
+    inequality_jacobian: &SparseMatrixStructure,
+    profiling: &mut InteriorPointProfiling,
+    verbose: bool,
+) -> std::result::Result<SpralAugmentedKktWorkspace, InteriorPointSolveError> {
+    let equality_count = equality_jacobian.ccs.nrow;
+    let inequality_count = inequality_jacobian.ccs.nrow;
+    let matrix_dimension = hessian_structure.nrow + equality_count + 2 * inequality_count;
+    if verbose {
+        println!(
+            "[NLIP][SPRAL] Analysing sparse KKT structure: dim={} x={} eq={} ineq={} hess_nnz={} eq_jac_nnz={} ineq_jac_nnz={}",
+            matrix_dimension,
+            hessian_structure.nrow,
+            equality_count,
+            inequality_count,
+            hessian_structure.nnz(),
+            equality_jacobian.ccs.nnz(),
+            inequality_jacobian.ccs.nnz(),
+        );
+    }
+    let analyse_started = Instant::now();
+    profiling.sparse_symbolic_analyses += 1;
+    let result = SpralAugmentedKktWorkspace::analyse(
+        hessian_structure,
+        equality_jacobian,
+        inequality_jacobian,
+    );
+    profiling.sparse_symbolic_analysis_time += analyse_started.elapsed();
+    match result {
+        Ok((workspace, info)) => {
+            if verbose {
+                println!(
+                    "[NLIP][SPRAL] Analysis completed in {}: matrix_nnz={} est_fill={} supernodes={} max_width={} ordering={}",
+                    compact_duration_text(analyse_started.elapsed().as_secs_f64()),
+                    workspace.pattern.ccs.nnz(),
+                    info.estimated_fill_nnz,
+                    info.supernode_count,
+                    info.max_supernode_width,
+                    info.ordering_kind,
+                );
+            }
+            Ok(workspace)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn spawn_spral_stage_heartbeat(label: &'static str) -> (Arc<AtomicBool>, thread::JoinHandle<()>) {
+    let finished = Arc::new(AtomicBool::new(false));
+    let finished_for_thread = Arc::clone(&finished);
+    let handle = thread::spawn(move || {
+        let started = Instant::now();
+        let mut next_notice_after = Duration::from_secs(5);
+        loop {
+            let elapsed = started.elapsed();
+            if elapsed < next_notice_after {
+                thread::park_timeout(next_notice_after - elapsed);
+            }
+            if finished_for_thread.load(Ordering::Relaxed) {
+                break;
+            }
+            if let Some(progress) = spral_current_factorization_progress() {
+                let root_tail_status = if progress.current_root_delayed_block > 0 {
+                    let mut status = format!(
+                        " root_delayed={}/{} size={} stage={}",
+                        progress.current_root_delayed_block,
+                        progress.total_root_delayed_blocks,
+                        progress.current_root_delayed_block_size,
+                        progress.root_delayed_stage.label(),
+                    );
+                    if progress.current_root_delayed_inverse_column > 0
+                        && progress.current_root_delayed_block_size > 0
+                    {
+                        status.push_str(&format!(
+                            " rhs={}/{}",
+                            progress.current_root_delayed_inverse_column,
+                            progress.current_root_delayed_block_size,
+                        ));
+                    }
+                    status
+                } else if progress.completed_root_delayed_blocks > 0
+                    && progress.completed_pivots < progress.total_pivots
+                {
+                    format!(
+                        " root_delayed={}/{} stage=between_blocks",
+                        progress.completed_root_delayed_blocks, progress.total_root_delayed_blocks,
+                    )
+                } else {
+                    String::new()
+                };
+                println!(
+                    "{label} still running after {}: weighted={:.0}% pivots={}/{} ({:.0}%) fronts={}/{} roots={}/{}{}",
+                    compact_duration_text(started.elapsed().as_secs_f64()),
+                    progress.weighted_percent(),
+                    progress.completed_pivots,
+                    progress.total_pivots,
+                    progress.pivot_percent(),
+                    progress.completed_fronts,
+                    progress.total_fronts,
+                    progress.completed_roots,
+                    progress.total_roots,
+                    root_tail_status,
+                );
+            } else {
+                println!(
+                    "{label} still running after {}",
+                    compact_duration_text(started.elapsed().as_secs_f64()),
+                );
+            }
+            next_notice_after += Duration::from_secs(10);
+        }
+    });
+    (finished, handle)
 }
 
 #[derive(Clone)]
@@ -2799,6 +2930,7 @@ fn factor_solve_spral_ssids(
     rhs: &[f64],
     regularization: f64,
     profiling: &mut InteriorPointProfiling,
+    verbose: bool,
 ) -> std::result::Result<Vec<f64>, InteriorPointLinearSolveAttempt> {
     let matrix = SpralSymmetricCscMatrix::new(
         workspace.pattern.dimension(),
@@ -2825,12 +2957,36 @@ fn factor_solve_spral_ssids(
     if !needs_new_factor {
         let started = Instant::now();
         profiling.sparse_numeric_refactorizations += 1;
+        let refactorization_index = profiling.sparse_numeric_refactorizations;
         if let Some(factor) = workspace.factor.as_mut() {
+            let refactor_heartbeat =
+                verbose.then(|| spawn_spral_stage_heartbeat("[NLIP][SPRAL] Refactorization"));
             match factor.refactorize(matrix) {
                 Ok(_) => {
-                    profiling.sparse_numeric_refactorization_time += started.elapsed();
+                    if let Some((finished, handle)) = refactor_heartbeat {
+                        finished.store(true, Ordering::Relaxed);
+                        handle.thread().unpark();
+                        let _ = handle.join();
+                    }
+                    let elapsed = started.elapsed();
+                    profiling.sparse_numeric_refactorization_time += elapsed;
+                    if verbose
+                        && (refactorization_index <= 3 || refactorization_index.is_multiple_of(25))
+                    {
+                        println!(
+                            "[NLIP][SPRAL] Refactorization #{} completed in {} (reg={:.3e})",
+                            refactorization_index,
+                            compact_duration_text(elapsed.as_secs_f64()),
+                            regularization,
+                        );
+                    }
                 }
                 Err(error) => {
+                    if let Some((finished, handle)) = refactor_heartbeat {
+                        finished.store(true, Ordering::Relaxed);
+                        handle.thread().unpark();
+                        let _ = handle.join();
+                    }
                     profiling.sparse_numeric_refactorization_time += started.elapsed();
                     workspace.factor = None;
                     workspace.factor_regularization = None;
@@ -2846,13 +3002,45 @@ fn factor_solve_spral_ssids(
     if workspace.factor.is_none() {
         let started = Instant::now();
         profiling.sparse_numeric_factorizations += 1;
+        if verbose {
+            println!(
+                "[NLIP][SPRAL] Starting numeric factorization: dim={} nnz={} reg={:.3e}",
+                workspace.pattern.dimension(),
+                workspace.pattern.ccs.nnz(),
+                regularization,
+            );
+        }
+        let factorization_heartbeat =
+            verbose.then(|| spawn_spral_stage_heartbeat("[NLIP][SPRAL] Numeric factorization"));
         match spral_factorize(matrix, &workspace.symbolic, &numeric_options) {
             Ok((factor, _)) => {
-                profiling.sparse_numeric_factorization_time += started.elapsed();
+                if let Some((finished, handle)) = factorization_heartbeat {
+                    finished.store(true, Ordering::Relaxed);
+                    handle.thread().unpark();
+                    let _ = handle.join();
+                }
+                let elapsed = started.elapsed();
+                profiling.sparse_numeric_factorization_time += elapsed;
+                if verbose {
+                    println!(
+                        "[NLIP][SPRAL] Numeric factorization completed in {}: stored_nnz={} factor_bytes={} fronts={} max_front={} delayed_fronts={}",
+                        compact_duration_text(elapsed.as_secs_f64()),
+                        factor.stored_nnz(),
+                        factor.factor_bytes(),
+                        factor.front_count(),
+                        factor.max_front_size(),
+                        factor.delayed_front_propagations(),
+                    );
+                }
                 workspace.factor = Some(factor);
                 workspace.factor_regularization = Some(regularization);
             }
             Err(error) => {
+                if let Some((finished, handle)) = factorization_heartbeat {
+                    finished.store(true, Ordering::Relaxed);
+                    handle.thread().unpark();
+                    let _ = handle.join();
+                }
                 profiling.sparse_numeric_factorization_time += started.elapsed();
                 return Err(spral_error_attempt(
                     regularization,
@@ -2934,6 +3122,7 @@ fn solve_reduced_kkt_with_spral_ssids(
     system: &ReducedKktSystem<'_>,
     workspace: &mut SpralAugmentedKktWorkspace,
     profiling: &mut InteriorPointProfiling,
+    verbose: bool,
 ) -> std::result::Result<NewtonDirection, Vec<InteriorPointLinearSolveAttempt>> {
     let n = system.hessian.lower_triangle.nrow;
     let meq = system.equality_jacobian.nrows();
@@ -2981,7 +3170,8 @@ fn solve_reduced_kkt_with_spral_ssids(
             dual_shift,
             &inequality_scalings,
         );
-        match factor_solve_spral_ssids(workspace, &rhs, current_regularization, profiling) {
+        match factor_solve_spral_ssids(workspace, &rhs, current_regularization, profiling, verbose)
+        {
             Ok(solution) => {
                 let dx = solution[..n].to_vec();
                 let p = solution[workspace.pattern.p_offset..workspace.pattern.p_offset + mineq]
@@ -3260,6 +3450,7 @@ fn solve_reduced_kkt(
     system: &ReducedKktSystem<'_>,
     spral_workspace: Option<&mut SpralAugmentedKktWorkspace>,
     profiling: &mut InteriorPointProfiling,
+    verbose: bool,
 ) -> std::result::Result<NewtonDirection, InteriorPointSolveError> {
     let preferred_solver = preferred_linear_solver(
         system.solver,
@@ -3275,7 +3466,7 @@ fn solve_reduced_kkt(
         && let Some(workspace) = spral_workspace
         && !workspace.auto_fallback_disabled
     {
-        match solve_reduced_kkt_with_spral_ssids(system, workspace, profiling) {
+        match solve_reduced_kkt_with_spral_ssids(system, workspace, profiling, verbose) {
             Ok(direction) => return Ok(direction),
             Err(mut spral_attempts) => {
                 attempts.append(&mut spral_attempts);
@@ -4310,29 +4501,8 @@ where
         equality_count,
         augmented_inequality_count,
     );
-    let mut spral_workspace = if matches!(preferred_solver, InteriorPointLinearSolver::SpralSsids) {
-        let analyse_started = Instant::now();
-        profiling.sparse_symbolic_analyses += 1;
-        match SpralAugmentedKktWorkspace::analyse(
-            hessian_structure.as_ref(),
-            equality_jacobian_structure.as_ref(),
-            inequality_jacobian_structure.as_ref(),
-        ) {
-            Ok(workspace) => {
-                profiling.sparse_symbolic_analysis_time += analyse_started.elapsed();
-                Some(workspace)
-            }
-            Err(error) => {
-                profiling.sparse_symbolic_analysis_time += analyse_started.elapsed();
-                if options.linear_solver == InteriorPointLinearSolver::SpralSsids {
-                    return Err(error);
-                }
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let mut spral_workspace = None;
+    let mut spral_workspace_unavailable = false;
     let mut x = x0.to_vec();
     project_initial_point_into_box_interior(&mut x, &bounds, options);
     let mut lambda_eq = vec![0.0; equality_count];
@@ -4942,10 +5112,42 @@ where
             regularization_growth_factor: options.regularization_growth_factor,
             regularization_max: options.regularization_max,
         };
+        if !spral_workspace_unavailable
+            && spral_workspace.is_none()
+            && preferred_solver == InteriorPointLinearSolver::SpralSsids
+        {
+            match prepare_spral_workspace(
+                hessian_structure.as_ref(),
+                equality_jacobian_structure.as_ref(),
+                inequality_jacobian_structure.as_ref(),
+                &mut profiling,
+                options.verbose,
+            ) {
+                Ok(workspace) => {
+                    spral_workspace = Some(workspace);
+                }
+                Err(error) => {
+                    if options.linear_solver == InteriorPointLinearSolver::SpralSsids {
+                        return Err(with_interior_point_failure_profiling(
+                            error,
+                            Some(snapshot_with_nlip_events(
+                                current_snapshot.clone(),
+                                &iteration_events,
+                            )),
+                            last_accepted_state.clone(),
+                            &profiling,
+                            solve_started,
+                        ));
+                    }
+                    spral_workspace_unavailable = true;
+                }
+            }
+        }
         let direction = solve_reduced_kkt(
             &reduced_kkt_system,
             spral_workspace.as_mut(),
             &mut profiling,
+            options.verbose,
         )
         .map_err(|error| {
             with_interior_point_failure_profiling(
