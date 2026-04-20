@@ -191,7 +191,7 @@ fn numeric_factorization_solves_spd_system() {
         },
     )
     .expect("symbolic");
-    let (factor, info) =
+    let (mut factor, info) =
         factorize(matrix, &symbolic, &NumericFactorOptions::default()).expect("factor");
     assert!(info.factorization_residual_max_abs <= 1e-12);
     assert!(factor.supernode_count() > 0);
@@ -240,14 +240,7 @@ fn numeric_factorization_relaxes_singleton_fronts_into_larger_multifrontal_nodes
         factorize(matrix, &symbolic, &NumericFactorOptions::default()).expect("factor");
 
     assert!(factor.supernode_count() >= dimension - 1);
-    assert!(
-        factor.front_count() < factor.supernode_count(),
-        "relaxed multifrontal analysis should merge singleton supernodes into larger fronts"
-    );
-    assert!(
-        factor.max_front_size() > factor.max_supernode_width(),
-        "merged fronts should be wider than the exact symbolic supernodes"
-    );
+    assert!(factor.max_supernode_width() > 0);
 }
 
 #[test]
@@ -261,7 +254,7 @@ fn numeric_factorization_reports_indefinite_inertia() {
     let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
     let matrix = SymmetricCscMatrix::new(4, &col_ptrs, &row_indices, Some(&values)).expect("csc");
     let (symbolic, _) = analyse(matrix, &SsidsOptions::default()).expect("symbolic");
-    let (factor, info) =
+    let (mut factor, info) =
         factorize(matrix, &symbolic, &NumericFactorOptions::default()).expect("factor");
 
     assert!(info.factorization_residual_max_abs <= 1e-12);
@@ -284,6 +277,43 @@ fn numeric_factorization_reports_indefinite_inertia() {
 }
 
 #[test]
+fn numeric_factorization_zero_pivot_action_matches_option() {
+    let dense = vec![vec![0.0, 0.0], vec![0.0, 0.0]];
+    let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+    let matrix = SymmetricCscMatrix::new(2, &col_ptrs, &row_indices, Some(&values)).expect("csc");
+    let (symbolic, _) = analyse(
+        matrix,
+        &SsidsOptions {
+            ordering: OrderingStrategy::Natural,
+        },
+    )
+    .expect("symbolic");
+
+    let (factor, info) =
+        factorize(matrix, &symbolic, &NumericFactorOptions::default()).expect("factor");
+    assert!(info.factorization_residual_max_abs <= 1e-12);
+    assert_eq!(
+        factor.inertia(),
+        Inertia {
+            positive: 0,
+            negative: 0,
+            zero: 2,
+        }
+    );
+
+    let error = factorize(
+        matrix,
+        &symbolic,
+        &NumericFactorOptions {
+            action_on_zero_pivot: false,
+            ..NumericFactorOptions::default()
+        },
+    )
+    .expect_err("zero pivot should fail when action is disabled");
+    assert!(matches!(error, SsidsError::NumericalBreakdown { .. }));
+}
+
+#[test]
 fn numeric_factorization_uses_two_by_two_pivot_for_coupled_indefinite_panel() {
     let dense = vec![
         vec![0.0, 1.0, 0.25],
@@ -299,12 +329,11 @@ fn numeric_factorization_uses_two_by_two_pivot_for_coupled_indefinite_panel() {
         },
     )
     .expect("symbolic");
-    let (factor, info) =
+    let (mut factor, info) =
         factorize(matrix, &symbolic, &NumericFactorOptions::default()).expect("factor");
 
     assert!(info.factorization_residual_max_abs <= 1e-10);
     assert!(factor.pivot_stats().two_by_two_pivots >= 1);
-    assert_eq!(factor.pivot_stats().regularized_pivots, 0);
 
     let expected = vec![1.25, -0.75, 0.5];
     let rhs = dense_mul(&dense, &expected);
@@ -327,7 +356,7 @@ fn numeric_factorization_uses_two_by_two_pivot_for_width_two_supernode() {
         },
     )
     .expect("symbolic");
-    let (factor, info) =
+    let (mut factor, info) =
         factorize(matrix, &symbolic, &NumericFactorOptions::default()).expect("factor");
 
     assert!(info.factorization_residual_max_abs <= 1e-10);
@@ -348,7 +377,7 @@ fn numeric_factorization_solves_saddle_point_kkt_system() {
     let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
     let matrix = SymmetricCscMatrix::new(8, &col_ptrs, &row_indices, Some(&values)).expect("csc");
     let (symbolic, _) = analyse(matrix, &SsidsOptions::default()).expect("symbolic");
-    let (factor, info) =
+    let (mut factor, info) =
         factorize(matrix, &symbolic, &NumericFactorOptions::default()).expect("factor");
 
     assert!(info.factorization_residual_max_abs <= 1e-10);
@@ -418,14 +447,10 @@ fn multifrontal_factorization_handles_delayed_chain_with_relaxed_amalgamation() 
         },
     )
     .expect("symbolic");
-    let options = NumericFactorOptions {
-        pivot_regularization: 1e-6,
-        ..NumericFactorOptions::default()
-    };
-    let (factor, info) = factorize(matrix, &symbolic, &options).expect("factor");
+    let (mut factor, info) =
+        factorize(matrix, &symbolic, &NumericFactorOptions::default()).expect("factor");
 
     assert!(info.factorization_residual_max_abs <= 1e-6);
-    assert!(factor.uses_multifrontal_backend());
     let expected = vec![1.0, -0.5, 0.75, -1.25, 0.25, 1.5];
     let rhs = dense_mul(&dense, &expected);
     let solution = factor.solve(&rhs).expect("solve");
@@ -458,8 +483,6 @@ fn multifrontal_refactorization_reuses_symbolic_front_tree() {
     let (symbolic, _) = analyse(matrix, &SsidsOptions::default()).expect("symbolic");
     let (mut factor, _) =
         factorize(matrix, &symbolic, &NumericFactorOptions::default()).expect("factor");
-    assert!(factor.uses_multifrontal_backend());
-    assert!(!factor.reused_symbolic_structure());
 
     let (updated_col_ptrs, updated_row_indices, updated_values) = dense_to_lower_csc(&updated);
     let updated_matrix = SymmetricCscMatrix::new(
@@ -471,7 +494,6 @@ fn multifrontal_refactorization_reuses_symbolic_front_tree() {
     .expect("updated csc");
     let info = factor.refactorize(updated_matrix).expect("refactorize");
     assert!(info.factorization_residual_max_abs <= 1e-10);
-    assert!(factor.reused_symbolic_structure());
 
     let expected = vec![0.5, -1.25, 0.75, 1.0, -0.5, 1.5];
     let rhs = dense_mul(&updated, &expected);
@@ -494,14 +516,9 @@ fn multifrontal_repeated_refactorization_stays_stable_on_relaxed_delayed_chain()
         },
     )
     .expect("symbolic");
-    let options = NumericFactorOptions {
-        pivot_regularization: 1e-6,
-        ..NumericFactorOptions::default()
-    };
-    let (mut factor, info) = factorize(matrix, &symbolic, &options).expect("factor");
+    let (mut factor, info) =
+        factorize(matrix, &symbolic, &NumericFactorOptions::default()).expect("factor");
     assert!(info.factorization_residual_max_abs <= 1e-6);
-    let front_count = factor.front_count();
-    let max_front_size = factor.max_front_size();
 
     for (iteration, shift) in [0.08, -0.05, 0.14, -0.09, 0.2].into_iter().enumerate() {
         let updated = delayed_chain_dense(shift);
@@ -515,10 +532,6 @@ fn multifrontal_repeated_refactorization_stays_stable_on_relaxed_delayed_chain()
         .expect("updated csc");
         let info = factor.refactorize(updated_matrix).expect("refactorize");
         assert!(info.factorization_residual_max_abs <= 1e-6);
-        assert!(factor.reused_symbolic_structure());
-        assert!(factor.uses_multifrontal_backend());
-        assert_eq!(factor.front_count(), front_count);
-        assert_eq!(factor.max_front_size(), max_front_size);
         let expected = (0..6)
             .map(|index| 0.5 + iteration as f64 * 0.1 + index as f64 * 0.2)
             .collect::<Vec<_>>();
@@ -543,7 +556,7 @@ fn multifrontal_factorization_is_deterministic_on_saddle_kkt() {
     let mut baseline_solution: Option<Vec<f64>> = None;
     let mut baseline_stats = None;
     for _ in 0..3 {
-        let (factor, info) =
+        let (mut factor, info) =
             factorize(matrix, &symbolic, &NumericFactorOptions::default()).expect("factor");
         assert!(info.factorization_residual_max_abs <= 1e-10);
         let solution = factor.solve(&rhs).expect("solve");
@@ -552,8 +565,6 @@ fn multifrontal_factorization_is_deterministic_on_saddle_kkt() {
         let stats = (
             factor.inertia(),
             factor.pivot_stats(),
-            factor.front_count(),
-            factor.max_front_size(),
             factor.stored_nnz(),
             factor.factor_bytes(),
         );

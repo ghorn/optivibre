@@ -1863,23 +1863,13 @@ fn spawn_spral_stage_heartbeat(label: &'static str) -> (Arc<AtomicBool>, thread:
             }
             if let Some(progress) = spral_current_factorization_progress() {
                 let root_tail_status = if progress.current_root_delayed_block > 0 {
-                    let mut status = format!(
+                    format!(
                         " root_delayed={}/{} size={} stage={}",
                         progress.current_root_delayed_block,
                         progress.total_root_delayed_blocks,
                         progress.current_root_delayed_block_size,
                         progress.root_delayed_stage.label(),
-                    );
-                    if progress.current_root_delayed_inverse_column > 0
-                        && progress.current_root_delayed_block_size > 0
-                    {
-                        status.push_str(&format!(
-                            " rhs={}/{}",
-                            progress.current_root_delayed_inverse_column,
-                            progress.current_root_delayed_block_size,
-                        ));
-                    }
-                    status
+                    )
                 } else if progress.completed_root_delayed_blocks > 0
                     && progress.completed_pivots < progress.total_pivots
                 {
@@ -4059,13 +4049,10 @@ fn factor_solve_spral_ssids(
                 profiling.sparse_numeric_factorization_time += elapsed;
                 if verbose {
                     println!(
-                        "[NLIP][SPRAL] Numeric factorization completed in {}: stored_nnz={} factor_bytes={} fronts={} max_front={} delayed_fronts={}",
+                        "[NLIP][SPRAL] Numeric factorization completed in {}: stored_nnz={} factor_bytes={}",
                         compact_duration_text(elapsed.as_secs_f64()),
                         factor.stored_nnz(),
                         factor.factor_bytes(),
-                        factor.front_count(),
-                        factor.max_front_size(),
-                        factor.delayed_front_propagations(),
                     );
                 }
                 workspace.factor = Some(factor);
@@ -4087,7 +4074,8 @@ fn factor_solve_spral_ssids(
         }
     }
 
-    let factor = workspace.factor.as_ref().expect("factorization must exist");
+    let reused_symbolic = !needs_new_factor;
+    let factor = workspace.factor.as_mut().expect("factorization must exist");
     let expected_inertia = spral_expected_augmented_inertia(&workspace.pattern);
     let actual_inertia = factor.inertia();
     if actual_inertia != expected_inertia {
@@ -4141,7 +4129,7 @@ fn factor_solve_spral_ssids(
                     solver: InteriorPointLinearSolver::SpralSsids,
                     factorization_time,
                     solve_time,
-                    reused_symbolic: Some(factor.reused_symbolic_structure()),
+                    reused_symbolic: Some(reused_symbolic),
                     inertia: Some(interior_point_linear_inertia(actual_inertia)),
                     residual_inf: assessment.residual_inf,
                     solution_inf: assessment.solution_inf,

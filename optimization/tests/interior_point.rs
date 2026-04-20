@@ -406,7 +406,7 @@ fn replay_dumped_augmented_rust_spral(dump: &str) -> Vec<f64> {
         },
     )
     .expect("rust spral analysis on dumped KKT should succeed");
-    let (factor, _) = spral_factorize(matrix, &symbolic, &SpralNumericFactorOptions::default())
+    let (mut factor, _) = spral_factorize(matrix, &symbolic, &SpralNumericFactorOptions::default())
         .expect("rust spral factorization on dumped KKT should succeed");
     let mut solution = factor
         .solve(&rhs)

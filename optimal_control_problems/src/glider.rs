@@ -1476,7 +1476,7 @@ mod tests {
         )
         .expect("rust spral analyse should succeed on dumped KKT");
         let factor_started = Instant::now();
-        let (factor, _) = spral_factorize(numeric, &symbolic, &NumericFactorOptions::default())
+        let (mut factor, _) = spral_factorize(numeric, &symbolic, &NumericFactorOptions::default())
             .expect("rust spral factorization should succeed on dumped KKT");
         let factor_time = factor_started.elapsed();
         let solve_started = Instant::now();

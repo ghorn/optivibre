@@ -166,8 +166,9 @@ fn property_numeric_factorization_solves_diagonally_dominant_systems() {
             ] {
                 let (symbolic, _) =
                     analyse(matrix, &SsidsOptions { ordering }).expect("analysis succeeds");
-                let (factor, info) = factorize(matrix, &symbolic, &NumericFactorOptions::default())
-                    .expect("factor succeeds");
+                let (mut factor, info) =
+                    factorize(matrix, &symbolic, &NumericFactorOptions::default())
+                        .expect("factor succeeds");
                 prop_assert!(info.factorization_residual_max_abs <= 1e-8);
                 let solution = factor.solve(&rhs).expect("solve succeeds");
                 prop_assert!(solution.iter().all(|value| value.is_finite()));

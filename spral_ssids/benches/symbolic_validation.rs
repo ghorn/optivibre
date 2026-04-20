@@ -228,18 +228,14 @@ fn numeric_factorization_bench(c: &mut Criterion) {
                 bench.iter(|| factorize(*matrix, symbolic, &options).expect("factor"));
             },
         );
-        let (factor, _) = factorize(matrix, &auto_symbolic, &options).expect("factor");
-        group.bench_with_input(
-            BenchmarkId::new("solve_auto", name),
-            &factor,
-            |bench, factor| {
-                bench.iter_batched(
-                    || rhs.clone(),
-                    |mut rhs| factor.solve_in_place(&mut rhs).expect("solve"),
-                    BatchSize::SmallInput,
-                );
-            },
-        );
+        let (mut factor, _) = factorize(matrix, &auto_symbolic, &options).expect("factor");
+        group.bench_function(BenchmarkId::new("solve_auto", name), |bench| {
+            bench.iter_batched(
+                || rhs.clone(),
+                |mut rhs| factor.solve_in_place(&mut rhs).expect("solve"),
+                BatchSize::SmallInput,
+            );
+        });
         group.bench_with_input(
             BenchmarkId::new("refactorize_auto", name),
             &(factor.clone(), matrix),

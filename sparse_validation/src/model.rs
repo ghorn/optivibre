@@ -154,15 +154,8 @@ pub struct NumericFactorizationMetrics {
     pub factor_storage_bytes: usize,
     pub supernode_count: usize,
     pub max_supernode_width: usize,
-    pub front_count: usize,
-    pub max_front_size: usize,
-    pub contribution_storage_bytes: usize,
-    pub delayed_front_propagations: usize,
-    pub reused_symbolic_structure: bool,
-    pub regularized_pivots: usize,
     pub two_by_two_pivots: usize,
     pub delayed_pivots: usize,
-    pub min_abs_pivot: f64,
     pub refactor_speedup_vs_factor: Option<f64>,
 }
 

@@ -1,5 +1,4 @@
 use std::cmp::Reverse;
-use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -142,17 +141,19 @@ impl Default for SsidsOptions {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NumericFactorOptions {
-    pub pivot_regularization: f64,
+    pub action_on_zero_pivot: bool,
+    pub small_pivot_tolerance: f64,
+    pub threshold_pivot_u: f64,
     pub inertia_zero_tol: f64,
-    pub two_by_two_pivot_threshold: f64,
 }
 
 impl Default for NumericFactorOptions {
     fn default() -> Self {
         Self {
-            pivot_regularization: 1e-9,
+            action_on_zero_pivot: true,
+            small_pivot_tolerance: 1e-20,
+            threshold_pivot_u: 0.01,
             inertia_zero_tol: 1e-10,
-            two_by_two_pivot_threshold: (1.0 + 17.0_f64.sqrt()) / 8.0,
         }
     }
 }
@@ -166,17 +167,13 @@ pub struct Inertia {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PivotStats {
-    pub regularized_pivots: usize,
     pub two_by_two_pivots: usize,
     pub delayed_pivots: usize,
-    pub min_abs_pivot: f64,
-    pub max_abs_pivot: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FactorInfo {
     pub factorization_residual_max_abs: f64,
-    pub regularized_pivots: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,7 +190,6 @@ pub struct FactorizationProgressSnapshot {
     pub completed_root_delayed_blocks: usize,
     pub current_root_delayed_block: usize,
     pub current_root_delayed_block_size: usize,
-    pub current_root_delayed_inverse_column: usize,
     pub root_delayed_stage: RootDelayedBlockStage,
 }
 
@@ -220,8 +216,6 @@ pub enum RootDelayedBlockStage {
     Idle,
     Packing,
     Factoring,
-    Inverting,
-    Eigenvalues,
     Emitting,
 }
 
@@ -230,9 +224,7 @@ impl RootDelayedBlockStage {
         match value {
             1 => Self::Packing,
             2 => Self::Factoring,
-            3 => Self::Inverting,
-            4 => Self::Eigenvalues,
-            5 => Self::Emitting,
+            3 => Self::Emitting,
             _ => Self::Idle,
         }
     }
@@ -242,8 +234,6 @@ impl RootDelayedBlockStage {
             Self::Idle => "idle",
             Self::Packing => "packing",
             Self::Factoring => "factoring",
-            Self::Inverting => "inverting",
-            Self::Eigenvalues => "eigenvalues",
             Self::Emitting => "emitting",
         }
     }
@@ -283,14 +273,7 @@ pub struct SymbolicFactor {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DiagonalBlock {
-    start: usize,
     size: usize,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct DiagonalBlockValue {
-    block: DiagonalBlock,
-    values: Vec<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -331,7 +314,6 @@ struct FactorizationProgressShared {
     completed_root_delayed_blocks: AtomicUsize,
     current_root_delayed_block: AtomicUsize,
     current_root_delayed_block_size: AtomicUsize,
-    current_root_delayed_inverse_column: AtomicUsize,
     root_delayed_stage: AtomicUsize,
 }
 
@@ -354,9 +336,6 @@ impl FactorizationProgressShared {
             current_root_delayed_block_size: self
                 .current_root_delayed_block_size
                 .load(Ordering::Relaxed),
-            current_root_delayed_inverse_column: self
-                .current_root_delayed_inverse_column
-                .load(Ordering::Relaxed),
             root_delayed_stage: RootDelayedBlockStage::from_usize(
                 self.root_delayed_stage.load(Ordering::Relaxed),
             ),
@@ -368,8 +347,6 @@ impl FactorizationProgressShared {
             .store(block_index, Ordering::Relaxed);
         self.current_root_delayed_block_size
             .store(size, Ordering::Relaxed);
-        self.current_root_delayed_inverse_column
-            .store(0, Ordering::Relaxed);
         self.root_delayed_stage
             .store(RootDelayedBlockStage::Packing as usize, Ordering::Relaxed);
     }
@@ -379,18 +356,11 @@ impl FactorizationProgressShared {
             .store(stage as usize, Ordering::Relaxed);
     }
 
-    fn set_root_delayed_inverse_column(&self, column: usize) {
-        self.current_root_delayed_inverse_column
-            .store(column, Ordering::Relaxed);
-    }
-
     fn finish_root_delayed_block(&self) {
         self.completed_root_delayed_blocks
             .fetch_add(1, Ordering::Relaxed);
         self.current_root_delayed_block.store(0, Ordering::Relaxed);
         self.current_root_delayed_block_size
-            .store(0, Ordering::Relaxed);
-        self.current_root_delayed_inverse_column
             .store(0, Ordering::Relaxed);
         self.root_delayed_stage
             .store(RootDelayedBlockStage::Idle as usize, Ordering::Relaxed);
@@ -447,10 +417,6 @@ struct ContributionBlock {
 struct MultifrontalFactorizationOutcome {
     pivot_stats: PivotStats,
     factorization_residual_max_abs: f64,
-    front_count: usize,
-    max_front_size: usize,
-    contribution_storage_bytes: usize,
-    delayed_front_propagations: usize,
     stored_nnz: usize,
     factor_bytes: usize,
 }
@@ -458,7 +424,7 @@ struct MultifrontalFactorizationOutcome {
 #[derive(Clone, Debug, PartialEq)]
 struct FactorBlockRecord {
     size: usize,
-    values: Vec<f64>,
+    values: [f64; 4],
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -470,7 +436,6 @@ struct FrontFactorizationResult {
     stats: PanelFactorStats,
     max_front_size: usize,
     contribution_storage_bytes: usize,
-    delayed_front_propagations: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -480,7 +445,6 @@ struct DenseFrontFactorization {
     block_records: Vec<FactorBlockRecord>,
     contribution: ContributionBlock,
     stats: PanelFactorStats,
-    delayed_front_propagations: usize,
 }
 
 struct NumericFactorBuffers<'a> {
@@ -489,8 +453,12 @@ struct NumericFactorBuffers<'a> {
     lower_col_ptrs: &'a mut Vec<usize>,
     lower_row_indices: &'a mut Vec<usize>,
     lower_values: &'a mut Vec<f64>,
-    diagonal_blocks: &'a mut Vec<DiagonalBlockValue>,
-    dense_matrix_scratch: &'a mut Vec<f64>,
+    diagonal_blocks: &'a mut Vec<DiagonalBlock>,
+    diagonal_values: &'a mut Vec<f64>,
+    permuted_matrix_col_ptrs: &'a mut Vec<usize>,
+    permuted_matrix_row_indices: &'a mut Vec<usize>,
+    permuted_matrix_source_positions: &'a mut Vec<usize>,
+    permuted_matrix_values: &'a mut Vec<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -499,7 +467,8 @@ pub struct NumericFactor {
     permutation: Permutation,
     pattern_col_ptrs: Vec<usize>,
     pattern_row_indices: Vec<usize>,
-    diagonal_blocks: Vec<DiagonalBlockValue>,
+    diagonal_blocks: Vec<DiagonalBlock>,
+    diagonal_values: Vec<f64>,
     inertia: Inertia,
     pivot_stats: PivotStats,
     options: NumericFactorOptions,
@@ -508,13 +477,12 @@ pub struct NumericFactor {
     lower_col_ptrs: Vec<usize>,
     lower_row_indices: Vec<usize>,
     lower_values: Vec<f64>,
+    solve_workspace: Vec<f64>,
     symbolic_front_tree: SymbolicFrontTree,
-    dense_matrix_scratch: Vec<f64>,
-    front_count_cached: usize,
-    max_front_size_cached: usize,
-    contribution_storage_bytes_cached: usize,
-    delayed_front_propagations_cached: usize,
-    symbolic_reuse_cached: bool,
+    permuted_matrix_col_ptrs: Vec<usize>,
+    permuted_matrix_row_indices: Vec<usize>,
+    permuted_matrix_source_positions: Vec<usize>,
+    permuted_matrix_values: Vec<f64>,
     stored_nnz_cached: usize,
     factor_bytes_cached: usize,
     symbolic_supernode_count_cached: usize,
@@ -550,35 +518,11 @@ impl NumericFactor {
         self.symbolic_max_supernode_width_cached
     }
 
-    pub fn front_count(&self) -> usize {
-        self.front_count_cached
-    }
-
-    pub fn max_front_size(&self) -> usize {
-        self.max_front_size_cached
-    }
-
-    pub fn contribution_storage_bytes(&self) -> usize {
-        self.contribution_storage_bytes_cached
-    }
-
-    pub fn delayed_front_propagations(&self) -> usize {
-        self.delayed_front_propagations_cached
-    }
-
-    pub fn reused_symbolic_structure(&self) -> bool {
-        self.symbolic_reuse_cached
-    }
-
-    pub fn uses_multifrontal_backend(&self) -> bool {
-        true
-    }
-
     pub fn factor_bytes(&self) -> usize {
         self.factor_bytes_cached
     }
 
-    pub fn solve(&self, rhs: &[f64]) -> Result<Vec<f64>, SsidsError> {
+    pub fn solve(&mut self, rhs: &[f64]) -> Result<Vec<f64>, SsidsError> {
         let mut solution = rhs.to_vec();
         self.solve_in_place(&mut solution)?;
         Ok(solution)
@@ -586,7 +530,7 @@ impl NumericFactor {
 
     /// Solve `Ax = rhs` in place for the factorized matrix. The slice length
     /// must match the factor dimension exactly.
-    pub fn solve_in_place(&self, rhs: &mut [f64]) -> Result<(), SsidsError> {
+    pub fn solve_in_place(&mut self, rhs: &mut [f64]) -> Result<(), SsidsError> {
         if rhs.len() != self.dimension {
             return Err(SsidsError::SolveDimensionMismatch {
                 expected: self.dimension,
@@ -597,7 +541,10 @@ impl NumericFactor {
             return Ok(());
         }
 
-        let mut factor_rhs = vec![0.0; self.dimension];
+        if self.solve_workspace.len() != self.dimension {
+            self.solve_workspace.resize(self.dimension, 0.0);
+        }
+        let factor_rhs = &mut self.solve_workspace;
         for (factor_position, &ordered_index) in self.factor_order.iter().enumerate() {
             factor_rhs[factor_position] = rhs[self.permutation.perm()[ordered_index]];
         }
@@ -610,29 +557,46 @@ impl NumericFactor {
             }
         }
 
-        for block in &self.diagonal_blocks {
-            let start = block.block.start;
-            let end = start + block.block.size;
-            if block.block.size == 1 {
-                let diagonal = block.values[0];
-                if !diagonal.is_finite() || diagonal.abs() < f64::EPSILON {
+        let mut diagonal_start = 0;
+        for (block, values) in self
+            .diagonal_blocks
+            .iter()
+            .zip(self.diagonal_values.chunks_exact(4))
+        {
+            let start = diagonal_start;
+            let end = start + block.size;
+            if block.size == 1 {
+                let inverse_diagonal =
+                    one_by_one_inverse_diagonal(&values[..2]).map_err(|detail| {
+                        SsidsError::NumericalBreakdown {
+                            pivot: start,
+                            detail,
+                        }
+                    })?;
+                if !inverse_diagonal.is_finite() {
                     return Err(SsidsError::NumericalBreakdown {
                         pivot: start,
                         detail: "diagonal pivot vanished during solve".into(),
                     });
                 }
-                factor_rhs[start] /= diagonal;
-            } else {
-                solve_dense_block_in_place(
-                    &block.values,
-                    block.block.size,
-                    &mut factor_rhs[start..end],
-                )
-                    .map_err(|detail| SsidsError::NumericalBreakdown {
+                factor_rhs[start] *= inverse_diagonal;
+            } else if block.size == 2 {
+                solve_two_by_two_block_in_place(values, &mut factor_rhs[start..end]).map_err(
+                    |detail| SsidsError::NumericalBreakdown {
                         pivot: start,
                         detail,
-                    })?;
+                    },
+                )?;
+            } else {
+                return Err(SsidsError::NumericalBreakdown {
+                    pivot: start,
+                    detail: format!(
+                        "unexpected dense diagonal block of size {} in solve path",
+                        block.size
+                    ),
+                });
             }
+            diagonal_start = end;
         }
 
         for pivot in (0..self.dimension).rev() {
@@ -676,13 +640,12 @@ impl NumericFactor {
                 "refactorization requires identical CSC sparsity structure".into(),
             ));
         }
-        self.refactorize_with_cached_symbolic(matrix, true)
+        self.refactorize_with_cached_symbolic(matrix)
     }
 
     fn refactorize_with_cached_symbolic(
         &mut self,
         matrix: SymmetricCscMatrix<'_>,
-        reused_symbolic: bool,
     ) -> Result<FactorInfo, SsidsError> {
         let factorization = multifrontal_factorize_with_tree(
             matrix,
@@ -696,21 +659,22 @@ impl NumericFactor {
                 lower_row_indices: &mut self.lower_row_indices,
                 lower_values: &mut self.lower_values,
                 diagonal_blocks: &mut self.diagonal_blocks,
-                dense_matrix_scratch: &mut self.dense_matrix_scratch,
+                diagonal_values: &mut self.diagonal_values,
+                permuted_matrix_col_ptrs: &mut self.permuted_matrix_col_ptrs,
+                permuted_matrix_row_indices: &mut self.permuted_matrix_row_indices,
+                permuted_matrix_source_positions: &mut self.permuted_matrix_source_positions,
+                permuted_matrix_values: &mut self.permuted_matrix_values,
             },
         )?;
         let info = FactorInfo {
             factorization_residual_max_abs: factorization.factorization_residual_max_abs,
-            regularized_pivots: factorization.pivot_stats.regularized_pivots,
         };
-        self.inertia =
-            inertia_from_blocks(&[], &self.diagonal_blocks, self.options.inertia_zero_tol);
+        self.inertia = inertia_from_blocks(
+            &self.diagonal_blocks,
+            &self.diagonal_values,
+            self.options.inertia_zero_tol,
+        );
         self.pivot_stats = factorization.pivot_stats;
-        self.front_count_cached = factorization.front_count;
-        self.max_front_size_cached = factorization.max_front_size;
-        self.contribution_storage_bytes_cached = factorization.contribution_storage_bytes;
-        self.delayed_front_propagations_cached = factorization.delayed_front_propagations;
-        self.symbolic_reuse_cached = reused_symbolic;
         self.stored_nnz_cached = factorization.stored_nnz;
         self.factor_bytes_cached = factorization.factor_bytes;
         Ok(info)
@@ -932,17 +896,15 @@ pub fn factorize(
         pattern_col_ptrs: matrix.col_ptrs().to_vec(),
         pattern_row_indices: matrix.row_indices().to_vec(),
         diagonal_blocks: Vec::new(),
+        diagonal_values: Vec::new(),
         inertia: Inertia {
             positive: 0,
             negative: 0,
             zero: 0,
         },
         pivot_stats: PivotStats {
-            regularized_pivots: 0,
             two_by_two_pivots: 0,
             delayed_pivots: 0,
-            min_abs_pivot: 0.0,
-            max_abs_pivot: 0.0,
         },
         options: *options,
         factor_order: Vec::with_capacity(matrix.dimension()),
@@ -950,13 +912,12 @@ pub fn factorize(
         lower_col_ptrs: Vec::with_capacity(matrix.dimension() + 1),
         lower_row_indices: Vec::new(),
         lower_values: Vec::new(),
+        solve_workspace: vec![0.0; matrix.dimension()],
         symbolic_front_tree: front_tree,
-        dense_matrix_scratch: Vec::with_capacity(matrix.dimension() * matrix.dimension()),
-        front_count_cached: 0,
-        max_front_size_cached: 0,
-        contribution_storage_bytes_cached: 0,
-        delayed_front_propagations_cached: 0,
-        symbolic_reuse_cached: false,
+        permuted_matrix_col_ptrs: Vec::with_capacity(matrix.dimension() + 1),
+        permuted_matrix_row_indices: Vec::with_capacity(matrix.row_indices().len()),
+        permuted_matrix_source_positions: Vec::with_capacity(matrix.row_indices().len()),
+        permuted_matrix_values: Vec::with_capacity(matrix.row_indices().len()),
         stored_nnz_cached: 0,
         factor_bytes_cached: 0,
         symbolic_supernode_count_cached: symbolic.supernodes.len(),
@@ -967,7 +928,7 @@ pub fn factorize(
             .max()
             .unwrap_or(0),
     };
-    let info = factor.refactorize_with_cached_symbolic(matrix, false)?;
+    let info = factor.refactorize_with_cached_symbolic(matrix)?;
     Ok((factor, info))
 }
 
@@ -1235,35 +1196,84 @@ fn collect_root_fronts(fronts: &[SymbolicFront]) -> Vec<usize> {
         .collect()
 }
 
-fn fill_permuted_dense_matrix_from_csc(
+struct PermutedLowerMatrix<'a> {
+    dimension: usize,
+    col_ptrs: &'a [usize],
+    row_indices: &'a [usize],
+    values: &'a [f64],
+}
+
+fn build_permuted_lower_csc_pattern(
     matrix: SymmetricCscMatrix<'_>,
     permutation: &Permutation,
-    dense: &mut Vec<f64>,
+    col_ptrs: &mut Vec<usize>,
+    row_indices: &mut Vec<usize>,
+    source_positions: &mut Vec<usize>,
 ) -> Result<(), SsidsError> {
-    let values = matrix.values().ok_or(SsidsError::MissingValues)?;
     let dimension = matrix.dimension();
     let inverse = permutation.inverse();
-    dense.clear();
-    dense.resize(dimension * dimension, 0.0);
+    let nnz = matrix.row_indices().len();
+    let mut counts = vec![0usize; dimension];
     for col in 0..dimension {
         let start = matrix.col_ptrs()[col];
         let end = matrix.col_ptrs()[col + 1];
-        for (&row, &value) in matrix.row_indices()[start..end]
-            .iter()
-            .zip(values[start..end].iter())
-        {
-            if !value.is_finite() {
-                return Err(SsidsError::InvalidMatrix(format!(
-                    "numeric value at ({row}, {col}) is not finite"
-                )));
-            }
+        for &row in &matrix.row_indices()[start..end] {
             let permuted_col = inverse[col];
             let permuted_row = inverse[row];
-            dense[permuted_row * dimension + permuted_col] += value;
-            if permuted_row != permuted_col {
-                dense[permuted_col * dimension + permuted_row] += value;
-            }
+            counts[permuted_col.min(permuted_row)] += 1;
         }
+    }
+
+    col_ptrs.clear();
+    col_ptrs.resize(dimension + 1, 0);
+    for col in 0..dimension {
+        col_ptrs[col + 1] = col_ptrs[col] + counts[col];
+    }
+
+    row_indices.clear();
+    row_indices.resize(nnz, 0);
+    source_positions.clear();
+    source_positions.resize(nnz, 0);
+    let mut next = col_ptrs[..dimension].to_vec();
+    for col in 0..dimension {
+        let start = matrix.col_ptrs()[col];
+        let end = matrix.col_ptrs()[col + 1];
+        for source_index in start..end {
+            let row = matrix.row_indices()[source_index];
+            let permuted_col = inverse[col];
+            let permuted_row = inverse[row];
+            let target_col = permuted_col.min(permuted_row);
+            let target_row = permuted_col.max(permuted_row);
+            let slot = next[target_col];
+            row_indices[slot] = target_row;
+            source_positions[slot] = source_index;
+            next[target_col] += 1;
+        }
+    }
+    Ok(())
+}
+
+fn fill_permuted_lower_csc_values(
+    matrix: SymmetricCscMatrix<'_>,
+    source_positions: &[usize],
+    values: &mut Vec<f64>,
+) -> Result<(), SsidsError> {
+    let source_values = matrix.values().ok_or(SsidsError::MissingValues)?;
+    values.clear();
+    values.resize(source_positions.len(), 0.0);
+    for (index, &source_index) in source_positions.iter().enumerate() {
+        let value = source_values[source_index];
+        if !value.is_finite() {
+            let row = matrix.row_indices()[source_index];
+            let col = matrix
+                .col_ptrs()
+                .partition_point(|&pointer| pointer <= source_index)
+                .saturating_sub(1);
+            return Err(SsidsError::InvalidMatrix(format!(
+                "numeric value at ({row}, {col}) is not finite"
+            )));
+        }
+        values[index] = value;
     }
     Ok(())
 }
@@ -1272,42 +1282,279 @@ fn dense_symmetric_swap(matrix: &mut [f64], size: usize, lhs: usize, rhs: usize)
     if lhs == rhs {
         return;
     }
-    for column in 0..size {
-        matrix.swap(lhs * size + column, rhs * size + column);
+    let (lhs, rhs) = if lhs < rhs { (lhs, rhs) } else { (rhs, lhs) };
+
+    for col in 0..lhs {
+        let lhs_offset = dense_lower_offset(size, lhs, col);
+        let rhs_offset = dense_lower_offset(size, rhs, col);
+        matrix.swap(lhs_offset, rhs_offset);
     }
-    for row in 0..size {
-        matrix.swap(row * size + lhs, row * size + rhs);
+
+    for index in (lhs + 1)..rhs {
+        let lhs_offset = dense_lower_offset(size, index, lhs);
+        let rhs_offset = dense_lower_offset(size, rhs, index);
+        matrix.swap(lhs_offset, rhs_offset);
+    }
+
+    for row in (rhs + 1)..size {
+        let lhs_offset = dense_lower_offset(size, row, lhs);
+        let rhs_offset = dense_lower_offset(size, row, rhs);
+        matrix.swap(lhs_offset, rhs_offset);
+    }
+
+    let lhs_diag = dense_lower_offset(size, lhs, lhs);
+    let rhs_diag = dense_lower_offset(size, rhs, rhs);
+    matrix.swap(lhs_diag, rhs_diag);
+}
+
+fn dense_symmetric_swap_with_workspace(
+    matrix: &mut [f64],
+    size: usize,
+    lhs: usize,
+    rhs: usize,
+    workspace: &mut [f64],
+) {
+    if lhs == rhs {
+        return;
+    }
+    let (lhs, rhs) = if lhs < rhs { (lhs, rhs) } else { (rhs, lhs) };
+    for work_row in 0..lhs {
+        workspace.swap(work_row * size + lhs, work_row * size + rhs);
+    }
+    dense_symmetric_swap(matrix, size, lhs, rhs);
+}
+
+#[inline]
+fn dense_lower_offset(size: usize, row: usize, col: usize) -> usize {
+    if row >= col {
+        col * size + row
+    } else {
+        row * size + col
     }
 }
 
-fn dense_block_to_packed_lower(values: &[f64], size: usize) -> Vec<f64> {
-    let mut packed = vec![0.0; size * (size + 1) / 2];
-    for row in 0..size {
-        for col in 0..=row {
-            diagonal_block_set(&mut packed, size, row, col, values[row * size + col]);
-        }
-    }
-    packed
+#[inline]
+fn packed_lower_len(size: usize) -> usize {
+    size * (size + 1) / 2
+}
+
+#[inline]
+fn packed_lower_offset(size: usize, row: usize, col: usize) -> usize {
+    debug_assert!(row >= col);
+    col * size - col * (col.saturating_sub(1)) / 2 + (row - col)
 }
 
 fn aggregate_panel_stats(target: &mut PanelFactorStats, source: PanelFactorStats) {
-    target.regularized_pivots += source.regularized_pivots;
     target.two_by_two_pivots += source.two_by_two_pivots;
     target.delayed_pivots += source.delayed_pivots;
-    target.min_abs_pivot = target.min_abs_pivot.min(source.min_abs_pivot);
-    target.max_abs_pivot = target.max_abs_pivot.max(source.max_abs_pivot);
     target.max_residual = target.max_residual.max(source.max_residual);
 }
 
-fn dense_factor_one_by_one(
+fn scaled_two_by_two_inverse(a11: f64, a21: f64, a22: f64, small: f64) -> Option<(f64, f64, f64)> {
+    let max_pivot = a11.abs().max(a21.abs()).max(a22.abs());
+    if !a11.is_finite() || !a21.is_finite() || !a22.is_finite() || max_pivot < small {
+        return None;
+    }
+    let detscale = 1.0 / max_pivot;
+    let det0 = (a11 * detscale) * a22;
+    let det1 = (a21 * detscale) * a21;
+    let det = det0 - det1;
+    if !det.is_finite() || det.abs() < small.max(det0.abs().max(det1.abs()) / 2.0) {
+        return None;
+    }
+    let d11 = (a22 * detscale) / det;
+    let d21 = (-a21 * detscale) / det;
+    let d22 = (a11 * detscale) / det;
+    if d11.is_finite() && d21.is_finite() && d22.is_finite() {
+        Some((d11, d21, d22))
+    } else {
+        None
+    }
+}
+
+fn app_two_by_two_inverse(a11: f64, a21: f64, a22: f64, small: f64) -> Option<(f64, f64, f64)> {
+    if !a11.is_finite() || !a21.is_finite() || !a22.is_finite() || a21.abs() < small {
+        return None;
+    }
+    let detscale = 1.0 / a21.abs();
+    let det = (a11 * detscale) * a22 - a21.abs();
+    if !det.is_finite() || det.abs() < a21.abs() / 2.0 {
+        return None;
+    }
+    let d11 = (a22 * detscale) / det;
+    let d21 = (-a21 * detscale) / det;
+    let d22 = (a11 * detscale) / det;
+    if d11.is_finite() && d21.is_finite() && d22.is_finite() {
+        Some((d11, d21, d22))
+    } else {
+        None
+    }
+}
+
+fn one_by_one_inverse_diagonal(values: &[f64]) -> Result<f64, String> {
+    if values.len() >= 2 {
+        Ok(values[0])
+    } else {
+        Err("invalid one-by-one block dimensions".into())
+    }
+}
+
+fn exact_two_by_two_eigenvalues(a11: f64, a21: f64, a22: f64) -> [f64; 2] {
+    let trace = a11 + a22;
+    let discriminant = ((a11 - a22) * (a11 - a22) + 4.0 * a21 * a21).sqrt();
+    [0.5 * (trace + discriminant), 0.5 * (trace - discriminant)]
+}
+
+fn reset_ldwork_column_tail(workspace: &mut [f64], size: usize, col: usize, from: usize) {
+    let column = &mut workspace[col * size..(col + 1) * size];
+    column[from..].fill(0.0);
+}
+
+fn dense_find_maxloc(
+    matrix: &[f64],
+    size: usize,
+    from: usize,
+    to: usize,
+) -> Option<(f64, usize, usize)> {
+    if from >= to {
+        return None;
+    }
+    let mut best = -1.0_f64;
+    let mut best_row = to;
+    let mut best_col = to;
+    for col in from..to {
+        for row in col..to {
+            let value = matrix[dense_lower_offset(size, row, col)].abs();
+            if value > best {
+                best = value;
+                best_row = row;
+                best_col = col;
+            }
+        }
+    }
+    if best_col < to {
+        Some((best, best_row, best_col))
+    } else {
+        None
+    }
+}
+
+fn dense_find_rc_abs_max_exclude(
+    matrix: &[f64],
+    size: usize,
+    col: usize,
+    from: usize,
+    exclude: Option<usize>,
+) -> f64 {
+    let mut best = 0.0_f64;
+    for other_col in from..col {
+        if Some(other_col) == exclude {
+            continue;
+        }
+        best = best.max(matrix[dense_lower_offset(size, col, other_col)].abs());
+    }
+    for row in (col + 1)..size {
+        if Some(row) == exclude {
+            continue;
+        }
+        best = best.max(matrix[dense_lower_offset(size, row, col)].abs());
+    }
+    best
+}
+
+fn dense_column_small(matrix: &[f64], size: usize, col: usize, from: usize, small: f64) -> bool {
+    for other_col in from..col {
+        if matrix[dense_lower_offset(size, col, other_col)].abs() >= small {
+            return false;
+        }
+    }
+    for row in col..size {
+        if matrix[dense_lower_offset(size, row, col)].abs() >= small {
+            return false;
+        }
+    }
+    true
+}
+
+fn dense_find_row_abs_max_in_column(
+    matrix: &[f64],
+    size: usize,
+    col: usize,
+    from: usize,
+) -> Option<usize> {
+    if from >= col || col >= size {
+        return None;
+    }
+    let mut best_row = from;
+    let mut best_value = matrix[dense_lower_offset(size, col, from)].abs();
+    for row in (from + 1)..col {
+        let value = matrix[dense_lower_offset(size, col, row)].abs();
+        if value > best_value {
+            best_value = value;
+            best_row = row;
+        }
+    }
+    Some(best_row)
+}
+
+fn tpp_test_two_by_two(
+    a11: f64,
+    a21: f64,
+    a22: f64,
+    maxt: f64,
+    maxp: f64,
+    options: NumericFactorOptions,
+) -> Option<(f64, f64, f64)> {
+    let (d11, d21, d22) = scaled_two_by_two_inverse(a11, a21, a22, options.small_pivot_tolerance)?;
+    if maxt.max(maxp) < options.small_pivot_tolerance {
+        return Some((d11, d21, d22));
+    }
+    let x1 = d11.abs() * maxt + d21.abs() * maxp;
+    let x2 = d21.abs() * maxt + d22.abs() * maxp;
+    if options.threshold_pivot_u * x1.max(x2) < 1.0 {
+        Some((d11, d21, d22))
+    } else {
+        None
+    }
+}
+
+fn app_update_one_by_one(matrix: &mut [f64], size: usize, pivot: usize, workspace: &[f64]) {
+    let ld = &workspace[pivot * size..(pivot + 1) * size];
+    for (col, &preserved) in ld.iter().enumerate().take(size).skip(pivot + 1) {
+        for row in col..size {
+            let update_entry = dense_lower_offset(size, row, col);
+            let multiplier = matrix[dense_lower_offset(size, row, pivot)];
+            matrix[update_entry] -= preserved * multiplier;
+        }
+    }
+}
+
+fn app_update_two_by_two(matrix: &mut [f64], size: usize, pivot: usize, workspace: &[f64]) {
+    let first_ld = &workspace[pivot * size..(pivot + 1) * size];
+    let second_ld = &workspace[(pivot + 1) * size..(pivot + 2) * size];
+    for col in (pivot + 2)..size {
+        let first_preserved = first_ld[col];
+        let second_preserved = second_ld[col];
+        for row in col..size {
+            let update_entry = dense_lower_offset(size, row, col);
+            let first_multiplier = matrix[dense_lower_offset(size, row, pivot)];
+            let second_multiplier = matrix[dense_lower_offset(size, row, pivot + 1)];
+            matrix[update_entry] -=
+                first_preserved * first_multiplier + second_preserved * second_multiplier;
+        }
+    }
+}
+
+fn factor_one_by_one_common(
     rows: &[usize],
     matrix: &mut [f64],
     size: usize,
     pivot: usize,
-    options: NumericFactorOptions,
     stats: &mut PanelFactorStats,
+    scratch: &mut [f64],
 ) -> Result<(FactorColumn, FactorBlockRecord), SsidsError> {
-    let diagonal_index = pivot * size + pivot;
+    let work = &mut scratch[pivot * size..(pivot + 1) * size];
+    let diagonal_index = dense_lower_offset(size, pivot, pivot);
     let original_diagonal = matrix[diagonal_index];
     if !original_diagonal.is_finite() {
         return Err(SsidsError::NumericalBreakdown {
@@ -1315,31 +1562,24 @@ fn dense_factor_one_by_one(
             detail: "diagonal pivot became non-finite".into(),
         });
     }
-    let mut diagonal = original_diagonal;
-    if diagonal.abs() < options.pivot_regularization {
-        stats.regularized_pivots += 1;
-        diagonal = if diagonal.is_sign_negative() {
-            -options.pivot_regularization
-        } else {
-            options.pivot_regularization
-        };
-    }
-    if diagonal.abs() < f64::EPSILON {
+    let diagonal = original_diagonal;
+    let inverse_diagonal = 1.0 / diagonal;
+    if !inverse_diagonal.is_finite() {
         return Err(SsidsError::NumericalBreakdown {
             pivot: rows[pivot],
-            detail: "diagonal pivot is numerically zero".into(),
+            detail: "inverse diagonal pivot became non-finite".into(),
         });
     }
     matrix[diagonal_index] = diagonal;
     stats.max_residual = stats.max_residual.max((diagonal - original_diagonal).abs());
-    let abs_pivot = diagonal.abs();
-    stats.min_abs_pivot = stats.min_abs_pivot.min(abs_pivot);
-    stats.max_abs_pivot = stats.max_abs_pivot.max(abs_pivot);
+    matrix[diagonal_index] = 1.0;
 
     let mut entries = Vec::new();
     for row in (pivot + 1)..size {
-        let entry_index = row * size + pivot;
-        let value = matrix[entry_index] / diagonal;
+        let entry_index = dense_lower_offset(size, row, pivot);
+        let original = matrix[entry_index];
+        work[row] = original;
+        let value = original / diagonal;
         if !value.is_finite() {
             return Err(SsidsError::NumericalBreakdown {
                 pivot: rows[pivot],
@@ -1350,23 +1590,12 @@ fn dense_factor_one_by_one(
             });
         }
         matrix[entry_index] = value;
-        matrix[pivot * size + row] = value;
         if value != 0.0 {
             entries.push((rows[row], value));
         }
     }
 
-    for row in (pivot + 1)..size {
-        let l_row = matrix[row * size + pivot];
-        if l_row == 0.0 {
-            continue;
-        }
-        for col in (pivot + 1)..=row {
-            let updated = matrix[row * size + col] - l_row * diagonal * matrix[col * size + pivot];
-            matrix[row * size + col] = updated;
-            matrix[col * size + row] = updated;
-        }
-    }
+    app_update_one_by_one(matrix, size, pivot, scratch);
 
     Ok((
         FactorColumn {
@@ -1375,82 +1604,37 @@ fn dense_factor_one_by_one(
         },
         FactorBlockRecord {
             size: 1,
-            values: vec![diagonal],
+            values: [inverse_diagonal, 0.0, 0.0, 0.0],
         },
     ))
 }
 
-fn choose_two_by_two_partner(
-    matrix: &[f64],
-    size: usize,
-    pivot: usize,
-    active_candidate_end: usize,
-    options: NumericFactorOptions,
-) -> Option<usize> {
-    let diagonal = matrix[pivot * size + pivot].abs();
-    let mut max_offdiag = 0.0_f64;
-    let mut partner = None;
-    for candidate in (pivot + 1)..active_candidate_end {
-        let coupling = matrix[candidate * size + pivot].abs();
-        if coupling > max_offdiag {
-            max_offdiag = coupling;
-            partner = Some(candidate);
-        }
-    }
-    if max_offdiag <= options.pivot_regularization {
-        return None;
-    }
-    if diagonal >= options.two_by_two_pivot_threshold * max_offdiag {
-        return None;
-    }
-    partner
-}
-
-fn dense_factor_two_by_two(
+fn factor_two_by_two_common(
     rows: &[usize],
     matrix: &mut [f64],
     size: usize,
     pivot: usize,
-    options: NumericFactorOptions,
+    inverse: (f64, f64, f64),
     stats: &mut PanelFactorStats,
+    scratch: &mut [f64],
 ) -> Result<([FactorColumn; 2], FactorBlockRecord), SsidsError> {
-    let mut values = vec![
-        matrix[pivot * size + pivot],
-        matrix[(pivot + 1) * size + pivot],
-        matrix[(pivot + 1) * size + pivot + 1],
-    ];
-    let (inverse, regularized, max_shift) =
-        stabilized_dense_block_inverse(&mut values, 2, options, None).map_err(|detail| {
-            SsidsError::NumericalBreakdown {
-                pivot: rows[pivot],
-                detail,
-            }
-        })?;
-    stats.regularized_pivots += regularized;
+    let second_start = (pivot + 1) * size;
+    let (first_prefix, second_suffix) = scratch.split_at_mut(second_start);
+    let first_scratch = &mut first_prefix[pivot * size..second_start];
+    let second_scratch = &mut second_suffix[..size];
+    let (inv11, inv12, inv22) = inverse;
     stats.two_by_two_pivots += 1;
-    stats.max_residual = stats.max_residual.max(max_shift);
-    for eigenvalue in jacobi_eigenvalues(&values, 2) {
-        let abs_pivot = eigenvalue.abs();
-        stats.min_abs_pivot = stats.min_abs_pivot.min(abs_pivot);
-        stats.max_abs_pivot = stats.max_abs_pivot.max(abs_pivot);
-    }
+    matrix[dense_lower_offset(size, pivot, pivot)] = 1.0;
+    matrix[dense_lower_offset(size, pivot + 1, pivot)] = 0.0;
+    matrix[dense_lower_offset(size, pivot + 1, pivot + 1)] = 1.0;
 
-    let d11 = values[0];
-    let d21 = values[1];
-    let d22 = values[2];
-    matrix[pivot * size + pivot] = d11;
-    matrix[(pivot + 1) * size + pivot] = d21;
-    matrix[pivot * size + pivot + 1] = d21;
-    matrix[(pivot + 1) * size + pivot + 1] = d22;
-
-    let inv11 = inverse[0];
-    let inv12 = inverse[1];
-    let inv22 = inverse[3];
     let mut first_entries = Vec::new();
     let mut second_entries = Vec::new();
     for row in (pivot + 2)..size {
-        let b1 = matrix[row * size + pivot];
-        let b2 = matrix[row * size + pivot + 1];
+        let b1 = matrix[dense_lower_offset(size, row, pivot)];
+        let b2 = matrix[dense_lower_offset(size, row, pivot + 1)];
+        first_scratch[row] = b1;
+        second_scratch[row] = b2;
         let l1 = b1 * inv11 + b2 * inv12;
         let l2 = b1 * inv12 + b2 * inv22;
         if !l1.is_finite() || !l2.is_finite() {
@@ -1459,10 +1643,8 @@ fn dense_factor_two_by_two(
                 detail: "two-by-two multipliers became non-finite".into(),
             });
         }
-        matrix[row * size + pivot] = l1;
-        matrix[pivot * size + row] = l1;
-        matrix[row * size + pivot + 1] = l2;
-        matrix[(pivot + 1) * size + row] = l2;
+        matrix[dense_lower_offset(size, row, pivot)] = l1;
+        matrix[dense_lower_offset(size, row, pivot + 1)] = l2;
         if l1 != 0.0 {
             first_entries.push((rows[row], l1));
         }
@@ -1471,20 +1653,7 @@ fn dense_factor_two_by_two(
         }
     }
 
-    for row in (pivot + 2)..size {
-        let l1_row = matrix[row * size + pivot];
-        let l2_row = matrix[row * size + pivot + 1];
-        for col in (pivot + 2)..=row {
-            let l1_col = matrix[col * size + pivot];
-            let l2_col = matrix[col * size + pivot + 1];
-            let update = d11 * l1_row * l1_col
-                + d21 * (l1_row * l2_col + l2_row * l1_col)
-                + d22 * l2_row * l2_col;
-            let updated = matrix[row * size + col] - update;
-            matrix[row * size + col] = updated;
-            matrix[col * size + row] = updated;
-        }
-    }
+    app_update_two_by_two(matrix, size, pivot, scratch);
 
     Ok((
         [
@@ -1497,39 +1666,218 @@ fn dense_factor_two_by_two(
                 entries: second_entries,
             },
         ],
-        FactorBlockRecord { size: 2, values },
+        FactorBlockRecord {
+            size: 2,
+            values: [inv11, inv12, f64::INFINITY, inv22],
+        },
     ))
 }
 
-fn factorize_dense_front(
-    mut rows: Vec<usize>,
+fn tpp_factor_one_by_one(
+    rows: &[usize],
+    matrix: &mut [f64],
+    size: usize,
+    pivot: usize,
+    _stats: &mut PanelFactorStats,
+    ld: &mut [f64],
+) -> Result<(FactorColumn, FactorBlockRecord), SsidsError> {
+    let work = &mut ld[..size];
+    let diagonal_index = dense_lower_offset(size, pivot, pivot);
+    let diagonal = matrix[diagonal_index];
+    if !diagonal.is_finite() {
+        return Err(SsidsError::NumericalBreakdown {
+            pivot: rows[pivot],
+            detail: "TPP diagonal pivot became non-finite".into(),
+        });
+    }
+    let inverse_diagonal = 1.0 / diagonal;
+    if !inverse_diagonal.is_finite() {
+        return Err(SsidsError::NumericalBreakdown {
+            pivot: rows[pivot],
+            detail: "TPP inverse diagonal pivot became non-finite".into(),
+        });
+    }
+    matrix[diagonal_index] = 1.0;
+
+    let mut entries = Vec::new();
+    for row in (pivot + 1)..size {
+        let entry_index = dense_lower_offset(size, row, pivot);
+        let original = matrix[entry_index];
+        work[row] = original;
+        let value = original * inverse_diagonal;
+        if !value.is_finite() {
+            return Err(SsidsError::NumericalBreakdown {
+                pivot: rows[pivot],
+                detail: format!(
+                    "TPP subdiagonal entry ({}, {}) became non-finite",
+                    rows[row], rows[pivot]
+                ),
+            });
+        }
+        matrix[entry_index] = value;
+        if value != 0.0 {
+            entries.push((rows[row], value));
+        }
+    }
+
+    root_tpp_rank1_update(matrix, size, pivot + 1, pivot, work);
+
+    Ok((
+        FactorColumn {
+            global_column: rows[pivot],
+            entries,
+        },
+        FactorBlockRecord {
+            size: 1,
+            values: [inverse_diagonal, 0.0, 0.0, 0.0],
+        },
+    ))
+}
+
+fn tpp_factor_two_by_two(
+    rows: &[usize],
+    matrix: &mut [f64],
+    size: usize,
+    pivot: usize,
+    inverse: (f64, f64, f64),
+    stats: &mut PanelFactorStats,
+    ld: &mut [f64],
+) -> Result<([FactorColumn; 2], FactorBlockRecord), SsidsError> {
+    let (first_scratch, second_scratch) = ld.split_at_mut(size);
+    let (inv11, inv12, inv22) = inverse;
+    stats.two_by_two_pivots += 1;
+    matrix[dense_lower_offset(size, pivot, pivot)] = 1.0;
+    matrix[dense_lower_offset(size, pivot + 1, pivot)] = 0.0;
+    matrix[dense_lower_offset(size, pivot + 1, pivot + 1)] = 1.0;
+
+    let mut first_entries = Vec::new();
+    let mut second_entries = Vec::new();
+    for row in (pivot + 2)..size {
+        let b1 = matrix[dense_lower_offset(size, row, pivot)];
+        let b2 = matrix[dense_lower_offset(size, row, pivot + 1)];
+        first_scratch[row] = b1;
+        second_scratch[row] = b2;
+        let l1 = b1 * inv11 + b2 * inv12;
+        let l2 = b1 * inv12 + b2 * inv22;
+        if !l1.is_finite() || !l2.is_finite() {
+            return Err(SsidsError::NumericalBreakdown {
+                pivot: rows[pivot],
+                detail: "TPP two-by-two multipliers became non-finite".into(),
+            });
+        }
+        matrix[dense_lower_offset(size, row, pivot)] = l1;
+        matrix[dense_lower_offset(size, row, pivot + 1)] = l2;
+        if l1 != 0.0 {
+            first_entries.push((rows[row], l1));
+        }
+        if l2 != 0.0 {
+            second_entries.push((rows[row], l2));
+        }
+    }
+
+    root_tpp_rank2_update(
+        matrix,
+        size,
+        pivot + 2,
+        pivot,
+        pivot + 1,
+        first_scratch,
+        second_scratch,
+    );
+
+    Ok((
+        [
+            FactorColumn {
+                global_column: rows[pivot],
+                entries: first_entries,
+            },
+            FactorColumn {
+                global_column: rows[pivot + 1],
+                entries: second_entries,
+            },
+        ],
+        FactorBlockRecord {
+            size: 2,
+            values: [inv11, inv12, f64::INFINITY, inv22],
+        },
+    ))
+}
+
+fn root_tpp_rank1_update(
+    matrix: &mut [f64],
+    size: usize,
+    start: usize,
+    multiplier_column: usize,
+    preserved_column: &[f64],
+) {
+    for (col, &preserved) in preserved_column.iter().enumerate().take(size).skip(start) {
+        for row in col..size {
+            let l_row = matrix[dense_lower_offset(size, row, multiplier_column)];
+            let update_entry = dense_lower_offset(size, row, col);
+            matrix[update_entry] -= l_row * preserved;
+        }
+    }
+}
+
+fn root_tpp_rank2_update(
+    matrix: &mut [f64],
+    size: usize,
+    start: usize,
+    first_multiplier_column: usize,
+    second_multiplier_column: usize,
+    first_preserved_column: &[f64],
+    second_preserved_column: &[f64],
+) {
+    for (col, (&first_preserved, &second_preserved)) in first_preserved_column
+        .iter()
+        .zip(second_preserved_column.iter())
+        .enumerate()
+        .take(size)
+        .skip(start)
+    {
+        for row in col..size {
+            let l1_row = matrix[dense_lower_offset(size, row, first_multiplier_column)];
+            let l2_row = matrix[dense_lower_offset(size, row, second_multiplier_column)];
+            let update_entry = dense_lower_offset(size, row, col);
+            matrix[update_entry] -= l1_row * first_preserved + l2_row * second_preserved;
+        }
+    }
+}
+
+fn factorize_dense_tpp_tail_in_place(
+    rows: &mut Vec<usize>,
+    dense: &mut [f64],
+    start_pivot: usize,
     candidate_len: usize,
-    mut dense: Vec<f64>,
     options: NumericFactorOptions,
+    require_full_elimination: bool,
+    ld: &mut [f64],
 ) -> Result<DenseFrontFactorization, SsidsError> {
     let size = rows.len();
-    let mut stats = PanelFactorStats {
-        min_abs_pivot: f64::INFINITY,
-        ..PanelFactorStats::default()
-    };
-    let mut factor_order = Vec::new();
-    let mut factor_columns = Vec::new();
+    let mut stats = PanelFactorStats::default();
+    let mut factor_order = Vec::with_capacity(size);
+    let mut factor_columns = Vec::with_capacity(size);
     let mut block_records = Vec::new();
-    let mut pivot = 0;
-    let mut active_candidate_end = candidate_len.min(size);
-    let mut delayed_front_propagations = 0;
+    let mut pivot = start_pivot;
+    let active_candidate_end = (start_pivot + candidate_len).min(size);
 
     while pivot < active_candidate_end {
-        let diagonal = dense[pivot * size + pivot].abs();
-        let mut max_offdiag = 0.0_f64;
-        for row in (pivot + 1)..size {
-            max_offdiag = max_offdiag.max(dense[row * size + pivot].abs());
-        }
-        let one_by_one = max_offdiag <= options.pivot_regularization
-            || diagonal >= options.two_by_two_pivot_threshold * max_offdiag;
-        if one_by_one {
-            let (column, block) =
-                dense_factor_one_by_one(&rows, &mut dense, size, pivot, options, &mut stats)?;
+        if dense_column_small(dense, size, pivot, pivot, options.small_pivot_tolerance) {
+            if !options.action_on_zero_pivot {
+                return Err(SsidsError::NumericalBreakdown {
+                    pivot: rows[pivot],
+                    detail: "TPP encountered a zero pivot with action disabled".into(),
+                });
+            }
+            zero_dense_column(dense, size, pivot);
+            let column = FactorColumn {
+                global_column: rows[pivot],
+                entries: Vec::new(),
+            };
+            let block = FactorBlockRecord {
+                size: 1,
+                values: [0.0, 0.0, 0.0, 0.0],
+            };
             factor_order.push(rows[pivot]);
             factor_columns.push(column);
             block_records.push(block);
@@ -1537,46 +1885,124 @@ fn factorize_dense_front(
             continue;
         }
 
-        if let Some(partner) =
-            choose_two_by_two_partner(&dense, size, pivot, active_candidate_end, options)
-        {
-            if partner != pivot + 1 {
-                dense_symmetric_swap(&mut dense, size, partner, pivot + 1);
-                rows.swap(partner, pivot + 1);
+        let mut advanced = false;
+        for candidate in (pivot + 1)..active_candidate_end {
+            if dense_column_small(dense, size, candidate, pivot, options.small_pivot_tolerance) {
+                if !options.action_on_zero_pivot {
+                    return Err(SsidsError::NumericalBreakdown {
+                        pivot: rows[pivot],
+                        detail: "TPP encountered a zero pivot with action disabled".into(),
+                    });
+                }
+                if candidate != pivot {
+                    dense_symmetric_swap(dense, size, candidate, pivot);
+                    rows.swap(candidate, pivot);
+                }
+                zero_dense_column(dense, size, pivot);
+                let column = FactorColumn {
+                    global_column: rows[pivot],
+                    entries: Vec::new(),
+                };
+                let block = FactorBlockRecord {
+                    size: 1,
+                    values: [0.0, 0.0, 0.0, 0.0],
+                };
+                factor_order.push(rows[pivot]);
+                factor_columns.push(column);
+                block_records.push(block);
+                pivot += 1;
+                advanced = true;
+                break;
             }
-            let (columns, block) =
-                dense_factor_two_by_two(&rows, &mut dense, size, pivot, options, &mut stats)?;
-            factor_order.push(rows[pivot]);
-            factor_order.push(rows[pivot + 1]);
-            factor_columns.push(columns[0].clone());
-            factor_columns.push(columns[1].clone());
-            block_records.push(block);
-            pivot += 2;
+
+            let Some(first) = dense_find_row_abs_max_in_column(dense, size, candidate, pivot)
+            else {
+                continue;
+            };
+            let mut second = candidate;
+            let a11 = dense[dense_lower_offset(size, first, first)];
+            let a22 = dense[dense_lower_offset(size, second, second)];
+            let a21 = dense[dense_lower_offset(size, second, first)];
+            let maxt = dense_find_rc_abs_max_exclude(dense, size, first, pivot, Some(second));
+            let mut maxp = dense_find_rc_abs_max_exclude(dense, size, second, pivot, Some(first));
+
+            if let Some(inverse) = tpp_test_two_by_two(a11, a21, a22, maxt, maxp, options) {
+                if first != pivot {
+                    dense_symmetric_swap(dense, size, first, pivot);
+                    rows.swap(first, pivot);
+                    if second == pivot {
+                        second = first;
+                    }
+                }
+                if second != pivot + 1 {
+                    dense_symmetric_swap(dense, size, second, pivot + 1);
+                    rows.swap(second, pivot + 1);
+                }
+                let (columns, block) =
+                    tpp_factor_two_by_two(rows, dense, size, pivot, inverse, &mut stats, ld)?;
+                factor_order.push(rows[pivot]);
+                factor_order.push(rows[pivot + 1]);
+                let [first_column, second_column] = columns;
+                factor_columns.push(first_column);
+                factor_columns.push(second_column);
+                block_records.push(block);
+                pivot += 2;
+                advanced = true;
+                break;
+            }
+
+            maxp = maxp.max(a21.abs());
+            if a22.abs() >= options.threshold_pivot_u * maxp {
+                if candidate != pivot {
+                    dense_symmetric_swap(dense, size, candidate, pivot);
+                    rows.swap(candidate, pivot);
+                }
+                let (column, block) =
+                    tpp_factor_one_by_one(rows, dense, size, pivot, &mut stats, ld)?;
+                factor_order.push(rows[pivot]);
+                factor_columns.push(column);
+                block_records.push(block);
+                pivot += 1;
+                advanced = true;
+                break;
+            }
+        }
+
+        if advanced {
             continue;
         }
 
-        if active_candidate_end == 0 {
-            break;
+        let current_diag = dense[dense_lower_offset(size, pivot, pivot)];
+        let current_offdiag_max = dense_find_rc_abs_max_exclude(dense, size, pivot, pivot, None);
+        if current_diag.abs() >= options.threshold_pivot_u * current_offdiag_max {
+            let (column, block) = tpp_factor_one_by_one(rows, dense, size, pivot, &mut stats, ld)?;
+            factor_order.push(rows[pivot]);
+            factor_columns.push(column);
+            block_records.push(block);
+            pivot += 1;
+            continue;
         }
-        dense_symmetric_swap(&mut dense, size, pivot, active_candidate_end - 1);
-        rows.swap(pivot, active_candidate_end - 1);
-        active_candidate_end -= 1;
-        stats.delayed_pivots += 1;
-        delayed_front_propagations += 1;
+
+        if require_full_elimination {
+            return Err(SsidsError::NumericalBreakdown {
+                pivot: rows[pivot],
+                detail: "root TPP completion could not find an acceptable pivot".into(),
+            });
+        }
+        break;
     }
 
-    if size == 0 || stats.min_abs_pivot == f64::INFINITY {
-        stats.min_abs_pivot = 0.0;
-    }
-
-    let remaining_rows = rows[pivot..].to_vec();
+    let remaining_rows = rows.split_off(pivot);
     let remaining_size = remaining_rows.len();
-    let delayed_count = candidate_len.saturating_sub(pivot).min(remaining_size);
-    let mut contribution_dense = vec![0.0; remaining_size * remaining_size];
+    let delayed_count = active_candidate_end
+        .saturating_sub(pivot)
+        .min(remaining_size);
+    stats.delayed_pivots += delayed_count;
+    let mut contribution_dense = vec![0.0; packed_lower_len(remaining_size)];
     for row in 0..remaining_size {
-        for col in 0..remaining_size {
-            contribution_dense[row * remaining_size + col] =
-                dense[(pivot + row) * size + (pivot + col)];
+        for col in 0..=row {
+            let value = dense[dense_lower_offset(size, pivot + row, pivot + col)];
+            contribution_dense[packed_lower_offset(remaining_size, row, col)] = value;
         }
     }
 
@@ -1590,15 +2016,234 @@ fn factorize_dense_front(
             dense: contribution_dense,
         },
         stats,
-        delayed_front_propagations,
+    })
+}
+
+fn zero_dense_column(matrix: &mut [f64], size: usize, pivot: usize) {
+    for row in pivot..size {
+        matrix[dense_lower_offset(size, row, pivot)] = 0.0;
+    }
+}
+
+fn factorize_root_dense_tpp(
+    mut rows: Vec<usize>,
+    mut dense: Vec<f64>,
+    options: NumericFactorOptions,
+) -> Result<DenseFrontFactorization, SsidsError> {
+    let size = rows.len();
+    let mut ld = vec![0.0; size.saturating_mul(2).max(1)];
+    let factorization =
+        factorize_dense_tpp_tail_in_place(&mut rows, &mut dense, 0, size, options, true, &mut ld)?;
+    if let Some(&pivot) = factorization.contribution.row_ids.first() {
+        return Err(SsidsError::NumericalBreakdown {
+            pivot,
+            detail: format!(
+                "root TPP completion retained {} delayed pivots",
+                factorization.contribution.delayed_count
+            ),
+        });
+    }
+    Ok(factorization)
+}
+
+fn factorize_dense_front(
+    mut rows: Vec<usize>,
+    candidate_len: usize,
+    mut dense: Vec<f64>,
+    options: NumericFactorOptions,
+) -> Result<DenseFrontFactorization, SsidsError> {
+    let size = rows.len();
+    let mut stats = PanelFactorStats::default();
+    let mut factor_order = Vec::new();
+    let mut factor_columns = Vec::new();
+    let mut block_records = Vec::new();
+    let mut scratch = vec![0.0; size.saturating_mul(size).max(1)];
+    let mut pivot = 0;
+    let active_candidate_end = candidate_len.min(size);
+
+    while pivot < active_candidate_end {
+        let Some((best_abs, best_row, best_col)) =
+            dense_find_maxloc(&dense, size, pivot, active_candidate_end)
+        else {
+            break;
+        };
+        if best_abs < options.small_pivot_tolerance {
+            if !options.action_on_zero_pivot {
+                return Err(SsidsError::NumericalBreakdown {
+                    pivot: rows[pivot],
+                    detail: "APP encountered a zero pivot with action disabled".into(),
+                });
+            }
+            while pivot < active_candidate_end {
+                zero_dense_column(&mut dense, size, pivot);
+                reset_ldwork_column_tail(&mut scratch, size, pivot, pivot);
+                let column = FactorColumn {
+                    global_column: rows[pivot],
+                    entries: Vec::new(),
+                };
+                let block = FactorBlockRecord {
+                    size: 1,
+                    values: [0.0, 0.0, 0.0, 0.0],
+                };
+                factor_order.push(rows[pivot]);
+                factor_columns.push(column);
+                block_records.push(block);
+                pivot += 1;
+            }
+            break;
+        }
+
+        if best_row == best_col {
+            if best_col != pivot {
+                dense_symmetric_swap_with_workspace(
+                    &mut dense,
+                    size,
+                    best_col,
+                    pivot,
+                    &mut scratch,
+                );
+                rows.swap(best_col, pivot);
+            }
+            let (column, block) =
+                factor_one_by_one_common(&rows, &mut dense, size, pivot, &mut stats, &mut scratch)?;
+            factor_order.push(rows[pivot]);
+            factor_columns.push(column);
+            block_records.push(block);
+            pivot += 1;
+            continue;
+        }
+
+        let first = best_col;
+        let mut second = best_row;
+        let a11 = dense[dense_lower_offset(size, first, first)];
+        let a22 = dense[dense_lower_offset(size, second, second)];
+        let a21 = dense[dense_lower_offset(size, second, first)];
+
+        let mut two_by_two_inverse = None;
+        let mut one_by_one_index = None;
+        if let Some(inverse) = app_two_by_two_inverse(a11, a21, a22, options.small_pivot_tolerance)
+        {
+            two_by_two_inverse = Some(inverse);
+        } else if a11.abs() > a22.abs() {
+            if (a11 / a21).abs() >= options.threshold_pivot_u {
+                one_by_one_index = Some(first);
+            }
+        } else if (a22 / a21).abs() >= options.threshold_pivot_u {
+            one_by_one_index = Some(second);
+        }
+
+        if let Some(index) = one_by_one_index {
+            if index != pivot {
+                dense_symmetric_swap_with_workspace(&mut dense, size, index, pivot, &mut scratch);
+                rows.swap(index, pivot);
+            }
+            let (column, block) =
+                factor_one_by_one_common(&rows, &mut dense, size, pivot, &mut stats, &mut scratch)?;
+            factor_order.push(rows[pivot]);
+            factor_columns.push(column);
+            block_records.push(block);
+            pivot += 1;
+            continue;
+        }
+
+        if let Some(inverse) = two_by_two_inverse {
+            if first != pivot {
+                dense_symmetric_swap_with_workspace(&mut dense, size, first, pivot, &mut scratch);
+                rows.swap(first, pivot);
+                if second == pivot {
+                    second = first;
+                }
+            }
+            if second != pivot + 1 {
+                dense_symmetric_swap_with_workspace(
+                    &mut dense,
+                    size,
+                    second,
+                    pivot + 1,
+                    &mut scratch,
+                );
+                rows.swap(second, pivot + 1);
+            }
+            let (columns, block) = factor_two_by_two_common(
+                &rows,
+                &mut dense,
+                size,
+                pivot,
+                inverse,
+                &mut stats,
+                &mut scratch,
+            )?;
+            factor_order.push(rows[pivot]);
+            factor_order.push(rows[pivot + 1]);
+            let [first_column, second_column] = columns;
+            factor_columns.push(first_column);
+            factor_columns.push(second_column);
+            block_records.push(block);
+            pivot += 2;
+            continue;
+        }
+
+        // Upstream APP stops after the first failed pivot prefix and hands the
+        // remaining candidate block to the configured failed-pivot method
+        // (TPP by default). Do not keep eagerly delaying individual pivots and
+        // continuing APP on the rest of the front.
+        break;
+    }
+
+    let remaining_rows = rows.split_off(pivot);
+    let remaining_size = remaining_rows.len();
+    let delayed_count = candidate_len.saturating_sub(pivot).min(remaining_size);
+    if delayed_count > 0 {
+        rows.extend(remaining_rows);
+        let mut tpp_ld = vec![0.0; rows.len().saturating_mul(2).max(1)];
+        let tpp_tail = factorize_dense_tpp_tail_in_place(
+            &mut rows,
+            &mut dense,
+            pivot,
+            delayed_count,
+            options,
+            false,
+            &mut tpp_ld,
+        )?;
+        factor_order.extend(tpp_tail.factor_order);
+        factor_columns.extend(tpp_tail.factor_columns);
+        block_records.extend(tpp_tail.block_records);
+        aggregate_panel_stats(&mut stats, tpp_tail.stats);
+        return Ok(DenseFrontFactorization {
+            factor_order,
+            factor_columns,
+            block_records,
+            contribution: tpp_tail.contribution,
+            stats,
+        });
+    }
+
+    let mut contribution_dense = vec![0.0; packed_lower_len(remaining_size)];
+    stats.delayed_pivots += delayed_count;
+    for row in 0..remaining_size {
+        for col in 0..=row {
+            let value = dense[dense_lower_offset(size, pivot + row, pivot + col)];
+            contribution_dense[packed_lower_offset(remaining_size, row, col)] = value;
+        }
+    }
+
+    Ok(DenseFrontFactorization {
+        factor_order,
+        factor_columns,
+        block_records,
+        contribution: ContributionBlock {
+            row_ids: remaining_rows,
+            delayed_count,
+            dense: contribution_dense,
+        },
+        stats,
     })
 }
 
 fn factor_front_recursive(
     front_id: usize,
     tree: &SymbolicFrontTree,
-    dense_matrix: &[f64],
-    dimension: usize,
+    matrix: &PermutedLowerMatrix<'_>,
     options: NumericFactorOptions,
     progress: Option<&FactorizationProgressShared>,
 ) -> Result<FrontFactorizationResult, SsidsError> {
@@ -1608,9 +2253,7 @@ fn factor_front_recursive(
             let raw = front
                 .children
                 .par_iter()
-                .map(|&child| {
-                    factor_front_recursive(child, tree, dense_matrix, dimension, options, progress)
-                })
+                .map(|&child| factor_front_recursive(child, tree, matrix, options, progress))
                 .collect::<Vec<_>>();
             let mut collected = Vec::with_capacity(raw.len());
             for result in raw {
@@ -1621,12 +2264,7 @@ fn factor_front_recursive(
             let mut collected = Vec::with_capacity(front.children.len());
             for &child in &front.children {
                 collected.push(factor_front_recursive(
-                    child,
-                    tree,
-                    dense_matrix,
-                    dimension,
-                    options,
-                    progress,
+                    child, tree, matrix, options, progress,
                 )?);
             }
             collected
@@ -1636,13 +2274,9 @@ fn factor_front_recursive(
     let mut factor_columns = Vec::new();
     let mut block_records = Vec::new();
     let mut child_contributions = Vec::with_capacity(child_results.len());
-    let mut stats = PanelFactorStats {
-        min_abs_pivot: f64::INFINITY,
-        ..PanelFactorStats::default()
-    };
+    let mut stats = PanelFactorStats::default();
     let mut max_front_size = 0;
     let mut contribution_storage_bytes = 0;
-    let mut delayed_front_propagations = 0;
 
     for child in child_results {
         factor_order.extend(child.factor_order);
@@ -1652,63 +2286,71 @@ fn factor_front_recursive(
         aggregate_panel_stats(&mut stats, child.stats);
         max_front_size = max_front_size.max(child.max_front_size);
         contribution_storage_bytes += child.contribution_storage_bytes;
-        delayed_front_propagations += child.delayed_front_propagations;
     }
 
-    let mut candidate_rows = front.columns.clone();
-    let mut all_rows = candidate_rows.iter().copied().collect::<BTreeSet<_>>();
-    for &row in &front.interface_rows {
-        all_rows.insert(row);
+    let mut row_state = vec![0_u8; matrix.dimension];
+    let mut candidate_rows = Vec::with_capacity(front.columns.len());
+    for &row in &front.columns {
+        if row_state[row] == 0 {
+            row_state[row] = 1;
+            candidate_rows.push(row);
+        }
     }
     for contribution in &child_contributions {
-        for &row in &contribution.row_ids {
-            all_rows.insert(row);
-        }
         for &row in contribution.row_ids.iter().take(contribution.delayed_count) {
-            if !candidate_rows.contains(&row) {
+            if row_state[row] == 0 {
+                row_state[row] = 1;
                 candidate_rows.push(row);
             }
         }
     }
-    let mut interface_rows = all_rows
-        .into_iter()
-        .filter(|row| !candidate_rows.contains(row))
-        .collect::<Vec<_>>();
+    let mut interface_rows = Vec::with_capacity(front.interface_rows.len());
+    for &row in &front.interface_rows {
+        if row_state[row] == 0 {
+            row_state[row] = 2;
+            interface_rows.push(row);
+        }
+    }
+    for contribution in &child_contributions {
+        for &row in &contribution.row_ids {
+            if row_state[row] == 0 {
+                row_state[row] = 2;
+                interface_rows.push(row);
+            }
+        }
+    }
     interface_rows.sort_unstable();
     let mut local_rows = candidate_rows;
     local_rows.extend(interface_rows);
     let local_size = local_rows.len();
     max_front_size = max_front_size.max(local_size);
     let mut local_dense = vec![0.0; local_size * local_size];
-    let mut local_positions = vec![usize::MAX; dimension];
+    let mut local_positions = vec![usize::MAX; matrix.dimension];
     for (position, &row) in local_rows.iter().enumerate() {
         local_positions[row] = position;
     }
     for &column in &front.columns {
         let local_column = local_positions[column];
-        for &row in &local_rows {
-            if row < column {
-                continue;
-            }
-            let value = dense_matrix[row * dimension + column];
-            if value == 0.0 {
-                continue;
-            }
+        for entry in matrix.col_ptrs[column]..matrix.col_ptrs[column + 1] {
+            let row = matrix.row_indices[entry];
             let local_row = local_positions[row];
-            local_dense[local_row * local_size + local_column] += value;
-            if local_row != local_column {
-                local_dense[local_column * local_size + local_row] += value;
+            if local_row == usize::MAX {
+                continue;
             }
+            let value = matrix.values[entry];
+            let offset = dense_lower_offset(local_size, local_row, local_column);
+            local_dense[offset] += value;
         }
     }
     for contribution in &child_contributions {
         let size = contribution.row_ids.len();
         for row in 0..size {
             let local_row = local_positions[contribution.row_ids[row]];
-            for col in 0..size {
+            for col in 0..=row {
                 let local_col = local_positions[contribution.row_ids[col]];
-                local_dense[local_row * local_size + local_col] +=
-                    contribution.dense[row * size + col];
+                let value = contribution.dense[packed_lower_offset(size, row, col)];
+                let offset = dense_lower_offset(local_size, local_row, local_col);
+                local_dense[offset] += value;
             }
         }
     }
@@ -1732,7 +2374,6 @@ fn factor_front_recursive(
     block_records.extend(local.block_records);
     aggregate_panel_stats(&mut stats, local.stats);
     contribution_storage_bytes += local.contribution.dense.len() * std::mem::size_of::<f64>();
-    delayed_front_propagations += local.delayed_front_propagations;
 
     Ok(FrontFactorizationResult {
         factor_order,
@@ -1742,7 +2383,6 @@ fn factor_front_recursive(
         stats,
         max_front_size,
         contribution_storage_bytes,
-        delayed_front_propagations,
     })
 }
 
@@ -1754,8 +2394,28 @@ fn multifrontal_factorize_with_tree(
     buffers: NumericFactorBuffers<'_>,
 ) -> Result<MultifrontalFactorizationOutcome, SsidsError> {
     let dimension = matrix.dimension();
-    fill_permuted_dense_matrix_from_csc(matrix, permutation, buffers.dense_matrix_scratch)?;
-    let dense_matrix = buffers.dense_matrix_scratch.as_slice();
+    if buffers.permuted_matrix_source_positions.len() != matrix.row_indices().len()
+        || buffers.permuted_matrix_col_ptrs.len() != dimension + 1
+    {
+        build_permuted_lower_csc_pattern(
+            matrix,
+            permutation,
+            buffers.permuted_matrix_col_ptrs,
+            buffers.permuted_matrix_row_indices,
+            buffers.permuted_matrix_source_positions,
+        )?;
+    }
+    fill_permuted_lower_csc_values(
+        matrix,
+        buffers.permuted_matrix_source_positions,
+        buffers.permuted_matrix_values,
+    )?;
+    let permuted_matrix = PermutedLowerMatrix {
+        dimension,
+        col_ptrs: buffers.permuted_matrix_col_ptrs,
+        row_indices: buffers.permuted_matrix_row_indices,
+        values: buffers.permuted_matrix_values,
+    };
     let progress = Arc::new(FactorizationProgressShared {
         total_fronts: tree.fronts.len(),
         total_pivots: dimension,
@@ -1773,7 +2433,6 @@ fn multifrontal_factorize_with_tree(
         completed_root_delayed_blocks: AtomicUsize::new(0),
         current_root_delayed_block: AtomicUsize::new(0),
         current_root_delayed_block_size: AtomicUsize::new(0),
-        current_root_delayed_inverse_column: AtomicUsize::new(0),
         root_delayed_stage: AtomicUsize::new(RootDelayedBlockStage::Idle as usize),
     });
     let _progress_guard = install_factorization_progress(Arc::clone(&progress));
@@ -1782,14 +2441,7 @@ fn multifrontal_factorize_with_tree(
             .roots
             .par_iter()
             .map(|&root| {
-                factor_front_recursive(
-                    root,
-                    tree,
-                    dense_matrix,
-                    dimension,
-                    options,
-                    Some(&progress),
-                )
+                factor_front_recursive(root, tree, &permuted_matrix, options, Some(&progress))
             })
             .collect::<Vec<_>>();
         let mut collected = Vec::with_capacity(raw.len());
@@ -1803,8 +2455,7 @@ fn multifrontal_factorize_with_tree(
             collected.push(factor_front_recursive(
                 root,
                 tree,
-                dense_matrix,
-                dimension,
+                &permuted_matrix,
                 options,
                 Some(&progress),
             )?);
@@ -1815,13 +2466,7 @@ fn multifrontal_factorize_with_tree(
     let mut factor_order = Vec::with_capacity(dimension);
     let mut factor_columns = Vec::with_capacity(dimension);
     let mut block_records = Vec::new();
-    let mut stats = PanelFactorStats {
-        min_abs_pivot: f64::INFINITY,
-        ..PanelFactorStats::default()
-    };
-    let mut max_front_size = 0;
-    let mut contribution_storage_bytes = 0;
-    let mut delayed_front_propagations = 0;
+    let mut stats = PanelFactorStats::default();
     let mut pending_root_contributions = Vec::new();
     for result in root_results {
         factor_order.extend(result.factor_order);
@@ -1829,9 +2474,6 @@ fn multifrontal_factorize_with_tree(
         block_records.extend(result.block_records);
         pending_root_contributions.push(result.contribution);
         aggregate_panel_stats(&mut stats, result.stats);
-        max_front_size = max_front_size.max(result.max_front_size);
-        contribution_storage_bytes += result.contribution_storage_bytes;
-        delayed_front_propagations += result.delayed_front_propagations;
     }
 
     let delayed_block_total = pending_root_contributions
@@ -1843,17 +2485,21 @@ fn multifrontal_factorize_with_tree(
         .store(delayed_block_total, Ordering::Relaxed);
     let mut delayed_block_index = 0;
     for contribution in pending_root_contributions {
-        if contribution.row_ids.is_empty() {
+        let ContributionBlock {
+            row_ids,
+            delayed_count: _,
+            dense,
+        } = contribution;
+        if row_ids.is_empty() {
             continue;
         }
         delayed_block_index += 1;
-        let size = contribution.row_ids.len();
+        let size = row_ids.len();
         progress.begin_root_delayed_block(delayed_block_index, size);
         progress.set_root_delayed_stage(RootDelayedBlockStage::Factoring);
-        let delayed_local = factorize_dense_front(
-            contribution.row_ids.clone(),
-            size,
-            contribution.dense.clone(),
+        let delayed_local = factorize_root_dense_tpp(
+            row_ids,
+            unpack_packed_lower_to_dense_square(size, &dense),
             options,
         )?;
         let fully_eliminated = size - delayed_local.contribution.row_ids.len();
@@ -1861,61 +2507,10 @@ fn multifrontal_factorize_with_tree(
         factor_columns.extend(delayed_local.factor_columns);
         block_records.extend(delayed_local.block_records);
         aggregate_panel_stats(&mut stats, delayed_local.stats);
-        delayed_front_propagations += delayed_local.delayed_front_propagations;
         progress
             .completed_pivots
             .fetch_add(fully_eliminated, Ordering::Relaxed);
-
-        if delayed_local.contribution.row_ids.is_empty() {
-            progress.finish_root_delayed_block();
-            continue;
-        }
-
-        let fallback = delayed_local.contribution;
-        let fallback_size = fallback.row_ids.len();
-        let mut values = dense_block_to_packed_lower(&fallback.dense, fallback_size);
-        progress.set_root_delayed_stage(RootDelayedBlockStage::Inverting);
-        let (_, regularized, max_shift) =
-            stabilized_dense_block_inverse(&mut values, fallback_size, options, Some(&progress))
-                .map_err(|detail| SsidsError::NumericalBreakdown {
-                    pivot: fallback.row_ids[0],
-                    detail,
-                })?;
-        stats.regularized_pivots += regularized;
-        stats.max_residual = stats.max_residual.max(max_shift);
-        if fallback_size == 1 {
-            let abs_pivot = values[0].abs();
-            stats.min_abs_pivot = stats.min_abs_pivot.min(abs_pivot);
-            stats.max_abs_pivot = stats.max_abs_pivot.max(abs_pivot);
-        } else {
-            stats.delayed_pivots += fallback_size;
-            progress.set_root_delayed_stage(RootDelayedBlockStage::Eigenvalues);
-            for eigenvalue in jacobi_eigenvalues(&values, fallback_size) {
-                let abs_pivot = eigenvalue.abs();
-                stats.min_abs_pivot = stats.min_abs_pivot.min(abs_pivot);
-                stats.max_abs_pivot = stats.max_abs_pivot.max(abs_pivot);
-            }
-        }
-        progress.set_root_delayed_stage(RootDelayedBlockStage::Emitting);
-        for &row in &fallback.row_ids {
-            factor_order.push(row);
-            factor_columns.push(FactorColumn {
-                global_column: row,
-                entries: Vec::new(),
-            });
-        }
-        block_records.push(FactorBlockRecord {
-            size: fallback_size,
-            values,
-        });
-        progress
-            .completed_pivots
-            .fetch_add(fallback_size, Ordering::Relaxed);
         progress.finish_root_delayed_block();
-    }
-
-    if stats.min_abs_pivot == f64::INFINITY {
-        stats.min_abs_pivot = 0.0;
     }
 
     if factor_order.len() != dimension {
@@ -1968,26 +2563,16 @@ fn multifrontal_factorize_with_tree(
             buffers.lower_row_indices.push(row_position);
             buffers.lower_values.push(value);
         }
-        buffers
-            .lower_col_ptrs
-            .push(buffers.lower_row_indices.len());
+        buffers.lower_col_ptrs.push(buffers.lower_row_indices.len());
     }
 
     buffers.diagonal_blocks.clear();
-    let mut start = 0;
+    buffers.diagonal_values.clear();
     for block in block_records {
-        buffers.diagonal_blocks.push(DiagonalBlockValue {
-            block: DiagonalBlock {
-                start,
-                size: block.size,
-            },
-            values: block.values,
-        });
-        start += buffers
+        buffers
             .diagonal_blocks
-            .last()
-            .map(|block| block.block.size)
-            .unwrap_or(0);
+            .push(DiagonalBlock { size: block.size });
+        buffers.diagonal_values.extend(block.values);
     }
 
     let stored_nnz = dimension
@@ -1998,15 +2583,10 @@ fn multifrontal_factorize_with_tree(
         + buffers
             .diagonal_blocks
             .iter()
-            .map(|block| block.values.len().saturating_sub(block.block.size))
+            .map(|block| block.size)
             .sum::<usize>();
     let factor_bytes = std::mem::size_of::<f64>()
-        * (buffers.lower_values.len()
-            + buffers
-                .diagonal_blocks
-                .iter()
-                .map(|block| block.values.len())
-                .sum::<usize>())
+        * (buffers.lower_values.len() + buffers.diagonal_values.len())
         + std::mem::size_of::<usize>()
             * (buffers.factor_order.len()
                 + buffers.factor_inverse.len()
@@ -2020,239 +2600,42 @@ fn multifrontal_factorize_with_tree(
 
     Ok(MultifrontalFactorizationOutcome {
         pivot_stats: PivotStats {
-            regularized_pivots: stats.regularized_pivots,
             two_by_two_pivots: stats.two_by_two_pivots,
             delayed_pivots: stats.delayed_pivots,
-            min_abs_pivot: stats.min_abs_pivot,
-            max_abs_pivot: stats.max_abs_pivot,
         },
         factorization_residual_max_abs: stats.max_residual,
-        front_count: tree.fronts.len(),
-        max_front_size,
-        contribution_storage_bytes,
-        delayed_front_propagations,
         stored_nnz,
         factor_bytes,
     })
 }
 
-fn diagonal_block_index(row: usize, col: usize) -> usize {
-    row * (row + 1) / 2 + col
-}
-
-fn diagonal_block_get(values: &[f64], size: usize, row: usize, col: usize) -> f64 {
-    debug_assert!(row < size && col < size);
-    let (row, col) = if row >= col { (row, col) } else { (col, row) };
-    values[diagonal_block_index(row, col)]
-}
-
-fn diagonal_block_set(values: &mut [f64], size: usize, row: usize, col: usize, value: f64) {
-    debug_assert!(row < size && col < size);
-    let (row, col) = if row >= col { (row, col) } else { (col, row) };
-    values[diagonal_block_index(row, col)] = value;
-}
-
-fn dense_matrix_from_diagonal_block(values: &[f64], size: usize) -> Vec<f64> {
-    let mut dense = vec![0.0; size * size];
-    for row in 0..size {
-        for col in 0..=row {
-            let value = values[diagonal_block_index(row, col)];
-            dense[row * size + col] = value;
-            dense[col * size + row] = value;
-        }
+fn solve_two_by_two_block_in_place(values: &[f64], rhs: &mut [f64]) -> Result<(), String> {
+    if values.len() != 4 || rhs.len() != 2 {
+        return Err("invalid two-by-two block dimensions".into());
     }
-    dense
-}
-
-fn solve_dense_matrix_in_place(dense: &[f64], size: usize, rhs: &mut [f64]) -> Result<(), String> {
-    let mut matrix = dense.to_vec();
-    for pivot in 0..size {
-        let mut pivot_row = pivot;
-        let mut pivot_abs = matrix[pivot * size + pivot].abs();
-        for row in (pivot + 1)..size {
-            let candidate = matrix[row * size + pivot].abs();
-            if candidate > pivot_abs {
-                pivot_abs = candidate;
-                pivot_row = row;
-            }
-        }
-        if !pivot_abs.is_finite() || pivot_abs < f64::EPSILON {
-            return Err("dense diagonal block became singular during solve".into());
-        }
-        if pivot_row != pivot {
-            for col in pivot..size {
-                matrix.swap(pivot * size + col, pivot_row * size + col);
-            }
-            rhs.swap(pivot, pivot_row);
-        }
-        let pivot_value = matrix[pivot * size + pivot];
-        for row in (pivot + 1)..size {
-            let factor = matrix[row * size + pivot] / pivot_value;
-            matrix[row * size + pivot] = 0.0;
-            for col in (pivot + 1)..size {
-                matrix[row * size + col] -= factor * matrix[pivot * size + col];
-            }
-            rhs[row] -= factor * rhs[pivot];
-        }
+    let d11 = values[0];
+    let d21 = values[1];
+    let d22 = values[3];
+    let x0 = d11 * rhs[0] + d21 * rhs[1];
+    let x1 = d21 * rhs[0] + d22 * rhs[1];
+    if !x0.is_finite() || !x1.is_finite() {
+        return Err("two-by-two diagonal block solve produced non-finite values".into());
     }
-    for row in (0..size).rev() {
-        let mut value = rhs[row];
-        for col in (row + 1)..size {
-            value -= matrix[row * size + col] * rhs[col];
-        }
-        let diagonal = matrix[row * size + row];
-        if !diagonal.is_finite() || diagonal.abs() < f64::EPSILON {
-            return Err("dense diagonal block became singular during back solve".into());
-        }
-        rhs[row] = value / diagonal;
-    }
+    rhs[0] = x0;
+    rhs[1] = x1;
     Ok(())
-}
-
-fn solve_dense_block_in_place(values: &[f64], size: usize, rhs: &mut [f64]) -> Result<(), String> {
-    solve_dense_matrix_in_place(&dense_matrix_from_diagonal_block(values, size), size, rhs)
-}
-
-fn invert_dense_block(
-    values: &[f64],
-    size: usize,
-    progress: Option<&FactorizationProgressShared>,
-) -> Result<Vec<f64>, String> {
-    let dense = dense_matrix_from_diagonal_block(values, size);
-    let mut inverse = vec![0.0; size * size];
-    let mut rhs = vec![0.0; size];
-    for col in 0..size {
-        if let Some(progress) = progress {
-            progress.set_root_delayed_inverse_column(col + 1);
-        }
-        rhs.fill(0.0);
-        rhs[col] = 1.0;
-        solve_dense_matrix_in_place(&dense, size, &mut rhs)?;
-        for row in 0..size {
-            inverse[row * size + col] = rhs[row];
-        }
-    }
-    if let Some(progress) = progress {
-        progress.set_root_delayed_inverse_column(size);
-    }
-    Ok(inverse)
-}
-
-fn stabilized_dense_block_inverse(
-    values: &mut [f64],
-    size: usize,
-    options: NumericFactorOptions,
-    progress: Option<&FactorizationProgressShared>,
-) -> Result<(Vec<f64>, usize, f64), String> {
-    if size == 0 {
-        return Ok((Vec::new(), 0, 0.0));
-    }
-    let mut applied_regularization = false;
-    let mut max_shift = 0.0_f64;
-    for attempt in 0..6 {
-        if let Some(progress) = progress {
-            progress.set_root_delayed_stage(RootDelayedBlockStage::Inverting);
-            progress.set_root_delayed_inverse_column(0);
-        }
-        if let Ok(inverse) = invert_dense_block(values, size, progress) {
-            return Ok((
-                inverse,
-                if applied_regularization { size } else { 0 },
-                max_shift,
-            ));
-        }
-        let shift = options.pivot_regularization * 10.0_f64.powi(attempt);
-        for diagonal in 0..size {
-            let current = diagonal_block_get(values, size, diagonal, diagonal);
-            let adjusted = current
-                + if current.is_sign_negative() {
-                    -shift
-                } else {
-                    shift
-                };
-            diagonal_block_set(values, size, diagonal, diagonal, adjusted);
-        }
-        applied_regularization = true;
-        max_shift = max_shift.max(shift);
-    }
-    Err("dense diagonal block remained singular after regularization".into())
-}
-
-fn jacobi_eigenvalues(values: &[f64], size: usize) -> Vec<f64> {
-    if size == 0 {
-        return Vec::new();
-    }
-    if size == 1 {
-        return vec![values[0]];
-    }
-    let mut dense = dense_matrix_from_diagonal_block(values, size);
-    let sweep_limit = 32 * size * size;
-    for _ in 0..sweep_limit {
-        let mut max_value = 0.0_f64;
-        let mut pivot = (0, 1);
-        for row in 0..size {
-            for col in 0..row {
-                let value = dense[row * size + col].abs();
-                if value > max_value {
-                    max_value = value;
-                    pivot = (row, col);
-                }
-            }
-        }
-        if max_value <= 1e-12 {
-            break;
-        }
-        let (p, q) = pivot;
-        let app = dense[p * size + p];
-        let aqq = dense[q * size + q];
-        let apq = dense[p * size + q];
-        if apq.abs() <= 1e-15 {
-            continue;
-        }
-        let tau = (aqq - app) / (2.0 * apq);
-        let tangent = if tau >= 0.0 {
-            1.0 / (tau + (1.0 + tau * tau).sqrt())
-        } else {
-            -1.0 / (-tau + (1.0 + tau * tau).sqrt())
-        };
-        let cosine = 1.0 / (1.0 + tangent * tangent).sqrt();
-        let sine = tangent * cosine;
-        for k in 0..size {
-            if k == p || k == q {
-                continue;
-            }
-            let aik = dense[p * size + k];
-            let akq = dense[q * size + k];
-            let new_pk = cosine * aik - sine * akq;
-            let new_qk = sine * aik + cosine * akq;
-            dense[p * size + k] = new_pk;
-            dense[k * size + p] = new_pk;
-            dense[q * size + k] = new_qk;
-            dense[k * size + q] = new_qk;
-        }
-        let new_pp = cosine * cosine * app - 2.0 * sine * cosine * apq + sine * sine * aqq;
-        let new_qq = sine * sine * app + 2.0 * sine * cosine * apq + cosine * cosine * aqq;
-        dense[p * size + p] = new_pp;
-        dense[q * size + q] = new_qq;
-        dense[p * size + q] = 0.0;
-        dense[q * size + p] = 0.0;
-    }
-    (0..size).map(|index| dense[index * size + index]).collect()
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct PanelFactorStats {
-    regularized_pivots: usize,
     two_by_two_pivots: usize,
     delayed_pivots: usize,
-    min_abs_pivot: f64,
-    max_abs_pivot: f64,
     max_residual: f64,
 }
 
 fn inertia_from_blocks(
-    diag: &[f64],
-    diagonal_blocks: &[DiagonalBlockValue],
+    diagonal_blocks: &[DiagonalBlock],
+    diagonal_values: &[f64],
     zero_tol: f64,
 ) -> Inertia {
     let mut inertia = Inertia {
@@ -2260,9 +2643,10 @@ fn inertia_from_blocks(
         negative: 0,
         zero: 0,
     };
-    for block in diagonal_blocks {
-        if block.block.size == 1 {
-            let value = block.values[0];
+    debug_assert_eq!(diagonal_values.len(), diagonal_blocks.len() * 4);
+    for (block, values) in diagonal_blocks.iter().zip(diagonal_values.chunks_exact(4)) {
+        if block.size == 1 {
+            let value = one_by_one_inverse_diagonal(&values[..2]).unwrap_or(0.0);
             if value > zero_tol {
                 inertia.positive += 1;
             } else if value < -zero_tol {
@@ -2272,18 +2656,9 @@ fn inertia_from_blocks(
             }
             continue;
         }
-        for value in jacobi_eigenvalues(&block.values, block.block.size) {
-            if value > zero_tol {
-                inertia.positive += 1;
-            } else if value < -zero_tol {
-                inertia.negative += 1;
-            } else {
-                inertia.zero += 1;
-            }
-        }
-    }
-    if diagonal_blocks.is_empty() {
-        for &value in diag {
+        debug_assert_eq!(block.size, 2);
+        let d22 = values[3];
+        for value in exact_two_by_two_eigenvalues(values[0], values[1], d22) {
             if value > zero_tol {
                 inertia.positive += 1;
             } else if value < -zero_tol {
@@ -2294,4 +2669,56 @@ fn inertia_from_blocks(
         }
     }
     inertia
+}
+fn unpack_packed_lower_to_dense_square(size: usize, packed: &[f64]) -> Vec<f64> {
+    let mut dense = vec![0.0; size * size];
+    for row in 0..size {
+        for col in 0..=row {
+            dense[dense_lower_offset(size, row, col)] = packed[packed_lower_offset(size, row, col)];
+        }
+    }
+    dense
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NumericFactorOptions, dense_lower_offset, factorize_dense_tpp_tail_in_place};
+
+    fn square_to_dense_lower(matrix: &[Vec<f64>]) -> Vec<f64> {
+        let size = matrix.len();
+        let mut dense = vec![0.0; size * size];
+        for row in 0..size {
+            for col in 0..=row {
+                dense[dense_lower_offset(size, row, col)] = matrix[row][col];
+            }
+        }
+        dense
+    }
+
+    #[test]
+    fn dense_tpp_tail_records_outgoing_delays() {
+        let mut rows = vec![0, 1, 2];
+        let mut dense = square_to_dense_lower(&[
+            vec![-422.9265249204227, 0.0, 0.0],
+            vec![0.0, -2.580878217593716e-06, 0.0],
+            vec![-2221.525473541999, -7.3870375201836405, 0.0],
+        ]);
+        let mut ld = vec![0.0; rows.len() * 2];
+
+        let factorization = factorize_dense_tpp_tail_in_place(
+            &mut rows,
+            &mut dense,
+            0,
+            2,
+            NumericFactorOptions::default(),
+            false,
+            &mut ld,
+        )
+        .expect("tpp tail factorization");
+
+        assert_eq!(factorization.stats.delayed_pivots, 1);
+        assert_eq!(factorization.contribution.delayed_count, 1);
+        assert_eq!(factorization.factor_order.len(), 1);
+        assert_eq!(factorization.contribution.row_ids, vec![1, 2]);
+    }
 }

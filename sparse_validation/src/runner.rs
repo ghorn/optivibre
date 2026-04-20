@@ -551,14 +551,6 @@ fn validate_numeric_strategy(
     };
 
     let mut notes = vec![format!("ordering_kind={}", info.ordering_kind)];
-    notes.push(format!(
-        "backend={}",
-        if factor.uses_multifrontal_backend() {
-            "multifrontal"
-        } else {
-            "prototype"
-        }
-    ));
     if case.matrix.dimension() > NUMERIC_EXACT_INERTIA_MAX_DIM {
         notes.push(format!(
             "exact dense inertia oracle skipped above dimension {NUMERIC_EXACT_INERTIA_MAX_DIM}"
@@ -586,15 +578,8 @@ fn validate_numeric_strategy(
             factor_storage_bytes: factor.factor_bytes(),
             supernode_count: factor.supernode_count(),
             max_supernode_width: factor.max_supernode_width(),
-            front_count: factor.front_count(),
-            max_front_size: factor.max_front_size(),
-            contribution_storage_bytes: factor.contribution_storage_bytes(),
-            delayed_front_propagations: factor.delayed_front_propagations(),
-            reused_symbolic_structure: factor.reused_symbolic_structure(),
-            regularized_pivots: factor.pivot_stats().regularized_pivots,
             two_by_two_pivots: factor.pivot_stats().two_by_two_pivots,
             delayed_pivots: factor.pivot_stats().delayed_pivots,
-            min_abs_pivot: factor.pivot_stats().min_abs_pivot,
             refactor_speedup_vs_factor,
         }),
         notes,
@@ -715,18 +700,7 @@ fn validate_native_spral_strategy(
     })
 }
 
-fn numeric_factor_options(case: &LoadedCorpusCase) -> NumericFactorOptions {
-    if case
-        .metadata
-        .tags
-        .iter()
-        .any(|tag| matches!(tag, crate::model::CorpusTag::DelayedPivot))
-    {
-        return NumericFactorOptions {
-            pivot_regularization: 1e-4,
-            ..NumericFactorOptions::default()
-        };
-    }
+fn numeric_factor_options(_case: &LoadedCorpusCase) -> NumericFactorOptions {
     NumericFactorOptions::default()
 }
 
@@ -836,8 +810,9 @@ fn run_robustness_suite() -> Vec<RobustnessCaseResult> {
                     .map_err(|error| error.to_string())?;
                 let (symbolic, _) =
                     analyse(matrix, &SsidsOptions::default()).map_err(|error| error.to_string())?;
-                let (factor, _) = factorize(matrix, &symbolic, &NumericFactorOptions::default())
-                    .map_err(|error| error.to_string())?;
+                let (mut factor, _) =
+                    factorize(matrix, &symbolic, &NumericFactorOptions::default())
+                        .map_err(|error| error.to_string())?;
                 let mut rhs = vec![1.0, -2.0, 0.5];
                 factor
                     .solve_in_place(&mut rhs)
@@ -855,8 +830,9 @@ fn run_robustness_suite() -> Vec<RobustnessCaseResult> {
                     .map_err(|error| error.to_string())?;
                 let (symbolic, _) =
                     analyse(matrix, &SsidsOptions::default()).map_err(|error| error.to_string())?;
-                let (factor, _) = factorize(matrix, &symbolic, &NumericFactorOptions::default())
-                    .map_err(|error| error.to_string())?;
+                let (mut factor, _) =
+                    factorize(matrix, &symbolic, &NumericFactorOptions::default())
+                        .map_err(|error| error.to_string())?;
                 let mut rhs = vec![1.0, -2.0];
                 factor
                     .solve_in_place(&mut rhs)
@@ -916,12 +892,9 @@ fn run_robustness_suite() -> Vec<RobustnessCaseResult> {
                     },
                 )
                 .map_err(|error| error.to_string())?;
-                let options = NumericFactorOptions {
-                    pivot_regularization: 1e-6,
-                    ..NumericFactorOptions::default()
-                };
                 let (mut factor, _) =
-                    factorize(matrix, &symbolic, &options).map_err(|error| error.to_string())?;
+                    factorize(matrix, &symbolic, &NumericFactorOptions::default())
+                        .map_err(|error| error.to_string())?;
                 for shift in [0.08, -0.05, 0.14, -0.09, 0.2] {
                     let updated_values = delayed_chain_values(shift);
                     let updated_matrix =
@@ -930,13 +903,6 @@ fn run_robustness_suite() -> Vec<RobustnessCaseResult> {
                     factor
                         .refactorize(updated_matrix)
                         .map_err(|error| error.to_string())?;
-                    if !factor.reused_symbolic_structure()
-                        || factor.delayed_front_propagations() == 0
-                    {
-                        return Err(
-                            "multifrontal refactorization lost reuse or delayed propagation".into(),
-                        );
-                    }
                     let expected = (0..6)
                         .map(|index| 0.75 + index as f64 * 0.15)
                         .collect::<Vec<_>>();
@@ -976,7 +942,7 @@ fn run_robustness_suite() -> Vec<RobustnessCaseResult> {
 
                 let mut baseline = None;
                 for _ in 0..3 {
-                    let (factor, info) =
+                    let (mut factor, info) =
                         factorize(matrix, &symbolic, &NumericFactorOptions::default())
                             .map_err(|error| error.to_string())?;
                     let solution = factor.solve(&rhs).map_err(|error| error.to_string())?;
@@ -997,8 +963,6 @@ fn run_robustness_suite() -> Vec<RobustnessCaseResult> {
                     let snapshot = (
                         factor.inertia(),
                         factor.pivot_stats(),
-                        factor.front_count(),
-                        factor.max_front_size(),
                         factor.stored_nnz(),
                         factor.factor_bytes(),
                         solution,
