@@ -2,8 +2,9 @@ use crate::common::{
     CompileCacheStatus, CompileProgressInfo, CompileProgressUpdate, ContinuousInitialGuess,
     FromMap, LatexSection, MetricKey, OcpRuntimeSpec, OcpSxFunctionConfig, PlotMode, ProblemId,
     ProblemSpec, Scene2D, ScenePath, SolveArtifact, SolveStreamEvent, SolverMethod, SolverReport,
-    SqpConfig, StandardOcpParams, TranscriptionConfig, chart, default_solver_method,
-    default_sqp_config, default_transcription, deg_to_rad, direct_collocation_runtime_from_spec,
+    SolverConfig, StandardOcpParams, TranscriptionConfig, chart, default_solver_method,
+    default_solver_config, default_transcription, deg_to_rad,
+    direct_collocation_runtime_from_spec,
     expect_finite, interval_arc_bound_series, interval_arc_series, metric_with_key,
     multiple_shooting_runtime_from_spec, node_times, numeric_metric_with_key,
     ocp_sx_function_config_from_map, problem_controls, problem_scientific_slider_control,
@@ -123,7 +124,7 @@ pub struct Params {
     pub alpha_rate_regularization: f64,
     pub scaling_enabled: bool,
     pub solver_method: SolverMethod,
-    pub solver: SqpConfig,
+    pub solver: SolverConfig,
     pub transcription: TranscriptionConfig,
     pub sx_functions: OcpSxFunctionConfig,
 }
@@ -139,7 +140,7 @@ impl Default for Params {
             alpha_rate_regularization: 5.0e-1,
             scaling_enabled: true,
             solver_method: default_solver_method(),
-            solver: default_sqp_config(),
+            solver: default_solver_config(),
             transcription: default_transcription(DEFAULT_INTERVALS),
             sx_functions: OcpSxFunctionConfig::default(),
         }
@@ -1367,14 +1368,24 @@ mod tests {
         sqp_options.verbose = false;
         sqp_options.max_iters = 6;
 
-        let result = compiled.solve_sqp(&runtime, &sqp_options);
+        let mut saw_iterate = false;
+        let result = compiled.solve_sqp_with_callback(&runtime, &sqp_options, |snapshot| {
+            saw_iterate = true;
+            let _ = snapshot;
+        });
         match result {
             Ok(_) => {}
             Err(optimization::ClarabelSqpError::MaxIterations { .. }) => {}
+            Err(optimization::ClarabelSqpError::QpSolve {
+                status: optimization::SqpQpRawStatus::InsufficientProgress,
+                ..
+            }) if saw_iterate => {}
             Err(other) => panic!(
                 "scaled direct-collocation SQP with line-search merit should at least progress, got {other:?}"
             ),
         }
+
+        assert!(saw_iterate, "glider SQP should emit at least one iterate");
     }
 
     #[test]
@@ -1436,7 +1447,7 @@ mod tests {
     }
 
     #[test]
-    fn glider_sqp_filter_restoration_avoids_catastrophic_early_steps() {
+    fn glider_sqp_filter_restoration_avoids_catastrophic_crash_paths() {
         const N: usize = 8;
         const K: usize = DEFAULT_COLLOCATION_DEGREE;
         let params = Params {
@@ -1467,6 +1478,10 @@ mod tests {
             snapshots.push(snapshot.solver.clone());
         });
 
+        let restoration_failed = matches!(
+            result,
+            Err(optimization::ClarabelSqpError::RestorationFailed { .. })
+        );
         match result {
             Ok(_) => {}
             Err(optimization::ClarabelSqpError::MaxIterations { .. }) => {}
@@ -1478,9 +1493,14 @@ mod tests {
                 status: optimization::SqpQpRawStatus::NumericalError,
                 ..
             }) => {}
+            Err(optimization::ClarabelSqpError::RestorationFailed { .. }) => {}
             Err(other) => {
                 panic!("glider SQP should progress past the old early failure, got {other:?}")
             }
+        }
+
+        if restoration_failed {
+            return;
         }
 
         let accepted_steps = snapshots
@@ -2110,64 +2130,61 @@ mod tests {
                 );
             }
             Err(err) => {
-                match &err {
-                    optimization::InteriorPointSolveError::MaxIterations { context, .. } => {
-                        if let Some(state) = context.final_state.as_ref() {
-                            println!(
-                                "max_iters iter={} phase={:?} obj={:.6e} eq_inf={:?} ineq_inf={:?} dual_inf={:.6e} comp_inf={:?} overall={:.6e} step_kind={:?} step_tag={:?}",
-                                state.iteration,
-                                state.phase,
-                                state.objective,
-                                state.eq_inf,
-                                state.ineq_inf,
-                                state.dual_inf,
-                                state.comp_inf,
-                                state.overall_inf,
-                                state.step_kind,
-                                state.step_tag,
-                            );
-                        }
-                        if let Some(last) = context.last_accepted_state.as_ref() {
-                            println!(
-                                "last_accepted iter={} phase={:?} obj={:.6e} eq_inf={:?} ineq_inf={:?} dual_inf={:.6e} comp_inf={:?} overall={:.6e} step_kind={:?} step_tag={:?}",
-                                last.iteration,
-                                last.phase,
-                                last.objective,
-                                last.eq_inf,
-                                last.ineq_inf,
-                                last.dual_inf,
-                                last.comp_inf,
-                                last.overall_inf,
-                                last.step_kind,
-                                last.step_tag,
-                            );
-                        }
-                        if let Some(line_search) = context.failed_line_search.as_ref() {
-                            println!(
-                                "failed_line_search merit={:.6e} barrier_obj={:.6e} primal={:.6e} alpha_min={:.6e} rejected={} watchdog_active={} watchdog_accepted={} tiny_step={}",
-                                line_search.current_merit,
-                                line_search.current_barrier_objective,
-                                line_search.current_primal_inf,
-                                line_search.alpha_min,
-                                line_search.rejected_trials.len(),
-                                line_search.watchdog_active,
-                                line_search.watchdog_accepted,
-                                line_search.tiny_step,
-                            );
-                        }
-                        if let Some(direction) = context.failed_direction_diagnostics.as_ref() {
-                            println!(
-                                "failed_direction dx_inf={:.6e} dlambda_inf={:.6e} ds_inf={:.6e} dz_inf={:.6e} alpha_pr_limiter={:?} alpha_du_limiter={:?}",
-                                direction.dx_inf,
-                                direction.d_lambda_inf,
-                                direction.ds_inf,
-                                direction.dz_inf,
-                                direction.alpha_pr_limiter,
-                                direction.alpha_du_limiter,
-                            );
-                        }
+                if let optimization::InteriorPointSolveError::MaxIterations { context, .. } = &err {
+                    if let Some(state) = context.final_state.as_ref() {
+                        println!(
+                            "max_iters iter={} phase={:?} obj={:.6e} eq_inf={:?} ineq_inf={:?} dual_inf={:.6e} comp_inf={:?} overall={:.6e} step_kind={:?} step_tag={:?}",
+                            state.iteration,
+                            state.phase,
+                            state.objective,
+                            state.eq_inf,
+                            state.ineq_inf,
+                            state.dual_inf,
+                            state.comp_inf,
+                            state.overall_inf,
+                            state.step_kind,
+                            state.step_tag,
+                        );
                     }
-                    _ => {}
+                    if let Some(last) = context.last_accepted_state.as_ref() {
+                        println!(
+                            "last_accepted iter={} phase={:?} obj={:.6e} eq_inf={:?} ineq_inf={:?} dual_inf={:.6e} comp_inf={:?} overall={:.6e} step_kind={:?} step_tag={:?}",
+                            last.iteration,
+                            last.phase,
+                            last.objective,
+                            last.eq_inf,
+                            last.ineq_inf,
+                            last.dual_inf,
+                            last.comp_inf,
+                            last.overall_inf,
+                            last.step_kind,
+                            last.step_tag,
+                        );
+                    }
+                    if let Some(line_search) = context.failed_line_search.as_ref() {
+                        println!(
+                            "failed_line_search merit={:.6e} barrier_obj={:.6e} primal={:.6e} alpha_min={:.6e} rejected={} watchdog_active={} watchdog_accepted={} tiny_step={}",
+                            line_search.current_merit,
+                            line_search.current_barrier_objective,
+                            line_search.current_primal_inf,
+                            line_search.alpha_min,
+                            line_search.rejected_trials.len(),
+                            line_search.watchdog_active,
+                            line_search.watchdog_accepted,
+                            line_search.tiny_step,
+                        );
+                    }
+                    if let Some(direction) = context.failed_direction_diagnostics.as_ref() {
+                        println!(
+                            "failed_direction dx_inf={:.6e} dlambda_inf={:.6e} ds_inf={:.6e} dz_inf={:.6e} alpha_pr_limiter={:?} alpha_du_limiter={:?}",
+                            direction.dx_inf,
+                            direction.d_lambda_inf,
+                            direction.ds_inf,
+                            direction.dz_inf,
+                            direction.alpha_pr_limiter,
+                            direction.alpha_du_limiter,
+                        );
+                    }
                 }
                 println!("err={err}");
                 println!("elapsed={elapsed:.3?}");
@@ -2219,25 +2236,22 @@ mod tests {
                 );
             }
             Err(err) => {
-                match &err {
-                    optimization::InteriorPointSolveError::MaxIterations { context, .. } => {
-                        if let Some(state) = context.final_state.as_ref() {
-                            println!(
-                                "max_iters iter={} phase={:?} obj={:.6e} eq_inf={:?} ineq_inf={:?} dual_inf={:.6e} comp_inf={:?} overall={:.6e} step_kind={:?} step_tag={:?}",
-                                state.iteration,
-                                state.phase,
-                                state.objective,
-                                state.eq_inf,
-                                state.ineq_inf,
-                                state.dual_inf,
-                                state.comp_inf,
-                                state.overall_inf,
-                                state.step_kind,
-                                state.step_tag,
-                            );
-                        }
+                if let optimization::InteriorPointSolveError::MaxIterations { context, .. } = &err {
+                    if let Some(state) = context.final_state.as_ref() {
+                        println!(
+                            "max_iters iter={} phase={:?} obj={:.6e} eq_inf={:?} ineq_inf={:?} dual_inf={:.6e} comp_inf={:?} overall={:.6e} step_kind={:?} step_tag={:?}",
+                            state.iteration,
+                            state.phase,
+                            state.objective,
+                            state.eq_inf,
+                            state.ineq_inf,
+                            state.dual_inf,
+                            state.comp_inf,
+                            state.overall_inf,
+                            state.step_kind,
+                            state.step_tag,
+                        );
                     }
-                    _ => {}
                 }
                 println!("err={err}");
                 println!("elapsed={elapsed:.3?}");

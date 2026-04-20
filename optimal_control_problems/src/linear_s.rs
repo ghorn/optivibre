@@ -2,8 +2,8 @@ use crate::common::{
     CompileCacheStatus, CompileProgressInfo, CompileProgressUpdate, ContinuousInitialGuess,
     FromMap, LatexSection, MetricKey, OcpRuntimeSpec, OcpSxFunctionConfig, PlotMode, ProblemId,
     ProblemSpec, Scene2D, ScenePath, SolveArtifact, SolveStreamEvent, SolverMethod, SolverReport,
-    SqpConfig, StandardOcpParams, TranscriptionConfig, chart, default_solver_method,
-    default_sqp_config, default_transcription, direct_collocation_runtime_from_spec, expect_finite,
+    SolverConfig, StandardOcpParams, TranscriptionConfig, chart, default_solver_config,
+    default_solver_method, default_transcription, direct_collocation_runtime_from_spec, expect_finite,
     interval_arc_bound_series, interval_arc_series, metric_with_key,
     multiple_shooting_runtime_from_spec, numeric_metric_with_key, ocp_sx_function_config_from_map,
     problem_controls, problem_scientific_slider_control, problem_slider_control, problem_spec,
@@ -109,14 +109,14 @@ pub struct Params {
     pub jerk_limit_mps3: f64,
     pub jerk_regularization: f64,
     pub solver_method: SolverMethod,
-    pub solver: SqpConfig,
+    pub solver: SolverConfig,
     pub transcription: TranscriptionConfig,
     pub sx_functions: OcpSxFunctionConfig,
 }
 impl Default for Params {
     fn default() -> Self {
-        let mut solver = default_sqp_config();
-        solver.globalization = crate::common::SqpGlobalizationConfig::LineSearchFilter {
+        let mut solver = default_solver_config();
+        solver.sqp.globalization = crate::common::SqpGlobalizationConfig::LineSearchFilter {
             line_search: crate::common::default_sqp_line_search_config(),
             filter: crate::common::default_sqp_filter_config(),
             exact_merit_penalty: 10.0,
@@ -1114,7 +1114,11 @@ mod tests {
     use super::*;
     #[test]
     fn s_maneuver_reaches_target_and_weaves() {
-        let artifact = solve(&Params::default()).expect("linear s solve should succeed");
+        let params = Params {
+            solver_method: SolverMethod::Sqp,
+            ..Params::default()
+        };
+        let artifact = solve(&params).expect("linear s solve should succeed");
         let max_y = crate::find_metric(&artifact.summary, crate::MetricKey::MaxY)
             .and_then(|metric| metric.numeric_value)
             .expect("max y metric should exist");

@@ -2,9 +2,9 @@ use crate::common::{
     CompileCacheStatus, CompileProgressInfo, CompileProgressUpdate, ContinuousInitialGuess,
     FromMap, LatexSection, MetricKey, OcpRuntimeSpec, OcpSxFunctionConfig, PlotMode, ProblemId,
     ProblemSpec, Scene2D, SceneAnimation, SceneArrow, SceneFrame, ScenePath, SolveArtifact,
-    SolveStreamEvent, SolverMethod, SolverReport, SqpConfig, StandardOcpParams, TimeSeries,
-    TranscriptionConfig, chart, default_solver_method, default_sqp_config, default_transcription,
-    deg_to_rad, direct_collocation_runtime_from_spec, expect_finite, interval_arc_bound_series,
+    SolveStreamEvent, SolverConfig, SolverMethod, SolverReport, StandardOcpParams, TimeSeries,
+    TranscriptionConfig, chart, default_solver_config, default_solver_method,
+    default_transcription, deg_to_rad, direct_collocation_runtime_from_spec, expect_finite, interval_arc_bound_series,
     interval_arc_series, metric_with_key, multiple_shooting_runtime_from_spec, node_times,
     numeric_metric_with_key, ocp_sx_function_config_from_map, problem_controls,
     problem_scientific_slider_control, problem_slider_control, problem_spec, rad_to_deg,
@@ -133,7 +133,7 @@ pub struct Params {
     pub alpha_rate_regularization: f64,
     pub cross_track_limit_m: f64,
     pub solver_method: SolverMethod,
-    pub solver: SqpConfig,
+    pub solver: SolverConfig,
     pub transcription: TranscriptionConfig,
     pub sx_functions: OcpSxFunctionConfig,
 }
@@ -154,7 +154,7 @@ impl Default for Params {
             alpha_rate_regularization: 0.0,
             cross_track_limit_m: 30.0,
             solver_method: default_solver_method(),
-            solver: default_sqp_config(),
+            solver: default_solver_config(),
             transcription: default_transcription(DEFAULT_INTERVALS),
             sx_functions: OcpSxFunctionConfig::default(),
         }
@@ -1586,13 +1586,16 @@ mod tests {
             alpha_rate_regularization: 0.0,
             cross_track_limit_m: 30.0,
             solver_method: SolverMethod::Sqp,
-            solver: SqpConfig {
+            solver: SolverConfig {
                 max_iters: 8,
-                hessian_regularization_enabled: false,
                 dual_tol: 1.0e-1,
                 constraint_tol: 1.0e-4,
                 complementarity_tol: 1.0e-4,
-                globalization: crate::common::default_sqp_config().globalization,
+                sqp: crate::common::SqpMethodConfig {
+                    hessian_regularization_enabled: false,
+                    globalization: crate::common::default_solver_config().sqp.globalization,
+                },
+                nlip: crate::common::default_nlip_config(),
             },
             transcription: TranscriptionConfig {
                 method: crate::common::TranscriptionMethod::MultipleShooting,

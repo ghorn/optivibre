@@ -19,11 +19,12 @@ use axum::{
 };
 use clap::Parser;
 use optimal_control_problems::{
-    CompileCacheState, CompileCacheStatus, ProblemId, SolveArtifact, SolveLogLevel, SolveRequest,
-    SolveStage, SolveStatus, SolveStreamEvent, compile_variant_for_problem,
-    prewarm_problem_with_progress, problem_specs, solve_problem, solve_problem_with_progress,
+    CompileCacheState, CompileCacheStatus, ControlSemantic, ProblemId, SolveArtifact,
+    SolveLogLevel, SolveRequest, SolveStage, SolveStatus, SolveStreamEvent, SolverMethod,
+    SolverReport, compile_variant_for_problem, prewarm_problem_with_progress, problem_specs,
+    solve_problem, solve_problem_with_progress,
 };
-use optimization::{AnsiColorMode, set_ansi_color_mode};
+use optimization::{AnsiColorMode, InteriorPointLinearSolver, set_ansi_color_mode};
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
@@ -89,6 +90,37 @@ enum PendingSolveJob {
         values: BTreeMap<String, f64>,
         sender: StreamSender,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SolveRequestContext {
+    solver_method: Option<SolverMethod>,
+    nlip_linear_solver: Option<InteriorPointLinearSolver>,
+}
+
+impl SolveRequestContext {
+    fn from_values(problem: ProblemId, values: &BTreeMap<String, f64>) -> Self {
+        Self {
+            solver_method: solver_method_for_values(problem, values),
+            nlip_linear_solver: nlip_linear_solver_for_values(problem, values),
+        }
+    }
+
+    fn initial_notice(self) -> Option<(&'static str, SolveLogLevel)> {
+        if matches!(self.solver_method, Some(SolverMethod::Nlip))
+            && matches!(
+                self.nlip_linear_solver,
+                Some(InteriorPointLinearSolver::SpralSsids)
+            )
+        {
+            Some((
+                "[NLIP] Preparing SPRAL sparse KKT analysis; the first warmed solve may pause before iteration 0.",
+                SolveLogLevel::Info,
+            ))
+        } else {
+            None
+        }
+    }
 }
 
 struct AnsiColorModeGuard(AnsiColorMode);
@@ -200,9 +232,17 @@ async fn solve_stream(
     Json(request): Json<SolveRequest>,
 ) -> ApiResult<impl IntoResponse> {
     let (sender, receiver) = mpsc::channel::<Result<Bytes, Infallible>>(64);
-    let initial_status = problem_backend().solve_stream(problem, request, sender.clone());
+    let context = SolveRequestContext::from_values(problem, &request.values);
+    let initial_status = problem_backend().solve_stream(problem, request, sender.clone(), context);
     if let Some(status) = initial_status {
         send_stream_event_async(&sender, SolveStreamEvent::Status { status }).await;
+    }
+    if let Some((line, level)) = context.initial_notice() {
+        send_stream_event_async(&sender, SolveStreamEvent::Log {
+            line: line.to_string(),
+            level,
+        })
+        .await;
     }
     Ok(ndjson_stream_response(receiver))
 }
@@ -254,9 +294,10 @@ impl ProblemBackend {
         problem: ProblemId,
         request: SolveRequest,
         sender: StreamSender,
+        context: SolveRequestContext,
     ) -> Option<SolveStatus> {
         self.actor_for(problem, &request.values)
-            .enqueue_stream_solve(request.values, sender)
+            .enqueue_stream_solve(request.values, sender, context)
     }
 
     fn actor_for(&self, problem: ProblemId, values: &BTreeMap<String, f64>) -> Arc<ProblemActor> {
@@ -327,6 +368,7 @@ impl ProblemActor {
         &self,
         values: BTreeMap<String, f64>,
         sender: StreamSender,
+        context: SolveRequestContext,
     ) -> Option<SolveStatus> {
         {
             let (lock, cvar) = &*self.shared;
@@ -334,10 +376,10 @@ impl ProblemActor {
             let initial_status = if state.phase == WorkerPhase::Warming {
                 state.latest_compile_status.clone()
             } else if state.ready {
-                state
-                    .latest_compile_status
-                    .clone()
-                    .map(mark_compile_status_cached)
+                Some(ready_solve_status(
+                    state.latest_compile_status.clone(),
+                    context.solver_method,
+                ))
             } else {
                 None
             };
@@ -564,6 +606,69 @@ fn compile_cache_status_from_parts(
 fn mark_compile_status_cached(mut status: SolveStatus) -> SolveStatus {
     status.solver.compile_cached = true;
     status
+}
+
+fn ready_solve_status(
+    latest_compile_status: Option<SolveStatus>,
+    solver_method: Option<SolverMethod>,
+) -> SolveStatus {
+    let mut status = latest_compile_status
+        .map(mark_compile_status_cached)
+        .unwrap_or_else(|| SolveStatus {
+            stage: SolveStage::Solving,
+            solver_method,
+            solver: SolverReport::in_progress(solver_running_label(solver_method)),
+        });
+    status.stage = SolveStage::Solving;
+    status.solver_method = solver_method;
+    status.solver.status_label = solver_running_label(solver_method).to_string();
+    status.solver.solve_s = Some(0.0);
+    status
+}
+
+fn solver_running_label(solver_method: Option<SolverMethod>) -> &'static str {
+    match solver_method {
+        Some(SolverMethod::Nlip) => "Running NLIP solver...",
+        Some(SolverMethod::Sqp) => "Running SQP...",
+        Some(_) => "Running solver...",
+        None => "Starting solve...",
+    }
+}
+
+fn control_value_for_semantic(
+    problem: ProblemId,
+    values: &BTreeMap<String, f64>,
+    semantic: ControlSemantic,
+) -> Option<f64> {
+    let spec = problem_specs().into_iter().find(|spec| spec.id == problem)?;
+    let control = spec.controls.iter().find(|control| control.semantic == semantic)?;
+    Some(values.get(&control.id).copied().unwrap_or(control.default))
+}
+
+fn solver_method_for_values(
+    problem: ProblemId,
+    values: &BTreeMap<String, f64>,
+) -> Option<SolverMethod> {
+    let value = control_value_for_semantic(problem, values, ControlSemantic::SolverMethod)?;
+    match value.round() as i64 {
+        0 => Some(SolverMethod::Sqp),
+        1 => Some(SolverMethod::Nlip),
+        _ => None,
+    }
+}
+
+fn nlip_linear_solver_for_values(
+    problem: ProblemId,
+    values: &BTreeMap<String, f64>,
+) -> Option<InteriorPointLinearSolver> {
+    let value =
+        control_value_for_semantic(problem, values, ControlSemantic::SolverNlipLinearSolver)?;
+    match value.round() as i64 {
+        0 => Some(InteriorPointLinearSolver::SpralSsids),
+        1 => Some(InteriorPointLinearSolver::SparseQdldl),
+        2 => Some(InteriorPointLinearSolver::Auto),
+        _ => None,
+    }
 }
 
 fn is_compile_stage(stage: SolveStage) -> bool {

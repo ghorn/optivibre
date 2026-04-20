@@ -2,8 +2,8 @@ use crate::common::{
     CompileCacheStatus, CompileProgressInfo, CompileProgressUpdate, ContinuousInitialGuess,
     FromMap, LatexSection, MetricKey, OcpRuntimeSpec, OcpSxFunctionConfig, PlotMode, ProblemId,
     ProblemSpec, Scene2D, SceneAnimation, SceneFrame, ScenePath, SolveArtifact, SolveStreamEvent,
-    SolverMethod, SolverReport, SqpConfig, StandardOcpParams, TranscriptionConfig, chart,
-    default_solver_method, default_sqp_config, default_transcription, deg_to_rad,
+    SolverConfig, SolverMethod, SolverReport, StandardOcpParams, TranscriptionConfig, chart,
+    default_solver_config, default_solver_method, default_transcription, deg_to_rad,
     direct_collocation_runtime_from_spec, expect_finite, interval_arc_bound_series,
     interval_arc_series, metric_with_key, multiple_shooting_runtime_from_spec, node_times,
     numeric_metric_with_key, ocp_sx_function_config_from_map, problem_controls,
@@ -114,14 +114,14 @@ pub struct Params {
     pub force_rate_regularization: f64,
     pub swing_limit_deg: f64,
     pub solver_method: SolverMethod,
-    pub solver: SqpConfig,
+    pub solver: SolverConfig,
     pub transcription: TranscriptionConfig,
     pub sx_functions: OcpSxFunctionConfig,
 }
 impl Default for Params {
     fn default() -> Self {
-        let mut solver = default_sqp_config();
-        solver.globalization = crate::common::SqpGlobalizationConfig::LineSearchFilter {
+        let mut solver = default_solver_config();
+        solver.sqp.globalization = crate::common::SqpGlobalizationConfig::LineSearchFilter {
             line_search: crate::common::default_sqp_line_search_config(),
             filter: crate::common::default_sqp_filter_config(),
             exact_merit_penalty: 10.0,
@@ -1201,14 +1201,18 @@ mod tests {
 
     #[test]
     fn crane_reaches_target_with_bounded_swing() {
-        let artifact = solve(&Params::default()).expect("crane solve should succeed");
+        let params = Params {
+            solver_method: SolverMethod::Sqp,
+            ..Params::default()
+        };
+        let artifact = solve(&params).expect("crane solve should succeed");
         let final_x = crate::find_metric(&artifact.summary, crate::MetricKey::FinalX)
             .and_then(|metric| metric.numeric_value)
             .expect("final x should exist");
         let max_swing = crate::find_metric(&artifact.summary, crate::MetricKey::MaxSwing)
             .and_then(|metric| metric.numeric_value)
             .expect("max swing should exist");
-        assert!((final_x - Params::default().target_x_m).abs() < 0.2);
+        assert!((final_x - params.target_x_m).abs() < 0.2);
         assert!(max_swing < 10.0, "swing should remain controlled");
     }
 

@@ -25,7 +25,7 @@ use optimization::{
     BackendCompileReport, BackendTimingMetadata, CallPolicy, CallPolicyConfig, ClarabelSqpError,
     ClarabelSqpOptions, ClarabelSqpProfiling, ClarabelSqpSummary, ConstraintSatisfaction,
     FilterAcceptanceMode, FiniteDifferenceValidationOptions, FunctionCompileOptions,
-    InteriorPointIterationSnapshot, InteriorPointOptions, InteriorPointProfiling,
+    InteriorPointIterationSnapshot, InteriorPointLinearSolver, InteriorPointOptions, InteriorPointProfiling,
     InteriorPointSolveError, InteriorPointSummary, LineSearchFilterOptions, LineSearchMeritOptions,
     LlvmOptimizationLevel, NlpCompileStats, NlpDerivativeValidationReport, NlpEvaluationBenchmark,
     NlpEvaluationBenchmarkOptions, NlpEvaluationKernelKind, SqpFilterOptions, SqpGlobalization,
@@ -90,6 +90,7 @@ pub enum ControlSemantic {
     SolverGlobalization,
     SolverMaxIterations,
     SolverHessianRegularization,
+    SolverNlipLinearSolver,
     SolverDualTolerance,
     SolverConstraintTolerance,
     SolverComplementarityTolerance,
@@ -1440,13 +1441,24 @@ fn nlip_failure_diagnostic_lines(error: &InteriorPointSolveError) -> Vec<String>
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SqpConfig {
+pub struct SolverConfig {
     pub max_iters: usize,
-    pub hessian_regularization_enabled: bool,
     pub dual_tol: f64,
     pub constraint_tol: f64,
     pub complementarity_tol: f64,
+    pub sqp: SqpMethodConfig,
+    pub nlip: NlipConfig,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SqpMethodConfig {
+    pub hessian_regularization_enabled: bool,
     pub globalization: SqpGlobalizationConfig,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NlipConfig {
+    pub linear_solver: InteriorPointLinearSolver,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2062,6 +2074,7 @@ enum SharedControlId {
     SolverGlobalization,
     SolverMaxIterations,
     SolverHessianRegularization,
+    SolverNlipLinearSolver,
     SolverDualTolerance,
     SolverConstraintTolerance,
     SolverComplementarityTolerance,
@@ -2112,6 +2125,7 @@ impl SharedControlId {
             Self::SolverGlobalization => "solver_globalization",
             Self::SolverMaxIterations => "solver_max_iters",
             Self::SolverHessianRegularization => "solver_hessian_regularization",
+            Self::SolverNlipLinearSolver => "solver_nlip_linear_solver",
             Self::SolverDualTolerance => "solver_dual_tol",
             Self::SolverConstraintTolerance => "solver_constraint_tol",
             Self::SolverComplementarityTolerance => "solver_complementarity_tol",
@@ -2430,7 +2444,7 @@ pub fn solve_standard_ocp<
     transcription: TranscriptionMethod,
     collocation_family: CollocationFamily,
     solver_method: SolverMethod,
-    solver_config: &SqpConfig,
+    solver_config: &SolverConfig,
     cached_multiple_shooting: CachedMs,
     cached_direct_collocation: CachedDc,
     multiple_shooting_runtime: MsRuntimeFn,
@@ -2518,7 +2532,7 @@ pub fn solve_standard_ocp_with_progress<
     transcription: TranscriptionMethod,
     collocation_family: CollocationFamily,
     solver_method: SolverMethod,
-    solver_config: &SqpConfig,
+    solver_config: &SolverConfig,
     emit: Emit,
     compile_multiple_shooting: CompileMs,
     compile_direct_collocation: CompileDc,
@@ -3445,13 +3459,9 @@ pub fn default_sqp_trust_region_config() -> SqpTrustRegionConfig {
     }
 }
 
-pub fn default_sqp_config() -> SqpConfig {
-    SqpConfig {
-        max_iters: 200,
+pub fn default_sqp_method_config() -> SqpMethodConfig {
+    SqpMethodConfig {
         hessian_regularization_enabled: false,
-        dual_tol: 1.0e-6,
-        constraint_tol: 1.0e-8,
-        complementarity_tol: 1.0e-6,
         globalization: SqpGlobalizationConfig::TrustRegionFilter {
             trust_region: default_sqp_trust_region_config(),
             filter: default_sqp_filter_config(),
@@ -3460,12 +3470,29 @@ pub fn default_sqp_config() -> SqpConfig {
     }
 }
 
+pub const fn default_nlip_config() -> NlipConfig {
+    NlipConfig {
+        linear_solver: InteriorPointLinearSolver::SpralSsids,
+    }
+}
+
+pub fn default_solver_config() -> SolverConfig {
+    SolverConfig {
+        max_iters: 200,
+        dual_tol: 1.0e-6,
+        constraint_tol: 1.0e-8,
+        complementarity_tol: 1.0e-6,
+        sqp: default_sqp_method_config(),
+        nlip: default_nlip_config(),
+    }
+}
+
 pub fn default_solver_method() -> SolverMethod {
     SolverMethod::Nlip
 }
 
-fn sqp_globalization_mode(config: &SqpConfig) -> SqpGlobalizationMode {
-    match config.globalization {
+fn sqp_globalization_mode(config: &SolverConfig) -> SqpGlobalizationMode {
+    match config.sqp.globalization {
         SqpGlobalizationConfig::LineSearchFilter { .. } => SqpGlobalizationMode::LineSearchFilter,
         SqpGlobalizationConfig::LineSearchMerit { .. } => SqpGlobalizationMode::LineSearchMerit,
         SqpGlobalizationConfig::TrustRegionFilter { .. } => SqpGlobalizationMode::TrustRegionFilter,
@@ -3482,32 +3509,32 @@ fn sqp_globalization_mode_value(mode: SqpGlobalizationMode) -> f64 {
     }
 }
 
-fn config_line_search(config: &SqpConfig) -> SqpLineSearchConfig {
-    match config.globalization {
+fn config_line_search(config: &SolverConfig) -> SqpLineSearchConfig {
+    match config.sqp.globalization {
         SqpGlobalizationConfig::LineSearchFilter { line_search, .. }
         | SqpGlobalizationConfig::LineSearchMerit { line_search, .. } => line_search,
         _ => default_sqp_line_search_config(),
     }
 }
 
-fn config_filter(config: &SqpConfig) -> SqpFilterConfig {
-    match config.globalization {
+fn config_filter(config: &SolverConfig) -> SqpFilterConfig {
+    match config.sqp.globalization {
         SqpGlobalizationConfig::LineSearchFilter { filter, .. }
         | SqpGlobalizationConfig::TrustRegionFilter { filter, .. } => filter,
         _ => default_sqp_filter_config(),
     }
 }
 
-fn config_trust_region(config: &SqpConfig) -> SqpTrustRegionConfig {
-    match config.globalization {
+fn config_trust_region(config: &SolverConfig) -> SqpTrustRegionConfig {
+    match config.sqp.globalization {
         SqpGlobalizationConfig::TrustRegionFilter { trust_region, .. }
         | SqpGlobalizationConfig::TrustRegionMerit { trust_region, .. } => trust_region,
         _ => default_sqp_trust_region_config(),
     }
 }
 
-fn config_exact_merit_penalty(config: &SqpConfig) -> f64 {
-    match config.globalization {
+fn config_exact_merit_penalty(config: &SolverConfig) -> f64 {
+    match config.sqp.globalization {
         SqpGlobalizationConfig::LineSearchFilter {
             exact_merit_penalty,
             ..
@@ -3527,8 +3554,8 @@ fn config_exact_merit_penalty(config: &SqpConfig) -> f64 {
     }
 }
 
-fn config_penalty_increase_factor(config: &SqpConfig) -> f64 {
-    match config.globalization {
+fn config_penalty_increase_factor(config: &SolverConfig) -> f64 {
+    match config.sqp.globalization {
         SqpGlobalizationConfig::LineSearchMerit {
             penalty_increase_factor,
             ..
@@ -3537,8 +3564,8 @@ fn config_penalty_increase_factor(config: &SqpConfig) -> f64 {
     }
 }
 
-fn config_max_penalty_updates(config: &SqpConfig) -> usize {
-    match config.globalization {
+fn config_max_penalty_updates(config: &SolverConfig) -> usize {
+    match config.sqp.globalization {
         SqpGlobalizationConfig::LineSearchMerit {
             max_penalty_updates,
             ..
@@ -3547,8 +3574,8 @@ fn config_max_penalty_updates(config: &SqpConfig) -> usize {
     }
 }
 
-fn config_trust_region_fixed_penalty(config: &SqpConfig) -> bool {
-    match config.globalization {
+fn config_trust_region_fixed_penalty(config: &SolverConfig) -> bool {
+    match config.sqp.globalization {
         SqpGlobalizationConfig::TrustRegionMerit { fixed_penalty, .. } => fixed_penalty,
         _ => TrustRegionMeritOptions::default().fixed_penalty,
     }
@@ -3905,7 +3932,7 @@ pub fn transcription_controls(
     controls
 }
 
-pub fn solver_controls(default_method: SolverMethod, default: SqpConfig) -> Vec<ControlSpec> {
+pub fn solver_controls(default_method: SolverMethod, default: SolverConfig) -> Vec<ControlSpec> {
     let default_line_search = config_line_search(&default);
     let default_filter = config_filter(&default);
     let default_trust_region = config_trust_region(&default);
@@ -3954,7 +3981,7 @@ pub fn solver_controls(default_method: SolverMethod, default: SqpConfig) -> Vec<
         select_control(
             SharedControlId::SolverHessianRegularization.id(),
             "Hessian Regularization",
-            if default.hessian_regularization_enabled {
+            if default.sqp.hessian_regularization_enabled {
                 1.0
             } else {
                 0.0
@@ -3965,6 +3992,17 @@ pub fn solver_controls(default_method: SolverMethod, default: SqpConfig) -> Vec<
             ControlSection::Solver,
             ControlVisibility::Always,
             ControlSemantic::SolverHessianRegularization,
+        ),
+        select_control(
+            SharedControlId::SolverNlipLinearSolver.id(),
+            "NLIP Linear Solver",
+            nlip_linear_solver_value(default.nlip.linear_solver),
+            "",
+            "Choose the sparse linear solver backend for NLIP KKT systems.",
+            &nlip_linear_solver_choices(),
+            ControlSection::Solver,
+            ControlVisibility::Always,
+            ControlSemantic::SolverNlipLinearSolver,
         ),
         text_control(
             SharedControlId::SolverDualTolerance.id(),
@@ -4233,6 +4271,18 @@ fn solver_globalization_choices() -> Vec<(f64, &'static str)> {
     ]
 }
 
+fn nlip_linear_solver_value(solver: InteriorPointLinearSolver) -> f64 {
+    match solver {
+        InteriorPointLinearSolver::SpralSsids => 0.0,
+        InteriorPointLinearSolver::SparseQdldl => 1.0,
+        InteriorPointLinearSolver::Auto => 2.0,
+    }
+}
+
+fn nlip_linear_solver_choices() -> Vec<(f64, &'static str)> {
+    vec![(0.0, "SPRAL SSIDS"), (1.0, "QDLDL"), (2.0, "Auto")]
+}
+
 fn sample_shared_or_default(
     values: &BTreeMap<String, f64>,
     key: SharedControlId,
@@ -4253,8 +4303,8 @@ fn parse_enum_choice(value: f64, key: SharedControlId, variants: &[f64]) -> Resu
 
 pub fn solver_config_from_map(
     values: &BTreeMap<String, f64>,
-    default: SqpConfig,
-) -> Result<SqpConfig> {
+    default: SolverConfig,
+) -> Result<SolverConfig> {
     let default_line_search = config_line_search(&default);
     let default_filter = config_filter(&default);
     let default_trust_region = config_trust_region(&default);
@@ -4271,7 +4321,7 @@ pub fn solver_config_from_map(
         sample_shared_or_default(
             values,
             SharedControlId::SolverHessianRegularization,
-            if default.hessian_regularization_enabled {
+            if default.sqp.hessian_regularization_enabled {
                 1.0
             } else {
                 0.0
@@ -4308,6 +4358,20 @@ pub fn solver_config_from_map(
         ),
         SharedControlId::SolverComplementarityTolerance.id(),
     )?;
+    let nlip_linear_solver = match parse_enum_choice(
+        sample_shared_or_default(
+            values,
+            SharedControlId::SolverNlipLinearSolver,
+            nlip_linear_solver_value(default.nlip.linear_solver),
+        ),
+        SharedControlId::SolverNlipLinearSolver,
+        &[0.0, 1.0, 2.0],
+    )? {
+        0 => InteriorPointLinearSolver::SpralSsids,
+        1 => InteriorPointLinearSolver::SparseQdldl,
+        2 => InteriorPointLinearSolver::Auto,
+        _ => unreachable!("validated NLIP linear solver choice"),
+    };
     let globalization = match parse_enum_choice(
         sample_shared_or_default(
             values,
@@ -4725,13 +4789,18 @@ pub fn solver_config_from_map(
         },
         _ => unreachable!("validated SQP globalization choice"),
     };
-    Ok(SqpConfig {
+    Ok(SolverConfig {
         max_iters,
-        hessian_regularization_enabled,
         dual_tol,
         constraint_tol,
         complementarity_tol,
-        globalization,
+        sqp: SqpMethodConfig {
+            hessian_regularization_enabled,
+            globalization,
+        },
+        nlip: NlipConfig {
+            linear_solver: nlip_linear_solver,
+        },
     })
 }
 
@@ -5018,14 +5087,14 @@ fn kernel_strategy_choice_value(strategy: OcpKernelStrategy) -> f64 {
     }
 }
 
-pub fn sqp_options(config: &SqpConfig) -> ClarabelSqpOptions {
+pub fn sqp_options(config: &SolverConfig) -> ClarabelSqpOptions {
     ClarabelSqpOptions {
         max_iters: config.max_iters,
-        hessian_regularization_enabled: config.hessian_regularization_enabled,
+        hessian_regularization_enabled: config.sqp.hessian_regularization_enabled,
         dual_tol: config.dual_tol,
         constraint_tol: config.constraint_tol,
         complementarity_tol: config.complementarity_tol,
-        globalization: match config.globalization {
+        globalization: match config.sqp.globalization {
             SqpGlobalizationConfig::LineSearchFilter {
                 line_search,
                 filter,
@@ -5119,7 +5188,7 @@ pub fn sqp_options(config: &SqpConfig) -> ClarabelSqpOptions {
     }
 }
 
-pub fn nlip_options(config: &SqpConfig) -> InteriorPointOptions {
+pub fn nlip_options(config: &SolverConfig) -> InteriorPointOptions {
     let tol = config
         .dual_tol
         .min(config.constraint_tol)
@@ -5135,12 +5204,13 @@ pub fn nlip_options(config: &SqpConfig) -> InteriorPointOptions {
         acceptable_constr_viol_tol: config.constraint_tol,
         acceptable_compl_inf_tol: config.complementarity_tol,
         acceptable_obj_change_tol: 1e20,
+        linear_solver: config.nlip.linear_solver,
         ..InteriorPointOptions::default()
     }
 }
 
 #[cfg(feature = "ipopt")]
-pub fn ipopt_options(config: &SqpConfig) -> IpoptOptions {
+pub fn ipopt_options(config: &SolverConfig) -> IpoptOptions {
     let tol = config
         .dual_tol
         .min(config.constraint_tol)
@@ -5390,7 +5460,7 @@ pub fn problem_controls(
     supported_intervals: &[usize],
     supported_degrees: &[usize],
     solver_method: SolverMethod,
-    solver: SqpConfig,
+    solver: SolverConfig,
     extra_controls: impl IntoIterator<Item = ControlSpec>,
 ) -> Vec<ControlSpec> {
     let mut controls =
@@ -6855,7 +6925,7 @@ pub fn solve_multiple_shooting_problem<Compiled, Build, const N: usize>(
         N,
     >,
     solver_method: SolverMethod,
-    solver_config: &SqpConfig,
+    solver_config: &SolverConfig,
     mut build_artifact: Build,
 ) -> Result<SolveArtifact>
 where
@@ -6938,7 +7008,7 @@ pub fn solve_cached_multiple_shooting_problem<Compiled, Build, const N: usize>(
         N,
     >,
     solver_method: SolverMethod,
-    solver_config: &SqpConfig,
+    solver_config: &SolverConfig,
     build_artifact: Build,
 ) -> Result<SolveArtifact>
 where
@@ -6971,7 +7041,7 @@ pub fn solve_multiple_shooting_problem_with_progress<Compiled, Emit, Build, cons
         N,
     >,
     solver_method: SolverMethod,
-    solver_config: &SqpConfig,
+    solver_config: &SolverConfig,
     emit: Emit,
     running_solver: SolverReport,
     build_artifact: Build,
@@ -7309,7 +7379,7 @@ pub fn solve_cached_multiple_shooting_problem_with_progress<Compiled, Emit, Buil
         N,
     >,
     solver_method: SolverMethod,
-    solver_config: &SqpConfig,
+    solver_config: &SolverConfig,
     emit: Emit,
     running_solver: SolverReport,
     build_artifact: Build,
@@ -7348,7 +7418,7 @@ pub fn solve_direct_collocation_problem<Compiled, Build, const N: usize, const K
         K,
     >,
     solver_method: SolverMethod,
-    solver_config: &SqpConfig,
+    solver_config: &SolverConfig,
     mut build_artifact: Build,
 ) -> Result<SolveArtifact>
 where
@@ -7425,7 +7495,7 @@ pub fn solve_cached_direct_collocation_problem<Compiled, Build, const N: usize, 
         K,
     >,
     solver_method: SolverMethod,
-    solver_config: &SqpConfig,
+    solver_config: &SolverConfig,
     build_artifact: Build,
 ) -> Result<SolveArtifact>
 where
@@ -7464,7 +7534,7 @@ pub fn solve_direct_collocation_problem_with_progress<
         K,
     >,
     solver_method: SolverMethod,
-    solver_config: &SqpConfig,
+    solver_config: &SolverConfig,
     emit: Emit,
     running_solver: SolverReport,
     build_artifact: Build,
@@ -7773,7 +7843,7 @@ pub fn solve_cached_direct_collocation_problem_with_progress<
         K,
     >,
     solver_method: SolverMethod,
-    solver_config: &SqpConfig,
+    solver_config: &SolverConfig,
     emit: Emit,
     running_solver: SolverReport,
     build_artifact: Build,
@@ -9116,7 +9186,7 @@ mod tests {
 
     #[test]
     fn solver_controls_include_sqp_hessian_regularization_toggle() {
-        let controls = solver_controls(default_solver_method(), default_sqp_config());
+        let controls = solver_controls(default_solver_method(), default_solver_config());
         let toggle = controls
             .iter()
             .find(|control| control.id == "solver_hessian_regularization")
@@ -9137,9 +9207,18 @@ mod tests {
     fn solver_config_from_map_parses_hessian_regularization_toggle() {
         let mut values = BTreeMap::new();
         values.insert("solver_hessian_regularization".to_string(), 1.0);
-        let parsed = solver_config_from_map(&values, default_sqp_config())
+        let parsed = solver_config_from_map(&values, default_solver_config())
             .expect("solver config should parse");
-        assert!(parsed.hessian_regularization_enabled);
+        assert!(parsed.sqp.hessian_regularization_enabled);
+    }
+
+    #[test]
+    fn solver_config_from_map_parses_nlip_linear_solver_choice() {
+        let mut values = BTreeMap::new();
+        values.insert("solver_nlip_linear_solver".to_string(), 1.0);
+        let parsed = solver_config_from_map(&values, default_solver_config())
+            .expect("solver config should parse");
+        assert_eq!(parsed.nlip.linear_solver, InteriorPointLinearSolver::SparseQdldl);
     }
 
     #[test]
