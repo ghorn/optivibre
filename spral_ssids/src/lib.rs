@@ -486,7 +486,9 @@ struct DenseFrontFactorization {
 struct NumericFactorBuffers<'a> {
     factor_order: &'a mut Vec<usize>,
     factor_inverse: &'a mut Vec<usize>,
-    dense_lower: &'a mut Vec<f64>,
+    lower_col_ptrs: &'a mut Vec<usize>,
+    lower_row_indices: &'a mut Vec<usize>,
+    lower_values: &'a mut Vec<f64>,
     diagonal_blocks: &'a mut Vec<DiagonalBlockValue>,
     dense_matrix_scratch: &'a mut Vec<f64>,
 }
@@ -503,7 +505,9 @@ pub struct NumericFactor {
     options: NumericFactorOptions,
     factor_order: Vec<usize>,
     factor_inverse: Vec<usize>,
-    dense_lower: Vec<f64>,
+    lower_col_ptrs: Vec<usize>,
+    lower_row_indices: Vec<usize>,
+    lower_values: Vec<f64>,
     symbolic_front_tree: SymbolicFrontTree,
     dense_matrix_scratch: Vec<f64>,
     front_count_cached: usize,
@@ -593,24 +597,19 @@ impl NumericFactor {
             return Ok(());
         }
 
-        let mut permuted_rhs = vec![0.0; self.dimension];
-        for (ordered, &original) in self.permutation.perm().iter().enumerate() {
-            permuted_rhs[ordered] = rhs[original];
-        }
-
         let mut factor_rhs = vec![0.0; self.dimension];
         for (factor_position, &ordered_index) in self.factor_order.iter().enumerate() {
-            factor_rhs[factor_position] = permuted_rhs[ordered_index];
+            factor_rhs[factor_position] = rhs[self.permutation.perm()[ordered_index]];
         }
 
         for pivot in 0..self.dimension {
             let pivot_value = factor_rhs[pivot];
-            for (row, rhs_value) in factor_rhs.iter_mut().enumerate().skip(pivot + 1) {
-                *rhs_value -= self.dense_lower[row * self.dimension + pivot] * pivot_value;
+            for entry in self.lower_col_ptrs[pivot]..self.lower_col_ptrs[pivot + 1] {
+                let row = self.lower_row_indices[entry];
+                factor_rhs[row] -= self.lower_values[entry] * pivot_value;
             }
         }
 
-        let mut z = factor_rhs;
         for block in &self.diagonal_blocks {
             let start = block.block.start;
             let end = start + block.block.size;
@@ -622,9 +621,13 @@ impl NumericFactor {
                         detail: "diagonal pivot vanished during solve".into(),
                     });
                 }
-                z[start] /= diagonal;
+                factor_rhs[start] /= diagonal;
             } else {
-                solve_dense_block_in_place(&block.values, block.block.size, &mut z[start..end])
+                solve_dense_block_in_place(
+                    &block.values,
+                    block.block.size,
+                    &mut factor_rhs[start..end],
+                )
                     .map_err(|detail| SsidsError::NumericalBreakdown {
                         pivot: start,
                         detail,
@@ -632,27 +635,22 @@ impl NumericFactor {
             }
         }
 
-        let mut factor_solution = z;
         for pivot in (0..self.dimension).rev() {
-            let mut value = factor_solution[pivot];
-            for (row, &row_value) in factor_solution.iter().enumerate().skip(pivot + 1) {
-                value -= self.dense_lower[row * self.dimension + pivot] * row_value;
+            let mut value = factor_rhs[pivot];
+            for entry in self.lower_col_ptrs[pivot]..self.lower_col_ptrs[pivot + 1] {
+                let row = self.lower_row_indices[entry];
+                value -= self.lower_values[entry] * factor_rhs[row];
             }
-            factor_solution[pivot] = value;
+            factor_rhs[pivot] = value;
         }
-
-        let mut ordered_solution = vec![0.0; self.dimension];
-        for (factor_position, &ordered_index) in self.factor_order.iter().enumerate() {
-            ordered_solution[ordered_index] = factor_solution[factor_position];
-        }
-        if !ordered_solution.iter().all(|value| value.is_finite()) {
+        if !factor_rhs.iter().all(|value| value.is_finite()) {
             return Err(SsidsError::NumericalBreakdown {
                 pivot: self.dimension.saturating_sub(1),
                 detail: "solve produced non-finite values".into(),
             });
         }
-        for (ordered, &original) in self.permutation.perm().iter().enumerate() {
-            rhs[original] = ordered_solution[ordered];
+        for (factor_position, &ordered_index) in self.factor_order.iter().enumerate() {
+            rhs[self.permutation.perm()[ordered_index]] = factor_rhs[factor_position];
         }
         Ok(())
     }
@@ -694,7 +692,9 @@ impl NumericFactor {
             NumericFactorBuffers {
                 factor_order: &mut self.factor_order,
                 factor_inverse: &mut self.factor_inverse,
-                dense_lower: &mut self.dense_lower,
+                lower_col_ptrs: &mut self.lower_col_ptrs,
+                lower_row_indices: &mut self.lower_row_indices,
+                lower_values: &mut self.lower_values,
                 diagonal_blocks: &mut self.diagonal_blocks,
                 dense_matrix_scratch: &mut self.dense_matrix_scratch,
             },
@@ -947,7 +947,9 @@ pub fn factorize(
         options: *options,
         factor_order: Vec::with_capacity(matrix.dimension()),
         factor_inverse: Vec::with_capacity(matrix.dimension()),
-        dense_lower: Vec::with_capacity(matrix.dimension() * matrix.dimension()),
+        lower_col_ptrs: Vec::with_capacity(matrix.dimension() + 1),
+        lower_row_indices: Vec::new(),
+        lower_values: Vec::new(),
         symbolic_front_tree: front_tree,
         dense_matrix_scratch: Vec::with_capacity(matrix.dimension() * matrix.dimension()),
         front_count_cached: 0,
@@ -1943,8 +1945,11 @@ fn multifrontal_factorize_with_tree(
     for (position, &ordered_index) in buffers.factor_order.iter().enumerate() {
         buffers.factor_inverse[ordered_index] = position;
     }
-    buffers.dense_lower.clear();
-    buffers.dense_lower.resize(dimension * dimension, 0.0);
+    buffers.lower_col_ptrs.clear();
+    buffers.lower_col_ptrs.reserve(dimension + 1);
+    buffers.lower_col_ptrs.push(0);
+    buffers.lower_row_indices.clear();
+    buffers.lower_values.clear();
     for (column_position, column) in factor_columns.iter().enumerate() {
         if column.global_column != buffers.factor_order[column_position] {
             return Err(SsidsError::NumericalBreakdown {
@@ -1960,8 +1965,12 @@ fn multifrontal_factorize_with_tree(
                     detail: "factor column referenced an invalid trailing row".into(),
                 });
             }
-            buffers.dense_lower[row_position * dimension + column_position] = value;
+            buffers.lower_row_indices.push(row_position);
+            buffers.lower_values.push(value);
         }
+        buffers
+            .lower_col_ptrs
+            .push(buffers.lower_row_indices.len());
     }
 
     buffers.diagonal_blocks.clear();
@@ -1992,7 +2001,7 @@ fn multifrontal_factorize_with_tree(
             .map(|block| block.values.len().saturating_sub(block.block.size))
             .sum::<usize>();
     let factor_bytes = std::mem::size_of::<f64>()
-        * (buffers.dense_lower.len()
+        * (buffers.lower_values.len()
             + buffers
                 .diagonal_blocks
                 .iter()
@@ -2001,6 +2010,8 @@ fn multifrontal_factorize_with_tree(
         + std::mem::size_of::<usize>()
             * (buffers.factor_order.len()
                 + buffers.factor_inverse.len()
+                + buffers.lower_col_ptrs.len()
+                + buffers.lower_row_indices.len()
                 + tree
                     .fronts
                     .iter()
