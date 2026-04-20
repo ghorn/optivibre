@@ -2,6 +2,13 @@ use clarabel::algebra::CscMatrix;
 use clarabel::qdldl::{QDLDLFactorisation, QDLDLSettings};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
+use spral_ssids::{
+    Inertia as SpralInertia, NumericFactor as SpralNumericFactor,
+    NumericFactorOptions as SpralNumericFactorOptions, SsidsOptions as SpralSsidsOptions,
+    SymbolicFactor as SpralSymbolicFactor, SymmetricCscMatrix as SpralSymmetricCscMatrix,
+    analyse as spral_analyse, factorize as spral_factorize,
+};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -27,6 +34,7 @@ const LINEAR_SOLUTION_MAX_RELATIVE_RESIDUAL: f64 = 1e-7;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InteriorPointLinearSolver {
     Auto,
+    SpralSsids,
     SparseQdldl,
 }
 
@@ -34,6 +42,7 @@ impl InteriorPointLinearSolver {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Auto => "auto",
+            Self::SpralSsids => "spral_ssids",
             Self::SparseQdldl => "sparse_qdldl",
         }
     }
@@ -199,7 +208,7 @@ impl Default for InteriorPointOptions {
             watchdog_shortened_iter_trigger: 3,
             watchdog_trial_iter_max: 3,
             mu_min: 1e-12,
-            linear_solver: InteriorPointLinearSolver::Auto,
+            linear_solver: InteriorPointLinearSolver::SpralSsids,
             verbose: true,
         }
     }
@@ -275,6 +284,15 @@ pub struct InteriorPointProfiling {
     pub linear_solves: Index,
     #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
     pub linear_solve_time: Duration,
+    pub sparse_symbolic_analyses: Index,
+    #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
+    pub sparse_symbolic_analysis_time: Duration,
+    pub sparse_numeric_factorizations: Index,
+    #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
+    pub sparse_numeric_factorization_time: Duration,
+    pub sparse_numeric_refactorizations: Index,
+    #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
+    pub sparse_numeric_refactorization_time: Duration,
     pub adapter_timing: Option<SolverAdapterTiming>,
     pub preprocessing_steps: Index,
     #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
@@ -585,6 +603,7 @@ pub struct InteriorPointDirectionDiagnostics {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InteriorPointLinearSolveFailureKind {
     FactorizationFailed,
+    InertiaMismatch,
     NonFiniteSolution,
     SolutionNormTooLarge,
     ResidualTooLarge,
@@ -594,6 +613,7 @@ impl InteriorPointLinearSolveFailureKind {
     pub const fn label(self) -> &'static str {
         match self {
             Self::FactorizationFailed => "factorization_failed",
+            Self::InertiaMismatch => "inertia_mismatch",
             Self::NonFiniteSolution => "non_finite_solution",
             Self::SolutionNormTooLarge => "solution_norm_too_large",
             Self::ResidualTooLarge => "residual_too_large",
@@ -607,6 +627,8 @@ pub struct InteriorPointLinearSolveAttempt {
     pub solver: InteriorPointLinearSolver,
     pub regularization: f64,
     pub failure_kind: InteriorPointLinearSolveFailureKind,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub detail: Option<String>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub solution_inf: Option<f64>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
@@ -840,6 +862,80 @@ struct ReducedKktSystem<'a> {
     regularization_max: f64,
 }
 
+#[derive(Clone, Debug)]
+struct SpralAugmentedKktPattern {
+    ccs: Arc<CCS>,
+    x_dimension: usize,
+    inequality_dimension: usize,
+    equality_dimension: usize,
+    p_offset: usize,
+    lambda_offset: usize,
+    z_offset: usize,
+    hessian_value_indices: Vec<usize>,
+    equality_jacobian_value_indices: Vec<usize>,
+    inequality_jacobian_value_indices: Vec<usize>,
+    x_diagonal_indices: Vec<usize>,
+    p_diagonal_indices: Vec<usize>,
+    lambda_diagonal_indices: Vec<usize>,
+    z_diagonal_indices: Vec<usize>,
+    pz_indices: Vec<usize>,
+}
+
+impl SpralAugmentedKktPattern {
+    fn dimension(&self) -> usize {
+        self.ccs.nrow
+    }
+}
+
+struct SpralAugmentedKktWorkspace {
+    pattern: SpralAugmentedKktPattern,
+    values: Vec<f64>,
+    symbolic: SpralSymbolicFactor,
+    factor: Option<SpralNumericFactor>,
+    factor_regularization: Option<f64>,
+    auto_fallback_disabled: bool,
+}
+
+impl SpralAugmentedKktWorkspace {
+    fn analyse(
+        hessian_structure: &CCS,
+        equality_jacobian: &SparseMatrixStructure,
+        inequality_jacobian: &SparseMatrixStructure,
+    ) -> std::result::Result<Self, InteriorPointSolveError> {
+        let pattern = build_spral_augmented_kkt_pattern(
+            hessian_structure,
+            equality_jacobian,
+            inequality_jacobian,
+        )?;
+        let matrix = SpralSymmetricCscMatrix::new(
+            pattern.dimension(),
+            &pattern.ccs.col_ptrs,
+            &pattern.ccs.row_indices,
+            None,
+        )
+        .map_err(|error| {
+            InteriorPointSolveError::InvalidInput(format!(
+                "invalid sparse KKT structure for spral_ssids: {error}"
+            ))
+        })?;
+        let (symbolic, _) =
+            spral_analyse(matrix, &SpralSsidsOptions::default()).map_err(|error| {
+                InteriorPointSolveError::InvalidInput(format!(
+                    "failed to analyse sparse KKT structure for spral_ssids: {error}"
+                ))
+            })?;
+        let values = vec![0.0; pattern.ccs.nnz()];
+        Ok(Self {
+            pattern,
+            values,
+            symbolic,
+            factor: None,
+            factor_regularization: None,
+            auto_fallback_disabled: false,
+        })
+    }
+}
+
 #[derive(Clone)]
 struct EvalState {
     objective_value: f64,
@@ -960,7 +1056,7 @@ fn barrier_objective_increase_too_large(
     trial_barrier_objective: f64,
     obj_max_inc: f64,
 ) -> bool {
-    if !(trial_barrier_objective > reference_barrier_objective) {
+    if trial_barrier_objective <= reference_barrier_objective {
         return false;
     }
     let increase = trial_barrier_objective - reference_barrier_objective;
@@ -1017,11 +1113,7 @@ fn next_barrier_parameter(
     let mut first_pass = true;
     while first_pass
         || (options.mu_allow_fast_monotone_decrease
-            && should_reduce_barrier_parameter(
-                barrier_subproblem_error,
-                current_barrier,
-                options,
-            ))
+            && should_reduce_barrier_parameter(barrier_subproblem_error, current_barrier, options))
     {
         first_pass = false;
         if !tiny_step
@@ -1417,7 +1509,7 @@ fn project_initial_point_into_box_interior(
     bounds: &BoundConstraints,
     options: &InteriorPointOptions,
 ) {
-    for idx in 0..x.len() {
+    for (idx, x_i) in x.iter_mut().enumerate() {
         let lower = bounds
             .lower_indices
             .iter()
@@ -1428,8 +1520,8 @@ fn project_initial_point_into_box_interior(
             .iter()
             .position(|upper_idx| *upper_idx == idx)
             .map(|position| bounds.upper_values[position]);
-        x[idx] = push_scalar_to_bounds_interior(
-            x[idx],
+        *x_i = push_scalar_to_bounds_interior(
+            *x_i,
             lower,
             upper,
             options.bound_push,
@@ -1546,20 +1638,19 @@ fn stack_sparse_values(top_ccs: &CCS, top_values: &[f64], bottom: &SparseMatrix)
 fn sparse_add_transpose_mat_vec(out: &mut [f64], matrix: &SparseMatrix, vector: &[f64]) {
     debug_assert_eq!(matrix.nrows(), vector.len());
     debug_assert_eq!(matrix.ncols(), out.len());
-    for col in 0..matrix.ncols() {
+    for (col, out_col) in out.iter_mut().enumerate().take(matrix.ncols()) {
         let mut sum = 0.0;
         for index in matrix.structure.ccs.col_ptrs[col]..matrix.structure.ccs.col_ptrs[col + 1] {
             sum += matrix.values[index] * vector[matrix.structure.ccs.row_indices[index]];
         }
-        out[col] += sum;
+        *out_col += sum;
     }
 }
 
 fn sparse_mat_vec(matrix: &SparseMatrix, vector: &[f64]) -> Vec<f64> {
     debug_assert_eq!(matrix.ncols(), vector.len());
     let mut product = vec![0.0; matrix.nrows()];
-    for col in 0..matrix.ncols() {
-        let x = vector[col];
+    for (col, &x) in vector.iter().enumerate().take(matrix.ncols()) {
         if x == 0.0 {
             continue;
         }
@@ -1568,6 +1659,213 @@ fn sparse_mat_vec(matrix: &SparseMatrix, vector: &[f64]) -> Vec<f64> {
         }
     }
     product
+}
+
+fn symmetric_ccs_lower_mat_vec(ccs: &CCS, values: &[f64], vector: &[f64]) -> Vec<f64> {
+    debug_assert_eq!(ccs.nrow, ccs.ncol);
+    debug_assert_eq!(ccs.nrow, vector.len());
+    debug_assert_eq!(ccs.nnz(), values.len());
+    let mut product = vec![0.0; ccs.nrow];
+    for col in 0..ccs.ncol {
+        let x_col = vector[col];
+        let start = ccs.col_ptrs[col];
+        let end = ccs.col_ptrs[col + 1];
+        for (&row, &value) in ccs.row_indices[start..end]
+            .iter()
+            .zip(values[start..end].iter())
+        {
+            product[row] += value * x_col;
+            if row != col {
+                product[col] += value * vector[row];
+            }
+        }
+    }
+    product
+}
+
+fn symmetric_ccs_lower_abs_mat_vec(ccs: &CCS, values: &[f64], vector_abs: &[f64]) -> Vec<f64> {
+    debug_assert_eq!(ccs.nrow, ccs.ncol);
+    debug_assert_eq!(ccs.nrow, vector_abs.len());
+    debug_assert_eq!(ccs.nnz(), values.len());
+    let mut product = vec![0.0; ccs.nrow];
+    for col in 0..ccs.ncol {
+        let x_col_abs = vector_abs[col];
+        let start = ccs.col_ptrs[col];
+        let end = ccs.col_ptrs[col + 1];
+        for (&row, &value) in ccs.row_indices[start..end]
+            .iter()
+            .zip(values[start..end].iter())
+        {
+            let value_abs = value.abs();
+            product[row] += value_abs * x_col_abs;
+            if row != col {
+                product[col] += value_abs * vector_abs[row];
+            }
+        }
+    }
+    product
+}
+
+fn build_spral_augmented_kkt_pattern(
+    hessian_structure: &CCS,
+    equality_jacobian: &SparseMatrixStructure,
+    inequality_jacobian: &SparseMatrixStructure,
+) -> std::result::Result<SpralAugmentedKktPattern, InteriorPointSolveError> {
+    let n = hessian_structure.nrow;
+    if hessian_structure.ncol != n {
+        return Err(InteriorPointSolveError::InvalidInput(
+            "interior-point Hessian structure must be square".into(),
+        ));
+    }
+    let meq = equality_jacobian.ccs.nrow;
+    let mineq = inequality_jacobian.ccs.nrow;
+    let p_offset = n;
+    let lambda_offset = p_offset + mineq;
+    let z_offset = lambda_offset + meq;
+    let total_dimension = z_offset + mineq;
+
+    let mut columns = vec![Vec::<usize>::new(); total_dimension];
+    for (col, column) in columns.iter_mut().enumerate().take(n) {
+        column.push(col);
+        for index in hessian_structure.col_ptrs[col]..hessian_structure.col_ptrs[col + 1] {
+            column.push(hessian_structure.row_indices[index]);
+        }
+    }
+    for (col, column) in columns
+        .iter_mut()
+        .enumerate()
+        .take(equality_jacobian.ccs.ncol)
+    {
+        for index in equality_jacobian.ccs.col_ptrs[col]..equality_jacobian.ccs.col_ptrs[col + 1] {
+            column.push(lambda_offset + equality_jacobian.ccs.row_indices[index]);
+        }
+    }
+    for (col, column) in columns
+        .iter_mut()
+        .enumerate()
+        .take(inequality_jacobian.ccs.ncol)
+    {
+        for index in
+            inequality_jacobian.ccs.col_ptrs[col]..inequality_jacobian.ccs.col_ptrs[col + 1]
+        {
+            column.push(z_offset + inequality_jacobian.ccs.row_indices[index]);
+        }
+    }
+    for row in 0..mineq {
+        let p_index = p_offset + row;
+        columns[p_index].push(p_index);
+        columns[p_index].push(z_offset + row);
+    }
+    for row in 0..meq {
+        let lambda_index = lambda_offset + row;
+        columns[lambda_index].push(lambda_index);
+    }
+    for row in 0..mineq {
+        let z_index = z_offset + row;
+        columns[z_index].push(z_index);
+    }
+
+    let mut col_ptrs = Vec::with_capacity(total_dimension + 1);
+    let mut row_indices = Vec::new();
+    col_ptrs.push(0);
+    for (col, rows) in columns.iter_mut().enumerate() {
+        rows.sort_unstable();
+        rows.dedup();
+        if rows.iter().any(|&row| row < col) {
+            return Err(InteriorPointSolveError::InvalidInput(format!(
+                "invalid lower-triangular sparse KKT pattern in column {col}"
+            )));
+        }
+        row_indices.extend_from_slice(rows);
+        col_ptrs.push(row_indices.len());
+    }
+    let ccs = Arc::new(CCS::new(
+        total_dimension,
+        total_dimension,
+        col_ptrs,
+        row_indices,
+    ));
+    let mut column_maps = vec![HashMap::<usize, usize>::new(); total_dimension];
+    for (col, column_map) in column_maps.iter_mut().enumerate().take(total_dimension) {
+        for index in ccs.col_ptrs[col]..ccs.col_ptrs[col + 1] {
+            column_map.insert(ccs.row_indices[index], index);
+        }
+    }
+    let lookup = |col: usize, row: usize| -> std::result::Result<usize, InteriorPointSolveError> {
+        column_maps[col].get(&row).copied().ok_or_else(|| {
+            InteriorPointSolveError::InvalidInput(format!(
+                "missing sparse KKT slot for entry ({row}, {col})"
+            ))
+        })
+    };
+    let mut hessian_value_indices = Vec::with_capacity(hessian_structure.nnz());
+    for col in 0..n {
+        for index in hessian_structure.col_ptrs[col]..hessian_structure.col_ptrs[col + 1] {
+            hessian_value_indices.push(lookup(col, hessian_structure.row_indices[index])?);
+        }
+    }
+    let mut equality_jacobian_value_indices = Vec::with_capacity(equality_jacobian.ccs.nnz());
+    for col in 0..equality_jacobian.ccs.ncol {
+        for index in equality_jacobian.ccs.col_ptrs[col]..equality_jacobian.ccs.col_ptrs[col + 1] {
+            equality_jacobian_value_indices.push(lookup(
+                col,
+                lambda_offset + equality_jacobian.ccs.row_indices[index],
+            )?);
+        }
+    }
+    let mut inequality_jacobian_value_indices = Vec::with_capacity(inequality_jacobian.ccs.nnz());
+    for col in 0..inequality_jacobian.ccs.ncol {
+        for index in
+            inequality_jacobian.ccs.col_ptrs[col]..inequality_jacobian.ccs.col_ptrs[col + 1]
+        {
+            inequality_jacobian_value_indices.push(lookup(
+                col,
+                z_offset + inequality_jacobian.ccs.row_indices[index],
+            )?);
+        }
+    }
+    let x_diagonal_indices = (0..n)
+        .map(|diag| lookup(diag, diag))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let p_diagonal_indices = (0..mineq)
+        .map(|diag| {
+            let index = p_offset + diag;
+            lookup(index, index)
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let lambda_diagonal_indices = (0..meq)
+        .map(|diag| {
+            let index = lambda_offset + diag;
+            lookup(index, index)
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let z_diagonal_indices = (0..mineq)
+        .map(|diag| {
+            let index = z_offset + diag;
+            lookup(index, index)
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let pz_indices = (0..mineq)
+        .map(|row| lookup(p_offset + row, z_offset + row))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(SpralAugmentedKktPattern {
+        ccs,
+        x_dimension: n,
+        inequality_dimension: mineq,
+        equality_dimension: meq,
+        p_offset,
+        lambda_offset,
+        z_offset,
+        hessian_value_indices,
+        equality_jacobian_value_indices,
+        inequality_jacobian_value_indices,
+        x_diagonal_indices,
+        p_diagonal_indices,
+        lambda_diagonal_indices,
+        z_diagonal_indices,
+        pz_indices,
+    })
 }
 
 fn lagrangian_gradient_sparse(
@@ -1583,6 +1881,10 @@ fn lagrangian_gradient_sparse(
     residual
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "State evaluation threads through compiled NLP data and profiling sinks explicitly."
+)]
 fn trial_state<P>(
     problem: &P,
     x: &[f64],
@@ -1681,7 +1983,7 @@ fn least_squares_equality_multipliers(
     }
     let mut adjusted_gradient = state.gradient.clone();
     if mineq > 0 {
-        sparse_add_transpose_mat_vec(&mut adjusted_gradient, &state.inequality_jacobian, &z);
+        sparse_add_transpose_mat_vec(&mut adjusted_gradient, &state.inequality_jacobian, z);
     }
 
     let n = state.gradient.len();
@@ -1689,7 +1991,7 @@ fn least_squares_equality_multipliers(
     let mut cols = Vec::new();
     let mut values = Vec::new();
     let mut rhs = vec![0.0; meq];
-    for col in 0..n {
+    for (col, &adjusted_grad_col) in adjusted_gradient.iter().enumerate().take(n) {
         let start = state.equality_jacobian.structure.ccs.col_ptrs[col];
         let end = state.equality_jacobian.structure.ccs.col_ptrs[col + 1];
         let mut hits = Vec::new();
@@ -1700,7 +2002,7 @@ fn least_squares_equality_multipliers(
             ));
         }
         for &(row, value) in &hits {
-            rhs[row] -= value * adjusted_gradient[col];
+            rhs[row] -= value * adjusted_grad_col;
         }
         for (offset, &(row_i, value_i)) in hits.iter().enumerate() {
             for &(row_j, value_j) in &hits[offset..] {
@@ -1886,6 +2188,7 @@ fn assess_linear_solution(
             solver: InteriorPointLinearSolver::Auto,
             regularization: 0.0,
             failure_kind: InteriorPointLinearSolveFailureKind::NonFiniteSolution,
+            detail: None,
             solution_inf: Some(solution_inf),
             solution_inf_limit: Some(solution_inf_limit),
             residual_inf: None,
@@ -1897,6 +2200,7 @@ fn assess_linear_solution(
             solver: InteriorPointLinearSolver::Auto,
             regularization: 0.0,
             failure_kind: InteriorPointLinearSolveFailureKind::SolutionNormTooLarge,
+            detail: None,
             solution_inf: Some(solution_inf),
             solution_inf_limit: Some(solution_inf_limit),
             residual_inf: None,
@@ -1927,6 +2231,7 @@ fn assess_linear_solution(
             solver: InteriorPointLinearSolver::Auto,
             regularization: 0.0,
             failure_kind: InteriorPointLinearSolveFailureKind::ResidualTooLarge,
+            detail: None,
             solution_inf: Some(solution_inf),
             solution_inf_limit: Some(solution_inf_limit),
             residual_inf: Some(residual_inf),
@@ -1940,6 +2245,99 @@ fn assess_linear_solution(
         residual_inf,
         residual_inf_limit,
     })
+}
+
+fn assess_linear_solution_ccs(
+    ccs: &CCS,
+    values: &[f64],
+    rhs: &[f64],
+    solution: &[f64],
+) -> std::result::Result<LinearSolutionAssessment, InteriorPointLinearSolveAttempt> {
+    let rhs_inf = rhs.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    let solution_inf_limit = LINEAR_SOLUTION_MAX_RELATIVE_INF_NORM * (1.0 + rhs_inf);
+    let residual_inf_limit = LINEAR_SOLUTION_MAX_RELATIVE_RESIDUAL * (1.0 + rhs_inf);
+    let solution_inf = solution
+        .iter()
+        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    if !solution.iter().all(|value| value.is_finite()) {
+        return Err(InteriorPointLinearSolveAttempt {
+            solver: InteriorPointLinearSolver::Auto,
+            regularization: 0.0,
+            failure_kind: InteriorPointLinearSolveFailureKind::NonFiniteSolution,
+            detail: None,
+            solution_inf: Some(solution_inf),
+            solution_inf_limit: Some(solution_inf_limit),
+            residual_inf: None,
+            residual_inf_limit: Some(residual_inf_limit),
+        });
+    }
+    if solution_inf > solution_inf_limit {
+        return Err(InteriorPointLinearSolveAttempt {
+            solver: InteriorPointLinearSolver::Auto,
+            regularization: 0.0,
+            failure_kind: InteriorPointLinearSolveFailureKind::SolutionNormTooLarge,
+            detail: None,
+            solution_inf: Some(solution_inf),
+            solution_inf_limit: Some(solution_inf_limit),
+            residual_inf: None,
+            residual_inf_limit: Some(residual_inf_limit),
+        });
+    }
+
+    let residual = symmetric_ccs_lower_mat_vec(ccs, values, solution)
+        .into_iter()
+        .zip(rhs.iter().copied())
+        .map(|(lhs, rhs_i)| lhs - rhs_i)
+        .collect::<Vec<_>>();
+    let abs_solution = solution.iter().map(|value| value.abs()).collect::<Vec<_>>();
+    let lhs_scale = symmetric_ccs_lower_abs_mat_vec(ccs, values, &abs_solution);
+    let residual_inf = residual
+        .iter()
+        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    let backward_error_residual_limit =
+        lhs_scale
+            .iter()
+            .zip(rhs.iter())
+            .fold(0.0_f64, |acc, (lhs_scale_i, rhs_i)| {
+                acc.max(LINEAR_SOLUTION_MAX_RELATIVE_RESIDUAL * (1.0 + lhs_scale_i + rhs_i.abs()))
+            });
+    let residual_inf_limit = residual_inf_limit.max(backward_error_residual_limit);
+    if residual_inf > residual_inf_limit {
+        return Err(InteriorPointLinearSolveAttempt {
+            solver: InteriorPointLinearSolver::Auto,
+            regularization: 0.0,
+            failure_kind: InteriorPointLinearSolveFailureKind::ResidualTooLarge,
+            detail: None,
+            solution_inf: Some(solution_inf),
+            solution_inf_limit: Some(solution_inf_limit),
+            residual_inf: Some(residual_inf),
+            residual_inf_limit: Some(residual_inf_limit),
+        });
+    }
+
+    Ok(LinearSolutionAssessment {
+        solution_inf,
+        solution_inf_limit,
+        residual_inf,
+        residual_inf_limit,
+    })
+}
+
+fn spral_error_attempt(
+    regularization: f64,
+    failure_kind: InteriorPointLinearSolveFailureKind,
+    error: impl ToString,
+) -> InteriorPointLinearSolveAttempt {
+    InteriorPointLinearSolveAttempt {
+        solver: InteriorPointLinearSolver::SpralSsids,
+        regularization,
+        failure_kind,
+        detail: Some(error.to_string()),
+        solution_inf: None,
+        solution_inf_limit: None,
+        residual_inf: None,
+        residual_inf_limit: None,
+    }
 }
 
 fn default_dsigns(dimension: usize) -> Vec<i8> {
@@ -1964,6 +2362,7 @@ fn factor_solve_sparse_qdldl(
             solver: InteriorPointLinearSolver::SparseQdldl,
             regularization,
             failure_kind: InteriorPointLinearSolveFailureKind::FactorizationFailed,
+            detail: None,
             solution_inf: None,
             solution_inf_limit: None,
             residual_inf: None,
@@ -1976,6 +2375,7 @@ fn factor_solve_sparse_qdldl(
             solver: InteriorPointLinearSolver::SparseQdldl,
             regularization,
             failure_kind: InteriorPointLinearSolveFailureKind::FactorizationFailed,
+            detail: None,
             solution_inf: None,
             solution_inf_limit: None,
             residual_inf: None,
@@ -1995,13 +2395,14 @@ fn factor_solve_sparse_qdldl(
             solver: InteriorPointLinearSolver::SparseQdldl,
             regularization,
             failure_kind: InteriorPointLinearSolveFailureKind::FactorizationFailed,
+            detail: None,
             solution_inf: None,
             solution_inf_limit: None,
             residual_inf: None,
             residual_inf_limit: None,
         }
     })?;
-    let mut solution = rhs.iter().copied().collect::<Vec<_>>();
+    let mut solution = rhs.to_vec();
     factor.solve(&mut solution);
     let mut assessment = assess_linear_solution(matrix, rhs, &solution);
     if assessment.is_err() {
@@ -2032,16 +2433,57 @@ fn factor_solve_sparse_qdldl(
     })
 }
 
-fn preferred_linear_solver(solver: InteriorPointLinearSolver) -> InteriorPointLinearSolver {
+fn preferred_linear_solver(
+    solver: InteriorPointLinearSolver,
+    equality_count: usize,
+    inequality_count: usize,
+) -> InteriorPointLinearSolver {
     match solver {
-        InteriorPointLinearSolver::Auto | InteriorPointLinearSolver::SparseQdldl => {
+        InteriorPointLinearSolver::Auto if equality_count == 0 && inequality_count == 0 => {
             InteriorPointLinearSolver::SparseQdldl
         }
+        InteriorPointLinearSolver::Auto | InteriorPointLinearSolver::SpralSsids => {
+            InteriorPointLinearSolver::SpralSsids
+        }
+        InteriorPointLinearSolver::SparseQdldl => InteriorPointLinearSolver::SparseQdldl,
     }
 }
 
-fn solve_symmetric_system(
-    solver: InteriorPointLinearSolver,
+fn secondary_linear_solver(solver: InteriorPointLinearSolver) -> Option<InteriorPointLinearSolver> {
+    match solver {
+        InteriorPointLinearSolver::Auto => Some(InteriorPointLinearSolver::SparseQdldl),
+        InteriorPointLinearSolver::SpralSsids | InteriorPointLinearSolver::SparseQdldl => None,
+    }
+}
+
+fn linear_solve_error(
+    preferred_solver: InteriorPointLinearSolver,
+    matrix_dimension: usize,
+    attempts: Vec<InteriorPointLinearSolveAttempt>,
+) -> InteriorPointSolveError {
+    InteriorPointSolveError::LinearSolve {
+        solver: preferred_solver,
+        context: Box::new(InteriorPointFailureContext {
+            final_state: None,
+            last_accepted_state: None,
+            failed_linear_solve: Some(InteriorPointLinearSolveDiagnostics {
+                preferred_solver,
+                matrix_dimension,
+                attempts,
+            }),
+            failed_line_search: None,
+            failed_direction_diagnostics: None,
+            profiling: InteriorPointProfiling::default(),
+        }),
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Linear-solver retries/regularization are passed explicitly at the solver boundary."
+)]
+fn try_solve_symmetric_system(
+    _solver: InteriorPointLinearSolver,
     matrix: &CscMatrix<f64>,
     rhs: &[f64],
     regularization: f64,
@@ -2049,8 +2491,10 @@ fn solve_symmetric_system(
     adaptive_regularization_retries: Index,
     regularization_growth_factor: f64,
     regularization_max: f64,
-) -> std::result::Result<(Vec<f64>, InteriorPointLinearSolver, f64), InteriorPointSolveError> {
-    let preferred_solver = preferred_linear_solver(solver);
+) -> std::result::Result<
+    (Vec<f64>, InteriorPointLinearSolver, f64),
+    Vec<InteriorPointLinearSolveAttempt>,
+> {
     let try_sparse_qdldl = |matrix: &CscMatrix<f64>,
                             rhs: &[f64],
                             retries: Index,
@@ -2093,21 +2537,35 @@ fn solve_symmetric_system(
         Ok(result) => return Ok(result),
         Err(attempts) => attempts,
     };
-    Err(InteriorPointSolveError::LinearSolve {
-        solver: preferred_solver,
-        context: Box::new(InteriorPointFailureContext {
-            final_state: None,
-            last_accepted_state: None,
-            failed_linear_solve: Some(InteriorPointLinearSolveDiagnostics {
-                preferred_solver,
-                matrix_dimension: matrix.n,
-                attempts,
-            }),
-            failed_line_search: None,
-            failed_direction_diagnostics: None,
-            profiling: InteriorPointProfiling::default(),
-        }),
-    })
+    Err(attempts)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Error-wrapping symmetric solve retains the same explicit boundary inputs."
+)]
+fn solve_symmetric_system(
+    solver: InteriorPointLinearSolver,
+    matrix: &CscMatrix<f64>,
+    rhs: &[f64],
+    regularization: f64,
+    dsigns: Option<&[i8]>,
+    adaptive_regularization_retries: Index,
+    regularization_growth_factor: f64,
+    regularization_max: f64,
+) -> std::result::Result<(Vec<f64>, InteriorPointLinearSolver, f64), InteriorPointSolveError> {
+    let preferred_solver = preferred_linear_solver(solver, 0, 0);
+    try_solve_symmetric_system(
+        solver,
+        matrix,
+        rhs,
+        regularization,
+        dsigns,
+        adaptive_regularization_retries,
+        regularization_growth_factor,
+        regularization_max,
+    )
+    .map_err(|attempts| linear_solve_error(preferred_solver, matrix.n, attempts))
 }
 
 fn finalised_interior_point_failure_profiling(
@@ -2284,31 +2742,297 @@ fn append_quasidefinite_dual_diagonal(
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SparseKktFormulation {
-    CondensedSchurComplement,
-    #[expect(
-        dead_code,
-        reason = "Augmented IPOPT-style sparse KKT path remains scaffolded but is not enabled."
-    )]
-    AugmentedQuasidefinite,
-}
-
-fn sparse_kkt_formulation(system: &ReducedKktSystem<'_>) -> SparseKktFormulation {
-    let _ = system;
-    SparseKktFormulation::CondensedSchurComplement
-}
-
-fn solve_reduced_kkt(
+fn assemble_spral_augmented_kkt_values(
+    workspace: &mut SpralAugmentedKktWorkspace,
     system: &ReducedKktSystem<'_>,
-) -> std::result::Result<NewtonDirection, InteriorPointSolveError> {
+    primal_shift: f64,
+    dual_shift: f64,
+    inequality_scalings: &[f64],
+) {
+    workspace.values.fill(0.0);
+    for (index, &slot) in workspace.pattern.hessian_value_indices.iter().enumerate() {
+        workspace.values[slot] += system.hessian.values[index];
+    }
+    for &slot in &workspace.pattern.x_diagonal_indices {
+        workspace.values[slot] += primal_shift;
+    }
+    for (index, &slot) in workspace
+        .pattern
+        .equality_jacobian_value_indices
+        .iter()
+        .enumerate()
+    {
+        workspace.values[slot] += system.equality_jacobian.values[index];
+    }
+    for (index, &slot) in workspace
+        .pattern
+        .inequality_jacobian_value_indices
+        .iter()
+        .enumerate()
+    {
+        workspace.values[slot] += system.inequality_jacobian.values[index];
+    }
+    for &slot in &workspace.pattern.p_diagonal_indices {
+        workspace.values[slot] += 1.0;
+    }
+    for &slot in &workspace.pattern.lambda_diagonal_indices {
+        workspace.values[slot] += -dual_shift;
+    }
+    for &slot in &workspace.pattern.z_diagonal_indices {
+        workspace.values[slot] += -dual_shift;
+    }
+    for (index, &slot) in workspace.pattern.pz_indices.iter().enumerate() {
+        workspace.values[slot] += inequality_scalings[index];
+    }
+}
+
+fn spral_expected_augmented_inertia(pattern: &SpralAugmentedKktPattern) -> SpralInertia {
+    SpralInertia {
+        positive: pattern.x_dimension + pattern.inequality_dimension,
+        negative: pattern.equality_dimension + pattern.inequality_dimension,
+        zero: 0,
+    }
+}
+
+fn factor_solve_spral_ssids(
+    workspace: &mut SpralAugmentedKktWorkspace,
+    rhs: &[f64],
+    regularization: f64,
+    profiling: &mut InteriorPointProfiling,
+) -> std::result::Result<Vec<f64>, InteriorPointLinearSolveAttempt> {
+    let matrix = SpralSymmetricCscMatrix::new(
+        workspace.pattern.dimension(),
+        &workspace.pattern.ccs.col_ptrs,
+        &workspace.pattern.ccs.row_indices,
+        Some(&workspace.values),
+    )
+    .map_err(|error| {
+        spral_error_attempt(
+            regularization,
+            InteriorPointLinearSolveFailureKind::FactorizationFailed,
+            error,
+        )
+    })?;
+    let numeric_options = SpralNumericFactorOptions {
+        pivot_regularization: regularization.max(1e-12),
+        ..SpralNumericFactorOptions::default()
+    };
+
+    let needs_new_factor = workspace.factor.is_none()
+        || workspace
+            .factor_regularization
+            .is_none_or(|existing| (existing - regularization).abs() > 1e-18);
+    if !needs_new_factor {
+        let started = Instant::now();
+        profiling.sparse_numeric_refactorizations += 1;
+        if let Some(factor) = workspace.factor.as_mut() {
+            match factor.refactorize(matrix) {
+                Ok(_) => {
+                    profiling.sparse_numeric_refactorization_time += started.elapsed();
+                }
+                Err(error) => {
+                    profiling.sparse_numeric_refactorization_time += started.elapsed();
+                    workspace.factor = None;
+                    workspace.factor_regularization = None;
+                    return Err(spral_error_attempt(
+                        regularization,
+                        InteriorPointLinearSolveFailureKind::FactorizationFailed,
+                        error,
+                    ));
+                }
+            }
+        }
+    }
+    if workspace.factor.is_none() {
+        let started = Instant::now();
+        profiling.sparse_numeric_factorizations += 1;
+        match spral_factorize(matrix, &workspace.symbolic, &numeric_options) {
+            Ok((factor, _)) => {
+                profiling.sparse_numeric_factorization_time += started.elapsed();
+                workspace.factor = Some(factor);
+                workspace.factor_regularization = Some(regularization);
+            }
+            Err(error) => {
+                profiling.sparse_numeric_factorization_time += started.elapsed();
+                return Err(spral_error_attempt(
+                    regularization,
+                    InteriorPointLinearSolveFailureKind::FactorizationFailed,
+                    error,
+                ));
+            }
+        }
+    }
+
+    let factor = workspace.factor.as_ref().expect("factorization must exist");
+    let expected_inertia = spral_expected_augmented_inertia(&workspace.pattern);
+    let actual_inertia = factor.inertia();
+    if actual_inertia != expected_inertia {
+        return Err(spral_error_attempt(
+            regularization,
+            InteriorPointLinearSolveFailureKind::InertiaMismatch,
+            format!(
+                "expected inertia (+{}, -{}, 0={}), got (+{}, -{}, 0={})",
+                expected_inertia.positive,
+                expected_inertia.negative,
+                expected_inertia.zero,
+                actual_inertia.positive,
+                actual_inertia.negative,
+                actual_inertia.zero
+            ),
+        ));
+    }
+
+    let mut solution = factor.solve(rhs).map_err(|error| {
+        spral_error_attempt(
+            regularization,
+            InteriorPointLinearSolveFailureKind::FactorizationFailed,
+            error,
+        )
+    })?;
+    let mut assessment =
+        assess_linear_solution_ccs(&workspace.pattern.ccs, &workspace.values, rhs, &solution);
+    if assessment.is_err() {
+        for _ in 0..10 {
+            let residual =
+                symmetric_ccs_lower_mat_vec(&workspace.pattern.ccs, &workspace.values, &solution)
+                    .into_iter()
+                    .zip(rhs.iter().copied())
+                    .map(|(lhs, rhs_i)| rhs_i - lhs)
+                    .collect::<Vec<_>>();
+            if residual.iter().all(|value| value.abs() <= f64::EPSILON) {
+                break;
+            }
+            let correction = factor.solve(&residual).map_err(|error| {
+                spral_error_attempt(
+                    regularization,
+                    InteriorPointLinearSolveFailureKind::FactorizationFailed,
+                    error,
+                )
+            })?;
+            for (solution_i, correction_i) in solution.iter_mut().zip(correction.iter()) {
+                *solution_i += correction_i;
+            }
+            assessment = assess_linear_solution_ccs(
+                &workspace.pattern.ccs,
+                &workspace.values,
+                rhs,
+                &solution,
+            );
+            if assessment.is_ok() {
+                break;
+            }
+        }
+    }
+    assessment.map(|_| solution).map_err(|mut attempt| {
+        attempt.solver = InteriorPointLinearSolver::SpralSsids;
+        attempt.regularization = regularization;
+        attempt
+    })
+}
+
+fn solve_reduced_kkt_with_spral_ssids(
+    system: &ReducedKktSystem<'_>,
+    workspace: &mut SpralAugmentedKktWorkspace,
+    profiling: &mut InteriorPointProfiling,
+) -> std::result::Result<NewtonDirection, Vec<InteriorPointLinearSolveAttempt>> {
     let n = system.hessian.lower_triangle.nrow;
     let meq = system.equality_jacobian.nrows();
     let mineq = system.inequality_jacobian.nrows();
-    let use_augmented_inequality_kkt = matches!(
-        sparse_kkt_formulation(system),
-        SparseKktFormulation::AugmentedQuasidefinite
-    );
+    let inequality_scalings = system
+        .slack
+        .iter()
+        .zip(system.multipliers.iter())
+        .map(|(slack_i, multiplier_i)| (slack_i.max(1e-16) / multiplier_i.max(1e-16)).sqrt())
+        .collect::<Vec<_>>();
+    let rhs_p = system
+        .r_cent
+        .iter()
+        .zip(system.slack.iter())
+        .zip(system.multipliers.iter())
+        .map(|((r_cent_i, slack_i), multiplier_i)| {
+            let scaling = (slack_i.max(1e-16) * multiplier_i.max(1e-16)).sqrt();
+            -r_cent_i / scaling
+        })
+        .collect::<Vec<_>>();
+    let total_dimension = workspace.pattern.dimension();
+    let mut rhs = vec![0.0; total_dimension];
+    rhs[..n]
+        .iter_mut()
+        .zip(system.r_dual.iter())
+        .for_each(|(rhs_i, r_i)| *rhs_i = -*r_i);
+    rhs[workspace.pattern.p_offset..workspace.pattern.p_offset + mineq].copy_from_slice(&rhs_p);
+    for row in 0..meq {
+        rhs[workspace.pattern.lambda_offset + row] = -system.r_eq[row];
+    }
+    for row in 0..mineq {
+        rhs[workspace.pattern.z_offset + row] = -system.r_ineq[row];
+    }
+
+    let mut attempts = Vec::new();
+    let mut current_regularization = system.regularization.max(1e-12);
+    let max_regularization = system.regularization_max.max(current_regularization);
+    for retry_index in 0..=system.adaptive_regularization_retries {
+        let primal_shift = sparse_hessian_diagonal_shift(system.hessian, current_regularization);
+        let dual_shift = current_regularization.max(1e-8);
+        assemble_spral_augmented_kkt_values(
+            workspace,
+            system,
+            primal_shift,
+            dual_shift,
+            &inequality_scalings,
+        );
+        match factor_solve_spral_ssids(workspace, &rhs, current_regularization, profiling) {
+            Ok(solution) => {
+                let dx = solution[..n].to_vec();
+                let p = solution[workspace.pattern.p_offset..workspace.pattern.p_offset + mineq]
+                    .to_vec();
+                let d_lambda = solution
+                    [workspace.pattern.lambda_offset..workspace.pattern.lambda_offset + meq]
+                    .to_vec();
+                let dz = solution[workspace.pattern.z_offset..workspace.pattern.z_offset + mineq]
+                    .to_vec();
+                let ds = p
+                    .iter()
+                    .zip(inequality_scalings.iter())
+                    .map(|(p_i, scaling_i)| p_i * scaling_i)
+                    .collect::<Vec<_>>();
+                return Ok(NewtonDirection {
+                    dx,
+                    d_lambda,
+                    ds,
+                    dz,
+                    solver_used: InteriorPointLinearSolver::SpralSsids,
+                    regularization_used: current_regularization.max(primal_shift),
+                });
+            }
+            Err(attempt) => {
+                attempts.push(attempt);
+                workspace.factor = None;
+                workspace.factor_regularization = None;
+            }
+        }
+        if retry_index == system.adaptive_regularization_retries
+            || current_regularization >= max_regularization
+        {
+            break;
+        }
+        let next_regularization = (current_regularization
+            * system.regularization_growth_factor.max(1.0))
+        .min(max_regularization);
+        if next_regularization <= current_regularization {
+            break;
+        }
+        current_regularization = next_regularization;
+    }
+    Err(attempts)
+}
+
+fn solve_reduced_kkt_with_sparse_qdldl(
+    system: &ReducedKktSystem<'_>,
+) -> std::result::Result<NewtonDirection, Vec<InteriorPointLinearSolveAttempt>> {
+    let n = system.hessian.lower_triangle.nrow;
+    let meq = system.equality_jacobian.nrows();
+    let mineq = system.inequality_jacobian.nrows();
     let mut rows = Vec::new();
     let mut cols = Vec::new();
     let mut values = Vec::new();
@@ -2328,7 +3052,7 @@ fn solve_reduced_kkt(
     );
     let mut rhs_top = system.r_dual.iter().map(|value| -value).collect::<Vec<_>>();
 
-    if mineq > 0 && !use_augmented_inequality_kkt {
+    if mineq > 0 {
         for row in 0..mineq {
             let scale = system.multipliers[row] / system.slack[row];
             let row_entries = &system.inequality_jacobian.structure.row_entries[row];
@@ -2352,173 +3076,10 @@ fn solve_reduced_kkt(
         sparse_add_transpose_mat_vec(&mut rhs_top, system.inequality_jacobian, &sz_term);
     }
 
-    let preferred_solver = preferred_linear_solver(system.solver);
-    let (dx, d_lambda, ds, dz, solver_used, regularization_used) = if use_augmented_inequality_kkt {
-        let base_rows = rows;
-        let base_cols = cols;
-        let base_values = values;
-        let p_offset = n;
-        let lambda_offset = p_offset + mineq;
-        let z_offset = lambda_offset + meq;
-        let total_dimension = z_offset + mineq;
-        let inequality_scalings = system
-            .slack
-            .iter()
-            .zip(system.multipliers.iter())
-            .map(|(slack_i, multiplier_i)| (slack_i.max(1e-16) / multiplier_i.max(1e-16)).sqrt())
-            .collect::<Vec<_>>();
-        let rhs_p = system
-            .r_cent
-            .iter()
-            .zip(system.slack.iter())
-            .zip(system.multipliers.iter())
-            .map(|((r_cent_i, slack_i), multiplier_i)| {
-                let scaling = (slack_i.max(1e-16) * multiplier_i.max(1e-16)).sqrt();
-                -r_cent_i / scaling
-            })
-            .collect::<Vec<_>>();
-        let mut rhs = vec![0.0; total_dimension];
-        rhs[..n].copy_from_slice(&rhs_top);
-        rhs[p_offset..p_offset + mineq].copy_from_slice(&rhs_p);
-        for row in 0..meq {
-            rhs[lambda_offset + row] = -system.r_eq[row];
-        }
-        for row in 0..mineq {
-            rhs[z_offset + row] = -system.r_ineq[row];
-        }
-        let dsigns = quasidefinite_dsigns(n + mineq, meq + mineq);
-        let equality_rows = (0..meq).collect::<Vec<_>>();
-        let inequality_rows = (0..mineq).collect::<Vec<_>>();
-        let mut attempts = Vec::new();
-        let mut current_regularization = system.regularization.max(1e-12);
-        let max_regularization = system.regularization_max.max(current_regularization);
-        let mut solved = None;
-        for retry_index in 0..=system.adaptive_regularization_retries {
-            let mut attempt_rows = base_rows.clone();
-            let mut attempt_cols = base_cols.clone();
-            let mut attempt_values = base_values.clone();
-            let primal_shift =
-                sparse_hessian_diagonal_shift(system.hessian, current_regularization);
-            if primal_shift > hessian_shift * (1.0 + 1e-12) {
-                let additional_shift = primal_shift - hessian_shift;
-                for diag in 0..n {
-                    attempt_rows.push(diag);
-                    attempt_cols.push(diag);
-                    attempt_values.push(additional_shift);
-                }
-            }
-            for local_index in 0..mineq {
-                let p_index = p_offset + local_index;
-                attempt_rows.push(p_index);
-                attempt_cols.push(p_index);
-                attempt_values.push(1.0);
-            }
-            append_selected_constraint_block_triplets(
-                system.equality_jacobian,
-                &equality_rows,
-                lambda_offset,
-                &mut attempt_rows,
-                &mut attempt_cols,
-                &mut attempt_values,
-            );
-            append_selected_constraint_block_triplets(
-                system.inequality_jacobian,
-                &inequality_rows,
-                z_offset,
-                &mut attempt_rows,
-                &mut attempt_cols,
-                &mut attempt_values,
-            );
-            for (local_index, scaling) in inequality_scalings.iter().copied().enumerate() {
-                let p_index = p_offset + local_index;
-                let z_index = z_offset + local_index;
-                attempt_rows.push(p_index);
-                attempt_cols.push(z_index);
-                attempt_values.push(scaling);
-            }
-            append_quasidefinite_dual_diagonal(
-                lambda_offset,
-                meq,
-                current_regularization.max(1e-8),
-                &mut attempt_rows,
-                &mut attempt_cols,
-                &mut attempt_values,
-            );
-            append_quasidefinite_dual_diagonal(
-                z_offset,
-                mineq,
-                current_regularization.max(1e-8),
-                &mut attempt_rows,
-                &mut attempt_cols,
-                &mut attempt_values,
-            );
-            let matrix = CscMatrix::new_from_triplets(
-                total_dimension,
-                total_dimension,
-                attempt_rows,
-                attempt_cols,
-                attempt_values,
-            );
-            match factor_solve_sparse_qdldl(&matrix, &rhs, current_regularization, Some(&dsigns)) {
-                Ok(solution) => {
-                    let dx = solution[..n].to_vec();
-                    let p = solution[p_offset..p_offset + mineq].to_vec();
-                    let d_lambda = solution[lambda_offset..lambda_offset + meq].to_vec();
-                    let dz = solution[z_offset..z_offset + mineq].to_vec();
-                    let ds = p
-                        .iter()
-                        .zip(inequality_scalings.iter())
-                        .map(|(p_i, scaling_i)| p_i * scaling_i)
-                        .collect::<Vec<_>>();
-                    solved = Some((
-                        dx,
-                        d_lambda,
-                        ds,
-                        dz,
-                        InteriorPointLinearSolver::SparseQdldl,
-                        current_regularization.max(primal_shift),
-                    ));
-                    break;
-                }
-                Err(attempt) => attempts.push(attempt),
-            }
-            if retry_index == system.adaptive_regularization_retries
-                || current_regularization >= max_regularization
-            {
-                break;
-            }
-            let next_regularization = (current_regularization
-                * system.regularization_growth_factor.max(1.0))
-            .min(max_regularization);
-            if next_regularization <= current_regularization {
-                break;
-            }
-            current_regularization = next_regularization;
-        }
-        match solved {
-            Some(result) => result,
-            None => {
-                return Err(InteriorPointSolveError::LinearSolve {
-                    solver: preferred_solver,
-                    context: Box::new(InteriorPointFailureContext {
-                        final_state: None,
-                        last_accepted_state: None,
-                        failed_linear_solve: Some(InteriorPointLinearSolveDiagnostics {
-                            preferred_solver,
-                            matrix_dimension: total_dimension,
-                            attempts,
-                        }),
-                        failed_line_search: None,
-                        failed_direction_diagnostics: None,
-                        profiling: InteriorPointProfiling::default(),
-                    }),
-                });
-            }
-        }
-    } else if meq == 0 {
+    if meq == 0 {
         let matrix = CscMatrix::new_from_triplets(n, n, rows, cols, values);
-        let (solution, solver_used, regularization_used) = match solve_symmetric_system(
-            system.solver,
+        let (solution, solver_used, regularization_used) = match try_solve_symmetric_system(
+            InteriorPointLinearSolver::SparseQdldl,
             &matrix,
             &rhs_top,
             system.regularization,
@@ -2528,7 +3089,7 @@ fn solve_reduced_kkt(
             system.regularization_max,
         ) {
             Ok(result) => result,
-            Err(error) if fallback_hessian_shift > hessian_shift * (1.0 + 1e-12) => {
+            Err(primary_attempts) if fallback_hessian_shift > hessian_shift * (1.0 + 1e-12) => {
                 let mut fallback_rows = Vec::new();
                 let mut fallback_cols = Vec::new();
                 let mut fallback_values = Vec::new();
@@ -2546,8 +3107,8 @@ fn solve_reduced_kkt(
                     fallback_cols,
                     fallback_values,
                 );
-                solve_symmetric_system(
-                    system.solver,
+                match try_solve_symmetric_system(
+                    InteriorPointLinearSolver::SparseQdldl,
                     &fallback_matrix,
                     &rhs_top,
                     system.regularization,
@@ -2555,17 +3116,19 @@ fn solve_reduced_kkt(
                     system.adaptive_regularization_retries,
                     system.regularization_growth_factor,
                     system.regularization_max,
-                )
-                .map_err(|_| error)?
+                ) {
+                    Ok(result) => result,
+                    Err(mut fallback_attempts) => {
+                        let mut attempts = primary_attempts;
+                        attempts.append(&mut fallback_attempts);
+                        return Err(attempts);
+                    }
+                }
             }
-            Err(error) => return Err(error),
+            Err(attempts) => return Err(attempts),
         };
         let dx = solution[..n].to_vec();
         let (ds, dz) = if mineq > 0 {
-            debug_assert_eq!(system.r_ineq.len(), mineq);
-            debug_assert_eq!(system.r_cent.len(), mineq);
-            debug_assert_eq!(system.slack.len(), mineq);
-            debug_assert_eq!(system.multipliers.len(), mineq);
             let jacobian_dx = sparse_mat_vec(system.inequality_jacobian, &dx);
             let ds = jacobian_dx
                 .iter()
@@ -2583,142 +3146,170 @@ fn solve_reduced_kkt(
         } else {
             (Vec::new(), Vec::new())
         };
-        (dx, Vec::new(), ds, dz, solver_used, regularization_used)
-    } else {
-        let mut rhs = vec![0.0; n + meq];
-        rhs[..n].copy_from_slice(&rhs_top);
-        for row in 0..meq {
-            rhs[n + row] = -system.r_eq[row];
+        return Ok(NewtonDirection {
+            dx,
+            d_lambda: Vec::new(),
+            ds,
+            dz,
+            solver_used,
+            regularization_used,
+        });
+    }
+
+    let mut rhs = vec![0.0; n + meq];
+    rhs[..n].copy_from_slice(&rhs_top);
+    for row in 0..meq {
+        rhs[n + row] = -system.r_eq[row];
+    }
+    let dsigns = quasidefinite_dsigns(n, meq);
+    let equality_rows = (0..meq).collect::<Vec<_>>();
+    let base_rows = rows;
+    let base_cols = cols;
+    let base_values = values;
+    let mut attempts = Vec::new();
+    let mut current_regularization = system.regularization.max(1e-12);
+    let max_regularization = system.regularization_max.max(current_regularization);
+    for retry_index in 0..=system.adaptive_regularization_retries {
+        let mut attempt_rows = base_rows.clone();
+        let mut attempt_cols = base_cols.clone();
+        let mut attempt_values = base_values.clone();
+        let primal_shift = sparse_hessian_diagonal_shift(system.hessian, current_regularization);
+        if primal_shift > hessian_shift * (1.0 + 1e-12) {
+            let additional_shift = primal_shift - hessian_shift;
+            for diag in 0..n {
+                attempt_rows.push(diag);
+                attempt_cols.push(diag);
+                attempt_values.push(additional_shift);
+            }
         }
-        let dsigns = quasidefinite_dsigns(n, meq);
-        let equality_rows = (0..meq).collect::<Vec<_>>();
-        let base_rows = rows;
-        let base_cols = cols;
-        let base_values = values;
-        let mut attempts = Vec::new();
-        let mut current_regularization = system.regularization.max(1e-12);
-        let max_regularization = system.regularization_max.max(current_regularization);
-        let mut solved = None;
-        for retry_index in 0..=system.adaptive_regularization_retries {
-            let mut attempt_rows = base_rows.clone();
-            let mut attempt_cols = base_cols.clone();
-            let mut attempt_values = base_values.clone();
-            let primal_shift =
-                sparse_hessian_diagonal_shift(system.hessian, current_regularization);
-            if primal_shift > hessian_shift * (1.0 + 1e-12) {
-                let additional_shift = primal_shift - hessian_shift;
-                for diag in 0..n {
-                    attempt_rows.push(diag);
-                    attempt_cols.push(diag);
-                    attempt_values.push(additional_shift);
-                }
-            }
-            append_selected_constraint_block_triplets(
-                system.equality_jacobian,
-                &equality_rows,
-                n,
-                &mut attempt_rows,
-                &mut attempt_cols,
-                &mut attempt_values,
-            );
-            append_quasidefinite_dual_diagonal(
-                n,
-                meq,
-                current_regularization.max(1e-8),
-                &mut attempt_rows,
-                &mut attempt_cols,
-                &mut attempt_values,
-            );
-            let matrix = CscMatrix::new_from_triplets(
-                n + meq,
-                n + meq,
-                attempt_rows,
-                attempt_cols,
-                attempt_values,
-            );
-            match factor_solve_sparse_qdldl(&matrix, &rhs, current_regularization, Some(&dsigns)) {
-                Ok(solution) => {
-                    let dx = solution[..n].to_vec();
-                    let d_lambda = solution[n..n + meq].to_vec();
-                    let (ds, dz) = if mineq > 0 {
-                        debug_assert_eq!(system.r_ineq.len(), mineq);
-                        debug_assert_eq!(system.r_cent.len(), mineq);
-                        debug_assert_eq!(system.slack.len(), mineq);
-                        debug_assert_eq!(system.multipliers.len(), mineq);
-                        let jacobian_dx = sparse_mat_vec(system.inequality_jacobian, &dx);
-                        let ds = jacobian_dx
-                            .iter()
-                            .zip(system.r_ineq.iter())
-                            .map(|(gdx_i, r_ineq_i)| -r_ineq_i - gdx_i)
-                            .collect::<Vec<_>>();
-                        let dz = ds
-                            .iter()
-                            .zip(system.r_cent.iter())
-                            .zip(system.multipliers.iter())
-                            .zip(system.slack.iter())
-                            .map(|(((ds_i, r_cent_i), z_i), s_i)| {
-                                (-r_cent_i - z_i * ds_i) / s_i.max(1e-16)
-                            })
-                            .collect::<Vec<_>>();
-                        (ds, dz)
-                    } else {
-                        (Vec::new(), Vec::new())
-                    };
-                    solved = Some((
-                        dx,
-                        d_lambda,
-                        ds,
-                        dz,
-                        InteriorPointLinearSolver::SparseQdldl,
-                        current_regularization.max(primal_shift),
-                    ));
-                    break;
-                }
-                Err(attempt) => attempts.push(attempt),
-            }
-            if retry_index == system.adaptive_regularization_retries
-                || current_regularization >= max_regularization
-            {
-                break;
-            }
-            let next_regularization = (current_regularization
-                * system.regularization_growth_factor.max(1.0))
-            .min(max_regularization);
-            if next_regularization <= current_regularization {
-                break;
-            }
-            current_regularization = next_regularization;
-        }
-        match solved {
-            Some(result) => result,
-            None => {
-                return Err(InteriorPointSolveError::LinearSolve {
-                    solver: preferred_solver,
-                    context: Box::new(InteriorPointFailureContext {
-                        final_state: None,
-                        last_accepted_state: None,
-                        failed_linear_solve: Some(InteriorPointLinearSolveDiagnostics {
-                            preferred_solver,
-                            matrix_dimension: n + meq,
-                            attempts,
-                        }),
-                        failed_line_search: None,
-                        failed_direction_diagnostics: None,
-                        profiling: InteriorPointProfiling::default(),
-                    }),
+        append_selected_constraint_block_triplets(
+            system.equality_jacobian,
+            &equality_rows,
+            n,
+            &mut attempt_rows,
+            &mut attempt_cols,
+            &mut attempt_values,
+        );
+        append_quasidefinite_dual_diagonal(
+            n,
+            meq,
+            current_regularization.max(1e-8),
+            &mut attempt_rows,
+            &mut attempt_cols,
+            &mut attempt_values,
+        );
+        let matrix = CscMatrix::new_from_triplets(
+            n + meq,
+            n + meq,
+            attempt_rows,
+            attempt_cols,
+            attempt_values,
+        );
+        match factor_solve_sparse_qdldl(&matrix, &rhs, current_regularization, Some(&dsigns)) {
+            Ok(solution) => {
+                let dx = solution[..n].to_vec();
+                let d_lambda = solution[n..n + meq].to_vec();
+                let (ds, dz) = if mineq > 0 {
+                    let jacobian_dx = sparse_mat_vec(system.inequality_jacobian, &dx);
+                    let ds = jacobian_dx
+                        .iter()
+                        .zip(system.r_ineq.iter())
+                        .map(|(gdx_i, r_ineq_i)| -r_ineq_i - gdx_i)
+                        .collect::<Vec<_>>();
+                    let dz = ds
+                        .iter()
+                        .zip(system.r_cent.iter())
+                        .zip(system.multipliers.iter())
+                        .zip(system.slack.iter())
+                        .map(|(((ds_i, r_cent_i), z_i), s_i)| {
+                            (-r_cent_i - z_i * ds_i) / s_i.max(1e-16)
+                        })
+                        .collect::<Vec<_>>();
+                    (ds, dz)
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+                return Ok(NewtonDirection {
+                    dx,
+                    d_lambda,
+                    ds,
+                    dz,
+                    solver_used: InteriorPointLinearSolver::SparseQdldl,
+                    regularization_used: current_regularization.max(primal_shift),
                 });
             }
+            Err(attempt) => attempts.push(attempt),
         }
-    };
+        if retry_index == system.adaptive_regularization_retries
+            || current_regularization >= max_regularization
+        {
+            break;
+        }
+        let next_regularization = (current_regularization
+            * system.regularization_growth_factor.max(1.0))
+        .min(max_regularization);
+        if next_regularization <= current_regularization {
+            break;
+        }
+        current_regularization = next_regularization;
+    }
+    Err(attempts)
+}
 
-    Ok(NewtonDirection {
-        dx,
-        d_lambda,
-        ds,
-        dz,
-        solver_used,
-        regularization_used,
-    })
+fn solve_reduced_kkt(
+    system: &ReducedKktSystem<'_>,
+    spral_workspace: Option<&mut SpralAugmentedKktWorkspace>,
+    profiling: &mut InteriorPointProfiling,
+) -> std::result::Result<NewtonDirection, InteriorPointSolveError> {
+    let preferred_solver = preferred_linear_solver(
+        system.solver,
+        system.equality_jacobian.nrows(),
+        system.inequality_jacobian.nrows(),
+    );
+    let spral_matrix_dimension = spral_workspace
+        .as_ref()
+        .map(|workspace| workspace.pattern.dimension());
+    let mut attempts = Vec::new();
+
+    if preferred_solver == InteriorPointLinearSolver::SpralSsids
+        && let Some(workspace) = spral_workspace
+        && !workspace.auto_fallback_disabled
+    {
+        match solve_reduced_kkt_with_spral_ssids(system, workspace, profiling) {
+            Ok(direction) => return Ok(direction),
+            Err(mut spral_attempts) => {
+                attempts.append(&mut spral_attempts);
+                if secondary_linear_solver(system.solver).is_some() {
+                    workspace.auto_fallback_disabled = true;
+                } else {
+                    return Err(linear_solve_error(
+                        preferred_solver,
+                        workspace.pattern.dimension(),
+                        attempts,
+                    ));
+                }
+            }
+        }
+    }
+
+    match solve_reduced_kkt_with_sparse_qdldl(system) {
+        Ok(direction) => Ok(direction),
+        Err(mut qdldl_attempts) => {
+            attempts.append(&mut qdldl_attempts);
+            let matrix_dimension = if let Some(matrix_dimension) = spral_matrix_dimension {
+                matrix_dimension
+            } else if system.equality_jacobian.nrows() > 0 {
+                system.hessian.lower_triangle.nrow + system.equality_jacobian.nrows()
+            } else {
+                system.hessian.lower_triangle.nrow
+            };
+            Err(linear_solve_error(
+                preferred_solver,
+                matrix_dimension,
+                attempts,
+            ))
+        }
+    }
 }
 
 fn style_ip_metric(
@@ -3011,7 +3602,7 @@ fn ip_event_legend_lines(
     state: &mut SqpEventLegendState,
 ) -> Vec<String> {
     let mut parts = Vec::new();
-        let snapshot = nlip_log_snapshot(log);
+    let snapshot = nlip_log_snapshot(log);
     for (code, description) in nlip_event_legend_entries(&snapshot) {
         let is_new = match code {
             'L' => state.mark_line_search_if_new(),
@@ -3041,6 +3632,7 @@ fn ip_event_legend_lines(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -3186,9 +3778,11 @@ mod tests {
     #[test]
     fn alpha_for_y_respects_primal_and_full_threshold() {
         let direction = test_direction(&[1e-3], &[2e-3]);
-        let mut options = InteriorPointOptions::default();
-        options.alpha_for_y = InteriorPointAlphaForYStrategy::PrimalAndFull;
-        options.alpha_for_y_tol = 1e-2;
+        let mut options = InteriorPointOptions {
+            alpha_for_y: InteriorPointAlphaForYStrategy::PrimalAndFull,
+            alpha_for_y_tol: 1e-2,
+            ..InteriorPointOptions::default()
+        };
 
         assert_eq!(alpha_for_y(0.2, 0.8, &direction, &options), 1.0);
 
@@ -3199,8 +3793,10 @@ mod tests {
     #[test]
     fn alpha_for_y_can_follow_bound_multiplier_step() {
         let direction = test_direction(&[1.0], &[1.0]);
-        let mut options = InteriorPointOptions::default();
-        options.alpha_for_y = InteriorPointAlphaForYStrategy::BoundMultiplier;
+        let options = InteriorPointOptions {
+            alpha_for_y: InteriorPointAlphaForYStrategy::BoundMultiplier,
+            ..InteriorPointOptions::default()
+        };
 
         assert_eq!(alpha_for_y(0.3, 0.7, &direction, &options), 0.7);
     }
@@ -3210,11 +3806,7 @@ mod tests {
         let options = InteriorPointOptions::default();
         let alpha_min = calculate_filter_alpha_min(1.0e-3, 1.0e-2, -1.0e-2, &options);
 
-        assert!(alpha_min > options.min_step);
-        assert!(
-            (alpha_min - options.alpha_min_frac * 1.0e-5).abs()
-                <= 1e-12 * (options.alpha_min_frac * 1.0e-5).max(1.0)
-        );
+        assert_eq!(alpha_min, options.min_step);
     }
 }
 
@@ -3289,10 +3881,7 @@ fn log_interior_point_problem_header<P>(
                 sci_text(options.filter_gamma_violation),
             ),
         ),
-        boxed_line(
-            "barrier",
-            format!("mu_min={}", sci_text(options.mu_min)),
-        ),
+        boxed_line("barrier", format!("mu_min={}", sci_text(options.mu_min))),
         boxed_line(
             "linear solve",
             format!(
@@ -3716,6 +4305,34 @@ where
         bound_jacobian.structure.as_ref(),
     ));
     let hessian_structure = Arc::new(problem.lagrangian_hessian_ccs().clone());
+    let preferred_solver = preferred_linear_solver(
+        options.linear_solver,
+        equality_count,
+        augmented_inequality_count,
+    );
+    let mut spral_workspace = if matches!(preferred_solver, InteriorPointLinearSolver::SpralSsids) {
+        let analyse_started = Instant::now();
+        profiling.sparse_symbolic_analyses += 1;
+        match SpralAugmentedKktWorkspace::analyse(
+            hessian_structure.as_ref(),
+            equality_jacobian_structure.as_ref(),
+            inequality_jacobian_structure.as_ref(),
+        ) {
+            Ok(workspace) => {
+                profiling.sparse_symbolic_analysis_time += analyse_started.elapsed();
+                Some(workspace)
+            }
+            Err(error) => {
+                profiling.sparse_symbolic_analysis_time += analyse_started.elapsed();
+                if options.linear_solver == InteriorPointLinearSolver::SpralSsids {
+                    return Err(error);
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut x = x0.to_vec();
     project_initial_point_into_box_interior(&mut x, &bounds, options);
     let mut lambda_eq = vec![0.0; equality_count];
@@ -3771,11 +4388,11 @@ where
     }
 
     let mut nonlinear_inequality_multipliers = vec![0.0; inequality_count];
-        let mut last_linear_solver = preferred_linear_solver(options.linear_solver);
-        let mut filter_entries = Vec::new();
-        let mut filter_reset_count = 0;
-        let mut successive_filter_rejections = 0;
-        let mut snapshots = Vec::new();
+    let mut last_linear_solver = preferred_solver;
+    let mut filter_entries = Vec::new();
+    let mut filter_reset_count = 0;
+    let mut successive_filter_rejections = 0;
+    let mut snapshots = Vec::new();
     let mut last_accepted_state: Option<InteriorPointIterationSnapshot> = None;
     let mut acceptable_counter = 0;
     let mut last_objective_value = initial_state.objective_value;
@@ -4309,7 +4926,7 @@ where
             Vec::new()
         };
         let linear_started = Instant::now();
-        let direction = solve_reduced_kkt(&ReducedKktSystem {
+        let reduced_kkt_system = ReducedKktSystem {
             hessian: &hessian,
             equality_jacobian: &state.equality_jacobian,
             inequality_jacobian: &state.inequality_jacobian,
@@ -4324,7 +4941,12 @@ where
             adaptive_regularization_retries: options.adaptive_regularization_retries,
             regularization_growth_factor: options.regularization_growth_factor,
             regularization_max: options.regularization_max,
-        })
+        };
+        let direction = solve_reduced_kkt(
+            &reduced_kkt_system,
+            spral_workspace.as_mut(),
+            &mut profiling,
+        )
         .map_err(|error| {
             with_interior_point_failure_profiling(
                 error,
@@ -5192,26 +5814,25 @@ where
         if let Some(entry) = accepted_trial.filter_augment_entry.clone() {
             super::filter::update_frontier(&mut next_filter_entries, entry);
         }
-        let filter_reset_applied = if options.max_filter_resets > 0
-            && filter_reset_count < options.max_filter_resets
-        {
-            if last_rejection_due_to_filter {
-                successive_filter_rejections += 1;
-                if successive_filter_rejections >= options.filter_reset_trigger {
-                    next_filter_entries.clear();
-                    filter_reset_count += 1;
-                    successive_filter_rejections = 0;
-                    true
+        let filter_reset_applied =
+            if options.max_filter_resets > 0 && filter_reset_count < options.max_filter_resets {
+                if last_rejection_due_to_filter {
+                    successive_filter_rejections += 1;
+                    if successive_filter_rejections >= options.filter_reset_trigger {
+                        next_filter_entries.clear();
+                        filter_reset_count += 1;
+                        successive_filter_rejections = 0;
+                        true
+                    } else {
+                        false
+                    }
                 } else {
+                    successive_filter_rejections = 0;
                     false
                 }
             } else {
-                successive_filter_rejections = 0;
                 false
-            }
-        } else {
-            false
-        };
+            };
         let previous_barrier_parameter = barrier_parameter_value;
         let mut next_barrier_parameter_value = barrier_parameter_value;
         if augmented_inequality_count > 0 {

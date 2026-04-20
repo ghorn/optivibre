@@ -136,7 +136,6 @@ fn hs071_native_options() -> InteriorPointOptions {
         max_iters: 300,
         dual_tol: 1.0e-5,
         overall_tol: 1.0e-5,
-        filter_method: false,
         verbose: compare_verbose_requested(),
         ..InteriorPointOptions::default()
     }

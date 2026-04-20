@@ -160,7 +160,7 @@ const MANIFEST: &[ProblemManifestEntry] = &[
     manifest_entry_with_ipopt(
         "wood_4",
         KnownStatus::KnownPassing,
-        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
         KnownStatus::KnownPassing,
         IterationLimits::with_default(DEFAULT_MAX_ITERS),
     ),

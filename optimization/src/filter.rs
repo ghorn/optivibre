@@ -130,6 +130,10 @@ pub(crate) fn update_frontier(entries: &mut Vec<FilterEntry>, accepted: FilterEn
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Filter acceptance mirrors the solver-side IPOPT-style decision inputs explicitly."
+)]
 pub(crate) fn assess_trial(
     entries: &[FilterEntry],
     current: &FilterEntry,

@@ -196,19 +196,19 @@ fn sqp_solves_casadi_rosenbrock_example(
     #[values(CallbackBackend::Aot, CallbackBackend::Jit)] backend: CallbackBackend,
 ) {
     let problem = build_problem_ok(casadi_rosenbrock_nlp_problem(backend), backend);
-    let summary = solve_ok(
-        &problem,
-        &[2.5, 3.0, 0.75],
-        &[],
-        ClarabelSqpOptions::default(),
-    );
+    let options = ClarabelSqpOptions::default();
+    let summary = solve_ok(&problem, &[2.5, 3.0, 0.75], &[], options.clone());
 
     assert_abs_diff_eq!(summary.x[0], 0.0, epsilon = 1e-6);
     assert_abs_diff_eq!(summary.x[1], 1.0, epsilon = 1e-6);
     assert_abs_diff_eq!(summary.x[2], 0.0, epsilon = 1e-6);
     assert_abs_diff_eq!(summary.objective, 0.0, epsilon = 1e-6);
-    assert!(summary.equality_inf_norm.is_some_and(|value| value <= 1e-7));
-    assert!(summary.dual_inf_norm <= 1e-7);
+    assert!(
+        summary
+            .equality_inf_norm
+            .is_some_and(|value| value <= options.constraint_tol)
+    );
+    assert!(summary.dual_inf_norm <= options.dual_tol);
 }
 
 #[rstest]

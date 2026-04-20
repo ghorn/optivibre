@@ -364,7 +364,6 @@ fn interior_point_solves_hs071(
             max_iters: 300,
             dual_tol: 1.0e-5,
             overall_tol: 1.0e-5,
-            filter_method: false,
             ..InteriorPointOptions::default()
         },
     );
@@ -460,7 +459,7 @@ fn interior_point_reports_profiling_breakdown(
 }
 
 #[test]
-fn interior_point_auto_uses_sparse_qdldl_on_small_hanging_chain() {
+fn interior_point_auto_prefers_spral_ssids_on_small_hanging_chain() {
     let problem = build_problem_ok(
         hanging_chain_problem(CallbackBackend::Aot),
         CallbackBackend::Aot,
@@ -471,27 +470,29 @@ fn interior_point_auto_uses_sparse_qdldl_on_small_hanging_chain() {
         &[],
         InteriorPointOptions::default(),
     );
-    assert_eq!(
-        summary.linear_solver,
-        InteriorPointLinearSolver::SparseQdldl
-    );
+    assert_eq!(summary.linear_solver, InteriorPointLinearSolver::SpralSsids);
 }
 
 #[test]
-fn interior_point_auto_uses_sparse_qdldl_on_small_kkt_system() {
+fn interior_point_auto_prefers_spral_ssids_on_small_kkt_system() {
     let problem = build_problem_ok(hs021_problem(CallbackBackend::Aot), CallbackBackend::Aot);
     let summary = solve_ok(&problem, &[2.0, 2.0], &[], InteriorPointOptions::default());
-    assert_eq!(
-        summary.linear_solver,
-        InteriorPointLinearSolver::SparseQdldl,
-    );
+    assert_eq!(summary.linear_solver, InteriorPointLinearSolver::SpralSsids,);
 }
 
 #[test]
-fn interior_point_auto_and_sparse_solver_match() {
+fn interior_point_spral_and_qdldl_match_on_small_kkt_system() {
     let problem = build_problem_ok(hs021_problem(CallbackBackend::Aot), CallbackBackend::Aot);
-    let auto = solve_ok(&problem, &[2.0, 2.0], &[], InteriorPointOptions::default());
-    let sparse = solve_ok(
+    let spral = solve_ok(
+        &problem,
+        &[2.0, 2.0],
+        &[],
+        InteriorPointOptions {
+            linear_solver: InteriorPointLinearSolver::SpralSsids,
+            ..InteriorPointOptions::default()
+        },
+    );
+    let qdldl = solve_ok(
         &problem,
         &[2.0, 2.0],
         &[],
@@ -501,9 +502,66 @@ fn interior_point_auto_and_sparse_solver_match() {
         },
     );
 
-    assert_eq!(auto.linear_solver, InteriorPointLinearSolver::SparseQdldl);
-    assert_eq!(sparse.linear_solver, InteriorPointLinearSolver::SparseQdldl);
-    assert_abs_diff_eq!(auto.x[0], sparse.x[0], epsilon = 1e-6);
-    assert_abs_diff_eq!(auto.x[1], sparse.x[1], epsilon = 1e-6);
-    assert_abs_diff_eq!(auto.objective, sparse.objective, epsilon = 1e-8);
+    assert_eq!(spral.linear_solver, InteriorPointLinearSolver::SpralSsids);
+    assert_eq!(qdldl.linear_solver, InteriorPointLinearSolver::SparseQdldl);
+    assert_abs_diff_eq!(spral.x[0], qdldl.x[0], epsilon = 1e-6);
+    assert_abs_diff_eq!(spral.x[1], qdldl.x[1], epsilon = 1e-6);
+    assert_abs_diff_eq!(spral.objective, qdldl.objective, epsilon = 1e-8);
+    assert!(spral.primal_inf_norm <= 1e-6);
+    assert!(spral.dual_inf_norm <= 1e-5);
+    assert!(spral.complementarity_inf_norm <= 1e-6);
+}
+
+#[test]
+fn interior_point_spral_and_qdldl_match_on_hanging_chain() {
+    let problem = build_problem_ok(
+        hanging_chain_problem(CallbackBackend::Aot),
+        CallbackBackend::Aot,
+    );
+    let spral = solve_ok(
+        &problem,
+        &hanging_chain_initial_guess(),
+        &[],
+        InteriorPointOptions {
+            linear_solver: InteriorPointLinearSolver::SpralSsids,
+            ..InteriorPointOptions::default()
+        },
+    );
+    let qdldl = solve_ok(
+        &problem,
+        &hanging_chain_initial_guess(),
+        &[],
+        InteriorPointOptions {
+            linear_solver: InteriorPointLinearSolver::SparseQdldl,
+            ..InteriorPointOptions::default()
+        },
+    );
+
+    assert_eq!(spral.linear_solver, InteriorPointLinearSolver::SpralSsids);
+    assert_eq!(qdldl.linear_solver, InteriorPointLinearSolver::SparseQdldl);
+    assert_abs_diff_eq!(spral.objective, qdldl.objective, epsilon = 1e-6);
+    for (spral_x, qdldl_x) in spral.x.iter().zip(qdldl.x.iter()) {
+        assert_abs_diff_eq!(spral_x, qdldl_x, epsilon = 1e-5);
+    }
+    assert!(spral.primal_inf_norm <= 1e-6);
+    assert!(spral.dual_inf_norm <= 1e-6);
+}
+
+#[test]
+fn interior_point_spral_reuses_symbolic_analysis_and_refactorizes() {
+    let problem = build_problem_ok(hs021_problem(CallbackBackend::Aot), CallbackBackend::Aot);
+    let summary = solve_ok(
+        &problem,
+        &[2.0, 2.0],
+        &[],
+        InteriorPointOptions {
+            linear_solver: InteriorPointLinearSolver::SpralSsids,
+            ..InteriorPointOptions::default()
+        },
+    );
+
+    assert_eq!(summary.linear_solver, InteriorPointLinearSolver::SpralSsids);
+    assert_eq!(summary.profiling.sparse_symbolic_analyses, 1);
+    assert!(summary.profiling.sparse_numeric_factorizations >= 1);
+    assert!(summary.profiling.sparse_numeric_refactorizations >= 1);
 }

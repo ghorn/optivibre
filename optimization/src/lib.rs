@@ -3132,6 +3132,7 @@ where
                     alpha,
                     objective_directional_derivative,
                     switching_condition_satisfied,
+                    switching_condition_satisfied,
                     sqp_filter_parameters(options, filter_theta_max),
                 )
             });
@@ -4596,7 +4597,7 @@ fn visible_len(text: &str) -> usize {
         if ch == '\u{1b}' {
             if matches!(chars.peek(), Some('[')) {
                 chars.next();
-                while let Some(control) = chars.next() {
+                for control in chars.by_ref() {
                     if ('@'..='~').contains(&control) {
                         break;
                     }

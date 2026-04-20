@@ -909,7 +909,6 @@ fn nlip_filter_replay_from_snapshots(
             let phase = match snapshot.phase {
                 optimization::InteriorPointIterationPhase::Initial => "initial",
                 optimization::InteriorPointIterationPhase::AcceptedStep => "accepted_step",
-                optimization::InteriorPointIterationPhase::Restoration => "restoration",
                 optimization::InteriorPointIterationPhase::Converged => "converged",
             };
             Some(FilterReplayFrame {
@@ -1046,7 +1045,6 @@ fn metrics_from_ip_error(error: &InteriorPointSolveError) -> SolverMetrics {
         InteriorPointSolveError::InvalidInput(_) => return SolverMetrics::default(),
         InteriorPointSolveError::LinearSolve { context, .. }
         | InteriorPointSolveError::LineSearchFailed { context, .. }
-        | InteriorPointSolveError::RestorationFailed { context, .. }
         | InteriorPointSolveError::MaxIterations { context, .. } => context.as_ref(),
     };
     let snapshot = context
@@ -1480,7 +1478,6 @@ fn render_nlip_transcript(
         let phase = match snapshot.phase {
             optimization::InteriorPointIterationPhase::Initial => "start",
             optimization::InteriorPointIterationPhase::AcceptedStep => "accept",
-            optimization::InteriorPointIterationPhase::Restoration => "restore",
             optimization::InteriorPointIterationPhase::Converged => "final",
         };
         let events = if snapshot.events.is_empty() {
@@ -1534,7 +1531,6 @@ fn render_nlip_transcript(
             InteriorPointSolveError::InvalidInput(_) => None,
             InteriorPointSolveError::LinearSolve { context, .. }
             | InteriorPointSolveError::LineSearchFailed { context, .. }
-            | InteriorPointSolveError::RestorationFailed { context, .. }
             | InteriorPointSolveError::MaxIterations { context, .. } => Some(context.as_ref()),
         };
         if let Some(context) = context {
@@ -1772,7 +1768,6 @@ fn nlip_error_code(error: &InteriorPointSolveError) -> &'static str {
         InteriorPointSolveError::InvalidInput(_) => "invalid_input",
         InteriorPointSolveError::LinearSolve { .. } => "linear_solve",
         InteriorPointSolveError::LineSearchFailed { .. } => "line_search",
-        InteriorPointSolveError::RestorationFailed { .. } => "restoration",
         InteriorPointSolveError::MaxIterations { .. } => "max_iters",
     }
 }
