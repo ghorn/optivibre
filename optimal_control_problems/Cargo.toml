@@ -27,5 +27,6 @@ sx_core = { path = "../sx_core" }
 
 [dev-dependencies]
 approx.workspace = true
+spral_ssids = { path = "../spral_ssids" }
 sx_codegen_llvm = { path = "../sx_codegen_llvm" }
 tempfile.workspace = true

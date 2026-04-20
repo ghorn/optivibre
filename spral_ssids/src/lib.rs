@@ -4,12 +4,19 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
+mod native;
+
 use metis_ordering::{
     CsrGraph, NestedDissectionOptions, OrderingError, Permutation,
     approximate_minimum_degree_order, nested_dissection_order,
 };
 use rayon::prelude::*;
 use thiserror::Error;
+
+pub use native::{
+    NativeSpral, NativeSpralAnalyseInfo, NativeSpralError, NativeSpralFactorInfo,
+    NativeSpralSession,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct SymmetricCscMatrix<'a> {

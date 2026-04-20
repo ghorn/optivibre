@@ -1278,6 +1278,300 @@ fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
 mod tests {
     use super::*;
     use approx::assert_abs_diff_eq;
+    use serde::de::DeserializeOwned;
+    use spral_ssids::{
+        NativeSpral, NumericFactorOptions, OrderingStrategy, SsidsOptions, SymmetricCscMatrix,
+        analyse as spral_analyse, factorize as spral_factorize,
+    };
+    use std::fs;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+    use tempfile::TempDir;
+
+    #[derive(Debug)]
+    struct GliderLinearDebugDump {
+        matrix_dimension: usize,
+        x_dimension: usize,
+        inequality_dimension: usize,
+        equality_dimension: usize,
+        p_offset: usize,
+        lambda_offset: usize,
+        z_offset: usize,
+        col_ptrs: Vec<usize>,
+        row_indices: Vec<usize>,
+        values: Vec<f64>,
+        rhs: Vec<f64>,
+        slack: Vec<f64>,
+        multipliers: Vec<f64>,
+    }
+
+    #[derive(Debug)]
+    struct ExactAugmentedReplay {
+        factor_time: Duration,
+        solve_time: Duration,
+        residual_inf: f64,
+        solution_inf: f64,
+        solution: Vec<f64>,
+        inertia: String,
+    }
+
+    #[derive(Debug)]
+    struct AugmentedStepBlocks {
+        dx: Vec<f64>,
+        ds: Vec<f64>,
+        d_lambda: Vec<f64>,
+        dz: Vec<f64>,
+        p: Vec<f64>,
+    }
+
+    fn parse_dump_value<T>(text: &str, prefix: &str) -> T
+    where
+        T: std::str::FromStr,
+        T::Err: std::fmt::Debug,
+    {
+        text.lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .expect("expected dump key to be present")
+            .parse::<T>()
+            .expect("expected dump scalar to parse")
+    }
+
+    fn parse_dump_vec<T>(text: &str, prefix: &str) -> Vec<T>
+    where
+        T: DeserializeOwned,
+    {
+        let value = text
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .expect("expected dump vector to be present");
+        serde_json::from_str(value).expect("expected dump vector to parse")
+    }
+
+    fn load_glider_linear_debug_dump(path: &Path) -> GliderLinearDebugDump {
+        let text = fs::read_to_string(path).expect("expected linear debug dump to exist");
+        GliderLinearDebugDump {
+            matrix_dimension: parse_dump_value(&text, "matrix_dimension="),
+            x_dimension: parse_dump_value(&text, "x_dimension="),
+            inequality_dimension: parse_dump_value(&text, "inequality_dimension="),
+            equality_dimension: parse_dump_value(&text, "equality_dimension="),
+            p_offset: parse_dump_value(&text, "p_offset="),
+            lambda_offset: parse_dump_value(&text, "lambda_offset="),
+            z_offset: parse_dump_value(&text, "z_offset="),
+            col_ptrs: parse_dump_vec(&text, "col_ptrs="),
+            row_indices: parse_dump_vec(&text, "row_indices="),
+            values: parse_dump_vec(&text, "values="),
+            rhs: parse_dump_vec(&text, "rhs="),
+            slack: parse_dump_vec(&text, "slack="),
+            multipliers: parse_dump_vec(&text, "multipliers="),
+        }
+    }
+
+    fn symmetric_lower_csc_mat_vec(dump: &GliderLinearDebugDump, x: &[f64]) -> Vec<f64> {
+        let mut y = vec![0.0; dump.matrix_dimension];
+        for col in 0..dump.matrix_dimension {
+            for idx in dump.col_ptrs[col]..dump.col_ptrs[col + 1] {
+                let row = dump.row_indices[idx];
+                let value = dump.values[idx];
+                y[row] += value * x[col];
+                if row != col {
+                    y[col] += value * x[row];
+                }
+            }
+        }
+        y
+    }
+
+    fn residual_inf(dump: &GliderLinearDebugDump, solution: &[f64]) -> f64 {
+        symmetric_lower_csc_mat_vec(dump, solution)
+            .into_iter()
+            .zip(dump.rhs.iter().copied())
+            .map(|(lhs, rhs)| (rhs - lhs).abs())
+            .fold(0.0_f64, f64::max)
+    }
+
+    fn residual_vector(dump: &GliderLinearDebugDump, solution: &[f64]) -> Vec<f64> {
+        symmetric_lower_csc_mat_vec(dump, solution)
+            .into_iter()
+            .zip(dump.rhs.iter().copied())
+            .map(|(lhs, rhs)| rhs - lhs)
+            .collect::<Vec<_>>()
+    }
+
+    fn solution_inf(solution: &[f64]) -> f64 {
+        solution
+            .iter()
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()))
+    }
+
+    fn delta_inf(lhs: &[f64], rhs: &[f64]) -> f64 {
+        lhs.iter()
+            .zip(rhs.iter())
+            .map(|(lhs_i, rhs_i)| (lhs_i - rhs_i).abs())
+            .fold(0.0_f64, f64::max)
+    }
+
+    fn sorted_glider_dump_paths(dir: &Path) -> Vec<std::path::PathBuf> {
+        let mut paths = fs::read_dir(dir)
+            .expect("dump directory should be readable")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("nlip_kkt_iter_") && name.ends_with(".txt")
+                    })
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    fn augmented_step_blocks(
+        dump: &GliderLinearDebugDump,
+        solution: &[f64],
+    ) -> AugmentedStepBlocks {
+        let dx = solution[..dump.x_dimension].to_vec();
+        let p = solution[dump.p_offset..dump.p_offset + dump.inequality_dimension].to_vec();
+        let d_lambda =
+            solution[dump.lambda_offset..dump.lambda_offset + dump.equality_dimension].to_vec();
+        let dz = solution[dump.z_offset..dump.z_offset + dump.inequality_dimension].to_vec();
+        let ds = p
+            .iter()
+            .zip(dump.slack.iter())
+            .zip(dump.multipliers.iter())
+            .map(|((p_i, slack_i), multiplier_i)| {
+                let scaling = (slack_i.max(1e-16) / multiplier_i.max(1e-16)).sqrt();
+                p_i * scaling
+            })
+            .collect::<Vec<_>>();
+        AugmentedStepBlocks {
+            dx,
+            ds,
+            d_lambda,
+            dz,
+            p,
+        }
+    }
+
+    fn replay_rust_augmented_spral(dump: &GliderLinearDebugDump) -> ExactAugmentedReplay {
+        let structure = SymmetricCscMatrix::new(
+            dump.matrix_dimension,
+            &dump.col_ptrs,
+            &dump.row_indices,
+            None,
+        )
+        .expect("dumped augmented CSC should validate");
+        let numeric = SymmetricCscMatrix::new(
+            dump.matrix_dimension,
+            &dump.col_ptrs,
+            &dump.row_indices,
+            Some(&dump.values),
+        )
+        .expect("dumped augmented CSC values should validate");
+        let (symbolic, _) = spral_analyse(
+            structure,
+            &SsidsOptions {
+                ordering: OrderingStrategy::ApproximateMinimumDegree,
+            },
+        )
+        .expect("rust spral analyse should succeed on dumped KKT");
+        let factor_started = Instant::now();
+        let (factor, _) = spral_factorize(numeric, &symbolic, &NumericFactorOptions::default())
+            .expect("rust spral factorization should succeed on dumped KKT");
+        let factor_time = factor_started.elapsed();
+        let solve_started = Instant::now();
+        let mut solution = factor
+            .solve(&dump.rhs)
+            .expect("rust spral solve should succeed on dumped KKT");
+        let mut solve_time = solve_started.elapsed();
+        for _ in 0..10 {
+            let residual = residual_vector(dump, &solution);
+            if residual.iter().all(|value| value.abs() <= f64::EPSILON) {
+                break;
+            }
+            let correction_started = Instant::now();
+            let correction = factor
+                .solve(&residual)
+                .expect("rust spral iterative refinement should succeed on dumped KKT");
+            solve_time += correction_started.elapsed();
+            for (solution_i, correction_i) in solution.iter_mut().zip(correction.iter()) {
+                *solution_i += correction_i;
+            }
+        }
+        ExactAugmentedReplay {
+            factor_time,
+            solve_time,
+            residual_inf: residual_inf(dump, &solution),
+            solution_inf: solution_inf(&solution),
+            solution,
+            inertia: format!("{:?}", factor.inertia()),
+        }
+    }
+
+    fn replay_native_augmented_spral(dump: &GliderLinearDebugDump) -> ExactAugmentedReplay {
+        let structure = SymmetricCscMatrix::new(
+            dump.matrix_dimension,
+            &dump.col_ptrs,
+            &dump.row_indices,
+            None,
+        )
+        .expect("dumped augmented CSC should validate");
+        let numeric = SymmetricCscMatrix::new(
+            dump.matrix_dimension,
+            &dump.col_ptrs,
+            &dump.row_indices,
+            Some(&dump.values),
+        )
+        .expect("dumped augmented CSC values should validate");
+        let native = NativeSpral::load().expect("native SPRAL should be available locally");
+        let mut session = native
+            .analyse(structure)
+            .expect("native spral analyse should succeed on dumped KKT");
+        let factor_started = Instant::now();
+        let factor_info = session
+            .factorize(numeric)
+            .expect("native spral factorization should succeed on dumped KKT");
+        let factor_time = factor_started.elapsed();
+        let solve_started = Instant::now();
+        let mut solution = session
+            .solve(&dump.rhs)
+            .expect("native spral solve should succeed on dumped KKT");
+        let mut solve_time = solve_started.elapsed();
+        for _ in 0..10 {
+            let residual = residual_vector(dump, &solution);
+            if residual.iter().all(|value| value.abs() <= f64::EPSILON) {
+                break;
+            }
+            let correction_started = Instant::now();
+            let correction = session
+                .solve(&residual)
+                .expect("native spral iterative refinement should succeed on dumped KKT");
+            solve_time += correction_started.elapsed();
+            for (solution_i, correction_i) in solution.iter_mut().zip(correction.iter()) {
+                *solution_i += correction_i;
+            }
+        }
+        ExactAugmentedReplay {
+            factor_time,
+            solve_time,
+            residual_inf: residual_inf(dump, &solution),
+            solution_inf: solution_inf(&solution),
+            solution,
+            inertia: format!("{:?}", factor_info.inertia),
+        }
+    }
+
+    fn native_spral_debug_result(
+        report: &optimization::InteriorPointLinearDebugReport,
+    ) -> &optimization::InteriorPointLinearDebugBackendResult {
+        report
+            .results
+            .iter()
+            .find(|result| {
+                result.solver == optimization::InteriorPointLinearSolver::NativeSpralSsids
+            })
+            .expect("expected native SPRAL comparison result")
+    }
 
     #[test]
     fn glider_runtime_scaling_defaults_match_problem_tuning() {
@@ -1745,6 +2039,810 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual NLIP KKT compare helper"]
+    fn print_current_glider_nlip_linear_debug_compare() {
+        let params = Params {
+            launch_speed_mps: 30.0,
+            initial_alpha_deg: 6.0,
+            max_alpha_rate_deg_s: 12.0,
+            solver_method: SolverMethod::Nlip,
+            ..Params::default()
+        };
+        let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
+            .expect("glider direct collocation should compile");
+        let compiled = compiled.compiled.borrow();
+        let runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+        let mut options = crate::common::nlip_options(&params.solver);
+        options.max_iters = 120;
+        options.acceptable_iter = 0;
+        options.verbose = false;
+        options.linear_debug = Some(optimization::InteriorPointLinearDebugOptions {
+            compare_solvers: vec![
+                optimization::InteriorPointLinearSolver::NativeSpralSsids,
+                optimization::InteriorPointLinearSolver::SparseQdldl,
+            ],
+            schedule: optimization::InteriorPointLinearDebugSchedule::EveryIteration,
+            dump_dir: None,
+        });
+
+        let mut first_divergence = None;
+        let result = compiled.solve_interior_point_with_callback(&runtime, &options, |snapshot| {
+            let solver = &snapshot.solver;
+            if let Some(report) = solver.linear_debug.as_ref() {
+                println!(
+                    "iter={} phase={:?} verdict={:?} primary={} obj={:.3e} eq_inf={:?} ineq_inf={:?} dual_inf={:.3e} comp_inf={:?}",
+                    solver.iteration,
+                    solver.phase,
+                    report.verdict,
+                    report.primary_solver.label(),
+                    solver.objective,
+                    solver.eq_inf,
+                    solver.ineq_inf,
+                    solver.dual_inf,
+                    solver.comp_inf,
+                );
+                for result in &report.results {
+                    println!(
+                        "  solver={} success={} inertia={:?} residual={:?} step_inf={:?} factor_time={:?} solve_time={:?} step_delta={:?} dx_delta={:?} dlambda_delta={:?} ds_delta={:?} dz_delta={:?} detail={:?}",
+                        result.solver.label(),
+                        result.success,
+                        result.inertia,
+                        result.residual_inf,
+                        result.step_inf,
+                        result.factorization_time,
+                        result.solve_time,
+                        result.step_delta_inf,
+                        result.dx_delta_inf,
+                        result.d_lambda_delta_inf,
+                        result.ds_delta_inf,
+                        result.dz_delta_inf,
+                        result.detail,
+                    );
+                }
+                for note in &report.notes {
+                    println!("  note={note}");
+                }
+                if first_divergence.is_none()
+                    && !matches!(
+                        report.verdict,
+                        optimization::InteriorPointLinearDebugVerdict::Consistent
+                    )
+                {
+                    first_divergence = Some((
+                        solver.iteration,
+                        solver.phase,
+                        report.verdict,
+                        report.results.clone(),
+                        report.notes.clone(),
+                    ));
+                }
+            }
+        });
+
+        println!("\n=== glider NLIP linear-debug compare ===");
+        match &result {
+            Ok(summary) => {
+                println!(
+                    "result: Ok(iterations={} termination={:?} objective={:.6e})",
+                    summary.solver.iterations, summary.solver.termination, summary.solver.objective
+                );
+            }
+            Err(err) => println!("result: Err({err})"),
+        }
+        if let Some((iteration, phase, verdict, results, notes)) = first_divergence {
+            println!(
+                "first divergence: iter={} phase={:?} verdict={:?}",
+                iteration, phase, verdict
+            );
+            for result in results {
+                println!(
+                    "  {} success={} inertia={:?} residual={:?} step_delta={:?} detail={:?}",
+                    result.solver.label(),
+                    result.success,
+                    result.inertia,
+                    result.residual_inf,
+                    result.step_delta_inf,
+                    result.detail,
+                );
+            }
+            for note in notes {
+                println!("  note={note}");
+            }
+        } else {
+            println!("no linear-solver divergence detected before termination");
+        }
+    }
+
+    #[test]
+    #[ignore = "manual NLIP native-vs-QDLDL compare helper"]
+    fn print_current_glider_nlip_native_vs_qdldl_compare() {
+        let params = Params {
+            launch_speed_mps: 30.0,
+            initial_alpha_deg: 6.0,
+            max_alpha_rate_deg_s: 12.0,
+            solver_method: SolverMethod::Nlip,
+            ..Params::default()
+        };
+        let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
+            .expect("glider direct collocation should compile");
+        let compiled = compiled.compiled.borrow();
+        let runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+        let mut options = crate::common::nlip_options(&params.solver);
+        options.linear_solver = optimization::InteriorPointLinearSolver::NativeSpralSsids;
+        options.max_iters = 120;
+        options.acceptable_iter = 0;
+        options.verbose = false;
+        options.linear_debug = Some(optimization::InteriorPointLinearDebugOptions {
+            compare_solvers: vec![optimization::InteriorPointLinearSolver::SparseQdldl],
+            schedule: optimization::InteriorPointLinearDebugSchedule::EveryIteration,
+            dump_dir: None,
+        });
+
+        let mut first_divergence = None;
+        let result = compiled.solve_interior_point_with_callback(&runtime, &options, |snapshot| {
+            let solver = &snapshot.solver;
+            if let Some(report) = solver.linear_debug.as_ref() {
+                println!(
+                    "iter={} phase={:?} verdict={:?} primary={} obj={:.3e} eq_inf={:?} ineq_inf={:?} dual_inf={:.3e} comp_inf={:?}",
+                    solver.iteration,
+                    solver.phase,
+                    report.verdict,
+                    report.primary_solver.label(),
+                    solver.objective,
+                    solver.eq_inf,
+                    solver.ineq_inf,
+                    solver.dual_inf,
+                    solver.comp_inf,
+                );
+                for result in &report.results {
+                    println!(
+                        "  solver={} success={} inertia={:?} residual={:?} step_inf={:?} factor_time={:?} solve_time={:?} step_delta={:?} dx_delta={:?} dlambda_delta={:?} ds_delta={:?} dz_delta={:?} detail={:?}",
+                        result.solver.label(),
+                        result.success,
+                        result.inertia,
+                        result.residual_inf,
+                        result.step_inf,
+                        result.factorization_time,
+                        result.solve_time,
+                        result.step_delta_inf,
+                        result.dx_delta_inf,
+                        result.d_lambda_delta_inf,
+                        result.ds_delta_inf,
+                        result.dz_delta_inf,
+                        result.detail,
+                    );
+                }
+                for note in &report.notes {
+                    println!("  note={note}");
+                }
+                if first_divergence.is_none()
+                    && !matches!(
+                        report.verdict,
+                        optimization::InteriorPointLinearDebugVerdict::Consistent
+                    )
+                {
+                    first_divergence = Some((
+                        solver.iteration,
+                        solver.phase,
+                        report.verdict,
+                        report.results.clone(),
+                        report.notes.clone(),
+                    ));
+                }
+            }
+        });
+
+        println!("\n=== glider NLIP native-vs-QDLDL compare ===");
+        match &result {
+            Ok(summary) => {
+                println!(
+                    "result: Ok(iterations={} termination={:?} objective={:.6e})",
+                    summary.solver.iterations, summary.solver.termination, summary.solver.objective
+                );
+            }
+            Err(err) => println!("result: Err({err})"),
+        }
+        if let Some((iteration, phase, verdict, results, notes)) = first_divergence {
+            println!(
+                "first divergence: iter={} phase={:?} verdict={:?}",
+                iteration, phase, verdict
+            );
+            for result in results {
+                println!(
+                    "  {} success={} inertia={:?} residual={:?} step_delta={:?} detail={:?}",
+                    result.solver.label(),
+                    result.success,
+                    result.inertia,
+                    result.residual_inf,
+                    result.step_delta_inf,
+                    result.detail,
+                );
+            }
+            for note in notes {
+                println!("  note={note}");
+            }
+        } else {
+            println!("no linear-solver divergence detected before termination");
+        }
+    }
+
+    #[test]
+    #[ignore = "manual NLIP iteration-0 augmented replay helper"]
+    fn print_current_glider_nlip_iteration0_augmented_compare() {
+        let params = Params {
+            launch_speed_mps: 30.0,
+            initial_alpha_deg: 6.0,
+            max_alpha_rate_deg_s: 12.0,
+            solver_method: SolverMethod::Nlip,
+            ..Params::default()
+        };
+        let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
+            .expect("glider direct collocation should compile");
+        let compiled = compiled.compiled.borrow();
+        let runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+        let dump_dir = TempDir::new().expect("temp dump dir should create");
+        let mut options = crate::common::nlip_options(&params.solver);
+        options.linear_solver = optimization::InteriorPointLinearSolver::SpralSsids;
+        options.max_iters = 1;
+        options.acceptable_iter = 0;
+        options.verbose = false;
+        options.linear_debug = Some(optimization::InteriorPointLinearDebugOptions {
+            compare_solvers: vec![
+                optimization::InteriorPointLinearSolver::NativeSpralSsids,
+                optimization::InteriorPointLinearSolver::SparseQdldl,
+            ],
+            schedule: optimization::InteriorPointLinearDebugSchedule::FirstIteration,
+            dump_dir: Some(dump_dir.path().to_path_buf()),
+        });
+
+        let mut first_report = None;
+        let result = compiled.solve_interior_point_with_callback(&runtime, &options, |snapshot| {
+            if first_report.is_none() {
+                first_report = snapshot.solver.linear_debug.clone();
+            }
+        });
+
+        let dump = load_glider_linear_debug_dump(&dump_dir.path().join("nlip_kkt_iter_0000.txt"));
+        let rust_exact = replay_rust_augmented_spral(&dump);
+        let native_exact = replay_native_augmented_spral(&dump);
+        let rust_blocks = augmented_step_blocks(&dump, &rust_exact.solution);
+        let native_blocks = augmented_step_blocks(&dump, &native_exact.solution);
+        let report = first_report.expect("expected first iteration linear debug report");
+
+        println!("\n=== glider NLIP iteration-0 augmented replay ===");
+        match &result {
+            Ok(summary) => {
+                println!(
+                    "result: Ok(iterations={} termination={:?} objective={:.6e})",
+                    summary.solver.iterations, summary.solver.termination, summary.solver.objective
+                );
+            }
+            Err(err) => println!("result: Err({err})"),
+        }
+
+        println!("live compare results:");
+        for result in &report.results {
+            println!(
+                "  solver={} success={} inertia={:?} residual={:?} step_inf={:?} factor_time={:?} solve_time={:?} step_delta={:?} dx_delta={:?} dlambda_delta={:?} ds_delta={:?} dz_delta={:?}",
+                result.solver.label(),
+                result.success,
+                result.inertia,
+                result.residual_inf,
+                result.step_inf,
+                result.factorization_time,
+                result.solve_time,
+                result.step_delta_inf,
+                result.dx_delta_inf,
+                result.d_lambda_delta_inf,
+                result.ds_delta_inf,
+                result.dz_delta_inf,
+            );
+        }
+
+        println!("exact augmented replay:");
+        println!(
+            "  rust_spral factor={:?} solve={:?} residual={:.3e} solution_inf={:.3e} inertia={}",
+            rust_exact.factor_time,
+            rust_exact.solve_time,
+            rust_exact.residual_inf,
+            rust_exact.solution_inf,
+            rust_exact.inertia,
+        );
+        println!(
+            "  native_spral factor={:?} solve={:?} residual={:.3e} solution_inf={:.3e} inertia={}",
+            native_exact.factor_time,
+            native_exact.solve_time,
+            native_exact.residual_inf,
+            native_exact.solution_inf,
+            native_exact.inertia,
+        );
+        println!(
+            "  augmented deltas: solution={:.6e} dx={:.6e} dp={:.6e} ds={:.6e} dlambda={:.6e} dz={:.6e}",
+            delta_inf(&rust_exact.solution, &native_exact.solution),
+            delta_inf(&rust_blocks.dx, &native_blocks.dx),
+            delta_inf(&rust_blocks.p, &native_blocks.p),
+            delta_inf(&rust_blocks.ds, &native_blocks.ds),
+            delta_inf(&rust_blocks.d_lambda, &native_blocks.d_lambda),
+            delta_inf(&rust_blocks.dz, &native_blocks.dz),
+        );
+    }
+
+    #[test]
+    #[ignore = "manual release-oriented native-vs-rust SPRAL parity check"]
+    fn glider_native_spral_matches_rust_spral_extremely_closely() {
+        if NativeSpral::load().is_err() {
+            eprintln!("skipping glider native SPRAL parity test: library unavailable");
+            return;
+        }
+
+        let params = Params {
+            launch_speed_mps: 30.0,
+            initial_alpha_deg: 6.0,
+            max_alpha_rate_deg_s: 12.0,
+            solver_method: SolverMethod::Nlip,
+            ..Params::default()
+        };
+        let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
+            .expect("glider direct collocation should compile");
+        let compiled = compiled.compiled.borrow();
+        let runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+        let mut options = crate::common::nlip_options(&params.solver);
+        options.max_iters = 10;
+        options.acceptable_iter = 0;
+        options.verbose = false;
+        options.linear_debug = Some(optimization::InteriorPointLinearDebugOptions {
+            compare_solvers: vec![optimization::InteriorPointLinearSolver::NativeSpralSsids],
+            schedule: optimization::InteriorPointLinearDebugSchedule::EveryIteration,
+            dump_dir: None,
+        });
+
+        let mut reports = Vec::new();
+        let _ = compiled.solve_interior_point_with_callback(&runtime, &options, |snapshot| {
+            if let Some(report) = snapshot.solver.linear_debug.clone() {
+                reports.push(report);
+            }
+        });
+
+        assert!(
+            !reports.is_empty(),
+            "expected glider run to emit native SPRAL comparison reports"
+        );
+        for report in &reports {
+            assert_eq!(
+                report.primary_solver,
+                optimization::InteriorPointLinearSolver::SpralSsids
+            );
+            assert_eq!(
+                report.schedule,
+                optimization::InteriorPointLinearDebugSchedule::EveryIteration
+            );
+            assert_eq!(report.results.len(), 2);
+            let native = native_spral_debug_result(report);
+            assert!(native.success, "native SPRAL comparison failed: {native:?}");
+            assert!(
+                native
+                    .residual_inf
+                    .expect("native residual should be present")
+                    <= 1e-9,
+                "native residual too large: {native:?}"
+            );
+            assert!(
+                native.step_delta_inf.expect("step delta should be present") <= 5e-9,
+                "native-vs-rust step delta too large: {native:?}"
+            );
+            assert!(
+                native.dx_delta_inf.expect("dx delta should be present") <= 1e-9,
+                "native-vs-rust dx delta too large: {native:?}"
+            );
+            assert!(
+                native
+                    .d_lambda_delta_inf
+                    .expect("dlambda delta should be present")
+                    <= 5e-9,
+                "native-vs-rust dlambda delta too large: {native:?}"
+            );
+            assert!(
+                native.ds_delta_inf.expect("ds delta should be present") <= 1e-9,
+                "native-vs-rust ds delta too large: {native:?}"
+            );
+            assert!(
+                native.dz_delta_inf.expect("dz delta should be present") <= 1e-9,
+                "native-vs-rust dz delta too large: {native:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release-oriented exact augmented parity check"]
+    fn glider_native_spral_exact_augmented_replay_matches_rust_to_machine_precision() {
+        if NativeSpral::load().is_err() {
+            eprintln!("skipping glider augmented SPRAL parity test: library unavailable");
+            return;
+        }
+
+        let params = Params {
+            launch_speed_mps: 30.0,
+            initial_alpha_deg: 6.0,
+            max_alpha_rate_deg_s: 12.0,
+            solver_method: SolverMethod::Nlip,
+            ..Params::default()
+        };
+        let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
+            .expect("glider direct collocation should compile");
+        let compiled = compiled.compiled.borrow();
+        let runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+        let dump_dir = TempDir::new().expect("temp dump dir should create");
+        let mut options = crate::common::nlip_options(&params.solver);
+        options.linear_solver = optimization::InteriorPointLinearSolver::SpralSsids;
+        options.max_iters = 1;
+        options.acceptable_iter = 0;
+        options.verbose = false;
+        options.linear_debug = Some(optimization::InteriorPointLinearDebugOptions {
+            compare_solvers: vec![optimization::InteriorPointLinearSolver::NativeSpralSsids],
+            schedule: optimization::InteriorPointLinearDebugSchedule::FirstIteration,
+            dump_dir: Some(dump_dir.path().to_path_buf()),
+        });
+
+        let _ = compiled.solve_interior_point_with_callback(&runtime, &options, |_snapshot| {});
+
+        let dump = load_glider_linear_debug_dump(&dump_dir.path().join("nlip_kkt_iter_0000.txt"));
+        let rust_exact = replay_rust_augmented_spral(&dump);
+        let native_exact = replay_native_augmented_spral(&dump);
+        let rust_blocks = augmented_step_blocks(&dump, &rust_exact.solution);
+        let native_blocks = augmented_step_blocks(&dump, &native_exact.solution);
+
+        assert!(
+            rust_exact.residual_inf <= 1e-12,
+            "rust residual too large: {rust_exact:?}"
+        );
+        assert!(
+            native_exact.residual_inf <= 1e-12,
+            "native residual too large: {native_exact:?}"
+        );
+        assert_eq!(rust_exact.inertia, native_exact.inertia);
+        assert!(
+            delta_inf(&rust_exact.solution, &native_exact.solution) <= 1e-12,
+            "augmented solution delta too large"
+        );
+        assert!(
+            delta_inf(&rust_blocks.dx, &native_blocks.dx) <= 1e-12,
+            "dx delta too large"
+        );
+        assert!(
+            delta_inf(&rust_blocks.p, &native_blocks.p) <= 1e-12,
+            "dp delta too large"
+        );
+        assert!(
+            delta_inf(&rust_blocks.ds, &native_blocks.ds) <= 1e-12,
+            "ds delta too large"
+        );
+        assert!(
+            delta_inf(&rust_blocks.d_lambda, &native_blocks.d_lambda) <= 1e-12,
+            "dlambda delta too large"
+        );
+        assert!(
+            delta_inf(&rust_blocks.dz, &native_blocks.dz) <= 1e-12,
+            "dz delta too large"
+        );
+    }
+
+    #[test]
+    #[ignore = "manual release-oriented exact augmented parity sweep"]
+    fn glider_native_spral_exact_augmented_replay_matches_each_dump_extremely_closely() {
+        if NativeSpral::load().is_err() {
+            eprintln!("skipping glider augmented SPRAL parity sweep: library unavailable");
+            return;
+        }
+
+        let params = Params {
+            launch_speed_mps: 30.0,
+            initial_alpha_deg: 6.0,
+            max_alpha_rate_deg_s: 12.0,
+            solver_method: SolverMethod::Nlip,
+            ..Params::default()
+        };
+        let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
+            .expect("glider direct collocation should compile");
+        let compiled = compiled.compiled.borrow();
+        let runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+        let dump_dir = TempDir::new().expect("temp dump dir should create");
+        let mut options = crate::common::nlip_options(&params.solver);
+        options.linear_solver = optimization::InteriorPointLinearSolver::SpralSsids;
+        options.max_iters = 10;
+        options.acceptable_iter = 0;
+        options.verbose = false;
+        options.linear_debug = Some(optimization::InteriorPointLinearDebugOptions {
+            compare_solvers: vec![optimization::InteriorPointLinearSolver::NativeSpralSsids],
+            schedule: optimization::InteriorPointLinearDebugSchedule::EveryIteration,
+            dump_dir: Some(dump_dir.path().to_path_buf()),
+        });
+
+        let mut reports = Vec::new();
+        let _ = compiled.solve_interior_point_with_callback(&runtime, &options, |snapshot| {
+            if let Some(report) = snapshot.solver.linear_debug.clone() {
+                reports.push(report);
+            }
+        });
+
+        assert!(
+            !reports.is_empty(),
+            "expected glider run to emit native SPRAL comparison reports"
+        );
+        let dump_paths = sorted_glider_dump_paths(dump_dir.path());
+        assert_eq!(
+            dump_paths.len(),
+            reports.len(),
+            "expected one dumped KKT snapshot per glider linear-debug report"
+        );
+
+        for dump_path in dump_paths {
+            let dump = load_glider_linear_debug_dump(&dump_path);
+            let rust_exact = replay_rust_augmented_spral(&dump);
+            let native_exact = replay_native_augmented_spral(&dump);
+            let rust_blocks = augmented_step_blocks(&dump, &rust_exact.solution);
+            let native_blocks = augmented_step_blocks(&dump, &native_exact.solution);
+            let solution_delta = delta_inf(&rust_exact.solution, &native_exact.solution);
+            let dx_delta = delta_inf(&rust_blocks.dx, &native_blocks.dx);
+            let p_delta = delta_inf(&rust_blocks.p, &native_blocks.p);
+            let ds_delta = delta_inf(&rust_blocks.ds, &native_blocks.ds);
+            let dlambda_delta = delta_inf(&rust_blocks.d_lambda, &native_blocks.d_lambda);
+            let dz_delta = delta_inf(&rust_blocks.dz, &native_blocks.dz);
+
+            assert!(
+                rust_exact.residual_inf <= 5e-10,
+                "rust residual too large for {}: {:?}",
+                dump_path.display(),
+                rust_exact
+            );
+            assert!(
+                native_exact.residual_inf <= 5e-10,
+                "native residual too large for {}: {:?}",
+                dump_path.display(),
+                native_exact
+            );
+            assert_eq!(rust_exact.inertia, native_exact.inertia);
+            assert!(
+                solution_delta <= 1e-10,
+                "augmented solution delta too large for {}",
+                dump_path.display()
+            );
+            assert!(
+                dx_delta <= 1e-10,
+                "dx delta too large for {}",
+                dump_path.display()
+            );
+            assert!(
+                p_delta <= 1e-10,
+                "dp delta too large for {}",
+                dump_path.display()
+            );
+            assert!(
+                ds_delta <= 1e-10,
+                "ds delta too large for {}",
+                dump_path.display()
+            );
+            assert!(
+                dlambda_delta <= 1e-10,
+                "dlambda delta too large for {}",
+                dump_path.display()
+            );
+            assert!(
+                dz_delta <= 1e-10,
+                "dz delta too large for {}",
+                dump_path.display()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release-oriented exact augmented refactorization sweep"]
+    fn glider_native_spral_exact_augmented_refactorize_sequence_matches_each_dump_extremely_closely()
+     {
+        if NativeSpral::load().is_err() {
+            eprintln!("skipping glider augmented SPRAL refactorization sweep: library unavailable");
+            return;
+        }
+
+        let params = Params {
+            launch_speed_mps: 30.0,
+            initial_alpha_deg: 6.0,
+            max_alpha_rate_deg_s: 12.0,
+            solver_method: SolverMethod::Nlip,
+            ..Params::default()
+        };
+        let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
+            .expect("glider direct collocation should compile");
+        let compiled = compiled.compiled.borrow();
+        let runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+        let dump_dir = TempDir::new().expect("temp dump dir should create");
+        let mut options = crate::common::nlip_options(&params.solver);
+        options.linear_solver = optimization::InteriorPointLinearSolver::SpralSsids;
+        options.max_iters = 10;
+        options.acceptable_iter = 0;
+        options.verbose = false;
+        options.linear_debug = Some(optimization::InteriorPointLinearDebugOptions {
+            compare_solvers: vec![optimization::InteriorPointLinearSolver::NativeSpralSsids],
+            schedule: optimization::InteriorPointLinearDebugSchedule::EveryIteration,
+            dump_dir: Some(dump_dir.path().to_path_buf()),
+        });
+
+        let mut reports = Vec::new();
+        let _ = compiled.solve_interior_point_with_callback(&runtime, &options, |snapshot| {
+            if let Some(report) = snapshot.solver.linear_debug.clone() {
+                reports.push(report);
+            }
+        });
+
+        assert!(
+            !reports.is_empty(),
+            "expected glider run to emit native SPRAL comparison reports"
+        );
+        let dump_paths = sorted_glider_dump_paths(dump_dir.path());
+        assert_eq!(
+            dump_paths.len(),
+            reports.len(),
+            "expected one dumped KKT snapshot per glider linear-debug report"
+        );
+
+        let first_dump = load_glider_linear_debug_dump(&dump_paths[0]);
+        let first_structure = SymmetricCscMatrix::new(
+            first_dump.matrix_dimension,
+            &first_dump.col_ptrs,
+            &first_dump.row_indices,
+            None,
+        )
+        .expect("first dumped augmented CSC should validate");
+        let first_numeric = SymmetricCscMatrix::new(
+            first_dump.matrix_dimension,
+            &first_dump.col_ptrs,
+            &first_dump.row_indices,
+            Some(&first_dump.values),
+        )
+        .expect("first dumped augmented CSC values should validate");
+        let (symbolic, _) = spral_analyse(
+            first_structure,
+            &SsidsOptions {
+                ordering: OrderingStrategy::ApproximateMinimumDegree,
+            },
+        )
+        .expect("rust spral analyse should succeed on first dumped KKT");
+        let (mut rust_factor, _) =
+            spral_factorize(first_numeric, &symbolic, &NumericFactorOptions::default())
+                .expect("rust spral factorization should succeed on first dumped KKT");
+
+        let native = NativeSpral::load().expect("native SPRAL should be available locally");
+        let mut native_session = native
+            .analyse(
+                SymmetricCscMatrix::new(
+                    first_dump.matrix_dimension,
+                    &first_dump.col_ptrs,
+                    &first_dump.row_indices,
+                    None,
+                )
+                .expect("first dumped native structure should validate"),
+            )
+            .expect("native spral analyse should succeed on first dumped KKT");
+        native_session
+            .factorize(
+                SymmetricCscMatrix::new(
+                    first_dump.matrix_dimension,
+                    &first_dump.col_ptrs,
+                    &first_dump.row_indices,
+                    Some(&first_dump.values),
+                )
+                .expect("first dumped native numeric matrix should validate"),
+            )
+            .expect("native spral factorization should succeed on first dumped KKT");
+
+        for (index, dump_path) in dump_paths.iter().enumerate() {
+            let dump = load_glider_linear_debug_dump(dump_path);
+            let numeric = SymmetricCscMatrix::new(
+                dump.matrix_dimension,
+                &dump.col_ptrs,
+                &dump.row_indices,
+                Some(&dump.values),
+            )
+            .expect("dumped augmented CSC values should validate");
+
+            if index > 0 {
+                rust_factor
+                    .refactorize(numeric)
+                    .expect("rust spral refactorization should succeed on dumped KKT");
+                native_session
+                    .refactorize(numeric)
+                    .expect("native spral refactorization should succeed on dumped KKT");
+            }
+
+            let mut rust_solution = rust_factor
+                .solve(&dump.rhs)
+                .expect("rust spral solve should succeed on dumped KKT");
+            for _ in 0..10 {
+                let residual = residual_vector(&dump, &rust_solution);
+                if residual.iter().all(|value| value.abs() <= f64::EPSILON) {
+                    break;
+                }
+                let correction = rust_factor
+                    .solve(&residual)
+                    .expect("rust spral iterative refinement should succeed on dumped KKT");
+                for (solution_i, correction_i) in rust_solution.iter_mut().zip(correction.iter()) {
+                    *solution_i += correction_i;
+                }
+            }
+
+            let mut native_solution = native_session
+                .solve(&dump.rhs)
+                .expect("native spral solve should succeed on dumped KKT");
+            for _ in 0..10 {
+                let residual = residual_vector(&dump, &native_solution);
+                if residual.iter().all(|value| value.abs() <= f64::EPSILON) {
+                    break;
+                }
+                let correction = native_session
+                    .solve(&residual)
+                    .expect("native spral iterative refinement should succeed on dumped KKT");
+                for (solution_i, correction_i) in native_solution.iter_mut().zip(correction.iter())
+                {
+                    *solution_i += correction_i;
+                }
+            }
+
+            let rust_blocks = augmented_step_blocks(&dump, &rust_solution);
+            let native_blocks = augmented_step_blocks(&dump, &native_solution);
+            let solution_delta = delta_inf(&rust_solution, &native_solution);
+            let dx_delta = delta_inf(&rust_blocks.dx, &native_blocks.dx);
+            let p_delta = delta_inf(&rust_blocks.p, &native_blocks.p);
+            let ds_delta = delta_inf(&rust_blocks.ds, &native_blocks.ds);
+            let dlambda_delta = delta_inf(&rust_blocks.d_lambda, &native_blocks.d_lambda);
+            let dz_delta = delta_inf(&rust_blocks.dz, &native_blocks.dz);
+
+            assert!(
+                residual_inf(&dump, &rust_solution) <= 1e-8,
+                "rust residual too large for {}",
+                dump_path.display()
+            );
+            assert!(
+                residual_inf(&dump, &native_solution) <= 1e-8,
+                "native residual too large for {}",
+                dump_path.display()
+            );
+            assert_eq!(
+                rust_factor.inertia(),
+                native_session.factor_info().expect("factor info").inertia
+            );
+            assert!(
+                solution_delta <= 1e-10,
+                "augmented solution delta too large for {}",
+                dump_path.display()
+            );
+            assert!(
+                dx_delta <= 1e-10,
+                "dx delta too large for {}",
+                dump_path.display()
+            );
+            assert!(
+                p_delta <= 1e-10,
+                "dp delta too large for {}",
+                dump_path.display()
+            );
+            assert!(
+                ds_delta <= 1e-10,
+                "ds delta too large for {}",
+                dump_path.display()
+            );
+            assert!(
+                dlambda_delta <= 1e-10,
+                "dlambda delta too large for {}",
+                dump_path.display()
+            );
+            assert!(
+                dz_delta <= 1e-10,
+                "dz delta too large for {}",
+                dump_path.display()
+            );
         }
     }
 

@@ -4366,13 +4366,19 @@ fn solver_globalization_choices() -> Vec<(f64, &'static str)> {
 fn nlip_linear_solver_value(solver: InteriorPointLinearSolver) -> f64 {
     match solver {
         InteriorPointLinearSolver::SpralSsids => 0.0,
-        InteriorPointLinearSolver::SparseQdldl => 1.0,
-        InteriorPointLinearSolver::Auto => 2.0,
+        InteriorPointLinearSolver::NativeSpralSsids => 1.0,
+        InteriorPointLinearSolver::SparseQdldl => 2.0,
+        InteriorPointLinearSolver::Auto => 3.0,
     }
 }
 
 fn nlip_linear_solver_choices() -> Vec<(f64, &'static str)> {
-    vec![(0.0, "SPRAL SSIDS"), (1.0, "QDLDL"), (2.0, "Auto")]
+    vec![
+        (0.0, "SPRAL SSIDS"),
+        (1.0, "Native SPRAL SSIDS"),
+        (2.0, "QDLDL"),
+        (3.0, "Auto"),
+    ]
 }
 
 fn sample_shared_or_default(
@@ -4457,11 +4463,12 @@ pub fn solver_config_from_map(
             nlip_linear_solver_value(default.nlip.linear_solver),
         ),
         SharedControlId::SolverNlipLinearSolver,
-        &[0.0, 1.0, 2.0],
+        &[0.0, 1.0, 2.0, 3.0],
     )? {
         0 => InteriorPointLinearSolver::SpralSsids,
-        1 => InteriorPointLinearSolver::SparseQdldl,
-        2 => InteriorPointLinearSolver::Auto,
+        1 => InteriorPointLinearSolver::NativeSpralSsids,
+        2 => InteriorPointLinearSolver::SparseQdldl,
+        3 => InteriorPointLinearSolver::Auto,
         _ => unreachable!("validated NLIP linear solver choice"),
     };
     let globalization = match parse_enum_choice(
@@ -9314,12 +9321,24 @@ mod tests {
     #[test]
     fn solver_config_from_map_parses_nlip_linear_solver_choice() {
         let mut values = BTreeMap::new();
-        values.insert("solver_nlip_linear_solver".to_string(), 1.0);
+        values.insert("solver_nlip_linear_solver".to_string(), 2.0);
         let parsed = solver_config_from_map(&values, default_solver_config())
             .expect("solver config should parse");
         assert_eq!(
             parsed.nlip.linear_solver,
             InteriorPointLinearSolver::SparseQdldl
+        );
+    }
+
+    #[test]
+    fn solver_config_from_map_parses_native_nlip_linear_solver_choice() {
+        let mut values = BTreeMap::new();
+        values.insert("solver_nlip_linear_solver".to_string(), 1.0);
+        let parsed = solver_config_from_map(&values, default_solver_config())
+            .expect("solver config should parse");
+        assert_eq!(
+            parsed.nlip.linear_solver,
+            InteriorPointLinearSolver::NativeSpralSsids
         );
     }
 

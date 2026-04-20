@@ -1578,6 +1578,7 @@ dependencies = [
  "optimization",
  "serde",
  "serde_json",
+ "spral_ssids",
  "sx_codegen_llvm",
  "sx_core",
  "tempfile",
