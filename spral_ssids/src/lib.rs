@@ -13,7 +13,7 @@ use rayon::prelude::*;
 use thiserror::Error;
 
 pub use native::{
-    NativeSpral, NativeSpralAnalyseInfo, NativeSpralError, NativeSpralFactorInfo,
+    NativeOrdering, NativeSpral, NativeSpralAnalyseInfo, NativeSpralError, NativeSpralFactorInfo,
     NativeSpralSession,
 };
 
@@ -270,6 +270,7 @@ impl Supernode {
 }
 
 const RELAXED_NODE_AMALGAMATION_NEMIN: usize = 32;
+const APP_INNER_BLOCK_SIZE: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SymbolicFactor {
@@ -558,11 +559,31 @@ impl NumericFactor {
             factor_rhs[factor_position] = rhs[self.permutation.perm()[ordered_index]];
         }
 
-        for pivot in 0..self.dimension {
-            let pivot_value = factor_rhs[pivot];
-            for entry in self.lower_col_ptrs[pivot]..self.lower_col_ptrs[pivot + 1] {
-                let row = self.lower_row_indices[entry];
-                factor_rhs[row] -= self.lower_values[entry] * pivot_value;
+        if self.dimension <= APP_INNER_BLOCK_SIZE {
+            let dense_lower = build_dense_unit_lower_from_factor(
+                self.dimension,
+                &self.lower_col_ptrs,
+                &self.lower_row_indices,
+                &self.lower_values,
+            );
+            for row in 0..self.dimension {
+                let mut value = factor_rhs[row];
+                for col in 0..row {
+                    let coefficient = dense_lower[row * self.dimension + col];
+                    if coefficient != 0.0 {
+                        value = (-coefficient).mul_add(factor_rhs[col], value);
+                    }
+                }
+                factor_rhs[row] = value;
+            }
+        } else {
+            for pivot in 0..self.dimension {
+                let pivot_value = factor_rhs[pivot];
+                for entry in self.lower_col_ptrs[pivot]..self.lower_col_ptrs[pivot + 1] {
+                    let row = self.lower_row_indices[entry];
+                    factor_rhs[row] =
+                        (-self.lower_values[entry]).mul_add(pivot_value, factor_rhs[row]);
+                }
             }
         }
 
@@ -607,14 +628,32 @@ impl NumericFactor {
             }
             diagonal_start = end;
         }
-
-        for pivot in (0..self.dimension).rev() {
-            let mut value = factor_rhs[pivot];
-            for entry in self.lower_col_ptrs[pivot]..self.lower_col_ptrs[pivot + 1] {
-                let row = self.lower_row_indices[entry];
-                value -= self.lower_values[entry] * factor_rhs[row];
+        if self.dimension <= APP_INNER_BLOCK_SIZE {
+            let dense_lower = build_dense_unit_lower_from_factor(
+                self.dimension,
+                &self.lower_col_ptrs,
+                &self.lower_row_indices,
+                &self.lower_values,
+            );
+            for row in (0..self.dimension).rev() {
+                let mut dot = 0.0;
+                for col in (row + 1)..self.dimension {
+                    let coefficient = dense_lower[col * self.dimension + row];
+                    if coefficient != 0.0 {
+                        dot = coefficient.mul_add(factor_rhs[col], dot);
+                    }
+                }
+                factor_rhs[row] -= dot;
             }
-            factor_rhs[pivot] = value;
+        } else {
+            for pivot in (0..self.dimension).rev() {
+                let mut dot = 0.0;
+                for entry in self.lower_col_ptrs[pivot]..self.lower_col_ptrs[pivot + 1] {
+                    let row = self.lower_row_indices[entry];
+                    dot = self.lower_values[entry].mul_add(factor_rhs[row], dot);
+                }
+                factor_rhs[pivot] -= dot;
+            }
         }
         if !factor_rhs.iter().all(|value| value.is_finite()) {
             return Err(SsidsError::NumericalBreakdown {
@@ -1518,8 +1557,8 @@ fn tpp_test_two_by_two(
     if maxt.max(maxp) < options.small_pivot_tolerance {
         return Some((d11, d21, d22));
     }
-    let x1 = d11.abs() * maxt + d21.abs() * maxp;
-    let x2 = d21.abs() * maxt + d22.abs() * maxp;
+    let x1 = d11.abs().mul_add(maxt, d21.abs() * maxp);
+    let x2 = d21.abs().mul_add(maxt, d22.abs() * maxp);
     if options.threshold_pivot_u * x1.max(x2) < 1.0 {
         Some((d11, d21, d22))
     } else {
@@ -1529,11 +1568,18 @@ fn tpp_test_two_by_two(
 
 fn app_update_one_by_one(matrix: &mut [f64], size: usize, pivot: usize, workspace: &[f64]) {
     let ld = &workspace[pivot * size..(pivot + 1) * size];
+    // Native SPRAL routes a 1x1 trailing update through scalar dgemm, but
+    // wider trailing blocks round like OpenBLAS' block kernel.
+    let use_scalar_fma = size.saturating_sub(pivot + 1) == 1;
     for (col, &preserved) in ld.iter().enumerate().take(size).skip(pivot + 1) {
         for row in col..size {
             let update_entry = dense_lower_offset(size, row, col);
             let multiplier = matrix[dense_lower_offset(size, row, pivot)];
-            matrix[update_entry] -= preserved * multiplier;
+            if use_scalar_fma {
+                matrix[update_entry] = (-multiplier).mul_add(preserved, matrix[update_entry]);
+            } else {
+                matrix[update_entry] -= multiplier * preserved;
+            }
         }
     }
 }
@@ -1541,6 +1587,7 @@ fn app_update_one_by_one(matrix: &mut [f64], size: usize, pivot: usize, workspac
 fn app_update_two_by_two(matrix: &mut [f64], size: usize, pivot: usize, workspace: &[f64]) {
     let first_ld = &workspace[pivot * size..(pivot + 1) * size];
     let second_ld = &workspace[(pivot + 1) * size..(pivot + 2) * size];
+    let use_compensated_dot = size.saturating_sub(pivot + 2) >= 2;
     for col in (pivot + 2)..size {
         let first_preserved = first_ld[col];
         let second_preserved = second_ld[col];
@@ -1548,9 +1595,59 @@ fn app_update_two_by_two(matrix: &mut [f64], size: usize, pivot: usize, workspac
             let update_entry = dense_lower_offset(size, row, col);
             let first_multiplier = matrix[dense_lower_offset(size, row, pivot)];
             let second_multiplier = matrix[dense_lower_offset(size, row, pivot + 1)];
-            matrix[update_entry] -=
-                first_preserved * first_multiplier + second_preserved * second_multiplier;
+            matrix[update_entry] = rank2_update_value(
+                matrix[update_entry],
+                -first_multiplier,
+                first_preserved,
+                -second_multiplier,
+                second_preserved,
+                use_compensated_dot,
+            );
         }
+    }
+}
+
+fn two_sum(a: f64, b: f64) -> (f64, f64) {
+    let sum = a + b;
+    let b_virtual = sum - a;
+    let error = (a - (sum - b_virtual)) + (b - b_virtual);
+    (sum, error)
+}
+
+fn two_product(a: f64, b: f64) -> (f64, f64) {
+    let product = a * b;
+    let error = a.mul_add(b, -product);
+    (product, error)
+}
+
+fn compensated_rank2_update(current: f64, a1: f64, b1: f64, a2: f64, b2: f64) -> f64 {
+    let (product1, error1) = two_product(a1, b1);
+    let (product2, error2) = two_product(a2, b2);
+    let (dot, dot_error) = two_sum(product1, product2);
+    let (updated, update_error) = two_sum(current, dot);
+    updated + (error1 + error2 + dot_error + update_error)
+}
+
+fn rank2_update_value(
+    current: f64,
+    a1: f64,
+    b1: f64,
+    a2: f64,
+    b2: f64,
+    use_compensated_dot: bool,
+) -> f64 {
+    if use_compensated_dot {
+        // OpenBLAS' tiny block dgemm effectively rounds the two-term dot
+        // differently from a scalar chained FMA when both products contribute.
+        let product1 = a1 * b1;
+        let product2 = a2 * b2;
+        if product1 != 0.0 && product2 != 0.0 {
+            compensated_rank2_update(current, a1, b1, a2, b2)
+        } else {
+            current + product1 + product2
+        }
+    } else {
+        a2.mul_add(b2, a1.mul_add(b1, current))
     }
 }
 
@@ -1644,8 +1741,8 @@ fn factor_two_by_two_common(
         let b2 = matrix[dense_lower_offset(size, row, pivot + 1)];
         first_scratch[row] = b1;
         second_scratch[row] = b2;
-        let l1 = b1 * inv11 + b2 * inv12;
-        let l2 = b1 * inv12 + b2 * inv22;
+        let l1 = inv11.mul_add(b1, inv12 * b2);
+        let l2 = inv12.mul_add(b1, inv22 * b2);
         if !l1.is_finite() || !l2.is_finite() {
             return Err(SsidsError::NumericalBreakdown {
                 pivot: rows[pivot],
@@ -1766,8 +1863,8 @@ fn tpp_factor_two_by_two(
         let b2 = matrix[dense_lower_offset(size, row, pivot + 1)];
         first_scratch[row] = b1;
         second_scratch[row] = b2;
-        let l1 = b1 * inv11 + b2 * inv12;
-        let l2 = b1 * inv12 + b2 * inv22;
+        let l1 = inv11.mul_add(b1, inv12 * b2);
+        let l2 = inv12.mul_add(b1, inv22 * b2);
         if !l1.is_finite() || !l2.is_finite() {
             return Err(SsidsError::NumericalBreakdown {
                 pivot: rows[pivot],
@@ -1819,11 +1916,18 @@ fn root_tpp_rank1_update(
     multiplier_column: usize,
     preserved_column: &[f64],
 ) {
+    // Native SPRAL routes a 1x1 trailing update through scalar dgemm, but
+    // wider trailing blocks round like OpenBLAS' block kernel.
+    let use_scalar_fma = size.saturating_sub(start) == 1;
     for (col, &preserved) in preserved_column.iter().enumerate().take(size).skip(start) {
         for row in col..size {
             let l_row = matrix[dense_lower_offset(size, row, multiplier_column)];
             let update_entry = dense_lower_offset(size, row, col);
-            matrix[update_entry] -= l_row * preserved;
+            if use_scalar_fma {
+                matrix[update_entry] = (-l_row).mul_add(preserved, matrix[update_entry]);
+            } else {
+                matrix[update_entry] -= l_row * preserved;
+            }
         }
     }
 }
@@ -1837,6 +1941,7 @@ fn root_tpp_rank2_update(
     first_preserved_column: &[f64],
     second_preserved_column: &[f64],
 ) {
+    let use_compensated_dot = size.saturating_sub(start) >= 2;
     for (col, (&first_preserved, &second_preserved)) in first_preserved_column
         .iter()
         .zip(second_preserved_column.iter())
@@ -1848,7 +1953,14 @@ fn root_tpp_rank2_update(
             let l1_row = matrix[dense_lower_offset(size, row, first_multiplier_column)];
             let l2_row = matrix[dense_lower_offset(size, row, second_multiplier_column)];
             let update_entry = dense_lower_offset(size, row, col);
-            matrix[update_entry] -= l1_row * first_preserved + l2_row * second_preserved;
+            matrix[update_entry] = rank2_update_value(
+                matrix[update_entry],
+                -l1_row,
+                first_preserved,
+                -l2_row,
+                second_preserved,
+                use_compensated_dot,
+            );
         }
     }
 }
@@ -2062,13 +2174,16 @@ fn factorize_dense_front(
     options: NumericFactorOptions,
 ) -> Result<DenseFrontFactorization, SsidsError> {
     let size = rows.len();
-    if matches!(options.pivot_method, PivotMethod::ThresholdPartial) {
+    let active_candidate_end = candidate_len.min(size);
+    if matches!(options.pivot_method, PivotMethod::ThresholdPartial)
+        || active_candidate_end < APP_INNER_BLOCK_SIZE
+    {
         let mut tpp_ld = vec![0.0; size.saturating_mul(2).max(1)];
         return factorize_dense_tpp_tail_in_place(
             &mut rows,
             &mut dense,
             0,
-            candidate_len.min(size),
+            active_candidate_end,
             options,
             false,
             &mut tpp_ld,
@@ -2081,7 +2196,6 @@ fn factorize_dense_front(
     let mut block_records = Vec::new();
     let mut scratch = vec![0.0; size.saturating_mul(size).max(1)];
     let mut pivot = 0;
-    let active_candidate_end = candidate_len.min(size);
 
     while pivot < active_candidate_end {
         let Some((best_abs, best_row, best_col)) =
@@ -2638,14 +2752,33 @@ fn solve_two_by_two_block_in_place(values: &[f64], rhs: &mut [f64]) -> Result<()
     let d11 = values[0];
     let d21 = values[1];
     let d22 = values[3];
-    let x0 = d11 * rhs[0] + d21 * rhs[1];
-    let x1 = d21 * rhs[0] + d22 * rhs[1];
+    let x0 = d11.mul_add(rhs[0], d21 * rhs[1]);
+    let x1 = d21.mul_add(rhs[0], d22 * rhs[1]);
     if !x0.is_finite() || !x1.is_finite() {
         return Err("two-by-two diagonal block solve produced non-finite values".into());
     }
     rhs[0] = x0;
     rhs[1] = x1;
     Ok(())
+}
+
+fn build_dense_unit_lower_from_factor(
+    dimension: usize,
+    lower_col_ptrs: &[usize],
+    lower_row_indices: &[usize],
+    lower_values: &[f64],
+) -> Vec<f64> {
+    let mut lower = vec![0.0; dimension * dimension];
+    for diagonal in 0..dimension {
+        lower[diagonal * dimension + diagonal] = 1.0;
+    }
+    for col in 0..dimension {
+        for entry in lower_col_ptrs[col]..lower_col_ptrs[col + 1] {
+            let row = lower_row_indices[entry];
+            lower[row * dimension + col] = lower_values[entry];
+        }
+    }
+    lower
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

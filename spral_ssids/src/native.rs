@@ -129,6 +129,13 @@ pub struct NativeSpral {
     inner: Arc<NativeSpralLibrary>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum NativeOrdering {
+    #[default]
+    LibraryDefault,
+    Natural,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NativeSpralAnalyseInfo {
     pub supernode_count: usize,
@@ -252,13 +259,30 @@ impl NativeSpral {
         &self,
         matrix: SymmetricCscMatrix<'_>,
     ) -> Result<NativeSpralSession, NativeSpralError> {
-        self.analyse_with_options(matrix, &NumericFactorOptions::default())
+        self.analyse_with_options_and_ordering(
+            matrix,
+            &NumericFactorOptions::default(),
+            NativeOrdering::LibraryDefault,
+        )
     }
 
     pub fn analyse_with_options(
         &self,
         matrix: SymmetricCscMatrix<'_>,
         numeric_options: &NumericFactorOptions,
+    ) -> Result<NativeSpralSession, NativeSpralError> {
+        self.analyse_with_options_and_ordering(
+            matrix,
+            numeric_options,
+            NativeOrdering::LibraryDefault,
+        )
+    }
+
+    pub fn analyse_with_options_and_ordering(
+        &self,
+        matrix: SymmetricCscMatrix<'_>,
+        numeric_options: &NumericFactorOptions,
+        ordering: NativeOrdering,
     ) -> Result<NativeSpralSession, NativeSpralError> {
         if matrix.dimension() > i32::MAX as usize {
             return Err(NativeSpralError::DimensionTooLarge {
@@ -282,6 +306,13 @@ impl NativeSpral {
         options.ignore_numa = true;
         options.print_level = 0;
         apply_numeric_factor_options(&mut options, numeric_options);
+        let mut order_storage = None;
+        apply_native_ordering(
+            &mut options,
+            matrix.dimension(),
+            ordering,
+            &mut order_storage,
+        );
 
         let mut inform = SpralSsidsInform::default();
         let mut analysed = ptr::null_mut();
@@ -289,7 +320,9 @@ impl NativeSpral {
             (self.inner.analyse)(
                 true,
                 i32::try_from(matrix.dimension()).unwrap_or(i32::MAX),
-                ptr::null_mut(),
+                order_storage
+                    .as_mut()
+                    .map_or(ptr::null_mut(), |order| order.as_mut_ptr()),
                 col_ptrs64.as_ptr(),
                 row_indices32.as_ptr(),
                 ptr::null(),
@@ -332,6 +365,25 @@ fn apply_numeric_factor_options(native: &mut SpralSsidsOptions, numeric: &Numeri
     };
     native.small = numeric.small_pivot_tolerance;
     native.u = numeric.threshold_pivot_u;
+}
+
+fn apply_native_ordering(
+    native: &mut SpralSsidsOptions,
+    dimension: usize,
+    ordering: NativeOrdering,
+    order_storage: &mut Option<Vec<i32>>,
+) {
+    match ordering {
+        NativeOrdering::LibraryDefault => {}
+        NativeOrdering::Natural => {
+            native.ordering = 0;
+            *order_storage = Some(
+                (0..dimension)
+                    .map(|index| i32::try_from(index).unwrap_or(i32::MAX))
+                    .collect(),
+            );
+        }
+    }
 }
 
 impl NativeSpralSession {
