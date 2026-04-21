@@ -2636,12 +2636,21 @@ fn slack_bound_relaxation(options: &InteriorPointOptions) -> f64 {
     bound_relaxation_amount(0.0, options)
 }
 
-fn relaxed_slack_barrier_values(slack: &[f64], options: &InteriorPointOptions) -> Vec<f64> {
+fn relax_augmented_inequality_values(values: &mut [f64], options: &InteriorPointOptions) {
     let relaxation = slack_bound_relaxation(options);
     if relaxation == 0.0 {
-        return slack.to_vec();
+        return;
     }
-    slack.iter().map(|value| value + relaxation).collect()
+    // IPOPT relaxes d_L/d_U before forming its internal d(x)-s=0 row. Our
+    // compiled inequalities are already normalized as g(x) <= 0, so every
+    // one-sided row moves outward by the zero-bound relaxation amount.
+    for value in values {
+        *value -= relaxation;
+    }
+}
+
+fn slack_barrier_values(slack: &[f64]) -> Vec<f64> {
+    slack.to_vec()
 }
 
 fn native_bound_log_sum(x: &[f64], bounds: &BoundConstraints) -> f64 {
@@ -3719,6 +3728,7 @@ fn project_initial_point_into_box_interior(
 
 fn collect_interior_point_bounds_and_fixed<P>(
     problem: &P,
+    options: &InteriorPointOptions,
 ) -> std::result::Result<(BoundConstraints, FixedVariableElimination), InteriorPointSolveError>
 where
     P: CompiledNlpProblem,
@@ -3753,11 +3763,15 @@ where
         }
         if let Some(lower_bound) = lower_bound {
             bounds.lower_indices.push(idx);
-            bounds.lower_values.push(lower_bound);
+            bounds
+                .lower_values
+                .push(lower_bound - bound_relaxation_amount(lower_bound, options));
         }
         if let Some(upper_bound) = upper_bound {
             bounds.upper_indices.push(idx);
-            bounds.upper_values.push(upper_bound);
+            bounds
+                .upper_values
+                .push(upper_bound + bound_relaxation_amount(upper_bound, options));
         }
     }
 
@@ -4145,12 +4159,17 @@ fn lagrangian_gradient_sparse(
     residual
 }
 
+struct TrialEvaluationContext<'a> {
+    equality_jacobian_structure: &'a Arc<SparseMatrixStructure>,
+    inequality_jacobian_structure: &'a Arc<SparseMatrixStructure>,
+    options: &'a InteriorPointOptions,
+}
+
 fn trial_state<P>(
     problem: &P,
     x: &[f64],
     parameters: &[ParameterMatrix<'_>],
-    equality_jacobian_structure: &Arc<SparseMatrixStructure>,
-    inequality_jacobian_structure: &Arc<SparseMatrixStructure>,
+    context: &TrialEvaluationContext<'_>,
     profiling: &mut InteriorPointProfiling,
     callback_time: &mut Duration,
 ) -> EvalState
@@ -4174,6 +4193,7 @@ where
     time_callback(&mut profiling.inequality_values, callback_time, || {
         problem.inequality_values(x, parameters, &mut augmented_inequality_values);
     });
+    relax_augmented_inequality_values(&mut augmented_inequality_values, context.options);
     time_callback(
         &mut profiling.equality_jacobian_values,
         callback_time,
@@ -4190,11 +4210,11 @@ where
         equality_values,
         augmented_inequality_values,
         equality_jacobian: SparseMatrix {
-            structure: Arc::clone(equality_jacobian_structure),
+            structure: Arc::clone(context.equality_jacobian_structure),
             values: equality_jacobian_values,
         },
         inequality_jacobian: SparseMatrix {
-            structure: Arc::clone(inequality_jacobian_structure),
+            structure: Arc::clone(context.inequality_jacobian_structure),
             values: inequality_jacobian_values,
         },
     }
@@ -7720,7 +7740,7 @@ where
 
     let equality_count = problem.equality_count();
     let inequality_count = problem.inequality_count();
-    let (bounds, fixed_variables) = collect_interior_point_bounds_and_fixed(problem)?;
+    let (bounds, fixed_variables) = collect_interior_point_bounds_and_fixed(problem, options)?;
     let augmented_inequality_count = inequality_count;
     let barrier_bound_count = bounds.total_count();
     let barrier_pair_count = augmented_inequality_count + barrier_bound_count;
@@ -7762,6 +7782,11 @@ where
     let mut x = x0.to_vec();
     project_initial_point_into_box_interior(&mut x, &bounds, options);
     fixed_variables.project_fixed_values(&mut x);
+    let trial_evaluation_context = TrialEvaluationContext {
+        equality_jacobian_structure: &equality_jacobian_structure,
+        inequality_jacobian_structure: &inequality_jacobian_structure,
+        options,
+    };
     let mut lambda_eq = vec![0.0; equality_count];
     let mut z = vec![1.0; augmented_inequality_count];
     let mut z_lower = vec![1.0; bounds.lower_indices.len()];
@@ -7777,8 +7802,7 @@ where
         problem,
         &x,
         parameters,
-        &equality_jacobian_structure,
-        &inequality_jacobian_structure,
+        &trial_evaluation_context,
         &mut profiling,
         &mut setup_callback_time,
     );
@@ -7789,7 +7813,7 @@ where
         &mut slack,
         options,
     );
-    let initial_slack_barrier = relaxed_slack_barrier_values(&slack, options);
+    let initial_slack_barrier = slack_barrier_values(&slack);
     match options.bound_mult_init_method {
         InteriorPointBoundMultiplierInitMethod::Constant => {
             z.fill(options.bound_mult_init_val);
@@ -8087,8 +8111,7 @@ where
             problem,
             &x,
             parameters,
-            &equality_jacobian_structure,
-            &inequality_jacobian_structure,
+            &trial_evaluation_context,
             &mut profiling,
             &mut iteration_callback_time,
         );
@@ -8096,7 +8119,7 @@ where
         let inequality_inf = positive_part_inf_norm(&state.augmented_inequality_values);
         let inequality_residual =
             slack_form_inequality_residuals(&state.augmented_inequality_values, &slack);
-        let slack_barrier = relaxed_slack_barrier_values(&slack, options);
+        let slack_barrier = slack_barrier_values(&slack);
         let internal_inequality_inf = inf_norm(&inequality_residual);
         let primal_inf = equality_inf.max(internal_inequality_inf);
         let full_dual_residual = lagrangian_gradient_sparse(
@@ -8914,7 +8937,7 @@ where
                 .zip(direction.ds.iter())
                 .map(|(value, delta)| value + trial_alpha_pr * delta)
                 .collect::<Vec<_>>();
-            let trial_slack_barrier = relaxed_slack_barrier_values(&trial_slack, options);
+            let trial_slack_barrier = slack_barrier_values(&trial_slack);
             let trial_z = z
                 .iter()
                 .zip(direction.dz.iter())
@@ -8979,8 +9002,7 @@ where
                 problem,
                 &trial_x,
                 parameters,
-                &equality_jacobian_structure,
-                &inequality_jacobian_structure,
+                &trial_evaluation_context,
                 &mut profiling,
                 &mut trial_callback_time,
             );
@@ -9272,8 +9294,7 @@ where
                     problem,
                     &corrected_x,
                     parameters,
-                    &equality_jacobian_structure,
-                    &inequality_jacobian_structure,
+                    &trial_evaluation_context,
                     &mut profiling,
                     &mut corrected_callback_time,
                 );
@@ -9286,8 +9307,7 @@ where
                 } else {
                     Vec::new()
                 };
-                let corrected_slack_barrier =
-                    relaxed_slack_barrier_values(&corrected_slack, options);
+                let corrected_slack_barrier = slack_barrier_values(&corrected_slack);
                 let corrected_z = trial_z.clone();
                 let corrected_bounds_positive = bounds
                     .lower_indices
@@ -9809,8 +9829,7 @@ where
                 problem,
                 &restored_x,
                 parameters,
-                &equality_jacobian_structure,
-                &inequality_jacobian_structure,
+                &trial_evaluation_context,
                 &mut profiling,
                 &mut iteration_callback_time,
             );
@@ -10128,8 +10147,7 @@ where
         let previous_barrier_parameter = barrier_parameter_value;
         let mut next_barrier_parameter_value = barrier_parameter_value;
         if barrier_pair_count > 0 {
-            let accepted_slack_barrier =
-                relaxed_slack_barrier_values(&accepted_trial.slack, options);
+            let accepted_slack_barrier = slack_barrier_values(&accepted_trial.slack);
             let accepted_all_dual_multipliers = combined_multiplier_vector([
                 accepted_trial.lambda.as_slice(),
                 accepted_trial.inequality_multipliers.as_slice(),
