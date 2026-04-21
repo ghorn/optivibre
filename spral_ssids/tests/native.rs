@@ -1,5 +1,5 @@
 use approx::assert_abs_diff_eq;
-use spral_ssids::{Inertia, NativeSpral, SymmetricCscMatrix};
+use spral_ssids::{Inertia, NativeOrdering, NativeSpral, NumericFactorOptions, SymmetricCscMatrix};
 
 fn dense_mul(matrix: &[Vec<f64>], x: &[f64]) -> Vec<f64> {
     matrix
@@ -135,4 +135,37 @@ fn native_spral_session_refactorizes_same_pattern() {
         assert_abs_diff_eq!(actual, expected_i, epsilon = 1e-10);
     }
     assert!(residual_inf_norm(&dense1, &in_place, &rhs) <= 1e-10);
+}
+
+#[test]
+fn native_spral_enquires_indefinite_pivots() {
+    let Some(native) = load_native_or_skip() else {
+        return;
+    };
+    let col_ptrs = [0, 2, 3];
+    let row_indices = [0, 1, 1];
+    let values = [0.0, 1.0, 0.0];
+    let matrix = SymmetricCscMatrix::new(2, &col_ptrs, &row_indices, Some(&values)).expect("csc");
+    let options = NumericFactorOptions::default();
+    let mut session = native
+        .analyse_with_options_and_ordering(matrix, &options, NativeOrdering::Natural)
+        .expect("analyse");
+
+    let factor_info = session.factorize(matrix).expect("factorize");
+    assert_eq!(
+        factor_info.inertia,
+        Inertia {
+            positive: 1,
+            negative: 1,
+            zero: 0,
+        }
+    );
+    assert_eq!(factor_info.two_by_two_pivots, 1);
+
+    let enquiry = session.enquire_indef().expect("enquire indefinite factor");
+    assert_eq!(enquiry.pivot_order, vec![0, 1]);
+    assert_eq!(
+        enquiry.inverse_diagonal_entries,
+        vec![[0.0, 1.0], [0.0, 0.0]]
+    );
 }

@@ -14,7 +14,7 @@ use thiserror::Error;
 
 pub use native::{
     NativeOrdering, NativeSpral, NativeSpralAnalyseInfo, NativeSpralError, NativeSpralFactorInfo,
-    NativeSpralSession,
+    NativeSpralIndefEnquiry, NativeSpralSession,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -1576,18 +1576,12 @@ fn app_update_one_by_one(
     workspace: &[f64],
 ) {
     let ld = &workspace[pivot * size..(pivot + 1) * size];
-    // Native SPRAL routes a 1x1 trailing update through scalar dgemm, but
-    // wider trailing blocks round like OpenBLAS' block kernel.
-    let use_scalar_fma = update_end.saturating_sub(pivot + 1) == 1;
     for (col, &preserved) in ld.iter().enumerate().take(update_end).skip(pivot + 1) {
         for row in col..update_end {
             let update_entry = dense_lower_offset(size, row, col);
             let multiplier = matrix[dense_lower_offset(size, row, pivot)];
-            if use_scalar_fma {
-                matrix[update_entry] = (-multiplier).mul_add(preserved, matrix[update_entry]);
-            } else {
-                matrix[update_entry] -= multiplier * preserved;
-            }
+            // Match SPRAL's scalar block_ldlt update expression on the local build.
+            matrix[update_entry] -= multiplier * preserved;
         }
     }
 }
@@ -1608,10 +1602,9 @@ fn app_update_two_by_two(
             let update_entry = dense_lower_offset(size, row, col);
             let first_multiplier = matrix[dense_lower_offset(size, row, pivot)];
             let second_multiplier = matrix[dense_lower_offset(size, row, pivot + 1)];
-            // Native SPRAL sends 2x2-pivot APP updates through dgemm with
-            // k=2, alpha=-1, beta=1. Match the OpenBLAS dot order used there.
+            // Native block_ldlt forms the two products separately before the update.
             matrix[update_entry] -=
-                second_multiplier.mul_add(second_preserved, first_multiplier * first_preserved);
+                first_multiplier * first_preserved + second_multiplier * second_preserved;
         }
     }
 }

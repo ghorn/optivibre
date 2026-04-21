@@ -39,6 +39,14 @@ type SpralSolve1Fn = unsafe extern "C" fn(
     *const SpralSsidsOptions,
     *mut SpralSsidsInform,
 );
+type SpralEnquireIndefFn = unsafe extern "C" fn(
+    *const c_void,
+    *const c_void,
+    *const SpralSsidsOptions,
+    *mut SpralSsidsInform,
+    *mut i32,
+    *mut f64,
+);
 type SpralFreeFn = unsafe extern "C" fn(*mut *mut c_void, *mut *mut c_void) -> i32;
 
 #[repr(C)]
@@ -121,6 +129,7 @@ struct NativeSpralLibrary {
     analyse: SpralAnalyseFn,
     factor: SpralFactorFn,
     solve1: SpralSolve1Fn,
+    enquire_indef: SpralEnquireIndefFn,
     free: SpralFreeFn,
 }
 
@@ -151,6 +160,16 @@ pub struct NativeSpralFactorInfo {
     pub delayed_pivots: usize,
     pub supernode_count: usize,
     pub max_supernode_width: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeSpralIndefEnquiry {
+    /// Position of each original column in the pivot sequence.
+    pub pivot_order: Vec<usize>,
+    /// Inverse-D entries in pivot order. For a 1x1 pivot this stores
+    /// `[d11, 0.0]`; for a 2x2 pivot the two consecutive entries store
+    /// `[d11, d21]` and `[d22, 0.0]`.
+    pub inverse_diagonal_entries: Vec<[f64; 2]>,
 }
 
 #[derive(Debug)]
@@ -192,6 +211,8 @@ pub enum NativeSpralError {
     FactorizationFailed { flag: i32 },
     #[error("native SPRAL solve failed with flag {flag}")]
     SolveFailed { flag: i32 },
+    #[error("native SPRAL indefinite enquiry failed with flag {flag}")]
+    EnquireFailed { flag: i32 },
     #[error("native SPRAL session has not been factorized yet")]
     NotFactorized,
 }
@@ -231,6 +252,11 @@ impl NativeSpral {
                         &candidate,
                         b"spral_ssids_solve1\0",
                     )?;
+                    let enquire_indef = load_symbol::<SpralEnquireIndefFn>(
+                        &library,
+                        &candidate,
+                        b"spral_ssids_enquire_indef\0",
+                    )?;
                     let free =
                         load_symbol::<SpralFreeFn>(&library, &candidate, b"spral_ssids_free\0")?;
                     let native = Self {
@@ -240,6 +266,7 @@ impl NativeSpral {
                             analyse,
                             factor,
                             solve1,
+                            enquire_indef,
                             free,
                         }),
                     };
@@ -504,6 +531,42 @@ impl NativeSpralSession {
             return Err(NativeSpralError::SolveFailed { flag: inform.flag });
         }
         Ok(())
+    }
+
+    pub fn enquire_indef(&self) -> Result<NativeSpralIndefEnquiry, NativeSpralError> {
+        if self.factorized.is_null() {
+            return Err(NativeSpralError::NotFactorized);
+        }
+
+        let mut pivot_order = vec![0; self.dimension];
+        let mut inverse_diagonal_raw = vec![0.0; 2 * self.dimension];
+        let mut inform = SpralSsidsInform::default();
+        unsafe {
+            (self.inner.enquire_indef)(
+                self.analysed,
+                self.factorized,
+                &self.options,
+                &mut inform,
+                pivot_order.as_mut_ptr(),
+                inverse_diagonal_raw.as_mut_ptr(),
+            );
+        }
+        if inform.flag < 0 {
+            return Err(NativeSpralError::EnquireFailed { flag: inform.flag });
+        }
+
+        let pivot_order = pivot_order
+            .into_iter()
+            .map(|entry| usize::try_from(entry).unwrap_or(usize::MAX))
+            .collect();
+        let inverse_diagonal_entries = inverse_diagonal_raw
+            .chunks_exact(2)
+            .map(|entry| [entry[0], entry[1]])
+            .collect();
+        Ok(NativeSpralIndefEnquiry {
+            pivot_order,
+            inverse_diagonal_entries,
+        })
     }
 
     fn factorize_values(
