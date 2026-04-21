@@ -136,6 +136,24 @@ fn rust_and_native_spral_match_app_dense_zero_reduction_64x64_solution_bits() {
     assert_exact_bitwise_parity_witness(&matrix, &expected_solution);
 }
 
+#[test]
+fn rust_and_native_spral_match_app_blocked_update_65x65_solution_bits() {
+    let matrix = deterministic_complete_dyadic_matrix(65);
+    let expected_solution = (0..65)
+        .map(|index| f64::from((index % 11) as i16 - 5) / 8.0)
+        .collect::<Vec<_>>();
+    assert_exact_bitwise_parity_witness(&matrix, &expected_solution);
+}
+
+#[test]
+fn rust_and_native_spral_match_app_width_one_update_96x96_solution_bits() {
+    let matrix = deterministic_complete_dyadic_matrix(96);
+    let expected_solution = (0..96)
+        .map(|index| f64::from((index % 11) as i16 - 5) / 8.0)
+        .collect::<Vec<_>>();
+    assert_exact_bitwise_parity_witness(&matrix, &expected_solution);
+}
+
 fn bit_patterns(values: &[f64]) -> Vec<u64> {
     values.iter().map(|value| value.to_bits()).collect()
 }

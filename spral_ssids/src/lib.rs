@@ -271,6 +271,7 @@ impl Supernode {
 
 const RELAXED_NODE_AMALGAMATION_NEMIN: usize = 32;
 const APP_INNER_BLOCK_SIZE: usize = 32;
+const OPENBLAS_DTRSV_BLOCK_SIZE: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SymbolicFactor {
@@ -654,16 +655,13 @@ impl NumericFactor {
                 factor_rhs[row] -= dot;
             }
         } else {
-            for pivot in (0..self.dimension).rev() {
-                let dot = lower_transpose_dot_like_native(
-                    pivot,
-                    &self.lower_col_ptrs,
-                    &self.lower_row_indices,
-                    &self.lower_values,
-                    factor_rhs,
-                );
-                factor_rhs[pivot] -= dot;
-            }
+            solve_lower_transpose_like_native(
+                self.dimension,
+                &self.lower_col_ptrs,
+                &self.lower_row_indices,
+                &self.lower_values,
+                factor_rhs,
+            );
         }
         if !factor_rhs.iter().all(|value| value.is_finite()) {
             return Err(SsidsError::NumericalBreakdown {
@@ -1944,8 +1942,51 @@ fn app_apply_accepted_prefix_update(
     if accepted_end >= size {
         return;
     }
+    if accepted_end + 1 == size {
+        let row = accepted_end;
+        let entry = dense_lower_offset(size, row, row);
+        let mut pivot = block_start;
+        for block in block_records {
+            if block.size == 1 {
+                let diagonal = app_original_one_by_one_diagonal(block.values[0]);
+                let row_l = matrix[dense_lower_offset(size, row, pivot)];
+                let row_ld = diagonal * row_l;
+                matrix[entry] = (-row_l).mul_add(row_ld, matrix[entry]);
+                pivot += 1;
+            } else {
+                let inv11 = block.values[0];
+                let inv21 = block.values[1];
+                let inv22 = block.values[3];
+                let det = inv11.mul_add(inv22, -(inv21 * inv21));
+                let d11 = inv11 / det;
+                let d21 = inv21 / det;
+                let d22 = inv22 / det;
+                let row_l1 = matrix[dense_lower_offset(size, row, pivot)];
+                let row_l2 = matrix[dense_lower_offset(size, row, pivot + 1)];
+                let row_ld1 = d22.mul_add(row_l1, -(d21 * row_l2));
+                let row_ld2 = (-d21).mul_add(row_l1, d11 * row_l2);
+                matrix[entry] = (-row_l1).mul_add(row_ld1, matrix[entry]);
+                matrix[entry] = (-row_l2).mul_add(row_ld2, matrix[entry]);
+                pivot += 2;
+            }
+        }
+        debug_assert_eq!(pivot, accepted_end);
+        return;
+    }
     for row in accepted_end..size {
         for col in accepted_end..=row {
+            if app_target_block_uses_gemv_forward(size, accepted_end, col) {
+                app_apply_accepted_prefix_update_entry_incremental(
+                    matrix,
+                    size,
+                    block_start,
+                    accepted_end,
+                    block_records,
+                    row,
+                    col,
+                );
+                continue;
+            }
             let mut update = 0.0;
             let mut pivot = block_start;
             for block in block_records {
@@ -1980,6 +2021,54 @@ fn app_apply_accepted_prefix_update(
             matrix[entry] = update.mul_add(-1.0, matrix[entry]);
         }
     }
+}
+
+fn app_target_block_uses_gemv_forward(size: usize, accepted_end: usize, col: usize) -> bool {
+    let col_block_start =
+        accepted_end + ((col - accepted_end) / APP_INNER_BLOCK_SIZE) * APP_INNER_BLOCK_SIZE;
+    let col_block_end = (col_block_start + APP_INNER_BLOCK_SIZE).min(size);
+    col_block_end - col_block_start == 1
+}
+
+fn app_apply_accepted_prefix_update_entry_incremental(
+    matrix: &mut [f64],
+    size: usize,
+    block_start: usize,
+    accepted_end: usize,
+    block_records: &[FactorBlockRecord],
+    row: usize,
+    col: usize,
+) {
+    let entry = dense_lower_offset(size, row, col);
+    let mut pivot = block_start;
+    for block in block_records {
+        if block.size == 1 {
+            let diagonal = app_original_one_by_one_diagonal(block.values[0]);
+            let row_l = matrix[dense_lower_offset(size, row, pivot)];
+            let col_l = matrix[dense_lower_offset(size, col, pivot)];
+            let row_ld = diagonal * row_l;
+            matrix[entry] = (-col_l).mul_add(row_ld, matrix[entry]);
+            pivot += 1;
+        } else {
+            let inv11 = block.values[0];
+            let inv21 = block.values[1];
+            let inv22 = block.values[3];
+            let det = inv11.mul_add(inv22, -(inv21 * inv21));
+            let d11 = inv11 / det;
+            let d21 = inv21 / det;
+            let d22 = inv22 / det;
+            let row_l1 = matrix[dense_lower_offset(size, row, pivot)];
+            let row_l2 = matrix[dense_lower_offset(size, row, pivot + 1)];
+            let col_l1 = matrix[dense_lower_offset(size, col, pivot)];
+            let col_l2 = matrix[dense_lower_offset(size, col, pivot + 1)];
+            let row_ld1 = d22.mul_add(row_l1, -(d21 * row_l2));
+            let row_ld2 = (-d21).mul_add(row_l1, d11 * row_l2);
+            matrix[entry] = (-col_l1).mul_add(row_ld1, matrix[entry]);
+            matrix[entry] = (-col_l2).mul_add(row_ld2, matrix[entry]);
+            pivot += 2;
+        }
+    }
+    debug_assert_eq!(pivot, accepted_end);
 }
 
 fn app_build_factor_columns_for_prefix(
@@ -3066,48 +3155,127 @@ fn solve_two_by_two_block_in_place(values: &[f64], rhs: &mut [f64]) -> Result<()
     Ok(())
 }
 
-fn lower_transpose_dot_like_native(
+fn solve_lower_transpose_like_native(
+    dimension: usize,
+    lower_col_ptrs: &[usize],
+    lower_row_indices: &[usize],
+    lower_values: &[f64],
+    factor_rhs: &mut [f64],
+) {
+    let mut block_end = dimension;
+    while block_end > 0 {
+        let block_start = block_end.saturating_sub(OPENBLAS_DTRSV_BLOCK_SIZE);
+        if block_end < dimension {
+            for pivot in block_start..block_end {
+                let dot = lower_transpose_gemv_dot_like_native(
+                    pivot,
+                    block_end,
+                    dimension,
+                    lower_col_ptrs,
+                    lower_row_indices,
+                    lower_values,
+                    factor_rhs,
+                );
+                factor_rhs[pivot] = (-1.0f64).mul_add(dot, factor_rhs[pivot]);
+            }
+        }
+
+        for pivot in (block_start..block_end).rev() {
+            let dot = lower_transpose_dot_in_range_like_native(
+                pivot,
+                pivot + 1,
+                block_end,
+                lower_col_ptrs,
+                lower_row_indices,
+                lower_values,
+                factor_rhs,
+            );
+            factor_rhs[pivot] -= dot;
+        }
+        block_end = block_start;
+    }
+}
+
+fn lower_transpose_dot_in_range_like_native(
     pivot: usize,
+    range_start: usize,
+    range_end: usize,
     lower_col_ptrs: &[usize],
     lower_row_indices: &[usize],
     lower_values: &[f64],
     factor_rhs: &[f64],
 ) -> f64 {
+    debug_assert!(range_start <= range_end);
     let start = lower_col_ptrs[pivot];
     let end = lower_col_ptrs[pivot + 1];
     let rows = &lower_row_indices[start..end];
     let values = &lower_values[start..end];
-    let first_row = pivot + 1;
-    if first_row + values.len() <= factor_rhs.len()
+    if range_start == range_end {
+        return 0.0;
+    }
+    if range_start + values.len() <= range_end
         && rows
             .iter()
             .enumerate()
-            .all(|(offset, &row)| row == first_row + offset)
+            .all(|(offset, &row)| row == range_start + offset)
     {
-        openblas_dotu_like_contiguous(values, &factor_rhs[first_row..first_row + values.len()])
+        openblas_dotu_like_contiguous(values, &factor_rhs[range_start..range_start + values.len()])
     } else if rows
         .iter()
-        .all(|&row| (first_row..factor_rhs.len()).contains(&row))
+        .all(|&row| (range_start..range_end).contains(&row))
     {
         // Native APP solves call dense BLAS over the whole panel. Structural
         // zeros inside that panel still participate in the dot reduction order.
-        let mut dense_values = vec![0.0; factor_rhs.len() - first_row];
+        let mut dense_values = vec![0.0; range_end - range_start];
         for (&value, &row) in values.iter().zip(rows) {
-            dense_values[row - first_row] = value;
+            dense_values[row - range_start] = value;
         }
-        openblas_dotu_like_contiguous(&dense_values, &factor_rhs[first_row..])
+        openblas_dotu_like_contiguous(&dense_values, &factor_rhs[range_start..range_end])
     } else {
         let mut dot = 0.0;
         for (&value, &row) in values.iter().zip(rows) {
-            dot = value.mul_add(factor_rhs[row], dot);
+            if (range_start..range_end).contains(&row) {
+                dot = value.mul_add(factor_rhs[row], dot);
+            }
         }
         dot
     }
 }
 
+fn lower_transpose_gemv_dot_like_native(
+    pivot: usize,
+    range_start: usize,
+    range_end: usize,
+    lower_col_ptrs: &[usize],
+    lower_row_indices: &[usize],
+    lower_values: &[f64],
+    factor_rhs: &[f64],
+) -> f64 {
+    debug_assert!(range_start <= range_end);
+    let start = lower_col_ptrs[pivot];
+    let end = lower_col_ptrs[pivot + 1];
+    let rows = &lower_row_indices[start..end];
+    let values = &lower_values[start..end];
+    if range_start == range_end {
+        return 0.0;
+    }
+    let mut dense_values = vec![0.0; range_end - range_start];
+    for (&value, &row) in values.iter().zip(rows) {
+        if (range_start..range_end).contains(&row) {
+            dense_values[row - range_start] = value;
+        }
+    }
+    openblas_gemv_t_dot_like_contiguous(&dense_values, &factor_rhs[range_start..range_end])
+}
+
 fn openblas_dotu_like_contiguous(lhs: &[f64], rhs: &[f64]) -> f64 {
     debug_assert_eq!(lhs.len(), rhs.len());
     openblas_dotu_like_contiguous_impl(lhs, rhs)
+}
+
+fn openblas_gemv_t_dot_like_contiguous(lhs: &[f64], rhs: &[f64]) -> f64 {
+    debug_assert_eq!(lhs.len(), rhs.len());
+    openblas_gemv_t_dot_like_contiguous_impl(lhs, rhs)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -3165,6 +3333,56 @@ fn openblas_dotu_like_contiguous_impl(lhs: &[f64], rhs: &[f64]) -> f64 {
 
 #[cfg(not(target_arch = "aarch64"))]
 fn openblas_dotu_like_contiguous_impl(lhs: &[f64], rhs: &[f64]) -> f64 {
+    let mut dot = 0.0;
+    for (&left, &right) in lhs.iter().zip(rhs) {
+        dot = left.mul_add(right, dot);
+    }
+    dot
+}
+
+#[cfg(target_arch = "aarch64")]
+fn openblas_gemv_t_dot_like_contiguous_impl(lhs: &[f64], rhs: &[f64]) -> f64 {
+    // ARM64 OpenBLAS dgemv_t reduces each output column through four two-lane
+    // accumulators over 32- and 8-element chunks, then folds scalar remainder.
+    const CHUNK_32: usize = 32;
+    const CHUNK_8: usize = 8;
+    const ACCUMULATORS: usize = 4;
+
+    let mut accumulators = [[0.0; 2]; ACCUMULATORS];
+    let mut offset = 0;
+    while offset + CHUNK_32 <= lhs.len() {
+        for group in 0..4 {
+            let group_base = offset + group * CHUNK_8;
+            for (accumulator, lanes) in accumulators.iter_mut().enumerate() {
+                let index = group_base + 2 * accumulator;
+                lanes[0] = lhs[index].mul_add(rhs[index], lanes[0]);
+                lanes[1] = lhs[index + 1].mul_add(rhs[index + 1], lanes[1]);
+            }
+        }
+        offset += CHUNK_32;
+    }
+    while offset + CHUNK_8 <= lhs.len() {
+        for (accumulator, lanes) in accumulators.iter_mut().enumerate() {
+            let index = offset + 2 * accumulator;
+            lanes[0] = lhs[index].mul_add(rhs[index], lanes[0]);
+            lanes[1] = lhs[index + 1].mul_add(rhs[index + 1], lanes[1]);
+        }
+        offset += CHUNK_8;
+    }
+
+    let pair0 = accumulators[0][0] + accumulators[0][1];
+    let pair1 = accumulators[1][0] + accumulators[1][1];
+    let pair2 = accumulators[2][0] + accumulators[2][1];
+    let pair3 = accumulators[3][0] + accumulators[3][1];
+    let mut dot = (pair0 + pair1) + (pair2 + pair3);
+    for index in offset..lhs.len() {
+        dot = lhs[index].mul_add(rhs[index], dot);
+    }
+    dot
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn openblas_gemv_t_dot_like_contiguous_impl(lhs: &[f64], rhs: &[f64]) -> f64 {
     let mut dot = 0.0;
     for (&left, &right) in lhs.iter().zip(rhs) {
         dot = left.mul_add(right, dot);
