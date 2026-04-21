@@ -3410,6 +3410,8 @@ mod tests {
             trial_count: usize,
             events: String,
             inertia: String,
+            alpha_pr_limiter: String,
+            alpha_du_limiter: String,
         }
 
         fn log_gap(lhs: f64, rhs: f64, floor: f64) -> f64 {
@@ -3502,6 +3504,18 @@ mod tests {
                 )
         }
 
+        fn limiter_text(limiter: Option<&optimization::InteriorPointBoundaryLimiter>) -> String {
+            limiter.map_or_else(
+                || "--".to_string(),
+                |limiter| {
+                    format!(
+                        "#{} val={:.3e} dir={:.3e} a={:.3e}",
+                        limiter.index, limiter.value, limiter.direction, limiter.alpha
+                    )
+                },
+            )
+        }
+
         fn print_trace_window(
             nlip_trace: &[TracePoint],
             ipopt_trace: &[TracePoint],
@@ -3515,14 +3529,14 @@ mod tests {
             };
             let end = (center + 5).min(compared);
             println!(
-                "trace_window index={} range={}..{} columns: idx | nlip(iter tag obj primal dual mu reg alpha_pr alpha_du ls inertia evt) || ipopt(iter tag obj primal dual mu reg alpha_pr alpha_du ls)",
+                "trace_window index={} range={}..{} columns: idx | nlip(iter tag obj primal dual mu reg alpha_pr alpha_du ls inertia evt limiter_pr limiter_du) || ipopt(iter tag obj primal dual mu reg alpha_pr alpha_du ls)",
                 center, start, end
             );
             for index in start..end {
                 let nlip = &nlip_trace[index];
                 let ipopt = &ipopt_trace[index];
                 println!(
-                    "trace[{index:02}] | nlip({:>3} {:>2} {:>12.5e} {:>10.3e} {:>10.3e} {:>9.2e} {:>8} {:>9.2e} {:>9.2e} {:>2} {:>13} {:<10}) || ipopt({:>3} {:>2} {:>12.5e} {:>10.3e} {:>10.3e} {:>9.2e} {:>8} {:>9.2e} {:>9.2e} {:>2})",
+                    "trace[{index:02}] | nlip({:>3} {:>2} {:>12.5e} {:>10.3e} {:>10.3e} {:>9.2e} {:>8} {:>9.2e} {:>9.2e} {:>2} {:>13} {:<10} {:<34} {:<34}) || ipopt({:>3} {:>2} {:>12.5e} {:>10.3e} {:>10.3e} {:>9.2e} {:>8} {:>9.2e} {:>9.2e} {:>2})",
                     nlip.iteration,
                     nlip.step_tag,
                     nlip.objective,
@@ -3535,6 +3549,8 @@ mod tests {
                     nlip.trial_count,
                     nlip.inertia,
                     nlip.events,
+                    nlip.alpha_pr_limiter,
+                    nlip.alpha_du_limiter,
                     ipopt.iteration,
                     ipopt.step_tag,
                     ipopt.objective,
@@ -3631,6 +3647,18 @@ mod tests {
                 trial_count: snapshot.line_search_trials,
                 events: optimization::nlip_event_codes_for_events(&snapshot.events),
                 inertia: nlip_primary_inertia_text(snapshot),
+                alpha_pr_limiter: limiter_text(
+                    snapshot
+                        .direction_diagnostics
+                        .as_ref()
+                        .and_then(|diagnostics| diagnostics.alpha_pr_limiter.as_ref()),
+                ),
+                alpha_du_limiter: limiter_text(
+                    snapshot
+                        .direction_diagnostics
+                        .as_ref()
+                        .and_then(|diagnostics| diagnostics.alpha_du_limiter.as_ref()),
+                ),
             })
             .collect::<Vec<_>>();
 
@@ -3653,6 +3681,8 @@ mod tests {
                 trial_count: snapshot.line_search_trials.saturating_sub(1),
                 events: String::new(),
                 inertia: String::new(),
+                alpha_pr_limiter: String::new(),
+                alpha_du_limiter: String::new(),
             })
             .collect::<Vec<_>>();
 
