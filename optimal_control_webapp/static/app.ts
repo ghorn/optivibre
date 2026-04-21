@@ -3005,6 +3005,9 @@ function appendControl(wrapperParent: HTMLElement, control: ControlSpec): void {
       if (Number.isFinite(control.min) && numeric < control.min) {
         return;
       }
+      if (Number.isFinite(control.max) && numeric > control.max) {
+        return;
+      }
       state.values[control.id] = numeric;
       pill.textContent = formatValue(numeric);
       handleControlUpdate(control);

@@ -4017,20 +4017,7 @@ pub fn transcription_controls(
     supported_degrees: &[usize],
 ) -> Vec<ControlSpec> {
     let mut controls = vec![
-        select_control(
-            SharedControlId::TranscriptionIntervals.id(),
-            "Intervals",
-            default.intervals as f64,
-            "",
-            "Number of mesh intervals. Changing this compiles a matching transcription variant on demand.",
-            &supported_intervals
-                .iter()
-                .map(|value| (*value as f64, value.to_string()))
-                .collect::<Vec<_>>(),
-            ControlSection::Transcription,
-            ControlVisibility::Always,
-            ControlSemantic::TranscriptionIntervals,
-        ),
+        transcription_interval_control(default.intervals, supported_intervals),
         select_control(
             SharedControlId::TranscriptionMethod.id(),
             "Transcription",
@@ -4076,6 +4063,45 @@ pub fn transcription_controls(
     ];
     controls.extend(ocp_sx_function_controls(OcpSxFunctionConfig::default()));
     controls
+}
+
+fn transcription_interval_control(default: usize, supported_intervals: &[usize]) -> ControlSpec {
+    let (min, max) = interval_bounds(supported_intervals, default);
+    ControlSpec {
+        id: SharedControlId::TranscriptionIntervals.id().to_string(),
+        label: "Intervals".to_string(),
+        min: min as f64,
+        max: max as f64,
+        step: 1.0,
+        default: default as f64,
+        unit: String::new(),
+        help: format!(
+            "Number of mesh intervals. Enter an integer from {min} to {max}; changing this compiles a matching transcription variant on demand."
+        ),
+        section: ControlSection::Transcription,
+        panel: None,
+        editor: ControlEditor::Text,
+        visibility: ControlVisibility::Always,
+        semantic: ControlSemantic::TranscriptionIntervals,
+        value_display: ControlValueDisplay::Integer,
+        choices: Vec::new(),
+    }
+}
+
+fn interval_bounds(supported_intervals: &[usize], default: usize) -> (usize, usize) {
+    let min = supported_intervals
+        .iter()
+        .copied()
+        .min()
+        .unwrap_or(default)
+        .max(1);
+    let max = supported_intervals
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(default)
+        .max(min);
+    (min, max)
 }
 
 pub fn solver_controls(default_method: SolverMethod, default: SolverConfig) -> Vec<ControlSpec> {
@@ -5125,9 +5151,10 @@ pub fn transcription_from_map(
         SharedControlId::TranscriptionIntervals.id(),
     )?
     .round() as usize;
-    if !supported_intervals.contains(&intervals) {
+    let (min_intervals, max_intervals) = interval_bounds(supported_intervals, default.intervals);
+    if intervals < min_intervals || intervals > max_intervals {
         return Err(anyhow!(
-            "unsupported {} {}",
+            "unsupported {} {}; expected {min_intervals}..={max_intervals}",
             SharedControlId::TranscriptionIntervals.id(),
             intervals
         ));
@@ -9130,6 +9157,45 @@ mod tests {
         assert_eq!(hessian.section, ControlSection::Transcription);
         assert_eq!(hessian.panel, Some(ControlPanel::SxFunctions));
         assert_eq!(hessian.semantic, ControlSemantic::SxFunctionOption);
+    }
+
+    #[test]
+    fn transcription_controls_use_text_entry_for_interval_count() {
+        let controls =
+            transcription_controls(default_transcription(30), &[10, 20, 30, 40], &[2, 3, 4]);
+        let intervals = controls
+            .iter()
+            .find(|control| control.id == "transcription_intervals")
+            .expect("expected interval control");
+        let collocation_nodes = controls
+            .iter()
+            .find(|control| control.id == "collocation_degree")
+            .expect("expected collocation node control");
+
+        assert_eq!(intervals.section, ControlSection::Transcription);
+        assert_eq!(intervals.editor, ControlEditor::Text);
+        assert_eq!(intervals.value_display, ControlValueDisplay::Integer);
+        assert!(intervals.choices.is_empty());
+        assert_eq!(intervals.min, 10.0);
+        assert_eq!(intervals.max, 40.0);
+        assert_eq!(collocation_nodes.editor, ControlEditor::Select);
+        assert_eq!(collocation_nodes.choices.len(), 3);
+    }
+
+    #[test]
+    fn transcription_from_map_accepts_any_interval_inside_configured_range() {
+        let default = default_transcription(30);
+        let mut values = BTreeMap::new();
+        values.insert("transcription_intervals".to_string(), 25.0);
+
+        let parsed = transcription_from_map(&values, default, &[10, 20, 30, 40], &[3])
+            .expect("interval inside range should parse");
+        assert_eq!(parsed.intervals, 25);
+
+        values.insert("transcription_intervals".to_string(), 45.0);
+        let error = transcription_from_map(&values, default, &[10, 20, 30, 40], &[3])
+            .expect_err("interval outside range should fail");
+        assert!(error.to_string().contains("expected 10..=40"));
     }
 
     #[test]
