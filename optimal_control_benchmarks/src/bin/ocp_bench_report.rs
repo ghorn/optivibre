@@ -2831,6 +2831,8 @@ fn matrix_problem_title(problem_id: ProblemId) -> &'static str {
         ProblemId::LinearSManeuver => "Linear-S",
         ProblemId::SailboatUpwind => "Sailboat",
         ProblemId::CraneTransfer => "Crane",
+        ProblemId::HangingChainStatic => "Chain",
+        ProblemId::RosenbrockVariants => "Rosenbrock",
     }
 }
 
@@ -3990,6 +3992,8 @@ fn short_problem_label(problem_id: ProblemId) -> &'static str {
         ProblemId::LinearSManeuver => "Lin",
         ProblemId::SailboatUpwind => "Sai",
         ProblemId::CraneTransfer => "Crn",
+        ProblemId::HangingChainStatic => "Chn",
+        ProblemId::RosenbrockVariants => "Ros",
     }
 }
 
