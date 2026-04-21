@@ -4426,6 +4426,46 @@ mod tests {
             );
         }
 
+        fn print_internal_probe_window(
+            label: &str,
+            center_index: usize,
+            accepted_nlip_solver_snapshots: &[optimization::InteriorPointIterationSnapshot],
+            accepted_ipopt_solver_snapshots: &[optimization::IpoptIterationSnapshot],
+            ipopt_trace: &[TracePoint],
+            bounds: &VariableBoundView,
+            intervals: usize,
+            order: usize,
+        ) {
+            let probe_start = center_index.saturating_sub(4);
+            let probe_end = (center_index + 3)
+                .min(accepted_ipopt_solver_snapshots.len())
+                .min(accepted_nlip_solver_snapshots.len());
+            println!("{label} internal IPOPT/NLIP state probes range={probe_start}..{probe_end}");
+            for probe_index in probe_start..probe_end {
+                if probe_index > 0 {
+                    println!(
+                        "          ipopt alpha_pr limiters: {}",
+                        ipopt_fraction_to_boundary_limiters(
+                            &accepted_ipopt_solver_snapshots[probe_index - 1],
+                            &accepted_ipopt_solver_snapshots[probe_index],
+                            bounds,
+                            ipopt_trace[probe_index].alpha_pr,
+                            intervals,
+                            order,
+                        )
+                    );
+                }
+                print_internal_ipopt_probe(
+                    probe_index,
+                    &accepted_nlip_solver_snapshots[probe_index],
+                    &accepted_ipopt_solver_snapshots[probe_index],
+                    bounds,
+                    intervals,
+                    order,
+                );
+            }
+        }
+
         fn print_trace_window(
             nlip_trace: &[TracePoint],
             ipopt_trace: &[TracePoint],
@@ -4887,6 +4927,16 @@ mod tests {
                 params.transcription.intervals,
                 params.transcription.collocation_degree,
             );
+            print_internal_probe_window(
+                "first_direction_divergence",
+                direction_index,
+                &accepted_nlip_solver_snapshots,
+                &accepted_ipopt_solver_snapshots,
+                &ipopt_trace,
+                &variable_bounds,
+                params.transcription.intervals,
+                params.transcription.collocation_degree,
+            );
         }
         for (index, (nlip_point, ipopt_point)) in
             nlip_trace.iter().zip(ipopt_trace.iter()).enumerate()
@@ -4975,37 +5025,16 @@ mod tests {
                     params.transcription.intervals,
                     params.transcription.collocation_degree,
                 );
-                let probe_start = index.saturating_sub(4);
-                let probe_end = (index + 3)
-                    .min(accepted_ipopt_solver_snapshots.len())
-                    .min(accepted_nlip_solver_snapshots.len());
-                println!(
-                    "internal IPOPT/NLIP state probes range={}..{}",
-                    probe_start, probe_end
+                print_internal_probe_window(
+                    "accepted-state divergence",
+                    index,
+                    &accepted_nlip_solver_snapshots,
+                    &accepted_ipopt_solver_snapshots,
+                    &ipopt_trace,
+                    &variable_bounds,
+                    params.transcription.intervals,
+                    params.transcription.collocation_degree,
                 );
-                for probe_index in probe_start..probe_end {
-                    if probe_index > 0 {
-                        println!(
-                            "          ipopt alpha_pr limiters: {}",
-                            ipopt_fraction_to_boundary_limiters(
-                                &accepted_ipopt_solver_snapshots[probe_index - 1],
-                                &accepted_ipopt_solver_snapshots[probe_index],
-                                &variable_bounds,
-                                ipopt_trace[probe_index].alpha_pr,
-                                params.transcription.intervals,
-                                params.transcription.collocation_degree,
-                            )
-                        );
-                    }
-                    print_internal_ipopt_probe(
-                        probe_index,
-                        &accepted_nlip_solver_snapshots[probe_index],
-                        &accepted_ipopt_solver_snapshots[probe_index],
-                        &variable_bounds,
-                        params.transcription.intervals,
-                        params.transcription.collocation_degree,
-                    );
-                }
                 return;
             }
         }
