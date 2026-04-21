@@ -1597,8 +1597,8 @@ fn hanging_chain_artifact(
         .visualizations
         .push(ArtifactVisualization::Paths3D {
             title: "Chain Convergence".to_string(),
-            x_label: "chain x".to_string(),
-            y_label: "iteration".to_string(),
+            x_label: "iteration".to_string(),
+            y_label: "chain x".to_string(),
             z_label: "chain y".to_string(),
             paths: chain_history_paths_3d(history, span),
         });
@@ -1613,8 +1613,8 @@ fn chain_history_paths_3d(history: &[Vec<f64>], span: f64) -> Vec<ScenePath3D> {
             let points = chain_points_from_flat(state, span);
             ScenePath3D {
                 name: format!("iter {idx}"),
-                x: points.iter().map(|(x, _)| *x).collect(),
-                y: vec![idx as f64; points.len()],
+                x: vec![idx as f64; points.len()],
+                y: points.iter().map(|(x, _)| *x).collect(),
                 z: points.iter().map(|(_, y)| *y).collect(),
             }
         })
