@@ -2074,7 +2074,7 @@ fn build_interior_point_kkt_snapshot(
         .zip(system.slack.iter())
         .enumerate()
         .map(|(index, (r_cent_i, slack_i))| {
-            -(r_cent_i / slack_i.max(1e-16) - damped_slack_stationarity_residual(system, index))
+            -(r_cent_i / slack_i - damped_slack_stationarity_residual(system, index))
         })
         .collect::<Vec<_>>();
     let pattern = build_spral_augmented_kkt_pattern(
@@ -2671,11 +2671,11 @@ fn filter_theta_l1_norm(
 }
 
 fn native_lower_bound_slack(x: &[f64], index: usize, lower: f64) -> f64 {
-    (x[index] - lower).max(1.0e-16)
+    x[index] - lower
 }
 
 fn native_upper_bound_slack(x: &[f64], index: usize, upper: f64) -> f64 {
-    (upper - x[index]).max(1.0e-16)
+    upper - x[index]
 }
 
 fn bound_relaxation_amount(bound: f64, options: &InteriorPointOptions) -> f64 {
@@ -2815,7 +2815,7 @@ fn slack_sigma_values(slack_barrier: &[f64], z: &[f64]) -> Vec<f64> {
     slack_barrier
         .iter()
         .zip(z.iter())
-        .map(|(slack_i, z_i)| z_i / slack_i.max(1.0e-16))
+        .map(|(slack_i, z_i)| z_i / slack_i)
         .collect()
 }
 
@@ -2866,7 +2866,7 @@ fn barrier_objective_directional_derivative(
     let slack_barrier_term = slack
         .iter()
         .zip(ds.iter())
-        .map(|(slack_i, ds_i)| ds_i / slack_i.max(1e-16))
+        .map(|(slack_i, ds_i)| ds_i / slack_i)
         .sum::<f64>();
     let lower_barrier_term = bounds
         .lower_indices
@@ -3594,9 +3594,8 @@ fn correct_bound_multiplier_estimate(
     let mut corrected_z = trial_z.to_vec();
     let mut max_correction = 0.0_f64;
     for (z_i, slack_i) in corrected_z.iter_mut().zip(trial_slack.iter()) {
-        let slack_floor = slack_i.max(1e-16);
-        let upper_multiplier = upper_complementarity / slack_floor;
-        let lower_multiplier = lower_complementarity / slack_floor;
+        let upper_multiplier = upper_complementarity / slack_i;
+        let lower_multiplier = lower_complementarity / slack_i;
         let corrected = z_i.min(upper_multiplier).max(lower_multiplier);
         max_correction = max_correction.max((corrected - *z_i).abs());
         *z_i = corrected;
@@ -5595,8 +5594,7 @@ fn fill_spral_augmented_kkt_values(
         values[slot] += system.inequality_jacobian.values[index];
     }
     for (index, &slot) in pattern.p_diagonal_indices.iter().enumerate() {
-        values[slot] +=
-            system.multipliers[index].max(1e-16) / system.slack[index].max(1e-16) + slack_shift;
+        values[slot] += system.multipliers[index] / system.slack[index] + slack_shift;
     }
     for &slot in &pattern.lambda_diagonal_indices {
         values[slot] += -dual_shift;
@@ -5995,7 +5993,7 @@ fn solve_reduced_kkt_with_native_spral_ssids(
         .zip(system.slack.iter())
         .enumerate()
         .map(|(index, (r_cent_i, slack_i))| {
-            -(r_cent_i / slack_i.max(1e-16) - damped_slack_stationarity_residual(system, index))
+            -(r_cent_i / slack_i - damped_slack_stationarity_residual(system, index))
         })
         .collect::<Vec<_>>();
     let total_dimension = workspace.pattern.dimension();
@@ -6153,7 +6151,7 @@ fn solve_reduced_kkt_with_spral_ssids(
         .zip(system.slack.iter())
         .enumerate()
         .map(|(index, (r_cent_i, slack_i))| {
-            -(r_cent_i / slack_i.max(1e-16) - damped_slack_stationarity_residual(system, index))
+            -(r_cent_i / slack_i - damped_slack_stationarity_residual(system, index))
         })
         .collect::<Vec<_>>();
     let total_dimension = workspace.pattern.dimension();
@@ -6387,7 +6385,7 @@ fn solve_reduced_kkt_with_sparse_qdldl(
                 .map(|(index, (((ds_i, r_cent_i), z_i), s_i))| {
                     (-r_cent_i + s_i * damped_slack_stationarity_residual(system, index)
                         - z_i * ds_i)
-                        / s_i.max(1e-16)
+                        / s_i
                 })
                 .collect::<Vec<_>>();
             let dz = d_ineq
@@ -6491,7 +6489,7 @@ fn solve_reduced_kkt_with_sparse_qdldl(
                         .map(|(index, (((ds_i, r_cent_i), z_i), s_i))| {
                             (-r_cent_i + s_i * damped_slack_stationarity_residual(system, index)
                                 - z_i * ds_i)
-                                / s_i.max(1e-16)
+                                / s_i
                         })
                         .collect::<Vec<_>>();
                     let dz = d_ineq
@@ -7716,7 +7714,7 @@ where
         }
         InteriorPointBoundMultiplierInitMethod::MuBased => {
             for (slack_i, z_i) in initial_slack_barrier.iter().zip(z.iter_mut()) {
-                *z_i = options.mu_init / slack_i.max(1e-8);
+                *z_i = options.mu_init / slack_i;
             }
             for ((&index, &lower), z_i) in bounds
                 .lower_indices
@@ -7724,7 +7722,7 @@ where
                 .zip(bounds.lower_values.iter())
                 .zip(z_lower.iter_mut())
             {
-                *z_i = options.mu_init / native_lower_bound_slack(&x, index, lower).max(1e-8);
+                *z_i = options.mu_init / native_lower_bound_slack(&x, index, lower);
             }
             for ((&index, &upper), z_i) in bounds
                 .upper_indices
@@ -7732,7 +7730,7 @@ where
                 .zip(bounds.upper_values.iter())
                 .zip(z_upper.iter_mut())
             {
-                *z_i = options.mu_init / native_upper_bound_slack(&x, index, upper).max(1e-8);
+                *z_i = options.mu_init / native_upper_bound_slack(&x, index, upper);
             }
         }
     }
