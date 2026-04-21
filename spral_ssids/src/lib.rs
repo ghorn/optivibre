@@ -771,6 +771,9 @@ pub fn analyse(
 ) -> Result<(SymbolicFactor, AnalyseInfo), SsidsError> {
     let graph =
         CsrGraph::from_symmetric_csc(matrix.dimension(), matrix.col_ptrs(), matrix.row_indices())?;
+    let column_has_entries = (0..matrix.dimension())
+        .map(|col| matrix.col_ptrs()[col + 1] > matrix.col_ptrs()[col])
+        .collect::<Vec<_>>();
     let analyse_started = Instant::now();
     match options.ordering {
         OrderingStrategy::Natural => {
@@ -780,8 +783,12 @@ pub fn analyse(
                 matrix.row_indices().len(),
             ));
             let permutation = Permutation::identity(matrix.dimension());
-            let result =
-                build_symbolic_result_with_native_supernode_order(&graph, permutation, "natural")?;
+            let result = build_symbolic_result_with_native_order(
+                &graph,
+                permutation,
+                &column_has_entries,
+                "natural",
+            )?;
             analyse_debug_log(format!(
                 "[spral_ssids::analyse] strategy=natural done in {:.3}s fill={} supernodes={}",
                 analyse_started.elapsed().as_secs_f64(),
@@ -797,9 +804,10 @@ pub fn analyse(
                 matrix.row_indices().len(),
             ));
             let summary = approximate_minimum_degree_order(&graph)?;
-            let result = build_symbolic_result_with_native_supernode_order(
+            let result = build_symbolic_result_with_native_order(
                 &graph,
                 summary.permutation,
+                &column_has_entries,
                 "approximate_minimum_degree",
             )?;
             analyse_debug_log(format!(
@@ -817,9 +825,10 @@ pub fn analyse(
                 matrix.row_indices().len(),
             ));
             let summary = nested_dissection_order(&graph, &ordering_options)?;
-            let result = build_symbolic_result_with_native_supernode_order(
+            let result = build_symbolic_result_with_native_order(
                 &graph,
                 summary.permutation,
+                &column_has_entries,
                 "nested_dissection",
             )?;
             analyse_debug_log(format!(
@@ -873,9 +882,10 @@ pub fn analyse(
             ));
 
             if amd_fill <= natural_fill && amd_fill <= nd_fill {
-                let result = build_symbolic_result_with_native_supernode_order(
+                let result = build_symbolic_result_with_native_order(
                     &graph,
                     amd_summary.permutation,
+                    &column_has_entries,
                     "auto_approximate_minimum_degree",
                 )?;
                 analyse_debug_log(format!(
@@ -884,9 +894,10 @@ pub fn analyse(
                 ));
                 Ok(result)
             } else if nd_fill <= natural_fill {
-                let result = build_symbolic_result_with_native_supernode_order(
+                let result = build_symbolic_result_with_native_order(
                     &graph,
                     summary.permutation,
+                    &column_has_entries,
                     "auto_nested_dissection",
                 )?;
                 analyse_debug_log(format!(
@@ -895,9 +906,10 @@ pub fn analyse(
                 ));
                 Ok(result)
             } else {
-                let result = build_symbolic_result_with_native_supernode_order(
+                let result = build_symbolic_result_with_native_order(
                     &graph,
                     natural_permutation,
+                    &column_has_entries,
                     "auto_natural",
                 )?;
                 analyse_debug_log(format!(
@@ -984,18 +996,30 @@ fn permute_graph(graph: &CsrGraph, permutation: &Permutation) -> CsrGraph {
     CsrGraph::from_edges(graph.vertex_count(), &edges).expect("permutation preserves graph shape")
 }
 
-fn build_symbolic_result_with_native_supernode_order(
+fn build_symbolic_result_with_native_order(
     graph: &CsrGraph,
-    base_permutation: Permutation,
+    mut current_permutation: Permutation,
+    column_has_entries: &[bool],
     ordering_kind: &'static str,
 ) -> Result<(SymbolicFactor, AnalyseInfo), SsidsError> {
-    let permuted_graph = permute_graph(graph, &base_permutation);
-    let (elimination_tree, column_counts, column_pattern) =
-        symbolic_factor_pattern(&permuted_graph);
-    let supernode_permutation = native_supernode_permutation(&elimination_tree, &column_counts);
+    let mut current_graph = permute_graph(graph, &current_permutation);
+    let (initial_tree, _, _) = symbolic_factor_pattern(&current_graph);
+    let (postorder_permutation, realn) =
+        native_postorder_permutation(&initial_tree, &current_permutation, column_has_entries);
+    if !is_identity_order(&postorder_permutation) {
+        current_permutation = compose_ordering_with_symbolic_permutation(
+            &current_permutation,
+            &postorder_permutation,
+        )?;
+        current_graph = permute_graph(graph, &current_permutation);
+    }
+
+    let (elimination_tree, column_counts, column_pattern) = symbolic_factor_pattern(&current_graph);
+    let supernode_permutation =
+        native_supernode_permutation(&elimination_tree, &column_counts, realn);
     if is_identity_order(&supernode_permutation) {
         return Ok(build_symbolic_result(
-            base_permutation,
+            current_permutation,
             elimination_tree,
             column_counts,
             column_pattern,
@@ -1004,7 +1028,7 @@ fn build_symbolic_result_with_native_supernode_order(
     }
 
     let final_permutation =
-        compose_ordering_with_supernode_permutation(&base_permutation, &supernode_permutation)?;
+        compose_ordering_with_symbolic_permutation(&current_permutation, &supernode_permutation)?;
     let final_graph = permute_graph(graph, &final_permutation);
     let (final_tree, final_counts, final_pattern) = symbolic_factor_pattern(&final_graph);
     Ok(build_symbolic_result(
@@ -1016,12 +1040,12 @@ fn build_symbolic_result_with_native_supernode_order(
     ))
 }
 
-fn compose_ordering_with_supernode_permutation(
+fn compose_ordering_with_symbolic_permutation(
     base_permutation: &Permutation,
-    supernode_permutation: &[usize],
+    symbolic_permutation: &[usize],
 ) -> Result<Permutation, OrderingError> {
     let mut perm = vec![usize::MAX; base_permutation.len()];
-    for (old_position, &new_position) in supernode_permutation.iter().enumerate() {
+    for (old_position, &new_position) in symbolic_permutation.iter().enumerate() {
         perm[new_position] = base_permutation.perm()[old_position];
     }
     Permutation::new(perm)
@@ -1034,17 +1058,76 @@ fn is_identity_order(order: &[usize]) -> bool {
         .all(|(index, &value)| index == value)
 }
 
+fn native_postorder_permutation(
+    elimination_tree: &[Option<usize>],
+    base_permutation: &Permutation,
+    column_has_entries: &[bool],
+) -> (Vec<usize>, usize) {
+    // Mirror SPRAL's core_analyse.find_postorder map construction. Native
+    // tests empty roots against raw CSC column length, so use the original
+    // column indices from the current inverse permutation rather than graph
+    // degree, which omits diagonal storage.
+    let n = elimination_tree.len();
+    if base_permutation.len() != n || column_has_entries.len() != n {
+        return ((0..n).collect(), n);
+    }
+
+    let virtual_root = n;
+    let mut children = vec![Vec::new(); n + 1];
+    for (node, parent) in elimination_tree.iter().copied().enumerate() {
+        children[parent.unwrap_or(virtual_root)].push(node);
+    }
+
+    let mut permutation = vec![usize::MAX; n];
+    let mut realn = n;
+    let mut next_id = n;
+    let mut stack = vec![virtual_root];
+    while let Some(node) = stack.pop() {
+        if node != virtual_root {
+            next_id = next_id.saturating_sub(1);
+            permutation[node] = next_id;
+        }
+
+        if node == virtual_root {
+            for &child in &children[node] {
+                let original_column = base_permutation.perm()[child];
+                if column_has_entries[original_column] {
+                    stack.push(child);
+                }
+            }
+            for &child in &children[node] {
+                let original_column = base_permutation.perm()[child];
+                if !column_has_entries[original_column] {
+                    realn -= 1;
+                    stack.push(child);
+                }
+            }
+        } else {
+            for &child in &children[node] {
+                stack.push(child);
+            }
+        }
+    }
+
+    if permutation.contains(&usize::MAX) {
+        return ((0..n).collect(), n);
+    }
+    (permutation, realn)
+}
+
 fn native_supernode_permutation(
     elimination_tree: &[Option<usize>],
     column_counts: &[usize],
+    realn: usize,
 ) -> Vec<usize> {
     // Mirror the renumbering part of SPRAL's core_analyse.find_supernodes:
     // merged vertices are walked with a small stack and then applied as a
     // second symbolic permutation before numeric factorization.
     let n = elimination_tree.len();
+    let realn = realn.min(n);
     let virtual_root = n;
     let mut children = vec![Vec::new(); n + 1];
-    for (node, parent) in elimination_tree.iter().copied().enumerate() {
+    for (node, parent) in elimination_tree.iter().copied().enumerate().take(realn) {
         children[parent.unwrap_or(virtual_root)].push(node);
     }
 
@@ -1073,7 +1156,7 @@ fn native_supernode_permutation(
     let mut permutation = vec![usize::MAX; n];
     let mut next_position = 0;
     let mut stack = Vec::new();
-    for node in 0..n {
+    for node in 0..realn {
         if !marked[node] {
             continue;
         }
@@ -1090,6 +1173,9 @@ fn native_supernode_permutation(
                 stack.push(head);
             }
         }
+    }
+    for (node, slot) in permutation.iter_mut().enumerate().skip(realn) {
+        *slot = node;
     }
 
     if permutation.contains(&usize::MAX) {
@@ -3608,10 +3694,12 @@ fn unpack_packed_lower_to_dense_square(size: usize, packed: &[f64]) -> Vec<f64> 
 
 #[cfg(test)]
 mod tests {
+    use metis_ordering::Permutation;
+
     use super::{
         NativeOrdering, NativeSpral, NumericFactorOptions, OrderingStrategy, SsidsOptions,
         SymmetricCscMatrix, analyse, build_symbolic_front_tree, dense_lower_offset, factorize,
-        factorize_dense_tpp_tail_in_place,
+        factorize_dense_tpp_tail_in_place, native_postorder_permutation,
     };
 
     #[derive(Clone, Debug)]
@@ -3642,6 +3730,32 @@ mod tests {
             let shift = self.next_u64() as u8 % (max_shift + 1);
             f64::from(numerator) / f64::from(1_u32 << shift)
         }
+    }
+
+    #[test]
+    fn native_postorder_matches_depth_first_mapping_for_branching_tree() {
+        let elimination_tree = vec![Some(3), Some(3), Some(4), Some(4), None];
+        let base_permutation = Permutation::identity(elimination_tree.len());
+        let column_has_entries = vec![true; elimination_tree.len()];
+
+        let (postorder, realn) =
+            native_postorder_permutation(&elimination_tree, &base_permutation, &column_has_entries);
+
+        assert_eq!(postorder, vec![1, 2, 0, 3, 4]);
+        assert_eq!(realn, elimination_tree.len());
+    }
+
+    #[test]
+    fn native_postorder_moves_empty_roots_after_real_columns() {
+        let elimination_tree = vec![None, None, None];
+        let base_permutation = Permutation::identity(elimination_tree.len());
+        let column_has_entries = vec![true, false, true];
+
+        let (postorder, realn) =
+            native_postorder_permutation(&elimination_tree, &base_permutation, &column_has_entries);
+
+        assert_eq!(postorder, vec![0, 2, 1]);
+        assert_eq!(realn, 2);
     }
 
     fn random_dense_dyadic_matrix(dimension: usize, rng: &mut DenseBoundaryRng) -> Vec<Vec<f64>> {
