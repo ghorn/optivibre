@@ -4091,6 +4091,31 @@ mod tests {
                 )
         }
 
+        fn direction_gap_ladder(nlip_trace: &[TracePoint], ipopt_trace: &[TracePoint]) -> String {
+            [1.0e-8, 1.0e-6, 1.0e-4, 1.0e-2, 1.0e-1]
+                .iter()
+                .map(|&threshold| {
+                    let marker = (1..nlip_trace.len().min(ipopt_trace.len())).find_map(|index| {
+                        let gap = max_direction_estimate_diff(
+                            &nlip_trace[index - 1],
+                            &nlip_trace[index],
+                            &ipopt_trace[index - 1],
+                            &ipopt_trace[index],
+                        );
+                        (gap > threshold).then_some((index, gap))
+                    });
+                    match marker {
+                        Some((index, gap)) => format!(
+                            ">{threshold:.0e}:index={index},nlip_iter={},ipopt_iter={},gap={gap:.3e}",
+                            nlip_trace[index].iteration, ipopt_trace[index].iteration
+                        ),
+                        None => format!(">{threshold:.0e}:none"),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        }
+
         fn expanded_compact_lower_bound_multipliers(
             compact: Option<&[f64]>,
             bounds: &VariableBoundView,
@@ -4816,6 +4841,15 @@ mod tests {
             ipopt_ocp_snapshots.len(),
             ipopt_snapshot_lengths
         );
+        println!(
+            "direction_gap_ladder {}",
+            direction_gap_ladder(&nlip_trace, &ipopt_trace)
+        );
+        let direction_window_threshold = std::env::var("GLIDER_PARITY_DIRECTION_THRESHOLD")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .unwrap_or(1.0e-1);
         if let Some((direction_index, direction_gap)) = (1..nlip_trace.len().min(ipopt_trace.len()))
             .find_map(|index| {
                 let gap = max_direction_estimate_diff(
@@ -4824,11 +4858,12 @@ mod tests {
                     &ipopt_trace[index - 1],
                     &ipopt_trace[index],
                 );
-                (gap > 1.0e-1).then_some((index, gap))
+                (gap > direction_window_threshold).then_some((index, gap))
             })
         {
             println!(
-                "first_direction_divergence index={} nlip_iter={} ipopt_iter={} max_dir_gap={:.3e}",
+                "first_direction_divergence threshold={:.3e} index={} nlip_iter={} ipopt_iter={} max_dir_gap={:.3e}",
+                direction_window_threshold,
                 direction_index,
                 nlip_trace[direction_index].iteration,
                 ipopt_trace[direction_index].iteration,
