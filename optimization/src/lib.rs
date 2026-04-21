@@ -79,6 +79,9 @@ pub use vectorize::{
 
 pub type Index = usize;
 const BOX_LABEL_WIDTH: usize = 13;
+const IPOPT_PERTURB_INC_FACT: f64 = 8.0;
+const IPOPT_MAX_HESSIAN_PERTURBATION: f64 = 1.0e20;
+const NATIVE_SPRAL_PARITY_INERTIA_CORRECTION_RETRIES: Index = 32;
 pub(crate) const EQ_INF_LABEL: &str = "‖eq‖∞";
 pub(crate) const INEQ_INF_LABEL: &str = "‖ineq₊‖∞";
 pub(crate) const DUAL_INF_LABEL: &str = "‖∇L‖∞";
@@ -314,6 +317,9 @@ pub fn apply_native_spral_parity_to_nlip_options(options: &mut InteriorPointOpti
     options.linear_solver = InteriorPointLinearSolver::NativeSpralSsids;
     options.regularization = 0.0;
     options.kappa_d = profile.kappa_d;
+    options.regularization_growth_factor = IPOPT_PERTURB_INC_FACT;
+    options.regularization_max = IPOPT_MAX_HESSIAN_PERTURBATION;
+    options.adaptive_regularization_retries = NATIVE_SPRAL_PARITY_INERTIA_CORRECTION_RETRIES;
     options.spral_pivot_method = match profile.pivot_method {
         SpralParityPivotProfile::Block => InteriorPointSpralPivotMethod::BlockAposteriori,
     };
@@ -4761,12 +4767,34 @@ fn log_boxed_section(title: &str, lines: &[String], title_style: fn(&str) -> Str
 
 #[cfg(test)]
 mod tests {
-    use super::visible_len;
+    use super::{
+        IPOPT_MAX_HESSIAN_PERTURBATION, IPOPT_PERTURB_INC_FACT, InteriorPointLinearSolver,
+        NATIVE_SPRAL_PARITY_INERTIA_CORRECTION_RETRIES, native_spral_parity_nlip_options,
+        visible_len,
+    };
 
     #[test]
     fn visible_len_ignores_ansi_and_counts_unicode_chars() {
         let styled = "\u{1b}[1m‖ineq₊‖∞=1.70e-08\u{1b}[0m";
         assert_eq!(visible_len(styled), "‖ineq₊‖∞=1.70e-08".chars().count());
+    }
+
+    #[test]
+    fn native_spral_parity_nlip_options_use_ipopt_inertia_correction_scale() {
+        let options = native_spral_parity_nlip_options();
+
+        assert_eq!(
+            options.linear_solver,
+            InteriorPointLinearSolver::NativeSpralSsids
+        );
+        assert_eq!(options.regularization, 0.0);
+        assert_eq!(options.first_hessian_perturbation, 1.0e-4);
+        assert_eq!(options.regularization_growth_factor, IPOPT_PERTURB_INC_FACT);
+        assert_eq!(options.regularization_max, IPOPT_MAX_HESSIAN_PERTURBATION);
+        assert_eq!(
+            options.adaptive_regularization_retries,
+            NATIVE_SPRAL_PARITY_INERTIA_CORRECTION_RETRIES
+        );
     }
 }
 
