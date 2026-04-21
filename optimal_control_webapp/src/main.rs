@@ -675,8 +675,9 @@ fn nlip_linear_solver_for_values(
         control_value_for_semantic(problem, values, ControlSemantic::SolverNlipLinearSolver)?;
     match value.round() as i64 {
         0 => Some(InteriorPointLinearSolver::SpralSsids),
-        1 => Some(InteriorPointLinearSolver::SparseQdldl),
-        2 => Some(InteriorPointLinearSolver::Auto),
+        1 => Some(InteriorPointLinearSolver::NativeSpralSsids),
+        2 => Some(InteriorPointLinearSolver::SparseQdldl),
+        3 => Some(InteriorPointLinearSolver::Auto),
         _ => None,
     }
 }

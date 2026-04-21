@@ -1283,6 +1283,7 @@ mod tests {
         NativeSpral, NumericFactorOptions, OrderingStrategy, SsidsOptions, SymmetricCscMatrix,
         analyse as spral_analyse, factorize as spral_factorize,
     };
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
     use std::time::{Duration, Instant};
@@ -3721,5 +3722,21 @@ mod tests {
                 "{label} expected clean glider direct-collocation Hessian\nworst: {worst}\nworst_missing: {worst_missing}\nworst_extra: {worst_extra}\nsummary: {summary:?}"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "manual direct reproducer for native SPRAL webapp glider solve crash"]
+    fn reproduce_native_spral_webapp_glider_solve() {
+        if NativeSpral::load().is_err() {
+            eprintln!(
+                "skipping native SPRAL webapp-style glider solve reproducer: library unavailable"
+            );
+            return;
+        }
+        let mut values = BTreeMap::new();
+        values.insert("solver_method".to_string(), 1.0);
+        values.insert("solver_nlip_linear_solver".to_string(), 1.0);
+        values.insert("solver_max_iters".to_string(), 200.0);
+        let _ = crate::solve_problem(crate::ProblemId::OptimalDistanceGlider, &values);
     }
 }

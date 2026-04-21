@@ -139,9 +139,17 @@ impl Default for SsidsOptions {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PivotMethod {
+    AggressiveAposteriori,
+    BlockAposteriori,
+    ThresholdPartial,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NumericFactorOptions {
     pub action_on_zero_pivot: bool,
+    pub pivot_method: PivotMethod,
     pub small_pivot_tolerance: f64,
     pub threshold_pivot_u: f64,
     pub inertia_zero_tol: f64,
@@ -151,8 +159,9 @@ impl Default for NumericFactorOptions {
     fn default() -> Self {
         Self {
             action_on_zero_pivot: true,
+            pivot_method: PivotMethod::BlockAposteriori,
             small_pivot_tolerance: 1e-20,
-            threshold_pivot_u: 0.01,
+            threshold_pivot_u: 1e-8,
             inertia_zero_tol: 1e-10,
         }
     }
@@ -2053,6 +2062,19 @@ fn factorize_dense_front(
     options: NumericFactorOptions,
 ) -> Result<DenseFrontFactorization, SsidsError> {
     let size = rows.len();
+    if matches!(options.pivot_method, PivotMethod::ThresholdPartial) {
+        let mut tpp_ld = vec![0.0; size.saturating_mul(2).max(1)];
+        return factorize_dense_tpp_tail_in_place(
+            &mut rows,
+            &mut dense,
+            0,
+            candidate_len.min(size),
+            options,
+            false,
+            &mut tpp_ld,
+        );
+    }
+
     let mut stats = PanelFactorStats::default();
     let mut factor_order = Vec::new();
     let mut factor_columns = Vec::new();
@@ -2710,7 +2732,10 @@ mod tests {
             &mut dense,
             0,
             2,
-            NumericFactorOptions::default(),
+            NumericFactorOptions {
+                threshold_pivot_u: 0.01,
+                ..NumericFactorOptions::default()
+            },
             false,
             &mut ld,
         )

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use libloading::{Library, Symbol};
 use thiserror::Error;
 
-use crate::{Inertia, SymmetricCscMatrix};
+use crate::{Inertia, NumericFactorOptions, PivotMethod, SymmetricCscMatrix};
 
 type SpralDefaultOptionsFn = unsafe extern "C" fn(*mut SpralSsidsOptions);
 type SpralAnalyseFn = unsafe extern "C" fn(
@@ -252,6 +252,14 @@ impl NativeSpral {
         &self,
         matrix: SymmetricCscMatrix<'_>,
     ) -> Result<NativeSpralSession, NativeSpralError> {
+        self.analyse_with_options(matrix, &NumericFactorOptions::default())
+    }
+
+    pub fn analyse_with_options(
+        &self,
+        matrix: SymmetricCscMatrix<'_>,
+        numeric_options: &NumericFactorOptions,
+    ) -> Result<NativeSpralSession, NativeSpralError> {
         if matrix.dimension() > i32::MAX as usize {
             return Err(NativeSpralError::DimensionTooLarge {
                 dimension: matrix.dimension(),
@@ -273,6 +281,7 @@ impl NativeSpral {
         options.use_gpu = false;
         options.ignore_numa = true;
         options.print_level = 0;
+        apply_numeric_factor_options(&mut options, numeric_options);
 
         let mut inform = SpralSsidsInform::default();
         let mut analysed = ptr::null_mut();
@@ -312,6 +321,17 @@ impl NativeSpral {
             factorized: ptr::null_mut(),
         })
     }
+}
+
+fn apply_numeric_factor_options(native: &mut SpralSsidsOptions, numeric: &NumericFactorOptions) {
+    native.action = numeric.action_on_zero_pivot;
+    native.pivot_method = match numeric.pivot_method {
+        PivotMethod::AggressiveAposteriori => 1,
+        PivotMethod::BlockAposteriori => 2,
+        PivotMethod::ThresholdPartial => 3,
+    };
+    native.small = numeric.small_pivot_tolerance;
+    native.u = numeric.threshold_pivot_u;
 }
 
 impl NativeSpralSession {

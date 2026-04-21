@@ -6,8 +6,9 @@ use spral_ssids::{
     AnalyseInfo as SpralAnalyseInfo, Inertia as SpralInertia, NativeSpral as NativeSpralLibrary,
     NativeSpralSession, NumericFactor as SpralNumericFactor,
     NumericFactorOptions as SpralNumericFactorOptions, OrderingStrategy as SpralOrderingStrategy,
-    SsidsOptions as SpralSsidsOptions, SymbolicFactor as SpralSymbolicFactor,
-    SymmetricCscMatrix as SpralSymmetricCscMatrix, analyse as spral_analyse,
+    PivotMethod as SpralPivotMethod, SsidsOptions as SpralSsidsOptions,
+    SymbolicFactor as SpralSymbolicFactor, SymmetricCscMatrix as SpralSymmetricCscMatrix,
+    analyse as spral_analyse,
     current_factorization_progress as spral_current_factorization_progress,
     factorize as spral_factorize,
 };
@@ -54,6 +55,24 @@ impl InteriorPointLinearSolver {
             Self::SpralSsids => "spral_ssids",
             Self::NativeSpralSsids => "native_spral_ssids",
             Self::SparseQdldl => "sparse_qdldl",
+        }
+    }
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InteriorPointSpralPivotMethod {
+    AggressiveAposteriori,
+    BlockAposteriori,
+    ThresholdPartial,
+}
+
+impl InteriorPointSpralPivotMethod {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::AggressiveAposteriori => "aggressive_app",
+            Self::BlockAposteriori => "block_app",
+            Self::ThresholdPartial => "threshold_partial",
         }
     }
 }
@@ -241,6 +260,10 @@ pub struct InteriorPointOptions {
     pub watchdog_trial_iter_max: Index,
     pub mu_min: f64,
     pub linear_solver: InteriorPointLinearSolver,
+    pub spral_pivot_method: InteriorPointSpralPivotMethod,
+    pub spral_action_on_zero_pivot: bool,
+    pub spral_small_pivot_tolerance: f64,
+    pub spral_threshold_pivot_u: f64,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub linear_debug: Option<InteriorPointLinearDebugOptions>,
     pub verbose: bool,
@@ -304,6 +327,10 @@ impl Default for InteriorPointOptions {
             watchdog_trial_iter_max: 3,
             mu_min: 1e-12,
             linear_solver: InteriorPointLinearSolver::SpralSsids,
+            spral_pivot_method: InteriorPointSpralPivotMethod::BlockAposteriori,
+            spral_action_on_zero_pivot: true,
+            spral_small_pivot_tolerance: 1e-20,
+            spral_threshold_pivot_u: 1e-8,
             linear_debug: None,
             verbose: true,
         }
@@ -312,10 +339,18 @@ impl Default for InteriorPointOptions {
 
 pub fn format_nlip_settings_summary(options: &InteriorPointOptions) -> String {
     format!(
-        "filter={}; linear_solver={}; linear_debug={}; beta={}; c1={}; min_step={}; tau={}; alpha_y=[strategy={}, tol={}] ; init=[bound_push={}, bound_frac={}, slack_push={}, slack_frac={}] ; dual_init=[method={}, val={}, least_square={}, max={}] ; regularization={} (retries={}, growth={}, max={}); soc={}; watchdog=[trigger={}, max={}]; filter_reset=[max={}, trigger={}]; tiny_step={}; mu=[init={}, target={}, min={}, barrier_tol={}, linear={}, superlinear={}, fast={}]; theta=[{}, {}]; acceptable_iter={}",
+        "filter={}; linear_solver={}; linear_debug={}; spral=[pivot={}, action={}, small={}, u={}]; beta={}; c1={}; min_step={}; tau={}; alpha_y=[strategy={}, tol={}] ; init=[bound_push={}, bound_frac={}, slack_push={}, slack_frac={}] ; dual_init=[method={}, val={}, least_square={}, max={}] ; regularization={} (retries={}, growth={}, max={}); soc={}; watchdog=[trigger={}, max={}]; filter_reset=[max={}, trigger={}]; tiny_step={}; mu=[init={}, target={}, min={}, barrier_tol={}, linear={}, superlinear={}, fast={}]; theta=[{}, {}]; acceptable_iter={}",
         "on",
         options.linear_solver.label(),
         format_nlip_linear_debug_summary(options.linear_debug.as_ref()),
+        options.spral_pivot_method.label(),
+        if options.spral_action_on_zero_pivot {
+            "continue"
+        } else {
+            "abort"
+        },
+        sci_text(options.spral_small_pivot_tolerance),
+        sci_text(options.spral_threshold_pivot_u),
         sci_text(options.line_search_beta),
         sci_text(options.line_search_c1),
         sci_text(options.min_step),
@@ -386,6 +421,38 @@ fn format_nlip_linear_debug_summary(options: Option<&InteriorPointLinearDebugOpt
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "-".into());
     format!("on[schedule={schedule}, compare={compare}, dump={dump}]")
+}
+
+fn spral_numeric_factor_options(options: &InteriorPointOptions) -> SpralNumericFactorOptions {
+    SpralNumericFactorOptions {
+        action_on_zero_pivot: options.spral_action_on_zero_pivot,
+        pivot_method: match options.spral_pivot_method {
+            InteriorPointSpralPivotMethod::AggressiveAposteriori => {
+                SpralPivotMethod::AggressiveAposteriori
+            }
+            InteriorPointSpralPivotMethod::BlockAposteriori => SpralPivotMethod::BlockAposteriori,
+            InteriorPointSpralPivotMethod::ThresholdPartial => SpralPivotMethod::ThresholdPartial,
+        },
+        small_pivot_tolerance: options.spral_small_pivot_tolerance,
+        threshold_pivot_u: options.spral_threshold_pivot_u,
+        ..SpralNumericFactorOptions::default()
+    }
+}
+
+fn system_spral_numeric_factor_options(system: &ReducedKktSystem<'_>) -> SpralNumericFactorOptions {
+    SpralNumericFactorOptions {
+        action_on_zero_pivot: system.spral_action_on_zero_pivot,
+        pivot_method: match system.spral_pivot_method {
+            InteriorPointSpralPivotMethod::AggressiveAposteriori => {
+                SpralPivotMethod::AggressiveAposteriori
+            }
+            InteriorPointSpralPivotMethod::BlockAposteriori => SpralPivotMethod::BlockAposteriori,
+            InteriorPointSpralPivotMethod::ThresholdPartial => SpralPivotMethod::ThresholdPartial,
+        },
+        small_pivot_tolerance: system.spral_small_pivot_tolerance,
+        threshold_pivot_u: system.spral_threshold_pivot_u,
+        ..SpralNumericFactorOptions::default()
+    }
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -989,6 +1056,10 @@ struct ReducedKktSystem<'a> {
     adaptive_regularization_retries: Index,
     regularization_growth_factor: f64,
     regularization_max: f64,
+    spral_pivot_method: InteriorPointSpralPivotMethod,
+    spral_action_on_zero_pivot: bool,
+    spral_small_pivot_tolerance: f64,
+    spral_threshold_pivot_u: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -1056,6 +1127,10 @@ struct InteriorPointKktSnapshot {
     adaptive_regularization_retries: Index,
     regularization_growth_factor: f64,
     regularization_max: f64,
+    spral_pivot_method: InteriorPointSpralPivotMethod,
+    spral_action_on_zero_pivot: bool,
+    spral_small_pivot_tolerance: f64,
+    spral_threshold_pivot_u: f64,
     augmented_pattern: SpralAugmentedKktPattern,
     augmented_values: Vec<f64>,
     augmented_rhs: Vec<f64>,
@@ -1144,6 +1219,7 @@ impl NativeSpralAugmentedKktWorkspace {
         hessian_structure: &CCS,
         equality_jacobian: &SparseMatrixStructure,
         inequality_jacobian: &SparseMatrixStructure,
+        numeric_options: &SpralNumericFactorOptions,
     ) -> std::result::Result<(Self, SpralAnalyseInfo), InteriorPointSolveError> {
         let pattern = build_spral_augmented_kkt_pattern(
             hessian_structure,
@@ -1166,11 +1242,13 @@ impl NativeSpralAugmentedKktWorkspace {
                 "failed to load native spral_ssids: {error}"
             ))
         })?;
-        let session = native.analyse(matrix).map_err(|error| {
-            InteriorPointSolveError::InvalidInput(format!(
-                "failed to analyse sparse KKT structure for native spral_ssids: {error}"
-            ))
-        })?;
+        let session = native
+            .analyse_with_options(matrix, numeric_options)
+            .map_err(|error| {
+                InteriorPointSolveError::InvalidInput(format!(
+                    "failed to analyse sparse KKT structure for native spral_ssids: {error}"
+                ))
+            })?;
         let analyse_info = session.analyse_info();
         let values = vec![0.0; pattern.ccs.nnz()];
         Ok((
@@ -1243,6 +1321,7 @@ fn prepare_native_spral_workspace(
     hessian_structure: &CCS,
     equality_jacobian: &SparseMatrixStructure,
     inequality_jacobian: &SparseMatrixStructure,
+    numeric_options: &SpralNumericFactorOptions,
     profiling: &mut InteriorPointProfiling,
     verbose: bool,
 ) -> std::result::Result<NativeSpralAugmentedKktWorkspace, InteriorPointSolveError> {
@@ -1267,6 +1346,7 @@ fn prepare_native_spral_workspace(
         hessian_structure,
         equality_jacobian,
         inequality_jacobian,
+        numeric_options,
     );
     profiling.sparse_symbolic_analysis_time += analyse_started.elapsed();
     match result {
@@ -1305,6 +1385,10 @@ impl InteriorPointKktSnapshot {
             adaptive_regularization_retries: self.adaptive_regularization_retries,
             regularization_growth_factor: self.regularization_growth_factor,
             regularization_max: self.regularization_max,
+            spral_pivot_method: self.spral_pivot_method,
+            spral_action_on_zero_pivot: self.spral_action_on_zero_pivot,
+            spral_small_pivot_tolerance: self.spral_small_pivot_tolerance,
+            spral_threshold_pivot_u: self.spral_threshold_pivot_u,
         }
     }
 }
@@ -1435,6 +1519,10 @@ fn build_interior_point_kkt_snapshot(
         adaptive_regularization_retries: system.adaptive_regularization_retries,
         regularization_growth_factor: system.regularization_growth_factor,
         regularization_max: system.regularization_max,
+        spral_pivot_method: system.spral_pivot_method,
+        spral_action_on_zero_pivot: system.spral_action_on_zero_pivot,
+        spral_small_pivot_tolerance: system.spral_small_pivot_tolerance,
+        spral_threshold_pivot_u: system.spral_threshold_pivot_u,
         augmented_pattern: pattern.clone(),
         augmented_values,
         augmented_rhs,
@@ -1574,6 +1662,7 @@ fn replay_snapshot_with_solver(
                     snapshot.hessian.lower_triangle.as_ref(),
                     snapshot.equality_jacobian.structure.as_ref(),
                     snapshot.inequality_jacobian.structure.as_ref(),
+                    &system_spral_numeric_factor_options(&system),
                     &mut scratch_profiling,
                     false,
                 ) {
@@ -3947,6 +4036,7 @@ fn spral_expected_augmented_inertia(pattern: &SpralAugmentedKktPattern) -> Spral
 }
 
 fn factor_solve_spral_ssids(
+    system: &ReducedKktSystem<'_>,
     workspace: &mut SpralAugmentedKktWorkspace,
     rhs: &[f64],
     regularization: f64,
@@ -3970,7 +4060,7 @@ fn factor_solve_spral_ssids(
     // Reusing that value as the LDL pivot regularization materially changes the
     // factorization path versus native SPRAL; keep the solver's own small pivot
     // floor instead.
-    let numeric_options = SpralNumericFactorOptions::default();
+    let numeric_options = system_spral_numeric_factor_options(system);
 
     let needs_new_factor = workspace.factor.is_none()
         || workspace
@@ -4431,8 +4521,14 @@ fn solve_reduced_kkt_with_spral_ssids(
             dual_shift,
             &inequality_scalings,
         );
-        match factor_solve_spral_ssids(workspace, &rhs, current_regularization, profiling, verbose)
-        {
+        match factor_solve_spral_ssids(
+            system,
+            workspace,
+            &rhs,
+            current_regularization,
+            profiling,
+            verbose,
+        ) {
             Ok((solution, backend_stats)) => {
                 let dx = solution[..n].to_vec();
                 let p = solution[workspace.pattern.p_offset..workspace.pattern.p_offset + mineq]
@@ -6446,6 +6542,10 @@ where
             adaptive_regularization_retries: options.adaptive_regularization_retries,
             regularization_growth_factor: options.regularization_growth_factor,
             regularization_max: options.regularization_max,
+            spral_pivot_method: options.spral_pivot_method,
+            spral_action_on_zero_pivot: options.spral_action_on_zero_pivot,
+            spral_small_pivot_tolerance: options.spral_small_pivot_tolerance,
+            spral_threshold_pivot_u: options.spral_threshold_pivot_u,
         };
         current_snapshot.linear_solver = preferred_solver;
         if !spral_workspace_unavailable
@@ -6487,6 +6587,7 @@ where
                 hessian_structure.as_ref(),
                 equality_jacobian_structure.as_ref(),
                 inequality_jacobian_structure.as_ref(),
+                &spral_numeric_factor_options(options),
                 &mut profiling,
                 options.verbose,
             ) {

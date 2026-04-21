@@ -81,6 +81,10 @@ const CONTROL_SEMANTIC = Object.freeze({
   solverTrustRegionFixedPenalty: 35,
   sxFunctionOption: 36,
   problemParameter: 37,
+  solverNlipSpralPivotMethod: 38,
+  solverNlipSpralZeroPivotAction: 39,
+  solverNlipSpralSmallPivot: 40,
+  solverNlipSpralPivotU: 41,
 } as const);
 const CONTROL_SEMANTIC_FROM_WIRE = Object.freeze({
   transcription_method: CONTROL_SEMANTIC.transcriptionMethod,
@@ -92,6 +96,10 @@ const CONTROL_SEMANTIC_FROM_WIRE = Object.freeze({
   solver_max_iterations: CONTROL_SEMANTIC.solverMaxIterations,
   solver_hessian_regularization: CONTROL_SEMANTIC.solverHessianRegularization,
   solver_nlip_linear_solver: CONTROL_SEMANTIC.solverNlipLinearSolver,
+  solver_nlip_spral_pivot_method: CONTROL_SEMANTIC.solverNlipSpralPivotMethod,
+  solver_nlip_spral_zero_pivot_action: CONTROL_SEMANTIC.solverNlipSpralZeroPivotAction,
+  solver_nlip_spral_small_pivot: CONTROL_SEMANTIC.solverNlipSpralSmallPivot,
+  solver_nlip_spral_pivot_u: CONTROL_SEMANTIC.solverNlipSpralPivotU,
   solver_dual_tolerance: CONTROL_SEMANTIC.solverDualTolerance,
   solver_constraint_tolerance: CONTROL_SEMANTIC.solverConstraintTolerance,
   solver_complementarity_tolerance: CONTROL_SEMANTIC.solverComplementarityTolerance,
@@ -301,6 +309,12 @@ const SOLVER_METHOD_FROM_WIRE = Object.freeze({
   sqp: SOLVER_METHOD.sqp,
   nlip: SOLVER_METHOD.nlip,
   ipopt: SOLVER_METHOD.ipopt,
+} as const);
+const NLIP_LINEAR_SOLVER = Object.freeze({
+  spralSsids: 0,
+  nativeSpralSsids: 1,
+  sparseQdldl: 2,
+  auto: 3,
 } as const);
 const SQP_GLOBALIZATION = Object.freeze({
   lineSearchFilter: 0,
@@ -2579,6 +2593,18 @@ function currentSolverMethodValue(): number {
   return currentSharedControlValue(CONTROL_SEMANTIC.solverMethod, SOLVER_METHOD.nlip);
 }
 
+function currentNlipLinearSolverValue(): number {
+  return currentSharedControlValue(
+    CONTROL_SEMANTIC.solverNlipLinearSolver,
+    NLIP_LINEAR_SOLVER.spralSsids,
+  );
+}
+
+function currentNlipLinearSolverUsesSpralControls(): boolean {
+  const value = currentNlipLinearSolverValue();
+  return value !== NLIP_LINEAR_SOLVER.sparseQdldl;
+}
+
 function currentSqpGlobalizationValue(): number {
   return currentSharedControlValue(
     CONTROL_SEMANTIC.solverGlobalization,
@@ -2722,6 +2748,7 @@ function handleControlUpdate(control: ControlSpec): void {
     control.semantic === CONTROL_SEMANTIC.transcriptionMethod
     || control.semantic === CONTROL_SEMANTIC.solverMethod
     || control.semantic === CONTROL_SEMANTIC.solverGlobalization
+    || control.semantic === CONTROL_SEMANTIC.solverNlipLinearSolver
   ) {
     renderControls();
   }
@@ -2740,6 +2767,15 @@ function isControlVisible(control: ControlSpec): boolean {
   }
   if (control.semantic === CONTROL_SEMANTIC.solverNlipLinearSolver) {
     return currentSolverMethodValue() === SOLVER_METHOD.nlip;
+  }
+  if (
+    control.semantic === CONTROL_SEMANTIC.solverNlipSpralPivotMethod
+    || control.semantic === CONTROL_SEMANTIC.solverNlipSpralZeroPivotAction
+    || control.semantic === CONTROL_SEMANTIC.solverNlipSpralSmallPivot
+    || control.semantic === CONTROL_SEMANTIC.solverNlipSpralPivotU
+  ) {
+    return currentSolverMethodValue() === SOLVER_METHOD.nlip
+      && currentNlipLinearSolverUsesSpralControls();
   }
   if (
     control.semantic === CONTROL_SEMANTIC.solverExactMeritPenalty

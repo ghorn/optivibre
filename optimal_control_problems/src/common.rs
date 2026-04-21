@@ -26,13 +26,13 @@ use optimization::{
     ClarabelSqpOptions, ClarabelSqpProfiling, ClarabelSqpSummary, ConstraintSatisfaction,
     FilterAcceptanceMode, FiniteDifferenceValidationOptions, FunctionCompileOptions,
     InteriorPointIterationSnapshot, InteriorPointLinearSolver, InteriorPointOptions,
-    InteriorPointProfiling, InteriorPointSolveError, InteriorPointSummary, LineSearchFilterOptions,
-    LineSearchMeritOptions, LlvmOptimizationLevel, NlpCompileStats, NlpDerivativeValidationReport,
-    NlpEvaluationBenchmark, NlpEvaluationBenchmarkOptions, NlpEvaluationKernelKind,
-    SqpFilterOptions, SqpGlobalization, SqpIterationEvent, SqpIterationPhase, SqpIterationSnapshot,
-    SqpLineSearchOptions, SqpTrustRegionOptions, SymbolicSetupProfile, TrustRegionFilterOptions,
-    TrustRegionMeritOptions, ValidationTolerances, Vectorize, format_nlip_settings_summary,
-    format_sqp_settings_summary,
+    InteriorPointProfiling, InteriorPointSolveError, InteriorPointSpralPivotMethod,
+    InteriorPointSummary, LineSearchFilterOptions, LineSearchMeritOptions, LlvmOptimizationLevel,
+    NlpCompileStats, NlpDerivativeValidationReport, NlpEvaluationBenchmark,
+    NlpEvaluationBenchmarkOptions, NlpEvaluationKernelKind, SqpFilterOptions, SqpGlobalization,
+    SqpIterationEvent, SqpIterationPhase, SqpIterationSnapshot, SqpLineSearchOptions,
+    SqpTrustRegionOptions, SymbolicSetupProfile, TrustRegionFilterOptions, TrustRegionMeritOptions,
+    ValidationTolerances, Vectorize, format_nlip_settings_summary, format_sqp_settings_summary,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptOptions, IpoptRawStatus, IpoptSummary, format_ipopt_settings_summary};
@@ -92,6 +92,10 @@ pub enum ControlSemantic {
     SolverMaxIterations,
     SolverHessianRegularization,
     SolverNlipLinearSolver,
+    SolverNlipSpralPivotMethod,
+    SolverNlipSpralZeroPivotAction,
+    SolverNlipSpralSmallPivot,
+    SolverNlipSpralPivotU,
     SolverDualTolerance,
     SolverConstraintTolerance,
     SolverComplementarityTolerance,
@@ -1459,9 +1463,13 @@ pub struct SqpMethodConfig {
     pub globalization: SqpGlobalizationConfig,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NlipConfig {
     pub linear_solver: InteriorPointLinearSolver,
+    pub spral_pivot_method: InteriorPointSpralPivotMethod,
+    pub spral_action_on_zero_pivot: bool,
+    pub spral_small_pivot_tolerance: f64,
+    pub spral_threshold_pivot_u: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2090,6 +2098,10 @@ enum SharedControlId {
     SolverMaxIterations,
     SolverHessianRegularization,
     SolverNlipLinearSolver,
+    SolverNlipSpralPivotMethod,
+    SolverNlipSpralZeroPivotAction,
+    SolverNlipSpralSmallPivot,
+    SolverNlipSpralPivotU,
     SolverDualTolerance,
     SolverConstraintTolerance,
     SolverComplementarityTolerance,
@@ -2141,6 +2153,10 @@ impl SharedControlId {
             Self::SolverMaxIterations => "solver_max_iters",
             Self::SolverHessianRegularization => "solver_hessian_regularization",
             Self::SolverNlipLinearSolver => "solver_nlip_linear_solver",
+            Self::SolverNlipSpralPivotMethod => "solver_nlip_spral_pivot_method",
+            Self::SolverNlipSpralZeroPivotAction => "solver_nlip_spral_zero_pivot_action",
+            Self::SolverNlipSpralSmallPivot => "solver_nlip_spral_small_pivot",
+            Self::SolverNlipSpralPivotU => "solver_nlip_spral_pivot_u",
             Self::SolverDualTolerance => "solver_dual_tol",
             Self::SolverConstraintTolerance => "solver_constraint_tol",
             Self::SolverComplementarityTolerance => "solver_complementarity_tol",
@@ -3565,6 +3581,10 @@ pub fn default_sqp_method_config() -> SqpMethodConfig {
 pub const fn default_nlip_config() -> NlipConfig {
     NlipConfig {
         linear_solver: InteriorPointLinearSolver::SpralSsids,
+        spral_pivot_method: InteriorPointSpralPivotMethod::BlockAposteriori,
+        spral_action_on_zero_pivot: true,
+        spral_small_pivot_tolerance: 1.0e-20,
+        spral_threshold_pivot_u: 1.0e-8,
     }
 }
 
@@ -4096,6 +4116,50 @@ pub fn solver_controls(default_method: SolverMethod, default: SolverConfig) -> V
             ControlVisibility::Always,
             ControlSemantic::SolverNlipLinearSolver,
         ),
+        select_control(
+            SharedControlId::SolverNlipSpralPivotMethod.id(),
+            "NLIP SPRAL Pivoting",
+            nlip_spral_pivot_method_value(default.nlip.spral_pivot_method),
+            "",
+            "Pivoting strategy for SPRAL-based NLIP KKT solves. Ipopt defaults to block a posteriori pivoting.",
+            &nlip_spral_pivot_method_choices(),
+            ControlSection::Solver,
+            ControlVisibility::Always,
+            ControlSemantic::SolverNlipSpralPivotMethod,
+        ),
+        select_control(
+            SharedControlId::SolverNlipSpralZeroPivotAction.id(),
+            "NLIP SPRAL Zero Pivot",
+            if default.nlip.spral_action_on_zero_pivot {
+                1.0
+            } else {
+                0.0
+            },
+            "",
+            "Whether SPRAL continues factorization after encountering a zero pivot.",
+            &[(1.0, "Continue"), (0.0, "Abort")],
+            ControlSection::Solver,
+            ControlVisibility::Always,
+            ControlSemantic::SolverNlipSpralZeroPivotAction,
+        ),
+        text_control(
+            SharedControlId::SolverNlipSpralSmallPivot.id(),
+            "NLIP SPRAL Small Pivot",
+            default.nlip.spral_small_pivot_tolerance,
+            "",
+            "Absolute minimum pivot size accepted by SPRAL.",
+            ControlSemantic::SolverNlipSpralSmallPivot,
+            ControlValueDisplay::Scientific,
+        ),
+        text_control(
+            SharedControlId::SolverNlipSpralPivotU.id(),
+            "NLIP SPRAL Pivot u",
+            default.nlip.spral_threshold_pivot_u,
+            "",
+            "SPRAL threshold-pivoting parameter u.",
+            ControlSemantic::SolverNlipSpralPivotU,
+            ControlValueDisplay::Scientific,
+        ),
         text_control(
             SharedControlId::SolverDualTolerance.id(),
             "Dual Tolerance",
@@ -4381,6 +4445,22 @@ fn nlip_linear_solver_choices() -> Vec<(f64, &'static str)> {
     ]
 }
 
+fn nlip_spral_pivot_method_value(method: InteriorPointSpralPivotMethod) -> f64 {
+    match method {
+        InteriorPointSpralPivotMethod::AggressiveAposteriori => 0.0,
+        InteriorPointSpralPivotMethod::BlockAposteriori => 1.0,
+        InteriorPointSpralPivotMethod::ThresholdPartial => 2.0,
+    }
+}
+
+fn nlip_spral_pivot_method_choices() -> Vec<(f64, &'static str)> {
+    vec![
+        (0.0, "Aggressive APP"),
+        (1.0, "Block APP"),
+        (2.0, "Threshold Partial"),
+    ]
+}
+
 fn sample_shared_or_default(
     values: &BTreeMap<String, f64>,
     key: SharedControlId,
@@ -4471,6 +4551,49 @@ pub fn solver_config_from_map(
         3 => InteriorPointLinearSolver::Auto,
         _ => unreachable!("validated NLIP linear solver choice"),
     };
+    let nlip_spral_pivot_method = match parse_enum_choice(
+        sample_shared_or_default(
+            values,
+            SharedControlId::SolverNlipSpralPivotMethod,
+            nlip_spral_pivot_method_value(default.nlip.spral_pivot_method),
+        ),
+        SharedControlId::SolverNlipSpralPivotMethod,
+        &[0.0, 1.0, 2.0],
+    )? {
+        0 => InteriorPointSpralPivotMethod::AggressiveAposteriori,
+        1 => InteriorPointSpralPivotMethod::BlockAposteriori,
+        2 => InteriorPointSpralPivotMethod::ThresholdPartial,
+        _ => unreachable!("validated NLIP SPRAL pivot method"),
+    };
+    let nlip_spral_action_on_zero_pivot = parse_enum_choice(
+        sample_shared_or_default(
+            values,
+            SharedControlId::SolverNlipSpralZeroPivotAction,
+            if default.nlip.spral_action_on_zero_pivot {
+                1.0
+            } else {
+                0.0
+            },
+        ),
+        SharedControlId::SolverNlipSpralZeroPivotAction,
+        &[0.0, 1.0],
+    )? == 1;
+    let nlip_spral_small_pivot_tolerance = expect_positive_finite(
+        sample_shared_or_default(
+            values,
+            SharedControlId::SolverNlipSpralSmallPivot,
+            default.nlip.spral_small_pivot_tolerance,
+        ),
+        SharedControlId::SolverNlipSpralSmallPivot.id(),
+    )?;
+    let nlip_spral_threshold_pivot_u = expect_positive_finite(
+        sample_shared_or_default(
+            values,
+            SharedControlId::SolverNlipSpralPivotU,
+            default.nlip.spral_threshold_pivot_u,
+        ),
+        SharedControlId::SolverNlipSpralPivotU.id(),
+    )?;
     let globalization = match parse_enum_choice(
         sample_shared_or_default(
             values,
@@ -4899,6 +5022,10 @@ pub fn solver_config_from_map(
         },
         nlip: NlipConfig {
             linear_solver: nlip_linear_solver,
+            spral_pivot_method: nlip_spral_pivot_method,
+            spral_action_on_zero_pivot: nlip_spral_action_on_zero_pivot,
+            spral_small_pivot_tolerance: nlip_spral_small_pivot_tolerance,
+            spral_threshold_pivot_u: nlip_spral_threshold_pivot_u,
         },
     })
 }
@@ -5304,6 +5431,10 @@ pub fn nlip_options(config: &SolverConfig) -> InteriorPointOptions {
         acceptable_compl_inf_tol: config.complementarity_tol,
         acceptable_obj_change_tol: 1e20,
         linear_solver: config.nlip.linear_solver,
+        spral_pivot_method: config.nlip.spral_pivot_method,
+        spral_action_on_zero_pivot: config.nlip.spral_action_on_zero_pivot,
+        spral_small_pivot_tolerance: config.nlip.spral_small_pivot_tolerance,
+        spral_threshold_pivot_u: config.nlip.spral_threshold_pivot_u,
         ..InteriorPointOptions::default()
     }
 }
@@ -9340,6 +9471,36 @@ mod tests {
             parsed.nlip.linear_solver,
             InteriorPointLinearSolver::NativeSpralSsids
         );
+    }
+
+    #[test]
+    fn default_nlip_config_matches_ipopt_spral_defaults() {
+        let default = default_nlip_config();
+        assert_eq!(
+            default.spral_pivot_method,
+            InteriorPointSpralPivotMethod::BlockAposteriori
+        );
+        assert!(default.spral_action_on_zero_pivot);
+        assert_eq!(default.spral_small_pivot_tolerance, 1.0e-20);
+        assert_eq!(default.spral_threshold_pivot_u, 1.0e-8);
+    }
+
+    #[test]
+    fn solver_config_from_map_parses_nlip_spral_controls() {
+        let mut values = BTreeMap::new();
+        values.insert("solver_nlip_spral_pivot_method".to_string(), 2.0);
+        values.insert("solver_nlip_spral_zero_pivot_action".to_string(), 0.0);
+        values.insert("solver_nlip_spral_small_pivot".to_string(), 1.0e-18);
+        values.insert("solver_nlip_spral_pivot_u".to_string(), 1.0e-6);
+        let parsed = solver_config_from_map(&values, default_solver_config())
+            .expect("solver config should parse");
+        assert_eq!(
+            parsed.nlip.spral_pivot_method,
+            InteriorPointSpralPivotMethod::ThresholdPartial
+        );
+        assert!(!parsed.nlip.spral_action_on_zero_pivot);
+        assert_eq!(parsed.nlip.spral_small_pivot_tolerance, 1.0e-18);
+        assert_eq!(parsed.nlip.spral_threshold_pivot_u, 1.0e-6);
     }
 
     #[test]
