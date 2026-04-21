@@ -3559,6 +3559,12 @@ fn solve_lower_transpose_like_native(
     lower_values: &[f64],
     factor_rhs: &mut [f64],
 ) {
+    let lower = LowerTransposeFactor {
+        col_ptrs: lower_col_ptrs,
+        row_indices: lower_row_indices,
+        values: lower_values,
+    };
+    let mut dense_workspace = Vec::new();
     let mut block_end = dimension;
     while block_end > 0 {
         let block_start = block_end.saturating_sub(OPENBLAS_DTRSV_BLOCK_SIZE);
@@ -3568,10 +3574,9 @@ fn solve_lower_transpose_like_native(
                     pivot,
                     block_end,
                     dimension,
-                    lower_col_ptrs,
-                    lower_row_indices,
-                    lower_values,
+                    lower,
                     factor_rhs,
+                    &mut dense_workspace,
                 );
                 factor_rhs[pivot] = (-1.0f64).mul_add(dot, factor_rhs[pivot]);
             }
@@ -3582,10 +3587,9 @@ fn solve_lower_transpose_like_native(
                 pivot,
                 pivot + 1,
                 block_end,
-                lower_col_ptrs,
-                lower_row_indices,
-                lower_values,
+                lower,
                 factor_rhs,
+                &mut dense_workspace,
             );
             factor_rhs[pivot] -= dot;
         }
@@ -3593,20 +3597,26 @@ fn solve_lower_transpose_like_native(
     }
 }
 
+#[derive(Clone, Copy)]
+struct LowerTransposeFactor<'a> {
+    col_ptrs: &'a [usize],
+    row_indices: &'a [usize],
+    values: &'a [f64],
+}
+
 fn lower_transpose_dot_in_range_like_native(
     pivot: usize,
     range_start: usize,
     range_end: usize,
-    lower_col_ptrs: &[usize],
-    lower_row_indices: &[usize],
-    lower_values: &[f64],
+    lower: LowerTransposeFactor<'_>,
     factor_rhs: &[f64],
+    dense_workspace: &mut Vec<f64>,
 ) -> f64 {
     debug_assert!(range_start <= range_end);
-    let start = lower_col_ptrs[pivot];
-    let end = lower_col_ptrs[pivot + 1];
-    let rows = &lower_row_indices[start..end];
-    let values = &lower_values[start..end];
+    let start = lower.col_ptrs[pivot];
+    let end = lower.col_ptrs[pivot + 1];
+    let rows = &lower.row_indices[start..end];
+    let values = &lower.values[start..end];
     if range_start == range_end {
         return 0.0;
     }
@@ -3622,13 +3632,15 @@ fn lower_transpose_dot_in_range_like_native(
         // Native APP DTRSV works on dense panels. Rows outside this triangular
         // panel are ignored, but structural zeros inside it still participate
         // in the OpenBLAS DOTU reduction order.
-        let mut dense_values = vec![0.0; range_len];
+        dense_workspace.resize(range_len, 0.0);
+        let dense_values = &mut dense_workspace[..range_len];
+        dense_values.fill(0.0);
         for (&value, &row) in values.iter().zip(rows) {
             if (range_start..range_end).contains(&row) {
                 dense_values[row - range_start] = value;
             }
         }
-        openblas_dotu_like_contiguous(&dense_values, &factor_rhs[range_start..range_end])
+        openblas_dotu_like_contiguous(dense_values, &factor_rhs[range_start..range_end])
     }
 }
 
@@ -3636,26 +3648,28 @@ fn lower_transpose_gemv_dot_like_native(
     pivot: usize,
     range_start: usize,
     range_end: usize,
-    lower_col_ptrs: &[usize],
-    lower_row_indices: &[usize],
-    lower_values: &[f64],
+    lower: LowerTransposeFactor<'_>,
     factor_rhs: &[f64],
+    dense_workspace: &mut Vec<f64>,
 ) -> f64 {
     debug_assert!(range_start <= range_end);
-    let start = lower_col_ptrs[pivot];
-    let end = lower_col_ptrs[pivot + 1];
-    let rows = &lower_row_indices[start..end];
-    let values = &lower_values[start..end];
+    let start = lower.col_ptrs[pivot];
+    let end = lower.col_ptrs[pivot + 1];
+    let rows = &lower.row_indices[start..end];
+    let values = &lower.values[start..end];
     if range_start == range_end {
         return 0.0;
     }
-    let mut dense_values = vec![0.0; range_end - range_start];
+    let range_len = range_end - range_start;
+    dense_workspace.resize(range_len, 0.0);
+    let dense_values = &mut dense_workspace[..range_len];
+    dense_values.fill(0.0);
     for (&value, &row) in values.iter().zip(rows) {
         if (range_start..range_end).contains(&row) {
             dense_values[row - range_start] = value;
         }
     }
-    openblas_gemv_t_dot_like_contiguous(&dense_values, &factor_rhs[range_start..range_end])
+    openblas_gemv_t_dot_like_contiguous(dense_values, &factor_rhs[range_start..range_end])
 }
 
 fn openblas_dotu_like_contiguous(lhs: &[f64], rhs: &[f64]) -> f64 {
