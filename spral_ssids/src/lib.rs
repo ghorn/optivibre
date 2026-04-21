@@ -1158,8 +1158,12 @@ fn sort_and_dedup(values: &mut Vec<usize>) {
 }
 
 fn should_relax_merge(child: &SymbolicFront, parent: &SymbolicFront) -> bool {
+    // SPRAL's column-level amalgamation can absorb a sub-nemin child into a
+    // parent that has already become large through fundamental supernodes.
+    // At this coarser front level, allowing either side under nemin matches
+    // that behavior for fragmented dense roots.
     child.width() < RELAXED_NODE_AMALGAMATION_NEMIN
-        && parent.width() < RELAXED_NODE_AMALGAMATION_NEMIN
+        || parent.width() < RELAXED_NODE_AMALGAMATION_NEMIN
 }
 
 fn relax_symbolic_fronts(mut fronts: Vec<SymbolicFront>) -> SymbolicFrontTree {
@@ -3477,7 +3481,80 @@ fn unpack_packed_lower_to_dense_square(size: usize, packed: &[f64]) -> Vec<f64> 
 
 #[cfg(test)]
 mod tests {
-    use super::{NumericFactorOptions, dense_lower_offset, factorize_dense_tpp_tail_in_place};
+    use super::{
+        NativeOrdering, NativeSpral, NumericFactorOptions, OrderingStrategy, SsidsOptions,
+        SymmetricCscMatrix, analyse, build_symbolic_front_tree, dense_lower_offset, factorize,
+        factorize_dense_tpp_tail_in_place,
+    };
+
+    #[derive(Clone, Debug)]
+    struct DenseBoundaryRng {
+        state: u64,
+    }
+
+    impl DenseBoundaryRng {
+        fn new(seed: u64) -> Self {
+            Self { state: seed }
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut value = self.state;
+            value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            value ^ (value >> 31)
+        }
+
+        fn usize_inclusive(&mut self, low: usize, high: usize) -> usize {
+            low + (self.next_u64() as usize % (high - low + 1))
+        }
+
+        fn dyadic(&mut self, numerator_radius: i16, max_shift: u8) -> f64 {
+            let span = i32::from(numerator_radius) * 2 + 1;
+            let numerator = self.next_u64() as i32 % span - i32::from(numerator_radius);
+            let shift = self.next_u64() as u8 % (max_shift + 1);
+            f64::from(numerator) / f64::from(1_u32 << shift)
+        }
+    }
+
+    fn random_dense_dyadic_matrix(dimension: usize, rng: &mut DenseBoundaryRng) -> Vec<Vec<f64>> {
+        let mut matrix = vec![vec![0.0; dimension]; dimension];
+        let mut row = 0;
+        while row < dimension {
+            let mut col = 0;
+            while col <= row {
+                let value = if row == col {
+                    rng.dyadic(8, 6)
+                } else {
+                    rng.dyadic(16, 7)
+                };
+                matrix[row][col] = value;
+                matrix[col][row] = value;
+                col += 1;
+            }
+            row += 1;
+        }
+        matrix
+    }
+
+    fn dense_to_lower_csc(matrix: &[Vec<f64>]) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
+        let dimension = matrix.len();
+        let mut col_ptrs = Vec::with_capacity(dimension + 1);
+        let mut row_indices = Vec::new();
+        let mut values = Vec::new();
+        col_ptrs.push(0);
+        for col in 0..dimension {
+            for (row, dense_row) in matrix.iter().enumerate().skip(col) {
+                let value = dense_row[col];
+                if row == col || value != 0.0 {
+                    row_indices.push(row);
+                    values.push(value);
+                }
+            }
+            col_ptrs.push(row_indices.len());
+        }
+        (col_ptrs, row_indices, values)
+    }
 
     fn square_to_dense_lower(matrix: &[Vec<f64>]) -> Vec<f64> {
         let size = matrix.len();
@@ -3518,5 +3595,54 @@ mod tests {
         assert_eq!(factorization.contribution.delayed_count, 1);
         assert_eq!(factorization.factor_order.len(), 1);
         assert_eq!(factorization.contribution.row_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn relaxed_symbolic_fronts_match_native_dense_gap_pivot_order() {
+        let Ok(native) = NativeSpral::load() else {
+            return;
+        };
+        let mut rng = DenseBoundaryRng::new(0x1001);
+        let dimension = rng.usize_inclusive(33, 160);
+        assert_eq!(dimension, 54);
+        let dense = random_dense_dyadic_matrix(dimension, &mut rng);
+        let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+        let matrix = SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
+            .expect("valid CSC");
+        let options = NumericFactorOptions::default();
+
+        let (symbolic, _) = analyse(
+            matrix,
+            &SsidsOptions {
+                ordering: OrderingStrategy::Natural,
+            },
+        )
+        .expect("rust analyse");
+        let tree = build_symbolic_front_tree(&symbolic);
+        assert_eq!(tree.fronts.len(), 1);
+        let (rust_factor, _) = factorize(matrix, &symbolic, &options).expect("rust factorize");
+        let mut native_session = native
+            .analyse_with_options_and_ordering(matrix, &options, NativeOrdering::Natural)
+            .expect("native analyse");
+        let native_info = native_session.factorize(matrix).expect("native factorize");
+        let native_enquiry = native_session
+            .enquire_indef()
+            .expect("native enquire indef");
+
+        let mut native_factor_order = vec![usize::MAX; native_enquiry.pivot_order.len()];
+        for (column, &pivot_position) in native_enquiry.pivot_order.iter().enumerate() {
+            native_factor_order[pivot_position] = column;
+        }
+
+        assert_eq!(rust_factor.inertia(), native_info.inertia);
+        assert_eq!(
+            rust_factor.pivot_stats().two_by_two_pivots,
+            native_info.two_by_two_pivots
+        );
+        assert_eq!(
+            rust_factor.pivot_stats().delayed_pivots,
+            native_info.delayed_pivots
+        );
+        assert_eq!(rust_factor.factor_order, native_factor_order);
     }
 }

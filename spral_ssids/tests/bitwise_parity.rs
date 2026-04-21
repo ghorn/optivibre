@@ -61,6 +61,85 @@ fn deterministic_complete_dyadic_matrix(dimension: usize) -> Vec<Vec<f64>> {
     matrix
 }
 
+#[derive(Clone, Debug)]
+struct DenseBoundaryRng {
+    state: u64,
+}
+
+impl DenseBoundaryRng {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut value = self.state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
+    }
+
+    fn usize_inclusive(&mut self, low: usize, high: usize) -> usize {
+        debug_assert!(low <= high);
+        low + (self.next_u64() as usize % (high - low + 1))
+    }
+
+    fn dyadic(&mut self, numerator_radius: i16, max_shift: u8) -> f64 {
+        let span = i32::from(numerator_radius) * 2 + 1;
+        let numerator = self.next_u64() as i32 % span - i32::from(numerator_radius);
+        let shift = self.next_u64() as u8 % (max_shift + 1);
+        f64::from(numerator) / f64::from(1_u32 << shift)
+    }
+}
+
+fn random_dense_dyadic_matrix(dimension: usize, rng: &mut DenseBoundaryRng) -> Vec<Vec<f64>> {
+    let mut matrix = vec![vec![0.0; dimension]; dimension];
+    let mut row = 0;
+    while row < dimension {
+        let mut col = 0;
+        while col <= row {
+            let value = if row == col {
+                rng.dyadic(8, 6)
+            } else {
+                rng.dyadic(16, 7)
+            };
+            matrix[row][col] = value;
+            matrix[col][row] = value;
+            col += 1;
+        }
+        row += 1;
+    }
+    matrix
+}
+
+fn random_dyadic_solution(dimension: usize, rng: &mut DenseBoundaryRng) -> Vec<f64> {
+    (0..dimension).map(|_| rng.dyadic(8, 4)).collect()
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| parse_u64(&value))
+        .unwrap_or(default)
+}
+
+fn parse_u64(value: &str) -> Option<u64> {
+    value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .map_or_else(
+            || value.parse::<u64>().ok(),
+            |hex| u64::from_str_radix(hex, 16).ok(),
+        )
+}
+
 fn load_native_or_skip() -> Option<NativeSpral> {
     match NativeSpral::load() {
         Ok(native) => Some(native),
@@ -161,6 +240,28 @@ fn rust_and_native_spral_match_app_prefix_dtrsv_97x97_solution_bits() {
         .map(|index| f64::from((index % 11) as i16 - 5) / 8.0)
         .collect::<Vec<_>>();
     assert_exact_bitwise_parity_witness(&matrix, &expected_solution);
+}
+
+#[test]
+#[ignore = "manual native-vs-rust APP boundary hunt with seed/case repro output"]
+fn rust_and_native_spral_match_random_dense_app_boundary_cases() {
+    let cases = env_usize("SPRAL_SSIDS_DENSE_PARITY_CASES", 256);
+    let seed = env_u64("SPRAL_SSIDS_DENSE_PARITY_SEED", 0x5eed_d35e);
+    let min_dim = env_usize("SPRAL_SSIDS_DENSE_PARITY_MIN_DIM", 33);
+    let max_dim = env_usize("SPRAL_SSIDS_DENSE_PARITY_MAX_DIM", 160);
+    assert!(
+        min_dim <= max_dim,
+        "invalid dense parity dimension range: {min_dim}..={max_dim}"
+    );
+
+    let mut rng = DenseBoundaryRng::new(seed);
+    for case_index in 0..cases {
+        let dimension = rng.usize_inclusive(min_dim, max_dim);
+        let matrix = random_dense_dyadic_matrix(dimension, &mut rng);
+        let expected_solution = random_dyadic_solution(dimension, &mut rng);
+        eprintln!("dense_app_boundary seed=0x{seed:016x} case={case_index} dimension={dimension}");
+        assert_exact_bitwise_parity_witness(&matrix, &expected_solution);
+    }
 }
 
 fn bit_patterns(values: &[f64]) -> Vec<u64> {
