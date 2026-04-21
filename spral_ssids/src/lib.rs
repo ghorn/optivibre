@@ -1,4 +1,3 @@
-use std::cmp::Reverse;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -1015,27 +1014,32 @@ fn build_symbolic_result_with_native_order(
     }
 
     let (elimination_tree, column_counts, column_pattern) = symbolic_factor_pattern(&current_graph);
-    let supernode_permutation =
-        native_supernode_permutation(&elimination_tree, &column_counts, realn);
-    if is_identity_order(&supernode_permutation) {
+    let supernode_layout = native_supernode_layout(&elimination_tree, &column_counts, realn);
+    if is_identity_order(&supernode_layout.permutation) {
+        let supernodes = build_supernodes_from_ranges(&supernode_layout.ranges, &column_pattern);
         return Ok(build_symbolic_result(
             current_permutation,
             elimination_tree,
             column_counts,
             column_pattern,
+            supernodes,
             ordering_kind,
         ));
     }
 
-    let final_permutation =
-        compose_ordering_with_symbolic_permutation(&current_permutation, &supernode_permutation)?;
+    let final_permutation = compose_ordering_with_symbolic_permutation(
+        &current_permutation,
+        &supernode_layout.permutation,
+    )?;
     let final_graph = permute_graph(graph, &final_permutation);
     let (final_tree, final_counts, final_pattern) = symbolic_factor_pattern(&final_graph);
+    let final_supernodes = build_supernodes_from_ranges(&supernode_layout.ranges, &final_pattern);
     Ok(build_symbolic_result(
         final_permutation,
         final_tree,
         final_counts,
         final_pattern,
+        final_supernodes,
         ordering_kind,
     ))
 }
@@ -1115,16 +1119,26 @@ fn native_postorder_permutation(
     (permutation, realn)
 }
 
-fn native_supernode_permutation(
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NativeSupernodeLayout {
+    permutation: Vec<usize>,
+    ranges: Vec<std::ops::Range<usize>>,
+}
+
+fn native_supernode_layout(
     elimination_tree: &[Option<usize>],
     column_counts: &[usize],
     realn: usize,
-) -> Vec<usize> {
+) -> NativeSupernodeLayout {
     // Mirror the renumbering part of SPRAL's core_analyse.find_supernodes:
-    // merged vertices are walked with a small stack and then applied as a
-    // second symbolic permutation before numeric factorization.
+    // merged vertices are walked with a small stack, producing both the
+    // second symbolic permutation and the final supernode ranges (`sptr`).
     let n = elimination_tree.len();
     let realn = realn.min(n);
+    let identity = || NativeSupernodeLayout {
+        permutation: (0..n).collect(),
+        ranges: (0..n).map(|node| node..node + 1).collect(),
+    };
     let virtual_root = n;
     let mut children = vec![Vec::new(); n + 1];
     for (node, parent) in elimination_tree.iter().copied().enumerate().take(realn) {
@@ -1154,13 +1168,16 @@ fn native_supernode_permutation(
     }
 
     let mut permutation = vec![usize::MAX; n];
+    let mut ranges = Vec::new();
     let mut next_position = 0;
     let mut stack = Vec::new();
     for node in 0..realn {
         if !marked[node] {
             continue;
         }
+        let start = next_position;
         next_position += nvert[node];
+        ranges.push(start..next_position);
         let mut position = next_position;
         stack.push(node);
         while let Some(vertex) = stack.pop() {
@@ -1179,9 +1196,12 @@ fn native_supernode_permutation(
     }
 
     if permutation.contains(&usize::MAX) {
-        return (0..n).collect();
+        return identity();
     }
-    permutation
+    NativeSupernodeLayout {
+        permutation,
+        ranges,
+    }
 }
 
 fn native_should_merge_supernode(
@@ -1236,34 +1256,51 @@ fn symbolic_factor_pattern(graph: &CsrGraph) -> (Vec<Option<usize>>, Vec<usize>,
     (elimination_tree, column_counts, column_pattern)
 }
 
-fn build_supernodes(
-    elimination_tree: &[Option<usize>],
+fn build_supernodes_from_ranges(
+    ranges: &[std::ops::Range<usize>],
     column_pattern: &[Vec<usize>],
 ) -> Vec<Supernode> {
     let mut supernodes = Vec::new();
-    let mut column = 0;
-    while column < column_pattern.len() {
-        let mut end = column + 1;
-        while end < column_pattern.len()
-            && elimination_tree[end - 1] == Some(end)
-            && column_pattern[end - 1][1..] == column_pattern[end][..]
-        {
-            end += 1;
+    let mut next_column = 0;
+    for range in ranges {
+        for column in next_column..range.start {
+            supernodes.push(unit_supernode(column, column_pattern));
         }
-        let trailing_rows = column_pattern[end - 1]
-            .iter()
-            .copied()
-            .skip(1)
-            .filter(|&row| row >= end)
-            .collect::<Vec<_>>();
+        let mut trailing_rows = Vec::new();
+        for column in range.clone() {
+            trailing_rows.extend(
+                column_pattern[column]
+                    .iter()
+                    .copied()
+                    .filter(|&row| row >= range.end),
+            );
+        }
+        trailing_rows.sort_unstable();
+        trailing_rows.dedup();
         supernodes.push(Supernode {
-            start_column: column,
-            end_column: end,
+            start_column: range.start,
+            end_column: range.end,
             trailing_rows,
         });
-        column = end;
+        next_column = range.end;
+    }
+    for column in next_column..column_pattern.len() {
+        supernodes.push(unit_supernode(column, column_pattern));
     }
     supernodes
+}
+
+fn unit_supernode(column: usize, column_pattern: &[Vec<usize>]) -> Supernode {
+    let trailing_rows = column_pattern[column]
+        .iter()
+        .copied()
+        .filter(|&row| row > column)
+        .collect::<Vec<_>>();
+    Supernode {
+        start_column: column,
+        end_column: column + 1,
+        trailing_rows,
+    }
 }
 
 fn build_symbolic_result(
@@ -1271,9 +1308,9 @@ fn build_symbolic_result(
     elimination_tree: Vec<Option<usize>>,
     column_counts: Vec<usize>,
     column_pattern: Vec<Vec<usize>>,
+    supernodes: Vec<Supernode>,
     ordering_kind: &'static str,
 ) -> (SymbolicFactor, AnalyseInfo) {
-    let supernodes = build_supernodes(&elimination_tree, &column_pattern);
     let supernode_count = supernodes.len();
     let max_supernode_width = supernodes.iter().map(Supernode::width).max().unwrap_or(0);
     let info = AnalyseInfo {
@@ -1335,109 +1372,14 @@ fn build_symbolic_front_tree(symbolic: &SymbolicFactor) -> SymbolicFrontTree {
     for front in &mut fronts {
         front.children.sort_by_key(|&child| start_columns[child]);
     }
-    relax_symbolic_fronts(fronts)
+    let roots = collect_root_fronts(&fronts);
+    SymbolicFrontTree { roots, fronts }
 }
 
 fn front_work_weight(width: usize, interface_len: usize) -> u64 {
     let front_dim = width.saturating_add(interface_len) as u64;
     let width = width as u64;
     width.saturating_mul(front_dim).saturating_mul(front_dim)
-}
-
-fn sort_and_dedup(values: &mut Vec<usize>) {
-    values.sort_unstable();
-    values.dedup();
-}
-
-fn should_relax_merge(child: &SymbolicFront, parent: &SymbolicFront) -> bool {
-    // SPRAL's column-level amalgamation can absorb a sub-nemin child into a
-    // parent that has already become large through fundamental supernodes.
-    // At this coarser front level, allowing either side under nemin matches
-    // that behavior for fragmented dense roots.
-    child.width() < RELAXED_NODE_AMALGAMATION_NEMIN
-        || parent.width() < RELAXED_NODE_AMALGAMATION_NEMIN
-}
-
-fn relax_symbolic_fronts(mut fronts: Vec<SymbolicFront>) -> SymbolicFrontTree {
-    for parent_idx in 0..fronts.len() {
-        if fronts[parent_idx].columns.is_empty() {
-            continue;
-        }
-        let mut pending = fronts[parent_idx].children.clone();
-        pending.sort_by_key(|&child| {
-            Reverse(
-                fronts[child]
-                    .width()
-                    .saturating_add(fronts[child].interface_rows.len()),
-            )
-        });
-        let mut retained = Vec::new();
-        while let Some(child_idx) = pending.pop() {
-            if fronts[child_idx].columns.is_empty() {
-                continue;
-            }
-            if should_relax_merge(&fronts[child_idx], &fronts[parent_idx]) {
-                let child_columns = std::mem::take(&mut fronts[child_idx].columns);
-                let child_interface = std::mem::take(&mut fronts[child_idx].interface_rows);
-                let child_children = std::mem::take(&mut fronts[child_idx].children);
-                fronts[parent_idx].columns.extend(child_columns);
-                fronts[parent_idx].interface_rows.extend(child_interface);
-                sort_and_dedup(&mut fronts[parent_idx].columns);
-                sort_and_dedup(&mut fronts[parent_idx].interface_rows);
-                for grandchild in child_children {
-                    fronts[grandchild].parent = Some(parent_idx);
-                    pending.push(grandchild);
-                }
-                pending.sort_by_key(|&child| {
-                    Reverse(
-                        fronts[child]
-                            .width()
-                            .saturating_add(fronts[child].interface_rows.len()),
-                    )
-                });
-            } else {
-                retained.push(child_idx);
-            }
-        }
-        retained.sort_by_key(|&child| fronts[child].first_column());
-        fronts[parent_idx].children = retained;
-        let parent_columns = fronts[parent_idx].columns.clone();
-        fronts[parent_idx]
-            .interface_rows
-            .retain(|row| parent_columns.binary_search(row).is_err());
-    }
-
-    let active = fronts
-        .iter()
-        .enumerate()
-        .filter_map(|(index, front)| (!front.columns.is_empty()).then_some(index))
-        .collect::<Vec<_>>();
-    let mut remap = vec![usize::MAX; fronts.len()];
-    for (new_index, &old_index) in active.iter().enumerate() {
-        remap[old_index] = new_index;
-    }
-    let mut merged = Vec::with_capacity(active.len());
-    for &old_index in &active {
-        let mut front = fronts[old_index].clone();
-        sort_and_dedup(&mut front.columns);
-        sort_and_dedup(&mut front.interface_rows);
-        front
-            .interface_rows
-            .retain(|row| front.columns.binary_search(row).is_err());
-        front.parent = front.parent.map(|parent| remap[parent]);
-        front.children = front
-            .children
-            .into_iter()
-            .filter(|&child| remap[child] != usize::MAX)
-            .map(|child| remap[child])
-            .collect();
-        merged.push(front);
-    }
-    let roots = collect_root_fronts(&merged);
-    SymbolicFrontTree {
-        fronts: merged,
-        roots,
-    }
 }
 
 fn collect_root_fronts(fronts: &[SymbolicFront]) -> Vec<usize> {

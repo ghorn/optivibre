@@ -216,7 +216,7 @@ fn numeric_factorization_solves_spd_system() {
 }
 
 #[test]
-fn numeric_factorization_relaxes_singleton_fronts_into_larger_multifrontal_nodes() {
+fn numeric_factorization_uses_native_relaxed_supernode_ranges() {
     let dimension = 64;
     let mut dense = vec![vec![0.0; dimension]; dimension];
     for idx in 0..dimension {
@@ -239,8 +239,9 @@ fn numeric_factorization_relaxes_singleton_fronts_into_larger_multifrontal_nodes
     let (factor, _) =
         factorize(matrix, &symbolic, &NumericFactorOptions::default()).expect("factor");
 
-    assert!(factor.supernode_count() >= dimension - 1);
-    assert!(factor.max_supernode_width() > 0);
+    assert_eq!(symbolic.supernodes.len(), 2);
+    assert_eq!(factor.supernode_count(), symbolic.supernodes.len());
+    assert_eq!(factor.max_supernode_width(), 32);
 }
 
 #[test]
