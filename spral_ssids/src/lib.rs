@@ -568,10 +568,11 @@ impl NumericFactor {
             );
             for row in 0..self.dimension {
                 let mut value = factor_rhs[row];
-                for col in 0..row {
-                    let coefficient = dense_lower[row * self.dimension + col];
-                    if coefficient != 0.0 {
-                        value = (-coefficient).mul_add(factor_rhs[col], value);
+                for (col, &column_value) in factor_rhs.iter().take(row).enumerate() {
+                    let offset = row * self.dimension + col;
+                    if column_value != 0.0 && dense_lower.present[offset] {
+                        let coefficient = dense_lower.values[offset];
+                        value = (-coefficient).mul_add(column_value, value);
                     }
                 }
                 factor_rhs[row] = value;
@@ -637,10 +638,11 @@ impl NumericFactor {
             );
             for row in (0..self.dimension).rev() {
                 let mut dot = 0.0;
-                for col in (row + 1)..self.dimension {
-                    let coefficient = dense_lower[col * self.dimension + row];
-                    if coefficient != 0.0 {
-                        dot = coefficient.mul_add(factor_rhs[col], dot);
+                for (col, &column_value) in factor_rhs.iter().enumerate().skip(row + 1) {
+                    let offset = col * self.dimension + row;
+                    if column_value != 0.0 && dense_lower.present[offset] {
+                        let coefficient = dense_lower.values[offset];
+                        dot = coefficient.mul_add(column_value, dot);
                     }
                 }
                 factor_rhs[row] -= dot;
@@ -1447,12 +1449,6 @@ fn one_by_one_inverse_diagonal(values: &[f64]) -> Result<f64, String> {
     }
 }
 
-fn exact_two_by_two_eigenvalues(a11: f64, a21: f64, a22: f64) -> [f64; 2] {
-    let trace = a11 + a22;
-    let discriminant = ((a11 - a22) * (a11 - a22) + 4.0 * a21 * a21).sqrt();
-    [0.5 * (trace + discriminant), 0.5 * (trace - discriminant)]
-}
-
 fn reset_ldwork_column_tail(workspace: &mut [f64], size: usize, col: usize, from: usize) {
     let column = &mut workspace[col * size..(col + 1) * size];
     column[from..].fill(0.0);
@@ -1587,7 +1583,6 @@ fn app_update_one_by_one(matrix: &mut [f64], size: usize, pivot: usize, workspac
 fn app_update_two_by_two(matrix: &mut [f64], size: usize, pivot: usize, workspace: &[f64]) {
     let first_ld = &workspace[pivot * size..(pivot + 1) * size];
     let second_ld = &workspace[(pivot + 1) * size..(pivot + 2) * size];
-    let use_compensated_dot = size.saturating_sub(pivot + 2) >= 2;
     for col in (pivot + 2)..size {
         let first_preserved = first_ld[col];
         let second_preserved = second_ld[col];
@@ -1595,59 +1590,11 @@ fn app_update_two_by_two(matrix: &mut [f64], size: usize, pivot: usize, workspac
             let update_entry = dense_lower_offset(size, row, col);
             let first_multiplier = matrix[dense_lower_offset(size, row, pivot)];
             let second_multiplier = matrix[dense_lower_offset(size, row, pivot + 1)];
-            matrix[update_entry] = rank2_update_value(
-                matrix[update_entry],
-                -first_multiplier,
-                first_preserved,
-                -second_multiplier,
-                second_preserved,
-                use_compensated_dot,
-            );
+            // Native SPRAL sends 2x2-pivot APP updates through dgemm with
+            // k=2, alpha=-1, beta=1. Match the OpenBLAS dot order used there.
+            matrix[update_entry] -=
+                second_multiplier.mul_add(second_preserved, first_multiplier * first_preserved);
         }
-    }
-}
-
-fn two_sum(a: f64, b: f64) -> (f64, f64) {
-    let sum = a + b;
-    let b_virtual = sum - a;
-    let error = (a - (sum - b_virtual)) + (b - b_virtual);
-    (sum, error)
-}
-
-fn two_product(a: f64, b: f64) -> (f64, f64) {
-    let product = a * b;
-    let error = a.mul_add(b, -product);
-    (product, error)
-}
-
-fn compensated_rank2_update(current: f64, a1: f64, b1: f64, a2: f64, b2: f64) -> f64 {
-    let (product1, error1) = two_product(a1, b1);
-    let (product2, error2) = two_product(a2, b2);
-    let (dot, dot_error) = two_sum(product1, product2);
-    let (updated, update_error) = two_sum(current, dot);
-    updated + (error1 + error2 + dot_error + update_error)
-}
-
-fn rank2_update_value(
-    current: f64,
-    a1: f64,
-    b1: f64,
-    a2: f64,
-    b2: f64,
-    use_compensated_dot: bool,
-) -> f64 {
-    if use_compensated_dot {
-        // OpenBLAS' tiny block dgemm effectively rounds the two-term dot
-        // differently from a scalar chained FMA when both products contribute.
-        let product1 = a1 * b1;
-        let product2 = a2 * b2;
-        if product1 != 0.0 && product2 != 0.0 {
-            compensated_rank2_update(current, a1, b1, a2, b2)
-        } else {
-            current + product1 + product2
-        }
-    } else {
-        a2.mul_add(b2, a1.mul_add(b1, current))
     }
 }
 
@@ -1696,9 +1643,7 @@ fn factor_one_by_one_common(
             });
         }
         matrix[entry_index] = value;
-        if value != 0.0 {
-            entries.push((rows[row], value));
-        }
+        entries.push((rows[row], value));
     }
 
     app_update_one_by_one(matrix, size, pivot, scratch);
@@ -1751,12 +1696,8 @@ fn factor_two_by_two_common(
         }
         matrix[dense_lower_offset(size, row, pivot)] = l1;
         matrix[dense_lower_offset(size, row, pivot + 1)] = l2;
-        if l1 != 0.0 {
-            first_entries.push((rows[row], l1));
-        }
-        if l2 != 0.0 {
-            second_entries.push((rows[row], l2));
-        }
+        first_entries.push((rows[row], l1));
+        second_entries.push((rows[row], l2));
     }
 
     app_update_two_by_two(matrix, size, pivot, scratch);
@@ -1777,6 +1718,21 @@ fn factor_two_by_two_common(
             values: [inv11, inv12, f64::INFINITY, inv22],
         },
     ))
+}
+
+fn remove_zero_lower_entries_targeting_row(factor_columns: &mut [FactorColumn], row: usize) {
+    let row_has_nonzero_entry = factor_columns
+        .iter()
+        .flat_map(|column| column.entries.iter())
+        .any(|&(entry_row, value)| entry_row == row && value != 0.0);
+    if row_has_nonzero_entry {
+        return;
+    }
+    for column in factor_columns {
+        column
+            .entries
+            .retain(|&(entry_row, value)| entry_row != row || value != 0.0);
+    }
 }
 
 fn tpp_factor_one_by_one(
@@ -1821,9 +1777,7 @@ fn tpp_factor_one_by_one(
             });
         }
         matrix[entry_index] = value;
-        if value != 0.0 {
-            entries.push((rows[row], value));
-        }
+        entries.push((rows[row], value));
     }
 
     root_tpp_rank1_update(matrix, size, pivot + 1, pivot, work);
@@ -1873,12 +1827,8 @@ fn tpp_factor_two_by_two(
         }
         matrix[dense_lower_offset(size, row, pivot)] = l1;
         matrix[dense_lower_offset(size, row, pivot + 1)] = l2;
-        if l1 != 0.0 {
-            first_entries.push((rows[row], l1));
-        }
-        if l2 != 0.0 {
-            second_entries.push((rows[row], l2));
-        }
+        first_entries.push((rows[row], l1));
+        second_entries.push((rows[row], l2));
     }
 
     root_tpp_rank2_update(
@@ -1958,47 +1908,11 @@ fn root_tpp_rank2_update(
                 matrix[update_entry] = (-l2_row).mul_add(second_preserved, updated);
             } else {
                 let current = matrix[update_entry];
-                let product1 = -l1_row * first_preserved;
-                let product2 = -l2_row * second_preserved;
-                let dot = -(product1 + product2);
-                // Mirror native BLAS micro-kernel rounding: cancellation with
-                // beta*C uses the compensated dot path, while two-product
-                // updates that native OpenBLAS contracts use chained FMA. The
-                // remaining cases round as a plain subtract.
-                let products_cancel = product1 != 0.0
-                    && product2 != 0.0
-                    && product1.is_sign_positive() != product2.is_sign_positive();
-                let use_compensated_dot = products_cancel
-                    && current != 0.0
-                    && dot != 0.0
-                    && current.is_sign_positive() == dot.is_sign_positive();
-                let use_chained_fma = products_cancel
-                    || (current == 0.0 && product1 != 0.0 && product2 != 0.0)
-                    || (product1 != 0.0
-                        && product2 != 0.0
-                        && current != 0.0
-                        && current.is_sign_positive() != (product1 + product2).is_sign_positive());
-                if use_compensated_dot {
-                    matrix[update_entry] = rank2_update_value(
-                        current,
-                        -l1_row,
-                        first_preserved,
-                        -l2_row,
-                        second_preserved,
-                        true,
-                    );
-                } else if use_chained_fma {
-                    matrix[update_entry] = rank2_update_value(
-                        current,
-                        -l1_row,
-                        first_preserved,
-                        -l2_row,
-                        second_preserved,
-                        false,
-                    );
-                } else {
-                    matrix[update_entry] -= first_preserved * l1_row + second_preserved * l2_row;
-                }
+                // Native SPRAL calls dgemm(..., k=2, alpha=-1, beta=1).
+                // OpenBLAS forms this two-term dot with the k=1 product first,
+                // then applies beta*C.
+                matrix[update_entry] =
+                    current - l2_row.mul_add(second_preserved, l1_row * first_preserved);
             }
         }
     }
@@ -2029,6 +1943,7 @@ fn factorize_dense_tpp_tail_in_place(
                     detail: "TPP encountered a zero pivot with action disabled".into(),
                 });
             }
+            remove_zero_lower_entries_targeting_row(&mut factor_columns, rows[pivot]);
             zero_dense_column(dense, size, pivot);
             let column = FactorColumn {
                 global_column: rows[pivot],
@@ -2058,6 +1973,7 @@ fn factorize_dense_tpp_tail_in_place(
                     dense_symmetric_swap(dense, size, candidate, pivot);
                     rows.swap(candidate, pivot);
                 }
+                remove_zero_lower_entries_targeting_row(&mut factor_columns, rows[pivot]);
                 zero_dense_column(dense, size, pivot);
                 let column = FactorColumn {
                     global_column: rows[pivot],
@@ -2250,6 +2166,7 @@ fn factorize_dense_front(
                 });
             }
             while pivot < active_candidate_end {
+                remove_zero_lower_entries_targeting_row(&mut factor_columns, rows[pivot]);
                 zero_dense_column(&mut dense, size, pivot);
                 reset_ldwork_column_tail(&mut scratch, size, pivot, pivot);
                 let column = FactorColumn {
@@ -2801,20 +2718,32 @@ fn solve_two_by_two_block_in_place(values: &[f64], rhs: &mut [f64]) -> Result<()
     Ok(())
 }
 
+struct DenseUnitLower {
+    values: Vec<f64>,
+    present: Vec<bool>,
+}
+
 fn build_dense_unit_lower_from_factor(
     dimension: usize,
     lower_col_ptrs: &[usize],
     lower_row_indices: &[usize],
     lower_values: &[f64],
-) -> Vec<f64> {
-    let mut lower = vec![0.0; dimension * dimension];
+) -> DenseUnitLower {
+    let mut lower = DenseUnitLower {
+        values: vec![0.0; dimension * dimension],
+        present: vec![false; dimension * dimension],
+    };
     for diagonal in 0..dimension {
-        lower[diagonal * dimension + diagonal] = 1.0;
+        let offset = diagonal * dimension + diagonal;
+        lower.values[offset] = 1.0;
+        lower.present[offset] = true;
     }
     for col in 0..dimension {
         for entry in lower_col_ptrs[col]..lower_col_ptrs[col + 1] {
             let row = lower_row_indices[entry];
-            lower[row * dimension + col] = lower_values[entry];
+            let offset = row * dimension + col;
+            lower.values[offset] = lower_values[entry];
+            lower.present[offset] = true;
         }
     }
     lower
@@ -2825,6 +2754,22 @@ struct PanelFactorStats {
     two_by_two_pivots: usize,
     delayed_pivots: usize,
     max_residual: f64,
+}
+
+fn accumulate_native_two_by_two_inertia(inertia: &mut Inertia, a11: f64, a21: f64, a22: f64) {
+    // Native SPRAL's CPU stats count 2x2 pivots from the stored D block with
+    // det/trace signs, not by forming eigenvalues. This avoids cancellation in
+    // trace +/- sqrt(discriminant) for ill-conditioned inverse pivot blocks.
+    let det = a11 * a22 - a21 * a21;
+    let trace = a11 + a22;
+    if det < 0.0 {
+        inertia.positive += 1;
+        inertia.negative += 1;
+    } else if trace < 0.0 {
+        inertia.negative += 2;
+    } else {
+        inertia.positive += 2;
+    }
 }
 
 fn inertia_from_blocks(
@@ -2851,16 +2796,7 @@ fn inertia_from_blocks(
             continue;
         }
         debug_assert_eq!(block.size, 2);
-        let d22 = values[3];
-        for value in exact_two_by_two_eigenvalues(values[0], values[1], d22) {
-            if value > zero_tol {
-                inertia.positive += 1;
-            } else if value < -zero_tol {
-                inertia.negative += 1;
-            } else {
-                inertia.zero += 1;
-            }
-        }
+        accumulate_native_two_by_two_inertia(&mut inertia, values[0], values[1], values[3]);
     }
     inertia
 }

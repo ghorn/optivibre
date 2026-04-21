@@ -79,16 +79,47 @@ enum SolveOutcome {
     Error(String),
 }
 
+const DEFAULT_PARITY_SEED: u64 = 0xB17_515E;
+
 fn deterministic_runner(cases: u32) -> TestRunner {
+    seeded_runner(cases, DEFAULT_PARITY_SEED)
+}
+
+fn seeded_runner(cases: u32, seed: u64) -> TestRunner {
     TestRunner::new_with_rng(
         Config {
             cases,
+            max_local_rejects: cases.saturating_mul(16).max(65_536),
             failure_persistence: None,
-            rng_seed: RngSeed::Fixed(0xB17_515E),
+            rng_seed: RngSeed::Fixed(seed),
             ..Config::default()
         },
         TestRng::deterministic_rng(RngAlgorithm::ChaCha),
     )
+}
+
+fn env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| parse_u64(&value))
+        .unwrap_or(default)
+}
+
+fn parse_u64(value: &str) -> Option<u64> {
+    value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .map_or_else(
+            || value.parse::<u64>().ok(),
+            |hex| u64::from_str_radix(hex, 16).ok(),
+        )
 }
 
 fn dyadic_strategy() -> impl Strategy<Value = Dyadic> {
@@ -563,7 +594,9 @@ fn rust_and_native_spral_match_bitwise_on_shrinkable_sparse_deep_search() {
     };
 
     let strategy = sparse_bitwise_case_strategy();
-    let mut runner = deterministic_runner(4096);
+    let cases = env_u32("SPRAL_SSIDS_PARITY_CASES", 262_144);
+    let seed = env_u64("SPRAL_SSIDS_PARITY_SEED", DEFAULT_PARITY_SEED);
+    let mut runner = seeded_runner(cases, seed);
     runner
         .run(&strategy, |test_case| {
             assert_sparse_case_bitwise_parity(&native, &test_case).map_err(TestCaseError::fail)
