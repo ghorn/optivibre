@@ -783,6 +783,7 @@ pub fn analyse(
             ));
             let permutation = Permutation::identity(matrix.dimension());
             let result = build_symbolic_result_with_native_order(
+                matrix,
                 &graph,
                 permutation,
                 &column_has_entries,
@@ -804,6 +805,7 @@ pub fn analyse(
             ));
             let summary = approximate_minimum_degree_order(&graph)?;
             let result = build_symbolic_result_with_native_order(
+                matrix,
                 &graph,
                 summary.permutation,
                 &column_has_entries,
@@ -825,6 +827,7 @@ pub fn analyse(
             ));
             let summary = nested_dissection_order(&graph, &ordering_options)?;
             let result = build_symbolic_result_with_native_order(
+                matrix,
                 &graph,
                 summary.permutation,
                 &column_has_entries,
@@ -882,6 +885,7 @@ pub fn analyse(
 
             if amd_fill <= natural_fill && amd_fill <= nd_fill {
                 let result = build_symbolic_result_with_native_order(
+                    matrix,
                     &graph,
                     amd_summary.permutation,
                     &column_has_entries,
@@ -894,6 +898,7 @@ pub fn analyse(
                 Ok(result)
             } else if nd_fill <= natural_fill {
                 let result = build_symbolic_result_with_native_order(
+                    matrix,
                     &graph,
                     summary.permutation,
                     &column_has_entries,
@@ -906,6 +911,7 @@ pub fn analyse(
                 Ok(result)
             } else {
                 let result = build_symbolic_result_with_native_order(
+                    matrix,
                     &graph,
                     natural_permutation,
                     &column_has_entries,
@@ -996,6 +1002,7 @@ fn permute_graph(graph: &CsrGraph, permutation: &Permutation) -> CsrGraph {
 }
 
 fn build_symbolic_result_with_native_order(
+    matrix: SymmetricCscMatrix<'_>,
     graph: &CsrGraph,
     mut current_permutation: Permutation,
     column_has_entries: &[bool],
@@ -1016,7 +1023,12 @@ fn build_symbolic_result_with_native_order(
     let (elimination_tree, column_counts, column_pattern) = symbolic_factor_pattern(&current_graph);
     let supernode_layout = native_supernode_layout(&elimination_tree, &column_counts, realn);
     if is_identity_order(&supernode_layout.permutation) {
-        let supernodes = build_supernodes_from_ranges(&supernode_layout.ranges, &column_pattern);
+        let supernodes = build_native_row_list_supernodes(
+            matrix,
+            &current_permutation,
+            &supernode_layout,
+            &column_pattern,
+        );
         return Ok(build_symbolic_result(
             current_permutation,
             elimination_tree,
@@ -1033,7 +1045,12 @@ fn build_symbolic_result_with_native_order(
     )?;
     let final_graph = permute_graph(graph, &final_permutation);
     let (final_tree, final_counts, final_pattern) = symbolic_factor_pattern(&final_graph);
-    let final_supernodes = build_supernodes_from_ranges(&supernode_layout.ranges, &final_pattern);
+    let final_supernodes = build_native_row_list_supernodes(
+        matrix,
+        &final_permutation,
+        &supernode_layout,
+        &final_pattern,
+    );
     Ok(build_symbolic_result(
         final_permutation,
         final_tree,
@@ -1123,6 +1140,7 @@ fn native_postorder_permutation(
 struct NativeSupernodeLayout {
     permutation: Vec<usize>,
     ranges: Vec<std::ops::Range<usize>>,
+    parents: Vec<Option<usize>>,
 }
 
 fn native_supernode_layout(
@@ -1138,6 +1156,7 @@ fn native_supernode_layout(
     let identity = || NativeSupernodeLayout {
         permutation: (0..n).collect(),
         ranges: (0..n).map(|node| node..node + 1).collect(),
+        parents: elimination_tree.to_vec(),
     };
     let virtual_root = n;
     let mut children = vec![Vec::new(); n + 1];
@@ -1168,6 +1187,8 @@ fn native_supernode_layout(
     }
 
     let mut permutation = vec![usize::MAX; n];
+    let mut vertex_to_supernode = vec![usize::MAX; n + 1];
+    let mut parent_vertices = Vec::new();
     let mut ranges = Vec::new();
     let mut next_position = 0;
     let mut stack = Vec::new();
@@ -1177,12 +1198,15 @@ fn native_supernode_layout(
         }
         let start = next_position;
         next_position += nvert[node];
+        let supernode_index = ranges.len();
+        parent_vertices.push(elimination_tree[node].unwrap_or(virtual_root));
         ranges.push(start..next_position);
         let mut position = next_position;
         stack.push(node);
         while let Some(vertex) = stack.pop() {
             position -= 1;
             permutation[vertex] = position;
+            vertex_to_supernode[vertex] = supernode_index;
             if let Some(next) = vnext[vertex] {
                 stack.push(next);
             }
@@ -1198,9 +1222,19 @@ fn native_supernode_layout(
     if permutation.contains(&usize::MAX) {
         return identity();
     }
+    vertex_to_supernode[virtual_root] = ranges.len();
+    let parents = parent_vertices
+        .into_iter()
+        .map(|parent| {
+            (parent != virtual_root)
+                .then_some(vertex_to_supernode[parent])
+                .filter(|&parent_supernode| parent_supernode != usize::MAX)
+        })
+        .collect();
     NativeSupernodeLayout {
         permutation,
         ranges,
+        parents,
     }
 }
 
@@ -1256,27 +1290,24 @@ fn symbolic_factor_pattern(graph: &CsrGraph) -> (Vec<Option<usize>>, Vec<usize>,
     (elimination_tree, column_counts, column_pattern)
 }
 
-fn build_supernodes_from_ranges(
-    ranges: &[std::ops::Range<usize>],
+fn build_native_row_list_supernodes(
+    matrix: SymmetricCscMatrix<'_>,
+    permutation: &Permutation,
+    layout: &NativeSupernodeLayout,
     column_pattern: &[Vec<usize>],
 ) -> Vec<Supernode> {
     let mut supernodes = Vec::new();
+    let native_row_lists = native_row_lists(matrix, permutation, &layout.ranges, &layout.parents);
     let mut next_column = 0;
-    for range in ranges {
+    for (range, row_list) in layout.ranges.iter().zip(native_row_lists.iter()) {
         for column in next_column..range.start {
             supernodes.push(unit_supernode(column, column_pattern));
         }
-        let mut trailing_rows = Vec::new();
-        for column in range.clone() {
-            trailing_rows.extend(
-                column_pattern[column]
-                    .iter()
-                    .copied()
-                    .filter(|&row| row >= range.end),
-            );
-        }
-        trailing_rows.sort_unstable();
-        trailing_rows.dedup();
+        let trailing_rows = row_list
+            .iter()
+            .copied()
+            .filter(|&row| row >= range.end)
+            .collect();
         supernodes.push(Supernode {
             start_column: range.start,
             end_column: range.end,
@@ -1288,6 +1319,72 @@ fn build_supernodes_from_ranges(
         supernodes.push(unit_supernode(column, column_pattern));
     }
     supernodes
+}
+
+fn native_row_lists(
+    matrix: SymmetricCscMatrix<'_>,
+    permutation: &Permutation,
+    ranges: &[std::ops::Range<usize>],
+    parents: &[Option<usize>],
+) -> Vec<Vec<usize>> {
+    // Mirror core_analyse.find_row_lists followed by dbl_tr_sort. Native
+    // builds each row list bottom-up from eliminated pivots, child row lists,
+    // and original CSC entries under the current pivot permutation.
+    let n = permutation.len();
+    assert_eq!(matrix.dimension(), n, "symbolic matrix dimension mismatch");
+    assert_eq!(
+        parents.len(),
+        ranges.len(),
+        "native supernode parent/range mismatch"
+    );
+
+    let mut children = vec![Vec::new(); ranges.len()];
+    for (node, parent) in parents.iter().copied().enumerate() {
+        if let Some(parent) = parent
+            && parent < children.len()
+        {
+            children[parent].push(node);
+        }
+    }
+
+    let mut row_lists = vec![Vec::new(); ranges.len()];
+    let mut seen = vec![0_usize; n];
+    for node in 0..ranges.len() {
+        let tag = node + 1;
+        let range = &ranges[node];
+        let mut row_list = Vec::new();
+
+        for pivot in range.clone() {
+            seen[pivot] = tag;
+            row_list.push(pivot);
+        }
+
+        for &child in &children[node] {
+            for &row in &row_lists[child] {
+                if row < range.start || seen[row] == tag {
+                    continue;
+                }
+                seen[row] = tag;
+                row_list.push(row);
+            }
+        }
+
+        for pivot in range.clone() {
+            let original_col = permutation.perm()[pivot];
+            for source in matrix.col_ptrs()[original_col]..matrix.col_ptrs()[original_col + 1] {
+                let row = permutation.inverse()[matrix.row_indices()[source]];
+                if row < pivot || seen[row] == tag {
+                    continue;
+                }
+                seen[row] = tag;
+                row_list.push(row);
+            }
+        }
+
+        row_list.sort_unstable();
+        row_lists[node] = row_list;
+    }
+    row_lists
 }
 
 fn unit_supernode(column: usize, column_pattern: &[Vec<usize>]) -> Supernode {
