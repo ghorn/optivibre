@@ -1787,7 +1787,7 @@ fn app_apply_block_pivots_to_trailing_rows(
                 for target_col in (col + 1)..group_end {
                     let target_entry = dense_lower_offset(size, row, target_col);
                     let lower_value = matrix[dense_lower_offset(size, target_col, col)];
-                    matrix[target_entry] -= value * lower_value;
+                    matrix[target_entry] = (-value).mul_add(lower_value, matrix[target_entry]);
                 }
             }
             group_start = group_end;
@@ -1947,18 +1947,16 @@ fn app_apply_accepted_prefix_update(
     for row in accepted_end..size {
         for col in accepted_end..=row {
             let mut update = 0.0;
-            let mut pivot_end = accepted_end;
-            for block in block_records.iter().rev() {
+            let mut pivot = block_start;
+            for block in block_records {
                 if block.size == 1 {
-                    let pivot = pivot_end - 1;
                     let diagonal = app_original_one_by_one_diagonal(block.values[0]);
                     let row_l = matrix[dense_lower_offset(size, row, pivot)];
                     let col_l = matrix[dense_lower_offset(size, col, pivot)];
                     let row_ld = diagonal * row_l;
                     update = row_ld.mul_add(col_l, update);
-                    pivot_end -= 1;
+                    pivot += 1;
                 } else {
-                    let pivot = pivot_end - 2;
                     let inv11 = block.values[0];
                     let inv21 = block.values[1];
                     let inv22 = block.values[3];
@@ -1972,14 +1970,14 @@ fn app_apply_accepted_prefix_update(
                     let col_l2 = matrix[dense_lower_offset(size, col, pivot + 1)];
                     let row_ld1 = d22.mul_add(row_l1, -(d21 * row_l2));
                     let row_ld2 = (-d21).mul_add(row_l1, d11 * row_l2);
-                    update = row_ld2.mul_add(col_l2, update);
                     update = row_ld1.mul_add(col_l1, update);
-                    pivot_end -= 2;
+                    update = row_ld2.mul_add(col_l2, update);
+                    pivot += 2;
                 }
             }
-            debug_assert_eq!(pivot_end, block_start);
+            debug_assert_eq!(pivot, accepted_end);
             let entry = dense_lower_offset(size, row, col);
-            matrix[entry] -= update;
+            matrix[entry] = update.mul_add(-1.0, matrix[entry]);
         }
     }
 }

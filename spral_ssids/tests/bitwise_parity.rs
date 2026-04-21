@@ -118,6 +118,15 @@ fn rust_and_native_spral_match_app_block_boundary_33x33_solution_bits() {
     assert_exact_bitwise_parity_witness(&matrix, &expected_solution);
 }
 
+#[test]
+fn rust_and_native_spral_match_app_block_boundary_34x34_solution_bits() {
+    let matrix = deterministic_complete_dyadic_matrix(34);
+    let expected_solution = (0..34)
+        .map(|index| f64::from((index % 11) as i16 - 5) / 8.0)
+        .collect::<Vec<_>>();
+    assert_exact_bitwise_parity_witness(&matrix, &expected_solution);
+}
+
 fn bit_patterns(values: &[f64]) -> Vec<u64> {
     values.iter().map(|value| value.to_bits()).collect()
 }
