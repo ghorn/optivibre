@@ -4148,6 +4148,52 @@ mod tests {
                 .join("; ")
         }
 
+        fn top_vector_direction_diffs(
+            prev_nlip: &[f64],
+            nlip: &[f64],
+            prev_ipopt: &[f64],
+            ipopt: &[f64],
+            nlip_alpha: f64,
+            ipopt_alpha: f64,
+            label: impl Fn(usize) -> String,
+        ) -> String {
+            let nlip_alpha = nlip_alpha.abs().max(1.0e-16);
+            let ipopt_alpha = ipopt_alpha.abs().max(1.0e-16);
+            let mut diffs = nlip
+                .iter()
+                .zip(prev_nlip.iter())
+                .zip(ipopt.iter().zip(prev_ipopt.iter()))
+                .enumerate()
+                .map(
+                    |(index, ((nlip_value, prev_nlip_value), (ipopt_value, prev_ipopt_value)))| {
+                        let nlip_direction = (nlip_value - prev_nlip_value) / nlip_alpha;
+                        let ipopt_direction = (ipopt_value - prev_ipopt_value) / ipopt_alpha;
+                        (
+                            index,
+                            nlip_direction,
+                            ipopt_direction,
+                            (nlip_direction - ipopt_direction).abs(),
+                        )
+                    },
+                )
+                .collect::<Vec<_>>();
+            diffs.sort_by(|lhs, rhs| rhs.3.total_cmp(&lhs.3));
+            if diffs.is_empty() {
+                return "--".to_string();
+            }
+            diffs
+                .into_iter()
+                .take(6)
+                .map(|(index, nlip_direction, ipopt_direction, diff)| {
+                    format!(
+                        "#{index} {} dn={nlip_direction:.6e} di={ipopt_direction:.6e} d={diff:.3e}",
+                        label(index)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        }
+
         fn max_direction_estimate_diff(
             prev_nlip: &TracePoint,
             nlip: &TracePoint,
@@ -4625,6 +4671,7 @@ mod tests {
             center_index: usize,
             accepted_nlip_solver_snapshots: &[optimization::InteriorPointIterationSnapshot],
             accepted_ipopt_solver_snapshots: &[optimization::IpoptIterationSnapshot],
+            nlip_trace: &[TracePoint],
             ipopt_trace: &[TracePoint],
             bounds: &VariableBoundView,
             intervals: usize,
@@ -4646,6 +4693,46 @@ mod tests {
                             ipopt_trace[probe_index].alpha_pr,
                             intervals,
                             order,
+                        )
+                    );
+                }
+                if probe_index > 0
+                    && probe_index < nlip_trace.len()
+                    && probe_index < ipopt_trace.len()
+                {
+                    // Ipopt BacktrackingLineSearch::PerformDualStep defaults
+                    // alpha_for_y to alpha_primal and applies alpha_dual to
+                    // bound multipliers.
+                    let nlip_alpha_y = nlip_trace[probe_index].alpha_pr;
+                    let ipopt_alpha_y = ipopt_trace[probe_index].alpha_pr;
+                    let nlip_alpha_du = nlip_trace[probe_index].alpha_du;
+                    let ipopt_alpha_du = ipopt_trace[probe_index].alpha_du;
+                    let prev_nlip = &accepted_nlip_solver_snapshots[probe_index - 1];
+                    let nlip = &accepted_nlip_solver_snapshots[probe_index];
+                    let prev_ipopt = &accepted_ipopt_solver_snapshots[probe_index - 1];
+                    let ipopt = &accepted_ipopt_solver_snapshots[probe_index];
+                    println!(
+                        "          top y_d accepted-direction diffs: {}",
+                        top_vector_direction_diffs(
+                            prev_nlip.inequality_multipliers.as_deref().unwrap_or(&[]),
+                            nlip.inequality_multipliers.as_deref().unwrap_or(&[]),
+                            &prev_ipopt.inequality_multipliers,
+                            &ipopt.inequality_multipliers,
+                            nlip_alpha_y,
+                            ipopt_alpha_y,
+                            |idx| glider_inequality_label(idx, intervals, order),
+                        )
+                    );
+                    println!(
+                        "          top v_U accepted-direction diffs: {}",
+                        top_vector_direction_diffs(
+                            prev_nlip.slack_multipliers.as_deref().unwrap_or(&[]),
+                            nlip.slack_multipliers.as_deref().unwrap_or(&[]),
+                            &prev_ipopt.slack_upper_bound_multipliers,
+                            &ipopt.slack_upper_bound_multipliers,
+                            nlip_alpha_du,
+                            ipopt_alpha_du,
+                            |idx| glider_inequality_label(idx, intervals, order),
                         )
                     );
                 }
@@ -5135,6 +5222,7 @@ mod tests {
                 direction_index,
                 &accepted_nlip_solver_snapshots,
                 &accepted_ipopt_solver_snapshots,
+                &nlip_trace,
                 &ipopt_trace,
                 &variable_bounds,
                 params.transcription.intervals,
@@ -5157,6 +5245,7 @@ mod tests {
                 probe_index,
                 &accepted_nlip_solver_snapshots,
                 &accepted_ipopt_solver_snapshots,
+                &nlip_trace,
                 &ipopt_trace,
                 &variable_bounds,
                 params.transcription.intervals,
@@ -5255,6 +5344,7 @@ mod tests {
                     index,
                     &accepted_nlip_solver_snapshots,
                     &accepted_ipopt_solver_snapshots,
+                    &nlip_trace,
                     &ipopt_trace,
                     &variable_bounds,
                     params.transcription.intervals,
