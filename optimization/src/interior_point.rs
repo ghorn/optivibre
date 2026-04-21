@@ -2132,9 +2132,7 @@ fn build_interior_point_kkt_snapshot(
         .iter()
         .zip(system.slack.iter())
         .enumerate()
-        .map(|(index, (r_cent_i, slack_i))| {
-            -(r_cent_i / slack_i - damped_slack_stationarity_residual(system, index))
-        })
+        .map(|(index, _)| ipopt_internal_slack_rhs(system, index))
         .collect::<Vec<_>>();
     let pattern = build_spral_augmented_kkt_pattern(
         system.hessian.lower_triangle.as_ref(),
@@ -2832,6 +2830,10 @@ fn system_positive_slack_damping(system: &ReducedKktSystem<'_>) -> f64 {
 
 fn damped_slack_stationarity_residual(system: &ReducedKktSystem<'_>, index: usize) -> f64 {
     system.r_slack_stationarity[index] - system_positive_slack_damping(system)
+}
+
+fn ipopt_internal_slack_rhs(system: &ReducedKktSystem<'_>, index: usize) -> f64 {
+    system.r_cent[index] / system.slack[index] - damped_slack_stationarity_residual(system, index)
 }
 
 fn damped_slack_stationarity_residuals(
@@ -5705,7 +5707,7 @@ fn fill_spral_augmented_kkt_values(
         values[slot] += -dual_shift;
     }
     for &slot in &pattern.pz_indices {
-        values[slot] += 1.0;
+        values[slot] += -1.0;
     }
 }
 
@@ -6094,9 +6096,7 @@ fn solve_reduced_kkt_with_native_spral_ssids(
         .iter()
         .zip(system.slack.iter())
         .enumerate()
-        .map(|(index, (r_cent_i, slack_i))| {
-            -(r_cent_i / slack_i - damped_slack_stationarity_residual(system, index))
-        })
+        .map(|(index, _)| ipopt_internal_slack_rhs(system, index))
         .collect::<Vec<_>>();
     let total_dimension = workspace.pattern.dimension();
     let mut rhs = vec![0.0; total_dimension];
@@ -6172,8 +6172,10 @@ fn solve_reduced_kkt_with_native_spral_ssids(
                     });
                 }
                 let dx = solution[..n].to_vec();
-                let p = solution[workspace.pattern.p_offset..workspace.pattern.p_offset + mineq]
+                let ipopt_ds = solution
+                    [workspace.pattern.p_offset..workspace.pattern.p_offset + mineq]
                     .to_vec();
+                let ds = ipopt_ds.iter().map(|value| -*value).collect::<Vec<_>>();
                 let d_lambda = solution
                     [workspace.pattern.lambda_offset..workspace.pattern.lambda_offset + meq]
                     .to_vec();
@@ -6183,14 +6185,13 @@ fn solve_reduced_kkt_with_native_spral_ssids(
                 let dz = d_ineq
                     .iter()
                     .zip(system.r_slack_stationarity.iter())
-                    .zip(p.iter())
+                    .zip(ds.iter())
                     .enumerate()
                     .map(|(index, ((dy_i, _), ds_i))| {
                         *dy_i - damped_slack_stationarity_residual(system, index)
                             + slack_shift * *ds_i
                     })
                     .collect::<Vec<_>>();
-                let ds = p;
                 return Ok(NewtonDirection {
                     dx,
                     d_lambda,
@@ -6277,9 +6278,7 @@ fn solve_reduced_kkt_with_spral_ssids(
         .iter()
         .zip(system.slack.iter())
         .enumerate()
-        .map(|(index, (r_cent_i, slack_i))| {
-            -(r_cent_i / slack_i - damped_slack_stationarity_residual(system, index))
-        })
+        .map(|(index, _)| ipopt_internal_slack_rhs(system, index))
         .collect::<Vec<_>>();
     let total_dimension = workspace.pattern.dimension();
     let mut rhs = vec![0.0; total_dimension];
@@ -6326,8 +6325,10 @@ fn solve_reduced_kkt_with_spral_ssids(
         ) {
             Ok((solution, backend_stats)) => {
                 let dx = solution[..n].to_vec();
-                let p = solution[workspace.pattern.p_offset..workspace.pattern.p_offset + mineq]
+                let ipopt_ds = solution
+                    [workspace.pattern.p_offset..workspace.pattern.p_offset + mineq]
                     .to_vec();
+                let ds = ipopt_ds.iter().map(|value| -*value).collect::<Vec<_>>();
                 let d_lambda = solution
                     [workspace.pattern.lambda_offset..workspace.pattern.lambda_offset + meq]
                     .to_vec();
@@ -6337,14 +6338,13 @@ fn solve_reduced_kkt_with_spral_ssids(
                 let dz = d_ineq
                     .iter()
                     .zip(system.r_slack_stationarity.iter())
-                    .zip(p.iter())
+                    .zip(ds.iter())
                     .enumerate()
                     .map(|(index, ((dy_i, _), ds_i))| {
                         *dy_i - damped_slack_stationarity_residual(system, index)
                             + slack_shift * *ds_i
                     })
                     .collect::<Vec<_>>();
-                let ds = p;
                 return Ok(NewtonDirection {
                     dx,
                     d_lambda,
