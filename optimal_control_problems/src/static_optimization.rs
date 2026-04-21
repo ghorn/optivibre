@@ -39,7 +39,6 @@ const CHAIN_LINKS: usize = 24;
 const CHAIN_POINTS: usize = CHAIN_LINKS - 1;
 const CHAIN_LINK_LENGTH: f64 = 1.0;
 const DEFAULT_CHAIN_SPAN_RATIO: f64 = 0.75;
-const MAX_3D_CHAIN_FRAMES: usize = 44;
 const ROSENBROCK_CONTOUR_POINTS: usize = 68;
 
 type HangingChainCompiled =
@@ -1598,44 +1597,28 @@ fn hanging_chain_artifact(
         .visualizations
         .push(ArtifactVisualization::Paths3D {
             title: "Chain Convergence".to_string(),
-            x_label: "x".to_string(),
-            y_label: "y".to_string(),
-            z_label: "iteration".to_string(),
+            x_label: "chain x".to_string(),
+            y_label: "iteration".to_string(),
+            z_label: "chain y".to_string(),
             paths: chain_history_paths_3d(history, span),
         });
     artifact
 }
 
 fn chain_history_paths_3d(history: &[Vec<f64>], span: f64) -> Vec<ScenePath3D> {
-    let indices = sampled_history_indices(history.len(), MAX_3D_CHAIN_FRAMES);
-    indices
-        .into_iter()
-        .map(|idx| {
-            let points = chain_points_from_flat(&history[idx], span);
+    history
+        .iter()
+        .enumerate()
+        .map(|(idx, state)| {
+            let points = chain_points_from_flat(state, span);
             ScenePath3D {
                 name: format!("iter {idx}"),
                 x: points.iter().map(|(x, _)| *x).collect(),
-                y: points.iter().map(|(_, y)| *y).collect(),
-                z: vec![idx as f64; points.len()],
+                y: vec![idx as f64; points.len()],
+                z: points.iter().map(|(_, y)| *y).collect(),
             }
         })
         .collect()
-}
-
-fn sampled_history_indices(len: usize, max_count: usize) -> Vec<usize> {
-    if len <= max_count {
-        return (0..len).collect();
-    }
-    let step = (len - 1) as f64 / (max_count - 1) as f64;
-    let mut indices = (0..max_count)
-        .map(|idx| (idx as f64 * step).round() as usize)
-        .collect::<Vec<_>>();
-    indices.sort_unstable();
-    indices.dedup();
-    if indices.last().copied() != Some(len - 1) {
-        indices.push(len - 1);
-    }
-    indices
 }
 
 fn rosenbrock_objective(coeffs: &RosenbrockCoefficients<f64>, x: f64, y: f64) -> f64 {

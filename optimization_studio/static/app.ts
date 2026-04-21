@@ -5774,12 +5774,18 @@ function ensureChartViews(panels: ChartPanel[]): void {
   state.chartLayoutKey = nextKey;
 
   for (const panel of panels) {
+    const isPaths3D = panel.kind === "visualization" && panel.visualization.kind === "paths_3d";
     const shell = document.createElement("section");
     shell.className = "chart-shell";
+    if (isPaths3D) {
+      shell.classList.add("chart-shell-3d");
+    }
     const header = document.createElement("div");
     header.className = "chart-header";
     header.innerHTML = `<div>${panel.title}</div><div class="card-subtitle">${panel.subtitle}</div>`;
-    const plotEl = createPlotlyHostElement("plot-surface");
+    const plotEl = createPlotlyHostElement(
+      isPaths3D ? "plot-surface plot-surface-3d" : "plot-surface",
+    );
     shell.append(header, plotEl);
     chartsEl.appendChild(shell);
     state.chartViews.set(panel.key, {
@@ -6059,12 +6065,15 @@ function updatePaths3DVisualization(
     margin: { l: 0, r: 0, t: 0, b: 0 },
     legend: {
       orientation: "h",
-      y: 0,
-      x: 0,
+      y: 0.02,
+      x: 0.01,
       font: { color: "#94b6bd", size: 11 },
     },
     scene: {
+      domain: { x: [0, 1], y: [0, 1] },
       bgcolor: "rgba(4, 15, 22, 0.92)",
+      aspectmode: "manual",
+      aspectratio: { x: 2.35, y: 1.25, z: 1.0 },
       xaxis: {
         title: visualization.x_label,
         gridcolor: "rgba(229, 241, 244, 0.08)",
@@ -6084,7 +6093,8 @@ function updatePaths3DVisualization(
         titlefont: { color: "#94b6bd" },
       },
       camera: {
-        eye: { x: 1.45, y: -1.65, z: 1.1 },
+        up: { x: 0, y: 0, z: 1 },
+        eye: { x: 1.65, y: -1.45, z: 0.95 },
       },
     },
   };

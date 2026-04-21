@@ -734,6 +734,10 @@ select {
   min-height: 620px;
 }
 
+.plot-surface-3d {
+  min-height: clamp(620px, 76vh, 780px);
+}
+
 .solve-plot {
   min-height: 360px;
 }
