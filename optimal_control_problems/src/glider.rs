@@ -4164,6 +4164,96 @@ mod tests {
             })
         }
 
+        fn accepted_state_gap_ladder(
+            accepted_nlip_solver_snapshots: &[optimization::InteriorPointIterationSnapshot],
+            accepted_ipopt_solver_snapshots: &[optimization::IpoptIterationSnapshot],
+        ) -> String {
+            fn metric_gap(
+                metric: &str,
+                thresholds: &[f64],
+                accepted_nlip_solver_snapshots: &[optimization::InteriorPointIterationSnapshot],
+                accepted_ipopt_solver_snapshots: &[optimization::IpoptIterationSnapshot],
+                gap: impl Fn(
+                    &optimization::InteriorPointIterationSnapshot,
+                    &optimization::IpoptIterationSnapshot,
+                ) -> f64,
+            ) -> String {
+                let compared = accepted_nlip_solver_snapshots
+                    .len()
+                    .min(accepted_ipopt_solver_snapshots.len());
+                let threshold_text = thresholds
+                    .iter()
+                    .map(|&threshold| {
+                        let marker = (0..compared).find_map(|index| {
+                            let nlip = &accepted_nlip_solver_snapshots[index];
+                            let ipopt = &accepted_ipopt_solver_snapshots[index];
+                            let gap = gap(nlip, ipopt);
+                            (gap > threshold).then_some((index, gap, nlip.iteration, ipopt.iteration))
+                        });
+                        match marker {
+                            Some((index, gap, nlip_iter, ipopt_iter)) => format!(
+                                ">{threshold:.0e}:index={index},nlip_iter={nlip_iter},ipopt_iter={ipopt_iter},gap={gap:.3e}"
+                            ),
+                            None => format!(">{threshold:.0e}:none"),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("{metric}[{threshold_text}]")
+            }
+
+            let thresholds = [1.0e-10, 1.0e-8, 1.0e-6, 1.0e-4];
+            [
+                metric_gap(
+                    "x",
+                    &thresholds,
+                    accepted_nlip_solver_snapshots,
+                    accepted_ipopt_solver_snapshots,
+                    |nlip, ipopt| vector_inf_diff(&nlip.x, &ipopt.x, 1.0),
+                ),
+                metric_gap(
+                    "eq_y",
+                    &thresholds,
+                    accepted_nlip_solver_snapshots,
+                    accepted_ipopt_solver_snapshots,
+                    |nlip, ipopt| {
+                        vector_inf_diff(
+                            nlip.equality_multipliers.as_deref().unwrap_or(&[]),
+                            &ipopt.equality_multipliers,
+                            1.0,
+                        )
+                    },
+                ),
+                metric_gap(
+                    "ineq_y",
+                    &thresholds,
+                    accepted_nlip_solver_snapshots,
+                    accepted_ipopt_solver_snapshots,
+                    |nlip, ipopt| {
+                        vector_inf_diff(
+                            nlip.inequality_multipliers.as_deref().unwrap_or(&[]),
+                            &ipopt.inequality_multipliers,
+                            1.0,
+                        )
+                    },
+                ),
+                metric_gap(
+                    "slack_stat",
+                    &thresholds,
+                    accepted_nlip_solver_snapshots,
+                    accepted_ipopt_solver_snapshots,
+                    |nlip, ipopt| {
+                        vector_inf_diff(
+                            nlip.kkt_slack_stationarity.as_deref().unwrap_or(&[]),
+                            &ipopt.kkt_slack_stationarity,
+                            1.0,
+                        )
+                    },
+                ),
+            ]
+            .join("; ")
+        }
+
         fn top_vector_diffs<F>(lhs: &[f64], rhs: &[f64], rhs_sign: f64, mut label: F) -> String
         where
             F: FnMut(usize) -> String,
@@ -4884,6 +4974,13 @@ mod tests {
         println!(
             "direction_gap_ladder {}",
             direction_gap_ladder(&nlip_trace, &ipopt_trace)
+        );
+        println!(
+            "accepted_state_gap_ladder {}",
+            accepted_state_gap_ladder(
+                &accepted_nlip_solver_snapshots,
+                &accepted_ipopt_solver_snapshots,
+            )
         );
         let direction_window_threshold = std::env::var("GLIDER_PARITY_DIRECTION_THRESHOLD")
             .ok()
