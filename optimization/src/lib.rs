@@ -82,6 +82,11 @@ const BOX_LABEL_WIDTH: usize = 13;
 const IPOPT_PERTURB_INC_FACT: f64 = 8.0;
 const IPOPT_MAX_HESSIAN_PERTURBATION: f64 = 1.0e20;
 const NATIVE_SPRAL_PARITY_INERTIA_CORRECTION_RETRIES: Index = 32;
+pub const LOCAL_SPRAL_IPOPT_VERSION: &str = "3.14.20";
+pub const LOCAL_SPRAL_IPOPT_PREFIX: &str = "/Users/greg/local/ipopt-spral";
+pub const LOCAL_SPRAL_IPOPT_BINARY: &str = "/Users/greg/local/ipopt-spral/bin/ipopt";
+pub const LOCAL_SPRAL_LIBSPRAL_DYLIB: &str = "/Users/greg/local/ipopt-spral/lib/libspral.dylib";
+pub const NATIVE_SPRAL_PARITY_FAIL_CLOSED_ENV: &str = "AD_CODEGEN_REQUIRE_NATIVE_SPRAL_PARITY";
 pub(crate) const EQ_INF_LABEL: &str = "‖eq‖∞";
 pub(crate) const INEQ_INF_LABEL: &str = "‖ineq₊‖∞";
 pub(crate) const DUAL_INF_LABEL: &str = "‖∇L‖∞";
@@ -315,6 +320,9 @@ pub fn native_spral_parity_profile() -> SpralParityProfile {
 pub fn apply_native_spral_parity_to_nlip_options(options: &mut InteriorPointOptions) {
     let profile = native_spral_parity_profile();
     options.linear_solver = InteriorPointLinearSolver::NativeSpralSsids;
+    if let Some(linear_debug) = options.linear_debug.as_mut() {
+        linear_debug.compare_solvers.clear();
+    }
     options.regularization = 0.0;
     options.kappa_d = profile.kappa_d;
     options.regularization_growth_factor = IPOPT_PERTURB_INC_FACT;
@@ -332,6 +340,15 @@ pub fn native_spral_parity_nlip_options() -> InteriorPointOptions {
     let mut options = InteriorPointOptions::default();
     apply_native_spral_parity_to_nlip_options(&mut options);
     options
+}
+
+pub fn native_spral_parity_fail_closed_requested() -> bool {
+    std::env::var_os(NATIVE_SPRAL_PARITY_FAIL_CLOSED_ENV).is_some_and(|value| {
+        matches!(
+            value.to_string_lossy().as_ref(),
+            "1" | "true" | "TRUE" | "yes" | "YES"
+        )
+    })
 }
 
 #[cfg(feature = "ipopt")]
@@ -367,6 +384,192 @@ pub fn native_spral_parity_ipopt_options() -> IpoptOptions {
     let mut options = IpoptOptions::default();
     apply_native_spral_parity_to_ipopt_options(&mut options);
     options
+}
+
+#[cfg(feature = "ipopt")]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeSpralParityPreflight {
+    pub ipopt: IpoptProvenance,
+    pub spral_ssids_native_lib: Option<String>,
+    pub rayon_num_threads: Option<String>,
+    pub omp_num_threads: Option<String>,
+    pub fail_closed: bool,
+}
+
+#[cfg(feature = "ipopt")]
+pub fn capture_native_spral_parity_preflight() -> NativeSpralParityPreflight {
+    NativeSpralParityPreflight {
+        ipopt: capture_ipopt_provenance(),
+        spral_ssids_native_lib: std::env::var("SPRAL_SSIDS_NATIVE_LIB").ok(),
+        rayon_num_threads: std::env::var("RAYON_NUM_THREADS").ok(),
+        omp_num_threads: std::env::var("OMP_NUM_THREADS").ok(),
+        fail_closed: native_spral_parity_fail_closed_requested(),
+    }
+}
+
+#[cfg(feature = "ipopt")]
+fn path_is_under_prefix_components(path: &str, prefix: &str) -> bool {
+    let path = std::path::Path::new(path);
+    let prefix = std::path::Path::new(prefix);
+    path == prefix || path.starts_with(prefix)
+}
+
+#[cfg(feature = "ipopt")]
+fn path_matches_exact_or_canonical(path: &str, expected: &str) -> bool {
+    if path == expected {
+        return true;
+    }
+    match (std::fs::canonicalize(path), std::fs::canonicalize(expected)) {
+        (Ok(path), Ok(expected)) => path == expected,
+        _ => false,
+    }
+}
+
+#[cfg(feature = "ipopt")]
+fn pkg_config_flag_paths(flags: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut tokens = flags.split_whitespace();
+    while let Some(token) = tokens.next() {
+        match token {
+            "-I" | "-L" => {
+                if let Some(path) = tokens.next() {
+                    paths.push(path.to_string());
+                }
+            }
+            _ if token.starts_with("-I") || token.starts_with("-L") => {
+                paths.push(token[2..].to_string());
+            }
+            _ => {}
+        }
+    }
+    paths
+}
+
+#[cfg(feature = "ipopt")]
+pub fn native_spral_parity_ipopt_provenance_errors(provenance: &IpoptProvenance) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    match provenance.pkg_config_version.as_deref() {
+        Some(LOCAL_SPRAL_IPOPT_VERSION) => {}
+        Some(version) => errors.push(format!(
+            "pkg-config ipopt version {version} does not match expected {LOCAL_SPRAL_IPOPT_VERSION}"
+        )),
+        None => errors.push("pkg-config ipopt version is unavailable".to_string()),
+    }
+
+    match provenance.pkg_config_cflags_libs.as_deref() {
+        Some(flags) => {
+            let flag_paths = pkg_config_flag_paths(flags);
+            if let Some(path) = flag_paths.iter().find(|path| {
+                path.starts_with(LOCAL_SPRAL_IPOPT_PREFIX)
+                    && !path_is_under_prefix_components(path, LOCAL_SPRAL_IPOPT_PREFIX)
+            }) {
+                errors.push(format!(
+                    "pkg-config ipopt cflags/libs use lookalike prefix path {path}, expected exact prefix {LOCAL_SPRAL_IPOPT_PREFIX}"
+                ));
+            } else if !flag_paths
+                .iter()
+                .any(|path| path_is_under_prefix_components(path, LOCAL_SPRAL_IPOPT_PREFIX))
+            {
+                errors.push(format!(
+                    "pkg-config ipopt cflags/libs do not contain component-safe expected prefix {LOCAL_SPRAL_IPOPT_PREFIX}: {flags}"
+                ));
+            }
+            if let Some(path) = flag_paths
+                .iter()
+                .find(|path| path.starts_with("/usr/local/") || path.starts_with("/opt/homebrew/"))
+            {
+                errors.push(format!(
+                    "pkg-config ipopt cflags/libs contain disallowed non-local path {path}"
+                ));
+            }
+        }
+        None => errors.push("pkg-config ipopt cflags/libs are unavailable".to_string()),
+    }
+
+    match provenance.ipopt_binary.as_deref() {
+        Some(path) if path_matches_exact_or_canonical(path, LOCAL_SPRAL_IPOPT_BINARY) => {}
+        Some(path) => errors.push(format!(
+            "ipopt binary {path} does not resolve to expected local binary {LOCAL_SPRAL_IPOPT_BINARY}"
+        )),
+        None => errors.push("ipopt binary is unavailable".to_string()),
+    }
+
+    match provenance.linear_solver_default.as_deref() {
+        Some("spral") => {}
+        Some(default) => errors.push(format!(
+            "ipopt linear_solver default {default} does not match expected spral"
+        )),
+        None => errors.push("ipopt linear_solver default is unavailable".to_string()),
+    }
+
+    errors
+}
+
+#[cfg(feature = "ipopt")]
+pub fn native_spral_parity_preflight_errors(preflight: &NativeSpralParityPreflight) -> Vec<String> {
+    let mut errors = native_spral_parity_ipopt_provenance_errors(&preflight.ipopt);
+
+    match preflight.spral_ssids_native_lib.as_deref() {
+        Some(LOCAL_SPRAL_LIBSPRAL_DYLIB) => {}
+        Some(path) if path.starts_with("/usr/local/") || path.starts_with("/opt/homebrew/") => {
+            errors.push(format!(
+                "SPRAL_SSIDS_NATIVE_LIB points to disallowed non-local SPRAL library {path}"
+            ));
+        }
+        Some(path) if path.starts_with(LOCAL_SPRAL_IPOPT_PREFIX) => {
+            errors.push(format!(
+                "SPRAL_SSIDS_NATIVE_LIB should point at {LOCAL_SPRAL_LIBSPRAL_DYLIB}, got {path}"
+            ));
+        }
+        Some(path) => errors.push(format!(
+            "SPRAL_SSIDS_NATIVE_LIB is outside expected prefix {LOCAL_SPRAL_IPOPT_PREFIX}: {path}"
+        )),
+        None => errors.push(format!(
+            "SPRAL_SSIDS_NATIVE_LIB must be set to {LOCAL_SPRAL_LIBSPRAL_DYLIB}"
+        )),
+    }
+
+    for (name, value) in [
+        ("RAYON_NUM_THREADS", preflight.rayon_num_threads.as_deref()),
+        ("OMP_NUM_THREADS", preflight.omp_num_threads.as_deref()),
+    ] {
+        match value {
+            Some("1") => {}
+            Some(value) => errors.push(format!("{name} must be 1 for exact parity, got {value}")),
+            None => errors.push(format!("{name} must be set to 1 for exact parity")),
+        }
+    }
+
+    errors
+}
+
+#[cfg(feature = "ipopt")]
+pub fn validate_native_spral_parity_preflight()
+-> std::result::Result<NativeSpralParityPreflight, Vec<String>> {
+    let preflight = capture_native_spral_parity_preflight();
+    let errors = native_spral_parity_preflight_errors(&preflight);
+    if errors.is_empty() {
+        Ok(preflight)
+    } else {
+        Err(errors)
+    }
+}
+
+#[cfg(feature = "ipopt")]
+pub fn assert_native_spral_parity_preflight() -> NativeSpralParityPreflight {
+    match validate_native_spral_parity_preflight() {
+        Ok(preflight) => preflight,
+        Err(errors) => panic!(
+            "native-SPRAL parity preflight failed:\n{}",
+            errors
+                .iter()
+                .map(|error| format!("  - {error}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4794,6 +4997,132 @@ mod tests {
         assert_eq!(
             options.adaptive_regularization_retries,
             NATIVE_SPRAL_PARITY_INERTIA_CORRECTION_RETRIES
+        );
+    }
+
+    #[test]
+    fn native_spral_parity_nlip_options_clear_alternate_linear_debug_solvers() {
+        let mut options = super::InteriorPointOptions {
+            linear_debug: Some(super::InteriorPointLinearDebugOptions {
+                schedule: super::InteriorPointLinearDebugSchedule::EveryIteration,
+                compare_solvers: vec![
+                    super::InteriorPointLinearSolver::SparseQdldl,
+                    super::InteriorPointLinearSolver::SpralSsids,
+                ],
+                dump_dir: None,
+            }),
+            ..super::InteriorPointOptions::default()
+        };
+
+        super::apply_native_spral_parity_to_nlip_options(&mut options);
+
+        assert_eq!(
+            options.linear_solver,
+            super::InteriorPointLinearSolver::NativeSpralSsids
+        );
+        assert_eq!(
+            options
+                .linear_debug
+                .as_ref()
+                .map(|debug| debug.compare_solvers.as_slice()),
+            Some(&[][..])
+        );
+    }
+
+    #[cfg(feature = "ipopt")]
+    #[test]
+    fn native_spral_parity_ipopt_options_force_spral_profile() {
+        let options = super::native_spral_parity_ipopt_options();
+
+        assert_eq!(options.linear_solver, Some(super::IpoptLinearSolver::Spral));
+        assert_eq!(
+            options.spral_ordering,
+            Some(super::IpoptSpralOrdering::Matching)
+        );
+        assert_eq!(
+            options.spral_scaling,
+            Some(super::IpoptSpralScaling::Matching)
+        );
+        assert_eq!(
+            options.spral_pivot_method,
+            Some(super::IpoptSpralPivotMethod::Block)
+        );
+        assert_eq!(options.spral_small_pivot_tolerance, Some(1.0e-20));
+        assert_eq!(options.spral_threshold_pivot_u, Some(1.0e-8));
+        assert_eq!(options.spral_pivot_tolerance_max, Some(1.0e-4));
+        assert_eq!(options.spral_use_gpu, Some(false));
+        assert!(options.capture_provenance);
+    }
+
+    #[cfg(feature = "ipopt")]
+    fn good_local_ipopt_provenance() -> super::IpoptProvenance {
+        super::IpoptProvenance {
+            pkg_config_version: Some(super::LOCAL_SPRAL_IPOPT_VERSION.to_string()),
+            pkg_config_cflags_libs: Some(format!(
+                "-I{}/include/coin-or -lipopt",
+                super::LOCAL_SPRAL_IPOPT_PREFIX
+            )),
+            ipopt_binary: Some(super::LOCAL_SPRAL_IPOPT_BINARY.to_string()),
+            linear_solver_default: Some("spral".to_string()),
+        }
+    }
+
+    #[cfg(feature = "ipopt")]
+    #[test]
+    fn native_spral_parity_preflight_accepts_pinned_local_inputs() {
+        let preflight = super::NativeSpralParityPreflight {
+            ipopt: good_local_ipopt_provenance(),
+            spral_ssids_native_lib: Some(super::LOCAL_SPRAL_LIBSPRAL_DYLIB.to_string()),
+            rayon_num_threads: Some("1".to_string()),
+            omp_num_threads: Some("1".to_string()),
+            fail_closed: true,
+        };
+
+        assert!(super::native_spral_parity_preflight_errors(&preflight).is_empty());
+    }
+
+    #[cfg(feature = "ipopt")]
+    #[test]
+    fn native_spral_parity_preflight_rejects_solver_substitution_inputs() {
+        let mut provenance = good_local_ipopt_provenance();
+        provenance.linear_solver_default = Some("mumps".to_string());
+        let preflight = super::NativeSpralParityPreflight {
+            ipopt: provenance,
+            spral_ssids_native_lib: Some("/opt/homebrew/lib/libspral.dylib".to_string()),
+            rayon_num_threads: Some("4".to_string()),
+            omp_num_threads: None,
+            fail_closed: true,
+        };
+
+        let errors = super::native_spral_parity_preflight_errors(&preflight);
+        assert!(errors.iter().any(|error| error.contains("expected spral")));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("disallowed non-local"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("RAYON_NUM_THREADS"))
+        );
+        assert!(errors.iter().any(|error| error.contains("OMP_NUM_THREADS")));
+    }
+
+    #[cfg(feature = "ipopt")]
+    #[test]
+    fn native_spral_parity_preflight_rejects_lookalike_local_paths() {
+        let mut provenance = good_local_ipopt_provenance();
+        provenance.pkg_config_cflags_libs =
+            Some("-I/Users/greg/local/ipopt-spral-alt/include/coin-or -lipopt".to_string());
+        provenance.ipopt_binary = Some("/Users/greg/local/ipopt-spral-alt/bin/ipopt".to_string());
+
+        let errors = super::native_spral_parity_ipopt_provenance_errors(&provenance);
+        assert!(errors.iter().any(|error| error.contains("lookalike")));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains(super::LOCAL_SPRAL_IPOPT_BINARY))
         );
     }
 }

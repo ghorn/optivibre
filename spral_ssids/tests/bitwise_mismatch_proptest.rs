@@ -186,6 +186,9 @@ fn load_native_or_skip() -> Option<NativeSpral> {
     match NativeSpral::load() {
         Ok(native) => Some(native),
         Err(error) => {
+            if std::env::var_os("AD_CODEGEN_REQUIRE_NATIVE_SPRAL_PARITY").is_some() {
+                panic!("native SPRAL is required for fail-closed mismatch search: {error}");
+            }
             eprintln!("skipping native SPRAL mismatch search: {error}");
             None
         }

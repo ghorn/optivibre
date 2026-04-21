@@ -3,7 +3,8 @@
 use approx::assert_abs_diff_eq;
 use optimization::{
     CCS, CompiledNlpProblem, ConstraintBounds, FilterAcceptanceMode, InteriorPointIterationPhase,
-    InteriorPointOptions, InteriorPointStepKind, IpoptOptions, ParameterMatrix,
+    InteriorPointIterationSnapshot, InteriorPointOptions, InteriorPointStepKind,
+    IpoptIterationSnapshot, IpoptOptions, ParameterMatrix,
     apply_native_spral_parity_to_ipopt_options, apply_native_spral_parity_to_nlip_options,
     solve_nlp_interior_point, solve_nlp_interior_point_with_callback, solve_nlp_ipopt,
 };
@@ -344,46 +345,16 @@ fn assert_local_spral_ipopt_provenance(summary: &optimization::IpoptSummary) {
         .provenance
         .as_ref()
         .expect("expected IPOPT provenance for native-SPRAL parity runs");
-    assert_local_spral_ipopt_environment(provenance);
-}
-
-const LOCAL_SPRAL_IPOPT_VERSION: &str = "3.14.20";
-const LOCAL_SPRAL_IPOPT_PREFIX: &str = "/Users/greg/local/ipopt-spral";
-
-fn local_spral_ipopt_environment_error(
-    provenance: &optimization::IpoptProvenance,
-) -> Option<String> {
-    match provenance.pkg_config_version.as_deref() {
-        Some(LOCAL_SPRAL_IPOPT_VERSION) => {}
-        Some(version) => {
-            return Some(format!(
-                "pkg-config ipopt version {version} does not match expected {LOCAL_SPRAL_IPOPT_VERSION}"
-            ));
-        }
-        None => return Some("pkg-config ipopt version is unavailable".to_string()),
-    }
-
-    let Some(flags) = provenance.pkg_config_cflags_libs.as_deref() else {
-        return Some("pkg-config ipopt cflags/libs are unavailable".to_string());
-    };
-    if !flags.contains(LOCAL_SPRAL_IPOPT_PREFIX) {
-        return Some(format!(
-            "pkg-config ipopt flags do not contain expected prefix {LOCAL_SPRAL_IPOPT_PREFIX}: {flags}"
-        ));
-    }
-
-    match provenance.linear_solver_default.as_deref() {
-        Some("spral") => None,
-        Some(default) => Some(format!(
-            "ipopt linear_solver default {default} does not match expected spral"
-        )),
-        None => Some("ipopt linear_solver default is unavailable".to_string()),
-    }
-}
-
-fn assert_local_spral_ipopt_environment(provenance: &optimization::IpoptProvenance) {
-    if let Some(error) = local_spral_ipopt_environment_error(provenance) {
-        panic!("unsupported local SPRAL IPOPT environment: {error}; provenance={provenance:?}");
+    let errors = optimization::native_spral_parity_ipopt_provenance_errors(provenance);
+    if !errors.is_empty() {
+        panic!(
+            "unsupported local SPRAL IPOPT provenance:\n{}\nprovenance={provenance:?}",
+            errors
+                .iter()
+                .map(|error| format!("  - {error}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
 }
 
@@ -605,6 +576,9 @@ fn native_spral_available() -> bool {
     }) {
         Ok(()) => true,
         Err(error) => {
+            if optimization::native_spral_parity_fail_closed_requested() {
+                panic!("native SPRAL is required for fail-closed parity runs: {error}");
+            }
             eprintln!("skipping native SPRAL/IPOPT comparison: {error}");
             false
         }
@@ -614,15 +588,15 @@ fn native_spral_available() -> bool {
 fn local_spral_ipopt_environment_available() -> bool {
     static AVAILABLE: OnceLock<Result<(), String>> = OnceLock::new();
     match AVAILABLE.get_or_init(|| {
-        let provenance = optimization::capture_ipopt_provenance();
-        if let Some(error) = local_spral_ipopt_environment_error(&provenance) {
-            Err(format!("{error}; provenance={provenance:?}"))
-        } else {
-            Ok(())
-        }
+        optimization::validate_native_spral_parity_preflight()
+            .map(|_| ())
+            .map_err(|errors| errors.join("; "))
     }) {
         Ok(()) => true,
         Err(error) => {
+            if optimization::native_spral_parity_fail_closed_requested() {
+                panic!("native-SPRAL parity preflight is required: {error}");
+            }
             eprintln!("skipping native SPRAL/IPOPT comparison: {error}");
             false
         }
@@ -689,28 +663,112 @@ fn max_abs_diff(lhs: &[f64], rhs: &[f64]) -> f64 {
         })
 }
 
-fn maybe_print_compare_summary(
+fn optional_abs_diff(lhs: Option<f64>, rhs: Option<f64>) -> Option<f64> {
+    lhs.zip(rhs).map(|(lhs, rhs)| (lhs - rhs).abs())
+}
+
+fn sci(value: f64) -> String {
+    format!("{value:.3e}")
+}
+
+fn sci_optional(value: Option<f64>) -> String {
+    value.map_or_else(|| "--".to_string(), sci)
+}
+
+fn accepted_nlip_trace(
+    summary: &optimization::InteriorPointSummary,
+) -> Vec<&InteriorPointIterationSnapshot> {
+    summary
+        .snapshots
+        .iter()
+        .filter(|snapshot| snapshot.phase == InteriorPointIterationPhase::AcceptedStep)
+        .collect()
+}
+
+fn first_accepted_step_delta_gap(
+    nlip_trace: &[&InteriorPointIterationSnapshot],
+    ipopt_trace: &[IpoptIterationSnapshot],
+    threshold: f64,
+) -> Option<(usize, usize, usize, f64)> {
+    let limit = nlip_trace.len().min(ipopt_trace.len());
+    (1..limit).find_map(|index| {
+        let nlip_prev = &nlip_trace[index - 1].x;
+        let nlip_current = &nlip_trace[index].x;
+        let ipopt_prev = &ipopt_trace[index - 1].x;
+        let ipopt_current = &ipopt_trace[index].x;
+        let gap = nlip_current
+            .iter()
+            .zip(nlip_prev.iter())
+            .zip(ipopt_current.iter().zip(ipopt_prev.iter()))
+            .fold(
+                0.0_f64,
+                |acc, ((nlip_current, nlip_prev), (ipopt_current, ipopt_prev))| {
+                    let nlip_step = *nlip_current - *nlip_prev;
+                    let ipopt_step = *ipopt_current - *ipopt_prev;
+                    acc.max((nlip_step - ipopt_step).abs())
+                },
+            );
+        (gap > threshold).then_some((
+            index,
+            nlip_trace[index].iteration,
+            ipopt_trace[index].iteration,
+            gap,
+        ))
+    })
+}
+
+fn print_compare_summary(
     problem_name: &str,
     backend: Option<CallbackBackend>,
     native: &optimization::InteriorPointSummary,
     ipopt: &optimization::IpoptSummary,
 ) {
-    if !compare_verbose_requested() {
-        return;
-    }
     let backend_label = backend.map_or("direct", CallbackBackend::label);
-    eprintln!();
-    eprintln!(
-        "[compare] {problem_name} backend={backend_label} native_iters={} ipopt_iters={} native_obj={} ipopt_obj={} max|dx|={:.3e}",
-        native.iterations,
-        ipopt.iterations,
-        native.objective,
-        ipopt.objective,
-        max_abs_diff(&native.x, &ipopt.x),
+    let nlip_trace = accepted_nlip_trace(native);
+    let nlip_last = native
+        .last_accepted_state
+        .as_ref()
+        .unwrap_or(&native.final_state);
+    let ipopt_last = ipopt.snapshots.last();
+    let accepted_step_delta_gap =
+        first_accepted_step_delta_gap(&nlip_trace, &ipopt.snapshots, 1.0e-10)
+            .map(|(index, nlip_iter, ipopt_iter, gap)| {
+                format!("index={index},nlip_iter={nlip_iter},ipopt_iter={ipopt_iter},gap={gap:.3e}")
+            })
+            .unwrap_or_else(|| "--".to_string());
+    let alpha_gap = optional_abs_diff(
+        nlip_last.alpha_pr,
+        ipopt_last.map(|snapshot| snapshot.alpha_pr),
+    );
+    let regularization_gap = optional_abs_diff(
+        nlip_last.regularization_size,
+        ipopt_last.map(|snapshot| snapshot.regularization_size),
     );
     eprintln!(
-        "[compare] {problem_name} native_linear_solver={:?} ipopt_provenance={:?}",
-        native.linear_solver, ipopt.provenance,
+        "[parity] {problem_name} backend={backend_label} nlip_solver={:?} ipopt_solver=spral nlip_iters={} ipopt_iters={} max_x_gap={} obj_gap={} alpha_gap={} reg_gap={} first_accepted_step_delta_gap={} nlip_residuals=(p:{},d:{},c:{}) ipopt_residuals=(p:{},d:{},c:{}) timing=(nlip:{:.3}s,ipopt:{:.3}s)",
+        native.linear_solver,
+        native.iterations,
+        ipopt.iterations,
+        sci(max_abs_diff(&native.x, &ipopt.x)),
+        sci((native.objective - ipopt.objective).abs()),
+        sci_optional(alpha_gap),
+        sci_optional(regularization_gap),
+        accepted_step_delta_gap,
+        sci(native.primal_inf_norm),
+        sci(native.dual_inf_norm),
+        sci(native.complementarity_inf_norm),
+        sci(ipopt.primal_inf_norm),
+        sci(ipopt.dual_inf_norm),
+        sci(ipopt.complementarity_inf_norm),
+        native.profiling.total_time.as_secs_f64(),
+        ipopt.profiling.total_time.as_secs_f64(),
+    );
+    eprintln!(
+        "[parity] {problem_name} provenance ipopt={:?} native_lib={:?} threads=(rayon:{:?},omp:{:?})",
+        ipopt.provenance,
+        std::env::var("SPRAL_SSIDS_NATIVE_LIB").ok(),
+        std::env::var("RAYON_NUM_THREADS").ok(),
+        std::env::var("OMP_NUM_THREADS").ok(),
     );
 }
 
@@ -750,7 +808,7 @@ fn assert_native_matches_ipopt(
     x_epsilon: f64,
     objective_epsilon: f64,
 ) {
-    maybe_print_compare_summary(problem_name, backend, native, ipopt);
+    print_compare_summary(problem_name, backend, native, ipopt);
     assert_eq!(
         native.linear_solver,
         optimization::InteriorPointLinearSolver::NativeSpralSsids
@@ -811,7 +869,7 @@ fn solve_ipopt_ok<P: CompiledNlpProblem>(
     x0: &[f64],
     parameters: &[ParameterMatrix<'_>],
 ) -> optimization::IpoptSummary {
-    assert_local_spral_ipopt_environment(&optimization::capture_ipopt_provenance());
+    optimization::assert_native_spral_parity_preflight();
     let solve_result = solve_nlp_ipopt(problem, x0, parameters, &ipopt_options());
     assert!(solve_result.is_ok(), "Ipopt solve failed: {solve_result:?}");
     match solve_result {

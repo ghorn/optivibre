@@ -2756,7 +2756,7 @@ function currentSolverMethodValue(): number {
 function currentNlipLinearSolverValue(): number {
   return currentSharedControlValue(
     CONTROL_SEMANTIC.solverNlipLinearSolver,
-    NLIP_LINEAR_SOLVER.spralSsids,
+    NLIP_LINEAR_SOLVER.nativeSpralSsids,
   );
 }
 

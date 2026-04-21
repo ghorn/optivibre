@@ -3816,7 +3816,10 @@ pub fn default_sqp_method_config() -> SqpMethodConfig {
 
 pub const fn default_nlip_config() -> NlipConfig {
     NlipConfig {
-        linear_solver: InteriorPointLinearSolver::SpralSsids,
+        // IPOPT 3.14.20 `IpSpralSolverInterface` defaults to native SPRAL with
+        // matching ordering/scaling and block APP pivoting. The Rust SPRAL
+        // reimplementation is still an explicit non-default comparison lane.
+        linear_solver: InteriorPointLinearSolver::NativeSpralSsids,
         spral_pivot_method: InteriorPointSpralPivotMethod::BlockAposteriori,
         spral_action_on_zero_pivot: true,
         spral_small_pivot_tolerance: 1.0e-20,
@@ -9861,6 +9864,10 @@ mod tests {
     #[test]
     fn default_nlip_config_matches_ipopt_spral_defaults() {
         let default = default_nlip_config();
+        assert_eq!(
+            default.linear_solver,
+            InteriorPointLinearSolver::NativeSpralSsids
+        );
         assert_eq!(
             default.spral_pivot_method,
             InteriorPointSpralPivotMethod::BlockAposteriori

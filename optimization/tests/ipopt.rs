@@ -81,17 +81,26 @@ fn maybe_print_ipopt_trace(problem_name: &str, snapshots: &[IpoptIterationSnapsh
 }
 
 fn local_native_spral_ipopt_available() -> bool {
-    let provenance = optimization::capture_ipopt_provenance();
-    let has_local_spral = provenance
-        .pkg_config_cflags_libs
-        .as_deref()
-        .is_some_and(|flags| flags.contains("/Users/greg/local/ipopt-spral"));
-    let has_spral_default = provenance.linear_solver_default.as_deref() == Some("spral");
-    if !has_local_spral || !has_spral_default {
-        eprintln!("skipping local native-SPRAL IPOPT profile test: {provenance:?}");
-        return false;
+    match optimization::validate_native_spral_parity_preflight() {
+        Ok(_) => true,
+        Err(errors) => {
+            if optimization::native_spral_parity_fail_closed_requested() {
+                panic!(
+                    "native-SPRAL parity preflight is required:\n{}",
+                    errors
+                        .iter()
+                        .map(|error| format!("  - {error}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+            }
+            eprintln!(
+                "skipping local native-SPRAL IPOPT profile test: {}",
+                errors.join("; ")
+            );
+            false
+        }
     }
-    true
 }
 
 #[rstest]

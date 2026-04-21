@@ -159,7 +159,15 @@ fn solve_ok<P: CompiledNlpProblem>(
 }
 
 fn native_spral_available() -> bool {
-    NativeSpral::load().is_ok()
+    match NativeSpral::load() {
+        Ok(_) => true,
+        Err(error) => {
+            if std::env::var_os("AD_CODEGEN_REQUIRE_NATIVE_SPRAL_PARITY").is_some() {
+                panic!("native SPRAL is required for fail-closed parity runs: {error}");
+            }
+            false
+        }
+    }
 }
 
 fn first_linear_debug_report(
