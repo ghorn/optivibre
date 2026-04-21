@@ -2332,14 +2332,14 @@ fn newton_direction_from_augmented_solution(
         [snapshot.augmented_pattern.z_offset..snapshot.augmented_pattern.z_offset + mineq]
         .to_vec();
     let ds = ipopt_ds.iter().map(|value| -*value).collect::<Vec<_>>();
-    let damping = positive_slack_damping(snapshot.barrier_parameter, snapshot.kappa_d);
-    let dz = d_ineq
+    let dz = snapshot
+        .r_cent
         .iter()
-        .zip(snapshot.r_slack_stationarity.iter())
-        .zip(ds.iter())
-        .map(|((dy_i, r_slack_i), ds_i)| {
-            let damped_stationarity = *r_slack_i - damping;
-            *dy_i - damped_stationarity + snapshot.primal_diagonal_shift * *ds_i
+        .zip(snapshot.multipliers.iter())
+        .zip(snapshot.slack.iter())
+        .zip(ipopt_ds.iter())
+        .map(|(((r_cent_i, z_i), s_i), ipopt_ds_i)| {
+            ipopt_upper_slack_bound_multiplier_step(*s_i, *z_i, *r_cent_i, *ipopt_ds_i)
         })
         .collect::<Vec<_>>();
     NewtonDirection {
@@ -2930,6 +2930,20 @@ fn damped_slack_stationarity_residual(system: &ReducedKktSystem<'_>, index: usiz
 
 fn ipopt_internal_slack_rhs(system: &ReducedKktSystem<'_>, index: usize) -> f64 {
     system.r_cent[index] / system.slack[index] - damped_slack_stationarity_residual(system, index)
+}
+
+fn ipopt_upper_slack_bound_multiplier_step(
+    slack: f64,
+    multiplier: f64,
+    complementarity_residual: f64,
+    ipopt_internal_slack_step: f64,
+) -> f64 {
+    // Mirrors IPOPT PDFullSpaceSolver::SolveOnce Pd_U.SinvBlrmZMTdBr(1., ...)
+    // followed by PDSearchDirCalc's Solve(-1., 0., ...) final scaling:
+    // delta_v_U = (-rhs.v_U + v_U * delta_s) / slack_s_U. NLIP's public slack
+    // direction is sign-flipped for the upper-slack distance, so this takes
+    // the raw IPOPT-internal augmented-system slack component.
+    (-complementarity_residual + multiplier * ipopt_internal_slack_step) / slack
 }
 
 fn slack_stationarity_residuals(lambda_ineq: &[f64], z: &[f64]) -> Vec<f64> {
@@ -6300,14 +6314,14 @@ fn solve_reduced_kkt_with_native_spral_ssids(
                 let d_ineq = solution
                     [workspace.pattern.z_offset..workspace.pattern.z_offset + mineq]
                     .to_vec();
-                let dz = d_ineq
+                let dz = system
+                    .r_cent
                     .iter()
-                    .zip(system.r_slack_stationarity.iter())
-                    .zip(ds.iter())
-                    .enumerate()
-                    .map(|(index, ((dy_i, _), ds_i))| {
-                        *dy_i - damped_slack_stationarity_residual(system, index)
-                            + slack_shift * *ds_i
+                    .zip(system.multipliers.iter())
+                    .zip(system.slack.iter())
+                    .zip(ipopt_ds.iter())
+                    .map(|(((r_cent_i, z_i), s_i), ipopt_ds_i)| {
+                        ipopt_upper_slack_bound_multiplier_step(*s_i, *z_i, *r_cent_i, *ipopt_ds_i)
                     })
                     .collect::<Vec<_>>();
                 return Ok(NewtonDirection {
@@ -6453,14 +6467,14 @@ fn solve_reduced_kkt_with_spral_ssids(
                 let d_ineq = solution
                     [workspace.pattern.z_offset..workspace.pattern.z_offset + mineq]
                     .to_vec();
-                let dz = d_ineq
+                let dz = system
+                    .r_cent
                     .iter()
-                    .zip(system.r_slack_stationarity.iter())
-                    .zip(ds.iter())
-                    .enumerate()
-                    .map(|(index, ((dy_i, _), ds_i))| {
-                        *dy_i - damped_slack_stationarity_residual(system, index)
-                            + slack_shift * *ds_i
+                    .zip(system.multipliers.iter())
+                    .zip(system.slack.iter())
+                    .zip(ipopt_ds.iter())
+                    .map(|(((r_cent_i, z_i), s_i), ipopt_ds_i)| {
+                        ipopt_upper_slack_bound_multiplier_step(*s_i, *z_i, *r_cent_i, *ipopt_ds_i)
                     })
                     .collect::<Vec<_>>();
                 return Ok(NewtonDirection {
