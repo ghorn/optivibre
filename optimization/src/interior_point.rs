@@ -228,6 +228,8 @@ pub struct InteriorPointOptions {
     pub min_step: f64,
     pub filter_gamma_objective: f64,
     pub filter_gamma_violation: f64,
+    pub max_filter_resets: Index,
+    pub filter_reset_trigger: Index,
     pub theta_max_fact: f64,
     pub theta_min_fact: f64,
     pub eta_phi: f64,
@@ -303,6 +305,8 @@ impl Default for InteriorPointOptions {
             min_step: 1e-8,
             filter_gamma_objective: 1e-8,
             filter_gamma_violation: 1e-5,
+            max_filter_resets: 5,
+            filter_reset_trigger: 5,
             theta_max_fact: 1e4,
             theta_min_fact: 1e-4,
             eta_phi: 1e-8,
@@ -355,7 +359,7 @@ impl Default for InteriorPointOptions {
 
 pub fn format_nlip_settings_summary(options: &InteriorPointOptions) -> String {
     format!(
-        "filter={}; linear_solver={}; linear_debug={}; spral=[pivot={}, action={}, small={}, u={}]; beta={}; c1={}; min_step={}; tau={}; alpha_y=[strategy={}, tol={}] ; init=[bound_push={}, bound_frac={}, slack_push={}, slack_frac={}, bound_relax={}]; dual_init=[method={}, val={}, least_square={}, max={}] ; regularization={} (first={}, first_growth={}, retries={}, growth={}, decay={}, max={}, jacobian={}, jac_exp={}); soc={} (max={}, kappa={}); restoration={}; watchdog=[trigger={}, max={}]; tiny_step={}; mu=[init={}, target={}, min={}, barrier_tol={}, linear={}, superlinear={}, fast={}, kappa_d={}]; theta=[{}, {}]; acceptable_iter={}",
+        "filter={}; linear_solver={}; linear_debug={}; spral=[pivot={}, action={}, small={}, u={}]; beta={}; c1={}; min_step={}; tau={}; alpha_y=[strategy={}, tol={}] ; init=[bound_push={}, bound_frac={}, slack_push={}, slack_frac={}, bound_relax={}]; dual_init=[method={}, val={}, least_square={}, max={}] ; regularization={} (first={}, first_growth={}, retries={}, growth={}, decay={}, max={}, jacobian={}, jac_exp={}); soc={} (max={}, kappa={}); restoration={}; watchdog=[trigger={}, max={}]; filter_reset=[max={}, trigger={}]; tiny_step={}; mu=[init={}, target={}, min={}, barrier_tol={}, linear={}, superlinear={}, fast={}, kappa_d={}]; theta=[{}, {}]; acceptable_iter={}",
         "on",
         options.linear_solver.label(),
         format_nlip_linear_debug_summary(options.linear_debug.as_ref()),
@@ -409,6 +413,8 @@ pub fn format_nlip_settings_summary(options: &InteriorPointOptions) -> String {
         },
         options.watchdog_shortened_iter_trigger,
         options.watchdog_trial_iter_max,
+        options.max_filter_resets,
+        options.filter_reset_trigger,
         sci_text(options.tiny_step_tol),
         sci_text(options.mu_init),
         sci_text(options.mu_target),
@@ -607,6 +613,7 @@ pub enum InteriorPointIterationEvent {
     SecondOrderCorrectionAccepted,
     WatchdogArmed,
     WatchdogActivated,
+    FilterReset,
     BoundMultiplierSafeguardApplied,
     BarrierParameterUpdated,
     AdaptiveRegularizationUsed,
@@ -641,6 +648,10 @@ pub fn nlip_event_legend_entries_for_events(
             InteriorPointIterationEvent::WatchdogActivated => {
                 entries.push(('W', "W=watchdog accepted a residual-improving step"))
             }
+            InteriorPointIterationEvent::FilterReset => entries.push((
+                'X',
+                "X=IPOPT filter reset heuristic cleared the previous filter frontier",
+            )),
             InteriorPointIterationEvent::BoundMultiplierSafeguardApplied => entries.push((
                 'B',
                 "B=accepted step corrected bound multipliers via IPOPT kappa_sigma safeguard",
@@ -690,8 +701,9 @@ pub fn nlip_event_codes(snapshot: &InteriorPointIterationSnapshot) -> String {
     nlip_event_codes_for_events(&snapshot.events)
 }
 
-const NLIP_EVENT_SLOT_ORDER: [char; 12] =
-    ['L', 'F', 's', 'S', 'A', 'W', 'B', 'U', 'V', 'R', 'T', 'M'];
+const NLIP_EVENT_SLOT_ORDER: [char; 13] = [
+    'L', 'F', 's', 'S', 'A', 'W', 'X', 'B', 'U', 'V', 'R', 'T', 'M',
+];
 const NLIP_EVENT_CELL_WIDTH: usize = NLIP_EVENT_SLOT_ORDER.len();
 
 fn nlip_event_slot_codes(snapshot: &InteriorPointIterationSnapshot) -> String {
@@ -6899,6 +6911,7 @@ fn ip_event_legend_lines(
         let is_new = match code {
             'L' => state.mark_line_search_if_new(),
             'F' => state.mark_filter_if_new(),
+            'X' => state.mark_filter_reset_if_new(),
             's' => state.mark_soc_attempted_if_new(),
             'S' => state.mark_soc_if_new(),
             'A' => state.mark_watchdog_armed_if_new(),
@@ -6984,15 +6997,17 @@ mod tests {
             InteriorPointIterationEvent::FilterAccepted,
             InteriorPointIterationEvent::WatchdogActivated,
         ]);
+        let filter_reset = snapshot_with_events(vec![InteriorPointIterationEvent::FilterReset]);
         let watchdog_only =
             snapshot_with_events(vec![InteriorPointIterationEvent::WatchdogActivated]);
         let barrier_update =
             snapshot_with_events(vec![InteriorPointIterationEvent::BarrierParameterUpdated]);
 
-        assert_eq!(nlip_event_slot_codes(&filter_soc), " F S        ");
-        assert_eq!(nlip_event_slot_codes(&filter_watchdog), " F   W      ");
-        assert_eq!(nlip_event_slot_codes(&watchdog_only), "     W      ");
-        assert_eq!(nlip_event_slot_codes(&barrier_update), "       U    ");
+        assert_eq!(nlip_event_slot_codes(&filter_soc), " F S         ");
+        assert_eq!(nlip_event_slot_codes(&filter_watchdog), " F   W       ");
+        assert_eq!(nlip_event_slot_codes(&filter_reset), "      X      ");
+        assert_eq!(nlip_event_slot_codes(&watchdog_only), "     W       ");
+        assert_eq!(nlip_event_slot_codes(&barrier_update), "        U    ");
     }
 
     #[test]
@@ -7761,6 +7776,7 @@ where
     let mut nonlinear_inequality_multipliers = lambda_ineq.clone();
     let mut last_linear_solver = preferred_solver;
     let mut filter_entries = Vec::new();
+    let mut successive_filter_rejections = 0;
     let mut snapshots = Vec::new();
     let mut last_accepted_state: Option<InteriorPointIterationSnapshot> = None;
     let mut acceptable_counter = 0;
@@ -10077,6 +10093,9 @@ where
             && next_shortened_step_streak >= options.watchdog_shortened_iter_trigger;
 
         let accepted_rejected_trials = rejected_trials.clone();
+        let last_rejection_due_to_filter = accepted_rejected_trials.last().is_some_and(|trial| {
+            trial.local_filter_acceptable == Some(true) && trial.filter_acceptable == Some(false)
+        });
         let line_search_info = InteriorPointLineSearchInfo {
             initial_alpha_pr: accepted_trial.line_search_initial_alpha_pr,
             initial_alpha_du: accepted_trial.line_search_initial_alpha_du,
@@ -10142,6 +10161,28 @@ where
             );
         }
         let mut next_filter_entries = filter_entries.clone();
+        let filter_reset_applied = if options.max_filter_resets > 0 {
+            if last_rejection_due_to_filter {
+                successive_filter_rejections += 1;
+                if successive_filter_rejections >= options.filter_reset_trigger {
+                    // IPOPT 3.14's n_filter_resets_ is checked but not incremented, so
+                    // max_filter_resets behaves as an enable/disable flag in practice.
+                    next_filter_entries.clear();
+                    successive_filter_rejections = 0;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                successive_filter_rejections = 0;
+                false
+            }
+        } else {
+            false
+        };
+        if filter_reset_applied {
+            push_unique_nlip_event(&mut events, InteriorPointIterationEvent::FilterReset);
+        }
         if let Some(entry) = accepted_trial.filter_augment_entry.clone() {
             super::filter::update_frontier(&mut next_filter_entries, entry);
         }

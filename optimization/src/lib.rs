@@ -4268,6 +4268,7 @@ struct SqpEventLegendState {
     hessian_shift: bool,
     line_search: bool,
     filter: bool,
+    filter_reset: bool,
     soc_attempted: bool,
     elastic_attempted: bool,
     qp: bool,
@@ -4305,6 +4306,10 @@ impl SqpEventLegendState {
 
     fn mark_filter_if_new(&mut self) -> bool {
         Self::mark_new(&mut self.filter)
+    }
+
+    fn mark_filter_reset_if_new(&mut self) -> bool {
+        Self::mark_new(&mut self.filter_reset)
     }
 
     fn mark_soc_attempted_if_new(&mut self) -> bool {
