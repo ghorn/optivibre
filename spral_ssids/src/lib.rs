@@ -1008,6 +1008,7 @@ fn build_symbolic_result_with_native_order(
     column_has_entries: &[bool],
     ordering_kind: &'static str,
 ) -> Result<(SymbolicFactor, AnalyseInfo), SsidsError> {
+    let expanded_pattern = expand_symmetric_pattern(matrix);
     let mut current_graph = permute_graph(graph, &current_permutation);
     let (initial_tree, _, _) = symbolic_factor_pattern(&current_graph);
     let (postorder_permutation, realn) =
@@ -1020,11 +1021,15 @@ fn build_symbolic_result_with_native_order(
         current_graph = permute_graph(graph, &current_permutation);
     }
 
-    let (elimination_tree, column_counts, column_pattern) = symbolic_factor_pattern(&current_graph);
+    let (elimination_tree, simulated_column_counts, column_pattern) =
+        symbolic_factor_pattern(&current_graph);
+    let column_counts =
+        native_column_counts(&expanded_pattern, &current_permutation, &elimination_tree);
+    debug_assert_eq!(column_counts, simulated_column_counts);
     let supernode_layout = native_supernode_layout(&elimination_tree, &column_counts, realn);
     if is_identity_order(&supernode_layout.permutation) {
         let supernodes = build_native_row_list_supernodes(
-            matrix,
+            &expanded_pattern,
             &current_permutation,
             &supernode_layout,
             &column_pattern,
@@ -1044,9 +1049,11 @@ fn build_symbolic_result_with_native_order(
         &supernode_layout.permutation,
     )?;
     let final_graph = permute_graph(graph, &final_permutation);
-    let (final_tree, final_counts, final_pattern) = symbolic_factor_pattern(&final_graph);
+    let (final_tree, simulated_final_counts, final_pattern) = symbolic_factor_pattern(&final_graph);
+    let final_counts = native_column_counts(&expanded_pattern, &final_permutation, &final_tree);
+    debug_assert_eq!(final_counts, simulated_final_counts);
     let final_supernodes = build_native_row_list_supernodes(
-        matrix,
+        &expanded_pattern,
         &final_permutation,
         &supernode_layout,
         &final_pattern,
@@ -1252,6 +1259,127 @@ fn native_should_merge_supernode(
             && nelim[node] < RELAXED_NODE_AMALGAMATION_NEMIN)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExpandedSymmetricPattern {
+    col_ptrs: Vec<usize>,
+    row_indices: Vec<usize>,
+}
+
+impl ExpandedSymmetricPattern {
+    fn dimension(&self) -> usize {
+        self.col_ptrs.len().saturating_sub(1)
+    }
+}
+
+fn expand_symmetric_pattern(matrix: SymmetricCscMatrix<'_>) -> ExpandedSymmetricPattern {
+    // Mirror ssids/anal.F90 expand_pattern: expand user lower-CSC input into
+    // a full symmetric CSC pattern before calling core_analyse.
+    let n = matrix.dimension();
+    let mut counts = vec![0_usize; n];
+    for col in 0..n {
+        for &row in &matrix.row_indices()[matrix.col_ptrs()[col]..matrix.col_ptrs()[col + 1]] {
+            counts[row] += 1;
+            if row != col {
+                counts[col] += 1;
+            }
+        }
+    }
+
+    let mut col_ptrs = vec![0_usize; n + 1];
+    for col in 0..n {
+        col_ptrs[col + 1] = col_ptrs[col] + counts[col];
+    }
+
+    let mut write_ptrs = col_ptrs[1..].to_vec();
+    let mut row_indices = vec![usize::MAX; col_ptrs[n]];
+    for col in 0..n {
+        for &row in &matrix.row_indices()[matrix.col_ptrs()[col]..matrix.col_ptrs()[col + 1]] {
+            write_ptrs[row] -= 1;
+            row_indices[write_ptrs[row]] = col;
+            if row != col {
+                write_ptrs[col] -= 1;
+                row_indices[write_ptrs[col]] = row;
+            }
+        }
+    }
+
+    debug_assert_eq!(&write_ptrs, &col_ptrs[..n]);
+    ExpandedSymmetricPattern {
+        col_ptrs,
+        row_indices,
+    }
+}
+
+fn native_column_counts(
+    pattern: &ExpandedSymmetricPattern,
+    permutation: &Permutation,
+    elimination_tree: &[Option<usize>],
+) -> Vec<usize> {
+    // Mirror SPRAL core_analyse.find_col_counts. The routine tracks the net
+    // number of entries first appearing at each elimination-tree node, then
+    // passes those counts up the virtual forest to form final column counts.
+    let n = elimination_tree.len();
+    assert_eq!(pattern.dimension(), n, "symbolic matrix dimension mismatch");
+    assert_eq!(permutation.len(), n, "symbolic permutation mismatch");
+
+    let virtual_root = n;
+    let mut first = (0..=n).collect::<Vec<_>>();
+    let mut column_counts = vec![0_isize; n + 1];
+    for node in 0..n {
+        let parent = elimination_tree[node].unwrap_or(virtual_root);
+        first[parent] = first[parent].min(first[node]);
+        column_counts[node] = if first[node] == node { 1 } else { 0 };
+    }
+    column_counts[virtual_root] = (n + 1) as isize;
+
+    let mut virtual_forest = vec![None; n + 1];
+    let mut last_pivot = vec![None; n + 1];
+    let mut last_neighbor = vec![None; n + 1];
+    for pivot in 0..n {
+        let original_col = permutation.perm()[pivot];
+        for source in pattern.col_ptrs[original_col]..pattern.col_ptrs[original_col + 1] {
+            let row = permutation.inverse()[pattern.row_indices[source]];
+            if row <= pivot {
+                continue;
+            }
+
+            let first_seen_in_subtree = last_neighbor[row].is_none_or(|last| first[pivot] > last);
+            if first_seen_in_subtree {
+                column_counts[pivot] += 1;
+                if let Some(previous_pivot) = last_pivot[row] {
+                    let lca = native_virtual_forest_find(&mut virtual_forest, previous_pivot);
+                    column_counts[lca] -= 1;
+                }
+                last_pivot[row] = Some(pivot);
+            }
+            last_neighbor[row] = Some(pivot);
+        }
+
+        let parent = elimination_tree[pivot].unwrap_or(virtual_root);
+        column_counts[parent] += column_counts[pivot] - 1;
+        virtual_forest[pivot] = Some(parent);
+    }
+
+    column_counts
+        .into_iter()
+        .take(n)
+        .map(|count| {
+            usize::try_from(count).expect("native column count should not be negative on exit")
+        })
+        .collect()
+}
+
+fn native_virtual_forest_find(virtual_forest: &mut [Option<usize>], node: usize) -> usize {
+    let mut current = node;
+    while let Some(parent) = virtual_forest[current] {
+        if let Some(grandparent) = virtual_forest[parent] {
+            virtual_forest[current] = Some(grandparent);
+        }
+        current = parent;
+    }
+    current
+}
+
 fn symbolic_factor_pattern(graph: &CsrGraph) -> (Vec<Option<usize>>, Vec<usize>, Vec<Vec<usize>>) {
     let dimension = graph.vertex_count();
     let mut adjacency = (0..dimension)
@@ -1291,13 +1419,18 @@ fn symbolic_factor_pattern(graph: &CsrGraph) -> (Vec<Option<usize>>, Vec<usize>,
 }
 
 fn build_native_row_list_supernodes(
-    matrix: SymmetricCscMatrix<'_>,
+    expanded_pattern: &ExpandedSymmetricPattern,
     permutation: &Permutation,
     layout: &NativeSupernodeLayout,
     column_pattern: &[Vec<usize>],
 ) -> Vec<Supernode> {
     let mut supernodes = Vec::new();
-    let native_row_lists = native_row_lists(matrix, permutation, &layout.ranges, &layout.parents);
+    let native_row_lists = native_row_lists(
+        expanded_pattern,
+        permutation,
+        &layout.ranges,
+        &layout.parents,
+    );
     let mut next_column = 0;
     for (range, row_list) in layout.ranges.iter().zip(native_row_lists.iter()) {
         for column in next_column..range.start {
@@ -1322,16 +1455,16 @@ fn build_native_row_list_supernodes(
 }
 
 fn native_row_lists(
-    matrix: SymmetricCscMatrix<'_>,
+    pattern: &ExpandedSymmetricPattern,
     permutation: &Permutation,
     ranges: &[std::ops::Range<usize>],
     parents: &[Option<usize>],
 ) -> Vec<Vec<usize>> {
     // Mirror core_analyse.find_row_lists followed by dbl_tr_sort. Native
     // builds each row list bottom-up from eliminated pivots, child row lists,
-    // and original CSC entries under the current pivot permutation.
+    // and expanded CSC entries under the current pivot permutation.
     let n = permutation.len();
-    assert_eq!(matrix.dimension(), n, "symbolic matrix dimension mismatch");
+    assert_eq!(pattern.dimension(), n, "symbolic matrix dimension mismatch");
     assert_eq!(
         parents.len(),
         ranges.len(),
@@ -1371,8 +1504,8 @@ fn native_row_lists(
 
         for pivot in range.clone() {
             let original_col = permutation.perm()[pivot];
-            for source in matrix.col_ptrs()[original_col]..matrix.col_ptrs()[original_col + 1] {
-                let row = permutation.inverse()[matrix.row_indices()[source]];
+            for source in pattern.col_ptrs[original_col]..pattern.col_ptrs[original_col + 1] {
+                let row = permutation.inverse()[pattern.row_indices[source]];
                 if row < pivot || seen[row] == tag {
                     continue;
                 }
@@ -3733,12 +3866,13 @@ fn unpack_packed_lower_to_dense_square(size: usize, packed: &[f64]) -> Vec<f64> 
 
 #[cfg(test)]
 mod tests {
-    use metis_ordering::Permutation;
+    use metis_ordering::{CsrGraph, Permutation};
 
     use super::{
         NativeOrdering, NativeSpral, NumericFactorOptions, OrderingStrategy, SsidsOptions,
-        SymmetricCscMatrix, analyse, build_symbolic_front_tree, dense_lower_offset, factorize,
-        factorize_dense_tpp_tail_in_place, native_postorder_permutation,
+        SymmetricCscMatrix, analyse, build_symbolic_front_tree, dense_lower_offset,
+        expand_symmetric_pattern, factorize, factorize_dense_tpp_tail_in_place,
+        native_column_counts, native_postorder_permutation, permute_graph, symbolic_factor_pattern,
     };
 
     #[derive(Clone, Debug)]
@@ -3795,6 +3929,36 @@ mod tests {
 
         assert_eq!(postorder, vec![0, 2, 1]);
         assert_eq!(realn, 2);
+    }
+
+    #[test]
+    fn native_column_counts_match_symbolic_patterns_for_permuted_sparse_case() {
+        let dense = vec![
+            vec![4.0, 1.0, 1.0, 0.0, 0.0, 0.0],
+            vec![1.0, 4.0, 0.0, 1.0, 0.0, 1.0],
+            vec![1.0, 0.0, 4.0, 1.0, 1.0, 0.0],
+            vec![0.0, 1.0, 1.0, 4.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0, 1.0, 4.0, 1.0],
+            vec![0.0, 1.0, 0.0, 0.0, 1.0, 4.0],
+        ];
+        let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+        let matrix =
+            SymmetricCscMatrix::new(6, &col_ptrs, &row_indices, Some(&values)).expect("valid CSC");
+        let graph = CsrGraph::from_symmetric_csc(6, &col_ptrs, &row_indices).expect("valid graph");
+        let permutation = Permutation::new(vec![2, 0, 5, 1, 4, 3]).expect("valid permutation");
+        let permuted_graph = permute_graph(&graph, &permutation);
+        let (elimination_tree, simulated_counts, column_pattern) =
+            symbolic_factor_pattern(&permuted_graph);
+        let expanded_pattern = expand_symmetric_pattern(matrix);
+
+        let native_counts =
+            native_column_counts(&expanded_pattern, &permutation, &elimination_tree);
+
+        assert_eq!(native_counts, simulated_counts);
+        assert_eq!(
+            native_counts,
+            column_pattern.iter().map(Vec::len).collect::<Vec<usize>>()
+        );
     }
 
     fn random_dense_dyadic_matrix(dimension: usize, rng: &mut DenseBoundaryRng) -> Vec<Vec<f64>> {
