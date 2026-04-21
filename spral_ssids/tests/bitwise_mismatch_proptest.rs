@@ -26,6 +26,7 @@ enum MatrixFamily {
     Arrow,
     PathPlusChord,
     TwoByTwoPivot,
+    Complete,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,6 +173,7 @@ fn sparse_bitwise_case_strategy() -> BoxedStrategy<SparseBitwiseParityCase> {
         4 => family_case_strategy(MatrixFamily::Arrow),
         3 => family_case_strategy(MatrixFamily::PathPlusChord),
         2 => family_case_strategy(MatrixFamily::TwoByTwoPivot),
+        1 => family_case_strategy(MatrixFamily::Complete),
     ]
     .prop_filter(
         "case should keep its family skeleton active and avoid the all-zero exact solution",
@@ -262,6 +264,11 @@ impl SparseBitwiseParityCase {
                     )
             }
             MatrixFamily::TwoByTwoPivot => self.pivot_edge.numerator != 0,
+            MatrixFamily::Complete => EDGE_SLOTS
+                .iter()
+                .copied()
+                .filter(|&(_, rhs)| rhs < self.active_dim)
+                .all(|(lhs, rhs)| self.edge_values[edge_slot_index(lhs, rhs)].numerator != 0),
         }
     }
 
@@ -310,6 +317,16 @@ impl SparseBitwiseParityCase {
                 dense_matrix[1][1] = 0.0;
                 set_symmetric_entry(&mut dense_matrix, 0, 1, self.pivot_edge.as_f64());
                 for (lhs, rhs) in path_edges(self.active_dim).skip(1) {
+                    let value = self.edge_values[edge_slot_index(lhs, rhs)].as_f64();
+                    set_symmetric_entry(&mut dense_matrix, lhs, rhs, value);
+                }
+            }
+            MatrixFamily::Complete => {
+                for (lhs, rhs) in EDGE_SLOTS
+                    .iter()
+                    .copied()
+                    .filter(|&(_, rhs)| rhs < self.active_dim)
+                {
                     let value = self.edge_values[edge_slot_index(lhs, rhs)].as_f64();
                     set_symmetric_entry(&mut dense_matrix, lhs, rhs, value);
                 }
