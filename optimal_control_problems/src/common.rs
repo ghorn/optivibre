@@ -6185,7 +6185,7 @@ pub fn text_control(
         id: id.into(),
         label: label.into(),
         min: 0.0,
-        max: default,
+        max: f64::MAX,
         step: default,
         default,
         unit: unit.into(),
@@ -9835,6 +9835,23 @@ mod tests {
         let parsed = solver_config_from_map(&values, default_solver_config())
             .expect("solver config should parse");
         assert!(parsed.sqp.hessian_regularization_enabled);
+    }
+
+    #[test]
+    fn solver_controls_allow_max_iterations_above_default() {
+        let controls = solver_controls(default_solver_method(), default_solver_config());
+        let max_iters = controls
+            .iter()
+            .find(|control| control.id == "solver_max_iters")
+            .expect("expected max-iterations control");
+        assert_eq!(max_iters.editor, ControlEditor::Text);
+        assert!(max_iters.max > max_iters.default);
+
+        let mut values = BTreeMap::new();
+        values.insert("solver_max_iters".to_string(), 1000.0);
+        let parsed = solver_config_from_map(&values, default_solver_config())
+            .expect("solver config should parse");
+        assert_eq!(parsed.max_iters, 1000);
     }
 
     #[test]
