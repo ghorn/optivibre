@@ -207,6 +207,26 @@ fn rust_and_native_spral_match_app_block_boundary_34x34_solution_bits() {
 }
 
 #[test]
+fn rust_and_native_spral_match_dense_seed_1001_33x33_solution_bits() {
+    let mut rng = DenseBoundaryRng::new(0x1001);
+    let dimension = rng.usize_inclusive(33, 33);
+    assert_eq!(dimension, 33);
+    let matrix = random_dense_dyadic_matrix(dimension, &mut rng);
+    let expected_solution = random_dyadic_solution(dimension, &mut rng);
+    assert_exact_bitwise_parity_witness(&matrix, &expected_solution);
+}
+
+#[test]
+fn rust_and_native_spral_match_dense_seed_6_33x33_solution_bits() {
+    let mut rng = DenseBoundaryRng::new(6);
+    let dimension = rng.usize_inclusive(33, 33);
+    assert_eq!(dimension, 33);
+    let matrix = random_dense_dyadic_matrix(dimension, &mut rng);
+    let expected_solution = random_dyadic_solution(dimension, &mut rng);
+    assert_exact_bitwise_parity_witness(&matrix, &expected_solution);
+}
+
+#[test]
 fn rust_and_native_spral_match_app_dense_zero_reduction_64x64_solution_bits() {
     let matrix = deterministic_complete_dyadic_matrix(64);
     let expected_solution = (0..64)

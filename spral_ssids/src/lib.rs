@@ -1437,7 +1437,8 @@ fn app_two_by_two_inverse(a11: f64, a21: f64, a22: f64, small: f64) -> Option<(f
         return None;
     }
     let detscale = 1.0 / a21.abs();
-    let det = (a11 * detscale) * a22 - a21.abs();
+    // Native SPRAL's block_ldlt contracts this multiply/subtract on the local build.
+    let det = (a11 * detscale).mul_add(a22, -a21.abs());
     if !det.is_finite() || det.abs() < a21.abs() / 2.0 {
         return None;
     }
@@ -1473,24 +1474,44 @@ fn dense_find_maxloc(
     if from >= to {
         return None;
     }
-    let mut best = -1.0_f64;
-    let mut best_row = to;
-    let mut best_col = to;
-    for col in from..to {
-        for row in col..to {
-            let value = matrix[dense_lower_offset(size, row, col)].abs();
-            if value > best {
-                best = value;
-                best_row = row;
-                best_col = col;
-            }
+    debug_assert!(to >= APP_INNER_BLOCK_SIZE);
+    let block_start = to - APP_INNER_BLOCK_SIZE;
+    debug_assert!(from >= block_start);
+    let local_from = from - block_start;
+
+    let mut primary = (-1.0_f64, to, to);
+    let mut secondary = (-1.0_f64, to, to);
+
+    let update = |slot: &mut (f64, usize, usize), local_row: usize, local_col: usize| {
+        let row = block_start + local_row;
+        let col = block_start + local_col;
+        let value = matrix[dense_lower_offset(size, row, col)].abs();
+        if value > slot.0 {
+            *slot = (value, row, col);
+        }
+    };
+
+    // Native SPRAL's non-AVX SimdVec path still uses two per-lane maxima. Equal
+    // values keep their existing lane, so ties are not column-major.
+    for local_col in local_from..APP_INNER_BLOCK_SIZE {
+        update(&mut primary, local_col, local_col);
+        if local_col + 1 < 2 * (local_col / 2 + 1) {
+            update(&mut primary, local_col + 1, local_col);
+        }
+        let mut local_row = 2 * (local_col / 2 + 1);
+        while local_row < APP_INNER_BLOCK_SIZE {
+            update(&mut primary, local_row, local_col);
+            update(&mut secondary, local_row + 1, local_col);
+            local_row += 2;
         }
     }
-    if best_col < to {
-        Some((best, best_row, best_col))
+
+    let best = if secondary.0 > primary.0 {
+        secondary
     } else {
-        None
-    }
+        primary
+    };
+    (best.2 < to).then_some(best)
 }
 
 fn dense_find_rc_abs_max_exclude(
@@ -1606,9 +1627,9 @@ fn app_update_two_by_two(
             let update_entry = dense_lower_offset(size, row, col);
             let first_multiplier = matrix[dense_lower_offset(size, row, pivot)];
             let second_multiplier = matrix[dense_lower_offset(size, row, pivot + 1)];
-            // Clang contracts SPRAL's block_ldlt 2x2 update RHS before subtracting it.
+            // Match native block_ldlt's contracted 2x2 update RHS.
             matrix[update_entry] -=
-                first_multiplier.mul_add(first_preserved, second_multiplier * second_preserved);
+                first_preserved.mul_add(first_multiplier, second_preserved * second_multiplier);
         }
     }
 }
@@ -3643,6 +3664,42 @@ mod tests {
             rust_factor.pivot_stats().delayed_pivots,
             native_info.delayed_pivots
         );
+        assert_eq!(rust_factor.factor_order, native_factor_order);
+    }
+
+    #[test]
+    fn app_find_maxloc_tie_order_matches_native_dense_seed6() {
+        let Ok(native) = NativeSpral::load() else {
+            return;
+        };
+        let mut rng = DenseBoundaryRng::new(6);
+        let dimension = rng.usize_inclusive(33, 33);
+        assert_eq!(dimension, 33);
+        let dense = random_dense_dyadic_matrix(dimension, &mut rng);
+        let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+        let matrix = SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
+            .expect("valid CSC");
+        let options = NumericFactorOptions::default();
+        let (symbolic, _) = analyse(
+            matrix,
+            &SsidsOptions {
+                ordering: OrderingStrategy::Natural,
+            },
+        )
+        .expect("rust analyse");
+        let (rust_factor, _) = factorize(matrix, &symbolic, &options).expect("rust factorize");
+        let mut native_session = native
+            .analyse_with_options_and_ordering(matrix, &options, NativeOrdering::Natural)
+            .expect("native analyse");
+        native_session.factorize(matrix).expect("native factorize");
+        let native_enquiry = native_session.enquire_indef().expect("native enquire");
+
+        let mut native_factor_order = vec![usize::MAX; native_enquiry.pivot_order.len()];
+        for (column, &pivot_position) in native_enquiry.pivot_order.iter().enumerate() {
+            native_factor_order[pivot_position] = column;
+        }
+
+        assert_eq!(&rust_factor.factor_order[..4], &[25, 28, 2, 27]);
         assert_eq!(rust_factor.factor_order, native_factor_order);
     }
 }
