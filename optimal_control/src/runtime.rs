@@ -12,8 +12,9 @@ pub struct MultipleShooting {
     pub rk4_substeps: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum TimeGrid {
+    #[default]
     Uniform,
     Cosine {
         strength: f64,
@@ -82,12 +83,6 @@ impl TimeGrid {
             breakpoint,
             first_interval_fraction,
         }
-    }
-}
-
-impl Default for TimeGrid {
-    fn default() -> Self {
-        Self::Uniform
     }
 }
 
@@ -2834,8 +2829,13 @@ where
         let mut path = Vec::with_capacity(self.scheme.intervals * self.scheme.order * C::LEN);
         let mut objective = SX::zero();
 
-        for interval in 0..self.scheme.intervals {
-            let step = *tf * interval_fractions[interval];
+        for (interval, interval_fraction) in interval_fractions
+            .iter()
+            .copied()
+            .enumerate()
+            .take(self.scheme.intervals)
+        {
+            let step = *tf * interval_fraction;
             let x_start = x_mesh.nodes[interval].clone();
             let u_start = u_mesh.nodes[interval].clone();
             let mut basis_x = Vec::with_capacity(self.scheme.order + 1);
