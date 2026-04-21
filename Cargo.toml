@@ -7,13 +7,14 @@ members = [
     "sx_core",
     "sx_codegen",
     "sx_codegen_llvm",
+    "vectorize",
+    "vectorize_derive",
     "optimization",
     "optimal_control",
     "optimal_control_problems",
     "optimal_control_benchmarks",
     "optimal_control_webapp",
     "lqr_solvers",
-    "optimization_derive",
     "test_problems",
     "examples_source",
     "examples_run",
@@ -50,6 +51,7 @@ toml = "0.8.22"
 syn = { version = "2.0.106", features = ["full"] }
 quote = "1.0.40"
 proc-macro2 = "1.0.95"
+proc-macro-crate = "3.4.0"
 
 [workspace.lints.rust]
 warnings = "deny"

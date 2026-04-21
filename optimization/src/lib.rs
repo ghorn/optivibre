@@ -29,7 +29,6 @@ mod interior_point;
 mod ipopt_backend;
 mod symbolic;
 mod validation;
-mod vectorize;
 
 pub use filter::{FilterAcceptanceMode, FilterEntry, FilterInfo};
 pub use filter::{
@@ -56,7 +55,6 @@ pub use ipopt_backend::{
     IpoptOptions, IpoptProfiling, IpoptRawStatus, IpoptSolveError, IpoptSummary,
     format_ipopt_settings_summary, solve_nlp_ipopt, solve_nlp_ipopt_with_callback,
 };
-pub use optimization_derive::Vectorize;
 pub use symbolic::{
     ConstraintBounds, RuntimeBoundedJitNlp, RuntimeNlpBounds, SymbolicNlpBuildError,
     SymbolicNlpCompileError, SymbolicNlpCompileOptions, SymbolicNlpOutputs, TypedCompiledJitNlp,
@@ -298,6 +296,7 @@ pub struct BackendCompileReport {
     pub warnings: Vec<CompileWarning>,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LlvmJitCacheStats {
     pub hits: Index,

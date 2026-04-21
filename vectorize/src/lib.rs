@@ -1,6 +1,11 @@
 use sx_core::{SX, SXMatrix, SxError};
 use thiserror::Error;
 
+pub use vectorize_derive::Vectorize;
+
+#[cfg(feature = "nalgebra")]
+mod nalgebra_support;
+
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum VectorizeLayoutError {
     #[error("flat layout length mismatch: expected {expected}, got {got}")]

@@ -11,9 +11,6 @@ use rstest::rstest;
 use std::sync::OnceLock;
 use sx_core::SX;
 
-#[cfg(feature = "serde")]
-use serde_json;
-
 #[derive(Clone, optimization::Vectorize)]
 struct Pair<T> {
     x: T,
@@ -1595,7 +1592,7 @@ fn sqp_qp_failure_diagnostics_serialize_cleanly() {
     assert!(json["cones"].is_array());
     assert_eq!(json["qp_info"]["raw_status"], "PrimalInfeasible");
 
-    let roundtrip: SqpQpFailureDiagnostics =
+    let roundtrip: optimization::SqpQpFailureDiagnostics =
         serde_json::from_value(json).expect("diagnostics should deserialize");
     assert_eq!(
         roundtrip.qp_info.raw_status,

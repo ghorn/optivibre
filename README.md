@@ -14,7 +14,7 @@ This project is intentionally scoped around compiled execution. There is no publ
 
 The current public optimization path is:
 
-- define typed symbolic variables and parameters with `sx_core` + `optimization::Vectorize`
+- define typed symbolic variables and parameters with `sx_core` + `vectorize::Vectorize`
 - build the NLP with `optimization::symbolic_nlp(...)`
 - JIT-compile it with `.compile_jit()`
 - solve it with runtime variable / constraint bounds
@@ -29,7 +29,16 @@ Example:
 ```toml
 [dependencies]
 sx_core = { git = "https://github.com/ghorn/ad_codegen_rs.git" }
+vectorize = { git = "https://github.com/ghorn/ad_codegen_rs.git" }
 optimization = { git = "https://github.com/ghorn/ad_codegen_rs.git" }
+```
+
+With nalgebra-backed `Vectorize` impls enabled:
+
+```toml
+[dependencies]
+vectorize = { git = "https://github.com/ghorn/ad_codegen_rs.git", features = ["nalgebra"] }
+optimization = { git = "https://github.com/ghorn/ad_codegen_rs.git", features = ["nalgebra"] }
 ```
 
 With IPOPT enabled:
@@ -77,6 +86,7 @@ Not in scope yet:
 - [sx_core](/Users/greg/dev/ad_codegen/sx_core): symbolic graph, sparse matrices, AD
 - [sx_codegen](/Users/greg/dev/ad_codegen/sx_codegen): lowered IR
 - [sx_codegen_llvm](/Users/greg/dev/ad_codegen/sx_codegen_llvm): LLVM JIT/AOT backend
+- [vectorize](/Users/greg/dev/ad_codegen/vectorize): scalar-leaf layout vectorization and derive support
 - [optimization](/Users/greg/dev/ad_codegen/optimization): SQP and IPOPT adapters
 - [examples_source](/Users/greg/dev/ad_codegen/examples_source): symbolic problem builders
 - [examples_run](/Users/greg/dev/ad_codegen/examples_run): generated-code consumers and benches

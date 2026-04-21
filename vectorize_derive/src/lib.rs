@@ -1,4 +1,5 @@
 use proc_macro::TokenStream;
+use proc_macro_crate::{FoundCrate, crate_name};
 use quote::{format_ident, quote};
 use syn::{
     Data, DeriveInput, Fields, GenericParam, Generics, Ident, Index, Type, parse_macro_input,
@@ -17,6 +18,7 @@ fn derive_vectorize_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenSt
     let ident = input.ident;
     let generics = input.generics;
     let leaf_ident = extract_single_type_parameter(&generics)?;
+    let support_crate = support_crate_path()?;
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let replacement: Type = parse_quote!(U);
     let output_ty = rebind_generics(&ident, &generics, &replacement);
@@ -37,12 +39,12 @@ fn derive_vectorize_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenSt
     let mut where_predicates = where_clause.cloned().unwrap_or_else(|| parse_quote!(where));
     where_predicates
         .predicates
-        .push(parse_quote!(#leaf_ident: ::optimization::ScalarLeaf));
+        .push(parse_quote!(#leaf_ident: #support_crate::ScalarLeaf));
     for field_ty in &field_types {
         if !is_leaf_type(field_ty, &leaf_ident) {
             where_predicates
                 .predicates
-                .push(parse_quote!(#field_ty: ::optimization::Vectorize<#leaf_ident>));
+                .push(parse_quote!(#field_ty: #support_crate::Vectorize<#leaf_ident>));
         }
     }
     let mut view_where_predicates = where_predicates.clone();
@@ -55,7 +57,7 @@ fn derive_vectorize_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenSt
             quote! { out.push(&self.#access); }
         } else {
             quote! {
-                ::optimization::Vectorize::<#leaf_ident>::flatten_refs(&self.#access, out);
+                #support_crate::Vectorize::<#leaf_ident>::flatten_refs(&self.#access, out);
             }
         }
     });
@@ -77,8 +79,8 @@ fn derive_vectorize_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenSt
             .map_or_else(|| format!("[{index}]"), ToString::to_string);
         let field_ty = &field.ty;
         quote! {
-            <#field_ty as ::optimization::Vectorize<#leaf_ident>>::flat_layout_names(
-                &::optimization::extend_layout_name(prefix, #component)
+            <#field_ty as #support_crate::Vectorize<#leaf_ident>>::flat_layout_names(
+                &#support_crate::extend_layout_name(prefix, #component)
                 , out
             )
         }
@@ -95,7 +97,7 @@ fn derive_vectorize_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenSt
             quote!(&'a #leaf_ident)
         } else {
             let field_ty = &field.ty;
-            quote!(<#field_ty as ::optimization::Vectorize<#leaf_ident>>::View<'a>)
+            quote!(<#field_ty as #support_crate::Vectorize<#leaf_ident>>::View<'a>)
         };
         quote! { pub #access: #view_ty }
     });
@@ -122,7 +124,7 @@ fn derive_vectorize_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenSt
             quote!(&self.#access)
         } else {
             let field_ty = &field.ty;
-            quote!(<#field_ty as ::optimization::Vectorize<#leaf_ident>>::view(&self.#access))
+            quote!(<#field_ty as #support_crate::Vectorize<#leaf_ident>>::view(&self.#access))
         };
         quote! { #access: #value_expr }
     });
@@ -130,7 +132,7 @@ fn derive_vectorize_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenSt
         if is_leaf_type(field_ty, &leaf_ident) {
             quote!(1usize)
         } else {
-            quote!(<#field_ty as ::optimization::Vectorize<#leaf_ident>>::LEN)
+            quote!(<#field_ty as #support_crate::Vectorize<#leaf_ident>>::LEN)
         }
     });
     let construct_expr = match &data.fields {
@@ -152,7 +154,7 @@ fn derive_vectorize_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenSt
                     quote!(&'a #leaf_ident)
                 } else {
                     let field_ty = &field.ty;
-                    quote!(<#field_ty as ::optimization::Vectorize<#leaf_ident>>::View<'a>)
+                    quote!(<#field_ty as #support_crate::Vectorize<#leaf_ident>>::View<'a>)
                 }
             });
             quote! {
@@ -192,17 +194,17 @@ fn derive_vectorize_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenSt
         #where_predicates
         {
             #[doc(hidden)]
-            pub fn __optimization_from_flat<U: ::optimization::ScalarLeaf>(
+            pub fn __vectorize_from_flat<U: #support_crate::ScalarLeaf>(
                 f: &mut impl ::core::ops::FnMut() -> U
             ) -> #output_ty {
                 #construct_expr
             }
         }
 
-        impl #impl_generics ::optimization::Vectorize<#leaf_ident> for #ident #ty_generics
+        impl #impl_generics #support_crate::Vectorize<#leaf_ident> for #ident #ty_generics
         #where_predicates
         {
-            type Rebind<U: ::optimization::ScalarLeaf> = #output_ty;
+            type Rebind<U: #support_crate::ScalarLeaf> = #output_ty;
             type View<'a> = #view_ident #view_use_generics where #leaf_ident: 'a, Self: 'a;
 
             const LEN: usize = 0 #(+ #len_terms)*;
@@ -211,10 +213,10 @@ fn derive_vectorize_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenSt
                 #(#flatten_statements)*
             }
 
-            fn from_flat_fn<U: ::optimization::ScalarLeaf>(
+            fn from_flat_fn<U: #support_crate::ScalarLeaf>(
                 f: &mut impl ::core::ops::FnMut() -> U
             ) -> Self::Rebind<U> {
-                Self::__optimization_from_flat::<U>(f)
+                Self::__vectorize_from_flat::<U>(f)
             }
 
             fn view<'a>(&'a self) -> Self::View<'a>
@@ -262,6 +264,29 @@ fn extract_single_type_parameter(generics: &Generics) -> syn::Result<Ident> {
         ));
     }
     Ok(first.ident.clone())
+}
+
+fn support_crate_path() -> syn::Result<proc_macro2::TokenStream> {
+    match crate_name("vectorize") {
+        Ok(found) => Ok(found_crate_path(found)),
+        Err(_) => match crate_name("optimization") {
+            Ok(found) => Ok(found_crate_path(found)),
+            Err(_) => Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "Vectorize derive requires a direct dependency on `vectorize` or `optimization`",
+            )),
+        },
+    }
+}
+
+fn found_crate_path(found: FoundCrate) -> proc_macro2::TokenStream {
+    match found {
+        FoundCrate::Itself => quote!(crate),
+        FoundCrate::Name(name) => {
+            let ident = Ident::new(&name, proc_macro2::Span::call_site());
+            quote!(::#ident)
+        }
+    }
 }
 
 fn field_types(fields: &Fields) -> Vec<Type> {
@@ -380,7 +405,7 @@ fn construct_value_expr(ty: &Type, leaf_ident: &Ident) -> proc_macro2::TokenStre
         let value_expr = construct_value_expr(&array.elem, leaf_ident);
         quote!(::std::array::from_fn(|_| #value_expr))
     } else {
-        quote!(<#ty>::__optimization_from_flat::<U>(f))
+        quote!(<#ty>::__vectorize_from_flat::<U>(f))
     }
 }
 
@@ -392,5 +417,6 @@ fn construct_view_expr(ty: &Type, leaf_ident: &Ident) -> proc_macro2::TokenStrea
             value
         });
     }
-    quote!(<#ty as ::optimization::Vectorize<#leaf_ident>>::view_from_flat_slice(slice, index))
+    let support_crate = support_crate_path().expect("support crate path should resolve");
+    quote!(<#ty as #support_crate::Vectorize<#leaf_ident>>::view_from_flat_slice(slice, index))
 }
