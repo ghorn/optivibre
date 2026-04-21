@@ -161,7 +161,7 @@ impl Default for NumericFactorOptions {
             pivot_method: PivotMethod::BlockAposteriori,
             small_pivot_tolerance: 1e-20,
             threshold_pivot_u: 1e-8,
-            inertia_zero_tol: 1e-10,
+            inertia_zero_tol: 0.0,
         }
     }
 }

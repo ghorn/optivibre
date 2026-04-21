@@ -1381,6 +1381,24 @@ mod tests {
         }
     }
 
+    fn failure_linear_debug_report<T>(
+        result: &std::result::Result<T, optimization::InteriorPointSolveError>,
+    ) -> Option<optimization::InteriorPointLinearDebugReport> {
+        let Err(error) = result else {
+            return None;
+        };
+        let context = match error {
+            optimization::InteriorPointSolveError::LinearSolve { context, .. }
+            | optimization::InteriorPointSolveError::LineSearchFailed { context, .. }
+            | optimization::InteriorPointSolveError::MaxIterations { context, .. } => context,
+            optimization::InteriorPointSolveError::InvalidInput(_) => return None,
+        };
+        context
+            .failed_linear_solve
+            .as_ref()
+            .and_then(|diagnostics| diagnostics.debug_report.clone())
+    }
+
     fn symmetric_lower_csc_mat_vec(dump: &GliderLinearDebugDump, x: &[f64]) -> Vec<f64> {
         let mut y = vec![0.0; dump.matrix_dimension];
         for col in 0..dump.matrix_dimension {
@@ -2334,6 +2352,9 @@ mod tests {
                 first_report = snapshot.solver.linear_debug.clone();
             }
         });
+        if first_report.is_none() {
+            first_report = failure_linear_debug_report(&result);
+        }
 
         let dump = load_glider_linear_debug_dump(&dump_dir.path().join("nlip_kkt_iter_0000.txt"));
         let rust_exact = replay_rust_augmented_spral(&dump);
@@ -2430,11 +2451,14 @@ mod tests {
         });
 
         let mut reports = Vec::new();
-        let _ = compiled.solve_interior_point_with_callback(&runtime, &options, |snapshot| {
+        let result = compiled.solve_interior_point_with_callback(&runtime, &options, |snapshot| {
             if let Some(report) = snapshot.solver.linear_debug.clone() {
                 reports.push(report);
             }
         });
+        if let Some(report) = failure_linear_debug_report(&result) {
+            reports.push(report);
+        }
 
         assert!(
             !reports.is_empty(),
@@ -2591,11 +2615,14 @@ mod tests {
         });
 
         let mut reports = Vec::new();
-        let _ = compiled.solve_interior_point_with_callback(&runtime, &options, |snapshot| {
+        let result = compiled.solve_interior_point_with_callback(&runtime, &options, |snapshot| {
             if let Some(report) = snapshot.solver.linear_debug.clone() {
                 reports.push(report);
             }
         });
+        if let Some(report) = failure_linear_debug_report(&result) {
+            reports.push(report);
+        }
 
         assert!(
             !reports.is_empty(),

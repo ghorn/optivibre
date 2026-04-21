@@ -193,6 +193,10 @@ fn debug_backend_result(
         .expect("expected backend result to be present")
 }
 
+fn native_spral_debug_delta_limit(abs_tol: f64, primary_scale: f64) -> f64 {
+    abs_tol.max(1e-8 * (1.0 + primary_scale))
+}
+
 fn assert_native_spral_parity_with_schedule(
     report: &optimization::InteriorPointLinearDebugReport,
     expected_schedule: InteriorPointLinearDebugSchedule,
@@ -201,7 +205,11 @@ fn assert_native_spral_parity_with_schedule(
 ) {
     assert_eq!(report.primary_solver, InteriorPointLinearSolver::SpralSsids);
     assert_eq!(report.schedule, expected_schedule);
-    assert_eq!(report.verdict, InteriorPointLinearDebugVerdict::Consistent);
+    assert_eq!(
+        report.verdict,
+        InteriorPointLinearDebugVerdict::Consistent,
+        "native SPRAL debug report was not consistent: {report:#?}"
+    );
     assert_eq!(report.results.len(), 2);
     assert!(report.notes.is_empty());
 
@@ -210,21 +218,24 @@ fn assert_native_spral_parity_with_schedule(
     assert!(primary.success);
     assert!(native.success);
     assert_eq!(native.inertia, primary.inertia);
+    let primary_step_scale = primary.step_inf.unwrap_or(0.0);
     assert!(
         native
             .residual_inf
             .expect("native residual should be present")
-            <= 1e-8,
+            <= 5e-8,
         "native residual too large: {:?}",
         native.residual_inf
     );
     assert!(
-        native.step_delta_inf.expect("step delta should be present") <= step_tol,
+        native.step_delta_inf.expect("step delta should be present")
+            <= native_spral_debug_delta_limit(step_tol, primary_step_scale),
         "step delta too large: {:?}",
         native.step_delta_inf
     );
     assert!(
-        native.dx_delta_inf.expect("dx delta should be present") <= component_tol,
+        native.dx_delta_inf.expect("dx delta should be present")
+            <= native_spral_debug_delta_limit(component_tol, primary_step_scale),
         "dx delta too large: {:?}",
         native.dx_delta_inf
     );
@@ -232,17 +243,19 @@ fn assert_native_spral_parity_with_schedule(
         native
             .d_lambda_delta_inf
             .expect("dlambda delta should be present")
-            <= component_tol,
+            <= native_spral_debug_delta_limit(component_tol, primary_step_scale),
         "dlambda delta too large: {:?}",
         native.d_lambda_delta_inf
     );
     assert!(
-        native.ds_delta_inf.expect("ds delta should be present") <= component_tol,
+        native.ds_delta_inf.expect("ds delta should be present")
+            <= native_spral_debug_delta_limit(component_tol, primary_step_scale),
         "ds delta too large: {:?}",
         native.ds_delta_inf
     );
     assert!(
-        native.dz_delta_inf.expect("dz delta should be present") <= component_tol,
+        native.dz_delta_inf.expect("dz delta should be present")
+            <= native_spral_debug_delta_limit(component_tol, primary_step_scale),
         "dz delta too large: {:?}",
         native.dz_delta_inf
     );

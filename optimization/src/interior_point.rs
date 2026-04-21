@@ -38,7 +38,7 @@ const IP_COMP_INF_LABEL: &str = "‖s∘z‖∞";
 
 const LINEAR_SOLUTION_MAX_RELATIVE_INF_NORM: f64 = 1e12;
 const LINEAR_SOLUTION_MAX_RELATIVE_RESIDUAL: f64 = 1e-7;
-const LINEAR_DEBUG_DELTA_TOLERANCE: f64 = 1e-5;
+const LINEAR_DEBUG_RELATIVE_DELTA_TOLERANCE: f64 = 1e-8;
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InteriorPointLinearSolver {
@@ -2119,8 +2119,9 @@ fn build_interior_point_kkt_snapshot(
     phase: InteriorPointIterationPhase,
     primary_solver: InteriorPointLinearSolver,
     system: &ReducedKktSystem<'_>,
-    dual_regularization_used: f64,
+    regularization_used: f64,
     primal_diagonal_shift_used: f64,
+    dual_diagonal_shift_used: f64,
     barrier_parameter: f64,
     primal_inf: f64,
     dual_inf: f64,
@@ -2189,7 +2190,7 @@ fn build_interior_point_kkt_snapshot(
         r_cent: system.r_cent.to_vec(),
         regularization: primal_diagonal_shift_used,
         primal_diagonal_shift: primal_diagonal_shift_used,
-        dual_regularization: dual_regularization_used,
+        dual_regularization: dual_diagonal_shift_used,
         first_hessian_perturbation: system.first_hessian_perturbation,
         previous_hessian_perturbation: system.previous_hessian_perturbation,
         regularization_first_growth_factor: system.regularization_first_growth_factor,
@@ -2281,23 +2282,76 @@ fn annotate_linear_debug_delta(
     result.dz_delta_inf = Some(delta_inf_norm(&primary.dz, &comparison.dz));
 }
 
-fn linear_debug_matches_primary(result: &InteriorPointLinearDebugBackendResult) -> bool {
+fn scaled_linear_debug_delta_matches(delta: Option<f64>, primary_scale: f64) -> bool {
+    delta
+        .is_some_and(|delta| delta <= LINEAR_DEBUG_RELATIVE_DELTA_TOLERANCE * (1.0 + primary_scale))
+}
+
+fn slice_inf_norm(values: &[f64]) -> f64 {
+    values
+        .iter()
+        .fold(0.0_f64, |acc, value| acc.max(value.abs()))
+}
+
+fn linear_debug_matches_primary(
+    primary: &NewtonDirection,
+    result: &InteriorPointLinearDebugBackendResult,
+) -> bool {
     result.success
-        && result
-            .step_delta_inf
-            .is_some_and(|delta| delta <= LINEAR_DEBUG_DELTA_TOLERANCE)
-        && result
-            .dx_delta_inf
-            .is_some_and(|delta| delta <= LINEAR_DEBUG_DELTA_TOLERANCE)
-        && result
-            .d_lambda_delta_inf
-            .is_some_and(|delta| delta <= LINEAR_DEBUG_DELTA_TOLERANCE)
-        && result
-            .ds_delta_inf
-            .is_some_and(|delta| delta <= LINEAR_DEBUG_DELTA_TOLERANCE)
-        && result
-            .dz_delta_inf
-            .is_some_and(|delta| delta <= LINEAR_DEBUG_DELTA_TOLERANCE)
+        && scaled_linear_debug_delta_matches(
+            result.step_delta_inf,
+            linear_direction_inf_norm(primary),
+        )
+        && scaled_linear_debug_delta_matches(result.dx_delta_inf, slice_inf_norm(&primary.dx))
+        && scaled_linear_debug_delta_matches(
+            result.d_lambda_delta_inf,
+            slice_inf_norm(&primary.d_lambda),
+        )
+        && scaled_linear_debug_delta_matches(result.ds_delta_inf, slice_inf_norm(&primary.ds))
+        && scaled_linear_debug_delta_matches(result.dz_delta_inf, slice_inf_norm(&primary.dz))
+}
+
+fn newton_direction_from_augmented_solution(
+    snapshot: &InteriorPointKktSnapshot,
+    solver: InteriorPointLinearSolver,
+    solution: Vec<f64>,
+    backend_stats: LinearBackendRunStats,
+) -> NewtonDirection {
+    let n = snapshot.x_dimension;
+    let meq = snapshot.equality_dimension;
+    let mineq = snapshot.inequality_dimension;
+    let dx = solution[..n].to_vec();
+    let p = solution
+        [snapshot.augmented_pattern.p_offset..snapshot.augmented_pattern.p_offset + mineq]
+        .to_vec();
+    let d_lambda = solution
+        [snapshot.augmented_pattern.lambda_offset..snapshot.augmented_pattern.lambda_offset + meq]
+        .to_vec();
+    let dz = solution
+        [snapshot.augmented_pattern.z_offset..snapshot.augmented_pattern.z_offset + mineq]
+        .to_vec();
+    let ds = p
+        .iter()
+        .zip(snapshot.slack.iter())
+        .zip(snapshot.multipliers.iter())
+        .map(|((p_i, slack_i), multiplier_i)| {
+            let scaling = (slack_i.max(1e-16) / multiplier_i.max(1e-16)).sqrt();
+            p_i * scaling
+        })
+        .collect::<Vec<_>>();
+    NewtonDirection {
+        dx,
+        d_lambda,
+        ds,
+        dz,
+        solver_used: solver,
+        regularization_used: snapshot.regularization.max(snapshot.primal_diagonal_shift),
+        dual_regularization_used: snapshot.dual_regularization,
+        primal_diagonal_shift_used: snapshot.primal_diagonal_shift,
+        linear_solution: solution,
+        backend_stats,
+        linear_debug: None,
+    }
 }
 
 fn replay_snapshot_with_solver(
@@ -2336,7 +2390,26 @@ fn replay_snapshot_with_solver(
                         .unwrap_or("rust spral_ssids workspace unavailable"),
                 )]);
             };
-            solve_reduced_kkt_with_spral_ssids(&system, workspace, &mut scratch_profiling, false)
+            if workspace.values.len() != snapshot.augmented_values.len() {
+                return Err(vec![spral_error_attempt(
+                    snapshot.regularization,
+                    InteriorPointLinearSolveFailureKind::FactorizationFailed,
+                    "snapshot pattern does not match rust SPRAL workspace",
+                )]);
+            }
+            workspace.values.copy_from_slice(&snapshot.augmented_values);
+            factor_solve_spral_ssids(
+                &system,
+                workspace,
+                &snapshot.augmented_rhs,
+                snapshot.regularization,
+                &mut scratch_profiling,
+                false,
+            )
+            .map(|(solution, backend_stats)| {
+                newton_direction_from_augmented_solution(snapshot, solver, solution, backend_stats)
+            })
+            .map_err(|attempt| vec![attempt])
         }
         InteriorPointLinearSolver::NativeSpralSsids => {
             if debug_state.native_workspace.is_none() && !debug_state.native_workspace_unavailable {
@@ -2367,12 +2440,25 @@ fn replay_snapshot_with_solver(
                         .unwrap_or("native spral_ssids workspace unavailable"),
                 )]);
             };
-            solve_reduced_kkt_with_native_spral_ssids(
-                &system,
+            if workspace.values.len() != snapshot.augmented_values.len() {
+                return Err(vec![native_spral_error_attempt(
+                    snapshot.regularization,
+                    InteriorPointLinearSolveFailureKind::FactorizationFailed,
+                    "snapshot pattern does not match native SPRAL workspace",
+                )]);
+            }
+            workspace.values.copy_from_slice(&snapshot.augmented_values);
+            factor_solve_native_spral_ssids(
                 workspace,
+                &snapshot.augmented_rhs,
+                snapshot.regularization,
                 &mut scratch_profiling,
                 false,
             )
+            .map(|(solution, backend_stats)| {
+                newton_direction_from_augmented_solution(snapshot, solver, solution, backend_stats)
+            })
+            .map_err(|attempt| vec![attempt])
         }
         InteriorPointLinearSolver::SparseQdldl => solve_reduced_kkt_with_sparse_qdldl(&system),
         InteriorPointLinearSolver::Auto => Err(vec![InteriorPointLinearSolveAttempt {
@@ -2413,7 +2499,7 @@ fn run_linear_debug_report_on_success(
                     direction.regularization_used,
                 );
                 annotate_linear_debug_delta(primary_direction, &direction, &mut result);
-                if linear_debug_matches_primary(&result) {
+                if linear_debug_matches_primary(primary_direction, &result) {
                     matched_solvers.push(solver.label());
                 } else {
                     mismatch = true;
@@ -5531,6 +5617,24 @@ fn sparse_hessian_diagonal_shift(hessian: &SparseSymmetricMatrix, minimum_shift:
     shift
 }
 
+fn spral_augmented_kkt_regularization_shifts(
+    system: &ReducedKktSystem<'_>,
+    solver: InteriorPointLinearSolver,
+    regularization: f64,
+) -> (f64, f64) {
+    match solver {
+        InteriorPointLinearSolver::NativeSpralSsids => (regularization.max(0.0), 0.0),
+        InteriorPointLinearSolver::SpralSsids | InteriorPointLinearSolver::Auto => (
+            sparse_hessian_diagonal_shift(system.hessian, regularization),
+            regularization.max(1e-8),
+        ),
+        InteriorPointLinearSolver::SparseQdldl => (
+            sparse_hessian_diagonal_shift(system.hessian, regularization),
+            regularization.max(1e-8),
+        ),
+    }
+}
+
 fn next_ipopt_hessian_perturbation(
     current: f64,
     previous_successful: Option<f64>,
@@ -6355,7 +6459,7 @@ fn solve_reduced_kkt_with_spral_ssids(
                     dz_upper: Vec::new(),
                     solver_used: InteriorPointLinearSolver::SpralSsids,
                     regularization_used: current_regularization.max(primal_shift),
-                    dual_regularization_used: current_regularization,
+                    dual_regularization_used: dual_shift,
                     primal_diagonal_shift_used: primal_shift,
                     linear_solution: solution,
                     backend_stats,
@@ -8712,8 +8816,9 @@ where
                         current_snapshot.phase,
                         direction.solver_used,
                         &reduced_kkt_system,
-                        direction.dual_regularization_used,
+                        direction.regularization_used,
                         direction.primal_diagonal_shift_used,
+                        direction.dual_regularization_used,
                         barrier_parameter_value,
                         primal_inf,
                         dual_inf,
@@ -8743,13 +8848,19 @@ where
                         .map_or(reduced_kkt_system.regularization, |attempt| {
                             attempt.regularization
                         });
+                    let (primal_shift, dual_shift) = spral_augmented_kkt_regularization_shifts(
+                        &reduced_kkt_system,
+                        *solver,
+                        regularization,
+                    );
                     if let Ok(snapshot) = build_interior_point_kkt_snapshot(
                         iteration,
                         current_snapshot.phase,
                         *solver,
                         &reduced_kkt_system,
                         regularization,
-                        sparse_hessian_diagonal_shift(reduced_kkt_system.hessian, regularization),
+                        primal_shift,
+                        dual_shift,
                         barrier_parameter_value,
                         primal_inf,
                         dual_inf,
