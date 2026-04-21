@@ -1309,8 +1309,9 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use serde::de::DeserializeOwned;
     use spral_ssids::{
-        NativeSpral, NumericFactorOptions, OrderingStrategy, SsidsOptions, SymmetricCscMatrix,
-        analyse as spral_analyse, approximate_minimum_degree_permutation as spral_amd_permutation,
+        NativeSpral, NumericFactorOptions, OrderingStrategy, SolveProfile, SsidsOptions,
+        SymmetricCscMatrix, analyse as spral_analyse,
+        approximate_minimum_degree_permutation as spral_amd_permutation,
         factorize as spral_factorize,
     };
     use std::collections::{BTreeMap, BTreeSet};
@@ -1344,6 +1345,7 @@ mod tests {
         solution_inf: f64,
         solution: Vec<f64>,
         inertia: String,
+        solve_profile: Option<SolveProfile>,
     }
 
     #[derive(Debug)]
@@ -1529,8 +1531,8 @@ mod tests {
             .expect("rust spral factorization should succeed on dumped KKT");
         let factor_time = factor_started.elapsed();
         let solve_started = Instant::now();
-        let mut solution = factor
-            .solve(&dump.rhs)
+        let (mut solution, mut solve_profile) = factor
+            .solve_with_profile(&dump.rhs)
             .expect("rust spral solve should succeed on dumped KKT");
         let mut solve_time = solve_started.elapsed();
         for _ in 0..10 {
@@ -1539,10 +1541,11 @@ mod tests {
                 break;
             }
             let correction_started = Instant::now();
-            let correction = factor
-                .solve(&residual)
+            let (correction, correction_profile) = factor
+                .solve_with_profile(&residual)
                 .expect("rust spral iterative refinement should succeed on dumped KKT");
             solve_time += correction_started.elapsed();
+            solve_profile.accumulate(&correction_profile);
             for (solution_i, correction_i) in solution.iter_mut().zip(correction.iter()) {
                 *solution_i += correction_i;
             }
@@ -1554,6 +1557,7 @@ mod tests {
             solution_inf: solution_inf(&solution),
             solution,
             inertia: format!("{:?}", factor.inertia()),
+            solve_profile: Some(solve_profile),
         }
     }
 
@@ -1613,6 +1617,7 @@ mod tests {
             solution_inf: solution_inf(&solution),
             solution,
             inertia: format!("{:?}", factor_info.inertia),
+            solve_profile: None,
         }
     }
 
@@ -2427,6 +2432,17 @@ mod tests {
             rust_exact.solution_inf,
             rust_exact.inertia,
         );
+        if let Some(profile) = &rust_exact.solve_profile {
+            println!(
+                "  rust_spral solve_profile input_perm={:?} forward={:?} diagonal={:?} backward={:?} output_perm={:?} recorded={:?}",
+                profile.input_permutation_time,
+                profile.forward_substitution_time,
+                profile.diagonal_solve_time,
+                profile.backward_substitution_time,
+                profile.output_permutation_time,
+                profile.total_recorded_time(),
+            );
+        }
         println!(
             "  native_spral factor={:?} solve={:?} residual={:.3e} solution_inf={:.3e} inertia={}",
             native_exact.factor_time,

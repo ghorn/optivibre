@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 mod native;
 
@@ -15,6 +15,33 @@ pub use native::{
     NativeOrdering, NativeSpral, NativeSpralAnalyseInfo, NativeSpralError, NativeSpralFactorInfo,
     NativeSpralIndefEnquiry, NativeSpralSession,
 };
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SolveProfile {
+    pub input_permutation_time: Duration,
+    pub forward_substitution_time: Duration,
+    pub diagonal_solve_time: Duration,
+    pub backward_substitution_time: Duration,
+    pub output_permutation_time: Duration,
+}
+
+impl SolveProfile {
+    pub fn total_recorded_time(&self) -> Duration {
+        self.input_permutation_time
+            + self.forward_substitution_time
+            + self.diagonal_solve_time
+            + self.backward_substitution_time
+            + self.output_permutation_time
+    }
+
+    pub fn accumulate(&mut self, other: &Self) {
+        self.input_permutation_time += other.input_permutation_time;
+        self.forward_substitution_time += other.forward_substitution_time;
+        self.diagonal_solve_time += other.diagonal_solve_time;
+        self.backward_substitution_time += other.backward_substitution_time;
+        self.output_permutation_time += other.output_permutation_time;
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct SymmetricCscMatrix<'a> {
@@ -544,9 +571,35 @@ impl NumericFactor {
         Ok(solution)
     }
 
+    pub fn solve_with_profile(
+        &mut self,
+        rhs: &[f64],
+    ) -> Result<(Vec<f64>, SolveProfile), SsidsError> {
+        let mut solution = rhs.to_vec();
+        let profile = self.solve_in_place_with_profile(&mut solution)?;
+        Ok((solution, profile))
+    }
+
     /// Solve `Ax = rhs` in place for the factorized matrix. The slice length
     /// must match the factor dimension exactly.
     pub fn solve_in_place(&mut self, rhs: &mut [f64]) -> Result<(), SsidsError> {
+        self.solve_in_place_impl(rhs, None)
+    }
+
+    pub fn solve_in_place_with_profile(
+        &mut self,
+        rhs: &mut [f64],
+    ) -> Result<SolveProfile, SsidsError> {
+        let mut profile = SolveProfile::default();
+        self.solve_in_place_impl(rhs, Some(&mut profile))?;
+        Ok(profile)
+    }
+
+    fn solve_in_place_impl(
+        &mut self,
+        rhs: &mut [f64],
+        mut profile: Option<&mut SolveProfile>,
+    ) -> Result<(), SsidsError> {
         if rhs.len() != self.dimension {
             return Err(SsidsError::SolveDimensionMismatch {
                 expected: self.dimension,
@@ -561,10 +614,20 @@ impl NumericFactor {
             self.solve_workspace.resize(self.dimension, 0.0);
         }
         let factor_rhs = &mut self.solve_workspace;
+        let profile_enabled = profile.is_some();
+
+        let started = profile_enabled.then(Instant::now);
         for (factor_position, &ordered_index) in self.factor_order.iter().enumerate() {
             factor_rhs[factor_position] = rhs[self.permutation.perm()[ordered_index]];
         }
+        if let Some(started) = started {
+            profile
+                .as_mut()
+                .expect("profile exists when timing is enabled")
+                .input_permutation_time += started.elapsed();
+        }
 
+        let started = profile_enabled.then(Instant::now);
         if self.dimension <= APP_INNER_BLOCK_SIZE {
             let dense_lower = build_dense_unit_lower_from_factor(
                 self.dimension,
@@ -593,48 +656,67 @@ impl NumericFactor {
                 }
             }
         }
+        if let Some(started) = started {
+            profile
+                .as_mut()
+                .expect("profile exists when timing is enabled")
+                .forward_substitution_time += started.elapsed();
+        }
 
-        let mut diagonal_start = 0;
-        for (block, values) in self
-            .diagonal_blocks
-            .iter()
-            .zip(self.diagonal_values.chunks_exact(4))
-        {
-            let start = diagonal_start;
-            let end = start + block.size;
-            if block.size == 1 {
-                let inverse_diagonal =
-                    one_by_one_inverse_diagonal(&values[..2]).map_err(|detail| {
-                        SsidsError::NumericalBreakdown {
+        let started = profile_enabled.then(Instant::now);
+        let diagonal_result = (|| {
+            let mut diagonal_start = 0;
+            for (block, values) in self
+                .diagonal_blocks
+                .iter()
+                .zip(self.diagonal_values.chunks_exact(4))
+            {
+                let start = diagonal_start;
+                let end = start + block.size;
+                if block.size == 1 {
+                    let inverse_diagonal =
+                        one_by_one_inverse_diagonal(&values[..2]).map_err(|detail| {
+                            SsidsError::NumericalBreakdown {
+                                pivot: start,
+                                detail,
+                            }
+                        })?;
+                    if !inverse_diagonal.is_finite() {
+                        return Err(SsidsError::NumericalBreakdown {
+                            pivot: start,
+                            detail: "diagonal pivot vanished during solve".into(),
+                        });
+                    }
+                    factor_rhs[start] *= inverse_diagonal;
+                } else if block.size == 2 {
+                    solve_two_by_two_block_in_place(values, &mut factor_rhs[start..end]).map_err(
+                        |detail| SsidsError::NumericalBreakdown {
                             pivot: start,
                             detail,
-                        }
-                    })?;
-                if !inverse_diagonal.is_finite() {
+                        },
+                    )?;
+                } else {
                     return Err(SsidsError::NumericalBreakdown {
                         pivot: start,
-                        detail: "diagonal pivot vanished during solve".into(),
+                        detail: format!(
+                            "unexpected dense diagonal block of size {} in solve path",
+                            block.size
+                        ),
                     });
                 }
-                factor_rhs[start] *= inverse_diagonal;
-            } else if block.size == 2 {
-                solve_two_by_two_block_in_place(values, &mut factor_rhs[start..end]).map_err(
-                    |detail| SsidsError::NumericalBreakdown {
-                        pivot: start,
-                        detail,
-                    },
-                )?;
-            } else {
-                return Err(SsidsError::NumericalBreakdown {
-                    pivot: start,
-                    detail: format!(
-                        "unexpected dense diagonal block of size {} in solve path",
-                        block.size
-                    ),
-                });
+                diagonal_start = end;
             }
-            diagonal_start = end;
+            Ok(())
+        })();
+        if let Some(started) = started {
+            profile
+                .as_mut()
+                .expect("profile exists when timing is enabled")
+                .diagonal_solve_time += started.elapsed();
         }
+        diagonal_result?;
+
+        let started = profile_enabled.then(Instant::now);
         if self.dimension <= APP_INNER_BLOCK_SIZE {
             let dense_lower = build_dense_unit_lower_from_factor(
                 self.dimension,
@@ -662,14 +744,27 @@ impl NumericFactor {
                 factor_rhs,
             );
         }
+        if let Some(started) = started {
+            profile
+                .as_mut()
+                .expect("profile exists when timing is enabled")
+                .backward_substitution_time += started.elapsed();
+        }
         if !factor_rhs.iter().all(|value| value.is_finite()) {
             return Err(SsidsError::NumericalBreakdown {
                 pivot: self.dimension.saturating_sub(1),
                 detail: "solve produced non-finite values".into(),
             });
         }
+        let started = profile_enabled.then(Instant::now);
         for (factor_position, &ordered_index) in self.factor_order.iter().enumerate() {
             rhs[self.permutation.perm()[ordered_index]] = factor_rhs[factor_position];
+        }
+        if let Some(started) = started {
+            profile
+                .as_mut()
+                .expect("profile exists when timing is enabled")
+                .output_permutation_time += started.elapsed();
         }
         Ok(())
     }
@@ -3981,6 +4076,33 @@ mod tests {
             native_counts,
             column_pattern.iter().map(Vec::len).collect::<Vec<usize>>()
         );
+    }
+
+    #[test]
+    fn solve_profile_preserves_solution() {
+        let col_ptrs = vec![0, 2, 3];
+        let row_indices = vec![0, 1, 1];
+        let values = vec![2.0, 1.0, 2.0];
+        let matrix =
+            SymmetricCscMatrix::new(2, &col_ptrs, &row_indices, Some(&values)).expect("valid CSC");
+        let (symbolic, _) = analyse(
+            matrix,
+            &SsidsOptions {
+                ordering: OrderingStrategy::Natural,
+            },
+        )
+        .expect("analyse");
+        let (mut factor, _) =
+            factorize(matrix, &symbolic, &NumericFactorOptions::default()).expect("factorize");
+        let mut rhs = vec![1.0, 0.0];
+
+        let profile = factor
+            .solve_in_place_with_profile(&mut rhs)
+            .expect("profiled solve");
+
+        assert!((rhs[0] - 2.0 / 3.0).abs() < 1e-12);
+        assert!((rhs[1] + 1.0 / 3.0).abs() < 1e-12);
+        assert!(profile.total_recorded_time() >= profile.diagonal_solve_time);
     }
 
     fn random_dense_dyadic_matrix(dimension: usize, rng: &mut DenseBoundaryRng) -> Vec<Vec<f64>> {
