@@ -1297,7 +1297,7 @@ mod tests {
         NativeSpral, NumericFactorOptions, OrderingStrategy, SsidsOptions, SymmetricCscMatrix,
         analyse as spral_analyse, factorize as spral_factorize,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::Path;
     use std::time::{Duration, Instant};
@@ -3220,6 +3220,92 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual local-SPRAL IPOPT strategy comparison for the glider repro"]
+    fn print_current_glider_ipopt_mu_strategy_compare() {
+        fn local_spral_ipopt_options(config: &SolverConfig) -> optimization::IpoptOptions {
+            let mut options = crate::common::ipopt_options(config);
+            let profile = optimization::native_spral_parity_profile();
+            options.linear_solver = Some(optimization::IpoptLinearSolver::Spral);
+            options.spral_pivot_method = Some(match profile.pivot_method {
+                optimization::SpralParityPivotProfile::Block => {
+                    optimization::IpoptSpralPivotMethod::Block
+                }
+            });
+            options.spral_small_pivot_tolerance = Some(profile.small_pivot_tolerance);
+            options.spral_threshold_pivot_u = Some(profile.threshold_pivot_u);
+            options.spral_use_gpu = Some(profile.use_gpu);
+            options.capture_provenance = true;
+            options
+        }
+
+        let params = Params {
+            launch_speed_mps: 30.0,
+            initial_alpha_deg: 6.0,
+            max_alpha_rate_deg_s: 12.0,
+            solver_method: SolverMethod::Ipopt,
+            ..Params::default()
+        };
+        let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
+            .expect("glider direct collocation should compile");
+        let compiled = compiled.compiled.borrow();
+        let runtime = dc_runtime(&params);
+
+        for (label, mut options) in [
+            ("default-local-spral", {
+                let mut options = crate::common::ipopt_options(&params.solver);
+                options.capture_provenance = true;
+                options
+            }),
+            ("explicit-spral-adaptive", {
+                let mut options = local_spral_ipopt_options(&params.solver);
+                options.mu_strategy = optimization::IpoptMuStrategy::Adaptive;
+                options
+            }),
+            ("explicit-spral-monotone", {
+                let mut options = local_spral_ipopt_options(&params.solver);
+                options.mu_strategy = optimization::IpoptMuStrategy::Monotone;
+                options
+            }),
+        ] {
+            options.print_level = 0;
+            options.suppress_banner = true;
+            let mut last_solver = None;
+            let mut last_tf = None;
+            let mut last_x = None;
+            let result = compiled.solve_ipopt_with_callback(&runtime, &options, |snapshot| {
+                last_solver = Some(snapshot.solver.clone());
+                last_tf = Some(snapshot.trajectories.tf);
+                last_x = Some(snapshot.trajectories.x.terminal.x);
+            });
+            if last_solver.is_none()
+                && let Err(optimization::IpoptSolveError::Solve { snapshots, .. }) = &result
+            {
+                last_solver = snapshots.last().cloned();
+            }
+            println!("\n=== glider IPOPT local SPRAL {label} ===");
+            if let Some(last) = last_solver {
+                println!(
+                    "last iter={} phase={:?} obj={:.6e} tf={:?} x_T={:?} inf_pr={:.6e} inf_du={:.6e} mu={:.6e} alpha_pr={:.6e} alpha_du={:.6e}",
+                    last.iteration,
+                    last.phase,
+                    last.objective,
+                    last_tf,
+                    last_x,
+                    last.primal_inf,
+                    last.dual_inf,
+                    last.barrier_parameter,
+                    last.alpha_pr,
+                    last.alpha_du,
+                );
+            }
+            println!(
+                "result: {:?}",
+                result.as_ref().map(|_| ()).map_err(|err| err.to_string())
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "manual NLIP strict summary helper without per-iteration callbacks"]
     fn print_current_glider_nlip_strict_fast() {
         let params = Params {
@@ -3399,19 +3485,44 @@ mod tests {
         #[derive(Clone)]
         struct TracePoint {
             iteration: usize,
+            x: Vec<f64>,
             objective: f64,
             primal_inf: f64,
             dual_inf: f64,
             mu: f64,
+            tf: f64,
+            terminal_x: f64,
             regularization: Option<f64>,
+            primal_shift: f64,
+            dual_regularization: f64,
+            step_inf: f64,
+            dx_inf: f64,
+            ds_inf: f64,
+            dz_inf: f64,
             alpha_pr: f64,
             alpha_du: f64,
             step_tag: String,
             trial_count: usize,
             events: String,
             inertia: String,
+            linear_stats: String,
+            linear_detail: String,
             alpha_pr_limiter: String,
             alpha_du_limiter: String,
+            alpha_du_limiters: String,
+        }
+
+        #[derive(Clone)]
+        struct VariableBoundView {
+            lower: Vec<Option<f64>>,
+            upper: Vec<Option<f64>>,
+        }
+
+        #[derive(Clone)]
+        struct IpoptOcpTracePoint {
+            solver: optimization::IpoptIterationSnapshot,
+            tf: f64,
+            terminal_x: f64,
         }
 
         fn log_gap(lhs: f64, rhs: f64, floor: f64) -> f64 {
@@ -3425,7 +3536,7 @@ mod tests {
         }
 
         fn regularization_text(value: Option<f64>) -> String {
-            value.map_or_else(|| "--".to_string(), |value| format!("{value:.1e}"))
+            value.map_or_else(|| "--".to_string(), |value| format!("{value:.6e}"))
         }
 
         fn regularization_log_gap(lhs: Option<f64>, rhs: Option<f64>) -> f64 {
@@ -3504,22 +3615,712 @@ mod tests {
                 )
         }
 
-        fn limiter_text(limiter: Option<&optimization::InteriorPointBoundaryLimiter>) -> String {
+        fn nlip_primary_detail_text(
+            snapshot: &optimization::InteriorPointIterationSnapshot,
+        ) -> String {
+            snapshot
+                .linear_debug
+                .as_ref()
+                .and_then(|report| {
+                    report
+                        .results
+                        .iter()
+                        .find(|result| result.solver == report.primary_solver)
+                })
+                .and_then(|result| result.detail.as_deref())
+                .map_or_else(|| "--".to_string(), ToString::to_string)
+        }
+
+        fn nlip_primary_linear_stats_text(
+            snapshot: &optimization::InteriorPointIterationSnapshot,
+        ) -> String {
+            snapshot
+                .linear_debug
+                .as_ref()
+                .and_then(|report| {
+                    report
+                        .results
+                        .iter()
+                        .find(|result| result.solver == report.primary_solver)
+                })
+                .map(|result| {
+                    format!(
+                        "residual={} solution={} step={}",
+                        result
+                            .residual_inf
+                            .map_or_else(|| "--".to_string(), |value| format!("{value:.3e}")),
+                        result
+                            .solution_inf
+                            .map_or_else(|| "--".to_string(), |value| format!("{value:.3e}")),
+                        result
+                            .step_inf
+                            .map_or_else(|| "--".to_string(), |value| format!("{value:.3e}")),
+                    )
+                })
+                .unwrap_or_else(|| "--".to_string())
+        }
+
+        fn glider_decision_count(intervals: usize, order: usize) -> usize {
+            const STATE_LEN: usize = 4;
+            const CONTROL_LEN: usize = 1;
+            (intervals + 1) * (STATE_LEN + CONTROL_LEN)
+                + intervals * order * (STATE_LEN + 2 * CONTROL_LEN)
+                + 1
+        }
+
+        fn variable_bound_view(params: &Params) -> VariableBoundView {
+            let intervals = params.transcription.intervals;
+            let order = params.transcription.collocation_degree;
+            let dimension = glider_decision_count(intervals, order);
+            let mut lower = vec![None; dimension];
+            let mut upper = vec![None; dimension];
+            let tf_index = dimension - 1;
+            lower[tf_index] = Some(params.min_time_bound_s);
+            upper[tf_index] = Some(params.max_time_bound_s);
+            VariableBoundView { lower, upper }
+        }
+
+        fn glider_path_inequality_label(index: usize, intervals: usize, order: usize) -> String {
+            let point = index / 6;
+            let residual = index % 6;
+            let interval = point / order;
+            let root = point % order;
+            if interval >= intervals {
+                return format!("ineq[{index}]");
+            }
+            let name = match residual {
+                0 => "lower(path.altitude)",
+                1 => "lower(path.vx)",
+                2 => "lower(path.cl)",
+                3 => "upper(path.cl)",
+                4 => "lower(path.alpha_rate)",
+                5 => "upper(path.alpha_rate)",
+                _ => unreachable!(),
+            };
+            format!("{name}[{interval}][{root}]")
+        }
+
+        fn glider_inequality_label(index: usize, intervals: usize, order: usize) -> String {
+            let path_row_count = intervals * order * 6;
+            if index < path_row_count {
+                return glider_path_inequality_label(index, intervals, order);
+            }
+            format!("ineq[{index}]")
+        }
+
+        fn primal_limiter_label(
+            limiter: &optimization::InteriorPointBoundaryLimiter,
+            x: &[f64],
+            bounds: &VariableBoundView,
+            intervals: usize,
+            order: usize,
+        ) -> String {
+            if limiter.index < x.len() {
+                if let Some(lower) = bounds.lower.get(limiter.index).copied().flatten() {
+                    let slack = (x[limiter.index] - lower).max(1.0e-16);
+                    if (slack - limiter.value).abs() <= 1.0e-7 * slack.abs().max(1.0) {
+                        return format!(
+                            "lower({})",
+                            glider_decision_label(limiter.index, intervals, order)
+                        );
+                    }
+                }
+                if let Some(upper) = bounds.upper.get(limiter.index).copied().flatten() {
+                    let slack = (upper - x[limiter.index]).max(1.0e-16);
+                    if (slack - limiter.value).abs() <= 1.0e-7 * slack.abs().max(1.0) {
+                        return format!(
+                            "upper({})",
+                            glider_decision_label(limiter.index, intervals, order)
+                        );
+                    }
+                }
+            }
+            format!(
+                "slack_or_multiplier({})",
+                glider_inequality_label(limiter.index, intervals, order)
+            )
+        }
+
+        fn limiter_text(
+            limiter: Option<&optimization::InteriorPointBoundaryLimiter>,
+            x: &[f64],
+            bounds: &VariableBoundView,
+            intervals: usize,
+            order: usize,
+        ) -> String {
             limiter.map_or_else(
                 || "--".to_string(),
                 |limiter| {
+                    let label = primal_limiter_label(limiter, x, bounds, intervals, order);
                     format!(
-                        "#{} val={:.3e} dir={:.3e} a={:.3e}",
-                        limiter.index, limiter.value, limiter.direction, limiter.alpha
+                        "#{} {} val={:.3e} dir={:.3e} a={:.3e}",
+                        limiter.index, label, limiter.value, limiter.direction, limiter.alpha
                     )
                 },
             )
+        }
+
+        fn limiters_text(limiters: &[optimization::InteriorPointBoundaryLimiter]) -> String {
+            if limiters.is_empty() {
+                return "--".to_string();
+            }
+            limiters
+                .iter()
+                .map(|limiter| {
+                    format!(
+                        "#{} val={:.3e} dir={:.3e} a={:.6e}",
+                        limiter.index, limiter.value, limiter.direction, limiter.alpha
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        }
+
+        fn state_field_name(index: usize) -> &'static str {
+            match index {
+                0 => "x",
+                1 => "altitude",
+                2 => "vx",
+                3 => "vy",
+                _ => "?",
+            }
+        }
+
+        fn control_field_name(index: usize) -> &'static str {
+            match index {
+                0 => "alpha",
+                _ => "?",
+            }
+        }
+
+        fn glider_decision_label(index: usize, intervals: usize, order: usize) -> String {
+            const STATE_LEN: usize = 4;
+            const CONTROL_LEN: usize = 1;
+
+            let x_len = (intervals + 1) * STATE_LEN;
+            if index < x_len {
+                let node = index / STATE_LEN;
+                let field = state_field_name(index % STATE_LEN);
+                return if node == intervals {
+                    format!("x[T].{field}")
+                } else {
+                    format!("x[{node}].{field}")
+                };
+            }
+
+            let mut offset = index - x_len;
+            let u_len = (intervals + 1) * CONTROL_LEN;
+            if offset < u_len {
+                let node = offset / CONTROL_LEN;
+                let field = control_field_name(0);
+                return if node == intervals {
+                    format!("u[T].{field}")
+                } else {
+                    format!("u[{node}].{field}")
+                };
+            }
+
+            offset -= u_len;
+            let root_x_len = intervals * order * STATE_LEN;
+            if offset < root_x_len {
+                let point = offset / STATE_LEN;
+                let interval = point / order;
+                let root = point % order;
+                let field = state_field_name(offset % STATE_LEN);
+                return format!("root_x[{interval}][{root}].{field}");
+            }
+
+            offset -= root_x_len;
+            let root_u_len = intervals * order * CONTROL_LEN;
+            if offset < root_u_len {
+                let point = offset / CONTROL_LEN;
+                let interval = point / order;
+                let root = point % order;
+                let field = control_field_name(0);
+                return format!("root_u[{interval}][{root}].{field}");
+            }
+
+            offset -= root_u_len;
+            let root_dudt_len = intervals * order * CONTROL_LEN;
+            if offset < root_dudt_len {
+                let point = offset / CONTROL_LEN;
+                let interval = point / order;
+                let root = point % order;
+                let field = control_field_name(0);
+                return format!("root_dudt[{interval}][{root}].{field}");
+            }
+
+            offset -= root_dudt_len;
+            if offset == 0 {
+                "tf".to_string()
+            } else {
+                format!("unknown[{index}]")
+            }
+        }
+
+        fn top_x_diffs(
+            nlip: &TracePoint,
+            ipopt: &TracePoint,
+            intervals: usize,
+            order: usize,
+        ) -> String {
+            let mut diffs = nlip
+                .x
+                .iter()
+                .zip(ipopt.x.iter())
+                .enumerate()
+                .map(|(index, (nlip_value, ipopt_value))| {
+                    (
+                        index,
+                        nlip_value,
+                        ipopt_value,
+                        (nlip_value - ipopt_value).abs(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            diffs.sort_by(|lhs, rhs| rhs.3.total_cmp(&lhs.3));
+            if diffs.is_empty() {
+                return "--".to_string();
+            }
+            diffs
+                .into_iter()
+                .take(8)
+                .map(|(index, nlip_value, ipopt_value, diff)| {
+                    let label = glider_decision_label(index, intervals, order);
+                    format!("#{index} {label} n={nlip_value:.6e} i={ipopt_value:.6e} d={diff:.3e}")
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        }
+
+        fn top_step_delta_diffs(
+            prev_nlip: &TracePoint,
+            nlip: &TracePoint,
+            prev_ipopt: &TracePoint,
+            ipopt: &TracePoint,
+            intervals: usize,
+            order: usize,
+        ) -> String {
+            let mut diffs = nlip
+                .x
+                .iter()
+                .zip(prev_nlip.x.iter())
+                .zip(ipopt.x.iter().zip(prev_ipopt.x.iter()))
+                .enumerate()
+                .map(
+                    |(index, ((nlip_value, prev_nlip_value), (ipopt_value, prev_ipopt_value)))| {
+                        let nlip_delta = nlip_value - prev_nlip_value;
+                        let ipopt_delta = ipopt_value - prev_ipopt_value;
+                        (
+                            index,
+                            nlip_delta,
+                            ipopt_delta,
+                            (nlip_delta - ipopt_delta).abs(),
+                        )
+                    },
+                )
+                .collect::<Vec<_>>();
+            diffs.sort_by(|lhs, rhs| rhs.3.total_cmp(&lhs.3));
+            if diffs.is_empty() {
+                return "--".to_string();
+            }
+            diffs
+                .into_iter()
+                .take(8)
+                .map(|(index, nlip_delta, ipopt_delta, diff)| {
+                    let label = glider_decision_label(index, intervals, order);
+                    format!(
+                        "#{index} {label} dn={nlip_delta:.6e} di={ipopt_delta:.6e} d={diff:.3e}"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        }
+
+        fn top_direction_estimate_diffs(
+            prev_nlip: &TracePoint,
+            nlip: &TracePoint,
+            prev_ipopt: &TracePoint,
+            ipopt: &TracePoint,
+            intervals: usize,
+            order: usize,
+        ) -> String {
+            let nlip_alpha = nlip.alpha_pr.abs().max(1.0e-16);
+            let ipopt_alpha = ipopt.alpha_pr.abs().max(1.0e-16);
+            let mut diffs = nlip
+                .x
+                .iter()
+                .zip(prev_nlip.x.iter())
+                .zip(ipopt.x.iter().zip(prev_ipopt.x.iter()))
+                .enumerate()
+                .map(
+                    |(index, ((nlip_value, prev_nlip_value), (ipopt_value, prev_ipopt_value)))| {
+                        let nlip_direction = (nlip_value - prev_nlip_value) / nlip_alpha;
+                        let ipopt_direction = (ipopt_value - prev_ipopt_value) / ipopt_alpha;
+                        (
+                            index,
+                            nlip_direction,
+                            ipopt_direction,
+                            (nlip_direction - ipopt_direction).abs(),
+                        )
+                    },
+                )
+                .collect::<Vec<_>>();
+            diffs.sort_by(|lhs, rhs| rhs.3.total_cmp(&lhs.3));
+            if diffs.is_empty() {
+                return "--".to_string();
+            }
+            diffs
+                .into_iter()
+                .take(8)
+                .map(|(index, nlip_direction, ipopt_direction, diff)| {
+                    let label = glider_decision_label(index, intervals, order);
+                    format!(
+                        "#{index} {label} dn={nlip_direction:.6e} di={ipopt_direction:.6e} d={diff:.3e}"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        }
+
+        fn max_direction_estimate_diff(
+            prev_nlip: &TracePoint,
+            nlip: &TracePoint,
+            prev_ipopt: &TracePoint,
+            ipopt: &TracePoint,
+        ) -> f64 {
+            let nlip_alpha = nlip.alpha_pr.abs().max(1.0e-16);
+            let ipopt_alpha = ipopt.alpha_pr.abs().max(1.0e-16);
+            nlip.x
+                .iter()
+                .zip(prev_nlip.x.iter())
+                .zip(ipopt.x.iter().zip(prev_ipopt.x.iter()))
+                .fold(
+                    0.0_f64,
+                    |acc, ((nlip_value, prev_nlip_value), (ipopt_value, prev_ipopt_value))| {
+                        let nlip_direction = (nlip_value - prev_nlip_value) / nlip_alpha;
+                        let ipopt_direction = (ipopt_value - prev_ipopt_value) / ipopt_alpha;
+                        acc.max((nlip_direction - ipopt_direction).abs())
+                    },
+                )
+        }
+
+        fn expanded_compact_lower_bound_multipliers(
+            compact: Option<&[f64]>,
+            bounds: &VariableBoundView,
+        ) -> Vec<f64> {
+            let mut expanded = vec![0.0; bounds.lower.len()];
+            let Some(compact) = compact else {
+                return expanded;
+            };
+            let mut compact_index = 0;
+            for (index, lower) in bounds.lower.iter().enumerate() {
+                let upper = bounds.upper.get(index).copied().flatten();
+                if lower.is_some() && *lower != upper {
+                    if let Some(value) = compact.get(compact_index) {
+                        expanded[index] = *value;
+                    }
+                    compact_index += 1;
+                }
+            }
+            expanded
+        }
+
+        fn expanded_compact_upper_bound_multipliers(
+            compact: Option<&[f64]>,
+            bounds: &VariableBoundView,
+        ) -> Vec<f64> {
+            let mut expanded = vec![0.0; bounds.upper.len()];
+            let Some(compact) = compact else {
+                return expanded;
+            };
+            let mut compact_index = 0;
+            for (index, upper) in bounds.upper.iter().enumerate() {
+                let lower = bounds.lower.get(index).copied().flatten();
+                if upper.is_some() && *upper != lower {
+                    if let Some(value) = compact.get(compact_index) {
+                        expanded[index] = *value;
+                    }
+                    compact_index += 1;
+                }
+            }
+            expanded
+        }
+
+        fn vector_inf_diff(lhs: &[f64], rhs: &[f64], rhs_sign: f64) -> f64 {
+            lhs.iter().zip(rhs.iter()).fold(0.0_f64, |acc, (lhs, rhs)| {
+                acc.max((lhs - rhs_sign * rhs).abs())
+            })
+        }
+
+        fn top_vector_diffs<F>(lhs: &[f64], rhs: &[f64], rhs_sign: f64, mut label: F) -> String
+        where
+            F: FnMut(usize) -> String,
+        {
+            let mut diffs = lhs
+                .iter()
+                .zip(rhs.iter())
+                .enumerate()
+                .map(|(index, (lhs, rhs))| {
+                    let signed_rhs = rhs_sign * *rhs;
+                    (index, *lhs, signed_rhs, (*lhs - signed_rhs).abs())
+                })
+                .collect::<Vec<_>>();
+            diffs.sort_by(|lhs, rhs| rhs.3.total_cmp(&lhs.3));
+            if diffs.is_empty() {
+                return "--".to_string();
+            }
+            diffs
+                .into_iter()
+                .take(6)
+                .map(|(index, lhs, rhs, diff)| {
+                    format!(
+                        "#{} {} n={lhs:.6e} i={rhs:.6e} d={diff:.3e}",
+                        index,
+                        label(index)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        }
+
+        fn ipopt_fraction_to_boundary_limiters(
+            previous: &optimization::IpoptIterationSnapshot,
+            current: &optimization::IpoptIterationSnapshot,
+            bounds: &VariableBoundView,
+            alpha_pr: f64,
+            intervals: usize,
+            order: usize,
+        ) -> String {
+            let alpha = alpha_pr.abs().max(1.0e-16);
+            let tau = 0.99_f64.max(1.0 - current.barrier_parameter.max(0.0));
+            let mut limiters = Vec::new();
+
+            for (index, (&previous_value, &current_value)) in
+                previous.x.iter().zip(current.x.iter()).enumerate()
+            {
+                let direction = (current_value - previous_value) / alpha;
+                if direction < 0.0
+                    && let Some(Some(lower)) = bounds.lower.get(index)
+                {
+                    let candidate = tau * (previous_value - lower) / -direction;
+                    if candidate.is_finite() {
+                        limiters.push((
+                            candidate,
+                            format!(
+                                "x lower {} value={previous_value:.3e} dir={direction:.3e}",
+                                glider_decision_label(index, intervals, order)
+                            ),
+                        ));
+                    }
+                }
+                if direction > 0.0
+                    && let Some(Some(upper)) = bounds.upper.get(index)
+                {
+                    let candidate = tau * (upper - previous_value) / direction;
+                    if candidate.is_finite() {
+                        limiters.push((
+                            candidate,
+                            format!(
+                                "x upper {} value={previous_value:.3e} dir={direction:.3e}",
+                                glider_decision_label(index, intervals, order)
+                            ),
+                        ));
+                    }
+                }
+            }
+
+            for (index, (&previous_value, &current_value)) in previous
+                .internal_slack
+                .iter()
+                .zip(current.internal_slack.iter())
+                .enumerate()
+            {
+                let direction = (current_value - previous_value) / alpha;
+                // The OCP inequality adapter presents each normalized path row as upper-only.
+                if direction > 0.0 {
+                    let candidate = tau * (0.0 - previous_value) / direction;
+                    if candidate.is_finite() {
+                        limiters.push((
+                            candidate,
+                            format!(
+                                "s upper {} value={previous_value:.3e} dir={direction:.3e}",
+                                glider_inequality_label(index, intervals, order)
+                            ),
+                        ));
+                    }
+                }
+            }
+
+            limiters.sort_by(|lhs, rhs| lhs.0.total_cmp(&rhs.0));
+            if limiters.is_empty() {
+                return "--".to_string();
+            }
+            limiters
+                .into_iter()
+                .take(6)
+                .map(|(alpha, label)| format!("a={alpha:.3e} {label}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        }
+
+        fn print_internal_ipopt_probe(
+            index: usize,
+            nlip_snapshot: &optimization::InteriorPointIterationSnapshot,
+            ipopt_snapshot: &optimization::IpoptIterationSnapshot,
+            bounds: &VariableBoundView,
+            intervals: usize,
+            order: usize,
+        ) {
+            let nlip_slack_primal = nlip_snapshot.slack_primal.as_deref().unwrap_or(&[]);
+            let nlip_eq = nlip_snapshot.equality_multipliers.as_deref().unwrap_or(&[]);
+            let nlip_ineq = nlip_snapshot
+                .inequality_multipliers
+                .as_deref()
+                .unwrap_or(&[]);
+            let nlip_slack_dual = nlip_snapshot.slack_multipliers.as_deref().unwrap_or(&[]);
+            let nlip_kkt_ineq = nlip_snapshot
+                .kkt_inequality_residual
+                .as_deref()
+                .unwrap_or(&[]);
+            let nlip_kkt_slack_stationarity = nlip_snapshot
+                .kkt_slack_stationarity
+                .as_deref()
+                .unwrap_or(&[]);
+            let nlip_kkt_slack_complementarity = nlip_snapshot
+                .kkt_slack_complementarity
+                .as_deref()
+                .unwrap_or(&[]);
+            let nlip_kkt_slack_sigma = nlip_snapshot.kkt_slack_sigma.as_deref().unwrap_or(&[]);
+            let nlip_lower = expanded_compact_lower_bound_multipliers(
+                nlip_snapshot.lower_bound_multipliers.as_deref(),
+                bounds,
+            );
+            let nlip_upper = expanded_compact_upper_bound_multipliers(
+                nlip_snapshot.upper_bound_multipliers.as_deref(),
+                bounds,
+            );
+
+            println!(
+                "internal_probe[{index}] ipopt_iter={} x_diff={:.3e} slack_same={:.3e} slack_neg={:.3e} slack_dist={:.3e} eq_y_diff={:.3e} ineq_y_same={:.3e} ineq_y_neg={:.3e} lower_z_diff={:.3e} upper_z_diff={:.3e} slack_vl_same={:.3e} slack_vu_same={:.3e} slack_vu_neg={:.3e} kkt_ineq={:.3e} kkt_slack_stat_neg={:.3e} kkt_slack_comp={:.3e} kkt_slack_sigma={:.3e}",
+                ipopt_snapshot.iteration,
+                vector_inf_diff(&nlip_snapshot.x, &ipopt_snapshot.x, 1.0),
+                vector_inf_diff(nlip_slack_primal, &ipopt_snapshot.internal_slack, 1.0),
+                vector_inf_diff(nlip_slack_primal, &ipopt_snapshot.internal_slack, -1.0),
+                vector_inf_diff(nlip_slack_primal, &ipopt_snapshot.kkt_slack_distance, 1.0),
+                vector_inf_diff(nlip_eq, &ipopt_snapshot.equality_multipliers, 1.0),
+                vector_inf_diff(nlip_ineq, &ipopt_snapshot.inequality_multipliers, 1.0),
+                vector_inf_diff(nlip_ineq, &ipopt_snapshot.inequality_multipliers, -1.0),
+                vector_inf_diff(&nlip_lower, &ipopt_snapshot.lower_bound_multipliers, 1.0),
+                vector_inf_diff(&nlip_upper, &ipopt_snapshot.upper_bound_multipliers, 1.0),
+                vector_inf_diff(
+                    nlip_slack_dual,
+                    &ipopt_snapshot.slack_lower_bound_multipliers,
+                    1.0,
+                ),
+                vector_inf_diff(
+                    nlip_slack_dual,
+                    &ipopt_snapshot.slack_upper_bound_multipliers,
+                    1.0,
+                ),
+                vector_inf_diff(
+                    nlip_slack_dual,
+                    &ipopt_snapshot.slack_upper_bound_multipliers,
+                    -1.0,
+                ),
+                vector_inf_diff(nlip_kkt_ineq, &ipopt_snapshot.kkt_inequality_residual, 1.0),
+                vector_inf_diff(
+                    nlip_kkt_slack_stationarity,
+                    &ipopt_snapshot.kkt_slack_stationarity,
+                    -1.0,
+                ),
+                vector_inf_diff(
+                    nlip_kkt_slack_complementarity,
+                    &ipopt_snapshot.kkt_slack_complementarity,
+                    1.0,
+                ),
+                vector_inf_diff(nlip_kkt_slack_sigma, &ipopt_snapshot.kkt_slack_sigma, 1.0),
+            );
+            println!(
+                "          top internal slack diffs (same sign): {}",
+                top_vector_diffs(
+                    nlip_slack_primal,
+                    &ipopt_snapshot.internal_slack,
+                    1.0,
+                    |idx| glider_inequality_label(idx, intervals, order),
+                )
+            );
+            println!(
+                "          top internal slack diffs (opposite sign): {}",
+                top_vector_diffs(
+                    nlip_slack_primal,
+                    &ipopt_snapshot.internal_slack,
+                    -1.0,
+                    |idx| glider_inequality_label(idx, intervals, order),
+                )
+            );
+            println!(
+                "          top y_d diffs: {}",
+                top_vector_diffs(
+                    nlip_ineq,
+                    &ipopt_snapshot.inequality_multipliers,
+                    1.0,
+                    |idx| glider_inequality_label(idx, intervals, order),
+                )
+            );
+            println!(
+                "          top v_U diffs: {}",
+                top_vector_diffs(
+                    nlip_slack_dual,
+                    &ipopt_snapshot.slack_upper_bound_multipliers,
+                    1.0,
+                    |idx| glider_inequality_label(idx, intervals, order),
+                )
+            );
+            println!(
+                "          top variable upper z diffs: {}",
+                top_vector_diffs(
+                    &nlip_upper,
+                    &ipopt_snapshot.upper_bound_multipliers,
+                    1.0,
+                    |idx| glider_decision_label(idx, intervals, order),
+                )
+            );
+            println!(
+                "          top KKT inequality residual diffs: {}",
+                top_vector_diffs(
+                    nlip_kkt_ineq,
+                    &ipopt_snapshot.kkt_inequality_residual,
+                    1.0,
+                    |idx| glider_inequality_label(idx, intervals, order),
+                )
+            );
+            println!(
+                "          top KKT slack stationarity diffs (opposite sign): {}",
+                top_vector_diffs(
+                    nlip_kkt_slack_stationarity,
+                    &ipopt_snapshot.kkt_slack_stationarity,
+                    -1.0,
+                    |idx| glider_inequality_label(idx, intervals, order),
+                )
+            );
+            println!(
+                "          top KKT slack sigma diffs: {}",
+                top_vector_diffs(
+                    nlip_kkt_slack_sigma,
+                    &ipopt_snapshot.kkt_slack_sigma,
+                    1.0,
+                    |idx| glider_inequality_label(idx, intervals, order),
+                )
+            );
         }
 
         fn print_trace_window(
             nlip_trace: &[TracePoint],
             ipopt_trace: &[TracePoint],
             center: usize,
+            intervals: usize,
+            order: usize,
         ) {
             let compared = nlip_trace.len().min(ipopt_trace.len());
             let start = if center <= 8 {
@@ -3529,21 +4330,27 @@ mod tests {
             };
             let end = (center + 5).min(compared);
             println!(
-                "trace_window index={} range={}..{} columns: idx | nlip(iter tag obj primal dual mu reg alpha_pr alpha_du ls inertia evt limiter_pr limiter_du) || ipopt(iter tag obj primal dual mu reg alpha_pr alpha_du ls)",
+                "trace_window index={} range={}..{} columns: idx | nlip(iter tag obj primal dual mu tf x_T reg step dx ds dz alpha_pr alpha_du ls inertia evt limiter_pr limiter_du) || ipopt(iter tag obj primal dual mu tf x_T reg step alpha_pr alpha_du ls)",
                 center, start, end
             );
             for index in start..end {
                 let nlip = &nlip_trace[index];
                 let ipopt = &ipopt_trace[index];
                 println!(
-                    "trace[{index:02}] | nlip({:>3} {:>2} {:>12.5e} {:>10.3e} {:>10.3e} {:>9.2e} {:>8} {:>9.2e} {:>9.2e} {:>2} {:>13} {:<10} {:<34} {:<34}) || ipopt({:>3} {:>2} {:>12.5e} {:>10.3e} {:>10.3e} {:>9.2e} {:>8} {:>9.2e} {:>9.2e} {:>2})",
+                    "trace[{index:02}] | nlip({:>3} {:>2} {:>12.5e} {:>10.3e} {:>10.3e} {:>9.2e} {:>9.2e} {:>12.5e} {:>8} {:>9.2e} {:>9.2e} {:>9.2e} {:>9.2e} {:>9.2e} {:>9.2e} {:>2} {:>13} {:<10} {:<34} {:<34}) || ipopt({:>3} {:>2} {:>12.5e} {:>10.3e} {:>10.3e} {:>9.2e} {:>9.2e} {:>12.5e} {:>8} {:>9.2e} {:>9.2e} {:>9.2e} {:>2})",
                     nlip.iteration,
                     nlip.step_tag,
                     nlip.objective,
                     nlip.primal_inf,
                     nlip.dual_inf,
                     nlip.mu,
+                    nlip.tf,
+                    nlip.terminal_x,
                     regularization_text(nlip.regularization),
+                    nlip.step_inf,
+                    nlip.dx_inf,
+                    nlip.ds_inf,
+                    nlip.dz_inf,
                     nlip.alpha_pr,
                     nlip.alpha_du,
                     nlip.trial_count,
@@ -3557,11 +4364,57 @@ mod tests {
                     ipopt.primal_inf,
                     ipopt.dual_inf,
                     ipopt.mu,
+                    ipopt.tf,
+                    ipopt.terminal_x,
                     regularization_text(ipopt.regularization),
+                    ipopt.step_inf,
                     ipopt.alpha_pr,
                     ipopt.alpha_du,
                     ipopt.trial_count,
                 );
+                if nlip.alpha_du_limiters != "--" {
+                    println!("          nlip alpha_du top: {}", nlip.alpha_du_limiters);
+                }
+                if nlip.linear_detail != "--" {
+                    println!("          nlip linear detail: {}", nlip.linear_detail);
+                }
+                if nlip.linear_stats != "--" {
+                    println!("          nlip linear stats: {}", nlip.linear_stats);
+                }
+                println!(
+                    "          nlip perturbations: primal_shift={:.6e} dual_regularization={:.6e}; ipopt regularization={}",
+                    nlip.primal_shift,
+                    nlip.dual_regularization,
+                    regularization_text(ipopt.regularization),
+                );
+                println!(
+                    "          top x diffs: {}",
+                    top_x_diffs(nlip, ipopt, intervals, order)
+                );
+                if index > 0 {
+                    println!(
+                        "          top step delta diffs: {}",
+                        top_step_delta_diffs(
+                            &nlip_trace[index - 1],
+                            nlip,
+                            &ipopt_trace[index - 1],
+                            ipopt,
+                            intervals,
+                            order
+                        )
+                    );
+                    println!(
+                        "          top accepted-direction diffs: {}",
+                        top_direction_estimate_diffs(
+                            &nlip_trace[index - 1],
+                            nlip,
+                            &ipopt_trace[index - 1],
+                            ipopt,
+                            intervals,
+                            order
+                        )
+                    );
+                }
             }
         }
 
@@ -3576,6 +4429,7 @@ mod tests {
             .expect("glider direct collocation should compile");
         let compiled = compiled.compiled.borrow();
         let runtime = dc_runtime(&params);
+        let variable_bounds = variable_bound_view(&params);
 
         let mut nlip_options = crate::common::nlip_options(&params.solver);
         optimization::apply_native_spral_parity_to_nlip_options(&mut nlip_options);
@@ -3591,25 +4445,76 @@ mod tests {
         let mut ipopt_options = crate::common::ipopt_options(&params.solver);
         optimization::apply_native_spral_parity_to_ipopt_options(&mut ipopt_options);
 
-        let mut nlip_snapshots = Vec::new();
+        let mut nlip_initial_options = nlip_options.clone();
+        nlip_initial_options.max_iters = 0;
+        nlip_initial_options.linear_debug = None;
+        let mut nlip_initial_ocp_snapshots = Vec::new();
+        let _ = compiled.solve_interior_point_with_callback(
+            &runtime,
+            &nlip_initial_options,
+            |snapshot| nlip_initial_ocp_snapshots.push(snapshot.clone()),
+        );
+
+        let mut nlip_ocp_snapshots = Vec::new();
         let nlip =
             compiled.solve_interior_point_with_callback(&runtime, &nlip_options, |snapshot| {
-                nlip_snapshots.push(snapshot.solver.clone());
+                nlip_ocp_snapshots.push(snapshot.clone());
             });
         if let Err(err) = &nlip {
             println!("nlip_err={err}");
+            if let optimization::InteriorPointSolveError::LinearSolve { context, .. } = err {
+                if let Some(diagnostics) = context.failed_linear_solve.as_ref() {
+                    println!(
+                        "nlip_linear_failure dim={} attempts={}",
+                        diagnostics.matrix_dimension,
+                        diagnostics.attempts.len()
+                    );
+                    for (index, attempt) in diagnostics.attempts.iter().enumerate().take(8) {
+                        println!(
+                            "  attempt[{index}] solver={} kind={} reg={:.3e} detail={}",
+                            attempt.solver.label(),
+                            attempt.failure_kind.label(),
+                            attempt.regularization,
+                            attempt.detail.as_deref().unwrap_or("--"),
+                        );
+                    }
+                    if diagnostics.attempts.len() > 8
+                        && let Some(attempt) = diagnostics.attempts.last()
+                    {
+                        println!(
+                            "  attempt[last] solver={} kind={} reg={:.3e} detail={}",
+                            attempt.solver.label(),
+                            attempt.failure_kind.label(),
+                            attempt.regularization,
+                            attempt.detail.as_deref().unwrap_or("--"),
+                        );
+                    }
+                }
+            }
         }
         let mut ipopt_snapshots = Vec::new();
+        let mut ipopt_ocp_snapshots = Vec::new();
         let ipopt = compiled.solve_ipopt_with_callback(&runtime, &ipopt_options, |snapshot| {
             ipopt_snapshots.push(snapshot.solver.clone());
+            ipopt_ocp_snapshots.push(IpoptOcpTracePoint {
+                solver: snapshot.solver.clone(),
+                tf: snapshot.trajectories.tf,
+                terminal_x: snapshot.trajectories.x.terminal.x,
+            });
         });
         if let Err(err) = &ipopt {
             println!("ipopt_err={err}");
         }
-        if ipopt_snapshots.is_empty()
-            && let Err(optimization::IpoptSolveError::Solve { snapshots, .. }) = &ipopt
-        {
-            ipopt_snapshots = snapshots.clone();
+        if ipopt_snapshots.is_empty() {
+            match &ipopt {
+                Ok(summary) => {
+                    ipopt_snapshots = summary.solver.snapshots.clone();
+                }
+                Err(optimization::IpoptSolveError::Solve { snapshots, .. }) => {
+                    ipopt_snapshots = snapshots.clone();
+                }
+                Err(_) => {}
+            }
         }
         let ipopt_journal_output = match &ipopt {
             Ok(summary) => summary.solver.journal_output.as_deref(),
@@ -3620,70 +4525,193 @@ mod tests {
         };
         let ipopt_step_tags = parse_ipopt_step_tags(ipopt_journal_output);
 
-        let nlip_trace = nlip_snapshots
+        if let (Some(nlip_initial), Some(ipopt_initial)) = (
+            nlip_initial_ocp_snapshots.iter().find(|snapshot| {
+                snapshot.solver.phase == optimization::InteriorPointIterationPhase::Initial
+                    && snapshot.solver.iteration == 0
+            }),
+            ipopt_snapshots
+                .iter()
+                .find(|snapshot| snapshot.iteration == 0),
+        ) {
+            let nlip_primal = nlip_initial
+                .solver
+                .eq_inf
+                .unwrap_or(0.0)
+                .max(nlip_initial.solver.ineq_inf.unwrap_or(0.0));
+            println!(
+                "initial nlip obj={:.6e} primal={:.6e} dual={:.6e} comp={:.6e} mu={:.6e} tf={:.6e} x_T={:.6e} || ipopt obj={:.6e} primal={:.6e} dual={:.6e} mu={:.6e}",
+                nlip_initial.solver.objective,
+                nlip_primal,
+                nlip_initial.solver.dual_inf,
+                nlip_initial.solver.comp_inf.unwrap_or(0.0),
+                nlip_initial.solver.barrier_parameter.unwrap_or(0.0),
+                nlip_initial.trajectories.tf,
+                nlip_initial.trajectories.x.terminal.x,
+                ipopt_initial.objective,
+                ipopt_initial.primal_inf,
+                ipopt_initial.dual_inf,
+                ipopt_initial.barrier_parameter,
+            );
+        }
+
+        let nlip_trace = nlip_ocp_snapshots
             .iter()
             .filter(|snapshot| {
-                snapshot.phase == optimization::InteriorPointIterationPhase::AcceptedStep
-                    && snapshot.alpha.is_some()
+                snapshot.solver.phase == optimization::InteriorPointIterationPhase::AcceptedStep
+                    && snapshot.solver.alpha.is_some()
             })
             .map(|snapshot| TracePoint {
-                iteration: snapshot.iteration,
-                objective: snapshot.objective,
+                iteration: snapshot.solver.iteration,
+                x: snapshot.solver.x.clone(),
+                objective: snapshot.solver.objective,
                 primal_inf: snapshot
+                    .solver
                     .eq_inf
                     .unwrap_or(0.0)
-                    .max(snapshot.ineq_inf.unwrap_or(0.0)),
-                dual_inf: snapshot.dual_inf,
-                mu: snapshot.barrier_parameter.unwrap_or(0.0),
+                    .max(snapshot.solver.ineq_inf.unwrap_or(0.0)),
+                dual_inf: snapshot.solver.dual_inf,
+                mu: snapshot.solver.barrier_parameter.unwrap_or(0.0),
+                tf: snapshot.trajectories.tf,
+                terminal_x: snapshot.trajectories.x.terminal.x,
                 regularization: snapshot
+                    .solver
                     .regularization_size
                     .and_then(positive_regularization),
-                alpha_pr: snapshot.alpha_pr.or(snapshot.alpha).unwrap_or(f64::NAN),
-                alpha_du: snapshot.alpha_du.unwrap_or(f64::NAN),
+                primal_shift: snapshot
+                    .solver
+                    .direction_diagnostics
+                    .as_ref()
+                    .map_or(f64::NAN, |diagnostics| diagnostics.primal_diagonal_shift),
+                dual_regularization: snapshot
+                    .solver
+                    .direction_diagnostics
+                    .as_ref()
+                    .map_or(f64::NAN, |diagnostics| diagnostics.dual_regularization),
+                step_inf: snapshot.solver.step_inf.unwrap_or(f64::NAN),
+                dx_inf: snapshot
+                    .solver
+                    .direction_diagnostics
+                    .as_ref()
+                    .map_or(f64::NAN, |diagnostics| diagnostics.dx_inf),
+                ds_inf: snapshot
+                    .solver
+                    .direction_diagnostics
+                    .as_ref()
+                    .map_or(f64::NAN, |diagnostics| diagnostics.ds_inf),
+                dz_inf: snapshot
+                    .solver
+                    .direction_diagnostics
+                    .as_ref()
+                    .map_or(f64::NAN, |diagnostics| diagnostics.dz_inf),
+                alpha_pr: snapshot
+                    .solver
+                    .alpha_pr
+                    .or(snapshot.solver.alpha)
+                    .unwrap_or(f64::NAN),
+                alpha_du: snapshot.solver.alpha_du.unwrap_or(f64::NAN),
                 step_tag: snapshot
+                    .solver
                     .step_tag
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "-".to_string()),
-                trial_count: snapshot.line_search_trials,
-                events: optimization::nlip_event_codes_for_events(&snapshot.events),
-                inertia: nlip_primary_inertia_text(snapshot),
+                trial_count: snapshot.solver.line_search_trials,
+                events: optimization::nlip_event_codes_for_events(&snapshot.solver.events),
+                inertia: nlip_primary_inertia_text(&snapshot.solver),
+                linear_stats: nlip_primary_linear_stats_text(&snapshot.solver),
+                linear_detail: nlip_primary_detail_text(&snapshot.solver),
                 alpha_pr_limiter: limiter_text(
                     snapshot
+                        .solver
                         .direction_diagnostics
                         .as_ref()
                         .and_then(|diagnostics| diagnostics.alpha_pr_limiter.as_ref()),
+                    &snapshot.solver.x,
+                    &variable_bounds,
+                    params.transcription.intervals,
+                    params.transcription.collocation_degree,
                 ),
                 alpha_du_limiter: limiter_text(
                     snapshot
+                        .solver
                         .direction_diagnostics
                         .as_ref()
                         .and_then(|diagnostics| diagnostics.alpha_du_limiter.as_ref()),
+                    &snapshot.solver.x,
+                    &variable_bounds,
+                    params.transcription.intervals,
+                    params.transcription.collocation_degree,
+                ),
+                alpha_du_limiters: snapshot.solver.direction_diagnostics.as_ref().map_or_else(
+                    || "--".to_string(),
+                    |diagnostics| limiters_text(&diagnostics.alpha_du_limiters),
                 ),
             })
             .collect::<Vec<_>>();
 
+        let ipopt_ocp_by_iteration = ipopt_ocp_snapshots
+            .iter()
+            .map(|snapshot| {
+                (
+                    snapshot.solver.iteration,
+                    (snapshot.tf, snapshot.terminal_x),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
         let ipopt_trace = ipopt_snapshots
             .iter()
             .filter(|snapshot| snapshot.iteration > 0)
-            .map(|snapshot| TracePoint {
-                iteration: snapshot.iteration,
-                objective: snapshot.objective,
-                primal_inf: snapshot.primal_inf,
-                dual_inf: snapshot.dual_inf,
-                mu: snapshot.barrier_parameter,
-                regularization: positive_regularization(snapshot.regularization_size),
-                alpha_pr: snapshot.alpha_pr,
-                alpha_du: snapshot.alpha_du,
-                step_tag: ipopt_step_tags
+            .map(|snapshot| {
+                let (tf, terminal_x) = ipopt_ocp_by_iteration
                     .get(&snapshot.iteration)
-                    .cloned()
-                    .unwrap_or_else(|| "-".to_string()),
-                trial_count: snapshot.line_search_trials.saturating_sub(1),
-                events: String::new(),
-                inertia: String::new(),
-                alpha_pr_limiter: String::new(),
-                alpha_du_limiter: String::new(),
+                    .copied()
+                    .unwrap_or((f64::NAN, f64::NAN));
+                TracePoint {
+                    iteration: snapshot.iteration,
+                    x: snapshot.x.clone(),
+                    objective: snapshot.objective,
+                    primal_inf: snapshot.primal_inf,
+                    dual_inf: snapshot.dual_inf,
+                    mu: snapshot.barrier_parameter,
+                    tf,
+                    terminal_x,
+                    regularization: positive_regularization(snapshot.regularization_size),
+                    primal_shift: snapshot.regularization_size,
+                    dual_regularization: f64::NAN,
+                    step_inf: snapshot.step_inf,
+                    dx_inf: f64::NAN,
+                    ds_inf: f64::NAN,
+                    dz_inf: f64::NAN,
+                    alpha_pr: snapshot.alpha_pr,
+                    alpha_du: snapshot.alpha_du,
+                    step_tag: ipopt_step_tags
+                        .get(&snapshot.iteration)
+                        .cloned()
+                        .unwrap_or_else(|| "-".to_string()),
+                    trial_count: snapshot.line_search_trials.saturating_sub(1),
+                    events: String::new(),
+                    inertia: String::new(),
+                    linear_stats: String::new(),
+                    linear_detail: String::new(),
+                    alpha_pr_limiter: String::new(),
+                    alpha_du_limiter: String::new(),
+                    alpha_du_limiters: String::new(),
+                }
             })
+            .collect::<Vec<_>>();
+        let accepted_nlip_solver_snapshots = nlip_ocp_snapshots
+            .iter()
+            .filter(|snapshot| {
+                snapshot.solver.phase == optimization::InteriorPointIterationPhase::AcceptedStep
+                    && snapshot.solver.alpha.is_some()
+            })
+            .map(|snapshot| snapshot.solver.clone())
+            .collect::<Vec<_>>();
+        let accepted_ipopt_solver_snapshots = ipopt_snapshots
+            .iter()
+            .filter(|snapshot| snapshot.iteration > 0)
+            .cloned()
             .collect::<Vec<_>>();
 
         println!("\n=== glider native SPRAL NLIP/IPOPT first divergence ===");
@@ -3692,6 +4720,46 @@ mod tests {
             nlip_trace.len(),
             ipopt_trace.len()
         );
+        let ipopt_snapshot_lengths = ipopt_snapshots
+            .iter()
+            .map(|snapshot| snapshot.x.len())
+            .collect::<BTreeSet<_>>();
+        println!(
+            "ipopt_snapshot_count={} ipopt_ocp_snapshot_count={} ipopt_x_lengths={:?}",
+            ipopt_snapshots.len(),
+            ipopt_ocp_snapshots.len(),
+            ipopt_snapshot_lengths
+        );
+        if let Some((direction_index, direction_gap)) = (1..nlip_trace.len().min(ipopt_trace.len()))
+            .find_map(|index| {
+                let gap = max_direction_estimate_diff(
+                    &nlip_trace[index - 1],
+                    &nlip_trace[index],
+                    &ipopt_trace[index - 1],
+                    &ipopt_trace[index],
+                );
+                (gap > 1.0e-1).then_some((index, gap))
+            })
+        {
+            println!(
+                "first_direction_divergence index={} nlip_iter={} ipopt_iter={} max_dir_gap={:.3e}",
+                direction_index,
+                nlip_trace[direction_index].iteration,
+                ipopt_trace[direction_index].iteration,
+                direction_gap
+            );
+            println!(
+                "first_direction_divergence top accepted-direction diffs: {}",
+                top_direction_estimate_diffs(
+                    &nlip_trace[direction_index - 1],
+                    &nlip_trace[direction_index],
+                    &ipopt_trace[direction_index - 1],
+                    &ipopt_trace[direction_index],
+                    params.transcription.intervals,
+                    params.transcription.collocation_degree,
+                )
+            );
+        }
         for (index, (nlip_point, ipopt_point)) in
             nlip_trace.iter().zip(ipopt_trace.iter()).enumerate()
         {
@@ -3701,6 +4769,7 @@ mod tests {
             let objective_gap = log_gap(nlip_point.objective, ipopt_point.objective, 1.0e-12);
             let regularization_gap =
                 regularization_log_gap(nlip_point.regularization, ipopt_point.regularization);
+            let step_gap = log_gap(nlip_point.step_inf, ipopt_point.step_inf, 1.0e-12);
             let alpha_pr_gap = (nlip_point.alpha_pr - ipopt_point.alpha_pr).abs();
             let alpha_du_gap = (nlip_point.alpha_du - ipopt_point.alpha_du).abs();
             let trial_gap = nlip_point.trial_count.abs_diff(ipopt_point.trial_count);
@@ -3709,9 +4778,9 @@ mod tests {
                 && nlip_point.step_tag != ipopt_point.step_tag;
             let divergence_kind = if step_tag_mismatch {
                 Some(DivergenceKind::StepTag)
-            } else if alpha_pr_gap > 1.0e-6 {
+            } else if alpha_pr_gap > 1.0e-2 {
                 Some(DivergenceKind::AlphaPr)
-            } else if alpha_du_gap > 1.0e-6 {
+            } else if alpha_du_gap > 1.0e-2 {
                 Some(DivergenceKind::AlphaDu)
             } else if regularization_gap > 0.5 {
                 Some(DivergenceKind::Regularization)
@@ -3730,7 +4799,7 @@ mod tests {
             };
             if let Some(divergence_kind) = divergence_kind {
                 println!(
-                    "divergence_at_index={} kind={:?} nlip_iter={} ipopt_iter={} objective_gap={:.3e} primal_gap={:.3e} dual_gap={:.3e} mu_gap={:.3e} regularization_gap={:.3e} alpha_pr_gap={:.3e} alpha_du_gap={:.3e} trial_gap={} nlip_obj={:.6e} ipopt_obj={:.6e} nlip_primal={:.6e} ipopt_primal={:.6e} nlip_dual={:.6e} ipopt_dual={:.6e} nlip_mu={:.6e} ipopt_mu={:.6e} nlip_reg={} ipopt_reg={} nlip_alpha_pr={:.6e} ipopt_alpha_pr={:.6e} nlip_alpha_du={:.6e} ipopt_alpha_du={:.6e} nlip_trials={} ipopt_trials={} nlip_tag={} ipopt_tag={}",
+                    "divergence_at_index={} kind={:?} nlip_iter={} ipopt_iter={} objective_gap={:.3e} primal_gap={:.3e} dual_gap={:.3e} mu_gap={:.3e} regularization_gap={:.3e} step_gap={:.3e} alpha_pr_gap={:.3e} alpha_du_gap={:.3e} trial_gap={} nlip_obj={:.6e} ipopt_obj={:.6e} nlip_primal={:.6e} ipopt_primal={:.6e} nlip_dual={:.6e} ipopt_dual={:.6e} nlip_mu={:.6e} ipopt_mu={:.6e} nlip_tf={:.6e} ipopt_tf={:.6e} nlip_x_T={:.6e} ipopt_x_T={:.6e} nlip_reg={} ipopt_reg={} nlip_primal_shift={:.6e} nlip_dual_reg={:.6e} nlip_step={:.6e} ipopt_step={:.6e} nlip_alpha_pr={:.6e} ipopt_alpha_pr={:.6e} nlip_alpha_du={:.6e} ipopt_alpha_du={:.6e} nlip_trials={} ipopt_trials={} nlip_tag={} ipopt_tag={}",
                     index,
                     divergence_kind,
                     nlip_point.iteration,
@@ -3740,6 +4809,7 @@ mod tests {
                     dual_gap,
                     mu_gap,
                     regularization_gap,
+                    step_gap,
                     alpha_pr_gap,
                     alpha_du_gap,
                     trial_gap,
@@ -3751,8 +4821,16 @@ mod tests {
                     ipopt_point.dual_inf,
                     nlip_point.mu,
                     ipopt_point.mu,
+                    nlip_point.tf,
+                    ipopt_point.tf,
+                    nlip_point.terminal_x,
+                    ipopt_point.terminal_x,
                     regularization_text(nlip_point.regularization),
                     regularization_text(ipopt_point.regularization),
+                    nlip_point.primal_shift,
+                    nlip_point.dual_regularization,
+                    nlip_point.step_inf,
+                    ipopt_point.step_inf,
                     nlip_point.alpha_pr,
                     ipopt_point.alpha_pr,
                     nlip_point.alpha_du,
@@ -3762,7 +4840,44 @@ mod tests {
                     nlip_point.step_tag,
                     ipopt_point.step_tag,
                 );
-                print_trace_window(&nlip_trace, &ipopt_trace, index);
+                print_trace_window(
+                    &nlip_trace,
+                    &ipopt_trace,
+                    index,
+                    params.transcription.intervals,
+                    params.transcription.collocation_degree,
+                );
+                let probe_start = index.saturating_sub(4);
+                let probe_end = (index + 3)
+                    .min(accepted_ipopt_solver_snapshots.len())
+                    .min(accepted_nlip_solver_snapshots.len());
+                println!(
+                    "internal IPOPT/NLIP state probes range={}..{}",
+                    probe_start, probe_end
+                );
+                for probe_index in probe_start..probe_end {
+                    if probe_index > 0 {
+                        println!(
+                            "          ipopt alpha_pr limiters: {}",
+                            ipopt_fraction_to_boundary_limiters(
+                                &accepted_ipopt_solver_snapshots[probe_index - 1],
+                                &accepted_ipopt_solver_snapshots[probe_index],
+                                &variable_bounds,
+                                ipopt_trace[probe_index].alpha_pr,
+                                params.transcription.intervals,
+                                params.transcription.collocation_degree,
+                            )
+                        );
+                    }
+                    print_internal_ipopt_probe(
+                        probe_index,
+                        &accepted_nlip_solver_snapshots[probe_index],
+                        &accepted_ipopt_solver_snapshots[probe_index],
+                        &variable_bounds,
+                        params.transcription.intervals,
+                        params.transcription.collocation_degree,
+                    );
+                }
                 return;
             }
         }

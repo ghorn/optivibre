@@ -508,6 +508,34 @@ pub struct IntermediateCallbackData<'a> {
     pub ls_trials: Index,
     /// The current primal iterate.
     pub x: &'a [Number],
+    /// The current internal slack variables.
+    pub s: &'a [Number],
+    /// The current equality constraint multipliers.
+    pub y_c: &'a [Number],
+    /// The current inequality constraint multipliers.
+    pub y_d: &'a [Number],
+    /// The current lower-bound multipliers for primal variables.
+    pub z_l: &'a [Number],
+    /// The current upper-bound multipliers for primal variables.
+    pub z_u: &'a [Number],
+    /// The current lower-bound multipliers for internal slack variables.
+    pub v_l: &'a [Number],
+    /// The current upper-bound multipliers for internal slack variables.
+    pub v_u: &'a [Number],
+    /// IPOPT's current damped stationarity residual for primal variables.
+    pub kkt_x_stationarity: &'a [Number],
+    /// IPOPT's current damped stationarity residual for internal slack variables.
+    pub kkt_slack_stationarity: &'a [Number],
+    /// IPOPT's current equality residual.
+    pub kkt_equality_residual: &'a [Number],
+    /// IPOPT's current inequality-minus-slack residual.
+    pub kkt_inequality_residual: &'a [Number],
+    /// IPOPT's current relaxed upper-slack complementarity residual.
+    pub kkt_slack_complementarity: &'a [Number],
+    /// IPOPT's current upper-slack diagonal contribution.
+    pub kkt_slack_sigma: &'a [Number],
+    /// IPOPT's current upper-slack distance.
+    pub kkt_slack_distance: &'a [Number],
 }
 
 /// A data structure to store data returned by the solver.
@@ -978,11 +1006,65 @@ impl<P: BasicProblem> Ipopt<P> {
         ls_trials: Index,
         x_count: Index,
         x: *const Number,
+        s_count: Index,
+        s: *const Number,
+        y_c_count: Index,
+        y_c: *const Number,
+        y_d_count: Index,
+        y_d: *const Number,
+        z_l_count: Index,
+        z_l: *const Number,
+        z_u_count: Index,
+        z_u: *const Number,
+        v_l_count: Index,
+        v_l: *const Number,
+        v_u_count: Index,
+        v_u: *const Number,
+        kkt_x_stationarity_count: Index,
+        kkt_x_stationarity: *const Number,
+        kkt_slack_stationarity_count: Index,
+        kkt_slack_stationarity: *const Number,
+        kkt_equality_residual_count: Index,
+        kkt_equality_residual: *const Number,
+        kkt_inequality_residual_count: Index,
+        kkt_inequality_residual: *const Number,
+        kkt_slack_complementarity_count: Index,
+        kkt_slack_complementarity: *const Number,
+        kkt_slack_sigma_count: Index,
+        kkt_slack_sigma: *const Number,
+        kkt_slack_distance_count: Index,
+        kkt_slack_distance: *const Number,
         user_data: ffi::CNLP_UserDataPtr,
     ) -> Bool {
         let ip = &mut (*(user_data as *mut Ipopt<P>));
         if let Some(callback) = ip.intermediate_callback {
-            let x = slice::from_raw_parts(x, x_count as usize);
+            fn optional_slice<'a>(ptr: *const Number, count: Index) -> &'a [Number] {
+                if count == 0 || ptr.is_null() {
+                    &[]
+                } else {
+                    unsafe { slice::from_raw_parts(ptr, count as usize) }
+                }
+            }
+            let x = optional_slice(x, x_count);
+            let s = optional_slice(s, s_count);
+            let y_c = optional_slice(y_c, y_c_count);
+            let y_d = optional_slice(y_d, y_d_count);
+            let z_l = optional_slice(z_l, z_l_count);
+            let z_u = optional_slice(z_u, z_u_count);
+            let v_l = optional_slice(v_l, v_l_count);
+            let v_u = optional_slice(v_u, v_u_count);
+            let kkt_x_stationarity =
+                optional_slice(kkt_x_stationarity, kkt_x_stationarity_count);
+            let kkt_slack_stationarity =
+                optional_slice(kkt_slack_stationarity, kkt_slack_stationarity_count);
+            let kkt_equality_residual =
+                optional_slice(kkt_equality_residual, kkt_equality_residual_count);
+            let kkt_inequality_residual =
+                optional_slice(kkt_inequality_residual, kkt_inequality_residual_count);
+            let kkt_slack_complementarity =
+                optional_slice(kkt_slack_complementarity, kkt_slack_complementarity_count);
+            let kkt_slack_sigma = optional_slice(kkt_slack_sigma, kkt_slack_sigma_count);
+            let kkt_slack_distance = optional_slice(kkt_slack_distance, kkt_slack_distance_count);
             (callback)(
                 &mut ip.nlp_interface,
                 IntermediateCallbackData {
@@ -1001,6 +1083,20 @@ impl<P: BasicProblem> Ipopt<P> {
                     alpha_pr,
                     ls_trials,
                     x,
+                    s,
+                    y_c,
+                    y_d,
+                    z_l,
+                    z_u,
+                    v_l,
+                    v_u,
+                    kkt_x_stationarity,
+                    kkt_slack_stationarity,
+                    kkt_equality_residual,
+                    kkt_inequality_residual,
+                    kkt_slack_complementarity,
+                    kkt_slack_sigma,
+                    kkt_slack_distance,
                 },
             ) as Bool
         } else {

@@ -1025,7 +1025,7 @@ fn interior_point_spral_reuses_symbolic_analysis_and_refactorizes() {
 }
 
 #[test]
-fn interior_point_native_spral_reuses_symbolic_analysis_and_refactorizes() {
+fn interior_point_native_spral_matching_reanalyses_numeric_pattern() {
     if !native_spral_available() {
         eprintln!("skipping native SPRAL test: library unavailable");
         return;
@@ -1045,9 +1045,12 @@ fn interior_point_native_spral_reuses_symbolic_analysis_and_refactorizes() {
         summary.linear_solver,
         InteriorPointLinearSolver::NativeSpralSsids
     );
-    assert_eq!(summary.profiling.sparse_symbolic_analyses, 1);
+    // IPOPT's SPRAL default uses matching ordering/scaling. That analysis is
+    // value-dependent, so the native parity path must reanalyse instead of
+    // reusing a stale symbolic object for refactorization.
+    assert!(summary.profiling.sparse_symbolic_analyses > 1);
     assert!(summary.profiling.sparse_numeric_factorizations >= 1);
-    assert!(summary.profiling.sparse_numeric_refactorizations >= 1);
+    assert_eq!(summary.profiling.sparse_numeric_refactorizations, 0);
 }
 
 #[test]

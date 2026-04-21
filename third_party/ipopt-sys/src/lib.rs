@@ -457,11 +457,114 @@ mod tests {
         _ls_trials: CNLP_Index,
         x_count: CNLP_Index,
         x: *const CNLP_Number,
+        s_count: CNLP_Index,
+        s: *const CNLP_Number,
+        y_c_count: CNLP_Index,
+        y_c: *const CNLP_Number,
+        y_d_count: CNLP_Index,
+        y_d: *const CNLP_Number,
+        z_l_count: CNLP_Index,
+        z_l: *const CNLP_Number,
+        z_u_count: CNLP_Index,
+        z_u: *const CNLP_Number,
+        v_l_count: CNLP_Index,
+        v_l: *const CNLP_Number,
+        v_u_count: CNLP_Index,
+        v_u: *const CNLP_Number,
+        kkt_x_stationarity_count: CNLP_Index,
+        kkt_x_stationarity: *const CNLP_Number,
+        kkt_slack_stationarity_count: CNLP_Index,
+        kkt_slack_stationarity: *const CNLP_Number,
+        kkt_equality_residual_count: CNLP_Index,
+        kkt_equality_residual: *const CNLP_Number,
+        kkt_inequality_residual_count: CNLP_Index,
+        kkt_inequality_residual: *const CNLP_Number,
+        kkt_slack_complementarity_count: CNLP_Index,
+        kkt_slack_complementarity: *const CNLP_Number,
+        kkt_slack_sigma_count: CNLP_Index,
+        kkt_slack_sigma: *const CNLP_Number,
+        kkt_slack_distance_count: CNLP_Index,
+        kkt_slack_distance: *const CNLP_Number,
         _user_data: CNLP_UserDataPtr,
     ) -> CNLP_Bool {
         assert_eq!(x_count, 4);
         let x = unsafe { slice::from_raw_parts(x, x_count as usize) };
         assert_eq!(x.len(), 4);
+        if s_count > 0 {
+            let s = unsafe { slice::from_raw_parts(s, s_count as usize) };
+            assert_eq!(s.len(), s_count as usize);
+        }
+        if y_c_count > 0 {
+            let y_c = unsafe { slice::from_raw_parts(y_c, y_c_count as usize) };
+            assert_eq!(y_c.len(), y_c_count as usize);
+        }
+        if y_d_count > 0 {
+            let y_d = unsafe { slice::from_raw_parts(y_d, y_d_count as usize) };
+            assert_eq!(y_d.len(), y_d_count as usize);
+        }
+        if z_l_count > 0 {
+            let z_l = unsafe { slice::from_raw_parts(z_l, z_l_count as usize) };
+            assert_eq!(z_l.len(), z_l_count as usize);
+        }
+        if z_u_count > 0 {
+            let z_u = unsafe { slice::from_raw_parts(z_u, z_u_count as usize) };
+            assert_eq!(z_u.len(), z_u_count as usize);
+        }
+        if v_l_count > 0 {
+            let v_l = unsafe { slice::from_raw_parts(v_l, v_l_count as usize) };
+            assert_eq!(v_l.len(), v_l_count as usize);
+        }
+        if v_u_count > 0 {
+            let v_u = unsafe { slice::from_raw_parts(v_u, v_u_count as usize) };
+            assert_eq!(v_u.len(), v_u_count as usize);
+        }
+        if kkt_x_stationarity_count > 0 {
+            let values = unsafe {
+                slice::from_raw_parts(kkt_x_stationarity, kkt_x_stationarity_count as usize)
+            };
+            assert_eq!(values.len(), kkt_x_stationarity_count as usize);
+        }
+        if kkt_slack_stationarity_count > 0 {
+            let values = unsafe {
+                slice::from_raw_parts(kkt_slack_stationarity, kkt_slack_stationarity_count as usize)
+            };
+            assert_eq!(values.len(), kkt_slack_stationarity_count as usize);
+        }
+        if kkt_equality_residual_count > 0 {
+            let values = unsafe {
+                slice::from_raw_parts(kkt_equality_residual, kkt_equality_residual_count as usize)
+            };
+            assert_eq!(values.len(), kkt_equality_residual_count as usize);
+        }
+        if kkt_inequality_residual_count > 0 {
+            let values = unsafe {
+                slice::from_raw_parts(
+                    kkt_inequality_residual,
+                    kkt_inequality_residual_count as usize,
+                )
+            };
+            assert_eq!(values.len(), kkt_inequality_residual_count as usize);
+        }
+        if kkt_slack_complementarity_count > 0 {
+            let values = unsafe {
+                slice::from_raw_parts(
+                    kkt_slack_complementarity,
+                    kkt_slack_complementarity_count as usize,
+                )
+            };
+            assert_eq!(values.len(), kkt_slack_complementarity_count as usize);
+        }
+        if kkt_slack_sigma_count > 0 {
+            let values =
+                unsafe { slice::from_raw_parts(kkt_slack_sigma, kkt_slack_sigma_count as usize) };
+            assert_eq!(values.len(), kkt_slack_sigma_count as usize);
+        }
+        if kkt_slack_distance_count > 0 {
+            let values = unsafe {
+                slice::from_raw_parts(kkt_slack_distance, kkt_slack_distance_count as usize)
+            };
+            assert_eq!(values.len(), kkt_slack_distance_count as usize);
+        }
         (inf_pr >= 1e-4) as CNLP_Bool
     }
 }

@@ -28,8 +28,8 @@ use crate::{
 };
 #[cfg(feature = "ipopt")]
 use crate::{
-    IpoptIterationSnapshot, IpoptOptions, IpoptSolveError, IpoptSummary, solve_nlp_ipopt,
-    solve_nlp_ipopt_with_callback,
+    IpoptIterationSnapshot, IpoptOptions, IpoptPartialSolution, IpoptSolveError, IpoptSummary,
+    solve_nlp_ipopt, solve_nlp_ipopt_with_callback,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -219,6 +219,94 @@ pub struct ConstraintBounds {
 pub struct RuntimeNlpBounds {
     pub variables: ConstraintBounds,
     pub inequalities: ConstraintBounds,
+}
+
+#[cfg(feature = "ipopt")]
+fn fixed_bound_value(lower: Option<f64>, upper: Option<f64>) -> Option<f64> {
+    let (Some(lower), Some(upper)) = (lower, upper) else {
+        return None;
+    };
+    let tolerance = 1.0e-12 * lower.abs().max(upper.abs()).max(1.0);
+    ((lower - upper).abs() <= tolerance).then_some(0.5 * (lower + upper))
+}
+
+#[cfg(feature = "ipopt")]
+fn expand_ipopt_fixed_variable_snapshot(
+    snapshot: &IpoptIterationSnapshot,
+    full_dimension: usize,
+    bounds: Option<&ConstraintBounds>,
+) -> IpoptIterationSnapshot {
+    if snapshot.x.len() == full_dimension {
+        return snapshot.clone();
+    }
+    let Some(bounds) = bounds else {
+        return snapshot.clone();
+    };
+    let reduced_dimension = snapshot.x.len();
+    let mut expanded = Vec::with_capacity(full_dimension);
+    let mut reduced_index = 0;
+    let mut fixed_mask = Vec::with_capacity(full_dimension);
+    for index in 0..full_dimension {
+        let lower = bounds
+            .lower
+            .as_ref()
+            .and_then(|values| values.get(index))
+            .and_then(|value| *value);
+        let upper = bounds
+            .upper
+            .as_ref()
+            .and_then(|values| values.get(index))
+            .and_then(|value| *value);
+        if let Some(fixed_value) = fixed_bound_value(lower, upper) {
+            expanded.push(fixed_value);
+            fixed_mask.push(true);
+        } else if let Some(&value) = snapshot.x.get(reduced_index) {
+            expanded.push(value);
+            fixed_mask.push(false);
+            reduced_index += 1;
+        } else {
+            return snapshot.clone();
+        }
+    }
+    if reduced_index != snapshot.x.len() {
+        return snapshot.clone();
+    }
+    let mut snapshot = snapshot.clone();
+    snapshot.x = expanded;
+    if snapshot.lower_bound_multipliers.len() == reduced_dimension {
+        snapshot.lower_bound_multipliers =
+            expand_compact_ipopt_vector(&snapshot.lower_bound_multipliers, &fixed_mask);
+    }
+    if snapshot.upper_bound_multipliers.len() == reduced_dimension {
+        snapshot.upper_bound_multipliers =
+            expand_compact_ipopt_vector(&snapshot.upper_bound_multipliers, &fixed_mask);
+    }
+    if snapshot.kkt_x_stationarity.len() == reduced_dimension {
+        snapshot.kkt_x_stationarity =
+            expand_compact_ipopt_vector(&snapshot.kkt_x_stationarity, &fixed_mask);
+    }
+    snapshot
+}
+
+#[cfg(feature = "ipopt")]
+fn expand_compact_ipopt_vector(values: &[f64], fixed_mask: &[bool]) -> Vec<f64> {
+    let mut expanded = Vec::with_capacity(fixed_mask.len());
+    let mut reduced_index = 0;
+    for &fixed in fixed_mask {
+        if fixed {
+            expanded.push(0.0);
+        } else if let Some(&value) = values.get(reduced_index) {
+            expanded.push(value);
+            reduced_index += 1;
+        } else {
+            return values.to_vec();
+        }
+    }
+    if reduced_index == values.len() {
+        expanded
+    } else {
+        values.to_vec()
+    }
 }
 
 #[derive(Debug)]
@@ -1352,23 +1440,42 @@ impl DynamicCompiledJitNlp {
                 base: &bound_problem,
                 scaling: scaling.clone(),
             };
+            let scaled_variable_bounds = scaled_problem.variable_bounds();
+            let full_dimension = x0_values.len();
             let mut callback = callback;
             solve_nlp_ipopt_with_callback(
                 &scaled_problem,
                 &x0_values,
                 &parameter_storage,
                 options,
-                |snapshot| callback(&scaling.transform_ipopt_snapshot(snapshot)),
+                |snapshot| {
+                    let snapshot = expand_ipopt_fixed_variable_snapshot(
+                        snapshot,
+                        full_dimension,
+                        scaled_variable_bounds.as_ref(),
+                    );
+                    callback(&scaling.transform_ipopt_snapshot(&snapshot));
+                },
             )
             .map(|summary| scaling.transform_ipopt_summary(&summary))
             .map_err(|error| transform_ipopt_error(&scaling, error))
         } else {
+            let variable_bounds = bound_problem.variable_bounds();
+            let full_dimension = x0_values.len();
+            let mut callback = callback;
             solve_nlp_ipopt_with_callback(
                 &bound_problem,
                 &x0_values,
                 &parameter_storage,
                 options,
-                callback,
+                |snapshot| {
+                    let snapshot = expand_ipopt_fixed_variable_snapshot(
+                        snapshot,
+                        full_dimension,
+                        variable_bounds.as_ref(),
+                    );
+                    callback(&snapshot);
+                },
             )
         }
     }
@@ -1431,11 +1538,26 @@ impl DynamicCompiledJitNlp {
                 actual: scaling.constraints.len(),
             });
         }
+        let variable = invert_scaling_vector(validate_scaling_vector(
+            problem.dimension(),
+            scaling.variables.clone(),
+            true,
+        )?);
+        let constraint = invert_scaling_vector(validate_scaling_vector(
+            problem.equality_count() + problem.base.inequality_base_count(),
+            scaling.constraints.clone(),
+            false,
+        )?);
+        if !scaling.objective.is_finite() || scaling.objective <= 0.0 {
+            return Err(RuntimeNlpBoundsError::InvalidObjectiveScaling {
+                value: scaling.objective,
+            });
+        }
         let flat = FlatNlpScaling {
-            variable: scaling.variables.clone(),
-            equality: scaling.constraints[..equality_count].to_vec(),
-            inequality: scaling.constraints[equality_count..].to_vec(),
-            objective: scaling.objective,
+            variable,
+            equality: constraint[..equality_count].to_vec(),
+            inequality: constraint[equality_count..].to_vec(),
+            objective: 1.0 / scaling.objective,
         };
         AppliedNlpScaling::from_runtime_problem(problem, flat).map(Some)
     }
@@ -1512,6 +1634,7 @@ fn transform_ipopt_error(scaling: &AppliedNlpScaling, error: IpoptSolveError) ->
             status,
             iterations,
             snapshots,
+            partial_solution,
             journal_output,
             profiling,
         } => IpoptSolveError::Solve {
@@ -1521,6 +1644,9 @@ fn transform_ipopt_error(scaling: &AppliedNlpScaling, error: IpoptSolveError) ->
                 .iter()
                 .map(|snapshot| scaling.transform_ipopt_snapshot(snapshot))
                 .collect(),
+            partial_solution: partial_solution.map(|partial| {
+                Box::new(scaling.transform_ipopt_partial_solution(partial.as_ref()))
+            }),
             journal_output,
             profiling,
         },
@@ -1764,6 +1890,7 @@ where
                 status,
                 iterations,
                 snapshots,
+                partial_solution,
                 journal_output,
                 profiling,
             } => IpoptSolveError::Solve {
@@ -1773,6 +1900,9 @@ where
                     .iter()
                     .map(|snapshot| scaling.transform_ipopt_snapshot(snapshot))
                     .collect(),
+                partial_solution: partial_solution.map(|partial| {
+                    Box::new(scaling.transform_ipopt_partial_solution(partial.as_ref()))
+                }),
                 journal_output,
                 profiling,
             },
@@ -2156,23 +2286,42 @@ where
                 base: &bound_problem,
                 scaling: scaling.clone(),
             };
+            let scaled_variable_bounds = scaled_problem.variable_bounds();
+            let full_dimension = x0_values.len();
             let mut callback = callback;
             solve_nlp_ipopt_with_callback(
                 &scaled_problem,
                 &x0_values,
                 &parameter_storage,
                 options,
-                |snapshot| callback(&scaling.transform_ipopt_snapshot(snapshot)),
+                |snapshot| {
+                    let snapshot = expand_ipopt_fixed_variable_snapshot(
+                        snapshot,
+                        full_dimension,
+                        scaled_variable_bounds.as_ref(),
+                    );
+                    callback(&scaling.transform_ipopt_snapshot(&snapshot));
+                },
             )
             .map(|summary| scaling.transform_ipopt_summary(&summary))
             .map_err(|error| self.transform_ipopt_error(&scaling, error))
         } else {
+            let variable_bounds = bound_problem.variable_bounds();
+            let full_dimension = x0_values.len();
+            let mut callback = callback;
             solve_nlp_ipopt_with_callback(
                 &bound_problem,
                 &x0_values,
                 &parameter_storage,
                 options,
-                callback,
+                |snapshot| {
+                    let snapshot = expand_ipopt_fixed_variable_snapshot(
+                        snapshot,
+                        full_dimension,
+                        variable_bounds.as_ref(),
+                    );
+                    callback(&snapshot);
+                },
             )
         }
     }
@@ -2497,6 +2646,14 @@ impl AppliedNlpScaling {
             .collect()
     }
 
+    fn unscale_inequality_values(&self, values: &[f64]) -> Vec<f64> {
+        values
+            .iter()
+            .zip(self.inequality.iter())
+            .map(|(value, scale)| value / scale)
+            .collect()
+    }
+
     fn unscale_bound_multipliers(&self, multipliers: &[f64]) -> Vec<f64> {
         multipliers
             .iter()
@@ -2600,6 +2757,32 @@ impl AppliedNlpScaling {
     ) -> InteriorPointIterationSnapshot {
         let mut snapshot = snapshot.clone();
         snapshot.x = self.unscale_x(&snapshot.x);
+        snapshot.slack_primal = snapshot
+            .slack_primal
+            .as_ref()
+            .map(|values| self.unscale_inequality_values(values));
+        snapshot.equality_multipliers = snapshot
+            .equality_multipliers
+            .as_ref()
+            .map(|multipliers| self.unscale_equality_multipliers(multipliers));
+        snapshot.inequality_multipliers = snapshot
+            .inequality_multipliers
+            .as_ref()
+            .map(|multipliers| self.unscale_inequality_multipliers(multipliers));
+        snapshot.slack_multipliers = snapshot
+            .slack_multipliers
+            .as_ref()
+            .map(|multipliers| self.unscale_inequality_multipliers(multipliers));
+        snapshot.lower_bound_multipliers = snapshot
+            .lower_bound_multipliers
+            .as_ref()
+            .map(|multipliers| self.unscale_bound_multipliers(multipliers));
+        snapshot.upper_bound_multipliers = snapshot
+            .upper_bound_multipliers
+            .as_ref()
+            .map(|multipliers| self.unscale_bound_multipliers(multipliers));
+        // KKT diagnostic vectors are intentionally left in internal solver units so NLIP and
+        // IPOPT can be compared before user-unit scaling is applied to display quantities.
         snapshot.objective = self.unscale_objective(snapshot.objective);
         snapshot
     }
@@ -2651,8 +2834,47 @@ impl AppliedNlpScaling {
     ) -> IpoptIterationSnapshot {
         let mut snapshot = snapshot.clone();
         snapshot.x = self.unscale_x(&snapshot.x);
+        snapshot.internal_slack = self.unscale_inequality_values(&snapshot.internal_slack);
+        snapshot.equality_multipliers =
+            self.unscale_equality_multipliers(&snapshot.equality_multipliers);
+        snapshot.inequality_multipliers =
+            self.unscale_inequality_multipliers(&snapshot.inequality_multipliers);
+        snapshot.lower_bound_multipliers =
+            self.unscale_bound_multipliers(&snapshot.lower_bound_multipliers);
+        snapshot.upper_bound_multipliers =
+            self.unscale_bound_multipliers(&snapshot.upper_bound_multipliers);
+        snapshot.slack_lower_bound_multipliers =
+            self.unscale_inequality_multipliers(&snapshot.slack_lower_bound_multipliers);
+        snapshot.slack_upper_bound_multipliers =
+            self.unscale_inequality_multipliers(&snapshot.slack_upper_bound_multipliers);
+        // KKT diagnostic vectors remain in IPOPT's internal solver units. Only the slack distance
+        // is state-like and is scaled back for direct comparison against NLIP's positive slack.
+        snapshot.kkt_slack_distance = self.unscale_inequality_values(&snapshot.kkt_slack_distance);
         snapshot.objective = self.unscale_objective(snapshot.objective);
         snapshot
+    }
+
+    #[cfg(feature = "ipopt")]
+    fn transform_ipopt_partial_solution(
+        &self,
+        partial: &IpoptPartialSolution,
+    ) -> IpoptPartialSolution {
+        IpoptPartialSolution {
+            x: self.unscale_x(&partial.x),
+            lower_bound_multipliers: self
+                .unscale_bound_multipliers(&partial.lower_bound_multipliers),
+            upper_bound_multipliers: self
+                .unscale_bound_multipliers(&partial.upper_bound_multipliers),
+            equality_multipliers: self.unscale_equality_multipliers(&partial.equality_multipliers),
+            inequality_multipliers: self
+                .unscale_inequality_multipliers(&partial.inequality_multipliers),
+            objective: self.unscale_objective(partial.objective),
+            equality_inf_norm: partial.equality_inf_norm,
+            inequality_inf_norm: partial.inequality_inf_norm,
+            primal_inf_norm: partial.primal_inf_norm,
+            dual_inf_norm: partial.dual_inf_norm,
+            complementarity_inf_norm: partial.complementarity_inf_norm,
+        }
     }
 
     #[cfg(feature = "ipopt")]

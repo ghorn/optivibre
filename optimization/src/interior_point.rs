@@ -3,12 +3,12 @@ use clarabel::qdldl::{QDLDLFactorisation, QDLDLSettings};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use spral_ssids::{
-    AnalyseInfo as SpralAnalyseInfo, Inertia as SpralInertia, NativeSpral as NativeSpralLibrary,
-    NativeSpralSession, NumericFactor as SpralNumericFactor,
-    NumericFactorOptions as SpralNumericFactorOptions, OrderingStrategy as SpralOrderingStrategy,
-    PivotMethod as SpralPivotMethod, SsidsOptions as SpralSsidsOptions,
-    SymbolicFactor as SpralSymbolicFactor, SymmetricCscMatrix as SpralSymmetricCscMatrix,
-    analyse as spral_analyse,
+    AnalyseInfo as SpralAnalyseInfo, Inertia as SpralInertia,
+    NativeOrdering as SpralNativeOrdering, NativeSpral as NativeSpralLibrary, NativeSpralSession,
+    NumericFactor as SpralNumericFactor, NumericFactorOptions as SpralNumericFactorOptions,
+    OrderingStrategy as SpralOrderingStrategy, PivotMethod as SpralPivotMethod,
+    SsidsOptions as SpralSsidsOptions, SymbolicFactor as SpralSymbolicFactor,
+    SymmetricCscMatrix as SpralSymmetricCscMatrix, analyse as spral_analyse,
     current_factorization_progress as spral_current_factorization_progress,
     factorize as spral_factorize,
 };
@@ -22,16 +22,16 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use super::{
-    BackendTimingMetadata, BoundConstraints, CCS, CompiledNlpProblem, DUAL_INF_LABEL, EQ_INF_LABEL,
-    EvalTimingStat, FilterAcceptanceMode, FilterInfo, INEQ_INF_LABEL, Index, OVERALL_INF_LABEL,
-    PRIMAL_INF_LABEL, ParameterMatrix, SolverAdapterTiming, SqpEventLegendState,
-    augment_inequality_values, boxed_line, choose_summary_duration_unit, collect_bound_constraints,
-    compact_duration_text, complementarity_inf_norm, declared_box_constraint_count,
-    dense_fill_percent, fmt_duration_in_unit, fmt_optional_duration_in_unit, inf_norm,
-    log_boxed_section, lower_tri_fill_percent, positive_part_inf_norm, scaled_overall_inf_norm,
-    sci_text, split_augmented_inequality_multipliers, style_bold, style_cyan_bold,
-    style_green_bold, style_iteration_label_cell, style_metric_against_tolerance, style_red_bold,
-    style_yellow_bold, time_callback, validate_nlp_problem_shapes, validate_parameter_inputs,
+    BackendTimingMetadata, BoundConstraints, CCS, CompiledNlpProblem, ConstraintBounds,
+    DUAL_INF_LABEL, EQ_INF_LABEL, EvalTimingStat, FilterAcceptanceMode, FilterInfo, INEQ_INF_LABEL,
+    Index, OVERALL_INF_LABEL, PRIMAL_INF_LABEL, ParameterMatrix, SolverAdapterTiming,
+    SqpEventLegendState, boxed_line, choose_summary_duration_unit, compact_duration_text,
+    complementarity_inf_norm, declared_box_constraint_count, dense_fill_percent,
+    fmt_duration_in_unit, fmt_optional_duration_in_unit, inf_norm, log_boxed_section,
+    lower_tri_fill_percent, positive_part_inf_norm, scaled_overall_inf_norm, sci_text, style_bold,
+    style_cyan_bold, style_green_bold, style_iteration_label_cell, style_metric_against_tolerance,
+    style_red_bold, style_yellow_bold, time_callback, validate_nlp_problem_shapes,
+    validate_parameter_inputs,
 };
 
 const IP_COMP_INF_LABEL: &str = "‖s∘z‖∞";
@@ -222,6 +222,7 @@ pub struct InteriorPointOptions {
     pub bound_frac: f64,
     pub slack_bound_push: f64,
     pub slack_bound_frac: f64,
+    pub bound_relax_factor: f64,
     pub line_search_beta: f64,
     pub line_search_c1: f64,
     pub min_step: f64,
@@ -249,6 +250,7 @@ pub struct InteriorPointOptions {
     pub mu_superlinear_decrease_power: f64,
     pub mu_allow_fast_monotone_decrease: bool,
     pub mu_target: f64,
+    pub kappa_d: f64,
     pub kappa_sigma: f64,
     pub regularization: f64,
     pub first_hessian_perturbation: f64,
@@ -257,7 +259,10 @@ pub struct InteriorPointOptions {
     pub regularization_growth_factor: f64,
     pub regularization_decay_factor: f64,
     pub regularization_max: f64,
+    pub jacobian_regularization_value: f64,
+    pub jacobian_regularization_exponent: f64,
     pub second_order_correction: bool,
+    pub restoration_phase: bool,
     pub tiny_step_tol: f64,
     pub watchdog_shortened_iter_trigger: Index,
     pub watchdog_trial_iter_max: Index,
@@ -281,7 +286,7 @@ impl Default for InteriorPointOptions {
             complementarity_tol: 1e-6,
             overall_tol: 1e-6,
             overall_scale_max: 100.0,
-            fraction_to_boundary: 0.995,
+            fraction_to_boundary: 0.99,
             alpha_for_y: InteriorPointAlphaForYStrategy::Primal,
             alpha_for_y_tol: 10.0,
             bound_mult_init_method: InteriorPointBoundMultiplierInitMethod::Constant,
@@ -292,6 +297,7 @@ impl Default for InteriorPointOptions {
             bound_frac: 1e-2,
             slack_bound_push: 1e-2,
             slack_bound_frac: 1e-2,
+            bound_relax_factor: 1e-8,
             line_search_beta: 0.5,
             line_search_c1: 1e-4,
             min_step: 1e-8,
@@ -319,6 +325,7 @@ impl Default for InteriorPointOptions {
             mu_superlinear_decrease_power: 1.5,
             mu_allow_fast_monotone_decrease: true,
             mu_target: 0.0,
+            kappa_d: 1e-5,
             kappa_sigma: 1e10,
             regularization: 1e-6,
             first_hessian_perturbation: 1e-4,
@@ -327,9 +334,12 @@ impl Default for InteriorPointOptions {
             regularization_growth_factor: 8.0,
             regularization_decay_factor: 1.0 / 3.0,
             regularization_max: 1e20,
+            jacobian_regularization_value: 1e-8,
+            jacobian_regularization_exponent: 0.25,
             second_order_correction: true,
-            tiny_step_tol: 1e-6,
-            watchdog_shortened_iter_trigger: 3,
+            restoration_phase: true,
+            tiny_step_tol: 10.0 * f64::EPSILON,
+            watchdog_shortened_iter_trigger: 10,
             watchdog_trial_iter_max: 3,
             mu_min: 1e-12,
             linear_solver: InteriorPointLinearSolver::SpralSsids,
@@ -345,7 +355,7 @@ impl Default for InteriorPointOptions {
 
 pub fn format_nlip_settings_summary(options: &InteriorPointOptions) -> String {
     format!(
-        "filter={}; linear_solver={}; linear_debug={}; spral=[pivot={}, action={}, small={}, u={}]; beta={}; c1={}; min_step={}; tau={}; alpha_y=[strategy={}, tol={}] ; init=[bound_push={}, bound_frac={}, slack_push={}, slack_frac={}] ; dual_init=[method={}, val={}, least_square={}, max={}] ; regularization={} (first={}, first_growth={}, retries={}, growth={}, decay={}, max={}); soc={}; watchdog=[trigger={}, max={}]; filter_reset=[max={}, trigger={}]; tiny_step={}; mu=[init={}, target={}, min={}, barrier_tol={}, linear={}, superlinear={}, fast={}]; theta=[{}, {}]; acceptable_iter={}",
+        "filter={}; linear_solver={}; linear_debug={}; spral=[pivot={}, action={}, small={}, u={}]; beta={}; c1={}; min_step={}; tau={}; alpha_y=[strategy={}, tol={}] ; init=[bound_push={}, bound_frac={}, slack_push={}, slack_frac={}, bound_relax={}]; dual_init=[method={}, val={}, least_square={}, max={}] ; regularization={} (first={}, first_growth={}, retries={}, growth={}, decay={}, max={}, jacobian={}, jac_exp={}); soc={}; restoration={}; watchdog=[trigger={}, max={}]; filter_reset=[max={}, trigger={}]; tiny_step={}; mu=[init={}, target={}, min={}, barrier_tol={}, linear={}, superlinear={}, fast={}, kappa_d={}]; theta=[{}, {}]; acceptable_iter={}",
         "on",
         options.linear_solver.label(),
         format_nlip_linear_debug_summary(options.linear_debug.as_ref()),
@@ -367,6 +377,7 @@ pub fn format_nlip_settings_summary(options: &InteriorPointOptions) -> String {
         sci_text(options.bound_frac),
         sci_text(options.slack_bound_push),
         sci_text(options.slack_bound_frac),
+        sci_text(options.bound_relax_factor),
         options.bound_mult_init_method.label(),
         sci_text(options.bound_mult_init_val),
         if options.least_square_init_duals {
@@ -382,7 +393,14 @@ pub fn format_nlip_settings_summary(options: &InteriorPointOptions) -> String {
         sci_text(options.regularization_growth_factor),
         sci_text(options.regularization_decay_factor),
         sci_text(options.regularization_max),
+        sci_text(options.jacobian_regularization_value),
+        sci_text(options.jacobian_regularization_exponent),
         if options.second_order_correction {
+            "on"
+        } else {
+            "off"
+        },
+        if options.restoration_phase {
             "on"
         } else {
             "off"
@@ -403,6 +421,7 @@ pub fn format_nlip_settings_summary(options: &InteriorPointOptions) -> String {
         } else {
             "off"
         },
+        sci_text(options.kappa_d),
         sci_text(options.theta_min_fact),
         sci_text(options.theta_max_fact),
         options.acceptable_iter,
@@ -592,6 +611,7 @@ pub enum InteriorPointIterationEvent {
     BoundMultiplierSafeguardApplied,
     BarrierParameterUpdated,
     AdaptiveRegularizationUsed,
+    RestorationPhaseAccepted,
     TinyStep,
     MaxIterationsReached,
 }
@@ -638,6 +658,10 @@ pub fn nlip_event_legend_entries_for_events(
                 'V',
                 "V=adaptive KKT regularization increased before acceptance",
             )),
+            InteriorPointIterationEvent::RestorationPhaseAccepted => entries.push((
+                'R',
+                "R=restoration phase returned an acceptable original iterate",
+            )),
             InteriorPointIterationEvent::TinyStep => {
                 entries.push(('T', "T=accepted step was tiny"))
             }
@@ -671,8 +695,9 @@ pub fn nlip_event_codes(snapshot: &InteriorPointIterationSnapshot) -> String {
     nlip_event_codes_for_events(&snapshot.events)
 }
 
-const NLIP_EVENT_SLOT_ORDER: [char; 12] =
-    ['L', 'F', 's', 'S', 'A', 'W', 'X', 'B', 'U', 'V', 'T', 'M'];
+const NLIP_EVENT_SLOT_ORDER: [char; 13] = [
+    'L', 'F', 's', 'S', 'A', 'W', 'X', 'B', 'U', 'V', 'R', 'T', 'M',
+];
 const NLIP_EVENT_CELL_WIDTH: usize = NLIP_EVENT_SLOT_ORDER.len();
 
 fn nlip_event_slot_codes(snapshot: &InteriorPointIterationSnapshot) -> String {
@@ -731,6 +756,26 @@ pub struct InteriorPointIterationSnapshot {
     pub iteration: Index,
     pub phase: InteriorPointIterationPhase,
     pub x: Vec<f64>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub slack_primal: Option<Vec<f64>>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub equality_multipliers: Option<Vec<f64>>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub inequality_multipliers: Option<Vec<f64>>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub slack_multipliers: Option<Vec<f64>>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub lower_bound_multipliers: Option<Vec<f64>>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub upper_bound_multipliers: Option<Vec<f64>>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub kkt_inequality_residual: Option<Vec<f64>>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub kkt_slack_stationarity: Option<Vec<f64>>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub kkt_slack_complementarity: Option<Vec<f64>>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub kkt_slack_sigma: Option<Vec<f64>>,
     pub objective: f64,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub barrier_objective: Option<f64>,
@@ -791,10 +836,23 @@ pub struct InteriorPointDirectionDiagnostics {
     pub d_lambda_inf: f64,
     pub ds_inf: f64,
     pub dz_inf: f64,
+    pub regularization_size: f64,
+    pub primal_diagonal_shift: f64,
+    pub dual_regularization: f64,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub alpha_pr_limiter: Option<InteriorPointBoundaryLimiter>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub alpha_du_limiter: Option<InteriorPointBoundaryLimiter>,
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub alpha_pr_limiters: Vec<InteriorPointBoundaryLimiter>,
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub alpha_du_limiters: Vec<InteriorPointBoundaryLimiter>,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -948,8 +1006,11 @@ pub enum InteriorPointSolveError {
 struct NewtonDirection {
     dx: Vec<f64>,
     d_lambda: Vec<f64>,
+    d_ineq: Vec<f64>,
     ds: Vec<f64>,
     dz: Vec<f64>,
+    dz_lower: Vec<f64>,
+    dz_upper: Vec<f64>,
     solver_used: InteriorPointLinearSolver,
     regularization_used: f64,
     dual_regularization_used: f64,
@@ -962,12 +1023,20 @@ struct NewtonDirection {
 struct AcceptedInteriorPointTrial {
     x: Vec<f64>,
     lambda: Vec<f64>,
+    inequality_multipliers: Vec<f64>,
     slack: Vec<f64>,
     z: Vec<f64>,
+    z_lower: Vec<f64>,
+    z_upper: Vec<f64>,
+    kkt_inequality_residual: Vec<f64>,
+    kkt_slack_stationarity: Vec<f64>,
+    kkt_slack_complementarity: Vec<f64>,
+    kkt_slack_sigma: Vec<f64>,
     objective: f64,
     barrier_objective: f64,
     equality_inf: f64,
     inequality_inf: f64,
+    primal_inf: f64,
     dual_inf: f64,
     complementarity_inf: f64,
     overall_inf: f64,
@@ -993,9 +1062,9 @@ struct AcceptedInteriorPointTrial {
 
 struct AcceptedTrialMultiplierState {
     z: Vec<f64>,
+    z_lower: Vec<f64>,
+    z_upper: Vec<f64>,
     dual_inf: f64,
-    complementarity_inf: f64,
-    overall_inf: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1020,6 +1089,381 @@ struct InteriorPointWatchdogState {
     remaining_iters: Index,
     shortened_step_streak: Index,
     tiny_step_streak: Index,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RestorationJacobianEntry {
+    Original(Index),
+    PositiveResidual,
+    NegativeResidual,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RestorationHessianEntry {
+    original: Option<Index>,
+    proximity_diagonal_index: Option<Index>,
+}
+
+struct EqualityRestorationNlp<'a> {
+    original: &'a dyn CompiledNlpProblem,
+    x_ref: Vec<f64>,
+    dr2_x: Vec<f64>,
+    rho: f64,
+    eta: f64,
+    equality_jacobian_ccs: CCS,
+    equality_jacobian_entries: Vec<RestorationJacobianEntry>,
+    inequality_jacobian_ccs: CCS,
+    lagrangian_hessian_ccs: CCS,
+    lagrangian_hessian_entries: Vec<RestorationHessianEntry>,
+    bounds: ConstraintBounds,
+}
+
+impl<'a> EqualityRestorationNlp<'a> {
+    fn new(
+        original: &'a dyn CompiledNlpProblem,
+        x_ref: &[f64],
+        rho: f64,
+        eta: f64,
+    ) -> Option<Self> {
+        if original.inequality_count() != 0 {
+            return None;
+        }
+        let dimension = original.dimension();
+        let equality_count = original.equality_count();
+        if equality_count == 0 {
+            return None;
+        }
+        let total_dimension = dimension + 2 * equality_count;
+        let dr2_x = x_ref
+            .iter()
+            .map(|value| {
+                let scale = value.abs().max(1.0);
+                1.0 / (scale * scale)
+            })
+            .collect::<Vec<_>>();
+        let (equality_jacobian_ccs, equality_jacobian_entries) =
+            build_equality_restoration_jacobian_ccs(original.equality_jacobian_ccs());
+        let (lagrangian_hessian_ccs, lagrangian_hessian_entries) =
+            build_equality_restoration_hessian_ccs(
+                original.lagrangian_hessian_ccs(),
+                dimension,
+                total_dimension,
+            );
+        let mut lower = vec![None; total_dimension];
+        let mut upper = vec![None; total_dimension];
+        if let Some(original_bounds) = original.variable_bounds() {
+            if let Some(values) = original_bounds.lower {
+                for (index, value) in values.into_iter().enumerate().take(dimension) {
+                    lower[index] = value;
+                }
+            }
+            if let Some(values) = original_bounds.upper {
+                for (index, value) in values.into_iter().enumerate().take(dimension) {
+                    upper[index] = value;
+                }
+            }
+        }
+        for value in lower.iter_mut().skip(dimension) {
+            *value = Some(0.0);
+        }
+        Some(Self {
+            original,
+            x_ref: x_ref.to_vec(),
+            dr2_x,
+            rho,
+            eta,
+            equality_jacobian_ccs,
+            equality_jacobian_entries,
+            inequality_jacobian_ccs: CCS::empty(0, total_dimension),
+            lagrangian_hessian_ccs,
+            lagrangian_hessian_entries,
+            bounds: ConstraintBounds {
+                lower: Some(lower),
+                upper: Some(upper),
+            },
+        })
+    }
+
+    fn original_dimension(&self) -> Index {
+        self.x_ref.len()
+    }
+
+    fn equality_residual_count(&self) -> Index {
+        self.original.equality_count()
+    }
+
+    fn split_x<'x>(&self, x: &'x [f64]) -> (&'x [f64], &'x [f64], &'x [f64]) {
+        let n = self.original_dimension();
+        let m = self.equality_residual_count();
+        (&x[..n], &x[n..n + m], &x[n + m..n + 2 * m])
+    }
+}
+
+impl CompiledNlpProblem for EqualityRestorationNlp<'_> {
+    fn dimension(&self) -> Index {
+        self.original_dimension() + 2 * self.equality_residual_count()
+    }
+
+    fn parameter_count(&self) -> Index {
+        self.original.parameter_count()
+    }
+
+    fn parameter_ccs(&self, parameter_index: Index) -> &CCS {
+        self.original.parameter_ccs(parameter_index)
+    }
+
+    fn variable_bounds(&self) -> Option<ConstraintBounds> {
+        Some(self.bounds.clone())
+    }
+
+    fn equality_count(&self) -> Index {
+        self.equality_residual_count()
+    }
+
+    fn inequality_count(&self) -> Index {
+        0
+    }
+
+    fn objective_value(&self, x: &[f64], _parameters: &[ParameterMatrix<'_>]) -> f64 {
+        let (x_original, negative_residual, positive_residual) = self.split_x(x);
+        let residual_penalty =
+            negative_residual.iter().sum::<f64>() + positive_residual.iter().sum::<f64>();
+        let proximity = x_original
+            .iter()
+            .zip(self.x_ref.iter())
+            .zip(self.dr2_x.iter())
+            .map(|((value, reference), dr2)| dr2 * (value - reference).powi(2))
+            .sum::<f64>();
+        self.rho * residual_penalty + 0.5 * self.eta * proximity
+    }
+
+    fn objective_gradient(&self, x: &[f64], _parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
+        let n = self.original_dimension();
+        let m = self.equality_residual_count();
+        for index in 0..n {
+            out[index] = self.eta * self.dr2_x[index] * (x[index] - self.x_ref[index]);
+        }
+        for value in &mut out[n..n + 2 * m] {
+            *value = self.rho;
+        }
+    }
+
+    fn equality_jacobian_ccs(&self) -> &CCS {
+        &self.equality_jacobian_ccs
+    }
+
+    fn equality_values(&self, x: &[f64], parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
+        let (x_original, negative_residual, positive_residual) = self.split_x(x);
+        self.original.equality_values(x_original, parameters, out);
+        for ((value, negative), positive) in out
+            .iter_mut()
+            .zip(negative_residual.iter())
+            .zip(positive_residual.iter())
+        {
+            *value += negative - positive;
+        }
+    }
+
+    fn equality_jacobian_values(
+        &self,
+        x: &[f64],
+        parameters: &[ParameterMatrix<'_>],
+        out: &mut [f64],
+    ) {
+        let n = self.original_dimension();
+        let original_nnz = self.original.equality_jacobian_ccs().nnz();
+        let mut original_values = vec![0.0; original_nnz];
+        self.original
+            .equality_jacobian_values(&x[..n], parameters, &mut original_values);
+        for (slot, entry) in out.iter_mut().zip(self.equality_jacobian_entries.iter()) {
+            *slot = match entry {
+                RestorationJacobianEntry::Original(index) => original_values[*index],
+                RestorationJacobianEntry::PositiveResidual => 1.0,
+                RestorationJacobianEntry::NegativeResidual => -1.0,
+            };
+        }
+    }
+
+    fn inequality_jacobian_ccs(&self) -> &CCS {
+        &self.inequality_jacobian_ccs
+    }
+
+    fn inequality_values(&self, _x: &[f64], _parameters: &[ParameterMatrix<'_>], _out: &mut [f64]) {
+    }
+
+    fn inequality_jacobian_values(
+        &self,
+        _x: &[f64],
+        _parameters: &[ParameterMatrix<'_>],
+        _out: &mut [f64],
+    ) {
+    }
+
+    fn lagrangian_hessian_ccs(&self) -> &CCS {
+        &self.lagrangian_hessian_ccs
+    }
+
+    fn lagrangian_hessian_values(
+        &self,
+        x: &[f64],
+        parameters: &[ParameterMatrix<'_>],
+        equality_multipliers: &[f64],
+        _inequality_multipliers: &[f64],
+        out: &mut [f64],
+    ) {
+        let n = self.original_dimension();
+        let original_nnz = self.original.lagrangian_hessian_ccs().nnz();
+        let mut with_constraints = vec![0.0; original_nnz];
+        let mut objective_only = vec![0.0; original_nnz];
+        self.original.lagrangian_hessian_values(
+            &x[..n],
+            parameters,
+            equality_multipliers,
+            &[],
+            &mut with_constraints,
+        );
+        self.original.lagrangian_hessian_values(
+            &x[..n],
+            parameters,
+            &vec![0.0; equality_multipliers.len()],
+            &[],
+            &mut objective_only,
+        );
+        for (slot, entry) in out.iter_mut().zip(self.lagrangian_hessian_entries.iter()) {
+            let mut value = entry
+                .original
+                .map(|index| with_constraints[index] - objective_only[index])
+                .unwrap_or(0.0);
+            if let Some(index) = entry.proximity_diagonal_index {
+                value += self.eta * self.dr2_x[index];
+            }
+            *slot = value;
+        }
+    }
+}
+
+fn build_equality_restoration_jacobian_ccs(original: &CCS) -> (CCS, Vec<RestorationJacobianEntry>) {
+    let n = original.ncol;
+    let m = original.nrow;
+    let total_dimension = n + 2 * m;
+    let mut col_ptrs = Vec::with_capacity(total_dimension + 1);
+    let mut row_indices = Vec::with_capacity(original.nnz() + 2 * m);
+    let mut entries = Vec::with_capacity(original.nnz() + 2 * m);
+    col_ptrs.push(0);
+    for col in 0..n {
+        for index in original.col_ptrs[col]..original.col_ptrs[col + 1] {
+            row_indices.push(original.row_indices[index]);
+            entries.push(RestorationJacobianEntry::Original(index));
+        }
+        col_ptrs.push(row_indices.len());
+    }
+    for row in 0..m {
+        row_indices.push(row);
+        entries.push(RestorationJacobianEntry::PositiveResidual);
+        col_ptrs.push(row_indices.len());
+    }
+    for row in 0..m {
+        row_indices.push(row);
+        entries.push(RestorationJacobianEntry::NegativeResidual);
+        col_ptrs.push(row_indices.len());
+    }
+    (CCS::new(m, total_dimension, col_ptrs, row_indices), entries)
+}
+
+fn build_equality_restoration_hessian_ccs(
+    original: &CCS,
+    original_dimension: Index,
+    total_dimension: Index,
+) -> (CCS, Vec<RestorationHessianEntry>) {
+    let mut original_by_position = HashMap::with_capacity(original.nnz());
+    for col in 0..original.ncol {
+        for index in original.col_ptrs[col]..original.col_ptrs[col + 1] {
+            let row = original.row_indices[index];
+            let (row, col) = if row >= col { (row, col) } else { (col, row) };
+            original_by_position.insert((row, col), index);
+        }
+    }
+    let mut rows_by_col = vec![Vec::<Index>::new(); original_dimension];
+    for &(row, col) in original_by_position.keys() {
+        if col < original_dimension && row < original_dimension {
+            rows_by_col[col].push(row);
+        }
+    }
+    for (col, rows) in rows_by_col.iter_mut().enumerate() {
+        rows.push(col);
+        rows.sort_unstable();
+        rows.dedup();
+    }
+    let mut col_ptrs = Vec::with_capacity(total_dimension + 1);
+    let mut row_indices = Vec::new();
+    let mut entries = Vec::new();
+    col_ptrs.push(0);
+    for (col, rows) in rows_by_col.iter().enumerate() {
+        for &row in rows {
+            row_indices.push(row);
+            entries.push(RestorationHessianEntry {
+                original: original_by_position.get(&(row, col)).copied(),
+                proximity_diagonal_index: (row == col).then_some(col),
+            });
+        }
+        col_ptrs.push(row_indices.len());
+    }
+    for _ in original_dimension..total_dimension {
+        col_ptrs.push(row_indices.len());
+    }
+    (
+        CCS::new(total_dimension, total_dimension, col_ptrs, row_indices),
+        entries,
+    )
+}
+
+fn equality_restoration_initial_guess(
+    x: &[f64],
+    equality_values: &[f64],
+    bound_push: f64,
+) -> Vec<f64> {
+    let push = bound_push.max(1.0e-8);
+    let mut restoration_x = Vec::with_capacity(x.len() + 2 * equality_values.len());
+    restoration_x.extend_from_slice(x);
+    for &value in equality_values {
+        restoration_x.push(if value < 0.0 { -value + push } else { push });
+    }
+    for &value in equality_values {
+        restoration_x.push(if value >= 0.0 { value + push } else { push });
+    }
+    restoration_x
+}
+
+fn solve_equality_restoration_problem<P>(
+    problem: &P,
+    x: &[f64],
+    equality_values: &[f64],
+    parameters: &[ParameterMatrix<'_>],
+    options: &InteriorPointOptions,
+    current_primal_inf: f64,
+) -> Option<InteriorPointSummary>
+where
+    P: CompiledNlpProblem,
+{
+    let restoration_mu = current_primal_inf.max(options.mu_init).max(1.0e-8);
+    let restoration_problem =
+        EqualityRestorationNlp::new(problem, x, 1.0e3, restoration_mu.sqrt())?;
+    let restoration_x0 = equality_restoration_initial_guess(x, equality_values, options.bound_push);
+    let mut restoration_options = options.clone();
+    restoration_options.restoration_phase = false;
+    restoration_options.verbose = false;
+    restoration_options.linear_debug = None;
+    restoration_options.max_iters = options.max_iters.clamp(10, 30);
+    restoration_options.acceptable_iter = 0;
+    restoration_options.mu_init = restoration_mu;
+    restoration_options.mu_target = 0.0;
+    solve_nlp_interior_point(
+        &restoration_problem,
+        &restoration_x0,
+        parameters,
+        &restoration_options,
+    )
+    .ok()
 }
 
 #[derive(Clone, Debug)]
@@ -1050,16 +1494,113 @@ struct SparseSymmetricMatrix {
     values: Vec<f64>,
 }
 
+#[derive(Clone, Debug)]
+struct FixedVariableElimination {
+    free_indices: Vec<usize>,
+    fixed_indices: Vec<usize>,
+    fixed_values: Vec<f64>,
+    free_position: Vec<Option<usize>>,
+}
+
+impl FixedVariableElimination {
+    fn new(dimension: usize, fixed_indices: Vec<usize>, fixed_values: Vec<f64>) -> Self {
+        debug_assert_eq!(fixed_indices.len(), fixed_values.len());
+        let mut is_fixed = vec![false; dimension];
+        for &index in &fixed_indices {
+            is_fixed[index] = true;
+        }
+        let free_indices = (0..dimension)
+            .filter(|index| !is_fixed[*index])
+            .collect::<Vec<_>>();
+        let mut free_position = vec![None; dimension];
+        for (position, &index) in free_indices.iter().enumerate() {
+            free_position[index] = Some(position);
+        }
+        Self {
+            free_indices,
+            fixed_indices,
+            fixed_values,
+            free_position,
+        }
+    }
+
+    fn none(dimension: usize) -> Self {
+        Self::new(dimension, Vec::new(), Vec::new())
+    }
+
+    fn has_fixed(&self) -> bool {
+        !self.fixed_indices.is_empty()
+    }
+
+    fn reduced_dimension(&self) -> usize {
+        self.free_indices.len()
+    }
+
+    fn project_fixed_values(&self, x: &mut [f64]) {
+        for (&index, &value) in self.fixed_indices.iter().zip(self.fixed_values.iter()) {
+            x[index] = value;
+        }
+    }
+
+    fn reduce_vector(&self, values: &[f64]) -> Vec<f64> {
+        if !self.has_fixed() {
+            return values.to_vec();
+        }
+        self.free_indices
+            .iter()
+            .map(|&index| values[index])
+            .collect()
+    }
+
+    fn expand_direction(&self, reduced: &[f64]) -> Vec<f64> {
+        if !self.has_fixed() {
+            return reduced.to_vec();
+        }
+        debug_assert_eq!(reduced.len(), self.free_indices.len());
+        let mut full = vec![0.0; self.free_position.len()];
+        for (&index, &value) in self.free_indices.iter().zip(reduced.iter()) {
+            full[index] = value;
+        }
+        full
+    }
+
+    fn free_inf_norm(&self, values: &[f64]) -> f64 {
+        if !self.has_fixed() {
+            return inf_norm(values);
+        }
+        self.free_indices
+            .iter()
+            .fold(0.0_f64, |acc, &index| acc.max(values[index].abs()))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SparseColumnReduction {
+    structure: Arc<SparseMatrixStructure>,
+    source_value_indices: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct SymmetricSubmatrixReduction {
+    lower_triangle: Arc<CCS>,
+    source_value_indices: Vec<usize>,
+}
+
 struct ReducedKktSystem<'a> {
     hessian: &'a SparseSymmetricMatrix,
     equality_jacobian: &'a SparseMatrix,
     inequality_jacobian: &'a SparseMatrix,
+    bound_diagonal: &'a [f64],
+    bound_rhs: &'a [f64],
     slack: &'a [f64],
     multipliers: &'a [f64],
     r_dual: &'a [f64],
     r_eq: &'a [f64],
     r_ineq: &'a [f64],
+    r_slack_stationarity: &'a [f64],
     r_cent: &'a [f64],
+    barrier_parameter: f64,
+    kappa_d: f64,
     solver: InteriorPointLinearSolver,
     regularization: f64,
     first_hessian_perturbation: f64,
@@ -1069,6 +1610,8 @@ struct ReducedKktSystem<'a> {
     regularization_growth_factor: f64,
     regularization_decay_factor: f64,
     regularization_max: f64,
+    jacobian_regularization_value: f64,
+    jacobian_regularization_exponent: f64,
     spral_pivot_method: InteriorPointSpralPivotMethod,
     spral_action_on_zero_pivot: bool,
     spral_small_pivot_tolerance: f64,
@@ -1112,7 +1655,10 @@ struct SpralAugmentedKktWorkspace {
 struct NativeSpralAugmentedKktWorkspace {
     pattern: SpralAugmentedKktPattern,
     values: Vec<f64>,
-    session: NativeSpralSession,
+    native: NativeSpralLibrary,
+    session: Option<NativeSpralSession>,
+    numeric_options: SpralNumericFactorOptions,
+    ordering: SpralNativeOrdering,
     factor_regularization: Option<f64>,
 }
 
@@ -1128,11 +1674,14 @@ struct InteriorPointKktSnapshot {
     hessian: SparseSymmetricMatrix,
     equality_jacobian: SparseMatrix,
     inequality_jacobian: SparseMatrix,
+    bound_diagonal: Vec<f64>,
+    bound_rhs: Vec<f64>,
     slack: Vec<f64>,
     multipliers: Vec<f64>,
     r_dual: Vec<f64>,
     r_eq: Vec<f64>,
     r_ineq: Vec<f64>,
+    r_slack_stationarity: Vec<f64>,
     r_cent: Vec<f64>,
     regularization: f64,
     primal_diagonal_shift: f64,
@@ -1144,6 +1693,8 @@ struct InteriorPointKktSnapshot {
     regularization_growth_factor: f64,
     regularization_decay_factor: f64,
     regularization_max: f64,
+    jacobian_regularization_value: f64,
+    jacobian_regularization_exponent: f64,
     spral_pivot_method: InteriorPointSpralPivotMethod,
     spral_action_on_zero_pivot: bool,
     spral_small_pivot_tolerance: f64,
@@ -1153,6 +1704,7 @@ struct InteriorPointKktSnapshot {
     augmented_rhs: Vec<f64>,
     expected_augmented_inertia: SpralInertia,
     barrier_parameter: f64,
+    kappa_d: f64,
     primal_inf: f64,
     dual_inf: f64,
     complementarity_inf: f64,
@@ -1243,43 +1795,27 @@ impl NativeSpralAugmentedKktWorkspace {
             equality_jacobian,
             inequality_jacobian,
         )?;
-        let matrix = SpralSymmetricCscMatrix::new(
-            pattern.dimension(),
-            &pattern.ccs.col_ptrs,
-            &pattern.ccs.row_indices,
-            None,
-        )
-        .map_err(|error| {
-            InteriorPointSolveError::InvalidInput(format!(
-                "invalid sparse KKT structure for native spral_ssids: {error}"
-            ))
-        })?;
         let native = NativeSpralLibrary::load().map_err(|error| {
             InteriorPointSolveError::InvalidInput(format!(
                 "failed to load native spral_ssids: {error}"
             ))
         })?;
-        let session = native
-            .analyse_with_options(matrix, numeric_options)
-            .map_err(|error| {
-                InteriorPointSolveError::InvalidInput(format!(
-                    "failed to analyse sparse KKT structure for native spral_ssids: {error}"
-                ))
-            })?;
-        let analyse_info = session.analyse_info();
         let values = vec![0.0; pattern.ccs.nnz()];
         Ok((
             Self {
                 pattern,
                 values,
-                session,
+                native,
+                session: None,
+                numeric_options: *numeric_options,
+                ordering: SpralNativeOrdering::Matching,
                 factor_regularization: None,
             },
             SpralAnalyseInfo {
                 estimated_fill_nnz: 0,
-                supernode_count: analyse_info.supernode_count,
-                max_supernode_width: analyse_info.max_supernode_width,
-                ordering_kind: "native_spral_default",
+                supernode_count: 0,
+                max_supernode_width: 0,
+                ordering_kind: "native_spral_matching_value_dependent",
             },
         ))
     }
@@ -1391,12 +1927,17 @@ impl InteriorPointKktSnapshot {
             hessian: &self.hessian,
             equality_jacobian: &self.equality_jacobian,
             inequality_jacobian: &self.inequality_jacobian,
+            bound_diagonal: &self.bound_diagonal,
+            bound_rhs: &self.bound_rhs,
             slack: &self.slack,
             multipliers: &self.multipliers,
             r_dual: &self.r_dual,
             r_eq: &self.r_eq,
             r_ineq: &self.r_ineq,
+            r_slack_stationarity: &self.r_slack_stationarity,
             r_cent: &self.r_cent,
+            barrier_parameter: self.barrier_parameter,
+            kappa_d: self.kappa_d,
             solver,
             regularization: self.regularization,
             first_hessian_perturbation: self.first_hessian_perturbation,
@@ -1406,6 +1947,8 @@ impl InteriorPointKktSnapshot {
             regularization_growth_factor: self.regularization_growth_factor,
             regularization_decay_factor: self.regularization_decay_factor,
             regularization_max: self.regularization_max,
+            jacobian_regularization_value: self.jacobian_regularization_value,
+            jacobian_regularization_exponent: self.jacobian_regularization_exponent,
             spral_pivot_method: self.spral_pivot_method,
             spral_action_on_zero_pivot: self.spral_action_on_zero_pivot,
             spral_small_pivot_tolerance: self.spral_small_pivot_tolerance,
@@ -1470,20 +2013,13 @@ fn build_interior_point_kkt_snapshot(
     complementarity_inf: f64,
     line_search_trials: Index,
 ) -> std::result::Result<InteriorPointKktSnapshot, InteriorPointSolveError> {
-    let inequality_scalings = system
-        .slack
-        .iter()
-        .zip(system.multipliers.iter())
-        .map(|(slack_i, multiplier_i)| (slack_i.max(1e-16) / multiplier_i.max(1e-16)).sqrt())
-        .collect::<Vec<_>>();
     let rhs_p = system
         .r_cent
         .iter()
         .zip(system.slack.iter())
-        .zip(system.multipliers.iter())
-        .map(|((r_cent_i, slack_i), multiplier_i)| {
-            let scaling = (slack_i.max(1e-16) * multiplier_i.max(1e-16)).sqrt();
-            -r_cent_i / scaling
+        .enumerate()
+        .map(|(index, (r_cent_i, slack_i))| {
+            -(r_cent_i / slack_i.max(1e-16) + damped_slack_stationarity_residual(system, index))
         })
         .collect::<Vec<_>>();
     let pattern = build_spral_augmented_kkt_pattern(
@@ -1492,15 +2028,16 @@ fn build_interior_point_kkt_snapshot(
         system.inequality_jacobian.structure.as_ref(),
     )?;
     let primal_shift = primal_diagonal_shift_used;
-    let dual_shift = dual_regularization_used.max(1e-8);
+    let slack_shift = primal_diagonal_shift_used;
+    let dual_shift = dual_regularization_used.max(0.0);
     let mut augmented_values = vec![0.0; pattern.ccs.nnz()];
     fill_spral_augmented_kkt_values(
         &pattern,
         &mut augmented_values,
         system,
         primal_shift,
+        slack_shift,
         dual_shift,
-        &inequality_scalings,
     );
     let mut augmented_rhs = vec![0.0; pattern.dimension()];
     let n = system.hessian.lower_triangle.nrow;
@@ -1509,7 +2046,8 @@ fn build_interior_point_kkt_snapshot(
     augmented_rhs[..n]
         .iter_mut()
         .zip(system.r_dual.iter())
-        .for_each(|(rhs_i, r_i)| *rhs_i = -*r_i);
+        .zip(system.bound_rhs.iter())
+        .for_each(|((rhs_i, r_i), bound_rhs_i)| *rhs_i = -*r_i + bound_rhs_i);
     augmented_rhs[pattern.p_offset..pattern.p_offset + mineq].copy_from_slice(&rhs_p);
     for row in 0..meq {
         augmented_rhs[pattern.lambda_offset + row] = -system.r_eq[row];
@@ -1528,13 +2066,16 @@ fn build_interior_point_kkt_snapshot(
         hessian: system.hessian.clone(),
         equality_jacobian: system.equality_jacobian.clone(),
         inequality_jacobian: system.inequality_jacobian.clone(),
+        bound_diagonal: system.bound_diagonal.to_vec(),
+        bound_rhs: system.bound_rhs.to_vec(),
         slack: system.slack.to_vec(),
         multipliers: system.multipliers.to_vec(),
         r_dual: system.r_dual.to_vec(),
         r_eq: system.r_eq.to_vec(),
         r_ineq: system.r_ineq.to_vec(),
+        r_slack_stationarity: system.r_slack_stationarity.to_vec(),
         r_cent: system.r_cent.to_vec(),
-        regularization: dual_regularization_used,
+        regularization: primal_diagonal_shift_used,
         primal_diagonal_shift: primal_diagonal_shift_used,
         dual_regularization: dual_regularization_used,
         first_hessian_perturbation: system.first_hessian_perturbation,
@@ -1544,6 +2085,8 @@ fn build_interior_point_kkt_snapshot(
         regularization_growth_factor: system.regularization_growth_factor,
         regularization_decay_factor: system.regularization_decay_factor,
         regularization_max: system.regularization_max,
+        jacobian_regularization_value: system.jacobian_regularization_value,
+        jacobian_regularization_exponent: system.jacobian_regularization_exponent,
         spral_pivot_method: system.spral_pivot_method,
         spral_action_on_zero_pivot: system.spral_action_on_zero_pivot,
         spral_small_pivot_tolerance: system.spral_small_pivot_tolerance,
@@ -1553,6 +2096,7 @@ fn build_interior_point_kkt_snapshot(
         augmented_rhs,
         expected_augmented_inertia: spral_expected_augmented_inertia(&pattern),
         barrier_parameter,
+        kappa_d: system.kappa_d,
         primal_inf,
         dual_inf,
         complementarity_inf,
@@ -2071,34 +2615,202 @@ fn filter_theta_l1_norm(
     l1_norm(equality_values) + slack_form_inequality_l1_norm(augmented_inequality_values, slack)
 }
 
-fn barrier_objective_value(objective_value: f64, slack: &[f64], barrier_parameter: f64) -> f64 {
-    if slack.is_empty() || barrier_parameter <= 0.0 {
-        return objective_value;
-    }
-    objective_value - barrier_parameter * slack.iter().map(|value| value.ln()).sum::<f64>()
+fn native_lower_bound_slack(x: &[f64], index: usize, lower: f64) -> f64 {
+    (x[index] - lower).max(1.0e-16)
 }
 
+fn native_upper_bound_slack(x: &[f64], index: usize, upper: f64) -> f64 {
+    (upper - x[index]).max(1.0e-16)
+}
+
+fn bound_relaxation_amount(bound: f64, options: &InteriorPointOptions) -> f64 {
+    if options.bound_relax_factor <= 0.0 {
+        return 0.0;
+    }
+    options
+        .constraint_tol
+        .min(options.bound_relax_factor * bound.abs().max(1.0))
+}
+
+fn slack_bound_relaxation(options: &InteriorPointOptions) -> f64 {
+    bound_relaxation_amount(0.0, options)
+}
+
+fn relaxed_slack_barrier_values(slack: &[f64], options: &InteriorPointOptions) -> Vec<f64> {
+    let relaxation = slack_bound_relaxation(options);
+    if relaxation == 0.0 {
+        return slack.to_vec();
+    }
+    slack.iter().map(|value| value + relaxation).collect()
+}
+
+fn native_bound_log_sum(x: &[f64], bounds: &BoundConstraints) -> f64 {
+    let lower_sum = bounds
+        .lower_indices
+        .iter()
+        .zip(bounds.lower_values.iter())
+        .map(|(&index, &lower)| native_lower_bound_slack(x, index, lower).ln())
+        .sum::<f64>();
+    let upper_sum = bounds
+        .upper_indices
+        .iter()
+        .zip(bounds.upper_values.iter())
+        .map(|(&index, &upper)| native_upper_bound_slack(x, index, upper).ln())
+        .sum::<f64>();
+    lower_sum + upper_sum
+}
+
+fn native_bound_damping_sum(x: &[f64], bounds: &BoundConstraints) -> f64 {
+    let lower_sum = bounds
+        .lower_indices
+        .iter()
+        .zip(bounds.lower_values.iter())
+        .filter(|(index, _)| !bounds.upper_indices.contains(index))
+        .map(|(&index, &lower)| native_lower_bound_slack(x, index, lower))
+        .sum::<f64>();
+    let upper_sum = bounds
+        .upper_indices
+        .iter()
+        .zip(bounds.upper_values.iter())
+        .filter(|(index, _)| !bounds.lower_indices.contains(index))
+        .map(|(&index, &upper)| native_upper_bound_slack(x, index, upper))
+        .sum::<f64>();
+    lower_sum + upper_sum
+}
+
+fn native_bound_damping_directional_derivative(dx: &[f64], bounds: &BoundConstraints) -> f64 {
+    let lower_sum = bounds
+        .lower_indices
+        .iter()
+        .filter(|index| !bounds.upper_indices.contains(index))
+        .map(|&index| dx[index])
+        .sum::<f64>();
+    let upper_sum = bounds
+        .upper_indices
+        .iter()
+        .filter(|index| !bounds.lower_indices.contains(index))
+        .map(|&index| -dx[index])
+        .sum::<f64>();
+    lower_sum + upper_sum
+}
+
+fn positive_slack_damping(barrier_parameter: f64, kappa_d: f64) -> f64 {
+    if barrier_parameter > 0.0 && kappa_d > 0.0 {
+        barrier_parameter * kappa_d
+    } else {
+        0.0
+    }
+}
+
+fn system_positive_slack_damping(system: &ReducedKktSystem<'_>) -> f64 {
+    positive_slack_damping(system.barrier_parameter, system.kappa_d)
+}
+
+fn damped_slack_stationarity_residual(system: &ReducedKktSystem<'_>, index: usize) -> f64 {
+    system.r_slack_stationarity[index] + system_positive_slack_damping(system)
+}
+
+fn damped_slack_stationarity_residuals(
+    lambda_ineq: &[f64],
+    z: &[f64],
+    barrier_parameter: f64,
+    kappa_d: f64,
+) -> Vec<f64> {
+    let damping = positive_slack_damping(barrier_parameter, kappa_d);
+    lambda_ineq
+        .iter()
+        .zip(z.iter())
+        .map(|(y_i, z_i)| y_i - z_i + damping)
+        .collect()
+}
+
+fn slack_complementarity_residuals(slack_barrier: &[f64], z: &[f64], mu: f64) -> Vec<f64> {
+    slack_barrier
+        .iter()
+        .zip(z.iter())
+        .map(|(slack_i, z_i)| slack_i * z_i - mu)
+        .collect()
+}
+
+fn slack_sigma_values(slack_barrier: &[f64], z: &[f64]) -> Vec<f64> {
+    slack_barrier
+        .iter()
+        .zip(z.iter())
+        .map(|(slack_i, z_i)| z_i / slack_i.max(1.0e-16))
+        .collect()
+}
+
+fn barrier_objective_value(
+    objective_value: f64,
+    slack: &[f64],
+    x: &[f64],
+    bounds: &BoundConstraints,
+    barrier_parameter: f64,
+    kappa_d: f64,
+) -> f64 {
+    if (slack.is_empty() && bounds.total_count() == 0) || barrier_parameter <= 0.0 {
+        return objective_value;
+    }
+    let slack_log_sum = slack.iter().map(|value| value.ln()).sum::<f64>();
+    let damping_weight = positive_slack_damping(barrier_parameter, kappa_d);
+    let damping = if damping_weight > 0.0 {
+        damping_weight * (slack.iter().sum::<f64>() + native_bound_damping_sum(x, bounds))
+    } else {
+        0.0
+    };
+    objective_value - barrier_parameter * (slack_log_sum + native_bound_log_sum(x, bounds))
+        + damping
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "IPOPT filter derivative uses separate primal, slack, bound, and damping inputs."
+)]
 fn barrier_objective_directional_derivative(
     gradient: &[f64],
     slack: &[f64],
+    x: &[f64],
+    bounds: &BoundConstraints,
     dx: &[f64],
     ds: &[f64],
     barrier_parameter: f64,
+    kappa_d: f64,
 ) -> f64 {
     let objective_term = gradient
         .iter()
         .zip(dx.iter())
         .map(|(gradient_i, dx_i)| gradient_i * dx_i)
         .sum::<f64>();
-    if slack.is_empty() || barrier_parameter <= 0.0 {
+    if (slack.is_empty() && bounds.total_count() == 0) || barrier_parameter <= 0.0 {
         return objective_term;
     }
-    let barrier_term = slack
+    let slack_barrier_term = slack
         .iter()
         .zip(ds.iter())
         .map(|(slack_i, ds_i)| ds_i / slack_i.max(1e-16))
         .sum::<f64>();
-    objective_term - barrier_parameter * barrier_term
+    let lower_barrier_term = bounds
+        .lower_indices
+        .iter()
+        .zip(bounds.lower_values.iter())
+        .map(|(&index, &lower)| dx[index] / native_lower_bound_slack(x, index, lower))
+        .sum::<f64>();
+    let upper_barrier_term = bounds
+        .upper_indices
+        .iter()
+        .zip(bounds.upper_values.iter())
+        .map(|(&index, &upper)| -dx[index] / native_upper_bound_slack(x, index, upper))
+        .sum::<f64>();
+    let damping_weight = positive_slack_damping(barrier_parameter, kappa_d);
+    let damping_term = if damping_weight > 0.0 {
+        damping_weight
+            * (ds.iter().sum::<f64>() + native_bound_damping_directional_derivative(dx, bounds))
+    } else {
+        0.0
+    };
+    objective_term
+        - barrier_parameter * (slack_barrier_term + lower_barrier_term + upper_barrier_term)
+        + damping_term
 }
 
 fn switching_condition_satisfied(
@@ -2166,17 +2878,10 @@ fn minimum_monotone_barrier_parameter(options: &InteriorPointOptions) -> f64 {
         .max(tol / (options.barrier_tol_factor + 1.0))
 }
 
-fn next_barrier_parameter_once(
-    barrier_parameter: f64,
-    barrier_subproblem_error: f64,
-    options: &InteriorPointOptions,
-) -> f64 {
+fn next_barrier_parameter_once(barrier_parameter: f64, options: &InteriorPointOptions) -> f64 {
     let minimum_barrier = minimum_monotone_barrier_parameter(options);
     if barrier_parameter <= minimum_barrier {
         return minimum_barrier;
-    }
-    if !should_reduce_barrier_parameter(barrier_subproblem_error, barrier_parameter, options) {
-        return barrier_parameter;
     }
     minimum_barrier.max(
         (options.mu_linear_decrease_factor * barrier_parameter)
@@ -2184,27 +2889,25 @@ fn next_barrier_parameter_once(
     )
 }
 
-fn next_barrier_parameter(
+fn next_barrier_parameter<F>(
     barrier_parameter: f64,
-    barrier_subproblem_error: f64,
     tiny_step: bool,
     options: &InteriorPointOptions,
-) -> f64 {
+    mut barrier_error: F,
+) -> f64
+where
+    F: FnMut(f64) -> f64,
+{
     let mut current_barrier = barrier_parameter;
     let minimum_barrier = minimum_monotone_barrier_parameter(options);
-    let mut first_pass = true;
-    while first_pass
-        || (options.mu_allow_fast_monotone_decrease
-            && should_reduce_barrier_parameter(barrier_subproblem_error, current_barrier, options))
-    {
-        first_pass = false;
+    loop {
+        let current_barrier_error = barrier_error(current_barrier);
         if !tiny_step
-            && !should_reduce_barrier_parameter(barrier_subproblem_error, current_barrier, options)
+            && !should_reduce_barrier_parameter(current_barrier_error, current_barrier, options)
         {
             break;
         }
-        let next_barrier =
-            next_barrier_parameter_once(current_barrier, barrier_subproblem_error, options);
+        let next_barrier = next_barrier_parameter_once(current_barrier, options);
         if next_barrier >= current_barrier - 1e-18 {
             break;
         }
@@ -2245,8 +2948,36 @@ fn step_inf_norm(step: &[f64]) -> f64 {
     step.iter().fold(0.0, |acc, value| acc.max(value.abs()))
 }
 
-fn accepted_ip_step_inf_norm(direction: &NewtonDirection, alpha_pr: f64) -> f64 {
-    alpha_pr * step_inf_norm(&direction.dx)
+fn ipopt_primal_step_inf_norm(direction: &NewtonDirection) -> f64 {
+    step_inf_norm(&direction.dx).max(step_inf_norm(&direction.ds))
+}
+
+fn is_tiny_ip_step(
+    x: &[f64],
+    slack: &[f64],
+    direction: &NewtonDirection,
+    primal_inf: f64,
+    options: &InteriorPointOptions,
+) -> bool {
+    if options.tiny_step_tol == 0.0 || primal_inf > 1.0e-4 {
+        return false;
+    }
+    let max_x = x
+        .iter()
+        .zip(direction.dx.iter())
+        .fold(0.0_f64, |acc, (&value, &delta)| {
+            acc.max(delta.abs() / (1.0 + value.abs()))
+        });
+    if max_x > options.tiny_step_tol {
+        return false;
+    }
+    let max_s = slack
+        .iter()
+        .zip(direction.ds.iter())
+        .fold(0.0_f64, |acc, (&value, &delta)| {
+            acc.max(delta.abs() / (1.0 + value.abs()))
+        });
+    max_s <= options.tiny_step_tol
 }
 
 fn alpha_for_y(
@@ -2381,8 +3112,11 @@ fn is_shortened_ip_step(
     line_search_iterations > 0
 }
 
-fn is_tiny_ip_step(step_inf: f64, options: &InteriorPointOptions) -> bool {
-    step_inf <= options.tiny_step_tol
+fn current_fraction_to_boundary_tau(barrier_parameter: f64, options: &InteriorPointOptions) -> f64 {
+    options
+        .fraction_to_boundary
+        .max(1.0 - barrier_parameter.max(0.0))
+        .clamp(0.0, 1.0)
 }
 
 fn fraction_to_boundary_with_limiter(
@@ -2409,32 +3143,328 @@ fn fraction_to_boundary_with_limiter(
     (alpha.clamp(0.0, 1.0), limiter)
 }
 
+fn fraction_to_boundary_limiters(
+    current: &[f64],
+    direction: &[f64],
+    tau: f64,
+    max_count: usize,
+) -> Vec<InteriorPointBoundaryLimiter> {
+    if max_count == 0 {
+        return Vec::new();
+    }
+    let mut limiters = current
+        .iter()
+        .zip(direction.iter())
+        .enumerate()
+        .filter_map(|(index, (&value, &delta))| {
+            if delta < 0.0 {
+                Some(InteriorPointBoundaryLimiter {
+                    index,
+                    value,
+                    direction: delta,
+                    alpha: (-tau * value / delta).clamp(0.0, 1.0),
+                })
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    limiters.sort_by(|lhs, rhs| {
+        lhs.alpha
+            .total_cmp(&rhs.alpha)
+            .then_with(|| lhs.index.cmp(&rhs.index))
+    });
+    limiters.truncate(max_count);
+    limiters
+}
+
+fn fraction_to_variable_bounds_with_limiter(
+    x: &[f64],
+    dx: &[f64],
+    bounds: &BoundConstraints,
+    tau: f64,
+) -> (f64, Option<InteriorPointBoundaryLimiter>) {
+    let mut alpha = 1.0_f64;
+    let mut limiter = None;
+    for (&index, &lower) in bounds.lower_indices.iter().zip(bounds.lower_values.iter()) {
+        let value = native_lower_bound_slack(x, index, lower);
+        let direction = dx[index];
+        if direction < 0.0 {
+            let candidate = (-tau * value / direction).clamp(0.0, 1.0);
+            if candidate < alpha {
+                alpha = candidate;
+                limiter = Some(InteriorPointBoundaryLimiter {
+                    index,
+                    value,
+                    direction,
+                    alpha: candidate,
+                });
+            }
+        }
+    }
+    for (&index, &upper) in bounds.upper_indices.iter().zip(bounds.upper_values.iter()) {
+        let value = native_upper_bound_slack(x, index, upper);
+        let direction = -dx[index];
+        if direction < 0.0 {
+            let candidate = (-tau * value / direction).clamp(0.0, 1.0);
+            if candidate < alpha {
+                alpha = candidate;
+                limiter = Some(InteriorPointBoundaryLimiter {
+                    index,
+                    value,
+                    direction,
+                    alpha: candidate,
+                });
+            }
+        }
+    }
+    (alpha.clamp(0.0, 1.0), limiter)
+}
+
+fn add_native_bound_multiplier_terms(
+    residual: &mut [f64],
+    bounds: &BoundConstraints,
+    z_lower: &[f64],
+    z_upper: &[f64],
+) {
+    for (&index, &z_i) in bounds.lower_indices.iter().zip(z_lower.iter()) {
+        residual[index] -= z_i;
+    }
+    for (&index, &z_i) in bounds.upper_indices.iter().zip(z_upper.iter()) {
+        residual[index] += z_i;
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Bound KKT assembly keeps IPOPT damping and complementarity terms explicit."
+)]
+fn native_bound_kkt_terms(
+    x: &[f64],
+    bounds: &BoundConstraints,
+    fixed_variables: &FixedVariableElimination,
+    z_lower: &[f64],
+    z_upper: &[f64],
+    barrier_parameter: f64,
+    sigma: f64,
+    kappa_d: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    let mut diagonal = vec![0.0; fixed_variables.reduced_dimension()];
+    let mut rhs = vec![0.0; fixed_variables.reduced_dimension()];
+    let damping_weight = positive_slack_damping(barrier_parameter, kappa_d);
+    for ((&index, &lower), &z_i) in bounds
+        .lower_indices
+        .iter()
+        .zip(bounds.lower_values.iter())
+        .zip(z_lower.iter())
+    {
+        let Some(reduced_index) = fixed_variables.free_position[index] else {
+            continue;
+        };
+        let slack = native_lower_bound_slack(x, index, lower);
+        let residual = slack * z_i - sigma * barrier_parameter;
+        diagonal[reduced_index] += z_i / slack;
+        rhs[reduced_index] += -residual / slack;
+        if damping_weight > 0.0 && !bounds.upper_indices.contains(&index) {
+            rhs[reduced_index] -= damping_weight;
+        }
+    }
+    for ((&index, &upper), &z_i) in bounds
+        .upper_indices
+        .iter()
+        .zip(bounds.upper_values.iter())
+        .zip(z_upper.iter())
+    {
+        let Some(reduced_index) = fixed_variables.free_position[index] else {
+            continue;
+        };
+        let slack = native_upper_bound_slack(x, index, upper);
+        let residual = slack * z_i - sigma * barrier_parameter;
+        diagonal[reduced_index] += z_i / slack;
+        rhs[reduced_index] += residual / slack;
+        if damping_weight > 0.0 && !bounds.lower_indices.contains(&index) {
+            rhs[reduced_index] += damping_weight;
+        }
+    }
+    (diagonal, rhs)
+}
+
+fn native_bound_multiplier_steps(
+    x: &[f64],
+    dx: &[f64],
+    bounds: &BoundConstraints,
+    z_lower: &[f64],
+    z_upper: &[f64],
+    barrier_parameter: f64,
+    sigma: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    let dz_lower = bounds
+        .lower_indices
+        .iter()
+        .zip(bounds.lower_values.iter())
+        .zip(z_lower.iter())
+        .map(|((&index, &lower), &z_i)| {
+            let slack = native_lower_bound_slack(x, index, lower);
+            let residual = slack * z_i - sigma * barrier_parameter;
+            (-residual - z_i * dx[index]) / slack
+        })
+        .collect::<Vec<_>>();
+    let dz_upper = bounds
+        .upper_indices
+        .iter()
+        .zip(bounds.upper_values.iter())
+        .zip(z_upper.iter())
+        .map(|((&index, &upper), &z_i)| {
+            let slack = native_upper_bound_slack(x, index, upper);
+            let residual = slack * z_i - sigma * barrier_parameter;
+            (-residual + z_i * dx[index]) / slack
+        })
+        .collect::<Vec<_>>();
+    (dz_lower, dz_upper)
+}
+
 fn interior_point_direction_diagnostics(
     direction: &NewtonDirection,
     alpha_pr_limiter: Option<InteriorPointBoundaryLimiter>,
     alpha_du_limiter: Option<InteriorPointBoundaryLimiter>,
+    alpha_pr_limiters: Vec<InteriorPointBoundaryLimiter>,
+    alpha_du_limiters: Vec<InteriorPointBoundaryLimiter>,
 ) -> InteriorPointDirectionDiagnostics {
     InteriorPointDirectionDiagnostics {
         dx_inf: step_inf_norm(&direction.dx),
-        d_lambda_inf: step_inf_norm(&direction.d_lambda),
+        d_lambda_inf: step_inf_norm(&direction.d_lambda).max(step_inf_norm(&direction.d_ineq)),
         ds_inf: step_inf_norm(&direction.ds),
-        dz_inf: step_inf_norm(&direction.dz),
+        dz_inf: step_inf_norm(&direction.dz)
+            .max(step_inf_norm(&direction.dz_lower))
+            .max(step_inf_norm(&direction.dz_upper)),
+        regularization_size: direction.regularization_used,
+        primal_diagonal_shift: direction.primal_diagonal_shift_used,
+        dual_regularization: direction.dual_regularization_used,
         alpha_pr_limiter,
         alpha_du_limiter,
+        alpha_pr_limiters,
+        alpha_du_limiters,
     }
 }
 
-fn barrier_parameter(slack: &[f64], multipliers: &[f64]) -> f64 {
-    if slack.is_empty() {
+fn native_bound_complementarity_sum(
+    x: &[f64],
+    bounds: &BoundConstraints,
+    z_lower: &[f64],
+    z_upper: &[f64],
+) -> f64 {
+    let lower_sum = bounds
+        .lower_indices
+        .iter()
+        .zip(bounds.lower_values.iter())
+        .zip(z_lower.iter())
+        .map(|((&index, &lower), &z_i)| native_lower_bound_slack(x, index, lower) * z_i)
+        .sum::<f64>();
+    let upper_sum = bounds
+        .upper_indices
+        .iter()
+        .zip(bounds.upper_values.iter())
+        .zip(z_upper.iter())
+        .map(|((&index, &upper), &z_i)| native_upper_bound_slack(x, index, upper) * z_i)
+        .sum::<f64>();
+    lower_sum + upper_sum
+}
+
+fn native_bound_complementarity_inf_norm(
+    x: &[f64],
+    bounds: &BoundConstraints,
+    z_lower: &[f64],
+    z_upper: &[f64],
+) -> f64 {
+    let lower_inf = bounds
+        .lower_indices
+        .iter()
+        .zip(bounds.lower_values.iter())
+        .zip(z_lower.iter())
+        .fold(0.0_f64, |acc, ((&index, &lower), &z_i)| {
+            acc.max((native_lower_bound_slack(x, index, lower) * z_i).abs())
+        });
+    bounds
+        .upper_indices
+        .iter()
+        .zip(bounds.upper_values.iter())
+        .zip(z_upper.iter())
+        .fold(lower_inf, |acc, ((&index, &upper), &z_i)| {
+            acc.max((native_upper_bound_slack(x, index, upper) * z_i).abs())
+        })
+}
+
+fn combined_barrier_parameter(
+    slack: &[f64],
+    z: &[f64],
+    x: &[f64],
+    bounds: &BoundConstraints,
+    z_lower: &[f64],
+    z_upper: &[f64],
+) -> f64 {
+    let count = slack.len() + bounds.total_count();
+    if count == 0 {
+        return 0.0;
+    }
+    let slack_sum = slack
+        .iter()
+        .zip(z.iter())
+        .map(|(s, z_i)| s * z_i)
+        .sum::<f64>();
+    (slack_sum + native_bound_complementarity_sum(x, bounds, z_lower, z_upper)) / count as f64
+}
+
+fn combined_complementarity_inf_norm(
+    slack: &[f64],
+    z: &[f64],
+    x: &[f64],
+    bounds: &BoundConstraints,
+    z_lower: &[f64],
+    z_upper: &[f64],
+) -> f64 {
+    let slack_inf = if slack.is_empty() {
         0.0
     } else {
-        slack
-            .iter()
-            .zip(multipliers.iter())
-            .map(|(s, z)| s * z)
-            .sum::<f64>()
-            / slack.len() as f64
-    }
+        complementarity_inf_norm(slack, z)
+    };
+    slack_inf.max(native_bound_complementarity_inf_norm(
+        x, bounds, z_lower, z_upper,
+    ))
+}
+
+fn combined_complementarity_target_inf_norm(
+    slack: &[f64],
+    z: &[f64],
+    x: &[f64],
+    bounds: &BoundConstraints,
+    z_lower: &[f64],
+    z_upper: &[f64],
+    mu_target: f64,
+) -> f64 {
+    let slack_inf = interior_point_complementarity_target_inf_norm(slack, z, mu_target);
+    let lower_inf = bounds
+        .lower_indices
+        .iter()
+        .zip(bounds.lower_values.iter())
+        .zip(z_lower.iter())
+        .fold(0.0_f64, |acc, ((&index, &lower), &z_i)| {
+            acc.max((native_lower_bound_slack(x, index, lower) * z_i - mu_target).abs())
+        });
+    bounds
+        .upper_indices
+        .iter()
+        .zip(bounds.upper_values.iter())
+        .zip(z_upper.iter())
+        .fold(slack_inf.max(lower_inf), |acc, ((&index, &upper), &z_i)| {
+            acc.max((native_upper_bound_slack(x, index, upper) * z_i - mu_target).abs())
+        })
+}
+
+fn combined_multiplier_vector<'a>(slices: impl IntoIterator<Item = &'a [f64]>) -> Vec<f64> {
+    slices
+        .into_iter()
+        .flat_map(|slice| slice.iter().copied())
+        .collect()
 }
 
 fn correct_bound_multiplier_estimate(
@@ -2474,49 +3504,79 @@ fn correct_bound_multiplier_estimate(
     (corrected_z, max_correction)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "IPOPT kappa_sigma correction needs the full accepted trial multiplier state."
+)]
 fn apply_bound_multiplier_safeguard(
-    state: &EvalState,
-    primal_inf: f64,
-    lambda: &[f64],
+    inequality_multipliers: &[f64],
+    raw_dual_residual: &[f64],
+    fixed_variables: &FixedVariableElimination,
+    x: &[f64],
+    bounds: &BoundConstraints,
     slack: &[f64],
     z: &[f64],
+    z_lower: &[f64],
+    z_upper: &[f64],
     barrier_parameter_value: f64,
     options: &InteriorPointOptions,
 ) -> Option<AcceptedTrialMultiplierState> {
     let (corrected_z, max_correction) =
         correct_bound_multiplier_estimate(z, slack, barrier_parameter_value, options.kappa_sigma);
-    if max_correction <= 0.0 {
+
+    let lower_slack = bounds
+        .lower_indices
+        .iter()
+        .zip(bounds.lower_values.iter())
+        .map(|(&index, &lower)| native_lower_bound_slack(x, index, lower))
+        .collect::<Vec<_>>();
+    let (corrected_z_lower, lower_max_correction) = correct_bound_multiplier_estimate(
+        z_lower,
+        &lower_slack,
+        barrier_parameter_value,
+        options.kappa_sigma,
+    );
+
+    let upper_slack = bounds
+        .upper_indices
+        .iter()
+        .zip(bounds.upper_values.iter())
+        .map(|(&index, &upper)| native_upper_bound_slack(x, index, upper))
+        .collect::<Vec<_>>();
+    let (corrected_z_upper, upper_max_correction) = correct_bound_multiplier_estimate(
+        z_upper,
+        &upper_slack,
+        barrier_parameter_value,
+        options.kappa_sigma,
+    );
+
+    if max_correction
+        .max(lower_max_correction)
+        .max(upper_max_correction)
+        <= 0.0
+    {
         return None;
     }
 
-    let corrected_dual_residual = lagrangian_gradient_sparse(
-        &state.gradient,
-        &state.equality_jacobian,
-        lambda,
-        &state.inequality_jacobian,
-        &corrected_z,
+    let mut corrected_dual_residual = raw_dual_residual.to_vec();
+    add_native_bound_multiplier_terms(
+        &mut corrected_dual_residual,
+        bounds,
+        &corrected_z_lower,
+        &corrected_z_upper,
     );
-    let corrected_dual_inf = inf_norm(&corrected_dual_residual);
-    let corrected_comp_inf = if corrected_z.is_empty() {
-        0.0
-    } else {
-        complementarity_inf_norm(slack, &corrected_z)
-    };
-    let corrected_all_dual_multipliers = [lambda, corrected_z.as_slice()].concat();
-    let corrected_overall_inf = scaled_overall_inf_norm(
-        primal_inf,
-        corrected_dual_inf,
-        corrected_comp_inf,
-        &corrected_all_dual_multipliers,
-        &corrected_z,
-        options.overall_scale_max,
-    );
+    let corrected_dual_x_inf = fixed_variables.free_inf_norm(&corrected_dual_residual);
+    let corrected_slack_stationarity_inf = inequality_multipliers
+        .iter()
+        .zip(corrected_z.iter())
+        .fold(0.0_f64, |acc, (y_i, z_i)| acc.max((y_i - z_i).abs()));
+    let corrected_dual_inf = corrected_dual_x_inf.max(corrected_slack_stationarity_inf);
 
     Some(AcceptedTrialMultiplierState {
         z: corrected_z,
+        z_lower: corrected_z_lower,
+        z_upper: corrected_z_upper,
         dual_inf: corrected_dual_inf,
-        complementarity_inf: corrected_comp_inf,
-        overall_inf: corrected_overall_inf,
     })
 }
 
@@ -2612,6 +3672,56 @@ fn project_initial_point_into_box_interior(
     }
 }
 
+fn collect_interior_point_bounds_and_fixed<P>(
+    problem: &P,
+) -> std::result::Result<(BoundConstraints, FixedVariableElimination), InteriorPointSolveError>
+where
+    P: CompiledNlpProblem,
+{
+    let dimension = problem.dimension();
+    let Some(bounds_view) = problem.variable_bounds() else {
+        return Ok((
+            BoundConstraints::default(),
+            FixedVariableElimination::none(dimension),
+        ));
+    };
+    let lower = bounds_view.lower.unwrap_or_default();
+    let upper = bounds_view.upper.unwrap_or_default();
+
+    let mut bounds = BoundConstraints::default();
+    let mut fixed_indices = Vec::new();
+    let mut fixed_values = Vec::new();
+    for idx in 0..dimension {
+        let lower_bound = lower.get(idx).copied().flatten();
+        let upper_bound = upper.get(idx).copied().flatten();
+        if let (Some(lower_bound), Some(upper_bound)) = (lower_bound, upper_bound) {
+            if lower_bound > upper_bound {
+                return Err(InteriorPointSolveError::InvalidInput(format!(
+                    "variable bound interval is empty at index {idx}: lower={lower_bound} > upper={upper_bound}"
+                )));
+            }
+            if lower_bound == upper_bound {
+                fixed_indices.push(idx);
+                fixed_values.push(lower_bound);
+                continue;
+            }
+        }
+        if let Some(lower_bound) = lower_bound {
+            bounds.lower_indices.push(idx);
+            bounds.lower_values.push(lower_bound);
+        }
+        if let Some(upper_bound) = upper_bound {
+            bounds.upper_indices.push(idx);
+            bounds.upper_values.push(upper_bound);
+        }
+    }
+
+    Ok((
+        bounds,
+        FixedVariableElimination::new(dimension, fixed_indices, fixed_values),
+    ))
+}
+
 fn initialise_slacks(
     augmented_inequality_values: &[f64],
     slack: &mut [f64],
@@ -2646,75 +3756,102 @@ fn sparse_structure_from_ccs(ccs: &CCS) -> SparseMatrixStructure {
     }
 }
 
-fn build_bound_jacobian_sparse(bounds: &BoundConstraints, dimension: Index) -> SparseMatrix {
-    let mut columns = vec![Vec::<(usize, f64)>::new(); dimension];
-    for (row, &idx) in bounds.lower_indices.iter().enumerate() {
-        columns[idx].push((row, -1.0));
-    }
-    let row_offset = bounds.lower_indices.len();
-    for (row, &idx) in bounds.upper_indices.iter().enumerate() {
-        columns[idx].push((row_offset + row, 1.0));
+fn build_sparse_column_reduction(
+    source: &SparseMatrixStructure,
+    fixed_variables: &FixedVariableElimination,
+) -> SparseColumnReduction {
+    if !fixed_variables.has_fixed() {
+        return SparseColumnReduction {
+            structure: Arc::new(source.clone()),
+            source_value_indices: (0..source.ccs.nnz()).collect(),
+        };
     }
 
-    let mut col_ptrs = Vec::with_capacity(dimension + 1);
+    let mut col_ptrs = Vec::with_capacity(fixed_variables.reduced_dimension() + 1);
     let mut row_indices = Vec::new();
-    let mut values = Vec::new();
+    let mut source_value_indices = Vec::new();
     col_ptrs.push(0);
-    for column in columns {
-        for (row, value) in column {
-            row_indices.push(row);
-            values.push(value);
+    for &source_col in &fixed_variables.free_indices {
+        for source_index in source.ccs.col_ptrs[source_col]..source.ccs.col_ptrs[source_col + 1] {
+            row_indices.push(source.ccs.row_indices[source_index]);
+            source_value_indices.push(source_index);
         }
         col_ptrs.push(row_indices.len());
     }
-
-    let ccs = CCS::new(bounds.total_count(), dimension, col_ptrs, row_indices);
-    SparseMatrix {
-        structure: Arc::new(sparse_structure_from_ccs(&ccs)),
-        values,
-    }
-}
-
-fn vstack_sparse_structures(
-    top: &SparseMatrixStructure,
-    bottom: &SparseMatrixStructure,
-) -> SparseMatrixStructure {
-    debug_assert_eq!(top.ccs.ncol, bottom.ccs.ncol);
-    let row_offset = top.ccs.nrow;
-    let mut col_ptrs = Vec::with_capacity(top.ccs.ncol + 1);
-    let mut row_indices = Vec::with_capacity(top.ccs.nnz() + bottom.ccs.nnz());
-    col_ptrs.push(0);
-    for col in 0..top.ccs.ncol {
-        row_indices.extend_from_slice(
-            &top.ccs.row_indices[top.ccs.col_ptrs[col]..top.ccs.col_ptrs[col + 1]],
-        );
-        row_indices.extend(
-            bottom.ccs.row_indices[bottom.ccs.col_ptrs[col]..bottom.ccs.col_ptrs[col + 1]]
-                .iter()
-                .map(|row| row_offset + row),
-        );
-        col_ptrs.push(row_indices.len());
-    }
-    sparse_structure_from_ccs(&CCS::new(
-        top.ccs.nrow + bottom.ccs.nrow,
-        top.ccs.ncol,
+    let ccs = CCS::new(
+        source.ccs.nrow,
+        fixed_variables.reduced_dimension(),
         col_ptrs,
         row_indices,
-    ))
+    );
+    SparseColumnReduction {
+        structure: Arc::new(sparse_structure_from_ccs(&ccs)),
+        source_value_indices,
+    }
 }
 
-fn stack_sparse_values(top_ccs: &CCS, top_values: &[f64], bottom: &SparseMatrix) -> Vec<f64> {
-    debug_assert_eq!(top_values.len(), top_ccs.nnz());
-    debug_assert_eq!(top_ccs.ncol, bottom.structure.ccs.ncol);
-    let mut values = Vec::with_capacity(top_values.len() + bottom.values.len());
-    for col in 0..top_ccs.ncol {
-        values.extend_from_slice(&top_values[top_ccs.col_ptrs[col]..top_ccs.col_ptrs[col + 1]]);
-        values.extend_from_slice(
-            &bottom.values
-                [bottom.structure.ccs.col_ptrs[col]..bottom.structure.ccs.col_ptrs[col + 1]],
-        );
+fn reduce_sparse_matrix_columns(
+    matrix: &SparseMatrix,
+    reduction: &SparseColumnReduction,
+) -> SparseMatrix {
+    SparseMatrix {
+        structure: Arc::clone(&reduction.structure),
+        values: reduction
+            .source_value_indices
+            .iter()
+            .map(|&source_index| matrix.values[source_index])
+            .collect(),
     }
-    values
+}
+
+fn build_symmetric_submatrix_reduction(
+    source: &CCS,
+    fixed_variables: &FixedVariableElimination,
+) -> SymmetricSubmatrixReduction {
+    if !fixed_variables.has_fixed() {
+        return SymmetricSubmatrixReduction {
+            lower_triangle: Arc::new(source.clone()),
+            source_value_indices: (0..source.nnz()).collect(),
+        };
+    }
+
+    let mut col_ptrs = Vec::with_capacity(fixed_variables.reduced_dimension() + 1);
+    let mut row_indices = Vec::new();
+    let mut source_value_indices = Vec::new();
+    col_ptrs.push(0);
+    for &source_col in &fixed_variables.free_indices {
+        for source_index in source.col_ptrs[source_col]..source.col_ptrs[source_col + 1] {
+            let source_row = source.row_indices[source_index];
+            if let Some(reduced_row) = fixed_variables.free_position[source_row] {
+                row_indices.push(reduced_row);
+                source_value_indices.push(source_index);
+            }
+        }
+        col_ptrs.push(row_indices.len());
+    }
+    SymmetricSubmatrixReduction {
+        lower_triangle: Arc::new(CCS::new(
+            fixed_variables.reduced_dimension(),
+            fixed_variables.reduced_dimension(),
+            col_ptrs,
+            row_indices,
+        )),
+        source_value_indices,
+    }
+}
+
+fn reduce_symmetric_matrix(
+    matrix: &SparseSymmetricMatrix,
+    reduction: &SymmetricSubmatrixReduction,
+) -> SparseSymmetricMatrix {
+    SparseSymmetricMatrix {
+        lower_triangle: Arc::clone(&reduction.lower_triangle),
+        values: reduction
+            .source_value_indices
+            .iter()
+            .map(|&source_index| matrix.values[source_index])
+            .collect(),
+    }
 }
 
 fn sparse_add_transpose_mat_vec(out: &mut [f64], matrix: &SparseMatrix, vector: &[f64]) {
@@ -2963,16 +4100,10 @@ fn lagrangian_gradient_sparse(
     residual
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "State evaluation threads through compiled NLP data and profiling sinks explicitly."
-)]
 fn trial_state<P>(
     problem: &P,
     x: &[f64],
     parameters: &[ParameterMatrix<'_>],
-    bounds: &BoundConstraints,
-    bound_jacobian: &SparseMatrix,
     equality_jacobian_structure: &Arc<SparseMatrixStructure>,
     inequality_jacobian_structure: &Arc<SparseMatrixStructure>,
     profiling: &mut InteriorPointProfiling,
@@ -2983,9 +4114,7 @@ where
 {
     let mut gradient = vec![0.0; problem.dimension()];
     let mut equality_values = vec![0.0; problem.equality_count()];
-    let mut nonlinear_inequality_values = vec![0.0; problem.inequality_count()];
-    let mut augmented_inequality_values =
-        vec![0.0; problem.inequality_count() + bounds.total_count()];
+    let mut augmented_inequality_values = vec![0.0; problem.inequality_count()];
     let mut equality_jacobian_values = vec![0.0; problem.equality_jacobian_ccs().nnz()];
     let mut inequality_jacobian_values = vec![0.0; problem.inequality_jacobian_ccs().nnz()];
     let objective_value = time_callback(&mut profiling.objective_value, callback_time, || {
@@ -2998,14 +4127,8 @@ where
         problem.equality_values(x, parameters, &mut equality_values);
     });
     time_callback(&mut profiling.inequality_values, callback_time, || {
-        problem.inequality_values(x, parameters, &mut nonlinear_inequality_values);
+        problem.inequality_values(x, parameters, &mut augmented_inequality_values);
     });
-    augment_inequality_values(
-        &nonlinear_inequality_values,
-        x,
-        bounds,
-        &mut augmented_inequality_values,
-    );
     time_callback(
         &mut profiling.equality_jacobian_values,
         callback_time,
@@ -3027,93 +4150,240 @@ where
         },
         inequality_jacobian: SparseMatrix {
             structure: Arc::clone(inequality_jacobian_structure),
-            values: stack_sparse_values(
-                problem.inequality_jacobian_ccs(),
-                &inequality_jacobian_values,
-                bound_jacobian,
-            ),
+            values: inequality_jacobian_values,
         },
     }
 }
 
-fn least_squares_initial_dual_state(
-    state: &EvalState,
-    initial_z: &[f64],
-    regularization: f64,
-    solver: InteriorPointLinearSolver,
-) -> (Vec<f64>, Vec<f64>) {
-    let meq = state.equality_values.len();
-    let mineq = state.augmented_inequality_values.len();
-    if meq + mineq == 0 {
-        return (Vec::new(), Vec::new());
-    }
-
-    debug_assert_eq!(initial_z.len(), mineq);
-    let lambda_eq = least_squares_equality_multipliers(state, initial_z, regularization, solver);
-    (lambda_eq, initial_z.to_vec())
-}
-
-fn least_squares_equality_multipliers(
+fn least_squares_constraint_multipliers(
     state: &EvalState,
     z: &[f64],
     regularization: f64,
     solver: InteriorPointLinearSolver,
-) -> Vec<f64> {
-    let dual_regularization = regularization.max(1e-8);
+) -> (Vec<f64>, Vec<f64>) {
+    let debug_ls_multipliers = std::env::var_os("NLIP_DEBUG_LS_MULT").is_some();
     let meq = state.equality_values.len();
     let mineq = state.augmented_inequality_values.len();
-    if meq == 0 {
-        return Vec::new();
-    }
-    let mut adjusted_gradient = state.gradient.clone();
-    if mineq > 0 {
-        sparse_add_transpose_mat_vec(&mut adjusted_gradient, &state.inequality_jacobian, z);
+    let total_constraints = meq + mineq;
+    if total_constraints == 0 {
+        return (Vec::new(), Vec::new());
     }
 
     let n = state.gradient.len();
+    let slack_offset = n;
+    let lambda_offset = slack_offset + mineq;
+    let ineq_offset = lambda_offset + meq;
+    let dimension = ineq_offset + mineq;
     let mut rows = Vec::new();
     let mut cols = Vec::new();
     let mut values = Vec::new();
-    let mut rhs = vec![0.0; meq];
-    for (col, &adjusted_grad_col) in adjusted_gradient.iter().enumerate().take(n) {
-        let start = state.equality_jacobian.structure.ccs.col_ptrs[col];
-        let end = state.equality_jacobian.structure.ccs.col_ptrs[col + 1];
-        let mut hits = Vec::new();
-        for index in start..end {
-            hits.push((
-                state.equality_jacobian.structure.ccs.row_indices[index],
-                state.equality_jacobian.values[index],
-            ));
-        }
-        for &(row, value) in &hits {
-            rhs[row] -= value * adjusted_grad_col;
-        }
-        for (offset, &(row_i, value_i)) in hits.iter().enumerate() {
-            for &(row_j, value_j) in &hits[offset..] {
-                rows.push(row_i.min(row_j));
-                cols.push(row_i.max(row_j));
-                values.push(value_i * value_j);
-            }
-        }
+    let mut rhs = vec![0.0; dimension];
+    rhs[..n].copy_from_slice(&state.gradient);
+    for (row, &z_i) in z.iter().enumerate().take(mineq) {
+        rhs[slack_offset + row] = z_i;
     }
-    for diag in 0..meq {
+
+    for diag in 0..n {
         rows.push(diag);
         cols.push(diag);
-        values.push(dual_regularization);
+        values.push(1.0);
     }
-    let normal_matrix = CscMatrix::new_from_triplets(meq, meq, rows, cols, values);
-    match solve_symmetric_system(
+    for diag in 0..mineq {
+        let index = slack_offset + diag;
+        rows.push(index);
+        cols.push(index);
+        values.push(1.0);
+    }
+    for col in 0..n {
+        for index in state.equality_jacobian.structure.ccs.col_ptrs[col]
+            ..state.equality_jacobian.structure.ccs.col_ptrs[col + 1]
+        {
+            let dual_col = lambda_offset + state.equality_jacobian.structure.ccs.row_indices[index];
+            rows.push(col.min(dual_col));
+            cols.push(col.max(dual_col));
+            values.push(state.equality_jacobian.values[index]);
+        }
+        for index in state.inequality_jacobian.structure.ccs.col_ptrs[col]
+            ..state.inequality_jacobian.structure.ccs.col_ptrs[col + 1]
+        {
+            let dual_col = ineq_offset + state.inequality_jacobian.structure.ccs.row_indices[index];
+            rows.push(col.min(dual_col));
+            cols.push(col.max(dual_col));
+            values.push(state.inequality_jacobian.values[index]);
+        }
+    }
+    for row in 0..mineq {
+        let slack_index = slack_offset + row;
+        let dual_index = ineq_offset + row;
+        rows.push(slack_index.min(dual_index));
+        cols.push(slack_index.max(dual_index));
+        values.push(-1.0);
+    }
+
+    let augmented_matrix = CscMatrix::new_from_triplets(dimension, dimension, rows, cols, values);
+    let dsigns = quasidefinite_dsigns(n + mineq, total_constraints);
+    match try_solve_symmetric_system_with_metrics(
         solver,
-        &normal_matrix,
+        &augmented_matrix,
         &rhs,
-        dual_regularization,
-        None,
+        regularization.max(1e-12),
+        Some(&dsigns),
         0,
         1.0,
-        dual_regularization,
+        regularization.max(1e-12),
     ) {
-        Ok((solution, _, _)) => solution,
-        Err(_) => vec![0.0; meq],
+        Ok((solution, stats, _regularization_used)) => {
+            let lambda_eq = solution[lambda_offset..lambda_offset + meq]
+                .iter()
+                .map(|value| -*value)
+                .collect::<Vec<_>>();
+            let lambda_ineq = solution[ineq_offset..ineq_offset + mineq]
+                .iter()
+                .map(|value| -*value)
+                .collect::<Vec<_>>();
+            if debug_ls_multipliers {
+                let residual_current = lagrangian_gradient_sparse(
+                    &state.gradient,
+                    &state.equality_jacobian,
+                    &lambda_eq,
+                    &state.inequality_jacobian,
+                    &lambda_ineq,
+                );
+                let neg_lambda_eq = lambda_eq.iter().map(|value| -*value).collect::<Vec<_>>();
+                let neg_lambda_ineq = lambda_ineq.iter().map(|value| -*value).collect::<Vec<_>>();
+                let residual_neg_eq = lagrangian_gradient_sparse(
+                    &state.gradient,
+                    &state.equality_jacobian,
+                    &neg_lambda_eq,
+                    &state.inequality_jacobian,
+                    &lambda_ineq,
+                );
+                let residual_neg_ineq = lagrangian_gradient_sparse(
+                    &state.gradient,
+                    &state.equality_jacobian,
+                    &lambda_eq,
+                    &state.inequality_jacobian,
+                    &neg_lambda_ineq,
+                );
+                let residual_neg_both = lagrangian_gradient_sparse(
+                    &state.gradient,
+                    &state.equality_jacobian,
+                    &neg_lambda_eq,
+                    &state.inequality_jacobian,
+                    &neg_lambda_ineq,
+                );
+                let slack_stationarity_inf = lambda_ineq
+                    .iter()
+                    .zip(z.iter())
+                    .fold(0.0_f64, |acc, (y_i, z_i)| acc.max((y_i - z_i).abs()));
+                let rhs_plus_slack_report = {
+                    let mut alt_rhs = rhs.clone();
+                    for (row, &z_i) in z.iter().enumerate().take(mineq) {
+                        alt_rhs[slack_offset + row] = z_i;
+                    }
+                    try_solve_symmetric_system_with_metrics(
+                        solver,
+                        &augmented_matrix,
+                        &alt_rhs,
+                        regularization.max(1e-12),
+                        Some(&dsigns),
+                        0,
+                        1.0,
+                        regularization.max(1e-12),
+                    )
+                    .ok()
+                    .map(|(alt_solution, _stats, _regularization_used)| {
+                        let alt_lambda_eq =
+                            alt_solution[lambda_offset..lambda_offset + meq].to_vec();
+                        let alt_lambda_ineq =
+                            alt_solution[ineq_offset..ineq_offset + mineq].to_vec();
+                        let alt_residual = lagrangian_gradient_sparse(
+                            &state.gradient,
+                            &state.equality_jacobian,
+                            &alt_lambda_eq,
+                            &state.inequality_jacobian,
+                            &alt_lambda_ineq,
+                        );
+                        let neg_alt_lambda_eq =
+                            alt_lambda_eq.iter().map(|value| -*value).collect::<Vec<_>>();
+                        let neg_alt_lambda_ineq =
+                            alt_lambda_ineq.iter().map(|value| -*value).collect::<Vec<_>>();
+                        let alt_neg_both_residual = lagrangian_gradient_sparse(
+                            &state.gradient,
+                            &state.equality_jacobian,
+                            &neg_alt_lambda_eq,
+                            &state.inequality_jacobian,
+                            &neg_alt_lambda_ineq,
+                        );
+                        let alt_slack_stationarity_inf = alt_lambda_ineq
+                            .iter()
+                            .zip(z.iter())
+                            .fold(0.0_f64, |acc, (y_i, z_i)| acc.max((y_i - z_i).abs()));
+                        let alt_neg_slack_stationarity_inf = neg_alt_lambda_ineq
+                            .iter()
+                            .zip(z.iter())
+                            .fold(0.0_f64, |acc, (y_i, z_i)| acc.max((y_i - z_i).abs()));
+                        format!(
+                            "rhs_plus_lag={:.6e} rhs_plus_slack_stat={:.6e} rhs_plus_neg_both_lag={:.6e} rhs_plus_neg_slack_stat={:.6e} rhs_plus_lambda_eq_inf={:.6e} rhs_plus_lambda_ineq_inf={:.6e}",
+                            inf_norm(&alt_residual),
+                            alt_slack_stationarity_inf,
+                            inf_norm(&alt_neg_both_residual),
+                            alt_neg_slack_stationarity_inf,
+                            inf_norm(&alt_lambda_eq),
+                            inf_norm(&alt_lambda_ineq),
+                        )
+                    })
+                    .unwrap_or_else(|| "rhs_plus_failed".to_string())
+                };
+                eprintln!(
+                    "NLIP_DEBUG_LS_MULT success solver={} n={} meq={} mineq={} lambda_eq_inf={:.6e} lambda_ineq_inf={:.6e} residual_inf={:.6e} solution_inf={:.6e} inertia={} lag_current={:.6e} lag_neg_eq={:.6e} lag_neg_ineq={:.6e} lag_neg_both={:.6e} slack_stat={:.6e} {}",
+                    solver.label(),
+                    n,
+                    meq,
+                    mineq,
+                    inf_norm(&lambda_eq),
+                    inf_norm(&lambda_ineq),
+                    stats.residual_inf,
+                    stats.solution_inf,
+                    stats.inertia.map_or_else(
+                        || "none".to_owned(),
+                        |inertia| format!(
+                            "+{}/-{}/0{}",
+                            inertia.positive, inertia.negative, inertia.zero
+                        )
+                    ),
+                    inf_norm(&residual_current),
+                    inf_norm(&residual_neg_eq),
+                    inf_norm(&residual_neg_ineq),
+                    inf_norm(&residual_neg_both),
+                    slack_stationarity_inf,
+                    rhs_plus_slack_report,
+                );
+            }
+            (lambda_eq, lambda_ineq)
+        }
+        Err(attempts) => {
+            if debug_ls_multipliers {
+                let details = attempts
+                    .iter()
+                    .map(|attempt| {
+                        format!(
+                            "{}:{} reg={:.3e} detail={}",
+                            attempt.solver.label(),
+                            attempt.failure_kind.label(),
+                            attempt.regularization,
+                            attempt.detail.as_deref().unwrap_or("none")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                eprintln!(
+                    "NLIP_DEBUG_LS_MULT fallback_zero n={} meq={} mineq={} attempts=[{}]",
+                    n, meq, mineq, details
+                );
+            }
+            (vec![0.0; meq], vec![0.0; mineq])
+        }
     }
 }
 
@@ -3255,6 +4525,22 @@ fn symmetric_csc_upper_abs_mat_vec(matrix: &CscMatrix<f64>, vector_abs: &[f64]) 
         }
     }
     product
+}
+
+fn symmetric_csc_lower_from_any_triangle(matrix: &CscMatrix<f64>) -> CscMatrix<f64> {
+    debug_assert_eq!(matrix.m, matrix.n);
+    let mut rows = Vec::with_capacity(matrix.nzval.len());
+    let mut cols = Vec::with_capacity(matrix.nzval.len());
+    let mut values = Vec::with_capacity(matrix.nzval.len());
+    for col in 0..matrix.n {
+        for index in matrix.colptr[col]..matrix.colptr[col + 1] {
+            let row = matrix.rowval[index];
+            rows.push(row.max(col));
+            cols.push(row.min(col));
+            values.push(matrix.nzval[index]);
+        }
+    }
+    CscMatrix::new_from_triplets(matrix.m, matrix.n, rows, cols, values)
 }
 
 fn assess_linear_solution(
@@ -3654,16 +4940,26 @@ fn factor_solve_spral_ssids_symmetric_with_metrics(
             residual_inf_limit: None,
         });
     }
-    let spral_matrix =
-        SpralSymmetricCscMatrix::new(n, &matrix.colptr, &matrix.rowval, Some(&matrix.nzval))
-            .map_err(|error| {
-                spral_error_attempt(
-                    regularization,
-                    InteriorPointLinearSolveFailureKind::FactorizationFailed,
-                    error,
-                )
-            })?;
-    let ccs = CCS::new(n, n, matrix.colptr.clone(), matrix.rowval.clone());
+    let lower_matrix = symmetric_csc_lower_from_any_triangle(matrix);
+    let spral_matrix = SpralSymmetricCscMatrix::new(
+        n,
+        &lower_matrix.colptr,
+        &lower_matrix.rowval,
+        Some(&lower_matrix.nzval),
+    )
+    .map_err(|error| {
+        spral_error_attempt(
+            regularization,
+            InteriorPointLinearSolveFailureKind::FactorizationFailed,
+            error,
+        )
+    })?;
+    let ccs = CCS::new(
+        n,
+        n,
+        lower_matrix.colptr.clone(),
+        lower_matrix.rowval.clone(),
+    );
     let factor_started = Instant::now();
     let (symbolic, _) =
         spral_analyse(spral_matrix, &SpralSsidsOptions::default()).map_err(|error| {
@@ -3699,7 +4995,7 @@ fn factor_solve_spral_ssids_symmetric_with_metrics(
     let mut solve_time = solve_started.elapsed();
     let refinement_steps = refine_linear_solution_ccs(
         &ccs,
-        &matrix.nzval,
+        &lower_matrix.nzval,
         rhs,
         &mut solution,
         &mut solve_time,
@@ -3713,7 +5009,7 @@ fn factor_solve_spral_ssids_symmetric_with_metrics(
             })
         },
     )?;
-    let assessment = assess_linear_solution_ccs(&ccs, &matrix.nzval, rhs, &solution);
+    let assessment = assess_linear_solution_ccs(&ccs, &lower_matrix.nzval, rhs, &solution);
     assessment
         .map(|assessment| {
             (
@@ -3756,16 +5052,26 @@ fn factor_solve_native_spral_ssids_symmetric_with_metrics(
             residual_inf_limit: None,
         });
     }
-    let spral_matrix =
-        SpralSymmetricCscMatrix::new(n, &matrix.colptr, &matrix.rowval, Some(&matrix.nzval))
-            .map_err(|error| {
-                native_spral_error_attempt(
-                    regularization,
-                    InteriorPointLinearSolveFailureKind::FactorizationFailed,
-                    error,
-                )
-            })?;
-    let ccs = CCS::new(n, n, matrix.colptr.clone(), matrix.rowval.clone());
+    let lower_matrix = symmetric_csc_lower_from_any_triangle(matrix);
+    let spral_matrix = SpralSymmetricCscMatrix::new(
+        n,
+        &lower_matrix.colptr,
+        &lower_matrix.rowval,
+        Some(&lower_matrix.nzval),
+    )
+    .map_err(|error| {
+        native_spral_error_attempt(
+            regularization,
+            InteriorPointLinearSolveFailureKind::FactorizationFailed,
+            error,
+        )
+    })?;
+    let ccs = CCS::new(
+        n,
+        n,
+        lower_matrix.colptr.clone(),
+        lower_matrix.rowval.clone(),
+    );
     let native = NativeSpralLibrary::load().map_err(|error| {
         native_spral_error_attempt(
             regularization,
@@ -3803,7 +5109,7 @@ fn factor_solve_native_spral_ssids_symmetric_with_metrics(
     let mut solve_time = solve_started.elapsed();
     let refinement_steps = refine_linear_solution_ccs(
         &ccs,
-        &matrix.nzval,
+        &lower_matrix.nzval,
         rhs,
         &mut solution,
         &mut solve_time,
@@ -3817,7 +5123,7 @@ fn factor_solve_native_spral_ssids_symmetric_with_metrics(
             })
         },
     )?;
-    let assessment = assess_linear_solution_ccs(&ccs, &matrix.nzval, rhs, &solution);
+    let assessment = assess_linear_solution_ccs(&ccs, &lower_matrix.nzval, rhs, &solution);
     assessment
         .map(|assessment| {
             (
@@ -4219,6 +5525,46 @@ fn next_ipopt_hessian_perturbation(
     }
 }
 
+fn ipopt_jacobian_perturbation(system: &ReducedKktSystem<'_>) -> f64 {
+    system.jacobian_regularization_value
+        * system
+            .barrier_parameter
+            .max(0.0)
+            .powf(system.jacobian_regularization_exponent)
+}
+
+fn is_factorization_failure(attempt: &InteriorPointLinearSolveAttempt) -> bool {
+    attempt.failure_kind == InteriorPointLinearSolveFailureKind::FactorizationFailed
+}
+
+fn is_singularity_like_linear_failure(attempt: &InteriorPointLinearSolveAttempt) -> bool {
+    is_factorization_failure(attempt)
+        || (attempt.failure_kind == InteriorPointLinearSolveFailureKind::InertiaMismatch
+            && attempt
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("negative_eigenvalues_too_few")))
+}
+
+fn inertia_mismatch_detail(expected: SpralInertia, actual: SpralInertia) -> String {
+    let prefix = if actual.negative < expected.negative {
+        "negative_eigenvalues_too_few; "
+    } else if actual.negative > expected.negative {
+        "negative_eigenvalues_too_many; "
+    } else {
+        ""
+    };
+    format!(
+        "{prefix}expected inertia (+{}, -{}, 0={}), got (+{}, -{}, 0={})",
+        expected.positive,
+        expected.negative,
+        expected.zero,
+        actual.positive,
+        actual.negative,
+        actual.zero
+    )
+}
+
 fn append_selected_constraint_block_triplets(
     matrix: &SparseMatrix,
     selected_rows: &[usize],
@@ -4258,15 +5604,16 @@ fn fill_spral_augmented_kkt_values(
     values: &mut [f64],
     system: &ReducedKktSystem<'_>,
     primal_shift: f64,
+    slack_shift: f64,
     dual_shift: f64,
-    inequality_scalings: &[f64],
 ) {
     values.fill(0.0);
     for (index, &slot) in pattern.hessian_value_indices.iter().enumerate() {
         values[slot] += system.hessian.values[index];
     }
-    for &slot in &pattern.x_diagonal_indices {
+    for (index, &slot) in pattern.x_diagonal_indices.iter().enumerate() {
         values[slot] += primal_shift;
+        values[slot] += system.bound_diagonal.get(index).copied().unwrap_or(0.0);
     }
     for (index, &slot) in pattern.equality_jacobian_value_indices.iter().enumerate() {
         values[slot] += system.equality_jacobian.values[index];
@@ -4274,8 +5621,9 @@ fn fill_spral_augmented_kkt_values(
     for (index, &slot) in pattern.inequality_jacobian_value_indices.iter().enumerate() {
         values[slot] += system.inequality_jacobian.values[index];
     }
-    for &slot in &pattern.p_diagonal_indices {
-        values[slot] += 1.0;
+    for (index, &slot) in pattern.p_diagonal_indices.iter().enumerate() {
+        values[slot] +=
+            system.multipliers[index].max(1e-16) / system.slack[index].max(1e-16) + slack_shift;
     }
     for &slot in &pattern.lambda_diagonal_indices {
         values[slot] += -dual_shift;
@@ -4283,8 +5631,8 @@ fn fill_spral_augmented_kkt_values(
     for &slot in &pattern.z_diagonal_indices {
         values[slot] += -dual_shift;
     }
-    for (index, &slot) in pattern.pz_indices.iter().enumerate() {
-        values[slot] += inequality_scalings[index];
+    for &slot in &pattern.pz_indices {
+        values[slot] += 1.0;
     }
 }
 
@@ -4292,16 +5640,16 @@ fn assemble_spral_augmented_kkt_values(
     workspace: &mut SpralAugmentedKktWorkspace,
     system: &ReducedKktSystem<'_>,
     primal_shift: f64,
+    slack_shift: f64,
     dual_shift: f64,
-    inequality_scalings: &[f64],
 ) {
     fill_spral_augmented_kkt_values(
         &workspace.pattern,
         &mut workspace.values,
         system,
         primal_shift,
+        slack_shift,
         dual_shift,
-        inequality_scalings,
     );
 }
 
@@ -4450,15 +5798,7 @@ fn factor_solve_spral_ssids(
         return Err(spral_error_attempt(
             regularization,
             InteriorPointLinearSolveFailureKind::InertiaMismatch,
-            format!(
-                "expected inertia (+{}, -{}, 0={}), got (+{}, -{}, 0={})",
-                expected_inertia.positive,
-                expected_inertia.negative,
-                expected_inertia.zero,
-                actual_inertia.positive,
-                actual_inertia.negative,
-                actual_inertia.zero
-            ),
+            inertia_mismatch_detail(expected_inertia, actual_inertia),
         ));
     }
 
@@ -4534,12 +5874,42 @@ fn factor_solve_native_spral_ssids(
         )
     })?;
 
+    let value_dependent_analysis = matches!(workspace.ordering, SpralNativeOrdering::Matching);
+    let mut reused_symbolic =
+        workspace.factor_regularization.is_some() && !value_dependent_analysis;
+    if value_dependent_analysis || workspace.session.is_none() {
+        let analyse_started = Instant::now();
+        profiling.sparse_symbolic_analyses += 1;
+        workspace.session = Some(
+            workspace
+                .native
+                .analyse_with_options_and_ordering(
+                    matrix,
+                    &workspace.numeric_options,
+                    workspace.ordering,
+                )
+                .map_err(|error| {
+                    native_spral_error_attempt(
+                        regularization,
+                        InteriorPointLinearSolveFailureKind::FactorizationFailed,
+                        format!("native SPRAL analyse failed: {error}"),
+                    )
+                })?,
+        );
+        profiling.sparse_symbolic_analysis_time += analyse_started.elapsed();
+        workspace.factor_regularization = None;
+        reused_symbolic = false;
+    }
+
     let mut factorization_time = Duration::ZERO;
-    let reused_symbolic = workspace.factor_regularization.is_some();
+    let session = workspace
+        .session
+        .as_mut()
+        .expect("native SPRAL session must exist after analysis");
     let factor_started = Instant::now();
     let factor_info = if reused_symbolic {
         profiling.sparse_numeric_refactorizations += 1;
-        workspace.session.refactorize(matrix).map_err(|error| {
+        session.refactorize(matrix).map_err(|error| {
             native_spral_error_attempt(
                 regularization,
                 InteriorPointLinearSolveFailureKind::FactorizationFailed,
@@ -4556,7 +5926,7 @@ fn factor_solve_native_spral_ssids(
                 regularization,
             );
         }
-        workspace.session.factorize(matrix).map_err(|error| {
+        session.factorize(matrix).map_err(|error| {
             native_spral_error_attempt(
                 regularization,
                 InteriorPointLinearSolveFailureKind::FactorizationFailed,
@@ -4577,20 +5947,16 @@ fn factor_solve_native_spral_ssids(
         return Err(native_spral_error_attempt(
             regularization,
             InteriorPointLinearSolveFailureKind::InertiaMismatch,
-            format!(
-                "expected inertia (+{}, -{}, 0={}), got (+{}, -{}, 0={})",
-                expected_inertia.positive,
-                expected_inertia.negative,
-                expected_inertia.zero,
-                factor_info.inertia.positive,
-                factor_info.inertia.negative,
-                factor_info.inertia.zero
-            ),
+            inertia_mismatch_detail(expected_inertia, factor_info.inertia),
         ));
     }
 
     let solve_started = Instant::now();
-    let mut solution = workspace.session.solve(rhs).map_err(|error| {
+    let session = workspace
+        .session
+        .as_ref()
+        .expect("native SPRAL session must exist after factorization");
+    let mut solution = session.solve(rhs).map_err(|error| {
         native_spral_error_attempt(
             regularization,
             InteriorPointLinearSolveFailureKind::FactorizationFailed,
@@ -4605,7 +5971,7 @@ fn factor_solve_native_spral_ssids(
         &mut solution,
         &mut solve_time,
         |residual| {
-            workspace.session.solve(residual).map_err(|error| {
+            session.solve(residual).map_err(|error| {
                 native_spral_error_attempt(
                     regularization,
                     InteriorPointLinearSolveFailureKind::FactorizationFailed,
@@ -4650,20 +6016,13 @@ fn solve_reduced_kkt_with_native_spral_ssids(
     let n = system.hessian.lower_triangle.nrow;
     let meq = system.equality_jacobian.nrows();
     let mineq = system.inequality_jacobian.nrows();
-    let inequality_scalings = system
-        .slack
-        .iter()
-        .zip(system.multipliers.iter())
-        .map(|(slack_i, multiplier_i)| (slack_i.max(1e-16) / multiplier_i.max(1e-16)).sqrt())
-        .collect::<Vec<_>>();
     let rhs_p = system
         .r_cent
         .iter()
         .zip(system.slack.iter())
-        .zip(system.multipliers.iter())
-        .map(|((r_cent_i, slack_i), multiplier_i)| {
-            let scaling = (slack_i.max(1e-16) * multiplier_i.max(1e-16)).sqrt();
-            -r_cent_i / scaling
+        .enumerate()
+        .map(|(index, (r_cent_i, slack_i))| {
+            -(r_cent_i / slack_i.max(1e-16) + damped_slack_stationarity_residual(system, index))
         })
         .collect::<Vec<_>>();
     let total_dimension = workspace.pattern.dimension();
@@ -4671,7 +6030,8 @@ fn solve_reduced_kkt_with_native_spral_ssids(
     rhs[..n]
         .iter_mut()
         .zip(system.r_dual.iter())
-        .for_each(|(rhs_i, r_i)| *rhs_i = -*r_i);
+        .zip(system.bound_rhs.iter())
+        .for_each(|((rhs_i, r_i), bound_rhs_i)| *rhs_i = -*r_i + bound_rhs_i);
     rhs[workspace.pattern.p_offset..workspace.pattern.p_offset + mineq].copy_from_slice(&rhs_p);
     for row in 0..meq {
         rhs[workspace.pattern.lambda_offset + row] = -system.r_eq[row];
@@ -4680,22 +6040,26 @@ fn solve_reduced_kkt_with_native_spral_ssids(
         rhs[workspace.pattern.z_offset + row] = -system.r_ineq[row];
     }
 
-    let mut attempts = Vec::new();
+    let mut attempts: Vec<InteriorPointLinearSolveAttempt> = Vec::new();
     let mut current_regularization = system.regularization.max(0.0);
+    let mut current_jacobian_regularization = 0.0_f64;
+    let mut tried_jacobian_regularization = false;
     let max_regularization = system
         .regularization_max
         .max(current_regularization)
         .max(system.first_hessian_perturbation);
-    for retry_index in 0..=system.adaptive_regularization_retries {
+    let max_retry_count = system.adaptive_regularization_retries + 2;
+    for retry_index in 0..=max_retry_count {
         let primal_shift = current_regularization;
-        let dual_shift = 0.0;
+        let slack_shift = current_regularization;
+        let dual_shift = current_jacobian_regularization;
         fill_spral_augmented_kkt_values(
             &workspace.pattern,
             &mut workspace.values,
             system,
             primal_shift,
+            slack_shift,
             dual_shift,
-            &inequality_scalings,
         );
         match factor_solve_native_spral_ssids(
             workspace,
@@ -4704,39 +6068,86 @@ fn solve_reduced_kkt_with_native_spral_ssids(
             profiling,
             verbose,
         ) {
-            Ok((solution, backend_stats)) => {
+            Ok((solution, mut backend_stats)) => {
+                if !attempts.is_empty() {
+                    let attempt_detail = attempts
+                        .iter()
+                        .map(|attempt| {
+                            format!(
+                                "reg={:.3e}:{}:{}",
+                                attempt.regularization,
+                                attempt.failure_kind.label(),
+                                attempt.detail.as_deref().unwrap_or("--")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    backend_stats.detail = Some(match backend_stats.detail.take() {
+                        Some(detail) => format!("{detail}; prior_attempts=[{attempt_detail}]"),
+                        None => format!("prior_attempts=[{attempt_detail}]"),
+                    });
+                }
                 let dx = solution[..n].to_vec();
                 let p = solution[workspace.pattern.p_offset..workspace.pattern.p_offset + mineq]
                     .to_vec();
                 let d_lambda = solution
                     [workspace.pattern.lambda_offset..workspace.pattern.lambda_offset + meq]
                     .to_vec();
-                let dz = solution[workspace.pattern.z_offset..workspace.pattern.z_offset + mineq]
+                let d_ineq = solution
+                    [workspace.pattern.z_offset..workspace.pattern.z_offset + mineq]
                     .to_vec();
-                let ds = p
+                let dz = d_ineq
                     .iter()
-                    .zip(inequality_scalings.iter())
-                    .map(|(p_i, scaling_i)| p_i * scaling_i)
+                    .zip(system.r_slack_stationarity.iter())
+                    .zip(p.iter())
+                    .enumerate()
+                    .map(|(index, ((dy_i, _), ds_i))| {
+                        *dy_i
+                            + damped_slack_stationarity_residual(system, index)
+                            + slack_shift * *ds_i
+                    })
                     .collect::<Vec<_>>();
+                let ds = p;
                 return Ok(NewtonDirection {
                     dx,
                     d_lambda,
+                    d_ineq,
                     ds,
                     dz,
+                    dz_lower: Vec::new(),
+                    dz_upper: Vec::new(),
                     solver_used: InteriorPointLinearSolver::NativeSpralSsids,
-                    regularization_used: current_regularization.max(primal_shift),
-                    dual_regularization_used: current_regularization,
+                    regularization_used: current_regularization,
+                    dual_regularization_used: current_jacobian_regularization,
                     primal_diagonal_shift_used: primal_shift,
                     linear_solution: solution,
                     backend_stats,
                     linear_debug: None,
                 });
             }
-            Err(attempt) => attempts.push(attempt),
+            Err(attempt) => {
+                let singularity_like_failure = is_singularity_like_linear_failure(&attempt);
+                attempts.push(attempt);
+                if singularity_like_failure
+                    && meq + mineq > 0
+                    && !tried_jacobian_regularization
+                    && current_jacobian_regularization <= 0.0
+                {
+                    current_jacobian_regularization = ipopt_jacobian_perturbation(system);
+                    tried_jacobian_regularization = true;
+                    if current_jacobian_regularization > 0.0 {
+                        continue;
+                    }
+                }
+                if singularity_like_failure
+                    && current_jacobian_regularization > 0.0
+                    && current_regularization <= 0.0
+                {
+                    current_jacobian_regularization = 0.0;
+                }
+            }
         }
-        if retry_index == system.adaptive_regularization_retries
-            || current_regularization >= max_regularization
-        {
+        if retry_index == max_retry_count || current_regularization >= max_regularization {
             break;
         }
         let Some(next_regularization) = next_ipopt_hessian_perturbation(
@@ -4764,20 +6175,13 @@ fn solve_reduced_kkt_with_spral_ssids(
     let n = system.hessian.lower_triangle.nrow;
     let meq = system.equality_jacobian.nrows();
     let mineq = system.inequality_jacobian.nrows();
-    let inequality_scalings = system
-        .slack
-        .iter()
-        .zip(system.multipliers.iter())
-        .map(|(slack_i, multiplier_i)| (slack_i.max(1e-16) / multiplier_i.max(1e-16)).sqrt())
-        .collect::<Vec<_>>();
     let rhs_p = system
         .r_cent
         .iter()
         .zip(system.slack.iter())
-        .zip(system.multipliers.iter())
-        .map(|((r_cent_i, slack_i), multiplier_i)| {
-            let scaling = (slack_i.max(1e-16) * multiplier_i.max(1e-16)).sqrt();
-            -r_cent_i / scaling
+        .enumerate()
+        .map(|(index, (r_cent_i, slack_i))| {
+            -(r_cent_i / slack_i.max(1e-16) + damped_slack_stationarity_residual(system, index))
         })
         .collect::<Vec<_>>();
     let total_dimension = workspace.pattern.dimension();
@@ -4785,7 +6189,8 @@ fn solve_reduced_kkt_with_spral_ssids(
     rhs[..n]
         .iter_mut()
         .zip(system.r_dual.iter())
-        .for_each(|(rhs_i, r_i)| *rhs_i = -*r_i);
+        .zip(system.bound_rhs.iter())
+        .for_each(|((rhs_i, r_i), bound_rhs_i)| *rhs_i = -*r_i + bound_rhs_i);
     rhs[workspace.pattern.p_offset..workspace.pattern.p_offset + mineq].copy_from_slice(&rhs_p);
     for row in 0..meq {
         rhs[workspace.pattern.lambda_offset + row] = -system.r_eq[row];
@@ -4799,13 +6204,14 @@ fn solve_reduced_kkt_with_spral_ssids(
     let max_regularization = system.regularization_max.max(current_regularization);
     for retry_index in 0..=system.adaptive_regularization_retries {
         let primal_shift = sparse_hessian_diagonal_shift(system.hessian, current_regularization);
+        let slack_shift = primal_shift;
         let dual_shift = current_regularization.max(1e-8);
         assemble_spral_augmented_kkt_values(
             workspace,
             system,
             primal_shift,
+            slack_shift,
             dual_shift,
-            &inequality_scalings,
         );
         match factor_solve_spral_ssids(
             system,
@@ -4822,18 +6228,29 @@ fn solve_reduced_kkt_with_spral_ssids(
                 let d_lambda = solution
                     [workspace.pattern.lambda_offset..workspace.pattern.lambda_offset + meq]
                     .to_vec();
-                let dz = solution[workspace.pattern.z_offset..workspace.pattern.z_offset + mineq]
+                let d_ineq = solution
+                    [workspace.pattern.z_offset..workspace.pattern.z_offset + mineq]
                     .to_vec();
-                let ds = p
+                let dz = d_ineq
                     .iter()
-                    .zip(inequality_scalings.iter())
-                    .map(|(p_i, scaling_i)| p_i * scaling_i)
+                    .zip(system.r_slack_stationarity.iter())
+                    .zip(p.iter())
+                    .enumerate()
+                    .map(|(index, ((dy_i, _), ds_i))| {
+                        *dy_i
+                            + damped_slack_stationarity_residual(system, index)
+                            + slack_shift * *ds_i
+                    })
                     .collect::<Vec<_>>();
+                let ds = p;
                 return Ok(NewtonDirection {
                     dx,
                     d_lambda,
+                    d_ineq,
                     ds,
                     dz,
+                    dz_lower: Vec::new(),
+                    dz_upper: Vec::new(),
                     solver_used: InteriorPointLinearSolver::SpralSsids,
                     regularization_used: current_regularization.max(primal_shift),
                     dual_regularization_used: current_regularization,
@@ -4888,7 +6305,19 @@ fn solve_reduced_kkt_with_sparse_qdldl(
         &mut cols,
         &mut values,
     );
-    let mut rhs_top = system.r_dual.iter().map(|value| -value).collect::<Vec<_>>();
+    for (diag, &value) in system.bound_diagonal.iter().enumerate() {
+        if value != 0.0 {
+            rows.push(diag);
+            cols.push(diag);
+            values.push(value);
+        }
+    }
+    let mut rhs_top = system
+        .r_dual
+        .iter()
+        .zip(system.bound_rhs.iter())
+        .map(|(value, bound_rhs)| -value + bound_rhs)
+        .collect::<Vec<_>>();
 
     if mineq > 0 {
         for row in 0..mineq {
@@ -4909,7 +6338,11 @@ fn solve_reduced_kkt_with_sparse_qdldl(
             .zip(system.multipliers.iter())
             .zip(system.r_ineq.iter())
             .zip(system.slack.iter())
-            .map(|(((r_cent_i, z_i), r_ineq_i), s_i)| (r_cent_i - z_i * r_ineq_i) / s_i)
+            .enumerate()
+            .map(|(index, (((r_cent_i, z_i), r_ineq_i), s_i))| {
+                (r_cent_i - z_i * r_ineq_i) / s_i
+                    + damped_slack_stationarity_residual(system, index)
+            })
             .collect::<Vec<_>>();
         sparse_add_transpose_mat_vec(&mut rhs_top, system.inequality_jacobian, &sz_term);
     }
@@ -4967,29 +6400,43 @@ fn solve_reduced_kkt_with_sparse_qdldl(
                 Err(attempts) => return Err(attempts),
             };
         let dx = solution[..n].to_vec();
-        let (ds, dz) = if mineq > 0 {
+        let (ds, d_ineq, dz) = if mineq > 0 {
             let jacobian_dx = sparse_mat_vec(system.inequality_jacobian, &dx);
             let ds = jacobian_dx
                 .iter()
                 .zip(system.r_ineq.iter())
                 .map(|(gdx_i, r_ineq_i)| -r_ineq_i - gdx_i)
                 .collect::<Vec<_>>();
-            let dz = ds
+            let d_ineq = ds
                 .iter()
                 .zip(system.r_cent.iter())
                 .zip(system.multipliers.iter())
                 .zip(system.slack.iter())
-                .map(|(((ds_i, r_cent_i), z_i), s_i)| (-r_cent_i - z_i * ds_i) / s_i.max(1e-16))
+                .enumerate()
+                .map(|(index, (((ds_i, r_cent_i), z_i), s_i))| {
+                    (-r_cent_i
+                        - s_i * damped_slack_stationarity_residual(system, index)
+                        - z_i * ds_i)
+                        / s_i.max(1e-16)
+                })
                 .collect::<Vec<_>>();
-            (ds, dz)
+            let dz = d_ineq
+                .iter()
+                .enumerate()
+                .map(|(index, dy_i)| *dy_i + damped_slack_stationarity_residual(system, index))
+                .collect::<Vec<_>>();
+            (ds, d_ineq, dz)
         } else {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new())
         };
         return Ok(NewtonDirection {
             dx,
             d_lambda: Vec::new(),
+            d_ineq,
             ds,
             dz,
+            dz_lower: Vec::new(),
+            dz_upper: Vec::new(),
             solver_used: InteriorPointLinearSolver::SparseQdldl,
             regularization_used,
             dual_regularization_used: regularization_used,
@@ -5058,31 +6505,45 @@ fn solve_reduced_kkt_with_sparse_qdldl(
             Ok((solution, backend_stats)) => {
                 let dx = solution[..n].to_vec();
                 let d_lambda = solution[n..n + meq].to_vec();
-                let (ds, dz) = if mineq > 0 {
+                let (ds, d_ineq, dz) = if mineq > 0 {
                     let jacobian_dx = sparse_mat_vec(system.inequality_jacobian, &dx);
                     let ds = jacobian_dx
                         .iter()
                         .zip(system.r_ineq.iter())
                         .map(|(gdx_i, r_ineq_i)| -r_ineq_i - gdx_i)
                         .collect::<Vec<_>>();
-                    let dz = ds
+                    let d_ineq = ds
                         .iter()
                         .zip(system.r_cent.iter())
                         .zip(system.multipliers.iter())
                         .zip(system.slack.iter())
-                        .map(|(((ds_i, r_cent_i), z_i), s_i)| {
-                            (-r_cent_i - z_i * ds_i) / s_i.max(1e-16)
+                        .enumerate()
+                        .map(|(index, (((ds_i, r_cent_i), z_i), s_i))| {
+                            (-r_cent_i
+                                - s_i * damped_slack_stationarity_residual(system, index)
+                                - z_i * ds_i)
+                                / s_i.max(1e-16)
                         })
                         .collect::<Vec<_>>();
-                    (ds, dz)
+                    let dz = d_ineq
+                        .iter()
+                        .enumerate()
+                        .map(|(index, dy_i)| {
+                            *dy_i + damped_slack_stationarity_residual(system, index)
+                        })
+                        .collect::<Vec<_>>();
+                    (ds, d_ineq, dz)
                 } else {
-                    (Vec::new(), Vec::new())
+                    (Vec::new(), Vec::new(), Vec::new())
                 };
                 return Ok(NewtonDirection {
                     dx,
                     d_lambda,
+                    d_ineq,
                     ds,
                     dz,
+                    dz_lower: Vec::new(),
+                    dz_upper: Vec::new(),
                     solver_used: InteriorPointLinearSolver::SparseQdldl,
                     regularization_used: current_regularization.max(primal_shift),
                     dual_regularization_used: current_regularization,
@@ -5286,6 +6747,16 @@ fn nlip_log_snapshot(log: &InteriorPointIterationLog) -> InteriorPointIterationS
         iteration: log.iteration,
         phase: log.phase,
         x: Vec::new(),
+        slack_primal: None,
+        equality_multipliers: None,
+        inequality_multipliers: None,
+        slack_multipliers: None,
+        lower_bound_multipliers: None,
+        upper_bound_multipliers: None,
+        kkt_inequality_residual: None,
+        kkt_slack_stationarity: None,
+        kkt_slack_complementarity: None,
+        kkt_slack_sigma: None,
         objective: log.objective_value,
         barrier_objective: Some(log.barrier_objective),
         eq_inf: Some(log.equality_inf),
@@ -5509,6 +6980,16 @@ mod tests {
             iteration: 0,
             phase: InteriorPointIterationPhase::AcceptedStep,
             x: Vec::new(),
+            slack_primal: None,
+            equality_multipliers: None,
+            inequality_multipliers: None,
+            slack_multipliers: None,
+            lower_bound_multipliers: None,
+            upper_bound_multipliers: None,
+            kkt_inequality_residual: None,
+            kkt_slack_stationarity: None,
+            kkt_slack_complementarity: None,
+            kkt_slack_sigma: None,
             objective: 0.0,
             barrier_objective: None,
             eq_inf: None,
@@ -5555,11 +7036,11 @@ mod tests {
         let barrier_update =
             snapshot_with_events(vec![InteriorPointIterationEvent::BarrierParameterUpdated]);
 
-        assert_eq!(nlip_event_slot_codes(&filter_soc), " F S        ");
-        assert_eq!(nlip_event_slot_codes(&filter_watchdog), " F   W      ");
-        assert_eq!(nlip_event_slot_codes(&filter_reset), "      X     ");
-        assert_eq!(nlip_event_slot_codes(&watchdog_only), "     W      ");
-        assert_eq!(nlip_event_slot_codes(&barrier_update), "        U   ");
+        assert_eq!(nlip_event_slot_codes(&filter_soc), " F S         ");
+        assert_eq!(nlip_event_slot_codes(&filter_watchdog), " F   W       ");
+        assert_eq!(nlip_event_slot_codes(&filter_reset), "      X      ");
+        assert_eq!(nlip_event_slot_codes(&watchdog_only), "     W       ");
+        assert_eq!(nlip_event_slot_codes(&barrier_update), "        U    ");
     }
 
     #[test]
@@ -5635,8 +7116,11 @@ mod tests {
         NewtonDirection {
             dx: dx.to_vec(),
             d_lambda: Vec::new(),
+            d_ineq: Vec::new(),
             ds: ds.to_vec(),
             dz: Vec::new(),
+            dz_lower: Vec::new(),
+            dz_upper: Vec::new(),
             solver_used: InteriorPointLinearSolver::SparseQdldl,
             regularization_used: 0.0,
             dual_regularization_used: 0.0,
@@ -6181,20 +7665,22 @@ where
 
     let equality_count = problem.equality_count();
     let inequality_count = problem.inequality_count();
-    let bounds = collect_bound_constraints(problem)
-        .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
-    let augmented_inequality_count = inequality_count + bounds.total_count();
-    let lower_bound_count = bounds.lower_indices.len();
-    let bound_jacobian = build_bound_jacobian_sparse(&bounds, n);
+    let (bounds, fixed_variables) = collect_interior_point_bounds_and_fixed(problem)?;
+    let augmented_inequality_count = inequality_count;
+    let barrier_bound_count = bounds.total_count();
+    let barrier_pair_count = augmented_inequality_count + barrier_bound_count;
     let equality_jacobian_structure =
         Arc::new(sparse_structure_from_ccs(problem.equality_jacobian_ccs()));
-    let nonlinear_inequality_structure =
-        sparse_structure_from_ccs(problem.inequality_jacobian_ccs());
-    let inequality_jacobian_structure = Arc::new(vstack_sparse_structures(
-        &nonlinear_inequality_structure,
-        bound_jacobian.structure.as_ref(),
-    ));
-    let hessian_structure = Arc::new(problem.lagrangian_hessian_ccs().clone());
+    let inequality_jacobian_structure =
+        Arc::new(sparse_structure_from_ccs(problem.inequality_jacobian_ccs()));
+    let equality_column_reduction =
+        build_sparse_column_reduction(equality_jacobian_structure.as_ref(), &fixed_variables);
+    let inequality_column_reduction =
+        build_sparse_column_reduction(inequality_jacobian_structure.as_ref(), &fixed_variables);
+    let full_hessian_structure = Arc::new(problem.lagrangian_hessian_ccs().clone());
+    let hessian_reduction =
+        build_symmetric_submatrix_reduction(full_hessian_structure.as_ref(), &fixed_variables);
+    let hessian_structure = Arc::clone(&hessian_reduction.lower_triangle);
     let preferred_solver = preferred_linear_solver(
         options.linear_solver,
         equality_count,
@@ -6220,8 +7706,11 @@ where
             });
     let mut x = x0.to_vec();
     project_initial_point_into_box_interior(&mut x, &bounds, options);
+    fixed_variables.project_fixed_values(&mut x);
     let mut lambda_eq = vec![0.0; equality_count];
     let mut z = vec![1.0; augmented_inequality_count];
+    let mut z_lower = vec![1.0; bounds.lower_indices.len()];
+    let mut z_upper = vec![1.0; bounds.upper_indices.len()];
     let mut slack = vec![1.0; augmented_inequality_count];
     let mut event_state = SqpEventLegendState::default();
     let mut last_adapter_timing = problem.adapter_timing_snapshot();
@@ -6233,8 +7722,6 @@ where
         problem,
         &x,
         parameters,
-        &bounds,
-        &bound_jacobian,
         &equality_jacobian_structure,
         &inequality_jacobian_structure,
         &mut profiling,
@@ -6247,36 +7734,75 @@ where
         &mut slack,
         options,
     );
+    let initial_slack_barrier = relaxed_slack_barrier_values(&slack, options);
     match options.bound_mult_init_method {
         InteriorPointBoundMultiplierInitMethod::Constant => {
             z.fill(options.bound_mult_init_val);
+            z_lower.fill(options.bound_mult_init_val);
+            z_upper.fill(options.bound_mult_init_val);
         }
         InteriorPointBoundMultiplierInitMethod::MuBased => {
-            for (slack_i, z_i) in slack.iter().zip(z.iter_mut()) {
+            for (slack_i, z_i) in initial_slack_barrier.iter().zip(z.iter_mut()) {
                 *z_i = options.mu_init / slack_i.max(1e-8);
+            }
+            for ((&index, &lower), z_i) in bounds
+                .lower_indices
+                .iter()
+                .zip(bounds.lower_values.iter())
+                .zip(z_lower.iter_mut())
+            {
+                *z_i = options.mu_init / native_lower_bound_slack(&x, index, lower).max(1e-8);
+            }
+            for ((&index, &upper), z_i) in bounds
+                .upper_indices
+                .iter()
+                .zip(bounds.upper_values.iter())
+                .zip(z_upper.iter_mut())
+            {
+                *z_i = options.mu_init / native_upper_bound_slack(&x, index, upper).max(1e-8);
             }
         }
     }
-    if options.least_square_init_duals {
-        let (initial_lambda_eq, initial_z) = least_squares_initial_dual_state(
-            &initial_state,
+    let mut lambda_ineq = z.clone();
+    if (equality_count > 0 || augmented_inequality_count > 0) && options.constr_mult_init_max > 0.0
+    {
+        let mut initial_ls_gradient = initial_state.gradient.clone();
+        add_native_bound_multiplier_terms(&mut initial_ls_gradient, &bounds, &z_lower, &z_upper);
+        let initial_linear_state = EvalState {
+            objective_value: initial_state.objective_value,
+            gradient: fixed_variables.reduce_vector(&initial_ls_gradient),
+            equality_values: initial_state.equality_values.clone(),
+            augmented_inequality_values: initial_state.augmented_inequality_values.clone(),
+            equality_jacobian: reduce_sparse_matrix_columns(
+                &initial_state.equality_jacobian,
+                &equality_column_reduction,
+            ),
+            inequality_jacobian: reduce_sparse_matrix_columns(
+                &initial_state.inequality_jacobian,
+                &inequality_column_reduction,
+            ),
+        };
+        let (initial_lambda_eq, initial_lambda_ineq) = least_squares_constraint_multipliers(
+            &initial_linear_state,
             &z,
             options.regularization,
             options.linear_solver,
         );
-        if initial_z.len() == z.len() {
-            for (z_i, restored_z_i) in z.iter_mut().zip(initial_z.into_iter()) {
-                *z_i = (*z_i).max(restored_z_i);
-            }
+        let initial_lambda_inf = inf_norm(&initial_lambda_eq).max(inf_norm(&initial_lambda_ineq));
+        if initial_lambda_inf <= options.constr_mult_init_max {
+            lambda_eq = initial_lambda_eq;
+            lambda_ineq = initial_lambda_ineq;
+        } else {
+            lambda_eq.fill(0.0);
+            lambda_ineq.fill(0.0);
         }
-        lambda_eq = initial_lambda_eq;
     }
 
     if options.verbose {
         log_interior_point_problem_header(problem, parameters, options);
     }
 
-    let mut nonlinear_inequality_multipliers = vec![0.0; inequality_count];
+    let mut nonlinear_inequality_multipliers = lambda_ineq.clone();
     let mut last_linear_solver = preferred_solver;
     let mut filter_entries = Vec::new();
     let mut filter_reset_count = 0;
@@ -6293,8 +7819,9 @@ where
     let theta_scale = initial_theta.max(1.0);
     let theta_max = options.theta_max_fact * theta_scale;
     let theta_min = options.theta_min_fact * theta_scale;
-    let mut barrier_parameter_value = if augmented_inequality_count > 0 {
-        let initial_complementarity = barrier_parameter(&slack, &z);
+    let mut barrier_parameter_value = if barrier_pair_count > 0 {
+        let initial_complementarity =
+            combined_barrier_parameter(&initial_slack_barrier, &z, &x, &bounds, &z_lower, &z_upper);
         options
             .mu_target
             .max(options.mu_min)
@@ -6308,15 +7835,33 @@ where
     if options.max_iters == 0 {
         let equality_inf = inf_norm(&initial_state.equality_values);
         let inequality_inf = positive_part_inf_norm(&initial_state.augmented_inequality_values);
-        let dual_inf = inf_norm(&lagrangian_gradient_sparse(
+        let initial_inequality_residual =
+            slack_form_inequality_residuals(&initial_state.augmented_inequality_values, &slack);
+        let initial_dual_residual = lagrangian_gradient_sparse(
             &initial_state.gradient,
             &initial_state.equality_jacobian,
             &lambda_eq,
             &initial_state.inequality_jacobian,
-            &z,
-        ));
-        let complementarity_inf = if augmented_inequality_count > 0 {
-            complementarity_inf_norm(&slack, &z)
+            &lambda_ineq,
+        );
+        let mut initial_dual_residual = initial_dual_residual;
+        add_native_bound_multiplier_terms(&mut initial_dual_residual, &bounds, &z_lower, &z_upper);
+        let initial_slack_stationarity_inf = lambda_ineq
+            .iter()
+            .zip(z.iter())
+            .fold(0.0_f64, |acc, (y_i, z_i)| acc.max((y_i - z_i).abs()));
+        let dual_inf = fixed_variables
+            .free_inf_norm(&initial_dual_residual)
+            .max(initial_slack_stationarity_inf);
+        let complementarity_inf = if barrier_pair_count > 0 {
+            combined_complementarity_inf_norm(
+                &initial_slack_barrier,
+                &z,
+                &x,
+                &bounds,
+                &z_lower,
+                &z_upper,
+            )
         } else {
             0.0
         };
@@ -6327,31 +7872,61 @@ where
         );
         let current_barrier_objective = barrier_objective_value(
             initial_state.objective_value,
-            &slack,
+            &initial_slack_barrier,
+            &x,
+            &bounds,
             barrier_parameter_value,
+            options.kappa_d,
         );
         let current_filter_entry = super::filter::entry(current_barrier_objective, current_theta);
-        let all_dual_multipliers = [lambda_eq.as_slice(), z.as_slice()].concat();
+        let all_dual_multipliers = combined_multiplier_vector([
+            lambda_eq.as_slice(),
+            lambda_ineq.as_slice(),
+            z.as_slice(),
+            z_lower.as_slice(),
+            z_upper.as_slice(),
+        ]);
+        let complementarity_multipliers =
+            combined_multiplier_vector([z.as_slice(), z_lower.as_slice(), z_upper.as_slice()]);
         let overall_inf = scaled_overall_inf_norm(
             current_theta,
             dual_inf,
             complementarity_inf,
             &all_dual_multipliers,
-            &z,
+            &complementarity_multipliers,
             options.overall_scale_max,
         );
         let snapshot = InteriorPointIterationSnapshot {
             iteration: 0,
             phase: InteriorPointIterationPhase::Initial,
             x: x.clone(),
+            slack_primal: Some(slack.clone()),
+            equality_multipliers: Some(lambda_eq.clone()),
+            inequality_multipliers: Some(lambda_ineq.clone()),
+            slack_multipliers: Some(z.clone()),
+            lower_bound_multipliers: Some(z_lower.clone()),
+            upper_bound_multipliers: Some(z_upper.clone()),
+            kkt_inequality_residual: Some(initial_inequality_residual),
+            kkt_slack_stationarity: Some(damped_slack_stationarity_residuals(
+                &lambda_ineq,
+                &z,
+                barrier_parameter_value,
+                options.kappa_d,
+            )),
+            kkt_slack_complementarity: Some(slack_complementarity_residuals(
+                &initial_slack_barrier,
+                &z,
+                barrier_parameter_value,
+            )),
+            kkt_slack_sigma: Some(slack_sigma_values(&initial_slack_barrier, &z)),
             objective: initial_state.objective_value,
             barrier_objective: Some(current_barrier_objective),
             eq_inf: (equality_count > 0).then_some(equality_inf),
             ineq_inf: (augmented_inequality_count > 0).then_some(inequality_inf),
             dual_inf,
-            comp_inf: (augmented_inequality_count > 0).then_some(complementarity_inf),
+            comp_inf: (barrier_pair_count > 0).then_some(complementarity_inf),
             overall_inf,
-            barrier_parameter: (augmented_inequality_count > 0).then_some(barrier_parameter_value),
+            barrier_parameter: (barrier_pair_count > 0).then_some(barrier_parameter_value),
             filter_theta: Some(current_theta),
             step_inf: None,
             alpha: None,
@@ -6389,7 +7964,7 @@ where
         if options.verbose {
             let flags = InteriorPointIterationLogFlags {
                 has_equalities: equality_count > 0,
-                has_inequalities: augmented_inequality_count > 0,
+                has_inequalities: barrier_pair_count > 0,
                 iteration_limit_reached: true,
                 ..InteriorPointIterationLogFlags::default()
             };
@@ -6407,7 +7982,7 @@ where
                     dual_inf,
                     complementarity_inf,
                     overall_inf,
-                    barrier_parameter: if augmented_inequality_count > 0 {
+                    barrier_parameter: if barrier_pair_count > 0 {
                         barrier_parameter_value
                     } else {
                         0.0
@@ -6448,8 +8023,6 @@ where
             problem,
             &x,
             parameters,
-            &bounds,
-            &bound_jacobian,
             &equality_jacobian_structure,
             &inequality_jacobian_structure,
             &mut profiling,
@@ -6459,16 +8032,27 @@ where
         let inequality_inf = positive_part_inf_norm(&state.augmented_inequality_values);
         let inequality_residual =
             slack_form_inequality_residuals(&state.augmented_inequality_values, &slack);
+        let slack_barrier = relaxed_slack_barrier_values(&slack, options);
         let internal_inequality_inf = inf_norm(&inequality_residual);
         let primal_inf = equality_inf.max(internal_inequality_inf);
-        let dual_residual = lagrangian_gradient_sparse(
+        let full_dual_residual = lagrangian_gradient_sparse(
             &state.gradient,
             &state.equality_jacobian,
             &lambda_eq,
             &state.inequality_jacobian,
-            &z,
+            &lambda_ineq,
         );
-        let dual_inf = inf_norm(&dual_residual);
+        let mut full_dual_residual = full_dual_residual;
+        add_native_bound_multiplier_terms(&mut full_dual_residual, &bounds, &z_lower, &z_upper);
+        let dual_residual = fixed_variables.reduce_vector(&full_dual_residual);
+        let slack_stationarity_residual = lambda_ineq
+            .iter()
+            .zip(z.iter())
+            .map(|(y_i, z_i)| y_i - z_i)
+            .collect::<Vec<_>>();
+        let dual_x_inf = inf_norm(&dual_residual);
+        let slack_stationarity_inf = inf_norm(&slack_stationarity_residual);
+        let dual_inf = dual_x_inf.max(slack_stationarity_inf);
         let debug_any_dual = std::env::var_os("NLIP_DEBUG_MAX_DUAL_ANY").is_some();
         if (std::env::var_os("NLIP_DEBUG_MAX_DUAL").is_some()
             && primal_inf <= 1.0e-4
@@ -6480,16 +8064,21 @@ where
                 .enumerate()
                 .max_by(|(_, lhs), (_, rhs)| lhs.abs().total_cmp(&rhs.abs()))
         {
-            let equality_contrib = state.equality_jacobian.structure.ccs.col_ptrs[max_index]
-                ..state.equality_jacobian.structure.ccs.col_ptrs[max_index + 1];
+            let full_index = fixed_variables
+                .free_indices
+                .get(max_index)
+                .copied()
+                .unwrap_or(max_index);
+            let equality_contrib = state.equality_jacobian.structure.ccs.col_ptrs[full_index]
+                ..state.equality_jacobian.structure.ccs.col_ptrs[full_index + 1];
             let equality_contrib = equality_contrib
                 .map(|entry| {
                     state.equality_jacobian.values[entry]
                         * lambda_eq[state.equality_jacobian.structure.ccs.row_indices[entry]]
                 })
                 .sum::<f64>();
-            let top_eq_terms = state.equality_jacobian.structure.ccs.col_ptrs[max_index]
-                ..state.equality_jacobian.structure.ccs.col_ptrs[max_index + 1];
+            let top_eq_terms = state.equality_jacobian.structure.ccs.col_ptrs[full_index]
+                ..state.equality_jacobian.structure.ccs.col_ptrs[full_index + 1];
             let mut top_eq_terms = top_eq_terms
                 .map(|entry| {
                     let row = state.equality_jacobian.structure.ccs.row_indices[entry];
@@ -6504,20 +8093,20 @@ where
                 .map(|(row, contribution)| format!("{row}:{contribution:.3e}"))
                 .collect::<Vec<_>>()
                 .join(",");
-            let inequality_contrib = state.inequality_jacobian.structure.ccs.col_ptrs[max_index]
-                ..state.inequality_jacobian.structure.ccs.col_ptrs[max_index + 1];
+            let inequality_contrib = state.inequality_jacobian.structure.ccs.col_ptrs[full_index]
+                ..state.inequality_jacobian.structure.ccs.col_ptrs[full_index + 1];
             let inequality_contrib = inequality_contrib
                 .map(|entry| {
                     state.inequality_jacobian.values[entry]
-                        * z[state.inequality_jacobian.structure.ccs.row_indices[entry]]
+                        * lambda_ineq[state.inequality_jacobian.structure.ccs.row_indices[entry]]
                 })
                 .sum::<f64>();
-            let top_ineq_terms = state.inequality_jacobian.structure.ccs.col_ptrs[max_index]
-                ..state.inequality_jacobian.structure.ccs.col_ptrs[max_index + 1];
+            let top_ineq_terms = state.inequality_jacobian.structure.ccs.col_ptrs[full_index]
+                ..state.inequality_jacobian.structure.ccs.col_ptrs[full_index + 1];
             let mut top_ineq_terms = top_ineq_terms
                 .map(|entry| {
                     let row = state.inequality_jacobian.structure.ccs.row_indices[entry];
-                    let contribution = state.inequality_jacobian.values[entry] * z[row];
+                    let contribution = state.inequality_jacobian.values[entry] * lambda_ineq[row];
                     (row, contribution)
                 })
                 .collect::<Vec<_>>();
@@ -6526,13 +8115,7 @@ where
                 .iter()
                 .take(3)
                 .map(|(row, contribution)| {
-                    let kind = if *row < inequality_count {
-                        "ineq"
-                    } else if *row < inequality_count + lower_bound_count {
-                        "lb"
-                    } else {
-                        "ub"
-                    };
+                    let kind = "ineq";
                     format!("{kind}:{row}:{contribution:.3e}")
                 })
                 .collect::<Vec<_>>()
@@ -6540,10 +8123,10 @@ where
             eprintln!(
                 "NLIP_DEBUG_MAX_DUAL iter={} idx={} residual={:.6e} x={:.6e} grad={:.6e} eq={:.6e} ineq={:.6e} primal={:.6e} top_eq=[{}] top_ineq=[{}]",
                 iteration,
-                max_index,
+                full_index,
                 max_value,
-                x.get(max_index).copied().unwrap_or(0.0),
-                state.gradient.get(max_index).copied().unwrap_or(0.0),
+                x.get(full_index).copied().unwrap_or(0.0),
+                state.gradient.get(full_index).copied().unwrap_or(0.0),
                 equality_contrib,
                 inequality_contrib,
                 primal_inf,
@@ -6551,22 +8134,36 @@ where
                 top_ineq_summary,
             );
         }
-        let complementarity_inf = if augmented_inequality_count > 0 {
-            complementarity_inf_norm(&slack, &z)
+        let complementarity_inf = if barrier_pair_count > 0 {
+            combined_complementarity_inf_norm(&slack_barrier, &z, &x, &bounds, &z_lower, &z_upper)
         } else {
             0.0
         };
-        let all_dual_multipliers = [lambda_eq.as_slice(), z.as_slice()].concat();
+        let all_dual_multipliers = combined_multiplier_vector([
+            lambda_eq.as_slice(),
+            lambda_ineq.as_slice(),
+            z.as_slice(),
+            z_lower.as_slice(),
+            z_upper.as_slice(),
+        ]);
+        let complementarity_multipliers =
+            combined_multiplier_vector([z.as_slice(), z_lower.as_slice(), z_upper.as_slice()]);
         let overall_inf = scaled_overall_inf_norm(
             primal_inf,
             dual_inf,
             complementarity_inf,
             &all_dual_multipliers,
-            &z,
+            &complementarity_multipliers,
             options.overall_scale_max,
         );
-        let current_barrier_objective =
-            barrier_objective_value(state.objective_value, &slack, barrier_parameter_value);
+        let current_barrier_objective = barrier_objective_value(
+            state.objective_value,
+            &slack_barrier,
+            &x,
+            &bounds,
+            barrier_parameter_value,
+            options.kappa_d,
+        );
         let current_theta = filter_theta_l1_norm(
             &state.equality_values,
             &state.augmented_inequality_values,
@@ -6581,14 +8178,33 @@ where
                 InteriorPointIterationPhase::AcceptedStep
             },
             x: x.clone(),
+            slack_primal: Some(slack.clone()),
+            equality_multipliers: Some(lambda_eq.clone()),
+            inequality_multipliers: Some(lambda_ineq.clone()),
+            slack_multipliers: Some(z.clone()),
+            lower_bound_multipliers: Some(z_lower.clone()),
+            upper_bound_multipliers: Some(z_upper.clone()),
+            kkt_inequality_residual: Some(inequality_residual.clone()),
+            kkt_slack_stationarity: Some(damped_slack_stationarity_residuals(
+                &lambda_ineq,
+                &z,
+                barrier_parameter_value,
+                options.kappa_d,
+            )),
+            kkt_slack_complementarity: Some(slack_complementarity_residuals(
+                &slack_barrier,
+                &z,
+                barrier_parameter_value,
+            )),
+            kkt_slack_sigma: Some(slack_sigma_values(&slack_barrier, &z)),
             objective: state.objective_value,
             barrier_objective: Some(current_barrier_objective),
             eq_inf: (equality_count > 0).then_some(equality_inf),
             ineq_inf: (augmented_inequality_count > 0).then_some(inequality_inf),
             dual_inf,
-            comp_inf: (augmented_inequality_count > 0).then_some(complementarity_inf),
+            comp_inf: (barrier_pair_count > 0).then_some(complementarity_inf),
             overall_inf,
-            barrier_parameter: (augmented_inequality_count > 0).then_some(barrier_parameter_value),
+            barrier_parameter: (barrier_pair_count > 0).then_some(barrier_parameter_value),
             filter_theta: Some(current_theta),
             step_inf: None,
             alpha: None,
@@ -6618,9 +8234,13 @@ where
             overall_error: overall_inf,
             dual_inf,
             constr_viol: primal_inf,
-            compl_inf: interior_point_complementarity_target_inf_norm(
-                &slack,
+            compl_inf: combined_complementarity_target_inf_norm(
+                &slack_barrier,
                 &z,
+                &x,
+                &bounds,
+                &z_lower,
+                &z_upper,
                 options.mu_target,
             ),
             objective: state.objective_value,
@@ -6659,15 +8279,33 @@ where
                 iteration,
                 phase: InteriorPointIterationPhase::Converged,
                 x: x.clone(),
+                slack_primal: Some(slack.clone()),
+                equality_multipliers: Some(lambda_eq.clone()),
+                inequality_multipliers: Some(lambda_ineq.clone()),
+                slack_multipliers: Some(z.clone()),
+                lower_bound_multipliers: Some(z_lower.clone()),
+                upper_bound_multipliers: Some(z_upper.clone()),
+                kkt_inequality_residual: Some(inequality_residual.clone()),
+                kkt_slack_stationarity: Some(damped_slack_stationarity_residuals(
+                    &lambda_ineq,
+                    &z,
+                    barrier_parameter_value,
+                    options.kappa_d,
+                )),
+                kkt_slack_complementarity: Some(slack_complementarity_residuals(
+                    &slack_barrier,
+                    &z,
+                    barrier_parameter_value,
+                )),
+                kkt_slack_sigma: Some(slack_sigma_values(&slack_barrier, &z)),
                 objective: state.objective_value,
                 barrier_objective: Some(current_barrier_objective),
                 eq_inf: (equality_count > 0).then_some(equality_inf),
                 ineq_inf: (augmented_inequality_count > 0).then_some(inequality_inf),
                 dual_inf,
-                comp_inf: (augmented_inequality_count > 0).then_some(complementarity_inf),
+                comp_inf: (barrier_pair_count > 0).then_some(complementarity_inf),
                 overall_inf,
-                barrier_parameter: (augmented_inequality_count > 0)
-                    .then_some(barrier_parameter_value),
+                barrier_parameter: (barrier_pair_count > 0).then_some(barrier_parameter_value),
                 filter_theta: Some(current_theta),
                 step_inf: None,
                 alpha: None,
@@ -6701,14 +8339,12 @@ where
             };
             snapshots.push(snapshot.clone());
             callback(&snapshot);
-            let (nonlinear_ineq, lower_bounds, upper_bounds) =
-                split_augmented_inequality_multipliers(&z, inequality_count, lower_bound_count);
             let summary = InteriorPointSummary {
                 x,
                 equality_multipliers: lambda_eq,
-                inequality_multipliers: nonlinear_ineq,
-                lower_bound_multipliers: lower_bounds,
-                upper_bound_multipliers: upper_bounds,
+                inequality_multipliers: lambda_ineq,
+                lower_bound_multipliers: z_lower,
+                upper_bound_multipliers: z_upper,
                 slack,
                 objective: state.objective_value,
                 iterations: iteration,
@@ -6739,7 +8375,7 @@ where
                         phase: InteriorPointIterationPhase::Converged,
                         flags: InteriorPointIterationLogFlags {
                             has_equalities: equality_count > 0,
-                            has_inequalities: augmented_inequality_count > 0,
+                            has_inequalities: barrier_pair_count > 0,
                             ..InteriorPointIterationLogFlags::default()
                         },
                         extra_events: iteration_events.clone(),
@@ -6787,29 +8423,30 @@ where
                 );
             },
         );
-        let hessian = SparseSymmetricMatrix {
-            lower_triangle: Arc::clone(&hessian_structure),
+        let full_hessian = SparseSymmetricMatrix {
+            lower_triangle: Arc::clone(&full_hessian_structure),
             values: hessian_values,
         };
+        let hessian = reduce_symmetric_matrix(&full_hessian, &hessian_reduction);
+        let linear_equality_jacobian =
+            reduce_sparse_matrix_columns(&state.equality_jacobian, &equality_column_reduction);
+        let linear_inequality_jacobian =
+            reduce_sparse_matrix_columns(&state.inequality_jacobian, &inequality_column_reduction);
         let hessian_elapsed = hessian_started.elapsed();
         profiling.kkt_assemblies += 1;
         profiling.kkt_assembly_time += hessian_elapsed;
         iteration_kkt_assembly_time += hessian_elapsed;
 
         let kkt_regularization = kkt_regularization(
-            augmented_inequality_count > 0,
+            barrier_pair_count > 0,
             primal_inf,
             complementarity_inf,
             dual_inf,
             options,
         );
-        let sigma = if augmented_inequality_count > 0 {
-            1.0
-        } else {
-            0.0
-        };
+        let sigma = if barrier_pair_count > 0 { 1.0 } else { 0.0 };
         let r_cent = if augmented_inequality_count > 0 {
-            slack
+            slack_barrier
                 .iter()
                 .zip(z.iter())
                 .map(|(s, z_i)| s * z_i - sigma * barrier_parameter_value)
@@ -6817,17 +8454,32 @@ where
         } else {
             Vec::new()
         };
+        let (bound_diagonal, bound_rhs) = native_bound_kkt_terms(
+            &x,
+            &bounds,
+            &fixed_variables,
+            &z_lower,
+            &z_upper,
+            barrier_parameter_value,
+            sigma,
+            options.kappa_d,
+        );
         let linear_started = Instant::now();
         let reduced_kkt_system = ReducedKktSystem {
             hessian: &hessian,
-            equality_jacobian: &state.equality_jacobian,
-            inequality_jacobian: &state.inequality_jacobian,
-            slack: &slack,
+            equality_jacobian: &linear_equality_jacobian,
+            inequality_jacobian: &linear_inequality_jacobian,
+            bound_diagonal: &bound_diagonal,
+            bound_rhs: &bound_rhs,
+            slack: &slack_barrier,
             multipliers: &z,
             r_dual: &dual_residual,
             r_eq: &state.equality_values,
             r_ineq: &inequality_residual,
+            r_slack_stationarity: &slack_stationarity_residual,
             r_cent: &r_cent,
+            barrier_parameter: barrier_parameter_value,
+            kappa_d: options.kappa_d,
             solver: options.linear_solver,
             regularization: kkt_regularization,
             first_hessian_perturbation: options.first_hessian_perturbation,
@@ -6837,6 +8489,8 @@ where
             regularization_growth_factor: options.regularization_growth_factor,
             regularization_decay_factor: options.regularization_decay_factor,
             regularization_max: options.regularization_max,
+            jacobian_regularization_value: options.jacobian_regularization_value,
+            jacobian_regularization_exponent: options.jacobian_regularization_exponent,
             spral_pivot_method: options.spral_pivot_method,
             spral_action_on_zero_pivot: options.spral_action_on_zero_pivot,
             spral_small_pivot_tolerance: options.spral_small_pivot_tolerance,
@@ -6849,8 +8503,8 @@ where
         {
             match prepare_spral_workspace(
                 hessian_structure.as_ref(),
-                equality_jacobian_structure.as_ref(),
-                inequality_jacobian_structure.as_ref(),
+                equality_column_reduction.structure.as_ref(),
+                inequality_column_reduction.structure.as_ref(),
                 &mut profiling,
                 options.verbose,
             ) {
@@ -6880,8 +8534,8 @@ where
         {
             match prepare_native_spral_workspace(
                 hessian_structure.as_ref(),
-                equality_jacobian_structure.as_ref(),
-                inequality_jacobian_structure.as_ref(),
+                equality_column_reduction.structure.as_ref(),
+                inequality_column_reduction.structure.as_ref(),
                 &spral_numeric_factor_options(options),
                 &mut profiling,
                 options.verbose,
@@ -6913,7 +8567,7 @@ where
             &mut profiling,
             options.verbose,
         );
-        let direction = match solve_result {
+        let mut direction = match solve_result {
             Ok(mut direction) => {
                 current_snapshot.linear_solver = direction.solver_used;
                 current_snapshot.linear_solve_time = Some(
@@ -6993,6 +8647,18 @@ where
                 ));
             }
         };
+        direction.dx = fixed_variables.expand_direction(&direction.dx);
+        let (dz_lower_direction, dz_upper_direction) = native_bound_multiplier_steps(
+            &x,
+            &direction.dx,
+            &bounds,
+            &z_lower,
+            &z_upper,
+            barrier_parameter_value,
+            sigma,
+        );
+        direction.dz_lower = dz_lower_direction;
+        direction.dz_upper = dz_upper_direction;
         last_linear_solver = direction.solver_used;
         let linear_elapsed = linear_started.elapsed();
         profiling.linear_solves += 1;
@@ -7005,20 +8671,52 @@ where
             );
         }
 
-        let (alpha_pr, alpha_pr_limiter) = if augmented_inequality_count > 0 {
-            fraction_to_boundary_with_limiter(&slack, &direction.ds, options.fraction_to_boundary)
+        let fraction_to_boundary_tau =
+            current_fraction_to_boundary_tau(barrier_parameter_value, options);
+        let (slack_alpha_pr, slack_alpha_pr_limiter) = if augmented_inequality_count > 0 {
+            fraction_to_boundary_with_limiter(
+                &slack_barrier,
+                &direction.ds,
+                fraction_to_boundary_tau,
+            )
         } else {
             (1.0, None)
         };
-        let (alpha_du, alpha_du_limiter) = if augmented_inequality_count > 0 {
-            fraction_to_boundary_with_limiter(&z, &direction.dz, options.fraction_to_boundary)
+        let (bound_alpha_pr, bound_alpha_pr_limiter) = fraction_to_variable_bounds_with_limiter(
+            &x,
+            &direction.dx,
+            &bounds,
+            fraction_to_boundary_tau,
+        );
+        let (alpha_pr, alpha_pr_limiter) = if bound_alpha_pr < slack_alpha_pr {
+            (bound_alpha_pr, bound_alpha_pr_limiter)
+        } else {
+            (slack_alpha_pr, slack_alpha_pr_limiter)
+        };
+        let combined_z =
+            combined_multiplier_vector([z.as_slice(), z_lower.as_slice(), z_upper.as_slice()]);
+        let combined_dz = combined_multiplier_vector([
+            direction.dz.as_slice(),
+            direction.dz_lower.as_slice(),
+            direction.dz_upper.as_slice(),
+        ]);
+        let (alpha_du, alpha_du_limiter) = if barrier_pair_count > 0 {
+            fraction_to_boundary_with_limiter(&combined_z, &combined_dz, fraction_to_boundary_tau)
         } else {
             (1.0, None)
+        };
+        let alpha_pr_limiters = alpha_pr_limiter.iter().cloned().collect::<Vec<_>>();
+        let alpha_du_limiters = if barrier_pair_count > 0 {
+            fraction_to_boundary_limiters(&combined_z, &combined_dz, fraction_to_boundary_tau, 8)
+        } else {
+            Vec::new()
         };
         let current_direction_diagnostics = Some(interior_point_direction_diagnostics(
             &direction,
             alpha_pr_limiter.clone(),
             alpha_du_limiter.clone(),
+            alpha_pr_limiters,
+            alpha_du_limiters,
         ));
         let watchdog_active =
             watchdog_state.reference.is_some() && watchdog_state.remaining_iters > 0;
@@ -7086,10 +8784,13 @@ where
         let current_primal_inf = primal_inf;
         let barrier_directional_derivative = barrier_objective_directional_derivative(
             &state.gradient,
-            &slack,
+            &slack_barrier,
+            &x,
+            &bounds,
             &direction.dx,
             &direction.ds,
             barrier_parameter_value,
+            options.kappa_d,
         );
         let filter_parameters = super::filter::FilterParameters {
             gamma_phi: options.filter_gamma_objective,
@@ -7127,24 +8828,56 @@ where
                 .zip(direction.d_lambda.iter())
                 .map(|(value, delta)| value + trial_alpha_y * delta)
                 .collect::<Vec<_>>();
+            let trial_lambda_ineq = lambda_ineq
+                .iter()
+                .zip(direction.d_ineq.iter())
+                .map(|(value, delta)| value + trial_alpha_y * delta)
+                .collect::<Vec<_>>();
             let trial_slack = slack
                 .iter()
                 .zip(direction.ds.iter())
                 .map(|(value, delta)| value + trial_alpha_pr * delta)
                 .collect::<Vec<_>>();
+            let trial_slack_barrier = relaxed_slack_barrier_values(&trial_slack, options);
             let trial_z = z
                 .iter()
                 .zip(direction.dz.iter())
                 .map(|(value, delta)| value + trial_alpha_du * delta)
                 .collect::<Vec<_>>();
-            if trial_slack.iter().any(|value| *value <= 0.0)
+            let trial_z_lower = z_lower
+                .iter()
+                .zip(direction.dz_lower.iter())
+                .map(|(value, delta)| value + trial_alpha_du * delta)
+                .collect::<Vec<_>>();
+            let trial_z_upper = z_upper
+                .iter()
+                .zip(direction.dz_upper.iter())
+                .map(|(value, delta)| value + trial_alpha_du * delta)
+                .collect::<Vec<_>>();
+            let trial_bounds_positive = bounds
+                .lower_indices
+                .iter()
+                .zip(bounds.lower_values.iter())
+                .all(|(&index, &lower)| trial_x[index] > lower)
+                && bounds
+                    .upper_indices
+                    .iter()
+                    .zip(bounds.upper_values.iter())
+                    .all(|(&index, &upper)| trial_x[index] < upper);
+            let trial_bound_multipliers_positive = trial_z_lower.iter().all(|value| *value > 0.0)
+                && trial_z_upper.iter().all(|value| *value > 0.0);
+            if trial_slack_barrier.iter().any(|value| *value <= 0.0)
                 || trial_z.iter().any(|value| *value <= 0.0)
+                || !trial_bounds_positive
+                || !trial_bound_multipliers_positive
             {
                 rejected_trials.push(InteriorPointLineSearchTrial {
                     alpha: trial_alpha_pr,
                     alpha_du: Some(trial_alpha_du),
-                    slack_positive: trial_slack.iter().all(|value| *value > 0.0),
-                    multipliers_positive: trial_z.iter().all(|value| *value > 0.0),
+                    slack_positive: trial_slack_barrier.iter().all(|value| *value > 0.0)
+                        && trial_bounds_positive,
+                    multipliers_positive: trial_z.iter().all(|value| *value > 0.0)
+                        && trial_bound_multipliers_positive,
                     objective: None,
                     barrier_objective: None,
                     merit: None,
@@ -7170,8 +8903,6 @@ where
                 problem,
                 &trial_x,
                 parameters,
-                &bounds,
-                &bound_jacobian,
                 &equality_jacobian_structure,
                 &inequality_jacobian_structure,
                 &mut profiling,
@@ -7183,16 +8914,35 @@ where
                 &trial_state.augmented_inequality_values,
                 &trial_slack,
             );
-            let trial_dual_residual = lagrangian_gradient_sparse(
+            let trial_raw_dual_residual = lagrangian_gradient_sparse(
                 &trial_state.gradient,
                 &trial_state.equality_jacobian,
                 &trial_lambda,
                 &trial_state.inequality_jacobian,
-                &trial_z,
+                &trial_lambda_ineq,
             );
-            let trial_dual_inf = inf_norm(&trial_dual_residual);
-            let trial_comp_inf = if augmented_inequality_count > 0 {
-                complementarity_inf_norm(&trial_slack, &trial_z)
+            let mut trial_dual_residual = trial_raw_dual_residual.clone();
+            add_native_bound_multiplier_terms(
+                &mut trial_dual_residual,
+                &bounds,
+                &trial_z_lower,
+                &trial_z_upper,
+            );
+            let trial_dual_x_inf = fixed_variables.free_inf_norm(&trial_dual_residual);
+            let trial_slack_stationarity_inf = trial_lambda_ineq
+                .iter()
+                .zip(trial_z.iter())
+                .fold(0.0_f64, |acc, (y_i, z_i)| acc.max((y_i - z_i).abs()));
+            let trial_dual_inf = trial_dual_x_inf.max(trial_slack_stationarity_inf);
+            let trial_comp_inf = if barrier_pair_count > 0 {
+                combined_complementarity_inf_norm(
+                    &trial_slack_barrier,
+                    &trial_z,
+                    &trial_x,
+                    &bounds,
+                    &trial_z_lower,
+                    &trial_z_upper,
+                )
             } else {
                 0.0
             };
@@ -7208,28 +8958,46 @@ where
                 trial_comp_inf,
                 barrier_parameter_value,
             );
-            let trial_all_dual_multipliers = [trial_lambda.as_slice(), trial_z.as_slice()].concat();
+            let trial_all_dual_multipliers = combined_multiplier_vector([
+                trial_lambda.as_slice(),
+                trial_lambda_ineq.as_slice(),
+                trial_z.as_slice(),
+                trial_z_lower.as_slice(),
+                trial_z_upper.as_slice(),
+            ]);
+            let trial_complementarity_multipliers = combined_multiplier_vector([
+                trial_z.as_slice(),
+                trial_z_lower.as_slice(),
+                trial_z_upper.as_slice(),
+            ]);
             let trial_overall_inf = scaled_overall_inf_norm(
                 trial_primal_inf,
                 trial_dual_inf,
                 trial_comp_inf,
                 &trial_all_dual_multipliers,
-                &trial_z,
+                &trial_complementarity_multipliers,
                 options.overall_scale_max,
             );
             let corrected_bound_multipliers = apply_bound_multiplier_safeguard(
-                &trial_state,
-                trial_primal_inf,
-                &trial_lambda,
-                &trial_slack,
+                &trial_lambda_ineq,
+                &trial_raw_dual_residual,
+                &fixed_variables,
+                &trial_x,
+                &bounds,
+                &trial_slack_barrier,
                 &trial_z,
+                &trial_z_lower,
+                &trial_z_upper,
                 barrier_parameter_value,
                 options,
             );
             let trial_barrier_objective = barrier_objective_value(
                 trial_state.objective_value,
-                &trial_slack,
+                &trial_slack_barrier,
+                &trial_x,
+                &bounds,
                 barrier_parameter_value,
+                options.kappa_d,
             );
             let trial_filter_entry =
                 super::filter::entry(trial_barrier_objective, trial_filter_theta);
@@ -7273,23 +9041,57 @@ where
                 };
                 let (
                     accepted_z,
+                    accepted_z_lower,
+                    accepted_z_upper,
                     accepted_dual_inf,
                     accepted_comp_inf,
                     accepted_mu,
                     accepted_overall_inf,
                     bound_multiplier_corrected,
                 ) = if let Some(corrected) = corrected_bound_multipliers {
+                    let corrected_comp_inf = combined_complementarity_inf_norm(
+                        &trial_slack_barrier,
+                        &corrected.z,
+                        &trial_x,
+                        &bounds,
+                        &corrected.z_lower,
+                        &corrected.z_upper,
+                    );
+                    let corrected_complementarity_multipliers = combined_multiplier_vector([
+                        corrected.z.as_slice(),
+                        corrected.z_lower.as_slice(),
+                        corrected.z_upper.as_slice(),
+                    ]);
+                    let corrected_all_dual_multipliers = combined_multiplier_vector([
+                        trial_lambda.as_slice(),
+                        trial_lambda_ineq.as_slice(),
+                        corrected.z.as_slice(),
+                        corrected.z_lower.as_slice(),
+                        corrected.z_upper.as_slice(),
+                    ]);
+                    let corrected_overall_inf = scaled_overall_inf_norm(
+                        trial_primal_inf,
+                        corrected.dual_inf,
+                        corrected_comp_inf,
+                        &corrected_all_dual_multipliers,
+                        &corrected_complementarity_multipliers,
+                        options.overall_scale_max,
+                    );
                     (
                         corrected.z,
+                        corrected.z_lower,
+                        corrected.z_upper,
                         corrected.dual_inf,
-                        corrected.complementarity_inf,
+                        corrected_comp_inf,
                         barrier_parameter_value,
-                        corrected.overall_inf,
+                        corrected_overall_inf,
                         true,
                     )
                 } else {
                     (
                         trial_z,
+                        trial_z_lower,
+                        trial_z_upper,
                         trial_dual_inf,
                         trial_comp_inf,
                         barrier_parameter_value,
@@ -7300,12 +9102,32 @@ where
                 accepted = Some(AcceptedInteriorPointTrial {
                     x: trial_x,
                     lambda: trial_lambda,
+                    inequality_multipliers: trial_lambda_ineq.clone(),
+                    kkt_inequality_residual: slack_form_inequality_residuals(
+                        &trial_state.augmented_inequality_values,
+                        &trial_slack,
+                    ),
+                    kkt_slack_stationarity: damped_slack_stationarity_residuals(
+                        &trial_lambda_ineq,
+                        &accepted_z,
+                        barrier_parameter_value,
+                        options.kappa_d,
+                    ),
+                    kkt_slack_complementarity: slack_complementarity_residuals(
+                        &trial_slack_barrier,
+                        &accepted_z,
+                        barrier_parameter_value,
+                    ),
+                    kkt_slack_sigma: slack_sigma_values(&trial_slack_barrier, &accepted_z),
                     slack: trial_slack,
                     z: accepted_z,
+                    z_lower: accepted_z_lower,
+                    z_upper: accepted_z_upper,
                     objective: trial_state.objective_value,
                     barrier_objective: trial_barrier_objective,
                     equality_inf: trial_eq_inf,
                     inequality_inf: trial_ineq_inf,
+                    primal_inf: trial_primal_inf,
                     dual_inf: accepted_dual_inf,
                     complementarity_inf: accepted_comp_inf,
                     overall_inf: accepted_overall_inf,
@@ -7347,7 +9169,7 @@ where
                     &trial_state.inequality_jacobian,
                     &trial_state.equality_values,
                     &trial_state.augmented_inequality_values,
-                    &trial_z,
+                    &trial_lambda_ineq,
                     options.constraint_tol,
                     options.linear_solver,
                 )
@@ -7359,13 +9181,12 @@ where
                     .map(|(value, delta)| value + delta)
                     .collect::<Vec<_>>();
                 let corrected_lambda = trial_lambda.clone();
+                let corrected_lambda_ineq = trial_lambda_ineq.clone();
                 let mut corrected_callback_time = Duration::ZERO;
                 let corrected_state = self::trial_state(
                     problem,
                     &corrected_x,
                     parameters,
-                    &bounds,
-                    &bound_jacobian,
                     &equality_jacobian_structure,
                     &inequality_jacobian_structure,
                     &mut profiling,
@@ -7380,7 +9201,19 @@ where
                 } else {
                     Vec::new()
                 };
+                let corrected_slack_barrier =
+                    relaxed_slack_barrier_values(&corrected_slack, options);
                 let corrected_z = trial_z.clone();
+                let corrected_bounds_positive = bounds
+                    .lower_indices
+                    .iter()
+                    .zip(bounds.lower_values.iter())
+                    .all(|(&index, &lower)| corrected_x[index] > lower)
+                    && bounds
+                        .upper_indices
+                        .iter()
+                        .zip(bounds.upper_values.iter())
+                        .all(|(&index, &upper)| corrected_x[index] < upper);
                 let corrected_eq_inf = inf_norm(&corrected_state.equality_values);
                 let corrected_ineq_inf =
                     positive_part_inf_norm(&corrected_state.augmented_inequality_values);
@@ -7388,16 +9221,35 @@ where
                     &corrected_state.augmented_inequality_values,
                     &corrected_slack,
                 ));
-                let corrected_dual_residual = lagrangian_gradient_sparse(
+                let corrected_raw_dual_residual = lagrangian_gradient_sparse(
                     &corrected_state.gradient,
                     &corrected_state.equality_jacobian,
                     &corrected_lambda,
                     &corrected_state.inequality_jacobian,
-                    &corrected_z,
+                    &corrected_lambda_ineq,
                 );
-                let corrected_dual_inf = inf_norm(&corrected_dual_residual);
-                let corrected_comp_inf = if augmented_inequality_count > 0 {
-                    complementarity_inf_norm(&corrected_slack, &corrected_z)
+                let mut corrected_dual_residual = corrected_raw_dual_residual.clone();
+                add_native_bound_multiplier_terms(
+                    &mut corrected_dual_residual,
+                    &bounds,
+                    &trial_z_lower,
+                    &trial_z_upper,
+                );
+                let corrected_dual_x_inf = fixed_variables.free_inf_norm(&corrected_dual_residual);
+                let corrected_slack_stationarity_inf = corrected_lambda_ineq
+                    .iter()
+                    .zip(corrected_z.iter())
+                    .fold(0.0_f64, |acc, (y_i, z_i)| acc.max((y_i - z_i).abs()));
+                let corrected_dual_inf = corrected_dual_x_inf.max(corrected_slack_stationarity_inf);
+                let corrected_comp_inf = if barrier_pair_count > 0 {
+                    combined_complementarity_inf_norm(
+                        &corrected_slack_barrier,
+                        &corrected_z,
+                        &corrected_x,
+                        &bounds,
+                        &trial_z_lower,
+                        &trial_z_upper,
+                    )
                 } else {
                     0.0
                 };
@@ -7408,8 +9260,11 @@ where
                 );
                 let corrected_barrier_objective = barrier_objective_value(
                     corrected_state.objective_value,
-                    &corrected_slack,
+                    &corrected_slack_barrier,
+                    &corrected_x,
+                    &bounds,
                     barrier_parameter_value,
+                    options.kappa_d,
                 );
                 let corrected_filter_entry =
                     super::filter::entry(corrected_barrier_objective, corrected_filter_theta);
@@ -7440,7 +9295,7 @@ where
                 let corrected_filter_acceptance_mode = (!corrected_barrier_objective_too_large)
                     .then_some(corrected_filter_assessment.acceptance_mode)
                     .flatten();
-                if corrected_filter_acceptance_mode.is_some() {
+                if corrected_filter_acceptance_mode.is_some() && corrected_bounds_positive {
                     let step_kind = if corrected_filter_acceptance_mode
                         == Some(FilterAcceptanceMode::ObjectiveArmijo)
                     {
@@ -7453,45 +9308,93 @@ where
                     } else {
                         'f'
                     };
-                    let corrected_all_dual_multipliers =
-                        [corrected_lambda.as_slice(), corrected_z.as_slice()].concat();
+                    let corrected_all_dual_multipliers = combined_multiplier_vector([
+                        corrected_lambda.as_slice(),
+                        corrected_lambda_ineq.as_slice(),
+                        corrected_z.as_slice(),
+                        trial_z_lower.as_slice(),
+                        trial_z_upper.as_slice(),
+                    ]);
+                    let corrected_complementarity_multipliers = combined_multiplier_vector([
+                        corrected_z.as_slice(),
+                        trial_z_lower.as_slice(),
+                        trial_z_upper.as_slice(),
+                    ]);
                     let corrected_overall_inf = scaled_overall_inf_norm(
                         corrected_primal_inf,
                         corrected_dual_inf,
                         corrected_comp_inf,
                         &corrected_all_dual_multipliers,
-                        &corrected_z,
+                        &corrected_complementarity_multipliers,
                         options.overall_scale_max,
                     );
                     let corrected_bound_multipliers = apply_bound_multiplier_safeguard(
-                        &corrected_state,
-                        corrected_primal_inf,
-                        &corrected_lambda,
-                        &corrected_slack,
+                        &corrected_lambda_ineq,
+                        &corrected_raw_dual_residual,
+                        &fixed_variables,
+                        &corrected_x,
+                        &bounds,
+                        &corrected_slack_barrier,
                         &corrected_z,
+                        &trial_z_lower,
+                        &trial_z_upper,
                         barrier_parameter_value,
                         options,
                     );
                     second_order_correction_used = true;
                     let (
                         accepted_z,
+                        accepted_z_lower,
+                        accepted_z_upper,
                         accepted_dual_inf,
                         accepted_comp_inf,
                         accepted_mu,
                         accepted_overall_inf,
                         bound_multiplier_corrected,
                     ) = if let Some(corrected) = corrected_bound_multipliers {
+                        let corrected_comp_inf = combined_complementarity_inf_norm(
+                            &corrected_slack_barrier,
+                            &corrected.z,
+                            &corrected_x,
+                            &bounds,
+                            &corrected.z_lower,
+                            &corrected.z_upper,
+                        );
+                        let corrected_complementarity_multipliers = combined_multiplier_vector([
+                            corrected.z.as_slice(),
+                            corrected.z_lower.as_slice(),
+                            corrected.z_upper.as_slice(),
+                        ]);
+                        let corrected_all_dual_multipliers = combined_multiplier_vector([
+                            corrected_lambda.as_slice(),
+                            corrected_lambda_ineq.as_slice(),
+                            corrected.z.as_slice(),
+                            corrected.z_lower.as_slice(),
+                            corrected.z_upper.as_slice(),
+                        ]);
+                        let corrected_overall_inf = scaled_overall_inf_norm(
+                            corrected_primal_inf,
+                            corrected.dual_inf,
+                            corrected_comp_inf,
+                            &corrected_all_dual_multipliers,
+                            &corrected_complementarity_multipliers,
+                            options.overall_scale_max,
+                        );
                         (
                             corrected.z,
+                            corrected.z_lower,
+                            corrected.z_upper,
                             corrected.dual_inf,
-                            corrected.complementarity_inf,
+                            corrected_comp_inf,
                             barrier_parameter_value,
-                            corrected.overall_inf,
+                            corrected_overall_inf,
                             true,
                         )
                     } else {
                         (
                             corrected_z,
+                            trial_z_lower.clone(),
+                            trial_z_upper.clone(),
                             corrected_dual_inf,
                             corrected_comp_inf,
                             barrier_parameter_value,
@@ -7502,12 +9405,32 @@ where
                     accepted = Some(AcceptedInteriorPointTrial {
                         x: corrected_x,
                         lambda: corrected_lambda,
+                        inequality_multipliers: corrected_lambda_ineq.clone(),
+                        kkt_inequality_residual: slack_form_inequality_residuals(
+                            &corrected_state.augmented_inequality_values,
+                            &corrected_slack,
+                        ),
+                        kkt_slack_stationarity: damped_slack_stationarity_residuals(
+                            &corrected_lambda_ineq,
+                            &accepted_z,
+                            barrier_parameter_value,
+                            options.kappa_d,
+                        ),
+                        kkt_slack_complementarity: slack_complementarity_residuals(
+                            &corrected_slack_barrier,
+                            &accepted_z,
+                            barrier_parameter_value,
+                        ),
+                        kkt_slack_sigma: slack_sigma_values(&corrected_slack_barrier, &accepted_z),
                         slack: corrected_slack,
                         z: accepted_z,
+                        z_lower: accepted_z_lower,
+                        z_upper: accepted_z_upper,
                         objective: corrected_state.objective_value,
                         barrier_objective: corrected_barrier_objective,
                         equality_inf: corrected_eq_inf,
                         inequality_inf: corrected_ineq_inf,
+                        primal_inf: corrected_primal_inf,
                         dual_inf: accepted_dual_inf,
                         complementarity_inf: accepted_comp_inf,
                         overall_inf: accepted_overall_inf,
@@ -7610,33 +9533,71 @@ where
                     'f'
                 };
                 let corrected_bound_multipliers = apply_bound_multiplier_safeguard(
-                    &trial_state,
-                    trial_primal_inf,
-                    &trial_lambda,
-                    &trial_slack,
+                    &trial_lambda_ineq,
+                    &trial_raw_dual_residual,
+                    &fixed_variables,
+                    &trial_x,
+                    &bounds,
+                    &trial_slack_barrier,
                     &trial_z,
+                    &trial_z_lower,
+                    &trial_z_upper,
                     barrier_parameter_value,
                     options,
                 );
                 let (
                     accepted_z,
+                    accepted_z_lower,
+                    accepted_z_upper,
                     accepted_dual_inf,
                     accepted_comp_inf,
                     accepted_mu,
                     accepted_overall_inf,
                     bound_multiplier_corrected,
                 ) = if let Some(corrected) = corrected_bound_multipliers {
+                    let corrected_comp_inf = combined_complementarity_inf_norm(
+                        &trial_slack_barrier,
+                        &corrected.z,
+                        &trial_x,
+                        &bounds,
+                        &corrected.z_lower,
+                        &corrected.z_upper,
+                    );
+                    let corrected_complementarity_multipliers = combined_multiplier_vector([
+                        corrected.z.as_slice(),
+                        corrected.z_lower.as_slice(),
+                        corrected.z_upper.as_slice(),
+                    ]);
+                    let corrected_all_dual_multipliers = combined_multiplier_vector([
+                        trial_lambda.as_slice(),
+                        trial_lambda_ineq.as_slice(),
+                        corrected.z.as_slice(),
+                        corrected.z_lower.as_slice(),
+                        corrected.z_upper.as_slice(),
+                    ]);
+                    let corrected_overall_inf = scaled_overall_inf_norm(
+                        trial_primal_inf,
+                        corrected.dual_inf,
+                        corrected_comp_inf,
+                        &corrected_all_dual_multipliers,
+                        &corrected_complementarity_multipliers,
+                        options.overall_scale_max,
+                    );
                     (
                         corrected.z,
+                        corrected.z_lower,
+                        corrected.z_upper,
                         corrected.dual_inf,
-                        corrected.complementarity_inf,
+                        corrected_comp_inf,
                         barrier_parameter_value,
-                        corrected.overall_inf,
+                        corrected_overall_inf,
                         true,
                     )
                 } else {
                     (
                         trial_z,
+                        trial_z_lower,
+                        trial_z_upper,
                         trial_dual_inf,
                         trial_comp_inf,
                         barrier_parameter_value,
@@ -7647,12 +9608,32 @@ where
                 accepted = Some(AcceptedInteriorPointTrial {
                     x: trial_x,
                     lambda: trial_lambda,
+                    inequality_multipliers: trial_lambda_ineq.clone(),
+                    kkt_inequality_residual: slack_form_inequality_residuals(
+                        &trial_state.augmented_inequality_values,
+                        &trial_slack,
+                    ),
+                    kkt_slack_stationarity: damped_slack_stationarity_residuals(
+                        &trial_lambda_ineq,
+                        &accepted_z,
+                        barrier_parameter_value,
+                        options.kappa_d,
+                    ),
+                    kkt_slack_complementarity: slack_complementarity_residuals(
+                        &trial_slack_barrier,
+                        &accepted_z,
+                        barrier_parameter_value,
+                    ),
+                    kkt_slack_sigma: slack_sigma_values(&trial_slack_barrier, &accepted_z),
                     slack: trial_slack,
                     z: accepted_z,
+                    z_lower: accepted_z_lower,
+                    z_upper: accepted_z_upper,
                     objective: trial_state.objective_value,
                     barrier_objective: trial_barrier_objective,
                     equality_inf: trial_eq_inf,
                     inequality_inf: trial_ineq_inf,
+                    primal_inf: trial_primal_inf,
                     dual_inf: accepted_dual_inf,
                     complementarity_inf: accepted_comp_inf,
                     overall_inf: accepted_overall_inf,
@@ -7716,6 +9697,182 @@ where
             alpha *= options.line_search_beta;
             line_search_iterations += 1;
         }
+        if accepted.is_none()
+            && options.restoration_phase
+            && augmented_inequality_count == 0
+            && let Some(restoration_summary) = solve_equality_restoration_problem(
+                problem,
+                &x,
+                &state.equality_values,
+                parameters,
+                options,
+                current_primal_inf,
+            )
+        {
+            let restored_x = restoration_summary.x[..problem.dimension()].to_vec();
+            let restored_state = trial_state(
+                problem,
+                &restored_x,
+                parameters,
+                &equality_jacobian_structure,
+                &inequality_jacobian_structure,
+                &mut profiling,
+                &mut iteration_callback_time,
+            );
+            let restored_eq_inf = inf_norm(&restored_state.equality_values);
+            let restored_ineq_inf =
+                positive_part_inf_norm(&restored_state.augmented_inequality_values);
+            let restored_primal_inf = restored_eq_inf.max(restored_ineq_inf);
+            if restored_primal_inf
+                <= 0.9 * current_primal_inf.max(options.constraint_tol)
+                    + 100.0 * f64::EPSILON * current_primal_inf.abs().max(1.0)
+            {
+                let restored_linear_state = EvalState {
+                    objective_value: restored_state.objective_value,
+                    gradient: fixed_variables.reduce_vector(&restored_state.gradient),
+                    equality_values: restored_state.equality_values.clone(),
+                    augmented_inequality_values: restored_state.augmented_inequality_values.clone(),
+                    equality_jacobian: reduce_sparse_matrix_columns(
+                        &restored_state.equality_jacobian,
+                        &equality_column_reduction,
+                    ),
+                    inequality_jacobian: reduce_sparse_matrix_columns(
+                        &restored_state.inequality_jacobian,
+                        &inequality_column_reduction,
+                    ),
+                };
+                let (restored_lambda, restored_lambda_ineq) = least_squares_constraint_multipliers(
+                    &restored_linear_state,
+                    &[],
+                    options.regularization,
+                    options.linear_solver,
+                );
+                let restored_raw_dual_residual = lagrangian_gradient_sparse(
+                    &restored_state.gradient,
+                    &restored_state.equality_jacobian,
+                    &restored_lambda,
+                    &restored_state.inequality_jacobian,
+                    &restored_lambda_ineq,
+                );
+                let mut restored_dual_residual = restored_raw_dual_residual;
+                add_native_bound_multiplier_terms(
+                    &mut restored_dual_residual,
+                    &bounds,
+                    &z_lower,
+                    &z_upper,
+                );
+                let restored_dual_inf = fixed_variables.free_inf_norm(&restored_dual_residual);
+                let restored_complementarity_inf = if barrier_pair_count > 0 {
+                    combined_complementarity_inf_norm(
+                        &[],
+                        &[],
+                        &restored_x,
+                        &bounds,
+                        &z_lower,
+                        &z_upper,
+                    )
+                } else {
+                    0.0
+                };
+                let restored_all_dual_multipliers = combined_multiplier_vector([
+                    restored_lambda.as_slice(),
+                    restored_lambda_ineq.as_slice(),
+                    z.as_slice(),
+                    z_lower.as_slice(),
+                    z_upper.as_slice(),
+                ]);
+                let restored_complementarity_multipliers = combined_multiplier_vector([
+                    z.as_slice(),
+                    z_lower.as_slice(),
+                    z_upper.as_slice(),
+                ]);
+                let restored_overall_inf = scaled_overall_inf_norm(
+                    restored_primal_inf,
+                    restored_dual_inf,
+                    restored_complementarity_inf,
+                    &restored_all_dual_multipliers,
+                    &restored_complementarity_multipliers,
+                    options.overall_scale_max,
+                );
+                let restored_filter_theta = filter_theta_l1_norm(
+                    &restored_state.equality_values,
+                    &restored_state.augmented_inequality_values,
+                    &[],
+                );
+                let restored_barrier_objective = barrier_objective_value(
+                    restored_state.objective_value,
+                    &[],
+                    &restored_x,
+                    &bounds,
+                    barrier_parameter_value,
+                    options.kappa_d,
+                );
+                let restored_filter_entry =
+                    super::filter::entry(restored_barrier_objective, restored_filter_theta);
+                let restoration_filter_assessment = super::filter::assess_trial(
+                    &filter_entries,
+                    &current_filter_entry,
+                    &restored_filter_entry,
+                    0.0,
+                    barrier_directional_derivative,
+                    false,
+                    false,
+                    filter_parameters,
+                );
+                if restoration_filter_assessment.current_iterate_acceptable
+                    && restoration_filter_assessment.filter_acceptable
+                {
+                    push_unique_nlip_event(
+                        &mut iteration_events,
+                        InteriorPointIterationEvent::RestorationPhaseAccepted,
+                    );
+                    accepted = Some(AcceptedInteriorPointTrial {
+                        x: restored_x,
+                        lambda: restored_lambda,
+                        inequality_multipliers: restored_lambda_ineq.clone(),
+                        slack: Vec::new(),
+                        z: z.clone(),
+                        z_lower: z_lower.clone(),
+                        z_upper: z_upper.clone(),
+                        kkt_inequality_residual: Vec::new(),
+                        kkt_slack_stationarity: Vec::new(),
+                        kkt_slack_complementarity: Vec::new(),
+                        kkt_slack_sigma: Vec::new(),
+                        objective: restored_state.objective_value,
+                        barrier_objective: restored_barrier_objective,
+                        equality_inf: restored_eq_inf,
+                        inequality_inf: restored_ineq_inf,
+                        primal_inf: restored_primal_inf,
+                        dual_inf: restored_dual_inf,
+                        complementarity_inf: restored_complementarity_inf,
+                        overall_inf: restored_overall_inf,
+                        mu: barrier_parameter_value,
+                        filter_entry: restored_filter_entry,
+                        filter_augment_entry: Some(super::filter::augment_entry(
+                            current_barrier_objective,
+                            current_theta,
+                            options.filter_gamma_objective,
+                            options.filter_gamma_violation,
+                        )),
+                        filter_theta: restored_filter_theta,
+                        filter_acceptance_mode: None,
+                        step_kind: InteriorPointStepKind::Feasibility,
+                        step_tag: 'r',
+                        phase: InteriorPointIterationPhase::AcceptedStep,
+                        accepted_alpha_pr: last_tried_alpha_pr,
+                        accepted_alpha_du: Some(0.0),
+                        line_search_initial_alpha_pr: alpha_pr,
+                        line_search_initial_alpha_du: Some(alpha_du),
+                        line_search_last_alpha_pr: last_tried_alpha_pr,
+                        line_search_last_alpha_du: Some(last_tried_alpha_du),
+                        line_search_backtrack_count: line_search_iterations,
+                        second_order_correction_used: false,
+                        watchdog_accepted: false,
+                        bound_multiplier_corrected: false,
+                    });
+                }
+            }
+        }
         let accepted_direction_diagnostics = current_direction_diagnostics.clone();
         let accepted_regularization_size = Some(direction.regularization_used);
         let Some(accepted_trial) = accepted else {
@@ -7759,9 +9916,8 @@ where
                 ),
             });
         };
-        let accepted_step_inf =
-            accepted_ip_step_inf_norm(&direction, accepted_trial.accepted_alpha_pr);
-        let tiny_step = is_tiny_ip_step(accepted_step_inf, options);
+        let step_inf = ipopt_primal_step_inf_norm(&direction);
+        let tiny_step = is_tiny_ip_step(&x, &slack_barrier, &direction, primal_inf, options);
         let shortened_step = is_shortened_ip_step(
             accepted_trial.accepted_alpha_pr,
             accepted_trial.accepted_alpha_du,
@@ -7870,12 +10026,45 @@ where
             };
         let previous_barrier_parameter = barrier_parameter_value;
         let mut next_barrier_parameter_value = barrier_parameter_value;
-        if augmented_inequality_count > 0 {
+        if barrier_pair_count > 0 {
+            let accepted_slack_barrier =
+                relaxed_slack_barrier_values(&accepted_trial.slack, options);
+            let accepted_all_dual_multipliers = combined_multiplier_vector([
+                accepted_trial.lambda.as_slice(),
+                accepted_trial.inequality_multipliers.as_slice(),
+                accepted_trial.z.as_slice(),
+                accepted_trial.z_lower.as_slice(),
+                accepted_trial.z_upper.as_slice(),
+            ]);
+            let accepted_complementarity_multipliers = combined_multiplier_vector([
+                accepted_trial.z.as_slice(),
+                accepted_trial.z_lower.as_slice(),
+                accepted_trial.z_upper.as_slice(),
+            ]);
             next_barrier_parameter_value = next_barrier_parameter(
                 barrier_parameter_value,
-                accepted_trial.overall_inf,
                 tiny_step,
                 options,
+                |candidate_barrier_parameter| {
+                    let accepted_target_complementarity_inf =
+                        combined_complementarity_target_inf_norm(
+                            &accepted_slack_barrier,
+                            &accepted_trial.z,
+                            &accepted_trial.x,
+                            &bounds,
+                            &accepted_trial.z_lower,
+                            &accepted_trial.z_upper,
+                            candidate_barrier_parameter,
+                        );
+                    scaled_overall_inf_norm(
+                        accepted_trial.primal_inf,
+                        accepted_trial.dual_inf,
+                        accepted_target_complementarity_inf,
+                        &accepted_all_dual_multipliers,
+                        &accepted_complementarity_multipliers,
+                        options.overall_scale_max,
+                    )
+                },
             );
         }
         let barrier_parameter_updated = next_barrier_parameter_value
@@ -7902,7 +10091,7 @@ where
         if options.verbose {
             let flags = InteriorPointIterationLogFlags {
                 has_equalities: equality_count > 0,
-                has_inequalities: augmented_inequality_count > 0,
+                has_inequalities: barrier_pair_count > 0,
                 filter_accepted: accepted_trial.filter_acceptance_mode
                     == Some(FilterAcceptanceMode::ViolationReduction),
                 soc_attempted: second_order_correction_attempted,
@@ -7925,7 +10114,7 @@ where
                     dual_inf: accepted_trial.dual_inf,
                     complementarity_inf: accepted_trial.complementarity_inf,
                     overall_inf: accepted_trial.overall_inf,
-                    barrier_parameter: if augmented_inequality_count > 0 {
+                    barrier_parameter: if barrier_pair_count > 0 {
                         accepted_trial.mu
                     } else {
                         0.0
@@ -7949,17 +10138,26 @@ where
             iteration,
             phase: accepted_trial.phase,
             x: accepted_trial.x.clone(),
+            slack_primal: Some(accepted_trial.slack.clone()),
+            equality_multipliers: Some(accepted_trial.lambda.clone()),
+            inequality_multipliers: Some(accepted_trial.inequality_multipliers.clone()),
+            slack_multipliers: Some(accepted_trial.z.clone()),
+            lower_bound_multipliers: Some(accepted_trial.z_lower.clone()),
+            upper_bound_multipliers: Some(accepted_trial.z_upper.clone()),
+            kkt_inequality_residual: Some(accepted_trial.kkt_inequality_residual.clone()),
+            kkt_slack_stationarity: Some(accepted_trial.kkt_slack_stationarity.clone()),
+            kkt_slack_complementarity: Some(accepted_trial.kkt_slack_complementarity.clone()),
+            kkt_slack_sigma: Some(accepted_trial.kkt_slack_sigma.clone()),
             objective: accepted_trial.objective,
             barrier_objective: Some(accepted_trial.barrier_objective),
             eq_inf: (equality_count > 0).then_some(accepted_trial.equality_inf),
             ineq_inf: (augmented_inequality_count > 0).then_some(accepted_trial.inequality_inf),
             dual_inf: accepted_trial.dual_inf,
-            comp_inf: (augmented_inequality_count > 0)
-                .then_some(accepted_trial.complementarity_inf),
+            comp_inf: (barrier_pair_count > 0).then_some(accepted_trial.complementarity_inf),
             overall_inf: accepted_trial.overall_inf,
-            barrier_parameter: (augmented_inequality_count > 0).then_some(accepted_trial.mu),
+            barrier_parameter: (barrier_pair_count > 0).then_some(accepted_trial.mu),
             filter_theta: Some(accepted_trial.filter_theta),
-            step_inf: Some(accepted_step_inf),
+            step_inf: Some(step_inf),
             alpha: Some(accepted_trial.accepted_alpha_pr),
             alpha_pr: Some(accepted_trial.accepted_alpha_pr),
             alpha_du: accepted_trial.accepted_alpha_du,
@@ -8002,15 +10200,16 @@ where
         );
         x = accepted_trial.x;
         lambda_eq = accepted_trial.lambda;
+        lambda_ineq = accepted_trial.inequality_multipliers;
         slack = accepted_trial.slack;
         z = accepted_trial.z;
+        z_lower = accepted_trial.z_lower;
+        z_upper = accepted_trial.z_upper;
         filter_entries = next_filter_entries;
-        if augmented_inequality_count > 0 {
+        if barrier_pair_count > 0 {
             barrier_parameter_value = next_barrier_parameter_value;
         }
-        let (nonlinear, _, _) =
-            split_augmented_inequality_multipliers(&z, inequality_count, lower_bound_count);
-        nonlinear_inequality_multipliers = nonlinear;
+        nonlinear_inequality_multipliers = lambda_ineq.clone();
         if barrier_parameter_updated {
             watchdog_state = InteriorPointWatchdogState::default();
             continue;

@@ -103,13 +103,13 @@ fn theta_acceptable(trial_violation: f64, theta_max: f64) -> bool {
 fn dominates_trial(
     entry: &FilterEntry,
     trial: &FilterEntry,
-    gamma_phi: f64,
-    gamma_theta: f64,
+    _gamma_phi: f64,
+    _gamma_theta: f64,
 ) -> bool {
-    let violation_barrier = (1.0 - gamma_theta).max(0.0) * entry.violation;
-    let objective_barrier = entry.objective - gamma_phi * trial.violation.max(1e-12);
-    trial.violation >= violation_barrier - absolute_tolerance(entry.violation)
-        && trial.objective >= objective_barrier - absolute_tolerance(entry.objective)
+    // IPOPT stores augmented filter entries. A trial is acceptable to a single
+    // entry if either coordinate improves; it is rejected only when both are
+    // worse than the stored entry.
+    trial.violation > entry.violation && trial.objective > entry.objective
 }
 
 fn entries_match(lhs: &FilterEntry, rhs: &FilterEntry) -> bool {

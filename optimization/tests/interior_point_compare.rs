@@ -5,11 +5,11 @@ use optimization::{
     CCS, CompiledNlpProblem, ConstraintBounds, FilterAcceptanceMode, InteriorPointIterationPhase,
     InteriorPointOptions, InteriorPointStepKind, IpoptOptions, ParameterMatrix,
     apply_native_spral_parity_to_ipopt_options, apply_native_spral_parity_to_nlip_options,
-    solve_nlp_interior_point, solve_nlp_ipopt,
+    solve_nlp_interior_point, solve_nlp_interior_point_with_callback, solve_nlp_ipopt,
 };
 use rstest::rstest;
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 #[path = "support/generated_problem.rs"]
 mod generated_problem;
@@ -628,8 +628,16 @@ fn local_spral_ipopt_environment_available() -> bool {
     }
 }
 
+fn native_spral_compare_guard() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("native SPRAL/IPOPT comparison lock poisoned")
+}
+
 macro_rules! skip_without_native_spral {
     () => {
+        let _native_spral_compare_guard = native_spral_compare_guard();
         if !native_spral_available() || !local_spral_ipopt_environment_available() {
             return;
         }
@@ -705,6 +713,34 @@ fn maybe_print_compare_summary(
     );
 }
 
+fn maybe_print_native_trace(
+    problem_name: &str,
+    snapshots: &[optimization::InteriorPointIterationSnapshot],
+) {
+    if !compare_verbose_requested() {
+        return;
+    }
+    eprintln!("NLIP trace for {problem_name}:");
+    for snapshot in snapshots
+        .iter()
+        .filter(|snapshot| snapshot.phase == InteriorPointIterationPhase::AcceptedStep)
+    {
+        eprintln!(
+            "  iter={:>3} obj={:.6e} eq={:.6e} ineq={:.6e} dual={:.6e} reg={} alpha={} x={:?}",
+            snapshot.iteration,
+            snapshot.objective,
+            snapshot.eq_inf.unwrap_or(0.0),
+            snapshot.ineq_inf.unwrap_or(0.0),
+            snapshot.dual_inf,
+            trace_regularization_text(snapshot.regularization_size),
+            snapshot
+                .alpha_pr
+                .map_or_else(|| "--".to_string(), |value| format!("{value:.6e}")),
+            snapshot.x
+        );
+    }
+}
+
 fn assert_native_matches_ipopt(
     problem_name: &str,
     backend: Option<CallbackBackend>,
@@ -753,7 +789,12 @@ fn solve_native_with_options_ok<P: CompiledNlpProblem>(
     parameters: &[ParameterMatrix<'_>],
     options: InteriorPointOptions,
 ) -> optimization::InteriorPointSummary {
-    let solve_result = solve_nlp_interior_point(problem, x0, parameters, &options);
+    let mut snapshots = Vec::new();
+    let solve_result =
+        solve_nlp_interior_point_with_callback(problem, x0, parameters, &options, |snapshot| {
+            snapshots.push(snapshot.clone());
+        });
+    maybe_print_native_trace("native solve", &snapshots);
     assert!(
         solve_result.is_ok(),
         "native IP solve failed: {solve_result:?}"

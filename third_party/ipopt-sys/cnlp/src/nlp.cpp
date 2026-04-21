@@ -1,11 +1,35 @@
 #include "nlp.hpp"
 #include <coin/IpIpoptApplication.hpp>
 #include <coin/IpBlas.hpp>
+#include <coin/IpIpoptCalculatedQuantities.hpp>
 #include <coin/IpIpoptData.hpp>
 #include <coin/IpIteratesVector.hpp>
 #include <coin/IpDenseVector.hpp>
 
 #include <algorithm>
+
+namespace {
+
+struct DenseVectorView {
+    Ipopt::Index count = 0;
+    const Ipopt::Number* values = nullptr;
+};
+
+DenseVectorView dense_vector_view(const Ipopt::SmartPtr<const Ipopt::Vector>& vector)
+{
+    DenseVectorView view;
+    if (Ipopt::IsValid(vector)) {
+        const auto* dense_vector =
+            dynamic_cast<const Ipopt::DenseVector*>(Ipopt::GetRawPtr(vector));
+        if (dense_vector != nullptr) {
+            view.count = dense_vector->Dim();
+            view.values = dense_vector->ExpandedValues();
+        }
+    }
+    return view;
+}
+
+} // namespace
 
 /**
  * The following two functions provide safe conversion for return codes and modes in Ipopt.
@@ -331,23 +355,64 @@ bool CNLP_Problem::intermediate_callback(
 {
     CNLP_Bool retval = 1;
     if (m_intermediate_cb && *m_intermediate_cb) {
-        const Ipopt::Number* x_values = nullptr;
-        Ipopt::Index x_count = 0;
+        DenseVectorView x_view;
+        DenseVectorView s_view;
+        DenseVectorView y_c_view;
+        DenseVectorView y_d_view;
+        DenseVectorView z_l_view;
+        DenseVectorView z_u_view;
+        DenseVectorView v_l_view;
+        DenseVectorView v_u_view;
+        DenseVectorView kkt_x_stationarity_view;
+        DenseVectorView kkt_slack_stationarity_view;
+        DenseVectorView kkt_equality_residual_view;
+        DenseVectorView kkt_inequality_residual_view;
+        DenseVectorView kkt_slack_complementarity_view;
+        DenseVectorView kkt_slack_sigma_view;
+        DenseVectorView kkt_slack_distance_view;
         if (ip_data != nullptr) {
             Ipopt::SmartPtr<const Ipopt::IteratesVector> current_iterates = ip_data->curr();
             if (Ipopt::IsValid(current_iterates)) {
-                Ipopt::SmartPtr<const Ipopt::Vector> current_x = current_iterates->x();
-                const auto* dense_x =
-                    dynamic_cast<const Ipopt::DenseVector*>(Ipopt::GetRawPtr(current_x));
-                if (dense_x != nullptr) {
-                    x_count = dense_x->Dim();
-                    x_values = dense_x->ExpandedValues();
-                }
+                x_view = dense_vector_view(current_iterates->x());
+                s_view = dense_vector_view(current_iterates->s());
+                y_c_view = dense_vector_view(current_iterates->y_c());
+                y_d_view = dense_vector_view(current_iterates->y_d());
+                z_l_view = dense_vector_view(current_iterates->z_L());
+                z_u_view = dense_vector_view(current_iterates->z_U());
+                v_l_view = dense_vector_view(current_iterates->v_L());
+                v_u_view = dense_vector_view(current_iterates->v_U());
             }
+        }
+        if (ip_cq != nullptr) {
+            kkt_x_stationarity_view =
+                    dense_vector_view(ip_cq->curr_grad_lag_with_damping_x());
+            kkt_slack_stationarity_view =
+                    dense_vector_view(ip_cq->curr_grad_lag_with_damping_s());
+            kkt_equality_residual_view = dense_vector_view(ip_cq->curr_c());
+            kkt_inequality_residual_view = dense_vector_view(ip_cq->curr_d_minus_s());
+            kkt_slack_complementarity_view =
+                    dense_vector_view(ip_cq->curr_relaxed_compl_s_U());
+            kkt_slack_sigma_view = dense_vector_view(ip_cq->curr_sigma_s());
+            kkt_slack_distance_view = dense_vector_view(ip_cq->curr_slack_s_U());
         }
         retval = (**m_intermediate_cb)(convert_algorithm_mode(mode), iter, obj_value, inf_pr, inf_du,
                 mu, d_norm, regularization_size, alpha_du,
-                alpha_pr, ls_trials, x_count, x_values, m_user_data);
+                alpha_pr, ls_trials, x_view.count, x_view.values,
+                s_view.count, s_view.values,
+                y_c_view.count, y_c_view.values,
+                y_d_view.count, y_d_view.values,
+                z_l_view.count, z_l_view.values,
+                z_u_view.count, z_u_view.values,
+                v_l_view.count, v_l_view.values,
+                v_u_view.count, v_u_view.values,
+                kkt_x_stationarity_view.count, kkt_x_stationarity_view.values,
+                kkt_slack_stationarity_view.count, kkt_slack_stationarity_view.values,
+                kkt_equality_residual_view.count, kkt_equality_residual_view.values,
+                kkt_inequality_residual_view.count, kkt_inequality_residual_view.values,
+                kkt_slack_complementarity_view.count, kkt_slack_complementarity_view.values,
+                kkt_slack_sigma_view.count, kkt_slack_sigma_view.values,
+                kkt_slack_distance_view.count, kkt_slack_distance_view.values,
+                m_user_data);
     }
     return (retval!=0);
 }

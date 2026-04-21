@@ -921,6 +921,12 @@ fn append_nlip_direction_diagnostics_lines(
         fmt_diag_sci(diagnostics.ds_inf),
         fmt_diag_sci(diagnostics.dz_inf),
     ));
+    lines.push(format!(
+        "  direction regularization={} primal_shift={} dual_regularization={}",
+        fmt_diag_sci(diagnostics.regularization_size),
+        fmt_diag_sci(diagnostics.primal_diagonal_shift),
+        fmt_diag_sci(diagnostics.dual_regularization),
+    ));
     if let Some(limiter) = &diagnostics.alpha_pr_limiter {
         lines.push(format!(
             "  alpha_pr limiter idx={} value={} delta={} alpha={}",

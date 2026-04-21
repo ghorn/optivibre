@@ -206,7 +206,68 @@ CNLP_Bool hs071_intermediate_callback(enum CNLP_AlgorithmMode alg_mod,
                                  CNLP_Number alpha_du,
                                  CNLP_Number alpha_pr,
                                  CNLP_Index ls_trials,
+                                 CNLP_Index x_count,
+                                 const CNLP_Number* x,
+                                 CNLP_Index s_count,
+                                 const CNLP_Number* s,
+                                 CNLP_Index y_c_count,
+                                 const CNLP_Number* y_c,
+                                 CNLP_Index y_d_count,
+                                 const CNLP_Number* y_d,
+                                 CNLP_Index z_l_count,
+                                 const CNLP_Number* z_l,
+                                 CNLP_Index z_u_count,
+                                 const CNLP_Number* z_u,
+                                 CNLP_Index v_l_count,
+                                 const CNLP_Number* v_l,
+                                 CNLP_Index v_u_count,
+                                 const CNLP_Number* v_u,
+                                 CNLP_Index kkt_x_stationarity_count,
+                                 const CNLP_Number* kkt_x_stationarity,
+                                 CNLP_Index kkt_slack_stationarity_count,
+                                 const CNLP_Number* kkt_slack_stationarity,
+                                 CNLP_Index kkt_equality_residual_count,
+                                 const CNLP_Number* kkt_equality_residual,
+                                 CNLP_Index kkt_inequality_residual_count,
+                                 const CNLP_Number* kkt_inequality_residual,
+                                 CNLP_Index kkt_slack_complementarity_count,
+                                 const CNLP_Number* kkt_slack_complementarity,
+                                 CNLP_Index kkt_slack_sigma_count,
+                                 const CNLP_Number* kkt_slack_sigma,
+                                 CNLP_Index kkt_slack_distance_count,
+                                 const CNLP_Number* kkt_slack_distance,
                                  CNLP_UserDataPtr user_data)
 {
+  (void)x_count;
+  (void)x;
+  (void)s_count;
+  (void)s;
+  (void)y_c_count;
+  (void)y_c;
+  (void)y_d_count;
+  (void)y_d;
+  (void)z_l_count;
+  (void)z_l;
+  (void)z_u_count;
+  (void)z_u;
+  (void)v_l_count;
+  (void)v_l;
+  (void)v_u_count;
+  (void)v_u;
+  (void)kkt_x_stationarity_count;
+  (void)kkt_x_stationarity;
+  (void)kkt_slack_stationarity_count;
+  (void)kkt_slack_stationarity;
+  (void)kkt_equality_residual_count;
+  (void)kkt_equality_residual;
+  (void)kkt_inequality_residual_count;
+  (void)kkt_inequality_residual;
+  (void)kkt_slack_complementarity_count;
+  (void)kkt_slack_complementarity;
+  (void)kkt_slack_sigma_count;
+  (void)kkt_slack_sigma;
+  (void)kkt_slack_distance_count;
+  (void)kkt_slack_distance;
+  (void)user_data;
   return inf_pr >= 1e-4;
 }

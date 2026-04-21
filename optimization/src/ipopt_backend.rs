@@ -39,6 +39,22 @@ impl IpoptMuStrategy {
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpoptNlpScalingMethod {
+    None,
+    GradientBased,
+}
+
+impl IpoptNlpScalingMethod {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::GradientBased => "gradient-based",
+        }
+    }
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IpoptLinearSolver {
     Spral,
 }
@@ -91,6 +107,9 @@ pub struct IpoptOptions {
     pub suppress_banner: bool,
     pub mu_strategy: IpoptMuStrategy,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub nlp_scaling_method: Option<IpoptNlpScalingMethod>,
+    pub kappa_d: f64,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub linear_solver: Option<IpoptLinearSolver>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub spral_pivot_method: Option<IpoptSpralPivotMethod>,
@@ -115,6 +134,8 @@ impl Default for IpoptOptions {
             print_level: 0,
             suppress_banner: true,
             mu_strategy: IpoptMuStrategy::Adaptive,
+            nlp_scaling_method: None,
+            kappa_d: 1e-5,
             linear_solver: None,
             spral_pivot_method: None,
             spral_small_pivot_tolerance: None,
@@ -127,8 +148,12 @@ impl Default for IpoptOptions {
 
 pub fn format_ipopt_settings_summary(options: &IpoptOptions) -> String {
     format!(
-        "mu_strategy={}; acceptable_tol={}; print_level={}; banner={}; linear_solver={}; spral_pivot={}; spral_small={}; spral_u={}; spral_gpu={}; provenance={}",
+        "mu_strategy={}; nlp_scaling={}; kappa_d={:.1e}; acceptable_tol={}; print_level={}; banner={}; linear_solver={}; spral_pivot={}; spral_small={}; spral_u={}; spral_gpu={}; provenance={}",
         options.mu_strategy.as_str(),
+        options
+            .nlp_scaling_method
+            .map_or("problem/default", IpoptNlpScalingMethod::as_str),
+        options.kappa_d,
         options
             .acceptable_tol
             .map(|value| format!("{value:.3e}"))
@@ -261,6 +286,20 @@ pub struct IpoptIterationSnapshot {
     pub iteration: Index,
     pub phase: IpoptIterationPhase,
     pub x: Vec<f64>,
+    pub internal_slack: Vec<f64>,
+    pub equality_multipliers: Vec<f64>,
+    pub inequality_multipliers: Vec<f64>,
+    pub lower_bound_multipliers: Vec<f64>,
+    pub upper_bound_multipliers: Vec<f64>,
+    pub slack_lower_bound_multipliers: Vec<f64>,
+    pub slack_upper_bound_multipliers: Vec<f64>,
+    pub kkt_x_stationarity: Vec<f64>,
+    pub kkt_slack_stationarity: Vec<f64>,
+    pub kkt_equality_residual: Vec<f64>,
+    pub kkt_inequality_residual: Vec<f64>,
+    pub kkt_slack_complementarity: Vec<f64>,
+    pub kkt_slack_sigma: Vec<f64>,
+    pub kkt_slack_distance: Vec<f64>,
     pub objective: f64,
     pub primal_inf: f64,
     pub dual_inf: f64,
@@ -285,6 +324,22 @@ pub struct IpoptProfiling {
     #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
     pub total_time: Duration,
     pub backend_timing: BackendTimingMetadata,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug)]
+pub struct IpoptPartialSolution {
+    pub x: Vec<f64>,
+    pub lower_bound_multipliers: Vec<f64>,
+    pub upper_bound_multipliers: Vec<f64>,
+    pub equality_multipliers: Vec<f64>,
+    pub inequality_multipliers: Vec<f64>,
+    pub objective: f64,
+    pub equality_inf_norm: f64,
+    pub inequality_inf_norm: f64,
+    pub primal_inf_norm: f64,
+    pub dual_inf_norm: f64,
+    pub complementarity_inf_norm: f64,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -324,6 +379,7 @@ pub enum IpoptSolveError {
         status: IpoptRawStatus,
         iterations: Index,
         snapshots: Vec<IpoptIterationSnapshot>,
+        partial_solution: Option<Box<IpoptPartialSolution>>,
         journal_output: Option<String>,
         profiling: Box<IpoptProfiling>,
     },
@@ -528,6 +584,20 @@ where
             iteration: data.iter_count as usize,
             phase: data.alg_mod.into(),
             x: data.x.to_vec(),
+            internal_slack: data.s.to_vec(),
+            equality_multipliers: data.y_c.to_vec(),
+            inequality_multipliers: data.y_d.to_vec(),
+            lower_bound_multipliers: data.z_l.to_vec(),
+            upper_bound_multipliers: data.z_u.to_vec(),
+            slack_lower_bound_multipliers: data.v_l.to_vec(),
+            slack_upper_bound_multipliers: data.v_u.to_vec(),
+            kkt_x_stationarity: data.kkt_x_stationarity.to_vec(),
+            kkt_slack_stationarity: data.kkt_slack_stationarity.to_vec(),
+            kkt_equality_residual: data.kkt_equality_residual.to_vec(),
+            kkt_inequality_residual: data.kkt_inequality_residual.to_vec(),
+            kkt_slack_complementarity: data.kkt_slack_complementarity.to_vec(),
+            kkt_slack_sigma: data.kkt_slack_sigma.to_vec(),
+            kkt_slack_distance: data.kkt_slack_distance.to_vec(),
             objective: data.obj_value,
             primal_inf: data.inf_pr,
             dual_inf: data.inf_du,
@@ -898,10 +968,15 @@ where
     if let Some(value) = options.dual_tol {
         set_ipopt_option(solver, "dual_inf_tol", value)?;
     }
-    if let Some(method) = nlp_scaling_method {
+    if let Some(method) = options
+        .nlp_scaling_method
+        .map(IpoptNlpScalingMethod::as_str)
+        .or(nlp_scaling_method)
+    {
         set_ipopt_option(solver, "nlp_scaling_method", method)?;
     }
     set_ipopt_option(solver, "mu_strategy", options.mu_strategy.as_str())?;
+    set_ipopt_option(solver, "kappa_d", options.kappa_d)?;
     set_ipopt_option(solver, "print_level", options.print_level)?;
     if let Some(linear_solver) = options.linear_solver {
         set_ipopt_option(solver, "linear_solver", linear_solver.as_str())?;
@@ -989,11 +1064,25 @@ where
         let mut profiling = solve_result.solver_data.problem.profiling();
         profiling.total_time = solve_started.elapsed();
         let journal_output = read_ipopt_journal(journal_path);
+        let partial_solution = IpoptPartialSolution {
+            x: x.clone(),
+            lower_bound_multipliers: lower_bound_multipliers.clone(),
+            upper_bound_multipliers: upper_bound_multipliers.clone(),
+            equality_multipliers: Vec::new(),
+            inequality_multipliers: Vec::new(),
+            objective,
+            equality_inf_norm: 0.0,
+            inequality_inf_norm: 0.0,
+            primal_inf_norm: 0.0,
+            dual_inf_norm: 0.0,
+            complementarity_inf_norm: 0.0,
+        };
         if !solve_status_is_success(status) {
             return Err(IpoptSolveError::Solve {
                 status: raw_status,
                 iterations,
                 snapshots,
+                partial_solution: Some(Box::new(partial_solution)),
                 journal_output,
                 profiling: Box::new(profiling),
             });
@@ -1050,16 +1139,6 @@ where
         .solution
         .constraint_multipliers
         .to_vec();
-    if !solve_status_is_success(status) {
-        return Err(IpoptSolveError::Solve {
-            status: raw_status,
-            iterations,
-            snapshots,
-            journal_output,
-            profiling: Box::new(profiling),
-        });
-    }
-
     let equality_count = problem.equality_count();
     let equality_multipliers = constraint_multipliers[..equality_count].to_vec();
     let inequality_multipliers = constraint_multipliers[equality_count..].to_vec();
@@ -1092,6 +1171,30 @@ where
     let dual_inf_norm = inf_norm(&lagrangian_residual);
     let complementarity_inf_norm =
         complementarity_inf_norm(&inequality_values, &inequality_multipliers);
+    let partial_solution = IpoptPartialSolution {
+        x: x.clone(),
+        lower_bound_multipliers: lower_bound_multipliers.clone(),
+        upper_bound_multipliers: upper_bound_multipliers.clone(),
+        equality_multipliers: equality_multipliers.clone(),
+        inequality_multipliers: inequality_multipliers.clone(),
+        objective,
+        equality_inf_norm,
+        inequality_inf_norm,
+        primal_inf_norm,
+        dual_inf_norm,
+        complementarity_inf_norm,
+    };
+
+    if !solve_status_is_success(status) {
+        return Err(IpoptSolveError::Solve {
+            status: raw_status,
+            iterations,
+            snapshots,
+            partial_solution: Some(Box::new(partial_solution)),
+            journal_output,
+            profiling: Box::new(profiling),
+        });
+    }
 
     Ok(IpoptSummary {
         x,

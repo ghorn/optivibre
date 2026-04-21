@@ -134,6 +134,7 @@ pub enum NativeOrdering {
     #[default]
     LibraryDefault,
     Natural,
+    Matching,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,7 +159,10 @@ pub struct NativeSpralSession {
     dimension: usize,
     pattern_col_ptrs: Vec<usize>,
     pattern_row_indices: Vec<usize>,
+    pattern_col_ptrs64: Vec<i64>,
+    pattern_row_indices32: Vec<i32>,
     options: SpralSsidsOptions,
+    scaling: Option<Vec<f64>>,
     analyse_info: NativeSpralAnalyseInfo,
     factor_info: Option<NativeSpralFactorInfo>,
     analysed: *mut c_void,
@@ -306,7 +310,7 @@ impl NativeSpral {
         options.array_base = 0;
         options.use_gpu = false;
         options.ignore_numa = true;
-        options.print_level = 0;
+        options.print_level = -1;
         apply_numeric_factor_options(&mut options, numeric_options);
         let mut order_storage = None;
         apply_native_ordering(
@@ -318,16 +322,27 @@ impl NativeSpral {
 
         let mut inform = SpralSsidsInform::default();
         let mut analysed = ptr::null_mut();
+        let values_ptr = if ordering == NativeOrdering::Matching {
+            matrix
+                .values()
+                .ok_or(NativeSpralError::MissingValues)?
+                .as_ptr()
+        } else {
+            matrix
+                .values()
+                .map_or(ptr::null(), |values| values.as_ptr())
+        };
+
         unsafe {
             (self.inner.analyse)(
-                true,
+                false,
                 i32::try_from(matrix.dimension()).unwrap_or(i32::MAX),
                 order_storage
                     .as_mut()
                     .map_or(ptr::null_mut(), |order| order.as_mut_ptr()),
                 col_ptrs64.as_ptr(),
                 row_indices32.as_ptr(),
-                ptr::null(),
+                values_ptr,
                 &mut analysed,
                 &options,
                 &mut inform,
@@ -340,12 +355,16 @@ impl NativeSpral {
             }
             return Err(NativeSpralError::AnalyseFailed { flag: inform.flag });
         }
+        let scaling = (options.scaling != 0).then(|| vec![0.0; matrix.dimension()]);
         Ok(NativeSpralSession {
             inner: Arc::clone(&self.inner),
             dimension: matrix.dimension(),
             pattern_col_ptrs: matrix.col_ptrs().to_vec(),
             pattern_row_indices: matrix.row_indices().to_vec(),
+            pattern_col_ptrs64: col_ptrs64,
+            pattern_row_indices32: row_indices32,
             options,
+            scaling,
             analyse_info: NativeSpralAnalyseInfo {
                 supernode_count: inform.num_sup.max(0) as usize,
                 max_front_size: inform.maxfront.max(0) as usize,
@@ -391,10 +410,12 @@ fn native_spral_library_candidates() -> Vec<PathBuf> {
 
 fn apply_numeric_factor_options(native: &mut SpralSsidsOptions, numeric: &NumericFactorOptions) {
     native.action = numeric.action_on_zero_pivot;
+    // SPRAL's C API uses the same zero-based pivot-method numbering that
+    // IPOPT passes through in IpSpralSolverInterface.
     native.pivot_method = match numeric.pivot_method {
-        PivotMethod::AggressiveAposteriori => 1,
-        PivotMethod::BlockAposteriori => 2,
-        PivotMethod::ThresholdPartial => 3,
+        PivotMethod::AggressiveAposteriori => 0,
+        PivotMethod::BlockAposteriori => 1,
+        PivotMethod::ThresholdPartial => 2,
     };
     native.small = numeric.small_pivot_tolerance;
     native.u = numeric.threshold_pivot_u;
@@ -415,6 +436,10 @@ fn apply_native_ordering(
                     .map(|index| i32::try_from(index).unwrap_or(i32::MAX))
                     .collect(),
             );
+        }
+        NativeOrdering::Matching => {
+            native.ordering = 2;
+            native.scaling = 3;
         }
     }
 }
@@ -493,13 +518,17 @@ impl NativeSpralSession {
             )));
         }
         let mut inform = SpralSsidsInform::default();
+        let scaling_ptr = self
+            .scaling
+            .as_mut()
+            .map_or(ptr::null_mut(), |scaling| scaling.as_mut_ptr());
         unsafe {
             (self.inner.factor)(
                 false,
-                ptr::null(),
-                ptr::null(),
+                self.pattern_col_ptrs64.as_ptr(),
+                self.pattern_row_indices32.as_ptr(),
                 values.as_ptr(),
-                ptr::null_mut(),
+                scaling_ptr,
                 self.analysed,
                 &mut self.factorized,
                 &self.options,

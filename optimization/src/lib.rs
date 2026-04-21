@@ -55,9 +55,10 @@ pub use ipopt::SolveStatus as IpoptSolveStatus;
 #[cfg(feature = "ipopt")]
 pub use ipopt_backend::{
     IpoptIterationPhase, IpoptIterationSnapshot, IpoptIterationTiming, IpoptLinearSolver,
-    IpoptMuStrategy, IpoptOptions, IpoptProfiling, IpoptProvenance, IpoptRawStatus,
-    IpoptSolveError, IpoptSpralPivotMethod, IpoptSummary, capture_ipopt_provenance,
-    format_ipopt_settings_summary, solve_nlp_ipopt, solve_nlp_ipopt_with_callback,
+    IpoptMuStrategy, IpoptNlpScalingMethod, IpoptOptions, IpoptPartialSolution, IpoptProfiling,
+    IpoptProvenance, IpoptRawStatus, IpoptSolveError, IpoptSpralPivotMethod, IpoptSummary,
+    capture_ipopt_provenance, format_ipopt_settings_summary, solve_nlp_ipopt,
+    solve_nlp_ipopt_with_callback,
 };
 pub use symbolic::{
     ConstraintBounds, DynamicCompiledJitNlp, DynamicSymbolicNlp, RuntimeBoundedJitNlp,
@@ -271,6 +272,7 @@ pub struct SpralParityProfile {
     pub small_pivot_tolerance: f64,
     pub threshold_pivot_u: f64,
     pub use_gpu: bool,
+    pub kappa_d: f64,
 }
 
 impl Default for SpralParityProfile {
@@ -280,6 +282,7 @@ impl Default for SpralParityProfile {
             small_pivot_tolerance: 1.0e-20,
             threshold_pivot_u: 1.0e-8,
             use_gpu: false,
+            kappa_d: 1.0e-5,
         }
     }
 }
@@ -292,6 +295,7 @@ pub fn apply_native_spral_parity_to_nlip_options(options: &mut InteriorPointOpti
     let profile = native_spral_parity_profile();
     options.linear_solver = InteriorPointLinearSolver::NativeSpralSsids;
     options.regularization = 0.0;
+    options.kappa_d = profile.kappa_d;
     options.spral_pivot_method = match profile.pivot_method {
         SpralParityPivotProfile::Block => InteriorPointSpralPivotMethod::BlockAposteriori,
     };
@@ -311,6 +315,10 @@ pub fn apply_native_spral_parity_to_ipopt_options(options: &mut IpoptOptions) {
     // NLIP currently implements IPOPT's monotone barrier-update path, not the
     // adaptive strategy, so parity runs force IPOPT onto the same update mode.
     options.mu_strategy = IpoptMuStrategy::Monotone;
+    // IPOPT's default gradient-based NLP scaling changes the KKT system before
+    // the linear solver sees it. Keep native-SPRAL parity on the same unscaled
+    // NLP until NLIP has a deliberate IPOPT-compatible scaling layer.
+    options.nlp_scaling_method = Some(IpoptNlpScalingMethod::None);
     options.linear_solver = Some(IpoptLinearSolver::Spral);
     options.spral_pivot_method = Some(match profile.pivot_method {
         SpralParityPivotProfile::Block => IpoptSpralPivotMethod::Block,
@@ -318,6 +326,7 @@ pub fn apply_native_spral_parity_to_ipopt_options(options: &mut IpoptOptions) {
     options.spral_small_pivot_tolerance = Some(profile.small_pivot_tolerance);
     options.spral_threshold_pivot_u = Some(profile.threshold_pivot_u);
     options.spral_use_gpu = Some(profile.use_gpu);
+    options.kappa_d = profile.kappa_d;
     options.capture_provenance = true;
 }
 

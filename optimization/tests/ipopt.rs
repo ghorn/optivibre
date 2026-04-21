@@ -2,8 +2,8 @@
 
 use approx::assert_abs_diff_eq;
 use optimization::{
-    IpoptOptions, ParameterMatrix, apply_native_spral_parity_to_ipopt_options, solve_nlp_ipopt,
-    solve_nlp_ipopt_with_callback,
+    IpoptIterationSnapshot, IpoptOptions, ParameterMatrix,
+    apply_native_spral_parity_to_ipopt_options, solve_nlp_ipopt, solve_nlp_ipopt_with_callback,
 };
 use rstest::rstest;
 
@@ -51,6 +51,33 @@ fn local_native_spral_ipopt_options() -> IpoptOptions {
     let mut options = IpoptOptions::default();
     apply_native_spral_parity_to_ipopt_options(&mut options);
     options
+}
+
+fn compare_verbose_requested() -> bool {
+    std::env::var_os("AD_CODEGEN_COMPARE_VERBOSE").is_some()
+}
+
+fn maybe_print_ipopt_trace(problem_name: &str, snapshots: &[IpoptIterationSnapshot]) {
+    if !compare_verbose_requested() {
+        return;
+    }
+    eprintln!("IPOPT trace for {problem_name}:");
+    for snapshot in snapshots {
+        eprintln!(
+            "  iter={:>3} phase={:?} obj={:.6e} inf_pr={:.6e} inf_du={:.6e} mu={:.6e} reg={:.6e} alpha_pr={:.6e} alpha_du={:.6e} ls={} x={:?}",
+            snapshot.iteration,
+            snapshot.phase,
+            snapshot.objective,
+            snapshot.primal_inf,
+            snapshot.dual_inf,
+            snapshot.barrier_parameter,
+            snapshot.regularization_size,
+            snapshot.alpha_pr,
+            snapshot.alpha_du,
+            snapshot.line_search_trials,
+            snapshot.x
+        );
+    }
 }
 
 fn local_native_spral_ipopt_available() -> bool {
@@ -137,6 +164,34 @@ fn ipopt_solves_casadi_rosenbrock_example(
 ) {
     let problem = build_problem_ok(casadi_rosenbrock_nlp_problem(backend), backend);
     let summary = solve_ok(&problem, &[2.5, 3.0, 0.75], &[], IpoptOptions::default());
+
+    assert_abs_diff_eq!(summary.x[0], 0.0, epsilon = 1e-7);
+    assert_abs_diff_eq!(summary.x[1], 1.0, epsilon = 1e-7);
+    assert_abs_diff_eq!(summary.x[2], 0.0, epsilon = 1e-7);
+    assert_abs_diff_eq!(summary.objective, 0.0, epsilon = 1e-7);
+    assert!(summary.equality_inf_norm <= 1e-7);
+    assert!(summary.dual_inf_norm <= 1e-6);
+}
+
+#[rstest]
+fn ipopt_solves_casadi_rosenbrock_with_local_native_spral_profile(
+    #[values(CallbackBackend::Aot, CallbackBackend::Jit)] backend: CallbackBackend,
+) {
+    if !local_native_spral_ipopt_available() {
+        return;
+    }
+    let problem = build_problem_ok(casadi_rosenbrock_nlp_problem(backend), backend);
+    let mut snapshots = Vec::new();
+    let solve_result = solve_nlp_ipopt_with_callback(
+        &problem,
+        &[2.5, 3.0, 0.75],
+        &[],
+        &local_native_spral_ipopt_options(),
+        |snapshot| snapshots.push(snapshot.clone()),
+    );
+    maybe_print_ipopt_trace("casadi_rosenbrock/native_spral_profile", &snapshots);
+    assert!(solve_result.is_ok(), "Ipopt solve failed: {solve_result:?}");
+    let summary = solve_result.expect("asserted success");
 
     assert_abs_diff_eq!(summary.x[0], 0.0, epsilon = 1e-7);
     assert_abs_diff_eq!(summary.x[1], 1.0, epsilon = 1e-7);

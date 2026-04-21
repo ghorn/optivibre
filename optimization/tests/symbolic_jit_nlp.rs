@@ -5,10 +5,10 @@ use std::sync::{Mutex, OnceLock};
 use optimization::{
     CallPolicy, CallPolicyConfig, ClarabelSqpOptions, ConstraintBounds,
     FiniteDifferenceValidationOptions, FunctionCompileOptions, InteriorPointLinearSolver,
-    InteriorPointOptions, LlvmOptimizationLevel, RuntimeNlpBounds, RuntimeNlpScaling,
-    SqpGlobalization, SymbolicCompileProgress, SymbolicCompileStage, SymbolicNlpOutputs,
-    TypedNlpScaling, TypedRuntimeNlpBounds, clear_optivibre_jit_cache, flat_view, symbolic_nlp,
-    symbolic_nlp_dynamic,
+    InteriorPointOptions, LlvmOptimizationLevel, NlpEvaluationBenchmarkOptions, RuntimeNlpBounds,
+    RuntimeNlpScaling, SqpGlobalization, SymbolicCompileProgress, SymbolicCompileStage,
+    SymbolicNlpOutputs, TypedNlpScaling, TypedRuntimeNlpBounds, clear_optivibre_jit_cache,
+    flat_view, symbolic_nlp, symbolic_nlp_dynamic,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptOptions, IpoptRawStatus};
@@ -335,6 +335,56 @@ fn dynamic_symbolic_nlp_solves_with_flat_bounds_and_scaling() {
     assert_abs_diff_eq!(summary.x[0] + summary.x[1], 1.0, epsilon = 1e-6);
     assert!(summary.x[0].powi(2) + summary.x[1].powi(2) <= 2.0 + 1e-6);
     assert!(summary.x[1] <= 1.0 + 1e-6);
+}
+
+#[test]
+fn dynamic_symbolic_nlp_uses_reference_scales_like_typed_api() {
+    let compiled = dynamic_parameterized_problem()
+        .compile_jit()
+        .expect("dynamic JIT compile should succeed");
+    let benchmark = compiled
+        .benchmark_bounded_evaluations(
+            &[-1.2, 1.0],
+            Some(&[0.25, 0.75]),
+            &RuntimeNlpBounds {
+                variables: ConstraintBounds::default(),
+                inequalities: ConstraintBounds {
+                    lower: Some(vec![None, None]),
+                    upper: Some(vec![Some(2.0), Some(1.0)]),
+                },
+            },
+            Some(&RuntimeNlpScaling {
+                variables: vec![2.0, 0.5],
+                constraints: vec![1.0, 0.25, 0.5],
+                objective: 2.0,
+            }),
+            NlpEvaluationBenchmarkOptions {
+                warmup_iterations: 1,
+                measured_iterations: 1,
+            },
+        )
+        .expect("dynamic benchmark should succeed");
+
+    assert_abs_diff_eq!(
+        benchmark.benchmark_point.objective_value,
+        1.0825,
+        epsilon = 1e-12
+    );
+    assert_abs_diff_eq!(
+        benchmark.benchmark_point.equality_inf_norm.unwrap(),
+        1.2,
+        epsilon = 1e-12
+    );
+    assert_abs_diff_eq!(
+        benchmark.benchmark_point.inequality_inf_norm.unwrap(),
+        1.76,
+        epsilon = 1e-12
+    );
+    assert_abs_diff_eq!(
+        benchmark.benchmark_point.decision_inf_norm,
+        2.0,
+        epsilon = 1e-12
+    );
 }
 
 #[test]

@@ -170,7 +170,23 @@ extern "C"
             CNLP_Number regularization_size,
             CNLP_Number alpha_du, CNLP_Number alpha_pr,
             CNLP_Index ls_trials, CNLP_Index x_count,
-            const CNLP_Number* x, CNLP_UserDataPtr user_data);
+            const CNLP_Number* x,
+            CNLP_Index s_count, const CNLP_Number* s,
+            CNLP_Index y_c_count, const CNLP_Number* y_c,
+            CNLP_Index y_d_count, const CNLP_Number* y_d,
+            CNLP_Index z_l_count, const CNLP_Number* z_l,
+            CNLP_Index z_u_count, const CNLP_Number* z_u,
+            CNLP_Index v_l_count, const CNLP_Number* v_l,
+            CNLP_Index v_u_count, const CNLP_Number* v_u,
+            CNLP_Index kkt_x_stationarity_count, const CNLP_Number* kkt_x_stationarity,
+            CNLP_Index kkt_slack_stationarity_count, const CNLP_Number* kkt_slack_stationarity,
+            CNLP_Index kkt_equality_residual_count, const CNLP_Number* kkt_equality_residual,
+            CNLP_Index kkt_inequality_residual_count, const CNLP_Number* kkt_inequality_residual,
+            CNLP_Index kkt_slack_complementarity_count,
+            const CNLP_Number* kkt_slack_complementarity,
+            CNLP_Index kkt_slack_sigma_count, const CNLP_Number* kkt_slack_sigma,
+            CNLP_Index kkt_slack_distance_count, const CNLP_Number* kkt_slack_distance,
+            CNLP_UserDataPtr user_data);
 
     /** Enum reporting the status of problem creation */
     enum CNLP_CreateProblemStatus {
