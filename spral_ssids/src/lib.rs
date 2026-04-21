@@ -780,14 +780,8 @@ pub fn analyse(
                 matrix.row_indices().len(),
             ));
             let permutation = Permutation::identity(matrix.dimension());
-            let (elimination_tree, column_counts, column_pattern) = symbolic_factor_pattern(&graph);
-            let result = build_symbolic_result(
-                permutation,
-                elimination_tree,
-                column_counts,
-                column_pattern,
-                "natural",
-            );
+            let result =
+                build_symbolic_result_with_native_supernode_order(&graph, permutation, "natural")?;
             analyse_debug_log(format!(
                 "[spral_ssids::analyse] strategy=natural done in {:.3}s fill={} supernodes={}",
                 analyse_started.elapsed().as_secs_f64(),
@@ -803,16 +797,11 @@ pub fn analyse(
                 matrix.row_indices().len(),
             ));
             let summary = approximate_minimum_degree_order(&graph)?;
-            let permuted_graph = permute_graph(&graph, &summary.permutation);
-            let (elimination_tree, column_counts, column_pattern) =
-                symbolic_factor_pattern(&permuted_graph);
-            let result = build_symbolic_result(
+            let result = build_symbolic_result_with_native_supernode_order(
+                &graph,
                 summary.permutation,
-                elimination_tree,
-                column_counts,
-                column_pattern,
                 "approximate_minimum_degree",
-            );
+            )?;
             analyse_debug_log(format!(
                 "[spral_ssids::analyse] strategy=amd done in {:.3}s fill={} supernodes={}",
                 analyse_started.elapsed().as_secs_f64(),
@@ -828,16 +817,11 @@ pub fn analyse(
                 matrix.row_indices().len(),
             ));
             let summary = nested_dissection_order(&graph, &ordering_options)?;
-            let permuted_graph = permute_graph(&graph, &summary.permutation);
-            let (elimination_tree, column_counts, column_pattern) =
-                symbolic_factor_pattern(&permuted_graph);
-            let result = build_symbolic_result(
+            let result = build_symbolic_result_with_native_supernode_order(
+                &graph,
                 summary.permutation,
-                elimination_tree,
-                column_counts,
-                column_pattern,
                 "nested_dissection",
-            );
+            )?;
             analyse_debug_log(format!(
                 "[spral_ssids::analyse] strategy=nested_dissection done in {:.3}s fill={} supernodes={}",
                 analyse_started.elapsed().as_secs_f64(),
@@ -854,7 +838,7 @@ pub fn analyse(
             ));
             let natural_permutation = Permutation::identity(matrix.dimension());
             analyse_debug_log("[spral_ssids::analyse] auto natural symbolic start");
-            let (natural_tree, natural_counts, natural_pattern) = symbolic_factor_pattern(&graph);
+            let (_, natural_counts, _) = symbolic_factor_pattern(&graph);
             let natural_fill = natural_counts.iter().sum::<usize>();
             analyse_debug_log(format!(
                 "[spral_ssids::analyse] auto natural symbolic done fill={} elapsed={:.3}s",
@@ -866,7 +850,7 @@ pub fn analyse(
             analyse_debug_log("[spral_ssids::analyse] auto amd start");
             let amd_summary = approximate_minimum_degree_order(&graph)?;
             let amd_graph = permute_graph(&graph, &amd_summary.permutation);
-            let (amd_tree, amd_counts, amd_pattern) = symbolic_factor_pattern(&amd_graph);
+            let (_, amd_counts, _) = symbolic_factor_pattern(&amd_graph);
             let amd_fill = amd_counts.iter().sum::<usize>();
             analyse_debug_log(format!(
                 "[spral_ssids::analyse] auto amd done fill={} elapsed={:.3}s total={:.3}s",
@@ -879,7 +863,7 @@ pub fn analyse(
             analyse_debug_log("[spral_ssids::analyse] auto nested dissection start");
             let summary = nested_dissection_order(&graph, &ordering_options)?;
             let permuted_graph = permute_graph(&graph, &summary.permutation);
-            let (nd_tree, nd_counts, nd_pattern) = symbolic_factor_pattern(&permuted_graph);
+            let (_, nd_counts, _) = symbolic_factor_pattern(&permuted_graph);
             let nd_fill = nd_counts.iter().sum::<usize>();
             analyse_debug_log(format!(
                 "[spral_ssids::analyse] auto nested dissection done fill={} elapsed={:.3}s total={:.3}s",
@@ -889,39 +873,33 @@ pub fn analyse(
             ));
 
             if amd_fill <= natural_fill && amd_fill <= nd_fill {
-                let result = build_symbolic_result(
+                let result = build_symbolic_result_with_native_supernode_order(
+                    &graph,
                     amd_summary.permutation,
-                    amd_tree,
-                    amd_counts,
-                    amd_pattern,
                     "auto_approximate_minimum_degree",
-                );
+                )?;
                 analyse_debug_log(format!(
                     "[spral_ssids::analyse] auto selected=amd total={:.3}s",
                     analyse_started.elapsed().as_secs_f64(),
                 ));
                 Ok(result)
             } else if nd_fill <= natural_fill {
-                let result = build_symbolic_result(
+                let result = build_symbolic_result_with_native_supernode_order(
+                    &graph,
                     summary.permutation,
-                    nd_tree,
-                    nd_counts,
-                    nd_pattern,
                     "auto_nested_dissection",
-                );
+                )?;
                 analyse_debug_log(format!(
                     "[spral_ssids::analyse] auto selected=nested_dissection total={:.3}s",
                     analyse_started.elapsed().as_secs_f64(),
                 ));
                 Ok(result)
             } else {
-                let result = build_symbolic_result(
+                let result = build_symbolic_result_with_native_supernode_order(
+                    &graph,
                     natural_permutation,
-                    natural_tree,
-                    natural_counts,
-                    natural_pattern,
                     "auto_natural",
-                );
+                )?;
                 analyse_debug_log(format!(
                     "[spral_ssids::analyse] auto selected=natural total={:.3}s",
                     analyse_started.elapsed().as_secs_f64(),
@@ -1004,6 +982,134 @@ fn permute_graph(graph: &CsrGraph, permutation: &Permutation) -> CsrGraph {
         })
         .collect::<Vec<_>>();
     CsrGraph::from_edges(graph.vertex_count(), &edges).expect("permutation preserves graph shape")
+}
+
+fn build_symbolic_result_with_native_supernode_order(
+    graph: &CsrGraph,
+    base_permutation: Permutation,
+    ordering_kind: &'static str,
+) -> Result<(SymbolicFactor, AnalyseInfo), SsidsError> {
+    let permuted_graph = permute_graph(graph, &base_permutation);
+    let (elimination_tree, column_counts, column_pattern) =
+        symbolic_factor_pattern(&permuted_graph);
+    let supernode_permutation = native_supernode_permutation(&elimination_tree, &column_counts);
+    if is_identity_order(&supernode_permutation) {
+        return Ok(build_symbolic_result(
+            base_permutation,
+            elimination_tree,
+            column_counts,
+            column_pattern,
+            ordering_kind,
+        ));
+    }
+
+    let final_permutation =
+        compose_ordering_with_supernode_permutation(&base_permutation, &supernode_permutation)?;
+    let final_graph = permute_graph(graph, &final_permutation);
+    let (final_tree, final_counts, final_pattern) = symbolic_factor_pattern(&final_graph);
+    Ok(build_symbolic_result(
+        final_permutation,
+        final_tree,
+        final_counts,
+        final_pattern,
+        ordering_kind,
+    ))
+}
+
+fn compose_ordering_with_supernode_permutation(
+    base_permutation: &Permutation,
+    supernode_permutation: &[usize],
+) -> Result<Permutation, OrderingError> {
+    let mut perm = vec![usize::MAX; base_permutation.len()];
+    for (old_position, &new_position) in supernode_permutation.iter().enumerate() {
+        perm[new_position] = base_permutation.perm()[old_position];
+    }
+    Permutation::new(perm)
+}
+
+fn is_identity_order(order: &[usize]) -> bool {
+    order
+        .iter()
+        .enumerate()
+        .all(|(index, &value)| index == value)
+}
+
+fn native_supernode_permutation(
+    elimination_tree: &[Option<usize>],
+    column_counts: &[usize],
+) -> Vec<usize> {
+    // Mirror the renumbering part of SPRAL's core_analyse.find_supernodes:
+    // merged vertices are walked with a small stack and then applied as a
+    // second symbolic permutation before numeric factorization.
+    let n = elimination_tree.len();
+    let virtual_root = n;
+    let mut children = vec![Vec::new(); n + 1];
+    for (node, parent) in elimination_tree.iter().copied().enumerate() {
+        children[parent.unwrap_or(virtual_root)].push(node);
+    }
+
+    let mut nelim = vec![1_usize; n + 1];
+    let mut nvert = vec![1_usize; n + 1];
+    let mut vhead = vec![None; n + 1];
+    let mut vnext = vec![None; n + 1];
+    let mut marked = vec![false; n];
+    nelim[virtual_root] = n + 1 + RELAXED_NODE_AMALGAMATION_NEMIN;
+
+    for parent in 0..=n {
+        children[parent].sort_by(|&lhs, &rhs| column_counts[rhs].cmp(&column_counts[lhs]));
+        for &node in &children[parent] {
+            if native_should_merge_supernode(node, parent, &nelim, column_counts) {
+                vnext[node] = vhead[parent];
+                vhead[parent] = Some(node);
+                nelim[parent] += nelim[node];
+                nvert[parent] += nvert[node];
+                marked[node] = false;
+            } else {
+                marked[node] = true;
+            }
+        }
+    }
+
+    let mut permutation = vec![usize::MAX; n];
+    let mut next_position = 0;
+    let mut stack = Vec::new();
+    for node in 0..n {
+        if !marked[node] {
+            continue;
+        }
+        next_position += nvert[node];
+        let mut position = next_position;
+        stack.push(node);
+        while let Some(vertex) = stack.pop() {
+            position -= 1;
+            permutation[vertex] = position;
+            if let Some(next) = vnext[vertex] {
+                stack.push(next);
+            }
+            if let Some(head) = vhead[vertex] {
+                stack.push(head);
+            }
+        }
+    }
+
+    if permutation.contains(&usize::MAX) {
+        return (0..n).collect();
+    }
+    permutation
+}
+
+fn native_should_merge_supernode(
+    node: usize,
+    parent: usize,
+    nelim: &[usize],
+    column_counts: &[usize],
+) -> bool {
+    if parent >= column_counts.len() {
+        return false;
+    }
+    (column_counts[parent] == column_counts[node].saturating_sub(1) && nelim[parent] == 1)
+        || (nelim[parent] < RELAXED_NODE_AMALGAMATION_NEMIN
+            && nelim[node] < RELAXED_NODE_AMALGAMATION_NEMIN)
 }
 
 fn symbolic_factor_pattern(graph: &CsrGraph) -> (Vec<Option<usize>>, Vec<usize>, Vec<Vec<usize>>) {

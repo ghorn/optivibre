@@ -227,6 +227,22 @@ fn rust_and_native_spral_match_dense_seed_6_33x33_solution_bits() {
 }
 
 #[test]
+fn rust_and_native_spral_match_dense_seed_706172697479_case58_solution_bits() {
+    let mut rng = DenseBoundaryRng::new(0x7061_7269_7479);
+    let mut dimension = 0;
+    let mut matrix = Vec::new();
+    let mut expected_solution = Vec::new();
+    for _case_index in 0..=58 {
+        dimension = rng.usize_inclusive(33, 160);
+        matrix = random_dense_dyadic_matrix(dimension, &mut rng);
+        expected_solution = random_dyadic_solution(dimension, &mut rng);
+    }
+
+    assert_eq!(dimension, 137);
+    assert_exact_bitwise_parity_witness(&matrix, &expected_solution);
+}
+
+#[test]
 fn rust_and_native_spral_match_app_dense_zero_reduction_64x64_solution_bits() {
     let matrix = deterministic_complete_dyadic_matrix(64);
     let expected_solution = (0..64)
