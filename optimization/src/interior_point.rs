@@ -1624,6 +1624,7 @@ struct ReducedKktSystem<'a> {
     regularization_max: f64,
     jacobian_regularization_value: f64,
     jacobian_regularization_exponent: f64,
+    forced_jacobian_regularization: Option<f64>,
     spral_pivot_method: InteriorPointSpralPivotMethod,
     spral_action_on_zero_pivot: bool,
     spral_small_pivot_tolerance: f64,
@@ -1665,6 +1666,50 @@ impl<'a> ReducedKktSystem<'a> {
             regularization_max: self.regularization_max,
             jacobian_regularization_value: self.jacobian_regularization_value,
             jacobian_regularization_exponent: self.jacobian_regularization_exponent,
+            forced_jacobian_regularization: self.forced_jacobian_regularization,
+            spral_pivot_method: self.spral_pivot_method,
+            spral_action_on_zero_pivot: self.spral_action_on_zero_pivot,
+            spral_small_pivot_tolerance: self.spral_small_pivot_tolerance,
+            spral_threshold_pivot_u: self.spral_threshold_pivot_u,
+        }
+    }
+
+    fn with_forced_perturbations<'b>(
+        &'b self,
+        primal_regularization: f64,
+        jacobian_regularization: f64,
+    ) -> ReducedKktSystem<'b>
+    where
+        'a: 'b,
+    {
+        let primal_regularization = primal_regularization.max(0.0);
+        ReducedKktSystem {
+            hessian: self.hessian,
+            equality_jacobian: self.equality_jacobian,
+            inequality_jacobian: self.inequality_jacobian,
+            bound_diagonal: self.bound_diagonal,
+            bound_rhs: self.bound_rhs,
+            slack: self.slack,
+            multipliers: self.multipliers,
+            r_dual: self.r_dual,
+            r_eq: self.r_eq,
+            r_ineq: self.r_ineq,
+            r_slack_stationarity: self.r_slack_stationarity,
+            r_cent: self.r_cent,
+            barrier_parameter: self.barrier_parameter,
+            kappa_d: self.kappa_d,
+            solver: self.solver,
+            regularization: primal_regularization,
+            first_hessian_perturbation: primal_regularization,
+            previous_hessian_perturbation: Some(primal_regularization),
+            regularization_first_growth_factor: self.regularization_first_growth_factor,
+            adaptive_regularization_retries: 0,
+            regularization_growth_factor: self.regularization_growth_factor,
+            regularization_decay_factor: self.regularization_decay_factor,
+            regularization_max: primal_regularization,
+            jacobian_regularization_value: self.jacobian_regularization_value,
+            jacobian_regularization_exponent: self.jacobian_regularization_exponent,
+            forced_jacobian_regularization: Some(jacobian_regularization.max(0.0)),
             spral_pivot_method: self.spral_pivot_method,
             spral_action_on_zero_pivot: self.spral_action_on_zero_pivot,
             spral_small_pivot_tolerance: self.spral_small_pivot_tolerance,
@@ -2004,6 +2049,7 @@ impl InteriorPointKktSnapshot {
             regularization_max: self.regularization_max,
             jacobian_regularization_value: self.jacobian_regularization_value,
             jacobian_regularization_exponent: self.jacobian_regularization_exponent,
+            forced_jacobian_regularization: None,
             spral_pivot_method: self.spral_pivot_method,
             spral_action_on_zero_pivot: self.spral_action_on_zero_pivot,
             spral_small_pivot_tolerance: self.spral_small_pivot_tolerance,
@@ -6013,8 +6059,8 @@ fn solve_reduced_kkt_with_native_spral_ssids(
 
     let mut attempts: Vec<InteriorPointLinearSolveAttempt> = Vec::new();
     let mut current_regularization = system.regularization.max(0.0);
-    let mut current_jacobian_regularization = 0.0_f64;
-    let mut tried_jacobian_regularization = false;
+    let mut current_jacobian_regularization = system.forced_jacobian_regularization.unwrap_or(0.0);
+    let mut tried_jacobian_regularization = system.forced_jacobian_regularization.is_some();
     let max_regularization = system
         .regularization_max
         .max(current_regularization)
@@ -6170,12 +6216,18 @@ fn solve_reduced_kkt_with_spral_ssids(
     }
 
     let mut attempts = Vec::new();
-    let mut current_regularization = system.regularization.max(1e-12);
+    let mut current_regularization = if system.forced_jacobian_regularization.is_some() {
+        system.regularization.max(0.0)
+    } else {
+        system.regularization.max(1e-12)
+    };
     let max_regularization = system.regularization_max.max(current_regularization);
     for retry_index in 0..=system.adaptive_regularization_retries {
         let primal_shift = sparse_hessian_diagonal_shift(system.hessian, current_regularization);
         let slack_shift = primal_shift;
-        let dual_shift = current_regularization.max(1e-8);
+        let dual_shift = system
+            .forced_jacobian_regularization
+            .unwrap_or_else(|| current_regularization.max(1e-8));
         assemble_spral_augmented_kkt_values(
             workspace,
             system,
@@ -8483,6 +8535,7 @@ where
             regularization_max: options.regularization_max,
             jacobian_regularization_value: options.jacobian_regularization_value,
             jacobian_regularization_exponent: options.jacobian_regularization_exponent,
+            forced_jacobian_regularization: None,
             spral_pivot_method: options.spral_pivot_method,
             spral_action_on_zero_pivot: options.spral_action_on_zero_pivot,
             spral_small_pivot_tolerance: options.spral_small_pivot_tolerance,
@@ -9321,8 +9374,13 @@ where
                     soc_eq_accumulator = soc_eq_residual.clone();
                     soc_ineq_accumulator = soc_ineq_residual.clone();
 
-                    let soc_reduced_kkt_system = reduced_kkt_system
+                    let soc_constraint_kkt_system = reduced_kkt_system
                         .with_constraint_residuals(&soc_eq_residual, &soc_ineq_residual);
+                    let soc_reduced_kkt_system = soc_constraint_kkt_system
+                        .with_forced_perturbations(
+                            direction.primal_diagonal_shift_used,
+                            direction.dual_regularization_used,
+                        );
                     let soc_linear_started = Instant::now();
                     let mut soc_direction = match solve_reduced_kkt(
                         &soc_reduced_kkt_system,
