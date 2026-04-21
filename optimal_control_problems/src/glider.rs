@@ -3755,11 +3755,45 @@ mod tests {
         }
 
         fn variable_bound_view(params: &Params) -> VariableBoundView {
+            const STATE_LEN: usize = 4;
+            const CONTROL_LEN: usize = 1;
+            const X_FIELD: usize = 0;
+            const ALTITUDE_FIELD: usize = 1;
+            const VX_FIELD: usize = 2;
+
             let intervals = params.transcription.intervals;
             let order = params.transcription.collocation_degree;
             let dimension = glider_decision_count(intervals, order);
             let mut lower = vec![None; dimension];
             let mut upper = vec![None; dimension];
+
+            // Keep this in step with optimal_control::build_raw_bounds: affine
+            // boundary and path rows are promoted to variable bounds before the
+            // NLP reaches either NLIP or IPOPT.
+            lower[X_FIELD] = Some(0.0);
+            upper[X_FIELD] = Some(0.0);
+            lower[ALTITUDE_FIELD] = Some(INITIAL_ALTITUDE_M);
+            upper[ALTITUDE_FIELD] = Some(INITIAL_ALTITUDE_M);
+
+            let x_mesh_len = (intervals + 1) * STATE_LEN;
+            let u_mesh_len = (intervals + 1) * CONTROL_LEN;
+            let root_x_start = x_mesh_len + u_mesh_len;
+            let root_u_start = root_x_start + intervals * order * STATE_LEN;
+            let root_dudt_start = root_u_start + intervals * order * CONTROL_LEN;
+            for point in 0..intervals * order {
+                let root_x_index = root_x_start + point * STATE_LEN;
+                lower[root_x_index + ALTITUDE_FIELD] = Some(0.0);
+                lower[root_x_index + VX_FIELD] = Some(1.0);
+
+                let root_u_index = root_u_start + point * CONTROL_LEN;
+                lower[root_u_index] = Some(CL_LOWER_BOUND / CL_SLOPE);
+                upper[root_u_index] = Some(CL_UPPER_BOUND / CL_SLOPE);
+
+                let root_dudt_index = root_dudt_start + point * CONTROL_LEN;
+                lower[root_dudt_index] = Some(-deg_to_rad(params.max_alpha_rate_deg_s));
+                upper[root_dudt_index] = Some(deg_to_rad(params.max_alpha_rate_deg_s));
+            }
+
             let tf_index = dimension - 1;
             lower[tf_index] = Some(params.min_time_bound_s);
             upper[tf_index] = Some(params.max_time_bound_s);
@@ -4158,6 +4192,26 @@ mod tests {
             expanded
         }
 
+        fn ipopt_algorithmic_bound_multipliers(
+            multipliers: &[f64],
+            bounds: &VariableBoundView,
+        ) -> Vec<f64> {
+            let mut filtered = multipliers.to_vec();
+            // Ipopt's TNLPAdapter default fixed_variable_treatment=make_parameter
+            // removes fixed variables from the algorithmic NLP, then
+            // ResortBoundMultipliers computes output-only fixed-variable z_L/z_U.
+            for ((value, lower), upper) in filtered
+                .iter_mut()
+                .zip(bounds.lower.iter())
+                .zip(bounds.upper.iter())
+            {
+                if lower.is_some() && lower == upper {
+                    *value = 0.0;
+                }
+            }
+            filtered
+        }
+
         fn vector_inf_diff(lhs: &[f64], rhs: &[f64], rhs_sign: f64) -> f64 {
             lhs.iter().zip(rhs.iter()).fold(0.0_f64, |acc, (lhs, rhs)| {
                 acc.max((lhs - rhs_sign * rhs).abs())
@@ -4401,6 +4455,14 @@ mod tests {
                 nlip_snapshot.upper_bound_multipliers.as_deref(),
                 bounds,
             );
+            let ipopt_lower = ipopt_algorithmic_bound_multipliers(
+                &ipopt_snapshot.lower_bound_multipliers,
+                bounds,
+            );
+            let ipopt_upper = ipopt_algorithmic_bound_multipliers(
+                &ipopt_snapshot.upper_bound_multipliers,
+                bounds,
+            );
 
             println!(
                 "internal_probe[{index}] ipopt_iter={} x_diff={:.3e} slack_same={:.3e} slack_neg={:.3e} slack_dist={:.3e} eq_y_diff={:.3e} ineq_y_same={:.3e} ineq_y_neg={:.3e} lower_z_diff={:.3e} upper_z_diff={:.3e} slack_vl_same={:.3e} slack_vu_same={:.3e} slack_vu_neg={:.3e} kkt_ineq={:.3e} kkt_slack_stat={:.3e} kkt_slack_comp={:.3e} kkt_slack_sigma={:.3e}",
@@ -4412,8 +4474,8 @@ mod tests {
                 vector_inf_diff(nlip_eq, &ipopt_snapshot.equality_multipliers, 1.0),
                 vector_inf_diff(nlip_ineq, &ipopt_snapshot.inequality_multipliers, 1.0),
                 vector_inf_diff(nlip_ineq, &ipopt_snapshot.inequality_multipliers, -1.0),
-                vector_inf_diff(&nlip_lower, &ipopt_snapshot.lower_bound_multipliers, 1.0),
-                vector_inf_diff(&nlip_upper, &ipopt_snapshot.upper_bound_multipliers, 1.0),
+                vector_inf_diff(&nlip_lower, &ipopt_lower, 1.0),
+                vector_inf_diff(&nlip_upper, &ipopt_upper, 1.0),
                 vector_inf_diff(
                     nlip_slack_dual,
                     &ipopt_snapshot.slack_lower_bound_multipliers,
@@ -4480,12 +4542,9 @@ mod tests {
             );
             println!(
                 "          top variable upper z diffs: {}",
-                top_vector_diffs(
-                    &nlip_upper,
-                    &ipopt_snapshot.upper_bound_multipliers,
-                    1.0,
-                    |idx| glider_decision_label(idx, intervals, order),
-                )
+                top_vector_diffs(&nlip_upper, &ipopt_upper, 1.0, |idx| glider_decision_label(
+                    idx, intervals, order
+                ),)
             );
             println!(
                 "          top KKT inequality residual diffs: {}",
