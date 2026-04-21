@@ -655,11 +655,13 @@ impl NumericFactor {
             }
         } else {
             for pivot in (0..self.dimension).rev() {
-                let mut dot = 0.0;
-                for entry in self.lower_col_ptrs[pivot]..self.lower_col_ptrs[pivot + 1] {
-                    let row = self.lower_row_indices[entry];
-                    dot = self.lower_values[entry].mul_add(factor_rhs[row], dot);
-                }
+                let dot = lower_transpose_dot_like_native(
+                    pivot,
+                    &self.lower_col_ptrs,
+                    &self.lower_row_indices,
+                    &self.lower_values,
+                    factor_rhs,
+                );
                 factor_rhs[pivot] -= dot;
             }
         }
@@ -1644,7 +1646,7 @@ fn factor_one_by_one_common(
         let entry_index = dense_lower_offset(size, row, pivot);
         let original = matrix[entry_index];
         work[row] = original;
-        let value = original / diagonal;
+        let value = original * inverse_diagonal;
         if !value.is_finite() {
             return Err(SsidsError::NumericalBreakdown {
                 pivot: rows[pivot],
@@ -1761,15 +1763,34 @@ fn app_apply_block_pivots_to_trailing_rows(
         return;
     }
 
+    const OPENBLAS_DTRSM_UNROLL_N: usize = 4;
     for row in block_end..size {
-        for col in block_start..block_end {
-            let mut value = matrix[dense_lower_offset(size, row, col)];
-            for prior in block_start..col {
-                let prior_value = matrix[dense_lower_offset(size, row, prior)];
-                let lower_value = matrix[dense_lower_offset(size, col, prior)];
-                value -= prior_value * lower_value;
+        let mut group_start = block_start;
+        while group_start < block_end {
+            let group_end = (group_start + OPENBLAS_DTRSM_UNROLL_N).min(block_end);
+            for col in group_start..group_end {
+                let mut value = matrix[dense_lower_offset(size, row, col)];
+                if group_start > block_start {
+                    let mut dot = 0.0;
+                    for prior in block_start..group_start {
+                        let prior_value = matrix[dense_lower_offset(size, row, prior)];
+                        let lower_value = matrix[dense_lower_offset(size, col, prior)];
+                        dot = prior_value.mul_add(lower_value, dot);
+                    }
+                    value = dot.mul_add(-1.0, value);
+                }
+                matrix[dense_lower_offset(size, row, col)] = value;
             }
-            matrix[dense_lower_offset(size, row, col)] = value;
+
+            for col in group_start..group_end {
+                let value = matrix[dense_lower_offset(size, row, col)];
+                for target_col in (col + 1)..group_end {
+                    let target_entry = dense_lower_offset(size, row, target_col);
+                    let lower_value = matrix[dense_lower_offset(size, target_col, col)];
+                    matrix[target_entry] -= value * lower_value;
+                }
+            }
+            group_start = group_end;
         }
     }
 
@@ -1800,8 +1821,8 @@ fn app_apply_block_pivots_to_trailing_rows(
                 let second_entry = dense_lower_offset(size, row, col + 1);
                 let a1 = matrix[first_entry];
                 let a2 = matrix[second_entry];
-                matrix[first_entry] = d11 * a1 + d21 * a2;
-                matrix[second_entry] = d21 * a1 + d22 * a2;
+                matrix[first_entry] = d11.mul_add(a1, d21 * a2);
+                matrix[second_entry] = d21.mul_add(a1, d22 * a2);
             }
             col += 2;
         }
@@ -1926,32 +1947,37 @@ fn app_apply_accepted_prefix_update(
     for row in accepted_end..size {
         for col in accepted_end..=row {
             let mut update = 0.0;
-            let mut pivot = block_start;
-            for block in block_records {
+            let mut pivot_end = accepted_end;
+            for block in block_records.iter().rev() {
                 if block.size == 1 {
+                    let pivot = pivot_end - 1;
                     let diagonal = app_original_one_by_one_diagonal(block.values[0]);
                     let row_l = matrix[dense_lower_offset(size, row, pivot)];
                     let col_l = matrix[dense_lower_offset(size, col, pivot)];
-                    update += (diagonal * row_l) * col_l;
-                    pivot += 1;
+                    let row_ld = diagonal * row_l;
+                    update = row_ld.mul_add(col_l, update);
+                    pivot_end -= 1;
                 } else {
+                    let pivot = pivot_end - 2;
                     let inv11 = block.values[0];
                     let inv21 = block.values[1];
                     let inv22 = block.values[3];
-                    let det = inv11 * inv22 - inv21 * inv21;
-                    let d11 = inv22 / det;
-                    let d21 = -inv21 / det;
-                    let d22 = inv11 / det;
+                    let det = inv11.mul_add(inv22, -(inv21 * inv21));
+                    let d11 = inv11 / det;
+                    let d21 = inv21 / det;
+                    let d22 = inv22 / det;
                     let row_l1 = matrix[dense_lower_offset(size, row, pivot)];
                     let row_l2 = matrix[dense_lower_offset(size, row, pivot + 1)];
                     let col_l1 = matrix[dense_lower_offset(size, col, pivot)];
                     let col_l2 = matrix[dense_lower_offset(size, col, pivot + 1)];
-                    let row_ld1 = d11 * row_l1 + d21 * row_l2;
-                    let row_ld2 = d21 * row_l1 + d22 * row_l2;
-                    update += row_ld1 * col_l1 + row_ld2 * col_l2;
-                    pivot += 2;
+                    let row_ld1 = d22.mul_add(row_l1, -(d21 * row_l2));
+                    let row_ld2 = (-d21).mul_add(row_l1, d11 * row_l2);
+                    update = row_ld2.mul_add(col_l2, update);
+                    update = row_ld1.mul_add(col_l1, update);
+                    pivot_end -= 2;
                 }
             }
+            debug_assert_eq!(pivot_end, block_start);
             let entry = dense_lower_offset(size, row, col);
             matrix[entry] -= update;
         }
@@ -3040,6 +3066,101 @@ fn solve_two_by_two_block_in_place(values: &[f64], rhs: &mut [f64]) -> Result<()
     rhs[0] = x0;
     rhs[1] = x1;
     Ok(())
+}
+
+fn lower_transpose_dot_like_native(
+    pivot: usize,
+    lower_col_ptrs: &[usize],
+    lower_row_indices: &[usize],
+    lower_values: &[f64],
+    factor_rhs: &[f64],
+) -> f64 {
+    let start = lower_col_ptrs[pivot];
+    let end = lower_col_ptrs[pivot + 1];
+    let rows = &lower_row_indices[start..end];
+    let values = &lower_values[start..end];
+    let first_row = pivot + 1;
+    if first_row + values.len() <= factor_rhs.len()
+        && rows
+            .iter()
+            .enumerate()
+            .all(|(offset, &row)| row == first_row + offset)
+    {
+        openblas_dotu_like_contiguous(values, &factor_rhs[first_row..first_row + values.len()])
+    } else {
+        let mut dot = 0.0;
+        for (&value, &row) in values.iter().zip(rows) {
+            dot = value.mul_add(factor_rhs[row], dot);
+        }
+        dot
+    }
+}
+
+fn openblas_dotu_like_contiguous(lhs: &[f64], rhs: &[f64]) -> f64 {
+    debug_assert_eq!(lhs.len(), rhs.len());
+    openblas_dotu_like_contiguous_impl(lhs, rhs)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn openblas_dotu_like_contiguous_impl(lhs: &[f64], rhs: &[f64]) -> f64 {
+    // Homebrew's ARM64 OpenBLAS dot kernel reduces 32 contiguous f64 products
+    // through eight two-lane accumulators before handling the scalar remainder.
+    const UNROLL: usize = 32;
+    const ACCUMULATORS: usize = 8;
+    let chunks = lhs.len() / UNROLL;
+    let mut accumulators = [[0.0; 2]; ACCUMULATORS];
+    for chunk in 0..chunks {
+        let base = chunk * UNROLL;
+        for (accumulator, lanes) in accumulators.iter_mut().enumerate() {
+            let index = base + 2 * accumulator;
+            lanes[0] = lhs[index].mul_add(rhs[index], lanes[0]);
+            lanes[1] = lhs[index + 1].mul_add(rhs[index + 1], lanes[1]);
+        }
+        for (accumulator, lanes) in accumulators.iter_mut().enumerate() {
+            let index = base + 16 + 2 * accumulator;
+            lanes[0] = lhs[index].mul_add(rhs[index], lanes[0]);
+            lanes[1] = lhs[index + 1].mul_add(rhs[index + 1], lanes[1]);
+        }
+    }
+
+    let mut dot = if chunks == 0 {
+        0.0
+    } else {
+        let v0 = [
+            accumulators[0][0] + accumulators[1][0],
+            accumulators[0][1] + accumulators[1][1],
+        ];
+        let v2 = [
+            accumulators[2][0] + accumulators[3][0],
+            accumulators[2][1] + accumulators[3][1],
+        ];
+        let v4 = [
+            accumulators[4][0] + accumulators[5][0],
+            accumulators[4][1] + accumulators[5][1],
+        ];
+        let v6 = [
+            accumulators[6][0] + accumulators[7][0],
+            accumulators[6][1] + accumulators[7][1],
+        ];
+        let v0 = [v0[0] + v2[0], v0[1] + v2[1]];
+        let v4 = [v4[0] + v6[0], v4[1] + v6[1]];
+        let v0 = [v0[0] + v4[0], v0[1] + v4[1]];
+        v0[0] + v0[1]
+    };
+
+    for index in (chunks * UNROLL)..lhs.len() {
+        dot = lhs[index].mul_add(rhs[index], dot);
+    }
+    dot
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn openblas_dotu_like_contiguous_impl(lhs: &[f64], rhs: &[f64]) -> f64 {
+    let mut dot = 0.0;
+    for (&left, &right) in lhs.iter().zip(rhs) {
+        dot = left.mul_add(right, dot);
+    }
+    dot
 }
 
 struct DenseUnitLower {
