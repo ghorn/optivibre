@@ -576,13 +576,11 @@ const gustAirColorLow = new THREE.Color("#55c5ff");
 const gustAirColorMid = new THREE.Color("#ffbf72");
 const gustAirColorHigh = new THREE.Color("#ff5b78");
 const SUMMARY_REFRESH_MIN_INTERVAL_MS = 125;
-const MAX_FRAMES_PER_ANIMATION_TICK = 6;
-
 let consoleLines: string[] = [];
 let framesReceived = 0;
 let framesRendered = 0;
-let pendingFrames: ApiFrame[] = [];
-let pendingPlotFrame: ApiFrame | null = null;
+let pendingPlaybackFrames: ApiFrame[] = [];
+let pendingPlotFrames: ApiFrame[] = [];
 let pendingSummary: RunSummary | null = null;
 let latestProgressState: SimulationProgress | null = null;
 let activeSummaryRequest: { preset: string; phase_mode: PhaseMode } | null = null;
@@ -1272,11 +1270,15 @@ function timeDilationLabel(preset: TimeDilationPreset): string {
   }
 }
 
+function bufferedFrameCount(): number {
+  return pendingPlaybackFrames.length;
+}
+
 function resetPlaybackState(label: string, rate: number | null): void {
   framesReceived = 0;
   framesRendered = 0;
-  pendingFrames = [];
-  pendingPlotFrame = null;
+  pendingPlaybackFrames = [];
+  pendingPlotFrames = [];
   pendingSummary = null;
   latestProgressState = null;
   currentPlaybackLabel = label;
@@ -3121,7 +3123,7 @@ function refreshProgressSummary(): void {
     latestProgressState,
     framesReceived,
     framesRendered,
-    pendingFrames.length,
+    bufferedFrameCount(),
     currentPlaybackLabel
   );
   if (html !== lastSummaryHtml) {
@@ -3137,11 +3139,16 @@ function renderFrameBatch(frames: ApiFrame[]): void {
     return;
   }
   framesRendered += frames.length;
+  const renderFrameForBatch = frames[frames.length - 1];
   if (airflowUpdatesEnabled) {
     try {
-      frames.forEach((frame) => {
-        advanceAirflowParticlesToFrame(frame);
-      });
+      if (currentPlaybackRate === null && frames.length > 1) {
+        advanceAirflowParticlesToFrame(renderFrameForBatch);
+      } else {
+        frames.forEach((frame) => {
+          advanceAirflowParticlesToFrame(frame);
+        });
+      }
     } catch (error) {
       airflowUpdatesEnabled = false;
       ambientParticleCloud.visible = false;
@@ -3152,7 +3159,7 @@ function renderFrameBatch(frames: ApiFrame[]): void {
     }
   }
   try {
-    renderFrame(frames[frames.length - 1]);
+    renderFrame(renderFrameForBatch);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     appendConsole(`3D render error: ${message}`);
@@ -3164,38 +3171,42 @@ function renderFrameBatch(frames: ApiFrame[]): void {
 }
 
 function drainPendingFrames(timestamp: number): void {
-  if (pendingFrames.length === 0) {
+  if (pendingPlaybackFrames.length === 0) {
     return;
   }
 
   if (currentPlaybackRate === null) {
-    const batch = pendingFrames.splice(0, Math.min(pendingFrames.length, MAX_FRAMES_PER_ANIMATION_TICK));
-    renderFrameBatch(batch);
+    const frames = pendingPlaybackFrames;
+    pendingPlaybackFrames = [];
+    renderFrameBatch(frames);
     return;
   }
 
   if (playbackStartWallTimeMs === null) {
     playbackStartWallTimeMs = timestamp;
-    playbackStartSimTime = pendingFrames[0].time;
+    playbackStartSimTime = pendingPlaybackFrames[0].time;
   }
 
   const targetSimTime =
     playbackStartSimTime + ((timestamp - playbackStartWallTimeMs) / 1000) * currentPlaybackRate;
 
-  let consumeCount = 0;
-  while (consumeCount < pendingFrames.length && pendingFrames[consumeCount].time <= targetSimTime + 1e-9) {
-    consumeCount += 1;
+  let releaseCount = 0;
+  while (
+    releaseCount < pendingPlaybackFrames.length &&
+    pendingPlaybackFrames[releaseCount].time <= targetSimTime + 1e-9
+  ) {
+    releaseCount += 1;
   }
 
-  if (consumeCount > 0) {
-    const batch = pendingFrames.splice(0, Math.min(consumeCount, MAX_FRAMES_PER_ANIMATION_TICK));
-    renderFrameBatch(batch);
+  if (releaseCount > 0) {
+    const frames = pendingPlaybackFrames.splice(0, releaseCount);
+    renderFrameBatch(frames);
   }
 }
 
-function flushPendingPlotFrame(): void {
+function flushPendingPlotFrames(): void {
   if (
-    pendingPlotFrame === null ||
+    pendingPlotFrames.length === 0 ||
     activePlotSections.length === 0 ||
     !plotUpdatesEnabled ||
     plotFlushInFlight
@@ -3203,25 +3214,25 @@ function flushPendingPlotFrame(): void {
     return;
   }
 
-  const frame = pendingPlotFrame;
-  pendingPlotFrame = null;
+  const frames = pendingPlotFrames;
+  pendingPlotFrames = [];
   plotFlushInFlight = true;
 
-  const updates = activePlotSections.map((section) =>
-    Plotly.extendTraces(
+  const frameTimes = frames.map((frame) => frame.time);
+  const updates = activePlotSections.map((section) => {
+    const x = section.definition.groups.flatMap((group) =>
+      group.traces.map(() => frameTimes)
+    );
+    const y = section.definition.groups.flatMap((group) =>
+      group.traces.map((trace) => frames.map((frame) => trace.value(frame)))
+    );
+    return Plotly.extendTraces(
       section.plot,
-      {
-        x: section.definition.groups.flatMap((group) =>
-          group.traces.map(() => [frame.time])
-        ),
-        y: section.definition.groups.flatMap((group) =>
-          group.traces.map((trace) => [trace.value(frame)])
-        )
-      },
+      { x, y },
       section.traceIndices,
       plotMaxPoints
-    )
-  );
+    );
+  });
 
   void Promise.all(updates)
     .catch((error: unknown) => {
@@ -3234,8 +3245,8 @@ function flushPendingPlotFrame(): void {
     })
     .finally(() => {
       plotFlushInFlight = false;
-      if (pendingPlotFrame !== null) {
-        flushPendingPlotFrame();
+      if (pendingPlotFrames.length > 0) {
+        flushPendingPlotFrames();
       }
     });
 }
@@ -3243,7 +3254,7 @@ function flushPendingPlotFrame(): void {
 function animate(timestamp: number): void {
   requestAnimationFrame(animate);
   drainPendingFrames(timestamp);
-  flushPendingPlotFrame();
+  flushPendingPlotFrames();
   if (summaryRefreshPending) {
     refreshProgressSummary();
   }
@@ -3413,33 +3424,37 @@ function appendPlotFrames(frames: ApiFrame[]): void {
   if (frames.length === 0 || activePlotSections.length === 0 || !plotUpdatesEnabled) {
     return;
   }
-  pendingPlotFrame = frames[frames.length - 1];
-  flushPendingPlotFrame();
+  pendingPlotFrames.push(...frames);
+  flushPendingPlotFrames();
 }
 
-function queueFrame(frame: ApiFrame): void {
-  if (
-    currentPlaybackRate !== null &&
-    framesRendered === 0 &&
-    playbackStartWallTimeMs === null &&
-    pendingFrames.length === 0
-  ) {
-    renderFrameBatch([frame]);
-    playbackStartWallTimeMs = performance.now();
-    playbackStartSimTime = frame.time;
+function queueFrames(frames: ApiFrame[]): void {
+  if (frames.length === 0) {
     return;
   }
-  pendingFrames.push(frame);
+  if (
+    framesRendered === 0 &&
+    playbackStartWallTimeMs === null &&
+    pendingPlaybackFrames.length === 0
+  ) {
+    const [firstFrame, ...remainingFrames] = frames;
+    renderFrameBatch([firstFrame]);
+    playbackStartWallTimeMs = performance.now();
+    playbackStartSimTime = firstFrame.time;
+    pendingPlaybackFrames.push(...remainingFrames);
+  } else {
+    pendingPlaybackFrames.push(...frames);
+  }
   refreshProgressSummary();
 }
 
 function waitForPlaybackDrain(): Promise<void> {
-  if (pendingFrames.length === 0) {
+  if (pendingPlaybackFrames.length === 0) {
     return Promise.resolve();
   }
   return new Promise((resolve) => {
     const poll = () => {
-      if (pendingFrames.length === 0) {
+      if (pendingPlaybackFrames.length === 0) {
         resolve();
         return;
       }
@@ -3466,9 +3481,10 @@ async function runSimulation(): Promise<void> {
   const selectedTimeDilation = timeDilationSelect.value as TimeDilationPreset;
   const playbackLabel = timeDilationLabel(selectedTimeDilation);
   const playbackRate = timeDilationRate(selectedTimeDilation);
+  const durationSeconds = Number(durationInput.value);
   const request = {
     preset: presetSelect.value,
-    duration: Number(durationInput.value),
+    duration: durationSeconds,
     phase_mode: phaseModeSelect.value as PhaseMode,
     payload_mass_kg: Number(payloadInput.value),
     wind_speed_mps: Number(windInput.value),
@@ -3535,6 +3551,7 @@ async function runSimulation(): Promise<void> {
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? "";
+      const framesInChunk: ApiFrame[] = [];
       for (const line of lines) {
         if (!line.trim()) {
           continue;
@@ -3563,13 +3580,14 @@ async function runSimulation(): Promise<void> {
         }
         if (event.kind === "frame") {
           framesReceived += 1;
-          queueFrame(event.frame);
+          framesInChunk.push(event.frame);
           continue;
         }
         summary = event.summary;
         pendingSummary = event.summary;
         setFailure(event.summary.failure ?? null);
       }
+      queueFrames(framesInChunk);
     }
 
     if (buffer.trim()) {
@@ -3581,7 +3599,7 @@ async function runSimulation(): Promise<void> {
         refreshProgressSummary();
       } else if (event.kind === "frame") {
         framesReceived += 1;
-        queueFrame(event.frame);
+        queueFrames([event.frame]);
       } else {
         summary = event.summary;
         pendingSummary = event.summary;

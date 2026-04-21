@@ -603,7 +603,7 @@ button:hover {
 .docs-diagram-grid {
   display: grid;
   gap: 18px;
-  grid-template-columns: repeat(auto-fit, minmax(520px, 1fr));
+  grid-template-columns: 1fr;
 }
 
 .docs-diagram {

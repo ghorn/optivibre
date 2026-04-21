@@ -12,6 +12,10 @@ use optimization::{
     FunctionCompileOptions, LlvmOptimizationLevel, flatten_value, symbolic_column, symbolic_value,
     unflatten_value,
 };
+use std::cell::RefCell;
+use std::any::Any;
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Mutex;
 use sx_codegen_llvm::{CompiledJitFunction, JitExecutionContext};
 use sx_core::{NamedMatrix, SX, SXFunction};
@@ -854,6 +858,11 @@ pub struct CompiledRhs<const NK: usize, const N_COMMON: usize, const N_UPPER: us
     context: Mutex<JitExecutionContext>,
 }
 
+thread_local! {
+    static COMPILED_RHS_CACHE: RefCell<HashMap<(usize, usize, usize), Box<dyn Any>>> =
+        RefCell::new(HashMap::new());
+}
+
 impl<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>
     CompiledRhs<NK, N_COMMON, N_UPPER>
 {
@@ -867,6 +876,29 @@ impl<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>
         Ok(Self {
             function: compiled,
             context,
+        })
+    }
+
+    pub fn shared() -> Result<Rc<Self>> {
+        let key = (NK, N_COMMON, N_UPPER);
+        if let Some(existing) = COMPILED_RHS_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            cache.get(&key)
+                .and_then(|entry| entry.downcast_ref::<Rc<Self>>())
+                .cloned()
+        }) {
+            return Ok(existing);
+        }
+
+        let rhs = Rc::new(Self::new()?);
+        COMPILED_RHS_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let existing = cache.entry(key).or_insert_with(|| Box::new(rhs.clone()) as Box<dyn Any>);
+            if let Some(cached) = existing.downcast_ref::<Rc<Self>>() {
+                Ok(cached.clone())
+            } else {
+                unreachable!("compiled RHS cache type mismatch for key {:?}", key);
+            }
         })
     }
 
@@ -891,5 +923,18 @@ impl<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>
             unflatten_value::<State<f64, NK, N_COMMON, N_UPPER>, f64>(context.output(0))?,
             unflatten_value::<Diagnostics<f64, NK>, f64>(context.output(1))?,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CompiledRhs;
+    use std::rc::Rc;
+
+    #[test]
+    fn compiled_rhs_shared_reuses_instance() {
+        let first = CompiledRhs::<1, 0, 0>::shared().expect("first compiled rhs");
+        let second = CompiledRhs::<1, 0, 0>::shared().expect("second compiled rhs");
+        assert!(Rc::ptr_eq(&first, &second));
     }
 }

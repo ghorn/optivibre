@@ -593,7 +593,7 @@ fn simulate<
     let mut params = base_params::<NK>(init)?;
     let mut dryden = DrydenField::<NK>::new(0xD15E_A5E0_u64 ^ NK as u64);
     params.kite_gusts_n = dryden.gusts_n();
-    let rhs = CompiledRhs::<NK, N_COMMON, N_UPPER>::new()?;
+    let rhs = CompiledRhs::<NK, N_COMMON, N_UPPER>::shared()?;
     let mut state = initializer(&params);
     let mut controls = initial_controls(&params);
     let (_, initial_diag) = rhs.eval(&state, &controls, &params)?;
@@ -672,7 +672,7 @@ fn simulate<
         }
         let step = (config.duration - time).min(config.dt_control);
         let (next_state, _, accepted, rejected, substeps) =
-            integrate_interval(&rhs, &state, &next_controls, &params, step, config)?;
+            integrate_interval(rhs.as_ref(), &state, &next_controls, &params, step, config)?;
         dryden.advance(
             step,
             &diagnostics,
@@ -709,7 +709,7 @@ fn simulate_passive<
     progress_cb: &mut P,
     frame_cb: &mut G,
 ) -> Result<RunResult<NK, N_COMMON, N_UPPER>> {
-    let rhs = CompiledRhs::<NK, N_COMMON, N_UPPER>::new()?;
+    let rhs = CompiledRhs::<NK, N_COMMON, N_UPPER>::shared()?;
     let mut state = initializer(&params);
     let controls = initial_controls(&params);
     let mut frames = Vec::new();
@@ -776,7 +776,7 @@ fn simulate_passive<
         }
         let step = (config.duration - time).min(config.dt_control);
         let (next_state, _, accepted, rejected, substeps) =
-            integrate_interval(&rhs, &state, &controls, &params, step, config)?;
+            integrate_interval(rhs.as_ref(), &state, &controls, &params, step, config)?;
         state = next_state;
         time = zero_if_nan(time + step);
         iteration += 1;

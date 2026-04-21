@@ -1,5 +1,9 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use serde::Deserialize;
+use std::sync::OnceLock;
+
+static ASSET_MANIFEST_CACHE: OnceLock<Result<AssetManifest, String>> = OnceLock::new();
+static REFERENCE_EXPORT_CACHE: OnceLock<Result<ReferenceExport, String>> = OnceLock::new();
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct AssetManifest {
@@ -139,13 +143,20 @@ pub struct EnvironmentExport {
 }
 
 pub fn asset_manifest() -> Result<AssetManifest> {
-    Ok(serde_json::from_str(include_str!(
-        "../assets/asset_manifest.json"
-    ))?)
+    match ASSET_MANIFEST_CACHE.get_or_init(|| {
+        serde_json::from_str(include_str!("../assets/asset_manifest.json")).map_err(|e| e.to_string())
+    }) {
+        Ok(manifest) => Ok(manifest.clone()),
+        Err(error) => Err(anyhow!(error.clone())),
+    }
 }
 
 pub fn reference_export() -> Result<ReferenceExport> {
-    Ok(serde_json::from_str(include_str!(
-        "../assets/reference_export.json"
-    ))?)
+    match REFERENCE_EXPORT_CACHE.get_or_init(|| {
+        serde_json::from_str(include_str!("../assets/reference_export.json"))
+            .map_err(|e| e.to_string())
+    }) {
+        Ok(export) => Ok(export.clone()),
+        Err(error) => Err(anyhow!(error.clone())),
+    }
 }

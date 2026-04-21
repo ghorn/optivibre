@@ -26,6 +26,7 @@ use tokio_stream::wrappers::ReceiverStream;
 const TEXT_HTML_UTF8: &str = "text/html; charset=utf-8";
 const TEXT_JAVASCRIPT_UTF8: &str = "text/javascript; charset=utf-8";
 const TEXT_CSS_UTF8: &str = "text/css; charset=utf-8";
+const IMAGE_SVG_XML: &str = "image/svg+xml";
 const APPLICATION_NDJSON_UTF8: &str = "application/x-ndjson; charset=utf-8";
 const GENERATED_APP_JS: &str = include_str!(concat!(env!("OUT_DIR"), "/app.js"));
 
@@ -176,6 +177,8 @@ async fn main() -> Result<()> {
         .route("/", get(index))
         .route("/app.js", get(app_js))
         .route("/styles.css", get(styles_css))
+        .route("/favicon.svg", get(favicon))
+        .route("/favicon.ico", get(favicon))
         .route("/api/presets", get(presets))
         .route("/api/run", post(run))
         .route("/api/run_stream", post(run_stream))
@@ -203,6 +206,10 @@ async fn app_js() -> impl IntoResponse {
 
 async fn styles_css() -> impl IntoResponse {
     static_text_response(TEXT_CSS_UTF8, include_str!("../static/styles.css"))
+}
+
+async fn favicon() -> impl IntoResponse {
+    static_text_response(IMAGE_SVG_XML, include_str!("../static/favicon.svg"))
 }
 
 async fn presets() -> Json<Vec<multikite_sim::PresetInfo>> {
