@@ -22,6 +22,12 @@ pub struct SolveProfile {
     pub forward_substitution_time: Duration,
     pub diagonal_solve_time: Duration,
     pub backward_substitution_time: Duration,
+    pub backward_trailing_update_time: Duration,
+    pub backward_triangular_solve_time: Duration,
+    pub backward_trailing_update_columns: usize,
+    pub backward_trailing_update_dense_entries: usize,
+    pub backward_triangular_columns: usize,
+    pub backward_triangular_dense_entries: usize,
     pub output_permutation_time: Duration,
 }
 
@@ -39,6 +45,12 @@ impl SolveProfile {
         self.forward_substitution_time += other.forward_substitution_time;
         self.diagonal_solve_time += other.diagonal_solve_time;
         self.backward_substitution_time += other.backward_substitution_time;
+        self.backward_trailing_update_time += other.backward_trailing_update_time;
+        self.backward_triangular_solve_time += other.backward_triangular_solve_time;
+        self.backward_trailing_update_columns += other.backward_trailing_update_columns;
+        self.backward_trailing_update_dense_entries += other.backward_trailing_update_dense_entries;
+        self.backward_triangular_columns += other.backward_triangular_columns;
+        self.backward_triangular_dense_entries += other.backward_triangular_dense_entries;
         self.output_permutation_time += other.output_permutation_time;
     }
 }
@@ -742,6 +754,7 @@ impl NumericFactor {
                 &self.lower_row_indices,
                 &self.lower_values,
                 factor_rhs,
+                profile.as_deref_mut(),
             );
         }
         if let Some(started) = started {
@@ -3653,17 +3666,20 @@ fn solve_lower_transpose_like_native(
     lower_row_indices: &[usize],
     lower_values: &[f64],
     factor_rhs: &mut [f64],
+    mut profile: Option<&mut SolveProfile>,
 ) {
     let lower = LowerTransposeFactor {
         col_ptrs: lower_col_ptrs,
         row_indices: lower_row_indices,
         values: lower_values,
     };
+    let profile_enabled = profile.is_some();
     let mut dense_workspace = Vec::new();
     let mut block_end = dimension;
     while block_end > 0 {
         let block_start = block_end.saturating_sub(OPENBLAS_DTRSV_BLOCK_SIZE);
         if block_end < dimension {
+            let started = profile_enabled.then(Instant::now);
             for pivot in block_start..block_end {
                 let dot = lower_transpose_gemv_dot_like_native(
                     pivot,
@@ -3675,8 +3691,17 @@ fn solve_lower_transpose_like_native(
                 );
                 factor_rhs[pivot] = (-1.0f64).mul_add(dot, factor_rhs[pivot]);
             }
+            if let Some(profile) = profile.as_mut() {
+                if let Some(started) = started {
+                    profile.backward_trailing_update_time += started.elapsed();
+                }
+                profile.backward_trailing_update_columns += block_end - block_start;
+                profile.backward_trailing_update_dense_entries +=
+                    (block_end - block_start) * (dimension - block_end);
+            }
         }
 
+        let started = profile_enabled.then(Instant::now);
         for pivot in (block_start..block_end).rev() {
             let dot = lower_transpose_dot_in_range_like_native(
                 pivot,
@@ -3687,6 +3712,14 @@ fn solve_lower_transpose_like_native(
                 &mut dense_workspace,
             );
             factor_rhs[pivot] -= dot;
+        }
+        if let Some(profile) = profile.as_mut() {
+            if let Some(started) = started {
+                profile.backward_triangular_solve_time += started.elapsed();
+            }
+            let block_width = block_end - block_start;
+            profile.backward_triangular_columns += block_width;
+            profile.backward_triangular_dense_entries += block_width * (block_width - 1) / 2;
         }
         block_end = block_start;
     }

@@ -2442,6 +2442,15 @@ mod tests {
                 profile.output_permutation_time,
                 profile.total_recorded_time(),
             );
+            println!(
+                "  rust_spral backward_profile trailing_update={:?} triangular={:?} trailing_columns={} trailing_dense_entries={} triangular_columns={} triangular_dense_entries={}",
+                profile.backward_trailing_update_time,
+                profile.backward_triangular_solve_time,
+                profile.backward_trailing_update_columns,
+                profile.backward_trailing_update_dense_entries,
+                profile.backward_triangular_columns,
+                profile.backward_triangular_dense_entries,
+            );
         }
         println!(
             "  native_spral factor={:?} solve={:?} residual={:.3e} solution_inf={:.3e} inertia={}",
