@@ -56,9 +56,9 @@ pub use ipopt::SolveStatus as IpoptSolveStatus;
 pub use ipopt_backend::{
     IpoptIterationPhase, IpoptIterationSnapshot, IpoptIterationTiming, IpoptLinearSolver,
     IpoptMuStrategy, IpoptNlpScalingMethod, IpoptOptions, IpoptPartialSolution, IpoptProfiling,
-    IpoptProvenance, IpoptRawStatus, IpoptSolveError, IpoptSpralPivotMethod, IpoptSummary,
-    capture_ipopt_provenance, format_ipopt_settings_summary, solve_nlp_ipopt,
-    solve_nlp_ipopt_with_callback,
+    IpoptProvenance, IpoptRawStatus, IpoptSolveError, IpoptSpralOrdering, IpoptSpralPivotMethod,
+    IpoptSpralScaling, IpoptSummary, capture_ipopt_provenance, format_ipopt_settings_summary,
+    solve_nlp_ipopt, solve_nlp_ipopt_with_callback,
 };
 pub use symbolic::{
     ConstraintBounds, DynamicCompiledJitNlp, DynamicSymbolicNlp, RuntimeBoundedJitNlp,
@@ -266,9 +266,23 @@ pub enum SpralParityPivotProfile {
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpralParityOrderingProfile {
+    Matching,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpralParityScalingProfile {
+    Matching,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SpralParityProfile {
     pub pivot_method: SpralParityPivotProfile,
+    pub ordering: SpralParityOrderingProfile,
+    pub scaling: SpralParityScalingProfile,
     pub small_pivot_tolerance: f64,
     pub threshold_pivot_u: f64,
     pub pivot_tolerance_max: f64,
@@ -280,6 +294,8 @@ impl Default for SpralParityProfile {
     fn default() -> Self {
         Self {
             pivot_method: SpralParityPivotProfile::Block,
+            ordering: SpralParityOrderingProfile::Matching,
+            scaling: SpralParityScalingProfile::Matching,
             small_pivot_tolerance: 1.0e-20,
             threshold_pivot_u: 1.0e-8,
             pivot_tolerance_max: 1.0e-4,
@@ -325,6 +341,12 @@ pub fn apply_native_spral_parity_to_ipopt_options(options: &mut IpoptOptions) {
     options.linear_solver = Some(IpoptLinearSolver::Spral);
     options.spral_pivot_method = Some(match profile.pivot_method {
         SpralParityPivotProfile::Block => IpoptSpralPivotMethod::Block,
+    });
+    options.spral_ordering = Some(match profile.ordering {
+        SpralParityOrderingProfile::Matching => IpoptSpralOrdering::Matching,
+    });
+    options.spral_scaling = Some(match profile.scaling {
+        SpralParityScalingProfile::Matching => IpoptSpralScaling::Matching,
     });
     options.spral_small_pivot_tolerance = Some(profile.small_pivot_tolerance);
     options.spral_threshold_pivot_u = Some(profile.threshold_pivot_u);

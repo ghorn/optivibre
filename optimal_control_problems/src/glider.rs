@@ -3224,17 +3224,7 @@ mod tests {
     fn print_current_glider_ipopt_mu_strategy_compare() {
         fn local_spral_ipopt_options(config: &SolverConfig) -> optimization::IpoptOptions {
             let mut options = crate::common::ipopt_options(config);
-            let profile = optimization::native_spral_parity_profile();
-            options.linear_solver = Some(optimization::IpoptLinearSolver::Spral);
-            options.spral_pivot_method = Some(match profile.pivot_method {
-                optimization::SpralParityPivotProfile::Block => {
-                    optimization::IpoptSpralPivotMethod::Block
-                }
-            });
-            options.spral_small_pivot_tolerance = Some(profile.small_pivot_tolerance);
-            options.spral_threshold_pivot_u = Some(profile.threshold_pivot_u);
-            options.spral_use_gpu = Some(profile.use_gpu);
-            options.capture_provenance = true;
+            optimization::apply_native_spral_parity_to_ipopt_options(&mut options);
             options
         }
 
