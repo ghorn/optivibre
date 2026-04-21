@@ -34,6 +34,33 @@ fn dense_to_lower_csc(matrix: &[Vec<f64>]) -> (Vec<usize>, Vec<usize>, Vec<f64>)
     (col_ptrs, row_indices, values)
 }
 
+fn deterministic_complete_dyadic_matrix(dimension: usize) -> Vec<Vec<f64>> {
+    let mut matrix = vec![vec![0.0; dimension]; dimension];
+    let mut row = 0;
+    while row < dimension {
+        let mut col = 0;
+        while col <= row {
+            let value = if row == col {
+                f64::from((row % 7) as i16 - 3) / 64.0
+            } else {
+                let lower_triangle_index = row * (row + 1) / 2 + col;
+                let magnitude = f64::from(lower_triangle_index as u16 + 1) / 512.0;
+                let sign = if (row * 13 + col * 19 + 5) % 2 == 0 {
+                    1.0
+                } else {
+                    -1.0
+                };
+                sign * magnitude
+            };
+            matrix[row][col] = value;
+            matrix[col][row] = value;
+            col += 1;
+        }
+        row += 1;
+    }
+    matrix
+}
+
 fn load_native_or_skip() -> Option<NativeSpral> {
     match NativeSpral::load() {
         Ok(native) => Some(native),
@@ -42,6 +69,44 @@ fn load_native_or_skip() -> Option<NativeSpral> {
             None
         }
     }
+}
+
+#[test]
+fn rust_and_native_spral_match_app_block_boundary_33x33_pivot_stats() {
+    let Some(native) = load_native_or_skip() else {
+        return;
+    };
+
+    let matrix_dense = deterministic_complete_dyadic_matrix(33);
+    let (col_ptrs, row_indices, values) = dense_to_lower_csc(&matrix_dense);
+    let matrix = SymmetricCscMatrix::new(33, &col_ptrs, &row_indices, Some(&values))
+        .expect("valid boundary CSC");
+    let options = NumericFactorOptions::default();
+
+    let (symbolic, _) = analyse(
+        matrix,
+        &SsidsOptions {
+            ordering: OrderingStrategy::Natural,
+        },
+    )
+    .expect("rust analyse");
+    let (rust_factor, _) = factorize(matrix, &symbolic, &options).expect("rust factorize");
+
+    let mut native_session = native
+        .analyse_with_options_and_ordering(matrix, &options, NativeOrdering::Natural)
+        .expect("native analyse");
+    let native_info = native_session.factorize(matrix).expect("native factorize");
+
+    assert_eq!(rust_factor.inertia(), native_info.inertia);
+    assert_eq!(
+        rust_factor.pivot_stats().two_by_two_pivots,
+        native_info.two_by_two_pivots
+    );
+    assert_eq!(
+        rust_factor.pivot_stats().delayed_pivots,
+        native_info.delayed_pivots
+    );
+    assert_eq!(rust_factor.pivot_stats().two_by_two_pivots, 2);
 }
 
 fn bit_patterns(values: &[f64]) -> Vec<u64> {

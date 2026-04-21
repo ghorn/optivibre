@@ -286,6 +286,12 @@ struct DiagonalBlock {
     size: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DenseUpdateBounds {
+    size: usize,
+    update_end: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SymbolicFront {
     columns: Vec<usize>,
@@ -1562,13 +1568,19 @@ fn tpp_test_two_by_two(
     }
 }
 
-fn app_update_one_by_one(matrix: &mut [f64], size: usize, pivot: usize, workspace: &[f64]) {
+fn app_update_one_by_one(
+    matrix: &mut [f64],
+    size: usize,
+    pivot: usize,
+    update_end: usize,
+    workspace: &[f64],
+) {
     let ld = &workspace[pivot * size..(pivot + 1) * size];
     // Native SPRAL routes a 1x1 trailing update through scalar dgemm, but
     // wider trailing blocks round like OpenBLAS' block kernel.
-    let use_scalar_fma = size.saturating_sub(pivot + 1) == 1;
-    for (col, &preserved) in ld.iter().enumerate().take(size).skip(pivot + 1) {
-        for row in col..size {
+    let use_scalar_fma = update_end.saturating_sub(pivot + 1) == 1;
+    for (col, &preserved) in ld.iter().enumerate().take(update_end).skip(pivot + 1) {
+        for row in col..update_end {
             let update_entry = dense_lower_offset(size, row, col);
             let multiplier = matrix[dense_lower_offset(size, row, pivot)];
             if use_scalar_fma {
@@ -1580,13 +1592,19 @@ fn app_update_one_by_one(matrix: &mut [f64], size: usize, pivot: usize, workspac
     }
 }
 
-fn app_update_two_by_two(matrix: &mut [f64], size: usize, pivot: usize, workspace: &[f64]) {
+fn app_update_two_by_two(
+    matrix: &mut [f64],
+    size: usize,
+    pivot: usize,
+    update_end: usize,
+    workspace: &[f64],
+) {
     let first_ld = &workspace[pivot * size..(pivot + 1) * size];
     let second_ld = &workspace[(pivot + 1) * size..(pivot + 2) * size];
-    for col in (pivot + 2)..size {
+    for col in (pivot + 2)..update_end {
         let first_preserved = first_ld[col];
         let second_preserved = second_ld[col];
-        for row in col..size {
+        for row in col..update_end {
             let update_entry = dense_lower_offset(size, row, col);
             let first_multiplier = matrix[dense_lower_offset(size, row, pivot)];
             let second_multiplier = matrix[dense_lower_offset(size, row, pivot + 1)];
@@ -1603,6 +1621,7 @@ fn factor_one_by_one_common(
     matrix: &mut [f64],
     size: usize,
     pivot: usize,
+    update_end: usize,
     stats: &mut PanelFactorStats,
     scratch: &mut [f64],
 ) -> Result<(FactorColumn, FactorBlockRecord), SsidsError> {
@@ -1628,7 +1647,7 @@ fn factor_one_by_one_common(
     matrix[diagonal_index] = 1.0;
 
     let mut entries = Vec::new();
-    for row in (pivot + 1)..size {
+    for row in (pivot + 1)..update_end {
         let entry_index = dense_lower_offset(size, row, pivot);
         let original = matrix[entry_index];
         work[row] = original;
@@ -1646,7 +1665,7 @@ fn factor_one_by_one_common(
         entries.push((rows[row], value));
     }
 
-    app_update_one_by_one(matrix, size, pivot, scratch);
+    app_update_one_by_one(matrix, size, pivot, update_end, scratch);
 
     Ok((
         FactorColumn {
@@ -1663,12 +1682,14 @@ fn factor_one_by_one_common(
 fn factor_two_by_two_common(
     rows: &[usize],
     matrix: &mut [f64],
-    size: usize,
+    bounds: DenseUpdateBounds,
     pivot: usize,
     inverse: (f64, f64, f64),
     stats: &mut PanelFactorStats,
     scratch: &mut [f64],
 ) -> Result<([FactorColumn; 2], FactorBlockRecord), SsidsError> {
+    let size = bounds.size;
+    let update_end = bounds.update_end;
     let second_start = (pivot + 1) * size;
     let (first_prefix, second_suffix) = scratch.split_at_mut(second_start);
     let first_scratch = &mut first_prefix[pivot * size..second_start];
@@ -1681,7 +1702,7 @@ fn factor_two_by_two_common(
 
     let mut first_entries = Vec::new();
     let mut second_entries = Vec::new();
-    for row in (pivot + 2)..size {
+    for row in (pivot + 2)..update_end {
         let b1 = matrix[dense_lower_offset(size, row, pivot)];
         let b2 = matrix[dense_lower_offset(size, row, pivot + 1)];
         first_scratch[row] = b1;
@@ -1700,7 +1721,7 @@ fn factor_two_by_two_common(
         second_entries.push((rows[row], l2));
     }
 
-    app_update_two_by_two(matrix, size, pivot, scratch);
+    app_update_two_by_two(matrix, size, pivot, update_end, scratch);
 
     Ok((
         [
@@ -1733,6 +1754,236 @@ fn remove_zero_lower_entries_targeting_row(factor_columns: &mut [FactorColumn], 
             .entries
             .retain(|&(entry_row, value)| entry_row != row || value != 0.0);
     }
+}
+
+fn app_apply_block_pivots_to_trailing_rows(
+    matrix: &mut [f64],
+    size: usize,
+    block_start: usize,
+    block_end: usize,
+    block_records: &[FactorBlockRecord],
+    small: f64,
+) {
+    if block_end >= size {
+        return;
+    }
+
+    for row in block_end..size {
+        for col in block_start..block_end {
+            let mut value = matrix[dense_lower_offset(size, row, col)];
+            for prior in block_start..col {
+                let prior_value = matrix[dense_lower_offset(size, row, prior)];
+                let lower_value = matrix[dense_lower_offset(size, col, prior)];
+                value -= prior_value * lower_value;
+            }
+            matrix[dense_lower_offset(size, row, col)] = value;
+        }
+    }
+
+    let mut col = block_start;
+    for block in block_records {
+        if block.size == 1 {
+            let d11 = block.values[0];
+            for row in block_end..size {
+                let entry = dense_lower_offset(size, row, col);
+                let value = matrix[entry];
+                matrix[entry] = if d11 == 0.0 {
+                    if value.abs() < small {
+                        0.0
+                    } else {
+                        f64::INFINITY * value
+                    }
+                } else {
+                    value * d11
+                };
+            }
+            col += 1;
+        } else {
+            let d11 = block.values[0];
+            let d21 = block.values[1];
+            let d22 = block.values[3];
+            for row in block_end..size {
+                let first_entry = dense_lower_offset(size, row, col);
+                let second_entry = dense_lower_offset(size, row, col + 1);
+                let a1 = matrix[first_entry];
+                let a2 = matrix[second_entry];
+                matrix[first_entry] = d11 * a1 + d21 * a2;
+                matrix[second_entry] = d21 * a1 + d22 * a2;
+            }
+            col += 2;
+        }
+    }
+}
+
+fn app_first_failed_trailing_column(
+    matrix: &[f64],
+    size: usize,
+    block_start: usize,
+    block_end: usize,
+    threshold_pivot_u: f64,
+) -> usize {
+    if block_end >= size || threshold_pivot_u <= 0.0 {
+        return block_end;
+    }
+    let limit = 1.0 / threshold_pivot_u;
+    for col in block_start..block_end {
+        for row in block_end..size {
+            if matrix[dense_lower_offset(size, row, col)].abs() > limit {
+                return col;
+            }
+        }
+    }
+    block_end
+}
+
+fn app_prefix_ending_on_first_half_two_by_two(
+    block_records: &[FactorBlockRecord],
+    local_prefix: usize,
+) -> bool {
+    if local_prefix == 0 {
+        return false;
+    }
+    let last_accepted = local_prefix - 1;
+    let mut cursor = 0;
+    for block in block_records {
+        if block.size == 2 && cursor == last_accepted {
+            return true;
+        }
+        cursor += block.size;
+    }
+    false
+}
+
+fn app_adjust_passed_prefix(block_records: &[FactorBlockRecord], local_prefix: usize) -> usize {
+    if app_prefix_ending_on_first_half_two_by_two(block_records, local_prefix) {
+        local_prefix - 1
+    } else {
+        local_prefix
+    }
+}
+
+fn app_truncate_records_to_prefix(
+    block_records: &[FactorBlockRecord],
+    local_prefix: usize,
+) -> Vec<FactorBlockRecord> {
+    let mut accepted = Vec::new();
+    let mut cursor = 0;
+    for block in block_records {
+        if cursor + block.size > local_prefix {
+            break;
+        }
+        accepted.push(block.clone());
+        cursor += block.size;
+    }
+    debug_assert_eq!(cursor, local_prefix);
+    accepted
+}
+
+fn app_restore_trailing_from_block_backup(
+    rows: &[usize],
+    rows_before_block: &[usize],
+    matrix: &mut [f64],
+    matrix_before_block: &[f64],
+    size: usize,
+    trailing_start: usize,
+) {
+    if trailing_start >= size {
+        return;
+    }
+    let mut old_positions = vec![
+        usize::MAX;
+        rows.iter()
+            .chain(rows_before_block)
+            .copied()
+            .max()
+            .unwrap_or(0)
+            + 1
+    ];
+    for (position, &row) in rows_before_block.iter().enumerate() {
+        old_positions[row] = position;
+    }
+    for row in trailing_start..size {
+        let old_row = old_positions[rows[row]];
+        for col in trailing_start..=row {
+            let old_col = old_positions[rows[col]];
+            matrix[dense_lower_offset(size, row, col)] =
+                matrix_before_block[dense_lower_offset(size, old_row, old_col)];
+        }
+    }
+}
+
+fn app_original_one_by_one_diagonal(inverse_diagonal: f64) -> f64 {
+    if inverse_diagonal == 0.0 {
+        0.0
+    } else {
+        1.0 / inverse_diagonal
+    }
+}
+
+fn app_apply_accepted_prefix_update(
+    matrix: &mut [f64],
+    size: usize,
+    block_start: usize,
+    accepted_end: usize,
+    block_records: &[FactorBlockRecord],
+) {
+    if accepted_end >= size {
+        return;
+    }
+    for row in accepted_end..size {
+        for col in accepted_end..=row {
+            let mut update = 0.0;
+            let mut pivot = block_start;
+            for block in block_records {
+                if block.size == 1 {
+                    let diagonal = app_original_one_by_one_diagonal(block.values[0]);
+                    let row_l = matrix[dense_lower_offset(size, row, pivot)];
+                    let col_l = matrix[dense_lower_offset(size, col, pivot)];
+                    update += (diagonal * row_l) * col_l;
+                    pivot += 1;
+                } else {
+                    let inv11 = block.values[0];
+                    let inv21 = block.values[1];
+                    let inv22 = block.values[3];
+                    let det = inv11 * inv22 - inv21 * inv21;
+                    let d11 = inv22 / det;
+                    let d21 = -inv21 / det;
+                    let d22 = inv11 / det;
+                    let row_l1 = matrix[dense_lower_offset(size, row, pivot)];
+                    let row_l2 = matrix[dense_lower_offset(size, row, pivot + 1)];
+                    let col_l1 = matrix[dense_lower_offset(size, col, pivot)];
+                    let col_l2 = matrix[dense_lower_offset(size, col, pivot + 1)];
+                    let row_ld1 = d11 * row_l1 + d21 * row_l2;
+                    let row_ld2 = d21 * row_l1 + d22 * row_l2;
+                    update += row_ld1 * col_l1 + row_ld2 * col_l2;
+                    pivot += 2;
+                }
+            }
+            let entry = dense_lower_offset(size, row, col);
+            matrix[entry] -= update;
+        }
+    }
+}
+
+fn app_build_factor_columns_for_prefix(
+    rows: &[usize],
+    matrix: &[f64],
+    size: usize,
+    start: usize,
+    end: usize,
+) -> Vec<FactorColumn> {
+    let mut columns = Vec::with_capacity(end.saturating_sub(start));
+    for col in start..end {
+        let mut entries = Vec::with_capacity(size.saturating_sub(col + 1));
+        for row in (col + 1)..size {
+            entries.push((rows[row], matrix[dense_lower_offset(size, row, col)]));
+        }
+        columns.push(FactorColumn {
+            global_column: rows[col],
+            entries,
+        });
+    }
+    columns
 }
 
 fn tpp_factor_one_by_one(
@@ -2101,6 +2352,12 @@ fn zero_dense_column(matrix: &mut [f64], size: usize, pivot: usize) {
     }
 }
 
+fn zero_dense_column_until(matrix: &mut [f64], size: usize, pivot: usize, end: usize) {
+    for row in pivot..end {
+        matrix[dense_lower_offset(size, row, pivot)] = 0.0;
+    }
+}
+
 fn factorize_root_dense_tpp(
     mut rows: Vec<usize>,
     mut dense: Vec<f64>,
@@ -2152,134 +2409,208 @@ fn factorize_dense_front(
     let mut scratch = vec![0.0; size.saturating_mul(size).max(1)];
     let mut pivot = 0;
 
-    while pivot < active_candidate_end {
-        let Some((best_abs, best_row, best_col)) =
-            dense_find_maxloc(&dense, size, pivot, active_candidate_end)
-        else {
-            break;
-        };
-        if best_abs < options.small_pivot_tolerance {
-            if !options.action_on_zero_pivot {
-                return Err(SsidsError::NumericalBreakdown {
-                    pivot: rows[pivot],
-                    detail: "APP encountered a zero pivot with action disabled".into(),
-                });
-            }
-            while pivot < active_candidate_end {
-                remove_zero_lower_entries_targeting_row(&mut factor_columns, rows[pivot]);
-                zero_dense_column(&mut dense, size, pivot);
-                reset_ldwork_column_tail(&mut scratch, size, pivot, pivot);
-                let column = FactorColumn {
-                    global_column: rows[pivot],
-                    entries: Vec::new(),
-                };
-                let block = FactorBlockRecord {
-                    size: 1,
-                    values: [0.0, 0.0, 0.0, 0.0],
-                };
-                factor_order.push(rows[pivot]);
-                factor_columns.push(column);
-                block_records.push(block);
-                pivot += 1;
-            }
-            break;
-        }
+    while active_candidate_end - pivot >= APP_INNER_BLOCK_SIZE {
+        let block_start = pivot;
+        let block_end = pivot + APP_INNER_BLOCK_SIZE;
+        let rows_before_block = rows.clone();
+        let dense_before_block = dense.clone();
+        let mut local_stats = PanelFactorStats::default();
+        let mut local_blocks = Vec::new();
+        let mut block_pivot = block_start;
 
-        if best_row == best_col {
-            if best_col != pivot {
-                dense_symmetric_swap_with_workspace(
-                    &mut dense,
-                    size,
-                    best_col,
-                    pivot,
-                    &mut scratch,
-                );
-                rows.swap(best_col, pivot);
-            }
-            let (column, block) =
-                factor_one_by_one_common(&rows, &mut dense, size, pivot, &mut stats, &mut scratch)?;
-            factor_order.push(rows[pivot]);
-            factor_columns.push(column);
-            block_records.push(block);
-            pivot += 1;
-            continue;
-        }
-
-        let first = best_col;
-        let mut second = best_row;
-        let a11 = dense[dense_lower_offset(size, first, first)];
-        let a22 = dense[dense_lower_offset(size, second, second)];
-        let a21 = dense[dense_lower_offset(size, second, first)];
-
-        let mut two_by_two_inverse = None;
-        let mut one_by_one_index = None;
-        if let Some(inverse) = app_two_by_two_inverse(a11, a21, a22, options.small_pivot_tolerance)
-        {
-            two_by_two_inverse = Some(inverse);
-        } else if a11.abs() > a22.abs() {
-            if (a11 / a21).abs() >= options.threshold_pivot_u {
-                one_by_one_index = Some(first);
-            }
-        } else if (a22 / a21).abs() >= options.threshold_pivot_u {
-            one_by_one_index = Some(second);
-        }
-
-        if let Some(index) = one_by_one_index {
-            if index != pivot {
-                dense_symmetric_swap_with_workspace(&mut dense, size, index, pivot, &mut scratch);
-                rows.swap(index, pivot);
-            }
-            let (column, block) =
-                factor_one_by_one_common(&rows, &mut dense, size, pivot, &mut stats, &mut scratch)?;
-            factor_order.push(rows[pivot]);
-            factor_columns.push(column);
-            block_records.push(block);
-            pivot += 1;
-            continue;
-        }
-
-        if let Some(inverse) = two_by_two_inverse {
-            if first != pivot {
-                dense_symmetric_swap_with_workspace(&mut dense, size, first, pivot, &mut scratch);
-                rows.swap(first, pivot);
-                if second == pivot {
-                    second = first;
+        while block_pivot < block_end {
+            let Some((best_abs, best_row, best_col)) =
+                dense_find_maxloc(&dense, size, block_pivot, block_end)
+            else {
+                break;
+            };
+            if best_abs < options.small_pivot_tolerance {
+                if !options.action_on_zero_pivot {
+                    return Err(SsidsError::NumericalBreakdown {
+                        pivot: rows[block_pivot],
+                        detail: "APP encountered a zero pivot with action disabled".into(),
+                    });
                 }
+                while block_pivot < block_end {
+                    zero_dense_column_until(&mut dense, size, block_pivot, block_end);
+                    reset_ldwork_column_tail(&mut scratch, size, block_pivot, block_pivot);
+                    local_blocks.push(FactorBlockRecord {
+                        size: 1,
+                        values: [0.0, 0.0, 0.0, 0.0],
+                    });
+                    block_pivot += 1;
+                }
+                break;
             }
-            if second != pivot + 1 {
-                dense_symmetric_swap_with_workspace(
+
+            if best_row == best_col {
+                if best_col != block_pivot {
+                    dense_symmetric_swap_with_workspace(
+                        &mut dense,
+                        size,
+                        best_col,
+                        block_pivot,
+                        &mut scratch,
+                    );
+                    rows.swap(best_col, block_pivot);
+                }
+                let (_, block) = factor_one_by_one_common(
+                    &rows,
                     &mut dense,
                     size,
-                    second,
-                    pivot + 1,
+                    block_pivot,
+                    block_end,
+                    &mut local_stats,
                     &mut scratch,
-                );
-                rows.swap(second, pivot + 1);
+                )?;
+                local_blocks.push(block);
+                block_pivot += 1;
+                continue;
             }
-            let (columns, block) = factor_two_by_two_common(
-                &rows,
-                &mut dense,
-                size,
-                pivot,
-                inverse,
-                &mut stats,
-                &mut scratch,
-            )?;
-            factor_order.push(rows[pivot]);
-            factor_order.push(rows[pivot + 1]);
-            let [first_column, second_column] = columns;
-            factor_columns.push(first_column);
-            factor_columns.push(second_column);
-            block_records.push(block);
-            pivot += 2;
-            continue;
+
+            let first = best_col;
+            let mut second = best_row;
+            let a11 = dense[dense_lower_offset(size, first, first)];
+            let a22 = dense[dense_lower_offset(size, second, second)];
+            let a21 = dense[dense_lower_offset(size, second, first)];
+
+            let mut two_by_two_inverse = None;
+            let mut one_by_one_index = None;
+            if let Some(inverse) =
+                app_two_by_two_inverse(a11, a21, a22, options.small_pivot_tolerance)
+            {
+                two_by_two_inverse = Some(inverse);
+            } else if a11.abs() > a22.abs() {
+                if (a11 / a21).abs() >= options.threshold_pivot_u {
+                    one_by_one_index = Some(first);
+                }
+            } else if (a22 / a21).abs() >= options.threshold_pivot_u {
+                one_by_one_index = Some(second);
+            }
+
+            if let Some(index) = one_by_one_index {
+                if index != block_pivot {
+                    dense_symmetric_swap_with_workspace(
+                        &mut dense,
+                        size,
+                        index,
+                        block_pivot,
+                        &mut scratch,
+                    );
+                    rows.swap(index, block_pivot);
+                }
+                let (_, block) = factor_one_by_one_common(
+                    &rows,
+                    &mut dense,
+                    size,
+                    block_pivot,
+                    block_end,
+                    &mut local_stats,
+                    &mut scratch,
+                )?;
+                local_blocks.push(block);
+                block_pivot += 1;
+                continue;
+            }
+
+            if let Some(inverse) = two_by_two_inverse {
+                if first != block_pivot {
+                    dense_symmetric_swap_with_workspace(
+                        &mut dense,
+                        size,
+                        first,
+                        block_pivot,
+                        &mut scratch,
+                    );
+                    rows.swap(first, block_pivot);
+                    if second == block_pivot {
+                        second = first;
+                    }
+                }
+                if second != block_pivot + 1 {
+                    dense_symmetric_swap_with_workspace(
+                        &mut dense,
+                        size,
+                        second,
+                        block_pivot + 1,
+                        &mut scratch,
+                    );
+                    rows.swap(second, block_pivot + 1);
+                }
+                let (_, block) = factor_two_by_two_common(
+                    &rows,
+                    &mut dense,
+                    DenseUpdateBounds {
+                        size,
+                        update_end: block_end,
+                    },
+                    block_pivot,
+                    inverse,
+                    &mut local_stats,
+                    &mut scratch,
+                )?;
+                local_blocks.push(block);
+                block_pivot += 2;
+                continue;
+            }
+
+            break;
         }
 
-        // Upstream APP stops after the first failed pivot prefix and hands the
-        // remaining candidate block to the configured failed-pivot method
-        // (TPP by default). Do not keep eagerly delaying individual pivots and
-        // continuing APP on the rest of the front.
-        break;
+        app_apply_block_pivots_to_trailing_rows(
+            &mut dense,
+            size,
+            block_start,
+            block_end,
+            &local_blocks,
+            options.small_pivot_tolerance,
+        );
+        let first_failed = app_first_failed_trailing_column(
+            &dense,
+            size,
+            block_start,
+            block_end,
+            options.threshold_pivot_u,
+        );
+        let local_passed = app_adjust_passed_prefix(&local_blocks, first_failed - block_start);
+        let accepted_end = block_start + local_passed;
+        let accepted_blocks = app_truncate_records_to_prefix(&local_blocks, local_passed);
+
+        app_restore_trailing_from_block_backup(
+            &rows,
+            &rows_before_block,
+            &mut dense,
+            &dense_before_block,
+            size,
+            accepted_end,
+        );
+        app_apply_accepted_prefix_update(
+            &mut dense,
+            size,
+            block_start,
+            accepted_end,
+            &accepted_blocks,
+        );
+
+        factor_order.extend(rows[block_start..accepted_end].iter().copied());
+        factor_columns.extend(app_build_factor_columns_for_prefix(
+            &rows,
+            &dense,
+            size,
+            block_start,
+            accepted_end,
+        ));
+        stats.two_by_two_pivots += accepted_blocks
+            .iter()
+            .filter(|block| block.size == 2)
+            .count();
+        stats.max_residual = stats.max_residual.max(local_stats.max_residual);
+        block_records.extend(accepted_blocks);
+        pivot = accepted_end;
+
+        if pivot < block_end {
+            break;
+        }
     }
 
     let remaining_rows = rows.split_off(pivot);
