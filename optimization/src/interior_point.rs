@@ -2932,6 +2932,21 @@ fn ipopt_internal_slack_rhs(system: &ReducedKktSystem<'_>, index: usize) -> f64 
     system.r_cent[index] / system.slack[index] - damped_slack_stationarity_residual(system, index)
 }
 
+fn slack_stationarity_residuals(lambda_ineq: &[f64], z: &[f64]) -> Vec<f64> {
+    lambda_ineq
+        .iter()
+        .zip(z.iter())
+        .map(|(y_i, z_i)| z_i - y_i)
+        .collect()
+}
+
+fn slack_stationarity_inf_norm(lambda_ineq: &[f64], z: &[f64]) -> f64 {
+    lambda_ineq
+        .iter()
+        .zip(z.iter())
+        .fold(0.0_f64, |acc, (y_i, z_i)| acc.max((z_i - y_i).abs()))
+}
+
 fn damped_slack_stationarity_residuals(
     lambda_ineq: &[f64],
     z: &[f64],
@@ -2939,26 +2954,10 @@ fn damped_slack_stationarity_residuals(
     kappa_d: f64,
 ) -> Vec<f64> {
     let damping = positive_slack_damping(barrier_parameter, kappa_d);
-    lambda_ineq
-        .iter()
-        .zip(z.iter())
-        .map(|(y_i, z_i)| z_i - y_i - damping)
+    slack_stationarity_residuals(lambda_ineq, z)
+        .into_iter()
+        .map(|residual| residual - damping)
         .collect()
-}
-
-fn damped_slack_stationarity_inf_norm(
-    lambda_ineq: &[f64],
-    z: &[f64],
-    barrier_parameter: f64,
-    kappa_d: f64,
-) -> f64 {
-    let damping = positive_slack_damping(barrier_parameter, kappa_d);
-    lambda_ineq
-        .iter()
-        .zip(z.iter())
-        .fold(0.0_f64, |acc, (y_i, z_i)| {
-            acc.max((z_i - y_i - damping).abs())
-        })
 }
 
 fn slack_complementarity_residuals(slack_barrier: &[f64], z: &[f64], mu: f64) -> Vec<f64> {
@@ -3472,28 +3471,6 @@ fn add_native_bound_multiplier_terms(
     }
 }
 
-fn add_native_bound_damping_terms(
-    residual: &mut [f64],
-    bounds: &BoundConstraints,
-    barrier_parameter: f64,
-    kappa_d: f64,
-) {
-    let damping_weight = positive_slack_damping(barrier_parameter, kappa_d);
-    if damping_weight == 0.0 {
-        return;
-    }
-    for &index in bounds.lower_indices.iter() {
-        if !bounds.upper_indices.contains(&index) {
-            residual[index] += damping_weight;
-        }
-    }
-    for &index in bounds.upper_indices.iter() {
-        if !bounds.lower_indices.contains(&index) {
-            residual[index] -= damping_weight;
-        }
-    }
-}
-
 #[expect(
     clippy::too_many_arguments,
     reason = "Bound KKT assembly keeps IPOPT damping and complementarity terms explicit."
@@ -3823,19 +3800,9 @@ fn apply_bound_multiplier_safeguard(
         &corrected_z_lower,
         &corrected_z_upper,
     );
-    add_native_bound_damping_terms(
-        &mut corrected_dual_residual,
-        bounds,
-        barrier_parameter_value,
-        options.kappa_d,
-    );
     let corrected_dual_x_inf = fixed_variables.free_inf_norm(&corrected_dual_residual);
-    let corrected_slack_stationarity_inf = damped_slack_stationarity_inf_norm(
-        inequality_multipliers,
-        &corrected_z,
-        barrier_parameter_value,
-        options.kappa_d,
-    );
+    let corrected_slack_stationarity_inf =
+        slack_stationarity_inf_norm(inequality_multipliers, &corrected_z);
     let corrected_dual_inf = corrected_dual_x_inf.max(corrected_slack_stationarity_inf);
 
     Some(AcceptedTrialMultiplierState {
@@ -8105,21 +8072,9 @@ where
         );
         let mut initial_dual_residual = initial_dual_residual;
         add_native_bound_multiplier_terms(&mut initial_dual_residual, &bounds, &z_lower, &z_upper);
-        let mut initial_damped_dual_residual = initial_dual_residual.clone();
-        add_native_bound_damping_terms(
-            &mut initial_damped_dual_residual,
-            &bounds,
-            barrier_parameter_value,
-            options.kappa_d,
-        );
-        let initial_slack_stationarity_inf = damped_slack_stationarity_inf_norm(
-            &lambda_ineq,
-            &z,
-            barrier_parameter_value,
-            options.kappa_d,
-        );
+        let initial_slack_stationarity_inf = slack_stationarity_inf_norm(&lambda_ineq, &z);
         let dual_inf = fixed_variables
-            .free_inf_norm(&initial_damped_dual_residual)
+            .free_inf_norm(&initial_dual_residual)
             .max(initial_slack_stationarity_inf);
         let complementarity_inf = if barrier_pair_count > 0 {
             combined_complementarity_inf_norm(
@@ -8312,27 +8267,11 @@ where
         let mut full_dual_residual = full_dual_residual;
         add_native_bound_multiplier_terms(&mut full_dual_residual, &bounds, &z_lower, &z_upper);
         let dual_residual = fixed_variables.reduce_vector(&full_dual_residual);
-        let mut damped_full_dual_residual = full_dual_residual.clone();
-        add_native_bound_damping_terms(
-            &mut damped_full_dual_residual,
-            &bounds,
-            barrier_parameter_value,
-            options.kappa_d,
-        );
-        // IPOPT's upper-bound slack stationarity is grad_lag_s = v_U - y_d,
-        // with damping grad_lag_s - kappa_d * mu for upper-side rows.
-        let slack_stationarity_residual = lambda_ineq
-            .iter()
-            .zip(z.iter())
-            .map(|(y_i, z_i)| z_i - y_i)
-            .collect::<Vec<_>>();
-        let dual_x_inf = fixed_variables.free_inf_norm(&damped_full_dual_residual);
-        let slack_stationarity_inf = damped_slack_stationarity_inf_norm(
-            &lambda_ineq,
-            &z,
-            barrier_parameter_value,
-            options.kappa_d,
-        );
+        let slack_stationarity_residual = slack_stationarity_residuals(&lambda_ineq, &z);
+        // IPOPT reports and tests convergence with curr_dual_infeasibility(), which uses the
+        // undamped Lagrangian gradients. The damped vectors are kept as separate KKT diagnostics.
+        let dual_x_inf = fixed_variables.free_inf_norm(&full_dual_residual);
+        let slack_stationarity_inf = slack_stationarity_inf_norm(&lambda_ineq, &z);
         let dual_inf = dual_x_inf.max(slack_stationarity_inf);
         let debug_any_dual = std::env::var_os("NLIP_DEBUG_MAX_DUAL_ANY").is_some();
         if (std::env::var_os("NLIP_DEBUG_MAX_DUAL").is_some()
@@ -9225,20 +9164,9 @@ where
                 &trial_z_lower,
                 &trial_z_upper,
             );
-            let mut trial_damped_dual_residual = trial_dual_residual.clone();
-            add_native_bound_damping_terms(
-                &mut trial_damped_dual_residual,
-                &bounds,
-                barrier_parameter_value,
-                options.kappa_d,
-            );
-            let trial_dual_x_inf = fixed_variables.free_inf_norm(&trial_damped_dual_residual);
-            let trial_slack_stationarity_inf = damped_slack_stationarity_inf_norm(
-                &trial_lambda_ineq,
-                &trial_z,
-                barrier_parameter_value,
-                options.kappa_d,
-            );
+            let trial_dual_x_inf = fixed_variables.free_inf_norm(&trial_dual_residual);
+            let trial_slack_stationarity_inf =
+                slack_stationarity_inf_norm(&trial_lambda_ineq, &trial_z);
             let trial_dual_inf = trial_dual_x_inf.max(trial_slack_stationarity_inf);
             let trial_comp_inf = if barrier_pair_count > 0 {
                 combined_complementarity_inf_norm(
@@ -9842,21 +9770,10 @@ where
                             &corrected_z_lower,
                             &corrected_z_upper,
                         );
-                        let mut corrected_damped_dual_residual = corrected_dual_residual.clone();
-                        add_native_bound_damping_terms(
-                            &mut corrected_damped_dual_residual,
-                            &bounds,
-                            barrier_parameter_value,
-                            options.kappa_d,
-                        );
                         let corrected_dual_x_inf =
-                            fixed_variables.free_inf_norm(&corrected_damped_dual_residual);
-                        let corrected_slack_stationarity_inf = damped_slack_stationarity_inf_norm(
-                            &corrected_lambda_ineq,
-                            &corrected_z,
-                            barrier_parameter_value,
-                            options.kappa_d,
-                        );
+                            fixed_variables.free_inf_norm(&corrected_dual_residual);
+                        let corrected_slack_stationarity_inf =
+                            slack_stationarity_inf_norm(&corrected_lambda_ineq, &corrected_z);
                         let corrected_dual_inf =
                             corrected_dual_x_inf.max(corrected_slack_stationarity_inf);
                         let corrected_comp_inf = if barrier_pair_count > 0 {
@@ -10354,12 +10271,6 @@ where
                     &bounds,
                     &z_lower,
                     &z_upper,
-                );
-                add_native_bound_damping_terms(
-                    &mut restored_dual_residual,
-                    &bounds,
-                    barrier_parameter_value,
-                    options.kappa_d,
                 );
                 let restored_dual_inf = fixed_variables.free_inf_norm(&restored_dual_residual);
                 let restored_complementarity_inf = if barrier_pair_count > 0 {
