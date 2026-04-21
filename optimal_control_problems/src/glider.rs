@@ -2923,11 +2923,17 @@ mod tests {
             .expect("glider direct collocation should compile");
         let compiled = compiled.compiled.borrow();
         let strict_runtime = dc_runtime(&params);
+        let dump_dir = TempDir::new().expect("temp dump dir should create");
         let mut options = crate::common::nlip_options(&params.solver);
         optimization::apply_native_spral_parity_to_nlip_options(&mut options);
         options.max_iters = 400;
         options.acceptable_iter = 0;
         options.verbose = false;
+        options.linear_debug = Some(optimization::InteriorPointLinearDebugOptions {
+            compare_solvers: vec![optimization::InteriorPointLinearSolver::SpralSsids],
+            schedule: optimization::InteriorPointLinearDebugSchedule::FailuresOnly,
+            dump_dir: Some(dump_dir.path().to_path_buf()),
+        });
 
         let mut iterations = Vec::new();
         let mut last_tf = None;
@@ -3062,9 +3068,10 @@ mod tests {
                         );
                         for (index, attempt) in info.attempts.iter().enumerate() {
                             println!(
-                                "  attempt[{index}] solver={:?} reg={:.6e} kind={:?} sol_inf={:?} sol_lim={:?} res_inf={:?} res_lim={:?} detail={:?}",
+                                "  attempt[{index}] solver={:?} reg={:.6e} inertia={:?} kind={:?} sol_inf={:?} sol_lim={:?} res_inf={:?} res_lim={:?} detail={:?}",
                                 attempt.solver,
                                 attempt.regularization,
+                                attempt.inertia,
                                 attempt.failure_kind,
                                 attempt.solution_inf,
                                 attempt.solution_inf_limit,
@@ -3076,6 +3083,42 @@ mod tests {
                     }
                 }
                 _ => {}
+            }
+        }
+        if let Some(report) = failure_linear_debug_report(&result) {
+            println!(
+                "linear_debug_failure verdict={:?} primary={}",
+                report.verdict,
+                report.primary_solver.label(),
+            );
+            for result in &report.results {
+                println!(
+                    "  debug solver={} success={} reg={:.6e} inertia={:?} residual={:?} step_inf={:?} detail={:?}",
+                    result.solver.label(),
+                    result.success,
+                    result.regularization,
+                    result.inertia,
+                    result.residual_inf,
+                    result.step_inf,
+                    result.detail,
+                );
+            }
+            for note in &report.notes {
+                println!("  debug note={note}");
+            }
+            let dump_paths = sorted_glider_dump_paths(dump_dir.path());
+            if let Some(dump_path) = dump_paths.last() {
+                let dump = load_glider_linear_debug_dump(dump_path);
+                let rust_exact = replay_rust_augmented_spral(&dump);
+                let native_exact = replay_native_augmented_spral(&dump);
+                println!(
+                    "  failure_dump={} rust_exact inertia={} residual={:.3e} native_exact inertia={} residual={:.3e}",
+                    dump_path.display(),
+                    rust_exact.inertia,
+                    rust_exact.residual_inf,
+                    native_exact.inertia,
+                    native_exact.residual_inf,
+                );
             }
         }
         println!(
@@ -3181,9 +3224,10 @@ mod tests {
             );
             for (index, attempt) in info.attempts.iter().enumerate() {
                 println!(
-                    "  attempt[{index}] solver={:?} reg={:.6e} kind={:?} sol_inf={:?} sol_lim={:?} res_inf={:?} res_lim={:?} detail={:?}",
+                    "  attempt[{index}] solver={:?} reg={:.6e} inertia={:?} kind={:?} sol_inf={:?} sol_lim={:?} res_inf={:?} res_lim={:?} detail={:?}",
                     attempt.solver,
                     attempt.regularization,
+                    attempt.inertia,
                     attempt.failure_kind,
                     attempt.solution_inf,
                     attempt.solution_inf_limit,

@@ -900,6 +900,8 @@ impl InteriorPointLinearSolveFailureKind {
 pub struct InteriorPointLinearSolveAttempt {
     pub solver: InteriorPointLinearSolver,
     pub regularization: f64,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub inertia: Option<Box<InteriorPointLinearInertia>>,
     pub failure_kind: InteriorPointLinearSolveFailureKind,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub detail: Option<String>,
@@ -2251,7 +2253,7 @@ fn linear_debug_result_from_attempt(
         solver,
         success: false,
         regularization: attempt.regularization,
-        inertia: None,
+        inertia: attempt.inertia.as_deref().copied(),
         residual_inf: attempt.residual_inf,
         solution_inf: attempt.solution_inf,
         step_inf: None,
@@ -2464,6 +2466,7 @@ fn replay_snapshot_with_solver(
         InteriorPointLinearSolver::Auto => Err(vec![InteriorPointLinearSolveAttempt {
             solver,
             regularization: snapshot.regularization,
+            inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::FactorizationFailed,
             detail: Some("auto is not a concrete comparison backend".into()),
             solution_inf: None,
@@ -2511,6 +2514,7 @@ fn run_linear_debug_report_on_success(
                 let fallback_attempt = InteriorPointLinearSolveAttempt {
                     solver,
                     regularization: snapshot.regularization,
+                    inertia: None,
                     failure_kind: InteriorPointLinearSolveFailureKind::FactorizationFailed,
                     detail: Some("comparison backend failed without diagnostics".into()),
                     solution_inf: None,
@@ -2568,6 +2572,7 @@ fn run_linear_debug_report_on_failure(
         attempts.last().unwrap_or(&InteriorPointLinearSolveAttempt {
             solver: preferred_solver,
             regularization: snapshot.regularization,
+            inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::FactorizationFailed,
             detail: Some("primary backend failed without diagnostics".into()),
             solution_inf: None,
@@ -2602,6 +2607,7 @@ fn run_linear_debug_report_on_failure(
                 let fallback_attempt = InteriorPointLinearSolveAttempt {
                     solver,
                     regularization: snapshot.regularization,
+                    inertia: None,
                     failure_kind: InteriorPointLinearSolveFailureKind::FactorizationFailed,
                     detail: Some("comparison backend failed without diagnostics".into()),
                     solution_inf: None,
@@ -4729,6 +4735,7 @@ fn assess_linear_solution(
         return Err(InteriorPointLinearSolveAttempt {
             solver: InteriorPointLinearSolver::Auto,
             regularization: 0.0,
+            inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::NonFiniteSolution,
             detail: None,
             solution_inf: Some(solution_inf),
@@ -4741,6 +4748,7 @@ fn assess_linear_solution(
         return Err(InteriorPointLinearSolveAttempt {
             solver: InteriorPointLinearSolver::Auto,
             regularization: 0.0,
+            inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::SolutionNormTooLarge,
             detail: None,
             solution_inf: Some(solution_inf),
@@ -4772,6 +4780,7 @@ fn assess_linear_solution(
         return Err(InteriorPointLinearSolveAttempt {
             solver: InteriorPointLinearSolver::Auto,
             regularization: 0.0,
+            inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::ResidualTooLarge,
             detail: None,
             solution_inf: Some(solution_inf),
@@ -4805,6 +4814,7 @@ fn assess_linear_solution_ccs(
         return Err(InteriorPointLinearSolveAttempt {
             solver: InteriorPointLinearSolver::Auto,
             regularization: 0.0,
+            inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::NonFiniteSolution,
             detail: None,
             solution_inf: Some(solution_inf),
@@ -4817,6 +4827,7 @@ fn assess_linear_solution_ccs(
         return Err(InteriorPointLinearSolveAttempt {
             solver: InteriorPointLinearSolver::Auto,
             regularization: 0.0,
+            inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::SolutionNormTooLarge,
             detail: None,
             solution_inf: Some(solution_inf),
@@ -4848,6 +4859,7 @@ fn assess_linear_solution_ccs(
         return Err(InteriorPointLinearSolveAttempt {
             solver: InteriorPointLinearSolver::Auto,
             regularization: 0.0,
+            inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::ResidualTooLarge,
             detail: None,
             solution_inf: Some(solution_inf),
@@ -4959,6 +4971,7 @@ fn spral_error_attempt(
     InteriorPointLinearSolveAttempt {
         solver: InteriorPointLinearSolver::SpralSsids,
         regularization,
+        inertia: None,
         failure_kind,
         detail: Some(error.to_string()),
         solution_inf: None,
@@ -4976,6 +4989,7 @@ fn native_spral_error_attempt(
     InteriorPointLinearSolveAttempt {
         solver: InteriorPointLinearSolver::NativeSpralSsids,
         regularization,
+        inertia: None,
         failure_kind,
         detail: Some(error.to_string()),
         solution_inf: None,
@@ -5006,6 +5020,7 @@ fn factor_solve_sparse_qdldl_with_metrics(
         return Err(InteriorPointLinearSolveAttempt {
             solver: InteriorPointLinearSolver::SparseQdldl,
             regularization,
+            inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::FactorizationFailed,
             detail: None,
             solution_inf: None,
@@ -5019,6 +5034,7 @@ fn factor_solve_sparse_qdldl_with_metrics(
         return Err(InteriorPointLinearSolveAttempt {
             solver: InteriorPointLinearSolver::SparseQdldl,
             regularization,
+            inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::FactorizationFailed,
             detail: None,
             solution_inf: None,
@@ -5040,6 +5056,7 @@ fn factor_solve_sparse_qdldl_with_metrics(
         InteriorPointLinearSolveAttempt {
             solver: InteriorPointLinearSolver::SparseQdldl,
             regularization,
+            inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::FactorizationFailed,
             detail: None,
             solution_inf: None,
@@ -5113,6 +5130,7 @@ fn factor_solve_spral_ssids_symmetric_with_metrics(
         return Err(InteriorPointLinearSolveAttempt {
             solver: InteriorPointLinearSolver::SpralSsids,
             regularization,
+            inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::FactorizationFailed,
             detail: None,
             solution_inf: None,
@@ -5225,6 +5243,7 @@ fn factor_solve_native_spral_ssids_symmetric_with_metrics(
         return Err(InteriorPointLinearSolveAttempt {
             solver: InteriorPointLinearSolver::NativeSpralSsids,
             regularization,
+            inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::FactorizationFailed,
             detail: None,
             solution_inf: None,
@@ -5974,11 +5993,17 @@ fn factor_solve_spral_ssids(
     let expected_inertia = spral_expected_augmented_inertia(&workspace.pattern);
     let actual_inertia = factor.inertia();
     if actual_inertia != expected_inertia {
-        return Err(spral_error_attempt(
+        return Err(InteriorPointLinearSolveAttempt {
+            solver: InteriorPointLinearSolver::SpralSsids,
             regularization,
-            InteriorPointLinearSolveFailureKind::InertiaMismatch,
-            inertia_mismatch_detail(expected_inertia, actual_inertia),
-        ));
+            inertia: Some(Box::new(interior_point_linear_inertia(actual_inertia))),
+            failure_kind: InteriorPointLinearSolveFailureKind::InertiaMismatch,
+            detail: Some(inertia_mismatch_detail(expected_inertia, actual_inertia)),
+            solution_inf: None,
+            solution_inf_limit: None,
+            residual_inf: None,
+            residual_inf_limit: None,
+        });
     }
 
     let solve_started = Instant::now();
@@ -6123,11 +6148,20 @@ fn factor_solve_native_spral_ssids(
 
     let expected_inertia = spral_expected_augmented_inertia(&workspace.pattern);
     if factor_info.inertia != expected_inertia {
-        return Err(native_spral_error_attempt(
+        return Err(InteriorPointLinearSolveAttempt {
+            solver: InteriorPointLinearSolver::NativeSpralSsids,
             regularization,
-            InteriorPointLinearSolveFailureKind::InertiaMismatch,
-            inertia_mismatch_detail(expected_inertia, factor_info.inertia),
-        ));
+            inertia: Some(Box::new(interior_point_linear_inertia(factor_info.inertia))),
+            failure_kind: InteriorPointLinearSolveFailureKind::InertiaMismatch,
+            detail: Some(inertia_mismatch_detail(
+                expected_inertia,
+                factor_info.inertia,
+            )),
+            solution_inf: None,
+            solution_inf_limit: None,
+            residual_inf: None,
+            residual_inf_limit: None,
+        });
     }
 
     let solve_started = Instant::now();
