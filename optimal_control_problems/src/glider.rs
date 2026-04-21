@@ -4759,6 +4759,13 @@ mod tests {
                     params.transcription.collocation_degree,
                 )
             );
+            print_trace_window(
+                &nlip_trace,
+                &ipopt_trace,
+                direction_index,
+                params.transcription.intervals,
+                params.transcription.collocation_degree,
+            );
         }
         for (index, (nlip_point, ipopt_point)) in
             nlip_trace.iter().zip(ipopt_trace.iter()).enumerate()

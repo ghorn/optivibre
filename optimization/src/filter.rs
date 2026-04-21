@@ -46,8 +46,8 @@ pub(crate) struct FilterTrialAssessment {
     pub switching_condition_satisfied: bool,
 }
 
-fn absolute_tolerance(value: f64) -> f64 {
-    100.0 * f64::EPSILON * value.abs().max(1.0)
+fn compare_le(lhs: f64, rhs: f64, baseline: f64) -> bool {
+    lhs - rhs <= 10.0 * f64::EPSILON * baseline.abs()
 }
 
 pub(crate) fn entry(objective: f64, violation: f64) -> FilterEntry {
@@ -77,9 +77,8 @@ fn objective_armijo_assessment(
     eta_phi: f64,
 ) -> (bool, bool) {
     let armijo_rhs = objective_value + eta_phi * alpha * objective_directional_derivative;
-    let armijo_abs_tol = absolute_tolerance(objective_value);
     let strict = trial_objective <= armijo_rhs;
-    let tolerance_adjusted = !strict && trial_objective <= armijo_rhs + armijo_abs_tol;
+    let tolerance_adjusted = !strict && compare_le(trial_objective, armijo_rhs, objective_value);
     (strict || tolerance_adjusted, tolerance_adjusted)
 }
 
@@ -93,11 +92,11 @@ fn sufficient_violation_reduction(
     } else {
         current_violation
     };
-    trial_violation <= target + absolute_tolerance(current_violation)
+    compare_le(trial_violation, target, current_violation)
 }
 
 fn theta_acceptable(trial_violation: f64, theta_max: f64) -> bool {
-    trial_violation <= theta_max + absolute_tolerance(theta_max)
+    theta_max <= 0.0 || trial_violation <= theta_max
 }
 
 fn dominates_trial(
@@ -112,22 +111,11 @@ fn dominates_trial(
     trial.violation > entry.violation && trial.objective > entry.objective
 }
 
-fn entries_match(lhs: &FilterEntry, rhs: &FilterEntry) -> bool {
-    let violation_scale = lhs.violation.abs().max(rhs.violation.abs()).max(1.0);
-    let objective_scale = lhs.objective.abs().max(rhs.objective.abs()).max(1.0);
-    (lhs.violation - rhs.violation).abs() <= 1e-12 * violation_scale
-        && (lhs.objective - rhs.objective).abs() <= 1e-12 * objective_scale
-}
-
 pub(crate) fn update_frontier(entries: &mut Vec<FilterEntry>, accepted: FilterEntry) {
     entries.retain(|entry| {
-        entries_match(entry, &accepted)
-            || accepted.violation > entry.violation + absolute_tolerance(entry.violation)
-            || accepted.objective > entry.objective + absolute_tolerance(entry.objective)
+        accepted.violation > entry.violation || accepted.objective > entry.objective
     });
-    if !entries.iter().any(|entry| entries_match(entry, &accepted)) {
-        entries.push(accepted);
-    }
+    entries.push(accepted);
 }
 
 #[expect(
@@ -159,10 +147,11 @@ pub(crate) fn assess_trial(
     let filter_acceptable = filter_theta_acceptable && !filter_dominated;
     let filter_sufficient_violation_reduction =
         sufficient_violation_reduction(current.violation, trial.violation, parameters.gamma_theta);
-    let filter_sufficient_objective_reduction = objective_armijo_satisfied
-        || trial.objective
-            <= current.objective - parameters.gamma_phi * current.violation
-                + absolute_tolerance(current.objective);
+    let filter_sufficient_objective_reduction = compare_le(
+        trial.objective - current.objective,
+        -parameters.gamma_phi * current.violation,
+        current.objective,
+    );
     let current_iterate_acceptable = if armijo_required {
         objective_armijo_satisfied
     } else {
@@ -221,6 +210,27 @@ mod tests {
             assessment.acceptance_mode,
             Some(FilterAcceptanceMode::ViolationReduction)
         );
+    }
+
+    #[test]
+    fn armijo_alone_does_not_accept_h_type_step_without_ipopt_reduction() {
+        let current = entry(0.0, 10.0);
+        let trial = entry(-1.0e-8, 11.0);
+        let assessment = assess_trial(
+            &[],
+            &current,
+            &trial,
+            1.0,
+            -1.0,
+            false,
+            false,
+            params(20.0, 1.0e-8),
+        );
+        assert!(assessment.objective_armijo_satisfied);
+        assert!(!assessment.filter_sufficient_violation_reduction);
+        assert!(!assessment.filter_sufficient_objective_reduction);
+        assert!(!assessment.current_iterate_acceptable);
+        assert_eq!(assessment.acceptance_mode, None);
     }
 
     #[test]
