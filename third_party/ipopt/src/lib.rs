@@ -1039,7 +1039,8 @@ impl<P: BasicProblem> Ipopt<P> {
         let ip = &mut (*(user_data as *mut Ipopt<P>));
         if let Some(callback) = ip.intermediate_callback {
             fn optional_slice<'a>(ptr: *const Number, count: Index) -> &'a [Number] {
-                if count == 0 || ptr.is_null() {
+                let misaligned = !(ptr as usize).is_multiple_of(std::mem::align_of::<Number>());
+                if count <= 0 || ptr.is_null() || misaligned {
                     &[]
                 } else {
                     unsafe { slice::from_raw_parts(ptr, count as usize) }
