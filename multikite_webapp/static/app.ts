@@ -21,6 +21,11 @@ interface PlotlyLike {
     indices: number[],
     maxPoints?: number
   ): Promise<unknown>;
+  restyle(
+    element: HTMLElement,
+    update: { x: number[][]; y: number[][] },
+    indices: number[]
+  ): Promise<unknown>;
   purge(element: HTMLElement): void;
   Plots?: {
     resize(element: HTMLElement): void;
@@ -217,6 +222,7 @@ type StreamEvent =
   | { kind: "log"; message: string }
   | { kind: "progress"; progress: SimulationProgress }
   | { kind: "frame"; frame: ApiFrame }
+  | { kind: "plot_buffer"; frames: ApiFrame[] }
   | { kind: "summary"; summary: RunSummary };
 
 const presetSelect = document.querySelector<HTMLSelectElement>("#preset")!;
@@ -580,7 +586,7 @@ let consoleLines: string[] = [];
 let framesReceived = 0;
 let framesRendered = 0;
 let pendingPlaybackFrames: ApiFrame[] = [];
-let pendingPlotFrames: ApiFrame[] = [];
+let latestPlotBuffer: ApiFrame[] = [];
 let pendingSummary: RunSummary | null = null;
 let latestProgressState: SimulationProgress | null = null;
 let activeSummaryRequest: { preset: string; phase_mode: PhaseMode } | null = null;
@@ -590,12 +596,14 @@ let playbackStartWallTimeMs: number | null = null;
 let playbackStartSimTime = 0;
 let shouldSnapOrbitTargetToFrame = true;
 let lastRenderedFrame: ApiFrame | null = null;
+let displayedSimTime: number | null = null;
 let lastCameraFollowHeadingRad: number | null = null;
 let lastCameraFollowTarget: CameraFollowTarget | null = null;
 let lastAirflowFrameTime: number | null = null;
 let airflowUpdatesEnabled = true;
 let plotUpdatesEnabled = true;
 let plotFlushInFlight = false;
+let plotRefreshPending = false;
 let lastSummaryRefreshWallTimeMs = 0;
 let summaryRefreshPending = false;
 let lastSummaryHtml = "";
@@ -644,7 +652,6 @@ const KITE_COLORS = ["#45d7a7", "#66b8ff", "#ffbe6b", "#ff7b72"];
 const REF_ALPHA = 0.6;
 const LIMIT_COLOR = "rgba(255, 94, 94, 0.72)";
 const ZERO_REF_COLOR = "rgba(211, 228, 245, 0.38)";
-const plotMaxPoints = 12000;
 const MAX_PLOT_COLUMNS = 3;
 const PLOT_SECTION_ROW_HEIGHT_PX = 292;
 let activePlotSections: ActivePlotSection[] = [];
@@ -1278,7 +1285,7 @@ function resetPlaybackState(label: string, rate: number | null): void {
   framesReceived = 0;
   framesRendered = 0;
   pendingPlaybackFrames = [];
-  pendingPlotFrames = [];
+  latestPlotBuffer = [];
   pendingSummary = null;
   latestProgressState = null;
   currentPlaybackLabel = label;
@@ -1287,11 +1294,13 @@ function resetPlaybackState(label: string, rate: number | null): void {
   playbackStartSimTime = 0;
   shouldSnapOrbitTargetToFrame = true;
   lastRenderedFrame = null;
+  displayedSimTime = null;
   resetCameraFollowState();
   lastAirflowFrameTime = null;
   airflowUpdatesEnabled = true;
   plotUpdatesEnabled = true;
   plotFlushInFlight = false;
+  plotRefreshPending = false;
   lastSummaryRefreshWallTimeMs = 0;
   summaryRefreshPending = false;
   lastSummaryHtml = "";
@@ -3160,13 +3169,14 @@ function renderFrameBatch(frames: ApiFrame[]): void {
   }
   try {
     renderFrame(renderFrameForBatch);
+    displayedSimTime = renderFrameForBatch.time;
+    updatePlotsForDisplayedTime();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     appendConsole(`3D render error: ${message}`);
     refreshProgressSummary();
     return;
   }
-  appendPlotFrames(frames);
   refreshProgressSummary();
 }
 
@@ -3204,18 +3214,26 @@ function drainPendingFrames(timestamp: number): void {
   }
 }
 
-function flushPendingPlotFrames(): void {
+function updatePlotsForDisplayedTime(): void {
   if (
-    pendingPlotFrames.length === 0 ||
+    latestPlotBuffer.length === 0 ||
+    displayedSimTime === null ||
     activePlotSections.length === 0 ||
-    !plotUpdatesEnabled ||
-    plotFlushInFlight
+    !plotUpdatesEnabled
   ) {
     return;
   }
 
-  const frames = pendingPlotFrames;
-  pendingPlotFrames = [];
+  if (plotFlushInFlight) {
+    plotRefreshPending = true;
+    return;
+  }
+
+  const cutoff = displayedSimTime + 1.0e-9;
+  const frames = latestPlotBuffer.filter((frame) => frame.time <= cutoff);
+  if (frames.length === 0) {
+    return;
+  }
   plotFlushInFlight = true;
 
   const frameTimes = frames.map((frame) => frame.time);
@@ -3226,11 +3244,10 @@ function flushPendingPlotFrames(): void {
     const y = section.definition.groups.flatMap((group) =>
       group.traces.map((trace) => frames.map((frame) => trace.value(frame)))
     );
-    return Plotly.extendTraces(
+    return Plotly.restyle(
       section.plot,
       { x, y },
-      section.traceIndices,
-      plotMaxPoints
+      section.traceIndices
     );
   });
 
@@ -3245,8 +3262,9 @@ function flushPendingPlotFrames(): void {
     })
     .finally(() => {
       plotFlushInFlight = false;
-      if (pendingPlotFrames.length > 0) {
-        flushPendingPlotFrames();
+      if (plotRefreshPending) {
+        plotRefreshPending = false;
+        updatePlotsForDisplayedTime();
       }
     });
 }
@@ -3254,7 +3272,6 @@ function flushPendingPlotFrames(): void {
 function animate(timestamp: number): void {
   requestAnimationFrame(animate);
   drainPendingFrames(timestamp);
-  flushPendingPlotFrames();
   if (summaryRefreshPending) {
     refreshProgressSummary();
   }
@@ -3418,14 +3435,17 @@ async function resetPlots(kiteCount: number): Promise<void> {
   });
 
   await Promise.all(sectionPromises);
+  updatePlotsForDisplayedTime();
 }
 
-function appendPlotFrames(frames: ApiFrame[]): void {
-  if (frames.length === 0 || activePlotSections.length === 0 || !plotUpdatesEnabled) {
+function replacePlotBuffer(frames: ApiFrame[]): void {
+  if (frames.length === 0) {
     return;
   }
-  pendingPlotFrames.push(...frames);
-  flushPendingPlotFrames();
+  latestPlotBuffer = frames;
+  framesReceived = Math.max(framesReceived, frames.length);
+  updatePlotsForDisplayedTime();
+  refreshProgressSummary();
 }
 
 function queueFrames(frames: ApiFrame[]): void {
@@ -3551,7 +3571,8 @@ async function runSimulation(): Promise<void> {
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? "";
-      const framesInChunk: ApiFrame[] = [];
+      const sceneFramesInChunk: ApiFrame[] = [];
+      let latestPlotBufferInChunk: ApiFrame[] | null = null;
       for (const line of lines) {
         if (!line.trim()) {
           continue;
@@ -3579,15 +3600,21 @@ async function runSimulation(): Promise<void> {
           continue;
         }
         if (event.kind === "frame") {
-          framesReceived += 1;
-          framesInChunk.push(event.frame);
+          sceneFramesInChunk.push(event.frame);
+          continue;
+        }
+        if (event.kind === "plot_buffer") {
+          latestPlotBufferInChunk = event.frames;
           continue;
         }
         summary = event.summary;
         pendingSummary = event.summary;
         setFailure(event.summary.failure ?? null);
       }
-      queueFrames(framesInChunk);
+      if (latestPlotBufferInChunk) {
+        replacePlotBuffer(latestPlotBufferInChunk);
+      }
+      queueFrames(sceneFramesInChunk);
     }
 
     if (buffer.trim()) {
@@ -3598,8 +3625,9 @@ async function runSimulation(): Promise<void> {
         latestProgressState = event.progress;
         refreshProgressSummary();
       } else if (event.kind === "frame") {
-        framesReceived += 1;
         queueFrames([event.frame]);
+      } else if (event.kind === "plot_buffer") {
+        replacePlotBuffer(event.frames);
       } else {
         summary = event.summary;
         pendingSummary = event.summary;
