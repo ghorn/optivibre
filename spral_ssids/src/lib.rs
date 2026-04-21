@@ -1602,9 +1602,9 @@ fn app_update_two_by_two(
             let update_entry = dense_lower_offset(size, row, col);
             let first_multiplier = matrix[dense_lower_offset(size, row, pivot)];
             let second_multiplier = matrix[dense_lower_offset(size, row, pivot + 1)];
-            // Native block_ldlt forms the two products separately before the update.
+            // Clang contracts SPRAL's block_ldlt 2x2 update RHS before subtracting it.
             matrix[update_entry] -=
-                first_multiplier * first_preserved + second_multiplier * second_preserved;
+                first_multiplier.mul_add(first_preserved, second_multiplier * second_preserved);
         }
     }
 }
