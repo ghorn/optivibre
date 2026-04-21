@@ -1295,7 +1295,8 @@ mod tests {
     use serde::de::DeserializeOwned;
     use spral_ssids::{
         NativeSpral, NumericFactorOptions, OrderingStrategy, SsidsOptions, SymmetricCscMatrix,
-        analyse as spral_analyse, factorize as spral_factorize,
+        analyse as spral_analyse, approximate_minimum_degree_permutation as spral_amd_permutation,
+        factorize as spral_factorize,
     };
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
@@ -1557,8 +1558,14 @@ mod tests {
         )
         .expect("dumped augmented CSC values should validate");
         let native = NativeSpral::load().expect("native SPRAL should be available locally");
+        let rust_initial_order =
+            spral_amd_permutation(structure).expect("rust AMD order should succeed on dumped KKT");
         let mut session = native
-            .analyse(structure)
+            .analyse_with_options_and_user_ordering(
+                structure,
+                &NumericFactorOptions::default(),
+                rust_initial_order.inverse(),
+            )
             .expect("native spral analyse should succeed on dumped KKT");
         let factor_started = Instant::now();
         let factor_info = session

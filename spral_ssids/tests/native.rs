@@ -1,5 +1,8 @@
 use approx::assert_abs_diff_eq;
-use spral_ssids::{Inertia, NativeOrdering, NativeSpral, NumericFactorOptions, SymmetricCscMatrix};
+use spral_ssids::{
+    Inertia, NativeOrdering, NativeSpral, NativeSpralError, NumericFactorOptions,
+    SymmetricCscMatrix,
+};
 
 fn dense_mul(matrix: &[Vec<f64>], x: &[f64]) -> Vec<f64> {
     matrix
@@ -135,6 +138,58 @@ fn native_spral_session_refactorizes_same_pattern() {
         assert_abs_diff_eq!(actual, expected_i, epsilon = 1e-10);
     }
     assert!(residual_inf_norm(&dense1, &in_place, &rhs) <= 1e-10);
+}
+
+#[test]
+fn native_spral_accepts_explicit_user_ordering() {
+    let Some(native) = load_native_or_skip() else {
+        return;
+    };
+    let dense = vec![
+        vec![5.0, 1.0, 0.0],
+        vec![1.0, 4.0, 1.0],
+        vec![0.0, 1.0, 3.0],
+    ];
+    let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+    let matrix = SymmetricCscMatrix::new(3, &col_ptrs, &row_indices, Some(&values)).expect("csc");
+    let options = NumericFactorOptions::default();
+    let reverse_original_to_position = [2, 1, 0];
+    let mut session = native
+        .analyse_with_options_and_user_ordering(matrix, &options, &reverse_original_to_position)
+        .expect("analyse with user order");
+    let factor_info = session.factorize(matrix).expect("factorize");
+    assert_eq!(
+        factor_info.inertia,
+        Inertia {
+            positive: 3,
+            negative: 0,
+            zero: 0,
+        }
+    );
+
+    let expected = vec![2.0, -1.0, 0.5];
+    let rhs = dense_mul(&dense, &expected);
+    let solution = session.solve(&rhs).expect("solve");
+    for (actual, expected_i) in solution.iter().zip(expected.iter()) {
+        assert_abs_diff_eq!(actual, expected_i, epsilon = 1e-10);
+    }
+    assert!(residual_inf_norm(&dense, &solution, &rhs) <= 1e-10);
+}
+
+#[test]
+fn native_spral_rejects_invalid_user_ordering() {
+    let Some(native) = load_native_or_skip() else {
+        return;
+    };
+    let col_ptrs = [0, 1, 2, 3];
+    let row_indices = [0, 1, 2];
+    let values = [1.0, 2.0, 3.0];
+    let matrix = SymmetricCscMatrix::new(3, &col_ptrs, &row_indices, Some(&values)).expect("csc");
+    let options = NumericFactorOptions::default();
+    let error = native
+        .analyse_with_options_and_user_ordering(matrix, &options, &[0, 0, 2])
+        .expect_err("duplicate user order should be rejected");
+    assert!(matches!(error, NativeSpralError::InvalidOrdering(_)));
 }
 
 #[test]

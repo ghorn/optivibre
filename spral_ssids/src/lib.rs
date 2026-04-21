@@ -927,6 +927,14 @@ pub fn analyse(
     }
 }
 
+pub fn approximate_minimum_degree_permutation(
+    matrix: SymmetricCscMatrix<'_>,
+) -> Result<Permutation, SsidsError> {
+    let graph =
+        CsrGraph::from_symmetric_csc(matrix.dimension(), matrix.col_ptrs(), matrix.row_indices())?;
+    Ok(approximate_minimum_degree_order(&graph)?.permutation)
+}
+
 /// Perform a numeric multifrontal LDL^T factorization for a previously
 /// analyzed symmetric CSC matrix.
 pub fn factorize(

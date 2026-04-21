@@ -147,6 +147,16 @@ pub enum NativeOrdering {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeOrderingSpec<'a> {
+    LibraryDefault,
+    Natural,
+    Matching,
+    /// User order in SPRAL's C-facing convention: `order[original_column]`
+    /// is the zero-based position of that column in the pivot sequence.
+    UserSupplied(&'a [usize]),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NativeSpralAnalyseInfo {
     pub supernode_count: usize,
     pub max_front_size: usize,
@@ -205,6 +215,8 @@ pub enum NativeSpralError {
     DimensionMismatch { expected: usize, actual: usize },
     #[error("native SPRAL pattern mismatch: {0}")]
     PatternMismatch(String),
+    #[error("native SPRAL invalid user ordering: {0}")]
+    InvalidOrdering(String),
     #[error("native SPRAL analyse failed with flag {flag}")]
     AnalyseFailed { flag: i32 },
     #[error("native SPRAL factorization failed with flag {flag}")]
@@ -317,6 +329,37 @@ impl NativeSpral {
         numeric_options: &NumericFactorOptions,
         ordering: NativeOrdering,
     ) -> Result<NativeSpralSession, NativeSpralError> {
+        let ordering = match ordering {
+            NativeOrdering::LibraryDefault => NativeOrderingSpec::LibraryDefault,
+            NativeOrdering::Natural => NativeOrderingSpec::Natural,
+            NativeOrdering::Matching => NativeOrderingSpec::Matching,
+        };
+        self.analyse_with_ordering_spec(matrix, numeric_options, ordering)
+    }
+
+    /// Analyse with an explicit user ordering.
+    ///
+    /// `order[original_column]` is the zero-based position of that original
+    /// column in the pivot sequence, matching SPRAL's C interface convention.
+    pub fn analyse_with_options_and_user_ordering(
+        &self,
+        matrix: SymmetricCscMatrix<'_>,
+        numeric_options: &NumericFactorOptions,
+        order: &[usize],
+    ) -> Result<NativeSpralSession, NativeSpralError> {
+        self.analyse_with_ordering_spec(
+            matrix,
+            numeric_options,
+            NativeOrderingSpec::UserSupplied(order),
+        )
+    }
+
+    fn analyse_with_ordering_spec(
+        &self,
+        matrix: SymmetricCscMatrix<'_>,
+        numeric_options: &NumericFactorOptions,
+        ordering: NativeOrderingSpec<'_>,
+    ) -> Result<NativeSpralSession, NativeSpralError> {
         if matrix.dimension() > i32::MAX as usize {
             return Err(NativeSpralError::DimensionTooLarge {
                 dimension: matrix.dimension(),
@@ -345,11 +388,11 @@ impl NativeSpral {
             matrix.dimension(),
             ordering,
             &mut order_storage,
-        );
+        )?;
 
         let mut inform = SpralSsidsInform::default();
         let mut analysed = ptr::null_mut();
-        let values_ptr = if ordering == NativeOrdering::Matching {
+        let values_ptr = if ordering == NativeOrderingSpec::Matching {
             matrix
                 .values()
                 .ok_or(NativeSpralError::MissingValues)?
@@ -451,12 +494,12 @@ fn apply_numeric_factor_options(native: &mut SpralSsidsOptions, numeric: &Numeri
 fn apply_native_ordering(
     native: &mut SpralSsidsOptions,
     dimension: usize,
-    ordering: NativeOrdering,
+    ordering: NativeOrderingSpec<'_>,
     order_storage: &mut Option<Vec<i32>>,
-) {
+) -> Result<(), NativeSpralError> {
     match ordering {
-        NativeOrdering::LibraryDefault => {}
-        NativeOrdering::Natural => {
+        NativeOrderingSpec::LibraryDefault => {}
+        NativeOrderingSpec::Natural => {
             native.ordering = 0;
             *order_storage = Some(
                 (0..dimension)
@@ -464,11 +507,41 @@ fn apply_native_ordering(
                     .collect(),
             );
         }
-        NativeOrdering::Matching => {
+        NativeOrderingSpec::Matching => {
             native.ordering = 2;
             native.scaling = 3;
         }
+        NativeOrderingSpec::UserSupplied(order) => {
+            if order.len() != dimension {
+                return Err(NativeSpralError::InvalidOrdering(format!(
+                    "expected {dimension} entries, got {}",
+                    order.len()
+                )));
+            }
+            let mut seen = vec![false; dimension];
+            for (original, &position) in order.iter().enumerate() {
+                if position >= dimension {
+                    return Err(NativeSpralError::InvalidOrdering(format!(
+                        "order[{original}]={position} is out of bounds for {dimension} columns"
+                    )));
+                }
+                if seen[position] {
+                    return Err(NativeSpralError::InvalidOrdering(format!(
+                        "duplicate pivot position {position}"
+                    )));
+                }
+                seen[position] = true;
+            }
+            native.ordering = 0;
+            *order_storage = Some(
+                order
+                    .iter()
+                    .map(|&position| i32::try_from(position).unwrap_or(i32::MAX))
+                    .collect(),
+            );
+        }
     }
+    Ok(())
 }
 
 impl NativeSpralSession {
