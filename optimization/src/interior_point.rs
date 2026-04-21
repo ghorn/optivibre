@@ -4739,32 +4739,37 @@ fn assess_linear_solution_ccs(
     })
 }
 
-const LINEAR_REFINEMENT_MAX_STEPS: usize = 10;
-const LINEAR_REFINEMENT_RELATIVE_RESIDUAL: f64 = 128.0 * f64::EPSILON;
+const IPOPT_LINEAR_MIN_REFINEMENT_STEPS: usize = 1;
+const IPOPT_LINEAR_MAX_REFINEMENT_STEPS: usize = 10;
+const IPOPT_LINEAR_RESIDUAL_RATIO_MAX: f64 = 1e-10;
+const IPOPT_LINEAR_RESIDUAL_IMPROVEMENT_FACTOR: f64 = 0.999_999_999;
+const IPOPT_LINEAR_RESIDUAL_MAX_COND: f64 = 1e6;
 
-fn refinement_residual_target_ccs(
+fn ipopt_refinement_residual_ratio_ccs(
     ccs: &CCS,
     values: &[f64],
     rhs: &[f64],
     solution: &[f64],
-) -> (Vec<f64>, f64, f64) {
+) -> (Vec<f64>, f64) {
     let residual = symmetric_ccs_lower_mat_vec(ccs, values, solution)
         .into_iter()
         .zip(rhs.iter().copied())
-        .map(|(lhs, rhs_i)| rhs_i - lhs)
+        .map(|(lhs, rhs_i)| lhs - rhs_i)
         .collect::<Vec<_>>();
-    let abs_solution = solution.iter().map(|value| value.abs()).collect::<Vec<_>>();
-    let lhs_scale = symmetric_ccs_lower_abs_mat_vec(ccs, values, &abs_solution);
+    let rhs_inf = rhs.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    let solution_inf = solution
+        .iter()
+        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
     let residual_inf = residual
         .iter()
         .fold(0.0_f64, |acc, value| acc.max(value.abs()));
-    let target = lhs_scale
-        .iter()
-        .zip(rhs.iter())
-        .fold(0.0_f64, |acc, (lhs_scale_i, rhs_i)| {
-            acc.max(LINEAR_REFINEMENT_RELATIVE_RESIDUAL * (1.0 + lhs_scale_i + rhs_i.abs()))
-        });
-    (residual, residual_inf, target)
+    let denominator = solution_inf.min(IPOPT_LINEAR_RESIDUAL_MAX_COND * rhs_inf) + rhs_inf;
+    let ratio = if denominator == 0.0 {
+        residual_inf
+    } else {
+        residual_inf / denominator
+    };
+    (residual, ratio)
 }
 
 fn refine_linear_solution_ccs<E>(
@@ -4776,27 +4781,32 @@ fn refine_linear_solution_ccs<E>(
     mut solve_correction: impl FnMut(&[f64]) -> Result<Vec<f64>, E>,
 ) -> Result<usize, E> {
     let mut steps = 0;
-    let mut previous_residual_inf = f64::INFINITY;
-    loop {
-        let (residual, residual_inf, target) =
-            refinement_residual_target_ccs(ccs, values, rhs, solution);
-        if residual_inf <= target
-            || steps >= LINEAR_REFINEMENT_MAX_STEPS
-            || residual_inf >= previous_residual_inf * (1.0 - 1e-6)
-        {
-            break;
-        }
-        previous_residual_inf = residual_inf;
+    let (mut residual, mut residual_ratio) =
+        ipopt_refinement_residual_ratio_ccs(ccs, values, rhs, solution);
+    let mut previous_residual_ratio = residual_ratio;
+    while steps < IPOPT_LINEAR_MIN_REFINEMENT_STEPS
+        || residual_ratio > IPOPT_LINEAR_RESIDUAL_RATIO_MAX
+    {
         let correction_started = Instant::now();
         let correction = solve_correction(&residual)?;
         *solve_time += correction_started.elapsed();
-        if correction.iter().all(|value| value.abs() <= f64::EPSILON) {
-            break;
-        }
         for (solution_i, correction_i) in solution.iter_mut().zip(correction.iter()) {
-            *solution_i += correction_i;
+            *solution_i -= correction_i;
         }
         steps += 1;
+        let (new_residual, new_residual_ratio) =
+            ipopt_refinement_residual_ratio_ccs(ccs, values, rhs, solution);
+        if new_residual_ratio > IPOPT_LINEAR_RESIDUAL_RATIO_MAX
+            && steps > IPOPT_LINEAR_MIN_REFINEMENT_STEPS
+            && (steps > IPOPT_LINEAR_MAX_REFINEMENT_STEPS
+                || new_residual_ratio
+                    > IPOPT_LINEAR_RESIDUAL_IMPROVEMENT_FACTOR * previous_residual_ratio)
+        {
+            break;
+        }
+        residual = new_residual;
+        previous_residual_ratio = new_residual_ratio;
+        residual_ratio = new_residual_ratio;
     }
     Ok(steps)
 }
