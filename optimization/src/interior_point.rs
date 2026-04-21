@@ -2121,7 +2121,6 @@ fn build_interior_point_kkt_snapshot(
     phase: InteriorPointIterationPhase,
     primary_solver: InteriorPointLinearSolver,
     system: &ReducedKktSystem<'_>,
-    regularization_used: f64,
     primal_diagonal_shift_used: f64,
     dual_diagonal_shift_used: f64,
     barrier_parameter: f64,
@@ -2144,7 +2143,7 @@ fn build_interior_point_kkt_snapshot(
     )?;
     let primal_shift = primal_diagonal_shift_used;
     let slack_shift = primal_diagonal_shift_used;
-    let dual_shift = dual_regularization_used.max(0.0);
+    let dual_shift = dual_diagonal_shift_used.max(0.0);
     let mut augmented_values = vec![0.0; pattern.ccs.nnz()];
     fill_spral_augmented_kkt_values(
         &pattern,
@@ -2323,29 +2322,34 @@ fn newton_direction_from_augmented_solution(
     let meq = snapshot.equality_dimension;
     let mineq = snapshot.inequality_dimension;
     let dx = solution[..n].to_vec();
-    let p = solution
+    let ipopt_ds = solution
         [snapshot.augmented_pattern.p_offset..snapshot.augmented_pattern.p_offset + mineq]
         .to_vec();
     let d_lambda = solution
         [snapshot.augmented_pattern.lambda_offset..snapshot.augmented_pattern.lambda_offset + meq]
         .to_vec();
-    let dz = solution
+    let d_ineq = solution
         [snapshot.augmented_pattern.z_offset..snapshot.augmented_pattern.z_offset + mineq]
         .to_vec();
-    let ds = p
+    let ds = ipopt_ds.iter().map(|value| -*value).collect::<Vec<_>>();
+    let damping = positive_slack_damping(snapshot.barrier_parameter, snapshot.kappa_d);
+    let dz = d_ineq
         .iter()
-        .zip(snapshot.slack.iter())
-        .zip(snapshot.multipliers.iter())
-        .map(|((p_i, slack_i), multiplier_i)| {
-            let scaling = (slack_i.max(1e-16) / multiplier_i.max(1e-16)).sqrt();
-            p_i * scaling
+        .zip(snapshot.r_slack_stationarity.iter())
+        .zip(ds.iter())
+        .map(|((dy_i, r_slack_i), ds_i)| {
+            let damped_stationarity = *r_slack_i - damping;
+            *dy_i - damped_stationarity + snapshot.primal_diagonal_shift * *ds_i
         })
         .collect::<Vec<_>>();
     NewtonDirection {
         dx,
         d_lambda,
+        d_ineq,
         ds,
         dz,
+        dz_lower: Vec::new(),
+        dz_upper: Vec::new(),
         solver_used: solver,
         regularization_used: snapshot.regularization.max(snapshot.primal_diagonal_shift),
         dual_regularization_used: snapshot.dual_regularization,
@@ -8850,7 +8854,6 @@ where
                         current_snapshot.phase,
                         direction.solver_used,
                         &reduced_kkt_system,
-                        direction.regularization_used,
                         direction.primal_diagonal_shift_used,
                         direction.dual_regularization_used,
                         barrier_parameter_value,
@@ -8892,7 +8895,6 @@ where
                         current_snapshot.phase,
                         *solver,
                         &reduced_kkt_system,
-                        regularization,
                         primal_shift,
                         dual_shift,
                         barrier_parameter_value,
