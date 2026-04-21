@@ -317,6 +317,19 @@ fn rust_and_native_spral_minimized_singular_arrow_4x4() {
 
 #[test]
 #[ignore = "manual exact parity witness while debugging the native-vs-rust mismatch"]
+fn rust_and_native_spral_minimized_singular_arrow_solve_order_4x4() {
+    let matrix = vec![
+        vec![1.0, -1.0, 0.25, 1.0],
+        vec![-1.0, -2.0, 0.0, 0.0],
+        vec![0.25, 0.0, 0.0, 0.0],
+        vec![1.0, 0.0, 0.0, 0.0],
+    ];
+    let expected_solution = vec![0.0, -0.25, 2.0, -2.0];
+    assert_exact_bitwise_parity_witness(&matrix, &expected_solution);
+}
+
+#[test]
+#[ignore = "manual exact parity witness while debugging the native-vs-rust mismatch"]
 fn rust_and_native_spral_minimized_path_plus_chord_4x4() {
     let matrix = vec![
         vec![-4.0, 4.0, 1.0, 0.0],
@@ -356,6 +369,97 @@ fn rust_and_native_spral_minimized_path_plus_chord_scaled_4x4() {
 
 #[test]
 #[ignore = "manual exact parity witness while debugging the native-vs-rust mismatch"]
+fn rust_and_native_spral_minimized_path_plus_chord_tpp_update_4x4() {
+    let matrix = vec![
+        vec![0.25, -0.375, -3.0, 0.0],
+        vec![-0.375, -1.0, -1.0, 0.0],
+        vec![-3.0, -1.0, 0.0, 1.0],
+        vec![0.0, 0.0, 1.0, -5.0],
+    ];
+    let expected_solution = vec![0.0, 0.0, 0.0, -1.0];
+    assert_exact_bitwise_parity_witness(&matrix, &expected_solution);
+}
+
+#[test]
+#[ignore = "manual exact parity witness while debugging the native-vs-rust mismatch"]
+fn rust_and_native_spral_minimized_path_plus_chord_tpp_cancellation_4x4() {
+    let matrix = vec![
+        vec![0.25, -0.375, -3.0, 0.0],
+        vec![-0.375, -1.0, -1.0, 0.0],
+        vec![-3.0, -1.0, -1.0, 0.5],
+        vec![0.0, 0.0, 0.5, -1.0],
+    ];
+    let expected_solution = vec![0.25, 2.0, 0.0, 0.0];
+    assert_exact_bitwise_parity_witness(&matrix, &expected_solution);
+}
+
+#[test]
+#[ignore = "manual exact parity witness while debugging the native-vs-rust mismatch"]
+fn rust_and_native_spral_minimized_path_plus_chord_tpp_fma_4x4() {
+    let matrix = vec![
+        vec![0.25, -0.75, 5.0, 0.0],
+        vec![-0.75, -2.0, 7.0, 0.0],
+        vec![5.0, 7.0, 0.0, -1.0],
+        vec![0.0, 0.0, -1.0, 0.0],
+    ];
+    let expected_solution = vec![-0.125, -3.0, -3.0, 0.0];
+    assert_exact_bitwise_parity_witness(&matrix, &expected_solution);
+}
+
+#[test]
+#[ignore = "manual exact parity witness while debugging the native-vs-rust mismatch"]
+fn rust_and_native_spral_minimized_path_plus_chord_tpp_opposite_product_fma_4x4() {
+    let matrix = vec![
+        vec![0.25, -0.75, 5.0, 0.0],
+        vec![-0.75, -2.0, 5.0, 0.0],
+        vec![5.0, 5.0, -1.0, -3.0],
+        vec![0.0, 0.0, -3.0, 0.0],
+    ];
+    let expected_solution = vec![0.0, 0.0, -1.0, 0.0];
+    assert_exact_bitwise_parity_witness(&matrix, &expected_solution);
+}
+
+#[test]
+#[ignore = "manual exact parity witness while debugging the native-vs-rust mismatch"]
+fn rust_and_native_spral_minimized_path_plus_chord_tpp_plain_4x4() {
+    let matrix = vec![
+        vec![-4.0, 4.0, 1.0, 0.0],
+        vec![4.0, -1.5, -0.75, 0.0],
+        vec![1.0, -0.75, 4.0, -1.0],
+        vec![0.0, 0.0, -1.0, 0.0],
+    ];
+    let expected_solution = vec![0.0, 0.0, 1.0, 0.0];
+    assert_exact_bitwise_parity_witness(&matrix, &expected_solution);
+}
+
+#[test]
+#[ignore = "manual exact parity witness while debugging the native-vs-rust mismatch"]
+fn rust_and_native_spral_minimized_path_plus_chord_tpp_same_product_plain_4x4() {
+    let matrix = vec![
+        vec![-0.5, 0.0625, -3.0, 0.0],
+        vec![0.0625, -3.0, -2.0, 0.0],
+        vec![-3.0, -2.0, -0.25, -1.0],
+        vec![0.0, 0.0, -1.0, 0.0],
+    ];
+    let expected_solution = vec![0.0, 0.0, -1.0, 0.0];
+    assert_exact_bitwise_parity_witness(&matrix, &expected_solution);
+}
+
+#[test]
+#[ignore = "manual exact parity witness while debugging the native-vs-rust mismatch"]
+fn rust_and_native_spral_minimized_path_plus_chord_tpp_same_product_fma_4x4() {
+    let matrix = vec![
+        vec![-3.0, 1.75, 2.0, 0.0],
+        vec![1.75, 0.0, -0.75, 0.0],
+        vec![2.0, -0.75, -3.0, 0.5],
+        vec![0.0, 0.0, 0.5, -0.25],
+    ];
+    let expected_solution = vec![0.0, -1.0, 0.0, 0.0];
+    assert_exact_bitwise_parity_witness(&matrix, &expected_solution);
+}
+
+#[test]
+#[ignore = "manual exact parity witness while debugging the native-vs-rust mismatch"]
 fn rust_and_native_spral_minimized_arrow_5x5() {
     let matrix = vec![
         vec![0.0, 1.0, -1.0, -5.0, -1.0],
@@ -365,5 +469,19 @@ fn rust_and_native_spral_minimized_arrow_5x5() {
         vec![-1.0, 0.0, 0.0, 0.0, 0.0],
     ];
     let expected_solution = vec![0.0, 0.0, 0.0, 0.0, 1.0];
+    assert_exact_bitwise_parity_witness(&matrix, &expected_solution);
+}
+
+#[test]
+#[ignore = "manual exact parity witness while debugging the native-vs-rust mismatch"]
+fn rust_and_native_spral_minimized_arrow_triangular_solve_5x5() {
+    let matrix = vec![
+        vec![-0.25, 2.0, -1.0, -2.0, 6.0],
+        vec![2.0, 1.0, 0.0, 0.0, 0.0],
+        vec![-1.0, 0.0, -1.0, 0.0, 0.0],
+        vec![-2.0, 0.0, 0.0, 0.5, 0.0],
+        vec![6.0, 0.0, 0.0, 0.0, 0.0],
+    ];
+    let expected_solution = vec![0.0, 0.0, 0.0, 0.0, -1.0];
     assert_exact_bitwise_parity_witness(&matrix, &expected_solution);
 }

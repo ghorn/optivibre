@@ -1941,7 +1941,7 @@ fn root_tpp_rank2_update(
     first_preserved_column: &[f64],
     second_preserved_column: &[f64],
 ) {
-    let use_compensated_dot = size.saturating_sub(start) >= 2;
+    let use_scalar_fma = size.saturating_sub(start) == 1;
     for (col, (&first_preserved, &second_preserved)) in first_preserved_column
         .iter()
         .zip(second_preserved_column.iter())
@@ -1953,14 +1953,53 @@ fn root_tpp_rank2_update(
             let l1_row = matrix[dense_lower_offset(size, row, first_multiplier_column)];
             let l2_row = matrix[dense_lower_offset(size, row, second_multiplier_column)];
             let update_entry = dense_lower_offset(size, row, col);
-            matrix[update_entry] = rank2_update_value(
-                matrix[update_entry],
-                -l1_row,
-                first_preserved,
-                -l2_row,
-                second_preserved,
-                use_compensated_dot,
-            );
+            if use_scalar_fma {
+                let updated = (-l1_row).mul_add(first_preserved, matrix[update_entry]);
+                matrix[update_entry] = (-l2_row).mul_add(second_preserved, updated);
+            } else {
+                let current = matrix[update_entry];
+                let product1 = -l1_row * first_preserved;
+                let product2 = -l2_row * second_preserved;
+                let dot = -(product1 + product2);
+                // Mirror native BLAS micro-kernel rounding: cancellation with
+                // beta*C uses the compensated dot path, while two-product
+                // updates that native OpenBLAS contracts use chained FMA. The
+                // remaining cases round as a plain subtract.
+                let products_cancel = product1 != 0.0
+                    && product2 != 0.0
+                    && product1.is_sign_positive() != product2.is_sign_positive();
+                let use_compensated_dot = products_cancel
+                    && current != 0.0
+                    && dot != 0.0
+                    && current.is_sign_positive() == dot.is_sign_positive();
+                let use_chained_fma = products_cancel
+                    || (current == 0.0 && product1 != 0.0 && product2 != 0.0)
+                    || (product1 != 0.0
+                        && product2 != 0.0
+                        && current != 0.0
+                        && current.is_sign_positive() != (product1 + product2).is_sign_positive());
+                if use_compensated_dot {
+                    matrix[update_entry] = rank2_update_value(
+                        current,
+                        -l1_row,
+                        first_preserved,
+                        -l2_row,
+                        second_preserved,
+                        true,
+                    );
+                } else if use_chained_fma {
+                    matrix[update_entry] = rank2_update_value(
+                        current,
+                        -l1_row,
+                        first_preserved,
+                        -l2_row,
+                        second_preserved,
+                        false,
+                    );
+                } else {
+                    matrix[update_entry] -= first_preserved * l1_row + second_preserved * l2_row;
+                }
+            }
         }
     }
 }

@@ -346,17 +346,44 @@ fn assert_local_spral_ipopt_provenance(summary: &optimization::IpoptSummary) {
     assert_local_spral_ipopt_environment(provenance);
 }
 
+const LOCAL_SPRAL_IPOPT_VERSION: &str = "3.14.20";
+const LOCAL_SPRAL_IPOPT_PREFIX: &str = "/Users/greg/local/ipopt-spral";
+
+fn local_spral_ipopt_environment_error(
+    provenance: &optimization::IpoptProvenance,
+) -> Option<String> {
+    match provenance.pkg_config_version.as_deref() {
+        Some(LOCAL_SPRAL_IPOPT_VERSION) => {}
+        Some(version) => {
+            return Some(format!(
+                "pkg-config ipopt version {version} does not match expected {LOCAL_SPRAL_IPOPT_VERSION}"
+            ));
+        }
+        None => return Some("pkg-config ipopt version is unavailable".to_string()),
+    }
+
+    let Some(flags) = provenance.pkg_config_cflags_libs.as_deref() else {
+        return Some("pkg-config ipopt cflags/libs are unavailable".to_string());
+    };
+    if !flags.contains(LOCAL_SPRAL_IPOPT_PREFIX) {
+        return Some(format!(
+            "pkg-config ipopt flags do not contain expected prefix {LOCAL_SPRAL_IPOPT_PREFIX}: {flags}"
+        ));
+    }
+
+    match provenance.linear_solver_default.as_deref() {
+        Some("spral") => None,
+        Some(default) => Some(format!(
+            "ipopt linear_solver default {default} does not match expected spral"
+        )),
+        None => Some("ipopt linear_solver default is unavailable".to_string()),
+    }
+}
+
 fn assert_local_spral_ipopt_environment(provenance: &optimization::IpoptProvenance) {
-    assert_eq!(provenance.pkg_config_version.as_deref(), Some("3.14.20"));
-    let flags = provenance
-        .pkg_config_cflags_libs
-        .as_deref()
-        .expect("expected pkg-config cflags/libs for local IPOPT");
-    assert!(
-        flags.contains("/Users/greg/local/ipopt-spral"),
-        "expected local SPRAL IPOPT flags, got {flags}"
-    );
-    assert_eq!(provenance.linear_solver_default.as_deref(), Some("spral"));
+    if let Some(error) = local_spral_ipopt_environment_error(provenance) {
+        panic!("unsupported local SPRAL IPOPT environment: {error}; provenance={provenance:?}");
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -583,9 +610,27 @@ fn native_spral_available() -> bool {
     }
 }
 
+fn local_spral_ipopt_environment_available() -> bool {
+    static AVAILABLE: OnceLock<Result<(), String>> = OnceLock::new();
+    match AVAILABLE.get_or_init(|| {
+        let provenance = optimization::capture_ipopt_provenance();
+        if let Some(error) = local_spral_ipopt_environment_error(&provenance) {
+            Err(format!("{error}; provenance={provenance:?}"))
+        } else {
+            Ok(())
+        }
+    }) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("skipping native SPRAL/IPOPT comparison: {error}");
+            false
+        }
+    }
+}
+
 macro_rules! skip_without_native_spral {
     () => {
-        if !native_spral_available() {
+        if !native_spral_available() || !local_spral_ipopt_environment_available() {
             return;
         }
     };
