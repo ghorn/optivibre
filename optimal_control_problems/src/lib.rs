@@ -124,30 +124,40 @@ pub fn compile_variant_for_problem(
     values: &BTreeMap<String, f64>,
 ) -> Option<(String, String)> {
     let spec = problem_specs().into_iter().find(|spec| spec.id == id)?;
-    let method = spec
-        .controls
-        .iter()
-        .find(|control| control.semantic == ControlSemantic::TranscriptionMethod)
-        .map(|control| values.get(&control.id).copied().unwrap_or(control.default))
-        .unwrap_or(0.0);
+    let control_value = |semantic: ControlSemantic, fallback: f64| {
+        spec.controls
+            .iter()
+            .find(|control| control.semantic == semantic)
+            .map(|control| values.get(&control.id).copied().unwrap_or(control.default))
+            .unwrap_or(fallback)
+    };
+    let method = control_value(ControlSemantic::TranscriptionMethod, 0.0);
+    let intervals = control_value(ControlSemantic::TranscriptionIntervals, 0.0)
+        .round()
+        .max(0.0) as usize;
     let sx_functions =
         ocp_sx_function_config_from_map_lossy(values, OcpSxFunctionConfig::default());
     let (variant_id, variant_label) = if method.round() as i32 == 0 {
-        multiple_shooting_variant_with_sx(common::multiple_shooting_compile_key(0, sx_functions))
+        multiple_shooting_variant_with_sx(common::multiple_shooting_compile_key(
+            intervals,
+            sx_functions,
+        ))
     } else {
-        let family = spec
-            .controls
-            .iter()
-            .find(|control| control.semantic == ControlSemantic::CollocationFamily)
-            .map(|control| values.get(&control.id).copied().unwrap_or(control.default))
-            .unwrap_or(0.0);
+        let family = control_value(ControlSemantic::CollocationFamily, 0.0);
+        let order = control_value(ControlSemantic::CollocationDegree, 0.0)
+            .round()
+            .max(0.0) as usize;
         if family.round() as i32 == 1 {
             direct_collocation_variant_with_sx(common::DirectCollocationCompileVariantKey {
+                intervals,
+                order,
                 family: DirectCollocationCompileKey::RadauIia,
                 sx_functions,
             })
         } else {
             direct_collocation_variant_with_sx(common::DirectCollocationCompileVariantKey {
+                intervals,
+                order,
                 family: DirectCollocationCompileKey::Legendre,
                 sx_functions,
             })
@@ -180,4 +190,53 @@ pub(crate) fn benchmark_problem_case_with_progress(
         eval_options,
         on_progress,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compile_variant_includes_multiple_shooting_interval_count() {
+        let mut values = BTreeMap::new();
+        values.insert("transcription_method".to_string(), 0.0);
+        values.insert("transcription_intervals".to_string(), 20.0);
+        let (variant_20, label_20) =
+            compile_variant_for_problem(ProblemId::LinearSManeuver, &values)
+                .expect("variant should exist");
+
+        values.insert("transcription_intervals".to_string(), 40.0);
+        let (variant_40, label_40) =
+            compile_variant_for_problem(ProblemId::LinearSManeuver, &values)
+                .expect("variant should exist");
+
+        assert_ne!(variant_20, variant_40);
+        assert!(variant_20.contains("__n20"));
+        assert!(variant_40.contains("__n40"));
+        assert!(label_20.contains("20 intervals"));
+        assert!(label_40.contains("40 intervals"));
+    }
+
+    #[test]
+    fn compile_variant_includes_direct_collocation_interval_and_order() {
+        let mut values = BTreeMap::new();
+        values.insert("transcription_method".to_string(), 1.0);
+        values.insert("transcription_intervals".to_string(), 20.0);
+        values.insert("collocation_degree".to_string(), 2.0);
+        let (variant_k2, label_k2) =
+            compile_variant_for_problem(ProblemId::LinearSManeuver, &values)
+                .expect("variant should exist");
+
+        values.insert("collocation_degree".to_string(), 4.0);
+        let (variant_k4, label_k4) =
+            compile_variant_for_problem(ProblemId::LinearSManeuver, &values)
+                .expect("variant should exist");
+
+        assert_ne!(variant_k2, variant_k4);
+        assert!(variant_k2.contains("__n20_k2"));
+        assert!(variant_k4.contains("__n20_k4"));
+        assert!(label_k2.contains("20 intervals"));
+        assert!(label_k2.contains("2 nodes"));
+        assert!(label_k4.contains("4 nodes"));
+    }
 }

@@ -2002,6 +2002,8 @@ pub struct MultipleShootingCompileKey {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DirectCollocationCompileVariantKey {
+    pub intervals: usize,
+    pub order: usize,
     pub family: DirectCollocationCompileKey,
     pub sx_functions: OcpSxFunctionConfig,
 }
@@ -2017,10 +2019,14 @@ pub const fn multiple_shooting_compile_key(
 }
 
 pub fn direct_collocation_compile_key_with_sx(
+    intervals: usize,
+    order: usize,
     family: CollocationFamily,
     sx_functions: OcpSxFunctionConfig,
 ) -> DirectCollocationCompileVariantKey {
     DirectCollocationCompileVariantKey {
+        intervals,
+        order,
         family: direct_collocation_compile_key(family),
         sx_functions,
     }
@@ -2994,7 +3000,9 @@ pub fn multiple_shooting_variant() -> (&'static str, &'static str) {
 
 pub fn multiple_shooting_variant_with_sx(key: MultipleShootingCompileKey) -> (String, String) {
     let (base_id, base_label) = multiple_shooting_variant();
-    with_sx_variant_suffix(base_id, base_label, key.sx_functions)
+    let (base_id, base_label) =
+        with_transcription_size_suffix(base_id, base_label, key.intervals, None);
+    with_sx_variant_suffix(&base_id, &base_label, key.sx_functions)
 }
 
 pub fn direct_collocation_compile_key(family: CollocationFamily) -> DirectCollocationCompileKey {
@@ -3023,7 +3031,24 @@ pub fn direct_collocation_variant_with_sx(
     key: DirectCollocationCompileVariantKey,
 ) -> (String, String) {
     let (base_id, base_label) = direct_collocation_variant(key.family);
-    with_sx_variant_suffix(base_id, base_label, key.sx_functions)
+    let (base_id, base_label) =
+        with_transcription_size_suffix(base_id, base_label, key.intervals, Some(key.order));
+    with_sx_variant_suffix(&base_id, &base_label, key.sx_functions)
+}
+
+fn with_transcription_size_suffix(
+    base_id: &str,
+    base_label: &str,
+    intervals: usize,
+    collocation_order: Option<usize>,
+) -> (String, String) {
+    let mut variant_id = format!("{base_id}__n{intervals}");
+    let mut variant_label = format!("{base_label} · {intervals} intervals");
+    if let Some(order) = collocation_order {
+        variant_id = format!("{variant_id}_k{order}");
+        variant_label = format!("{variant_label} · {order} nodes");
+    }
+    (variant_id, variant_label)
 }
 
 fn with_sx_variant_suffix(
@@ -3410,6 +3435,8 @@ where
 
 pub fn cached_direct_collocation_ocp_compile<Compiled, Build, E>(
     cache: &mut SharedCompileCache<DirectCollocationCompileVariantKey, Compiled>,
+    intervals: usize,
+    order: usize,
     family: CollocationFamily,
     sx_functions: OcpSxFunctionConfig,
     build: Build,
@@ -3419,7 +3446,7 @@ where
     E: Into<anyhow::Error>,
 {
     cache.get_or_try_init(
-        direct_collocation_compile_key_with_sx(family, sx_functions),
+        direct_collocation_compile_key_with_sx(intervals, order, family, sx_functions),
         || {
             build(ocp_compile_options(
                 interactive_direct_collocation_opt_level(),
@@ -3466,6 +3493,8 @@ where
 
 pub fn cached_direct_collocation_ocp_compile_with_progress<Compiled, Build, Summary, E>(
     cache: &mut SharedCompileCache<DirectCollocationCompileVariantKey, Compiled>,
+    intervals: usize,
+    order: usize,
     family: CollocationFamily,
     sx_functions: OcpSxFunctionConfig,
     on_symbolic_ready: &mut dyn FnMut(CompileProgressUpdate),
@@ -3482,7 +3511,7 @@ where
 {
     cached_compile_with_progress(
         cache,
-        direct_collocation_compile_key_with_sx(family, sx_functions),
+        direct_collocation_compile_key_with_sx(intervals, order, family, sx_functions),
         on_symbolic_ready,
         |on_compile_progress| {
             let mut progress_state = OcpCompileProgressState::default();
@@ -3993,7 +4022,7 @@ pub fn transcription_controls(
             "Intervals",
             default.intervals as f64,
             "",
-            "Number of mesh intervals. The current build exposes the compiled interval count only.",
+            "Number of mesh intervals. Changing this compiles a matching transcription variant on demand.",
             &supported_intervals
                 .iter()
                 .map(|value| (*value as f64, value.to_string()))
@@ -4035,7 +4064,7 @@ pub fn transcription_controls(
             "Collocation Nodes",
             default.collocation_degree as f64,
             "",
-            "Number of collocation nodes per interval when direct collocation is selected. The current build exposes the compiled degree only.",
+            "Number of collocation nodes per interval when direct collocation is selected.",
             &supported_degrees
                 .iter()
                 .map(|value| (*value as f64, value.to_string()))

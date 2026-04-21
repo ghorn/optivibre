@@ -26,8 +26,8 @@ use sx_core::SX;
 const RK4_SUBSTEPS: usize = 2;
 const DEFAULT_INTERVALS: usize = 50;
 const DEFAULT_COLLOCATION_DEGREE: usize = 3;
-const SUPPORTED_INTERVALS: [usize; 1] = [DEFAULT_INTERVALS];
-const SUPPORTED_DEGREES: [usize; 1] = [DEFAULT_COLLOCATION_DEGREE];
+const SUPPORTED_INTERVALS: [usize; 7] = [10, 20, 30, 40, DEFAULT_INTERVALS, 60, 80];
+const SUPPORTED_DEGREES: [usize; 5] = [1, 2, DEFAULT_COLLOCATION_DEGREE, 4, 5];
 const ASPECT_RATIO: f64 = 10.0;
 const EFFICIENCY: f64 = 0.95;
 const CL_SLOPE: f64 = 2.0 * PI * ASPECT_RATIO / 12.0;
@@ -518,14 +518,15 @@ fn model<Scheme>(
 }
 
 fn cached_multiple_shooting(params: &Params) -> Result<crate::common::CachedCompile<MsCompiled>> {
+    let intervals = params.transcription.intervals;
     MULTIPLE_SHOOTING_CACHE.with(|cache| {
         crate::common::cached_multiple_shooting_ocp_compile(
             &mut cache.borrow_mut(),
-            DEFAULT_INTERVALS,
+            intervals,
             params.sx_functions,
             |options| {
                 model(MultipleShooting {
-                    intervals: DEFAULT_INTERVALS,
+                    intervals,
                     rk4_substeps: RK4_SUBSTEPS,
                 })
                 .compile_jit_with_ocp_options(options)
@@ -538,15 +539,19 @@ fn cached_direct_collocation(
     params: &Params,
     family: optimal_control::CollocationFamily,
 ) -> Result<crate::common::CachedCompile<DcCompiled>> {
+    let intervals = params.transcription.intervals;
+    let order = params.transcription.collocation_degree;
     DIRECT_COLLOCATION_CACHE.with(|cache| {
         crate::common::cached_direct_collocation_ocp_compile(
             &mut cache.borrow_mut(),
+            intervals,
+            order,
             family,
             params.sx_functions,
             |options| {
                 model(DirectCollocation {
-                    intervals: DEFAULT_INTERVALS,
-                    order: DEFAULT_COLLOCATION_DEGREE,
+                    intervals,
+                    order,
                     family,
                 })
                 .compile_jit_with_ocp_options(options)
@@ -562,15 +567,16 @@ fn compile_multiple_shooting_with_progress(
     std::rc::Rc<std::cell::RefCell<MsCompiled>>,
     CompileProgressInfo,
 )> {
+    let intervals = params.transcription.intervals;
     MULTIPLE_SHOOTING_CACHE.with(|cache| {
         crate::common::cached_multiple_shooting_ocp_compile_with_progress(
             &mut cache.borrow_mut(),
-            DEFAULT_INTERVALS,
+            intervals,
             params.sx_functions,
             callback,
             |options, on_progress| {
                 model(MultipleShooting {
-                    intervals: DEFAULT_INTERVALS,
+                    intervals,
                     rk4_substeps: RK4_SUBSTEPS,
                 })
                 .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
@@ -588,16 +594,20 @@ fn compile_direct_collocation_with_progress(
     std::rc::Rc<std::cell::RefCell<DcCompiled>>,
     CompileProgressInfo,
 )> {
+    let intervals = params.transcription.intervals;
+    let order = params.transcription.collocation_degree;
     DIRECT_COLLOCATION_CACHE.with(|cache| {
         crate::common::cached_direct_collocation_ocp_compile_with_progress(
             &mut cache.borrow_mut(),
+            intervals,
+            order,
             family,
             params.sx_functions,
             callback,
             |options, on_progress| {
                 model(DirectCollocation {
-                    intervals: DEFAULT_INTERVALS,
-                    order: DEFAULT_COLLOCATION_DEGREE,
+                    intervals,
+                    order,
                     family,
                 })
                 .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
