@@ -32,10 +32,11 @@ pub use common::{
     ProblemDerivativeCheck, ProblemId, ProblemSpec, Scene2D, SceneAnimation, SceneArrow,
     SceneCircle, SceneFrame, ScenePath, SolveArtifact, SolveLogLevel, SolvePhase, SolveProgress,
     SolveRequest, SolveStage, SolveStatus, SolveStreamEvent, SolverMethod, SolverReport,
-    SolverStatusKind, TimeSeries, TimeSeriesRole, TranscriptionConfig, TranscriptionMethod,
-    direct_collocation_variant, direct_collocation_variant_with_sx, find_metric, metric,
-    metric_with_key, multiple_shooting_variant, multiple_shooting_variant_with_sx,
-    numeric_metric_with_key, ocp_sx_function_config_from_map_lossy,
+    SolverStatusKind, TimeGrid, TimeSeries, TimeSeriesRole, TranscriptionConfig,
+    TranscriptionMethod, direct_collocation_variant, direct_collocation_variant_with_sx,
+    find_metric, metric, metric_with_key, multiple_shooting_variant,
+    multiple_shooting_variant_with_sx, numeric_metric_with_key,
+    ocp_sx_function_config_from_map_lossy, time_grid_from_map_lossy,
 };
 
 pub(crate) struct ProblemEntry {
@@ -141,14 +142,18 @@ pub fn compile_variant_for_problem(
             .find(|control| control.semantic == ControlSemantic::CollocationFamily)
             .map(|control| values.get(&control.id).copied().unwrap_or(control.default))
             .unwrap_or(0.0);
+        let time_grid =
+            common::time_grid_compile_key(time_grid_from_map_lossy(values, TimeGrid::default()));
         if family.round() as i32 == 1 {
             direct_collocation_variant_with_sx(common::DirectCollocationCompileVariantKey {
                 family: DirectCollocationCompileKey::RadauIia,
+                time_grid,
                 sx_functions,
             })
         } else {
             direct_collocation_variant_with_sx(common::DirectCollocationCompileVariantKey {
                 family: DirectCollocationCompileKey::Legendre,
+                time_grid,
                 sx_functions,
             })
         }

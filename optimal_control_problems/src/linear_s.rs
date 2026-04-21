@@ -424,12 +424,14 @@ fn cached_direct_collocation(
         crate::common::cached_direct_collocation_ocp_compile(
             &mut cache.borrow_mut(),
             family,
+            params.transcription.time_grid,
             params.sx_functions,
             |options| {
                 model(DirectCollocation {
                     intervals: DEFAULT_INTERVALS,
                     order: DEFAULT_COLLOCATION_DEGREE,
                     family,
+                    time_grid: params.transcription.time_grid,
                 })
                 .compile_jit_with_ocp_options(options)
             },
@@ -474,6 +476,7 @@ fn compile_direct_collocation_with_progress(
         crate::common::cached_direct_collocation_ocp_compile_with_progress(
             &mut cache.borrow_mut(),
             family,
+            params.transcription.time_grid,
             params.sx_functions,
             callback,
             |options, on_progress| {
@@ -481,6 +484,7 @@ fn compile_direct_collocation_with_progress(
                     intervals: DEFAULT_INTERVALS,
                     order: DEFAULT_COLLOCATION_DEGREE,
                     family,
+                    time_grid: params.transcription.time_grid,
                 })
                 .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
             },
@@ -552,6 +556,7 @@ pub(crate) fn benchmark_default_case_with_progress(
                 intervals: DEFAULT_INTERVALS,
                 order: DEFAULT_COLLOCATION_DEGREE,
                 family,
+                time_grid: Default::default(),
             })
             .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
         },
@@ -1203,6 +1208,7 @@ mod tests {
             intervals: DEFAULT_INTERVALS,
             order: DEFAULT_COLLOCATION_DEGREE,
             family,
+            time_grid: Default::default(),
         });
         let started = std::time::Instant::now();
         let compiled = ocp

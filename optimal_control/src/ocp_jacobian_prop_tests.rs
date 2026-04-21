@@ -418,6 +418,7 @@ fn generated_dc_ocp(
             intervals: DC_INTERVALS,
             order: DC_COLLOCATION_ROOTS,
             family: CollocationFamily::RadauIIA,
+            time_grid: Default::default(),
         },
     )
     .objective_lagrange(

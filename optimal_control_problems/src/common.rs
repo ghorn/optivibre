@@ -80,6 +80,12 @@ pub enum ControlSemantic {
     TranscriptionIntervals,
     CollocationFamily,
     CollocationDegree,
+    TimeGrid,
+    TimeGridStrength,
+    TimeGridFocusCenter,
+    TimeGridFocusWidth,
+    TimeGridBreakpoint,
+    TimeGridFirstIntervalFraction,
     SolverMethod,
     SolverGlobalization,
     SolverMaxIterations,
@@ -232,6 +238,30 @@ pub enum DirectCollocationCompileKey {
     RadauIia,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TimeGridCompileKey {
+    Uniform,
+    Cosine {
+        strength_bits: u64,
+    },
+    Tanh {
+        strength_bits: u64,
+    },
+    Geometric {
+        strength_bits: u64,
+        bias: ocp_runtime::TimeGridBias,
+    },
+    Focus {
+        center_bits: u64,
+        width_bits: u64,
+        strength_bits: u64,
+    },
+    Piecewise {
+        breakpoint_bits: u64,
+        first_interval_fraction_bits: u64,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MetricKey {
@@ -240,6 +270,7 @@ pub enum MetricKey {
     TranscriptionMethod,
     IntervalCount,
     CollocationNodeCount,
+    TimeGrid,
     Termination,
     Distance,
     FinalTime,
@@ -1737,12 +1768,13 @@ pub enum TranscriptionMethod {
     DirectCollocation,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TranscriptionConfig {
     pub method: TranscriptionMethod,
     pub intervals: usize,
     pub collocation_degree: usize,
     pub collocation_family: CollocationFamily,
+    pub time_grid: ocp_runtime::TimeGrid,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -2003,6 +2035,7 @@ pub struct MultipleShootingCompileKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DirectCollocationCompileVariantKey {
     pub family: DirectCollocationCompileKey,
+    pub time_grid: TimeGridCompileKey,
     pub sx_functions: OcpSxFunctionConfig,
 }
 
@@ -2018,10 +2051,12 @@ pub const fn multiple_shooting_compile_key(
 
 pub fn direct_collocation_compile_key_with_sx(
     family: CollocationFamily,
+    time_grid: ocp_runtime::TimeGrid,
     sx_functions: OcpSxFunctionConfig,
 ) -> DirectCollocationCompileVariantKey {
     DirectCollocationCompileVariantKey {
         family: direct_collocation_compile_key(family),
+        time_grid: time_grid_compile_key(time_grid),
         sx_functions,
     }
 }
@@ -2084,6 +2119,12 @@ enum SharedControlId {
     TranscriptionIntervals,
     CollocationFamily,
     CollocationDegree,
+    TimeGrid,
+    TimeGridStrength,
+    TimeGridFocusCenter,
+    TimeGridFocusWidth,
+    TimeGridBreakpoint,
+    TimeGridFirstIntervalFraction,
     SxFunctionGlobalCallPolicy,
     SxFunctionOverrideBehavior,
     SxFunctionHessianStrategy,
@@ -2139,6 +2180,12 @@ impl SharedControlId {
             Self::TranscriptionIntervals => "transcription_intervals",
             Self::CollocationFamily => "collocation_family",
             Self::CollocationDegree => "collocation_degree",
+            Self::TimeGrid => "time_grid",
+            Self::TimeGridStrength => "time_grid_strength",
+            Self::TimeGridFocusCenter => "time_grid_focus_center",
+            Self::TimeGridFocusWidth => "time_grid_focus_width",
+            Self::TimeGridBreakpoint => "time_grid_breakpoint",
+            Self::TimeGridFirstIntervalFraction => "time_grid_first_interval_fraction",
             Self::SxFunctionGlobalCallPolicy => "sxf_global_call_policy",
             Self::SxFunctionOverrideBehavior => "sxf_override_behavior",
             Self::SxFunctionHessianStrategy => "sxf_hessian_strategy",
@@ -2208,6 +2255,8 @@ pub type DirectCollocationRuntimeValues<P, C, Beq, Bineq, X, U> =
     ocp_runtime::DirectCollocationRuntimeValues<P, C, Beq, Bineq, X, U>;
 pub type MultipleShootingTrajectories<X, U> = ocp_runtime::MultipleShootingTrajectories<X, U>;
 pub type DirectCollocationTrajectories<X, U> = ocp_runtime::DirectCollocationTrajectories<X, U>;
+pub type TimeGrid = ocp_runtime::TimeGrid;
+pub type TimeGridBias = ocp_runtime::TimeGridBias;
 pub type DirectCollocationTimeGrid = ocp_runtime::DirectCollocationTimeGrid;
 pub type MultipleShootingSqpSnapshot<X, U> = ocp_runtime::MultipleShootingSqpSnapshot<X, U>;
 pub type DirectCollocationSqpSnapshot<X, U> = ocp_runtime::DirectCollocationSqpSnapshot<X, U>;
@@ -3004,6 +3053,38 @@ pub fn direct_collocation_compile_key(family: CollocationFamily) -> DirectColloc
     }
 }
 
+pub fn time_grid_compile_key(time_grid: TimeGrid) -> TimeGridCompileKey {
+    match time_grid {
+        TimeGrid::Uniform => TimeGridCompileKey::Uniform,
+        TimeGrid::Cosine { strength } => TimeGridCompileKey::Cosine {
+            strength_bits: strength.to_bits(),
+        },
+        TimeGrid::Tanh { strength } => TimeGridCompileKey::Tanh {
+            strength_bits: strength.to_bits(),
+        },
+        TimeGrid::Geometric { strength, bias } => TimeGridCompileKey::Geometric {
+            strength_bits: strength.to_bits(),
+            bias,
+        },
+        TimeGrid::Focus {
+            center,
+            width,
+            strength,
+        } => TimeGridCompileKey::Focus {
+            center_bits: center.to_bits(),
+            width_bits: width.to_bits(),
+            strength_bits: strength.to_bits(),
+        },
+        TimeGrid::Piecewise {
+            breakpoint,
+            first_interval_fraction,
+        } => TimeGridCompileKey::Piecewise {
+            breakpoint_bits: breakpoint.to_bits(),
+            first_interval_fraction_bits: first_interval_fraction.to_bits(),
+        },
+    }
+}
+
 pub fn direct_collocation_variant(
     key: DirectCollocationCompileKey,
 ) -> (&'static str, &'static str) {
@@ -3023,7 +3104,84 @@ pub fn direct_collocation_variant_with_sx(
     key: DirectCollocationCompileVariantKey,
 ) -> (String, String) {
     let (base_id, base_label) = direct_collocation_variant(key.family);
-    with_sx_variant_suffix(base_id, base_label, key.sx_functions)
+    let (grid_id, grid_label) = time_grid_variant_suffix(key.time_grid);
+    let variant_id = if let Some(grid_id) = grid_id {
+        format!("{base_id}__{grid_id}")
+    } else {
+        base_id.to_string()
+    };
+    let variant_label = if let Some(grid_label) = grid_label {
+        format!("{base_label} · {grid_label}")
+    } else {
+        base_label.to_string()
+    };
+    with_sx_variant_suffix(&variant_id, &variant_label, key.sx_functions)
+}
+
+fn time_grid_variant_suffix(key: TimeGridCompileKey) -> (Option<String>, Option<String>) {
+    match key {
+        TimeGridCompileKey::Uniform => (None, None),
+        TimeGridCompileKey::Cosine { strength_bits } => {
+            let strength = f64::from_bits(strength_bits);
+            (
+                Some(format!("cosine_{strength_bits:016x}")),
+                Some(format!("Cosine Grid s={strength:.2}")),
+            )
+        }
+        TimeGridCompileKey::Tanh { strength_bits } => {
+            let strength = f64::from_bits(strength_bits);
+            (
+                Some(format!("tanh_{strength_bits:016x}")),
+                Some(format!("Tanh Grid s={strength:.2}")),
+            )
+        }
+        TimeGridCompileKey::Geometric {
+            strength_bits,
+            bias,
+        } => {
+            let strength = f64::from_bits(strength_bits);
+            let (bias_id, bias_label) = match bias {
+                TimeGridBias::Start => ("start", "Start"),
+                TimeGridBias::End => ("end", "End"),
+            };
+            (
+                Some(format!("geometric_{bias_id}_{strength_bits:016x}")),
+                Some(format!("Geometric {bias_label} Grid s={strength:.2}")),
+            )
+        }
+        TimeGridCompileKey::Focus {
+            center_bits,
+            width_bits,
+            strength_bits,
+        } => {
+            let center = f64::from_bits(center_bits);
+            let width = f64::from_bits(width_bits);
+            let strength = f64::from_bits(strength_bits);
+            (
+                Some(format!(
+                    "focus_{center_bits:016x}_{width_bits:016x}_{strength_bits:016x}"
+                )),
+                Some(format!(
+                    "Focus Grid c={center:.2} w={width:.2} s={strength:.2}"
+                )),
+            )
+        }
+        TimeGridCompileKey::Piecewise {
+            breakpoint_bits,
+            first_interval_fraction_bits,
+        } => {
+            let breakpoint = f64::from_bits(breakpoint_bits);
+            let first_interval_fraction = f64::from_bits(first_interval_fraction_bits);
+            (
+                Some(format!(
+                    "piecewise_{breakpoint_bits:016x}_{first_interval_fraction_bits:016x}"
+                )),
+                Some(format!(
+                    "Piecewise Grid b={breakpoint:.2} n1={first_interval_fraction:.2}"
+                )),
+            )
+        }
+    }
 }
 
 fn with_sx_variant_suffix(
@@ -3411,6 +3569,7 @@ where
 pub fn cached_direct_collocation_ocp_compile<Compiled, Build, E>(
     cache: &mut SharedCompileCache<DirectCollocationCompileVariantKey, Compiled>,
     family: CollocationFamily,
+    time_grid: TimeGrid,
     sx_functions: OcpSxFunctionConfig,
     build: Build,
 ) -> Result<CachedCompile<Compiled>>
@@ -3419,7 +3578,7 @@ where
     E: Into<anyhow::Error>,
 {
     cache.get_or_try_init(
-        direct_collocation_compile_key_with_sx(family, sx_functions),
+        direct_collocation_compile_key_with_sx(family, time_grid, sx_functions),
         || {
             build(ocp_compile_options(
                 interactive_direct_collocation_opt_level(),
@@ -3467,6 +3626,7 @@ where
 pub fn cached_direct_collocation_ocp_compile_with_progress<Compiled, Build, Summary, E>(
     cache: &mut SharedCompileCache<DirectCollocationCompileVariantKey, Compiled>,
     family: CollocationFamily,
+    time_grid: TimeGrid,
     sx_functions: OcpSxFunctionConfig,
     on_symbolic_ready: &mut dyn FnMut(CompileProgressUpdate),
     build: Build,
@@ -3482,7 +3642,7 @@ where
 {
     cached_compile_with_progress(
         cache,
-        direct_collocation_compile_key_with_sx(family, sx_functions),
+        direct_collocation_compile_key_with_sx(family, time_grid, sx_functions),
         on_symbolic_ready,
         |on_compile_progress| {
             let mut progress_state = OcpCompileProgressState::default();
@@ -3534,6 +3694,7 @@ pub fn default_transcription(intervals: usize) -> TranscriptionConfig {
         intervals,
         collocation_degree: 3,
         collocation_family: CollocationFamily::GaussLegendre,
+        time_grid: TimeGrid::Uniform,
     }
 }
 
@@ -3982,6 +4143,106 @@ fn ocp_sx_function_controls(default: OcpSxFunctionConfig) -> Vec<ControlSpec> {
     ]
 }
 
+fn time_grid_choices() -> Vec<(f64, &'static str)> {
+    vec![
+        (0.0, "Uniform"),
+        (1.0, "Cosine"),
+        (2.0, "Tanh"),
+        (3.0, "Geometric Start"),
+        (4.0, "Geometric End"),
+        (5.0, "Focus"),
+        (6.0, "Piecewise"),
+    ]
+}
+
+fn time_grid_choice_value(time_grid: TimeGrid) -> f64 {
+    match time_grid {
+        TimeGrid::Uniform => 0.0,
+        TimeGrid::Cosine { .. } => 1.0,
+        TimeGrid::Tanh { .. } => 2.0,
+        TimeGrid::Geometric {
+            bias: TimeGridBias::Start,
+            ..
+        } => 3.0,
+        TimeGrid::Geometric {
+            bias: TimeGridBias::End,
+            ..
+        } => 4.0,
+        TimeGrid::Focus { .. } => 5.0,
+        TimeGrid::Piecewise { .. } => 6.0,
+    }
+}
+
+fn time_grid_strength_value(time_grid: TimeGrid) -> f64 {
+    match time_grid {
+        TimeGrid::Cosine { strength }
+        | TimeGrid::Tanh { strength }
+        | TimeGrid::Geometric { strength, .. }
+        | TimeGrid::Focus { strength, .. } => strength,
+        TimeGrid::Uniform | TimeGrid::Piecewise { .. } => 1.0,
+    }
+}
+
+fn time_grid_focus_center_value(time_grid: TimeGrid) -> f64 {
+    match time_grid {
+        TimeGrid::Focus { center, .. } => center,
+        _ => 0.5,
+    }
+}
+
+fn time_grid_focus_width_value(time_grid: TimeGrid) -> f64 {
+    match time_grid {
+        TimeGrid::Focus { width, .. } => width,
+        _ => 0.15,
+    }
+}
+
+fn time_grid_breakpoint_value(time_grid: TimeGrid) -> f64 {
+    match time_grid {
+        TimeGrid::Piecewise { breakpoint, .. } => breakpoint,
+        _ => 0.5,
+    }
+}
+
+fn time_grid_first_interval_fraction_value(time_grid: TimeGrid) -> f64 {
+    match time_grid {
+        TimeGrid::Piecewise {
+            first_interval_fraction,
+            ..
+        } => first_interval_fraction,
+        _ => 0.5,
+    }
+}
+
+fn time_grid_slider_control(
+    id: SharedControlId,
+    label: &str,
+    min: f64,
+    max: f64,
+    step: f64,
+    default: f64,
+    help: &str,
+    semantic: ControlSemantic,
+) -> ControlSpec {
+    ControlSpec {
+        id: id.id().to_string(),
+        label: label.to_string(),
+        min,
+        max,
+        step,
+        default,
+        unit: "".to_string(),
+        help: help.to_string(),
+        section: ControlSection::Transcription,
+        panel: None,
+        editor: ControlEditor::Slider,
+        visibility: ControlVisibility::DirectCollocationOnly,
+        semantic,
+        value_display: ControlValueDisplay::Scalar,
+        choices: Vec::new(),
+    }
+}
+
 pub fn transcription_controls(
     default: TranscriptionConfig,
     supported_intervals: &[usize],
@@ -4043,6 +4304,67 @@ pub fn transcription_controls(
             ControlSection::Transcription,
             ControlVisibility::DirectCollocationOnly,
             ControlSemantic::CollocationDegree,
+        ),
+        select_control(
+            SharedControlId::TimeGrid.id(),
+            "Time Grid",
+            time_grid_choice_value(default.time_grid),
+            "",
+            "Distribution of mesh interval lengths for direct collocation.",
+            &time_grid_choices(),
+            ControlSection::Transcription,
+            ControlVisibility::DirectCollocationOnly,
+            ControlSemantic::TimeGrid,
+        ),
+        time_grid_slider_control(
+            SharedControlId::TimeGridStrength,
+            "Grid Strength",
+            0.0,
+            1.0,
+            0.05,
+            time_grid_strength_value(default.time_grid),
+            "Blend from uniform spacing at 0 to the selected warped spacing at 1.",
+            ControlSemantic::TimeGridStrength,
+        ),
+        time_grid_slider_control(
+            SharedControlId::TimeGridFocusCenter,
+            "Focus Center",
+            0.0,
+            1.0,
+            0.05,
+            time_grid_focus_center_value(default.time_grid),
+            "Normalized location where focus gridding uses the shortest intervals.",
+            ControlSemantic::TimeGridFocusCenter,
+        ),
+        time_grid_slider_control(
+            SharedControlId::TimeGridFocusWidth,
+            "Focus Width",
+            0.01,
+            1.0,
+            0.01,
+            time_grid_focus_width_value(default.time_grid),
+            "Normalized spread of the focus gridding region.",
+            ControlSemantic::TimeGridFocusWidth,
+        ),
+        time_grid_slider_control(
+            SharedControlId::TimeGridBreakpoint,
+            "Phase Break",
+            0.05,
+            0.95,
+            0.05,
+            time_grid_breakpoint_value(default.time_grid),
+            "Normalized time reached at the piecewise grid transition.",
+            ControlSemantic::TimeGridBreakpoint,
+        ),
+        time_grid_slider_control(
+            SharedControlId::TimeGridFirstIntervalFraction,
+            "Phase Interval Share",
+            0.05,
+            0.95,
+            0.05,
+            time_grid_first_interval_fraction_value(default.time_grid),
+            "Fraction of mesh intervals assigned before the piecewise grid transition.",
+            ControlSemantic::TimeGridFirstIntervalFraction,
         ),
     ];
     controls.extend(ocp_sx_function_controls(OcpSxFunctionConfig::default()));
@@ -5138,12 +5460,146 @@ pub fn transcription_from_map(
         ));
     }
 
+    let time_grid_choice = parse_enum_choice(
+        sample_shared_or_default(
+            values,
+            SharedControlId::TimeGrid,
+            time_grid_choice_value(default.time_grid),
+        ),
+        SharedControlId::TimeGrid,
+        &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+    )?;
+    let time_grid_strength = expect_unit_interval_finite(
+        sample_shared_or_default(
+            values,
+            SharedControlId::TimeGridStrength,
+            time_grid_strength_value(default.time_grid),
+        ),
+        SharedControlId::TimeGridStrength.id(),
+    )?;
+    let time_grid_focus_center = expect_unit_interval_finite(
+        sample_shared_or_default(
+            values,
+            SharedControlId::TimeGridFocusCenter,
+            time_grid_focus_center_value(default.time_grid),
+        ),
+        SharedControlId::TimeGridFocusCenter.id(),
+    )?;
+    let time_grid_focus_width = expect_open_unit_interval_finite(
+        sample_shared_or_default(
+            values,
+            SharedControlId::TimeGridFocusWidth,
+            time_grid_focus_width_value(default.time_grid),
+        ),
+        SharedControlId::TimeGridFocusWidth.id(),
+    )?;
+    let time_grid_breakpoint = expect_open_unit_interval_finite(
+        sample_shared_or_default(
+            values,
+            SharedControlId::TimeGridBreakpoint,
+            time_grid_breakpoint_value(default.time_grid),
+        ),
+        SharedControlId::TimeGridBreakpoint.id(),
+    )?;
+    let time_grid_first_interval_fraction = expect_open_unit_interval_finite(
+        sample_shared_or_default(
+            values,
+            SharedControlId::TimeGridFirstIntervalFraction,
+            time_grid_first_interval_fraction_value(default.time_grid),
+        ),
+        SharedControlId::TimeGridFirstIntervalFraction.id(),
+    )?;
+    let time_grid = match time_grid_choice {
+        0 => TimeGrid::Uniform,
+        1 => TimeGrid::Cosine {
+            strength: time_grid_strength,
+        },
+        2 => TimeGrid::Tanh {
+            strength: time_grid_strength,
+        },
+        3 => TimeGrid::Geometric {
+            strength: time_grid_strength,
+            bias: TimeGridBias::Start,
+        },
+        4 => TimeGrid::Geometric {
+            strength: time_grid_strength,
+            bias: TimeGridBias::End,
+        },
+        5 => TimeGrid::Focus {
+            center: time_grid_focus_center,
+            width: time_grid_focus_width,
+            strength: time_grid_strength,
+        },
+        6 => TimeGrid::Piecewise {
+            breakpoint: time_grid_breakpoint,
+            first_interval_fraction: time_grid_first_interval_fraction,
+        },
+        _ => unreachable!("validated time grid choice index"),
+    };
+
     Ok(TranscriptionConfig {
         method,
         intervals,
         collocation_degree,
         collocation_family,
+        time_grid,
     })
+}
+
+pub fn time_grid_from_map_lossy(values: &BTreeMap<String, f64>, default: TimeGrid) -> TimeGrid {
+    let default_choice = time_grid_choice_value(default);
+    let default_strength = time_grid_strength_value(default);
+    let strength =
+        sample_shared_or_default(values, SharedControlId::TimeGridStrength, default_strength);
+    let focus_center = sample_shared_or_default(
+        values,
+        SharedControlId::TimeGridFocusCenter,
+        time_grid_focus_center_value(default),
+    );
+    let focus_width = sample_shared_or_default(
+        values,
+        SharedControlId::TimeGridFocusWidth,
+        time_grid_focus_width_value(default),
+    );
+    let breakpoint = sample_shared_or_default(
+        values,
+        SharedControlId::TimeGridBreakpoint,
+        time_grid_breakpoint_value(default),
+    );
+    let first_interval_fraction = sample_shared_or_default(
+        values,
+        SharedControlId::TimeGridFirstIntervalFraction,
+        time_grid_first_interval_fraction_value(default),
+    );
+    let valid_strength = strength.is_finite() && (0.0..=1.0).contains(&strength);
+    let valid_focus_center = focus_center.is_finite() && (0.0..=1.0).contains(&focus_center);
+    let valid_focus_width = focus_width.is_finite() && (0.0..1.0).contains(&focus_width);
+    let valid_breakpoint = breakpoint.is_finite() && (0.0..1.0).contains(&breakpoint);
+    let valid_first_interval_fraction =
+        first_interval_fraction.is_finite() && (0.0..1.0).contains(&first_interval_fraction);
+    match sample_shared_or_default(values, SharedControlId::TimeGrid, default_choice).round() as i32
+    {
+        1 if valid_strength => TimeGrid::Cosine { strength },
+        2 if valid_strength => TimeGrid::Tanh { strength },
+        3 if valid_strength => TimeGrid::Geometric {
+            strength,
+            bias: TimeGridBias::Start,
+        },
+        4 if valid_strength => TimeGrid::Geometric {
+            strength,
+            bias: TimeGridBias::End,
+        },
+        5 if valid_strength && valid_focus_center && valid_focus_width => TimeGrid::Focus {
+            center: focus_center,
+            width: focus_width,
+            strength,
+        },
+        6 if valid_breakpoint && valid_first_interval_fraction => TimeGrid::Piecewise {
+            breakpoint,
+            first_interval_fraction,
+        },
+        _ => TimeGrid::Uniform,
+    }
 }
 
 fn parse_call_policy_choice(value: f64, key: SharedControlId) -> Result<CallPolicy> {
@@ -5463,7 +5919,7 @@ pub fn ipopt_options(config: &SolverConfig) -> IpoptOptions {
     }
 }
 
-pub fn transcription_metrics(config: &TranscriptionConfig) -> [Metric; 3] {
+pub fn transcription_metrics(config: &TranscriptionConfig) -> [Metric; 4] {
     [
         metric_with_key(
             MetricKey::TranscriptionMethod,
@@ -5492,7 +5948,37 @@ pub fn transcription_metrics(config: &TranscriptionConfig) -> [Metric; 3] {
                 TranscriptionMethod::DirectCollocation => config.collocation_degree.to_string(),
             },
         ),
+        metric_with_key(
+            MetricKey::TimeGrid,
+            "Time Grid",
+            time_grid_label(config.time_grid),
+        ),
     ]
+}
+
+fn time_grid_label(time_grid: TimeGrid) -> String {
+    match time_grid {
+        TimeGrid::Uniform => "Uniform".to_string(),
+        TimeGrid::Cosine { strength } => format!("Cosine ({strength:.2})"),
+        TimeGrid::Tanh { strength } => format!("Tanh ({strength:.2})"),
+        TimeGrid::Geometric {
+            strength,
+            bias: TimeGridBias::Start,
+        } => format!("Geometric Start ({strength:.2})"),
+        TimeGrid::Geometric {
+            strength,
+            bias: TimeGridBias::End,
+        } => format!("Geometric End ({strength:.2})"),
+        TimeGrid::Focus {
+            center,
+            width,
+            strength,
+        } => format!("Focus (c {center:.2}, w {width:.2}, s {strength:.2})"),
+        TimeGrid::Piecewise {
+            breakpoint,
+            first_interval_fraction,
+        } => format!("Piecewise (b {breakpoint:.2}, n1 {first_interval_fraction:.2})"),
+    }
 }
 
 pub fn chart(
@@ -5857,6 +6343,26 @@ pub fn expect_nonnegative_finite(value: f64, label: &str) -> Result<f64> {
     }
     if value < 0.0 {
         return Err(anyhow!("{label} must be nonnegative"));
+    }
+    Ok(value)
+}
+
+pub fn expect_unit_interval_finite(value: f64, label: &str) -> Result<f64> {
+    if !value.is_finite() {
+        return Err(anyhow!("{label} must be finite"));
+    }
+    if !(0.0..=1.0).contains(&value) {
+        return Err(anyhow!("{label} must be in [0, 1]"));
+    }
+    Ok(value)
+}
+
+pub fn expect_open_unit_interval_finite(value: f64, label: &str) -> Result<f64> {
+    if !value.is_finite() {
+        return Err(anyhow!("{label} must be finite"));
+    }
+    if !(0.0..1.0).contains(&value) {
+        return Err(anyhow!("{label} must be in (0, 1)"));
     }
     Ok(value)
 }
@@ -9101,6 +9607,67 @@ mod tests {
         assert_eq!(hessian.section, ControlSection::Transcription);
         assert_eq!(hessian.panel, Some(ControlPanel::SxFunctions));
         assert_eq!(hessian.semantic, ControlSemantic::SxFunctionOption);
+    }
+
+    #[test]
+    fn transcription_controls_include_time_grid_warping_parameters() {
+        let controls = transcription_controls(default_transcription(30), &[30], &[3]);
+        let time_grid = controls
+            .iter()
+            .find(|control| control.id == "time_grid")
+            .expect("expected time grid control");
+        let focus_center = controls
+            .iter()
+            .find(|control| control.id == "time_grid_focus_center")
+            .expect("expected focus center control");
+        let piecewise_share = controls
+            .iter()
+            .find(|control| control.id == "time_grid_first_interval_fraction")
+            .expect("expected piecewise interval share control");
+
+        assert_eq!(time_grid.semantic, ControlSemantic::TimeGrid);
+        assert_eq!(time_grid.choices.len(), 7);
+        assert_eq!(focus_center.semantic, ControlSemantic::TimeGridFocusCenter);
+        assert_eq!(
+            piecewise_share.semantic,
+            ControlSemantic::TimeGridFirstIntervalFraction
+        );
+        assert_eq!(
+            focus_center.visibility,
+            ControlVisibility::DirectCollocationOnly
+        );
+    }
+
+    #[test]
+    fn transcription_from_map_parses_time_grid_warping_parameters() {
+        let mut values = BTreeMap::new();
+        values.insert("time_grid".to_string(), 5.0);
+        values.insert("time_grid_strength".to_string(), 0.7);
+        values.insert("time_grid_focus_center".to_string(), 0.25);
+        values.insert("time_grid_focus_width".to_string(), 0.2);
+        let focus = transcription_from_map(&values, default_transcription(30), &[30], &[3])
+            .expect("focus time grid should parse");
+        assert_eq!(
+            focus.time_grid,
+            TimeGrid::Focus {
+                center: 0.25,
+                width: 0.2,
+                strength: 0.7,
+            }
+        );
+
+        values.insert("time_grid".to_string(), 6.0);
+        values.insert("time_grid_breakpoint".to_string(), 0.35);
+        values.insert("time_grid_first_interval_fraction".to_string(), 0.6);
+        let piecewise = transcription_from_map(&values, default_transcription(30), &[30], &[3])
+            .expect("piecewise time grid should parse");
+        assert_eq!(
+            piecewise.time_grid,
+            TimeGrid::Piecewise {
+                breakpoint: 0.35,
+                first_interval_fraction: 0.6,
+            }
+        );
     }
 
     #[test]

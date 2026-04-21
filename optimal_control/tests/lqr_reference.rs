@@ -130,6 +130,7 @@ fn ocp_dc<const N: usize, const K: usize>()
             intervals: N,
             order: K,
             family: CollocationFamily::RadauIIA,
+            time_grid: Default::default(),
         },
     )
     .objective_lagrange(
