@@ -5164,14 +5164,23 @@ fn factor_solve_spral_ssids_symmetric_with_metrics(
         lower_matrix.rowval.clone(),
     );
     let factor_started = Instant::now();
-    let (symbolic, _) =
-        spral_analyse(spral_matrix, &SpralSsidsOptions::default()).map_err(|error| {
-            spral_error_attempt(
-                regularization,
-                InteriorPointLinearSolveFailureKind::FactorizationFailed,
-                error,
-            )
-        })?;
+    let (symbolic, _) = spral_analyse(
+        spral_matrix,
+        &SpralSsidsOptions {
+            // IPOPT's SPRAL path does not have this crate's `Auto` heuristic.
+            // Keep sparse auxiliary solves on explicit AMD, matching the Rust
+            // augmented-KKT integration and avoiding Auto's natural-order fill
+            // simulation on glider-sized least-squares multiplier systems.
+            ordering: SpralOrderingStrategy::ApproximateMinimumDegree,
+        },
+    )
+    .map_err(|error| {
+        spral_error_attempt(
+            regularization,
+            InteriorPointLinearSolveFailureKind::FactorizationFailed,
+            error,
+        )
+    })?;
     let mut factor = spral_factorize(
         spral_matrix,
         &symbolic,
