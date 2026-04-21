@@ -202,6 +202,7 @@ struct AcceptedTracePoint {
     dual_inf: f64,
     barrier_parameter: f64,
     has_barrier_parameter: bool,
+    regularization_size: Option<f64>,
     alpha_pr: Option<f64>,
     line_search_trials: usize,
     step_tag: Option<String>,
@@ -276,6 +277,7 @@ fn nlip_accepted_trace(summary: &optimization::InteriorPointSummary) -> Vec<Acce
             dual_inf: snapshot.dual_inf,
             barrier_parameter: snapshot.barrier_parameter.unwrap_or(0.0),
             has_barrier_parameter: snapshot.barrier_parameter.is_some(),
+            regularization_size: positive_optional(snapshot.regularization_size),
             alpha_pr: snapshot.alpha_pr.or(snapshot.alpha),
             line_search_trials: snapshot.line_search_trials,
             step_tag: nlip_step_tag(snapshot),
@@ -297,6 +299,7 @@ fn ipopt_accepted_trace(summary: &optimization::IpoptSummary) -> Vec<AcceptedTra
             dual_inf: snapshot.dual_inf,
             barrier_parameter: snapshot.barrier_parameter,
             has_barrier_parameter: true,
+            regularization_size: positive_regularization(snapshot.regularization_size),
             alpha_pr: Some(snapshot.alpha_pr),
             // IPOPT's printed `ls` count includes the accepted trial itself;
             // NLIP snapshots store pure backtracks. Normalize before comparing.
@@ -311,6 +314,27 @@ fn log_gap(lhs: f64, rhs: f64, floor: f64) -> f64 {
     let lhs = lhs.abs().max(floor).log10();
     let rhs = rhs.abs().max(floor).log10();
     (lhs - rhs).abs()
+}
+
+fn positive_optional(value: Option<f64>) -> Option<f64> {
+    value.and_then(positive_regularization)
+}
+
+fn positive_regularization(value: f64) -> Option<f64> {
+    (value.is_finite() && value > 0.0).then_some(value)
+}
+
+fn optional_log_gap(lhs: Option<f64>, rhs: Option<f64>, floor: f64) -> Option<f64> {
+    match (lhs, rhs) {
+        (Some(lhs), Some(rhs)) => Some(log_gap(lhs, rhs, floor)),
+        (Some(lhs), None) if lhs > floor => Some(log_gap(lhs, 0.0, floor)),
+        (None, Some(rhs)) if rhs > floor => Some(log_gap(0.0, rhs, floor)),
+        _ => None,
+    }
+}
+
+fn trace_regularization_text(value: Option<f64>) -> String {
+    value.map_or_else(|| "--".to_string(), |value| format!("{value:.1e}"))
 }
 
 fn assert_local_spral_ipopt_provenance(summary: &optimization::IpoptSummary) {
@@ -343,8 +367,10 @@ fn assert_accepted_trace_parity(
     max_primal_log_gap: f64,
     max_dual_log_gap: f64,
     max_mu_log_gap: f64,
+    max_regularization_log_gap: f64,
 ) {
     const PRIMAL_TRACE_FLOOR: f64 = 1.0e-6;
+    const REGULARIZATION_TRACE_FLOOR: f64 = 1.0e-20;
     let native_trace = nlip_accepted_trace(native);
     let ipopt_trace = ipopt_accepted_trace(ipopt);
     if compare_verbose_requested() {
@@ -360,6 +386,7 @@ fn assert_accepted_trace_parity(
     let compared = native_trace.len().min(ipopt_trace.len());
     let mut step_tag_mismatches = 0usize;
     let mut max_dual_gap_observed = 0.0f64;
+    let strict_step_trace = max_iteration_gap == 0 && max_step_tag_mismatches == 0;
     for (native_point, ipopt_point) in native_trace.iter().zip(ipopt_trace.iter()) {
         if let (Some(native_tag), Some(ipopt_tag)) = (&native_point.step_tag, &ipopt_point.step_tag)
             && native_tag != ipopt_tag
@@ -405,16 +432,53 @@ fn assert_accepted_trace_parity(
                 ipopt_point.barrier_parameter,
             );
         }
+        if let Some(regularization_gap) = optional_log_gap(
+            native_point.regularization_size,
+            ipopt_point.regularization_size,
+            REGULARIZATION_TRACE_FLOOR,
+        ) {
+            assert!(
+                regularization_gap <= max_regularization_log_gap,
+                "{problem_name} regularization trace diverged at accepted iter {} (native iter {} / ipopt iter {}): native={} ipopt={} log_gap={regularization_gap:.3}",
+                native_point.iteration.min(ipopt_point.iteration),
+                native_point.iteration,
+                ipopt_point.iteration,
+                trace_regularization_text(native_point.regularization_size),
+                trace_regularization_text(ipopt_point.regularization_size),
+            );
+        }
+        if strict_step_trace {
+            assert_eq!(
+                native_point.line_search_trials,
+                ipopt_point.line_search_trials,
+                "{problem_name} line-search trace diverged at accepted iter {} (native iter {} / ipopt iter {})",
+                native_point.iteration.min(ipopt_point.iteration),
+                native_point.iteration,
+                ipopt_point.iteration,
+            );
+            if let (Some(native_alpha), Some(ipopt_alpha)) =
+                (native_point.alpha_pr, ipopt_point.alpha_pr)
+            {
+                let alpha_delta = (native_alpha - ipopt_alpha).abs();
+                let alpha_tol = 1.0e-10_f64.max(1.0e-8 * ipopt_alpha.abs());
+                assert!(
+                    alpha_delta <= alpha_tol,
+                    "{problem_name} accepted alpha trace diverged at accepted iter {} (native iter {} / ipopt iter {}): native={native_alpha:.12e} ipopt={ipopt_alpha:.12e} delta={alpha_delta:.3e}",
+                    native_point.iteration.min(ipopt_point.iteration),
+                    native_point.iteration,
+                    ipopt_point.iteration,
+                );
+            }
+        }
     }
     assert!(
         step_tag_mismatches <= max_step_tag_mismatches,
         "{problem_name} step-tag mismatches too large: {step_tag_mismatches} over {compared} accepted steps",
     );
-    if compare_verbose_requested() && max_dual_gap_observed > max_dual_log_gap {
-        eprintln!(
-            "[compare] {problem_name} dual trace gap exceeds budget diagnostically: max_gap={max_dual_gap_observed:.3} budget={max_dual_log_gap:.3}"
-        );
-    }
+    assert!(
+        max_dual_gap_observed <= max_dual_log_gap,
+        "{problem_name} dual trace gap exceeds budget: max_gap={max_dual_gap_observed:.3} budget={max_dual_log_gap:.3}",
+    );
 }
 
 fn print_accepted_trace_comparison(
@@ -424,13 +488,14 @@ fn print_accepted_trace_comparison(
 ) {
     eprintln!("[compare] accepted trace for {problem_name}");
     eprintln!(
-        "[compare] {:>4} | {:>4} {:>2} {:>10} {:>10} {:>10} {:>8} {:>2} {:<12} || {:>4} {:>2} {:>10} {:>10} {:>10} {:>8} {:>2}",
+        "[compare] {:>4} | {:>4} {:>2} {:>10} {:>10} {:>10} {:>8} {:>8} {:>2} {:<12} || {:>4} {:>2} {:>10} {:>10} {:>10} {:>8} {:>8} {:>2}",
         "idx",
         "n_it",
         "nt",
         "n_obj",
         "n_pr",
         "n_du",
+        "n_reg",
         "n_alpha",
         "nl",
         "n_evt",
@@ -439,18 +504,20 @@ fn print_accepted_trace_comparison(
         "i_obj",
         "i_pr",
         "i_du",
+        "i_reg",
         "i_alpha",
         "il",
     );
     for (index, (native, ipopt)) in native_trace.iter().zip(ipopt_trace.iter()).enumerate() {
         eprintln!(
-            "[compare] {:>4} | {:>4} {:>2} {:>10.3e} {:>10.3e} {:>10.3e} {:>8.2e} {:>2} {:<12} || {:>4} {:>2} {:>10.3e} {:>10.3e} {:>10.3e} {:>8.2e} {:>2}",
+            "[compare] {:>4} | {:>4} {:>2} {:>10.3e} {:>10.3e} {:>10.3e} {:>8} {:>8.2e} {:>2} {:<12} || {:>4} {:>2} {:>10.3e} {:>10.3e} {:>10.3e} {:>8} {:>8.2e} {:>2}",
             index,
             native.iteration,
             native.step_tag.as_deref().unwrap_or("-"),
             native.objective,
             native.primal_inf,
             native.dual_inf,
+            trace_regularization_text(native.regularization_size),
             native.alpha_pr.unwrap_or(f64::NAN),
             native.line_search_trials,
             native.marker,
@@ -459,6 +526,7 @@ fn print_accepted_trace_comparison(
             ipopt.objective,
             ipopt.primal_inf,
             ipopt.dual_inf,
+            trace_regularization_text(ipopt.regularization_size),
             ipopt.alpha_pr.unwrap_or(f64::NAN),
             ipopt.line_search_trials,
         );
@@ -744,7 +812,17 @@ fn compare_native_and_ipopt_on_hanging_chain(
     let native = solve_native_ok(&problem, &x0, &[]);
     let ipopt = solve_ipopt_ok(&problem, &x0, &[]);
     assert_native_matches_ipopt("hanging_chain", Some(backend), &native, &ipopt, 1e-3, 1e-4);
-    assert_accepted_trace_parity("hanging_chain", &native, &ipopt, 6, 6, 2.5, 3.0, 3.0);
+    assert_accepted_trace_parity(
+        "hanging_chain",
+        &native,
+        &ipopt,
+        0,
+        0,
+        0.05,
+        0.05,
+        0.05,
+        0.05,
+    );
 }
 
 #[test]
@@ -775,8 +853,9 @@ fn compare_native_and_ipopt_on_linearly_constrained_quadratic_trace() {
         2,
         2,
         1.5,
+        13.0,
         2.0,
-        2.0,
+        1.0,
     );
 }
 

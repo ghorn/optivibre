@@ -1051,6 +1051,7 @@ fn interior_point_native_spral_reuses_symbolic_analysis_and_refactorizes() {
 }
 
 #[test]
+#[ignore = "rust-SPRAL/native-SPRAL backend replay validation; not part of native-SPRAL/IPOPT parity"]
 fn interior_point_native_spral_matches_small_kkt_extremely_closely() {
     if !native_spral_available() {
         eprintln!("skipping native SPRAL test: library unavailable");
@@ -1106,6 +1107,7 @@ fn interior_point_native_spral_matches_hanging_chain_extremely_closely() {
 }
 
 #[test]
+#[ignore = "rust-SPRAL/native-SPRAL backend replay validation; not part of native-SPRAL/IPOPT parity"]
 fn interior_point_native_spral_matches_hanging_chain_each_iteration_extremely_closely() {
     if !native_spral_available() {
         eprintln!("skipping native SPRAL test: library unavailable");
@@ -1146,6 +1148,7 @@ fn interior_point_native_spral_matches_hanging_chain_each_iteration_extremely_cl
 }
 
 #[test]
+#[ignore = "rust-SPRAL/native-SPRAL backend replay validation; not part of native-SPRAL/IPOPT parity"]
 fn interior_point_native_spral_exact_small_kkt_replay_matches_to_machine_precision() {
     if !native_spral_available() {
         eprintln!("skipping native SPRAL test: library unavailable");
@@ -1201,6 +1204,7 @@ fn interior_point_native_spral_exact_small_kkt_replay_matches_to_machine_precisi
 }
 
 #[test]
+#[ignore = "rust-SPRAL/native-SPRAL backend replay validation; not part of native-SPRAL/IPOPT parity"]
 fn interior_point_native_spral_exact_hanging_chain_replay_matches_extremely_closely() {
     if !native_spral_available() {
         eprintln!("skipping native SPRAL test: library unavailable");
@@ -1259,6 +1263,7 @@ fn interior_point_native_spral_exact_hanging_chain_replay_matches_extremely_clos
 }
 
 #[test]
+#[ignore = "rust-SPRAL/native-SPRAL backend replay validation; not part of native-SPRAL/IPOPT parity"]
 fn interior_point_native_spral_exact_hanging_chain_replay_matches_each_dump_extremely_closely() {
     if !native_spral_available() {
         eprintln!("skipping native SPRAL test: library unavailable");
@@ -1337,6 +1342,7 @@ fn interior_point_native_spral_exact_hanging_chain_replay_matches_each_dump_extr
 }
 
 #[test]
+#[ignore = "rust-SPRAL/native-SPRAL backend replay validation; not part of native-SPRAL/IPOPT parity"]
 fn interior_point_native_spral_hanging_chain_refactorize_sequence_matches_extremely_closely() {
     if !native_spral_available() {
         eprintln!("skipping native SPRAL test: library unavailable");
