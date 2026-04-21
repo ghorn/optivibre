@@ -194,14 +194,7 @@ pub enum NativeSpralError {
 
 impl NativeSpral {
     pub fn load() -> Result<Self, NativeSpralError> {
-        let mut candidates = vec![
-            PathBuf::from("target/native/spral-upstream/builddir/libspral.dylib"),
-            PathBuf::from("libspral.dylib"),
-            PathBuf::from("/usr/local/lib/libspral.dylib"),
-            PathBuf::from("/opt/homebrew/lib/libspral.dylib"),
-            PathBuf::from("libspral.so"),
-            PathBuf::from("/usr/local/lib/libspral.so"),
-        ];
+        let mut candidates = native_spral_library_candidates();
         if let Ok(cwd) = std::env::current_dir() {
             for ancestor in cwd.ancestors() {
                 candidates.insert(
@@ -354,6 +347,24 @@ impl NativeSpral {
             factorized: ptr::null_mut(),
         })
     }
+}
+
+fn native_spral_library_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(override_path) = std::env::var_os("SPRAL_SSIDS_NATIVE_LIB") {
+        candidates.push(PathBuf::from(override_path));
+    }
+    candidates.extend([
+        PathBuf::from("/Users/greg/local/ipopt-spral/lib/libspral.dylib"),
+        PathBuf::from("/Users/greg/local/ipopt-spral/lib/libspral.so"),
+        PathBuf::from("target/native/spral-upstream/builddir/libspral.dylib"),
+        PathBuf::from("libspral.dylib"),
+        PathBuf::from("/usr/local/lib/libspral.dylib"),
+        PathBuf::from("/opt/homebrew/lib/libspral.dylib"),
+        PathBuf::from("libspral.so"),
+        PathBuf::from("/usr/local/lib/libspral.so"),
+    ]);
+    candidates
 }
 
 fn apply_numeric_factor_options(native: &mut SpralSsidsOptions, numeric: &NumericFactorOptions) {

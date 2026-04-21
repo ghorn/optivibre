@@ -251,6 +251,7 @@ pub struct InteriorPointOptions {
     pub mu_target: f64,
     pub kappa_sigma: f64,
     pub regularization: f64,
+    pub first_hessian_perturbation: f64,
     pub adaptive_regularization_retries: Index,
     pub regularization_growth_factor: f64,
     pub regularization_max: f64,
@@ -318,6 +319,7 @@ impl Default for InteriorPointOptions {
             mu_target: 0.0,
             kappa_sigma: 1e10,
             regularization: 1e-6,
+            first_hessian_perturbation: 1e-4,
             adaptive_regularization_retries: 3,
             regularization_growth_factor: 10.0,
             regularization_max: 1e2,
@@ -339,7 +341,7 @@ impl Default for InteriorPointOptions {
 
 pub fn format_nlip_settings_summary(options: &InteriorPointOptions) -> String {
     format!(
-        "filter={}; linear_solver={}; linear_debug={}; spral=[pivot={}, action={}, small={}, u={}]; beta={}; c1={}; min_step={}; tau={}; alpha_y=[strategy={}, tol={}] ; init=[bound_push={}, bound_frac={}, slack_push={}, slack_frac={}] ; dual_init=[method={}, val={}, least_square={}, max={}] ; regularization={} (retries={}, growth={}, max={}); soc={}; watchdog=[trigger={}, max={}]; filter_reset=[max={}, trigger={}]; tiny_step={}; mu=[init={}, target={}, min={}, barrier_tol={}, linear={}, superlinear={}, fast={}]; theta=[{}, {}]; acceptable_iter={}",
+        "filter={}; linear_solver={}; linear_debug={}; spral=[pivot={}, action={}, small={}, u={}]; beta={}; c1={}; min_step={}; tau={}; alpha_y=[strategy={}, tol={}] ; init=[bound_push={}, bound_frac={}, slack_push={}, slack_frac={}] ; dual_init=[method={}, val={}, least_square={}, max={}] ; regularization={} (first={}, retries={}, growth={}, max={}); soc={}; watchdog=[trigger={}, max={}]; filter_reset=[max={}, trigger={}]; tiny_step={}; mu=[init={}, target={}, min={}, barrier_tol={}, linear={}, superlinear={}, fast={}]; theta=[{}, {}]; acceptable_iter={}",
         "on",
         options.linear_solver.label(),
         format_nlip_linear_debug_summary(options.linear_debug.as_ref()),
@@ -370,6 +372,7 @@ pub fn format_nlip_settings_summary(options: &InteriorPointOptions) -> String {
         },
         sci_text(options.constr_mult_init_max),
         sci_text(options.regularization),
+        sci_text(options.first_hessian_perturbation),
         options.adaptive_regularization_retries,
         sci_text(options.regularization_growth_factor),
         sci_text(options.regularization_max),
@@ -1053,6 +1056,8 @@ struct ReducedKktSystem<'a> {
     r_cent: &'a [f64],
     solver: InteriorPointLinearSolver,
     regularization: f64,
+    first_hessian_perturbation: f64,
+    previous_hessian_perturbation: Option<f64>,
     adaptive_regularization_retries: Index,
     regularization_growth_factor: f64,
     regularization_max: f64,
@@ -1124,6 +1129,8 @@ struct InteriorPointKktSnapshot {
     regularization: f64,
     primal_diagonal_shift: f64,
     dual_regularization: f64,
+    first_hessian_perturbation: f64,
+    previous_hessian_perturbation: Option<f64>,
     adaptive_regularization_retries: Index,
     regularization_growth_factor: f64,
     regularization_max: f64,
@@ -1382,6 +1389,8 @@ impl InteriorPointKktSnapshot {
             r_cent: &self.r_cent,
             solver,
             regularization: self.regularization,
+            first_hessian_perturbation: self.first_hessian_perturbation,
+            previous_hessian_perturbation: self.previous_hessian_perturbation,
             adaptive_regularization_retries: self.adaptive_regularization_retries,
             regularization_growth_factor: self.regularization_growth_factor,
             regularization_max: self.regularization_max,
@@ -1516,6 +1525,8 @@ fn build_interior_point_kkt_snapshot(
         regularization: dual_regularization_used,
         primal_diagonal_shift: primal_diagonal_shift_used,
         dual_regularization: dual_regularization_used,
+        first_hessian_perturbation: system.first_hessian_perturbation,
+        previous_hessian_perturbation: system.previous_hessian_perturbation,
         adaptive_regularization_retries: system.adaptive_regularization_retries,
         regularization_growth_factor: system.regularization_growth_factor,
         regularization_max: system.regularization_max,
@@ -2118,11 +2129,10 @@ fn barrier_objective_increase_too_large(
         return false;
     }
     let increase = trial_barrier_objective - reference_barrier_objective;
-    let baseline = if reference_barrier_objective == 0.0 {
-        0.0
-    } else {
-        reference_barrier_objective.abs().log10()
-    };
+    let mut baseline = 1.0;
+    if reference_barrier_objective.abs() > 10.0 {
+        baseline = reference_barrier_objective.abs().log10();
+    }
     increase > 0.0 && increase.log10() > obj_max_inc + baseline
 }
 
@@ -3016,6 +3026,7 @@ fn least_squares_initial_dual_state(
     state: &EvalState,
     initial_z: &[f64],
     regularization: f64,
+    solver: InteriorPointLinearSolver,
 ) -> (Vec<f64>, Vec<f64>) {
     let meq = state.equality_values.len();
     let mineq = state.augmented_inequality_values.len();
@@ -3024,7 +3035,7 @@ fn least_squares_initial_dual_state(
     }
 
     debug_assert_eq!(initial_z.len(), mineq);
-    let lambda_eq = least_squares_equality_multipliers(state, initial_z, regularization);
+    let lambda_eq = least_squares_equality_multipliers(state, initial_z, regularization, solver);
     (lambda_eq, initial_z.to_vec())
 }
 
@@ -3032,6 +3043,7 @@ fn least_squares_equality_multipliers(
     state: &EvalState,
     z: &[f64],
     regularization: f64,
+    solver: InteriorPointLinearSolver,
 ) -> Vec<f64> {
     let dual_regularization = regularization.max(1e-8);
     let meq = state.equality_values.len();
@@ -3077,7 +3089,7 @@ fn least_squares_equality_multipliers(
     }
     let normal_matrix = CscMatrix::new_from_triplets(meq, meq, rows, cols, values);
     match solve_symmetric_system(
-        InteriorPointLinearSolver::SparseQdldl,
+        solver,
         &normal_matrix,
         &rhs,
         dual_regularization,
@@ -3098,6 +3110,7 @@ fn sparse_second_order_correction_step(
     trial_augmented_inequality_values: &[f64],
     candidate_augmented_inequality_multipliers: &[f64],
     constraint_tol: f64,
+    solver: InteriorPointLinearSolver,
 ) -> Option<Vec<f64>> {
     debug_assert_eq!(equality_jacobian.nrows(), trial_equality_values.len());
     debug_assert_eq!(
@@ -3172,7 +3185,7 @@ fn sparse_second_order_correction_step(
     }
     let normal_matrix = CscMatrix::new_from_triplets(n, n, rows, cols, values);
     let (correction, _, _) = solve_symmetric_system(
-        InteriorPointLinearSolver::SparseQdldl,
+        solver,
         &normal_matrix,
         &rhs,
         regularization,
@@ -3609,6 +3622,212 @@ fn factor_solve_sparse_qdldl_with_metrics(
         })
 }
 
+fn factor_solve_spral_ssids_symmetric_with_metrics(
+    matrix: &CscMatrix<f64>,
+    rhs: &[f64],
+    regularization: f64,
+) -> std::result::Result<(Vec<f64>, LinearBackendRunStats), InteriorPointLinearSolveAttempt> {
+    let n = matrix.n;
+    if matrix.m != n || rhs.len() != n {
+        return Err(InteriorPointLinearSolveAttempt {
+            solver: InteriorPointLinearSolver::SpralSsids,
+            regularization,
+            failure_kind: InteriorPointLinearSolveFailureKind::FactorizationFailed,
+            detail: None,
+            solution_inf: None,
+            solution_inf_limit: None,
+            residual_inf: None,
+            residual_inf_limit: None,
+        });
+    }
+    let spral_matrix =
+        SpralSymmetricCscMatrix::new(n, &matrix.colptr, &matrix.rowval, Some(&matrix.nzval))
+            .map_err(|error| {
+                spral_error_attempt(
+                    regularization,
+                    InteriorPointLinearSolveFailureKind::FactorizationFailed,
+                    error,
+                )
+            })?;
+    let ccs = CCS::new(n, n, matrix.colptr.clone(), matrix.rowval.clone());
+    let factor_started = Instant::now();
+    let (symbolic, _) =
+        spral_analyse(spral_matrix, &SpralSsidsOptions::default()).map_err(|error| {
+            spral_error_attempt(
+                regularization,
+                InteriorPointLinearSolveFailureKind::FactorizationFailed,
+                error,
+            )
+        })?;
+    let mut factor = spral_factorize(
+        spral_matrix,
+        &symbolic,
+        &SpralNumericFactorOptions::default(),
+    )
+    .map_err(|error| {
+        spral_error_attempt(
+            regularization,
+            InteriorPointLinearSolveFailureKind::FactorizationFailed,
+            error,
+        )
+    })?
+    .0;
+    let factorization_time = factor_started.elapsed();
+    let inertia = interior_point_linear_inertia(factor.inertia());
+    let solve_started = Instant::now();
+    let mut solution = factor.solve(rhs).map_err(|error| {
+        spral_error_attempt(
+            regularization,
+            InteriorPointLinearSolveFailureKind::FactorizationFailed,
+            error,
+        )
+    })?;
+    let mut solve_time = solve_started.elapsed();
+    let refinement_steps = refine_linear_solution_ccs(
+        &ccs,
+        &matrix.nzval,
+        rhs,
+        &mut solution,
+        &mut solve_time,
+        |residual| {
+            factor.solve(residual).map_err(|error| {
+                spral_error_attempt(
+                    regularization,
+                    InteriorPointLinearSolveFailureKind::FactorizationFailed,
+                    error,
+                )
+            })
+        },
+    )?;
+    let assessment = assess_linear_solution_ccs(&ccs, &matrix.nzval, rhs, &solution);
+    assessment
+        .map(|assessment| {
+            (
+                solution,
+                LinearBackendRunStats {
+                    solver: InteriorPointLinearSolver::SpralSsids,
+                    factorization_time,
+                    solve_time,
+                    reused_symbolic: Some(false),
+                    inertia: Some(inertia),
+                    residual_inf: assessment.residual_inf,
+                    solution_inf: assessment.solution_inf,
+                    detail: (refinement_steps > 0)
+                        .then(|| format!("iterative_refinement_steps={refinement_steps}")),
+                },
+            )
+        })
+        .map_err(|mut attempt| {
+            attempt.solver = InteriorPointLinearSolver::SpralSsids;
+            attempt.regularization = regularization;
+            attempt
+        })
+}
+
+fn factor_solve_native_spral_ssids_symmetric_with_metrics(
+    matrix: &CscMatrix<f64>,
+    rhs: &[f64],
+    regularization: f64,
+) -> std::result::Result<(Vec<f64>, LinearBackendRunStats), InteriorPointLinearSolveAttempt> {
+    let n = matrix.n;
+    if matrix.m != n || rhs.len() != n {
+        return Err(InteriorPointLinearSolveAttempt {
+            solver: InteriorPointLinearSolver::NativeSpralSsids,
+            regularization,
+            failure_kind: InteriorPointLinearSolveFailureKind::FactorizationFailed,
+            detail: None,
+            solution_inf: None,
+            solution_inf_limit: None,
+            residual_inf: None,
+            residual_inf_limit: None,
+        });
+    }
+    let spral_matrix =
+        SpralSymmetricCscMatrix::new(n, &matrix.colptr, &matrix.rowval, Some(&matrix.nzval))
+            .map_err(|error| {
+                native_spral_error_attempt(
+                    regularization,
+                    InteriorPointLinearSolveFailureKind::FactorizationFailed,
+                    error,
+                )
+            })?;
+    let ccs = CCS::new(n, n, matrix.colptr.clone(), matrix.rowval.clone());
+    let native = NativeSpralLibrary::load().map_err(|error| {
+        native_spral_error_attempt(
+            regularization,
+            InteriorPointLinearSolveFailureKind::FactorizationFailed,
+            error,
+        )
+    })?;
+    let factor_started = Instant::now();
+    let mut session = native
+        .analyse_with_options(spral_matrix, &SpralNumericFactorOptions::default())
+        .map_err(|error| {
+            native_spral_error_attempt(
+                regularization,
+                InteriorPointLinearSolveFailureKind::FactorizationFailed,
+                error,
+            )
+        })?;
+    let factor_info = session.factorize(spral_matrix).map_err(|error| {
+        native_spral_error_attempt(
+            regularization,
+            InteriorPointLinearSolveFailureKind::FactorizationFailed,
+            error,
+        )
+    })?;
+    let factorization_time = factor_started.elapsed();
+    let inertia = interior_point_linear_inertia(factor_info.inertia);
+    let solve_started = Instant::now();
+    let mut solution = session.solve(rhs).map_err(|error| {
+        native_spral_error_attempt(
+            regularization,
+            InteriorPointLinearSolveFailureKind::FactorizationFailed,
+            error,
+        )
+    })?;
+    let mut solve_time = solve_started.elapsed();
+    let refinement_steps = refine_linear_solution_ccs(
+        &ccs,
+        &matrix.nzval,
+        rhs,
+        &mut solution,
+        &mut solve_time,
+        |residual| {
+            session.solve(residual).map_err(|error| {
+                native_spral_error_attempt(
+                    regularization,
+                    InteriorPointLinearSolveFailureKind::FactorizationFailed,
+                    error,
+                )
+            })
+        },
+    )?;
+    let assessment = assess_linear_solution_ccs(&ccs, &matrix.nzval, rhs, &solution);
+    assessment
+        .map(|assessment| {
+            (
+                solution,
+                LinearBackendRunStats {
+                    solver: InteriorPointLinearSolver::NativeSpralSsids,
+                    factorization_time,
+                    solve_time,
+                    reused_symbolic: Some(false),
+                    inertia: Some(inertia),
+                    residual_inf: assessment.residual_inf,
+                    solution_inf: assessment.solution_inf,
+                    detail: (refinement_steps > 0)
+                        .then(|| format!("iterative_refinement_steps={refinement_steps}")),
+                },
+            )
+        })
+        .map_err(|mut attempt| {
+            attempt.solver = InteriorPointLinearSolver::NativeSpralSsids;
+            attempt.regularization = regularization;
+            attempt
+        })
+}
+
 fn preferred_linear_solver(
     solver: InteriorPointLinearSolver,
     equality_count: usize,
@@ -3663,7 +3882,7 @@ fn linear_solve_error(
     reason = "Linear-solver retries/regularization are passed explicitly at the solver boundary."
 )]
 fn try_solve_symmetric_system(
-    _solver: InteriorPointLinearSolver,
+    solver: InteriorPointLinearSolver,
     matrix: &CscMatrix<f64>,
     rhs: &[f64],
     regularization: f64,
@@ -3675,8 +3894,9 @@ fn try_solve_symmetric_system(
     (Vec<f64>, InteriorPointLinearSolver, f64),
     Vec<InteriorPointLinearSolveAttempt>,
 > {
+    let preferred_solver = preferred_linear_solver(solver, 0, 0);
     try_solve_symmetric_system_with_metrics(
-        InteriorPointLinearSolver::SparseQdldl,
+        solver,
         matrix,
         rhs,
         regularization,
@@ -3686,11 +3906,7 @@ fn try_solve_symmetric_system(
         regularization_max,
     )
     .map(|(solution, _stats, regularization_used)| {
-        (
-            solution,
-            InteriorPointLinearSolver::SparseQdldl,
-            regularization_used,
-        )
+        (solution, preferred_solver, regularization_used)
     })
 }
 
@@ -3699,7 +3915,7 @@ fn try_solve_symmetric_system(
     reason = "Linear-solver retries/regularization are passed explicitly at the solver boundary."
 )]
 fn try_solve_symmetric_system_with_metrics(
-    _solver: InteriorPointLinearSolver,
+    solver: InteriorPointLinearSolver,
     matrix: &CscMatrix<f64>,
     rhs: &[f64],
     regularization: f64,
@@ -3709,21 +3925,41 @@ fn try_solve_symmetric_system_with_metrics(
     regularization_max: f64,
 ) -> std::result::Result<(Vec<f64>, LinearBackendRunStats, f64), Vec<InteriorPointLinearSolveAttempt>>
 {
-    let try_sparse_qdldl = |matrix: &CscMatrix<f64>,
-                            rhs: &[f64],
-                            retries: Index,
-                            growth_factor: f64,
-                            regularization_max: f64| {
+    let preferred_solver = preferred_linear_solver(solver, 0, 0);
+    let try_solver = |matrix: &CscMatrix<f64>,
+                      rhs: &[f64],
+                      retries: Index,
+                      growth_factor: f64,
+                      regularization_max: f64| {
         let mut attempts = Vec::new();
         let mut current_regularization = regularization.max(1e-12);
         let max_regularization = regularization_max.max(current_regularization);
         for retry_index in 0..=retries {
-            match factor_solve_sparse_qdldl_with_metrics(
-                matrix,
-                rhs,
-                current_regularization,
-                dsigns,
-            ) {
+            let attempt_result = match preferred_solver {
+                InteriorPointLinearSolver::NativeSpralSsids => {
+                    factor_solve_native_spral_ssids_symmetric_with_metrics(
+                        matrix,
+                        rhs,
+                        current_regularization,
+                    )
+                }
+                InteriorPointLinearSolver::SpralSsids => {
+                    factor_solve_spral_ssids_symmetric_with_metrics(
+                        matrix,
+                        rhs,
+                        current_regularization,
+                    )
+                }
+                InteriorPointLinearSolver::SparseQdldl | InteriorPointLinearSolver::Auto => {
+                    factor_solve_sparse_qdldl_with_metrics(
+                        matrix,
+                        rhs,
+                        current_regularization,
+                        dsigns,
+                    )
+                }
+            };
+            match attempt_result {
                 Ok((solution, stats)) => {
                     return Ok((solution, stats, current_regularization));
                 }
@@ -3741,7 +3977,7 @@ fn try_solve_symmetric_system_with_metrics(
         }
         Err(attempts)
     };
-    let sparse_result = try_sparse_qdldl(
+    let sparse_result = try_solver(
         matrix,
         rhs,
         adaptive_regularization_retries,
@@ -3939,6 +4175,24 @@ fn sparse_hessian_diagonal_shift(hessian: &SparseSymmetricMatrix, minimum_shift:
         shift = shift.max(off_diagonal_abs_sum[idx] - diagonal[idx] + minimum_shift);
     }
     shift
+}
+
+fn next_ipopt_hessian_perturbation(
+    current: f64,
+    first: f64,
+    growth_factor: f64,
+    max_regularization: f64,
+) -> Option<f64> {
+    let next = if current <= 0.0 {
+        first.max(0.0)
+    } else {
+        current * growth_factor.max(1.0)
+    };
+    if next <= current || next > max_regularization {
+        None
+    } else {
+        Some(next.min(max_regularization))
+    }
 }
 
 fn append_selected_constraint_block_triplets(
@@ -4403,11 +4657,14 @@ fn solve_reduced_kkt_with_native_spral_ssids(
     }
 
     let mut attempts = Vec::new();
-    let mut current_regularization = system.regularization.max(1e-12);
-    let max_regularization = system.regularization_max.max(current_regularization);
+    let mut current_regularization = system.regularization.max(0.0);
+    let max_regularization = system
+        .regularization_max
+        .max(current_regularization)
+        .max(system.first_hessian_perturbation);
     for retry_index in 0..=system.adaptive_regularization_retries {
-        let primal_shift = sparse_hessian_diagonal_shift(system.hessian, current_regularization);
-        let dual_shift = current_regularization.max(1e-8);
+        let primal_shift = current_regularization;
+        let dual_shift = 0.0;
         fill_spral_augmented_kkt_values(
             &workspace.pattern,
             &mut workspace.values,
@@ -4458,12 +4715,19 @@ fn solve_reduced_kkt_with_native_spral_ssids(
         {
             break;
         }
-        let next_regularization = (current_regularization
-            * system.regularization_growth_factor.max(1.0))
-        .min(max_regularization);
-        if next_regularization <= current_regularization {
+        let first_perturbation = system
+            .previous_hessian_perturbation
+            .map_or(system.first_hessian_perturbation, |previous| {
+                (previous / 3.0).max(1e-20)
+            });
+        let Some(next_regularization) = next_ipopt_hessian_perturbation(
+            current_regularization,
+            first_perturbation,
+            system.regularization_growth_factor,
+            max_regularization,
+        ) else {
             break;
-        }
+        };
         current_regularization = next_regularization;
     }
     Err(attempts)
@@ -5918,6 +6182,7 @@ where
     let mut spral_workspace_unavailable = false;
     let mut native_spral_workspace = None;
     let mut native_spral_workspace_unavailable = false;
+    let mut previous_hessian_perturbation = None;
     let mut linear_debug_state =
         options
             .linear_debug
@@ -5971,8 +6236,12 @@ where
         }
     }
     if options.least_square_init_duals {
-        let (initial_lambda_eq, initial_z) =
-            least_squares_initial_dual_state(&initial_state, &z, options.regularization);
+        let (initial_lambda_eq, initial_z) = least_squares_initial_dual_state(
+            &initial_state,
+            &z,
+            options.regularization,
+            options.linear_solver,
+        );
         if initial_z.len() == z.len() {
             for (z_i, restored_z_i) in z.iter_mut().zip(initial_z.into_iter()) {
                 *z_i = (*z_i).max(restored_z_i);
@@ -6539,6 +6808,8 @@ where
             r_cent: &r_cent,
             solver: options.linear_solver,
             regularization: kkt_regularization,
+            first_hessian_perturbation: options.first_hessian_perturbation,
+            previous_hessian_perturbation,
             adaptive_regularization_retries: options.adaptive_regularization_retries,
             regularization_growth_factor: options.regularization_growth_factor,
             regularization_max: options.regularization_max,
@@ -7054,6 +7325,7 @@ where
                     &trial_state.augmented_inequality_values,
                     &trial_z,
                     options.constraint_tol,
+                    options.linear_solver,
                 )
             {
                 second_order_correction_attempted = true;
@@ -7696,6 +7968,9 @@ where
         snapshots.push(accepted_snapshot.clone());
         callback(&accepted_snapshot);
         last_accepted_state = Some(accepted_snapshot);
+        if direction.primal_diagonal_shift_used > 0.0 {
+            previous_hessian_perturbation = Some(direction.primal_diagonal_shift_used);
+        }
 
         profiling.preprocessing_steps += 1;
         profiling.preprocessing_time += iteration_started.elapsed().saturating_sub(

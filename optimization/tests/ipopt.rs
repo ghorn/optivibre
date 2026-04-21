@@ -1,7 +1,10 @@
 #![cfg(feature = "ipopt")]
 
 use approx::assert_abs_diff_eq;
-use optimization::{IpoptOptions, ParameterMatrix, solve_nlp_ipopt, solve_nlp_ipopt_with_callback};
+use optimization::{
+    IpoptOptions, ParameterMatrix, apply_native_spral_parity_to_ipopt_options, solve_nlp_ipopt,
+    solve_nlp_ipopt_with_callback,
+};
 use rstest::rstest;
 
 #[path = "support/generated_problem.rs"]
@@ -42,6 +45,12 @@ fn solve_ok<P: optimization::CompiledNlpProblem>(
         Ok(summary) => summary,
         Err(err) => unreachable!("asserted success: {err}"),
     }
+}
+
+fn local_native_spral_ipopt_options() -> IpoptOptions {
+    let mut options = IpoptOptions::default();
+    apply_native_spral_parity_to_ipopt_options(&mut options);
+    options
 }
 
 #[rstest]
@@ -135,6 +144,36 @@ fn ipopt_solves_casadi_simple_nlp_example(
     assert_abs_diff_eq!(summary.objective, 50.0, epsilon = 1e-7);
     assert!(summary.equality_inf_norm <= 1e-7);
     assert!(summary.dual_inf_norm <= 1e-6);
+}
+
+#[rstest]
+fn ipopt_solves_simple_nlp_with_local_native_spral_profile(
+    #[values(CallbackBackend::Aot, CallbackBackend::Jit)] backend: CallbackBackend,
+) {
+    let problem = build_problem_ok(simple_nlp_problem(backend), backend);
+    let summary = solve_ok(
+        &problem,
+        &[0.0, 0.0],
+        &[],
+        local_native_spral_ipopt_options(),
+    );
+
+    assert_eq!(
+        summary
+            .provenance
+            .as_ref()
+            .and_then(|value| value.pkg_config_version.as_deref()),
+        Some("3.14.20")
+    );
+    assert_eq!(
+        summary
+            .provenance
+            .as_ref()
+            .and_then(|value| value.linear_solver_default.as_deref()),
+        Some("spral")
+    );
+    assert_abs_diff_eq!(summary.x[0], 5.0, epsilon = 1e-7);
+    assert_abs_diff_eq!(summary.x[1], 5.0, epsilon = 1e-7);
 }
 
 #[rstest]

@@ -2036,6 +2036,7 @@ impl AppliedNlpScaling {
                 .collect(),
             journal_output: summary.journal_output.clone(),
             profiling: summary.profiling.clone(),
+            provenance: summary.provenance.clone(),
         }
     }
 }

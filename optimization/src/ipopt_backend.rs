@@ -12,7 +12,9 @@ use ipopt::{
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -36,6 +38,47 @@ impl IpoptMuStrategy {
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpoptLinearSolver {
+    Spral,
+}
+
+impl IpoptLinearSolver {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Spral => "spral",
+        }
+    }
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpoptSpralPivotMethod {
+    Block,
+}
+
+impl IpoptSpralPivotMethod {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+        }
+    }
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IpoptProvenance {
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub pkg_config_version: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub pkg_config_cflags_libs: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub ipopt_binary: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linear_solver_default: Option<String>,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug)]
 pub struct IpoptOptions {
     pub max_iters: Index,
@@ -47,6 +90,17 @@ pub struct IpoptOptions {
     pub print_level: i32,
     pub suppress_banner: bool,
     pub mu_strategy: IpoptMuStrategy,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linear_solver: Option<IpoptLinearSolver>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub spral_pivot_method: Option<IpoptSpralPivotMethod>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub spral_small_pivot_tolerance: Option<f64>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub spral_threshold_pivot_u: Option<f64>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub spral_use_gpu: Option<bool>,
+    pub capture_provenance: bool,
 }
 
 impl Default for IpoptOptions {
@@ -61,13 +115,19 @@ impl Default for IpoptOptions {
             print_level: 0,
             suppress_banner: true,
             mu_strategy: IpoptMuStrategy::Adaptive,
+            linear_solver: None,
+            spral_pivot_method: None,
+            spral_small_pivot_tolerance: None,
+            spral_threshold_pivot_u: None,
+            spral_use_gpu: None,
+            capture_provenance: false,
         }
     }
 }
 
 pub fn format_ipopt_settings_summary(options: &IpoptOptions) -> String {
     format!(
-        "mu_strategy={}; acceptable_tol={}; print_level={}; banner={}",
+        "mu_strategy={}; acceptable_tol={}; print_level={}; banner={}; linear_solver={}; spral_pivot={}; spral_small={}; spral_u={}; spral_gpu={}; provenance={}",
         options.mu_strategy.as_str(),
         options
             .acceptable_tol
@@ -75,6 +135,31 @@ pub fn format_ipopt_settings_summary(options: &IpoptOptions) -> String {
             .unwrap_or_else(|| "off".to_string()),
         options.print_level,
         if options.suppress_banner { "off" } else { "on" },
+        options
+            .linear_solver
+            .map(|value| value.as_str().to_string())
+            .unwrap_or_else(|| "default".to_string()),
+        options
+            .spral_pivot_method
+            .map(|value| value.as_str().to_string())
+            .unwrap_or_else(|| "default".to_string()),
+        options
+            .spral_small_pivot_tolerance
+            .map(|value| format!("{value:.1e}"))
+            .unwrap_or_else(|| "default".to_string()),
+        options
+            .spral_threshold_pivot_u
+            .map(|value| format!("{value:.1e}"))
+            .unwrap_or_else(|| "default".to_string()),
+        options
+            .spral_use_gpu
+            .map(|value| if value { "yes" } else { "no" }.to_string())
+            .unwrap_or_else(|| "default".to_string()),
+        if options.capture_provenance {
+            "on"
+        } else {
+            "off"
+        },
     )
 }
 
@@ -221,6 +306,8 @@ pub struct IpoptSummary {
     pub snapshots: Vec<IpoptIterationSnapshot>,
     pub journal_output: Option<String>,
     pub profiling: IpoptProfiling,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub provenance: Option<IpoptProvenance>,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -676,14 +763,14 @@ where
     }
 }
 
-fn set_ipopt_option<P, O>(
+fn set_ipopt_option<'a, P, O>(
     solver: &mut Ipopt<P>,
     name: &str,
     value: O,
 ) -> std::result::Result<(), IpoptSolveError>
 where
     P: BasicProblem,
-    O: Into<ipopt::IpoptOption<'static>>,
+    O: Into<ipopt::IpoptOption<'a>>,
 {
     if solver.set_option(name, value).is_none() {
         return Err(IpoptSolveError::OptionRejected {
@@ -728,6 +815,115 @@ fn read_ipopt_journal(path: Option<PathBuf>) -> Option<String> {
     journal.filter(|text| !text.trim().is_empty())
 }
 
+fn command_stdout(mut command: Command) -> Option<String> {
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn find_executable_on_path(name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .map(|entry| entry.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+fn parse_linear_solver_default(options: &str) -> Option<String> {
+    options.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("linear_solver") {
+            return None;
+        }
+        let start = trimmed.find("(\"")? + 2;
+        let end = trimmed[start..].find("\")")?;
+        Some(trimmed[start..start + end].to_string())
+    })
+}
+
+fn ipopt_linear_solver_default(ipopt_binary: &Path) -> Option<String> {
+    command_stdout({
+        let mut command = Command::new(ipopt_binary);
+        command.arg("--print-options");
+        command
+    })
+    .and_then(|options| parse_linear_solver_default(&options))
+}
+
+pub fn capture_ipopt_provenance() -> IpoptProvenance {
+    let pkg_config_version = command_stdout({
+        let mut command = Command::new("pkg-config");
+        command.arg("--modversion").arg("ipopt");
+        command
+    });
+    let pkg_config_cflags_libs = command_stdout({
+        let mut command = Command::new("pkg-config");
+        command.arg("--cflags").arg("--libs").arg("ipopt");
+        command
+    });
+    let ipopt_binary = find_executable_on_path("ipopt");
+    let linear_solver_default = ipopt_binary
+        .as_deref()
+        .and_then(ipopt_linear_solver_default);
+    IpoptProvenance {
+        pkg_config_version,
+        pkg_config_cflags_libs,
+        ipopt_binary: ipopt_binary.map(|path| path.display().to_string()),
+        linear_solver_default,
+    }
+}
+
+fn apply_ipopt_options<P>(
+    solver: &mut Ipopt<P>,
+    nlp_scaling_method: Option<&str>,
+    options: &IpoptOptions,
+) -> std::result::Result<(), IpoptSolveError>
+where
+    P: BasicProblem,
+{
+    set_ipopt_option(solver, "max_iter", options.max_iters as i32)?;
+    set_ipopt_option(solver, "tol", options.tol)?;
+    if let Some(value) = options.acceptable_tol {
+        set_ipopt_option(solver, "acceptable_tol", value)?;
+    }
+    if let Some(value) = options.constraint_tol {
+        set_ipopt_option(solver, "constr_viol_tol", value)?;
+    }
+    if let Some(value) = options.complementarity_tol {
+        set_ipopt_option(solver, "compl_inf_tol", value)?;
+    }
+    if let Some(value) = options.dual_tol {
+        set_ipopt_option(solver, "dual_inf_tol", value)?;
+    }
+    if let Some(method) = nlp_scaling_method {
+        set_ipopt_option(solver, "nlp_scaling_method", method)?;
+    }
+    set_ipopt_option(solver, "mu_strategy", options.mu_strategy.as_str())?;
+    set_ipopt_option(solver, "print_level", options.print_level)?;
+    if let Some(linear_solver) = options.linear_solver {
+        set_ipopt_option(solver, "linear_solver", linear_solver.as_str())?;
+    }
+    if let Some(pivot_method) = options.spral_pivot_method {
+        set_ipopt_option(solver, "spral_pivot_method", pivot_method.as_str())?;
+    }
+    if let Some(value) = options.spral_small_pivot_tolerance {
+        set_ipopt_option(solver, "spral_small", value)?;
+    }
+    if let Some(value) = options.spral_threshold_pivot_u {
+        set_ipopt_option(solver, "spral_u", value)?;
+    }
+    if let Some(value) = options.spral_use_gpu {
+        set_ipopt_option(solver, "spral_use_gpu", if value { "yes" } else { "no" })?;
+    }
+    if options.suppress_banner {
+        set_ipopt_option(solver, "sb", "yes")?;
+    }
+    Ok(())
+}
+
 pub fn solve_nlp_ipopt<'a, P>(
     problem: &'a P,
     x0: &'a [f64],
@@ -763,28 +959,14 @@ where
         )));
     }
     let solve_started = Instant::now();
+    let provenance = options.capture_provenance.then(capture_ipopt_provenance);
 
     let adapter = IpoptProblemAdapter::new(problem, x0, parameters, callback)?;
     let total_constraint_count = problem.equality_count() + problem.inequality_count();
     if total_constraint_count == 0 {
         let mut solver =
             Ipopt::new_newton(adapter).map_err(|err| IpoptSolveError::Setup(format!("{err:?}")))?;
-        set_ipopt_option(&mut solver, "max_iter", options.max_iters as i32)?;
-        set_ipopt_option(&mut solver, "tol", options.tol)?;
-        if let Some(value) = options.acceptable_tol {
-            set_ipopt_option(&mut solver, "acceptable_tol", value)?;
-        }
-        if let Some(value) = options.dual_tol {
-            set_ipopt_option(&mut solver, "dual_inf_tol", value)?;
-        }
-        if let Some(method) = problem.ipopt_nlp_scaling_method() {
-            set_ipopt_option(&mut solver, "nlp_scaling_method", method)?;
-        }
-        set_ipopt_option(&mut solver, "mu_strategy", options.mu_strategy.as_str())?;
-        set_ipopt_option(&mut solver, "print_level", options.print_level)?;
-        if options.suppress_banner {
-            set_ipopt_option(&mut solver, "sb", "yes")?;
-        }
+        apply_ipopt_options(&mut solver, problem.ipopt_nlp_scaling_method(), options)?;
         let journal_path = open_ipopt_journal(&mut solver);
         solver.set_intermediate_callback(Some(IpoptProblemAdapter::<P, C>::record_iteration));
         let solve_result = solver.solve();
@@ -833,33 +1015,13 @@ where
             snapshots,
             journal_output,
             profiling,
+            provenance,
         });
     }
 
     let mut solver =
         Ipopt::new(adapter).map_err(|err| IpoptSolveError::Setup(format!("{err:?}")))?;
-    set_ipopt_option(&mut solver, "max_iter", options.max_iters as i32)?;
-    set_ipopt_option(&mut solver, "tol", options.tol)?;
-    if let Some(value) = options.acceptable_tol {
-        set_ipopt_option(&mut solver, "acceptable_tol", value)?;
-    }
-    if let Some(value) = options.constraint_tol {
-        set_ipopt_option(&mut solver, "constr_viol_tol", value)?;
-    }
-    if let Some(value) = options.complementarity_tol {
-        set_ipopt_option(&mut solver, "compl_inf_tol", value)?;
-    }
-    if let Some(value) = options.dual_tol {
-        set_ipopt_option(&mut solver, "dual_inf_tol", value)?;
-    }
-    if let Some(method) = problem.ipopt_nlp_scaling_method() {
-        set_ipopt_option(&mut solver, "nlp_scaling_method", method)?;
-    }
-    set_ipopt_option(&mut solver, "mu_strategy", options.mu_strategy.as_str())?;
-    set_ipopt_option(&mut solver, "print_level", options.print_level)?;
-    if options.suppress_banner {
-        set_ipopt_option(&mut solver, "sb", "yes")?;
-    }
+    apply_ipopt_options(&mut solver, problem.ipopt_nlp_scaling_method(), options)?;
     let journal_path = open_ipopt_journal(&mut solver);
     solver.set_intermediate_callback(Some(IpoptProblemAdapter::<P, C>::record_iteration));
 
@@ -948,5 +1110,6 @@ where
         snapshots,
         journal_output,
         profiling,
+        provenance,
     })
 }

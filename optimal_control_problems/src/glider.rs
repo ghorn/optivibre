@@ -2862,6 +2862,7 @@ mod tests {
         let compiled = compiled.compiled.borrow();
         let strict_runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
         let mut options = crate::common::nlip_options(&params.solver);
+        optimization::apply_native_spral_parity_to_nlip_options(&mut options);
         options.max_iters = 400;
         options.acceptable_iter = 0;
         options.verbose = false;
@@ -3035,6 +3036,7 @@ mod tests {
         let compiled = compiled.compiled.borrow();
         let strict_runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
         let mut options = crate::common::nlip_options(&params.solver);
+        optimization::apply_native_spral_parity_to_nlip_options(&mut options);
         options.max_iters = 400;
         options.acceptable_iter = 0;
         options.watchdog_shortened_iter_trigger = 0;
@@ -3147,7 +3149,8 @@ mod tests {
             .expect("glider direct collocation should compile");
         let compiled = compiled.compiled.borrow();
         let runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
-        let options = crate::common::ipopt_options(&params.solver);
+        let mut options = crate::common::ipopt_options(&params.solver);
+        optimization::apply_native_spral_parity_to_ipopt_options(&mut options);
         let mut last = None;
         let result = compiled.solve_ipopt_with_callback(&runtime, &options, |snapshot| {
             if snapshot.solver.iteration % 10 == 0 {
@@ -3201,6 +3204,7 @@ mod tests {
         let compiled = compiled.compiled.borrow();
         let runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
         let mut options = crate::common::nlip_options(&params.solver);
+        optimization::apply_native_spral_parity_to_nlip_options(&mut options);
         options.max_iters = 400;
         options.acceptable_iter = 0;
         options.verbose = false;
@@ -3305,6 +3309,7 @@ mod tests {
         let compiled = compiled.compiled.borrow();
         let runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
         let mut options = crate::common::nlip_options(&params.solver);
+        optimization::apply_native_spral_parity_to_nlip_options(&mut options);
         options.max_iters = 400;
         options.acceptable_iter = 0;
         options.watchdog_shortened_iter_trigger = 0;
@@ -3355,6 +3360,134 @@ mod tests {
                 println!("elapsed={elapsed:.3?}");
             }
         }
+    }
+
+    #[cfg(feature = "ipopt")]
+    #[test]
+    #[ignore = "manual native-SPRAL NLIP/IPOPT parity divergence helper"]
+    fn print_current_glider_native_spral_ipopt_first_divergence() {
+        #[derive(Clone)]
+        struct TracePoint {
+            iteration: usize,
+            objective: f64,
+            primal_inf: f64,
+            dual_inf: f64,
+            mu: f64,
+            trial_count: usize,
+        }
+
+        fn log_gap(lhs: f64, rhs: f64, floor: f64) -> f64 {
+            let lhs = lhs.abs().max(floor).log10();
+            let rhs = rhs.abs().max(floor).log10();
+            (lhs - rhs).abs()
+        }
+
+        let params = Params {
+            launch_speed_mps: 30.0,
+            initial_alpha_deg: 6.0,
+            max_alpha_rate_deg_s: 12.0,
+            solver_method: SolverMethod::Nlip,
+            ..Params::default()
+        };
+        let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
+            .expect("glider direct collocation should compile");
+        let compiled = compiled.compiled.borrow();
+        let runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+
+        let mut nlip_options = crate::common::nlip_options(&params.solver);
+        optimization::apply_native_spral_parity_to_nlip_options(&mut nlip_options);
+        nlip_options.max_iters = 400;
+        nlip_options.acceptable_iter = 0;
+        nlip_options.verbose = false;
+
+        let mut ipopt_options = crate::common::ipopt_options(&params.solver);
+        optimization::apply_native_spral_parity_to_ipopt_options(&mut ipopt_options);
+
+        let nlip = compiled.solve_interior_point(&runtime, &nlip_options);
+        let ipopt = compiled.solve_ipopt(&runtime, &ipopt_options);
+
+        let nlip_trace = match &nlip {
+            Ok(summary) => summary
+                .solver
+                .snapshots
+                .iter()
+                .filter(|snapshot| {
+                    snapshot.phase == optimization::InteriorPointIterationPhase::AcceptedStep
+                        && snapshot.alpha.is_some()
+                })
+                .map(|snapshot| TracePoint {
+                    iteration: snapshot.iteration,
+                    objective: snapshot.objective,
+                    primal_inf: snapshot
+                        .eq_inf
+                        .unwrap_or(0.0)
+                        .max(snapshot.ineq_inf.unwrap_or(0.0)),
+                    dual_inf: snapshot.dual_inf,
+                    mu: snapshot.barrier_parameter.unwrap_or(0.0),
+                    trial_count: snapshot.line_search_trials,
+                })
+                .collect::<Vec<_>>(),
+            Err(err) => {
+                println!("nlip_err={err}");
+                Vec::new()
+            }
+        };
+
+        let ipopt_trace = match &ipopt {
+            Ok(summary) => summary
+                .solver
+                .snapshots
+                .iter()
+                .filter(|snapshot| snapshot.iteration > 0)
+                .map(|snapshot| TracePoint {
+                    iteration: snapshot.iteration,
+                    objective: snapshot.objective,
+                    primal_inf: snapshot.primal_inf,
+                    dual_inf: snapshot.dual_inf,
+                    mu: snapshot.barrier_parameter,
+                    trial_count: snapshot.line_search_trials,
+                })
+                .collect::<Vec<_>>(),
+            Err(err) => {
+                println!("ipopt_err={err}");
+                Vec::new()
+            }
+        };
+
+        println!("\n=== glider native SPRAL NLIP/IPOPT first divergence ===");
+        println!(
+            "nlip_steps={} ipopt_steps={}",
+            nlip_trace.len(),
+            ipopt_trace.len()
+        );
+        for (index, (nlip_point, ipopt_point)) in
+            nlip_trace.iter().zip(ipopt_trace.iter()).enumerate()
+        {
+            let primal_gap = log_gap(nlip_point.primal_inf, ipopt_point.primal_inf, 1.0e-12);
+            let dual_gap = log_gap(nlip_point.dual_inf, ipopt_point.dual_inf, 1.0e-12);
+            let mu_gap = log_gap(nlip_point.mu, ipopt_point.mu, 1.0e-16);
+            let trial_gap = nlip_point.trial_count.abs_diff(ipopt_point.trial_count);
+            if primal_gap > 2.0 || dual_gap > 2.5 || mu_gap > 2.5 || trial_gap > 3 {
+                println!(
+                    "divergence_at_index={} nlip_iter={} ipopt_iter={} nlip_obj={:.6e} ipopt_obj={:.6e} nlip_primal={:.6e} ipopt_primal={:.6e} nlip_dual={:.6e} ipopt_dual={:.6e} nlip_mu={:.6e} ipopt_mu={:.6e} nlip_trials={} ipopt_trials={}",
+                    index,
+                    nlip_point.iteration,
+                    ipopt_point.iteration,
+                    nlip_point.objective,
+                    ipopt_point.objective,
+                    nlip_point.primal_inf,
+                    ipopt_point.primal_inf,
+                    nlip_point.dual_inf,
+                    ipopt_point.dual_inf,
+                    nlip_point.mu,
+                    ipopt_point.mu,
+                    nlip_point.trial_count,
+                    ipopt_point.trial_count,
+                );
+                return;
+            }
+        }
+        println!("no early divergence detected in compared accepted traces");
     }
 
     #[test]

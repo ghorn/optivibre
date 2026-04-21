@@ -2,10 +2,13 @@
 
 use approx::assert_abs_diff_eq;
 use optimization::{
-    CCS, CompiledNlpProblem, ConstraintBounds, InteriorPointOptions, IpoptOptions, ParameterMatrix,
+    CCS, CompiledNlpProblem, ConstraintBounds, FilterAcceptanceMode, InteriorPointIterationPhase,
+    InteriorPointOptions, InteriorPointStepKind, IpoptOptions, ParameterMatrix,
+    apply_native_spral_parity_to_ipopt_options, apply_native_spral_parity_to_nlip_options,
     solve_nlp_interior_point, solve_nlp_ipopt,
 };
 use rstest::rstest;
+use std::collections::BTreeMap;
 
 #[path = "support/generated_problem.rs"]
 mod generated_problem;
@@ -103,6 +106,372 @@ impl CompiledNlpProblem for BoundConstrainedQuadraticProblem {
     }
 }
 
+struct LinearlyConstrainedQuadraticProblem;
+
+impl CompiledNlpProblem for LinearlyConstrainedQuadraticProblem {
+    fn dimension(&self) -> usize {
+        2
+    }
+
+    fn parameter_count(&self) -> usize {
+        0
+    }
+
+    fn parameter_ccs(&self, _parameter_index: usize) -> &CCS {
+        unreachable!("linearly constrained quadratic problem has no parameters")
+    }
+
+    fn variable_bounds(&self) -> Option<ConstraintBounds> {
+        None
+    }
+
+    fn equality_count(&self) -> usize {
+        1
+    }
+
+    fn inequality_count(&self) -> usize {
+        1
+    }
+
+    fn objective_value(&self, x: &[f64], _parameters: &[ParameterMatrix<'_>]) -> f64 {
+        (x[0] - 2.0).powi(2) + 2.0 * (x[1] + 1.0).powi(2)
+    }
+
+    fn objective_gradient(&self, x: &[f64], _parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
+        out.copy_from_slice(&[2.0 * (x[0] - 2.0), 4.0 * (x[1] + 1.0)]);
+    }
+
+    fn equality_jacobian_ccs(&self) -> &CCS {
+        static JAC: std::sync::OnceLock<CCS> = std::sync::OnceLock::new();
+        JAC.get_or_init(|| CCS::new(1, 2, vec![0, 1, 2], vec![0, 0]))
+    }
+
+    fn equality_values(&self, x: &[f64], _parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
+        out[0] = x[0] + x[1] - 1.0;
+    }
+
+    fn equality_jacobian_values(
+        &self,
+        _x: &[f64],
+        _parameters: &[ParameterMatrix<'_>],
+        out: &mut [f64],
+    ) {
+        out.copy_from_slice(&[1.0, 1.0]);
+    }
+
+    fn inequality_jacobian_ccs(&self) -> &CCS {
+        static JAC: std::sync::OnceLock<CCS> = std::sync::OnceLock::new();
+        JAC.get_or_init(|| CCS::new(1, 2, vec![0, 1, 1], vec![0]))
+    }
+
+    fn inequality_values(&self, x: &[f64], _parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
+        out[0] = x[0] - 0.75;
+    }
+
+    fn inequality_jacobian_values(
+        &self,
+        _x: &[f64],
+        _parameters: &[ParameterMatrix<'_>],
+        out: &mut [f64],
+    ) {
+        out.copy_from_slice(&[1.0]);
+    }
+
+    fn lagrangian_hessian_ccs(&self) -> &CCS {
+        static HESSIAN_CCS: std::sync::OnceLock<CCS> = std::sync::OnceLock::new();
+        HESSIAN_CCS.get_or_init(|| CCS::lower_triangular_dense(2))
+    }
+
+    fn lagrangian_hessian_values(
+        &self,
+        _x: &[f64],
+        _parameters: &[ParameterMatrix<'_>],
+        _equality_multipliers: &[f64],
+        _inequality_multipliers: &[f64],
+        out: &mut [f64],
+    ) {
+        out.copy_from_slice(&[2.0, 0.0, 4.0]);
+    }
+}
+
+#[derive(Debug)]
+struct AcceptedTracePoint {
+    iteration: usize,
+    objective: f64,
+    primal_inf: f64,
+    dual_inf: f64,
+    barrier_parameter: f64,
+    has_barrier_parameter: bool,
+    alpha_pr: Option<f64>,
+    line_search_trials: usize,
+    step_tag: Option<String>,
+    marker: String,
+}
+
+fn parse_ipopt_step_tags(journal_output: Option<&str>) -> BTreeMap<usize, String> {
+    let mut tags = BTreeMap::new();
+    let Some(journal) = journal_output else {
+        return tags;
+    };
+    for line in journal.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || !trimmed.as_bytes()[0].is_ascii_digit() {
+            continue;
+        }
+        let tokens = trimmed.split_whitespace().collect::<Vec<_>>();
+        let Some(iteration) = tokens.first().and_then(|token| token.parse::<usize>().ok()) else {
+            continue;
+        };
+        let Some(alpha_pr_token) = tokens.iter().rev().nth(1).copied() else {
+            continue;
+        };
+        let Some(step_char) = alpha_pr_token
+            .chars()
+            .last()
+            .filter(|value| value.is_ascii_alphabetic())
+        else {
+            continue;
+        };
+        tags.insert(iteration, step_char.to_string());
+    }
+    tags
+}
+
+fn nlip_step_tag(snapshot: &optimization::InteriorPointIterationSnapshot) -> Option<String> {
+    snapshot
+        .step_tag
+        .map(|value| value.to_string())
+        .or_else(|| {
+            snapshot
+                .filter
+                .as_ref()
+                .and_then(|filter| filter.accepted_mode)
+                .map(|mode| match mode {
+                    FilterAcceptanceMode::ObjectiveArmijo => "f".to_string(),
+                    FilterAcceptanceMode::ViolationReduction => "h".to_string(),
+                })
+                .or_else(|| {
+                    snapshot.step_kind.map(|kind| match kind {
+                        InteriorPointStepKind::Objective => "f".to_string(),
+                        InteriorPointStepKind::Feasibility => "h".to_string(),
+                    })
+                })
+        })
+}
+
+fn nlip_accepted_trace(summary: &optimization::InteriorPointSummary) -> Vec<AcceptedTracePoint> {
+    summary
+        .snapshots
+        .iter()
+        .filter(|snapshot| {
+            snapshot.phase == InteriorPointIterationPhase::AcceptedStep && snapshot.alpha.is_some()
+        })
+        .map(|snapshot| AcceptedTracePoint {
+            iteration: snapshot.iteration,
+            objective: snapshot.objective,
+            primal_inf: snapshot
+                .eq_inf
+                .unwrap_or(0.0)
+                .max(snapshot.ineq_inf.unwrap_or(0.0)),
+            dual_inf: snapshot.dual_inf,
+            barrier_parameter: snapshot.barrier_parameter.unwrap_or(0.0),
+            has_barrier_parameter: snapshot.barrier_parameter.is_some(),
+            alpha_pr: snapshot.alpha_pr.or(snapshot.alpha),
+            line_search_trials: snapshot.line_search_trials,
+            step_tag: nlip_step_tag(snapshot),
+            marker: optimization::nlip_event_codes_for_events(&snapshot.events),
+        })
+        .collect()
+}
+
+fn ipopt_accepted_trace(summary: &optimization::IpoptSummary) -> Vec<AcceptedTracePoint> {
+    let step_tags = parse_ipopt_step_tags(summary.journal_output.as_deref());
+    summary
+        .snapshots
+        .iter()
+        .filter(|snapshot| snapshot.iteration > 0)
+        .map(|snapshot| AcceptedTracePoint {
+            iteration: snapshot.iteration,
+            objective: snapshot.objective,
+            primal_inf: snapshot.primal_inf,
+            dual_inf: snapshot.dual_inf,
+            barrier_parameter: snapshot.barrier_parameter,
+            has_barrier_parameter: true,
+            alpha_pr: Some(snapshot.alpha_pr),
+            // IPOPT's printed `ls` count includes the accepted trial itself;
+            // NLIP snapshots store pure backtracks. Normalize before comparing.
+            line_search_trials: snapshot.line_search_trials.saturating_sub(1),
+            step_tag: step_tags.get(&snapshot.iteration).cloned(),
+            marker: String::new(),
+        })
+        .collect()
+}
+
+fn log_gap(lhs: f64, rhs: f64, floor: f64) -> f64 {
+    let lhs = lhs.abs().max(floor).log10();
+    let rhs = rhs.abs().max(floor).log10();
+    (lhs - rhs).abs()
+}
+
+fn assert_local_spral_ipopt_provenance(summary: &optimization::IpoptSummary) {
+    let provenance = summary
+        .provenance
+        .as_ref()
+        .expect("expected IPOPT provenance for native-SPRAL parity runs");
+    assert_local_spral_ipopt_environment(provenance);
+}
+
+fn assert_local_spral_ipopt_environment(provenance: &optimization::IpoptProvenance) {
+    assert_eq!(provenance.pkg_config_version.as_deref(), Some("3.14.20"));
+    let flags = provenance
+        .pkg_config_cflags_libs
+        .as_deref()
+        .expect("expected pkg-config cflags/libs for local IPOPT");
+    assert!(
+        flags.contains("/Users/greg/local/ipopt-spral"),
+        "expected local SPRAL IPOPT flags, got {flags}"
+    );
+    assert_eq!(provenance.linear_solver_default.as_deref(), Some("spral"));
+}
+
+fn assert_accepted_trace_parity(
+    problem_name: &str,
+    native: &optimization::InteriorPointSummary,
+    ipopt: &optimization::IpoptSummary,
+    max_iteration_gap: usize,
+    max_step_tag_mismatches: usize,
+    max_primal_log_gap: f64,
+    max_dual_log_gap: f64,
+    max_mu_log_gap: f64,
+) {
+    const PRIMAL_TRACE_FLOOR: f64 = 1.0e-6;
+    let native_trace = nlip_accepted_trace(native);
+    let ipopt_trace = ipopt_accepted_trace(ipopt);
+    if compare_verbose_requested() {
+        print_accepted_trace_comparison(problem_name, &native_trace, &ipopt_trace);
+    }
+    let iteration_gap = native_trace.len().abs_diff(ipopt_trace.len());
+    assert!(
+        iteration_gap <= max_iteration_gap,
+        "{problem_name} accepted-step count mismatch: native={} ipopt={}",
+        native_trace.len(),
+        ipopt_trace.len(),
+    );
+    let compared = native_trace.len().min(ipopt_trace.len());
+    let mut step_tag_mismatches = 0usize;
+    let mut max_dual_gap_observed = 0.0f64;
+    for (native_point, ipopt_point) in native_trace.iter().zip(ipopt_trace.iter()) {
+        if let (Some(native_tag), Some(ipopt_tag)) = (&native_point.step_tag, &ipopt_point.step_tag)
+            && native_tag != ipopt_tag
+        {
+            step_tag_mismatches += 1;
+        }
+        assert!(
+            log_gap(
+                native_point.primal_inf,
+                ipopt_point.primal_inf,
+                PRIMAL_TRACE_FLOOR,
+            ) <= max_primal_log_gap,
+            "{problem_name} primal trace diverged at accepted iter {} (native iter {} / ipopt iter {}): native={} ipopt={}",
+            native_point.iteration.min(ipopt_point.iteration),
+            native_point.iteration,
+            ipopt_point.iteration,
+            native_point.primal_inf,
+            ipopt_point.primal_inf,
+        );
+        max_dual_gap_observed = max_dual_gap_observed.max(log_gap(
+            native_point.dual_inf,
+            ipopt_point.dual_inf,
+            1.0e-12,
+        ));
+        if native_point.has_barrier_parameter
+            && ipopt_point.has_barrier_parameter
+            && native_point
+                .barrier_parameter
+                .max(ipopt_point.barrier_parameter)
+                > 1.0e-10
+        {
+            assert!(
+                log_gap(
+                    native_point.barrier_parameter,
+                    ipopt_point.barrier_parameter,
+                    1.0e-16,
+                ) <= max_mu_log_gap,
+                "{problem_name} barrier trace diverged at accepted iter {} (native iter {} / ipopt iter {}): native={} ipopt={}",
+                native_point.iteration.min(ipopt_point.iteration),
+                native_point.iteration,
+                ipopt_point.iteration,
+                native_point.barrier_parameter,
+                ipopt_point.barrier_parameter,
+            );
+        }
+    }
+    assert!(
+        step_tag_mismatches <= max_step_tag_mismatches,
+        "{problem_name} step-tag mismatches too large: {step_tag_mismatches} over {compared} accepted steps",
+    );
+    if compare_verbose_requested() && max_dual_gap_observed > max_dual_log_gap {
+        eprintln!(
+            "[compare] {problem_name} dual trace gap exceeds budget diagnostically: max_gap={max_dual_gap_observed:.3} budget={max_dual_log_gap:.3}"
+        );
+    }
+}
+
+fn print_accepted_trace_comparison(
+    problem_name: &str,
+    native_trace: &[AcceptedTracePoint],
+    ipopt_trace: &[AcceptedTracePoint],
+) {
+    eprintln!("[compare] accepted trace for {problem_name}");
+    eprintln!(
+        "[compare] {:>4} | {:>4} {:>2} {:>10} {:>10} {:>10} {:>8} {:>2} {:<12} || {:>4} {:>2} {:>10} {:>10} {:>10} {:>8} {:>2}",
+        "idx",
+        "n_it",
+        "nt",
+        "n_obj",
+        "n_pr",
+        "n_du",
+        "n_alpha",
+        "nl",
+        "n_evt",
+        "i_it",
+        "it",
+        "i_obj",
+        "i_pr",
+        "i_du",
+        "i_alpha",
+        "il",
+    );
+    for (index, (native, ipopt)) in native_trace.iter().zip(ipopt_trace.iter()).enumerate() {
+        eprintln!(
+            "[compare] {:>4} | {:>4} {:>2} {:>10.3e} {:>10.3e} {:>10.3e} {:>8.2e} {:>2} {:<12} || {:>4} {:>2} {:>10.3e} {:>10.3e} {:>10.3e} {:>8.2e} {:>2}",
+            index,
+            native.iteration,
+            native.step_tag.as_deref().unwrap_or("-"),
+            native.objective,
+            native.primal_inf,
+            native.dual_inf,
+            native.alpha_pr.unwrap_or(f64::NAN),
+            native.line_search_trials,
+            native.marker,
+            ipopt.iteration,
+            ipopt.step_tag.as_deref().unwrap_or("-"),
+            ipopt.objective,
+            ipopt.primal_inf,
+            ipopt.dual_inf,
+            ipopt.alpha_pr.unwrap_or(f64::NAN),
+            ipopt.line_search_trials,
+        );
+    }
+    if native_trace.len() != ipopt_trace.len() {
+        eprintln!(
+            "[compare] accepted trace length differs: native={} ipopt={}",
+            native_trace.len(),
+            ipopt_trace.len()
+        );
+    }
+}
+
 fn build_problem_ok(
     result: anyhow::Result<CallbackNlpProblem>,
     backend: CallbackBackend,
@@ -124,31 +493,39 @@ fn compare_verbose_requested() -> bool {
 }
 
 fn native_options() -> InteriorPointOptions {
-    InteriorPointOptions {
+    let mut options = InteriorPointOptions {
         max_iters: 120,
+        acceptable_iter: 0,
         verbose: compare_verbose_requested(),
         ..InteriorPointOptions::default()
-    }
+    };
+    apply_native_spral_parity_to_nlip_options(&mut options);
+    options
 }
 
 fn hs071_native_options() -> InteriorPointOptions {
-    InteriorPointOptions {
+    let mut options = InteriorPointOptions {
         max_iters: 300,
         dual_tol: 1.0e-5,
         overall_tol: 1.0e-5,
+        acceptable_iter: 0,
         verbose: compare_verbose_requested(),
         ..InteriorPointOptions::default()
-    }
+    };
+    apply_native_spral_parity_to_nlip_options(&mut options);
+    options
 }
 
 fn ipopt_options() -> IpoptOptions {
     let verbose = compare_verbose_requested();
-    IpoptOptions {
+    let mut options = IpoptOptions {
         max_iters: 120,
         print_level: if verbose { 5 } else { 0 },
         suppress_banner: !verbose,
         ..IpoptOptions::default()
-    }
+    };
+    apply_native_spral_parity_to_ipopt_options(&mut options);
+    options
 }
 
 fn max_abs_diff(lhs: &[f64], rhs: &[f64]) -> f64 {
@@ -178,6 +555,10 @@ fn maybe_print_compare_summary(
         ipopt.objective,
         max_abs_diff(&native.x, &ipopt.x),
     );
+    eprintln!(
+        "[compare] {problem_name} native_linear_solver={:?} ipopt_provenance={:?}",
+        native.linear_solver, ipopt.provenance,
+    );
 }
 
 fn assert_native_matches_ipopt(
@@ -189,6 +570,11 @@ fn assert_native_matches_ipopt(
     objective_epsilon: f64,
 ) {
     maybe_print_compare_summary(problem_name, backend, native, ipopt);
+    assert_eq!(
+        native.linear_solver,
+        optimization::InteriorPointLinearSolver::NativeSpralSsids
+    );
+    assert_local_spral_ipopt_provenance(ipopt);
     assert_abs_diff_eq!(
         native.objective,
         ipopt.objective,
@@ -239,10 +625,14 @@ fn solve_ipopt_ok<P: CompiledNlpProblem>(
     x0: &[f64],
     parameters: &[ParameterMatrix<'_>],
 ) -> optimization::IpoptSummary {
+    assert_local_spral_ipopt_environment(&optimization::capture_ipopt_provenance());
     let solve_result = solve_nlp_ipopt(problem, x0, parameters, &ipopt_options());
     assert!(solve_result.is_ok(), "Ipopt solve failed: {solve_result:?}");
     match solve_result {
-        Ok(summary) => summary,
+        Ok(summary) => {
+            assert_local_spral_ipopt_provenance(&summary);
+            summary
+        }
         Err(err) => unreachable!("asserted success: {err}"),
     }
 }
@@ -354,6 +744,7 @@ fn compare_native_and_ipopt_on_hanging_chain(
     let native = solve_native_ok(&problem, &x0, &[]);
     let ipopt = solve_ipopt_ok(&problem, &x0, &[]);
     assert_native_matches_ipopt("hanging_chain", Some(backend), &native, &ipopt, 1e-3, 1e-4);
+    assert_accepted_trace_parity("hanging_chain", &native, &ipopt, 6, 6, 2.5, 3.0, 3.0);
 }
 
 #[test]
@@ -362,6 +753,31 @@ fn compare_native_and_ipopt_on_box_bounds_regression() {
     let native = solve_native_ok(&problem, &[-10.0, 10.0], &[]);
     let ipopt = solve_ipopt_ok(&problem, &[-10.0, 10.0], &[]);
     assert_native_matches_ipopt("box_bounds_quadratic", None, &native, &ipopt, 1e-4, 1e-4);
+}
+
+#[test]
+fn compare_native_and_ipopt_on_linearly_constrained_quadratic_trace() {
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_native_ok(&problem, &[0.1, 0.9], &[]);
+    let ipopt = solve_ipopt_ok(&problem, &[0.1, 0.9], &[]);
+    assert_native_matches_ipopt(
+        "linearly_constrained_quadratic",
+        None,
+        &native,
+        &ipopt,
+        1e-6,
+        1e-6,
+    );
+    assert_accepted_trace_parity(
+        "linearly_constrained_quadratic",
+        &native,
+        &ipopt,
+        2,
+        2,
+        1.5,
+        2.0,
+        2.0,
+    );
 }
 
 #[test]

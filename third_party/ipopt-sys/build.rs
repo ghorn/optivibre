@@ -130,6 +130,15 @@ fn main() {
     println!("cargo:rerun-if-changed=cnlp/src/c_api.h");
     println!("cargo:rerun-if-changed=cnlp/src/nlp.cpp");
     println!("cargo:rerun-if-changed=cnlp/src/nlp.hpp");
+    println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
+    println!("cargo:rerun-if-env-changed=PKG_CONFIG_LIBDIR");
+    println!("cargo:rerun-if-env-changed=PKG_CONFIG_SYSROOT_DIR");
+    println!("cargo:rerun-if-env-changed=LIBRARY_PATH");
+    println!("cargo:rerun-if-env-changed=DYLD_LIBRARY_PATH");
+    println!("cargo:rerun-if-env-changed=DYLD_FALLBACK_LIBRARY_PATH");
+    println!("cargo:rerun-if-env-changed=CC");
+    println!("cargo:rerun-if-env-changed=CXX");
+    println!("cargo:rerun-if-env-changed=PATH");
 
     let mut msg = String::from("\n\n");
 
@@ -555,7 +564,7 @@ fn link(cnlp_install_path: PathBuf, link_info: LinkInfo) -> Result<(), Error> {
     }
 
     // Add the C++ standard lib for linking against CNLP.
-    if cfg!(target_os = "macos") {
+    if cfg!(target_os = "macos") && !uses_gnu_cxx() {
         println!("cargo:rustc-link-lib=dylib=c++");
     } else {
         println!("cargo:rustc-link-lib=dylib=stdc++");
@@ -575,6 +584,18 @@ fn link(cnlp_install_path: PathBuf, link_info: LinkInfo) -> Result<(), Error> {
         .expect("Couldn't write bindings!");
 
     Ok(())
+}
+
+fn uses_gnu_cxx() -> bool {
+    env::var("CXX")
+        .ok()
+        .and_then(|value| {
+            Path::new(&value)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .map(|name| name.starts_with("g++"))
+        .unwrap_or(false)
 }
 
 /// Download a tarball if it doesn't already exist.
@@ -694,7 +715,7 @@ fn build_and_install_ipopt() -> Result<LinkInfo, Error> {
 }
 
 /// The kind of library being linked by rustc.
-#[derive(Copy, Clone, Serialize, Deserialize, Debug)]
+#[derive(Copy, Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 enum LibKind {
     Dynamic,
     Static,
