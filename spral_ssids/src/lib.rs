@@ -3213,32 +3213,25 @@ fn lower_transpose_dot_in_range_like_native(
     if range_start == range_end {
         return 0.0;
     }
-    if range_start + values.len() <= range_end
+    let range_len = range_end - range_start;
+    if values.len() == range_len
         && rows
             .iter()
             .enumerate()
             .all(|(offset, &row)| row == range_start + offset)
     {
-        openblas_dotu_like_contiguous(values, &factor_rhs[range_start..range_start + values.len()])
-    } else if rows
-        .iter()
-        .all(|&row| (range_start..range_end).contains(&row))
-    {
-        // Native APP solves call dense BLAS over the whole panel. Structural
-        // zeros inside that panel still participate in the dot reduction order.
-        let mut dense_values = vec![0.0; range_end - range_start];
-        for (&value, &row) in values.iter().zip(rows) {
-            dense_values[row - range_start] = value;
-        }
-        openblas_dotu_like_contiguous(&dense_values, &factor_rhs[range_start..range_end])
+        openblas_dotu_like_contiguous(values, &factor_rhs[range_start..range_end])
     } else {
-        let mut dot = 0.0;
+        // Native APP DTRSV works on dense panels. Rows outside this triangular
+        // panel are ignored, but structural zeros inside it still participate
+        // in the OpenBLAS DOTU reduction order.
+        let mut dense_values = vec![0.0; range_len];
         for (&value, &row) in values.iter().zip(rows) {
             if (range_start..range_end).contains(&row) {
-                dot = value.mul_add(factor_rhs[row], dot);
+                dense_values[row - range_start] = value;
             }
         }
-        dot
+        openblas_dotu_like_contiguous(&dense_values, &factor_rhs[range_start..range_end])
     }
 }
 
