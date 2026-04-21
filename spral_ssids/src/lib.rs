@@ -3085,6 +3085,17 @@ fn lower_transpose_dot_like_native(
             .all(|(offset, &row)| row == first_row + offset)
     {
         openblas_dotu_like_contiguous(values, &factor_rhs[first_row..first_row + values.len()])
+    } else if rows
+        .iter()
+        .all(|&row| (first_row..factor_rhs.len()).contains(&row))
+    {
+        // Native APP solves call dense BLAS over the whole panel. Structural
+        // zeros inside that panel still participate in the dot reduction order.
+        let mut dense_values = vec![0.0; factor_rhs.len() - first_row];
+        for (&value, &row) in values.iter().zip(rows) {
+            dense_values[row - first_row] = value;
+        }
+        openblas_dotu_like_contiguous(&dense_values, &factor_rhs[first_row..])
     } else {
         let mut dot = 0.0;
         for (&value, &row) in values.iter().zip(rows) {
