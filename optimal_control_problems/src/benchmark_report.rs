@@ -1798,6 +1798,8 @@ const fn problem_label(problem_id: ProblemId) -> &'static str {
         ProblemId::LinearSManeuver => "Linear Point-to-Point S Maneuver",
         ProblemId::SailboatUpwind => "Sailboat Upwind",
         ProblemId::CraneTransfer => "Crane Transfer",
+        ProblemId::HangingChainStatic => "Static Hanging Chain",
+        ProblemId::RosenbrockVariants => "Rosenbrock Variants",
     }
 }
 

@@ -143,8 +143,8 @@ struct CompileCacheSnapshot {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "optimal_control_webapp",
-    about = "Local interactive web app for optimal_control problem demos."
+    name = "optimization_studio",
+    about = "Local interactive web app for optimization and optimal-control demos."
 )]
 struct WebappCli {
     #[arg(long, env = "PORT", default_value_t = 3000)]
@@ -156,7 +156,7 @@ async fn main() -> Result<()> {
     let cli = WebappCli::parse();
     let port = cli.port;
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
-    println!("optimal_control_webapp listening on http://127.0.0.1:{port}");
+    println!("optimization_studio listening on http://127.0.0.1:{port}");
 
     let app = Router::new()
         .route("/", get(index))

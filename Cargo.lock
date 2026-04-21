@@ -1585,23 +1585,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "optimal_control_webapp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "libc",
- "optimal_control_problems",
- "optimization",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-stream",
-]
-
-[[package]]
 name = "optimization"
 version = "0.1.0"
 dependencies = [
@@ -1625,6 +1608,23 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "vectorize",
+]
+
+[[package]]
+name = "optimization_studio"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "libc",
+ "optimal_control_problems",
+ "optimization",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]

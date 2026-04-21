@@ -13,7 +13,7 @@ members = [
     "optimal_control",
     "optimal_control_problems",
     "optimal_control_benchmarks",
-    "optimal_control_webapp",
+    "optimization_studio",
     "lqr_solvers",
     "test_problems",
     "examples_source",

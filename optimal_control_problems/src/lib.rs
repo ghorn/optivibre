@@ -13,6 +13,7 @@ pub mod crane;
 pub mod glider;
 pub mod linear_s;
 pub mod sailboat;
+mod static_optimization;
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -25,14 +26,14 @@ pub use benchmark_report::{
     write_ocp_benchmark_report,
 };
 pub use common::{
-    Chart, CompileCacheState, CompileCacheStatus, ControlChoice, ControlEditor, ControlPanel,
-    ControlSection, ControlSemantic, ControlSpec, ControlValueDisplay, ControlVisibility,
-    DerivativeCheckOrder, DerivativeCheckRequest, DirectCollocationCompileKey, LatexSection,
-    Metric, MetricKey, OcpKernelStrategy, OcpOverrideBehavior, OcpSxFunctionConfig, PlotMode,
-    ProblemDerivativeCheck, ProblemId, ProblemSpec, Scene2D, SceneAnimation, SceneArrow,
-    SceneCircle, SceneFrame, ScenePath, SolveArtifact, SolveLogLevel, SolvePhase, SolveProgress,
-    SolveRequest, SolveStage, SolveStatus, SolveStreamEvent, SolverMethod, SolverReport,
-    SolverStatusKind, TimeGrid, TimeSeries, TimeSeriesRole, TranscriptionConfig,
+    ArtifactVisualization, Chart, CompileCacheState, CompileCacheStatus, ControlChoice,
+    ControlEditor, ControlPanel, ControlSection, ControlSemantic, ControlSpec, ControlValueDisplay,
+    ControlVisibility, DerivativeCheckOrder, DerivativeCheckRequest, DirectCollocationCompileKey,
+    LatexSection, Metric, MetricKey, OcpKernelStrategy, OcpOverrideBehavior, OcpSxFunctionConfig,
+    PlotMode, ProblemDerivativeCheck, ProblemId, ProblemSpec, Scene2D, SceneAnimation, SceneArrow,
+    SceneCircle, SceneFrame, ScenePath, ScenePath3D, SolveArtifact, SolveLogLevel, SolvePhase,
+    SolveProgress, SolveRequest, SolveStage, SolveStatus, SolveStreamEvent, SolverMethod,
+    SolverReport, SolverStatusKind, TimeGrid, TimeSeries, TimeSeriesRole, TranscriptionConfig,
     TranscriptionMethod, direct_collocation_variant, direct_collocation_variant_with_sx,
     find_metric, metric, metric_with_key, multiple_shooting_variant,
     multiple_shooting_variant_with_sx, numeric_metric_with_key,
@@ -68,6 +69,8 @@ fn problem_entries() -> &'static [ProblemEntry] {
             linear_s::problem_entry(),
             sailboat::problem_entry(),
             crane::problem_entry(),
+            static_optimization::hanging_chain_problem_entry(),
+            static_optimization::rosenbrock_problem_entry(),
         ]
     });
     &ENTRIES
@@ -124,6 +127,9 @@ pub fn compile_variant_for_problem(
     id: ProblemId,
     values: &BTreeMap<String, f64>,
 ) -> Option<(String, String)> {
+    if let Some(variant) = static_optimization::compile_variant_for_problem(id) {
+        return Some(variant);
+    }
     let spec = problem_specs().into_iter().find(|spec| spec.id == id)?;
     let control_value = |semantic: ControlSemantic, fallback: f64| {
         spec.controls

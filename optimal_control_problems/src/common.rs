@@ -175,6 +175,8 @@ pub enum ProblemId {
     LinearSManeuver,
     SailboatUpwind,
     CraneTransfer,
+    HangingChainStatic,
+    RosenbrockVariants,
 }
 
 impl ProblemId {
@@ -184,6 +186,8 @@ impl ProblemId {
             Self::LinearSManeuver => "linear_s_maneuver",
             Self::SailboatUpwind => "sailboat_upwind",
             Self::CraneTransfer => "crane_transfer",
+            Self::HangingChainStatic => "hanging_chain_static",
+            Self::RosenbrockVariants => "rosenbrock_variants",
         }
     }
 }
@@ -197,6 +201,8 @@ impl std::str::FromStr for ProblemId {
             "linear_s_maneuver" => Ok(Self::LinearSManeuver),
             "sailboat_upwind" => Ok(Self::SailboatUpwind),
             "crane_transfer" => Ok(Self::CraneTransfer),
+            "hanging_chain_static" => Ok(Self::HangingChainStatic),
+            "rosenbrock_variants" => Ok(Self::RosenbrockVariants),
             _ => Err(format!("unknown problem `{value}`")),
         }
     }
@@ -394,6 +400,38 @@ pub struct Scene2D {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct ScenePath3D {
+    pub name: String,
+    pub x: Vec<f64>,
+    pub y: Vec<f64>,
+    pub z: Vec<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ArtifactVisualization {
+    #[serde(rename = "contour_2d")]
+    Contour2D {
+        title: String,
+        x_label: String,
+        y_label: String,
+        x: Vec<f64>,
+        y: Vec<f64>,
+        z: Vec<Vec<f64>>,
+        paths: Vec<ScenePath>,
+        circles: Vec<SceneCircle>,
+    },
+    #[serde(rename = "paths_3d")]
+    Paths3D {
+        title: String,
+        x_label: String,
+        y_label: String,
+        z_label: String,
+        paths: Vec<ScenePath3D>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct SolveArtifact {
     pub title: String,
     pub summary: Vec<Metric>,
@@ -404,6 +442,8 @@ pub struct SolveArtifact {
     pub constraint_panels: ConstraintPanels,
     pub charts: Vec<Chart>,
     pub scene: Scene2D,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub visualizations: Vec<ArtifactVisualization>,
     pub notes: Vec<String>,
 }
 
@@ -424,6 +464,7 @@ impl SolveArtifact {
             constraint_panels: ConstraintPanels::default(),
             charts,
             scene,
+            visualizations: Vec::new(),
             notes,
         }
     }

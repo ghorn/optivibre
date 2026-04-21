@@ -381,12 +381,16 @@ const PROBLEM_ID = Object.freeze({
   linearSManeuver: 1,
   sailboatUpwind: 2,
   craneTransfer: 3,
+  hangingChainStatic: 4,
+  rosenbrockVariants: 5,
 } as const);
 const PROBLEM_ID_FROM_WIRE = Object.freeze({
   optimal_distance_glider: PROBLEM_ID.optimalDistanceGlider,
   linear_s_maneuver: PROBLEM_ID.linearSManeuver,
   sailboat_upwind: PROBLEM_ID.sailboatUpwind,
   crane_transfer: PROBLEM_ID.craneTransfer,
+  hanging_chain_static: PROBLEM_ID.hangingChainStatic,
+  rosenbrock_variants: PROBLEM_ID.rosenbrockVariants,
 } as const);
 const COMPILE_CACHE_STATE = Object.freeze({
   warming: 0,
@@ -585,6 +589,36 @@ interface Scene2D {
   animation?: SceneAnimation | null;
 }
 
+interface ScenePath3D {
+  name: string;
+  x: number[];
+  y: number[];
+  z: number[];
+}
+
+interface Contour2DVisualization {
+  kind: "contour_2d";
+  title: string;
+  x_label: string;
+  y_label: string;
+  x: number[];
+  y: number[];
+  z: number[][];
+  paths: ScenePath[];
+  circles: SceneCircle[];
+}
+
+interface Paths3DVisualization {
+  kind: "paths_3d";
+  title: string;
+  x_label: string;
+  y_label: string;
+  z_label: string;
+  paths: ScenePath3D[];
+}
+
+type ArtifactVisualization = Contour2DVisualization | Paths3DVisualization;
+
 interface ConstraintPanelEntry {
   label: string;
   category: ConstraintPanelCategoryCode;
@@ -710,17 +744,19 @@ interface SolveArtifact {
   constraint_panels: ConstraintPanels;
   charts: Chart[];
   scene: Scene2D;
+  visualizations: ArtifactVisualization[];
   notes: string[];
 }
 
 interface WireSolveArtifact extends Omit<
   SolveArtifact,
-  "summary" | "solver" | "constraint_panels" | "charts"
+  "summary" | "solver" | "constraint_panels" | "charts" | "visualizations"
 > {
   summary?: WireMetric[];
   solver: WireSolverReport;
   constraint_panels?: WireConstraintPanels | null;
   charts?: WireChart[];
+  visualizations?: ArtifactVisualization[];
 }
 
 interface SolveStatus {
@@ -811,7 +847,26 @@ interface LogLine {
 interface ChartView {
   plotEl: PlotlyHostElement;
   linkedRangeBound: boolean;
+  linkXRange: boolean;
 }
+
+interface ChartPanelChart {
+  kind: "chart";
+  key: string;
+  title: string;
+  subtitle: string;
+  chart: Chart;
+}
+
+interface ChartPanelVisualization {
+  kind: "visualization";
+  key: string;
+  title: string;
+  subtitle: string;
+  visualization: ArtifactVisualization;
+}
+
+type ChartPanel = ChartPanelChart | ChartPanelVisualization;
 
 interface SceneView {
   scene: Scene2D;
@@ -1022,6 +1077,11 @@ function readJsonNumberArray(value: JsonValue | undefined, context: string): num
     readJsonNumber(item, `${context}[${index}]`));
 }
 
+function readJsonNumberMatrix(value: JsonValue | undefined, context: string): number[][] {
+  return readJsonArray(value, context).map((row, index) =>
+    readJsonNumberArray(row, `${context}[${index}]`));
+}
+
 function readOptionalJsonArray(value: JsonValue | undefined, context: string): JsonArray | undefined {
   if (value == null) {
     return undefined;
@@ -1230,6 +1290,16 @@ function readScenePath(value: JsonValue | undefined, context: string): ScenePath
   };
 }
 
+function readScenePath3D(value: JsonValue | undefined, context: string): ScenePath3D {
+  const object = readJsonObject(value, context);
+  return {
+    name: readJsonString(readJsonValueAt(object, "name"), `${context}.name`),
+    x: readJsonNumberArray(readJsonValueAt(object, "x"), `${context}.x`),
+    y: readJsonNumberArray(readJsonValueAt(object, "y"), `${context}.y`),
+    z: readJsonNumberArray(readJsonValueAt(object, "z"), `${context}.z`),
+  };
+}
+
 function readSceneCircle(value: JsonValue | undefined, context: string): SceneCircle {
   const object = readJsonObject(value, context);
   return {
@@ -1298,6 +1368,45 @@ function readScene2D(value: JsonValue | undefined, context: string): Scene2D {
     animation:
       animationValue == null ? null : readSceneAnimation(animationValue, `${context}.animation`),
   };
+}
+
+function readArtifactVisualization(
+  value: JsonValue | undefined,
+  context: string,
+): ArtifactVisualization {
+  const object = readJsonObject(value, context);
+  const kind = readJsonString(readJsonValueAt(object, "kind"), `${context}.kind`);
+  if (kind === "contour_2d") {
+    const pathsValue = readOptionalJsonArray(readJsonValueAt(object, "paths"), `${context}.paths`);
+    const circlesValue = readOptionalJsonArray(
+      readJsonValueAt(object, "circles"),
+      `${context}.circles`,
+    );
+    return {
+      kind,
+      title: readJsonString(readJsonValueAt(object, "title"), `${context}.title`),
+      x_label: readJsonString(readJsonValueAt(object, "x_label"), `${context}.x_label`),
+      y_label: readJsonString(readJsonValueAt(object, "y_label"), `${context}.y_label`),
+      x: readJsonNumberArray(readJsonValueAt(object, "x"), `${context}.x`),
+      y: readJsonNumberArray(readJsonValueAt(object, "y"), `${context}.y`),
+      z: readJsonNumberMatrix(readJsonValueAt(object, "z"), `${context}.z`),
+      paths: (pathsValue ?? []).map((path, index) => readScenePath(path, `${context}.paths[${index}]`)),
+      circles: (circlesValue ?? []).map((circle, index) =>
+        readSceneCircle(circle, `${context}.circles[${index}]`)),
+    };
+  }
+  if (kind === "paths_3d") {
+    const pathsValue = readOptionalJsonArray(readJsonValueAt(object, "paths"), `${context}.paths`);
+    return {
+      kind,
+      title: readJsonString(readJsonValueAt(object, "title"), `${context}.title`),
+      x_label: readJsonString(readJsonValueAt(object, "x_label"), `${context}.x_label`),
+      y_label: readJsonString(readJsonValueAt(object, "y_label"), `${context}.y_label`),
+      z_label: readJsonString(readJsonValueAt(object, "z_label"), `${context}.z_label`),
+      paths: (pathsValue ?? []).map((path, index) => readScenePath3D(path, `${context}.paths[${index}]`)),
+    };
+  }
+  throw new Error(`${context}.kind has unsupported visualization kind ${JSON.stringify(kind)}.`);
 }
 
 function readWireConstraintPanelEntry(
@@ -1526,6 +1635,10 @@ function readWireSolveArtifact(value: JsonValue | undefined, context: string): W
   const object = readJsonObject(value, context);
   const summary = readOptionalJsonArray(readJsonValueAt(object, "summary"), `${context}.summary`);
   const charts = readOptionalJsonArray(readJsonValueAt(object, "charts"), `${context}.charts`);
+  const visualizations = readOptionalJsonArray(
+    readJsonValueAt(object, "visualizations"),
+    `${context}.visualizations`,
+  );
   const notes = readOptionalJsonArray(readJsonValueAt(object, "notes"), `${context}.notes`);
   const constraintPanels = readJsonValueAt(object, "constraint_panels");
   return {
@@ -1537,6 +1650,8 @@ function readWireSolveArtifact(value: JsonValue | undefined, context: string): W
         ? null
         : readWireConstraintPanels(constraintPanels, `${context}.constraint_panels`),
     charts: charts?.map((chart, index) => readWireChart(chart, `${context}.charts[${index}]`)),
+    visualizations: visualizations?.map((visualization, index) =>
+      readArtifactVisualization(visualization, `${context}.visualizations[${index}]`)),
     scene: readScene2D(readJsonValueAt(object, "scene"), `${context}.scene`),
     notes: notes?.map((note, index) => readJsonString(note, `${context}.notes[${index}]`)) ?? [],
   };
@@ -2534,6 +2649,7 @@ function normalizeArtifact(artifact: WireSolveArtifact): SolveArtifact {
     summary: (artifact.summary ?? []).map(normalizeMetric),
     constraint_panels: normalizeConstraintPanels(artifact.constraint_panels),
     charts: (artifact.charts ?? []).map(normalizeChart),
+    visualizations: artifact.visualizations ?? [],
   };
 }
 
@@ -3293,7 +3409,7 @@ function syncLinkedChartRange(sourceView: ChartView, eventData: PlotlyRelayoutPa
   const tasks: Promise<void>[] = [];
   state.linkingChartRange = true;
   for (const view of state.chartViews.values()) {
-    if (view === sourceView) {
+    if (view === sourceView || !view.linkXRange) {
       continue;
     }
     tasks.push(window.Plotly.relayout(view.plotEl, payload));
@@ -5614,13 +5730,42 @@ function renderScene(): void {
   updateScenePlot(view);
 }
 
-function chartLayoutKey(charts: Chart[]): string {
-  return charts.map((chart) => chart.title).join("::");
+function visualizationSubtitle(visualization: ArtifactVisualization): string {
+  if (visualization.kind === "paths_3d") {
+    return `${visualization.x_label} · ${visualization.y_label} · ${visualization.z_label}`;
+  }
+  return `${visualization.x_label} · ${visualization.y_label}`;
 }
 
-function ensureChartViews(charts: Chart[]): void {
-  const nextKey = chartLayoutKey(charts);
-  if (state.chartLayoutKey === nextKey && state.chartViews.size === charts.length) {
+function artifactChartPanels(artifact: SolveArtifact | null): ChartPanel[] {
+  if (!artifact) {
+    return [];
+  }
+  return [
+    ...artifact.charts.map((chart, index): ChartPanel => ({
+      kind: "chart",
+      key: `chart:${index}:${chart.title}`,
+      title: chart.title,
+      subtitle: chart.y_label,
+      chart,
+    })),
+    ...artifact.visualizations.map((visualization, index): ChartPanel => ({
+      kind: "visualization",
+      key: `visualization:${index}:${visualization.kind}:${visualization.title}`,
+      title: visualization.title,
+      subtitle: visualizationSubtitle(visualization),
+      visualization,
+    })),
+  ];
+}
+
+function chartLayoutKey(panels: ChartPanel[]): string {
+  return panels.map((panel) => panel.key).join("::");
+}
+
+function ensureChartViews(panels: ChartPanel[]): void {
+  const nextKey = chartLayoutKey(panels);
+  if (state.chartLayoutKey === nextKey && state.chartViews.size === panels.length) {
     return;
   }
 
@@ -5628,16 +5773,20 @@ function ensureChartViews(charts: Chart[]): void {
   chartsEl.innerHTML = "";
   state.chartLayoutKey = nextKey;
 
-  for (const chart of charts) {
+  for (const panel of panels) {
     const shell = document.createElement("section");
     shell.className = "chart-shell";
     const header = document.createElement("div");
     header.className = "chart-header";
-    header.innerHTML = `<div>${chart.title}</div><div class="card-subtitle">${chart.y_label}</div>`;
+    header.innerHTML = `<div>${panel.title}</div><div class="card-subtitle">${panel.subtitle}</div>`;
     const plotEl = createPlotlyHostElement("plot-surface");
     shell.append(header, plotEl);
     chartsEl.appendChild(shell);
-    state.chartViews.set(chart.title, { plotEl, linkedRangeBound: false });
+    state.chartViews.set(panel.key, {
+      plotEl,
+      linkedRangeBound: false,
+      linkXRange: panel.kind === "chart",
+    });
   }
 }
 
@@ -5721,11 +5870,11 @@ function updateChart(view: ChartView | undefined, chart: Chart): void {
     displaylogo: false,
     displayModeBar: false,
   };
-  if (!state.linkedChartAutorange && state.linkedChartRange) {
+  if (view.linkXRange && !state.linkedChartAutorange && state.linkedChartRange) {
     layout.xaxis.range = state.linkedChartRange.slice();
   }
   window.Plotly.react(view.plotEl, data, layout, config).then(() => {
-    if (!view.linkedRangeBound && typeof view.plotEl.on === "function") {
+    if (view.linkXRange && !view.linkedRangeBound && typeof view.plotEl.on === "function") {
       view.plotEl.on("plotly_relayout", (eventData) => {
         syncLinkedChartRange(view, eventData);
       });
@@ -5734,19 +5883,252 @@ function updateChart(view: ChartView | undefined, chart: Chart): void {
   });
 }
 
+function circleShapes(circles: SceneCircle[]): PlotlyTrace[] {
+  return circles.map((circle) => ({
+    type: "circle",
+    xref: "x",
+    yref: "y",
+    x0: circle.cx - circle.radius,
+    x1: circle.cx + circle.radius,
+    y0: circle.cy - circle.radius,
+    y1: circle.cy + circle.radius,
+    line: {
+      color: "#f25f5c",
+      width: 2,
+      dash: "dash",
+    },
+    fillcolor: "rgba(242, 95, 92, 0.13)",
+  }));
+}
+
+function circleAnnotations(circles: SceneCircle[]): PlotlyTrace[] {
+  return circles
+    .filter((circle) => circle.label)
+    .map((circle) => ({
+      x: circle.cx,
+      y: circle.cy,
+      text: circle.label,
+      showarrow: false,
+      font: {
+        color: "#f25f5c",
+        size: 11,
+      },
+      bgcolor: "rgba(4, 15, 22, 0.75)",
+      bordercolor: "rgba(242, 95, 92, 0.28)",
+      borderwidth: 1,
+      borderpad: 3,
+    }));
+}
+
+function updateContourVisualization(
+  view: ChartView | undefined,
+  visualization: Contour2DVisualization,
+): void {
+  if (!window.Plotly || !view) {
+    return;
+  }
+  const pathTraces = visualization.paths.map((path, index) => ({
+    type: "scatter",
+    mode: "lines+markers",
+    name: path.name,
+    x: path.x,
+    y: path.y,
+    line: {
+      color: index === 0 ? "#5bd1b5" : PALETTE[index % PALETTE.length],
+      width: index === 0 ? 3.5 : 2.3,
+    },
+    marker: {
+      color: index === 0 ? "#5bd1b5" : PALETTE[index % PALETTE.length],
+      size: 6,
+      line: { color: "#041016", width: 1 },
+    },
+    hovertemplate: `${visualization.x_label}: %{x:.4f}<br>${visualization.y_label}: %{y:.4f}<extra>${path.name}</extra>`,
+  }));
+  const data: PlotlyTrace[] = [
+    {
+      type: "contour",
+      name: visualization.title,
+      x: visualization.x,
+      y: visualization.y,
+      z: visualization.z,
+      colorscale: "Viridis",
+      contours: {
+        coloring: "heatmap",
+        showlines: true,
+      },
+      line: {
+        color: "rgba(229, 241, 244, 0.28)",
+        width: 0.7,
+      },
+      colorbar: {
+        title: "f",
+        tickfont: { color: "#94b6bd" },
+        titlefont: { color: "#94b6bd" },
+      },
+      opacity: 0.9,
+      hovertemplate: `${visualization.x_label}: %{x:.4f}<br>${visualization.y_label}: %{y:.4f}<br>f: %{z:.4g}<extra></extra>`,
+    },
+    ...pathTraces,
+  ];
+  const layout: PlotlyLayout = {
+    uirevision: visualization.title,
+    paper_bgcolor: "rgba(0,0,0,0)",
+    plot_bgcolor: "rgba(4, 15, 22, 0.92)",
+    font: {
+      color: "#e5f1f4",
+      family: '"Avenir Next", Futura, "Trebuchet MS", sans-serif',
+      size: 12,
+    },
+    margin: { l: 74, r: 42, t: 18, b: 62 },
+    legend: {
+      orientation: "h",
+      y: -0.26,
+      x: 0,
+      font: { color: "#94b6bd", size: 11 },
+    },
+    dragmode: "zoom",
+    hovermode: "closest",
+    shapes: circleShapes(visualization.circles),
+    annotations: circleAnnotations(visualization.circles),
+    xaxis: {
+      title: visualization.x_label,
+      gridcolor: "rgba(229, 241, 244, 0.08)",
+      linecolor: "rgba(177, 214, 222, 0.18)",
+      zeroline: false,
+      ticks: "outside",
+      titlefont: { color: "#94b6bd" },
+    },
+    yaxis: {
+      title: visualization.y_label,
+      gridcolor: "rgba(229, 241, 244, 0.08)",
+      linecolor: "rgba(177, 214, 222, 0.18)",
+      zeroline: false,
+      ticks: "outside",
+      titlefont: { color: "#94b6bd" },
+      scaleanchor: "x",
+      scaleratio: 1,
+    },
+  };
+  const config: PlotlyConfig = {
+    responsive: true,
+    displaylogo: false,
+    displayModeBar: "hover",
+    scrollZoom: false,
+    modeBarButtonsToRemove: ["select2d", "lasso2d", "autoScale2d", "toImage"],
+  };
+  window.Plotly.react(view.plotEl, data, layout, config);
+}
+
+function updatePaths3DVisualization(
+  view: ChartView | undefined,
+  visualization: Paths3DVisualization,
+): void {
+  if (!window.Plotly || !view) {
+    return;
+  }
+  const lastIndex = visualization.paths.length - 1;
+  const data: PlotlyTrace[] = visualization.paths.map((path, index) => {
+    const isLatest = index === lastIndex;
+    return {
+      type: "scatter3d",
+      mode: "lines",
+      name: path.name,
+      x: path.x,
+      y: path.y,
+      z: path.z,
+      showlegend: visualization.paths.length <= 8 || index === 0 || isLatest,
+      opacity: isLatest ? 1 : 0.48,
+      line: {
+        color: isLatest ? "#5bd1b5" : PALETTE[index % PALETTE.length],
+        width: isLatest ? 7 : 3,
+      },
+      hovertemplate:
+        `${visualization.x_label}: %{x:.3f}<br>${visualization.y_label}: %{y:.3f}<br>` +
+        `${visualization.z_label}: %{z:.0f}<extra>${path.name}</extra>`,
+    };
+  });
+  const layout: PlotlyLayout = {
+    uirevision: visualization.title,
+    paper_bgcolor: "rgba(0,0,0,0)",
+    plot_bgcolor: "rgba(4, 15, 22, 0.92)",
+    font: {
+      color: "#e5f1f4",
+      family: '"Avenir Next", Futura, "Trebuchet MS", sans-serif',
+      size: 12,
+    },
+    margin: { l: 0, r: 0, t: 0, b: 0 },
+    legend: {
+      orientation: "h",
+      y: 0,
+      x: 0,
+      font: { color: "#94b6bd", size: 11 },
+    },
+    scene: {
+      bgcolor: "rgba(4, 15, 22, 0.92)",
+      xaxis: {
+        title: visualization.x_label,
+        gridcolor: "rgba(229, 241, 244, 0.08)",
+        zerolinecolor: "rgba(229, 241, 244, 0.18)",
+        titlefont: { color: "#94b6bd" },
+      },
+      yaxis: {
+        title: visualization.y_label,
+        gridcolor: "rgba(229, 241, 244, 0.08)",
+        zerolinecolor: "rgba(229, 241, 244, 0.18)",
+        titlefont: { color: "#94b6bd" },
+      },
+      zaxis: {
+        title: visualization.z_label,
+        gridcolor: "rgba(229, 241, 244, 0.08)",
+        zerolinecolor: "rgba(229, 241, 244, 0.18)",
+        titlefont: { color: "#94b6bd" },
+      },
+      camera: {
+        eye: { x: 1.45, y: -1.65, z: 1.1 },
+      },
+    },
+  };
+  const config: PlotlyConfig = {
+    responsive: true,
+    displaylogo: false,
+    displayModeBar: "hover",
+    scrollZoom: false,
+    modeBarButtonsToRemove: ["toImage"],
+  };
+  window.Plotly.react(view.plotEl, data, layout, config);
+}
+
+function updateVisualization(
+  view: ChartView | undefined,
+  visualization: ArtifactVisualization,
+): void {
+  if (visualization.kind === "contour_2d") {
+    updateContourVisualization(view, visualization);
+  } else {
+    updatePaths3DVisualization(view, visualization);
+  }
+}
+
 function renderCharts(): void {
-  const charts = state.artifact?.charts ?? [];
-  if (charts.length === 0) {
+  const panels = artifactChartPanels(state.artifact);
+  if (panels.length === 0) {
     resetChartViews();
-    chartsEl.innerHTML = `<div class="placeholder">The solver will populate state, control, and constraint charts here.</div>`;
+    chartsEl.innerHTML = `<div class="placeholder">The solver will populate state, control, static, and constraint charts here.</div>`;
     return;
   }
   if (!window.Plotly) {
     chartsEl.innerHTML = `<div class="placeholder">Plotly is still loading.</div>`;
     return;
   }
-  ensureChartViews(charts);
-  charts.forEach((chart) => updateChart(state.chartViews.get(chart.title), chart));
+  ensureChartViews(panels);
+  for (const panel of panels) {
+    const view = state.chartViews.get(panel.key);
+    if (panel.kind === "chart") {
+      updateChart(view, panel.chart);
+    } else {
+      updateVisualization(view, panel.visualization);
+    }
+  }
 }
 
 function stopAnimation(): void {
