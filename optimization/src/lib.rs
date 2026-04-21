@@ -271,6 +271,7 @@ pub struct SpralParityProfile {
     pub pivot_method: SpralParityPivotProfile,
     pub small_pivot_tolerance: f64,
     pub threshold_pivot_u: f64,
+    pub pivot_tolerance_max: f64,
     pub use_gpu: bool,
     pub kappa_d: f64,
 }
@@ -281,6 +282,7 @@ impl Default for SpralParityProfile {
             pivot_method: SpralParityPivotProfile::Block,
             small_pivot_tolerance: 1.0e-20,
             threshold_pivot_u: 1.0e-8,
+            pivot_tolerance_max: 1.0e-4,
             use_gpu: false,
             kappa_d: 1.0e-5,
         }
@@ -301,6 +303,7 @@ pub fn apply_native_spral_parity_to_nlip_options(options: &mut InteriorPointOpti
     };
     options.spral_small_pivot_tolerance = profile.small_pivot_tolerance;
     options.spral_threshold_pivot_u = profile.threshold_pivot_u;
+    options.spral_pivot_tolerance_max = profile.pivot_tolerance_max;
 }
 
 pub fn native_spral_parity_nlip_options() -> InteriorPointOptions {
@@ -325,6 +328,7 @@ pub fn apply_native_spral_parity_to_ipopt_options(options: &mut IpoptOptions) {
     });
     options.spral_small_pivot_tolerance = Some(profile.small_pivot_tolerance);
     options.spral_threshold_pivot_u = Some(profile.threshold_pivot_u);
+    options.spral_pivot_tolerance_max = Some(profile.pivot_tolerance_max);
     options.spral_use_gpu = Some(profile.use_gpu);
     options.kappa_d = profile.kappa_d;
     options.capture_provenance = true;
@@ -4279,6 +4283,7 @@ struct SqpEventLegendState {
     soc: bool,
     watchdog_armed: bool,
     watchdog: bool,
+    linear_solver_quality: bool,
     bound_multiplier_safeguard: bool,
     barrier_update: bool,
     adaptive_regularization: bool,
@@ -4350,6 +4355,10 @@ impl SqpEventLegendState {
 
     fn mark_watchdog_if_new(&mut self) -> bool {
         Self::mark_new(&mut self.watchdog)
+    }
+
+    fn mark_linear_solver_quality_if_new(&mut self) -> bool {
+        Self::mark_new(&mut self.linear_solver_quality)
     }
 
     fn mark_bound_multiplier_safeguard_if_new(&mut self) -> bool {

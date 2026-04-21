@@ -118,6 +118,8 @@ pub struct IpoptOptions {
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub spral_threshold_pivot_u: Option<f64>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub spral_pivot_tolerance_max: Option<f64>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub spral_use_gpu: Option<bool>,
     pub capture_provenance: bool,
 }
@@ -140,6 +142,7 @@ impl Default for IpoptOptions {
             spral_pivot_method: None,
             spral_small_pivot_tolerance: None,
             spral_threshold_pivot_u: None,
+            spral_pivot_tolerance_max: None,
             spral_use_gpu: None,
             capture_provenance: false,
         }
@@ -148,7 +151,7 @@ impl Default for IpoptOptions {
 
 pub fn format_ipopt_settings_summary(options: &IpoptOptions) -> String {
     format!(
-        "mu_strategy={}; nlp_scaling={}; kappa_d={:.1e}; acceptable_tol={}; print_level={}; banner={}; linear_solver={}; spral_pivot={}; spral_small={}; spral_u={}; spral_gpu={}; provenance={}",
+        "mu_strategy={}; nlp_scaling={}; kappa_d={:.1e}; acceptable_tol={}; print_level={}; banner={}; linear_solver={}; spral_pivot={}; spral_small={}; spral_u={}; spral_umax={}; spral_gpu={}; provenance={}",
         options.mu_strategy.as_str(),
         options
             .nlp_scaling_method
@@ -174,6 +177,10 @@ pub fn format_ipopt_settings_summary(options: &IpoptOptions) -> String {
             .unwrap_or_else(|| "default".to_string()),
         options
             .spral_threshold_pivot_u
+            .map(|value| format!("{value:.1e}"))
+            .unwrap_or_else(|| "default".to_string()),
+        options
+            .spral_pivot_tolerance_max
             .map(|value| format!("{value:.1e}"))
             .unwrap_or_else(|| "default".to_string()),
         options
@@ -989,6 +996,9 @@ where
     }
     if let Some(value) = options.spral_threshold_pivot_u {
         set_ipopt_option(solver, "spral_u", value)?;
+    }
+    if let Some(value) = options.spral_pivot_tolerance_max {
+        set_ipopt_option(solver, "spral_umax", value)?;
     }
     if let Some(value) = options.spral_use_gpu {
         set_ipopt_option(solver, "spral_use_gpu", if value { "yes" } else { "no" })?;

@@ -275,6 +275,7 @@ pub struct InteriorPointOptions {
     pub spral_action_on_zero_pivot: bool,
     pub spral_small_pivot_tolerance: f64,
     pub spral_threshold_pivot_u: f64,
+    pub spral_pivot_tolerance_max: f64,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub linear_debug: Option<InteriorPointLinearDebugOptions>,
     pub verbose: bool,
@@ -353,6 +354,7 @@ impl Default for InteriorPointOptions {
             spral_action_on_zero_pivot: true,
             spral_small_pivot_tolerance: 1e-20,
             spral_threshold_pivot_u: 1e-8,
+            spral_pivot_tolerance_max: 1e-4,
             linear_debug: None,
             verbose: true,
         }
@@ -361,7 +363,7 @@ impl Default for InteriorPointOptions {
 
 pub fn format_nlip_settings_summary(options: &InteriorPointOptions) -> String {
     format!(
-        "filter={}; linear_solver={}; linear_debug={}; spral=[pivot={}, action={}, small={}, u={}]; beta={}; c1={}; min_step={}; tau={}; alpha_y=[strategy={}, tol={}] ; init=[bound_push={}, bound_frac={}, slack_push={}, slack_frac={}, bound_relax={}]; dual_init=[method={}, val={}, least_square={}, max={}] ; regularization={} (first={}, first_growth={}, retries={}, growth={}, decay={}, max={}, jacobian={}, jac_exp={}); soc={} (max={}, kappa={}); restoration={}; watchdog=[trigger={}, max={}]; filter_reset=[max={}, trigger={}]; tiny_step=[x={}, y={}]; mu=[init={}, target={}, min={}, barrier_tol={}, linear={}, superlinear={}, fast={}, kappa_d={}]; theta=[{}, {}]; acceptable_iter={}",
+        "filter={}; linear_solver={}; linear_debug={}; spral=[pivot={}, action={}, small={}, u={}, umax={}]; beta={}; c1={}; min_step={}; tau={}; alpha_y=[strategy={}, tol={}] ; init=[bound_push={}, bound_frac={}, slack_push={}, slack_frac={}, bound_relax={}]; dual_init=[method={}, val={}, least_square={}, max={}] ; regularization={} (first={}, first_growth={}, retries={}, growth={}, decay={}, max={}, jacobian={}, jac_exp={}); soc={} (max={}, kappa={}); restoration={}; watchdog=[trigger={}, max={}]; filter_reset=[max={}, trigger={}]; tiny_step=[x={}, y={}]; mu=[init={}, target={}, min={}, barrier_tol={}, linear={}, superlinear={}, fast={}, kappa_d={}]; theta=[{}, {}]; acceptable_iter={}",
         "on",
         options.linear_solver.label(),
         format_nlip_linear_debug_summary(options.linear_debug.as_ref()),
@@ -373,6 +375,7 @@ pub fn format_nlip_settings_summary(options: &InteriorPointOptions) -> String {
         },
         sci_text(options.spral_small_pivot_tolerance),
         sci_text(options.spral_threshold_pivot_u),
+        sci_text(options.spral_pivot_tolerance_max),
         sci_text(options.line_search_beta),
         sci_text(options.line_search_c1),
         sci_text(options.min_step),
@@ -618,6 +621,7 @@ pub enum InteriorPointIterationEvent {
     WatchdogArmed,
     WatchdogActivated,
     FilterReset,
+    LinearSolverQualityIncreased,
     BoundMultiplierSafeguardApplied,
     BarrierParameterUpdated,
     AdaptiveRegularizationUsed,
@@ -655,6 +659,10 @@ pub fn nlip_event_legend_entries_for_events(
             InteriorPointIterationEvent::FilterReset => entries.push((
                 'X',
                 "X=IPOPT filter reset heuristic cleared the previous filter frontier",
+            )),
+            InteriorPointIterationEvent::LinearSolverQualityIncreased => entries.push((
+                'q',
+                "q=SPRAL pivot tolerance was increased by IPOPT quality retry",
             )),
             InteriorPointIterationEvent::BoundMultiplierSafeguardApplied => entries.push((
                 'B',
@@ -705,8 +713,8 @@ pub fn nlip_event_codes(snapshot: &InteriorPointIterationSnapshot) -> String {
     nlip_event_codes_for_events(&snapshot.events)
 }
 
-const NLIP_EVENT_SLOT_ORDER: [char; 13] = [
-    'L', 'F', 's', 'S', 'A', 'W', 'X', 'B', 'U', 'V', 'R', 'T', 'M',
+const NLIP_EVENT_SLOT_ORDER: [char; 14] = [
+    'L', 'F', 's', 'S', 'A', 'W', 'X', 'q', 'B', 'U', 'V', 'R', 'T', 'M',
 ];
 const NLIP_EVENT_CELL_WIDTH: usize = NLIP_EVENT_SLOT_ORDER.len();
 
@@ -1629,6 +1637,7 @@ struct ReducedKktSystem<'a> {
     spral_action_on_zero_pivot: bool,
     spral_small_pivot_tolerance: f64,
     spral_threshold_pivot_u: f64,
+    spral_pivot_tolerance_max: f64,
 }
 
 impl<'a> ReducedKktSystem<'a> {
@@ -1671,6 +1680,7 @@ impl<'a> ReducedKktSystem<'a> {
             spral_action_on_zero_pivot: self.spral_action_on_zero_pivot,
             spral_small_pivot_tolerance: self.spral_small_pivot_tolerance,
             spral_threshold_pivot_u: self.spral_threshold_pivot_u,
+            spral_pivot_tolerance_max: self.spral_pivot_tolerance_max,
         }
     }
 
@@ -1714,6 +1724,7 @@ impl<'a> ReducedKktSystem<'a> {
             spral_action_on_zero_pivot: self.spral_action_on_zero_pivot,
             spral_small_pivot_tolerance: self.spral_small_pivot_tolerance,
             spral_threshold_pivot_u: self.spral_threshold_pivot_u,
+            spral_pivot_tolerance_max: self.spral_pivot_tolerance_max,
         }
     }
 }
@@ -1799,6 +1810,7 @@ struct InteriorPointKktSnapshot {
     spral_action_on_zero_pivot: bool,
     spral_small_pivot_tolerance: f64,
     spral_threshold_pivot_u: f64,
+    spral_pivot_tolerance_max: f64,
     augmented_pattern: SpralAugmentedKktPattern,
     augmented_values: Vec<f64>,
     augmented_rhs: Vec<f64>,
@@ -2054,6 +2066,7 @@ impl InteriorPointKktSnapshot {
             spral_action_on_zero_pivot: self.spral_action_on_zero_pivot,
             spral_small_pivot_tolerance: self.spral_small_pivot_tolerance,
             spral_threshold_pivot_u: self.spral_threshold_pivot_u,
+            spral_pivot_tolerance_max: self.spral_pivot_tolerance_max,
         }
     }
 }
@@ -2192,6 +2205,7 @@ fn build_interior_point_kkt_snapshot(
         spral_action_on_zero_pivot: system.spral_action_on_zero_pivot,
         spral_small_pivot_tolerance: system.spral_small_pivot_tolerance,
         spral_threshold_pivot_u: system.spral_threshold_pivot_u,
+        spral_pivot_tolerance_max: system.spral_pivot_tolerance_max,
         augmented_pattern: pattern.clone(),
         augmented_values,
         augmented_rhs,
@@ -5564,6 +5578,48 @@ fn is_singularity_like_linear_failure(attempt: &InteriorPointLinearSolveAttempt)
                 .is_some_and(|detail| detail.contains("negative_eigenvalues_too_few")))
 }
 
+fn is_negative_eigenvalues_too_few(attempt: &InteriorPointLinearSolveAttempt) -> bool {
+    attempt.failure_kind == InteriorPointLinearSolveFailureKind::InertiaMismatch
+        && attempt
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("negative_eigenvalues_too_few"))
+}
+
+fn append_attempt_detail(attempt: &mut InteriorPointLinearSolveAttempt, detail: impl Into<String>) {
+    let detail = detail.into();
+    attempt.detail = Some(match attempt.detail.take() {
+        Some(existing) => format!("{existing}; {detail}"),
+        None => detail,
+    });
+}
+
+fn try_increase_native_spral_quality(
+    workspace: &mut NativeSpralAugmentedKktWorkspace,
+    system: &ReducedKktSystem<'_>,
+) -> Option<(f64, f64)> {
+    let old_u = workspace.numeric_options.threshold_pivot_u;
+    let max_u = system.spral_pivot_tolerance_max.max(0.0);
+    if !old_u.is_finite() || !max_u.is_finite() || old_u >= max_u {
+        return None;
+    }
+    let next_u = old_u.powf(0.75).min(max_u);
+    if !next_u.is_finite() || next_u <= old_u {
+        return None;
+    }
+    workspace.numeric_options.threshold_pivot_u = next_u;
+    workspace.session = None;
+    workspace.factor_regularization = None;
+    Some((old_u, next_u))
+}
+
+fn linear_solver_quality_was_increased(stats: &LinearBackendRunStats) -> bool {
+    stats
+        .detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("spral_quality_retry="))
+}
+
 fn inertia_mismatch_detail(expected: SpralInertia, actual: SpralInertia) -> String {
     let prefix = if actual.negative < expected.negative {
         "negative_eigenvalues_too_few; "
@@ -6061,6 +6117,8 @@ fn solve_reduced_kkt_with_native_spral_ssids(
     let mut current_regularization = system.regularization.max(0.0);
     let mut current_jacobian_regularization = system.forced_jacobian_regularization.unwrap_or(0.0);
     let mut tried_jacobian_regularization = system.forced_jacobian_regularization.is_some();
+    let mut quality_retry_detail: Option<String> = None;
+    let mut solver_quality_improved = false;
     let max_regularization = system
         .regularization_max
         .max(current_regularization)
@@ -6099,9 +6157,18 @@ fn solve_reduced_kkt_with_native_spral_ssids(
                         })
                         .collect::<Vec<_>>()
                         .join("; ");
-                    backend_stats.detail = Some(match backend_stats.detail.take() {
+                    let detail = match backend_stats.detail.take() {
                         Some(detail) => format!("{detail}; prior_attempts=[{attempt_detail}]"),
                         None => format!("prior_attempts=[{attempt_detail}]"),
+                    };
+                    backend_stats.detail = Some(match quality_retry_detail.take() {
+                        Some(quality_detail) => format!("{detail}; {quality_detail}"),
+                        None => detail,
+                    });
+                } else if let Some(quality_detail) = quality_retry_detail.take() {
+                    backend_stats.detail = Some(match backend_stats.detail.take() {
+                        Some(detail) => format!("{detail}; {quality_detail}"),
+                        None => quality_detail,
                     });
                 }
                 let dx = solution[..n].to_vec();
@@ -6143,7 +6210,21 @@ fn solve_reduced_kkt_with_native_spral_ssids(
             }
             Err(attempt) => {
                 let singularity_like_failure = is_singularity_like_linear_failure(&attempt);
+                let too_few_negative_eigenvalues = is_negative_eigenvalues_too_few(&attempt);
                 attempts.push(attempt);
+                if too_few_negative_eigenvalues
+                    && !solver_quality_improved
+                    && let Some((old_u, new_u)) =
+                        try_increase_native_spral_quality(workspace, system)
+                {
+                    solver_quality_improved = true;
+                    let quality_detail = format!("spral_quality_retry=u:{old_u:.3e}->{new_u:.3e}");
+                    if let Some(last_attempt) = attempts.last_mut() {
+                        append_attempt_detail(last_attempt, quality_detail.clone());
+                    }
+                    quality_retry_detail = Some(quality_detail);
+                    continue;
+                }
                 if singularity_like_failure
                     && meq + mineq > 0
                     && !tried_jacobian_regularization
@@ -6968,6 +7049,7 @@ fn ip_event_legend_lines(
             'S' => state.mark_soc_if_new(),
             'A' => state.mark_watchdog_armed_if_new(),
             'W' => state.mark_watchdog_if_new(),
+            'q' => state.mark_linear_solver_quality_if_new(),
             'B' => state.mark_bound_multiplier_safeguard_if_new(),
             'U' => state.mark_barrier_update_if_new(),
             'V' => state.mark_adaptive_regularization_if_new(),
@@ -7052,14 +7134,18 @@ mod tests {
         let filter_reset = snapshot_with_events(vec![InteriorPointIterationEvent::FilterReset]);
         let watchdog_only =
             snapshot_with_events(vec![InteriorPointIterationEvent::WatchdogActivated]);
+        let linear_quality = snapshot_with_events(vec![
+            InteriorPointIterationEvent::LinearSolverQualityIncreased,
+        ]);
         let barrier_update =
             snapshot_with_events(vec![InteriorPointIterationEvent::BarrierParameterUpdated]);
 
-        assert_eq!(nlip_event_slot_codes(&filter_soc), " F S         ");
-        assert_eq!(nlip_event_slot_codes(&filter_watchdog), " F   W       ");
-        assert_eq!(nlip_event_slot_codes(&filter_reset), "      X      ");
-        assert_eq!(nlip_event_slot_codes(&watchdog_only), "     W       ");
-        assert_eq!(nlip_event_slot_codes(&barrier_update), "        U    ");
+        assert_eq!(nlip_event_slot_codes(&filter_soc), " F S          ");
+        assert_eq!(nlip_event_slot_codes(&filter_watchdog), " F   W        ");
+        assert_eq!(nlip_event_slot_codes(&filter_reset), "      X       ");
+        assert_eq!(nlip_event_slot_codes(&watchdog_only), "     W        ");
+        assert_eq!(nlip_event_slot_codes(&linear_quality), "       q      ");
+        assert_eq!(nlip_event_slot_codes(&barrier_update), "         U    ");
     }
 
     #[test]
@@ -8540,6 +8626,7 @@ where
             spral_action_on_zero_pivot: options.spral_action_on_zero_pivot,
             spral_small_pivot_tolerance: options.spral_small_pivot_tolerance,
             spral_threshold_pivot_u: options.spral_threshold_pivot_u,
+            spral_pivot_tolerance_max: options.spral_pivot_tolerance_max,
         };
         current_snapshot.linear_solver = preferred_solver;
         if !spral_workspace_unavailable
@@ -8713,6 +8800,12 @@ where
             push_unique_nlip_event(
                 &mut iteration_events,
                 InteriorPointIterationEvent::AdaptiveRegularizationUsed,
+            );
+        }
+        if linear_solver_quality_was_increased(&direction.backend_stats) {
+            push_unique_nlip_event(
+                &mut iteration_events,
+                InteriorPointIterationEvent::LinearSolverQualityIncreased,
             );
         }
 
@@ -9400,6 +9493,12 @@ where
                         push_unique_nlip_event(
                             &mut iteration_events,
                             InteriorPointIterationEvent::AdaptiveRegularizationUsed,
+                        );
+                    }
+                    if linear_solver_quality_was_increased(&soc_direction.backend_stats) {
+                        push_unique_nlip_event(
+                            &mut iteration_events,
+                            InteriorPointIterationEvent::LinearSolverQualityIncreased,
                         );
                     }
                     soc_direction.dx = fixed_variables.expand_direction(&soc_direction.dx);
