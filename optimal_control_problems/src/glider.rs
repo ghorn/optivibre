@@ -5035,6 +5035,28 @@ mod tests {
                 params.transcription.collocation_degree,
             );
         }
+        if let Some(probe_index) = std::env::var("GLIDER_PARITY_PROBE_INDEX")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            print_trace_window(
+                &nlip_trace,
+                &ipopt_trace,
+                probe_index,
+                params.transcription.intervals,
+                params.transcription.collocation_degree,
+            );
+            print_internal_probe_window(
+                "requested_probe",
+                probe_index,
+                &accepted_nlip_solver_snapshots,
+                &accepted_ipopt_solver_snapshots,
+                &ipopt_trace,
+                &variable_bounds,
+                params.transcription.intervals,
+                params.transcription.collocation_degree,
+            );
+        }
         for (index, (nlip_point, ipopt_point)) in
             nlip_trace.iter().zip(ipopt_trace.iter()).enumerate()
         {
