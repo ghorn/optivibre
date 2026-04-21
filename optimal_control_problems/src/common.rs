@@ -1392,7 +1392,7 @@ fn append_nlip_linear_solve_failure_lines(
     ));
     for attempt in &diagnostics.attempts {
         lines.push(format!(
-            "  attempt solver={} regularization={} failure={} solution_inf={} solution_limit={} residual_inf={} residual_limit={}",
+            "  attempt solver={} regularization={} failure={} solution_inf={} solution_limit={} residual_inf={} residual_limit={} detail={}",
             attempt.solver.label(),
             fmt_diag_sci(attempt.regularization),
             attempt.failure_kind.label(),
@@ -1400,6 +1400,7 @@ fn append_nlip_linear_solve_failure_lines(
             fmt_diag_opt_sci(attempt.solution_inf_limit),
             fmt_diag_opt_sci(attempt.residual_inf),
             fmt_diag_opt_sci(attempt.residual_inf_limit),
+            attempt.detail.as_deref().unwrap_or("-"),
         ));
     }
 }

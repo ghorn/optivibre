@@ -252,8 +252,10 @@ pub struct InteriorPointOptions {
     pub kappa_sigma: f64,
     pub regularization: f64,
     pub first_hessian_perturbation: f64,
+    pub regularization_first_growth_factor: f64,
     pub adaptive_regularization_retries: Index,
     pub regularization_growth_factor: f64,
+    pub regularization_decay_factor: f64,
     pub regularization_max: f64,
     pub second_order_correction: bool,
     pub tiny_step_tol: f64,
@@ -320,9 +322,11 @@ impl Default for InteriorPointOptions {
             kappa_sigma: 1e10,
             regularization: 1e-6,
             first_hessian_perturbation: 1e-4,
-            adaptive_regularization_retries: 3,
-            regularization_growth_factor: 10.0,
-            regularization_max: 1e2,
+            regularization_first_growth_factor: 100.0,
+            adaptive_regularization_retries: 30,
+            regularization_growth_factor: 8.0,
+            regularization_decay_factor: 1.0 / 3.0,
+            regularization_max: 1e20,
             second_order_correction: true,
             tiny_step_tol: 1e-6,
             watchdog_shortened_iter_trigger: 3,
@@ -341,7 +345,7 @@ impl Default for InteriorPointOptions {
 
 pub fn format_nlip_settings_summary(options: &InteriorPointOptions) -> String {
     format!(
-        "filter={}; linear_solver={}; linear_debug={}; spral=[pivot={}, action={}, small={}, u={}]; beta={}; c1={}; min_step={}; tau={}; alpha_y=[strategy={}, tol={}] ; init=[bound_push={}, bound_frac={}, slack_push={}, slack_frac={}] ; dual_init=[method={}, val={}, least_square={}, max={}] ; regularization={} (first={}, retries={}, growth={}, max={}); soc={}; watchdog=[trigger={}, max={}]; filter_reset=[max={}, trigger={}]; tiny_step={}; mu=[init={}, target={}, min={}, barrier_tol={}, linear={}, superlinear={}, fast={}]; theta=[{}, {}]; acceptable_iter={}",
+        "filter={}; linear_solver={}; linear_debug={}; spral=[pivot={}, action={}, small={}, u={}]; beta={}; c1={}; min_step={}; tau={}; alpha_y=[strategy={}, tol={}] ; init=[bound_push={}, bound_frac={}, slack_push={}, slack_frac={}] ; dual_init=[method={}, val={}, least_square={}, max={}] ; regularization={} (first={}, first_growth={}, retries={}, growth={}, decay={}, max={}); soc={}; watchdog=[trigger={}, max={}]; filter_reset=[max={}, trigger={}]; tiny_step={}; mu=[init={}, target={}, min={}, barrier_tol={}, linear={}, superlinear={}, fast={}]; theta=[{}, {}]; acceptable_iter={}",
         "on",
         options.linear_solver.label(),
         format_nlip_linear_debug_summary(options.linear_debug.as_ref()),
@@ -373,8 +377,10 @@ pub fn format_nlip_settings_summary(options: &InteriorPointOptions) -> String {
         sci_text(options.constr_mult_init_max),
         sci_text(options.regularization),
         sci_text(options.first_hessian_perturbation),
+        sci_text(options.regularization_first_growth_factor),
         options.adaptive_regularization_retries,
         sci_text(options.regularization_growth_factor),
+        sci_text(options.regularization_decay_factor),
         sci_text(options.regularization_max),
         if options.second_order_correction {
             "on"
@@ -1058,8 +1064,10 @@ struct ReducedKktSystem<'a> {
     regularization: f64,
     first_hessian_perturbation: f64,
     previous_hessian_perturbation: Option<f64>,
+    regularization_first_growth_factor: f64,
     adaptive_regularization_retries: Index,
     regularization_growth_factor: f64,
+    regularization_decay_factor: f64,
     regularization_max: f64,
     spral_pivot_method: InteriorPointSpralPivotMethod,
     spral_action_on_zero_pivot: bool,
@@ -1131,8 +1139,10 @@ struct InteriorPointKktSnapshot {
     dual_regularization: f64,
     first_hessian_perturbation: f64,
     previous_hessian_perturbation: Option<f64>,
+    regularization_first_growth_factor: f64,
     adaptive_regularization_retries: Index,
     regularization_growth_factor: f64,
+    regularization_decay_factor: f64,
     regularization_max: f64,
     spral_pivot_method: InteriorPointSpralPivotMethod,
     spral_action_on_zero_pivot: bool,
@@ -1391,8 +1401,10 @@ impl InteriorPointKktSnapshot {
             regularization: self.regularization,
             first_hessian_perturbation: self.first_hessian_perturbation,
             previous_hessian_perturbation: self.previous_hessian_perturbation,
+            regularization_first_growth_factor: self.regularization_first_growth_factor,
             adaptive_regularization_retries: self.adaptive_regularization_retries,
             regularization_growth_factor: self.regularization_growth_factor,
+            regularization_decay_factor: self.regularization_decay_factor,
             regularization_max: self.regularization_max,
             spral_pivot_method: self.spral_pivot_method,
             spral_action_on_zero_pivot: self.spral_action_on_zero_pivot,
@@ -1527,8 +1539,10 @@ fn build_interior_point_kkt_snapshot(
         dual_regularization: dual_regularization_used,
         first_hessian_perturbation: system.first_hessian_perturbation,
         previous_hessian_perturbation: system.previous_hessian_perturbation,
+        regularization_first_growth_factor: system.regularization_first_growth_factor,
         adaptive_regularization_retries: system.adaptive_regularization_retries,
         regularization_growth_factor: system.regularization_growth_factor,
+        regularization_decay_factor: system.regularization_decay_factor,
         regularization_max: system.regularization_max,
         spral_pivot_method: system.spral_pivot_method,
         spral_action_on_zero_pivot: system.spral_action_on_zero_pivot,
@@ -4179,12 +4193,22 @@ fn sparse_hessian_diagonal_shift(hessian: &SparseSymmetricMatrix, minimum_shift:
 
 fn next_ipopt_hessian_perturbation(
     current: f64,
+    previous_successful: Option<f64>,
     first: f64,
+    first_growth_factor: f64,
     growth_factor: f64,
+    decay_factor: f64,
     max_regularization: f64,
 ) -> Option<f64> {
+    let previous_successful = previous_successful.unwrap_or(0.0).max(0.0);
     let next = if current <= 0.0 {
-        first.max(0.0)
+        if previous_successful <= 0.0 {
+            first.max(0.0)
+        } else {
+            (previous_successful * decay_factor.clamp(0.0, 1.0)).max(1e-20)
+        }
+    } else if previous_successful <= 0.0 || 1e5 * previous_successful < current {
+        current * first_growth_factor.max(1.0)
     } else {
         current * growth_factor.max(1.0)
     };
@@ -4715,15 +4739,13 @@ fn solve_reduced_kkt_with_native_spral_ssids(
         {
             break;
         }
-        let first_perturbation = system
-            .previous_hessian_perturbation
-            .map_or(system.first_hessian_perturbation, |previous| {
-                (previous / 3.0).max(1e-20)
-            });
         let Some(next_regularization) = next_ipopt_hessian_perturbation(
             current_regularization,
-            first_perturbation,
+            system.previous_hessian_perturbation,
+            system.first_hessian_perturbation,
+            system.regularization_first_growth_factor,
             system.regularization_growth_factor,
+            system.regularization_decay_factor,
             max_regularization,
         ) else {
             break;
@@ -6810,8 +6832,10 @@ where
             regularization: kkt_regularization,
             first_hessian_perturbation: options.first_hessian_perturbation,
             previous_hessian_perturbation,
+            regularization_first_growth_factor: options.regularization_first_growth_factor,
             adaptive_regularization_retries: options.adaptive_regularization_retries,
             regularization_growth_factor: options.regularization_growth_factor,
+            regularization_decay_factor: options.regularization_decay_factor,
             regularization_max: options.regularization_max,
             spral_pivot_method: options.spral_pivot_method,
             spral_action_on_zero_pivot: options.spral_action_on_zero_pivot,
