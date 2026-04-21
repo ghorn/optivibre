@@ -266,6 +266,7 @@ pub struct InteriorPointOptions {
     pub second_order_correction_reduction_factor: f64,
     pub restoration_phase: bool,
     pub tiny_step_tol: f64,
+    pub tiny_step_y_tol: f64,
     pub watchdog_shortened_iter_trigger: Index,
     pub watchdog_trial_iter_max: Index,
     pub mu_min: f64,
@@ -343,6 +344,7 @@ impl Default for InteriorPointOptions {
             second_order_correction_reduction_factor: 0.99,
             restoration_phase: true,
             tiny_step_tol: 10.0 * f64::EPSILON,
+            tiny_step_y_tol: 1e-2,
             watchdog_shortened_iter_trigger: 10,
             watchdog_trial_iter_max: 3,
             mu_min: 1e-12,
@@ -359,7 +361,7 @@ impl Default for InteriorPointOptions {
 
 pub fn format_nlip_settings_summary(options: &InteriorPointOptions) -> String {
     format!(
-        "filter={}; linear_solver={}; linear_debug={}; spral=[pivot={}, action={}, small={}, u={}]; beta={}; c1={}; min_step={}; tau={}; alpha_y=[strategy={}, tol={}] ; init=[bound_push={}, bound_frac={}, slack_push={}, slack_frac={}, bound_relax={}]; dual_init=[method={}, val={}, least_square={}, max={}] ; regularization={} (first={}, first_growth={}, retries={}, growth={}, decay={}, max={}, jacobian={}, jac_exp={}); soc={} (max={}, kappa={}); restoration={}; watchdog=[trigger={}, max={}]; filter_reset=[max={}, trigger={}]; tiny_step={}; mu=[init={}, target={}, min={}, barrier_tol={}, linear={}, superlinear={}, fast={}, kappa_d={}]; theta=[{}, {}]; acceptable_iter={}",
+        "filter={}; linear_solver={}; linear_debug={}; spral=[pivot={}, action={}, small={}, u={}]; beta={}; c1={}; min_step={}; tau={}; alpha_y=[strategy={}, tol={}] ; init=[bound_push={}, bound_frac={}, slack_push={}, slack_frac={}, bound_relax={}]; dual_init=[method={}, val={}, least_square={}, max={}] ; regularization={} (first={}, first_growth={}, retries={}, growth={}, decay={}, max={}, jacobian={}, jac_exp={}); soc={} (max={}, kappa={}); restoration={}; watchdog=[trigger={}, max={}]; filter_reset=[max={}, trigger={}]; tiny_step=[x={}, y={}]; mu=[init={}, target={}, min={}, barrier_tol={}, linear={}, superlinear={}, fast={}, kappa_d={}]; theta=[{}, {}]; acceptable_iter={}",
         "on",
         options.linear_solver.label(),
         format_nlip_linear_debug_summary(options.linear_debug.as_ref()),
@@ -416,6 +418,7 @@ pub fn format_nlip_settings_summary(options: &InteriorPointOptions) -> String {
         options.max_filter_resets,
         options.filter_reset_trigger,
         sci_text(options.tiny_step_tol),
+        sci_text(options.tiny_step_y_tol),
         sci_text(options.mu_init),
         sci_text(options.mu_target),
         sci_text(options.mu_min),
@@ -602,6 +605,7 @@ pub enum InteriorPointIterationPhase {
 pub enum InteriorPointStepKind {
     Objective,
     Feasibility,
+    Tiny,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -1063,6 +1067,8 @@ struct AcceptedInteriorPointTrial {
     line_search_backtrack_count: Index,
     second_order_correction_used: bool,
     watchdog_accepted: bool,
+    tiny_step: bool,
+    tiny_step_barrier_update: bool,
     bound_multiplier_corrected: bool,
 }
 
@@ -1094,7 +1100,7 @@ struct InteriorPointWatchdogState {
     reference: Option<WatchdogReferencePoint>,
     remaining_iters: Index,
     shortened_step_streak: Index,
-    tiny_step_streak: Index,
+    tiny_step_last_iteration: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -8800,6 +8806,10 @@ where
         let mut second_order_correction_attempted = false;
         let mut second_order_correction_used = false;
         let mut watchdog_accepted = false;
+        let tiny_step_unchecked_accept = !watchdog_active
+            && is_tiny_ip_step(&x, &slack_barrier, &direction, primal_inf, options);
+        let tiny_step_barrier_update =
+            tiny_step_unchecked_accept && watchdog_state.tiny_step_last_iteration;
         while alpha >= alpha_min {
             let trial_alpha_pr = alpha;
             let trial_alpha_du = dual_alpha_limit;
@@ -8997,6 +9007,122 @@ where
             );
             let trial_filter_entry =
                 super::filter::entry(trial_barrier_objective, trial_filter_theta);
+            if tiny_step_unchecked_accept {
+                let (
+                    accepted_z,
+                    accepted_z_lower,
+                    accepted_z_upper,
+                    accepted_dual_inf,
+                    accepted_comp_inf,
+                    accepted_mu,
+                    accepted_overall_inf,
+                    bound_multiplier_corrected,
+                ) = if let Some(corrected) = corrected_bound_multipliers {
+                    let corrected_comp_inf = combined_complementarity_inf_norm(
+                        &trial_slack_barrier,
+                        &corrected.z,
+                        &trial_x,
+                        &bounds,
+                        &corrected.z_lower,
+                        &corrected.z_upper,
+                    );
+                    let corrected_complementarity_multipliers = combined_multiplier_vector([
+                        corrected.z.as_slice(),
+                        corrected.z_lower.as_slice(),
+                        corrected.z_upper.as_slice(),
+                    ]);
+                    let corrected_all_dual_multipliers = combined_multiplier_vector([
+                        trial_lambda.as_slice(),
+                        trial_lambda_ineq.as_slice(),
+                        corrected.z.as_slice(),
+                        corrected.z_lower.as_slice(),
+                        corrected.z_upper.as_slice(),
+                    ]);
+                    let corrected_overall_inf = scaled_overall_inf_norm(
+                        trial_primal_inf,
+                        corrected.dual_inf,
+                        corrected_comp_inf,
+                        &corrected_all_dual_multipliers,
+                        &corrected_complementarity_multipliers,
+                        options.overall_scale_max,
+                    );
+                    (
+                        corrected.z,
+                        corrected.z_lower,
+                        corrected.z_upper,
+                        corrected.dual_inf,
+                        corrected_comp_inf,
+                        barrier_parameter_value,
+                        corrected_overall_inf,
+                        true,
+                    )
+                } else {
+                    (
+                        trial_z,
+                        trial_z_lower,
+                        trial_z_upper,
+                        trial_dual_inf,
+                        trial_comp_inf,
+                        barrier_parameter_value,
+                        trial_overall_inf,
+                        false,
+                    )
+                };
+                accepted = Some(AcceptedInteriorPointTrial {
+                    x: trial_x,
+                    lambda: trial_lambda,
+                    inequality_multipliers: trial_lambda_ineq.clone(),
+                    kkt_inequality_residual: slack_form_inequality_residuals(
+                        &trial_state.augmented_inequality_values,
+                        &trial_slack,
+                    ),
+                    kkt_slack_stationarity: damped_slack_stationarity_residuals(
+                        &trial_lambda_ineq,
+                        &accepted_z,
+                        barrier_parameter_value,
+                        options.kappa_d,
+                    ),
+                    kkt_slack_complementarity: slack_complementarity_residuals(
+                        &trial_slack_barrier,
+                        &accepted_z,
+                        barrier_parameter_value,
+                    ),
+                    kkt_slack_sigma: slack_sigma_values(&trial_slack_barrier, &accepted_z),
+                    slack: trial_slack,
+                    z: accepted_z,
+                    z_lower: accepted_z_lower,
+                    z_upper: accepted_z_upper,
+                    objective: trial_state.objective_value,
+                    barrier_objective: trial_barrier_objective,
+                    equality_inf: trial_eq_inf,
+                    inequality_inf: trial_ineq_inf,
+                    primal_inf: trial_primal_inf,
+                    dual_inf: accepted_dual_inf,
+                    complementarity_inf: accepted_comp_inf,
+                    overall_inf: accepted_overall_inf,
+                    mu: accepted_mu,
+                    filter_theta: trial_filter_theta,
+                    filter_entry: trial_filter_entry.clone(),
+                    filter_augment_entry: None,
+                    filter_acceptance_mode: None,
+                    step_kind: InteriorPointStepKind::Tiny,
+                    step_tag: if tiny_step_barrier_update { 'T' } else { 't' },
+                    phase: InteriorPointIterationPhase::AcceptedStep,
+                    accepted_alpha_pr: trial_alpha_pr,
+                    accepted_alpha_du: Some(trial_alpha_du),
+                    line_search_initial_alpha_pr: alpha_pr,
+                    line_search_initial_alpha_du: Some(alpha_du),
+                    line_search_last_alpha_pr: trial_alpha_pr,
+                    line_search_last_alpha_du: Some(trial_alpha_du),
+                    line_search_backtrack_count: 0,
+                    second_order_correction_used: false,
+                    watchdog_accepted: false,
+                    tiny_step: true,
+                    tiny_step_barrier_update,
+                    bound_multiplier_corrected,
+                });
+                break;
+            }
             let switching_condition = switching_condition_satisfied(
                 current_theta,
                 barrier_directional_derivative,
@@ -9153,6 +9279,8 @@ where
                     line_search_backtrack_count: line_search_iterations,
                     second_order_correction_used: false,
                     watchdog_accepted: false,
+                    tiny_step: false,
+                    tiny_step_barrier_update: false,
                     bound_multiplier_corrected,
                 });
                 break;
@@ -9599,6 +9727,8 @@ where
                             line_search_backtrack_count: line_search_iterations,
                             second_order_correction_used: true,
                             watchdog_accepted: false,
+                            tiny_step: false,
+                            tiny_step_barrier_update: false,
                             bound_multiplier_corrected,
                         });
                         break;
@@ -9815,6 +9945,8 @@ where
                     line_search_backtrack_count: line_search_iterations,
                     second_order_correction_used: false,
                     watchdog_accepted: true,
+                    tiny_step: false,
+                    tiny_step_barrier_update: false,
                     bound_multiplier_corrected,
                 });
                 break;
@@ -10025,6 +10157,8 @@ where
                         line_search_backtrack_count: line_search_iterations,
                         second_order_correction_used: false,
                         watchdog_accepted: false,
+                        tiny_step: false,
+                        tiny_step_barrier_update: false,
                         bound_multiplier_corrected: false,
                     });
                 }
@@ -10074,7 +10208,7 @@ where
             });
         };
         let step_inf = ipopt_primal_step_inf_norm(&direction);
-        let tiny_step = is_tiny_ip_step(&x, &slack_barrier, &direction, primal_inf, options);
+        let tiny_step = accepted_trial.tiny_step;
         let shortened_step = is_shortened_ip_step(
             accepted_trial.accepted_alpha_pr,
             accepted_trial.accepted_alpha_du,
@@ -10202,7 +10336,7 @@ where
             ]);
             next_barrier_parameter_value = next_barrier_parameter(
                 barrier_parameter_value,
-                tiny_step,
+                accepted_trial.tiny_step_barrier_update,
                 options,
                 |candidate_barrier_parameter| {
                     let accepted_target_complementarity_inf =
@@ -10375,11 +10509,10 @@ where
         } else {
             watchdog_state.shortened_step_streak = 0;
         }
-        if tiny_step {
-            watchdog_state.tiny_step_streak += 1;
-        } else {
-            watchdog_state.tiny_step_streak = 0;
-        }
+        let dual_step_norm =
+            step_inf_norm(&direction.d_lambda).max(step_inf_norm(&direction.d_ineq));
+        watchdog_state.tiny_step_last_iteration =
+            tiny_step && dual_step_norm < options.tiny_step_y_tol;
         if accepted_trial.watchdog_accepted {
             if watchdog_state.remaining_iters > 0 {
                 watchdog_state.remaining_iters -= 1;

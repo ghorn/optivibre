@@ -779,6 +779,7 @@ fn fmt_nlip_step_kind(kind: Option<optimization::InteriorPointStepKind>) -> &'st
     match kind {
         Some(optimization::InteriorPointStepKind::Objective) => "f-step",
         Some(optimization::InteriorPointStepKind::Feasibility) => "h-step",
+        Some(optimization::InteriorPointStepKind::Tiny) => "tiny-step",
         None => "--",
     }
 }

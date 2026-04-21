@@ -256,6 +256,7 @@ fn nlip_step_tag(snapshot: &optimization::InteriorPointIterationSnapshot) -> Opt
                     snapshot.step_kind.map(|kind| match kind {
                         InteriorPointStepKind::Objective => "f".to_string(),
                         InteriorPointStepKind::Feasibility => "h".to_string(),
+                        InteriorPointStepKind::Tiny => "t".to_string(),
                     })
                 })
         })
