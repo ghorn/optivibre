@@ -1580,8 +1580,8 @@ fn app_update_one_by_one(
         for row in col..update_end {
             let update_entry = dense_lower_offset(size, row, col);
             let multiplier = matrix[dense_lower_offset(size, row, pivot)];
-            // Match SPRAL's scalar block_ldlt update expression on the local build.
-            matrix[update_entry] -= multiplier * preserved;
+            // Clang contracts SPRAL's scalar SimdVec update on the local build.
+            matrix[update_entry] = (-preserved).mul_add(multiplier, matrix[update_entry]);
         }
     }
 }
