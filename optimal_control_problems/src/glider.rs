@@ -4202,7 +4202,7 @@ mod tests {
             );
 
             println!(
-                "internal_probe[{index}] ipopt_iter={} x_diff={:.3e} slack_same={:.3e} slack_neg={:.3e} slack_dist={:.3e} eq_y_diff={:.3e} ineq_y_same={:.3e} ineq_y_neg={:.3e} lower_z_diff={:.3e} upper_z_diff={:.3e} slack_vl_same={:.3e} slack_vu_same={:.3e} slack_vu_neg={:.3e} kkt_ineq={:.3e} kkt_slack_stat_neg={:.3e} kkt_slack_comp={:.3e} kkt_slack_sigma={:.3e}",
+                "internal_probe[{index}] ipopt_iter={} x_diff={:.3e} slack_same={:.3e} slack_neg={:.3e} slack_dist={:.3e} eq_y_diff={:.3e} ineq_y_same={:.3e} ineq_y_neg={:.3e} lower_z_diff={:.3e} upper_z_diff={:.3e} slack_vl_same={:.3e} slack_vu_same={:.3e} slack_vu_neg={:.3e} kkt_ineq={:.3e} kkt_slack_stat={:.3e} kkt_slack_comp={:.3e} kkt_slack_sigma={:.3e}",
                 ipopt_snapshot.iteration,
                 vector_inf_diff(&nlip_snapshot.x, &ipopt_snapshot.x, 1.0),
                 vector_inf_diff(nlip_slack_primal, &ipopt_snapshot.internal_slack, 1.0),
@@ -4232,7 +4232,7 @@ mod tests {
                 vector_inf_diff(
                     nlip_kkt_slack_stationarity,
                     &ipopt_snapshot.kkt_slack_stationarity,
-                    -1.0,
+                    1.0,
                 ),
                 vector_inf_diff(
                     nlip_kkt_slack_complementarity,
@@ -4296,11 +4296,11 @@ mod tests {
                 )
             );
             println!(
-                "          top KKT slack stationarity diffs (opposite sign): {}",
+                "          top KKT slack stationarity diffs: {}",
                 top_vector_diffs(
                     nlip_kkt_slack_stationarity,
                     &ipopt_snapshot.kkt_slack_stationarity,
-                    -1.0,
+                    1.0,
                     |idx| glider_inequality_label(idx, intervals, order),
                 )
             );

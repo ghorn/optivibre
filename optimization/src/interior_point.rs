@@ -2068,7 +2068,7 @@ fn build_interior_point_kkt_snapshot(
         .zip(system.slack.iter())
         .enumerate()
         .map(|(index, (r_cent_i, slack_i))| {
-            -(r_cent_i / slack_i.max(1e-16) + damped_slack_stationarity_residual(system, index))
+            -(r_cent_i / slack_i.max(1e-16) - damped_slack_stationarity_residual(system, index))
         })
         .collect::<Vec<_>>();
     let pattern = build_spral_augmented_kkt_pattern(
@@ -2765,7 +2765,7 @@ fn system_positive_slack_damping(system: &ReducedKktSystem<'_>) -> f64 {
 }
 
 fn damped_slack_stationarity_residual(system: &ReducedKktSystem<'_>, index: usize) -> f64 {
-    system.r_slack_stationarity[index] + system_positive_slack_damping(system)
+    system.r_slack_stationarity[index] - system_positive_slack_damping(system)
 }
 
 fn damped_slack_stationarity_residuals(
@@ -2778,7 +2778,7 @@ fn damped_slack_stationarity_residuals(
     lambda_ineq
         .iter()
         .zip(z.iter())
-        .map(|(y_i, z_i)| y_i - z_i + damping)
+        .map(|(y_i, z_i)| z_i - y_i - damping)
         .collect()
 }
 
@@ -2793,7 +2793,7 @@ fn damped_slack_stationarity_inf_norm(
         .iter()
         .zip(z.iter())
         .fold(0.0_f64, |acc, (y_i, z_i)| {
-            acc.max((y_i - z_i + damping).abs())
+            acc.max((z_i - y_i - damping).abs())
         })
 }
 
@@ -5989,7 +5989,7 @@ fn solve_reduced_kkt_with_native_spral_ssids(
         .zip(system.slack.iter())
         .enumerate()
         .map(|(index, (r_cent_i, slack_i))| {
-            -(r_cent_i / slack_i.max(1e-16) + damped_slack_stationarity_residual(system, index))
+            -(r_cent_i / slack_i.max(1e-16) - damped_slack_stationarity_residual(system, index))
         })
         .collect::<Vec<_>>();
     let total_dimension = workspace.pattern.dimension();
@@ -6069,8 +6069,7 @@ fn solve_reduced_kkt_with_native_spral_ssids(
                     .zip(p.iter())
                     .enumerate()
                     .map(|(index, ((dy_i, _), ds_i))| {
-                        *dy_i
-                            + damped_slack_stationarity_residual(system, index)
+                        *dy_i - damped_slack_stationarity_residual(system, index)
                             + slack_shift * *ds_i
                     })
                     .collect::<Vec<_>>();
@@ -6148,7 +6147,7 @@ fn solve_reduced_kkt_with_spral_ssids(
         .zip(system.slack.iter())
         .enumerate()
         .map(|(index, (r_cent_i, slack_i))| {
-            -(r_cent_i / slack_i.max(1e-16) + damped_slack_stationarity_residual(system, index))
+            -(r_cent_i / slack_i.max(1e-16) - damped_slack_stationarity_residual(system, index))
         })
         .collect::<Vec<_>>();
     let total_dimension = workspace.pattern.dimension();
@@ -6204,8 +6203,7 @@ fn solve_reduced_kkt_with_spral_ssids(
                     .zip(p.iter())
                     .enumerate()
                     .map(|(index, ((dy_i, _), ds_i))| {
-                        *dy_i
-                            + damped_slack_stationarity_residual(system, index)
+                        *dy_i - damped_slack_stationarity_residual(system, index)
                             + slack_shift * *ds_i
                     })
                     .collect::<Vec<_>>();
@@ -6308,7 +6306,7 @@ fn solve_reduced_kkt_with_sparse_qdldl(
             .enumerate()
             .map(|(index, (((r_cent_i, z_i), r_ineq_i), s_i))| {
                 (r_cent_i - z_i * r_ineq_i) / s_i
-                    + damped_slack_stationarity_residual(system, index)
+                    - damped_slack_stationarity_residual(system, index)
             })
             .collect::<Vec<_>>();
         sparse_add_transpose_mat_vec(&mut rhs_top, system.inequality_jacobian, &sz_term);
@@ -6381,8 +6379,7 @@ fn solve_reduced_kkt_with_sparse_qdldl(
                 .zip(system.slack.iter())
                 .enumerate()
                 .map(|(index, (((ds_i, r_cent_i), z_i), s_i))| {
-                    (-r_cent_i
-                        - s_i * damped_slack_stationarity_residual(system, index)
+                    (-r_cent_i + s_i * damped_slack_stationarity_residual(system, index)
                         - z_i * ds_i)
                         / s_i.max(1e-16)
                 })
@@ -6390,7 +6387,7 @@ fn solve_reduced_kkt_with_sparse_qdldl(
             let dz = d_ineq
                 .iter()
                 .enumerate()
-                .map(|(index, dy_i)| *dy_i + damped_slack_stationarity_residual(system, index))
+                .map(|(index, dy_i)| *dy_i - damped_slack_stationarity_residual(system, index))
                 .collect::<Vec<_>>();
             (ds, d_ineq, dz)
         } else {
@@ -6486,8 +6483,7 @@ fn solve_reduced_kkt_with_sparse_qdldl(
                         .zip(system.slack.iter())
                         .enumerate()
                         .map(|(index, (((ds_i, r_cent_i), z_i), s_i))| {
-                            (-r_cent_i
-                                - s_i * damped_slack_stationarity_residual(system, index)
+                            (-r_cent_i + s_i * damped_slack_stationarity_residual(system, index)
                                 - z_i * ds_i)
                                 / s_i.max(1e-16)
                         })
@@ -6496,7 +6492,7 @@ fn solve_reduced_kkt_with_sparse_qdldl(
                         .iter()
                         .enumerate()
                         .map(|(index, dy_i)| {
-                            *dy_i + damped_slack_stationarity_residual(system, index)
+                            *dy_i - damped_slack_stationarity_residual(system, index)
                         })
                         .collect::<Vec<_>>();
                     (ds, d_ineq, dz)
@@ -8030,10 +8026,12 @@ where
             barrier_parameter_value,
             options.kappa_d,
         );
+        // IPOPT's upper-bound slack stationarity is grad_lag_s = v_U - y_d,
+        // with damping grad_lag_s - kappa_d * mu for upper-side rows.
         let slack_stationarity_residual = lambda_ineq
             .iter()
             .zip(z.iter())
-            .map(|(y_i, z_i)| y_i - z_i)
+            .map(|(y_i, z_i)| z_i - y_i)
             .collect::<Vec<_>>();
         let dual_x_inf = fixed_variables.free_inf_norm(&damped_full_dual_residual);
         let slack_stationarity_inf = damped_slack_stationarity_inf_norm(
