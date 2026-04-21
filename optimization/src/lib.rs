@@ -36,9 +36,10 @@ pub use filter::{
     FilterInfo as SqpFilterInfo,
 };
 pub use interior_point::{
-    InteriorPointBoundaryLimiter, InteriorPointDirectionDiagnostics, InteriorPointFailureContext,
-    InteriorPointIterationEvent, InteriorPointIterationPhase, InteriorPointIterationSnapshot,
-    InteriorPointIterationTiming, InteriorPointLineSearchInfo, InteriorPointLineSearchTrial,
+    InteriorPointBoundaryLimiter, InteriorPointBoundaryLimiterKind,
+    InteriorPointDirectionDiagnostics, InteriorPointFailureContext, InteriorPointIterationEvent,
+    InteriorPointIterationPhase, InteriorPointIterationSnapshot, InteriorPointIterationTiming,
+    InteriorPointLineSearchInfo, InteriorPointLineSearchTrial,
     InteriorPointLinearDebugBackendResult, InteriorPointLinearDebugOptions,
     InteriorPointLinearDebugReport, InteriorPointLinearDebugSchedule,
     InteriorPointLinearDebugVerdict, InteriorPointLinearInertia, InteriorPointLinearSolveAttempt,

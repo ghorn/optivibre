@@ -3831,12 +3831,56 @@ mod tests {
         fn primal_limiter_label(
             limiter: &optimization::InteriorPointBoundaryLimiter,
             x: &[f64],
+            slack: Option<&[f64]>,
             bounds: &VariableBoundView,
             intervals: usize,
             order: usize,
         ) -> String {
-            if limiter.index < x.len() {
-                if let Some(lower) = bounds.lower.get(limiter.index).copied().flatten() {
+            match limiter.kind {
+                optimization::InteriorPointBoundaryLimiterKind::Slack => {
+                    return format!(
+                        "s_upper({})",
+                        glider_inequality_label(limiter.index, intervals, order)
+                    );
+                }
+                optimization::InteriorPointBoundaryLimiterKind::VariableLowerBound => {
+                    return format!(
+                        "lower({})",
+                        glider_decision_label(limiter.index, intervals, order)
+                    );
+                }
+                optimization::InteriorPointBoundaryLimiterKind::VariableUpperBound => {
+                    return format!(
+                        "upper({})",
+                        glider_decision_label(limiter.index, intervals, order)
+                    );
+                }
+                optimization::InteriorPointBoundaryLimiterKind::Multiplier => {
+                    return format!("multiplier[{}]", limiter.index);
+                }
+                optimization::InteriorPointBoundaryLimiterKind::Unknown => {}
+            }
+            if let Some(slack) = slack
+                && let Some(&value) = slack.get(limiter.index)
+            {
+                let value = value.max(1.0e-16);
+                if (value - limiter.value).abs() <= 1.0e-7 * value.abs().max(1.0) {
+                    return format!(
+                        "s_upper({})",
+                        glider_inequality_label(limiter.index, intervals, order)
+                    );
+                }
+            }
+            if slack.is_some() && limiter.index < x.len() {
+                let lower = bounds.lower.get(limiter.index).copied().flatten();
+                let upper = bounds.upper.get(limiter.index).copied().flatten();
+                if lower.is_some() && lower == upper {
+                    return format!(
+                        "fixed({})",
+                        glider_decision_label(limiter.index, intervals, order)
+                    );
+                }
+                if let Some(lower) = lower {
                     let slack = (x[limiter.index] - lower).max(1.0e-16);
                     if (slack - limiter.value).abs() <= 1.0e-7 * slack.abs().max(1.0) {
                         return format!(
@@ -3845,7 +3889,7 @@ mod tests {
                         );
                     }
                 }
-                if let Some(upper) = bounds.upper.get(limiter.index).copied().flatten() {
+                if let Some(upper) = upper {
                     let slack = (upper - x[limiter.index]).max(1.0e-16);
                     if (slack - limiter.value).abs() <= 1.0e-7 * slack.abs().max(1.0) {
                         return format!(
@@ -3864,6 +3908,7 @@ mod tests {
         fn limiter_text(
             limiter: Option<&optimization::InteriorPointBoundaryLimiter>,
             x: &[f64],
+            slack: Option<&[f64]>,
             bounds: &VariableBoundView,
             intervals: usize,
             order: usize,
@@ -3871,7 +3916,7 @@ mod tests {
             limiter.map_or_else(
                 || "--".to_string(),
                 |limiter| {
-                    let label = primal_limiter_label(limiter, x, bounds, intervals, order);
+                    let label = primal_limiter_label(limiter, x, slack, bounds, intervals, order);
                     format!(
                         "#{} {} val={:.3e} dir={:.3e} a={:.3e}",
                         limiter.index, label, limiter.value, limiter.direction, limiter.alpha
@@ -4927,6 +4972,7 @@ mod tests {
                         .as_ref()
                         .and_then(|diagnostics| diagnostics.alpha_pr_limiter.as_ref()),
                     &snapshot.solver.x,
+                    snapshot.solver.slack_primal.as_deref(),
                     &variable_bounds,
                     params.transcription.intervals,
                     params.transcription.collocation_degree,
@@ -4938,6 +4984,7 @@ mod tests {
                         .as_ref()
                         .and_then(|diagnostics| diagnostics.alpha_du_limiter.as_ref()),
                     &snapshot.solver.x,
+                    None,
                     &variable_bounds,
                     params.transcription.intervals,
                     params.transcription.collocation_degree,

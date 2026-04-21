@@ -839,8 +839,21 @@ pub struct InteriorPointIterationSnapshot {
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InteriorPointBoundaryLimiterKind {
+    #[default]
+    Unknown,
+    Slack,
+    VariableLowerBound,
+    VariableUpperBound,
+    Multiplier,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct InteriorPointBoundaryLimiter {
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub kind: InteriorPointBoundaryLimiterKind,
     pub index: Index,
     pub value: f64,
     pub direction: f64,
@@ -3373,6 +3386,7 @@ fn fraction_to_boundary_with_limiter(
     current: &[f64],
     direction: &[f64],
     tau: f64,
+    kind: InteriorPointBoundaryLimiterKind,
 ) -> (f64, Option<InteriorPointBoundaryLimiter>) {
     let mut alpha = 1.0_f64;
     let mut limiter = None;
@@ -3382,6 +3396,7 @@ fn fraction_to_boundary_with_limiter(
             if candidate < alpha {
                 alpha = candidate;
                 limiter = Some(InteriorPointBoundaryLimiter {
+                    kind,
                     index: idx,
                     value,
                     direction: delta,
@@ -3398,6 +3413,7 @@ fn fraction_to_boundary_limiters(
     direction: &[f64],
     tau: f64,
     max_count: usize,
+    kind: InteriorPointBoundaryLimiterKind,
 ) -> Vec<InteriorPointBoundaryLimiter> {
     if max_count == 0 {
         return Vec::new();
@@ -3409,6 +3425,7 @@ fn fraction_to_boundary_limiters(
         .filter_map(|(index, (&value, &delta))| {
             if delta < 0.0 {
                 Some(InteriorPointBoundaryLimiter {
+                    kind,
                     index,
                     value,
                     direction: delta,
@@ -3444,6 +3461,7 @@ fn fraction_to_variable_bounds_with_limiter(
             if candidate < alpha {
                 alpha = candidate;
                 limiter = Some(InteriorPointBoundaryLimiter {
+                    kind: InteriorPointBoundaryLimiterKind::VariableLowerBound,
                     index,
                     value,
                     direction,
@@ -3460,6 +3478,7 @@ fn fraction_to_variable_bounds_with_limiter(
             if candidate < alpha {
                 alpha = candidate;
                 limiter = Some(InteriorPointBoundaryLimiter {
+                    kind: InteriorPointBoundaryLimiterKind::VariableUpperBound,
                     index,
                     value,
                     direction,
@@ -8925,6 +8944,7 @@ where
                 &slack_barrier,
                 &direction.ds,
                 fraction_to_boundary_tau,
+                InteriorPointBoundaryLimiterKind::Slack,
             )
         } else {
             (1.0, None)
@@ -8948,13 +8968,24 @@ where
             direction.dz_upper.as_slice(),
         ]);
         let (alpha_du, alpha_du_limiter) = if barrier_pair_count > 0 {
-            fraction_to_boundary_with_limiter(&combined_z, &combined_dz, fraction_to_boundary_tau)
+            fraction_to_boundary_with_limiter(
+                &combined_z,
+                &combined_dz,
+                fraction_to_boundary_tau,
+                InteriorPointBoundaryLimiterKind::Multiplier,
+            )
         } else {
             (1.0, None)
         };
         let alpha_pr_limiters = alpha_pr_limiter.iter().cloned().collect::<Vec<_>>();
         let alpha_du_limiters = if barrier_pair_count > 0 {
-            fraction_to_boundary_limiters(&combined_z, &combined_dz, fraction_to_boundary_tau, 8)
+            fraction_to_boundary_limiters(
+                &combined_z,
+                &combined_dz,
+                fraction_to_boundary_tau,
+                8,
+                InteriorPointBoundaryLimiterKind::Multiplier,
+            )
         } else {
             Vec::new()
         };
@@ -9617,6 +9648,7 @@ where
                             &slack_barrier,
                             &soc_direction.ds,
                             fraction_to_boundary_tau,
+                            InteriorPointBoundaryLimiterKind::Slack,
                         )
                     } else {
                         (1.0, None)
@@ -9737,6 +9769,7 @@ where
                                 &soc_combined_z,
                                 &soc_combined_dz,
                                 fraction_to_boundary_tau,
+                                InteriorPointBoundaryLimiterKind::Multiplier,
                             )
                             .0
                             .clamp(0.0, 1.0)
