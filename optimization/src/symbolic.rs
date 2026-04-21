@@ -36,7 +36,7 @@ use crate::{
 struct SymbolicNlp {
     name: String,
     variables: SXMatrix,
-    parameters: Vec<NamedMatrix>,
+    parameters: Option<NamedMatrix>,
     objective: SXMatrix,
     equalities: Option<SXMatrix>,
     inequalities: Option<SXMatrix>,
@@ -52,7 +52,7 @@ pub struct SymbolicNlpOutputs<E = (), I = ()> {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TypedSymbolicNlp<X, P, E, I> {
-    symbolic: SymbolicNlp,
+    symbolic: DynamicSymbolicNlp,
     _marker: TypedMarker<X, P, E, I>,
 }
 
@@ -74,9 +74,19 @@ struct CompiledJitNlp {
     lagrangian_hessian_values: JitKernel,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct DynamicSymbolicNlp {
+    symbolic: SymbolicNlp,
+}
+
+#[derive(Debug)]
+pub struct DynamicCompiledJitNlp {
+    inner: CompiledJitNlp,
+}
+
 #[derive(Debug)]
 pub struct TypedCompiledJitNlp<X, P, E, I> {
-    inner: CompiledJitNlp,
+    inner: DynamicCompiledJitNlp,
     _marker: TypedMarker<X, P, E, I>,
 }
 
@@ -119,6 +129,13 @@ where
     pub objective: f64,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuntimeNlpScaling {
+    pub variables: Vec<f64>,
+    pub constraints: Vec<f64>,
+    pub objective: f64,
+}
+
 impl<X, P, E, I> TypedCompiledJitNlp<X, P, E, I> {
     #[doc(hidden)]
     pub fn backend_compile_report_untyped(&self) -> &BackendCompileReport {
@@ -138,6 +155,16 @@ where
     pub inequality_lower: Option<<I as Vectorize<SX>>::Rebind<Option<f64>>>,
     pub inequality_upper: Option<<I as Vectorize<SX>>::Rebind<Option<f64>>>,
     pub scaling: Option<TypedNlpScaling<X>>,
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum RuntimeNlpParameterError {
+    #[error("parameter value length mismatch: expected {expected}, got {actual}")]
+    LengthMismatch { expected: usize, actual: usize },
+    #[error("parameter values were provided for a problem with no parameters")]
+    UnexpectedValues,
+    #[error("parameter values are required for this problem")]
+    MissingValues,
 }
 
 impl<X, I> Default for TypedRuntimeNlpBounds<X, I>
@@ -302,7 +329,7 @@ impl SymbolicNlp {
     pub fn new(
         name: impl Into<String>,
         variables: SXMatrix,
-        parameters: Vec<NamedMatrix>,
+        parameters: Option<NamedMatrix>,
         objective: SXMatrix,
         equalities: Option<SXMatrix>,
         inequalities: Option<SXMatrix>,
@@ -317,7 +344,10 @@ impl SymbolicNlp {
             symbolic_inputs(&variables, &parameters)?,
             vec![NamedMatrix::new("objective", objective.clone())?],
         )?;
-        debug_assert_eq!(objective_function.n_in(), parameters.len() + 1);
+        debug_assert_eq!(
+            objective_function.n_in(),
+            usize::from(parameters.is_some()) + 1
+        );
         let _ = objective.scalar_expr()?;
 
         let equalities = normalize_optional_matrix(equalities);
@@ -327,7 +357,7 @@ impl SymbolicNlp {
                 symbolic_inputs(&variables, &parameters)?,
                 vec![NamedMatrix::new("equalities", equalities.clone())?],
             )?;
-            debug_assert_eq!(validation.n_in(), parameters.len() + 1);
+            debug_assert_eq!(validation.n_in(), usize::from(parameters.is_some()) + 1);
         }
         let inequalities = normalize_optional_matrix(inequalities);
         if let Some(inequalities) = &inequalities {
@@ -336,7 +366,7 @@ impl SymbolicNlp {
                 symbolic_inputs(&variables, &parameters)?,
                 vec![NamedMatrix::new("inequalities", inequalities.clone())?],
             )?;
-            debug_assert_eq!(validation.n_in(), parameters.len() + 1);
+            debug_assert_eq!(validation.n_in(), usize::from(parameters.is_some()) + 1);
         }
 
         Ok(Self {
@@ -347,6 +377,47 @@ impl SymbolicNlp {
             equalities,
             inequalities,
             construction_time: None,
+        })
+    }
+}
+
+impl DynamicSymbolicNlp {
+    pub fn construction_time(&self) -> Option<Duration> {
+        self.symbolic.construction_time
+    }
+
+    pub fn compile_jit(&self) -> Result<DynamicCompiledJitNlp, SymbolicNlpCompileError> {
+        self.compile_jit_with_options(FunctionCompileOptions::from(LlvmOptimizationLevel::O3))
+    }
+
+    pub fn compile_jit_with_options(
+        &self,
+        options: FunctionCompileOptions,
+    ) -> Result<DynamicCompiledJitNlp, SymbolicNlpCompileError> {
+        self.compile_jit_with_compile_options(SymbolicNlpCompileOptions::from(options))
+    }
+
+    pub fn compile_jit_with_compile_options(
+        &self,
+        options: SymbolicNlpCompileOptions,
+    ) -> Result<DynamicCompiledJitNlp, SymbolicNlpCompileError> {
+        self.compile_jit_with_compile_options_and_symbolic_progress_callback(options, |_| {})
+    }
+
+    pub fn compile_jit_with_compile_options_and_symbolic_progress_callback<CB>(
+        &self,
+        options: SymbolicNlpCompileOptions,
+        on_symbolic_progress: CB,
+    ) -> Result<DynamicCompiledJitNlp, SymbolicNlpCompileError>
+    where
+        CB: FnMut(SymbolicCompileProgress),
+    {
+        Ok(DynamicCompiledJitNlp {
+            inner: compile_symbolic_nlp_with_symbolic_progress_callback(
+                &self.symbolic,
+                options,
+                on_symbolic_progress,
+            )?,
         })
     }
 }
@@ -381,7 +452,7 @@ where
 
     pub fn backend_timing_metadata(&self) -> BackendTimingMetadata {
         BackendTimingMetadata {
-            function_creation_time: self.symbolic.construction_time,
+            function_creation_time: self.symbolic.construction_time(),
             derivative_generation_time: None,
             jit_time: None,
         }
@@ -482,11 +553,12 @@ where
         CB: FnMut(SymbolicCompileProgress),
     {
         Ok(TypedCompiledJitNlp {
-            inner: compile_symbolic_nlp_with_symbolic_progress_callback(
-                &self.symbolic,
-                options,
-                on_symbolic_progress,
-            )?,
+            inner: self
+                .symbolic
+                .compile_jit_with_compile_options_and_symbolic_progress_callback(
+                    options,
+                    on_symbolic_progress,
+                )?,
             _marker: PhantomData,
         })
     }
@@ -513,30 +585,50 @@ where
     let parameters = symbolic_value::<P>("p")?;
     let outputs = model(&variables, &parameters);
 
-    let variable_matrix = symbolic_column(&variables)?;
-    let parameter_matrices = if P::LEN == 0 {
-        Vec::new()
-    } else {
-        vec![NamedMatrix::new("p", symbolic_column(&parameters)?)?]
-    };
-    let equalities = (E::LEN > 0)
-        .then(|| symbolic_column(&outputs.equalities))
-        .transpose()?;
-    let inequalities = (I::LEN > 0)
-        .then(|| symbolic_column(&outputs.inequalities))
-        .transpose()?;
-    let mut symbolic = SymbolicNlp::new(
+    let mut symbolic = symbolic_nlp_dynamic(
         name,
-        variable_matrix,
-        parameter_matrices,
-        SXMatrix::scalar(outputs.objective),
-        equalities,
-        inequalities,
+        symbolic_column(&variables)?,
+        (P::LEN > 0)
+            .then(|| symbolic_column(&parameters))
+            .transpose()?,
+        outputs.objective,
+        (E::LEN > 0)
+            .then(|| symbolic_column(&outputs.equalities))
+            .transpose()?,
+        (I::LEN > 0)
+            .then(|| symbolic_column(&outputs.inequalities))
+            .transpose()?,
     )?;
-    symbolic.construction_time = Some(started_at.elapsed());
+    symbolic.symbolic.construction_time = Some(started_at.elapsed());
     Ok(TypedSymbolicNlp {
         symbolic,
         _marker: PhantomData,
+    })
+}
+
+pub fn symbolic_nlp_dynamic(
+    name: impl Into<String>,
+    variables: SXMatrix,
+    parameters: Option<SXMatrix>,
+    objective: SX,
+    equalities: Option<SXMatrix>,
+    inequalities: Option<SXMatrix>,
+) -> Result<DynamicSymbolicNlp, SymbolicNlpBuildError> {
+    let name = name.into();
+    if name.trim().is_empty() {
+        return Err(SymbolicNlpBuildError::EmptyName);
+    }
+    Ok(DynamicSymbolicNlp {
+        symbolic: SymbolicNlp::new(
+            name,
+            variables,
+            parameters
+                .map(|matrix| NamedMatrix::new("p", matrix))
+                .transpose()?,
+            SXMatrix::scalar(objective),
+            equalities,
+            inequalities,
+        )?,
     })
 }
 
@@ -888,6 +980,553 @@ impl CompiledJitNlp {
     }
 }
 
+impl DynamicCompiledJitNlp {
+    #[doc(hidden)]
+    pub fn debug_lagrangian_hessian_lowered(&self) -> &LoweredFunction {
+        self.inner.lagrangian_hessian_values.function.lowered()
+    }
+
+    pub fn backend_timing_metadata(&self) -> BackendTimingMetadata {
+        self.inner.backend_timing_metadata()
+    }
+
+    pub fn compile_stats(&self) -> NlpCompileStats {
+        self.inner.compile_stats()
+    }
+
+    pub fn backend_compile_report(&self) -> &BackendCompileReport {
+        self.inner.backend_compile_report()
+    }
+
+    pub(crate) fn parameter_ccs(&self, parameter_index: Index) -> &CCS {
+        self.inner.parameter_ccs(parameter_index)
+    }
+
+    pub(crate) fn equality_count(&self) -> Index {
+        self.inner.equality_count()
+    }
+
+    pub(crate) fn inequality_base_count(&self) -> Index {
+        self.inner.inequality_base_count()
+    }
+
+    pub fn parameter_vector_ccs(&self) -> Option<&CCS> {
+        (self.inner.parameter_count() > 0).then(|| self.inner.parameter_ccs(0))
+    }
+
+    pub fn parameter_storage<'a>(
+        &'a self,
+        values: Option<&'a [f64]>,
+    ) -> Result<Vec<ParameterMatrix<'a>>, RuntimeNlpParameterError> {
+        match (self.parameter_vector_ccs(), values) {
+            (None, None) => Ok(Vec::new()),
+            (None, Some(_)) => Err(RuntimeNlpParameterError::UnexpectedValues),
+            (Some(_ccs), None) => Err(RuntimeNlpParameterError::MissingValues),
+            (Some(ccs), Some(values)) => {
+                if values.len() != ccs.nnz() {
+                    return Err(RuntimeNlpParameterError::LengthMismatch {
+                        expected: ccs.nnz(),
+                        actual: values.len(),
+                    });
+                }
+                Ok(vec![ParameterMatrix { ccs, values }])
+            }
+        }
+    }
+
+    pub fn bind_runtime_bounds(
+        &self,
+        bounds: &RuntimeNlpBounds,
+    ) -> Result<RuntimeBoundedJitNlp<'_>, RuntimeNlpBoundsError> {
+        self.inner.bind_runtime_bounds(bounds.clone())
+    }
+
+    pub fn benchmark_bounded_evaluations_with_progress<CB>(
+        &self,
+        x: &[f64],
+        parameters: Option<&[f64]>,
+        bounds: &RuntimeNlpBounds,
+        scaling: Option<&RuntimeNlpScaling>,
+        options: NlpEvaluationBenchmarkOptions,
+        on_progress: CB,
+    ) -> AnyResult<NlpEvaluationBenchmark>
+    where
+        CB: FnMut(NlpEvaluationKernelKind),
+    {
+        let bound_problem = self.bind_runtime_bounds(bounds)?;
+        let scaling = self.build_applied_scaling(scaling, &bound_problem)?;
+        let mut x_values = x.to_vec();
+        let parameter_storage = self.parameter_storage(parameters)?;
+        if let Some(scaling) = scaling {
+            x_values = scaling.scale_x(&x_values);
+            let scaled_problem = ScaledNlpProblem {
+                base: &bound_problem,
+                scaling,
+            };
+            Ok(benchmark_compiled_nlp_problem_with_progress(
+                &scaled_problem,
+                &x_values,
+                &parameter_storage,
+                options,
+                on_progress,
+            ))
+        } else {
+            Ok(benchmark_compiled_nlp_problem_with_progress(
+                &bound_problem,
+                &x_values,
+                &parameter_storage,
+                options,
+                on_progress,
+            ))
+        }
+    }
+
+    pub fn benchmark_bounded_evaluations(
+        &self,
+        x: &[f64],
+        parameters: Option<&[f64]>,
+        bounds: &RuntimeNlpBounds,
+        scaling: Option<&RuntimeNlpScaling>,
+        options: NlpEvaluationBenchmarkOptions,
+    ) -> AnyResult<NlpEvaluationBenchmark> {
+        self.benchmark_bounded_evaluations_with_progress(
+            x,
+            parameters,
+            bounds,
+            scaling,
+            options,
+            |_| {},
+        )
+    }
+
+    pub fn validate_derivatives_flat_values(
+        &self,
+        x: &[f64],
+        parameter_values: Option<&[f64]>,
+        equality_multipliers: &[f64],
+        inequality_multipliers: &[f64],
+        options: FiniteDifferenceValidationOptions,
+    ) -> AnyResult<NlpDerivativeValidationReport> {
+        let parameter_storage = self.parameter_storage(parameter_values)?;
+        validate_compiled_nlp_problem_derivatives(
+            &self.inner,
+            x,
+            &parameter_storage,
+            equality_multipliers,
+            inequality_multipliers,
+            options,
+        )
+    }
+
+    pub fn solve_sqp(
+        &self,
+        x0: &[f64],
+        parameters: Option<&[f64]>,
+        bounds: &RuntimeNlpBounds,
+        scaling: Option<&RuntimeNlpScaling>,
+        options: &ClarabelSqpOptions,
+    ) -> Result<ClarabelSqpSummary, ClarabelSqpError> {
+        let projection_started = Instant::now();
+        let bound_problem = self
+            .bind_runtime_bounds(bounds)
+            .map_err(|err| ClarabelSqpError::InvalidInput(err.to_string()))?;
+        let scaling = self
+            .build_applied_scaling(scaling, &bound_problem)
+            .map_err(|err| ClarabelSqpError::InvalidInput(err.to_string()))?;
+        let mut x0_values = x0.to_vec();
+        let parameter_storage = self
+            .parameter_storage(parameters)
+            .map_err(|err| ClarabelSqpError::InvalidInput(err.to_string()))?;
+        bound_problem.record_layout_projection(projection_started.elapsed());
+        if let Some(scaling) = scaling {
+            x0_values = scaling.scale_x(&x0_values);
+            let scaled_problem = ScaledNlpProblem {
+                base: &bound_problem,
+                scaling: scaling.clone(),
+            };
+            solve_nlp_sqp(&scaled_problem, &x0_values, &parameter_storage, options)
+                .map(|summary| scaling.transform_sqp_summary(&summary))
+                .map_err(|error| transform_sqp_error(&scaling, error))
+        } else {
+            solve_nlp_sqp(&bound_problem, &x0_values, &parameter_storage, options)
+        }
+    }
+
+    pub fn solve_sqp_with_callback<CB>(
+        &self,
+        x0: &[f64],
+        parameters: Option<&[f64]>,
+        bounds: &RuntimeNlpBounds,
+        scaling: Option<&RuntimeNlpScaling>,
+        options: &ClarabelSqpOptions,
+        callback: CB,
+    ) -> Result<ClarabelSqpSummary, ClarabelSqpError>
+    where
+        CB: FnMut(&crate::SqpIterationSnapshot),
+    {
+        let projection_started = Instant::now();
+        let bound_problem = self
+            .bind_runtime_bounds(bounds)
+            .map_err(|err| ClarabelSqpError::InvalidInput(err.to_string()))?;
+        let scaling = self
+            .build_applied_scaling(scaling, &bound_problem)
+            .map_err(|err| ClarabelSqpError::InvalidInput(err.to_string()))?;
+        let mut x0_values = x0.to_vec();
+        let parameter_storage = self
+            .parameter_storage(parameters)
+            .map_err(|err| ClarabelSqpError::InvalidInput(err.to_string()))?;
+        bound_problem.record_layout_projection(projection_started.elapsed());
+        if let Some(scaling) = scaling {
+            x0_values = scaling.scale_x(&x0_values);
+            let scaled_problem = ScaledNlpProblem {
+                base: &bound_problem,
+                scaling: scaling.clone(),
+            };
+            let mut callback = callback;
+            solve_nlp_sqp_with_callback(
+                &scaled_problem,
+                &x0_values,
+                &parameter_storage,
+                options,
+                |snapshot| callback(&scaling.transform_sqp_snapshot(snapshot)),
+            )
+            .map(|summary| scaling.transform_sqp_summary(&summary))
+            .map_err(|error| transform_sqp_error(&scaling, error))
+        } else {
+            solve_nlp_sqp_with_callback(
+                &bound_problem,
+                &x0_values,
+                &parameter_storage,
+                options,
+                callback,
+            )
+        }
+    }
+
+    pub fn solve_interior_point(
+        &self,
+        x0: &[f64],
+        parameters: Option<&[f64]>,
+        bounds: &RuntimeNlpBounds,
+        scaling: Option<&RuntimeNlpScaling>,
+        options: &InteriorPointOptions,
+    ) -> Result<InteriorPointSummary, InteriorPointSolveError> {
+        let projection_started = Instant::now();
+        let bound_problem = self
+            .bind_runtime_bounds(bounds)
+            .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
+        let scaling = self
+            .build_applied_scaling(scaling, &bound_problem)
+            .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
+        let mut x0_values = x0.to_vec();
+        let parameter_storage = self
+            .parameter_storage(parameters)
+            .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
+        bound_problem.record_layout_projection(projection_started.elapsed());
+        if let Some(scaling) = scaling {
+            x0_values = scaling.scale_x(&x0_values);
+            let scaled_problem = ScaledNlpProblem {
+                base: &bound_problem,
+                scaling: scaling.clone(),
+            };
+            solve_nlp_interior_point(&scaled_problem, &x0_values, &parameter_storage, options)
+                .map(|summary| scaling.transform_interior_point_summary(&summary))
+        } else {
+            solve_nlp_interior_point(&bound_problem, &x0_values, &parameter_storage, options)
+        }
+    }
+
+    pub fn solve_interior_point_with_callback<CB>(
+        &self,
+        x0: &[f64],
+        parameters: Option<&[f64]>,
+        bounds: &RuntimeNlpBounds,
+        scaling: Option<&RuntimeNlpScaling>,
+        options: &InteriorPointOptions,
+        callback: CB,
+    ) -> Result<InteriorPointSummary, InteriorPointSolveError>
+    where
+        CB: FnMut(&InteriorPointIterationSnapshot),
+    {
+        let projection_started = Instant::now();
+        let bound_problem = self
+            .bind_runtime_bounds(bounds)
+            .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
+        let scaling = self
+            .build_applied_scaling(scaling, &bound_problem)
+            .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
+        let mut x0_values = x0.to_vec();
+        let parameter_storage = self
+            .parameter_storage(parameters)
+            .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
+        bound_problem.record_layout_projection(projection_started.elapsed());
+        if let Some(scaling) = scaling {
+            x0_values = scaling.scale_x(&x0_values);
+            let scaled_problem = ScaledNlpProblem {
+                base: &bound_problem,
+                scaling: scaling.clone(),
+            };
+            let mut callback = callback;
+            solve_nlp_interior_point_with_callback(
+                &scaled_problem,
+                &x0_values,
+                &parameter_storage,
+                options,
+                |snapshot| callback(&scaling.transform_interior_point_snapshot(snapshot)),
+            )
+            .map(|summary| scaling.transform_interior_point_summary(&summary))
+        } else {
+            solve_nlp_interior_point_with_callback(
+                &bound_problem,
+                &x0_values,
+                &parameter_storage,
+                options,
+                callback,
+            )
+        }
+    }
+
+    #[cfg(feature = "ipopt")]
+    pub fn solve_ipopt(
+        &self,
+        x0: &[f64],
+        parameters: Option<&[f64]>,
+        bounds: &RuntimeNlpBounds,
+        scaling: Option<&RuntimeNlpScaling>,
+        options: &IpoptOptions,
+    ) -> Result<IpoptSummary, IpoptSolveError> {
+        let projection_started = Instant::now();
+        let bound_problem = self
+            .bind_runtime_bounds(bounds)
+            .map_err(|err| IpoptSolveError::InvalidInput(err.to_string()))?;
+        let scaling = self
+            .build_applied_scaling(scaling, &bound_problem)
+            .map_err(|err| IpoptSolveError::InvalidInput(err.to_string()))?;
+        let mut x0_values = x0.to_vec();
+        let parameter_storage = self
+            .parameter_storage(parameters)
+            .map_err(|err| IpoptSolveError::InvalidInput(err.to_string()))?;
+        bound_problem.record_layout_projection(projection_started.elapsed());
+        if let Some(scaling) = scaling {
+            x0_values = scaling.scale_x(&x0_values);
+            let scaled_problem = ScaledNlpProblem {
+                base: &bound_problem,
+                scaling: scaling.clone(),
+            };
+            solve_nlp_ipopt(&scaled_problem, &x0_values, &parameter_storage, options)
+                .map(|summary| scaling.transform_ipopt_summary(&summary))
+                .map_err(|error| transform_ipopt_error(&scaling, error))
+        } else {
+            solve_nlp_ipopt(&bound_problem, &x0_values, &parameter_storage, options)
+        }
+    }
+
+    #[cfg(feature = "ipopt")]
+    pub fn solve_ipopt_with_callback<CB>(
+        &self,
+        x0: &[f64],
+        parameters: Option<&[f64]>,
+        bounds: &RuntimeNlpBounds,
+        scaling: Option<&RuntimeNlpScaling>,
+        options: &IpoptOptions,
+        callback: CB,
+    ) -> Result<IpoptSummary, IpoptSolveError>
+    where
+        CB: FnMut(&IpoptIterationSnapshot),
+    {
+        let projection_started = Instant::now();
+        let bound_problem = self
+            .bind_runtime_bounds(bounds)
+            .map_err(|err| IpoptSolveError::InvalidInput(err.to_string()))?;
+        let scaling = self
+            .build_applied_scaling(scaling, &bound_problem)
+            .map_err(|err| IpoptSolveError::InvalidInput(err.to_string()))?;
+        let mut x0_values = x0.to_vec();
+        let parameter_storage = self
+            .parameter_storage(parameters)
+            .map_err(|err| IpoptSolveError::InvalidInput(err.to_string()))?;
+        bound_problem.record_layout_projection(projection_started.elapsed());
+        if let Some(scaling) = scaling {
+            x0_values = scaling.scale_x(&x0_values);
+            let scaled_problem = ScaledNlpProblem {
+                base: &bound_problem,
+                scaling: scaling.clone(),
+            };
+            let mut callback = callback;
+            solve_nlp_ipopt_with_callback(
+                &scaled_problem,
+                &x0_values,
+                &parameter_storage,
+                options,
+                |snapshot| callback(&scaling.transform_ipopt_snapshot(snapshot)),
+            )
+            .map(|summary| scaling.transform_ipopt_summary(&summary))
+            .map_err(|error| transform_ipopt_error(&scaling, error))
+        } else {
+            solve_nlp_ipopt_with_callback(
+                &bound_problem,
+                &x0_values,
+                &parameter_storage,
+                options,
+                callback,
+            )
+        }
+    }
+
+    pub fn rank_constraint_violations(
+        &self,
+        x: &[f64],
+        parameters: Option<&[f64]>,
+        bounds: &RuntimeNlpBounds,
+        tolerance: f64,
+    ) -> AnyResult<NlpConstraintViolationReport> {
+        let parameter_storage = self.parameter_storage(parameters)?;
+        Ok(rank_nlp_constraint_violations(
+            &self.inner,
+            x,
+            &parameter_storage,
+            bounds,
+            tolerance,
+        )?)
+    }
+
+    pub fn evaluate_equalities_flat(
+        &self,
+        x: &[f64],
+        parameters: Option<&[f64]>,
+    ) -> Result<Vec<f64>, RuntimeNlpParameterError> {
+        let parameter_storage = self.parameter_storage(parameters)?;
+        let mut values = vec![0.0; self.inner.equality_count()];
+        let _ = self
+            .inner
+            .equality_values_timed(x, &parameter_storage, &mut values);
+        Ok(values)
+    }
+
+    pub fn evaluate_inequalities_flat(
+        &self,
+        x: &[f64],
+        parameters: Option<&[f64]>,
+    ) -> Result<Vec<f64>, RuntimeNlpParameterError> {
+        let parameter_storage = self.parameter_storage(parameters)?;
+        let mut values = vec![0.0; self.inner.inequality_base_count()];
+        let _ = self
+            .inner
+            .inequality_values_timed(x, &parameter_storage, &mut values);
+        Ok(values)
+    }
+
+    fn build_applied_scaling(
+        &self,
+        scaling: Option<&RuntimeNlpScaling>,
+        problem: &RuntimeBoundedJitNlp<'_>,
+    ) -> Result<Option<AppliedNlpScaling>, RuntimeNlpBoundsError> {
+        let Some(scaling) = scaling else {
+            return Ok(None);
+        };
+        let equality_count = problem.equality_count();
+        if scaling.constraints.len() < equality_count {
+            return Err(RuntimeNlpBoundsError::ConstraintScalingLengthMismatch {
+                expected: equality_count,
+                actual: scaling.constraints.len(),
+            });
+        }
+        let flat = FlatNlpScaling {
+            variable: scaling.variables.clone(),
+            equality: scaling.constraints[..equality_count].to_vec(),
+            inequality: scaling.constraints[equality_count..].to_vec(),
+            objective: scaling.objective,
+        };
+        AppliedNlpScaling::from_runtime_problem(problem, flat).map(Some)
+    }
+}
+
+fn transform_sqp_error(scaling: &AppliedNlpScaling, error: ClarabelSqpError) -> ClarabelSqpError {
+    match error {
+        ClarabelSqpError::InvalidInput(message) => ClarabelSqpError::InvalidInput(message),
+        ClarabelSqpError::NonFiniteInput { stage } => ClarabelSqpError::NonFiniteInput { stage },
+        ClarabelSqpError::MaxIterations {
+            iterations,
+            context,
+        } => ClarabelSqpError::MaxIterations {
+            iterations,
+            context: Box::new(scaling.transform_sqp_context(&context)),
+        },
+        ClarabelSqpError::Setup(message) => ClarabelSqpError::Setup(message),
+        ClarabelSqpError::QpSolve { status, context } => ClarabelSqpError::QpSolve {
+            status,
+            context: Box::new(scaling.transform_sqp_context(&context)),
+        },
+        ClarabelSqpError::UnconstrainedStepSolve { context } => {
+            ClarabelSqpError::UnconstrainedStepSolve {
+                context: Box::new(scaling.transform_sqp_context(&context)),
+            }
+        }
+        ClarabelSqpError::LineSearchFailed {
+            directional_derivative,
+            step_inf_norm,
+            penalty,
+            context,
+        } => ClarabelSqpError::LineSearchFailed {
+            directional_derivative,
+            step_inf_norm,
+            penalty,
+            context: Box::new(scaling.transform_sqp_context(&context)),
+        },
+        ClarabelSqpError::Stalled {
+            step_inf_norm,
+            primal_inf_norm,
+            dual_inf_norm,
+            complementarity_inf_norm,
+            context,
+        } => ClarabelSqpError::Stalled {
+            step_inf_norm,
+            primal_inf_norm,
+            dual_inf_norm,
+            complementarity_inf_norm,
+            context: Box::new(scaling.transform_sqp_context(&context)),
+        },
+        ClarabelSqpError::RestorationFailed {
+            step_inf_norm,
+            context,
+        } => ClarabelSqpError::RestorationFailed {
+            step_inf_norm,
+            context: Box::new(scaling.transform_sqp_context(&context)),
+        },
+        ClarabelSqpError::NonFiniteCallbackOutput { stage, context } => {
+            ClarabelSqpError::NonFiniteCallbackOutput {
+                stage,
+                context: Box::new(scaling.transform_sqp_context(&context)),
+            }
+        }
+    }
+}
+
+#[cfg(feature = "ipopt")]
+fn transform_ipopt_error(scaling: &AppliedNlpScaling, error: IpoptSolveError) -> IpoptSolveError {
+    match error {
+        IpoptSolveError::InvalidInput(message) => IpoptSolveError::InvalidInput(message),
+        IpoptSolveError::Setup(message) => IpoptSolveError::Setup(message),
+        IpoptSolveError::OptionRejected { name } => IpoptSolveError::OptionRejected { name },
+        IpoptSolveError::Solve {
+            status,
+            iterations,
+            snapshots,
+            journal_output,
+            profiling,
+        } => IpoptSolveError::Solve {
+            status,
+            iterations,
+            snapshots: snapshots
+                .iter()
+                .map(|snapshot| scaling.transform_ipopt_snapshot(snapshot))
+                .collect(),
+            journal_output,
+            profiling,
+        },
+    }
+}
+
 impl<X, P, E, I> TypedCompiledJitNlp<X, P, E, I>
 where
     X: Vectorize<SX, Rebind<SX> = X>,
@@ -901,7 +1540,11 @@ where
 {
     #[doc(hidden)]
     pub fn debug_lagrangian_hessian_lowered(&self) -> &LoweredFunction {
-        self.inner.lagrangian_hessian_values.function.lowered()
+        self.inner
+            .inner
+            .lagrangian_hessian_values
+            .function
+            .lowered()
     }
 
     pub fn backend_timing_metadata(&self) -> BackendTimingMetadata {
@@ -934,6 +1577,7 @@ where
         let mut values = vec![0.0; self.inner.equality_count()];
         let _ = self
             .inner
+            .inner
             .equality_values_timed(&x_values, &parameter_storage, &mut values);
         values
     }
@@ -954,9 +1598,10 @@ where
             }]
         };
         let mut values = vec![0.0; self.inner.inequality_base_count()];
-        let _ = self
-            .inner
-            .inequality_values_timed(&x_values, &parameter_storage, &mut values);
+        let _ =
+            self.inner
+                .inner
+                .inequality_values_timed(&x_values, &parameter_storage, &mut values);
         values
     }
 }
@@ -979,7 +1624,7 @@ where
         bounds: &TypedRuntimeNlpBounds<X, I>,
     ) -> Result<RuntimeBoundedJitNlp<'_>, RuntimeNlpBoundsError> {
         self.inner
-            .bind_runtime_bounds(self.flatten_runtime_bounds(bounds))
+            .bind_runtime_bounds(&self.flatten_runtime_bounds(bounds))
     }
 
     fn flatten_runtime_bounds(&self, bounds: &TypedRuntimeNlpBounds<X, I>) -> RuntimeNlpBounds {
@@ -2287,6 +2932,99 @@ impl CompiledNlpProblem for CompiledJitNlp {
     }
 }
 
+impl CompiledNlpProblem for DynamicCompiledJitNlp {
+    fn dimension(&self) -> Index {
+        self.inner.dimension()
+    }
+
+    fn parameter_count(&self) -> Index {
+        self.inner.parameter_count()
+    }
+
+    fn parameter_ccs(&self, parameter_index: Index) -> &CCS {
+        self.inner.parameter_ccs(parameter_index)
+    }
+
+    fn backend_timing_metadata(&self) -> BackendTimingMetadata {
+        self.inner.backend_timing_metadata()
+    }
+
+    fn backend_compile_report(&self) -> Option<&BackendCompileReport> {
+        Some(self.inner.backend_compile_report())
+    }
+
+    fn equality_count(&self) -> Index {
+        self.inner.equality_count()
+    }
+
+    fn inequality_count(&self) -> Index {
+        self.inner.inequality_base_count()
+    }
+
+    fn objective_value(&self, x: &[f64], parameters: &[ParameterMatrix<'_>]) -> f64 {
+        self.inner.objective_value(x, parameters)
+    }
+
+    fn objective_gradient(&self, x: &[f64], parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
+        self.inner.objective_gradient(x, parameters, out);
+    }
+
+    fn equality_jacobian_ccs(&self) -> &CCS {
+        self.inner.equality_jacobian_ccs()
+    }
+
+    fn equality_values(&self, x: &[f64], parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
+        self.inner.equality_values(x, parameters, out);
+    }
+
+    fn equality_jacobian_values(
+        &self,
+        x: &[f64],
+        parameters: &[ParameterMatrix<'_>],
+        out: &mut [f64],
+    ) {
+        self.inner.equality_jacobian_values(x, parameters, out);
+    }
+
+    fn inequality_jacobian_ccs(&self) -> &CCS {
+        self.inner.inequality_jacobian_ccs()
+    }
+
+    fn inequality_values(&self, x: &[f64], parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
+        self.inner.inequality_values(x, parameters, out);
+    }
+
+    fn inequality_jacobian_values(
+        &self,
+        x: &[f64],
+        parameters: &[ParameterMatrix<'_>],
+        out: &mut [f64],
+    ) {
+        self.inner.inequality_jacobian_values(x, parameters, out);
+    }
+
+    fn lagrangian_hessian_ccs(&self) -> &CCS {
+        self.inner.lagrangian_hessian_ccs()
+    }
+
+    fn lagrangian_hessian_values(
+        &self,
+        x: &[f64],
+        parameters: &[ParameterMatrix<'_>],
+        equality_multipliers: &[f64],
+        inequality_multipliers: &[f64],
+        out: &mut [f64],
+    ) {
+        self.inner.lagrangian_hessian_values(
+            x,
+            parameters,
+            equality_multipliers,
+            inequality_multipliers,
+            out,
+        );
+    }
+}
+
 impl CompiledNlpProblem for RuntimeBoundedJitNlp<'_> {
     fn dimension(&self) -> Index {
         self.base.dimension()
@@ -2577,9 +3315,9 @@ impl JitKernel {
 
 fn symbolic_inputs(
     variables: &SXMatrix,
-    parameters: &[NamedMatrix],
+    parameters: &Option<NamedMatrix>,
 ) -> Result<Vec<NamedMatrix>, SymbolicNlpBuildError> {
-    let mut inputs = Vec::with_capacity(parameters.len() + 1);
+    let mut inputs = Vec::with_capacity(usize::from(parameters.is_some()) + 1);
     inputs.push(NamedMatrix::new("x", variables.clone())?);
     inputs.extend(parameters.iter().cloned());
     Ok(inputs)

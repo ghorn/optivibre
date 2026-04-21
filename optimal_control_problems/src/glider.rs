@@ -1,10 +1,13 @@
 use crate::common::{
-    CompileCacheStatus, CompileProgressInfo, CompileProgressUpdate, ContinuousInitialGuess,
-    FromMap, LatexSection, MetricKey, OcpRuntimeSpec, OcpSxFunctionConfig, PlotMode, ProblemId,
-    ProblemSpec, Scene2D, ScenePath, SolveArtifact, SolveStreamEvent, SolverConfig, SolverMethod,
-    SolverReport, StandardOcpParams, TranscriptionConfig, chart, default_solver_config,
-    default_solver_method, default_transcription, deg_to_rad, direct_collocation_runtime_from_spec,
-    expect_finite, interval_arc_bound_series, interval_arc_series, metric_with_key,
+    CompileCacheStatus, CompileProgressInfo, CompileProgressUpdate, CompiledDirectCollocationOcp,
+    CompiledMultipleShootingOcp, ContinuousInitialGuess, DirectCollocationRuntimeValues,
+    DirectCollocationTimeGrid, DirectCollocationTrajectories, FromMap, LatexSection, MetricKey,
+    MultipleShootingRuntimeValues, MultipleShootingTrajectories, OcpRuntimeSpec,
+    OcpSxFunctionConfig, PlotMode, ProblemId, ProblemSpec, Scene2D, ScenePath, SolveArtifact,
+    SolveStreamEvent, SolverConfig, SolverMethod, SolverReport, StandardOcpParams,
+    TranscriptionConfig, chart, default_solver_config, default_solver_method,
+    default_transcription, deg_to_rad, direct_collocation_runtime_from_spec, expect_finite,
+    interval_arc_bound_series, interval_arc_series, metric_with_key,
     multiple_shooting_runtime_from_spec, node_times, numeric_metric_with_key,
     ocp_sx_function_config_from_map, problem_controls, problem_scientific_slider_control,
     problem_slider_control, problem_spec, rad_to_deg, sample_or_default, segmented_bound_series,
@@ -12,13 +15,11 @@ use crate::common::{
     transcription_from_map, transcription_metrics, trapezoid_integral,
 };
 use anyhow::{Result, anyhow};
-use optimal_control::{
-    Bounds1D, CompiledDirectCollocationOcp, CompiledMultipleShootingOcp, DirectCollocation,
-    DirectCollocationRuntimeValues, DirectCollocationTimeGrid, DirectCollocationTrajectories,
-    InterpolatedTrajectory, IntervalArc, MultipleShooting, MultipleShootingRuntimeValues,
-    MultipleShootingTrajectories, Ocp, OcpScaling, direct_collocation_root_arcs,
+use optimal_control::runtime::{
+    DirectCollocation, MultipleShooting, direct_collocation_root_arcs,
     direct_collocation_state_like_arcs,
 };
+use optimal_control::{Bounds1D, InterpolatedTrajectory, IntervalArc, Ocp, OcpScaling};
 use serde::Serialize;
 use std::f64::consts::PI;
 use sx_core::SX;
@@ -77,36 +78,32 @@ struct ModelParams<T> {
     alpha_rate_weight: T,
 }
 
-type MsCompiled<const N: usize> = CompiledMultipleShootingOcp<
+type MsCompiled = CompiledMultipleShootingOcp<
     State<SX>,
     Control<SX>,
     ModelParams<SX>,
     Path<SX>,
     Boundary<SX>,
     (),
-    N,
-    RK4_SUBSTEPS,
 >;
 
-type DcCompiled<const N: usize, const K: usize> = CompiledDirectCollocationOcp<
+type DcCompiled = CompiledDirectCollocationOcp<
     State<SX>,
     Control<SX>,
     ModelParams<SX>,
     Path<SX>,
     Boundary<SX>,
     (),
-    N,
-    K,
 >;
 
 thread_local! {
     static MULTIPLE_SHOOTING_CACHE: std::cell::RefCell<
-        crate::common::SharedCompileCache<crate::common::MultipleShootingCompileKey, MsCompiled<DEFAULT_INTERVALS>>
+        crate::common::SharedCompileCache<crate::common::MultipleShootingCompileKey, MsCompiled>
     > = std::cell::RefCell::new(crate::common::SharedCompileCache::new());
     static DIRECT_COLLOCATION_CACHE: std::cell::RefCell<
         crate::common::SharedCompileCache<
             crate::common::DirectCollocationCompileVariantKey,
-            DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+            DcCompiled,
         >
     > = std::cell::RefCell::new(crate::common::SharedCompileCache::new());
 }
@@ -520,17 +517,18 @@ fn model<Scheme>(
         .expect("glider model should build")
 }
 
-fn cached_multiple_shooting(
-    params: &Params,
-) -> Result<crate::common::CachedCompile<MsCompiled<DEFAULT_INTERVALS>>> {
+fn cached_multiple_shooting(params: &Params) -> Result<crate::common::CachedCompile<MsCompiled>> {
     MULTIPLE_SHOOTING_CACHE.with(|cache| {
         crate::common::cached_multiple_shooting_ocp_compile(
             &mut cache.borrow_mut(),
             DEFAULT_INTERVALS,
             params.sx_functions,
             |options| {
-                model(MultipleShooting::<DEFAULT_INTERVALS, RK4_SUBSTEPS>)
-                    .compile_jit_with_ocp_options(options)
+                model(MultipleShooting {
+                    intervals: DEFAULT_INTERVALS,
+                    rk4_substeps: RK4_SUBSTEPS,
+                })
+                .compile_jit_with_ocp_options(options)
             },
         )
     })
@@ -539,16 +537,19 @@ fn cached_multiple_shooting(
 fn cached_direct_collocation(
     params: &Params,
     family: optimal_control::CollocationFamily,
-) -> Result<crate::common::CachedCompile<DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>>>
-{
+) -> Result<crate::common::CachedCompile<DcCompiled>> {
     DIRECT_COLLOCATION_CACHE.with(|cache| {
         crate::common::cached_direct_collocation_ocp_compile(
             &mut cache.borrow_mut(),
             family,
             params.sx_functions,
             |options| {
-                model(DirectCollocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE> { family })
-                    .compile_jit_with_ocp_options(options)
+                model(DirectCollocation {
+                    intervals: DEFAULT_INTERVALS,
+                    order: DEFAULT_COLLOCATION_DEGREE,
+                    family,
+                })
+                .compile_jit_with_ocp_options(options)
             },
         )
     })
@@ -558,7 +559,7 @@ fn compile_multiple_shooting_with_progress(
     params: &Params,
     callback: &mut dyn FnMut(CompileProgressUpdate),
 ) -> Result<(
-    std::rc::Rc<std::cell::RefCell<MsCompiled<DEFAULT_INTERVALS>>>,
+    std::rc::Rc<std::cell::RefCell<MsCompiled>>,
     CompileProgressInfo,
 )> {
     MULTIPLE_SHOOTING_CACHE.with(|cache| {
@@ -568,8 +569,11 @@ fn compile_multiple_shooting_with_progress(
             params.sx_functions,
             callback,
             |options, on_progress| {
-                model(MultipleShooting::<DEFAULT_INTERVALS, RK4_SUBSTEPS>)
-                    .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
+                model(MultipleShooting {
+                    intervals: DEFAULT_INTERVALS,
+                    rk4_substeps: RK4_SUBSTEPS,
+                })
+                .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
             },
             crate::common::compile_progress_info_from_compiled,
         )
@@ -581,7 +585,7 @@ fn compile_direct_collocation_with_progress(
     family: optimal_control::CollocationFamily,
     callback: &mut dyn FnMut(CompileProgressUpdate),
 ) -> Result<(
-    std::rc::Rc<std::cell::RefCell<DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>>>,
+    std::rc::Rc<std::cell::RefCell<DcCompiled>>,
     CompileProgressInfo,
 )> {
     DIRECT_COLLOCATION_CACHE.with(|cache| {
@@ -591,8 +595,12 @@ fn compile_direct_collocation_with_progress(
             params.sx_functions,
             callback,
             |options, on_progress| {
-                model(DirectCollocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE> { family })
-                    .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
+                model(DirectCollocation {
+                    intervals: DEFAULT_INTERVALS,
+                    order: DEFAULT_COLLOCATION_DEGREE,
+                    family,
+                })
+                .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
             },
             crate::common::compile_progress_info_from_compiled,
         )
@@ -643,7 +651,7 @@ pub(crate) fn benchmark_default_case_with_progress(
     eval_options: optimization::NlpEvaluationBenchmarkOptions,
     on_progress: &mut dyn FnMut(crate::benchmark_report::BenchmarkCaseProgress),
 ) -> Result<crate::benchmark_report::OcpBenchmarkRecord> {
-    crate::common::benchmark_standard_ocp_case_with_progress(
+    crate::common::benchmark_standard_ocp_case_with_progress::<_, _, _, _, _, _, _, _>(
         ProblemId::OptimalDistanceGlider,
         PROBLEM_NAME,
         transcription,
@@ -651,20 +659,27 @@ pub(crate) fn benchmark_default_case_with_progress(
         eval_options,
         on_progress,
         |options, on_progress| {
-            model(MultipleShooting::<DEFAULT_INTERVALS, RK4_SUBSTEPS>)
-                .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
+            model(MultipleShooting {
+                intervals: DEFAULT_INTERVALS,
+                rk4_substeps: RK4_SUBSTEPS,
+            })
+            .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
         },
         |family, options, on_progress| {
-            model(DirectCollocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE> { family })
-                .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
+            model(DirectCollocation {
+                intervals: DEFAULT_INTERVALS,
+                order: DEFAULT_COLLOCATION_DEGREE,
+                family,
+            })
+            .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
         },
-        ms_runtime::<DEFAULT_INTERVALS>,
-        dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+        ms_runtime,
+        dc_runtime,
     )
 }
 
 pub fn solve(params: &Params) -> Result<SolveArtifact> {
-    crate::common::solve_standard_ocp(
+    crate::common::solve_standard_ocp::<_, _, _, _, _, _, _, _, _>(
         params,
         params.transcription.method,
         params.transcription.collocation_family,
@@ -672,8 +687,8 @@ pub fn solve(params: &Params) -> Result<SolveArtifact> {
         &params.solver,
         cached_multiple_shooting,
         cached_direct_collocation,
-        ms_runtime::<DEFAULT_INTERVALS>,
-        dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+        ms_runtime,
+        dc_runtime,
         |trajectories, x_arcs, u_arcs| {
             artifact_from_ms_trajectories(params, trajectories, x_arcs, u_arcs)
         },
@@ -685,7 +700,7 @@ pub fn solve_with_progress<F>(params: &Params, emit: F) -> Result<SolveArtifact>
 where
     F: FnMut(SolveStreamEvent) + Send,
 {
-    crate::common::solve_standard_ocp_with_progress(
+    crate::common::solve_standard_ocp_with_progress::<_, _, _, _, _, _, _, _, _, _>(
         params,
         params.transcription.method,
         params.transcription.collocation_family,
@@ -694,8 +709,8 @@ where
         emit,
         compile_multiple_shooting_with_progress,
         compile_direct_collocation_with_progress,
-        ms_runtime::<DEFAULT_INTERVALS>,
-        dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+        ms_runtime,
+        dc_runtime,
         |trajectories, x_arcs, u_arcs| {
             artifact_from_ms_trajectories(params, trajectories, x_arcs, u_arcs)
         },
@@ -737,7 +752,7 @@ pub fn validate_derivatives(
     params: &Params,
     request: &crate::common::DerivativeCheckRequest,
 ) -> Result<crate::common::ProblemDerivativeCheck> {
-    crate::common::validate_standard_ocp_derivatives(
+    crate::common::validate_standard_ocp_derivatives::<_, _, _, _, _, _, _>(
         ProblemId::OptimalDistanceGlider,
         PROBLEM_NAME,
         params,
@@ -747,8 +762,8 @@ pub fn validate_derivatives(
         request,
         cached_multiple_shooting,
         cached_direct_collocation,
-        ms_runtime::<DEFAULT_INTERVALS>,
-        dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+        ms_runtime,
+        dc_runtime,
     )
 }
 
@@ -938,7 +953,7 @@ fn glider_scaling(params: &Params) -> OcpScaling<ModelParams<f64>, State<f64>, C
     }
 }
 
-fn ms_runtime<const N: usize>(
+fn ms_runtime(
     params: &Params,
 ) -> MultipleShootingRuntimeValues<
     ModelParams<f64>,
@@ -947,14 +962,13 @@ fn ms_runtime<const N: usize>(
     (),
     State<f64>,
     Control<f64>,
-    N,
 > {
     let mut runtime = multiple_shooting_runtime_from_spec(runtime_spec(params));
     runtime.scaling = params.scaling_enabled.then(|| glider_scaling(params));
     runtime
 }
 
-fn dc_runtime<const N: usize, const K: usize>(
+fn dc_runtime(
     params: &Params,
 ) -> DirectCollocationRuntimeValues<
     ModelParams<f64>,
@@ -963,8 +977,6 @@ fn dc_runtime<const N: usize, const K: usize>(
     (),
     State<f64>,
     Control<f64>,
-    N,
-    K,
 > {
     let mut runtime = direct_collocation_runtime_from_spec(runtime_spec(params));
     runtime.scaling = params.scaling_enabled.then(|| glider_scaling(params));
@@ -1124,19 +1136,20 @@ fn artifact_from_interval_data(
     )
 }
 
-fn artifact_from_ms_trajectories<const N: usize>(
+fn artifact_from_ms_trajectories(
     params: &Params,
-    trajectories: &MultipleShootingTrajectories<State<f64>, Control<f64>, N>,
+    trajectories: &MultipleShootingTrajectories<State<f64>, Control<f64>>,
     x_arcs: &[IntervalArc<State<f64>>],
     u_arcs: &[IntervalArc<Control<f64>>],
 ) -> SolveArtifact {
     let tf = trajectories.tf;
-    let times = node_times::<N>(tf);
-    let mut altitude = Vec::with_capacity(N + 1);
-    let mut alpha_rate = Vec::with_capacity(N + 1);
-    let mut x = Vec::with_capacity(N + 1);
-    let mut y = Vec::with_capacity(N + 1);
-    for index in 0..N {
+    let intervals = trajectories.interval_count();
+    let times = node_times(tf, intervals);
+    let mut altitude = Vec::with_capacity(intervals + 1);
+    let mut alpha_rate = Vec::with_capacity(intervals + 1);
+    let mut x = Vec::with_capacity(intervals + 1);
+    let mut y = Vec::with_capacity(intervals + 1);
+    for index in 0..intervals {
         let state = &trajectories.x.nodes[index];
         let control = &trajectories.u.nodes[index];
         let rate = &trajectories.dudt[index];
@@ -1196,10 +1209,10 @@ fn artifact_from_ms_trajectories<const N: usize>(
     )
 }
 
-fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
+fn artifact_from_dc_trajectories(
     params: &Params,
-    trajectories: &DirectCollocationTrajectories<State<f64>, Control<f64>, N, K>,
-    time_grid: &DirectCollocationTimeGrid<N, K>,
+    trajectories: &DirectCollocationTrajectories<State<f64>, Control<f64>>,
+    time_grid: &DirectCollocationTimeGrid,
 ) -> SolveArtifact {
     let x_arcs =
         direct_collocation_state_like_arcs(&trajectories.x, &trajectories.root_x, time_grid)
@@ -1208,10 +1221,11 @@ fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
         direct_collocation_state_like_arcs(&trajectories.u, &trajectories.root_u, time_grid)
             .expect("collocation control-state arcs should match trajectory layout");
     let dudt_arcs = direct_collocation_root_arcs(&trajectories.root_dudt, time_grid);
-    let mut x = Vec::with_capacity(N + 1);
-    let mut y = Vec::with_capacity(N + 1);
+    let intervals = trajectories.x.nodes.len();
+    let mut x = Vec::with_capacity(intervals + 1);
+    let mut y = Vec::with_capacity(intervals + 1);
     let mut peak_altitude = f64::NEG_INFINITY;
-    for index in 0..N {
+    for index in 0..intervals {
         let state = &trajectories.x.nodes[index];
         x.push(state.x);
         y.push(state.altitude);
@@ -1224,11 +1238,11 @@ fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
         .iter()
         .flat_map(|arc| arc.times.iter().copied())
         .collect::<Vec<_>>();
-    let root_rates = (0..N)
-        .flat_map(|interval| {
-            (0..K)
-                .map(move |root| rad_to_deg(trajectories.root_dudt.intervals[interval][root].alpha))
-        })
+    let root_rates = trajectories
+        .root_dudt
+        .intervals
+        .iter()
+        .flat_map(|interval| interval.iter().map(|rate| rad_to_deg(rate.alpha)))
         .collect::<Vec<_>>();
     let trim_cost = if root_times.len() >= 2 {
         trapezoid_integral(
@@ -1577,7 +1591,7 @@ mod tests {
     #[test]
     fn glider_runtime_scaling_defaults_match_problem_tuning() {
         let params = Params::default();
-        let runtime = ms_runtime::<2>(&params);
+        let runtime = ms_runtime(&params);
         let scaling = runtime
             .scaling
             .expect("glider scaling should be enabled by default");
@@ -1628,7 +1642,7 @@ mod tests {
 
     #[test]
     fn glider_runtime_scaling_can_be_disabled() {
-        let runtime = ms_runtime::<2>(&Params {
+        let runtime = ms_runtime(&Params {
             scaling_enabled: false,
             ..Params::default()
         });
@@ -1647,13 +1661,17 @@ mod tests {
             ..Params::default()
         };
         let family = params.transcription.collocation_family;
-        let runtime = dc_runtime::<N, K>(&params);
-        let compiled = model(optimal_control::DirectCollocation::<N, K> { family })
-            .compile_jit_with_ocp_options(crate::common::ocp_compile_options(
-                crate::common::interactive_direct_collocation_opt_level(),
-                params.sx_functions,
-            ))
-            .expect("reduced glider direct collocation should compile");
+        let runtime = dc_runtime(&params);
+        let compiled = model(DirectCollocation {
+            intervals: N,
+            order: K,
+            family,
+        })
+        .compile_jit_with_ocp_options(crate::common::ocp_compile_options(
+            crate::common::interactive_direct_collocation_opt_level(),
+            params.sx_functions,
+        ))
+        .expect("reduced glider direct collocation should compile");
 
         let mut sqp_options = crate::common::sqp_options(&params.solver);
         sqp_options.globalization = optimization::SqpGlobalization::LineSearchMerit(
@@ -1671,7 +1689,9 @@ mod tests {
             Ok(_) => {}
             Err(optimization::ClarabelSqpError::MaxIterations { .. }) => {}
             Err(optimization::ClarabelSqpError::QpSolve {
-                status: optimization::SqpQpRawStatus::InsufficientProgress,
+                status:
+                    optimization::SqpQpRawStatus::InsufficientProgress
+                    | optimization::SqpQpRawStatus::NumericalError,
                 ..
             }) if saw_iterate => {}
             Err(other) => panic!(
@@ -1695,13 +1715,17 @@ mod tests {
             ..Params::default()
         };
         let family = params.transcription.collocation_family;
-        let runtime = dc_runtime::<N, K>(&params);
-        let compiled = model(optimal_control::DirectCollocation::<N, K> { family })
-            .compile_jit_with_ocp_options(crate::common::ocp_compile_options(
-                crate::common::interactive_direct_collocation_opt_level(),
-                params.sx_functions,
-            ))
-            .expect("reduced glider direct collocation should compile");
+        let runtime = dc_runtime(&params);
+        let compiled = model(DirectCollocation {
+            intervals: N,
+            order: K,
+            family,
+        })
+        .compile_jit_with_ocp_options(crate::common::ocp_compile_options(
+            crate::common::interactive_direct_collocation_opt_level(),
+            params.sx_functions,
+        ))
+        .expect("reduced glider direct collocation should compile");
 
         let mut sqp_options = crate::common::sqp_options(&params.solver);
         sqp_options.globalization = optimization::SqpGlobalization::LineSearchMerit(
@@ -1752,13 +1776,17 @@ mod tests {
             ..Params::default()
         };
         let family = params.transcription.collocation_family;
-        let runtime = dc_runtime::<N, K>(&params);
-        let compiled = model(optimal_control::DirectCollocation::<N, K> { family })
-            .compile_jit_with_ocp_options(crate::common::ocp_compile_options(
-                crate::common::interactive_direct_collocation_opt_level(),
-                params.sx_functions,
-            ))
-            .expect("reduced glider direct collocation should compile");
+        let runtime = dc_runtime(&params);
+        let compiled = model(DirectCollocation {
+            intervals: N,
+            order: K,
+            family,
+        })
+        .compile_jit_with_ocp_options(crate::common::ocp_compile_options(
+            crate::common::interactive_direct_collocation_opt_level(),
+            params.sx_functions,
+        ))
+        .expect("reduced glider direct collocation should compile");
 
         let mut sqp_options = crate::common::sqp_options(&params.solver);
         sqp_options.globalization = optimization::SqpGlobalization::LineSearchFilter(
@@ -1882,7 +1910,7 @@ mod tests {
             max_alpha_rate_deg_s: 12.0,
             ..Params::default()
         };
-        let runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+        let runtime = dc_runtime(&params);
         let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
             .expect("glider direct collocation should compile");
         let compiled = compiled.compiled.borrow();
@@ -2056,7 +2084,7 @@ mod tests {
         let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
             .expect("glider direct collocation should compile");
         let compiled = compiled.compiled.borrow();
-        let runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+        let runtime = dc_runtime(&params);
         let mut options = crate::common::nlip_options(&params.solver);
         options.max_iters = 120;
         options.acceptable_iter = 0;
@@ -2171,7 +2199,7 @@ mod tests {
         let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
             .expect("glider direct collocation should compile");
         let compiled = compiled.compiled.borrow();
-        let runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+        let runtime = dc_runtime(&params);
         let mut options = crate::common::nlip_options(&params.solver);
         options.linear_solver = optimization::InteriorPointLinearSolver::NativeSpralSsids;
         options.max_iters = 120;
@@ -2284,7 +2312,7 @@ mod tests {
         let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
             .expect("glider direct collocation should compile");
         let compiled = compiled.compiled.borrow();
-        let runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+        let runtime = dc_runtime(&params);
         let dump_dir = TempDir::new().expect("temp dump dir should create");
         let mut options = crate::common::nlip_options(&params.solver);
         options.linear_solver = optimization::InteriorPointLinearSolver::SpralSsids;
@@ -2390,7 +2418,7 @@ mod tests {
         let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
             .expect("glider direct collocation should compile");
         let compiled = compiled.compiled.borrow();
-        let runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+        let runtime = dc_runtime(&params);
         let mut options = crate::common::nlip_options(&params.solver);
         options.max_iters = 10;
         options.acceptable_iter = 0;
@@ -2475,7 +2503,7 @@ mod tests {
         let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
             .expect("glider direct collocation should compile");
         let compiled = compiled.compiled.borrow();
-        let runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+        let runtime = dc_runtime(&params);
         let dump_dir = TempDir::new().expect("temp dump dir should create");
         let mut options = crate::common::nlip_options(&params.solver);
         options.linear_solver = optimization::InteriorPointLinearSolver::SpralSsids;
@@ -2549,7 +2577,7 @@ mod tests {
         let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
             .expect("glider direct collocation should compile");
         let compiled = compiled.compiled.borrow();
-        let runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+        let runtime = dc_runtime(&params);
         let dump_dir = TempDir::new().expect("temp dump dir should create");
         let mut options = crate::common::nlip_options(&params.solver);
         options.linear_solver = optimization::InteriorPointLinearSolver::SpralSsids;
@@ -2658,7 +2686,7 @@ mod tests {
         let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
             .expect("glider direct collocation should compile");
         let compiled = compiled.compiled.borrow();
-        let runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+        let runtime = dc_runtime(&params);
         let dump_dir = TempDir::new().expect("temp dump dir should create");
         let mut options = crate::common::nlip_options(&params.solver);
         options.linear_solver = optimization::InteriorPointLinearSolver::SpralSsids;
@@ -2860,7 +2888,7 @@ mod tests {
         let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
             .expect("glider direct collocation should compile");
         let compiled = compiled.compiled.borrow();
-        let strict_runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+        let strict_runtime = dc_runtime(&params);
         let mut options = crate::common::nlip_options(&params.solver);
         optimization::apply_native_spral_parity_to_nlip_options(&mut options);
         options.max_iters = 400;
@@ -3034,7 +3062,7 @@ mod tests {
         let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
             .expect("glider direct collocation should compile");
         let compiled = compiled.compiled.borrow();
-        let strict_runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+        let strict_runtime = dc_runtime(&params);
         let mut options = crate::common::nlip_options(&params.solver);
         optimization::apply_native_spral_parity_to_nlip_options(&mut options);
         options.max_iters = 400;
@@ -3148,7 +3176,7 @@ mod tests {
         let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
             .expect("glider direct collocation should compile");
         let compiled = compiled.compiled.borrow();
-        let runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+        let runtime = dc_runtime(&params);
         let mut options = crate::common::ipopt_options(&params.solver);
         optimization::apply_native_spral_parity_to_ipopt_options(&mut options);
         let mut last = None;
@@ -3202,7 +3230,7 @@ mod tests {
         let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
             .expect("glider direct collocation should compile");
         let compiled = compiled.compiled.borrow();
-        let runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+        let runtime = dc_runtime(&params);
         let mut options = crate::common::nlip_options(&params.solver);
         optimization::apply_native_spral_parity_to_nlip_options(&mut options);
         options.max_iters = 400;
@@ -3307,7 +3335,7 @@ mod tests {
         let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
             .expect("glider direct collocation should compile");
         let compiled = compiled.compiled.borrow();
-        let runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+        let runtime = dc_runtime(&params);
         let mut options = crate::common::nlip_options(&params.solver);
         optimization::apply_native_spral_parity_to_nlip_options(&mut options);
         options.max_iters = 400;
@@ -3392,7 +3420,7 @@ mod tests {
         let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
             .expect("glider direct collocation should compile");
         let compiled = compiled.compiled.borrow();
-        let runtime = dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>(&params);
+        let runtime = dc_runtime(&params);
 
         let mut nlip_options = crate::common::nlip_options(&params.solver);
         optimization::apply_native_spral_parity_to_nlip_options(&mut nlip_options);
@@ -3494,7 +3522,11 @@ mod tests {
     #[ignore = "manual profiling helper"]
     fn profile_reduced_direct_collocation_symbolic_setup() {
         let family = optimal_control::CollocationFamily::RadauIIA;
-        let ocp = model(optimal_control::DirectCollocation::<6, 2> { family });
+        let ocp = model(DirectCollocation {
+            intervals: 6,
+            order: 2,
+            family,
+        });
         for (label, symbolic_functions) in [
             (
                 "inline_all",
@@ -3545,10 +3577,9 @@ mod tests {
     #[ignore = "manual profiling helper"]
     fn profile_direct_collocation_symbolic_setup() {
         let family = Params::default().transcription.collocation_family;
-        let ocp = model(optimal_control::DirectCollocation::<
-            DEFAULT_INTERVALS,
-            DEFAULT_COLLOCATION_DEGREE,
-        > {
+        let ocp = model(DirectCollocation {
+            intervals: DEFAULT_INTERVALS,
+            order: DEFAULT_COLLOCATION_DEGREE,
             family,
         });
         let started = std::time::Instant::now();
@@ -3597,19 +3628,15 @@ mod tests {
         );
     }
 
-    type DcDecisionLayout = (
-        optimal_control::Mesh<State<SX>, DEFAULT_INTERVALS>,
-        optimal_control::Mesh<Control<SX>, DEFAULT_INTERVALS>,
-        optimal_control::IntervalGrid<State<SX>, DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
-        optimal_control::IntervalGrid<Control<SX>, DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
-        optimal_control::IntervalGrid<Control<SX>, DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
-        SX,
-    );
-
     fn dc_decision_layout_names() -> Vec<String> {
-        let mut names = Vec::new();
-        <DcDecisionLayout as optimization::Vectorize<SX>>::flat_layout_names("w", &mut names);
-        names
+        let x_len = <State<SX> as optimization::Vectorize<SX>>::LEN;
+        let u_len = <Control<SX> as optimization::Vectorize<SX>>::LEN;
+        let decision_len = (DEFAULT_INTERVALS + 1) * (x_len + u_len)
+            + DEFAULT_INTERVALS * DEFAULT_COLLOCATION_DEGREE * (x_len + 2 * u_len)
+            + 1;
+        (0..decision_len)
+            .map(|index| format!("w[{index}]"))
+            .collect()
     }
 
     fn named_hessian_entry(names: &[String], entry: &optimization::ValidationWorstEntry) -> String {
@@ -3636,7 +3663,7 @@ mod tests {
         require_release_mode_for_manual_policy_checks();
         const N: usize = 8;
         let params = Params::default();
-        let runtime = ms_runtime::<N>(&params);
+        let runtime = ms_runtime(&params);
 
         for (label, symbolic_functions) in [
             (
@@ -3672,15 +3699,18 @@ mod tests {
                 ),
             ),
         ] {
-            let compiled = model(MultipleShooting::<N, RK4_SUBSTEPS>)
-                .compile_jit_with_ocp_options(optimal_control::OcpCompileOptions {
-                    function_options: optimization::FunctionCompileOptions::from(
-                        optimization::LlvmOptimizationLevel::O0,
-                    ),
-                    symbolic_functions,
-                    hessian_strategy: sx_core::HessianStrategy::LowerTriangleByColumn,
-                })
-                .expect("compile should succeed");
+            let compiled = model(MultipleShooting {
+                intervals: N,
+                rk4_substeps: RK4_SUBSTEPS,
+            })
+            .compile_jit_with_ocp_options(optimal_control::OcpCompileOptions {
+                function_options: optimization::FunctionCompileOptions::from(
+                    optimization::LlvmOptimizationLevel::O0,
+                ),
+                symbolic_functions,
+                hessian_strategy: sx_core::HessianStrategy::LowerTriangleByColumn,
+            })
+            .expect("compile should succeed");
 
             let stats = compiled.nlp_compile_stats();
             let validation = compiled
@@ -3710,7 +3740,7 @@ mod tests {
         const N: usize = 8;
         const K: usize = DEFAULT_COLLOCATION_DEGREE;
         let params = Params::default();
-        let runtime = dc_runtime::<N, K>(&params);
+        let runtime = dc_runtime(&params);
 
         for (label, symbolic_functions) in [
             (
@@ -3746,15 +3776,19 @@ mod tests {
                 ),
             ),
         ] {
-            let compiled = model(DirectCollocation::<N, K>::default())
-                .compile_jit_with_ocp_options(optimal_control::OcpCompileOptions {
-                    function_options: optimization::FunctionCompileOptions::from(
-                        optimization::LlvmOptimizationLevel::O0,
-                    ),
-                    symbolic_functions,
-                    hessian_strategy: sx_core::HessianStrategy::LowerTriangleByColumn,
-                })
-                .expect("compile should succeed");
+            let compiled = model(DirectCollocation {
+                intervals: N,
+                order: K,
+                family: optimal_control::CollocationFamily::RadauIIA,
+            })
+            .compile_jit_with_ocp_options(optimal_control::OcpCompileOptions {
+                function_options: optimization::FunctionCompileOptions::from(
+                    optimization::LlvmOptimizationLevel::O0,
+                ),
+                symbolic_functions,
+                hessian_strategy: sx_core::HessianStrategy::LowerTriangleByColumn,
+            })
+            .expect("compile should succeed");
 
             let stats = compiled.nlp_compile_stats();
             let validation = compiled

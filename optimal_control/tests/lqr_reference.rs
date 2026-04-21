@@ -4,12 +4,12 @@ use lqr_solvers::{
     solve_finite_horizon, steady_state_gain,
 };
 use nalgebra::{DMatrix, DVector};
-use optimal_control::{
-    Bounds1D, CollocationFamily, DirectCollocation, DirectCollocationInitialGuess,
-    DirectCollocationRuntimeValues, DirectCollocationTrajectories, IntervalGrid, Mesh,
-    MultipleShooting, MultipleShootingInitialGuess, MultipleShootingRuntimeValues,
-    MultipleShootingTrajectories, Ocp,
+use optimal_control::runtime as ocp_runtime;
+use optimal_control::runtime::{
+    DirectCollocation, DirectCollocationInitialGuess, MultipleShooting,
+    MultipleShootingInitialGuess,
 };
+use optimal_control::{Bounds1D, CollocationFamily, Ocp};
 use optimization::{ClarabelSqpOptions, Vectorize};
 use sx_core::SX;
 
@@ -25,6 +25,14 @@ struct Control<T> {
 }
 
 type Boundary<T> = (State<T>, Control<T>);
+type Mesh<T> = ocp_runtime::Mesh<T>;
+type IntervalGrid<T> = ocp_runtime::IntervalGrid<T>;
+type MultipleShootingRuntimeValues<P, C, Beq, Bineq, X, U> =
+    ocp_runtime::MultipleShootingRuntimeValues<P, C, Beq, Bineq, X, U>;
+type DirectCollocationRuntimeValues<P, C, Beq, Bineq, X, U> =
+    ocp_runtime::DirectCollocationRuntimeValues<P, C, Beq, Bineq, X, U>;
+type MultipleShootingTrajectories<X, U> = ocp_runtime::MultipleShootingTrajectories<X, U>;
+type DirectCollocationTrajectories<X, U> = ocp_runtime::DirectCollocationTrajectories<X, U>;
 
 const Q_POSITION: f64 = 10.0;
 const Q_VELOCITY: f64 = 1.0;
@@ -74,45 +82,53 @@ fn finite_horizon_solution() -> FiniteHorizonLqrSolution {
 }
 
 fn ocp_ms<const N: usize, const RK4_SUBSTEPS: usize>()
--> Ocp<State<SX>, Control<SX>, (), (), Boundary<SX>, (), MultipleShooting<N, RK4_SUBSTEPS>> {
-    Ocp::new("augmented_lqr_ms", MultipleShooting::<N, RK4_SUBSTEPS>)
-        .objective_lagrange(
-            |x: &State<SX>, u: &Control<SX>, dudt: &Control<SX>, _: &()| {
-                Q_POSITION * x.position.sqr()
-                    + Q_VELOCITY * x.velocity.sqr()
-                    + Q_CONTROL * u.acceleration.sqr()
-                    + R_DUDT * dudt.acceleration.sqr()
-            },
-        )
-        .objective_mayer(
-            |_: &State<SX>, _: &Control<SX>, x_t: &State<SX>, u_t: &Control<SX>, _: &(), _: &SX| {
-                QF_POSITION * x_t.position.sqr()
-                    + QF_VELOCITY * x_t.velocity.sqr()
-                    + QF_CONTROL * u_t.acceleration.sqr()
-            },
-        )
-        .ode(|x: &State<SX>, u: &Control<SX>, _: &()| State {
-            position: x.velocity,
-            velocity: u.acceleration,
-        })
-        .path_constraints(|_: &State<SX>, _: &Control<SX>, _: &Control<SX>, _: &()| ())
-        .boundary_equalities(
-            |x0: &State<SX>, u0: &Control<SX>, _: &State<SX>, _: &Control<SX>, _: &(), _: &SX| {
-                (x0.clone(), u0.clone())
-            },
-        )
-        .boundary_inequalities(
-            |_: &State<SX>, _: &Control<SX>, _: &State<SX>, _: &Control<SX>, _: &(), _: &SX| (),
-        )
-        .build()
-        .expect("builder should succeed")
+-> Ocp<State<SX>, Control<SX>, (), (), Boundary<SX>, (), MultipleShooting> {
+    Ocp::new(
+        "augmented_lqr_ms",
+        MultipleShooting {
+            intervals: N,
+            rk4_substeps: RK4_SUBSTEPS,
+        },
+    )
+    .objective_lagrange(
+        |x: &State<SX>, u: &Control<SX>, dudt: &Control<SX>, _: &()| {
+            Q_POSITION * x.position.sqr()
+                + Q_VELOCITY * x.velocity.sqr()
+                + Q_CONTROL * u.acceleration.sqr()
+                + R_DUDT * dudt.acceleration.sqr()
+        },
+    )
+    .objective_mayer(
+        |_: &State<SX>, _: &Control<SX>, x_t: &State<SX>, u_t: &Control<SX>, _: &(), _: &SX| {
+            QF_POSITION * x_t.position.sqr()
+                + QF_VELOCITY * x_t.velocity.sqr()
+                + QF_CONTROL * u_t.acceleration.sqr()
+        },
+    )
+    .ode(|x: &State<SX>, u: &Control<SX>, _: &()| State {
+        position: x.velocity,
+        velocity: u.acceleration,
+    })
+    .path_constraints(|_: &State<SX>, _: &Control<SX>, _: &Control<SX>, _: &()| ())
+    .boundary_equalities(
+        |x0: &State<SX>, u0: &Control<SX>, _: &State<SX>, _: &Control<SX>, _: &(), _: &SX| {
+            (x0.clone(), u0.clone())
+        },
+    )
+    .boundary_inequalities(
+        |_: &State<SX>, _: &Control<SX>, _: &State<SX>, _: &Control<SX>, _: &(), _: &SX| (),
+    )
+    .build()
+    .expect("builder should succeed")
 }
 
 fn ocp_dc<const N: usize, const K: usize>()
--> Ocp<State<SX>, Control<SX>, (), (), Boundary<SX>, (), DirectCollocation<N, K>> {
+-> Ocp<State<SX>, Control<SX>, (), (), Boundary<SX>, (), DirectCollocation> {
     Ocp::new(
         "augmented_lqr_dc",
-        DirectCollocation::<N, K> {
+        DirectCollocation {
+            intervals: N,
+            order: K,
             family: CollocationFamily::RadauIIA,
         },
     )
@@ -188,9 +204,9 @@ fn solve_reference_at(times: &[f64]) -> Vec<(State<f64>, Control<f64>, Control<f
         .collect()
 }
 
-fn node_times<const N: usize>(tf: f64) -> [f64; N] {
-    let step = tf / N as f64;
-    std::array::from_fn(|index| index as f64 * step)
+fn node_times(tf: f64, intervals: usize) -> Vec<f64> {
+    let step = tf / intervals as f64;
+    (0..intervals).map(|index| index as f64 * step).collect()
 }
 
 fn terminal_time(tf: f64) -> f64 {
@@ -222,24 +238,28 @@ fn ms_interpolated_guess<const N: usize>()
 }
 
 fn dc_explicit_guess<const N: usize, const K: usize>()
--> DirectCollocationTrajectories<State<f64>, Control<f64>, N, K> {
+-> DirectCollocationTrajectories<State<f64>, Control<f64>> {
     let step = TF / N as f64;
     let node_query_times = {
-        let mut times = node_times::<N>(TF).to_vec();
+        let mut times = node_times(TF, N);
         times.push(terminal_time(TF));
         times
     };
     let node_samples = solve_reference_at(&node_query_times);
-    let root_times: [[f64; K]; N] = std::array::from_fn(|interval| {
-        std::array::from_fn(|root| {
-            let root_offset = match root {
-                0 => 1.0 / 3.0,
-                1 => 1.0,
-                _ => unreachable!("test only supports Radau IIA with K=2"),
-            };
-            (interval as f64 + root_offset) * step
+    let root_times: Vec<Vec<f64>> = (0..N)
+        .map(|interval| {
+            (0..K)
+                .map(|root| {
+                    let root_offset = match root {
+                        0 => 1.0 / 3.0,
+                        1 => 1.0,
+                        _ => unreachable!("test only supports Radau IIA with K=2"),
+                    };
+                    (interval as f64 + root_offset) * step
+                })
+                .collect()
         })
-    });
+        .collect();
     let root_query_times = root_times
         .iter()
         .flat_map(|interval| interval.iter().copied())
@@ -248,38 +268,50 @@ fn dc_explicit_guess<const N: usize, const K: usize>()
 
     DirectCollocationTrajectories {
         x: Mesh {
-            nodes: std::array::from_fn(|index| node_samples[index].0.clone()),
+            nodes: (0..N).map(|index| node_samples[index].0.clone()).collect(),
             terminal: node_samples[N].0.clone(),
         },
         u: Mesh {
-            nodes: std::array::from_fn(|index| node_samples[index].1.clone()),
+            nodes: (0..N).map(|index| node_samples[index].1.clone()).collect(),
             terminal: node_samples[N].1.clone(),
         },
         root_x: IntervalGrid {
-            intervals: std::array::from_fn(|interval| {
-                std::array::from_fn(|root| root_samples[interval * K + root].0.clone())
-            }),
+            intervals: (0..N)
+                .map(|interval| {
+                    (0..K)
+                        .map(|root| root_samples[interval * K + root].0.clone())
+                        .collect()
+                })
+                .collect(),
         },
         root_u: IntervalGrid {
-            intervals: std::array::from_fn(|interval| {
-                std::array::from_fn(|root| root_samples[interval * K + root].1.clone())
-            }),
+            intervals: (0..N)
+                .map(|interval| {
+                    (0..K)
+                        .map(|root| root_samples[interval * K + root].1.clone())
+                        .collect()
+                })
+                .collect(),
         },
         root_dudt: IntervalGrid {
-            intervals: std::array::from_fn(|interval| {
-                std::array::from_fn(|root| root_samples[interval * K + root].2.clone())
-            }),
+            intervals: (0..N)
+                .map(|interval| {
+                    (0..K)
+                        .map(|root| root_samples[interval * K + root].2.clone())
+                        .collect()
+                })
+                .collect(),
         },
         tf: TF,
     }
 }
 
 fn compare_ms<const N: usize>(
-    solved: &MultipleShootingTrajectories<State<f64>, Control<f64>, N>,
+    solved: &MultipleShootingTrajectories<State<f64>, Control<f64>>,
     tolerance: f64,
 ) {
     assert_abs_diff_eq!(solved.tf, TF, epsilon = 1e-9);
-    let mut query_times = node_times::<N>(TF).to_vec();
+    let mut query_times = node_times(TF, N);
     query_times.push(TF);
     let reference = solve_reference_at(&query_times);
     for (index, sample) in reference.iter().take(N).enumerate() {
@@ -322,11 +354,11 @@ fn compare_ms<const N: usize>(
 }
 
 fn compare_dc<const N: usize, const K: usize>(
-    solved: &DirectCollocationTrajectories<State<f64>, Control<f64>, N, K>,
+    solved: &DirectCollocationTrajectories<State<f64>, Control<f64>>,
     tolerance: f64,
 ) {
     assert_abs_diff_eq!(solved.tf, TF, epsilon = 1e-9);
-    let mut query_times = node_times::<N>(TF).to_vec();
+    let mut query_times = node_times(TF, N);
     query_times.push(TF);
     let reference = solve_reference_at(&query_times);
     for (index, sample) in reference.iter().take(N).enumerate() {
@@ -415,7 +447,7 @@ fn multiple_shooting_tracks_finite_horizon_lqr_reference_and_emits_structured_ca
 
     assert!(callback_count > 0);
     assert_abs_diff_eq!(saw_terminal_time, TF, epsilon = 1e-9);
-    compare_ms(&result.trajectories, 2.5e-1);
+    compare_ms::<N>(&result.trajectories, 2.5e-1);
 }
 
 #[test]
@@ -449,7 +481,7 @@ fn direct_collocation_tracks_finite_horizon_lqr_reference() {
         .solve_sqp(&runtime, &options)
         .expect("direct collocation SQP solve should succeed");
 
-    compare_dc(&result.trajectories, 1.2e-1);
+    compare_dc::<N, K>(&result.trajectories, 1.2e-1);
 }
 
 #[test]
@@ -504,5 +536,5 @@ fn rollout_initial_guess_from_steady_state_lqr_gain_converges() {
         .solve_sqp(&runtime, &options)
         .expect("multiple shooting SQP solve should succeed from rollout guess");
 
-    compare_ms(&result.trajectories, 2.5e-1);
+    compare_ms::<N>(&result.trajectories, 2.5e-1);
 }

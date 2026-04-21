@@ -1,5 +1,40 @@
 use crate::{ScalarLeaf, Vectorize, extend_layout_name};
-use nalgebra::{ArrayStorage, Quaternion, SVector};
+use nalgebra::{ArrayStorage, Const, Quaternion, SVector};
+
+impl<T, const D: usize> Vectorize<T> for Const<D>
+where
+    T: ScalarLeaf,
+{
+    type Rebind<U: ScalarLeaf> = Const<D>;
+    type View<'a>
+        = Const<D>
+    where
+        T: 'a;
+
+    const LEN: usize = 0;
+
+    fn flatten_refs<'a>(&'a self, _out: &mut Vec<&'a T>) {}
+
+    fn from_flat_fn<U: ScalarLeaf>(_f: &mut impl FnMut() -> U) -> Self::Rebind<U> {
+        Const
+    }
+
+    fn view<'a>(&'a self) -> Self::View<'a>
+    where
+        T: 'a,
+    {
+        *self
+    }
+
+    fn view_from_flat_slice<'a>(_slice: &'a [T], _index: &mut usize) -> Self::View<'a>
+    where
+        T: 'a,
+    {
+        Const
+    }
+
+    fn flat_layout_names(_prefix: &str, _out: &mut Vec<String>) {}
+}
 
 impl<T, const D: usize> Vectorize<T> for SVector<T, D>
 where

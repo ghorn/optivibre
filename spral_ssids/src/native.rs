@@ -229,7 +229,7 @@ impl NativeSpral {
                     )?;
                     let free =
                         load_symbol::<SpralFreeFn>(&library, &candidate, b"spral_ssids_free\0")?;
-                    return Ok(Self {
+                    let native = Self {
                         inner: Arc::new(NativeSpralLibrary {
                             _library: library,
                             default_options,
@@ -238,7 +238,16 @@ impl NativeSpral {
                             solve1,
                             free,
                         }),
-                    });
+                    };
+                    match native_spral_smoke_test(&native) {
+                        Ok(()) => return Ok(native),
+                        Err(error) => {
+                            last_error = Some(format!(
+                                "{} loaded but failed a factorization smoke test: {error}",
+                                candidate.display()
+                            ));
+                        }
+                    }
                 }
                 Err(error) => last_error = Some(error.to_string()),
             }
@@ -347,6 +356,19 @@ impl NativeSpral {
             factorized: ptr::null_mut(),
         })
     }
+}
+
+fn native_spral_smoke_test(native: &NativeSpral) -> Result<(), NativeSpralError> {
+    let col_ptrs = [0, 2, 3];
+    let row_indices = [0, 1, 1];
+    let values = [2.0, -1.0, 2.0];
+    let matrix = SymmetricCscMatrix::new(2, &col_ptrs, &row_indices, Some(&values))
+        .expect("hard-coded native SPRAL smoke matrix is valid");
+    let mut session = native.analyse(matrix)?;
+    session.factorize(matrix)?;
+    let mut rhs = [1.0, 0.0];
+    session.solve_in_place(&mut rhs)?;
+    Ok(())
 }
 
 fn native_spral_library_candidates() -> Vec<PathBuf> {

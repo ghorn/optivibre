@@ -60,9 +60,10 @@ pub use ipopt_backend::{
     format_ipopt_settings_summary, solve_nlp_ipopt, solve_nlp_ipopt_with_callback,
 };
 pub use symbolic::{
-    ConstraintBounds, RuntimeBoundedJitNlp, RuntimeNlpBounds, SymbolicNlpBuildError,
+    ConstraintBounds, DynamicCompiledJitNlp, DynamicSymbolicNlp, RuntimeBoundedJitNlp,
+    RuntimeNlpBounds, RuntimeNlpParameterError, RuntimeNlpScaling, SymbolicNlpBuildError,
     SymbolicNlpCompileError, SymbolicNlpCompileOptions, SymbolicNlpOutputs, TypedCompiledJitNlp,
-    TypedNlpScaling, TypedRuntimeNlpBounds, TypedSymbolicNlp, symbolic_nlp,
+    TypedNlpScaling, TypedRuntimeNlpBounds, TypedSymbolicNlp, symbolic_nlp, symbolic_nlp_dynamic,
 };
 pub use validation::{
     FiniteDifferenceValidationOptions, NlpDerivativeValidationReport, ValidationSparsitySummary,

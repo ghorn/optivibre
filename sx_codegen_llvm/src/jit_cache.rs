@@ -17,10 +17,10 @@ use sx_core::{
 use crate::LlvmOptimizationLevel;
 
 const OPTIVIBRE_JIT_CACHE_ENV: &str = "OPTIVIBRE_JIT_CACHE_DIR";
-const OPTIVIBRE_JIT_CACHE_SCHEMA_VERSION: u32 = 1;
+const OPTIVIBRE_JIT_CACHE_SCHEMA_VERSION: u32 = 2;
 const OPTIVIBRE_JIT_CACHE_CODEGEN_FORMAT_VERSION: u32 = 1;
 const OPTIVIBRE_JIT_CACHE_COMPILE_MODE: &str = "jit";
-const OPTIVIBRE_JIT_CACHE_VERSION_DIR: &str = "v1";
+const OPTIVIBRE_JIT_CACHE_VERSION_DIR: &str = "v2";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct JitCacheReport {
@@ -38,6 +38,8 @@ pub(crate) struct CachedObject {
 pub(crate) struct CacheKeyMetadata {
     lowered_name: String,
     lowered_fingerprint: String,
+    symbolic_fingerprint: Option<String>,
+    entry_key_kind: String,
     entry_hash: String,
     target_triple: String,
     cpu_name: String,
@@ -47,11 +49,23 @@ pub(crate) struct CacheKeyMetadata {
     cpu_component: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CacheKeyFingerprintInput {
+    lowered_name: String,
+    lowered_fingerprint: String,
+    symbolic_fingerprint: Option<String>,
+    entry_key_kind: &'static str,
+    entry_key_fingerprint: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct JitCacheManifest {
     schema_version: u32,
     lowered_name: String,
     lowered_fingerprint: String,
+    symbolic_fingerprint: Option<String>,
+    llvm_ir_fingerprint: Option<String>,
+    entry_key_kind: String,
     target_triple: String,
     cpu_name: String,
     cpu_features: String,
@@ -69,9 +83,15 @@ pub(crate) fn cache_key_metadata(
     cpu_name: String,
     cpu_features: String,
 ) -> CacheKeyMetadata {
+    let lowered_fingerprint = lowered_function_fingerprint(lowered);
     build_cache_key_metadata(
-        lowered.name.clone(),
-        lowered_function_fingerprint(lowered),
+        CacheKeyFingerprintInput {
+            lowered_name: lowered.name.clone(),
+            lowered_fingerprint: lowered_fingerprint.clone(),
+            symbolic_fingerprint: None,
+            entry_key_kind: "lowered_fingerprint",
+            entry_key_fingerprint: lowered_fingerprint,
+        },
         opt_level,
         target_triple,
         cpu_name,
@@ -81,15 +101,23 @@ pub(crate) fn cache_key_metadata(
 
 pub(crate) fn cache_key_metadata_for_function(
     function: &SXFunction,
+    lowered: &LoweredFunction,
     call_policy: CallPolicyConfig,
     opt_level: LlvmOptimizationLevel,
     target_triple: String,
     cpu_name: String,
     cpu_features: String,
 ) -> CacheKeyMetadata {
+    let lowered_fingerprint = lowered_function_fingerprint(lowered);
+    let symbolic_fingerprint = symbolic_function_fingerprint(function, call_policy);
     build_cache_key_metadata(
-        function.name().to_string(),
-        symbolic_function_fingerprint(function, call_policy),
+        CacheKeyFingerprintInput {
+            lowered_name: lowered.name.clone(),
+            lowered_fingerprint: lowered_fingerprint.clone(),
+            symbolic_fingerprint: Some(symbolic_fingerprint.clone()),
+            entry_key_kind: "lowered_fingerprint",
+            entry_key_fingerprint: lowered_fingerprint,
+        },
         opt_level,
         target_triple,
         cpu_name,
@@ -98,8 +126,7 @@ pub(crate) fn cache_key_metadata_for_function(
 }
 
 fn build_cache_key_metadata(
-    lowered_name: String,
-    lowered_fingerprint: String,
+    fingerprint: CacheKeyFingerprintInput,
     opt_level: LlvmOptimizationLevel,
     target_triple: String,
     cpu_name: String,
@@ -112,14 +139,16 @@ fn build_cache_key_metadata(
         cpu_name.as_bytes(),
         cpu_features.as_bytes(),
         opt_level.as_bytes(),
-        lowered_fingerprint.as_bytes(),
+        fingerprint.entry_key_fingerprint.as_bytes(),
         &OPTIVIBRE_JIT_CACHE_SCHEMA_VERSION.to_le_bytes(),
         &OPTIVIBRE_JIT_CACHE_CODEGEN_FORMAT_VERSION.to_le_bytes(),
     ]);
     let cpu_component = hash_parts(&[cpu_name.as_bytes(), cpu_features.as_bytes()]);
     CacheKeyMetadata {
-        lowered_name,
-        lowered_fingerprint,
+        lowered_name: fingerprint.lowered_name,
+        lowered_fingerprint: fingerprint.lowered_fingerprint,
+        symbolic_fingerprint: fingerprint.symbolic_fingerprint,
+        entry_key_kind: fingerprint.entry_key_kind.to_string(),
         entry_hash,
         target_component: sanitize_path_component(&target_triple),
         cpu_component,
@@ -146,11 +175,18 @@ impl CacheKeyMetadata {
             .join(&self.entry_hash))
     }
 
-    fn manifest(&self, object_size_bytes: usize) -> JitCacheManifest {
+    fn manifest(
+        &self,
+        object_size_bytes: usize,
+        llvm_ir_fingerprint: Option<String>,
+    ) -> JitCacheManifest {
         JitCacheManifest {
             schema_version: OPTIVIBRE_JIT_CACHE_SCHEMA_VERSION,
             lowered_name: self.lowered_name.clone(),
             lowered_fingerprint: self.lowered_fingerprint.clone(),
+            symbolic_fingerprint: self.symbolic_fingerprint.clone(),
+            llvm_ir_fingerprint,
+            entry_key_kind: self.entry_key_kind.clone(),
             target_triple: self.target_triple.clone(),
             cpu_name: self.cpu_name.clone(),
             cpu_features: self.cpu_features.clone(),
@@ -185,6 +221,7 @@ pub(crate) fn try_load_cached_object(metadata: &CacheKeyMetadata) -> Option<Cach
 pub(crate) fn write_cached_object(
     metadata: &CacheKeyMetadata,
     object_bytes: &[u8],
+    llvm_ir_fingerprint: Option<&str>,
 ) -> anyhow::Result<()> {
     let entry_dir = metadata.entry_dir()?;
     if entry_dir.exists() {
@@ -198,7 +235,10 @@ pub(crate) fn write_cached_object(
     let write_result = (|| -> anyhow::Result<()> {
         let object_path = temp_dir.join("object.o");
         write_synced_file(&object_path, object_bytes)?;
-        let manifest = metadata.manifest(object_bytes.len());
+        let manifest = metadata.manifest(
+            object_bytes.len(),
+            llvm_ir_fingerprint.map(ToOwned::to_owned),
+        );
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
         write_synced_file(&temp_dir.join("manifest.json"), &manifest_bytes)?;
         Ok(())
@@ -273,9 +313,15 @@ pub fn clear_optivibre_jit_cache() -> anyhow::Result<()> {
 }
 
 fn manifest_matches(manifest: &JitCacheManifest, metadata: &CacheKeyMetadata) -> bool {
+    let fingerprint_matches = match metadata.entry_key_kind.as_str() {
+        "lowered_fingerprint" => manifest.lowered_fingerprint == metadata.lowered_fingerprint,
+        "symbolic_fingerprint" => manifest.symbolic_fingerprint == metadata.symbolic_fingerprint,
+        _ => false,
+    };
     manifest.schema_version == OPTIVIBRE_JIT_CACHE_SCHEMA_VERSION
         && manifest.lowered_name == metadata.lowered_name
-        && manifest.lowered_fingerprint == metadata.lowered_fingerprint
+        && manifest.entry_key_kind == metadata.entry_key_kind
+        && fingerprint_matches
         && manifest.target_triple == metadata.target_triple
         && manifest.cpu_name == metadata.cpu_name
         && manifest.cpu_features == metadata.cpu_features
@@ -643,6 +689,14 @@ fn value_ref_fingerprint(
                         subfunctions,
                         subfunction_memo,
                     );
+                    let (lhs, rhs) =
+                        if matches!(op, BinaryOp::Add | BinaryOp::Mul | BinaryOp::Hypot)
+                            && rhs < lhs
+                        {
+                            (rhs, lhs)
+                        } else {
+                            (lhs, rhs)
+                        };
                     hash_parts(&[
                         &[3],
                         format!("{op:?}").as_bytes(),
@@ -760,10 +814,13 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        OPTIVIBRE_JIT_CACHE_ENV, clear_optivibre_jit_cache, optivibre_jit_cache_base_dir,
-        try_load_cached_object, write_cached_object,
+        JitCacheManifest, OPTIVIBRE_JIT_CACHE_ENV, clear_optivibre_jit_cache,
+        optivibre_jit_cache_base_dir, try_load_cached_object, write_cached_object,
     };
-    use crate::{CompiledJitFunction, JitOptimizationLevel, host_cache_metadata};
+    use crate::{
+        CompiledJitFunction, FunctionCompileOptions, JitOptimizationLevel, host_cache_metadata,
+        native_cache_target_info, optimized_jit_ir_fingerprint,
+    };
 
     fn cache_env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -782,15 +839,19 @@ mod tests {
     }
 
     fn demo_lowered(name: &str, shift: f64) -> sx_codegen::LoweredFunction {
+        let function = demo_function(name, shift);
+        lower_function(&function).expect("lowered")
+    }
+
+    fn demo_function(name: &str, shift: f64) -> SXFunction {
         let x = SXMatrix::sym_dense("x", 2, 1).expect("x");
         let value = SXMatrix::scalar(x.nz(0) * x.nz(1) + shift);
-        let function = SXFunction::new(
+        SXFunction::new(
             name,
             vec![NamedMatrix::new("x", x).expect("input")],
             vec![NamedMatrix::new("value", value).expect("output")],
         )
-        .expect("function");
-        lower_function(&function).expect("lowered")
+        .expect("function")
     }
 
     #[test]
@@ -805,7 +866,7 @@ mod tests {
                 &crate::LlvmTarget::Native,
             )
             .expect("object bytes");
-            write_cached_object(&metadata, &bytes).expect("write cache");
+            write_cached_object(&metadata, &bytes, None).expect("write cache");
             let entry = metadata.entry_dir().expect("entry dir");
             assert!(entry.join("manifest.json").exists());
             assert!(entry.join("object.o").exists());
@@ -838,6 +899,93 @@ mod tests {
     }
 
     #[test]
+    fn llvm_ir_fingerprint_changes_on_materially_different_lowered_functions() {
+        let lhs = demo_lowered("ir_fingerprint_a", 1.0);
+        let rhs = demo_lowered("ir_fingerprint_b", 2.0);
+        let lhs_fp = optimized_jit_ir_fingerprint(
+            &lhs,
+            JitOptimizationLevel::O0,
+            &crate::LlvmTarget::Native,
+        )
+        .expect("lhs ir fingerprint");
+        let rhs_fp = optimized_jit_ir_fingerprint(
+            &rhs,
+            JitOptimizationLevel::O0,
+            &crate::LlvmTarget::Native,
+        )
+        .expect("rhs ir fingerprint");
+        assert_ne!(lhs_fp, rhs_fp);
+    }
+
+    #[test]
+    fn manifest_records_ir_fingerprint_and_key_kind() {
+        with_temp_cache_root(|_| {
+            let lowered = demo_lowered("cache_manifest_demo", 7.0);
+            let metadata =
+                host_cache_metadata(&lowered, JitOptimizationLevel::O0).expect("metadata");
+            let bytes = crate::emit_object_bytes_lowered(
+                &lowered,
+                JitOptimizationLevel::O0,
+                &crate::LlvmTarget::Native,
+            )
+            .expect("object bytes");
+            let ir_fingerprint = optimized_jit_ir_fingerprint(
+                &lowered,
+                JitOptimizationLevel::O0,
+                &crate::LlvmTarget::Native,
+            )
+            .expect("ir fingerprint");
+            write_cached_object(&metadata, &bytes, Some(&ir_fingerprint)).expect("write cache");
+            let manifest_path = metadata
+                .entry_dir()
+                .expect("entry dir")
+                .join("manifest.json");
+            let manifest = serde_json::from_str::<JitCacheManifest>(
+                &fs::read_to_string(manifest_path).expect("manifest text"),
+            )
+            .expect("manifest json");
+            assert_eq!(manifest.entry_key_kind, "lowered_fingerprint");
+            assert_eq!(
+                manifest.llvm_ir_fingerprint.as_deref(),
+                Some(ir_fingerprint.as_str())
+            );
+            assert!(manifest.symbolic_fingerprint.is_none());
+        });
+    }
+
+    #[test]
+    fn function_cache_manifest_records_symbolic_fingerprint() {
+        with_temp_cache_root(|_| {
+            let function = demo_function("cache_symbolic_demo", 8.0);
+            let options = FunctionCompileOptions::from(JitOptimizationLevel::O0);
+            let _compiled = CompiledJitFunction::compile_function_with_options(&function, options)
+                .expect("compile function");
+            let lowered = lower_function(&function).expect("lowered");
+            let (target_triple, cpu_name, cpu_features) =
+                native_cache_target_info(&crate::LlvmTarget::Native).expect("target info");
+            let metadata = super::cache_key_metadata_for_function(
+                &function,
+                &lowered,
+                options.call_policy,
+                options.opt_level,
+                target_triple,
+                cpu_name,
+                cpu_features,
+            );
+            let manifest_path = metadata
+                .entry_dir()
+                .expect("entry dir")
+                .join("manifest.json");
+            let manifest = serde_json::from_str::<JitCacheManifest>(
+                &fs::read_to_string(manifest_path).expect("manifest text"),
+            )
+            .expect("manifest json");
+            assert_eq!(manifest.entry_key_kind, "lowered_fingerprint");
+            assert!(manifest.symbolic_fingerprint.is_some());
+        });
+    }
+
+    #[test]
     fn target_or_options_mismatch_invalidates_entry() {
         with_temp_cache_root(|_| {
             let lowered = demo_lowered("cache_mismatch_demo", 3.0);
@@ -849,7 +997,7 @@ mod tests {
                 &crate::LlvmTarget::Native,
             )
             .expect("object bytes");
-            write_cached_object(&metadata_o0, &bytes).expect("write cache");
+            write_cached_object(&metadata_o0, &bytes, None).expect("write cache");
             let metadata_o2 =
                 host_cache_metadata(&lowered, JitOptimizationLevel::O2).expect("o2 metadata");
             assert!(try_load_cached_object(&metadata_o2).is_none());
@@ -868,12 +1016,12 @@ mod tests {
                 &crate::LlvmTarget::Native,
             )
             .expect("object bytes");
-            write_cached_object(&metadata, &bytes).expect("write cache");
+            write_cached_object(&metadata, &bytes, None).expect("write cache");
             let entry = metadata.entry_dir().expect("entry dir");
             fs::write(entry.join("manifest.json"), b"not json").expect("corrupt manifest");
             assert!(try_load_cached_object(&metadata).is_none());
 
-            write_cached_object(&metadata, &bytes).expect("rewrite cache");
+            write_cached_object(&metadata, &bytes, None).expect("rewrite cache");
             fs::write(entry.join("object.o"), b"bad").expect("corrupt object");
             assert!(try_load_cached_object(&metadata).is_none());
         });
@@ -896,7 +1044,7 @@ mod tests {
                     let metadata = metadata.clone();
                     let bytes = bytes.clone();
                     scope.spawn(move || {
-                        write_cached_object(&metadata, &bytes).expect("cache write");
+                        write_cached_object(&metadata, &bytes, None).expect("cache write");
                     });
                 }
             });
@@ -917,7 +1065,7 @@ mod tests {
                 &crate::LlvmTarget::Native,
             )
             .expect("object bytes");
-            write_cached_object(&metadata, &bytes).expect("write cache");
+            write_cached_object(&metadata, &bytes, None).expect("write cache");
             let cache_root = optivibre_jit_cache_base_dir().expect("cache root");
             assert!(cache_root.exists());
             clear_optivibre_jit_cache().expect("clear cache");

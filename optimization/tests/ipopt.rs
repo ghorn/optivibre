@@ -53,6 +53,20 @@ fn local_native_spral_ipopt_options() -> IpoptOptions {
     options
 }
 
+fn local_native_spral_ipopt_available() -> bool {
+    let provenance = optimization::capture_ipopt_provenance();
+    let has_local_spral = provenance
+        .pkg_config_cflags_libs
+        .as_deref()
+        .is_some_and(|flags| flags.contains("/Users/greg/local/ipopt-spral"));
+    let has_spral_default = provenance.linear_solver_default.as_deref() == Some("spral");
+    if !has_local_spral || !has_spral_default {
+        eprintln!("skipping local native-SPRAL IPOPT profile test: {provenance:?}");
+        return false;
+    }
+    true
+}
+
 #[rstest]
 fn ipopt_callback_exposes_snapshots(
     #[values(CallbackBackend::Aot, CallbackBackend::Jit)] backend: CallbackBackend,
@@ -150,6 +164,9 @@ fn ipopt_solves_casadi_simple_nlp_example(
 fn ipopt_solves_simple_nlp_with_local_native_spral_profile(
     #[values(CallbackBackend::Aot, CallbackBackend::Jit)] backend: CallbackBackend,
 ) {
+    if !local_native_spral_ipopt_available() {
+        return;
+    }
     let problem = build_problem_ok(simple_nlp_problem(backend), backend);
     let summary = solve_ok(
         &problem,

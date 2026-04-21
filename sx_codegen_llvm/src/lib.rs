@@ -19,8 +19,8 @@ use llvm_sys::core::{
     LLVMDisposeMemoryBuffer, LLVMDisposeMessage, LLVMDoubleTypeInContext, LLVMFunctionType,
     LLVMGetBufferSize, LLVMGetBufferStart, LLVMGetEnumAttributeKindForName, LLVMGetNamedFunction,
     LLVMGetParam, LLVMGlobalGetValueType, LLVMInt64TypeInContext,
-    LLVMModuleCreateWithNameInContext, LLVMPointerType, LLVMPositionBuilderAtEnd, LLVMSetLinkage,
-    LLVMSetTarget, LLVMVoidTypeInContext,
+    LLVMModuleCreateWithNameInContext, LLVMPointerType, LLVMPositionBuilderAtEnd,
+    LLVMPrintModuleToString, LLVMSetLinkage, LLVMSetTarget, LLVMVoidTypeInContext,
 };
 use llvm_sys::error::{LLVMDisposeErrorMessage, LLVMErrorRef, LLVMGetErrorMessage};
 use llvm_sys::orc2::LLVMOrcExecutorAddress;
@@ -50,6 +50,7 @@ use llvm_sys::transforms::pass_builder::{
     LLVMCreatePassBuilderOptions, LLVMDisposePassBuilderOptions, LLVMRunPasses,
 };
 use llvm_sys::{LLVMAttributeFunctionIndex, LLVMLinkage};
+use sha2::{Digest, Sha256};
 use sx_codegen::{
     Instruction, LoweredFunction, LoweredSubfunction, ValueRef, format_rust_source,
     lower_function_with_policies, sanitize_ident, to_pascal_case,
@@ -200,19 +201,20 @@ impl CompiledJitFunction {
         options: FunctionCompileOptions,
     ) -> Result<Self> {
         ensure_native_llvm_initialized()?;
+        let lowering_started = Instant::now();
+        let lowered = lower_function_with_policies(function, options.call_policy)?;
+        let lowering_time = lowering_started.elapsed();
         let (target_triple, cpu_name, cpu_features) =
             native_cache_target_info(&LlvmTarget::Native)?;
         let cache_metadata = jit_cache::cache_key_metadata_for_function(
             function,
+            &lowered,
             options.call_policy,
             options.opt_level,
             target_triple,
             cpu_name,
             cpu_features,
         );
-        let lowering_started = Instant::now();
-        let lowered = lower_function_with_policies(function, options.call_policy)?;
-        let lowering_time = lowering_started.elapsed();
         Self::compile_lowered_with_report(
             &lowered,
             options.opt_level,
@@ -273,7 +275,12 @@ impl CompiledJitFunction {
         let object = build_object_buffer(lowered, opt_level, &target, LlvmCompileMode::Jit)?;
         let object_bytes = unsafe { memory_buffer_to_bytes(object) }?;
         unsafe { LLVMDisposeMemoryBuffer(object) };
-        let _ = jit_cache::write_cached_object(&metadata, &object_bytes);
+        let llvm_ir_fingerprint = optimized_jit_ir_fingerprint(lowered, opt_level, &target).ok();
+        let _ = jit_cache::write_cached_object(
+            &metadata,
+            &object_bytes,
+            llvm_ir_fingerprint.as_deref(),
+        );
         let (lljit, function) = load_jit_function_from_object_bytes(&object_bytes, &lowered.name)?;
         let llvm_time = llvm_started.elapsed();
 
@@ -308,6 +315,50 @@ impl CompiledJitFunction {
             (self.function)(context.input_ptrs.as_ptr(), context.output_ptrs.as_ptr());
         }
     }
+}
+
+pub(crate) fn optimized_jit_ir_fingerprint(
+    lowered: &LoweredFunction,
+    opt_level: LlvmOptimizationLevel,
+    target: &LlvmTarget,
+) -> Result<String> {
+    ensure_native_llvm_initialized()?;
+    unsafe {
+        let context = LLVMContextCreate();
+        let (target_machine, triple) =
+            create_target_machine(opt_level, target, LlvmCompileMode::Jit)?;
+        let module = match build_module(lowered, context, target_machine, &triple) {
+            Ok(module) => module,
+            Err(error) => {
+                LLVMDisposeTargetMachine(target_machine);
+                LLVMContextDispose(context);
+                return Err(error);
+            }
+        };
+        let result = (|| -> Result<String> {
+            verify_module(module, "before optimization")?;
+            run_default_pass_pipeline(module, target_machine, opt_level)?;
+            verify_module(module, "after optimization")?;
+            let ir = take_llvm_message(LLVMPrintModuleToString(module))?;
+            Ok(sha256_hex(ir.as_bytes()))
+        })();
+        llvm_sys::core::LLVMDisposeModule(module);
+        LLVMDisposeTargetMachine(target_machine);
+        LLVMContextDispose(context);
+        result
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push(char::from_digit((byte >> 4) as u32, 16).expect("hex digit"));
+        out.push(char::from_digit((byte & 0x0f) as u32, 16).expect("hex digit"));
+    }
+    out
 }
 
 fn host_cache_metadata(

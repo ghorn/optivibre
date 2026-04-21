@@ -1,24 +1,24 @@
 use crate::common::{
-    CompileCacheStatus, CompileProgressInfo, CompileProgressUpdate, ContinuousInitialGuess,
-    FromMap, LatexSection, MetricKey, OcpRuntimeSpec, OcpSxFunctionConfig, PlotMode, ProblemId,
-    ProblemSpec, Scene2D, SceneAnimation, SceneArrow, SceneFrame, ScenePath, SolveArtifact,
-    SolveStreamEvent, SolverConfig, SolverMethod, SolverReport, StandardOcpParams, TimeSeries,
-    TranscriptionConfig, chart, default_solver_config, default_solver_method,
-    default_transcription, deg_to_rad, direct_collocation_runtime_from_spec, expect_finite,
-    interval_arc_bound_series, interval_arc_series, metric_with_key,
+    CompileCacheStatus, CompileProgressInfo, CompileProgressUpdate, CompiledDirectCollocationOcp,
+    CompiledMultipleShootingOcp, ContinuousInitialGuess, DirectCollocationRuntimeValues,
+    DirectCollocationTimeGrid, DirectCollocationTrajectories, FromMap, LatexSection, MetricKey,
+    MultipleShootingRuntimeValues, MultipleShootingTrajectories, OcpRuntimeSpec,
+    OcpSxFunctionConfig, PlotMode, ProblemId, ProblemSpec, Scene2D, SceneAnimation, SceneArrow,
+    SceneFrame, ScenePath, SolveArtifact, SolveStreamEvent, SolverConfig, SolverMethod,
+    SolverReport, StandardOcpParams, TimeSeries, TranscriptionConfig, chart, default_solver_config,
+    default_solver_method, default_transcription, deg_to_rad, direct_collocation_runtime_from_spec,
+    expect_finite, interval_arc_bound_series, interval_arc_series, metric_with_key,
     multiple_shooting_runtime_from_spec, node_times, numeric_metric_with_key,
     ocp_sx_function_config_from_map, problem_controls, problem_scientific_slider_control,
     problem_slider_control, problem_spec, rad_to_deg, sample_or_default, segmented_series,
     solver_config_from_map, solver_method_from_map, transcription_from_map, transcription_metrics,
 };
 use anyhow::Result;
-use optimal_control::{
-    Bounds1D, CompiledDirectCollocationOcp, CompiledMultipleShootingOcp, DirectCollocation,
-    DirectCollocationRuntimeValues, DirectCollocationTimeGrid, DirectCollocationTrajectories,
-    InterpolatedTrajectory, IntervalArc, MultipleShooting, MultipleShootingRuntimeValues,
-    MultipleShootingTrajectories, Ocp, direct_collocation_root_arcs,
+use optimal_control::runtime::{
+    DirectCollocation, MultipleShooting, direct_collocation_root_arcs,
     direct_collocation_state_like_arcs,
 };
+use optimal_control::{Bounds1D, InterpolatedTrajectory, IntervalArc, Ocp};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::f64::consts::PI;
@@ -82,36 +82,32 @@ struct ModelParams<T> {
     alpha_rate_weight: T,
 }
 
-type MsCompiled<const N: usize> = CompiledMultipleShootingOcp<
+type MsCompiled = CompiledMultipleShootingOcp<
     State<SX>,
     Control<SX>,
     ModelParams<SX>,
     Path<SX>,
     BoundaryEq<SX>,
     (),
-    N,
-    RK4_SUBSTEPS,
 >;
 
-type DcCompiled<const N: usize, const K: usize> = CompiledDirectCollocationOcp<
+type DcCompiled = CompiledDirectCollocationOcp<
     State<SX>,
     Control<SX>,
     ModelParams<SX>,
     Path<SX>,
     BoundaryEq<SX>,
     (),
-    N,
-    K,
 >;
 
 thread_local! {
     static MULTIPLE_SHOOTING_CACHE: std::cell::RefCell<
-        crate::common::SharedCompileCache<crate::common::MultipleShootingCompileKey, MsCompiled<DEFAULT_INTERVALS>>
+        crate::common::SharedCompileCache<crate::common::MultipleShootingCompileKey, MsCompiled>
     > = std::cell::RefCell::new(crate::common::SharedCompileCache::new());
     static DIRECT_COLLOCATION_CACHE: std::cell::RefCell<
         crate::common::SharedCompileCache<
             crate::common::DirectCollocationCompileVariantKey,
-            DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+            DcCompiled,
         >
     > = std::cell::RefCell::new(crate::common::SharedCompileCache::new());
 }
@@ -639,17 +635,18 @@ fn model<Scheme>(
         .expect("sailboat model should build")
 }
 
-fn cached_multiple_shooting(
-    params: &Params,
-) -> Result<crate::common::CachedCompile<MsCompiled<DEFAULT_INTERVALS>>> {
+fn cached_multiple_shooting(params: &Params) -> Result<crate::common::CachedCompile<MsCompiled>> {
     MULTIPLE_SHOOTING_CACHE.with(|cache| {
         crate::common::cached_multiple_shooting_ocp_compile(
             &mut cache.borrow_mut(),
             DEFAULT_INTERVALS,
             params.sx_functions,
             |options| {
-                model(MultipleShooting::<DEFAULT_INTERVALS, RK4_SUBSTEPS>)
-                    .compile_jit_with_ocp_options(options)
+                model(MultipleShooting {
+                    intervals: DEFAULT_INTERVALS,
+                    rk4_substeps: RK4_SUBSTEPS,
+                })
+                .compile_jit_with_ocp_options(options)
             },
         )
     })
@@ -658,16 +655,19 @@ fn cached_multiple_shooting(
 fn cached_direct_collocation(
     params: &Params,
     family: optimal_control::CollocationFamily,
-) -> Result<crate::common::CachedCompile<DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>>>
-{
+) -> Result<crate::common::CachedCompile<DcCompiled>> {
     DIRECT_COLLOCATION_CACHE.with(|cache| {
         crate::common::cached_direct_collocation_ocp_compile(
             &mut cache.borrow_mut(),
             family,
             params.sx_functions,
             |options| {
-                model(DirectCollocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE> { family })
-                    .compile_jit_with_ocp_options(options)
+                model(DirectCollocation {
+                    intervals: DEFAULT_INTERVALS,
+                    order: DEFAULT_COLLOCATION_DEGREE,
+                    family,
+                })
+                .compile_jit_with_ocp_options(options)
             },
         )
     })
@@ -677,7 +677,7 @@ fn compile_multiple_shooting_with_progress(
     params: &Params,
     callback: &mut dyn FnMut(CompileProgressUpdate),
 ) -> Result<(
-    std::rc::Rc<std::cell::RefCell<MsCompiled<DEFAULT_INTERVALS>>>,
+    std::rc::Rc<std::cell::RefCell<MsCompiled>>,
     CompileProgressInfo,
 )> {
     MULTIPLE_SHOOTING_CACHE.with(|cache| {
@@ -687,8 +687,11 @@ fn compile_multiple_shooting_with_progress(
             params.sx_functions,
             callback,
             |options, on_progress| {
-                model(MultipleShooting::<DEFAULT_INTERVALS, RK4_SUBSTEPS>)
-                    .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
+                model(MultipleShooting {
+                    intervals: DEFAULT_INTERVALS,
+                    rk4_substeps: RK4_SUBSTEPS,
+                })
+                .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
             },
             crate::common::compile_progress_info_from_compiled,
         )
@@ -700,7 +703,7 @@ fn compile_direct_collocation_with_progress(
     family: optimal_control::CollocationFamily,
     callback: &mut dyn FnMut(CompileProgressUpdate),
 ) -> Result<(
-    std::rc::Rc<std::cell::RefCell<DcCompiled<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>>>,
+    std::rc::Rc<std::cell::RefCell<DcCompiled>>,
     CompileProgressInfo,
 )> {
     DIRECT_COLLOCATION_CACHE.with(|cache| {
@@ -710,8 +713,12 @@ fn compile_direct_collocation_with_progress(
             params.sx_functions,
             callback,
             |options, on_progress| {
-                model(DirectCollocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE> { family })
-                    .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
+                model(DirectCollocation {
+                    intervals: DEFAULT_INTERVALS,
+                    order: DEFAULT_COLLOCATION_DEGREE,
+                    family,
+                })
+                .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
             },
             crate::common::compile_progress_info_from_compiled,
         )
@@ -762,7 +769,7 @@ pub(crate) fn benchmark_default_case_with_progress(
     eval_options: optimization::NlpEvaluationBenchmarkOptions,
     on_progress: &mut dyn FnMut(crate::benchmark_report::BenchmarkCaseProgress),
 ) -> Result<crate::benchmark_report::OcpBenchmarkRecord> {
-    crate::common::benchmark_standard_ocp_case_with_progress(
+    crate::common::benchmark_standard_ocp_case_with_progress::<_, _, _, _, _, _, _, _>(
         ProblemId::SailboatUpwind,
         PROBLEM_NAME,
         transcription,
@@ -770,20 +777,27 @@ pub(crate) fn benchmark_default_case_with_progress(
         eval_options,
         on_progress,
         |options, on_progress| {
-            model(MultipleShooting::<DEFAULT_INTERVALS, RK4_SUBSTEPS>)
-                .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
+            model(MultipleShooting {
+                intervals: DEFAULT_INTERVALS,
+                rk4_substeps: RK4_SUBSTEPS,
+            })
+            .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
         },
         |family, options, on_progress| {
-            model(DirectCollocation::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE> { family })
-                .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
+            model(DirectCollocation {
+                intervals: DEFAULT_INTERVALS,
+                order: DEFAULT_COLLOCATION_DEGREE,
+                family,
+            })
+            .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
         },
-        ms_runtime::<DEFAULT_INTERVALS>,
-        dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+        ms_runtime,
+        dc_runtime,
     )
 }
 
 pub fn solve(params: &Params) -> Result<SolveArtifact> {
-    crate::common::solve_standard_ocp(
+    crate::common::solve_standard_ocp::<_, _, _, _, _, _, _, _, _>(
         params,
         params.transcription.method,
         params.transcription.collocation_family,
@@ -791,8 +805,8 @@ pub fn solve(params: &Params) -> Result<SolveArtifact> {
         &params.solver,
         cached_multiple_shooting,
         cached_direct_collocation,
-        ms_runtime::<DEFAULT_INTERVALS>,
-        dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+        ms_runtime,
+        dc_runtime,
         |trajectories, x_arcs, u_arcs| {
             artifact_from_ms_trajectories(params, trajectories, x_arcs, u_arcs)
         },
@@ -804,7 +818,7 @@ pub fn solve_with_progress<F>(params: &Params, emit: F) -> Result<SolveArtifact>
 where
     F: FnMut(SolveStreamEvent) + Send,
 {
-    crate::common::solve_standard_ocp_with_progress(
+    crate::common::solve_standard_ocp_with_progress::<_, _, _, _, _, _, _, _, _, _>(
         params,
         params.transcription.method,
         params.transcription.collocation_family,
@@ -813,8 +827,8 @@ where
         emit,
         compile_multiple_shooting_with_progress,
         compile_direct_collocation_with_progress,
-        ms_runtime::<DEFAULT_INTERVALS>,
-        dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+        ms_runtime,
+        dc_runtime,
         |trajectories, x_arcs, u_arcs| {
             artifact_from_ms_trajectories(params, trajectories, x_arcs, u_arcs)
         },
@@ -856,7 +870,7 @@ pub fn validate_derivatives(
     params: &Params,
     request: &crate::common::DerivativeCheckRequest,
 ) -> Result<crate::common::ProblemDerivativeCheck> {
-    crate::common::validate_standard_ocp_derivatives(
+    crate::common::validate_standard_ocp_derivatives::<_, _, _, _, _, _, _>(
         ProblemId::SailboatUpwind,
         PROBLEM_NAME,
         params,
@@ -866,8 +880,8 @@ pub fn validate_derivatives(
         request,
         cached_multiple_shooting,
         cached_direct_collocation,
-        ms_runtime::<DEFAULT_INTERVALS>,
-        dc_runtime::<DEFAULT_INTERVALS, DEFAULT_COLLOCATION_DEGREE>,
+        ms_runtime,
+        dc_runtime,
     )
 }
 
@@ -995,7 +1009,7 @@ fn runtime_spec(
     }
 }
 
-fn ms_runtime<const N: usize>(
+fn ms_runtime(
     params: &Params,
 ) -> MultipleShootingRuntimeValues<
     ModelParams<f64>,
@@ -1004,12 +1018,11 @@ fn ms_runtime<const N: usize>(
     (),
     State<f64>,
     Control<f64>,
-    N,
 > {
     multiple_shooting_runtime_from_spec(runtime_spec(params))
 }
 
-fn dc_runtime<const N: usize, const K: usize>(
+fn dc_runtime(
     params: &Params,
 ) -> DirectCollocationRuntimeValues<
     ModelParams<f64>,
@@ -1018,8 +1031,6 @@ fn dc_runtime<const N: usize, const K: usize>(
     (),
     State<f64>,
     Control<f64>,
-    N,
-    K,
 > {
     direct_collocation_runtime_from_spec(runtime_spec(params))
 }
@@ -1426,9 +1437,9 @@ fn artifact_from_interval_data(
     )
 }
 
-fn artifact_from_ms_trajectories<const N: usize>(
+fn artifact_from_ms_trajectories(
     params: &Params,
-    trajectories: &MultipleShootingTrajectories<State<f64>, Control<f64>, N>,
+    trajectories: &MultipleShootingTrajectories<State<f64>, Control<f64>>,
     x_arcs: &[IntervalArc<State<f64>>],
     u_arcs: &[IntervalArc<Control<f64>>],
 ) -> SolveArtifact {
@@ -1446,7 +1457,7 @@ fn artifact_from_ms_trajectories<const N: usize>(
     artifact_from_interval_data(
         params,
         metrics,
-        node_times::<N>(trajectories.tf),
+        node_times(trajectories.tf, trajectories.interval_count()),
         states,
         x_arcs,
         u_arcs,
@@ -1459,10 +1470,10 @@ fn artifact_from_ms_trajectories<const N: usize>(
     )
 }
 
-fn artifact_from_dc_trajectories<const N: usize, const K: usize>(
+fn artifact_from_dc_trajectories(
     params: &Params,
-    trajectories: &DirectCollocationTrajectories<State<f64>, Control<f64>, N, K>,
-    time_grid: &DirectCollocationTimeGrid<N, K>,
+    trajectories: &DirectCollocationTrajectories<State<f64>, Control<f64>>,
+    time_grid: &DirectCollocationTimeGrid,
 ) -> SolveArtifact {
     let x_arcs =
         direct_collocation_state_like_arcs(&trajectories.x, &trajectories.root_x, time_grid)
@@ -1515,15 +1526,18 @@ mod tests {
     };
 
     fn repro_multiple_shooting_inline_all_hessian_preflight_for<const N: usize>() {
-        let compiled = model(MultipleShooting::<N, RK4_SUBSTEPS>)
-            .compile_jit_with_ocp_options(optimal_control::OcpCompileOptions {
-                function_options: optimization::FunctionCompileOptions::from(
-                    optimization::LlvmOptimizationLevel::O0,
-                ),
-                symbolic_functions: optimal_control::OcpSymbolicFunctionOptions::inline_all(),
-                hessian_strategy: sx_core::HessianStrategy::LowerTriangleByColumn,
-            })
-            .expect("compile should succeed");
+        let compiled = model(MultipleShooting {
+            intervals: N,
+            rk4_substeps: RK4_SUBSTEPS,
+        })
+        .compile_jit_with_ocp_options(optimal_control::OcpCompileOptions {
+            function_options: optimization::FunctionCompileOptions::from(
+                optimization::LlvmOptimizationLevel::O0,
+            ),
+            symbolic_functions: optimal_control::OcpSymbolicFunctionOptions::inline_all(),
+            hessian_strategy: sx_core::HessianStrategy::LowerTriangleByColumn,
+        })
+        .expect("compile should succeed");
         let lowered = compiled.debug_lagrangian_hessian_lowered();
         println!(
             "N={N} lowered instructions={} subfunctions={} hessian_nnz={}",
@@ -1533,7 +1547,7 @@ mod tests {
         );
         let mut params = Params::default();
         params.transcription.intervals = N;
-        let values = ms_runtime::<N>(&params);
+        let values = ms_runtime(&params);
         let benchmark = compiled
             .benchmark_nlp_evaluations_with_progress(
                 &values,
@@ -1634,10 +1648,9 @@ mod tests {
     #[ignore = "manual profiling helper"]
     fn profile_direct_collocation_symbolic_setup() {
         let family = Params::default().transcription.collocation_family;
-        let ocp = model(optimal_control::DirectCollocation::<
-            DEFAULT_INTERVALS,
-            DEFAULT_COLLOCATION_DEGREE,
-        > {
+        let ocp = model(DirectCollocation {
+            intervals: DEFAULT_INTERVALS,
+            order: DEFAULT_COLLOCATION_DEGREE,
             family,
         });
         let started = std::time::Instant::now();
@@ -1661,7 +1674,10 @@ mod tests {
     #[test]
     #[ignore = "manual debug helper"]
     fn dump_multiple_shooting_inline_all_hessian_wrapper() {
-        let ocp = model(MultipleShooting::<DEFAULT_INTERVALS, RK4_SUBSTEPS>);
+        let ocp = model(MultipleShooting {
+            intervals: DEFAULT_INTERVALS,
+            rk4_substeps: RK4_SUBSTEPS,
+        });
         let compiled = ocp
             .compile_jit_with_ocp_options(optimal_control::OcpCompileOptions {
                 function_options: optimization::FunctionCompileOptions::from(
@@ -1723,15 +1739,18 @@ mod tests {
     #[ignore = "manual debug helper"]
     fn dump_small_multiple_shooting_inline_all_hessian_wrapper() {
         const SMALL_N: usize = 3;
-        let compiled = model(MultipleShooting::<SMALL_N, RK4_SUBSTEPS>)
-            .compile_jit_with_ocp_options(optimal_control::OcpCompileOptions {
-                function_options: optimization::FunctionCompileOptions::from(
-                    optimization::LlvmOptimizationLevel::O0,
-                ),
-                symbolic_functions: optimal_control::OcpSymbolicFunctionOptions::inline_all(),
-                hessian_strategy: sx_core::HessianStrategy::LowerTriangleByColumn,
-            })
-            .expect("compile should succeed");
+        let compiled = model(MultipleShooting {
+            intervals: SMALL_N,
+            rk4_substeps: RK4_SUBSTEPS,
+        })
+        .compile_jit_with_ocp_options(optimal_control::OcpCompileOptions {
+            function_options: optimization::FunctionCompileOptions::from(
+                optimization::LlvmOptimizationLevel::O0,
+            ),
+            symbolic_functions: optimal_control::OcpSymbolicFunctionOptions::inline_all(),
+            hessian_strategy: sx_core::HessianStrategy::LowerTriangleByColumn,
+        })
+        .expect("compile should succeed");
         let lowered = compiled.debug_lagrangian_hessian_lowered();
         let wrapper = generate_aot_wrapper_module(
             lowered,
@@ -1778,13 +1797,16 @@ mod tests {
     fn dump_multiple_shooting_inline_all_hessian_object_for<const N: usize>(
         opt_level: LlvmOptimizationLevel,
     ) {
-        let compiled = model(MultipleShooting::<N, RK4_SUBSTEPS>)
-            .compile_jit_with_ocp_options(optimal_control::OcpCompileOptions {
-                function_options: optimization::FunctionCompileOptions::from(opt_level),
-                symbolic_functions: optimal_control::OcpSymbolicFunctionOptions::inline_all(),
-                hessian_strategy: sx_core::HessianStrategy::LowerTriangleByColumn,
-            })
-            .expect("compile should succeed");
+        let compiled = model(MultipleShooting {
+            intervals: N,
+            rk4_substeps: RK4_SUBSTEPS,
+        })
+        .compile_jit_with_ocp_options(optimal_control::OcpCompileOptions {
+            function_options: optimization::FunctionCompileOptions::from(opt_level),
+            symbolic_functions: optimal_control::OcpSymbolicFunctionOptions::inline_all(),
+            hessian_strategy: sx_core::HessianStrategy::LowerTriangleByColumn,
+        })
+        .expect("compile should succeed");
         let lowered = compiled.debug_lagrangian_hessian_lowered();
         let out_path = std::path::PathBuf::from(format!(
             "target/sailboat_ms{N}_inline_all_lagrangian_hessian_{}.o",

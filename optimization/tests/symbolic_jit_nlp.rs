@@ -3,10 +3,12 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 use optimization::{
-    CallPolicy, CallPolicyConfig, ClarabelSqpOptions, FiniteDifferenceValidationOptions,
-    FunctionCompileOptions, InteriorPointLinearSolver, InteriorPointOptions, LlvmOptimizationLevel,
+    CallPolicy, CallPolicyConfig, ClarabelSqpOptions, ConstraintBounds,
+    FiniteDifferenceValidationOptions, FunctionCompileOptions, InteriorPointLinearSolver,
+    InteriorPointOptions, LlvmOptimizationLevel, RuntimeNlpBounds, RuntimeNlpScaling,
     SqpGlobalization, SymbolicCompileProgress, SymbolicCompileStage, SymbolicNlpOutputs,
     TypedNlpScaling, TypedRuntimeNlpBounds, clear_optivibre_jit_cache, flat_view, symbolic_nlp,
+    symbolic_nlp_dynamic,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptOptions, IpoptRawStatus};
@@ -37,6 +39,26 @@ struct Chain<T, const N: usize> {
 
 fn named(name: &str, matrix: SXMatrix) -> NamedMatrix {
     NamedMatrix::new(name, matrix).expect("named matrix should be valid")
+}
+
+fn dynamic_parameterized_problem() -> optimization::DynamicSymbolicNlp {
+    let x = Pair {
+        x: SX::sym("x0"),
+        y: SX::sym("x1"),
+    };
+    let p = Pair {
+        x: SX::sym("p0"),
+        y: SX::sym("p1"),
+    };
+    symbolic_nlp_dynamic(
+        "parameterized_quadratic_dynamic",
+        optimization::symbolic_column(&x).expect("x column"),
+        Some(optimization::symbolic_column(&p).expect("p column")),
+        (x.x - p.x).sqr() + (x.y - p.y).sqr(),
+        Some(SXMatrix::dense_column(vec![x.x + x.y - 1.0]).expect("equality column")),
+        Some(SXMatrix::dense_column(vec![x.x.sqr() + x.y.sqr(), x.y]).expect("ineq column")),
+    )
+    .expect("dynamic symbolic NLP should build")
 }
 
 #[derive(Clone, optimization::Vectorize)]
@@ -250,6 +272,69 @@ fn typed_symbolic_parameterized_nlp_solves_end_to_end() {
     assert_abs_diff_eq!(summary.x[1], 0.25, epsilon = 1e-6);
     assert_abs_diff_eq!(summary.objective, 0.5, epsilon = 1e-9);
     assert!(summary.equality_inf_norm.is_some_and(|value| value <= 1e-8));
+}
+
+#[test]
+fn dynamic_symbolic_builder_matches_typed_compile_surface() {
+    let typed = symbolic_nlp::<Pair<SX>, Pair<SX>, SX, Pair<SX>, _>(
+        "parameterized_quadratic_dynamic",
+        |x, p| SymbolicNlpOutputs {
+            objective: (x.x - p.x).sqr() + (x.y - p.y).sqr(),
+            equalities: x.x + x.y - 1.0,
+            inequalities: Pair {
+                x: x.x.sqr() + x.y.sqr(),
+                y: x.y,
+            },
+        },
+    )
+    .expect("typed symbolic NLP should build")
+    .compile_jit()
+    .expect("typed JIT compile should succeed");
+    let dynamic = dynamic_parameterized_problem()
+        .compile_jit()
+        .expect("dynamic JIT compile should succeed");
+
+    assert_eq!(typed.compile_stats(), dynamic.compile_stats());
+}
+
+#[test]
+fn dynamic_symbolic_nlp_solves_with_flat_bounds_and_scaling() {
+    let compiled = dynamic_parameterized_problem()
+        .compile_jit()
+        .expect("dynamic JIT compile should succeed");
+    let summary = compiled
+        .solve_sqp(
+            &[-1.2, 1.0],
+            Some(&[0.25, 0.75]),
+            &RuntimeNlpBounds {
+                variables: ConstraintBounds::default(),
+                inequalities: ConstraintBounds {
+                    lower: Some(vec![None, None]),
+                    upper: Some(vec![Some(2.0), Some(1.0)]),
+                },
+            },
+            Some(&RuntimeNlpScaling {
+                variables: vec![2.0, 0.5],
+                constraints: vec![1.0, 0.25, 0.5],
+                objective: 2.0,
+            }),
+            &ClarabelSqpOptions {
+                verbose: false,
+                max_iters: 80,
+                ..ClarabelSqpOptions::default()
+            },
+        )
+        .expect("dynamic SQP solve should succeed");
+
+    assert!(summary.equality_inf_norm.is_some_and(|value| value <= 1e-6));
+    assert!(
+        summary
+            .inequality_inf_norm
+            .is_some_and(|value| value <= 1e-6)
+    );
+    assert_abs_diff_eq!(summary.x[0] + summary.x[1], 1.0, epsilon = 1e-6);
+    assert!(summary.x[0].powi(2) + summary.x[1].powi(2) <= 2.0 + 1e-6);
+    assert!(summary.x[1] <= 1.0 + 1e-6);
 }
 
 #[test]

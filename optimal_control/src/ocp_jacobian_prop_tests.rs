@@ -12,11 +12,11 @@ use proptest::test_runner::{Config, TestCaseError, TestCaseResult, TestRunner};
 use sx_codegen_llvm::CompiledJitFunction;
 use sx_core::{NamedMatrix, SX, SXFunction, SXMatrix};
 
-use crate::{
-    Bounds1D, CollocationFamily, DirectCollocation, DirectCollocationInitialGuess,
-    DirectCollocationRuntimeValues, MultipleShooting, MultipleShootingInitialGuess,
-    MultipleShootingRuntimeValues, Ocp, OcpCompileOptions, OcpSymbolicFunctionOptions,
+use crate::runtime::{
+    DirectCollocation, DirectCollocationInitialGuess, DirectCollocationRuntimeValues,
+    MultipleShooting, MultipleShootingInitialGuess, MultipleShootingRuntimeValues,
 };
+use crate::{Bounds1D, CollocationFamily, Ocp, OcpCompileOptions, OcpSymbolicFunctionOptions};
 
 use crate::jacobian_proptest::{
     CaseFeatures, CaseProfile, CoverageCounters, DenseMatrix, ExprAst, FunctionAst, GeneratedCase,
@@ -262,19 +262,27 @@ fn deterministic_ms_bug_case() -> GeneratedCase {
 
 fn ms_decision_layout_names() -> Vec<String> {
     let mut names = Vec::new();
-    <crate::MsVars<StageState<SX>, StageControl<SX>, MS_INTERVALS> as Vectorize<SX>>::flat_layout_names(
-        "w",
-        &mut names,
-    );
+    for index in 0..MS_INTERVALS {
+        StageState::<SX>::flat_layout_names(&format!("w.x.nodes[{index}]"), &mut names);
+    }
+    StageState::<SX>::flat_layout_names("w.x.terminal", &mut names);
+    for index in 0..MS_INTERVALS {
+        StageControl::<SX>::flat_layout_names(&format!("w.u.nodes[{index}]"), &mut names);
+    }
+    StageControl::<SX>::flat_layout_names("w.u.terminal", &mut names);
+    for index in 0..MS_INTERVALS {
+        StageControl::<SX>::flat_layout_names(&format!("w.dudt[{index}]"), &mut names);
+    }
+    names.push("w.tf".to_string());
     names
 }
 
 fn ms_equality_layout_names() -> Vec<String> {
     let mut names = Vec::new();
-    <crate::MsEqualities<StageState<SX>, StageControl<SX>, MS_INTERVALS> as Vectorize<SX>>::flat_layout_names(
-        "eq",
-        &mut names,
-    );
+    for index in 0..MS_INTERVALS {
+        StageState::<SX>::flat_layout_names(&format!("eq.continuity_x[{index}]"), &mut names);
+        StageControl::<SX>::flat_layout_names(&format!("eq.continuity_u[{index}]"), &mut names);
+    }
     names
 }
 
@@ -308,15 +316,8 @@ fn named_worst_entry(
 
 fn generated_ms_ocp(
     case: &GeneratedCase,
-) -> Ocp<
-    StageState<SX>,
-    StageControl<SX>,
-    (),
-    PathIneq<SX>,
-    (),
-    BoundaryIneq<SX>,
-    MultipleShooting<MS_INTERVALS, MS_RK4_SUBSTEPS>,
-> {
+) -> Ocp<StageState<SX>, StageControl<SX>, (), PathIneq<SX>, (), BoundaryIneq<SX>, MultipleShooting>
+{
     let lag_case = case.clone();
     let mayer_case = case.clone();
     let ode_case = case.clone();
@@ -324,7 +325,10 @@ fn generated_ms_ocp(
     let bineq_case = case.clone();
     Ocp::new(
         "generated_ocp_ms",
-        MultipleShooting::<MS_INTERVALS, MS_RK4_SUBSTEPS>,
+        MultipleShooting {
+            intervals: MS_INTERVALS,
+            rk4_substeps: MS_RK4_SUBSTEPS,
+        },
     )
     .objective_lagrange(
         move |x: &StageState<SX>, u: &StageControl<SX>, _: &StageControl<SX>, _: &()| {
@@ -401,15 +405,8 @@ fn generated_ms_ocp(
 
 fn generated_dc_ocp(
     case: &GeneratedCase,
-) -> Ocp<
-    StageState<SX>,
-    StageControl<SX>,
-    (),
-    PathIneq<SX>,
-    (),
-    BoundaryIneq<SX>,
-    DirectCollocation<DC_INTERVALS, DC_COLLOCATION_ROOTS>,
-> {
+) -> Ocp<StageState<SX>, StageControl<SX>, (), PathIneq<SX>, (), BoundaryIneq<SX>, DirectCollocation>
+{
     let lag_case = case.clone();
     let mayer_case = case.clone();
     let ode_case = case.clone();
@@ -417,7 +414,9 @@ fn generated_dc_ocp(
     let bineq_case = case.clone();
     Ocp::new(
         "generated_ocp_dc",
-        DirectCollocation::<DC_INTERVALS, DC_COLLOCATION_ROOTS> {
+        DirectCollocation {
+            intervals: DC_INTERVALS,
+            order: DC_COLLOCATION_ROOTS,
             family: CollocationFamily::RadauIIA,
         },
     )
@@ -507,7 +506,6 @@ fn ms_runtime(
     BoundaryIneq<Bounds1D>,
     StageState<f64>,
     StageControl<f64>,
-    MS_INTERVALS,
 > {
     let x = constant_state(case);
     let u = constant_control(case);
@@ -551,8 +549,6 @@ fn dc_runtime(
     BoundaryIneq<Bounds1D>,
     StageState<f64>,
     StageControl<f64>,
-    DC_INTERVALS,
-    DC_COLLOCATION_ROOTS,
 > {
     let x = constant_state(case);
     let u = constant_control(case);
@@ -807,35 +803,36 @@ fn evaluate_multiple_shooting(
 
     let values = ms_runtime(case);
     let x0 = compiled
-        .build_initial_guess(&values)
+        .test_initial_guess_flat(&values)
         .expect("multiple-shooting initial guess should build");
-    let bounds = compiled
-        .build_runtime_bounds(&values)
+    let (bounds, _scaling) = compiled
+        .test_runtime_bounds(&values)
         .expect("multiple-shooting bounds should build");
-    let runtime_params = ((), ());
+    let runtime_params = None;
 
     let equality_values = compiled
-        .compiled
-        .evaluate_equalities_flat(&x0, &runtime_params);
+        .test_dynamic_nlp()
+        .evaluate_equalities_flat(&x0, runtime_params)
+        .expect("multiple-shooting equality evaluation should succeed");
     let inequality_values = compiled
-        .compiled
-        .evaluate_inequalities_flat(&x0, &runtime_params);
+        .test_dynamic_nlp()
+        .evaluate_inequalities_flat(&x0, runtime_params)
+        .expect("multiple-shooting inequality evaluation should succeed");
     if !all_finite(&equality_values) || !all_finite(&inequality_values) {
         return CaseEvaluation::Reject("ms_values_nonfinite");
     }
 
-    let x = flatten_value(&x0);
     let bound_problem = compiled
-        .compiled
+        .test_dynamic_nlp()
         .bind_runtime_bounds(&bounds)
         .expect("multiple-shooting runtime bounds should bind");
-    let equality_jacobian = analytic_constraint_jacobian(&bound_problem, &x, true);
-    let inequality_jacobian = analytic_constraint_jacobian(&bound_problem, &x, false);
+    let equality_jacobian = analytic_constraint_jacobian(&bound_problem, &x0, true);
+    let inequality_jacobian = analytic_constraint_jacobian(&bound_problem, &x0, false);
     if !all_dense_finite(&equality_jacobian) || !all_dense_finite(&inequality_jacobian) {
         return CaseEvaluation::Reject("ms_analytic_jacobian_nonfinite");
     }
-    let equality_fd = finite_difference_constraint_jacobian(&bound_problem, &x, true, fd_step);
-    let inequality_fd = finite_difference_constraint_jacobian(&bound_problem, &x, false, fd_step);
+    let equality_fd = finite_difference_constraint_jacobian(&bound_problem, &x0, true, fd_step);
+    let inequality_fd = finite_difference_constraint_jacobian(&bound_problem, &x0, false, fd_step);
     if !all_dense_finite(&equality_fd) || !all_dense_finite(&inequality_fd) {
         return CaseEvaluation::Reject("finite_difference_nonfinite");
     }
@@ -888,35 +885,36 @@ fn evaluate_direct_collocation(
 
     let values = dc_runtime(case);
     let x0 = compiled
-        .build_initial_guess(&values)
+        .test_initial_guess_flat(&values)
         .expect("direct-collocation initial guess should build");
-    let bounds = compiled
-        .build_runtime_bounds(&values)
+    let (bounds, _scaling) = compiled
+        .test_runtime_bounds(&values)
         .expect("direct-collocation bounds should build");
-    let runtime_params = ((), ());
+    let runtime_params = None;
 
     let equality_values = compiled
-        .compiled
-        .evaluate_equalities_flat(&x0, &runtime_params);
+        .test_dynamic_nlp()
+        .evaluate_equalities_flat(&x0, runtime_params)
+        .expect("direct-collocation equality evaluation should succeed");
     let inequality_values = compiled
-        .compiled
-        .evaluate_inequalities_flat(&x0, &runtime_params);
+        .test_dynamic_nlp()
+        .evaluate_inequalities_flat(&x0, runtime_params)
+        .expect("direct-collocation inequality evaluation should succeed");
     if !all_finite(&equality_values) || !all_finite(&inequality_values) {
         return CaseEvaluation::Reject("dc_values_nonfinite");
     }
 
-    let x = flatten_value(&x0);
     let bound_problem = compiled
-        .compiled
+        .test_dynamic_nlp()
         .bind_runtime_bounds(&bounds)
         .expect("direct-collocation runtime bounds should bind");
-    let equality_jacobian = analytic_constraint_jacobian(&bound_problem, &x, true);
-    let inequality_jacobian = analytic_constraint_jacobian(&bound_problem, &x, false);
+    let equality_jacobian = analytic_constraint_jacobian(&bound_problem, &x0, true);
+    let inequality_jacobian = analytic_constraint_jacobian(&bound_problem, &x0, false);
     if !all_dense_finite(&equality_jacobian) || !all_dense_finite(&inequality_jacobian) {
         return CaseEvaluation::Reject("dc_analytic_jacobian_nonfinite");
     }
-    let equality_fd = finite_difference_constraint_jacobian(&bound_problem, &x, true, fd_step);
-    let inequality_fd = finite_difference_constraint_jacobian(&bound_problem, &x, false, fd_step);
+    let equality_fd = finite_difference_constraint_jacobian(&bound_problem, &x0, true, fd_step);
+    let inequality_fd = finite_difference_constraint_jacobian(&bound_problem, &x0, false, fd_step);
     if !all_dense_finite(&equality_fd) || !all_dense_finite(&inequality_fd) {
         return CaseEvaluation::Reject("finite_difference_nonfinite");
     }
@@ -1301,7 +1299,7 @@ fn preserved_call_multiple_shooting_integrator_wrapper_identity_jacobian_is_fixe
     let case = deterministic_ms_bug_case();
     let ocp = generated_ms_ocp(&case);
     let library = ocp
-        .build_multiple_shooting_symbolic_function_library(preserved_options().symbolic_functions)
+        .test_symbolic_function_library(preserved_options().symbolic_functions)
         .expect("multiple-shooting symbolic library should build");
     let integrator = library
         .multiple_shooting_integrator
@@ -1373,7 +1371,7 @@ fn diagnose_preserved_call_multiple_shooting_integrator_forward_helper_identity_
     let case = deterministic_ms_bug_case();
     let ocp = generated_ms_ocp(&case);
     let library = ocp
-        .build_multiple_shooting_symbolic_function_library(preserved_options().symbolic_functions)
+        .test_symbolic_function_library(preserved_options().symbolic_functions)
         .expect("multiple-shooting symbolic library should build");
     let integrator = library
         .multiple_shooting_integrator
@@ -1446,7 +1444,7 @@ fn diagnose_preserved_call_multiple_shooting_integrator_wrapper_jacobian_structu
     let case = deterministic_ms_bug_case();
     let ocp = generated_ms_ocp(&case);
     let library = ocp
-        .build_multiple_shooting_symbolic_function_library(preserved_options().symbolic_functions)
+        .test_symbolic_function_library(preserved_options().symbolic_functions)
         .expect("multiple-shooting symbolic library should build");
     let integrator = library
         .multiple_shooting_integrator
@@ -1483,7 +1481,7 @@ fn diagnose_preserved_call_multiple_shooting_integrator_wrapper_forward_path() {
     let case = deterministic_ms_bug_case();
     let ocp = generated_ms_ocp(&case);
     let library = ocp
-        .build_multiple_shooting_symbolic_function_library(preserved_options().symbolic_functions)
+        .test_symbolic_function_library(preserved_options().symbolic_functions)
         .expect("multiple-shooting symbolic library should build");
     let integrator = library
         .multiple_shooting_integrator

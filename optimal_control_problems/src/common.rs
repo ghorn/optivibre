@@ -9,18 +9,11 @@ use std::time::Instant;
 
 use anyhow::{Result, anyhow};
 use optimal_control::{
-    Bounds1D, CollocationFamily, CompiledDirectCollocationOcp, CompiledMultipleShootingOcp,
-    ControllerFn, DirectCollocationInitialGuess, DirectCollocationInteriorPointSnapshot,
-    DirectCollocationRuntimeValues, DirectCollocationSqpSnapshot, DirectCollocationTimeGrid,
-    DirectCollocationTrajectories, InterpolatedTrajectory, IntervalArc,
-    MultipleShootingInitialGuess, MultipleShootingInteriorPointSnapshot,
-    MultipleShootingRuntimeValues, MultipleShootingSqpSnapshot, MultipleShootingTrajectories,
+    Bounds1D, CollocationFamily, ControllerFn, InterpolatedTrajectory, IntervalArc,
     OcpCompileHelperKind, OcpCompileOptions, OcpCompileProgress, OcpConstraintCategory,
     OcpConstraintViolationReport, OcpHelperCompileStats, OcpKernelFunctionOptions,
-    OcpSymbolicFunctionOptions,
+    OcpSymbolicFunctionOptions, runtime as ocp_runtime,
 };
-#[cfg(feature = "ipopt")]
-use optimal_control::{DirectCollocationIpoptSnapshot, MultipleShootingIpoptSnapshot};
 use optimization::{
     BackendCompileReport, BackendTimingMetadata, CallPolicy, CallPolicyConfig, ClarabelSqpError,
     ClarabelSqpOptions, ClarabelSqpProfiling, ClarabelSqpSummary, ConstraintSatisfaction,
@@ -2194,6 +2187,43 @@ impl SharedControlId {
 
 type Numeric<T> = <T as Vectorize<SX>>::Rebind<f64>;
 
+pub type CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq> =
+    ocp_runtime::CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq>;
+pub type CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq> =
+    ocp_runtime::CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq>;
+pub type MultipleShootingInitialGuess<X, U, P> = ocp_runtime::MultipleShootingInitialGuess<X, U, P>;
+pub type DirectCollocationInitialGuess<X, U, P> =
+    ocp_runtime::DirectCollocationInitialGuess<X, U, P>;
+pub type MultipleShootingRuntimeValues<P, C, Beq, Bineq, X, U> =
+    ocp_runtime::MultipleShootingRuntimeValues<P, C, Beq, Bineq, X, U>;
+pub type DirectCollocationRuntimeValues<P, C, Beq, Bineq, X, U> =
+    ocp_runtime::DirectCollocationRuntimeValues<P, C, Beq, Bineq, X, U>;
+pub type MultipleShootingTrajectories<X, U> = ocp_runtime::MultipleShootingTrajectories<X, U>;
+pub type DirectCollocationTrajectories<X, U> = ocp_runtime::DirectCollocationTrajectories<X, U>;
+pub type DirectCollocationTimeGrid = ocp_runtime::DirectCollocationTimeGrid;
+pub type MultipleShootingSqpSnapshot<X, U> = ocp_runtime::MultipleShootingSqpSnapshot<X, U>;
+pub type DirectCollocationSqpSnapshot<X, U> = ocp_runtime::DirectCollocationSqpSnapshot<X, U>;
+pub type MultipleShootingInteriorPointSnapshot<X, U> =
+    ocp_runtime::MultipleShootingInteriorPointSnapshot<X, U>;
+pub type DirectCollocationInteriorPointSnapshot<X, U> =
+    ocp_runtime::DirectCollocationInteriorPointSnapshot<X, U>;
+pub type MultipleShootingSqpSolveResult<X, U> = ocp_runtime::MultipleShootingSqpSolveResult<X, U>;
+pub type DirectCollocationSqpSolveResult<X, U> = ocp_runtime::DirectCollocationSqpSolveResult<X, U>;
+pub type MultipleShootingInteriorPointSolveResult<X, U> =
+    ocp_runtime::MultipleShootingInteriorPointSolveResult<X, U>;
+pub type DirectCollocationInteriorPointSolveResult<X, U> =
+    ocp_runtime::DirectCollocationInteriorPointSolveResult<X, U>;
+#[cfg(feature = "ipopt")]
+pub type MultipleShootingIpoptSolveResult<X, U> =
+    ocp_runtime::MultipleShootingIpoptSolveResult<X, U>;
+#[cfg(feature = "ipopt")]
+pub type DirectCollocationIpoptSolveResult<X, U> =
+    ocp_runtime::DirectCollocationIpoptSolveResult<X, U>;
+#[cfg(feature = "ipopt")]
+pub type MultipleShootingIpoptSnapshot<X, U> = ocp_runtime::MultipleShootingIpoptSnapshot<X, U>;
+#[cfg(feature = "ipopt")]
+pub type DirectCollocationIpoptSnapshot<X, U> = ocp_runtime::DirectCollocationIpoptSnapshot<X, U>;
+
 pub enum ContinuousInitialGuess<X, U, P> {
     Interpolated(InterpolatedTrajectory<X, U>),
     #[allow(dead_code)]
@@ -2215,9 +2245,7 @@ pub struct OcpRuntimeSpec<P, C, Beq, Bineq, X, U> {
 }
 
 impl<X, U, P> ContinuousInitialGuess<X, U, P> {
-    pub fn into_multiple_shooting<const N: usize>(
-        self,
-    ) -> MultipleShootingInitialGuess<X, U, P, N> {
+    pub fn into_multiple_shooting(self) -> ocp_runtime::MultipleShootingInitialGuess<X, U, P> {
         match self {
             Self::Interpolated(trajectory) => {
                 MultipleShootingInitialGuess::Interpolated(trajectory)
@@ -2236,9 +2264,7 @@ impl<X, U, P> ContinuousInitialGuess<X, U, P> {
         }
     }
 
-    pub fn into_direct_collocation<const N: usize, const K: usize>(
-        self,
-    ) -> DirectCollocationInitialGuess<X, U, P, N, K> {
+    pub fn into_direct_collocation(self) -> ocp_runtime::DirectCollocationInitialGuess<X, U, P> {
         match self {
             Self::Interpolated(trajectory) => {
                 DirectCollocationInitialGuess::Interpolated(trajectory)
@@ -2258,10 +2284,10 @@ impl<X, U, P> ContinuousInitialGuess<X, U, P> {
     }
 }
 
-pub fn multiple_shooting_runtime_from_spec<P, C, Beq, Bineq, X, U, const N: usize>(
+pub fn multiple_shooting_runtime_from_spec<P, C, Beq, Bineq, X, U>(
     spec: OcpRuntimeSpec<P, C, Beq, Bineq, X, U>,
-) -> MultipleShootingRuntimeValues<P, C, Beq, Bineq, X, U, N> {
-    MultipleShootingRuntimeValues {
+) -> ocp_runtime::MultipleShootingRuntimeValues<P, C, Beq, Bineq, X, U> {
+    ocp_runtime::MultipleShootingRuntimeValues {
         parameters: spec.parameters,
         beq: spec.beq,
         bineq_bounds: spec.bineq_bounds,
@@ -2272,19 +2298,10 @@ pub fn multiple_shooting_runtime_from_spec<P, C, Beq, Bineq, X, U, const N: usiz
     }
 }
 
-pub fn direct_collocation_runtime_from_spec<
-    P,
-    C,
-    Beq,
-    Bineq,
-    X,
-    U,
-    const N: usize,
-    const K: usize,
->(
+pub fn direct_collocation_runtime_from_spec<P, C, Beq, Bineq, X, U>(
     spec: OcpRuntimeSpec<P, C, Beq, Bineq, X, U>,
-) -> DirectCollocationRuntimeValues<P, C, Beq, Bineq, X, U, N, K> {
-    DirectCollocationRuntimeValues {
+) -> ocp_runtime::DirectCollocationRuntimeValues<P, C, Beq, Bineq, X, U> {
+    ocp_runtime::DirectCollocationRuntimeValues {
         parameters: spec.parameters,
         beq: spec.beq,
         bineq_bounds: spec.bineq_bounds,
@@ -2466,8 +2483,6 @@ pub fn solve_standard_ocp<
     DcRuntimeFn,
     MsArtifact,
     DcArtifact,
-    const N: usize,
-    const K: usize,
 >(
     params: &Params,
     transcription: TranscriptionMethod,
@@ -2482,8 +2497,8 @@ pub fn solve_standard_ocp<
     direct_collocation_artifact: DcArtifact,
 ) -> Result<SolveArtifact>
 where
-    MsCompiled: MultipleShootingCompiled<N>,
-    DcCompiled: DirectCollocationCompiled<N, K>,
+    MsCompiled: MultipleShootingCompiled,
+    DcCompiled: DirectCollocationCompiled,
     CachedMs: Fn(&Params) -> Result<CachedCompile<MsCompiled>>,
     CachedDc: Fn(&Params, CollocationFamily) -> Result<CachedCompile<DcCompiled>>,
     MsRuntimeFn: Fn(
@@ -2495,7 +2510,6 @@ where
         MsCompiled::BineqBounds,
         MsCompiled::XNum,
         MsCompiled::UNum,
-        N,
     >,
     DcRuntimeFn: Fn(
         &Params,
@@ -2506,17 +2520,15 @@ where
         DcCompiled::BineqBounds,
         DcCompiled::XNum,
         DcCompiled::UNum,
-        N,
-        K,
     >,
     MsArtifact: FnMut(
-        &MultipleShootingTrajectories<MsCompiled::XNum, MsCompiled::UNum, N>,
+        &MultipleShootingTrajectories<MsCompiled::XNum, MsCompiled::UNum>,
         &[IntervalArc<MsCompiled::XNum>],
         &[IntervalArc<MsCompiled::UNum>],
     ) -> SolveArtifact,
     DcArtifact: FnMut(
-        &DirectCollocationTrajectories<DcCompiled::XNum, DcCompiled::UNum, N, K>,
-        &DirectCollocationTimeGrid<N, K>,
+        &DirectCollocationTrajectories<DcCompiled::XNum, DcCompiled::UNum>,
+        &DirectCollocationTimeGrid,
     ) -> SolveArtifact,
 {
     match transcription {
@@ -2554,8 +2566,6 @@ pub fn solve_standard_ocp_with_progress<
     DcRuntimeFn,
     MsArtifact,
     DcArtifact,
-    const N: usize,
-    const K: usize,
 >(
     params: &Params,
     transcription: TranscriptionMethod,
@@ -2572,8 +2582,8 @@ pub fn solve_standard_ocp_with_progress<
 ) -> Result<SolveArtifact>
 where
     Emit: FnMut(SolveStreamEvent) + Send,
-    MsCompiled: MultipleShootingCompiled<N>,
-    DcCompiled: DirectCollocationCompiled<N, K>,
+    MsCompiled: MultipleShootingCompiled,
+    DcCompiled: DirectCollocationCompiled,
     CompileMs: Fn(
         &Params,
         &mut dyn FnMut(CompileProgressUpdate),
@@ -2592,7 +2602,6 @@ where
         MsCompiled::BineqBounds,
         MsCompiled::XNum,
         MsCompiled::UNum,
-        N,
     >,
     DcRuntimeFn: Fn(
         &Params,
@@ -2603,17 +2612,15 @@ where
         DcCompiled::BineqBounds,
         DcCompiled::XNum,
         DcCompiled::UNum,
-        N,
-        K,
     >,
     MsArtifact: FnMut(
-        &MultipleShootingTrajectories<MsCompiled::XNum, MsCompiled::UNum, N>,
+        &MultipleShootingTrajectories<MsCompiled::XNum, MsCompiled::UNum>,
         &[IntervalArc<MsCompiled::XNum>],
         &[IntervalArc<MsCompiled::UNum>],
     ) -> SolveArtifact,
     DcArtifact: FnMut(
-        &DirectCollocationTrajectories<DcCompiled::XNum, DcCompiled::UNum, N, K>,
-        &DirectCollocationTimeGrid<N, K>,
+        &DirectCollocationTrajectories<DcCompiled::XNum, DcCompiled::UNum>,
+        &DirectCollocationTimeGrid,
     ) -> SolveArtifact,
 {
     let mut lifecycle = SolveLifecycleReporter::new(emit, solver_method);
@@ -2662,8 +2669,6 @@ pub fn benchmark_standard_ocp_case_with_progress<
     MsRuntimeFn,
     DcRuntimeFn,
     E,
-    const N: usize,
-    const K: usize,
 >(
     problem_id: ProblemId,
     problem_name: &str,
@@ -2678,8 +2683,8 @@ pub fn benchmark_standard_ocp_case_with_progress<
 ) -> Result<crate::benchmark_report::OcpBenchmarkRecord>
 where
     Params: Default + StandardOcpParams,
-    MsCompiled: MultipleShootingCompiled<N>,
-    DcCompiled: DirectCollocationCompiled<N, K>,
+    MsCompiled: MultipleShootingCompiled,
+    DcCompiled: DirectCollocationCompiled,
     CompileMs: FnOnce(
         OcpCompileOptions,
         &mut dyn FnMut(OcpCompileProgress),
@@ -2698,7 +2703,6 @@ where
         MsCompiled::BineqBounds,
         MsCompiled::XNum,
         MsCompiled::UNum,
-        N,
     >,
     DcRuntimeFn: Fn(
         &Params,
@@ -2709,8 +2713,6 @@ where
         DcCompiled::BineqBounds,
         DcCompiled::XNum,
         DcCompiled::UNum,
-        N,
-        K,
     >,
     E: Into<anyhow::Error>,
 {
@@ -2791,8 +2793,6 @@ pub fn validate_standard_ocp_derivatives<
     CachedDc,
     MsRuntimeFn,
     DcRuntimeFn,
-    const N: usize,
-    const K: usize,
 >(
     problem_id: ProblemId,
     problem_name: &str,
@@ -2807,8 +2807,8 @@ pub fn validate_standard_ocp_derivatives<
     direct_collocation_runtime: DcRuntimeFn,
 ) -> Result<ProblemDerivativeCheck>
 where
-    MsCompiled: MultipleShootingCompiled<N>,
-    DcCompiled: DirectCollocationCompiled<N, K>,
+    MsCompiled: MultipleShootingCompiled,
+    DcCompiled: DirectCollocationCompiled,
     CachedMs: Fn(&Params) -> Result<CachedCompile<MsCompiled>>,
     CachedDc: Fn(&Params, CollocationFamily) -> Result<CachedCompile<DcCompiled>>,
     MsRuntimeFn: Fn(
@@ -2820,7 +2820,6 @@ where
         MsCompiled::BineqBounds,
         MsCompiled::XNum,
         MsCompiled::UNum,
-        N,
     >,
     DcRuntimeFn: Fn(
         &Params,
@@ -2831,8 +2830,6 @@ where
         DcCompiled::BineqBounds,
         DcCompiled::XNum,
         DcCompiled::UNum,
-        N,
-        K,
     >,
 {
     match transcription {
@@ -5864,9 +5861,9 @@ pub fn rad_to_deg(value: f64) -> f64 {
     value.to_degrees()
 }
 
-pub fn node_times<const N: usize>(tf: f64) -> Vec<f64> {
-    let step = tf / N as f64;
-    (0..=N).map(|index| index as f64 * step).collect()
+pub fn node_times(tf: f64, intervals: usize) -> Vec<f64> {
+    let step = tf / intervals as f64;
+    (0..=intervals).map(|index| index as f64 * step).collect()
 }
 
 pub fn trapezoid_integral(times: &[f64], values: &[f64]) -> f64 {
@@ -5946,7 +5943,7 @@ fn attach_constraint_panels(artifact: &mut SolveArtifact, report: OcpConstraintV
     artifact.constraint_panels = constraint_panels_from_report(report);
 }
 
-fn try_attach_multiple_shooting_constraint_panels<Compiled, const N: usize>(
+fn try_attach_multiple_shooting_constraint_panels<Compiled>(
     artifact: &mut SolveArtifact,
     compiled: &Compiled,
     runtime: &MultipleShootingRuntimeValues<
@@ -5956,20 +5953,19 @@ fn try_attach_multiple_shooting_constraint_panels<Compiled, const N: usize>(
         Compiled::BineqBounds,
         Compiled::XNum,
         Compiled::UNum,
-        N,
     >,
-    trajectories: &MultipleShootingTrajectories<Compiled::XNum, Compiled::UNum, N>,
+    trajectories: &MultipleShootingTrajectories<Compiled::XNum, Compiled::UNum>,
     tolerance: f64,
 ) -> Result<()>
 where
-    Compiled: MultipleShootingCompiled<N>,
+    Compiled: MultipleShootingCompiled,
 {
     let report = compiled.build_constraint_violation_report(runtime, trajectories, tolerance)?;
     attach_constraint_panels(artifact, report);
     Ok(())
 }
 
-fn try_attach_direct_collocation_constraint_panels<Compiled, const N: usize, const K: usize>(
+fn try_attach_direct_collocation_constraint_panels<Compiled>(
     artifact: &mut SolveArtifact,
     compiled: &Compiled,
     runtime: &DirectCollocationRuntimeValues<
@@ -5979,14 +5975,12 @@ fn try_attach_direct_collocation_constraint_panels<Compiled, const N: usize, con
         Compiled::BineqBounds,
         Compiled::XNum,
         Compiled::UNum,
-        N,
-        K,
     >,
-    trajectories: &DirectCollocationTrajectories<Compiled::XNum, Compiled::UNum, N, K>,
+    trajectories: &DirectCollocationTrajectories<Compiled::XNum, Compiled::UNum>,
     tolerance: f64,
 ) -> Result<()>
 where
-    Compiled: DirectCollocationCompiled<N, K>,
+    Compiled: DirectCollocationCompiled,
 {
     let report = compiled.build_constraint_violation_report(runtime, trajectories, tolerance)?;
     attach_constraint_panels(artifact, report);
@@ -6001,7 +5995,7 @@ pub trait CompiledOcpMetadata {
     fn backend_compile_report(&self) -> &BackendCompileReport;
 }
 
-pub trait MultipleShootingCompiled<const N: usize>: CompiledOcpMetadata {
+pub trait MultipleShootingCompiled: CompiledOcpMetadata {
     type PNum;
     type CBounds;
     type BeqNum;
@@ -6018,10 +6012,9 @@ pub trait MultipleShootingCompiled<const N: usize>: CompiledOcpMetadata {
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
         >,
         options: &ClarabelSqpOptions,
-    ) -> Result<optimal_control::MultipleShootingSqpSolveResult<Self::XNum, Self::UNum, N>>;
+    ) -> Result<MultipleShootingSqpSolveResult<Self::XNum, Self::UNum>>;
 
     fn run_sqp_with_callback<CB>(
         &self,
@@ -6032,13 +6025,12 @@ pub trait MultipleShootingCompiled<const N: usize>: CompiledOcpMetadata {
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
         >,
         options: &ClarabelSqpOptions,
         callback: CB,
-    ) -> Result<optimal_control::MultipleShootingSqpSolveResult<Self::XNum, Self::UNum, N>>
+    ) -> Result<MultipleShootingSqpSolveResult<Self::XNum, Self::UNum>>
     where
-        CB: FnMut(&MultipleShootingSqpSnapshot<Self::XNum, Self::UNum, N>);
+        CB: FnMut(&MultipleShootingSqpSnapshot<Self::XNum, Self::UNum>);
 
     fn run_nlip(
         &self,
@@ -6049,10 +6041,9 @@ pub trait MultipleShootingCompiled<const N: usize>: CompiledOcpMetadata {
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
         >,
         options: &InteriorPointOptions,
-    ) -> Result<optimal_control::MultipleShootingInteriorPointSolveResult<Self::XNum, Self::UNum, N>>;
+    ) -> Result<MultipleShootingInteriorPointSolveResult<Self::XNum, Self::UNum>>;
 
     fn run_nlip_with_callback<CB>(
         &self,
@@ -6063,13 +6054,12 @@ pub trait MultipleShootingCompiled<const N: usize>: CompiledOcpMetadata {
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
         >,
         options: &InteriorPointOptions,
         callback: CB,
-    ) -> Result<optimal_control::MultipleShootingInteriorPointSolveResult<Self::XNum, Self::UNum, N>>
+    ) -> Result<MultipleShootingInteriorPointSolveResult<Self::XNum, Self::UNum>>
     where
-        CB: FnMut(&MultipleShootingInteriorPointSnapshot<Self::XNum, Self::UNum, N>);
+        CB: FnMut(&MultipleShootingInteriorPointSnapshot<Self::XNum, Self::UNum>);
 
     #[cfg(feature = "ipopt")]
     fn run_ipopt(
@@ -6081,10 +6071,9 @@ pub trait MultipleShootingCompiled<const N: usize>: CompiledOcpMetadata {
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
         >,
         options: &IpoptOptions,
-    ) -> Result<optimal_control::MultipleShootingIpoptSolveResult<Self::XNum, Self::UNum, N>>;
+    ) -> Result<MultipleShootingIpoptSolveResult<Self::XNum, Self::UNum>>;
 
     #[cfg(feature = "ipopt")]
     fn run_ipopt_with_callback<CB>(
@@ -6096,17 +6085,16 @@ pub trait MultipleShootingCompiled<const N: usize>: CompiledOcpMetadata {
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
         >,
         options: &IpoptOptions,
         callback: CB,
-    ) -> Result<optimal_control::MultipleShootingIpoptSolveResult<Self::XNum, Self::UNum, N>>
+    ) -> Result<MultipleShootingIpoptSolveResult<Self::XNum, Self::UNum>>
     where
-        CB: FnMut(&MultipleShootingIpoptSnapshot<Self::XNum, Self::UNum, N>);
+        CB: FnMut(&MultipleShootingIpoptSnapshot<Self::XNum, Self::UNum>);
 
     fn build_interval_arcs(
         &self,
-        trajectories: &MultipleShootingTrajectories<Self::XNum, Self::UNum, N>,
+        trajectories: &MultipleShootingTrajectories<Self::XNum, Self::UNum>,
         parameters: &Self::PNum,
     ) -> Result<(Vec<IntervalArc<Self::XNum>>, Vec<IntervalArc<Self::UNum>>)>;
 
@@ -6119,9 +6107,8 @@ pub trait MultipleShootingCompiled<const N: usize>: CompiledOcpMetadata {
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
         >,
-        trajectories: &MultipleShootingTrajectories<Self::XNum, Self::UNum, N>,
+        trajectories: &MultipleShootingTrajectories<Self::XNum, Self::UNum>,
         tolerance: f64,
     ) -> Result<OcpConstraintViolationReport>;
 
@@ -6134,7 +6121,6 @@ pub trait MultipleShootingCompiled<const N: usize>: CompiledOcpMetadata {
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
         >,
         equality_multipliers: &[f64],
         inequality_multipliers: &[f64],
@@ -6150,7 +6136,6 @@ pub trait MultipleShootingCompiled<const N: usize>: CompiledOcpMetadata {
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
         >,
         options: NlpEvaluationBenchmarkOptions,
         on_progress: CB,
@@ -6159,7 +6144,7 @@ pub trait MultipleShootingCompiled<const N: usize>: CompiledOcpMetadata {
         CB: FnMut(NlpEvaluationKernelKind);
 }
 
-pub trait DirectCollocationCompiled<const N: usize, const K: usize>: CompiledOcpMetadata {
+pub trait DirectCollocationCompiled: CompiledOcpMetadata {
     type PNum;
     type CBounds;
     type BeqNum;
@@ -6176,11 +6161,9 @@ pub trait DirectCollocationCompiled<const N: usize, const K: usize>: CompiledOcp
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
-            K,
         >,
         options: &ClarabelSqpOptions,
-    ) -> Result<optimal_control::DirectCollocationSqpSolveResult<Self::XNum, Self::UNum, N, K>>;
+    ) -> Result<DirectCollocationSqpSolveResult<Self::XNum, Self::UNum>>;
 
     fn run_sqp_with_callback<CB>(
         &self,
@@ -6191,14 +6174,12 @@ pub trait DirectCollocationCompiled<const N: usize, const K: usize>: CompiledOcp
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
-            K,
         >,
         options: &ClarabelSqpOptions,
         callback: CB,
-    ) -> Result<optimal_control::DirectCollocationSqpSolveResult<Self::XNum, Self::UNum, N, K>>
+    ) -> Result<DirectCollocationSqpSolveResult<Self::XNum, Self::UNum>>
     where
-        CB: FnMut(&DirectCollocationSqpSnapshot<Self::XNum, Self::UNum, N, K>);
+        CB: FnMut(&DirectCollocationSqpSnapshot<Self::XNum, Self::UNum>);
 
     fn run_nlip(
         &self,
@@ -6209,13 +6190,9 @@ pub trait DirectCollocationCompiled<const N: usize, const K: usize>: CompiledOcp
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
-            K,
         >,
         options: &InteriorPointOptions,
-    ) -> Result<
-        optimal_control::DirectCollocationInteriorPointSolveResult<Self::XNum, Self::UNum, N, K>,
-    >;
+    ) -> Result<DirectCollocationInteriorPointSolveResult<Self::XNum, Self::UNum>>;
 
     fn run_nlip_with_callback<CB>(
         &self,
@@ -6226,16 +6203,12 @@ pub trait DirectCollocationCompiled<const N: usize, const K: usize>: CompiledOcp
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
-            K,
         >,
         options: &InteriorPointOptions,
         callback: CB,
-    ) -> Result<
-        optimal_control::DirectCollocationInteriorPointSolveResult<Self::XNum, Self::UNum, N, K>,
-    >
+    ) -> Result<DirectCollocationInteriorPointSolveResult<Self::XNum, Self::UNum>>
     where
-        CB: FnMut(&DirectCollocationInteriorPointSnapshot<Self::XNum, Self::UNum, N, K>);
+        CB: FnMut(&DirectCollocationInteriorPointSnapshot<Self::XNum, Self::UNum>);
 
     #[cfg(feature = "ipopt")]
     fn run_ipopt(
@@ -6247,11 +6220,9 @@ pub trait DirectCollocationCompiled<const N: usize, const K: usize>: CompiledOcp
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
-            K,
         >,
         options: &IpoptOptions,
-    ) -> Result<optimal_control::DirectCollocationIpoptSolveResult<Self::XNum, Self::UNum, N, K>>;
+    ) -> Result<DirectCollocationIpoptSolveResult<Self::XNum, Self::UNum>>;
 
     #[cfg(feature = "ipopt")]
     fn run_ipopt_with_callback<CB>(
@@ -6263,14 +6234,12 @@ pub trait DirectCollocationCompiled<const N: usize, const K: usize>: CompiledOcp
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
-            K,
         >,
         options: &IpoptOptions,
         callback: CB,
-    ) -> Result<optimal_control::DirectCollocationIpoptSolveResult<Self::XNum, Self::UNum, N, K>>
+    ) -> Result<DirectCollocationIpoptSolveResult<Self::XNum, Self::UNum>>
     where
-        CB: FnMut(&DirectCollocationIpoptSnapshot<Self::XNum, Self::UNum, N, K>);
+        CB: FnMut(&DirectCollocationIpoptSnapshot<Self::XNum, Self::UNum>);
 
     fn build_constraint_violation_report(
         &self,
@@ -6281,10 +6250,8 @@ pub trait DirectCollocationCompiled<const N: usize, const K: usize>: CompiledOcp
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
-            K,
         >,
-        trajectories: &DirectCollocationTrajectories<Self::XNum, Self::UNum, N, K>,
+        trajectories: &DirectCollocationTrajectories<Self::XNum, Self::UNum>,
         tolerance: f64,
     ) -> Result<OcpConstraintViolationReport>;
 
@@ -6297,8 +6264,6 @@ pub trait DirectCollocationCompiled<const N: usize, const K: usize>: CompiledOcp
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
-            K,
         >,
         equality_multipliers: &[f64],
         inequality_multipliers: &[f64],
@@ -6314,8 +6279,6 @@ pub trait DirectCollocationCompiled<const N: usize, const K: usize>: CompiledOcp
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
-            K,
         >,
         options: NlpEvaluationBenchmarkOptions,
         on_progress: CB,
@@ -6324,8 +6287,8 @@ pub trait DirectCollocationCompiled<const N: usize, const K: usize>: CompiledOcp
         CB: FnMut(NlpEvaluationKernelKind);
 }
 
-impl<X, U, P, C, Beq, Bineq, const N: usize, const RK4_SUBSTEPS: usize> CompiledOcpMetadata
-    for CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>
+impl<X, U, P, C, Beq, Bineq> CompiledOcpMetadata
+    for ocp_runtime::CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq>
 where
     X: Vectorize<SX, Rebind<SX> = X> + Clone,
     U: Vectorize<SX, Rebind<SX> = U> + Clone,
@@ -6333,86 +6296,46 @@ where
     C: Vectorize<SX, Rebind<SX> = C>,
     Beq: Vectorize<SX, Rebind<SX> = Beq>,
     Bineq: Vectorize<SX, Rebind<SX> = Bineq>,
-    optimal_control::Mesh<X, N>: Vectorize<SX, Rebind<SX> = optimal_control::Mesh<X, N>>,
-    optimal_control::Mesh<U, N>: Vectorize<SX, Rebind<SX> = optimal_control::Mesh<U, N>>,
-    [C; N]: Vectorize<SX, Rebind<SX> = [C; N]>,
-    [X; N]: Vectorize<SX, Rebind<SX> = [X; N]>,
-    [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,
-    <([X; N], [U; N]) as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
-    (
-        optimal_control::Mesh<X, N>,
-        optimal_control::Mesh<U, N>,
-        [U; N],
-        SX,
-    ): Vectorize<
-            SX,
-            Rebind<SX> = (
-                optimal_control::Mesh<X, N>,
-                optimal_control::Mesh<U, N>,
-                [U; N],
-                SX,
-            ),
-            Rebind<f64> = (
-                optimal_control::Mesh<Numeric<X>, N>,
-                optimal_control::Mesh<Numeric<U>, N>,
-                [Numeric<U>; N],
-                f64,
-            ),
-        >,
-    <(
-        optimal_control::Mesh<X, N>,
-        optimal_control::Mesh<U, N>,
-        [U; N],
-        SX,
-    ) as Vectorize<SX>>::Rebind<Option<f64>>: Vectorize<Option<f64>>,
-    ([X; N], [U; N]): Vectorize<SX, Rebind<SX> = ([X; N], [U; N])>,
-    (Beq, Bineq, [C; N]): Vectorize<
-            SX,
-            Rebind<SX> = (Beq, Bineq, [C; N]),
-            Rebind<f64> = (Numeric<Beq>, Numeric<Bineq>, [Numeric<C>; N]),
-        >,
-    <(Beq, Bineq, [C; N]) as Vectorize<SX>>::Rebind<Option<f64>>: Vectorize<Option<f64>>,
-    (P, Beq): Vectorize<SX, Rebind<SX> = (P, Beq), Rebind<f64> = (Numeric<P>, Numeric<Beq>)>,
     Numeric<X>: Vectorize<f64, Rebind<f64> = Numeric<X>> + Clone,
     Numeric<U>: Vectorize<f64, Rebind<f64> = Numeric<U>> + Clone,
     Numeric<P>: Vectorize<f64, Rebind<f64> = Numeric<P>> + Clone,
     Numeric<Beq>: Vectorize<f64, Rebind<f64> = Numeric<Beq>> + Clone,
-    Numeric<Bineq>: Vectorize<f64, Rebind<f64> = Numeric<Bineq>>,
-    Numeric<C>: Vectorize<f64, Rebind<f64> = Numeric<C>>,
     <C as Vectorize<SX>>::Rebind<Bounds1D>:
         Vectorize<Bounds1D, Rebind<Bounds1D> = <C as Vectorize<SX>>::Rebind<Bounds1D>>,
     <Bineq as Vectorize<SX>>::Rebind<Bounds1D>:
         Vectorize<Bounds1D, Rebind<Bounds1D> = <Bineq as Vectorize<SX>>::Rebind<Bounds1D>>,
 {
     fn backend_timing_metadata(&self) -> BackendTimingMetadata {
-        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::backend_timing_metadata(self)
-    }
-
-    fn nlp_compile_stats(&self) -> NlpCompileStats {
-        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::nlp_compile_stats(
+        ocp_runtime::CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq>::backend_timing_metadata(
             self,
         )
     }
 
+    fn nlp_compile_stats(&self) -> NlpCompileStats {
+        ocp_runtime::CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq>::nlp_compile_stats(self)
+    }
+
     fn helper_compile_stats(&self) -> OcpHelperCompileStats {
-        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::helper_compile_stats(
+        ocp_runtime::CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq>::helper_compile_stats(
             self,
         )
     }
 
     fn helper_kernel_count(&self) -> usize {
-        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::helper_kernel_count(
+        ocp_runtime::CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq>::helper_kernel_count(
             self,
         )
     }
 
     fn backend_compile_report(&self) -> &BackendCompileReport {
-        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::backend_compile_report(self)
+        ocp_runtime::CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq>::backend_compile_report(
+            self,
+        )
     }
 }
 
-impl<X, U, P, C, Beq, Bineq, const N: usize, const RK4_SUBSTEPS: usize> MultipleShootingCompiled<N>
-    for CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>
+impl<X, U, P, C, Beq, Bineq> MultipleShootingCompiled
+    for ocp_runtime::CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq>
 where
     X: Vectorize<SX, Rebind<SX> = X> + Clone,
     U: Vectorize<SX, Rebind<SX> = U> + Clone,
@@ -6420,52 +6343,10 @@ where
     C: Vectorize<SX, Rebind<SX> = C>,
     Beq: Vectorize<SX, Rebind<SX> = Beq>,
     Bineq: Vectorize<SX, Rebind<SX> = Bineq>,
-    optimal_control::Mesh<X, N>: Vectorize<SX, Rebind<SX> = optimal_control::Mesh<X, N>>,
-    optimal_control::Mesh<U, N>: Vectorize<SX, Rebind<SX> = optimal_control::Mesh<U, N>>,
-    [C; N]: Vectorize<SX, Rebind<SX> = [C; N]>,
-    [X; N]: Vectorize<SX, Rebind<SX> = [X; N]>,
-    [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,
-    <([X; N], [U; N]) as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
-    (
-        optimal_control::Mesh<X, N>,
-        optimal_control::Mesh<U, N>,
-        [U; N],
-        SX,
-    ): Vectorize<
-            SX,
-            Rebind<SX> = (
-                optimal_control::Mesh<X, N>,
-                optimal_control::Mesh<U, N>,
-                [U; N],
-                SX,
-            ),
-            Rebind<f64> = (
-                optimal_control::Mesh<Numeric<X>, N>,
-                optimal_control::Mesh<Numeric<U>, N>,
-                [Numeric<U>; N],
-                f64,
-            ),
-        >,
-    <(
-        optimal_control::Mesh<X, N>,
-        optimal_control::Mesh<U, N>,
-        [U; N],
-        SX,
-    ) as Vectorize<SX>>::Rebind<Option<f64>>: Vectorize<Option<f64>>,
-    ([X; N], [U; N]): Vectorize<SX, Rebind<SX> = ([X; N], [U; N])>,
-    (Beq, Bineq, [C; N]): Vectorize<
-            SX,
-            Rebind<SX> = (Beq, Bineq, [C; N]),
-            Rebind<f64> = (Numeric<Beq>, Numeric<Bineq>, [Numeric<C>; N]),
-        >,
-    <(Beq, Bineq, [C; N]) as Vectorize<SX>>::Rebind<Option<f64>>: Vectorize<Option<f64>>,
-    (P, Beq): Vectorize<SX, Rebind<SX> = (P, Beq), Rebind<f64> = (Numeric<P>, Numeric<Beq>)>,
     Numeric<X>: Vectorize<f64, Rebind<f64> = Numeric<X>> + Clone,
     Numeric<U>: Vectorize<f64, Rebind<f64> = Numeric<U>> + Clone,
     Numeric<P>: Vectorize<f64, Rebind<f64> = Numeric<P>> + Clone,
     Numeric<Beq>: Vectorize<f64, Rebind<f64> = Numeric<Beq>> + Clone,
-    Numeric<Bineq>: Vectorize<f64, Rebind<f64> = Numeric<Bineq>>,
-    Numeric<C>: Vectorize<f64, Rebind<f64> = Numeric<C>>,
     <C as Vectorize<SX>>::Rebind<Bounds1D>:
         Vectorize<Bounds1D, Rebind<Bounds1D> = <C as Vectorize<SX>>::Rebind<Bounds1D>>,
     <Bineq as Vectorize<SX>>::Rebind<Bounds1D>:
@@ -6487,11 +6368,10 @@ where
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
         >,
         options: &ClarabelSqpOptions,
-    ) -> Result<optimal_control::MultipleShootingSqpSolveResult<Self::XNum, Self::UNum, N>> {
-        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::solve_sqp(
+    ) -> Result<MultipleShootingSqpSolveResult<Self::XNum, Self::UNum>> {
+        ocp_runtime::CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq>::solve_sqp(
             self, values, options,
         )
         .map_err(Into::into)
@@ -6506,19 +6386,15 @@ where
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
         >,
         options: &ClarabelSqpOptions,
         callback: CB,
-    ) -> Result<optimal_control::MultipleShootingSqpSolveResult<Self::XNum, Self::UNum, N>>
+    ) -> Result<MultipleShootingSqpSolveResult<Self::XNum, Self::UNum>>
     where
-        CB: FnMut(&MultipleShootingSqpSnapshot<Self::XNum, Self::UNum, N>),
+        CB: FnMut(&MultipleShootingSqpSnapshot<Self::XNum, Self::UNum>),
     {
-        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::solve_sqp_with_callback(
-            self,
-            values,
-            options,
-            callback,
+        ocp_runtime::CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq>::solve_sqp_with_callback(
+            self, values, options, callback,
         )
         .map_err(Into::into)
     }
@@ -6532,15 +6408,11 @@ where
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
         >,
         options: &InteriorPointOptions,
-    ) -> Result<optimal_control::MultipleShootingInteriorPointSolveResult<Self::XNum, Self::UNum, N>>
-    {
-        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::solve_interior_point(
-            self,
-            values,
-            options,
+    ) -> Result<MultipleShootingInteriorPointSolveResult<Self::XNum, Self::UNum>> {
+        ocp_runtime::CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq>::solve_interior_point(
+            self, values, options,
         )
         .map_err(Into::into)
     }
@@ -6554,15 +6426,14 @@ where
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
         >,
         options: &InteriorPointOptions,
         callback: CB,
-    ) -> Result<optimal_control::MultipleShootingInteriorPointSolveResult<Self::XNum, Self::UNum, N>>
+    ) -> Result<MultipleShootingInteriorPointSolveResult<Self::XNum, Self::UNum>>
     where
-        CB: FnMut(&MultipleShootingInteriorPointSnapshot<Self::XNum, Self::UNum, N>),
+        CB: FnMut(&MultipleShootingInteriorPointSnapshot<Self::XNum, Self::UNum>),
     {
-        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::solve_interior_point_with_callback(
+        ocp_runtime::CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq>::solve_interior_point_with_callback(
             self,
             values,
             options,
@@ -6581,11 +6452,10 @@ where
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
         >,
         options: &IpoptOptions,
-    ) -> Result<optimal_control::MultipleShootingIpoptSolveResult<Self::XNum, Self::UNum, N>> {
-        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::solve_ipopt(
+    ) -> Result<MultipleShootingIpoptSolveResult<Self::XNum, Self::UNum>> {
+        ocp_runtime::CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq>::solve_ipopt(
             self, values, options,
         )
         .map_err(Into::into)
@@ -6601,15 +6471,14 @@ where
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
         >,
         options: &IpoptOptions,
         callback: CB,
-    ) -> Result<optimal_control::MultipleShootingIpoptSolveResult<Self::XNum, Self::UNum, N>>
+    ) -> Result<MultipleShootingIpoptSolveResult<Self::XNum, Self::UNum>>
     where
-        CB: FnMut(&MultipleShootingIpoptSnapshot<Self::XNum, Self::UNum, N>),
+        CB: FnMut(&MultipleShootingIpoptSnapshot<Self::XNum, Self::UNum>),
     {
-        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::solve_ipopt_with_callback(
+        ocp_runtime::CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq>::solve_ipopt_with_callback(
             self,
             values,
             options,
@@ -6620,10 +6489,10 @@ where
 
     fn build_interval_arcs(
         &self,
-        trajectories: &MultipleShootingTrajectories<Self::XNum, Self::UNum, N>,
+        trajectories: &MultipleShootingTrajectories<Self::XNum, Self::UNum>,
         parameters: &Self::PNum,
     ) -> Result<(Vec<IntervalArc<Self::XNum>>, Vec<IntervalArc<Self::UNum>>)> {
-        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::interval_arcs(
+        ocp_runtime::CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq>::interval_arcs(
             self,
             trajectories,
             parameters,
@@ -6640,12 +6509,11 @@ where
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
         >,
-        trajectories: &MultipleShootingTrajectories<Self::XNum, Self::UNum, N>,
+        trajectories: &MultipleShootingTrajectories<Self::XNum, Self::UNum>,
         tolerance: f64,
     ) -> Result<OcpConstraintViolationReport> {
-        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::rank_constraint_violations(
+        ocp_runtime::CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq>::rank_constraint_violations(
             self,
             values,
             trajectories,
@@ -6663,13 +6531,12 @@ where
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
         >,
         equality_multipliers: &[f64],
         inequality_multipliers: &[f64],
         options: FiniteDifferenceValidationOptions,
     ) -> Result<NlpDerivativeValidationReport> {
-        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::validate_nlp_derivatives(
+        ocp_runtime::CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq>::validate_nlp_derivatives(
             self,
             values,
             equality_multipliers,
@@ -6688,7 +6555,6 @@ where
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
         >,
         options: NlpEvaluationBenchmarkOptions,
         on_progress: CB,
@@ -6696,7 +6562,7 @@ where
     where
         CB: FnMut(NlpEvaluationKernelKind),
     {
-        CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, N, RK4_SUBSTEPS>::benchmark_nlp_evaluations_with_progress(
+        ocp_runtime::CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq>::benchmark_nlp_evaluations_with_progress(
             self,
             values,
             options,
@@ -6706,8 +6572,8 @@ where
     }
 }
 
-impl<X, U, P, C, Beq, Bineq, const N: usize, const K: usize> CompiledOcpMetadata
-    for CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq, N, K>
+impl<X, U, P, C, Beq, Bineq> CompiledOcpMetadata
+    for ocp_runtime::CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq>
 where
     X: Vectorize<SX, Rebind<SX> = X> + Clone,
     U: Vectorize<SX, Rebind<SX> = U> + Clone,
@@ -6715,114 +6581,46 @@ where
     C: Vectorize<SX, Rebind<SX> = C>,
     Beq: Vectorize<SX, Rebind<SX> = Beq>,
     Bineq: Vectorize<SX, Rebind<SX> = Bineq>,
-    optimal_control::Mesh<X, N>: Vectorize<SX, Rebind<SX> = optimal_control::Mesh<X, N>>,
-    optimal_control::Mesh<U, N>: Vectorize<SX, Rebind<SX> = optimal_control::Mesh<U, N>>,
-    optimal_control::IntervalGrid<X, N, K>:
-        Vectorize<SX, Rebind<SX> = optimal_control::IntervalGrid<X, N, K>>,
-    optimal_control::IntervalGrid<U, N, K>:
-        Vectorize<SX, Rebind<SX> = optimal_control::IntervalGrid<U, N, K>>,
-    optimal_control::IntervalGrid<C, N, K>:
-        Vectorize<SX, Rebind<SX> = optimal_control::IntervalGrid<C, N, K>>,
-    (
-        optimal_control::Mesh<X, N>,
-        optimal_control::Mesh<U, N>,
-        optimal_control::IntervalGrid<X, N, K>,
-        optimal_control::IntervalGrid<U, N, K>,
-        optimal_control::IntervalGrid<U, N, K>,
-        SX,
-    ): Vectorize<
-            SX,
-            Rebind<SX> = (
-                optimal_control::Mesh<X, N>,
-                optimal_control::Mesh<U, N>,
-                optimal_control::IntervalGrid<X, N, K>,
-                optimal_control::IntervalGrid<U, N, K>,
-                optimal_control::IntervalGrid<U, N, K>,
-                SX,
-            ),
-            Rebind<f64> = (
-                optimal_control::Mesh<Numeric<X>, N>,
-                optimal_control::Mesh<Numeric<U>, N>,
-                optimal_control::IntervalGrid<Numeric<X>, N, K>,
-                optimal_control::IntervalGrid<Numeric<U>, N, K>,
-                optimal_control::IntervalGrid<Numeric<U>, N, K>,
-                f64,
-            ),
-        >,
-    <(
-        optimal_control::Mesh<X, N>,
-        optimal_control::Mesh<U, N>,
-        optimal_control::IntervalGrid<X, N, K>,
-        optimal_control::IntervalGrid<U, N, K>,
-        optimal_control::IntervalGrid<U, N, K>,
-        SX,
-    ) as Vectorize<SX>>::Rebind<Option<f64>>: Vectorize<Option<f64>>,
-    (
-        [X; N],
-        [U; N],
-        optimal_control::IntervalGrid<X, N, K>,
-        optimal_control::IntervalGrid<U, N, K>,
-    ): Vectorize<
-            SX,
-            Rebind<SX> = (
-                [X; N],
-                [U; N],
-                optimal_control::IntervalGrid<X, N, K>,
-                optimal_control::IntervalGrid<U, N, K>,
-            ),
-        >,
-    (Beq, Bineq, optimal_control::IntervalGrid<C, N, K>): Vectorize<
-            SX,
-            Rebind<SX> = (Beq, Bineq, optimal_control::IntervalGrid<C, N, K>),
-            Rebind<f64> = (
-                Numeric<Beq>,
-                Numeric<Bineq>,
-                optimal_control::IntervalGrid<Numeric<C>, N, K>,
-            ),
-        >,
-    <(Beq, Bineq, optimal_control::IntervalGrid<C, N, K>) as Vectorize<SX>>::Rebind<Option<f64>>:
-        Vectorize<Option<f64>>,
-    (P, Beq): Vectorize<SX, Rebind<SX> = (P, Beq), Rebind<f64> = (Numeric<P>, Numeric<Beq>)>,
-    [X; N]: Vectorize<SX, Rebind<SX> = [X; N]>,
-    [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,
-    <optimal_control::IntervalGrid<X, N, K> as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
-    <optimal_control::IntervalGrid<U, N, K> as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
-    <[X; N] as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
-    <[U; N] as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
     Numeric<X>: Vectorize<f64, Rebind<f64> = Numeric<X>> + Clone,
     Numeric<U>: Vectorize<f64, Rebind<f64> = Numeric<U>> + Clone,
     Numeric<P>: Vectorize<f64, Rebind<f64> = Numeric<P>> + Clone,
     Numeric<Beq>: Vectorize<f64, Rebind<f64> = Numeric<Beq>> + Clone,
-    Numeric<Bineq>: Vectorize<f64, Rebind<f64> = Numeric<Bineq>>,
-    Numeric<C>: Vectorize<f64, Rebind<f64> = Numeric<C>>,
     <C as Vectorize<SX>>::Rebind<Bounds1D>:
         Vectorize<Bounds1D, Rebind<Bounds1D> = <C as Vectorize<SX>>::Rebind<Bounds1D>>,
     <Bineq as Vectorize<SX>>::Rebind<Bounds1D>:
         Vectorize<Bounds1D, Rebind<Bounds1D> = <Bineq as Vectorize<SX>>::Rebind<Bounds1D>>,
 {
     fn backend_timing_metadata(&self) -> BackendTimingMetadata {
-        CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq, N, K>::backend_timing_metadata(self)
+        ocp_runtime::CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq>::backend_timing_metadata(
+            self,
+        )
     }
 
     fn nlp_compile_stats(&self) -> NlpCompileStats {
-        CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq, N, K>::nlp_compile_stats(self)
+        ocp_runtime::CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq>::nlp_compile_stats(self)
     }
 
     fn helper_compile_stats(&self) -> OcpHelperCompileStats {
-        CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq, N, K>::helper_compile_stats(self)
+        ocp_runtime::CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq>::helper_compile_stats(
+            self,
+        )
     }
 
     fn helper_kernel_count(&self) -> usize {
-        CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq, N, K>::helper_kernel_count(self)
+        ocp_runtime::CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq>::helper_kernel_count(
+            self,
+        )
     }
 
     fn backend_compile_report(&self) -> &BackendCompileReport {
-        CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq, N, K>::backend_compile_report(self)
+        ocp_runtime::CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq>::backend_compile_report(
+            self,
+        )
     }
 }
 
-impl<X, U, P, C, Beq, Bineq, const N: usize, const K: usize> DirectCollocationCompiled<N, K>
-    for CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq, N, K>
+impl<X, U, P, C, Beq, Bineq> DirectCollocationCompiled
+    for ocp_runtime::CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq>
 where
     X: Vectorize<SX, Rebind<SX> = X> + Clone,
     U: Vectorize<SX, Rebind<SX> = U> + Clone,
@@ -6830,86 +6628,10 @@ where
     C: Vectorize<SX, Rebind<SX> = C>,
     Beq: Vectorize<SX, Rebind<SX> = Beq>,
     Bineq: Vectorize<SX, Rebind<SX> = Bineq>,
-    optimal_control::Mesh<X, N>: Vectorize<SX, Rebind<SX> = optimal_control::Mesh<X, N>>,
-    optimal_control::Mesh<U, N>: Vectorize<SX, Rebind<SX> = optimal_control::Mesh<U, N>>,
-    optimal_control::IntervalGrid<X, N, K>:
-        Vectorize<SX, Rebind<SX> = optimal_control::IntervalGrid<X, N, K>>,
-    optimal_control::IntervalGrid<U, N, K>:
-        Vectorize<SX, Rebind<SX> = optimal_control::IntervalGrid<U, N, K>>,
-    optimal_control::IntervalGrid<C, N, K>:
-        Vectorize<SX, Rebind<SX> = optimal_control::IntervalGrid<C, N, K>>,
-    (
-        optimal_control::Mesh<X, N>,
-        optimal_control::Mesh<U, N>,
-        optimal_control::IntervalGrid<X, N, K>,
-        optimal_control::IntervalGrid<U, N, K>,
-        optimal_control::IntervalGrid<U, N, K>,
-        SX,
-    ): Vectorize<
-            SX,
-            Rebind<SX> = (
-                optimal_control::Mesh<X, N>,
-                optimal_control::Mesh<U, N>,
-                optimal_control::IntervalGrid<X, N, K>,
-                optimal_control::IntervalGrid<U, N, K>,
-                optimal_control::IntervalGrid<U, N, K>,
-                SX,
-            ),
-            Rebind<f64> = (
-                optimal_control::Mesh<Numeric<X>, N>,
-                optimal_control::Mesh<Numeric<U>, N>,
-                optimal_control::IntervalGrid<Numeric<X>, N, K>,
-                optimal_control::IntervalGrid<Numeric<U>, N, K>,
-                optimal_control::IntervalGrid<Numeric<U>, N, K>,
-                f64,
-            ),
-        >,
-    <(
-        optimal_control::Mesh<X, N>,
-        optimal_control::Mesh<U, N>,
-        optimal_control::IntervalGrid<X, N, K>,
-        optimal_control::IntervalGrid<U, N, K>,
-        optimal_control::IntervalGrid<U, N, K>,
-        SX,
-    ) as Vectorize<SX>>::Rebind<Option<f64>>: Vectorize<Option<f64>>,
-    (
-        [X; N],
-        [U; N],
-        optimal_control::IntervalGrid<X, N, K>,
-        optimal_control::IntervalGrid<U, N, K>,
-    ): Vectorize<
-            SX,
-            Rebind<SX> = (
-                [X; N],
-                [U; N],
-                optimal_control::IntervalGrid<X, N, K>,
-                optimal_control::IntervalGrid<U, N, K>,
-            ),
-        >,
-    (Beq, Bineq, optimal_control::IntervalGrid<C, N, K>): Vectorize<
-            SX,
-            Rebind<SX> = (Beq, Bineq, optimal_control::IntervalGrid<C, N, K>),
-            Rebind<f64> = (
-                Numeric<Beq>,
-                Numeric<Bineq>,
-                optimal_control::IntervalGrid<Numeric<C>, N, K>,
-            ),
-        >,
-    <(Beq, Bineq, optimal_control::IntervalGrid<C, N, K>) as Vectorize<SX>>::Rebind<Option<f64>>:
-        Vectorize<Option<f64>>,
-    (P, Beq): Vectorize<SX, Rebind<SX> = (P, Beq), Rebind<f64> = (Numeric<P>, Numeric<Beq>)>,
-    [X; N]: Vectorize<SX, Rebind<SX> = [X; N]>,
-    [U; N]: Vectorize<SX, Rebind<SX> = [U; N]>,
-    <optimal_control::IntervalGrid<X, N, K> as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
-    <optimal_control::IntervalGrid<U, N, K> as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
-    <[X; N] as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
-    <[U; N] as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
     Numeric<X>: Vectorize<f64, Rebind<f64> = Numeric<X>> + Clone,
     Numeric<U>: Vectorize<f64, Rebind<f64> = Numeric<U>> + Clone,
     Numeric<P>: Vectorize<f64, Rebind<f64> = Numeric<P>> + Clone,
     Numeric<Beq>: Vectorize<f64, Rebind<f64> = Numeric<Beq>> + Clone,
-    Numeric<Bineq>: Vectorize<f64, Rebind<f64> = Numeric<Bineq>>,
-    Numeric<C>: Vectorize<f64, Rebind<f64> = Numeric<C>>,
     <C as Vectorize<SX>>::Rebind<Bounds1D>:
         Vectorize<Bounds1D, Rebind<Bounds1D> = <C as Vectorize<SX>>::Rebind<Bounds1D>>,
     <Bineq as Vectorize<SX>>::Rebind<Bounds1D>:
@@ -6931,13 +6653,10 @@ where
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
-            K,
         >,
         options: &ClarabelSqpOptions,
-    ) -> Result<optimal_control::DirectCollocationSqpSolveResult<Self::XNum, Self::UNum, N, K>>
-    {
-        CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq, N, K>::solve_sqp(
+    ) -> Result<DirectCollocationSqpSolveResult<Self::XNum, Self::UNum>> {
+        ocp_runtime::CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq>::solve_sqp(
             self, values, options,
         )
         .map_err(Into::into)
@@ -6952,16 +6671,14 @@ where
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
-            K,
         >,
         options: &ClarabelSqpOptions,
         callback: CB,
-    ) -> Result<optimal_control::DirectCollocationSqpSolveResult<Self::XNum, Self::UNum, N, K>>
+    ) -> Result<DirectCollocationSqpSolveResult<Self::XNum, Self::UNum>>
     where
-        CB: FnMut(&DirectCollocationSqpSnapshot<Self::XNum, Self::UNum, N, K>),
+        CB: FnMut(&DirectCollocationSqpSnapshot<Self::XNum, Self::UNum>),
     {
-        CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq, N, K>::solve_sqp_with_callback(
+        ocp_runtime::CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq>::solve_sqp_with_callback(
             self, values, options, callback,
         )
         .map_err(Into::into)
@@ -6976,14 +6693,10 @@ where
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
-            K,
         >,
         options: &InteriorPointOptions,
-    ) -> Result<
-        optimal_control::DirectCollocationInteriorPointSolveResult<Self::XNum, Self::UNum, N, K>,
-    > {
-        CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq, N, K>::solve_interior_point(
+    ) -> Result<DirectCollocationInteriorPointSolveResult<Self::XNum, Self::UNum>> {
+        ocp_runtime::CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq>::solve_interior_point(
             self, values, options,
         )
         .map_err(Into::into)
@@ -6998,18 +6711,14 @@ where
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
-            K,
         >,
         options: &InteriorPointOptions,
         callback: CB,
-    ) -> Result<
-        optimal_control::DirectCollocationInteriorPointSolveResult<Self::XNum, Self::UNum, N, K>,
-    >
+    ) -> Result<DirectCollocationInteriorPointSolveResult<Self::XNum, Self::UNum>>
     where
-        CB: FnMut(&DirectCollocationInteriorPointSnapshot<Self::XNum, Self::UNum, N, K>),
+        CB: FnMut(&DirectCollocationInteriorPointSnapshot<Self::XNum, Self::UNum>),
     {
-        CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq, N, K>::solve_interior_point_with_callback(
+        ocp_runtime::CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq>::solve_interior_point_with_callback(
             self,
             values,
             options,
@@ -7028,13 +6737,10 @@ where
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
-            K,
         >,
         options: &IpoptOptions,
-    ) -> Result<optimal_control::DirectCollocationIpoptSolveResult<Self::XNum, Self::UNum, N, K>>
-    {
-        CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq, N, K>::solve_ipopt(
+    ) -> Result<DirectCollocationIpoptSolveResult<Self::XNum, Self::UNum>> {
+        ocp_runtime::CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq>::solve_ipopt(
             self, values, options,
         )
         .map_err(Into::into)
@@ -7050,16 +6756,14 @@ where
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
-            K,
         >,
         options: &IpoptOptions,
         callback: CB,
-    ) -> Result<optimal_control::DirectCollocationIpoptSolveResult<Self::XNum, Self::UNum, N, K>>
+    ) -> Result<DirectCollocationIpoptSolveResult<Self::XNum, Self::UNum>>
     where
-        CB: FnMut(&DirectCollocationIpoptSnapshot<Self::XNum, Self::UNum, N, K>),
+        CB: FnMut(&DirectCollocationIpoptSnapshot<Self::XNum, Self::UNum>),
     {
-        CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq, N, K>::solve_ipopt_with_callback(
+        ocp_runtime::CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq>::solve_ipopt_with_callback(
             self, values, options, callback,
         )
         .map_err(Into::into)
@@ -7074,13 +6778,11 @@ where
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
-            K,
         >,
-        trajectories: &DirectCollocationTrajectories<Self::XNum, Self::UNum, N, K>,
+        trajectories: &DirectCollocationTrajectories<Self::XNum, Self::UNum>,
         tolerance: f64,
     ) -> Result<OcpConstraintViolationReport> {
-        CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq, N, K>::rank_constraint_violations(
+        ocp_runtime::CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq>::rank_constraint_violations(
             self,
             values,
             trajectories,
@@ -7098,14 +6800,12 @@ where
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
-            K,
         >,
         equality_multipliers: &[f64],
         inequality_multipliers: &[f64],
         options: FiniteDifferenceValidationOptions,
     ) -> Result<NlpDerivativeValidationReport> {
-        CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq, N, K>::validate_nlp_derivatives(
+        ocp_runtime::CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq>::validate_nlp_derivatives(
             self,
             values,
             equality_multipliers,
@@ -7124,8 +6824,6 @@ where
             Self::BineqBounds,
             Self::XNum,
             Self::UNum,
-            N,
-            K,
         >,
         options: NlpEvaluationBenchmarkOptions,
         on_progress: CB,
@@ -7133,7 +6831,7 @@ where
     where
         CB: FnMut(NlpEvaluationKernelKind),
     {
-        CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq, N, K>::benchmark_nlp_evaluations_with_progress(
+        ocp_runtime::CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq>::benchmark_nlp_evaluations_with_progress(
             self,
             values,
             options,
@@ -7143,7 +6841,7 @@ where
     }
 }
 
-pub fn solve_multiple_shooting_problem<Compiled, Build, const N: usize>(
+pub fn solve_multiple_shooting_problem<Compiled, Build>(
     compiled: &Compiled,
     runtime: &MultipleShootingRuntimeValues<
         Compiled::PNum,
@@ -7152,16 +6850,15 @@ pub fn solve_multiple_shooting_problem<Compiled, Build, const N: usize>(
         Compiled::BineqBounds,
         Compiled::XNum,
         Compiled::UNum,
-        N,
     >,
     solver_method: SolverMethod,
     solver_config: &SolverConfig,
     mut build_artifact: Build,
 ) -> Result<SolveArtifact>
 where
-    Compiled: MultipleShootingCompiled<N>,
+    Compiled: MultipleShootingCompiled,
     Build: FnMut(
-        &MultipleShootingTrajectories<Compiled::XNum, Compiled::UNum, N>,
+        &MultipleShootingTrajectories<Compiled::XNum, Compiled::UNum>,
         &[IntervalArc<Compiled::XNum>],
         &[IntervalArc<Compiled::UNum>],
     ) -> SolveArtifact,
@@ -7226,7 +6923,7 @@ where
     }
 }
 
-pub fn solve_cached_multiple_shooting_problem<Compiled, Build, const N: usize>(
+pub fn solve_cached_multiple_shooting_problem<Compiled, Build>(
     compiled: &Rc<RefCell<Compiled>>,
     runtime: &MultipleShootingRuntimeValues<
         Compiled::PNum,
@@ -7235,16 +6932,15 @@ pub fn solve_cached_multiple_shooting_problem<Compiled, Build, const N: usize>(
         Compiled::BineqBounds,
         Compiled::XNum,
         Compiled::UNum,
-        N,
     >,
     solver_method: SolverMethod,
     solver_config: &SolverConfig,
     build_artifact: Build,
 ) -> Result<SolveArtifact>
 where
-    Compiled: MultipleShootingCompiled<N>,
+    Compiled: MultipleShootingCompiled,
     Build: FnMut(
-        &MultipleShootingTrajectories<Compiled::XNum, Compiled::UNum, N>,
+        &MultipleShootingTrajectories<Compiled::XNum, Compiled::UNum>,
         &[IntervalArc<Compiled::XNum>],
         &[IntervalArc<Compiled::UNum>],
     ) -> SolveArtifact,
@@ -7259,7 +6955,7 @@ where
     )
 }
 
-pub fn solve_multiple_shooting_problem_with_progress<Compiled, Emit, Build, const N: usize>(
+pub fn solve_multiple_shooting_problem_with_progress<Compiled, Emit, Build>(
     compiled: &Compiled,
     runtime: &MultipleShootingRuntimeValues<
         Compiled::PNum,
@@ -7268,7 +6964,6 @@ pub fn solve_multiple_shooting_problem_with_progress<Compiled, Emit, Build, cons
         Compiled::BineqBounds,
         Compiled::XNum,
         Compiled::UNum,
-        N,
     >,
     solver_method: SolverMethod,
     solver_config: &SolverConfig,
@@ -7277,10 +6972,10 @@ pub fn solve_multiple_shooting_problem_with_progress<Compiled, Emit, Build, cons
     build_artifact: Build,
 ) -> Result<SolveArtifact>
 where
-    Compiled: MultipleShootingCompiled<N>,
+    Compiled: MultipleShootingCompiled,
     Emit: FnMut(SolveStreamEvent) + Send,
     Build: FnMut(
-        &MultipleShootingTrajectories<Compiled::XNum, Compiled::UNum, N>,
+        &MultipleShootingTrajectories<Compiled::XNum, Compiled::UNum>,
         &[IntervalArc<Compiled::XNum>],
         &[IntervalArc<Compiled::UNum>],
     ) -> SolveArtifact,
@@ -7597,7 +7292,7 @@ where
     }
 }
 
-pub fn solve_cached_multiple_shooting_problem_with_progress<Compiled, Emit, Build, const N: usize>(
+pub fn solve_cached_multiple_shooting_problem_with_progress<Compiled, Emit, Build>(
     compiled: &Rc<RefCell<Compiled>>,
     runtime: &MultipleShootingRuntimeValues<
         Compiled::PNum,
@@ -7606,7 +7301,6 @@ pub fn solve_cached_multiple_shooting_problem_with_progress<Compiled, Emit, Buil
         Compiled::BineqBounds,
         Compiled::XNum,
         Compiled::UNum,
-        N,
     >,
     solver_method: SolverMethod,
     solver_config: &SolverConfig,
@@ -7615,10 +7309,10 @@ pub fn solve_cached_multiple_shooting_problem_with_progress<Compiled, Emit, Buil
     build_artifact: Build,
 ) -> Result<SolveArtifact>
 where
-    Compiled: MultipleShootingCompiled<N>,
+    Compiled: MultipleShootingCompiled,
     Emit: FnMut(SolveStreamEvent) + Send,
     Build: FnMut(
-        &MultipleShootingTrajectories<Compiled::XNum, Compiled::UNum, N>,
+        &MultipleShootingTrajectories<Compiled::XNum, Compiled::UNum>,
         &[IntervalArc<Compiled::XNum>],
         &[IntervalArc<Compiled::UNum>],
     ) -> SolveArtifact,
@@ -7635,7 +7329,7 @@ where
     )
 }
 
-pub fn solve_direct_collocation_problem<Compiled, Build, const N: usize, const K: usize>(
+pub fn solve_direct_collocation_problem<Compiled, Build>(
     compiled: &Compiled,
     runtime: &DirectCollocationRuntimeValues<
         Compiled::PNum,
@@ -7644,18 +7338,16 @@ pub fn solve_direct_collocation_problem<Compiled, Build, const N: usize, const K
         Compiled::BineqBounds,
         Compiled::XNum,
         Compiled::UNum,
-        N,
-        K,
     >,
     solver_method: SolverMethod,
     solver_config: &SolverConfig,
     mut build_artifact: Build,
 ) -> Result<SolveArtifact>
 where
-    Compiled: DirectCollocationCompiled<N, K>,
+    Compiled: DirectCollocationCompiled,
     Build: FnMut(
-        &DirectCollocationTrajectories<Compiled::XNum, Compiled::UNum, N, K>,
-        &DirectCollocationTimeGrid<N, K>,
+        &DirectCollocationTrajectories<Compiled::XNum, Compiled::UNum>,
+        &DirectCollocationTimeGrid,
     ) -> SolveArtifact,
 {
     let started = Instant::now();
@@ -7712,7 +7404,7 @@ where
     }
 }
 
-pub fn solve_cached_direct_collocation_problem<Compiled, Build, const N: usize, const K: usize>(
+pub fn solve_cached_direct_collocation_problem<Compiled, Build>(
     compiled: &Rc<RefCell<Compiled>>,
     runtime: &DirectCollocationRuntimeValues<
         Compiled::PNum,
@@ -7721,18 +7413,16 @@ pub fn solve_cached_direct_collocation_problem<Compiled, Build, const N: usize, 
         Compiled::BineqBounds,
         Compiled::XNum,
         Compiled::UNum,
-        N,
-        K,
     >,
     solver_method: SolverMethod,
     solver_config: &SolverConfig,
     build_artifact: Build,
 ) -> Result<SolveArtifact>
 where
-    Compiled: DirectCollocationCompiled<N, K>,
+    Compiled: DirectCollocationCompiled,
     Build: FnMut(
-        &DirectCollocationTrajectories<Compiled::XNum, Compiled::UNum, N, K>,
-        &DirectCollocationTimeGrid<N, K>,
+        &DirectCollocationTrajectories<Compiled::XNum, Compiled::UNum>,
+        &DirectCollocationTimeGrid,
     ) -> SolveArtifact,
 {
     let compiled = compiled.borrow();
@@ -7745,13 +7435,7 @@ where
     )
 }
 
-pub fn solve_direct_collocation_problem_with_progress<
-    Compiled,
-    Emit,
-    Build,
-    const N: usize,
-    const K: usize,
->(
+pub fn solve_direct_collocation_problem_with_progress<Compiled, Emit, Build>(
     compiled: &Compiled,
     runtime: &DirectCollocationRuntimeValues<
         Compiled::PNum,
@@ -7760,8 +7444,6 @@ pub fn solve_direct_collocation_problem_with_progress<
         Compiled::BineqBounds,
         Compiled::XNum,
         Compiled::UNum,
-        N,
-        K,
     >,
     solver_method: SolverMethod,
     solver_config: &SolverConfig,
@@ -7770,11 +7452,11 @@ pub fn solve_direct_collocation_problem_with_progress<
     build_artifact: Build,
 ) -> Result<SolveArtifact>
 where
-    Compiled: DirectCollocationCompiled<N, K>,
+    Compiled: DirectCollocationCompiled,
     Emit: FnMut(SolveStreamEvent) + Send,
     Build: FnMut(
-        &DirectCollocationTrajectories<Compiled::XNum, Compiled::UNum, N, K>,
-        &DirectCollocationTimeGrid<N, K>,
+        &DirectCollocationTrajectories<Compiled::XNum, Compiled::UNum>,
+        &DirectCollocationTimeGrid,
     ) -> SolveArtifact,
 {
     let started = Instant::now();
@@ -8054,13 +7736,7 @@ where
     }
 }
 
-pub fn solve_cached_direct_collocation_problem_with_progress<
-    Compiled,
-    Emit,
-    Build,
-    const N: usize,
-    const K: usize,
->(
+pub fn solve_cached_direct_collocation_problem_with_progress<Compiled, Emit, Build>(
     compiled: &Rc<RefCell<Compiled>>,
     runtime: &DirectCollocationRuntimeValues<
         Compiled::PNum,
@@ -8069,8 +7745,6 @@ pub fn solve_cached_direct_collocation_problem_with_progress<
         Compiled::BineqBounds,
         Compiled::XNum,
         Compiled::UNum,
-        N,
-        K,
     >,
     solver_method: SolverMethod,
     solver_config: &SolverConfig,
@@ -8079,11 +7753,11 @@ pub fn solve_cached_direct_collocation_problem_with_progress<
     build_artifact: Build,
 ) -> Result<SolveArtifact>
 where
-    Compiled: DirectCollocationCompiled<N, K>,
+    Compiled: DirectCollocationCompiled,
     Emit: FnMut(SolveStreamEvent) + Send,
     Build: FnMut(
-        &DirectCollocationTrajectories<Compiled::XNum, Compiled::UNum, N, K>,
-        &DirectCollocationTimeGrid<N, K>,
+        &DirectCollocationTrajectories<Compiled::XNum, Compiled::UNum>,
+        &DirectCollocationTimeGrid,
     ) -> SolveArtifact,
 {
     let compiled = compiled.borrow();

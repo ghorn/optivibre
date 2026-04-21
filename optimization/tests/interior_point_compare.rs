@@ -9,6 +9,7 @@ use optimization::{
 };
 use rstest::rstest;
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 #[path = "support/generated_problem.rs"]
 mod generated_problem;
@@ -358,16 +359,21 @@ fn assert_local_spral_ipopt_environment(provenance: &optimization::IpoptProvenan
     assert_eq!(provenance.linear_solver_default.as_deref(), Some("spral"));
 }
 
-fn assert_accepted_trace_parity(
-    problem_name: &str,
-    native: &optimization::InteriorPointSummary,
-    ipopt: &optimization::IpoptSummary,
+#[derive(Clone, Copy)]
+struct AcceptedTraceParityTolerances {
     max_iteration_gap: usize,
     max_step_tag_mismatches: usize,
     max_primal_log_gap: f64,
     max_dual_log_gap: f64,
     max_mu_log_gap: f64,
     max_regularization_log_gap: f64,
+}
+
+fn assert_accepted_trace_parity(
+    problem_name: &str,
+    native: &optimization::InteriorPointSummary,
+    ipopt: &optimization::IpoptSummary,
+    tolerances: AcceptedTraceParityTolerances,
 ) {
     const PRIMAL_TRACE_FLOOR: f64 = 1.0e-6;
     const REGULARIZATION_TRACE_FLOOR: f64 = 1.0e-20;
@@ -378,7 +384,7 @@ fn assert_accepted_trace_parity(
     }
     let iteration_gap = native_trace.len().abs_diff(ipopt_trace.len());
     assert!(
-        iteration_gap <= max_iteration_gap,
+        iteration_gap <= tolerances.max_iteration_gap,
         "{problem_name} accepted-step count mismatch: native={} ipopt={}",
         native_trace.len(),
         ipopt_trace.len(),
@@ -386,7 +392,8 @@ fn assert_accepted_trace_parity(
     let compared = native_trace.len().min(ipopt_trace.len());
     let mut step_tag_mismatches = 0usize;
     let mut max_dual_gap_observed = 0.0f64;
-    let strict_step_trace = max_iteration_gap == 0 && max_step_tag_mismatches == 0;
+    let strict_step_trace =
+        tolerances.max_iteration_gap == 0 && tolerances.max_step_tag_mismatches == 0;
     for (native_point, ipopt_point) in native_trace.iter().zip(ipopt_trace.iter()) {
         if let (Some(native_tag), Some(ipopt_tag)) = (&native_point.step_tag, &ipopt_point.step_tag)
             && native_tag != ipopt_tag
@@ -398,7 +405,7 @@ fn assert_accepted_trace_parity(
                 native_point.primal_inf,
                 ipopt_point.primal_inf,
                 PRIMAL_TRACE_FLOOR,
-            ) <= max_primal_log_gap,
+            ) <= tolerances.max_primal_log_gap,
             "{problem_name} primal trace diverged at accepted iter {} (native iter {} / ipopt iter {}): native={} ipopt={}",
             native_point.iteration.min(ipopt_point.iteration),
             native_point.iteration,
@@ -423,7 +430,7 @@ fn assert_accepted_trace_parity(
                     native_point.barrier_parameter,
                     ipopt_point.barrier_parameter,
                     1.0e-16,
-                ) <= max_mu_log_gap,
+                ) <= tolerances.max_mu_log_gap,
                 "{problem_name} barrier trace diverged at accepted iter {} (native iter {} / ipopt iter {}): native={} ipopt={}",
                 native_point.iteration.min(ipopt_point.iteration),
                 native_point.iteration,
@@ -438,7 +445,7 @@ fn assert_accepted_trace_parity(
             REGULARIZATION_TRACE_FLOOR,
         ) {
             assert!(
-                regularization_gap <= max_regularization_log_gap,
+                regularization_gap <= tolerances.max_regularization_log_gap,
                 "{problem_name} regularization trace diverged at accepted iter {} (native iter {} / ipopt iter {}): native={} ipopt={} log_gap={regularization_gap:.3}",
                 native_point.iteration.min(ipopt_point.iteration),
                 native_point.iteration,
@@ -472,12 +479,13 @@ fn assert_accepted_trace_parity(
         }
     }
     assert!(
-        step_tag_mismatches <= max_step_tag_mismatches,
+        step_tag_mismatches <= tolerances.max_step_tag_mismatches,
         "{problem_name} step-tag mismatches too large: {step_tag_mismatches} over {compared} accepted steps",
     );
     assert!(
-        max_dual_gap_observed <= max_dual_log_gap,
-        "{problem_name} dual trace gap exceeds budget: max_gap={max_dual_gap_observed:.3} budget={max_dual_log_gap:.3}",
+        max_dual_gap_observed <= tolerances.max_dual_log_gap,
+        "{problem_name} dual trace gap exceeds budget: max_gap={max_dual_gap_observed:.3} budget={:.3}",
+        tolerances.max_dual_log_gap,
     );
 }
 
@@ -558,6 +566,29 @@ fn build_problem_ok(
 
 fn compare_verbose_requested() -> bool {
     std::env::var_os("AD_CODEGEN_COMPARE_VERBOSE").is_some()
+}
+
+fn native_spral_available() -> bool {
+    static AVAILABLE: OnceLock<Result<(), String>> = OnceLock::new();
+    match AVAILABLE.get_or_init(|| {
+        spral_ssids::NativeSpral::load()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("skipping native SPRAL/IPOPT comparison: {error}");
+            false
+        }
+    }
+}
+
+macro_rules! skip_without_native_spral {
+    () => {
+        if !native_spral_available() {
+            return;
+        }
+    };
 }
 
 fn native_options() -> InteriorPointOptions {
@@ -709,6 +740,7 @@ fn solve_ipopt_ok<P: CompiledNlpProblem>(
 fn compare_native_and_ipopt_on_equality_constrained_rosenbrock(
     #[values(CallbackBackend::Aot, CallbackBackend::Jit)] backend: CallbackBackend,
 ) {
+    skip_without_native_spral!();
     let problem = build_problem_ok(constrained_rosenbrock_problem(backend), backend);
     let native = solve_native_ok(&problem, &[0.5, 0.5], &[]);
     let ipopt = solve_ipopt_ok(&problem, &[0.5, 0.5], &[]);
@@ -726,6 +758,7 @@ fn compare_native_and_ipopt_on_equality_constrained_rosenbrock(
 fn compare_native_and_ipopt_on_casadi_rosenbrock_example(
     #[values(CallbackBackend::Aot, CallbackBackend::Jit)] backend: CallbackBackend,
 ) {
+    skip_without_native_spral!();
     let problem = build_problem_ok(casadi_rosenbrock_nlp_problem(backend), backend);
     let native = solve_native_ok(&problem, &[2.5, 3.0, 0.75], &[]);
     let ipopt = solve_ipopt_ok(&problem, &[2.5, 3.0, 0.75], &[]);
@@ -743,6 +776,7 @@ fn compare_native_and_ipopt_on_casadi_rosenbrock_example(
 fn compare_native_and_ipopt_on_simple_nlp(
     #[values(CallbackBackend::Aot, CallbackBackend::Jit)] backend: CallbackBackend,
 ) {
+    skip_without_native_spral!();
     let problem = build_problem_ok(simple_nlp_problem(backend), backend);
     let native = solve_native_ok(&problem, &[0.0, 0.0], &[]);
     let ipopt = solve_ipopt_ok(&problem, &[0.0, 0.0], &[]);
@@ -753,6 +787,7 @@ fn compare_native_and_ipopt_on_simple_nlp(
 fn compare_native_and_ipopt_on_hs021(
     #[values(CallbackBackend::Aot, CallbackBackend::Jit)] backend: CallbackBackend,
 ) {
+    skip_without_native_spral!();
     let problem = build_problem_ok(hs021_problem(backend), backend);
     let native = solve_native_ok(&problem, &[2.0, 2.0], &[]);
     let ipopt = solve_ipopt_ok(&problem, &[2.0, 2.0], &[]);
@@ -763,6 +798,7 @@ fn compare_native_and_ipopt_on_hs021(
 fn compare_native_and_ipopt_on_hs035(
     #[values(CallbackBackend::Aot, CallbackBackend::Jit)] backend: CallbackBackend,
 ) {
+    skip_without_native_spral!();
     let problem = build_problem_ok(hs035_problem(backend), backend);
     let native = solve_native_ok(&problem, &[0.5, 0.5, 0.5], &[]);
     let ipopt = solve_ipopt_ok(&problem, &[0.5, 0.5, 0.5], &[]);
@@ -773,6 +809,7 @@ fn compare_native_and_ipopt_on_hs035(
 fn compare_native_and_ipopt_on_hs071(
     #[values(CallbackBackend::Aot, CallbackBackend::Jit)] backend: CallbackBackend,
 ) {
+    skip_without_native_spral!();
     let problem = build_problem_ok(hs071_problem(backend), backend);
     let native =
         solve_native_with_options_ok(&problem, &[1.0, 5.0, 5.0, 1.0], &[], hs071_native_options());
@@ -784,6 +821,7 @@ fn compare_native_and_ipopt_on_hs071(
 fn compare_native_and_ipopt_on_parameterized_problem(
     #[values(CallbackBackend::Aot, CallbackBackend::Jit)] backend: CallbackBackend,
 ) {
+    skip_without_native_spral!();
     let problem = build_problem_ok(parameterized_quadratic_problem(backend), backend);
     let parameter_values = [0.2, 0.8];
     let parameter_ccs = parameterized_quadratic_parameter_ccs();
@@ -807,6 +845,7 @@ fn compare_native_and_ipopt_on_parameterized_problem(
 fn compare_native_and_ipopt_on_hanging_chain(
     #[values(CallbackBackend::Aot, CallbackBackend::Jit)] backend: CallbackBackend,
 ) {
+    skip_without_native_spral!();
     let problem = build_problem_ok(hanging_chain_problem(backend), backend);
     let x0 = hanging_chain_initial_guess();
     let native = solve_native_ok(&problem, &x0, &[]);
@@ -816,17 +855,20 @@ fn compare_native_and_ipopt_on_hanging_chain(
         "hanging_chain",
         &native,
         &ipopt,
-        0,
-        0,
-        0.05,
-        0.05,
-        0.05,
-        0.05,
+        AcceptedTraceParityTolerances {
+            max_iteration_gap: 0,
+            max_step_tag_mismatches: 0,
+            max_primal_log_gap: 0.05,
+            max_dual_log_gap: 0.05,
+            max_mu_log_gap: 0.05,
+            max_regularization_log_gap: 0.05,
+        },
     );
 }
 
 #[test]
 fn compare_native_and_ipopt_on_box_bounds_regression() {
+    skip_without_native_spral!();
     let problem = BoundConstrainedQuadraticProblem;
     let native = solve_native_ok(&problem, &[-10.0, 10.0], &[]);
     let ipopt = solve_ipopt_ok(&problem, &[-10.0, 10.0], &[]);
@@ -835,6 +877,7 @@ fn compare_native_and_ipopt_on_box_bounds_regression() {
 
 #[test]
 fn compare_native_and_ipopt_on_linearly_constrained_quadratic_trace() {
+    skip_without_native_spral!();
     let problem = LinearlyConstrainedQuadraticProblem;
     let native = solve_native_ok(&problem, &[0.1, 0.9], &[]);
     let ipopt = solve_ipopt_ok(&problem, &[0.1, 0.9], &[]);
@@ -850,12 +893,14 @@ fn compare_native_and_ipopt_on_linearly_constrained_quadratic_trace() {
         "linearly_constrained_quadratic",
         &native,
         &ipopt,
-        2,
-        2,
-        1.5,
-        13.0,
-        2.0,
-        1.0,
+        AcceptedTraceParityTolerances {
+            max_iteration_gap: 2,
+            max_step_tag_mismatches: 2,
+            max_primal_log_gap: 1.5,
+            max_dual_log_gap: 13.0,
+            max_mu_log_gap: 2.0,
+            max_regularization_log_gap: 1.0,
+        },
     );
 }
 
