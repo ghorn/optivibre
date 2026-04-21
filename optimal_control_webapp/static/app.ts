@@ -85,12 +85,24 @@ const CONTROL_SEMANTIC = Object.freeze({
   solverNlipSpralZeroPivotAction: 39,
   solverNlipSpralSmallPivot: 40,
   solverNlipSpralPivotU: 41,
+  timeGrid: 42,
+  timeGridStrength: 43,
+  timeGridFocusCenter: 44,
+  timeGridFocusWidth: 45,
+  timeGridBreakpoint: 46,
+  timeGridFirstIntervalFraction: 47,
 } as const);
 const CONTROL_SEMANTIC_FROM_WIRE = Object.freeze({
   transcription_method: CONTROL_SEMANTIC.transcriptionMethod,
   transcription_intervals: CONTROL_SEMANTIC.transcriptionIntervals,
   collocation_family: CONTROL_SEMANTIC.collocationFamily,
   collocation_degree: CONTROL_SEMANTIC.collocationDegree,
+  time_grid: CONTROL_SEMANTIC.timeGrid,
+  time_grid_strength: CONTROL_SEMANTIC.timeGridStrength,
+  time_grid_focus_center: CONTROL_SEMANTIC.timeGridFocusCenter,
+  time_grid_focus_width: CONTROL_SEMANTIC.timeGridFocusWidth,
+  time_grid_breakpoint: CONTROL_SEMANTIC.timeGridBreakpoint,
+  time_grid_first_interval_fraction: CONTROL_SEMANTIC.timeGridFirstIntervalFraction,
   solver_method: CONTROL_SEMANTIC.solverMethod,
   solver_globalization: CONTROL_SEMANTIC.solverGlobalization,
   solver_max_iterations: CONTROL_SEMANTIC.solverMaxIterations,
@@ -245,12 +257,14 @@ const METRIC_KEY = Object.freeze({
   tackCount: 25,
   centerlineError: 26,
   maxCrossTrack: 27,
+  timeGrid: 28,
 } as const);
 const METRIC_KEY_FROM_WIRE = Object.freeze({
   custom: METRIC_KEY.custom,
   transcription_method: METRIC_KEY.transcriptionMethod,
   interval_count: METRIC_KEY.intervalCount,
   collocation_node_count: METRIC_KEY.collocationNodeCount,
+  time_grid: METRIC_KEY.timeGrid,
   termination: METRIC_KEY.termination,
   distance: METRIC_KEY.distance,
   final_time: METRIC_KEY.finalTime,
@@ -304,6 +318,15 @@ const SOLVER_METHOD = Object.freeze({
   sqp: 0,
   nlip: 1,
   ipopt: 2,
+} as const);
+const TIME_GRID = Object.freeze({
+  uniform: 0,
+  cosine: 1,
+  tanh: 2,
+  geometricStart: 3,
+  geometricEnd: 4,
+  focus: 5,
+  piecewise: 6,
 } as const);
 const SOLVER_METHOD_FROM_WIRE = Object.freeze({
   sqp: SOLVER_METHOD.sqp,
@@ -2589,6 +2612,27 @@ function currentTranscriptionMethodValue(): number {
   return currentSharedControlValue(CONTROL_SEMANTIC.transcriptionMethod, 0);
 }
 
+function currentTimeGridValue(): number {
+  return currentSharedControlValue(CONTROL_SEMANTIC.timeGrid, TIME_GRID.uniform);
+}
+
+function currentTimeGridUsesStrength(): boolean {
+  const value = currentTimeGridValue();
+  return value === TIME_GRID.cosine
+    || value === TIME_GRID.tanh
+    || value === TIME_GRID.geometricStart
+    || value === TIME_GRID.geometricEnd
+    || value === TIME_GRID.focus;
+}
+
+function currentTimeGridIsFocus(): boolean {
+  return currentTimeGridValue() === TIME_GRID.focus;
+}
+
+function currentTimeGridIsPiecewise(): boolean {
+  return currentTimeGridValue() === TIME_GRID.piecewise;
+}
+
 function currentSolverMethodValue(): number {
   return currentSharedControlValue(CONTROL_SEMANTIC.solverMethod, SOLVER_METHOD.nlip);
 }
@@ -2641,6 +2685,12 @@ function isStructuralControl(control: ControlSpec): boolean {
     case CONTROL_SEMANTIC.transcriptionIntervals:
     case CONTROL_SEMANTIC.collocationFamily:
     case CONTROL_SEMANTIC.collocationDegree:
+    case CONTROL_SEMANTIC.timeGrid:
+    case CONTROL_SEMANTIC.timeGridStrength:
+    case CONTROL_SEMANTIC.timeGridFocusCenter:
+    case CONTROL_SEMANTIC.timeGridFocusWidth:
+    case CONTROL_SEMANTIC.timeGridBreakpoint:
+    case CONTROL_SEMANTIC.timeGridFirstIntervalFraction:
     case CONTROL_SEMANTIC.sxFunctionOption:
       return true;
     default:
@@ -2746,6 +2796,7 @@ function schedulePrewarm(): void {
 function handleControlUpdate(control: ControlSpec): void {
   if (
     control.semantic === CONTROL_SEMANTIC.transcriptionMethod
+    || control.semantic === CONTROL_SEMANTIC.timeGrid
     || control.semantic === CONTROL_SEMANTIC.solverMethod
     || control.semantic === CONTROL_SEMANTIC.solverGlobalization
     || control.semantic === CONTROL_SEMANTIC.solverNlipLinearSolver
@@ -2759,6 +2810,24 @@ function handleControlUpdate(control: ControlSpec): void {
 }
 
 function isControlVisible(control: ControlSpec): boolean {
+  if (control.semantic === CONTROL_SEMANTIC.timeGridStrength) {
+    return currentTranscriptionMethodValue() === DIRECT_COLLOCATION_VALUE
+      && currentTimeGridUsesStrength();
+  }
+  if (
+    control.semantic === CONTROL_SEMANTIC.timeGridFocusCenter
+    || control.semantic === CONTROL_SEMANTIC.timeGridFocusWidth
+  ) {
+    return currentTranscriptionMethodValue() === DIRECT_COLLOCATION_VALUE
+      && currentTimeGridIsFocus();
+  }
+  if (
+    control.semantic === CONTROL_SEMANTIC.timeGridBreakpoint
+    || control.semantic === CONTROL_SEMANTIC.timeGridFirstIntervalFraction
+  ) {
+    return currentTranscriptionMethodValue() === DIRECT_COLLOCATION_VALUE
+      && currentTimeGridIsPiecewise();
+  }
   if (
     control.semantic === CONTROL_SEMANTIC.solverHessianRegularization
     || control.semantic === CONTROL_SEMANTIC.solverGlobalization

@@ -64,6 +64,7 @@ fn runtime_ms_ocp(
 fn runtime_dc_ocp(
     intervals: usize,
     order: usize,
+    time_grid: optimal_control::runtime::TimeGrid,
 ) -> Ocp<State<SX>, Control<SX>, (), (), State<SX>, (), optimal_control::runtime::DirectCollocation>
 {
     Ocp::new(
@@ -72,6 +73,7 @@ fn runtime_dc_ocp(
             intervals,
             order,
             family: optimal_control::CollocationFamily::RadauIIA,
+            time_grid,
         },
     )
     .objective_lagrange(
@@ -142,9 +144,13 @@ fn runtime_multiple_shooting_compiles_solves_and_projects() {
 fn runtime_direct_collocation_compiles_solves_and_projects() {
     let intervals = 6;
     let order = 2;
-    let compiled = runtime_dc_ocp(intervals, order)
-        .compile_jit()
-        .expect("runtime direct-collocation OCP should compile");
+    let compiled = runtime_dc_ocp(
+        intervals,
+        order,
+        optimal_control::runtime::TimeGrid::Cosine { strength: 0.5 },
+    )
+    .compile_jit()
+    .expect("runtime direct-collocation OCP should compile");
     let runtime = optimal_control::runtime::DirectCollocationRuntimeValues {
         parameters: (),
         beq: State { x: 1.0 },
@@ -162,15 +168,28 @@ fn runtime_direct_collocation_compiles_solves_and_projects() {
         },
         scaling: None,
     };
+    let mut callback_count = 0usize;
+    let mut saw_warped_callback_grid = false;
     let result = compiled
-        .solve_sqp(&runtime, &sqp_options())
+        .solve_sqp_with_callback(&runtime, &sqp_options(), |snapshot| {
+            callback_count += 1;
+            let first_step = snapshot.time_grid.nodes.nodes[1] - snapshot.time_grid.nodes.nodes[0];
+            let second_step = snapshot.time_grid.nodes.nodes[2] - snapshot.time_grid.nodes.nodes[1];
+            saw_warped_callback_grid |= first_step < second_step;
+        })
         .expect("runtime direct-collocation solve should succeed");
 
+    assert!(callback_count > 0);
+    assert!(saw_warped_callback_grid);
     assert_eq!(result.trajectories.x.nodes.len(), intervals);
     assert_eq!(result.trajectories.root_x.intervals.len(), intervals);
     assert_eq!(result.trajectories.root_x.intervals[0].len(), order);
     assert_eq!(result.time_grid.roots.intervals.len(), intervals);
     assert_eq!(result.time_grid.roots.intervals[0].len(), order);
+    assert!(
+        result.time_grid.nodes.nodes[1] - result.time_grid.nodes.nodes[0]
+            < result.time_grid.nodes.nodes[2] - result.time_grid.nodes.nodes[1]
+    );
     assert_abs_diff_eq!(result.trajectories.tf, 1.0, epsilon = 1.0e-9);
     assert!(result.trajectories.x.terminal.x.abs() < 0.5);
 }

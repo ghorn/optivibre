@@ -434,12 +434,14 @@ fn cached_direct_collocation(
             intervals,
             order,
             family,
+            params.transcription.time_grid,
             params.sx_functions,
             |options| {
                 model(DirectCollocation {
                     intervals,
                     order,
                     family,
+                    time_grid: params.transcription.time_grid,
                 })
                 .compile_jit_with_ocp_options(options)
             },
@@ -489,6 +491,7 @@ fn compile_direct_collocation_with_progress(
             intervals,
             order,
             family,
+            params.transcription.time_grid,
             params.sx_functions,
             callback,
             |options, on_progress| {
@@ -496,6 +499,7 @@ fn compile_direct_collocation_with_progress(
                     intervals,
                     order,
                     family,
+                    time_grid: params.transcription.time_grid,
                 })
                 .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
             },
@@ -567,6 +571,7 @@ pub(crate) fn benchmark_default_case_with_progress(
                 intervals: DEFAULT_INTERVALS,
                 order: DEFAULT_COLLOCATION_DEGREE,
                 family,
+                time_grid: Default::default(),
             })
             .compile_jit_with_ocp_options_and_progress_callback(options, on_progress)
         },

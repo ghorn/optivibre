@@ -12,11 +12,91 @@ pub struct MultipleShooting {
     pub rk4_substeps: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TimeGrid {
+    Uniform,
+    Cosine {
+        strength: f64,
+    },
+    Tanh {
+        strength: f64,
+    },
+    Geometric {
+        strength: f64,
+        bias: TimeGridBias,
+    },
+    Focus {
+        center: f64,
+        width: f64,
+        strength: f64,
+    },
+    Piecewise {
+        breakpoint: f64,
+        first_interval_fraction: f64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TimeGridBias {
+    Start,
+    End,
+}
+
+impl TimeGrid {
+    pub const fn uniform() -> Self {
+        Self::Uniform
+    }
+
+    pub const fn cosine(strength: f64) -> Self {
+        Self::Cosine { strength }
+    }
+
+    pub const fn tanh(strength: f64) -> Self {
+        Self::Tanh { strength }
+    }
+
+    pub const fn geometric_start(strength: f64) -> Self {
+        Self::Geometric {
+            strength,
+            bias: TimeGridBias::Start,
+        }
+    }
+
+    pub const fn geometric_end(strength: f64) -> Self {
+        Self::Geometric {
+            strength,
+            bias: TimeGridBias::End,
+        }
+    }
+
+    pub const fn focus(center: f64, width: f64, strength: f64) -> Self {
+        Self::Focus {
+            center,
+            width,
+            strength,
+        }
+    }
+
+    pub const fn piecewise(breakpoint: f64, first_interval_fraction: f64) -> Self {
+        Self::Piecewise {
+            breakpoint,
+            first_interval_fraction,
+        }
+    }
+}
+
+impl Default for TimeGrid {
+    fn default() -> Self {
+        Self::Uniform
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DirectCollocation {
     pub intervals: usize,
     pub order: usize,
     pub family: CollocationFamily,
+    pub time_grid: TimeGrid,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -639,32 +719,379 @@ where
     out
 }
 
-fn mesh_times(tf: f64, intervals: usize) -> Mesh<f64> {
-    let step = tf / intervals as f64;
+fn validate_time_grid(time_grid: TimeGrid) -> Result<(), OcpCompileError> {
+    fn require_unit_interval(value: f64, label: &str) -> Result<(), OcpCompileError> {
+        if !value.is_finite() {
+            return Err(OcpCompileError::InvalidConfiguration(format!(
+                "{label} must be finite"
+            )));
+        }
+        if !(0.0..=1.0).contains(&value) {
+            return Err(OcpCompileError::InvalidConfiguration(format!(
+                "{label} must be in [0, 1]"
+            )));
+        }
+        Ok(())
+    }
+
+    fn require_open_unit_interval(value: f64, label: &str) -> Result<(), OcpCompileError> {
+        if !value.is_finite() {
+            return Err(OcpCompileError::InvalidConfiguration(format!(
+                "{label} must be finite"
+            )));
+        }
+        if !(0.0..1.0).contains(&value) {
+            return Err(OcpCompileError::InvalidConfiguration(format!(
+                "{label} must be in (0, 1)"
+            )));
+        }
+        Ok(())
+    }
+
+    match time_grid {
+        TimeGrid::Uniform => Ok(()),
+        TimeGrid::Cosine { strength }
+        | TimeGrid::Tanh { strength }
+        | TimeGrid::Geometric { strength, .. } => {
+            require_unit_interval(strength, "time-grid strength")?;
+            Ok(())
+        }
+        TimeGrid::Focus {
+            center,
+            width,
+            strength,
+        } => {
+            require_unit_interval(center, "focus time-grid center")?;
+            require_open_unit_interval(width, "focus time-grid width")?;
+            require_unit_interval(strength, "time-grid strength")?;
+            Ok(())
+        }
+        TimeGrid::Piecewise {
+            breakpoint,
+            first_interval_fraction,
+        } => {
+            require_open_unit_interval(breakpoint, "piecewise time-grid breakpoint")?;
+            require_open_unit_interval(
+                first_interval_fraction,
+                "piecewise time-grid first interval fraction",
+            )?;
+            Ok(())
+        }
+    }
+}
+
+fn normalized_nodes_from_interval_weights(weights: &[f64]) -> Vec<f64> {
+    let total = weights.iter().sum::<f64>();
+    let mut nodes = Vec::with_capacity(weights.len() + 1);
+    nodes.push(0.0);
+    let mut cumulative = 0.0;
+    for weight in weights {
+        cumulative += weight / total;
+        nodes.push(cumulative);
+    }
+    if let Some(first) = nodes.first_mut() {
+        *first = 0.0;
+    }
+    if let Some(last) = nodes.last_mut() {
+        *last = 1.0;
+    }
+    nodes
+}
+
+fn normalized_time_grid_nodes(intervals: usize, time_grid: TimeGrid) -> Vec<f64> {
+    if intervals == 0 {
+        return vec![0.0];
+    }
+    match time_grid {
+        TimeGrid::Geometric { strength, bias } => {
+            if intervals == 1 {
+                return vec![0.0, 1.0];
+            }
+            let ratio = 1.0 + 19.0 * strength;
+            let denom = (intervals - 1) as f64;
+            let weights = (0..intervals)
+                .map(|interval| {
+                    let exponent = interval as f64 / denom;
+                    match bias {
+                        TimeGridBias::Start => ratio.powf(exponent),
+                        TimeGridBias::End => ratio.powf(1.0 - exponent),
+                    }
+                })
+                .collect::<Vec<_>>();
+            return normalized_nodes_from_interval_weights(&weights);
+        }
+        TimeGrid::Focus {
+            center,
+            width,
+            strength,
+        } => {
+            let focus_gain = 19.0 * strength;
+            let weights = (0..intervals)
+                .map(|interval| {
+                    let midpoint = (interval as f64 + 0.5) / intervals as f64;
+                    let z = (midpoint - center) / width;
+                    let focus = (-0.5 * z * z).exp();
+                    1.0 / (1.0 + focus_gain * focus)
+                })
+                .collect::<Vec<_>>();
+            return normalized_nodes_from_interval_weights(&weights);
+        }
+        TimeGrid::Piecewise {
+            breakpoint,
+            first_interval_fraction,
+        } => {
+            if intervals == 1 {
+                return vec![0.0, 1.0];
+            }
+            let split_index = ((first_interval_fraction * intervals as f64).round() as usize)
+                .clamp(1, intervals - 1);
+            let split = split_index as f64 / intervals as f64;
+            let mut nodes = (0..=intervals)
+                .map(|index| {
+                    let s = index as f64 / intervals as f64;
+                    if index <= split_index {
+                        breakpoint * s / split
+                    } else {
+                        breakpoint + (1.0 - breakpoint) * (s - split) / (1.0 - split)
+                    }
+                })
+                .collect::<Vec<_>>();
+            nodes[0] = 0.0;
+            nodes[split_index] = breakpoint;
+            nodes[intervals] = 1.0;
+            return nodes;
+        }
+        TimeGrid::Uniform | TimeGrid::Cosine { .. } | TimeGrid::Tanh { .. } => {}
+    }
+
+    let mut nodes = (0..=intervals)
+        .map(|index| {
+            let s = index as f64 / intervals as f64;
+            match time_grid {
+                TimeGrid::Uniform => s,
+                TimeGrid::Cosine { strength } => {
+                    let cosine = 0.5 * (1.0 - (std::f64::consts::PI * s).cos());
+                    (1.0 - strength) * s + strength * cosine
+                }
+                TimeGrid::Tanh { strength } => {
+                    if strength == 0.0 {
+                        s
+                    } else {
+                        let beta = 6.0 * strength;
+                        0.5 * (1.0 + (beta * (2.0 * s - 1.0)).tanh() / beta.tanh())
+                    }
+                }
+                TimeGrid::Geometric { .. }
+                | TimeGrid::Focus { .. }
+                | TimeGrid::Piecewise { .. } => unreachable!("handled above"),
+            }
+        })
+        .collect::<Vec<_>>();
+    nodes[0] = 0.0;
+    nodes[intervals] = 1.0;
+    nodes
+}
+
+fn time_grid_interval_fractions(intervals: usize, time_grid: TimeGrid) -> Vec<f64> {
+    normalized_time_grid_nodes(intervals, time_grid)
+        .windows(2)
+        .map(|window| window[1] - window[0])
+        .collect()
+}
+
+fn time_grid_mesh_unchecked(tf: f64, intervals: usize, time_grid: TimeGrid) -> Mesh<f64> {
+    let normalized = normalized_time_grid_nodes(intervals, time_grid);
     Mesh {
-        nodes: (0..intervals).map(|index| index as f64 * step).collect(),
+        nodes: normalized
+            .iter()
+            .take(intervals)
+            .map(|fraction| fraction * tf)
+            .collect(),
         terminal: tf,
     }
+}
+
+fn mesh_times(tf: f64, intervals: usize) -> Mesh<f64> {
+    time_grid_mesh_unchecked(tf, intervals, TimeGrid::Uniform)
+}
+
+pub fn time_grid_mesh(
+    tf: f64,
+    intervals: usize,
+    time_grid: TimeGrid,
+) -> Result<Mesh<f64>, OcpCompileError> {
+    if intervals == 0 {
+        return Err(OcpCompileError::InvalidConfiguration(
+            "time grid requires at least one interval".to_string(),
+        ));
+    }
+    validate_time_grid(time_grid)?;
+    Ok(time_grid_mesh_unchecked(tf, intervals, time_grid))
+}
+
+pub fn time_grid_mesh_from_interval_weights(
+    tf: f64,
+    weights: &[f64],
+) -> Result<Mesh<f64>, OcpCompileError> {
+    if weights.is_empty() {
+        return Err(OcpCompileError::InvalidConfiguration(
+            "time grid interval weights cannot be empty".to_string(),
+        ));
+    }
+    if weights
+        .iter()
+        .any(|weight| !weight.is_finite() || *weight <= 0.0)
+    {
+        return Err(OcpCompileError::InvalidConfiguration(
+            "time grid interval weights must be finite and positive".to_string(),
+        ));
+    }
+    let normalized = normalized_nodes_from_interval_weights(weights);
+    Ok(Mesh {
+        nodes: normalized
+            .iter()
+            .take(weights.len())
+            .map(|fraction| fraction * tf)
+            .collect(),
+        terminal: tf,
+    })
+}
+
+pub fn adaptive_time_grid_mesh(
+    tf: f64,
+    indicators: &[f64],
+    strength: f64,
+) -> Result<Mesh<f64>, OcpCompileError> {
+    validate_time_grid(TimeGrid::Cosine { strength })?;
+    if indicators.is_empty() {
+        return Err(OcpCompileError::InvalidConfiguration(
+            "adaptive time-grid indicators cannot be empty".to_string(),
+        ));
+    }
+    if indicators
+        .iter()
+        .any(|indicator| !indicator.is_finite() || *indicator < 0.0)
+    {
+        return Err(OcpCompileError::InvalidConfiguration(
+            "adaptive time-grid indicators must be finite and nonnegative".to_string(),
+        ));
+    }
+    let max_indicator = indicators.iter().copied().fold(0.0, f64::max);
+    if max_indicator == 0.0 || strength == 0.0 {
+        return time_grid_mesh(tf, indicators.len(), TimeGrid::Uniform);
+    }
+    let weights = indicators
+        .iter()
+        .map(|indicator| {
+            let normalized = indicator / max_indicator;
+            1.0 / (1.0 + 19.0 * strength * normalized)
+        })
+        .collect::<Vec<_>>();
+    time_grid_mesh_from_interval_weights(tf, &weights)
 }
 
 fn direct_collocation_times(
     tf: f64,
     coeffs: &CollocationCoefficients,
     intervals: usize,
+    time_grid: TimeGrid,
 ) -> DirectCollocationTimeGrid {
-    let step = tf / intervals as f64;
+    let nodes = time_grid_mesh_unchecked(tf, intervals, time_grid);
     DirectCollocationTimeGrid {
-        nodes: mesh_times(tf, intervals),
+        nodes: nodes.clone(),
         roots: IntervalGrid {
             intervals: (0..intervals)
                 .map(|interval| {
+                    let start = nodes.nodes[interval];
+                    let end = if interval + 1 < intervals {
+                        nodes.nodes[interval + 1]
+                    } else {
+                        nodes.terminal
+                    };
+                    let step = end - start;
                     (0..coeffs.nodes.len())
-                        .map(|root| (interval as f64 + coeffs.nodes[root]) * step)
+                        .map(|root| start + coeffs.nodes[root] * step)
                         .collect()
                 })
                 .collect(),
         },
     }
+}
+
+pub fn direct_collocation_time_grid_from_mesh(
+    nodes: Mesh<f64>,
+    family: CollocationFamily,
+    order: usize,
+) -> Result<DirectCollocationTimeGrid, OcpCompileError> {
+    if nodes.nodes.is_empty() {
+        return Err(OcpCompileError::InvalidConfiguration(
+            "direct collocation time grid requires at least one interval".to_string(),
+        ));
+    }
+    if order == 0 {
+        return Err(OcpCompileError::InvalidConfiguration(
+            "direct collocation time grid requires at least one collocation root".to_string(),
+        ));
+    }
+    let mut all_nodes = nodes.nodes.clone();
+    all_nodes.push(nodes.terminal);
+    if all_nodes
+        .windows(2)
+        .any(|window| !window[0].is_finite() || !window[1].is_finite() || window[1] <= window[0])
+    {
+        return Err(OcpCompileError::InvalidConfiguration(
+            "direct collocation time-grid nodes must be finite and strictly increasing".to_string(),
+        ));
+    }
+    let coeffs = collocation_coefficients(family, order)?;
+    Ok(DirectCollocationTimeGrid {
+        nodes,
+        roots: IntervalGrid {
+            intervals: all_nodes
+                .windows(2)
+                .map(|window| {
+                    let start = window[0];
+                    let step = window[1] - start;
+                    coeffs
+                        .nodes
+                        .iter()
+                        .map(|root| start + root * step)
+                        .collect()
+                })
+                .collect(),
+        },
+    })
+}
+
+pub fn direct_collocation_time_grid(
+    tf: f64,
+    scheme: DirectCollocation,
+) -> Result<DirectCollocationTimeGrid, OcpCompileError> {
+    if scheme.intervals == 0 {
+        return Err(OcpCompileError::InvalidConfiguration(
+            "direct collocation time grid requires at least one interval".to_string(),
+        ));
+    }
+    if scheme.order == 0 {
+        return Err(OcpCompileError::InvalidConfiguration(
+            "direct collocation time grid requires at least one collocation root".to_string(),
+        ));
+    }
+    validate_time_grid(scheme.time_grid)?;
+    let coeffs = collocation_coefficients(scheme.family, scheme.order)?;
+    Ok(direct_collocation_times(
+        tf,
+        &coeffs,
+        scheme.intervals,
+        scheme.time_grid,
+    ))
+}
+
+pub fn direct_collocation_root_time_grid(
+    tf: f64,
+    scheme: DirectCollocation,
+) -> Result<IntervalGrid<f64>, OcpCompileError> {
+    Ok(direct_collocation_time_grid(tf, scheme)?.roots)
 }
 
 fn build_promotion_plan_flat(
@@ -2175,13 +2602,14 @@ fn build_direct_collocation_interpolated_guess<X, U>(
     samples: &InterpolatedTrajectory<X, U>,
     coeffs: &CollocationCoefficients,
     intervals: usize,
+    time_grid: TimeGrid,
 ) -> Result<DirectCollocationTrajectories<X, U>, GuessError>
 where
     X: Clone,
     U: Clone,
 {
     validate_interpolation_samples(samples)?;
-    let times = direct_collocation_times(samples.tf, coeffs, intervals);
+    let times = direct_collocation_times(samples.tf, coeffs, intervals, time_grid);
     Ok(DirectCollocationTrajectories {
         x: Mesh {
             nodes: times
@@ -2267,6 +2695,7 @@ fn build_direct_collocation_rollout_guess<X, U, P>(
     controller: &ControllerFn<Numeric<X>, Numeric<U>, Numeric<P>>,
     coeffs: &CollocationCoefficients,
     intervals: usize,
+    time_grid: TimeGrid,
 ) -> Result<DirectCollocationTrajectories<Numeric<X>, Numeric<U>>, GuessError>
 where
     X: Vectorize<SX>,
@@ -2276,7 +2705,7 @@ where
     Numeric<U>: Vectorize<f64, Rebind<f64> = Numeric<U>> + Clone,
     Numeric<P>: Vectorize<f64, Rebind<f64> = Numeric<P>>,
 {
-    let h = tf / intervals as f64;
+    let mesh_times = time_grid_mesh_unchecked(tf, intervals, time_grid);
     let mut x = x0.clone();
     let mut u = u0.clone();
     let mut x_nodes = Vec::with_capacity(intervals);
@@ -2287,7 +2716,13 @@ where
     for interval in 0..intervals {
         x_nodes.push(x.clone());
         u_nodes.push(u.clone());
-        let t = interval as f64 * h;
+        let t = mesh_times.nodes[interval];
+        let interval_end = if interval + 1 < intervals {
+            mesh_times.nodes[interval + 1]
+        } else {
+            mesh_times.terminal
+        };
+        let h = interval_end - t;
         let dudt = controller(t, &x, &u, parameters);
         let mut interval_x = Vec::with_capacity(coeffs.nodes.len());
         let mut interval_u = Vec::with_capacity(coeffs.nodes.len());
@@ -2388,7 +2823,8 @@ where
         coeffs: &CollocationCoefficients,
         symbolic_library: &OcpSymbolicFunctionLibrary,
     ) -> Result<DcTranscription, SxError> {
-        let step = *tf / self.scheme.intervals as f64;
+        let interval_fractions =
+            time_grid_interval_fractions(self.scheme.intervals, self.scheme.time_grid);
         let mut collocation_x =
             Vec::with_capacity(self.scheme.intervals * self.scheme.order * X::LEN);
         let mut collocation_u =
@@ -2399,6 +2835,7 @@ where
         let mut objective = SX::zero();
 
         for interval in 0..self.scheme.intervals {
+            let step = *tf * interval_fractions[interval];
             let x_start = x_mesh.nodes[interval].clone();
             let u_start = u_mesh.nodes[interval].clone();
             let mut basis_x = Vec::with_capacity(self.scheme.order + 1);
@@ -2549,6 +2986,7 @@ where
                 "direct collocation requires at least one collocation root".to_string(),
             ));
         }
+        validate_time_grid(self.scheme.time_grid)?;
         let coefficients = collocation_coefficients(self.scheme.family, self.scheme.order)?;
         let symbolic_library = self.build_symbolic_function_library(options.symbolic_functions)?;
         let decision_symbols = symbolic_dense_vector(
@@ -2864,6 +3302,15 @@ where
         )
     }
 
+    fn time_grid_for_tf(&self, tf: f64) -> DirectCollocationTimeGrid {
+        direct_collocation_times(
+            tf,
+            &self.coefficients,
+            self.scheme.intervals,
+            self.scheme.time_grid,
+        )
+    }
+
     pub fn solve_sqp(
         &self,
         values: &DirectCollocationRuntimeValues<
@@ -2901,11 +3348,7 @@ where
         )
         .map_err(|err| ClarabelSqpError::InvalidInput(err.to_string()))?;
         Ok(DirectCollocationSqpSolveResult {
-            time_grid: direct_collocation_times(
-                trajectories.tf,
-                &self.coefficients,
-                self.scheme.intervals,
-            ),
+            time_grid: self.time_grid_for_tf(trajectories.tf),
             trajectories,
             solver: summary,
             setup_timing: OcpSolveSetupTiming {
@@ -2956,11 +3399,7 @@ where
                 )
                 .expect("solver iterate should match runtime OCP layout");
                 callback(&DirectCollocationSqpSnapshot {
-                    time_grid: direct_collocation_times(
-                        trajectories.tf,
-                        &self.coefficients,
-                        self.scheme.intervals,
-                    ),
+                    time_grid: self.time_grid_for_tf(trajectories.tf),
                     trajectories,
                     solver: snapshot.clone(),
                 });
@@ -2973,11 +3412,7 @@ where
         )
         .map_err(|err| ClarabelSqpError::InvalidInput(err.to_string()))?;
         Ok(DirectCollocationSqpSolveResult {
-            time_grid: direct_collocation_times(
-                trajectories.tf,
-                &self.coefficients,
-                self.scheme.intervals,
-            ),
+            time_grid: self.time_grid_for_tf(trajectories.tf),
             trajectories,
             solver: summary,
             setup_timing: OcpSolveSetupTiming {
@@ -3027,11 +3462,7 @@ where
         )
         .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
         Ok(DirectCollocationInteriorPointSolveResult {
-            time_grid: direct_collocation_times(
-                trajectories.tf,
-                &self.coefficients,
-                self.scheme.intervals,
-            ),
+            time_grid: self.time_grid_for_tf(trajectories.tf),
             trajectories,
             solver: summary,
             setup_timing: OcpSolveSetupTiming {
@@ -3085,11 +3516,7 @@ where
                 )
                 .expect("solver iterate should match runtime OCP layout");
                 callback(&DirectCollocationInteriorPointSnapshot {
-                    time_grid: direct_collocation_times(
-                        trajectories.tf,
-                        &self.coefficients,
-                        self.scheme.intervals,
-                    ),
+                    time_grid: self.time_grid_for_tf(trajectories.tf),
                     trajectories,
                     solver: snapshot.clone(),
                 });
@@ -3102,11 +3529,7 @@ where
         )
         .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
         Ok(DirectCollocationInteriorPointSolveResult {
-            time_grid: direct_collocation_times(
-                trajectories.tf,
-                &self.coefficients,
-                self.scheme.intervals,
-            ),
+            time_grid: self.time_grid_for_tf(trajectories.tf),
             trajectories,
             solver: summary,
             setup_timing: OcpSolveSetupTiming {
@@ -3154,11 +3577,7 @@ where
         )
         .map_err(|err| IpoptSolveError::InvalidInput(err.to_string()))?;
         Ok(DirectCollocationIpoptSolveResult {
-            time_grid: direct_collocation_times(
-                trajectories.tf,
-                &self.coefficients,
-                self.scheme.intervals,
-            ),
+            time_grid: self.time_grid_for_tf(trajectories.tf),
             trajectories,
             solver: summary,
             setup_timing: OcpSolveSetupTiming {
@@ -3209,11 +3628,7 @@ where
                     self.scheme.order,
                 ) {
                     callback(&DirectCollocationIpoptSnapshot {
-                        time_grid: direct_collocation_times(
-                            trajectories.tf,
-                            &self.coefficients,
-                            self.scheme.intervals,
-                        ),
+                        time_grid: self.time_grid_for_tf(trajectories.tf),
                         trajectories,
                         solver: snapshot.clone(),
                     });
@@ -3227,11 +3642,7 @@ where
         )
         .map_err(|err| IpoptSolveError::InvalidInput(err.to_string()))?;
         Ok(DirectCollocationIpoptSolveResult {
-            time_grid: direct_collocation_times(
-                trajectories.tf,
-                &self.coefficients,
-                self.scheme.intervals,
-            ),
+            time_grid: self.time_grid_for_tf(trajectories.tf),
             trajectories,
             solver: summary,
             setup_timing: OcpSolveSetupTiming {
@@ -3445,6 +3856,7 @@ where
                     samples,
                     &self.coefficients,
                     self.scheme.intervals,
+                    self.scheme.time_grid,
                 )?
             }
             DirectCollocationInitialGuess::Rollout {
@@ -3461,6 +3873,7 @@ where
                 controller.as_ref(),
                 &self.coefficients,
                 self.scheme.intervals,
+                self.scheme.time_grid,
             )?,
         };
         Ok(self.flatten_decision(&trajectories))

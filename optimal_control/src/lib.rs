@@ -2184,6 +2184,7 @@ mod tests {
                 intervals: N,
                 order: K,
                 family: CollocationFamily::RadauIIA,
+                time_grid: Default::default(),
             },
         )
         .objective_lagrange(
@@ -2348,6 +2349,156 @@ mod tests {
             mesh.states().cloned().collect::<Vec<_>>(),
             vec![State { x: 1.0, v: 2.0 }, State { x: 3.0, v: 4.0 }]
         );
+    }
+
+    fn time_grid_interval_lengths(mesh: &runtime::Mesh<f64>) -> Vec<f64> {
+        mesh.nodes
+            .iter()
+            .copied()
+            .chain(std::iter::once(mesh.terminal))
+            .collect::<Vec<_>>()
+            .windows(2)
+            .map(|window| window[1] - window[0])
+            .collect()
+    }
+
+    #[test]
+    fn cosine_time_grid_clusters_mesh_nodes_at_both_ends() {
+        let uniform = runtime::time_grid_mesh(1.0, 4, runtime::TimeGrid::Uniform)
+            .expect("uniform time grid should build");
+        let cosine_zero =
+            runtime::time_grid_mesh(1.0, 4, runtime::TimeGrid::Cosine { strength: 0.0 })
+                .expect("zero-strength cosine time grid should build");
+        assert_eq!(uniform, cosine_zero);
+
+        let cosine = runtime::time_grid_mesh(1.0, 4, runtime::TimeGrid::Cosine { strength: 1.0 })
+            .expect("cosine time grid should build");
+        let mut times = cosine.nodes.clone();
+        times.push(cosine.terminal);
+        let intervals = times
+            .windows(2)
+            .map(|window| window[1] - window[0])
+            .collect::<Vec<_>>();
+
+        assert_abs_diff_eq!(times[0], 0.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(times[4], 1.0, epsilon = 1e-12);
+        assert!(intervals[0] < intervals[1]);
+        assert!(intervals[3] < intervals[2]);
+    }
+
+    #[test]
+    fn tanh_time_grid_clusters_mesh_nodes_at_both_ends() {
+        let tanh = runtime::time_grid_mesh(1.0, 8, runtime::TimeGrid::Tanh { strength: 1.0 })
+            .expect("tanh time grid should build");
+        let intervals = time_grid_interval_lengths(&tanh);
+
+        assert!(intervals[0] < intervals[3]);
+        assert!(intervals[7] < intervals[4]);
+    }
+
+    #[test]
+    fn geometric_time_grid_clusters_toward_the_selected_end() {
+        let start = runtime::time_grid_mesh(1.0, 5, runtime::TimeGrid::geometric_start(1.0))
+            .expect("geometric start time grid should build");
+        let end = runtime::time_grid_mesh(1.0, 5, runtime::TimeGrid::geometric_end(1.0))
+            .expect("geometric end time grid should build");
+        let start_intervals = time_grid_interval_lengths(&start);
+        let end_intervals = time_grid_interval_lengths(&end);
+
+        assert!(start_intervals[0] < start_intervals[4]);
+        assert!(end_intervals[4] < end_intervals[0]);
+    }
+
+    #[test]
+    fn focus_time_grid_clusters_near_requested_center() {
+        let focus = runtime::time_grid_mesh(1.0, 9, runtime::TimeGrid::focus(0.5, 0.12, 1.0))
+            .expect("focus time grid should build");
+        let intervals = time_grid_interval_lengths(&focus);
+
+        assert!(intervals[4] < intervals[0]);
+        assert!(intervals[4] < intervals[8]);
+    }
+
+    #[test]
+    fn piecewise_time_grid_places_breakpoint_at_interval_split() {
+        let piecewise = runtime::time_grid_mesh(1.0, 4, runtime::TimeGrid::piecewise(0.25, 0.5))
+            .expect("piecewise time grid should build");
+        let intervals = time_grid_interval_lengths(&piecewise);
+
+        assert_abs_diff_eq!(piecewise.nodes[2], 0.25, epsilon = 1e-12);
+        assert_abs_diff_eq!(intervals[0], intervals[1], epsilon = 1e-12);
+        assert_abs_diff_eq!(intervals[2], intervals[3], epsilon = 1e-12);
+        assert!(intervals[0] < intervals[2]);
+    }
+
+    #[test]
+    fn adaptive_time_grid_mesh_clusters_at_larger_indicators() {
+        let adaptive = runtime::adaptive_time_grid_mesh(1.0, &[0.0, 10.0, 0.0], 1.0)
+            .expect("adaptive time grid should build");
+        let intervals = time_grid_interval_lengths(&adaptive);
+
+        assert!(intervals[1] < intervals[0]);
+        assert!(intervals[1] < intervals[2]);
+    }
+
+    #[test]
+    fn direct_collocation_time_grid_from_mesh_maps_roots_inside_existing_intervals() {
+        let mesh = runtime::Mesh {
+            nodes: vec![0.0, 0.1, 0.5],
+            terminal: 1.0,
+        };
+        let family = CollocationFamily::RadauIIA;
+        let order = 2;
+        let coeffs =
+            collocation_coefficients(family, order).expect("collocation coefficients should build");
+        let grid = runtime::direct_collocation_time_grid_from_mesh(mesh.clone(), family, order)
+            .expect("direct-collocation time grid should build from mesh");
+
+        assert_eq!(grid.nodes, mesh);
+        for interval in 0..grid.nodes.interval_count() {
+            let start = grid.nodes.nodes[interval];
+            let end = if interval + 1 < grid.nodes.interval_count() {
+                grid.nodes.nodes[interval + 1]
+            } else {
+                grid.nodes.terminal
+            };
+            let step = end - start;
+            for (root, &time) in grid.roots.intervals[interval].iter().enumerate() {
+                assert_abs_diff_eq!((time - start) / step, coeffs.nodes[root], epsilon = 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn direct_collocation_time_grid_maps_roots_linearly_inside_warped_intervals() {
+        let scheme = runtime::DirectCollocation {
+            intervals: 4,
+            order: 2,
+            family: CollocationFamily::RadauIIA,
+            time_grid: runtime::TimeGrid::Cosine { strength: 1.0 },
+        };
+        let coeffs = collocation_coefficients(scheme.family, scheme.order)
+            .expect("collocation coefficients should build");
+        let grid = runtime::direct_collocation_time_grid(2.0, scheme)
+            .expect("direct-collocation time grid should build");
+
+        let first_step = grid.nodes.nodes[1] - grid.nodes.nodes[0];
+        let second_step = grid.nodes.nodes[2] - grid.nodes.nodes[1];
+        assert!(first_step < second_step);
+        for interval in 0..scheme.intervals {
+            let start = grid.nodes.nodes[interval];
+            let end = if interval + 1 < scheme.intervals {
+                grid.nodes.nodes[interval + 1]
+            } else {
+                grid.nodes.terminal
+            };
+            let step = end - start;
+            for (root, &time) in grid.roots.intervals[interval].iter().enumerate() {
+                assert!(time >= start);
+                assert!(time <= end);
+                assert_abs_diff_eq!((time - start) / step, coeffs.nodes[root], epsilon = 1e-12);
+            }
+        }
     }
 
     #[test]
