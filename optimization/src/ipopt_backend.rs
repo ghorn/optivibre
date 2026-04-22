@@ -125,6 +125,32 @@ impl IpoptSpralScaling {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IpoptProvenance {
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linked_solver_stack: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linked_ipopt_version: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linked_ipopt_source_commit: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linked_spral_version: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linked_metis_version: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linked_openblas_version: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linked_openblas_threading: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linked_static_solver_math: Option<bool>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linked_ipopt_lib_dir: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linked_spral_lib_dir: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linked_metis_lib_dir: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linked_openblas_lib_dir: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linked_openmp_lib: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub pkg_config_version: Option<String>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub pkg_config_cflags_libs: Option<String>,
@@ -985,6 +1011,7 @@ fn ipopt_linear_solver_default(ipopt_binary: &Path) -> Option<String> {
 }
 
 pub fn capture_ipopt_provenance() -> IpoptProvenance {
+    let linked = ipopt::linked_ipopt_provenance();
     let pkg_config_version = command_stdout({
         let mut command = Command::new("pkg-config");
         command.arg("--modversion").arg("ipopt");
@@ -1000,6 +1027,19 @@ pub fn capture_ipopt_provenance() -> IpoptProvenance {
         .as_deref()
         .and_then(ipopt_linear_solver_default);
     IpoptProvenance {
+        linked_solver_stack: linked.link_mode.map(str::to_string),
+        linked_ipopt_version: linked.ipopt_version.map(str::to_string),
+        linked_ipopt_source_commit: linked.ipopt_source_commit.map(str::to_string),
+        linked_spral_version: linked.spral_version.map(str::to_string),
+        linked_metis_version: linked.metis_version.map(str::to_string),
+        linked_openblas_version: linked.openblas_version.map(str::to_string),
+        linked_openblas_threading: linked.openblas_threading.map(str::to_string),
+        linked_static_solver_math: linked.static_solver_math,
+        linked_ipopt_lib_dir: linked.ipopt_lib_dir.map(str::to_string),
+        linked_spral_lib_dir: linked.spral_lib_dir.map(str::to_string),
+        linked_metis_lib_dir: linked.metis_lib_dir.map(str::to_string),
+        linked_openblas_lib_dir: linked.openblas_lib_dir.map(str::to_string),
+        linked_openmp_lib: linked.openmp_lib.map(str::to_string),
         pkg_config_version,
         pkg_config_cflags_libs,
         ipopt_binary: ipopt_binary.map(|path| path.display().to_string()),

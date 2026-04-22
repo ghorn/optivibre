@@ -128,6 +128,56 @@ use std::ffi::CString;
 use std::fmt::{Debug, Display, Formatter};
 use std::slice;
 
+/// Compile-time provenance for the Ipopt library linked into this Rust crate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LinkedIpoptProvenance {
+    /// Link mode selected by `ipopt-sys`.
+    pub link_mode: Option<&'static str>,
+    /// Ipopt source version, when provided by the native build crate.
+    pub ipopt_version: Option<&'static str>,
+    /// Exact upstream Ipopt source commit, when provided by the native build crate.
+    pub ipopt_source_commit: Option<&'static str>,
+    /// SPRAL source version linked into Ipopt.
+    pub spral_version: Option<&'static str>,
+    /// METIS source version linked into SPRAL.
+    pub metis_version: Option<&'static str>,
+    /// OpenBLAS source version linked into SPRAL and Ipopt.
+    pub openblas_version: Option<&'static str>,
+    /// OpenBLAS threading mode selected by `spral-src`.
+    pub openblas_threading: Option<&'static str>,
+    /// Directory containing the source-built Ipopt archive.
+    pub ipopt_lib_dir: Option<&'static str>,
+    /// Directory containing the source-built SPRAL archive.
+    pub spral_lib_dir: Option<&'static str>,
+    /// Directory containing the source-built METIS archive.
+    pub metis_lib_dir: Option<&'static str>,
+    /// Directory containing the source-built OpenBLAS archive.
+    pub openblas_lib_dir: Option<&'static str>,
+    /// OpenMP runtime library name linked with the source-built stack.
+    pub openmp_lib: Option<&'static str>,
+    /// Whether solver and math libraries are linked from static source-built archives.
+    pub static_solver_math: Option<bool>,
+}
+
+/// Return compile-time provenance for the linked Ipopt solver stack.
+pub fn linked_ipopt_provenance() -> LinkedIpoptProvenance {
+    LinkedIpoptProvenance {
+        link_mode: ffi::IPOPT_LINK_MODE,
+        ipopt_version: ffi::IPOPT_VERSION,
+        ipopt_source_commit: ffi::IPOPT_SOURCE_COMMIT,
+        spral_version: ffi::SPRAL_VERSION,
+        metis_version: ffi::METIS_VERSION,
+        openblas_version: ffi::OPENBLAS_VERSION,
+        openblas_threading: ffi::OPENBLAS_THREADING,
+        ipopt_lib_dir: ffi::IPOPT_LIB_DIR,
+        spral_lib_dir: ffi::SPRAL_LIB_DIR,
+        metis_lib_dir: ffi::METIS_LIB_DIR,
+        openblas_lib_dir: ffi::OPENBLAS_LIB_DIR,
+        openmp_lib: ffi::OPENMP_LIB,
+        static_solver_math: ffi::STATIC_SOLVER_MATH.map(|value| value == "true"),
+    }
+}
+
 /// The callback interface for a non-linear problem to be solved by Ipopt.
 ///
 /// This trait specifies all the information needed to construct the unconstrained optimization

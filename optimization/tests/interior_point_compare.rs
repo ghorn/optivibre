@@ -340,15 +340,15 @@ fn trace_regularization_text(value: Option<f64>) -> String {
     value.map_or_else(|| "--".to_string(), |value| format!("{value:.1e}"))
 }
 
-fn assert_local_spral_ipopt_provenance(summary: &optimization::IpoptSummary) {
+fn assert_source_built_spral_ipopt_provenance(summary: &optimization::IpoptSummary) {
     let provenance = summary
         .provenance
         .as_ref()
-        .expect("expected IPOPT provenance for native-SPRAL parity runs");
-    let errors = optimization::native_spral_parity_ipopt_provenance_errors(provenance);
+        .expect("expected IPOPT provenance for source-built SPRAL parity runs");
+    let errors = optimization::source_built_spral_parity_ipopt_provenance_errors(provenance);
     if !errors.is_empty() {
         panic!(
-            "unsupported local SPRAL IPOPT provenance:\n{}\nprovenance={provenance:?}",
+            "unsupported source-built SPRAL IPOPT provenance:\n{}\nprovenance={provenance:?}",
             errors
                 .iter()
                 .map(|error| format!("  - {error}"))
@@ -567,37 +567,19 @@ fn compare_verbose_requested() -> bool {
     std::env::var_os("AD_CODEGEN_COMPARE_VERBOSE").is_some()
 }
 
-fn native_spral_available() -> bool {
+fn source_built_spral_ipopt_environment_available() -> bool {
     static AVAILABLE: OnceLock<Result<(), String>> = OnceLock::new();
     match AVAILABLE.get_or_init(|| {
-        ssids_rs::NativeSpral::load()
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-    }) {
-        Ok(()) => true,
-        Err(error) => {
-            if optimization::native_spral_parity_fail_closed_requested() {
-                panic!("native SPRAL is required for fail-closed parity runs: {error}");
-            }
-            eprintln!("skipping native SPRAL/IPOPT comparison: {error}");
-            false
-        }
-    }
-}
-
-fn local_spral_ipopt_environment_available() -> bool {
-    static AVAILABLE: OnceLock<Result<(), String>> = OnceLock::new();
-    match AVAILABLE.get_or_init(|| {
-        optimization::validate_native_spral_parity_preflight()
+        optimization::validate_source_built_spral_parity_preflight()
             .map(|_| ())
             .map_err(|errors| errors.join("; "))
     }) {
         Ok(()) => true,
         Err(error) => {
             if optimization::native_spral_parity_fail_closed_requested() {
-                panic!("native-SPRAL parity preflight is required: {error}");
+                panic!("source-built SPRAL parity preflight is required: {error}");
             }
-            eprintln!("skipping native SPRAL/IPOPT comparison: {error}");
+            eprintln!("skipping source-built SPRAL/IPOPT comparison: {error}");
             false
         }
     }
@@ -613,7 +595,7 @@ fn native_spral_compare_guard() -> MutexGuard<'static, ()> {
 macro_rules! skip_without_native_spral {
     () => {
         let _native_spral_compare_guard = native_spral_compare_guard();
-        if !native_spral_available() || !local_spral_ipopt_environment_available() {
+        if !source_built_spral_ipopt_environment_available() {
             return;
         }
     };
@@ -764,11 +746,11 @@ fn print_compare_summary(
         ipopt.profiling.total_time.as_secs_f64(),
     );
     eprintln!(
-        "[parity] {problem_name} provenance ipopt={:?} native_lib={:?} threads=(rayon:{:?},omp:{:?})",
+        "[parity] {problem_name} provenance ipopt={:?} threads=(rayon:{:?},omp:{:?},omp_cancellation:{:?})",
         ipopt.provenance,
-        std::env::var("SPRAL_SSIDS_NATIVE_LIB").ok(),
         std::env::var("RAYON_NUM_THREADS").ok(),
         std::env::var("OMP_NUM_THREADS").ok(),
+        std::env::var("OMP_CANCELLATION").ok(),
     );
 }
 
@@ -813,7 +795,7 @@ fn assert_native_matches_ipopt(
         native.linear_solver,
         optimization::InteriorPointLinearSolver::SpralSrc
     );
-    assert_local_spral_ipopt_provenance(ipopt);
+    assert_source_built_spral_ipopt_provenance(ipopt);
     assert_abs_diff_eq!(
         native.objective,
         ipopt.objective,
@@ -869,12 +851,12 @@ fn solve_ipopt_ok<P: CompiledNlpProblem>(
     x0: &[f64],
     parameters: &[ParameterMatrix<'_>],
 ) -> optimization::IpoptSummary {
-    optimization::assert_native_spral_parity_preflight();
+    optimization::assert_source_built_spral_parity_preflight();
     let solve_result = solve_nlp_ipopt(problem, x0, parameters, &ipopt_options());
     assert!(solve_result.is_ok(), "Ipopt solve failed: {solve_result:?}");
     match solve_result {
         Ok(summary) => {
-            assert_local_spral_ipopt_provenance(&summary);
+            assert_source_built_spral_ipopt_provenance(&summary);
             summary
         }
         Err(err) => unreachable!("asserted success: {err}"),

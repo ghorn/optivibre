@@ -144,6 +144,7 @@ fn main() {
 
     #[cfg(feature = "source-built-spral")]
     {
+        emit_source_built_spral_provenance();
         let link_info = source_built_spral_link_info();
         link(build_cnlp(&link_info.include_paths), link_info)
             .expect("Failed to create bindings for source-built Ipopt library.");
@@ -260,6 +261,31 @@ fn source_built_spral_link_info() -> LinkInfo {
         search_paths,
         include_paths: vec![metadata_path("INCLUDE")],
     }
+}
+
+#[cfg(feature = "source-built-spral")]
+fn emit_source_built_spral_provenance() {
+    emit_rustc_env("IPOPT_SYS_LINK_MODE", "source-built-spral");
+    emit_rustc_env("IPOPT_SYS_IPOPT_VERSION", &metadata("VERSION"));
+    emit_rustc_env("IPOPT_SYS_IPOPT_SOURCE_COMMIT", &metadata("SOURCE_COMMIT"));
+    emit_rustc_env("IPOPT_SYS_SPRAL_VERSION", &metadata("SPRAL_VERSION"));
+    emit_rustc_env("IPOPT_SYS_METIS_VERSION", &metadata("METIS_VERSION"));
+    emit_rustc_env("IPOPT_SYS_OPENBLAS_VERSION", &metadata("OPENBLAS_VERSION"));
+    emit_rustc_env(
+        "IPOPT_SYS_OPENBLAS_THREADING",
+        &metadata("OPENBLAS_THREADING"),
+    );
+    emit_rustc_env("IPOPT_SYS_IPOPT_LIB", &metadata("LIB"));
+    emit_rustc_env("IPOPT_SYS_SPRAL_LIB", &metadata("SPRAL_LIB"));
+    emit_rustc_env("IPOPT_SYS_METIS_LIB", &metadata("METIS_LIB"));
+    emit_rustc_env("IPOPT_SYS_OPENBLAS_LIB", &metadata("OPENBLAS_LIB"));
+    emit_rustc_env("IPOPT_SYS_OPENMP_LIB", &metadata("OPENMP_LIB"));
+    emit_rustc_env("IPOPT_SYS_STATIC_SOLVER_MATH", "true");
+}
+
+#[cfg(feature = "source-built-spral")]
+fn emit_rustc_env(name: &str, value: &str) {
+    println!("cargo:rustc-env={name}={value}");
 }
 
 #[cfg(feature = "source-built-spral")]

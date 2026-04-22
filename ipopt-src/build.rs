@@ -82,6 +82,10 @@ struct SpralMetadata {
     spral_cflags: String,
     spral_lflags: String,
     lapack_lflags: String,
+    spral_version: String,
+    metis_version: String,
+    openblas_version: String,
+    openblas_threading: String,
 }
 
 impl SpralMetadata {
@@ -103,6 +107,10 @@ impl SpralMetadata {
             spral_cflags: metadata("SPRAL_CFLAGS"),
             spral_lflags: metadata("SPRAL_LFLAGS"),
             lapack_lflags: metadata("LAPACK_LFLAGS"),
+            spral_version: metadata("SPRAL_VERSION"),
+            metis_version: metadata("METIS_VERSION"),
+            openblas_version: metadata("OPENBLAS_VERSION"),
+            openblas_threading: metadata("OPENBLAS_THREADING"),
         }
     }
 }
@@ -404,6 +412,10 @@ fn emit_link_metadata(install_dir: &Path, spral: &SpralMetadata) {
     emit_dep_metadata("OPENBLAS_THREADING", &spral.openblas_threading);
     emit_dep_metadata("VERSION", IPOPT_VERSION);
     emit_dep_metadata("SOURCE_COMMIT", IPOPT_COMMIT);
+    emit_dep_metadata("SPRAL_VERSION", &spral.spral_version);
+    emit_dep_metadata("METIS_VERSION", &spral.metis_version);
+    emit_dep_metadata("OPENBLAS_VERSION", &spral.openblas_version);
+    emit_dep_metadata("OPENBLAS_THREADING", &spral.openblas_threading);
     emit_dep_metadata("SPRAL_CFLAGS", &spral.spral_cflags);
     emit_dep_metadata("SPRAL_LFLAGS", &spral.spral_lflags);
     emit_dep_metadata("LAPACK_LFLAGS", &spral.lapack_lflags);

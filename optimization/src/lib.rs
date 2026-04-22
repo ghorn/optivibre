@@ -390,7 +390,37 @@ pub fn native_spral_parity_ipopt_options() -> IpoptOptions {
 #[cfg(feature = "ipopt")]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NativeSpralParityPreflight {
+pub struct SourceBuiltSpralParityPreflight {
+    pub ipopt: IpoptProvenance,
+    pub rayon_num_threads: Option<String>,
+    pub omp_num_threads: Option<String>,
+    pub omp_cancellation: Option<String>,
+    pub fail_closed: bool,
+}
+
+#[cfg(feature = "ipopt")]
+pub type NativeSpralParityPreflight = SourceBuiltSpralParityPreflight;
+
+#[cfg(feature = "ipopt")]
+pub fn capture_source_built_spral_parity_preflight() -> SourceBuiltSpralParityPreflight {
+    SourceBuiltSpralParityPreflight {
+        ipopt: capture_ipopt_provenance(),
+        rayon_num_threads: std::env::var("RAYON_NUM_THREADS").ok(),
+        omp_num_threads: std::env::var("OMP_NUM_THREADS").ok(),
+        omp_cancellation: std::env::var("OMP_CANCELLATION").ok(),
+        fail_closed: native_spral_parity_fail_closed_requested(),
+    }
+}
+
+#[cfg(feature = "ipopt")]
+pub fn capture_native_spral_parity_preflight() -> SourceBuiltSpralParityPreflight {
+    capture_source_built_spral_parity_preflight()
+}
+
+#[cfg(all(feature = "ipopt", feature = "dynamic-spral-parity"))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DynamicSpralParityPreflight {
     pub ipopt: IpoptProvenance,
     pub spral_ssids_native_lib: Option<String>,
     pub rayon_num_threads: Option<String>,
@@ -398,9 +428,9 @@ pub struct NativeSpralParityPreflight {
     pub fail_closed: bool,
 }
 
-#[cfg(feature = "ipopt")]
-pub fn capture_native_spral_parity_preflight() -> NativeSpralParityPreflight {
-    NativeSpralParityPreflight {
+#[cfg(all(feature = "ipopt", feature = "dynamic-spral-parity"))]
+pub fn capture_dynamic_spral_parity_preflight() -> DynamicSpralParityPreflight {
+    DynamicSpralParityPreflight {
         ipopt: capture_ipopt_provenance(),
         spral_ssids_native_lib: std::env::var("SPRAL_SSIDS_NATIVE_LIB").ok(),
         rayon_num_threads: std::env::var("RAYON_NUM_THREADS").ok(),
@@ -409,14 +439,14 @@ pub fn capture_native_spral_parity_preflight() -> NativeSpralParityPreflight {
     }
 }
 
-#[cfg(feature = "ipopt")]
+#[cfg(all(feature = "ipopt", feature = "dynamic-spral-parity"))]
 fn path_is_under_prefix_components(path: &str, prefix: &str) -> bool {
     let path = std::path::Path::new(path);
     let prefix = std::path::Path::new(prefix);
     path == prefix || path.starts_with(prefix)
 }
 
-#[cfg(feature = "ipopt")]
+#[cfg(all(feature = "ipopt", feature = "dynamic-spral-parity"))]
 fn path_matches_exact_or_canonical(path: &str, expected: &str) -> bool {
     if path == expected {
         return true;
@@ -448,7 +478,133 @@ fn pkg_config_flag_paths(flags: &str) -> Vec<String> {
 }
 
 #[cfg(feature = "ipopt")]
+fn disallowed_source_built_solver_path(path: &str) -> Option<&'static str> {
+    ["/usr/local/", "/opt/homebrew/", LOCAL_SPRAL_IPOPT_PREFIX]
+        .into_iter()
+        .find(|prefix| path.starts_with(prefix))
+}
+
+#[cfg(feature = "ipopt")]
+pub fn source_built_spral_parity_ipopt_provenance_errors(
+    provenance: &IpoptProvenance,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    match provenance.linked_solver_stack.as_deref() {
+        Some("source-built-spral") => {}
+        Some(stack) => errors.push(format!(
+            "linked IPOPT solver stack {stack} does not match expected source-built-spral"
+        )),
+        None => errors.push("linked IPOPT solver stack provenance is unavailable".to_string()),
+    }
+
+    match provenance.linked_ipopt_version.as_deref() {
+        Some(LOCAL_SPRAL_IPOPT_VERSION) => {}
+        Some(version) => errors.push(format!(
+            "linked IPOPT version {version} does not match expected {LOCAL_SPRAL_IPOPT_VERSION}"
+        )),
+        None => errors.push("linked IPOPT version provenance is unavailable".to_string()),
+    }
+
+    for (label, value) in [
+        (
+            "SPRAL source version",
+            provenance.linked_spral_version.as_deref(),
+        ),
+        (
+            "METIS source version",
+            provenance.linked_metis_version.as_deref(),
+        ),
+        (
+            "OpenBLAS source version",
+            provenance.linked_openblas_version.as_deref(),
+        ),
+        (
+            "OpenBLAS threading mode",
+            provenance.linked_openblas_threading.as_deref(),
+        ),
+    ] {
+        match value {
+            Some(value) if !value.is_empty() => {}
+            _ => errors.push(format!("{label} provenance is unavailable")),
+        }
+    }
+
+    match provenance.linked_static_solver_math {
+        Some(true) => {}
+        Some(false) => errors.push(
+            "linked solver/math libraries are not marked as static source-built archives"
+                .to_string(),
+        ),
+        None => errors.push("linked solver/math static-link provenance is unavailable".to_string()),
+    }
+
+    for (label, value) in [
+        (
+            "linked IPOPT library directory",
+            provenance.linked_ipopt_lib_dir.as_deref(),
+        ),
+        (
+            "linked SPRAL library directory",
+            provenance.linked_spral_lib_dir.as_deref(),
+        ),
+        (
+            "linked METIS library directory",
+            provenance.linked_metis_lib_dir.as_deref(),
+        ),
+        (
+            "linked OpenBLAS library directory",
+            provenance.linked_openblas_lib_dir.as_deref(),
+        ),
+    ] {
+        match value {
+            Some(path) if !path.is_empty() => {
+                if let Some(prefix) = disallowed_source_built_solver_path(path) {
+                    errors.push(format!(
+                        "{label} {path} uses disallowed non-source-built prefix {prefix}"
+                    ));
+                }
+            }
+            _ => errors.push(format!("{label} provenance is unavailable")),
+        }
+    }
+
+    if let Some(flags) = provenance.pkg_config_cflags_libs.as_deref() {
+        for path in pkg_config_flag_paths(flags) {
+            if let Some(prefix) = disallowed_source_built_solver_path(&path) {
+                errors.push(format!(
+                    "pkg-config ipopt cflags/libs contain disallowed non-source-built path {path} under {prefix}"
+                ));
+            }
+        }
+    }
+
+    if let Some(path) = provenance.ipopt_binary.as_deref()
+        && let Some(prefix) = disallowed_source_built_solver_path(path)
+    {
+        errors.push(format!(
+            "ipopt binary {path} uses disallowed non-source-built prefix {prefix}"
+        ));
+    }
+
+    if let Some(default) = provenance.linear_solver_default.as_deref()
+        && default != "spral"
+    {
+        errors.push(format!(
+            "ipopt linear_solver default {default} does not match expected spral"
+        ));
+    }
+
+    errors
+}
+
+#[cfg(feature = "ipopt")]
 pub fn native_spral_parity_ipopt_provenance_errors(provenance: &IpoptProvenance) -> Vec<String> {
+    source_built_spral_parity_ipopt_provenance_errors(provenance)
+}
+
+#[cfg(all(feature = "ipopt", feature = "dynamic-spral-parity"))]
+pub fn dynamic_spral_parity_ipopt_provenance_errors(provenance: &IpoptProvenance) -> Vec<String> {
     let mut errors = Vec::new();
 
     match provenance.pkg_config_version.as_deref() {
@@ -509,8 +665,53 @@ pub fn native_spral_parity_ipopt_provenance_errors(provenance: &IpoptProvenance)
 }
 
 #[cfg(feature = "ipopt")]
-pub fn native_spral_parity_preflight_errors(preflight: &NativeSpralParityPreflight) -> Vec<String> {
-    let mut errors = native_spral_parity_ipopt_provenance_errors(&preflight.ipopt);
+pub fn source_built_spral_parity_preflight_errors(
+    preflight: &SourceBuiltSpralParityPreflight,
+) -> Vec<String> {
+    let mut errors = source_built_spral_parity_ipopt_provenance_errors(&preflight.ipopt);
+
+    if !cfg!(feature = "native-spral-src") {
+        errors.push(
+            "optimization must be built with native-spral-src for source-built SPRAL parity"
+                .to_string(),
+        );
+    }
+
+    for (name, value) in [
+        ("RAYON_NUM_THREADS", preflight.rayon_num_threads.as_deref()),
+        ("OMP_NUM_THREADS", preflight.omp_num_threads.as_deref()),
+    ] {
+        match value {
+            Some("1") => {}
+            Some(value) => errors.push(format!("{name} must be 1 for exact parity, got {value}")),
+            None => errors.push(format!("{name} must be set to 1 for exact parity")),
+        }
+    }
+
+    match preflight.omp_cancellation.as_deref() {
+        Some("true") | Some("TRUE") => {}
+        Some(value) => errors.push(format!(
+            "OMP_CANCELLATION must be true before OpenMP initializes, got {value}"
+        )),
+        None => errors
+            .push("OMP_CANCELLATION must be set to true before OpenMP initializes".to_string()),
+    }
+
+    errors
+}
+
+#[cfg(feature = "ipopt")]
+pub fn native_spral_parity_preflight_errors(
+    preflight: &SourceBuiltSpralParityPreflight,
+) -> Vec<String> {
+    source_built_spral_parity_preflight_errors(preflight)
+}
+
+#[cfg(all(feature = "ipopt", feature = "dynamic-spral-parity"))]
+pub fn dynamic_spral_parity_preflight_errors(
+    preflight: &DynamicSpralParityPreflight,
+) -> Vec<String> {
+    let mut errors = dynamic_spral_parity_ipopt_provenance_errors(&preflight.ipopt);
 
     match preflight.spral_ssids_native_lib.as_deref() {
         Some(LOCAL_SPRAL_LIBSPRAL_DYLIB) => {}
@@ -547,10 +748,10 @@ pub fn native_spral_parity_preflight_errors(preflight: &NativeSpralParityPreflig
 }
 
 #[cfg(feature = "ipopt")]
-pub fn validate_native_spral_parity_preflight()
--> std::result::Result<NativeSpralParityPreflight, Vec<String>> {
-    let preflight = capture_native_spral_parity_preflight();
-    let errors = native_spral_parity_preflight_errors(&preflight);
+pub fn validate_source_built_spral_parity_preflight()
+-> std::result::Result<SourceBuiltSpralParityPreflight, Vec<String>> {
+    let preflight = capture_source_built_spral_parity_preflight();
+    let errors = source_built_spral_parity_preflight_errors(&preflight);
     if errors.is_empty() {
         Ok(preflight)
     } else {
@@ -559,11 +760,49 @@ pub fn validate_native_spral_parity_preflight()
 }
 
 #[cfg(feature = "ipopt")]
-pub fn assert_native_spral_parity_preflight() -> NativeSpralParityPreflight {
-    match validate_native_spral_parity_preflight() {
+pub fn validate_native_spral_parity_preflight()
+-> std::result::Result<SourceBuiltSpralParityPreflight, Vec<String>> {
+    validate_source_built_spral_parity_preflight()
+}
+
+#[cfg(all(feature = "ipopt", feature = "dynamic-spral-parity"))]
+pub fn validate_dynamic_spral_parity_preflight()
+-> std::result::Result<DynamicSpralParityPreflight, Vec<String>> {
+    let preflight = capture_dynamic_spral_parity_preflight();
+    let errors = dynamic_spral_parity_preflight_errors(&preflight);
+    if errors.is_empty() {
+        Ok(preflight)
+    } else {
+        Err(errors)
+    }
+}
+
+#[cfg(feature = "ipopt")]
+pub fn assert_source_built_spral_parity_preflight() -> SourceBuiltSpralParityPreflight {
+    match validate_source_built_spral_parity_preflight() {
         Ok(preflight) => preflight,
         Err(errors) => panic!(
-            "native-SPRAL parity preflight failed:\n{}",
+            "source-built SPRAL parity preflight failed:\n{}",
+            errors
+                .iter()
+                .map(|error| format!("  - {error}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    }
+}
+
+#[cfg(feature = "ipopt")]
+pub fn assert_native_spral_parity_preflight() -> SourceBuiltSpralParityPreflight {
+    assert_source_built_spral_parity_preflight()
+}
+
+#[cfg(all(feature = "ipopt", feature = "dynamic-spral-parity"))]
+pub fn assert_dynamic_spral_parity_preflight() -> DynamicSpralParityPreflight {
+    match validate_dynamic_spral_parity_preflight() {
+        Ok(preflight) => preflight,
+        Err(errors) => panic!(
+            "dynamic SPRAL parity preflight failed:\n{}",
             errors
                 .iter()
                 .map(|error| format!("  - {error}"))
@@ -5053,51 +5292,73 @@ mod tests {
     }
 
     #[cfg(feature = "ipopt")]
-    fn good_local_ipopt_provenance() -> super::IpoptProvenance {
+    fn good_source_built_ipopt_provenance() -> super::IpoptProvenance {
         super::IpoptProvenance {
-            pkg_config_version: Some(super::LOCAL_SPRAL_IPOPT_VERSION.to_string()),
-            pkg_config_cflags_libs: Some(format!(
-                "-I{}/include/coin-or -lipopt",
-                super::LOCAL_SPRAL_IPOPT_PREFIX
-            )),
-            ipopt_binary: Some(super::LOCAL_SPRAL_IPOPT_BINARY.to_string()),
-            linear_solver_default: Some("spral".to_string()),
+            linked_solver_stack: Some("source-built-spral".to_string()),
+            linked_ipopt_version: Some(super::LOCAL_SPRAL_IPOPT_VERSION.to_string()),
+            linked_ipopt_source_commit: Some(
+                "4667204c76e534d3e4df6b1462f258a4f9c681bd".to_string(),
+            ),
+            linked_spral_version: Some("2025.09.18".to_string()),
+            linked_metis_version: Some("5.2.1".to_string()),
+            linked_openblas_version: Some("0.3.32".to_string()),
+            linked_openblas_threading: Some("serial".to_string()),
+            linked_static_solver_math: Some(true),
+            linked_ipopt_lib_dir: Some("/tmp/cargo-target/ipopt/lib".to_string()),
+            linked_spral_lib_dir: Some("/tmp/cargo-target/spral/lib".to_string()),
+            linked_metis_lib_dir: Some("/tmp/cargo-target/metis/lib".to_string()),
+            linked_openblas_lib_dir: Some("/tmp/cargo-target/openblas/lib".to_string()),
+            linked_openmp_lib: Some("omp".to_string()),
+            ..super::IpoptProvenance::default()
         }
     }
 
-    #[cfg(feature = "ipopt")]
+    #[cfg(all(feature = "ipopt", feature = "native-spral-src"))]
     #[test]
-    fn native_spral_parity_preflight_accepts_pinned_local_inputs() {
-        let preflight = super::NativeSpralParityPreflight {
-            ipopt: good_local_ipopt_provenance(),
-            spral_ssids_native_lib: Some(super::LOCAL_SPRAL_LIBSPRAL_DYLIB.to_string()),
+    fn source_built_spral_parity_preflight_accepts_linked_source_inputs() {
+        let preflight = super::SourceBuiltSpralParityPreflight {
+            ipopt: good_source_built_ipopt_provenance(),
             rayon_num_threads: Some("1".to_string()),
             omp_num_threads: Some("1".to_string()),
+            omp_cancellation: Some("true".to_string()),
             fail_closed: true,
         };
 
-        assert!(super::native_spral_parity_preflight_errors(&preflight).is_empty());
+        assert!(super::source_built_spral_parity_preflight_errors(&preflight).is_empty());
     }
 
     #[cfg(feature = "ipopt")]
     #[test]
-    fn native_spral_parity_preflight_rejects_solver_substitution_inputs() {
-        let mut provenance = good_local_ipopt_provenance();
+    fn source_built_spral_parity_preflight_rejects_solver_substitution_inputs() {
+        let mut provenance = good_source_built_ipopt_provenance();
+        provenance.linked_solver_stack = Some("legacy-native-build".to_string());
+        provenance.linked_static_solver_math = Some(false);
+        provenance.ipopt_binary = Some("/opt/homebrew/bin/ipopt".to_string());
         provenance.linear_solver_default = Some("mumps".to_string());
-        let preflight = super::NativeSpralParityPreflight {
+        let preflight = super::SourceBuiltSpralParityPreflight {
             ipopt: provenance,
-            spral_ssids_native_lib: Some("/opt/homebrew/lib/libspral.dylib".to_string()),
             rayon_num_threads: Some("4".to_string()),
             omp_num_threads: None,
+            omp_cancellation: Some("false".to_string()),
             fail_closed: true,
         };
 
-        let errors = super::native_spral_parity_preflight_errors(&preflight);
+        let errors = super::source_built_spral_parity_preflight_errors(&preflight);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("source-built-spral"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("static source-built"))
+        );
         assert!(errors.iter().any(|error| error.contains("expected spral")));
         assert!(
             errors
                 .iter()
-                .any(|error| error.contains("disallowed non-local"))
+                .any(|error| error.contains("disallowed non-source-built"))
         );
         assert!(
             errors
@@ -5105,22 +5366,26 @@ mod tests {
                 .any(|error| error.contains("RAYON_NUM_THREADS"))
         );
         assert!(errors.iter().any(|error| error.contains("OMP_NUM_THREADS")));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("OMP_CANCELLATION"))
+        );
     }
 
     #[cfg(feature = "ipopt")]
     #[test]
-    fn native_spral_parity_preflight_rejects_lookalike_local_paths() {
-        let mut provenance = good_local_ipopt_provenance();
+    fn source_built_spral_parity_preflight_rejects_dynamic_local_paths() {
+        let mut provenance = good_source_built_ipopt_provenance();
         provenance.pkg_config_cflags_libs =
             Some("-I/Users/greg/local/ipopt-spral-alt/include/coin-or -lipopt".to_string());
         provenance.ipopt_binary = Some("/Users/greg/local/ipopt-spral-alt/bin/ipopt".to_string());
 
-        let errors = super::native_spral_parity_ipopt_provenance_errors(&provenance);
-        assert!(errors.iter().any(|error| error.contains("lookalike")));
+        let errors = super::source_built_spral_parity_ipopt_provenance_errors(&provenance);
         assert!(
             errors
                 .iter()
-                .any(|error| error.contains(super::LOCAL_SPRAL_IPOPT_BINARY))
+                .any(|error| error.contains("disallowed non-source-built"))
         );
     }
 }

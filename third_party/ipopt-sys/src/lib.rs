@@ -17,6 +17,20 @@
 #![allow(non_snake_case)]
 include!(concat!(env!("OUT_DIR"), "/ipopt_cnlp.rs"));
 
+pub const IPOPT_LINK_MODE: Option<&str> = option_env!("IPOPT_SYS_LINK_MODE");
+pub const IPOPT_VERSION: Option<&str> = option_env!("IPOPT_SYS_IPOPT_VERSION");
+pub const IPOPT_SOURCE_COMMIT: Option<&str> = option_env!("IPOPT_SYS_IPOPT_SOURCE_COMMIT");
+pub const SPRAL_VERSION: Option<&str> = option_env!("IPOPT_SYS_SPRAL_VERSION");
+pub const METIS_VERSION: Option<&str> = option_env!("IPOPT_SYS_METIS_VERSION");
+pub const OPENBLAS_VERSION: Option<&str> = option_env!("IPOPT_SYS_OPENBLAS_VERSION");
+pub const OPENBLAS_THREADING: Option<&str> = option_env!("IPOPT_SYS_OPENBLAS_THREADING");
+pub const IPOPT_LIB_DIR: Option<&str> = option_env!("IPOPT_SYS_IPOPT_LIB");
+pub const SPRAL_LIB_DIR: Option<&str> = option_env!("IPOPT_SYS_SPRAL_LIB");
+pub const METIS_LIB_DIR: Option<&str> = option_env!("IPOPT_SYS_METIS_LIB");
+pub const OPENBLAS_LIB_DIR: Option<&str> = option_env!("IPOPT_SYS_OPENBLAS_LIB");
+pub const OPENMP_LIB: Option<&str> = option_env!("IPOPT_SYS_OPENMP_LIB");
+pub const STATIC_SOLVER_MATH: Option<&str> = option_env!("IPOPT_SYS_STATIC_SOLVER_MATH");
+
 #[cfg(test)]
 mod tests {
     use super::*;

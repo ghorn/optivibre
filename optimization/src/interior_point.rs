@@ -1069,7 +1069,6 @@ struct AcceptedInteriorPointTrial {
     barrier_objective: f64,
     equality_inf: f64,
     inequality_inf: f64,
-    primal_inf: f64,
     dual_inf: f64,
     complementarity_inf: f64,
     overall_inf: f64,
@@ -1091,7 +1090,6 @@ struct AcceptedInteriorPointTrial {
     second_order_correction_used: bool,
     watchdog_accepted: bool,
     tiny_step: bool,
-    tiny_step_barrier_update: bool,
     bound_multiplier_corrected: bool,
 }
 
@@ -8404,7 +8402,7 @@ where
             &complementarity_multipliers,
             options.overall_scale_max,
         );
-        let current_barrier_objective = barrier_objective_value(
+        let mut current_barrier_objective = barrier_objective_value(
             state.objective_value,
             &slack_barrier,
             &x,
@@ -8417,7 +8415,8 @@ where
             &state.augmented_inequality_values,
             &slack,
         );
-        let current_filter_entry = super::filter::entry(current_barrier_objective, current_theta);
+        let mut current_filter_entry =
+            super::filter::entry(current_barrier_objective, current_theta);
         let mut current_snapshot = InteriorPointIterationSnapshot {
             iteration,
             phase: if iteration == 0 {
@@ -8655,6 +8654,80 @@ where
             return Ok(summary);
         }
         last_objective_value = state.objective_value;
+
+        if barrier_pair_count > 0 {
+            let previous_barrier_parameter = barrier_parameter_value;
+            let next_barrier_parameter_value = next_barrier_parameter(
+                barrier_parameter_value,
+                watchdog_state.tiny_step_last_iteration,
+                options,
+                |candidate_barrier_parameter| {
+                    let current_target_complementarity_inf =
+                        combined_complementarity_target_inf_norm(
+                            &slack_barrier,
+                            &z,
+                            &x,
+                            &bounds,
+                            &z_lower,
+                            &z_upper,
+                            candidate_barrier_parameter,
+                        );
+                    scaled_overall_inf_norm(
+                        primal_inf,
+                        dual_inf,
+                        current_target_complementarity_inf,
+                        &all_dual_multipliers,
+                        &complementarity_multipliers,
+                        options.overall_scale_max,
+                    )
+                },
+            );
+            if next_barrier_parameter_value
+                < previous_barrier_parameter - 1e-18 * previous_barrier_parameter.abs().max(1.0)
+            {
+                // IPOPT calls MonotoneMuUpdate::UpdateBarrierParameter before
+                // ComputeSearchDirection, and BacktrackingLineSearch observes
+                // the changed mu by clearing filter/watchdog state before the
+                // trial search starts.
+                barrier_parameter_value = next_barrier_parameter_value;
+                filter_entries.clear();
+                watchdog_state = InteriorPointWatchdogState::default();
+                push_unique_nlip_event(
+                    &mut iteration_events,
+                    InteriorPointIterationEvent::BarrierParameterUpdated,
+                );
+                current_barrier_objective = barrier_objective_value(
+                    state.objective_value,
+                    &slack_barrier,
+                    &x,
+                    &bounds,
+                    barrier_parameter_value,
+                    options.kappa_d,
+                );
+                current_filter_entry =
+                    super::filter::entry(current_barrier_objective, current_theta);
+                current_snapshot.barrier_objective = Some(current_barrier_objective);
+                current_snapshot.barrier_parameter = Some(barrier_parameter_value);
+                current_snapshot.kkt_slack_stationarity =
+                    Some(damped_slack_stationarity_residuals(
+                        &lambda_ineq,
+                        &z,
+                        barrier_parameter_value,
+                        options.kappa_d,
+                    ));
+                current_snapshot.kkt_slack_complementarity = Some(slack_complementarity_residuals(
+                    &slack_barrier,
+                    &z,
+                    barrier_parameter_value,
+                ));
+                current_snapshot.filter = Some(FilterInfo {
+                    current: current_filter_entry.clone(),
+                    entries: filter_entries.clone(),
+                    accepted_mode: None,
+                });
+                current_snapshot.events = iteration_events.clone();
+            }
+        }
 
         let hessian_started = Instant::now();
         let mut hessian_values = vec![0.0; problem.lagrangian_hessian_ccs().nnz()];
@@ -9364,7 +9437,6 @@ where
                     barrier_objective: trial_barrier_objective,
                     equality_inf: trial_eq_inf,
                     inequality_inf: trial_ineq_inf,
-                    primal_inf: trial_primal_inf,
                     dual_inf: accepted_dual_inf,
                     complementarity_inf: accepted_comp_inf,
                     overall_inf: accepted_overall_inf,
@@ -9386,7 +9458,6 @@ where
                     second_order_correction_used: false,
                     watchdog_accepted: false,
                     tiny_step: true,
-                    tiny_step_barrier_update,
                     bound_multiplier_corrected,
                 });
                 break;
@@ -9517,7 +9588,6 @@ where
                     barrier_objective: trial_barrier_objective,
                     equality_inf: trial_eq_inf,
                     inequality_inf: trial_ineq_inf,
-                    primal_inf: trial_primal_inf,
                     dual_inf: accepted_dual_inf,
                     complementarity_inf: accepted_comp_inf,
                     overall_inf: accepted_overall_inf,
@@ -9548,7 +9618,6 @@ where
                     second_order_correction_used: false,
                     watchdog_accepted: false,
                     tiny_step: false,
-                    tiny_step_barrier_update: false,
                     bound_multiplier_corrected,
                 });
                 break;
@@ -9968,7 +10037,6 @@ where
                             barrier_objective: corrected_barrier_objective,
                             equality_inf: corrected_eq_inf,
                             inequality_inf: corrected_ineq_inf,
-                            primal_inf: corrected_primal_inf,
                             dual_inf: accepted_dual_inf,
                             complementarity_inf: accepted_comp_inf,
                             overall_inf: accepted_overall_inf,
@@ -9998,7 +10066,6 @@ where
                             second_order_correction_used: true,
                             watchdog_accepted: false,
                             tiny_step: false,
-                            tiny_step_barrier_update: false,
                             bound_multiplier_corrected,
                         });
                         break;
@@ -10185,7 +10252,6 @@ where
                     barrier_objective: trial_barrier_objective,
                     equality_inf: trial_eq_inf,
                     inequality_inf: trial_ineq_inf,
-                    primal_inf: trial_primal_inf,
                     dual_inf: accepted_dual_inf,
                     complementarity_inf: accepted_comp_inf,
                     overall_inf: accepted_overall_inf,
@@ -10216,7 +10282,6 @@ where
                     second_order_correction_used: false,
                     watchdog_accepted: true,
                     tiny_step: false,
-                    tiny_step_barrier_update: false,
                     bound_multiplier_corrected,
                 });
                 break;
@@ -10395,7 +10460,6 @@ where
                         barrier_objective: restored_barrier_objective,
                         equality_inf: restored_eq_inf,
                         inequality_inf: restored_ineq_inf,
-                        primal_inf: restored_primal_inf,
                         dual_inf: restored_dual_inf,
                         complementarity_inf: restored_complementarity_inf,
                         overall_inf: restored_overall_inf,
@@ -10422,7 +10486,6 @@ where
                         second_order_correction_used: false,
                         watchdog_accepted: false,
                         tiny_step: false,
-                        tiny_step_barrier_update: false,
                         bound_multiplier_corrected: false,
                     });
                 }
@@ -10582,60 +10645,6 @@ where
         if let Some(entry) = accepted_trial.filter_augment_entry.clone() {
             super::filter::update_frontier(&mut next_filter_entries, entry);
         }
-        let previous_barrier_parameter = barrier_parameter_value;
-        let mut next_barrier_parameter_value = barrier_parameter_value;
-        if barrier_pair_count > 0 {
-            let accepted_slack_barrier = slack_barrier_values(&accepted_trial.slack);
-            let accepted_all_dual_multipliers = combined_multiplier_vector([
-                accepted_trial.lambda.as_slice(),
-                accepted_trial.inequality_multipliers.as_slice(),
-                accepted_trial.z.as_slice(),
-                accepted_trial.z_lower.as_slice(),
-                accepted_trial.z_upper.as_slice(),
-            ]);
-            let accepted_complementarity_multipliers = combined_multiplier_vector([
-                accepted_trial.z.as_slice(),
-                accepted_trial.z_lower.as_slice(),
-                accepted_trial.z_upper.as_slice(),
-            ]);
-            next_barrier_parameter_value = next_barrier_parameter(
-                barrier_parameter_value,
-                accepted_trial.tiny_step_barrier_update,
-                options,
-                |candidate_barrier_parameter| {
-                    let accepted_target_complementarity_inf =
-                        combined_complementarity_target_inf_norm(
-                            &accepted_slack_barrier,
-                            &accepted_trial.z,
-                            &accepted_trial.x,
-                            &bounds,
-                            &accepted_trial.z_lower,
-                            &accepted_trial.z_upper,
-                            candidate_barrier_parameter,
-                        );
-                    scaled_overall_inf_norm(
-                        accepted_trial.primal_inf,
-                        accepted_trial.dual_inf,
-                        accepted_target_complementarity_inf,
-                        &accepted_all_dual_multipliers,
-                        &accepted_complementarity_multipliers,
-                        options.overall_scale_max,
-                    )
-                },
-            );
-        }
-        let barrier_parameter_updated = next_barrier_parameter_value
-            < previous_barrier_parameter - 1e-18 * previous_barrier_parameter.abs().max(1.0);
-        if barrier_parameter_updated {
-            next_filter_entries.clear();
-        }
-
-        if barrier_parameter_updated {
-            push_unique_nlip_event(
-                &mut events,
-                InteriorPointIterationEvent::BarrierParameterUpdated,
-            );
-        }
         let adapter_timing = adapter_timing_delta(problem, &mut last_adapter_timing);
         profiling.adapter_timing = last_adapter_timing;
         let iteration_total = iteration_started.elapsed();
@@ -10760,14 +10769,7 @@ where
         z_lower = accepted_trial.z_lower;
         z_upper = accepted_trial.z_upper;
         filter_entries = next_filter_entries;
-        if barrier_pair_count > 0 {
-            barrier_parameter_value = next_barrier_parameter_value;
-        }
         nonlinear_inequality_multipliers = lambda_ineq.clone();
-        if barrier_parameter_updated {
-            watchdog_state = InteriorPointWatchdogState::default();
-            continue;
-        }
         if shortened_step {
             watchdog_state.shortened_step_streak += 1;
         } else {
