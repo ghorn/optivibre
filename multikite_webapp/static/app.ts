@@ -123,6 +123,18 @@ interface ApiFrame {
   rabbit_targets_n: [number, number, number][];
   phase_error: number[];
   speed_target: number[];
+  altitude: number[];
+  altitude_ref: number[];
+  kinetic_energy_specific: number[];
+  kinetic_energy_ref_specific: number[];
+  kinetic_energy_error_specific: number[];
+  potential_energy_specific: number[];
+  potential_energy_ref_specific: number[];
+  potential_energy_error_specific: number[];
+  total_energy_error_specific: number[];
+  energy_balance_error_specific: number[];
+  thrust_energy_integrator: number[];
+  pitch_energy_integrator: number[];
   inertial_speed: number[];
   airspeed: number[];
   alpha_deg: number[];
@@ -838,23 +850,26 @@ function controllerDocsHtml(phaseMode: PhaseMode): string {
     A["Measured phase<br/>φ_i"] --> B["Phase coordination<br/>phase error e_i"]
     M["Phase mode<br/>adaptive or open-loop"] --> B
     B --> C["Radius scheduler<br/>r_i^r"]
-    B --> D["Speed scheduler<br/>v_i^*"]
+    B --> D["Airspeed scheduler<br/>V_i^*"]
     C --> E["Rabbit geometry<br/>p_i^r"]
-    D --> F["Propulsion loop<br/>speed error + I_v"]
+    E --> H["Altitude reference<br/>h_i^*"]
+    D --> F["TECS<br/>specific energy errors"]
+    H --> F
     F --> G["Motor torque<br/>τ_i"]
+    F --> I["Pitch reference<br/>θ_i^*"]
     classDef block fill:#112231,stroke:#3ecf9b,color:#edf6ff;`;
   const innerLoopDiagram = String.raw`flowchart LR
     A["Rabbit target<br/>p_i^r"] --> B["Guidance block<br/>body-frame curvature references κ_y^*, κ_z^*"]
     S["Measured state<br/>position, curvature, body rates"] --> B
     B --> C["Roll-reference loop<br/>κ_y^* - κ̂_y → φ^*"]
     C --> D["Roll inner loop<br/>φ^* - φ, p → δ_a"]
-    B --> E["Vertical actuator law<br/>curvature error + I_z + rate damping"]
+    T["TECS pitch reference<br/>θ^*"] --> E["Pitch inner loop<br/>θ^* - θ, q → δ_e"]
     B --> F["Rudder coordination loop<br/>β and r damping"]
     P["AOA backoff"] --> E
     D --> G["Aileron<br/>δ_a"]
     F --> H["Rudder<br/>δ_r"]
     E --> I["Elevator<br/>δ_e"]
-    E --> J["Flap<br/>δ_f"]
+    J["Flap<br/>trim only δ_f=δ_f0"]
     W["Winglet"] --> K["Trim only<br/>δ_w = δ_{w,0}"]
     classDef block fill:#112231,stroke:#66b8ff,color:#edf6ff;`;
 
@@ -868,10 +883,11 @@ function controllerDocsHtml(phaseMode: PhaseMode): string {
         <div class="docs-grid">
           <div class="docs-prose">
             <div class="docs-phase-pill">Active UI phase mode <strong>${modeLabel}</strong></div>
-            <p>The propulsion loop regulates <strong>inertial speed</strong>, not airspeed.</p>
-            <p>The controller is naturally read as a cascade: phase scheduling and rabbit geometry, then body-frame curvature guidance, then roll-reference generation for the aileron channel, then the remaining surface and torque commands.</p>
-            <p><strong>The lateral aileron path now introduces a desired roll angle.</strong> Rudder is now used as a beta/yaw-damper coordination loop, while the vertical channel remains curvature-based rather than pitch-angle hold.</p>
-            <p>The winglet command is fixed at trim, and the motor torque proportional term is referenced to <span class="docs-inline-math">\(v_{\mathrm{ref}}\)</span> while the integral state is driven by the scheduled speed <span class="docs-inline-math">\(v_i^\star\)</span>.</p>
+            <p>The propulsion loop now regulates <strong>airspeed-derived specific kinetic energy</strong>.</p>
+            <p>The controller is naturally read as a cascade: phase scheduling and rabbit geometry, body-frame lateral curvature guidance, a total-energy layer, then roll/pitch inner loops and actuator commands.</p>
+            <p><strong>The lateral aileron path introduces a desired roll angle.</strong> Rudder is used as a beta/yaw-rate coordination loop.</p>
+            <p><strong>The vertical path is now TECS-style.</strong> Desired airspeed and altitude become kinetic and potential energy references. Motor torque closes kinetic-energy error, and pitch trades potential against kinetic energy.</p>
+            <p>The flap and winglet commands are fixed at trim.</p>
           </div>
           <div class="docs-kv">
             <div class="docs-kv-row">
@@ -880,11 +896,11 @@ function controllerDocsHtml(phaseMode: PhaseMode): string {
             </div>
             <div class="docs-kv-row">
               <div class="docs-kv-label">Scheduling Variables</div>
-              <div class="docs-kv-value">\(e_i\) drives both the rabbit radius \(r_i^r\) and the scheduled speed \(v_i^\star\).</div>
+              <div class="docs-kv-value">\(e_i\) drives both the rabbit radius \(r_i^r\) and the scheduled airspeed \(V_i^\star\).</div>
             </div>
             <div class="docs-kv-row">
               <div class="docs-kv-label">Inner-Loop Structure</div>
-              <div class="docs-kv-value">Lateral and vertical curvature errors feed separate integral states and then direct surface laws with body-rate damping.</div>
+              <div class="docs-kv-value">Lateral curvature feeds desired roll; airspeed and altitude feed TECS, which commands motor torque and desired pitch.</div>
             </div>
             <div class="docs-kv-row">
               <div class="docs-kv-label">Implementation Bounds</div>
@@ -911,9 +927,9 @@ function controllerDocsHtml(phaseMode: PhaseMode): string {
       </div>
       <div class="docs-card-body">
         <div class="docs-note-list">
-          <div class="docs-note-item"><strong>Most of the controller still matches closely.</strong> Both controllers use rabbit-point geometry, body-frame curvature references \\(\\kappa_y^\\star,\\kappa_z^\\star\\), and inertial-speed PI to motor torque.</div>
+          <div class="docs-note-item"><strong>The outer geometry still matches closely.</strong> Both controllers use phase scheduling, rabbit-point geometry, and body-frame lateral curvature references.</div>
           <div class="docs-note-item"><strong>The lateral channel is now the deliberate divergence.</strong> The flown Haskell controller drove both aileron and rudder directly from lateral-curvature terms, whereas the current Rust controller maps lateral-curvature error into a desired roll angle for aileron and uses rudder as a beta/yaw-damper coordination loop.</div>
-          <div class="docs-note-item"><strong>The propulsion loop also matches in form.</strong> Haskell used a proportional torque term on inertial speed against \\(v_{\\mathrm{ref}}\\) and a separate integral state driven by the phase-scheduled speed target \\(v_i^\\star\\). The current Rust controller keeps that same split.</div>
+          <div class="docs-note-item"><strong>The energy controller is a deliberate modernization.</strong> The flown Haskell controller used inertial-speed PI to motor torque and curvature-to-surface vertical control; current Rust uses airspeed/altitude specific-energy PI loops for motor torque and pitch reference.</div>
           <div class="docs-note-item"><strong>Main implementation differences are wrapper-level.</strong> Rust computes phase error internally instead of consuming an external <code>phaseLag</code> signal, uses hard clamps where Haskell used <code>smoothSaturate</code>, and omits the Haskell RC/enable mixing path. Rust also exposes an open-loop phase mode that was not part of the flown Haskell path.</div>
           <div class="docs-note-item"><strong>There was no hidden roll-reference layer in the flown Haskell controller.</strong> The old Haskell code had only a commented roll-angle idea. So this new roll cascade is an intentional modernization, not a recovery of a missing historical layer.</div>
         </div>
@@ -922,7 +938,7 @@ function controllerDocsHtml(phaseMode: PhaseMode): string {
     <section class="docs-card">
       <div class="docs-card-head">
         <div class="docs-card-title">Loop Topology</div>
-        <div class="docs-card-note">This is the structural answer to the “what sits between error and actuator?” question. The inner controller computes curvature references and then commands surfaces directly from curvature error, integral state, and body-rate damping.</div>
+        <div class="docs-card-note">This is the structural answer to the “what sits between error and actuator?” question. Lateral curvature becomes a roll reference; vertical path/airspeed control is now a TECS-style energy layer.</div>
       </div>
       <div class="docs-card-body">
         <div class="docs-equation">
@@ -938,14 +954,16 @@ function controllerDocsHtml(phaseMode: PhaseMode): string {
           &\\rightarrow \\delta_{a,i},\\\\[0.35em]
           \\left(\\beta_i, \\omega_{z,i}\\right)
           &\\rightarrow \\delta_{r,i},\\\\[0.35em]
-          \\left(\\kappa_{z,i}^{\\star}, \\kappa_{z,i}, I_{z,i}, \\omega_{y,i}\\right)
-          &\\rightarrow \\left(\\delta_{e,i}, \\delta_{f,i}\\right).
+          \\left(V_i^\\star,h_i^\\star,V_i,h_i\\right)
+          &\\rightarrow \\left(\\tau_i, \\theta_i^\\star\\right),\\\\[0.35em]
+          \\left(\\theta_i^\\star,\\theta_i,\\omega_{y,i}\\right)
+          &\\rightarrow \\delta_{e,i}.
           \\end{aligned}
           \\]
         </div>
         <div class="docs-note-list">
           <div class="docs-note-item">The aileron channel now has an explicit commanded roll angle <span class="docs-inline-math">\\(\\phi_i^{\\star}\\)</span>, generated from lateral-curvature error.</div>
-          <div class="docs-note-item">The vertical channel still has no explicit commanded pitch angle <span class="docs-inline-math">\\(\\theta_i^{\\star}\\)</span>, commanded angular acceleration, or commanded aerodynamic moment state.</div>
+          <div class="docs-note-item">The vertical channel now has an explicit commanded pitch angle <span class="docs-inline-math">\\(\\theta_i^{\\star}\\)</span> from the energy-balance PI loop.</div>
           <div class="docs-note-item">The most relevant “desired versus actual” lateral quantities are now <span class="docs-inline-math">\\(\\kappa_y^{\\star}\\)</span> versus <span class="docs-inline-math">\\(\\hat\\kappa_y\\)</span>, and <span class="docs-inline-math">\\(\\phi^{\\star}\\)</span> versus <span class="docs-inline-math">\\(\\phi\\)</span>.</div>
         </div>
       </div>
@@ -1027,12 +1045,13 @@ function controllerDocsHtml(phaseMode: PhaseMode): string {
           m_i &= \\tfrac12\\left(p_i^r + \\ell_i^{(2)}\\right) - \\ell_i^{(1)},\\\\
           k_i^n &= m_i\\,\\frac{\\lVert m_i \\rVert}{L_i},\\\\
           k_i^b &= R_{n\\to b} k_i^n,\\\\[0.35em]
-          I_{v,i}^{+} &= I_{v,i} + \\Delta t\\left(\\lVert v_i^{\\mathrm{cad}} \\rVert - v_i^{\\star}\\right),\\\\
           \\hat\\kappa_{y,i} &= \\frac{\\omega_{n,z,i}}{\\lVert v_i^{\\mathrm{cad}} \\rVert},\\\\
           I_{\\kappa\\phi,i}^{+} &= I_{\\kappa\\phi,i} + \\Delta t\\left(\\kappa_{y,i}^{\\star} - \\hat\\kappa_{y,i}\\right),\\\\
           \\phi_i^{\\star} &= k_{\\phi\\kappa,p}\\left(\\kappa_{y,i}^{\\star} - \\hat\\kappa_{y,i}\\right) + k_{\\phi\\kappa,i} I_{\\kappa\\phi,i},\\\\
-          I_{y,i}^{+} &= I_{y,i} + \\Delta t\\,\\tilde\\kappa_{y,i} - b_{\\alpha,y}\\,\\alpha_i^{+},\\\\
-          I_{z,i}^{+} &= I_{z,i} + \\Delta t\\,\\tilde\\kappa_{z,i} - b_{\\alpha,z}\\,\\alpha_i^{+}.
+          h_i &= -z_i,\\\\
+          e_{h,i} &= \\operatorname{sat}(h_i^\\star-h_i),\\\\
+          E_{k,i} &= \\tfrac12 V_i^2,\\qquad E_{k,i}^\\star=\\tfrac12(V_i^\\star)^2,\\\\
+          E_{p,i} &= g h_i,\\qquad E_{p,i}^\\star=g(h_i+e_{h,i}).
           \\end{aligned}
           \\]
         </div>
@@ -1045,15 +1064,21 @@ function controllerDocsHtml(phaseMode: PhaseMode): string {
       </div>
       <div class="docs-card-body">
         <div class="docs-equation">
-          <div class="docs-equation-caption">Nominal surface and torque commands</div>
+          <div class="docs-equation-caption">Nominal TECS, surface, and torque commands</div>
           \\[
           \\begin{aligned}
+          e_{k,i} &= E_{k,i}^{\\star}-E_{k,i},\\\\
+          e_{p,i} &= E_{p,i}^{\\star}-E_{p,i},\\\\
+          e_{b,i} &= e_{p,i}-e_{k,i},\\\\
+          I_{\\tau,i}^{+} &= \\operatorname{aw}\\!\\left(I_{\\tau,i}+k_{\\tau,i}e_{k,i}\\Delta t\\right),\\\\
+          I_{\\theta,i}^{+} &= \\operatorname{aw}\\!\\left(I_{\\theta,i}-k_{\\theta,i}e_{b,i}\\Delta t\\right),\\\\
+          \\tau_i &= \\tau_0 + k_{\\tau,p}e_{k,i}+I_{\\tau,i},\\\\
+          \\theta_i^\\star &= -k_{\\theta,p}e_{b,i}+I_{\\theta,i},\\\\[0.35em]
           \\delta_{a,i} &= \\delta_{a,0} + k_{a,\\phi}\\left(\\phi_i^{\\star} - \\phi_i\\right) - k_{a,p}\\,\\omega_{x,i},\\\\
-          \\delta_{f,i} &= \\delta_{f,0} + k_{f,p}\\,\\tilde\\kappa_{z,i} - k_{f,i} I_{z,i},\\\\
+          \\delta_{f,i} &= \\delta_{f,0},\\\\
           \\delta_{w,i} &= \\delta_{w,0},\\\\
-          \\delta_{e,i} &= \\delta_{e,0} - k_{e,p}\\,\\tilde\\kappa_{z,i} - k_{e,i} I_{z,i} + k_{e,\\omega}\\,\\omega_{y,i},\\\\
-          \\delta_{r,i} &= \\delta_{r,0} - k_{r,\\beta}\\,\\beta_i - k_{r,\\omega}\\,\\omega_{z,i},\\\\
-          \\tau_i &= \\tau_0 - k_{\\tau,p}\\left(\\lVert v_i^{\\mathrm{cad}} \\rVert - v_{\\mathrm{ref}}\\right) - k_{\\tau,i} I_{v,i}.
+          \\delta_{e,i} &= \\delta_{e,0} - k_{e,\\theta}\\left(\\theta_i^\\star-\\theta_i\\right) + k_{e,q}\\,\\omega_{y,i} + k_{e,\\alpha}\\alpha_i^{\\mathrm{prot}},\\\\
+          \\delta_{r,i} &= \\delta_{r,0} - k_{r,\\beta}\\,\\beta_i + k_{r,\\Omega}\\left(\\Omega_{z,i}-\\Omega_{z,i}^\\star\\right).
           \\end{aligned}
           \\]
         </div>
@@ -1075,67 +1100,63 @@ function controllerDocsHtml(phaseMode: PhaseMode): string {
           </div>
           <div class="docs-gain-row">
             <div><span class="docs-inline-math">\(k_{\phi\kappa,p},\;k_{\phi\kappa,i}\)</span></div>
-            <div><code>30.0</code>, <code>8.0</code></div>
+            <div><code>8.0</code>, <code>2.0</code></div>
             <div>Outer-loop gains that map lateral-curvature tracking error into desired roll angle.</div>
           </div>
           <div class="docs-gain-row">
             <div><span class="docs-inline-math">\(k_{a,\phi},\;k_{a,p}\)</span></div>
-            <div><code>0.5</code>, <code>0.18</code></div>
+            <div><code>0.7</code>, <code>0.22</code></div>
             <div>Inner roll loop gains from roll-angle error and roll rate to aileron command.</div>
           </div>
           <div class="docs-gain-row">
-            <div><span class="docs-inline-math">\(k_{f,p},\;k_{e,p}\)</span></div>
-            <div><code>0.3</code>, <code>1.0</code></div>
-            <div>Flap and elevator proportional curvature gains.</div>
+            <div><span class="docs-inline-math">\(k_{\tau,p},\;k_{\tau,i}\)</span></div>
+            <div><code>0.04</code>, <code>0.008</code></div>
+            <div>Specific kinetic-energy PI gains from airspeed error to motor torque.</div>
           </div>
           <div class="docs-gain-row">
-            <div><span class="docs-inline-math">\(k_{f,i}=k_{e,i}\)</span></div>
-            <div><code>gain_int_z</code></div>
-            <div>Vertical integral gain.</div>
+            <div><span class="docs-inline-math">\(k_{\theta,p},\;k_{\theta,i}\)</span></div>
+            <div><code>0.0012</code>, <code>0.00035</code></div>
+            <div>Specific energy-balance PI gains from potential-minus-kinetic error to pitch reference.</div>
+          </div>
+          <div class="docs-gain-row">
+            <div><span class="docs-inline-math">\(e_h^{\\max},\;I_{\\tau}^{\\max},\;I_{\\theta}^{\\max}\)</span></div>
+            <div><code>25 m</code>, <code>8 N m</code>, <code>7 deg</code></div>
+            <div>Altitude-error saturation and anti-windup bounds for the TECS integrators.</div>
           </div>
           <div class="docs-gain-row">
             <div><span class="docs-inline-math">\(k_{r,\beta},\;k_{r,\omega}\)</span></div>
-            <div><code>1.25</code>, <code>0.45</code></div>
+            <div><code>0.7</code>, <code>0.2</code></div>
             <div>Rudder beta feedback and yaw-rate damping gains for coordinated-turn control.</div>
           </div>
           <div class="docs-gain-row">
-            <div><span class="docs-inline-math">\(k_{a,\omega},\;k_{e,\omega},\;k_{r,\omega}\)</span></div>
-            <div><code>wx_to_ail</code>, <code>wy_to_elev</code>, <code>wz_to_rudder</code></div>
-            <div>Body-rate damping gains for roll, pitch, and yaw channels.</div>
-          </div>
-          <div class="docs-gain-row">
-            <div><span class="docs-inline-math">\(k_{\tau,p},\;k_{\tau,i}\)</span></div>
-            <div><code>speed_to_torque_p</code>, <code>speed_to_torque_i</code></div>
-            <div>Propulsion proportional and integral gains.</div>
-          </div>
-          <div class="docs-gain-row">
-            <div><span class="docs-inline-math">\(\\tau_1,\;\\tau_2,\;b_{\\alpha,y}=b_{\\alpha,z}\)</span></div>
-            <div><code>0.1 s</code>, <code>0.2 s</code>, <code>0.5</code></div>
-            <div>Rabbit lag time constants and angle-of-attack backoff coefficient.</div>
+            <div><span class="docs-inline-math">\(k_{e,\theta},\;k_{e,q},\;k_{e,\alpha}\)</span></div>
+            <div><code>0.6</code>, <code>0.18</code>, <code>2.0</code></div>
+            <div>Pitch inner-loop proportional gain, pitch-rate damping, and angle-of-attack protection.</div>
           </div>
         </div>
         <div class="docs-note-list">
           <div class="docs-note-item">The implementation applies bounds after the nominal laws are evaluated: scheduled speed, integral states, surface deflections, and motor torque are all clamped in code.</div>
           <div class="docs-note-item">The aileron channel uses a saturated lateral curvature reference <span class="docs-inline-math">\(\\bar\\kappa_{y,i}^{\\star}\)</span>, i.e. the current code limits <span class="docs-inline-math">\(\\kappa_{y,i}^{\\star}\)</span> before the proportional term.</div>
-          <div class="docs-note-item">Angle-of-attack backoff uses <span class="docs-inline-math">\(\\alpha_i^{+}\)</span>, the positive part of angle of attack capped at <span class="docs-inline-math">\(0.15\\,\\mathrm{rad}\)</span>.</div>
-          <div class="docs-note-item">Current output limits are: aileron/flap/rudder <span class="docs-inline-math">\(\\pm 15^{\\circ}\)</span>, elevator <span class="docs-inline-math">\(\\pm 20^{\\circ}\)</span>, and motor torque <span class="docs-inline-math">\(0\\le\\tau\\le 8\\,\\mathrm{N\\,m}\)</span>.</div>
+          <div class="docs-note-item">The altitude reference shown in the TECS plots is the saturated effective reference used by the energy controller.</div>
+          <div class="docs-note-item">Angle-of-attack protection still biases the elevator command after the nominal pitch loop.</div>
+          <div class="docs-note-item">Current output limits are: roll reference <span class="docs-inline-math">\(\\pm 35^{\\circ}\)</span>, pitch reference <span class="docs-inline-math">\(\\pm 14^{\\circ}\)</span>, aileron/flap/rudder <span class="docs-inline-math">\(\\pm 15^{\\circ}\)</span>, elevator <span class="docs-inline-math">\(\\pm 20^{\\circ}\)</span>, and motor torque <span class="docs-inline-math">\(0\\le\\tau\\le 16\\,\\mathrm{N\\,m}\)</span>.</div>
         </div>
       </div>
     </section>
     <section class="docs-card">
       <div class="docs-card-head">
         <div class="docs-card-title">Loop Diagrams</div>
-        <div class="docs-card-note">These are abstract control block diagrams: first the outer scheduling logic, then the curvature-based actuator loops. The second figure intentionally does not contain a roll-moment or pitch-moment block because the implementation does not have one.</div>
+        <div class="docs-card-note">These are abstract control block diagrams: first the outer scheduling and energy logic, then the roll, pitch, and coordination loops. There is still no commanded moment or angular-acceleration block.</div>
       </div>
       <div class="docs-card-body">
         <div class="docs-diagram-grid">
           <div class="docs-diagram">
             <div class="mermaid">${phaseDiagram}</div>
-            <div class="docs-diagram-caption">Figure 1. Phase mode selection, rabbit scheduling, and propulsion command generation.</div>
+            <div class="docs-diagram-caption">Figure 1. Phase mode selection, rabbit scheduling, TECS references, and motor/pitch commands.</div>
           </div>
           <div class="docs-diagram">
             <div class="mermaid">${innerLoopDiagram}</div>
-            <div class="docs-diagram-caption">Figure 2. Body-frame guidance, curvature references, integral states, and direct actuator channels. Roll and pitch are downstream plant responses, not hidden commanded states.</div>
+            <div class="docs-diagram-caption">Figure 2. Body-frame guidance, lateral roll cascade, TECS pitch cascade, and direct actuator channels.</div>
           </div>
         </div>
       </div>
@@ -1548,16 +1569,95 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
       maxColumns: 1
     },
     {
-      title: "Controller / 3. Speed & Propulsion Loop",
+      title: "Controller / 3. Total Energy Controller",
       description:
-        "This controller closes inertial-speed error with motor torque. There is no separate pitch-command speed loop in the current implementation.",
+        "Specific kinetic and potential energy loops. Airspeed error is mapped to kinetic-energy error and closed with motor torque; altitude error is saturated, converted to potential-energy error, and pitch trades potential energy against kinetic energy.",
       groups: [
         buildPerKiteGroup(
           kiteCount,
-          "Inertial Speed (m/s)",
+          "Airspeed Desired vs Actual (m/s)",
           "m/s",
-          (frame, kiteIndex) => frame.inertial_speed[kiteIndex] ?? 0,
+          (frame, kiteIndex) => frame.airspeed[kiteIndex] ?? 0,
           (frame, kiteIndex) => frame.speed_target[kiteIndex] ?? 0
+        ),
+        buildPerKiteGroup(
+          kiteCount,
+          "Altitude Desired vs Actual (m)",
+          "m",
+          (frame, kiteIndex) => frame.altitude[kiteIndex] ?? 0,
+          (frame, kiteIndex) => frame.altitude_ref[kiteIndex] ?? 0
+        ),
+        buildPerKiteGroup(
+          kiteCount,
+          "Specific Kinetic Energy Desired vs Actual (m²/s²)",
+          "m²/s²",
+          (frame, kiteIndex) => frame.kinetic_energy_specific[kiteIndex] ?? 0,
+          (frame, kiteIndex) => frame.kinetic_energy_ref_specific[kiteIndex] ?? 0
+        ),
+        buildPerKiteGroup(
+          kiteCount,
+          "Specific Potential Energy Desired vs Actual (m²/s²)",
+          "m²/s²",
+          (frame, kiteIndex) => frame.potential_energy_specific[kiteIndex] ?? 0,
+          (frame, kiteIndex) => frame.potential_energy_ref_specific[kiteIndex] ?? 0
+        ),
+        buildPerKiteGroup(
+          kiteCount,
+          "Specific Total Energy Desired vs Actual (m²/s²)",
+          "m²/s²",
+          (frame, kiteIndex) =>
+            (frame.kinetic_energy_specific[kiteIndex] ?? 0) +
+            (frame.potential_energy_specific[kiteIndex] ?? 0),
+          (frame, kiteIndex) =>
+            (frame.kinetic_energy_ref_specific[kiteIndex] ?? 0) +
+            (frame.potential_energy_ref_specific[kiteIndex] ?? 0)
+        ),
+        buildPerKiteBreakdownGroup(
+          kiteCount,
+          "Specific Energy Errors (m²/s²)",
+          "m²/s²",
+          [
+            {
+              name: "Kinetic",
+              value: (frame, kiteIndex) => frame.kinetic_energy_error_specific[kiteIndex] ?? 0
+            },
+            {
+              name: "Potential",
+              dash: "dash",
+              alpha: 0.76,
+              value: (frame, kiteIndex) => frame.potential_energy_error_specific[kiteIndex] ?? 0
+            },
+            {
+              name: "Total",
+              dash: "dot",
+              alpha: 0.62,
+              value: (frame, kiteIndex) => frame.total_energy_error_specific[kiteIndex] ?? 0
+            },
+            {
+              name: "Balance",
+              dash: "dashdot",
+              alpha: 0.62,
+              value: (frame, kiteIndex) => frame.energy_balance_error_specific[kiteIndex] ?? 0
+            }
+          ]
+        ),
+        buildPerKiteBreakdownGroup(
+          kiteCount,
+          "TECS PI Integrator Outputs",
+          "cmd units",
+          [
+            {
+              name: "Thrust Int (N m)",
+              value: (frame, kiteIndex) => frame.thrust_energy_integrator[kiteIndex] ?? 0
+            },
+            {
+              name: "Pitch Int (deg)",
+              dash: "dash",
+              alpha: 0.76,
+              value: (frame, kiteIndex) =>
+                ((frame.pitch_energy_integrator[kiteIndex] ?? 0) * 180) / Math.PI
+            }
+          ]
         ),
         buildPerKiteGroup(
           kiteCount,
@@ -1567,25 +1667,18 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
         ),
         buildPerKiteGroup(
           kiteCount,
-          "Airspeed Response (m/s)",
-          "m/s",
-          (frame, kiteIndex) => frame.airspeed[kiteIndex] ?? 0
+          "TECS Pitch Command (deg)",
+          "deg",
+          (frame, kiteIndex) => frame.pitch_ref_deg[kiteIndex] ?? 0
         ),
       ],
       maxColumns: 1
     },
     {
-      title: "Controller / 4. Vertical Inner Loop",
+      title: "Controller / 4. Pitch Inner Loop",
       description:
-        "The vertical path now follows the same sequential pattern as roll: desired vertical curvature is mapped into a desired pitch angle, and the elevator then closes pitch with q damping. Flap is held at trim for now so the elevator loop can be tuned in isolation.",
+        "The TECS energy-balance output is a desired pitch angle. The elevator closes pitch with q damping. Flap is held at trim for now so the elevator loop can be tuned in isolation.",
       groups: [
-        buildPerKiteGroup(
-          kiteCount,
-          "Curvature Z Desired vs Actual (1/m)",
-          "1/m",
-          (frame, kiteIndex) => frame.curvature_z_b[kiteIndex] ?? 0,
-          (frame, kiteIndex) => frame.curvature_z_ref[kiteIndex] ?? 0
-        ),
         buildPerKiteGroup(
           kiteCount,
           "Desired Pitch vs Actual (deg)",
@@ -1678,6 +1771,13 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
           "Top Tension (N)",
           "N",
           (frame, kiteIndex) => frame.top_tension[kiteIndex] ?? 0
+        ),
+        buildPerKiteGroup(
+          kiteCount,
+          "Vertical Curvature Desired vs Actual (1/m)",
+          "1/m",
+          (frame, kiteIndex) => frame.curvature_z_b[kiteIndex] ?? 0,
+          (frame, kiteIndex) => frame.curvature_z_ref[kiteIndex] ?? 0
         )
       ]
     },

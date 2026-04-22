@@ -144,7 +144,8 @@ pub struct EnvironmentExport {
 
 pub fn asset_manifest() -> Result<AssetManifest> {
     match ASSET_MANIFEST_CACHE.get_or_init(|| {
-        serde_json::from_str(include_str!("../assets/asset_manifest.json")).map_err(|e| e.to_string())
+        serde_json::from_str(include_str!("../assets/asset_manifest.json"))
+            .map_err(|e| e.to_string())
     }) {
         Ok(manifest) => Ok(manifest.clone()),
         Err(error) => Err(anyhow!(error.clone())),

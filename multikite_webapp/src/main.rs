@@ -9,12 +9,11 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use multikite_sim::{
-    COMMON_NODES, FREE_COMMON_NODES, FREE_UPPER_NODES, InitRequest, PhaseMode, Preset,
-    RunSummary, SimulationConfig, SimulationFrame, SimulationProgress, UPPER_NODES,
-    available_presets, simulate_free_flight1_with_callbacks, simulate_free_flight1_with_progress,
+    COMMON_NODES, FREE_COMMON_NODES, FREE_UPPER_NODES, InitRequest, PhaseMode, Preset, RunSummary,
+    SimulationConfig, SimulationFrame, SimulationProgress, UPPER_NODES, available_presets,
+    simulate_free_flight1_with_callbacks, simulate_free_flight1_with_progress,
     simulate_simple_tether_with_callbacks, simulate_simple_tether_with_progress,
-    simulate_star1_with_callbacks,
-    simulate_star1_with_progress, simulate_star3_with_callbacks,
+    simulate_star1_with_callbacks, simulate_star1_with_progress, simulate_star3_with_callbacks,
     simulate_star3_with_progress, simulate_star4_with_callbacks, simulate_star4_with_progress,
     simulate_y2_with_callbacks, simulate_y2_with_progress,
 };
@@ -85,6 +84,18 @@ struct ApiFrame {
     rabbit_targets_n: Vec<[f64; 3]>,
     phase_error: Vec<f64>,
     speed_target: Vec<f64>,
+    altitude: Vec<f64>,
+    altitude_ref: Vec<f64>,
+    kinetic_energy_specific: Vec<f64>,
+    kinetic_energy_ref_specific: Vec<f64>,
+    kinetic_energy_error_specific: Vec<f64>,
+    potential_energy_specific: Vec<f64>,
+    potential_energy_ref_specific: Vec<f64>,
+    potential_energy_error_specific: Vec<f64>,
+    total_energy_error_specific: Vec<f64>,
+    energy_balance_error_specific: Vec<f64>,
+    thrust_energy_integrator: Vec<f64>,
+    pitch_energy_integrator: Vec<f64>,
     inertial_speed: Vec<f64>,
     airspeed: Vec<f64>,
     alpha_deg: Vec<f64>,
@@ -350,6 +361,78 @@ fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
             .kites
             .iter()
             .map(|diag| diag.speed_target)
+            .collect(),
+        altitude: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.altitude)
+            .collect(),
+        altitude_ref: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.altitude_ref)
+            .collect(),
+        kinetic_energy_specific: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.kinetic_energy_specific)
+            .collect(),
+        kinetic_energy_ref_specific: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.kinetic_energy_ref_specific)
+            .collect(),
+        kinetic_energy_error_specific: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.kinetic_energy_error_specific)
+            .collect(),
+        potential_energy_specific: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.potential_energy_specific)
+            .collect(),
+        potential_energy_ref_specific: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.potential_energy_ref_specific)
+            .collect(),
+        potential_energy_error_specific: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.potential_energy_error_specific)
+            .collect(),
+        total_energy_error_specific: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.total_energy_error_specific)
+            .collect(),
+        energy_balance_error_specific: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.energy_balance_error_specific)
+            .collect(),
+        thrust_energy_integrator: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.thrust_energy_integrator)
+            .collect(),
+        pitch_energy_integrator: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.pitch_energy_integrator)
             .collect(),
         inertial_speed: frame
             .diagnostics
@@ -867,25 +950,26 @@ async fn run_stream(
             let mut plot_buffer = Vec::<ApiFrame>::new();
             let mut latest_scene_frame = None::<ApiFrame>;
             let mut last_sent_plot_len = 0usize;
-            let flush_snapshots = |plot_buffer: &Vec<ApiFrame>,
-                                   latest_scene_frame: &Option<ApiFrame>,
-                                   last_sent_plot_len: &mut usize| {
-                if let Some(frame) = latest_scene_frame.clone() {
-                    let _ = send_stream_event_blocking(
-                        &progress_sender,
-                        StreamEvent::Frame { frame },
-                    );
-                }
-                if plot_buffer.len() != *last_sent_plot_len {
-                    let _ = send_stream_event_blocking(
-                        &progress_sender,
-                        StreamEvent::PlotBuffer {
-                            frames: plot_buffer.clone(),
-                        },
-                    );
-                    *last_sent_plot_len = plot_buffer.len();
-                }
-            };
+            let flush_snapshots =
+                |plot_buffer: &Vec<ApiFrame>,
+                 latest_scene_frame: &Option<ApiFrame>,
+                 last_sent_plot_len: &mut usize| {
+                    if let Some(frame) = latest_scene_frame.clone() {
+                        let _ = send_stream_event_blocking(
+                            &progress_sender,
+                            StreamEvent::Frame { frame },
+                        );
+                    }
+                    if plot_buffer.len() != *last_sent_plot_len {
+                        let _ = send_stream_event_blocking(
+                            &progress_sender,
+                            StreamEvent::PlotBuffer {
+                                frames: plot_buffer.clone(),
+                            },
+                        );
+                        *last_sent_plot_len = plot_buffer.len();
+                    }
+                };
             let mut frame_cb = |frame: ApiFrame| {
                 plot_buffer.push(frame.clone());
                 latest_scene_frame = Some(frame);

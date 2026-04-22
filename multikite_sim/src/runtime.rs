@@ -1,6 +1,6 @@
 use crate::assets::{asset_manifest, reference_export};
 use crate::controller::{ControllerState, apply_trace, controller_step};
-use crate::math::{yaw_quaternion_n2b, zero_if_nan};
+use crate::math::{rotate_body_to_nav, rotate_nav_to_body, yaw_quaternion_n2b, zero_if_nan};
 use crate::model::{CompiledRhs, compute_bridle_node, compute_tether_link_tensions};
 use crate::turbulence::DrydenField;
 use crate::types::{
@@ -187,7 +187,12 @@ pub fn star_configuration<const NK: usize, const N_COMMON: usize, const N_UPPER:
             bridle_radius * theta.sin(),
             -bridle_altitude,
         );
-        let quat_n2b = yaw_quaternion_n2b(theta + std::f64::consts::FRAC_PI_2);
+        let path_quat_n2b = yaw_quaternion_n2b(theta + std::f64::consts::FRAC_PI_2);
+        let body_velocity_n =
+            rotate_body_to_nav(&path_quat_n2b, &Vector3::new(BODY_SPEED_0_MPS, 0.0, 0.0));
+        let apparent_air_n = body_velocity_n - params.environment.wind_n;
+        let quat_n2b = yaw_quaternion_n2b((-apparent_air_n[1]).atan2(apparent_air_n[0]));
+        let body_vel_b = rotate_nav_to_body(&quat_n2b, &body_velocity_n);
         let bridle_to_body_b =
             -(params.kites[index].bridle.pivot_b + params.kites[index].rigid_body.cad_offset_b);
         let body_pos_n = bridle_pos_n
@@ -195,13 +200,13 @@ pub fn star_configuration<const NK: usize, const N_COMMON: usize, const N_UPPER:
             + crate::math::rotate_body_to_nav(&quat_n2b, &bridle_to_body_b);
         let body = BodyState {
             pos_n: body_pos_n,
-            vel_b: Vector3::new(BODY_SPEED_0_MPS, 0.0, 0.0),
+            vel_b: body_vel_b,
             quat_n2b,
             omega_b: Vector3::zeros(),
         };
         let top = TetherNode {
             pos_n: bridle_pos_n,
-            vel_n: Vector3::zeros(),
+            vel_n: body_velocity_n,
         };
         KiteState {
             body,
@@ -228,7 +233,11 @@ pub fn free_flight_configuration<const N_COMMON: usize, const N_UPPER: usize>(
 ) -> State<f64, 1, N_COMMON, N_UPPER> {
     let body = BodyState {
         pos_n: Vector3::new(0.0, 0.0, -120.0),
-        vel_b: Vector3::new(params.controller.speed_ref, 0.0, 0.0),
+        vel_b: Vector3::new(
+            params.controller.speed_ref + params.environment.wind_n[0],
+            0.0,
+            0.0,
+        ),
         quat_n2b: yaw_quaternion_n2b(0.0),
         omega_b: Vector3::zeros(),
     };
@@ -1131,4 +1140,291 @@ pub fn simulate_simple_tether_with_callbacks<
         progress_cb,
         frame_cb,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::controller::{FreeFlightReference, controller_step_with_free_flight_reference};
+
+    use super::*;
+    use nalgebra::UnitQuaternion;
+
+    const TEST_DT_CONTROL: f64 = 0.02;
+    const ROLL_STEP_RAD: f64 = 20.0_f64.to_radians();
+
+    fn constrain_free_flight_to_2d(state: &mut State<f64, 1, FREE_COMMON_NODES, FREE_UPPER_NODES>) {
+        let body = &mut state.kites[0].body;
+        body.pos_n[1] = 0.0;
+        body.vel_b[1] = 0.0;
+        body.omega_b[0] = 0.0;
+        body.omega_b[2] = 0.0;
+
+        let (_, pitch, _) = UnitQuaternion::from_quaternion(body.quat_n2b).euler_angles();
+        body.quat_n2b = *UnitQuaternion::from_euler_angles(0.0, pitch, 0.0).quaternion();
+        state.renormalize_attitudes();
+    }
+
+    fn suppress_lateral_controls(controls: &mut Controls<f64, 1>, params: &Params<f64, 1>) {
+        controls.kites[0].surfaces.aileron = params.controller.trim.surfaces.aileron;
+        controls.kites[0].surfaces.rudder = params.controller.trim.surfaces.rudder;
+        controls.kites[0].surfaces.winglet = params.controller.trim.surfaces.winglet;
+    }
+
+    fn roll_reversal_reference(time: f64) -> f64 {
+        if time < 1.0 {
+            0.0
+        } else if time < 3.0 {
+            ROLL_STEP_RAD
+        } else if time < 5.0 {
+            -ROLL_STEP_RAD
+        } else if time < 7.0 {
+            ROLL_STEP_RAD
+        } else {
+            0.0
+        }
+    }
+
+    #[test]
+    fn total_energy_controller_tracks_2d_free_flight_climb_and_descent() {
+        let init = InitRequest {
+            preset: Preset::FreeFlight1,
+            payload_mass_kg: None,
+            wind_speed_mps: None,
+        };
+        let params = base_params::<1>(&init).expect("free-flight params");
+        let config = SimulationConfig {
+            duration: 12.0,
+            dt_control: TEST_DT_CONTROL,
+            sample_stride: 1,
+            ..SimulationConfig::default()
+        };
+        let rhs = CompiledRhs::<1, FREE_COMMON_NODES, FREE_UPPER_NODES>::shared()
+            .expect("compiled free-flight rhs");
+        let mut state = free_flight_configuration::<FREE_COMMON_NODES, FREE_UPPER_NODES>(&params);
+        constrain_free_flight_to_2d(&mut state);
+
+        let mut controls = initial_controls(&params);
+        suppress_lateral_controls(&mut controls, &params);
+        let (_, initial_diag) = rhs
+            .eval(&state, &controls, &params)
+            .expect("initial diagnostics");
+        let initial_altitude = (-initial_diag.kites[0].cad_position_n[2]
+            - params.kites[0].tether.contact.ground_altitude)
+            .max(0.0);
+        let mut controller_state = ControllerState::<1>::new(&initial_diag);
+
+        let mut time = 0.0_f64;
+        let mut min_airspeed = f64::INFINITY;
+        let mut max_abs_alpha = 0.0_f64;
+        let mut max_abs_beta = 0.0_f64;
+        let mut max_abs_y = 0.0_f64;
+        let mut max_abs_roll = 0.0_f64;
+        let mut peak_altitude = initial_altitude;
+        let mut final_altitude = initial_altitude;
+
+        while time <= config.duration + 1.0e-12 {
+            constrain_free_flight_to_2d(&mut state);
+            let (_, mut diagnostics) = rhs
+                .eval(&state, &controls, &params)
+                .expect("diagnostics during 2D TECS test");
+            let (mut next_controls, trace) = controller_step(
+                &mut controller_state,
+                &state,
+                &diagnostics,
+                &params,
+                config.dt_control,
+                config.phase_mode,
+                time,
+            );
+            suppress_lateral_controls(&mut next_controls, &params);
+            apply_trace(&mut diagnostics, &trace);
+
+            let kite_diag = &diagnostics.kites[0];
+            min_airspeed = min_airspeed.min(kite_diag.airspeed);
+            max_abs_alpha = max_abs_alpha.max(kite_diag.alpha.abs());
+            max_abs_beta = max_abs_beta.max(kite_diag.beta.abs());
+            max_abs_y = max_abs_y.max(state.kites[0].body.pos_n[1].abs());
+            let (roll, _, _) =
+                UnitQuaternion::from_quaternion(state.kites[0].body.quat_n2b).euler_angles();
+            max_abs_roll = max_abs_roll.max(roll.abs());
+
+            final_altitude = kite_diag.altitude;
+            if time >= 2.0 && time <= 7.0 {
+                peak_altitude = peak_altitude.max(kite_diag.altitude);
+            }
+
+            if time >= config.duration - 1.0e-12 {
+                break;
+            }
+
+            let step = (config.duration - time).min(config.dt_control);
+            let (next_state, _, _, _, _) =
+                integrate_interval(rhs.as_ref(), &state, &next_controls, &params, step, &config)
+                    .expect("2D TECS integration interval");
+            state = next_state;
+            constrain_free_flight_to_2d(&mut state);
+            controls = next_controls;
+            time = zero_if_nan(time + step);
+        }
+
+        assert!(
+            peak_altitude > initial_altitude + 2.0,
+            "TECS did not climb enough: initial={initial_altitude:.2} m, peak={peak_altitude:.2} m"
+        );
+        assert!(
+            final_altitude < peak_altitude - 8.0,
+            "TECS did not descend after the descent command: peak={peak_altitude:.2} m, final={final_altitude:.2} m"
+        );
+        assert!(
+            min_airspeed > 15.0,
+            "TECS let airspeed get too low: min={min_airspeed:.2} m/s"
+        );
+        assert!(
+            max_abs_alpha.to_degrees() < 15.0,
+            "TECS exceeded alpha margin in 2D free flight: max_abs_alpha={:.2} deg",
+            max_abs_alpha.to_degrees()
+        );
+        assert!(
+            max_abs_beta.to_degrees() < 1.0,
+            "2D constraint leaked sideslip: max_abs_beta={:.3} deg",
+            max_abs_beta.to_degrees()
+        );
+        assert!(
+            max_abs_y < 1.0e-9,
+            "2D constraint leaked lateral position: max_abs_y={max_abs_y:e} m"
+        );
+        assert!(
+            max_abs_roll.to_degrees() < 1.0e-9,
+            "2D constraint leaked roll: max_abs_roll={:.3e} deg",
+            max_abs_roll.to_degrees()
+        );
+    }
+
+    #[test]
+    fn roll_controller_tracks_3d_free_flight_reversals_with_fixed_tecs_refs() {
+        let init = InitRequest {
+            preset: Preset::FreeFlight1,
+            payload_mass_kg: None,
+            wind_speed_mps: None,
+        };
+        let params = base_params::<1>(&init).expect("free-flight params");
+        let config = SimulationConfig {
+            duration: 8.0,
+            dt_control: TEST_DT_CONTROL,
+            sample_stride: 1,
+            ..SimulationConfig::default()
+        };
+        let rhs = CompiledRhs::<1, FREE_COMMON_NODES, FREE_UPPER_NODES>::shared()
+            .expect("compiled free-flight rhs");
+        let mut state = free_flight_configuration::<FREE_COMMON_NODES, FREE_UPPER_NODES>(&params);
+        let mut controls = initial_controls(&params);
+        let (_, initial_diag) = rhs
+            .eval(&state, &controls, &params)
+            .expect("initial diagnostics");
+        let mut controller_state = ControllerState::<1>::new(&initial_diag);
+
+        let fixed_altitude = (-initial_diag.kites[0].cad_position_n[2]
+            - params.kites[0].tether.contact.ground_altitude)
+            .max(0.0);
+        let fixed_speed = params.controller.speed_ref;
+        let reference = |index: usize, time: f64, _initial_altitude: f64, _speed_ref: f64| {
+            assert_eq!(index, 0);
+            FreeFlightReference {
+                speed_target: fixed_speed,
+                altitude_ref_raw: fixed_altitude,
+                roll_ref: roll_reversal_reference(time),
+            }
+        };
+
+        let mut time = 0.0_f64;
+        let mut min_airspeed = f64::INFINITY;
+        let mut max_abs_alpha = 0.0_f64;
+        let mut max_abs_beta = 0.0_f64;
+        let mut max_abs_altitude_error = 0.0_f64;
+        let mut max_abs_roll = 0.0_f64;
+        let mut max_settled_roll_error = 0.0_f64;
+        let mut settled_samples = 0usize;
+
+        while time <= config.duration + 1.0e-12 {
+            let (_, mut diagnostics) = rhs
+                .eval(&state, &controls, &params)
+                .expect("diagnostics during roll regression");
+            let (next_controls, trace) = controller_step_with_free_flight_reference(
+                &mut controller_state,
+                &state,
+                &diagnostics,
+                &params,
+                config.dt_control,
+                config.phase_mode,
+                time,
+                reference,
+            );
+            apply_trace(&mut diagnostics, &trace);
+
+            let kite_diag = &diagnostics.kites[0];
+            let (roll, _, _) =
+                UnitQuaternion::from_quaternion(state.kites[0].body.quat_n2b).euler_angles();
+            let roll_ref = trace.roll_refs[0];
+            let settled = (2.2..3.0).contains(&time)
+                || (4.2..5.0).contains(&time)
+                || (6.2..7.0).contains(&time);
+
+            min_airspeed = min_airspeed.min(kite_diag.airspeed);
+            max_abs_alpha = max_abs_alpha.max(kite_diag.alpha.abs());
+            max_abs_beta = max_abs_beta.max(kite_diag.beta.abs());
+            max_abs_altitude_error =
+                max_abs_altitude_error.max((kite_diag.altitude - fixed_altitude).abs());
+            max_abs_roll = max_abs_roll.max(roll.abs());
+            if settled {
+                settled_samples += 1;
+                max_settled_roll_error = max_settled_roll_error.max((roll - roll_ref).abs());
+            }
+
+            if time >= config.duration - 1.0e-12 {
+                break;
+            }
+
+            let step = (config.duration - time).min(config.dt_control);
+            let (next_state, _, _, _, _) =
+                integrate_interval(rhs.as_ref(), &state, &next_controls, &params, step, &config)
+                    .expect("roll regression integration interval");
+            state = next_state;
+            state.renormalize_attitudes();
+            controls = next_controls;
+            time = zero_if_nan(time + step);
+        }
+
+        assert!(
+            settled_samples > 30,
+            "roll regression did not collect enough settled samples"
+        );
+        assert!(
+            max_settled_roll_error.to_degrees() < 6.0,
+            "roll controller did not track reversals: max settled error={:.2} deg",
+            max_settled_roll_error.to_degrees()
+        );
+        assert!(
+            max_abs_roll.to_degrees() < 32.0,
+            "roll controller overshot too far: max_abs_roll={:.2} deg",
+            max_abs_roll.to_degrees()
+        );
+        assert!(
+            min_airspeed > 18.0,
+            "roll reversals let airspeed get too low: min={min_airspeed:.2} m/s"
+        );
+        assert!(
+            max_abs_alpha.to_degrees() < 12.0,
+            "roll reversals exceeded alpha margin: max_abs_alpha={:.2} deg",
+            max_abs_alpha.to_degrees()
+        );
+        assert!(
+            max_abs_beta.to_degrees() < 12.0,
+            "roll reversals exceeded beta margin: max_abs_beta={:.2} deg",
+            max_abs_beta.to_degrees()
+        );
+        assert!(
+            max_abs_altitude_error < 12.0,
+            "fixed-altitude TECS drifted during roll test: max_abs_altitude_error={max_abs_altitude_error:.2} m"
+        );
+    }
 }

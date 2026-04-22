@@ -12,8 +12,8 @@ use optimization::{
     FunctionCompileOptions, LlvmOptimizationLevel, flatten_value, symbolic_column, symbolic_value,
     unflatten_value,
 };
-use std::cell::RefCell;
 use std::any::Any;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Mutex;
@@ -52,6 +52,18 @@ fn blank_kite_diag<T: Scalar>() -> KiteDiagnostics<T> {
         phase_angle: T::zero(),
         phase_error: T::zero(),
         speed_target: T::zero(),
+        altitude: T::zero(),
+        altitude_ref: T::zero(),
+        kinetic_energy_specific: T::zero(),
+        kinetic_energy_ref_specific: T::zero(),
+        kinetic_energy_error_specific: T::zero(),
+        potential_energy_specific: T::zero(),
+        potential_energy_ref_specific: T::zero(),
+        potential_energy_error_specific: T::zero(),
+        total_energy_error_specific: T::zero(),
+        energy_balance_error_specific: T::zero(),
+        thrust_energy_integrator: T::zero(),
+        pitch_energy_integrator: T::zero(),
         rabbit_phase: T::zero(),
         rabbit_radius: T::zero(),
         rabbit_target_n: zero_vec(),
@@ -615,6 +627,18 @@ fn compute_kite<T: Scalar, const N_UPPER: usize>(
             phase_angle: phase,
             phase_error: T::zero(),
             speed_target: common_params.controller.speed_ref,
+            altitude: T::zero(),
+            altitude_ref: T::zero(),
+            kinetic_energy_specific: T::zero(),
+            kinetic_energy_ref_specific: T::zero(),
+            kinetic_energy_error_specific: T::zero(),
+            potential_energy_specific: T::zero(),
+            potential_energy_ref_specific: T::zero(),
+            potential_energy_error_specific: T::zero(),
+            total_energy_error_specific: T::zero(),
+            energy_balance_error_specific: T::zero(),
+            thrust_energy_integrator: T::zero(),
+            pitch_energy_integrator: T::zero(),
             rabbit_phase: T::zero(),
             rabbit_radius: common_params.controller.disk_radius,
             rabbit_target_n: zero_vec(),
@@ -883,7 +907,8 @@ impl<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>
         let key = (NK, N_COMMON, N_UPPER);
         if let Some(existing) = COMPILED_RHS_CACHE.with(|cache| {
             let cache = cache.borrow();
-            cache.get(&key)
+            cache
+                .get(&key)
                 .and_then(|entry| entry.downcast_ref::<Rc<Self>>())
                 .cloned()
         }) {
@@ -893,7 +918,9 @@ impl<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>
         let rhs = Rc::new(Self::new()?);
         COMPILED_RHS_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
-            let existing = cache.entry(key).or_insert_with(|| Box::new(rhs.clone()) as Box<dyn Any>);
+            let existing = cache
+                .entry(key)
+                .or_insert_with(|| Box::new(rhs.clone()) as Box<dyn Any>);
             if let Some(cached) = existing.downcast_ref::<Rc<Self>>() {
                 Ok(cached.clone())
             } else {
