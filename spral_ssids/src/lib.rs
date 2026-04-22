@@ -8913,6 +8913,17 @@ extern "C" int spral_kernel_block_prefix_trace_32(
         (dimension, lower_dense)
     }
 
+    fn lower_dense_seed09_case0() -> (usize, Vec<f64>) {
+        let (dimension, dense) = dense_seed09_case0_matrix();
+        let mut lower_dense = vec![0.0; dimension * dimension];
+        for col in 0..dimension {
+            for row in col..dimension {
+                lower_dense[dense_lower_offset(dimension, row, col)] = dense[row][col];
+            }
+        }
+        (dimension, lower_dense)
+    }
+
     fn copy_lower_dense_to_stride(dense: &[f64], size: usize, stride: usize) -> Vec<f64> {
         assert!(stride >= size);
         let mut strided = vec![0.0; stride * stride];
@@ -8987,6 +8998,23 @@ extern "C" int spral_kernel_block_prefix_trace_32(
             return;
         };
         let (dimension, lower_dense) = lower_dense_seed6_33();
+        let aligned_stride = native_aligned_double_stride(shim, dimension);
+        let aligned_lower_dense =
+            copy_lower_dense_to_stride(&lower_dense, dimension, aligned_stride);
+        let options = NumericFactorOptions::default();
+        let rust_trace =
+            rust_app_block_prefix_trace_32(&aligned_lower_dense, aligned_stride, options);
+        let native_trace =
+            native_block_prefix_trace_32(shim, &lower_dense, dimension, aligned_stride, options);
+        assert_block_prefix_traces_equal(&rust_trace, &native_trace);
+    }
+
+    #[test]
+    fn app_block_ldlt_32_aligned_prefix_trace_matches_native_dense_seed09_case0() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let (dimension, lower_dense) = lower_dense_seed09_case0();
         let aligned_stride = native_aligned_double_stride(shim, dimension);
         let aligned_lower_dense =
             copy_lower_dense_to_stride(&lower_dense, dimension, aligned_stride);

@@ -8,6 +8,16 @@ nodes are newly passing guards that narrow an open mismatch without proving full
 bitwise parity. Red nodes are the next open bitwise mismatch target.
 
 Current newly passing witness:
+`app_block_ldlt_32_aligned_prefix_trace_matches_native_dense_seed09_case0`
+pins the dense seed09 first APP diagonal block against native
+`target/native/spral-upstream/src/ssids/cpu/kernels/block_ldlt.hxx` at the
+same aligned leading dimension used by the full 55-row front. The per-pivot
+trace covers factor status, next pivot, global/local permutations, lower block
+storage, `ldwork`, and inverse-D storage bitwise. The remaining red dense
+seed09 inverse-D drift is therefore not caused by the first APP block's
+`block_ldlt<32>` prefix.
+
+Previous newly narrowed witness:
 `dense_seed09_case0_production_inverse_d_mismatches_are_nonzero_numeric_components`
 keeps the full dense seed09 production inverse-D mismatch pinned to nonzero
 numeric D components. The first mismatch remains pivot 37 component 1 with
@@ -16,7 +26,7 @@ is nonzero on both Rust and native sides. This does not turn the full inverse-D
 node green; it rules out another signed-zero or structural-layout explanation
 for the remaining red witness.
 
-Previous newly passing witness:
+Earlier newly passing witness:
 `dense_seed09_case0_production_inverse_d_structural_zero_components_match_native`
 pins the full dense seed09 production inverse-D enquiry layout for structural
 zero off-diagonal components. Every Rust entry whose `d(2,:)` component is the
@@ -117,8 +127,9 @@ flowchart TD
 
     G2 -->|"failed / delayed"| G10["delay pivot to parent front"]
 
-    G5 --> I0["Dense seed09 APP-stride apply_pivot OP_N L block"]
-    G9 --> I0
+    G5 --> I00["Dense seed09 first APP block_ldlt trace"]
+    G9 --> I00
+    I00 --> I0["Dense seed09 APP-stride apply_pivot OP_N L block"]
     I0 --> I["APP accepted-prefix update"]
     G10 --> J["Record delayed pivots"]
     H --> I
@@ -163,8 +174,9 @@ flowchart TD
     classDef open fill:#ffd8d8,stroke:#b43b3b,color:#2b0d0d,stroke-width:2px;
 
     class A,B,B1,B2,B3,G0,G1,G3,G5,G6,G8,G8a,G8b,G9,H1,H2,H3,K1,M,O,P,Q,R match;
+    class I00 newly;
     class K4j match;
-    class K4k newlyPartial;
+    class K4k partial;
     class C,D,E,F,G,G2,G4,G7,G10,H,I,J,K,L,N partial;
     class G8c,G8d,G9a,I0,I1,I2,I3,K2,K3,K4a,K4c,K4d,K4e,K4f,K4g,K4h,K4i match;
     class K4b,K4 open;
