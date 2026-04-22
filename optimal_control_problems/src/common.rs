@@ -5987,6 +5987,7 @@ pub fn nlip_options(config: &SolverConfig) -> InteriorPointOptions {
         dual_tol: config.dual_tol,
         constraint_tol: config.constraint_tol,
         complementarity_tol: config.complementarity_tol,
+        overall_tol: tol,
         acceptable_tol: tol,
         acceptable_iter: 0,
         acceptable_dual_inf_tol: config.dual_tol,
@@ -9412,6 +9413,26 @@ mod tests {
             (value - expected).abs() < 1.0e-12,
             "expected {expected}, got {value}"
         );
+    }
+
+    #[test]
+    fn nlip_overall_tolerance_tracks_ipopt_tol() {
+        let config = SolverConfig {
+            dual_tol: 1.0e-5,
+            constraint_tol: 1.0e-8,
+            complementarity_tol: 1.0e-6,
+            ..default_solver_config()
+        };
+
+        let nlip = nlip_options(&config);
+        assert_eq!(nlip.overall_tol, 1.0e-8);
+        assert_eq!(nlip.acceptable_tol, 1.0e-8);
+
+        #[cfg(feature = "ipopt")]
+        {
+            let ipopt = ipopt_options(&config);
+            assert_eq!(nlip.overall_tol, ipopt.tol);
+        }
     }
 
     #[test]
