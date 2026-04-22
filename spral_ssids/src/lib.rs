@@ -2845,8 +2845,10 @@ fn tpp_factor_two_by_two(
         let b2 = matrix[dense_lower_offset(size, row, pivot + 1)];
         first_scratch[row] = b1;
         second_scratch[row] = b2;
-        let l1 = inv11.mul_add(b1, inv12 * b2);
-        let l2 = inv12.mul_add(b1, inv22 * b2);
+        // Native SPRAL's ldlt_tpp.cxx::apply_2x2 evaluates these as
+        // independent products followed by an addition.
+        let l1 = inv11 * b1 + inv12 * b2;
+        let l2 = inv12 * b1 + inv22 * b2;
         if !l1.is_finite() || !l2.is_finite() {
             return Err(SsidsError::NumericalBreakdown {
                 pivot: rows[pivot],
@@ -4560,6 +4562,7 @@ mod tests {
     use std::os::raw::c_int;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::ptr;
     use std::sync::OnceLock;
 
     use libloading::Library;
@@ -4704,6 +4707,22 @@ mod tests {
         f64,
         *mut c_int,
     );
+    type LdltTppFactorFn = unsafe extern "C" fn(
+        c_int,
+        c_int,
+        *mut c_int,
+        *mut f64,
+        c_int,
+        *mut f64,
+        *mut f64,
+        c_int,
+        c_int,
+        f64,
+        f64,
+        c_int,
+        *mut f64,
+        c_int,
+    ) -> c_int;
 
     struct NativeKernelShim {
         _libspral: Library,
@@ -4728,6 +4747,7 @@ mod tests {
         block_first_step_32: BlockFirstStep32Fn,
         block_prefix_trace_32: BlockPrefixTrace32Fn,
         block_ldlt_32: BlockLdlt32Fn,
+        ldlt_tpp_factor: LdltTppFactorFn,
     }
 
     static NATIVE_KERNEL_SHIM: OnceLock<Result<NativeKernelShim, String>> = OnceLock::new();
@@ -4940,6 +4960,11 @@ mod tests {
                 .get::<BlockLdlt32Fn>(b"spral_kernel_block_ldlt_32\0")
                 .map_err(|error| format!("failed to load block_ldlt_32 shim: {error}"))?
         };
+        let ldlt_tpp_factor = unsafe {
+            *library
+                .get::<LdltTppFactorFn>(b"spral_kernel_ldlt_tpp_factor\0")
+                .map_err(|error| format!("failed to load ldlt_tpp_factor shim: {error}"))?
+        };
 
         Ok(NativeKernelShim {
             _libspral: libspral_library,
@@ -4964,6 +4989,7 @@ mod tests {
             block_first_step_32,
             block_prefix_trace_32,
             block_ldlt_32,
+            ldlt_tpp_factor,
         })
     }
 
@@ -5015,6 +5041,7 @@ mod tests {
 #include "ssids/cpu/cpu_iface.hxx"
 #include "ssids/cpu/kernels/block_ldlt.hxx"
 #include "ssids/cpu/kernels/ldlt_app.hxx"
+#include "ssids/cpu/kernels/ldlt_tpp.hxx"
 #include "ssids/cpu/kernels/wrappers.hxx"
 
 namespace spral { namespace ssids { namespace cpu {
@@ -5110,6 +5137,15 @@ extern "C" void spral_kernel_block_ldlt_32(
       int action, double u, double small, int* lperm) {
    spral::ssids::cpu::block_ldlt<double, 32>(
          from, perm, a, lda, d, ldwork, action != 0, u, small, lperm);
+}
+
+extern "C" int spral_kernel_ldlt_tpp_factor(
+      int m, int n, int* perm, double* a, int lda, double* d,
+      double* ld, int ldld, int action, double u, double small,
+      int nleft, double* aleft, int ldleft) {
+   return spral::ssids::cpu::ldlt_tpp_factor(
+         m, n, perm, a, lda, d, ld, ldld, action != 0, u, small,
+         nleft, aleft, ldleft);
 }
 
 extern "C" void spral_kernel_block_update_1x1_32(
@@ -5454,6 +5490,14 @@ extern "C" int spral_kernel_block_prefix_trace_32(
     struct BlockLdltKernelResult {
         perm: Vec<usize>,
         local_perm: Vec<usize>,
+        matrix: Vec<f64>,
+        diagonal: Vec<f64>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct DenseTppKernelResult {
+        eliminated: usize,
+        perm: Vec<usize>,
         matrix: Vec<f64>,
         diagonal: Vec<f64>,
     }
@@ -6645,6 +6689,141 @@ extern "C" int spral_kernel_block_prefix_trace_32(
             local_perm: factorization.factor_order[..APP_INNER_BLOCK_SIZE].to_vec(),
             matrix,
             diagonal,
+        }
+    }
+
+    fn native_ldlt_tpp_factor_from_lower_dense(
+        shim: &NativeKernelShim,
+        dense: &[f64],
+        size: usize,
+        candidate_len: usize,
+        options: NumericFactorOptions,
+    ) -> DenseTppKernelResult {
+        debug_assert_eq!(dense.len(), size * size);
+        debug_assert!(candidate_len <= size);
+        let mut matrix = copy_lower_dense_to_stride(dense, size, size);
+        let mut perm = (0..size as c_int).collect::<Vec<_>>();
+        let mut diagonal = vec![0.0; 2 * candidate_len.max(1)];
+        let mut ld = vec![0.0; 2 * size.max(1)];
+        let eliminated = unsafe {
+            (shim.ldlt_tpp_factor)(
+                size as c_int,
+                candidate_len as c_int,
+                perm.as_mut_ptr(),
+                matrix.as_mut_ptr(),
+                size as c_int,
+                diagonal.as_mut_ptr(),
+                ld.as_mut_ptr(),
+                size as c_int,
+                i32::from(options.action_on_zero_pivot),
+                options.threshold_pivot_u,
+                options.small_pivot_tolerance,
+                0,
+                ptr::null_mut(),
+                0,
+            )
+        };
+        assert!(
+            eliminated >= 0,
+            "native ldlt_tpp_factor returned {eliminated}"
+        );
+        DenseTppKernelResult {
+            eliminated: eliminated as usize,
+            perm: perm.into_iter().map(|entry| entry as usize).collect(),
+            matrix,
+            diagonal,
+        }
+    }
+
+    fn dense_tpp_diagonal_from_blocks(
+        blocks: &[FactorBlockRecord],
+        candidate_len: usize,
+    ) -> Vec<f64> {
+        let mut diagonal = vec![0.0; 2 * candidate_len.max(1)];
+        let mut pivot = 0;
+        for block in blocks {
+            if pivot >= candidate_len {
+                break;
+            }
+            if block.size == 1 {
+                diagonal[2 * pivot] = block.values[0];
+                diagonal[2 * pivot + 1] = block.values[1];
+                pivot += 1;
+            } else {
+                diagonal[2 * pivot] = block.values[0];
+                diagonal[2 * pivot + 1] = block.values[1];
+                diagonal[2 * pivot + 2] = block.values[2];
+                diagonal[2 * pivot + 3] = block.values[3];
+                pivot += 2;
+            }
+        }
+        diagonal
+    }
+
+    fn rust_ldlt_tpp_factor_from_lower_dense(
+        dense: &[f64],
+        size: usize,
+        candidate_len: usize,
+        options: NumericFactorOptions,
+    ) -> DenseTppKernelResult {
+        debug_assert_eq!(dense.len(), size * size);
+        debug_assert!(candidate_len <= size);
+        let mut rows = (0..size).collect::<Vec<_>>();
+        let mut matrix = dense.to_vec();
+        let mut ld = vec![0.0; 2 * size.max(1)];
+        let factorization = factorize_dense_tpp_tail_in_place(
+            &mut rows,
+            &mut matrix,
+            DenseTppTailRequest {
+                start_pivot: 0,
+                candidate_len,
+                options,
+                require_full_elimination: true,
+                profile_enabled: false,
+            },
+            &mut ld,
+        )
+        .expect("rust TPP factorization");
+        DenseTppKernelResult {
+            eliminated: factorization.factor_order.len(),
+            perm: factorization.factor_order,
+            matrix,
+            diagonal: dense_tpp_diagonal_from_blocks(&factorization.block_records, candidate_len),
+        }
+    }
+
+    fn assert_dense_tpp_kernel_results_equal(
+        label: &str,
+        rust: &DenseTppKernelResult,
+        native: &DenseTppKernelResult,
+        active_columns: usize,
+    ) {
+        assert_eq!(rust.eliminated, native.eliminated, "{label}");
+        assert_eq!(
+            &rust.perm[..active_columns],
+            &native.perm[..active_columns],
+            "{label}"
+        );
+        for (index, (&rust_value, &native_value)) in
+            rust.diagonal.iter().zip(&native.diagonal).enumerate()
+        {
+            assert_eq!(
+                rust_value.to_bits(),
+                native_value.to_bits(),
+                "{label}: ldlt_tpp d mismatch index={index} rust={rust_value:?} native={native_value:?}"
+            );
+        }
+        let size = active_columns;
+        for col in 0..active_columns {
+            for row in col..size {
+                let rust_value = rust.matrix[col * size + row];
+                let native_value = native.matrix[col * size + row];
+                assert_eq!(
+                    rust_value.to_bits(),
+                    native_value.to_bits(),
+                    "{label}: ldlt_tpp matrix mismatch row={row} col={col} rust={rust_value:?} native={native_value:?}"
+                );
+            }
         }
     }
 
@@ -8244,6 +8423,53 @@ extern "C" int spral_kernel_block_prefix_trace_32(
             }
         }
         dense
+    }
+
+    #[test]
+    fn dense_tpp_factor_4x4_matches_native_kernel() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let dense = square_to_dense_lower(&[
+            vec![4.0, 1.0, 0.25, -0.5],
+            vec![1.0, -3.0, 0.75, 0.125],
+            vec![0.25, 0.75, 2.0, -1.0],
+            vec![-0.5, 0.125, -1.0, 1.5],
+        ]);
+        let options = NumericFactorOptions::default();
+
+        let rust = rust_ldlt_tpp_factor_from_lower_dense(&dense, 4, 4, options);
+        let native = native_ldlt_tpp_factor_from_lower_dense(shim, &dense, 4, 4, options);
+
+        assert_dense_tpp_kernel_results_equal("4x4 hand witness", &rust, &native, 4);
+    }
+
+    #[test]
+    #[ignore = "manual native-vs-rust TPP update-order witness; case 0 first differs in D at index 4"]
+    fn dense_tpp_factor_small_dyadic_cases_match_native_kernel() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let options = NumericFactorOptions::default();
+
+        for case in 0..16 {
+            let dimension = 3 + case % 4;
+            let mut rng = DenseBoundaryRng::new(0x7d00_0000_0000_0000_u64 ^ case as u64);
+            let mut matrix = random_dense_dyadic_matrix(dimension, &mut rng);
+            for (row, values) in matrix.iter_mut().enumerate() {
+                let offset = if row.is_multiple_of(2) { 4.0 } else { -4.0 };
+                values[row] += offset;
+            }
+            let dense = square_to_dense_lower(&matrix);
+
+            let rust = rust_ldlt_tpp_factor_from_lower_dense(&dense, dimension, dimension, options);
+            let native = native_ldlt_tpp_factor_from_lower_dense(
+                shim, &dense, dimension, dimension, options,
+            );
+
+            let label = format!("dyadic case={case} dimension={dimension}");
+            assert_dense_tpp_kernel_results_equal(&label, &rust, &native, dimension);
+        }
     }
 
     #[test]

@@ -6,9 +6,12 @@ newly passing in the current checkpoint. Orange nodes have partial coverage or a
 known narrowed boundary. Red nodes are the next open bitwise mismatch target.
 
 Current newly passing witness:
-`dense_seed6_production_app_prefix_inverse_d_matches_native` proves that the
-production seed6 APP accepted inverse-D prefix matches native bitwise through
-flattened entry 11. Flattened entry 12 remains the first TPP-tail mismatch.
+`dense_tpp_factor_4x4_matches_native_kernel` calls native
+`ldlt_tpp_factor` directly and proves a standalone 4x4 TPP factorization
+matches Rust bitwise for eliminated count, permutation, D values, and lower
+factor state. The next smaller open TPP witness is
+`dense_tpp_factor_small_dyadic_cases_match_native_kernel`, where case 0 first
+differs in D at index 4.
 
 ```mermaid
 flowchart TD
@@ -27,6 +30,8 @@ flowchart TD
 
     F -->|"APP block path"| G["block_ldlt APP panel"]
     F -->|"TPP / tail path"| H["dense TPP tail factorization"]
+    H --> H1["Standalone TPP 4x4 factor state"]
+    H1 --> H2["Dyadic TPP update-order cases"]
 
     G --> G0["Native align_lda panel layout"]
     G0 --> G1["find_maxloc"]
@@ -68,8 +73,8 @@ flowchart TD
     classDef partial fill:#ffe3bf,stroke:#b76d12,color:#2b1800,stroke-width:2px;
     classDef open fill:#ffd8d8,stroke:#b43b3b,color:#2b0d0d,stroke-width:2px;
 
-    class A,B,B1,B2,B3,G0,G1,G3,G5,G6,G8,G9,K1,M,O,P,Q,R match;
-    class K2 newly;
+    class A,B,B1,B2,B3,G0,G1,G3,G5,G6,G8,G9,K1,K2,M,O,P,Q,R match;
+    class H1 newly;
     class C,D,E,F,G,G2,G4,G7,G10,H,I,J,K,L,N partial;
-    class K3 open;
+    class H2,K3 open;
 ```
