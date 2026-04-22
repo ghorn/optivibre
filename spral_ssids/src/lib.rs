@@ -2229,9 +2229,8 @@ fn app_update_two_by_two(
             let update_entry = dense_lower_offset(size, row, col);
             let first_multiplier = matrix[dense_lower_offset(size, row, pivot)];
             let second_multiplier = matrix[dense_lower_offset(size, row, pivot + 1)];
-            // Match the local native code generated from block_ldlt.hxx::update_2x2.
             matrix[update_entry] -=
-                second_preserved.mul_add(second_multiplier, first_preserved * first_multiplier);
+                first_preserved * first_multiplier + second_preserved * second_multiplier;
         }
     }
 }
@@ -2317,9 +2316,8 @@ fn factor_two_by_two_common(
         let b2 = matrix[dense_lower_offset(size, row, pivot + 1)];
         first_scratch[row] = b1;
         second_scratch[row] = b2;
-        // Match the local native code generated from block_ldlt.hxx's divide-through assignment.
-        let l1 = inv12.mul_add(b2, inv11 * b1);
-        let l2 = inv12.mul_add(b1, inv22 * b2);
+        let l1 = inv11 * b1 + inv12 * b2;
+        let l2 = inv12 * b1 + inv22 * b2;
         if !l1.is_finite() || !l2.is_finite() {
             return Err(SsidsError::NumericalBreakdown {
                 pivot: rows[pivot],
@@ -4572,17 +4570,18 @@ mod tests {
     use proptest::test_runner::{Config, RngAlgorithm, RngSeed, TestRng, TestRunner};
 
     use super::{
-        APP_INNER_BLOCK_SIZE, DenseTppTailRequest, FactorBlockRecord, NativeOrdering, NativeSpral,
-        NumericFactorOptions, OrderingStrategy, SolvePanel, SsidsOptions, SymmetricCscMatrix,
-        analyse, app_apply_block_pivots_to_trailing_rows, app_build_ld_workspace,
+        APP_INNER_BLOCK_SIZE, DenseTppTailRequest, DenseUpdateBounds, FactorBlockRecord,
+        NativeOrdering, NativeSpral, NumericFactorOptions, OrderingStrategy, PanelFactorStats,
+        SolvePanel, SsidsError, SsidsOptions, SymmetricCscMatrix, analyse,
+        app_apply_block_pivots_to_trailing_rows, app_build_ld_workspace,
         app_solve_block_triangular_to_trailing_rows, app_two_by_two_inverse, app_update_one_by_one,
         app_update_two_by_two, build_symbolic_front_tree, dense_find_maxloc, dense_lower_offset,
-        dense_symmetric_swap_with_workspace, expand_symmetric_pattern, factorize,
-        factorize_dense_front, factorize_dense_tpp_tail_in_place, native_column_counts,
-        native_postorder_permutation, openblas_gemv_n_update_like_native,
-        openblas_gemv_t_dot_like_contiguous, openblas_trsv_lower_unit_op_n_like_native,
-        openblas_trsv_lower_unit_op_t_like_native, permute_graph,
-        solve_forward_front_panels_like_native, solve_two_by_two_block_in_place,
+        dense_symmetric_swap_with_workspace, expand_symmetric_pattern, factor_one_by_one_common,
+        factor_two_by_two_common, factorize, factorize_dense_front,
+        factorize_dense_tpp_tail_in_place, native_column_counts, native_postorder_permutation,
+        openblas_gemv_n_update_like_native, openblas_gemv_t_dot_like_contiguous,
+        openblas_trsv_lower_unit_op_n_like_native, openblas_trsv_lower_unit_op_t_like_native,
+        permute_graph, solve_forward_front_panels_like_native, solve_two_by_two_block_in_place,
         symbolic_factor_pattern,
     };
 
@@ -4658,6 +4657,19 @@ mod tests {
         unsafe extern "C" fn(c_int, *const f64, c_int, *mut f64, *mut c_int, *mut c_int);
     type BlockTest2x2Fn = unsafe extern "C" fn(f64, f64, f64, *mut f64, *mut f64) -> c_int;
     type BlockTwoByTwoMultipliersFn = unsafe extern "C" fn(f64, f64, f64, f64, f64, *mut f64);
+    type BlockFirstStep32Fn = unsafe extern "C" fn(
+        c_int,
+        *mut c_int,
+        *mut f64,
+        c_int,
+        *mut f64,
+        *mut f64,
+        c_int,
+        f64,
+        f64,
+        *mut c_int,
+        *mut c_int,
+    ) -> c_int;
     type BlockLdlt32Fn = unsafe extern "C" fn(
         c_int,
         *mut c_int,
@@ -4690,6 +4702,7 @@ mod tests {
         block_find_maxloc_32: BlockFindMaxlocFn,
         block_test_2x2: BlockTest2x2Fn,
         block_two_by_two_multipliers: BlockTwoByTwoMultipliersFn,
+        block_first_step_32: BlockFirstStep32Fn,
         block_ldlt_32: BlockLdlt32Fn,
     }
 
@@ -4757,6 +4770,7 @@ mod tests {
         let mut command = Command::new(&cxx);
         command
             .arg("-std=c++17")
+            .arg("-ffp-contract=off")
             .arg(dynamic_library_flag())
             .arg("-fPIC")
             .arg("-I")
@@ -4882,6 +4896,11 @@ mod tests {
                     format!("failed to load block_two_by_two_multipliers shim: {error}")
                 })?
         };
+        let block_first_step_32 = unsafe {
+            *library
+                .get::<BlockFirstStep32Fn>(b"spral_kernel_block_first_step_32\0")
+                .map_err(|error| format!("failed to load block_first_step_32 shim: {error}"))?
+        };
         let block_ldlt_32 = unsafe {
             *library
                 .get::<BlockLdlt32Fn>(b"spral_kernel_block_ldlt_32\0")
@@ -4907,6 +4926,7 @@ mod tests {
             block_find_maxloc_32,
             block_test_2x2,
             block_two_by_two_multipliers,
+            block_first_step_32,
             block_ldlt_32,
         })
     }
@@ -5092,6 +5112,99 @@ extern "C" void spral_kernel_block_two_by_two_multipliers(
    out[0] = d11*work0 + d21*work1;
    out[1] = d21*work0 + d22*work1;
 }
+
+extern "C" int spral_kernel_block_first_step_32(
+      int from, int* perm, double* a, int lda, double* d, double* ldwork,
+      int action, double u, double small, int* lperm, int* next_p) {
+   using namespace spral::ssids::cpu::block_ldlt_internal;
+
+   int p = from;
+   double bestv;
+   int t, m;
+   find_maxloc<double, 32>(p, a, lda, bestv, t, m);
+
+   if(fabs(bestv) < small) {
+      if(!action) return -1;
+      for(; p<32; ) {
+         d[2*p] = 0.0; d[2*p+1] = 0.0;
+         for(int r=p; r<32; r++)
+            a[p*lda+r] = 0.0;
+         for(int r=p; r<32; r++)
+            ldwork[p*32+r] = 0.0;
+         p++;
+      }
+      *next_p = p;
+      return 0;
+   }
+
+   int pivsiz = 0;
+   double a11, a21 = 0.0, a22 = 0.0, detscale = 0.0, detpiv = 0.0;
+   if(t==m) {
+      a11 = a[t*lda+t];
+      pivsiz = 1;
+   } else {
+      a11 = a[m*lda+m];
+      a22 = a[t*lda+t];
+      a21 = a[m*lda+t];
+      if(test_2x2<double>(a11, a21, a22, detpiv, detscale)) {
+         pivsiz = 2;
+      } else {
+         if(fabs(a11) > fabs(a22)) {
+            pivsiz = 1;
+            t = m;
+            if(fabs(a11 / a21) < u) pivsiz = 0;
+         } else {
+            pivsiz = 1;
+            a11 = a22;
+            m = t;
+            if(fabs(a22 / a21) < u) pivsiz = 0;
+         }
+      }
+   }
+
+   if(pivsiz == 0) return -2;
+   if(pivsiz == 1) {
+      double d11 = 1.0/a11;
+      swap_cols<double, 32>(p, t, 32, a, lda, ldwork, perm);
+      if(lperm) { int temp=lperm[p]; lperm[p]=lperm[t]; lperm[t]=temp; }
+      double *work = &ldwork[p*32];
+      for(int r=p+1; r<32; r++) {
+         work[r] = a[p*lda+r];
+         a[p*lda+r] *= d11;
+      }
+      update_1x1<double, 32>(p, a, lda, work);
+      d[2*p] = d11;
+      d[2*p+1] = 0.0;
+      a[p*lda+p] = 1.0;
+   } else {
+      swap_cols<double, 32>(p, m, 32, a, lda, ldwork, perm);
+      if(lperm) { int temp=lperm[p]; lperm[p]=lperm[m]; lperm[m]=temp; }
+      swap_cols<double, 32>(p+1, t, 32, a, lda, ldwork, perm);
+      if(lperm) { int temp=lperm[p+1]; lperm[p+1]=lperm[t]; lperm[t]=temp; }
+      double d11 = (a22*detscale)/detpiv;
+      double d22 = (a11*detscale)/detpiv;
+      double d21 = (-a21*detscale)/detpiv;
+      double *work = &ldwork[p*32];
+      for(int r=p+2; r<32; r++) {
+         work[r] = a[p*lda+r];
+         work[32+r] = a[(p+1)*lda+r];
+         a[p*lda+r] = d11*work[r] + d21*work[32+r];
+         a[(p+1)*lda+r] = d21*work[r] + d22*work[32+r];
+      }
+      update_2x2<double, 32>(p, a, lda, work);
+      d[2*p] = d11;
+      d[2*p+1] = d21;
+      d[2*p+2] = std::numeric_limits<double>::infinity();
+      d[2*p+3] = d22;
+      a[p*(lda+1)] = 1.0;
+      a[p*(lda+1)+1] = 0.0;
+      a[(p+1)*(lda+1)] = 1.0;
+   }
+
+   p += pivsiz;
+   *next_p = p;
+   return pivsiz;
+}
 "#
     }
 
@@ -5185,6 +5298,22 @@ extern "C" void spral_kernel_block_two_by_two_multipliers(
         seed: u64,
         from: usize,
         matrix: Vec<f64>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct BlockFirstStepCase {
+        seed: u64,
+        from: usize,
+        matrix: Vec<f64>,
+        perm: Vec<usize>,
+        local_perm: Vec<usize>,
+        options: NumericFactorOptions,
+    }
+
+    struct BlockFirstStepState<'a> {
+        matrix: &'a [f64],
+        workspace: &'a [f64],
+        diagonal: &'a [f64],
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -5393,6 +5522,43 @@ extern "C" void spral_kernel_block_two_by_two_multipliers(
             }
         }
         BlockFindMaxlocCase { seed, from, matrix }
+    }
+
+    fn block_first_step_case_from_seed(seed: u64, two_by_two: bool) -> BlockFirstStepCase {
+        let mut rng = DenseBoundaryRng::new(seed);
+        let from = if two_by_two {
+            rng.usize_inclusive(0, APP_INNER_BLOCK_SIZE - 2)
+        } else {
+            rng.usize_inclusive(0, APP_INNER_BLOCK_SIZE - 1)
+        };
+        let mut matrix = vec![0.0; APP_INNER_BLOCK_SIZE * APP_INNER_BLOCK_SIZE];
+        for col in 0..APP_INNER_BLOCK_SIZE {
+            for row in col..APP_INNER_BLOCK_SIZE {
+                matrix[col * APP_INNER_BLOCK_SIZE + row] = rng.dyadic_kernel_value(8, 8, false);
+            }
+        }
+
+        if two_by_two {
+            let first = rng.usize_inclusive(from, APP_INNER_BLOCK_SIZE - 2);
+            let second = rng.usize_inclusive(first + 1, APP_INNER_BLOCK_SIZE - 1);
+            let sign = if rng.next_u64() & 1 == 0 { 1.0 } else { -1.0 };
+            matrix[dense_lower_offset(APP_INNER_BLOCK_SIZE, first, first)] = 1.0;
+            matrix[dense_lower_offset(APP_INNER_BLOCK_SIZE, second, second)] = -1.0;
+            matrix[dense_lower_offset(APP_INNER_BLOCK_SIZE, second, first)] = sign * 32.0;
+        } else {
+            let pivot = rng.usize_inclusive(from, APP_INNER_BLOCK_SIZE - 1);
+            let sign = if rng.next_u64() & 1 == 0 { 1.0 } else { -1.0 };
+            matrix[dense_lower_offset(APP_INNER_BLOCK_SIZE, pivot, pivot)] = sign * 32.0;
+        }
+
+        BlockFirstStepCase {
+            seed,
+            from,
+            matrix,
+            perm: (0..APP_INNER_BLOCK_SIZE).collect(),
+            local_perm: (0..APP_INNER_BLOCK_SIZE).collect(),
+            options: NumericFactorOptions::default(),
+        }
     }
 
     fn native_host_trsm_op_n(shim: &NativeKernelShim, case: &AppKernelCase, matrix: &mut [f64]) {
@@ -5686,6 +5852,200 @@ extern "C" void spral_kernel_block_two_by_two_multipliers(
         (accepted, detpiv, detscale)
     }
 
+    fn native_block_first_step_32(
+        shim: &NativeKernelShim,
+        case: &BlockFirstStepCase,
+        matrix: &mut [f64],
+        workspace: &mut [f64],
+        diagonal: &mut [f64],
+        perm: &mut [usize],
+        local_perm: &mut [usize],
+    ) -> (i32, usize) {
+        let mut native_perm = perm.iter().map(|&entry| entry as c_int).collect::<Vec<_>>();
+        let mut native_local_perm = local_perm
+            .iter()
+            .map(|&entry| entry as c_int)
+            .collect::<Vec<_>>();
+        let mut next = 0;
+        let status = unsafe {
+            (shim.block_first_step_32)(
+                case.from as c_int,
+                native_perm.as_mut_ptr(),
+                matrix.as_mut_ptr(),
+                APP_INNER_BLOCK_SIZE as c_int,
+                diagonal.as_mut_ptr(),
+                workspace.as_mut_ptr(),
+                i32::from(case.options.action_on_zero_pivot),
+                case.options.threshold_pivot_u,
+                case.options.small_pivot_tolerance,
+                native_local_perm.as_mut_ptr(),
+                &mut next as *mut c_int,
+            )
+        };
+        for (target, native) in perm.iter_mut().zip(native_perm) {
+            *target = native as usize;
+        }
+        for (target, native) in local_perm.iter_mut().zip(native_local_perm) {
+            *target = native as usize;
+        }
+        (status, next as usize)
+    }
+
+    fn rust_block_first_step_32(
+        case: &BlockFirstStepCase,
+        matrix: &mut [f64],
+        workspace: &mut [f64],
+        diagonal: &mut [f64],
+        perm: &mut [usize],
+        local_perm: &mut [usize],
+    ) -> Result<(i32, usize), SsidsError> {
+        let pivot = case.from;
+        let Some((best_abs, best_row, best_col)) =
+            dense_find_maxloc(matrix, APP_INNER_BLOCK_SIZE, pivot, APP_INNER_BLOCK_SIZE)
+        else {
+            return Ok((0, pivot));
+        };
+
+        if best_abs < case.options.small_pivot_tolerance {
+            if !case.options.action_on_zero_pivot {
+                return Ok((-1, pivot));
+            }
+            for col in pivot..APP_INNER_BLOCK_SIZE {
+                diagonal[2 * col] = 0.0;
+                diagonal[2 * col + 1] = 0.0;
+                for row in col..APP_INNER_BLOCK_SIZE {
+                    matrix[col * APP_INNER_BLOCK_SIZE + row] = 0.0;
+                    workspace[col * APP_INNER_BLOCK_SIZE + row] = 0.0;
+                }
+            }
+            return Ok((0, APP_INNER_BLOCK_SIZE));
+        }
+
+        let mut rows = perm.to_vec();
+        let mut stats = PanelFactorStats::default();
+        if best_row == best_col {
+            if best_col != pivot {
+                dense_symmetric_swap_with_workspace(
+                    matrix,
+                    APP_INNER_BLOCK_SIZE,
+                    best_col,
+                    pivot,
+                    workspace,
+                );
+                rows.swap(best_col, pivot);
+                perm.swap(best_col, pivot);
+                local_perm.swap(best_col, pivot);
+            }
+            let block = factor_one_by_one_common(
+                &rows,
+                matrix,
+                APP_INNER_BLOCK_SIZE,
+                pivot,
+                APP_INNER_BLOCK_SIZE,
+                &mut stats,
+                workspace,
+            )?;
+            diagonal[2 * pivot] = block.values[0];
+            diagonal[2 * pivot + 1] = 0.0;
+            return Ok((1, pivot + 1));
+        }
+
+        let first = best_col;
+        let mut second = best_row;
+        let a11 = matrix[dense_lower_offset(APP_INNER_BLOCK_SIZE, first, first)];
+        let a22 = matrix[dense_lower_offset(APP_INNER_BLOCK_SIZE, second, second)];
+        let a21 = matrix[dense_lower_offset(APP_INNER_BLOCK_SIZE, second, first)];
+        let mut two_by_two_inverse = None;
+        let mut one_by_one_index = None;
+        if let Some(inverse) =
+            app_two_by_two_inverse(a11, a21, a22, case.options.small_pivot_tolerance)
+        {
+            two_by_two_inverse = Some(inverse);
+        } else if a11.abs() > a22.abs() {
+            if (a11 / a21).abs() >= case.options.threshold_pivot_u {
+                one_by_one_index = Some(first);
+            }
+        } else if (a22 / a21).abs() >= case.options.threshold_pivot_u {
+            one_by_one_index = Some(second);
+        }
+
+        if let Some(index) = one_by_one_index {
+            if index != pivot {
+                dense_symmetric_swap_with_workspace(
+                    matrix,
+                    APP_INNER_BLOCK_SIZE,
+                    index,
+                    pivot,
+                    workspace,
+                );
+                rows.swap(index, pivot);
+                perm.swap(index, pivot);
+                local_perm.swap(index, pivot);
+            }
+            let block = factor_one_by_one_common(
+                &rows,
+                matrix,
+                APP_INNER_BLOCK_SIZE,
+                pivot,
+                APP_INNER_BLOCK_SIZE,
+                &mut stats,
+                workspace,
+            )?;
+            diagonal[2 * pivot] = block.values[0];
+            diagonal[2 * pivot + 1] = 0.0;
+            return Ok((1, pivot + 1));
+        }
+
+        if let Some(inverse) = two_by_two_inverse {
+            if first != pivot {
+                dense_symmetric_swap_with_workspace(
+                    matrix,
+                    APP_INNER_BLOCK_SIZE,
+                    first,
+                    pivot,
+                    workspace,
+                );
+                rows.swap(first, pivot);
+                perm.swap(first, pivot);
+                local_perm.swap(first, pivot);
+                if second == pivot {
+                    second = first;
+                }
+            }
+            if second != pivot + 1 {
+                dense_symmetric_swap_with_workspace(
+                    matrix,
+                    APP_INNER_BLOCK_SIZE,
+                    second,
+                    pivot + 1,
+                    workspace,
+                );
+                rows.swap(second, pivot + 1);
+                perm.swap(second, pivot + 1);
+                local_perm.swap(second, pivot + 1);
+            }
+            let block = factor_two_by_two_common(
+                &rows,
+                matrix,
+                DenseUpdateBounds {
+                    size: APP_INNER_BLOCK_SIZE,
+                    update_end: APP_INNER_BLOCK_SIZE,
+                },
+                pivot,
+                inverse,
+                &mut stats,
+                workspace,
+            )?;
+            diagonal[2 * pivot] = block.values[0];
+            diagonal[2 * pivot + 1] = block.values[1];
+            diagonal[2 * pivot + 2] = f64::INFINITY;
+            diagonal[2 * pivot + 3] = block.values[3];
+            return Ok((2, pivot + 2));
+        }
+
+        Ok((-2, pivot))
+    }
+
     fn native_block_ldlt_32_from_lower_dense(
         shim: &NativeKernelShim,
         dense: &[f64],
@@ -5877,7 +6237,7 @@ extern "C" void spral_kernel_block_two_by_two_multipliers(
     ) -> (f64, f64) {
         let (inv11, inv12, inv22) = inverse;
         let (b1, b2) = values;
-        (inv12.mul_add(b2, inv11 * b1), inv12.mul_add(b1, inv22 * b2))
+        (inv11 * b1 + inv12 * b2, inv12 * b1 + inv22 * b2)
     }
 
     fn assert_app_kernel_matrices_bitwise_equal(
@@ -5956,6 +6316,62 @@ extern "C" void spral_kernel_block_two_by_two_multipliers(
                     case
                 );
             }
+        }
+        Ok(())
+    }
+
+    fn assert_block_first_step_state_equal(
+        label: &str,
+        case: &BlockFirstStepCase,
+        rust: BlockFirstStepState<'_>,
+        native: BlockFirstStepState<'_>,
+    ) -> Result<(), TestCaseError> {
+        for col in 0..APP_INNER_BLOCK_SIZE {
+            for row in col..APP_INNER_BLOCK_SIZE {
+                let index = col * APP_INNER_BLOCK_SIZE + row;
+                prop_assert_eq!(
+                    rust.matrix[index].to_bits(),
+                    native.matrix[index].to_bits(),
+                    "{} matrix mismatch seed={:#x} index={} row={} col={} from={} rust={:?} native={:?} case={:?}",
+                    label,
+                    case.seed,
+                    index,
+                    row,
+                    col,
+                    case.from,
+                    rust.matrix[index],
+                    native.matrix[index],
+                    case
+                );
+            }
+        }
+        for (index, (&rust, &native)) in rust.workspace.iter().zip(native.workspace).enumerate() {
+            prop_assert_eq!(
+                rust.to_bits(),
+                native.to_bits(),
+                "{} ldwork mismatch seed={:#x} index={} from={} rust={:?} native={:?} case={:?}",
+                label,
+                case.seed,
+                index,
+                case.from,
+                rust,
+                native,
+                case
+            );
+        }
+        for (index, (&rust, &native)) in rust.diagonal.iter().zip(native.diagonal).enumerate() {
+            prop_assert_eq!(
+                rust.to_bits(),
+                native.to_bits(),
+                "{} diagonal mismatch seed={:#x} index={} from={} rust={:?} native={:?} case={:?}",
+                label,
+                case.seed,
+                index,
+                case.from,
+                rust,
+                native,
+                case
+            );
         }
         Ok(())
     }
@@ -6561,6 +6977,164 @@ extern "C" void spral_kernel_block_two_by_two_multipliers(
                 Ok(())
             })
             .expect("block_ldlt find_maxloc kernel parity property failed");
+    }
+
+    #[test]
+    fn app_block_first_step_one_by_one_matches_native_kernel_property_cases() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let cases = env_usize("SPRAL_SSIDS_KERNEL_PARITY_CASES", 512);
+        let seed = env_u64("SPRAL_SSIDS_KERNEL_PARITY_SEED", 0x1511_900d_0001);
+        let mut runner = deterministic_kernel_runner(cases, seed);
+
+        runner
+            .run(&any::<u64>(), |case_seed| {
+                let case = block_first_step_case_from_seed(seed ^ case_seed, false);
+                let mut rust_matrix = case.matrix.clone();
+                let mut native_matrix = case.matrix.clone();
+                let mut rust_workspace = vec![0.0; APP_INNER_BLOCK_SIZE * APP_INNER_BLOCK_SIZE];
+                let mut native_workspace = vec![0.0; APP_INNER_BLOCK_SIZE * APP_INNER_BLOCK_SIZE];
+                let mut rust_diagonal = vec![0.0; 2 * APP_INNER_BLOCK_SIZE];
+                let mut native_diagonal = vec![0.0; 2 * APP_INNER_BLOCK_SIZE];
+                let mut rust_perm = case.perm.clone();
+                let mut native_perm = case.perm.clone();
+                let mut rust_local_perm = case.local_perm.clone();
+                let mut native_local_perm = case.local_perm.clone();
+
+                let rust_status = rust_block_first_step_32(
+                    &case,
+                    &mut rust_matrix,
+                    &mut rust_workspace,
+                    &mut rust_diagonal,
+                    &mut rust_perm,
+                    &mut rust_local_perm,
+                )
+                .expect("generated one-by-one first step should factor");
+                let native_status = native_block_first_step_32(
+                    shim,
+                    &case,
+                    &mut native_matrix,
+                    &mut native_workspace,
+                    &mut native_diagonal,
+                    &mut native_perm,
+                    &mut native_local_perm,
+                );
+
+                prop_assert_eq!(
+                    rust_status,
+                    native_status,
+                    "block_ldlt first-step 1x1 status mismatch case={:?}",
+                    case
+                );
+                prop_assert_eq!(
+                    rust_perm,
+                    native_perm,
+                    "block_ldlt first-step 1x1 perm mismatch case={:?}",
+                    case
+                );
+                prop_assert_eq!(
+                    rust_local_perm,
+                    native_local_perm,
+                    "block_ldlt first-step 1x1 local perm mismatch case={:?}",
+                    case
+                );
+                assert_block_first_step_state_equal(
+                    "block_ldlt first-step 1x1",
+                    &case,
+                    BlockFirstStepState {
+                        matrix: &rust_matrix,
+                        workspace: &rust_workspace,
+                        diagonal: &rust_diagonal,
+                    },
+                    BlockFirstStepState {
+                        matrix: &native_matrix,
+                        workspace: &native_workspace,
+                        diagonal: &native_diagonal,
+                    },
+                )?;
+                Ok(())
+            })
+            .expect("block_ldlt first-step 1x1 kernel parity property failed");
+    }
+
+    #[test]
+    fn app_block_first_step_two_by_two_matches_native_kernel_property_cases() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let cases = env_usize("SPRAL_SSIDS_KERNEL_PARITY_CASES", 512);
+        let seed = env_u64("SPRAL_SSIDS_KERNEL_PARITY_SEED", 0x2522_900d_0001);
+        let mut runner = deterministic_kernel_runner(cases, seed);
+
+        runner
+            .run(&any::<u64>(), |case_seed| {
+                let case = block_first_step_case_from_seed(seed ^ case_seed, true);
+                let mut rust_matrix = case.matrix.clone();
+                let mut native_matrix = case.matrix.clone();
+                let mut rust_workspace = vec![0.0; APP_INNER_BLOCK_SIZE * APP_INNER_BLOCK_SIZE];
+                let mut native_workspace = vec![0.0; APP_INNER_BLOCK_SIZE * APP_INNER_BLOCK_SIZE];
+                let mut rust_diagonal = vec![0.0; 2 * APP_INNER_BLOCK_SIZE];
+                let mut native_diagonal = vec![0.0; 2 * APP_INNER_BLOCK_SIZE];
+                let mut rust_perm = case.perm.clone();
+                let mut native_perm = case.perm.clone();
+                let mut rust_local_perm = case.local_perm.clone();
+                let mut native_local_perm = case.local_perm.clone();
+
+                let rust_status = rust_block_first_step_32(
+                    &case,
+                    &mut rust_matrix,
+                    &mut rust_workspace,
+                    &mut rust_diagonal,
+                    &mut rust_perm,
+                    &mut rust_local_perm,
+                )
+                .expect("generated two-by-two first step should factor");
+                let native_status = native_block_first_step_32(
+                    shim,
+                    &case,
+                    &mut native_matrix,
+                    &mut native_workspace,
+                    &mut native_diagonal,
+                    &mut native_perm,
+                    &mut native_local_perm,
+                );
+
+                prop_assert_eq!(
+                    rust_status,
+                    native_status,
+                    "block_ldlt first-step 2x2 status mismatch case={:?}",
+                    case
+                );
+                prop_assert_eq!(
+                    rust_perm,
+                    native_perm,
+                    "block_ldlt first-step 2x2 perm mismatch case={:?}",
+                    case
+                );
+                prop_assert_eq!(
+                    rust_local_perm,
+                    native_local_perm,
+                    "block_ldlt first-step 2x2 local perm mismatch case={:?}",
+                    case
+                );
+                assert_block_first_step_state_equal(
+                    "block_ldlt first-step 2x2",
+                    &case,
+                    BlockFirstStepState {
+                        matrix: &rust_matrix,
+                        workspace: &rust_workspace,
+                        diagonal: &rust_diagonal,
+                    },
+                    BlockFirstStepState {
+                        matrix: &native_matrix,
+                        workspace: &native_workspace,
+                        diagonal: &native_diagonal,
+                    },
+                )?;
+                Ok(())
+            })
+            .expect("block_ldlt first-step 2x2 kernel parity property failed");
     }
 
     #[test]
