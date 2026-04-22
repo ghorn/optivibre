@@ -3129,7 +3129,10 @@ fn calculate_filter_alpha_min(
             );
         }
     }
-    (options.alpha_min_frac * alpha_min).max(options.min_step)
+    // IPOPT `FilterLSAcceptor::CalculateAlphaMin` returns only
+    // `alpha_min_frac * alpha_min`; the backtracking loop itself is
+    // responsible for always checking the first trial point.
+    options.alpha_min_frac * alpha_min
 }
 
 fn barrier_objective_increase_too_large(
@@ -7821,7 +7824,8 @@ mod tests {
         let options = InteriorPointOptions::default();
         let alpha_min = calculate_filter_alpha_min(1.0e-3, 1.0e-2, -1.0e-2, &options);
 
-        assert_eq!(alpha_min, options.min_step);
+        assert!((alpha_min - 5.0e-11).abs() <= 1.0e-25);
+        assert!(alpha_min < options.min_step);
     }
 }
 
@@ -9570,7 +9574,10 @@ where
             && is_tiny_ip_step(&x, &slack_barrier, &direction, primal_inf, options);
         let tiny_step_barrier_update =
             tiny_step_unchecked_accept && watchdog_state.tiny_step_last_iteration;
-        while alpha >= alpha_min {
+        // IPOPT `BacktrackingLineSearch::DoBacktrackingLineSearch` uses
+        // `alpha_primal > alpha_min || n_steps == 0`, so the initial trial is
+        // evaluated even when the maximum feasible step is already tiny.
+        while alpha > alpha_min || line_search_iterations == 0 {
             let trial_alpha_pr = alpha;
             let trial_alpha_du = dual_alpha_limit;
             let trial_alpha_y = alpha_for_y(trial_alpha_pr, trial_alpha_du, &direction, options);
