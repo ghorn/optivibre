@@ -45,6 +45,18 @@ stack reports OpenBLAS `0.3.32 DYNAMIC_ARCH ... neoversen1`, whose arm64
 `KERNEL.NEOVERSEN1` selects the generic `trsm_kernel_RN.c` path for double RN
 dtrsm.
 
+Current newly narrowed solve-lane witness:
+`dense_seed6_solution_bits_diverge_after_matching_inverse_d` proves that dense
+seed6 production factor metadata, factor order, and inverse-D enquiry bits
+match native SPRAL before the solve. The same RHS still has a first solution
+bit mismatch at index 2: Rust `0x3fc000000000002a` versus native
+`0x3fc0000000000022`. That moves the seed6 full-solver failure out of the D
+storage lane and into production L storage or full solve traversal. The source
+anchors for the next read are SPRAL
+`target/native/spral-upstream/src/ssids/cpu/NumericSubtree.hxx` solve traversal
+and `target/native/spral-upstream/src/ssids/cpu/kernels/ldlt_app.cxx`
+`ldlt_app_solve_*`.
+
 Previous newly narrowed witness:
 `app_apply_pivot_and_host_trsm_signed_zero_boundaries_are_complementary` pins a
 generic APP kernel signed-zero boundary to one deterministic witness. For seed
@@ -345,6 +357,7 @@ flowchart TD
     K --> K1["Factor order, inertia, pivot stats"]
     K --> K2["Seed6 APP prefix inverse-D bits through 29"]
     K2 --> K3["Seed6 full inverse-D bits"]
+    K3 --> K3a["Seed6 full solution bits after matching D"]
     K --> K4a["Dense APP case0 prefix inverse-D bits through 74"]
     K4a --> K4e["Dense seed09 APP-stride apply_pivot OP_N L bits"]
     K4e --> K4c["Dense seed09 isolated APP update + TPP tail kernels"]
@@ -369,7 +382,9 @@ flowchart TD
     N --> O["Forward triangular solve"]
     O --> P["Block diagonal solve"]
     P --> Q["Backward triangular solve"]
-    Q --> R["Solution bit patterns"]
+    Q --> R["Individual solve kernel bit patterns"]
+    R --> S["Full production solution bit patterns"]
+    K3a --> S
 
     classDef match fill:#dff7df,stroke:#2f8f46,color:#102615,stroke-width:2px;
     classDef newly fill:#fff4b8,stroke:#b88a00,color:#2a2100,stroke-width:3px;
@@ -392,7 +407,8 @@ flowchart TD
     class K4j match;
     class K4k partial;
     class C,D,E,F,G,G2,G4,G7,G10,H,I,J,K,L,N partial;
+    class K3a newlyPartial;
     class K4l newlyPartial;
     class G8c,G8d,G9a,I00,I0,I0a,I1,I2,I3,K2,K3,K4a,K4c,K4d,K4e,K4f,K4g,K4h,K4i match;
-    class K4b,K4 open;
+    class K4b,K4,S open;
 ```

@@ -8996,6 +8996,22 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         matrix
     }
 
+    fn random_dyadic_solution(dimension: usize, rng: &mut DenseBoundaryRng) -> Vec<f64> {
+        (0..dimension).map(|_| rng.dyadic(8, 4)).collect()
+    }
+
+    fn dense_mul(matrix: &[Vec<f64>], x: &[f64]) -> Vec<f64> {
+        matrix
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .zip(x.iter())
+                    .map(|(value, x_i)| value * x_i)
+                    .sum::<f64>()
+            })
+            .collect()
+    }
+
     fn dense_to_lower_csc(matrix: &[Vec<f64>]) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
         let dimension = matrix.len();
         let mut col_ptrs = Vec::with_capacity(dimension + 1);
@@ -9257,6 +9273,15 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         (dimension, random_dense_dyadic_matrix(dimension, &mut rng))
     }
 
+    fn dense_seed6_33_matrix_and_solution() -> (usize, Vec<Vec<f64>>, Vec<f64>) {
+        let mut rng = DenseBoundaryRng::new(6);
+        let dimension = rng.usize_inclusive(33, 33);
+        assert_eq!(dimension, 33);
+        let matrix = random_dense_dyadic_matrix(dimension, &mut rng);
+        let solution = random_dyadic_solution(dimension, &mut rng);
+        (dimension, matrix, solution)
+    }
+
     fn dense_seed09_case0_matrix() -> (usize, Vec<Vec<f64>>) {
         let mut rng = DenseBoundaryRng::new(0x09c9_134e_4eff_0004);
         let dimension = rng.usize_inclusive(33, 160);
@@ -9321,6 +9346,19 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             .flatten()
             .map(|value| value.to_bits())
             .collect()
+    }
+
+    fn bit_patterns(values: &[f64]) -> Vec<u64> {
+        values.iter().map(|value| value.to_bits()).collect()
+    }
+
+    fn first_bit_mismatch(left: &[u64], right: &[u64]) -> Option<(usize, u64, u64)> {
+        left.iter()
+            .zip(right)
+            .enumerate()
+            .find_map(|(index, (&left_bits, &right_bits))| {
+                (left_bits != right_bits).then_some((index, left_bits, right_bits))
+            })
     }
 
     fn inverse_diagonal_entries_from_internal_diagonal(
@@ -9499,6 +9537,71 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         assert_eq!(
             rust_bits, native_bits,
             "seed6 production inverse-D bit patterns differ"
+        );
+    }
+
+    #[test]
+    fn dense_seed6_solution_bits_diverge_after_matching_inverse_d() {
+        let Some(native) = native_spral_or_skip() else {
+            return;
+        };
+        let (dimension, dense, expected_solution) = dense_seed6_33_matrix_and_solution();
+        let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+        let matrix = SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
+            .expect("valid CSC");
+        let options = NumericFactorOptions::default();
+
+        let (symbolic, _) = analyse(
+            matrix,
+            &SsidsOptions {
+                ordering: OrderingStrategy::Natural,
+            },
+        )
+        .expect("rust analyse");
+        let (mut rust_factor, _) = factorize(matrix, &symbolic, &options).expect("rust factorize");
+
+        let mut native_session = native
+            .analyse_with_options_and_ordering(matrix, &options, NativeOrdering::Natural)
+            .expect("native analyse");
+        let native_info = native_session.factorize(matrix).expect("native factorize");
+        let native_enquiry = native_session.enquire_indef().expect("native enquire");
+        let mut native_factor_order = vec![usize::MAX; native_enquiry.pivot_order.len()];
+        for (column, &pivot_position) in native_enquiry.pivot_order.iter().enumerate() {
+            native_factor_order[pivot_position] = column;
+        }
+
+        assert_eq!(rust_factor.inertia(), native_info.inertia);
+        assert_eq!(
+            rust_factor.pivot_stats().two_by_two_pivots,
+            native_info.two_by_two_pivots
+        );
+        assert_eq!(
+            rust_factor.pivot_stats().delayed_pivots,
+            native_info.delayed_pivots
+        );
+        assert_eq!(rust_factor.factor_order, native_factor_order);
+
+        let rust_d_bits = inverse_diagonal_bits(&rust_inverse_diagonal_entries(&rust_factor));
+        let native_d_bits = inverse_diagonal_bits(&native_enquiry.inverse_diagonal_entries);
+        assert_eq!(
+            rust_d_bits, native_d_bits,
+            "seed6 production inverse-D bit patterns differ before solve"
+        );
+
+        let rhs = dense_mul(&dense, &expected_solution);
+        let rust_solution = rust_factor.solve(&rhs).expect("rust solve");
+        let native_solution = native_session.solve(&rhs).expect("native solve");
+        let rust_bits = bit_patterns(&rust_solution);
+        let native_bits = bit_patterns(&native_solution);
+
+        assert_ne!(
+            rust_bits, native_bits,
+            "seed6 solution bits now match after matching inverse-D; promote the full witness"
+        );
+        assert_eq!(
+            first_bit_mismatch(&rust_bits, &native_bits),
+            Some((2, 0x3fc0_0000_0000_002a, 0x3fc0_0000_0000_0022)),
+            "seed6 first solution-bit mismatch moved after matching factor metadata and inverse-D"
         );
     }
 
