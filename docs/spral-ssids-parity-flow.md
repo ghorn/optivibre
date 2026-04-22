@@ -38,7 +38,10 @@ right-side case to the RN microkernel. The generic RN solve walks columns
 forward and updates later packed columns, which source-backs the current Rust
 forward in-block order. The unresolved mismatch is therefore the OpenBLAS
 packed-buffer zero-sign policy across `TRSM_OLTCOPY` plus the RN kernel, not
-the high-level triangular-solve direction.
+the high-level triangular-solve direction. The native parity preflight now
+records the linked OpenBLAS runtime provenance; the current local stack reports
+OpenBLAS `0.3.32 DYNAMIC_ARCH ... neoversen1`, whose arm64 `KERNEL.NEOVERSEN1`
+selects the generic `trsm_kernel_RN.c` path for double RN dtrsm.
 
 Previous newly narrowed witness:
 `app_apply_pivot_and_host_trsm_signed_zero_boundaries_are_complementary` pins a
@@ -317,7 +320,7 @@ flowchart TD
     G9 --> I00
     I00 --> I0["Dense seed09 APP-stride apply_pivot OP_N L block"]
     I0 --> I0z["APP host_trsm/apply_pivot signed-zero boundary"]
-    I0z --> I0zz["OpenBLAS dtrsm OLTCOPY/RN zero-sign policy"]
+    I0z --> I0zz["OpenBLAS dtrsm OLTCOPY/generic RN zero-sign policy"]
     I0zz --> I0a["Dense seed09 APP check_threshold OP_N pass count"]
     I0a --> I0p["Dense seed09 source-shaped APP pre-apply trailing operands"]
     I0p --> I0r["Dense seed09 production-vs-aligned Rust APP diagonal block"]

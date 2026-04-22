@@ -16,7 +16,9 @@ scripts/native_spral_parity_preflight.sh <command>
 The preflight sources `scripts/use_local_ipopt_spral_env.sh`, requires IPOPT
 3.14.20 from `/Users/greg/local/ipopt-spral`, pins `SPRAL_SSIDS_NATIVE_LIB` to
 the local `libspral.dylib`, sets `RAYON_NUM_THREADS=1` and `OMP_NUM_THREADS=1`
-by default, and enables `AD_CODEGEN_REQUIRE_NATIVE_SPRAL_PARITY=1`.
+by default, enables `AD_CODEGEN_REQUIRE_NATIVE_SPRAL_PARITY=1`, and records the
+linked OpenBLAS path plus runtime config/core/thread count underneath native
+SPRAL.
 For source-backed SPRAL algorithm acceptance, also set
 `AD_CODEGEN_REQUIRE_SPRAL_UPSTREAM_SOURCE=1`; the preflight then fails unless
 `target/native/spral-upstream/src/ssids` or `SPRAL_UPSTREAM_SSIDS_DIR` exists.
