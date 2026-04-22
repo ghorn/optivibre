@@ -306,13 +306,18 @@ passes together with the full dense seed09 inverse-D guard, so dense seed09
 case0 no longer represents the open APP boundary solve mismatch.
 
 Current open guard witnesses:
-The remaining active full-solution parity failures are
-`rust_and_native_spral_match_app_blocked_update_65x65_solution_bits`,
-`rust_and_native_spral_match_app_width_one_update_96x96_solution_bits`,
-`rust_and_native_spral_match_app_prefix_dtrsv_97x97_solution_bits`, and
+The deterministic 65x65, 96x96, and 97x97 APP solve witnesses now pass after
+the production backward solve switched from a plain reverse dot loop to the
+native-order OpenBLAS `host_trsv` OP_T traversal used by
+`ldlt_app.cxx::ldlt_app_solve_bwd`. The added 65x65 regression also checks
+metadata, factor order, inverse-D, forward panel replay, diagonal replay,
+backward panel replay, and final solution bits against native SPRAL.
+
+The remaining active full-solution parity failure is
 `rust_and_native_spral_match_dense_seed_706172697479_case58_solution_bits`.
-These keep the production solution-bit node red while the seed6, dense seed09
-case0, and dense seed1001 solution witnesses are newly green.
+This keeps the production solution-bit node red while the seed6, deterministic
+65/96/97, dense seed09 case0, and dense seed1001 solution witnesses are newly
+green.
 
 ```mermaid
 flowchart TD
@@ -421,11 +426,15 @@ flowchart TD
     O --> O1["Production diag+bwd traversal uses NumericSubtree combined path"]
     O1 --> P["Block diagonal solve"]
     O1 --> Q["Backward triangular solve"]
+    Q --> Q1["OpenBLAS host_trsv OP_T 64-column boundary"]
+    Q1 --> Q2["Deterministic APP 65/96/97 solution bits"]
     Q --> R["Individual solve kernel bit patterns"]
+    Q2 --> R
     P --> R
     R --> S["Full production solution bit patterns"]
     K3a --> S
     K5 --> S
+    Q2 --> S
 
     classDef match fill:#dff7df,stroke:#2f8f46,color:#102615,stroke-width:2px;
     classDef newly fill:#fff4b8,stroke:#b88a00,color:#2a2100,stroke-width:3px;
@@ -448,7 +457,8 @@ flowchart TD
     class K4j match;
     class K4k newly;
     class C,D,E,F,G,G2,G4,G7,G10,H,I,J,K,L,N partial;
-    class O0,O1 newlyPartial;
+    class O0 newlyPartial;
+    class O1,Q1,Q2 newly;
     class K3b,K3c newlyPartial;
     class K3a,K3d newly;
     class K4l newly;

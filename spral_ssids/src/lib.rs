@@ -4258,7 +4258,6 @@ fn openblas_gemv_n_update_like_native(
 
 // Mirrors OpenBLAS driver/level2/trsv_U.c for lower/unit/transpose on the
 // local panel solve path used by SPRAL's ldlt_app_solve_bwd.
-#[cfg(test)]
 fn openblas_trsv_lower_unit_op_t_like_native(a: &[f64], lda: usize, x: &mut [f64]) {
     const DTB_ENTRIES: usize = 64;
     let n = x.len();
@@ -4466,14 +4465,11 @@ fn solve_diagonal_and_lower_transpose_front_panels_like_native(
         }
 
         let started = profile_enabled.then(Instant::now);
-        for local_col in (0..eliminated_len).rev() {
-            let column_start = local_col * local_size;
-            let dot = openblas_dotu_like_contiguous(
-                &panel.values[column_start + local_col + 1..column_start + eliminated_len],
-                &local_rhs[local_col + 1..eliminated_len],
-            );
-            local_rhs[local_col] -= dot;
-        }
+        openblas_trsv_lower_unit_op_t_like_native(
+            &panel.values,
+            local_size,
+            &mut local_rhs[..eliminated_len],
+        );
         if let Some(profile) = profile.as_mut() {
             if let Some(started) = started {
                 profile.backward_triangular_solve_time += started.elapsed();
@@ -4691,9 +4687,9 @@ mod tests {
     use proptest::test_runner::{Config, RngAlgorithm, RngSeed, TestRng, TestRunner};
 
     use super::{
-        APP_INNER_BLOCK_SIZE, DenseTppTailRequest, DenseUpdateBounds, FactorBlockRecord,
-        NativeOrdering, NativeSpral, NumericFactorOptions, OrderingStrategy, PanelFactorStats,
-        SolvePanel, SsidsError, SsidsOptions, SymmetricCscMatrix, analyse,
+        APP_INNER_BLOCK_SIZE, DenseTppTailRequest, DenseUpdateBounds, DiagonalBlock,
+        FactorBlockRecord, NativeOrdering, NativeSpral, NumericFactorOptions, OrderingStrategy,
+        PanelFactorStats, SolvePanel, SsidsError, SsidsOptions, SymmetricCscMatrix, analyse,
         app_adjust_passed_prefix, app_apply_accepted_prefix_update,
         app_apply_block_pivots_to_trailing_rows, app_build_ld_workspace,
         app_first_failed_trailing_column, app_restore_trailing_from_block_backup,
@@ -4705,8 +4701,10 @@ mod tests {
         factorize_dense_tpp_tail_in_place, native_column_counts, native_postorder_permutation,
         openblas_gemv_n_update_like_native, openblas_gemv_t_dot_like_contiguous,
         openblas_trsv_lower_unit_op_n_like_native, openblas_trsv_lower_unit_op_t_like_native,
-        permute_graph, reset_ldwork_column_tail, solve_forward_front_panels_like_native,
-        solve_two_by_two_block_in_place, symbolic_factor_pattern, zero_dense_column_until,
+        permute_graph, reset_ldwork_column_tail,
+        solve_diagonal_and_lower_transpose_front_panels_like_native,
+        solve_forward_front_panels_like_native, solve_two_by_two_block_in_place,
+        symbolic_factor_pattern, zero_dense_column_until,
     };
 
     #[derive(Clone, Debug)]
@@ -6305,6 +6303,118 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
                 rhs.as_mut_ptr(),
                 case.rows as c_int,
             );
+        }
+    }
+
+    fn solve_panel_block_ranges(
+        panels: &[SolvePanel],
+        diagonal_blocks: &[DiagonalBlock],
+    ) -> Vec<(usize, usize)> {
+        let mut ranges = Vec::with_capacity(panels.len());
+        let mut block_index = 0;
+        for panel in panels {
+            let first_block = block_index;
+            let mut covered = 0;
+            while covered < panel.eliminated_len {
+                let block = diagonal_blocks
+                    .get(block_index)
+                    .expect("diagonal blocks cover solve panels");
+                covered += block.size;
+                block_index += 1;
+            }
+            assert_eq!(covered, panel.eliminated_len);
+            ranges.push((first_block, block_index));
+        }
+        assert_eq!(block_index, diagonal_blocks.len());
+        ranges
+    }
+
+    fn native_app_diagonal_for_block_range(
+        diagonal_blocks: &[DiagonalBlock],
+        diagonal_values: &[f64],
+        block_range: (usize, usize),
+        eliminated_len: usize,
+    ) -> Vec<f64> {
+        let mut diagonal = vec![0.0; 2 * eliminated_len.max(1)];
+        let mut local_col = 0;
+        for block_index in block_range.0..block_range.1 {
+            let block = diagonal_blocks[block_index];
+            let values = &diagonal_values[4 * block_index..4 * block_index + 4];
+            if block.size == 1 {
+                diagonal[2 * local_col] = values[0];
+                diagonal[2 * local_col + 1] = values[1];
+                local_col += 1;
+            } else {
+                assert_eq!(block.size, 2);
+                diagonal[2 * local_col] = values[0];
+                diagonal[2 * local_col + 1] = values[1];
+                diagonal[2 * local_col + 2] = values[2];
+                diagonal[2 * local_col + 3] = values[3];
+                local_col += 2;
+            }
+        }
+        assert_eq!(local_col, eliminated_len);
+        diagonal
+    }
+
+    fn native_solve_forward_front_panels(
+        shim: &NativeKernelShim,
+        panels: &[SolvePanel],
+        factor_rhs: &mut [f64],
+    ) {
+        let mut local_rhs = Vec::new();
+        for panel in panels {
+            local_rhs.resize(panel.row_positions.len(), 0.0);
+            for (local_row, &factor_position) in panel.row_positions.iter().enumerate() {
+                local_rhs[local_row] = factor_rhs[factor_position];
+            }
+            let case = AppSolveKernelCase {
+                seed: 0,
+                rows: panel.row_positions.len(),
+                eliminated_len: panel.eliminated_len,
+                lower: panel.values.clone(),
+                diagonal: Vec::new(),
+                rhs: Vec::new(),
+            };
+            native_ldlt_app_solve_fwd(shim, &case, &mut local_rhs);
+            for (local_row, &factor_position) in panel.row_positions.iter().enumerate() {
+                factor_rhs[factor_position] = local_rhs[local_row];
+            }
+        }
+    }
+
+    fn native_solve_diagonal_and_bwd_front_panels(
+        shim: &NativeKernelShim,
+        panels: &[SolvePanel],
+        diagonal_blocks: &[DiagonalBlock],
+        diagonal_values: &[f64],
+        factor_rhs: &mut [f64],
+    ) {
+        let ranges = solve_panel_block_ranges(panels, diagonal_blocks);
+        let mut local_rhs = Vec::new();
+        for (panel, block_range) in panels.iter().zip(ranges).rev() {
+            local_rhs.resize(panel.row_positions.len(), 0.0);
+            for (local_row, &factor_position) in panel.row_positions.iter().enumerate() {
+                local_rhs[local_row] = factor_rhs[factor_position];
+            }
+            let case = AppSolveKernelCase {
+                seed: 0,
+                rows: panel.row_positions.len(),
+                eliminated_len: panel.eliminated_len,
+                lower: panel.values.clone(),
+                diagonal: native_app_diagonal_for_block_range(
+                    diagonal_blocks,
+                    diagonal_values,
+                    block_range,
+                    panel.eliminated_len,
+                ),
+                rhs: Vec::new(),
+            };
+            native_ldlt_app_solve_diag(shim, &case, &mut local_rhs);
+            native_ldlt_app_solve_bwd(shim, &case, &mut local_rhs);
+            for local_row in 0..panel.eliminated_len {
+                factor_rhs[panel.row_positions[local_row]] = local_rhs[local_row];
+            }
         }
     }
 
@@ -9537,6 +9647,39 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         (dimension, random_dense_dyadic_matrix(dimension, &mut rng))
     }
 
+    fn deterministic_complete_dyadic_matrix(dimension: usize) -> Vec<Vec<f64>> {
+        let mut matrix = vec![vec![0.0; dimension]; dimension];
+        let mut row = 0;
+        while row < dimension {
+            let mut col = 0;
+            while col <= row {
+                let value = if row == col {
+                    f64::from((row % 7) as i16 - 3) / 64.0
+                } else {
+                    let lower_triangle_index = row * (row + 1) / 2 + col;
+                    let magnitude = f64::from(lower_triangle_index as u16 + 1) / 512.0;
+                    let sign = if (row * 13 + col * 19 + 5) % 2 == 0 {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    sign * magnitude
+                };
+                matrix[row][col] = value;
+                matrix[col][row] = value;
+                col += 1;
+            }
+            row += 1;
+        }
+        matrix
+    }
+
+    fn deterministic_complete_dyadic_solution(dimension: usize) -> Vec<f64> {
+        (0..dimension)
+            .map(|index| f64::from((index % 11) as i16 - 5) / 8.0)
+            .collect()
+    }
+
     fn lower_dense_seed6_33() -> (usize, Vec<f64>) {
         let (dimension, dense) = dense_seed6_33_matrix();
         let mut lower_dense = vec![0.0; dimension * dimension];
@@ -10188,6 +10331,153 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         assert_eq!(
             rust_bits, native_bits,
             "seed6 solution bits should match after scalar-tail APP multiplier"
+        );
+    }
+
+    #[test]
+    fn deterministic_65_metadata_inverse_d_and_panel_solve_match_native() {
+        let Some(native) = native_spral_or_skip() else {
+            return;
+        };
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let dimension = 65;
+        let dense = deterministic_complete_dyadic_matrix(dimension);
+        let expected_solution = deterministic_complete_dyadic_solution(dimension);
+        let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+        let matrix = SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
+            .expect("valid CSC");
+        let options = NumericFactorOptions::default();
+
+        let (symbolic, _) = analyse(
+            matrix,
+            &SsidsOptions {
+                ordering: OrderingStrategy::Natural,
+            },
+        )
+        .expect("rust analyse");
+        let (mut rust_factor, _) = factorize(matrix, &symbolic, &options).expect("rust factorize");
+
+        let mut native_session = native
+            .analyse_with_options_and_ordering(matrix, &options, NativeOrdering::Natural)
+            .expect("native analyse");
+        let native_info = native_session.factorize(matrix).expect("native factorize");
+        let native_enquiry = native_session.enquire_indef().expect("native enquire");
+        let mut native_factor_order = vec![usize::MAX; native_enquiry.pivot_order.len()];
+        for (column, &pivot_position) in native_enquiry.pivot_order.iter().enumerate() {
+            native_factor_order[pivot_position] = column;
+        }
+
+        assert_eq!(rust_factor.inertia(), native_info.inertia);
+        assert_eq!(
+            rust_factor.pivot_stats().two_by_two_pivots,
+            native_info.two_by_two_pivots
+        );
+        assert_eq!(
+            rust_factor.pivot_stats().delayed_pivots,
+            native_info.delayed_pivots
+        );
+        assert_eq!(rust_factor.factor_order, native_factor_order);
+
+        let rust_d_bits = inverse_diagonal_bits(&rust_inverse_diagonal_entries(&rust_factor));
+        let native_d_bits = inverse_diagonal_bits(&native_enquiry.inverse_diagonal_entries);
+        assert_eq!(
+            rust_d_bits, native_d_bits,
+            "deterministic 65x65 inverse-D bit patterns differ"
+        );
+
+        let rhs = dense_mul(&dense, &expected_solution);
+        let mut rust_panel_rhs = vec![0.0; dimension];
+        for (factor_position, &ordered_index) in rust_factor.factor_order.iter().enumerate() {
+            rust_panel_rhs[factor_position] = rhs[rust_factor.permutation.perm()[ordered_index]];
+        }
+        let mut native_panel_rhs = rust_panel_rhs.clone();
+
+        // Mirrors NumericSubtree.hxx::solve_fwd and
+        // ldlt_app.cxx::ldlt_app_solve_fwd on Rust's stored panels.
+        solve_forward_front_panels_like_native(&rust_factor.solve_panels, &mut rust_panel_rhs);
+        native_solve_forward_front_panels(shim, &rust_factor.solve_panels, &mut native_panel_rhs);
+        assert_eq!(
+            bit_patterns(&rust_panel_rhs),
+            bit_patterns(&native_panel_rhs),
+            "deterministic 65x65 forward panel replay differs from native kernels"
+        );
+
+        let block_ranges =
+            solve_panel_block_ranges(&rust_factor.solve_panels, &rust_factor.diagonal_blocks);
+        assert_eq!(
+            rust_factor.solve_panels.len(),
+            1,
+            "deterministic 65x65 solve-panel shape moved"
+        );
+        let panel = &rust_factor.solve_panels[0];
+        let replay_case = AppSolveKernelCase {
+            seed: 0,
+            rows: panel.row_positions.len(),
+            eliminated_len: panel.eliminated_len,
+            lower: panel.values.clone(),
+            diagonal: native_app_diagonal_for_block_range(
+                &rust_factor.diagonal_blocks,
+                &rust_factor.diagonal_values,
+                block_ranges[0],
+                panel.eliminated_len,
+            ),
+            rhs: Vec::new(),
+        };
+        let mut rust_local = vec![0.0; panel.row_positions.len()];
+        let mut native_local = vec![0.0; panel.row_positions.len()];
+        for (local_row, &factor_position) in panel.row_positions.iter().enumerate() {
+            rust_local[local_row] = rust_panel_rhs[factor_position];
+            native_local[local_row] = native_panel_rhs[factor_position];
+        }
+        rust_ldlt_app_solve_diag_like_native(&replay_case, &mut rust_local);
+        native_ldlt_app_solve_diag(shim, &replay_case, &mut native_local);
+        assert_eq!(
+            bit_patterns(&rust_local),
+            bit_patterns(&native_local),
+            "deterministic 65x65 diagonal replay differs from native kernel"
+        );
+        rust_ldlt_app_solve_bwd_like_native(&replay_case, &mut rust_local);
+        native_ldlt_app_solve_bwd(shim, &replay_case, &mut native_local);
+        assert_eq!(
+            bit_patterns(&rust_local),
+            bit_patterns(&native_local),
+            "deterministic 65x65 backward replay differs from native kernel"
+        );
+
+        // Mirrors NumericSubtree.hxx::solve_diag_bwd_inner<true,true> and
+        // ldlt_app.cxx::ldlt_app_solve_diag / ldlt_app_solve_bwd on Rust data.
+        solve_diagonal_and_lower_transpose_front_panels_like_native(
+            &rust_factor.solve_panels,
+            &rust_factor.diagonal_blocks,
+            &rust_factor.diagonal_values,
+            &mut rust_panel_rhs,
+            None,
+        )
+        .expect("rust panel diagonal/backward replay");
+        native_solve_diagonal_and_bwd_front_panels(
+            shim,
+            &rust_factor.solve_panels,
+            &rust_factor.diagonal_blocks,
+            &rust_factor.diagonal_values,
+            &mut native_panel_rhs,
+        );
+        assert_eq!(
+            bit_patterns(&rust_panel_rhs),
+            bit_patterns(&native_panel_rhs),
+            "deterministic 65x65 diag+bwd panel replay differs from native kernels"
+        );
+
+        let rust_solution = rust_factor.solve(&rhs).expect("rust solve");
+        let native_solution = native_session.solve(&rhs).expect("native solve");
+        let first_solution_mismatch = bit_patterns(&rust_solution)
+            .iter()
+            .zip(bit_patterns(&native_solution))
+            .position(|(rust, native)| rust != &native);
+        assert_eq!(
+            first_solution_mismatch, None,
+            "deterministic 65x65 full native solution mismatch"
         );
     }
 
