@@ -7,7 +7,20 @@ Orange nodes have partial coverage or a known narrowed boundary. Gold-orange
 nodes are newly passing guards that narrow an open mismatch without proving full
 bitwise parity. Red nodes are the next open bitwise mismatch target.
 
-Current newly passing witness:
+Current newly narrowed witness:
+`dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now pins an
+earlier source-shaped first APP boundary: the trailing pre-apply operand rows
+match bitwise, but the diagonal block read by SPRAL's BLAS-backed
+`target/native/spral-upstream/src/ssids/cpu/kernels/wrappers.cxx`
+`host_trsm(... SIDE_RIGHT, FILL_MODE_LWR, OP_T, DIAG_UNIT ...)` first differs at
+row 30, col 19: `rust=0xbf8cbfa8da674b6b`,
+`native=0xbf8cbfa8da674b6c`. The downstream host-trsm output then first differs
+at row 47, col 30: `rust=0xc0091687167b6783`,
+`native=0xc0091687167b6782`. This is not a green bitwise parity node; it moves
+the source-shaped APP drift above the trailing operand permutation and into the
+diagonal block storage handed to the BLAS triangular solve.
+
+Previous newly passing witness:
 `dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now pins the
 dense seed09 source-shaped first APP pre-apply operand layout. After native
 `block_ldlt<32>` and the source-shaped local column permutation, the trailing
@@ -159,8 +172,10 @@ flowchart TD
     G9 --> I00
     I00 --> I0["Dense seed09 APP-stride apply_pivot OP_N L block"]
     I0 --> I0a["Dense seed09 APP check_threshold OP_N pass count"]
-    I0a --> I0p["Dense seed09 source-shaped APP pre-apply operands"]
-    I0p --> I0b["Dense seed09 source-shaped APP post-apply operand gap"]
+    I0a --> I0p["Dense seed09 source-shaped APP pre-apply trailing operands"]
+    I0p --> I0d["Dense seed09 source-shaped APP diagonal block gap"]
+    I0d --> I0t["Dense seed09 source-shaped APP host_trsm gap"]
+    I0t --> I0b["Dense seed09 source-shaped APP post-apply operand gap"]
     I0b --> I["APP accepted-prefix update"]
     G10 --> J["Record delayed pivots"]
     H --> I
@@ -205,8 +220,9 @@ flowchart TD
     classDef open fill:#ffd8d8,stroke:#b43b3b,color:#2b0d0d,stroke-width:2px;
 
     class A,B,B1,B2,B3,G0,G1,G3,G5,G6,G8,G8a,G8b,G9,H1,H2,H3,K1,M,O,P,Q,R match;
-    class I0p newly;
-    class I0b partial;
+    class I0p match;
+    class I0d newlyPartial;
+    class I0t,I0b partial;
     class K4j match;
     class K4k partial;
     class C,D,E,F,G,G2,G4,G7,G10,H,I,J,K,L,N partial;

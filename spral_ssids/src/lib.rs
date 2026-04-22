@@ -9696,6 +9696,57 @@ extern "C" int spral_kernel_block_prefix_trace_32(
             first_source_pre_apply_mismatch, None,
             "dense seed09 source-shaped first APP pre-apply operand mismatch"
         );
+        let mut first_source_diagonal_mismatch = None;
+        'source_diagonal_compare: for col in block_start..block_end {
+            for row in col..block_end {
+                let rust_bits = dense_before_apply[col * dimension + row].to_bits();
+                let native_bits = native_source_apply_matrix[col * native_lda + row].to_bits();
+                if rust_bits != native_bits {
+                    first_source_diagonal_mismatch = Some((row, col, rust_bits, native_bits));
+                    break 'source_diagonal_compare;
+                }
+            }
+        }
+        assert_eq!(
+            first_source_diagonal_mismatch,
+            Some((30, 19, 0xbf8c_bfa8_da67_4b6b, 0xbf8c_bfa8_da67_4b6c)),
+            "dense seed09 source-shaped first APP diagonal operand boundary moved"
+        );
+        let mut rust_source_trsm_matrix = dense_before_apply.clone();
+        app_solve_block_triangular_to_trailing_rows(
+            &mut rust_source_trsm_matrix,
+            dimension,
+            block_start,
+            block_end,
+            false,
+        );
+        let mut native_source_trsm_matrix = native_source_apply_matrix.clone();
+        unsafe {
+            (shim.host_trsm_right_lower_trans_unit)(
+                (dimension - block_end) as c_int,
+                block_end as c_int,
+                native_source_trsm_matrix.as_ptr(),
+                native_lda as c_int,
+                native_source_trsm_matrix.as_mut_ptr().add(block_end),
+                native_lda as c_int,
+            );
+        }
+        let mut first_source_trsm_mismatch = None;
+        'source_trsm_compare: for col in block_start..block_end {
+            for row in block_end..dimension {
+                let rust_bits = rust_source_trsm_matrix[col * dimension + row].to_bits();
+                let native_bits = native_source_trsm_matrix[col * native_lda + row].to_bits();
+                if rust_bits != native_bits {
+                    first_source_trsm_mismatch = Some((row, col, rust_bits, native_bits));
+                    break 'source_trsm_compare;
+                }
+            }
+        }
+        assert_eq!(
+            first_source_trsm_mismatch,
+            Some((47, 30, 0xc009_1687_167b_6783, 0xc009_1687_167b_6782)),
+            "dense seed09 source-shaped first APP host_trsm operand boundary moved"
+        );
         unsafe {
             (shim.apply_pivot_op_n)(
                 (dimension - block_end) as c_int,
