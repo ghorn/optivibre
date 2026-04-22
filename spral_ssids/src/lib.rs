@@ -4383,12 +4383,23 @@ fn unpack_packed_lower_to_dense_square(size: usize, packed: &[f64]) -> Vec<f64> 
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    use std::fs;
+    use std::os::raw::c_int;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::OnceLock;
+
+    use libloading::Library;
     use metis_ordering::{CsrGraph, Permutation};
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config, RngAlgorithm, RngSeed, TestRng, TestRunner};
 
     use super::{
-        DenseTppTailRequest, NativeOrdering, NativeSpral, NumericFactorOptions, OrderingStrategy,
-        SsidsOptions, SymmetricCscMatrix, analyse, build_symbolic_front_tree, dense_lower_offset,
-        expand_symmetric_pattern, factorize, factorize_dense_tpp_tail_in_place,
+        DenseTppTailRequest, FactorBlockRecord, NativeOrdering, NativeSpral, NumericFactorOptions,
+        OrderingStrategy, SsidsOptions, SymmetricCscMatrix, analyse,
+        app_apply_block_pivots_to_trailing_rows, app_build_ld_workspace, build_symbolic_front_tree,
+        dense_lower_offset, expand_symmetric_pattern, factorize, factorize_dense_tpp_tail_in_place,
         native_column_counts, native_postorder_permutation, permute_graph, symbolic_factor_pattern,
     };
 
@@ -4420,6 +4431,584 @@ mod tests {
             let shift = self.next_u64() as u8 % (max_shift + 1);
             f64::from(numerator) / f64::from(1_u32 << shift)
         }
+
+        fn dyadic_kernel_value(
+            &mut self,
+            numerator_radius: i16,
+            max_shift: u8,
+            allow_signed_zero: bool,
+        ) -> f64 {
+            if allow_signed_zero && self.next_u64().is_multiple_of(32) {
+                if self.next_u64() & 1 == 0 { 0.0 } else { -0.0 }
+            } else {
+                self.dyadic(numerator_radius, max_shift)
+            }
+        }
+
+        fn nonzero_dyadic(&mut self, numerator_radius: i16, max_shift: u8) -> f64 {
+            loop {
+                let value = self.dyadic(numerator_radius, max_shift);
+                if value != 0.0 {
+                    return value;
+                }
+            }
+        }
+    }
+
+    type ApplyPivotOpNFn =
+        unsafe extern "C" fn(c_int, c_int, *const f64, *const f64, f64, *mut f64, c_int);
+    type CalcLdOpNFn =
+        unsafe extern "C" fn(c_int, c_int, *const f64, c_int, *const f64, *mut f64, c_int);
+
+    struct NativeKernelShim {
+        _library: Library,
+        apply_pivot_op_n: ApplyPivotOpNFn,
+        calc_ld_op_n: CalcLdOpNFn,
+    }
+
+    static NATIVE_KERNEL_SHIM: OnceLock<Result<NativeKernelShim, String>> = OnceLock::new();
+
+    fn native_kernel_shim_or_skip() -> Option<&'static NativeKernelShim> {
+        match NATIVE_KERNEL_SHIM.get_or_init(build_native_kernel_shim) {
+            Ok(shim) => Some(shim),
+            Err(error) => {
+                if std::env::var_os("AD_CODEGEN_REQUIRE_NATIVE_SPRAL_PARITY").is_some()
+                    || std::env::var_os("AD_CODEGEN_REQUIRE_SPRAL_UPSTREAM_SOURCE").is_some()
+                {
+                    panic!("native SPRAL kernel parity shim is required: {error}");
+                }
+                eprintln!("skipping native SPRAL kernel parity tests: {error}");
+                None
+            }
+        }
+    }
+
+    fn build_native_kernel_shim() -> Result<NativeKernelShim, String> {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .ok_or_else(|| "spral_ssids manifest has no parent".to_string())?
+            .to_path_buf();
+        let ssids_source = std::env::var_os("SPRAL_UPSTREAM_SSIDS_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| repo_root.join("target/native/spral-upstream/src/ssids"));
+        if !ssids_source.is_dir() {
+            return Err(format!(
+                "SPRAL source anchor missing: {}",
+                ssids_source.display()
+            ));
+        }
+        let upstream_src = ssids_source
+            .parent()
+            .ok_or_else(|| format!("invalid SPRAL source anchor: {}", ssids_source.display()))?;
+
+        let libspral = std::env::var_os("SPRAL_SSIDS_NATIVE_LIB")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/Users/greg/local/ipopt-spral/lib/libspral.dylib"));
+        if !libspral.is_file() {
+            return Err(format!(
+                "native SPRAL library missing: {}",
+                libspral.display()
+            ));
+        }
+        let libspral_dir = libspral
+            .parent()
+            .ok_or_else(|| format!("invalid native SPRAL library path: {}", libspral.display()))?;
+
+        let out_dir = repo_root.join("target/spral-kernel-parity-shim");
+        fs::create_dir_all(&out_dir)
+            .map_err(|error| format!("failed to create {}: {error}", out_dir.display()))?;
+        let source_path = out_dir.join("spral_kernel_shim.cpp");
+        let library_path = out_dir.join(dynamic_library_name("spral_kernel_shim"));
+        fs::write(&source_path, native_kernel_shim_source()).map_err(|error| {
+            format!(
+                "failed to write native kernel shim source {}: {error}",
+                source_path.display()
+            )
+        })?;
+
+        let cxx = std::env::var_os("CXX").unwrap_or_else(|| OsString::from("c++"));
+        let mut command = Command::new(&cxx);
+        command
+            .arg("-std=c++17")
+            .arg(dynamic_library_flag())
+            .arg("-fPIC")
+            .arg("-I")
+            .arg(upstream_src)
+            .arg(&source_path)
+            .arg("-L")
+            .arg(libspral_dir)
+            .arg("-lspral")
+            .arg(format!("-Wl,-rpath,{}", libspral_dir.display()))
+            .arg("-o")
+            .arg(&library_path);
+        let output = command.output().map_err(|error| {
+            format!(
+                "failed to run C++ compiler `{}`: {error}",
+                Path::new(&cxx).display()
+            )
+        })?;
+        if !output.status.success() {
+            return Err(format!(
+                "native kernel shim compile failed with status {}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        let library = unsafe {
+            Library::new(&library_path).map_err(|error| {
+                format!(
+                    "failed to load native kernel shim {}: {error}",
+                    library_path.display()
+                )
+            })?
+        };
+        let apply_pivot_op_n = unsafe {
+            *library
+                .get::<ApplyPivotOpNFn>(b"spral_kernel_apply_pivot_op_n\0")
+                .map_err(|error| format!("failed to load apply_pivot OP_N shim: {error}"))?
+        };
+        let calc_ld_op_n = unsafe {
+            *library
+                .get::<CalcLdOpNFn>(b"spral_kernel_calc_ld_op_n\0")
+                .map_err(|error| format!("failed to load calcLD OP_N shim: {error}"))?
+        };
+
+        Ok(NativeKernelShim {
+            _library: library,
+            apply_pivot_op_n,
+            calc_ld_op_n,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn dynamic_library_name(stem: &str) -> String {
+        format!("lib{stem}.dylib")
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn dynamic_library_name(stem: &str) -> String {
+        format!("lib{stem}.so")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn dynamic_library_flag() -> &'static str {
+        "-dynamiclib"
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn dynamic_library_flag() -> &'static str {
+        "-shared"
+    }
+
+    fn native_kernel_shim_source() -> &'static str {
+        r#"
+#include "ssids/cpu/kernels/common.hxx"
+
+namespace spral { namespace ssids { namespace cpu {
+template <enum operation op, typename T>
+void calcLD(int m, int n, T const* l, int ldl, T const* d, T* ld, int ldld);
+
+namespace ldlt_app_internal {
+template <enum operation op, typename T>
+void apply_pivot(int m, int n, int from, const T *diag, const T *d, const T small, T* aval, int lda);
+}
+}}}
+
+extern "C" void spral_kernel_apply_pivot_op_n(
+      int m, int n, const double* diag, const double* d,
+      double small, double* aval, int lda) {
+   spral::ssids::cpu::ldlt_app_internal::apply_pivot<spral::ssids::cpu::OP_N, double>(
+         m, n, 0, diag, d, small, aval, lda);
+}
+
+extern "C" void spral_kernel_calc_ld_op_n(
+      int m, int n, const double* l, int ldl, const double* d,
+      double* ld, int ldld) {
+   spral::ssids::cpu::calcLD<spral::ssids::cpu::OP_N, double>(
+         m, n, l, ldl, d, ld, ldld);
+}
+"#
+    }
+
+    fn env_usize(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(default)
+    }
+
+    fn env_u64(name: &str, default: u64) -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| parse_u64(&value))
+            .unwrap_or(default)
+    }
+
+    fn parse_u64(value: &str) -> Option<u64> {
+        value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+            .map_or_else(
+                || value.parse::<u64>().ok(),
+                |hex| u64::from_str_radix(hex, 16).ok(),
+            )
+    }
+
+    fn deterministic_kernel_runner(cases: usize, seed: u64) -> TestRunner {
+        TestRunner::new_with_rng(
+            Config {
+                cases: cases as u32,
+                failure_persistence: None,
+                rng_seed: RngSeed::Fixed(seed),
+                ..Config::default()
+            },
+            TestRng::deterministic_rng(RngAlgorithm::ChaCha),
+        )
+    }
+
+    #[derive(Clone, Debug)]
+    struct AppKernelCase {
+        seed: u64,
+        size: usize,
+        block_start: usize,
+        block_end: usize,
+        matrix: Vec<f64>,
+        block_records: Vec<FactorBlockRecord>,
+        d_values: Vec<f64>,
+        small: f64,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct AppKernelCaseOptions {
+        allow_two_by_two: bool,
+        allow_signed_zero: bool,
+    }
+
+    fn app_kernel_case_from_seed(seed: u64, options: AppKernelCaseOptions) -> AppKernelCase {
+        let mut rng = DenseBoundaryRng::new(seed);
+        let block_start = rng.usize_inclusive(0, 4);
+        let block_width = rng.usize_inclusive(1, 8);
+        let trailing_rows = rng.usize_inclusive(1, 18);
+        let block_end = block_start + block_width;
+        let size = block_end + trailing_rows;
+        let mut matrix = vec![0.0; size * size];
+
+        for col in block_start..block_end {
+            matrix[col * size + col] = 1.0;
+            for row in (col + 1)..block_end {
+                matrix[col * size + row] =
+                    rng.dyadic_kernel_value(12, 5, options.allow_signed_zero);
+            }
+            for row in block_end..size {
+                matrix[col * size + row] =
+                    rng.dyadic_kernel_value(18, 6, options.allow_signed_zero);
+            }
+        }
+        for col in block_end..size {
+            for row in col..size {
+                matrix[col * size + row] =
+                    rng.dyadic_kernel_value(12, 6, options.allow_signed_zero);
+            }
+        }
+
+        let mut block_records = Vec::new();
+        let mut d_values = vec![0.0; 2 * block_width];
+        let mut local_col = 0;
+        while local_col < block_width {
+            let use_two_by_two = options.allow_two_by_two
+                && local_col + 1 < block_width
+                && rng.next_u64().is_multiple_of(3);
+            if use_two_by_two {
+                let d11 = rng.nonzero_dyadic(12, 4);
+                let d21 = rng.nonzero_dyadic(12, 4);
+                let d22 = rng.nonzero_dyadic(12, 4);
+                block_records.push(FactorBlockRecord {
+                    size: 2,
+                    values: [d11, d21, f64::INFINITY, d22],
+                });
+                d_values[2 * local_col] = d11;
+                d_values[2 * local_col + 1] = d21;
+                d_values[2 * local_col + 2] = f64::INFINITY;
+                d_values[2 * local_col + 3] = d22;
+                local_col += 2;
+            } else {
+                let d11 = if rng.next_u64().is_multiple_of(7) {
+                    0.0
+                } else {
+                    rng.nonzero_dyadic(12, 4)
+                };
+                block_records.push(FactorBlockRecord {
+                    size: 1,
+                    values: [d11, 0.0, 0.0, 0.0],
+                });
+                d_values[2 * local_col] = d11;
+                d_values[2 * local_col + 1] = 0.0;
+                local_col += 1;
+            }
+        }
+
+        AppKernelCase {
+            seed,
+            size,
+            block_start,
+            block_end,
+            matrix,
+            block_records,
+            d_values,
+            small: 1e-20,
+        }
+    }
+
+    #[test]
+    fn app_apply_pivot_op_n_matches_native_kernel_property_cases() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let cases = env_usize("SPRAL_SSIDS_KERNEL_PARITY_CASES", 512);
+        let seed = env_u64("SPRAL_SSIDS_KERNEL_PARITY_SEED", 0xa991_900d_0001);
+        let mut runner = deterministic_kernel_runner(cases, seed);
+
+        runner
+            .run(&any::<u64>(), |case_seed| {
+                let case = app_kernel_case_from_seed(
+                    seed ^ case_seed,
+                    AppKernelCaseOptions {
+                        allow_two_by_two: true,
+                        allow_signed_zero: false,
+                    },
+                );
+                let mut rust_matrix = case.matrix.clone();
+                let mut native_matrix = case.matrix.clone();
+                let trailing_rows = case.size - case.block_end;
+                let block_width = case.block_end - case.block_start;
+                let diag_offset = case.block_start * case.size + case.block_start;
+                let aval_offset = case.block_start * case.size + case.block_end;
+
+                unsafe {
+                    (shim.apply_pivot_op_n)(
+                        trailing_rows as c_int,
+                        block_width as c_int,
+                        native_matrix.as_ptr().add(diag_offset),
+                        case.d_values.as_ptr(),
+                        case.small,
+                        native_matrix.as_mut_ptr().add(aval_offset),
+                        case.size as c_int,
+                    );
+                }
+                app_apply_block_pivots_to_trailing_rows(
+                    &mut rust_matrix,
+                    case.size,
+                    case.block_start,
+                    case.block_end,
+                    &case.block_records,
+                    case.small,
+                    false,
+                );
+
+                for (index, (&rust, &native)) in
+                    rust_matrix.iter().zip(native_matrix.iter()).enumerate()
+                {
+                    prop_assert_eq!(
+                        rust.to_bits(),
+                        native.to_bits(),
+                        "apply_pivot<OP_N> mismatch seed={:#x} index={} rust={:?} native={:?} case={:?}",
+                        case.seed,
+                        index,
+                        rust,
+                        native,
+                        case
+                    );
+                }
+                Ok(())
+            })
+            .expect("apply_pivot<OP_N> kernel parity property failed");
+    }
+
+    #[test]
+    fn app_calc_ld_op_n_one_by_one_matches_native_kernel_property_cases() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let cases = env_usize("SPRAL_SSIDS_KERNEL_PARITY_CASES", 512);
+        let seed = env_u64("SPRAL_SSIDS_KERNEL_PARITY_SEED", 0xc41c_1d00_0001);
+        let mut runner = deterministic_kernel_runner(cases, seed);
+
+        runner
+            .run(&any::<u64>(), |case_seed| {
+                let case = app_kernel_case_from_seed(
+                    seed ^ case_seed,
+                    AppKernelCaseOptions {
+                        allow_two_by_two: false,
+                        allow_signed_zero: false,
+                    },
+                );
+                let trailing_rows = case.size - case.block_end;
+                let block_width = case.block_end - case.block_start;
+                let l_offset = case.block_start * case.size + case.block_end;
+                let mut native_ld = vec![0.0; block_width * case.size];
+
+                unsafe {
+                    (shim.calc_ld_op_n)(
+                        trailing_rows as c_int,
+                        block_width as c_int,
+                        case.matrix.as_ptr().add(l_offset),
+                        case.size as c_int,
+                        case.d_values.as_ptr(),
+                        native_ld.as_mut_ptr().add(case.block_end),
+                        case.size as c_int,
+                    );
+                }
+                let rust_ld = app_build_ld_workspace(
+                    &case.matrix,
+                    case.size,
+                    case.block_start,
+                    case.block_end,
+                    &case.block_records,
+                );
+
+                for (index, (&rust, &native)) in rust_ld.iter().zip(native_ld.iter()).enumerate() {
+                    prop_assert_eq!(
+                        rust.to_bits(),
+                        native.to_bits(),
+                        "calcLD<OP_N> mismatch seed={:#x} index={} rust={:?} native={:?} case={:?}",
+                        case.seed,
+                        index,
+                        rust,
+                        native,
+                        case
+                    );
+                }
+                Ok(())
+            })
+            .expect("calcLD<OP_N> kernel parity property failed");
+    }
+
+    #[test]
+    #[ignore = "manual native-vs-rust APP signed-zero/2x2 kernel mismatch hunt"]
+    fn app_apply_pivot_op_n_matches_native_kernel_full_property_hunt() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let cases = env_usize("SPRAL_SSIDS_KERNEL_PARITY_CASES", 4096);
+        let seed = env_u64("SPRAL_SSIDS_KERNEL_PARITY_SEED", 0xa991_900d_0001);
+        let mut runner = deterministic_kernel_runner(cases, seed);
+
+        runner
+            .run(&any::<u64>(), |case_seed| {
+                let case = app_kernel_case_from_seed(
+                    seed ^ case_seed,
+                    AppKernelCaseOptions {
+                        allow_two_by_two: true,
+                        allow_signed_zero: true,
+                    },
+                );
+                let mut rust_matrix = case.matrix.clone();
+                let mut native_matrix = case.matrix.clone();
+                let trailing_rows = case.size - case.block_end;
+                let block_width = case.block_end - case.block_start;
+                let diag_offset = case.block_start * case.size + case.block_start;
+                let aval_offset = case.block_start * case.size + case.block_end;
+
+                unsafe {
+                    (shim.apply_pivot_op_n)(
+                        trailing_rows as c_int,
+                        block_width as c_int,
+                        native_matrix.as_ptr().add(diag_offset),
+                        case.d_values.as_ptr(),
+                        case.small,
+                        native_matrix.as_mut_ptr().add(aval_offset),
+                        case.size as c_int,
+                    );
+                }
+                app_apply_block_pivots_to_trailing_rows(
+                    &mut rust_matrix,
+                    case.size,
+                    case.block_start,
+                    case.block_end,
+                    &case.block_records,
+                    case.small,
+                    false,
+                );
+
+                for (index, (&rust, &native)) in
+                    rust_matrix.iter().zip(native_matrix.iter()).enumerate()
+                {
+                    prop_assert_eq!(
+                        rust.to_bits(),
+                        native.to_bits(),
+                        "apply_pivot<OP_N> full mismatch seed={:#x} index={} rust={:?} native={:?} case={:?}",
+                        case.seed,
+                        index,
+                        rust,
+                        native,
+                        case
+                    );
+                }
+                Ok(())
+            })
+            .expect("apply_pivot<OP_N> full kernel parity hunt failed");
+    }
+
+    #[test]
+    #[ignore = "manual native-vs-rust calcLD 2x2 contraction mismatch hunt"]
+    fn app_calc_ld_op_n_matches_native_kernel_full_property_hunt() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let cases = env_usize("SPRAL_SSIDS_KERNEL_PARITY_CASES", 4096);
+        let seed = env_u64("SPRAL_SSIDS_KERNEL_PARITY_SEED", 0xc41c_1d00_0001);
+        let mut runner = deterministic_kernel_runner(cases, seed);
+
+        runner
+            .run(&any::<u64>(), |case_seed| {
+                let case = app_kernel_case_from_seed(
+                    seed ^ case_seed,
+                    AppKernelCaseOptions {
+                        allow_two_by_two: true,
+                        allow_signed_zero: true,
+                    },
+                );
+                let trailing_rows = case.size - case.block_end;
+                let block_width = case.block_end - case.block_start;
+                let l_offset = case.block_start * case.size + case.block_end;
+                let mut native_ld = vec![0.0; block_width * case.size];
+
+                unsafe {
+                    (shim.calc_ld_op_n)(
+                        trailing_rows as c_int,
+                        block_width as c_int,
+                        case.matrix.as_ptr().add(l_offset),
+                        case.size as c_int,
+                        case.d_values.as_ptr(),
+                        native_ld.as_mut_ptr().add(case.block_end),
+                        case.size as c_int,
+                    );
+                }
+                let rust_ld = app_build_ld_workspace(
+                    &case.matrix,
+                    case.size,
+                    case.block_start,
+                    case.block_end,
+                    &case.block_records,
+                );
+
+                for (index, (&rust, &native)) in rust_ld.iter().zip(native_ld.iter()).enumerate() {
+                    prop_assert_eq!(
+                        rust.to_bits(),
+                        native.to_bits(),
+                        "calcLD<OP_N> full mismatch seed={:#x} index={} rust={:?} native={:?} case={:?}",
+                        case.seed,
+                        index,
+                        rust,
+                        native,
+                        case
+                    );
+                }
+                Ok(())
+            })
+            .expect("calcLD<OP_N> full kernel parity hunt failed");
     }
 
     #[test]
