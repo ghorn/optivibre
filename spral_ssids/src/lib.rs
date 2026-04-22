@@ -8841,6 +8841,13 @@ extern "C" int spral_kernel_block_prefix_trace_32(
         (dimension, random_dense_dyadic_matrix(dimension, &mut rng))
     }
 
+    fn dense_seed09_case0_matrix() -> (usize, Vec<Vec<f64>>) {
+        let mut rng = DenseBoundaryRng::new(0x09c9_134e_4eff_0004);
+        let dimension = rng.usize_inclusive(33, 160);
+        assert_eq!(dimension, 55);
+        (dimension, random_dense_dyadic_matrix(dimension, &mut rng))
+    }
+
     fn lower_dense_seed6_33() -> (usize, Vec<f64>) {
         let (dimension, dense) = dense_seed6_33_matrix();
         let mut lower_dense = vec![0.0; dimension * dimension];
@@ -9037,6 +9044,60 @@ extern "C" int spral_kernel_block_prefix_trace_32(
     }
 
     #[test]
+    fn dense_seed09_case0_production_app_prefix_inverse_d_matches_native() {
+        let Ok(native) = NativeSpral::load() else {
+            return;
+        };
+        let (dimension, dense) = dense_seed09_case0_matrix();
+        let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+        let matrix = SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
+            .expect("valid CSC");
+        let options = NumericFactorOptions::default();
+
+        let (symbolic, _) = analyse(
+            matrix,
+            &SsidsOptions {
+                ordering: OrderingStrategy::Natural,
+            },
+        )
+        .expect("rust analyse");
+        let (rust_factor, _) = factorize(matrix, &symbolic, &options).expect("rust factorize");
+
+        let mut native_session = native
+            .analyse_with_options_and_ordering(matrix, &options, NativeOrdering::Natural)
+            .expect("native analyse");
+        let native_info = native_session.factorize(matrix).expect("native factorize");
+        let native_enquiry = native_session.enquire_indef().expect("native enquire");
+
+        let mut native_factor_order = vec![usize::MAX; native_enquiry.pivot_order.len()];
+        for (column, &pivot_position) in native_enquiry.pivot_order.iter().enumerate() {
+            native_factor_order[pivot_position] = column;
+        }
+
+        assert_eq!(rust_factor.inertia(), native_info.inertia);
+        assert_eq!(
+            rust_factor.pivot_stats().two_by_two_pivots,
+            native_info.two_by_two_pivots
+        );
+        assert_eq!(
+            rust_factor.pivot_stats().delayed_pivots,
+            native_info.delayed_pivots
+        );
+        assert_eq!(rust_factor.factor_order, native_factor_order);
+
+        let rust_bits = inverse_diagonal_bits(&rust_inverse_diagonal_entries(&rust_factor));
+        let native_bits = inverse_diagonal_bits(&native_enquiry.inverse_diagonal_entries);
+
+        // This dense APP boundary case now pins the production parity ladder
+        // before the first optimized block_ldlt<32> inverse-D drift.
+        assert_eq!(&rust_bits[..12], &native_bits[..12]);
+        assert_ne!(
+            rust_bits[12], native_bits[12],
+            "dense seed09 case0 no longer differs at the current APP inverse-D boundary; promote the full witness"
+        );
+    }
+
+    #[test]
     #[ignore = "manual exact production inverse-D bit mismatch witness after factor metadata parity"]
     fn dense_seed6_production_inverse_d_matches_native() {
         let Ok(native) = NativeSpral::load() else {
@@ -9068,5 +9129,47 @@ extern "C" int spral_kernel_block_prefix_trace_32(
             inverse_diagonal_bits(&native_enquiry.inverse_diagonal_entries),
             "production inverse-D bit patterns differ on seed6 dense APP boundary"
         );
+    }
+
+    #[test]
+    #[ignore = "manual exact production inverse-D bit mismatch witness for dense seed09 case0"]
+    fn dense_seed09_case0_production_inverse_d_matches_native() {
+        let Ok(native) = NativeSpral::load() else {
+            return;
+        };
+        let (dimension, dense) = dense_seed09_case0_matrix();
+        let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+        let matrix = SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
+            .expect("valid CSC");
+        let options = NumericFactorOptions::default();
+
+        let (symbolic, _) = analyse(
+            matrix,
+            &SsidsOptions {
+                ordering: OrderingStrategy::Natural,
+            },
+        )
+        .expect("rust analyse");
+        let (rust_factor, _) = factorize(matrix, &symbolic, &options).expect("rust factorize");
+
+        let mut native_session = native
+            .analyse_with_options_and_ordering(matrix, &options, NativeOrdering::Natural)
+            .expect("native analyse");
+        native_session.factorize(matrix).expect("native factorize");
+        let native_enquiry = native_session.enquire_indef().expect("native enquire");
+
+        let rust_bits = inverse_diagonal_bits(&rust_inverse_diagonal_entries(&rust_factor));
+        let native_bits = inverse_diagonal_bits(&native_enquiry.inverse_diagonal_entries);
+        if rust_bits != native_bits {
+            let index = rust_bits
+                .iter()
+                .zip(&native_bits)
+                .position(|(rust, native)| rust != native)
+                .unwrap_or(usize::MAX);
+            panic!(
+                "production inverse-D bit patterns differ on dense seed09 case0 APP boundary: first mismatch index={index} rust={:#018x} native={:#018x}",
+                rust_bits[index], native_bits[index]
+            );
+        }
     }
 }

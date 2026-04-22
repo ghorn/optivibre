@@ -6,6 +6,13 @@ newly passing in the current checkpoint. Orange nodes have partial coverage or a
 known narrowed boundary. Red nodes are the next open bitwise mismatch target.
 
 Current newly passing witness:
+`dense_seed09_case0_production_app_prefix_inverse_d_matches_native` narrows the
+dense seed `0x09c9134e4eff0004` case0 APP guard. Rust/native production
+factorization metadata still match exactly, and inverse-D now has an active
+bitwise prefix guard through flattened index 11. The remaining open production
+boundary starts at index 12 inside optimized `block_ldlt<32>`.
+
+Previous newly passing witness:
 `dense_seed6_production_app_prefix_inverse_d_matches_native` now pins the
 optimized native `block_ldlt<32>` APP prefix through flattened inverse-D index
 20. This checkpoint matches the local `block_ldlt.hxx` build's contracted 2x2
@@ -15,7 +22,9 @@ The full production witness is still `dense_seed6_production_inverse_d_matches_n
 Current open guard witness:
 `rust_and_native_spral_dense_seed_09c9134e4eff0004_case0_solution_bits`
 captures a dense APP boundary solve mismatch that rejects `update_2x2`
-contraction tweaks which only move the seed6 inverse-D boundary.
+contraction tweaks which only move the seed6 inverse-D boundary. The paired
+manual inverse-D replay is
+`dense_seed09_case0_production_inverse_d_matches_native`.
 
 ```mermaid
 flowchart TD
@@ -64,7 +73,9 @@ flowchart TD
     K --> K1["Factor order, inertia, pivot stats"]
     K --> K2["Seed6 APP prefix inverse-D bits"]
     K2 --> K3["Seed6 full inverse-D bits"]
-    K --> K4["Dense APP boundary case0 solution bits"]
+    K --> K4a["Dense APP case0 prefix inverse-D bits"]
+    K4a --> K4b["Dense APP case0 full inverse-D bits"]
+    K4b --> K4["Dense APP boundary case0 solution bits"]
     J --> K
     K1 --> L{"More fronts?"}
     K3 --> L
@@ -84,7 +95,8 @@ flowchart TD
     classDef open fill:#ffd8d8,stroke:#b43b3b,color:#2b0d0d,stroke-width:2px;
 
     class A,B,B1,B2,B3,G0,G1,G3,G5,G6,G8,G8a,G8b,G9,H1,H2,H3,K1,M,O,P,Q,R match;
-    class G8c,K2 newly;
+    class K4a newly;
     class C,D,E,F,G,G2,G4,G7,G10,H,I,J,K,L,N partial;
-    class K3,K4 open;
+    class G8c,K2 match;
+    class K3,K4b,K4 open;
 ```
