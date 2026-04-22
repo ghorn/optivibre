@@ -2607,12 +2607,22 @@ fn app_build_ld_workspace(
             let d11 = inv11 / det;
             let d21 = inv21 / det;
             let d22 = inv22 / det;
+            let trailing_rows = size - accepted_end;
+            let vector_tail_start = if trailing_rows > 4 {
+                accepted_end + (trailing_rows & !1)
+            } else {
+                accepted_end
+            };
             for row in accepted_end..size {
                 let row_l1 = matrix[pivot * size + row];
                 let row_l2 = matrix[(pivot + 1) * size + row];
-                // SPRAL cpu/kernels/calc_ld.hxx calcLD<OP_N> contracts the first
-                // 2x2 row as the compiled d22*a1 - d21*a2 vector path locally.
-                ld_values[relative_pivot * size + row] = (-d21).mul_add(row_l2, d22 * row_l1);
+                // SPRAL cpu/kernels/calc_ld.hxx calcLD<OP_N> is compiled
+                // locally into a two-lane vector body plus scalar tail.
+                ld_values[relative_pivot * size + row] = if row < vector_tail_start {
+                    (-d21).mul_add(row_l2, d22 * row_l1)
+                } else {
+                    d22.mul_add(row_l1, -(d21 * row_l2))
+                };
                 ld_values[(relative_pivot + 1) * size + row] = (-d21).mul_add(row_l1, d11 * row_l2);
             }
             pivot += 2;
@@ -8313,8 +8323,7 @@ extern "C" int spral_kernel_block_prefix_trace_32(
     }
 
     #[test]
-    #[ignore = "manual native-vs-rust calcLD 2x2 contraction mismatch hunt"]
-    fn app_calc_ld_op_n_matches_native_kernel_full_property_hunt() {
+    fn app_calc_ld_op_n_matches_native_kernel_full_property_cases() {
         let Some(shim) = native_kernel_shim_or_skip() else {
             return;
         };
@@ -8369,7 +8378,7 @@ extern "C" int spral_kernel_block_prefix_trace_32(
                 }
                 Ok(())
             })
-            .expect("calcLD<OP_N> full kernel parity hunt failed");
+            .expect("calcLD<OP_N> full kernel parity property failed");
     }
 
     #[test]
@@ -8414,6 +8423,54 @@ extern "C" int spral_kernel_block_prefix_trace_32(
                 native.to_bits(),
                 "calcLD<OP_N> two-by-two vector row mismatch index={index} rust={rust:?} native={native:?}"
             );
+        }
+    }
+
+    #[test]
+    fn app_calc_ld_op_n_two_by_two_scalar_rows_regression() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+
+        for seed in [0x311b_d3c6_e0de_a5dc, 0x709b_7377_12ec_ad2a] {
+            let case = app_kernel_case_from_seed(
+                seed,
+                AppKernelCaseOptions {
+                    allow_two_by_two: true,
+                    allow_signed_zero: true,
+                },
+            );
+            let trailing_rows = case.size - case.block_end;
+            let block_width = case.block_end - case.block_start;
+            let l_offset = case.block_start * case.size + case.block_end;
+            let mut native_ld = vec![0.0; block_width * case.size];
+
+            unsafe {
+                (shim.calc_ld_op_n)(
+                    trailing_rows as c_int,
+                    block_width as c_int,
+                    case.matrix.as_ptr().add(l_offset),
+                    case.size as c_int,
+                    case.d_values.as_ptr(),
+                    native_ld.as_mut_ptr().add(case.block_end),
+                    case.size as c_int,
+                );
+            }
+            let rust_ld = app_build_ld_workspace(
+                &case.matrix,
+                case.size,
+                case.block_start,
+                case.block_end,
+                &case.block_records,
+            );
+
+            for (index, (&rust, &native)) in rust_ld.iter().zip(native_ld.iter()).enumerate() {
+                assert_eq!(
+                    rust.to_bits(),
+                    native.to_bits(),
+                    "calcLD<OP_N> scalar row mismatch seed={seed:#x} index={index} rust={rust:?} native={native:?}"
+                );
+            }
         }
     }
 

@@ -6,14 +6,13 @@ newly passing in the current checkpoint. Orange nodes have partial coverage or a
 known narrowed boundary. Red nodes are the next open bitwise mismatch target.
 
 Current newly passing witness:
-`app_calc_ld_op_n_two_by_two_vector_row_regression` is now active and proves
-the native `calcLD<OP_N>` 2x2 vector-row contraction matches Rust bitwise for
-the reduced seed `0x3ef599a674c46051`. This pins the
-`target/native/spral-upstream/src/ssids/cpu/kernels/calc_ld.hxx` APP
-postprocess primitive used before `host_gemm` accepted updates. The next open
-APP micro-kernel boundary is the remaining ignored
-`app_calc_ld_op_n_matches_native_kernel_full_property_hunt` scalar/alignment
-case; the production red node is still `dense_seed6_production_inverse_d_matches_native`.
+`app_calc_ld_op_n_matches_native_kernel_full_property_cases` is now active and
+proves native `calcLD<OP_N>` bitwise parity across the signed-zero 1x1/2x2 APP
+property set. This pins the
+`target/native/spral-upstream/src/ssids/cpu/kernels/calc_ld.hxx` postprocess
+primitive, including the local binary's two-lane vector body and scalar tail
+split. The production red node is still
+`dense_seed6_production_inverse_d_matches_native`.
 
 ```mermaid
 flowchart TD
@@ -47,7 +46,7 @@ flowchart TD
     G6 --> G7["swap_cols twice"]
     G7 --> G8["compute 2x2 inverse / multipliers"]
     G8 --> G8a["calcLD OP_N 2x2 vector row"]
-    G8a --> G8b["calcLD OP_N remaining 2x2 alignment cases"]
+    G8a --> G8b["calcLD OP_N vector/scalar row split"]
     G8b --> G9["update_2x2 trailing block"]
 
     G2 -->|"failed / delayed"| G10["delay pivot to parent front"]
@@ -78,8 +77,8 @@ flowchart TD
     classDef partial fill:#ffe3bf,stroke:#b76d12,color:#2b1800,stroke-width:2px;
     classDef open fill:#ffd8d8,stroke:#b43b3b,color:#2b0d0d,stroke-width:2px;
 
-    class A,B,B1,B2,B3,G0,G1,G3,G5,G6,G8,H1,H2,H3,K1,K2,M,O,P,Q,R match;
-    class G8a newly;
+    class A,B,B1,B2,B3,G0,G1,G3,G5,G6,G8,G8a,G9,H1,H2,H3,K1,K2,M,O,P,Q,R match;
+    class G8b newly;
     class C,D,E,F,G,G2,G4,G7,G10,H,I,J,K,L,N partial;
-    class G8b,K3 open;
+    class K3 open;
 ```
