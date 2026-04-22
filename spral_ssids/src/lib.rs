@@ -9428,5 +9428,45 @@ extern "C" int spral_kernel_block_prefix_trace_32(
             &native,
             tail_size,
         );
+
+        let native_tail_lda = native_aligned_double_stride(shim, dimension);
+        let native_tail_ldld = native_aligned_double_stride(shim, APP_INNER_BLOCK_SIZE);
+        let mut native_tail_matrix = vec![0.0; native_tail_lda * tail_size];
+        for col in 0..tail_size {
+            for row in col..tail_size {
+                native_tail_matrix[col * native_tail_lda + row] = tail[col * tail_size + row];
+            }
+        }
+        let mut native_tail_perm = (0..tail_size as c_int).collect::<Vec<_>>();
+        let mut native_tail_diagonal = vec![0.0; 2 * tail_size];
+        let mut native_tail_ld = vec![0.0; 2 * native_tail_ldld];
+        let eliminated = unsafe {
+            (shim.ldlt_tpp_factor)(
+                tail_size as c_int,
+                tail_size as c_int,
+                native_tail_perm.as_mut_ptr(),
+                native_tail_matrix.as_mut_ptr(),
+                native_tail_lda as c_int,
+                native_tail_diagonal.as_mut_ptr(),
+                native_tail_ld.as_mut_ptr(),
+                native_tail_ldld as c_int,
+                i32::from(options.action_on_zero_pivot),
+                options.threshold_pivot_u,
+                options.small_pivot_tolerance,
+                0,
+                ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(eliminated, tail_size as c_int);
+        for (index, (&rust_value, &native_value)) in
+            rust.diagonal.iter().zip(&native_tail_diagonal).enumerate()
+        {
+            assert_eq!(
+                rust_value.to_bits(),
+                native_value.to_bits(),
+                "dense seed09 APP-stride TPP tail D mismatch index={index} rust={rust_value:?} native={native_value:?}"
+            );
+        }
     }
 }

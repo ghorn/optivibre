@@ -6,21 +6,18 @@ newly passing in the current checkpoint. Orange nodes have partial coverage or a
 known narrowed boundary. Red nodes are the next open bitwise mismatch target.
 
 Current newly passing witness:
-`dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now isolates
-the dense seed `0x09c9134e4eff0004` case0 boundary: the first accepted APP
-panel update matches native SPRAL's `calcLD<OP_N>` plus
-`host_gemm(OP_N, OP_T)`, and the resulting 23x23 TPP tail matches native
-`ldlt_tpp_factor` bitwise. The full production inverse-D guard still first
-differs at flattened index 75, so the open issue is outside that isolated TPP
-tail kernel on Rust's post-APP tail input.
+`dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now also
+checks the post-APP 23x23 TPP tail with SPRAL's native APP leading dimensions:
+`lda=align_lda(55)` for the tail matrix and `ldld=align_lda(32)` for
+`ldlt_tpp_factor`'s workspace. The APP-stride tail D entries match bitwise.
+The full production inverse-D guard still first differs at flattened index 75,
+so the open issue is outside the isolated APP update and APP-stride TPP tail.
 
 Previous newly passing witness:
-`block_ldlt.hxx`'s 2x2 multiplier rows mirrored the local optimized native
-contraction order for both APP multiplier columns. That promoted
-`dense_seed6_production_inverse_d_matches_native` to a full active bitwise
-inverse-D guard and extended
-`dense_seed09_case0_production_app_prefix_inverse_d_matches_native` through
-flattened inverse-D index 74.
+`dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` isolated the
+dense seed `0x09c9134e4eff0004` case0 boundary: the first accepted APP panel
+update matched native SPRAL's `calcLD<OP_N>` plus `host_gemm(OP_N, OP_T)`, and
+the compact 23x23 TPP tail matched native `ldlt_tpp_factor` bitwise.
 
 Current open guard witness:
 `rust_and_native_spral_dense_seed_09c9134e4eff0004_case0_solution_bits`
@@ -75,14 +72,16 @@ flowchart TD
 
     I --> I1["Dense seed09 first APP accepted update via calcLD + host_gemm"]
     I1 --> I2["Dense seed09 post-APP 23x23 TPP tail factor"]
-    I2 --> K4c
+    I2 --> I3["Dense seed09 APP-stride 23x23 TPP tail factor"]
+    I3 --> K4d
     I --> K["Store L/D blocks, local perms, pivot records"]
     K --> K1["Factor order, inertia, pivot stats"]
     K --> K2["Seed6 APP prefix inverse-D bits through 29"]
     K2 --> K3["Seed6 full inverse-D bits"]
     K --> K4a["Dense APP case0 prefix inverse-D bits through 74"]
     K4a --> K4c["Dense seed09 isolated APP update + TPP tail kernels"]
-    K4c --> K4b["Dense APP case0 full inverse-D bits"]
+    K4c --> K4d["Dense seed09 APP-stride TPP tail D bits"]
+    K4d --> K4b["Dense APP case0 full inverse-D bits"]
     K4b --> K4["Dense APP boundary case0 solution bits"]
     J --> K
     K1 --> L{"More fronts?"}
@@ -103,8 +102,8 @@ flowchart TD
     classDef open fill:#ffd8d8,stroke:#b43b3b,color:#2b0d0d,stroke-width:2px;
 
     class A,B,B1,B2,B3,G0,G1,G3,G5,G6,G8,G8a,G8b,G9,H1,H2,H3,K1,M,O,P,Q,R match;
-    class I1,I2,K4c newly;
+    class I3,K4d newly;
     class C,D,E,F,G,G2,G4,G7,G10,H,I,J,K,L,N partial;
-    class G8c,G8d,G9a,K2,K3,K4a match;
+    class G8c,G8d,G9a,I1,I2,K2,K3,K4a,K4c match;
     class K4b,K4 open;
 ```
