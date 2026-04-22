@@ -9959,6 +9959,48 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             }),
             "dense seed09 FMA native APP trace continuation boundary moved"
         );
+        let fma_pivot_snapshot = native_trace
+            .iter()
+            .find(|snapshot| snapshot.step == 10 && snapshot.from == 19 && snapshot.status == 2)
+            .expect("dense seed09 FMA pivot-19 snapshot");
+        let multiplier_col = fma_pivot_snapshot.from;
+        let final_multiplier_row = 30;
+        let final_multiplier_source = native_block.local_perm[final_multiplier_row];
+        let multiplier_row = fma_pivot_snapshot
+            .local_perm
+            .iter()
+            .position(|&entry| entry == final_multiplier_source)
+            .expect("dense seed09 FMA pivot-19 final multiplier row source");
+        assert_eq!(
+            multiplier_row, 31,
+            "dense seed09 FMA pivot-19 source row moved"
+        );
+        assert_eq!(multiplier_col + 2, fma_pivot_snapshot.next);
+        assert!(multiplier_row >= fma_pivot_snapshot.next);
+        let d11 = fma_pivot_snapshot.diagonal[2 * multiplier_col];
+        let d21 = fma_pivot_snapshot.diagonal[2 * multiplier_col + 1];
+        let first_work =
+            fma_pivot_snapshot.workspace[multiplier_col * APP_INNER_BLOCK_SIZE + multiplier_row];
+        let second_work = fma_pivot_snapshot.workspace
+            [(multiplier_col + 1) * APP_INNER_BLOCK_SIZE + multiplier_row];
+        let reconstructed_first_multiplier = d21.mul_add(second_work, d11 * first_work);
+        let trace_first_multiplier =
+            fma_pivot_snapshot.matrix[multiplier_col * APP_INNER_BLOCK_SIZE + multiplier_row];
+        let native_block_first_multiplier =
+            native_block.matrix[multiplier_col * native_lda + final_multiplier_row];
+        assert_eq!(
+            reconstructed_first_multiplier.to_bits(),
+            trace_first_multiplier.to_bits(),
+            "dense seed09 FMA pivot-19 first-row multiplier reconstruction moved"
+        );
+        assert_eq!(
+            (
+                trace_first_multiplier.to_bits(),
+                native_block_first_multiplier.to_bits()
+            ),
+            (0xbf8c_bfa8_da67_4b6b, 0xbf8c_bfa8_da67_4b6c),
+            "dense seed09 FMA pivot-19 first-row multiplier boundary moved"
+        );
         assert_eq!(
             native_source_trace_block.perm, native_block.perm,
             "dense seed09 source native APP trace/block_ldlt permutation mismatch"
