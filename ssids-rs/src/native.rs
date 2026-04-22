@@ -301,7 +301,7 @@ impl NativeSpral {
                 inner: Arc::new(linked_spral_library()),
             };
             native_spral_smoke_test(&native)?;
-            return Ok(native);
+            Ok(native)
         }
 
         #[cfg(all(not(feature = "native-spral-src"), feature = "dynamic-spral-parity"))]

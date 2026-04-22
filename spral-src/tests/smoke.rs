@@ -207,5 +207,7 @@ fn public_config_declares_no_system_solver_math_fallbacks() {
     assert!(!std::hint::black_box(
         spral_src::SYSTEM_SOLVER_MATH_FALLBACKS
     ));
+    assert!(matches!(spral_src::OPENBLAS_THREADING, "serial" | "openmp"));
+    assert!(spral_src::config_summary().contains("openblas_threading="));
     assert!(spral_src::config_summary().contains("system_solver_math_fallbacks=false"));
 }

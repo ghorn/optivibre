@@ -20,6 +20,11 @@ is not required.
 brew install gcc meson ninja
 ```
 
+The default source-built path uses serial OpenBLAS underneath SPRAL/IPOPT for
+repeatable parity checks. Performance experiments can opt into OpenMP OpenBLAS
+with the `source-built-spral-openmp` forwarding feature and should set
+`OMP_NUM_THREADS` and, when needed, `OPENBLAS_NUM_PARALLEL` explicitly.
+
 ## Common Commands
 
 Base workspace checks:

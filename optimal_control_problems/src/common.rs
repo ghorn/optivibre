@@ -9878,6 +9878,16 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "ipopt")]
+    #[test]
+    fn solver_method_from_map_parses_ipopt_choice() {
+        let mut values = BTreeMap::new();
+        values.insert("solver_method".to_string(), 2.0);
+        let parsed = solver_method_from_map(&values, default_solver_method())
+            .expect("solver method should parse");
+        assert_eq!(parsed, SolverMethod::Ipopt);
+    }
+
     #[test]
     fn default_nlip_config_matches_ipopt_spral_defaults() {
         let default = default_nlip_config();

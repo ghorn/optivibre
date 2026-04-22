@@ -17,6 +17,7 @@ const IPOPT_SHA256: &str = "ca552a9ca9d457fd4ff72405a5fee3a70e8a52016d2d5dba5845
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    validate_feature_mode();
     for var in [
         "CC",
         "CXX",
@@ -34,6 +35,9 @@ fn main() {
     }
     println!("cargo:rustc-env=IPOPT_SRC_VERSION={IPOPT_VERSION}");
     println!("cargo:rustc-env=IPOPT_SRC_COMMIT={IPOPT_COMMIT}");
+    println!("cargo:rustc-env=IPOPT_SRC_SOLVER_FAMILY=spral");
+    println!("cargo:rustc-env=IPOPT_SRC_OPENBLAS_OWNER=spral-src");
+    println!("cargo:rustc-env=IPOPT_SRC_SYSTEM_SOLVER_MATH_FALLBACKS=false");
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set"));
     let source_dir = out_dir.join("sources");
@@ -74,6 +78,7 @@ struct SpralMetadata {
     runtime_link_dirs: Vec<PathBuf>,
     openblas_extra_link_dirs: Vec<PathBuf>,
     openblas_extra_link_libs: Vec<String>,
+    openblas_threading: String,
     spral_cflags: String,
     spral_lflags: String,
     lapack_lflags: String,
@@ -94,11 +99,41 @@ impl SpralMetadata {
             runtime_link_dirs: metadata_paths("RUNTIME_LINK_DIRS"),
             openblas_extra_link_dirs: metadata_paths("OPENBLAS_EXTRA_LINK_DIRS"),
             openblas_extra_link_libs: metadata_list("OPENBLAS_EXTRA_LINK_LIBS"),
+            openblas_threading: metadata("OPENBLAS_THREADING"),
             spral_cflags: metadata("SPRAL_CFLAGS"),
             spral_lflags: metadata("SPRAL_LFLAGS"),
             lapack_lflags: metadata("LAPACK_LFLAGS"),
         }
     }
+}
+
+fn validate_feature_mode() {
+    let spral_serial = cfg!(feature = "source-built-spral");
+    let spral_openmp = cfg!(feature = "source-built-spral-openmp");
+    let compatibility = [
+        ("mumps", cfg!(feature = "mumps")),
+        ("openblas-static", cfg!(feature = "openblas-static")),
+        ("openblas-system", cfg!(feature = "openblas-system")),
+        ("intel-mkl", cfg!(feature = "intel-mkl")),
+        ("intel-mkl-static", cfg!(feature = "intel-mkl-static")),
+        ("intel-mkl-system", cfg!(feature = "intel-mkl-system")),
+    ]
+    .into_iter()
+    .filter_map(|(name, enabled)| enabled.then_some(name))
+    .collect::<Vec<_>>();
+
+    assert!(
+        spral_serial ^ spral_openmp,
+        "ipopt-src requires exactly one SPRAL source-built feature: \
+         `source-built-spral` or `source-built-spral-openmp`"
+    );
+    assert!(
+        compatibility.is_empty(),
+        "ipopt-src upstream-compatible feature(s) {} are reserved for \
+         non-parity compatibility work and are not wired into this strict \
+         SPRAL source-built fork yet",
+        compatibility.join(", ")
+    );
 }
 
 fn metadata(name: &str) -> String {
@@ -325,6 +360,12 @@ fn emit_link_metadata(install_dir: &Path, spral: &SpralMetadata) {
         "cargo:openblas_extra_link_libs={}",
         spral.openblas_extra_link_libs.join(";")
     );
+    println!("cargo:openblas_owner=spral-src");
+    println!("cargo:openblas_threading={}", spral.openblas_threading);
+    println!(
+        "cargo:rustc-env=IPOPT_SRC_OPENBLAS_THREADING={}",
+        spral.openblas_threading
+    );
     println!("cargo:version={IPOPT_VERSION}");
     println!("cargo:source_commit={IPOPT_COMMIT}");
     println!("cargo:spral_cflags={}", spral.spral_cflags);
@@ -359,6 +400,8 @@ fn emit_link_metadata(install_dir: &Path, spral: &SpralMetadata) {
         "OPENBLAS_EXTRA_LINK_LIBS",
         &spral.openblas_extra_link_libs.join(";"),
     );
+    emit_dep_metadata("OPENBLAS_OWNER", "spral-src");
+    emit_dep_metadata("OPENBLAS_THREADING", &spral.openblas_threading);
     emit_dep_metadata("VERSION", IPOPT_VERSION);
     emit_dep_metadata("SOURCE_COMMIT", IPOPT_COMMIT);
     emit_dep_metadata("SPRAL_CFLAGS", &spral.spral_cflags);

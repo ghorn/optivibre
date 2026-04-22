@@ -23,6 +23,7 @@ members = [
     "xtask",
 ]
 resolver = "2"
+exclude = ["third_party/openblas-src"]
 
 [workspace.package]
 edition = "2024"

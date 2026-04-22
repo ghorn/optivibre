@@ -36,8 +36,8 @@ repository = "https://github.com/elrnv/ipopt-rs"
 
 [features]
 default = ["source-built-spral"]
-source-built-spral = ["dep:ipopt-src", "ipopt-src/openblas-serial"]
-source-built-spral-openmp = ["dep:ipopt-src", "ipopt-src/openblas-openmp"]
+source-built-spral = ["dep:ipopt-src", "ipopt-src/source-built-spral"]
+source-built-spral-openmp = ["dep:ipopt-src", "ipopt-src/source-built-spral-openmp"]
 legacy-native-build = []
 
 [lib]

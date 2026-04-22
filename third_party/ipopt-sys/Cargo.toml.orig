@@ -16,8 +16,8 @@ keywords = ["non-linear", "optimization", "constrained", "ipopt", "unsafe"]
 
 [features]
 default = ["source-built-spral"]
-source-built-spral = ["dep:ipopt-src", "ipopt-src/openblas-serial"]
-source-built-spral-openmp = ["dep:ipopt-src", "ipopt-src/openblas-openmp"]
+source-built-spral = ["dep:ipopt-src", "ipopt-src/source-built-spral"]
+source-built-spral-openmp = ["dep:ipopt-src", "ipopt-src/source-built-spral-openmp"]
 legacy-native-build = []
 
 [dev-dependencies]

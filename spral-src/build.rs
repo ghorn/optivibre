@@ -75,6 +75,7 @@ fn main() {
         "OPENBLAS_CC",
         "OPENBLAS_FC",
         "OPENBLAS_HOSTCC",
+        "OPENBLAS_NUM_PARALLEL",
         "OPENBLAS_RANLIB",
         "OPENBLAS_TARGET",
         "SPRAL_SRC_OPENMP_LIB",
@@ -703,6 +704,9 @@ fn openblas_make_args(tools: &Toolchain, threading: OpenBlasThreading) -> Vec<St
         OpenBlasThreading::OpenMp => {
             args.push("USE_THREAD=1".to_string());
             args.push("USE_OPENMP=1".to_string());
+            if let Ok(num_parallel) = env::var("OPENBLAS_NUM_PARALLEL") {
+                args.push(format!("NUM_PARALLEL={num_parallel}"));
+            }
         }
     }
     if let Ok(ranlib) = env::var("OPENBLAS_RANLIB") {
@@ -993,6 +997,10 @@ fn emit_link_metadata(
     emit_dep_metadata("OPENBLAS_VERSION", OPENBLAS_VERSION);
     println!(
         "cargo:config=spral={SPRAL_VERSION};metis={METIS_VERSION};openblas={OPENBLAS_VERSION};openblas_threading={};openmp=required;system_solver_math_fallbacks=false",
+        openblas_threading.label()
+    );
+    println!(
+        "cargo:rustc-env=SPRAL_SRC_OPENBLAS_THREADING={}",
         openblas_threading.label()
     );
 }

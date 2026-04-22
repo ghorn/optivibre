@@ -9,6 +9,9 @@ regression test.
 
 Normal distribution builds should use `spral-src` / `ipopt-src` and must not
 depend on Homebrew, `/usr/local`, or `/Users/greg/local/ipopt-spral`.
+Parity acceptance must force NLIP `InteriorPointLinearSolver::SpralSrc` and
+IPOPT `linear_solver=spral`; `Auto`, QDLDL, MUMPS, and MKL-backed IPOPT modes
+are runtime/compatibility choices only and must fail parity preflight.
 
 Run parity acceptance commands through:
 

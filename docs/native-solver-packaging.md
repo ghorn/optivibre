@@ -11,12 +11,26 @@ The default OpenBLAS mode is deterministic serial BLAS via
 `openblas-serial`; `openblas-openmp` is opt-in and mutually exclusive. Consumers
 should use the forwarding features on `ssids-rs` or `ipopt-src` instead of
 enabling both OpenBLAS modes through Cargo feature unification.
+`OPENBLAS_NUM_PARALLEL` is forwarded to OpenBLAS `NUM_PARALLEL` for OpenMP
+builds when multiple independent OpenMP regions may call BLAS concurrently.
 
-`ipopt-src` is the standard native IPOPT distribution crate. It builds IPOPT
-3.14.20 from commit `4667204c76e534d3e4df6b1462f258a4f9c681bd`, configures it
-against `spral-src` via explicit SPRAL and LAPACK flags, disables MUMPS/HSL and
+`ipopt-src` is the standard native IPOPT distribution crate. It tracks the
+published `ipopt-src` feature vocabulary where possible, but Optivibre's default
+is the strict `source-built-spral` lane. It builds IPOPT 3.14.20 from commit
+`4667204c76e534d3e4df6b1462f258a4f9c681bd`, configures it against `spral-src`
+via explicit SPRAL and LAPACK flags, disables MUMPS/HSL and
 linear-solver-loader discovery, and re-emits the static IPOPT+SPRAL link
-metadata as `DEP_IPOPT_*`.
+metadata as `DEP_IPOPT_*`. Upstream-compatible MUMPS/MKL feature names are
+reserved for a non-parity compatibility lane and intentionally fail closed until
+they can share one BLAS owner or are documented as bringing their own BLAS.
+
+The upstream `openblas-src` patch lives under `third_party/openblas-src`, but it
+is not selected by the default Optivibre workspace because the SPRAL/IPOPT path
+does not depend on `openblas-src`. The patch adds mutually exclusive
+`threading-serial`, `threading-pthread`, and `threading-openmp` features that
+feed the existing `openblas-build` `USE_THREAD`/`USE_OPENMP` controls. The
+SPRAL/IPOPT default path still consumes OpenBLAS only through `spral-src`,
+avoiding duplicate BLAS archives.
 
 The patched `ipopt-sys` crate defaults to `source-built-spral`, consumes
 `ipopt-src`, builds only the CNLP shim and bindings, and does not run its legacy

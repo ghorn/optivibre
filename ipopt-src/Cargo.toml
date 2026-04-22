@@ -11,12 +11,24 @@ rust-version.workspace = true
 description = "Source-built IPOPT 3.14.20 linked against the spral-src native solver stack."
 
 [features]
-default = ["openblas-serial"]
-openblas-serial = ["spral-src/openblas-serial"]
-openblas-openmp = ["spral-src/openblas-openmp"]
+default = ["source-built-spral"]
+source-built-spral = ["spral", "spral-src/openblas-serial"]
+source-built-spral-openmp = ["spral", "spral-src/openblas-openmp"]
+spral = ["dep:spral-src"]
+openblas-serial = ["source-built-spral"]
+openblas-openmp = ["source-built-spral-openmp"]
+
+# Upstream-compatible feature names. They are explicit non-parity lanes in this
+# fork until MUMPS/MKL can share a single BLAS owner with the SPRAL path.
+mumps = []
+openblas-static = []
+openblas-system = []
+intel-mkl = []
+intel-mkl-static = ["intel-mkl"]
+intel-mkl-system = ["intel-mkl"]
 
 [dependencies]
-spral-src = { path = "../spral-src", default-features = false }
+spral-src = { path = "../spral-src", optional = true, default-features = false }
 
 [build-dependencies]
 flate2 = "1.1.5"

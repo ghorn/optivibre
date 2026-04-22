@@ -663,6 +663,7 @@ fn solver_method_for_values(
     match value.round() as i64 {
         0 => Some(SolverMethod::Sqp),
         1 => Some(SolverMethod::Nlip),
+        2 => Some(SolverMethod::Ipopt),
         _ => None,
     }
 }
@@ -939,6 +940,16 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .expect("cache env lock")
+    }
+
+    #[test]
+    fn solver_method_for_values_parses_ipopt_choice() {
+        let mut values = BTreeMap::new();
+        values.insert("solver_method".to_string(), 2.0);
+        assert_eq!(
+            solver_method_for_values(ProblemId::OptimalDistanceGlider, &values),
+            Some(SolverMethod::Ipopt)
+        );
     }
 
     #[test]
