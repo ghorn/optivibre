@@ -9506,6 +9506,48 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
     }
 
     #[test]
+    fn dense_seed6_native_block_continuation_diverges_at_l_storage_gap() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let (dimension, lower_dense) = lower_dense_seed6_33();
+        let options = NumericFactorOptions::default();
+        let native_lda = native_aligned_double_stride(shim, dimension);
+        let native_trace =
+            native_block_prefix_trace_32(shim, &lower_dense, dimension, native_lda, options);
+        let native_block = native_block_ldlt_32_from_lower_dense(
+            shim,
+            &lower_dense,
+            dimension,
+            native_lda,
+            options,
+        );
+
+        assert_eq!(
+            first_native_block_continuation_mismatch(
+                shim,
+                &native_trace,
+                &native_block,
+                native_lda,
+                options,
+            ),
+            Some(BlockContinuationMismatch {
+                step: 14,
+                from: 28,
+                status: 2,
+                next: 30,
+                component: "matrix",
+                index: 988,
+                row: 30,
+                col: 28,
+                continued_bits: 0xbf81_6117_c4f8_272d,
+                block_bits: 0xbf81_6117_c4f8_2730,
+            }),
+            "dense seed6 native APP continuation boundary moved"
+        );
+    }
+
+    #[test]
     #[ignore = "manual native-vs-rust production APP acceptance/storage witness after matching block_ldlt<32> prefix"]
     fn app_block_ldlt_32_matches_native_dense_seed6_prefix() {
         let Some(shim) = native_kernel_shim_or_skip() else {

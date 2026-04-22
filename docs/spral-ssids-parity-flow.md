@@ -46,6 +46,16 @@ stack reports OpenBLAS `0.3.32 DYNAMIC_ARCH ... neoversen1`, whose arm64
 dtrsm.
 
 Current newly narrowed solve-lane witness:
+`dense_seed6_native_block_continuation_diverges_at_l_storage_gap` now re-enters
+native `block_ldlt<32>` from seed6 native prefix-trace snapshots. The first
+native continuation mismatch is the same L-storage gap as the Rust/native final
+block comparison: `step=14, from=28, status=2, next=30`, matrix row 30, col 28,
+continued `0xbf816117c4f8272d` versus full native block
+`0xbf816117c4f82730`. This pins the seed6 gap to native full-block optimized
+continuation state for the final 2x2 APP pivot, not to Rust-only production
+solve traversal or native enquiry/D metadata.
+
+Previous newly narrowed solve-lane witness:
 `dense_seed6_app_block_storage_diverges_after_matching_prefix_trace` now pins
 the dense seed6 solve-lane boundary below factor metadata and APP prefix
 tracing. Rust and native `block_ldlt<32>` prefix traces match bitwise with the
@@ -382,7 +392,8 @@ flowchart TD
     K --> K2["Seed6 APP prefix inverse-D bits through 29"]
     K2 --> K3["Seed6 full inverse-D bits"]
     K3 --> K3b["Seed6 APP block final L storage after matching prefix trace"]
-    K3b --> K3a["Seed6 full solution bits after matching D"]
+    K3b --> K3c["Seed6 native APP continuation reproduces L-storage gap"]
+    K3c --> K3a["Seed6 full solution bits after matching D"]
     K --> K4a["Dense APP case0 prefix inverse-D bits through 74"]
     K4a --> K4e["Dense seed09 APP-stride apply_pivot OP_N L bits"]
     K4e --> K4c["Dense seed09 isolated APP update + TPP tail kernels"]
@@ -436,7 +447,7 @@ flowchart TD
     class K4k partial;
     class C,D,E,F,G,G2,G4,G7,G10,H,I,J,K,L,N partial;
     class O0,O1 newlyPartial;
-    class K3a,K3b newlyPartial;
+    class K3a,K3b,K3c newlyPartial;
     class K4l newlyPartial;
     class G8c,G8d,G9a,I00,I0,I0a,I1,I2,I3,K2,K3,K4a,K4c,K4d,K4e,K4f,K4g,K4h,K4i match;
     class K4b,K4,S open;
