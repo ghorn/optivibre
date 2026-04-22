@@ -6,13 +6,13 @@ newly passing in the current checkpoint. Orange nodes have partial coverage or a
 known narrowed boundary. Red nodes are the next open bitwise mismatch target.
 
 Current newly passing witness:
-`dense_tpp_factor_dyadic_cases_0_to_6_match_native_kernel` proves the
+`dense_tpp_factor_dyadic_cases_0_to_15_match_native_kernel` proves the
 standalone native `ldlt_tpp_factor` path matches Rust bitwise for dyadic cases
-0 through 6. This checkpoint also pins native TPP's `m`/`n` update bound:
-factor multipliers are formed for all rows, but trailing updates only touch
-candidate columns. The next smaller open TPP witness is
-`dense_tpp_factor_small_dyadic_cases_match_native_kernel`, where the remaining
-sweep first differs at case 7, matrix row 5, col 0.
+0 through 15. This checkpoint also pins native TPP's compiled 2x2 multiplier
+loop behavior: vectorized rows and scalar rows contract the source expression
+with different accumulator order. The next smaller open TPP witness is
+`dense_tpp_dyadic_case7_three_candidate_prefix_matches_native_kernel`, where
+partial candidate length 3 first differs at matrix row 5, col 2.
 
 ```mermaid
 flowchart TD
@@ -32,8 +32,8 @@ flowchart TD
     F -->|"APP block path"| G["block_ldlt APP panel"]
     F -->|"TPP / tail path"| H["dense TPP tail factorization"]
     H --> H1["Standalone TPP 4x4 factor state"]
-    H1 --> H2["Dyadic TPP cases 0-6 factor state"]
-    H2 --> H3["Dyadic TPP case 7 update-order"]
+    H1 --> H2["Dyadic TPP full cases 0-15"]
+    H2 --> H3["Partial TPP case 7 n=3"]
 
     G --> G0["Native align_lda panel layout"]
     G0 --> G1["find_maxloc"]

@@ -2840,17 +2840,30 @@ fn tpp_factor_two_by_two(
     matrix[dense_lower_offset(size, pivot + 1, pivot)] = 0.0;
     matrix[dense_lower_offset(size, pivot + 1, pivot + 1)] = 1.0;
 
+    let first_multiplier_row = pivot + 2;
+    let trailing_rows = size.saturating_sub(first_multiplier_row);
+    // The local native SPRAL build vectorizes ldlt_tpp.cxx::apply_2x2 once
+    // there are at least four trailing rows. Its vector loop accumulates the
+    // first multiplier as d21*b2 + d11*b1; the scalar path accumulates it as
+    // the source-spelled d11*b1 + d21*b2.
+    let vectorized_multiplier_rows = if trailing_rows >= 4 {
+        trailing_rows / 2 * 2
+    } else {
+        0
+    };
     let mut first_entries = Vec::new();
     let mut second_entries = Vec::new();
-    for row in (pivot + 2)..size {
+    for row in first_multiplier_row..size {
         let b1 = matrix[dense_lower_offset(size, row, pivot)];
         let b2 = matrix[dense_lower_offset(size, row, pivot + 1)];
         first_scratch[row] = b1;
         second_scratch[row] = b2;
-        // Native SPRAL's ldlt_tpp.cxx::apply_2x2 spells these as product plus
-        // add expressions; the local native build contracts them. The direct
-        // TPP kernel witnesses pin the compiled behavior used in parity runs.
-        let l1 = inv11.mul_add(b1, inv12 * b2);
+        let local_row = row - first_multiplier_row;
+        let l1 = if local_row < vectorized_multiplier_rows {
+            inv12.mul_add(b2, inv11 * b1)
+        } else {
+            inv11.mul_add(b1, inv12 * b2)
+        };
         let l2 = inv12.mul_add(b1, inv22 * b2);
         if !l1.is_finite() || !l2.is_finite() {
             return Err(SsidsError::NumericalBreakdown {
@@ -8538,13 +8551,13 @@ extern "C" int spral_kernel_block_prefix_trace_32(
     }
 
     #[test]
-    fn dense_tpp_factor_dyadic_cases_0_to_6_match_native_kernel() {
+    fn dense_tpp_factor_dyadic_cases_0_to_15_match_native_kernel() {
         let Some(shim) = native_kernel_shim_or_skip() else {
             return;
         };
         let options = NumericFactorOptions::default();
 
-        for case in 0..7 {
+        for case in 0..16 {
             let (dimension, dense) = dense_tpp_dyadic_case_lower(case);
             let rust = rust_ldlt_tpp_factor_from_lower_dense(&dense, dimension, dimension, options);
             let native = native_ldlt_tpp_factor_from_lower_dense(
@@ -8557,23 +8570,44 @@ extern "C" int spral_kernel_block_prefix_trace_32(
     }
 
     #[test]
-    #[ignore = "manual native-vs-rust TPP update-order witness; case 7 first differs in matrix row 5 col 0"]
-    fn dense_tpp_factor_small_dyadic_cases_match_native_kernel() {
+    fn dense_tpp_dyadic_case7_two_candidate_prefix_matches_native_kernel() {
         let Some(shim) = native_kernel_shim_or_skip() else {
             return;
         };
         let options = NumericFactorOptions::default();
+        let (dimension, dense) = dense_tpp_dyadic_case_lower(7);
 
-        for case in 7..16 {
-            let (dimension, dense) = dense_tpp_dyadic_case_lower(case);
-            let rust = rust_ldlt_tpp_factor_from_lower_dense(&dense, dimension, dimension, options);
-            let native = native_ldlt_tpp_factor_from_lower_dense(
-                shim, &dense, dimension, dimension, options,
-            );
+        let rust = rust_ldlt_tpp_factor_from_lower_dense(&dense, dimension, 2, options);
+        let native = native_ldlt_tpp_factor_from_lower_dense(shim, &dense, dimension, 2, options);
 
-            let label = format!("dyadic case={case} dimension={dimension}");
-            assert_dense_tpp_kernel_results_equal(&label, &rust, &native, dimension);
-        }
+        assert_dense_tpp_kernel_results_equal("dyadic case=7 candidate_len=2", &rust, &native, 2);
+        assert_dense_tpp_full_lower_matrix_equal(
+            "dyadic case=7 candidate_len=2",
+            &rust,
+            &native,
+            dimension,
+        );
+    }
+
+    #[test]
+    #[ignore = "manual native-vs-rust TPP partial-candidate witness; case 7 candidate_len 3 differs in matrix row 5 col 2"]
+    fn dense_tpp_dyadic_case7_three_candidate_prefix_matches_native_kernel() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let options = NumericFactorOptions::default();
+        let (dimension, dense) = dense_tpp_dyadic_case_lower(7);
+
+        let rust = rust_ldlt_tpp_factor_from_lower_dense(&dense, dimension, 3, options);
+        let native = native_ldlt_tpp_factor_from_lower_dense(shim, &dense, dimension, 3, options);
+
+        assert_dense_tpp_kernel_results_equal("dyadic case=7 candidate_len=3", &rust, &native, 3);
+        assert_dense_tpp_full_lower_matrix_equal(
+            "dyadic case=7 candidate_len=3",
+            &rust,
+            &native,
+            dimension,
+        );
     }
 
     #[test]
