@@ -2610,7 +2610,9 @@ fn app_build_ld_workspace(
             for row in accepted_end..size {
                 let row_l1 = matrix[pivot * size + row];
                 let row_l2 = matrix[(pivot + 1) * size + row];
-                ld_values[relative_pivot * size + row] = d22.mul_add(row_l1, -(d21 * row_l2));
+                // SPRAL cpu/kernels/calc_ld.hxx calcLD<OP_N> contracts the first
+                // 2x2 row as the compiled d22*a1 - d21*a2 vector path locally.
+                ld_values[relative_pivot * size + row] = (-d21).mul_add(row_l2, d22 * row_l1);
                 ld_values[(relative_pivot + 1) * size + row] = (-d21).mul_add(row_l1, d11 * row_l2);
             }
             pivot += 2;
@@ -8368,6 +8370,51 @@ extern "C" int spral_kernel_block_prefix_trace_32(
                 Ok(())
             })
             .expect("calcLD<OP_N> full kernel parity hunt failed");
+    }
+
+    #[test]
+    fn app_calc_ld_op_n_two_by_two_vector_row_regression() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let case = app_kernel_case_from_seed(
+            0x3ef5_99a6_74c4_6051,
+            AppKernelCaseOptions {
+                allow_two_by_two: true,
+                allow_signed_zero: true,
+            },
+        );
+        let trailing_rows = case.size - case.block_end;
+        let block_width = case.block_end - case.block_start;
+        let l_offset = case.block_start * case.size + case.block_end;
+        let mut native_ld = vec![0.0; block_width * case.size];
+
+        unsafe {
+            (shim.calc_ld_op_n)(
+                trailing_rows as c_int,
+                block_width as c_int,
+                case.matrix.as_ptr().add(l_offset),
+                case.size as c_int,
+                case.d_values.as_ptr(),
+                native_ld.as_mut_ptr().add(case.block_end),
+                case.size as c_int,
+            );
+        }
+        let rust_ld = app_build_ld_workspace(
+            &case.matrix,
+            case.size,
+            case.block_start,
+            case.block_end,
+            &case.block_records,
+        );
+
+        for (index, (&rust, &native)) in rust_ld.iter().zip(native_ld.iter()).enumerate() {
+            assert_eq!(
+                rust.to_bits(),
+                native.to_bits(),
+                "calcLD<OP_N> two-by-two vector row mismatch index={index} rust={rust:?} native={native:?}"
+            );
+        }
     }
 
     #[test]
