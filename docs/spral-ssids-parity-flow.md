@@ -12,6 +12,11 @@ optimized native `block_ldlt<32>` APP prefix through flattened inverse-D index
 multiplier rows, moving the production red boundary from index 12 to index 20.
 The full production witness is still `dense_seed6_production_inverse_d_matches_native`.
 
+Current open guard witness:
+`rust_and_native_spral_dense_seed_09c9134e4eff0004_case0_solution_bits`
+captures a dense APP boundary solve mismatch that rejects `update_2x2`
+contraction tweaks which only move the seed6 inverse-D boundary.
+
 ```mermaid
 flowchart TD
     A["Input symmetric CSC matrix"] --> B["Analyse structure"]
@@ -59,9 +64,11 @@ flowchart TD
     K --> K1["Factor order, inertia, pivot stats"]
     K --> K2["Seed6 APP prefix inverse-D bits"]
     K2 --> K3["Seed6 full inverse-D bits"]
+    K --> K4["Dense APP boundary case0 solution bits"]
     J --> K
     K1 --> L{"More fronts?"}
     K3 --> L
+    K4 --> L
     L -->|"yes"| D
     L -->|"no"| M["Report inertia + pivot stats"]
 
@@ -79,5 +86,5 @@ flowchart TD
     class A,B,B1,B2,B3,G0,G1,G3,G5,G6,G8,G8a,G8b,G9,H1,H2,H3,K1,M,O,P,Q,R match;
     class G8c,K2 newly;
     class C,D,E,F,G,G2,G4,G7,G10,H,I,J,K,L,N partial;
-    class K3 open;
+    class K3,K4 open;
 ```
