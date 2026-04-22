@@ -8311,10 +8311,7 @@ extern "C" int spral_kernel_block_prefix_trace_32(
         let Ok(native) = NativeSpral::load() else {
             return;
         };
-        let mut rng = DenseBoundaryRng::new(6);
-        let dimension = rng.usize_inclusive(33, 33);
-        assert_eq!(dimension, 33);
-        let dense = random_dense_dyadic_matrix(dimension, &mut rng);
+        let (dimension, dense) = dense_seed6_33_matrix();
         let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
         let matrix = SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
             .expect("valid CSC");
@@ -8342,26 +8339,44 @@ extern "C" int spral_kernel_block_prefix_trace_32(
         assert_eq!(rust_factor.factor_order, native_factor_order);
     }
 
-    #[test]
-    #[ignore = "manual native-vs-rust block_ldlt<32> lower/D witness"]
-    fn app_block_ldlt_32_matches_native_dense_seed6_prefix() {
-        let Some(shim) = native_kernel_shim_or_skip() else {
-            return;
-        };
+    fn dense_seed6_33_matrix() -> (usize, Vec<Vec<f64>>) {
         let mut rng = DenseBoundaryRng::new(6);
         let dimension = rng.usize_inclusive(33, 33);
         assert_eq!(dimension, 33);
-        let dense = random_dense_dyadic_matrix(dimension, &mut rng);
+        (dimension, random_dense_dyadic_matrix(dimension, &mut rng))
+    }
+
+    fn lower_dense_seed6_33() -> (usize, Vec<f64>) {
+        let (dimension, dense) = dense_seed6_33_matrix();
         let mut lower_dense = vec![0.0; dimension * dimension];
         for col in 0..dimension {
             for row in col..dimension {
                 lower_dense[dense_lower_offset(dimension, row, col)] = dense[row][col];
             }
         }
+        (dimension, lower_dense)
+    }
+
+    #[test]
+    fn app_block_ldlt_32_prefix_trace_matches_native_dense_seed6() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let (dimension, lower_dense) = lower_dense_seed6_33();
         let options = NumericFactorOptions::default();
         let rust_trace = rust_app_block_prefix_trace_32(&lower_dense, dimension, options);
         let native_trace = native_block_prefix_trace_32(shim, &lower_dense, dimension, 34, options);
         assert_block_prefix_traces_equal(&rust_trace, &native_trace);
+    }
+
+    #[test]
+    #[ignore = "manual native-vs-rust production APP acceptance/storage witness after matching block_ldlt<32> prefix"]
+    fn app_block_ldlt_32_matches_native_dense_seed6_prefix() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let (dimension, lower_dense) = lower_dense_seed6_33();
+        let options = NumericFactorOptions::default();
 
         let rust = rust_block_ldlt_32_from_lower_dense(&lower_dense, dimension, options);
         let native =
