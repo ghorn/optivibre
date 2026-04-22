@@ -4841,6 +4841,7 @@ mod tests {
         block_two_by_two_multipliers: BlockTwoByTwoMultipliersFn,
         block_first_step_32: BlockFirstStep32Fn,
         block_prefix_trace_32: BlockPrefixTrace32Fn,
+        block_prefix_trace_32_source_multiplier: BlockPrefixTrace32Fn,
         block_prefix_trace_32_source: BlockPrefixTrace32Fn,
         block_ldlt_32: BlockLdlt32Fn,
         ldlt_tpp_factor: LdltTppFactorFn,
@@ -5076,6 +5077,15 @@ mod tests {
                 .get::<BlockPrefixTrace32Fn>(b"spral_kernel_block_prefix_trace_32\0")
                 .map_err(|error| format!("failed to load block_prefix_trace_32 shim: {error}"))?
         };
+        let block_prefix_trace_32_source_multiplier = unsafe {
+            *library
+                .get::<BlockPrefixTrace32Fn>(
+                    b"spral_kernel_block_prefix_trace_32_source_multiplier\0",
+                )
+                .map_err(|error| {
+                    format!("failed to load source-multiplier block_prefix_trace_32 shim: {error}")
+                })?
+        };
         let block_prefix_trace_32_source = unsafe {
             *library
                 .get::<BlockPrefixTrace32Fn>(b"spral_kernel_block_prefix_trace_32_source\0")
@@ -5118,6 +5128,7 @@ mod tests {
             block_two_by_two_multipliers,
             block_first_step_32,
             block_prefix_trace_32,
+            block_prefix_trace_32_source_multiplier,
             block_prefix_trace_32_source,
             block_ldlt_32,
             ldlt_tpp_factor,
@@ -5462,7 +5473,7 @@ static void spral_kernel_record_block_prefix_trace_32(
       trace_d[step*64+i] = d[i];
 }
 
-template <bool source_plain>
+template <bool source_multiplier, bool source_update>
 static int spral_kernel_block_prefix_trace_32_impl(
       int from, int* perm, double* a, int lda, double* d, double* ldwork,
       int action, double u, double small, int* lperm, int max_steps,
@@ -5560,7 +5571,7 @@ static int spral_kernel_block_prefix_trace_32_impl(
          for(int r=p+2; r<32; r++) {
             work[r] = a[p*lda+r];
             work[32+r] = a[(p+1)*lda+r];
-            if(source_plain) {
+            if(source_multiplier) {
                a[p*lda+r] = d11*work[r] + d21*work[32+r];
                a[(p+1)*lda+r] = d21*work[r] + d22*work[32+r];
             } else {
@@ -5568,7 +5579,7 @@ static int spral_kernel_block_prefix_trace_32_impl(
                a[(p+1)*lda+r] = std::fma(d21, work[r], d22*work[32+r]);
             }
          }
-         if(source_plain) {
+         if(source_update) {
             update_2x2<double, 32>(p, a, lda, work);
          } else {
             spral_kernel_block_update_2x2_32(p, a, lda, work);
@@ -5598,7 +5609,19 @@ extern "C" int spral_kernel_block_prefix_trace_32(
       int* trace_from, int* trace_status, int* trace_next, int* trace_perm,
       int* trace_lperm, double* trace_matrix, double* trace_ldwork,
       double* trace_d) {
-   return spral_kernel_block_prefix_trace_32_impl<false>(
+   return spral_kernel_block_prefix_trace_32_impl<false, false>(
+         from, perm, a, lda, d, ldwork, action, u, small, lperm, max_steps,
+         trace_from, trace_status, trace_next, trace_perm, trace_lperm,
+         trace_matrix, trace_ldwork, trace_d);
+}
+
+extern "C" int spral_kernel_block_prefix_trace_32_source_multiplier(
+      int from, int* perm, double* a, int lda, double* d, double* ldwork,
+      int action, double u, double small, int* lperm, int max_steps,
+      int* trace_from, int* trace_status, int* trace_next, int* trace_perm,
+      int* trace_lperm, double* trace_matrix, double* trace_ldwork,
+      double* trace_d) {
+   return spral_kernel_block_prefix_trace_32_impl<true, false>(
          from, perm, a, lda, d, ldwork, action, u, small, lperm, max_steps,
          trace_from, trace_status, trace_next, trace_perm, trace_lperm,
          trace_matrix, trace_ldwork, trace_d);
@@ -5610,7 +5633,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
       int* trace_from, int* trace_status, int* trace_next, int* trace_perm,
       int* trace_lperm, double* trace_matrix, double* trace_ldwork,
       double* trace_d) {
-   return spral_kernel_block_prefix_trace_32_impl<true>(
+   return spral_kernel_block_prefix_trace_32_impl<true, true>(
          from, perm, a, lda, d, ldwork, action, u, small, lperm, max_steps,
          trace_from, trace_status, trace_next, trace_perm, trace_lperm,
          trace_matrix, trace_ldwork, trace_d);
@@ -6550,7 +6573,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         lda: usize,
         options: NumericFactorOptions,
     ) -> Vec<BlockPrefixSnapshot> {
-        native_block_prefix_trace_32_impl(shim, dense, size, lda, options, false)
+        native_block_prefix_trace_32_impl(dense, size, lda, options, shim.block_prefix_trace_32)
     }
 
     fn native_block_prefix_trace_32_source(
@@ -6560,16 +6583,37 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         lda: usize,
         options: NumericFactorOptions,
     ) -> Vec<BlockPrefixSnapshot> {
-        native_block_prefix_trace_32_impl(shim, dense, size, lda, options, true)
+        native_block_prefix_trace_32_impl(
+            dense,
+            size,
+            lda,
+            options,
+            shim.block_prefix_trace_32_source,
+        )
     }
 
-    fn native_block_prefix_trace_32_impl(
+    fn native_block_prefix_trace_32_source_multiplier(
         shim: &NativeKernelShim,
         dense: &[f64],
         size: usize,
         lda: usize,
         options: NumericFactorOptions,
-        source_plain: bool,
+    ) -> Vec<BlockPrefixSnapshot> {
+        native_block_prefix_trace_32_impl(
+            dense,
+            size,
+            lda,
+            options,
+            shim.block_prefix_trace_32_source_multiplier,
+        )
+    }
+
+    fn native_block_prefix_trace_32_impl(
+        dense: &[f64],
+        size: usize,
+        lda: usize,
+        options: NumericFactorOptions,
+        trace_fn: BlockPrefixTrace32Fn,
     ) -> Vec<BlockPrefixSnapshot> {
         debug_assert_eq!(dense.len(), size * size);
         debug_assert!(size >= APP_INNER_BLOCK_SIZE);
@@ -6594,11 +6638,6 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         let mut trace_workspace =
             vec![0.0; max_steps * APP_INNER_BLOCK_SIZE * APP_INNER_BLOCK_SIZE];
         let mut trace_diagonal = vec![0.0; max_steps * 2 * APP_INNER_BLOCK_SIZE];
-        let trace_fn = if source_plain {
-            shim.block_prefix_trace_32_source
-        } else {
-            shim.block_prefix_trace_32
-        };
         let steps = unsafe {
             (trace_fn)(
                 0,
@@ -9888,6 +9927,16 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         let native_trace =
             native_block_prefix_trace_32(shim, &dense_before_block, dimension, native_lda, options);
         let native_trace_block = native_trace.last().expect("native APP block prefix trace");
+        let native_source_multiplier_trace = native_block_prefix_trace_32_source_multiplier(
+            shim,
+            &dense_before_block,
+            dimension,
+            native_lda,
+            options,
+        );
+        let native_source_multiplier_trace_block = native_source_multiplier_trace
+            .last()
+            .expect("source-multiplier native APP block prefix trace");
         let native_source_trace = native_block_prefix_trace_32_source(
             shim,
             &dense_before_block,
@@ -10006,6 +10055,75 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
                 0xbf8c_bfa8_da67_4b6c,
             ),
             "dense seed09 FMA pivot-19 first-row multiplier boundary moved"
+        );
+        let first_source_multiplier_continuation_mismatch =
+            first_native_block_continuation_mismatch(
+                shim,
+                &native_source_multiplier_trace,
+                &native_block,
+                native_lda,
+                options,
+            );
+        assert_eq!(
+            first_source_multiplier_continuation_mismatch,
+            Some(BlockContinuationMismatch {
+                step: 0,
+                from: 0,
+                status: 2,
+                next: 2,
+                component: "diagonal",
+                index: 7,
+                row: 0,
+                col: 0,
+                continued_bits: 0xbf2b_4429_642a_1ee2,
+                block_bits: 0xbf2b_4429_642a_1ee4,
+            }),
+            "dense seed09 source-multiplier native APP trace continuation boundary moved"
+        );
+        assert_eq!(
+            native_source_multiplier_trace_block.perm, native_block.perm,
+            "dense seed09 source-multiplier native APP trace/block_ldlt permutation mismatch"
+        );
+        assert_eq!(
+            native_source_multiplier_trace_block.local_perm, native_block.local_perm,
+            "dense seed09 source-multiplier native APP trace/block_ldlt local permutation mismatch"
+        );
+        let mut first_source_multiplier_trace_d_mismatch = None;
+        for (index, (&trace_value, &block_value)) in native_source_multiplier_trace_block
+            .diagonal
+            .iter()
+            .zip(&native_block.diagonal)
+            .enumerate()
+        {
+            if trace_value.to_bits() != block_value.to_bits() {
+                first_source_multiplier_trace_d_mismatch =
+                    Some((index, trace_value.to_bits(), block_value.to_bits()));
+                break;
+            }
+        }
+        assert_eq!(
+            first_source_multiplier_trace_d_mismatch,
+            Some((7, 0xbf2b_4429_642a_1ee2, 0xbf2b_4429_642a_1ee4)),
+            "dense seed09 source-multiplier native APP trace/block_ldlt D boundary moved"
+        );
+        let mut first_source_multiplier_trace_block_mismatch = None;
+        'source_multiplier_trace_block_compare: for col in block_start..block_end {
+            for row in col..block_end {
+                let trace_bits = native_source_multiplier_trace_block.matrix
+                    [col * APP_INNER_BLOCK_SIZE + row]
+                    .to_bits();
+                let block_bits = native_block.matrix[col * native_lda + row].to_bits();
+                if trace_bits != block_bits {
+                    first_source_multiplier_trace_block_mismatch =
+                        Some((row, col, trace_bits, block_bits));
+                    break 'source_multiplier_trace_block_compare;
+                }
+            }
+        }
+        assert_eq!(
+            first_source_multiplier_trace_block_mismatch,
+            Some((2, 0, 0x3f79_e327_dcf6_7cce, 0x3f79_e327_dcf6_7ccf)),
+            "dense seed09 source-multiplier native APP trace/block_ldlt matrix boundary moved"
         );
         assert_eq!(
             native_source_trace_block.perm, native_block.perm,

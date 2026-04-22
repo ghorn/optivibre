@@ -8,6 +8,16 @@ nodes are newly passing guards that narrow an open mismatch without proving full
 bitwise parity. Red nodes are the next open bitwise mismatch target.
 
 Current newly narrowed witness:
+`dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now carries a
+hybrid native trace with source-shaped 2x2 multipliers but the FMA-shaped
+`update_2x2` path. That hybrid still diverges from native `block_ldlt<32>` at
+the same first-step boundary as the full source-shaped trace: inverse-D index 7
+(`trace=0xbf2b4429642a1ee2`, `block_ldlt=0xbf2b4429642a1ee4`) and matrix row
+2, col 0 (`trace=0x3f79e327dcf67cce`,
+`block_ldlt=0x3f79e327dcf67ccf`). So the pivot-19 source-expression match is
+local evidence, not justification for a global APP multiplier expression swap.
+
+Previous newly narrowed witness:
 `dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now pins the
 row 30, col 19 native-wrapper bit to the source-shaped first-row 2x2 multiplier
 expression at pivot 19. For the snapshot row 31 operands, the explicit FMA
@@ -251,7 +261,8 @@ flowchart TD
     I0a --> I0p["Dense seed09 source-shaped APP pre-apply trailing operands"]
     I0p --> I0r["Dense seed09 production-vs-aligned Rust APP diagonal block"]
     I0r --> I0s["Dense seed09 source-plain native trace D/matrix gap"]
-    I0s --> I0q["Dense seed09 source-plain continuation first-step D gap"]
+    I0s --> I0u["Dense seed09 source-multiplier FMA-update first-step D gap"]
+    I0u --> I0q["Dense seed09 source-plain continuation first-step D gap"]
     I0q --> I0n["Dense seed09 FMA native trace-vs-wrapper APP permutation and D"]
     I0n --> I0m["Dense seed09 continuation pivot metadata"]
     I0m --> I0x["Dense seed09 FMA pivot19 multiplier source row31"]
@@ -307,6 +318,7 @@ flowchart TD
     class I0p,I0r match;
     class I0s partial;
     class I0m newly;
+    class I0u newlyPartial;
     class I0x,I0y newlyPartial;
     class I0q,I0c newlyPartial;
     class I0n match;
