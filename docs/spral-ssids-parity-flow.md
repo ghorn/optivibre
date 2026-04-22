@@ -8,6 +8,19 @@ nodes are newly passing guards that narrow an open mismatch without proving full
 bitwise parity. Red nodes are the next open bitwise mismatch target.
 
 Current newly narrowed witness:
+`app_apply_pivot_and_host_trsm_signed_zero_boundaries_are_complementary` pins a
+generic APP kernel signed-zero boundary to one deterministic witness. For seed
+`0xbffedbb32ab866e0`, both raw `host_trsm` and full `apply_pivot<OP_N>` first
+differ at flattened matrix index 82, with complementary zero signs:
+`host_trsm` has Rust `+0.0` and native `-0.0`, while `apply_pivot<OP_N>` has
+Rust `-0.0` and native `+0.0`. This is a new fail-closed guard for the open
+signed-zero mismatch, not bitwise parity. The source anchors are
+`target/native/spral-upstream/src/ssids/cpu/kernels/ldlt_app.cxx`
+`apply_pivot<OP_N>`, which calls `host_trsm` before diagonal scaling, and
+`target/native/spral-upstream/src/ssids/cpu/kernels/wrappers.cxx` `host_trsm`,
+which delegates to BLAS `dtrsm`.
+
+Previous newly narrowed witness:
 `dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now compares
 native production `enquire_indef` output with the source-shaped native
 `factor_node_indef` second-pass TPP replay for the same dense seed09 tail. The
@@ -270,7 +283,8 @@ flowchart TD
     G5 --> I00["Dense seed09 first APP block_ldlt trace"]
     G9 --> I00
     I00 --> I0["Dense seed09 APP-stride apply_pivot OP_N L block"]
-    I0 --> I0a["Dense seed09 APP check_threshold OP_N pass count"]
+    I0 --> I0z["APP host_trsm/apply_pivot signed-zero boundary"]
+    I0z --> I0a["Dense seed09 APP check_threshold OP_N pass count"]
     I0a --> I0p["Dense seed09 source-shaped APP pre-apply trailing operands"]
     I0p --> I0r["Dense seed09 production-vs-aligned Rust APP diagonal block"]
     I0r --> I0s["Dense seed09 source-plain native trace D/matrix gap"]
@@ -337,6 +351,7 @@ flowchart TD
     class I0q,I0c newlyPartial;
     class I0n match;
     class I0d partial;
+    class I0z newlyPartial;
     class I0t,I0b partial;
     class K4j match;
     class K4k partial;

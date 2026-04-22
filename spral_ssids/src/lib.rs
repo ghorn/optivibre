@@ -7388,6 +7388,21 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         }
     }
 
+    fn first_app_kernel_bit_mismatch(
+        rust_matrix: &[f64],
+        native_matrix: &[f64],
+    ) -> Option<(usize, u64, u64)> {
+        rust_matrix
+            .iter()
+            .zip(native_matrix)
+            .enumerate()
+            .find_map(|(index, (&rust, &native))| {
+                let rust_bits = rust.to_bits();
+                let native_bits = native.to_bits();
+                (rust_bits != native_bits).then_some((index, rust_bits, native_bits))
+            })
+    }
+
     fn assert_block_lower_matrix_bitwise_equal(
         label: &str,
         case: &BlockUpdateCase,
@@ -7730,6 +7745,60 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             &case,
             &rust_matrix,
             &native_matrix,
+        );
+    }
+
+    #[test]
+    fn app_apply_pivot_and_host_trsm_signed_zero_boundaries_are_complementary() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let case = app_kernel_case_from_seed(
+            0xbffe_dbb3_2ab8_66e0,
+            AppKernelCaseOptions {
+                allow_two_by_two: true,
+                allow_signed_zero: true,
+            },
+        );
+        let mut rust_trsm_matrix = case.matrix.clone();
+        let mut native_trsm_matrix = case.matrix.clone();
+        let mut rust_apply_matrix = case.matrix.clone();
+        let mut native_apply_matrix = case.matrix.clone();
+
+        native_host_trsm_op_n(shim, &case, &mut native_trsm_matrix);
+        app_solve_block_triangular_to_trailing_rows(
+            &mut rust_trsm_matrix,
+            case.size,
+            case.block_start,
+            case.block_end,
+            false,
+        );
+
+        native_apply_pivot_op_n(shim, &case, &mut native_apply_matrix);
+        app_apply_block_pivots_to_trailing_rows(
+            &mut rust_apply_matrix,
+            case.size,
+            case.block_start,
+            case.block_end,
+            &case.block_records,
+            case.small,
+            false,
+        );
+
+        let host_trsm_mismatch =
+            first_app_kernel_bit_mismatch(&rust_trsm_matrix, &native_trsm_matrix);
+        let apply_pivot_mismatch =
+            first_app_kernel_bit_mismatch(&rust_apply_matrix, &native_apply_matrix);
+
+        assert_eq!(
+            host_trsm_mismatch,
+            Some((82, 0x0000_0000_0000_0000, 0x8000_0000_0000_0000)),
+            "host_trsm OP_N signed-zero boundary moved for case={case:?}"
+        );
+        assert_eq!(
+            apply_pivot_mismatch,
+            Some((82, 0x8000_0000_0000_0000, 0x0000_0000_0000_0000)),
+            "apply_pivot OP_N signed-zero boundary moved for case={case:?}"
         );
     }
 
