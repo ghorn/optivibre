@@ -7,7 +7,15 @@ Orange nodes have partial coverage or a known narrowed boundary. Gold-orange
 nodes are newly passing guards that narrow an open mismatch without proving full
 bitwise parity. Red nodes are the next open bitwise mismatch target.
 
-Current newly narrowed witness:
+Current newly passing witness:
+`dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now pins that
+Rust's production-stride first APP diagonal block and Rust's native-aligned
+first APP prefix trace match bitwise. The known row 30, col 19 diagonal gap is
+therefore not caused by Rust's dense front using stride 55 while native
+`block_ldlt<32>` uses `align_lda(55)`. It sits between Rust/prefix-trace APP
+storage and the final native `block_ldlt<32>` wrapper result.
+
+Previous newly narrowed witness:
 `dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now pins an
 earlier source-shaped first APP boundary: the trailing pre-apply operand rows
 match bitwise, but the diagonal block read by SPRAL's BLAS-backed
@@ -173,7 +181,8 @@ flowchart TD
     I00 --> I0["Dense seed09 APP-stride apply_pivot OP_N L block"]
     I0 --> I0a["Dense seed09 APP check_threshold OP_N pass count"]
     I0a --> I0p["Dense seed09 source-shaped APP pre-apply trailing operands"]
-    I0p --> I0d["Dense seed09 source-shaped APP diagonal block gap"]
+    I0p --> I0r["Dense seed09 production-vs-aligned Rust APP diagonal block"]
+    I0r --> I0d["Dense seed09 source-shaped APP diagonal block gap"]
     I0d --> I0t["Dense seed09 source-shaped APP host_trsm gap"]
     I0t --> I0b["Dense seed09 source-shaped APP post-apply operand gap"]
     I0b --> I["APP accepted-prefix update"]
@@ -221,7 +230,8 @@ flowchart TD
 
     class A,B,B1,B2,B3,G0,G1,G3,G5,G6,G8,G8a,G8b,G9,H1,H2,H3,K1,M,O,P,Q,R match;
     class I0p match;
-    class I0d newlyPartial;
+    class I0r newly;
+    class I0d partial;
     class I0t,I0b partial;
     class K4j match;
     class K4k partial;

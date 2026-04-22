@@ -9696,6 +9696,44 @@ extern "C" int spral_kernel_block_prefix_trace_32(
             first_source_pre_apply_mismatch, None,
             "dense seed09 source-shaped first APP pre-apply operand mismatch"
         );
+        let aligned_lower_dense =
+            copy_lower_dense_to_stride(&dense_before_block, dimension, native_lda);
+        let aligned_trace =
+            rust_app_block_prefix_trace_32(&aligned_lower_dense, native_lda, options);
+        let aligned_block = aligned_trace.last().expect("aligned Rust APP block trace");
+        let mut first_aligned_rust_diagonal_mismatch = None;
+        'aligned_rust_diagonal_compare: for col in block_start..block_end {
+            for row in col..block_end {
+                let rust_bits = dense_before_apply[col * dimension + row].to_bits();
+                let aligned_bits = aligned_block.matrix[col * APP_INNER_BLOCK_SIZE + row].to_bits();
+                if rust_bits != aligned_bits {
+                    first_aligned_rust_diagonal_mismatch =
+                        Some((row, col, rust_bits, aligned_bits));
+                    break 'aligned_rust_diagonal_compare;
+                }
+            }
+        }
+        assert_eq!(
+            first_aligned_rust_diagonal_mismatch, None,
+            "dense seed09 production-stride and aligned Rust APP diagonal operands diverged"
+        );
+        let mut first_aligned_source_diagonal_mismatch = None;
+        'aligned_source_diagonal_compare: for col in block_start..block_end {
+            for row in col..block_end {
+                let rust_bits = aligned_block.matrix[col * APP_INNER_BLOCK_SIZE + row].to_bits();
+                let native_bits = native_source_apply_matrix[col * native_lda + row].to_bits();
+                if rust_bits != native_bits {
+                    first_aligned_source_diagonal_mismatch =
+                        Some((row, col, rust_bits, native_bits));
+                    break 'aligned_source_diagonal_compare;
+                }
+            }
+        }
+        assert_eq!(
+            first_aligned_source_diagonal_mismatch,
+            Some((30, 19, 0xbf8c_bfa8_da67_4b6b, 0xbf8c_bfa8_da67_4b6c)),
+            "dense seed09 source-shaped aligned first APP diagonal operand boundary moved"
+        );
         let mut first_source_diagonal_mismatch = None;
         'source_diagonal_compare: for col in block_start..block_end {
             for row in col..block_end {
