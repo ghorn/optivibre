@@ -913,7 +913,7 @@ pub fn analyse(
     match options.ordering {
         OrderingStrategy::Natural => {
             analyse_debug_log(format!(
-                "[spral_ssids::analyse] strategy=natural dim={} nnz={}",
+                "[ssids_rs::analyse] strategy=natural dim={} nnz={}",
                 matrix.dimension(),
                 matrix.row_indices().len(),
             ));
@@ -926,7 +926,7 @@ pub fn analyse(
                 "natural",
             )?;
             analyse_debug_log(format!(
-                "[spral_ssids::analyse] strategy=natural done in {:.3}s fill={} supernodes={}",
+                "[ssids_rs::analyse] strategy=natural done in {:.3}s fill={} supernodes={}",
                 analyse_started.elapsed().as_secs_f64(),
                 result.1.estimated_fill_nnz,
                 result.1.supernode_count,
@@ -935,7 +935,7 @@ pub fn analyse(
         }
         OrderingStrategy::ApproximateMinimumDegree => {
             analyse_debug_log(format!(
-                "[spral_ssids::analyse] strategy=amd dim={} nnz={} start",
+                "[ssids_rs::analyse] strategy=amd dim={} nnz={} start",
                 matrix.dimension(),
                 matrix.row_indices().len(),
             ));
@@ -948,7 +948,7 @@ pub fn analyse(
                 "approximate_minimum_degree",
             )?;
             analyse_debug_log(format!(
-                "[spral_ssids::analyse] strategy=amd done in {:.3}s fill={} supernodes={}",
+                "[ssids_rs::analyse] strategy=amd done in {:.3}s fill={} supernodes={}",
                 analyse_started.elapsed().as_secs_f64(),
                 result.1.estimated_fill_nnz,
                 result.1.supernode_count,
@@ -957,7 +957,7 @@ pub fn analyse(
         }
         OrderingStrategy::NestedDissection(ordering_options) => {
             analyse_debug_log(format!(
-                "[spral_ssids::analyse] strategy=nested_dissection dim={} nnz={} start",
+                "[ssids_rs::analyse] strategy=nested_dissection dim={} nnz={} start",
                 matrix.dimension(),
                 matrix.row_indices().len(),
             ));
@@ -970,7 +970,7 @@ pub fn analyse(
                 "nested_dissection",
             )?;
             analyse_debug_log(format!(
-                "[spral_ssids::analyse] strategy=nested_dissection done in {:.3}s fill={} supernodes={}",
+                "[ssids_rs::analyse] strategy=nested_dissection done in {:.3}s fill={} supernodes={}",
                 analyse_started.elapsed().as_secs_f64(),
                 result.1.estimated_fill_nnz,
                 result.1.supernode_count,
@@ -979,41 +979,41 @@ pub fn analyse(
         }
         OrderingStrategy::Auto(ordering_options) => {
             analyse_debug_log(format!(
-                "[spral_ssids::analyse] strategy=auto dim={} nnz={} start",
+                "[ssids_rs::analyse] strategy=auto dim={} nnz={} start",
                 matrix.dimension(),
                 matrix.row_indices().len(),
             ));
             let natural_permutation = Permutation::identity(matrix.dimension());
-            analyse_debug_log("[spral_ssids::analyse] auto natural symbolic start");
+            analyse_debug_log("[ssids_rs::analyse] auto natural symbolic start");
             let (_, natural_counts, _) = symbolic_factor_pattern(&graph);
             let natural_fill = natural_counts.iter().sum::<usize>();
             analyse_debug_log(format!(
-                "[spral_ssids::analyse] auto natural symbolic done fill={} elapsed={:.3}s",
+                "[ssids_rs::analyse] auto natural symbolic done fill={} elapsed={:.3}s",
                 natural_fill,
                 analyse_started.elapsed().as_secs_f64(),
             ));
 
             let amd_started = Instant::now();
-            analyse_debug_log("[spral_ssids::analyse] auto amd start");
+            analyse_debug_log("[ssids_rs::analyse] auto amd start");
             let amd_summary = approximate_minimum_degree_order(&graph)?;
             let amd_graph = permute_graph(&graph, &amd_summary.permutation);
             let (_, amd_counts, _) = symbolic_factor_pattern(&amd_graph);
             let amd_fill = amd_counts.iter().sum::<usize>();
             analyse_debug_log(format!(
-                "[spral_ssids::analyse] auto amd done fill={} elapsed={:.3}s total={:.3}s",
+                "[ssids_rs::analyse] auto amd done fill={} elapsed={:.3}s total={:.3}s",
                 amd_fill,
                 amd_started.elapsed().as_secs_f64(),
                 analyse_started.elapsed().as_secs_f64(),
             ));
 
             let nd_started = Instant::now();
-            analyse_debug_log("[spral_ssids::analyse] auto nested dissection start");
+            analyse_debug_log("[ssids_rs::analyse] auto nested dissection start");
             let summary = nested_dissection_order(&graph, &ordering_options)?;
             let permuted_graph = permute_graph(&graph, &summary.permutation);
             let (_, nd_counts, _) = symbolic_factor_pattern(&permuted_graph);
             let nd_fill = nd_counts.iter().sum::<usize>();
             analyse_debug_log(format!(
-                "[spral_ssids::analyse] auto nested dissection done fill={} elapsed={:.3}s total={:.3}s",
+                "[ssids_rs::analyse] auto nested dissection done fill={} elapsed={:.3}s total={:.3}s",
                 nd_fill,
                 nd_started.elapsed().as_secs_f64(),
                 analyse_started.elapsed().as_secs_f64(),
@@ -1028,7 +1028,7 @@ pub fn analyse(
                     "auto_approximate_minimum_degree",
                 )?;
                 analyse_debug_log(format!(
-                    "[spral_ssids::analyse] auto selected=amd total={:.3}s",
+                    "[ssids_rs::analyse] auto selected=amd total={:.3}s",
                     analyse_started.elapsed().as_secs_f64(),
                 ));
                 Ok(result)
@@ -1041,7 +1041,7 @@ pub fn analyse(
                     "auto_nested_dissection",
                 )?;
                 analyse_debug_log(format!(
-                    "[spral_ssids::analyse] auto selected=nested_dissection total={:.3}s",
+                    "[ssids_rs::analyse] auto selected=nested_dissection total={:.3}s",
                     analyse_started.elapsed().as_secs_f64(),
                 ));
                 Ok(result)
@@ -1054,7 +1054,7 @@ pub fn analyse(
                     "auto_natural",
                 )?;
                 analyse_debug_log(format!(
-                    "[spral_ssids::analyse] auto selected=natural total={:.3}s",
+                    "[ssids_rs::analyse] auto selected=natural total={:.3}s",
                     analyse_started.elapsed().as_secs_f64(),
                 ));
                 Ok(result)
@@ -4995,7 +4995,7 @@ mod tests {
     fn build_native_kernel_shim() -> Result<NativeKernelShim, String> {
         let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
-            .ok_or_else(|| "spral_ssids manifest has no parent".to_string())?
+            .ok_or_else(|| "ssids_rs manifest has no parent".to_string())?
             .to_path_buf();
         let ssids_source = std::env::var_os("SPRAL_UPSTREAM_SSIDS_DIR")
             .map(PathBuf::from)

@@ -4,7 +4,7 @@ use metis_ordering::NestedDissectionOptions;
 use proptest::collection::vec;
 use proptest::prelude::*;
 use proptest::test_runner::{Config, RngAlgorithm, RngSeed, TestRng, TestRunner};
-use spral_ssids::{
+use ssids_rs::{
     NumericFactorOptions, OrderingStrategy, SsidsOptions, SymmetricCscMatrix, analyse, factorize,
 };
 

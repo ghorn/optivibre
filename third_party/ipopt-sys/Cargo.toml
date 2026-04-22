@@ -34,12 +34,23 @@ keywords = [
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/elrnv/ipopt-rs"
 
+[features]
+default = ["source-built-spral"]
+source-built-spral = ["dep:ipopt-src", "ipopt-src/openblas-serial"]
+source-built-spral-openmp = ["dep:ipopt-src", "ipopt-src/openblas-openmp"]
+legacy-native-build = []
+
 [lib]
 name = "ipopt_sys"
 path = "src/lib.rs"
 
 [dev-dependencies.approx]
 version = "0.5"
+
+[dependencies.ipopt-src]
+path = "../../ipopt-src"
+optional = true
+default-features = false
 
 [build-dependencies.bindgen]
 version = "0.71"

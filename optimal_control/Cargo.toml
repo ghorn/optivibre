@@ -14,6 +14,8 @@ workspace = true
 
 [features]
 ipopt = ["optimization/ipopt"]
+native-spral-src = ["optimization/native-spral-src"]
+dynamic-spral-parity = ["optimization/dynamic-spral-parity"]
 
 [dependencies]
 anyhow.workspace = true

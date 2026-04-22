@@ -1,6 +1,6 @@
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use metis_ordering::NestedDissectionOptions;
-use spral_ssids::{
+use ssids_rs::{
     NumericFactorOptions, OrderingStrategy, SsidsOptions, SymmetricCscMatrix, analyse, factorize,
 };
 
@@ -115,7 +115,7 @@ fn synthetic_values(dimension: usize, col_ptrs: &[usize], row_indices: &[usize])
 }
 
 fn matrix_validation_bench(c: &mut Criterion) {
-    let mut group = c.benchmark_group("spral_ssids/matrix_validation");
+    let mut group = c.benchmark_group("ssids_rs/matrix_validation");
     group.bench_function("grid_20x20_csc_validation", |bench| {
         let (col_ptrs, row_indices) = grid_matrix(20, 20);
         bench.iter_batched(
@@ -132,7 +132,7 @@ fn matrix_validation_bench(c: &mut Criterion) {
 }
 
 fn symbolic_analysis_bench(c: &mut Criterion) {
-    let mut group = c.benchmark_group("spral_ssids/symbolic_analysis");
+    let mut group = c.benchmark_group("ssids_rs/symbolic_analysis");
     let nd_options = SsidsOptions {
         ordering: OrderingStrategy::NestedDissection(NestedDissectionOptions {
             leaf_size: 16,
@@ -185,7 +185,7 @@ fn symbolic_analysis_bench(c: &mut Criterion) {
 }
 
 fn numeric_factorization_bench(c: &mut Criterion) {
-    let mut group = c.benchmark_group("spral_ssids/numeric_factorization");
+    let mut group = c.benchmark_group("ssids_rs/numeric_factorization");
     let options = NumericFactorOptions::default();
     let nd_options = SsidsOptions {
         ordering: OrderingStrategy::NestedDissection(NestedDissectionOptions {

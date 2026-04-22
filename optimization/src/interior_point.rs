@@ -2,7 +2,7 @@ use clarabel::algebra::CscMatrix;
 use clarabel::qdldl::{QDLDLFactorisation, QDLDLSettings};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-use spral_ssids::{
+use ssids_rs::{
     AnalyseInfo as SpralAnalyseInfo, Inertia as SpralInertia,
     NativeOrdering as SpralNativeOrdering, NativeSpral as NativeSpralLibrary, NativeSpralSession,
     NumericFactor as SpralNumericFactor, NumericFactorOptions as SpralNumericFactorOptions,
@@ -43,8 +43,8 @@ const LINEAR_DEBUG_RELATIVE_DELTA_TOLERANCE: f64 = 1e-8;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InteriorPointLinearSolver {
     Auto,
-    SpralSsids,
-    NativeSpralSsids,
+    SsidsRs,
+    SpralSrc,
     SparseQdldl,
 }
 
@@ -52,8 +52,8 @@ impl InteriorPointLinearSolver {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Auto => "auto",
-            Self::SpralSsids => "spral_ssids",
-            Self::NativeSpralSsids => "native_spral_ssids",
+            Self::SsidsRs => "ssids_rs",
+            Self::SpralSrc => "spral_src",
             Self::SparseQdldl => "sparse_qdldl",
         }
     }
@@ -349,7 +349,7 @@ impl Default for InteriorPointOptions {
             watchdog_shortened_iter_trigger: 10,
             watchdog_trial_iter_max: 3,
             mu_min: 1e-12,
-            linear_solver: InteriorPointLinearSolver::SpralSsids,
+            linear_solver: InteriorPointLinearSolver::SsidsRs,
             spral_pivot_method: InteriorPointSpralPivotMethod::BlockAposteriori,
             spral_action_on_zero_pivot: true,
             spral_small_pivot_tolerance: 1e-20,
@@ -1879,7 +1879,7 @@ impl SpralAugmentedKktWorkspace {
         )
         .map_err(|error| {
             InteriorPointSolveError::InvalidInput(format!(
-                "invalid sparse KKT structure for spral_ssids: {error}"
+                "invalid sparse KKT structure for ssids_rs: {error}"
             ))
         })?;
         let (symbolic, info) = spral_analyse(
@@ -1892,7 +1892,7 @@ impl SpralAugmentedKktWorkspace {
         )
         .map_err(|error| {
             InteriorPointSolveError::InvalidInput(format!(
-                "failed to analyse sparse KKT structure for spral_ssids: {error}"
+                "failed to analyse sparse KKT structure for ssids_rs: {error}"
             ))
         })?;
         let values = vec![0.0; pattern.ccs.nnz()];
@@ -1924,7 +1924,7 @@ impl NativeSpralAugmentedKktWorkspace {
         )?;
         let native = NativeSpralLibrary::load().map_err(|error| {
             InteriorPointSolveError::InvalidInput(format!(
-                "failed to load native spral_ssids: {error}"
+                "failed to load native ssids_rs: {error}"
             ))
         })?;
         let values = vec![0.0; pattern.ccs.nnz()];
@@ -2381,7 +2381,7 @@ fn replay_snapshot_with_solver(
     let system = snapshot.reduced_system(solver);
     let mut scratch_profiling = InteriorPointProfiling::default();
     match solver {
-        InteriorPointLinearSolver::SpralSsids => {
+        InteriorPointLinearSolver::SsidsRs => {
             if debug_state.rust_workspace.is_none() && !debug_state.rust_workspace_unavailable {
                 match prepare_spral_workspace(
                     snapshot.hessian.lower_triangle.as_ref(),
@@ -2406,7 +2406,7 @@ fn replay_snapshot_with_solver(
                     debug_state
                         .rust_workspace_error
                         .as_deref()
-                        .unwrap_or("rust spral_ssids workspace unavailable"),
+                        .unwrap_or("rust ssids_rs workspace unavailable"),
                 )]);
             };
             if workspace.values.len() != snapshot.augmented_values.len() {
@@ -2430,7 +2430,7 @@ fn replay_snapshot_with_solver(
             })
             .map_err(|attempt| vec![attempt])
         }
-        InteriorPointLinearSolver::NativeSpralSsids => {
+        InteriorPointLinearSolver::SpralSrc => {
             if debug_state.native_workspace.is_none() && !debug_state.native_workspace_unavailable {
                 match prepare_native_spral_workspace(
                     snapshot.hessian.lower_triangle.as_ref(),
@@ -2456,7 +2456,7 @@ fn replay_snapshot_with_solver(
                     debug_state
                         .native_workspace_error
                         .as_deref()
-                        .unwrap_or("native spral_ssids workspace unavailable"),
+                        .unwrap_or("native ssids_rs workspace unavailable"),
                 )]);
             };
             if workspace.values.len() != snapshot.augmented_values.len() {
@@ -2467,7 +2467,7 @@ fn replay_snapshot_with_solver(
                 )]);
             }
             workspace.values.copy_from_slice(&snapshot.augmented_values);
-            factor_solve_native_spral_ssids(
+            factor_solve_spral_src(
                 workspace,
                 &snapshot.augmented_rhs,
                 snapshot.regularization,
@@ -4973,7 +4973,7 @@ fn spral_error_attempt(
     error: impl ToString,
 ) -> InteriorPointLinearSolveAttempt {
     InteriorPointLinearSolveAttempt {
-        solver: InteriorPointLinearSolver::SpralSsids,
+        solver: InteriorPointLinearSolver::SsidsRs,
         regularization,
         inertia: None,
         failure_kind,
@@ -4991,7 +4991,7 @@ fn native_spral_error_attempt(
     error: impl ToString,
 ) -> InteriorPointLinearSolveAttempt {
     InteriorPointLinearSolveAttempt {
-        solver: InteriorPointLinearSolver::NativeSpralSsids,
+        solver: InteriorPointLinearSolver::SpralSrc,
         regularization,
         inertia: None,
         failure_kind,
@@ -5132,7 +5132,7 @@ fn factor_solve_spral_ssids_symmetric_with_metrics(
     let n = matrix.n;
     if matrix.m != n || rhs.len() != n {
         return Err(InteriorPointLinearSolveAttempt {
-            solver: InteriorPointLinearSolver::SpralSsids,
+            solver: InteriorPointLinearSolver::SsidsRs,
             regularization,
             inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::FactorizationFailed,
@@ -5227,7 +5227,7 @@ fn factor_solve_spral_ssids_symmetric_with_metrics(
             (
                 solution,
                 LinearBackendRunStats {
-                    solver: InteriorPointLinearSolver::SpralSsids,
+                    solver: InteriorPointLinearSolver::SsidsRs,
                     factorization_time,
                     solve_time,
                     reused_symbolic: Some(false),
@@ -5240,13 +5240,13 @@ fn factor_solve_spral_ssids_symmetric_with_metrics(
             )
         })
         .map_err(|mut attempt| {
-            attempt.solver = InteriorPointLinearSolver::SpralSsids;
+            attempt.solver = InteriorPointLinearSolver::SsidsRs;
             attempt.regularization = regularization;
             attempt
         })
 }
 
-fn factor_solve_native_spral_ssids_symmetric_with_metrics(
+fn factor_solve_spral_src_symmetric_with_metrics(
     matrix: &CscMatrix<f64>,
     rhs: &[f64],
     regularization: f64,
@@ -5254,7 +5254,7 @@ fn factor_solve_native_spral_ssids_symmetric_with_metrics(
     let n = matrix.n;
     if matrix.m != n || rhs.len() != n {
         return Err(InteriorPointLinearSolveAttempt {
-            solver: InteriorPointLinearSolver::NativeSpralSsids,
+            solver: InteriorPointLinearSolver::SpralSrc,
             regularization,
             inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::FactorizationFailed,
@@ -5342,7 +5342,7 @@ fn factor_solve_native_spral_ssids_symmetric_with_metrics(
             (
                 solution,
                 LinearBackendRunStats {
-                    solver: InteriorPointLinearSolver::NativeSpralSsids,
+                    solver: InteriorPointLinearSolver::SpralSrc,
                     factorization_time,
                     solve_time,
                     reused_symbolic: Some(false),
@@ -5355,7 +5355,7 @@ fn factor_solve_native_spral_ssids_symmetric_with_metrics(
             )
         })
         .map_err(|mut attempt| {
-            attempt.solver = InteriorPointLinearSolver::NativeSpralSsids;
+            attempt.solver = InteriorPointLinearSolver::SpralSrc;
             attempt.regularization = regularization;
             attempt
         })
@@ -5370,10 +5370,10 @@ fn preferred_linear_solver(
         InteriorPointLinearSolver::Auto if equality_count == 0 && inequality_count == 0 => {
             InteriorPointLinearSolver::SparseQdldl
         }
-        InteriorPointLinearSolver::Auto | InteriorPointLinearSolver::SpralSsids => {
-            InteriorPointLinearSolver::SpralSsids
+        InteriorPointLinearSolver::Auto | InteriorPointLinearSolver::SsidsRs => {
+            InteriorPointLinearSolver::SsidsRs
         }
-        InteriorPointLinearSolver::NativeSpralSsids => InteriorPointLinearSolver::NativeSpralSsids,
+        InteriorPointLinearSolver::SpralSrc => InteriorPointLinearSolver::SpralSrc,
         InteriorPointLinearSolver::SparseQdldl => InteriorPointLinearSolver::SparseQdldl,
     }
 }
@@ -5381,8 +5381,8 @@ fn preferred_linear_solver(
 fn secondary_linear_solver(solver: InteriorPointLinearSolver) -> Option<InteriorPointLinearSolver> {
     match solver {
         InteriorPointLinearSolver::Auto => Some(InteriorPointLinearSolver::SparseQdldl),
-        InteriorPointLinearSolver::SpralSsids
-        | InteriorPointLinearSolver::NativeSpralSsids
+        InteriorPointLinearSolver::SsidsRs
+        | InteriorPointLinearSolver::SpralSrc
         | InteriorPointLinearSolver::SparseQdldl => None,
     }
 }
@@ -5436,14 +5436,14 @@ fn try_solve_symmetric_system_with_metrics(
         let max_regularization = regularization_max.max(current_regularization);
         for retry_index in 0..=retries {
             let attempt_result = match preferred_solver {
-                InteriorPointLinearSolver::NativeSpralSsids => {
-                    factor_solve_native_spral_ssids_symmetric_with_metrics(
+                InteriorPointLinearSolver::SpralSrc => {
+                    factor_solve_spral_src_symmetric_with_metrics(
                         matrix,
                         rhs,
                         current_regularization,
                     )
                 }
-                InteriorPointLinearSolver::SpralSsids => {
+                InteriorPointLinearSolver::SsidsRs => {
                     factor_solve_spral_ssids_symmetric_with_metrics(
                         matrix,
                         rhs,
@@ -5655,8 +5655,8 @@ fn spral_augmented_kkt_regularization_shifts(
     regularization: f64,
 ) -> (f64, f64) {
     match solver {
-        InteriorPointLinearSolver::NativeSpralSsids => (regularization.max(0.0), 0.0),
-        InteriorPointLinearSolver::SpralSsids | InteriorPointLinearSolver::Auto => (
+        InteriorPointLinearSolver::SpralSrc => (regularization.max(0.0), 0.0),
+        InteriorPointLinearSolver::SsidsRs | InteriorPointLinearSolver::Auto => (
             sparse_hessian_diagonal_shift(system.hessian, regularization),
             regularization.max(1e-8),
         ),
@@ -6007,7 +6007,7 @@ fn factor_solve_spral_ssids(
     let actual_inertia = factor.inertia();
     if actual_inertia != expected_inertia {
         return Err(InteriorPointLinearSolveAttempt {
-            solver: InteriorPointLinearSolver::SpralSsids,
+            solver: InteriorPointLinearSolver::SsidsRs,
             regularization,
             inertia: Some(Box::new(interior_point_linear_inertia(actual_inertia))),
             failure_kind: InteriorPointLinearSolveFailureKind::InertiaMismatch,
@@ -6051,7 +6051,7 @@ fn factor_solve_spral_ssids(
             (
                 solution,
                 LinearBackendRunStats {
-                    solver: InteriorPointLinearSolver::SpralSsids,
+                    solver: InteriorPointLinearSolver::SsidsRs,
                     factorization_time,
                     solve_time,
                     reused_symbolic: Some(reused_symbolic),
@@ -6064,13 +6064,13 @@ fn factor_solve_spral_ssids(
             )
         })
         .map_err(|mut attempt| {
-            attempt.solver = InteriorPointLinearSolver::SpralSsids;
+            attempt.solver = InteriorPointLinearSolver::SsidsRs;
             attempt.regularization = regularization;
             attempt
         })
 }
 
-fn factor_solve_native_spral_ssids(
+fn factor_solve_spral_src(
     workspace: &mut NativeSpralAugmentedKktWorkspace,
     rhs: &[f64],
     regularization: f64,
@@ -6162,7 +6162,7 @@ fn factor_solve_native_spral_ssids(
     let expected_inertia = spral_expected_augmented_inertia(&workspace.pattern);
     if factor_info.inertia != expected_inertia {
         return Err(InteriorPointLinearSolveAttempt {
-            solver: InteriorPointLinearSolver::NativeSpralSsids,
+            solver: InteriorPointLinearSolver::SpralSrc,
             regularization,
             inertia: Some(Box::new(interior_point_linear_inertia(factor_info.inertia))),
             failure_kind: InteriorPointLinearSolveFailureKind::InertiaMismatch,
@@ -6214,7 +6214,7 @@ fn factor_solve_native_spral_ssids(
             (
                 solution,
                 LinearBackendRunStats {
-                    solver: InteriorPointLinearSolver::NativeSpralSsids,
+                    solver: InteriorPointLinearSolver::SpralSrc,
                     factorization_time,
                     solve_time,
                     reused_symbolic: Some(reused_symbolic),
@@ -6227,13 +6227,13 @@ fn factor_solve_native_spral_ssids(
             )
         })
         .map_err(|mut attempt| {
-            attempt.solver = InteriorPointLinearSolver::NativeSpralSsids;
+            attempt.solver = InteriorPointLinearSolver::SpralSrc;
             attempt.regularization = regularization;
             attempt
         })
 }
 
-fn solve_reduced_kkt_with_native_spral_ssids(
+fn solve_reduced_kkt_with_spral_src(
     system: &ReducedKktSystem<'_>,
     workspace: &mut NativeSpralAugmentedKktWorkspace,
     profiling: &mut InteriorPointProfiling,
@@ -6287,13 +6287,7 @@ fn solve_reduced_kkt_with_native_spral_ssids(
             slack_shift,
             dual_shift,
         );
-        match factor_solve_native_spral_ssids(
-            workspace,
-            &rhs,
-            current_regularization,
-            profiling,
-            verbose,
-        ) {
+        match factor_solve_spral_src(workspace, &rhs, current_regularization, profiling, verbose) {
             Ok((solution, mut backend_stats)) => {
                 if !attempts.is_empty() {
                     let attempt_detail = attempts
@@ -6351,7 +6345,7 @@ fn solve_reduced_kkt_with_native_spral_ssids(
                     dz,
                     dz_lower: Vec::new(),
                     dz_upper: Vec::new(),
-                    solver_used: InteriorPointLinearSolver::NativeSpralSsids,
+                    solver_used: InteriorPointLinearSolver::SpralSrc,
                     regularization_used: current_regularization,
                     dual_regularization_used: current_jacobian_regularization,
                     primal_diagonal_shift_used: primal_shift,
@@ -6504,7 +6498,7 @@ fn solve_reduced_kkt_with_spral_ssids(
                     dz,
                     dz_lower: Vec::new(),
                     dz_upper: Vec::new(),
-                    solver_used: InteriorPointLinearSolver::SpralSsids,
+                    solver_used: InteriorPointLinearSolver::SsidsRs,
                     regularization_used: current_regularization.max(primal_shift),
                     dual_regularization_used: dual_shift,
                     primal_diagonal_shift_used: primal_shift,
@@ -6839,16 +6833,17 @@ fn solve_reduced_kkt(
         .map(|workspace| workspace.pattern.dimension());
     let mut attempts = Vec::new();
 
-    if preferred_solver == InteriorPointLinearSolver::NativeSpralSsids
+    if preferred_solver == InteriorPointLinearSolver::SpralSrc
         && let Some(workspace) = native_spral_workspace
     {
-        return solve_reduced_kkt_with_native_spral_ssids(system, workspace, profiling, verbose)
-            .map_err(|attempts| {
+        return solve_reduced_kkt_with_spral_src(system, workspace, profiling, verbose).map_err(
+            |attempts| {
                 linear_solve_error(preferred_solver, workspace.pattern.dimension(), attempts)
-            });
+            },
+        );
     }
 
-    if preferred_solver == InteriorPointLinearSolver::SpralSsids
+    if preferred_solver == InteriorPointLinearSolver::SsidsRs
         && let Some(workspace) = spral_workspace
         && !workspace.auto_fallback_disabled
     {
@@ -8754,7 +8749,7 @@ where
         current_snapshot.linear_solver = preferred_solver;
         if !spral_workspace_unavailable
             && spral_workspace.is_none()
-            && preferred_solver == InteriorPointLinearSolver::SpralSsids
+            && preferred_solver == InteriorPointLinearSolver::SsidsRs
         {
             match prepare_spral_workspace(
                 hessian_structure.as_ref(),
@@ -8767,7 +8762,7 @@ where
                     spral_workspace = Some(workspace);
                 }
                 Err(error) => {
-                    if options.linear_solver == InteriorPointLinearSolver::SpralSsids {
+                    if options.linear_solver == InteriorPointLinearSolver::SsidsRs {
                         return Err(with_interior_point_failure_profiling(
                             error,
                             Some(snapshot_with_nlip_events(
@@ -8785,7 +8780,7 @@ where
         }
         if !native_spral_workspace_unavailable
             && native_spral_workspace.is_none()
-            && preferred_solver == InteriorPointLinearSolver::NativeSpralSsids
+            && preferred_solver == InteriorPointLinearSolver::SpralSrc
         {
             match prepare_native_spral_workspace(
                 hessian_structure.as_ref(),
@@ -8799,7 +8794,7 @@ where
                     native_spral_workspace = Some(workspace);
                 }
                 Err(error) => {
-                    if options.linear_solver == InteriorPointLinearSolver::NativeSpralSsids {
+                    if options.linear_solver == InteriorPointLinearSolver::SpralSrc {
                         return Err(with_interior_point_failure_profiling(
                             error,
                             Some(snapshot_with_nlip_events(

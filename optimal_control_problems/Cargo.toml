@@ -15,6 +15,11 @@ workspace = true
 [features]
 default = ["ipopt"]
 ipopt = ["optimal_control/ipopt", "optimization/ipopt"]
+native-spral-src = ["optimal_control/native-spral-src", "optimization/native-spral-src"]
+dynamic-spral-parity = [
+    "optimal_control/dynamic-spral-parity",
+    "optimization/dynamic-spral-parity",
+]
 
 [dependencies]
 anyhow.workspace = true
@@ -27,6 +32,6 @@ sx_core = { path = "../sx_core" }
 
 [dev-dependencies]
 approx.workspace = true
-spral_ssids = { path = "../spral_ssids" }
+ssids_rs = { package = "ssids-rs", path = "../ssids-rs" }
 sx_codegen_llvm = { path = "../sx_codegen_llvm" }
 tempfile.workspace = true

@@ -34,6 +34,12 @@ keywords = [
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/elrnv/ipopt-rs"
 
+[features]
+default = ["source-built-spral"]
+source-built-spral = ["ipopt-sys/source-built-spral"]
+source-built-spral-openmp = ["ipopt-sys/source-built-spral-openmp"]
+legacy-native-build = ["ipopt-sys/legacy-native-build"]
+
 [lib]
 name = "ipopt"
 path = "src/lib.rs"
@@ -56,6 +62,7 @@ path = "tests/unconstrained_approx_newton.rs"
 
 [dependencies.ipopt-sys]
 version = "0.6"
+default-features = false
 
 [dev-dependencies.approx]
 version = "0.5"

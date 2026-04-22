@@ -13,8 +13,14 @@ documentation = "https://docs.rs/ipopt-rs"
 
 keywords = ["non-linear", "optimization", "constrained", "ipopt", "newton"]
 
+[features]
+default = ["source-built-spral"]
+source-built-spral = ["ipopt-sys/source-built-spral"]
+source-built-spral-openmp = ["ipopt-sys/source-built-spral-openmp"]
+legacy-native-build = ["ipopt-sys/legacy-native-build"]
+
 [dependencies]
-ipopt-sys = { path = "ipopt-sys", version = "0.6" }
+ipopt-sys = { path = "ipopt-sys", version = "0.6", default-features = false }
 
 [dev-dependencies]
 approx = "0.5"

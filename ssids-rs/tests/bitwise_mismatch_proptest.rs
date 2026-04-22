@@ -1,7 +1,7 @@
 use proptest::array::{uniform5, uniform10};
 use proptest::prelude::*;
 use proptest::test_runner::{Config, RngAlgorithm, RngSeed, TestCaseError, TestRng, TestRunner};
-use spral_ssids::{
+use ssids_rs::{
     Inertia, NativeOrdering, NativeSpral, NumericFactorOptions, OrderingStrategy, PivotStats,
     SsidsOptions, SymmetricCscMatrix, analyse, factorize,
 };

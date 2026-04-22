@@ -1,5 +1,5 @@
 use metis_ordering::NestedDissectionOptions;
-use spral_ssids::{AnalyseInfo, OrderingStrategy, SsidsOptions, SymmetricCscMatrix, analyse};
+use ssids_rs::{AnalyseInfo, OrderingStrategy, SsidsOptions, SymmetricCscMatrix, analyse};
 
 fn tridiagonal_pattern(dimension: usize) -> (Vec<usize>, Vec<usize>) {
     let mut col_ptrs = Vec::with_capacity(dimension + 1);

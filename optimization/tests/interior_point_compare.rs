@@ -570,7 +570,7 @@ fn compare_verbose_requested() -> bool {
 fn native_spral_available() -> bool {
     static AVAILABLE: OnceLock<Result<(), String>> = OnceLock::new();
     match AVAILABLE.get_or_init(|| {
-        spral_ssids::NativeSpral::load()
+        ssids_rs::NativeSpral::load()
             .map(|_| ())
             .map_err(|error| error.to_string())
     }) {
@@ -811,7 +811,7 @@ fn assert_native_matches_ipopt(
     print_compare_summary(problem_name, backend, native, ipopt);
     assert_eq!(
         native.linear_solver,
-        optimization::InteriorPointLinearSolver::NativeSpralSsids
+        optimization::InteriorPointLinearSolver::SpralSrc
     );
     assert_local_spral_ipopt_provenance(ipopt);
     assert_abs_diff_eq!(

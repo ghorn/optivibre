@@ -1,5 +1,5 @@
 [package]
-name = "spral_ssids"
+name = "ssids-rs"
 version.workspace = true
 edition.workspace = true
 homepage.workspace = true
@@ -9,15 +9,25 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Initial pure-Rust symbolic and numeric SSIDS-style solver stack for ad_codegen_rs."
 
+[lib]
+name = "ssids_rs"
+
+[features]
+native-spral-src = ["dep:spral-src", "spral-src/openblas-serial"]
+native-spral-src-openmp = ["dep:spral-src", "spral-src/openblas-openmp"]
+dynamic-spral-parity = ["dep:libloading"]
+
 [dependencies]
-libloading = "0.8.9"
+libloading = { version = "0.8.9", optional = true }
 metis_ordering = { path = "../metis_ordering" }
 rayon.workspace = true
+spral-src = { path = "../spral-src", optional = true, default-features = false }
 thiserror.workspace = true
 
 [dev-dependencies]
 approx.workspace = true
 criterion.workspace = true
+libloading = "0.8.9"
 proptest.workspace = true
 
 [lints]

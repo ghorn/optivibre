@@ -1,4 +1,4 @@
-use spral_ssids::{
+use ssids_rs::{
     NativeOrdering, NativeSpral, NumericFactorOptions, OrderingStrategy, SsidsOptions,
     SymmetricCscMatrix, analyse, factorize,
 };

@@ -46,13 +46,13 @@ fuzz_target!(|data: &[u8]| {
         .collect::<Vec<_>>();
     let (col_ptrs, row_indices, values) = lower_csc_from_pairs(dimension, &entries);
     if let Ok(matrix) =
-        spral_ssids::SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
-        && let Ok((symbolic, _)) = spral_ssids::analyse(matrix, &spral_ssids::SsidsOptions::default())
+        ssids_rs::SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
+        && let Ok((symbolic, _)) = ssids_rs::analyse(matrix, &ssids_rs::SsidsOptions::default())
     {
-        let _ = spral_ssids::factorize(
+        let _ = ssids_rs::factorize(
             matrix,
             &symbolic,
-            &spral_ssids::NumericFactorOptions::default(),
+            &ssids_rs::NumericFactorOptions::default(),
         );
     }
 });

@@ -334,8 +334,8 @@ const SOLVER_METHOD_FROM_WIRE = Object.freeze({
   ipopt: SOLVER_METHOD.ipopt,
 } as const);
 const NLIP_LINEAR_SOLVER = Object.freeze({
-  spralSsids: 0,
-  nativeSpralSsids: 1,
+  ssidsRs: 0,
+  spralSrc: 1,
   sparseQdldl: 2,
   auto: 3,
 } as const);
@@ -2756,7 +2756,7 @@ function currentSolverMethodValue(): number {
 function currentNlipLinearSolverValue(): number {
   return currentSharedControlValue(
     CONTROL_SEMANTIC.solverNlipLinearSolver,
-    NLIP_LINEAR_SOLVER.nativeSpralSsids,
+    NLIP_LINEAR_SOLVER.spralSrc,
   );
 }
 

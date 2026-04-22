@@ -8,7 +8,7 @@ use metis_ordering::{
     NestedDissectionOptions, OrderingSummary, Permutation, nested_dissection_order,
 };
 use nalgebra::{DMatrix, SymmetricEigen};
-use spral_ssids::{
+use ssids_rs::{
     Inertia, NumericFactorOptions, OrderingStrategy, SsidsOptions, SymmetricCscMatrix, analyse,
     factorize,
 };
@@ -727,7 +727,7 @@ fn run_robustness_suite() -> Vec<RobustnessCaseResult> {
         }),
         robustness_expect_error(
             "csc_bad_value_length",
-            "spral_ssids::SymmetricCscMatrix::new",
+            "ssids_rs::SymmetricCscMatrix::new",
             || {
                 SymmetricCscMatrix::new(2, &[0, 1, 2], &[0, 1], Some(&[1.0]))
                     .map(|_| ())
@@ -736,7 +736,7 @@ fn run_robustness_suite() -> Vec<RobustnessCaseResult> {
         ),
         robustness_expect_error(
             "csc_nonmonotone_ptrs",
-            "spral_ssids::SymmetricCscMatrix::new",
+            "ssids_rs::SymmetricCscMatrix::new",
             || {
                 SymmetricCscMatrix::new(2, &[0, 2, 1], &[0, 1], None)
                     .map(|_| ())
@@ -745,7 +745,7 @@ fn run_robustness_suite() -> Vec<RobustnessCaseResult> {
         ),
         robustness_expect_error(
             "numeric_factorize_missing_values",
-            "spral_ssids::factorize",
+            "ssids_rs::factorize",
             || {
                 let matrix = SymmetricCscMatrix::new(2, &[0, 2, 3], &[0, 1, 1], None)
                     .map_err(|error| error.to_string())?;
@@ -758,7 +758,7 @@ fn run_robustness_suite() -> Vec<RobustnessCaseResult> {
         ),
         robustness_expect_error(
             "numeric_factorize_nonfinite_value",
-            "spral_ssids::factorize",
+            "ssids_rs::factorize",
             || {
                 let matrix =
                     SymmetricCscMatrix::new(2, &[0, 2, 3], &[0, 1, 1], Some(&[2.0, f64::NAN, 1.0]))
@@ -770,7 +770,7 @@ fn run_robustness_suite() -> Vec<RobustnessCaseResult> {
                     .map_err(|error| error.to_string())
             },
         ),
-        robustness_expect_success("analyse_adversarial_ladder", "spral_ssids::analyse", || {
+        robustness_expect_success("analyse_adversarial_ladder", "ssids_rs::analyse", || {
             let matrix = crate::corpus::SymmetricPatternMatrix::from_undirected_edges(
                 14,
                 &[(0, 7), (0, 1), (7, 8), (1, 8), (1, 2), (8, 9)],
@@ -801,7 +801,7 @@ fn run_robustness_suite() -> Vec<RobustnessCaseResult> {
         ),
         robustness_expect_success(
             "numeric_factorize_small_indefinite",
-            "spral_ssids::factorize",
+            "ssids_rs::factorize",
             || {
                 let col_ptrs = vec![0, 2, 4, 5];
                 let row_indices = vec![0, 1, 1, 2, 2];
@@ -821,7 +821,7 @@ fn run_robustness_suite() -> Vec<RobustnessCaseResult> {
         ),
         robustness_expect_error(
             "numeric_solve_dimension_mismatch",
-            "spral_ssids::NumericFactor::solve_in_place",
+            "ssids_rs::NumericFactor::solve_in_place",
             || {
                 let col_ptrs = vec![0, 2, 4, 5];
                 let row_indices = vec![0, 1, 1, 2, 2];
@@ -841,7 +841,7 @@ fn run_robustness_suite() -> Vec<RobustnessCaseResult> {
         ),
         robustness_expect_error(
             "numeric_refactorize_pattern_mismatch",
-            "spral_ssids::NumericFactor::refactorize",
+            "ssids_rs::NumericFactor::refactorize",
             || {
                 let original_col_ptrs = vec![0, 2, 4, 6, 7];
                 let original_row_indices = vec![0, 1, 1, 2, 2, 3, 3];
@@ -877,7 +877,7 @@ fn run_robustness_suite() -> Vec<RobustnessCaseResult> {
         ),
         robustness_expect_success(
             "numeric_refactorize_repeated_delayed_chain",
-            "spral_ssids::NumericFactor::refactorize",
+            "ssids_rs::NumericFactor::refactorize",
             || {
                 let col_ptrs = vec![0, 2, 4, 6, 8, 10, 11];
                 let row_indices = vec![0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5];
@@ -928,7 +928,7 @@ fn run_robustness_suite() -> Vec<RobustnessCaseResult> {
         ),
         robustness_expect_success(
             "numeric_factorize_deterministic_saddle_kkt",
-            "spral_ssids::factorize",
+            "ssids_rs::factorize",
             || {
                 let col_ptrs = vec![0, 3, 7, 10, 13, 15, 16, 17, 18];
                 let row_indices = vec![0, 1, 5, 1, 2, 5, 7, 2, 3, 6, 3, 4, 6, 4, 7, 5, 6, 7];

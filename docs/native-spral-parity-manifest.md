@@ -7,6 +7,9 @@ regression test.
 
 ## Preflight
 
+Normal distribution builds should use `spral-src` / `ipopt-src` and must not
+depend on Homebrew, `/usr/local`, or `/Users/greg/local/ipopt-spral`.
+
 Run parity acceptance commands through:
 
 ```sh
@@ -22,6 +25,8 @@ SPRAL.
 For source-backed SPRAL algorithm acceptance, also set
 `AD_CODEGEN_REQUIRE_SPRAL_UPSTREAM_SOURCE=1`; the preflight then fails unless
 `target/native/spral-upstream/src/ssids` or `SPRAL_UPSTREAM_SSIDS_DIR` exists.
+This dynamic native path is compiled only with the `dynamic-spral-parity`
+feature; source-built native SPRAL is `native-spral-src`.
 
 ## NLIP vs IPOPT Lane
 

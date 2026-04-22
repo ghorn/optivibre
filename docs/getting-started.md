@@ -12,10 +12,12 @@ Install LLVM:
 brew install llvm
 ```
 
-Optional IPOPT support:
+Optional IPOPT support is source-built by default through `ipopt-src` and
+`spral-src`. It requires a C/C++/Fortran toolchain plus OpenMP; Homebrew IPOPT
+is not required.
 
 ```bash
-brew install ipopt
+brew install gcc meson ninja
 ```
 
 ## Common Commands
@@ -63,7 +65,7 @@ cargo test -p optimization --test sqp sqp_solves_hanging_chain -- --nocapture --
 IPOPT hanging chain:
 
 ```bash
-PKG_CONFIG_PATH="$(brew --prefix ipopt)/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
+OMP_CANCELLATION=true \
 cargo test -p optimization --features ipopt ipopt_solves_hanging_chain -- --nocapture
 ```
 
