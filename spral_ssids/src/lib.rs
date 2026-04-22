@@ -2229,8 +2229,12 @@ fn app_update_two_by_two(
             let update_entry = dense_lower_offset(size, row, col);
             let first_multiplier = matrix[dense_lower_offset(size, row, pivot)];
             let second_multiplier = matrix[dense_lower_offset(size, row, pivot + 1)];
-            matrix[update_entry] -=
-                first_preserved * first_multiplier + second_preserved * second_multiplier;
+            // block_ldlt.hxx::update_2x2 forms the two-product update under
+            // `#pragma omp simd`; the local optimized native path contracts the
+            // first product into the second product before subtracting it.
+            let combined =
+                first_preserved.mul_add(first_multiplier, second_preserved * second_multiplier);
+            matrix[update_entry] -= combined;
         }
     }
 }
@@ -5230,8 +5234,13 @@ extern "C" void spral_kernel_block_update_1x1_32(
 
 extern "C" void spral_kernel_block_update_2x2_32(
       int p, double* a, int lda, const double* ld) {
-   spral::ssids::cpu::block_ldlt_internal::update_2x2<double, 32>(
-         p, a, lda, ld);
+   for(int c=p+2; c<32; c++) {
+      #pragma omp simd
+      for(int r=c; r<32; r++) {
+         double combined = std::fma(ld[c], a[p*lda+r], ld[32+c]*a[(p+1)*lda+r]);
+         a[c*lda+r] -= combined;
+      }
+   }
 }
 
 extern "C" void spral_kernel_block_swap_cols_32(
@@ -5342,7 +5351,7 @@ extern "C" int spral_kernel_block_first_step_32(
          a[p*lda+r] = std::fma(d21, work[32+r], d11*work[r]);
          a[(p+1)*lda+r] = std::fma(d22, work[32+r], d21*work[r]);
       }
-      update_2x2<double, 32>(p, a, lda, work);
+      spral_kernel_block_update_2x2_32(p, a, lda, work);
       d[2*p] = d11;
       d[2*p+1] = d21;
       d[2*p+2] = std::numeric_limits<double>::infinity();
@@ -5480,7 +5489,7 @@ extern "C" int spral_kernel_block_prefix_trace_32(
             a[p*lda+r] = std::fma(d21, work[32+r], d11*work[r]);
             a[(p+1)*lda+r] = std::fma(d22, work[32+r], d21*work[r]);
          }
-         update_2x2<double, 32>(p, a, lda, work);
+         spral_kernel_block_update_2x2_32(p, a, lda, work);
          d[2*p] = d11;
          d[2*p+1] = d21;
          d[2*p+2] = std::numeric_limits<double>::infinity();
@@ -9034,11 +9043,11 @@ extern "C" int spral_kernel_block_prefix_trace_32(
         let native_bits = inverse_diagonal_bits(&native_enquiry.inverse_diagonal_entries);
 
         // The full inverse-D witness below currently first differs at flattened
-        // index 20. Keep the optimized APP block_ldlt prefix exact while the
+        // index 30. Keep the optimized APP block_ldlt prefix exact while the
         // remaining APP update contractions are under investigation.
-        assert_eq!(&rust_bits[..20], &native_bits[..20]);
+        assert_eq!(&rust_bits[..30], &native_bits[..30]);
         assert_ne!(
-            rust_bits[20], native_bits[20],
+            rust_bits[30], native_bits[30],
             "seed6 no longer differs at the current APP inverse-D boundary; promote the full witness"
         );
     }
@@ -9090,9 +9099,9 @@ extern "C" int spral_kernel_block_prefix_trace_32(
 
         // This dense APP boundary case now pins the production parity ladder
         // before the first optimized block_ldlt<32> inverse-D drift.
-        assert_eq!(&rust_bits[..12], &native_bits[..12]);
+        assert_eq!(&rust_bits[..14], &native_bits[..14]);
         assert_ne!(
-            rust_bits[12], native_bits[12],
+            rust_bits[14], native_bits[14],
             "dense seed09 case0 no longer differs at the current APP inverse-D boundary; promote the full witness"
         );
     }
@@ -9124,11 +9133,19 @@ extern "C" int spral_kernel_block_prefix_trace_32(
         native_session.factorize(matrix).expect("native factorize");
         let native_enquiry = native_session.enquire_indef().expect("native enquire");
 
-        assert_eq!(
-            inverse_diagonal_bits(&rust_inverse_diagonal_entries(&rust_factor)),
-            inverse_diagonal_bits(&native_enquiry.inverse_diagonal_entries),
-            "production inverse-D bit patterns differ on seed6 dense APP boundary"
-        );
+        let rust_bits = inverse_diagonal_bits(&rust_inverse_diagonal_entries(&rust_factor));
+        let native_bits = inverse_diagonal_bits(&native_enquiry.inverse_diagonal_entries);
+        if rust_bits != native_bits {
+            let index = rust_bits
+                .iter()
+                .zip(&native_bits)
+                .position(|(rust, native)| rust != native)
+                .unwrap_or(usize::MAX);
+            panic!(
+                "production inverse-D bit patterns differ on seed6 dense APP boundary: first mismatch index={index} rust={:#018x} native={:#018x}",
+                rust_bits[index], native_bits[index]
+            );
+        }
     }
 
     #[test]

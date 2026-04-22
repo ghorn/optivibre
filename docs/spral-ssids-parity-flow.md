@@ -6,18 +6,18 @@ newly passing in the current checkpoint. Orange nodes have partial coverage or a
 known narrowed boundary. Red nodes are the next open bitwise mismatch target.
 
 Current newly passing witness:
-`dense_seed09_case0_production_app_prefix_inverse_d_matches_native` narrows the
-dense seed `0x09c9134e4eff0004` case0 APP guard. Rust/native production
-factorization metadata still match exactly, and inverse-D now has an active
-bitwise prefix guard through flattened index 11. The remaining open production
-boundary starts at index 12 inside optimized `block_ldlt<32>`.
+`block_ldlt.hxx::update_2x2` now mirrors the local optimized native
+two-product contraction order for the APP trailing update. That extends
+`dense_seed6_production_app_prefix_inverse_d_matches_native` through flattened
+inverse-D index 29 and
+`dense_seed09_case0_production_app_prefix_inverse_d_matches_native` through
+flattened inverse-D index 13. The next open production boundaries are seed6
+index 30 and dense seed `0x09c9134e4eff0004` case0 index 14.
 
 Previous newly passing witness:
-`dense_seed6_production_app_prefix_inverse_d_matches_native` now pins the
-optimized native `block_ldlt<32>` APP prefix through flattened inverse-D index
-20. This checkpoint matches the local `block_ldlt.hxx` build's contracted 2x2
-multiplier rows, moving the production red boundary from index 12 to index 20.
-The full production witness is still `dense_seed6_production_inverse_d_matches_native`.
+`dense_seed09_case0_production_app_prefix_inverse_d_matches_native` narrowed the
+dense seed `0x09c9134e4eff0004` case0 APP guard through flattened inverse-D
+index 11 before the update contraction checkpoint.
 
 Current open guard witness:
 `rust_and_native_spral_dense_seed_09c9134e4eff0004_case0_solution_bits`
@@ -60,7 +60,8 @@ flowchart TD
     G8 --> G8c["block_ldlt optimized 2x2 multiplier contraction"]
     G8c --> G8a["calcLD OP_N 2x2 vector row"]
     G8a --> G8b["calcLD OP_N vector/scalar row split"]
-    G8b --> G9["update_2x2 trailing block"]
+    G8b --> G9a["update_2x2 product-sum contraction"]
+    G9a --> G9["update_2x2 trailing block"]
 
     G2 -->|"failed / delayed"| G10["delay pivot to parent front"]
 
@@ -71,9 +72,9 @@ flowchart TD
 
     I --> K["Store L/D blocks, local perms, pivot records"]
     K --> K1["Factor order, inertia, pivot stats"]
-    K --> K2["Seed6 APP prefix inverse-D bits"]
+    K --> K2["Seed6 APP prefix inverse-D bits through 29"]
     K2 --> K3["Seed6 full inverse-D bits"]
-    K --> K4a["Dense APP case0 prefix inverse-D bits"]
+    K --> K4a["Dense APP case0 prefix inverse-D bits through 13"]
     K4a --> K4b["Dense APP case0 full inverse-D bits"]
     K4b --> K4["Dense APP boundary case0 solution bits"]
     J --> K
@@ -95,8 +96,8 @@ flowchart TD
     classDef open fill:#ffd8d8,stroke:#b43b3b,color:#2b0d0d,stroke-width:2px;
 
     class A,B,B1,B2,B3,G0,G1,G3,G5,G6,G8,G8a,G8b,G9,H1,H2,H3,K1,M,O,P,Q,R match;
-    class K4a newly;
+    class G9a,K2,K4a newly;
     class C,D,E,F,G,G2,G4,G7,G10,H,I,J,K,L,N partial;
-    class G8c,K2 match;
+    class G8c match;
     class K3,K4b,K4 open;
 ```
