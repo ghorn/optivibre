@@ -28,7 +28,9 @@ use optimization::{
     ValidationTolerances, Vectorize, format_nlip_settings_summary, format_sqp_settings_summary,
 };
 #[cfg(feature = "ipopt")]
-use optimization::{IpoptOptions, IpoptRawStatus, IpoptSummary, format_ipopt_settings_summary};
+use optimization::{
+    IpoptLinearSolver, IpoptOptions, IpoptRawStatus, IpoptSummary, format_ipopt_settings_summary,
+};
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptProfiling, IpoptSolveError};
 use serde::{Deserialize, Serialize};
@@ -6015,6 +6017,7 @@ pub fn ipopt_options(config: &SolverConfig) -> IpoptOptions {
         dual_tol: Some(config.dual_tol),
         print_level: 5,
         suppress_banner: false,
+        linear_solver: Some(IpoptLinearSolver::Spral),
         ..IpoptOptions::default()
     }
 }
@@ -9886,6 +9889,14 @@ mod tests {
         let parsed = solver_method_from_map(&values, default_solver_method())
             .expect("solver method should parse");
         assert_eq!(parsed, SolverMethod::Ipopt);
+    }
+
+    #[cfg(feature = "ipopt")]
+    #[test]
+    fn default_ipopt_options_select_spral_explicitly() {
+        let options = ipopt_options(&default_solver_config());
+        assert_eq!(options.linear_solver, Some(IpoptLinearSolver::Spral));
+        assert!(format_ipopt_settings_summary(&options).contains("linear_solver=spral"));
     }
 
     #[test]
