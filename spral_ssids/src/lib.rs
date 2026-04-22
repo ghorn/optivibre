@@ -8357,6 +8357,17 @@ extern "C" int spral_kernel_block_prefix_trace_32(
         (dimension, lower_dense)
     }
 
+    fn copy_lower_dense_to_stride(dense: &[f64], size: usize, stride: usize) -> Vec<f64> {
+        assert!(stride >= size);
+        let mut strided = vec![0.0; stride * stride];
+        for col in 0..size {
+            for row in col..size {
+                strided[col * stride + row] = dense[dense_lower_offset(size, row, col)];
+            }
+        }
+        strided
+    }
+
     #[test]
     fn app_block_ldlt_32_prefix_trace_matches_native_dense_seed6() {
         let Some(shim) = native_kernel_shim_or_skip() else {
@@ -8366,6 +8377,23 @@ extern "C" int spral_kernel_block_prefix_trace_32(
         let options = NumericFactorOptions::default();
         let rust_trace = rust_app_block_prefix_trace_32(&lower_dense, dimension, options);
         let native_trace = native_block_prefix_trace_32(shim, &lower_dense, dimension, 34, options);
+        assert_block_prefix_traces_equal(&rust_trace, &native_trace);
+    }
+
+    #[test]
+    fn app_block_ldlt_32_aligned_prefix_trace_matches_native_dense_seed6() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let (dimension, lower_dense) = lower_dense_seed6_33();
+        let aligned_stride = 40;
+        let aligned_lower_dense =
+            copy_lower_dense_to_stride(&lower_dense, dimension, aligned_stride);
+        let options = NumericFactorOptions::default();
+        let rust_trace =
+            rust_app_block_prefix_trace_32(&aligned_lower_dense, aligned_stride, options);
+        let native_trace =
+            native_block_prefix_trace_32(shim, &lower_dense, dimension, aligned_stride, options);
         assert_block_prefix_traces_equal(&rust_trace, &native_trace);
     }
 
