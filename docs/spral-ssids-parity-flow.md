@@ -6,13 +6,13 @@ newly passing in the current checkpoint. Orange nodes have partial coverage or a
 known narrowed boundary. Red nodes are the next open bitwise mismatch target.
 
 Current newly passing witness:
-`dense_tpp_factor_dyadic_cases_0_to_15_match_native_kernel` proves the
-standalone native `ldlt_tpp_factor` path matches Rust bitwise for dyadic cases
-0 through 15. This checkpoint also pins native TPP's compiled 2x2 multiplier
-loop behavior: vectorized rows and scalar rows contract the source expression
-with different accumulator order. The next smaller open TPP witness is
-`dense_tpp_dyadic_case7_three_candidate_prefix_matches_native_kernel`, where
-partial candidate length 3 first differs at matrix row 5, col 2.
+`dense_tpp_dyadic_case7_three_candidate_prefix_matches_native_kernel` is now
+active and proves the standalone native `ldlt_tpp_factor` partial-candidate
+path matches Rust bitwise for the previously red `case=7, candidate_len=3`
+witness. This checkpoint pins native TPP's one-column `host_gemm(..., k=2)`
+shape as two sequential scalar updates. The next open witness is the ignored
+`dense_seed6_production_inverse_d_matches_native`, where the APP prefix remains
+green but full production inverse-D bits first differ at vector index 12.
 
 ```mermaid
 flowchart TD
@@ -57,7 +57,7 @@ flowchart TD
     I --> K["Store L/D blocks, local perms, pivot records"]
     K --> K1["Factor order, inertia, pivot stats"]
     K --> K2["Seed6 APP prefix inverse-D bits"]
-    K2 --> K3["TPP-tail inverse-D bits"]
+    K2 --> K3["Seed6 full inverse-D bits"]
     J --> K
     K1 --> L{"More fronts?"}
     K3 --> L
@@ -75,8 +75,8 @@ flowchart TD
     classDef partial fill:#ffe3bf,stroke:#b76d12,color:#2b1800,stroke-width:2px;
     classDef open fill:#ffd8d8,stroke:#b43b3b,color:#2b0d0d,stroke-width:2px;
 
-    class A,B,B1,B2,B3,G0,G1,G3,G5,G6,G8,G9,H1,K1,K2,M,O,P,Q,R match;
-    class H2 newly;
+    class A,B,B1,B2,B3,G0,G1,G3,G5,G6,G8,G9,H1,H2,K1,K2,M,O,P,Q,R match;
+    class H3 newly;
     class C,D,E,F,G,G2,G4,G7,G10,H,I,J,K,L,N partial;
-    class H3,K3 open;
+    class K3 open;
 ```

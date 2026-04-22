@@ -2913,9 +2913,11 @@ fn root_tpp_rank1_update(
     preserved_column: &[f64],
 ) {
     let size = bounds.size;
-    // Native SPRAL routes a 1x1 trailing update through scalar dgemm, but
-    // wider trailing blocks round like OpenBLAS' block kernel.
-    let use_scalar_fma = size.saturating_sub(start) == 1;
+    // Native SPRAL routes one-row and one-column TPP updates through dgemm
+    // shapes that round like sequential scalar updates. Wider trailing blocks
+    // round like OpenBLAS' block kernel.
+    let use_scalar_fma =
+        size.saturating_sub(start) == 1 || bounds.update_end.saturating_sub(start) == 1;
     // ldlt_tpp_factor distinguishes m rows from n candidate columns; the
     // trailing update spans all rows but only columns before n.
     for (col, &preserved) in preserved_column
@@ -2946,7 +2948,8 @@ fn root_tpp_rank2_update(
     second_preserved_column: &[f64],
 ) {
     let size = bounds.size;
-    let use_scalar_fma = size.saturating_sub(start) == 1;
+    let use_scalar_fma =
+        size.saturating_sub(start) == 1 || bounds.update_end.saturating_sub(start) == 1;
     // ldlt_tpp_factor distinguishes m rows from n candidate columns; the
     // trailing update spans all rows but only columns before n.
     for (col, (&first_preserved, &second_preserved)) in first_preserved_column
@@ -8590,7 +8593,6 @@ extern "C" int spral_kernel_block_prefix_trace_32(
     }
 
     #[test]
-    #[ignore = "manual native-vs-rust TPP partial-candidate witness; case 7 candidate_len 3 differs in matrix row 5 col 2"]
     fn dense_tpp_dyadic_case7_three_candidate_prefix_matches_native_kernel() {
         let Some(shim) = native_kernel_shim_or_skip() else {
             return;
