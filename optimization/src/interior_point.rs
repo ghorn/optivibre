@@ -3914,46 +3914,48 @@ fn push_scalar_to_bounds_interior(
     bound_push: f64,
     bound_frac: f64,
 ) -> f64 {
-    let mut pushed = match (lower, upper) {
+    let snapped = match (lower, upper) {
         (Some(lower), Some(upper)) if lower <= upper => value.clamp(lower, upper),
         (Some(lower), _) => value.max(lower),
         (_, Some(upper)) => value.min(upper),
         (None, None) => value,
     };
-    let lower_margin = lower.map(|lower| {
-        let absolute_margin = bound_push * lower.abs().max(1.0);
-        match upper {
-            Some(upper) if upper > lower => absolute_margin.min(bound_frac * (upper - lower)),
-            _ => absolute_margin,
-        }
-    });
-    let upper_margin = upper.map(|upper| {
-        let absolute_margin = bound_push * upper.abs().max(1.0);
-        match lower {
-            Some(lower) if upper > lower => absolute_margin.min(bound_frac * (upper - lower)),
-            _ => absolute_margin,
-        }
-    });
-    if let Some(lower) = lower
-        && let Some(lower_margin) = lower_margin
-    {
-        pushed = pushed.max(lower + lower_margin);
+    if bound_frac <= 0.0 {
+        return snapped;
     }
-    if let Some(upper) = upper
-        && let Some(upper_margin) = upper_margin
-    {
-        pushed = pushed.min(upper - upper_margin);
-    }
-    if let (Some(lower), Some(upper), Some(lower_margin), Some(upper_margin)) =
-        (lower, upper, lower_margin, upper_margin)
-    {
-        let interior_lower = lower + lower_margin;
-        let interior_upper = upper - upper_margin;
-        if interior_lower > interior_upper {
-            pushed = 0.5 * (lower + upper);
+
+    // Mirrors Ipopt::DefaultIterateInitializer::push_variables: IPOPT first
+    // snaps to the original bounds, then applies bound_push/bound_frac margins
+    // with the same asymmetric tiny-double handling for lower and upper sides.
+    let tiny_double = 100.0 * f64::MIN_POSITIVE;
+    let mut lower_correction = 0.0_f64;
+    if let Some(lower) = lower {
+        let mut lower_margin = bound_push * lower.abs().max(1.0);
+        if let Some(upper) = upper
+            && upper > lower
+        {
+            let fractional_margin = bound_frac * (upper - lower) - tiny_double;
+            if fractional_margin > 0.0 {
+                lower_margin = lower_margin.min(fractional_margin);
+            }
         }
+        lower_correction = (lower + lower_margin - snapped).max(0.0);
     }
-    pushed
+    let mut upper_correction = 0.0_f64;
+    if let Some(upper) = upper {
+        let mut upper_margin = bound_push * upper.abs().max(1.0);
+        if let Some(lower) = lower
+            && upper > lower
+        {
+            let fractional_margin = bound_frac * (upper - lower) - tiny_double;
+            if fractional_margin > 0.0 {
+                upper_margin = upper_margin.min(fractional_margin);
+            }
+        }
+        upper_margin += tiny_double;
+        upper_correction = (snapped - (upper - upper_margin)).max(0.0);
+    }
+    snapped + lower_correction - upper_correction
 }
 
 fn project_initial_point_into_box_interior(
@@ -7849,6 +7851,46 @@ mod tests {
         };
 
         assert_eq!(alpha_for_y(0.3, 0.7, &direction, &options), 0.7);
+    }
+
+    #[test]
+    fn push_scalar_to_bounds_interior_keeps_ipopt_tiny_margin_order() {
+        let lower = 0.0;
+        let upper = 1.0e-305;
+        let bound_push = 1.0;
+        let bound_frac = 0.5;
+        let tiny_double = 100.0 * f64::MIN_POSITIVE;
+
+        let pushed_from_lower =
+            push_scalar_to_bounds_interior(lower, Some(lower), Some(upper), bound_push, bound_frac);
+        let pushed_from_upper =
+            push_scalar_to_bounds_interior(upper, Some(lower), Some(upper), bound_push, bound_frac);
+
+        // Ipopt::DefaultIterateInitializer::push_variables subtracts
+        // tiny_double from the lower-side fraction margin, then adds it back
+        // only for the upper-side margin.
+        assert_eq!(
+            pushed_from_lower.to_bits(),
+            (bound_frac * (upper - lower) - tiny_double).to_bits()
+        );
+        assert_eq!(
+            pushed_from_upper.to_bits(),
+            (upper - bound_frac * (upper - lower)).to_bits()
+        );
+    }
+
+    #[test]
+    fn push_scalar_to_bounds_interior_snaps_before_pushing() {
+        let pushed = push_scalar_to_bounds_interior(-10.0, Some(2.0), Some(8.0), 1.0e-1, 1.0e-1);
+
+        assert_eq!(pushed, 2.2);
+    }
+
+    #[test]
+    fn push_scalar_to_bounds_interior_without_bound_frac_only_snaps() {
+        let pushed = push_scalar_to_bounds_interior(-10.0, Some(2.0), Some(8.0), 1.0e-1, 0.0);
+
+        assert_eq!(pushed, 2.0);
     }
 
     #[test]
