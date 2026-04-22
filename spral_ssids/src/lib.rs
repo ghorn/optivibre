@@ -9226,6 +9226,56 @@ extern "C" int spral_kernel_block_prefix_trace_32(
     }
 
     #[test]
+    fn dense_seed09_case0_production_inverse_d_structural_zero_components_match_native() {
+        let Some(native) = native_spral_or_skip() else {
+            return;
+        };
+        let (dimension, dense) = dense_seed09_case0_matrix();
+        let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+        let matrix = SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
+            .expect("valid CSC");
+        let options = NumericFactorOptions::default();
+
+        let (symbolic, _) = analyse(
+            matrix,
+            &SsidsOptions {
+                ordering: OrderingStrategy::Natural,
+            },
+        )
+        .expect("rust analyse");
+        let (rust_factor, _) = factorize(matrix, &symbolic, &options).expect("rust factorize");
+
+        let mut native_session = native
+            .analyse_with_options_and_ordering(matrix, &options, NativeOrdering::Natural)
+            .expect("native analyse");
+        native_session.factorize(matrix).expect("native factorize");
+        let native_enquiry = native_session.enquire_indef().expect("native enquire");
+
+        let rust_entries = rust_inverse_diagonal_entries(&rust_factor);
+        let native_entries = native_enquiry.inverse_diagonal_entries;
+        assert_eq!(rust_entries.len(), native_entries.len());
+
+        let positive_zero_bits = 0.0f64.to_bits();
+        for (pivot, (&rust_entry, &native_entry)) in
+            rust_entries.iter().zip(&native_entries).enumerate()
+        {
+            let rust_structural_zero = rust_entry[1].to_bits() == positive_zero_bits;
+            let native_structural_zero = native_entry[1].to_bits() == positive_zero_bits;
+            assert_eq!(
+                rust_structural_zero, native_structural_zero,
+                "dense seed09 inverse-D structural zero layout mismatch pivot={pivot} rust={rust_entry:?} native={native_entry:?}"
+            );
+            if rust_structural_zero {
+                assert_eq!(
+                    rust_entry[1].to_bits(),
+                    native_entry[1].to_bits(),
+                    "dense seed09 inverse-D structural zero bit mismatch pivot={pivot}"
+                );
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "manual exact production inverse-D bit mismatch witness for dense seed09 case0"]
     fn dense_seed09_case0_production_inverse_d_matches_native() {
         let Some(native) = native_spral_or_skip() else {
