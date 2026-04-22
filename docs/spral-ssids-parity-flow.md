@@ -6,15 +6,25 @@ newly passing in the current checkpoint. Orange nodes have partial coverage or a
 known narrowed boundary. Red nodes are the next open bitwise mismatch target.
 
 Current newly passing witness:
+`dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now also
+mirrors `target/native/spral-upstream/src/ssids/cpu/factor.hxx`'s
+`factor_node_indef` second-pass TPP call after APP accepts the first block:
+`ldlt_tpp_factor(m-nelim, n-nelim, &perm[nelim], &lcol[nelim*(ldl+1)], ldl,
+&d[2*nelim], ld, m-nelim, ..., nelim, &lcol[nelim], ldl)`. With the same
+post-APP Rust front state, this source-shaped native TPP replay matches Rust
+production tail inverse-D storage bitwise. The remaining dense seed09 mismatch
+therefore stays above this second-pass TPP call convention.
+
+Previous newly passing witness:
 `dense_seed09_case0_production_inverse_d_entries_match_through_pivot38_except_known_gap`
 pins SPRAL's `enquire_indef` layout from
 `target/native/spral-upstream/src/ssids/cpu/NumericSubtree.hxx`: `d(1,:)`
 holds inverse-D diagonal entries and `d(2,:)` holds off-diagonal entries in
-pivot order. Dense seed09 production inverse-D now has an active guard showing
-all components through pivot 38 match bitwise except the known pivot 37
-off-diagonal gap. The next confirmed drift is pivot 39's diagonal component.
+pivot order. Dense seed09 production inverse-D has an active guard showing all
+components through pivot 38 match bitwise except the known pivot 37 off-diagonal
+gap. The next confirmed drift is pivot 39's diagonal component.
 
-Previous newly passing witness:
+Earlier passing witness:
 `dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` checked the
 seed09 tail with native `ldlt_tpp_factor` embedded at the same offset and
 leading dimension it has inside the 55-row APP front. The embedded tail D
@@ -22,7 +32,7 @@ entries match the isolated native tail D entries bitwise. The full
 native-production inverse-D guard still first differs at flattened index 75, so
 the open issue is outside tail-pointer offset and leading-dimension effects.
 
-Earlier passing witness:
+Earlier storage witness:
 `dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` checked that
 Rust production inverse-D storage for the dense seed09 tail matched the isolated
 TPP tail D entries after converting SPRAL's internal 2x2 marker layout to
@@ -107,7 +117,8 @@ flowchart TD
     K4e --> K4c["Dense seed09 isolated APP update + TPP tail kernels"]
     K4c --> K4d["Dense seed09 APP-stride TPP tail D bits"]
     K4d --> K4g["Dense seed09 embedded-offset native TPP tail D bits"]
-    K4g --> K4f["Dense seed09 Rust production tail D storage"]
+    K4g --> K4i["Dense seed09 factor_node second-pass TPP tail D bits"]
+    K4i --> K4f["Dense seed09 Rust production tail D storage"]
     K4f --> K4h["Dense seed09 post-gap pivot38 inverse-D bits"]
     K4h --> K4b["Dense APP case0 full inverse-D bits"]
     K4b --> K4["Dense APP boundary case0 solution bits"]
@@ -130,8 +141,8 @@ flowchart TD
     classDef open fill:#ffd8d8,stroke:#b43b3b,color:#2b0d0d,stroke-width:2px;
 
     class A,B,B1,B2,B3,G0,G1,G3,G5,G6,G8,G8a,G8b,G9,H1,H2,H3,K1,M,O,P,Q,R match;
-    class K4h newly;
+    class K4i newly;
     class C,D,E,F,G,G2,G4,G7,G10,H,I,J,K,L,N partial;
-    class G8c,G8d,G9a,I0,I1,I2,I3,K2,K3,K4a,K4c,K4d,K4e,K4f,K4g match;
+    class G8c,G8d,G9a,I0,I1,I2,I3,K2,K3,K4a,K4c,K4d,K4e,K4f,K4g,K4h match;
     class K4b,K4 open;
 ```

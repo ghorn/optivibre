@@ -9649,6 +9649,43 @@ extern "C" int spral_kernel_block_prefix_trace_32(
             );
         }
 
+        // Mirror factor_node_indef's second-pass TPP call after APP accepts
+        // the first block: the tail submatrix is addressed inside the parent
+        // node with parent ldl, ldld is the tail height, and nleft/aleft allow
+        // TPP row swaps to update the previously eliminated APP columns.
+        let mut native_factor_node_matrix = vec![0.0; native_tail_lda * dimension];
+        for col in 0..dimension {
+            for row in col..dimension {
+                native_factor_node_matrix[col * native_tail_lda + row] =
+                    lower_dense[col * dimension + row];
+            }
+        }
+        let mut native_factor_node_perm = rows.iter().map(|&row| row as c_int).collect::<Vec<_>>();
+        let mut native_factor_node_tail_diagonal = vec![0.0; 2 * tail_size];
+        let mut native_factor_node_tail_ld = vec![0.0; 2 * tail_size];
+        let native_factor_node_tail_offset = accepted_end * native_tail_lda + accepted_end;
+        let factor_node_eliminated = unsafe {
+            (shim.ldlt_tpp_factor)(
+                tail_size as c_int,
+                tail_size as c_int,
+                native_factor_node_perm.as_mut_ptr().add(accepted_end),
+                native_factor_node_matrix
+                    .as_mut_ptr()
+                    .add(native_factor_node_tail_offset),
+                native_tail_lda as c_int,
+                native_factor_node_tail_diagonal.as_mut_ptr(),
+                native_factor_node_tail_ld.as_mut_ptr(),
+                tail_size as c_int,
+                i32::from(options.action_on_zero_pivot),
+                options.threshold_pivot_u,
+                options.small_pivot_tolerance,
+                accepted_end as c_int,
+                native_factor_node_matrix.as_mut_ptr().add(accepted_end),
+                native_tail_lda as c_int,
+            )
+        };
+        assert_eq!(factor_node_eliminated, tail_size as c_int);
+
         let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
         let matrix = SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
             .expect("valid CSC");
@@ -9663,6 +9700,10 @@ extern "C" int spral_kernel_block_prefix_trace_32(
         let production_entries = rust_inverse_diagonal_entries(&production);
         let isolated_entries =
             inverse_diagonal_entries_from_internal_diagonal(&rust.diagonal, tail_size);
+        let factor_node_entries = inverse_diagonal_entries_from_internal_diagonal(
+            &native_factor_node_tail_diagonal,
+            tail_size,
+        );
         for (index, (&production_value, &isolated_value)) in production_entries[accepted_end..]
             .iter()
             .flat_map(|entry| entry.iter())
@@ -9673,6 +9714,18 @@ extern "C" int spral_kernel_block_prefix_trace_32(
                 production_value.to_bits(),
                 isolated_value.to_bits(),
                 "dense seed09 production-vs-isolated TPP tail D mismatch index={index} production={production_value:?} isolated={isolated_value:?}"
+            );
+        }
+        for (index, (&production_value, &factor_node_value)) in production_entries[accepted_end..]
+            .iter()
+            .flat_map(|entry| entry.iter())
+            .zip(factor_node_entries.iter().flat_map(|entry| entry.iter()))
+            .enumerate()
+        {
+            assert_eq!(
+                production_value.to_bits(),
+                factor_node_value.to_bits(),
+                "dense seed09 production-vs-factor-node TPP tail D mismatch index={index} production={production_value:?} factor_node={factor_node_value:?}"
             );
         }
     }
