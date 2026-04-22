@@ -4423,6 +4423,8 @@ mod tests {
     use std::sync::OnceLock;
 
     use libloading::Library;
+    #[cfg(unix)]
+    use libloading::os::unix::{Library as UnixLibrary, RTLD_GLOBAL, RTLD_NOW};
     use metis_ordering::{CsrGraph, Permutation};
     use proptest::prelude::*;
     use proptest::test_runner::{Config, RngAlgorithm, RngSeed, TestRng, TestRunner};
@@ -4496,6 +4498,7 @@ mod tests {
         unsafe extern "C" fn(c_int, c_int, *const f64, c_int, *mut f64, c_int);
 
     struct NativeKernelShim {
+        _libspral: Library,
         _library: Library,
         apply_pivot_op_n: ApplyPivotOpNFn,
         calc_ld_op_n: CalcLdOpNFn,
@@ -4592,6 +4595,7 @@ mod tests {
             ));
         }
 
+        let libspral_library = load_library_global(&libspral, "native SPRAL library")?;
         let library = unsafe {
             Library::new(&library_path).map_err(|error| {
                 format!(
@@ -4621,11 +4625,34 @@ mod tests {
         };
 
         Ok(NativeKernelShim {
+            _libspral: libspral_library,
             _library: library,
             apply_pivot_op_n,
             calc_ld_op_n,
             host_trsm_right_lower_trans_unit,
         })
+    }
+
+    #[cfg(unix)]
+    fn load_library_global(path: &Path, label: &str) -> Result<Library, String> {
+        let library = unsafe {
+            UnixLibrary::open(Some(path.as_os_str()), RTLD_NOW | RTLD_GLOBAL).map_err(|error| {
+                format!(
+                    "failed to load {label} {} with global symbols: {error}",
+                    path.display()
+                )
+            })?
+        };
+        Ok(Library::from(library))
+    }
+
+    #[cfg(not(unix))]
+    fn load_library_global(path: &Path, label: &str) -> Result<Library, String> {
+        let library = unsafe {
+            Library::new(path)
+                .map_err(|error| format!("failed to load {label} {}: {error}", path.display()))?
+        };
+        Ok(library)
     }
 
     #[cfg(target_os = "macos")]
@@ -4744,10 +4771,19 @@ extern "C" void spral_kernel_host_trsm_right_lower_trans_unit(
     }
 
     fn app_kernel_case_from_seed(seed: u64, options: AppKernelCaseOptions) -> AppKernelCase {
+        app_kernel_case_from_seed_with_limits(seed, options, 8, 18)
+    }
+
+    fn app_kernel_case_from_seed_with_limits(
+        seed: u64,
+        options: AppKernelCaseOptions,
+        max_block_width: usize,
+        max_trailing_rows: usize,
+    ) -> AppKernelCase {
         let mut rng = DenseBoundaryRng::new(seed);
         let block_start = rng.usize_inclusive(0, 4);
-        let block_width = rng.usize_inclusive(1, 8);
-        let trailing_rows = rng.usize_inclusive(1, 18);
+        let block_width = rng.usize_inclusive(1, max_block_width);
+        let trailing_rows = rng.usize_inclusive(1, max_trailing_rows);
         let block_end = block_start + block_width;
         let size = block_end + trailing_rows;
         let mut matrix = vec![0.0; size * size];
@@ -4988,6 +5024,76 @@ extern "C" void spral_kernel_host_trsm_right_lower_trans_unit(
 
         assert_app_kernel_matrices_bitwise_equal(
             "apply_pivot OP_N signed-zero witness",
+            &case,
+            &rust_matrix,
+            &native_matrix,
+        );
+    }
+
+    #[test]
+    fn app_block_triangular_solve_op_n_wide_openblas_update_regression() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let case = app_kernel_case_from_seed_with_limits(
+            0x0d3b_9ddd_c779_97d6,
+            AppKernelCaseOptions {
+                allow_two_by_two: true,
+                allow_signed_zero: true,
+            },
+            64,
+            128,
+        );
+        let mut rust_matrix = case.matrix.clone();
+        let mut native_matrix = case.matrix.clone();
+
+        native_host_trsm_op_n(shim, &case, &mut native_matrix);
+        app_solve_block_triangular_to_trailing_rows(
+            &mut rust_matrix,
+            case.size,
+            case.block_start,
+            case.block_end,
+            false,
+        );
+
+        assert_app_kernel_matrices_bitwise_equal(
+            "host_trsm OP_N wide OpenBLAS update regression",
+            &case,
+            &rust_matrix,
+            &native_matrix,
+        );
+    }
+
+    #[test]
+    fn app_apply_pivot_op_n_wide_openblas_update_regression() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let case = app_kernel_case_from_seed_with_limits(
+            0x00aa_b8cb_5a34_9e52,
+            AppKernelCaseOptions {
+                allow_two_by_two: true,
+                allow_signed_zero: true,
+            },
+            64,
+            128,
+        );
+        let mut rust_matrix = case.matrix.clone();
+        let mut native_matrix = case.matrix.clone();
+
+        native_apply_pivot_op_n(shim, &case, &mut native_matrix);
+        app_apply_block_pivots_to_trailing_rows(
+            &mut rust_matrix,
+            case.size,
+            case.block_start,
+            case.block_end,
+            &case.block_records,
+            case.small,
+            false,
+        );
+
+        assert_app_kernel_matrices_bitwise_equal(
+            "apply_pivot OP_N wide OpenBLAS update regression",
             &case,
             &rust_matrix,
             &native_matrix,
