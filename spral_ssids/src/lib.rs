@@ -2040,8 +2040,7 @@ fn app_two_by_two_inverse(a11: f64, a21: f64, a22: f64, small: f64) -> Option<(f
         return None;
     }
     let detscale = 1.0 / a21.abs();
-    // Native SPRAL's block_ldlt contracts this multiply/subtract on the local build.
-    let det = (a11 * detscale).mul_add(a22, -a21.abs());
+    let det = (a11 * detscale) * a22 - a21.abs();
     if !det.is_finite() || det.abs() < a21.abs() / 2.0 {
         return None;
     }
@@ -2230,9 +2229,9 @@ fn app_update_two_by_two(
             let update_entry = dense_lower_offset(size, row, col);
             let first_multiplier = matrix[dense_lower_offset(size, row, pivot)];
             let second_multiplier = matrix[dense_lower_offset(size, row, pivot + 1)];
-            // Match native block_ldlt's contracted 2x2 update RHS.
+            // Match the local native code generated from block_ldlt.hxx::update_2x2.
             matrix[update_entry] -=
-                first_preserved.mul_add(first_multiplier, second_preserved * second_multiplier);
+                second_preserved.mul_add(second_multiplier, first_preserved * first_multiplier);
         }
     }
 }
@@ -2318,7 +2317,8 @@ fn factor_two_by_two_common(
         let b2 = matrix[dense_lower_offset(size, row, pivot + 1)];
         first_scratch[row] = b1;
         second_scratch[row] = b2;
-        let l1 = inv11.mul_add(b1, inv12 * b2);
+        // Match the local native code generated from block_ldlt.hxx's divide-through assignment.
+        let l1 = inv12.mul_add(b2, inv11 * b1);
         let l2 = inv12.mul_add(b1, inv22 * b2);
         if !l1.is_finite() || !l2.is_finite() {
             return Err(SsidsError::NumericalBreakdown {
@@ -4572,15 +4572,16 @@ mod tests {
     use proptest::test_runner::{Config, RngAlgorithm, RngSeed, TestRng, TestRunner};
 
     use super::{
-        DenseTppTailRequest, FactorBlockRecord, NativeOrdering, NativeSpral, NumericFactorOptions,
-        OrderingStrategy, SolvePanel, SsidsOptions, SymmetricCscMatrix, analyse,
-        app_apply_block_pivots_to_trailing_rows, app_build_ld_workspace,
-        app_solve_block_triangular_to_trailing_rows, build_symbolic_front_tree, dense_lower_offset,
-        expand_symmetric_pattern, factorize, factorize_dense_tpp_tail_in_place,
-        native_column_counts, native_postorder_permutation, openblas_gemv_n_update_like_native,
-        openblas_gemv_t_dot_like_contiguous, openblas_trsv_lower_unit_op_n_like_native,
-        openblas_trsv_lower_unit_op_t_like_native, permute_graph,
-        solve_forward_front_panels_like_native, solve_two_by_two_block_in_place,
+        APP_INNER_BLOCK_SIZE, DenseTppTailRequest, FactorBlockRecord, NativeOrdering, NativeSpral,
+        NumericFactorOptions, OrderingStrategy, SolvePanel, SsidsOptions, SymmetricCscMatrix,
+        analyse, app_apply_block_pivots_to_trailing_rows, app_build_ld_workspace,
+        app_solve_block_triangular_to_trailing_rows, app_two_by_two_inverse, app_update_one_by_one,
+        app_update_two_by_two, build_symbolic_front_tree, dense_lower_offset,
+        expand_symmetric_pattern, factorize, factorize_dense_front,
+        factorize_dense_tpp_tail_in_place, native_column_counts, native_postorder_permutation,
+        openblas_gemv_n_update_like_native, openblas_gemv_t_dot_like_contiguous,
+        openblas_trsv_lower_unit_op_n_like_native, openblas_trsv_lower_unit_op_t_like_native,
+        permute_graph, solve_forward_front_panels_like_native, solve_two_by_two_block_in_place,
         symbolic_factor_pattern,
     };
 
@@ -4648,6 +4649,22 @@ mod tests {
     type LdltAppSolveFn =
         unsafe extern "C" fn(c_int, c_int, *const f64, c_int, c_int, *mut f64, c_int);
     type LdltAppSolveDiagFn = unsafe extern "C" fn(c_int, *const f64, c_int, *mut f64, c_int);
+    type BlockUpdate1x1Fn = unsafe extern "C" fn(c_int, *mut f64, c_int, *const f64);
+    type BlockUpdate2x2Fn = unsafe extern "C" fn(c_int, *mut f64, c_int, *const f64);
+    type BlockTest2x2Fn = unsafe extern "C" fn(f64, f64, f64, *mut f64, *mut f64) -> c_int;
+    type BlockTwoByTwoMultipliersFn = unsafe extern "C" fn(f64, f64, f64, f64, f64, *mut f64);
+    type BlockLdlt32Fn = unsafe extern "C" fn(
+        c_int,
+        *mut c_int,
+        *mut f64,
+        c_int,
+        *mut f64,
+        *mut f64,
+        c_int,
+        f64,
+        f64,
+        *mut c_int,
+    );
 
     struct NativeKernelShim {
         _libspral: Library,
@@ -4662,6 +4679,11 @@ mod tests {
         ldlt_app_solve_fwd: LdltAppSolveFn,
         ldlt_app_solve_diag: LdltAppSolveDiagFn,
         ldlt_app_solve_bwd: LdltAppSolveFn,
+        block_update_1x1_32: BlockUpdate1x1Fn,
+        block_update_2x2_32: BlockUpdate2x2Fn,
+        block_test_2x2: BlockTest2x2Fn,
+        block_two_by_two_multipliers: BlockTwoByTwoMultipliersFn,
+        block_ldlt_32: BlockLdlt32Fn,
     }
 
     static NATIVE_KERNEL_SHIM: OnceLock<Result<NativeKernelShim, String>> = OnceLock::new();
@@ -4821,6 +4843,33 @@ mod tests {
                 .get::<LdltAppSolveFn>(b"spral_kernel_ldlt_app_solve_bwd\0")
                 .map_err(|error| format!("failed to load ldlt_app_solve_bwd shim: {error}"))?
         };
+        let block_update_1x1_32 = unsafe {
+            *library
+                .get::<BlockUpdate1x1Fn>(b"spral_kernel_block_update_1x1_32\0")
+                .map_err(|error| format!("failed to load block_update_1x1_32 shim: {error}"))?
+        };
+        let block_update_2x2_32 = unsafe {
+            *library
+                .get::<BlockUpdate2x2Fn>(b"spral_kernel_block_update_2x2_32\0")
+                .map_err(|error| format!("failed to load block_update_2x2_32 shim: {error}"))?
+        };
+        let block_test_2x2 = unsafe {
+            *library
+                .get::<BlockTest2x2Fn>(b"spral_kernel_block_test_2x2\0")
+                .map_err(|error| format!("failed to load block_test_2x2 shim: {error}"))?
+        };
+        let block_two_by_two_multipliers = unsafe {
+            *library
+                .get::<BlockTwoByTwoMultipliersFn>(b"spral_kernel_block_two_by_two_multipliers\0")
+                .map_err(|error| {
+                    format!("failed to load block_two_by_two_multipliers shim: {error}")
+                })?
+        };
+        let block_ldlt_32 = unsafe {
+            *library
+                .get::<BlockLdlt32Fn>(b"spral_kernel_block_ldlt_32\0")
+                .map_err(|error| format!("failed to load block_ldlt_32 shim: {error}"))?
+        };
 
         Ok(NativeKernelShim {
             _libspral: libspral_library,
@@ -4835,6 +4884,11 @@ mod tests {
             ldlt_app_solve_fwd,
             ldlt_app_solve_diag,
             ldlt_app_solve_bwd,
+            block_update_1x1_32,
+            block_update_2x2_32,
+            block_test_2x2,
+            block_two_by_two_multipliers,
+            block_ldlt_32,
         })
     }
 
@@ -4883,6 +4937,7 @@ mod tests {
     fn native_kernel_shim_source() -> &'static str {
         r#"
 #include "ssids/cpu/kernels/common.hxx"
+#include "ssids/cpu/kernels/block_ldlt.hxx"
 #include "ssids/cpu/kernels/ldlt_app.hxx"
 #include "ssids/cpu/kernels/wrappers.hxx"
 
@@ -4969,6 +5024,43 @@ extern "C" void spral_kernel_ldlt_app_solve_bwd(
    spral::ssids::cpu::ldlt_app_solve_bwd<double>(
          m, n, l, ldl, nrhs, x, ldx);
 }
+
+extern "C" void spral_kernel_block_ldlt_32(
+      int from, int* perm, double* a, int lda, double* d, double* ldwork,
+      int action, double u, double small, int* lperm) {
+   spral::ssids::cpu::block_ldlt<double, 32>(
+         from, perm, a, lda, d, ldwork, action != 0, u, small, lperm);
+}
+
+extern "C" void spral_kernel_block_update_1x1_32(
+      int p, double* a, int lda, const double* ld) {
+   spral::ssids::cpu::block_ldlt_internal::update_1x1<double, 32>(
+         p, a, lda, ld);
+}
+
+extern "C" void spral_kernel_block_update_2x2_32(
+      int p, double* a, int lda, const double* ld) {
+   spral::ssids::cpu::block_ldlt_internal::update_2x2<double, 32>(
+         p, a, lda, ld);
+}
+
+extern "C" int spral_kernel_block_test_2x2(
+      double a11, double a21, double a22, double* detpiv, double* detscale) {
+   double local_detpiv = 0.0;
+   double local_detscale = 0.0;
+   bool accepted = spral::ssids::cpu::block_ldlt_internal::test_2x2<double>(
+         a11, a21, a22, local_detpiv, local_detscale);
+   *detpiv = local_detpiv;
+   *detscale = local_detscale;
+   return accepted ? 1 : 0;
+}
+
+extern "C" void spral_kernel_block_two_by_two_multipliers(
+      double d11, double d21, double d22, double work0, double work1,
+      double* out) {
+   out[0] = d11*work0 + d21*work1;
+   out[1] = d21*work0 + d22*work1;
+}
 "#
     }
 
@@ -5028,6 +5120,22 @@ extern "C" void spral_kernel_ldlt_app_solve_bwd(
         lower: Vec<f64>,
         diagonal: Vec<f64>,
         rhs: Vec<f64>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct BlockLdltKernelResult {
+        perm: Vec<usize>,
+        local_perm: Vec<usize>,
+        matrix: Vec<f64>,
+        diagonal: Vec<f64>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct BlockUpdateCase {
+        seed: u64,
+        pivot: usize,
+        matrix: Vec<f64>,
+        workspace: Vec<f64>,
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -5161,6 +5269,34 @@ extern "C" void spral_kernel_ldlt_app_solve_bwd(
             lower,
             diagonal,
             rhs,
+        }
+    }
+
+    fn block_update_case_from_seed(seed: u64, pivot_width: usize) -> BlockUpdateCase {
+        let mut rng = DenseBoundaryRng::new(seed);
+        let pivot = rng.usize_inclusive(0, APP_INNER_BLOCK_SIZE - pivot_width);
+        let mut matrix = vec![0.0; APP_INNER_BLOCK_SIZE * APP_INNER_BLOCK_SIZE];
+        let mut workspace = vec![0.0; APP_INNER_BLOCK_SIZE * APP_INNER_BLOCK_SIZE];
+        for col in 0..APP_INNER_BLOCK_SIZE {
+            for row in col..APP_INNER_BLOCK_SIZE {
+                matrix[col * APP_INNER_BLOCK_SIZE + row] = rng.dyadic_kernel_value(24, 9, true);
+            }
+        }
+        for row in (pivot + 1)..APP_INNER_BLOCK_SIZE {
+            matrix[pivot * APP_INNER_BLOCK_SIZE + row] = rng.dyadic_kernel_value(24, 9, true);
+            workspace[pivot * APP_INNER_BLOCK_SIZE + row] = rng.dyadic_kernel_value(24, 9, true);
+            if row > pivot + 1 {
+                matrix[(pivot + 1) * APP_INNER_BLOCK_SIZE + row] =
+                    rng.dyadic_kernel_value(24, 9, true);
+                workspace[(pivot + 1) * APP_INNER_BLOCK_SIZE + row] =
+                    rng.dyadic_kernel_value(24, 9, true);
+            }
+        }
+        BlockUpdateCase {
+            seed,
+            pivot,
+            matrix,
+            workspace,
         }
     }
 
@@ -5323,6 +5459,174 @@ extern "C" void spral_kernel_ldlt_app_solve_bwd(
         }
     }
 
+    fn native_block_update_1x1_32(
+        shim: &NativeKernelShim,
+        case: &BlockUpdateCase,
+        matrix: &mut [f64],
+    ) {
+        unsafe {
+            (shim.block_update_1x1_32)(
+                case.pivot as c_int,
+                matrix.as_mut_ptr(),
+                APP_INNER_BLOCK_SIZE as c_int,
+                case.workspace
+                    .as_ptr()
+                    .add(case.pivot * APP_INNER_BLOCK_SIZE),
+            );
+        }
+    }
+
+    fn native_block_update_2x2_32(
+        shim: &NativeKernelShim,
+        case: &BlockUpdateCase,
+        matrix: &mut [f64],
+    ) {
+        unsafe {
+            (shim.block_update_2x2_32)(
+                case.pivot as c_int,
+                matrix.as_mut_ptr(),
+                APP_INNER_BLOCK_SIZE as c_int,
+                case.workspace
+                    .as_ptr()
+                    .add(case.pivot * APP_INNER_BLOCK_SIZE),
+            );
+        }
+    }
+
+    fn native_block_two_by_two_multipliers(
+        shim: &NativeKernelShim,
+        inverse: (f64, f64, f64),
+        values: (f64, f64),
+    ) -> (f64, f64) {
+        let mut out = [0.0; 2];
+        unsafe {
+            (shim.block_two_by_two_multipliers)(
+                inverse.0,
+                inverse.1,
+                inverse.2,
+                values.0,
+                values.1,
+                out.as_mut_ptr(),
+            );
+        }
+        (out[0], out[1])
+    }
+
+    fn native_block_test_2x2(
+        shim: &NativeKernelShim,
+        a11: f64,
+        a21: f64,
+        a22: f64,
+    ) -> (bool, f64, f64) {
+        let mut detpiv = 0.0;
+        let mut detscale = 0.0;
+        let accepted = unsafe {
+            (shim.block_test_2x2)(
+                a11,
+                a21,
+                a22,
+                &mut detpiv as *mut f64,
+                &mut detscale as *mut f64,
+            )
+        } != 0;
+        (accepted, detpiv, detscale)
+    }
+
+    fn native_block_ldlt_32_from_lower_dense(
+        shim: &NativeKernelShim,
+        dense: &[f64],
+        size: usize,
+        lda: usize,
+        options: NumericFactorOptions,
+    ) -> BlockLdltKernelResult {
+        debug_assert_eq!(dense.len(), size * size);
+        debug_assert!(size >= APP_INNER_BLOCK_SIZE);
+        debug_assert!(lda >= APP_INNER_BLOCK_SIZE);
+        let mut matrix = vec![0.0; lda * APP_INNER_BLOCK_SIZE];
+        for col in 0..APP_INNER_BLOCK_SIZE {
+            for row in col..APP_INNER_BLOCK_SIZE {
+                matrix[col * lda + row] = dense[dense_lower_offset(size, row, col)];
+            }
+        }
+        let mut perm = (0..APP_INNER_BLOCK_SIZE as c_int).collect::<Vec<_>>();
+        let mut local_perm = (0..APP_INNER_BLOCK_SIZE as c_int).collect::<Vec<_>>();
+        let mut diagonal = vec![0.0; 2 * APP_INNER_BLOCK_SIZE];
+        let mut ldwork = vec![0.0; APP_INNER_BLOCK_SIZE * APP_INNER_BLOCK_SIZE];
+        unsafe {
+            (shim.block_ldlt_32)(
+                0,
+                perm.as_mut_ptr(),
+                matrix.as_mut_ptr(),
+                lda as c_int,
+                diagonal.as_mut_ptr(),
+                ldwork.as_mut_ptr(),
+                i32::from(options.action_on_zero_pivot),
+                options.threshold_pivot_u,
+                options.small_pivot_tolerance,
+                local_perm.as_mut_ptr(),
+            );
+        }
+        BlockLdltKernelResult {
+            perm: perm.into_iter().map(|entry| entry as usize).collect(),
+            local_perm: local_perm.into_iter().map(|entry| entry as usize).collect(),
+            matrix,
+            diagonal,
+        }
+    }
+
+    fn rust_block_ldlt_32_from_lower_dense(
+        dense: &[f64],
+        size: usize,
+        options: NumericFactorOptions,
+    ) -> BlockLdltKernelResult {
+        let rows = (0..size).collect::<Vec<_>>();
+        let factorization = factorize_dense_front(rows, size, dense.to_vec(), options, false)
+            .expect("rust block factorization");
+        let mut factor_inverse = vec![usize::MAX; size];
+        for (position, &row) in factorization.factor_order.iter().enumerate() {
+            factor_inverse[row] = position;
+        }
+        let mut matrix = vec![0.0; size * APP_INNER_BLOCK_SIZE];
+        for (local_col, column) in factorization
+            .factor_columns
+            .iter()
+            .take(APP_INNER_BLOCK_SIZE)
+            .enumerate()
+        {
+            matrix[local_col * size + local_col] = 1.0;
+            for &(row, value) in &column.entries {
+                let local_row = factor_inverse[row];
+                if local_row < APP_INNER_BLOCK_SIZE {
+                    matrix[local_col * size + local_row] = value;
+                }
+            }
+        }
+        let mut diagonal = vec![0.0; 2 * APP_INNER_BLOCK_SIZE];
+        let mut cursor = 0;
+        for block in &factorization.block_records {
+            if cursor >= APP_INNER_BLOCK_SIZE {
+                break;
+            }
+            if block.size == 1 {
+                diagonal[2 * cursor] = block.values[0];
+                diagonal[2 * cursor + 1] = 0.0;
+                cursor += 1;
+            } else {
+                diagonal[2 * cursor] = block.values[0];
+                diagonal[2 * cursor + 1] = block.values[1];
+                diagonal[2 * cursor + 2] = f64::INFINITY;
+                diagonal[2 * cursor + 3] = block.values[3];
+                cursor += 2;
+            }
+        }
+        BlockLdltKernelResult {
+            perm: factorization.factor_order[..APP_INNER_BLOCK_SIZE].to_vec(),
+            local_perm: factorization.factor_order[..APP_INNER_BLOCK_SIZE].to_vec(),
+            matrix,
+            diagonal,
+        }
+    }
+
     fn rust_host_trsv_lower_op_n_like_native(case: &AppSolveKernelCase, rhs: &mut [f64]) {
         openblas_trsv_lower_unit_op_n_like_native(
             &case.lower,
@@ -5393,6 +5697,35 @@ extern "C" void spral_kernel_ldlt_app_solve_bwd(
         rust_host_trsv_lower_op_t_like_native(case, rhs);
     }
 
+    fn rust_block_update_1x1_32(case: &BlockUpdateCase, matrix: &mut [f64]) {
+        app_update_one_by_one(
+            matrix,
+            APP_INNER_BLOCK_SIZE,
+            case.pivot,
+            APP_INNER_BLOCK_SIZE,
+            &case.workspace,
+        );
+    }
+
+    fn rust_block_update_2x2_32(case: &BlockUpdateCase, matrix: &mut [f64]) {
+        app_update_two_by_two(
+            matrix,
+            APP_INNER_BLOCK_SIZE,
+            case.pivot,
+            APP_INNER_BLOCK_SIZE,
+            &case.workspace,
+        );
+    }
+
+    fn rust_block_two_by_two_multipliers(
+        inverse: (f64, f64, f64),
+        values: (f64, f64),
+    ) -> (f64, f64) {
+        let (inv11, inv12, inv22) = inverse;
+        let (b1, b2) = values;
+        (inv12.mul_add(b2, inv11 * b1), inv12.mul_add(b1, inv22 * b2))
+    }
+
     fn assert_app_kernel_matrices_bitwise_equal(
         label: &str,
         case: &AppKernelCase,
@@ -5413,6 +5746,34 @@ extern "C" void spral_kernel_ldlt_app_solve_bwd(
                 case
             );
         }
+    }
+
+    fn assert_block_lower_matrix_bitwise_equal(
+        label: &str,
+        case: &BlockUpdateCase,
+        rust_matrix: &[f64],
+        native_matrix: &[f64],
+    ) -> Result<(), TestCaseError> {
+        for col in 0..APP_INNER_BLOCK_SIZE {
+            for row in col..APP_INNER_BLOCK_SIZE {
+                let index = col * APP_INNER_BLOCK_SIZE + row;
+                prop_assert_eq!(
+                    rust_matrix[index].to_bits(),
+                    native_matrix[index].to_bits(),
+                    "{} mismatch seed={:#x} index={} row={} col={} pivot={} rust={:?} native={:?} case={:?}",
+                    label,
+                    case.seed,
+                    index,
+                    row,
+                    col,
+                    case.pivot,
+                    rust_matrix[index],
+                    native_matrix[index],
+                    case
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -5845,6 +6206,197 @@ extern "C" void spral_kernel_ldlt_app_solve_bwd(
                 Ok(())
             })
             .expect("ldlt_app_solve_bwd kernel parity property failed");
+    }
+
+    #[test]
+    fn app_block_update_1x1_matches_native_kernel_property_cases() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let cases = env_usize("SPRAL_SSIDS_KERNEL_PARITY_CASES", 512);
+        let seed = env_u64("SPRAL_SSIDS_KERNEL_PARITY_SEED", 0xb101_900d_0001);
+        let mut runner = deterministic_kernel_runner(cases, seed);
+
+        runner
+            .run(&any::<u64>(), |case_seed| {
+                let case = block_update_case_from_seed(seed ^ case_seed, 1);
+                let mut rust_matrix = case.matrix.clone();
+                let mut native_matrix = case.matrix.clone();
+
+                rust_block_update_1x1_32(&case, &mut rust_matrix);
+                native_block_update_1x1_32(shim, &case, &mut native_matrix);
+
+                assert_block_lower_matrix_bitwise_equal(
+                    "block_ldlt update_1x1",
+                    &case,
+                    &rust_matrix,
+                    &native_matrix,
+                )?;
+                Ok(())
+            })
+            .expect("block_ldlt update_1x1 kernel parity property failed");
+    }
+
+    #[test]
+    fn app_block_update_2x2_matches_native_kernel_property_cases() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let cases = env_usize("SPRAL_SSIDS_KERNEL_PARITY_CASES", 512);
+        let seed = env_u64("SPRAL_SSIDS_KERNEL_PARITY_SEED", 0xb102_900d_0001);
+        let mut runner = deterministic_kernel_runner(cases, seed);
+
+        runner
+            .run(&any::<u64>(), |case_seed| {
+                let case = block_update_case_from_seed(seed ^ case_seed, 2);
+                let mut rust_matrix = case.matrix.clone();
+                let mut native_matrix = case.matrix.clone();
+
+                rust_block_update_2x2_32(&case, &mut rust_matrix);
+                native_block_update_2x2_32(shim, &case, &mut native_matrix);
+
+                assert_block_lower_matrix_bitwise_equal(
+                    "block_ldlt update_2x2",
+                    &case,
+                    &rust_matrix,
+                    &native_matrix,
+                )?;
+                Ok(())
+            })
+            .expect("block_ldlt update_2x2 kernel parity property failed");
+    }
+
+    #[test]
+    fn app_block_test_2x2_matches_native_kernel_property_cases() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let cases = env_usize("SPRAL_SSIDS_KERNEL_PARITY_CASES", 512);
+        let seed = env_u64("SPRAL_SSIDS_KERNEL_PARITY_SEED", 0xb221_900d_0001);
+        let mut runner = deterministic_kernel_runner(cases, seed);
+
+        runner
+            .run(&any::<u64>(), |case_seed| {
+                let mut rng = DenseBoundaryRng::new(seed ^ case_seed);
+                let exponent = rng.usize_inclusive(0, 16) as i32 - 8;
+                let magnitude = 2.0_f64.powi(exponent);
+                let sign = if rng.next_u64() & 1 == 0 { 1.0 } else { -1.0 };
+                let signed_fraction = |rng: &mut DenseBoundaryRng| {
+                    let numerator = rng.usize_inclusive(0, 1024) as i32 - 512;
+                    magnitude * f64::from(numerator) / 512.0
+                };
+                let a11 = signed_fraction(&mut rng);
+                let a21 = sign * magnitude;
+                let a22 = signed_fraction(&mut rng);
+
+                let (native_accepted, native_detpiv, native_detscale) =
+                    native_block_test_2x2(shim, a11, a21, a22);
+                let rust_inverse = app_two_by_two_inverse(a11, a21, a22, 0.0);
+
+                prop_assert_eq!(
+                    rust_inverse.is_some(),
+                    native_accepted,
+                    "block_ldlt test_2x2 acceptance mismatch seed={:#x} a11={:?} a21={:?} a22={:?} native_detpiv={:?} native_detscale={:?}",
+                    seed ^ case_seed,
+                    a11,
+                    a21,
+                    a22,
+                    native_detpiv,
+                    native_detscale
+                );
+                if let Some(rust_inverse) = rust_inverse {
+                    let native_inverse = (
+                        (a22 * native_detscale) / native_detpiv,
+                        (-a21 * native_detscale) / native_detpiv,
+                        (a11 * native_detscale) / native_detpiv,
+                    );
+                    prop_assert_eq!(
+                        rust_inverse.0.to_bits(),
+                        native_inverse.0.to_bits(),
+                        "block_ldlt 2x2 d11 mismatch seed={:#x} values=({:?}, {:?}, {:?}) native_detpiv={:?} native_detscale={:?}",
+                        seed ^ case_seed,
+                        a11,
+                        a21,
+                        a22,
+                        native_detpiv,
+                        native_detscale
+                    );
+                    prop_assert_eq!(
+                        rust_inverse.1.to_bits(),
+                        native_inverse.1.to_bits(),
+                        "block_ldlt 2x2 d21 mismatch seed={:#x} values=({:?}, {:?}, {:?}) native_detpiv={:?} native_detscale={:?}",
+                        seed ^ case_seed,
+                        a11,
+                        a21,
+                        a22,
+                        native_detpiv,
+                        native_detscale
+                    );
+                    prop_assert_eq!(
+                        rust_inverse.2.to_bits(),
+                        native_inverse.2.to_bits(),
+                        "block_ldlt 2x2 d22 mismatch seed={:#x} values=({:?}, {:?}, {:?}) native_detpiv={:?} native_detscale={:?}",
+                        seed ^ case_seed,
+                        a11,
+                        a21,
+                        a22,
+                        native_detpiv,
+                        native_detscale
+                    );
+                }
+                Ok(())
+            })
+            .expect("block_ldlt test_2x2 kernel parity property failed");
+    }
+
+    #[test]
+    fn app_block_two_by_two_multipliers_match_native_kernel_property_cases() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let cases = env_usize("SPRAL_SSIDS_KERNEL_PARITY_CASES", 512);
+        let seed = env_u64("SPRAL_SSIDS_KERNEL_PARITY_SEED", 0xb22b_900d_0001);
+        let mut runner = deterministic_kernel_runner(cases, seed);
+
+        runner
+            .run(&any::<u64>(), |case_seed| {
+                let mut rng = DenseBoundaryRng::new(seed ^ case_seed);
+                let inverse = (
+                    rng.dyadic_kernel_value(24, 12, false),
+                    rng.dyadic_kernel_value(24, 12, false),
+                    rng.dyadic_kernel_value(24, 12, false),
+                );
+                let values = (
+                    rng.dyadic_kernel_value(24, 12, true),
+                    rng.dyadic_kernel_value(24, 12, true),
+                );
+
+                let rust = rust_block_two_by_two_multipliers(inverse, values);
+                let native = native_block_two_by_two_multipliers(shim, inverse, values);
+
+                prop_assert_eq!(
+                    rust.0.to_bits(),
+                    native.0.to_bits(),
+                    "block_ldlt 2x2 first multiplier mismatch seed={:#x} inverse={:?} values={:?} rust={:?} native={:?}",
+                    seed ^ case_seed,
+                    inverse,
+                    values,
+                    rust,
+                    native
+                );
+                prop_assert_eq!(
+                    rust.1.to_bits(),
+                    native.1.to_bits(),
+                    "block_ldlt 2x2 second multiplier mismatch seed={:#x} inverse={:?} values={:?} rust={:?} native={:?}",
+                    seed ^ case_seed,
+                    inverse,
+                    values,
+                    rust,
+                    native
+                );
+                Ok(())
+            })
+            .expect("block_ldlt 2x2 multiplier kernel parity property failed");
     }
 
     #[test]
@@ -6318,5 +6870,51 @@ extern "C" void spral_kernel_ldlt_app_solve_bwd(
 
         assert_eq!(&rust_factor.factor_order[..4], &[25, 28, 2, 27]);
         assert_eq!(rust_factor.factor_order, native_factor_order);
+    }
+
+    #[test]
+    #[ignore = "manual native-vs-rust block_ldlt<32> lower/D witness"]
+    fn app_block_ldlt_32_matches_native_dense_seed6_prefix() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let mut rng = DenseBoundaryRng::new(6);
+        let dimension = rng.usize_inclusive(33, 33);
+        assert_eq!(dimension, 33);
+        let dense = random_dense_dyadic_matrix(dimension, &mut rng);
+        let mut lower_dense = vec![0.0; dimension * dimension];
+        for col in 0..dimension {
+            for row in col..dimension {
+                lower_dense[dense_lower_offset(dimension, row, col)] = dense[row][col];
+            }
+        }
+        let options = NumericFactorOptions::default();
+        let rust = rust_block_ldlt_32_from_lower_dense(&lower_dense, dimension, options);
+        let native =
+            native_block_ldlt_32_from_lower_dense(shim, &lower_dense, dimension, 34, options);
+
+        assert_eq!(rust.perm, native.perm);
+        assert_eq!(rust.local_perm, native.local_perm);
+        for (index, (&rust_value, &native_value)) in
+            rust.diagonal.iter().zip(&native.diagonal).enumerate()
+        {
+            assert_eq!(
+                rust_value.to_bits(),
+                native_value.to_bits(),
+                "block_ldlt d mismatch index={index} rust={rust_value:?} native={native_value:?}"
+            );
+        }
+        for col in 0..APP_INNER_BLOCK_SIZE {
+            for row in col..APP_INNER_BLOCK_SIZE {
+                let rust_value = rust.matrix[col * dimension + row];
+                let native_value = native.matrix[col * 34 + row];
+                assert_eq!(
+                    rust_value.to_bits(),
+                    native_value.to_bits(),
+                    "block_ldlt matrix mismatch row={row} col={col} rust={rust_value:?} native={native_value:?} local_perm={:?}",
+                    rust.local_perm
+                );
+            }
+        }
     }
 }
