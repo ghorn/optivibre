@@ -8937,6 +8937,25 @@ extern "C" int spral_kernel_block_prefix_trace_32(
             .collect()
     }
 
+    fn inverse_diagonal_entries_from_internal_diagonal(
+        diagonal: &[f64],
+        candidate_len: usize,
+    ) -> Vec<[f64; 2]> {
+        let mut entries = Vec::with_capacity(candidate_len);
+        let mut cursor = 0;
+        while cursor < candidate_len {
+            if cursor + 1 == candidate_len || diagonal[2 * cursor + 2].is_finite() {
+                entries.push([diagonal[2 * cursor], 0.0]);
+                cursor += 1;
+            } else {
+                entries.push([diagonal[2 * cursor], diagonal[2 * cursor + 1]]);
+                entries.push([diagonal[2 * cursor + 3], 0.0]);
+                cursor += 2;
+            }
+        }
+        entries
+    }
+
     #[test]
     fn app_block_ldlt_32_prefix_trace_matches_native_dense_seed6() {
         let Some(shim) = native_kernel_shim_or_skip() else {
@@ -9507,6 +9526,33 @@ extern "C" int spral_kernel_block_prefix_trace_32(
                 rust_value.to_bits(),
                 native_value.to_bits(),
                 "dense seed09 APP-stride TPP tail D mismatch index={index} rust={rust_value:?} native={native_value:?}"
+            );
+        }
+
+        let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+        let matrix = SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
+            .expect("valid CSC");
+        let (symbolic, _) = analyse(
+            matrix,
+            &SsidsOptions {
+                ordering: OrderingStrategy::Natural,
+            },
+        )
+        .expect("rust analyse");
+        let (production, _) = factorize(matrix, &symbolic, &options).expect("rust factorize");
+        let production_entries = rust_inverse_diagonal_entries(&production);
+        let isolated_entries =
+            inverse_diagonal_entries_from_internal_diagonal(&rust.diagonal, tail_size);
+        for (index, (&production_value, &isolated_value)) in production_entries[accepted_end..]
+            .iter()
+            .flat_map(|entry| entry.iter())
+            .zip(isolated_entries.iter().flat_map(|entry| entry.iter()))
+            .enumerate()
+        {
+            assert_eq!(
+                production_value.to_bits(),
+                isolated_value.to_bits(),
+                "dense seed09 production-vs-isolated TPP tail D mismatch index={index} production={production_value:?} isolated={isolated_value:?}"
             );
         }
     }

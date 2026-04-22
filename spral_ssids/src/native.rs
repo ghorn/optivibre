@@ -480,12 +480,13 @@ fn native_spral_library_candidates() -> Vec<PathBuf> {
 
 fn apply_numeric_factor_options(native: &mut SpralSsidsOptions, numeric: &NumericFactorOptions) {
     native.action = numeric.action_on_zero_pivot;
-    // SPRAL's C API uses the same zero-based pivot-method numbering that
-    // IPOPT passes through in IpSpralSolverInterface.
+    // SPRAL's C API copies this value directly into the Fortran
+    // `ssids_options%pivot_method`, whose constants are 1-based:
+    // APP aggressive=1, APP block=2, TPP=3.
     native.pivot_method = match numeric.pivot_method {
-        PivotMethod::AggressiveAposteriori => 0,
-        PivotMethod::BlockAposteriori => 1,
-        PivotMethod::ThresholdPartial => 2,
+        PivotMethod::AggressiveAposteriori => 1,
+        PivotMethod::BlockAposteriori => 2,
+        PivotMethod::ThresholdPartial => 3,
     };
     native.small = numeric.small_pivot_tolerance;
     native.u = numeric.threshold_pivot_u;

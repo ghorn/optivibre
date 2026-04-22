@@ -42,6 +42,7 @@ present, only diagnostics and exact regression promotion are allowed.
 | --- | --- | --- |
 | Ordering, postorder, supernodes, row lists | SPRAL SSIDS analyse source | None for exact evidence unless the test is explicitly about Rust-only `Auto` ordering. |
 | Matching ordering/scaling bridge | SPRAL SSIDS analyse source and IPOPT `IpSpralSolverInterface.cpp` | None for native-SPRAL parity profile. |
+| Native SPRAL C option bridge, including `pivot_method` | `interfaces/C/ssids.f90`, `src/ssids/datatypes.f90`, `src/ssids/cpu/cpu_iface.f90` | None. The C `spral_ssids_options%pivot_method` is copied into Fortran `ssids_options%pivot_method`, whose APP aggressive/block/TPP constants are `1/2/3`. |
 | APP/TPP pivot choice, delayed pivots, failed pivots | SPRAL SSIDS numeric factor source | None. Preserve the ladder: factorization outcome, inertia, pivot stats, solve outcome, solution bits. |
 | Dot/update/FMA order, signed zero, solve order | SPRAL SSIDS solve and update source | None for bitwise witnesses. |
 | Inertia reporting | SPRAL SSIDS inform/enquiry source | None; compare reported inertia and native enquiry data before accepting solve-bit changes. |

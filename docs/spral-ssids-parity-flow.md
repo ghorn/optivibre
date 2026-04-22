@@ -7,13 +7,19 @@ known narrowed boundary. Red nodes are the next open bitwise mismatch target.
 
 Current newly passing witness:
 `dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now also
-checks the seed09 first-panel `apply_pivot<OP_N>` output with SPRAL's APP
-leading dimension, `lda=align_lda(55)`. The L block handed to the accepted APP
-update matches native SPRAL bitwise. The full production inverse-D guard still
-first differs at flattened index 75, so the open issue is outside the isolated
-APP-stride apply-pivot, accepted update, and TPP tail kernels.
+checks that Rust production inverse-D storage for the dense seed09 tail matches
+the isolated TPP tail D entries after converting SPRAL's internal 2x2 marker
+layout to enquiry layout. The full native-production inverse-D guard still
+first differs at flattened index 75, so the open issue is outside Rust
+production D storage for the isolated APP-stride tail.
 
 Previous newly passing witness:
+`dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` checked the
+seed09 first-panel `apply_pivot<OP_N>` output with SPRAL's APP leading
+dimension, `lda=align_lda(55)`. The L block handed to the accepted APP update
+matched native SPRAL bitwise.
+
+Earlier passing witness:
 `dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` checked the
 post-APP 23x23 TPP tail with SPRAL's native APP leading dimensions:
 `lda=align_lda(55)` for the tail matrix and `ldld=align_lda(32)` for
@@ -83,7 +89,8 @@ flowchart TD
     K4a --> K4e["Dense seed09 APP-stride apply_pivot OP_N L bits"]
     K4e --> K4c["Dense seed09 isolated APP update + TPP tail kernels"]
     K4c --> K4d["Dense seed09 APP-stride TPP tail D bits"]
-    K4d --> K4b["Dense APP case0 full inverse-D bits"]
+    K4d --> K4f["Dense seed09 Rust production tail D storage"]
+    K4f --> K4b["Dense APP case0 full inverse-D bits"]
     K4b --> K4["Dense APP boundary case0 solution bits"]
     J --> K
     K1 --> L{"More fronts?"}
@@ -104,8 +111,8 @@ flowchart TD
     classDef open fill:#ffd8d8,stroke:#b43b3b,color:#2b0d0d,stroke-width:2px;
 
     class A,B,B1,B2,B3,G0,G1,G3,G5,G6,G8,G8a,G8b,G9,H1,H2,H3,K1,M,O,P,Q,R match;
-    class I0,K4e newly;
+    class K4f newly;
     class C,D,E,F,G,G2,G4,G7,G10,H,I,J,K,L,N partial;
-    class G8c,G8d,G9a,I1,I2,I3,K2,K3,K4a,K4c,K4d match;
+    class G8c,G8d,G9a,I0,I1,I2,I3,K2,K3,K4a,K4c,K4d,K4e match;
     class K4b,K4 open;
 ```
