@@ -4653,9 +4653,12 @@ mod tests {
         APP_INNER_BLOCK_SIZE, DenseTppTailRequest, DenseUpdateBounds, FactorBlockRecord,
         NativeOrdering, NativeSpral, NumericFactorOptions, OrderingStrategy, PanelFactorStats,
         SolvePanel, SsidsError, SsidsOptions, SymmetricCscMatrix, analyse,
+        app_adjust_passed_prefix, app_apply_accepted_prefix_update,
         app_apply_block_pivots_to_trailing_rows, app_build_ld_workspace,
-        app_solve_block_triangular_to_trailing_rows, app_two_by_two_inverse, app_update_one_by_one,
-        app_update_two_by_two, build_symbolic_front_tree, dense_find_maxloc, dense_lower_offset,
+        app_first_failed_trailing_column, app_restore_trailing_from_block_backup,
+        app_solve_block_triangular_to_trailing_rows, app_truncate_records_to_prefix,
+        app_two_by_two_inverse, app_update_one_by_one, app_update_two_by_two,
+        build_symbolic_front_tree, dense_find_maxloc, dense_lower_offset,
         dense_symmetric_swap_with_workspace, expand_symmetric_pattern, factor_one_by_one_common,
         factor_two_by_two_common, factorize, factorize_dense_front,
         factorize_dense_tpp_tail_in_place, native_column_counts, native_postorder_permutation,
@@ -4726,6 +4729,17 @@ mod tests {
     type HostTrsvLowerUnitFn = unsafe extern "C" fn(c_int, *const f64, c_int, *mut f64);
     type GemvSolveUpdateFn =
         unsafe extern "C" fn(c_int, c_int, *const f64, c_int, *const f64, *mut f64);
+    type HostGemmOpNOpTUpdateFn = unsafe extern "C" fn(
+        c_int,
+        c_int,
+        c_int,
+        *const f64,
+        c_int,
+        *const f64,
+        c_int,
+        *mut f64,
+        c_int,
+    );
     type LdltAppSolveFn =
         unsafe extern "C" fn(c_int, c_int, *const f64, c_int, c_int, *mut f64, c_int);
     type LdltAppSolveDiagFn = unsafe extern "C" fn(c_int, *const f64, c_int, *mut f64, c_int);
@@ -4811,6 +4825,7 @@ mod tests {
         host_trsv_lower_unit_op_t: HostTrsvLowerUnitFn,
         gemv_op_n_solve_update: GemvSolveUpdateFn,
         gemv_op_t_solve_update: GemvSolveUpdateFn,
+        host_gemm_op_n_op_t_update: HostGemmOpNOpTUpdateFn,
         ldlt_app_solve_fwd: LdltAppSolveFn,
         ldlt_app_solve_diag: LdltAppSolveDiagFn,
         ldlt_app_solve_bwd: LdltAppSolveFn,
@@ -4970,6 +4985,13 @@ mod tests {
                 .get::<GemvSolveUpdateFn>(b"spral_kernel_gemv_op_t_solve_update\0")
                 .map_err(|error| format!("failed to load gemv OP_T solve update shim: {error}"))?
         };
+        let host_gemm_op_n_op_t_update = unsafe {
+            *library
+                .get::<HostGemmOpNOpTUpdateFn>(b"spral_kernel_host_gemm_op_n_op_t_update\0")
+                .map_err(|error| {
+                    format!("failed to load host_gemm OP_N/OP_T update shim: {error}")
+                })?
+        };
         let ldlt_app_solve_fwd = unsafe {
             *library
                 .get::<LdltAppSolveFn>(b"spral_kernel_ldlt_app_solve_fwd\0")
@@ -5053,6 +5075,7 @@ mod tests {
             host_trsv_lower_unit_op_t,
             gemv_op_n_solve_update,
             gemv_op_t_solve_update,
+            host_gemm_op_n_op_t_update,
             ldlt_app_solve_fwd,
             ldlt_app_solve_diag,
             ldlt_app_solve_bwd,
@@ -5186,6 +5209,15 @@ extern "C" void spral_kernel_gemv_op_t_solve_update(
    spral::ssids::cpu::gemv<double>(
          spral::ssids::cpu::OP_T,
          m, n, -1.0, a, lda, x, 1, 1.0, y, 1);
+}
+
+extern "C" void spral_kernel_host_gemm_op_n_op_t_update(
+      int m, int n, int k, const double* a, int lda,
+      const double* b, int ldb, double* c, int ldc) {
+   spral::ssids::cpu::host_gemm<double>(
+         spral::ssids::cpu::OP_N,
+         spral::ssids::cpu::OP_T,
+         m, n, k, -1.0, a, lda, b, ldb, 1.0, c, ldc);
 }
 
 extern "C" void spral_kernel_ldlt_app_solve_fwd(
@@ -9142,5 +9174,259 @@ extern "C" int spral_kernel_block_prefix_trace_32(
                 rust_bits[index], native_bits[index]
             );
         }
+    }
+
+    #[test]
+    fn dense_seed09_first_app_update_and_tail_tpp_match_native_kernels() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let (dimension, dense) = dense_seed09_case0_matrix();
+        let mut rows = (0..dimension).collect::<Vec<_>>();
+        let mut lower_dense = vec![0.0; dimension * dimension];
+        for col in 0..dimension {
+            for row in col..dimension {
+                lower_dense[dense_lower_offset(dimension, row, col)] = dense[row][col];
+            }
+        }
+        let options = NumericFactorOptions::default();
+        let mut scratch = vec![0.0; dimension * dimension];
+        let block_start = 0;
+        let block_end = APP_INNER_BLOCK_SIZE;
+        let rows_before_block = rows.clone();
+        let dense_before_block = lower_dense.clone();
+        let mut local_stats = PanelFactorStats::default();
+        let mut local_blocks = Vec::new();
+        let mut block_pivot = block_start;
+
+        while block_pivot < block_end {
+            let Some((best_abs, best_row, best_col)) =
+                dense_find_maxloc(&lower_dense, dimension, block_pivot, block_end)
+            else {
+                break;
+            };
+            assert!(best_abs >= options.small_pivot_tolerance);
+            if best_row == best_col {
+                if best_col != block_pivot {
+                    dense_symmetric_swap_with_workspace(
+                        &mut lower_dense,
+                        dimension,
+                        best_col,
+                        block_pivot,
+                        &mut scratch,
+                    );
+                    rows.swap(best_col, block_pivot);
+                }
+                let block = factor_one_by_one_common(
+                    &rows,
+                    &mut lower_dense,
+                    dimension,
+                    block_pivot,
+                    block_end,
+                    &mut local_stats,
+                    &mut scratch,
+                )
+                .expect("1x1 APP pivot");
+                local_blocks.push(block);
+                block_pivot += 1;
+                continue;
+            }
+
+            let first = best_col;
+            let mut second = best_row;
+            let a11 = lower_dense[dense_lower_offset(dimension, first, first)];
+            let a22 = lower_dense[dense_lower_offset(dimension, second, second)];
+            let a21 = lower_dense[dense_lower_offset(dimension, second, first)];
+            let mut two_by_two_inverse = None;
+            let mut one_by_one_index = None;
+            if let Some(inverse) =
+                app_two_by_two_inverse(a11, a21, a22, options.small_pivot_tolerance)
+            {
+                two_by_two_inverse = Some(inverse);
+            } else if a11.abs() > a22.abs() {
+                if (a11 / a21).abs() >= options.threshold_pivot_u {
+                    one_by_one_index = Some(first);
+                }
+            } else if (a22 / a21).abs() >= options.threshold_pivot_u {
+                one_by_one_index = Some(second);
+            }
+
+            if let Some(index) = one_by_one_index {
+                if index != block_pivot {
+                    dense_symmetric_swap_with_workspace(
+                        &mut lower_dense,
+                        dimension,
+                        index,
+                        block_pivot,
+                        &mut scratch,
+                    );
+                    rows.swap(index, block_pivot);
+                }
+                let block = factor_one_by_one_common(
+                    &rows,
+                    &mut lower_dense,
+                    dimension,
+                    block_pivot,
+                    block_end,
+                    &mut local_stats,
+                    &mut scratch,
+                )
+                .expect("1x1 APP pivot");
+                local_blocks.push(block);
+                block_pivot += 1;
+                continue;
+            }
+
+            let Some(inverse) = two_by_two_inverse else {
+                break;
+            };
+            if first != block_pivot {
+                dense_symmetric_swap_with_workspace(
+                    &mut lower_dense,
+                    dimension,
+                    first,
+                    block_pivot,
+                    &mut scratch,
+                );
+                rows.swap(first, block_pivot);
+                if second == block_pivot {
+                    second = first;
+                }
+            }
+            if second != block_pivot + 1 {
+                dense_symmetric_swap_with_workspace(
+                    &mut lower_dense,
+                    dimension,
+                    second,
+                    block_pivot + 1,
+                    &mut scratch,
+                );
+                rows.swap(second, block_pivot + 1);
+            }
+            let block = factor_two_by_two_common(
+                &rows,
+                &mut lower_dense,
+                DenseUpdateBounds {
+                    size: dimension,
+                    update_end: block_end,
+                },
+                block_pivot,
+                inverse,
+                &mut local_stats,
+                &mut scratch,
+            )
+            .expect("2x2 APP pivot");
+            local_blocks.push(block);
+            block_pivot += 2;
+        }
+
+        app_apply_block_pivots_to_trailing_rows(
+            &mut lower_dense,
+            dimension,
+            block_start,
+            block_end,
+            &local_blocks,
+            options.small_pivot_tolerance,
+            false,
+        );
+        let first_failed = app_first_failed_trailing_column(
+            &lower_dense,
+            dimension,
+            block_start,
+            block_end,
+            options.threshold_pivot_u,
+        );
+        let local_passed = app_adjust_passed_prefix(&local_blocks, first_failed - block_start);
+        let accepted_end = block_start + local_passed;
+        let accepted_blocks = app_truncate_records_to_prefix(&local_blocks, local_passed);
+        assert_eq!(accepted_end, APP_INNER_BLOCK_SIZE);
+        app_restore_trailing_from_block_backup(
+            &rows,
+            &rows_before_block,
+            &mut lower_dense,
+            &dense_before_block,
+            dimension,
+            accepted_end,
+        );
+        let restored_lower_dense = lower_dense.clone();
+        let tail_size = dimension - accepted_end;
+        app_apply_accepted_prefix_update(
+            &mut lower_dense,
+            dimension,
+            block_start,
+            accepted_end,
+            &accepted_blocks,
+        );
+
+        let native_lda = native_aligned_double_stride(shim, dimension);
+        let native_ldld = native_aligned_double_stride(shim, APP_INNER_BLOCK_SIZE);
+        let mut l_block = vec![0.0; accepted_end * native_lda];
+        for col in 0..accepted_end {
+            for row in 0..tail_size {
+                l_block[col * native_lda + row] = lower_dense[col * dimension + accepted_end + row];
+            }
+        }
+        let diagonal = dense_tpp_diagonal_from_blocks(&accepted_blocks, accepted_end);
+        let mut ld_block = vec![0.0; accepted_end * native_ldld];
+        unsafe {
+            (shim.calc_ld_op_n)(
+                tail_size as c_int,
+                accepted_end as c_int,
+                l_block.as_ptr(),
+                native_lda as c_int,
+                diagonal.as_ptr(),
+                ld_block.as_mut_ptr(),
+                native_ldld as c_int,
+            );
+        }
+        let mut native_tail_update = vec![0.0; tail_size * native_lda];
+        for col in 0..tail_size {
+            for row in col..tail_size {
+                native_tail_update[col * native_lda + row] =
+                    restored_lower_dense[(accepted_end + col) * dimension + accepted_end + row];
+            }
+        }
+        unsafe {
+            (shim.host_gemm_op_n_op_t_update)(
+                tail_size as c_int,
+                tail_size as c_int,
+                accepted_end as c_int,
+                ld_block.as_ptr(),
+                native_ldld as c_int,
+                l_block.as_ptr(),
+                native_lda as c_int,
+                native_tail_update.as_mut_ptr(),
+                native_lda as c_int,
+            );
+        }
+        for col in 0..tail_size {
+            for row in col..tail_size {
+                let rust_value = lower_dense[(accepted_end + col) * dimension + accepted_end + row];
+                let native_value = native_tail_update[col * native_lda + row];
+                assert_eq!(
+                    rust_value.to_bits(),
+                    native_value.to_bits(),
+                    "dense seed09 accepted APP update mismatch row={row} col={col}"
+                );
+            }
+        }
+
+        let mut tail = vec![0.0; tail_size * tail_size];
+        for col in 0..tail_size {
+            for row in col..tail_size {
+                tail[col * tail_size + row] =
+                    lower_dense[(accepted_end + col) * dimension + accepted_end + row];
+            }
+        }
+
+        let rust = rust_ldlt_tpp_factor_from_lower_dense(&tail, tail_size, tail_size, options);
+        let native =
+            native_ldlt_tpp_factor_from_lower_dense(shim, &tail, tail_size, tail_size, options);
+        assert_dense_tpp_kernel_results_equal(
+            "dense seed09 tail after first APP block",
+            &rust,
+            &native,
+            tail_size,
+        );
     }
 }
