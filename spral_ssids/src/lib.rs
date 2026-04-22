@@ -9984,6 +9984,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         let second_work = fma_pivot_snapshot.workspace
             [(multiplier_col + 1) * APP_INNER_BLOCK_SIZE + multiplier_row];
         let reconstructed_first_multiplier = d21.mul_add(second_work, d11 * first_work);
+        let source_first_multiplier = d11 * first_work + d21 * second_work;
         let trace_first_multiplier =
             fma_pivot_snapshot.matrix[multiplier_col * APP_INNER_BLOCK_SIZE + multiplier_row];
         let native_block_first_multiplier =
@@ -9996,9 +9997,14 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         assert_eq!(
             (
                 trace_first_multiplier.to_bits(),
+                source_first_multiplier.to_bits(),
                 native_block_first_multiplier.to_bits()
             ),
-            (0xbf8c_bfa8_da67_4b6b, 0xbf8c_bfa8_da67_4b6c),
+            (
+                0xbf8c_bfa8_da67_4b6b,
+                0xbf8c_bfa8_da67_4b6c,
+                0xbf8c_bfa8_da67_4b6c,
+            ),
             "dense seed09 FMA pivot-19 first-row multiplier boundary moved"
         );
         assert_eq!(

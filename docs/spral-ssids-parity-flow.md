@@ -7,7 +7,16 @@ Orange nodes have partial coverage or a known narrowed boundary. Gold-orange
 nodes are newly passing guards that narrow an open mismatch without proving full
 bitwise parity. Red nodes are the next open bitwise mismatch target.
 
-Current newly passing metadata witness:
+Current newly narrowed witness:
+`dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now pins the
+row 30, col 19 native-wrapper bit to the source-shaped first-row 2x2 multiplier
+expression at pivot 19. For the snapshot row 31 operands, the explicit FMA
+form gives `0xbf8cbfa8da674b6b`, while the source expression
+`d11*work + d21*work2` gives `0xbf8cbfa8da674b6c`, matching native
+`block_ldlt<32>` final storage. This explains the one-ulp wrapper bit at this
+boundary without invoking a trailing `update_2x2` entry.
+
+Previous newly passing metadata witness:
 `dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now also
 maps the FMA continuation row 30, col 19 matrix gap back through APP-local
 permutations. Final row 30 maps to snapshot row 31 at the `from=19, status=2,
@@ -246,7 +255,8 @@ flowchart TD
     I0q --> I0n["Dense seed09 FMA native trace-vs-wrapper APP permutation and D"]
     I0n --> I0m["Dense seed09 continuation pivot metadata"]
     I0m --> I0x["Dense seed09 FMA pivot19 multiplier source row31"]
-    I0x --> I0c["Dense seed09 FMA continuation to row30/col19 matrix gap"]
+    I0x --> I0y["Dense seed09 pivot19 source expression matches wrapper bit"]
+    I0y --> I0c["Dense seed09 FMA continuation to row30/col19 matrix gap"]
     I0c --> I0d["Dense seed09 FMA native trace-vs-wrapper APP matrix gap"]
     I0d --> I0t["Dense seed09 source-shaped APP host_trsm gap"]
     I0t --> I0b["Dense seed09 source-shaped APP post-apply operand gap"]
@@ -297,7 +307,7 @@ flowchart TD
     class I0p,I0r match;
     class I0s partial;
     class I0m newly;
-    class I0x newlyPartial;
+    class I0x,I0y newlyPartial;
     class I0q,I0c newlyPartial;
     class I0n match;
     class I0d partial;
