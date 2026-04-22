@@ -9548,6 +9548,74 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
     }
 
     #[test]
+    fn dense_seed6_final_app_pivot_source_expression_matches_native_block() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let (dimension, lower_dense) = lower_dense_seed6_33();
+        let options = NumericFactorOptions::default();
+        let native_lda = native_aligned_double_stride(shim, dimension);
+        let native_trace =
+            native_block_prefix_trace_32(shim, &lower_dense, dimension, native_lda, options);
+        let native_block = native_block_ldlt_32_from_lower_dense(
+            shim,
+            &lower_dense,
+            dimension,
+            native_lda,
+            options,
+        );
+
+        let fma_pivot_snapshot = native_trace
+            .iter()
+            .find(|snapshot| snapshot.step == 14 && snapshot.from == 28 && snapshot.status == 2)
+            .expect("dense seed6 FMA pivot-28 snapshot");
+        let multiplier_col = fma_pivot_snapshot.from;
+        let final_multiplier_row = 30;
+        let final_multiplier_source = native_block.local_perm[final_multiplier_row];
+        let multiplier_row = fma_pivot_snapshot
+            .local_perm
+            .iter()
+            .position(|&entry| entry == final_multiplier_source)
+            .expect("dense seed6 FMA pivot-28 final multiplier row source");
+        assert_eq!(
+            multiplier_row, 30,
+            "dense seed6 FMA pivot-28 source row moved"
+        );
+        assert_eq!(multiplier_col + 2, fma_pivot_snapshot.next);
+        assert!(multiplier_row >= fma_pivot_snapshot.next);
+        let d11 = fma_pivot_snapshot.diagonal[2 * multiplier_col];
+        let d21 = fma_pivot_snapshot.diagonal[2 * multiplier_col + 1];
+        let first_work =
+            fma_pivot_snapshot.workspace[multiplier_col * APP_INNER_BLOCK_SIZE + multiplier_row];
+        let second_work = fma_pivot_snapshot.workspace
+            [(multiplier_col + 1) * APP_INNER_BLOCK_SIZE + multiplier_row];
+        let reconstructed_first_multiplier = d21.mul_add(second_work, d11 * first_work);
+        let source_first_multiplier = d11 * first_work + d21 * second_work;
+        let trace_first_multiplier =
+            fma_pivot_snapshot.matrix[multiplier_col * APP_INNER_BLOCK_SIZE + multiplier_row];
+        let native_block_first_multiplier =
+            native_block.matrix[multiplier_col * native_lda + final_multiplier_row];
+        assert_eq!(
+            reconstructed_first_multiplier.to_bits(),
+            trace_first_multiplier.to_bits(),
+            "dense seed6 FMA pivot-28 first-row multiplier reconstruction moved"
+        );
+        assert_eq!(
+            (
+                trace_first_multiplier.to_bits(),
+                source_first_multiplier.to_bits(),
+                native_block_first_multiplier.to_bits()
+            ),
+            (
+                0xbf81_6117_c4f8_272d,
+                0xbf81_6117_c4f8_2730,
+                0xbf81_6117_c4f8_2730,
+            ),
+            "dense seed6 FMA pivot-28 first-row multiplier boundary moved"
+        );
+    }
+
+    #[test]
     #[ignore = "manual native-vs-rust production APP acceptance/storage witness after matching block_ldlt<32> prefix"]
     fn app_block_ldlt_32_matches_native_dense_seed6_prefix() {
         let Some(shim) = native_kernel_shim_or_skip() else {

@@ -46,6 +46,20 @@ stack reports OpenBLAS `0.3.32 DYNAMIC_ARCH ... neoversen1`, whose arm64
 dtrsm.
 
 Current newly narrowed solve-lane witness:
+`dense_seed6_final_app_pivot_source_expression_matches_native_block` now
+reconstructs the final seed6 2x2 APP pivot multiplier from the native prefix
+snapshot operands at `step=14, from=28`. The FMA-shaped continuation expression
+lands on `0xbf816117c4f8272d`, while the source-spelled
+`d11*work[r] + d21*work[32+r]` expression lands on `0xbf816117c4f82730`,
+matching the full native `block_ldlt<32>` block at row 30, col 28. This
+narrows the remaining seed6 storage gap to the full native optimized
+`block_ldlt<32>` source expression at the final 2x2 APP pivot; it is still not
+a production fix or full solution-bit parity. The source anchor is SPRAL
+`target/native/spral-upstream/src/ssids/cpu/kernels/block_ldlt.hxx`
+`block_ldlt<T, BLOCK_SIZE>`'s 2x2 multiplier loop, reached from
+`target/native/spral-upstream/src/ssids/cpu/kernels/ldlt_app.cxx`.
+
+Previous newly narrowed solve-lane witness:
 `dense_seed6_native_block_continuation_diverges_at_l_storage_gap` now re-enters
 native `block_ldlt<32>` from seed6 native prefix-trace snapshots. The first
 native continuation mismatch is the same L-storage gap as the Rust/native final
@@ -393,7 +407,8 @@ flowchart TD
     K2 --> K3["Seed6 full inverse-D bits"]
     K3 --> K3b["Seed6 APP block final L storage after matching prefix trace"]
     K3b --> K3c["Seed6 native APP continuation reproduces L-storage gap"]
-    K3c --> K3a["Seed6 full solution bits after matching D"]
+    K3c --> K3d["Seed6 final 2x2 APP source expression matches native L bit"]
+    K3d --> K3a["Seed6 full solution bits after matching D"]
     K --> K4a["Dense APP case0 prefix inverse-D bits through 74"]
     K4a --> K4e["Dense seed09 APP-stride apply_pivot OP_N L bits"]
     K4e --> K4c["Dense seed09 isolated APP update + TPP tail kernels"]
@@ -447,7 +462,7 @@ flowchart TD
     class K4k partial;
     class C,D,E,F,G,G2,G4,G7,G10,H,I,J,K,L,N partial;
     class O0,O1 newlyPartial;
-    class K3a,K3b,K3c newlyPartial;
+    class K3a,K3b,K3c,K3d newlyPartial;
     class K4l newlyPartial;
     class G8c,G8d,G9a,I00,I0,I0a,I1,I2,I3,K2,K3,K4a,K4c,K4d,K4e,K4f,K4g,K4h,K4i match;
     class K4b,K4,S open;
