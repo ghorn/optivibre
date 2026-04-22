@@ -1970,7 +1970,9 @@ fn app_two_by_two_inverse(a11: f64, a21: f64, a22: f64, small: f64) -> Option<(f
         return None;
     }
     let detscale = 1.0 / a21.abs();
-    let det = (a11 * detscale) * a22 - a21.abs();
+    // The local SPRAL block_ldlt<32> APP kernel contracts test_2x2's
+    // determinant expression inside the optimized full-block path.
+    let det = (a11 * detscale).mul_add(a22, -a21.abs());
     if !det.is_finite() || det.abs() < a21.abs() / 2.0 {
         return None;
     }
@@ -4877,6 +4879,7 @@ mod tests {
         block_swap_cols_32: BlockSwapColsFn,
         block_find_maxloc_32: BlockFindMaxlocFn,
         block_test_2x2: BlockTest2x2Fn,
+        block_test_2x2_full_block_codegen: BlockTest2x2Fn,
         block_two_by_two_multipliers: BlockTwoByTwoMultipliersFn,
         block_first_step_32: BlockFirstStep32Fn,
         block_prefix_trace_32: BlockPrefixTrace32Fn,
@@ -5099,6 +5102,13 @@ mod tests {
                 .get::<BlockTest2x2Fn>(b"spral_kernel_block_test_2x2\0")
                 .map_err(|error| format!("failed to load block_test_2x2 shim: {error}"))?
         };
+        let block_test_2x2_full_block_codegen = unsafe {
+            *library
+                .get::<BlockTest2x2Fn>(b"spral_kernel_block_test_2x2_full_block_codegen\0")
+                .map_err(|error| {
+                    format!("failed to load full-block-codegen block_test_2x2 shim: {error}")
+                })?
+        };
         let block_two_by_two_multipliers = unsafe {
             *library
                 .get::<BlockTwoByTwoMultipliersFn>(b"spral_kernel_block_two_by_two_multipliers\0")
@@ -5164,6 +5174,7 @@ mod tests {
             block_swap_cols_32,
             block_find_maxloc_32,
             block_test_2x2,
+            block_test_2x2_full_block_codegen,
             block_two_by_two_multipliers,
             block_first_step_32,
             block_prefix_trace_32,
@@ -5251,6 +5262,19 @@ extern "C" int spral_kernel_check_threshold_op_n(
       if(fabs(aval[j*lda+i]) > 1.0/u)
          return j;
    return cto;
+}
+
+static bool spral_kernel_block_test_2x2_full_block_codegen_impl(
+      double a11, double a21, double a22, double* detpiv, double* detscale) {
+   *detscale = 1.0/fabs(a21);
+   *detpiv = std::fma(a11*(*detscale), a22, -fabs(a21));
+   return fabs(*detpiv) >= fabs(a21)/2;
+}
+
+extern "C" int spral_kernel_block_test_2x2_full_block_codegen(
+      double a11, double a21, double a22, double* detpiv, double* detscale) {
+   return spral_kernel_block_test_2x2_full_block_codegen_impl(
+         a11, a21, a22, detpiv, detscale) ? 1 : 0;
 }
 
 extern "C" void spral_kernel_calc_ld_op_n(
@@ -5429,7 +5453,7 @@ extern "C" int spral_kernel_block_first_step_32(
       a11 = a[m*lda+m];
       a22 = a[t*lda+t];
       a21 = a[m*lda+t];
-      if(test_2x2<double>(a11, a21, a22, detpiv, detscale)) {
+      if(spral_kernel_block_test_2x2_full_block_codegen_impl(a11, a21, a22, &detpiv, &detscale)) {
          pivsiz = 2;
       } else {
          if(fabs(a11) > fabs(a22)) {
@@ -5562,7 +5586,7 @@ static int spral_kernel_block_prefix_trace_32_impl(
          a11 = a[m*lda+m];
          a22 = a[t*lda+t];
          a21 = a[m*lda+t];
-         if(test_2x2<double>(a11, a21, a22, detpiv, detscale)) {
+         if(spral_kernel_block_test_2x2_full_block_codegen_impl(a11, a21, a22, &detpiv, &detscale)) {
             pivsiz = 2;
          } else {
             if(fabs(a11) > fabs(a22)) {
@@ -6423,6 +6447,50 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             )
         } != 0;
         (accepted, detpiv, detscale)
+    }
+
+    fn native_block_test_2x2_full_block_codegen(
+        shim: &NativeKernelShim,
+        a11: f64,
+        a21: f64,
+        a22: f64,
+    ) -> (bool, f64, f64) {
+        let mut detpiv = 0.0;
+        let mut detscale = 0.0;
+        let accepted = unsafe {
+            (shim.block_test_2x2_full_block_codegen)(
+                a11,
+                a21,
+                a22,
+                &mut detpiv as *mut f64,
+                &mut detscale as *mut f64,
+            )
+        } != 0;
+        (accepted, detpiv, detscale)
+    }
+
+    fn app_two_by_two_inverse_source_test_2x2(
+        a11: f64,
+        a21: f64,
+        a22: f64,
+        small: f64,
+    ) -> Option<(f64, f64, f64)> {
+        if !a11.is_finite() || !a21.is_finite() || !a22.is_finite() || a21.abs() < small {
+            return None;
+        }
+        let detscale = 1.0 / a21.abs();
+        let det = (a11 * detscale) * a22 - a21.abs();
+        if !det.is_finite() || det.abs() < a21.abs() / 2.0 {
+            return None;
+        }
+        let d11 = (a22 * detscale) / det;
+        let d21 = (-a21 * detscale) / det;
+        let d22 = (a11 * detscale) / det;
+        if d11.is_finite() && d21.is_finite() && d22.is_finite() {
+            Some((d11, d21, d22))
+        } else {
+            None
+        }
     }
 
     fn native_block_first_step_32(
@@ -8528,7 +8596,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
     }
 
     #[test]
-    fn app_block_test_2x2_matches_native_kernel_property_cases() {
+    fn app_block_source_test_2x2_matches_native_kernel_property_cases() {
         let Some(shim) = native_kernel_shim_or_skip() else {
             return;
         };
@@ -8552,12 +8620,12 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
 
                 let (native_accepted, native_detpiv, native_detscale) =
                     native_block_test_2x2(shim, a11, a21, a22);
-                let rust_inverse = app_two_by_two_inverse(a11, a21, a22, 0.0);
+                let rust_inverse = app_two_by_two_inverse_source_test_2x2(a11, a21, a22, 0.0);
 
                 prop_assert_eq!(
                     rust_inverse.is_some(),
                     native_accepted,
-                    "block_ldlt test_2x2 acceptance mismatch seed={:#x} a11={:?} a21={:?} a22={:?} native_detpiv={:?} native_detscale={:?}",
+                    "block_ldlt source test_2x2 acceptance mismatch seed={:#x} a11={:?} a21={:?} a22={:?} native_detpiv={:?} native_detscale={:?}",
                     seed ^ case_seed,
                     a11,
                     a21,
@@ -8574,7 +8642,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
                     prop_assert_eq!(
                         rust_inverse.0.to_bits(),
                         native_inverse.0.to_bits(),
-                        "block_ldlt 2x2 d11 mismatch seed={:#x} values=({:?}, {:?}, {:?}) native_detpiv={:?} native_detscale={:?}",
+                        "block_ldlt source 2x2 d11 mismatch seed={:#x} values=({:?}, {:?}, {:?}) native_detpiv={:?} native_detscale={:?}",
                         seed ^ case_seed,
                         a11,
                         a21,
@@ -8585,7 +8653,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
                     prop_assert_eq!(
                         rust_inverse.1.to_bits(),
                         native_inverse.1.to_bits(),
-                        "block_ldlt 2x2 d21 mismatch seed={:#x} values=({:?}, {:?}, {:?}) native_detpiv={:?} native_detscale={:?}",
+                        "block_ldlt source 2x2 d21 mismatch seed={:#x} values=({:?}, {:?}, {:?}) native_detpiv={:?} native_detscale={:?}",
                         seed ^ case_seed,
                         a11,
                         a21,
@@ -8596,7 +8664,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
                     prop_assert_eq!(
                         rust_inverse.2.to_bits(),
                         native_inverse.2.to_bits(),
-                        "block_ldlt 2x2 d22 mismatch seed={:#x} values=({:?}, {:?}, {:?}) native_detpiv={:?} native_detscale={:?}",
+                        "block_ldlt source 2x2 d22 mismatch seed={:#x} values=({:?}, {:?}, {:?}) native_detpiv={:?} native_detscale={:?}",
                         seed ^ case_seed,
                         a11,
                         a21,
@@ -8607,7 +8675,90 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
                 }
                 Ok(())
             })
-            .expect("block_ldlt test_2x2 kernel parity property failed");
+            .expect("block_ldlt source test_2x2 kernel parity property failed");
+    }
+
+    #[test]
+    fn app_block_full_codegen_test_2x2_matches_native_kernel_property_cases() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let cases = env_usize("SPRAL_SSIDS_KERNEL_PARITY_CASES", 512);
+        let seed = env_u64("SPRAL_SSIDS_KERNEL_PARITY_SEED", 0xb221_900d_0002);
+        let mut runner = deterministic_kernel_runner(cases, seed);
+
+        runner
+            .run(&any::<u64>(), |case_seed| {
+                let mut rng = DenseBoundaryRng::new(seed ^ case_seed);
+                let exponent = rng.usize_inclusive(0, 16) as i32 - 8;
+                let magnitude = 2.0_f64.powi(exponent);
+                let sign = if rng.next_u64() & 1 == 0 { 1.0 } else { -1.0 };
+                let signed_fraction = |rng: &mut DenseBoundaryRng| {
+                    let numerator = rng.usize_inclusive(0, 1024) as i32 - 512;
+                    magnitude * f64::from(numerator) / 512.0
+                };
+                let a11 = signed_fraction(&mut rng);
+                let a21 = sign * magnitude;
+                let a22 = signed_fraction(&mut rng);
+
+                let (native_accepted, native_detpiv, native_detscale) =
+                    native_block_test_2x2_full_block_codegen(shim, a11, a21, a22);
+                let rust_inverse = app_two_by_two_inverse(a11, a21, a22, 0.0);
+
+                prop_assert_eq!(
+                    rust_inverse.is_some(),
+                    native_accepted,
+                    "block_ldlt full-codegen test_2x2 acceptance mismatch seed={:#x} a11={:?} a21={:?} a22={:?} native_detpiv={:?} native_detscale={:?}",
+                    seed ^ case_seed,
+                    a11,
+                    a21,
+                    a22,
+                    native_detpiv,
+                    native_detscale
+                );
+                if let Some(rust_inverse) = rust_inverse {
+                    let native_inverse = (
+                        (a22 * native_detscale) / native_detpiv,
+                        (-a21 * native_detscale) / native_detpiv,
+                        (a11 * native_detscale) / native_detpiv,
+                    );
+                    prop_assert_eq!(
+                        rust_inverse.0.to_bits(),
+                        native_inverse.0.to_bits(),
+                        "block_ldlt full-codegen 2x2 d11 mismatch seed={:#x} values=({:?}, {:?}, {:?}) native_detpiv={:?} native_detscale={:?}",
+                        seed ^ case_seed,
+                        a11,
+                        a21,
+                        a22,
+                        native_detpiv,
+                        native_detscale
+                    );
+                    prop_assert_eq!(
+                        rust_inverse.1.to_bits(),
+                        native_inverse.1.to_bits(),
+                        "block_ldlt full-codegen 2x2 d21 mismatch seed={:#x} values=({:?}, {:?}, {:?}) native_detpiv={:?} native_detscale={:?}",
+                        seed ^ case_seed,
+                        a11,
+                        a21,
+                        a22,
+                        native_detpiv,
+                        native_detscale
+                    );
+                    prop_assert_eq!(
+                        rust_inverse.2.to_bits(),
+                        native_inverse.2.to_bits(),
+                        "block_ldlt full-codegen 2x2 d22 mismatch seed={:#x} values=({:?}, {:?}, {:?}) native_detpiv={:?} native_detscale={:?}",
+                        seed ^ case_seed,
+                        a11,
+                        a21,
+                        a22,
+                        native_detpiv,
+                        native_detscale
+                    );
+                }
+                Ok(())
+            })
+            .expect("block_ldlt full-codegen test_2x2 kernel parity property failed");
     }
 
     #[test]
@@ -9539,7 +9690,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
     }
 
     #[test]
-    fn app_block_ldlt_32_prefix_trace_matches_native_dense_seed1001_until_pivot19_scalar_tail() {
+    fn app_block_ldlt_32_prefix_trace_matches_native_dense_seed1001() {
         let Some(shim) = native_kernel_shim_or_skip() else {
             return;
         };
@@ -9551,24 +9702,13 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             native_block_prefix_trace_32(shim, &lower_dense, dimension, native_lda, options);
         assert_eq!(
             first_block_prefix_trace_mismatch(&rust_trace, &native_trace),
-            Some(BlockPrefixTraceMismatch {
-                step: 10,
-                from: 19,
-                status: 2,
-                next: 21,
-                component: "matrix",
-                index: 1011,
-                row: 31,
-                col: 19,
-                rust_bits: 0xbf88_7752_e268_8fa1,
-                native_bits: 0xbf88_7752_e268_8fa2,
-            }),
-            "dense seed1001 APP prefix trace boundary moved"
+            None,
+            "dense seed1001 APP prefix trace mismatch"
         );
     }
 
     #[test]
-    fn dense_seed1001_app_block_storage_diverges_at_native_pivot10_continuation() {
+    fn dense_seed1001_app_block_storage_matches_native() {
         let Some(shim) = native_kernel_shim_or_skip() else {
             return;
         };
@@ -9599,9 +9739,8 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
                 ))
             });
         assert_eq!(
-            first_diagonal_mismatch,
-            Some((20, 0xbf66_e810_015a_444c, 0xbf66_e810_015a_444d)),
-            "dense seed1001 APP block D boundary moved"
+            first_diagonal_mismatch, None,
+            "dense seed1001 APP block D mismatch"
         );
 
         let native_trace =
@@ -9614,19 +9753,8 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
                 native_lda,
                 options,
             ),
-            Some(BlockContinuationMismatch {
-                step: 5,
-                from: 10,
-                status: 2,
-                next: 12,
-                component: "diagonal",
-                index: 20,
-                row: 0,
-                col: 0,
-                continued_bits: 0xbf66_e810_015a_444c,
-                block_bits: 0xbf66_e810_015a_444d,
-            }),
-            "dense seed1001 native APP continuation boundary moved"
+            None,
+            "dense seed1001 native APP continuation mismatch"
         );
 
         let mut first_matrix_mismatch = None;
@@ -9641,9 +9769,8 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             }
         }
         assert_eq!(
-            first_matrix_mismatch,
-            Some((12, 10, 0xbfd6_74b1_4783_386b, 0xbfd6_74b1_4783_386c)),
-            "dense seed1001 APP block L-storage boundary moved"
+            first_matrix_mismatch, None,
+            "dense seed1001 APP block L-storage mismatch"
         );
     }
 
@@ -10065,7 +10192,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
     }
 
     #[test]
-    fn dense_seed1001_production_inverse_d_diverges_before_solve() {
+    fn dense_seed1001_production_inverse_d_matches_native() {
         let Some(native) = native_spral_or_skip() else {
             return;
         };
@@ -10112,13 +10239,8 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
                 .iter()
                 .zip(&native_d_bits)
                 .position(|(rust, native)| rust != native),
-            Some(20),
-            "dense seed1001 first production inverse-D mismatch moved"
-        );
-        assert_eq!(
-            (rust_d_bits[20], native_d_bits[20]),
-            (0xbf66_e810_015a_444c, 0xbf66_e810_015a_444d),
-            "dense seed1001 production inverse-D mismatch bits moved"
+            None,
+            "dense seed1001 production inverse-D mismatch"
         );
     }
 

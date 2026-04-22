@@ -53,8 +53,8 @@ for the narrow scalar tail. The second multiplier remains contracted, matching
 the local native build. This closes the active dense seed6 full solution
 witness and promotes dense seed09 case0 from ignored/manual to active full
 solution-bit parity. `cargo test -p spral_ssids --test bitwise_parity` now has
-8 active passing solution witnesses and 5 active remaining failures; seed6 and
-dense seed09 case0 both pass. The source anchor is SPRAL
+9 active passing solution witnesses and 4 active remaining failures; seed6,
+dense seed09 case0, and dense seed1001 all pass. The source anchor is SPRAL
 `target/native/spral-upstream/src/ssids/cpu/kernels/block_ldlt.hxx`
 `block_ldlt<T, BLOCK_SIZE>`'s 2x2 multiplier loop, reached from
 `target/native/spral-upstream/src/ssids/cpu/kernels/ldlt_app.cxx`.
@@ -67,22 +67,22 @@ is row 31, col 28: Rust/source-tail `0x3f66e35ec7827340` versus native full
 block `0x3f66e35ec782734a`. This keeps block storage colored partial while the
 seed6 full solution node is newly green.
 
-Current newly narrowed seed1001 witness:
-`dense_seed1001_production_inverse_d_diverges_before_solve` shows the active
-33x33 seed1001 solution failure is already present in production inverse-D, not
-introduced by the solve phase. Factor outcome, inertia, pivot counts, and pivot
-order match native; the first inverse-D mismatch is flattened index 20, i.e.
-pivot 10 component 0: Rust `0xbf66e810015a444c` versus native
-`0xbf66e810015a444d`.
-`dense_seed1001_app_block_storage_diverges_at_native_pivot10_continuation`
-then pins that same one-ulp D gap inside the first native `block_ldlt<32>` APP
-panel. Re-entering native from the prefix trace first differs at `step=5,
-from=10, status=2, next=12`, diagonal index 20 with continued
-`0xbf66e810015a444c` versus full native block `0xbf66e810015a444d`; the first
-final L-storage gap is row 12, col 10 with Rust `0xbfd674b14783386b` versus
-native `0xbfd674b14783386c`. The source anchor is SPRAL
+Current newly passing seed1001 witness:
+`app_block_ldlt_32_prefix_trace_matches_native_dense_seed1001`,
+`dense_seed1001_app_block_storage_matches_native`, and
+`dense_seed1001_production_inverse_d_matches_native` now assert bitwise equality
+through the seed1001 APP prefix trace, final APP block storage, and production
+inverse-D. The active full-solution guard
+`rust_and_native_spral_match_dense_seed_1001_33x33_solution_bits` now passes.
+The closed one-ulp pivot-10 D gap was caused by `block_ldlt<32>` contracting
+`test_2x2`'s determinant expression:
+`(a11*detscale)*a22 - fabs(a21)`. Rust now mirrors that full-block codegen with
+a fused multiply-add in the APP 2x2 inverse path. The source `test_2x2` helper
+and the full-block-codegen determinant guard are tracked separately so the
+standalone source-function parity guard cannot hide production APP behavior.
+The source anchor remains SPRAL
 `target/native/spral-upstream/src/ssids/cpu/kernels/block_ldlt.hxx`
-`block_ldlt<T, BLOCK_SIZE>`, reached from
+`block_ldlt<T, BLOCK_SIZE>` / `test_2x2`, reached from
 `target/native/spral-upstream/src/ssids/cpu/kernels/ldlt_app.cxx`.
 
 Previous newly narrowed solve-lane witness:
@@ -307,13 +307,12 @@ case0 no longer represents the open APP boundary solve mismatch.
 
 Current open guard witnesses:
 The remaining active full-solution parity failures are
-`rust_and_native_spral_match_dense_seed_1001_33x33_solution_bits`,
 `rust_and_native_spral_match_app_blocked_update_65x65_solution_bits`,
 `rust_and_native_spral_match_app_width_one_update_96x96_solution_bits`,
 `rust_and_native_spral_match_app_prefix_dtrsv_97x97_solution_bits`, and
 `rust_and_native_spral_match_dense_seed_706172697479_case58_solution_bits`.
-These keep the production solution-bit node red while the seed6 and dense
-seed09 case0 solution witnesses are newly green.
+These keep the production solution-bit node red while the seed6, dense seed09
+case0, and dense seed1001 solution witnesses are newly green.
 
 ```mermaid
 flowchart TD
@@ -344,7 +343,8 @@ flowchart TD
     G4 --> G5["update_1x1 trailing block"]
 
     G2 -->|"2x2"| G6["test_2x2"]
-    G6 --> G7["swap_cols twice"]
+    G6 --> G6a["block_ldlt APP determinant contraction"]
+    G6a --> G7["swap_cols twice"]
     G7 --> G8["compute 2x2 inverse / multipliers"]
     G8 --> G8c["block_ldlt 2x2 first multiplier vector/scalar split"]
     G8c --> G8d["block_ldlt optimized 2x2 second multiplier contraction"]
@@ -403,9 +403,9 @@ flowchart TD
     K4j --> K4k["Dense seed09 inverse-D mismatch map is empty"]
     K4k --> K4b["Dense APP case0 full inverse-D bits"]
     K4b --> K4["Dense APP boundary case0 solution bits"]
-    K --> K5a["Dense seed1001 APP prefix trace reaches pivot19 scalar-tail boundary"]
-    K5a --> K5b["Dense seed1001 native APP continuation D gap at pivot10"]
-    K5b --> K5c["Dense seed1001 production inverse-D first gap"]
+    K --> K5a["Dense seed1001 APP prefix trace bits"]
+    K5a --> K5b["Dense seed1001 APP block storage bits"]
+    K5b --> K5c["Dense seed1001 production inverse-D bits"]
     K5c --> K5["Dense seed1001 solution bits"]
     J --> K
     K1 --> L{"More fronts?"}
@@ -452,8 +452,8 @@ flowchart TD
     class K3b,K3c newlyPartial;
     class K3a,K3d newly;
     class K4l newly;
-    class K5a,K5b,K5c newlyPartial;
+    class G6a,K5a,K5b,K5c,K5 newly;
     class G8c,G8d,G9a,I00,I0,I0a,I1,I2,I3,K2,K3,K4a,K4c,K4d,K4e,K4f,K4g,K4h,K4i match;
     class K4b,K4 newly;
-    class K5,S open;
+    class S open;
 ```
