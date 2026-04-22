@@ -8408,6 +8408,14 @@ extern "C" int spral_kernel_block_prefix_trace_32(
         entries
     }
 
+    fn inverse_diagonal_bits(entries: &[[f64; 2]]) -> Vec<u64> {
+        entries
+            .iter()
+            .flatten()
+            .map(|value| value.to_bits())
+            .collect()
+    }
+
     #[test]
     fn app_block_ldlt_32_prefix_trace_matches_native_dense_seed6() {
         let Some(shim) = native_kernel_shim_or_skip() else {
@@ -8518,6 +8526,45 @@ extern "C" int spral_kernel_block_prefix_trace_32(
     }
 
     #[test]
+    fn dense_seed6_production_app_prefix_inverse_d_matches_native() {
+        let Ok(native) = NativeSpral::load() else {
+            return;
+        };
+        let (dimension, dense) = dense_seed6_33_matrix();
+        let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+        let matrix = SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
+            .expect("valid CSC");
+        let options = NumericFactorOptions::default();
+
+        let (symbolic, _) = analyse(
+            matrix,
+            &SsidsOptions {
+                ordering: OrderingStrategy::Natural,
+            },
+        )
+        .expect("rust analyse");
+        let (rust_factor, _) = factorize(matrix, &symbolic, &options).expect("rust factorize");
+
+        let mut native_session = native
+            .analyse_with_options_and_ordering(matrix, &options, NativeOrdering::Natural)
+            .expect("native analyse");
+        native_session.factorize(matrix).expect("native factorize");
+        let native_enquiry = native_session.enquire_indef().expect("native enquire");
+
+        let rust_bits = inverse_diagonal_bits(&rust_inverse_diagonal_entries(&rust_factor));
+        let native_bits = inverse_diagonal_bits(&native_enquiry.inverse_diagonal_entries);
+
+        // The full inverse-D witness below currently first differs at flattened
+        // index 12. Keep the six-pivot APP accepted prefix exact while the TPP
+        // tail transition is under investigation.
+        assert_eq!(&rust_bits[..12], &native_bits[..12]);
+        assert_ne!(
+            rust_bits[12], native_bits[12],
+            "seed6 no longer differs at the first TPP-tail inverse-D entry; promote the full witness"
+        );
+    }
+
+    #[test]
     #[ignore = "manual exact production inverse-D bit mismatch witness after factor metadata parity"]
     fn dense_seed6_production_inverse_d_matches_native() {
         let Ok(native) = NativeSpral::load() else {
@@ -8545,17 +8592,8 @@ extern "C" int spral_kernel_block_prefix_trace_32(
         let native_enquiry = native_session.enquire_indef().expect("native enquire");
 
         assert_eq!(
-            rust_inverse_diagonal_entries(&rust_factor)
-                .iter()
-                .flatten()
-                .map(|value| value.to_bits())
-                .collect::<Vec<_>>(),
-            native_enquiry
-                .inverse_diagonal_entries
-                .iter()
-                .flatten()
-                .map(|value| value.to_bits())
-                .collect::<Vec<_>>(),
+            inverse_diagonal_bits(&rust_inverse_diagonal_entries(&rust_factor)),
+            inverse_diagonal_bits(&native_enquiry.inverse_diagonal_entries),
             "production inverse-D bit patterns differ on seed6 dense APP boundary"
         );
     }
