@@ -3161,9 +3161,11 @@ fn should_reduce_barrier_parameter(
 
 fn minimum_monotone_barrier_parameter(options: &InteriorPointOptions) -> f64 {
     let tol = options.overall_tol.min(options.complementarity_tol);
+    // IPOPT MonotoneMuUpdate::CalcNewMuAndTau uses mu_target and the
+    // tol/compl_inf_tol floor here. The separate mu_min option belongs to the
+    // adaptive/free-mu path, not to monotone mu updates.
     options
         .mu_target
-        .max(options.mu_min)
         .max(tol / (options.barrier_tol_factor + 1.0))
 }
 
@@ -3181,6 +3183,7 @@ fn next_barrier_parameter_once(barrier_parameter: f64, options: &InteriorPointOp
 fn next_barrier_parameter<F>(
     barrier_parameter: f64,
     tiny_step: bool,
+    mu_update_initialized: bool,
     options: &InteriorPointOptions,
     mut barrier_error: F,
 ) -> f64
@@ -3188,10 +3191,11 @@ where
     F: FnMut(f64) -> f64,
 {
     let mut current_barrier = barrier_parameter;
+    let mut current_tiny_step = tiny_step;
     let minimum_barrier = minimum_monotone_barrier_parameter(options);
     loop {
         let current_barrier_error = barrier_error(current_barrier);
-        if !tiny_step
+        if !current_tiny_step
             && !should_reduce_barrier_parameter(current_barrier_error, current_barrier, options)
         {
             break;
@@ -3201,9 +3205,10 @@ where
             break;
         }
         current_barrier = next_barrier.max(minimum_barrier);
-        if !options.mu_allow_fast_monotone_decrease {
+        if mu_update_initialized && !options.mu_allow_fast_monotone_decrease {
             break;
         }
+        current_tiny_step = false;
     }
     current_barrier.max(minimum_barrier)
 }
@@ -7860,6 +7865,54 @@ mod tests {
     }
 
     #[test]
+    fn monotone_mu_floor_ignores_adaptive_mu_min() {
+        let options = InteriorPointOptions {
+            overall_tol: 1e-12,
+            complementarity_tol: 1e-12,
+            mu_min: 1e-2,
+            ..InteriorPointOptions::default()
+        };
+
+        // IPOPT IpMonotoneMuUpdate::CalcNewMuAndTau does not include mu_min
+        // in the monotone lower bound. With mu=1e-4, the next value is
+        // min(0.2*mu, mu^1.5) = 1e-6, not the larger adaptive mu_min.
+        let next = next_barrier_parameter_once(1e-4, &options);
+
+        assert!((next - 1e-6).abs() <= 10.0 * f64::EPSILON);
+    }
+
+    #[test]
+    fn monotone_mu_tiny_step_forces_only_one_drop() {
+        let options = InteriorPointOptions::default();
+
+        // IPOPT IpMonotoneMuUpdate::UpdateBarrierParameter consumes
+        // tiny_step_flag after the first loop pass. A large barrier error
+        // therefore stops after the forced one-step update.
+        let next = next_barrier_parameter(1e-1, true, true, &options, |_| 1e6);
+
+        assert!((next - 2e-2).abs() <= f64::EPSILON);
+    }
+
+    #[test]
+    fn monotone_mu_first_call_can_fast_decrease_even_when_disabled() {
+        let options = InteriorPointOptions {
+            overall_tol: 1e-12,
+            complementarity_tol: 1e-12,
+            mu_allow_fast_monotone_decrease: false,
+            ..InteriorPointOptions::default()
+        };
+
+        // IPOPT keeps initialized_=false until the end of the first
+        // UpdateBarrierParameter call, so the first call can still take the
+        // fast monotone loop even when later calls would stop after one drop.
+        let first_call = next_barrier_parameter(1e-1, false, false, &options, |_| 0.0);
+        let later_call = next_barrier_parameter(1e-1, false, true, &options, |_| 0.0);
+
+        assert!((first_call - 1e-12 / 11.0).abs() <= f64::EPSILON);
+        assert!((later_call - 2e-2).abs() <= f64::EPSILON);
+    }
+
+    #[test]
     fn push_scalar_to_bounds_interior_keeps_ipopt_tiny_margin_order() {
         let lower = 0.0;
         let upper = 1.0e-305;
@@ -8580,6 +8633,7 @@ where
         0.0
     };
     let mut watchdog_state = InteriorPointWatchdogState::default();
+    let mut monotone_mu_update_initialized = false;
     let mut pending_iteration_events = Vec::new();
 
     if options.max_iters == 0 {
@@ -9158,6 +9212,7 @@ where
             let next_barrier_parameter_value = next_barrier_parameter(
                 barrier_parameter_value,
                 watchdog_state.tiny_step_last_iteration,
+                monotone_mu_update_initialized,
                 options,
                 |candidate_barrier_parameter| {
                     let current_target_complementarity_inf =
@@ -9180,6 +9235,7 @@ where
                     )
                 },
             );
+            monotone_mu_update_initialized = true;
             if next_barrier_parameter_value
                 < previous_barrier_parameter - 1e-18 * previous_barrier_parameter.abs().max(1.0)
             {
