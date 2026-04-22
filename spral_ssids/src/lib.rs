@@ -309,7 +309,6 @@ impl Supernode {
 
 const RELAXED_NODE_AMALGAMATION_NEMIN: usize = 32;
 const APP_INNER_BLOCK_SIZE: usize = 32;
-const OPENBLAS_DTRSV_BLOCK_SIZE: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SymbolicFactor {
@@ -483,10 +482,25 @@ struct FactorBlockRecord {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+struct FactorSolvePanelRecord {
+    eliminated_len: usize,
+    row_ids: Vec<usize>,
+    values: Vec<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SolvePanel {
+    eliminated_len: usize,
+    row_positions: Vec<usize>,
+    values: Vec<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct FrontFactorizationResult {
     factor_order: Vec<usize>,
     factor_columns: Vec<FactorColumn>,
     block_records: Vec<FactorBlockRecord>,
+    solve_panels: Vec<FactorSolvePanelRecord>,
     contribution: ContributionBlock,
     stats: PanelFactorStats,
     max_front_size: usize,
@@ -498,6 +512,7 @@ struct DenseFrontFactorization {
     factor_order: Vec<usize>,
     factor_columns: Vec<FactorColumn>,
     block_records: Vec<FactorBlockRecord>,
+    solve_panels: Vec<FactorSolvePanelRecord>,
     contribution: ContributionBlock,
     stats: PanelFactorStats,
 }
@@ -510,6 +525,7 @@ struct NumericFactorBuffers<'a> {
     lower_values: &'a mut Vec<f64>,
     diagonal_blocks: &'a mut Vec<DiagonalBlock>,
     diagonal_values: &'a mut Vec<f64>,
+    solve_panels: &'a mut Vec<SolvePanel>,
     permuted_matrix_col_ptrs: &'a mut Vec<usize>,
     permuted_matrix_row_indices: &'a mut Vec<usize>,
     permuted_matrix_source_positions: &'a mut Vec<usize>,
@@ -532,6 +548,7 @@ pub struct NumericFactor {
     lower_col_ptrs: Vec<usize>,
     lower_row_indices: Vec<usize>,
     lower_values: Vec<f64>,
+    solve_panels: Vec<SolvePanel>,
     solve_workspace: Vec<f64>,
     symbolic_front_tree: SymbolicFrontTree,
     permuted_matrix_col_ptrs: Vec<usize>,
@@ -728,35 +745,18 @@ impl NumericFactor {
         }
         diagonal_result?;
 
-        let started = profile_enabled.then(Instant::now);
-        if self.dimension <= APP_INNER_BLOCK_SIZE {
-            let dense_lower = build_dense_unit_lower_from_factor(
-                self.dimension,
-                &self.lower_col_ptrs,
-                &self.lower_row_indices,
-                &self.lower_values,
-            );
-            for row in (0..self.dimension).rev() {
-                let mut dot = 0.0;
-                for (col, &column_value) in factor_rhs.iter().enumerate().skip(row + 1) {
-                    let offset = col * self.dimension + row;
-                    if column_value != 0.0 && dense_lower.present[offset] {
-                        let coefficient = dense_lower.values[offset];
-                        dot = coefficient.mul_add(column_value, dot);
-                    }
-                }
-                factor_rhs[row] -= dot;
-            }
-        } else {
-            solve_lower_transpose_like_native(
-                self.dimension,
-                &self.lower_col_ptrs,
-                &self.lower_row_indices,
-                &self.lower_values,
-                factor_rhs,
-                profile.as_deref_mut(),
-            );
+        if self.dimension > 0 && self.solve_panels.is_empty() {
+            return Err(SsidsError::NumericalBreakdown {
+                pivot: self.dimension - 1,
+                detail: "solve panel metadata is missing for backward substitution".into(),
+            });
         }
+        let started = profile_enabled.then(Instant::now);
+        solve_lower_transpose_front_panels_like_native(
+            &self.solve_panels,
+            factor_rhs,
+            profile.as_deref_mut(),
+        );
         if let Some(started) = started {
             profile
                 .as_mut()
@@ -823,6 +823,7 @@ impl NumericFactor {
                 lower_values: &mut self.lower_values,
                 diagonal_blocks: &mut self.diagonal_blocks,
                 diagonal_values: &mut self.diagonal_values,
+                solve_panels: &mut self.solve_panels,
                 permuted_matrix_col_ptrs: &mut self.permuted_matrix_col_ptrs,
                 permuted_matrix_row_indices: &mut self.permuted_matrix_row_indices,
                 permuted_matrix_source_positions: &mut self.permuted_matrix_source_positions,
@@ -1079,6 +1080,7 @@ pub fn factorize(
         lower_col_ptrs: Vec::with_capacity(matrix.dimension() + 1),
         lower_row_indices: Vec::new(),
         lower_values: Vec::new(),
+        solve_panels: Vec::new(),
         solve_workspace: vec![0.0; matrix.dimension()],
         symbolic_front_tree: front_tree,
         permuted_matrix_col_ptrs: Vec::with_capacity(matrix.dimension() + 1),
@@ -2948,6 +2950,7 @@ fn factorize_dense_tpp_tail_in_place(
         factor_order,
         factor_columns,
         block_records,
+        solve_panels: Vec::new(),
         contribution: ContributionBlock {
             row_ids: remaining_rows,
             delayed_count,
@@ -2955,6 +2958,78 @@ fn factorize_dense_tpp_tail_in_place(
         },
         stats,
     })
+}
+
+fn build_factor_solve_panel_record(
+    factor_order: &[usize],
+    factor_columns: &[FactorColumn],
+    trailing_rows: &[usize],
+) -> Result<Option<FactorSolvePanelRecord>, SsidsError> {
+    let eliminated_len = factor_order.len();
+    if eliminated_len == 0 {
+        return Ok(None);
+    }
+    if factor_columns.len() != eliminated_len {
+        return Err(SsidsError::NumericalBreakdown {
+            pivot: eliminated_len,
+            detail: format!(
+                "solve panel has {} factor columns for {eliminated_len} eliminated rows",
+                factor_columns.len()
+            ),
+        });
+    }
+
+    let mut row_ids = Vec::with_capacity(eliminated_len + trailing_rows.len());
+    row_ids.extend_from_slice(factor_order);
+    row_ids.extend_from_slice(trailing_rows);
+    let max_row = row_ids
+        .iter()
+        .copied()
+        .chain(
+            factor_columns
+                .iter()
+                .flat_map(|column| column.entries.iter().map(|&(row, _)| row)),
+        )
+        .max()
+        .unwrap_or(0);
+    let mut local_positions = vec![usize::MAX; max_row + 1];
+    for (position, &row) in row_ids.iter().enumerate() {
+        if local_positions[row] != usize::MAX {
+            return Err(SsidsError::NumericalBreakdown {
+                pivot: row,
+                detail: "solve panel contains a duplicate local row".into(),
+            });
+        }
+        local_positions[row] = position;
+    }
+
+    let local_size = row_ids.len();
+    let mut values = vec![0.0; local_size * eliminated_len];
+    for (local_col, column) in factor_columns.iter().enumerate() {
+        if column.global_column != factor_order[local_col] {
+            return Err(SsidsError::NumericalBreakdown {
+                pivot: local_col,
+                detail: "solve panel column order drifted away from factor order".into(),
+            });
+        }
+        values[local_col * local_size + local_col] = 1.0;
+        for &(row, value) in &column.entries {
+            let local_row = local_positions.get(row).copied().unwrap_or(usize::MAX);
+            if local_row == usize::MAX || local_row <= local_col {
+                return Err(SsidsError::NumericalBreakdown {
+                    pivot: local_col,
+                    detail: "solve panel factor column referenced an invalid local row".into(),
+                });
+            }
+            values[local_col * local_size + local_row] = value;
+        }
+    }
+
+    Ok(Some(FactorSolvePanelRecord {
+        eliminated_len,
+        row_ids,
+        values,
+    }))
 }
 
 fn zero_dense_column(matrix: &mut [f64], size: usize, pivot: usize) {
@@ -2976,7 +3051,7 @@ fn factorize_root_dense_tpp(
 ) -> Result<DenseFrontFactorization, SsidsError> {
     let size = rows.len();
     let mut ld = vec![0.0; size.saturating_mul(2).max(1)];
-    let factorization =
+    let mut factorization =
         factorize_dense_tpp_tail_in_place(&mut rows, &mut dense, 0, size, options, true, &mut ld)?;
     if let Some(&pivot) = factorization.contribution.row_ids.first() {
         return Err(SsidsError::NumericalBreakdown {
@@ -2986,6 +3061,13 @@ fn factorize_root_dense_tpp(
                 factorization.contribution.delayed_count
             ),
         });
+    }
+    if let Some(panel) = build_factor_solve_panel_record(
+        &factorization.factor_order,
+        &factorization.factor_columns,
+        &factorization.contribution.row_ids,
+    )? {
+        factorization.solve_panels.push(panel);
     }
     Ok(factorization)
 }
@@ -3002,7 +3084,7 @@ fn factorize_dense_front(
         || active_candidate_end < APP_INNER_BLOCK_SIZE
     {
         let mut tpp_ld = vec![0.0; size.saturating_mul(2).max(1)];
-        return factorize_dense_tpp_tail_in_place(
+        let mut factorization = factorize_dense_tpp_tail_in_place(
             &mut rows,
             &mut dense,
             0,
@@ -3010,7 +3092,15 @@ fn factorize_dense_front(
             options,
             false,
             &mut tpp_ld,
-        );
+        )?;
+        if let Some(panel) = build_factor_solve_panel_record(
+            &factorization.factor_order,
+            &factorization.factor_columns,
+            &factorization.contribution.row_ids,
+        )? {
+            factorization.solve_panels.push(panel);
+        }
+        return Ok(factorization);
     }
 
     let mut stats = PanelFactorStats::default();
@@ -3243,11 +3333,19 @@ fn factorize_dense_front(
         factor_columns.extend(tpp_tail.factor_columns);
         block_records.extend(tpp_tail.block_records);
         aggregate_panel_stats(&mut stats, tpp_tail.stats);
+        let contribution = tpp_tail.contribution;
+        let mut solve_panels = Vec::new();
+        if let Some(panel) =
+            build_factor_solve_panel_record(&factor_order, &factor_columns, &contribution.row_ids)?
+        {
+            solve_panels.push(panel);
+        }
         return Ok(DenseFrontFactorization {
             factor_order,
             factor_columns,
             block_records,
-            contribution: tpp_tail.contribution,
+            solve_panels,
+            contribution,
             stats,
         });
     }
@@ -3261,15 +3359,24 @@ fn factorize_dense_front(
         }
     }
 
+    let contribution = ContributionBlock {
+        row_ids: remaining_rows,
+        delayed_count,
+        dense: contribution_dense,
+    };
+    let mut solve_panels = Vec::new();
+    if let Some(panel) =
+        build_factor_solve_panel_record(&factor_order, &factor_columns, &contribution.row_ids)?
+    {
+        solve_panels.push(panel);
+    }
+
     Ok(DenseFrontFactorization {
         factor_order,
         factor_columns,
         block_records,
-        contribution: ContributionBlock {
-            row_ids: remaining_rows,
-            delayed_count,
-            dense: contribution_dense,
-        },
+        solve_panels,
+        contribution,
         stats,
     })
 }
@@ -3307,6 +3414,7 @@ fn factor_front_recursive(
     let mut factor_order = Vec::new();
     let mut factor_columns = Vec::new();
     let mut block_records = Vec::new();
+    let mut solve_panels = Vec::new();
     let mut child_contributions = Vec::with_capacity(child_results.len());
     let mut stats = PanelFactorStats::default();
     let mut max_front_size = 0;
@@ -3316,6 +3424,7 @@ fn factor_front_recursive(
         factor_order.extend(child.factor_order);
         factor_columns.extend(child.factor_columns);
         block_records.extend(child.block_records);
+        solve_panels.extend(child.solve_panels);
         child_contributions.push(child.contribution);
         aggregate_panel_stats(&mut stats, child.stats);
         max_front_size = max_front_size.max(child.max_front_size);
@@ -3406,6 +3515,7 @@ fn factor_front_recursive(
     factor_order.extend(local.factor_order);
     factor_columns.extend(local.factor_columns);
     block_records.extend(local.block_records);
+    solve_panels.extend(local.solve_panels);
     aggregate_panel_stats(&mut stats, local.stats);
     contribution_storage_bytes += local.contribution.dense.len() * std::mem::size_of::<f64>();
 
@@ -3413,6 +3523,7 @@ fn factor_front_recursive(
         factor_order,
         factor_columns,
         block_records,
+        solve_panels,
         contribution: local.contribution,
         stats,
         max_front_size,
@@ -3500,12 +3611,14 @@ fn multifrontal_factorize_with_tree(
     let mut factor_order = Vec::with_capacity(dimension);
     let mut factor_columns = Vec::with_capacity(dimension);
     let mut block_records = Vec::new();
+    let mut solve_panel_records = Vec::new();
     let mut stats = PanelFactorStats::default();
     let mut pending_root_contributions = Vec::new();
     for result in root_results {
         factor_order.extend(result.factor_order);
         factor_columns.extend(result.factor_columns);
         block_records.extend(result.block_records);
+        solve_panel_records.extend(result.solve_panels);
         pending_root_contributions.push(result.contribution);
         aggregate_panel_stats(&mut stats, result.stats);
     }
@@ -3540,6 +3653,7 @@ fn multifrontal_factorize_with_tree(
         factor_order.extend(delayed_local.factor_order);
         factor_columns.extend(delayed_local.factor_columns);
         block_records.extend(delayed_local.block_records);
+        solve_panel_records.extend(delayed_local.solve_panels);
         aggregate_panel_stats(&mut stats, delayed_local.stats);
         progress
             .completed_pivots
@@ -3600,6 +3714,26 @@ fn multifrontal_factorize_with_tree(
         buffers.lower_col_ptrs.push(buffers.lower_row_indices.len());
     }
 
+    buffers.solve_panels.clear();
+    for record in solve_panel_records {
+        let mut row_positions = Vec::with_capacity(record.row_ids.len());
+        for row_id in record.row_ids {
+            let row_position = buffers.factor_inverse[row_id];
+            if row_position == usize::MAX {
+                return Err(SsidsError::NumericalBreakdown {
+                    pivot: row_id,
+                    detail: "solve panel referenced a row outside the factor order".into(),
+                });
+            }
+            row_positions.push(row_position);
+        }
+        buffers.solve_panels.push(SolvePanel {
+            eliminated_len: record.eliminated_len,
+            row_positions,
+            values: record.values,
+        });
+    }
+
     buffers.diagonal_blocks.clear();
     buffers.diagonal_values.clear();
     for block in block_records {
@@ -3620,12 +3754,23 @@ fn multifrontal_factorize_with_tree(
             .map(|block| block.size)
             .sum::<usize>();
     let factor_bytes = std::mem::size_of::<f64>()
-        * (buffers.lower_values.len() + buffers.diagonal_values.len())
+        * (buffers.lower_values.len()
+            + buffers.diagonal_values.len()
+            + buffers
+                .solve_panels
+                .iter()
+                .map(|panel| panel.values.len())
+                .sum::<usize>())
         + std::mem::size_of::<usize>()
             * (buffers.factor_order.len()
                 + buffers.factor_inverse.len()
                 + buffers.lower_col_ptrs.len()
                 + buffers.lower_row_indices.len()
+                + buffers
+                    .solve_panels
+                    .iter()
+                    .map(|panel| panel.row_positions.len())
+                    .sum::<usize>()
                 + tree
                     .fronts
                     .iter()
@@ -3660,144 +3805,69 @@ fn solve_two_by_two_block_in_place(values: &[f64], rhs: &mut [f64]) -> Result<()
     Ok(())
 }
 
-fn solve_lower_transpose_like_native(
-    dimension: usize,
-    lower_col_ptrs: &[usize],
-    lower_row_indices: &[usize],
-    lower_values: &[f64],
+// Mirrors SPRAL SSIDS CPU solve order in NumericSubtree.hxx and
+// kernels/ldlt_app.cxx: gather each front-local RHS, apply the dense APP
+// trailing GEMV update, run the unit-lower transposed triangular solve, then
+// scatter only the eliminated rows.
+fn solve_lower_transpose_front_panels_like_native(
+    panels: &[SolvePanel],
     factor_rhs: &mut [f64],
     mut profile: Option<&mut SolveProfile>,
 ) {
-    let lower = LowerTransposeFactor {
-        col_ptrs: lower_col_ptrs,
-        row_indices: lower_row_indices,
-        values: lower_values,
-    };
     let profile_enabled = profile.is_some();
-    let mut dense_workspace = Vec::new();
-    let mut block_end = dimension;
-    while block_end > 0 {
-        let block_start = block_end.saturating_sub(OPENBLAS_DTRSV_BLOCK_SIZE);
-        if block_end < dimension {
+    let mut local_rhs = Vec::new();
+    for panel in panels.iter().rev() {
+        let eliminated_len = panel.eliminated_len;
+        let local_size = panel.row_positions.len();
+        debug_assert!(eliminated_len <= local_size);
+        debug_assert_eq!(panel.values.len(), local_size * eliminated_len);
+
+        local_rhs.resize(local_size, 0.0);
+        for (local_row, &factor_position) in panel.row_positions.iter().enumerate() {
+            local_rhs[local_row] = factor_rhs[factor_position];
+        }
+
+        if local_size > eliminated_len {
             let started = profile_enabled.then(Instant::now);
-            for pivot in block_start..block_end {
-                let dot = lower_transpose_gemv_dot_like_native(
-                    pivot,
-                    block_end,
-                    dimension,
-                    lower,
-                    factor_rhs,
-                    &mut dense_workspace,
+            for local_col in 0..eliminated_len {
+                let column_start = local_col * local_size;
+                let dot = openblas_gemv_t_dot_like_contiguous(
+                    &panel.values[column_start + eliminated_len..column_start + local_size],
+                    &local_rhs[eliminated_len..local_size],
                 );
-                factor_rhs[pivot] = (-1.0f64).mul_add(dot, factor_rhs[pivot]);
+                local_rhs[local_col] = (-1.0f64).mul_add(dot, local_rhs[local_col]);
             }
             if let Some(profile) = profile.as_mut() {
                 if let Some(started) = started {
                     profile.backward_trailing_update_time += started.elapsed();
                 }
-                profile.backward_trailing_update_columns += block_end - block_start;
+                profile.backward_trailing_update_columns += eliminated_len;
                 profile.backward_trailing_update_dense_entries +=
-                    (block_end - block_start) * (dimension - block_end);
+                    eliminated_len * (local_size - eliminated_len);
             }
         }
 
         let started = profile_enabled.then(Instant::now);
-        for pivot in (block_start..block_end).rev() {
-            let dot = lower_transpose_dot_in_range_like_native(
-                pivot,
-                pivot + 1,
-                block_end,
-                lower,
-                factor_rhs,
-                &mut dense_workspace,
+        for local_col in (0..eliminated_len).rev() {
+            let column_start = local_col * local_size;
+            let dot = openblas_dotu_like_contiguous(
+                &panel.values[column_start + local_col + 1..column_start + eliminated_len],
+                &local_rhs[local_col + 1..eliminated_len],
             );
-            factor_rhs[pivot] -= dot;
+            local_rhs[local_col] -= dot;
         }
         if let Some(profile) = profile.as_mut() {
             if let Some(started) = started {
                 profile.backward_triangular_solve_time += started.elapsed();
             }
-            let block_width = block_end - block_start;
-            profile.backward_triangular_columns += block_width;
-            profile.backward_triangular_dense_entries += block_width * (block_width - 1) / 2;
+            profile.backward_triangular_columns += eliminated_len;
+            profile.backward_triangular_dense_entries += eliminated_len * (eliminated_len - 1) / 2;
         }
-        block_end = block_start;
-    }
-}
 
-#[derive(Clone, Copy)]
-struct LowerTransposeFactor<'a> {
-    col_ptrs: &'a [usize],
-    row_indices: &'a [usize],
-    values: &'a [f64],
-}
-
-fn lower_transpose_dot_in_range_like_native(
-    pivot: usize,
-    range_start: usize,
-    range_end: usize,
-    lower: LowerTransposeFactor<'_>,
-    factor_rhs: &[f64],
-    dense_workspace: &mut Vec<f64>,
-) -> f64 {
-    debug_assert!(range_start <= range_end);
-    let start = lower.col_ptrs[pivot];
-    let end = lower.col_ptrs[pivot + 1];
-    let rows = &lower.row_indices[start..end];
-    let values = &lower.values[start..end];
-    if range_start == range_end {
-        return 0.0;
-    }
-    let range_len = range_end - range_start;
-    if values.len() == range_len
-        && rows
-            .iter()
-            .enumerate()
-            .all(|(offset, &row)| row == range_start + offset)
-    {
-        openblas_dotu_like_contiguous(values, &factor_rhs[range_start..range_end])
-    } else {
-        // Native APP DTRSV works on dense panels. Rows outside this triangular
-        // panel are ignored, but structural zeros inside it still participate
-        // in the OpenBLAS DOTU reduction order.
-        dense_workspace.resize(range_len, 0.0);
-        let dense_values = &mut dense_workspace[..range_len];
-        dense_values.fill(0.0);
-        for (&value, &row) in values.iter().zip(rows) {
-            if (range_start..range_end).contains(&row) {
-                dense_values[row - range_start] = value;
-            }
-        }
-        openblas_dotu_like_contiguous(dense_values, &factor_rhs[range_start..range_end])
-    }
-}
-
-fn lower_transpose_gemv_dot_like_native(
-    pivot: usize,
-    range_start: usize,
-    range_end: usize,
-    lower: LowerTransposeFactor<'_>,
-    factor_rhs: &[f64],
-    dense_workspace: &mut Vec<f64>,
-) -> f64 {
-    debug_assert!(range_start <= range_end);
-    let start = lower.col_ptrs[pivot];
-    let end = lower.col_ptrs[pivot + 1];
-    let rows = &lower.row_indices[start..end];
-    let values = &lower.values[start..end];
-    if range_start == range_end {
-        return 0.0;
-    }
-    let range_len = range_end - range_start;
-    dense_workspace.resize(range_len, 0.0);
-    let dense_values = &mut dense_workspace[..range_len];
-    dense_values.fill(0.0);
-    for (&value, &row) in values.iter().zip(rows) {
-        if (range_start..range_end).contains(&row) {
-            dense_values[row - range_start] = value;
+        for local_row in 0..eliminated_len {
+            factor_rhs[panel.row_positions[local_row]] = local_rhs[local_row];
         }
     }
-    openblas_gemv_t_dot_like_contiguous(dense_values, &factor_rhs[range_start..range_end])
 }
 
 fn openblas_dotu_like_contiguous(lhs: &[f64], rhs: &[f64]) -> f64 {
