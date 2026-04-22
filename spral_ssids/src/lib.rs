@@ -2766,11 +2766,12 @@ fn app_build_factor_columns_for_prefix(
 fn tpp_factor_one_by_one(
     rows: &[usize],
     matrix: &mut [f64],
-    size: usize,
+    bounds: DenseUpdateBounds,
     pivot: usize,
     _stats: &mut PanelFactorStats,
     ld: &mut [f64],
 ) -> Result<(FactorColumn, FactorBlockRecord), SsidsError> {
+    let size = bounds.size;
     let work = &mut ld[..size];
     let diagonal_index = dense_lower_offset(size, pivot, pivot);
     let diagonal = matrix[diagonal_index];
@@ -2808,7 +2809,7 @@ fn tpp_factor_one_by_one(
         entries.push((rows[row], value));
     }
 
-    root_tpp_rank1_update(matrix, size, pivot + 1, pivot, work);
+    root_tpp_rank1_update(matrix, bounds, pivot + 1, pivot, work);
 
     Ok((
         FactorColumn {
@@ -2825,12 +2826,13 @@ fn tpp_factor_one_by_one(
 fn tpp_factor_two_by_two(
     rows: &[usize],
     matrix: &mut [f64],
-    size: usize,
+    bounds: DenseUpdateBounds,
     pivot: usize,
     inverse: (f64, f64, f64),
     stats: &mut PanelFactorStats,
     ld: &mut [f64],
 ) -> Result<([FactorColumn; 2], FactorBlockRecord), SsidsError> {
+    let size = bounds.size;
     let (first_scratch, second_scratch) = ld.split_at_mut(size);
     let (inv11, inv12, inv22) = inverse;
     stats.two_by_two_pivots += 1;
@@ -2845,10 +2847,11 @@ fn tpp_factor_two_by_two(
         let b2 = matrix[dense_lower_offset(size, row, pivot + 1)];
         first_scratch[row] = b1;
         second_scratch[row] = b2;
-        // Native SPRAL's ldlt_tpp.cxx::apply_2x2 evaluates these as
-        // independent products followed by an addition.
-        let l1 = inv11 * b1 + inv12 * b2;
-        let l2 = inv12 * b1 + inv22 * b2;
+        // Native SPRAL's ldlt_tpp.cxx::apply_2x2 spells these as product plus
+        // add expressions; the local native build contracts them. The direct
+        // TPP kernel witnesses pin the compiled behavior used in parity runs.
+        let l1 = inv11.mul_add(b1, inv12 * b2);
+        let l2 = inv12.mul_add(b1, inv22 * b2);
         if !l1.is_finite() || !l2.is_finite() {
             return Err(SsidsError::NumericalBreakdown {
                 pivot: rows[pivot],
@@ -2863,7 +2866,7 @@ fn tpp_factor_two_by_two(
 
     root_tpp_rank2_update(
         matrix,
-        size,
+        bounds,
         pivot + 2,
         pivot,
         pivot + 1,
@@ -2891,15 +2894,23 @@ fn tpp_factor_two_by_two(
 
 fn root_tpp_rank1_update(
     matrix: &mut [f64],
-    size: usize,
+    bounds: DenseUpdateBounds,
     start: usize,
     multiplier_column: usize,
     preserved_column: &[f64],
 ) {
+    let size = bounds.size;
     // Native SPRAL routes a 1x1 trailing update through scalar dgemm, but
     // wider trailing blocks round like OpenBLAS' block kernel.
     let use_scalar_fma = size.saturating_sub(start) == 1;
-    for (col, &preserved) in preserved_column.iter().enumerate().take(size).skip(start) {
+    // ldlt_tpp_factor distinguishes m rows from n candidate columns; the
+    // trailing update spans all rows but only columns before n.
+    for (col, &preserved) in preserved_column
+        .iter()
+        .enumerate()
+        .take(bounds.update_end)
+        .skip(start)
+    {
         for row in col..size {
             let l_row = matrix[dense_lower_offset(size, row, multiplier_column)];
             let update_entry = dense_lower_offset(size, row, col);
@@ -2914,19 +2925,22 @@ fn root_tpp_rank1_update(
 
 fn root_tpp_rank2_update(
     matrix: &mut [f64],
-    size: usize,
+    bounds: DenseUpdateBounds,
     start: usize,
     first_multiplier_column: usize,
     second_multiplier_column: usize,
     first_preserved_column: &[f64],
     second_preserved_column: &[f64],
 ) {
+    let size = bounds.size;
     let use_scalar_fma = size.saturating_sub(start) == 1;
+    // ldlt_tpp_factor distinguishes m rows from n candidate columns; the
+    // trailing update spans all rows but only columns before n.
     for (col, (&first_preserved, &second_preserved)) in first_preserved_column
         .iter()
         .zip(second_preserved_column.iter())
         .enumerate()
-        .take(size)
+        .take(bounds.update_end)
         .skip(start)
     {
         for row in col..size {
@@ -3054,8 +3068,18 @@ fn factorize_dense_tpp_tail_in_place(
                     dense_symmetric_swap(dense, size, second, pivot + 1);
                     rows.swap(second, pivot + 1);
                 }
-                let (columns, block) =
-                    tpp_factor_two_by_two(rows, dense, size, pivot, inverse, &mut stats, ld)?;
+                let (columns, block) = tpp_factor_two_by_two(
+                    rows,
+                    dense,
+                    DenseUpdateBounds {
+                        size,
+                        update_end: active_candidate_end,
+                    },
+                    pivot,
+                    inverse,
+                    &mut stats,
+                    ld,
+                )?;
                 factor_order.push(rows[pivot]);
                 factor_order.push(rows[pivot + 1]);
                 let [first_column, second_column] = columns;
@@ -3073,8 +3097,17 @@ fn factorize_dense_tpp_tail_in_place(
                     dense_symmetric_swap(dense, size, candidate, pivot);
                     rows.swap(candidate, pivot);
                 }
-                let (column, block) =
-                    tpp_factor_one_by_one(rows, dense, size, pivot, &mut stats, ld)?;
+                let (column, block) = tpp_factor_one_by_one(
+                    rows,
+                    dense,
+                    DenseUpdateBounds {
+                        size,
+                        update_end: active_candidate_end,
+                    },
+                    pivot,
+                    &mut stats,
+                    ld,
+                )?;
                 factor_order.push(rows[pivot]);
                 factor_columns.push(column);
                 block_records.push(block);
@@ -3091,7 +3124,17 @@ fn factorize_dense_tpp_tail_in_place(
         let current_diag = dense[dense_lower_offset(size, pivot, pivot)];
         let current_offdiag_max = dense_find_rc_abs_max_exclude(dense, size, pivot, pivot, None);
         if current_diag.abs() >= request.options.threshold_pivot_u * current_offdiag_max {
-            let (column, block) = tpp_factor_one_by_one(rows, dense, size, pivot, &mut stats, ld)?;
+            let (column, block) = tpp_factor_one_by_one(
+                rows,
+                dense,
+                DenseUpdateBounds {
+                    size,
+                    update_end: active_candidate_end,
+                },
+                pivot,
+                &mut stats,
+                ld,
+            )?;
             factor_order.push(rows[pivot]);
             factor_columns.push(column);
             block_records.push(block);
@@ -6827,6 +6870,25 @@ extern "C" int spral_kernel_block_prefix_trace_32(
         }
     }
 
+    fn assert_dense_tpp_full_lower_matrix_equal(
+        label: &str,
+        rust: &DenseTppKernelResult,
+        native: &DenseTppKernelResult,
+        size: usize,
+    ) {
+        for col in 0..size {
+            for row in col..size {
+                let rust_value = rust.matrix[col * size + row];
+                let native_value = native.matrix[col * size + row];
+                assert_eq!(
+                    rust_value.to_bits(),
+                    native_value.to_bits(),
+                    "{label}: ldlt_tpp full matrix mismatch row={row} col={col} rust={rust_value:?} native={native_value:?}"
+                );
+            }
+        }
+    }
+
     fn rust_host_trsv_lower_op_n_like_native(case: &AppSolveKernelCase, rhs: &mut [f64]) {
         openblas_trsv_lower_unit_op_n_like_native(
             &case.lower,
@@ -8444,24 +8506,66 @@ extern "C" int spral_kernel_block_prefix_trace_32(
         assert_dense_tpp_kernel_results_equal("4x4 hand witness", &rust, &native, 4);
     }
 
+    fn dense_tpp_dyadic_case_lower(case: usize) -> (usize, Vec<f64>) {
+        let dimension = 3 + case % 4;
+        let mut rng = DenseBoundaryRng::new(0x7d00_0000_0000_0000_u64 ^ case as u64);
+        let mut matrix = random_dense_dyadic_matrix(dimension, &mut rng);
+        for (row, values) in matrix.iter_mut().enumerate() {
+            let offset = if row.is_multiple_of(2) { 4.0 } else { -4.0 };
+            values[row] += offset;
+        }
+        (dimension, square_to_dense_lower(&matrix))
+    }
+
     #[test]
-    #[ignore = "manual native-vs-rust TPP update-order witness; case 0 first differs in D at index 4"]
+    fn dense_tpp_dyadic_case0_two_pivot_prefix_matches_native_kernel() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let (_, dense) = dense_tpp_dyadic_case_lower(0);
+        let options = NumericFactorOptions::default();
+
+        let rust = rust_ldlt_tpp_factor_from_lower_dense(&dense, 3, 2, options);
+        let native = native_ldlt_tpp_factor_from_lower_dense(shim, &dense, 3, 2, options);
+
+        assert_dense_tpp_kernel_results_equal("dyadic case=0 first two pivots", &rust, &native, 2);
+        assert_dense_tpp_full_lower_matrix_equal(
+            "dyadic case=0 first two pivots",
+            &rust,
+            &native,
+            3,
+        );
+    }
+
+    #[test]
+    fn dense_tpp_factor_dyadic_cases_0_to_6_match_native_kernel() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let options = NumericFactorOptions::default();
+
+        for case in 0..7 {
+            let (dimension, dense) = dense_tpp_dyadic_case_lower(case);
+            let rust = rust_ldlt_tpp_factor_from_lower_dense(&dense, dimension, dimension, options);
+            let native = native_ldlt_tpp_factor_from_lower_dense(
+                shim, &dense, dimension, dimension, options,
+            );
+
+            let label = format!("dyadic case={case} dimension={dimension}");
+            assert_dense_tpp_kernel_results_equal(&label, &rust, &native, dimension);
+        }
+    }
+
+    #[test]
+    #[ignore = "manual native-vs-rust TPP update-order witness; case 7 first differs in matrix row 5 col 0"]
     fn dense_tpp_factor_small_dyadic_cases_match_native_kernel() {
         let Some(shim) = native_kernel_shim_or_skip() else {
             return;
         };
         let options = NumericFactorOptions::default();
 
-        for case in 0..16 {
-            let dimension = 3 + case % 4;
-            let mut rng = DenseBoundaryRng::new(0x7d00_0000_0000_0000_u64 ^ case as u64);
-            let mut matrix = random_dense_dyadic_matrix(dimension, &mut rng);
-            for (row, values) in matrix.iter_mut().enumerate() {
-                let offset = if row.is_multiple_of(2) { 4.0 } else { -4.0 };
-                values[row] += offset;
-            }
-            let dense = square_to_dense_lower(&matrix);
-
+        for case in 7..16 {
+            let (dimension, dense) = dense_tpp_dyadic_case_lower(case);
             let rust = rust_ldlt_tpp_factor_from_lower_dense(&dense, dimension, dimension, options);
             let native = native_ldlt_tpp_factor_from_lower_dense(
                 shim, &dense, dimension, dimension, options,
