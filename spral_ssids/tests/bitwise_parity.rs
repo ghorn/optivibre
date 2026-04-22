@@ -246,8 +246,7 @@ fn rust_and_native_spral_match_dense_seed_706172697479_case58_solution_bits() {
 }
 
 #[test]
-#[ignore = "manual dense APP boundary case that guards against seed6-only update_2x2 overfitting"]
-fn rust_and_native_spral_dense_seed_09c9134e4eff0004_case0_solution_bits() {
+fn rust_and_native_spral_match_dense_seed_09c9134e4eff0004_case0_solution_bits() {
     let mut rng = DenseBoundaryRng::new(0x09c9_134e_4eff_0004);
     let dimension = rng.usize_inclusive(33, 160);
     assert_eq!(dimension, 55);

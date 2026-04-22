@@ -45,16 +45,38 @@ stack reports OpenBLAS `0.3.32 DYNAMIC_ARCH ... neoversen1`, whose arm64
 `KERNEL.NEOVERSEN1` selects the generic `trsm_kernel_RN.c` path for double RN
 dtrsm.
 
-Current newly narrowed solve-lane witness:
+Current newly passing solve-lane witness:
+Rust APP 2x2 first-multiplier arithmetic now mirrors the observed local
+`block_ldlt<32>` codegen split: contracted arithmetic for vectorized rows, and
+the `block_ldlt.hxx` source-spelled `d11*work[r] + d21*work[BLOCK_SIZE+r]`
+for the narrow scalar tail. The second multiplier remains contracted, matching
+the local native build. This closes the active dense seed6 full solution
+witness and promotes dense seed09 case0 from ignored/manual to active full
+solution-bit parity. `cargo test -p spral_ssids --test bitwise_parity` now has
+8 active passing solution witnesses and 5 active remaining failures; seed6 and
+dense seed09 case0 both pass. The source anchor is SPRAL
+`target/native/spral-upstream/src/ssids/cpu/kernels/block_ldlt.hxx`
+`block_ldlt<T, BLOCK_SIZE>`'s 2x2 multiplier loop, reached from
+`target/native/spral-upstream/src/ssids/cpu/kernels/ldlt_app.cxx`.
+
+Current remaining seed6 storage boundary:
+The seed6 solve now matches bitwise, but isolated final APP block storage is
+not fully green. `dense_seed6_app_block_storage_diverges_after_row30_scalar_tail`
+shows row 30, col 28 is closed, and the first remaining local block L mismatch
+is row 31, col 28: Rust/source-tail `0x3f66e35ec7827340` versus native full
+block `0x3f66e35ec782734a`. This keeps block storage colored partial while the
+seed6 full solution node is newly green.
+
+Previous newly narrowed solve-lane witness:
 `dense_seed6_final_app_pivot_source_expression_matches_native_block` now
 reconstructs the final seed6 2x2 APP pivot multiplier from the native prefix
 snapshot operands at `step=14, from=28`. The FMA-shaped continuation expression
 lands on `0xbf816117c4f8272d`, while the source-spelled
 `d11*work[r] + d21*work[32+r]` expression lands on `0xbf816117c4f82730`,
 matching the full native `block_ldlt<32>` block at row 30, col 28. This
-narrows the remaining seed6 storage gap to the full native optimized
-`block_ldlt<32>` source expression at the final 2x2 APP pivot; it is still not
-a production fix or full solution-bit parity. The source anchor is SPRAL
+narrows the seed6 row30 storage gap to the full native optimized
+`block_ldlt<32>` source expression at the final 2x2 APP pivot. The source
+anchor is SPRAL
 `target/native/spral-upstream/src/ssids/cpu/kernels/block_ldlt.hxx`
 `block_ldlt<T, BLOCK_SIZE>`'s 2x2 multiplier loop, reached from
 `target/native/spral-upstream/src/ssids/cpu/kernels/ldlt_app.cxx`.
@@ -75,16 +97,17 @@ the dense seed6 solve-lane boundary below factor metadata and APP prefix
 tracing. Rust and native `block_ldlt<32>` prefix traces match bitwise with the
 native aligned leading dimension `lda=34`, and final APP block permutations and
 inverse-D entries also match. The first final L-storage mismatch in native
-`block_ldlt<32>` is row 30, col 28: Rust `0xbf816117c4f8272d` versus native
-`0xbf816117c4f82730`. This keeps the full solution-bit mismatch open while
-narrowing it to native full-block APP L storage or optimized continuation, not
-the production solve traversal. The source anchors are SPRAL
+`block_ldlt<32>` was row 30, col 28: Rust `0xbf816117c4f8272d` versus native
+`0xbf816117c4f82730`. That narrowed the then-open full solution-bit mismatch to
+native full-block APP L storage or optimized continuation, not the production
+solve traversal. The current seed6 full solution guard is closed by the
+scalar-tail first-multiplier split. The source anchors are SPRAL
 `target/native/spral-upstream/src/ssids/cpu/kernels/ldlt_app.cxx`
 `ldlt_app_factor` / `block_ldlt<32>` and the local native trace shim around the
 same kernel.
 
-Previous newly narrowed solve-lane witness:
-`dense_seed6_solution_bits_diverge_after_matching_inverse_d` proves that dense
+Previous now-closed solve-lane witness:
+`dense_seed6_solution_bits_diverge_after_matching_inverse_d` proved that dense
 seed6 production factor metadata, factor order, and inverse-D enquiry bits
 match native SPRAL before the solve. Rust production forward solve now mirrors
 SPRAL's `NumericSubtree.hxx::solve_fwd` traversal: gather front-local RHS, call
@@ -93,11 +116,11 @@ production diagonal/backward solve now mirrors SPRAL's full-solve path through
 `fkeep.F90::inner_solve_cpu` and
 `NumericSubtree.hxx::solve_diag_bwd_inner<true,true>`: gather front-local RHS,
 apply front-local inverse-D blocks, call `ldlt_app_solve_bwd`, then scatter
-eliminated rows. The same seed6 RHS still has the original first solution bit
-mismatch at index 2: Rust `0x3fc000000000002a` versus native
-`0x3fc0000000000022`. That moves the seed6 full-solver failure past production
-front traversal staging and into APP backward arithmetic or production L
-storage. A source-spelled 2x2 diagonal solve experiment was also rejected: the
+eliminated rows. At that checkpoint, the same seed6 RHS still had the original
+first solution bit mismatch at index 2: Rust `0x3fc000000000002a` versus native
+`0x3fc0000000000022`. The current seed6 full solution guard now matches bitwise
+after the scalar-tail first-multiplier split. A source-spelled 2x2 diagonal solve
+experiment was also rejected: the
 local native `ldlt_app_solve_diag` kernel property matches the FMA-shaped Rust
 helper, and the source-spelled expression moved seed6's first solution mismatch
 earlier to index 0. The source anchors for the next read are SPRAL
@@ -114,15 +137,17 @@ differ at flattened matrix index 82, with complementary zero signs:
 Rust `-0.0` and native `+0.0`. This is a fail-closed guard for the open
 signed-zero mismatch, not bitwise parity.
 
-Previous newly narrowed witness:
+Previous now-closed witness:
 `dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now compares
 native production `enquire_indef` output with the source-shaped native
 `factor_node_indef` second-pass TPP replay for the same dense seed09 tail. The
-first replay gap is the same pivot/component as the remaining full inverse-D
-red witness: pivot 37 component 1 (`native_production=0xbf54f6581dd605f2`,
-`factor_node_replay=0xbf54f6581dd605fe`). Rust production tail storage already
-matches this factor-node replay, so this pins the next missing context on the
-native production/replay boundary rather than justifying a Rust storage change.
+first replay gap at that checkpoint was pivot 37 component 1
+(`native_production=0xbf54f6581dd605f2`,
+`factor_node_replay=0xbf54f6581dd605fe`). The current dense seed09 production
+inverse-D guard now matches native bitwise, so this section is retained as
+historical provenance rather than an active red witness. Rust production tail
+storage already matched this factor-node replay, so it did not justify a Rust
+storage change.
 The source anchors are `target/native/spral-upstream/src/ssids/cpu/factor.hxx`
 `factor_node_indef` and
 `target/native/spral-upstream/src/ssids/cpu/NumericSubtree.hxx` `enquire`.
@@ -201,7 +226,7 @@ their final 32x32 APP block matrix first differs at row 30, col 19:
 19 source-shaped diagonal gap is therefore inside the native APP block matrix
 storage path rather than native permutation or D metadata.
 
-Current newly passing metadata witness:
+Previous newly passing metadata witness:
 The same deterministic guard also pins the trace-vs-wrapper permutation, local
 permutation, and inverse-D entries as exact matches before the matrix gap.
 
@@ -213,126 +238,64 @@ therefore not caused by Rust's dense front using stride 55 while native
 `block_ldlt<32>` uses `align_lda(55)`. It sits between Rust/prefix-trace APP
 storage and the final native `block_ldlt<32>` wrapper result.
 
-Previous newly narrowed witness:
+Previous now-closed witness:
 `dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now pins an
 earlier source-shaped first APP boundary: the trailing pre-apply operand rows
 match bitwise, but the diagonal block read by SPRAL's BLAS-backed
 `target/native/spral-upstream/src/ssids/cpu/kernels/wrappers.cxx`
-`host_trsm(... SIDE_RIGHT, FILL_MODE_LWR, OP_T, DIAG_UNIT ...)` first differs at
-row 30, col 19: `rust=0xbf8cbfa8da674b6b`,
-`native=0xbf8cbfa8da674b6c`. The downstream host-trsm output then first differs
+`host_trsm(... SIDE_RIGHT, FILL_MODE_LWR, OP_T, DIAG_UNIT ...)` previously
+first differed at row 30, col 19: `rust=0xbf8cbfa8da674b6b`,
+`native=0xbf8cbfa8da674b6c`. The downstream host-trsm output then first differed
 at row 47, col 30: `rust=0xc0091687167b6783`,
-`native=0xc0091687167b6782`. This is not a green bitwise parity node; it moves
-the source-shaped APP drift above the trailing operand permutation and into the
-diagonal block storage handed to the BLAS triangular solve.
+`native=0xc0091687167b6782`. The current source-shaped host-trsm and post-apply
+operand guards now match; the remaining historical source-shaped diagnostic
+boundary is row 30, col 28.
 
-Previous newly passing witness:
+Previous now-closed witness:
 `dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now pins the
 dense seed09 source-shaped first APP pre-apply operand layout. After native
 `block_ldlt<32>` and the source-shaped local column permutation, the trailing
 operand handed to `target/native/spral-upstream/src/ssids/cpu/kernels/ldlt_app.cxx`
-`apply_pivot<OP_N>` matches Rust's pre-apply operand bitwise. The remaining
-row 47, col 30 one-ulp drift is therefore introduced by the source-shaped
-`apply_pivot<OP_N>` replay or immediately after it, not by the column
-permutation into the first APP trailing block.
+`apply_pivot<OP_N>` matches Rust's pre-apply operand bitwise. The previous row
+47, col 30 one-ulp drift is now closed by the scalar-tail multiplier change.
 
-Previous newly narrowed witness:
-`dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now pins the
-first dense seed09 source-shaped APP operand drift after native
-`block_ldlt<32>`, source-shaped column permutation, native `apply_pivot<OP_N>`,
-and source-shaped `check_threshold<OP_N>`. The first mismatch against Rust's
-production first APP operand is row 47, col 30:
-`rust=0xbfd76be586dab26a`, `native=0xbfd76be586dab269`. This is not a green
-bitwise parity node; it narrows the remaining full inverse-D failure to the
-first APP operand handed to the accepted update.
+Previous now-closed seed09 witness:
+`dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` originally
+kept dense seed09 case0 narrowed around the first APP accepted update and the
+post-APP TPP tail. After the scalar-tail multiplier change, the source-shaped
+`host_trsm` operand guard, the source-shaped post-apply operand guard, and the
+native production-vs-`factor_node_indef` TPP replay all match. The remaining
+source-shaped diagnostic boundary is the first APP diagonal operand at row 30,
+col 28: Rust `0xbf74d4f050074250` versus native `0xbf74d4f05007424d`. This is
+historical diagnostic context, not the current dense seed09 inverse-D state.
 
-Previous newly passing witness:
-`dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now pins the
-dense seed09 first APP a-posteriori threshold boundary against
-`target/native/spral-upstream/src/ssids/cpu/kernels/ldlt_app.cxx`'s
-`check_threshold<OP_N>` loop. After the bitwise-matching `apply_pivot<OP_N>`
-result, Rust and the source-shaped C++ shim agree on the accepted pass count,
-so the first APP block is not drifting through threshold-boundary selection.
-
-Previous newly passing witness:
-`app_block_ldlt_32_aligned_prefix_trace_matches_native_dense_seed09_case0`
-pins the dense seed09 first APP diagonal block against native
-`target/native/spral-upstream/src/ssids/cpu/kernels/block_ldlt.hxx` at the
-same aligned leading dimension used by the full 55-row front. The per-pivot
-trace covers factor status, next pivot, global/local permutations, lower block
-storage, `ldwork`, and inverse-D storage bitwise. The remaining red dense
-seed09 inverse-D drift is therefore not caused by the first APP block's
-`block_ldlt<32>` prefix.
-
-Previous newly narrowed witness:
+Current newly passing seed09 inverse-D witnesses:
+`dense_seed09_case0_production_inverse_d_matches_native`,
+`dense_seed09_case0_production_inverse_d_entries_match_native`, and
 `dense_seed09_case0_production_inverse_d_mismatches_are_nonzero_numeric_components`
-keeps the full dense seed09 production inverse-D mismatch pinned to nonzero
-numeric D components. The first mismatch remains pivot 37 component 1 with
-`rust=0xbf54f6581dd605fe` and `native=0xbf54f6581dd605f2`, and every mismatch
-is nonzero on both Rust and native sides. This does not turn the full inverse-D
-node green; it rules out another signed-zero or structural-layout explanation
-for the remaining red witness.
+now assert full production inverse-D bit equality and an empty mismatch map for
+dense seed09 case0. The structural-zero guard remains active and green, so the
+former pivot 37 component 1 and pivot 39 component 0 inverse-D gaps are closed.
+The source anchor for enquiry layout remains
+`target/native/spral-upstream/src/ssids/cpu/NumericSubtree.hxx`:
+`d(1,:)` holds inverse-D diagonal entries and `d(2,:)` holds off-diagonal
+entries in pivot order.
 
-Earlier newly passing witness:
-`dense_seed09_case0_production_inverse_d_structural_zero_components_match_native`
-pins the full dense seed09 production inverse-D enquiry layout for structural
-zero off-diagonal components. Every Rust entry whose `d(2,:)` component is the
-SPRAL enquiry structural `+0.0` has the same native structural-zero status and
-the same `+0.0` bit pattern. This keeps the remaining full inverse-D mismatch
-focused on nonzero numeric D entries, not block-layout or signed-zero drift.
+Current newly passing seed09 solution witness:
+`rust_and_native_spral_match_dense_seed_09c9134e4eff0004_case0_solution_bits`
+is promoted from ignored/manual to an active full-solution bitwise guard. It
+passes together with the full dense seed09 inverse-D guard, so dense seed09
+case0 no longer represents the open APP boundary solve mismatch.
 
-Earlier newly passing witness:
-`dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now also
-mirrors `target/native/spral-upstream/src/ssids/cpu/factor.hxx`'s
-`factor_node_indef` second-pass TPP call after APP accepts the first block:
-`ldlt_tpp_factor(m-nelim, n-nelim, &perm[nelim], &lcol[nelim*(ldl+1)], ldl,
-&d[2*nelim], ld, m-nelim, ..., nelim, &lcol[nelim], ldl)`. With the same
-post-APP Rust front state, this source-shaped native TPP replay matches Rust
-production tail inverse-D storage bitwise. The remaining dense seed09 mismatch
-therefore stays above this second-pass TPP call convention.
-
-Earlier post-gap witness:
-`dense_seed09_case0_production_inverse_d_entries_match_through_pivot38_except_known_gap`
-pins SPRAL's `enquire_indef` layout from
-`target/native/spral-upstream/src/ssids/cpu/NumericSubtree.hxx`: `d(1,:)`
-holds inverse-D diagonal entries and `d(2,:)` holds off-diagonal entries in
-pivot order. Dense seed09 production inverse-D has an active guard showing all
-components through pivot 38 match bitwise except the known pivot 37 off-diagonal
-gap. The next confirmed drift is pivot 39's diagonal component.
-
-Earlier passing witness:
-`dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` checked the
-seed09 tail with native `ldlt_tpp_factor` embedded at the same offset and
-leading dimension it has inside the 55-row APP front. The embedded tail D
-entries match the isolated native tail D entries bitwise. The full
-native-production inverse-D guard still first differs at flattened index 75, so
-the open issue is outside tail-pointer offset and leading-dimension effects.
-
-Earlier storage witness:
-`dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` checked that
-Rust production inverse-D storage for the dense seed09 tail matched the isolated
-TPP tail D entries after converting SPRAL's internal 2x2 marker layout to
-enquiry layout.
-
-Earlier APP apply-pivot witness:
-`dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` checked the
-seed09 first-panel `apply_pivot<OP_N>` output with SPRAL's APP leading
-dimension, `lda=align_lda(55)`. The L block handed to the accepted APP update
-matched native SPRAL bitwise.
-
-Earlier APP-stride TPP witness:
-`dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` checked the
-post-APP 23x23 TPP tail with SPRAL's native APP leading dimensions:
-`lda=align_lda(55)` for the tail matrix and `ldld=align_lda(32)` for
-`ldlt_tpp_factor`'s workspace. The APP-stride tail D entries matched bitwise.
-
-Current open guard witness:
-`rust_and_native_spral_dense_seed_09c9134e4eff0004_case0_solution_bits`
-still captures the dense APP boundary solve mismatch. The paired manual
-inverse-D replay is `dense_seed09_case0_production_inverse_d_matches_native`,
-which now first differs at flattened inverse-D index 75, i.e. pivot 37
-component 1 in SPRAL's enquiry layout. Pivot 39 component 0 is the next
-confirmed diagonal drift after skipping the first off-diagonal gap.
+Current open guard witnesses:
+The remaining active full-solution parity failures are
+`rust_and_native_spral_match_dense_seed_1001_33x33_solution_bits`,
+`rust_and_native_spral_match_app_blocked_update_65x65_solution_bits`,
+`rust_and_native_spral_match_app_width_one_update_96x96_solution_bits`,
+`rust_and_native_spral_match_app_prefix_dtrsv_97x97_solution_bits`, and
+`rust_and_native_spral_match_dense_seed_706172697479_case58_solution_bits`.
+These keep the production solution-bit node red while the seed6 and dense
+seed09 case0 solution witnesses are newly green.
 
 ```mermaid
 flowchart TD
@@ -365,8 +328,8 @@ flowchart TD
     G2 -->|"2x2"| G6["test_2x2"]
     G6 --> G7["swap_cols twice"]
     G7 --> G8["compute 2x2 inverse / multipliers"]
-    G8 --> G8c["block_ldlt optimized 2x2 first-row multiplier contraction"]
-    G8c --> G8d["block_ldlt optimized 2x2 second-row multiplier contraction"]
+    G8 --> G8c["block_ldlt 2x2 first multiplier vector/scalar split"]
+    G8c --> G8d["block_ldlt optimized 2x2 second multiplier contraction"]
     G8d --> G8a["calcLD OP_N 2x2 vector row"]
     G8a --> G8b["calcLD OP_N vector/scalar row split"]
     G8b --> G9a["update_2x2 product-sum contraction"]
@@ -391,8 +354,8 @@ flowchart TD
     I0x --> I0y["Dense seed09 pivot19 source expression matches wrapper bit"]
     I0y --> I0c["Dense seed09 FMA continuation to row30/col19 matrix gap"]
     I0c --> I0d["Dense seed09 FMA native trace-vs-wrapper APP matrix gap"]
-    I0d --> I0t["Dense seed09 source-shaped APP host_trsm gap"]
-    I0t --> I0b["Dense seed09 source-shaped APP post-apply operand gap"]
+    I0d --> I0t["Dense seed09 source-shaped APP host_trsm operands"]
+    I0t --> I0b["Dense seed09 source-shaped APP post-apply operands"]
     I0b --> I["APP accepted-prefix update"]
     G10 --> J["Record delayed pivots"]
     H --> I
@@ -405,21 +368,21 @@ flowchart TD
     K --> K1["Factor order, inertia, pivot stats"]
     K --> K2["Seed6 APP prefix inverse-D bits through 29"]
     K2 --> K3["Seed6 full inverse-D bits"]
-    K3 --> K3b["Seed6 APP block final L storage after matching prefix trace"]
-    K3b --> K3c["Seed6 native APP continuation reproduces L-storage gap"]
-    K3c --> K3d["Seed6 final 2x2 APP source expression matches native L bit"]
-    K3d --> K3a["Seed6 full solution bits after matching D"]
+    K3 --> K3b["Seed6 APP row30 L bit closes; row31 storage remains"]
+    K3b --> K3c["Seed6 all-FMA continuation reproduces old row30 gap"]
+    K3c --> K3d["Seed6 scalar-tail first multiplier closes solution bits"]
+    K3d --> K3a["Seed6 full solution bits"]
     K --> K4a["Dense APP case0 prefix inverse-D bits through 74"]
     K4a --> K4e["Dense seed09 APP-stride apply_pivot OP_N L bits"]
     K4e --> K4c["Dense seed09 isolated APP update + TPP tail kernels"]
     K4c --> K4d["Dense seed09 APP-stride TPP tail D bits"]
     K4d --> K4g["Dense seed09 embedded-offset native TPP tail D bits"]
     K4g --> K4i["Dense seed09 factor_node second-pass TPP tail D bits"]
-    K4i --> K4l["Dense seed09 native production vs factor_node replay D gap"]
+    K4i --> K4l["Dense seed09 native production vs factor_node replay D bits"]
     K4l --> K4f["Dense seed09 Rust production tail D storage"]
     K4f --> K4h["Dense seed09 post-gap pivot38 inverse-D bits"]
     K4h --> K4j["Dense seed09 inverse-D structural zero bits"]
-    K4j --> K4k["Dense seed09 nonzero inverse-D mismatch map"]
+    K4j --> K4k["Dense seed09 inverse-D mismatch map is empty"]
     K4k --> K4b["Dense APP case0 full inverse-D bits"]
     K4b --> K4["Dense APP boundary case0 solution bits"]
     J --> K
@@ -457,13 +420,15 @@ flowchart TD
     class I0d partial;
     class I0z newlyPartial;
     class I0zz open;
-    class I0t,I0b partial;
+    class I0t,I0b newly;
     class K4j match;
-    class K4k partial;
+    class K4k newly;
     class C,D,E,F,G,G2,G4,G7,G10,H,I,J,K,L,N partial;
     class O0,O1 newlyPartial;
-    class K3a,K3b,K3c,K3d newlyPartial;
-    class K4l newlyPartial;
+    class K3b,K3c newlyPartial;
+    class K3a,K3d newly;
+    class K4l newly;
     class G8c,G8d,G9a,I00,I0,I0a,I1,I2,I3,K2,K3,K4a,K4c,K4d,K4e,K4f,K4g,K4h,K4i match;
-    class K4b,K4,S open;
+    class K4b,K4 newly;
+    class S open;
 ```

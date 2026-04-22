@@ -2245,15 +2245,28 @@ fn factor_two_by_two_common(
     matrix[dense_lower_offset(size, pivot + 1, pivot)] = 0.0;
     matrix[dense_lower_offset(size, pivot + 1, pivot + 1)] = 1.0;
 
-    for row in (pivot + 2)..update_end {
+    let first_multiplier_row = pivot + 2;
+    let trailing_rows = update_end.saturating_sub(first_multiplier_row);
+    // The local optimized block_ldlt<32> build contracts the first multiplier
+    // when there are enough trailing rows to vectorize, but its narrow scalar
+    // tail follows block_ldlt.hxx source order. The second multiplier remains
+    // contracted on the local native build.
+    let vectorized_multiplier_rows = if trailing_rows >= 4 {
+        trailing_rows / 2 * 2
+    } else {
+        0
+    };
+    for row in first_multiplier_row..update_end {
         let b1 = matrix[dense_lower_offset(size, row, pivot)];
         let b2 = matrix[dense_lower_offset(size, row, pivot + 1)];
         first_scratch[row] = b1;
         second_scratch[row] = b2;
-        // The local optimized block_ldlt<32> build contracts both 2x2
-        // multiplier rows with the first addend folded into the second.
-        let l1 = inv12.mul_add(b2, inv11 * b1);
-        let l2 = inv12.mul_add(b1, inv22 * b2);
+        let local_row = row - first_multiplier_row;
+        let (l1, l2) = if local_row < vectorized_multiplier_rows {
+            (inv12.mul_add(b2, inv11 * b1), inv12.mul_add(b1, inv22 * b2))
+        } else {
+            (inv11 * b1 + inv12 * b2, inv12.mul_add(b1, inv22 * b2))
+        };
         if !l1.is_finite() || !l2.is_finite() {
             return Err(SsidsError::NumericalBreakdown {
                 pivot: rows[pivot],
@@ -5810,6 +5823,20 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         block_bits: u64,
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct BlockPrefixTraceMismatch {
+        step: usize,
+        from: usize,
+        status: i32,
+        next: usize,
+        component: &'static str,
+        index: usize,
+        row: usize,
+        col: usize,
+        rust_bits: u64,
+        native_bits: u64,
+    }
+
     struct RustAppBlockStepState<'a> {
         rows: &'a mut [usize],
         matrix: &'a mut [f64],
@@ -7543,69 +7570,103 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         Ok(())
     }
 
-    fn assert_block_prefix_traces_equal(
+    fn first_block_prefix_trace_mismatch(
         rust: &[BlockPrefixSnapshot],
         native: &[BlockPrefixSnapshot],
-    ) {
+    ) -> Option<BlockPrefixTraceMismatch> {
         for (rust_step, native_step) in rust.iter().zip(native) {
-            assert_eq!(
-                (
-                    rust_step.step,
-                    rust_step.from,
-                    rust_step.status,
-                    rust_step.next
-                ),
-                (
-                    native_step.step,
-                    native_step.from,
-                    native_step.status,
-                    native_step.next
-                ),
-                "block_ldlt prefix status mismatch rust={rust_step:?} native={native_step:?}"
-            );
-            assert_eq!(
-                rust_step.perm, native_step.perm,
-                "block_ldlt prefix perm mismatch step={} from={} rust={:?} native={:?}",
-                rust_step.step, rust_step.from, rust_step.perm, native_step.perm
-            );
-            assert_eq!(
-                rust_step.local_perm, native_step.local_perm,
-                "block_ldlt prefix local_perm mismatch step={} from={} rust={:?} native={:?}",
-                rust_step.step, rust_step.from, rust_step.local_perm, native_step.local_perm
-            );
+            if (
+                rust_step.step,
+                rust_step.from,
+                rust_step.status,
+                rust_step.next,
+            ) != (
+                native_step.step,
+                native_step.from,
+                native_step.status,
+                native_step.next,
+            ) {
+                return Some(BlockPrefixTraceMismatch {
+                    step: rust_step.step,
+                    from: rust_step.from,
+                    status: rust_step.status,
+                    next: rust_step.next,
+                    component: "status",
+                    index: 0,
+                    row: 0,
+                    col: 0,
+                    rust_bits: 0,
+                    native_bits: 0,
+                });
+            }
+            if rust_step.perm != native_step.perm {
+                return Some(BlockPrefixTraceMismatch {
+                    step: rust_step.step,
+                    from: rust_step.from,
+                    status: rust_step.status,
+                    next: rust_step.next,
+                    component: "perm",
+                    index: 0,
+                    row: 0,
+                    col: 0,
+                    rust_bits: 0,
+                    native_bits: 0,
+                });
+            }
+            if rust_step.local_perm != native_step.local_perm {
+                return Some(BlockPrefixTraceMismatch {
+                    step: rust_step.step,
+                    from: rust_step.from,
+                    status: rust_step.status,
+                    next: rust_step.next,
+                    component: "local_perm",
+                    index: 0,
+                    row: 0,
+                    col: 0,
+                    rust_bits: 0,
+                    native_bits: 0,
+                });
+            }
             for (index, (&rust_value, &native_value)) in rust_step
                 .diagonal
                 .iter()
                 .zip(&native_step.diagonal)
                 .enumerate()
             {
-                assert_eq!(
-                    rust_value.to_bits(),
-                    native_value.to_bits(),
-                    "block_ldlt prefix d mismatch step={} from={} index={} rust={:?} native={:?}",
-                    rust_step.step,
-                    rust_step.from,
-                    index,
-                    rust_value,
-                    native_value
-                );
+                if rust_value.to_bits() != native_value.to_bits() {
+                    return Some(BlockPrefixTraceMismatch {
+                        step: rust_step.step,
+                        from: rust_step.from,
+                        status: rust_step.status,
+                        next: rust_step.next,
+                        component: "diagonal",
+                        index,
+                        row: 0,
+                        col: 0,
+                        rust_bits: rust_value.to_bits(),
+                        native_bits: native_value.to_bits(),
+                    });
+                }
             }
             for col in 0..APP_INNER_BLOCK_SIZE {
                 for row in col..APP_INNER_BLOCK_SIZE {
-                    let index = col * APP_INNER_BLOCK_SIZE + row;
-                    let rust_value = rust_step.matrix[index];
-                    let native_value = native_step.matrix[index];
-                    assert_eq!(
-                        rust_value.to_bits(),
-                        native_value.to_bits(),
-                        "block_ldlt prefix matrix mismatch step={} from={} row={} col={} rust={:?} native={:?}",
-                        rust_step.step,
-                        rust_step.from,
-                        row,
-                        col,
-                        rust_value,
-                        native_value
-                    );
+                    let index = row * APP_INNER_BLOCK_SIZE + col;
+                    let rust_value = rust_step.matrix[col * APP_INNER_BLOCK_SIZE + row];
+                    let native_value = native_step.matrix[col * APP_INNER_BLOCK_SIZE + row];
+                    if rust_value.to_bits() != native_value.to_bits() {
+                        return Some(BlockPrefixTraceMismatch {
+                            step: rust_step.step,
+                            from: rust_step.from,
+                            status: rust_step.status,
+                            next: rust_step.next,
+                            component: "matrix",
+                            index,
+                            row,
+                            col,
+                            rust_bits: rust_value.to_bits(),
+                            native_bits: native_value.to_bits(),
+                        });
+                    }
                 }
             }
             for (index, (&rust_value, &native_value)) in rust_step
@@ -7614,47 +7675,34 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
                 .zip(&native_step.workspace)
                 .enumerate()
             {
-                assert_eq!(
-                    rust_value.to_bits(),
-                    native_value.to_bits(),
-                    "block_ldlt prefix ldwork mismatch step={} from={} index={} rust={:?} native={:?}",
-                    rust_step.step,
-                    rust_step.from,
-                    index,
-                    rust_value,
-                    native_value
-                );
+                if rust_value.to_bits() != native_value.to_bits() {
+                    return Some(BlockPrefixTraceMismatch {
+                        step: rust_step.step,
+                        from: rust_step.from,
+                        status: rust_step.status,
+                        next: rust_step.next,
+                        component: "workspace",
+                        index,
+                        row: index % APP_INNER_BLOCK_SIZE,
+                        col: index / APP_INNER_BLOCK_SIZE,
+                        rust_bits: rust_value.to_bits(),
+                        native_bits: native_value.to_bits(),
+                    });
+                }
             }
         }
-        if rust.len() != native.len() {
-            let next_rust = rust.get(native.len()).or_else(|| rust.last());
-            let next_native = native.get(rust.len()).or_else(|| native.last());
-            panic!(
-                "block_ldlt prefix step-count mismatch rust_len={} native_len={} last_common={} next_rust={} next_native={}",
-                rust.len(),
-                native.len(),
-                rust.len().min(native.len()).saturating_sub(1),
-                block_prefix_snapshot_summary(next_rust),
-                block_prefix_snapshot_summary(next_native)
-            );
-        }
-    }
-
-    fn block_prefix_snapshot_summary(snapshot: Option<&BlockPrefixSnapshot>) -> String {
-        snapshot.map_or_else(
-            || "none".to_string(),
-            |snapshot| {
-                format!(
-                    "step={} from={} status={} next={} perm={:?} local_perm={:?}",
-                    snapshot.step,
-                    snapshot.from,
-                    snapshot.status,
-                    snapshot.next,
-                    snapshot.perm,
-                    snapshot.local_perm
-                )
-            },
-        )
+        (rust.len() != native.len()).then_some(BlockPrefixTraceMismatch {
+            step: rust.len().min(native.len()),
+            from: 0,
+            status: 0,
+            next: 0,
+            component: "len",
+            index: 0,
+            row: 0,
+            col: 0,
+            rust_bits: rust.len() as u64,
+            native_bits: native.len() as u64,
+        })
     }
 
     #[test]
@@ -8394,7 +8442,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
     }
 
     #[test]
-    fn app_block_first_step_two_by_two_matches_native_kernel_property_cases() {
+    fn app_block_first_step_two_by_two_wide_rows_match_native_kernel_property_cases() {
         let Some(shim) = native_kernel_shim_or_skip() else {
             return;
         };
@@ -8405,6 +8453,13 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         runner
             .run(&any::<u64>(), |case_seed| {
                 let case = block_first_step_case_from_seed(seed ^ case_seed, true);
+                // The local native first-step shim models the vectorized
+                // all-FMA path. Narrow and odd scalar-tail coverage is pinned
+                // by the seed6/seed09 exact APP witnesses below.
+                let trailing_rows = APP_INNER_BLOCK_SIZE.saturating_sub(case.from + 2);
+                if trailing_rows < 4 || !trailing_rows.is_multiple_of(2) {
+                    return Ok(());
+                }
                 let mut rust_matrix = case.matrix.clone();
                 let mut native_matrix = case.matrix.clone();
                 let mut rust_workspace = vec![0.0; APP_INNER_BLOCK_SIZE * APP_INNER_BLOCK_SIZE];
@@ -9378,15 +9433,6 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         values.iter().map(|value| value.to_bits()).collect()
     }
 
-    fn first_bit_mismatch(left: &[u64], right: &[u64]) -> Option<(usize, u64, u64)> {
-        left.iter()
-            .zip(right)
-            .enumerate()
-            .find_map(|(index, (&left_bits, &right_bits))| {
-                (left_bits != right_bits).then_some((index, left_bits, right_bits))
-            })
-    }
-
     fn inverse_diagonal_entries_from_internal_diagonal(
         diagonal: &[f64],
         candidate_len: usize,
@@ -9407,7 +9453,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
     }
 
     #[test]
-    fn app_block_ldlt_32_prefix_trace_matches_native_dense_seed6() {
+    fn app_block_ldlt_32_prefix_trace_matches_native_dense_seed6_until_scalar_tail() {
         let Some(shim) = native_kernel_shim_or_skip() else {
             return;
         };
@@ -9415,11 +9461,26 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         let options = NumericFactorOptions::default();
         let rust_trace = rust_app_block_prefix_trace_32(&lower_dense, dimension, options);
         let native_trace = native_block_prefix_trace_32(shim, &lower_dense, dimension, 34, options);
-        assert_block_prefix_traces_equal(&rust_trace, &native_trace);
+        assert_eq!(
+            first_block_prefix_trace_mismatch(&rust_trace, &native_trace),
+            Some(BlockPrefixTraceMismatch {
+                step: 14,
+                from: 28,
+                status: 2,
+                next: 30,
+                component: "matrix",
+                index: 988,
+                row: 30,
+                col: 28,
+                rust_bits: 0xbf81_6117_c4f8_2730,
+                native_bits: 0xbf81_6117_c4f8_272d,
+            }),
+            "dense seed6 APP prefix trace boundary moved"
+        );
     }
 
     #[test]
-    fn app_block_ldlt_32_aligned_prefix_trace_matches_native_dense_seed6() {
+    fn app_block_ldlt_32_aligned_prefix_trace_matches_native_dense_seed6_until_scalar_tail() {
         let Some(shim) = native_kernel_shim_or_skip() else {
             return;
         };
@@ -9432,11 +9493,27 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             rust_app_block_prefix_trace_32(&aligned_lower_dense, aligned_stride, options);
         let native_trace =
             native_block_prefix_trace_32(shim, &lower_dense, dimension, aligned_stride, options);
-        assert_block_prefix_traces_equal(&rust_trace, &native_trace);
+        assert_eq!(
+            first_block_prefix_trace_mismatch(&rust_trace, &native_trace),
+            Some(BlockPrefixTraceMismatch {
+                step: 14,
+                from: 28,
+                status: 2,
+                next: 30,
+                component: "matrix",
+                index: 988,
+                row: 30,
+                col: 28,
+                rust_bits: 0xbf81_6117_c4f8_2730,
+                native_bits: 0xbf81_6117_c4f8_272d,
+            }),
+            "dense seed6 aligned APP prefix trace boundary moved"
+        );
     }
 
     #[test]
-    fn app_block_ldlt_32_aligned_prefix_trace_matches_native_dense_seed09_case0() {
+    fn app_block_ldlt_32_aligned_prefix_trace_matches_native_dense_seed09_case0_until_scalar_tail()
+    {
         let Some(shim) = native_kernel_shim_or_skip() else {
             return;
         };
@@ -9449,11 +9526,26 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             rust_app_block_prefix_trace_32(&aligned_lower_dense, aligned_stride, options);
         let native_trace =
             native_block_prefix_trace_32(shim, &lower_dense, dimension, aligned_stride, options);
-        assert_block_prefix_traces_equal(&rust_trace, &native_trace);
+        assert_eq!(
+            first_block_prefix_trace_mismatch(&rust_trace, &native_trace),
+            Some(BlockPrefixTraceMismatch {
+                step: 10,
+                from: 19,
+                status: 2,
+                next: 21,
+                component: "matrix",
+                index: 1011,
+                row: 31,
+                col: 19,
+                rust_bits: 0xbf8c_bfa8_da67_4b6c,
+                native_bits: 0xbf8c_bfa8_da67_4b6b,
+            }),
+            "dense seed09 aligned APP prefix trace boundary moved"
+        );
     }
 
     #[test]
-    fn dense_seed6_app_block_storage_diverges_after_matching_prefix_trace() {
+    fn dense_seed6_app_block_storage_diverges_after_row30_scalar_tail() {
         let Some(shim) = native_kernel_shim_or_skip() else {
             return;
         };
@@ -9465,7 +9557,22 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         let rust_trace = rust_app_block_prefix_trace_32(&lower_dense, dimension, options);
         let native_trace =
             native_block_prefix_trace_32(shim, &lower_dense, dimension, native_lda, options);
-        assert_block_prefix_traces_equal(&rust_trace, &native_trace);
+        assert_eq!(
+            first_block_prefix_trace_mismatch(&rust_trace, &native_trace),
+            Some(BlockPrefixTraceMismatch {
+                step: 14,
+                from: 28,
+                status: 2,
+                next: 30,
+                component: "matrix",
+                index: 988,
+                row: 30,
+                col: 28,
+                rust_bits: 0xbf81_6117_c4f8_2730,
+                native_bits: 0xbf81_6117_c4f8_272d,
+            }),
+            "dense seed6 APP all-FMA prefix trace boundary moved"
+        );
 
         let rust = rust_block_ldlt_32_from_lower_dense(&lower_dense, dimension, options);
         let native = native_block_ldlt_32_from_lower_dense(
@@ -9500,8 +9607,8 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         }
         assert_eq!(
             first_mismatch,
-            Some((30, 28, 0xbf81_6117_c4f8_272d, 0xbf81_6117_c4f8_2730)),
-            "dense seed6 APP block L-storage boundary moved after matching prefix trace"
+            Some((31, 28, 0x3f66_e35e_c782_7340, 0x3f66_e35e_c782_734a)),
+            "dense seed6 APP block L-storage boundary moved after row30 scalar-tail multiplier"
         );
     }
 
@@ -9612,6 +9719,38 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
                 0xbf81_6117_c4f8_2730,
             ),
             "dense seed6 FMA pivot-28 first-row multiplier boundary moved"
+        );
+
+        let final_second_row_source = native_block.local_perm[31];
+        let second_multiplier_row = fma_pivot_snapshot
+            .local_perm
+            .iter()
+            .position(|&entry| entry == final_second_row_source)
+            .expect("dense seed6 FMA pivot-28 final second row source");
+        assert_eq!(
+            second_multiplier_row, 31,
+            "dense seed6 FMA pivot-28 second source row moved"
+        );
+        let second_row_first_work = fma_pivot_snapshot.workspace
+            [multiplier_col * APP_INNER_BLOCK_SIZE + second_multiplier_row];
+        let second_row_second_work = fma_pivot_snapshot.workspace
+            [(multiplier_col + 1) * APP_INNER_BLOCK_SIZE + second_multiplier_row];
+        let second_row_fma = d21.mul_add(second_row_second_work, d11 * second_row_first_work);
+        let second_row_source = d11 * second_row_first_work + d21 * second_row_second_work;
+        let second_row_native =
+            native_block.matrix[multiplier_col * native_lda + final_multiplier_row + 1];
+        assert_eq!(
+            (
+                second_row_fma.to_bits(),
+                second_row_source.to_bits(),
+                second_row_native.to_bits()
+            ),
+            (
+                0x3f66_e35e_c782_732d,
+                0x3f66_e35e_c782_7340,
+                0x3f66_e35e_c782_734a,
+            ),
+            "dense seed6 FMA pivot-28 second-row multiplier boundary moved"
         );
     }
 
@@ -9730,7 +9869,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
     }
 
     #[test]
-    fn dense_seed6_solution_bits_diverge_after_matching_inverse_d() {
+    fn dense_seed6_solution_bits_match_after_scalar_tail_multiplier() {
         let Some(native) = native_spral_or_skip() else {
             return;
         };
@@ -9783,14 +9922,9 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         let rust_bits = bit_patterns(&rust_solution);
         let native_bits = bit_patterns(&native_solution);
 
-        assert_ne!(
-            rust_bits, native_bits,
-            "seed6 solution bits now match after matching inverse-D; promote the full witness"
-        );
         assert_eq!(
-            first_bit_mismatch(&rust_bits, &native_bits),
-            Some((2, 0x3fc0_0000_0000_002a, 0x3fc0_0000_0000_0022)),
-            "seed6 first solution-bit mismatch moved after matching factor metadata and inverse-D"
+            rust_bits, native_bits,
+            "seed6 solution bits should match after scalar-tail APP multiplier"
         );
     }
 
@@ -9839,17 +9973,14 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         let rust_bits = inverse_diagonal_bits(&rust_inverse_diagonal_entries(&rust_factor));
         let native_bits = inverse_diagonal_bits(&native_enquiry.inverse_diagonal_entries);
 
-        // This dense APP boundary case now pins the production parity ladder
-        // before the first optimized block_ldlt<32> inverse-D drift.
-        assert_eq!(&rust_bits[..75], &native_bits[..75]);
-        assert_ne!(
-            rust_bits[75], native_bits[75],
-            "dense seed09 case0 no longer differs at the current APP inverse-D boundary; promote the full witness"
+        assert_eq!(
+            rust_bits, native_bits,
+            "dense seed09 case0 production inverse-D bit patterns differ"
         );
     }
 
     #[test]
-    fn dense_seed09_case0_production_inverse_d_entries_match_through_pivot38_except_known_gap() {
+    fn dense_seed09_case0_production_inverse_d_entries_match_native() {
         let Some(native) = native_spral_or_skip() else {
             return;
         };
@@ -9878,16 +10009,8 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         let native_entries = native_enquiry.inverse_diagonal_entries;
         assert_eq!(rust_entries.len(), native_entries.len());
 
-        // Native enquiry writes d(1,:) as the inverse-D diagonal component and
-        // d(2,:) as the off-diagonal component in pivot order. The current
-        // production guard first diverges at pivot 37, component 1, but the
-        // following pivot still matches bitwise; the next diagonal drift starts
-        // at pivot 39.
-        for pivot in 0..=38 {
+        for pivot in 0..rust_entries.len() {
             for component in 0..2 {
-                if pivot == 37 && component == 1 {
-                    continue;
-                }
                 assert_eq!(
                     rust_entries[pivot][component].to_bits(),
                     native_entries[pivot][component].to_bits(),
@@ -9895,16 +10018,6 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
                 );
             }
         }
-        assert_ne!(
-            rust_entries[37][1].to_bits(),
-            native_entries[37][1].to_bits(),
-            "dense seed09 production inverse-D pivot 37 component 1 now matches; promote the full prefix"
-        );
-        assert_ne!(
-            rust_entries[39][0].to_bits(),
-            native_entries[39][0].to_bits(),
-            "dense seed09 production inverse-D pivot 39 diagonal now matches; promote this guard"
-        );
     }
 
     #[test]
@@ -10001,22 +10114,13 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             .collect::<Vec<_>>();
 
         assert_eq!(
-            mismatches.first().copied(),
-            Some((37, 1, 0xbf54_f658_1dd6_05fe, 0xbf54_f658_1dd6_05f2)),
-        );
-        assert!(
-            mismatches
-                .iter()
-                .all(
-                    |&(_, _, rust_bits, native_bits)| f64::from_bits(rust_bits) != 0.0
-                        && f64::from_bits(native_bits) != 0.0
-                ),
-            "dense seed09 inverse-D mismatch escaped nonzero numeric components: {mismatches:?}"
+            mismatches,
+            Vec::<(usize, usize, u64, u64)>::new(),
+            "dense seed09 inverse-D mismatches should be empty"
         );
     }
 
     #[test]
-    #[ignore = "manual exact production inverse-D bit mismatch witness for dense seed09 case0"]
     fn dense_seed09_case0_production_inverse_d_matches_native() {
         let Some(native) = native_spral_or_skip() else {
             return;
@@ -10610,7 +10714,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         }
         assert_eq!(
             first_aligned_source_diagonal_mismatch,
-            Some((30, 19, 0xbf8c_bfa8_da67_4b6b, 0xbf8c_bfa8_da67_4b6c)),
+            Some((30, 28, 0xbf74_d4f0_5007_4250, 0xbf74_d4f0_5007_424d)),
             "dense seed09 source-shaped aligned first APP diagonal operand boundary moved"
         );
         let mut first_source_diagonal_mismatch = None;
@@ -10626,7 +10730,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         }
         assert_eq!(
             first_source_diagonal_mismatch,
-            Some((30, 19, 0xbf8c_bfa8_da67_4b6b, 0xbf8c_bfa8_da67_4b6c)),
+            Some((30, 28, 0xbf74_d4f0_5007_4250, 0xbf74_d4f0_5007_424d)),
             "dense seed09 source-shaped first APP diagonal operand boundary moved"
         );
         let mut rust_source_trsm_matrix = dense_before_apply.clone();
@@ -10660,8 +10764,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             }
         }
         assert_eq!(
-            first_source_trsm_mismatch,
-            Some((47, 30, 0xc009_1687_167b_6783, 0xc009_1687_167b_6782)),
+            first_source_trsm_mismatch, None,
             "dense seed09 source-shaped first APP host_trsm operand boundary moved"
         );
         unsafe {
@@ -10687,8 +10790,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             }
         }
         assert_eq!(
-            first_source_apply_mismatch,
-            Some((47, 30, 0xbfd7_6be5_86da_b26a, 0xbfd7_6be5_86da_b269)),
+            first_source_apply_mismatch, None,
             "dense seed09 source-shaped first APP apply operand boundary moved"
         );
         let native_source_passed = native_check_threshold_op_n(
@@ -10999,8 +11101,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             }
         }
         assert_eq!(
-            first_native_production_factor_node_mismatch,
-            Some((37, 1, 0xbf54_f658_1dd6_05f2, 0xbf54_f658_1dd6_05fe)),
+            first_native_production_factor_node_mismatch, None,
             "dense seed09 native production-vs-factor-node TPP replay boundary moved"
         );
     }
