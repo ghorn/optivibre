@@ -740,35 +740,14 @@ impl NumericFactor {
                 .input_permutation_time += started.elapsed();
         }
 
-        let started = profile_enabled.then(Instant::now);
-        if self.dimension <= APP_INNER_BLOCK_SIZE {
-            let dense_lower = build_dense_unit_lower_from_factor(
-                self.dimension,
-                &self.lower_col_ptrs,
-                &self.lower_row_indices,
-                &self.lower_values,
-            );
-            for row in 0..self.dimension {
-                let mut value = factor_rhs[row];
-                for (col, &column_value) in factor_rhs.iter().take(row).enumerate() {
-                    let offset = row * self.dimension + col;
-                    if column_value != 0.0 && dense_lower.present[offset] {
-                        let coefficient = dense_lower.values[offset];
-                        value = (-coefficient).mul_add(column_value, value);
-                    }
-                }
-                factor_rhs[row] = value;
-            }
-        } else {
-            for pivot in 0..self.dimension {
-                let pivot_value = factor_rhs[pivot];
-                for entry in self.lower_col_ptrs[pivot]..self.lower_col_ptrs[pivot + 1] {
-                    let row = self.lower_row_indices[entry];
-                    factor_rhs[row] =
-                        (-self.lower_values[entry]).mul_add(pivot_value, factor_rhs[row]);
-                }
-            }
+        if self.dimension > 0 && self.solve_panels.is_empty() {
+            return Err(SsidsError::NumericalBreakdown {
+                pivot: self.dimension - 1,
+                detail: "solve panel metadata is missing for forward substitution".into(),
+            });
         }
+        let started = profile_enabled.then(Instant::now);
+        solve_forward_front_panels_like_native(&self.solve_panels, factor_rhs);
         if let Some(started) = started {
             profile
                 .as_mut()
@@ -829,12 +808,6 @@ impl NumericFactor {
         }
         diagonal_result?;
 
-        if self.dimension > 0 && self.solve_panels.is_empty() {
-            return Err(SsidsError::NumericalBreakdown {
-                pivot: self.dimension - 1,
-                detail: "solve panel metadata is missing for backward substitution".into(),
-            });
-        }
         let started = profile_enabled.then(Instant::now);
         solve_lower_transpose_front_panels_like_native(
             &self.solve_panels,
@@ -4215,7 +4188,6 @@ fn solve_two_by_two_block_in_place(values: &[f64], rhs: &mut [f64]) -> Result<()
 // kernels/ldlt_app.cxx: gather each front-local RHS, run the unit-lower
 // triangular solve, apply the dense APP trailing GEMV update, then scatter the
 // full front-local RHS.
-#[cfg(test)]
 fn solve_forward_front_panels_like_native(panels: &[SolvePanel], factor_rhs: &mut [f64]) {
     let mut local_rhs = Vec::new();
     for panel in panels {
@@ -4255,7 +4227,6 @@ fn solve_forward_front_panels_like_native(panels: &[SolvePanel], factor_rhs: &mu
 
 // Mirrors OpenBLAS driver/level2/trsv_L.c for lower/unit/no-transpose on the
 // local panel solve path used by SPRAL's ldlt_app_solve_fwd.
-#[cfg(test)]
 fn openblas_trsv_lower_unit_op_n_like_native(a: &[f64], lda: usize, x: &mut [f64]) {
     const DTB_ENTRIES: usize = 64;
     let n = x.len();
@@ -4293,7 +4264,6 @@ fn openblas_trsv_lower_unit_op_n_like_native(a: &[f64], lda: usize, x: &mut [f64
 // Mirrors OpenBLAS kernel/arm64/gemv_n.S for the OP_N solve update shape used
 // by dtrsv_NLU and ldlt_app_solve_fwd: each source column updates all trailing
 // rows before the next column is loaded.
-#[cfg(test)]
 #[allow(clippy::neg_multiply)]
 fn openblas_gemv_n_update_like_native(
     m: usize,
@@ -4538,37 +4508,6 @@ fn openblas_gemv_t_dot_like_contiguous_impl(lhs: &[f64], rhs: &[f64]) -> f64 {
         dot = left.mul_add(right, dot);
     }
     dot
-}
-
-struct DenseUnitLower {
-    values: Vec<f64>,
-    present: Vec<bool>,
-}
-
-fn build_dense_unit_lower_from_factor(
-    dimension: usize,
-    lower_col_ptrs: &[usize],
-    lower_row_indices: &[usize],
-    lower_values: &[f64],
-) -> DenseUnitLower {
-    let mut lower = DenseUnitLower {
-        values: vec![0.0; dimension * dimension],
-        present: vec![false; dimension * dimension],
-    };
-    for diagonal in 0..dimension {
-        let offset = diagonal * dimension + diagonal;
-        lower.values[offset] = 1.0;
-        lower.present[offset] = true;
-    }
-    for col in 0..dimension {
-        for entry in lower_col_ptrs[col]..lower_col_ptrs[col + 1] {
-            let row = lower_row_indices[entry];
-            let offset = row * dimension + col;
-            lower.values[offset] = lower_values[entry];
-            lower.present[offset] = true;
-        }
-    }
-    lower
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
