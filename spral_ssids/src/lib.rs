@@ -2556,6 +2556,54 @@ fn app_original_one_by_one_diagonal(inverse_diagonal: f64) -> f64 {
     }
 }
 
+fn app_build_ld_workspace(
+    matrix: &[f64],
+    size: usize,
+    block_start: usize,
+    accepted_end: usize,
+    block_records: &[FactorBlockRecord],
+) -> Vec<f64> {
+    let accepted_width = accepted_end - block_start;
+    let mut ld_values = vec![0.0; accepted_width * size];
+    let mut pivot = block_start;
+    for block in block_records {
+        let relative_pivot = pivot - block_start;
+        if block.size == 1 {
+            let diagonal = app_original_one_by_one_diagonal(block.values[0]);
+            for row in accepted_end..size {
+                let row_l = matrix[dense_lower_offset(size, row, pivot)];
+                ld_values[relative_pivot * size + row] = diagonal * row_l;
+            }
+            pivot += 1;
+        } else {
+            let inv11 = block.values[0];
+            let inv21 = block.values[1];
+            let inv22 = block.values[3];
+            let det = inv11.mul_add(inv22, -(inv21 * inv21));
+            let d11 = inv11 / det;
+            let d21 = inv21 / det;
+            let d22 = inv22 / det;
+            for row in accepted_end..size {
+                let row_l1 = matrix[dense_lower_offset(size, row, pivot)];
+                let row_l2 = matrix[dense_lower_offset(size, row, pivot + 1)];
+                ld_values[relative_pivot * size + row] = d22.mul_add(row_l1, -(d21 * row_l2));
+                ld_values[(relative_pivot + 1) * size + row] = (-d21).mul_add(row_l1, d11 * row_l2);
+            }
+            pivot += 2;
+        }
+    }
+    debug_assert_eq!(pivot, accepted_end);
+    ld_values
+}
+
+struct AppAcceptedUpdateContext<'a> {
+    size: usize,
+    block_start: usize,
+    accepted_end: usize,
+    block_records: &'a [FactorBlockRecord],
+    ld_values: &'a [f64],
+}
+
 fn app_apply_accepted_prefix_update(
     matrix: &mut [f64],
     size: usize,
@@ -2566,29 +2614,23 @@ fn app_apply_accepted_prefix_update(
     if accepted_end >= size {
         return;
     }
+    let ld_values = app_build_ld_workspace(matrix, size, block_start, accepted_end, block_records);
     if accepted_end + 1 == size {
         let row = accepted_end;
         let entry = dense_lower_offset(size, row, row);
         let mut pivot = block_start;
         for block in block_records {
+            let relative_pivot = pivot - block_start;
             if block.size == 1 {
-                let diagonal = app_original_one_by_one_diagonal(block.values[0]);
                 let row_l = matrix[dense_lower_offset(size, row, pivot)];
-                let row_ld = diagonal * row_l;
+                let row_ld = ld_values[relative_pivot * size + row];
                 matrix[entry] = (-row_l).mul_add(row_ld, matrix[entry]);
                 pivot += 1;
             } else {
-                let inv11 = block.values[0];
-                let inv21 = block.values[1];
-                let inv22 = block.values[3];
-                let det = inv11.mul_add(inv22, -(inv21 * inv21));
-                let d11 = inv11 / det;
-                let d21 = inv21 / det;
-                let d22 = inv22 / det;
                 let row_l1 = matrix[dense_lower_offset(size, row, pivot)];
                 let row_l2 = matrix[dense_lower_offset(size, row, pivot + 1)];
-                let row_ld1 = d22.mul_add(row_l1, -(d21 * row_l2));
-                let row_ld2 = (-d21).mul_add(row_l1, d11 * row_l2);
+                let row_ld1 = ld_values[relative_pivot * size + row];
+                let row_ld2 = ld_values[(relative_pivot + 1) * size + row];
                 matrix[entry] = (-row_l1).mul_add(row_ld1, matrix[entry]);
                 matrix[entry] = (-row_l2).mul_add(row_ld2, matrix[entry]);
                 pivot += 2;
@@ -2602,10 +2644,13 @@ fn app_apply_accepted_prefix_update(
             if app_target_block_uses_gemv_forward(size, accepted_end, col) {
                 app_apply_accepted_prefix_update_entry_incremental(
                     matrix,
-                    size,
-                    block_start,
-                    accepted_end,
-                    block_records,
+                    AppAcceptedUpdateContext {
+                        size,
+                        block_start,
+                        accepted_end,
+                        block_records,
+                        ld_values: &ld_values,
+                    },
                     row,
                     col,
                 );
@@ -2614,27 +2659,17 @@ fn app_apply_accepted_prefix_update(
             let mut update = 0.0;
             let mut pivot = block_start;
             for block in block_records {
+                let relative_pivot = pivot - block_start;
                 if block.size == 1 {
-                    let diagonal = app_original_one_by_one_diagonal(block.values[0]);
-                    let row_l = matrix[dense_lower_offset(size, row, pivot)];
                     let col_l = matrix[dense_lower_offset(size, col, pivot)];
-                    let row_ld = diagonal * row_l;
+                    let row_ld = ld_values[relative_pivot * size + row];
                     update = row_ld.mul_add(col_l, update);
                     pivot += 1;
                 } else {
-                    let inv11 = block.values[0];
-                    let inv21 = block.values[1];
-                    let inv22 = block.values[3];
-                    let det = inv11.mul_add(inv22, -(inv21 * inv21));
-                    let d11 = inv11 / det;
-                    let d21 = inv21 / det;
-                    let d22 = inv22 / det;
-                    let row_l1 = matrix[dense_lower_offset(size, row, pivot)];
-                    let row_l2 = matrix[dense_lower_offset(size, row, pivot + 1)];
                     let col_l1 = matrix[dense_lower_offset(size, col, pivot)];
                     let col_l2 = matrix[dense_lower_offset(size, col, pivot + 1)];
-                    let row_ld1 = d22.mul_add(row_l1, -(d21 * row_l2));
-                    let row_ld2 = (-d21).mul_add(row_l1, d11 * row_l2);
+                    let row_ld1 = ld_values[relative_pivot * size + row];
+                    let row_ld2 = ld_values[(relative_pivot + 1) * size + row];
                     update = row_ld1.mul_add(col_l1, update);
                     update = row_ld2.mul_add(col_l2, update);
                     pivot += 2;
@@ -2656,43 +2691,31 @@ fn app_target_block_uses_gemv_forward(size: usize, accepted_end: usize, col: usi
 
 fn app_apply_accepted_prefix_update_entry_incremental(
     matrix: &mut [f64],
-    size: usize,
-    block_start: usize,
-    accepted_end: usize,
-    block_records: &[FactorBlockRecord],
+    context: AppAcceptedUpdateContext<'_>,
     row: usize,
     col: usize,
 ) {
+    let size = context.size;
     let entry = dense_lower_offset(size, row, col);
-    let mut pivot = block_start;
-    for block in block_records {
+    let mut pivot = context.block_start;
+    for block in context.block_records {
+        let relative_pivot = pivot - context.block_start;
         if block.size == 1 {
-            let diagonal = app_original_one_by_one_diagonal(block.values[0]);
-            let row_l = matrix[dense_lower_offset(size, row, pivot)];
             let col_l = matrix[dense_lower_offset(size, col, pivot)];
-            let row_ld = diagonal * row_l;
+            let row_ld = context.ld_values[relative_pivot * size + row];
             matrix[entry] = (-col_l).mul_add(row_ld, matrix[entry]);
             pivot += 1;
         } else {
-            let inv11 = block.values[0];
-            let inv21 = block.values[1];
-            let inv22 = block.values[3];
-            let det = inv11.mul_add(inv22, -(inv21 * inv21));
-            let d11 = inv11 / det;
-            let d21 = inv21 / det;
-            let d22 = inv22 / det;
-            let row_l1 = matrix[dense_lower_offset(size, row, pivot)];
-            let row_l2 = matrix[dense_lower_offset(size, row, pivot + 1)];
             let col_l1 = matrix[dense_lower_offset(size, col, pivot)];
             let col_l2 = matrix[dense_lower_offset(size, col, pivot + 1)];
-            let row_ld1 = d22.mul_add(row_l1, -(d21 * row_l2));
-            let row_ld2 = (-d21).mul_add(row_l1, d11 * row_l2);
+            let row_ld1 = context.ld_values[relative_pivot * size + row];
+            let row_ld2 = context.ld_values[(relative_pivot + 1) * size + row];
             matrix[entry] = (-col_l1).mul_add(row_ld1, matrix[entry]);
             matrix[entry] = (-col_l2).mul_add(row_ld2, matrix[entry]);
             pivot += 2;
         }
     }
-    debug_assert_eq!(pivot, accepted_end);
+    debug_assert_eq!(pivot, context.accepted_end);
 }
 
 fn app_build_factor_columns_for_prefix(
