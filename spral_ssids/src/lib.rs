@@ -55,6 +55,74 @@ impl SolveProfile {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FactorProfile {
+    pub symbolic_front_tree_time: Duration,
+    pub permuted_pattern_time: Duration,
+    pub permuted_values_time: Duration,
+    pub front_factorization_time: Duration,
+    pub front_assembly_time: Duration,
+    pub dense_front_factorization_time: Duration,
+    pub tpp_factorization_time: Duration,
+    pub app_pivot_factor_time: Duration,
+    pub app_block_pivot_apply_time: Duration,
+    pub app_failed_pivot_scan_time: Duration,
+    pub app_restore_time: Duration,
+    pub app_accepted_update_time: Duration,
+    pub app_column_storage_time: Duration,
+    pub solve_panel_build_time: Duration,
+    pub root_delayed_factorization_time: Duration,
+    pub factor_inverse_time: Duration,
+    pub lower_storage_time: Duration,
+    pub solve_panel_storage_time: Duration,
+    pub diagonal_storage_time: Duration,
+    pub factor_bytes_time: Duration,
+    pub front_count: usize,
+    pub local_dense_entries: usize,
+    pub root_delayed_blocks: usize,
+}
+
+impl FactorProfile {
+    pub fn total_recorded_time(&self) -> Duration {
+        self.symbolic_front_tree_time
+            + self.permuted_pattern_time
+            + self.permuted_values_time
+            + self.front_factorization_time
+            + self.root_delayed_factorization_time
+            + self.factor_inverse_time
+            + self.lower_storage_time
+            + self.solve_panel_storage_time
+            + self.diagonal_storage_time
+            + self.factor_bytes_time
+    }
+
+    pub fn accumulate(&mut self, other: &Self) {
+        self.symbolic_front_tree_time += other.symbolic_front_tree_time;
+        self.permuted_pattern_time += other.permuted_pattern_time;
+        self.permuted_values_time += other.permuted_values_time;
+        self.front_factorization_time += other.front_factorization_time;
+        self.front_assembly_time += other.front_assembly_time;
+        self.dense_front_factorization_time += other.dense_front_factorization_time;
+        self.tpp_factorization_time += other.tpp_factorization_time;
+        self.app_pivot_factor_time += other.app_pivot_factor_time;
+        self.app_block_pivot_apply_time += other.app_block_pivot_apply_time;
+        self.app_failed_pivot_scan_time += other.app_failed_pivot_scan_time;
+        self.app_restore_time += other.app_restore_time;
+        self.app_accepted_update_time += other.app_accepted_update_time;
+        self.app_column_storage_time += other.app_column_storage_time;
+        self.solve_panel_build_time += other.solve_panel_build_time;
+        self.root_delayed_factorization_time += other.root_delayed_factorization_time;
+        self.factor_inverse_time += other.factor_inverse_time;
+        self.lower_storage_time += other.lower_storage_time;
+        self.solve_panel_storage_time += other.solve_panel_storage_time;
+        self.diagonal_storage_time += other.diagonal_storage_time;
+        self.factor_bytes_time += other.factor_bytes_time;
+        self.front_count += other.front_count;
+        self.local_dense_entries += other.local_dense_entries;
+        self.root_delayed_blocks += other.root_delayed_blocks;
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct SymmetricCscMatrix<'a> {
     dimension: usize,
@@ -473,6 +541,7 @@ struct MultifrontalFactorizationOutcome {
     factorization_residual_max_abs: f64,
     stored_nnz: usize,
     factor_bytes: usize,
+    profile: FactorProfile,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -503,6 +572,7 @@ struct FrontFactorizationResult {
     solve_panels: Vec<FactorSolvePanelRecord>,
     contribution: ContributionBlock,
     stats: PanelFactorStats,
+    profile: FactorProfile,
     max_front_size: usize,
     contribution_storage_bytes: usize,
 }
@@ -515,6 +585,16 @@ struct DenseFrontFactorization {
     solve_panels: Vec<FactorSolvePanelRecord>,
     contribution: ContributionBlock,
     stats: PanelFactorStats,
+    profile: FactorProfile,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DenseTppTailRequest {
+    start_pivot: usize,
+    candidate_len: usize,
+    options: NumericFactorOptions,
+    require_full_elimination: bool,
+    profile_enabled: bool,
 }
 
 struct NumericFactorBuffers<'a> {
@@ -810,6 +890,15 @@ impl NumericFactor {
         &mut self,
         matrix: SymmetricCscMatrix<'_>,
     ) -> Result<FactorInfo, SsidsError> {
+        self.refactorize_with_cached_symbolic_profile(matrix, None)
+    }
+
+    fn refactorize_with_cached_symbolic_profile(
+        &mut self,
+        matrix: SymmetricCscMatrix<'_>,
+        profile: Option<&mut FactorProfile>,
+    ) -> Result<FactorInfo, SsidsError> {
+        let profile_enabled = profile.is_some();
         let factorization = multifrontal_factorize_with_tree(
             matrix,
             &self.permutation,
@@ -829,7 +918,11 @@ impl NumericFactor {
                 permuted_matrix_source_positions: &mut self.permuted_matrix_source_positions,
                 permuted_matrix_values: &mut self.permuted_matrix_values,
             },
+            profile_enabled,
         )?;
+        if let Some(profile) = profile {
+            profile.accumulate(&factorization.profile);
+        }
         let info = FactorInfo {
             factorization_residual_max_abs: factorization.factorization_residual_max_abs,
         };
@@ -1051,13 +1144,37 @@ pub fn factorize(
     symbolic: &SymbolicFactor,
     options: &NumericFactorOptions,
 ) -> Result<(NumericFactor, FactorInfo), SsidsError> {
+    factorize_impl(matrix, symbolic, options, None)
+}
+
+pub fn factorize_with_profile(
+    matrix: SymmetricCscMatrix<'_>,
+    symbolic: &SymbolicFactor,
+    options: &NumericFactorOptions,
+) -> Result<(NumericFactor, FactorInfo, FactorProfile), SsidsError> {
+    let mut profile = FactorProfile::default();
+    let (factor, info) = factorize_impl(matrix, symbolic, options, Some(&mut profile))?;
+    Ok((factor, info, profile))
+}
+
+fn factorize_impl(
+    matrix: SymmetricCscMatrix<'_>,
+    symbolic: &SymbolicFactor,
+    options: &NumericFactorOptions,
+    mut profile: Option<&mut FactorProfile>,
+) -> Result<(NumericFactor, FactorInfo), SsidsError> {
     if matrix.dimension() != symbolic.permutation.len() {
         return Err(SsidsError::DimensionMismatch {
             expected: symbolic.permutation.len(),
             actual: matrix.dimension(),
         });
     }
+    let profile_enabled = profile.is_some();
+    let started = profile_enabled.then(Instant::now);
     let front_tree = build_symbolic_front_tree(symbolic);
+    if let (Some(profile), Some(started)) = (profile.as_mut(), started) {
+        profile.symbolic_front_tree_time += started.elapsed();
+    }
     let mut factor = NumericFactor {
         dimension: matrix.dimension(),
         permutation: symbolic.permutation.clone(),
@@ -1097,7 +1214,7 @@ pub fn factorize(
             .max()
             .unwrap_or(0),
     };
-    let info = factor.refactorize_with_cached_symbolic(matrix)?;
+    let info = factor.refactorize_with_cached_symbolic_profile(matrix, profile)?;
     Ok((factor, info))
 }
 
@@ -2785,23 +2902,27 @@ fn root_tpp_rank2_update(
 fn factorize_dense_tpp_tail_in_place(
     rows: &mut Vec<usize>,
     dense: &mut [f64],
-    start_pivot: usize,
-    candidate_len: usize,
-    options: NumericFactorOptions,
-    require_full_elimination: bool,
+    request: DenseTppTailRequest,
     ld: &mut [f64],
 ) -> Result<DenseFrontFactorization, SsidsError> {
+    let started = request.profile_enabled.then(Instant::now);
     let size = rows.len();
     let mut stats = PanelFactorStats::default();
     let mut factor_order = Vec::with_capacity(size);
     let mut factor_columns = Vec::with_capacity(size);
     let mut block_records = Vec::new();
-    let mut pivot = start_pivot;
-    let active_candidate_end = (start_pivot + candidate_len).min(size);
+    let mut pivot = request.start_pivot;
+    let active_candidate_end = (request.start_pivot + request.candidate_len).min(size);
 
     while pivot < active_candidate_end {
-        if dense_column_small(dense, size, pivot, pivot, options.small_pivot_tolerance) {
-            if !options.action_on_zero_pivot {
+        if dense_column_small(
+            dense,
+            size,
+            pivot,
+            pivot,
+            request.options.small_pivot_tolerance,
+        ) {
+            if !request.options.action_on_zero_pivot {
                 return Err(SsidsError::NumericalBreakdown {
                     pivot: rows[pivot],
                     detail: "TPP encountered a zero pivot with action disabled".into(),
@@ -2826,8 +2947,14 @@ fn factorize_dense_tpp_tail_in_place(
 
         let mut advanced = false;
         for candidate in (pivot + 1)..active_candidate_end {
-            if dense_column_small(dense, size, candidate, pivot, options.small_pivot_tolerance) {
-                if !options.action_on_zero_pivot {
+            if dense_column_small(
+                dense,
+                size,
+                candidate,
+                pivot,
+                request.options.small_pivot_tolerance,
+            ) {
+                if !request.options.action_on_zero_pivot {
                     return Err(SsidsError::NumericalBreakdown {
                         pivot: rows[pivot],
                         detail: "TPP encountered a zero pivot with action disabled".into(),
@@ -2866,7 +2993,7 @@ fn factorize_dense_tpp_tail_in_place(
             let maxt = dense_find_rc_abs_max_exclude(dense, size, first, pivot, Some(second));
             let mut maxp = dense_find_rc_abs_max_exclude(dense, size, second, pivot, Some(first));
 
-            if let Some(inverse) = tpp_test_two_by_two(a11, a21, a22, maxt, maxp, options) {
+            if let Some(inverse) = tpp_test_two_by_two(a11, a21, a22, maxt, maxp, request.options) {
                 if first != pivot {
                     dense_symmetric_swap(dense, size, first, pivot);
                     rows.swap(first, pivot);
@@ -2892,7 +3019,7 @@ fn factorize_dense_tpp_tail_in_place(
             }
 
             maxp = maxp.max(a21.abs());
-            if a22.abs() >= options.threshold_pivot_u * maxp {
+            if a22.abs() >= request.options.threshold_pivot_u * maxp {
                 if candidate != pivot {
                     dense_symmetric_swap(dense, size, candidate, pivot);
                     rows.swap(candidate, pivot);
@@ -2914,7 +3041,7 @@ fn factorize_dense_tpp_tail_in_place(
 
         let current_diag = dense[dense_lower_offset(size, pivot, pivot)];
         let current_offdiag_max = dense_find_rc_abs_max_exclude(dense, size, pivot, pivot, None);
-        if current_diag.abs() >= options.threshold_pivot_u * current_offdiag_max {
+        if current_diag.abs() >= request.options.threshold_pivot_u * current_offdiag_max {
             let (column, block) = tpp_factor_one_by_one(rows, dense, size, pivot, &mut stats, ld)?;
             factor_order.push(rows[pivot]);
             factor_columns.push(column);
@@ -2923,7 +3050,7 @@ fn factorize_dense_tpp_tail_in_place(
             continue;
         }
 
-        if require_full_elimination {
+        if request.require_full_elimination {
             return Err(SsidsError::NumericalBreakdown {
                 pivot: rows[pivot],
                 detail: "root TPP completion could not find an acceptable pivot".into(),
@@ -2946,6 +3073,11 @@ fn factorize_dense_tpp_tail_in_place(
         }
     }
 
+    let mut profile = FactorProfile::default();
+    if let Some(started) = started {
+        profile.tpp_factorization_time += started.elapsed();
+    }
+
     Ok(DenseFrontFactorization {
         factor_order,
         factor_columns,
@@ -2957,6 +3089,7 @@ fn factorize_dense_tpp_tail_in_place(
             dense: contribution_dense,
         },
         stats,
+        profile,
     })
 }
 
@@ -3048,11 +3181,22 @@ fn factorize_root_dense_tpp(
     mut rows: Vec<usize>,
     mut dense: Vec<f64>,
     options: NumericFactorOptions,
+    profile_enabled: bool,
 ) -> Result<DenseFrontFactorization, SsidsError> {
     let size = rows.len();
     let mut ld = vec![0.0; size.saturating_mul(2).max(1)];
-    let mut factorization =
-        factorize_dense_tpp_tail_in_place(&mut rows, &mut dense, 0, size, options, true, &mut ld)?;
+    let mut factorization = factorize_dense_tpp_tail_in_place(
+        &mut rows,
+        &mut dense,
+        DenseTppTailRequest {
+            start_pivot: 0,
+            candidate_len: size,
+            options,
+            require_full_elimination: true,
+            profile_enabled,
+        },
+        &mut ld,
+    )?;
     if let Some(&pivot) = factorization.contribution.row_ids.first() {
         return Err(SsidsError::NumericalBreakdown {
             pivot,
@@ -3062,12 +3206,16 @@ fn factorize_root_dense_tpp(
             ),
         });
     }
+    let started = profile_enabled.then(Instant::now);
     if let Some(panel) = build_factor_solve_panel_record(
         &factorization.factor_order,
         &factorization.factor_columns,
         &factorization.contribution.row_ids,
     )? {
         factorization.solve_panels.push(panel);
+    }
+    if let Some(started) = started {
+        factorization.profile.solve_panel_build_time += started.elapsed();
     }
     Ok(factorization)
 }
@@ -3077,6 +3225,7 @@ fn factorize_dense_front(
     candidate_len: usize,
     mut dense: Vec<f64>,
     options: NumericFactorOptions,
+    profile_enabled: bool,
 ) -> Result<DenseFrontFactorization, SsidsError> {
     let size = rows.len();
     let active_candidate_end = candidate_len.min(size);
@@ -3087,12 +3236,16 @@ fn factorize_dense_front(
         let mut factorization = factorize_dense_tpp_tail_in_place(
             &mut rows,
             &mut dense,
-            0,
-            active_candidate_end,
-            options,
-            false,
+            DenseTppTailRequest {
+                start_pivot: 0,
+                candidate_len: active_candidate_end,
+                options,
+                require_full_elimination: false,
+                profile_enabled,
+            },
             &mut tpp_ld,
         )?;
+        let started = profile_enabled.then(Instant::now);
         if let Some(panel) = build_factor_solve_panel_record(
             &factorization.factor_order,
             &factorization.factor_columns,
@@ -3100,10 +3253,14 @@ fn factorize_dense_front(
         )? {
             factorization.solve_panels.push(panel);
         }
+        if let Some(started) = started {
+            factorization.profile.solve_panel_build_time += started.elapsed();
+        }
         return Ok(factorization);
     }
 
     let mut stats = PanelFactorStats::default();
+    let mut profile = FactorProfile::default();
     let mut factor_order = Vec::new();
     let mut factor_columns = Vec::new();
     let mut block_records = Vec::new();
@@ -3119,6 +3276,7 @@ fn factorize_dense_front(
         let mut local_blocks = Vec::new();
         let mut block_pivot = block_start;
 
+        let started = profile_enabled.then(Instant::now);
         while block_pivot < block_end {
             let Some((best_abs, best_row, best_col)) =
                 dense_find_maxloc(&dense, size, block_pivot, block_end)
@@ -3257,7 +3415,11 @@ fn factorize_dense_front(
 
             break;
         }
+        if let Some(started) = started {
+            profile.app_pivot_factor_time += started.elapsed();
+        }
 
+        let started = profile_enabled.then(Instant::now);
         app_apply_block_pivots_to_trailing_rows(
             &mut dense,
             size,
@@ -3266,6 +3428,10 @@ fn factorize_dense_front(
             &local_blocks,
             options.small_pivot_tolerance,
         );
+        if let Some(started) = started {
+            profile.app_block_pivot_apply_time += started.elapsed();
+        }
+        let started = profile_enabled.then(Instant::now);
         let first_failed = app_first_failed_trailing_column(
             &dense,
             size,
@@ -3276,7 +3442,11 @@ fn factorize_dense_front(
         let local_passed = app_adjust_passed_prefix(&local_blocks, first_failed - block_start);
         let accepted_end = block_start + local_passed;
         let accepted_blocks = app_truncate_records_to_prefix(&local_blocks, local_passed);
+        if let Some(started) = started {
+            profile.app_failed_pivot_scan_time += started.elapsed();
+        }
 
+        let started = profile_enabled.then(Instant::now);
         app_restore_trailing_from_block_backup(
             &rows,
             &rows_before_block,
@@ -3285,6 +3455,10 @@ fn factorize_dense_front(
             size,
             accepted_end,
         );
+        if let Some(started) = started {
+            profile.app_restore_time += started.elapsed();
+        }
+        let started = profile_enabled.then(Instant::now);
         app_apply_accepted_prefix_update(
             &mut dense,
             size,
@@ -3292,8 +3466,12 @@ fn factorize_dense_front(
             accepted_end,
             &accepted_blocks,
         );
+        if let Some(started) = started {
+            profile.app_accepted_update_time += started.elapsed();
+        }
 
         factor_order.extend(rows[block_start..accepted_end].iter().copied());
+        let started = profile_enabled.then(Instant::now);
         factor_columns.extend(app_build_factor_columns_for_prefix(
             &rows,
             &dense,
@@ -3301,6 +3479,9 @@ fn factorize_dense_front(
             block_start,
             accepted_end,
         ));
+        if let Some(started) = started {
+            profile.app_column_storage_time += started.elapsed();
+        }
         stats.two_by_two_pivots += accepted_blocks
             .iter()
             .filter(|block| block.size == 2)
@@ -3323,22 +3504,30 @@ fn factorize_dense_front(
         let tpp_tail = factorize_dense_tpp_tail_in_place(
             &mut rows,
             &mut dense,
-            pivot,
-            delayed_count,
-            options,
-            false,
+            DenseTppTailRequest {
+                start_pivot: pivot,
+                candidate_len: delayed_count,
+                options,
+                require_full_elimination: false,
+                profile_enabled,
+            },
             &mut tpp_ld,
         )?;
         factor_order.extend(tpp_tail.factor_order);
         factor_columns.extend(tpp_tail.factor_columns);
         block_records.extend(tpp_tail.block_records);
         aggregate_panel_stats(&mut stats, tpp_tail.stats);
+        profile.accumulate(&tpp_tail.profile);
         let contribution = tpp_tail.contribution;
         let mut solve_panels = Vec::new();
+        let started = profile_enabled.then(Instant::now);
         if let Some(panel) =
             build_factor_solve_panel_record(&factor_order, &factor_columns, &contribution.row_ids)?
         {
             solve_panels.push(panel);
+        }
+        if let Some(started) = started {
+            profile.solve_panel_build_time += started.elapsed();
         }
         return Ok(DenseFrontFactorization {
             factor_order,
@@ -3347,6 +3536,7 @@ fn factorize_dense_front(
             solve_panels,
             contribution,
             stats,
+            profile,
         });
     }
 
@@ -3365,10 +3555,14 @@ fn factorize_dense_front(
         dense: contribution_dense,
     };
     let mut solve_panels = Vec::new();
+    let started = profile_enabled.then(Instant::now);
     if let Some(panel) =
         build_factor_solve_panel_record(&factor_order, &factor_columns, &contribution.row_ids)?
     {
         solve_panels.push(panel);
+    }
+    if let Some(started) = started {
+        profile.solve_panel_build_time += started.elapsed();
     }
 
     Ok(DenseFrontFactorization {
@@ -3378,6 +3572,7 @@ fn factorize_dense_front(
         solve_panels,
         contribution,
         stats,
+        profile,
     })
 }
 
@@ -3387,6 +3582,7 @@ fn factor_front_recursive(
     matrix: &PermutedLowerMatrix<'_>,
     options: NumericFactorOptions,
     progress: Option<&FactorizationProgressShared>,
+    profile_enabled: bool,
 ) -> Result<FrontFactorizationResult, SsidsError> {
     let front = &tree.fronts[front_id];
     let child_results =
@@ -3394,7 +3590,9 @@ fn factor_front_recursive(
             let raw = front
                 .children
                 .par_iter()
-                .map(|&child| factor_front_recursive(child, tree, matrix, options, progress))
+                .map(|&child| {
+                    factor_front_recursive(child, tree, matrix, options, progress, profile_enabled)
+                })
                 .collect::<Vec<_>>();
             let mut collected = Vec::with_capacity(raw.len());
             for result in raw {
@@ -3405,7 +3603,12 @@ fn factor_front_recursive(
             let mut collected = Vec::with_capacity(front.children.len());
             for &child in &front.children {
                 collected.push(factor_front_recursive(
-                    child, tree, matrix, options, progress,
+                    child,
+                    tree,
+                    matrix,
+                    options,
+                    progress,
+                    profile_enabled,
                 )?);
             }
             collected
@@ -3417,6 +3620,7 @@ fn factor_front_recursive(
     let mut solve_panels = Vec::new();
     let mut child_contributions = Vec::with_capacity(child_results.len());
     let mut stats = PanelFactorStats::default();
+    let mut profile = FactorProfile::default();
     let mut max_front_size = 0;
     let mut contribution_storage_bytes = 0;
 
@@ -3427,10 +3631,12 @@ fn factor_front_recursive(
         solve_panels.extend(child.solve_panels);
         child_contributions.push(child.contribution);
         aggregate_panel_stats(&mut stats, child.stats);
+        profile.accumulate(&child.profile);
         max_front_size = max_front_size.max(child.max_front_size);
         contribution_storage_bytes += child.contribution_storage_bytes;
     }
 
+    let assembly_started = profile_enabled.then(Instant::now);
     let mut row_state = vec![0_u8; matrix.dimension];
     let mut candidate_rows = Vec::with_capacity(front.columns.len());
     for &row in &front.columns {
@@ -3497,8 +3703,24 @@ fn factor_front_recursive(
             }
         }
     }
+    if let Some(started) = assembly_started {
+        profile.front_assembly_time += started.elapsed();
+        profile.front_count += 1;
+        profile.local_dense_entries += local_size * local_size;
+    }
 
-    let local = factorize_dense_front(local_rows, front.width(), local_dense, options)?;
+    let factor_started = profile_enabled.then(Instant::now);
+    let local = factorize_dense_front(
+        local_rows,
+        front.width(),
+        local_dense,
+        options,
+        profile_enabled,
+    )?;
+    if let Some(started) = factor_started {
+        profile.dense_front_factorization_time += started.elapsed();
+    }
+    profile.accumulate(&local.profile);
     if let Some(progress) = progress {
         progress.completed_fronts.fetch_add(1, Ordering::Relaxed);
         progress
@@ -3526,6 +3748,7 @@ fn factor_front_recursive(
         solve_panels,
         contribution: local.contribution,
         stats,
+        profile,
         max_front_size,
         contribution_storage_bytes,
     })
@@ -3537,11 +3760,14 @@ fn multifrontal_factorize_with_tree(
     tree: &SymbolicFrontTree,
     options: NumericFactorOptions,
     buffers: NumericFactorBuffers<'_>,
+    profile_enabled: bool,
 ) -> Result<MultifrontalFactorizationOutcome, SsidsError> {
     let dimension = matrix.dimension();
+    let mut profile = FactorProfile::default();
     if buffers.permuted_matrix_source_positions.len() != matrix.row_indices().len()
         || buffers.permuted_matrix_col_ptrs.len() != dimension + 1
     {
+        let started = profile_enabled.then(Instant::now);
         build_permuted_lower_csc_pattern(
             matrix,
             permutation,
@@ -3549,12 +3775,19 @@ fn multifrontal_factorize_with_tree(
             buffers.permuted_matrix_row_indices,
             buffers.permuted_matrix_source_positions,
         )?;
+        if let Some(started) = started {
+            profile.permuted_pattern_time += started.elapsed();
+        }
     }
+    let started = profile_enabled.then(Instant::now);
     fill_permuted_lower_csc_values(
         matrix,
         buffers.permuted_matrix_source_positions,
         buffers.permuted_matrix_values,
     )?;
+    if let Some(started) = started {
+        profile.permuted_values_time += started.elapsed();
+    }
     let permuted_matrix = PermutedLowerMatrix {
         dimension,
         col_ptrs: buffers.permuted_matrix_col_ptrs,
@@ -3582,19 +3815,31 @@ fn multifrontal_factorize_with_tree(
     });
     let _progress_guard = install_factorization_progress(Arc::clone(&progress));
     let root_results = if tree.roots.len() >= 2 && dimension >= 64 {
+        let started = profile_enabled.then(Instant::now);
         let raw = tree
             .roots
             .par_iter()
             .map(|&root| {
-                factor_front_recursive(root, tree, &permuted_matrix, options, Some(&progress))
+                factor_front_recursive(
+                    root,
+                    tree,
+                    &permuted_matrix,
+                    options,
+                    Some(&progress),
+                    profile_enabled,
+                )
             })
             .collect::<Vec<_>>();
+        if let Some(started) = started {
+            profile.front_factorization_time += started.elapsed();
+        }
         let mut collected = Vec::with_capacity(raw.len());
         for result in raw {
             collected.push(result?);
         }
         collected
     } else {
+        let started = profile_enabled.then(Instant::now);
         let mut collected = Vec::with_capacity(tree.roots.len());
         for &root in &tree.roots {
             collected.push(factor_front_recursive(
@@ -3603,7 +3848,11 @@ fn multifrontal_factorize_with_tree(
                 &permuted_matrix,
                 options,
                 Some(&progress),
+                profile_enabled,
             )?);
+        }
+        if let Some(started) = started {
+            profile.front_factorization_time += started.elapsed();
         }
         collected
     };
@@ -3621,6 +3870,7 @@ fn multifrontal_factorize_with_tree(
         solve_panel_records.extend(result.solve_panels);
         pending_root_contributions.push(result.contribution);
         aggregate_panel_stats(&mut stats, result.stats);
+        profile.accumulate(&result.profile);
     }
 
     let delayed_block_total = pending_root_contributions
@@ -3644,11 +3894,17 @@ fn multifrontal_factorize_with_tree(
         let size = row_ids.len();
         progress.begin_root_delayed_block(delayed_block_index, size);
         progress.set_root_delayed_stage(RootDelayedBlockStage::Factoring);
+        let started = profile_enabled.then(Instant::now);
         let delayed_local = factorize_root_dense_tpp(
             row_ids,
             unpack_packed_lower_to_dense_square(size, &dense),
             options,
+            profile_enabled,
         )?;
+        if let Some(started) = started {
+            profile.root_delayed_factorization_time += started.elapsed();
+            profile.root_delayed_blocks += 1;
+        }
         let fully_eliminated = size - delayed_local.contribution.row_ids.len();
         factor_order.extend(delayed_local.factor_order);
         factor_columns.extend(delayed_local.factor_columns);
@@ -3680,6 +3936,7 @@ fn multifrontal_factorize_with_tree(
         });
     }
 
+    let started = profile_enabled.then(Instant::now);
     buffers.factor_order.clear();
     buffers.factor_order.extend(factor_order);
 
@@ -3688,6 +3945,10 @@ fn multifrontal_factorize_with_tree(
     for (position, &ordered_index) in buffers.factor_order.iter().enumerate() {
         buffers.factor_inverse[ordered_index] = position;
     }
+    if let Some(started) = started {
+        profile.factor_inverse_time += started.elapsed();
+    }
+    let started = profile_enabled.then(Instant::now);
     buffers.lower_col_ptrs.clear();
     buffers.lower_col_ptrs.reserve(dimension + 1);
     buffers.lower_col_ptrs.push(0);
@@ -3713,7 +3974,11 @@ fn multifrontal_factorize_with_tree(
         }
         buffers.lower_col_ptrs.push(buffers.lower_row_indices.len());
     }
+    if let Some(started) = started {
+        profile.lower_storage_time += started.elapsed();
+    }
 
+    let started = profile_enabled.then(Instant::now);
     buffers.solve_panels.clear();
     for record in solve_panel_records {
         let mut row_positions = Vec::with_capacity(record.row_ids.len());
@@ -3733,7 +3998,11 @@ fn multifrontal_factorize_with_tree(
             values: record.values,
         });
     }
+    if let Some(started) = started {
+        profile.solve_panel_storage_time += started.elapsed();
+    }
 
+    let started = profile_enabled.then(Instant::now);
     buffers.diagonal_blocks.clear();
     buffers.diagonal_values.clear();
     for block in block_records {
@@ -3742,7 +4011,11 @@ fn multifrontal_factorize_with_tree(
             .push(DiagonalBlock { size: block.size });
         buffers.diagonal_values.extend(block.values);
     }
+    if let Some(started) = started {
+        profile.diagonal_storage_time += started.elapsed();
+    }
 
+    let started = profile_enabled.then(Instant::now);
     let stored_nnz = dimension
         + factor_columns
             .iter()
@@ -3776,6 +4049,9 @@ fn multifrontal_factorize_with_tree(
                     .iter()
                     .map(|front| 4 + front.interface_rows.len() + front.children.len())
                     .sum::<usize>());
+    if let Some(started) = started {
+        profile.factor_bytes_time += started.elapsed();
+    }
 
     Ok(MultifrontalFactorizationOutcome {
         pivot_stats: PivotStats {
@@ -3785,6 +4061,7 @@ fn multifrontal_factorize_with_tree(
         factorization_residual_max_abs: stats.max_residual,
         stored_nnz,
         factor_bytes,
+        profile,
     })
 }
 
@@ -4089,8 +4366,8 @@ mod tests {
     use metis_ordering::{CsrGraph, Permutation};
 
     use super::{
-        NativeOrdering, NativeSpral, NumericFactorOptions, OrderingStrategy, SsidsOptions,
-        SymmetricCscMatrix, analyse, build_symbolic_front_tree, dense_lower_offset,
+        DenseTppTailRequest, NativeOrdering, NativeSpral, NumericFactorOptions, OrderingStrategy,
+        SsidsOptions, SymmetricCscMatrix, analyse, build_symbolic_front_tree, dense_lower_offset,
         expand_symmetric_pattern, factorize, factorize_dense_tpp_tail_in_place,
         native_column_counts, native_postorder_permutation, permute_graph, symbolic_factor_pattern,
     };
@@ -4271,13 +4548,16 @@ mod tests {
         let factorization = factorize_dense_tpp_tail_in_place(
             &mut rows,
             &mut dense,
-            0,
-            2,
-            NumericFactorOptions {
-                threshold_pivot_u: 0.01,
-                ..NumericFactorOptions::default()
+            DenseTppTailRequest {
+                start_pivot: 0,
+                candidate_len: 2,
+                options: NumericFactorOptions {
+                    threshold_pivot_u: 0.01,
+                    ..NumericFactorOptions::default()
+                },
+                require_full_elimination: false,
+                profile_enabled: false,
             },
-            false,
             &mut ld,
         )
         .expect("tpp tail factorization");

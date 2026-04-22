@@ -1309,10 +1309,10 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use serde::de::DeserializeOwned;
     use spral_ssids::{
-        NativeSpral, NumericFactorOptions, OrderingStrategy, SolveProfile, SsidsOptions,
-        SymmetricCscMatrix, analyse as spral_analyse,
+        FactorProfile, NativeSpral, NumericFactorOptions, OrderingStrategy, SolveProfile,
+        SsidsOptions, SymmetricCscMatrix, analyse as spral_analyse,
         approximate_minimum_degree_permutation as spral_amd_permutation,
-        factorize as spral_factorize,
+        factorize as spral_factorize, factorize_with_profile as spral_factorize_with_profile,
     };
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
@@ -1345,6 +1345,7 @@ mod tests {
         solution_inf: f64,
         solution: Vec<f64>,
         inertia: String,
+        factor_profile: Option<FactorProfile>,
         solve_profile: Option<SolveProfile>,
     }
 
@@ -1527,8 +1528,9 @@ mod tests {
         )
         .expect("rust spral analyse should succeed on dumped KKT");
         let factor_started = Instant::now();
-        let (mut factor, _) = spral_factorize(numeric, &symbolic, &NumericFactorOptions::default())
-            .expect("rust spral factorization should succeed on dumped KKT");
+        let (mut factor, _, factor_profile) =
+            spral_factorize_with_profile(numeric, &symbolic, &NumericFactorOptions::default())
+                .expect("rust spral factorization should succeed on dumped KKT");
         let factor_time = factor_started.elapsed();
         let solve_started = Instant::now();
         let (mut solution, mut solve_profile) = factor
@@ -1557,6 +1559,7 @@ mod tests {
             solution_inf: solution_inf(&solution),
             solution,
             inertia: format!("{:?}", factor.inertia()),
+            factor_profile: Some(factor_profile),
             solve_profile: Some(solve_profile),
         }
     }
@@ -1617,6 +1620,7 @@ mod tests {
             solution_inf: solution_inf(&solution),
             solution,
             inertia: format!("{:?}", factor_info.inertia),
+            factor_profile: None,
             solve_profile: None,
         }
     }
@@ -2432,6 +2436,41 @@ mod tests {
             rust_exact.solution_inf,
             rust_exact.inertia,
         );
+        if let Some(profile) = &rust_exact.factor_profile {
+            println!(
+                "  rust_spral factor_profile symbolic_tree={:?} pattern={:?} values={:?} fronts={:?} root_delayed={:?} inverse={:?} lower_storage={:?} solve_panel_storage={:?} diagonal_storage={:?} bytes={:?} recorded={:?}",
+                profile.symbolic_front_tree_time,
+                profile.permuted_pattern_time,
+                profile.permuted_values_time,
+                profile.front_factorization_time,
+                profile.root_delayed_factorization_time,
+                profile.factor_inverse_time,
+                profile.lower_storage_time,
+                profile.solve_panel_storage_time,
+                profile.diagonal_storage_time,
+                profile.factor_bytes_time,
+                profile.total_recorded_time(),
+            );
+            println!(
+                "  rust_spral front_profile assembly={:?} dense_factor={:?} fronts={} local_dense_entries={} root_delayed_blocks={}",
+                profile.front_assembly_time,
+                profile.dense_front_factorization_time,
+                profile.front_count,
+                profile.local_dense_entries,
+                profile.root_delayed_blocks,
+            );
+            println!(
+                "  rust_spral dense_front_profile tpp={:?} app_pivot_factor={:?} app_block_apply={:?} app_failed_scan={:?} app_restore={:?} app_accepted_update={:?} app_column_storage={:?} solve_panel_build={:?}",
+                profile.tpp_factorization_time,
+                profile.app_pivot_factor_time,
+                profile.app_block_pivot_apply_time,
+                profile.app_failed_pivot_scan_time,
+                profile.app_restore_time,
+                profile.app_accepted_update_time,
+                profile.app_column_storage_time,
+                profile.solve_panel_build_time,
+            );
+        }
         if let Some(profile) = &rust_exact.solve_profile {
             println!(
                 "  rust_spral solve_profile input_perm={:?} forward={:?} diagonal={:?} backward={:?} output_perm={:?} recorded={:?}",
