@@ -2366,6 +2366,32 @@ fn app_apply_block_pivots_to_trailing_rows(
         return (Duration::default(), Duration::default());
     }
 
+    let triangular_solve_time = app_solve_block_triangular_to_trailing_rows(
+        matrix,
+        size,
+        block_start,
+        block_end,
+        profile_enabled,
+    );
+    let diagonal_apply_time = app_apply_block_diagonal_to_trailing_rows(
+        matrix,
+        size,
+        block_start,
+        block_end,
+        block_records,
+        small,
+        profile_enabled,
+    );
+    (triangular_solve_time, diagonal_apply_time)
+}
+
+fn app_solve_block_triangular_to_trailing_rows(
+    matrix: &mut [f64],
+    size: usize,
+    block_start: usize,
+    block_end: usize,
+    profile_enabled: bool,
+) -> Duration {
     // OP_N applies a diagonal block to rows below the eliminated columns, where
     // SPRAL's column-major `aval[col * lda + row]` matches our dense storage.
     let triangular_started = profile_enabled.then(Instant::now);
@@ -2400,9 +2426,18 @@ fn app_apply_block_pivots_to_trailing_rows(
             group_start = group_end;
         }
     }
-    let triangular_solve_time =
-        triangular_started.map_or(Duration::default(), |started| started.elapsed());
+    triangular_started.map_or(Duration::default(), |started| started.elapsed())
+}
 
+fn app_apply_block_diagonal_to_trailing_rows(
+    matrix: &mut [f64],
+    size: usize,
+    block_start: usize,
+    block_end: usize,
+    block_records: &[FactorBlockRecord],
+    small: f64,
+    profile_enabled: bool,
+) -> Duration {
     let diagonal_started = profile_enabled.then(Instant::now);
     let mut col = block_start;
     for block in block_records {
@@ -2437,10 +2472,7 @@ fn app_apply_block_pivots_to_trailing_rows(
             col += 2;
         }
     }
-    (
-        triangular_solve_time,
-        diagonal_started.map_or(Duration::default(), |started| started.elapsed()),
-    )
+    diagonal_started.map_or(Duration::default(), |started| started.elapsed())
 }
 
 fn app_first_failed_trailing_column(
@@ -4398,8 +4430,9 @@ mod tests {
     use super::{
         DenseTppTailRequest, FactorBlockRecord, NativeOrdering, NativeSpral, NumericFactorOptions,
         OrderingStrategy, SsidsOptions, SymmetricCscMatrix, analyse,
-        app_apply_block_pivots_to_trailing_rows, app_build_ld_workspace, build_symbolic_front_tree,
-        dense_lower_offset, expand_symmetric_pattern, factorize, factorize_dense_tpp_tail_in_place,
+        app_apply_block_pivots_to_trailing_rows, app_build_ld_workspace,
+        app_solve_block_triangular_to_trailing_rows, build_symbolic_front_tree, dense_lower_offset,
+        expand_symmetric_pattern, factorize, factorize_dense_tpp_tail_in_place,
         native_column_counts, native_postorder_permutation, permute_graph, symbolic_factor_pattern,
     };
 
@@ -4459,11 +4492,14 @@ mod tests {
         unsafe extern "C" fn(c_int, c_int, *const f64, *const f64, f64, *mut f64, c_int);
     type CalcLdOpNFn =
         unsafe extern "C" fn(c_int, c_int, *const f64, c_int, *const f64, *mut f64, c_int);
+    type HostTrsmRightLowerTransUnitFn =
+        unsafe extern "C" fn(c_int, c_int, *const f64, c_int, *mut f64, c_int);
 
     struct NativeKernelShim {
         _library: Library,
         apply_pivot_op_n: ApplyPivotOpNFn,
         calc_ld_op_n: CalcLdOpNFn,
+        host_trsm_right_lower_trans_unit: HostTrsmRightLowerTransUnitFn,
     }
 
     static NATIVE_KERNEL_SHIM: OnceLock<Result<NativeKernelShim, String>> = OnceLock::new();
@@ -4574,11 +4610,21 @@ mod tests {
                 .get::<CalcLdOpNFn>(b"spral_kernel_calc_ld_op_n\0")
                 .map_err(|error| format!("failed to load calcLD OP_N shim: {error}"))?
         };
+        let host_trsm_right_lower_trans_unit = unsafe {
+            *library
+                .get::<HostTrsmRightLowerTransUnitFn>(
+                    b"spral_kernel_host_trsm_right_lower_trans_unit\0",
+                )
+                .map_err(|error| {
+                    format!("failed to load host_trsm right/lower/trans/unit shim: {error}")
+                })?
+        };
 
         Ok(NativeKernelShim {
             _library: library,
             apply_pivot_op_n,
             calc_ld_op_n,
+            host_trsm_right_lower_trans_unit,
         })
     }
 
@@ -4605,6 +4651,7 @@ mod tests {
     fn native_kernel_shim_source() -> &'static str {
         r#"
 #include "ssids/cpu/kernels/common.hxx"
+#include "ssids/cpu/kernels/wrappers.hxx"
 
 namespace spral { namespace ssids { namespace cpu {
 template <enum operation op, typename T>
@@ -4628,6 +4675,16 @@ extern "C" void spral_kernel_calc_ld_op_n(
       double* ld, int ldld) {
    spral::ssids::cpu::calcLD<spral::ssids::cpu::OP_N, double>(
          m, n, l, ldl, d, ld, ldld);
+}
+
+extern "C" void spral_kernel_host_trsm_right_lower_trans_unit(
+      int m, int n, const double* a, int lda, double* b, int ldb) {
+   spral::ssids::cpu::host_trsm<double>(
+         spral::ssids::cpu::SIDE_RIGHT,
+         spral::ssids::cpu::FILL_MODE_LWR,
+         spral::ssids::cpu::OP_T,
+         spral::ssids::cpu::DIAG_UNIT,
+         m, n, 1.0, a, lda, b, ldb);
 }
 "#
     }
@@ -4761,6 +4818,182 @@ extern "C" void spral_kernel_calc_ld_op_n(
         }
     }
 
+    fn native_host_trsm_op_n(shim: &NativeKernelShim, case: &AppKernelCase, matrix: &mut [f64]) {
+        let trailing_rows = case.size - case.block_end;
+        let block_width = case.block_end - case.block_start;
+        let diag_offset = case.block_start * case.size + case.block_start;
+        let aval_offset = case.block_start * case.size + case.block_end;
+
+        unsafe {
+            (shim.host_trsm_right_lower_trans_unit)(
+                trailing_rows as c_int,
+                block_width as c_int,
+                matrix.as_ptr().add(diag_offset),
+                case.size as c_int,
+                matrix.as_mut_ptr().add(aval_offset),
+                case.size as c_int,
+            );
+        }
+    }
+
+    fn native_apply_pivot_op_n(shim: &NativeKernelShim, case: &AppKernelCase, matrix: &mut [f64]) {
+        let trailing_rows = case.size - case.block_end;
+        let block_width = case.block_end - case.block_start;
+        let diag_offset = case.block_start * case.size + case.block_start;
+        let aval_offset = case.block_start * case.size + case.block_end;
+
+        unsafe {
+            (shim.apply_pivot_op_n)(
+                trailing_rows as c_int,
+                block_width as c_int,
+                matrix.as_ptr().add(diag_offset),
+                case.d_values.as_ptr(),
+                case.small,
+                matrix.as_mut_ptr().add(aval_offset),
+                case.size as c_int,
+            );
+        }
+    }
+
+    fn assert_app_kernel_matrices_bitwise_equal(
+        label: &str,
+        case: &AppKernelCase,
+        rust_matrix: &[f64],
+        native_matrix: &[f64],
+    ) {
+        for (index, (&rust, &native)) in rust_matrix.iter().zip(native_matrix.iter()).enumerate() {
+            assert_eq!(
+                rust.to_bits(),
+                native.to_bits(),
+                "{label} mismatch seed={:#x} index={} rust={:?} ({:#018x}) native={:?} ({:#018x}) case={:?}",
+                case.seed,
+                index,
+                rust,
+                rust.to_bits(),
+                native,
+                native.to_bits(),
+                case
+            );
+        }
+    }
+
+    #[test]
+    fn app_block_triangular_solve_op_n_matches_native_host_trsm_property_cases() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let cases = env_usize("SPRAL_SSIDS_KERNEL_PARITY_CASES", 512);
+        let seed = env_u64("SPRAL_SSIDS_KERNEL_PARITY_SEED", 0xd751_900d_0001);
+        let mut runner = deterministic_kernel_runner(cases, seed);
+
+        runner
+            .run(&any::<u64>(), |case_seed| {
+                let case = app_kernel_case_from_seed(
+                    seed ^ case_seed,
+                    AppKernelCaseOptions {
+                        allow_two_by_two: true,
+                        allow_signed_zero: false,
+                    },
+                );
+                let mut rust_matrix = case.matrix.clone();
+                let mut native_matrix = case.matrix.clone();
+
+                native_host_trsm_op_n(shim, &case, &mut native_matrix);
+                app_solve_block_triangular_to_trailing_rows(
+                    &mut rust_matrix,
+                    case.size,
+                    case.block_start,
+                    case.block_end,
+                    false,
+                );
+
+                for (index, (&rust, &native)) in
+                    rust_matrix.iter().zip(native_matrix.iter()).enumerate()
+                {
+                    prop_assert_eq!(
+                        rust.to_bits(),
+                        native.to_bits(),
+                        "host_trsm OP_N mismatch seed={:#x} index={} rust={:?} native={:?} case={:?}",
+                        case.seed,
+                        index,
+                        rust,
+                        native,
+                        case
+                    );
+                }
+                Ok(())
+            })
+            .expect("host_trsm OP_N kernel parity property failed");
+    }
+
+    #[test]
+    #[ignore = "manual native-vs-rust host_trsm signed-zero witness"]
+    fn app_block_triangular_solve_op_n_signed_zero_witness() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let case = app_kernel_case_from_seed(
+            0xbffe_dbb3_2ab8_66e0,
+            AppKernelCaseOptions {
+                allow_two_by_two: true,
+                allow_signed_zero: true,
+            },
+        );
+        let mut rust_matrix = case.matrix.clone();
+        let mut native_matrix = case.matrix.clone();
+
+        native_host_trsm_op_n(shim, &case, &mut native_matrix);
+        app_solve_block_triangular_to_trailing_rows(
+            &mut rust_matrix,
+            case.size,
+            case.block_start,
+            case.block_end,
+            false,
+        );
+
+        assert_app_kernel_matrices_bitwise_equal(
+            "host_trsm OP_N signed-zero witness",
+            &case,
+            &rust_matrix,
+            &native_matrix,
+        );
+    }
+
+    #[test]
+    #[ignore = "manual native-vs-rust apply_pivot signed-zero witness"]
+    fn app_apply_pivot_op_n_signed_zero_witness() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let case = app_kernel_case_from_seed(
+            0xbffe_dbb3_2ab8_66e0,
+            AppKernelCaseOptions {
+                allow_two_by_two: true,
+                allow_signed_zero: true,
+            },
+        );
+        let mut rust_matrix = case.matrix.clone();
+        let mut native_matrix = case.matrix.clone();
+
+        native_apply_pivot_op_n(shim, &case, &mut native_matrix);
+        app_apply_block_pivots_to_trailing_rows(
+            &mut rust_matrix,
+            case.size,
+            case.block_start,
+            case.block_end,
+            &case.block_records,
+            case.small,
+            false,
+        );
+
+        assert_app_kernel_matrices_bitwise_equal(
+            "apply_pivot OP_N signed-zero witness",
+            &case,
+            &rust_matrix,
+            &native_matrix,
+        );
+    }
+
     #[test]
     fn app_apply_pivot_op_n_matches_native_kernel_property_cases() {
         let Some(shim) = native_kernel_shim_or_skip() else {
@@ -4781,22 +5014,8 @@ extern "C" void spral_kernel_calc_ld_op_n(
                 );
                 let mut rust_matrix = case.matrix.clone();
                 let mut native_matrix = case.matrix.clone();
-                let trailing_rows = case.size - case.block_end;
-                let block_width = case.block_end - case.block_start;
-                let diag_offset = case.block_start * case.size + case.block_start;
-                let aval_offset = case.block_start * case.size + case.block_end;
 
-                unsafe {
-                    (shim.apply_pivot_op_n)(
-                        trailing_rows as c_int,
-                        block_width as c_int,
-                        native_matrix.as_ptr().add(diag_offset),
-                        case.d_values.as_ptr(),
-                        case.small,
-                        native_matrix.as_mut_ptr().add(aval_offset),
-                        case.size as c_int,
-                    );
-                }
+                native_apply_pivot_op_n(shim, &case, &mut native_matrix);
                 app_apply_block_pivots_to_trailing_rows(
                     &mut rust_matrix,
                     case.size,
@@ -4906,22 +5125,8 @@ extern "C" void spral_kernel_calc_ld_op_n(
                 );
                 let mut rust_matrix = case.matrix.clone();
                 let mut native_matrix = case.matrix.clone();
-                let trailing_rows = case.size - case.block_end;
-                let block_width = case.block_end - case.block_start;
-                let diag_offset = case.block_start * case.size + case.block_start;
-                let aval_offset = case.block_start * case.size + case.block_end;
 
-                unsafe {
-                    (shim.apply_pivot_op_n)(
-                        trailing_rows as c_int,
-                        block_width as c_int,
-                        native_matrix.as_ptr().add(diag_offset),
-                        case.d_values.as_ptr(),
-                        case.small,
-                        native_matrix.as_mut_ptr().add(aval_offset),
-                        case.size as c_int,
-                    );
-                }
+                native_apply_pivot_op_n(shim, &case, &mut native_matrix);
                 app_apply_block_pivots_to_trailing_rows(
                     &mut rust_matrix,
                     case.size,
