@@ -6,20 +6,29 @@ newly passing in the current checkpoint. Orange nodes have partial coverage or a
 known narrowed boundary. Red nodes are the next open bitwise mismatch target.
 
 Current newly passing witness:
-`dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now also
-checks the seed09 tail with native `ldlt_tpp_factor` embedded at the same
-offset and leading dimension it has inside the 55-row APP front. The embedded
-tail D entries match the isolated native tail D entries bitwise. The full
+`dense_seed09_case0_production_inverse_d_entries_match_through_pivot38_except_known_gap`
+pins SPRAL's `enquire_indef` layout from
+`target/native/spral-upstream/src/ssids/cpu/NumericSubtree.hxx`: `d(1,:)`
+holds inverse-D diagonal entries and `d(2,:)` holds off-diagonal entries in
+pivot order. Dense seed09 production inverse-D now has an active guard showing
+all components through pivot 38 match bitwise except the known pivot 37
+off-diagonal gap. The next confirmed drift is pivot 39's diagonal component.
+
+Previous newly passing witness:
+`dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` checked the
+seed09 tail with native `ldlt_tpp_factor` embedded at the same offset and
+leading dimension it has inside the 55-row APP front. The embedded tail D
+entries match the isolated native tail D entries bitwise. The full
 native-production inverse-D guard still first differs at flattened index 75, so
 the open issue is outside tail-pointer offset and leading-dimension effects.
 
-Previous newly passing witness:
+Earlier passing witness:
 `dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` checked that
 Rust production inverse-D storage for the dense seed09 tail matched the isolated
 TPP tail D entries after converting SPRAL's internal 2x2 marker layout to
 enquiry layout.
 
-Earlier passing witness:
+Earlier APP apply-pivot witness:
 `dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` checked the
 seed09 first-panel `apply_pivot<OP_N>` output with SPRAL's APP leading
 dimension, `lda=align_lda(55)`. The L block handed to the accepted APP update
@@ -35,7 +44,9 @@ Current open guard witness:
 `rust_and_native_spral_dense_seed_09c9134e4eff0004_case0_solution_bits`
 still captures the dense APP boundary solve mismatch. The paired manual
 inverse-D replay is `dense_seed09_case0_production_inverse_d_matches_native`,
-which now first differs at flattened inverse-D index 75.
+which now first differs at flattened inverse-D index 75, i.e. pivot 37
+component 1 in SPRAL's enquiry layout. Pivot 39 component 0 is the next
+confirmed diagonal drift after skipping the first off-diagonal gap.
 
 ```mermaid
 flowchart TD
@@ -97,7 +108,8 @@ flowchart TD
     K4c --> K4d["Dense seed09 APP-stride TPP tail D bits"]
     K4d --> K4g["Dense seed09 embedded-offset native TPP tail D bits"]
     K4g --> K4f["Dense seed09 Rust production tail D storage"]
-    K4f --> K4b["Dense APP case0 full inverse-D bits"]
+    K4f --> K4h["Dense seed09 post-gap pivot38 inverse-D bits"]
+    K4h --> K4b["Dense APP case0 full inverse-D bits"]
     K4b --> K4["Dense APP boundary case0 solution bits"]
     J --> K
     K1 --> L{"More fronts?"}
@@ -118,8 +130,8 @@ flowchart TD
     classDef open fill:#ffd8d8,stroke:#b43b3b,color:#2b0d0d,stroke-width:2px;
 
     class A,B,B1,B2,B3,G0,G1,G3,G5,G6,G8,G8a,G8b,G9,H1,H2,H3,K1,M,O,P,Q,R match;
-    class K4g newly;
+    class K4h newly;
     class C,D,E,F,G,G2,G4,G7,G10,H,I,J,K,L,N partial;
-    class G8c,G8d,G9a,I0,I1,I2,I3,K2,K3,K4a,K4c,K4d,K4e,K4f match;
+    class G8c,G8d,G9a,I0,I1,I2,I3,K2,K3,K4a,K4c,K4d,K4e,K4f,K4g match;
     class K4b,K4 open;
 ```

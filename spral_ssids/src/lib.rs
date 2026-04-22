@@ -4859,6 +4859,19 @@ mod tests {
         }
     }
 
+    fn native_spral_or_skip() -> Option<NativeSpral> {
+        match NativeSpral::load() {
+            Ok(native) => Some(native),
+            Err(error) => {
+                if std::env::var_os("AD_CODEGEN_REQUIRE_NATIVE_SPRAL_PARITY").is_some() {
+                    panic!("native SPRAL is required for fail-closed parity runs: {error}");
+                }
+                eprintln!("skipping native SPRAL parity test: {error}");
+                None
+            }
+        }
+    }
+
     fn build_native_kernel_shim() -> Result<NativeKernelShim, String> {
         let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -8795,7 +8808,7 @@ extern "C" int spral_kernel_block_prefix_trace_32(
 
     #[test]
     fn relaxed_symbolic_fronts_match_native_dense_gap_pivot_order() {
-        let Ok(native) = NativeSpral::load() else {
+        let Some(native) = native_spral_or_skip() else {
             return;
         };
         let mut rng = DenseBoundaryRng::new(0x1001);
@@ -8844,7 +8857,7 @@ extern "C" int spral_kernel_block_prefix_trace_32(
 
     #[test]
     fn app_find_maxloc_tie_order_matches_native_dense_seed6() {
-        let Ok(native) = NativeSpral::load() else {
+        let Some(native) = native_spral_or_skip() else {
             return;
         };
         let (dimension, dense) = dense_seed6_33_matrix();
@@ -9024,7 +9037,7 @@ extern "C" int spral_kernel_block_prefix_trace_32(
 
     #[test]
     fn dense_seed6_production_factor_metadata_matches_native() {
-        let Ok(native) = NativeSpral::load() else {
+        let Some(native) = native_spral_or_skip() else {
             return;
         };
         let (dimension, dense) = dense_seed6_33_matrix();
@@ -9066,7 +9079,7 @@ extern "C" int spral_kernel_block_prefix_trace_32(
 
     #[test]
     fn dense_seed6_production_inverse_d_matches_native() {
-        let Ok(native) = NativeSpral::load() else {
+        let Some(native) = native_spral_or_skip() else {
             return;
         };
         let (dimension, dense) = dense_seed6_33_matrix();
@@ -9101,7 +9114,7 @@ extern "C" int spral_kernel_block_prefix_trace_32(
 
     #[test]
     fn dense_seed09_case0_production_app_prefix_inverse_d_matches_native() {
-        let Ok(native) = NativeSpral::load() else {
+        let Some(native) = native_spral_or_skip() else {
             return;
         };
         let (dimension, dense) = dense_seed09_case0_matrix();
@@ -9154,9 +9167,68 @@ extern "C" int spral_kernel_block_prefix_trace_32(
     }
 
     #[test]
+    fn dense_seed09_case0_production_inverse_d_entries_match_through_pivot38_except_known_gap() {
+        let Some(native) = native_spral_or_skip() else {
+            return;
+        };
+        let (dimension, dense) = dense_seed09_case0_matrix();
+        let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+        let matrix = SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
+            .expect("valid CSC");
+        let options = NumericFactorOptions::default();
+
+        let (symbolic, _) = analyse(
+            matrix,
+            &SsidsOptions {
+                ordering: OrderingStrategy::Natural,
+            },
+        )
+        .expect("rust analyse");
+        let (rust_factor, _) = factorize(matrix, &symbolic, &options).expect("rust factorize");
+
+        let mut native_session = native
+            .analyse_with_options_and_ordering(matrix, &options, NativeOrdering::Natural)
+            .expect("native analyse");
+        native_session.factorize(matrix).expect("native factorize");
+        let native_enquiry = native_session.enquire_indef().expect("native enquire");
+
+        let rust_entries = rust_inverse_diagonal_entries(&rust_factor);
+        let native_entries = native_enquiry.inverse_diagonal_entries;
+        assert_eq!(rust_entries.len(), native_entries.len());
+
+        // Native enquiry writes d(1,:) as the inverse-D diagonal component and
+        // d(2,:) as the off-diagonal component in pivot order. The current
+        // production guard first diverges at pivot 37, component 1, but the
+        // following pivot still matches bitwise; the next diagonal drift starts
+        // at pivot 39.
+        for pivot in 0..=38 {
+            for component in 0..2 {
+                if pivot == 37 && component == 1 {
+                    continue;
+                }
+                assert_eq!(
+                    rust_entries[pivot][component].to_bits(),
+                    native_entries[pivot][component].to_bits(),
+                    "dense seed09 production inverse-D mismatch pivot={pivot} component={component}"
+                );
+            }
+        }
+        assert_ne!(
+            rust_entries[37][1].to_bits(),
+            native_entries[37][1].to_bits(),
+            "dense seed09 production inverse-D pivot 37 component 1 now matches; promote the full prefix"
+        );
+        assert_ne!(
+            rust_entries[39][0].to_bits(),
+            native_entries[39][0].to_bits(),
+            "dense seed09 production inverse-D pivot 39 diagonal now matches; promote this guard"
+        );
+    }
+
+    #[test]
     #[ignore = "manual exact production inverse-D bit mismatch witness for dense seed09 case0"]
     fn dense_seed09_case0_production_inverse_d_matches_native() {
-        let Ok(native) = NativeSpral::load() else {
+        let Some(native) = native_spral_or_skip() else {
             return;
         };
         let (dimension, dense) = dense_seed09_case0_matrix();
