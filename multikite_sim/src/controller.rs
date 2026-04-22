@@ -23,6 +23,10 @@ const TECS_THRUST_INTEGRATOR_LIMIT_NM: f64 = 8.0;
 const TECS_PITCH_BALANCE_P: f64 = 0.0012;
 const TECS_PITCH_BALANCE_I: f64 = 0.00035;
 const TECS_PITCH_INTEGRATOR_LIMIT_RAD: f64 = 7.0_f64.to_radians();
+const FREE_FLIGHT_DEMO_STAGE_S: f64 = 10.0;
+const FREE_FLIGHT_DEMO_SPEED_STEP_MPS: f64 = 3.0;
+const FREE_FLIGHT_DEMO_ALTITUDE_STEP_UP_M: f64 = 12.0;
+const FREE_FLIGHT_DEMO_ALTITUDE_STEP_DOWN_M: f64 = -8.0;
 const ALPHA_PROTECTION_MIN_RAD: f64 = -10.0_f64.to_radians();
 const ALPHA_PROTECTION_MAX_RAD: f64 = 12.0_f64.to_radians();
 const ALPHA_TO_ELEVATOR: f64 = 2.0;
@@ -131,11 +135,11 @@ fn speed_integrator_target(phase_error: f64, speed_ref: f64) -> f64 {
 }
 
 fn free_flight_roll_reference(time: f64) -> f64 {
-    if time < 1.0 {
+    if time < 60.0 {
         0.0
-    } else if time < 3.0 {
+    } else if time < 70.0 {
         20.0_f64.to_radians()
-    } else if time < 5.0 {
+    } else if time < 80.0 {
         -20.0_f64.to_radians()
     } else {
         0.0
@@ -143,23 +147,23 @@ fn free_flight_roll_reference(time: f64) -> f64 {
 }
 
 fn free_flight_speed_reference(time: f64, speed_ref: f64) -> f64 {
-    if time < 2.0 {
-        speed_ref
-    } else if time < 4.0 {
-        speed_ref + 3.0
-    } else {
-        speed_ref - 3.0
+    match free_flight_demo_stage(time) {
+        1 | 2 | 4 => speed_ref + FREE_FLIGHT_DEMO_SPEED_STEP_MPS,
+        3 => speed_ref - FREE_FLIGHT_DEMO_SPEED_STEP_MPS,
+        _ => speed_ref,
     }
 }
 
 fn free_flight_altitude_reference(time: f64, initial_altitude: f64) -> f64 {
-    if time < 2.0 {
-        initial_altitude
-    } else if time < 7.0 {
-        initial_altitude + 12.0
-    } else {
-        initial_altitude - 8.0
+    match free_flight_demo_stage(time) {
+        2 | 4 => initial_altitude + FREE_FLIGHT_DEMO_ALTITUDE_STEP_UP_M,
+        3 => initial_altitude + FREE_FLIGHT_DEMO_ALTITUDE_STEP_DOWN_M,
+        _ => initial_altitude,
     }
+}
+
+fn free_flight_demo_stage(time: f64) -> usize {
+    (time.max(0.0) / FREE_FLIGHT_DEMO_STAGE_S).floor() as usize
 }
 
 #[derive(Clone, Copy, Debug)]

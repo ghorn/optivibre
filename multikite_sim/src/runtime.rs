@@ -1212,6 +1212,26 @@ mod tests {
             - params.kites[0].tether.contact.ground_altitude)
             .max(0.0);
         let mut controller_state = ControllerState::<1>::new(&initial_diag);
+        let reference = |index: usize, time: f64, initial_altitude: f64, speed_ref: f64| {
+            assert_eq!(index, 0);
+            FreeFlightReference {
+                speed_target: if time < 2.0 {
+                    speed_ref
+                } else if time < 4.0 {
+                    speed_ref + 3.0
+                } else {
+                    speed_ref - 3.0
+                },
+                altitude_ref_raw: if time < 2.0 {
+                    initial_altitude
+                } else if time < 7.0 {
+                    initial_altitude + 12.0
+                } else {
+                    initial_altitude - 8.0
+                },
+                roll_ref: 0.0,
+            }
+        };
 
         let mut time = 0.0_f64;
         let mut min_airspeed = f64::INFINITY;
@@ -1227,7 +1247,7 @@ mod tests {
             let (_, mut diagnostics) = rhs
                 .eval(&state, &controls, &params)
                 .expect("diagnostics during 2D TECS test");
-            let (mut next_controls, trace) = controller_step(
+            let (mut next_controls, trace) = controller_step_with_free_flight_reference(
                 &mut controller_state,
                 &state,
                 &diagnostics,
@@ -1235,6 +1255,7 @@ mod tests {
                 config.dt_control,
                 config.phase_mode,
                 time,
+                reference,
             );
             suppress_lateral_controls(&mut next_controls, &params);
             apply_trace(&mut diagnostics, &trace);

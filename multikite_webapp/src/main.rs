@@ -28,7 +28,7 @@ const TEXT_CSS_UTF8: &str = "text/css; charset=utf-8";
 const IMAGE_SVG_XML: &str = "image/svg+xml";
 const APPLICATION_NDJSON_UTF8: &str = "application/x-ndjson; charset=utf-8";
 const GENERATED_APP_JS: &str = include_str!(concat!(env!("OUT_DIR"), "/app.js"));
-const STREAM_SNAPSHOT_FRAME_STRIDE: usize = 10;
+const STREAM_SCENE_FRAME_STRIDE: usize = 10;
 
 static LAST_SUMMARY: OnceLock<Mutex<Option<RunSummary>>> = OnceLock::new();
 
@@ -173,7 +173,7 @@ enum StreamEvent {
     Log { message: String },
     Progress { progress: SimulationProgress },
     Frame { frame: ApiFrame },
-    PlotBuffer { frames: Vec<ApiFrame> },
+    Plots { frames: Vec<ApiFrame> },
     Summary { summary: RunSummary },
 }
 
@@ -949,48 +949,51 @@ async fn run_stream(
             };
             let mut plot_buffer = Vec::<ApiFrame>::new();
             let mut latest_scene_frame = None::<ApiFrame>;
-            let mut last_sent_plot_len = 0usize;
-            let flush_snapshots =
-                |plot_buffer: &Vec<ApiFrame>,
-                 latest_scene_frame: &Option<ApiFrame>,
-                 last_sent_plot_len: &mut usize| {
-                    if let Some(frame) = latest_scene_frame.clone() {
-                        let _ = send_stream_event_blocking(
-                            &progress_sender,
-                            StreamEvent::Frame { frame },
-                        );
-                    }
-                    if plot_buffer.len() != *last_sent_plot_len {
-                        let _ = send_stream_event_blocking(
-                            &progress_sender,
-                            StreamEvent::PlotBuffer {
-                                frames: plot_buffer.clone(),
-                            },
-                        );
-                        *last_sent_plot_len = plot_buffer.len();
-                    }
-                };
+            let mut frames_since_scene_flush = 0usize;
+            let flush_scene_frame = |latest_scene_frame: &mut Option<ApiFrame>| {
+                if let Some(frame) = latest_scene_frame.take() {
+                    let _ =
+                        send_stream_event_blocking(&progress_sender, StreamEvent::Frame { frame });
+                }
+            };
             let mut frame_cb = |frame: ApiFrame| {
                 plot_buffer.push(frame.clone());
                 latest_scene_frame = Some(frame);
-                if plot_buffer.len().saturating_sub(last_sent_plot_len)
-                    >= STREAM_SNAPSHOT_FRAME_STRIDE
-                {
-                    flush_snapshots(&plot_buffer, &latest_scene_frame, &mut last_sent_plot_len);
+                frames_since_scene_flush += 1;
+                if frames_since_scene_flush >= STREAM_SCENE_FRAME_STRIDE {
+                    flush_scene_frame(&mut latest_scene_frame);
+                    frames_since_scene_flush = 0;
                 }
             };
             let result = run_preset_streaming(&request_for_run, &mut progress_cb, &mut frame_cb);
             drop(frame_cb);
-            flush_snapshots(&plot_buffer, &latest_scene_frame, &mut last_sent_plot_len);
-            result
+            flush_scene_frame(&mut latest_scene_frame);
+            result.map(|summary| (summary, plot_buffer))
         })
         .await;
         match outcome {
-            Ok(Ok(summary)) => {
+            Ok(Ok((summary, plot_frames))) => {
                 let _ = send_stream_event(
                     &sender,
                     StreamEvent::Log {
                         message: "simulation complete".to_string(),
+                    },
+                )
+                .await;
+                let _ = send_stream_event(
+                    &sender,
+                    StreamEvent::Log {
+                        message: format!(
+                            "sending final plot buffer: {} samples",
+                            plot_frames.len()
+                        ),
+                    },
+                )
+                .await;
+                let _ = send_stream_event(
+                    &sender,
+                    StreamEvent::Plots {
+                        frames: plot_frames,
                     },
                 )
                 .await;

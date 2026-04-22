@@ -5,6 +5,7 @@ type PhaseMode = "adaptive" | "open_loop";
 type Preset = "free_flight1" | "star1" | "y2" | "star3" | "star4" | "simple_tether";
 type TimeDilationPreset = "fast" | "1" | "0.5" | "0.1";
 type CameraFollowTarget = "manual" | "disk_center" | `kite:${number}`;
+type RuntimeTab = "console" | "plots";
 
 type PlotlyDatum = Record<string, unknown>;
 
@@ -23,7 +24,7 @@ interface PlotlyLike {
   ): Promise<unknown>;
   restyle(
     element: HTMLElement,
-    update: { x: number[][]; y: number[][] },
+    update: PlotlyDatum,
     indices: number[]
   ): Promise<unknown>;
   purge(element: HTMLElement): void;
@@ -234,7 +235,7 @@ type StreamEvent =
   | { kind: "log"; message: string }
   | { kind: "progress"; progress: SimulationProgress }
   | { kind: "frame"; frame: ApiFrame }
-  | { kind: "plot_buffer"; frames: ApiFrame[] }
+  | { kind: "plots"; frames: ApiFrame[] }
   | { kind: "summary"; summary: RunSummary };
 
 const presetSelect = document.querySelector<HTMLSelectElement>("#preset")!;
@@ -248,6 +249,11 @@ const cameraFollowYawInput = document.querySelector<HTMLInputElement>("#camera-f
 const cameraFollowYawLabel = cameraFollowYawInput.closest<HTMLLabelElement>(".checkbox-label")!;
 const summaryNode = document.querySelector<HTMLElement>("#summary")!;
 const failureNode = document.querySelector<HTMLElement>("#failure-pill")!;
+const runtimeConsoleTab = document.querySelector<HTMLButtonElement>("#runtime-tab-console")!;
+const runtimePlotsTab = document.querySelector<HTMLButtonElement>("#runtime-tab-plots")!;
+const runtimeConsoleView = document.querySelector<HTMLElement>("#runtime-console-view")!;
+const runtimePlotsView = document.querySelector<HTMLElement>("#runtime-plots-view")!;
+const plotKiteControlsNode = document.querySelector<HTMLElement>("#plot-kite-controls")!;
 const plotsNode = document.querySelector<HTMLElement>("#plots")!;
 const viewport = document.querySelector<HTMLElement>("#viewport")!;
 const runForm = document.querySelector<HTMLFormElement>("#run-form")!;
@@ -598,7 +604,6 @@ let consoleLines: string[] = [];
 let framesReceived = 0;
 let framesRendered = 0;
 let pendingPlaybackFrames: ApiFrame[] = [];
-let latestPlotBuffer: ApiFrame[] = [];
 let pendingSummary: RunSummary | null = null;
 let latestProgressState: SimulationProgress | null = null;
 let activeSummaryRequest: { preset: string; phase_mode: PhaseMode } | null = null;
@@ -608,14 +613,10 @@ let playbackStartWallTimeMs: number | null = null;
 let playbackStartSimTime = 0;
 let shouldSnapOrbitTargetToFrame = true;
 let lastRenderedFrame: ApiFrame | null = null;
-let displayedSimTime: number | null = null;
 let lastCameraFollowHeadingRad: number | null = null;
 let lastCameraFollowTarget: CameraFollowTarget | null = null;
 let lastAirflowFrameTime: number | null = null;
 let airflowUpdatesEnabled = true;
-let plotUpdatesEnabled = true;
-let plotFlushInFlight = false;
-let plotRefreshPending = false;
 let lastSummaryRefreshWallTimeMs = 0;
 let summaryRefreshPending = false;
 let lastSummaryHtml = "";
@@ -630,6 +631,7 @@ type PlotDash = "solid" | "dash" | "dot" | "dashdot" | "longdash";
 interface PlotTraceDefinition {
   name: string;
   color: string;
+  kiteIndex?: number;
   dash?: PlotDash;
   width?: number;
   value: (frame: ApiFrame) => number;
@@ -667,6 +669,7 @@ const ZERO_REF_COLOR = "rgba(211, 228, 245, 0.38)";
 const MAX_PLOT_COLUMNS = 3;
 const PLOT_SECTION_ROW_HEIGHT_PX = 292;
 let activePlotSections: ActivePlotSection[] = [];
+let plotKiteVisibility: boolean[] = [];
 
 interface KiteBreakdownTraceDefinition {
   name: string;
@@ -684,6 +687,28 @@ function appendConsole(message: string): void {
   }
   consoleNode.textContent = consoleLines.join("\n");
   consoleNode.scrollTop = consoleNode.scrollHeight;
+}
+
+function clearConsole(): void {
+  consoleLines = [];
+  consoleNode.textContent = "";
+}
+
+function showRuntimeTab(tab: RuntimeTab): void {
+  const showConsole = tab === "console";
+  runtimeConsoleTab.classList.toggle("active", showConsole);
+  runtimePlotsTab.classList.toggle("active", !showConsole);
+  runtimeConsoleView.classList.toggle("active", showConsole);
+  runtimePlotsView.classList.toggle("active", !showConsole);
+  runtimeConsoleTab.setAttribute("aria-selected", String(showConsole));
+  runtimePlotsTab.setAttribute("aria-selected", String(!showConsole));
+  if (!showConsole) {
+    requestAnimationFrame(() => {
+      activePlotSections.forEach((section) => {
+        Plotly.Plots?.resize(section.plot);
+      });
+    });
+  }
 }
 
 function escapeHtml(value: string): string {
@@ -1306,7 +1331,6 @@ function resetPlaybackState(label: string, rate: number | null): void {
   framesReceived = 0;
   framesRendered = 0;
   pendingPlaybackFrames = [];
-  latestPlotBuffer = [];
   pendingSummary = null;
   latestProgressState = null;
   currentPlaybackLabel = label;
@@ -1315,13 +1339,9 @@ function resetPlaybackState(label: string, rate: number | null): void {
   playbackStartSimTime = 0;
   shouldSnapOrbitTargetToFrame = true;
   lastRenderedFrame = null;
-  displayedSimTime = null;
   resetCameraFollowState();
   lastAirflowFrameTime = null;
   airflowUpdatesEnabled = true;
-  plotUpdatesEnabled = true;
-  plotFlushInFlight = false;
-  plotRefreshPending = false;
   lastSummaryRefreshWallTimeMs = 0;
   summaryRefreshPending = false;
   lastSummaryHtml = "";
@@ -1356,6 +1376,91 @@ function plotColumnCount(): number {
   return MAX_PLOT_COLUMNS;
 }
 
+function ensurePlotKiteVisibility(kiteCount: number): void {
+  plotKiteVisibility = Array.from(
+    { length: kiteCount },
+    (_, index) => plotKiteVisibility[index] ?? true
+  );
+}
+
+function plotTraceVisible(trace: PlotTraceDefinition): boolean {
+  return trace.kiteIndex === undefined || (plotKiteVisibility[trace.kiteIndex] ?? true);
+}
+
+function sectionTraceVisibility(definition: PlotSectionDefinition): boolean[] {
+  return definition.groups.flatMap((group) =>
+    group.traces.map((trace) => plotTraceVisible(trace))
+  );
+}
+
+function applyPlotKiteVisibility(): void {
+  if (activePlotSections.length === 0) {
+    return;
+  }
+
+  const updates = activePlotSections.map((section) =>
+    Plotly.restyle(
+      section.plot,
+      { visible: sectionTraceVisibility(section.definition) },
+      section.traceIndices
+    )
+  );
+
+  void Promise.all(updates).catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    appendConsole(`plot kite visibility update failed: ${message}`);
+  });
+}
+
+function renderPlotKiteControls(kiteCount: number): void {
+  ensurePlotKiteVisibility(kiteCount);
+  plotKiteControlsNode.innerHTML = "";
+  plotKiteControlsNode.classList.toggle("empty", kiteCount === 0);
+  if (kiteCount === 0) {
+    return;
+  }
+
+  const title = document.createElement("div");
+  title.className = "plot-kite-controls-title";
+  title.textContent = "Visible";
+  plotKiteControlsNode.append(title);
+
+  const toggleGroup = document.createElement("div");
+  toggleGroup.className = "plot-kite-toggle-group";
+  plotKiteControlsNode.append(toggleGroup);
+
+  for (let kiteIndex = 0; kiteIndex < kiteCount; kiteIndex += 1) {
+    const label = document.createElement("label");
+    label.className = "plot-kite-toggle";
+    label.style.setProperty("--kite-color", kiteColor(kiteIndex));
+
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = plotKiteVisibility[kiteIndex] ?? true;
+
+    const swatch = document.createElement("span");
+    swatch.className = "plot-kite-swatch";
+
+    const text = document.createElement("span");
+    text.className = "plot-kite-label-text";
+    text.textContent = `Kite ${kiteIndex + 1}`;
+
+    const state = document.createElement("span");
+    state.className = "plot-kite-state";
+    state.textContent = input.checked ? "shown" : "hidden";
+
+    label.classList.toggle("muted", !input.checked);
+    input.addEventListener("change", () => {
+      plotKiteVisibility[kiteIndex] = input.checked;
+      label.classList.toggle("muted", !input.checked);
+      state.textContent = input.checked ? "shown" : "hidden";
+      applyPlotKiteVisibility();
+    });
+    label.append(input, swatch, text, state);
+    toggleGroup.append(label);
+  }
+}
+
 function buildPerKiteGroup(
   kiteCount: number,
   title: string,
@@ -1370,12 +1475,14 @@ function buildPerKiteGroup(
     traces.push({
       name: `Kite ${kiteIndex + 1}`,
       color,
+      kiteIndex,
       value: (frame) => actualValue(frame, kiteIndex)
     });
     if (referenceValue) {
       traces.push({
         name: `Kite ${kiteIndex + 1} Ref`,
         color: hexToRgba(color, REF_ALPHA),
+        kiteIndex,
         dash: "dash",
         value: (frame) => referenceValue(frame, kiteIndex)
       });
@@ -1401,6 +1508,7 @@ function buildPerKiteBreakdownGroup(
       traces.push({
         name: `Kite ${kiteIndex + 1} ${trace.name}`,
         color: hexToRgba(color, trace.alpha ?? 0.9),
+        kiteIndex,
         dash: trace.dash,
         width: trace.width,
         value: (frame) => trace.value(frame, kiteIndex)
@@ -1535,8 +1643,7 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
           "deg",
           (frame, kiteIndex) => frame.rudder_cmd_deg[kiteIndex] ?? 0
         )
-      ],
-      maxColumns: 1
+      ]
     },
     {
       title: "Controller / 2. Lateral Outer Loop",
@@ -1565,8 +1672,7 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
             }
           ]
         )
-      ],
-      maxColumns: 1
+      ]
     },
     {
       title: "Controller / 3. Total Energy Controller",
@@ -1671,8 +1777,7 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
           "deg",
           (frame, kiteIndex) => frame.pitch_ref_deg[kiteIndex] ?? 0
         ),
-      ],
-      maxColumns: 1
+      ]
     },
     {
       title: "Controller / 4. Pitch Inner Loop",
@@ -1704,8 +1809,7 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
           "deg",
           (frame, kiteIndex) => frame.flap_cmd_deg[kiteIndex] ?? 0
         )
-      ],
-      maxColumns: 1
+      ]
     },
     {
       title: "Physics / Plant State",
@@ -2097,6 +2201,9 @@ function formatRunSummary(
 function applyPresetDefaults(): void {
   if (presetSelect.value === "simple_tether" && windInput.value === "5") {
     windInput.value = "0";
+  }
+  if (presetSelect.value === "free_flight1" && durationInput.value === "10") {
+    durationInput.value = "60";
   }
 }
 
@@ -3269,8 +3376,6 @@ function renderFrameBatch(frames: ApiFrame[]): void {
   }
   try {
     renderFrame(renderFrameForBatch);
-    displayedSimTime = renderFrameForBatch.time;
-    updatePlotsForDisplayedTime();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     appendConsole(`3D render error: ${message}`);
@@ -3314,61 +3419,6 @@ function drainPendingFrames(timestamp: number): void {
   }
 }
 
-function updatePlotsForDisplayedTime(): void {
-  if (
-    latestPlotBuffer.length === 0 ||
-    displayedSimTime === null ||
-    activePlotSections.length === 0 ||
-    !plotUpdatesEnabled
-  ) {
-    return;
-  }
-
-  if (plotFlushInFlight) {
-    plotRefreshPending = true;
-    return;
-  }
-
-  const cutoff = displayedSimTime + 1.0e-9;
-  const frames = latestPlotBuffer.filter((frame) => frame.time <= cutoff);
-  if (frames.length === 0) {
-    return;
-  }
-  plotFlushInFlight = true;
-
-  const frameTimes = frames.map((frame) => frame.time);
-  const updates = activePlotSections.map((section) => {
-    const x = section.definition.groups.flatMap((group) =>
-      group.traces.map(() => frameTimes)
-    );
-    const y = section.definition.groups.flatMap((group) =>
-      group.traces.map((trace) => frames.map((frame) => trace.value(frame)))
-    );
-    return Plotly.restyle(
-      section.plot,
-      { x, y },
-      section.traceIndices
-    );
-  });
-
-  void Promise.all(updates)
-    .catch((error: unknown) => {
-      if (!plotUpdatesEnabled) {
-        return;
-      }
-      plotUpdatesEnabled = false;
-      const message = error instanceof Error ? error.message : String(error);
-      appendConsole(`plot updates disabled after error: ${message}`);
-    })
-    .finally(() => {
-      plotFlushInFlight = false;
-      if (plotRefreshPending) {
-        plotRefreshPending = false;
-        updatePlotsForDisplayedTime();
-      }
-    });
-}
-
 function animate(timestamp: number): void {
   requestAnimationFrame(animate);
   drainPendingFrames(timestamp);
@@ -3393,19 +3443,21 @@ function sectionPlotColumns(groupCount: number, maxColumns?: number): number {
   return Math.min(groupCount, availableColumns);
 }
 
-function sectionPlotData(groups: PlotGroupDefinition[]): PlotlyDatum[] {
+function sectionPlotData(groups: PlotGroupDefinition[], frames: ApiFrame[]): PlotlyDatum[] {
+  const frameTimes = frames.map((frame) => frame.time);
   return groups.flatMap((group, groupIndex) =>
     group.traces.map((trace) => ({
       type: "scatter",
       mode: "lines",
       name: trace.name,
-      x: [] as number[],
-      y: [] as number[],
+      x: frameTimes,
+      y: frames.map((frame) => trace.value(frame)),
       line: {
         color: trace.color,
         width: trace.width ?? 2,
         dash: trace.dash ?? "solid"
       },
+      visible: plotTraceVisible(trace),
       xaxis: groupIndex === 0 ? "x" : `x${groupIndex + 1}`,
       yaxis: groupIndex === 0 ? "y" : `y${groupIndex + 1}`,
       hovertemplate: `${trace.name}<br>t=%{x:.2f}s<br>%{y:.4f}<extra></extra>`
@@ -3483,12 +3535,27 @@ function sectionPlotLayout(definition: PlotSectionDefinition): PlotlyDatum {
   return layout;
 }
 
-async function resetPlots(kiteCount: number): Promise<void> {
+function clearPlots(message: string): void {
   activePlotSections.forEach((section) => {
     Plotly.purge(section.plot);
   });
   activePlotSections = [];
   plotsNode.innerHTML = "";
+  plotKiteControlsNode.innerHTML = "";
+  plotKiteControlsNode.classList.add("empty");
+  const placeholder = document.createElement("div");
+  placeholder.className = "plots-placeholder";
+  placeholder.textContent = message;
+  plotsNode.append(placeholder);
+}
+
+async function renderFinalPlots(frames: ApiFrame[], kiteCount: number): Promise<void> {
+  activePlotSections.forEach((section) => {
+    Plotly.purge(section.plot);
+  });
+  activePlotSections = [];
+  plotsNode.innerHTML = "";
+  renderPlotKiteControls(kiteCount);
 
   const definitions = buildPlotSections(kiteCount);
   const sectionPromises = definitions.map(async (definition) => {
@@ -3511,7 +3578,7 @@ async function resetPlots(kiteCount: number): Promise<void> {
     host.append(header, plot);
     plotsNode.append(host);
 
-    const data = sectionPlotData(definition.groups);
+    const data = sectionPlotData(definition.groups, frames);
     const traceIndices = data.map((_, index) => index);
 
     const activeSection: ActivePlotSection = {
@@ -3520,7 +3587,6 @@ async function resetPlots(kiteCount: number): Promise<void> {
       plot,
       traceIndices
     };
-    activePlotSections.push(activeSection);
 
     await Plotly.newPlot(plot, data, sectionPlotLayout(definition), {
       responsive: true,
@@ -3532,26 +3598,18 @@ async function resetPlots(kiteCount: number): Promise<void> {
         "toggleSpikelines"
       ]
     });
+    activePlotSections.push(activeSection);
   });
 
   await Promise.all(sectionPromises);
-  updatePlotsForDisplayedTime();
-}
-
-function replacePlotBuffer(frames: ApiFrame[]): void {
-  if (frames.length === 0) {
-    return;
-  }
-  latestPlotBuffer = frames;
-  framesReceived = Math.max(framesReceived, frames.length);
-  updatePlotsForDisplayedTime();
-  refreshProgressSummary();
+  applyPlotKiteVisibility();
 }
 
 function queueFrames(frames: ApiFrame[]): void {
   if (frames.length === 0) {
     return;
   }
+  framesReceived += frames.length;
   if (
     framesRendered === 0 &&
     playbackStartWallTimeMs === null &&
@@ -3594,6 +3652,7 @@ async function loadPresets(): Promise<void> {
     option.textContent = `${preset.name} — ${preset.description}`;
     presetSelect.append(option);
   });
+  applyPresetDefaults();
   updateCameraFollowOptions(presetKiteCount(presetSelect.value as Preset));
 }
 
@@ -3617,6 +3676,10 @@ async function runSimulation(): Promise<void> {
     phase_mode: request.phase_mode
   };
   resetPlaybackState(playbackLabel, playbackRate);
+  const kiteCount = presetKiteCount(request.preset as Preset);
+  showRuntimeTab("console");
+  clearConsole();
+  clearPlots("Plots will be generated once after the simulation finishes.");
   setFailure(null);
   summaryNode.innerHTML = renderSummaryCard(
     "Queued",
@@ -3640,11 +3703,6 @@ async function runSimulation(): Promise<void> {
   );
 
   try {
-    void resetPlots(presetKiteCount(request.preset as Preset)).catch((error: unknown) => {
-      plotUpdatesEnabled = false;
-      const message = error instanceof Error ? error.message : String(error);
-      appendConsole(`plot initialization failed: ${message}`);
-    });
     const response = await fetch("/api/run_stream", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -3661,6 +3719,7 @@ async function runSimulation(): Promise<void> {
     const decoder = new TextDecoder();
     let buffer = "";
     let summary: RunSummary | null = null;
+    let finalPlotFrames: ApiFrame[] | null = null;
     let nextProgressLogIteration = 0;
 
     while (true) {
@@ -3672,7 +3731,6 @@ async function runSimulation(): Promise<void> {
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? "";
       const sceneFramesInChunk: ApiFrame[] = [];
-      let latestPlotBufferInChunk: ApiFrame[] | null = null;
       for (const line of lines) {
         if (!line.trim()) {
           continue;
@@ -3703,16 +3761,14 @@ async function runSimulation(): Promise<void> {
           sceneFramesInChunk.push(event.frame);
           continue;
         }
-        if (event.kind === "plot_buffer") {
-          latestPlotBufferInChunk = event.frames;
+        if (event.kind === "plots") {
+          finalPlotFrames = event.frames;
+          appendConsole(`final plot buffer received: ${event.frames.length} samples`);
           continue;
         }
         summary = event.summary;
         pendingSummary = event.summary;
         setFailure(event.summary.failure ?? null);
-      }
-      if (latestPlotBufferInChunk) {
-        replacePlotBuffer(latestPlotBufferInChunk);
       }
       queueFrames(sceneFramesInChunk);
     }
@@ -3726,8 +3782,9 @@ async function runSimulation(): Promise<void> {
         refreshProgressSummary();
       } else if (event.kind === "frame") {
         queueFrames([event.frame]);
-      } else if (event.kind === "plot_buffer") {
-        replacePlotBuffer(event.frames);
+      } else if (event.kind === "plots") {
+        finalPlotFrames = event.frames;
+        appendConsole(`final plot buffer received: ${event.frames.length} samples`);
       } else {
         summary = event.summary;
         pendingSummary = event.summary;
@@ -3735,6 +3792,20 @@ async function runSimulation(): Promise<void> {
       }
     }
 
+    if (finalPlotFrames && finalPlotFrames.length > 0) {
+      appendConsole(`rendering plots from ${finalPlotFrames.length} samples`);
+      try {
+        showRuntimeTab("plots");
+        await renderFinalPlots(finalPlotFrames, kiteCount);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        clearPlots(`Plot rendering failed: ${message}`);
+        appendConsole(`plot rendering failed: ${message}`);
+      }
+    } else {
+      clearPlots("No plot samples were returned for this run.");
+      appendConsole("no final plot buffer received");
+    }
     await waitForPlaybackDrain();
     if (pendingSummary) {
       summaryNode.innerHTML = formatRunSummary(
@@ -3762,6 +3833,14 @@ async function runSimulation(): Promise<void> {
 runForm.addEventListener("submit", (event) => {
   event.preventDefault();
   void runSimulation();
+});
+
+runtimeConsoleTab.addEventListener("click", () => {
+  showRuntimeTab("console");
+});
+
+runtimePlotsTab.addEventListener("click", () => {
+  showRuntimeTab("plots");
 });
 
 presetSelect.addEventListener("change", () => {

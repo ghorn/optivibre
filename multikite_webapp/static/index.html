@@ -102,12 +102,18 @@
       <section class="panel scene">
         <div id="viewport"></div>
       </section>
-      <section class="panel plots">
-        <div id="plots"></div>
-      </section>
-      <section class="panel console-panel">
-        <div class="console-head">Console Log</div>
-        <pre id="console"></pre>
+      <section class="panel runtime-panel">
+        <div class="runtime-tabs" role="tablist" aria-label="Run output">
+          <button id="runtime-tab-console" class="runtime-tab active" type="button">Console Log</button>
+          <button id="runtime-tab-plots" class="runtime-tab" type="button">Plots</button>
+        </div>
+        <div id="runtime-console-view" class="runtime-view active">
+          <pre id="console"></pre>
+        </div>
+        <div id="runtime-plots-view" class="runtime-view">
+          <div id="plot-kite-controls" class="plot-kite-controls"></div>
+          <div id="plots"></div>
+        </div>
       </section>
       <section class="panel docs-panel">
         <div class="docs-head">

@@ -36,7 +36,7 @@ body {
   grid-template-columns: 320px minmax(0, 1fr) minmax(260px, 280px);
   grid-template-areas:
     "controls scene scene"
-    "controls plots console"
+    "controls runtime runtime"
     "controls docs docs";
   align-items: start;
 }
@@ -64,17 +64,8 @@ body {
   min-width: 0;
 }
 
-.plots {
-  grid-area: plots;
-  padding: 14px;
-  background:
-    linear-gradient(180deg, rgba(8, 17, 25, 0.94) 0%, rgba(5, 12, 18, 0.98) 100%);
-  min-width: 0;
-  overflow: auto;
-}
-
-.console-panel {
-  grid-area: console;
+.runtime-panel {
+  grid-area: runtime;
   padding: 0;
   overflow: hidden;
   display: flex;
@@ -85,6 +76,55 @@ body {
   min-width: 0;
 }
 
+.runtime-tabs {
+  display: flex;
+  gap: 8px;
+  padding: 10px 12px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.runtime-tab {
+  width: auto;
+  margin: 0;
+  padding: 9px 14px;
+  border: 1px solid rgba(115, 146, 168, 0.22);
+  border-bottom: 0;
+  border-radius: 12px 12px 0 0;
+  background: rgba(8, 16, 24, 0.72);
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 800;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  box-shadow: none;
+}
+
+.runtime-tab.active {
+  color: var(--ink);
+  background: rgba(13, 26, 38, 0.98);
+  border-color: rgba(115, 146, 168, 0.34);
+}
+
+.runtime-view {
+  display: none;
+  min-height: 520px;
+}
+
+.runtime-view.active {
+  display: block;
+}
+
+#runtime-console-view.active {
+  display: flex;
+  flex: 1;
+  min-height: 520px;
+}
+
+#runtime-plots-view {
+  padding: 14px;
+  overflow: auto;
+}
+
 .docs-panel {
   grid-area: docs;
   padding: 18px;
@@ -92,16 +132,6 @@ body {
     linear-gradient(180deg, rgba(8, 15, 23, 0.96) 0%, rgba(4, 9, 14, 0.99) 100%);
   min-width: 0;
   overflow: hidden;
-}
-
-.console-head {
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--line);
-  font-size: 0.85rem;
-  font-weight: 600;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-  color: var(--muted);
 }
 
 .docs-head {
@@ -421,6 +451,148 @@ button:hover {
   align-content: start;
 }
 
+.plot-kite-controls {
+  position: sticky;
+  top: 10px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding: 9px 10px 9px 12px;
+  border: 1px solid rgba(115, 146, 168, 0.18);
+  border-radius: 16px;
+  background:
+    linear-gradient(135deg, rgba(10, 24, 34, 0.98) 0%, rgba(4, 10, 16, 0.98) 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.03),
+    0 14px 28px rgba(0, 0, 0, 0.18);
+}
+
+.plot-kite-controls.empty,
+.plot-kite-controls:empty {
+  display: none;
+}
+
+.plot-kite-controls-title {
+  color: #9db4c8;
+  font-size: 0.68rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.plot-kite-toggle-group {
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.plot-kite-toggle {
+  --kite-color: #45d7a7;
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 7px 12px 7px 11px;
+  border: 1px solid color-mix(in srgb, var(--kite-color) 34%, rgba(115, 146, 168, 0.14));
+  border-radius: 12px;
+  color: #d9ecfb;
+  background:
+    linear-gradient(180deg,
+      color-mix(in srgb, var(--kite-color) 16%, rgba(9, 18, 27, 0.96)) 0%,
+      rgba(5, 11, 17, 0.94) 100%);
+  font-size: 0.78rem;
+  font-weight: 700;
+  cursor: pointer;
+  user-select: none;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.03),
+    0 0 0 1px color-mix(in srgb, var(--kite-color) 7%, transparent);
+  transition:
+    border-color 140ms ease,
+    opacity 140ms ease,
+    transform 140ms ease,
+    background 140ms ease;
+}
+
+.plot-kite-toggle input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.plot-kite-toggle:hover {
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--kite-color) 56%, rgba(115, 146, 168, 0.16));
+}
+
+.plot-kite-toggle.muted {
+  opacity: 0.56;
+  background: rgba(6, 14, 22, 0.82);
+  border-color: rgba(115, 146, 168, 0.14);
+  box-shadow: none;
+}
+
+.plot-kite-swatch {
+  width: 6px;
+  height: 18px;
+  border-radius: 999px;
+  background: var(--kite-color);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--kite-color) 78%, transparent);
+}
+
+.plot-kite-label-text {
+  color: #e6f3ff;
+  line-height: 1;
+}
+
+.plot-kite-state {
+  padding: 3px 7px;
+  border-radius: 999px;
+  color: color-mix(in srgb, var(--kite-color) 68%, #eaf6ff);
+  background: color-mix(in srgb, var(--kite-color) 11%, rgba(255, 255, 255, 0.04));
+  font-size: 0.62rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+.plot-kite-toggle.muted .plot-kite-state {
+  color: #7f93a4;
+  background: rgba(115, 146, 168, 0.08);
+}
+
+@media (max-width: 680px) {
+  .plot-kite-controls {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .plot-kite-toggle-group {
+    justify-content: flex-start;
+  }
+}
+
+.plots-placeholder {
+  display: grid;
+  place-items: center;
+  min-height: 240px;
+  border: 1px dashed rgba(115, 146, 168, 0.22);
+  border-radius: 14px;
+  color: var(--muted);
+  background: rgba(5, 12, 18, 0.42);
+  font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+  text-align: center;
+  padding: 18px;
+}
+
 #controller-docs {
   display: grid;
   gap: 16px;
@@ -706,8 +878,7 @@ button:hover {
     grid-template-areas:
       "controls"
       "scene"
-      "plots"
-      "console"
+      "runtime"
       "docs";
   }
 
