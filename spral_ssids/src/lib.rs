@@ -4581,8 +4581,8 @@ mod tests {
         factorize_dense_tpp_tail_in_place, native_column_counts, native_postorder_permutation,
         openblas_gemv_n_update_like_native, openblas_gemv_t_dot_like_contiguous,
         openblas_trsv_lower_unit_op_n_like_native, openblas_trsv_lower_unit_op_t_like_native,
-        permute_graph, solve_forward_front_panels_like_native, solve_two_by_two_block_in_place,
-        symbolic_factor_pattern,
+        permute_graph, reset_ldwork_column_tail, solve_forward_front_panels_like_native,
+        solve_two_by_two_block_in_place, symbolic_factor_pattern, zero_dense_column_until,
     };
 
     #[derive(Clone, Debug)]
@@ -4670,6 +4670,27 @@ mod tests {
         *mut c_int,
         *mut c_int,
     ) -> c_int;
+    type BlockPrefixTrace32Fn = unsafe extern "C" fn(
+        c_int,
+        *mut c_int,
+        *mut f64,
+        c_int,
+        *mut f64,
+        *mut f64,
+        c_int,
+        f64,
+        f64,
+        *mut c_int,
+        c_int,
+        *mut c_int,
+        *mut c_int,
+        *mut c_int,
+        *mut c_int,
+        *mut c_int,
+        *mut f64,
+        *mut f64,
+        *mut f64,
+    ) -> c_int;
     type BlockLdlt32Fn = unsafe extern "C" fn(
         c_int,
         *mut c_int,
@@ -4703,6 +4724,7 @@ mod tests {
         block_test_2x2: BlockTest2x2Fn,
         block_two_by_two_multipliers: BlockTwoByTwoMultipliersFn,
         block_first_step_32: BlockFirstStep32Fn,
+        block_prefix_trace_32: BlockPrefixTrace32Fn,
         block_ldlt_32: BlockLdlt32Fn,
     }
 
@@ -4901,6 +4923,11 @@ mod tests {
                 .get::<BlockFirstStep32Fn>(b"spral_kernel_block_first_step_32\0")
                 .map_err(|error| format!("failed to load block_first_step_32 shim: {error}"))?
         };
+        let block_prefix_trace_32 = unsafe {
+            *library
+                .get::<BlockPrefixTrace32Fn>(b"spral_kernel_block_prefix_trace_32\0")
+                .map_err(|error| format!("failed to load block_prefix_trace_32 shim: {error}"))?
+        };
         let block_ldlt_32 = unsafe {
             *library
                 .get::<BlockLdlt32Fn>(b"spral_kernel_block_ldlt_32\0")
@@ -4927,6 +4954,7 @@ mod tests {
             block_test_2x2,
             block_two_by_two_multipliers,
             block_first_step_32,
+            block_prefix_trace_32,
             block_ldlt_32,
         })
     }
@@ -5205,6 +5233,149 @@ extern "C" int spral_kernel_block_first_step_32(
    *next_p = p;
    return pivsiz;
 }
+
+static void spral_kernel_record_block_prefix_trace_32(
+      int step, int from, int status, int next, const int* perm,
+      const int* lperm, const double* a, int lda, const double* d,
+      const double* ldwork, int* trace_from, int* trace_status,
+      int* trace_next, int* trace_perm, int* trace_lperm,
+      double* trace_matrix, double* trace_ldwork, double* trace_d) {
+   trace_from[step] = from;
+   trace_status[step] = status;
+   trace_next[step] = next;
+   for(int i=0; i<32; i++) {
+      trace_perm[step*32+i] = perm[i];
+      trace_lperm[step*32+i] = lperm ? lperm[i] : i;
+   }
+   for(int c=0; c<32; c++) {
+      for(int r=0; r<32; r++) {
+         trace_matrix[step*32*32 + c*32+r] = (r >= c) ? a[c*lda+r] : 0.0;
+         trace_ldwork[step*32*32 + c*32+r] = ldwork[c*32+r];
+      }
+   }
+   for(int i=0; i<64; i++)
+      trace_d[step*64+i] = d[i];
+}
+
+extern "C" int spral_kernel_block_prefix_trace_32(
+      int from, int* perm, double* a, int lda, double* d, double* ldwork,
+      int action, double u, double small, int* lperm, int max_steps,
+      int* trace_from, int* trace_status, int* trace_next, int* trace_perm,
+      int* trace_lperm, double* trace_matrix, double* trace_ldwork,
+      double* trace_d) {
+   using namespace spral::ssids::cpu::block_ldlt_internal;
+
+   int trace_len = 0;
+   for(int p=from; p<32; ) {
+      if(trace_len >= max_steps) return trace_len;
+      int step_from = p;
+
+      double bestv;
+      int t, m;
+      find_maxloc<double, 32>(p, a, lda, bestv, t, m);
+
+      if(fabs(bestv) < small) {
+         if(!action) {
+            spral_kernel_record_block_prefix_trace_32(
+                  trace_len, step_from, -1, p, perm, lperm, a, lda, d,
+                  ldwork, trace_from, trace_status, trace_next, trace_perm,
+                  trace_lperm, trace_matrix, trace_ldwork, trace_d);
+            return trace_len + 1;
+         }
+         for(; p<32; ) {
+            d[2*p] = 0.0; d[2*p+1] = 0.0;
+            for(int r=p; r<32; r++)
+               a[p*lda+r] = 0.0;
+            for(int r=p; r<32; r++)
+               ldwork[p*32+r] = 0.0;
+            p++;
+         }
+         spral_kernel_record_block_prefix_trace_32(
+               trace_len, step_from, 0, p, perm, lperm, a, lda, d,
+               ldwork, trace_from, trace_status, trace_next, trace_perm,
+               trace_lperm, trace_matrix, trace_ldwork, trace_d);
+         return trace_len + 1;
+      }
+
+      int pivsiz = 0;
+      double a11, a21 = 0.0, a22 = 0.0, detscale = 0.0, detpiv = 0.0;
+      if(t==m) {
+         a11 = a[t*lda+t];
+         pivsiz = 1;
+      } else {
+         a11 = a[m*lda+m];
+         a22 = a[t*lda+t];
+         a21 = a[m*lda+t];
+         if(test_2x2<double>(a11, a21, a22, detpiv, detscale)) {
+            pivsiz = 2;
+         } else {
+            if(fabs(a11) > fabs(a22)) {
+               pivsiz = 1;
+               t = m;
+               if(fabs(a11 / a21) < u) pivsiz = 0;
+            } else {
+               pivsiz = 1;
+               a11 = a22;
+               m = t;
+               if(fabs(a22 / a21) < u) pivsiz = 0;
+            }
+         }
+      }
+
+      if(pivsiz == 0) {
+         spral_kernel_record_block_prefix_trace_32(
+               trace_len, step_from, -2, p, perm, lperm, a, lda, d,
+               ldwork, trace_from, trace_status, trace_next, trace_perm,
+               trace_lperm, trace_matrix, trace_ldwork, trace_d);
+         return trace_len + 1;
+      }
+      if(pivsiz == 1) {
+         double d11 = 1.0/a11;
+         swap_cols<double, 32>(p, t, 32, a, lda, ldwork, perm);
+         if(lperm) { int temp=lperm[p]; lperm[p]=lperm[t]; lperm[t]=temp; }
+         double *work = &ldwork[p*32];
+         for(int r=p+1; r<32; r++) {
+            work[r] = a[p*lda+r];
+            a[p*lda+r] *= d11;
+         }
+         update_1x1<double, 32>(p, a, lda, work);
+         d[2*p] = d11;
+         d[2*p+1] = 0.0;
+         a[p*lda+p] = 1.0;
+      } else {
+         swap_cols<double, 32>(p, m, 32, a, lda, ldwork, perm);
+         if(lperm) { int temp=lperm[p]; lperm[p]=lperm[m]; lperm[m]=temp; }
+         swap_cols<double, 32>(p+1, t, 32, a, lda, ldwork, perm);
+         if(lperm) { int temp=lperm[p+1]; lperm[p+1]=lperm[t]; lperm[t]=temp; }
+         double d11 = (a22*detscale)/detpiv;
+         double d22 = (a11*detscale)/detpiv;
+         double d21 = (-a21*detscale)/detpiv;
+         double *work = &ldwork[p*32];
+         for(int r=p+2; r<32; r++) {
+            work[r] = a[p*lda+r];
+            work[32+r] = a[(p+1)*lda+r];
+            a[p*lda+r] = d11*work[r] + d21*work[32+r];
+            a[(p+1)*lda+r] = d21*work[r] + d22*work[32+r];
+         }
+         update_2x2<double, 32>(p, a, lda, work);
+         d[2*p] = d11;
+         d[2*p+1] = d21;
+         d[2*p+2] = std::numeric_limits<double>::infinity();
+         d[2*p+3] = d22;
+         a[p*(lda+1)] = 1.0;
+         a[p*(lda+1)+1] = 0.0;
+         a[(p+1)*(lda+1)] = 1.0;
+      }
+
+      p += pivsiz;
+      spral_kernel_record_block_prefix_trace_32(
+            trace_len, step_from, pivsiz, p, perm, lperm, a, lda, d,
+            ldwork, trace_from, trace_status, trace_next, trace_perm,
+            trace_lperm, trace_matrix, trace_ldwork, trace_d);
+      trace_len++;
+   }
+   return trace_len;
+}
 "#
     }
 
@@ -5313,6 +5484,40 @@ extern "C" int spral_kernel_block_first_step_32(
     struct BlockFirstStepState<'a> {
         matrix: &'a [f64],
         workspace: &'a [f64],
+        diagonal: &'a [f64],
+    }
+
+    #[derive(Clone, Debug)]
+    struct BlockPrefixSnapshot {
+        step: usize,
+        from: usize,
+        status: i32,
+        next: usize,
+        perm: Vec<usize>,
+        local_perm: Vec<usize>,
+        matrix: Vec<f64>,
+        workspace: Vec<f64>,
+        diagonal: Vec<f64>,
+    }
+
+    struct RustAppBlockStepState<'a> {
+        rows: &'a mut [usize],
+        matrix: &'a mut [f64],
+        size: usize,
+        workspace: &'a mut [f64],
+        diagonal: &'a mut [f64],
+        local_perm: &'a mut [usize],
+    }
+
+    struct BlockPrefixSnapshotInput<'a> {
+        step: usize,
+        from: usize,
+        status: i32,
+        next: usize,
+        perm: &'a [usize],
+        local_perm: &'a [usize],
+        matrix: (&'a [f64], usize),
+        workspace: (&'a [f64], usize),
         diagonal: &'a [f64],
     }
 
@@ -6046,6 +6251,286 @@ extern "C" int spral_kernel_block_first_step_32(
         Ok((-2, pivot))
     }
 
+    fn native_block_prefix_trace_32(
+        shim: &NativeKernelShim,
+        dense: &[f64],
+        size: usize,
+        lda: usize,
+        options: NumericFactorOptions,
+    ) -> Vec<BlockPrefixSnapshot> {
+        debug_assert_eq!(dense.len(), size * size);
+        debug_assert!(size >= APP_INNER_BLOCK_SIZE);
+        debug_assert!(lda >= APP_INNER_BLOCK_SIZE);
+        let mut matrix = vec![0.0; lda * APP_INNER_BLOCK_SIZE];
+        for col in 0..APP_INNER_BLOCK_SIZE {
+            for row in col..APP_INNER_BLOCK_SIZE {
+                matrix[col * lda + row] = dense[dense_lower_offset(size, row, col)];
+            }
+        }
+        let mut workspace = vec![0.0; APP_INNER_BLOCK_SIZE * APP_INNER_BLOCK_SIZE];
+        let mut diagonal = vec![0.0; 2 * APP_INNER_BLOCK_SIZE];
+        let mut perm = (0..APP_INNER_BLOCK_SIZE as c_int).collect::<Vec<_>>();
+        let mut local_perm = (0..APP_INNER_BLOCK_SIZE as c_int).collect::<Vec<_>>();
+        let max_steps = APP_INNER_BLOCK_SIZE;
+        let mut trace_from = vec![0; max_steps];
+        let mut trace_status = vec![0; max_steps];
+        let mut trace_next = vec![0; max_steps];
+        let mut trace_perm = vec![0; max_steps * APP_INNER_BLOCK_SIZE];
+        let mut trace_local_perm = vec![0; max_steps * APP_INNER_BLOCK_SIZE];
+        let mut trace_matrix = vec![0.0; max_steps * APP_INNER_BLOCK_SIZE * APP_INNER_BLOCK_SIZE];
+        let mut trace_workspace =
+            vec![0.0; max_steps * APP_INNER_BLOCK_SIZE * APP_INNER_BLOCK_SIZE];
+        let mut trace_diagonal = vec![0.0; max_steps * 2 * APP_INNER_BLOCK_SIZE];
+        let steps = unsafe {
+            (shim.block_prefix_trace_32)(
+                0,
+                perm.as_mut_ptr(),
+                matrix.as_mut_ptr(),
+                lda as c_int,
+                diagonal.as_mut_ptr(),
+                workspace.as_mut_ptr(),
+                i32::from(options.action_on_zero_pivot),
+                options.threshold_pivot_u,
+                options.small_pivot_tolerance,
+                local_perm.as_mut_ptr(),
+                max_steps as c_int,
+                trace_from.as_mut_ptr(),
+                trace_status.as_mut_ptr(),
+                trace_next.as_mut_ptr(),
+                trace_perm.as_mut_ptr(),
+                trace_local_perm.as_mut_ptr(),
+                trace_matrix.as_mut_ptr(),
+                trace_workspace.as_mut_ptr(),
+                trace_diagonal.as_mut_ptr(),
+            )
+        } as usize;
+
+        let mut trace = Vec::new();
+        for step in 0..steps {
+            let perm_offset = step * APP_INNER_BLOCK_SIZE;
+            let matrix_offset = step * APP_INNER_BLOCK_SIZE * APP_INNER_BLOCK_SIZE;
+            let diagonal_offset = step * 2 * APP_INNER_BLOCK_SIZE;
+            trace.push(BlockPrefixSnapshot {
+                step,
+                from: trace_from[step] as usize,
+                status: trace_status[step],
+                next: trace_next[step] as usize,
+                perm: trace_perm[perm_offset..perm_offset + APP_INNER_BLOCK_SIZE]
+                    .iter()
+                    .map(|&entry| entry as usize)
+                    .collect(),
+                local_perm: trace_local_perm[perm_offset..perm_offset + APP_INNER_BLOCK_SIZE]
+                    .iter()
+                    .map(|&entry| entry as usize)
+                    .collect(),
+                matrix: trace_matrix
+                    [matrix_offset..matrix_offset + APP_INNER_BLOCK_SIZE * APP_INNER_BLOCK_SIZE]
+                    .to_vec(),
+                workspace: trace_workspace
+                    [matrix_offset..matrix_offset + APP_INNER_BLOCK_SIZE * APP_INNER_BLOCK_SIZE]
+                    .to_vec(),
+                diagonal: trace_diagonal
+                    [diagonal_offset..diagonal_offset + 2 * APP_INNER_BLOCK_SIZE]
+                    .to_vec(),
+            });
+        }
+        trace
+    }
+
+    fn rust_app_block_prefix_trace_32(
+        dense: &[f64],
+        size: usize,
+        options: NumericFactorOptions,
+    ) -> Vec<BlockPrefixSnapshot> {
+        debug_assert_eq!(dense.len(), size * size);
+        debug_assert!(size >= APP_INNER_BLOCK_SIZE);
+        let mut rows = (0..size).collect::<Vec<_>>();
+        let mut matrix = dense.to_vec();
+        let mut workspace = vec![0.0; size * size];
+        let mut diagonal = vec![0.0; 2 * APP_INNER_BLOCK_SIZE];
+        let mut local_perm = (0..APP_INNER_BLOCK_SIZE).collect::<Vec<_>>();
+        let mut trace = Vec::new();
+        let mut from = 0;
+        while from < APP_INNER_BLOCK_SIZE {
+            let mut state = RustAppBlockStepState {
+                rows: &mut rows,
+                matrix: &mut matrix,
+                size,
+                workspace: &mut workspace,
+                diagonal: &mut diagonal,
+                local_perm: &mut local_perm,
+            };
+            let (status, next) = rust_app_block_first_step_32(&mut state, from, options)
+                .expect("rust APP block prefix step");
+            trace.push(block_prefix_snapshot(BlockPrefixSnapshotInput {
+                step: trace.len(),
+                from,
+                status,
+                next,
+                perm: &rows[..APP_INNER_BLOCK_SIZE],
+                local_perm: &local_perm,
+                matrix: (&matrix, size),
+                workspace: (&workspace, size),
+                diagonal: &diagonal,
+            }));
+            if status <= 0 || next <= from {
+                break;
+            }
+            from = next;
+        }
+        trace
+    }
+
+    fn rust_app_block_first_step_32(
+        state: &mut RustAppBlockStepState<'_>,
+        pivot: usize,
+        options: NumericFactorOptions,
+    ) -> Result<(i32, usize), SsidsError> {
+        let rows = &mut *state.rows;
+        let matrix = &mut *state.matrix;
+        let size = state.size;
+        let workspace = &mut *state.workspace;
+        let diagonal = &mut *state.diagonal;
+        let local_perm = &mut *state.local_perm;
+        let block_end = APP_INNER_BLOCK_SIZE;
+        let Some((best_abs, best_row, best_col)) =
+            dense_find_maxloc(matrix, size, pivot, block_end)
+        else {
+            return Ok((0, pivot));
+        };
+
+        if best_abs < options.small_pivot_tolerance {
+            if !options.action_on_zero_pivot {
+                return Ok((-1, pivot));
+            }
+            let mut local_pivot = pivot;
+            while local_pivot < block_end {
+                diagonal[2 * local_pivot] = 0.0;
+                diagonal[2 * local_pivot + 1] = 0.0;
+                zero_dense_column_until(matrix, size, local_pivot, block_end);
+                reset_ldwork_column_tail(workspace, size, local_pivot, local_pivot);
+                local_pivot += 1;
+            }
+            return Ok((0, block_end));
+        }
+
+        let mut stats = PanelFactorStats::default();
+        if best_row == best_col {
+            if best_col != pivot {
+                dense_symmetric_swap_with_workspace(matrix, size, best_col, pivot, workspace);
+                rows.swap(best_col, pivot);
+                local_perm.swap(best_col, pivot);
+            }
+            let block = factor_one_by_one_common(
+                rows, matrix, size, pivot, block_end, &mut stats, workspace,
+            )?;
+            diagonal[2 * pivot] = block.values[0];
+            diagonal[2 * pivot + 1] = 0.0;
+            return Ok((1, pivot + 1));
+        }
+
+        let first = best_col;
+        let mut second = best_row;
+        let a11 = matrix[dense_lower_offset(size, first, first)];
+        let a22 = matrix[dense_lower_offset(size, second, second)];
+        let a21 = matrix[dense_lower_offset(size, second, first)];
+        let mut two_by_two_inverse = None;
+        let mut one_by_one_index = None;
+        if let Some(inverse) = app_two_by_two_inverse(a11, a21, a22, options.small_pivot_tolerance)
+        {
+            two_by_two_inverse = Some(inverse);
+        } else if a11.abs() > a22.abs() {
+            if (a11 / a21).abs() >= options.threshold_pivot_u {
+                one_by_one_index = Some(first);
+            }
+        } else if (a22 / a21).abs() >= options.threshold_pivot_u {
+            one_by_one_index = Some(second);
+        }
+
+        if let Some(index) = one_by_one_index {
+            if index != pivot {
+                dense_symmetric_swap_with_workspace(matrix, size, index, pivot, workspace);
+                rows.swap(index, pivot);
+                local_perm.swap(index, pivot);
+            }
+            let block = factor_one_by_one_common(
+                rows, matrix, size, pivot, block_end, &mut stats, workspace,
+            )?;
+            diagonal[2 * pivot] = block.values[0];
+            diagonal[2 * pivot + 1] = 0.0;
+            return Ok((1, pivot + 1));
+        }
+
+        if let Some(inverse) = two_by_two_inverse {
+            if first != pivot {
+                dense_symmetric_swap_with_workspace(matrix, size, first, pivot, workspace);
+                rows.swap(first, pivot);
+                local_perm.swap(first, pivot);
+                if second == pivot {
+                    second = first;
+                }
+            }
+            if second != pivot + 1 {
+                dense_symmetric_swap_with_workspace(matrix, size, second, pivot + 1, workspace);
+                rows.swap(second, pivot + 1);
+                local_perm.swap(second, pivot + 1);
+            }
+            let block = factor_two_by_two_common(
+                rows,
+                matrix,
+                DenseUpdateBounds {
+                    size,
+                    update_end: block_end,
+                },
+                pivot,
+                inverse,
+                &mut stats,
+                workspace,
+            )?;
+            diagonal[2 * pivot] = block.values[0];
+            diagonal[2 * pivot + 1] = block.values[1];
+            diagonal[2 * pivot + 2] = f64::INFINITY;
+            diagonal[2 * pivot + 3] = block.values[3];
+            return Ok((2, pivot + 2));
+        }
+
+        Ok((-2, pivot))
+    }
+
+    fn block_prefix_snapshot(input: BlockPrefixSnapshotInput<'_>) -> BlockPrefixSnapshot {
+        BlockPrefixSnapshot {
+            step: input.step,
+            from: input.from,
+            status: input.status,
+            next: input.next,
+            perm: input.perm.to_vec(),
+            local_perm: input.local_perm.to_vec(),
+            matrix: extract_lower_block(input.matrix.0, input.matrix.1),
+            workspace: extract_strided_block(input.workspace.0, input.workspace.1),
+            diagonal: input.diagonal.to_vec(),
+        }
+    }
+
+    fn extract_lower_block(matrix: &[f64], stride: usize) -> Vec<f64> {
+        let mut block = vec![0.0; APP_INNER_BLOCK_SIZE * APP_INNER_BLOCK_SIZE];
+        for col in 0..APP_INNER_BLOCK_SIZE {
+            for row in col..APP_INNER_BLOCK_SIZE {
+                block[col * APP_INNER_BLOCK_SIZE + row] = matrix[col * stride + row];
+            }
+        }
+        block
+    }
+
+    fn extract_strided_block(matrix: &[f64], stride: usize) -> Vec<f64> {
+        let mut block = vec![0.0; APP_INNER_BLOCK_SIZE * APP_INNER_BLOCK_SIZE];
+        for col in 0..APP_INNER_BLOCK_SIZE {
+            for row in 0..APP_INNER_BLOCK_SIZE {
+                block[col * APP_INNER_BLOCK_SIZE + row] = matrix[col * stride + row];
+            }
+        }
+        block
+    }
+
     fn native_block_ldlt_32_from_lower_dense(
         shim: &NativeKernelShim,
         dense: &[f64],
@@ -6374,6 +6859,120 @@ extern "C" int spral_kernel_block_first_step_32(
             );
         }
         Ok(())
+    }
+
+    fn assert_block_prefix_traces_equal(
+        rust: &[BlockPrefixSnapshot],
+        native: &[BlockPrefixSnapshot],
+    ) {
+        for (rust_step, native_step) in rust.iter().zip(native) {
+            assert_eq!(
+                (
+                    rust_step.step,
+                    rust_step.from,
+                    rust_step.status,
+                    rust_step.next
+                ),
+                (
+                    native_step.step,
+                    native_step.from,
+                    native_step.status,
+                    native_step.next
+                ),
+                "block_ldlt prefix status mismatch rust={rust_step:?} native={native_step:?}"
+            );
+            assert_eq!(
+                rust_step.perm, native_step.perm,
+                "block_ldlt prefix perm mismatch step={} from={} rust={:?} native={:?}",
+                rust_step.step, rust_step.from, rust_step.perm, native_step.perm
+            );
+            assert_eq!(
+                rust_step.local_perm, native_step.local_perm,
+                "block_ldlt prefix local_perm mismatch step={} from={} rust={:?} native={:?}",
+                rust_step.step, rust_step.from, rust_step.local_perm, native_step.local_perm
+            );
+            for (index, (&rust_value, &native_value)) in rust_step
+                .diagonal
+                .iter()
+                .zip(&native_step.diagonal)
+                .enumerate()
+            {
+                assert_eq!(
+                    rust_value.to_bits(),
+                    native_value.to_bits(),
+                    "block_ldlt prefix d mismatch step={} from={} index={} rust={:?} native={:?}",
+                    rust_step.step,
+                    rust_step.from,
+                    index,
+                    rust_value,
+                    native_value
+                );
+            }
+            for col in 0..APP_INNER_BLOCK_SIZE {
+                for row in col..APP_INNER_BLOCK_SIZE {
+                    let index = col * APP_INNER_BLOCK_SIZE + row;
+                    let rust_value = rust_step.matrix[index];
+                    let native_value = native_step.matrix[index];
+                    assert_eq!(
+                        rust_value.to_bits(),
+                        native_value.to_bits(),
+                        "block_ldlt prefix matrix mismatch step={} from={} row={} col={} rust={:?} native={:?}",
+                        rust_step.step,
+                        rust_step.from,
+                        row,
+                        col,
+                        rust_value,
+                        native_value
+                    );
+                }
+            }
+            for (index, (&rust_value, &native_value)) in rust_step
+                .workspace
+                .iter()
+                .zip(&native_step.workspace)
+                .enumerate()
+            {
+                assert_eq!(
+                    rust_value.to_bits(),
+                    native_value.to_bits(),
+                    "block_ldlt prefix ldwork mismatch step={} from={} index={} rust={:?} native={:?}",
+                    rust_step.step,
+                    rust_step.from,
+                    index,
+                    rust_value,
+                    native_value
+                );
+            }
+        }
+        if rust.len() != native.len() {
+            let next_rust = rust.get(native.len()).or_else(|| rust.last());
+            let next_native = native.get(rust.len()).or_else(|| native.last());
+            panic!(
+                "block_ldlt prefix step-count mismatch rust_len={} native_len={} last_common={} next_rust={} next_native={}",
+                rust.len(),
+                native.len(),
+                rust.len().min(native.len()).saturating_sub(1),
+                block_prefix_snapshot_summary(next_rust),
+                block_prefix_snapshot_summary(next_native)
+            );
+        }
+    }
+
+    fn block_prefix_snapshot_summary(snapshot: Option<&BlockPrefixSnapshot>) -> String {
+        snapshot.map_or_else(
+            || "none".to_string(),
+            |snapshot| {
+                format!(
+                    "step={} from={} status={} next={} perm={:?} local_perm={:?}",
+                    snapshot.step,
+                    snapshot.from,
+                    snapshot.status,
+                    snapshot.next,
+                    snapshot.perm,
+                    snapshot.local_perm
+                )
+            },
+        )
     }
 
     #[test]
@@ -7760,6 +8359,10 @@ extern "C" int spral_kernel_block_first_step_32(
             }
         }
         let options = NumericFactorOptions::default();
+        let rust_trace = rust_app_block_prefix_trace_32(&lower_dense, dimension, options);
+        let native_trace = native_block_prefix_trace_32(shim, &lower_dense, dimension, 34, options);
+        assert_block_prefix_traces_equal(&rust_trace, &native_trace);
+
         let rust = rust_block_ldlt_32_from_lower_dense(&lower_dense, dimension, options);
         let native =
             native_block_ldlt_32_from_lower_dense(shim, &lower_dense, dimension, 34, options);
@@ -7772,7 +8375,7 @@ extern "C" int spral_kernel_block_first_step_32(
             assert_eq!(
                 rust_value.to_bits(),
                 native_value.to_bits(),
-                "block_ldlt d mismatch index={index} rust={rust_value:?} native={native_value:?}"
+                "block_ldlt final d mismatch after matching traced APP prefix index={index} rust={rust_value:?} native={native_value:?}"
             );
         }
         for col in 0..APP_INNER_BLOCK_SIZE {
@@ -7782,7 +8385,7 @@ extern "C" int spral_kernel_block_first_step_32(
                 assert_eq!(
                     rust_value.to_bits(),
                     native_value.to_bits(),
-                    "block_ldlt matrix mismatch row={row} col={col} rust={rust_value:?} native={native_value:?} local_perm={:?}",
+                    "block_ldlt final matrix mismatch after matching traced APP prefix row={row} col={col} rust={rust_value:?} native={native_value:?} local_perm={:?}",
                     rust.local_perm
                 );
             }
