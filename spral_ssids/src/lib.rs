@@ -2366,6 +2366,8 @@ fn app_apply_block_pivots_to_trailing_rows(
         return (Duration::default(), Duration::default());
     }
 
+    // OP_N applies a diagonal block to rows below the eliminated columns, where
+    // SPRAL's column-major `aval[col * lda + row]` matches our dense storage.
     let triangular_started = profile_enabled.then(Instant::now);
     const OPENBLAS_DTRSM_UNROLL_N: usize = 4;
     for row in block_end..size {
@@ -2373,24 +2375,25 @@ fn app_apply_block_pivots_to_trailing_rows(
         while group_start < block_end {
             let group_end = (group_start + OPENBLAS_DTRSM_UNROLL_N).min(block_end);
             for col in group_start..group_end {
-                let mut value = matrix[dense_lower_offset(size, row, col)];
+                let entry = col * size + row;
+                let mut value = matrix[entry];
                 if group_start > block_start {
                     let mut dot = 0.0;
                     for prior in block_start..group_start {
-                        let prior_value = matrix[dense_lower_offset(size, row, prior)];
-                        let lower_value = matrix[dense_lower_offset(size, col, prior)];
+                        let prior_value = matrix[prior * size + row];
+                        let lower_value = matrix[prior * size + col];
                         dot = prior_value.mul_add(lower_value, dot);
                     }
                     value = dot.mul_add(-1.0, value);
                 }
-                matrix[dense_lower_offset(size, row, col)] = value;
+                matrix[entry] = value;
             }
 
             for col in group_start..group_end {
-                let value = matrix[dense_lower_offset(size, row, col)];
+                let value = matrix[col * size + row];
                 for target_col in (col + 1)..group_end {
-                    let target_entry = dense_lower_offset(size, row, target_col);
-                    let lower_value = matrix[dense_lower_offset(size, target_col, col)];
+                    let target_entry = target_col * size + row;
+                    let lower_value = matrix[col * size + target_col];
                     matrix[target_entry] = (-value).mul_add(lower_value, matrix[target_entry]);
                 }
             }
@@ -2406,7 +2409,7 @@ fn app_apply_block_pivots_to_trailing_rows(
         if block.size == 1 {
             let d11 = block.values[0];
             for row in block_end..size {
-                let entry = dense_lower_offset(size, row, col);
+                let entry = col * size + row;
                 let value = matrix[entry];
                 matrix[entry] = if d11 == 0.0 {
                     if value.abs() < small {
@@ -2424,8 +2427,8 @@ fn app_apply_block_pivots_to_trailing_rows(
             let d21 = block.values[1];
             let d22 = block.values[3];
             for row in block_end..size {
-                let first_entry = dense_lower_offset(size, row, col);
-                let second_entry = dense_lower_offset(size, row, col + 1);
+                let first_entry = col * size + row;
+                let second_entry = (col + 1) * size + row;
                 let a1 = matrix[first_entry];
                 let a2 = matrix[second_entry];
                 matrix[first_entry] = d11.mul_add(a1, d21 * a2);
