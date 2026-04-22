@@ -4135,6 +4135,148 @@ fn solve_two_by_two_block_in_place(values: &[f64], rhs: &mut [f64]) -> Result<()
 }
 
 // Mirrors SPRAL SSIDS CPU solve order in NumericSubtree.hxx and
+// kernels/ldlt_app.cxx: gather each front-local RHS, run the unit-lower
+// triangular solve, apply the dense APP trailing GEMV update, then scatter the
+// full front-local RHS.
+#[cfg(test)]
+fn solve_forward_front_panels_like_native(panels: &[SolvePanel], factor_rhs: &mut [f64]) {
+    let mut local_rhs = Vec::new();
+    for panel in panels {
+        let eliminated_len = panel.eliminated_len;
+        let local_size = panel.row_positions.len();
+        debug_assert!(eliminated_len <= local_size);
+        debug_assert_eq!(panel.values.len(), local_size * eliminated_len);
+
+        local_rhs.resize(local_size, 0.0);
+        for (local_row, &factor_position) in panel.row_positions.iter().enumerate() {
+            local_rhs[local_row] = factor_rhs[factor_position];
+        }
+
+        openblas_trsv_lower_unit_op_n_like_native(
+            &panel.values,
+            local_size,
+            &mut local_rhs[..eliminated_len],
+        );
+
+        if local_size > eliminated_len {
+            let (solved, trailing) = local_rhs.split_at_mut(eliminated_len);
+            openblas_gemv_n_update_like_native(
+                local_size - eliminated_len,
+                eliminated_len,
+                &panel.values[eliminated_len..],
+                local_size,
+                solved,
+                trailing,
+            );
+        }
+
+        for (local_row, &factor_position) in panel.row_positions.iter().enumerate() {
+            factor_rhs[factor_position] = local_rhs[local_row];
+        }
+    }
+}
+
+// Mirrors OpenBLAS driver/level2/trsv_L.c for lower/unit/no-transpose on the
+// local panel solve path used by SPRAL's ldlt_app_solve_fwd.
+#[cfg(test)]
+fn openblas_trsv_lower_unit_op_n_like_native(a: &[f64], lda: usize, x: &mut [f64]) {
+    const DTB_ENTRIES: usize = 64;
+    let n = x.len();
+    for block_start in (0..n).step_by(DTB_ENTRIES) {
+        let block_len = (n - block_start).min(DTB_ENTRIES);
+        let block_end = block_start + block_len;
+
+        for local_col in 0..block_len {
+            let global_col = block_start + local_col;
+            let pivot_value = x[global_col];
+            let alpha = -pivot_value;
+            if alpha == 0.0 {
+                continue;
+            }
+            for row in (global_col + 1)..block_end {
+                let coefficient = a[global_col * lda + row];
+                x[row] = coefficient.mul_add(alpha, x[row]);
+            }
+        }
+
+        if block_end < n {
+            let (solved, trailing) = x.split_at_mut(block_end);
+            openblas_gemv_n_update_like_native(
+                n - block_end,
+                block_len,
+                &a[block_start * lda + block_end..],
+                lda,
+                &solved[block_start..block_end],
+                trailing,
+            );
+        }
+    }
+}
+
+// Mirrors OpenBLAS kernel/arm64/gemv_n.S for the OP_N solve update shape used
+// by dtrsv_NLU and ldlt_app_solve_fwd: each source column updates all trailing
+// rows before the next column is loaded.
+#[cfg(test)]
+#[allow(clippy::neg_multiply)]
+fn openblas_gemv_n_update_like_native(
+    m: usize,
+    n: usize,
+    a: &[f64],
+    lda: usize,
+    x: &[f64],
+    y: &mut [f64],
+) {
+    debug_assert_eq!(x.len(), n);
+    debug_assert_eq!(y.len(), m);
+    for (col, &x_col) in x.iter().enumerate() {
+        let alpha_x = -1.0f64 * x_col;
+        let column_start = col * lda;
+        for row in 0..m {
+            y[row] = a[column_start + row].mul_add(alpha_x, y[row]);
+        }
+    }
+}
+
+// Mirrors OpenBLAS driver/level2/trsv_U.c for lower/unit/transpose on the
+// local panel solve path used by SPRAL's ldlt_app_solve_bwd.
+#[cfg(test)]
+fn openblas_trsv_lower_unit_op_t_like_native(a: &[f64], lda: usize, x: &mut [f64]) {
+    const DTB_ENTRIES: usize = 64;
+    let n = x.len();
+    let mut block_end = n;
+    while block_end > 0 {
+        let block_len = block_end.min(DTB_ENTRIES);
+        let block_start = block_end - block_len;
+
+        if block_end < n {
+            for global_col in block_start..block_end {
+                let column_start = global_col * lda;
+                let dot = openblas_gemv_t_dot_like_contiguous(
+                    &a[column_start + block_end..column_start + n],
+                    &x[block_end..n],
+                );
+                x[global_col] = (-1.0f64).mul_add(dot, x[global_col]);
+            }
+        }
+
+        for local_index in 0..block_len {
+            let global_col = block_end - local_index - 1;
+            let local_len = block_end - global_col - 1;
+            if local_len > 0 {
+                let column_start = global_col * lda + global_col + 1;
+                let dot = openblas_dotu_like_contiguous(
+                    &a[column_start..column_start + local_len],
+                    &x[global_col + 1..block_end],
+                );
+                x[global_col] -= dot;
+            }
+        }
+
+        block_end = block_start;
+    }
+}
+
+// Mirrors SPRAL SSIDS CPU solve order in NumericSubtree.hxx and
 // kernels/ldlt_app.cxx: gather each front-local RHS, apply the dense APP
 // trailing GEMV update, run the unit-lower transposed triangular solve, then
 // scatter only the eliminated rows.
@@ -4431,11 +4573,15 @@ mod tests {
 
     use super::{
         DenseTppTailRequest, FactorBlockRecord, NativeOrdering, NativeSpral, NumericFactorOptions,
-        OrderingStrategy, SsidsOptions, SymmetricCscMatrix, analyse,
+        OrderingStrategy, SolvePanel, SsidsOptions, SymmetricCscMatrix, analyse,
         app_apply_block_pivots_to_trailing_rows, app_build_ld_workspace,
         app_solve_block_triangular_to_trailing_rows, build_symbolic_front_tree, dense_lower_offset,
         expand_symmetric_pattern, factorize, factorize_dense_tpp_tail_in_place,
-        native_column_counts, native_postorder_permutation, permute_graph, symbolic_factor_pattern,
+        native_column_counts, native_postorder_permutation, openblas_gemv_n_update_like_native,
+        openblas_gemv_t_dot_like_contiguous, openblas_trsv_lower_unit_op_n_like_native,
+        openblas_trsv_lower_unit_op_t_like_native, permute_graph,
+        solve_forward_front_panels_like_native, solve_two_by_two_block_in_place,
+        symbolic_factor_pattern,
     };
 
     #[derive(Clone, Debug)]
@@ -4496,6 +4642,12 @@ mod tests {
         unsafe extern "C" fn(c_int, c_int, *const f64, c_int, *const f64, *mut f64, c_int);
     type HostTrsmRightLowerTransUnitFn =
         unsafe extern "C" fn(c_int, c_int, *const f64, c_int, *mut f64, c_int);
+    type HostTrsvLowerUnitFn = unsafe extern "C" fn(c_int, *const f64, c_int, *mut f64);
+    type GemvSolveUpdateFn =
+        unsafe extern "C" fn(c_int, c_int, *const f64, c_int, *const f64, *mut f64);
+    type LdltAppSolveFn =
+        unsafe extern "C" fn(c_int, c_int, *const f64, c_int, c_int, *mut f64, c_int);
+    type LdltAppSolveDiagFn = unsafe extern "C" fn(c_int, *const f64, c_int, *mut f64, c_int);
 
     struct NativeKernelShim {
         _libspral: Library,
@@ -4503,6 +4655,13 @@ mod tests {
         apply_pivot_op_n: ApplyPivotOpNFn,
         calc_ld_op_n: CalcLdOpNFn,
         host_trsm_right_lower_trans_unit: HostTrsmRightLowerTransUnitFn,
+        host_trsv_lower_unit_op_n: HostTrsvLowerUnitFn,
+        host_trsv_lower_unit_op_t: HostTrsvLowerUnitFn,
+        gemv_op_n_solve_update: GemvSolveUpdateFn,
+        gemv_op_t_solve_update: GemvSolveUpdateFn,
+        ldlt_app_solve_fwd: LdltAppSolveFn,
+        ldlt_app_solve_diag: LdltAppSolveDiagFn,
+        ldlt_app_solve_bwd: LdltAppSolveFn,
     }
 
     static NATIVE_KERNEL_SHIM: OnceLock<Result<NativeKernelShim, String>> = OnceLock::new();
@@ -4623,6 +4782,45 @@ mod tests {
                     format!("failed to load host_trsm right/lower/trans/unit shim: {error}")
                 })?
         };
+        let host_trsv_lower_unit_op_n = unsafe {
+            *library
+                .get::<HostTrsvLowerUnitFn>(b"spral_kernel_host_trsv_lower_unit_op_n\0")
+                .map_err(|error| {
+                    format!("failed to load host_trsv lower/unit OP_N shim: {error}")
+                })?
+        };
+        let host_trsv_lower_unit_op_t = unsafe {
+            *library
+                .get::<HostTrsvLowerUnitFn>(b"spral_kernel_host_trsv_lower_unit_op_t\0")
+                .map_err(|error| {
+                    format!("failed to load host_trsv lower/unit OP_T shim: {error}")
+                })?
+        };
+        let gemv_op_n_solve_update = unsafe {
+            *library
+                .get::<GemvSolveUpdateFn>(b"spral_kernel_gemv_op_n_solve_update\0")
+                .map_err(|error| format!("failed to load gemv OP_N solve update shim: {error}"))?
+        };
+        let gemv_op_t_solve_update = unsafe {
+            *library
+                .get::<GemvSolveUpdateFn>(b"spral_kernel_gemv_op_t_solve_update\0")
+                .map_err(|error| format!("failed to load gemv OP_T solve update shim: {error}"))?
+        };
+        let ldlt_app_solve_fwd = unsafe {
+            *library
+                .get::<LdltAppSolveFn>(b"spral_kernel_ldlt_app_solve_fwd\0")
+                .map_err(|error| format!("failed to load ldlt_app_solve_fwd shim: {error}"))?
+        };
+        let ldlt_app_solve_diag = unsafe {
+            *library
+                .get::<LdltAppSolveDiagFn>(b"spral_kernel_ldlt_app_solve_diag\0")
+                .map_err(|error| format!("failed to load ldlt_app_solve_diag shim: {error}"))?
+        };
+        let ldlt_app_solve_bwd = unsafe {
+            *library
+                .get::<LdltAppSolveFn>(b"spral_kernel_ldlt_app_solve_bwd\0")
+                .map_err(|error| format!("failed to load ldlt_app_solve_bwd shim: {error}"))?
+        };
 
         Ok(NativeKernelShim {
             _libspral: libspral_library,
@@ -4630,6 +4828,13 @@ mod tests {
             apply_pivot_op_n,
             calc_ld_op_n,
             host_trsm_right_lower_trans_unit,
+            host_trsv_lower_unit_op_n,
+            host_trsv_lower_unit_op_t,
+            gemv_op_n_solve_update,
+            gemv_op_t_solve_update,
+            ldlt_app_solve_fwd,
+            ldlt_app_solve_diag,
+            ldlt_app_solve_bwd,
         })
     }
 
@@ -4678,6 +4883,7 @@ mod tests {
     fn native_kernel_shim_source() -> &'static str {
         r#"
 #include "ssids/cpu/kernels/common.hxx"
+#include "ssids/cpu/kernels/ldlt_app.hxx"
 #include "ssids/cpu/kernels/wrappers.hxx"
 
 namespace spral { namespace ssids { namespace cpu {
@@ -4712,6 +4918,56 @@ extern "C" void spral_kernel_host_trsm_right_lower_trans_unit(
          spral::ssids::cpu::OP_T,
          spral::ssids::cpu::DIAG_UNIT,
          m, n, 1.0, a, lda, b, ldb);
+}
+
+extern "C" void spral_kernel_host_trsv_lower_unit_op_n(
+      int n, const double* a, int lda, double* x) {
+   spral::ssids::cpu::host_trsv<double>(
+         spral::ssids::cpu::FILL_MODE_LWR,
+         spral::ssids::cpu::OP_N,
+         spral::ssids::cpu::DIAG_UNIT,
+         n, a, lda, x, 1);
+}
+
+extern "C" void spral_kernel_host_trsv_lower_unit_op_t(
+      int n, const double* a, int lda, double* x) {
+   spral::ssids::cpu::host_trsv<double>(
+         spral::ssids::cpu::FILL_MODE_LWR,
+         spral::ssids::cpu::OP_T,
+         spral::ssids::cpu::DIAG_UNIT,
+         n, a, lda, x, 1);
+}
+
+extern "C" void spral_kernel_gemv_op_n_solve_update(
+      int m, int n, const double* a, int lda, const double* x, double* y) {
+   spral::ssids::cpu::gemv<double>(
+         spral::ssids::cpu::OP_N,
+         m, n, -1.0, a, lda, x, 1, 1.0, y, 1);
+}
+
+extern "C" void spral_kernel_gemv_op_t_solve_update(
+      int m, int n, const double* a, int lda, const double* x, double* y) {
+   spral::ssids::cpu::gemv<double>(
+         spral::ssids::cpu::OP_T,
+         m, n, -1.0, a, lda, x, 1, 1.0, y, 1);
+}
+
+extern "C" void spral_kernel_ldlt_app_solve_fwd(
+      int m, int n, const double* l, int ldl, int nrhs, double* x, int ldx) {
+   spral::ssids::cpu::ldlt_app_solve_fwd<double>(
+         m, n, l, ldl, nrhs, x, ldx);
+}
+
+extern "C" void spral_kernel_ldlt_app_solve_diag(
+      int n, const double* d, int nrhs, double* x, int ldx) {
+   spral::ssids::cpu::ldlt_app_solve_diag<double>(
+         n, d, nrhs, x, ldx);
+}
+
+extern "C" void spral_kernel_ldlt_app_solve_bwd(
+      int m, int n, const double* l, int ldl, int nrhs, double* x, int ldx) {
+   spral::ssids::cpu::ldlt_app_solve_bwd<double>(
+         m, n, l, ldl, nrhs, x, ldx);
 }
 "#
     }
@@ -4762,6 +5018,16 @@ extern "C" void spral_kernel_host_trsm_right_lower_trans_unit(
         block_records: Vec<FactorBlockRecord>,
         d_values: Vec<f64>,
         small: f64,
+    }
+
+    #[derive(Clone, Debug)]
+    struct AppSolveKernelCase {
+        seed: u64,
+        rows: usize,
+        eliminated_len: usize,
+        lower: Vec<f64>,
+        diagonal: Vec<f64>,
+        rhs: Vec<f64>,
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -4854,6 +5120,50 @@ extern "C" void spral_kernel_host_trsm_right_lower_trans_unit(
         }
     }
 
+    fn app_solve_kernel_case_from_seed(seed: u64) -> AppSolveKernelCase {
+        let mut rng = DenseBoundaryRng::new(seed);
+        let eliminated_len = rng.usize_inclusive(1, 80);
+        let trailing_rows = rng.usize_inclusive(0, 96);
+        let rows = eliminated_len + trailing_rows;
+        let mut lower = vec![0.0; rows * eliminated_len];
+        for col in 0..eliminated_len {
+            lower[col * rows + col] = 1.0;
+            for row in (col + 1)..rows {
+                lower[col * rows + row] = rng.dyadic_kernel_value(12, 6, true);
+            }
+        }
+
+        let mut diagonal = vec![0.0; 2 * eliminated_len];
+        let mut col = 0;
+        while col < eliminated_len {
+            let use_two_by_two = col + 1 < eliminated_len && rng.next_u64().is_multiple_of(3);
+            if use_two_by_two {
+                diagonal[2 * col] = rng.nonzero_dyadic(12, 4);
+                diagonal[2 * col + 1] = rng.nonzero_dyadic(12, 4);
+                diagonal[2 * col + 2] = f64::INFINITY;
+                diagonal[2 * col + 3] = rng.nonzero_dyadic(12, 4);
+                col += 2;
+            } else {
+                diagonal[2 * col] = rng.nonzero_dyadic(12, 4);
+                diagonal[2 * col + 1] = 0.0;
+                col += 1;
+            }
+        }
+
+        let rhs = (0..rows)
+            .map(|_| rng.dyadic_kernel_value(18, 6, true))
+            .collect();
+
+        AppSolveKernelCase {
+            seed,
+            rows,
+            eliminated_len,
+            lower,
+            diagonal,
+            rhs,
+        }
+    }
+
     fn native_host_trsm_op_n(shim: &NativeKernelShim, case: &AppKernelCase, matrix: &mut [f64]) {
         let trailing_rows = case.size - case.block_end;
         let block_width = case.block_end - case.block_start;
@@ -4868,6 +5178,76 @@ extern "C" void spral_kernel_host_trsm_right_lower_trans_unit(
                 case.size as c_int,
                 matrix.as_mut_ptr().add(aval_offset),
                 case.size as c_int,
+            );
+        }
+    }
+
+    fn native_host_trsv_lower_op_n(
+        shim: &NativeKernelShim,
+        case: &AppSolveKernelCase,
+        rhs: &mut [f64],
+    ) {
+        unsafe {
+            (shim.host_trsv_lower_unit_op_n)(
+                case.eliminated_len as c_int,
+                case.lower.as_ptr(),
+                case.rows as c_int,
+                rhs.as_mut_ptr(),
+            );
+        }
+    }
+
+    fn native_host_trsv_lower_op_t(
+        shim: &NativeKernelShim,
+        case: &AppSolveKernelCase,
+        rhs: &mut [f64],
+    ) {
+        unsafe {
+            (shim.host_trsv_lower_unit_op_t)(
+                case.eliminated_len as c_int,
+                case.lower.as_ptr(),
+                case.rows as c_int,
+                rhs.as_mut_ptr(),
+            );
+        }
+    }
+
+    fn native_gemv_op_n_solve_update(
+        shim: &NativeKernelShim,
+        case: &AppSolveKernelCase,
+        rhs: &mut [f64],
+    ) {
+        if case.rows == case.eliminated_len {
+            return;
+        }
+        unsafe {
+            (shim.gemv_op_n_solve_update)(
+                (case.rows - case.eliminated_len) as c_int,
+                case.eliminated_len as c_int,
+                case.lower.as_ptr().add(case.eliminated_len),
+                case.rows as c_int,
+                rhs.as_ptr(),
+                rhs.as_mut_ptr().add(case.eliminated_len),
+            );
+        }
+    }
+
+    fn native_gemv_op_t_solve_update(
+        shim: &NativeKernelShim,
+        case: &AppSolveKernelCase,
+        rhs: &mut [f64],
+    ) {
+        if case.rows == case.eliminated_len {
+            return;
+        }
+        unsafe {
+            (shim.gemv_op_t_solve_update)(
+                (case.rows - case.eliminated_len) as c_int,
+                case.eliminated_len as c_int,
+                case.lower.as_ptr().add(case.eliminated_len),
+                case.rows as c_int,
+                rhs.as_ptr().add(case.eliminated_len),
+                rhs.as_mut_ptr(),
             );
         }
     }
@@ -4889,6 +5269,128 @@ extern "C" void spral_kernel_host_trsm_right_lower_trans_unit(
                 case.size as c_int,
             );
         }
+    }
+
+    fn native_ldlt_app_solve_fwd(
+        shim: &NativeKernelShim,
+        case: &AppSolveKernelCase,
+        rhs: &mut [f64],
+    ) {
+        unsafe {
+            (shim.ldlt_app_solve_fwd)(
+                case.rows as c_int,
+                case.eliminated_len as c_int,
+                case.lower.as_ptr(),
+                case.rows as c_int,
+                1,
+                rhs.as_mut_ptr(),
+                case.rows as c_int,
+            );
+        }
+    }
+
+    fn native_ldlt_app_solve_diag(
+        shim: &NativeKernelShim,
+        case: &AppSolveKernelCase,
+        rhs: &mut [f64],
+    ) {
+        unsafe {
+            (shim.ldlt_app_solve_diag)(
+                case.eliminated_len as c_int,
+                case.diagonal.as_ptr(),
+                1,
+                rhs.as_mut_ptr(),
+                case.rows as c_int,
+            );
+        }
+    }
+
+    fn native_ldlt_app_solve_bwd(
+        shim: &NativeKernelShim,
+        case: &AppSolveKernelCase,
+        rhs: &mut [f64],
+    ) {
+        unsafe {
+            (shim.ldlt_app_solve_bwd)(
+                case.rows as c_int,
+                case.eliminated_len as c_int,
+                case.lower.as_ptr(),
+                case.rows as c_int,
+                1,
+                rhs.as_mut_ptr(),
+                case.rows as c_int,
+            );
+        }
+    }
+
+    fn rust_host_trsv_lower_op_n_like_native(case: &AppSolveKernelCase, rhs: &mut [f64]) {
+        openblas_trsv_lower_unit_op_n_like_native(
+            &case.lower,
+            case.rows,
+            &mut rhs[..case.eliminated_len],
+        );
+    }
+
+    fn rust_host_trsv_lower_op_t_like_native(case: &AppSolveKernelCase, rhs: &mut [f64]) {
+        openblas_trsv_lower_unit_op_t_like_native(
+            &case.lower,
+            case.rows,
+            &mut rhs[..case.eliminated_len],
+        );
+    }
+
+    fn rust_gemv_op_n_solve_update_like_native(case: &AppSolveKernelCase, rhs: &mut [f64]) {
+        let (solved, trailing) = rhs.split_at_mut(case.eliminated_len);
+        openblas_gemv_n_update_like_native(
+            case.rows - case.eliminated_len,
+            case.eliminated_len,
+            &case.lower[case.eliminated_len..],
+            case.rows,
+            solved,
+            trailing,
+        );
+    }
+
+    fn rust_gemv_op_t_solve_update_like_native(case: &AppSolveKernelCase, rhs: &mut [f64]) {
+        for local_col in 0..case.eliminated_len {
+            let column_start = local_col * case.rows;
+            let dot = openblas_gemv_t_dot_like_contiguous(
+                &case.lower[column_start + case.eliminated_len..column_start + case.rows],
+                &rhs[case.eliminated_len..case.rows],
+            );
+            rhs[local_col] = (-1.0f64).mul_add(dot, rhs[local_col]);
+        }
+    }
+
+    fn rust_ldlt_app_solve_fwd_like_native(case: &AppSolveKernelCase, rhs: &mut [f64]) {
+        let panel = SolvePanel {
+            eliminated_len: case.eliminated_len,
+            row_positions: (0..case.rows).collect(),
+            values: case.lower.clone(),
+        };
+        solve_forward_front_panels_like_native(&[panel], rhs);
+    }
+
+    fn rust_ldlt_app_solve_diag_like_native(case: &AppSolveKernelCase, rhs: &mut [f64]) {
+        let mut index = 0;
+        while index < case.eliminated_len {
+            if index + 1 == case.eliminated_len || case.diagonal[2 * index + 2].is_finite() {
+                rhs[index] *= case.diagonal[2 * index];
+                index += 1;
+            } else {
+                solve_two_by_two_block_in_place(
+                    &case.diagonal[2 * index..2 * index + 4],
+                    &mut rhs[index..index + 2],
+                )
+                .expect("generated finite two-by-two solve");
+                index += 2;
+            }
+        }
+    }
+
+    fn rust_ldlt_app_solve_bwd_like_native(case: &AppSolveKernelCase, rhs: &mut [f64]) {
+        rust_gemv_op_t_solve_update_like_native(case, rhs);
+        rust_host_trsv_lower_op_t_like_native(case, rhs);
     }
 
     fn assert_app_kernel_matrices_bitwise_equal(
@@ -5098,6 +5600,251 @@ extern "C" void spral_kernel_host_trsm_right_lower_trans_unit(
             &rust_matrix,
             &native_matrix,
         );
+    }
+
+    #[test]
+    fn app_host_trsv_lower_op_n_matches_native_kernel_property_cases() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let cases = env_usize("SPRAL_SSIDS_KERNEL_PARITY_CASES", 512);
+        let seed = env_u64("SPRAL_SSIDS_KERNEL_PARITY_SEED", 0x7150_900d_0001);
+        let mut runner = deterministic_kernel_runner(cases, seed);
+
+        runner
+            .run(&any::<u64>(), |case_seed| {
+                let case = app_solve_kernel_case_from_seed(seed ^ case_seed);
+                let mut rust_rhs = case.rhs.clone();
+                let mut native_rhs = case.rhs.clone();
+
+                rust_host_trsv_lower_op_n_like_native(&case, &mut rust_rhs);
+                native_host_trsv_lower_op_n(shim, &case, &mut native_rhs);
+
+                for (index, (&rust, &native)) in rust_rhs.iter().zip(&native_rhs).enumerate() {
+                    prop_assert_eq!(
+                        rust.to_bits(),
+                        native.to_bits(),
+                        "host_trsv lower/unit OP_N mismatch seed={:#x} index={} rust={:?} native={:?} case={:?}",
+                        case.seed,
+                        index,
+                        rust,
+                        native,
+                        case
+                    );
+                }
+                Ok(())
+            })
+            .expect("host_trsv lower/unit OP_N kernel parity property failed");
+    }
+
+    #[test]
+    fn app_host_trsv_lower_op_t_matches_native_kernel_property_cases() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let cases = env_usize("SPRAL_SSIDS_KERNEL_PARITY_CASES", 512);
+        let seed = env_u64("SPRAL_SSIDS_KERNEL_PARITY_SEED", 0x7151_900d_0001);
+        let mut runner = deterministic_kernel_runner(cases, seed);
+
+        runner
+            .run(&any::<u64>(), |case_seed| {
+                let case = app_solve_kernel_case_from_seed(seed ^ case_seed);
+                let mut rust_rhs = case.rhs.clone();
+                let mut native_rhs = case.rhs.clone();
+
+                rust_host_trsv_lower_op_t_like_native(&case, &mut rust_rhs);
+                native_host_trsv_lower_op_t(shim, &case, &mut native_rhs);
+
+                for (index, (&rust, &native)) in rust_rhs.iter().zip(&native_rhs).enumerate() {
+                    prop_assert_eq!(
+                        rust.to_bits(),
+                        native.to_bits(),
+                        "host_trsv lower/unit OP_T mismatch seed={:#x} index={} rust={:?} native={:?} case={:?}",
+                        case.seed,
+                        index,
+                        rust,
+                        native,
+                        case
+                    );
+                }
+                Ok(())
+            })
+            .expect("host_trsv lower/unit OP_T kernel parity property failed");
+    }
+
+    #[test]
+    fn app_gemv_op_n_solve_update_matches_native_kernel_property_cases() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let cases = env_usize("SPRAL_SSIDS_KERNEL_PARITY_CASES", 512);
+        let seed = env_u64("SPRAL_SSIDS_KERNEL_PARITY_SEED", 0x6e50_900d_0001);
+        let mut runner = deterministic_kernel_runner(cases, seed);
+
+        runner
+            .run(&any::<u64>(), |case_seed| {
+                let case = app_solve_kernel_case_from_seed(seed ^ case_seed);
+                let mut rust_rhs = case.rhs.clone();
+                let mut native_rhs = case.rhs.clone();
+
+                rust_gemv_op_n_solve_update_like_native(&case, &mut rust_rhs);
+                native_gemv_op_n_solve_update(shim, &case, &mut native_rhs);
+
+                for (index, (&rust, &native)) in rust_rhs.iter().zip(&native_rhs).enumerate() {
+                    prop_assert_eq!(
+                        rust.to_bits(),
+                        native.to_bits(),
+                        "gemv OP_N solve update mismatch seed={:#x} index={} rust={:?} native={:?} case={:?}",
+                        case.seed,
+                        index,
+                        rust,
+                        native,
+                        case
+                    );
+                }
+                Ok(())
+            })
+            .expect("gemv OP_N solve update kernel parity property failed");
+    }
+
+    #[test]
+    fn app_gemv_op_t_solve_update_matches_native_kernel_property_cases() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let cases = env_usize("SPRAL_SSIDS_KERNEL_PARITY_CASES", 512);
+        let seed = env_u64("SPRAL_SSIDS_KERNEL_PARITY_SEED", 0x6e51_900d_0001);
+        let mut runner = deterministic_kernel_runner(cases, seed);
+
+        runner
+            .run(&any::<u64>(), |case_seed| {
+                let case = app_solve_kernel_case_from_seed(seed ^ case_seed);
+                let mut rust_rhs = case.rhs.clone();
+                let mut native_rhs = case.rhs.clone();
+
+                rust_gemv_op_t_solve_update_like_native(&case, &mut rust_rhs);
+                native_gemv_op_t_solve_update(shim, &case, &mut native_rhs);
+
+                for (index, (&rust, &native)) in rust_rhs.iter().zip(&native_rhs).enumerate() {
+                    prop_assert_eq!(
+                        rust.to_bits(),
+                        native.to_bits(),
+                        "gemv OP_T solve update mismatch seed={:#x} index={} rust={:?} native={:?} case={:?}",
+                        case.seed,
+                        index,
+                        rust,
+                        native,
+                        case
+                    );
+                }
+                Ok(())
+            })
+            .expect("gemv OP_T solve update kernel parity property failed");
+    }
+
+    #[test]
+    fn app_ldlt_solve_fwd_matches_native_kernel_property_cases() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let cases = env_usize("SPRAL_SSIDS_KERNEL_PARITY_CASES", 512);
+        let seed = env_u64("SPRAL_SSIDS_KERNEL_PARITY_SEED", 0xf0ed_900d_0001);
+        let mut runner = deterministic_kernel_runner(cases, seed);
+
+        runner
+            .run(&any::<u64>(), |case_seed| {
+                let case = app_solve_kernel_case_from_seed(seed ^ case_seed);
+                let mut rust_rhs = case.rhs.clone();
+                let mut native_rhs = case.rhs.clone();
+
+                rust_ldlt_app_solve_fwd_like_native(&case, &mut rust_rhs);
+                native_ldlt_app_solve_fwd(shim, &case, &mut native_rhs);
+
+                for (index, (&rust, &native)) in rust_rhs.iter().zip(&native_rhs).enumerate() {
+                    prop_assert_eq!(
+                        rust.to_bits(),
+                        native.to_bits(),
+                        "ldlt_app_solve_fwd mismatch seed={:#x} index={} rust={:?} native={:?} case={:?}",
+                        case.seed,
+                        index,
+                        rust,
+                        native,
+                        case
+                    );
+                }
+                Ok(())
+            })
+            .expect("ldlt_app_solve_fwd kernel parity property failed");
+    }
+
+    #[test]
+    fn app_ldlt_solve_diag_matches_native_kernel_property_cases() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let cases = env_usize("SPRAL_SSIDS_KERNEL_PARITY_CASES", 512);
+        let seed = env_u64("SPRAL_SSIDS_KERNEL_PARITY_SEED", 0xd1a6_900d_0001);
+        let mut runner = deterministic_kernel_runner(cases, seed);
+
+        runner
+            .run(&any::<u64>(), |case_seed| {
+                let case = app_solve_kernel_case_from_seed(seed ^ case_seed);
+                let mut rust_rhs = case.rhs.clone();
+                let mut native_rhs = case.rhs.clone();
+
+                rust_ldlt_app_solve_diag_like_native(&case, &mut rust_rhs);
+                native_ldlt_app_solve_diag(shim, &case, &mut native_rhs);
+
+                for (index, (&rust, &native)) in rust_rhs.iter().zip(&native_rhs).enumerate() {
+                    prop_assert_eq!(
+                        rust.to_bits(),
+                        native.to_bits(),
+                        "ldlt_app_solve_diag mismatch seed={:#x} index={} rust={:?} native={:?} case={:?}",
+                        case.seed,
+                        index,
+                        rust,
+                        native,
+                        case
+                    );
+                }
+                Ok(())
+            })
+            .expect("ldlt_app_solve_diag kernel parity property failed");
+    }
+
+    #[test]
+    fn app_ldlt_solve_bwd_matches_native_kernel_property_cases() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let cases = env_usize("SPRAL_SSIDS_KERNEL_PARITY_CASES", 512);
+        let seed = env_u64("SPRAL_SSIDS_KERNEL_PARITY_SEED", 0xbad0_900d_0001);
+        let mut runner = deterministic_kernel_runner(cases, seed);
+
+        runner
+            .run(&any::<u64>(), |case_seed| {
+                let case = app_solve_kernel_case_from_seed(seed ^ case_seed);
+                let mut rust_rhs = case.rhs.clone();
+                let mut native_rhs = case.rhs.clone();
+
+                rust_ldlt_app_solve_bwd_like_native(&case, &mut rust_rhs);
+                native_ldlt_app_solve_bwd(shim, &case, &mut native_rhs);
+
+                for (index, (&rust, &native)) in rust_rhs.iter().zip(&native_rhs).enumerate() {
+                    prop_assert_eq!(
+                        rust.to_bits(),
+                        native.to_bits(),
+                        "ldlt_app_solve_bwd mismatch seed={:#x} index={} rust={:?} native={:?} case={:?}",
+                        case.seed,
+                        index,
+                        rust,
+                        native,
+                        case
+                    );
+                }
+                Ok(())
+            })
+            .expect("ldlt_app_solve_bwd kernel parity property failed");
     }
 
     #[test]
