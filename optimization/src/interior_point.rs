@@ -3408,6 +3408,13 @@ fn current_fraction_to_boundary_tau(barrier_parameter: f64, options: &InteriorPo
         .clamp(0.0, 1.0)
 }
 
+fn ipopt_dense_frac_to_bound_candidate(tau: f64, value: f64, delta: f64) -> f64 {
+    // IPOPT `DenseVector::FracToBoundImpl` evaluates this as
+    // `-tau / values_delta[i] * values_x[i]`; keep that operation order so
+    // fraction-to-boundary alphas do not drift by a bit on tight limiters.
+    -tau / delta * value
+}
+
 fn fraction_to_boundary_with_limiter(
     current: &[f64],
     direction: &[f64],
@@ -3418,7 +3425,7 @@ fn fraction_to_boundary_with_limiter(
     let mut limiter = None;
     for (idx, (&value, &delta)) in current.iter().zip(direction.iter()).enumerate() {
         if delta < 0.0 {
-            let candidate = (-tau * value / delta).clamp(0.0, 1.0);
+            let candidate = ipopt_dense_frac_to_bound_candidate(tau, value, delta);
             if candidate < alpha {
                 alpha = candidate;
                 limiter = Some(InteriorPointBoundaryLimiter {
@@ -3431,7 +3438,7 @@ fn fraction_to_boundary_with_limiter(
             }
         }
     }
-    (alpha.clamp(0.0, 1.0), limiter)
+    (alpha, limiter)
 }
 
 fn fraction_to_boundary_limiters(
@@ -3455,7 +3462,7 @@ fn fraction_to_boundary_limiters(
                     index,
                     value,
                     direction: delta,
-                    alpha: (-tau * value / delta).clamp(0.0, 1.0),
+                    alpha: ipopt_dense_frac_to_bound_candidate(tau, value, delta),
                 })
             } else {
                 None
@@ -3483,7 +3490,7 @@ fn fraction_to_variable_bounds_with_limiter(
         let value = native_lower_bound_slack(x, index, lower);
         let direction = dx[index];
         if direction < 0.0 {
-            let candidate = (-tau * value / direction).clamp(0.0, 1.0);
+            let candidate = ipopt_dense_frac_to_bound_candidate(tau, value, direction);
             if candidate < alpha {
                 alpha = candidate;
                 limiter = Some(InteriorPointBoundaryLimiter {
@@ -3500,7 +3507,7 @@ fn fraction_to_variable_bounds_with_limiter(
         let value = native_upper_bound_slack(x, index, upper);
         let direction = -dx[index];
         if direction < 0.0 {
-            let candidate = (-tau * value / direction).clamp(0.0, 1.0);
+            let candidate = ipopt_dense_frac_to_bound_candidate(tau, value, direction);
             if candidate < alpha {
                 alpha = candidate;
                 limiter = Some(InteriorPointBoundaryLimiter {
@@ -3513,7 +3520,7 @@ fn fraction_to_variable_bounds_with_limiter(
             }
         }
     }
-    (alpha.clamp(0.0, 1.0), limiter)
+    (alpha, limiter)
 }
 
 fn add_native_bound_multiplier_terms(
@@ -7826,6 +7833,19 @@ mod tests {
 
         assert!((alpha_min - 5.0e-11).abs() <= 1.0e-25);
         assert!(alpha_min < options.min_step);
+    }
+
+    #[test]
+    fn fraction_to_boundary_candidate_keeps_ipopt_operation_order() {
+        let tau = 0.7782901536485674;
+        let value = 2.59793708066258e-11;
+        let delta = -2.2047607129366904e-6;
+
+        let ipopt_order = ipopt_dense_frac_to_bound_candidate(tau, value, delta);
+        let old_nlip_order = -tau * value / delta;
+
+        assert_eq!(ipopt_order.to_bits(), 0x3ee3_3b8d_73e4_0424);
+        assert_eq!(old_nlip_order.to_bits(), 0x3ee3_3b8d_73e4_0425);
     }
 }
 
