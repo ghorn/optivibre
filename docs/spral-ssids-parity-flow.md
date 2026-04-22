@@ -25,23 +25,25 @@ signed-zero witness:
   `0x7e61757756000303`, index 118.
 - Skipping only negative-zero source values fixes the first two cases but fails
   at `0xaed55ad4b5afb713`, index 93.
+- Splitting the APP triangular solve tail into OpenBLAS RN-style 4/2/1 column
+  groups fixed the isolated `host_trsm` and `apply_pivot<OP_N>` signed-zero
+  witness and the 4096-case isolated APP property hunt, but regressed six
+  full-solver solution-bit witnesses in `cargo test -p spral_ssids --tests`.
+  That means the tail split is incomplete without the wider driver/update
+  context and is not an acceptable production parity fix yet.
 
-So the next real target is still the OpenBLAS level-3 `dtrsm` packing/kernel
-path used by SPRAL, not another local scalar sign heuristic. The relevant
-source anchors are `target/native/spral-upstream/src/ssids/cpu/kernels/wrappers.cxx`
-`host_trsm`, `target/native/spral-upstream/src/ssids/cpu/kernels/ldlt_app.cxx`
-`apply_pivot<OP_N>`, and OpenBLAS `driver/level3/trsm_R.c` plus its
-`TRSM_KERNEL_RN` and `TRSM_OLTCOPY` specializations. For SPRAL's
-`host_trsm(SIDE_RIGHT, FILL_MODE_LWR, OP_T, DIAG_UNIT)`, OpenBLAS dispatches
-to `DTRSM_RTLU`; `driver/level3/trsm_R.c` maps that real, transposed-lower,
-right-side case to the RN microkernel. The generic RN solve walks columns
-forward and updates later packed columns, which source-backs the current Rust
-forward in-block order. The unresolved mismatch is therefore the OpenBLAS
-packed-buffer zero-sign policy across `TRSM_OLTCOPY` plus the RN kernel, not
-the high-level triangular-solve direction. The native parity preflight now
-records the linked OpenBLAS runtime provenance; the current local stack reports
-OpenBLAS `0.3.32 DYNAMIC_ARCH ... neoversen1`, whose arm64 `KERNEL.NEOVERSEN1`
-selects the generic `trsm_kernel_RN.c` path for double RN dtrsm.
+The relevant source anchors are
+`target/native/spral-upstream/src/ssids/cpu/kernels/wrappers.cxx` `host_trsm`,
+`target/native/spral-upstream/src/ssids/cpu/kernels/ldlt_app.cxx`
+`apply_pivot<OP_N>`, and OpenBLAS `driver/level3/trsm_R.c` plus
+`kernel/generic/trsm_kernel_RN.c` and `kernel/generic/trsm_ltcopy_4.c`. For
+SPRAL's `host_trsm(SIDE_RIGHT, FILL_MODE_LWR, OP_T, DIAG_UNIT)`, OpenBLAS
+dispatches to `DTRSM_RTLU`; `driver/level3/trsm_R.c` maps that real,
+transposed-lower, right-side case to the RN microkernel. The native parity
+preflight records the linked OpenBLAS runtime provenance; the current local
+stack reports OpenBLAS `0.3.32 DYNAMIC_ARCH ... neoversen1`, whose arm64
+`KERNEL.NEOVERSEN1` selects the generic `trsm_kernel_RN.c` path for double RN
+dtrsm.
 
 Previous newly narrowed witness:
 `app_apply_pivot_and_host_trsm_signed_zero_boundaries_are_complementary` pins a
@@ -49,12 +51,8 @@ generic APP kernel signed-zero boundary to one deterministic witness. For seed
 `0xbffedbb32ab866e0`, both raw `host_trsm` and full `apply_pivot<OP_N>` first
 differ at flattened matrix index 82, with complementary zero signs:
 `host_trsm` has Rust `+0.0` and native `-0.0`, while `apply_pivot<OP_N>` has
-Rust `-0.0` and native `+0.0`. This is a new fail-closed guard for the open
-signed-zero mismatch, not bitwise parity. The source anchors are
-`target/native/spral-upstream/src/ssids/cpu/kernels/ldlt_app.cxx`
-`apply_pivot<OP_N>`, which calls `host_trsm` before diagonal scaling, and
-`target/native/spral-upstream/src/ssids/cpu/kernels/wrappers.cxx` `host_trsm`,
-which delegates to BLAS `dtrsm`.
+Rust `-0.0` and native `+0.0`. This is a fail-closed guard for the open
+signed-zero mismatch, not bitwise parity.
 
 Previous newly narrowed witness:
 `dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now compares
