@@ -2249,12 +2249,14 @@ fn factor_two_by_two_common(
 
     let first_multiplier_row = pivot + 2;
     let trailing_rows = update_end.saturating_sub(first_multiplier_row);
-    // The local optimized block_ldlt<32> build contracts the first multiplier
-    // when there are enough trailing rows to vectorize, but its narrow scalar
-    // tail follows block_ldlt.hxx source order. The second multiplier remains
-    // contracted on the local native build.
+    // Mirrors SPRAL ssids/cpu/kernels/block_ldlt.hxx::block_ldlt on the local
+    // optimized native build: the vectorized body contracts the second source
+    // product into the first rounded product, while the scalar tail contracts
+    // the first source product into the second rounded product.
     let vectorized_multiplier_rows = if trailing_rows >= 4 {
         trailing_rows / 2 * 2
+    } else if trailing_rows == 3 {
+        2
     } else {
         0
     };
@@ -2264,11 +2266,12 @@ fn factor_two_by_two_common(
         first_scratch[row] = b1;
         second_scratch[row] = b2;
         let local_row = row - first_multiplier_row;
-        let (l1, l2) = if local_row < vectorized_multiplier_rows {
-            (inv12.mul_add(b2, inv11 * b1), inv12.mul_add(b1, inv22 * b2))
+        let l1 = if local_row < vectorized_multiplier_rows {
+            inv12.mul_add(b2, inv11 * b1)
         } else {
-            (inv11 * b1 + inv12 * b2, inv12.mul_add(b1, inv22 * b2))
+            inv11.mul_add(b1, inv12 * b2)
         };
+        let l2 = inv12.mul_add(b1, inv22 * b2);
         if !l1.is_finite() || !l2.is_finite() {
             return Err(SsidsError::NumericalBreakdown {
                 pivot: rows[pivot],
@@ -2558,23 +2561,78 @@ fn app_build_ld_workspace(
             let d11 = inv11 / det;
             let d21 = inv21 / det;
             let d22 = inv22 / det;
-            let trailing_rows = size - accepted_end;
-            let vector_tail_start = if trailing_rows > 4 {
-                accepted_end + (trailing_rows & !1)
-            } else {
-                accepted_end
-            };
             for row in accepted_end..size {
                 let row_l1 = matrix[pivot * size + row];
                 let row_l2 = matrix[(pivot + 1) * size + row];
-                // SPRAL cpu/kernels/calc_ld.hxx calcLD<OP_N> is compiled
-                // locally into a two-lane vector body plus scalar tail.
-                ld_values[relative_pivot * size + row] = if row < vector_tail_start {
+                // Mirrors ldlt_app.cxx::Block::update: calcLD<OP_N> is
+                // called separately for each target block, so the local
+                // vector/scalar split resets at every APP_INNER_BLOCK_SIZE
+                // row tile rather than once for the full trailing tail.
+                let tile_start = accepted_end
+                    + ((row - accepted_end) / APP_INNER_BLOCK_SIZE) * APP_INNER_BLOCK_SIZE;
+                let tile_end = (tile_start + APP_INNER_BLOCK_SIZE).min(size);
+                let tile_rows = tile_end - tile_start;
+                let vector_rows = if tile_rows > 4 { tile_rows & !1 } else { 0 };
+                let local_row = row - tile_start;
+                ld_values[relative_pivot * size + row] = if local_row < vector_rows {
                     (-d21).mul_add(row_l2, d22 * row_l1)
                 } else {
                     d22.mul_add(row_l1, -(d21 * row_l2))
                 };
                 ld_values[(relative_pivot + 1) * size + row] = (-d21).mul_add(row_l1, d11 * row_l2);
+            }
+            pivot += 2;
+        }
+    }
+    debug_assert_eq!(pivot, accepted_end);
+    ld_values
+}
+
+#[cfg(test)]
+fn app_build_ld_tile_workspace(
+    matrix: &[f64],
+    size: usize,
+    block_start: usize,
+    accepted_end: usize,
+    block_records: &[FactorBlockRecord],
+    row_start: usize,
+    row_end: usize,
+) -> Vec<f64> {
+    let accepted_width = accepted_end - block_start;
+    let tile_rows = row_end - row_start;
+    let mut ld_values = vec![0.0; accepted_width * tile_rows.max(1)];
+    let mut pivot = block_start;
+    for block in block_records {
+        let relative_pivot = pivot - block_start;
+        if block.size == 1 {
+            let diagonal = app_original_one_by_one_diagonal(block.values[0]);
+            for row in row_start..row_end {
+                let row_l = matrix[pivot * size + row];
+                ld_values[relative_pivot * tile_rows + (row - row_start)] = diagonal * row_l;
+            }
+            pivot += 1;
+        } else {
+            let inv11 = block.values[0];
+            let inv21 = block.values[1];
+            let inv22 = block.values[3];
+            let det = inv11.mul_add(inv22, -(inv21 * inv21));
+            let d11 = inv11 / det;
+            let d21 = inv21 / det;
+            let d22 = inv22 / det;
+            let vector_rows = if tile_rows > 4 { tile_rows & !1 } else { 0 };
+            for row in row_start..row_end {
+                let local_row = row - row_start;
+                let row_l1 = matrix[pivot * size + row];
+                let row_l2 = matrix[(pivot + 1) * size + row];
+                // Mirrors SPRAL ssids/cpu/kernels/calc_ld.hxx
+                // calcLD<OP_N> as called from ldlt_app.cxx::Block::update.
+                ld_values[relative_pivot * tile_rows + local_row] = if local_row < vector_rows {
+                    (-d21).mul_add(row_l2, d22 * row_l1)
+                } else {
+                    d22.mul_add(row_l1, -(d21 * row_l2))
+                };
+                ld_values[(relative_pivot + 1) * tile_rows + local_row] =
+                    (-d21).mul_add(row_l1, d11 * row_l2);
             }
             pivot += 2;
         }
@@ -3762,7 +3820,10 @@ fn factor_front_recursive(
             }
             let value = matrix.values[entry];
             let offset = dense_lower_offset(local_size, local_row, local_column);
-            local_dense[offset] += value;
+            // Mirrors SPRAL ssids/cpu/kernels/assemble.hxx::add_a_block:
+            // original A entries are assigned into the node. Contributions
+            // from children are accumulated separately below.
+            local_dense[offset] = value;
         }
     }
     for contribution in &child_contributions {
@@ -4689,13 +4750,13 @@ mod tests {
     use super::{
         APP_INNER_BLOCK_SIZE, DenseTppTailRequest, DenseUpdateBounds, DiagonalBlock,
         FactorBlockRecord, NativeOrdering, NativeSpral, NumericFactorOptions, OrderingStrategy,
-        PanelFactorStats, SolvePanel, SsidsError, SsidsOptions, SymmetricCscMatrix, analyse,
-        app_adjust_passed_prefix, app_apply_accepted_prefix_update,
-        app_apply_block_pivots_to_trailing_rows, app_build_ld_workspace,
-        app_first_failed_trailing_column, app_restore_trailing_from_block_backup,
-        app_solve_block_triangular_to_trailing_rows, app_truncate_records_to_prefix,
-        app_two_by_two_inverse, app_update_one_by_one, app_update_two_by_two,
-        build_symbolic_front_tree, dense_find_maxloc, dense_lower_offset,
+        PanelFactorStats, PivotMethod, SolvePanel, SsidsError, SsidsOptions, SymmetricCscMatrix,
+        analyse, app_adjust_passed_prefix, app_apply_accepted_prefix_update,
+        app_apply_block_pivots_to_trailing_rows, app_build_ld_tile_workspace,
+        app_build_ld_workspace, app_first_failed_trailing_column,
+        app_restore_trailing_from_block_backup, app_solve_block_triangular_to_trailing_rows,
+        app_truncate_records_to_prefix, app_two_by_two_inverse, app_update_one_by_one,
+        app_update_two_by_two, build_symbolic_front_tree, dense_find_maxloc, dense_lower_offset,
         dense_symmetric_swap_with_workspace, expand_symmetric_pattern, factor_one_by_one_common,
         factor_two_by_two_common, factorize, factorize_dense_front,
         factorize_dense_tpp_tail_in_place, native_column_counts, native_postorder_permutation,
@@ -4781,6 +4842,19 @@ mod tests {
         *mut f64,
         c_int,
     );
+    type LdltAppFactorFn = unsafe extern "C" fn(
+        c_int,
+        c_int,
+        *mut c_int,
+        *mut f64,
+        c_int,
+        *mut f64,
+        c_int,
+        f64,
+        f64,
+        c_int,
+        c_int,
+    ) -> c_int;
     type LdltAppSolveFn =
         unsafe extern "C" fn(c_int, c_int, *const f64, c_int, c_int, *mut f64, c_int);
     type LdltAppSolveDiagFn = unsafe extern "C" fn(c_int, *const f64, c_int, *mut f64, c_int);
@@ -4868,6 +4942,7 @@ mod tests {
         gemv_op_n_solve_update: GemvSolveUpdateFn,
         gemv_op_t_solve_update: GemvSolveUpdateFn,
         host_gemm_op_n_op_t_update: HostGemmOpNOpTUpdateFn,
+        ldlt_app_factor: LdltAppFactorFn,
         ldlt_app_solve_fwd: LdltAppSolveFn,
         ldlt_app_solve_diag: LdltAppSolveDiagFn,
         ldlt_app_solve_bwd: LdltAppSolveFn,
@@ -5055,6 +5130,11 @@ mod tests {
                     format!("failed to load host_gemm OP_N/OP_T update shim: {error}")
                 })?
         };
+        let ldlt_app_factor = unsafe {
+            *library
+                .get::<LdltAppFactorFn>(b"spral_kernel_ldlt_app_factor\0")
+                .map_err(|error| format!("failed to load ldlt_app_factor shim: {error}"))?
+        };
         let ldlt_app_solve_fwd = unsafe {
             *library
                 .get::<LdltAppSolveFn>(b"spral_kernel_ldlt_app_solve_fwd\0")
@@ -5163,6 +5243,7 @@ mod tests {
             gemv_op_n_solve_update,
             gemv_op_t_solve_update,
             host_gemm_op_n_op_t_update,
+            ldlt_app_factor,
             ldlt_app_solve_fwd,
             ldlt_app_solve_diag,
             ldlt_app_solve_bwd,
@@ -5227,13 +5308,18 @@ mod tests {
 
     fn native_kernel_shim_source() -> &'static str {
         r#"
+#include <algorithm>
+#include <cmath>
+#include <stdexcept>
+#include <vector>
+
 #include "ssids/cpu/kernels/common.hxx"
+#include "ssids/cpu/BuddyAllocator.hxx"
 #include "ssids/cpu/cpu_iface.hxx"
 #include "ssids/cpu/kernels/block_ldlt.hxx"
 #include "ssids/cpu/kernels/ldlt_app.hxx"
 #include "ssids/cpu/kernels/ldlt_tpp.hxx"
 #include "ssids/cpu/kernels/wrappers.hxx"
-#include <cmath>
 
 namespace spral { namespace ssids { namespace cpu {
 template <enum operation op, typename T>
@@ -5333,6 +5419,39 @@ extern "C" void spral_kernel_host_gemm_op_n_op_t_update(
          m, n, k, -1.0, a, lda, b, ldb, 1.0, c, ldc);
 }
 
+extern "C" int spral_kernel_ldlt_app_factor(
+      int m, int n, int* perm, double* a, int lda, double* d, int action,
+      double u, double small, int cpu_block_size, int pivot_method) {
+   spral::ssids::cpu::cpu_factor_options options;
+   options.print_level = -1;
+   options.action = action != 0;
+   options.small = small;
+   options.u = u;
+   options.multiplier = 1.1;
+   options.small_subtree_threshold = 4000000;
+   options.cpu_block_size = cpu_block_size;
+   options.pivot_method =
+      static_cast<spral::ssids::cpu::PivotMethod>(pivot_method);
+   options.failed_pivot_method = spral::ssids::cpu::FailedPivotMethod::tpp;
+   std::vector<spral::ssids::cpu::Workspace> work;
+   work.reserve(256);
+   for(int i = 0; i < 256; ++i)
+      work.emplace_back(1);
+   size_t const backup_bytes =
+      spral::ssids::cpu::align_lda<double>(m) * n * sizeof(double)
+#if defined(__AVX512F__)
+      + 64;
+#elif defined(__AVX__)
+      + 32;
+#else
+      + 16;
+#endif
+   spral::ssids::cpu::BuddyAllocator<double, std::allocator<double>> alloc(
+         std::max<size_t>(backup_bytes, 1024));
+   return spral::ssids::cpu::ldlt_app_factor<double>(
+         m, n, perm, a, lda, d, 0.0, nullptr, 0, options, work, alloc);
+}
+
 extern "C" void spral_kernel_ldlt_app_solve_fwd(
       int m, int n, const double* l, int ldl, int nrhs, double* x, int ldx) {
    spral::ssids::cpu::ldlt_app_solve_fwd<double>(
@@ -5418,6 +5537,19 @@ extern "C" void spral_kernel_block_two_by_two_multipliers(
    out[1] = std::fma(d21, work0, d22*work1);
 }
 
+static double spral_kernel_block_first_multiplier(
+      int p, int r, double d11, double d21, const double* work) {
+   int const first_row = p + 2;
+   int const trailing_rows = 32 - first_row;
+   int const vector_rows = (trailing_rows >= 4) ? (trailing_rows / 2) * 2
+                         : (trailing_rows == 3) ? 2
+                         : 0;
+   if(r - first_row < vector_rows)
+      return std::fma(d21, work[32+r], d11*work[r]);
+   else
+      return std::fma(d11, work[r], d21*work[32+r]);
+}
+
 extern "C" int spral_kernel_block_first_step_32(
       int from, int* perm, double* a, int lda, double* d, double* ldwork,
       int action, double u, double small, int* lperm, int* next_p) {
@@ -5493,7 +5625,7 @@ extern "C" int spral_kernel_block_first_step_32(
       for(int r=p+2; r<32; r++) {
          work[r] = a[p*lda+r];
          work[32+r] = a[(p+1)*lda+r];
-         a[p*lda+r] = std::fma(d21, work[32+r], d11*work[r]);
+         a[p*lda+r] = spral_kernel_block_first_multiplier(p, r, d11, d21, work);
          a[(p+1)*lda+r] = std::fma(d21, work[r], d22*work[32+r]);
       }
       spral_kernel_block_update_2x2_32(p, a, lda, work);
@@ -5636,7 +5768,7 @@ static int spral_kernel_block_prefix_trace_32_impl(
                a[p*lda+r] = d11*work[r] + d21*work[32+r];
                a[(p+1)*lda+r] = d21*work[r] + d22*work[32+r];
             } else {
-               a[p*lda+r] = std::fma(d21, work[32+r], d11*work[r]);
+               a[p*lda+r] = spral_kernel_block_first_multiplier(p, r, d11, d21, work);
                a[(p+1)*lda+r] = std::fma(d21, work[r], d22*work[32+r]);
             }
          }
@@ -7161,6 +7293,64 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         }
     }
 
+    fn native_ldlt_app_factor_from_lower_dense(
+        shim: &NativeKernelShim,
+        dense: &[f64],
+        size: usize,
+        options: NumericFactorOptions,
+    ) -> DenseTppKernelResult {
+        native_ldlt_app_factor_from_lower_dense_with_block_size(shim, dense, size, options, 256)
+    }
+
+    fn native_ldlt_app_factor_from_lower_dense_with_block_size(
+        shim: &NativeKernelShim,
+        dense: &[f64],
+        size: usize,
+        options: NumericFactorOptions,
+        cpu_block_size: i32,
+    ) -> DenseTppKernelResult {
+        debug_assert_eq!(dense.len(), size * size);
+        let lda = native_aligned_double_stride(shim, size);
+        let mut matrix = vec![0.0; lda * size];
+        for col in 0..size {
+            for row in col..size {
+                matrix[col * lda + row] = dense[dense_lower_offset(size, row, col)];
+            }
+        }
+        let mut perm = (0..size as c_int).collect::<Vec<_>>();
+        let mut diagonal = vec![0.0; 2 * size.max(1)];
+        let pivot_method = match options.pivot_method {
+            PivotMethod::AggressiveAposteriori => 1,
+            PivotMethod::BlockAposteriori => 2,
+            PivotMethod::ThresholdPartial => 3,
+        };
+        let eliminated = unsafe {
+            (shim.ldlt_app_factor)(
+                size as c_int,
+                size as c_int,
+                perm.as_mut_ptr(),
+                matrix.as_mut_ptr(),
+                lda as c_int,
+                diagonal.as_mut_ptr(),
+                i32::from(options.action_on_zero_pivot),
+                options.threshold_pivot_u,
+                options.small_pivot_tolerance,
+                cpu_block_size,
+                pivot_method,
+            )
+        };
+        assert!(
+            eliminated >= 0,
+            "native ldlt_app_factor returned {eliminated}"
+        );
+        DenseTppKernelResult {
+            eliminated: eliminated as usize,
+            perm: perm.into_iter().map(|entry| entry as usize).collect(),
+            matrix,
+            diagonal,
+        }
+    }
+
     fn native_block_ldlt_32_continue_from_snapshot(
         shim: &NativeKernelShim,
         snapshot: &BlockPrefixSnapshot,
@@ -7289,6 +7479,94 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             }
         }
         None
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct FrozenPrefixMismatch {
+        step: usize,
+        next: usize,
+        row: usize,
+        col: usize,
+        source_row: usize,
+        snapshot_bits: u64,
+        block_bits: u64,
+    }
+
+    fn first_frozen_prefix_mismatch_against_block(
+        snapshot: &BlockPrefixSnapshot,
+        expected: &BlockLdltKernelResult,
+        lda: usize,
+    ) -> Option<FrozenPrefixMismatch> {
+        for col in 0..snapshot.next {
+            debug_assert_eq!(snapshot.local_perm[col], expected.local_perm[col]);
+            for row in col..APP_INNER_BLOCK_SIZE {
+                let source_row = snapshot.local_perm[row];
+                let final_row = expected
+                    .local_perm
+                    .iter()
+                    .position(|&entry| entry == source_row)
+                    .expect("snapshot source row exists in final block permutation");
+                let snapshot_value = snapshot.matrix[col * APP_INNER_BLOCK_SIZE + row];
+                let block_value = expected.matrix[col * lda + final_row];
+                if snapshot_value.to_bits() != block_value.to_bits() {
+                    return Some(FrozenPrefixMismatch {
+                        step: snapshot.step,
+                        next: snapshot.next,
+                        row,
+                        col,
+                        source_row,
+                        snapshot_bits: snapshot_value.to_bits(),
+                        block_bits: block_value.to_bits(),
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    fn two_by_two_first_multiplier_expression_bits(
+        snapshot: &BlockPrefixSnapshot,
+        row: usize,
+    ) -> (u64, u64, u64, u64) {
+        let pivot = snapshot.from;
+        let d11 = snapshot.diagonal[2 * pivot];
+        let d21 = snapshot.diagonal[2 * pivot + 1];
+        let first_work = snapshot.workspace[pivot * APP_INNER_BLOCK_SIZE + row];
+        let second_work = snapshot.workspace[(pivot + 1) * APP_INNER_BLOCK_SIZE + row];
+        let source = d11 * first_work + d21 * second_work;
+        let fma_second = d21.mul_add(second_work, d11 * first_work);
+        let fma_first = d11.mul_add(first_work, d21 * second_work);
+        let stored = snapshot.matrix[pivot * APP_INNER_BLOCK_SIZE + row];
+        (
+            source.to_bits(),
+            fma_second.to_bits(),
+            fma_first.to_bits(),
+            stored.to_bits(),
+        )
+    }
+
+    fn two_by_two_first_multiplier_block_expr_bits(
+        snapshot: &BlockPrefixSnapshot,
+        expected: &BlockLdltKernelResult,
+        lda: usize,
+    ) -> Vec<(usize, usize, u64, u64, u64, u64, u64)> {
+        let pivot = snapshot.from;
+        ((pivot + 2)..APP_INNER_BLOCK_SIZE)
+            .map(|row| {
+                let source_row = snapshot.local_perm[row];
+                let final_row = expected
+                    .local_perm
+                    .iter()
+                    .position(|&entry| entry == source_row)
+                    .expect("snapshot source row exists in final block permutation");
+                let (source, fma_second, fma_first, stored) =
+                    two_by_two_first_multiplier_expression_bits(snapshot, row);
+                let block = expected.matrix[pivot * lda + final_row].to_bits();
+                (
+                    row, source_row, source, fma_second, fma_first, stored, block,
+                )
+            })
+            .collect()
     }
 
     fn rust_block_ldlt_32_from_lower_dense(
@@ -9647,6 +9925,452 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         (dimension, random_dense_dyadic_matrix(dimension, &mut rng))
     }
 
+    fn dense_boundary_case_matrix_and_solution(
+        seed: u64,
+        case_index: usize,
+    ) -> (usize, Vec<Vec<f64>>, Vec<f64>) {
+        let mut rng = DenseBoundaryRng::new(seed);
+        let mut dimension = 0;
+        let mut matrix = Vec::new();
+        let mut solution = Vec::new();
+        for _ in 0..=case_index {
+            dimension = rng.usize_inclusive(33, 160);
+            matrix = random_dense_dyadic_matrix(dimension, &mut rng);
+            solution = random_dyadic_solution(dimension, &mut rng);
+        }
+        (dimension, matrix, solution)
+    }
+
+    fn dense_seed706172697479_case58_matrix_and_solution() -> (usize, Vec<Vec<f64>>, Vec<f64>) {
+        let (dimension, matrix, solution) =
+            dense_boundary_case_matrix_and_solution(0x7061_7269_7479, 58);
+        assert_eq!(dimension, 137);
+        (dimension, matrix, solution)
+    }
+
+    fn first_bit_mismatch(left: &[f64], right: &[f64]) -> Option<(usize, u64, u64)> {
+        left.iter()
+            .zip(right)
+            .enumerate()
+            .find_map(|(index, (&left, &right))| {
+                let left_bits = left.to_bits();
+                let right_bits = right.to_bits();
+                (left_bits != right_bits).then_some((index, left_bits, right_bits))
+            })
+    }
+
+    #[derive(Debug)]
+    struct AppBlockReplay {
+        rows: Vec<usize>,
+        after_factor: Vec<f64>,
+        after_apply: Vec<f64>,
+        after_update: Vec<f64>,
+        restored: Vec<f64>,
+        accepted_end: usize,
+        first_failed: usize,
+        local_blocks: Vec<FactorBlockRecord>,
+        accepted_blocks: Vec<FactorBlockRecord>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct AppAcceptedUpdateMismatch {
+        phase: &'static str,
+        row: usize,
+        col: usize,
+        rust_bits: u64,
+        native_bits: u64,
+    }
+
+    fn replay_app_block_for_debug(
+        mut rows: Vec<usize>,
+        mut lower_dense: Vec<f64>,
+        block_start: usize,
+        options: NumericFactorOptions,
+    ) -> AppBlockReplay {
+        let size = rows.len();
+        let block_end = (block_start + APP_INNER_BLOCK_SIZE).min(size);
+        assert_eq!(
+            block_end - block_start,
+            APP_INNER_BLOCK_SIZE,
+            "debug APP replay expects a full APP block"
+        );
+        let before_block = lower_dense.clone();
+        let rows_before_block = rows.clone();
+        let mut scratch = vec![0.0; size.saturating_mul(size).max(1)];
+        let mut local_stats = PanelFactorStats::default();
+        let mut local_blocks = Vec::new();
+        let mut block_pivot = block_start;
+
+        while block_pivot < block_end {
+            let Some((best_abs, best_row, best_col)) =
+                dense_find_maxloc(&lower_dense, size, block_pivot, block_end)
+            else {
+                break;
+            };
+            assert!(
+                best_abs >= options.small_pivot_tolerance,
+                "debug APP replay hit a zero-pivot branch"
+            );
+            if best_row == best_col {
+                if best_col != block_pivot {
+                    dense_symmetric_swap_with_workspace(
+                        &mut lower_dense,
+                        size,
+                        best_col,
+                        block_pivot,
+                        &mut scratch,
+                    );
+                    rows.swap(best_col, block_pivot);
+                }
+                let block = factor_one_by_one_common(
+                    &rows,
+                    &mut lower_dense,
+                    size,
+                    block_pivot,
+                    block_end,
+                    &mut local_stats,
+                    &mut scratch,
+                )
+                .expect("debug APP 1x1 pivot");
+                local_blocks.push(block);
+                block_pivot += 1;
+                continue;
+            }
+
+            let first = best_col;
+            let mut second = best_row;
+            let a11 = lower_dense[dense_lower_offset(size, first, first)];
+            let a22 = lower_dense[dense_lower_offset(size, second, second)];
+            let a21 = lower_dense[dense_lower_offset(size, second, first)];
+            let mut two_by_two_inverse = None;
+            let mut one_by_one_index = None;
+            if let Some(inverse) =
+                app_two_by_two_inverse(a11, a21, a22, options.small_pivot_tolerance)
+            {
+                two_by_two_inverse = Some(inverse);
+            } else if a11.abs() > a22.abs() {
+                if (a11 / a21).abs() >= options.threshold_pivot_u {
+                    one_by_one_index = Some(first);
+                }
+            } else if (a22 / a21).abs() >= options.threshold_pivot_u {
+                one_by_one_index = Some(second);
+            }
+
+            if let Some(index) = one_by_one_index {
+                if index != block_pivot {
+                    dense_symmetric_swap_with_workspace(
+                        &mut lower_dense,
+                        size,
+                        index,
+                        block_pivot,
+                        &mut scratch,
+                    );
+                    rows.swap(index, block_pivot);
+                }
+                let block = factor_one_by_one_common(
+                    &rows,
+                    &mut lower_dense,
+                    size,
+                    block_pivot,
+                    block_end,
+                    &mut local_stats,
+                    &mut scratch,
+                )
+                .expect("debug APP fallback 1x1 pivot");
+                local_blocks.push(block);
+                block_pivot += 1;
+                continue;
+            }
+
+            let Some(inverse) = two_by_two_inverse else {
+                break;
+            };
+            if first != block_pivot {
+                dense_symmetric_swap_with_workspace(
+                    &mut lower_dense,
+                    size,
+                    first,
+                    block_pivot,
+                    &mut scratch,
+                );
+                rows.swap(first, block_pivot);
+                if second == block_pivot {
+                    second = first;
+                }
+            }
+            if second != block_pivot + 1 {
+                dense_symmetric_swap_with_workspace(
+                    &mut lower_dense,
+                    size,
+                    second,
+                    block_pivot + 1,
+                    &mut scratch,
+                );
+                rows.swap(second, block_pivot + 1);
+            }
+            let block = factor_two_by_two_common(
+                &rows,
+                &mut lower_dense,
+                DenseUpdateBounds {
+                    size,
+                    update_end: block_end,
+                },
+                block_pivot,
+                inverse,
+                &mut local_stats,
+                &mut scratch,
+            )
+            .expect("debug APP 2x2 pivot");
+            local_blocks.push(block);
+            block_pivot += 2;
+        }
+
+        let after_factor = lower_dense.clone();
+        app_apply_block_pivots_to_trailing_rows(
+            &mut lower_dense,
+            size,
+            block_start,
+            block_end,
+            &local_blocks,
+            options.small_pivot_tolerance,
+            false,
+        );
+        let after_apply = lower_dense.clone();
+        let first_failed = app_first_failed_trailing_column(
+            &lower_dense,
+            size,
+            block_start,
+            block_end,
+            options.threshold_pivot_u,
+        );
+        let local_passed = app_adjust_passed_prefix(&local_blocks, first_failed - block_start);
+        let accepted_end = block_start + local_passed;
+        let accepted_blocks = app_truncate_records_to_prefix(&local_blocks, local_passed);
+
+        app_restore_trailing_from_block_backup(
+            &rows,
+            &rows_before_block,
+            &mut lower_dense,
+            &before_block,
+            size,
+            accepted_end,
+        );
+        let restored = lower_dense.clone();
+        app_apply_accepted_prefix_update(
+            &mut lower_dense,
+            size,
+            block_start,
+            accepted_end,
+            &accepted_blocks,
+        );
+
+        AppBlockReplay {
+            rows,
+            after_factor,
+            after_apply,
+            after_update: lower_dense,
+            restored,
+            accepted_end,
+            first_failed,
+            local_blocks,
+            accepted_blocks,
+        }
+    }
+
+    fn first_native_apply_pivot_tile_mismatch(
+        shim: &NativeKernelShim,
+        replay: &AppBlockReplay,
+        block_start: usize,
+    ) -> Option<AppAcceptedUpdateMismatch> {
+        let size = replay.rows.len();
+        let block_end = block_start + APP_INNER_BLOCK_SIZE;
+        let block_width = block_end - block_start;
+        let native_lda = native_aligned_double_stride(shim, size);
+        let diagonal = dense_tpp_diagonal_from_blocks(&replay.local_blocks, block_width);
+        let mut row_tile_start = block_end;
+        while row_tile_start < size {
+            let row_tile_end = (row_tile_start + APP_INNER_BLOCK_SIZE).min(size);
+            let tile_rows = row_tile_end - row_tile_start;
+            let mut native_matrix = vec![0.0; native_lda * size];
+            for col in block_start..block_end {
+                for row in col..block_end {
+                    native_matrix[col * native_lda + row] = replay.after_factor[col * size + row];
+                }
+                for row in row_tile_start..row_tile_end {
+                    native_matrix[col * native_lda + row] = replay.after_factor[col * size + row];
+                }
+            }
+            unsafe {
+                (shim.apply_pivot_op_n)(
+                    tile_rows as c_int,
+                    block_width as c_int,
+                    native_matrix
+                        .as_ptr()
+                        .add(block_start * native_lda + block_start),
+                    diagonal.as_ptr(),
+                    NumericFactorOptions::default().small_pivot_tolerance,
+                    native_matrix
+                        .as_mut_ptr()
+                        .add(block_start * native_lda + row_tile_start),
+                    native_lda as c_int,
+                );
+            }
+            for col in block_start..block_end {
+                for row in row_tile_start..row_tile_end {
+                    let rust = replay.after_apply[col * size + row];
+                    let native = native_matrix[col * native_lda + row];
+                    if rust.to_bits() != native.to_bits() {
+                        return Some(AppAcceptedUpdateMismatch {
+                            phase: "apply_pivot_op_n_tile",
+                            row,
+                            col,
+                            rust_bits: rust.to_bits(),
+                            native_bits: native.to_bits(),
+                        });
+                    }
+                }
+            }
+            row_tile_start += APP_INNER_BLOCK_SIZE;
+        }
+        None
+    }
+
+    fn first_native_accepted_update_mismatch(
+        shim: &NativeKernelShim,
+        replay: &AppBlockReplay,
+        block_start: usize,
+    ) -> Option<AppAcceptedUpdateMismatch> {
+        let size = replay.rows.len();
+        let accepted_width = replay.accepted_end - block_start;
+        let tail_size = size - replay.accepted_end;
+        if accepted_width == 0 || tail_size == 0 {
+            return None;
+        }
+        let diagonal = dense_tpp_diagonal_from_blocks(&replay.accepted_blocks, accepted_width);
+        let native_lda = native_aligned_double_stride(shim, size);
+        let native_ldld = native_aligned_double_stride(shim, APP_INNER_BLOCK_SIZE);
+        let mut col_tile_start = replay.accepted_end;
+        while col_tile_start < size {
+            let col_tile_end = (col_tile_start + APP_INNER_BLOCK_SIZE).min(size);
+            let target_width = col_tile_end - col_tile_start;
+            let mut row_tile_start = col_tile_start;
+            while row_tile_start < size {
+                let row_tile_end = (row_tile_start + APP_INNER_BLOCK_SIZE).min(size);
+                let tile_rows = row_tile_end - row_tile_start;
+                let mut l_block = vec![0.0; accepted_width * native_lda];
+                for local_col in 0..accepted_width {
+                    let source_col = block_start + local_col;
+                    for local_row in 0..tile_rows {
+                        l_block[local_col * native_lda + local_row] =
+                            replay.after_update[source_col * size + row_tile_start + local_row];
+                    }
+                }
+                let mut native_ld = vec![0.0; accepted_width * native_ldld];
+                unsafe {
+                    (shim.calc_ld_op_n)(
+                        tile_rows as c_int,
+                        accepted_width as c_int,
+                        l_block.as_ptr(),
+                        native_lda as c_int,
+                        diagonal.as_ptr(),
+                        native_ld.as_mut_ptr(),
+                        native_ldld as c_int,
+                    );
+                }
+                let rust_ld = app_build_ld_tile_workspace(
+                    &replay.after_update,
+                    size,
+                    block_start,
+                    replay.accepted_end,
+                    &replay.accepted_blocks,
+                    row_tile_start,
+                    row_tile_end,
+                );
+                for local_col in 0..accepted_width {
+                    for local_row in 0..tile_rows {
+                        let rust = rust_ld[local_col * tile_rows + local_row];
+                        let native = native_ld[local_col * native_ldld + local_row];
+                        if rust.to_bits() != native.to_bits() {
+                            return Some(AppAcceptedUpdateMismatch {
+                                phase: "calc_ld_op_n_tile",
+                                row: row_tile_start + local_row,
+                                col: block_start + local_col,
+                                rust_bits: rust.to_bits(),
+                                native_bits: native.to_bits(),
+                            });
+                        }
+                    }
+                }
+
+                let mut col_l_block = vec![0.0; accepted_width * native_lda];
+                for local_pivot in 0..accepted_width {
+                    let source_col = block_start + local_pivot;
+                    for local_col in 0..target_width {
+                        col_l_block[local_pivot * native_lda + local_col] =
+                            replay.after_update[source_col * size + col_tile_start + local_col];
+                    }
+                }
+                let mut native_target = vec![0.0; target_width * native_lda];
+                for local_col in 0..target_width {
+                    let col = col_tile_start + local_col;
+                    for local_row in 0..tile_rows {
+                        let row = row_tile_start + local_row;
+                        if row >= col {
+                            native_target[local_col * native_lda + local_row] =
+                                replay.restored[col * size + row];
+                        }
+                    }
+                }
+                unsafe {
+                    (shim.host_gemm_op_n_op_t_update)(
+                        tile_rows as c_int,
+                        target_width as c_int,
+                        accepted_width as c_int,
+                        native_ld.as_ptr(),
+                        native_ldld as c_int,
+                        col_l_block.as_ptr(),
+                        native_lda as c_int,
+                        native_target.as_mut_ptr(),
+                        native_lda as c_int,
+                    );
+                }
+                for local_col in 0..target_width {
+                    let col = col_tile_start + local_col;
+                    let first_row = if row_tile_start == col_tile_start {
+                        col
+                    } else {
+                        row_tile_start
+                    };
+                    for row in first_row..row_tile_end {
+                        let local_row = row - row_tile_start;
+                        let rust = replay.after_update[col * size + row];
+                        let native = native_target[local_col * native_lda + local_row];
+                        if rust.to_bits() != native.to_bits() {
+                            return Some(AppAcceptedUpdateMismatch {
+                                phase: "host_gemm_op_n_op_t_tile",
+                                row,
+                                col,
+                                rust_bits: rust.to_bits(),
+                                native_bits: native.to_bits(),
+                            });
+                        }
+                    }
+                }
+                row_tile_start += APP_INNER_BLOCK_SIZE;
+            }
+            col_tile_start += APP_INNER_BLOCK_SIZE;
+        }
+        None
+    }
+
+    fn assert_no_bit_mismatch(left: &[f64], right: &[f64], label: &str) {
+        assert_eq!(
+            first_bit_mismatch(left, right),
+            None,
+            "{label} first bit mismatch"
+        );
+    }
+
     fn deterministic_complete_dyadic_matrix(dimension: usize) -> Vec<Vec<f64>> {
         let mut matrix = vec![vec![0.0; dimension]; dimension];
         let mut row = 0;
@@ -9774,7 +10498,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
     }
 
     #[test]
-    fn app_block_ldlt_32_prefix_trace_matches_native_dense_seed6_until_scalar_tail() {
+    fn app_block_ldlt_32_prefix_trace_matches_native_dense_seed6() {
         let Some(shim) = native_kernel_shim_or_skip() else {
             return;
         };
@@ -9784,24 +10508,13 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         let native_trace = native_block_prefix_trace_32(shim, &lower_dense, dimension, 34, options);
         assert_eq!(
             first_block_prefix_trace_mismatch(&rust_trace, &native_trace),
-            Some(BlockPrefixTraceMismatch {
-                step: 14,
-                from: 28,
-                status: 2,
-                next: 30,
-                component: "matrix",
-                index: 988,
-                row: 30,
-                col: 28,
-                rust_bits: 0xbf81_6117_c4f8_2730,
-                native_bits: 0xbf81_6117_c4f8_272d,
-            }),
-            "dense seed6 APP prefix trace boundary moved"
+            None,
+            "dense seed6 APP prefix trace mismatch"
         );
     }
 
     #[test]
-    fn app_block_ldlt_32_aligned_prefix_trace_matches_native_dense_seed6_until_scalar_tail() {
+    fn app_block_ldlt_32_aligned_prefix_trace_matches_native_dense_seed6() {
         let Some(shim) = native_kernel_shim_or_skip() else {
             return;
         };
@@ -9816,19 +10529,8 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             native_block_prefix_trace_32(shim, &lower_dense, dimension, aligned_stride, options);
         assert_eq!(
             first_block_prefix_trace_mismatch(&rust_trace, &native_trace),
-            Some(BlockPrefixTraceMismatch {
-                step: 14,
-                from: 28,
-                status: 2,
-                next: 30,
-                component: "matrix",
-                index: 988,
-                row: 30,
-                col: 28,
-                rust_bits: 0xbf81_6117_c4f8_2730,
-                native_bits: 0xbf81_6117_c4f8_272d,
-            }),
-            "dense seed6 aligned APP prefix trace boundary moved"
+            None,
+            "dense seed6 aligned APP prefix trace mismatch"
         );
     }
 
@@ -9918,8 +10620,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
     }
 
     #[test]
-    fn app_block_ldlt_32_aligned_prefix_trace_matches_native_dense_seed09_case0_until_scalar_tail()
-    {
+    fn app_block_ldlt_32_aligned_prefix_trace_matches_native_dense_seed09_case0() {
         let Some(shim) = native_kernel_shim_or_skip() else {
             return;
         };
@@ -9934,24 +10635,13 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             native_block_prefix_trace_32(shim, &lower_dense, dimension, aligned_stride, options);
         assert_eq!(
             first_block_prefix_trace_mismatch(&rust_trace, &native_trace),
-            Some(BlockPrefixTraceMismatch {
-                step: 10,
-                from: 19,
-                status: 2,
-                next: 21,
-                component: "matrix",
-                index: 1011,
-                row: 31,
-                col: 19,
-                rust_bits: 0xbf8c_bfa8_da67_4b6c,
-                native_bits: 0xbf8c_bfa8_da67_4b6b,
-            }),
-            "dense seed09 aligned APP prefix trace boundary moved"
+            None,
+            "dense seed09 aligned APP prefix trace mismatch"
         );
     }
 
     #[test]
-    fn dense_seed6_app_block_storage_diverges_after_row30_scalar_tail() {
+    fn dense_seed6_app_block_storage_matches_native() {
         let Some(shim) = native_kernel_shim_or_skip() else {
             return;
         };
@@ -9965,19 +10655,8 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             native_block_prefix_trace_32(shim, &lower_dense, dimension, native_lda, options);
         assert_eq!(
             first_block_prefix_trace_mismatch(&rust_trace, &native_trace),
-            Some(BlockPrefixTraceMismatch {
-                step: 14,
-                from: 28,
-                status: 2,
-                next: 30,
-                component: "matrix",
-                index: 988,
-                row: 30,
-                col: 28,
-                rust_bits: 0xbf81_6117_c4f8_2730,
-                native_bits: 0xbf81_6117_c4f8_272d,
-            }),
-            "dense seed6 APP all-FMA prefix trace boundary moved"
+            None,
+            "dense seed6 APP prefix trace mismatch"
         );
 
         let rust = rust_block_ldlt_32_from_lower_dense(&lower_dense, dimension, options);
@@ -10012,14 +10691,13 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             }
         }
         assert_eq!(
-            first_mismatch,
-            Some((31, 28, 0x3f66_e35e_c782_7340, 0x3f66_e35e_c782_734a)),
-            "dense seed6 APP block L-storage boundary moved after row30 scalar-tail multiplier"
+            first_mismatch, None,
+            "dense seed6 APP block L-storage mismatch"
         );
     }
 
     #[test]
-    fn dense_seed6_native_block_continuation_diverges_at_l_storage_gap() {
+    fn dense_seed6_native_block_continuation_matches_full_block() {
         let Some(shim) = native_kernel_shim_or_skip() else {
             return;
         };
@@ -10044,19 +10722,8 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
                 native_lda,
                 options,
             ),
-            Some(BlockContinuationMismatch {
-                step: 14,
-                from: 28,
-                status: 2,
-                next: 30,
-                component: "matrix",
-                index: 988,
-                row: 30,
-                col: 28,
-                continued_bits: 0xbf81_6117_c4f8_272d,
-                block_bits: 0xbf81_6117_c4f8_2730,
-            }),
-            "dense seed6 native APP continuation boundary moved"
+            None,
+            "dense seed6 native APP continuation mismatch"
         );
     }
 
@@ -10102,7 +10769,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             fma_pivot_snapshot.workspace[multiplier_col * APP_INNER_BLOCK_SIZE + multiplier_row];
         let second_work = fma_pivot_snapshot.workspace
             [(multiplier_col + 1) * APP_INNER_BLOCK_SIZE + multiplier_row];
-        let reconstructed_first_multiplier = d21.mul_add(second_work, d11 * first_work);
+        let reconstructed_first_multiplier = d11.mul_add(first_work, d21 * second_work);
         let source_first_multiplier = d11 * first_work + d21 * second_work;
         let trace_first_multiplier =
             fma_pivot_snapshot.matrix[multiplier_col * APP_INNER_BLOCK_SIZE + multiplier_row];
@@ -10120,7 +10787,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
                 native_block_first_multiplier.to_bits()
             ),
             (
-                0xbf81_6117_c4f8_272d,
+                0xbf81_6117_c4f8_2730,
                 0xbf81_6117_c4f8_2730,
                 0xbf81_6117_c4f8_2730,
             ),
@@ -10141,7 +10808,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             [multiplier_col * APP_INNER_BLOCK_SIZE + second_multiplier_row];
         let second_row_second_work = fma_pivot_snapshot.workspace
             [(multiplier_col + 1) * APP_INNER_BLOCK_SIZE + second_multiplier_row];
-        let second_row_fma = d21.mul_add(second_row_second_work, d11 * second_row_first_work);
+        let second_row_fma = d11.mul_add(second_row_first_work, d21 * second_row_second_work);
         let second_row_source = d11 * second_row_first_work + d21 * second_row_second_work;
         let second_row_native =
             native_block.matrix[multiplier_col * native_lda + final_multiplier_row + 1];
@@ -10152,7 +10819,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
                 second_row_native.to_bits()
             ),
             (
-                0x3f66_e35e_c782_732d,
+                0x3f66_e35e_c782_734a,
                 0x3f66_e35e_c782_7340,
                 0x3f66_e35e_c782_734a,
             ),
@@ -10479,6 +11146,1076 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             first_solution_mismatch, None,
             "deterministic 65x65 full native solution mismatch"
         );
+    }
+
+    #[test]
+    #[ignore = "manual case58 APP/full-factor classification harness"]
+    fn dense_seed706172697479_case58_first_app_prefix_trace_matches_native() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let (dimension, dense, _) = dense_seed706172697479_case58_matrix_and_solution();
+        let mut lower_dense = vec![0.0; dimension * dimension];
+        for col in 0..dimension {
+            for row in col..dimension {
+                lower_dense[dense_lower_offset(dimension, row, col)] = dense[row][col];
+            }
+        }
+        let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+        let mut csc_lower_dense = vec![0.0; dimension * dimension];
+        for col in 0..dimension {
+            for entry in col_ptrs[col]..col_ptrs[col + 1] {
+                let row = row_indices[entry];
+                csc_lower_dense[dense_lower_offset(dimension, row, col)] = values[entry];
+            }
+        }
+        let options = NumericFactorOptions::default();
+        let native_lda = native_aligned_double_stride(shim, dimension);
+        let aligned_lower_dense = copy_lower_dense_to_stride(&lower_dense, dimension, native_lda);
+
+        let rust_unaligned_trace = rust_app_block_prefix_trace_32(&lower_dense, dimension, options);
+        let rust_trace = rust_app_block_prefix_trace_32(&aligned_lower_dense, native_lda, options);
+        let native_trace =
+            native_block_prefix_trace_32(shim, &lower_dense, dimension, native_lda, options);
+        let csc_aligned_lower_dense =
+            copy_lower_dense_to_stride(&csc_lower_dense, dimension, native_lda);
+        let rust_csc_trace =
+            rust_app_block_prefix_trace_32(&csc_aligned_lower_dense, native_lda, options);
+        let native_csc_trace =
+            native_block_prefix_trace_32(shim, &csc_lower_dense, dimension, native_lda, options);
+        eprintln!(
+            "case58 csc first APP prefix mismatch={:?}",
+            first_block_prefix_trace_mismatch(&rust_csc_trace, &native_csc_trace)
+        );
+        let rust_block = rust_block_ldlt_32_from_lower_dense(&lower_dense, dimension, options);
+        let native_block = native_block_ldlt_32_from_lower_dense(
+            shim,
+            &lower_dense,
+            dimension,
+            native_lda,
+            options,
+        );
+        let rust_full = factorize_dense_front(
+            (0..dimension).collect(),
+            dimension,
+            lower_dense.clone(),
+            options,
+            false,
+        )
+        .expect("rust full APP factor");
+        let rust_csc_full = factorize_dense_front(
+            (0..dimension).collect(),
+            dimension,
+            csc_lower_dense.clone(),
+            options,
+            false,
+        )
+        .expect("rust full APP factor from CSC-shaped lower dense");
+        eprintln!(
+            "case58 rust dense perm22={} perm27={} rust csc perm22={} perm27={}",
+            rust_full.factor_order[22],
+            rust_full.factor_order[27],
+            rust_csc_full.factor_order[22],
+            rust_csc_full.factor_order[27],
+        );
+        let rust_csc_diagonal =
+            dense_tpp_diagonal_from_blocks(&rust_csc_full.block_records, dimension);
+        let rust_csc_entries =
+            inverse_diagonal_entries_from_internal_diagonal(&rust_csc_diagonal, dimension);
+        let native_csc_full =
+            native_ldlt_app_factor_from_lower_dense(shim, &csc_lower_dense, dimension, options);
+        let native_csc_entries =
+            inverse_diagonal_entries_from_internal_diagonal(&native_csc_full.diagonal, dimension);
+        let first_csc_d_mismatch = rust_csc_entries
+            .iter()
+            .flat_map(|entry| entry.iter())
+            .zip(native_csc_entries.iter().flat_map(|entry| entry.iter()))
+            .position(|(rust, native)| rust.to_bits() != native.to_bits());
+        eprintln!(
+            "case58 direct csc rust/native D mismatch={:?}",
+            first_csc_d_mismatch.map(|index| (
+                index,
+                rust_csc_entries[index / 2][index % 2],
+                native_csc_entries[index / 2][index % 2],
+            ))
+        );
+        for cpu_block_size in [16, 32, 64, 128, 256] {
+            let direct = native_ldlt_app_factor_from_lower_dense_with_block_size(
+                shim,
+                &lower_dense,
+                dimension,
+                options,
+                cpu_block_size,
+            );
+            let direct_entries =
+                inverse_diagonal_entries_from_internal_diagonal(&direct.diagonal, dimension);
+            let first_direct_d_mismatch = rust_csc_entries
+                .iter()
+                .flat_map(|entry| entry.iter())
+                .zip(direct_entries.iter().flat_map(|entry| entry.iter()))
+                .position(|(rust, native)| rust.to_bits() != native.to_bits());
+            eprintln!(
+                "case58 direct ldlt_app cpu_block_size={cpu_block_size} eliminated={} perm22={} perm27={} rust_csc_d_mismatch={:?}",
+                direct.eliminated,
+                direct.perm[22],
+                direct.perm[27],
+                first_direct_d_mismatch.map(|index| (
+                    index,
+                    rust_csc_entries[index / 2][index % 2],
+                    direct_entries[index / 2][index % 2],
+                )),
+            );
+        }
+        let native_full =
+            native_ldlt_app_factor_from_lower_dense(shim, &lower_dense, dimension, options);
+        eprintln!(
+            "case58 direct ldlt_app_factor eliminated={} tail_size={}",
+            native_full.eliminated,
+            dimension - native_full.eliminated
+        );
+        assert_eq!(
+            (
+                first_block_prefix_trace_mismatch(&rust_unaligned_trace, &native_trace),
+                first_block_prefix_trace_mismatch(&rust_trace, &native_trace),
+                (rust_block.perm == native_block.perm).then_some(()),
+                (rust_block.local_perm == native_block.local_perm).then_some(()),
+                (rust_full.factor_order == native_full.perm).then_some(()),
+            ),
+            (None, None, Some(()), Some(()), Some(())),
+            "case58 first APP block prefix trace differs from native block_ldlt.hxx::block_ldlt"
+        );
+    }
+
+    #[test]
+    #[ignore = "manual case58 production Rust/native classification harness"]
+    fn dense_seed706172697479_case58_classifies_remaining_solution_gap() {
+        let Some(native) = native_spral_or_skip() else {
+            return;
+        };
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let (dimension, dense, expected_solution) =
+            dense_seed706172697479_case58_matrix_and_solution();
+        let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+        let mut csc_lower_dense = vec![0.0; dimension * dimension];
+        for col in 0..dimension {
+            for entry in col_ptrs[col]..col_ptrs[col + 1] {
+                let row = row_indices[entry];
+                csc_lower_dense[dense_lower_offset(dimension, row, col)] = values[entry];
+            }
+        }
+        let matrix = SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
+            .expect("valid CSC");
+        let options = NumericFactorOptions::default();
+
+        let first_app_replay =
+            replay_app_block_for_debug((0..dimension).collect(), csc_lower_dense, 0, options);
+        let first_apply_mismatch =
+            first_native_apply_pivot_tile_mismatch(shim, &first_app_replay, 0);
+        let first_update_mismatch =
+            first_native_accepted_update_mismatch(shim, &first_app_replay, 0);
+        eprintln!(
+            "case58 direct APP block0 accepted_end={} first_failed={} apply_mismatch={:?} accepted_update_mismatch={:?}",
+            first_app_replay.accepted_end,
+            first_app_replay.first_failed,
+            first_apply_mismatch,
+            first_update_mismatch
+        );
+        if first_update_mismatch.is_none()
+            && first_app_replay.accepted_end + APP_INNER_BLOCK_SIZE <= dimension
+        {
+            let tail_start = first_app_replay.accepted_end;
+            let tail_size = dimension - tail_start;
+            let mut tail_dense = vec![0.0; tail_size * tail_size];
+            for local_col in 0..tail_size {
+                for local_row in local_col..tail_size {
+                    tail_dense[local_col * tail_size + local_row] = first_app_replay.after_update
+                        [(tail_start + local_col) * dimension + tail_start + local_row];
+                }
+            }
+            let tail_lda = native_aligned_double_stride(shim, tail_size);
+            let parent_lda = native_aligned_double_stride(shim, dimension);
+            let rust_tail_trace = rust_app_block_prefix_trace_32(&tail_dense, tail_size, options);
+            let native_tail_trace =
+                native_block_prefix_trace_32(shim, &tail_dense, tail_size, tail_lda, options);
+            let native_tail_source_multiplier_trace =
+                native_block_prefix_trace_32_source_multiplier(
+                    shim,
+                    &tail_dense,
+                    tail_size,
+                    tail_lda,
+                    options,
+                );
+            let native_tail_source_trace = native_block_prefix_trace_32_source(
+                shim,
+                &tail_dense,
+                tail_size,
+                tail_lda,
+                options,
+            );
+            let native_parent_stride_tail_trace =
+                native_block_prefix_trace_32(shim, &tail_dense, tail_size, parent_lda, options);
+            let native_tail_block = native_block_ldlt_32_from_lower_dense(
+                shim,
+                &tail_dense,
+                tail_size,
+                tail_lda,
+                options,
+            );
+            let native_tail_continuation_mismatch = first_native_block_continuation_mismatch(
+                shim,
+                &native_tail_trace,
+                &native_tail_block,
+                tail_lda,
+                options,
+            );
+            let native_tail_source_multiplier_continuation_mismatch =
+                first_native_block_continuation_mismatch(
+                    shim,
+                    &native_tail_source_multiplier_trace,
+                    &native_tail_block,
+                    tail_lda,
+                    options,
+                );
+            let native_tail_source_continuation_mismatch = first_native_block_continuation_mismatch(
+                shim,
+                &native_tail_source_trace,
+                &native_tail_block,
+                tail_lda,
+                options,
+            );
+            let native_tail_frozen_mismatch = native_tail_trace
+                .iter()
+                .find(|snapshot| snapshot.step == 7)
+                .and_then(|snapshot| {
+                    first_frozen_prefix_mismatch_against_block(
+                        snapshot,
+                        &native_tail_block,
+                        tail_lda,
+                    )
+                });
+            let native_tail_step7_expr_bits = native_tail_trace
+                .iter()
+                .find(|snapshot| snapshot.step == 7)
+                .map(|snapshot| two_by_two_first_multiplier_expression_bits(snapshot, 31));
+            let native_tail_block_entries = inverse_diagonal_entries_from_internal_diagonal(
+                &native_tail_block.diagonal,
+                APP_INNER_BLOCK_SIZE,
+            );
+            let rust_tail_trace_entries = inverse_diagonal_entries_from_internal_diagonal(
+                &rust_tail_trace
+                    .last()
+                    .expect("case58 direct compact tail APP trace")
+                    .diagonal,
+                APP_INNER_BLOCK_SIZE,
+            );
+            let first_actual_block_d_mismatch = rust_tail_trace_entries
+                .iter()
+                .flat_map(|entry| entry.iter())
+                .zip(
+                    native_tail_block_entries
+                        .iter()
+                        .flat_map(|entry| entry.iter()),
+                )
+                .position(|(rust, native)| rust.to_bits() != native.to_bits());
+            eprintln!(
+                "case58 direct APP block1 prefix_mismatch tail_stride={:?} parent_stride={:?} continuation_mismatch={:?} source_multiplier_continuation={:?} source_continuation={:?} frozen_step7_mismatch={:?} step7_row31_expr_bits={:?} actual_block_d_mismatch={:?}",
+                first_block_prefix_trace_mismatch(&rust_tail_trace, &native_tail_trace),
+                first_block_prefix_trace_mismatch(
+                    &rust_tail_trace,
+                    &native_parent_stride_tail_trace
+                ),
+                native_tail_continuation_mismatch,
+                native_tail_source_multiplier_continuation_mismatch,
+                native_tail_source_continuation_mismatch,
+                native_tail_frozen_mismatch,
+                native_tail_step7_expr_bits,
+                first_actual_block_d_mismatch.map(|index| (
+                    index,
+                    rust_tail_trace_entries[index / 2][index % 2],
+                    native_tail_block_entries[index / 2][index % 2],
+                )),
+            );
+
+            let second_app_replay = replay_app_block_for_debug(
+                first_app_replay.rows.clone(),
+                first_app_replay.after_update.clone(),
+                first_app_replay.accepted_end,
+                options,
+            );
+            eprintln!(
+                "case58 direct APP block1 accepted_end={} first_failed={} apply_mismatch={:?} accepted_update_mismatch={:?}",
+                second_app_replay.accepted_end,
+                second_app_replay.first_failed,
+                first_native_apply_pivot_tile_mismatch(
+                    shim,
+                    &second_app_replay,
+                    first_app_replay.accepted_end,
+                ),
+                first_native_accepted_update_mismatch(
+                    shim,
+                    &second_app_replay,
+                    first_app_replay.accepted_end,
+                )
+            );
+        }
+
+        let (symbolic, _) = analyse(
+            matrix,
+            &SsidsOptions {
+                ordering: OrderingStrategy::Natural,
+            },
+        )
+        .expect("rust analyse");
+        let (mut rust_factor, _) = factorize(matrix, &symbolic, &options).expect("rust factorize");
+
+        let mut native_session = native
+            .analyse_with_options_and_ordering(matrix, &options, NativeOrdering::Natural)
+            .expect("native analyse");
+        eprintln!(
+            "case58 classifier symbolic rust_supernodes={} rust_max_supernode={} native_analyse={:?}",
+            symbolic.supernodes.len(),
+            symbolic
+                .supernodes
+                .iter()
+                .map(|supernode| supernode.width())
+                .max()
+                .unwrap_or(0),
+            native_session.analyse_info(),
+        );
+        let tree = build_symbolic_front_tree(&symbolic);
+        eprintln!(
+            "case58 rust permutation first32={:?} front_columns first32={:?}",
+            &symbolic.permutation.perm()[..32.min(symbolic.permutation.perm().len())],
+            &tree.fronts[0].columns[..32.min(tree.fronts[0].columns.len())],
+        );
+        let mut permuted_col_ptrs = Vec::new();
+        let mut permuted_row_indices = Vec::new();
+        let mut permuted_source_positions = Vec::new();
+        super::build_permuted_lower_csc_pattern(
+            matrix,
+            &symbolic.permutation,
+            &mut permuted_col_ptrs,
+            &mut permuted_row_indices,
+            &mut permuted_source_positions,
+        )
+        .expect("case58 permuted pattern");
+        let mut permuted_values = Vec::new();
+        super::fill_permuted_lower_csc_values(
+            matrix,
+            &permuted_source_positions,
+            &mut permuted_values,
+        )
+        .expect("case58 permuted values");
+        let front = &tree.fronts[0];
+        let mut production_local_rows = front.columns.clone();
+        let mut production_interface_rows = front.interface_rows.clone();
+        production_interface_rows.sort_unstable();
+        production_local_rows.extend(production_interface_rows);
+        let production_local_size = production_local_rows.len();
+        let mut production_local_positions = vec![usize::MAX; dimension];
+        for (position, &row) in production_local_rows.iter().enumerate() {
+            production_local_positions[row] = position;
+        }
+        let mut production_local_dense = vec![0.0; production_local_size * production_local_size];
+        for &column in &front.columns {
+            let local_column = production_local_positions[column];
+            for entry in permuted_col_ptrs[column]..permuted_col_ptrs[column + 1] {
+                let row = permuted_row_indices[entry];
+                let local_row = production_local_positions[row];
+                if local_row == usize::MAX {
+                    continue;
+                }
+                production_local_dense
+                    [dense_lower_offset(production_local_size, local_row, local_column)] =
+                    permuted_values[entry];
+            }
+        }
+        let production_first_app_replay =
+            replay_app_block_for_debug(production_local_rows, production_local_dense, 0, options);
+        let production_first_apply_mismatch =
+            first_native_apply_pivot_tile_mismatch(shim, &production_first_app_replay, 0);
+        let production_first_update_mismatch =
+            first_native_accepted_update_mismatch(shim, &production_first_app_replay, 0);
+        eprintln!(
+            "case58 production APP block0 accepted_end={} first_failed={} apply_mismatch={:?} accepted_update_mismatch={:?}",
+            production_first_app_replay.accepted_end,
+            production_first_app_replay.first_failed,
+            production_first_apply_mismatch,
+            production_first_update_mismatch
+        );
+        if production_first_update_mismatch.is_none()
+            && production_first_app_replay.accepted_end + APP_INNER_BLOCK_SIZE <= dimension
+        {
+            let tail_start = production_first_app_replay.accepted_end;
+            let tail_size = dimension - tail_start;
+            let mut tail_dense = vec![0.0; tail_size * tail_size];
+            for local_col in 0..tail_size {
+                for local_row in local_col..tail_size {
+                    tail_dense[local_col * tail_size + local_row] = production_first_app_replay
+                        .after_update
+                        [(tail_start + local_col) * dimension + tail_start + local_row];
+                }
+            }
+            let tail_lda = native_aligned_double_stride(shim, tail_size);
+            let parent_lda = native_aligned_double_stride(shim, dimension);
+            let rust_tail_trace = rust_app_block_prefix_trace_32(&tail_dense, tail_size, options);
+            let native_tail_trace =
+                native_block_prefix_trace_32(shim, &tail_dense, tail_size, tail_lda, options);
+            let native_tail_source_multiplier_trace =
+                native_block_prefix_trace_32_source_multiplier(
+                    shim,
+                    &tail_dense,
+                    tail_size,
+                    tail_lda,
+                    options,
+                );
+            let native_tail_source_trace = native_block_prefix_trace_32_source(
+                shim,
+                &tail_dense,
+                tail_size,
+                tail_lda,
+                options,
+            );
+            let native_parent_stride_tail_trace =
+                native_block_prefix_trace_32(shim, &tail_dense, tail_size, parent_lda, options);
+            let native_tail_block = native_block_ldlt_32_from_lower_dense(
+                shim,
+                &tail_dense,
+                tail_size,
+                tail_lda,
+                options,
+            );
+            let native_tail_continuation_mismatch = first_native_block_continuation_mismatch(
+                shim,
+                &native_tail_trace,
+                &native_tail_block,
+                tail_lda,
+                options,
+            );
+            let native_tail_source_multiplier_continuation_mismatch =
+                first_native_block_continuation_mismatch(
+                    shim,
+                    &native_tail_source_multiplier_trace,
+                    &native_tail_block,
+                    tail_lda,
+                    options,
+                );
+            let native_tail_source_continuation_mismatch = first_native_block_continuation_mismatch(
+                shim,
+                &native_tail_source_trace,
+                &native_tail_block,
+                tail_lda,
+                options,
+            );
+            let native_tail_frozen_mismatch = native_tail_trace
+                .iter()
+                .find(|snapshot| snapshot.step == 7)
+                .and_then(|snapshot| {
+                    first_frozen_prefix_mismatch_against_block(
+                        snapshot,
+                        &native_tail_block,
+                        tail_lda,
+                    )
+                });
+            let native_tail_step7_expr_bits = native_tail_trace
+                .iter()
+                .find(|snapshot| snapshot.step == 7)
+                .map(|snapshot| two_by_two_first_multiplier_expression_bits(snapshot, 31));
+            let native_tail_block_entries = inverse_diagonal_entries_from_internal_diagonal(
+                &native_tail_block.diagonal,
+                APP_INNER_BLOCK_SIZE,
+            );
+            let compact_tail_entries = inverse_diagonal_entries_from_internal_diagonal(
+                &rust_tail_trace
+                    .last()
+                    .expect("case58 compact tail APP trace")
+                    .diagonal,
+                APP_INNER_BLOCK_SIZE,
+            );
+            let first_actual_block_d_mismatch = compact_tail_entries
+                .iter()
+                .flat_map(|entry| entry.iter())
+                .zip(
+                    native_tail_block_entries
+                        .iter()
+                        .flat_map(|entry| entry.iter()),
+                )
+                .position(|(rust, native)| rust.to_bits() != native.to_bits());
+            eprintln!(
+                "case58 production APP block1 prefix_mismatch tail_stride={:?} parent_stride={:?} continuation_mismatch={:?} source_multiplier_continuation={:?} source_continuation={:?} frozen_step7_mismatch={:?} step7_row31_expr_bits={:?} actual_block_d_mismatch={:?}",
+                first_block_prefix_trace_mismatch(&rust_tail_trace, &native_tail_trace),
+                first_block_prefix_trace_mismatch(
+                    &rust_tail_trace,
+                    &native_parent_stride_tail_trace
+                ),
+                native_tail_continuation_mismatch,
+                native_tail_source_multiplier_continuation_mismatch,
+                native_tail_source_continuation_mismatch,
+                native_tail_frozen_mismatch,
+                native_tail_step7_expr_bits,
+                first_actual_block_d_mismatch.map(|index| (
+                    index,
+                    compact_tail_entries[index / 2][index % 2],
+                    native_tail_block_entries[index / 2][index % 2],
+                )),
+            );
+
+            let production_second_app_replay = replay_app_block_for_debug(
+                production_first_app_replay.rows.clone(),
+                production_first_app_replay.after_update.clone(),
+                production_first_app_replay.accepted_end,
+                options,
+            );
+            let second_replay_diagonal = dense_tpp_diagonal_from_blocks(
+                &production_second_app_replay.accepted_blocks,
+                production_second_app_replay.accepted_end
+                    - production_first_app_replay.accepted_end,
+            );
+            let second_replay_entries = inverse_diagonal_entries_from_internal_diagonal(
+                &second_replay_diagonal,
+                production_second_app_replay.accepted_end
+                    - production_first_app_replay.accepted_end,
+            );
+            let native_block1_tpp = native_ldlt_tpp_factor_from_lower_dense(
+                shim,
+                &tail_dense,
+                tail_size,
+                APP_INNER_BLOCK_SIZE,
+                options,
+            );
+            let native_block1_tpp_entries = inverse_diagonal_entries_from_internal_diagonal(
+                &native_block1_tpp.diagonal,
+                APP_INNER_BLOCK_SIZE,
+            );
+            let first_block1_tpp_d_mismatch = second_replay_entries
+                .iter()
+                .flat_map(|entry| entry.iter())
+                .zip(
+                    native_block1_tpp_entries
+                        .iter()
+                        .flat_map(|entry| entry.iter()),
+                )
+                .position(|(app, tpp)| app.to_bits() != tpp.to_bits());
+            let first_full_vs_compact_d_mismatch = second_replay_entries
+                .iter()
+                .flat_map(|entry| entry.iter())
+                .zip(compact_tail_entries.iter().flat_map(|entry| entry.iter()))
+                .position(|(full, compact)| full.to_bits() != compact.to_bits());
+            let mut replay_blocks = production_first_app_replay.accepted_blocks.clone();
+            replay_blocks.extend(production_second_app_replay.accepted_blocks.clone());
+            let replay_diagonal = dense_tpp_diagonal_from_blocks(
+                &replay_blocks,
+                production_second_app_replay.accepted_end,
+            );
+            let replay_entries = inverse_diagonal_entries_from_internal_diagonal(
+                &replay_diagonal,
+                production_second_app_replay.accepted_end,
+            );
+            let rust_entries = rust_inverse_diagonal_entries(&rust_factor);
+            let first_replay_vs_factor_d_mismatch = replay_entries
+                .iter()
+                .flat_map(|entry| entry.iter())
+                .zip(rust_entries.iter().flat_map(|entry| entry.iter()))
+                .position(|(replay, factor)| replay.to_bits() != factor.to_bits());
+            eprintln!(
+                "case58 production APP block1 accepted_end={} first_failed={} apply_mismatch={:?} accepted_update_mismatch={:?} app_vs_tpp_d_mismatch={:?} full_vs_compact_d_mismatch={:?} replay_vs_factor_d_mismatch={:?}",
+                production_second_app_replay.accepted_end,
+                production_second_app_replay.first_failed,
+                first_native_apply_pivot_tile_mismatch(
+                    shim,
+                    &production_second_app_replay,
+                    production_first_app_replay.accepted_end,
+                ),
+                first_native_accepted_update_mismatch(
+                    shim,
+                    &production_second_app_replay,
+                    production_first_app_replay.accepted_end,
+                ),
+                first_block1_tpp_d_mismatch.map(|index| (
+                    index,
+                    second_replay_entries[index / 2][index % 2],
+                    native_block1_tpp_entries[index / 2][index % 2],
+                )),
+                first_full_vs_compact_d_mismatch.map(|index| (
+                    index,
+                    second_replay_entries[index / 2][index % 2],
+                    compact_tail_entries[index / 2][index % 2],
+                )),
+                first_replay_vs_factor_d_mismatch.map(|index| (
+                    index,
+                    replay_entries[index / 2][index % 2],
+                    rust_entries[index / 2][index % 2],
+                )),
+            );
+            if production_second_app_replay.accepted_end + APP_INNER_BLOCK_SIZE <= dimension {
+                let third_tail_start = production_second_app_replay.accepted_end;
+                let third_tail_size = dimension - third_tail_start;
+                let mut third_tail_dense = vec![0.0; third_tail_size * third_tail_size];
+                for local_col in 0..third_tail_size {
+                    for local_row in local_col..third_tail_size {
+                        third_tail_dense[local_col * third_tail_size + local_row] =
+                            production_second_app_replay.after_update[(third_tail_start
+                                + local_col)
+                                * dimension
+                                + third_tail_start
+                                + local_row];
+                    }
+                }
+                let third_tail_lda = native_aligned_double_stride(shim, third_tail_size);
+                let third_rust_trace =
+                    rust_app_block_prefix_trace_32(&third_tail_dense, third_tail_size, options);
+                let third_native_trace = native_block_prefix_trace_32(
+                    shim,
+                    &third_tail_dense,
+                    third_tail_size,
+                    third_tail_lda,
+                    options,
+                );
+                let third_native_block = native_block_ldlt_32_from_lower_dense(
+                    shim,
+                    &third_tail_dense,
+                    third_tail_size,
+                    third_tail_lda,
+                    options,
+                );
+                let third_continuation_mismatch = first_native_block_continuation_mismatch(
+                    shim,
+                    &third_native_trace,
+                    &third_native_block,
+                    third_tail_lda,
+                    options,
+                );
+                let third_frozen_mismatch = third_continuation_mismatch
+                    .as_ref()
+                    .and_then(|mismatch| {
+                        third_native_trace
+                            .iter()
+                            .find(|snapshot| snapshot.step == mismatch.step)
+                    })
+                    .and_then(|snapshot| {
+                        first_frozen_prefix_mismatch_against_block(
+                            snapshot,
+                            &third_native_block,
+                            third_tail_lda,
+                        )
+                    });
+                let third_expr_bits = third_frozen_mismatch.as_ref().and_then(|mismatch| {
+                    third_native_trace
+                        .iter()
+                        .find(|snapshot| snapshot.step == mismatch.step)
+                        .map(|snapshot| {
+                            two_by_two_first_multiplier_expression_bits(snapshot, mismatch.row)
+                        })
+                });
+                let third_expr_rows = third_frozen_mismatch.as_ref().and_then(|mismatch| {
+                    third_native_trace
+                        .iter()
+                        .find(|snapshot| snapshot.step == mismatch.step)
+                        .map(|snapshot| {
+                            two_by_two_first_multiplier_block_expr_bits(
+                                snapshot,
+                                &third_native_block,
+                                third_tail_lda,
+                            )
+                        })
+                });
+                let third_native_entries = inverse_diagonal_entries_from_internal_diagonal(
+                    &third_native_block.diagonal,
+                    APP_INNER_BLOCK_SIZE,
+                );
+                let third_compact_entries = inverse_diagonal_entries_from_internal_diagonal(
+                    &third_rust_trace
+                        .last()
+                        .expect("case58 third compact APP trace")
+                        .diagonal,
+                    APP_INNER_BLOCK_SIZE,
+                );
+                let third_first_d_mismatch = third_compact_entries
+                    .iter()
+                    .flat_map(|entry| entry.iter())
+                    .zip(third_native_entries.iter().flat_map(|entry| entry.iter()))
+                    .position(|(rust, native)| rust.to_bits() != native.to_bits());
+                let production_third_app_replay = replay_app_block_for_debug(
+                    production_second_app_replay.rows.clone(),
+                    production_second_app_replay.after_update.clone(),
+                    third_tail_start,
+                    options,
+                );
+                eprintln!(
+                    "case58 production APP block2 prefix_mismatch={:?} continuation_mismatch={:?} frozen_mismatch={:?} expr_bits={:?} expr_rows={:?} actual_block_d_mismatch={:?} accepted_end={} first_failed={} apply_mismatch={:?} accepted_update_mismatch={:?}",
+                    first_block_prefix_trace_mismatch(&third_rust_trace, &third_native_trace),
+                    third_continuation_mismatch,
+                    third_frozen_mismatch,
+                    third_expr_bits,
+                    third_expr_rows,
+                    third_first_d_mismatch.map(|index| (
+                        index,
+                        third_compact_entries[index / 2][index % 2],
+                        third_native_entries[index / 2][index % 2],
+                    )),
+                    production_third_app_replay.accepted_end,
+                    production_third_app_replay.first_failed,
+                    first_native_apply_pivot_tile_mismatch(
+                        shim,
+                        &production_third_app_replay,
+                        third_tail_start,
+                    ),
+                    first_native_accepted_update_mismatch(
+                        shim,
+                        &production_third_app_replay,
+                        third_tail_start,
+                    ),
+                );
+            }
+        }
+        let native_info = native_session.factorize(matrix).expect("native factorize");
+        let native_enquiry = native_session.enquire_indef().expect("native enquire");
+        let mut native_factor_order = vec![usize::MAX; native_enquiry.pivot_order.len()];
+        for (column, &pivot_position) in native_enquiry.pivot_order.iter().enumerate() {
+            native_factor_order[pivot_position] = column;
+        }
+
+        assert_eq!(rust_factor.inertia(), native_info.inertia);
+        assert_eq!(
+            rust_factor.pivot_stats().two_by_two_pivots,
+            native_info.two_by_two_pivots
+        );
+        assert_eq!(
+            rust_factor.pivot_stats().delayed_pivots,
+            native_info.delayed_pivots
+        );
+        let rust_factor_order_original = rust_factor
+            .factor_order
+            .iter()
+            .map(|&ordered_index| rust_factor.permutation.perm()[ordered_index])
+            .collect::<Vec<_>>();
+        let first_order_mismatch = rust_factor_order_original
+            .iter()
+            .zip(&native_factor_order)
+            .position(|(rust, native)| rust != native);
+        assert_eq!(
+            first_order_mismatch.map(|index| {
+                (
+                    index,
+                    rust_factor_order_original[index],
+                    native_factor_order[index],
+                    native_enquiry.pivot_order[rust_factor_order_original[index]],
+                    native_enquiry.pivot_order[native_factor_order[index]],
+                )
+            }),
+            None,
+            "case58 factor order differs from native pivot order"
+        );
+
+        let rust_d_bits = inverse_diagonal_bits(&rust_inverse_diagonal_entries(&rust_factor));
+        let native_d_bits = inverse_diagonal_bits(&native_enquiry.inverse_diagonal_entries);
+        let first_d_mismatch = rust_d_bits
+            .iter()
+            .zip(&native_d_bits)
+            .position(|(rust, native)| rust != native);
+        assert_eq!(
+            first_d_mismatch.map(|index| {
+                (
+                    index,
+                    rust_d_bits[index],
+                    native_d_bits[index],
+                    rust_inverse_diagonal_entries(&rust_factor)[index / 2][index % 2],
+                    native_enquiry.inverse_diagonal_entries[index / 2][index % 2],
+                )
+            }),
+            None,
+            "case58 inverse-D bit patterns differ from native"
+        );
+
+        let rhs = dense_mul(&dense, &expected_solution);
+        let mut rust_panel_rhs = vec![0.0; dimension];
+        for (factor_position, &ordered_index) in rust_factor.factor_order.iter().enumerate() {
+            rust_panel_rhs[factor_position] = rhs[rust_factor.permutation.perm()[ordered_index]];
+        }
+        let mut native_panel_rhs = rust_panel_rhs.clone();
+
+        // Mirrors NumericSubtree.hxx::solve_fwd and
+        // ldlt_app.cxx::ldlt_app_solve_fwd on Rust's stored panels.
+        solve_forward_front_panels_like_native(&rust_factor.solve_panels, &mut rust_panel_rhs);
+        native_solve_forward_front_panels(shim, &rust_factor.solve_panels, &mut native_panel_rhs);
+        assert_no_bit_mismatch(
+            &rust_panel_rhs,
+            &native_panel_rhs,
+            "case58 forward panel replay",
+        );
+
+        let panel_block_ranges =
+            solve_panel_block_ranges(&rust_factor.solve_panels, &rust_factor.diagonal_blocks);
+        assert_eq!(
+            rust_factor.solve_panels.len(),
+            1,
+            "case58 solve-panel shape moved"
+        );
+        let panel = &rust_factor.solve_panels[0];
+        let replay_case = AppSolveKernelCase {
+            seed: 0,
+            rows: panel.row_positions.len(),
+            eliminated_len: panel.eliminated_len,
+            lower: panel.values.clone(),
+            diagonal: native_app_diagonal_for_block_range(
+                &rust_factor.diagonal_blocks,
+                &rust_factor.diagonal_values,
+                panel_block_ranges[0],
+                panel.eliminated_len,
+            ),
+            rhs: Vec::new(),
+        };
+        let mut rust_local = vec![0.0; panel.row_positions.len()];
+        let mut native_local = vec![0.0; panel.row_positions.len()];
+        for (local_row, &factor_position) in panel.row_positions.iter().enumerate() {
+            rust_local[local_row] = rust_panel_rhs[factor_position];
+            native_local[local_row] = native_panel_rhs[factor_position];
+        }
+        rust_ldlt_app_solve_diag_like_native(&replay_case, &mut rust_local);
+        native_ldlt_app_solve_diag(shim, &replay_case, &mut native_local);
+        assert_no_bit_mismatch(&rust_local, &native_local, "case58 diagonal replay");
+
+        rust_ldlt_app_solve_bwd_like_native(&replay_case, &mut rust_local);
+        native_ldlt_app_solve_bwd(shim, &replay_case, &mut native_local);
+        assert_no_bit_mismatch(&rust_local, &native_local, "case58 backward replay");
+
+        // Mirrors NumericSubtree.hxx::solve_diag_bwd_inner<true,true> and
+        // ldlt_app.cxx::ldlt_app_solve_diag / ldlt_app_solve_bwd on Rust data.
+        solve_diagonal_and_lower_transpose_front_panels_like_native(
+            &rust_factor.solve_panels,
+            &rust_factor.diagonal_blocks,
+            &rust_factor.diagonal_values,
+            &mut rust_panel_rhs,
+            None,
+        )
+        .expect("rust panel diagonal/backward replay");
+        native_solve_diagonal_and_bwd_front_panels(
+            shim,
+            &rust_factor.solve_panels,
+            &rust_factor.diagonal_blocks,
+            &rust_factor.diagonal_values,
+            &mut native_panel_rhs,
+        );
+        assert_no_bit_mismatch(
+            &rust_panel_rhs,
+            &native_panel_rhs,
+            "case58 diag+bwd panel replay",
+        );
+
+        let rust_solution = rust_factor.solve(&rhs).expect("rust solve");
+        let native_solution = native_session.solve(&rhs).expect("native solve");
+        assert_eq!(
+            first_bit_mismatch(&rust_solution, &native_solution),
+            None,
+            "case58 full solution differs after matching metadata, inverse-D, and Rust-data panel replays"
+        );
+    }
+
+    fn classify_dense_seed09_case_remaining_solution_gap(case_index: usize) {
+        let Some(native) = native_spral_or_skip() else {
+            return;
+        };
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let (dimension, dense, expected_solution) =
+            dense_boundary_case_matrix_and_solution(0x09c9_134e_4eff_0004, case_index);
+        eprintln!("dense seed09 case{case_index} dimension={dimension}");
+        let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+        let matrix = SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
+            .expect("valid CSC");
+        let options = NumericFactorOptions::default();
+
+        let (symbolic, _) = analyse(
+            matrix,
+            &SsidsOptions {
+                ordering: OrderingStrategy::Natural,
+            },
+        )
+        .expect("rust analyse");
+        let (mut rust_factor, _) = factorize(matrix, &symbolic, &options).expect("rust factorize");
+        let mut native_session = native
+            .analyse_with_options_and_ordering(matrix, &options, NativeOrdering::Natural)
+            .expect("native analyse");
+        let native_info = native_session.factorize(matrix).expect("native factorize");
+        let native_enquiry = native_session.enquire_indef().expect("native enquire");
+        eprintln!(
+            "dense seed09 case{case_index} metadata rust_inertia={:?} native_inertia={:?} rust_2x2={} native_2x2={} rust_delayed={} native_delayed={}",
+            rust_factor.inertia(),
+            native_info.inertia,
+            rust_factor.pivot_stats().two_by_two_pivots,
+            native_info.two_by_two_pivots,
+            rust_factor.pivot_stats().delayed_pivots,
+            native_info.delayed_pivots,
+        );
+        let rust_entries = rust_inverse_diagonal_entries(&rust_factor);
+        let rust_d_bits = inverse_diagonal_bits(&rust_entries);
+        let native_d_bits = inverse_diagonal_bits(&native_enquiry.inverse_diagonal_entries);
+        let first_d_mismatch = rust_d_bits
+            .iter()
+            .zip(&native_d_bits)
+            .position(|(rust, native)| rust != native);
+        eprintln!(
+            "dense seed09 case{case_index} first_d_mismatch={:?}",
+            first_d_mismatch.map(|index| (
+                index,
+                rust_entries[index / 2][index % 2],
+                native_enquiry.inverse_diagonal_entries[index / 2][index % 2],
+            )),
+        );
+
+        let tree = build_symbolic_front_tree(&symbolic);
+        let mut permuted_col_ptrs = Vec::new();
+        let mut permuted_row_indices = Vec::new();
+        let mut permuted_source_positions = Vec::new();
+        super::build_permuted_lower_csc_pattern(
+            matrix,
+            &symbolic.permutation,
+            &mut permuted_col_ptrs,
+            &mut permuted_row_indices,
+            &mut permuted_source_positions,
+        )
+        .expect("permuted pattern");
+        let mut permuted_values = Vec::new();
+        super::fill_permuted_lower_csc_values(
+            matrix,
+            &permuted_source_positions,
+            &mut permuted_values,
+        )
+        .expect("permuted values");
+        let front = &tree.fronts[0];
+        let mut local_rows = front.columns.clone();
+        let mut interface_rows = front.interface_rows.clone();
+        interface_rows.sort_unstable();
+        local_rows.extend(interface_rows);
+        let local_size = local_rows.len();
+        let mut local_positions = vec![usize::MAX; dimension];
+        for (position, &row) in local_rows.iter().enumerate() {
+            local_positions[row] = position;
+        }
+        let mut local_dense = vec![0.0; local_size * local_size];
+        for &column in &front.columns {
+            let local_column = local_positions[column];
+            for entry in permuted_col_ptrs[column]..permuted_col_ptrs[column + 1] {
+                let row = permuted_row_indices[entry];
+                let local_row = local_positions[row];
+                if local_row != usize::MAX {
+                    local_dense[dense_lower_offset(local_size, local_row, local_column)] =
+                        permuted_values[entry];
+                }
+            }
+        }
+
+        let mut rows = local_rows;
+        let mut dense_state = local_dense;
+        let mut block_start = 0;
+        while block_start + APP_INNER_BLOCK_SIZE <= local_size {
+            let tail_size = local_size - block_start;
+            let mut tail_dense = vec![0.0; tail_size * tail_size];
+            for local_col in 0..tail_size {
+                for local_row in local_col..tail_size {
+                    tail_dense[local_col * tail_size + local_row] = dense_state
+                        [(block_start + local_col) * local_size + block_start + local_row];
+                }
+            }
+            let tail_lda = native_aligned_double_stride(shim, tail_size);
+            let rust_trace = rust_app_block_prefix_trace_32(&tail_dense, tail_size, options);
+            let native_trace =
+                native_block_prefix_trace_32(shim, &tail_dense, tail_size, tail_lda, options);
+            let native_block = native_block_ldlt_32_from_lower_dense(
+                shim,
+                &tail_dense,
+                tail_size,
+                tail_lda,
+                options,
+            );
+            let native_entries = inverse_diagonal_entries_from_internal_diagonal(
+                &native_block.diagonal,
+                APP_INNER_BLOCK_SIZE,
+            );
+            let rust_entries = inverse_diagonal_entries_from_internal_diagonal(
+                &rust_trace.last().expect("dense seed09 APP trace").diagonal,
+                APP_INNER_BLOCK_SIZE,
+            );
+            let first_block_d_mismatch = rust_entries
+                .iter()
+                .flat_map(|entry| entry.iter())
+                .zip(native_entries.iter().flat_map(|entry| entry.iter()))
+                .position(|(rust, native)| rust.to_bits() != native.to_bits());
+            let continuation_mismatch = first_native_block_continuation_mismatch(
+                shim,
+                &native_trace,
+                &native_block,
+                tail_lda,
+                options,
+            );
+            let frozen_mismatch = continuation_mismatch
+                .as_ref()
+                .and_then(|mismatch| {
+                    native_trace
+                        .iter()
+                        .find(|snapshot| snapshot.step == mismatch.step)
+                })
+                .and_then(|snapshot| {
+                    first_frozen_prefix_mismatch_against_block(snapshot, &native_block, tail_lda)
+                });
+            let expr_rows = frozen_mismatch.as_ref().and_then(|mismatch| {
+                native_trace
+                    .iter()
+                    .find(|snapshot| snapshot.step == mismatch.step)
+                    .map(|snapshot| {
+                        two_by_two_first_multiplier_block_expr_bits(
+                            snapshot,
+                            &native_block,
+                            tail_lda,
+                        )
+                    })
+            });
+            let replay =
+                replay_app_block_for_debug(rows.clone(), dense_state.clone(), block_start, options);
+            eprintln!(
+                "dense seed09 case{case_index} APP block_start={block_start} accepted_end={} first_failed={} prefix_mismatch={:?} continuation_mismatch={:?} frozen_mismatch={:?} expr_rows={:?} block_d_mismatch={:?} apply_mismatch={:?} accepted_update_mismatch={:?}",
+                replay.accepted_end,
+                replay.first_failed,
+                first_block_prefix_trace_mismatch(&rust_trace, &native_trace),
+                continuation_mismatch,
+                frozen_mismatch,
+                expr_rows,
+                first_block_d_mismatch.map(|index| (
+                    index,
+                    rust_entries[index / 2][index % 2],
+                    native_entries[index / 2][index % 2],
+                )),
+                first_native_apply_pivot_tile_mismatch(shim, &replay, block_start),
+                first_native_accepted_update_mismatch(shim, &replay, block_start),
+            );
+            rows = replay.rows;
+            dense_state = replay.after_update;
+            block_start = replay.accepted_end;
+        }
+
+        let rhs = dense_mul(&dense, &expected_solution);
+        let rust_solution = rust_factor.solve(&rhs).expect("rust solve");
+        let native_solution = native_session.solve(&rhs).expect("native solve");
+        assert_eq!(
+            first_bit_mismatch(&rust_solution, &native_solution),
+            None,
+            "dense seed09 case{case_index} solution differs"
+        );
+    }
+
+    #[test]
+    #[ignore = "manual dense random APP block classifier"]
+    fn dense_seed09_case5_classifies_remaining_solution_gap() {
+        classify_dense_seed09_case_remaining_solution_gap(5);
+    }
+
+    #[test]
+    #[ignore = "manual dense random APP block classifier"]
+    fn dense_seed09_case15_classifies_remaining_solution_gap() {
+        classify_dense_seed09_case_remaining_solution_gap(15);
     }
 
     #[test]
@@ -11052,9 +12789,8 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             }
         }
         assert_eq!(
-            first_native_trace_block_mismatch,
-            Some((30, 19, 0xbf8c_bfa8_da67_4b6b, 0xbf8c_bfa8_da67_4b6c)),
-            "dense seed09 native APP trace/block_ldlt matrix boundary moved"
+            first_native_trace_block_mismatch, None,
+            "dense seed09 native APP trace/block_ldlt matrix mismatch"
         );
         let first_fma_continuation_mismatch = first_native_block_continuation_mismatch(
             shim,
@@ -11064,20 +12800,8 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             options,
         );
         assert_eq!(
-            first_fma_continuation_mismatch,
-            Some(BlockContinuationMismatch {
-                step: 10,
-                from: 19,
-                status: 2,
-                next: 21,
-                component: "matrix",
-                index: 979,
-                row: 30,
-                col: 19,
-                continued_bits: 0xbf8c_bfa8_da67_4b6b,
-                block_bits: 0xbf8c_bfa8_da67_4b6c,
-            }),
-            "dense seed09 FMA native APP trace continuation boundary moved"
+            first_fma_continuation_mismatch, None,
+            "dense seed09 native APP trace continuation mismatch"
         );
         let fma_pivot_snapshot = native_trace
             .iter()
@@ -11103,7 +12827,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             fma_pivot_snapshot.workspace[multiplier_col * APP_INNER_BLOCK_SIZE + multiplier_row];
         let second_work = fma_pivot_snapshot.workspace
             [(multiplier_col + 1) * APP_INNER_BLOCK_SIZE + multiplier_row];
-        let reconstructed_first_multiplier = d21.mul_add(second_work, d11 * first_work);
+        let reconstructed_first_multiplier = d11.mul_add(first_work, d21 * second_work);
         let source_first_multiplier = d11 * first_work + d21 * second_work;
         let trace_first_multiplier =
             fma_pivot_snapshot.matrix[multiplier_col * APP_INNER_BLOCK_SIZE + multiplier_row];
@@ -11121,7 +12845,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
                 native_block_first_multiplier.to_bits()
             ),
             (
-                0xbf8c_bfa8_da67_4b6b,
+                0xbf8c_bfa8_da67_4b6c,
                 0xbf8c_bfa8_da67_4b6c,
                 0xbf8c_bfa8_da67_4b6c,
             ),
@@ -11319,9 +13043,8 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             }
         }
         assert_eq!(
-            first_aligned_source_diagonal_mismatch,
-            Some((30, 28, 0xbf74_d4f0_5007_4250, 0xbf74_d4f0_5007_424d)),
-            "dense seed09 source-shaped aligned first APP diagonal operand boundary moved"
+            first_aligned_source_diagonal_mismatch, None,
+            "dense seed09 source-shaped aligned first APP diagonal operand mismatch"
         );
         let mut first_source_diagonal_mismatch = None;
         'source_diagonal_compare: for col in block_start..block_end {
@@ -11335,9 +13058,8 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             }
         }
         assert_eq!(
-            first_source_diagonal_mismatch,
-            Some((30, 28, 0xbf74_d4f0_5007_4250, 0xbf74_d4f0_5007_424d)),
-            "dense seed09 source-shaped first APP diagonal operand boundary moved"
+            first_source_diagonal_mismatch, None,
+            "dense seed09 source-shaped first APP diagonal operand mismatch"
         );
         let mut rust_source_trsm_matrix = dense_before_apply.clone();
         app_solve_block_triangular_to_trailing_rows(

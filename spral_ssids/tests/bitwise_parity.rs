@@ -116,6 +116,19 @@ fn random_dyadic_solution(dimension: usize, rng: &mut DenseBoundaryRng) -> Vec<f
     (0..dimension).map(|_| rng.dyadic(8, 4)).collect()
 }
 
+fn dense_boundary_case(seed: u64, case_index: usize) -> (usize, Vec<Vec<f64>>, Vec<f64>) {
+    let mut rng = DenseBoundaryRng::new(seed);
+    let mut dimension = 0;
+    let mut matrix = Vec::new();
+    let mut expected_solution = Vec::new();
+    for _ in 0..=case_index {
+        dimension = rng.usize_inclusive(33, 160);
+        matrix = random_dense_dyadic_matrix(dimension, &mut rng);
+        expected_solution = random_dyadic_solution(dimension, &mut rng);
+    }
+    (dimension, matrix, expected_solution)
+}
+
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -231,27 +244,29 @@ fn rust_and_native_spral_match_dense_seed_6_33x33_solution_bits() {
 
 #[test]
 fn rust_and_native_spral_match_dense_seed_706172697479_case58_solution_bits() {
-    let mut rng = DenseBoundaryRng::new(0x7061_7269_7479);
-    let mut dimension = 0;
-    let mut matrix = Vec::new();
-    let mut expected_solution = Vec::new();
-    for _case_index in 0..=58 {
-        dimension = rng.usize_inclusive(33, 160);
-        matrix = random_dense_dyadic_matrix(dimension, &mut rng);
-        expected_solution = random_dyadic_solution(dimension, &mut rng);
-    }
-
+    let (dimension, matrix, expected_solution) = dense_boundary_case(0x7061_7269_7479, 58);
     assert_eq!(dimension, 137);
     assert_exact_bitwise_parity_witness(&matrix, &expected_solution);
 }
 
 #[test]
 fn rust_and_native_spral_match_dense_seed_09c9134e4eff0004_case0_solution_bits() {
-    let mut rng = DenseBoundaryRng::new(0x09c9_134e_4eff_0004);
-    let dimension = rng.usize_inclusive(33, 160);
+    let (dimension, matrix, expected_solution) = dense_boundary_case(0x09c9_134e_4eff_0004, 0);
     assert_eq!(dimension, 55);
-    let matrix = random_dense_dyadic_matrix(dimension, &mut rng);
-    let expected_solution = random_dyadic_solution(dimension, &mut rng);
+    assert_exact_bitwise_parity_witness(&matrix, &expected_solution);
+}
+
+#[test]
+fn rust_and_native_spral_match_dense_seed_09c9134e4eff0004_case5_solution_bits() {
+    let (dimension, matrix, expected_solution) = dense_boundary_case(0x09c9_134e_4eff_0004, 5);
+    assert_eq!(dimension, 89);
+    assert_exact_bitwise_parity_witness(&matrix, &expected_solution);
+}
+
+#[test]
+fn rust_and_native_spral_match_dense_seed_09c9134e4eff0004_case15_solution_bits() {
+    let (dimension, matrix, expected_solution) = dense_boundary_case(0x09c9_134e_4eff_0004, 15);
+    assert_eq!(dimension, 66);
     assert_exact_bitwise_parity_witness(&matrix, &expected_solution);
 }
 

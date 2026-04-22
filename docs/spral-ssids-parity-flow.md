@@ -45,27 +45,41 @@ stack reports OpenBLAS `0.3.32 DYNAMIC_ARCH ... neoversen1`, whose arm64
 `KERNEL.NEOVERSEN1` selects the generic `trsm_kernel_RN.c` path for double RN
 dtrsm.
 
+Current newly passing accepted-update witness:
+Rust APP accepted-prefix update now mirrors SPRAL
+`ldlt_app.cxx::Block::update`: the `calcLD<OP_N>` workspace is rebuilt for
+each target block, so the local vector/scalar split resets at every
+`APP_INNER_BLOCK_SIZE` row tile. The deterministic dense seed
+`0x09c9134e4eff0004` case 15 previously first differed inside the accepted
+update at `host_gemm_op_n_op_t_tile`, row 64, col 38, after matching
+factorization outcome, inertia, pivot stats, APP prefix traces, and
+`calcLD` tile output. That case now matches through inverse-D and final
+solution bits, and it is an active bitwise regression alongside case 5 and
+case 58. Validation for this checkpoint includes the 512-case dense APP smoke
+for seed `0x09c9134e4eff0004` and the 4096-case sparse smoke for the same
+seed.
+
 Current newly passing solve-lane witness:
 Rust APP 2x2 first-multiplier arithmetic now mirrors the observed local
-`block_ldlt<32>` codegen split: contracted arithmetic for vectorized rows, and
-the `block_ldlt.hxx` source-spelled `d11*work[r] + d21*work[BLOCK_SIZE+r]`
-for the narrow scalar tail. The second multiplier remains contracted, matching
-the local native build. This closes the active dense seed6 full solution
-witness and promotes dense seed09 case0 from ignored/manual to active full
-solution-bit parity. `cargo test -p spral_ssids --test bitwise_parity` now has
-9 active passing solution witnesses and 4 active remaining failures; seed6,
-dense seed09 case0, and dense seed1001 all pass. The source anchor is SPRAL
+`block_ldlt<32>` codegen split: the vectorized body uses the previous
+contracted order, the one-row scalar remainder uses
+`fma(d11, work[r], d21*work[BLOCK_SIZE+r])`, and the three-row short tail keeps
+its first two rows in the vector-body contraction lane. The second multiplier
+remains contracted, matching the local native build. This closes the active
+137x137 dense seed `0x706172697479` case 58 full solution witness after
+classification showed matching factor order, APP block1/block2 native
+`block_ldlt<32>` continuation, inverse-D, solve-stage replays, and final
+solution bits. `cargo test -p spral_ssids --test bitwise_parity` now has 15
+active passing witnesses and no active failures. The source anchor is SPRAL
 `target/native/spral-upstream/src/ssids/cpu/kernels/block_ldlt.hxx`
 `block_ldlt<T, BLOCK_SIZE>`'s 2x2 multiplier loop, reached from
 `target/native/spral-upstream/src/ssids/cpu/kernels/ldlt_app.cxx`.
 
-Current remaining seed6 storage boundary:
-The seed6 solve now matches bitwise, but isolated final APP block storage is
-not fully green. `dense_seed6_app_block_storage_diverges_after_row30_scalar_tail`
-shows row 30, col 28 is closed, and the first remaining local block L mismatch
-is row 31, col 28: Rust/source-tail `0x3f66e35ec7827340` versus native full
-block `0x3f66e35ec782734a`. This keeps block storage colored partial while the
-seed6 full solution node is newly green.
+Current newly passing seed6 storage boundary:
+The seed6 solve, APP prefix trace, native `block_ldlt<32>` continuation, final
+APP block storage, inverse-D, and full solution guards now match bitwise. The
+previous row 30/31 scalar-tail storage gap is closed by the same
+first-multiplier codegen split used for case58.
 
 Current newly passing seed1001 witness:
 `app_block_ldlt_32_prefix_trace_matches_native_dense_seed1001`,
@@ -313,11 +327,9 @@ native-order OpenBLAS `host_trsv` OP_T traversal used by
 metadata, factor order, inverse-D, forward panel replay, diagonal replay,
 backward panel replay, and final solution bits against native SPRAL.
 
-The remaining active full-solution parity failure is
-`rust_and_native_spral_match_dense_seed_706172697479_case58_solution_bits`.
-This keeps the production solution-bit node red while the seed6, deterministic
-65/96/97, dense seed09 case0, and dense seed1001 solution witnesses are newly
-green.
+There is no remaining active deterministic full-solution failure in
+`cargo test -p spral_ssids --test bitwise_parity`; broader ignored random smoke
+and source-audit work still remain before claiming whole-solver equivalence.
 
 ```mermaid
 flowchart TD
@@ -352,7 +364,8 @@ flowchart TD
     G6a --> G7["swap_cols twice"]
     G7 --> G8["compute 2x2 inverse / multipliers"]
     G8 --> G8c["block_ldlt 2x2 first multiplier vector/scalar split"]
-    G8c --> G8d["block_ldlt optimized 2x2 second multiplier contraction"]
+    G8c --> G8e["Dense seed09 case5 three-row short-tail solution bits"]
+    G8e --> G8d["block_ldlt optimized 2x2 second multiplier contraction"]
     G8d --> G8a["calcLD OP_N 2x2 vector row"]
     G8a --> G8b["calcLD OP_N vector/scalar row split"]
     G8b --> G9a["update_2x2 product-sum contraction"]
@@ -374,25 +387,26 @@ flowchart TD
     I0q --> I0n["Dense seed09 FMA native trace-vs-wrapper APP permutation and D"]
     I0n --> I0m["Dense seed09 continuation pivot metadata"]
     I0m --> I0x["Dense seed09 FMA pivot19 multiplier source row31"]
-    I0x --> I0y["Dense seed09 pivot19 source expression matches wrapper bit"]
-    I0y --> I0c["Dense seed09 FMA continuation to row30/col19 matrix gap"]
-    I0c --> I0d["Dense seed09 FMA native trace-vs-wrapper APP matrix gap"]
+    I0x --> I0y["Dense seed09 pivot19 scalar-tail expression matches wrapper bit"]
+    I0y --> I0c["Dense seed09 FMA continuation matches wrapper"]
+    I0c --> I0d["Dense seed09 FMA native trace-vs-wrapper APP matrix bits"]
     I0d --> I0t["Dense seed09 source-shaped APP host_trsm operands"]
     I0t --> I0b["Dense seed09 source-shaped APP post-apply operands"]
     I0b --> I["APP accepted-prefix update"]
     G10 --> J["Record delayed pivots"]
     H --> I
 
-    I --> I1["Dense seed09 first APP accepted update via calcLD + host_gemm"]
-    I1 --> I2["Dense seed09 post-APP 23x23 TPP tail factor"]
+    I --> I1["APP accepted update calcLD per target block"]
+    I1 --> I1a["Dense seed09 case15 accepted-update and solution bits"]
+    I1a --> I2["Dense seed09 post-APP 23x23 TPP tail factor"]
     I2 --> I3["Dense seed09 APP-stride 23x23 TPP tail factor"]
     I3 --> K4d
     I --> K["Store L/D blocks, local perms, pivot records"]
     K --> K1["Factor order, inertia, pivot stats"]
     K --> K2["Seed6 APP prefix inverse-D bits through 29"]
     K2 --> K3["Seed6 full inverse-D bits"]
-    K3 --> K3b["Seed6 APP row30 L bit closes; row31 storage remains"]
-    K3b --> K3c["Seed6 all-FMA continuation reproduces old row30 gap"]
+    K3 --> K3b["Seed6 APP L storage bits"]
+    K3b --> K3c["Seed6 native continuation matches full block"]
     K3c --> K3d["Seed6 scalar-tail first multiplier closes solution bits"]
     K3d --> K3a["Seed6 full solution bits"]
     K --> K4a["Dense APP case0 prefix inverse-D bits through 74"]
@@ -412,6 +426,9 @@ flowchart TD
     K5a --> K5b["Dense seed1001 APP block storage bits"]
     K5b --> K5c["Dense seed1001 production inverse-D bits"]
     K5c --> K5["Dense seed1001 solution bits"]
+    K --> K6a["Dense case58 APP block1/block2 block_ldlt wrapper bits"]
+    K6a --> K6b["Dense case58 inverse-D and solve-stage replay bits"]
+    K6b --> K6["Dense case58 solution bits"]
     J --> K
     K1 --> L{"More fronts?"}
     K3 --> L
@@ -434,6 +451,7 @@ flowchart TD
     R --> S["Full production solution bit patterns"]
     K3a --> S
     K5 --> S
+    K6 --> S
     Q2 --> S
 
     classDef match fill:#dff7df,stroke:#2f8f46,color:#102615,stroke-width:2px;
@@ -447,10 +465,10 @@ flowchart TD
     class I0s partial;
     class I0m newly;
     class I0u newlyPartial;
-    class I0x,I0y newlyPartial;
-    class I0q,I0c newlyPartial;
+    class I0x,I0y newly;
+    class I0q newlyPartial;
+    class I0c,I0d newly;
     class I0n match;
-    class I0d partial;
     class I0z newlyPartial;
     class I0zz open;
     class I0t,I0b newly;
@@ -459,11 +477,13 @@ flowchart TD
     class C,D,E,F,G,G2,G4,G7,G10,H,I,J,K,L,N partial;
     class O0 newlyPartial;
     class O1,Q1,Q2 newly;
-    class K3b,K3c newlyPartial;
+    class K3b,K3c newly;
     class K3a,K3d newly;
     class K4l newly;
     class G6a,K5a,K5b,K5c,K5 newly;
-    class G8c,G8d,G9a,I00,I0,I0a,I1,I2,I3,K2,K3,K4a,K4c,K4d,K4e,K4f,K4g,K4h,K4i match;
+    class G8c,G8d,G9a,I00,I0,I0a,I2,I3,K2,K3,K4a,K4c,K4d,K4e,K4f,K4g,K4h,K4i match;
+    class G8e newly;
+    class I1,I1a newly;
     class K4b,K4 newly;
-    class S open;
+    class K6a,K6b,K6,S newly;
 ```
