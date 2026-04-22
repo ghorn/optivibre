@@ -9136,11 +9136,13 @@ where
                 < previous_barrier_parameter - 1e-18 * previous_barrier_parameter.abs().max(1.0)
             {
                 // IPOPT calls MonotoneMuUpdate::UpdateBarrierParameter before
-                // ComputeSearchDirection, and BacktrackingLineSearch observes
-                // the changed mu by clearing filter/watchdog state before the
-                // trial search starts.
+                // ComputeSearchDirection.  When mu changes, it calls
+                // BacktrackingLineSearch::Reset, clearing the filter acceptor;
+                // the subsequent FindAcceptableTrialPoint mu check clears the
+                // watchdog counters before trial search starts.
                 barrier_parameter_value = next_barrier_parameter_value;
                 filter_entries.clear();
+                successive_filter_rejections = 0;
                 watchdog_state = InteriorPointWatchdogState::default();
                 push_unique_nlip_event(
                     &mut iteration_events,
