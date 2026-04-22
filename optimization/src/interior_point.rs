@@ -3795,11 +3795,22 @@ fn correct_bound_multiplier_estimate(
     let mut corrected_z = trial_z.to_vec();
     let mut max_correction = 0.0_f64;
     for (z_i, slack_i) in corrected_z.iter_mut().zip(trial_slack.iter()) {
-        let upper_multiplier = upper_complementarity / slack_i;
-        let lower_multiplier = lower_complementarity / slack_i;
-        let corrected = z_i.min(upper_multiplier).max(lower_multiplier);
-        max_correction = max_correction.max((corrected - *z_i).abs());
-        *z_i = corrected;
+        // IPOPT `IpoptAlgorithm::correct_bound_multiplier` computes a
+        // correction vector using one_over_s, then adds the negative/positive
+        // correction back to z.  Preserve that order instead of assigning the
+        // mathematically equivalent clamp endpoints directly.
+        let one_over_s = 1.0 / *slack_i;
+        let step_to_upper = upper_complementarity * one_over_s - *z_i;
+        let max_correction_up = (-step_to_upper).max(0.0);
+        if step_to_upper < 0.0 {
+            *z_i += step_to_upper;
+        }
+        let step_to_lower = lower_complementarity * one_over_s - *z_i;
+        let max_correction_low = step_to_lower.max(0.0);
+        if step_to_lower > 0.0 {
+            *z_i += step_to_lower;
+        }
+        max_correction = max_correction.max(max_correction_up.max(max_correction_low));
     }
 
     (corrected_z, max_correction)
@@ -7739,6 +7750,20 @@ mod tests {
             assert!(compl <= kappa_sigma * mu + 1e-12);
             assert!(compl >= mu / kappa_sigma - 1e-12);
         }
+    }
+
+    #[test]
+    fn bound_multiplier_correction_keeps_ipopt_step_order() {
+        let mu = 1.7646745086707415e-7;
+        let kappa_sigma = 5.918795724267679;
+        let slack = vec![0.2958312539029896];
+        let z = vec![278.59313097706615];
+
+        let (corrected_z, _) = correct_bound_multiplier_estimate(&z, &slack, mu, kappa_sigma);
+        let direct_endpoint = (kappa_sigma * mu) / slack[0];
+
+        assert_eq!(corrected_z[0].to_bits(), 0x3ecd_9dff_f800_0000);
+        assert_eq!(direct_endpoint.to_bits(), 0x3ecd_9dff_fa07_9d96);
     }
 
     #[test]
