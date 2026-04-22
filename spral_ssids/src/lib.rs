@@ -2555,6 +2555,8 @@ fn app_build_ld_workspace(
     accepted_end: usize,
     block_records: &[FactorBlockRecord],
 ) -> Vec<f64> {
+    // Accepted-update operands are below the eliminated prefix, so SPRAL's
+    // column-major `aval[col * lda + row]` matches the dense lower storage.
     let accepted_width = accepted_end - block_start;
     let mut ld_values = vec![0.0; accepted_width * size];
     let mut pivot = block_start;
@@ -2563,7 +2565,7 @@ fn app_build_ld_workspace(
         if block.size == 1 {
             let diagonal = app_original_one_by_one_diagonal(block.values[0]);
             for row in accepted_end..size {
-                let row_l = matrix[dense_lower_offset(size, row, pivot)];
+                let row_l = matrix[pivot * size + row];
                 ld_values[relative_pivot * size + row] = diagonal * row_l;
             }
             pivot += 1;
@@ -2576,8 +2578,8 @@ fn app_build_ld_workspace(
             let d21 = inv21 / det;
             let d22 = inv22 / det;
             for row in accepted_end..size {
-                let row_l1 = matrix[dense_lower_offset(size, row, pivot)];
-                let row_l2 = matrix[dense_lower_offset(size, row, pivot + 1)];
+                let row_l1 = matrix[pivot * size + row];
+                let row_l2 = matrix[(pivot + 1) * size + row];
                 ld_values[relative_pivot * size + row] = d22.mul_add(row_l1, -(d21 * row_l2));
                 ld_values[(relative_pivot + 1) * size + row] = (-d21).mul_add(row_l1, d11 * row_l2);
             }
@@ -2609,18 +2611,18 @@ fn app_apply_accepted_prefix_update(
     let ld_values = app_build_ld_workspace(matrix, size, block_start, accepted_end, block_records);
     if accepted_end + 1 == size {
         let row = accepted_end;
-        let entry = dense_lower_offset(size, row, row);
+        let entry = row * size + row;
         let mut pivot = block_start;
         for block in block_records {
             let relative_pivot = pivot - block_start;
             if block.size == 1 {
-                let row_l = matrix[dense_lower_offset(size, row, pivot)];
+                let row_l = matrix[pivot * size + row];
                 let row_ld = ld_values[relative_pivot * size + row];
                 matrix[entry] = (-row_l).mul_add(row_ld, matrix[entry]);
                 pivot += 1;
             } else {
-                let row_l1 = matrix[dense_lower_offset(size, row, pivot)];
-                let row_l2 = matrix[dense_lower_offset(size, row, pivot + 1)];
+                let row_l1 = matrix[pivot * size + row];
+                let row_l2 = matrix[(pivot + 1) * size + row];
                 let row_ld1 = ld_values[relative_pivot * size + row];
                 let row_ld2 = ld_values[(relative_pivot + 1) * size + row];
                 matrix[entry] = (-row_l1).mul_add(row_ld1, matrix[entry]);
@@ -2653,13 +2655,13 @@ fn app_apply_accepted_prefix_update(
             for block in block_records {
                 let relative_pivot = pivot - block_start;
                 if block.size == 1 {
-                    let col_l = matrix[dense_lower_offset(size, col, pivot)];
+                    let col_l = matrix[pivot * size + col];
                     let row_ld = ld_values[relative_pivot * size + row];
                     update = row_ld.mul_add(col_l, update);
                     pivot += 1;
                 } else {
-                    let col_l1 = matrix[dense_lower_offset(size, col, pivot)];
-                    let col_l2 = matrix[dense_lower_offset(size, col, pivot + 1)];
+                    let col_l1 = matrix[pivot * size + col];
+                    let col_l2 = matrix[(pivot + 1) * size + col];
                     let row_ld1 = ld_values[relative_pivot * size + row];
                     let row_ld2 = ld_values[(relative_pivot + 1) * size + row];
                     update = row_ld1.mul_add(col_l1, update);
@@ -2668,7 +2670,7 @@ fn app_apply_accepted_prefix_update(
                 }
             }
             debug_assert_eq!(pivot, accepted_end);
-            let entry = dense_lower_offset(size, row, col);
+            let entry = col * size + row;
             matrix[entry] = update.mul_add(-1.0, matrix[entry]);
         }
     }
@@ -2688,18 +2690,18 @@ fn app_apply_accepted_prefix_update_entry_incremental(
     col: usize,
 ) {
     let size = context.size;
-    let entry = dense_lower_offset(size, row, col);
+    let entry = col * size + row;
     let mut pivot = context.block_start;
     for block in context.block_records {
         let relative_pivot = pivot - context.block_start;
         if block.size == 1 {
-            let col_l = matrix[dense_lower_offset(size, col, pivot)];
+            let col_l = matrix[pivot * size + col];
             let row_ld = context.ld_values[relative_pivot * size + row];
             matrix[entry] = (-col_l).mul_add(row_ld, matrix[entry]);
             pivot += 1;
         } else {
-            let col_l1 = matrix[dense_lower_offset(size, col, pivot)];
-            let col_l2 = matrix[dense_lower_offset(size, col, pivot + 1)];
+            let col_l1 = matrix[pivot * size + col];
+            let col_l2 = matrix[(pivot + 1) * size + col];
             let row_ld1 = context.ld_values[relative_pivot * size + row];
             let row_ld2 = context.ld_values[(relative_pivot + 1) * size + row];
             matrix[entry] = (-col_l1).mul_add(row_ld1, matrix[entry]);
@@ -2721,7 +2723,7 @@ fn app_build_factor_columns_for_prefix(
     for col in start..end {
         let mut entries = Vec::with_capacity(size.saturating_sub(col + 1));
         for row in (col + 1)..size {
-            entries.push((rows[row], matrix[dense_lower_offset(size, row, col)]));
+            entries.push((rows[row], matrix[col * size + row]));
         }
         columns.push(FactorColumn {
             global_column: rows[col],
