@@ -9665,6 +9665,63 @@ extern "C" int spral_kernel_block_prefix_trace_32(
             first_failed - block_start,
             "dense seed09 APP a-posteriori threshold boundary mismatch"
         );
+        let native_block = native_block_ldlt_32_from_lower_dense(
+            shim,
+            &dense_before_block,
+            dimension,
+            native_lda,
+            options,
+        );
+        assert_eq!(native_block.perm, rows[..block_end]);
+        let mut native_source_apply_matrix = native_block.matrix.clone();
+        for col in block_start..block_end {
+            let source_col = native_block.local_perm[col];
+            for row in block_end..dimension {
+                native_source_apply_matrix[col * native_lda + row] =
+                    dense_before_block[source_col * dimension + row];
+            }
+        }
+        unsafe {
+            (shim.apply_pivot_op_n)(
+                (dimension - block_end) as c_int,
+                block_end as c_int,
+                native_source_apply_matrix.as_ptr(),
+                native_block.diagonal.as_ptr(),
+                options.small_pivot_tolerance,
+                native_source_apply_matrix.as_mut_ptr().add(block_end),
+                native_lda as c_int,
+            );
+        }
+        let mut first_source_apply_mismatch = None;
+        'source_apply_compare: for col in block_start..block_end {
+            for row in block_end..dimension {
+                let rust_bits = rust_apply_matrix[col * dimension + row].to_bits();
+                let native_bits = native_source_apply_matrix[col * native_lda + row].to_bits();
+                if rust_bits != native_bits {
+                    first_source_apply_mismatch = Some((row, col, rust_bits, native_bits));
+                    break 'source_apply_compare;
+                }
+            }
+        }
+        assert_eq!(
+            first_source_apply_mismatch,
+            Some((47, 30, 0xbfd7_6be5_86da_b26a, 0xbfd7_6be5_86da_b269)),
+            "dense seed09 source-shaped first APP apply operand boundary moved"
+        );
+        let native_source_passed = native_check_threshold_op_n(
+            shim,
+            dimension - block_end,
+            block_end - block_start,
+            options.threshold_pivot_u,
+            &mut native_source_apply_matrix,
+            block_end,
+            native_lda,
+        );
+        assert_eq!(
+            native_source_passed,
+            first_failed - block_start,
+            "dense seed09 source-shaped APP threshold boundary mismatch"
+        );
 
         app_restore_trailing_from_block_backup(
             &rows,
