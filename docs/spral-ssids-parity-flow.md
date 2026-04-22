@@ -7,7 +7,17 @@ Orange nodes have partial coverage or a known narrowed boundary. Gold-orange
 nodes are newly passing guards that narrow an open mismatch without proving full
 bitwise parity. Red nodes are the next open bitwise mismatch target.
 
-Current newly narrowed witness:
+Current newly passing witness:
+`dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now pins the
+dense seed09 source-shaped first APP pre-apply operand layout. After native
+`block_ldlt<32>` and the source-shaped local column permutation, the trailing
+operand handed to `target/native/spral-upstream/src/ssids/cpu/kernels/ldlt_app.cxx`
+`apply_pivot<OP_N>` matches Rust's pre-apply operand bitwise. The remaining
+row 47, col 30 one-ulp drift is therefore introduced by the source-shaped
+`apply_pivot<OP_N>` replay or immediately after it, not by the column
+permutation into the first APP trailing block.
+
+Previous newly narrowed witness:
 `dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now pins the
 first dense seed09 source-shaped APP operand drift after native
 `block_ldlt<32>`, source-shaped column permutation, native `apply_pivot<OP_N>`,
@@ -149,7 +159,8 @@ flowchart TD
     G9 --> I00
     I00 --> I0["Dense seed09 APP-stride apply_pivot OP_N L block"]
     I0 --> I0a["Dense seed09 APP check_threshold OP_N pass count"]
-    I0a --> I0b["Dense seed09 source-shaped APP operand gap"]
+    I0a --> I0p["Dense seed09 source-shaped APP pre-apply operands"]
+    I0p --> I0b["Dense seed09 source-shaped APP post-apply operand gap"]
     I0b --> I["APP accepted-prefix update"]
     G10 --> J["Record delayed pivots"]
     H --> I
@@ -194,7 +205,8 @@ flowchart TD
     classDef open fill:#ffd8d8,stroke:#b43b3b,color:#2b0d0d,stroke-width:2px;
 
     class A,B,B1,B2,B3,G0,G1,G3,G5,G6,G8,G8a,G8b,G9,H1,H2,H3,K1,M,O,P,Q,R match;
-    class I0b newlyPartial;
+    class I0p newly;
+    class I0b partial;
     class K4j match;
     class K4k partial;
     class C,D,E,F,G,G2,G4,G7,G10,H,I,J,K,L,N partial;

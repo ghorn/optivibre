@@ -9681,6 +9681,21 @@ extern "C" int spral_kernel_block_prefix_trace_32(
                     dense_before_block[source_col * dimension + row];
             }
         }
+        let mut first_source_pre_apply_mismatch = None;
+        'source_pre_apply_compare: for col in block_start..block_end {
+            for row in block_end..dimension {
+                let rust_bits = dense_before_apply[col * dimension + row].to_bits();
+                let native_bits = native_source_apply_matrix[col * native_lda + row].to_bits();
+                if rust_bits != native_bits {
+                    first_source_pre_apply_mismatch = Some((row, col, rust_bits, native_bits));
+                    break 'source_pre_apply_compare;
+                }
+            }
+        }
+        assert_eq!(
+            first_source_pre_apply_mismatch, None,
+            "dense seed09 source-shaped first APP pre-apply operand mismatch"
+        );
         unsafe {
             (shim.apply_pivot_op_n)(
                 (dimension - block_end) as c_int,
