@@ -4649,6 +4649,7 @@ mod tests {
     type LdltAppSolveFn =
         unsafe extern "C" fn(c_int, c_int, *const f64, c_int, c_int, *mut f64, c_int);
     type LdltAppSolveDiagFn = unsafe extern "C" fn(c_int, *const f64, c_int, *mut f64, c_int);
+    type AlignLdaFn = unsafe extern "C" fn(c_int) -> c_int;
     type BlockUpdate1x1Fn = unsafe extern "C" fn(c_int, *mut f64, c_int, *const f64);
     type BlockUpdate2x2Fn = unsafe extern "C" fn(c_int, *mut f64, c_int, *const f64);
     type BlockSwapColsFn =
@@ -4717,6 +4718,7 @@ mod tests {
         ldlt_app_solve_fwd: LdltAppSolveFn,
         ldlt_app_solve_diag: LdltAppSolveDiagFn,
         ldlt_app_solve_bwd: LdltAppSolveFn,
+        align_lda_double: AlignLdaFn,
         block_update_1x1_32: BlockUpdate1x1Fn,
         block_update_2x2_32: BlockUpdate2x2Fn,
         block_swap_cols_32: BlockSwapColsFn,
@@ -4886,6 +4888,11 @@ mod tests {
                 .get::<LdltAppSolveFn>(b"spral_kernel_ldlt_app_solve_bwd\0")
                 .map_err(|error| format!("failed to load ldlt_app_solve_bwd shim: {error}"))?
         };
+        let align_lda_double = unsafe {
+            *library
+                .get::<AlignLdaFn>(b"spral_kernel_align_lda_double\0")
+                .map_err(|error| format!("failed to load align_lda<double> shim: {error}"))?
+        };
         let block_update_1x1_32 = unsafe {
             *library
                 .get::<BlockUpdate1x1Fn>(b"spral_kernel_block_update_1x1_32\0")
@@ -4947,6 +4954,7 @@ mod tests {
             ldlt_app_solve_fwd,
             ldlt_app_solve_diag,
             ldlt_app_solve_bwd,
+            align_lda_double,
             block_update_1x1_32,
             block_update_2x2_32,
             block_swap_cols_32,
@@ -5004,6 +5012,7 @@ mod tests {
     fn native_kernel_shim_source() -> &'static str {
         r#"
 #include "ssids/cpu/kernels/common.hxx"
+#include "ssids/cpu/cpu_iface.hxx"
 #include "ssids/cpu/kernels/block_ldlt.hxx"
 #include "ssids/cpu/kernels/ldlt_app.hxx"
 #include "ssids/cpu/kernels/wrappers.hxx"
@@ -5090,6 +5099,10 @@ extern "C" void spral_kernel_ldlt_app_solve_bwd(
       int m, int n, const double* l, int ldl, int nrhs, double* x, int ldx) {
    spral::ssids::cpu::ldlt_app_solve_bwd<double>(
          m, n, l, ldl, nrhs, x, ldx);
+}
+
+extern "C" int spral_kernel_align_lda_double(int lda) {
+   return static_cast<int>(spral::ssids::cpu::align_lda<double>(lda));
 }
 
 extern "C" void spral_kernel_block_ldlt_32(
@@ -5923,6 +5936,15 @@ extern "C" int spral_kernel_block_prefix_trace_32(
                 case.rows as c_int,
             );
         }
+    }
+
+    fn native_aligned_double_stride(shim: &NativeKernelShim, rows: usize) -> usize {
+        let stride = unsafe { (shim.align_lda_double)(rows as c_int) };
+        assert!(
+            stride >= 0,
+            "native align_lda<double> returned negative stride {stride}"
+        );
+        stride as usize
     }
 
     fn native_block_update_1x1_32(
@@ -8368,6 +8390,24 @@ extern "C" int spral_kernel_block_prefix_trace_32(
         strided
     }
 
+    fn rust_inverse_diagonal_entries(factor: &super::NumericFactor) -> Vec<[f64; 2]> {
+        let mut entries = Vec::with_capacity(factor.dimension);
+        for (block, values) in factor
+            .diagonal_blocks
+            .iter()
+            .zip(factor.diagonal_values.chunks_exact(4))
+        {
+            if block.size == 1 {
+                entries.push([values[0], 0.0]);
+            } else {
+                debug_assert_eq!(block.size, 2);
+                entries.push([values[0], values[1]]);
+                entries.push([values[3], 0.0]);
+            }
+        }
+        entries
+    }
+
     #[test]
     fn app_block_ldlt_32_prefix_trace_matches_native_dense_seed6() {
         let Some(shim) = native_kernel_shim_or_skip() else {
@@ -8386,7 +8426,7 @@ extern "C" int spral_kernel_block_prefix_trace_32(
             return;
         };
         let (dimension, lower_dense) = lower_dense_seed6_33();
-        let aligned_stride = 40;
+        let aligned_stride = native_aligned_double_stride(shim, dimension);
         let aligned_lower_dense =
             copy_lower_dense_to_stride(&lower_dense, dimension, aligned_stride);
         let options = NumericFactorOptions::default();
@@ -8433,5 +8473,90 @@ extern "C" int spral_kernel_block_prefix_trace_32(
                 );
             }
         }
+    }
+
+    #[test]
+    fn dense_seed6_production_factor_metadata_matches_native() {
+        let Ok(native) = NativeSpral::load() else {
+            return;
+        };
+        let (dimension, dense) = dense_seed6_33_matrix();
+        let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+        let matrix = SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
+            .expect("valid CSC");
+        let options = NumericFactorOptions::default();
+
+        let (symbolic, _) = analyse(
+            matrix,
+            &SsidsOptions {
+                ordering: OrderingStrategy::Natural,
+            },
+        )
+        .expect("rust analyse");
+        let (rust_factor, _) = factorize(matrix, &symbolic, &options).expect("rust factorize");
+
+        let mut native_session = native
+            .analyse_with_options_and_ordering(matrix, &options, NativeOrdering::Natural)
+            .expect("native analyse");
+        let native_info = native_session.factorize(matrix).expect("native factorize");
+        let native_enquiry = native_session.enquire_indef().expect("native enquire");
+        let mut native_factor_order = vec![usize::MAX; native_enquiry.pivot_order.len()];
+        for (column, &pivot_position) in native_enquiry.pivot_order.iter().enumerate() {
+            native_factor_order[pivot_position] = column;
+        }
+
+        assert_eq!(rust_factor.inertia(), native_info.inertia);
+        assert_eq!(
+            rust_factor.pivot_stats().two_by_two_pivots,
+            native_info.two_by_two_pivots
+        );
+        assert_eq!(
+            rust_factor.pivot_stats().delayed_pivots,
+            native_info.delayed_pivots
+        );
+        assert_eq!(rust_factor.factor_order, native_factor_order);
+    }
+
+    #[test]
+    #[ignore = "manual exact production inverse-D bit mismatch witness after factor metadata parity"]
+    fn dense_seed6_production_inverse_d_matches_native() {
+        let Ok(native) = NativeSpral::load() else {
+            return;
+        };
+        let (dimension, dense) = dense_seed6_33_matrix();
+        let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+        let matrix = SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
+            .expect("valid CSC");
+        let options = NumericFactorOptions::default();
+
+        let (symbolic, _) = analyse(
+            matrix,
+            &SsidsOptions {
+                ordering: OrderingStrategy::Natural,
+            },
+        )
+        .expect("rust analyse");
+        let (rust_factor, _) = factorize(matrix, &symbolic, &options).expect("rust factorize");
+
+        let mut native_session = native
+            .analyse_with_options_and_ordering(matrix, &options, NativeOrdering::Natural)
+            .expect("native analyse");
+        native_session.factorize(matrix).expect("native factorize");
+        let native_enquiry = native_session.enquire_indef().expect("native enquire");
+
+        assert_eq!(
+            rust_inverse_diagonal_entries(&rust_factor)
+                .iter()
+                .flatten()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            native_enquiry
+                .inverse_diagonal_entries
+                .iter()
+                .flatten()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "production inverse-D bit patterns differ on seed6 dense APP boundary"
+        );
     }
 }
