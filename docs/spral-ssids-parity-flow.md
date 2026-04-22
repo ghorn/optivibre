@@ -67,6 +67,24 @@ is row 31, col 28: Rust/source-tail `0x3f66e35ec7827340` versus native full
 block `0x3f66e35ec782734a`. This keeps block storage colored partial while the
 seed6 full solution node is newly green.
 
+Current newly narrowed seed1001 witness:
+`dense_seed1001_production_inverse_d_diverges_before_solve` shows the active
+33x33 seed1001 solution failure is already present in production inverse-D, not
+introduced by the solve phase. Factor outcome, inertia, pivot counts, and pivot
+order match native; the first inverse-D mismatch is flattened index 20, i.e.
+pivot 10 component 0: Rust `0xbf66e810015a444c` versus native
+`0xbf66e810015a444d`.
+`dense_seed1001_app_block_storage_diverges_at_native_pivot10_continuation`
+then pins that same one-ulp D gap inside the first native `block_ldlt<32>` APP
+panel. Re-entering native from the prefix trace first differs at `step=5,
+from=10, status=2, next=12`, diagonal index 20 with continued
+`0xbf66e810015a444c` versus full native block `0xbf66e810015a444d`; the first
+final L-storage gap is row 12, col 10 with Rust `0xbfd674b14783386b` versus
+native `0xbfd674b14783386c`. The source anchor is SPRAL
+`target/native/spral-upstream/src/ssids/cpu/kernels/block_ldlt.hxx`
+`block_ldlt<T, BLOCK_SIZE>`, reached from
+`target/native/spral-upstream/src/ssids/cpu/kernels/ldlt_app.cxx`.
+
 Previous newly narrowed solve-lane witness:
 `dense_seed6_final_app_pivot_source_expression_matches_native_block` now
 reconstructs the final seed6 2x2 APP pivot multiplier from the native prefix
@@ -385,10 +403,15 @@ flowchart TD
     K4j --> K4k["Dense seed09 inverse-D mismatch map is empty"]
     K4k --> K4b["Dense APP case0 full inverse-D bits"]
     K4b --> K4["Dense APP boundary case0 solution bits"]
+    K --> K5a["Dense seed1001 APP prefix trace reaches pivot19 scalar-tail boundary"]
+    K5a --> K5b["Dense seed1001 native APP continuation D gap at pivot10"]
+    K5b --> K5c["Dense seed1001 production inverse-D first gap"]
+    K5c --> K5["Dense seed1001 solution bits"]
     J --> K
     K1 --> L{"More fronts?"}
     K3 --> L
     K4 --> L
+    K5 --> L
     L -->|"yes"| D
     L -->|"no"| M["Report inertia + pivot stats"]
 
@@ -402,6 +425,7 @@ flowchart TD
     P --> R
     R --> S["Full production solution bit patterns"]
     K3a --> S
+    K5 --> S
 
     classDef match fill:#dff7df,stroke:#2f8f46,color:#102615,stroke-width:2px;
     classDef newly fill:#fff4b8,stroke:#b88a00,color:#2a2100,stroke-width:3px;
@@ -428,7 +452,8 @@ flowchart TD
     class K3b,K3c newlyPartial;
     class K3a,K3d newly;
     class K4l newly;
+    class K5a,K5b,K5c newlyPartial;
     class G8c,G8d,G9a,I00,I0,I0a,I1,I2,I3,K2,K3,K4a,K4c,K4d,K4e,K4f,K4g,K4h,K4i match;
     class K4b,K4 newly;
-    class S open;
+    class K5,S open;
 ```

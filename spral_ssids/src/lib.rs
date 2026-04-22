@@ -9363,6 +9363,22 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         (dimension, matrix, solution)
     }
 
+    fn dense_seed1001_33_matrix() -> (usize, Vec<Vec<f64>>) {
+        let mut rng = DenseBoundaryRng::new(0x1001);
+        let dimension = rng.usize_inclusive(33, 33);
+        assert_eq!(dimension, 33);
+        (dimension, random_dense_dyadic_matrix(dimension, &mut rng))
+    }
+
+    fn dense_seed1001_33_matrix_and_solution() -> (usize, Vec<Vec<f64>>, Vec<f64>) {
+        let mut rng = DenseBoundaryRng::new(0x1001);
+        let dimension = rng.usize_inclusive(33, 33);
+        assert_eq!(dimension, 33);
+        let matrix = random_dense_dyadic_matrix(dimension, &mut rng);
+        let solution = random_dyadic_solution(dimension, &mut rng);
+        (dimension, matrix, solution)
+    }
+
     fn dense_seed09_case0_matrix() -> (usize, Vec<Vec<f64>>) {
         let mut rng = DenseBoundaryRng::new(0x09c9_134e_4eff_0004);
         let dimension = rng.usize_inclusive(33, 160);
@@ -9372,6 +9388,17 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
 
     fn lower_dense_seed6_33() -> (usize, Vec<f64>) {
         let (dimension, dense) = dense_seed6_33_matrix();
+        let mut lower_dense = vec![0.0; dimension * dimension];
+        for col in 0..dimension {
+            for row in col..dimension {
+                lower_dense[dense_lower_offset(dimension, row, col)] = dense[row][col];
+            }
+        }
+        (dimension, lower_dense)
+    }
+
+    fn lower_dense_seed1001_33() -> (usize, Vec<f64>) {
+        let (dimension, dense) = dense_seed1001_33_matrix();
         let mut lower_dense = vec![0.0; dimension * dimension];
         for col in 0..dimension {
             for row in col..dimension {
@@ -9508,6 +9535,115 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
                 native_bits: 0xbf81_6117_c4f8_272d,
             }),
             "dense seed6 aligned APP prefix trace boundary moved"
+        );
+    }
+
+    #[test]
+    fn app_block_ldlt_32_prefix_trace_matches_native_dense_seed1001_until_pivot19_scalar_tail() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let (dimension, lower_dense) = lower_dense_seed1001_33();
+        let native_lda = native_aligned_double_stride(shim, dimension);
+        let options = NumericFactorOptions::default();
+        let rust_trace = rust_app_block_prefix_trace_32(&lower_dense, dimension, options);
+        let native_trace =
+            native_block_prefix_trace_32(shim, &lower_dense, dimension, native_lda, options);
+        assert_eq!(
+            first_block_prefix_trace_mismatch(&rust_trace, &native_trace),
+            Some(BlockPrefixTraceMismatch {
+                step: 10,
+                from: 19,
+                status: 2,
+                next: 21,
+                component: "matrix",
+                index: 1011,
+                row: 31,
+                col: 19,
+                rust_bits: 0xbf88_7752_e268_8fa1,
+                native_bits: 0xbf88_7752_e268_8fa2,
+            }),
+            "dense seed1001 APP prefix trace boundary moved"
+        );
+    }
+
+    #[test]
+    fn dense_seed1001_app_block_storage_diverges_at_native_pivot10_continuation() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let (dimension, lower_dense) = lower_dense_seed1001_33();
+        let options = NumericFactorOptions::default();
+        let native_lda = native_aligned_double_stride(shim, dimension);
+
+        let rust = rust_block_ldlt_32_from_lower_dense(&lower_dense, dimension, options);
+        let native = native_block_ldlt_32_from_lower_dense(
+            shim,
+            &lower_dense,
+            dimension,
+            native_lda,
+            options,
+        );
+        assert_eq!(rust.perm, native.perm);
+        assert_eq!(rust.local_perm, native.local_perm);
+        let first_diagonal_mismatch = rust
+            .diagonal
+            .iter()
+            .zip(&native.diagonal)
+            .enumerate()
+            .find_map(|(index, (&rust_value, &native_value))| {
+                (rust_value.to_bits() != native_value.to_bits()).then_some((
+                    index,
+                    rust_value.to_bits(),
+                    native_value.to_bits(),
+                ))
+            });
+        assert_eq!(
+            first_diagonal_mismatch,
+            Some((20, 0xbf66_e810_015a_444c, 0xbf66_e810_015a_444d)),
+            "dense seed1001 APP block D boundary moved"
+        );
+
+        let native_trace =
+            native_block_prefix_trace_32(shim, &lower_dense, dimension, native_lda, options);
+        assert_eq!(
+            first_native_block_continuation_mismatch(
+                shim,
+                &native_trace,
+                &native,
+                native_lda,
+                options,
+            ),
+            Some(BlockContinuationMismatch {
+                step: 5,
+                from: 10,
+                status: 2,
+                next: 12,
+                component: "diagonal",
+                index: 20,
+                row: 0,
+                col: 0,
+                continued_bits: 0xbf66_e810_015a_444c,
+                block_bits: 0xbf66_e810_015a_444d,
+            }),
+            "dense seed1001 native APP continuation boundary moved"
+        );
+
+        let mut first_matrix_mismatch = None;
+        'matrix_compare: for col in 0..APP_INNER_BLOCK_SIZE {
+            for row in col..APP_INNER_BLOCK_SIZE {
+                let rust_bits = rust.matrix[col * dimension + row].to_bits();
+                let native_bits = native.matrix[col * native_lda + row].to_bits();
+                if rust_bits != native_bits {
+                    first_matrix_mismatch = Some((row, col, rust_bits, native_bits));
+                    break 'matrix_compare;
+                }
+            }
+        }
+        assert_eq!(
+            first_matrix_mismatch,
+            Some((12, 10, 0xbfd6_74b1_4783_386b, 0xbfd6_74b1_4783_386c)),
+            "dense seed1001 APP block L-storage boundary moved"
         );
     }
 
@@ -9925,6 +10061,64 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         assert_eq!(
             rust_bits, native_bits,
             "seed6 solution bits should match after scalar-tail APP multiplier"
+        );
+    }
+
+    #[test]
+    fn dense_seed1001_production_inverse_d_diverges_before_solve() {
+        let Some(native) = native_spral_or_skip() else {
+            return;
+        };
+        let (dimension, dense, _expected_solution) = dense_seed1001_33_matrix_and_solution();
+        let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+        let matrix = SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
+            .expect("valid CSC");
+        let options = NumericFactorOptions::default();
+
+        let (symbolic, _) = analyse(
+            matrix,
+            &SsidsOptions {
+                ordering: OrderingStrategy::Natural,
+            },
+        )
+        .expect("rust analyse");
+        let (rust_factor, _) = factorize(matrix, &symbolic, &options).expect("rust factorize");
+
+        let mut native_session = native
+            .analyse_with_options_and_ordering(matrix, &options, NativeOrdering::Natural)
+            .expect("native analyse");
+        let native_info = native_session.factorize(matrix).expect("native factorize");
+        let native_enquiry = native_session.enquire_indef().expect("native enquire");
+        let mut native_factor_order = vec![usize::MAX; native_enquiry.pivot_order.len()];
+        for (column, &pivot_position) in native_enquiry.pivot_order.iter().enumerate() {
+            native_factor_order[pivot_position] = column;
+        }
+
+        assert_eq!(rust_factor.inertia(), native_info.inertia);
+        assert_eq!(
+            rust_factor.pivot_stats().two_by_two_pivots,
+            native_info.two_by_two_pivots
+        );
+        assert_eq!(
+            rust_factor.pivot_stats().delayed_pivots,
+            native_info.delayed_pivots
+        );
+        assert_eq!(rust_factor.factor_order, native_factor_order);
+
+        let rust_d_bits = inverse_diagonal_bits(&rust_inverse_diagonal_entries(&rust_factor));
+        let native_d_bits = inverse_diagonal_bits(&native_enquiry.inverse_diagonal_entries);
+        assert_eq!(
+            rust_d_bits
+                .iter()
+                .zip(&native_d_bits)
+                .position(|(rust, native)| rust != native),
+            Some(20),
+            "dense seed1001 first production inverse-D mismatch moved"
+        );
+        assert_eq!(
+            (rust_d_bits[20], native_d_bits[20]),
+            (0xbf66_e810_015a_444c, 0xbf66_e810_015a_444d),
+            "dense seed1001 production inverse-D mismatch bits moved"
         );
     }
 
