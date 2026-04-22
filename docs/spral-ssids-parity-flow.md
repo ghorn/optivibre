@@ -8,6 +8,14 @@ nodes are newly passing guards that narrow an open mismatch without proving full
 bitwise parity. Red nodes are the next open bitwise mismatch target.
 
 Current newly passing witness:
+`dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now pins the
+dense seed09 first APP a-posteriori threshold boundary against
+`target/native/spral-upstream/src/ssids/cpu/kernels/ldlt_app.cxx`'s
+`check_threshold<OP_N>` loop. After the bitwise-matching `apply_pivot<OP_N>`
+result, Rust and the source-shaped C++ shim agree on the accepted pass count,
+so the first APP block is not drifting through threshold-boundary selection.
+
+Previous newly passing witness:
 `app_block_ldlt_32_aligned_prefix_trace_matches_native_dense_seed09_case0`
 pins the dense seed09 first APP diagonal block against native
 `target/native/spral-upstream/src/ssids/cpu/kernels/block_ldlt.hxx` at the
@@ -130,7 +138,8 @@ flowchart TD
     G5 --> I00["Dense seed09 first APP block_ldlt trace"]
     G9 --> I00
     I00 --> I0["Dense seed09 APP-stride apply_pivot OP_N L block"]
-    I0 --> I["APP accepted-prefix update"]
+    I0 --> I0a["Dense seed09 APP check_threshold OP_N pass count"]
+    I0a --> I["APP accepted-prefix update"]
     G10 --> J["Record delayed pivots"]
     H --> I
 
@@ -174,10 +183,10 @@ flowchart TD
     classDef open fill:#ffd8d8,stroke:#b43b3b,color:#2b0d0d,stroke-width:2px;
 
     class A,B,B1,B2,B3,G0,G1,G3,G5,G6,G8,G8a,G8b,G9,H1,H2,H3,K1,M,O,P,Q,R match;
-    class I00 newly;
+    class I0a newly;
     class K4j match;
     class K4k partial;
     class C,D,E,F,G,G2,G4,G7,G10,H,I,J,K,L,N partial;
-    class G8c,G8d,G9a,I0,I1,I2,I3,K2,K3,K4a,K4c,K4d,K4e,K4f,K4g,K4h,K4i match;
+    class G8c,G8d,G9a,I00,I0,I1,I2,I3,K2,K3,K4a,K4c,K4d,K4e,K4f,K4g,K4h,K4i match;
     class K4b,K4 open;
 ```

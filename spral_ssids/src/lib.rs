@@ -4722,6 +4722,8 @@ mod tests {
 
     type ApplyPivotOpNFn =
         unsafe extern "C" fn(c_int, c_int, *const f64, *const f64, f64, *mut f64, c_int);
+    type CheckThresholdOpNFn =
+        unsafe extern "C" fn(c_int, c_int, c_int, c_int, f64, *mut f64, c_int) -> c_int;
     type CalcLdOpNFn =
         unsafe extern "C" fn(c_int, c_int, *const f64, c_int, *const f64, *mut f64, c_int);
     type HostTrsmRightLowerTransUnitFn =
@@ -4819,6 +4821,7 @@ mod tests {
         _libspral: Library,
         _library: Library,
         apply_pivot_op_n: ApplyPivotOpNFn,
+        check_threshold_op_n: CheckThresholdOpNFn,
         calc_ld_op_n: CalcLdOpNFn,
         host_trsm_right_lower_trans_unit: HostTrsmRightLowerTransUnitFn,
         host_trsv_lower_unit_op_n: HostTrsvLowerUnitFn,
@@ -4960,6 +4963,11 @@ mod tests {
                 .get::<ApplyPivotOpNFn>(b"spral_kernel_apply_pivot_op_n\0")
                 .map_err(|error| format!("failed to load apply_pivot OP_N shim: {error}"))?
         };
+        let check_threshold_op_n = unsafe {
+            *library
+                .get::<CheckThresholdOpNFn>(b"spral_kernel_check_threshold_op_n\0")
+                .map_err(|error| format!("failed to load check_threshold OP_N shim: {error}"))?
+        };
         let calc_ld_op_n = unsafe {
             *library
                 .get::<CalcLdOpNFn>(b"spral_kernel_calc_ld_op_n\0")
@@ -5082,6 +5090,7 @@ mod tests {
             _libspral: libspral_library,
             _library: library,
             apply_pivot_op_n,
+            check_threshold_op_n,
             calc_ld_op_n,
             host_trsm_right_lower_trans_unit,
             host_trsv_lower_unit_op_n,
@@ -5173,6 +5182,16 @@ extern "C" void spral_kernel_apply_pivot_op_n(
       double small, double* aval, int lda) {
    spral::ssids::cpu::ldlt_app_internal::apply_pivot<spral::ssids::cpu::OP_N, double>(
          m, n, 0, diag, d, small, aval, lda);
+}
+
+extern "C" int spral_kernel_check_threshold_op_n(
+      int rfrom, int rto, int cfrom, int cto, double u, double* aval, int lda) {
+   // Mirrors ldlt_app.cxx::check_threshold<OP_N>.
+   for(int j=cfrom; j<cto; j++)
+   for(int i=rfrom; i<rto; i++)
+      if(fabs(aval[j*lda+i]) > 1.0/u)
+         return j;
+   return cto;
 }
 
 extern "C" void spral_kernel_calc_ld_op_n(
@@ -6055,6 +6074,28 @@ extern "C" int spral_kernel_block_prefix_trace_32(
                 matrix.as_mut_ptr().add(aval_offset),
                 case.size as c_int,
             );
+        }
+    }
+
+    fn native_check_threshold_op_n(
+        shim: &NativeKernelShim,
+        rows: usize,
+        cols: usize,
+        threshold_pivot_u: f64,
+        matrix: &mut [f64],
+        offset: usize,
+        stride: usize,
+    ) -> usize {
+        unsafe {
+            (shim.check_threshold_op_n)(
+                0,
+                rows as c_int,
+                0,
+                cols as c_int,
+                threshold_pivot_u,
+                matrix.as_mut_ptr().add(offset),
+                stride as c_int,
+            ) as usize
         }
     }
 
@@ -9547,6 +9588,7 @@ extern "C" int spral_kernel_block_prefix_trace_32(
             block_pivot += 2;
         }
 
+        let dense_before_apply = lower_dense.clone();
         app_apply_block_pivots_to_trailing_rows(
             &mut lower_dense,
             dimension,
@@ -9572,10 +9614,11 @@ extern "C" int spral_kernel_block_prefix_trace_32(
         let mut native_apply_matrix = vec![0.0; block_end * native_lda];
         for col in block_start..block_end {
             for row in col..dimension {
-                native_apply_matrix[col * native_lda + row] = lower_dense[col * dimension + row];
+                native_apply_matrix[col * native_lda + row] =
+                    dense_before_apply[col * dimension + row];
             }
         }
-        let mut rust_apply_matrix = lower_dense.clone();
+        let mut rust_apply_matrix = dense_before_apply.clone();
         app_apply_block_pivots_to_trailing_rows(
             &mut rust_apply_matrix,
             dimension,
@@ -9608,6 +9651,20 @@ extern "C" int spral_kernel_block_prefix_trace_32(
                 );
             }
         }
+        let native_passed = native_check_threshold_op_n(
+            shim,
+            dimension - block_end,
+            block_end - block_start,
+            options.threshold_pivot_u,
+            &mut native_apply_matrix,
+            block_end,
+            native_lda,
+        );
+        assert_eq!(
+            native_passed,
+            first_failed - block_start,
+            "dense seed09 APP a-posteriori threshold boundary mismatch"
+        );
 
         app_restore_trailing_from_block_backup(
             &rows,
