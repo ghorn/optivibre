@@ -2316,8 +2316,10 @@ fn factor_two_by_two_common(
         let b2 = matrix[dense_lower_offset(size, row, pivot + 1)];
         first_scratch[row] = b1;
         second_scratch[row] = b2;
-        let l1 = inv11 * b1 + inv12 * b2;
-        let l2 = inv12 * b1 + inv22 * b2;
+        // The local optimized block_ldlt<32> build contracts
+        // block_ldlt.hxx's d11*b1 + d21*b2 multiplier as fma(d21, b2, d11*b1).
+        let l1 = inv12.mul_add(b2, inv11 * b1);
+        let l2 = inv22.mul_add(b2, inv12 * b1);
         if !l1.is_finite() || !l2.is_finite() {
             return Err(SsidsError::NumericalBreakdown {
                 pivot: rows[pivot],
@@ -5114,6 +5116,7 @@ mod tests {
 #include "ssids/cpu/kernels/ldlt_app.hxx"
 #include "ssids/cpu/kernels/ldlt_tpp.hxx"
 #include "ssids/cpu/kernels/wrappers.hxx"
+#include <cmath>
 
 namespace spral { namespace ssids { namespace cpu {
 template <enum operation op, typename T>
@@ -5257,8 +5260,8 @@ extern "C" int spral_kernel_block_test_2x2(
 extern "C" void spral_kernel_block_two_by_two_multipliers(
       double d11, double d21, double d22, double work0, double work1,
       double* out) {
-   out[0] = d11*work0 + d21*work1;
-   out[1] = d21*work0 + d22*work1;
+   out[0] = std::fma(d21, work1, d11*work0);
+   out[1] = std::fma(d22, work1, d21*work0);
 }
 
 extern "C" int spral_kernel_block_first_step_32(
@@ -5336,8 +5339,8 @@ extern "C" int spral_kernel_block_first_step_32(
       for(int r=p+2; r<32; r++) {
          work[r] = a[p*lda+r];
          work[32+r] = a[(p+1)*lda+r];
-         a[p*lda+r] = d11*work[r] + d21*work[32+r];
-         a[(p+1)*lda+r] = d21*work[r] + d22*work[32+r];
+         a[p*lda+r] = std::fma(d21, work[32+r], d11*work[r]);
+         a[(p+1)*lda+r] = std::fma(d22, work[32+r], d21*work[r]);
       }
       update_2x2<double, 32>(p, a, lda, work);
       d[2*p] = d11;
@@ -5474,8 +5477,8 @@ extern "C" int spral_kernel_block_prefix_trace_32(
          for(int r=p+2; r<32; r++) {
             work[r] = a[p*lda+r];
             work[32+r] = a[(p+1)*lda+r];
-            a[p*lda+r] = d11*work[r] + d21*work[32+r];
-            a[(p+1)*lda+r] = d21*work[r] + d22*work[32+r];
+            a[p*lda+r] = std::fma(d21, work[32+r], d11*work[r]);
+            a[(p+1)*lda+r] = std::fma(d22, work[32+r], d21*work[r]);
          }
          update_2x2<double, 32>(p, a, lda, work);
          d[2*p] = d11;
@@ -8927,7 +8930,6 @@ extern "C" int spral_kernel_block_prefix_trace_32(
         let rust = rust_block_ldlt_32_from_lower_dense(&lower_dense, dimension, options);
         let native =
             native_block_ldlt_32_from_lower_dense(shim, &lower_dense, dimension, 34, options);
-
         assert_eq!(rust.perm, native.perm);
         assert_eq!(rust.local_perm, native.local_perm);
         for (index, (&rust_value, &native_value)) in
@@ -9025,12 +9027,12 @@ extern "C" int spral_kernel_block_prefix_trace_32(
         let native_bits = inverse_diagonal_bits(&native_enquiry.inverse_diagonal_entries);
 
         // The full inverse-D witness below currently first differs at flattened
-        // index 12. Keep the six-pivot APP accepted prefix exact while the TPP
-        // tail transition is under investigation.
-        assert_eq!(&rust_bits[..12], &native_bits[..12]);
+        // index 20. Keep the optimized APP block_ldlt prefix exact while the
+        // remaining APP update contractions are under investigation.
+        assert_eq!(&rust_bits[..20], &native_bits[..20]);
         assert_ne!(
-            rust_bits[12], native_bits[12],
-            "seed6 no longer differs at the first TPP-tail inverse-D entry; promote the full witness"
+            rust_bits[20], native_bits[20],
+            "seed6 no longer differs at the current APP inverse-D boundary; promote the full witness"
         );
     }
 

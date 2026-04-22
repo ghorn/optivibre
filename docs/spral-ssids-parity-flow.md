@@ -6,13 +6,11 @@ newly passing in the current checkpoint. Orange nodes have partial coverage or a
 known narrowed boundary. Red nodes are the next open bitwise mismatch target.
 
 Current newly passing witness:
-`app_calc_ld_op_n_matches_native_kernel_full_property_cases` is now active and
-proves native `calcLD<OP_N>` bitwise parity across the signed-zero 1x1/2x2 APP
-property set. This pins the
-`target/native/spral-upstream/src/ssids/cpu/kernels/calc_ld.hxx` postprocess
-primitive, including the local binary's two-lane vector body and scalar tail
-split. The production red node is still
-`dense_seed6_production_inverse_d_matches_native`.
+`dense_seed6_production_app_prefix_inverse_d_matches_native` now pins the
+optimized native `block_ldlt<32>` APP prefix through flattened inverse-D index
+20. This checkpoint matches the local `block_ldlt.hxx` build's contracted 2x2
+multiplier rows, moving the production red boundary from index 12 to index 20.
+The full production witness is still `dense_seed6_production_inverse_d_matches_native`.
 
 ```mermaid
 flowchart TD
@@ -45,7 +43,8 @@ flowchart TD
     G2 -->|"2x2"| G6["test_2x2"]
     G6 --> G7["swap_cols twice"]
     G7 --> G8["compute 2x2 inverse / multipliers"]
-    G8 --> G8a["calcLD OP_N 2x2 vector row"]
+    G8 --> G8c["block_ldlt optimized 2x2 multiplier contraction"]
+    G8c --> G8a["calcLD OP_N 2x2 vector row"]
     G8a --> G8b["calcLD OP_N vector/scalar row split"]
     G8b --> G9["update_2x2 trailing block"]
 
@@ -77,8 +76,8 @@ flowchart TD
     classDef partial fill:#ffe3bf,stroke:#b76d12,color:#2b1800,stroke-width:2px;
     classDef open fill:#ffd8d8,stroke:#b43b3b,color:#2b0d0d,stroke-width:2px;
 
-    class A,B,B1,B2,B3,G0,G1,G3,G5,G6,G8,G8a,G9,H1,H2,H3,K1,K2,M,O,P,Q,R match;
-    class G8b newly;
+    class A,B,B1,B2,B3,G0,G1,G3,G5,G6,G8,G8a,G8b,G9,H1,H2,H3,K1,M,O,P,Q,R match;
+    class G8c,K2 newly;
     class C,D,E,F,G,G2,G4,G7,G10,H,I,J,K,L,N partial;
     class K3 open;
 ```
