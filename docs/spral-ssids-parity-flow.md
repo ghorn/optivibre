@@ -31,7 +31,14 @@ path used by SPRAL, not another local scalar sign heuristic. The relevant
 source anchors are `target/native/spral-upstream/src/ssids/cpu/kernels/wrappers.cxx`
 `host_trsm`, `target/native/spral-upstream/src/ssids/cpu/kernels/ldlt_app.cxx`
 `apply_pivot<OP_N>`, and OpenBLAS `driver/level3/trsm_R.c` plus its
-`TRSM_KERNEL_RT` and `TRSM_OLTCOPY` specializations.
+`TRSM_KERNEL_RN` and `TRSM_OLTCOPY` specializations. For SPRAL's
+`host_trsm(SIDE_RIGHT, FILL_MODE_LWR, OP_T, DIAG_UNIT)`, OpenBLAS dispatches
+to `DTRSM_RTLU`; `driver/level3/trsm_R.c` maps that real, transposed-lower,
+right-side case to the RN microkernel. The generic RN solve walks columns
+forward and updates later packed columns, which source-backs the current Rust
+forward in-block order. The unresolved mismatch is therefore the OpenBLAS
+packed-buffer zero-sign policy across `TRSM_OLTCOPY` plus the RN kernel, not
+the high-level triangular-solve direction.
 
 Previous newly narrowed witness:
 `app_apply_pivot_and_host_trsm_signed_zero_boundaries_are_complementary` pins a
@@ -310,7 +317,7 @@ flowchart TD
     G9 --> I00
     I00 --> I0["Dense seed09 APP-stride apply_pivot OP_N L block"]
     I0 --> I0z["APP host_trsm/apply_pivot signed-zero boundary"]
-    I0z --> I0zz["OpenBLAS dtrsm packing/kernel sign policy"]
+    I0z --> I0zz["OpenBLAS dtrsm OLTCOPY/RN zero-sign policy"]
     I0zz --> I0a["Dense seed09 APP check_threshold OP_N pass count"]
     I0a --> I0p["Dense seed09 source-shaped APP pre-apply trailing operands"]
     I0p --> I0r["Dense seed09 production-vs-aligned Rust APP diagonal block"]
