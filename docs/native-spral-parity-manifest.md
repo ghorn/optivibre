@@ -48,6 +48,7 @@ present, only diagnostics and exact regression promotion are allowed.
 | APP/TPP pivot choice, delayed pivots, failed pivots | SPRAL SSIDS numeric factor source | None. Preserve the ladder: factorization outcome, inertia, pivot stats, solve outcome, solution bits. |
 | Dot/update/FMA order, signed zero, solve order | SPRAL SSIDS solve and update source | None for bitwise witnesses. |
 | Production forward solve traversal | `src/ssids/cpu/NumericSubtree.hxx::solve_fwd`, `src/ssids/cpu/kernels/ldlt_app.cxx::ldlt_app_solve_fwd` | None. Rust production solve must gather each front, apply the APP forward solve kernel, then scatter the full front-local RHS; global sparse forward substitutes are diagnostic only. |
+| Production diagonal/backward solve traversal | `src/ssids/fkeep.F90::inner_solve_cpu`, `src/ssids/cpu/NumericSubtree.hxx::solve_diag_bwd_inner<true,true>`, `src/ssids/cpu/kernels/ldlt_app.cxx::ldlt_app_solve_diag` / `ldlt_app_solve_bwd` | None. Full Rust production solves must use the native combined `diag_bwd` staging: gather a front-local RHS, apply front-local inverse-D blocks, apply the APP backward solve, then scatter eliminated rows. |
 | Inertia reporting | SPRAL SSIDS inform/enquiry source | None; compare reported inertia and native enquiry data before accepting solve-bit changes. |
 
 ## Supervisor Checklist

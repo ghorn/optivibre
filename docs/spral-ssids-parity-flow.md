@@ -50,18 +50,22 @@ Current newly narrowed solve-lane witness:
 seed6 production factor metadata, factor order, and inverse-D enquiry bits
 match native SPRAL before the solve. Rust production forward solve now mirrors
 SPRAL's `NumericSubtree.hxx::solve_fwd` traversal: gather front-local RHS, call
-the APP forward solve kernel, then scatter the full front-local RHS. The same
-seed6 RHS still has the original first solution bit mismatch at index 2: Rust
-`0x3fc000000000002a` versus native `0x3fc0000000000022`. That moves the seed6
-full-solver failure past forward traversal and into diagonal/backward solve
-arithmetic or production L storage. A source-spelled 2x2 diagonal solve
-experiment was also rejected: the local native `ldlt_app_solve_diag` kernel
-property matches the FMA-shaped Rust helper, and the source-spelled expression
-moved seed6's first solution mismatch earlier to index 0. The source anchors
-for the next read are SPRAL
-`target/native/spral-upstream/src/ssids/cpu/NumericSubtree.hxx::solve_diag_bwd_inner`
-and `target/native/spral-upstream/src/ssids/cpu/kernels/ldlt_app.cxx`
-`ldlt_app_solve_diag` / `ldlt_app_solve_bwd`.
+the APP forward solve kernel, then scatter the full front-local RHS. Rust
+production diagonal/backward solve now mirrors SPRAL's full-solve path through
+`fkeep.F90::inner_solve_cpu` and
+`NumericSubtree.hxx::solve_diag_bwd_inner<true,true>`: gather front-local RHS,
+apply front-local inverse-D blocks, call `ldlt_app_solve_bwd`, then scatter
+eliminated rows. The same seed6 RHS still has the original first solution bit
+mismatch at index 2: Rust `0x3fc000000000002a` versus native
+`0x3fc0000000000022`. That moves the seed6 full-solver failure past production
+front traversal staging and into APP backward arithmetic or production L
+storage. A source-spelled 2x2 diagonal solve experiment was also rejected: the
+local native `ldlt_app_solve_diag` kernel property matches the FMA-shaped Rust
+helper, and the source-spelled expression moved seed6's first solution mismatch
+earlier to index 0. The source anchors for the next read are SPRAL
+`target/native/spral-upstream/src/ssids/cpu/kernels/ldlt_app.cxx`
+`ldlt_app_solve_bwd` and the exact local-panel L storage handed to it by
+`target/native/spral-upstream/src/ssids/cpu/NumericSubtree.hxx`.
 
 Previous newly narrowed witness:
 `app_apply_pivot_and_host_trsm_signed_zero_boundaries_are_complementary` pins a
@@ -387,9 +391,11 @@ flowchart TD
     M --> N["Solve phase"]
     N --> O0["Production forward traversal uses NumericSubtree front panels"]
     O0 --> O["Forward triangular solve"]
-    O --> P["Block diagonal solve"]
-    P --> Q["Backward triangular solve"]
+    O --> O1["Production diag+bwd traversal uses NumericSubtree combined path"]
+    O1 --> P["Block diagonal solve"]
+    O1 --> Q["Backward triangular solve"]
     Q --> R["Individual solve kernel bit patterns"]
+    P --> R
     R --> S["Full production solution bit patterns"]
     K3a --> S
 
@@ -414,7 +420,7 @@ flowchart TD
     class K4j match;
     class K4k partial;
     class C,D,E,F,G,G2,G4,G7,G10,H,I,J,K,L,N partial;
-    class O0 newlyPartial;
+    class O0,O1 newlyPartial;
     class K3a newlyPartial;
     class K4l newlyPartial;
     class G8c,G8d,G9a,I00,I0,I0a,I1,I2,I3,K2,K3,K4a,K4c,K4d,K4e,K4f,K4g,K4h,K4i match;

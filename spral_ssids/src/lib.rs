@@ -755,70 +755,27 @@ impl NumericFactor {
                 .forward_substitution_time += started.elapsed();
         }
 
+        let diagonal_time_before = profile
+            .as_ref()
+            .map(|profile| profile.diagonal_solve_time)
+            .unwrap_or_default();
         let started = profile_enabled.then(Instant::now);
-        let diagonal_result = (|| {
-            let mut diagonal_start = 0;
-            for (block, values) in self
-                .diagonal_blocks
-                .iter()
-                .zip(self.diagonal_values.chunks_exact(4))
-            {
-                let start = diagonal_start;
-                let end = start + block.size;
-                if block.size == 1 {
-                    let inverse_diagonal =
-                        one_by_one_inverse_diagonal(&values[..2]).map_err(|detail| {
-                            SsidsError::NumericalBreakdown {
-                                pivot: start,
-                                detail,
-                            }
-                        })?;
-                    if !inverse_diagonal.is_finite() {
-                        return Err(SsidsError::NumericalBreakdown {
-                            pivot: start,
-                            detail: "diagonal pivot vanished during solve".into(),
-                        });
-                    }
-                    factor_rhs[start] *= inverse_diagonal;
-                } else if block.size == 2 {
-                    solve_two_by_two_block_in_place(values, &mut factor_rhs[start..end]).map_err(
-                        |detail| SsidsError::NumericalBreakdown {
-                            pivot: start,
-                            detail,
-                        },
-                    )?;
-                } else {
-                    return Err(SsidsError::NumericalBreakdown {
-                        pivot: start,
-                        detail: format!(
-                            "unexpected dense diagonal block of size {} in solve path",
-                            block.size
-                        ),
-                    });
-                }
-                diagonal_start = end;
-            }
-            Ok(())
-        })();
-        if let Some(started) = started {
-            profile
-                .as_mut()
-                .expect("profile exists when timing is enabled")
-                .diagonal_solve_time += started.elapsed();
-        }
-        diagonal_result?;
-
-        let started = profile_enabled.then(Instant::now);
-        solve_lower_transpose_front_panels_like_native(
+        solve_diagonal_and_lower_transpose_front_panels_like_native(
             &self.solve_panels,
+            &self.diagonal_blocks,
+            &self.diagonal_values,
             factor_rhs,
             profile.as_deref_mut(),
-        );
+        )?;
         if let Some(started) = started {
-            profile
+            let profile = profile
                 .as_mut()
-                .expect("profile exists when timing is enabled")
-                .backward_substitution_time += started.elapsed();
+                .expect("profile exists when timing is enabled");
+            let diagonal_elapsed = profile
+                .diagonal_solve_time
+                .saturating_sub(diagonal_time_before);
+            profile.backward_substitution_time +=
+                started.elapsed().saturating_sub(diagonal_elapsed);
         }
         if !factor_rhs.iter().all(|value| value.is_finite()) {
             return Err(SsidsError::NumericalBreakdown {
@@ -4323,18 +4280,102 @@ fn openblas_trsv_lower_unit_op_t_like_native(a: &[f64], lda: usize, x: &mut [f64
     }
 }
 
-// Mirrors SPRAL SSIDS CPU solve order in NumericSubtree.hxx and
-// kernels/ldlt_app.cxx: gather each front-local RHS, apply the dense APP
-// trailing GEMV update, run the unit-lower transposed triangular solve, then
-// scatter only the eliminated rows.
-fn solve_lower_transpose_front_panels_like_native(
+// Mirrors SPRAL SSIDS CPU solve order in NumericSubtree.hxx:
+// solve_diag_bwd_inner<true, true>() gathers a front-local RHS, applies the
+// front-local inverse-D blocks, runs ldlt_app_solve_bwd(), then scatters only
+// the eliminated rows. Full native solves call this combined path from
+// fkeep.F90::inner_solve_cpu for SSIDS_SOLVE_JOB_ALL.
+fn solve_diagonal_and_lower_transpose_front_panels_like_native(
     panels: &[SolvePanel],
+    diagonal_blocks: &[DiagonalBlock],
+    diagonal_values: &[f64],
     factor_rhs: &mut [f64],
     mut profile: Option<&mut SolveProfile>,
-) {
+) -> Result<(), SsidsError> {
+    if diagonal_values.len() != diagonal_blocks.len() * 4 {
+        return Err(SsidsError::NumericalBreakdown {
+            pivot: 0,
+            detail: "diagonal solve metadata has inconsistent block/value counts".into(),
+        });
+    }
+
+    let mut panel_offsets: Vec<usize> = Vec::with_capacity(panels.len() + 1);
+    panel_offsets.push(0);
+    for panel in panels {
+        let next = panel_offsets
+            .last()
+            .copied()
+            .unwrap_or(0)
+            .checked_add(panel.eliminated_len)
+            .ok_or_else(|| SsidsError::NumericalBreakdown {
+                pivot: factor_rhs.len().saturating_sub(1),
+                detail: "solve panel eliminated-length sum overflowed".into(),
+            })?;
+        panel_offsets.push(next);
+    }
+    let total_eliminated = panel_offsets.last().copied().unwrap_or(0);
+    if total_eliminated != factor_rhs.len() {
+        return Err(SsidsError::NumericalBreakdown {
+            pivot: total_eliminated.min(factor_rhs.len().saturating_sub(1)),
+            detail: format!(
+                "solve panels eliminate {total_eliminated} rows for a {}-row factor",
+                factor_rhs.len()
+            ),
+        });
+    }
+
+    let mut panel_block_ranges = Vec::with_capacity(panels.len());
+    let mut block_index = 0;
+    let mut block_start = 0;
+    for window in panel_offsets.windows(2) {
+        let panel_start = window[0];
+        let panel_end = window[1];
+        let first_block = block_index;
+        while block_start < panel_end {
+            let block =
+                diagonal_blocks
+                    .get(block_index)
+                    .ok_or_else(|| SsidsError::NumericalBreakdown {
+                        pivot: block_start,
+                        detail: "solve panel diagonal metadata ended early".into(),
+                    })?;
+            if block.size != 1 && block.size != 2 {
+                return Err(SsidsError::NumericalBreakdown {
+                    pivot: block_start,
+                    detail: format!(
+                        "unexpected dense diagonal block of size {} in solve path",
+                        block.size
+                    ),
+                });
+            }
+            let block_end = block_start + block.size;
+            if block_end > panel_end {
+                return Err(SsidsError::NumericalBreakdown {
+                    pivot: block_start,
+                    detail: "diagonal block crosses a native solve panel boundary".into(),
+                });
+            }
+            block_start = block_end;
+            block_index += 1;
+        }
+        if block_start != panel_end || panel_start > panel_end {
+            return Err(SsidsError::NumericalBreakdown {
+                pivot: panel_start,
+                detail: "solve panel diagonal block range is inconsistent".into(),
+            });
+        }
+        panel_block_ranges.push((first_block, block_index));
+    }
+    if block_index != diagonal_blocks.len() || block_start != factor_rhs.len() {
+        return Err(SsidsError::NumericalBreakdown {
+            pivot: block_start.min(factor_rhs.len().saturating_sub(1)),
+            detail: "diagonal solve metadata does not cover exactly the factor dimension".into(),
+        });
+    }
+
     let profile_enabled = profile.is_some();
     let mut local_rhs = Vec::new();
-    for panel in panels.iter().rev() {
+    for (panel_index, panel) in panels.iter().enumerate().rev() {
         let eliminated_len = panel.eliminated_len;
         let local_size = panel.row_positions.len();
         debug_assert!(eliminated_len <= local_size);
@@ -4343,6 +4384,50 @@ fn solve_lower_transpose_front_panels_like_native(
         local_rhs.resize(local_size, 0.0);
         for (local_row, &factor_position) in panel.row_positions.iter().enumerate() {
             local_rhs[local_row] = factor_rhs[factor_position];
+        }
+
+        let started = profile_enabled.then(Instant::now);
+        let (first_block, end_block) = panel_block_ranges[panel_index];
+        let mut local_start = 0;
+        for (block_index, &block) in diagonal_blocks
+            .iter()
+            .enumerate()
+            .take(end_block)
+            .skip(first_block)
+        {
+            let values_start = 4 * block_index;
+            let values = &diagonal_values[values_start..values_start + 4];
+            if block.size == 1 {
+                let inverse_diagonal =
+                    one_by_one_inverse_diagonal(&values[..2]).map_err(|detail| {
+                        SsidsError::NumericalBreakdown {
+                            pivot: panel_offsets[panel_index] + local_start,
+                            detail,
+                        }
+                    })?;
+                if !inverse_diagonal.is_finite() {
+                    return Err(SsidsError::NumericalBreakdown {
+                        pivot: panel_offsets[panel_index] + local_start,
+                        detail: "diagonal pivot vanished during solve".into(),
+                    });
+                }
+                local_rhs[local_start] *= inverse_diagonal;
+                local_start += 1;
+            } else {
+                let local_end = local_start + 2;
+                solve_two_by_two_block_in_place(values, &mut local_rhs[local_start..local_end])
+                    .map_err(|detail| SsidsError::NumericalBreakdown {
+                        pivot: panel_offsets[panel_index] + local_start,
+                        detail,
+                    })?;
+                local_start = local_end;
+            }
+        }
+        debug_assert_eq!(local_start, eliminated_len);
+        if let Some(profile) = profile.as_mut()
+            && let Some(started) = started
+        {
+            profile.diagonal_solve_time += started.elapsed();
         }
 
         if local_size > eliminated_len {
@@ -4386,6 +4471,8 @@ fn solve_lower_transpose_front_panels_like_native(
             factor_rhs[panel.row_positions[local_row]] = local_rhs[local_row];
         }
     }
+
+    Ok(())
 }
 
 fn openblas_dotu_like_contiguous(lhs: &[f64], rhs: &[f64]) -> f64 {
