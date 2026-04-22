@@ -110,11 +110,11 @@ impl SolveRequestContext {
         if matches!(self.solver_method, Some(SolverMethod::Nlip))
             && matches!(
                 self.nlip_linear_solver,
-                Some(InteriorPointLinearSolver::SpralSsids)
+                Some(InteriorPointLinearSolver::SsidsRs)
             )
         {
             Some((
-                "[NLIP] Preparing SPRAL sparse KKT analysis; the first warmed solve may pause before iteration 0.",
+                "[NLIP] Preparing SSIDS-RS sparse KKT analysis; the first warmed solve may pause before iteration 0.",
                 SolveLogLevel::Info,
             ))
         } else {
@@ -674,8 +674,8 @@ fn nlip_linear_solver_for_values(
     let value =
         control_value_for_semantic(problem, values, ControlSemantic::SolverNlipLinearSolver)?;
     match value.round() as i64 {
-        0 => Some(InteriorPointLinearSolver::SpralSsids),
-        1 => Some(InteriorPointLinearSolver::NativeSpralSsids),
+        0 => Some(InteriorPointLinearSolver::SsidsRs),
+        1 => Some(InteriorPointLinearSolver::SpralSrc),
         2 => Some(InteriorPointLinearSolver::SparseQdldl),
         3 => Some(InteriorPointLinearSolver::Auto),
         _ => None,

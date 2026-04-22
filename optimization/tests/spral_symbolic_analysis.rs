@@ -1,6 +1,6 @@
 use optimization::{CCS, CompiledNlpProblem};
 use sparse_validation::{SymmetricPatternMatrix, exact_symbolic_metrics};
-use spral_ssids::{OrderingStrategy, SsidsOptions, SymmetricCscMatrix, analyse};
+use ssids_rs::{OrderingStrategy, SsidsOptions, SymmetricCscMatrix, analyse};
 
 #[path = "support/generated_problem.rs"]
 #[allow(dead_code)]

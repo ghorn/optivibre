@@ -25,6 +25,37 @@ const GKLIB_SHA256: &str = "ece01338c55412f085910968832289fb08e6761f6ce7b9475547
 
 const OPENBLAS_VERSION: &str = "0.3.32";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenBlasThreading {
+    Serial,
+    OpenMp,
+}
+
+impl OpenBlasThreading {
+    fn from_features() -> Self {
+        match (
+            cfg!(feature = "openblas-serial"),
+            cfg!(feature = "openblas-openmp"),
+        ) {
+            (true, false) => Self::Serial,
+            (false, true) => Self::OpenMp,
+            (true, true) => panic!(
+                "spral-src features `openblas-serial` and `openblas-openmp` are mutually exclusive"
+            ),
+            (false, false) => panic!(
+                "spral-src requires exactly one OpenBLAS threading feature: `openblas-serial` or `openblas-openmp`"
+            ),
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Serial => "serial",
+            Self::OpenMp => "openmp",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct NativeLibrary {
     include_dir: PathBuf,
@@ -59,6 +90,7 @@ fn main() {
     }
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set"));
+    let openblas_threading = OpenBlasThreading::from_features();
     let source_dir = out_dir.join("sources");
     let build_dir = out_dir.join("build");
     let install_dir = out_dir.join("install");
@@ -90,7 +122,7 @@ fn main() {
     );
 
     let metis = build_metis(&metis_source, &gklib_source, &build_dir.join("metis"));
-    let openblas = build_openblas(&build_dir.join("openblas"), &tools);
+    let openblas = build_openblas(&build_dir.join("openblas"), &tools, openblas_threading);
     let pc_dir = build_dir.join("pkgconfig");
     write_private_pkg_config(&pc_dir, &metis, &openblas);
     let spral = build_spral(
@@ -107,7 +139,7 @@ fn main() {
     assert_inside(&out_dir, &openblas.archive, "OpenBLAS archive");
     assert_inside(&out_dir, &spral.archive, "SPRAL archive");
 
-    emit_link_metadata(&spral, &metis, &openblas, &tools);
+    emit_link_metadata(&spral, &metis, &openblas, &tools, openblas_threading);
 }
 
 #[derive(Clone, Debug)]
@@ -562,7 +594,7 @@ fn build_metis(source: &Path, gklib_source: &Path, out: &Path) -> NativeLibrary 
     }
 }
 
-fn build_openblas(out: &Path, tools: &Toolchain) -> NativeLibrary {
+fn build_openblas(out: &Path, tools: &Toolchain, threading: OpenBlasThreading) -> NativeLibrary {
     fs::create_dir_all(out).expect("failed to create OpenBLAS build directory");
     let source = openblas_build::download(out)
         .unwrap_or_else(|error| panic!("failed to download OpenBLAS source: {error}"));
@@ -572,7 +604,7 @@ fn build_openblas(out: &Path, tools: &Toolchain) -> NativeLibrary {
         if makefile_conf.exists() {
             fs::remove_file(&makefile_conf).expect("failed to remove stale OpenBLAS Makefile.conf");
         }
-        run_openblas_make(&source, tools);
+        run_openblas_make(&source, tools, threading);
     }
     let make_conf = openblas_build::MakeConf::new(&makefile_conf)
         .unwrap_or_else(|error| panic!("failed to parse OpenBLAS Makefile.conf: {error}"));
@@ -617,7 +649,7 @@ fn build_openblas(out: &Path, tools: &Toolchain) -> NativeLibrary {
     }
 }
 
-fn run_openblas_make(source: &Path, tools: &Toolchain) {
+fn run_openblas_make(source: &Path, tools: &Toolchain, threading: OpenBlasThreading) {
     let out_log = File::create(source.join("out.log")).expect("failed to create OpenBLAS out.log");
     let err_log = File::create(source.join("err.log")).expect("failed to create OpenBLAS err.log");
     let mut command = Command::new(&tools.make);
@@ -626,7 +658,7 @@ fn run_openblas_make(source: &Path, tools: &Toolchain) {
         .stdout(out_log)
         .stderr(err_log)
         .env_remove("TARGET")
-        .args(openblas_make_args(tools))
+        .args(openblas_make_args(tools, threading))
         .arg("shared");
 
     eprintln!("spral-src: running OpenBLAS make shared: {command:?}");
@@ -654,17 +686,25 @@ fn openblas_has_required_lapack(archive: &Path) -> bool {
     symbols.contains("dsytrf_")
 }
 
-fn openblas_make_args(tools: &Toolchain) -> Vec<String> {
+fn openblas_make_args(tools: &Toolchain, threading: OpenBlasThreading) -> Vec<String> {
     let mut args = vec![
         "NO_SHARED=1".to_string(),
         "NO_LAPACKE=1".to_string(),
-        "USE_THREAD=0".to_string(),
-        "USE_OPENMP=0".to_string(),
         "USE_LOCKING=1".to_string(),
         format!("CC={}", tools.cc),
         format!("FC={}", tools.fc),
         format!("HOSTCC={}", tools.host_cc),
     ];
+    match threading {
+        OpenBlasThreading::Serial => {
+            args.push("USE_THREAD=0".to_string());
+            args.push("USE_OPENMP=0".to_string());
+        }
+        OpenBlasThreading::OpenMp => {
+            args.push("USE_THREAD=1".to_string());
+            args.push("USE_OPENMP=1".to_string());
+        }
+    }
     if let Ok(ranlib) = env::var("OPENBLAS_RANLIB") {
         args.push(format!("RANLIB={ranlib}"));
     }
@@ -846,6 +886,7 @@ fn emit_link_metadata(
     metis: &NativeLibrary,
     openblas: &NativeLibrary,
     tools: &Toolchain,
+    openblas_threading: OpenBlasThreading,
 ) {
     for dir in [&spral.lib_dir, &metis.lib_dir, &openblas.lib_dir] {
         println!("cargo:rustc-link-search=native={}", dir.display());
@@ -876,12 +917,153 @@ fn emit_link_metadata(
     println!("cargo:metis_lib={}", metis.lib_dir.display());
     println!("cargo:openblas_include={}", openblas.include_dir.display());
     println!("cargo:openblas_lib={}", openblas.lib_dir.display());
+    println!("cargo:openmp_lib={}", tools.openmp_lib);
+    if let Some(dir) = &tools.openmp_lib_dir {
+        println!("cargo:openmp_lib_dir={}", dir.display());
+    }
+    println!("cargo:cxx_stdlib={}", tools.cxx_stdlib);
+    println!(
+        "cargo:runtime_link_dirs={}",
+        join_paths_for_metadata(&tools.runtime_lib_dirs)
+    );
+    println!(
+        "cargo:openblas_extra_link_dirs={}",
+        join_paths_for_metadata(&openblas.extra_link_dirs)
+    );
+    println!(
+        "cargo:openblas_extra_link_libs={}",
+        openblas.extra_link_libs.join(";")
+    );
+    println!("cargo:openblas_threading={}", openblas_threading.label());
+    println!("cargo:spral_cflags=-I{}", shell_path(&spral.include_dir));
+    println!(
+        "cargo:spral_lflags={}",
+        spral_link_flags(spral, metis, openblas, tools)
+    );
+    println!("cargo:lapack_lflags={}", openblas_link_flags(openblas));
     println!("cargo:spral_version={SPRAL_VERSION}");
     println!("cargo:metis_version={METIS_VERSION}");
     println!("cargo:openblas_version={OPENBLAS_VERSION}");
-    println!(
-        "cargo:config=spral={SPRAL_VERSION};metis={METIS_VERSION};openblas={OPENBLAS_VERSION};openmp=required;system_solver_math_fallbacks=false"
+    emit_dep_metadata(
+        "ROOT",
+        &spral.lib_dir.parent().unwrap().display().to_string(),
     );
+    emit_dep_metadata("INCLUDE", &spral.include_dir.display().to_string());
+    emit_dep_metadata("LIB", &spral.lib_dir.display().to_string());
+    emit_dep_metadata("METIS_INCLUDE", &metis.include_dir.display().to_string());
+    emit_dep_metadata("METIS_LIB", &metis.lib_dir.display().to_string());
+    emit_dep_metadata(
+        "OPENBLAS_INCLUDE",
+        &openblas.include_dir.display().to_string(),
+    );
+    emit_dep_metadata("OPENBLAS_LIB", &openblas.lib_dir.display().to_string());
+    emit_dep_metadata("OPENMP_LIB", &tools.openmp_lib);
+    if let Some(dir) = &tools.openmp_lib_dir {
+        emit_dep_metadata("OPENMP_LIB_DIR", &dir.display().to_string());
+    }
+    emit_dep_metadata("CXX_STDLIB", &tools.cxx_stdlib);
+    emit_dep_metadata("CC", &tools.cc);
+    emit_dep_metadata("CXX", &tools.cxx);
+    emit_dep_metadata("FC", &tools.fc);
+    emit_dep_metadata("HOST_CC", &tools.host_cc);
+    emit_dep_metadata(
+        "RUNTIME_LINK_DIRS",
+        &join_paths_for_metadata(&tools.runtime_lib_dirs),
+    );
+    emit_dep_metadata(
+        "OPENBLAS_EXTRA_LINK_DIRS",
+        &join_paths_for_metadata(&openblas.extra_link_dirs),
+    );
+    emit_dep_metadata(
+        "OPENBLAS_EXTRA_LINK_LIBS",
+        &openblas.extra_link_libs.join(";"),
+    );
+    emit_dep_metadata("OPENBLAS_THREADING", openblas_threading.label());
+    emit_dep_metadata(
+        "SPRAL_CFLAGS",
+        &format!("-I{}", shell_path(&spral.include_dir)),
+    );
+    emit_dep_metadata(
+        "SPRAL_LFLAGS",
+        &spral_link_flags(spral, metis, openblas, tools),
+    );
+    emit_dep_metadata("LAPACK_LFLAGS", &openblas_link_flags(openblas));
+    emit_dep_metadata("SPRAL_VERSION", SPRAL_VERSION);
+    emit_dep_metadata("METIS_VERSION", METIS_VERSION);
+    emit_dep_metadata("OPENBLAS_VERSION", OPENBLAS_VERSION);
+    println!(
+        "cargo:config=spral={SPRAL_VERSION};metis={METIS_VERSION};openblas={OPENBLAS_VERSION};openblas_threading={};openmp=required;system_solver_math_fallbacks=false",
+        openblas_threading.label()
+    );
+}
+
+fn emit_dep_metadata(key: &str, value: &str) {
+    println!("cargo:{key}={value}");
+    println!("cargo::metadata={key}={value}");
+}
+
+fn join_paths_for_metadata(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn shell_path(path: &Path) -> String {
+    path.display().to_string()
+}
+
+fn append_link_dir_flag(flags: &mut Vec<String>, dir: &Path) {
+    flags.push(format!("-L{}", shell_path(dir)));
+}
+
+fn append_link_lib_flag(flags: &mut Vec<String>, lib: &str) {
+    flags.push(format!("-l{lib}"));
+}
+
+fn openblas_link_flags(openblas: &NativeLibrary) -> String {
+    let mut flags = Vec::new();
+    append_link_dir_flag(&mut flags, &openblas.lib_dir);
+    for dir in &openblas.extra_link_dirs {
+        append_link_dir_flag(&mut flags, dir);
+    }
+    append_link_lib_flag(&mut flags, "openblas");
+    for lib in &openblas.extra_link_libs {
+        append_link_lib_flag(&mut flags, lib);
+    }
+    flags.join(" ")
+}
+
+fn spral_link_flags(
+    spral: &NativeLibrary,
+    metis: &NativeLibrary,
+    openblas: &NativeLibrary,
+    tools: &Toolchain,
+) -> String {
+    let mut flags = Vec::new();
+    append_link_dir_flag(&mut flags, &spral.lib_dir);
+    append_link_dir_flag(&mut flags, &metis.lib_dir);
+    append_link_dir_flag(&mut flags, &openblas.lib_dir);
+    for dir in &openblas.extra_link_dirs {
+        append_link_dir_flag(&mut flags, dir);
+    }
+    if let Some(dir) = &tools.openmp_lib_dir {
+        append_link_dir_flag(&mut flags, dir);
+    }
+    append_link_lib_flag(&mut flags, "spral");
+    append_link_lib_flag(&mut flags, "metis");
+    append_link_lib_flag(&mut flags, "openblas");
+    append_link_lib_flag(&mut flags, &tools.openmp_lib);
+    append_link_lib_flag(&mut flags, &tools.cxx_stdlib);
+    for lib in &openblas.extra_link_libs {
+        append_link_lib_flag(&mut flags, lib);
+    }
+    if cfg!(unix) && !cfg!(target_os = "macos") {
+        append_link_lib_flag(&mut flags, "m");
+        append_link_lib_flag(&mut flags, "pthread");
+    }
+    flags.join(" ")
 }
 
 fn run(command: &mut Command, label: &str) {

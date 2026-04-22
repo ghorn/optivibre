@@ -25,7 +25,7 @@ fuzz_target!(|data: &[u8]| {
     } else {
         Some(vec![1.0; row_indices.len().saturating_sub(1)])
     };
-    let _ = spral_ssids::SymmetricCscMatrix::new(
+    let _ = ssids_rs::SymmetricCscMatrix::new(
         dimension,
         &col_ptrs,
         &row_indices,

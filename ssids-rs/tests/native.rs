@@ -1,5 +1,5 @@
 use approx::assert_abs_diff_eq;
-use spral_ssids::{
+use ssids_rs::{
     Inertia, NativeOrdering, NativeSpral, NativeSpralError, NumericFactorOptions,
     SymmetricCscMatrix,
 };

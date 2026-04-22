@@ -1,26 +1,25 @@
 [package]
-name = "spral-src"
+name = "ipopt-src"
 version.workspace = true
 edition.workspace = true
 homepage.workspace = true
 license.workspace = true
-links = "spral"
+links = "ipopt"
 publish = false
 repository.workspace = true
 rust-version.workspace = true
-description = "Source-built SPRAL, METIS, and OpenBLAS native dependency package for optivibre."
+description = "Source-built IPOPT 3.14.20 linked against the spral-src native solver stack."
 
 [features]
 default = ["openblas-serial"]
-openblas-serial = []
-openblas-openmp = []
+openblas-serial = ["spral-src/openblas-serial"]
+openblas-openmp = ["spral-src/openblas-openmp"]
 
 [dependencies]
+spral-src = { path = "../spral-src", default-features = false }
 
 [build-dependencies]
-cc = { version = "1.2.45", features = ["parallel"] }
 flate2 = "1.1.5"
-openblas-build = "=0.10.15"
 sha2 = "0.10.9"
 tar = "0.4.44"
 ureq = { version = "3.1.4", default-features = false, features = ["native-tls"] }

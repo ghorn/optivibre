@@ -1,5 +1,5 @@
 use approx::assert_abs_diff_eq;
-use spral_ssids::{
+use ssids_rs::{
     Inertia, NumericFactorOptions, OrderingStrategy, SsidsError, SsidsOptions, SymmetricCscMatrix,
     analyse, factorize,
 };
@@ -624,7 +624,7 @@ fn numeric_factorization_requires_values() {
     let (symbolic, _) = analyse(matrix, &SsidsOptions::default()).expect("symbolic");
     let error = factorize(matrix, &symbolic, &NumericFactorOptions::default())
         .expect_err("factorization should reject missing values");
-    assert!(matches!(error, spral_ssids::SsidsError::MissingValues));
+    assert!(matches!(error, ssids_rs::SsidsError::MissingValues));
 }
 
 #[test]

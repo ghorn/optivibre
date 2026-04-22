@@ -203,7 +203,9 @@ fn source_built_spral_ssids_factor_solve_smoke() {
 
 #[test]
 fn public_config_declares_no_system_solver_math_fallbacks() {
-    assert!(spral_src::OPENMP_REQUIRED);
-    assert!(!spral_src::SYSTEM_SOLVER_MATH_FALLBACKS);
+    assert!(std::hint::black_box(spral_src::OPENMP_REQUIRED));
+    assert!(!std::hint::black_box(
+        spral_src::SYSTEM_SOLVER_MATH_FALLBACKS
+    ));
     assert!(spral_src::config_summary().contains("system_solver_math_fallbacks=false"));
 }

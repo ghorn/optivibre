@@ -4,7 +4,7 @@ use amd::Control;
 use anyhow::{Context, Result, bail};
 use libloading::{Library, Symbol};
 use metis_ordering::{CsrGraph, Permutation};
-use spral_ssids::{NativeSpral, SymmetricCscMatrix};
+use ssids_rs::{NativeSpral, SymmetricCscMatrix};
 
 use crate::corpus::SymmetricPatternMatrix;
 

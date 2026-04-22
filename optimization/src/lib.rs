@@ -320,7 +320,7 @@ pub fn native_spral_parity_profile() -> SpralParityProfile {
 
 pub fn apply_native_spral_parity_to_nlip_options(options: &mut InteriorPointOptions) {
     let profile = native_spral_parity_profile();
-    options.linear_solver = InteriorPointLinearSolver::NativeSpralSsids;
+    options.linear_solver = InteriorPointLinearSolver::SpralSrc;
     if let Some(linear_debug) = options.linear_debug.as_mut() {
         linear_debug.compare_solvers.clear();
     }
@@ -4987,10 +4987,7 @@ mod tests {
     fn native_spral_parity_nlip_options_use_ipopt_inertia_correction_scale() {
         let options = native_spral_parity_nlip_options();
 
-        assert_eq!(
-            options.linear_solver,
-            InteriorPointLinearSolver::NativeSpralSsids
-        );
+        assert_eq!(options.linear_solver, InteriorPointLinearSolver::SpralSrc);
         assert_eq!(options.regularization, 0.0);
         assert_eq!(options.first_hessian_perturbation, 1.0e-4);
         assert_eq!(options.regularization_growth_factor, IPOPT_PERTURB_INC_FACT);
@@ -5008,7 +5005,7 @@ mod tests {
                 schedule: super::InteriorPointLinearDebugSchedule::EveryIteration,
                 compare_solvers: vec![
                     super::InteriorPointLinearSolver::SparseQdldl,
-                    super::InteriorPointLinearSolver::SpralSsids,
+                    super::InteriorPointLinearSolver::SsidsRs,
                 ],
                 dump_dir: None,
             }),
@@ -5019,7 +5016,7 @@ mod tests {
 
         assert_eq!(
             options.linear_solver,
-            super::InteriorPointLinearSolver::NativeSpralSsids
+            super::InteriorPointLinearSolver::SpralSrc
         );
         assert_eq!(
             options

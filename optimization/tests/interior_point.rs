@@ -6,7 +6,7 @@ use optimization::{
     solve_nlp_interior_point_with_callback, validate_nlp_problem_shapes, validate_parameter_inputs,
 };
 use rstest::rstest;
-use spral_ssids::{
+use ssids_rs::{
     NativeSpral, NumericFactorOptions as SpralNumericFactorOptions,
     OrderingStrategy as SpralOrderingStrategy, SsidsOptions as SpralSsidsOptions,
     SymmetricCscMatrix as SpralSymmetricCscMatrix, analyse as spral_analyse,
@@ -211,7 +211,7 @@ fn assert_native_spral_parity_with_schedule(
     step_tol: f64,
     component_tol: f64,
 ) {
-    assert_eq!(report.primary_solver, InteriorPointLinearSolver::SpralSsids);
+    assert_eq!(report.primary_solver, InteriorPointLinearSolver::SsidsRs);
     assert_eq!(report.schedule, expected_schedule);
     assert_eq!(
         report.verdict,
@@ -221,8 +221,8 @@ fn assert_native_spral_parity_with_schedule(
     assert_eq!(report.results.len(), 2);
     assert!(report.notes.is_empty());
 
-    let primary = debug_backend_result(report, InteriorPointLinearSolver::SpralSsids);
-    let native = debug_backend_result(report, InteriorPointLinearSolver::NativeSpralSsids);
+    let primary = debug_backend_result(report, InteriorPointLinearSolver::SsidsRs);
+    let native = debug_backend_result(report, InteriorPointLinearSolver::SpralSrc);
     assert!(primary.success);
     assert!(native.success);
     assert_eq!(native.inertia, primary.inertia);
@@ -870,14 +870,14 @@ fn interior_point_auto_prefers_spral_ssids_on_small_hanging_chain() {
         &[],
         InteriorPointOptions::default(),
     );
-    assert_eq!(summary.linear_solver, InteriorPointLinearSolver::SpralSsids);
+    assert_eq!(summary.linear_solver, InteriorPointLinearSolver::SsidsRs);
 }
 
 #[test]
 fn interior_point_auto_prefers_spral_ssids_on_small_kkt_system() {
     let problem = build_problem_ok(hs021_problem(CallbackBackend::Aot), CallbackBackend::Aot);
     let summary = solve_ok(&problem, &[2.0, 2.0], &[], InteriorPointOptions::default());
-    assert_eq!(summary.linear_solver, InteriorPointLinearSolver::SpralSsids,);
+    assert_eq!(summary.linear_solver, InteriorPointLinearSolver::SsidsRs,);
 }
 
 #[test]
@@ -888,7 +888,7 @@ fn interior_point_spral_and_qdldl_match_on_small_kkt_system() {
         &[2.0, 2.0],
         &[],
         InteriorPointOptions {
-            linear_solver: InteriorPointLinearSolver::SpralSsids,
+            linear_solver: InteriorPointLinearSolver::SsidsRs,
             ..InteriorPointOptions::default()
         },
     );
@@ -902,7 +902,7 @@ fn interior_point_spral_and_qdldl_match_on_small_kkt_system() {
         },
     );
 
-    assert_eq!(spral.linear_solver, InteriorPointLinearSolver::SpralSsids);
+    assert_eq!(spral.linear_solver, InteriorPointLinearSolver::SsidsRs);
     assert_eq!(qdldl.linear_solver, InteriorPointLinearSolver::SparseQdldl);
     assert_abs_diff_eq!(spral.x[0], qdldl.x[0], epsilon = 1e-6);
     assert_abs_diff_eq!(spral.x[1], qdldl.x[1], epsilon = 1e-6);
@@ -923,7 +923,7 @@ fn interior_point_spral_and_qdldl_match_on_hanging_chain() {
         &hanging_chain_initial_guess(),
         &[],
         InteriorPointOptions {
-            linear_solver: InteriorPointLinearSolver::SpralSsids,
+            linear_solver: InteriorPointLinearSolver::SsidsRs,
             ..InteriorPointOptions::default()
         },
     );
@@ -937,7 +937,7 @@ fn interior_point_spral_and_qdldl_match_on_hanging_chain() {
         },
     );
 
-    assert_eq!(spral.linear_solver, InteriorPointLinearSolver::SpralSsids);
+    assert_eq!(spral.linear_solver, InteriorPointLinearSolver::SsidsRs);
     assert_eq!(qdldl.linear_solver, InteriorPointLinearSolver::SparseQdldl);
     assert_abs_diff_eq!(spral.objective, qdldl.objective, epsilon = 1e-6);
     for (spral_x, qdldl_x) in spral.x.iter().zip(qdldl.x.iter()) {
@@ -959,7 +959,7 @@ fn interior_point_native_spral_matches_small_kkt_system() {
         &[2.0, 2.0],
         &[],
         InteriorPointOptions {
-            linear_solver: InteriorPointLinearSolver::SpralSsids,
+            linear_solver: InteriorPointLinearSolver::SsidsRs,
             ..InteriorPointOptions::default()
         },
     );
@@ -968,15 +968,12 @@ fn interior_point_native_spral_matches_small_kkt_system() {
         &[2.0, 2.0],
         &[],
         InteriorPointOptions {
-            linear_solver: InteriorPointLinearSolver::NativeSpralSsids,
+            linear_solver: InteriorPointLinearSolver::SpralSrc,
             ..InteriorPointOptions::default()
         },
     );
 
-    assert_eq!(
-        native.linear_solver,
-        InteriorPointLinearSolver::NativeSpralSsids
-    );
+    assert_eq!(native.linear_solver, InteriorPointLinearSolver::SpralSrc);
     assert_abs_diff_eq!(rust_spral.x[0], native.x[0], epsilon = 1e-6);
     assert_abs_diff_eq!(rust_spral.x[1], native.x[1], epsilon = 1e-6);
     assert_abs_diff_eq!(rust_spral.objective, native.objective, epsilon = 1e-8);
@@ -1000,7 +997,7 @@ fn interior_point_native_spral_matches_hanging_chain() {
         &hanging_chain_initial_guess(),
         &[],
         InteriorPointOptions {
-            linear_solver: InteriorPointLinearSolver::SpralSsids,
+            linear_solver: InteriorPointLinearSolver::SsidsRs,
             ..InteriorPointOptions::default()
         },
     );
@@ -1009,15 +1006,12 @@ fn interior_point_native_spral_matches_hanging_chain() {
         &hanging_chain_initial_guess(),
         &[],
         InteriorPointOptions {
-            linear_solver: InteriorPointLinearSolver::NativeSpralSsids,
+            linear_solver: InteriorPointLinearSolver::SpralSrc,
             ..InteriorPointOptions::default()
         },
     );
 
-    assert_eq!(
-        native.linear_solver,
-        InteriorPointLinearSolver::NativeSpralSsids
-    );
+    assert_eq!(native.linear_solver, InteriorPointLinearSolver::SpralSrc);
     assert_abs_diff_eq!(rust_spral.objective, native.objective, epsilon = 1e-6);
     for (rust_x, native_x) in rust_spral.x.iter().zip(native.x.iter()) {
         assert_abs_diff_eq!(rust_x, native_x, epsilon = 1e-5);
@@ -1034,12 +1028,12 @@ fn interior_point_spral_reuses_symbolic_analysis_and_refactorizes() {
         &[2.0, 2.0],
         &[],
         InteriorPointOptions {
-            linear_solver: InteriorPointLinearSolver::SpralSsids,
+            linear_solver: InteriorPointLinearSolver::SsidsRs,
             ..InteriorPointOptions::default()
         },
     );
 
-    assert_eq!(summary.linear_solver, InteriorPointLinearSolver::SpralSsids);
+    assert_eq!(summary.linear_solver, InteriorPointLinearSolver::SsidsRs);
     assert_eq!(summary.profiling.sparse_symbolic_analyses, 1);
     assert!(summary.profiling.sparse_numeric_factorizations >= 1);
     assert!(summary.profiling.sparse_numeric_refactorizations >= 1);
@@ -1057,15 +1051,12 @@ fn interior_point_native_spral_matching_reanalyses_numeric_pattern() {
         &[2.0, 2.0],
         &[],
         InteriorPointOptions {
-            linear_solver: InteriorPointLinearSolver::NativeSpralSsids,
+            linear_solver: InteriorPointLinearSolver::SpralSrc,
             ..InteriorPointOptions::default()
         },
     );
 
-    assert_eq!(
-        summary.linear_solver,
-        InteriorPointLinearSolver::NativeSpralSsids
-    );
+    assert_eq!(summary.linear_solver, InteriorPointLinearSolver::SpralSrc);
     // IPOPT's SPRAL default uses matching ordering/scaling. That analysis is
     // value-dependent, so the native parity path must reanalyse instead of
     // reusing a stale symbolic object for refactorization.
@@ -1087,9 +1078,9 @@ fn interior_point_native_spral_matches_small_kkt_extremely_closely() {
         &[2.0, 2.0],
         &[],
         InteriorPointOptions {
-            linear_solver: InteriorPointLinearSolver::SpralSsids,
+            linear_solver: InteriorPointLinearSolver::SsidsRs,
             linear_debug: Some(InteriorPointLinearDebugOptions {
-                compare_solvers: vec![InteriorPointLinearSolver::NativeSpralSsids],
+                compare_solvers: vec![InteriorPointLinearSolver::SpralSrc],
                 schedule: InteriorPointLinearDebugSchedule::FirstIteration,
                 dump_dir: None,
             }),
@@ -1116,9 +1107,9 @@ fn interior_point_native_spral_matches_hanging_chain_extremely_closely() {
         &hanging_chain_initial_guess(),
         &[],
         InteriorPointOptions {
-            linear_solver: InteriorPointLinearSolver::SpralSsids,
+            linear_solver: InteriorPointLinearSolver::SsidsRs,
             linear_debug: Some(InteriorPointLinearDebugOptions {
-                compare_solvers: vec![InteriorPointLinearSolver::NativeSpralSsids],
+                compare_solvers: vec![InteriorPointLinearSolver::SpralSrc],
                 schedule: InteriorPointLinearDebugSchedule::FirstIteration,
                 dump_dir: None,
             }),
@@ -1146,9 +1137,9 @@ fn interior_point_native_spral_matches_hanging_chain_each_iteration_extremely_cl
         &hanging_chain_initial_guess(),
         &[],
         InteriorPointOptions {
-            linear_solver: InteriorPointLinearSolver::SpralSsids,
+            linear_solver: InteriorPointLinearSolver::SsidsRs,
             linear_debug: Some(InteriorPointLinearDebugOptions {
-                compare_solvers: vec![InteriorPointLinearSolver::NativeSpralSsids],
+                compare_solvers: vec![InteriorPointLinearSolver::SpralSrc],
                 schedule: InteriorPointLinearDebugSchedule::EveryIteration,
                 dump_dir: None,
             }),
@@ -1185,9 +1176,9 @@ fn interior_point_native_spral_exact_small_kkt_replay_matches_to_machine_precisi
         &[2.0, 2.0],
         &[],
         InteriorPointOptions {
-            linear_solver: InteriorPointLinearSolver::SpralSsids,
+            linear_solver: InteriorPointLinearSolver::SsidsRs,
             linear_debug: Some(InteriorPointLinearDebugOptions {
-                compare_solvers: vec![InteriorPointLinearSolver::NativeSpralSsids],
+                compare_solvers: vec![InteriorPointLinearSolver::SpralSrc],
                 schedule: InteriorPointLinearDebugSchedule::FirstIteration,
                 dump_dir: Some(dump_dir.path().to_path_buf()),
             }),
@@ -1244,9 +1235,9 @@ fn interior_point_native_spral_exact_hanging_chain_replay_matches_extremely_clos
         &hanging_chain_initial_guess(),
         &[],
         InteriorPointOptions {
-            linear_solver: InteriorPointLinearSolver::SpralSsids,
+            linear_solver: InteriorPointLinearSolver::SsidsRs,
             linear_debug: Some(InteriorPointLinearDebugOptions {
-                compare_solvers: vec![InteriorPointLinearSolver::NativeSpralSsids],
+                compare_solvers: vec![InteriorPointLinearSolver::SpralSrc],
                 schedule: InteriorPointLinearDebugSchedule::FirstIteration,
                 dump_dir: Some(dump_dir.path().to_path_buf()),
             }),
@@ -1303,9 +1294,9 @@ fn interior_point_native_spral_exact_hanging_chain_replay_matches_each_dump_extr
         &hanging_chain_initial_guess(),
         &[],
         InteriorPointOptions {
-            linear_solver: InteriorPointLinearSolver::SpralSsids,
+            linear_solver: InteriorPointLinearSolver::SsidsRs,
             linear_debug: Some(InteriorPointLinearDebugOptions {
-                compare_solvers: vec![InteriorPointLinearSolver::NativeSpralSsids],
+                compare_solvers: vec![InteriorPointLinearSolver::SpralSrc],
                 schedule: InteriorPointLinearDebugSchedule::EveryIteration,
                 dump_dir: Some(dump_dir.path().to_path_buf()),
             }),
@@ -1382,9 +1373,9 @@ fn interior_point_native_spral_hanging_chain_refactorize_sequence_matches_extrem
         &hanging_chain_initial_guess(),
         &[],
         InteriorPointOptions {
-            linear_solver: InteriorPointLinearSolver::SpralSsids,
+            linear_solver: InteriorPointLinearSolver::SsidsRs,
             linear_debug: Some(InteriorPointLinearDebugOptions {
-                compare_solvers: vec![InteriorPointLinearSolver::NativeSpralSsids],
+                compare_solvers: vec![InteriorPointLinearSolver::SpralSrc],
                 schedule: InteriorPointLinearDebugSchedule::EveryIteration,
                 dump_dir: Some(dump_dir.path().to_path_buf()),
             }),
@@ -1578,10 +1569,10 @@ fn interior_point_linear_debug_compare_records_backend_results_on_small_kkt() {
         &[2.0, 2.0],
         &[],
         InteriorPointOptions {
-            linear_solver: InteriorPointLinearSolver::SpralSsids,
+            linear_solver: InteriorPointLinearSolver::SsidsRs,
             linear_debug: Some(InteriorPointLinearDebugOptions {
                 compare_solvers: vec![
-                    InteriorPointLinearSolver::NativeSpralSsids,
+                    InteriorPointLinearSolver::SpralSrc,
                     InteriorPointLinearSolver::SparseQdldl,
                 ],
                 schedule: InteriorPointLinearDebugSchedule::FirstIteration,
@@ -1592,7 +1583,7 @@ fn interior_point_linear_debug_compare_records_backend_results_on_small_kkt() {
     );
 
     let report = first_linear_debug_report(&summary);
-    assert_eq!(report.primary_solver, InteriorPointLinearSolver::SpralSsids);
+    assert_eq!(report.primary_solver, InteriorPointLinearSolver::SsidsRs);
     assert_eq!(
         report.schedule,
         InteriorPointLinearDebugSchedule::FirstIteration
@@ -1606,10 +1597,10 @@ fn interior_point_linear_debug_compare_records_backend_results_on_small_kkt() {
     let primary = report
         .results
         .iter()
-        .find(|result| result.solver == InteriorPointLinearSolver::SpralSsids)
+        .find(|result| result.solver == InteriorPointLinearSolver::SsidsRs)
         .expect("primary result");
     for solver in [
-        InteriorPointLinearSolver::NativeSpralSsids,
+        InteriorPointLinearSolver::SpralSrc,
         InteriorPointLinearSolver::SparseQdldl,
     ] {
         let comparison = report
@@ -1624,16 +1615,16 @@ fn interior_point_linear_debug_compare_records_backend_results_on_small_kkt() {
         assert!(comparison.d_lambda_delta_inf.is_some());
         assert!(comparison.ds_delta_inf.is_some());
         assert!(comparison.dz_delta_inf.is_some());
-        if solver == InteriorPointLinearSolver::NativeSpralSsids {
+        if solver == InteriorPointLinearSolver::SpralSrc {
             assert_eq!(comparison.inertia, primary.inertia);
         } else {
             assert!(comparison.inertia.is_some());
         }
     }
-    let native = debug_backend_result(&report, InteriorPointLinearSolver::NativeSpralSsids);
+    let native = debug_backend_result(&report, InteriorPointLinearSolver::SpralSrc);
     if report.verdict == InteriorPointLinearDebugVerdict::Consistent {
         for comparison in report.results.iter().filter(|result| {
-            result.solver == InteriorPointLinearSolver::NativeSpralSsids
+            result.solver == InteriorPointLinearSolver::SpralSrc
                 || result.solver == InteriorPointLinearSolver::SparseQdldl
         }) {
             assert!(comparison.step_delta_inf.expect("step delta") <= 1e-5);
@@ -1657,8 +1648,7 @@ fn interior_point_linear_debug_compare_records_backend_results_on_small_kkt() {
                 report
                     .notes
                     .iter()
-                    .any(|note| note
-                        .contains("matched primary within tolerance: native_spral_ssids")),
+                    .any(|note| note.contains("matched primary within tolerance: spral_src")),
                 "expected debug notes to record native SPRAL parity when another backend diverges: {:?}",
                 report.notes
             );

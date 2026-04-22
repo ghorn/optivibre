@@ -1,10 +1,10 @@
 use std::ffi::c_void;
-#[cfg(not(feature = "native-spral-src"))]
+#[cfg(feature = "dynamic-spral-parity")]
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
 
-#[cfg(not(feature = "native-spral-src"))]
+#[cfg(feature = "dynamic-spral-parity")]
 use libloading::{Library, Symbol};
 use thiserror::Error;
 
@@ -128,7 +128,7 @@ impl Default for SpralSsidsInform {
 
 #[derive(Debug)]
 struct NativeSpralLibrary {
-    #[cfg(not(feature = "native-spral-src"))]
+    #[cfg(all(feature = "dynamic-spral-parity", not(feature = "native-spral-src")))]
     _library: Library,
     #[cfg(feature = "native-spral-src")]
     _linked: (),
@@ -304,7 +304,7 @@ impl NativeSpral {
             return Ok(native);
         }
 
-        #[cfg(not(feature = "native-spral-src"))]
+        #[cfg(all(not(feature = "native-spral-src"), feature = "dynamic-spral-parity"))]
         {
             let mut candidates = native_spral_library_candidates();
             if let Ok(cwd) = std::env::current_dir() {
@@ -375,6 +375,17 @@ impl NativeSpral {
             }
             Err(NativeSpralError::LoadLibrary(
                 last_error.unwrap_or_else(|| "no candidates tried".into()),
+            ))
+        }
+
+        #[cfg(all(
+            not(feature = "native-spral-src"),
+            not(feature = "dynamic-spral-parity")
+        ))]
+        {
+            Err(NativeSpralError::LoadLibrary(
+                "native SPRAL is disabled; enable `native-spral-src` for the source-built distribution path or `dynamic-spral-parity` for parity-only dynamic loading"
+                    .into(),
             ))
         }
     }
@@ -526,6 +537,7 @@ impl NativeSpral {
     }
 }
 
+#[cfg(any(feature = "native-spral-src", feature = "dynamic-spral-parity"))]
 fn native_spral_smoke_test(native: &NativeSpral) -> Result<(), NativeSpralError> {
     let col_ptrs = [0, 2, 3];
     let row_indices = [0, 1, 1];
@@ -539,7 +551,7 @@ fn native_spral_smoke_test(native: &NativeSpral) -> Result<(), NativeSpralError>
     Ok(())
 }
 
-#[cfg(not(feature = "native-spral-src"))]
+#[cfg(feature = "dynamic-spral-parity")]
 fn native_spral_library_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(override_path) = std::env::var_os("SPRAL_SSIDS_NATIVE_LIB") {
@@ -550,10 +562,7 @@ fn native_spral_library_candidates() -> Vec<PathBuf> {
         PathBuf::from("/Users/greg/local/ipopt-spral/lib/libspral.so"),
         PathBuf::from("target/native/spral-upstream/builddir/libspral.dylib"),
         PathBuf::from("libspral.dylib"),
-        PathBuf::from("/usr/local/lib/libspral.dylib"),
-        PathBuf::from("/opt/homebrew/lib/libspral.dylib"),
         PathBuf::from("libspral.so"),
-        PathBuf::from("/usr/local/lib/libspral.so"),
     ]);
     candidates
 }
@@ -794,7 +803,7 @@ impl Drop for NativeSpralSession {
     }
 }
 
-#[cfg(not(feature = "native-spral-src"))]
+#[cfg(feature = "dynamic-spral-parity")]
 fn load_symbol<T: Copy>(
     library: &Library,
     candidate: &Path,

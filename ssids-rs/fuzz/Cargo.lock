@@ -117,16 +117,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "libloading"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
-dependencies = [
- "cfg-if",
- "windows-link",
-]
-
-[[package]]
 name = "metis_ordering"
 version = "0.1.0"
 dependencies = [
@@ -194,21 +184,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
-name = "spral_ssids"
+name = "ssids-rs"
 version = "0.1.0"
 dependencies = [
- "libloading",
  "metis_ordering",
  "rayon",
  "thiserror",
 ]
 
 [[package]]
-name = "spral_ssids-fuzz"
+name = "ssids_rs-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
- "spral_ssids",
+ "ssids-rs",
 ]
 
 [[package]]
@@ -256,12 +245,6 @@ checksum = "20064672db26d7cdc89c7798c48a0fdfac8213434a1186e5ef29fd560ae223d6"
 dependencies = [
  "wit-bindgen",
 ]
-
-[[package]]
-name = "windows-link"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
 
 [[package]]
 name = "wit-bindgen"

@@ -12,6 +12,8 @@
 //   See the License for the specific language governing permissions and
 //   limitations under the License.
 
+#![cfg_attr(feature = "source-built-spral", allow(dead_code))]
+
 use curl::easy::Easy;
 use flate2::read::GzDecoder;
 use lazy_static::lazy_static;
@@ -140,65 +142,160 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CXX");
     println!("cargo:rerun-if-env-changed=PATH");
 
-    let mut msg = String::from("\n\n");
-
-    // Try to find Ipopt preinstalled.
-    match try_pkg_config() {
-        Ok(link_info) => {
-            link(build_cnlp(&link_info.include_paths), link_info)
-                .expect("Failed to create bindings for Ipopt library.");
-            return;
-        }
-        Err(err) => {
-            msg.push_str(&format!(
-                "Failed to find Ipopt using pkg-config: {:?}\n\n",
-                err
-            ));
-        }
+    #[cfg(feature = "source-built-spral")]
+    {
+        let link_info = source_built_spral_link_info();
+        link(build_cnlp(&link_info.include_paths), link_info)
+            .expect("Failed to create bindings for source-built Ipopt library.");
+        return;
     }
 
-    // Check if Ipopt has been installed as a local system lib, but for some reason pkg-config is
-    // missing.
-    match try_system_install() {
-        Ok(link_info) => {
-            link(build_cnlp(&link_info.include_paths), link_info)
-                .expect("Failed to create bindings for Ipopt library.");
-            return;
-        }
-        Err(err) => {
-            msg.push_str(&format!(
-                "Failed to find Ipopt installed on the system: {:?}\n\n",
-                err
-            ));
-        }
+    #[cfg(all(
+        not(feature = "source-built-spral"),
+        not(feature = "legacy-native-build")
+    ))]
+    {
+        panic!(
+            "ipopt-sys native discovery is disabled by default; enable `source-built-spral` or explicitly opt into `legacy-native-build`"
+        );
     }
 
-    match build_and_install_ipopt() {
-        Ok(link_info) => {
-            link(build_cnlp(&link_info.include_paths), link_info)
-                .expect("Failed to create bindings for Ipopt library.");
-            return;
+    #[cfg(all(
+        not(feature = "source-built-spral"),
+        feature = "legacy-native-build"
+    ))]
+    {
+        let mut msg = String::from("\n\n");
+
+        // Try to find Ipopt preinstalled.
+        match try_pkg_config() {
+            Ok(link_info) => {
+                link(build_cnlp(&link_info.include_paths), link_info)
+                    .expect("Failed to create bindings for Ipopt library.");
+                return;
+            }
+            Err(err) => {
+                msg.push_str(&format!(
+                    "Failed to find Ipopt using pkg-config: {:?}\n\n",
+                    err
+                ));
+            }
         }
-        Err(err) => {
-            msg.push_str(&format!("Failed to build Ipopt from source: {:?}\n\n", err));
+
+        // Check if Ipopt has been installed as a local system lib, but for some reason pkg-config is
+        // missing.
+        match try_system_install() {
+            Ok(link_info) => {
+                link(build_cnlp(&link_info.include_paths), link_info)
+                    .expect("Failed to create bindings for Ipopt library.");
+                return;
+            }
+            Err(err) => {
+                msg.push_str(&format!(
+                    "Failed to find Ipopt installed on the system: {:?}\n\n",
+                    err
+                ));
+            }
+        }
+
+        match build_and_install_ipopt() {
+            Ok(link_info) => {
+                link(build_cnlp(&link_info.include_paths), link_info)
+                    .expect("Failed to create bindings for Ipopt library.");
+                return;
+            }
+            Err(err) => {
+                msg.push_str(&format!("Failed to build Ipopt from source: {:?}\n\n", err));
+            }
+        }
+
+        match download_and_install_prebuilt_binary() {
+            Ok(link_info) => {
+                link(build_cnlp(&link_info.include_paths), link_info)
+                    .expect("Failed to create bindings for Ipopt library.");
+            }
+            Err(err) => {
+                msg.push_str(&format!(
+                    "Failed to download and install Ipopt binaries: {:?}\n\n",
+                    err
+                ));
+                panic!("{}", msg);
+            }
         }
     }
+}
 
-    match download_and_install_prebuilt_binary() {
-        Ok(link_info) => {
-            link(build_cnlp(&link_info.include_paths), link_info)
-                .expect("Failed to create bindings for Ipopt library.");
-            return;
-        }
-        Err(err) => {
-            msg.push_str(&format!(
-                "Failed to download and install Ipopt binaries: {:?}\n\n",
-                err
-            ));
-        }
+#[cfg(feature = "source-built-spral")]
+fn source_built_spral_link_info() -> LinkInfo {
+    let mut search_paths = vec![
+        metadata_path("LIB"),
+        metadata_path("SPRAL_LIB"),
+        metadata_path("METIS_LIB"),
+        metadata_path("OPENBLAS_LIB"),
+    ];
+    search_paths.extend(metadata_paths("RUNTIME_LINK_DIRS"));
+    search_paths.extend(metadata_paths("OPENBLAS_EXTRA_LINK_DIRS"));
+    if let Some(openmp_lib_dir) = optional_metadata_path("OPENMP_LIB_DIR") {
+        search_paths.push(openmp_lib_dir);
     }
 
-    panic!("{}", msg);
+    let mut libs = vec![
+        (LibKind::Static, "ipopt".to_string()),
+        (LibKind::Static, "spral".to_string()),
+        (LibKind::Static, "metis".to_string()),
+        (LibKind::Static, "openblas".to_string()),
+        (LibKind::Dynamic, metadata("OPENMP_LIB")),
+        (LibKind::Dynamic, metadata("CXX_STDLIB")),
+    ];
+    for lib in metadata_list("OPENBLAS_EXTRA_LINK_LIBS") {
+        libs.push((LibKind::Dynamic, lib));
+    }
+    if cfg!(unix) && !cfg!(target_os = "macos") {
+        libs.push((LibKind::Dynamic, "m".to_string()));
+        libs.push((LibKind::Dynamic, "pthread".to_string()));
+    }
+
+    LinkInfo {
+        libs,
+        search_paths,
+        include_paths: vec![metadata_path("INCLUDE")],
+    }
+}
+
+#[cfg(feature = "source-built-spral")]
+fn metadata(name: &str) -> String {
+    env::var(format!("DEP_IPOPT_{name}"))
+        .unwrap_or_else(|_| panic!("ipopt-src did not emit DEP_IPOPT_{}", name))
+}
+
+#[cfg(feature = "source-built-spral")]
+fn optional_metadata(name: &str) -> Option<String> {
+    env::var(format!("DEP_IPOPT_{name}")).ok()
+}
+
+#[cfg(feature = "source-built-spral")]
+fn metadata_path(name: &str) -> PathBuf {
+    PathBuf::from(metadata(name))
+}
+
+#[cfg(feature = "source-built-spral")]
+fn optional_metadata_path(name: &str) -> Option<PathBuf> {
+    optional_metadata(name).filter(|value| !value.is_empty()).map(PathBuf::from)
+}
+
+#[cfg(feature = "source-built-spral")]
+fn metadata_paths(name: &str) -> Vec<PathBuf> {
+    metadata_list(name).into_iter().map(PathBuf::from).collect()
+}
+
+#[cfg(feature = "source-built-spral")]
+fn metadata_list(name: &str) -> Vec<String> {
+    optional_metadata(name)
+        .unwrap_or_default()
+        .split(';')
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -535,9 +632,17 @@ fn build_cnlp(ipopt_include_paths: &[PathBuf]) -> PathBuf {
         .map(|path| path.to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join(";");
-    cmake::Config::new("cnlp")
-        .define("Ipopt_INCLUDE_DIRS:STRING", ipopt_include_dirs)
-        .build()
+    let _ = fs::remove_dir_all(out_dir.join("build"));
+    let mut config = cmake::Config::new("cnlp");
+    config.no_default_flags(true);
+    config.define("Ipopt_INCLUDE_DIRS:STRING", ipopt_include_dirs);
+    if let Ok(cc) = env::var("DEP_IPOPT_CC") {
+        config.define("CMAKE_C_COMPILER", cc);
+    }
+    if let Ok(cxx) = env::var("DEP_IPOPT_CXX") {
+        config.define("CMAKE_CXX_COMPILER", cxx);
+    }
+    config.build()
 }
 
 /// Link ipopt-sys to our cnlp api. If ipopt is provided as a dynamic lib, we need to link it here.

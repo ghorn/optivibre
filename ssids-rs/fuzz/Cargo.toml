@@ -1,5 +1,5 @@
 [package]
-name = "spral_ssids-fuzz"
+name = "ssids_rs-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-spral_ssids = { path = ".." }
+ssids_rs = { package = "ssids-rs", path = ".." }
 
 [[bin]]
 name = "symmetric_csc_new"

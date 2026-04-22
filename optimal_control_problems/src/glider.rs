@@ -1308,7 +1308,7 @@ mod tests {
     use super::*;
     use approx::assert_abs_diff_eq;
     use serde::de::DeserializeOwned;
-    use spral_ssids::{
+    use ssids_rs::{
         FactorProfile, NativeSpral, NumericFactorOptions, OrderingStrategy, SolveProfile,
         SsidsOptions, SymmetricCscMatrix, analyse as spral_analyse,
         approximate_minimum_degree_permutation as spral_amd_permutation,
@@ -1631,9 +1631,7 @@ mod tests {
         report
             .results
             .iter()
-            .find(|result| {
-                result.solver == optimization::InteriorPointLinearSolver::NativeSpralSsids
-            })
+            .find(|result| result.solver == optimization::InteriorPointLinearSolver::SpralSrc)
             .expect("expected native SPRAL comparison result")
     }
 
@@ -2143,7 +2141,7 @@ mod tests {
         options.verbose = false;
         options.linear_debug = Some(optimization::InteriorPointLinearDebugOptions {
             compare_solvers: vec![
-                optimization::InteriorPointLinearSolver::NativeSpralSsids,
+                optimization::InteriorPointLinearSolver::SpralSrc,
                 optimization::InteriorPointLinearSolver::SparseQdldl,
             ],
             schedule: optimization::InteriorPointLinearDebugSchedule::EveryIteration,
@@ -2253,7 +2251,7 @@ mod tests {
         let compiled = compiled.compiled.borrow();
         let runtime = dc_runtime(&params);
         let mut options = crate::common::nlip_options(&params.solver);
-        options.linear_solver = optimization::InteriorPointLinearSolver::NativeSpralSsids;
+        options.linear_solver = optimization::InteriorPointLinearSolver::SpralSrc;
         options.max_iters = 120;
         options.acceptable_iter = 0;
         options.verbose = false;
@@ -2367,13 +2365,13 @@ mod tests {
         let runtime = dc_runtime(&params);
         let dump_dir = TempDir::new().expect("temp dump dir should create");
         let mut options = crate::common::nlip_options(&params.solver);
-        options.linear_solver = optimization::InteriorPointLinearSolver::SpralSsids;
+        options.linear_solver = optimization::InteriorPointLinearSolver::SsidsRs;
         options.max_iters = 1;
         options.acceptable_iter = 0;
         options.verbose = false;
         options.linear_debug = Some(optimization::InteriorPointLinearDebugOptions {
             compare_solvers: vec![
-                optimization::InteriorPointLinearSolver::NativeSpralSsids,
+                optimization::InteriorPointLinearSolver::SpralSrc,
                 optimization::InteriorPointLinearSolver::SparseQdldl,
             ],
             schedule: optimization::InteriorPointLinearDebugSchedule::FirstIteration,
@@ -2536,7 +2534,7 @@ mod tests {
         options.acceptable_iter = 0;
         options.verbose = false;
         options.linear_debug = Some(optimization::InteriorPointLinearDebugOptions {
-            compare_solvers: vec![optimization::InteriorPointLinearSolver::NativeSpralSsids],
+            compare_solvers: vec![optimization::InteriorPointLinearSolver::SpralSrc],
             schedule: optimization::InteriorPointLinearDebugSchedule::EveryIteration,
             dump_dir: None,
         });
@@ -2558,7 +2556,7 @@ mod tests {
         for report in &reports {
             assert_eq!(
                 report.primary_solver,
-                optimization::InteriorPointLinearSolver::SpralSsids
+                optimization::InteriorPointLinearSolver::SsidsRs
             );
             assert_eq!(
                 report.schedule,
@@ -2621,12 +2619,12 @@ mod tests {
         let runtime = dc_runtime(&params);
         let dump_dir = TempDir::new().expect("temp dump dir should create");
         let mut options = crate::common::nlip_options(&params.solver);
-        options.linear_solver = optimization::InteriorPointLinearSolver::SpralSsids;
+        options.linear_solver = optimization::InteriorPointLinearSolver::SsidsRs;
         options.max_iters = 1;
         options.acceptable_iter = 0;
         options.verbose = false;
         options.linear_debug = Some(optimization::InteriorPointLinearDebugOptions {
-            compare_solvers: vec![optimization::InteriorPointLinearSolver::NativeSpralSsids],
+            compare_solvers: vec![optimization::InteriorPointLinearSolver::SpralSrc],
             schedule: optimization::InteriorPointLinearDebugSchedule::FirstIteration,
             dump_dir: Some(dump_dir.path().to_path_buf()),
         });
@@ -2695,12 +2693,12 @@ mod tests {
         let runtime = dc_runtime(&params);
         let dump_dir = TempDir::new().expect("temp dump dir should create");
         let mut options = crate::common::nlip_options(&params.solver);
-        options.linear_solver = optimization::InteriorPointLinearSolver::SpralSsids;
+        options.linear_solver = optimization::InteriorPointLinearSolver::SsidsRs;
         options.max_iters = 10;
         options.acceptable_iter = 0;
         options.verbose = false;
         options.linear_debug = Some(optimization::InteriorPointLinearDebugOptions {
-            compare_solvers: vec![optimization::InteriorPointLinearSolver::NativeSpralSsids],
+            compare_solvers: vec![optimization::InteriorPointLinearSolver::SpralSrc],
             schedule: optimization::InteriorPointLinearDebugSchedule::EveryIteration,
             dump_dir: Some(dump_dir.path().to_path_buf()),
         });
@@ -2807,12 +2805,12 @@ mod tests {
         let runtime = dc_runtime(&params);
         let dump_dir = TempDir::new().expect("temp dump dir should create");
         let mut options = crate::common::nlip_options(&params.solver);
-        options.linear_solver = optimization::InteriorPointLinearSolver::SpralSsids;
+        options.linear_solver = optimization::InteriorPointLinearSolver::SsidsRs;
         options.max_iters = 10;
         options.acceptable_iter = 0;
         options.verbose = false;
         options.linear_debug = Some(optimization::InteriorPointLinearDebugOptions {
-            compare_solvers: vec![optimization::InteriorPointLinearSolver::NativeSpralSsids],
+            compare_solvers: vec![optimization::InteriorPointLinearSolver::SpralSrc],
             schedule: optimization::InteriorPointLinearDebugSchedule::EveryIteration,
             dump_dir: Some(dump_dir.path().to_path_buf()),
         });
@@ -3014,7 +3012,7 @@ mod tests {
         options.acceptable_iter = 0;
         options.verbose = false;
         options.linear_debug = Some(optimization::InteriorPointLinearDebugOptions {
-            compare_solvers: vec![optimization::InteriorPointLinearSolver::SpralSsids],
+            compare_solvers: vec![optimization::InteriorPointLinearSolver::SsidsRs],
             schedule: optimization::InteriorPointLinearDebugSchedule::FailuresOnly,
             dump_dir: Some(dump_dir.path().to_path_buf()),
         });

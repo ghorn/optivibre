@@ -18,7 +18,7 @@ metis_ordering = { path = "../metis_ordering" }
 nalgebra.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-spral_ssids = { path = "../spral_ssids" }
+ssids_rs = { package = "ssids-rs", path = "../ssids-rs" }
 tar = "0.4.44"
 thiserror.workspace = true
 

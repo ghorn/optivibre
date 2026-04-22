@@ -16,27 +16,20 @@ Contributions are welcome!
 
 ## Building
 
-We provide a number of options for building Ipopt from source as well as different methods for
-retrieving binaries.
-Building also requires the `openssl` and `libclang` system libraries.
-Currently supported methods for getting the Ipopt library:
+This vendored copy defaults to the Optivibre source-built path:
 
-  1. Using pkg-config to find a system installed static or dynamic library.
-  2. Manually check system lib directories for a dynamic library.
-  3. Build Ipopt from source. You will need fortran compiler libs installed (e.g. `libgfortran`) and
-     one of the following options for linear solvers:
+1. `ipopt-src` builds IPOPT 3.14.20.
+2. `spral-src` builds static SPRAL with private METIS and OpenBLAS.
+3. `ipopt-sys` builds only the CNLP shim and Rust bindings.
 
-     a. Linking against MKL. (set `MKLROOT` environment variable to specify a custom MKL installation
-        path or if the system path is not found.)
+The legacy pkg-config/system/source/prebuilt discovery stack is still present
+for upstream comparison, but it is disabled unless the `legacy-native-build`
+feature is explicitly enabled. Normal Optivibre builds should not require
+Homebrew IPOPT, `/usr/local` solver libraries, MUMPS, Accelerate, or prebuilt
+JuliaOpt binaries.
 
-     b. Building with MUMPS/METIS and linking against a system installed OpenBLAS library (Linux) or
-        Accelerate framework (macOS). If no system BLAS/LAPACK libraries are found, then the default
-        netlib implementations will be pulled and built.
-
-  4. Download a prebuilt dynamic Ipopt library from JuliaOpt.
-
-Each of these steps are at various levels of polish and currently tested on Linux and macOS systems
-only.
+SPRAL requires `OMP_CANCELLATION=true` before OpenMP runtime initialization.
+Set it before running tests or applications that exercise IPOPT's SPRAL solver.
 
 
 ### MacOS
@@ -100,4 +93,3 @@ This repository is licensed under either of
   * MIT License ([LICENSE-MIT](../LICENSE-MIT) or https://opensource.org/licenses/MIT)
 
 at your option.
-

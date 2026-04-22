@@ -3819,7 +3819,7 @@ pub const fn default_nlip_config() -> NlipConfig {
         // IPOPT 3.14.20 `IpSpralSolverInterface` defaults to native SPRAL with
         // matching ordering/scaling and block APP pivoting. The Rust SPRAL
         // reimplementation is still an explicit non-default comparison lane.
-        linear_solver: InteriorPointLinearSolver::NativeSpralSsids,
+        linear_solver: InteriorPointLinearSolver::SpralSrc,
         spral_pivot_method: InteriorPointSpralPivotMethod::BlockAposteriori,
         spral_action_on_zero_pivot: true,
         spral_small_pivot_tolerance: 1.0e-20,
@@ -4855,8 +4855,8 @@ fn solver_globalization_choices() -> Vec<(f64, &'static str)> {
 
 fn nlip_linear_solver_value(solver: InteriorPointLinearSolver) -> f64 {
     match solver {
-        InteriorPointLinearSolver::SpralSsids => 0.0,
-        InteriorPointLinearSolver::NativeSpralSsids => 1.0,
+        InteriorPointLinearSolver::SsidsRs => 0.0,
+        InteriorPointLinearSolver::SpralSrc => 1.0,
         InteriorPointLinearSolver::SparseQdldl => 2.0,
         InteriorPointLinearSolver::Auto => 3.0,
     }
@@ -4864,8 +4864,8 @@ fn nlip_linear_solver_value(solver: InteriorPointLinearSolver) -> f64 {
 
 fn nlip_linear_solver_choices() -> Vec<(f64, &'static str)> {
     vec![
-        (0.0, "SPRAL SSIDS"),
-        (1.0, "Native SPRAL SSIDS"),
+        (0.0, "SSIDS-RS"),
+        (1.0, "SPRAL-SRC"),
         (2.0, "QDLDL"),
         (3.0, "Auto"),
     ]
@@ -4971,8 +4971,8 @@ pub fn solver_config_from_map(
         SharedControlId::SolverNlipLinearSolver,
         &[0.0, 1.0, 2.0, 3.0],
     )? {
-        0 => InteriorPointLinearSolver::SpralSsids,
-        1 => InteriorPointLinearSolver::NativeSpralSsids,
+        0 => InteriorPointLinearSolver::SsidsRs,
+        1 => InteriorPointLinearSolver::SpralSrc,
         2 => InteriorPointLinearSolver::SparseQdldl,
         3 => InteriorPointLinearSolver::Auto,
         _ => unreachable!("validated NLIP linear solver choice"),
@@ -9874,17 +9874,14 @@ mod tests {
             .expect("solver config should parse");
         assert_eq!(
             parsed.nlip.linear_solver,
-            InteriorPointLinearSolver::NativeSpralSsids
+            InteriorPointLinearSolver::SpralSrc
         );
     }
 
     #[test]
     fn default_nlip_config_matches_ipopt_spral_defaults() {
         let default = default_nlip_config();
-        assert_eq!(
-            default.linear_solver,
-            InteriorPointLinearSolver::NativeSpralSsids
-        );
+        assert_eq!(default.linear_solver, InteriorPointLinearSolver::SpralSrc);
         assert_eq!(
             default.spral_pivot_method,
             InteriorPointSpralPivotMethod::BlockAposteriori
