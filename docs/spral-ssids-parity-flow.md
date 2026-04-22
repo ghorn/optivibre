@@ -7,7 +7,33 @@ Orange nodes have partial coverage or a known narrowed boundary. Gold-orange
 nodes are newly passing guards that narrow an open mismatch without proving full
 bitwise parity. Red nodes are the next open bitwise mismatch target.
 
-Current newly narrowed witness:
+Current rejected APP signed-zero hypotheses:
+The deterministic signed-zero boundary is inside SPRAL's BLAS-backed
+`host_trsm(SIDE_RIGHT, FILL_MODE_LWR, OP_T, DIAG_UNIT)` call rather than the
+later APP threshold or accepted-update path. Several tempting scalar rewrites
+were tested and rejected because they only moved the first mismatch to another
+signed-zero witness:
+
+- A right-to-left source-shaped triangular solve moved a nonzero entry first
+  (`0xbffedbb32ab866e0`, index 25), so the current Rust forward in-block order
+  is closer to the OpenBLAS path.
+- Preserving the previous target zero sign fixes `0xbffedbb32ab866e0` but fails
+  at `0x3c2fddd05272d936`, index 64.
+- Using the last exact-zero update sign fixes those two cases but fails at
+  `0x81baf41f636557c1`, index 56.
+- Skipping all zero source values fixes the first two cases but fails at
+  `0x7e61757756000303`, index 118.
+- Skipping only negative-zero source values fixes the first two cases but fails
+  at `0xaed55ad4b5afb713`, index 93.
+
+So the next real target is still the OpenBLAS level-3 `dtrsm` packing/kernel
+path used by SPRAL, not another local scalar sign heuristic. The relevant
+source anchors are `target/native/spral-upstream/src/ssids/cpu/kernels/wrappers.cxx`
+`host_trsm`, `target/native/spral-upstream/src/ssids/cpu/kernels/ldlt_app.cxx`
+`apply_pivot<OP_N>`, and OpenBLAS `driver/level3/trsm_R.c` plus its
+`TRSM_KERNEL_RT` and `TRSM_OLTCOPY` specializations.
+
+Previous newly narrowed witness:
 `app_apply_pivot_and_host_trsm_signed_zero_boundaries_are_complementary` pins a
 generic APP kernel signed-zero boundary to one deterministic witness. For seed
 `0xbffedbb32ab866e0`, both raw `host_trsm` and full `apply_pivot<OP_N>` first
@@ -284,7 +310,8 @@ flowchart TD
     G9 --> I00
     I00 --> I0["Dense seed09 APP-stride apply_pivot OP_N L block"]
     I0 --> I0z["APP host_trsm/apply_pivot signed-zero boundary"]
-    I0z --> I0a["Dense seed09 APP check_threshold OP_N pass count"]
+    I0z --> I0zz["OpenBLAS dtrsm packing/kernel sign policy"]
+    I0zz --> I0a["Dense seed09 APP check_threshold OP_N pass count"]
     I0a --> I0p["Dense seed09 source-shaped APP pre-apply trailing operands"]
     I0p --> I0r["Dense seed09 production-vs-aligned Rust APP diagonal block"]
     I0r --> I0s["Dense seed09 source-plain native trace D/matrix gap"]
@@ -352,6 +379,7 @@ flowchart TD
     class I0n match;
     class I0d partial;
     class I0z newlyPartial;
+    class I0zz open;
     class I0t,I0b partial;
     class K4j match;
     class K4k partial;
