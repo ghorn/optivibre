@@ -9340,6 +9340,48 @@ extern "C" int spral_kernel_block_prefix_trace_32(
         let accepted_end = block_start + local_passed;
         let accepted_blocks = app_truncate_records_to_prefix(&local_blocks, local_passed);
         assert_eq!(accepted_end, APP_INNER_BLOCK_SIZE);
+
+        let native_lda = native_aligned_double_stride(shim, dimension);
+        let mut native_apply_matrix = vec![0.0; block_end * native_lda];
+        for col in block_start..block_end {
+            for row in col..dimension {
+                native_apply_matrix[col * native_lda + row] = lower_dense[col * dimension + row];
+            }
+        }
+        let mut rust_apply_matrix = lower_dense.clone();
+        app_apply_block_pivots_to_trailing_rows(
+            &mut rust_apply_matrix,
+            dimension,
+            block_start,
+            block_end,
+            &local_blocks,
+            options.small_pivot_tolerance,
+            false,
+        );
+        let diagonal_before_apply = dense_tpp_diagonal_from_blocks(&local_blocks, block_end);
+        unsafe {
+            (shim.apply_pivot_op_n)(
+                (dimension - block_end) as c_int,
+                block_end as c_int,
+                native_apply_matrix.as_ptr(),
+                diagonal_before_apply.as_ptr(),
+                options.small_pivot_tolerance,
+                native_apply_matrix.as_mut_ptr().add(block_end),
+                native_lda as c_int,
+            );
+        }
+        for col in block_start..block_end {
+            for row in block_end..dimension {
+                let rust_value = rust_apply_matrix[col * dimension + row];
+                let native_value = native_apply_matrix[col * native_lda + row];
+                assert_eq!(
+                    rust_value.to_bits(),
+                    native_value.to_bits(),
+                    "dense seed09 APP-stride apply_pivot<OP_N> mismatch row={row} col={col}"
+                );
+            }
+        }
+
         app_restore_trailing_from_block_backup(
             &rows,
             &rows_before_block,
@@ -9358,7 +9400,6 @@ extern "C" int spral_kernel_block_prefix_trace_32(
             &accepted_blocks,
         );
 
-        let native_lda = native_aligned_double_stride(shim, dimension);
         let native_ldld = native_aligned_double_stride(shim, APP_INNER_BLOCK_SIZE);
         let mut l_block = vec![0.0; accepted_end * native_lda];
         for col in 0..accepted_end {
