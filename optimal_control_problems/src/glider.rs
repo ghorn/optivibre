@@ -2460,10 +2460,12 @@ mod tests {
                 profile.root_delayed_blocks,
             );
             println!(
-                "  rust_spral dense_front_profile tpp={:?} app_pivot_factor={:?} app_block_apply={:?} app_failed_scan={:?} app_restore={:?} app_accepted_update={:?} app_column_storage={:?} solve_panel_build={:?}",
+                "  rust_spral dense_front_profile tpp={:?} app_pivot_factor={:?} app_block_apply={:?} app_block_trsm={:?} app_block_diag={:?} app_failed_scan={:?} app_restore={:?} app_accepted_update={:?} app_column_storage={:?} solve_panel_build={:?}",
                 profile.tpp_factorization_time,
                 profile.app_pivot_factor_time,
                 profile.app_block_pivot_apply_time,
+                profile.app_block_triangular_solve_time,
+                profile.app_block_diagonal_apply_time,
                 profile.app_failed_pivot_scan_time,
                 profile.app_restore_time,
                 profile.app_accepted_update_time,

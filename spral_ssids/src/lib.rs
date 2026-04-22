@@ -66,6 +66,8 @@ pub struct FactorProfile {
     pub tpp_factorization_time: Duration,
     pub app_pivot_factor_time: Duration,
     pub app_block_pivot_apply_time: Duration,
+    pub app_block_triangular_solve_time: Duration,
+    pub app_block_diagonal_apply_time: Duration,
     pub app_failed_pivot_scan_time: Duration,
     pub app_restore_time: Duration,
     pub app_accepted_update_time: Duration,
@@ -106,6 +108,8 @@ impl FactorProfile {
         self.tpp_factorization_time += other.tpp_factorization_time;
         self.app_pivot_factor_time += other.app_pivot_factor_time;
         self.app_block_pivot_apply_time += other.app_block_pivot_apply_time;
+        self.app_block_triangular_solve_time += other.app_block_triangular_solve_time;
+        self.app_block_diagonal_apply_time += other.app_block_diagonal_apply_time;
         self.app_failed_pivot_scan_time += other.app_failed_pivot_scan_time;
         self.app_restore_time += other.app_restore_time;
         self.app_accepted_update_time += other.app_accepted_update_time;
@@ -2356,11 +2360,13 @@ fn app_apply_block_pivots_to_trailing_rows(
     block_end: usize,
     block_records: &[FactorBlockRecord],
     small: f64,
-) {
+    profile_enabled: bool,
+) -> (Duration, Duration) {
     if block_end >= size {
-        return;
+        return (Duration::default(), Duration::default());
     }
 
+    let triangular_started = profile_enabled.then(Instant::now);
     const OPENBLAS_DTRSM_UNROLL_N: usize = 4;
     for row in block_end..size {
         let mut group_start = block_start;
@@ -2391,7 +2397,10 @@ fn app_apply_block_pivots_to_trailing_rows(
             group_start = group_end;
         }
     }
+    let triangular_solve_time =
+        triangular_started.map_or(Duration::default(), |started| started.elapsed());
 
+    let diagonal_started = profile_enabled.then(Instant::now);
     let mut col = block_start;
     for block in block_records {
         if block.size == 1 {
@@ -2425,6 +2434,10 @@ fn app_apply_block_pivots_to_trailing_rows(
             col += 2;
         }
     }
+    (
+        triangular_solve_time,
+        diagonal_started.map_or(Duration::default(), |started| started.elapsed()),
+    )
 }
 
 fn app_first_failed_trailing_column(
@@ -3419,16 +3432,19 @@ fn factorize_dense_front(
         }
 
         let started = profile_enabled.then(Instant::now);
-        app_apply_block_pivots_to_trailing_rows(
+        let (triangular_solve_time, diagonal_apply_time) = app_apply_block_pivots_to_trailing_rows(
             &mut dense,
             size,
             block_start,
             block_end,
             &local_blocks,
             options.small_pivot_tolerance,
+            profile_enabled,
         );
         if let Some(started) = started {
             profile.app_block_pivot_apply_time += started.elapsed();
+            profile.app_block_triangular_solve_time += triangular_solve_time;
+            profile.app_block_diagonal_apply_time += diagonal_apply_time;
         }
         let started = profile_enabled.then(Instant::now);
         let first_failed = app_first_failed_trailing_column(
