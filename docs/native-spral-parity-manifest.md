@@ -48,6 +48,14 @@ feature; source-built native SPRAL is `native-spral-src`.
 available before source-backed SPRAL algorithm edits. If the source tree is not
 present, only diagnostics and exact regression promotion are allowed.
 
+Serial fail-closed runs are the algorithmic oracle for exact bitwise parity:
+`RAYON_NUM_THREADS=1`, `OMP_NUM_THREADS=1`, `OMP_CANCELLATION=true`, and
+`AD_CODEGEN_REQUIRE_NATIVE_SPRAL_PARITY=1`. Parallel safety is a separate gate:
+Rust-owned Rayon factorization must be exactly repeatable against the serial
+Rust result, while native OpenMP/OpenBLAS threaded runs are accepted by bounded
+outcome checks unless a specific threaded native configuration proves bitwise
+stable.
+
 | Rust area | Upstream oracle | Accepted deviations |
 | --- | --- | --- |
 | Ordering, postorder, supernodes, row lists | SPRAL SSIDS analyse source | None for exact evidence unless the test is explicitly about Rust-only `Auto` ordering. |
@@ -60,6 +68,25 @@ present, only diagnostics and exact regression promotion are allowed.
 | Production forward solve traversal | `src/ssids/cpu/NumericSubtree.hxx::solve_fwd`, `src/ssids/cpu/kernels/ldlt_app.cxx::ldlt_app_solve_fwd` | None. Rust production solve must gather each front, apply the APP forward solve kernel, then scatter the full front-local RHS; global sparse forward substitutes are diagnostic only. |
 | Production diagonal/backward solve traversal | `src/ssids/fkeep.F90::inner_solve_cpu`, `src/ssids/cpu/NumericSubtree.hxx::solve_diag_bwd_inner<true,true>`, `src/ssids/cpu/kernels/ldlt_app.cxx::ldlt_app_solve_diag` / `ldlt_app_solve_bwd` | None. Full Rust production solves must use the native combined `diag_bwd` staging: gather a front-local RHS, apply front-local inverse-D blocks, apply the APP backward solve, then scatter eliminated rows. |
 | Inertia reporting | SPRAL SSIDS inform/enquiry source | None; compare reported inertia and native enquiry data before accepting solve-bit changes. |
+
+## Parallel Safety Gate
+
+Use `scripts/ssids_rs_parallel_parity_matrix.sh` before starting performance
+work. It preserves the serial bitwise baseline, then checks:
+
+- exact `ssids-rs` Rayon determinism for dense APP and multi-root front trees;
+- bounded native SPRAL correctness under `OMP_NUM_THREADS=1` and `4`;
+- concurrent independent factor/solve and refactor/solve stress for Rust-owned
+  solver objects.
+
+The `native-spral-src-openmp` path is not part of the green acceptance matrix
+yet. The guard `parallel_openblas_threads_bounded_correctness` is ignored by
+default because source-built OpenBLAS OpenMP currently changes native SPRAL APP
+solve results on an active bitwise witness. Run it explicitly while fixing that
+packaging/backend path.
+
+Any new parallel mismatch must still be reduced to a deterministic witness
+before changing numeric behavior.
 
 ## Supervisor Checklist
 

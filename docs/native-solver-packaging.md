@@ -41,6 +41,15 @@ SPRAL factorization requires `OMP_CANCELLATION=true` before OpenMP runtime
 initialization. Source-built IPOPT/SPRAL tests and applications that exercise
 SPRAL must set that environment variable before process start.
 
+Threaded OpenBLAS is intentionally opt-in and not currently part of the green
+acceptance matrix. Before performance work depends on parallelism, run
+`scripts/ssids_rs_parallel_parity_matrix.sh`: serial bitwise SPRAL parity
+remains the algorithmic oracle, Rust Rayon factorization is required to be
+exactly repeatable, and native SPRAL OpenMP with serial OpenBLAS is checked
+with bounded residual and solution criteria. The `native-spral-src-openmp`
+guard is ignored by default because it currently changes native SPRAL APP solve
+results; run it explicitly while fixing that path.
+
 ## Pure Rust Lane
 
 `ssids-rs` is the pure Rust SSIDS implementation. It is the solver backend NLIP

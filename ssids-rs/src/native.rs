@@ -9,7 +9,7 @@ use libloading::{Library, Symbol};
 use thiserror::Error;
 
 use crate::{Inertia, NumericFactorOptions, PivotMethod, SymmetricCscMatrix};
-#[cfg(feature = "native-spral-src")]
+#[cfg(any(feature = "native-spral-src", feature = "native-spral-src-openmp"))]
 use spral_src as _;
 
 type SpralDefaultOptionsFn = unsafe extern "C" fn(*mut SpralSsidsOptions);
@@ -128,9 +128,12 @@ impl Default for SpralSsidsInform {
 
 #[derive(Debug)]
 struct NativeSpralLibrary {
-    #[cfg(all(feature = "dynamic-spral-parity", not(feature = "native-spral-src")))]
+    #[cfg(all(
+        feature = "dynamic-spral-parity",
+        not(any(feature = "native-spral-src", feature = "native-spral-src-openmp"))
+    ))]
     _library: Library,
-    #[cfg(feature = "native-spral-src")]
+    #[cfg(any(feature = "native-spral-src", feature = "native-spral-src-openmp"))]
     _linked: (),
     default_options: SpralDefaultOptionsFn,
     analyse: SpralAnalyseFn,
@@ -140,7 +143,7 @@ struct NativeSpralLibrary {
     free: SpralFreeFn,
 }
 
-#[cfg(feature = "native-spral-src")]
+#[cfg(any(feature = "native-spral-src", feature = "native-spral-src-openmp"))]
 unsafe extern "C" {
     fn spral_ssids_default_options(options: *mut SpralSsidsOptions);
     fn spral_ssids_analyse(
@@ -184,7 +187,7 @@ unsafe extern "C" {
     fn spral_ssids_free(akeep: *mut *mut c_void, fkeep: *mut *mut c_void) -> i32;
 }
 
-#[cfg(feature = "native-spral-src")]
+#[cfg(any(feature = "native-spral-src", feature = "native-spral-src-openmp"))]
 fn linked_spral_library() -> NativeSpralLibrary {
     NativeSpralLibrary {
         _linked: (),
@@ -295,7 +298,7 @@ pub enum NativeSpralError {
 
 impl NativeSpral {
     pub fn load() -> Result<Self, NativeSpralError> {
-        #[cfg(feature = "native-spral-src")]
+        #[cfg(any(feature = "native-spral-src", feature = "native-spral-src-openmp"))]
         {
             let native = Self {
                 inner: Arc::new(linked_spral_library()),
@@ -304,7 +307,10 @@ impl NativeSpral {
             Ok(native)
         }
 
-        #[cfg(all(not(feature = "native-spral-src"), feature = "dynamic-spral-parity"))]
+        #[cfg(all(
+            not(any(feature = "native-spral-src", feature = "native-spral-src-openmp")),
+            feature = "dynamic-spral-parity"
+        ))]
         {
             let mut candidates = native_spral_library_candidates();
             if let Ok(cwd) = std::env::current_dir() {
@@ -379,12 +385,12 @@ impl NativeSpral {
         }
 
         #[cfg(all(
-            not(feature = "native-spral-src"),
+            not(any(feature = "native-spral-src", feature = "native-spral-src-openmp")),
             not(feature = "dynamic-spral-parity")
         ))]
         {
             Err(NativeSpralError::LoadLibrary(
-                "native SPRAL is disabled; enable `native-spral-src` for the source-built distribution path or `dynamic-spral-parity` for parity-only dynamic loading"
+                "native SPRAL is disabled; enable `native-spral-src` or `native-spral-src-openmp` for the source-built distribution path, or `dynamic-spral-parity` for parity-only dynamic loading"
                     .into(),
             ))
         }
@@ -537,7 +543,11 @@ impl NativeSpral {
     }
 }
 
-#[cfg(any(feature = "native-spral-src", feature = "dynamic-spral-parity"))]
+#[cfg(any(
+    feature = "native-spral-src",
+    feature = "native-spral-src-openmp",
+    feature = "dynamic-spral-parity"
+))]
 fn native_spral_smoke_test(native: &NativeSpral) -> Result<(), NativeSpralError> {
     let col_ptrs = [0, 2, 3];
     let row_indices = [0, 1, 1];
