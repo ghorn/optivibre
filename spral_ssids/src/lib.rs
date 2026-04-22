@@ -10569,6 +10569,14 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         )
         .expect("rust analyse");
         let (production, _) = factorize(matrix, &symbolic, &options).expect("rust factorize");
+        let Some(native) = native_spral_or_skip() else {
+            return;
+        };
+        let mut native_session = native
+            .analyse_with_options_and_ordering(matrix, &options, NativeOrdering::Natural)
+            .expect("native analyse");
+        native_session.factorize(matrix).expect("native factorize");
+        let native_enquiry = native_session.enquire_indef().expect("native enquire");
         let production_entries = rust_inverse_diagonal_entries(&production);
         let isolated_entries =
             inverse_diagonal_entries_from_internal_diagonal(&rust.diagonal, tail_size);
@@ -10600,5 +10608,39 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
                 "dense seed09 production-vs-factor-node TPP tail D mismatch index={index} production={production_value:?} factor_node={factor_node_value:?}"
             );
         }
+        let native_tail_entries = &native_enquiry.inverse_diagonal_entries[accepted_end..];
+        assert_eq!(
+            native_tail_entries.len(),
+            factor_node_entries.len(),
+            "dense seed09 native production and factor-node replay tail lengths differ"
+        );
+        let mut first_native_production_factor_node_mismatch = None;
+        'native_production_factor_node_compare: for (
+            local_pivot,
+            (native_entry, factor_node_entry),
+        ) in native_tail_entries
+            .iter()
+            .zip(&factor_node_entries)
+            .enumerate()
+        {
+            for component in 0..2 {
+                let native_bits = native_entry[component].to_bits();
+                let factor_node_bits = factor_node_entry[component].to_bits();
+                if native_bits != factor_node_bits {
+                    first_native_production_factor_node_mismatch = Some((
+                        accepted_end + local_pivot,
+                        component,
+                        native_bits,
+                        factor_node_bits,
+                    ));
+                    break 'native_production_factor_node_compare;
+                }
+            }
+        }
+        assert_eq!(
+            first_native_production_factor_node_mismatch,
+            Some((37, 1, 0xbf54_f658_1dd6_05f2, 0xbf54_f658_1dd6_05fe)),
+            "dense seed09 native production-vs-factor-node TPP replay boundary moved"
+        );
     }
 }

@@ -8,6 +8,19 @@ nodes are newly passing guards that narrow an open mismatch without proving full
 bitwise parity. Red nodes are the next open bitwise mismatch target.
 
 Current newly narrowed witness:
+`dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now compares
+native production `enquire_indef` output with the source-shaped native
+`factor_node_indef` second-pass TPP replay for the same dense seed09 tail. The
+first replay gap is the same pivot/component as the remaining full inverse-D
+red witness: pivot 37 component 1 (`native_production=0xbf54f6581dd605f2`,
+`factor_node_replay=0xbf54f6581dd605fe`). Rust production tail storage already
+matches this factor-node replay, so this pins the next missing context on the
+native production/replay boundary rather than justifying a Rust storage change.
+The source anchors are `target/native/spral-upstream/src/ssids/cpu/factor.hxx`
+`factor_node_indef` and
+`target/native/spral-upstream/src/ssids/cpu/NumericSubtree.hxx` `enquire`.
+
+Previous newly narrowed witness:
 `dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now carries a
 hybrid native trace with source-shaped 2x2 multipliers but the FMA-shaped
 `update_2x2` path. That hybrid still diverges from native `block_ldlt<32>` at
@@ -17,7 +30,7 @@ the same first-step boundary as the full source-shaped trace: inverse-D index 7
 `block_ldlt=0x3f79e327dcf67ccf`). So the pivot-19 source-expression match is
 local evidence, not justification for a global APP multiplier expression swap.
 
-Previous newly narrowed witness:
+Earlier newly narrowed witness:
 `dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now pins the
 row 30, col 19 native-wrapper bit to the source-shaped first-row 2x2 multiplier
 expression at pivot 19. For the snapshot row 31 operands, the explicit FMA
@@ -289,7 +302,8 @@ flowchart TD
     K4c --> K4d["Dense seed09 APP-stride TPP tail D bits"]
     K4d --> K4g["Dense seed09 embedded-offset native TPP tail D bits"]
     K4g --> K4i["Dense seed09 factor_node second-pass TPP tail D bits"]
-    K4i --> K4f["Dense seed09 Rust production tail D storage"]
+    K4i --> K4l["Dense seed09 native production vs factor_node replay D gap"]
+    K4l --> K4f["Dense seed09 Rust production tail D storage"]
     K4f --> K4h["Dense seed09 post-gap pivot38 inverse-D bits"]
     K4h --> K4j["Dense seed09 inverse-D structural zero bits"]
     K4j --> K4k["Dense seed09 nonzero inverse-D mismatch map"]
@@ -327,6 +341,7 @@ flowchart TD
     class K4j match;
     class K4k partial;
     class C,D,E,F,G,G2,G4,G7,G10,H,I,J,K,L,N partial;
+    class K4l newlyPartial;
     class G8c,G8d,G9a,I00,I0,I0a,I1,I2,I3,K2,K3,K4a,K4c,K4d,K4e,K4f,K4g,K4h,K4i match;
     class K4b,K4 open;
 ```
