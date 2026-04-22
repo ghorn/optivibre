@@ -4258,6 +4258,95 @@ mod tests {
                 .join("; ")
         }
 
+        fn top_upper_slack_multiplier_direction_diffs(
+            prev_nlip: &optimization::InteriorPointIterationSnapshot,
+            nlip: &optimization::InteriorPointIterationSnapshot,
+            prev_ipopt: &optimization::IpoptIterationSnapshot,
+            ipopt: &optimization::IpoptIterationSnapshot,
+            nlip_alpha_pr: f64,
+            nlip_alpha_du: f64,
+            _nlip_mu: f64,
+            ipopt_alpha_pr: f64,
+            ipopt_alpha_du: f64,
+            _ipopt_mu: f64,
+            intervals: usize,
+            order: usize,
+        ) -> String {
+            let prev_nlip_slack = prev_nlip.slack_primal.as_deref().unwrap_or(&[]);
+            let nlip_slack = nlip.slack_primal.as_deref().unwrap_or(&[]);
+            let prev_nlip_v = prev_nlip.slack_multipliers.as_deref().unwrap_or(&[]);
+            let nlip_v = nlip.slack_multipliers.as_deref().unwrap_or(&[]);
+            let nlip_alpha_pr = nlip_alpha_pr.abs().max(1.0e-16);
+            let nlip_alpha_du = nlip_alpha_du.abs().max(1.0e-16);
+            let ipopt_alpha_pr = ipopt_alpha_pr.abs().max(1.0e-16);
+            let ipopt_alpha_du = ipopt_alpha_du.abs().max(1.0e-16);
+            // Accepted-state finite differences include the post-line-search
+            // IPOPT/NLIP bound multiplier safeguard, so this is a direction
+            // comparison probe rather than a raw PDFullSpaceSolver residual.
+
+            let count = prev_nlip_slack
+                .len()
+                .min(nlip_slack.len())
+                .min(prev_nlip_v.len())
+                .min(nlip_v.len())
+                .min(prev_ipopt.kkt_slack_distance.len())
+                .min(ipopt.kkt_slack_distance.len())
+                .min(prev_ipopt.internal_slack.len())
+                .min(ipopt.internal_slack.len())
+                .min(prev_ipopt.slack_upper_bound_multipliers.len())
+                .min(ipopt.slack_upper_bound_multipliers.len());
+            let mut diffs = (0..count)
+                .map(|index| {
+                    let nlip_internal_ds =
+                        -(nlip_slack[index] - prev_nlip_slack[index]) / nlip_alpha_pr;
+                    let nlip_actual_dv = (nlip_v[index] - prev_nlip_v[index]) / nlip_alpha_du;
+
+                    let ipopt_internal_ds = (ipopt.internal_slack[index]
+                        - prev_ipopt.internal_slack[index])
+                        / ipopt_alpha_pr;
+                    let ipopt_actual_dv = (ipopt.slack_upper_bound_multipliers[index]
+                        - prev_ipopt.slack_upper_bound_multipliers[index])
+                        / ipopt_alpha_du;
+
+                    (
+                        index,
+                        nlip_actual_dv,
+                        ipopt_actual_dv,
+                        nlip_internal_ds,
+                        ipopt_internal_ds,
+                        (nlip_actual_dv - ipopt_actual_dv).abs(),
+                        (nlip_internal_ds - ipopt_internal_ds).abs(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            diffs.sort_by(|lhs, rhs| rhs.5.total_cmp(&lhs.5));
+            if diffs.is_empty() {
+                return "--".to_string();
+            }
+            diffs
+                .into_iter()
+                .take(4)
+                .map(
+                    |(
+                        index,
+                        nlip_actual_dv,
+                        ipopt_actual_dv,
+                        nlip_internal_ds,
+                        ipopt_internal_ds,
+                        actual_gap,
+                        slack_step_gap,
+                    )| {
+                        format!(
+                            "#{} {} dv[n={nlip_actual_dv:.6e},i={ipopt_actual_dv:.6e},d={actual_gap:.3e}] ds_internal[n={nlip_internal_ds:.6e},i={ipopt_internal_ds:.6e},d={slack_step_gap:.3e}]",
+                            index,
+                            glider_inequality_label(index, intervals, order)
+                        )
+                    },
+                )
+                .collect::<Vec<_>>()
+                .join("; ")
+        }
+
         fn max_direction_estimate_diff(
             prev_nlip: &TracePoint,
             nlip: &TracePoint,
@@ -4270,6 +4359,29 @@ mod tests {
                 .iter()
                 .zip(prev_nlip.x.iter())
                 .zip(ipopt.x.iter().zip(prev_ipopt.x.iter()))
+                .fold(
+                    0.0_f64,
+                    |acc, ((nlip_value, prev_nlip_value), (ipopt_value, prev_ipopt_value))| {
+                        let nlip_direction = (nlip_value - prev_nlip_value) / nlip_alpha;
+                        let ipopt_direction = (ipopt_value - prev_ipopt_value) / ipopt_alpha;
+                        acc.max((nlip_direction - ipopt_direction).abs())
+                    },
+                )
+        }
+
+        fn max_vector_direction_diff(
+            prev_nlip: &[f64],
+            nlip: &[f64],
+            prev_ipopt: &[f64],
+            ipopt: &[f64],
+            nlip_alpha: f64,
+            ipopt_alpha: f64,
+        ) -> f64 {
+            let nlip_alpha = nlip_alpha.abs().max(1.0e-16);
+            let ipopt_alpha = ipopt_alpha.abs().max(1.0e-16);
+            nlip.iter()
+                .zip(prev_nlip.iter())
+                .zip(ipopt.iter().zip(prev_ipopt.iter()))
                 .fold(
                     0.0_f64,
                     |acc, ((nlip_value, prev_nlip_value), (ipopt_value, prev_ipopt_value))| {
@@ -4303,6 +4415,139 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
                 .join("; ")
+        }
+
+        fn accepted_direction_gap_ladder(
+            accepted_nlip_solver_snapshots: &[optimization::InteriorPointIterationSnapshot],
+            accepted_ipopt_solver_snapshots: &[optimization::IpoptIterationSnapshot],
+            nlip_trace: &[TracePoint],
+            ipopt_trace: &[TracePoint],
+        ) -> String {
+            fn metric_gap(
+                metric: &str,
+                thresholds: &[f64],
+                compared: usize,
+                gap: impl Fn(usize) -> f64,
+                nlip_trace: &[TracePoint],
+                ipopt_trace: &[TracePoint],
+            ) -> String {
+                let threshold_text = thresholds
+                    .iter()
+                    .map(|&threshold| {
+                        let marker = (1..compared).find_map(|index| {
+                            let gap = gap(index);
+                            (gap > threshold).then_some((index, gap))
+                        });
+                        match marker {
+                            Some((index, gap)) => format!(
+                                ">{threshold:.0e}:index={index},nlip_iter={},ipopt_iter={},gap={gap:.3e}",
+                                nlip_trace[index].iteration, ipopt_trace[index].iteration
+                            ),
+                            None => format!(">{threshold:.0e}:none"),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("{metric}[{threshold_text}]")
+            }
+
+            let compared = accepted_nlip_solver_snapshots
+                .len()
+                .min(accepted_ipopt_solver_snapshots.len())
+                .min(nlip_trace.len())
+                .min(ipopt_trace.len());
+            let thresholds = [1.0e-8, 1.0e-6, 1.0e-4, 1.0e-2, 1.0e-1, 1.0, 1.0e1];
+
+            [
+                metric_gap(
+                    "x",
+                    &thresholds,
+                    compared,
+                    |index| {
+                        max_vector_direction_diff(
+                            &accepted_nlip_solver_snapshots[index - 1].x,
+                            &accepted_nlip_solver_snapshots[index].x,
+                            &accepted_ipopt_solver_snapshots[index - 1].x,
+                            &accepted_ipopt_solver_snapshots[index].x,
+                            nlip_trace[index].alpha_pr,
+                            ipopt_trace[index].alpha_pr,
+                        )
+                    },
+                    nlip_trace,
+                    ipopt_trace,
+                ),
+                metric_gap(
+                    "y_c",
+                    &thresholds,
+                    compared,
+                    |index| {
+                        max_vector_direction_diff(
+                            accepted_nlip_solver_snapshots[index - 1]
+                                .equality_multipliers
+                                .as_deref()
+                                .unwrap_or(&[]),
+                            accepted_nlip_solver_snapshots[index]
+                                .equality_multipliers
+                                .as_deref()
+                                .unwrap_or(&[]),
+                            &accepted_ipopt_solver_snapshots[index - 1].equality_multipliers,
+                            &accepted_ipopt_solver_snapshots[index].equality_multipliers,
+                            nlip_trace[index].alpha_pr,
+                            ipopt_trace[index].alpha_pr,
+                        )
+                    },
+                    nlip_trace,
+                    ipopt_trace,
+                ),
+                metric_gap(
+                    "y_d",
+                    &thresholds,
+                    compared,
+                    |index| {
+                        max_vector_direction_diff(
+                            accepted_nlip_solver_snapshots[index - 1]
+                                .inequality_multipliers
+                                .as_deref()
+                                .unwrap_or(&[]),
+                            accepted_nlip_solver_snapshots[index]
+                                .inequality_multipliers
+                                .as_deref()
+                                .unwrap_or(&[]),
+                            &accepted_ipopt_solver_snapshots[index - 1].inequality_multipliers,
+                            &accepted_ipopt_solver_snapshots[index].inequality_multipliers,
+                            nlip_trace[index].alpha_pr,
+                            ipopt_trace[index].alpha_pr,
+                        )
+                    },
+                    nlip_trace,
+                    ipopt_trace,
+                ),
+                metric_gap(
+                    "v_U",
+                    &thresholds,
+                    compared,
+                    |index| {
+                        max_vector_direction_diff(
+                            accepted_nlip_solver_snapshots[index - 1]
+                                .slack_multipliers
+                                .as_deref()
+                                .unwrap_or(&[]),
+                            accepted_nlip_solver_snapshots[index]
+                                .slack_multipliers
+                                .as_deref()
+                                .unwrap_or(&[]),
+                            &accepted_ipopt_solver_snapshots[index - 1]
+                                .slack_upper_bound_multipliers,
+                            &accepted_ipopt_solver_snapshots[index].slack_upper_bound_multipliers,
+                            nlip_trace[index].alpha_du,
+                            ipopt_trace[index].alpha_du,
+                        )
+                    },
+                    nlip_trace,
+                    ipopt_trace,
+                ),
+            ]
+            .join("; ")
         }
 
         fn expanded_compact_lower_bound_multipliers(
@@ -4799,6 +5044,23 @@ mod tests {
                             |idx| glider_inequality_label(idx, intervals, order),
                         )
                     );
+                    println!(
+                        "          top upper-slack multiplier direction diffs: {}",
+                        top_upper_slack_multiplier_direction_diffs(
+                            prev_nlip,
+                            nlip,
+                            prev_ipopt,
+                            ipopt,
+                            nlip_alpha_y,
+                            nlip_alpha_du,
+                            nlip_trace[probe_index].mu,
+                            ipopt_alpha_y,
+                            ipopt_alpha_du,
+                            ipopt_trace[probe_index].mu,
+                            intervals,
+                            order,
+                        )
+                    );
                 }
                 print_internal_ipopt_probe(
                     probe_index,
@@ -5231,6 +5493,15 @@ mod tests {
         println!(
             "direction_gap_ladder {}",
             direction_gap_ladder(&nlip_trace, &ipopt_trace)
+        );
+        println!(
+            "accepted_direction_gap_ladder {}",
+            accepted_direction_gap_ladder(
+                &accepted_nlip_solver_snapshots,
+                &accepted_ipopt_solver_snapshots,
+                &nlip_trace,
+                &ipopt_trace,
+            )
         );
         println!(
             "accepted_state_gap_ladder {}",

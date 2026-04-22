@@ -1619,12 +1619,22 @@ struct SymmetricSubmatrixReduction {
     source_value_indices: Vec<usize>,
 }
 
+#[derive(Clone, Copy)]
+struct ReducedBoundKktData<'a> {
+    x: &'a [f64],
+    bounds: &'a BoundConstraints,
+    fixed_variables: &'a FixedVariableElimination,
+    z_lower: &'a [f64],
+    z_upper: &'a [f64],
+}
+
 struct ReducedKktSystem<'a> {
     hessian: &'a SparseSymmetricMatrix,
     equality_jacobian: &'a SparseMatrix,
     inequality_jacobian: &'a SparseMatrix,
     bound_diagonal: &'a [f64],
     bound_rhs: &'a [f64],
+    bound_data: Option<ReducedBoundKktData<'a>>,
     slack: &'a [f64],
     multipliers: &'a [f64],
     r_dual: &'a [f64],
@@ -1668,6 +1678,7 @@ impl<'a> ReducedKktSystem<'a> {
             inequality_jacobian: self.inequality_jacobian,
             bound_diagonal: self.bound_diagonal,
             bound_rhs: self.bound_rhs,
+            bound_data: self.bound_data,
             slack: self.slack,
             multipliers: self.multipliers,
             r_dual: self.r_dual,
@@ -1712,6 +1723,7 @@ impl<'a> ReducedKktSystem<'a> {
             inequality_jacobian: self.inequality_jacobian,
             bound_diagonal: self.bound_diagonal,
             bound_rhs: self.bound_rhs,
+            bound_data: self.bound_data,
             slack: self.slack,
             multipliers: self.multipliers,
             r_dual: self.r_dual,
@@ -2054,6 +2066,10 @@ impl InteriorPointKktSnapshot {
             inequality_jacobian: &self.inequality_jacobian,
             bound_diagonal: &self.bound_diagonal,
             bound_rhs: &self.bound_rhs,
+            // KKT snapshots do not yet carry the full variable-bound state
+            // needed for IPOPT's z_L/z_U residual rows, so replay diagnostics
+            // use the algebraically equivalent eliminated bound branch.
+            bound_data: None,
             slack: &self.slack,
             multipliers: &self.multipliers,
             r_dual: &self.r_dual,
@@ -2466,9 +2482,15 @@ fn replay_snapshot_with_solver(
             }
             workspace.values.copy_from_slice(&snapshot.augmented_values);
             factor_solve_spral_src(
+                &system,
                 workspace,
                 &snapshot.augmented_rhs,
                 snapshot.regularization,
+                IpoptLinearRefinementShifts {
+                    primal: snapshot.primal_diagonal_shift,
+                    slack: snapshot.primal_diagonal_shift,
+                    dual: snapshot.dual_regularization,
+                },
                 &mut scratch_profiling,
                 false,
             )
@@ -4951,6 +4973,231 @@ fn refine_linear_solution_ccs<E>(
     Ok(steps)
 }
 
+struct IpoptFullSpaceResidual {
+    augmented_correction_rhs: Vec<f64>,
+    residual_ratio: f64,
+}
+
+#[derive(Clone, Copy)]
+struct IpoptLinearRefinementShifts {
+    primal: f64,
+    slack: f64,
+    dual: f64,
+}
+
+fn ipopt_full_space_residual_ratio(
+    system: &ReducedKktSystem<'_>,
+    pattern: &SpralAugmentedKktPattern,
+    solution: &[f64],
+    shifts: IpoptLinearRefinementShifts,
+) -> IpoptFullSpaceResidual {
+    let n = system.hessian.lower_triangle.nrow;
+    let meq = system.equality_jacobian.nrows();
+    let mineq = system.inequality_jacobian.nrows();
+    let dx = &solution[..n];
+    let ipopt_ds = &solution[pattern.p_offset..pattern.p_offset + mineq];
+    let d_lambda = &solution[pattern.lambda_offset..pattern.lambda_offset + meq];
+    let d_ineq = &solution[pattern.z_offset..pattern.z_offset + mineq];
+
+    let mut residual_x = symmetric_ccs_lower_mat_vec(
+        system.hessian.lower_triangle.as_ref(),
+        &system.hessian.values,
+        dx,
+    );
+    for (index, residual_i) in residual_x.iter_mut().enumerate() {
+        *residual_i += shifts.primal * dx[index];
+    }
+    sparse_add_transpose_mat_vec(&mut residual_x, system.equality_jacobian, d_lambda);
+    sparse_add_transpose_mat_vec(&mut residual_x, system.inequality_jacobian, d_ineq);
+
+    let equality_dx = sparse_mat_vec(system.equality_jacobian, dx);
+    let inequality_dx = sparse_mat_vec(system.inequality_jacobian, dx);
+    let mut augmented_correction_rhs = vec![0.0; pattern.dimension()];
+
+    let mut rhs_inf = 0.0_f64;
+    let mut solution_inf = step_inf_norm(dx);
+    let mut bound_residual_inf = 0.0_f64;
+
+    if let Some(bound_data) = system.bound_data {
+        let mut rhs_x = system.r_dual.to_vec();
+        for (residual_i, r_dual_i) in residual_x.iter_mut().zip(system.r_dual.iter()) {
+            *residual_i += *r_dual_i;
+        }
+        let damping = system_positive_slack_damping(system);
+        for ((&index, &lower), &z_i) in bound_data
+            .bounds
+            .lower_indices
+            .iter()
+            .zip(bound_data.bounds.lower_values.iter())
+            .zip(bound_data.z_lower.iter())
+        {
+            let Some(reduced_index) = bound_data.fixed_variables.free_position[index] else {
+                continue;
+            };
+            let slack = native_lower_bound_slack(bound_data.x, index, lower);
+            let complementarity = slack * z_i - system.barrier_parameter;
+            let dz_i = (-complementarity - z_i * dx[reduced_index]) / slack;
+            let residual_z = slack * dz_i + z_i * dx[reduced_index] + complementarity;
+            residual_x[reduced_index] -= dz_i;
+            if damping > 0.0 && !bound_data.bounds.upper_indices.contains(&index) {
+                residual_x[reduced_index] += damping;
+                rhs_x[reduced_index] += damping;
+            }
+            augmented_correction_rhs[reduced_index] += residual_z / slack;
+            bound_residual_inf = bound_residual_inf.max(residual_z.abs());
+            rhs_inf = rhs_inf.max(complementarity.abs());
+            solution_inf = solution_inf.max(dz_i.abs());
+        }
+        for ((&index, &upper), &z_i) in bound_data
+            .bounds
+            .upper_indices
+            .iter()
+            .zip(bound_data.bounds.upper_values.iter())
+            .zip(bound_data.z_upper.iter())
+        {
+            let Some(reduced_index) = bound_data.fixed_variables.free_position[index] else {
+                continue;
+            };
+            let slack = native_upper_bound_slack(bound_data.x, index, upper);
+            let complementarity = slack * z_i - system.barrier_parameter;
+            let dz_i = (-complementarity + z_i * dx[reduced_index]) / slack;
+            let residual_z = slack * dz_i - z_i * dx[reduced_index] + complementarity;
+            residual_x[reduced_index] += dz_i;
+            if damping > 0.0 && !bound_data.bounds.lower_indices.contains(&index) {
+                residual_x[reduced_index] -= damping;
+                rhs_x[reduced_index] -= damping;
+            }
+            augmented_correction_rhs[reduced_index] -= residual_z / slack;
+            bound_residual_inf = bound_residual_inf.max(residual_z.abs());
+            rhs_inf = rhs_inf.max(complementarity.abs());
+            solution_inf = solution_inf.max(dz_i.abs());
+        }
+        for (rhs_i, residual_i) in augmented_correction_rhs[..n]
+            .iter_mut()
+            .zip(residual_x.iter())
+        {
+            *rhs_i += *residual_i;
+        }
+        rhs_inf = rhs_inf.max(step_inf_norm(&rhs_x));
+    } else {
+        for (residual_i, (r_dual_i, bound_rhs_i)) in residual_x
+            .iter_mut()
+            .zip(system.r_dual.iter().zip(system.bound_rhs.iter()))
+        {
+            *residual_i -= -*r_dual_i + *bound_rhs_i;
+        }
+        for (index, residual_i) in residual_x.iter_mut().enumerate() {
+            *residual_i += system.bound_diagonal.get(index).copied().unwrap_or(0.0) * dx[index];
+        }
+        augmented_correction_rhs[..n].copy_from_slice(&residual_x);
+        rhs_inf = system
+            .r_dual
+            .iter()
+            .zip(system.bound_rhs.iter())
+            .fold(0.0_f64, |acc, (r_dual_i, bound_rhs_i)| {
+                acc.max((-*r_dual_i + *bound_rhs_i).abs())
+            });
+    }
+
+    let mut residual_inf = step_inf_norm(&residual_x).max(bound_residual_inf);
+
+    for row in 0..mineq {
+        let slack = system.slack[row];
+        let multiplier = system.multipliers[row];
+        let ipopt_ds_i = ipopt_ds[row];
+        let dz_i = ipopt_upper_slack_bound_multiplier_step(
+            slack,
+            multiplier,
+            system.r_cent[row],
+            ipopt_ds_i,
+        );
+        let damped_slack_stationarity = damped_slack_stationarity_residual(system, row);
+        let residual_s = dz_i - d_ineq[row] + damped_slack_stationarity + shifts.slack * ipopt_ds_i;
+        let residual_v = slack * dz_i - multiplier * ipopt_ds_i + system.r_cent[row];
+        let residual_d =
+            inequality_dx[row] - ipopt_ds_i - shifts.dual * d_ineq[row] + system.r_ineq[row];
+        // Mirrors Ipopt::PDFullSpaceSolver::SolveOnce: full-space residuals
+        // from ComputeResiduals are converted to the augmented-system RHS with
+        // Pd_U.AddMSinvZ(-1.0, ...), i.e. rhs_s - rhs_v_U / slack_s_U.
+        augmented_correction_rhs[pattern.p_offset + row] = residual_s - residual_v / slack;
+        augmented_correction_rhs[pattern.z_offset + row] = residual_d;
+        residual_inf = residual_inf
+            .max(residual_s.abs())
+            .max(residual_v.abs())
+            .max(residual_d.abs());
+        rhs_inf = rhs_inf
+            .max(damped_slack_stationarity.abs())
+            .max(system.r_cent[row].abs())
+            .max(system.r_ineq[row].abs());
+        solution_inf = solution_inf
+            .max(ipopt_ds_i.abs())
+            .max(d_ineq[row].abs())
+            .max(dz_i.abs());
+    }
+
+    for row in 0..meq {
+        let residual_c = equality_dx[row] - shifts.dual * d_lambda[row] + system.r_eq[row];
+        augmented_correction_rhs[pattern.lambda_offset + row] = residual_c;
+        residual_inf = residual_inf.max(residual_c.abs());
+        rhs_inf = rhs_inf.max(system.r_eq[row].abs());
+        solution_inf = solution_inf.max(d_lambda[row].abs());
+    }
+
+    let residual_ratio = if rhs_inf + solution_inf == 0.0 {
+        residual_inf
+    } else {
+        let denominator = solution_inf.min(IPOPT_LINEAR_RESIDUAL_MAX_COND * rhs_inf) + rhs_inf;
+        residual_inf / denominator
+    };
+    IpoptFullSpaceResidual {
+        augmented_correction_rhs,
+        residual_ratio,
+    }
+}
+
+fn refine_ipopt_full_space_solution<E>(
+    system: &ReducedKktSystem<'_>,
+    pattern: &SpralAugmentedKktPattern,
+    solution: &mut [f64],
+    shifts: IpoptLinearRefinementShifts,
+    solve_time: &mut Duration,
+    mut solve_correction: impl FnMut(&[f64]) -> Result<Vec<f64>, E>,
+) -> Result<usize, E> {
+    // IPOPT refines PDFullSpaceSolver systems on the full unsymmetric
+    // primal-dual residual, not on the already-eliminated symmetric augmented
+    // matrix residual; see IpPDFullSpaceSolver.cpp::ComputeResiduals,
+    // SolveOnce, and ComputeResidualRatio.
+    let mut steps = 0;
+    let mut residual = ipopt_full_space_residual_ratio(system, pattern, solution, shifts);
+    let mut residual_ratio = residual.residual_ratio;
+    let mut previous_residual_ratio = residual_ratio;
+    while steps < IPOPT_LINEAR_MIN_REFINEMENT_STEPS
+        || residual_ratio > IPOPT_LINEAR_RESIDUAL_RATIO_MAX
+    {
+        let correction_started = Instant::now();
+        let correction = solve_correction(&residual.augmented_correction_rhs)?;
+        *solve_time += correction_started.elapsed();
+        for (solution_i, correction_i) in solution.iter_mut().zip(correction.iter()) {
+            *solution_i -= correction_i;
+        }
+        steps += 1;
+        let new_residual = ipopt_full_space_residual_ratio(system, pattern, solution, shifts);
+        let new_residual_ratio = new_residual.residual_ratio;
+        if new_residual_ratio > IPOPT_LINEAR_RESIDUAL_RATIO_MAX
+            && steps > IPOPT_LINEAR_MIN_REFINEMENT_STEPS
+            && (steps > IPOPT_LINEAR_MAX_REFINEMENT_STEPS
+                || new_residual_ratio
+                    > IPOPT_LINEAR_RESIDUAL_IMPROVEMENT_FACTOR * previous_residual_ratio)
+        {
+            break;
+        }
+        residual = new_residual;
+        previous_residual_ratio = new_residual_ratio;
+        residual_ratio = new_residual_ratio;
+    }
+    Ok(steps)
+}
+
 fn interior_point_linear_inertia(inertia: SpralInertia) -> InteriorPointLinearInertia {
     InteriorPointLinearInertia {
         positive: inertia.positive,
@@ -6069,9 +6316,11 @@ fn factor_solve_spral_ssids(
 }
 
 fn factor_solve_spral_src(
+    system: &ReducedKktSystem<'_>,
     workspace: &mut NativeSpralAugmentedKktWorkspace,
     rhs: &[f64],
     regularization: f64,
+    shifts: IpoptLinearRefinementShifts,
     profiling: &mut InteriorPointProfiling,
     verbose: bool,
 ) -> std::result::Result<(Vec<f64>, LinearBackendRunStats), InteriorPointLinearSolveAttempt> {
@@ -6188,11 +6437,11 @@ fn factor_solve_spral_src(
         )
     })?;
     let mut solve_time = solve_started.elapsed();
-    let refinement_steps = refine_linear_solution_ccs(
-        &workspace.pattern.ccs,
-        &workspace.values,
-        rhs,
+    let refinement_steps = refine_ipopt_full_space_solution(
+        system,
+        &workspace.pattern,
         &mut solution,
+        shifts,
         &mut solve_time,
         |residual| {
             session.solve(residual).map_err(|error| {
@@ -6219,8 +6468,9 @@ fn factor_solve_spral_src(
                     inertia: Some(interior_point_linear_inertia(factor_info.inertia)),
                     residual_inf: assessment.residual_inf,
                     solution_inf: assessment.solution_inf,
-                    detail: (refinement_steps > 0)
-                        .then(|| format!("iterative_refinement_steps={refinement_steps}")),
+                    detail: (refinement_steps > 0).then(|| {
+                        format!("full_space_iterative_refinement_steps={refinement_steps}")
+                    }),
                 },
             )
         })
@@ -6285,7 +6535,19 @@ fn solve_reduced_kkt_with_spral_src(
             slack_shift,
             dual_shift,
         );
-        match factor_solve_spral_src(workspace, &rhs, current_regularization, profiling, verbose) {
+        match factor_solve_spral_src(
+            system,
+            workspace,
+            &rhs,
+            current_regularization,
+            IpoptLinearRefinementShifts {
+                primal: primal_shift,
+                slack: slack_shift,
+                dual: dual_shift,
+            },
+            profiling,
+            verbose,
+        ) {
             Ok((solution, mut backend_stats)) => {
                 if !attempts.is_empty() {
                     let attempt_detail = attempts
@@ -8792,6 +9054,13 @@ where
             inequality_jacobian: &linear_inequality_jacobian,
             bound_diagonal: &bound_diagonal,
             bound_rhs: &bound_rhs,
+            bound_data: Some(ReducedBoundKktData {
+                x: &x,
+                bounds: &bounds,
+                fixed_variables: &fixed_variables,
+                z_lower: &z_lower,
+                z_upper: &z_upper,
+            }),
             slack: &slack_barrier,
             multipliers: &z,
             r_dual: &dual_residual,

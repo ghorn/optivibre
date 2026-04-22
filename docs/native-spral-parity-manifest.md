@@ -7,19 +7,26 @@ regression test.
 
 ## Preflight
 
-Normal distribution builds should use `spral-src` / `ipopt-src` and must not
-depend on Homebrew, `/usr/local`, or `/Users/greg/local/ipopt-spral`.
-Parity acceptance must force NLIP `InteriorPointLinearSolver::SpralSrc` and
-IPOPT `linear_solver=spral`; `Auto`, QDLDL, MUMPS, and MKL-backed IPOPT modes
-are runtime/compatibility choices only and must fail parity preflight.
+Normal nonlinear parity and distribution builds should use `spral-src` /
+`ipopt-src` and must not depend on Homebrew, `/usr/local`, or
+`/Users/greg/local/ipopt-spral`. Parity acceptance must force NLIP
+`InteriorPointLinearSolver::SpralSrc` and IPOPT `linear_solver=spral`; `Auto`,
+QDLDL, MUMPS, and MKL-backed IPOPT modes are runtime/compatibility choices only
+and must fail parity preflight.
 
-Run parity acceptance commands through:
+Source-built NLIP/IPOPT parity runs require `OMP_CANCELLATION=true`,
+`RAYON_NUM_THREADS=1`, and `OMP_NUM_THREADS=1`. NLIP must use
+`InteriorPointLinearSolver::SpralSrc`; IPOPT must use `linear_solver=spral`.
+The linked provenance should report `linked_solver_stack=source-built-spral`,
+IPOPT `3.14.20`, source-built SPRAL, and static solver/math libraries.
+
+Dynamic native SPRAL parity diagnostics can still run through:
 
 ```sh
 scripts/native_spral_parity_preflight.sh <command>
 ```
 
-The preflight sources `scripts/use_local_ipopt_spral_env.sh`, requires IPOPT
+That preflight sources `scripts/use_local_ipopt_spral_env.sh`, requires IPOPT
 3.14.20 from `/Users/greg/local/ipopt-spral`, pins `SPRAL_SSIDS_NATIVE_LIB` to
 the local `libspral.dylib`, sets `RAYON_NUM_THREADS=1` and `OMP_NUM_THREADS=1`
 by default, enables `AD_CODEGEN_REQUIRE_NATIVE_SPRAL_PARITY=1`, and records the
@@ -37,7 +44,7 @@ feature; source-built native SPRAL is `native-spral-src`.
 | --- | --- | --- |
 | `apply_native_spral_parity_to_nlip_options` / `apply_native_spral_parity_to_ipopt_options` | `IpSpralSolverInterface.cpp`, IPOPT option registration | None for parity runs: both lanes must use native SPRAL/SPRAL with matching order, matching scaling, block APP, `small=1e-20`, `u=1e-8`, `umax=1e-4`, GPU off. |
 | Full-space KKT assembly and slack signs | `IpPDFullSpaceSolver.cpp`, `IpPDSearchDirCalc.cpp`, `IpIpoptCalculatedQuantities.cpp` | Rust may expose user-facing slack step signs, but the internal linear system must match IPOPT before conversion. |
-| Linear residual and iterative refinement | `IpPDFullSpaceSolver.cpp` | None. Use IPOPT's full-system residual ratio, min/max refinement steps, improvement test, quality retry, and pretend-singular semantics. |
+| Linear residual and iterative refinement | `IpPDFullSpaceSolver.cpp::ComputeResiduals`, `SolveOnce`, `ComputeResidualRatio` | The live `SpralSrc` path reconstructs IPOPT full-space residual rows, including upper-slack and variable-bound multiplier rows, before converting them back to the augmented correction RHS. Snapshot replay uses the eliminated bound branch until snapshots carry variable-bound state. Quality retry and pretend-singular semantics are still in progress. |
 | Hessian/Jacobian perturbation and inertia retries | `IpPDPerturbationHandler.cpp` | None for accepted state changes. Diagnostic experiments must not be committed as parity fixes. |
 | Augmented-system solve and inertia checks | `IpStdAugSystemSolver.cpp`, `IpSpralSolverInterface.cpp` | None in native-SPRAL parity acceptance. `Auto`, `SparseQdldl`, and fallback solves are diagnostic only. |
 | Line search, `alpha_for_y`, filter, watchdog, SOC, restoration | IPOPT `Algorithm/` source for the corresponding component | Change only after direction/KKT parity evidence says the divergence has moved above the linear solve. |
