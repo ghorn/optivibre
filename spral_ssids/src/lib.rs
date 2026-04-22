@@ -9453,6 +9453,59 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
     }
 
     #[test]
+    fn dense_seed6_app_block_storage_diverges_after_matching_prefix_trace() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let (dimension, lower_dense) = lower_dense_seed6_33();
+        let options = NumericFactorOptions::default();
+        let native_lda = native_aligned_double_stride(shim, dimension);
+        assert_eq!(native_lda, 34);
+
+        let rust_trace = rust_app_block_prefix_trace_32(&lower_dense, dimension, options);
+        let native_trace =
+            native_block_prefix_trace_32(shim, &lower_dense, dimension, native_lda, options);
+        assert_block_prefix_traces_equal(&rust_trace, &native_trace);
+
+        let rust = rust_block_ldlt_32_from_lower_dense(&lower_dense, dimension, options);
+        let native = native_block_ldlt_32_from_lower_dense(
+            shim,
+            &lower_dense,
+            dimension,
+            native_lda,
+            options,
+        );
+        assert_eq!(rust.perm, native.perm);
+        assert_eq!(rust.local_perm, native.local_perm);
+        for (index, (&rust_value, &native_value)) in
+            rust.diagonal.iter().zip(&native.diagonal).enumerate()
+        {
+            assert_eq!(
+                rust_value.to_bits(),
+                native_value.to_bits(),
+                "dense seed6 APP block D mismatch after matching prefix trace index={index}"
+            );
+        }
+
+        let mut first_mismatch = None;
+        'matrix_compare: for col in 0..APP_INNER_BLOCK_SIZE {
+            for row in col..APP_INNER_BLOCK_SIZE {
+                let rust_bits = rust.matrix[col * dimension + row].to_bits();
+                let native_bits = native.matrix[col * native_lda + row].to_bits();
+                if rust_bits != native_bits {
+                    first_mismatch = Some((row, col, rust_bits, native_bits));
+                    break 'matrix_compare;
+                }
+            }
+        }
+        assert_eq!(
+            first_mismatch,
+            Some((30, 28, 0xbf81_6117_c4f8_272d, 0xbf81_6117_c4f8_2730)),
+            "dense seed6 APP block L-storage boundary moved after matching prefix trace"
+        );
+    }
+
+    #[test]
     #[ignore = "manual native-vs-rust production APP acceptance/storage witness after matching block_ldlt<32> prefix"]
     fn app_block_ldlt_32_matches_native_dense_seed6_prefix() {
         let Some(shim) = native_kernel_shim_or_skip() else {
