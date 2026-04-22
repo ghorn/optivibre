@@ -5603,7 +5603,10 @@ fn factor_solve_spral_src_symmetric_with_metrics(
     let factorization_time = factor_started.elapsed();
     let inertia = interior_point_linear_inertia(factor_info.inertia);
     let solve_started = Instant::now();
-    let mut solution = session.solve(rhs).map_err(|error| {
+    // IPOPT's SpralSolverInterface::MultiSolve calls spral_ssids_solve with
+    // nrhs=1 even for a single right-hand side. Keep the NLIP source-built
+    // SPRAL path on the same C entrypoint instead of spral_ssids_solve1.
+    let mut solution = session.solve_ipopt_single_rhs(rhs).map_err(|error| {
         native_spral_error_attempt(
             regularization,
             InteriorPointLinearSolveFailureKind::FactorizationFailed,
@@ -5618,7 +5621,7 @@ fn factor_solve_spral_src_symmetric_with_metrics(
         &mut solution,
         &mut solve_time,
         |residual| {
-            session.solve(residual).map_err(|error| {
+            session.solve_ipopt_single_rhs(residual).map_err(|error| {
                 native_spral_error_attempt(
                     regularization,
                     InteriorPointLinearSolveFailureKind::FactorizationFailed,
@@ -6490,7 +6493,10 @@ fn factor_solve_spral_src(
         .session
         .as_ref()
         .expect("native SPRAL session must exist after factorization");
-    let mut solution = session.solve(rhs).map_err(|error| {
+    // IPOPT's SpralSolverInterface::MultiSolve calls spral_ssids_solve with
+    // nrhs=1 even for a single right-hand side. Keep the live SpralSrc KKT path
+    // on the same C entrypoint instead of spral_ssids_solve1.
+    let mut solution = session.solve_ipopt_single_rhs(rhs).map_err(|error| {
         native_spral_error_attempt(
             regularization,
             InteriorPointLinearSolveFailureKind::FactorizationFailed,
@@ -6505,7 +6511,7 @@ fn factor_solve_spral_src(
         context.shifts,
         &mut solve_time,
         |residual| {
-            session.solve(residual).map_err(|error| {
+            session.solve_ipopt_single_rhs(residual).map_err(|error| {
                 native_spral_error_attempt(
                     regularization,
                     InteriorPointLinearSolveFailureKind::FactorizationFailed,

@@ -47,6 +47,16 @@ type SpralSolve1Fn = unsafe extern "C" fn(
     *const SpralSsidsOptions,
     *mut SpralSsidsInform,
 );
+type SpralSolveFn = unsafe extern "C" fn(
+    i32,
+    i32,
+    *mut f64,
+    i32,
+    *mut c_void,
+    *mut c_void,
+    *const SpralSsidsOptions,
+    *mut SpralSsidsInform,
+);
 type SpralEnquireIndefFn = unsafe extern "C" fn(
     *const c_void,
     *const c_void,
@@ -151,6 +161,7 @@ struct NativeSpralLibrary {
     analyse: SpralAnalyseFn,
     factor: SpralFactorFn,
     solve1: SpralSolve1Fn,
+    solve: SpralSolveFn,
     enquire_indef: SpralEnquireIndefFn,
     free: SpralFreeFn,
 }
@@ -192,6 +203,16 @@ unsafe extern "C" {
         options: *const SpralSsidsOptions,
         inform: *mut SpralSsidsInform,
     );
+    fn spral_ssids_solve(
+        job: i32,
+        nrhs: i32,
+        rhs: *mut f64,
+        ldx: i32,
+        akeep: *mut c_void,
+        fkeep: *mut c_void,
+        options: *const SpralSsidsOptions,
+        inform: *mut SpralSsidsInform,
+    );
     fn spral_ssids_enquire_indef(
         akeep: *const c_void,
         fkeep: *const c_void,
@@ -215,6 +236,7 @@ fn linked_spral_library() -> NativeSpralLibrary {
         analyse: spral_ssids_analyse,
         factor: spral_ssids_factor,
         solve1: spral_ssids_solve1,
+        solve: spral_ssids_solve,
         enquire_indef: spral_ssids_enquire_indef,
         free: spral_ssids_free,
     }
@@ -373,6 +395,11 @@ impl NativeSpral {
                             &candidate,
                             b"spral_ssids_solve1\0",
                         )?;
+                        let solve = load_symbol::<SpralSolveFn>(
+                            &library,
+                            &candidate,
+                            b"spral_ssids_solve\0",
+                        )?;
                         let enquire_indef = load_symbol::<SpralEnquireIndefFn>(
                             &library,
                             &candidate,
@@ -390,6 +417,7 @@ impl NativeSpral {
                                 analyse,
                                 factor,
                                 solve1,
+                                solve,
                                 enquire_indef,
                                 free,
                             }),
@@ -712,6 +740,12 @@ impl NativeSpralSession {
         Ok(solution)
     }
 
+    pub fn solve_ipopt_single_rhs(&self, rhs: &[f64]) -> Result<Vec<f64>, NativeSpralError> {
+        let mut solution = rhs.to_vec();
+        self.solve_ipopt_single_rhs_in_place(&mut solution)?;
+        Ok(solution)
+    }
+
     pub fn solve_in_place(&self, rhs: &mut [f64]) -> Result<(), NativeSpralError> {
         if rhs.len() != self.dimension {
             return Err(NativeSpralError::DimensionMismatch {
@@ -727,6 +761,39 @@ impl NativeSpralSession {
             (self.inner.solve1)(
                 0,
                 rhs.as_mut_ptr(),
+                self.analysed,
+                self.factorized,
+                &self.options,
+                &mut inform,
+            );
+        }
+        if inform.flag < 0 {
+            return Err(NativeSpralError::SolveFailed { flag: inform.flag });
+        }
+        Ok(())
+    }
+
+    pub fn solve_ipopt_single_rhs_in_place(&self, rhs: &mut [f64]) -> Result<(), NativeSpralError> {
+        if rhs.len() != self.dimension {
+            return Err(NativeSpralError::DimensionMismatch {
+                expected: self.dimension,
+                actual: rhs.len(),
+            });
+        }
+        if self.factorized.is_null() {
+            return Err(NativeSpralError::NotFactorized);
+        }
+        let ldx =
+            i32::try_from(self.dimension).map_err(|_| NativeSpralError::DimensionTooLarge {
+                dimension: self.dimension,
+            })?;
+        let mut inform = SpralSsidsInform::default();
+        unsafe {
+            (self.inner.solve)(
+                0,
+                1,
+                rhs.as_mut_ptr(),
+                ldx,
                 self.analysed,
                 self.factorized,
                 &self.options,
