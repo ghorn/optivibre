@@ -7,7 +7,16 @@ Orange nodes have partial coverage or a known narrowed boundary. Gold-orange
 nodes are newly passing guards that narrow an open mismatch without proving full
 bitwise parity. Red nodes are the next open bitwise mismatch target.
 
-Current newly narrowed witness:
+Current newly passing metadata witness:
+`dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now reports
+continuation mismatches with the full APP prefix snapshot pivot metadata. The
+source-plain continuation boundary is pinned to `step=0, from=0, status=2,
+next=2`, and the FMA-shaped continuation boundary is pinned to `step=10,
+from=19, status=2, next=21`. This does not prove a new numeric node green, but
+it makes future movement in the APP pivot trajectory fail at the exact pivot
+transition instead of only at a final matrix/D entry.
+
+Previous newly narrowed witness:
 `dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now re-enters
 native `block_ldlt<32>` from recorded APP prefix-trace snapshots. The source
 and FMA trace variants are compile-time specializations, so this no longer
@@ -224,7 +233,8 @@ flowchart TD
     I0r --> I0s["Dense seed09 source-plain native trace D/matrix gap"]
     I0s --> I0q["Dense seed09 source-plain continuation first-step D gap"]
     I0q --> I0n["Dense seed09 FMA native trace-vs-wrapper APP permutation and D"]
-    I0n --> I0c["Dense seed09 FMA continuation to row30/col19 matrix gap"]
+    I0n --> I0m["Dense seed09 continuation pivot metadata"]
+    I0m --> I0c["Dense seed09 FMA continuation to row30/col19 matrix gap"]
     I0c --> I0d["Dense seed09 FMA native trace-vs-wrapper APP matrix gap"]
     I0d --> I0t["Dense seed09 source-shaped APP host_trsm gap"]
     I0t --> I0b["Dense seed09 source-shaped APP post-apply operand gap"]
@@ -274,6 +284,7 @@ flowchart TD
     class A,B,B1,B2,B3,G0,G1,G3,G5,G6,G8,G8a,G8b,G9,H1,H2,H3,K1,M,O,P,Q,R match;
     class I0p,I0r match;
     class I0s partial;
+    class I0m newly;
     class I0q,I0c newlyPartial;
     class I0n match;
     class I0d partial;

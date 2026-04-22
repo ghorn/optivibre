@@ -5747,6 +5747,20 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         diagonal: Vec<f64>,
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct BlockContinuationMismatch {
+        step: usize,
+        from: usize,
+        status: i32,
+        next: usize,
+        component: &'static str,
+        index: usize,
+        row: usize,
+        col: usize,
+        continued_bits: u64,
+        block_bits: u64,
+    }
+
     struct RustAppBlockStepState<'a> {
         rows: &'a mut [usize],
         matrix: &'a mut [f64],
@@ -6922,6 +6936,89 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             matrix,
             diagonal,
         }
+    }
+
+    fn first_native_block_continuation_mismatch(
+        shim: &NativeKernelShim,
+        snapshots: &[BlockPrefixSnapshot],
+        expected: &BlockLdltKernelResult,
+        lda: usize,
+        options: NumericFactorOptions,
+    ) -> Option<BlockContinuationMismatch> {
+        for snapshot in snapshots {
+            let continued =
+                native_block_ldlt_32_continue_from_snapshot(shim, snapshot, lda, options);
+            if continued.perm != expected.perm {
+                return Some(BlockContinuationMismatch {
+                    step: snapshot.step,
+                    from: snapshot.from,
+                    status: snapshot.status,
+                    next: snapshot.next,
+                    component: "perm",
+                    index: 0,
+                    row: 0,
+                    col: 0,
+                    continued_bits: 0,
+                    block_bits: 0,
+                });
+            }
+            if continued.local_perm != expected.local_perm {
+                return Some(BlockContinuationMismatch {
+                    step: snapshot.step,
+                    from: snapshot.from,
+                    status: snapshot.status,
+                    next: snapshot.next,
+                    component: "local_perm",
+                    index: 0,
+                    row: 0,
+                    col: 0,
+                    continued_bits: 0,
+                    block_bits: 0,
+                });
+            }
+            for (index, (&continued_value, &block_value)) in continued
+                .diagonal
+                .iter()
+                .zip(&expected.diagonal)
+                .enumerate()
+            {
+                if continued_value.to_bits() != block_value.to_bits() {
+                    return Some(BlockContinuationMismatch {
+                        step: snapshot.step,
+                        from: snapshot.from,
+                        status: snapshot.status,
+                        next: snapshot.next,
+                        component: "diagonal",
+                        index,
+                        row: 0,
+                        col: 0,
+                        continued_bits: continued_value.to_bits(),
+                        block_bits: block_value.to_bits(),
+                    });
+                }
+            }
+            for col in 0..APP_INNER_BLOCK_SIZE {
+                for row in col..APP_INNER_BLOCK_SIZE {
+                    let continued_bits = continued.matrix[col * lda + row].to_bits();
+                    let block_bits = expected.matrix[col * lda + row].to_bits();
+                    if continued_bits != block_bits {
+                        return Some(BlockContinuationMismatch {
+                            step: snapshot.step,
+                            from: snapshot.from,
+                            status: snapshot.status,
+                            next: snapshot.next,
+                            component: "matrix",
+                            index: row * APP_INNER_BLOCK_SIZE + col,
+                            row,
+                            col,
+                            continued_bits,
+                            block_bits,
+                        });
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn rust_block_ldlt_32_from_lower_dense(
@@ -9839,69 +9936,27 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             Some((30, 19, 0xbf8c_bfa8_da67_4b6b, 0xbf8c_bfa8_da67_4b6c)),
             "dense seed09 native APP trace/block_ldlt matrix boundary moved"
         );
-        let mut first_fma_continuation_mismatch = None;
-        'fma_continuation_compare: for snapshot in &native_trace {
-            let continued =
-                native_block_ldlt_32_continue_from_snapshot(shim, snapshot, native_lda, options);
-            if continued.perm != native_block.perm {
-                first_fma_continuation_mismatch =
-                    Some((snapshot.step, snapshot.next, "perm", 0, 0, 0, 0));
-                break;
-            }
-            if continued.local_perm != native_block.local_perm {
-                first_fma_continuation_mismatch =
-                    Some((snapshot.step, snapshot.next, "local_perm", 0, 0, 0, 0));
-                break;
-            }
-            for (index, (&continued_value, &block_value)) in continued
-                .diagonal
-                .iter()
-                .zip(&native_block.diagonal)
-                .enumerate()
-            {
-                if continued_value.to_bits() != block_value.to_bits() {
-                    first_fma_continuation_mismatch = Some((
-                        snapshot.step,
-                        snapshot.next,
-                        "diagonal",
-                        index,
-                        0,
-                        continued_value.to_bits(),
-                        block_value.to_bits(),
-                    ));
-                    break 'fma_continuation_compare;
-                }
-            }
-            for col in block_start..block_end {
-                for row in col..block_end {
-                    let continued_bits = continued.matrix[col * native_lda + row].to_bits();
-                    let block_bits = native_block.matrix[col * native_lda + row].to_bits();
-                    if continued_bits != block_bits {
-                        first_fma_continuation_mismatch = Some((
-                            snapshot.step,
-                            snapshot.next,
-                            "matrix",
-                            row,
-                            col,
-                            continued_bits,
-                            block_bits,
-                        ));
-                        break 'fma_continuation_compare;
-                    }
-                }
-            }
-        }
+        let first_fma_continuation_mismatch = first_native_block_continuation_mismatch(
+            shim,
+            &native_trace,
+            &native_block,
+            native_lda,
+            options,
+        );
         assert_eq!(
             first_fma_continuation_mismatch,
-            Some((
-                10,
-                21,
-                "matrix",
-                30,
-                19,
-                0xbf8c_bfa8_da67_4b6b,
-                0xbf8c_bfa8_da67_4b6c,
-            )),
+            Some(BlockContinuationMismatch {
+                step: 10,
+                from: 19,
+                status: 2,
+                next: 21,
+                component: "matrix",
+                index: 979,
+                row: 30,
+                col: 19,
+                continued_bits: 0xbf8c_bfa8_da67_4b6b,
+                block_bits: 0xbf8c_bfa8_da67_4b6c,
+            }),
             "dense seed09 FMA native APP trace continuation boundary moved"
         );
         assert_eq!(
@@ -9947,69 +10002,27 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             Some((2, 0, 0x3f79_e327_dcf6_7cce, 0x3f79_e327_dcf6_7ccf)),
             "dense seed09 source native APP trace/block_ldlt matrix boundary moved"
         );
-        let mut first_source_continuation_mismatch = None;
-        'source_continuation_compare: for snapshot in &native_source_trace {
-            let continued =
-                native_block_ldlt_32_continue_from_snapshot(shim, snapshot, native_lda, options);
-            if continued.perm != native_block.perm {
-                first_source_continuation_mismatch =
-                    Some((snapshot.step, snapshot.next, "perm", 0, 0, 0, 0));
-                break;
-            }
-            if continued.local_perm != native_block.local_perm {
-                first_source_continuation_mismatch =
-                    Some((snapshot.step, snapshot.next, "local_perm", 0, 0, 0, 0));
-                break;
-            }
-            for (index, (&continued_value, &block_value)) in continued
-                .diagonal
-                .iter()
-                .zip(&native_block.diagonal)
-                .enumerate()
-            {
-                if continued_value.to_bits() != block_value.to_bits() {
-                    first_source_continuation_mismatch = Some((
-                        snapshot.step,
-                        snapshot.next,
-                        "diagonal",
-                        index,
-                        0,
-                        continued_value.to_bits(),
-                        block_value.to_bits(),
-                    ));
-                    break 'source_continuation_compare;
-                }
-            }
-            for col in block_start..block_end {
-                for row in col..block_end {
-                    let continued_bits = continued.matrix[col * native_lda + row].to_bits();
-                    let block_bits = native_block.matrix[col * native_lda + row].to_bits();
-                    if continued_bits != block_bits {
-                        first_source_continuation_mismatch = Some((
-                            snapshot.step,
-                            snapshot.next,
-                            "matrix",
-                            row,
-                            col,
-                            continued_bits,
-                            block_bits,
-                        ));
-                        break 'source_continuation_compare;
-                    }
-                }
-            }
-        }
+        let first_source_continuation_mismatch = first_native_block_continuation_mismatch(
+            shim,
+            &native_source_trace,
+            &native_block,
+            native_lda,
+            options,
+        );
         assert_eq!(
             first_source_continuation_mismatch,
-            Some((
-                0,
-                2,
-                "diagonal",
-                7,
-                0,
-                0xbf2b_4429_642a_1ee2,
-                0xbf2b_4429_642a_1ee4,
-            )),
+            Some(BlockContinuationMismatch {
+                step: 0,
+                from: 0,
+                status: 2,
+                next: 2,
+                component: "diagonal",
+                index: 7,
+                row: 0,
+                col: 0,
+                continued_bits: 0xbf2b_4429_642a_1ee2,
+                block_bits: 0xbf2b_4429_642a_1ee4,
+            }),
             "dense seed09 source native APP trace continuation boundary moved"
         );
         let mut native_source_apply_matrix = native_block.matrix.clone();
