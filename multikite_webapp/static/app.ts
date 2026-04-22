@@ -27,6 +27,7 @@ interface PlotlyLike {
     update: PlotlyDatum,
     indices: number[]
   ): Promise<unknown>;
+  relayout(element: HTMLElement, update: PlotlyDatum): Promise<unknown>;
   purge(element: HTMLElement): void;
   Plots?: {
     resize(element: HTMLElement): void;
@@ -34,6 +35,14 @@ interface PlotlyLike {
 }
 
 declare const Plotly: PlotlyLike;
+
+interface PlotlyRelayoutEvent {
+  [key: string]: unknown;
+}
+
+interface PlotElement extends HTMLElement {
+  on(event: "plotly_relayout", handler: (event: PlotlyRelayoutEvent) => void): void;
+}
 
 interface MathJaxLike {
   typesetPromise?(elements: Element[]): Promise<unknown>;
@@ -253,7 +262,6 @@ const runtimeConsoleTab = document.querySelector<HTMLButtonElement>("#runtime-ta
 const runtimePlotsTab = document.querySelector<HTMLButtonElement>("#runtime-tab-plots")!;
 const runtimeConsoleView = document.querySelector<HTMLElement>("#runtime-console-view")!;
 const runtimePlotsView = document.querySelector<HTMLElement>("#runtime-plots-view")!;
-const plotKiteControlsNode = document.querySelector<HTMLElement>("#plot-kite-controls")!;
 const plotsNode = document.querySelector<HTMLElement>("#plots")!;
 const viewport = document.querySelector<HTMLElement>("#viewport")!;
 const runForm = document.querySelector<HTMLFormElement>("#run-form")!;
@@ -670,6 +678,7 @@ const MAX_PLOT_COLUMNS = 3;
 const PLOT_SECTION_ROW_HEIGHT_PX = 292;
 let activePlotSections: ActivePlotSection[] = [];
 let plotKiteVisibility: boolean[] = [];
+let syncingPlotXAxes = false;
 
 interface KiteBreakdownTraceDefinition {
   name: string;
@@ -1393,10 +1402,30 @@ function sectionTraceVisibility(definition: PlotSectionDefinition): boolean[] {
   );
 }
 
+function syncPlotKiteControlUi(): void {
+  document.querySelectorAll<HTMLLabelElement>(".plot-kite-toggle").forEach((label) => {
+    const kiteIndex = Number(label.dataset.kiteIndex);
+    if (!Number.isInteger(kiteIndex)) {
+      return;
+    }
+    const visible = plotKiteVisibility[kiteIndex] ?? true;
+    const input = label.querySelector<HTMLInputElement>("input");
+    const state = label.querySelector<HTMLElement>(".plot-kite-state");
+    if (input) {
+      input.checked = visible;
+    }
+    if (state) {
+      state.textContent = visible ? "shown" : "hidden";
+    }
+    label.classList.toggle("muted", !visible);
+  });
+}
+
 function applyPlotKiteVisibility(): void {
   if (activePlotSections.length === 0) {
     return;
   }
+  syncPlotKiteControlUi();
 
   const updates = activePlotSections.map((section) =>
     Plotly.restyle(
@@ -1412,10 +1441,10 @@ function applyPlotKiteVisibility(): void {
   });
 }
 
-function renderPlotKiteControls(kiteCount: number): void {
+function renderPlotKiteControls(container: HTMLElement, kiteCount: number): void {
   ensurePlotKiteVisibility(kiteCount);
-  plotKiteControlsNode.innerHTML = "";
-  plotKiteControlsNode.classList.toggle("empty", kiteCount === 0);
+  container.innerHTML = "";
+  container.classList.toggle("empty", kiteCount === 0);
   if (kiteCount === 0) {
     return;
   }
@@ -1423,15 +1452,16 @@ function renderPlotKiteControls(kiteCount: number): void {
   const title = document.createElement("div");
   title.className = "plot-kite-controls-title";
   title.textContent = "Visible";
-  plotKiteControlsNode.append(title);
+  container.append(title);
 
   const toggleGroup = document.createElement("div");
   toggleGroup.className = "plot-kite-toggle-group";
-  plotKiteControlsNode.append(toggleGroup);
+  container.append(toggleGroup);
 
   for (let kiteIndex = 0; kiteIndex < kiteCount; kiteIndex += 1) {
     const label = document.createElement("label");
     label.className = "plot-kite-toggle";
+    label.dataset.kiteIndex = String(kiteIndex);
     label.style.setProperty("--kite-color", kiteColor(kiteIndex));
 
     const input = document.createElement("input");
@@ -1452,8 +1482,6 @@ function renderPlotKiteControls(kiteCount: number): void {
     label.classList.toggle("muted", !input.checked);
     input.addEventListener("change", () => {
       plotKiteVisibility[kiteIndex] = input.checked;
-      label.classList.toggle("muted", !input.checked);
-      state.textContent = input.checked ? "shown" : "hidden";
       applyPlotKiteVisibility();
     });
     label.append(input, swatch, text, state);
@@ -3519,6 +3547,7 @@ function sectionPlotLayout(definition: PlotSectionDefinition): PlotlyDatum {
       gridcolor: "#243b4a",
       zerolinecolor: "#243b4a",
       linecolor: "#345266",
+      matches: index === 1 ? undefined : "x",
       mirror: true,
       automargin: true
     };
@@ -3535,14 +3564,101 @@ function sectionPlotLayout(definition: PlotSectionDefinition): PlotlyDatum {
   return layout;
 }
 
+function xAxisName(index: number): string {
+  return index === 1 ? "xaxis" : `xaxis${index}`;
+}
+
+function linkedXAxisUpdate(groupCount: number, range: [number, number] | null): PlotlyDatum {
+  const update: PlotlyDatum = {};
+  for (let index = 1; index <= groupCount; index += 1) {
+    const axis = xAxisName(index);
+    if (range) {
+      update[`${axis}.range`] = range;
+      update[`${axis}.autorange`] = false;
+    } else {
+      update[`${axis}.autorange`] = true;
+    }
+  }
+  return update;
+}
+
+function relayoutRange(event: PlotlyRelayoutEvent): [number, number] | null {
+  for (const [key, value] of Object.entries(event)) {
+    const match = key.match(/^xaxis\d*\.range$/);
+    if (!match || !Array.isArray(value) || value.length !== 2) {
+      continue;
+    }
+    const start = Number(value[0]);
+    const end = Number(value[1]);
+    if (Number.isFinite(start) && Number.isFinite(end)) {
+      return [start, end];
+    }
+  }
+
+  for (const key of Object.keys(event)) {
+    const match = key.match(/^(xaxis\d*)\.range\[0\]$/);
+    if (!match) {
+      continue;
+    }
+    const axis = match[1];
+    const start = Number(event[`${axis}.range[0]`]);
+    const end = Number(event[`${axis}.range[1]`]);
+    if (Number.isFinite(start) && Number.isFinite(end)) {
+      return [start, end];
+    }
+  }
+
+  return null;
+}
+
+function relayoutRequestsXAxisAutorange(event: PlotlyRelayoutEvent): boolean {
+  return Object.entries(event).some(([key, value]) =>
+    /^xaxis\d*\.autorange$/.test(key) && value === true
+  );
+}
+
+function syncPlotXAxes(event: PlotlyRelayoutEvent): void {
+  if (syncingPlotXAxes || activePlotSections.length === 0) {
+    return;
+  }
+
+  const range = relayoutRange(event);
+  const autorange = relayoutRequestsXAxisAutorange(event);
+  if (!range && !autorange) {
+    return;
+  }
+
+  syncingPlotXAxes = true;
+  const updates = activePlotSections.map((section) =>
+    Plotly.relayout(
+      section.plot,
+      linkedXAxisUpdate(section.definition.groups.length, range)
+    )
+  );
+  void Promise.all(updates)
+    .catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      appendConsole(`plot x-axis sync failed: ${message}`);
+    })
+    .finally(() => {
+      syncingPlotXAxes = false;
+    });
+}
+
+function registerPlotXAxisSync(plot: HTMLElement): void {
+  const plotElement = plot as PlotElement;
+  if (typeof plotElement.on !== "function") {
+    return;
+  }
+  plotElement.on("plotly_relayout", syncPlotXAxes);
+}
+
 function clearPlots(message: string): void {
   activePlotSections.forEach((section) => {
     Plotly.purge(section.plot);
   });
   activePlotSections = [];
   plotsNode.innerHTML = "";
-  plotKiteControlsNode.innerHTML = "";
-  plotKiteControlsNode.classList.add("empty");
   const placeholder = document.createElement("div");
   placeholder.className = "plots-placeholder";
   placeholder.textContent = message;
@@ -3555,7 +3671,7 @@ async function renderFinalPlots(frames: ApiFrame[], kiteCount: number): Promise<
   });
   activePlotSections = [];
   plotsNode.innerHTML = "";
-  renderPlotKiteControls(kiteCount);
+  ensurePlotKiteVisibility(kiteCount);
 
   const definitions = buildPlotSections(kiteCount);
   const sectionPromises = definitions.map(async (definition) => {
@@ -3564,17 +3680,23 @@ async function renderFinalPlots(frames: ApiFrame[], kiteCount: number): Promise<
 
     const header = document.createElement("div");
     header.className = "plot-section-head";
+    const headerCopy = document.createElement("div");
+    headerCopy.className = "plot-section-copy";
     const title = document.createElement("div");
     title.className = "plot-section-title";
     title.textContent = definition.title;
     const description = document.createElement("div");
     description.className = "plot-section-note";
     description.textContent = definition.description;
+    const controls = document.createElement("div");
+    controls.className = "plot-kite-controls";
+    renderPlotKiteControls(controls, kiteCount);
 
     const plot = document.createElement("div");
     plot.className = "plot-canvas";
 
-    header.append(title, description);
+    headerCopy.append(title, description);
+    header.append(headerCopy, controls);
     host.append(header, plot);
     plotsNode.append(host);
 
@@ -3599,6 +3721,7 @@ async function renderFinalPlots(frames: ApiFrame[], kiteCount: number): Promise<
       ]
     });
     activePlotSections.push(activeSection);
+    registerPlotXAxisSync(plot);
   });
 
   await Promise.all(sectionPromises);
