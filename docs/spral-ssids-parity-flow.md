@@ -2,10 +2,21 @@
 
 This diagram tracks the Rust SSIDS parity ladder against native SPRAL SSIDS.
 Green nodes have active bitwise or exact metadata coverage. Yellow nodes are
-newly passing in the current checkpoint. Orange nodes have partial coverage or a
-known narrowed boundary. Red nodes are the next open bitwise mismatch target.
+newly passing bitwise or exact metadata coverage in the current checkpoint.
+Orange nodes have partial coverage or a known narrowed boundary. Gold-orange
+nodes are newly passing guards that narrow an open mismatch without proving full
+bitwise parity. Red nodes are the next open bitwise mismatch target.
 
 Current newly passing witness:
+`dense_seed09_case0_production_inverse_d_mismatches_are_nonzero_numeric_components`
+keeps the full dense seed09 production inverse-D mismatch pinned to nonzero
+numeric D components. The first mismatch remains pivot 37 component 1 with
+`rust=0xbf54f6581dd605fe` and `native=0xbf54f6581dd605f2`, and every mismatch
+is nonzero on both Rust and native sides. This does not turn the full inverse-D
+node green; it rules out another signed-zero or structural-layout explanation
+for the remaining red witness.
+
+Previous newly passing witness:
 `dense_seed09_case0_production_inverse_d_structural_zero_components_match_native`
 pins the full dense seed09 production inverse-D enquiry layout for structural
 zero off-diagonal components. Every Rust entry whose `d(2,:)` component is the
@@ -13,7 +24,7 @@ SPRAL enquiry structural `+0.0` has the same native structural-zero status and
 the same `+0.0` bit pattern. This keeps the remaining full inverse-D mismatch
 focused on nonzero numeric D entries, not block-layout or signed-zero drift.
 
-Previous newly passing witness:
+Earlier newly passing witness:
 `dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now also
 mirrors `target/native/spral-upstream/src/ssids/cpu/factor.hxx`'s
 `factor_node_indef` second-pass TPP call after APP accepts the first block:
@@ -129,7 +140,8 @@ flowchart TD
     K4i --> K4f["Dense seed09 Rust production tail D storage"]
     K4f --> K4h["Dense seed09 post-gap pivot38 inverse-D bits"]
     K4h --> K4j["Dense seed09 inverse-D structural zero bits"]
-    K4j --> K4b["Dense APP case0 full inverse-D bits"]
+    K4j --> K4k["Dense seed09 nonzero inverse-D mismatch map"]
+    K4k --> K4b["Dense APP case0 full inverse-D bits"]
     K4b --> K4["Dense APP boundary case0 solution bits"]
     J --> K
     K1 --> L{"More fronts?"}
@@ -146,11 +158,13 @@ flowchart TD
 
     classDef match fill:#dff7df,stroke:#2f8f46,color:#102615,stroke-width:2px;
     classDef newly fill:#fff4b8,stroke:#b88a00,color:#2a2100,stroke-width:3px;
+    classDef newlyPartial fill:#ffd89c,stroke:#b88a00,color:#2b1800,stroke-width:3px;
     classDef partial fill:#ffe3bf,stroke:#b76d12,color:#2b1800,stroke-width:2px;
     classDef open fill:#ffd8d8,stroke:#b43b3b,color:#2b0d0d,stroke-width:2px;
 
     class A,B,B1,B2,B3,G0,G1,G3,G5,G6,G8,G8a,G8b,G9,H1,H2,H3,K1,M,O,P,Q,R match;
-    class K4j newly;
+    class K4j match;
+    class K4k newlyPartial;
     class C,D,E,F,G,G2,G4,G7,G10,H,I,J,K,L,N partial;
     class G8c,G8d,G9a,I0,I1,I2,I3,K2,K3,K4a,K4c,K4d,K4e,K4f,K4g,K4h,K4i match;
     class K4b,K4 open;

@@ -9276,6 +9276,64 @@ extern "C" int spral_kernel_block_prefix_trace_32(
     }
 
     #[test]
+    fn dense_seed09_case0_production_inverse_d_mismatches_are_nonzero_numeric_components() {
+        let Some(native) = native_spral_or_skip() else {
+            return;
+        };
+        let (dimension, dense) = dense_seed09_case0_matrix();
+        let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+        let matrix = SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
+            .expect("valid CSC");
+        let options = NumericFactorOptions::default();
+
+        let (symbolic, _) = analyse(
+            matrix,
+            &SsidsOptions {
+                ordering: OrderingStrategy::Natural,
+            },
+        )
+        .expect("rust analyse");
+        let (rust_factor, _) = factorize(matrix, &symbolic, &options).expect("rust factorize");
+
+        let mut native_session = native
+            .analyse_with_options_and_ordering(matrix, &options, NativeOrdering::Natural)
+            .expect("native analyse");
+        native_session.factorize(matrix).expect("native factorize");
+        let native_enquiry = native_session.enquire_indef().expect("native enquire");
+
+        let rust_entries = rust_inverse_diagonal_entries(&rust_factor);
+        let native_entries = native_enquiry.inverse_diagonal_entries;
+        assert_eq!(rust_entries.len(), native_entries.len());
+
+        let mismatches = rust_entries
+            .iter()
+            .zip(&native_entries)
+            .enumerate()
+            .flat_map(|(pivot, (rust_entry, native_entry))| {
+                (0..2).filter_map(move |component| {
+                    let rust_bits = rust_entry[component].to_bits();
+                    let native_bits = native_entry[component].to_bits();
+                    (rust_bits != native_bits).then_some((pivot, component, rust_bits, native_bits))
+                })
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            mismatches.first().copied(),
+            Some((37, 1, 0xbf54_f658_1dd6_05fe, 0xbf54_f658_1dd6_05f2)),
+        );
+        assert!(
+            mismatches
+                .iter()
+                .all(
+                    |&(_, _, rust_bits, native_bits)| f64::from_bits(rust_bits) != 0.0
+                        && f64::from_bits(native_bits) != 0.0
+                ),
+            "dense seed09 inverse-D mismatch escaped nonzero numeric components: {mismatches:?}"
+        );
+    }
+
+    #[test]
     #[ignore = "manual exact production inverse-D bit mismatch witness for dense seed09 case0"]
     fn dense_seed09_case0_production_inverse_d_matches_native() {
         let Some(native) = native_spral_or_skip() else {
