@@ -3,6 +3,7 @@ members = [
     "bench_report",
     "metis_ordering",
     "sparse_validation",
+    "spral-src",
     "spral_ssids",
     "sx_core",
     "sx_codegen",

@@ -1,12 +1,16 @@
 use std::ffi::c_void;
+#[cfg(not(feature = "native-spral-src"))]
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
 
+#[cfg(not(feature = "native-spral-src"))]
 use libloading::{Library, Symbol};
 use thiserror::Error;
 
 use crate::{Inertia, NumericFactorOptions, PivotMethod, SymmetricCscMatrix};
+#[cfg(feature = "native-spral-src")]
+use spral_src as _;
 
 type SpralDefaultOptionsFn = unsafe extern "C" fn(*mut SpralSsidsOptions);
 type SpralAnalyseFn = unsafe extern "C" fn(
@@ -124,13 +128,73 @@ impl Default for SpralSsidsInform {
 
 #[derive(Debug)]
 struct NativeSpralLibrary {
+    #[cfg(not(feature = "native-spral-src"))]
     _library: Library,
+    #[cfg(feature = "native-spral-src")]
+    _linked: (),
     default_options: SpralDefaultOptionsFn,
     analyse: SpralAnalyseFn,
     factor: SpralFactorFn,
     solve1: SpralSolve1Fn,
     enquire_indef: SpralEnquireIndefFn,
     free: SpralFreeFn,
+}
+
+#[cfg(feature = "native-spral-src")]
+unsafe extern "C" {
+    fn spral_ssids_default_options(options: *mut SpralSsidsOptions);
+    fn spral_ssids_analyse(
+        check: bool,
+        n: i32,
+        order: *mut i32,
+        ptr: *const i64,
+        row: *const i32,
+        val: *const f64,
+        akeep: *mut *mut c_void,
+        options: *const SpralSsidsOptions,
+        inform: *mut SpralSsidsInform,
+    );
+    fn spral_ssids_factor(
+        posdef: bool,
+        ptr: *const i64,
+        row: *const i32,
+        val: *const f64,
+        scaling: *mut f64,
+        akeep: *mut c_void,
+        fkeep: *mut *mut c_void,
+        options: *const SpralSsidsOptions,
+        inform: *mut SpralSsidsInform,
+    );
+    fn spral_ssids_solve1(
+        job: i32,
+        rhs: *mut f64,
+        akeep: *mut c_void,
+        fkeep: *mut c_void,
+        options: *const SpralSsidsOptions,
+        inform: *mut SpralSsidsInform,
+    );
+    fn spral_ssids_enquire_indef(
+        akeep: *const c_void,
+        fkeep: *const c_void,
+        options: *const SpralSsidsOptions,
+        inform: *mut SpralSsidsInform,
+        order: *mut i32,
+        dinv: *mut f64,
+    );
+    fn spral_ssids_free(akeep: *mut *mut c_void, fkeep: *mut *mut c_void) -> i32;
+}
+
+#[cfg(feature = "native-spral-src")]
+fn linked_spral_library() -> NativeSpralLibrary {
+    NativeSpralLibrary {
+        _linked: (),
+        default_options: spral_ssids_default_options,
+        analyse: spral_ssids_analyse,
+        factor: spral_ssids_factor,
+        solve1: spral_ssids_solve1,
+        enquire_indef: spral_ssids_enquire_indef,
+        free: spral_ssids_free,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -231,73 +295,88 @@ pub enum NativeSpralError {
 
 impl NativeSpral {
     pub fn load() -> Result<Self, NativeSpralError> {
-        let mut candidates = native_spral_library_candidates();
-        if let Ok(cwd) = std::env::current_dir() {
-            for ancestor in cwd.ancestors() {
-                candidates.insert(
-                    0,
-                    ancestor.join("target/native/spral-upstream/builddir/libspral.dylib"),
-                );
-            }
+        #[cfg(feature = "native-spral-src")]
+        {
+            let native = Self {
+                inner: Arc::new(linked_spral_library()),
+            };
+            native_spral_smoke_test(&native)?;
+            return Ok(native);
         }
-        let mut last_error = None;
-        for candidate in candidates {
-            match unsafe { Library::new(&candidate) } {
-                Ok(library) => {
-                    let default_options = load_symbol::<SpralDefaultOptionsFn>(
-                        &library,
-                        &candidate,
-                        b"spral_ssids_default_options\0",
-                    )?;
-                    let analyse = load_symbol::<SpralAnalyseFn>(
-                        &library,
-                        &candidate,
-                        b"spral_ssids_analyse\0",
-                    )?;
-                    let factor = load_symbol::<SpralFactorFn>(
-                        &library,
-                        &candidate,
-                        b"spral_ssids_factor\0",
-                    )?;
-                    let solve1 = load_symbol::<SpralSolve1Fn>(
-                        &library,
-                        &candidate,
-                        b"spral_ssids_solve1\0",
-                    )?;
-                    let enquire_indef = load_symbol::<SpralEnquireIndefFn>(
-                        &library,
-                        &candidate,
-                        b"spral_ssids_enquire_indef\0",
-                    )?;
-                    let free =
-                        load_symbol::<SpralFreeFn>(&library, &candidate, b"spral_ssids_free\0")?;
-                    let native = Self {
-                        inner: Arc::new(NativeSpralLibrary {
-                            _library: library,
-                            default_options,
-                            analyse,
-                            factor,
-                            solve1,
-                            enquire_indef,
-                            free,
-                        }),
-                    };
-                    match native_spral_smoke_test(&native) {
-                        Ok(()) => return Ok(native),
-                        Err(error) => {
-                            last_error = Some(format!(
-                                "{} loaded but failed a factorization smoke test: {error}",
-                                candidate.display()
-                            ));
+
+        #[cfg(not(feature = "native-spral-src"))]
+        {
+            let mut candidates = native_spral_library_candidates();
+            if let Ok(cwd) = std::env::current_dir() {
+                for ancestor in cwd.ancestors() {
+                    candidates.insert(
+                        0,
+                        ancestor.join("target/native/spral-upstream/builddir/libspral.dylib"),
+                    );
+                }
+            }
+            let mut last_error = None;
+            for candidate in candidates {
+                match unsafe { Library::new(&candidate) } {
+                    Ok(library) => {
+                        let default_options = load_symbol::<SpralDefaultOptionsFn>(
+                            &library,
+                            &candidate,
+                            b"spral_ssids_default_options\0",
+                        )?;
+                        let analyse = load_symbol::<SpralAnalyseFn>(
+                            &library,
+                            &candidate,
+                            b"spral_ssids_analyse\0",
+                        )?;
+                        let factor = load_symbol::<SpralFactorFn>(
+                            &library,
+                            &candidate,
+                            b"spral_ssids_factor\0",
+                        )?;
+                        let solve1 = load_symbol::<SpralSolve1Fn>(
+                            &library,
+                            &candidate,
+                            b"spral_ssids_solve1\0",
+                        )?;
+                        let enquire_indef = load_symbol::<SpralEnquireIndefFn>(
+                            &library,
+                            &candidate,
+                            b"spral_ssids_enquire_indef\0",
+                        )?;
+                        let free = load_symbol::<SpralFreeFn>(
+                            &library,
+                            &candidate,
+                            b"spral_ssids_free\0",
+                        )?;
+                        let native = Self {
+                            inner: Arc::new(NativeSpralLibrary {
+                                _library: library,
+                                default_options,
+                                analyse,
+                                factor,
+                                solve1,
+                                enquire_indef,
+                                free,
+                            }),
+                        };
+                        match native_spral_smoke_test(&native) {
+                            Ok(()) => return Ok(native),
+                            Err(error) => {
+                                last_error = Some(format!(
+                                    "{} loaded but failed a factorization smoke test: {error}",
+                                    candidate.display()
+                                ));
+                            }
                         }
                     }
+                    Err(error) => last_error = Some(error.to_string()),
                 }
-                Err(error) => last_error = Some(error.to_string()),
             }
+            Err(NativeSpralError::LoadLibrary(
+                last_error.unwrap_or_else(|| "no candidates tried".into()),
+            ))
         }
-        Err(NativeSpralError::LoadLibrary(
-            last_error.unwrap_or_else(|| "no candidates tried".into()),
-        ))
     }
 
     pub fn analyse(
@@ -460,6 +539,7 @@ fn native_spral_smoke_test(native: &NativeSpral) -> Result<(), NativeSpralError>
     Ok(())
 }
 
+#[cfg(not(feature = "native-spral-src"))]
 fn native_spral_library_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(override_path) = std::env::var_os("SPRAL_SSIDS_NATIVE_LIB") {
@@ -714,6 +794,7 @@ impl Drop for NativeSpralSession {
     }
 }
 
+#[cfg(not(feature = "native-spral-src"))]
 fn load_symbol<T: Copy>(
     library: &Library,
     candidate: &Path,

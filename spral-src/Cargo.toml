@@ -1,0 +1,24 @@
+[package]
+name = "spral-src"
+version.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+links = "spral"
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+description = "Source-built SPRAL, METIS, and OpenBLAS native dependency package for optivibre."
+
+[dependencies]
+
+[build-dependencies]
+cc = { version = "1.2.45", features = ["parallel"] }
+flate2 = "1.1.5"
+openblas-build = "=0.10.15"
+sha2 = "0.10.9"
+tar = "0.4.44"
+ureq = { version = "3.1.4", default-features = false, features = ["native-tls"] }
+
+[lints]
+workspace = true

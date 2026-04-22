@@ -43,7 +43,19 @@ fn dense_to_lower_csc(matrix: &[Vec<f64>]) -> (Vec<usize>, Vec<usize>, Vec<f64>)
     (col_ptrs, row_indices, values)
 }
 
+fn openmp_cancellation_enabled() -> bool {
+    std::env::var("OMP_CANCELLATION").is_ok_and(|value| value.eq_ignore_ascii_case("true"))
+}
+
 fn load_native_or_skip() -> Option<NativeSpral> {
+    if !openmp_cancellation_enabled() {
+        if std::env::var_os("AD_CODEGEN_REQUIRE_NATIVE_SPRAL_PARITY").is_some() {
+            panic!("native SPRAL requires OMP_CANCELLATION=true before process start");
+        }
+        eprintln!("skipping native SPRAL test: set OMP_CANCELLATION=true before process start");
+        return None;
+    }
+
     match NativeSpral::load() {
         Ok(native) => Some(native),
         Err(error) => {

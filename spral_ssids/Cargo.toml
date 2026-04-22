@@ -9,10 +9,14 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Initial pure-Rust symbolic and numeric SSIDS-style solver stack for ad_codegen_rs."
 
+[features]
+native-spral-src = ["dep:spral-src"]
+
 [dependencies]
 libloading = "0.8.9"
 metis_ordering = { path = "../metis_ordering" }
 rayon.workspace = true
+spral-src = { path = "../spral-src", optional = true }
 thiserror.workspace = true
 
 [dev-dependencies]
