@@ -8,6 +8,18 @@ nodes are newly passing guards that narrow an open mismatch without proving full
 bitwise parity. Red nodes are the next open bitwise mismatch target.
 
 Current newly narrowed witness:
+`dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now carries a
+second native prefix trace that mirrors `target/native/spral-upstream/src/ssids/cpu/kernels/block_ldlt.hxx`
+more literally for the 2x2 multiplier and update expressions. That
+source-plain trace does not explain the final wrapper result: it first differs
+from native `block_ldlt<32>` in inverse-D at index 7
+(`trace=0xbf2b4429642a1ee2`, `block_ldlt=0xbf2b4429642a1ee4`) and in the matrix
+at row 2, col 0 (`trace=0x3f79e327dcf67cce`,
+`block_ldlt=0x3f79e327dcf67ccf`). The actual local wrapper therefore still sits
+between the FMA-shaped trace and the source-plain trace, not cleanly at either
+extreme.
+
+Previous newly narrowed witness:
 `dense_seed09_first_app_update_and_tail_tpp_match_native_kernels` now pins that
 the native prefix-trace shim and the native `block_ldlt<32>` wrapper agree on
 the first APP block permutation, local permutation, and inverse-D storage, but
@@ -195,8 +207,9 @@ flowchart TD
     I0 --> I0a["Dense seed09 APP check_threshold OP_N pass count"]
     I0a --> I0p["Dense seed09 source-shaped APP pre-apply trailing operands"]
     I0p --> I0r["Dense seed09 production-vs-aligned Rust APP diagonal block"]
-    I0r --> I0n["Dense seed09 native trace-vs-wrapper APP permutation and D"]
-    I0n --> I0d["Dense seed09 native trace-vs-wrapper APP matrix gap"]
+    I0r --> I0s["Dense seed09 source-plain native trace D/matrix gap"]
+    I0s --> I0n["Dense seed09 FMA native trace-vs-wrapper APP permutation and D"]
+    I0n --> I0d["Dense seed09 FMA native trace-vs-wrapper APP matrix gap"]
     I0d --> I0t["Dense seed09 source-shaped APP host_trsm gap"]
     I0t --> I0b["Dense seed09 source-shaped APP post-apply operand gap"]
     I0b --> I["APP accepted-prefix update"]
@@ -244,8 +257,9 @@ flowchart TD
 
     class A,B,B1,B2,B3,G0,G1,G3,G5,G6,G8,G8a,G8b,G9,H1,H2,H3,K1,M,O,P,Q,R match;
     class I0p,I0r match;
-    class I0n newly;
-    class I0d newlyPartial;
+    class I0s newlyPartial;
+    class I0n match;
+    class I0d partial;
     class I0t,I0b partial;
     class K4j match;
     class K4k partial;
