@@ -330,7 +330,12 @@ pub fn apply_native_spral_parity_to_nlip_options(options: &mut InteriorPointOpti
     options.regularization_max = IPOPT_MAX_HESSIAN_PERTURBATION;
     options.adaptive_regularization_retries = NATIVE_SPRAL_PARITY_INERTIA_CORRECTION_RETRIES;
     options.spral_pivot_method = match profile.pivot_method {
-        SpralParityPivotProfile::Block => InteriorPointSpralPivotMethod::BlockAposteriori,
+        // IpSpralSolverInterface.cpp::PivotMethodNameToNum maps IPOPT's
+        // option value `spral_pivot_method=block` to raw control value 1.
+        // SPRAL 2025.09.18's C ABI documents 1 as aggressive APP and 2 as
+        // block APP, so NLIP's native-SPRAL IPOPT parity path must use the
+        // control-value-equivalent mode, not the SPRAL-doc label.
+        SpralParityPivotProfile::Block => InteriorPointSpralPivotMethod::AggressiveAposteriori,
     };
     options.spral_small_pivot_tolerance = profile.small_pivot_tolerance;
     options.spral_threshold_pivot_u = profile.threshold_pivot_u;
@@ -5234,6 +5239,10 @@ mod tests {
         assert_eq!(
             options.adaptive_regularization_retries,
             NATIVE_SPRAL_PARITY_INERTIA_CORRECTION_RETRIES
+        );
+        assert_eq!(
+            options.spral_pivot_method,
+            super::InteriorPointSpralPivotMethod::AggressiveAposteriori
         );
     }
 
