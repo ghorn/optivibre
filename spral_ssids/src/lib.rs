@@ -9672,7 +9672,47 @@ extern "C" int spral_kernel_block_prefix_trace_32(
             native_lda,
             options,
         );
+        let native_trace =
+            native_block_prefix_trace_32(shim, &dense_before_block, dimension, native_lda, options);
+        let native_trace_block = native_trace.last().expect("native APP block prefix trace");
         assert_eq!(native_block.perm, rows[..block_end]);
+        assert_eq!(
+            native_trace_block.perm, native_block.perm,
+            "dense seed09 native APP trace/block_ldlt permutation mismatch"
+        );
+        assert_eq!(
+            native_trace_block.local_perm, native_block.local_perm,
+            "dense seed09 native APP trace/block_ldlt local permutation mismatch"
+        );
+        for (index, (&trace_value, &block_value)) in native_trace_block
+            .diagonal
+            .iter()
+            .zip(&native_block.diagonal)
+            .enumerate()
+        {
+            assert_eq!(
+                trace_value.to_bits(),
+                block_value.to_bits(),
+                "dense seed09 native APP trace/block_ldlt D mismatch index={index}"
+            );
+        }
+        let mut first_native_trace_block_mismatch = None;
+        'native_trace_block_compare: for col in block_start..block_end {
+            for row in col..block_end {
+                let trace_bits =
+                    native_trace_block.matrix[col * APP_INNER_BLOCK_SIZE + row].to_bits();
+                let block_bits = native_block.matrix[col * native_lda + row].to_bits();
+                if trace_bits != block_bits {
+                    first_native_trace_block_mismatch = Some((row, col, trace_bits, block_bits));
+                    break 'native_trace_block_compare;
+                }
+            }
+        }
+        assert_eq!(
+            first_native_trace_block_mismatch,
+            Some((30, 19, 0xbf8c_bfa8_da67_4b6b, 0xbf8c_bfa8_da67_4b6c)),
+            "dense seed09 native APP trace/block_ldlt matrix boundary moved"
+        );
         let mut native_source_apply_matrix = native_block.matrix.clone();
         for col in block_start..block_end {
             let source_col = native_block.local_perm[col];
