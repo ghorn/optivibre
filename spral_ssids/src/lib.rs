@@ -2241,7 +2241,7 @@ fn factor_one_by_one_common(
     update_end: usize,
     stats: &mut PanelFactorStats,
     scratch: &mut [f64],
-) -> Result<(FactorColumn, FactorBlockRecord), SsidsError> {
+) -> Result<FactorBlockRecord, SsidsError> {
     let work = &mut scratch[pivot * size..(pivot + 1) * size];
     let diagonal_index = dense_lower_offset(size, pivot, pivot);
     let original_diagonal = matrix[diagonal_index];
@@ -2263,7 +2263,6 @@ fn factor_one_by_one_common(
     stats.max_residual = stats.max_residual.max((diagonal - original_diagonal).abs());
     matrix[diagonal_index] = 1.0;
 
-    let mut entries = Vec::new();
     for row in (pivot + 1)..update_end {
         let entry_index = dense_lower_offset(size, row, pivot);
         let original = matrix[entry_index];
@@ -2279,21 +2278,14 @@ fn factor_one_by_one_common(
             });
         }
         matrix[entry_index] = value;
-        entries.push((rows[row], value));
     }
 
     app_update_one_by_one(matrix, size, pivot, update_end, scratch);
 
-    Ok((
-        FactorColumn {
-            global_column: rows[pivot],
-            entries,
-        },
-        FactorBlockRecord {
-            size: 1,
-            values: [inverse_diagonal, 0.0, 0.0, 0.0],
-        },
-    ))
+    Ok(FactorBlockRecord {
+        size: 1,
+        values: [inverse_diagonal, 0.0, 0.0, 0.0],
+    })
 }
 
 fn factor_two_by_two_common(
@@ -2304,7 +2296,7 @@ fn factor_two_by_two_common(
     inverse: (f64, f64, f64),
     stats: &mut PanelFactorStats,
     scratch: &mut [f64],
-) -> Result<([FactorColumn; 2], FactorBlockRecord), SsidsError> {
+) -> Result<FactorBlockRecord, SsidsError> {
     let size = bounds.size;
     let update_end = bounds.update_end;
     let second_start = (pivot + 1) * size;
@@ -2317,8 +2309,6 @@ fn factor_two_by_two_common(
     matrix[dense_lower_offset(size, pivot + 1, pivot)] = 0.0;
     matrix[dense_lower_offset(size, pivot + 1, pivot + 1)] = 1.0;
 
-    let mut first_entries = Vec::new();
-    let mut second_entries = Vec::new();
     for row in (pivot + 2)..update_end {
         let b1 = matrix[dense_lower_offset(size, row, pivot)];
         let b2 = matrix[dense_lower_offset(size, row, pivot + 1)];
@@ -2334,28 +2324,14 @@ fn factor_two_by_two_common(
         }
         matrix[dense_lower_offset(size, row, pivot)] = l1;
         matrix[dense_lower_offset(size, row, pivot + 1)] = l2;
-        first_entries.push((rows[row], l1));
-        second_entries.push((rows[row], l2));
     }
 
     app_update_two_by_two(matrix, size, pivot, update_end, scratch);
 
-    Ok((
-        [
-            FactorColumn {
-                global_column: rows[pivot],
-                entries: first_entries,
-            },
-            FactorColumn {
-                global_column: rows[pivot + 1],
-                entries: second_entries,
-            },
-        ],
-        FactorBlockRecord {
-            size: 2,
-            values: [inv11, inv12, f64::INFINITY, inv22],
-        },
-    ))
+    Ok(FactorBlockRecord {
+        size: 2,
+        values: [inv11, inv12, f64::INFINITY, inv22],
+    })
 }
 
 fn remove_zero_lower_entries_targeting_row(factor_columns: &mut [FactorColumn], row: usize) {
@@ -3336,7 +3312,7 @@ fn factorize_dense_front(
                     );
                     rows.swap(best_col, block_pivot);
                 }
-                let (_, block) = factor_one_by_one_common(
+                let block = factor_one_by_one_common(
                     &rows,
                     &mut dense,
                     size,
@@ -3381,7 +3357,7 @@ fn factorize_dense_front(
                     );
                     rows.swap(index, block_pivot);
                 }
-                let (_, block) = factor_one_by_one_common(
+                let block = factor_one_by_one_common(
                     &rows,
                     &mut dense,
                     size,
@@ -3419,7 +3395,7 @@ fn factorize_dense_front(
                     );
                     rows.swap(second, block_pivot + 1);
                 }
-                let (_, block) = factor_two_by_two_common(
+                let block = factor_two_by_two_common(
                     &rows,
                     &mut dense,
                     DenseUpdateBounds {
