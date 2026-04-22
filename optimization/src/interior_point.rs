@@ -2486,10 +2486,13 @@ fn replay_snapshot_with_solver(
                 workspace,
                 &snapshot.augmented_rhs,
                 snapshot.regularization,
-                IpoptLinearRefinementShifts {
-                    primal: snapshot.primal_diagonal_shift,
-                    slack: snapshot.primal_diagonal_shift,
-                    dual: snapshot.dual_regularization,
+                IpoptLinearSolveContext {
+                    shifts: IpoptLinearRefinementShifts {
+                        primal: snapshot.primal_diagonal_shift,
+                        slack: snapshot.primal_diagonal_shift,
+                        dual: snapshot.dual_regularization,
+                    },
+                    native_spral_quality_was_increased: false,
                 },
                 &mut scratch_profiling,
                 false,
@@ -4904,6 +4907,7 @@ fn assess_linear_solution_ccs(
 const IPOPT_LINEAR_MIN_REFINEMENT_STEPS: usize = 1;
 const IPOPT_LINEAR_MAX_REFINEMENT_STEPS: usize = 10;
 const IPOPT_LINEAR_RESIDUAL_RATIO_MAX: f64 = 1e-10;
+const IPOPT_LINEAR_RESIDUAL_RATIO_SINGULAR: f64 = 1e-5;
 const IPOPT_LINEAR_RESIDUAL_IMPROVEMENT_FACTOR: f64 = 0.999_999_999;
 const IPOPT_LINEAR_RESIDUAL_MAX_COND: f64 = 1e6;
 
@@ -4978,11 +4982,24 @@ struct IpoptFullSpaceResidual {
     residual_ratio: f64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct IpoptRefinementReport {
+    steps: usize,
+    residual_ratio: f64,
+    failed: bool,
+}
+
 #[derive(Clone, Copy)]
 struct IpoptLinearRefinementShifts {
     primal: f64,
     slack: f64,
     dual: f64,
+}
+
+#[derive(Clone, Copy)]
+struct IpoptLinearSolveContext {
+    shifts: IpoptLinearRefinementShifts,
+    native_spral_quality_was_increased: bool,
 }
 
 fn ipopt_full_space_residual_ratio(
@@ -5162,7 +5179,7 @@ fn refine_ipopt_full_space_solution<E>(
     shifts: IpoptLinearRefinementShifts,
     solve_time: &mut Duration,
     mut solve_correction: impl FnMut(&[f64]) -> Result<Vec<f64>, E>,
-) -> Result<usize, E> {
+) -> Result<IpoptRefinementReport, E> {
     // IPOPT refines PDFullSpaceSolver systems on the full unsymmetric
     // primal-dual residual, not on the already-eliminated symmetric augmented
     // matrix residual; see IpPDFullSpaceSolver.cpp::ComputeResiduals,
@@ -5171,6 +5188,7 @@ fn refine_ipopt_full_space_solution<E>(
     let mut residual = ipopt_full_space_residual_ratio(system, pattern, solution, shifts);
     let mut residual_ratio = residual.residual_ratio;
     let mut previous_residual_ratio = residual_ratio;
+    let mut failed = false;
     while steps < IPOPT_LINEAR_MIN_REFINEMENT_STEPS
         || residual_ratio > IPOPT_LINEAR_RESIDUAL_RATIO_MAX
     {
@@ -5183,19 +5201,24 @@ fn refine_ipopt_full_space_solution<E>(
         steps += 1;
         let new_residual = ipopt_full_space_residual_ratio(system, pattern, solution, shifts);
         let new_residual_ratio = new_residual.residual_ratio;
+        residual_ratio = new_residual_ratio;
         if new_residual_ratio > IPOPT_LINEAR_RESIDUAL_RATIO_MAX
             && steps > IPOPT_LINEAR_MIN_REFINEMENT_STEPS
             && (steps > IPOPT_LINEAR_MAX_REFINEMENT_STEPS
                 || new_residual_ratio
                     > IPOPT_LINEAR_RESIDUAL_IMPROVEMENT_FACTOR * previous_residual_ratio)
         {
+            failed = true;
             break;
         }
         residual = new_residual;
         previous_residual_ratio = new_residual_ratio;
-        residual_ratio = new_residual_ratio;
     }
-    Ok(steps)
+    Ok(IpoptRefinementReport {
+        steps,
+        residual_ratio,
+        failed,
+    })
 }
 
 fn interior_point_linear_inertia(inertia: SpralInertia) -> InteriorPointLinearInertia {
@@ -5959,6 +5982,10 @@ fn is_singularity_like_linear_failure(attempt: &InteriorPointLinearSolveAttempt)
                 .detail
                 .as_deref()
                 .is_some_and(|detail| detail.contains("negative_eigenvalues_too_few")))
+        || (attempt.failure_kind == InteriorPointLinearSolveFailureKind::ResidualTooLarge
+            && attempt.detail.as_deref().is_some_and(|detail| {
+                detail.contains("ipopt_pretend_singular_after_refinement_failure")
+            }))
 }
 
 fn is_negative_eigenvalues_too_few(attempt: &InteriorPointLinearSolveAttempt) -> bool {
@@ -5977,19 +6004,30 @@ fn append_attempt_detail(attempt: &mut InteriorPointLinearSolveAttempt, detail: 
     });
 }
 
+fn native_spral_quality_can_increase(
+    workspace: &NativeSpralAugmentedKktWorkspace,
+    system: &ReducedKktSystem<'_>,
+) -> bool {
+    let old_u = workspace.numeric_options.threshold_pivot_u;
+    let max_u = system.spral_pivot_tolerance_max.max(0.0);
+    if !old_u.is_finite() || !max_u.is_finite() || old_u >= max_u {
+        return false;
+    }
+    let next_u = old_u.powf(0.75).min(max_u);
+    next_u.is_finite() && next_u > old_u
+}
+
 fn try_increase_native_spral_quality(
     workspace: &mut NativeSpralAugmentedKktWorkspace,
     system: &ReducedKktSystem<'_>,
 ) -> Option<(f64, f64)> {
+    if !native_spral_quality_can_increase(workspace, system) {
+        return None;
+    }
     let old_u = workspace.numeric_options.threshold_pivot_u;
-    let max_u = system.spral_pivot_tolerance_max.max(0.0);
-    if !old_u.is_finite() || !max_u.is_finite() || old_u >= max_u {
-        return None;
-    }
-    let next_u = old_u.powf(0.75).min(max_u);
-    if !next_u.is_finite() || next_u <= old_u {
-        return None;
-    }
+    let next_u = old_u
+        .powf(0.75)
+        .min(system.spral_pivot_tolerance_max.max(0.0));
     workspace.numeric_options.threshold_pivot_u = next_u;
     workspace.session = None;
     workspace.factor_regularization = None;
@@ -6320,7 +6358,7 @@ fn factor_solve_spral_src(
     workspace: &mut NativeSpralAugmentedKktWorkspace,
     rhs: &[f64],
     regularization: f64,
-    shifts: IpoptLinearRefinementShifts,
+    context: IpoptLinearSolveContext,
     profiling: &mut InteriorPointProfiling,
     verbose: bool,
 ) -> std::result::Result<(Vec<f64>, LinearBackendRunStats), InteriorPointLinearSolveAttempt> {
@@ -6437,11 +6475,11 @@ fn factor_solve_spral_src(
         )
     })?;
     let mut solve_time = solve_started.elapsed();
-    let refinement_steps = refine_ipopt_full_space_solution(
+    let refinement = refine_ipopt_full_space_solution(
         system,
         &workspace.pattern,
         &mut solution,
-        shifts,
+        context.shifts,
         &mut solve_time,
         |residual| {
             session.solve(residual).map_err(|error| {
@@ -6453,8 +6491,99 @@ fn factor_solve_spral_src(
             })
         },
     )?;
+    let mut detail = (refinement.steps > 0)
+        .then(|| format!("full_space_iterative_refinement_steps={}", refinement.steps));
+    let mut accepted_after_failed_refinement = false;
+    if refinement.failed {
+        // IpPDFullSpaceSolver.cpp retries failed full-space iterative
+        // refinement by asking the augmented solver IncreaseQuality() once;
+        // if that has already happened, residual_ratio_singular decides
+        // whether to accept the current solution or pretend singular.
+        let refinement_detail = format!(
+            "ipopt_full_space_iterative_refinement_failed residual_ratio={:.3e}",
+            refinement.residual_ratio
+        );
+        if !context.native_spral_quality_was_increased
+            && native_spral_quality_can_increase(workspace, system)
+        {
+            return Err(InteriorPointLinearSolveAttempt {
+                solver: InteriorPointLinearSolver::SpralSrc,
+                regularization,
+                inertia: Some(Box::new(interior_point_linear_inertia(factor_info.inertia))),
+                failure_kind: InteriorPointLinearSolveFailureKind::ResidualTooLarge,
+                detail: Some(format!(
+                    "{refinement_detail}; spral_quality_retry_requested"
+                )),
+                solution_inf: Some(
+                    solution
+                        .iter()
+                        .fold(0.0_f64, |acc, value| acc.max(value.abs())),
+                ),
+                solution_inf_limit: None,
+                residual_inf: Some(refinement.residual_ratio),
+                residual_inf_limit: Some(IPOPT_LINEAR_RESIDUAL_RATIO_MAX),
+            });
+        }
+        if refinement.residual_ratio >= IPOPT_LINEAR_RESIDUAL_RATIO_SINGULAR {
+            return Err(InteriorPointLinearSolveAttempt {
+                solver: InteriorPointLinearSolver::SpralSrc,
+                regularization,
+                inertia: Some(Box::new(interior_point_linear_inertia(factor_info.inertia))),
+                failure_kind: InteriorPointLinearSolveFailureKind::ResidualTooLarge,
+                detail: Some(format!(
+                    "{refinement_detail}; ipopt_pretend_singular_after_refinement_failure"
+                )),
+                solution_inf: Some(
+                    solution
+                        .iter()
+                        .fold(0.0_f64, |acc, value| acc.max(value.abs())),
+                ),
+                solution_inf_limit: None,
+                residual_inf: Some(refinement.residual_ratio),
+                residual_inf_limit: Some(IPOPT_LINEAR_RESIDUAL_RATIO_SINGULAR),
+            });
+        }
+        detail = Some(match detail.take() {
+            Some(existing) => format!(
+                "{existing}; {refinement_detail}; ipopt_accept_current_solution_after_refinement_failure"
+            ),
+            None => {
+                format!(
+                    "{refinement_detail}; ipopt_accept_current_solution_after_refinement_failure"
+                )
+            }
+        });
+        accepted_after_failed_refinement = true;
+    }
     let assessment =
         assess_linear_solution_ccs(&workspace.pattern.ccs, &workspace.values, rhs, &solution);
+    if accepted_after_failed_refinement {
+        // IpPDFullSpaceSolver.cpp accepts this branch directly after the
+        // residual_ratio_singular check. Keep the generic augmented residual
+        // assessment as reporting metadata only.
+        let (solution_inf, residual_inf) = match assessment {
+            Ok(assessment) => (assessment.solution_inf, assessment.residual_inf),
+            Err(attempt) => (
+                attempt
+                    .solution_inf
+                    .unwrap_or_else(|| step_inf_norm(&solution)),
+                attempt.residual_inf.unwrap_or(f64::NAN),
+            ),
+        };
+        return Ok((
+            solution,
+            LinearBackendRunStats {
+                solver: InteriorPointLinearSolver::SpralSrc,
+                factorization_time,
+                solve_time,
+                reused_symbolic: Some(reused_symbolic),
+                inertia: Some(interior_point_linear_inertia(factor_info.inertia)),
+                residual_inf,
+                solution_inf,
+                detail,
+            },
+        ));
+    }
 
     assessment
         .map(|assessment| {
@@ -6468,9 +6597,7 @@ fn factor_solve_spral_src(
                     inertia: Some(interior_point_linear_inertia(factor_info.inertia)),
                     residual_inf: assessment.residual_inf,
                     solution_inf: assessment.solution_inf,
-                    detail: (refinement_steps > 0).then(|| {
-                        format!("full_space_iterative_refinement_steps={refinement_steps}")
-                    }),
+                    detail,
                 },
             )
         })
@@ -6517,6 +6644,9 @@ fn solve_reduced_kkt_with_spral_src(
     let mut current_jacobian_regularization = system.forced_jacobian_regularization.unwrap_or(0.0);
     let mut tried_jacobian_regularization = system.forced_jacobian_regularization.is_some();
     let mut quality_retry_detail: Option<String> = None;
+    // Mirrors IpPDFullSpaceSolver::augsys_improved_: scoped to this
+    // primal-dual system solve, and not reset by perturbation retries because
+    // IPOPT's cache dependencies exclude the perturbation shifts.
     let mut solver_quality_improved = false;
     let max_regularization = system
         .regularization_max
@@ -6540,10 +6670,13 @@ fn solve_reduced_kkt_with_spral_src(
             workspace,
             &rhs,
             current_regularization,
-            IpoptLinearRefinementShifts {
-                primal: primal_shift,
-                slack: slack_shift,
-                dual: dual_shift,
+            IpoptLinearSolveContext {
+                shifts: IpoptLinearRefinementShifts {
+                    primal: primal_shift,
+                    slack: slack_shift,
+                    dual: dual_shift,
+                },
+                native_spral_quality_was_increased: solver_quality_improved,
             },
             profiling,
             verbose,
@@ -6617,8 +6750,14 @@ fn solve_reduced_kkt_with_spral_src(
             Err(attempt) => {
                 let singularity_like_failure = is_singularity_like_linear_failure(&attempt);
                 let too_few_negative_eigenvalues = is_negative_eigenvalues_too_few(&attempt);
+                let full_space_refinement_quality_retry = attempt.failure_kind
+                    == InteriorPointLinearSolveFailureKind::ResidualTooLarge
+                    && attempt
+                        .detail
+                        .as_deref()
+                        .is_some_and(|detail| detail.contains("spral_quality_retry_requested"));
                 attempts.push(attempt);
-                if too_few_negative_eigenvalues
+                if (too_few_negative_eigenvalues || full_space_refinement_quality_retry)
                     && !solver_quality_improved
                     && let Some((old_u, new_u)) =
                         try_increase_native_spral_quality(workspace, system)
