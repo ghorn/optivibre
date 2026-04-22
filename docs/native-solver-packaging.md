@@ -8,11 +8,17 @@ Optivibre has three intentionally separate native-solver lanes.
 SPRAL with private METIS and OpenBLAS under Cargo `OUT_DIR`, rejects system
 solver/math fallbacks, and emits `DEP_SPRAL_*` metadata for downstream crates.
 The default OpenBLAS mode is deterministic serial BLAS via
-`openblas-serial`; `openblas-openmp` is opt-in and mutually exclusive. Consumers
+`openblas-serial`; `openblas-pthreads` is the supported threaded BLAS
+acceptance path; `openblas-openmp` is the OpenMP-threaded BLAS path. Consumers
 should use the forwarding features on `ssids-rs` or `ipopt-src` instead of
-enabling both OpenBLAS modes through Cargo feature unification.
+enabling multiple OpenBLAS modes through Cargo feature unification.
 `OPENBLAS_NUM_PARALLEL` is forwarded to OpenBLAS `NUM_PARALLEL` for OpenMP
 builds when multiple independent OpenMP regions may call BLAS concurrently.
+
+On Apple Silicon, `spral-src` forces OpenBLAS threaded builds to `TARGET=ARMV8`
+unless `OPENBLAS_TARGET` is explicitly provided. OpenBLAS 0.3.32 autodetects
+`VORTEX` on this host, and the `USE_THREAD=1` VORTEX artifact fails the direct
+`dtrsv_` guard used by SPRAL APP forward/backward solves.
 
 `ipopt-src` is the standard native IPOPT distribution crate. It tracks the
 published `ipopt-src` feature vocabulary where possible, but Optivibre's default
@@ -41,14 +47,16 @@ SPRAL factorization requires `OMP_CANCELLATION=true` before OpenMP runtime
 initialization. Source-built IPOPT/SPRAL tests and applications that exercise
 SPRAL must set that environment variable before process start.
 
-Threaded OpenBLAS is intentionally opt-in and not currently part of the green
-acceptance matrix. Before performance work depends on parallelism, run
+Threaded OpenBLAS is intentionally opt-in. Before performance work depends on
+parallelism, run
 `scripts/ssids_rs_parallel_parity_matrix.sh`: serial bitwise SPRAL parity
 remains the algorithmic oracle, Rust Rayon factorization is required to be
 exactly repeatable, and native SPRAL OpenMP with serial OpenBLAS is checked
-with bounded residual and solution criteria. The `native-spral-src-openmp`
-guard is ignored by default because it currently changes native SPRAL APP solve
-results; run it explicitly while fixing that path.
+with bounded residual and solution criteria. The green threaded BLAS lane is
+`native-spral-src-pthreads`, which compares OpenBLAS pthread counts by bounded
+outcome, inertia, pivot stats, residual, and solution criteria. The
+`native-spral-src-openmp` lane is also in the green matrix and compares the
+combined native SPRAL/OpenBLAS OpenMP path with the same bounded criteria.
 
 ## Pure Rust Lane
 

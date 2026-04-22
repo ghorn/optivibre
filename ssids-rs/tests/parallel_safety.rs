@@ -351,6 +351,7 @@ fn concurrent_ssids_rs_stress_independent_jobs_and_refactors_are_stable() {
 fn native_source_feature_enabled() -> bool {
     cfg!(any(
         feature = "native-spral-src",
+        feature = "native-spral-src-pthreads",
         feature = "native-spral-src-openmp"
     ))
 }
@@ -424,7 +425,13 @@ fn parse_native_outcome(encoded: &str) -> NativeOutcome {
     }
 }
 
-fn run_native_child(test_name: &str, omp_threads: usize) -> NativeOutcome {
+#[derive(Clone, Copy, Debug)]
+struct NativeThreadConfig {
+    omp_threads: usize,
+    openblas_threads: usize,
+}
+
+fn run_native_child(test_name: &str, config: NativeThreadConfig) -> NativeOutcome {
     let output = Command::new(std::env::current_exe().expect("current test executable"))
         .arg("--exact")
         .arg(test_name)
@@ -432,7 +439,9 @@ fn run_native_child(test_name: &str, omp_threads: usize) -> NativeOutcome {
         .env("SSIDS_RS_NATIVE_THREAD_CHILD", "1")
         .env("AD_CODEGEN_REQUIRE_NATIVE_SPRAL_PARITY", "1")
         .env("OMP_CANCELLATION", "true")
-        .env("OMP_NUM_THREADS", omp_threads.to_string())
+        .env("OMP_NUM_THREADS", config.omp_threads.to_string())
+        .env("OPENBLAS_NUM_THREADS", config.openblas_threads.to_string())
+        .env("GOTO_NUM_THREADS", config.openblas_threads.to_string())
         .env("RAYON_NUM_THREADS", "1")
         .output()
         .expect("spawn native thread child");
@@ -451,7 +460,12 @@ fn run_native_child(test_name: &str, omp_threads: usize) -> NativeOutcome {
     parse_native_outcome(encoded)
 }
 
-fn native_thread_bounded_check(test_name: &str) {
+fn native_thread_bounded_check(
+    test_name: &str,
+    baseline: NativeThreadConfig,
+    threaded: NativeThreadConfig,
+    comparison_label: &str,
+) {
     if std::env::var_os("SSIDS_RS_NATIVE_THREAD_CHILD").is_some() {
         let outcome = native_outcome(&dense_app_boundary_case());
         println!(
@@ -472,8 +486,8 @@ fn native_thread_bounded_check(test_name: &str) {
     }
 
     let rust_reference = rust_outcome_in_pool(1, &dense_app_boundary_case());
-    let native_one = run_native_child(test_name, 1);
-    let native_four = run_native_child(test_name, 4);
+    let native_one = run_native_child(test_name, baseline);
+    let native_four = run_native_child(test_name, threaded);
 
     assert_eq!(native_four.inertia, native_one.inertia);
     assert_eq!(native_four.pivot_stats, native_one.pivot_stats);
@@ -492,7 +506,7 @@ fn native_thread_bounded_check(test_name: &str) {
     let native_thread_delta = delta_inf(&native_one.solution, &native_four.solution);
     assert!(
         native_thread_delta <= NATIVE_THREADED_SOLUTION_TOL,
-        "native OMP=1 vs OMP=4 solution delta {native_thread_delta} exceeds {NATIVE_THREADED_SOLUTION_TOL}"
+        "{comparison_label} solution delta {native_thread_delta} exceeds {NATIVE_THREADED_SOLUTION_TOL}"
     );
     let rust_native_delta = delta_inf(&rust_reference.solution, &native_four.solution);
     assert!(
@@ -503,15 +517,58 @@ fn native_thread_bounded_check(test_name: &str) {
 
 #[test]
 fn parallel_native_threads_bounded_correctness() {
-    native_thread_bounded_check("parallel_native_threads_bounded_correctness");
+    native_thread_bounded_check(
+        "parallel_native_threads_bounded_correctness",
+        NativeThreadConfig {
+            omp_threads: 1,
+            openblas_threads: 1,
+        },
+        NativeThreadConfig {
+            omp_threads: 4,
+            openblas_threads: 1,
+        },
+        "native OMP=1 vs OMP=4",
+    );
 }
 
 #[test]
-#[ignore = "known source-built OpenBLAS OpenMP APP solve correctness failure; run before enabling this path"]
+fn parallel_openblas_pthreads_bounded_correctness() {
+    if !cfg!(feature = "native-spral-src-pthreads") {
+        eprintln!(
+            "skipping OpenBLAS pthreads check: native-spral-src-pthreads feature is disabled"
+        );
+        return;
+    }
+    native_thread_bounded_check(
+        "parallel_openblas_pthreads_bounded_correctness",
+        NativeThreadConfig {
+            omp_threads: 1,
+            openblas_threads: 1,
+        },
+        NativeThreadConfig {
+            omp_threads: 1,
+            openblas_threads: 4,
+        },
+        "native OpenBLAS pthreads=1 vs pthreads=4",
+    );
+}
+
+#[test]
 fn parallel_openblas_threads_bounded_correctness() {
     if !cfg!(feature = "native-spral-src-openmp") {
         eprintln!("skipping OpenBLAS OpenMP check: native-spral-src-openmp feature is disabled");
         return;
     }
-    native_thread_bounded_check("parallel_openblas_threads_bounded_correctness");
+    native_thread_bounded_check(
+        "parallel_openblas_threads_bounded_correctness",
+        NativeThreadConfig {
+            omp_threads: 1,
+            openblas_threads: 1,
+        },
+        NativeThreadConfig {
+            omp_threads: 4,
+            openblas_threads: 4,
+        },
+        "native OpenMP/OpenBLAS OpenMP=1 vs OpenMP/OpenBLAS OpenMP=4",
+    );
 }

@@ -28,31 +28,40 @@ const OPENBLAS_VERSION: &str = "0.3.32";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OpenBlasThreading {
     Serial,
+    Pthreads,
     OpenMp,
 }
 
 impl OpenBlasThreading {
     fn from_features() -> Self {
-        match (
-            cfg!(feature = "openblas-serial"),
-            cfg!(feature = "openblas-openmp"),
-        ) {
-            (true, false) => Self::Serial,
-            (false, true) => Self::OpenMp,
-            (true, true) => panic!(
-                "spral-src features `openblas-serial` and `openblas-openmp` are mutually exclusive"
-            ),
-            (false, false) => panic!(
-                "spral-src requires exactly one OpenBLAS threading feature: `openblas-serial` or `openblas-openmp`"
-            ),
+        let serial = cfg!(feature = "openblas-serial");
+        let pthreads = cfg!(feature = "openblas-pthreads");
+        let openmp = cfg!(feature = "openblas-openmp");
+        let enabled = usize::from(serial) + usize::from(pthreads) + usize::from(openmp);
+        assert!(
+            enabled == 1,
+            "spral-src requires exactly one OpenBLAS threading feature: \
+             `openblas-serial`, `openblas-pthreads`, or `openblas-openmp`"
+        );
+        if serial {
+            Self::Serial
+        } else if pthreads {
+            Self::Pthreads
+        } else {
+            Self::OpenMp
         }
     }
 
     const fn label(self) -> &'static str {
         match self {
             Self::Serial => "serial",
+            Self::Pthreads => "pthreads",
             Self::OpenMp => "openmp",
         }
+    }
+
+    const fn uses_threaded_blas(self) -> bool {
+        matches!(self, Self::Pthreads | Self::OpenMp)
     }
 }
 
@@ -597,8 +606,21 @@ fn build_metis(source: &Path, gklib_source: &Path, out: &Path) -> NativeLibrary 
 
 fn build_openblas(out: &Path, tools: &Toolchain, threading: OpenBlasThreading) -> NativeLibrary {
     fs::create_dir_all(out).expect("failed to create OpenBLAS build directory");
-    let source = openblas_build::download(out)
+    let mut source = openblas_build::download(out)
         .unwrap_or_else(|error| panic!("failed to download OpenBLAS source: {error}"));
+    let stale_configured_source = source.join(static_archive_name("openblas")).exists()
+        || source.join("Makefile.conf").exists()
+        || openblas_stamp_path(&source).exists();
+    if stale_configured_source && !openblas_stamp_matches(&source, tools, threading) {
+        fs::remove_dir_all(&source).unwrap_or_else(|error| {
+            panic!(
+                "failed to remove stale OpenBLAS source directory {}: {error}",
+                source.display()
+            )
+        });
+        source = openblas_build::download(out)
+            .unwrap_or_else(|error| panic!("failed to re-download OpenBLAS source: {error}"));
+    }
     let archive = source.join(static_archive_name("openblas"));
     let makefile_conf = source.join("Makefile.conf");
     if !archive.exists() || !makefile_conf.exists() || !openblas_has_required_lapack(&archive) {
@@ -606,6 +628,7 @@ fn build_openblas(out: &Path, tools: &Toolchain, threading: OpenBlasThreading) -
             fs::remove_file(&makefile_conf).expect("failed to remove stale OpenBLAS Makefile.conf");
         }
         run_openblas_make(&source, tools, threading);
+        write_openblas_stamp(&source, tools, threading);
     }
     let make_conf = openblas_build::MakeConf::new(&makefile_conf)
         .unwrap_or_else(|error| panic!("failed to parse OpenBLAS Makefile.conf: {error}"));
@@ -630,7 +653,7 @@ fn build_openblas(out: &Path, tools: &Toolchain, threading: OpenBlasThreading) -
         &mut extra_link_libs,
         &make_conf.f_extra_libs,
     );
-    for lib in ["gfortran", "quadmath"] {
+    for lib in ["gfortran", "quadmath", "gcc"] {
         if compiler_lib_dir(
             &env::var("TARGET").expect("TARGET must be set"),
             &tools.fc,
@@ -687,6 +710,46 @@ fn openblas_has_required_lapack(archive: &Path) -> bool {
     symbols.contains("dsytrf_")
 }
 
+fn openblas_stamp_path(source: &Path) -> PathBuf {
+    source.join(".spral-src-openblas-build-stamp")
+}
+
+fn openblas_build_stamp(tools: &Toolchain, threading: OpenBlasThreading) -> String {
+    let openblas_target =
+        openblas_target_arg(threading).unwrap_or_else(|| "autodetect".to_string());
+    let ranlib = env::var("OPENBLAS_RANLIB").unwrap_or_default();
+    format!(
+        "openblas_version={OPENBLAS_VERSION}\n\
+         threading={threading}\n\
+         cargo_target={target}\n\
+         cargo_host={host}\n\
+         openblas_target={openblas_target}\n\
+         cc={cc}\n\
+         fc={fc}\n\
+         host_cc={host_cc}\n\
+         ranlib={ranlib}\n",
+        threading = threading.label(),
+        target = env::var("TARGET").expect("TARGET must be set"),
+        host = env::var("HOST").expect("HOST must be set"),
+        cc = tools.cc,
+        fc = tools.fc,
+        host_cc = tools.host_cc,
+    )
+}
+
+fn openblas_stamp_matches(source: &Path, tools: &Toolchain, threading: OpenBlasThreading) -> bool {
+    fs::read_to_string(openblas_stamp_path(source))
+        .is_ok_and(|stamp| stamp == openblas_build_stamp(tools, threading))
+}
+
+fn write_openblas_stamp(source: &Path, tools: &Toolchain, threading: OpenBlasThreading) {
+    fs::write(
+        openblas_stamp_path(source),
+        openblas_build_stamp(tools, threading),
+    )
+    .expect("failed to write OpenBLAS build stamp");
+}
+
 fn openblas_make_args(tools: &Toolchain, threading: OpenBlasThreading) -> Vec<String> {
     let mut args = vec![
         "NO_SHARED=1".to_string(),
@@ -701,6 +764,10 @@ fn openblas_make_args(tools: &Toolchain, threading: OpenBlasThreading) -> Vec<St
             args.push("USE_THREAD=0".to_string());
             args.push("USE_OPENMP=0".to_string());
         }
+        OpenBlasThreading::Pthreads => {
+            args.push("USE_THREAD=1".to_string());
+            args.push("USE_OPENMP=0".to_string());
+        }
         OpenBlasThreading::OpenMp => {
             args.push("USE_THREAD=1".to_string());
             args.push("USE_OPENMP=1".to_string());
@@ -712,18 +779,38 @@ fn openblas_make_args(tools: &Toolchain, threading: OpenBlasThreading) -> Vec<St
     if let Ok(ranlib) = env::var("OPENBLAS_RANLIB") {
         args.push(format!("RANLIB={ranlib}"));
     }
+    if let Some(target) = openblas_target_arg(threading) {
+        args.push(format!("TARGET={target}"));
+    }
+    args
+}
+
+fn openblas_target_arg(threading: OpenBlasThreading) -> Option<String> {
     if let Ok(target) = env::var("OPENBLAS_TARGET") {
-        args.push(format!("TARGET={}", target.to_ascii_uppercase()));
+        Some(target.to_ascii_uppercase())
     } else if env::var("TARGET").expect("TARGET must be set")
         != env::var("HOST").expect("HOST must be set")
     {
         let target = env::var("TARGET").expect("TARGET must be set");
-        let openblas_target = generic_openblas_target(&target).unwrap_or_else(|| {
-            panic!("spral-src requires OPENBLAS_TARGET for cross-compilation target {target}")
-        });
-        args.push(format!("TARGET={openblas_target}"));
+        Some(
+            generic_openblas_target(&target)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "spral-src requires OPENBLAS_TARGET for cross-compilation target {target}"
+                    )
+                })
+                .to_string(),
+        )
+    } else if threading.uses_threaded_blas()
+        && env::var("TARGET").expect("TARGET must be set") == "aarch64-apple-darwin"
+    {
+        // OpenBLAS 0.3.32 autodetects VORTEX on Apple Silicon. Its threaded
+        // USE_THREAD=1 build miscomputes dtrsv_TLU, which SPRAL APP solves use
+        // through BLAS dtrsv; keep the direct dtrsv guard in tests green.
+        Some("ARMV8".to_string())
+    } else {
+        None
     }
-    args
 }
 
 fn generic_openblas_target(target: &str) -> Option<&'static str> {

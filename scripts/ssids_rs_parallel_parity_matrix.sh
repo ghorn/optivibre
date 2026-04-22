@@ -7,13 +7,25 @@ cd "${repo_root}"
 export OMP_CANCELLATION="${OMP_CANCELLATION:-true}"
 export AD_CODEGEN_REQUIRE_NATIVE_SPRAL_PARITY="${AD_CODEGEN_REQUIRE_NATIVE_SPRAL_PARITY:-1}"
 
+run_with_thread_env() {
+  local rayon_threads="$1"
+  local omp_threads="$2"
+  local openblas_threads="$3"
+  shift 3
+  echo
+  echo "==> RAYON_NUM_THREADS=${rayon_threads} OMP_NUM_THREADS=${omp_threads} OPENBLAS_NUM_THREADS=${openblas_threads} $*"
+  RAYON_NUM_THREADS="${rayon_threads}" \
+    OMP_NUM_THREADS="${omp_threads}" \
+    OPENBLAS_NUM_THREADS="${openblas_threads}" \
+    GOTO_NUM_THREADS="${openblas_threads}" \
+    "$@"
+}
+
 run_with_threads() {
   local rayon_threads="$1"
   local omp_threads="$2"
   shift 2
-  echo
-  echo "==> RAYON_NUM_THREADS=${rayon_threads} OMP_NUM_THREADS=${omp_threads} $*"
-  RAYON_NUM_THREADS="${rayon_threads}" OMP_NUM_THREADS="${omp_threads}" "$@"
+  run_with_thread_env "${rayon_threads}" "${omp_threads}" 1 "$@"
 }
 
 if [[ "$#" -gt 0 ]]; then
@@ -31,14 +43,13 @@ run_with_threads 4 1 \
 run_with_threads 1 4 \
   cargo test -p ssids-rs --features native-spral-src parallel_native_threads -- --nocapture
 
-echo
-echo "==> OpenBLAS OpenMP native path is currently excluded from the green matrix."
-echo "    Run with SSIDS_RS_CHECK_OPENBLAS_OPENMP=1 to execute the known-failing guard."
-if [[ "${SSIDS_RS_CHECK_OPENBLAS_OPENMP:-0}" == "1" ]]; then
-  run_with_threads 1 4 \
-    cargo test -p ssids-rs --no-default-features --features native-spral-src-openmp \
-      parallel_openblas_threads -- --ignored --nocapture
-fi
+run_with_thread_env 1 1 4 \
+  cargo test -p ssids-rs --no-default-features --features native-spral-src-pthreads \
+    parallel_openblas_pthreads -- --nocapture
+
+run_with_thread_env 1 4 4 \
+  cargo test -p ssids-rs --no-default-features --features native-spral-src-openmp \
+    parallel_openblas_threads -- --nocapture
 
 run_with_threads 8 1 \
   cargo test -p ssids-rs --features native-spral-src concurrent_ssids_rs_stress -- --nocapture

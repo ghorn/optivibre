@@ -76,14 +76,18 @@ work. It preserves the serial bitwise baseline, then checks:
 
 - exact `ssids-rs` Rayon determinism for dense APP and multi-root front trees;
 - bounded native SPRAL correctness under `OMP_NUM_THREADS=1` and `4`;
+- bounded source-built OpenBLAS pthread correctness under
+  `OPENBLAS_NUM_THREADS=1` and `4`;
+- bounded source-built OpenBLAS OpenMP correctness under
+  `OMP_NUM_THREADS=1` and `4`;
 - concurrent independent factor/solve and refactor/solve stress for Rust-owned
   solver objects.
 
-The `native-spral-src-openmp` path is not part of the green acceptance matrix
-yet. The guard `parallel_openblas_threads_bounded_correctness` is ignored by
-default because source-built OpenBLAS OpenMP currently changes native SPRAL APP
-solve results on an active bitwise witness. Run it explicitly while fixing that
-packaging/backend path.
+The direct `spral-src::openblas_dtrsv_lower_trans_unit_matches_reference` guard
+must stay green before treating any threaded OpenBLAS path as native SSIDS
+evidence. On Apple Silicon this currently requires the source-built OpenBLAS
+threaded artifact to use `TARGET=ARMV8`, because the autodetected `VORTEX`
+threaded artifact miscomputes the `dtrsv_TLU` path used by SPRAL APP solves.
 
 Any new parallel mismatch must still be reduced to a deterministic witness
 before changing numeric behavior.

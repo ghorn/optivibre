@@ -13,6 +13,7 @@ description = "Source-built SPRAL, METIS, and OpenBLAS native dependency package
 [features]
 default = ["openblas-serial"]
 openblas-serial = []
+openblas-pthreads = []
 openblas-openmp = []
 
 [dependencies]
