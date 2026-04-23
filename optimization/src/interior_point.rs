@@ -3841,27 +3841,32 @@ fn interior_point_direction_diagnostics(
     }
 }
 
-fn native_bound_complementarity_sum(
+fn native_lower_bound_complementarity_sum(
     x: &[f64],
     bounds: &BoundConstraints,
     z_lower: &[f64],
-    z_upper: &[f64],
 ) -> f64 {
-    let lower_sum = bounds
+    bounds
         .lower_indices
         .iter()
         .zip(bounds.lower_values.iter())
         .zip(z_lower.iter())
         .map(|((&index, &lower), &z_i)| native_lower_bound_slack(x, index, lower) * z_i)
-        .sum::<f64>();
-    let upper_sum = bounds
+        .sum::<f64>()
+}
+
+fn native_upper_bound_complementarity_sum(
+    x: &[f64],
+    bounds: &BoundConstraints,
+    z_upper: &[f64],
+) -> f64 {
+    bounds
         .upper_indices
         .iter()
         .zip(bounds.upper_values.iter())
         .zip(z_upper.iter())
         .map(|((&index, &upper), &z_i)| native_upper_bound_slack(x, index, upper) * z_i)
-        .sum::<f64>();
-    lower_sum + upper_sum
+        .sum::<f64>()
 }
 
 fn native_bound_complementarity_inf_norm(
@@ -3900,12 +3905,17 @@ fn combined_barrier_parameter(
     if count == 0 {
         return 0.0;
     }
-    let slack_sum = slack
+    // Mirror IpoptCalculatedQuantities::curr_avrg_compl: z_L * slack_x_L,
+    // then z_U * slack_x_U, then v_L * slack_s_L, then v_U * slack_s_U.
+    // NLIP has no lower slack block, so bound lower/upper precede upper slacks.
+    let mut complementarity_sum = native_lower_bound_complementarity_sum(x, bounds, z_lower);
+    complementarity_sum += native_upper_bound_complementarity_sum(x, bounds, z_upper);
+    complementarity_sum += slack
         .iter()
         .zip(z.iter())
         .map(|(s, z_i)| s * z_i)
         .sum::<f64>();
-    (slack_sum + native_bound_complementarity_sum(x, bounds, z_lower, z_upper)) / count as f64
+    complementarity_sum / count as f64
 }
 
 fn combined_complementarity_inf_norm(
@@ -3959,6 +3969,29 @@ fn combined_multiplier_vector<'a>(slices: impl IntoIterator<Item = &'a [f64]>) -
         .into_iter()
         .flat_map(|slice| slice.iter().copied())
         .collect()
+}
+
+fn ipopt_all_dual_multiplier_vector(
+    lambda_eq: &[f64],
+    lambda_ineq: &[f64],
+    z_lower: &[f64],
+    z_upper: &[f64],
+    z: &[f64],
+) -> Vec<f64> {
+    // IpoptCalculatedQuantities::ComputeOptimalityErrorScaling accumulates
+    // y_c, y_d, z_L, z_U, v_L, then v_U. NLIP has no lower slack multiplier,
+    // so the upper-slack multiplier block comes after bound multipliers.
+    combined_multiplier_vector([lambda_eq, lambda_ineq, z_lower, z_upper, z])
+}
+
+fn ipopt_complementarity_multiplier_vector(
+    z_lower: &[f64],
+    z_upper: &[f64],
+    z: &[f64],
+) -> Vec<f64> {
+    // Same source order as IpoptCalculatedQuantities::curr_complementarity:
+    // z_L, z_U, v_L, then v_U; NLIP omits v_L.
+    combined_multiplier_vector([z_lower, z_upper, z])
 }
 
 fn correct_bound_multiplier_estimate(
@@ -8730,6 +8763,20 @@ mod tests {
     }
 
     #[test]
+    fn ipopt_optimality_scaling_vectors_use_bound_before_slack_order() {
+        let all_dual =
+            ipopt_all_dual_multiplier_vector(&[1.0, 2.0], &[3.0], &[4.0, 5.0], &[6.0], &[7.0, 8.0]);
+        let complementarity =
+            ipopt_complementarity_multiplier_vector(&[4.0, 5.0], &[6.0], &[7.0, 8.0]);
+
+        // IpoptCalculatedQuantities::ComputeOptimalityErrorScaling accumulates
+        // y_c, y_d, z_L, z_U, v_L, v_U; curr_complementarity uses z_L, z_U,
+        // v_L, v_U. NLIP omits v_L but keeps v_U after variable bounds.
+        assert_eq!(all_dual, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(complementarity, vec![4.0, 5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
     fn fraction_to_boundary_candidate_keeps_ipopt_operation_order() {
         let tau = 0.7782901536485674;
         let value = 2.59793708066258e-11;
@@ -9494,15 +9541,10 @@ where
             options.kappa_d,
         );
         let current_filter_entry = super::filter::entry(current_barrier_objective, current_theta);
-        let all_dual_multipliers = combined_multiplier_vector([
-            lambda_eq.as_slice(),
-            lambda_ineq.as_slice(),
-            z.as_slice(),
-            z_lower.as_slice(),
-            z_upper.as_slice(),
-        ]);
+        let all_dual_multipliers =
+            ipopt_all_dual_multiplier_vector(&lambda_eq, &lambda_ineq, &z_lower, &z_upper, &z);
         let complementarity_multipliers =
-            combined_multiplier_vector([z.as_slice(), z_lower.as_slice(), z_upper.as_slice()]);
+            ipopt_complementarity_multiplier_vector(&z_lower, &z_upper, &z);
         let overall_inf = scaled_overall_inf_norm(
             current_theta,
             dual_inf,
@@ -9755,15 +9797,10 @@ where
         } else {
             0.0
         };
-        let all_dual_multipliers = combined_multiplier_vector([
-            lambda_eq.as_slice(),
-            lambda_ineq.as_slice(),
-            z.as_slice(),
-            z_lower.as_slice(),
-            z_upper.as_slice(),
-        ]);
+        let all_dual_multipliers =
+            ipopt_all_dual_multiplier_vector(&lambda_eq, &lambda_ineq, &z_lower, &z_upper, &z);
         let complementarity_multipliers =
-            combined_multiplier_vector([z.as_slice(), z_lower.as_slice(), z_upper.as_slice()]);
+            ipopt_complementarity_multiplier_vector(&z_lower, &z_upper, &z);
         let overall_inf = scaled_overall_inf_norm(
             primal_inf,
             dual_inf,
@@ -10701,18 +10738,15 @@ where
                 trial_comp_inf,
                 barrier_parameter_value,
             );
-            let trial_all_dual_multipliers = combined_multiplier_vector([
-                trial_lambda.as_slice(),
-                trial_lambda_ineq.as_slice(),
-                trial_z.as_slice(),
-                trial_z_lower.as_slice(),
-                trial_z_upper.as_slice(),
-            ]);
-            let trial_complementarity_multipliers = combined_multiplier_vector([
-                trial_z.as_slice(),
-                trial_z_lower.as_slice(),
-                trial_z_upper.as_slice(),
-            ]);
+            let trial_all_dual_multipliers = ipopt_all_dual_multiplier_vector(
+                &trial_lambda,
+                &trial_lambda_ineq,
+                &trial_z_lower,
+                &trial_z_upper,
+                &trial_z,
+            );
+            let trial_complementarity_multipliers =
+                ipopt_complementarity_multiplier_vector(&trial_z_lower, &trial_z_upper, &trial_z);
             let trial_overall_inf = scaled_overall_inf_norm(
                 trial_primal_inf,
                 trial_dual_inf,
@@ -10763,18 +10797,19 @@ where
                         &corrected.z_lower,
                         &corrected.z_upper,
                     );
-                    let corrected_complementarity_multipliers = combined_multiplier_vector([
-                        corrected.z.as_slice(),
-                        corrected.z_lower.as_slice(),
-                        corrected.z_upper.as_slice(),
-                    ]);
-                    let corrected_all_dual_multipliers = combined_multiplier_vector([
-                        trial_lambda.as_slice(),
-                        trial_lambda_ineq.as_slice(),
-                        corrected.z.as_slice(),
-                        corrected.z_lower.as_slice(),
-                        corrected.z_upper.as_slice(),
-                    ]);
+                    let corrected_complementarity_multipliers =
+                        ipopt_complementarity_multiplier_vector(
+                            &corrected.z_lower,
+                            &corrected.z_upper,
+                            &corrected.z,
+                        );
+                    let corrected_all_dual_multipliers = ipopt_all_dual_multiplier_vector(
+                        &trial_lambda,
+                        &trial_lambda_ineq,
+                        &corrected.z_lower,
+                        &corrected.z_upper,
+                        &corrected.z,
+                    );
                     let corrected_overall_inf = scaled_overall_inf_norm(
                         trial_primal_inf,
                         corrected.dual_inf,
@@ -10915,18 +10950,19 @@ where
                         &corrected.z_lower,
                         &corrected.z_upper,
                     );
-                    let corrected_complementarity_multipliers = combined_multiplier_vector([
-                        corrected.z.as_slice(),
-                        corrected.z_lower.as_slice(),
-                        corrected.z_upper.as_slice(),
-                    ]);
-                    let corrected_all_dual_multipliers = combined_multiplier_vector([
-                        trial_lambda.as_slice(),
-                        trial_lambda_ineq.as_slice(),
-                        corrected.z.as_slice(),
-                        corrected.z_lower.as_slice(),
-                        corrected.z_upper.as_slice(),
-                    ]);
+                    let corrected_complementarity_multipliers =
+                        ipopt_complementarity_multiplier_vector(
+                            &corrected.z_lower,
+                            &corrected.z_upper,
+                            &corrected.z,
+                        );
+                    let corrected_all_dual_multipliers = ipopt_all_dual_multiplier_vector(
+                        &trial_lambda,
+                        &trial_lambda_ineq,
+                        &corrected.z_lower,
+                        &corrected.z_upper,
+                        &corrected.z,
+                    );
                     let corrected_overall_inf = scaled_overall_inf_norm(
                         trial_primal_inf,
                         corrected.dual_inf,
@@ -11318,18 +11354,19 @@ where
                         } else {
                             'F'
                         };
-                        let corrected_all_dual_multipliers = combined_multiplier_vector([
-                            corrected_lambda.as_slice(),
-                            corrected_lambda_ineq.as_slice(),
-                            corrected_z.as_slice(),
-                            corrected_z_lower.as_slice(),
-                            corrected_z_upper.as_slice(),
-                        ]);
-                        let corrected_complementarity_multipliers = combined_multiplier_vector([
-                            corrected_z.as_slice(),
-                            corrected_z_lower.as_slice(),
-                            corrected_z_upper.as_slice(),
-                        ]);
+                        let corrected_all_dual_multipliers = ipopt_all_dual_multiplier_vector(
+                            &corrected_lambda,
+                            &corrected_lambda_ineq,
+                            &corrected_z_lower,
+                            &corrected_z_upper,
+                            &corrected_z,
+                        );
+                        let corrected_complementarity_multipliers =
+                            ipopt_complementarity_multiplier_vector(
+                                &corrected_z_lower,
+                                &corrected_z_upper,
+                                &corrected_z,
+                            );
                         let corrected_overall_inf = scaled_overall_inf_norm(
                             corrected_primal_inf,
                             corrected_dual_inf,
@@ -11371,18 +11408,18 @@ where
                                 &corrected.z_upper,
                             );
                             let corrected_complementarity_multipliers =
-                                combined_multiplier_vector([
-                                    corrected.z.as_slice(),
-                                    corrected.z_lower.as_slice(),
-                                    corrected.z_upper.as_slice(),
-                                ]);
-                            let corrected_all_dual_multipliers = combined_multiplier_vector([
-                                corrected_lambda.as_slice(),
-                                corrected_lambda_ineq.as_slice(),
-                                corrected.z.as_slice(),
-                                corrected.z_lower.as_slice(),
-                                corrected.z_upper.as_slice(),
-                            ]);
+                                ipopt_complementarity_multiplier_vector(
+                                    &corrected.z_lower,
+                                    &corrected.z_upper,
+                                    &corrected.z,
+                                );
+                            let corrected_all_dual_multipliers = ipopt_all_dual_multiplier_vector(
+                                &corrected_lambda,
+                                &corrected_lambda_ineq,
+                                &corrected.z_lower,
+                                &corrected.z_upper,
+                                &corrected.z,
+                            );
                             let corrected_overall_inf = scaled_overall_inf_norm(
                                 corrected_primal_inf,
                                 corrected.dual_inf,
@@ -11590,18 +11627,19 @@ where
                         &corrected.z_lower,
                         &corrected.z_upper,
                     );
-                    let corrected_complementarity_multipliers = combined_multiplier_vector([
-                        corrected.z.as_slice(),
-                        corrected.z_lower.as_slice(),
-                        corrected.z_upper.as_slice(),
-                    ]);
-                    let corrected_all_dual_multipliers = combined_multiplier_vector([
-                        trial_lambda.as_slice(),
-                        trial_lambda_ineq.as_slice(),
-                        corrected.z.as_slice(),
-                        corrected.z_lower.as_slice(),
-                        corrected.z_upper.as_slice(),
-                    ]);
+                    let corrected_complementarity_multipliers =
+                        ipopt_complementarity_multiplier_vector(
+                            &corrected.z_lower,
+                            &corrected.z_upper,
+                            &corrected.z,
+                        );
+                    let corrected_all_dual_multipliers = ipopt_all_dual_multiplier_vector(
+                        &trial_lambda,
+                        &trial_lambda_ineq,
+                        &corrected.z_lower,
+                        &corrected.z_upper,
+                        &corrected.z,
+                    );
                     let corrected_overall_inf = scaled_overall_inf_norm(
                         trial_primal_inf,
                         corrected.dual_inf,
@@ -11802,18 +11840,15 @@ where
                 } else {
                     0.0
                 };
-                let restored_all_dual_multipliers = combined_multiplier_vector([
-                    restored_lambda.as_slice(),
-                    restored_lambda_ineq.as_slice(),
-                    z.as_slice(),
-                    z_lower.as_slice(),
-                    z_upper.as_slice(),
-                ]);
-                let restored_complementarity_multipliers = combined_multiplier_vector([
-                    z.as_slice(),
-                    z_lower.as_slice(),
-                    z_upper.as_slice(),
-                ]);
+                let restored_all_dual_multipliers = ipopt_all_dual_multiplier_vector(
+                    &restored_lambda,
+                    &restored_lambda_ineq,
+                    &z_lower,
+                    &z_upper,
+                    &z,
+                );
+                let restored_complementarity_multipliers =
+                    ipopt_complementarity_multiplier_vector(&z_lower, &z_upper, &z);
                 let restored_overall_inf = scaled_overall_inf_norm(
                     restored_primal_inf,
                     restored_dual_inf,
