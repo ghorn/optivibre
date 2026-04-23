@@ -85,7 +85,6 @@ struct SpralMetadata {
     spral_version: String,
     metis_version: String,
     openblas_version: String,
-    openblas_threading: String,
 }
 
 impl SpralMetadata {
@@ -110,7 +109,6 @@ impl SpralMetadata {
             spral_version: metadata("SPRAL_VERSION"),
             metis_version: metadata("METIS_VERSION"),
             openblas_version: metadata("OPENBLAS_VERSION"),
-            openblas_threading: metadata("OPENBLAS_THREADING"),
         }
     }
 }
