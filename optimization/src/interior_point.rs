@@ -4497,8 +4497,24 @@ fn lagrangian_gradient_sparse(
     inequality_multipliers: &[f64],
 ) -> Vec<f64> {
     let mut residual = gradient.to_vec();
-    sparse_add_transpose_mat_vec(&mut residual, equality_jacobian, equality_multipliers);
-    sparse_add_transpose_mat_vec(&mut residual, inequality_jacobian, inequality_multipliers);
+    let mut equality_term = vec![0.0; gradient.len()];
+    let mut inequality_term = vec![0.0; gradient.len()];
+    sparse_add_transpose_mat_vec(&mut equality_term, equality_jacobian, equality_multipliers);
+    sparse_add_transpose_mat_vec(
+        &mut inequality_term,
+        inequality_jacobian,
+        inequality_multipliers,
+    );
+    // Mirrors IpIpoptCalculatedQuantities.cpp::curr_grad_lag_x:
+    // tmp starts as curr_grad_f(), then AddTwoVectors(1., jac_cT*y_c,
+    // 1., jac_dT*y_d, 1.) accumulates both multiplier products in one pass.
+    for ((residual_i, equality_i), inequality_i) in residual
+        .iter_mut()
+        .zip(equality_term.iter())
+        .zip(inequality_term.iter())
+    {
+        *residual_i += *equality_i + *inequality_i;
+    }
     residual
 }
 
