@@ -4173,6 +4173,41 @@ mod tests {
             (rhs_vectors, sol_vectors)
         }
 
+        fn ipopt_journal_dense_vectors(journal: &str, name: &str) -> Vec<Vec<f64>> {
+            let header = format!("DenseVector \"{name}\" with ");
+            let entry_prefix = format!("{name}[");
+            let mut vectors = Vec::new();
+            let mut current = Vec::new();
+            let mut in_vector = false;
+            for line in journal.lines() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with(&header) {
+                    if !current.is_empty() {
+                        vectors.push(std::mem::take(&mut current));
+                    }
+                    in_vector = true;
+                    continue;
+                }
+                if !in_vector {
+                    continue;
+                }
+                if trimmed.starts_with(&entry_prefix) {
+                    if let Some(value) = journal_value_after_equals(trimmed) {
+                        current.push(value);
+                    }
+                    continue;
+                }
+                if !current.is_empty() {
+                    vectors.push(std::mem::take(&mut current));
+                }
+                in_vector = false;
+            }
+            if !current.is_empty() {
+                vectors.push(current);
+            }
+            vectors
+        }
+
         fn print_ipopt_augmented_journal_fingerprints(journal_output: Option<&str>) {
             if std::env::var_os("GLIDER_PARITY_PRINT_IPOPT_AUGMENTED_FINGERPRINTS").is_none() {
                 return;
@@ -4365,6 +4400,26 @@ mod tests {
             let Some(journal) = journal_output else {
                 return;
             };
+            let ipopt_grad_lag_x_vectors = ipopt_journal_dense_vectors(journal, "curr_grad_lag_x");
+            println!(
+                "  ipopt_curr_grad_lag_x_count={}",
+                ipopt_grad_lag_x_vectors.len()
+            );
+            let mut ranked_grad_lag_x = ipopt_grad_lag_x_vectors
+                .iter()
+                .enumerate()
+                .map(|(index, gradient)| {
+                    (index, journal_vector_max_abs_diff(&dump.r_dual, gradient))
+                })
+                .collect::<Vec<_>>();
+            ranked_grad_lag_x.sort_by(|lhs, rhs| lhs.1.total_cmp(&rhs.1).then(lhs.0.cmp(&rhs.0)));
+            for (rank, (index, max_abs_diff)) in ranked_grad_lag_x.iter().take(4).enumerate() {
+                let gradient = &ipopt_grad_lag_x_vectors[*index];
+                println!(
+                    "  nlip_best_curr_grad_lag_x_match[{rank}] ipopt_curr_grad_lag_x[{index}] max_abs_diff={max_abs_diff:.17e} {}",
+                    journal_vector_diff_summary_text(&dump.r_dual, gradient),
+                );
+            }
             let ipopt_matrices = ipopt_augmented_journal_kkt_values(journal, &dims);
             println!("  ipopt_kkt_matrix_count={}", ipopt_matrices.len());
             for (rank, matrix) in ipopt_matrices.iter().take(4).enumerate() {
