@@ -19,7 +19,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const IPOPT_INF: f64 = 1e20;
-const IPOPT_JOURNAL_PRINT_LEVEL: i32 = 5;
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -962,7 +961,7 @@ fn solve_status_is_success(status: SolveStatus) -> bool {
     )
 }
 
-fn open_ipopt_journal<P>(solver: &mut Ipopt<P>) -> Option<PathBuf>
+fn open_ipopt_journal<P>(solver: &mut Ipopt<P>, print_level: i32) -> Option<PathBuf>
 where
     P: BasicProblem,
 {
@@ -977,7 +976,7 @@ where
     ));
     let path_text = path.to_string_lossy().into_owned();
     solver
-        .open_output_file(&path_text, IPOPT_JOURNAL_PRINT_LEVEL)
+        .open_output_file(&path_text, print_level)
         .map(|_| path)
 }
 
@@ -1168,7 +1167,7 @@ where
         let mut solver =
             Ipopt::new_newton(adapter).map_err(|err| IpoptSolveError::Setup(format!("{err:?}")))?;
         apply_ipopt_options(&mut solver, problem.ipopt_nlp_scaling_method(), options)?;
-        let journal_path = open_ipopt_journal(&mut solver);
+        let journal_path = open_ipopt_journal(&mut solver, options.print_level);
         solver.set_intermediate_callback(Some(IpoptProblemAdapter::<P, C>::record_iteration));
         let solve_result = solver.solve();
         let status = solve_result.status;
@@ -1237,7 +1236,7 @@ where
     let mut solver =
         Ipopt::new(adapter).map_err(|err| IpoptSolveError::Setup(format!("{err:?}")))?;
     apply_ipopt_options(&mut solver, problem.ipopt_nlp_scaling_method(), options)?;
-    let journal_path = open_ipopt_journal(&mut solver);
+    let journal_path = open_ipopt_journal(&mut solver, options.print_level);
     solver.set_intermediate_callback(Some(IpoptProblemAdapter::<P, C>::record_iteration));
 
     let solve_result = solver.solve();

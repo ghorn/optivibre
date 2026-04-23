@@ -5253,6 +5253,12 @@ mod tests {
 
         let mut ipopt_options = crate::common::ipopt_options(&params.solver);
         optimization::apply_native_spral_parity_to_ipopt_options(&mut ipopt_options);
+        if let Some(print_level) = std::env::var("GLIDER_PARITY_IPOPT_PRINT_LEVEL")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+        {
+            ipopt_options.print_level = print_level;
+        }
 
         let mut nlip_initial_options = nlip_options.clone();
         nlip_initial_options.max_iters = 0;

@@ -5057,14 +5057,69 @@ fn refine_linear_solution_ccs<E>(
 struct IpoptFullSpaceResidual {
     augmented_correction_rhs: Vec<f64>,
     residual_ratio: f64,
+    rhs_inf: f64,
+    solution_inf: f64,
+    residual_inf: f64,
+    residual_x_inf: f64,
+    residual_s_inf: f64,
+    residual_c_inf: f64,
+    residual_d_inf: f64,
+    residual_bound_inf: f64,
+    residual_vu_inf: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct IpoptRefinementReport {
     steps: usize,
     initial_residual_ratio: f64,
+    initial_residual: IpoptFullSpaceResidualMetrics,
     residual_ratio: f64,
+    final_residual: IpoptFullSpaceResidualMetrics,
     failed: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IpoptFullSpaceResidualMetrics {
+    rhs_inf: f64,
+    solution_inf: f64,
+    residual_inf: f64,
+    residual_x_inf: f64,
+    residual_s_inf: f64,
+    residual_c_inf: f64,
+    residual_d_inf: f64,
+    residual_bound_inf: f64,
+    residual_vu_inf: f64,
+}
+
+impl IpoptFullSpaceResidual {
+    fn metrics(&self) -> IpoptFullSpaceResidualMetrics {
+        IpoptFullSpaceResidualMetrics {
+            rhs_inf: self.rhs_inf,
+            solution_inf: self.solution_inf,
+            residual_inf: self.residual_inf,
+            residual_x_inf: self.residual_x_inf,
+            residual_s_inf: self.residual_s_inf,
+            residual_c_inf: self.residual_c_inf,
+            residual_d_inf: self.residual_d_inf,
+            residual_bound_inf: self.residual_bound_inf,
+            residual_vu_inf: self.residual_vu_inf,
+        }
+    }
+}
+
+fn ipopt_full_space_residual_metrics_text(metrics: IpoptFullSpaceResidualMetrics) -> String {
+    format!(
+        "rhs={:.3e},sol={:.3e},res={:.3e},x={:.3e},s={:.3e},c={:.3e},d={:.3e},bound={:.3e},vU={:.3e}",
+        metrics.rhs_inf,
+        metrics.solution_inf,
+        metrics.residual_inf,
+        metrics.residual_x_inf,
+        metrics.residual_s_inf,
+        metrics.residual_c_inf,
+        metrics.residual_d_inf,
+        metrics.residual_bound_inf,
+        metrics.residual_vu_inf,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -5195,6 +5250,9 @@ fn ipopt_full_space_residual_ratio(
     }
 
     let mut residual_inf = step_inf_norm(&residual_x).max(bound_residual_inf);
+    let mut residual_s_inf = 0.0_f64;
+    let mut residual_d_inf = 0.0_f64;
+    let mut residual_vu_inf = 0.0_f64;
 
     for row in 0..mineq {
         let slack = system.slack[row];
@@ -5211,6 +5269,9 @@ fn ipopt_full_space_residual_ratio(
         let residual_v = slack * dz_i - multiplier * ipopt_ds_i + system.r_cent[row];
         let residual_d =
             inequality_dx[row] - ipopt_ds_i - shifts.dual * d_ineq[row] + system.r_ineq[row];
+        residual_s_inf = residual_s_inf.max(residual_s.abs());
+        residual_d_inf = residual_d_inf.max(residual_d.abs());
+        residual_vu_inf = residual_vu_inf.max(residual_v.abs());
         // Mirrors Ipopt::PDFullSpaceSolver::SolveOnce: full-space residuals
         // from ComputeResiduals are converted to the augmented-system RHS with
         // Pd_U.AddMSinvZ(-1.0, ...), i.e. rhs_s - rhs_v_U / slack_s_U.
@@ -5230,9 +5291,11 @@ fn ipopt_full_space_residual_ratio(
             .max(dz_i.abs());
     }
 
+    let mut residual_c_inf = 0.0_f64;
     for row in 0..meq {
         let residual_c = equality_dx[row] - shifts.dual * d_lambda[row] + system.r_eq[row];
         augmented_correction_rhs[pattern.lambda_offset + row] = residual_c;
+        residual_c_inf = residual_c_inf.max(residual_c.abs());
         residual_inf = residual_inf.max(residual_c.abs());
         rhs_inf = rhs_inf.max(system.r_eq[row].abs());
         solution_inf = solution_inf.max(d_lambda[row].abs());
@@ -5247,6 +5310,15 @@ fn ipopt_full_space_residual_ratio(
     IpoptFullSpaceResidual {
         augmented_correction_rhs,
         residual_ratio,
+        rhs_inf,
+        solution_inf,
+        residual_inf,
+        residual_x_inf: step_inf_norm(&residual_x),
+        residual_s_inf,
+        residual_c_inf,
+        residual_d_inf,
+        residual_bound_inf: bound_residual_inf,
+        residual_vu_inf,
     }
 }
 
@@ -5266,6 +5338,7 @@ fn refine_ipopt_full_space_solution<E>(
     let mut residual = ipopt_full_space_residual_ratio(system, pattern, solution, shifts);
     let mut residual_ratio = residual.residual_ratio;
     let initial_residual_ratio = residual_ratio;
+    let initial_residual = residual.metrics();
     let mut previous_residual_ratio = residual_ratio;
     let mut failed = false;
     while steps < IPOPT_LINEAR_MIN_REFINEMENT_STEPS
@@ -5288,6 +5361,7 @@ fn refine_ipopt_full_space_solution<E>(
                     > IPOPT_LINEAR_RESIDUAL_IMPROVEMENT_FACTOR * previous_residual_ratio)
         {
             failed = true;
+            residual = new_residual;
             break;
         }
         residual = new_residual;
@@ -5296,7 +5370,9 @@ fn refine_ipopt_full_space_solution<E>(
     Ok(IpoptRefinementReport {
         steps,
         initial_residual_ratio,
+        initial_residual,
         residual_ratio,
+        final_residual: residual.metrics(),
         failed,
     })
 }
@@ -6577,8 +6653,12 @@ fn factor_solve_spral_src(
     )?;
     let mut detail = (refinement.steps > 0).then(|| {
         format!(
-            "full_space_iterative_refinement_steps={} residual_ratio={:.3e}->{:.3e}",
-            refinement.steps, refinement.initial_residual_ratio, refinement.residual_ratio
+            "full_space_iterative_refinement_steps={} residual_ratio={:.3e}->{:.3e} residuals=[{}]->[{}]",
+            refinement.steps,
+            refinement.initial_residual_ratio,
+            refinement.residual_ratio,
+            ipopt_full_space_residual_metrics_text(refinement.initial_residual),
+            ipopt_full_space_residual_metrics_text(refinement.final_residual),
         )
     });
     let mut accepted_after_failed_refinement = false;
