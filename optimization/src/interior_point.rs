@@ -2521,6 +2521,7 @@ fn replay_snapshot_with_solver(
                         dual: snapshot.dual_regularization,
                     },
                     rhs_orientation: IpoptLinearRhsOrientation::PreFinal,
+                    allow_inexact: false,
                     native_spral_quality_was_increased: false,
                 },
                 &mut scratch_profiling,
@@ -5403,6 +5404,7 @@ enum IpoptLinearRhsOrientation {
 struct IpoptLinearSolveContext {
     shifts: IpoptLinearRefinementShifts,
     rhs_orientation: IpoptLinearRhsOrientation,
+    allow_inexact: bool,
     native_spral_quality_was_increased: bool,
 }
 
@@ -7048,52 +7050,82 @@ fn factor_solve_spral_src(
         upper_slack_multiplier_step,
     };
     let mut solve_time = solve_started.elapsed();
-    let refinement = refine_ipopt_full_space_solution(
-        system,
-        &workspace.pattern,
-        &mut full_space_solution,
-        context.rhs_orientation,
-        context.shifts,
-        &mut solve_time,
-        |residual| {
-            session.solve_ipopt_single_rhs(residual).map_err(|error| {
-                native_spral_error_attempt(
-                    regularization,
-                    InteriorPointLinearSolveFailureKind::FactorizationFailed,
-                    error,
-                )
-            })
-        },
-    )?;
+    let refinement = if context.allow_inexact {
+        // IpFilterLSAcceptor::TrySecondOrderCorrection calls
+        // PDSystemSolver::Solve(..., allow_inexact=true), and
+        // IpPDFullSpaceSolver::Solve then exits after SolveOnce without
+        // full-space iterative refinement.
+        None
+    } else {
+        Some(refine_ipopt_full_space_solution(
+            system,
+            &workspace.pattern,
+            &mut full_space_solution,
+            context.rhs_orientation,
+            context.shifts,
+            &mut solve_time,
+            |residual| {
+                session.solve_ipopt_single_rhs(residual).map_err(|error| {
+                    native_spral_error_attempt(
+                        regularization,
+                        InteriorPointLinearSolveFailureKind::FactorizationFailed,
+                        error,
+                    )
+                })
+            },
+        )?)
+    };
     let post_refinement_prefinal_solution_fingerprint =
         vector_fingerprint(&full_space_solution.augmented_solution);
     let post_refinement_prefinal_solution_block_fingerprints = ipopt_augmented_block_fingerprints(
         &workspace.pattern,
         &full_space_solution.augmented_solution,
     );
-    let native_factor_detail = format!(
-        "native_spral_factor[delays={} nfactor={} nflops={} maxfront={} two_by_two={} supernodes={} maxsuper={}]; native_spral_rhs[{}]; native_spral_rhs_blocks[{}]; native_spral_solution_prefinal[{}]; native_spral_solution_prefinal_blocks[{}]; native_spral_solution_prefinal_refined[{}]; native_spral_solution_prefinal_refined_blocks[{}]",
-        factor_info.delayed_pivots,
-        factor_info.factor_entries,
-        factor_info.flop_count,
-        factor_info.max_front_size,
-        factor_info.two_by_two_pivots,
-        factor_info.supernode_count,
-        factor_info.max_supernode_width,
-        vector_fingerprint_text(vector_fingerprint(rhs)),
-        ipopt_augmented_block_fingerprints_text(ipopt_augmented_block_fingerprints(
-            &workspace.pattern,
-            rhs,
-        )),
-        vector_fingerprint_text(pre_refinement_solution_fingerprint),
-        ipopt_augmented_block_fingerprints_text(pre_refinement_solution_block_fingerprints),
-        vector_fingerprint_text(post_refinement_prefinal_solution_fingerprint),
-        ipopt_augmented_block_fingerprints_text(
-            post_refinement_prefinal_solution_block_fingerprints,
-        ),
-    );
-    let mut detail = (refinement.steps > 0)
-        .then(|| {
+    let native_factor_detail = if context.allow_inexact {
+        format!(
+            "ipopt_allow_inexact_no_refinement; native_spral_factor[delays={} nfactor={} nflops={} maxfront={} two_by_two={} supernodes={} maxsuper={}]; native_spral_rhs[{}]; native_spral_rhs_blocks[{}]; native_spral_solution_prefinal[{}]; native_spral_solution_prefinal_blocks[{}]",
+            factor_info.delayed_pivots,
+            factor_info.factor_entries,
+            factor_info.flop_count,
+            factor_info.max_front_size,
+            factor_info.two_by_two_pivots,
+            factor_info.supernode_count,
+            factor_info.max_supernode_width,
+            vector_fingerprint_text(vector_fingerprint(rhs)),
+            ipopt_augmented_block_fingerprints_text(ipopt_augmented_block_fingerprints(
+                &workspace.pattern,
+                rhs,
+            )),
+            vector_fingerprint_text(pre_refinement_solution_fingerprint),
+            ipopt_augmented_block_fingerprints_text(pre_refinement_solution_block_fingerprints),
+        )
+    } else {
+        format!(
+            "native_spral_factor[delays={} nfactor={} nflops={} maxfront={} two_by_two={} supernodes={} maxsuper={}]; native_spral_rhs[{}]; native_spral_rhs_blocks[{}]; native_spral_solution_prefinal[{}]; native_spral_solution_prefinal_blocks[{}]; native_spral_solution_prefinal_refined[{}]; native_spral_solution_prefinal_refined_blocks[{}]",
+            factor_info.delayed_pivots,
+            factor_info.factor_entries,
+            factor_info.flop_count,
+            factor_info.max_front_size,
+            factor_info.two_by_two_pivots,
+            factor_info.supernode_count,
+            factor_info.max_supernode_width,
+            vector_fingerprint_text(vector_fingerprint(rhs)),
+            ipopt_augmented_block_fingerprints_text(ipopt_augmented_block_fingerprints(
+                &workspace.pattern,
+                rhs,
+            )),
+            vector_fingerprint_text(pre_refinement_solution_fingerprint),
+            ipopt_augmented_block_fingerprints_text(pre_refinement_solution_block_fingerprints),
+            vector_fingerprint_text(post_refinement_prefinal_solution_fingerprint),
+            ipopt_augmented_block_fingerprints_text(
+                post_refinement_prefinal_solution_block_fingerprints,
+            ),
+        )
+    };
+    let mut detail = refinement
+        .as_ref()
+        .filter(|refinement| refinement.steps > 0)
+        .map(|refinement| {
             let first_correction_rhs = refinement
                 .first_correction_rhs
                 .map(vector_fingerprint_text)
@@ -7128,7 +7160,9 @@ fn factor_solve_spral_src(
             |detail| Some(format!("{detail}; {native_factor_detail}")),
         );
     let mut accepted_after_failed_refinement = false;
-    if refinement.failed {
+    if let Some(refinement) = refinement.as_ref()
+        && refinement.failed
+    {
         // IpPDFullSpaceSolver.cpp retries failed full-space iterative
         // refinement by asking the augmented solver IncreaseQuality() once;
         // if that has already happened, residual_ratio_singular decides
@@ -7215,10 +7249,10 @@ fn factor_solve_spral_src(
         final_rhs,
         &full_space_solution.augmented_solution,
     );
-    if accepted_after_failed_refinement {
+    if context.allow_inexact || accepted_after_failed_refinement {
         // IpPDFullSpaceSolver.cpp accepts this branch directly after the
-        // residual_ratio_singular check. Keep the generic augmented residual
-        // assessment as reporting metadata only.
+        // allow_inexact early exit or the residual_ratio_singular check. Keep
+        // the generic augmented residual assessment as reporting metadata only.
         let (solution_inf, residual_inf) = match assessment {
             Ok(assessment) => (assessment.solution_inf, assessment.residual_inf),
             Err(attempt) => (
@@ -7271,6 +7305,7 @@ fn solve_reduced_kkt_with_spral_src(
     workspace: &mut NativeSpralAugmentedKktWorkspace,
     profiling: &mut InteriorPointProfiling,
     verbose: bool,
+    allow_inexact: bool,
 ) -> std::result::Result<NewtonDirection, Vec<InteriorPointLinearSolveAttempt>> {
     let n = system.hessian.lower_triangle.nrow;
     let meq = system.equality_jacobian.nrows();
@@ -7319,6 +7354,7 @@ fn solve_reduced_kkt_with_spral_src(
                     dual: dual_shift,
                 },
                 rhs_orientation: IpoptLinearRhsOrientation::PreFinal,
+                allow_inexact,
                 native_spral_quality_was_increased: solver_quality_improved,
             },
             profiling,
@@ -7845,6 +7881,7 @@ fn solve_reduced_kkt(
     native_spral_workspace: Option<&mut NativeSpralAugmentedKktWorkspace>,
     profiling: &mut InteriorPointProfiling,
     verbose: bool,
+    allow_inexact: bool,
 ) -> std::result::Result<NewtonDirection, InteriorPointSolveError> {
     let preferred_solver = preferred_linear_solver(
         system.solver,
@@ -7859,11 +7896,16 @@ fn solve_reduced_kkt(
     if preferred_solver == InteriorPointLinearSolver::SpralSrc
         && let Some(workspace) = native_spral_workspace
     {
-        return solve_reduced_kkt_with_spral_src(system, workspace, profiling, verbose).map_err(
-            |attempts| {
-                linear_solve_error(preferred_solver, workspace.pattern.dimension(), attempts)
-            },
-        );
+        return solve_reduced_kkt_with_spral_src(
+            system,
+            workspace,
+            profiling,
+            verbose,
+            allow_inexact,
+        )
+        .map_err(|attempts| {
+            linear_solve_error(preferred_solver, workspace.pattern.dimension(), attempts)
+        });
     }
 
     if preferred_solver == InteriorPointLinearSolver::SsidsRs
@@ -10149,6 +10191,7 @@ where
             native_spral_workspace.as_mut(),
             &mut profiling,
             options.verbose,
+            false,
         );
         let mut direction = match solve_result {
             Ok(mut direction) => {
@@ -10937,12 +10980,18 @@ where
                             direction.dual_regularization_used,
                         );
                     let soc_linear_started = Instant::now();
+                    // IpFilterLSAcceptor::TrySecondOrderCorrection passes
+                    // allow_inexact=true to PDSystemSolver::Solve; then
+                    // IpPDFullSpaceSolver::Solve accepts SolveOnce without
+                    // full-space iterative refinement or residual safety
+                    // checks.
                     let mut soc_direction = match solve_reduced_kkt(
                         &soc_reduced_kkt_system,
                         spral_workspace.as_mut(),
                         native_spral_workspace.as_mut(),
                         &mut profiling,
                         options.verbose,
+                        true,
                     ) {
                         Ok(direction) => direction,
                         Err(_) => break,
