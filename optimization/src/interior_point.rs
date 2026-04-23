@@ -3593,6 +3593,46 @@ fn fraction_to_boundary_with_limiter(
     (alpha, limiter)
 }
 
+fn ipopt_min_boundary_candidate(
+    first: (f64, Option<InteriorPointBoundaryLimiter>),
+    second: (f64, Option<InteriorPointBoundaryLimiter>),
+) -> (f64, Option<InteriorPointBoundaryLimiter>) {
+    if second.0 < first.0 { second } else { first }
+}
+
+fn ipopt_dual_fraction_to_boundary_with_limiter(
+    z_lower: &[f64],
+    dz_lower: &[f64],
+    z_upper: &[f64],
+    dz_upper: &[f64],
+    slack_upper_multiplier: &[f64],
+    slack_upper_multiplier_step: &[f64],
+    tau: f64,
+) -> (f64, Option<InteriorPointBoundaryLimiter>) {
+    // IpoptCalculatedQuantities::dual_frac_to_the_bound checks z_L, z_U,
+    // v_L, then v_U. NLIP has no lower slack multiplier block, so this keeps
+    // the source ordering as z_L, z_U, v_U.
+    let lower = fraction_to_boundary_with_limiter(
+        z_lower,
+        dz_lower,
+        tau,
+        InteriorPointBoundaryLimiterKind::Multiplier,
+    );
+    let upper = fraction_to_boundary_with_limiter(
+        z_upper,
+        dz_upper,
+        tau,
+        InteriorPointBoundaryLimiterKind::Multiplier,
+    );
+    let slack_upper = fraction_to_boundary_with_limiter(
+        slack_upper_multiplier,
+        slack_upper_multiplier_step,
+        tau,
+        InteriorPointBoundaryLimiterKind::Multiplier,
+    );
+    ipopt_min_boundary_candidate(ipopt_min_boundary_candidate(lower, upper), slack_upper)
+}
+
 fn fraction_to_boundary_limiters(
     current: &[f64],
     direction: &[f64],
@@ -8701,6 +8741,47 @@ mod tests {
         assert_eq!(ipopt_order.to_bits(), 0x3ee3_3b8d_73e4_0424);
         assert_eq!(old_nlip_order.to_bits(), 0x3ee3_3b8d_73e4_0425);
     }
+
+    #[test]
+    fn fraction_to_boundary_min_keeps_ipopt_first_argument_on_tie() {
+        let first_limiter = InteriorPointBoundaryLimiter {
+            kind: InteriorPointBoundaryLimiterKind::VariableLowerBound,
+            index: 1,
+            value: 2.0,
+            direction: -4.0,
+            alpha: 0.125,
+        };
+        let second_limiter = InteriorPointBoundaryLimiter {
+            kind: InteriorPointBoundaryLimiterKind::Slack,
+            index: 2,
+            value: 4.0,
+            direction: -8.0,
+            alpha: 0.125,
+        };
+
+        let (_, limiter) = ipopt_min_boundary_candidate(
+            (0.125, Some(first_limiter.clone())),
+            (0.125, Some(second_limiter)),
+        );
+
+        assert_eq!(limiter, Some(first_limiter));
+    }
+
+    #[test]
+    fn dual_fraction_to_boundary_uses_ipopt_bound_then_slack_order() {
+        let (alpha, limiter) = ipopt_dual_fraction_to_boundary_with_limiter(
+            &[2.0],
+            &[-4.0],
+            &[],
+            &[],
+            &[4.0],
+            &[-8.0],
+            0.25,
+        );
+
+        assert_eq!(alpha, 0.125);
+        assert_eq!(limiter.expect("expected limiter").value, 2.0);
+    }
 }
 
 fn log_interior_point_problem_header<P>(
@@ -10327,24 +10408,29 @@ where
             &bounds,
             fraction_to_boundary_tau,
         );
-        let (alpha_pr, alpha_pr_limiter) = if bound_alpha_pr < slack_alpha_pr {
-            (bound_alpha_pr, bound_alpha_pr_limiter)
-        } else {
-            (slack_alpha_pr, slack_alpha_pr_limiter)
-        };
+        let (alpha_pr, alpha_pr_limiter) = ipopt_min_boundary_candidate(
+            (bound_alpha_pr, bound_alpha_pr_limiter),
+            (slack_alpha_pr, slack_alpha_pr_limiter),
+        );
+        // IpoptCalculatedQuantities::dual_frac_to_the_bound checks bound
+        // multipliers before slack multipliers: z_L, z_U, v_L, then v_U.
+        // NLIP has no lower slack multiplier block, so keep z_L, z_U, v_U.
         let combined_z =
-            combined_multiplier_vector([z.as_slice(), z_lower.as_slice(), z_upper.as_slice()]);
+            combined_multiplier_vector([z_lower.as_slice(), z_upper.as_slice(), z.as_slice()]);
         let combined_dz = combined_multiplier_vector([
-            direction.dz.as_slice(),
             direction.dz_lower.as_slice(),
             direction.dz_upper.as_slice(),
+            direction.dz.as_slice(),
         ]);
         let (alpha_du, alpha_du_limiter) = if barrier_pair_count > 0 {
-            fraction_to_boundary_with_limiter(
-                &combined_z,
-                &combined_dz,
+            ipopt_dual_fraction_to_boundary_with_limiter(
+                &z_lower,
+                &direction.dz_lower,
+                &z_upper,
+                &direction.dz_upper,
+                &z,
+                &direction.dz,
                 fraction_to_boundary_tau,
-                InteriorPointBoundaryLimiterKind::Multiplier,
             )
         } else {
             (1.0, None)
@@ -11043,7 +11129,12 @@ where
                         &bounds,
                         fraction_to_boundary_tau,
                     );
-                    soc_alpha_pr = soc_slack_alpha_pr.min(soc_bound_alpha_pr).clamp(0.0, 1.0);
+                    soc_alpha_pr = ipopt_min_boundary_candidate(
+                        (soc_bound_alpha_pr, None),
+                        (soc_slack_alpha_pr, None),
+                    )
+                    .0
+                    .clamp(0.0, 1.0);
                     if soc_alpha_pr <= 0.0 {
                         break;
                     }
@@ -11141,22 +11232,15 @@ where
 
                     if let Some(corrected_filter_acceptance_mode) = corrected_filter_acceptance_mode
                     {
-                        let soc_combined_z = combined_multiplier_vector([
-                            z.as_slice(),
-                            z_lower.as_slice(),
-                            z_upper.as_slice(),
-                        ]);
-                        let soc_combined_dz = combined_multiplier_vector([
-                            soc_direction.dz.as_slice(),
-                            soc_direction.dz_lower.as_slice(),
-                            soc_direction.dz_upper.as_slice(),
-                        ]);
                         let soc_alpha_du = if barrier_pair_count > 0 {
-                            fraction_to_boundary_with_limiter(
-                                &soc_combined_z,
-                                &soc_combined_dz,
+                            ipopt_dual_fraction_to_boundary_with_limiter(
+                                &z_lower,
+                                &soc_direction.dz_lower,
+                                &z_upper,
+                                &soc_direction.dz_upper,
+                                &z,
+                                &soc_direction.dz,
                                 fraction_to_boundary_tau,
-                                InteriorPointBoundaryLimiterKind::Multiplier,
                             )
                             .0
                             .clamp(0.0, 1.0)
