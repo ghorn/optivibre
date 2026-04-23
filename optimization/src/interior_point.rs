@@ -1877,6 +1877,8 @@ struct LinearBackendRunStats {
 
 struct SpralSrcFullSpaceSolution {
     augmented_solution: Vec<f64>,
+    lower_bound_multiplier_step: Vec<f64>,
+    upper_bound_multiplier_step: Vec<f64>,
     upper_slack_multiplier_step: Vec<f64>,
 }
 
@@ -3081,6 +3083,81 @@ fn ipopt_oriented_upper_slack_bound_multiplier_step(
     (oriented_complementarity_rhs + multiplier * oriented_slack_step) / slack
 }
 
+fn ipopt_oriented_lower_bound_multiplier_step(
+    slack: f64,
+    multiplier: f64,
+    oriented_complementarity_rhs: f64,
+    oriented_primal_step: f64,
+) -> f64 {
+    // Mirrors IPOPT PDFullSpaceSolver::SolveOnce:
+    // Px_L.SinvBlrmZMTdBr(-1., slack_x_L, rhs.z_L, z_L, sol.x, sol.z_L).
+    (oriented_complementarity_rhs - multiplier * oriented_primal_step) / slack
+}
+
+fn ipopt_oriented_upper_bound_multiplier_step(
+    slack: f64,
+    multiplier: f64,
+    oriented_complementarity_rhs: f64,
+    oriented_primal_step: f64,
+) -> f64 {
+    // Mirrors IPOPT PDFullSpaceSolver::SolveOnce:
+    // Px_U.SinvBlrmZMTdBr(1., slack_x_U, rhs.z_U, z_U, sol.x, sol.z_U).
+    (oriented_complementarity_rhs + multiplier * oriented_primal_step) / slack
+}
+
+fn ipopt_bound_multiplier_steps_for_orientation(
+    bound_data: ReducedBoundKktData<'_>,
+    reduced_primal_step: &[f64],
+    orientation: IpoptLinearRhsOrientation,
+    barrier_parameter: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    let sign = match orientation {
+        IpoptLinearRhsOrientation::PreFinal => 1.0,
+        IpoptLinearRhsOrientation::FinalDirection => -1.0,
+    };
+    let lower_steps = bound_data
+        .bounds
+        .lower_indices
+        .iter()
+        .zip(bound_data.bounds.lower_values.iter())
+        .zip(bound_data.z_lower.iter())
+        .map(|((&index, &lower), &z_i)| {
+            let Some(reduced_index) = bound_data.fixed_variables.free_position[index] else {
+                return 0.0;
+            };
+            let slack = native_lower_bound_slack(bound_data.x, index, lower);
+            let complementarity = slack * z_i - barrier_parameter;
+            ipopt_oriented_lower_bound_multiplier_step(
+                slack,
+                z_i,
+                sign * complementarity,
+                reduced_primal_step[reduced_index],
+            )
+        })
+        .collect::<Vec<_>>();
+    let upper_steps = bound_data
+        .bounds
+        .upper_indices
+        .iter()
+        .zip(bound_data.bounds.upper_values.iter())
+        .zip(bound_data.z_upper.iter())
+        .map(|((&index, &upper), &z_i)| {
+            let Some(reduced_index) = bound_data.fixed_variables.free_position[index] else {
+                return 0.0;
+            };
+            let slack = native_upper_bound_slack(bound_data.x, index, upper);
+            let complementarity = slack * z_i - barrier_parameter;
+            ipopt_oriented_upper_bound_multiplier_step(
+                slack,
+                z_i,
+                sign * complementarity,
+                reduced_primal_step[reduced_index],
+            )
+        })
+        .collect::<Vec<_>>();
+    (lower_steps, upper_steps)
+}
+
 fn ipopt_upper_slack_bound_multiplier_steps_for_orientation(
     system: &ReducedKktSystem<'_>,
     slack_steps: &[f64],
@@ -3431,8 +3508,10 @@ fn alpha_for_y(
     let alpha = match options.alpha_for_y {
         InteriorPointAlphaForYStrategy::Primal => alpha_primal,
         InteriorPointAlphaForYStrategy::BoundMultiplier => alpha_dual,
-        InteriorPointAlphaForYStrategy::Min => alpha_primal.min(alpha_dual),
-        InteriorPointAlphaForYStrategy::Max => alpha_primal.max(alpha_dual),
+        // IPOPT IpBacktrackingLineSearch::PerformDualStep calls
+        // Min(alpha_dual, alpha_primal) and Max(alpha_dual, alpha_primal).
+        InteriorPointAlphaForYStrategy::Min => ipopt_cxx_min(alpha_dual, alpha_primal),
+        InteriorPointAlphaForYStrategy::Max => ipopt_cxx_max(alpha_dual, alpha_primal),
         InteriorPointAlphaForYStrategy::Full => 1.0,
         InteriorPointAlphaForYStrategy::PrimalAndFull => {
             if primal_step_norm <= options.alpha_for_y_tol {
@@ -3450,6 +3529,14 @@ fn alpha_for_y(
         }
     };
     alpha.clamp(0.0, 1.0)
+}
+
+fn ipopt_cxx_min(first: f64, second: f64) -> f64 {
+    if second < first { second } else { first }
+}
+
+fn ipopt_cxx_max(first: f64, second: f64) -> f64 {
+    if first < second { second } else { first }
 }
 
 fn kkt_regularization(
@@ -5298,6 +5385,8 @@ fn refine_linear_solution_ccs<E>(
 
 struct IpoptFullSpaceResidual {
     augmented_correction_rhs: Vec<f64>,
+    residual_z_lower: Vec<f64>,
+    residual_z_upper: Vec<f64>,
     residual_vu: Vec<f64>,
     residual_ratio: f64,
     rhs_inf: f64,
@@ -5484,20 +5573,20 @@ struct IpoptLinearSolveContext {
 fn ipopt_full_space_residual_ratio(
     system: &ReducedKktSystem<'_>,
     pattern: &SpralAugmentedKktPattern,
-    solution: &[f64],
-    upper_slack_multiplier_step: &[f64],
+    full_solution: &SpralSrcFullSpaceSolution,
     rhs_orientation: IpoptLinearRhsOrientation,
     shifts: IpoptLinearRefinementShifts,
 ) -> IpoptFullSpaceResidual {
     let n = system.hessian.lower_triangle.nrow;
     let meq = system.equality_jacobian.nrows();
     let mineq = system.inequality_jacobian.nrows();
+    let solution = &full_solution.augmented_solution;
     let dx = &solution[..n];
     let ipopt_ds = &solution[pattern.p_offset..pattern.p_offset + mineq];
     let d_lambda = &solution[pattern.lambda_offset..pattern.lambda_offset + meq];
     let d_ineq = &solution[pattern.z_offset..pattern.z_offset + mineq];
     let prefinal_orientation = rhs_orientation == IpoptLinearRhsOrientation::PreFinal;
-    debug_assert_eq!(upper_slack_multiplier_step.len(), mineq);
+    debug_assert_eq!(full_solution.upper_slack_multiplier_step.len(), mineq);
 
     let mut residual_x = symmetric_ccs_lower_mat_vec(
         system.hessian.lower_triangle.as_ref(),
@@ -5514,6 +5603,20 @@ fn ipopt_full_space_residual_ratio(
     let mut rhs_inf = 0.0_f64;
     let mut solution_inf = step_inf_norm(dx);
     let mut bound_residual_inf = 0.0_f64;
+    let mut residual_z_lower = system.bound_data.map_or_else(Vec::new, |bound_data| {
+        debug_assert_eq!(
+            full_solution.lower_bound_multiplier_step.len(),
+            bound_data.bounds.lower_indices.len()
+        );
+        vec![0.0; bound_data.bounds.lower_indices.len()]
+    });
+    let mut residual_z_upper = system.bound_data.map_or_else(Vec::new, |bound_data| {
+        debug_assert_eq!(
+            full_solution.upper_bound_multiplier_step.len(),
+            bound_data.bounds.upper_indices.len()
+        );
+        vec![0.0; bound_data.bounds.upper_indices.len()]
+    });
 
     if let Some(bound_data) = system.bound_data {
         let mut rhs_x = system
@@ -5528,28 +5631,26 @@ fn ipopt_full_space_residual_ratio(
             })
             .collect::<Vec<_>>();
         let damping = system_positive_slack_damping(system);
-        for ((&index, &lower), &z_i) in bound_data
+        for (bound_position, ((&index, &lower), &z_i)) in bound_data
             .bounds
             .lower_indices
             .iter()
             .zip(bound_data.bounds.lower_values.iter())
             .zip(bound_data.z_lower.iter())
+            .enumerate()
         {
             let Some(reduced_index) = bound_data.fixed_variables.free_position[index] else {
                 continue;
             };
             let slack = native_lower_bound_slack(bound_data.x, index, lower);
             let complementarity = slack * z_i - system.barrier_parameter;
-            let dz_i = if prefinal_orientation {
-                (complementarity - z_i * dx[reduced_index]) / slack
-            } else {
-                (-complementarity - z_i * dx[reduced_index]) / slack
-            };
+            let dz_i = full_solution.lower_bound_multiplier_step[bound_position];
             let residual_z = if prefinal_orientation {
                 slack * dz_i + z_i * dx[reduced_index] - complementarity
             } else {
                 slack * dz_i + z_i * dx[reduced_index] + complementarity
             };
+            residual_z_lower[bound_position] = residual_z;
             residual_x[reduced_index] -= dz_i;
             if damping > 0.0 && !bound_data.bounds.upper_indices.contains(&index) {
                 rhs_x[reduced_index] += if prefinal_orientation {
@@ -5563,28 +5664,26 @@ fn ipopt_full_space_residual_ratio(
             rhs_inf = rhs_inf.max(complementarity.abs());
             solution_inf = solution_inf.max(dz_i.abs());
         }
-        for ((&index, &upper), &z_i) in bound_data
+        for (bound_position, ((&index, &upper), &z_i)) in bound_data
             .bounds
             .upper_indices
             .iter()
             .zip(bound_data.bounds.upper_values.iter())
             .zip(bound_data.z_upper.iter())
+            .enumerate()
         {
             let Some(reduced_index) = bound_data.fixed_variables.free_position[index] else {
                 continue;
             };
             let slack = native_upper_bound_slack(bound_data.x, index, upper);
             let complementarity = slack * z_i - system.barrier_parameter;
-            let dz_i = if prefinal_orientation {
-                (complementarity + z_i * dx[reduced_index]) / slack
-            } else {
-                (-complementarity + z_i * dx[reduced_index]) / slack
-            };
+            let dz_i = full_solution.upper_bound_multiplier_step[bound_position];
             let residual_z = if prefinal_orientation {
                 slack * dz_i - z_i * dx[reduced_index] - complementarity
             } else {
                 slack * dz_i - z_i * dx[reduced_index] + complementarity
             };
+            residual_z_upper[bound_position] = residual_z;
             residual_x[reduced_index] += dz_i;
             if damping > 0.0 && !bound_data.bounds.lower_indices.contains(&index) {
                 rhs_x[reduced_index] += if prefinal_orientation {
@@ -5648,7 +5747,7 @@ fn ipopt_full_space_residual_ratio(
         let slack = system.slack[row];
         let multiplier = system.multipliers[row];
         let ipopt_ds_i = ipopt_ds[row];
-        let dz_i = upper_slack_multiplier_step[row];
+        let dz_i = full_solution.upper_slack_multiplier_step[row];
         let damped_slack_stationarity = damped_slack_stationarity_residual(system, row);
         let (rhs_s_i, rhs_v_i, rhs_d_i) = if prefinal_orientation {
             (
@@ -5727,6 +5826,8 @@ fn ipopt_full_space_residual_ratio(
     };
     IpoptFullSpaceResidual {
         augmented_correction_rhs,
+        residual_z_lower,
+        residual_z_upper,
         residual_vu,
         residual_ratio,
         rhs_inf,
@@ -5755,14 +5856,8 @@ fn refine_ipopt_full_space_solution<E>(
     // matrix residual; see IpPDFullSpaceSolver.cpp::ComputeResiduals,
     // SolveOnce, and ComputeResidualRatio.
     let mut steps = 0;
-    let mut residual = ipopt_full_space_residual_ratio(
-        system,
-        pattern,
-        &solution.augmented_solution,
-        &solution.upper_slack_multiplier_step,
-        rhs_orientation,
-        shifts,
-    );
+    let mut residual =
+        ipopt_full_space_residual_ratio(system, pattern, solution, rhs_orientation, shifts);
     let mut residual_ratio = residual.residual_ratio;
     let initial_residual_ratio = residual_ratio;
     let initial_residual = residual.metrics();
@@ -5790,6 +5885,48 @@ fn refine_ipopt_full_space_solution<E>(
             first_correction_solution_blocks =
                 Some(ipopt_augmented_block_fingerprints(pattern, &correction));
         }
+        if let Some(bound_data) = system.bound_data {
+            for (bound_position, ((&index, &lower), &z_i)) in bound_data
+                .bounds
+                .lower_indices
+                .iter()
+                .zip(bound_data.bounds.lower_values.iter())
+                .zip(bound_data.z_lower.iter())
+                .enumerate()
+            {
+                let Some(reduced_index) = bound_data.fixed_variables.free_position[index] else {
+                    continue;
+                };
+                let slack = native_lower_bound_slack(bound_data.x, index, lower);
+                let correction_z = ipopt_oriented_lower_bound_multiplier_step(
+                    slack,
+                    z_i,
+                    residual.residual_z_lower[bound_position],
+                    correction[reduced_index],
+                );
+                solution.lower_bound_multiplier_step[bound_position] -= correction_z;
+            }
+            for (bound_position, ((&index, &upper), &z_i)) in bound_data
+                .bounds
+                .upper_indices
+                .iter()
+                .zip(bound_data.bounds.upper_values.iter())
+                .zip(bound_data.z_upper.iter())
+                .enumerate()
+            {
+                let Some(reduced_index) = bound_data.fixed_variables.free_position[index] else {
+                    continue;
+                };
+                let slack = native_upper_bound_slack(bound_data.x, index, upper);
+                let correction_z = ipopt_oriented_upper_bound_multiplier_step(
+                    slack,
+                    z_i,
+                    residual.residual_z_upper[bound_position],
+                    correction[reduced_index],
+                );
+                solution.upper_bound_multiplier_step[bound_position] -= correction_z;
+            }
+        }
         for (row, upper_step_i) in solution.upper_slack_multiplier_step.iter_mut().enumerate() {
             // IpPDFullSpaceSolver.cpp::SolveOnce computes the correction's
             // v_U with Pd_U.SinvBlrmZMTdBr(1., ...), then the refinement call
@@ -5813,14 +5950,8 @@ fn refine_ipopt_full_space_solution<E>(
             *solution_i -= correction_i;
         }
         steps += 1;
-        let new_residual = ipopt_full_space_residual_ratio(
-            system,
-            pattern,
-            &solution.augmented_solution,
-            &solution.upper_slack_multiplier_step,
-            rhs_orientation,
-            shifts,
-        );
+        let new_residual =
+            ipopt_full_space_residual_ratio(system, pattern, solution, rhs_orientation, shifts);
         let new_residual_ratio = new_residual.residual_ratio;
         residual_ratio = new_residual_ratio;
         if new_residual_ratio > IPOPT_LINEAR_RESIDUAL_RATIO_MAX
@@ -7113,6 +7244,17 @@ fn factor_solve_spral_src(
     let pre_refinement_solution_fingerprint = vector_fingerprint(&solution);
     let pre_refinement_solution_block_fingerprints =
         ipopt_augmented_block_fingerprints(&workspace.pattern, &solution);
+    let (lower_bound_multiplier_step, upper_bound_multiplier_step) = system.bound_data.map_or_else(
+        || (Vec::new(), Vec::new()),
+        |bound_data| {
+            ipopt_bound_multiplier_steps_for_orientation(
+                bound_data,
+                &solution[..system.hessian.lower_triangle.nrow],
+                context.rhs_orientation,
+                system.barrier_parameter,
+            )
+        },
+    );
     let upper_slack_multiplier_step = ipopt_upper_slack_bound_multiplier_steps_for_orientation(
         system,
         &solution[workspace.pattern.p_offset..workspace.pattern.p_offset + system.r_cent.len()],
@@ -7120,6 +7262,8 @@ fn factor_solve_spral_src(
     );
     let mut full_space_solution = SpralSrcFullSpaceSolution {
         augmented_solution: solution,
+        lower_bound_multiplier_step,
+        upper_bound_multiplier_step,
         upper_slack_multiplier_step,
     };
     let mut solve_time = solve_started.elapsed();
@@ -7305,6 +7449,12 @@ fn factor_solve_spral_src(
         for value in &mut full_space_solution.augmented_solution {
             *value = -*value;
         }
+        for value in &mut full_space_solution.lower_bound_multiplier_step {
+            *value = -*value;
+        }
+        for value in &mut full_space_solution.upper_bound_multiplier_step {
+            *value = -*value;
+        }
         for value in &mut full_space_solution.upper_slack_multiplier_step {
             *value = -*value;
         }
@@ -7463,6 +7613,8 @@ fn solve_reduced_kkt_with_spral_src(
                 }
                 let SpralSrcFullSpaceSolution {
                     augmented_solution: solution,
+                    lower_bound_multiplier_step,
+                    upper_bound_multiplier_step,
                     upper_slack_multiplier_step,
                 } = solution;
                 let dx = solution[..n].to_vec();
@@ -7483,8 +7635,8 @@ fn solve_reduced_kkt_with_spral_src(
                     d_ineq,
                     ds,
                     dz,
-                    dz_lower: Vec::new(),
-                    dz_upper: Vec::new(),
+                    dz_lower: lower_bound_multiplier_step,
+                    dz_upper: upper_bound_multiplier_step,
                     solver_used: InteriorPointLinearSolver::SpralSrc,
                     regularization_used: current_regularization,
                     dual_regularization_used: current_jacobian_regularization,
@@ -8569,6 +8721,26 @@ mod tests {
         };
 
         assert_eq!(alpha_for_y(0.3, 0.7, &direction, &options), 0.7);
+    }
+
+    #[test]
+    fn alpha_for_y_min_max_keep_ipopt_dual_first_tie_order() {
+        let direction = test_direction(&[1.0], &[1.0]);
+        let mut options = InteriorPointOptions {
+            alpha_for_y: InteriorPointAlphaForYStrategy::Min,
+            ..InteriorPointOptions::default()
+        };
+
+        assert_eq!(
+            alpha_for_y(-0.0, 0.0, &direction, &options).to_bits(),
+            0.0_f64.to_bits()
+        );
+
+        options.alpha_for_y = InteriorPointAlphaForYStrategy::Max;
+        assert_eq!(
+            alpha_for_y(-0.0, 0.0, &direction, &options).to_bits(),
+            0.0_f64.to_bits()
+        );
     }
 
     #[test]
@@ -10397,17 +10569,19 @@ where
             }
         };
         direction.dx = fixed_variables.expand_direction(&direction.dx);
-        let (dz_lower_direction, dz_upper_direction) = native_bound_multiplier_steps(
-            &x,
-            &direction.dx,
-            &bounds,
-            &z_lower,
-            &z_upper,
-            barrier_parameter_value,
-            sigma,
-        );
-        direction.dz_lower = dz_lower_direction;
-        direction.dz_upper = dz_upper_direction;
+        if direction.dz_lower.is_empty() && direction.dz_upper.is_empty() {
+            let (dz_lower_direction, dz_upper_direction) = native_bound_multiplier_steps(
+                &x,
+                &direction.dx,
+                &bounds,
+                &z_lower,
+                &z_upper,
+                barrier_parameter_value,
+                sigma,
+            );
+            direction.dz_lower = dz_lower_direction;
+            direction.dz_upper = dz_upper_direction;
+        }
         last_linear_solver = direction.solver_used;
         let linear_elapsed = linear_started.elapsed();
         profiling.linear_solves += 1;
@@ -11135,17 +11309,19 @@ where
                         );
                     }
                     soc_direction.dx = fixed_variables.expand_direction(&soc_direction.dx);
-                    let (soc_dz_lower, soc_dz_upper) = native_bound_multiplier_steps(
-                        &x,
-                        &soc_direction.dx,
-                        &bounds,
-                        &z_lower,
-                        &z_upper,
-                        barrier_parameter_value,
-                        sigma,
-                    );
-                    soc_direction.dz_lower = soc_dz_lower;
-                    soc_direction.dz_upper = soc_dz_upper;
+                    if soc_direction.dz_lower.is_empty() && soc_direction.dz_upper.is_empty() {
+                        let (soc_dz_lower, soc_dz_upper) = native_bound_multiplier_steps(
+                            &x,
+                            &soc_direction.dx,
+                            &bounds,
+                            &z_lower,
+                            &z_upper,
+                            barrier_parameter_value,
+                            sigma,
+                        );
+                        soc_direction.dz_lower = soc_dz_lower;
+                        soc_direction.dz_upper = soc_dz_upper;
+                    }
 
                     let (soc_slack_alpha_pr, _) = if augmented_inequality_count > 0 {
                         let soc_slack_barrier_direction =
