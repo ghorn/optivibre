@@ -3728,6 +3728,215 @@ mod tests {
             tags
         }
 
+        fn print_ipopt_linear_journal_excerpt(journal_output: Option<&str>) {
+            if std::env::var_os("GLIDER_PARITY_PRINT_IPOPT_LINEAR_JOURNAL").is_none() {
+                return;
+            }
+            let Some(journal) = journal_output else {
+                println!("ipopt linear journal excerpt unavailable");
+                return;
+            };
+            println!("ipopt linear journal excerpt:");
+            for line in journal.lines() {
+                let trimmed = line.trim_start();
+                if trimmed.contains("residual_ratio =")
+                    || trimmed.contains("max-norm resid_")
+                    || trimmed.contains("nrm_rhs =")
+                    || trimmed.contains("Perturbation parameters:")
+                    || trimmed.contains("Solving system with delta_x=")
+                    || trimmed.contains("Number of trial factorizations performed:")
+                    || trimmed.contains("Number of negative eigenvalues")
+                    || trimmed.contains("Asking augmented system solver")
+                {
+                    println!("  {trimmed}");
+                }
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct JournalVectorFingerprint {
+            len: usize,
+            inf: f64,
+            sum: f64,
+            hash: u64,
+            negative_zero_count: usize,
+            positive_zero_count: usize,
+        }
+
+        fn journal_vector_fingerprint(values: &[f64]) -> JournalVectorFingerprint {
+            const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+            const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+            let mut inf = 0.0_f64;
+            let mut sum = 0.0_f64;
+            let mut hash = FNV_OFFSET ^ values.len() as u64;
+            let mut negative_zero_count = 0;
+            let mut positive_zero_count = 0;
+            for value in values {
+                inf = inf.max(value.abs());
+                sum += *value;
+                hash = (hash ^ value.to_bits()).wrapping_mul(FNV_PRIME);
+                if *value == 0.0 {
+                    if value.is_sign_negative() {
+                        negative_zero_count += 1;
+                    } else {
+                        positive_zero_count += 1;
+                    }
+                }
+            }
+            JournalVectorFingerprint {
+                len: values.len(),
+                inf,
+                sum,
+                hash,
+                negative_zero_count,
+                positive_zero_count,
+            }
+        }
+
+        fn journal_vector_fingerprint_text(fingerprint: JournalVectorFingerprint) -> String {
+            format!(
+                "len={} inf={:.12e} sum={:.12e} hash={:016x} z[-/+]={}/{}",
+                fingerprint.len,
+                fingerprint.inf,
+                fingerprint.sum,
+                fingerprint.hash,
+                fingerprint.negative_zero_count,
+                fingerprint.positive_zero_count,
+            )
+        }
+
+        fn journal_augmented_block_fingerprint_text(values: &[f64], dims: &[usize; 4]) -> String {
+            let x_end = dims[0];
+            let p_end = x_end + dims[1];
+            let lambda_end = p_end + dims[2];
+            let z_end = lambda_end + dims[3];
+            if values.len() != z_end {
+                return "--".to_string();
+            }
+            format!(
+                "x[{}],p[{}],lambda[{}],z[{}]",
+                journal_vector_fingerprint_text(journal_vector_fingerprint(&values[..x_end])),
+                journal_vector_fingerprint_text(journal_vector_fingerprint(&values[x_end..p_end])),
+                journal_vector_fingerprint_text(journal_vector_fingerprint(
+                    &values[p_end..lambda_end],
+                )),
+                journal_vector_fingerprint_text(journal_vector_fingerprint(
+                    &values[lambda_end..z_end],
+                )),
+            )
+        }
+
+        fn journal_value_after_equals(line: &str) -> Option<f64> {
+            line.split_once('=')
+                .and_then(|(_, value)| value.trim().parse::<f64>().ok())
+        }
+
+        fn journal_sol_component(line: &str) -> Option<usize> {
+            let start = line.find("SOL[ 0][")? + "SOL[ 0][".len();
+            let rest = &line[start..];
+            let end = rest.find(']')?;
+            rest[..end].trim().parse::<usize>().ok()
+        }
+
+        fn print_ipopt_augmented_journal_fingerprints(journal_output: Option<&str>) {
+            if std::env::var_os("GLIDER_PARITY_PRINT_IPOPT_AUGMENTED_FINGERPRINTS").is_none() {
+                return;
+            }
+            let Some(journal) = journal_output else {
+                println!("ipopt augmented journal fingerprints unavailable");
+                return;
+            };
+
+            let mut rhs_vectors: Vec<Vec<f64>> = Vec::new();
+            let mut current_rhs = Vec::new();
+            let mut sol_vectors: Vec<Vec<f64>> = Vec::new();
+            let mut current_sol_components: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::new());
+
+            for line in journal.lines() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("Trhs[") {
+                    if let Some(value) = journal_value_after_equals(trimmed) {
+                        current_rhs.push(value);
+                    }
+                    continue;
+                }
+                if !current_rhs.is_empty() {
+                    rhs_vectors.push(std::mem::take(&mut current_rhs));
+                }
+
+                if trimmed.contains("SOL[ 0][") {
+                    if let (Some(component), Some(value)) = (
+                        journal_sol_component(trimmed),
+                        journal_value_after_equals(trimmed),
+                    ) && let Some(values) = current_sol_components.get_mut(component)
+                    {
+                        values.push(value);
+                    }
+                    continue;
+                }
+                if current_sol_components
+                    .iter()
+                    .any(|values| !values.is_empty())
+                    && trimmed.starts_with("CompoundVector")
+                {
+                    let mut solution = Vec::new();
+                    for component in current_sol_components.iter_mut() {
+                        solution.append(component);
+                    }
+                    sol_vectors.push(solution);
+                }
+            }
+            if !current_rhs.is_empty() {
+                rhs_vectors.push(current_rhs);
+            }
+            if current_sol_components
+                .iter()
+                .any(|values| !values.is_empty())
+            {
+                let mut solution = Vec::new();
+                for component in current_sol_components.iter_mut() {
+                    solution.append(component);
+                }
+                sol_vectors.push(solution);
+            }
+
+            let dims = sol_vectors
+                .first()
+                .and_then(|solution| {
+                    let rhs_len = rhs_vectors.first().map_or(solution.len(), Vec::len);
+                    (solution.len() == rhs_len).then_some([1154, 902, 1000, 902])
+                })
+                .filter(|dims| {
+                    dims.iter().sum::<usize>() == rhs_vectors.first().map_or(0, Vec::len)
+                });
+
+            println!(
+                "ipopt augmented journal fingerprints rhs_count={} sol_count={}",
+                rhs_vectors.len(),
+                sol_vectors.len()
+            );
+            for (index, rhs) in rhs_vectors.iter().enumerate() {
+                let blocks = dims.map_or_else(
+                    || "--".to_string(),
+                    |dims| journal_augmented_block_fingerprint_text(rhs, &dims),
+                );
+                println!(
+                    "  ipopt_rhs[{index}] [{}] blocks[{blocks}]",
+                    journal_vector_fingerprint_text(journal_vector_fingerprint(rhs)),
+                );
+            }
+            for (index, solution) in sol_vectors.iter().enumerate() {
+                let blocks = dims.map_or_else(
+                    || "--".to_string(),
+                    |dims| journal_augmented_block_fingerprint_text(solution, &dims),
+                );
+                println!(
+                    "  ipopt_sol[{index}] [{}] blocks[{blocks}]",
+                    journal_vector_fingerprint_text(journal_vector_fingerprint(solution)),
+                );
+            }
+        }
+
         #[derive(Clone, Copy, Debug)]
         enum DivergenceKind {
             Objective,
@@ -5680,6 +5889,7 @@ mod tests {
                 .min(accepted_nlip_solver_snapshots.len());
             println!("{label} internal IPOPT/NLIP state probes range={probe_start}..{probe_end}");
             for probe_index in probe_start..probe_end {
+                println!("          probe_index={probe_index}");
                 if probe_index > 0 {
                     let tau = 0.99_f64.max(1.0 - ipopt_trace[probe_index].mu.max(0.0));
                     println!(
@@ -6094,6 +6304,8 @@ mod tests {
             }
             Err(_) => None,
         };
+        print_ipopt_linear_journal_excerpt(ipopt_journal_output);
+        print_ipopt_augmented_journal_fingerprints(ipopt_journal_output);
         let ipopt_step_tags = parse_ipopt_step_tags(ipopt_journal_output);
 
         if let (Some(nlip_initial), Some(ipopt_initial)) = (
