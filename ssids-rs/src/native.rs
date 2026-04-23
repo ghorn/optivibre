@@ -325,6 +325,9 @@ pub struct NativeSpralFactorInfo {
     pub inertia: Inertia,
     pub two_by_two_pivots: usize,
     pub delayed_pivots: usize,
+    pub factor_entries: usize,
+    pub flop_count: usize,
+    pub max_front_size: usize,
     pub supernode_count: usize,
     pub max_supernode_width: usize,
 }
@@ -1018,6 +1021,9 @@ impl NativeSpralSession {
             inertia: inertia_from_inform(self.dimension, &inform),
             two_by_two_pivots: inform.num_two.max(0) as usize,
             delayed_pivots: inform.num_delay.max(0) as usize,
+            factor_entries: inform.num_factor.max(0) as usize,
+            flop_count: inform.num_flops.max(0) as usize,
+            max_front_size: inform.maxfront.max(0) as usize,
             supernode_count: inform.num_sup.max(0) as usize,
             max_supernode_width: inform.maxsupernode.max(0) as usize,
         };

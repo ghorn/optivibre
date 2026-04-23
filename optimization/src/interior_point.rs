@@ -5164,6 +5164,30 @@ fn ipopt_full_space_residual_metrics_text(metrics: IpoptFullSpaceResidualMetrics
     )
 }
 
+fn fnv1a_f64_bits_hash(values: &[f64]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    values
+        .iter()
+        .fold(FNV_OFFSET ^ values.len() as u64, |hash, value| {
+            (hash ^ value.to_bits()).wrapping_mul(FNV_PRIME)
+        })
+}
+
+fn vector_fingerprint_text(values: &[f64]) -> String {
+    let inf = values
+        .iter()
+        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    let sum = values.iter().sum::<f64>();
+    format!(
+        "len={} inf={:.12e} sum={:.12e} hash={:016x}",
+        values.len(),
+        inf,
+        sum,
+        fnv1a_f64_bits_hash(values),
+    )
+}
+
 #[derive(Clone, Copy)]
 struct IpoptLinearRefinementShifts {
     primal: f64,
@@ -6767,16 +6791,32 @@ fn factor_solve_spral_src(
             })
         },
     )?;
-    let mut detail = (refinement.steps > 0).then(|| {
-        format!(
-            "full_space_iterative_refinement_steps={} residual_ratio={:.3e}->{:.3e} residuals=[{}]->[{}]",
-            refinement.steps,
-            refinement.initial_residual_ratio,
-            refinement.residual_ratio,
-            ipopt_full_space_residual_metrics_text(refinement.initial_residual),
-            ipopt_full_space_residual_metrics_text(refinement.final_residual),
-        )
-    });
+    let native_factor_detail = format!(
+        "native_spral_factor[delays={} nfactor={} nflops={} maxfront={} two_by_two={} supernodes={} maxsuper={}]; native_spral_rhs[{}]",
+        factor_info.delayed_pivots,
+        factor_info.factor_entries,
+        factor_info.flop_count,
+        factor_info.max_front_size,
+        factor_info.two_by_two_pivots,
+        factor_info.supernode_count,
+        factor_info.max_supernode_width,
+        vector_fingerprint_text(rhs),
+    );
+    let mut detail = (refinement.steps > 0)
+        .then(|| {
+            format!(
+                "full_space_iterative_refinement_steps={} residual_ratio={:.3e}->{:.3e} residuals=[{}]->[{}]",
+                refinement.steps,
+                refinement.initial_residual_ratio,
+                refinement.residual_ratio,
+                ipopt_full_space_residual_metrics_text(refinement.initial_residual),
+                ipopt_full_space_residual_metrics_text(refinement.final_residual),
+            )
+        })
+        .map_or_else(
+            || Some(native_factor_detail.clone()),
+            |detail| Some(format!("{detail}; {native_factor_detail}")),
+        );
     let mut accepted_after_failed_refinement = false;
     if refinement.failed {
         // IpPDFullSpaceSolver.cpp retries failed full-space iterative

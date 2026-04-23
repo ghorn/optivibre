@@ -4628,6 +4628,138 @@ mod tests {
                 .join("; ")
         }
 
+        fn top_upper_slack_next_solve_rhs_diffs(
+            previous_nlip: &optimization::InteriorPointIterationSnapshot,
+            previous_ipopt: &optimization::IpoptIterationSnapshot,
+            next_nlip_mu: f64,
+            next_ipopt_mu: f64,
+            kappa_d: f64,
+            intervals: usize,
+            order: usize,
+        ) -> String {
+            let nlip_slack = previous_nlip.slack_primal.as_deref().unwrap_or(&[]);
+            let nlip_y = previous_nlip
+                .inequality_multipliers
+                .as_deref()
+                .unwrap_or(&[]);
+            let nlip_v = previous_nlip.slack_multipliers.as_deref().unwrap_or(&[]);
+            let count = nlip_slack
+                .len()
+                .min(nlip_y.len())
+                .min(nlip_v.len())
+                .min(previous_ipopt.internal_slack.len())
+                .min(previous_ipopt.kkt_slack_distance.len())
+                .min(previous_ipopt.inequality_multipliers.len())
+                .min(previous_ipopt.slack_upper_bound_multipliers.len());
+            let nlip_damping = next_nlip_mu * kappa_d;
+            let ipopt_damping = next_ipopt_mu * kappa_d;
+
+            let mut diffs = (0..count)
+                .map(|index| {
+                    let ipopt_upper = previous_ipopt.internal_slack[index]
+                        + previous_ipopt.kkt_slack_distance[index];
+                    let nlip_distance = ipopt_upper - nlip_slack[index];
+                    let ipopt_distance = previous_ipopt.kkt_slack_distance[index];
+                    let nlip_rhs_s = nlip_v[index] - nlip_y[index] - nlip_damping;
+                    let ipopt_rhs_s = previous_ipopt.slack_upper_bound_multipliers[index]
+                        - previous_ipopt.inequality_multipliers[index]
+                        - ipopt_damping;
+                    let nlip_rhs_v = nlip_distance * nlip_v[index] - next_nlip_mu;
+                    let ipopt_rhs_v = ipopt_distance
+                        * previous_ipopt.slack_upper_bound_multipliers[index]
+                        - next_ipopt_mu;
+                    let nlip_rhs_v_over_s = nlip_rhs_v / nlip_distance;
+                    let ipopt_rhs_v_over_s = ipopt_rhs_v / ipopt_distance;
+                    // Mirrors IpPDSearchDirCalc::ComputeSearchDirection rhs.s/rhs.v_U
+                    // plus IpPDFullSpaceSolver::SolveOnce Pd_U.AddMSinvZ(-1.0, ...):
+                    // prefinal augmented upper-slack RHS is rhs_s - rhs_v_U / slack_s_U.
+                    let nlip_aug_rhs = nlip_rhs_s - nlip_rhs_v_over_s;
+                    let ipopt_aug_rhs = ipopt_rhs_s - ipopt_rhs_v_over_s;
+                    let distance_gap = (nlip_distance - ipopt_distance).abs();
+                    let y_gap =
+                        (nlip_y[index] - previous_ipopt.inequality_multipliers[index]).abs();
+                    let v_gap =
+                        (nlip_v[index] - previous_ipopt.slack_upper_bound_multipliers[index]).abs();
+                    let rhs_s_gap = (nlip_rhs_s - ipopt_rhs_s).abs();
+                    let rhs_v_gap = (nlip_rhs_v - ipopt_rhs_v).abs();
+                    let rhs_v_over_s_gap = (nlip_rhs_v_over_s - ipopt_rhs_v_over_s).abs();
+                    let aug_rhs_gap = (nlip_aug_rhs - ipopt_aug_rhs).abs();
+                    let score = aug_rhs_gap
+                        .max(rhs_s_gap)
+                        .max(rhs_v_gap)
+                        .max(rhs_v_over_s_gap)
+                        .max(distance_gap);
+                    (
+                        index,
+                        score,
+                        distance_gap,
+                        y_gap,
+                        v_gap,
+                        rhs_s_gap,
+                        rhs_v_gap,
+                        rhs_v_over_s_gap,
+                        aug_rhs_gap,
+                        nlip_distance,
+                        ipopt_distance,
+                        nlip_y[index],
+                        previous_ipopt.inequality_multipliers[index],
+                        nlip_v[index],
+                        previous_ipopt.slack_upper_bound_multipliers[index],
+                        nlip_rhs_s,
+                        ipopt_rhs_s,
+                        nlip_rhs_v,
+                        ipopt_rhs_v,
+                        nlip_rhs_v_over_s,
+                        ipopt_rhs_v_over_s,
+                        nlip_aug_rhs,
+                        ipopt_aug_rhs,
+                    )
+                })
+                .collect::<Vec<_>>();
+            diffs.sort_by(|lhs, rhs| rhs.1.total_cmp(&lhs.1));
+            if diffs.is_empty() {
+                return "--".to_string();
+            }
+            diffs
+                .into_iter()
+                .take(4)
+                .map(
+                    |(
+                        index,
+                        score,
+                        distance_gap,
+                        y_gap,
+                        v_gap,
+                        rhs_s_gap,
+                        rhs_v_gap,
+                        rhs_v_over_s_gap,
+                        aug_rhs_gap,
+                        nlip_distance,
+                        ipopt_distance,
+                        nlip_y,
+                        ipopt_y,
+                        nlip_v,
+                        ipopt_v,
+                        nlip_rhs_s,
+                        ipopt_rhs_s,
+                        nlip_rhs_v,
+                        ipopt_rhs_v,
+                        nlip_rhs_v_over_s,
+                        ipopt_rhs_v_over_s,
+                        nlip_aug_rhs,
+                        ipopt_aug_rhs,
+                    )| {
+                        format!(
+                            "#{} {} score={score:.3e} gaps[dist={distance_gap:.3e},y={y_gap:.3e},vU={v_gap:.3e},rhs_s={rhs_s_gap:.3e},rhs_v={rhs_v_gap:.3e},rhs_v/s={rhs_v_over_s_gap:.3e},aug={aug_rhs_gap:.3e}] dist[n={nlip_distance:.12e},i={ipopt_distance:.12e}] y[n={nlip_y:.12e},i={ipopt_y:.12e}] vU[n={nlip_v:.12e},i={ipopt_v:.12e}] rhs_s[n={nlip_rhs_s:.12e},i={ipopt_rhs_s:.12e}] rhs_v[n={nlip_rhs_v:.12e},i={ipopt_rhs_v:.12e}] rhs_v/s[n={nlip_rhs_v_over_s:.12e},i={ipopt_rhs_v_over_s:.12e}] aug_rhs[n={nlip_aug_rhs:.12e},i={ipopt_aug_rhs:.12e}]",
+                            index,
+                            glider_inequality_label(index, intervals, order)
+                        )
+                    },
+                )
+                .collect::<Vec<_>>()
+                .join("; ")
+        }
+
         fn max_direction_estimate_diff(
             prev_nlip: &TracePoint,
             nlip: &TracePoint,
@@ -5537,6 +5669,7 @@ mod tests {
             accepted_ipopt_solver_snapshots: &[optimization::IpoptIterationSnapshot],
             nlip_trace: &[TracePoint],
             ipopt_trace: &[TracePoint],
+            kappa_d: f64,
             bounds: &VariableBoundView,
             intervals: usize,
             order: usize,
@@ -5596,6 +5729,30 @@ mod tests {
                     let nlip = &accepted_nlip_solver_snapshots[probe_index];
                     let prev_ipopt = &accepted_ipopt_solver_snapshots[probe_index - 1];
                     let ipopt = &accepted_ipopt_solver_snapshots[probe_index];
+                    println!(
+                        "          top upper-slack next-solve RHS diffs: {}",
+                        top_upper_slack_next_solve_rhs_diffs(
+                            prev_nlip,
+                            prev_ipopt,
+                            nlip_trace[probe_index].mu,
+                            ipopt_trace[probe_index].mu,
+                            kappa_d,
+                            intervals,
+                            order,
+                        )
+                    );
+                    println!(
+                        "          top y_c accepted-direction diffs: {}",
+                        top_vector_direction_diffs(
+                            prev_nlip.equality_multipliers.as_deref().unwrap_or(&[]),
+                            nlip.equality_multipliers.as_deref().unwrap_or(&[]),
+                            &prev_ipopt.equality_multipliers,
+                            &ipopt.equality_multipliers,
+                            nlip_alpha_y,
+                            ipopt_alpha_y,
+                            |idx| format!("eq[{idx}]"),
+                        )
+                    );
                     println!(
                         "          top y_d accepted-direction diffs: {}",
                         top_vector_direction_diffs(
@@ -5664,6 +5821,15 @@ mod tests {
                                 &ipopt.direction_slack,
                                 1.0,
                                 |idx| glider_inequality_label(idx, intervals, order),
+                            )
+                        );
+                        println!(
+                            "          top y_c delta-snapshot diffs: {}",
+                            top_vector_diffs(
+                                &nlip_direction.equality_multipliers,
+                                &ipopt.direction_equality_multipliers,
+                                1.0,
+                                |idx| format!("eq[{idx}]"),
                             )
                         );
                         println!(
@@ -6236,6 +6402,7 @@ mod tests {
                 &accepted_ipopt_solver_snapshots,
                 &nlip_trace,
                 &ipopt_trace,
+                nlip_options.kappa_d,
                 &variable_bounds,
                 params.transcription.intervals,
                 params.transcription.collocation_degree,
@@ -6259,6 +6426,7 @@ mod tests {
                 &accepted_ipopt_solver_snapshots,
                 &nlip_trace,
                 &ipopt_trace,
+                nlip_options.kappa_d,
                 &variable_bounds,
                 params.transcription.intervals,
                 params.transcription.collocation_degree,
@@ -6358,6 +6526,7 @@ mod tests {
                     &accepted_ipopt_solver_snapshots,
                     &nlip_trace,
                     &ipopt_trace,
+                    nlip_options.kappa_d,
                     &variable_bounds,
                     params.transcription.intervals,
                     params.transcription.collocation_degree,
