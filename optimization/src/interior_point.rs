@@ -3654,6 +3654,22 @@ fn ipopt_dense_frac_to_bound_candidate(tau: f64, value: f64, delta: f64) -> f64 
     -tau / delta * value
 }
 
+fn ipopt_dense_current_plus_step(value: f64, alpha: f64, delta: f64) -> f64 {
+    // IpIpoptData.cpp::SetTrial*FromStep calls DenseVector::AddTwoVectors
+    // with a=1, b=alpha, c=0. IpDenseVector.cpp special-cases b before
+    // falling back to `value + alpha * delta`; mirror those branches to avoid
+    // an extra multiply by exactly +/-1 on accepted full steps.
+    if alpha == 0.0 {
+        value
+    } else if alpha == 1.0 {
+        value + delta
+    } else if alpha == -1.0 {
+        value - delta
+    } else {
+        value + alpha * delta
+    }
+}
+
 fn fraction_to_boundary_with_limiter(
     current: &[f64],
     direction: &[f64],
@@ -8962,6 +8978,17 @@ mod tests {
     }
 
     #[test]
+    fn current_plus_step_copies_on_zero_alpha_like_ipopt() {
+        let value = -0.0_f64;
+        let delta = 42.0_f64;
+        let ipopt_order = ipopt_dense_current_plus_step(value, 0.0, delta);
+        let old_nlip_order = value + 0.0 * delta;
+
+        assert_eq!(ipopt_order.to_bits(), (-0.0_f64).to_bits());
+        assert_eq!(old_nlip_order.to_bits(), 0.0_f64.to_bits());
+    }
+
+    #[test]
     fn fraction_to_boundary_min_keeps_ipopt_first_argument_on_tie() {
         let first_limiter = InteriorPointBoundaryLimiter {
             kind: InteriorPointBoundaryLimiterKind::VariableLowerBound,
@@ -10775,38 +10802,38 @@ where
             let trial_x = x
                 .iter()
                 .zip(direction.dx.iter())
-                .map(|(value, delta)| value + trial_alpha_pr * delta)
+                .map(|(value, delta)| ipopt_dense_current_plus_step(*value, trial_alpha_pr, *delta))
                 .collect::<Vec<_>>();
             let trial_lambda = lambda_eq
                 .iter()
                 .zip(direction.d_lambda.iter())
-                .map(|(value, delta)| value + trial_alpha_y * delta)
+                .map(|(value, delta)| ipopt_dense_current_plus_step(*value, trial_alpha_y, *delta))
                 .collect::<Vec<_>>();
             let trial_lambda_ineq = lambda_ineq
                 .iter()
                 .zip(direction.d_ineq.iter())
-                .map(|(value, delta)| value + trial_alpha_y * delta)
+                .map(|(value, delta)| ipopt_dense_current_plus_step(*value, trial_alpha_y, *delta))
                 .collect::<Vec<_>>();
             let trial_slack = slack
                 .iter()
                 .zip(direction.ds.iter())
-                .map(|(value, delta)| value + trial_alpha_pr * delta)
+                .map(|(value, delta)| ipopt_dense_current_plus_step(*value, trial_alpha_pr, *delta))
                 .collect::<Vec<_>>();
             let trial_slack_barrier = slack_barrier_values(&trial_slack, &slack_upper_bounds);
             let trial_z = z
                 .iter()
                 .zip(direction.dz.iter())
-                .map(|(value, delta)| value + trial_alpha_du * delta)
+                .map(|(value, delta)| ipopt_dense_current_plus_step(*value, trial_alpha_du, *delta))
                 .collect::<Vec<_>>();
             let trial_z_lower = z_lower
                 .iter()
                 .zip(direction.dz_lower.iter())
-                .map(|(value, delta)| value + trial_alpha_du * delta)
+                .map(|(value, delta)| ipopt_dense_current_plus_step(*value, trial_alpha_du, *delta))
                 .collect::<Vec<_>>();
             let trial_z_upper = z_upper
                 .iter()
                 .zip(direction.dz_upper.iter())
-                .map(|(value, delta)| value + trial_alpha_du * delta)
+                .map(|(value, delta)| ipopt_dense_current_plus_step(*value, trial_alpha_du, *delta))
                 .collect::<Vec<_>>();
             let trial_bounds_positive = bounds
                 .lower_indices
@@ -11354,12 +11381,16 @@ where
                     let corrected_x = x
                         .iter()
                         .zip(soc_direction.dx.iter())
-                        .map(|(value, delta)| value + soc_alpha_pr * delta)
+                        .map(|(value, delta)| {
+                            ipopt_dense_current_plus_step(*value, soc_alpha_pr, *delta)
+                        })
                         .collect::<Vec<_>>();
                     let corrected_slack = slack
                         .iter()
                         .zip(soc_direction.ds.iter())
-                        .map(|(value, delta)| value + soc_alpha_pr * delta)
+                        .map(|(value, delta)| {
+                            ipopt_dense_current_plus_step(*value, soc_alpha_pr, *delta)
+                        })
                         .collect::<Vec<_>>();
                     let corrected_slack_barrier =
                         slack_barrier_values(&corrected_slack, &slack_upper_bounds);
@@ -11464,27 +11495,37 @@ where
                         let corrected_lambda = lambda_eq
                             .iter()
                             .zip(soc_direction.d_lambda.iter())
-                            .map(|(value, delta)| value + soc_alpha_y * delta)
+                            .map(|(value, delta)| {
+                                ipopt_dense_current_plus_step(*value, soc_alpha_y, *delta)
+                            })
                             .collect::<Vec<_>>();
                         let corrected_lambda_ineq = lambda_ineq
                             .iter()
                             .zip(soc_direction.d_ineq.iter())
-                            .map(|(value, delta)| value + soc_alpha_y * delta)
+                            .map(|(value, delta)| {
+                                ipopt_dense_current_plus_step(*value, soc_alpha_y, *delta)
+                            })
                             .collect::<Vec<_>>();
                         let corrected_z = z
                             .iter()
                             .zip(soc_direction.dz.iter())
-                            .map(|(value, delta)| value + soc_alpha_du * delta)
+                            .map(|(value, delta)| {
+                                ipopt_dense_current_plus_step(*value, soc_alpha_du, *delta)
+                            })
                             .collect::<Vec<_>>();
                         let corrected_z_lower = z_lower
                             .iter()
                             .zip(soc_direction.dz_lower.iter())
-                            .map(|(value, delta)| value + soc_alpha_du * delta)
+                            .map(|(value, delta)| {
+                                ipopt_dense_current_plus_step(*value, soc_alpha_du, *delta)
+                            })
                             .collect::<Vec<_>>();
                         let corrected_z_upper = z_upper
                             .iter()
                             .zip(soc_direction.dz_upper.iter())
-                            .map(|(value, delta)| value + soc_alpha_du * delta)
+                            .map(|(value, delta)| {
+                                ipopt_dense_current_plus_step(*value, soc_alpha_du, *delta)
+                            })
                             .collect::<Vec<_>>();
                         let corrected_raw_dual_residual = lagrangian_gradient_sparse(
                             &corrected_state.gradient,
