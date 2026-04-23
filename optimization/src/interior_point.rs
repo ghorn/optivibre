@@ -2948,54 +2948,42 @@ fn slack_barrier_direction_values(slack_direction: &[f64]) -> Vec<f64> {
     slack_direction.iter().map(|value| -*value).collect()
 }
 
-fn native_bound_log_sum(x: &[f64], bounds: &BoundConstraints) -> f64 {
-    let lower_sum = bounds
+fn native_lower_bound_log_sum(x: &[f64], bounds: &BoundConstraints) -> f64 {
+    bounds
         .lower_indices
         .iter()
         .zip(bounds.lower_values.iter())
         .map(|(&index, &lower)| native_lower_bound_slack(x, index, lower).ln())
-        .sum::<f64>();
-    let upper_sum = bounds
+        .sum::<f64>()
+}
+
+fn native_upper_bound_log_sum(x: &[f64], bounds: &BoundConstraints) -> f64 {
+    bounds
         .upper_indices
         .iter()
         .zip(bounds.upper_values.iter())
         .map(|(&index, &upper)| native_upper_bound_slack(x, index, upper).ln())
-        .sum::<f64>();
-    lower_sum + upper_sum
+        .sum::<f64>()
 }
 
-fn native_bound_damping_sum(x: &[f64], bounds: &BoundConstraints) -> f64 {
-    let lower_sum = bounds
+fn native_lower_bound_damping_sum(x: &[f64], bounds: &BoundConstraints) -> f64 {
+    bounds
         .lower_indices
         .iter()
         .zip(bounds.lower_values.iter())
         .filter(|(index, _)| !bounds.upper_indices.contains(index))
         .map(|(&index, &lower)| native_lower_bound_slack(x, index, lower))
-        .sum::<f64>();
-    let upper_sum = bounds
+        .sum::<f64>()
+}
+
+fn native_upper_bound_damping_sum(x: &[f64], bounds: &BoundConstraints) -> f64 {
+    bounds
         .upper_indices
         .iter()
         .zip(bounds.upper_values.iter())
         .filter(|(index, _)| !bounds.lower_indices.contains(index))
         .map(|(&index, &upper)| native_upper_bound_slack(x, index, upper))
-        .sum::<f64>();
-    lower_sum + upper_sum
-}
-
-fn native_bound_damping_directional_derivative(dx: &[f64], bounds: &BoundConstraints) -> f64 {
-    let lower_sum = bounds
-        .lower_indices
-        .iter()
-        .filter(|index| !bounds.upper_indices.contains(index))
-        .map(|&index| dx[index])
-        .sum::<f64>();
-    let upper_sum = bounds
-        .upper_indices
-        .iter()
-        .filter(|index| !bounds.lower_indices.contains(index))
-        .map(|&index| -dx[index])
-        .sum::<f64>();
-    lower_sum + upper_sum
+        .sum::<f64>()
 }
 
 fn positive_slack_damping(barrier_parameter: f64, kappa_d: f64) -> f64 {
@@ -3168,15 +3156,21 @@ fn barrier_objective_value(
     if (slack.is_empty() && bounds.total_count() == 0) || barrier_parameter <= 0.0 {
         return objective_value;
     }
-    let slack_log_sum = slack.iter().map(|value| value.ln()).sum::<f64>();
+    // Mirror IpoptCalculatedQuantities::CalcBarrierTerm: accumulate x_L,
+    // x_U, s_L, then s_U before applying -mu, then add damping in the same
+    // component order. NLIP currently has only upper slacks for inequalities.
+    let mut barrier_term = 0.0;
+    barrier_term += native_lower_bound_log_sum(x, bounds);
+    barrier_term += native_upper_bound_log_sum(x, bounds);
+    barrier_term += slack.iter().map(|value| value.ln()).sum::<f64>();
+    let mut result = objective_value + (-barrier_parameter * barrier_term);
     let damping_weight = positive_slack_damping(barrier_parameter, kappa_d);
-    let damping = if damping_weight > 0.0 {
-        damping_weight * (slack.iter().sum::<f64>() + native_bound_damping_sum(x, bounds))
-    } else {
-        0.0
-    };
-    objective_value - barrier_parameter * (slack_log_sum + native_bound_log_sum(x, bounds))
-        + damping
+    if damping_weight > 0.0 {
+        result += damping_weight * native_lower_bound_damping_sum(x, bounds);
+        result += damping_weight * native_upper_bound_damping_sum(x, bounds);
+        result += damping_weight * slack.iter().sum::<f64>();
+    }
+    result
 }
 
 #[expect(
@@ -3193,41 +3187,62 @@ fn barrier_objective_directional_derivative(
     barrier_parameter: f64,
     kappa_d: f64,
 ) -> f64 {
-    let objective_term = gradient
+    if (slack.is_empty() && bounds.total_count() == 0) || barrier_parameter <= 0.0 {
+        return gradient
+            .iter()
+            .zip(dx.iter())
+            .map(|(gradient_i, dx_i)| gradient_i * dx_i)
+            .sum::<f64>();
+    }
+    // Mirror IpoptCalculatedQuantities::curr_gradBarrTDelta: first build
+    // curr_grad_barrier_obj_x and curr_grad_barrier_obj_s in source order, then
+    // take the two dots. This preserves IPOPT's x_L/x_U/s_L/s_U update order
+    // instead of regrouping the algebra into independent sums.
+    let mut grad_x = gradient.to_vec();
+    for (&index, &lower) in bounds.lower_indices.iter().zip(bounds.lower_values.iter()) {
+        grad_x[index] += -barrier_parameter / native_lower_bound_slack(x, index, lower);
+    }
+    for (&index, &upper) in bounds.upper_indices.iter().zip(bounds.upper_values.iter()) {
+        grad_x[index] += barrier_parameter / native_upper_bound_slack(x, index, upper);
+    }
+    let damping_weight = positive_slack_damping(barrier_parameter, kappa_d);
+    if damping_weight > 0.0 {
+        for &index in bounds
+            .lower_indices
+            .iter()
+            .filter(|index| !bounds.upper_indices.contains(index))
+        {
+            grad_x[index] += damping_weight;
+        }
+        for &index in bounds
+            .upper_indices
+            .iter()
+            .filter(|index| !bounds.lower_indices.contains(index))
+        {
+            grad_x[index] -= damping_weight;
+        }
+    }
+    let x_dot = grad_x
         .iter()
         .zip(dx.iter())
         .map(|(gradient_i, dx_i)| gradient_i * dx_i)
         .sum::<f64>();
-    if (slack.is_empty() && bounds.total_count() == 0) || barrier_parameter <= 0.0 {
-        return objective_term;
+
+    let mut grad_s = vec![0.0; slack.len()];
+    for (grad_i, slack_i) in grad_s.iter_mut().zip(slack.iter()) {
+        *grad_i += barrier_parameter / slack_i;
     }
-    let slack_barrier_term = slack
+    if damping_weight > 0.0 {
+        for grad_i in &mut grad_s {
+            *grad_i -= damping_weight;
+        }
+    }
+    let s_dot = grad_s
         .iter()
         .zip(ds.iter())
-        .map(|(slack_i, ds_i)| ds_i / slack_i)
+        .map(|(gradient_i, ds_i)| gradient_i * ds_i)
         .sum::<f64>();
-    let lower_barrier_term = bounds
-        .lower_indices
-        .iter()
-        .zip(bounds.lower_values.iter())
-        .map(|(&index, &lower)| dx[index] / native_lower_bound_slack(x, index, lower))
-        .sum::<f64>();
-    let upper_barrier_term = bounds
-        .upper_indices
-        .iter()
-        .zip(bounds.upper_values.iter())
-        .map(|(&index, &upper)| -dx[index] / native_upper_bound_slack(x, index, upper))
-        .sum::<f64>();
-    let damping_weight = positive_slack_damping(barrier_parameter, kappa_d);
-    let damping_term = if damping_weight > 0.0 {
-        damping_weight
-            * (ds.iter().sum::<f64>() + native_bound_damping_directional_derivative(dx, bounds))
-    } else {
-        0.0
-    };
-    objective_term
-        - barrier_parameter * (slack_barrier_term + lower_barrier_term + upper_barrier_term)
-        + damping_term
+    x_dot + s_dot
 }
 
 fn switching_condition_satisfied(
@@ -8539,6 +8554,100 @@ mod tests {
     }
 
     #[test]
+    fn barrier_objective_accumulates_components_in_ipopt_order() {
+        let bounds = BoundConstraints {
+            lower_indices: vec![0, 1],
+            lower_values: vec![0.125, -2.0],
+            upper_indices: vec![1, 2],
+            upper_values: vec![3.0, 5.0],
+        };
+        let x = vec![1.25, 0.5, 2.0];
+        let slack = vec![0.03125, 1.5, 4.0];
+        let objective = 7.25;
+        let mu = 0.125;
+        let kappa_d = 1.0e-5;
+
+        let actual = barrier_objective_value(objective, &slack, &x, &bounds, mu, kappa_d);
+
+        // IpoptCalculatedQuantities::CalcBarrierTerm accumulates SumLogs in
+        // x_L, x_U, s_L, s_U order, then adds damping in the same order.
+        let mut barrier_term = 0.0;
+        barrier_term += native_lower_bound_log_sum(&x, &bounds);
+        barrier_term += native_upper_bound_log_sum(&x, &bounds);
+        barrier_term += slack.iter().map(|value| value.ln()).sum::<f64>();
+        let mut expected = objective + (-mu * barrier_term);
+        let damping_weight = mu * kappa_d;
+        expected += damping_weight * native_lower_bound_damping_sum(&x, &bounds);
+        expected += damping_weight * native_upper_bound_damping_sum(&x, &bounds);
+        expected += damping_weight * slack.iter().sum::<f64>();
+
+        assert_eq!(actual.to_bits(), expected.to_bits());
+    }
+
+    #[test]
+    fn barrier_directional_derivative_uses_ipopt_gradient_dot_order() {
+        let bounds = BoundConstraints {
+            lower_indices: vec![0, 1],
+            lower_values: vec![0.125, -2.0],
+            upper_indices: vec![1, 2],
+            upper_values: vec![3.0, 5.0],
+        };
+        let gradient = vec![1.5, -2.25, 0.75];
+        let x = vec![1.25, 0.5, 2.0];
+        let dx = vec![0.03125, -0.5, 0.125];
+        let slack = vec![0.03125, 1.5, 4.0];
+        let ds = vec![-0.0625, 0.25, -0.125];
+        let mu = 0.125;
+        let kappa_d = 1.0e-5;
+
+        let actual = barrier_objective_directional_derivative(
+            &gradient, &slack, &x, &bounds, &dx, &ds, mu, kappa_d,
+        );
+
+        // IpoptCalculatedQuantities::curr_gradBarrTDelta first builds
+        // curr_grad_barrier_obj_x and curr_grad_barrier_obj_s in source order,
+        // then computes grad_x.dot(delta_x) + grad_s.dot(delta_s).
+        let mut grad_x = gradient.clone();
+        for (&index, &lower) in bounds.lower_indices.iter().zip(bounds.lower_values.iter()) {
+            grad_x[index] += -mu / native_lower_bound_slack(&x, index, lower);
+        }
+        for (&index, &upper) in bounds.upper_indices.iter().zip(bounds.upper_values.iter()) {
+            grad_x[index] += mu / native_upper_bound_slack(&x, index, upper);
+        }
+        let damping_weight = mu * kappa_d;
+        for &index in bounds
+            .lower_indices
+            .iter()
+            .filter(|index| !bounds.upper_indices.contains(index))
+        {
+            grad_x[index] += damping_weight;
+        }
+        for &index in bounds
+            .upper_indices
+            .iter()
+            .filter(|index| !bounds.lower_indices.contains(index))
+        {
+            grad_x[index] -= damping_weight;
+        }
+        let x_dot = grad_x
+            .iter()
+            .zip(dx.iter())
+            .map(|(gradient_i, dx_i)| gradient_i * dx_i)
+            .sum::<f64>();
+        let mut grad_s = slack.iter().map(|slack_i| mu / slack_i).collect::<Vec<_>>();
+        for grad_i in &mut grad_s {
+            *grad_i -= damping_weight;
+        }
+        let s_dot = grad_s
+            .iter()
+            .zip(ds.iter())
+            .map(|(gradient_i, ds_i)| gradient_i * ds_i)
+            .sum::<f64>();
+
+        assert_eq!(actual.to_bits(), (x_dot + s_dot).to_bits());
+    }
+
+    #[test]
     fn fraction_to_boundary_candidate_keeps_ipopt_operation_order() {
         let tau = 0.7782901536485674;
         let value = 2.59793708066258e-11;
@@ -10286,7 +10395,7 @@ where
             &x,
             &bounds,
             &direction.dx,
-            &slack_barrier_direction,
+            &direction.ds,
             barrier_parameter_value,
             options.kappa_d,
         );
