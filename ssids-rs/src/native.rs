@@ -279,6 +279,7 @@ pub struct NativeSpralSession {
     pattern_row_indices32: Vec<i32>,
     options: SpralSsidsOptions,
     scaling: Option<Vec<f64>>,
+    analysis_order: Option<Vec<usize>>,
     analyse_info: NativeSpralAnalyseInfo,
     factor_info: Option<NativeSpralFactorInfo>,
     analysed: *mut c_void,
@@ -553,6 +554,10 @@ impl NativeSpral {
             }
             return Err(NativeSpralError::AnalyseFailed { flag: inform.flag });
         }
+        let analysis_order = order_storage
+            .as_deref()
+            .map(decode_native_analysis_order)
+            .transpose()?;
         let scaling = (options.scaling != 0).then(|| vec![0.0; matrix.dimension()]);
         Ok(NativeSpralSession {
             inner: Arc::clone(&self.inner),
@@ -563,6 +568,7 @@ impl NativeSpral {
             pattern_row_indices32: row_indices32,
             options,
             scaling,
+            analysis_order,
             analyse_info: NativeSpralAnalyseInfo {
                 supernode_count: inform.num_sup.max(0) as usize,
                 max_front_size: inform.maxfront.max(0) as usize,
@@ -641,8 +647,12 @@ fn apply_native_ordering(
             );
         }
         NativeOrderingSpec::Matching => {
+            // SPRAL's C interface treats `order` as optional output for
+            // `src/ssids/ssids.f90::analyse_double`; provide storage so the
+            // matching+METIS order can be observed without reimplementing it.
             native.ordering = 2;
             native.scaling = 3;
+            *order_storage = Some(vec![0; dimension]);
         }
         NativeOrderingSpec::UserSupplied(order) => {
             if order.len() != dimension {
@@ -677,6 +687,32 @@ fn apply_native_ordering(
     Ok(())
 }
 
+fn decode_native_analysis_order(order: &[i32]) -> Result<Vec<usize>, NativeSpralError> {
+    let dimension = order.len();
+    let mut seen = vec![false; dimension];
+    let mut decoded = Vec::with_capacity(dimension);
+    for (original, &position) in order.iter().enumerate() {
+        let position = usize::try_from(position).map_err(|_| {
+            NativeSpralError::InvalidOrdering(format!(
+                "native analysis order[{original}]={position} is negative"
+            ))
+        })?;
+        if position >= dimension {
+            return Err(NativeSpralError::InvalidOrdering(format!(
+                "native analysis order[{original}]={position} is out of bounds for {dimension} columns"
+            )));
+        }
+        if seen[position] {
+            return Err(NativeSpralError::InvalidOrdering(format!(
+                "native analysis order has duplicate pivot position {position}"
+            )));
+        }
+        seen[position] = true;
+        decoded.push(position);
+    }
+    Ok(decoded)
+}
+
 impl NativeSpralSession {
     pub fn dimension(&self) -> usize {
         self.dimension
@@ -688,6 +724,12 @@ impl NativeSpralSession {
 
     pub fn factor_info(&self) -> Option<NativeSpralFactorInfo> {
         self.factor_info
+    }
+
+    /// Return `order[original_column] = pivot_position` when native analyse was
+    /// called with an order buffer.
+    pub fn analysis_order(&self) -> Option<&[usize]> {
+        self.analysis_order.as_deref()
     }
 
     pub fn factorize(

@@ -1063,6 +1063,28 @@ pub fn analyse(
     }
 }
 
+/// Analyse with a user-supplied pivot order in SPRAL's C-facing convention:
+/// `order[original_column]` is the zero-based position of that column in the
+/// pivot sequence.
+pub fn analyse_with_user_ordering(
+    matrix: SymmetricCscMatrix<'_>,
+    order: &[usize],
+) -> Result<(SymbolicFactor, AnalyseInfo), SsidsError> {
+    let graph =
+        CsrGraph::from_symmetric_csc(matrix.dimension(), matrix.col_ptrs(), matrix.row_indices())?;
+    let column_has_entries = (0..matrix.dimension())
+        .map(|col| matrix.col_ptrs()[col + 1] > matrix.col_ptrs()[col])
+        .collect::<Vec<_>>();
+    let permutation = permutation_from_native_order(matrix.dimension(), order)?;
+    build_symbolic_result_with_native_order(
+        matrix,
+        &graph,
+        permutation,
+        &column_has_entries,
+        "user_supplied",
+    )
+}
+
 pub fn approximate_minimum_degree_permutation(
     matrix: SymmetricCscMatrix<'_>,
 ) -> Result<Permutation, SsidsError> {
@@ -1244,6 +1266,33 @@ fn compose_ordering_with_symbolic_permutation(
     let mut perm = vec![usize::MAX; base_permutation.len()];
     for (old_position, &new_position) in symbolic_permutation.iter().enumerate() {
         perm[new_position] = base_permutation.perm()[old_position];
+    }
+    Permutation::new(perm)
+}
+
+fn permutation_from_native_order(
+    dimension: usize,
+    order: &[usize],
+) -> Result<Permutation, OrderingError> {
+    if order.len() != dimension {
+        return Err(OrderingError::InvalidPermutation(format!(
+            "expected {dimension} user-order entries, got {}",
+            order.len()
+        )));
+    }
+    let mut perm = vec![usize::MAX; dimension];
+    for (original, &position) in order.iter().enumerate() {
+        if position >= dimension {
+            return Err(OrderingError::InvalidPermutation(format!(
+                "order[{original}]={position} is out of bounds for {dimension} columns"
+            )));
+        }
+        if perm[position] != usize::MAX {
+            return Err(OrderingError::InvalidPermutation(format!(
+                "duplicate pivot position {position}"
+            )));
+        }
+        perm[position] = original;
     }
     Permutation::new(perm)
 }
