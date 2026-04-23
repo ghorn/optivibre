@@ -3494,7 +3494,10 @@ where
             break;
         }
         let next_barrier = next_barrier_parameter_once(current_barrier, options);
-        if next_barrier >= current_barrier - 1e-18 {
+        // IpMonotoneMuUpdate::UpdateBarrierParameter uses exact `mu !=
+        // new_mu` to decide whether the barrier changed; avoid a local
+        // tolerance that can skip a source-visible mu update near the floor.
+        if next_barrier == current_barrier {
             break;
         }
         current_barrier = next_barrier.max(minimum_barrier);
@@ -8893,6 +8896,25 @@ mod tests {
     }
 
     #[test]
+    fn monotone_mu_change_detection_has_no_local_tolerance() {
+        let options = InteriorPointOptions {
+            overall_tol: 1e-12,
+            complementarity_tol: 1e-12,
+            ..InteriorPointOptions::default()
+        };
+        let floor = minimum_monotone_barrier_parameter(&options);
+        let just_above_floor = f64::from_bits(floor.to_bits() + 1);
+
+        // IPOPT IpMonotoneMuUpdate::UpdateBarrierParameter tests
+        // `mu != new_mu` exactly before accepting a barrier update and
+        // resetting the line search. Even a one-ulp drop to the monotone floor
+        // is therefore source-visible.
+        let next = next_barrier_parameter(just_above_floor, false, true, &options, |_| 0.0);
+
+        assert_eq!(next.to_bits(), floor.to_bits());
+    }
+
+    #[test]
     fn push_scalar_to_bounds_interior_keeps_ipopt_tiny_margin_order() {
         let lower = 0.0;
         let upper = 1.0e-305;
@@ -10390,9 +10412,7 @@ where
                 },
             );
             monotone_mu_update_initialized = true;
-            if next_barrier_parameter_value
-                < previous_barrier_parameter - 1e-18 * previous_barrier_parameter.abs().max(1.0)
-            {
+            if next_barrier_parameter_value != previous_barrier_parameter {
                 // IPOPT calls MonotoneMuUpdate::UpdateBarrierParameter before
                 // ComputeSearchDirection.  When mu changes, it calls
                 // BacktrackingLineSearch::Reset, clearing the filter acceptor;
