@@ -5117,6 +5117,8 @@ struct IpoptRefinementReport {
     initial_residual: IpoptFullSpaceResidualMetrics,
     residual_ratio: f64,
     final_residual: IpoptFullSpaceResidualMetrics,
+    first_correction_rhs: Option<VectorFingerprint>,
+    first_correction_solution: Option<VectorFingerprint>,
     failed: bool,
 }
 
@@ -5164,27 +5166,55 @@ fn ipopt_full_space_residual_metrics_text(metrics: IpoptFullSpaceResidualMetrics
     )
 }
 
-fn fnv1a_f64_bits_hash(values: &[f64]) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    values
-        .iter()
-        .fold(FNV_OFFSET ^ values.len() as u64, |hash, value| {
-            (hash ^ value.to_bits()).wrapping_mul(FNV_PRIME)
-        })
+#[derive(Clone, Copy, Debug)]
+struct VectorFingerprint {
+    len: usize,
+    inf: f64,
+    sum: f64,
+    hash: u64,
+    negative_zero_count: usize,
+    positive_zero_count: usize,
 }
 
-fn vector_fingerprint_text(values: &[f64]) -> String {
-    let inf = values
-        .iter()
-        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
-    let sum = values.iter().sum::<f64>();
-    format!(
-        "len={} inf={:.12e} sum={:.12e} hash={:016x}",
-        values.len(),
+fn vector_fingerprint(values: &[f64]) -> VectorFingerprint {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut inf = 0.0_f64;
+    let mut sum = 0.0_f64;
+    let mut hash = FNV_OFFSET ^ values.len() as u64;
+    let mut negative_zero_count = 0;
+    let mut positive_zero_count = 0;
+    for value in values {
+        inf = inf.max(value.abs());
+        sum += *value;
+        hash = (hash ^ value.to_bits()).wrapping_mul(FNV_PRIME);
+        if *value == 0.0 {
+            if value.is_sign_negative() {
+                negative_zero_count += 1;
+            } else {
+                positive_zero_count += 1;
+            }
+        }
+    }
+    VectorFingerprint {
+        len: values.len(),
         inf,
         sum,
-        fnv1a_f64_bits_hash(values),
+        hash,
+        negative_zero_count,
+        positive_zero_count,
+    }
+}
+
+fn vector_fingerprint_text(fingerprint: VectorFingerprint) -> String {
+    format!(
+        "len={} inf={:.12e} sum={:.12e} hash={:016x} z[-/+]={}/{}",
+        fingerprint.len,
+        fingerprint.inf,
+        fingerprint.sum,
+        fingerprint.hash,
+        fingerprint.negative_zero_count,
+        fingerprint.positive_zero_count,
     )
 }
 
@@ -5478,13 +5508,21 @@ fn refine_ipopt_full_space_solution<E>(
     let initial_residual_ratio = residual_ratio;
     let initial_residual = residual.metrics();
     let mut previous_residual_ratio = residual_ratio;
+    let mut first_correction_rhs = None;
+    let mut first_correction_solution = None;
     let mut failed = false;
     while steps < IPOPT_LINEAR_MIN_REFINEMENT_STEPS
         || residual_ratio > IPOPT_LINEAR_RESIDUAL_RATIO_MAX
     {
+        if steps == 0 {
+            first_correction_rhs = Some(vector_fingerprint(&residual.augmented_correction_rhs));
+        }
         let correction_started = Instant::now();
         let correction = solve_correction(&residual.augmented_correction_rhs)?;
         *solve_time += correction_started.elapsed();
+        if steps == 0 {
+            first_correction_solution = Some(vector_fingerprint(&correction));
+        }
         for (solution_i, correction_i) in solution.iter_mut().zip(correction.iter()) {
             *solution_i -= correction_i;
         }
@@ -5512,6 +5550,8 @@ fn refine_ipopt_full_space_solution<E>(
         initial_residual,
         residual_ratio,
         final_residual: residual.metrics(),
+        first_correction_rhs,
+        first_correction_solution,
         failed,
     })
 }
@@ -6773,6 +6813,7 @@ fn factor_solve_spral_src(
             error,
         )
     })?;
+    let pre_refinement_solution_fingerprint = vector_fingerprint(&solution);
     let mut solve_time = solve_started.elapsed();
     let refinement = refine_ipopt_full_space_solution(
         system,
@@ -6791,8 +6832,9 @@ fn factor_solve_spral_src(
             })
         },
     )?;
+    let post_refinement_prefinal_solution_fingerprint = vector_fingerprint(&solution);
     let native_factor_detail = format!(
-        "native_spral_factor[delays={} nfactor={} nflops={} maxfront={} two_by_two={} supernodes={} maxsuper={}]; native_spral_rhs[{}]",
+        "native_spral_factor[delays={} nfactor={} nflops={} maxfront={} two_by_two={} supernodes={} maxsuper={}]; native_spral_rhs[{}]; native_spral_solution_prefinal[{}]; native_spral_solution_prefinal_refined[{}]",
         factor_info.delayed_pivots,
         factor_info.factor_entries,
         factor_info.flop_count,
@@ -6800,17 +6842,29 @@ fn factor_solve_spral_src(
         factor_info.two_by_two_pivots,
         factor_info.supernode_count,
         factor_info.max_supernode_width,
-        vector_fingerprint_text(rhs),
+        vector_fingerprint_text(vector_fingerprint(rhs)),
+        vector_fingerprint_text(pre_refinement_solution_fingerprint),
+        vector_fingerprint_text(post_refinement_prefinal_solution_fingerprint),
     );
     let mut detail = (refinement.steps > 0)
         .then(|| {
+            let first_correction_rhs = refinement
+                .first_correction_rhs
+                .map(vector_fingerprint_text)
+                .unwrap_or_else(|| "--".to_string());
+            let first_correction_solution = refinement
+                .first_correction_solution
+                .map(vector_fingerprint_text)
+                .unwrap_or_else(|| "--".to_string());
             format!(
-                "full_space_iterative_refinement_steps={} residual_ratio={:.3e}->{:.3e} residuals=[{}]->[{}]",
+                "full_space_iterative_refinement_steps={} residual_ratio={:.3e}->{:.3e} residuals=[{}]->[{}] first_correction_rhs[{}] first_correction_solution[{}]",
                 refinement.steps,
                 refinement.initial_residual_ratio,
                 refinement.residual_ratio,
                 ipopt_full_space_residual_metrics_text(refinement.initial_residual),
                 ipopt_full_space_residual_metrics_text(refinement.final_residual),
+                first_correction_rhs,
+                first_correction_solution,
             )
         })
         .map_or_else(
