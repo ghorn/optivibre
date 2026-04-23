@@ -4535,6 +4535,7 @@ where
 fn least_squares_constraint_multipliers(
     state: &EvalState,
     z: &[f64],
+    hessian_structure: &CCS,
     regularization: f64,
     solver: InteriorPointLinearSolver,
 ) -> (Vec<f64>, Vec<f64>) {
@@ -4560,6 +4561,18 @@ fn least_squares_constraint_multipliers(
         rhs[slack_offset + row] = z_i;
     }
 
+    // IpLeastSquareMults.cpp passes IpNLP().uninitialized_h() with
+    // W_factor=0 into StdAugSystemSolver. The numeric contribution is zero,
+    // but TSymLinearSolver still includes the Hessian sparsity in the KKT
+    // pattern before SPRAL's value-dependent matching analysis.
+    for col in 0..hessian_structure.ncol {
+        for index in hessian_structure.col_ptrs[col]..hessian_structure.col_ptrs[col + 1] {
+            let row = hessian_structure.row_indices[index];
+            rows.push(col.min(row));
+            cols.push(col.max(row));
+            values.push(0.0);
+        }
+    }
     for diag in 0..n {
         rows.push(diag);
         cols.push(diag);
@@ -8728,6 +8741,7 @@ where
         let (initial_lambda_eq, initial_lambda_ineq) = least_squares_constraint_multipliers(
             &initial_linear_state,
             &z,
+            hessian_structure.as_ref(),
             options.regularization,
             options.linear_solver,
         );
@@ -11089,6 +11103,7 @@ where
                 let (restored_lambda, restored_lambda_ineq) = least_squares_constraint_multipliers(
                     &restored_linear_state,
                     &[],
+                    hessian_structure.as_ref(),
                     options.regularization,
                     options.linear_solver,
                 );
