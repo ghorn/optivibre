@@ -2375,7 +2375,7 @@ fn newton_direction_from_augmented_solution(
         .zip(snapshot.slack.iter())
         .zip(ds.iter())
         .map(|(((r_cent_i, z_i), s_i), ds_i)| {
-            ipopt_upper_slack_bound_multiplier_step(*s_i, *z_i, *r_cent_i, *ds_i)
+            ipopt_final_upper_slack_bound_multiplier_step(*s_i, *z_i, *r_cent_i, *ds_i)
         })
         .collect::<Vec<_>>();
     NewtonDirection {
@@ -3028,18 +3028,23 @@ fn build_ipopt_augmented_kkt_rhs(
     rhs
 }
 
-fn ipopt_upper_slack_bound_multiplier_step(
+fn ipopt_final_upper_slack_bound_multiplier_step(
     slack: f64,
     multiplier: f64,
     complementarity_residual: f64,
     ipopt_internal_slack_step: f64,
 ) -> f64 {
-    // Mirrors IPOPT PDFullSpaceSolver::SolveOnce Pd_U.SinvBlrmZMTdBr(1., ...)
-    // followed by PDSearchDirCalc's Solve(-1., 0., ...) final scaling:
-    // delta_v_U = (-rhs.v_U + v_U * delta_s) / slack_s_U. NLIP now stores the
-    // raw IPOPT-internal upper-bound slack component and converts separately
-    // when a positive upper-slack distance is needed.
-    (-complementarity_residual + multiplier * ipopt_internal_slack_step) / slack
+    // Mirrors IPOPT's operation order in PDFullSpaceSolver::Solve:
+    // SolveOnce first computes Pd_U.SinvBlrmZMTdBr(1., ...) using the
+    // pre-final slack step, then PDSearchDirCalc's Solve(-1., 0., ...) negates
+    // the whole IteratesVector. Keep that order instead of recomputing the
+    // algebraically equivalent final formula directly.
+    -ipopt_prefinal_upper_slack_bound_multiplier_step(
+        slack,
+        multiplier,
+        complementarity_residual,
+        -ipopt_internal_slack_step,
+    )
 }
 
 fn ipopt_prefinal_upper_slack_bound_multiplier_step(
@@ -5502,7 +5507,7 @@ fn ipopt_full_space_residual_ratio(
                 ipopt_ds_i,
             )
         } else {
-            ipopt_upper_slack_bound_multiplier_step(
+            ipopt_final_upper_slack_bound_multiplier_step(
                 slack,
                 multiplier,
                 system.r_cent[row],
@@ -5510,19 +5515,32 @@ fn ipopt_full_space_residual_ratio(
             )
         };
         let damped_slack_stationarity = damped_slack_stationarity_residual(system, row);
-        let (residual_s, residual_v, residual_d) = if prefinal_orientation {
+        let (rhs_s_i, rhs_v_i, rhs_d_i) = if prefinal_orientation {
             (
-                dz_i - d_ineq[row] - damped_slack_stationarity + shifts.slack * ipopt_ds_i,
-                slack * dz_i - multiplier * ipopt_ds_i - system.r_cent[row],
-                inequality_dx[row] - ipopt_ds_i - shifts.dual * d_ineq[row] - system.r_ineq[row],
+                damped_slack_stationarity,
+                system.r_cent[row],
+                system.r_ineq[row],
             )
         } else {
             (
-                dz_i - d_ineq[row] + damped_slack_stationarity + shifts.slack * ipopt_ds_i,
-                slack * dz_i - multiplier * ipopt_ds_i + system.r_cent[row],
-                inequality_dx[row] - ipopt_ds_i - shifts.dual * d_ineq[row] + system.r_ineq[row],
+                -damped_slack_stationarity,
+                -system.r_cent[row],
+                -system.r_ineq[row],
             )
         };
+        // Mirror IpPDFullSpaceSolver.cpp::ComputeResiduals and
+        // DenseVector::AddTwoVectorsImpl grouping for the s, v_U, and y_d
+        // blocks: start from the matrix product, add `-res - rhs` as one
+        // expression, then apply the perturbation Axpy separately.
+        let mut residual_s = dz_i + (-d_ineq[row] - rhs_s_i);
+        if shifts.slack != 0.0 {
+            residual_s += shifts.slack * ipopt_ds_i;
+        }
+        let residual_v = (slack * dz_i) + (-(multiplier * ipopt_ds_i) - rhs_v_i);
+        let mut residual_d = inequality_dx[row] + (-ipopt_ds_i - rhs_d_i);
+        if shifts.dual != 0.0 {
+            residual_d += -shifts.dual * d_ineq[row];
+        }
         residual_s_inf = residual_s_inf.max(residual_s.abs());
         residual_d_inf = residual_d_inf.max(residual_d.abs());
         residual_vu_inf = residual_vu_inf.max(residual_v.abs());
@@ -5547,11 +5565,17 @@ fn ipopt_full_space_residual_ratio(
 
     let mut residual_c_inf = 0.0_f64;
     for row in 0..meq {
-        let residual_c = if prefinal_orientation {
-            equality_dx[row] - shifts.dual * d_lambda[row] - system.r_eq[row]
+        let rhs_c_i = if prefinal_orientation {
+            system.r_eq[row]
         } else {
-            equality_dx[row] - shifts.dual * d_lambda[row] + system.r_eq[row]
+            -system.r_eq[row]
         };
+        // IpPDFullSpaceSolver.cpp::ComputeResiduals forms this with
+        // AddTwoVectors(-delta_c, res.y_c, -1., rhs.y_c, 1.).
+        let mut residual_c = equality_dx[row] - rhs_c_i;
+        if shifts.dual != 0.0 {
+            residual_c += -shifts.dual * d_lambda[row];
+        }
         augmented_correction_rhs[pattern.lambda_offset + row] = residual_c;
         residual_c_inf = residual_c_inf.max(residual_c.abs());
         residual_inf = residual_inf.max(residual_c.abs());
@@ -7233,7 +7257,7 @@ fn solve_reduced_kkt_with_spral_src(
                     .zip(system.slack.iter())
                     .zip(ds.iter())
                     .map(|(((r_cent_i, z_i), s_i), ds_i)| {
-                        ipopt_upper_slack_bound_multiplier_step(*s_i, *z_i, *r_cent_i, *ds_i)
+                        ipopt_final_upper_slack_bound_multiplier_step(*s_i, *z_i, *r_cent_i, *ds_i)
                     })
                     .collect::<Vec<_>>();
                 return Ok(NewtonDirection {
@@ -7376,7 +7400,7 @@ fn solve_reduced_kkt_with_spral_ssids(
                     .zip(system.slack.iter())
                     .zip(ds.iter())
                     .map(|(((r_cent_i, z_i), s_i), ds_i)| {
-                        ipopt_upper_slack_bound_multiplier_step(*s_i, *z_i, *r_cent_i, *ds_i)
+                        ipopt_final_upper_slack_bound_multiplier_step(*s_i, *z_i, *r_cent_i, *ds_i)
                     })
                     .collect::<Vec<_>>();
                 return Ok(NewtonDirection {
