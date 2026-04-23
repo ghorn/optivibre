@@ -5152,6 +5152,209 @@ mod tests {
                 .join("; ")
         }
 
+        fn direct_fraction_candidate(tau: f64, value: f64, direction: f64) -> f64 {
+            // Mirrors IpIpoptCalculatedQuantities::CalcFracToBound through
+            // DenseVector::FracToBoundImpl: candidates are evaluated as
+            // `-tau / direction * value` for negative slack directions.
+            -tau / direction * value
+        }
+
+        fn nlip_direct_primal_fraction_to_boundary_limiters(
+            previous: &optimization::InteriorPointIterationSnapshot,
+            current: &optimization::InteriorPointIterationSnapshot,
+            previous_ipopt: &optimization::IpoptIterationSnapshot,
+            bounds: &VariableBoundView,
+            tau: f64,
+            intervals: usize,
+            order: usize,
+        ) -> String {
+            let Some(direction) = current.step_direction.as_ref() else {
+                return "--".to_string();
+            };
+            let slack = previous.slack_primal.as_deref().unwrap_or(&[]);
+            let mut limiters = Vec::new();
+
+            for (index, maybe_lower) in bounds.lower.iter().enumerate() {
+                let Some(lower) = *maybe_lower else {
+                    continue;
+                };
+                let Some((&value, &delta)) = previous.x.get(index).zip(direction.x.get(index))
+                else {
+                    continue;
+                };
+                let slack_distance = value - lower;
+                if delta < 0.0 && slack_distance.is_finite() {
+                    let candidate = direct_fraction_candidate(tau, slack_distance, delta);
+                    if candidate.is_finite() {
+                        limiters.push((
+                            candidate,
+                            format!(
+                                "x lower {} value={slack_distance:.17e} dir={delta:.17e}",
+                                glider_decision_label(index, intervals, order)
+                            ),
+                        ));
+                    }
+                }
+            }
+            for (index, maybe_upper) in bounds.upper.iter().enumerate() {
+                let Some(upper) = *maybe_upper else {
+                    continue;
+                };
+                let Some((&value, &delta_x)) = previous.x.get(index).zip(direction.x.get(index))
+                else {
+                    continue;
+                };
+                let slack_distance = upper - value;
+                let slack_direction = -delta_x;
+                if slack_direction < 0.0 && slack_distance.is_finite() {
+                    let candidate = direct_fraction_candidate(tau, slack_distance, slack_direction);
+                    if candidate.is_finite() {
+                        limiters.push((
+                            candidate,
+                            format!(
+                                "x upper {} value={slack_distance:.17e} dir={slack_direction:.17e}",
+                                glider_decision_label(index, intervals, order)
+                            ),
+                        ));
+                    }
+                }
+            }
+
+            for (index, ((&slack_value, &delta_s), (&ipopt_internal, &ipopt_distance))) in slack
+                .iter()
+                .zip(direction.slack.iter())
+                .zip(
+                    previous_ipopt
+                        .internal_slack
+                        .iter()
+                        .zip(previous_ipopt.kkt_slack_distance.iter()),
+                )
+                .enumerate()
+            {
+                // NLIP snapshots do not currently expose the relaxed upper slack
+                // bounds. Reconstruct the same comparison distance from IPOPT's
+                // previous internal slack state so this probe isolates the
+                // FracToBound arithmetic and direction values.
+                let upper = ipopt_internal + ipopt_distance;
+                let slack_distance = upper - slack_value;
+                let slack_direction = -delta_s;
+                if slack_direction < 0.0 && slack_distance.is_finite() {
+                    let candidate = direct_fraction_candidate(tau, slack_distance, slack_direction);
+                    if candidate.is_finite() {
+                        limiters.push((
+                            candidate,
+                            format!(
+                                "s upper {} value={slack_distance:.17e} dir={slack_direction:.17e}",
+                                glider_inequality_label(index, intervals, order)
+                            ),
+                        ));
+                    }
+                }
+            }
+
+            limiters.sort_by(|lhs, rhs| lhs.0.total_cmp(&rhs.0));
+            if limiters.is_empty() {
+                return "--".to_string();
+            }
+            limiters
+                .into_iter()
+                .take(6)
+                .map(|(alpha, label)| format!("a={alpha:.17e} {label}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        }
+
+        fn ipopt_direct_primal_fraction_to_boundary_limiters(
+            previous: &optimization::IpoptIterationSnapshot,
+            current: &optimization::IpoptIterationSnapshot,
+            bounds: &VariableBoundView,
+            tau: f64,
+            intervals: usize,
+            order: usize,
+        ) -> String {
+            let mut limiters = Vec::new();
+
+            for (index, maybe_lower) in bounds.lower.iter().enumerate() {
+                let Some(lower) = *maybe_lower else {
+                    continue;
+                };
+                let Some((&value, &delta)) =
+                    previous.x.get(index).zip(current.direction_x.get(index))
+                else {
+                    continue;
+                };
+                let slack_distance = value - lower;
+                if delta < 0.0 && slack_distance.is_finite() {
+                    let candidate = direct_fraction_candidate(tau, slack_distance, delta);
+                    if candidate.is_finite() {
+                        limiters.push((
+                            candidate,
+                            format!(
+                                "x lower {} value={slack_distance:.17e} dir={delta:.17e}",
+                                glider_decision_label(index, intervals, order)
+                            ),
+                        ));
+                    }
+                }
+            }
+            for (index, maybe_upper) in bounds.upper.iter().enumerate() {
+                let Some(upper) = *maybe_upper else {
+                    continue;
+                };
+                let Some((&value, &delta_x)) =
+                    previous.x.get(index).zip(current.direction_x.get(index))
+                else {
+                    continue;
+                };
+                let slack_distance = upper - value;
+                let slack_direction = -delta_x;
+                if slack_direction < 0.0 && slack_distance.is_finite() {
+                    let candidate = direct_fraction_candidate(tau, slack_distance, slack_direction);
+                    if candidate.is_finite() {
+                        limiters.push((
+                            candidate,
+                            format!(
+                                "x upper {} value={slack_distance:.17e} dir={slack_direction:.17e}",
+                                glider_decision_label(index, intervals, order)
+                            ),
+                        ));
+                    }
+                }
+            }
+
+            for (index, (&distance, &delta_s)) in previous
+                .kkt_slack_distance
+                .iter()
+                .zip(current.direction_slack.iter())
+                .enumerate()
+            {
+                let slack_direction = -delta_s;
+                if slack_direction < 0.0 && distance.is_finite() {
+                    let candidate = direct_fraction_candidate(tau, distance, slack_direction);
+                    if candidate.is_finite() {
+                        limiters.push((
+                            candidate,
+                            format!(
+                                "s upper {} value={distance:.17e} dir={slack_direction:.17e}",
+                                glider_inequality_label(index, intervals, order)
+                            ),
+                        ));
+                    }
+                }
+            }
+
+            limiters.sort_by(|lhs, rhs| lhs.0.total_cmp(&rhs.0));
+            if limiters.is_empty() {
+                return "--".to_string();
+            }
+            limiters
+                .into_iter()
+                .take(6)
+                .map(|(alpha, label)| format!("a={alpha:.17e} {label}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        }
+
         fn print_internal_ipopt_probe(
             index: usize,
             nlip_snapshot: &optimization::InteriorPointIterationSnapshot,
@@ -5345,6 +5548,27 @@ mod tests {
             println!("{label} internal IPOPT/NLIP state probes range={probe_start}..{probe_end}");
             for probe_index in probe_start..probe_end {
                 if probe_index > 0 {
+                    let tau = 0.99_f64.max(1.0 - ipopt_trace[probe_index].mu.max(0.0));
+                    println!(
+                        "          direct alpha_pr limiters: nlip={} || ipopt={}",
+                        nlip_direct_primal_fraction_to_boundary_limiters(
+                            &accepted_nlip_solver_snapshots[probe_index - 1],
+                            &accepted_nlip_solver_snapshots[probe_index],
+                            &accepted_ipopt_solver_snapshots[probe_index - 1],
+                            bounds,
+                            tau,
+                            intervals,
+                            order,
+                        ),
+                        ipopt_direct_primal_fraction_to_boundary_limiters(
+                            &accepted_ipopt_solver_snapshots[probe_index - 1],
+                            &accepted_ipopt_solver_snapshots[probe_index],
+                            bounds,
+                            tau,
+                            intervals,
+                            order,
+                        )
+                    );
                     println!(
                         "          ipopt alpha_pr limiters: {}",
                         ipopt_fraction_to_boundary_limiters(
