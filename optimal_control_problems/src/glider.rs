@@ -5373,6 +5373,8 @@ mod tests {
         let compiled = compiled.compiled.borrow();
         let runtime = dc_runtime(&params);
         let variable_bounds = variable_bound_view(&params);
+        let intervals = params.transcription.intervals;
+        let order = params.transcription.collocation_degree;
 
         let mut nlip_options = crate::common::nlip_options(&params.solver);
         optimization::apply_native_spral_parity_to_nlip_options(&mut nlip_options);
@@ -5392,6 +5394,12 @@ mod tests {
             .and_then(|value| value.parse::<i32>().ok())
         {
             ipopt_options.print_level = print_level;
+        }
+        if let Some(max_iters) = std::env::var("GLIDER_PARITY_IPOPT_MAX_ITERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            ipopt_options.max_iters = max_iters;
         }
 
         let mut nlip_initial_options = nlip_options.clone();
@@ -5501,6 +5509,32 @@ mod tests {
                 ipopt_initial.primal_inf,
                 ipopt_initial.dual_inf,
                 ipopt_initial.barrier_parameter,
+            );
+            println!(
+                "initial top eq_y diffs: {}",
+                top_vector_diffs(
+                    nlip_initial
+                        .solver
+                        .equality_multipliers
+                        .as_deref()
+                        .unwrap_or(&[]),
+                    &ipopt_initial.equality_multipliers,
+                    1.0,
+                    |index| format!("eq[{index}]"),
+                )
+            );
+            println!(
+                "initial top y_d diffs: {}",
+                top_vector_diffs(
+                    nlip_initial
+                        .solver
+                        .inequality_multipliers
+                        .as_deref()
+                        .unwrap_or(&[]),
+                    &ipopt_initial.inequality_multipliers,
+                    1.0,
+                    |index| glider_inequality_label(index, intervals, order),
+                )
             );
         }
 
