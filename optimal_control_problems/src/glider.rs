@@ -3838,15 +3838,7 @@ mod tests {
             rest[..end].trim().parse::<usize>().ok()
         }
 
-        fn print_ipopt_augmented_journal_fingerprints(journal_output: Option<&str>) {
-            if std::env::var_os("GLIDER_PARITY_PRINT_IPOPT_AUGMENTED_FINGERPRINTS").is_none() {
-                return;
-            }
-            let Some(journal) = journal_output else {
-                println!("ipopt augmented journal fingerprints unavailable");
-                return;
-            };
-
+        fn ipopt_augmented_journal_vectors(journal: &str) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
             let mut rhs_vectors: Vec<Vec<f64>> = Vec::new();
             let mut current_rhs = Vec::new();
             let mut sol_vectors: Vec<Vec<f64>> = Vec::new();
@@ -3899,6 +3891,19 @@ mod tests {
                 }
                 sol_vectors.push(solution);
             }
+            (rhs_vectors, sol_vectors)
+        }
+
+        fn print_ipopt_augmented_journal_fingerprints(journal_output: Option<&str>) {
+            if std::env::var_os("GLIDER_PARITY_PRINT_IPOPT_AUGMENTED_FINGERPRINTS").is_none() {
+                return;
+            }
+            let Some(journal) = journal_output else {
+                println!("ipopt augmented journal fingerprints unavailable");
+                return;
+            };
+
+            let (rhs_vectors, sol_vectors) = ipopt_augmented_journal_vectors(journal);
 
             let dims = sol_vectors
                 .first()
@@ -3933,6 +3938,154 @@ mod tests {
                 println!(
                     "  ipopt_sol[{index}] [{}] blocks[{blocks}]",
                     journal_vector_fingerprint_text(journal_vector_fingerprint(solution)),
+                );
+            }
+        }
+
+        fn journal_vector_diff_summary_text(lhs: &[f64], rhs: &[f64]) -> String {
+            if lhs.len() != rhs.len() {
+                return format!("len_mismatch lhs={} rhs={}", lhs.len(), rhs.len());
+            }
+            let mut first_bits_diff: Option<(usize, f64, f64)> = None;
+            let mut max_abs_diff = 0.0_f64;
+            let mut max_abs_index = 0;
+            for (index, (&lhs_i, &rhs_i)) in lhs.iter().zip(rhs.iter()).enumerate() {
+                if lhs_i.to_bits() != rhs_i.to_bits() && first_bits_diff.is_none() {
+                    first_bits_diff = Some((index, lhs_i, rhs_i));
+                }
+                let abs_diff = (lhs_i - rhs_i).abs();
+                if abs_diff > max_abs_diff {
+                    max_abs_diff = abs_diff;
+                    max_abs_index = index;
+                }
+            }
+            let first = first_bits_diff.map_or_else(
+                || "first_bits_diff=none".to_string(),
+                |(index, lhs_i, rhs_i)| {
+                    format!(
+                        "first_bits_diff=index={} lhs={:.17e}/{:016x} rhs={:.17e}/{:016x}",
+                        index,
+                        lhs_i,
+                        lhs_i.to_bits(),
+                        rhs_i,
+                        rhs_i.to_bits()
+                    )
+                },
+            );
+            format!(
+                "{first} max_abs_diff={:.17e} max_abs_index={max_abs_index}",
+                max_abs_diff
+            )
+        }
+
+        fn journal_vector_max_abs_diff(lhs: &[f64], rhs: &[f64]) -> f64 {
+            if lhs.len() != rhs.len() {
+                return f64::INFINITY;
+            }
+            lhs.iter()
+                .zip(rhs.iter())
+                .fold(0.0_f64, |acc, (&lhs_i, &rhs_i)| {
+                    acc.max((lhs_i - rhs_i).abs())
+                })
+        }
+
+        fn glider_augmented_fingerprint_iteration() -> usize {
+            std::env::var("GLIDER_PARITY_NLIP_AUGMENTED_ITER")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0)
+        }
+
+        fn print_nlip_augmented_dump_fingerprints(
+            dump_dir: Option<&TempDir>,
+            journal_output: Option<&str>,
+        ) {
+            if std::env::var_os("GLIDER_PARITY_PRINT_NLIP_AUGMENTED_FINGERPRINTS").is_none() {
+                return;
+            }
+            let Some(dump_dir) = dump_dir else {
+                println!("nlip augmented dump fingerprints unavailable");
+                return;
+            };
+            let dump_iteration = glider_augmented_fingerprint_iteration();
+            let path = dump_dir
+                .path()
+                .join(format!("nlip_kkt_iter_{dump_iteration:04}.txt"));
+            if !path.exists() {
+                println!(
+                    "nlip augmented dump fingerprints missing path={}",
+                    path.display()
+                );
+                return;
+            }
+            let dump = load_glider_linear_debug_dump(&path);
+            let dims = [
+                dump.x_dimension,
+                dump.inequality_dimension,
+                dump.equality_dimension,
+                dump.inequality_dimension,
+            ];
+            println!(
+                "nlip augmented dump fingerprints matrix_dim={} rhs_len={} values_len={} p_offset={} lambda_offset={} z_offset={}",
+                dump.matrix_dimension,
+                dump.rhs.len(),
+                dump.values.len(),
+                dump.p_offset,
+                dump.lambda_offset,
+                dump.z_offset,
+            );
+            println!(
+                "  nlip_rhs_final [{}] blocks[{}]",
+                journal_vector_fingerprint_text(journal_vector_fingerprint(&dump.rhs)),
+                journal_augmented_block_fingerprint_text(&dump.rhs, &dims),
+            );
+            let prefinal_rhs = dump.rhs.iter().map(|value| -*value).collect::<Vec<_>>();
+            println!(
+                "  nlip_rhs_prefinal [{}] blocks[{}]",
+                journal_vector_fingerprint_text(journal_vector_fingerprint(&prefinal_rhs)),
+                journal_augmented_block_fingerprint_text(&prefinal_rhs, &dims),
+            );
+            let Some(journal) = journal_output else {
+                return;
+            };
+            let (ipopt_rhs_vectors, _) = ipopt_augmented_journal_vectors(journal);
+            let Some(ipopt_prefinal_rhs) = ipopt_rhs_vectors.get(1) else {
+                return;
+            };
+            println!(
+                "  nlip_vs_ipopt_rhs[1] {}",
+                journal_vector_diff_summary_text(&prefinal_rhs, ipopt_prefinal_rhs)
+            );
+            let mut start = 0;
+            for (name, len) in [
+                ("x", dims[0]),
+                ("p", dims[1]),
+                ("lambda", dims[2]),
+                ("z", dims[3]),
+            ] {
+                let end = start + len;
+                if prefinal_rhs.len() >= end && ipopt_prefinal_rhs.len() >= end {
+                    println!(
+                        "    block_{name} {}",
+                        journal_vector_diff_summary_text(
+                            &prefinal_rhs[start..end],
+                            &ipopt_prefinal_rhs[start..end],
+                        )
+                    );
+                }
+                start = end;
+            }
+            let mut ranked_rhs = ipopt_rhs_vectors
+                .iter()
+                .enumerate()
+                .map(|(index, rhs)| (index, journal_vector_max_abs_diff(&prefinal_rhs, rhs)))
+                .collect::<Vec<_>>();
+            ranked_rhs.sort_by(|lhs, rhs| lhs.1.total_cmp(&rhs.1).then(lhs.0.cmp(&rhs.0)));
+            for (rank, (index, max_abs_diff)) in ranked_rhs.iter().take(4).enumerate() {
+                let ipopt_rhs = &ipopt_rhs_vectors[*index];
+                println!(
+                    "  nlip_best_rhs_match[{rank}] ipopt_rhs[{index}] max_abs_diff={max_abs_diff:.17e} {}",
+                    journal_vector_diff_summary_text(&prefinal_rhs, ipopt_rhs),
                 );
             }
         }
@@ -6205,10 +6358,15 @@ mod tests {
         nlip_options.max_iters = 400;
         nlip_options.acceptable_iter = 0;
         nlip_options.verbose = false;
+        let nlip_augmented_dump_dir =
+            std::env::var_os("GLIDER_PARITY_PRINT_NLIP_AUGMENTED_FINGERPRINTS")
+                .map(|_| TempDir::new().expect("NLIP augmented fingerprint dump dir"));
         nlip_options.linear_debug = Some(optimization::InteriorPointLinearDebugOptions {
             compare_solvers: Vec::new(),
             schedule: optimization::InteriorPointLinearDebugSchedule::EveryIteration,
-            dump_dir: None,
+            dump_dir: nlip_augmented_dump_dir
+                .as_ref()
+                .map(|dir| dir.path().to_path_buf()),
         });
 
         let mut ipopt_options = crate::common::ipopt_options(&params.solver);
@@ -6306,6 +6464,10 @@ mod tests {
         };
         print_ipopt_linear_journal_excerpt(ipopt_journal_output);
         print_ipopt_augmented_journal_fingerprints(ipopt_journal_output);
+        print_nlip_augmented_dump_fingerprints(
+            nlip_augmented_dump_dir.as_ref(),
+            ipopt_journal_output,
+        );
         let ipopt_step_tags = parse_ipopt_step_tags(ipopt_journal_output);
 
         if let (Some(nlip_initial), Some(ipopt_initial)) = (
