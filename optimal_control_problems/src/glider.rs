@@ -4298,7 +4298,7 @@ mod tests {
             let mut diffs = (0..count)
                 .map(|index| {
                     let nlip_internal_ds =
-                        -(nlip_slack[index] - prev_nlip_slack[index]) / nlip_alpha_pr;
+                        (nlip_slack[index] - prev_nlip_slack[index]) / nlip_alpha_pr;
                     let nlip_actual_dv = (nlip_v[index] - prev_nlip_v[index]) / nlip_alpha_du;
 
                     let ipopt_internal_ds = (ipopt.internal_slack[index]
@@ -4828,6 +4828,10 @@ mod tests {
             order: usize,
         ) {
             let nlip_slack_primal = nlip_snapshot.slack_primal.as_deref().unwrap_or(&[]);
+            let nlip_slack_distance = nlip_slack_primal
+                .iter()
+                .map(|value| -*value)
+                .collect::<Vec<_>>();
             let nlip_eq = nlip_snapshot.equality_multipliers.as_deref().unwrap_or(&[]);
             let nlip_ineq = nlip_snapshot
                 .inequality_multipliers
@@ -4870,7 +4874,11 @@ mod tests {
                 vector_inf_diff(&nlip_snapshot.x, &ipopt_snapshot.x, 1.0),
                 vector_inf_diff(nlip_slack_primal, &ipopt_snapshot.internal_slack, 1.0),
                 vector_inf_diff(nlip_slack_primal, &ipopt_snapshot.internal_slack, -1.0),
-                vector_inf_diff(nlip_slack_primal, &ipopt_snapshot.kkt_slack_distance, 1.0),
+                vector_inf_diff(
+                    &nlip_slack_distance,
+                    &ipopt_snapshot.kkt_slack_distance,
+                    1.0
+                ),
                 vector_inf_diff(nlip_eq, &ipopt_snapshot.equality_multipliers, 1.0),
                 vector_inf_diff(nlip_ineq, &ipopt_snapshot.inequality_multipliers, 1.0),
                 vector_inf_diff(nlip_ineq, &ipopt_snapshot.inequality_multipliers, -1.0),
@@ -4914,11 +4922,11 @@ mod tests {
                 )
             );
             println!(
-                "          top internal slack diffs (opposite sign): {}",
+                "          top upper-slack distance diffs: {}",
                 top_vector_diffs(
-                    nlip_slack_primal,
-                    &ipopt_snapshot.internal_slack,
-                    -1.0,
+                    &nlip_slack_distance,
+                    &ipopt_snapshot.kkt_slack_distance,
+                    1.0,
                     |idx| glider_inequality_label(idx, intervals, order),
                 )
             );

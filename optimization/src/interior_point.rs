@@ -2358,15 +2358,15 @@ fn newton_direction_from_augmented_solution(
     let d_ineq = solution
         [snapshot.augmented_pattern.z_offset..snapshot.augmented_pattern.z_offset + mineq]
         .to_vec();
-    let ds = ipopt_ds.iter().map(|value| -*value).collect::<Vec<_>>();
+    let ds = ipopt_ds;
     let dz = snapshot
         .r_cent
         .iter()
         .zip(snapshot.multipliers.iter())
         .zip(snapshot.slack.iter())
-        .zip(ipopt_ds.iter())
-        .map(|(((r_cent_i, z_i), s_i), ipopt_ds_i)| {
-            ipopt_upper_slack_bound_multiplier_step(*s_i, *z_i, *r_cent_i, *ipopt_ds_i)
+        .zip(ds.iter())
+        .map(|(((r_cent_i, z_i), s_i), ds_i)| {
+            ipopt_upper_slack_bound_multiplier_step(*s_i, *z_i, *r_cent_i, *ds_i)
         })
         .collect::<Vec<_>>();
     NewtonDirection {
@@ -2831,7 +2831,7 @@ fn slack_form_inequality_residuals(augmented_inequality_values: &[f64], slack: &
     augmented_inequality_values
         .iter()
         .zip(slack.iter())
-        .map(|(&g_i, &s_i)| g_i + s_i)
+        .map(|(&g_i, &s_i)| g_i - s_i)
         .collect()
 }
 
@@ -2840,7 +2840,7 @@ fn slack_form_inequality_l1_norm(augmented_inequality_values: &[f64], slack: &[f
     augmented_inequality_values
         .iter()
         .zip(slack.iter())
-        .map(|(&g_i, &s_i)| (g_i + s_i).abs())
+        .map(|(&g_i, &s_i)| (g_i - s_i).abs())
         .sum()
 }
 
@@ -2849,7 +2849,7 @@ fn slack_form_inequality_inf_norm(augmented_inequality_values: &[f64], slack: &[
     augmented_inequality_values
         .iter()
         .zip(slack.iter())
-        .fold(0.0, |acc, (&g_i, &s_i)| acc.max((g_i + s_i).abs()))
+        .fold(0.0, |acc, (&g_i, &s_i)| acc.max((g_i - s_i).abs()))
 }
 
 fn filter_theta_l1_norm(
@@ -2895,7 +2895,16 @@ fn relax_augmented_inequality_values(values: &mut [f64], options: &InteriorPoint
 }
 
 fn slack_barrier_values(slack: &[f64]) -> Vec<f64> {
-    slack.to_vec()
+    // NLIP stores inequality slacks in IPOPT's internal upper-bound
+    // convention for the shifted zero-bound row: g_relaxed(x) - s = 0 and
+    // s <= 0.  IPOPT's barrier, complementarity, and sigma routines operate
+    // on curr_slack_s_U = d_U - s; with shifted d_U = 0, that distance is -s.
+    // See IpIpoptCalculatedQuantities.cpp::curr_slack_s_U/curr_sigma_s.
+    slack.iter().map(|value| -*value).collect()
+}
+
+fn slack_barrier_direction_values(slack_direction: &[f64]) -> Vec<f64> {
+    slack_direction.iter().map(|value| -*value).collect()
 }
 
 fn native_bound_log_sum(x: &[f64], bounds: &BoundConstraints) -> f64 {
@@ -2976,9 +2985,9 @@ fn ipopt_upper_slack_bound_multiplier_step(
 ) -> f64 {
     // Mirrors IPOPT PDFullSpaceSolver::SolveOnce Pd_U.SinvBlrmZMTdBr(1., ...)
     // followed by PDSearchDirCalc's Solve(-1., 0., ...) final scaling:
-    // delta_v_U = (-rhs.v_U + v_U * delta_s) / slack_s_U. NLIP's public slack
-    // direction is sign-flipped for the upper-slack distance, so this takes
-    // the raw IPOPT-internal augmented-system slack component.
+    // delta_v_U = (-rhs.v_U + v_U * delta_s) / slack_s_U. NLIP now stores the
+    // raw IPOPT-internal upper-bound slack component and converts separately
+    // when a positive upper-slack distance is needed.
     (-complementarity_residual + multiplier * ipopt_internal_slack_step) / slack
 }
 
@@ -4051,13 +4060,14 @@ fn initialise_slacks(
 ) {
     debug_assert_eq!(augmented_inequality_values.len(), slack.len());
     for (&g_i, s_i) in augmented_inequality_values.iter().zip(slack.iter_mut()) {
-        *s_i = push_scalar_to_bounds_interior(
+        let upper_slack_distance = push_scalar_to_bounds_interior(
             (-g_i).max(0.0),
             Some(0.0),
             None,
             options.slack_bound_push,
             options.slack_bound_frac,
         );
+        *s_i = -upper_slack_distance;
     }
 }
 
@@ -6752,7 +6762,7 @@ fn solve_reduced_kkt_with_spral_src(
                 let ipopt_ds = solution
                     [workspace.pattern.p_offset..workspace.pattern.p_offset + mineq]
                     .to_vec();
-                let ds = ipopt_ds.iter().map(|value| -*value).collect::<Vec<_>>();
+                let ds = ipopt_ds;
                 let d_lambda = solution
                     [workspace.pattern.lambda_offset..workspace.pattern.lambda_offset + meq]
                     .to_vec();
@@ -6764,9 +6774,9 @@ fn solve_reduced_kkt_with_spral_src(
                     .iter()
                     .zip(system.multipliers.iter())
                     .zip(system.slack.iter())
-                    .zip(ipopt_ds.iter())
-                    .map(|(((r_cent_i, z_i), s_i), ipopt_ds_i)| {
-                        ipopt_upper_slack_bound_multiplier_step(*s_i, *z_i, *r_cent_i, *ipopt_ds_i)
+                    .zip(ds.iter())
+                    .map(|(((r_cent_i, z_i), s_i), ds_i)| {
+                        ipopt_upper_slack_bound_multiplier_step(*s_i, *z_i, *r_cent_i, *ds_i)
                     })
                     .collect::<Vec<_>>();
                 return Ok(NewtonDirection {
@@ -6911,7 +6921,7 @@ fn solve_reduced_kkt_with_spral_ssids(
                 let ipopt_ds = solution
                     [workspace.pattern.p_offset..workspace.pattern.p_offset + mineq]
                     .to_vec();
-                let ds = ipopt_ds.iter().map(|value| -*value).collect::<Vec<_>>();
+                let ds = ipopt_ds;
                 let d_lambda = solution
                     [workspace.pattern.lambda_offset..workspace.pattern.lambda_offset + meq]
                     .to_vec();
@@ -6923,9 +6933,9 @@ fn solve_reduced_kkt_with_spral_ssids(
                     .iter()
                     .zip(system.multipliers.iter())
                     .zip(system.slack.iter())
-                    .zip(ipopt_ds.iter())
-                    .map(|(((r_cent_i, z_i), s_i), ipopt_ds_i)| {
-                        ipopt_upper_slack_bound_multiplier_step(*s_i, *z_i, *r_cent_i, *ipopt_ds_i)
+                    .zip(ds.iter())
+                    .map(|(((r_cent_i, z_i), s_i), ds_i)| {
+                        ipopt_upper_slack_bound_multiplier_step(*s_i, *z_i, *r_cent_i, *ds_i)
                     })
                     .collect::<Vec<_>>();
                 return Ok(NewtonDirection {
@@ -7090,7 +7100,7 @@ fn solve_reduced_kkt_with_sparse_qdldl(
             let ds = jacobian_dx
                 .iter()
                 .zip(system.r_ineq.iter())
-                .map(|(gdx_i, r_ineq_i)| -r_ineq_i - gdx_i)
+                .map(|(gdx_i, r_ineq_i)| r_ineq_i + gdx_i)
                 .collect::<Vec<_>>();
             let d_ineq = ds
                 .iter()
@@ -7099,8 +7109,9 @@ fn solve_reduced_kkt_with_sparse_qdldl(
                 .zip(system.slack.iter())
                 .enumerate()
                 .map(|(index, (((ds_i, r_cent_i), z_i), s_i))| {
-                    (-r_cent_i + s_i * damped_slack_stationarity_residual(system, index)
-                        - z_i * ds_i)
+                    (-r_cent_i
+                        + s_i * damped_slack_stationarity_residual(system, index)
+                        + z_i * ds_i)
                         / s_i
                 })
                 .collect::<Vec<_>>();
@@ -7194,7 +7205,7 @@ fn solve_reduced_kkt_with_sparse_qdldl(
                     let ds = jacobian_dx
                         .iter()
                         .zip(system.r_ineq.iter())
-                        .map(|(gdx_i, r_ineq_i)| -r_ineq_i - gdx_i)
+                        .map(|(gdx_i, r_ineq_i)| r_ineq_i + gdx_i)
                         .collect::<Vec<_>>();
                     let d_ineq = ds
                         .iter()
@@ -7203,8 +7214,9 @@ fn solve_reduced_kkt_with_sparse_qdldl(
                         .zip(system.slack.iter())
                         .enumerate()
                         .map(|(index, (((ds_i, r_cent_i), z_i), s_i))| {
-                            (-r_cent_i + s_i * damped_slack_stationarity_residual(system, index)
-                                - z_i * ds_i)
+                            (-r_cent_i
+                                + s_i * damped_slack_stationarity_residual(system, index)
+                                + z_i * ds_i)
                                 / s_i
                         })
                         .collect::<Vec<_>>();
@@ -9575,10 +9587,11 @@ where
 
         let fraction_to_boundary_tau =
             current_fraction_to_boundary_tau(barrier_parameter_value, options);
+        let slack_barrier_direction = slack_barrier_direction_values(&direction.ds);
         let (slack_alpha_pr, slack_alpha_pr_limiter) = if augmented_inequality_count > 0 {
             fraction_to_boundary_with_limiter(
                 &slack_barrier,
-                &direction.ds,
+                &slack_barrier_direction,
                 fraction_to_boundary_tau,
                 InteriorPointBoundaryLimiterKind::Slack,
             )
@@ -9702,7 +9715,7 @@ where
             &x,
             &bounds,
             &direction.dx,
-            &direction.ds,
+            &slack_barrier_direction,
             barrier_parameter_value,
             options.kappa_d,
         );
@@ -10279,9 +10292,11 @@ where
                     soc_direction.dz_upper = soc_dz_upper;
 
                     let (soc_slack_alpha_pr, _) = if augmented_inequality_count > 0 {
+                        let soc_slack_barrier_direction =
+                            slack_barrier_direction_values(&soc_direction.ds);
                         fraction_to_boundary_with_limiter(
                             &slack_barrier,
-                            &soc_direction.ds,
+                            &soc_slack_barrier_direction,
                             fraction_to_boundary_tau,
                             InteriorPointBoundaryLimiterKind::Slack,
                         )

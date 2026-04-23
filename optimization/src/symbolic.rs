@@ -2847,8 +2847,9 @@ impl AppliedNlpScaling {
             self.unscale_inequality_multipliers(&snapshot.slack_lower_bound_multipliers);
         snapshot.slack_upper_bound_multipliers =
             self.unscale_inequality_multipliers(&snapshot.slack_upper_bound_multipliers);
-        // KKT diagnostic vectors remain in IPOPT's internal solver units. Only the slack distance
-        // is state-like and is scaled back for direct comparison against NLIP's positive slack.
+        // KKT diagnostic vectors remain in IPOPT's internal solver units. The slack distance is
+        // state-like and is scaled back for direct comparison against NLIP's internal slack via
+        // the upper-bound distance conversion.
         snapshot.kkt_slack_distance = self.unscale_inequality_values(&snapshot.kkt_slack_distance);
         snapshot.objective = self.unscale_objective(snapshot.objective);
         snapshot
