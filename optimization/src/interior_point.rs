@@ -6920,6 +6920,17 @@ fn append_quasidefinite_dual_diagonal(
     }
 }
 
+fn ipopt_augmented_diagonal_with_shift(diagonal: f64, shift: f64) -> f64 {
+    // Mirrors IpStdAugSystemSolver.cpp::CreateAugmentedSystem: D_x and D_s
+    // are copied first, then `AddScalar(delta_*)` is applied before the
+    // diagonal matrix term is coalesced into the augmented KKT structure.
+    if shift == 0.0 {
+        diagonal
+    } else {
+        diagonal + shift
+    }
+}
+
 fn fill_spral_augmented_kkt_values(
     pattern: &SpralAugmentedKktPattern,
     values: &mut [f64],
@@ -6933,8 +6944,10 @@ fn fill_spral_augmented_kkt_values(
         values[slot] += system.hessian.values[index];
     }
     for (index, &slot) in pattern.x_diagonal_indices.iter().enumerate() {
-        values[slot] += primal_shift;
-        values[slot] += system.bound_diagonal.get(index).copied().unwrap_or(0.0);
+        values[slot] += ipopt_augmented_diagonal_with_shift(
+            system.bound_diagonal.get(index).copied().unwrap_or(0.0),
+            primal_shift,
+        );
     }
     for (index, &slot) in pattern.equality_jacobian_value_indices.iter().enumerate() {
         values[slot] += system.equality_jacobian.values[index];
@@ -6943,7 +6956,10 @@ fn fill_spral_augmented_kkt_values(
         values[slot] += system.inequality_jacobian.values[index];
     }
     for (index, &slot) in pattern.p_diagonal_indices.iter().enumerate() {
-        values[slot] += system.multipliers[index] / system.slack[index] + slack_shift;
+        values[slot] += ipopt_augmented_diagonal_with_shift(
+            system.multipliers[index] / system.slack[index],
+            slack_shift,
+        );
     }
     for &slot in &pattern.lambda_diagonal_indices {
         values[slot] += -dual_shift;
@@ -9038,6 +9054,19 @@ mod tests {
 
         assert_eq!(ipopt_order.to_bits(), (-0.0_f64).to_bits());
         assert_eq!(old_nlip_order.to_bits(), 0.0_f64.to_bits());
+    }
+
+    #[test]
+    fn augmented_diagonal_shift_groups_like_ipopt() {
+        let hessian_diagonal = 1.0e16;
+        let diagonal = 1.0;
+        let shift = -1.0e16;
+
+        let ipopt_order = hessian_diagonal + ipopt_augmented_diagonal_with_shift(diagonal, shift);
+        let old_nlip_order = (hessian_diagonal + shift) + diagonal;
+
+        assert_eq!(ipopt_order.to_bits(), 0.0_f64.to_bits());
+        assert_eq!(old_nlip_order.to_bits(), 1.0_f64.to_bits());
     }
 
     #[test]

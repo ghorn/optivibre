@@ -3835,6 +3835,237 @@ mod tests {
                 .and_then(|(_, value)| value.trim().parse::<f64>().ok())
         }
 
+        fn journal_first_value_after_equals(line: &str) -> Option<f64> {
+            let after_equals = line.split_once('=')?.1;
+            after_equals.split_whitespace().next()?.parse::<f64>().ok()
+        }
+
+        fn journal_kkt_component(line: &str) -> Option<(usize, usize)> {
+            let start = line.find("KKT[")? + "KKT[".len();
+            let first_end = line[start..].find(']')? + start;
+            let row_block = line[start..first_end].parse::<usize>().ok()?;
+            let second_start = line[first_end + 1..].find('[')? + first_end + 2;
+            let second_end = line[second_start..].find(']')? + second_start;
+            let col_block = line[second_start..second_end].parse::<usize>().ok()?;
+            Some((row_block, col_block))
+        }
+
+        fn journal_kkt_entry(line: &str) -> Option<(usize, usize, usize, usize, f64)> {
+            let (block_row, block_col) = journal_kkt_component(line)?;
+            let (local_row, local_col, value) = journal_kkt_local_entry(line)?;
+            Some((block_row, block_col, local_row, local_col, value))
+        }
+
+        fn journal_kkt_local_entry(line: &str) -> Option<(usize, usize, f64)> {
+            let equals = line.find('=')?;
+            let index_start = line[..equals].rfind('[')? + 1;
+            let index_end = line[index_start..equals].find(']')? + index_start;
+            let indices = &line[index_start..index_end];
+            let (row, col) = indices
+                .split_once(',')
+                .map_or((indices, indices), |(row, col)| (row, col));
+            let value = journal_first_value_after_equals(line)?;
+            Some((
+                row.trim().parse::<usize>().ok()?,
+                col.trim().parse::<usize>().ok()?,
+                value,
+            ))
+        }
+
+        fn journal_kkt_global_entry(line: &str, dims: &[usize; 4]) -> Option<(usize, usize, f64)> {
+            let (block_row, block_col, local_row, local_col, value) = journal_kkt_entry(line)?;
+            let row_offset = dims.iter().take(block_row).sum::<usize>();
+            let col_offset = dims.iter().take(block_col).sum::<usize>();
+            let row = row_offset + local_row.checked_sub(1)?;
+            let col = col_offset + local_col.checked_sub(1)?;
+            Some((row.min(col), row.max(col), value))
+        }
+
+        fn append_journal_kkt_identity_entries(
+            line: &str,
+            dims: &[usize; 4],
+            triplets: &mut Vec<(usize, usize, f64)>,
+        ) {
+            if !line.contains("IdentityMatrix") || !line.contains("the factor") {
+                return;
+            }
+            let Some((block_row, block_col)) = journal_kkt_component(line) else {
+                return;
+            };
+            let Some((_, factor_text)) = line.rsplit_once("the factor") else {
+                return;
+            };
+            let Some(factor) = factor_text.trim_end_matches('.').trim().parse::<f64>().ok() else {
+                return;
+            };
+            let row_offset = dims.iter().take(block_row).sum::<usize>();
+            let col_offset = dims.iter().take(block_col).sum::<usize>();
+            for index in 0..dims[block_row].min(dims[block_col]) {
+                let row = row_offset + index;
+                let col = col_offset + index;
+                triplets.push((row.min(col), row.max(col), factor));
+            }
+        }
+
+        fn append_journal_kkt_zero_diagonal_entries(
+            line: &str,
+            dims: &[usize; 4],
+            triplets: &mut Vec<(usize, usize, f64)>,
+        ) {
+            if !line.contains("DiagMatrix")
+                || !(line.contains("\"KKT[2][2]\"") || line.contains("\"KKT[3][3]\""))
+            {
+                return;
+            }
+            let Some((block_row, block_col)) = journal_kkt_component(line) else {
+                return;
+            };
+            let offset = dims.iter().take(block_row).sum::<usize>();
+            for index in 0..dims[block_row].min(dims[block_col]) {
+                let diag = offset + index;
+                triplets.push((diag, diag, 0.0));
+            }
+        }
+
+        fn compressed_journal_kkt_values(
+            mut triplets: Vec<(usize, usize, f64)>,
+        ) -> Vec<((usize, usize), f64)> {
+            // Mirrors IpTripletToCSRConverter.cpp: sort by triangular key,
+            // take the first triplet value, then add duplicate triplets.
+            triplets.sort_by(|lhs, rhs| lhs.0.cmp(&rhs.0).then(lhs.1.cmp(&rhs.1)));
+            let mut compressed = Vec::new();
+            for (row, col, value) in triplets {
+                if let Some((last_key, last_value)) = compressed.last_mut()
+                    && *last_key == (row, col)
+                {
+                    *last_value += value;
+                    continue;
+                }
+                compressed.push(((row, col), value));
+            }
+            compressed
+        }
+
+        fn ipopt_augmented_journal_kkt_values(
+            journal: &str,
+            dims: &[usize; 4],
+        ) -> Vec<Vec<((usize, usize), f64)>> {
+            let mut matrices = Vec::new();
+            let mut current_triplets = Vec::new();
+            let mut in_kkt = false;
+            let mut current_component: Option<(usize, usize)> = None;
+            for line in journal.lines() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("CompoundSymMatrix \"KKT\"") {
+                    if !current_triplets.is_empty() {
+                        matrices.push(compressed_journal_kkt_values(std::mem::take(
+                            &mut current_triplets,
+                        )));
+                    }
+                    in_kkt = true;
+                    current_component = None;
+                    continue;
+                }
+                if !in_kkt {
+                    continue;
+                }
+                if trimmed.contains("\"KKT[")
+                    && let Some(component) = journal_kkt_component(trimmed)
+                {
+                    current_component = Some(component);
+                }
+                append_journal_kkt_identity_entries(trimmed, dims, &mut current_triplets);
+                append_journal_kkt_zero_diagonal_entries(trimmed, dims, &mut current_triplets);
+                if let Some(entry) = journal_kkt_global_entry(trimmed, dims) {
+                    current_triplets.push(entry);
+                } else if trimmed.contains("Term:")
+                    && let (Some((block_row, block_col)), Some((local_row, local_col, value))) =
+                        (current_component, journal_kkt_local_entry(trimmed))
+                {
+                    let row_offset = dims.iter().take(block_row).sum::<usize>();
+                    let col_offset = dims.iter().take(block_col).sum::<usize>();
+                    let row = row_offset + local_row.saturating_sub(1);
+                    let col = col_offset + local_col.saturating_sub(1);
+                    current_triplets.push((row.min(col), row.max(col), value));
+                }
+            }
+            if !current_triplets.is_empty() {
+                matrices.push(compressed_journal_kkt_values(current_triplets));
+            }
+            matrices
+        }
+
+        fn dump_kkt_keys(dump: &GliderLinearDebugDump) -> Vec<(usize, usize)> {
+            let mut keys = Vec::with_capacity(dump.row_indices.len());
+            for col in 0..dump.matrix_dimension {
+                for index in dump.col_ptrs[col]..dump.col_ptrs[col + 1] {
+                    keys.push((col, dump.row_indices[index]));
+                }
+            }
+            keys
+        }
+
+        fn journal_kkt_diff_summary_text(
+            dump: &GliderLinearDebugDump,
+            ipopt_matrix: &[((usize, usize), f64)],
+        ) -> String {
+            let dump_keys = dump_kkt_keys(dump);
+            if dump_keys.len() != ipopt_matrix.len() {
+                return format!(
+                    "len_mismatch nlip={} ipopt={}",
+                    dump_keys.len(),
+                    ipopt_matrix.len()
+                );
+            }
+            let mut first_structure_diff = None;
+            let mut first_bits_diff = None;
+            let mut max_abs_diff = 0.0_f64;
+            let mut max_abs_index = 0;
+            for (index, ((dump_key, &nlip_value), &(ipopt_key, ipopt_value))) in dump_keys
+                .iter()
+                .zip(dump.values.iter())
+                .zip(ipopt_matrix.iter())
+                .enumerate()
+            {
+                if *dump_key != ipopt_key && first_structure_diff.is_none() {
+                    first_structure_diff = Some((index, *dump_key, ipopt_key));
+                }
+                if nlip_value.to_bits() != ipopt_value.to_bits() && first_bits_diff.is_none() {
+                    first_bits_diff = Some((index, nlip_value, ipopt_value));
+                }
+                let abs_diff = (nlip_value - ipopt_value).abs();
+                if abs_diff > max_abs_diff {
+                    max_abs_diff = abs_diff;
+                    max_abs_index = index;
+                }
+            }
+            let structure = first_structure_diff.map_or_else(
+                || "first_structure_diff=none".to_string(),
+                |(index, nlip_key, ipopt_key)| {
+                    format!(
+                        "first_structure_diff=index={index} nlip=({},{}) ipopt=({},{})",
+                        nlip_key.0, nlip_key.1, ipopt_key.0, ipopt_key.1
+                    )
+                },
+            );
+            let first = first_bits_diff.map_or_else(
+                || "first_bits_diff=none".to_string(),
+                |(index, lhs_i, rhs_i)| {
+                    format!(
+                        "first_bits_diff=index={} lhs={:.17e}/{:016x} rhs={:.17e}/{:016x}",
+                        index,
+                        lhs_i,
+                        lhs_i.to_bits(),
+                        rhs_i,
+                        rhs_i.to_bits()
+                    )
+                },
+            );
+            format!(
+                "{structure} {first} max_abs_diff={max_abs_diff:.17e} max_abs_index={max_abs_index}"
+            )
+        }
+
         fn journal_sol_component(line: &str) -> Option<usize> {
             let start = line.find("SOL[ 0][")? + "SOL[ 0][".len();
             let rest = &line[start..];
@@ -4060,6 +4291,16 @@ mod tests {
             let Some(journal) = journal_output else {
                 return;
             };
+            let ipopt_matrices = ipopt_augmented_journal_kkt_values(journal, &dims);
+            println!("  ipopt_kkt_matrix_count={}", ipopt_matrices.len());
+            for (rank, matrix) in ipopt_matrices.iter().take(4).enumerate() {
+                let values = matrix.iter().map(|(_, value)| *value).collect::<Vec<_>>();
+                println!(
+                    "  nlip_vs_ipopt_kkt[{rank}] [{}] {}",
+                    journal_vector_fingerprint_text(journal_vector_fingerprint(&values)),
+                    journal_kkt_diff_summary_text(&dump, matrix),
+                );
+            }
             let (ipopt_rhs_vectors, _) = ipopt_augmented_journal_vectors(journal);
             let Some(ipopt_prefinal_rhs) = ipopt_rhs_vectors.get(1) else {
                 return;
