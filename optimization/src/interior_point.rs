@@ -4268,6 +4268,24 @@ fn sparse_add_transpose_mat_vec(out: &mut [f64], matrix: &SparseMatrix, vector: 
     }
 }
 
+fn sparse_add_transpose_mat_vec_ipopt_order(
+    out: &mut [f64],
+    matrix: &SparseMatrix,
+    vector: &[f64],
+) {
+    debug_assert_eq!(matrix.nrows(), vector.len());
+    debug_assert_eq!(matrix.ncols(), out.len());
+    // IpGenTMatrix.cpp::TransMultVectorImpl accumulates directly into y in
+    // the stored triplet order.  The source-built parity path receives the
+    // same column-major triplets from ccs_triplet_indices, so avoid changing
+    // rounding by first reducing each column into a temporary dot product.
+    for (col, out_col) in out.iter_mut().enumerate().take(matrix.ncols()) {
+        for index in matrix.structure.ccs.col_ptrs[col]..matrix.structure.ccs.col_ptrs[col + 1] {
+            *out_col += matrix.values[index] * vector[matrix.structure.ccs.row_indices[index]];
+        }
+    }
+}
+
 fn sparse_mat_vec(matrix: &SparseMatrix, vector: &[f64]) -> Vec<f64> {
     debug_assert_eq!(matrix.ncols(), vector.len());
     let mut product = vec![0.0; matrix.nrows()];
@@ -4275,6 +4293,19 @@ fn sparse_mat_vec(matrix: &SparseMatrix, vector: &[f64]) -> Vec<f64> {
         if x == 0.0 {
             continue;
         }
+        for index in matrix.structure.ccs.col_ptrs[col]..matrix.structure.ccs.col_ptrs[col + 1] {
+            product[matrix.structure.ccs.row_indices[index]] += matrix.values[index] * x;
+        }
+    }
+    product
+}
+
+fn sparse_mat_vec_ipopt_order(matrix: &SparseMatrix, vector: &[f64]) -> Vec<f64> {
+    debug_assert_eq!(matrix.ncols(), vector.len());
+    let mut product = vec![0.0; matrix.nrows()];
+    // IpGenTMatrix.cpp::MultVectorImpl visits every stored nonzero in triplet
+    // order, even when the corresponding dense-vector entry is exactly zero.
+    for (col, &x) in vector.iter().enumerate().take(matrix.ncols()) {
         for index in matrix.structure.ccs.col_ptrs[col]..matrix.structure.ccs.col_ptrs[col + 1] {
             product[matrix.structure.ccs.row_indices[index]] += matrix.values[index] * x;
         }
@@ -4499,8 +4530,12 @@ fn lagrangian_gradient_sparse(
     let mut residual = gradient.to_vec();
     let mut equality_term = vec![0.0; gradient.len()];
     let mut inequality_term = vec![0.0; gradient.len()];
-    sparse_add_transpose_mat_vec(&mut equality_term, equality_jacobian, equality_multipliers);
-    sparse_add_transpose_mat_vec(
+    sparse_add_transpose_mat_vec_ipopt_order(
+        &mut equality_term,
+        equality_jacobian,
+        equality_multipliers,
+    );
+    sparse_add_transpose_mat_vec_ipopt_order(
         &mut inequality_term,
         inequality_jacobian,
         inequality_multipliers,
@@ -5134,7 +5169,9 @@ struct IpoptRefinementReport {
     residual_ratio: f64,
     final_residual: IpoptFullSpaceResidualMetrics,
     first_correction_rhs: Option<VectorFingerprint>,
+    first_correction_rhs_blocks: Option<IpoptAugmentedBlockFingerprints>,
     first_correction_solution: Option<VectorFingerprint>,
+    first_correction_solution_blocks: Option<IpoptAugmentedBlockFingerprints>,
     failed: bool,
 }
 
@@ -5192,6 +5229,14 @@ struct VectorFingerprint {
     positive_zero_count: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct IpoptAugmentedBlockFingerprints {
+    x: VectorFingerprint,
+    p: VectorFingerprint,
+    lambda: VectorFingerprint,
+    z: VectorFingerprint,
+}
+
 fn vector_fingerprint(values: &[f64]) -> VectorFingerprint {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -5231,6 +5276,37 @@ fn vector_fingerprint_text(fingerprint: VectorFingerprint) -> String {
         fingerprint.hash,
         fingerprint.negative_zero_count,
         fingerprint.positive_zero_count,
+    )
+}
+
+fn ipopt_augmented_block_fingerprints(
+    pattern: &SpralAugmentedKktPattern,
+    values: &[f64],
+) -> IpoptAugmentedBlockFingerprints {
+    debug_assert_eq!(values.len(), pattern.dimension());
+    IpoptAugmentedBlockFingerprints {
+        x: vector_fingerprint(&values[..pattern.x_dimension]),
+        p: vector_fingerprint(
+            &values[pattern.p_offset..pattern.p_offset + pattern.inequality_dimension],
+        ),
+        lambda: vector_fingerprint(
+            &values[pattern.lambda_offset..pattern.lambda_offset + pattern.equality_dimension],
+        ),
+        z: vector_fingerprint(
+            &values[pattern.z_offset..pattern.z_offset + pattern.inequality_dimension],
+        ),
+    }
+}
+
+fn ipopt_augmented_block_fingerprints_text(
+    fingerprints: IpoptAugmentedBlockFingerprints,
+) -> String {
+    format!(
+        "x[{}],p[{}],lambda[{}],z[{}]",
+        vector_fingerprint_text(fingerprints.x),
+        vector_fingerprint_text(fingerprints.p),
+        vector_fingerprint_text(fingerprints.lambda),
+        vector_fingerprint_text(fingerprints.z),
     )
 }
 
@@ -5275,11 +5351,11 @@ fn ipopt_full_space_residual_ratio(
         &system.hessian.values,
         dx,
     );
-    sparse_add_transpose_mat_vec(&mut residual_x, system.equality_jacobian, d_lambda);
-    sparse_add_transpose_mat_vec(&mut residual_x, system.inequality_jacobian, d_ineq);
+    sparse_add_transpose_mat_vec_ipopt_order(&mut residual_x, system.equality_jacobian, d_lambda);
+    sparse_add_transpose_mat_vec_ipopt_order(&mut residual_x, system.inequality_jacobian, d_ineq);
 
-    let equality_dx = sparse_mat_vec(system.equality_jacobian, dx);
-    let inequality_dx = sparse_mat_vec(system.inequality_jacobian, dx);
+    let equality_dx = sparse_mat_vec_ipopt_order(system.equality_jacobian, dx);
+    let inequality_dx = sparse_mat_vec_ipopt_order(system.inequality_jacobian, dx);
     let mut augmented_correction_rhs = vec![0.0; pattern.dimension()];
 
     let mut rhs_inf = 0.0_f64;
@@ -5525,19 +5601,27 @@ fn refine_ipopt_full_space_solution<E>(
     let initial_residual = residual.metrics();
     let mut previous_residual_ratio = residual_ratio;
     let mut first_correction_rhs = None;
+    let mut first_correction_rhs_blocks = None;
     let mut first_correction_solution = None;
+    let mut first_correction_solution_blocks = None;
     let mut failed = false;
     while steps < IPOPT_LINEAR_MIN_REFINEMENT_STEPS
         || residual_ratio > IPOPT_LINEAR_RESIDUAL_RATIO_MAX
     {
         if steps == 0 {
             first_correction_rhs = Some(vector_fingerprint(&residual.augmented_correction_rhs));
+            first_correction_rhs_blocks = Some(ipopt_augmented_block_fingerprints(
+                pattern,
+                &residual.augmented_correction_rhs,
+            ));
         }
         let correction_started = Instant::now();
         let correction = solve_correction(&residual.augmented_correction_rhs)?;
         *solve_time += correction_started.elapsed();
         if steps == 0 {
             first_correction_solution = Some(vector_fingerprint(&correction));
+            first_correction_solution_blocks =
+                Some(ipopt_augmented_block_fingerprints(pattern, &correction));
         }
         for (solution_i, correction_i) in solution.iter_mut().zip(correction.iter()) {
             *solution_i -= correction_i;
@@ -5567,7 +5651,9 @@ fn refine_ipopt_full_space_solution<E>(
         residual_ratio,
         final_residual: residual.metrics(),
         first_correction_rhs,
+        first_correction_rhs_blocks,
         first_correction_solution,
+        first_correction_solution_blocks,
         failed,
     })
 }
@@ -6830,6 +6916,8 @@ fn factor_solve_spral_src(
         )
     })?;
     let pre_refinement_solution_fingerprint = vector_fingerprint(&solution);
+    let pre_refinement_solution_block_fingerprints =
+        ipopt_augmented_block_fingerprints(&workspace.pattern, &solution);
     let mut solve_time = solve_started.elapsed();
     let refinement = refine_ipopt_full_space_solution(
         system,
@@ -6849,8 +6937,10 @@ fn factor_solve_spral_src(
         },
     )?;
     let post_refinement_prefinal_solution_fingerprint = vector_fingerprint(&solution);
+    let post_refinement_prefinal_solution_block_fingerprints =
+        ipopt_augmented_block_fingerprints(&workspace.pattern, &solution);
     let native_factor_detail = format!(
-        "native_spral_factor[delays={} nfactor={} nflops={} maxfront={} two_by_two={} supernodes={} maxsuper={}]; native_spral_rhs[{}]; native_spral_solution_prefinal[{}]; native_spral_solution_prefinal_refined[{}]",
+        "native_spral_factor[delays={} nfactor={} nflops={} maxfront={} two_by_two={} supernodes={} maxsuper={}]; native_spral_rhs[{}]; native_spral_rhs_blocks[{}]; native_spral_solution_prefinal[{}]; native_spral_solution_prefinal_blocks[{}]; native_spral_solution_prefinal_refined[{}]; native_spral_solution_prefinal_refined_blocks[{}]",
         factor_info.delayed_pivots,
         factor_info.factor_entries,
         factor_info.flop_count,
@@ -6859,8 +6949,16 @@ fn factor_solve_spral_src(
         factor_info.supernode_count,
         factor_info.max_supernode_width,
         vector_fingerprint_text(vector_fingerprint(rhs)),
+        ipopt_augmented_block_fingerprints_text(ipopt_augmented_block_fingerprints(
+            &workspace.pattern,
+            rhs,
+        )),
         vector_fingerprint_text(pre_refinement_solution_fingerprint),
+        ipopt_augmented_block_fingerprints_text(pre_refinement_solution_block_fingerprints),
         vector_fingerprint_text(post_refinement_prefinal_solution_fingerprint),
+        ipopt_augmented_block_fingerprints_text(
+            post_refinement_prefinal_solution_block_fingerprints,
+        ),
     );
     let mut detail = (refinement.steps > 0)
         .then(|| {
@@ -6868,19 +6966,29 @@ fn factor_solve_spral_src(
                 .first_correction_rhs
                 .map(vector_fingerprint_text)
                 .unwrap_or_else(|| "--".to_string());
+            let first_correction_rhs_blocks = refinement
+                .first_correction_rhs_blocks
+                .map(ipopt_augmented_block_fingerprints_text)
+                .unwrap_or_else(|| "--".to_string());
             let first_correction_solution = refinement
                 .first_correction_solution
                 .map(vector_fingerprint_text)
                 .unwrap_or_else(|| "--".to_string());
+            let first_correction_solution_blocks = refinement
+                .first_correction_solution_blocks
+                .map(ipopt_augmented_block_fingerprints_text)
+                .unwrap_or_else(|| "--".to_string());
             format!(
-                "full_space_iterative_refinement_steps={} residual_ratio={:.3e}->{:.3e} residuals=[{}]->[{}] first_correction_rhs[{}] first_correction_solution[{}]",
+                "full_space_iterative_refinement_steps={} residual_ratio={:.3e}->{:.3e} residuals=[{}]->[{}] first_correction_rhs[{}] first_correction_rhs_blocks[{}] first_correction_solution[{}] first_correction_solution_blocks[{}]",
                 refinement.steps,
                 refinement.initial_residual_ratio,
                 refinement.residual_ratio,
                 ipopt_full_space_residual_metrics_text(refinement.initial_residual),
                 ipopt_full_space_residual_metrics_text(refinement.final_residual),
                 first_correction_rhs,
+                first_correction_rhs_blocks,
                 first_correction_solution,
+                first_correction_solution_blocks,
             )
         })
         .map_or_else(
