@@ -2723,6 +2723,7 @@ fn dump_linear_debug_snapshot(
     options: &InteriorPointLinearDebugOptions,
     snapshot: &InteriorPointKktSnapshot,
     report: &InteriorPointLinearDebugReport,
+    primary_direction: Option<&NewtonDirection>,
 ) {
     let Some(dir) = options.dump_dir.as_ref() else {
         return;
@@ -2787,6 +2788,22 @@ fn dump_linear_debug_snapshot(
         snapshot.slack,
         snapshot.multipliers,
     ));
+    if let Some(direction) = primary_direction {
+        // For the IPOPT full-space path, `linear_solution` is stored after
+        // PDSearchDirCalc's final alpha=-1 scaling.  The prefinal vector is
+        // the post-refinement accumulated solution before that final scaling;
+        // individual IpStdAugSystemSolver.cpp SOL[0] lines are compared by the
+        // glider diagnostic's cumulative-window reconstruction.
+        let prefinal_solution = direction
+            .linear_solution
+            .iter()
+            .map(|value| -*value)
+            .collect::<Vec<_>>();
+        body.push_str(&format!(
+            "linear_solution_final={:?}\nlinear_solution_prefinal={:?}\n",
+            direction.linear_solution, prefinal_solution,
+        ));
+    }
     let _ = fs::write(path, body);
 }
 
@@ -10615,7 +10632,12 @@ where
                 {
                     let report =
                         run_linear_debug_report_on_success(&snapshot, &direction, debug_state);
-                    dump_linear_debug_snapshot(&debug_state.options, &snapshot, &report);
+                    dump_linear_debug_snapshot(
+                        &debug_state.options,
+                        &snapshot,
+                        &report,
+                        Some(&direction),
+                    );
                     current_snapshot.linear_debug = Some(report.clone());
                     direction.linear_debug = Some(report);
                 }
@@ -10659,7 +10681,7 @@ where
                             &diagnostics.attempts,
                             debug_state,
                         );
-                        dump_linear_debug_snapshot(&debug_state.options, &snapshot, &report);
+                        dump_linear_debug_snapshot(&debug_state.options, &snapshot, &report, None);
                         current_snapshot.linear_debug = Some(report.clone());
                         error = with_linear_debug_report(error, report);
                     }

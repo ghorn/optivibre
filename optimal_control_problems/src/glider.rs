@@ -1337,6 +1337,8 @@ mod tests {
         bound_rhs: Vec<f64>,
         slack: Vec<f64>,
         multipliers: Vec<f64>,
+        linear_solution_final: Option<Vec<f64>>,
+        linear_solution_prefinal: Option<Vec<f64>>,
     }
 
     #[derive(Debug)]
@@ -1383,6 +1385,14 @@ mod tests {
         serde_json::from_str(value).expect("expected dump vector to parse")
     }
 
+    fn parse_optional_dump_vec<T>(text: &str, prefix: &str) -> Option<Vec<T>>
+    where
+        T: DeserializeOwned,
+    {
+        let value = text.lines().find_map(|line| line.strip_prefix(prefix))?;
+        Some(serde_json::from_str(value).expect("expected optional dump vector to parse"))
+    }
+
     fn load_glider_linear_debug_dump(path: &Path) -> GliderLinearDebugDump {
         let text = fs::read_to_string(path).expect("expected linear debug dump to exist");
         GliderLinearDebugDump {
@@ -1401,6 +1411,8 @@ mod tests {
             bound_rhs: parse_dump_vec(&text, "bound_rhs="),
             slack: parse_dump_vec(&text, "slack="),
             multipliers: parse_dump_vec(&text, "multipliers="),
+            linear_solution_final: parse_optional_dump_vec(&text, "linear_solution_final="),
+            linear_solution_prefinal: parse_optional_dump_vec(&text, "linear_solution_prefinal="),
         }
     }
 
@@ -4021,6 +4033,9 @@ mod tests {
             let mut first_bits_diff = None;
             let mut max_abs_diff = 0.0_f64;
             let mut max_abs_index = 0;
+            let mut max_abs_key = (0, 0);
+            let mut max_abs_lhs = 0.0_f64;
+            let mut max_abs_rhs = 0.0_f64;
             for (index, ((dump_key, &nlip_value), &(ipopt_key, ipopt_value))) in dump_keys
                 .iter()
                 .zip(dump.values.iter())
@@ -4037,6 +4052,9 @@ mod tests {
                 if abs_diff > max_abs_diff {
                     max_abs_diff = abs_diff;
                     max_abs_index = index;
+                    max_abs_key = *dump_key;
+                    max_abs_lhs = nlip_value;
+                    max_abs_rhs = ipopt_value;
                 }
             }
             let structure = first_structure_diff.map_or_else(
@@ -4062,8 +4080,34 @@ mod tests {
                 },
             );
             format!(
-                "{structure} {first} max_abs_diff={max_abs_diff:.17e} max_abs_index={max_abs_index}"
+                "{structure} {first} max_abs_diff={max_abs_diff:.17e} max_abs_index={max_abs_index} max_abs_key=({},{}) max_abs_values=({max_abs_lhs:.17e},{max_abs_rhs:.17e})",
+                max_abs_key.0, max_abs_key.1
             )
+        }
+
+        fn journal_kkt_max_abs_diff(
+            dump: &GliderLinearDebugDump,
+            ipopt_matrix: &[((usize, usize), f64)],
+        ) -> f64 {
+            let dump_keys = dump_kkt_keys(dump);
+            if dump_keys.len() != ipopt_matrix.len() {
+                return f64::INFINITY;
+            }
+            dump_keys
+                .iter()
+                .zip(dump.values.iter())
+                .zip(ipopt_matrix.iter())
+                .try_fold(
+                    0.0_f64,
+                    |acc, ((dump_key, &nlip_value), &(ipopt_key, ipopt_value))| {
+                        if *dump_key != ipopt_key {
+                            None
+                        } else {
+                            Some(acc.max((nlip_value - ipopt_value).abs()))
+                        }
+                    },
+                )
+                .unwrap_or(f64::INFINITY)
         }
 
         fn journal_sol_component(line: &str) -> Option<usize> {
@@ -4224,6 +4268,36 @@ mod tests {
                 })
         }
 
+        fn ipopt_cumulative_solution_windows(
+            solutions: &[Vec<f64>],
+            max_terms: usize,
+        ) -> Vec<(usize, usize, Vec<f64>)> {
+            let mut windows = Vec::new();
+            for start in 0..solutions.len() {
+                let mut cumulative = Vec::new();
+                for terms in 1..=max_terms {
+                    let index = start + terms - 1;
+                    let Some(solution) = solutions.get(index) else {
+                        break;
+                    };
+                    if terms == 1 {
+                        cumulative = solution.clone();
+                    } else if cumulative.len() == solution.len() {
+                        for (value, correction) in cumulative.iter_mut().zip(solution.iter()) {
+                            // IpPDFullSpaceSolver.cpp::SolveOnce applies the
+                            // iterative-refinement correction with alpha=-1,
+                            // beta=1, so cumulative SOL = first - correction.
+                            *value -= correction;
+                        }
+                    } else {
+                        break;
+                    }
+                    windows.push((start, terms, cumulative.clone()));
+                }
+            }
+            windows
+        }
+
         fn glider_augmented_fingerprint_iteration() -> usize {
             std::env::var("GLIDER_PARITY_NLIP_AUGMENTED_ITER")
                 .ok()
@@ -4301,7 +4375,22 @@ mod tests {
                     journal_kkt_diff_summary_text(&dump, matrix),
                 );
             }
-            let (ipopt_rhs_vectors, _) = ipopt_augmented_journal_vectors(journal);
+            let mut ranked_kkt = ipopt_matrices
+                .iter()
+                .enumerate()
+                .map(|(index, matrix)| (index, journal_kkt_max_abs_diff(&dump, matrix)))
+                .collect::<Vec<_>>();
+            ranked_kkt.sort_by(|lhs, rhs| lhs.1.total_cmp(&rhs.1).then(lhs.0.cmp(&rhs.0)));
+            for (rank, (index, max_abs_diff)) in ranked_kkt.iter().take(4).enumerate() {
+                let matrix = &ipopt_matrices[*index];
+                let values = matrix.iter().map(|(_, value)| *value).collect::<Vec<_>>();
+                println!(
+                    "  nlip_best_kkt_match[{rank}] ipopt_kkt[{index}] max_abs_diff={max_abs_diff:.17e} [{}] {}",
+                    journal_vector_fingerprint_text(journal_vector_fingerprint(&values)),
+                    journal_kkt_diff_summary_text(&dump, matrix),
+                );
+            }
+            let (ipopt_rhs_vectors, ipopt_sol_vectors) = ipopt_augmented_journal_vectors(journal);
             let Some(ipopt_prefinal_rhs) = ipopt_rhs_vectors.get(1) else {
                 return;
             };
@@ -4339,6 +4428,64 @@ mod tests {
                 println!(
                     "  nlip_best_rhs_match[{rank}] ipopt_rhs[{index}] max_abs_diff={max_abs_diff:.17e} {}",
                     journal_vector_diff_summary_text(&prefinal_rhs, ipopt_rhs),
+                );
+            }
+            if let Some(nlip_prefinal_solution) = dump.linear_solution_prefinal.as_ref() {
+                println!(
+                    "  nlip_solution_prefinal [{}] blocks[{}]",
+                    journal_vector_fingerprint_text(journal_vector_fingerprint(
+                        nlip_prefinal_solution
+                    )),
+                    journal_augmented_block_fingerprint_text(nlip_prefinal_solution, &dims),
+                );
+                let mut ranked_sol = ipopt_sol_vectors
+                    .iter()
+                    .enumerate()
+                    .map(|(index, solution)| {
+                        (
+                            index,
+                            journal_vector_max_abs_diff(nlip_prefinal_solution, solution),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                ranked_sol.sort_by(|lhs, rhs| lhs.1.total_cmp(&rhs.1).then(lhs.0.cmp(&rhs.0)));
+                for (rank, (index, max_abs_diff)) in ranked_sol.iter().take(4).enumerate() {
+                    let solution = &ipopt_sol_vectors[*index];
+                    println!(
+                        "  nlip_best_sol_match[{rank}] ipopt_sol[{index}] max_abs_diff={max_abs_diff:.17e} {}",
+                        journal_vector_diff_summary_text(nlip_prefinal_solution, solution),
+                    );
+                }
+                let cumulative_windows = ipopt_cumulative_solution_windows(&ipopt_sol_vectors, 4);
+                let mut ranked_cumulative_sol = cumulative_windows
+                    .iter()
+                    .enumerate()
+                    .map(|(rank_index, (_, _, solution))| {
+                        (
+                            rank_index,
+                            journal_vector_max_abs_diff(nlip_prefinal_solution, solution),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                ranked_cumulative_sol
+                    .sort_by(|lhs, rhs| lhs.1.total_cmp(&rhs.1).then(lhs.0.cmp(&rhs.0)));
+                for (rank, (window_index, max_abs_diff)) in
+                    ranked_cumulative_sol.iter().take(4).enumerate()
+                {
+                    let (start, terms, solution) = &cumulative_windows[*window_index];
+                    println!(
+                        "  nlip_best_cumulative_sol_match[{rank}] ipopt_sol_start={start} terms={terms} max_abs_diff={max_abs_diff:.17e} {}",
+                        journal_vector_diff_summary_text(nlip_prefinal_solution, solution),
+                    );
+                }
+            }
+            if let Some(nlip_final_solution) = dump.linear_solution_final.as_ref() {
+                println!(
+                    "  nlip_solution_final [{}] blocks[{}]",
+                    journal_vector_fingerprint_text(journal_vector_fingerprint(
+                        nlip_final_solution
+                    )),
+                    journal_augmented_block_fingerprint_text(nlip_final_solution, &dims),
                 );
             }
         }
