@@ -5013,6 +5013,7 @@ struct IpoptFullSpaceResidual {
 #[derive(Clone, Copy, Debug)]
 struct IpoptRefinementReport {
     steps: usize,
+    initial_residual_ratio: f64,
     residual_ratio: f64,
     failed: bool,
 }
@@ -5215,6 +5216,7 @@ fn refine_ipopt_full_space_solution<E>(
     let mut steps = 0;
     let mut residual = ipopt_full_space_residual_ratio(system, pattern, solution, shifts);
     let mut residual_ratio = residual.residual_ratio;
+    let initial_residual_ratio = residual_ratio;
     let mut previous_residual_ratio = residual_ratio;
     let mut failed = false;
     while steps < IPOPT_LINEAR_MIN_REFINEMENT_STEPS
@@ -5244,6 +5246,7 @@ fn refine_ipopt_full_space_solution<E>(
     }
     Ok(IpoptRefinementReport {
         steps,
+        initial_residual_ratio,
         residual_ratio,
         failed,
     })
@@ -6525,8 +6528,12 @@ fn factor_solve_spral_src(
             })
         },
     )?;
-    let mut detail = (refinement.steps > 0)
-        .then(|| format!("full_space_iterative_refinement_steps={}", refinement.steps));
+    let mut detail = (refinement.steps > 0).then(|| {
+        format!(
+            "full_space_iterative_refinement_steps={} residual_ratio={:.3e}->{:.3e}",
+            refinement.steps, refinement.initial_residual_ratio, refinement.residual_ratio
+        )
+    });
     let mut accepted_after_failed_refinement = false;
     if refinement.failed {
         // IpPDFullSpaceSolver.cpp retries failed full-space iterative
