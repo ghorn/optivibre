@@ -2777,11 +2777,13 @@ fn dump_linear_debug_snapshot(
         body.push_str(&format!("note={note}\n"));
     }
     body.push_str(&format!(
-        "col_ptrs={:?}\nrow_indices={:?}\nvalues={:?}\nrhs={:?}\nslack={:?}\nmultipliers={:?}\n",
+        "col_ptrs={:?}\nrow_indices={:?}\nvalues={:?}\nrhs={:?}\nr_dual={:?}\nbound_rhs={:?}\nslack={:?}\nmultipliers={:?}\n",
         snapshot.augmented_pattern.ccs.col_ptrs,
         snapshot.augmented_pattern.ccs.row_indices,
         snapshot.augmented_values,
         snapshot.augmented_rhs,
+        snapshot.r_dual,
+        snapshot.bound_rhs,
         snapshot.slack,
         snapshot.multipliers,
     ));
@@ -3005,6 +3007,60 @@ fn damped_slack_stationarity_residual(system: &ReducedKktSystem<'_>, index: usiz
     system.r_slack_stationarity[index] - system_positive_slack_damping(system)
 }
 
+fn fill_ipopt_augmented_x_rhs(rhs: &mut [f64], system: &ReducedKktSystem<'_>, sign: f64) {
+    if let Some(bound_data) = system.bound_data {
+        rhs.iter_mut()
+            .zip(system.r_dual.iter())
+            .for_each(|(rhs_i, r_i)| *rhs_i = sign * *r_i);
+        let damping = system_positive_slack_damping(system);
+        // Mirrors IpPDSearchDirCalc.cpp::ComputeSearchDirection followed by
+        // IpPDFullSpaceSolver.cpp::SolveOnce: `augRhs_x` starts as
+        // `curr_grad_lag_with_damping_x`, then lower and upper bound relaxed
+        // complementarity terms are applied with AddMSinvZ in this order.
+        for ((&index, &lower), &z_i) in bound_data
+            .bounds
+            .lower_indices
+            .iter()
+            .zip(bound_data.bounds.lower_values.iter())
+            .zip(bound_data.z_lower.iter())
+        {
+            let Some(reduced_index) = bound_data.fixed_variables.free_position[index] else {
+                continue;
+            };
+            if damping > 0.0 && !bound_data.bounds.upper_indices.contains(&index) {
+                rhs[reduced_index] += sign * damping;
+            }
+            let slack = native_lower_bound_slack(bound_data.x, index, lower);
+            let mut relaxed_complementarity = slack * z_i;
+            relaxed_complementarity += -system.barrier_parameter;
+            rhs[reduced_index] += sign * (relaxed_complementarity / slack);
+        }
+        for ((&index, &upper), &z_i) in bound_data
+            .bounds
+            .upper_indices
+            .iter()
+            .zip(bound_data.bounds.upper_values.iter())
+            .zip(bound_data.z_upper.iter())
+        {
+            let Some(reduced_index) = bound_data.fixed_variables.free_position[index] else {
+                continue;
+            };
+            if damping > 0.0 && !bound_data.bounds.lower_indices.contains(&index) {
+                rhs[reduced_index] += sign * -damping;
+            }
+            let slack = native_upper_bound_slack(bound_data.x, index, upper);
+            let mut relaxed_complementarity = slack * z_i;
+            relaxed_complementarity += -system.barrier_parameter;
+            rhs[reduced_index] += sign * -(relaxed_complementarity / slack);
+        }
+    } else {
+        rhs.iter_mut()
+            .zip(system.r_dual.iter())
+            .zip(system.bound_rhs.iter())
+            .for_each(|((rhs_i, r_i), bound_rhs_i)| *rhs_i = sign * (*r_i - *bound_rhs_i));
+    }
+}
+
 fn build_ipopt_augmented_kkt_rhs(
     system: &ReducedKktSystem<'_>,
     pattern: &SpralAugmentedKktPattern,
@@ -3018,11 +3074,7 @@ fn build_ipopt_augmented_kkt_rhs(
         IpoptLinearRhsOrientation::PreFinal => 1.0,
         IpoptLinearRhsOrientation::FinalDirection => -1.0,
     };
-    rhs[..n]
-        .iter_mut()
-        .zip(system.r_dual.iter())
-        .zip(system.bound_rhs.iter())
-        .for_each(|((rhs_i, r_i), bound_rhs_i)| *rhs_i = sign * (*r_i - *bound_rhs_i));
+    fill_ipopt_augmented_x_rhs(&mut rhs[..n], system, sign);
     for row in 0..mineq {
         // Mirror IpPDFullSpaceSolver::SolveOnce: augRhs_s starts as
         // rhs.s(), then Pd_U.AddMSinvZ(-1.0, slack_s_U, rhs.v_U(), augRhs_s)

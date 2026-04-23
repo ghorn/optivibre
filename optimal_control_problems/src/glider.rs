@@ -1333,6 +1333,8 @@ mod tests {
         row_indices: Vec<usize>,
         values: Vec<f64>,
         rhs: Vec<f64>,
+        r_dual: Vec<f64>,
+        bound_rhs: Vec<f64>,
         slack: Vec<f64>,
         multipliers: Vec<f64>,
     }
@@ -1395,6 +1397,8 @@ mod tests {
             row_indices: parse_dump_vec(&text, "row_indices="),
             values: parse_dump_vec(&text, "values="),
             rhs: parse_dump_vec(&text, "rhs="),
+            r_dual: parse_dump_vec(&text, "r_dual="),
+            bound_rhs: parse_dump_vec(&text, "bound_rhs="),
             slack: parse_dump_vec(&text, "slack="),
             multipliers: parse_dump_vec(&text, "multipliers="),
         }
@@ -4044,6 +4048,14 @@ mod tests {
                 "  nlip_rhs_prefinal [{}] blocks[{}]",
                 journal_vector_fingerprint_text(journal_vector_fingerprint(&prefinal_rhs)),
                 journal_augmented_block_fingerprint_text(&prefinal_rhs, &dims),
+            );
+            println!(
+                "  nlip_r_dual [{}]",
+                journal_vector_fingerprint_text(journal_vector_fingerprint(&dump.r_dual)),
+            );
+            println!(
+                "  nlip_bound_rhs [{}]",
+                journal_vector_fingerprint_text(journal_vector_fingerprint(&dump.bound_rhs)),
             );
             let Some(journal) = journal_output else {
                 return;
