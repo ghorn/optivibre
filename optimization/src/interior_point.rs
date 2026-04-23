@@ -5205,9 +5205,6 @@ fn ipopt_full_space_residual_ratio(
         &system.hessian.values,
         dx,
     );
-    for (index, residual_i) in residual_x.iter_mut().enumerate() {
-        *residual_i += shifts.primal * dx[index];
-    }
     sparse_add_transpose_mat_vec(&mut residual_x, system.equality_jacobian, d_lambda);
     sparse_add_transpose_mat_vec(&mut residual_x, system.inequality_jacobian, d_ineq);
 
@@ -5220,14 +5217,17 @@ fn ipopt_full_space_residual_ratio(
     let mut bound_residual_inf = 0.0_f64;
 
     if let Some(bound_data) = system.bound_data {
-        let mut rhs_x = system.r_dual.to_vec();
-        for (residual_i, r_dual_i) in residual_x.iter_mut().zip(system.r_dual.iter()) {
-            if prefinal_orientation {
-                *residual_i -= *r_dual_i;
-            } else {
-                *residual_i += *r_dual_i;
-            }
-        }
+        let mut rhs_x = system
+            .r_dual
+            .iter()
+            .map(|value| {
+                if prefinal_orientation {
+                    *value
+                } else {
+                    -*value
+                }
+            })
+            .collect::<Vec<_>>();
         let damping = system_positive_slack_damping(system);
         for ((&index, &lower), &z_i) in bound_data
             .bounds
@@ -5253,12 +5253,11 @@ fn ipopt_full_space_residual_ratio(
             };
             residual_x[reduced_index] -= dz_i;
             if damping > 0.0 && !bound_data.bounds.upper_indices.contains(&index) {
-                if prefinal_orientation {
-                    residual_x[reduced_index] -= damping;
+                rhs_x[reduced_index] += if prefinal_orientation {
+                    damping
                 } else {
-                    residual_x[reduced_index] += damping;
-                }
-                rhs_x[reduced_index] += damping;
+                    -damping
+                };
             }
             augmented_correction_rhs[reduced_index] += residual_z / slack;
             bound_residual_inf = bound_residual_inf.max(residual_z.abs());
@@ -5289,17 +5288,22 @@ fn ipopt_full_space_residual_ratio(
             };
             residual_x[reduced_index] += dz_i;
             if damping > 0.0 && !bound_data.bounds.lower_indices.contains(&index) {
-                if prefinal_orientation {
-                    residual_x[reduced_index] += damping;
+                rhs_x[reduced_index] += if prefinal_orientation {
+                    -damping
                 } else {
-                    residual_x[reduced_index] -= damping;
-                }
-                rhs_x[reduced_index] -= damping;
+                    damping
+                };
             }
             augmented_correction_rhs[reduced_index] -= residual_z / slack;
             bound_residual_inf = bound_residual_inf.max(residual_z.abs());
             rhs_inf = rhs_inf.max(complementarity.abs());
             solution_inf = solution_inf.max(dz_i.abs());
+        }
+        // Mirror IpPDFullSpaceSolver.cpp::ComputeResiduals: W/J/bound terms are
+        // accumulated first, and the primal perturbation plus rhs.x contribution
+        // is applied last with AddTwoVectors(delta_x, res.x, -1., rhs.x, 1.).
+        for (index, (residual_i, rhs_i)) in residual_x.iter_mut().zip(rhs_x.iter()).enumerate() {
+            *residual_i += shifts.primal * dx[index] - rhs_i;
         }
         for (rhs_i, residual_i) in augmented_correction_rhs[..n]
             .iter_mut()
@@ -5321,7 +5325,9 @@ fn ipopt_full_space_residual_ratio(
             *residual_i -= rhs_i;
         }
         for (index, residual_i) in residual_x.iter_mut().enumerate() {
-            *residual_i += system.bound_diagonal.get(index).copied().unwrap_or(0.0) * dx[index];
+            *residual_i += (shifts.primal
+                + system.bound_diagonal.get(index).copied().unwrap_or(0.0))
+                * dx[index];
         }
         augmented_correction_rhs[..n].copy_from_slice(&residual_x);
         rhs_inf = system
