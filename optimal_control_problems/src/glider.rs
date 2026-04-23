@@ -4785,16 +4785,17 @@ mod tests {
                 }
             }
 
-            for (index, (&previous_value, &current_value)) in previous
+            for (index, ((&previous_value, &current_value), &previous_distance)) in previous
                 .internal_slack
                 .iter()
                 .zip(current.internal_slack.iter())
+                .zip(previous.kkt_slack_distance.iter())
                 .enumerate()
             {
                 let direction = (current_value - previous_value) / alpha;
                 // The OCP inequality adapter presents each normalized path row as upper-only.
                 if direction > 0.0 {
-                    let candidate = tau * (0.0 - previous_value) / direction;
+                    let candidate = tau * previous_distance / direction;
                     if candidate.is_finite() {
                         limiters.push((
                             candidate,
@@ -4828,9 +4829,16 @@ mod tests {
             order: usize,
         ) {
             let nlip_slack_primal = nlip_snapshot.slack_primal.as_deref().unwrap_or(&[]);
+            let ipopt_slack_upper_bound = ipopt_snapshot
+                .internal_slack
+                .iter()
+                .zip(ipopt_snapshot.kkt_slack_distance.iter())
+                .map(|(&value, &distance)| value + distance)
+                .collect::<Vec<_>>();
             let nlip_slack_distance = nlip_slack_primal
                 .iter()
-                .map(|value| -*value)
+                .zip(ipopt_slack_upper_bound.iter())
+                .map(|(&value, &upper)| upper - value)
                 .collect::<Vec<_>>();
             let nlip_eq = nlip_snapshot.equality_multipliers.as_deref().unwrap_or(&[]);
             let nlip_ineq = nlip_snapshot
