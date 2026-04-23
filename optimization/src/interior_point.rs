@@ -5593,7 +5593,15 @@ fn factor_solve_spral_src_symmetric_with_metrics(
     })?;
     let factor_started = Instant::now();
     let mut session = native
-        .analyse_with_options(spral_matrix, &SpralNumericFactorOptions::default())
+        // IpLeastSquareMults.cpp reaches SPRAL through StdAugSystemSolver and
+        // IpSpralSolverInterface, not the generic native wrapper defaults.
+        // Keep auxiliary multiplier solves on the same matching, one-based
+        // ptr32 path used by IPOPT's SPRAL interface.
+        .analyse_ipopt_compatible_with_options_and_ordering(
+            spral_matrix,
+            &SpralNumericFactorOptions::default(),
+            SpralNativeOrdering::Matching,
+        )
         .map_err(|error| {
             native_spral_error_attempt(
                 regularization,
@@ -5614,53 +5622,40 @@ fn factor_solve_spral_src_symmetric_with_metrics(
     // IPOPT's SpralSolverInterface::MultiSolve calls spral_ssids_solve with
     // nrhs=1 even for a single right-hand side. Keep the NLIP source-built
     // SPRAL path on the same C entrypoint instead of spral_ssids_solve1.
-    let mut solution = session.solve_ipopt_single_rhs(rhs).map_err(|error| {
+    let solution = session.solve_ipopt_single_rhs(rhs).map_err(|error| {
         native_spral_error_attempt(
             regularization,
             InteriorPointLinearSolveFailureKind::FactorizationFailed,
             error,
         )
     })?;
-    let mut solve_time = solve_started.elapsed();
-    let refinement_steps = refine_linear_solution_ccs(
-        &ccs,
-        &lower_matrix.nzval,
-        rhs,
-        &mut solution,
-        &mut solve_time,
-        |residual| {
-            session.solve_ipopt_single_rhs(residual).map_err(|error| {
-                native_spral_error_attempt(
-                    regularization,
-                    InteriorPointLinearSolveFailureKind::FactorizationFailed,
-                    error,
-                )
-            })
-        },
-    )?;
+    let solve_time = solve_started.elapsed();
+    // IPOPT LeastSquareMultipliers calls StdAugSystemSolver::Solve directly;
+    // the full-space PDFullSpaceSolver iterative refinement loop is not used
+    // for this auxiliary multiplier estimate.
     let assessment = assess_linear_solution_ccs(&ccs, &lower_matrix.nzval, rhs, &solution);
-    assessment
-        .map(|assessment| {
-            (
-                solution,
-                LinearBackendRunStats {
-                    solver: InteriorPointLinearSolver::SpralSrc,
-                    factorization_time,
-                    solve_time,
-                    reused_symbolic: Some(false),
-                    inertia: Some(inertia),
-                    residual_inf: assessment.residual_inf,
-                    solution_inf: assessment.solution_inf,
-                    detail: (refinement_steps > 0)
-                        .then(|| format!("iterative_refinement_steps={refinement_steps}")),
-                },
-            )
-        })
-        .map_err(|mut attempt| {
-            attempt.solver = InteriorPointLinearSolver::SpralSrc;
-            attempt.regularization = regularization;
+    let (solution_inf, residual_inf) = match assessment {
+        Ok(assessment) => (assessment.solution_inf, assessment.residual_inf),
+        Err(attempt) => (
             attempt
-        })
+                .solution_inf
+                .unwrap_or_else(|| step_inf_norm(&solution)),
+            attempt.residual_inf.unwrap_or(f64::NAN),
+        ),
+    };
+    Ok((
+        solution,
+        LinearBackendRunStats {
+            solver: InteriorPointLinearSolver::SpralSrc,
+            factorization_time,
+            solve_time,
+            reused_symbolic: Some(false),
+            inertia: Some(inertia),
+            residual_inf,
+            solution_inf,
+            detail: Some("ipopt_least_square_multipliers_std_aug_solver_no_refinement".to_string()),
+        },
+    ))
 }
 
 fn preferred_linear_solver(
