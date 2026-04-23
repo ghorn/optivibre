@@ -134,6 +134,42 @@ fn native_spral_session_solves_ipopt_single_rhs_entrypoint() {
 }
 
 #[test]
+fn native_spral_session_solves_through_ipopt_ptr32_entrypoints() {
+    let Some(native) = load_native_or_skip() else {
+        return;
+    };
+    let dense = vec![
+        vec![4.0, -1.0, 0.0, 0.0],
+        vec![-1.0, 4.0, -1.0, 0.0],
+        vec![0.0, -1.0, 4.0, -1.0],
+        vec![0.0, 0.0, -1.0, 3.0],
+    ];
+    let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+    let matrix = SymmetricCscMatrix::new(4, &col_ptrs, &row_indices, Some(&values)).expect("csc");
+    let options = NumericFactorOptions::default();
+    let mut session = native
+        .analyse_ipopt_compatible_with_options_and_ordering(
+            matrix,
+            &options,
+            NativeOrdering::Matching,
+        )
+        .expect("analyse through IPOPT-compatible ptr32 entrypoint");
+    session
+        .factorize(matrix)
+        .expect("factorize through IPOPT-compatible ptr32 entrypoint");
+
+    let expected = vec![1.0, -2.0, 0.5, 3.0];
+    let rhs = dense_mul(&dense, &expected);
+    let solution = session
+        .solve_ipopt_single_rhs(&rhs)
+        .expect("solve through IPOPT-compatible spral_ssids_solve call");
+    for (actual, expected_i) in solution.iter().zip(expected.iter()) {
+        assert_abs_diff_eq!(actual, expected_i, epsilon = 1e-10);
+    }
+    assert!(residual_inf_norm(&dense, &solution, &rhs) <= 1e-10);
+}
+
+#[test]
 fn native_spral_session_refactorizes_same_pattern() {
     let Some(native) = load_native_or_skip() else {
         return;

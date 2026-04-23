@@ -6419,7 +6419,10 @@ fn factor_solve_spral_src(
         workspace.session = Some(
             workspace
                 .native
-                .analyse_with_options_and_ordering(
+                // IpSpralSolverInterface.cpp exposes SPRAL through the ptr32
+                // one-based compressed sparse path. Keep NLIP's source-built
+                // SPRAL parity lane on the same analyse/factor entrypoints.
+                .analyse_ipopt_compatible_with_options_and_ordering(
                     matrix,
                     &workspace.numeric_options,
                     workspace.ordering,
