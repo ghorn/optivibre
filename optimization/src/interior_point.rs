@@ -1875,6 +1875,11 @@ struct LinearBackendRunStats {
     detail: Option<String>,
 }
 
+struct SpralSrcFullSpaceSolution {
+    augmented_solution: Vec<f64>,
+    upper_slack_multiplier_step: Vec<f64>,
+}
+
 struct InteriorPointLinearDebugState {
     options: InteriorPointLinearDebugOptions,
     rust_workspace: Option<SpralAugmentedKktWorkspace>,
@@ -2352,6 +2357,7 @@ fn newton_direction_from_augmented_solution(
     snapshot: &InteriorPointKktSnapshot,
     solver: InteriorPointLinearSolver,
     solution: Vec<f64>,
+    upper_slack_multiplier_step: Option<Vec<f64>>,
     backend_stats: LinearBackendRunStats,
 ) -> NewtonDirection {
     let n = snapshot.x_dimension;
@@ -2368,16 +2374,18 @@ fn newton_direction_from_augmented_solution(
         [snapshot.augmented_pattern.z_offset..snapshot.augmented_pattern.z_offset + mineq]
         .to_vec();
     let ds = ipopt_ds;
-    let dz = snapshot
-        .r_cent
-        .iter()
-        .zip(snapshot.multipliers.iter())
-        .zip(snapshot.slack.iter())
-        .zip(ds.iter())
-        .map(|(((r_cent_i, z_i), s_i), ds_i)| {
-            ipopt_final_upper_slack_bound_multiplier_step(*s_i, *z_i, *r_cent_i, *ds_i)
-        })
-        .collect::<Vec<_>>();
+    let dz = upper_slack_multiplier_step.unwrap_or_else(|| {
+        snapshot
+            .r_cent
+            .iter()
+            .zip(snapshot.multipliers.iter())
+            .zip(snapshot.slack.iter())
+            .zip(ds.iter())
+            .map(|(((r_cent_i, z_i), s_i), ds_i)| {
+                ipopt_final_upper_slack_bound_multiplier_step(*s_i, *z_i, *r_cent_i, *ds_i)
+            })
+            .collect::<Vec<_>>()
+    });
     NewtonDirection {
         dx,
         d_lambda,
@@ -2449,7 +2457,13 @@ fn replay_snapshot_with_solver(
                 false,
             )
             .map(|(solution, backend_stats)| {
-                newton_direction_from_augmented_solution(snapshot, solver, solution, backend_stats)
+                newton_direction_from_augmented_solution(
+                    snapshot,
+                    solver,
+                    solution,
+                    None,
+                    backend_stats,
+                )
             })
             .map_err(|attempt| vec![attempt])
         }
@@ -2513,7 +2527,13 @@ fn replay_snapshot_with_solver(
                 false,
             )
             .map(|(solution, backend_stats)| {
-                newton_direction_from_augmented_solution(snapshot, solver, solution, backend_stats)
+                newton_direction_from_augmented_solution(
+                    snapshot,
+                    solver,
+                    solution.augmented_solution,
+                    Some(solution.upper_slack_multiplier_step),
+                    backend_stats,
+                )
             })
             .map_err(|attempt| vec![attempt])
         }
@@ -2994,10 +3014,6 @@ fn damped_slack_stationarity_residual(system: &ReducedKktSystem<'_>, index: usiz
     system.r_slack_stationarity[index] - system_positive_slack_damping(system)
 }
 
-fn ipopt_internal_slack_rhs(system: &ReducedKktSystem<'_>, index: usize) -> f64 {
-    system.r_cent[index] / system.slack[index] - damped_slack_stationarity_residual(system, index)
-}
-
 fn build_ipopt_augmented_kkt_rhs(
     system: &ReducedKktSystem<'_>,
     pattern: &SpralAugmentedKktPattern,
@@ -3017,7 +3033,13 @@ fn build_ipopt_augmented_kkt_rhs(
         .zip(system.bound_rhs.iter())
         .for_each(|((rhs_i, r_i), bound_rhs_i)| *rhs_i = sign * (*r_i - *bound_rhs_i));
     for row in 0..mineq {
-        rhs[pattern.p_offset + row] = -sign * ipopt_internal_slack_rhs(system, row);
+        // Mirror IpPDFullSpaceSolver::SolveOnce: augRhs_s starts as
+        // rhs.s(), then Pd_U.AddMSinvZ(-1.0, slack_s_U, rhs.v_U(), augRhs_s)
+        // applies `rhs_s -= rhs_v / slack`. This avoids the different rounding
+        // from the algebraically equivalent `-(rhs_v / slack - rhs_s)`.
+        let mut rhs_s = sign * damped_slack_stationarity_residual(system, row);
+        rhs_s -= (sign * system.r_cent[row]) / system.slack[row];
+        rhs[pattern.p_offset + row] = rhs_s;
     }
     for row in 0..meq {
         rhs[pattern.lambda_offset + row] = sign * system.r_eq[row];
@@ -3056,6 +3078,39 @@ fn ipopt_prefinal_upper_slack_bound_multiplier_step(
     // Mirrors IPOPT PDFullSpaceSolver::SolveOnce Pd_U.SinvBlrmZMTdBr(1., ...)
     // before PDSearchDirCalc's final Solve(-1., 0., ...) scaling.
     (complementarity_residual + multiplier * ipopt_internal_slack_step) / slack
+}
+
+fn ipopt_oriented_upper_slack_bound_multiplier_step(
+    slack: f64,
+    multiplier: f64,
+    oriented_complementarity_rhs: f64,
+    oriented_slack_step: f64,
+) -> f64 {
+    // Mirrors ExpansionMatrix::SinvBlrmZMTdBrImpl for the upper slack block:
+    // X[i] = (R[i] + Z[i] * D[exp_pos[i]]) / S[i].  The caller passes R and D
+    // in the same orientation as the current PDFullSpaceSolver rhs/res vector.
+    (oriented_complementarity_rhs + multiplier * oriented_slack_step) / slack
+}
+
+fn ipopt_upper_slack_bound_multiplier_steps_for_orientation(
+    system: &ReducedKktSystem<'_>,
+    slack_steps: &[f64],
+    orientation: IpoptLinearRhsOrientation,
+) -> Vec<f64> {
+    let sign = match orientation {
+        IpoptLinearRhsOrientation::PreFinal => 1.0,
+        IpoptLinearRhsOrientation::FinalDirection => -1.0,
+    };
+    system
+        .r_cent
+        .iter()
+        .zip(system.multipliers.iter())
+        .zip(system.slack.iter())
+        .zip(slack_steps.iter())
+        .map(|(((r_cent_i, z_i), s_i), ds_i)| {
+            ipopt_oriented_upper_slack_bound_multiplier_step(*s_i, *z_i, sign * *r_cent_i, *ds_i)
+        })
+        .collect()
 }
 
 fn slack_stationarity_residuals(lambda_ineq: &[f64], z: &[f64]) -> Vec<f64> {
@@ -5154,6 +5209,7 @@ fn refine_linear_solution_ccs<E>(
 
 struct IpoptFullSpaceResidual {
     augmented_correction_rhs: Vec<f64>,
+    residual_vu: Vec<f64>,
     residual_ratio: f64,
     rhs_inf: f64,
     solution_inf: f64,
@@ -5339,6 +5395,7 @@ fn ipopt_full_space_residual_ratio(
     system: &ReducedKktSystem<'_>,
     pattern: &SpralAugmentedKktPattern,
     solution: &[f64],
+    upper_slack_multiplier_step: &[f64],
     rhs_orientation: IpoptLinearRhsOrientation,
     shifts: IpoptLinearRefinementShifts,
 ) -> IpoptFullSpaceResidual {
@@ -5350,6 +5407,7 @@ fn ipopt_full_space_residual_ratio(
     let d_lambda = &solution[pattern.lambda_offset..pattern.lambda_offset + meq];
     let d_ineq = &solution[pattern.z_offset..pattern.z_offset + mineq];
     let prefinal_orientation = rhs_orientation == IpoptLinearRhsOrientation::PreFinal;
+    debug_assert_eq!(upper_slack_multiplier_step.len(), mineq);
 
     let mut residual_x = symmetric_ccs_lower_mat_vec(
         system.hessian.lower_triangle.as_ref(),
@@ -5494,26 +5552,13 @@ fn ipopt_full_space_residual_ratio(
     let mut residual_s_inf = 0.0_f64;
     let mut residual_d_inf = 0.0_f64;
     let mut residual_vu_inf = 0.0_f64;
+    let mut residual_vu = vec![0.0; mineq];
 
     for row in 0..mineq {
         let slack = system.slack[row];
         let multiplier = system.multipliers[row];
         let ipopt_ds_i = ipopt_ds[row];
-        let dz_i = if prefinal_orientation {
-            ipopt_prefinal_upper_slack_bound_multiplier_step(
-                slack,
-                multiplier,
-                system.r_cent[row],
-                ipopt_ds_i,
-            )
-        } else {
-            ipopt_final_upper_slack_bound_multiplier_step(
-                slack,
-                multiplier,
-                system.r_cent[row],
-                ipopt_ds_i,
-            )
-        };
+        let dz_i = upper_slack_multiplier_step[row];
         let damped_slack_stationarity = damped_slack_stationarity_residual(system, row);
         let (rhs_s_i, rhs_v_i, rhs_d_i) = if prefinal_orientation {
             (
@@ -5541,6 +5586,7 @@ fn ipopt_full_space_residual_ratio(
         if shifts.dual != 0.0 {
             residual_d += -shifts.dual * d_ineq[row];
         }
+        residual_vu[row] = residual_v;
         residual_s_inf = residual_s_inf.max(residual_s.abs());
         residual_d_inf = residual_d_inf.max(residual_d.abs());
         residual_vu_inf = residual_vu_inf.max(residual_v.abs());
@@ -5591,6 +5637,7 @@ fn ipopt_full_space_residual_ratio(
     };
     IpoptFullSpaceResidual {
         augmented_correction_rhs,
+        residual_vu,
         residual_ratio,
         rhs_inf,
         solution_inf,
@@ -5607,7 +5654,7 @@ fn ipopt_full_space_residual_ratio(
 fn refine_ipopt_full_space_solution<E>(
     system: &ReducedKktSystem<'_>,
     pattern: &SpralAugmentedKktPattern,
-    solution: &mut [f64],
+    solution: &mut SpralSrcFullSpaceSolution,
     rhs_orientation: IpoptLinearRhsOrientation,
     shifts: IpoptLinearRefinementShifts,
     solve_time: &mut Duration,
@@ -5618,8 +5665,14 @@ fn refine_ipopt_full_space_solution<E>(
     // matrix residual; see IpPDFullSpaceSolver.cpp::ComputeResiduals,
     // SolveOnce, and ComputeResidualRatio.
     let mut steps = 0;
-    let mut residual =
-        ipopt_full_space_residual_ratio(system, pattern, solution, rhs_orientation, shifts);
+    let mut residual = ipopt_full_space_residual_ratio(
+        system,
+        pattern,
+        &solution.augmented_solution,
+        &solution.upper_slack_multiplier_step,
+        rhs_orientation,
+        shifts,
+    );
     let mut residual_ratio = residual.residual_ratio;
     let initial_residual_ratio = residual_ratio;
     let initial_residual = residual.metrics();
@@ -5647,12 +5700,37 @@ fn refine_ipopt_full_space_solution<E>(
             first_correction_solution_blocks =
                 Some(ipopt_augmented_block_fingerprints(pattern, &correction));
         }
-        for (solution_i, correction_i) in solution.iter_mut().zip(correction.iter()) {
+        for (row, upper_step_i) in solution.upper_slack_multiplier_step.iter_mut().enumerate() {
+            // IpPDFullSpaceSolver.cpp::SolveOnce computes the correction's
+            // v_U with Pd_U.SinvBlrmZMTdBr(1., ...), then the refinement call
+            // uses alpha=-1, beta=1 to apply `res.v_U -= sol.v_U`.  Preserve
+            // that operation order instead of recomputing v_U from the updated
+            // slack step after the correction.
+            let correction_s = correction[pattern.p_offset + row];
+            let correction_vu = ipopt_oriented_upper_slack_bound_multiplier_step(
+                system.slack[row],
+                system.multipliers[row],
+                residual.residual_vu[row],
+                correction_s,
+            );
+            *upper_step_i -= correction_vu;
+        }
+        for (solution_i, correction_i) in solution
+            .augmented_solution
+            .iter_mut()
+            .zip(correction.iter())
+        {
             *solution_i -= correction_i;
         }
         steps += 1;
-        let new_residual =
-            ipopt_full_space_residual_ratio(system, pattern, solution, rhs_orientation, shifts);
+        let new_residual = ipopt_full_space_residual_ratio(
+            system,
+            pattern,
+            &solution.augmented_solution,
+            &solution.upper_slack_multiplier_step,
+            rhs_orientation,
+            shifts,
+        );
         let new_residual_ratio = new_residual.residual_ratio;
         residual_ratio = new_residual_ratio;
         if new_residual_ratio > IPOPT_LINEAR_RESIDUAL_RATIO_MAX
@@ -6820,7 +6898,10 @@ fn factor_solve_spral_src(
     context: IpoptLinearSolveContext,
     profiling: &mut InteriorPointProfiling,
     verbose: bool,
-) -> std::result::Result<(Vec<f64>, LinearBackendRunStats), InteriorPointLinearSolveAttempt> {
+) -> std::result::Result<
+    (SpralSrcFullSpaceSolution, LinearBackendRunStats),
+    InteriorPointLinearSolveAttempt,
+> {
     let matrix = SpralSymmetricCscMatrix::new(
         workspace.pattern.dimension(),
         &workspace.pattern.ccs.col_ptrs,
@@ -6932,7 +7013,7 @@ fn factor_solve_spral_src(
     // IPOPT's SpralSolverInterface::MultiSolve calls spral_ssids_solve with
     // nrhs=1 even for a single right-hand side. Keep the live SpralSrc KKT path
     // on the same C entrypoint instead of spral_ssids_solve1.
-    let mut solution = session.solve_ipopt_single_rhs(rhs).map_err(|error| {
+    let solution = session.solve_ipopt_single_rhs(rhs).map_err(|error| {
         native_spral_error_attempt(
             regularization,
             InteriorPointLinearSolveFailureKind::FactorizationFailed,
@@ -6942,11 +7023,20 @@ fn factor_solve_spral_src(
     let pre_refinement_solution_fingerprint = vector_fingerprint(&solution);
     let pre_refinement_solution_block_fingerprints =
         ipopt_augmented_block_fingerprints(&workspace.pattern, &solution);
+    let upper_slack_multiplier_step = ipopt_upper_slack_bound_multiplier_steps_for_orientation(
+        system,
+        &solution[workspace.pattern.p_offset..workspace.pattern.p_offset + system.r_cent.len()],
+        context.rhs_orientation,
+    );
+    let mut full_space_solution = SpralSrcFullSpaceSolution {
+        augmented_solution: solution,
+        upper_slack_multiplier_step,
+    };
     let mut solve_time = solve_started.elapsed();
     let refinement = refine_ipopt_full_space_solution(
         system,
         &workspace.pattern,
-        &mut solution,
+        &mut full_space_solution,
         context.rhs_orientation,
         context.shifts,
         &mut solve_time,
@@ -6960,9 +7050,12 @@ fn factor_solve_spral_src(
             })
         },
     )?;
-    let post_refinement_prefinal_solution_fingerprint = vector_fingerprint(&solution);
-    let post_refinement_prefinal_solution_block_fingerprints =
-        ipopt_augmented_block_fingerprints(&workspace.pattern, &solution);
+    let post_refinement_prefinal_solution_fingerprint =
+        vector_fingerprint(&full_space_solution.augmented_solution);
+    let post_refinement_prefinal_solution_block_fingerprints = ipopt_augmented_block_fingerprints(
+        &workspace.pattern,
+        &full_space_solution.augmented_solution,
+    );
     let native_factor_detail = format!(
         "native_spral_factor[delays={} nfactor={} nflops={} maxfront={} two_by_two={} supernodes={} maxsuper={}]; native_spral_rhs[{}]; native_spral_rhs_blocks[{}]; native_spral_solution_prefinal[{}]; native_spral_solution_prefinal_blocks[{}]; native_spral_solution_prefinal_refined[{}]; native_spral_solution_prefinal_refined_blocks[{}]",
         factor_info.delayed_pivots,
@@ -7041,7 +7134,8 @@ fn factor_solve_spral_src(
                     "{refinement_detail}; spral_quality_retry_requested"
                 )),
                 solution_inf: Some(
-                    solution
+                    full_space_solution
+                        .augmented_solution
                         .iter()
                         .fold(0.0_f64, |acc, value| acc.max(value.abs())),
                 ),
@@ -7060,7 +7154,8 @@ fn factor_solve_spral_src(
                     "{refinement_detail}; ipopt_pretend_singular_after_refinement_failure"
                 )),
                 solution_inf: Some(
-                    solution
+                    full_space_solution
+                        .augmented_solution
                         .iter()
                         .fold(0.0_f64, |acc, value| acc.max(value.abs())),
                 ),
@@ -7085,7 +7180,10 @@ fn factor_solve_spral_src(
         // IPOPT's PDSearchDirCalc calls PDFullSpaceSolver::Solve(-1., 0., ...)
         // and PDFullSpaceSolver::Solve applies the final scaling only after
         // SolveOnce and full-space iterative refinement have finished.
-        for value in &mut solution {
+        for value in &mut full_space_solution.augmented_solution {
+            *value = -*value;
+        }
+        for value in &mut full_space_solution.upper_slack_multiplier_step {
             *value = -*value;
         }
     }
@@ -7100,7 +7198,7 @@ fn factor_solve_spral_src(
         &workspace.pattern.ccs,
         &workspace.values,
         final_rhs,
-        &solution,
+        &full_space_solution.augmented_solution,
     );
     if accepted_after_failed_refinement {
         // IpPDFullSpaceSolver.cpp accepts this branch directly after the
@@ -7111,12 +7209,12 @@ fn factor_solve_spral_src(
             Err(attempt) => (
                 attempt
                     .solution_inf
-                    .unwrap_or_else(|| step_inf_norm(&solution)),
+                    .unwrap_or_else(|| step_inf_norm(&full_space_solution.augmented_solution)),
                 attempt.residual_inf.unwrap_or(f64::NAN),
             ),
         };
         return Ok((
-            solution,
+            full_space_solution,
             LinearBackendRunStats {
                 solver: InteriorPointLinearSolver::SpralSrc,
                 factorization_time,
@@ -7133,7 +7231,7 @@ fn factor_solve_spral_src(
     assessment
         .map(|assessment| {
             (
-                solution,
+                full_space_solution,
                 LinearBackendRunStats {
                     solver: InteriorPointLinearSolver::SpralSrc,
                     factorization_time,
@@ -7239,6 +7337,10 @@ fn solve_reduced_kkt_with_spral_src(
                         None => quality_detail,
                     });
                 }
+                let SpralSrcFullSpaceSolution {
+                    augmented_solution: solution,
+                    upper_slack_multiplier_step,
+                } = solution;
                 let dx = solution[..n].to_vec();
                 let ipopt_ds = solution
                     [workspace.pattern.p_offset..workspace.pattern.p_offset + mineq]
@@ -7250,16 +7352,7 @@ fn solve_reduced_kkt_with_spral_src(
                 let d_ineq = solution
                     [workspace.pattern.z_offset..workspace.pattern.z_offset + mineq]
                     .to_vec();
-                let dz = system
-                    .r_cent
-                    .iter()
-                    .zip(system.multipliers.iter())
-                    .zip(system.slack.iter())
-                    .zip(ds.iter())
-                    .map(|(((r_cent_i, z_i), s_i), ds_i)| {
-                        ipopt_final_upper_slack_bound_multiplier_step(*s_i, *z_i, *r_cent_i, *ds_i)
-                    })
-                    .collect::<Vec<_>>();
+                let dz = upper_slack_multiplier_step;
                 return Ok(NewtonDirection {
                     dx,
                     d_lambda,
