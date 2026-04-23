@@ -4258,6 +4258,157 @@ mod tests {
                 .join("; ")
         }
 
+        fn max_abs(values: &[f64]) -> f64 {
+            values
+                .iter()
+                .fold(0.0_f64, |acc, value| acc.max(value.abs()))
+        }
+
+        fn max_update_reconstruction_gap(
+            previous: &[f64],
+            current: &[f64],
+            direction: &[f64],
+            alpha: f64,
+        ) -> f64 {
+            previous
+                .iter()
+                .zip(current.iter())
+                .zip(direction.iter())
+                .fold(0.0_f64, |acc, ((previous, current), direction)| {
+                    acc.max((current - previous - alpha * direction).abs())
+                })
+        }
+
+        fn max_scaled_direction_gap(
+            nlip_direction: &[f64],
+            nlip_alpha: f64,
+            ipopt_direction: &[f64],
+            ipopt_alpha: f64,
+        ) -> f64 {
+            nlip_direction.iter().zip(ipopt_direction.iter()).fold(
+                0.0_f64,
+                |acc, (nlip_direction, ipopt_direction)| {
+                    acc.max((nlip_alpha * nlip_direction - ipopt_alpha * ipopt_direction).abs())
+                },
+            )
+        }
+
+        fn step_application_metric(
+            name: &str,
+            prev_nlip: &[f64],
+            nlip: &[f64],
+            nlip_direction: &[f64],
+            nlip_alpha: f64,
+            prev_ipopt: &[f64],
+            ipopt: &[f64],
+            ipopt_direction: &[f64],
+            ipopt_alpha: f64,
+        ) -> String {
+            let count = prev_nlip
+                .len()
+                .min(nlip.len())
+                .min(nlip_direction.len())
+                .min(prev_ipopt.len())
+                .min(ipopt.len())
+                .min(ipopt_direction.len());
+            if count == 0 {
+                return format!("{name}[--]");
+            }
+            let prev_nlip = &prev_nlip[..count];
+            let nlip = &nlip[..count];
+            let nlip_direction = &nlip_direction[..count];
+            let prev_ipopt = &prev_ipopt[..count];
+            let ipopt = &ipopt[..count];
+            let ipopt_direction = &ipopt_direction[..count];
+            let alpha_gap = (nlip_alpha - ipopt_alpha).abs();
+            let nlip_update_gap =
+                max_update_reconstruction_gap(prev_nlip, nlip, nlip_direction, nlip_alpha);
+            let ipopt_update_gap =
+                max_update_reconstruction_gap(prev_ipopt, ipopt, ipopt_direction, ipopt_alpha);
+            let state_delta_gap = prev_nlip
+                .iter()
+                .zip(nlip.iter())
+                .zip(prev_ipopt.iter().zip(ipopt.iter()))
+                .fold(0.0_f64, |acc, ((prev_nlip, nlip), (prev_ipopt, ipopt))| {
+                    acc.max(((nlip - prev_nlip) - (ipopt - prev_ipopt)).abs())
+                });
+            let direction_gap = max_vector_direction_diff(
+                prev_nlip,
+                nlip,
+                prev_ipopt,
+                ipopt,
+                nlip_alpha,
+                ipopt_alpha,
+            );
+            let stored_direction_gap = nlip_direction.iter().zip(ipopt_direction.iter()).fold(
+                0.0_f64,
+                |acc, (nlip_direction, ipopt_direction)| {
+                    acc.max((nlip_direction - ipopt_direction).abs())
+                },
+            );
+            let scaled_direction_gap =
+                max_scaled_direction_gap(nlip_direction, nlip_alpha, ipopt_direction, ipopt_alpha);
+            let max_direction = max_abs(nlip_direction).max(max_abs(ipopt_direction));
+            let alpha_scaled_direction = alpha_gap * max_direction;
+            format!(
+                "{name}[alpha_gap={alpha_gap:.3e},max_dir={max_direction:.3e},alpha*max_dir={alpha_scaled_direction:.3e},delta_gap={state_delta_gap:.3e},fd_dir_gap={direction_gap:.3e},stored_dir_gap={stored_direction_gap:.3e},scaled_dir_gap={scaled_direction_gap:.3e},recon_n={nlip_update_gap:.3e},recon_i={ipopt_update_gap:.3e}]"
+            )
+        }
+
+        fn step_application_summary(
+            prev_nlip: &optimization::InteriorPointIterationSnapshot,
+            nlip: &optimization::InteriorPointIterationSnapshot,
+            prev_ipopt: &optimization::IpoptIterationSnapshot,
+            ipopt: &optimization::IpoptIterationSnapshot,
+            nlip_alpha_pr: f64,
+            nlip_alpha_du: f64,
+            ipopt_alpha_pr: f64,
+            ipopt_alpha_du: f64,
+        ) -> String {
+            let Some(nlip_direction) = nlip.step_direction.as_ref() else {
+                return "--".to_string();
+            };
+            // IpoptData::delta() is the accepted step still exposed to the
+            // TNLP intermediate callback after AcceptTrialPoint; compare that
+            // stored direction against the actual accepted-state update.
+            [
+                step_application_metric(
+                    "x",
+                    &prev_nlip.x,
+                    &nlip.x,
+                    &nlip_direction.x,
+                    nlip_alpha_pr,
+                    &prev_ipopt.x,
+                    &ipopt.x,
+                    &ipopt.direction_x,
+                    ipopt_alpha_pr,
+                ),
+                step_application_metric(
+                    "y_d",
+                    prev_nlip.inequality_multipliers.as_deref().unwrap_or(&[]),
+                    nlip.inequality_multipliers.as_deref().unwrap_or(&[]),
+                    &nlip_direction.inequality_multipliers,
+                    nlip_alpha_pr,
+                    &prev_ipopt.inequality_multipliers,
+                    &ipopt.inequality_multipliers,
+                    &ipopt.direction_inequality_multipliers,
+                    ipopt_alpha_pr,
+                ),
+                step_application_metric(
+                    "v_U",
+                    prev_nlip.slack_multipliers.as_deref().unwrap_or(&[]),
+                    nlip.slack_multipliers.as_deref().unwrap_or(&[]),
+                    &nlip_direction.slack_multipliers,
+                    nlip_alpha_du,
+                    &prev_ipopt.slack_upper_bound_multipliers,
+                    &ipopt.slack_upper_bound_multipliers,
+                    &ipopt.direction_slack_upper_bound_multipliers,
+                    ipopt_alpha_du,
+                ),
+            ]
+            .join("; ")
+        }
+
         fn top_upper_slack_multiplier_direction_diffs(
             prev_nlip: &optimization::InteriorPointIterationSnapshot,
             nlip: &optimization::InteriorPointIterationSnapshot,
@@ -4545,6 +4696,57 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
                 .join("; ")
+        }
+
+        fn alpha_gap_ladder(nlip_trace: &[TracePoint], ipopt_trace: &[TracePoint]) -> String {
+            fn metric_gap(
+                metric: &str,
+                thresholds: &[f64],
+                nlip_trace: &[TracePoint],
+                ipopt_trace: &[TracePoint],
+                gap: impl Fn(&TracePoint, &TracePoint) -> f64,
+            ) -> String {
+                let compared = nlip_trace.len().min(ipopt_trace.len());
+                let threshold_text = thresholds
+                    .iter()
+                    .map(|&threshold| {
+                        let marker = (0..compared).find_map(|index| {
+                            let nlip = &nlip_trace[index];
+                            let ipopt = &ipopt_trace[index];
+                            let gap = gap(nlip, ipopt);
+                            (gap.is_finite() && gap > threshold).then_some((index, gap))
+                        });
+                        match marker {
+                            Some((index, gap)) => format!(
+                                ">{threshold:.0e}:index={index},nlip_iter={},ipopt_iter={},gap={gap:.3e}",
+                                nlip_trace[index].iteration, ipopt_trace[index].iteration
+                            ),
+                            None => format!(">{threshold:.0e}:none"),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("{metric}[{threshold_text}]")
+            }
+
+            let thresholds = [1.0e-16, 1.0e-14, 1.0e-12, 1.0e-10, 1.0e-8, 1.0e-6, 1.0e-4];
+            [
+                metric_gap(
+                    "alpha_pr",
+                    &thresholds,
+                    nlip_trace,
+                    ipopt_trace,
+                    |nlip, ipopt| (nlip.alpha_pr - ipopt.alpha_pr).abs(),
+                ),
+                metric_gap(
+                    "alpha_du",
+                    &thresholds,
+                    nlip_trace,
+                    ipopt_trace,
+                    |nlip, ipopt| (nlip.alpha_du - ipopt.alpha_du).abs(),
+                ),
+            ]
+            .join("; ")
         }
 
         fn accepted_direction_gap_ladder(
@@ -5211,6 +5413,19 @@ mod tests {
                             order,
                         )
                     );
+                    println!(
+                        "          step application summary: {}",
+                        step_application_summary(
+                            prev_nlip,
+                            nlip,
+                            prev_ipopt,
+                            ipopt,
+                            nlip_alpha_y,
+                            nlip_alpha_du,
+                            ipopt_alpha_y,
+                            ipopt_alpha_du,
+                        )
+                    );
                     if let Some(nlip_direction) = nlip.step_direction.as_ref() {
                         println!(
                             "          top x delta-snapshot diffs: {}",
@@ -5329,6 +5544,15 @@ mod tests {
                     nlip.primal_shift,
                     nlip.dual_regularization,
                     regularization_text(ipopt.regularization),
+                );
+                println!(
+                    "          alpha exact: nlip_pr={:.17e} ipopt_pr={:.17e} gap_pr={:.3e}; nlip_du={:.17e} ipopt_du={:.17e} gap_du={:.3e}",
+                    nlip.alpha_pr,
+                    ipopt.alpha_pr,
+                    (nlip.alpha_pr - ipopt.alpha_pr).abs(),
+                    nlip.alpha_du,
+                    ipopt.alpha_du,
+                    (nlip.alpha_du - ipopt.alpha_du).abs(),
                 );
                 println!(
                     "          top x diffs: {}",
@@ -5718,6 +5942,10 @@ mod tests {
         println!(
             "direction_gap_ladder {}",
             direction_gap_ladder(&nlip_trace, &ipopt_trace)
+        );
+        println!(
+            "alpha_gap_ladder {}",
+            alpha_gap_ladder(&nlip_trace, &ipopt_trace)
         );
         println!(
             "accepted_direction_gap_ladder {}",
