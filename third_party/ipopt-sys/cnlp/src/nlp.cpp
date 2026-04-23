@@ -363,6 +363,14 @@ bool CNLP_Problem::intermediate_callback(
         DenseVectorView z_u_view;
         DenseVectorView v_l_view;
         DenseVectorView v_u_view;
+        DenseVectorView delta_x_view;
+        DenseVectorView delta_s_view;
+        DenseVectorView delta_y_c_view;
+        DenseVectorView delta_y_d_view;
+        DenseVectorView delta_z_l_view;
+        DenseVectorView delta_z_u_view;
+        DenseVectorView delta_v_l_view;
+        DenseVectorView delta_v_u_view;
         DenseVectorView kkt_x_stationarity_view;
         DenseVectorView kkt_slack_stationarity_view;
         DenseVectorView kkt_equality_residual_view;
@@ -388,6 +396,19 @@ bool CNLP_Problem::intermediate_callback(
                 z_u_view = dense_vector_view(current_iterates->z_U());
                 v_l_view = dense_vector_view(current_iterates->v_L());
                 v_u_view = dense_vector_view(current_iterates->v_U());
+            }
+            // IpoptData::AcceptTrialPoint resets HaveDeltas(), but
+            // OptimalityErrorConvergenceCheck still reads delta() directly for d_norm.
+            Ipopt::SmartPtr<const Ipopt::IteratesVector> delta = ip_data->delta();
+            if (Ipopt::IsValid(delta)) {
+                delta_x_view = dense_vector_view(delta->x());
+                delta_s_view = dense_vector_view(delta->s());
+                delta_y_c_view = dense_vector_view(delta->y_c());
+                delta_y_d_view = dense_vector_view(delta->y_d());
+                delta_z_l_view = dense_vector_view(delta->z_L());
+                delta_z_u_view = dense_vector_view(delta->z_U());
+                delta_v_l_view = dense_vector_view(delta->v_L());
+                delta_v_u_view = dense_vector_view(delta->v_U());
             }
         }
         if (ip_cq != nullptr) {
@@ -416,6 +437,14 @@ bool CNLP_Problem::intermediate_callback(
                 z_u_view.count, z_u_view.values,
                 v_l_view.count, v_l_view.values,
                 v_u_view.count, v_u_view.values,
+                delta_x_view.count, delta_x_view.values,
+                delta_s_view.count, delta_s_view.values,
+                delta_y_c_view.count, delta_y_c_view.values,
+                delta_y_d_view.count, delta_y_d_view.values,
+                delta_z_l_view.count, delta_z_l_view.values,
+                delta_z_u_view.count, delta_z_u_view.values,
+                delta_v_l_view.count, delta_v_l_view.values,
+                delta_v_u_view.count, delta_v_u_view.values,
                 kkt_x_stationarity_view.count, kkt_x_stationarity_view.values,
                 kkt_slack_stationarity_view.count, kkt_slack_stationarity_view.values,
                 kkt_equality_residual_view.count, kkt_equality_residual_view.values,

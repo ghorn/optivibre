@@ -5077,6 +5077,41 @@ mod tests {
                             order,
                         )
                     );
+                    if let Some(nlip_direction) = nlip.step_direction.as_ref() {
+                        println!(
+                            "          top x delta-snapshot diffs: {}",
+                            top_vector_diffs(&nlip_direction.x, &ipopt.direction_x, 1.0, |idx| {
+                                glider_decision_label(idx, intervals, order)
+                            },)
+                        );
+                        println!(
+                            "          top internal slack delta-snapshot diffs: {}",
+                            top_vector_diffs(
+                                &nlip_direction.slack,
+                                &ipopt.direction_slack,
+                                1.0,
+                                |idx| glider_inequality_label(idx, intervals, order),
+                            )
+                        );
+                        println!(
+                            "          top y_d delta-snapshot diffs: {}",
+                            top_vector_diffs(
+                                &nlip_direction.inequality_multipliers,
+                                &ipopt.direction_inequality_multipliers,
+                                1.0,
+                                |idx| glider_inequality_label(idx, intervals, order),
+                            )
+                        );
+                        println!(
+                            "          top v_U delta-snapshot diffs: {}",
+                            top_vector_diffs(
+                                &nlip_direction.slack_multipliers,
+                                &ipopt.direction_slack_upper_bound_multipliers,
+                                1.0,
+                                |idx| glider_inequality_label(idx, intervals, order),
+                            )
+                        );
+                    }
                 }
                 print_internal_ipopt_probe(
                     probe_index,

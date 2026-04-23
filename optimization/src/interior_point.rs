@@ -770,6 +770,18 @@ pub struct InteriorPointIterationTiming {
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq)]
+pub struct InteriorPointStepDirectionSnapshot {
+    pub x: Vec<f64>,
+    pub slack: Vec<f64>,
+    pub equality_multipliers: Vec<f64>,
+    pub inequality_multipliers: Vec<f64>,
+    pub slack_multipliers: Vec<f64>,
+    pub lower_bound_multipliers: Vec<f64>,
+    pub upper_bound_multipliers: Vec<f64>,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
 pub struct InteriorPointIterationSnapshot {
     pub iteration: Index,
     pub phase: InteriorPointIterationPhase,
@@ -824,6 +836,8 @@ pub struct InteriorPointIterationSnapshot {
     pub line_search: Option<InteriorPointLineSearchInfo>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub direction_diagnostics: Option<InteriorPointDirectionDiagnostics>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub step_direction: Option<InteriorPointStepDirectionSnapshot>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub linear_debug: Option<InteriorPointLinearDebugReport>,
     pub linear_solver: InteriorPointLinearSolver,
@@ -1079,6 +1093,7 @@ struct AcceptedInteriorPointTrial {
     filter_acceptance_mode: Option<FilterAcceptanceMode>,
     step_kind: InteriorPointStepKind,
     step_tag: char,
+    step_direction: Option<InteriorPointStepDirectionSnapshot>,
     phase: InteriorPointIterationPhase,
     accepted_alpha_pr: f64,
     accepted_alpha_du: Option<f64>,
@@ -2108,6 +2123,18 @@ fn linear_direction_inf_norm(direction: &NewtonDirection) -> f64 {
         .chain(direction.ds.iter())
         .chain(direction.dz.iter())
         .fold(0.0_f64, |acc, value| acc.max(value.abs()))
+}
+
+fn step_direction_snapshot(direction: &NewtonDirection) -> InteriorPointStepDirectionSnapshot {
+    InteriorPointStepDirectionSnapshot {
+        x: direction.dx.clone(),
+        slack: direction.ds.clone(),
+        equality_multipliers: direction.d_lambda.clone(),
+        inequality_multipliers: direction.d_ineq.clone(),
+        slack_multipliers: direction.dz.clone(),
+        lower_bound_multipliers: direction.dz_lower.clone(),
+        upper_bound_multipliers: direction.dz_upper.clone(),
+    }
 }
 
 fn should_run_linear_debug(
@@ -7486,6 +7513,7 @@ fn nlip_log_snapshot(log: &InteriorPointIterationLog) -> InteriorPointIterationS
         watchdog_active: log.flags.watchdog_active,
         line_search: None,
         direction_diagnostics: None,
+        step_direction: None,
         linear_debug: None,
         linear_solver: InteriorPointLinearSolver::Auto,
         linear_solve_time: log.linear_time_secs.map(Duration::from_secs_f64),
@@ -7720,6 +7748,7 @@ mod tests {
             watchdog_active: false,
             line_search: None,
             direction_diagnostics: None,
+            step_direction: None,
             linear_debug: None,
             linear_solver: InteriorPointLinearSolver::Auto,
             linear_solve_time: None,
@@ -8775,6 +8804,7 @@ where
                 && watchdog_state.remaining_iters > 0,
             line_search: None,
             direction_diagnostics: None,
+            step_direction: None,
             linear_debug: None,
             linear_solver: last_linear_solver,
             linear_solve_time: None,
@@ -9054,6 +9084,7 @@ where
                 && watchdog_state.remaining_iters > 0,
             line_search: None,
             direction_diagnostics: None,
+            step_direction: None,
             linear_debug: None,
             linear_solver: last_linear_solver,
             linear_solve_time: None,
@@ -9154,6 +9185,7 @@ where
                 watchdog_active: false,
                 line_search: None,
                 direction_diagnostics: None,
+                step_direction: None,
                 linear_debug: None,
                 linear_solver: last_linear_solver,
                 linear_solve_time: None,
@@ -10053,6 +10085,7 @@ where
                     filter_acceptance_mode: None,
                     step_kind: InteriorPointStepKind::Tiny,
                     step_tag: if tiny_step_barrier_update { 'T' } else { 't' },
+                    step_direction: Some(step_direction_snapshot(&direction)),
                     phase: InteriorPointIterationPhase::AcceptedStep,
                     accepted_alpha_pr: trial_alpha_pr,
                     accepted_alpha_du: Some(trial_alpha_du),
@@ -10213,6 +10246,7 @@ where
                     filter_acceptance_mode,
                     step_kind,
                     step_tag,
+                    step_direction: Some(step_direction_snapshot(&direction)),
                     phase: InteriorPointIterationPhase::AcceptedStep,
                     accepted_alpha_pr: trial_alpha_pr,
                     accepted_alpha_du: Some(trial_alpha_du),
@@ -10666,6 +10700,7 @@ where
                             filter_acceptance_mode: Some(corrected_filter_acceptance_mode),
                             step_kind,
                             step_tag,
+                            step_direction: Some(step_direction_snapshot(&soc_direction)),
                             phase: InteriorPointIterationPhase::AcceptedStep,
                             accepted_alpha_pr: soc_alpha_pr,
                             accepted_alpha_du: Some(soc_alpha_du),
@@ -10882,6 +10917,7 @@ where
                     filter_acceptance_mode: None,
                     step_kind,
                     step_tag,
+                    step_direction: Some(step_direction_snapshot(&direction)),
                     phase: InteriorPointIterationPhase::AcceptedStep,
                     accepted_alpha_pr: trial_alpha_pr,
                     accepted_alpha_du: Some(trial_alpha_du),
@@ -11086,6 +11122,7 @@ where
                         filter_acceptance_mode: None,
                         step_kind: InteriorPointStepKind::Feasibility,
                         step_tag: 'r',
+                        step_direction: None,
                         phase: InteriorPointIterationPhase::AcceptedStep,
                         accepted_alpha_pr: last_tried_alpha_pr,
                         accepted_alpha_du: Some(0.0),
@@ -11343,6 +11380,7 @@ where
             watchdog_active: accepted_trial.watchdog_accepted || watchdog_active,
             line_search: Some(line_search_info.clone()),
             direction_diagnostics: accepted_direction_diagnostics.clone(),
+            step_direction: accepted_trial.step_direction.clone(),
             linear_debug: direction.linear_debug.clone(),
             linear_solver: direction.solver_used,
             linear_solve_time: Some(iteration_linear_solve_time),

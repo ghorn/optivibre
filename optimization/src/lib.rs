@@ -46,10 +46,10 @@ pub use interior_point::{
     InteriorPointLinearSolveDiagnostics, InteriorPointLinearSolveFailureKind,
     InteriorPointLinearSolver, InteriorPointOptions, InteriorPointProfiling,
     InteriorPointSolveError, InteriorPointSpralPivotMethod, InteriorPointStatusKind,
-    InteriorPointStepKind, InteriorPointSummary, InteriorPointTermination,
-    format_nlip_settings_summary, nlip_event_codes, nlip_event_codes_for_events,
-    nlip_event_legend_entries, nlip_event_legend_entries_for_events, solve_nlp_interior_point,
-    solve_nlp_interior_point_with_callback,
+    InteriorPointStepDirectionSnapshot, InteriorPointStepKind, InteriorPointSummary,
+    InteriorPointTermination, format_nlip_settings_summary, nlip_event_codes,
+    nlip_event_codes_for_events, nlip_event_legend_entries, nlip_event_legend_entries_for_events,
+    solve_nlp_interior_point, solve_nlp_interior_point_with_callback,
 };
 #[cfg(feature = "ipopt")]
 pub use ipopt::SolveStatus as IpoptSolveStatus;

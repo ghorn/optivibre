@@ -572,6 +572,22 @@ pub struct IntermediateCallbackData<'a> {
     pub v_l: &'a [Number],
     /// The current upper-bound multipliers for internal slack variables.
     pub v_u: &'a [Number],
+    /// IPOPT's current primal variable search direction, if available.
+    pub delta_x: &'a [Number],
+    /// IPOPT's current internal slack search direction, if available.
+    pub delta_s: &'a [Number],
+    /// IPOPT's current equality multiplier search direction, if available.
+    pub delta_y_c: &'a [Number],
+    /// IPOPT's current inequality multiplier search direction, if available.
+    pub delta_y_d: &'a [Number],
+    /// IPOPT's current lower-bound multiplier search direction for primal variables, if available.
+    pub delta_z_l: &'a [Number],
+    /// IPOPT's current upper-bound multiplier search direction for primal variables, if available.
+    pub delta_z_u: &'a [Number],
+    /// IPOPT's current lower-bound multiplier search direction for internal slacks, if available.
+    pub delta_v_l: &'a [Number],
+    /// IPOPT's current upper-bound multiplier search direction for internal slacks, if available.
+    pub delta_v_u: &'a [Number],
     /// IPOPT's current damped stationarity residual for primal variables.
     pub kkt_x_stationarity: &'a [Number],
     /// IPOPT's current damped stationarity residual for internal slack variables.
@@ -1070,6 +1086,22 @@ impl<P: BasicProblem> Ipopt<P> {
         v_l: *const Number,
         v_u_count: Index,
         v_u: *const Number,
+        delta_x_count: Index,
+        delta_x: *const Number,
+        delta_s_count: Index,
+        delta_s: *const Number,
+        delta_y_c_count: Index,
+        delta_y_c: *const Number,
+        delta_y_d_count: Index,
+        delta_y_d: *const Number,
+        delta_z_l_count: Index,
+        delta_z_l: *const Number,
+        delta_z_u_count: Index,
+        delta_z_u: *const Number,
+        delta_v_l_count: Index,
+        delta_v_l: *const Number,
+        delta_v_u_count: Index,
+        delta_v_u: *const Number,
         kkt_x_stationarity_count: Index,
         kkt_x_stationarity: *const Number,
         kkt_slack_stationarity_count: Index,
@@ -1104,6 +1136,14 @@ impl<P: BasicProblem> Ipopt<P> {
             let z_u = optional_slice(z_u, z_u_count);
             let v_l = optional_slice(v_l, v_l_count);
             let v_u = optional_slice(v_u, v_u_count);
+            let delta_x = optional_slice(delta_x, delta_x_count);
+            let delta_s = optional_slice(delta_s, delta_s_count);
+            let delta_y_c = optional_slice(delta_y_c, delta_y_c_count);
+            let delta_y_d = optional_slice(delta_y_d, delta_y_d_count);
+            let delta_z_l = optional_slice(delta_z_l, delta_z_l_count);
+            let delta_z_u = optional_slice(delta_z_u, delta_z_u_count);
+            let delta_v_l = optional_slice(delta_v_l, delta_v_l_count);
+            let delta_v_u = optional_slice(delta_v_u, delta_v_u_count);
             let kkt_x_stationarity =
                 optional_slice(kkt_x_stationarity, kkt_x_stationarity_count);
             let kkt_slack_stationarity =
@@ -1141,6 +1181,14 @@ impl<P: BasicProblem> Ipopt<P> {
                     z_u,
                     v_l,
                     v_u,
+                    delta_x,
+                    delta_s,
+                    delta_y_c,
+                    delta_y_d,
+                    delta_z_l,
+                    delta_z_u,
+                    delta_v_l,
+                    delta_v_u,
                     kkt_x_stationarity,
                     kkt_slack_stationarity,
                     kkt_equality_residual,

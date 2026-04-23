@@ -485,6 +485,22 @@ mod tests {
         v_l: *const CNLP_Number,
         v_u_count: CNLP_Index,
         v_u: *const CNLP_Number,
+        delta_x_count: CNLP_Index,
+        delta_x: *const CNLP_Number,
+        delta_s_count: CNLP_Index,
+        delta_s: *const CNLP_Number,
+        delta_y_c_count: CNLP_Index,
+        delta_y_c: *const CNLP_Number,
+        delta_y_d_count: CNLP_Index,
+        delta_y_d: *const CNLP_Number,
+        delta_z_l_count: CNLP_Index,
+        delta_z_l: *const CNLP_Number,
+        delta_z_u_count: CNLP_Index,
+        delta_z_u: *const CNLP_Number,
+        delta_v_l_count: CNLP_Index,
+        delta_v_l: *const CNLP_Number,
+        delta_v_u_count: CNLP_Index,
+        delta_v_u: *const CNLP_Number,
         kkt_x_stationarity_count: CNLP_Index,
         kkt_x_stationarity: *const CNLP_Number,
         kkt_slack_stationarity_count: CNLP_Index,
@@ -531,6 +547,38 @@ mod tests {
         if v_u_count > 0 {
             let v_u = unsafe { slice::from_raw_parts(v_u, v_u_count as usize) };
             assert_eq!(v_u.len(), v_u_count as usize);
+        }
+        if delta_x_count > 0 {
+            let values = unsafe { slice::from_raw_parts(delta_x, delta_x_count as usize) };
+            assert_eq!(values.len(), delta_x_count as usize);
+        }
+        if delta_s_count > 0 {
+            let values = unsafe { slice::from_raw_parts(delta_s, delta_s_count as usize) };
+            assert_eq!(values.len(), delta_s_count as usize);
+        }
+        if delta_y_c_count > 0 {
+            let values = unsafe { slice::from_raw_parts(delta_y_c, delta_y_c_count as usize) };
+            assert_eq!(values.len(), delta_y_c_count as usize);
+        }
+        if delta_y_d_count > 0 {
+            let values = unsafe { slice::from_raw_parts(delta_y_d, delta_y_d_count as usize) };
+            assert_eq!(values.len(), delta_y_d_count as usize);
+        }
+        if delta_z_l_count > 0 {
+            let values = unsafe { slice::from_raw_parts(delta_z_l, delta_z_l_count as usize) };
+            assert_eq!(values.len(), delta_z_l_count as usize);
+        }
+        if delta_z_u_count > 0 {
+            let values = unsafe { slice::from_raw_parts(delta_z_u, delta_z_u_count as usize) };
+            assert_eq!(values.len(), delta_z_u_count as usize);
+        }
+        if delta_v_l_count > 0 {
+            let values = unsafe { slice::from_raw_parts(delta_v_l, delta_v_l_count as usize) };
+            assert_eq!(values.len(), delta_v_l_count as usize);
+        }
+        if delta_v_u_count > 0 {
+            let values = unsafe { slice::from_raw_parts(delta_v_u, delta_v_u_count as usize) };
+            assert_eq!(values.len(), delta_v_u_count as usize);
         }
         if kkt_x_stationarity_count > 0 {
             let values = unsafe {
