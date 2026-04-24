@@ -3509,6 +3509,20 @@ where
     current_barrier.max(minimum_barrier)
 }
 
+fn initial_monotone_barrier_parameter(
+    has_barrier_pairs: bool,
+    options: &InteriorPointOptions,
+) -> f64 {
+    if has_barrier_pairs {
+        // IPOPT IpMonotoneMuUpdate::Initialize sets IpData().Set_mu(mu_init_)
+        // directly; mu_min and current complementarity belong to other update
+        // modes and must not alter the monotone initial barrier parameter.
+        options.mu_init
+    } else {
+        0.0
+    }
+}
+
 fn interior_point_complementarity_target_inf_norm(
     slack: &[f64],
     multipliers: &[f64],
@@ -4016,34 +4030,6 @@ fn interior_point_direction_diagnostics(
     }
 }
 
-fn native_lower_bound_complementarity_sum(
-    x: &[f64],
-    bounds: &BoundConstraints,
-    z_lower: &[f64],
-) -> f64 {
-    bounds
-        .lower_indices
-        .iter()
-        .zip(bounds.lower_values.iter())
-        .zip(z_lower.iter())
-        .map(|((&index, &lower), &z_i)| native_lower_bound_slack(x, index, lower) * z_i)
-        .sum::<f64>()
-}
-
-fn native_upper_bound_complementarity_sum(
-    x: &[f64],
-    bounds: &BoundConstraints,
-    z_upper: &[f64],
-) -> f64 {
-    bounds
-        .upper_indices
-        .iter()
-        .zip(bounds.upper_values.iter())
-        .zip(z_upper.iter())
-        .map(|((&index, &upper), &z_i)| native_upper_bound_slack(x, index, upper) * z_i)
-        .sum::<f64>()
-}
-
 fn native_bound_complementarity_inf_norm(
     x: &[f64],
     bounds: &BoundConstraints,
@@ -4066,31 +4052,6 @@ fn native_bound_complementarity_inf_norm(
         .fold(lower_inf, |acc, ((&index, &upper), &z_i)| {
             acc.max((native_upper_bound_slack(x, index, upper) * z_i).abs())
         })
-}
-
-fn combined_barrier_parameter(
-    slack: &[f64],
-    z: &[f64],
-    x: &[f64],
-    bounds: &BoundConstraints,
-    z_lower: &[f64],
-    z_upper: &[f64],
-) -> f64 {
-    let count = slack.len() + bounds.total_count();
-    if count == 0 {
-        return 0.0;
-    }
-    // Mirror IpoptCalculatedQuantities::curr_avrg_compl: z_L * slack_x_L,
-    // then z_U * slack_x_U, then v_L * slack_s_L, then v_U * slack_s_U.
-    // NLIP has no lower slack block, so bound lower/upper precede upper slacks.
-    let mut complementarity_sum = native_lower_bound_complementarity_sum(x, bounds, z_lower);
-    complementarity_sum += native_upper_bound_complementarity_sum(x, bounds, z_upper);
-    complementarity_sum += slack
-        .iter()
-        .zip(z.iter())
-        .map(|(s, z_i)| s * z_i)
-        .sum::<f64>();
-    complementarity_sum / count as f64
 }
 
 fn combined_complementarity_inf_norm(
@@ -8865,6 +8826,27 @@ mod tests {
     }
 
     #[test]
+    fn monotone_mu_initialization_uses_mu_init_exactly() {
+        let options = InteriorPointOptions {
+            mu_init: 1e-1,
+            mu_min: 1e-2,
+            mu_target: 1e-4,
+            ..InteriorPointOptions::default()
+        };
+
+        // IPOPT IpMonotoneMuUpdate::Initialize sets mu_init_ directly instead
+        // of clamping through current complementarity, mu_min, or mu_target.
+        assert_eq!(
+            initial_monotone_barrier_parameter(true, &options).to_bits(),
+            options.mu_init.to_bits()
+        );
+        assert_eq!(
+            initial_monotone_barrier_parameter(false, &options).to_bits(),
+            0.0_f64.to_bits()
+        );
+    }
+
+    #[test]
     fn monotone_mu_tiny_step_forces_only_one_drop() {
         let options = InteriorPointOptions::default();
 
@@ -9799,16 +9781,8 @@ where
     let theta_scale = initial_theta.max(1.0);
     let theta_max = options.theta_max_fact * theta_scale;
     let theta_min = options.theta_min_fact * theta_scale;
-    let mut barrier_parameter_value = if barrier_pair_count > 0 {
-        let initial_complementarity =
-            combined_barrier_parameter(&initial_slack_barrier, &z, &x, &bounds, &z_lower, &z_upper);
-        options
-            .mu_target
-            .max(options.mu_min)
-            .max(initial_complementarity.min(options.mu_init))
-    } else {
-        0.0
-    };
+    let mut barrier_parameter_value =
+        initial_monotone_barrier_parameter(barrier_pair_count > 0, options);
     let mut watchdog_state = InteriorPointWatchdogState::default();
     let mut monotone_mu_update_initialized = false;
     let mut pending_iteration_events = Vec::new();
