@@ -19,7 +19,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const IPOPT_INF: f64 = 1e20;
-const IPOPT_JOURNAL_PRINT_LEVEL: i32 = 5;
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,6 +123,32 @@ impl IpoptSpralScaling {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IpoptProvenance {
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linked_solver_stack: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linked_ipopt_version: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linked_ipopt_source_commit: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linked_spral_version: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linked_metis_version: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linked_openblas_version: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linked_openblas_threading: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linked_static_solver_math: Option<bool>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linked_ipopt_lib_dir: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linked_spral_lib_dir: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linked_metis_lib_dir: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linked_openblas_lib_dir: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub linked_openmp_lib: Option<String>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub pkg_config_version: Option<String>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
@@ -354,6 +379,14 @@ pub struct IpoptIterationSnapshot {
     pub upper_bound_multipliers: Vec<f64>,
     pub slack_lower_bound_multipliers: Vec<f64>,
     pub slack_upper_bound_multipliers: Vec<f64>,
+    pub direction_x: Vec<f64>,
+    pub direction_slack: Vec<f64>,
+    pub direction_equality_multipliers: Vec<f64>,
+    pub direction_inequality_multipliers: Vec<f64>,
+    pub direction_lower_bound_multipliers: Vec<f64>,
+    pub direction_upper_bound_multipliers: Vec<f64>,
+    pub direction_slack_lower_bound_multipliers: Vec<f64>,
+    pub direction_slack_upper_bound_multipliers: Vec<f64>,
     pub kkt_x_stationarity: Vec<f64>,
     pub kkt_slack_stationarity: Vec<f64>,
     pub kkt_equality_residual: Vec<f64>,
@@ -652,6 +685,14 @@ where
             upper_bound_multipliers: data.z_u.to_vec(),
             slack_lower_bound_multipliers: data.v_l.to_vec(),
             slack_upper_bound_multipliers: data.v_u.to_vec(),
+            direction_x: data.delta_x.to_vec(),
+            direction_slack: data.delta_s.to_vec(),
+            direction_equality_multipliers: data.delta_y_c.to_vec(),
+            direction_inequality_multipliers: data.delta_y_d.to_vec(),
+            direction_lower_bound_multipliers: data.delta_z_l.to_vec(),
+            direction_upper_bound_multipliers: data.delta_z_u.to_vec(),
+            direction_slack_lower_bound_multipliers: data.delta_v_l.to_vec(),
+            direction_slack_upper_bound_multipliers: data.delta_v_u.to_vec(),
             kkt_x_stationarity: data.kkt_x_stationarity.to_vec(),
             kkt_slack_stationarity: data.kkt_slack_stationarity.to_vec(),
             kkt_equality_residual: data.kkt_equality_residual.to_vec(),
@@ -920,7 +961,7 @@ fn solve_status_is_success(status: SolveStatus) -> bool {
     )
 }
 
-fn open_ipopt_journal<P>(solver: &mut Ipopt<P>) -> Option<PathBuf>
+fn open_ipopt_journal<P>(solver: &mut Ipopt<P>, print_level: i32) -> Option<PathBuf>
 where
     P: BasicProblem,
 {
@@ -935,7 +976,7 @@ where
     ));
     let path_text = path.to_string_lossy().into_owned();
     solver
-        .open_output_file(&path_text, IPOPT_JOURNAL_PRINT_LEVEL)
+        .open_output_file(&path_text, print_level)
         .map(|_| path)
 }
 
@@ -985,6 +1026,7 @@ fn ipopt_linear_solver_default(ipopt_binary: &Path) -> Option<String> {
 }
 
 pub fn capture_ipopt_provenance() -> IpoptProvenance {
+    let linked = ipopt::linked_ipopt_provenance();
     let pkg_config_version = command_stdout({
         let mut command = Command::new("pkg-config");
         command.arg("--modversion").arg("ipopt");
@@ -1000,6 +1042,19 @@ pub fn capture_ipopt_provenance() -> IpoptProvenance {
         .as_deref()
         .and_then(ipopt_linear_solver_default);
     IpoptProvenance {
+        linked_solver_stack: linked.link_mode.map(str::to_string),
+        linked_ipopt_version: linked.ipopt_version.map(str::to_string),
+        linked_ipopt_source_commit: linked.ipopt_source_commit.map(str::to_string),
+        linked_spral_version: linked.spral_version.map(str::to_string),
+        linked_metis_version: linked.metis_version.map(str::to_string),
+        linked_openblas_version: linked.openblas_version.map(str::to_string),
+        linked_openblas_threading: linked.openblas_threading.map(str::to_string),
+        linked_static_solver_math: linked.static_solver_math,
+        linked_ipopt_lib_dir: linked.ipopt_lib_dir.map(str::to_string),
+        linked_spral_lib_dir: linked.spral_lib_dir.map(str::to_string),
+        linked_metis_lib_dir: linked.metis_lib_dir.map(str::to_string),
+        linked_openblas_lib_dir: linked.openblas_lib_dir.map(str::to_string),
+        linked_openmp_lib: linked.openmp_lib.map(str::to_string),
         pkg_config_version,
         pkg_config_cflags_libs,
         ipopt_binary: ipopt_binary.map(|path| path.display().to_string()),
@@ -1112,7 +1167,7 @@ where
         let mut solver =
             Ipopt::new_newton(adapter).map_err(|err| IpoptSolveError::Setup(format!("{err:?}")))?;
         apply_ipopt_options(&mut solver, problem.ipopt_nlp_scaling_method(), options)?;
-        let journal_path = open_ipopt_journal(&mut solver);
+        let journal_path = open_ipopt_journal(&mut solver, options.print_level);
         solver.set_intermediate_callback(Some(IpoptProblemAdapter::<P, C>::record_iteration));
         let solve_result = solver.solve();
         let status = solve_result.status;
@@ -1181,7 +1236,7 @@ where
     let mut solver =
         Ipopt::new(adapter).map_err(|err| IpoptSolveError::Setup(format!("{err:?}")))?;
     apply_ipopt_options(&mut solver, problem.ipopt_nlp_scaling_method(), options)?;
-    let journal_path = open_ipopt_journal(&mut solver);
+    let journal_path = open_ipopt_journal(&mut solver, options.print_level);
     solver.set_intermediate_callback(Some(IpoptProblemAdapter::<P, C>::record_iteration));
 
     let solve_result = solver.solve();

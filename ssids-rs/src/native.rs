@@ -28,6 +28,17 @@ type SpralAnalyseFn = unsafe extern "C" fn(
     *const SpralSsidsOptions,
     *mut SpralSsidsInform,
 );
+type SpralAnalysePtr32Fn = unsafe extern "C" fn(
+    bool,
+    i32,
+    *mut i32,
+    *const i32,
+    *const i32,
+    *const f64,
+    *mut *mut c_void,
+    *const SpralSsidsOptions,
+    *mut SpralSsidsInform,
+);
 type SpralFactorFn = unsafe extern "C" fn(
     bool,
     *const i64,
@@ -39,9 +50,30 @@ type SpralFactorFn = unsafe extern "C" fn(
     *const SpralSsidsOptions,
     *mut SpralSsidsInform,
 );
+type SpralFactorPtr32Fn = unsafe extern "C" fn(
+    bool,
+    *const i32,
+    *const i32,
+    *const f64,
+    *mut f64,
+    *mut c_void,
+    *mut *mut c_void,
+    *const SpralSsidsOptions,
+    *mut SpralSsidsInform,
+);
 type SpralSolve1Fn = unsafe extern "C" fn(
     i32,
     *mut f64,
+    *mut c_void,
+    *mut c_void,
+    *const SpralSsidsOptions,
+    *mut SpralSsidsInform,
+);
+type SpralSolveFn = unsafe extern "C" fn(
+    i32,
+    i32,
+    *mut f64,
+    i32,
     *mut c_void,
     *mut c_void,
     *const SpralSsidsOptions,
@@ -149,8 +181,11 @@ struct NativeSpralLibrary {
     _linked: (),
     default_options: SpralDefaultOptionsFn,
     analyse: SpralAnalyseFn,
+    analyse_ptr32: SpralAnalysePtr32Fn,
     factor: SpralFactorFn,
+    factor_ptr32: SpralFactorPtr32Fn,
     solve1: SpralSolve1Fn,
+    solve: SpralSolveFn,
     enquire_indef: SpralEnquireIndefFn,
     free: SpralFreeFn,
 }
@@ -173,6 +208,17 @@ unsafe extern "C" {
         options: *const SpralSsidsOptions,
         inform: *mut SpralSsidsInform,
     );
+    fn spral_ssids_analyse_ptr32(
+        check: bool,
+        n: i32,
+        order: *mut i32,
+        ptr: *const i32,
+        row: *const i32,
+        val: *const f64,
+        akeep: *mut *mut c_void,
+        options: *const SpralSsidsOptions,
+        inform: *mut SpralSsidsInform,
+    );
     fn spral_ssids_factor(
         posdef: bool,
         ptr: *const i64,
@@ -184,9 +230,30 @@ unsafe extern "C" {
         options: *const SpralSsidsOptions,
         inform: *mut SpralSsidsInform,
     );
+    fn spral_ssids_factor_ptr32(
+        posdef: bool,
+        ptr: *const i32,
+        row: *const i32,
+        val: *const f64,
+        scaling: *mut f64,
+        akeep: *mut c_void,
+        fkeep: *mut *mut c_void,
+        options: *const SpralSsidsOptions,
+        inform: *mut SpralSsidsInform,
+    );
     fn spral_ssids_solve1(
         job: i32,
         rhs: *mut f64,
+        akeep: *mut c_void,
+        fkeep: *mut c_void,
+        options: *const SpralSsidsOptions,
+        inform: *mut SpralSsidsInform,
+    );
+    fn spral_ssids_solve(
+        job: i32,
+        nrhs: i32,
+        rhs: *mut f64,
+        ldx: i32,
         akeep: *mut c_void,
         fkeep: *mut c_void,
         options: *const SpralSsidsOptions,
@@ -213,8 +280,11 @@ fn linked_spral_library() -> NativeSpralLibrary {
         _linked: (),
         default_options: spral_ssids_default_options,
         analyse: spral_ssids_analyse,
+        analyse_ptr32: spral_ssids_analyse_ptr32,
         factor: spral_ssids_factor,
+        factor_ptr32: spral_ssids_factor_ptr32,
         solve1: spral_ssids_solve1,
+        solve: spral_ssids_solve,
         enquire_indef: spral_ssids_enquire_indef,
         free: spral_ssids_free,
     }
@@ -255,6 +325,9 @@ pub struct NativeSpralFactorInfo {
     pub inertia: Inertia,
     pub two_by_two_pivots: usize,
     pub delayed_pivots: usize,
+    pub factor_entries: usize,
+    pub flop_count: usize,
+    pub max_front_size: usize,
     pub supernode_count: usize,
     pub max_supernode_width: usize,
 }
@@ -276,7 +349,9 @@ pub struct NativeSpralSession {
     pattern_col_ptrs: Vec<usize>,
     pattern_row_indices: Vec<usize>,
     pattern_col_ptrs64: Vec<i64>,
+    pattern_col_ptrs32: Vec<i32>,
     pattern_row_indices32: Vec<i32>,
+    use_ipopt_ptr32_indexing: bool,
     options: SpralSsidsOptions,
     scaling: Option<Vec<f64>>,
     analysis_order: Option<Vec<usize>>,
@@ -364,15 +439,30 @@ impl NativeSpral {
                             &candidate,
                             b"spral_ssids_analyse\0",
                         )?;
+                        let analyse_ptr32 = load_symbol::<SpralAnalysePtr32Fn>(
+                            &library,
+                            &candidate,
+                            b"spral_ssids_analyse_ptr32\0",
+                        )?;
                         let factor = load_symbol::<SpralFactorFn>(
                             &library,
                             &candidate,
                             b"spral_ssids_factor\0",
                         )?;
+                        let factor_ptr32 = load_symbol::<SpralFactorPtr32Fn>(
+                            &library,
+                            &candidate,
+                            b"spral_ssids_factor_ptr32\0",
+                        )?;
                         let solve1 = load_symbol::<SpralSolve1Fn>(
                             &library,
                             &candidate,
                             b"spral_ssids_solve1\0",
+                        )?;
+                        let solve = load_symbol::<SpralSolveFn>(
+                            &library,
+                            &candidate,
+                            b"spral_ssids_solve\0",
                         )?;
                         let enquire_indef = load_symbol::<SpralEnquireIndefFn>(
                             &library,
@@ -389,8 +479,11 @@ impl NativeSpral {
                                 _library: library,
                                 default_options,
                                 analyse,
+                                analyse_ptr32,
                                 factor,
+                                factor_ptr32,
                                 solve1,
+                                solve,
                                 enquire_indef,
                                 free,
                             }),
@@ -463,7 +556,24 @@ impl NativeSpral {
             NativeOrdering::Natural => NativeOrderingSpec::Natural,
             NativeOrdering::Matching => NativeOrderingSpec::Matching,
         };
-        self.analyse_with_ordering_spec(matrix, numeric_options, ordering)
+        self.analyse_with_ordering_spec(matrix, numeric_options, ordering, false)
+    }
+
+    /// Analyse through the same SPRAL C entrypoints and index convention used by
+    /// IPOPT's `IpSpralSolverInterface.cpp`: `spral_ssids_analyse_ptr32` with
+    /// one-based compressed sparse indices, followed by `factor_ptr32`.
+    pub fn analyse_ipopt_compatible_with_options_and_ordering(
+        &self,
+        matrix: SymmetricCscMatrix<'_>,
+        numeric_options: &NumericFactorOptions,
+        ordering: NativeOrdering,
+    ) -> Result<NativeSpralSession, NativeSpralError> {
+        let ordering = match ordering {
+            NativeOrdering::LibraryDefault => NativeOrderingSpec::LibraryDefault,
+            NativeOrdering::Natural => NativeOrderingSpec::Natural,
+            NativeOrdering::Matching => NativeOrderingSpec::Matching,
+        };
+        self.analyse_with_ordering_spec(matrix, numeric_options, ordering, true)
     }
 
     /// Analyse with an explicit user ordering.
@@ -480,6 +590,7 @@ impl NativeSpral {
             matrix,
             numeric_options,
             NativeOrderingSpec::UserSupplied(order),
+            false,
         )
     }
 
@@ -488,10 +599,18 @@ impl NativeSpral {
         matrix: SymmetricCscMatrix<'_>,
         numeric_options: &NumericFactorOptions,
         ordering: NativeOrderingSpec<'_>,
+        use_ipopt_ptr32_indexing: bool,
     ) -> Result<NativeSpralSession, NativeSpralError> {
         if matrix.dimension() > i32::MAX as usize {
             return Err(NativeSpralError::DimensionTooLarge {
                 dimension: matrix.dimension(),
+            });
+        }
+        if use_ipopt_ptr32_indexing
+            && matrix.col_ptrs().last().copied().unwrap_or(0) >= i32::MAX as usize
+        {
+            return Err(NativeSpralError::DimensionTooLarge {
+                dimension: matrix.col_ptrs().last().copied().unwrap_or(0),
             });
         }
         let col_ptrs64 = matrix
@@ -499,23 +618,42 @@ impl NativeSpral {
             .iter()
             .map(|&entry| i64::try_from(entry).unwrap_or(i64::MAX))
             .collect::<Vec<_>>();
-        let row_indices32 = matrix
-            .row_indices()
-            .iter()
-            .map(|&entry| i32::try_from(entry).unwrap_or(i32::MAX))
-            .collect::<Vec<_>>();
+        let pattern_col_ptrs32 = if use_ipopt_ptr32_indexing {
+            matrix
+                .col_ptrs()
+                .iter()
+                .map(|&entry| i32::try_from(entry + 1).unwrap_or(i32::MAX))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let row_indices32 = if use_ipopt_ptr32_indexing {
+            matrix
+                .row_indices()
+                .iter()
+                .map(|&entry| i32::try_from(entry + 1).unwrap_or(i32::MAX))
+                .collect::<Vec<_>>()
+        } else {
+            matrix
+                .row_indices()
+                .iter()
+                .map(|&entry| i32::try_from(entry).unwrap_or(i32::MAX))
+                .collect::<Vec<_>>()
+        };
         let mut options = unsafe { std::mem::zeroed::<SpralSsidsOptions>() };
         unsafe { (self.inner.default_options)(&mut options) };
-        options.array_base = 0;
+        options.array_base = if use_ipopt_ptr32_indexing { 1 } else { 0 };
         options.use_gpu = false;
         options.ignore_numa = true;
         options.print_level = -1;
         apply_numeric_factor_options(&mut options, numeric_options);
         let mut order_storage = None;
+        let order_array_base = options.array_base;
         apply_native_ordering(
             &mut options,
             matrix.dimension(),
             ordering,
+            order_array_base,
             &mut order_storage,
         )?;
 
@@ -533,19 +671,35 @@ impl NativeSpral {
         };
 
         unsafe {
-            (self.inner.analyse)(
-                false,
-                i32::try_from(matrix.dimension()).unwrap_or(i32::MAX),
-                order_storage
-                    .as_mut()
-                    .map_or(ptr::null_mut(), |order| order.as_mut_ptr()),
-                col_ptrs64.as_ptr(),
-                row_indices32.as_ptr(),
-                values_ptr,
-                &mut analysed,
-                &options,
-                &mut inform,
-            );
+            if use_ipopt_ptr32_indexing {
+                (self.inner.analyse_ptr32)(
+                    false,
+                    i32::try_from(matrix.dimension()).unwrap_or(i32::MAX),
+                    order_storage
+                        .as_mut()
+                        .map_or(ptr::null_mut(), |order| order.as_mut_ptr()),
+                    pattern_col_ptrs32.as_ptr(),
+                    row_indices32.as_ptr(),
+                    values_ptr,
+                    &mut analysed,
+                    &options,
+                    &mut inform,
+                );
+            } else {
+                (self.inner.analyse)(
+                    false,
+                    i32::try_from(matrix.dimension()).unwrap_or(i32::MAX),
+                    order_storage
+                        .as_mut()
+                        .map_or(ptr::null_mut(), |order| order.as_mut_ptr()),
+                    col_ptrs64.as_ptr(),
+                    row_indices32.as_ptr(),
+                    values_ptr,
+                    &mut analysed,
+                    &options,
+                    &mut inform,
+                );
+            }
         }
         if inform.flag < 0 {
             let mut factorized = ptr::null_mut();
@@ -565,7 +719,9 @@ impl NativeSpral {
             pattern_col_ptrs: matrix.col_ptrs().to_vec(),
             pattern_row_indices: matrix.row_indices().to_vec(),
             pattern_col_ptrs64: col_ptrs64,
+            pattern_col_ptrs32,
             pattern_row_indices32: row_indices32,
+            use_ipopt_ptr32_indexing,
             options,
             scaling,
             analysis_order,
@@ -634,6 +790,7 @@ fn apply_native_ordering(
     native: &mut SpralSsidsOptions,
     dimension: usize,
     ordering: NativeOrderingSpec<'_>,
+    array_base: i32,
     order_storage: &mut Option<Vec<i32>>,
 ) -> Result<(), NativeSpralError> {
     match ordering {
@@ -642,7 +799,7 @@ fn apply_native_ordering(
             native.ordering = 0;
             *order_storage = Some(
                 (0..dimension)
-                    .map(|index| i32::try_from(index).unwrap_or(i32::MAX))
+                    .map(|index| i32::try_from(index).unwrap_or(i32::MAX) + array_base)
                     .collect(),
             );
         }
@@ -679,7 +836,7 @@ fn apply_native_ordering(
             *order_storage = Some(
                 order
                     .iter()
-                    .map(|&position| i32::try_from(position).unwrap_or(i32::MAX))
+                    .map(|&position| i32::try_from(position).unwrap_or(i32::MAX) + array_base)
                     .collect(),
             );
         }
@@ -754,6 +911,12 @@ impl NativeSpralSession {
         Ok(solution)
     }
 
+    pub fn solve_ipopt_single_rhs(&self, rhs: &[f64]) -> Result<Vec<f64>, NativeSpralError> {
+        let mut solution = rhs.to_vec();
+        self.solve_ipopt_single_rhs_in_place(&mut solution)?;
+        Ok(solution)
+    }
+
     pub fn solve_in_place(&self, rhs: &mut [f64]) -> Result<(), NativeSpralError> {
         if rhs.len() != self.dimension {
             return Err(NativeSpralError::DimensionMismatch {
@@ -769,6 +932,39 @@ impl NativeSpralSession {
             (self.inner.solve1)(
                 0,
                 rhs.as_mut_ptr(),
+                self.analysed,
+                self.factorized,
+                &self.options,
+                &mut inform,
+            );
+        }
+        if inform.flag < 0 {
+            return Err(NativeSpralError::SolveFailed { flag: inform.flag });
+        }
+        Ok(())
+    }
+
+    pub fn solve_ipopt_single_rhs_in_place(&self, rhs: &mut [f64]) -> Result<(), NativeSpralError> {
+        if rhs.len() != self.dimension {
+            return Err(NativeSpralError::DimensionMismatch {
+                expected: self.dimension,
+                actual: rhs.len(),
+            });
+        }
+        if self.factorized.is_null() {
+            return Err(NativeSpralError::NotFactorized);
+        }
+        let ldx =
+            i32::try_from(self.dimension).map_err(|_| NativeSpralError::DimensionTooLarge {
+                dimension: self.dimension,
+            })?;
+        let mut inform = SpralSsidsInform::default();
+        unsafe {
+            (self.inner.solve)(
+                0,
+                1,
+                rhs.as_mut_ptr(),
+                ldx,
                 self.analysed,
                 self.factorized,
                 &self.options,
@@ -834,17 +1030,31 @@ impl NativeSpralSession {
             .as_mut()
             .map_or(ptr::null_mut(), |scaling| scaling.as_mut_ptr());
         unsafe {
-            (self.inner.factor)(
-                false,
-                self.pattern_col_ptrs64.as_ptr(),
-                self.pattern_row_indices32.as_ptr(),
-                values.as_ptr(),
-                scaling_ptr,
-                self.analysed,
-                &mut self.factorized,
-                &self.options,
-                &mut inform,
-            );
+            if self.use_ipopt_ptr32_indexing {
+                (self.inner.factor_ptr32)(
+                    false,
+                    self.pattern_col_ptrs32.as_ptr(),
+                    self.pattern_row_indices32.as_ptr(),
+                    values.as_ptr(),
+                    scaling_ptr,
+                    self.analysed,
+                    &mut self.factorized,
+                    &self.options,
+                    &mut inform,
+                );
+            } else {
+                (self.inner.factor)(
+                    false,
+                    self.pattern_col_ptrs64.as_ptr(),
+                    self.pattern_row_indices32.as_ptr(),
+                    values.as_ptr(),
+                    scaling_ptr,
+                    self.analysed,
+                    &mut self.factorized,
+                    &self.options,
+                    &mut inform,
+                );
+            }
         }
         if inform.flag < 0 {
             return Err(NativeSpralError::FactorizationFailed { flag: inform.flag });
@@ -853,6 +1063,9 @@ impl NativeSpralSession {
             inertia: inertia_from_inform(self.dimension, &inform),
             two_by_two_pivots: inform.num_two.max(0) as usize,
             delayed_pivots: inform.num_delay.max(0) as usize,
+            factor_entries: inform.num_factor.max(0) as usize,
+            flop_count: inform.num_flops.max(0) as usize,
+            max_front_size: inform.maxfront.max(0) as usize,
             supernode_count: inform.num_sup.max(0) as usize,
             max_supernode_width: inform.maxsupernode.max(0) as usize,
         };

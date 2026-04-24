@@ -770,6 +770,18 @@ pub struct InteriorPointIterationTiming {
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq)]
+pub struct InteriorPointStepDirectionSnapshot {
+    pub x: Vec<f64>,
+    pub slack: Vec<f64>,
+    pub equality_multipliers: Vec<f64>,
+    pub inequality_multipliers: Vec<f64>,
+    pub slack_multipliers: Vec<f64>,
+    pub lower_bound_multipliers: Vec<f64>,
+    pub upper_bound_multipliers: Vec<f64>,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
 pub struct InteriorPointIterationSnapshot {
     pub iteration: Index,
     pub phase: InteriorPointIterationPhase,
@@ -824,6 +836,8 @@ pub struct InteriorPointIterationSnapshot {
     pub line_search: Option<InteriorPointLineSearchInfo>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub direction_diagnostics: Option<InteriorPointDirectionDiagnostics>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub step_direction: Option<InteriorPointStepDirectionSnapshot>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub linear_debug: Option<InteriorPointLinearDebugReport>,
     pub linear_solver: InteriorPointLinearSolver,
@@ -1069,7 +1083,6 @@ struct AcceptedInteriorPointTrial {
     barrier_objective: f64,
     equality_inf: f64,
     inequality_inf: f64,
-    primal_inf: f64,
     dual_inf: f64,
     complementarity_inf: f64,
     overall_inf: f64,
@@ -1080,6 +1093,7 @@ struct AcceptedInteriorPointTrial {
     filter_acceptance_mode: Option<FilterAcceptanceMode>,
     step_kind: InteriorPointStepKind,
     step_tag: char,
+    step_direction: Option<InteriorPointStepDirectionSnapshot>,
     phase: InteriorPointIterationPhase,
     accepted_alpha_pr: f64,
     accepted_alpha_du: Option<f64>,
@@ -1091,7 +1105,6 @@ struct AcceptedInteriorPointTrial {
     second_order_correction_used: bool,
     watchdog_accepted: bool,
     tiny_step: bool,
-    tiny_step_barrier_update: bool,
     bound_multiplier_corrected: bool,
 }
 
@@ -1621,12 +1634,22 @@ struct SymmetricSubmatrixReduction {
     source_value_indices: Vec<usize>,
 }
 
+#[derive(Clone, Copy)]
+struct ReducedBoundKktData<'a> {
+    x: &'a [f64],
+    bounds: &'a BoundConstraints,
+    fixed_variables: &'a FixedVariableElimination,
+    z_lower: &'a [f64],
+    z_upper: &'a [f64],
+}
+
 struct ReducedKktSystem<'a> {
     hessian: &'a SparseSymmetricMatrix,
     equality_jacobian: &'a SparseMatrix,
     inequality_jacobian: &'a SparseMatrix,
     bound_diagonal: &'a [f64],
     bound_rhs: &'a [f64],
+    bound_data: Option<ReducedBoundKktData<'a>>,
     slack: &'a [f64],
     multipliers: &'a [f64],
     r_dual: &'a [f64],
@@ -1670,6 +1693,7 @@ impl<'a> ReducedKktSystem<'a> {
             inequality_jacobian: self.inequality_jacobian,
             bound_diagonal: self.bound_diagonal,
             bound_rhs: self.bound_rhs,
+            bound_data: self.bound_data,
             slack: self.slack,
             multipliers: self.multipliers,
             r_dual: self.r_dual,
@@ -1714,6 +1738,7 @@ impl<'a> ReducedKktSystem<'a> {
             inequality_jacobian: self.inequality_jacobian,
             bound_diagonal: self.bound_diagonal,
             bound_rhs: self.bound_rhs,
+            bound_data: self.bound_data,
             slack: self.slack,
             multipliers: self.multipliers,
             r_dual: self.r_dual,
@@ -1848,6 +1873,13 @@ struct LinearBackendRunStats {
     residual_inf: f64,
     solution_inf: f64,
     detail: Option<String>,
+}
+
+struct SpralSrcFullSpaceSolution {
+    augmented_solution: Vec<f64>,
+    lower_bound_multiplier_step: Vec<f64>,
+    upper_bound_multiplier_step: Vec<f64>,
+    upper_slack_multiplier_step: Vec<f64>,
 }
 
 struct InteriorPointLinearDebugState {
@@ -2056,6 +2088,10 @@ impl InteriorPointKktSnapshot {
             inequality_jacobian: &self.inequality_jacobian,
             bound_diagonal: &self.bound_diagonal,
             bound_rhs: &self.bound_rhs,
+            // KKT snapshots do not yet carry the full variable-bound state
+            // needed for IPOPT's z_L/z_U residual rows, so replay diagnostics
+            // use the algebraically equivalent eliminated bound branch.
+            bound_data: None,
             slack: &self.slack,
             multipliers: &self.multipliers,
             r_dual: &self.r_dual,
@@ -2094,6 +2130,18 @@ fn linear_direction_inf_norm(direction: &NewtonDirection) -> f64 {
         .chain(direction.ds.iter())
         .chain(direction.dz.iter())
         .fold(0.0_f64, |acc, value| acc.max(value.abs()))
+}
+
+fn step_direction_snapshot(direction: &NewtonDirection) -> InteriorPointStepDirectionSnapshot {
+    InteriorPointStepDirectionSnapshot {
+        x: direction.dx.clone(),
+        slack: direction.ds.clone(),
+        equality_multipliers: direction.d_lambda.clone(),
+        inequality_multipliers: direction.d_ineq.clone(),
+        slack_multipliers: direction.dz.clone(),
+        lower_bound_multipliers: direction.dz_lower.clone(),
+        upper_bound_multipliers: direction.dz_upper.clone(),
+    }
 }
 
 fn should_run_linear_debug(
@@ -2142,13 +2190,6 @@ fn build_interior_point_kkt_snapshot(
     complementarity_inf: f64,
     line_search_trials: Index,
 ) -> std::result::Result<InteriorPointKktSnapshot, InteriorPointSolveError> {
-    let rhs_p = system
-        .r_cent
-        .iter()
-        .zip(system.slack.iter())
-        .enumerate()
-        .map(|(index, _)| ipopt_internal_slack_rhs(system, index))
-        .collect::<Vec<_>>();
     let pattern = build_spral_augmented_kkt_pattern(
         system.hessian.lower_triangle.as_ref(),
         system.equality_jacobian.structure.as_ref(),
@@ -2166,22 +2207,11 @@ fn build_interior_point_kkt_snapshot(
         slack_shift,
         dual_shift,
     );
-    let mut augmented_rhs = vec![0.0; pattern.dimension()];
     let n = system.hessian.lower_triangle.nrow;
     let meq = system.equality_jacobian.nrows();
     let mineq = system.inequality_jacobian.nrows();
-    augmented_rhs[..n]
-        .iter_mut()
-        .zip(system.r_dual.iter())
-        .zip(system.bound_rhs.iter())
-        .for_each(|((rhs_i, r_i), bound_rhs_i)| *rhs_i = -*r_i + bound_rhs_i);
-    augmented_rhs[pattern.p_offset..pattern.p_offset + mineq].copy_from_slice(&rhs_p);
-    for row in 0..meq {
-        augmented_rhs[pattern.lambda_offset + row] = -system.r_eq[row];
-    }
-    for row in 0..mineq {
-        augmented_rhs[pattern.z_offset + row] = -system.r_ineq[row];
-    }
+    let augmented_rhs =
+        build_ipopt_augmented_kkt_rhs(system, &pattern, IpoptLinearRhsOrientation::FinalDirection);
     Ok(InteriorPointKktSnapshot {
         iteration,
         phase,
@@ -2329,6 +2359,7 @@ fn newton_direction_from_augmented_solution(
     snapshot: &InteriorPointKktSnapshot,
     solver: InteriorPointLinearSolver,
     solution: Vec<f64>,
+    upper_slack_multiplier_step: Option<Vec<f64>>,
     backend_stats: LinearBackendRunStats,
 ) -> NewtonDirection {
     let n = snapshot.x_dimension;
@@ -2344,17 +2375,19 @@ fn newton_direction_from_augmented_solution(
     let d_ineq = solution
         [snapshot.augmented_pattern.z_offset..snapshot.augmented_pattern.z_offset + mineq]
         .to_vec();
-    let ds = ipopt_ds.iter().map(|value| -*value).collect::<Vec<_>>();
-    let dz = snapshot
-        .r_cent
-        .iter()
-        .zip(snapshot.multipliers.iter())
-        .zip(snapshot.slack.iter())
-        .zip(ipopt_ds.iter())
-        .map(|(((r_cent_i, z_i), s_i), ipopt_ds_i)| {
-            ipopt_upper_slack_bound_multiplier_step(*s_i, *z_i, *r_cent_i, *ipopt_ds_i)
-        })
-        .collect::<Vec<_>>();
+    let ds = ipopt_ds;
+    let dz = upper_slack_multiplier_step.unwrap_or_else(|| {
+        snapshot
+            .r_cent
+            .iter()
+            .zip(snapshot.multipliers.iter())
+            .zip(snapshot.slack.iter())
+            .zip(ds.iter())
+            .map(|(((r_cent_i, z_i), s_i), ds_i)| {
+                ipopt_final_upper_slack_bound_multiplier_step(*s_i, *z_i, *r_cent_i, *ds_i)
+            })
+            .collect::<Vec<_>>()
+    });
     NewtonDirection {
         dx,
         d_lambda,
@@ -2426,7 +2459,13 @@ fn replay_snapshot_with_solver(
                 false,
             )
             .map(|(solution, backend_stats)| {
-                newton_direction_from_augmented_solution(snapshot, solver, solution, backend_stats)
+                newton_direction_from_augmented_solution(
+                    snapshot,
+                    solver,
+                    solution,
+                    None,
+                    backend_stats,
+                )
             })
             .map_err(|attempt| vec![attempt])
         }
@@ -2467,15 +2506,37 @@ fn replay_snapshot_with_solver(
                 )]);
             }
             workspace.values.copy_from_slice(&snapshot.augmented_values);
+            let prefinal_rhs = snapshot
+                .augmented_rhs
+                .iter()
+                .map(|value| -*value)
+                .collect::<Vec<_>>();
             factor_solve_spral_src(
+                &system,
                 workspace,
-                &snapshot.augmented_rhs,
+                &prefinal_rhs,
                 snapshot.regularization,
+                IpoptLinearSolveContext {
+                    shifts: IpoptLinearRefinementShifts {
+                        primal: snapshot.primal_diagonal_shift,
+                        slack: snapshot.primal_diagonal_shift,
+                        dual: snapshot.dual_regularization,
+                    },
+                    rhs_orientation: IpoptLinearRhsOrientation::PreFinal,
+                    allow_inexact: false,
+                    native_spral_quality_was_increased: false,
+                },
                 &mut scratch_profiling,
                 false,
             )
             .map(|(solution, backend_stats)| {
-                newton_direction_from_augmented_solution(snapshot, solver, solution, backend_stats)
+                newton_direction_from_augmented_solution(
+                    snapshot,
+                    solver,
+                    solution.augmented_solution,
+                    Some(solution.upper_slack_multiplier_step),
+                    backend_stats,
+                )
             })
             .map_err(|attempt| vec![attempt])
         }
@@ -2662,6 +2723,7 @@ fn dump_linear_debug_snapshot(
     options: &InteriorPointLinearDebugOptions,
     snapshot: &InteriorPointKktSnapshot,
     report: &InteriorPointLinearDebugReport,
+    primary_direction: Option<&NewtonDirection>,
 ) {
     let Some(dir) = options.dump_dir.as_ref() else {
         return;
@@ -2716,14 +2778,32 @@ fn dump_linear_debug_snapshot(
         body.push_str(&format!("note={note}\n"));
     }
     body.push_str(&format!(
-        "col_ptrs={:?}\nrow_indices={:?}\nvalues={:?}\nrhs={:?}\nslack={:?}\nmultipliers={:?}\n",
+        "col_ptrs={:?}\nrow_indices={:?}\nvalues={:?}\nrhs={:?}\nr_dual={:?}\nbound_rhs={:?}\nslack={:?}\nmultipliers={:?}\n",
         snapshot.augmented_pattern.ccs.col_ptrs,
         snapshot.augmented_pattern.ccs.row_indices,
         snapshot.augmented_values,
         snapshot.augmented_rhs,
+        snapshot.r_dual,
+        snapshot.bound_rhs,
         snapshot.slack,
         snapshot.multipliers,
     ));
+    if let Some(direction) = primary_direction {
+        // For the IPOPT full-space path, `linear_solution` is stored after
+        // PDSearchDirCalc's final alpha=-1 scaling.  The prefinal vector is
+        // the post-refinement accumulated solution before that final scaling;
+        // individual IpStdAugSystemSolver.cpp SOL[0] lines are compared by the
+        // glider diagnostic's cumulative-window reconstruction.
+        let prefinal_solution = direction
+            .linear_solution
+            .iter()
+            .map(|value| -*value)
+            .collect::<Vec<_>>();
+        body.push_str(&format!(
+            "linear_solution_final={:?}\nlinear_solution_prefinal={:?}\n",
+            direction.linear_solution, prefinal_solution,
+        ));
+    }
     let _ = fs::write(path, body);
 }
 
@@ -2808,7 +2888,7 @@ fn slack_form_inequality_residuals(augmented_inequality_values: &[f64], slack: &
     augmented_inequality_values
         .iter()
         .zip(slack.iter())
-        .map(|(&g_i, &s_i)| g_i + s_i)
+        .map(|(&g_i, &s_i)| g_i - s_i)
         .collect()
 }
 
@@ -2817,7 +2897,7 @@ fn slack_form_inequality_l1_norm(augmented_inequality_values: &[f64], slack: &[f
     augmented_inequality_values
         .iter()
         .zip(slack.iter())
-        .map(|(&g_i, &s_i)| (g_i + s_i).abs())
+        .map(|(&g_i, &s_i)| (g_i - s_i).abs())
         .sum()
 }
 
@@ -2826,7 +2906,7 @@ fn slack_form_inequality_inf_norm(augmented_inequality_values: &[f64], slack: &[
     augmented_inequality_values
         .iter()
         .zip(slack.iter())
-        .fold(0.0, |acc, (&g_i, &s_i)| acc.max((g_i + s_i).abs()))
+        .fold(0.0, |acc, (&g_i, &s_i)| acc.max((g_i - s_i).abs()))
 }
 
 fn filter_theta_l1_norm(
@@ -2858,71 +2938,74 @@ fn slack_bound_relaxation(options: &InteriorPointOptions) -> f64 {
     bound_relaxation_amount(0.0, options)
 }
 
-fn relax_augmented_inequality_values(values: &mut [f64], options: &InteriorPointOptions) {
-    let relaxation = slack_bound_relaxation(options);
-    if relaxation == 0.0 {
-        return;
-    }
-    // IPOPT relaxes d_L/d_U before forming its internal d(x)-s=0 row. Our
-    // compiled inequalities are already normalized as g(x) <= 0, so every
-    // one-sided row moves outward by the zero-bound relaxation amount.
-    for value in values {
-        *value -= relaxation;
-    }
+fn slack_upper_bound_values(count: usize, options: &InteriorPointOptions) -> Vec<f64> {
+    vec![slack_bound_relaxation(options); count]
 }
 
-fn slack_barrier_values(slack: &[f64]) -> Vec<f64> {
-    slack.to_vec()
+fn inequality_upper_bound_inf_norm(values: &[f64], upper_bounds: &[f64]) -> f64 {
+    debug_assert_eq!(values.len(), upper_bounds.len());
+    values
+        .iter()
+        .zip(upper_bounds.iter())
+        .fold(0.0_f64, |acc, (&value, &upper)| {
+            acc.max((value - upper).max(0.0))
+        })
 }
 
-fn native_bound_log_sum(x: &[f64], bounds: &BoundConstraints) -> f64 {
-    let lower_sum = bounds
+fn slack_barrier_values(slack: &[f64], upper_bounds: &[f64]) -> Vec<f64> {
+    debug_assert_eq!(slack.len(), upper_bounds.len());
+    // NLIP stores inequality slacks in IPOPT's internal upper-bound
+    // convention: d(x) - s = 0 and s <= d_U. IPOPT's barrier,
+    // complementarity, and sigma routines operate on curr_slack_s_U = d_U - s.
+    // See IpIpoptCalculatedQuantities.cpp::curr_slack_s_U/curr_sigma_s and
+    // OrigIpoptNLP.cpp::relax_bounds for the relaxed d_U construction.
+    upper_bounds
+        .iter()
+        .zip(slack.iter())
+        .map(|(&upper, &value)| upper - value)
+        .collect()
+}
+
+fn slack_barrier_direction_values(slack_direction: &[f64]) -> Vec<f64> {
+    slack_direction.iter().map(|value| -*value).collect()
+}
+
+fn native_lower_bound_log_sum(x: &[f64], bounds: &BoundConstraints) -> f64 {
+    bounds
         .lower_indices
         .iter()
         .zip(bounds.lower_values.iter())
         .map(|(&index, &lower)| native_lower_bound_slack(x, index, lower).ln())
-        .sum::<f64>();
-    let upper_sum = bounds
+        .sum::<f64>()
+}
+
+fn native_upper_bound_log_sum(x: &[f64], bounds: &BoundConstraints) -> f64 {
+    bounds
         .upper_indices
         .iter()
         .zip(bounds.upper_values.iter())
         .map(|(&index, &upper)| native_upper_bound_slack(x, index, upper).ln())
-        .sum::<f64>();
-    lower_sum + upper_sum
+        .sum::<f64>()
 }
 
-fn native_bound_damping_sum(x: &[f64], bounds: &BoundConstraints) -> f64 {
-    let lower_sum = bounds
+fn native_lower_bound_damping_sum(x: &[f64], bounds: &BoundConstraints) -> f64 {
+    bounds
         .lower_indices
         .iter()
         .zip(bounds.lower_values.iter())
         .filter(|(index, _)| !bounds.upper_indices.contains(index))
         .map(|(&index, &lower)| native_lower_bound_slack(x, index, lower))
-        .sum::<f64>();
-    let upper_sum = bounds
+        .sum::<f64>()
+}
+
+fn native_upper_bound_damping_sum(x: &[f64], bounds: &BoundConstraints) -> f64 {
+    bounds
         .upper_indices
         .iter()
         .zip(bounds.upper_values.iter())
         .filter(|(index, _)| !bounds.lower_indices.contains(index))
         .map(|(&index, &upper)| native_upper_bound_slack(x, index, upper))
-        .sum::<f64>();
-    lower_sum + upper_sum
-}
-
-fn native_bound_damping_directional_derivative(dx: &[f64], bounds: &BoundConstraints) -> f64 {
-    let lower_sum = bounds
-        .lower_indices
-        .iter()
-        .filter(|index| !bounds.upper_indices.contains(index))
-        .map(|&index| dx[index])
-        .sum::<f64>();
-    let upper_sum = bounds
-        .upper_indices
-        .iter()
-        .filter(|index| !bounds.lower_indices.contains(index))
-        .map(|&index| -dx[index])
-        .sum::<f64>();
-    lower_sum + upper_sum
+        .sum::<f64>()
 }
 
 fn positive_slack_damping(barrier_parameter: f64, kappa_d: f64) -> f64 {
@@ -2941,22 +3024,228 @@ fn damped_slack_stationarity_residual(system: &ReducedKktSystem<'_>, index: usiz
     system.r_slack_stationarity[index] - system_positive_slack_damping(system)
 }
 
-fn ipopt_internal_slack_rhs(system: &ReducedKktSystem<'_>, index: usize) -> f64 {
-    system.r_cent[index] / system.slack[index] - damped_slack_stationarity_residual(system, index)
+fn fill_ipopt_augmented_x_rhs(rhs: &mut [f64], system: &ReducedKktSystem<'_>, sign: f64) {
+    if let Some(bound_data) = system.bound_data {
+        rhs.iter_mut()
+            .zip(system.r_dual.iter())
+            .for_each(|(rhs_i, r_i)| *rhs_i = sign * *r_i);
+        let damping = system_positive_slack_damping(system);
+        // Mirrors IpPDSearchDirCalc.cpp::ComputeSearchDirection followed by
+        // IpPDFullSpaceSolver.cpp::SolveOnce: `augRhs_x` starts as
+        // `curr_grad_lag_with_damping_x`, then lower and upper bound relaxed
+        // complementarity terms are applied with AddMSinvZ in this order.
+        for ((&index, &lower), &z_i) in bound_data
+            .bounds
+            .lower_indices
+            .iter()
+            .zip(bound_data.bounds.lower_values.iter())
+            .zip(bound_data.z_lower.iter())
+        {
+            let Some(reduced_index) = bound_data.fixed_variables.free_position[index] else {
+                continue;
+            };
+            if damping > 0.0 && !bound_data.bounds.upper_indices.contains(&index) {
+                rhs[reduced_index] += sign * damping;
+            }
+            let slack = native_lower_bound_slack(bound_data.x, index, lower);
+            let mut relaxed_complementarity = slack * z_i;
+            relaxed_complementarity += -system.barrier_parameter;
+            rhs[reduced_index] += sign * (relaxed_complementarity / slack);
+        }
+        for ((&index, &upper), &z_i) in bound_data
+            .bounds
+            .upper_indices
+            .iter()
+            .zip(bound_data.bounds.upper_values.iter())
+            .zip(bound_data.z_upper.iter())
+        {
+            let Some(reduced_index) = bound_data.fixed_variables.free_position[index] else {
+                continue;
+            };
+            if damping > 0.0 && !bound_data.bounds.lower_indices.contains(&index) {
+                rhs[reduced_index] += sign * -damping;
+            }
+            let slack = native_upper_bound_slack(bound_data.x, index, upper);
+            let mut relaxed_complementarity = slack * z_i;
+            relaxed_complementarity += -system.barrier_parameter;
+            rhs[reduced_index] += sign * -(relaxed_complementarity / slack);
+        }
+    } else {
+        rhs.iter_mut()
+            .zip(system.r_dual.iter())
+            .zip(system.bound_rhs.iter())
+            .for_each(|((rhs_i, r_i), bound_rhs_i)| *rhs_i = sign * (*r_i - *bound_rhs_i));
+    }
 }
 
-fn ipopt_upper_slack_bound_multiplier_step(
+fn build_ipopt_augmented_kkt_rhs(
+    system: &ReducedKktSystem<'_>,
+    pattern: &SpralAugmentedKktPattern,
+    orientation: IpoptLinearRhsOrientation,
+) -> Vec<f64> {
+    let n = system.hessian.lower_triangle.nrow;
+    let meq = system.equality_jacobian.nrows();
+    let mineq = system.inequality_jacobian.nrows();
+    let mut rhs = vec![0.0; pattern.dimension()];
+    let sign = match orientation {
+        IpoptLinearRhsOrientation::PreFinal => 1.0,
+        IpoptLinearRhsOrientation::FinalDirection => -1.0,
+    };
+    fill_ipopt_augmented_x_rhs(&mut rhs[..n], system, sign);
+    for row in 0..mineq {
+        // Mirror IpPDFullSpaceSolver::SolveOnce: augRhs_s starts as
+        // rhs.s(), then Pd_U.AddMSinvZ(-1.0, slack_s_U, rhs.v_U(), augRhs_s)
+        // applies `rhs_s -= rhs_v / slack`. This avoids the different rounding
+        // from the algebraically equivalent `-(rhs_v / slack - rhs_s)`.
+        let mut rhs_s = sign * damped_slack_stationarity_residual(system, row);
+        rhs_s -= (sign * system.r_cent[row]) / system.slack[row];
+        rhs[pattern.p_offset + row] = rhs_s;
+    }
+    for row in 0..meq {
+        rhs[pattern.lambda_offset + row] = sign * system.r_eq[row];
+    }
+    for row in 0..mineq {
+        rhs[pattern.z_offset + row] = sign * system.r_ineq[row];
+    }
+    rhs
+}
+
+fn ipopt_final_upper_slack_bound_multiplier_step(
+    slack: f64,
+    multiplier: f64,
+    complementarity_residual: f64,
+    ipopt_internal_slack_step: f64,
+) -> f64 {
+    // Mirrors IPOPT's operation order in PDFullSpaceSolver::Solve:
+    // SolveOnce first computes Pd_U.SinvBlrmZMTdBr(1., ...) using the
+    // pre-final slack step, then PDSearchDirCalc's Solve(-1., 0., ...) negates
+    // the whole IteratesVector. Keep that order instead of recomputing the
+    // algebraically equivalent final formula directly.
+    -ipopt_prefinal_upper_slack_bound_multiplier_step(
+        slack,
+        multiplier,
+        complementarity_residual,
+        -ipopt_internal_slack_step,
+    )
+}
+
+fn ipopt_prefinal_upper_slack_bound_multiplier_step(
     slack: f64,
     multiplier: f64,
     complementarity_residual: f64,
     ipopt_internal_slack_step: f64,
 ) -> f64 {
     // Mirrors IPOPT PDFullSpaceSolver::SolveOnce Pd_U.SinvBlrmZMTdBr(1., ...)
-    // followed by PDSearchDirCalc's Solve(-1., 0., ...) final scaling:
-    // delta_v_U = (-rhs.v_U + v_U * delta_s) / slack_s_U. NLIP's public slack
-    // direction is sign-flipped for the upper-slack distance, so this takes
-    // the raw IPOPT-internal augmented-system slack component.
-    (-complementarity_residual + multiplier * ipopt_internal_slack_step) / slack
+    // before PDSearchDirCalc's final Solve(-1., 0., ...) scaling.
+    (complementarity_residual + multiplier * ipopt_internal_slack_step) / slack
+}
+
+fn ipopt_oriented_upper_slack_bound_multiplier_step(
+    slack: f64,
+    multiplier: f64,
+    oriented_complementarity_rhs: f64,
+    oriented_slack_step: f64,
+) -> f64 {
+    // Mirrors ExpansionMatrix::SinvBlrmZMTdBrImpl for the upper slack block:
+    // X[i] = (R[i] + Z[i] * D[exp_pos[i]]) / S[i].  The caller passes R and D
+    // in the same orientation as the current PDFullSpaceSolver rhs/res vector.
+    (oriented_complementarity_rhs + multiplier * oriented_slack_step) / slack
+}
+
+fn ipopt_oriented_lower_bound_multiplier_step(
+    slack: f64,
+    multiplier: f64,
+    oriented_complementarity_rhs: f64,
+    oriented_primal_step: f64,
+) -> f64 {
+    // Mirrors IPOPT PDFullSpaceSolver::SolveOnce:
+    // Px_L.SinvBlrmZMTdBr(-1., slack_x_L, rhs.z_L, z_L, sol.x, sol.z_L).
+    (oriented_complementarity_rhs - multiplier * oriented_primal_step) / slack
+}
+
+fn ipopt_oriented_upper_bound_multiplier_step(
+    slack: f64,
+    multiplier: f64,
+    oriented_complementarity_rhs: f64,
+    oriented_primal_step: f64,
+) -> f64 {
+    // Mirrors IPOPT PDFullSpaceSolver::SolveOnce:
+    // Px_U.SinvBlrmZMTdBr(1., slack_x_U, rhs.z_U, z_U, sol.x, sol.z_U).
+    (oriented_complementarity_rhs + multiplier * oriented_primal_step) / slack
+}
+
+fn ipopt_bound_multiplier_steps_for_orientation(
+    bound_data: ReducedBoundKktData<'_>,
+    reduced_primal_step: &[f64],
+    orientation: IpoptLinearRhsOrientation,
+    barrier_parameter: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    let sign = match orientation {
+        IpoptLinearRhsOrientation::PreFinal => 1.0,
+        IpoptLinearRhsOrientation::FinalDirection => -1.0,
+    };
+    let lower_steps = bound_data
+        .bounds
+        .lower_indices
+        .iter()
+        .zip(bound_data.bounds.lower_values.iter())
+        .zip(bound_data.z_lower.iter())
+        .map(|((&index, &lower), &z_i)| {
+            let Some(reduced_index) = bound_data.fixed_variables.free_position[index] else {
+                return 0.0;
+            };
+            let slack = native_lower_bound_slack(bound_data.x, index, lower);
+            let complementarity = slack * z_i - barrier_parameter;
+            ipopt_oriented_lower_bound_multiplier_step(
+                slack,
+                z_i,
+                sign * complementarity,
+                reduced_primal_step[reduced_index],
+            )
+        })
+        .collect::<Vec<_>>();
+    let upper_steps = bound_data
+        .bounds
+        .upper_indices
+        .iter()
+        .zip(bound_data.bounds.upper_values.iter())
+        .zip(bound_data.z_upper.iter())
+        .map(|((&index, &upper), &z_i)| {
+            let Some(reduced_index) = bound_data.fixed_variables.free_position[index] else {
+                return 0.0;
+            };
+            let slack = native_upper_bound_slack(bound_data.x, index, upper);
+            let complementarity = slack * z_i - barrier_parameter;
+            ipopt_oriented_upper_bound_multiplier_step(
+                slack,
+                z_i,
+                sign * complementarity,
+                reduced_primal_step[reduced_index],
+            )
+        })
+        .collect::<Vec<_>>();
+    (lower_steps, upper_steps)
+}
+
+fn ipopt_upper_slack_bound_multiplier_steps_for_orientation(
+    system: &ReducedKktSystem<'_>,
+    slack_steps: &[f64],
+    orientation: IpoptLinearRhsOrientation,
+) -> Vec<f64> {
+    let sign = match orientation {
+        IpoptLinearRhsOrientation::PreFinal => 1.0,
+        IpoptLinearRhsOrientation::FinalDirection => -1.0,
+    };
+    system
+        .r_cent
+        .iter()
+        .zip(system.multipliers.iter())
+        .zip(system.slack.iter())
+        .zip(slack_steps.iter())
+        .map(|(((r_cent_i, z_i), s_i), ds_i)| {
+            ipopt_oriented_upper_slack_bound_multiplier_step(*s_i, *z_i, sign * *r_cent_i, *ds_i)
+        })
+        .collect()
 }
 
 fn slack_stationarity_residuals(lambda_ineq: &[f64], z: &[f64]) -> Vec<f64> {
@@ -3014,15 +3303,21 @@ fn barrier_objective_value(
     if (slack.is_empty() && bounds.total_count() == 0) || barrier_parameter <= 0.0 {
         return objective_value;
     }
-    let slack_log_sum = slack.iter().map(|value| value.ln()).sum::<f64>();
+    // Mirror IpoptCalculatedQuantities::CalcBarrierTerm: accumulate x_L,
+    // x_U, s_L, then s_U before applying -mu, then add damping in the same
+    // component order. NLIP currently has only upper slacks for inequalities.
+    let mut barrier_term = 0.0;
+    barrier_term += native_lower_bound_log_sum(x, bounds);
+    barrier_term += native_upper_bound_log_sum(x, bounds);
+    barrier_term += slack.iter().map(|value| value.ln()).sum::<f64>();
+    let mut result = objective_value + (-barrier_parameter * barrier_term);
     let damping_weight = positive_slack_damping(barrier_parameter, kappa_d);
-    let damping = if damping_weight > 0.0 {
-        damping_weight * (slack.iter().sum::<f64>() + native_bound_damping_sum(x, bounds))
-    } else {
-        0.0
-    };
-    objective_value - barrier_parameter * (slack_log_sum + native_bound_log_sum(x, bounds))
-        + damping
+    if damping_weight > 0.0 {
+        result += damping_weight * native_lower_bound_damping_sum(x, bounds);
+        result += damping_weight * native_upper_bound_damping_sum(x, bounds);
+        result += damping_weight * slack.iter().sum::<f64>();
+    }
+    result
 }
 
 #[expect(
@@ -3039,41 +3334,62 @@ fn barrier_objective_directional_derivative(
     barrier_parameter: f64,
     kappa_d: f64,
 ) -> f64 {
-    let objective_term = gradient
+    if (slack.is_empty() && bounds.total_count() == 0) || barrier_parameter <= 0.0 {
+        return gradient
+            .iter()
+            .zip(dx.iter())
+            .map(|(gradient_i, dx_i)| gradient_i * dx_i)
+            .sum::<f64>();
+    }
+    // Mirror IpoptCalculatedQuantities::curr_gradBarrTDelta: first build
+    // curr_grad_barrier_obj_x and curr_grad_barrier_obj_s in source order, then
+    // take the two dots. This preserves IPOPT's x_L/x_U/s_L/s_U update order
+    // instead of regrouping the algebra into independent sums.
+    let mut grad_x = gradient.to_vec();
+    for (&index, &lower) in bounds.lower_indices.iter().zip(bounds.lower_values.iter()) {
+        grad_x[index] += -barrier_parameter / native_lower_bound_slack(x, index, lower);
+    }
+    for (&index, &upper) in bounds.upper_indices.iter().zip(bounds.upper_values.iter()) {
+        grad_x[index] += barrier_parameter / native_upper_bound_slack(x, index, upper);
+    }
+    let damping_weight = positive_slack_damping(barrier_parameter, kappa_d);
+    if damping_weight > 0.0 {
+        for &index in bounds
+            .lower_indices
+            .iter()
+            .filter(|index| !bounds.upper_indices.contains(index))
+        {
+            grad_x[index] += damping_weight;
+        }
+        for &index in bounds
+            .upper_indices
+            .iter()
+            .filter(|index| !bounds.lower_indices.contains(index))
+        {
+            grad_x[index] -= damping_weight;
+        }
+    }
+    let x_dot = grad_x
         .iter()
         .zip(dx.iter())
         .map(|(gradient_i, dx_i)| gradient_i * dx_i)
         .sum::<f64>();
-    if (slack.is_empty() && bounds.total_count() == 0) || barrier_parameter <= 0.0 {
-        return objective_term;
+
+    let mut grad_s = vec![0.0; slack.len()];
+    for (grad_i, slack_i) in grad_s.iter_mut().zip(slack.iter()) {
+        *grad_i += barrier_parameter / slack_i;
     }
-    let slack_barrier_term = slack
+    if damping_weight > 0.0 {
+        for grad_i in &mut grad_s {
+            *grad_i -= damping_weight;
+        }
+    }
+    let s_dot = grad_s
         .iter()
         .zip(ds.iter())
-        .map(|(slack_i, ds_i)| ds_i / slack_i)
+        .map(|(gradient_i, ds_i)| gradient_i * ds_i)
         .sum::<f64>();
-    let lower_barrier_term = bounds
-        .lower_indices
-        .iter()
-        .zip(bounds.lower_values.iter())
-        .map(|(&index, &lower)| dx[index] / native_lower_bound_slack(x, index, lower))
-        .sum::<f64>();
-    let upper_barrier_term = bounds
-        .upper_indices
-        .iter()
-        .zip(bounds.upper_values.iter())
-        .map(|(&index, &upper)| -dx[index] / native_upper_bound_slack(x, index, upper))
-        .sum::<f64>();
-    let damping_weight = positive_slack_damping(barrier_parameter, kappa_d);
-    let damping_term = if damping_weight > 0.0 {
-        damping_weight
-            * (ds.iter().sum::<f64>() + native_bound_damping_directional_derivative(dx, bounds))
-    } else {
-        0.0
-    };
-    objective_term
-        - barrier_parameter * (slack_barrier_term + lower_barrier_term + upper_barrier_term)
-        + damping_term
+    x_dot + s_dot
 }
 
 fn switching_condition_satisfied(
@@ -3106,7 +3422,10 @@ fn calculate_filter_alpha_min(
             );
         }
     }
-    (options.alpha_min_frac * alpha_min).max(options.min_step)
+    // IPOPT `FilterLSAcceptor::CalculateAlphaMin` returns only
+    // `alpha_min_frac * alpha_min`; the backtracking loop itself is
+    // responsible for always checking the first trial point.
+    options.alpha_min_frac * alpha_min
 }
 
 fn barrier_objective_increase_too_large(
@@ -3135,9 +3454,11 @@ fn should_reduce_barrier_parameter(
 
 fn minimum_monotone_barrier_parameter(options: &InteriorPointOptions) -> f64 {
     let tol = options.overall_tol.min(options.complementarity_tol);
+    // IPOPT MonotoneMuUpdate::CalcNewMuAndTau uses mu_target and the
+    // tol/compl_inf_tol floor here. The separate mu_min option belongs to the
+    // adaptive/free-mu path, not to monotone mu updates.
     options
         .mu_target
-        .max(options.mu_min)
         .max(tol / (options.barrier_tol_factor + 1.0))
 }
 
@@ -3155,6 +3476,7 @@ fn next_barrier_parameter_once(barrier_parameter: f64, options: &InteriorPointOp
 fn next_barrier_parameter<F>(
     barrier_parameter: f64,
     tiny_step: bool,
+    mu_update_initialized: bool,
     options: &InteriorPointOptions,
     mut barrier_error: F,
 ) -> f64
@@ -3162,24 +3484,43 @@ where
     F: FnMut(f64) -> f64,
 {
     let mut current_barrier = barrier_parameter;
+    let mut current_tiny_step = tiny_step;
     let minimum_barrier = minimum_monotone_barrier_parameter(options);
     loop {
         let current_barrier_error = barrier_error(current_barrier);
-        if !tiny_step
+        if !current_tiny_step
             && !should_reduce_barrier_parameter(current_barrier_error, current_barrier, options)
         {
             break;
         }
         let next_barrier = next_barrier_parameter_once(current_barrier, options);
-        if next_barrier >= current_barrier - 1e-18 {
+        // IpMonotoneMuUpdate::UpdateBarrierParameter uses exact `mu !=
+        // new_mu` to decide whether the barrier changed; avoid a local
+        // tolerance that can skip a source-visible mu update near the floor.
+        if next_barrier == current_barrier {
             break;
         }
         current_barrier = next_barrier.max(minimum_barrier);
-        if !options.mu_allow_fast_monotone_decrease {
+        if mu_update_initialized && !options.mu_allow_fast_monotone_decrease {
             break;
         }
+        current_tiny_step = false;
     }
     current_barrier.max(minimum_barrier)
+}
+
+fn initial_monotone_barrier_parameter(
+    has_barrier_pairs: bool,
+    options: &InteriorPointOptions,
+) -> f64 {
+    if has_barrier_pairs {
+        // IPOPT IpMonotoneMuUpdate::Initialize sets IpData().Set_mu(mu_init_)
+        // directly; mu_min and current complementarity belong to other update
+        // modes and must not alter the monotone initial barrier parameter.
+        options.mu_init
+    } else {
+        0.0
+    }
 }
 
 fn interior_point_complementarity_target_inf_norm(
@@ -3253,8 +3594,10 @@ fn alpha_for_y(
     let alpha = match options.alpha_for_y {
         InteriorPointAlphaForYStrategy::Primal => alpha_primal,
         InteriorPointAlphaForYStrategy::BoundMultiplier => alpha_dual,
-        InteriorPointAlphaForYStrategy::Min => alpha_primal.min(alpha_dual),
-        InteriorPointAlphaForYStrategy::Max => alpha_primal.max(alpha_dual),
+        // IPOPT IpBacktrackingLineSearch::PerformDualStep calls
+        // Min(alpha_dual, alpha_primal) and Max(alpha_dual, alpha_primal).
+        InteriorPointAlphaForYStrategy::Min => ipopt_cxx_min(alpha_dual, alpha_primal),
+        InteriorPointAlphaForYStrategy::Max => ipopt_cxx_max(alpha_dual, alpha_primal),
         InteriorPointAlphaForYStrategy::Full => 1.0,
         InteriorPointAlphaForYStrategy::PrimalAndFull => {
             if primal_step_norm <= options.alpha_for_y_tol {
@@ -3272,6 +3615,14 @@ fn alpha_for_y(
         }
     };
     alpha.clamp(0.0, 1.0)
+}
+
+fn ipopt_cxx_min(first: f64, second: f64) -> f64 {
+    if second < first { second } else { first }
+}
+
+fn ipopt_cxx_max(first: f64, second: f64) -> f64 {
+    if first < second { second } else { first }
 }
 
 fn kkt_regularization(
@@ -3382,6 +3733,29 @@ fn current_fraction_to_boundary_tau(barrier_parameter: f64, options: &InteriorPo
         .clamp(0.0, 1.0)
 }
 
+fn ipopt_dense_frac_to_bound_candidate(tau: f64, value: f64, delta: f64) -> f64 {
+    // IPOPT `DenseVector::FracToBoundImpl` evaluates this as
+    // `-tau / values_delta[i] * values_x[i]`; keep that operation order so
+    // fraction-to-boundary alphas do not drift by a bit on tight limiters.
+    -tau / delta * value
+}
+
+fn ipopt_dense_current_plus_step(value: f64, alpha: f64, delta: f64) -> f64 {
+    // IpIpoptData.cpp::SetTrial*FromStep calls DenseVector::AddTwoVectors
+    // with a=1, b=alpha, c=0. IpDenseVector.cpp special-cases b before
+    // falling back to `value + alpha * delta`; mirror those branches to avoid
+    // an extra multiply by exactly +/-1 on accepted full steps.
+    if alpha == 0.0 {
+        value
+    } else if alpha == 1.0 {
+        value + delta
+    } else if alpha == -1.0 {
+        value - delta
+    } else {
+        value + alpha * delta
+    }
+}
+
 fn fraction_to_boundary_with_limiter(
     current: &[f64],
     direction: &[f64],
@@ -3392,7 +3766,7 @@ fn fraction_to_boundary_with_limiter(
     let mut limiter = None;
     for (idx, (&value, &delta)) in current.iter().zip(direction.iter()).enumerate() {
         if delta < 0.0 {
-            let candidate = (-tau * value / delta).clamp(0.0, 1.0);
+            let candidate = ipopt_dense_frac_to_bound_candidate(tau, value, delta);
             if candidate < alpha {
                 alpha = candidate;
                 limiter = Some(InteriorPointBoundaryLimiter {
@@ -3405,7 +3779,47 @@ fn fraction_to_boundary_with_limiter(
             }
         }
     }
-    (alpha.clamp(0.0, 1.0), limiter)
+    (alpha, limiter)
+}
+
+fn ipopt_min_boundary_candidate(
+    first: (f64, Option<InteriorPointBoundaryLimiter>),
+    second: (f64, Option<InteriorPointBoundaryLimiter>),
+) -> (f64, Option<InteriorPointBoundaryLimiter>) {
+    if second.0 < first.0 { second } else { first }
+}
+
+fn ipopt_dual_fraction_to_boundary_with_limiter(
+    z_lower: &[f64],
+    dz_lower: &[f64],
+    z_upper: &[f64],
+    dz_upper: &[f64],
+    slack_upper_multiplier: &[f64],
+    slack_upper_multiplier_step: &[f64],
+    tau: f64,
+) -> (f64, Option<InteriorPointBoundaryLimiter>) {
+    // IpoptCalculatedQuantities::dual_frac_to_the_bound checks z_L, z_U,
+    // v_L, then v_U. NLIP has no lower slack multiplier block, so this keeps
+    // the source ordering as z_L, z_U, v_U.
+    let lower = fraction_to_boundary_with_limiter(
+        z_lower,
+        dz_lower,
+        tau,
+        InteriorPointBoundaryLimiterKind::Multiplier,
+    );
+    let upper = fraction_to_boundary_with_limiter(
+        z_upper,
+        dz_upper,
+        tau,
+        InteriorPointBoundaryLimiterKind::Multiplier,
+    );
+    let slack_upper = fraction_to_boundary_with_limiter(
+        slack_upper_multiplier,
+        slack_upper_multiplier_step,
+        tau,
+        InteriorPointBoundaryLimiterKind::Multiplier,
+    );
+    ipopt_min_boundary_candidate(ipopt_min_boundary_candidate(lower, upper), slack_upper)
 }
 
 fn fraction_to_boundary_limiters(
@@ -3429,7 +3843,7 @@ fn fraction_to_boundary_limiters(
                     index,
                     value,
                     direction: delta,
-                    alpha: (-tau * value / delta).clamp(0.0, 1.0),
+                    alpha: ipopt_dense_frac_to_bound_candidate(tau, value, delta),
                 })
             } else {
                 None
@@ -3457,7 +3871,7 @@ fn fraction_to_variable_bounds_with_limiter(
         let value = native_lower_bound_slack(x, index, lower);
         let direction = dx[index];
         if direction < 0.0 {
-            let candidate = (-tau * value / direction).clamp(0.0, 1.0);
+            let candidate = ipopt_dense_frac_to_bound_candidate(tau, value, direction);
             if candidate < alpha {
                 alpha = candidate;
                 limiter = Some(InteriorPointBoundaryLimiter {
@@ -3474,7 +3888,7 @@ fn fraction_to_variable_bounds_with_limiter(
         let value = native_upper_bound_slack(x, index, upper);
         let direction = -dx[index];
         if direction < 0.0 {
-            let candidate = (-tau * value / direction).clamp(0.0, 1.0);
+            let candidate = ipopt_dense_frac_to_bound_candidate(tau, value, direction);
             if candidate < alpha {
                 alpha = candidate;
                 limiter = Some(InteriorPointBoundaryLimiter {
@@ -3487,7 +3901,7 @@ fn fraction_to_variable_bounds_with_limiter(
             }
         }
     }
-    (alpha.clamp(0.0, 1.0), limiter)
+    (alpha, limiter)
 }
 
 fn add_native_bound_multiplier_terms(
@@ -3616,29 +4030,6 @@ fn interior_point_direction_diagnostics(
     }
 }
 
-fn native_bound_complementarity_sum(
-    x: &[f64],
-    bounds: &BoundConstraints,
-    z_lower: &[f64],
-    z_upper: &[f64],
-) -> f64 {
-    let lower_sum = bounds
-        .lower_indices
-        .iter()
-        .zip(bounds.lower_values.iter())
-        .zip(z_lower.iter())
-        .map(|((&index, &lower), &z_i)| native_lower_bound_slack(x, index, lower) * z_i)
-        .sum::<f64>();
-    let upper_sum = bounds
-        .upper_indices
-        .iter()
-        .zip(bounds.upper_values.iter())
-        .zip(z_upper.iter())
-        .map(|((&index, &upper), &z_i)| native_upper_bound_slack(x, index, upper) * z_i)
-        .sum::<f64>();
-    lower_sum + upper_sum
-}
-
 fn native_bound_complementarity_inf_norm(
     x: &[f64],
     bounds: &BoundConstraints,
@@ -3661,26 +4052,6 @@ fn native_bound_complementarity_inf_norm(
         .fold(lower_inf, |acc, ((&index, &upper), &z_i)| {
             acc.max((native_upper_bound_slack(x, index, upper) * z_i).abs())
         })
-}
-
-fn combined_barrier_parameter(
-    slack: &[f64],
-    z: &[f64],
-    x: &[f64],
-    bounds: &BoundConstraints,
-    z_lower: &[f64],
-    z_upper: &[f64],
-) -> f64 {
-    let count = slack.len() + bounds.total_count();
-    if count == 0 {
-        return 0.0;
-    }
-    let slack_sum = slack
-        .iter()
-        .zip(z.iter())
-        .map(|(s, z_i)| s * z_i)
-        .sum::<f64>();
-    (slack_sum + native_bound_complementarity_sum(x, bounds, z_lower, z_upper)) / count as f64
 }
 
 fn combined_complementarity_inf_norm(
@@ -3736,6 +4107,29 @@ fn combined_multiplier_vector<'a>(slices: impl IntoIterator<Item = &'a [f64]>) -
         .collect()
 }
 
+fn ipopt_all_dual_multiplier_vector(
+    lambda_eq: &[f64],
+    lambda_ineq: &[f64],
+    z_lower: &[f64],
+    z_upper: &[f64],
+    z: &[f64],
+) -> Vec<f64> {
+    // IpoptCalculatedQuantities::ComputeOptimalityErrorScaling accumulates
+    // y_c, y_d, z_L, z_U, v_L, then v_U. NLIP has no lower slack multiplier,
+    // so the upper-slack multiplier block comes after bound multipliers.
+    combined_multiplier_vector([lambda_eq, lambda_ineq, z_lower, z_upper, z])
+}
+
+fn ipopt_complementarity_multiplier_vector(
+    z_lower: &[f64],
+    z_upper: &[f64],
+    z: &[f64],
+) -> Vec<f64> {
+    // Same source order as IpoptCalculatedQuantities::curr_complementarity:
+    // z_L, z_U, v_L, then v_U; NLIP omits v_L.
+    combined_multiplier_vector([z_lower, z_upper, z])
+}
+
 fn correct_bound_multiplier_estimate(
     trial_z: &[f64],
     trial_slack: &[f64],
@@ -3762,11 +4156,22 @@ fn correct_bound_multiplier_estimate(
     let mut corrected_z = trial_z.to_vec();
     let mut max_correction = 0.0_f64;
     for (z_i, slack_i) in corrected_z.iter_mut().zip(trial_slack.iter()) {
-        let upper_multiplier = upper_complementarity / slack_i;
-        let lower_multiplier = lower_complementarity / slack_i;
-        let corrected = z_i.min(upper_multiplier).max(lower_multiplier);
-        max_correction = max_correction.max((corrected - *z_i).abs());
-        *z_i = corrected;
+        // IPOPT `IpoptAlgorithm::correct_bound_multiplier` computes a
+        // correction vector using one_over_s, then adds the negative/positive
+        // correction back to z.  Preserve that order instead of assigning the
+        // mathematically equivalent clamp endpoints directly.
+        let one_over_s = 1.0 / *slack_i;
+        let step_to_upper = upper_complementarity * one_over_s - *z_i;
+        let max_correction_up = (-step_to_upper).max(0.0);
+        if step_to_upper < 0.0 {
+            *z_i += step_to_upper;
+        }
+        let step_to_lower = lower_complementarity * one_over_s - *z_i;
+        let max_correction_low = step_to_lower.max(0.0);
+        if step_to_lower > 0.0 {
+            *z_i += step_to_lower;
+        }
+        max_correction = max_correction.max(max_correction_up.max(max_correction_low));
     }
 
     (corrected_z, max_correction)
@@ -3870,46 +4275,48 @@ fn push_scalar_to_bounds_interior(
     bound_push: f64,
     bound_frac: f64,
 ) -> f64 {
-    let mut pushed = match (lower, upper) {
+    let snapped = match (lower, upper) {
         (Some(lower), Some(upper)) if lower <= upper => value.clamp(lower, upper),
         (Some(lower), _) => value.max(lower),
         (_, Some(upper)) => value.min(upper),
         (None, None) => value,
     };
-    let lower_margin = lower.map(|lower| {
-        let absolute_margin = bound_push * lower.abs().max(1.0);
-        match upper {
-            Some(upper) if upper > lower => absolute_margin.min(bound_frac * (upper - lower)),
-            _ => absolute_margin,
-        }
-    });
-    let upper_margin = upper.map(|upper| {
-        let absolute_margin = bound_push * upper.abs().max(1.0);
-        match lower {
-            Some(lower) if upper > lower => absolute_margin.min(bound_frac * (upper - lower)),
-            _ => absolute_margin,
-        }
-    });
-    if let Some(lower) = lower
-        && let Some(lower_margin) = lower_margin
-    {
-        pushed = pushed.max(lower + lower_margin);
+    if bound_frac <= 0.0 {
+        return snapped;
     }
-    if let Some(upper) = upper
-        && let Some(upper_margin) = upper_margin
-    {
-        pushed = pushed.min(upper - upper_margin);
-    }
-    if let (Some(lower), Some(upper), Some(lower_margin), Some(upper_margin)) =
-        (lower, upper, lower_margin, upper_margin)
-    {
-        let interior_lower = lower + lower_margin;
-        let interior_upper = upper - upper_margin;
-        if interior_lower > interior_upper {
-            pushed = 0.5 * (lower + upper);
+
+    // Mirrors Ipopt::DefaultIterateInitializer::push_variables: IPOPT first
+    // snaps to the original bounds, then applies bound_push/bound_frac margins
+    // with the same asymmetric tiny-double handling for lower and upper sides.
+    let tiny_double = 100.0 * f64::MIN_POSITIVE;
+    let mut lower_correction = 0.0_f64;
+    if let Some(lower) = lower {
+        let mut lower_margin = bound_push * lower.abs().max(1.0);
+        if let Some(upper) = upper
+            && upper > lower
+        {
+            let fractional_margin = bound_frac * (upper - lower) - tiny_double;
+            if fractional_margin > 0.0 {
+                lower_margin = lower_margin.min(fractional_margin);
+            }
         }
+        lower_correction = (lower + lower_margin - snapped).max(0.0);
     }
-    pushed
+    let mut upper_correction = 0.0_f64;
+    if let Some(upper) = upper {
+        let mut upper_margin = bound_push * upper.abs().max(1.0);
+        if let Some(lower) = lower
+            && upper > lower
+        {
+            let fractional_margin = bound_frac * (upper - lower) - tiny_double;
+            if fractional_margin > 0.0 {
+                upper_margin = upper_margin.min(fractional_margin);
+            }
+        }
+        upper_margin += tiny_double;
+        upper_correction = (snapped - (upper - upper_margin)).max(0.0);
+    }
+    snapped + lower_correction - upper_correction
 }
 
 fn project_initial_point_into_box_interior(
@@ -3995,15 +4402,24 @@ where
 
 fn initialise_slacks(
     augmented_inequality_values: &[f64],
+    upper_bounds: &[f64],
     slack: &mut [f64],
     options: &InteriorPointOptions,
 ) {
     debug_assert_eq!(augmented_inequality_values.len(), slack.len());
-    for (&g_i, s_i) in augmented_inequality_values.iter().zip(slack.iter_mut()) {
+    debug_assert_eq!(augmented_inequality_values.len(), upper_bounds.len());
+    for ((&g_i, &upper), s_i) in augmented_inequality_values
+        .iter()
+        .zip(upper_bounds.iter())
+        .zip(slack.iter_mut())
+    {
+        // Mirrors Ipopt::DefaultIterateInitializer::push_variables for the
+        // slack variable s with only a relaxed upper bound d_U: start from
+        // trial_d() = d(x), snap to d_U if needed, then push strictly inside.
         *s_i = push_scalar_to_bounds_interior(
-            (-g_i).max(0.0),
-            Some(0.0),
+            g_i,
             None,
+            Some(upper),
             options.slack_bound_push,
             options.slack_bound_frac,
         );
@@ -4137,6 +4553,24 @@ fn sparse_add_transpose_mat_vec(out: &mut [f64], matrix: &SparseMatrix, vector: 
     }
 }
 
+fn sparse_add_transpose_mat_vec_ipopt_order(
+    out: &mut [f64],
+    matrix: &SparseMatrix,
+    vector: &[f64],
+) {
+    debug_assert_eq!(matrix.nrows(), vector.len());
+    debug_assert_eq!(matrix.ncols(), out.len());
+    // IpGenTMatrix.cpp::TransMultVectorImpl accumulates directly into y in
+    // the stored triplet order.  The source-built parity path receives the
+    // same column-major triplets from ccs_triplet_indices, so avoid changing
+    // rounding by first reducing each column into a temporary dot product.
+    for (col, out_col) in out.iter_mut().enumerate().take(matrix.ncols()) {
+        for index in matrix.structure.ccs.col_ptrs[col]..matrix.structure.ccs.col_ptrs[col + 1] {
+            *out_col += matrix.values[index] * vector[matrix.structure.ccs.row_indices[index]];
+        }
+    }
+}
+
 fn sparse_mat_vec(matrix: &SparseMatrix, vector: &[f64]) -> Vec<f64> {
     debug_assert_eq!(matrix.ncols(), vector.len());
     let mut product = vec![0.0; matrix.nrows()];
@@ -4144,6 +4578,19 @@ fn sparse_mat_vec(matrix: &SparseMatrix, vector: &[f64]) -> Vec<f64> {
         if x == 0.0 {
             continue;
         }
+        for index in matrix.structure.ccs.col_ptrs[col]..matrix.structure.ccs.col_ptrs[col + 1] {
+            product[matrix.structure.ccs.row_indices[index]] += matrix.values[index] * x;
+        }
+    }
+    product
+}
+
+fn sparse_mat_vec_ipopt_order(matrix: &SparseMatrix, vector: &[f64]) -> Vec<f64> {
+    debug_assert_eq!(matrix.ncols(), vector.len());
+    let mut product = vec![0.0; matrix.nrows()];
+    // IpGenTMatrix.cpp::MultVectorImpl visits every stored nonzero in triplet
+    // order, even when the corresponding dense-vector entry is exactly zero.
+    for (col, &x) in vector.iter().enumerate().take(matrix.ncols()) {
         for index in matrix.structure.ccs.col_ptrs[col]..matrix.structure.ccs.col_ptrs[col + 1] {
             product[matrix.structure.ccs.row_indices[index]] += matrix.values[index] * x;
         }
@@ -4366,15 +4813,34 @@ fn lagrangian_gradient_sparse(
     inequality_multipliers: &[f64],
 ) -> Vec<f64> {
     let mut residual = gradient.to_vec();
-    sparse_add_transpose_mat_vec(&mut residual, equality_jacobian, equality_multipliers);
-    sparse_add_transpose_mat_vec(&mut residual, inequality_jacobian, inequality_multipliers);
+    let mut equality_term = vec![0.0; gradient.len()];
+    let mut inequality_term = vec![0.0; gradient.len()];
+    sparse_add_transpose_mat_vec_ipopt_order(
+        &mut equality_term,
+        equality_jacobian,
+        equality_multipliers,
+    );
+    sparse_add_transpose_mat_vec_ipopt_order(
+        &mut inequality_term,
+        inequality_jacobian,
+        inequality_multipliers,
+    );
+    // Mirrors IpIpoptCalculatedQuantities.cpp::curr_grad_lag_x:
+    // tmp starts as curr_grad_f(), then AddTwoVectors(1., jac_cT*y_c,
+    // 1., jac_dT*y_d, 1.) accumulates both multiplier products in one pass.
+    for ((residual_i, equality_i), inequality_i) in residual
+        .iter_mut()
+        .zip(equality_term.iter())
+        .zip(inequality_term.iter())
+    {
+        *residual_i += *equality_i + *inequality_i;
+    }
     residual
 }
 
 struct TrialEvaluationContext<'a> {
     equality_jacobian_structure: &'a Arc<SparseMatrixStructure>,
     inequality_jacobian_structure: &'a Arc<SparseMatrixStructure>,
-    options: &'a InteriorPointOptions,
 }
 
 fn trial_state<P>(
@@ -4405,7 +4871,6 @@ where
     time_callback(&mut profiling.inequality_values, callback_time, || {
         problem.inequality_values(x, parameters, &mut augmented_inequality_values);
     });
-    relax_augmented_inequality_values(&mut augmented_inequality_values, context.options);
     time_callback(
         &mut profiling.equality_jacobian_values,
         callback_time,
@@ -4435,6 +4900,7 @@ where
 fn least_squares_constraint_multipliers(
     state: &EvalState,
     z: &[f64],
+    hessian_structure: &CCS,
     regularization: f64,
     solver: InteriorPointLinearSolver,
 ) -> (Vec<f64>, Vec<f64>) {
@@ -4460,6 +4926,18 @@ fn least_squares_constraint_multipliers(
         rhs[slack_offset + row] = z_i;
     }
 
+    // IpLeastSquareMults.cpp passes IpNLP().uninitialized_h() with
+    // W_factor=0 into StdAugSystemSolver. The numeric contribution is zero,
+    // but TSymLinearSolver still includes the Hessian sparsity in the KKT
+    // pattern before SPRAL's value-dependent matching analysis.
+    for col in 0..hessian_structure.ncol {
+        for index in hessian_structure.col_ptrs[col]..hessian_structure.col_ptrs[col + 1] {
+            let row = hessian_structure.row_indices[index];
+            rows.push(col.min(row));
+            cols.push(col.max(row));
+            values.push(0.0);
+        }
+    }
     for diag in 0..n {
         rows.push(diag);
         cols.push(diag);
@@ -4884,6 +5362,7 @@ fn assess_linear_solution_ccs(
 const IPOPT_LINEAR_MIN_REFINEMENT_STEPS: usize = 1;
 const IPOPT_LINEAR_MAX_REFINEMENT_STEPS: usize = 10;
 const IPOPT_LINEAR_RESIDUAL_RATIO_MAX: f64 = 1e-10;
+const IPOPT_LINEAR_RESIDUAL_RATIO_SINGULAR: f64 = 1e-5;
 const IPOPT_LINEAR_RESIDUAL_IMPROVEMENT_FACTOR: f64 = 0.999_999_999;
 const IPOPT_LINEAR_RESIDUAL_MAX_COND: f64 = 1e6;
 
@@ -4951,6 +5430,604 @@ fn refine_linear_solution_ccs<E>(
         residual_ratio = new_residual_ratio;
     }
     Ok(steps)
+}
+
+struct IpoptFullSpaceResidual {
+    augmented_correction_rhs: Vec<f64>,
+    residual_z_lower: Vec<f64>,
+    residual_z_upper: Vec<f64>,
+    residual_vu: Vec<f64>,
+    residual_ratio: f64,
+    rhs_inf: f64,
+    solution_inf: f64,
+    residual_inf: f64,
+    residual_x_inf: f64,
+    residual_s_inf: f64,
+    residual_c_inf: f64,
+    residual_d_inf: f64,
+    residual_bound_inf: f64,
+    residual_vu_inf: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IpoptRefinementReport {
+    steps: usize,
+    initial_residual_ratio: f64,
+    initial_residual: IpoptFullSpaceResidualMetrics,
+    residual_ratio: f64,
+    final_residual: IpoptFullSpaceResidualMetrics,
+    first_correction_rhs: Option<VectorFingerprint>,
+    first_correction_rhs_blocks: Option<IpoptAugmentedBlockFingerprints>,
+    first_correction_solution: Option<VectorFingerprint>,
+    first_correction_solution_blocks: Option<IpoptAugmentedBlockFingerprints>,
+    failed: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IpoptFullSpaceResidualMetrics {
+    rhs_inf: f64,
+    solution_inf: f64,
+    residual_inf: f64,
+    residual_x_inf: f64,
+    residual_s_inf: f64,
+    residual_c_inf: f64,
+    residual_d_inf: f64,
+    residual_bound_inf: f64,
+    residual_vu_inf: f64,
+}
+
+impl IpoptFullSpaceResidual {
+    fn metrics(&self) -> IpoptFullSpaceResidualMetrics {
+        IpoptFullSpaceResidualMetrics {
+            rhs_inf: self.rhs_inf,
+            solution_inf: self.solution_inf,
+            residual_inf: self.residual_inf,
+            residual_x_inf: self.residual_x_inf,
+            residual_s_inf: self.residual_s_inf,
+            residual_c_inf: self.residual_c_inf,
+            residual_d_inf: self.residual_d_inf,
+            residual_bound_inf: self.residual_bound_inf,
+            residual_vu_inf: self.residual_vu_inf,
+        }
+    }
+}
+
+fn ipopt_full_space_residual_metrics_text(metrics: IpoptFullSpaceResidualMetrics) -> String {
+    format!(
+        "rhs={:.3e},sol={:.3e},res={:.3e},x={:.3e},s={:.3e},c={:.3e},d={:.3e},bound={:.3e},vU={:.3e}",
+        metrics.rhs_inf,
+        metrics.solution_inf,
+        metrics.residual_inf,
+        metrics.residual_x_inf,
+        metrics.residual_s_inf,
+        metrics.residual_c_inf,
+        metrics.residual_d_inf,
+        metrics.residual_bound_inf,
+        metrics.residual_vu_inf,
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VectorFingerprint {
+    len: usize,
+    inf: f64,
+    sum: f64,
+    hash: u64,
+    negative_zero_count: usize,
+    positive_zero_count: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IpoptAugmentedBlockFingerprints {
+    x: VectorFingerprint,
+    p: VectorFingerprint,
+    lambda: VectorFingerprint,
+    z: VectorFingerprint,
+}
+
+fn vector_fingerprint(values: &[f64]) -> VectorFingerprint {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut inf = 0.0_f64;
+    let mut sum = 0.0_f64;
+    let mut hash = FNV_OFFSET ^ values.len() as u64;
+    let mut negative_zero_count = 0;
+    let mut positive_zero_count = 0;
+    for value in values {
+        inf = inf.max(value.abs());
+        sum += *value;
+        hash = (hash ^ value.to_bits()).wrapping_mul(FNV_PRIME);
+        if *value == 0.0 {
+            if value.is_sign_negative() {
+                negative_zero_count += 1;
+            } else {
+                positive_zero_count += 1;
+            }
+        }
+    }
+    VectorFingerprint {
+        len: values.len(),
+        inf,
+        sum,
+        hash,
+        negative_zero_count,
+        positive_zero_count,
+    }
+}
+
+fn vector_fingerprint_text(fingerprint: VectorFingerprint) -> String {
+    format!(
+        "len={} inf={:.12e} sum={:.12e} hash={:016x} z[-/+]={}/{}",
+        fingerprint.len,
+        fingerprint.inf,
+        fingerprint.sum,
+        fingerprint.hash,
+        fingerprint.negative_zero_count,
+        fingerprint.positive_zero_count,
+    )
+}
+
+fn ipopt_augmented_block_fingerprints(
+    pattern: &SpralAugmentedKktPattern,
+    values: &[f64],
+) -> IpoptAugmentedBlockFingerprints {
+    debug_assert_eq!(values.len(), pattern.dimension());
+    IpoptAugmentedBlockFingerprints {
+        x: vector_fingerprint(&values[..pattern.x_dimension]),
+        p: vector_fingerprint(
+            &values[pattern.p_offset..pattern.p_offset + pattern.inequality_dimension],
+        ),
+        lambda: vector_fingerprint(
+            &values[pattern.lambda_offset..pattern.lambda_offset + pattern.equality_dimension],
+        ),
+        z: vector_fingerprint(
+            &values[pattern.z_offset..pattern.z_offset + pattern.inequality_dimension],
+        ),
+    }
+}
+
+fn ipopt_augmented_block_fingerprints_text(
+    fingerprints: IpoptAugmentedBlockFingerprints,
+) -> String {
+    format!(
+        "x[{}],p[{}],lambda[{}],z[{}]",
+        vector_fingerprint_text(fingerprints.x),
+        vector_fingerprint_text(fingerprints.p),
+        vector_fingerprint_text(fingerprints.lambda),
+        vector_fingerprint_text(fingerprints.z),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct IpoptLinearRefinementShifts {
+    primal: f64,
+    slack: f64,
+    dual: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IpoptLinearRhsOrientation {
+    PreFinal,
+    FinalDirection,
+}
+
+#[derive(Clone, Copy)]
+struct IpoptLinearSolveContext {
+    shifts: IpoptLinearRefinementShifts,
+    rhs_orientation: IpoptLinearRhsOrientation,
+    allow_inexact: bool,
+    native_spral_quality_was_increased: bool,
+}
+
+fn ipopt_full_space_residual_ratio(
+    system: &ReducedKktSystem<'_>,
+    pattern: &SpralAugmentedKktPattern,
+    full_solution: &SpralSrcFullSpaceSolution,
+    rhs_orientation: IpoptLinearRhsOrientation,
+    shifts: IpoptLinearRefinementShifts,
+) -> IpoptFullSpaceResidual {
+    let n = system.hessian.lower_triangle.nrow;
+    let meq = system.equality_jacobian.nrows();
+    let mineq = system.inequality_jacobian.nrows();
+    let solution = &full_solution.augmented_solution;
+    let dx = &solution[..n];
+    let ipopt_ds = &solution[pattern.p_offset..pattern.p_offset + mineq];
+    let d_lambda = &solution[pattern.lambda_offset..pattern.lambda_offset + meq];
+    let d_ineq = &solution[pattern.z_offset..pattern.z_offset + mineq];
+    let prefinal_orientation = rhs_orientation == IpoptLinearRhsOrientation::PreFinal;
+    debug_assert_eq!(full_solution.upper_slack_multiplier_step.len(), mineq);
+
+    let mut residual_x = symmetric_ccs_lower_mat_vec(
+        system.hessian.lower_triangle.as_ref(),
+        &system.hessian.values,
+        dx,
+    );
+    sparse_add_transpose_mat_vec_ipopt_order(&mut residual_x, system.equality_jacobian, d_lambda);
+    sparse_add_transpose_mat_vec_ipopt_order(&mut residual_x, system.inequality_jacobian, d_ineq);
+
+    let equality_dx = sparse_mat_vec_ipopt_order(system.equality_jacobian, dx);
+    let inequality_dx = sparse_mat_vec_ipopt_order(system.inequality_jacobian, dx);
+    let mut augmented_correction_rhs = vec![0.0; pattern.dimension()];
+
+    let mut rhs_inf = 0.0_f64;
+    let mut solution_inf = step_inf_norm(dx);
+    let mut bound_residual_inf = 0.0_f64;
+    let mut residual_z_lower = system.bound_data.map_or_else(Vec::new, |bound_data| {
+        debug_assert_eq!(
+            full_solution.lower_bound_multiplier_step.len(),
+            bound_data.bounds.lower_indices.len()
+        );
+        vec![0.0; bound_data.bounds.lower_indices.len()]
+    });
+    let mut residual_z_upper = system.bound_data.map_or_else(Vec::new, |bound_data| {
+        debug_assert_eq!(
+            full_solution.upper_bound_multiplier_step.len(),
+            bound_data.bounds.upper_indices.len()
+        );
+        vec![0.0; bound_data.bounds.upper_indices.len()]
+    });
+
+    if let Some(bound_data) = system.bound_data {
+        let mut rhs_x = system
+            .r_dual
+            .iter()
+            .map(|value| {
+                if prefinal_orientation {
+                    *value
+                } else {
+                    -*value
+                }
+            })
+            .collect::<Vec<_>>();
+        let damping = system_positive_slack_damping(system);
+        for (bound_position, ((&index, &lower), &z_i)) in bound_data
+            .bounds
+            .lower_indices
+            .iter()
+            .zip(bound_data.bounds.lower_values.iter())
+            .zip(bound_data.z_lower.iter())
+            .enumerate()
+        {
+            let Some(reduced_index) = bound_data.fixed_variables.free_position[index] else {
+                continue;
+            };
+            let slack = native_lower_bound_slack(bound_data.x, index, lower);
+            let complementarity = slack * z_i - system.barrier_parameter;
+            let dz_i = full_solution.lower_bound_multiplier_step[bound_position];
+            let residual_z = if prefinal_orientation {
+                slack * dz_i + z_i * dx[reduced_index] - complementarity
+            } else {
+                slack * dz_i + z_i * dx[reduced_index] + complementarity
+            };
+            residual_z_lower[bound_position] = residual_z;
+            residual_x[reduced_index] -= dz_i;
+            if damping > 0.0 && !bound_data.bounds.upper_indices.contains(&index) {
+                rhs_x[reduced_index] += if prefinal_orientation {
+                    damping
+                } else {
+                    -damping
+                };
+            }
+            augmented_correction_rhs[reduced_index] += residual_z / slack;
+            bound_residual_inf = bound_residual_inf.max(residual_z.abs());
+            rhs_inf = rhs_inf.max(complementarity.abs());
+            solution_inf = solution_inf.max(dz_i.abs());
+        }
+        for (bound_position, ((&index, &upper), &z_i)) in bound_data
+            .bounds
+            .upper_indices
+            .iter()
+            .zip(bound_data.bounds.upper_values.iter())
+            .zip(bound_data.z_upper.iter())
+            .enumerate()
+        {
+            let Some(reduced_index) = bound_data.fixed_variables.free_position[index] else {
+                continue;
+            };
+            let slack = native_upper_bound_slack(bound_data.x, index, upper);
+            let complementarity = slack * z_i - system.barrier_parameter;
+            let dz_i = full_solution.upper_bound_multiplier_step[bound_position];
+            let residual_z = if prefinal_orientation {
+                slack * dz_i - z_i * dx[reduced_index] - complementarity
+            } else {
+                slack * dz_i - z_i * dx[reduced_index] + complementarity
+            };
+            residual_z_upper[bound_position] = residual_z;
+            residual_x[reduced_index] += dz_i;
+            if damping > 0.0 && !bound_data.bounds.lower_indices.contains(&index) {
+                rhs_x[reduced_index] += if prefinal_orientation {
+                    -damping
+                } else {
+                    damping
+                };
+            }
+            augmented_correction_rhs[reduced_index] -= residual_z / slack;
+            bound_residual_inf = bound_residual_inf.max(residual_z.abs());
+            rhs_inf = rhs_inf.max(complementarity.abs());
+            solution_inf = solution_inf.max(dz_i.abs());
+        }
+        // Mirror IpPDFullSpaceSolver.cpp::ComputeResiduals: W/J/bound terms are
+        // accumulated first, and the primal perturbation plus rhs.x contribution
+        // is applied last with AddTwoVectors(delta_x, res.x, -1., rhs.x, 1.).
+        for (index, (residual_i, rhs_i)) in residual_x.iter_mut().zip(rhs_x.iter()).enumerate() {
+            *residual_i += shifts.primal * dx[index] - rhs_i;
+        }
+        for (rhs_i, residual_i) in augmented_correction_rhs[..n]
+            .iter_mut()
+            .zip(residual_x.iter())
+        {
+            *rhs_i += *residual_i;
+        }
+        rhs_inf = rhs_inf.max(step_inf_norm(&rhs_x));
+    } else {
+        for (residual_i, (r_dual_i, bound_rhs_i)) in residual_x
+            .iter_mut()
+            .zip(system.r_dual.iter().zip(system.bound_rhs.iter()))
+        {
+            let rhs_i = if prefinal_orientation {
+                *r_dual_i - *bound_rhs_i
+            } else {
+                -*r_dual_i + *bound_rhs_i
+            };
+            *residual_i -= rhs_i;
+        }
+        for (index, residual_i) in residual_x.iter_mut().enumerate() {
+            *residual_i += (shifts.primal
+                + system.bound_diagonal.get(index).copied().unwrap_or(0.0))
+                * dx[index];
+        }
+        augmented_correction_rhs[..n].copy_from_slice(&residual_x);
+        rhs_inf = system
+            .r_dual
+            .iter()
+            .zip(system.bound_rhs.iter())
+            .fold(0.0_f64, |acc, (r_dual_i, bound_rhs_i)| {
+                acc.max((*r_dual_i - *bound_rhs_i).abs())
+            });
+    }
+
+    let mut residual_inf = step_inf_norm(&residual_x).max(bound_residual_inf);
+    let mut residual_s_inf = 0.0_f64;
+    let mut residual_d_inf = 0.0_f64;
+    let mut residual_vu_inf = 0.0_f64;
+    let mut residual_vu = vec![0.0; mineq];
+
+    for row in 0..mineq {
+        let slack = system.slack[row];
+        let multiplier = system.multipliers[row];
+        let ipopt_ds_i = ipopt_ds[row];
+        let dz_i = full_solution.upper_slack_multiplier_step[row];
+        let damped_slack_stationarity = damped_slack_stationarity_residual(system, row);
+        let (rhs_s_i, rhs_v_i, rhs_d_i) = if prefinal_orientation {
+            (
+                damped_slack_stationarity,
+                system.r_cent[row],
+                system.r_ineq[row],
+            )
+        } else {
+            (
+                -damped_slack_stationarity,
+                -system.r_cent[row],
+                -system.r_ineq[row],
+            )
+        };
+        // Mirror IpPDFullSpaceSolver.cpp::ComputeResiduals and
+        // DenseVector::AddTwoVectorsImpl grouping for the s, v_U, and y_d
+        // blocks: start from the matrix product, add `-res - rhs` as one
+        // expression, then apply the perturbation Axpy separately.
+        let mut residual_s = dz_i + (-d_ineq[row] - rhs_s_i);
+        if shifts.slack != 0.0 {
+            residual_s += shifts.slack * ipopt_ds_i;
+        }
+        let residual_v = (slack * dz_i) + (-(multiplier * ipopt_ds_i) - rhs_v_i);
+        let mut residual_d = inequality_dx[row] + (-ipopt_ds_i - rhs_d_i);
+        if shifts.dual != 0.0 {
+            residual_d += -shifts.dual * d_ineq[row];
+        }
+        residual_vu[row] = residual_v;
+        residual_s_inf = residual_s_inf.max(residual_s.abs());
+        residual_d_inf = residual_d_inf.max(residual_d.abs());
+        residual_vu_inf = residual_vu_inf.max(residual_v.abs());
+        // Mirrors Ipopt::PDFullSpaceSolver::SolveOnce: full-space residuals
+        // from ComputeResiduals are converted to the augmented-system RHS with
+        // Pd_U.AddMSinvZ(-1.0, ...), i.e. rhs_s - rhs_v_U / slack_s_U.
+        augmented_correction_rhs[pattern.p_offset + row] = residual_s - residual_v / slack;
+        augmented_correction_rhs[pattern.z_offset + row] = residual_d;
+        residual_inf = residual_inf
+            .max(residual_s.abs())
+            .max(residual_v.abs())
+            .max(residual_d.abs());
+        rhs_inf = rhs_inf
+            .max(damped_slack_stationarity.abs())
+            .max(system.r_cent[row].abs())
+            .max(system.r_ineq[row].abs());
+        solution_inf = solution_inf
+            .max(ipopt_ds_i.abs())
+            .max(d_ineq[row].abs())
+            .max(dz_i.abs());
+    }
+
+    let mut residual_c_inf = 0.0_f64;
+    for row in 0..meq {
+        let rhs_c_i = if prefinal_orientation {
+            system.r_eq[row]
+        } else {
+            -system.r_eq[row]
+        };
+        // IpPDFullSpaceSolver.cpp::ComputeResiduals forms this with
+        // AddTwoVectors(-delta_c, res.y_c, -1., rhs.y_c, 1.).
+        let mut residual_c = equality_dx[row] - rhs_c_i;
+        if shifts.dual != 0.0 {
+            residual_c += -shifts.dual * d_lambda[row];
+        }
+        augmented_correction_rhs[pattern.lambda_offset + row] = residual_c;
+        residual_c_inf = residual_c_inf.max(residual_c.abs());
+        residual_inf = residual_inf.max(residual_c.abs());
+        rhs_inf = rhs_inf.max(system.r_eq[row].abs());
+        solution_inf = solution_inf.max(d_lambda[row].abs());
+    }
+
+    let residual_ratio = if rhs_inf + solution_inf == 0.0 {
+        residual_inf
+    } else {
+        let denominator = solution_inf.min(IPOPT_LINEAR_RESIDUAL_MAX_COND * rhs_inf) + rhs_inf;
+        residual_inf / denominator
+    };
+    IpoptFullSpaceResidual {
+        augmented_correction_rhs,
+        residual_z_lower,
+        residual_z_upper,
+        residual_vu,
+        residual_ratio,
+        rhs_inf,
+        solution_inf,
+        residual_inf,
+        residual_x_inf: step_inf_norm(&residual_x),
+        residual_s_inf,
+        residual_c_inf,
+        residual_d_inf,
+        residual_bound_inf: bound_residual_inf,
+        residual_vu_inf,
+    }
+}
+
+fn refine_ipopt_full_space_solution<E>(
+    system: &ReducedKktSystem<'_>,
+    pattern: &SpralAugmentedKktPattern,
+    solution: &mut SpralSrcFullSpaceSolution,
+    rhs_orientation: IpoptLinearRhsOrientation,
+    shifts: IpoptLinearRefinementShifts,
+    solve_time: &mut Duration,
+    mut solve_correction: impl FnMut(&[f64]) -> Result<Vec<f64>, E>,
+) -> Result<IpoptRefinementReport, E> {
+    // IPOPT refines PDFullSpaceSolver systems on the full unsymmetric
+    // primal-dual residual, not on the already-eliminated symmetric augmented
+    // matrix residual; see IpPDFullSpaceSolver.cpp::ComputeResiduals,
+    // SolveOnce, and ComputeResidualRatio.
+    let mut steps = 0;
+    let mut residual =
+        ipopt_full_space_residual_ratio(system, pattern, solution, rhs_orientation, shifts);
+    let mut residual_ratio = residual.residual_ratio;
+    let initial_residual_ratio = residual_ratio;
+    let initial_residual = residual.metrics();
+    let mut previous_residual_ratio = residual_ratio;
+    let mut first_correction_rhs = None;
+    let mut first_correction_rhs_blocks = None;
+    let mut first_correction_solution = None;
+    let mut first_correction_solution_blocks = None;
+    let mut failed = false;
+    while steps < IPOPT_LINEAR_MIN_REFINEMENT_STEPS
+        || residual_ratio > IPOPT_LINEAR_RESIDUAL_RATIO_MAX
+    {
+        if steps == 0 {
+            first_correction_rhs = Some(vector_fingerprint(&residual.augmented_correction_rhs));
+            first_correction_rhs_blocks = Some(ipopt_augmented_block_fingerprints(
+                pattern,
+                &residual.augmented_correction_rhs,
+            ));
+        }
+        let correction_started = Instant::now();
+        let correction = solve_correction(&residual.augmented_correction_rhs)?;
+        *solve_time += correction_started.elapsed();
+        if steps == 0 {
+            first_correction_solution = Some(vector_fingerprint(&correction));
+            first_correction_solution_blocks =
+                Some(ipopt_augmented_block_fingerprints(pattern, &correction));
+        }
+        if let Some(bound_data) = system.bound_data {
+            for (bound_position, ((&index, &lower), &z_i)) in bound_data
+                .bounds
+                .lower_indices
+                .iter()
+                .zip(bound_data.bounds.lower_values.iter())
+                .zip(bound_data.z_lower.iter())
+                .enumerate()
+            {
+                let Some(reduced_index) = bound_data.fixed_variables.free_position[index] else {
+                    continue;
+                };
+                let slack = native_lower_bound_slack(bound_data.x, index, lower);
+                let correction_z = ipopt_oriented_lower_bound_multiplier_step(
+                    slack,
+                    z_i,
+                    residual.residual_z_lower[bound_position],
+                    correction[reduced_index],
+                );
+                solution.lower_bound_multiplier_step[bound_position] -= correction_z;
+            }
+            for (bound_position, ((&index, &upper), &z_i)) in bound_data
+                .bounds
+                .upper_indices
+                .iter()
+                .zip(bound_data.bounds.upper_values.iter())
+                .zip(bound_data.z_upper.iter())
+                .enumerate()
+            {
+                let Some(reduced_index) = bound_data.fixed_variables.free_position[index] else {
+                    continue;
+                };
+                let slack = native_upper_bound_slack(bound_data.x, index, upper);
+                let correction_z = ipopt_oriented_upper_bound_multiplier_step(
+                    slack,
+                    z_i,
+                    residual.residual_z_upper[bound_position],
+                    correction[reduced_index],
+                );
+                solution.upper_bound_multiplier_step[bound_position] -= correction_z;
+            }
+        }
+        for (row, upper_step_i) in solution.upper_slack_multiplier_step.iter_mut().enumerate() {
+            // IpPDFullSpaceSolver.cpp::SolveOnce computes the correction's
+            // v_U with Pd_U.SinvBlrmZMTdBr(1., ...), then the refinement call
+            // uses alpha=-1, beta=1 to apply `res.v_U -= sol.v_U`.  Preserve
+            // that operation order instead of recomputing v_U from the updated
+            // slack step after the correction.
+            let correction_s = correction[pattern.p_offset + row];
+            let correction_vu = ipopt_oriented_upper_slack_bound_multiplier_step(
+                system.slack[row],
+                system.multipliers[row],
+                residual.residual_vu[row],
+                correction_s,
+            );
+            *upper_step_i -= correction_vu;
+        }
+        for (solution_i, correction_i) in solution
+            .augmented_solution
+            .iter_mut()
+            .zip(correction.iter())
+        {
+            *solution_i -= correction_i;
+        }
+        steps += 1;
+        let new_residual =
+            ipopt_full_space_residual_ratio(system, pattern, solution, rhs_orientation, shifts);
+        let new_residual_ratio = new_residual.residual_ratio;
+        residual_ratio = new_residual_ratio;
+        if new_residual_ratio > IPOPT_LINEAR_RESIDUAL_RATIO_MAX
+            && steps > IPOPT_LINEAR_MIN_REFINEMENT_STEPS
+            && (steps > IPOPT_LINEAR_MAX_REFINEMENT_STEPS
+                || new_residual_ratio
+                    > IPOPT_LINEAR_RESIDUAL_IMPROVEMENT_FACTOR * previous_residual_ratio)
+        {
+            failed = true;
+            residual = new_residual;
+            break;
+        }
+        residual = new_residual;
+        previous_residual_ratio = new_residual_ratio;
+    }
+    Ok(IpoptRefinementReport {
+        steps,
+        initial_residual_ratio,
+        initial_residual,
+        residual_ratio,
+        final_residual: residual.metrics(),
+        first_correction_rhs,
+        first_correction_rhs_blocks,
+        first_correction_solution,
+        first_correction_solution_blocks,
+        failed,
+    })
 }
 
 fn interior_point_linear_inertia(inertia: SpralInertia) -> InteriorPointLinearInertia {
@@ -5294,7 +6371,15 @@ fn factor_solve_spral_src_symmetric_with_metrics(
     })?;
     let factor_started = Instant::now();
     let mut session = native
-        .analyse_with_options(spral_matrix, &SpralNumericFactorOptions::default())
+        // IpLeastSquareMults.cpp reaches SPRAL through StdAugSystemSolver and
+        // IpSpralSolverInterface, not the generic native wrapper defaults.
+        // Keep auxiliary multiplier solves on the same matching, one-based
+        // ptr32 path used by IPOPT's SPRAL interface.
+        .analyse_ipopt_compatible_with_options_and_ordering(
+            spral_matrix,
+            &SpralNumericFactorOptions::default(),
+            SpralNativeOrdering::Matching,
+        )
         .map_err(|error| {
             native_spral_error_attempt(
                 regularization,
@@ -5312,53 +6397,43 @@ fn factor_solve_spral_src_symmetric_with_metrics(
     let factorization_time = factor_started.elapsed();
     let inertia = interior_point_linear_inertia(factor_info.inertia);
     let solve_started = Instant::now();
-    let mut solution = session.solve(rhs).map_err(|error| {
+    // IPOPT's SpralSolverInterface::MultiSolve calls spral_ssids_solve with
+    // nrhs=1 even for a single right-hand side. Keep the NLIP source-built
+    // SPRAL path on the same C entrypoint instead of spral_ssids_solve1.
+    let solution = session.solve_ipopt_single_rhs(rhs).map_err(|error| {
         native_spral_error_attempt(
             regularization,
             InteriorPointLinearSolveFailureKind::FactorizationFailed,
             error,
         )
     })?;
-    let mut solve_time = solve_started.elapsed();
-    let refinement_steps = refine_linear_solution_ccs(
-        &ccs,
-        &lower_matrix.nzval,
-        rhs,
-        &mut solution,
-        &mut solve_time,
-        |residual| {
-            session.solve(residual).map_err(|error| {
-                native_spral_error_attempt(
-                    regularization,
-                    InteriorPointLinearSolveFailureKind::FactorizationFailed,
-                    error,
-                )
-            })
-        },
-    )?;
+    let solve_time = solve_started.elapsed();
+    // IPOPT LeastSquareMultipliers calls StdAugSystemSolver::Solve directly;
+    // the full-space PDFullSpaceSolver iterative refinement loop is not used
+    // for this auxiliary multiplier estimate.
     let assessment = assess_linear_solution_ccs(&ccs, &lower_matrix.nzval, rhs, &solution);
-    assessment
-        .map(|assessment| {
-            (
-                solution,
-                LinearBackendRunStats {
-                    solver: InteriorPointLinearSolver::SpralSrc,
-                    factorization_time,
-                    solve_time,
-                    reused_symbolic: Some(false),
-                    inertia: Some(inertia),
-                    residual_inf: assessment.residual_inf,
-                    solution_inf: assessment.solution_inf,
-                    detail: (refinement_steps > 0)
-                        .then(|| format!("iterative_refinement_steps={refinement_steps}")),
-                },
-            )
-        })
-        .map_err(|mut attempt| {
-            attempt.solver = InteriorPointLinearSolver::SpralSrc;
-            attempt.regularization = regularization;
+    let (solution_inf, residual_inf) = match assessment {
+        Ok(assessment) => (assessment.solution_inf, assessment.residual_inf),
+        Err(attempt) => (
             attempt
-        })
+                .solution_inf
+                .unwrap_or_else(|| step_inf_norm(&solution)),
+            attempt.residual_inf.unwrap_or(f64::NAN),
+        ),
+    };
+    Ok((
+        solution,
+        LinearBackendRunStats {
+            solver: InteriorPointLinearSolver::SpralSrc,
+            factorization_time,
+            solve_time,
+            reused_symbolic: Some(false),
+            inertia: Some(inertia),
+            residual_inf,
+            solution_inf,
+            detail: Some("ipopt_least_square_multipliers_std_aug_solver_no_refinement".to_string()),
+        },
+    ))
 }
 
 fn preferred_linear_solver(
@@ -5714,6 +6789,10 @@ fn is_singularity_like_linear_failure(attempt: &InteriorPointLinearSolveAttempt)
                 .detail
                 .as_deref()
                 .is_some_and(|detail| detail.contains("negative_eigenvalues_too_few")))
+        || (attempt.failure_kind == InteriorPointLinearSolveFailureKind::ResidualTooLarge
+            && attempt.detail.as_deref().is_some_and(|detail| {
+                detail.contains("ipopt_pretend_singular_after_refinement_failure")
+            }))
 }
 
 fn is_negative_eigenvalues_too_few(attempt: &InteriorPointLinearSolveAttempt) -> bool {
@@ -5732,19 +6811,30 @@ fn append_attempt_detail(attempt: &mut InteriorPointLinearSolveAttempt, detail: 
     });
 }
 
+fn native_spral_quality_can_increase(
+    workspace: &NativeSpralAugmentedKktWorkspace,
+    system: &ReducedKktSystem<'_>,
+) -> bool {
+    let old_u = workspace.numeric_options.threshold_pivot_u;
+    let max_u = system.spral_pivot_tolerance_max.max(0.0);
+    if !old_u.is_finite() || !max_u.is_finite() || old_u >= max_u {
+        return false;
+    }
+    let next_u = old_u.powf(0.75).min(max_u);
+    next_u.is_finite() && next_u > old_u
+}
+
 fn try_increase_native_spral_quality(
     workspace: &mut NativeSpralAugmentedKktWorkspace,
     system: &ReducedKktSystem<'_>,
 ) -> Option<(f64, f64)> {
+    if !native_spral_quality_can_increase(workspace, system) {
+        return None;
+    }
     let old_u = workspace.numeric_options.threshold_pivot_u;
-    let max_u = system.spral_pivot_tolerance_max.max(0.0);
-    if !old_u.is_finite() || !max_u.is_finite() || old_u >= max_u {
-        return None;
-    }
-    let next_u = old_u.powf(0.75).min(max_u);
-    if !next_u.is_finite() || next_u <= old_u {
-        return None;
-    }
+    let next_u = old_u
+        .powf(0.75)
+        .min(system.spral_pivot_tolerance_max.max(0.0));
     workspace.numeric_options.threshold_pivot_u = next_u;
     workspace.session = None;
     workspace.factor_regularization = None;
@@ -5811,6 +6901,17 @@ fn append_quasidefinite_dual_diagonal(
     }
 }
 
+fn ipopt_augmented_diagonal_with_shift(diagonal: f64, shift: f64) -> f64 {
+    // Mirrors IpStdAugSystemSolver.cpp::CreateAugmentedSystem: D_x and D_s
+    // are copied first, then `AddScalar(delta_*)` is applied before the
+    // diagonal matrix term is coalesced into the augmented KKT structure.
+    if shift == 0.0 {
+        diagonal
+    } else {
+        diagonal + shift
+    }
+}
+
 fn fill_spral_augmented_kkt_values(
     pattern: &SpralAugmentedKktPattern,
     values: &mut [f64],
@@ -5824,8 +6925,10 @@ fn fill_spral_augmented_kkt_values(
         values[slot] += system.hessian.values[index];
     }
     for (index, &slot) in pattern.x_diagonal_indices.iter().enumerate() {
-        values[slot] += primal_shift;
-        values[slot] += system.bound_diagonal.get(index).copied().unwrap_or(0.0);
+        values[slot] += ipopt_augmented_diagonal_with_shift(
+            system.bound_diagonal.get(index).copied().unwrap_or(0.0),
+            primal_shift,
+        );
     }
     for (index, &slot) in pattern.equality_jacobian_value_indices.iter().enumerate() {
         values[slot] += system.equality_jacobian.values[index];
@@ -5834,7 +6937,10 @@ fn fill_spral_augmented_kkt_values(
         values[slot] += system.inequality_jacobian.values[index];
     }
     for (index, &slot) in pattern.p_diagonal_indices.iter().enumerate() {
-        values[slot] += system.multipliers[index] / system.slack[index] + slack_shift;
+        values[slot] += ipopt_augmented_diagonal_with_shift(
+            system.multipliers[index] / system.slack[index],
+            slack_shift,
+        );
     }
     for &slot in &pattern.lambda_diagonal_indices {
         values[slot] += -dual_shift;
@@ -6071,12 +7177,17 @@ fn factor_solve_spral_ssids(
 }
 
 fn factor_solve_spral_src(
+    system: &ReducedKktSystem<'_>,
     workspace: &mut NativeSpralAugmentedKktWorkspace,
     rhs: &[f64],
     regularization: f64,
+    context: IpoptLinearSolveContext,
     profiling: &mut InteriorPointProfiling,
     verbose: bool,
-) -> std::result::Result<(Vec<f64>, LinearBackendRunStats), InteriorPointLinearSolveAttempt> {
+) -> std::result::Result<
+    (SpralSrcFullSpaceSolution, LinearBackendRunStats),
+    InteriorPointLinearSolveAttempt,
+> {
     let matrix = SpralSymmetricCscMatrix::new(
         workspace.pattern.dimension(),
         &workspace.pattern.ccs.col_ptrs,
@@ -6100,7 +7211,10 @@ fn factor_solve_spral_src(
         workspace.session = Some(
             workspace
                 .native
-                .analyse_with_options_and_ordering(
+                // IpSpralSolverInterface.cpp exposes SPRAL through the ptr32
+                // one-based compressed sparse path. Keep NLIP's source-built
+                // SPRAL parity lane on the same analyse/factor entrypoints.
+                .analyse_ipopt_compatible_with_options_and_ordering(
                     matrix,
                     &workspace.numeric_options,
                     workspace.ordering,
@@ -6182,37 +7296,279 @@ fn factor_solve_spral_src(
         .session
         .as_ref()
         .expect("native SPRAL session must exist after factorization");
-    let mut solution = session.solve(rhs).map_err(|error| {
+    // IPOPT's SpralSolverInterface::MultiSolve calls spral_ssids_solve with
+    // nrhs=1 even for a single right-hand side. Keep the live SpralSrc KKT path
+    // on the same C entrypoint instead of spral_ssids_solve1.
+    let solution = session.solve_ipopt_single_rhs(rhs).map_err(|error| {
         native_spral_error_attempt(
             regularization,
             InteriorPointLinearSolveFailureKind::FactorizationFailed,
             error,
         )
     })?;
+    let pre_refinement_solution_fingerprint = vector_fingerprint(&solution);
+    let pre_refinement_solution_block_fingerprints =
+        ipopt_augmented_block_fingerprints(&workspace.pattern, &solution);
+    let (lower_bound_multiplier_step, upper_bound_multiplier_step) = system.bound_data.map_or_else(
+        || (Vec::new(), Vec::new()),
+        |bound_data| {
+            ipopt_bound_multiplier_steps_for_orientation(
+                bound_data,
+                &solution[..system.hessian.lower_triangle.nrow],
+                context.rhs_orientation,
+                system.barrier_parameter,
+            )
+        },
+    );
+    let upper_slack_multiplier_step = ipopt_upper_slack_bound_multiplier_steps_for_orientation(
+        system,
+        &solution[workspace.pattern.p_offset..workspace.pattern.p_offset + system.r_cent.len()],
+        context.rhs_orientation,
+    );
+    let mut full_space_solution = SpralSrcFullSpaceSolution {
+        augmented_solution: solution,
+        lower_bound_multiplier_step,
+        upper_bound_multiplier_step,
+        upper_slack_multiplier_step,
+    };
     let mut solve_time = solve_started.elapsed();
-    let refinement_steps = refine_linear_solution_ccs(
+    let refinement = if context.allow_inexact {
+        // IpFilterLSAcceptor::TrySecondOrderCorrection calls
+        // PDSystemSolver::Solve(..., allow_inexact=true), and
+        // IpPDFullSpaceSolver::Solve then exits after SolveOnce without
+        // full-space iterative refinement.
+        None
+    } else {
+        Some(refine_ipopt_full_space_solution(
+            system,
+            &workspace.pattern,
+            &mut full_space_solution,
+            context.rhs_orientation,
+            context.shifts,
+            &mut solve_time,
+            |residual| {
+                session.solve_ipopt_single_rhs(residual).map_err(|error| {
+                    native_spral_error_attempt(
+                        regularization,
+                        InteriorPointLinearSolveFailureKind::FactorizationFailed,
+                        error,
+                    )
+                })
+            },
+        )?)
+    };
+    let post_refinement_prefinal_solution_fingerprint =
+        vector_fingerprint(&full_space_solution.augmented_solution);
+    let post_refinement_prefinal_solution_block_fingerprints = ipopt_augmented_block_fingerprints(
+        &workspace.pattern,
+        &full_space_solution.augmented_solution,
+    );
+    let native_factor_detail = if context.allow_inexact {
+        format!(
+            "ipopt_allow_inexact_no_refinement; native_spral_factor[delays={} nfactor={} nflops={} maxfront={} two_by_two={} supernodes={} maxsuper={}]; native_spral_rhs[{}]; native_spral_rhs_blocks[{}]; native_spral_solution_prefinal[{}]; native_spral_solution_prefinal_blocks[{}]",
+            factor_info.delayed_pivots,
+            factor_info.factor_entries,
+            factor_info.flop_count,
+            factor_info.max_front_size,
+            factor_info.two_by_two_pivots,
+            factor_info.supernode_count,
+            factor_info.max_supernode_width,
+            vector_fingerprint_text(vector_fingerprint(rhs)),
+            ipopt_augmented_block_fingerprints_text(ipopt_augmented_block_fingerprints(
+                &workspace.pattern,
+                rhs,
+            )),
+            vector_fingerprint_text(pre_refinement_solution_fingerprint),
+            ipopt_augmented_block_fingerprints_text(pre_refinement_solution_block_fingerprints),
+        )
+    } else {
+        format!(
+            "native_spral_factor[delays={} nfactor={} nflops={} maxfront={} two_by_two={} supernodes={} maxsuper={}]; native_spral_rhs[{}]; native_spral_rhs_blocks[{}]; native_spral_solution_prefinal[{}]; native_spral_solution_prefinal_blocks[{}]; native_spral_solution_prefinal_refined[{}]; native_spral_solution_prefinal_refined_blocks[{}]",
+            factor_info.delayed_pivots,
+            factor_info.factor_entries,
+            factor_info.flop_count,
+            factor_info.max_front_size,
+            factor_info.two_by_two_pivots,
+            factor_info.supernode_count,
+            factor_info.max_supernode_width,
+            vector_fingerprint_text(vector_fingerprint(rhs)),
+            ipopt_augmented_block_fingerprints_text(ipopt_augmented_block_fingerprints(
+                &workspace.pattern,
+                rhs,
+            )),
+            vector_fingerprint_text(pre_refinement_solution_fingerprint),
+            ipopt_augmented_block_fingerprints_text(pre_refinement_solution_block_fingerprints),
+            vector_fingerprint_text(post_refinement_prefinal_solution_fingerprint),
+            ipopt_augmented_block_fingerprints_text(
+                post_refinement_prefinal_solution_block_fingerprints,
+            ),
+        )
+    };
+    let mut detail = refinement
+        .as_ref()
+        .filter(|refinement| refinement.steps > 0)
+        .map(|refinement| {
+            let first_correction_rhs = refinement
+                .first_correction_rhs
+                .map(vector_fingerprint_text)
+                .unwrap_or_else(|| "--".to_string());
+            let first_correction_rhs_blocks = refinement
+                .first_correction_rhs_blocks
+                .map(ipopt_augmented_block_fingerprints_text)
+                .unwrap_or_else(|| "--".to_string());
+            let first_correction_solution = refinement
+                .first_correction_solution
+                .map(vector_fingerprint_text)
+                .unwrap_or_else(|| "--".to_string());
+            let first_correction_solution_blocks = refinement
+                .first_correction_solution_blocks
+                .map(ipopt_augmented_block_fingerprints_text)
+                .unwrap_or_else(|| "--".to_string());
+            format!(
+                "full_space_iterative_refinement_steps={} residual_ratio={:.3e}->{:.3e} residuals=[{}]->[{}] first_correction_rhs[{}] first_correction_rhs_blocks[{}] first_correction_solution[{}] first_correction_solution_blocks[{}]",
+                refinement.steps,
+                refinement.initial_residual_ratio,
+                refinement.residual_ratio,
+                ipopt_full_space_residual_metrics_text(refinement.initial_residual),
+                ipopt_full_space_residual_metrics_text(refinement.final_residual),
+                first_correction_rhs,
+                first_correction_rhs_blocks,
+                first_correction_solution,
+                first_correction_solution_blocks,
+            )
+        })
+        .map_or_else(
+            || Some(native_factor_detail.clone()),
+            |detail| Some(format!("{detail}; {native_factor_detail}")),
+        );
+    let mut accepted_after_failed_refinement = false;
+    if let Some(refinement) = refinement.as_ref()
+        && refinement.failed
+    {
+        // IpPDFullSpaceSolver.cpp retries failed full-space iterative
+        // refinement by asking the augmented solver IncreaseQuality() once;
+        // if that has already happened, residual_ratio_singular decides
+        // whether to accept the current solution or pretend singular.
+        let refinement_detail = format!(
+            "ipopt_full_space_iterative_refinement_failed residual_ratio={:.3e}",
+            refinement.residual_ratio
+        );
+        if !context.native_spral_quality_was_increased
+            && native_spral_quality_can_increase(workspace, system)
+        {
+            return Err(InteriorPointLinearSolveAttempt {
+                solver: InteriorPointLinearSolver::SpralSrc,
+                regularization,
+                inertia: Some(Box::new(interior_point_linear_inertia(factor_info.inertia))),
+                failure_kind: InteriorPointLinearSolveFailureKind::ResidualTooLarge,
+                detail: Some(format!(
+                    "{refinement_detail}; spral_quality_retry_requested"
+                )),
+                solution_inf: Some(
+                    full_space_solution
+                        .augmented_solution
+                        .iter()
+                        .fold(0.0_f64, |acc, value| acc.max(value.abs())),
+                ),
+                solution_inf_limit: None,
+                residual_inf: Some(refinement.residual_ratio),
+                residual_inf_limit: Some(IPOPT_LINEAR_RESIDUAL_RATIO_MAX),
+            });
+        }
+        if refinement.residual_ratio >= IPOPT_LINEAR_RESIDUAL_RATIO_SINGULAR {
+            return Err(InteriorPointLinearSolveAttempt {
+                solver: InteriorPointLinearSolver::SpralSrc,
+                regularization,
+                inertia: Some(Box::new(interior_point_linear_inertia(factor_info.inertia))),
+                failure_kind: InteriorPointLinearSolveFailureKind::ResidualTooLarge,
+                detail: Some(format!(
+                    "{refinement_detail}; ipopt_pretend_singular_after_refinement_failure"
+                )),
+                solution_inf: Some(
+                    full_space_solution
+                        .augmented_solution
+                        .iter()
+                        .fold(0.0_f64, |acc, value| acc.max(value.abs())),
+                ),
+                solution_inf_limit: None,
+                residual_inf: Some(refinement.residual_ratio),
+                residual_inf_limit: Some(IPOPT_LINEAR_RESIDUAL_RATIO_SINGULAR),
+            });
+        }
+        detail = Some(match detail.take() {
+            Some(existing) => format!(
+                "{existing}; {refinement_detail}; ipopt_accept_current_solution_after_refinement_failure"
+            ),
+            None => {
+                format!(
+                    "{refinement_detail}; ipopt_accept_current_solution_after_refinement_failure"
+                )
+            }
+        });
+        accepted_after_failed_refinement = true;
+    }
+    if context.rhs_orientation == IpoptLinearRhsOrientation::PreFinal {
+        // IPOPT's PDSearchDirCalc calls PDFullSpaceSolver::Solve(-1., 0., ...)
+        // and PDFullSpaceSolver::Solve applies the final scaling only after
+        // SolveOnce and full-space iterative refinement have finished.
+        for value in &mut full_space_solution.augmented_solution {
+            *value = -*value;
+        }
+        for value in &mut full_space_solution.lower_bound_multiplier_step {
+            *value = -*value;
+        }
+        for value in &mut full_space_solution.upper_bound_multiplier_step {
+            *value = -*value;
+        }
+        for value in &mut full_space_solution.upper_slack_multiplier_step {
+            *value = -*value;
+        }
+    }
+    let final_rhs_storage;
+    let final_rhs = if context.rhs_orientation == IpoptLinearRhsOrientation::PreFinal {
+        final_rhs_storage = rhs.iter().map(|value| -*value).collect::<Vec<_>>();
+        final_rhs_storage.as_slice()
+    } else {
+        rhs
+    };
+    let assessment = assess_linear_solution_ccs(
         &workspace.pattern.ccs,
         &workspace.values,
-        rhs,
-        &mut solution,
-        &mut solve_time,
-        |residual| {
-            session.solve(residual).map_err(|error| {
-                native_spral_error_attempt(
-                    regularization,
-                    InteriorPointLinearSolveFailureKind::FactorizationFailed,
-                    error,
-                )
-            })
-        },
-    )?;
-    let assessment =
-        assess_linear_solution_ccs(&workspace.pattern.ccs, &workspace.values, rhs, &solution);
+        final_rhs,
+        &full_space_solution.augmented_solution,
+    );
+    if context.allow_inexact || accepted_after_failed_refinement {
+        // IpPDFullSpaceSolver.cpp accepts this branch directly after the
+        // allow_inexact early exit or the residual_ratio_singular check. Keep
+        // the generic augmented residual assessment as reporting metadata only.
+        let (solution_inf, residual_inf) = match assessment {
+            Ok(assessment) => (assessment.solution_inf, assessment.residual_inf),
+            Err(attempt) => (
+                attempt
+                    .solution_inf
+                    .unwrap_or_else(|| step_inf_norm(&full_space_solution.augmented_solution)),
+                attempt.residual_inf.unwrap_or(f64::NAN),
+            ),
+        };
+        return Ok((
+            full_space_solution,
+            LinearBackendRunStats {
+                solver: InteriorPointLinearSolver::SpralSrc,
+                factorization_time,
+                solve_time,
+                reused_symbolic: Some(reused_symbolic),
+                inertia: Some(interior_point_linear_inertia(factor_info.inertia)),
+                residual_inf,
+                solution_inf,
+                detail,
+            },
+        ));
+    }
 
     assessment
         .map(|assessment| {
             (
-                solution,
+                full_space_solution,
                 LinearBackendRunStats {
                     solver: InteriorPointLinearSolver::SpralSrc,
                     factorization_time,
@@ -6221,8 +7577,7 @@ fn factor_solve_spral_src(
                     inertia: Some(interior_point_linear_inertia(factor_info.inertia)),
                     residual_inf: assessment.residual_inf,
                     solution_inf: assessment.solution_inf,
-                    detail: (refinement_steps > 0)
-                        .then(|| format!("iterative_refinement_steps={refinement_steps}")),
+                    detail,
                 },
             )
         })
@@ -6238,37 +7593,25 @@ fn solve_reduced_kkt_with_spral_src(
     workspace: &mut NativeSpralAugmentedKktWorkspace,
     profiling: &mut InteriorPointProfiling,
     verbose: bool,
+    allow_inexact: bool,
 ) -> std::result::Result<NewtonDirection, Vec<InteriorPointLinearSolveAttempt>> {
     let n = system.hessian.lower_triangle.nrow;
     let meq = system.equality_jacobian.nrows();
     let mineq = system.inequality_jacobian.nrows();
-    let rhs_p = system
-        .r_cent
-        .iter()
-        .zip(system.slack.iter())
-        .enumerate()
-        .map(|(index, _)| ipopt_internal_slack_rhs(system, index))
-        .collect::<Vec<_>>();
-    let total_dimension = workspace.pattern.dimension();
-    let mut rhs = vec![0.0; total_dimension];
-    rhs[..n]
-        .iter_mut()
-        .zip(system.r_dual.iter())
-        .zip(system.bound_rhs.iter())
-        .for_each(|((rhs_i, r_i), bound_rhs_i)| *rhs_i = -*r_i + bound_rhs_i);
-    rhs[workspace.pattern.p_offset..workspace.pattern.p_offset + mineq].copy_from_slice(&rhs_p);
-    for row in 0..meq {
-        rhs[workspace.pattern.lambda_offset + row] = -system.r_eq[row];
-    }
-    for row in 0..mineq {
-        rhs[workspace.pattern.z_offset + row] = -system.r_ineq[row];
-    }
+    let rhs = build_ipopt_augmented_kkt_rhs(
+        system,
+        &workspace.pattern,
+        IpoptLinearRhsOrientation::PreFinal,
+    );
 
     let mut attempts: Vec<InteriorPointLinearSolveAttempt> = Vec::new();
     let mut current_regularization = system.regularization.max(0.0);
     let mut current_jacobian_regularization = system.forced_jacobian_regularization.unwrap_or(0.0);
     let mut tried_jacobian_regularization = system.forced_jacobian_regularization.is_some();
     let mut quality_retry_detail: Option<String> = None;
+    // Mirrors IpPDFullSpaceSolver::augsys_improved_: scoped to this
+    // primal-dual system solve, and not reset by perturbation retries because
+    // IPOPT's cache dependencies exclude the perturbation shifts.
     let mut solver_quality_improved = false;
     let max_regularization = system
         .regularization_max
@@ -6287,7 +7630,24 @@ fn solve_reduced_kkt_with_spral_src(
             slack_shift,
             dual_shift,
         );
-        match factor_solve_spral_src(workspace, &rhs, current_regularization, profiling, verbose) {
+        match factor_solve_spral_src(
+            system,
+            workspace,
+            &rhs,
+            current_regularization,
+            IpoptLinearSolveContext {
+                shifts: IpoptLinearRefinementShifts {
+                    primal: primal_shift,
+                    slack: slack_shift,
+                    dual: dual_shift,
+                },
+                rhs_orientation: IpoptLinearRhsOrientation::PreFinal,
+                allow_inexact,
+                native_spral_quality_was_increased: solver_quality_improved,
+            },
+            profiling,
+            verbose,
+        ) {
             Ok((solution, mut backend_stats)) => {
                 if !attempts.is_empty() {
                     let attempt_detail = attempts
@@ -6316,35 +7676,32 @@ fn solve_reduced_kkt_with_spral_src(
                         None => quality_detail,
                     });
                 }
+                let SpralSrcFullSpaceSolution {
+                    augmented_solution: solution,
+                    lower_bound_multiplier_step,
+                    upper_bound_multiplier_step,
+                    upper_slack_multiplier_step,
+                } = solution;
                 let dx = solution[..n].to_vec();
                 let ipopt_ds = solution
                     [workspace.pattern.p_offset..workspace.pattern.p_offset + mineq]
                     .to_vec();
-                let ds = ipopt_ds.iter().map(|value| -*value).collect::<Vec<_>>();
+                let ds = ipopt_ds;
                 let d_lambda = solution
                     [workspace.pattern.lambda_offset..workspace.pattern.lambda_offset + meq]
                     .to_vec();
                 let d_ineq = solution
                     [workspace.pattern.z_offset..workspace.pattern.z_offset + mineq]
                     .to_vec();
-                let dz = system
-                    .r_cent
-                    .iter()
-                    .zip(system.multipliers.iter())
-                    .zip(system.slack.iter())
-                    .zip(ipopt_ds.iter())
-                    .map(|(((r_cent_i, z_i), s_i), ipopt_ds_i)| {
-                        ipopt_upper_slack_bound_multiplier_step(*s_i, *z_i, *r_cent_i, *ipopt_ds_i)
-                    })
-                    .collect::<Vec<_>>();
+                let dz = upper_slack_multiplier_step;
                 return Ok(NewtonDirection {
                     dx,
                     d_lambda,
                     d_ineq,
                     ds,
                     dz,
-                    dz_lower: Vec::new(),
-                    dz_upper: Vec::new(),
+                    dz_lower: lower_bound_multiplier_step,
+                    dz_upper: upper_bound_multiplier_step,
                     solver_used: InteriorPointLinearSolver::SpralSrc,
                     regularization_used: current_regularization,
                     dual_regularization_used: current_jacobian_regularization,
@@ -6357,8 +7714,14 @@ fn solve_reduced_kkt_with_spral_src(
             Err(attempt) => {
                 let singularity_like_failure = is_singularity_like_linear_failure(&attempt);
                 let too_few_negative_eigenvalues = is_negative_eigenvalues_too_few(&attempt);
+                let full_space_refinement_quality_retry = attempt.failure_kind
+                    == InteriorPointLinearSolveFailureKind::ResidualTooLarge
+                    && attempt
+                        .detail
+                        .as_deref()
+                        .is_some_and(|detail| detail.contains("spral_quality_retry_requested"));
                 attempts.push(attempt);
-                if too_few_negative_eigenvalues
+                if (too_few_negative_eigenvalues || full_space_refinement_quality_retry)
                     && !solver_quality_improved
                     && let Some((old_u, new_u)) =
                         try_increase_native_spral_quality(workspace, system)
@@ -6418,27 +7781,11 @@ fn solve_reduced_kkt_with_spral_ssids(
     let n = system.hessian.lower_triangle.nrow;
     let meq = system.equality_jacobian.nrows();
     let mineq = system.inequality_jacobian.nrows();
-    let rhs_p = system
-        .r_cent
-        .iter()
-        .zip(system.slack.iter())
-        .enumerate()
-        .map(|(index, _)| ipopt_internal_slack_rhs(system, index))
-        .collect::<Vec<_>>();
-    let total_dimension = workspace.pattern.dimension();
-    let mut rhs = vec![0.0; total_dimension];
-    rhs[..n]
-        .iter_mut()
-        .zip(system.r_dual.iter())
-        .zip(system.bound_rhs.iter())
-        .for_each(|((rhs_i, r_i), bound_rhs_i)| *rhs_i = -*r_i + bound_rhs_i);
-    rhs[workspace.pattern.p_offset..workspace.pattern.p_offset + mineq].copy_from_slice(&rhs_p);
-    for row in 0..meq {
-        rhs[workspace.pattern.lambda_offset + row] = -system.r_eq[row];
-    }
-    for row in 0..mineq {
-        rhs[workspace.pattern.z_offset + row] = -system.r_ineq[row];
-    }
+    let rhs = build_ipopt_augmented_kkt_rhs(
+        system,
+        &workspace.pattern,
+        IpoptLinearRhsOrientation::FinalDirection,
+    );
 
     let mut attempts = Vec::new();
     let mut current_regularization = if system.forced_jacobian_regularization.is_some() {
@@ -6473,7 +7820,7 @@ fn solve_reduced_kkt_with_spral_ssids(
                 let ipopt_ds = solution
                     [workspace.pattern.p_offset..workspace.pattern.p_offset + mineq]
                     .to_vec();
-                let ds = ipopt_ds.iter().map(|value| -*value).collect::<Vec<_>>();
+                let ds = ipopt_ds;
                 let d_lambda = solution
                     [workspace.pattern.lambda_offset..workspace.pattern.lambda_offset + meq]
                     .to_vec();
@@ -6485,9 +7832,9 @@ fn solve_reduced_kkt_with_spral_ssids(
                     .iter()
                     .zip(system.multipliers.iter())
                     .zip(system.slack.iter())
-                    .zip(ipopt_ds.iter())
-                    .map(|(((r_cent_i, z_i), s_i), ipopt_ds_i)| {
-                        ipopt_upper_slack_bound_multiplier_step(*s_i, *z_i, *r_cent_i, *ipopt_ds_i)
+                    .zip(ds.iter())
+                    .map(|(((r_cent_i, z_i), s_i), ds_i)| {
+                        ipopt_final_upper_slack_bound_multiplier_step(*s_i, *z_i, *r_cent_i, *ds_i)
                     })
                     .collect::<Vec<_>>();
                 return Ok(NewtonDirection {
@@ -6652,7 +7999,7 @@ fn solve_reduced_kkt_with_sparse_qdldl(
             let ds = jacobian_dx
                 .iter()
                 .zip(system.r_ineq.iter())
-                .map(|(gdx_i, r_ineq_i)| -r_ineq_i - gdx_i)
+                .map(|(gdx_i, r_ineq_i)| r_ineq_i + gdx_i)
                 .collect::<Vec<_>>();
             let d_ineq = ds
                 .iter()
@@ -6661,8 +8008,9 @@ fn solve_reduced_kkt_with_sparse_qdldl(
                 .zip(system.slack.iter())
                 .enumerate()
                 .map(|(index, (((ds_i, r_cent_i), z_i), s_i))| {
-                    (-r_cent_i + s_i * damped_slack_stationarity_residual(system, index)
-                        - z_i * ds_i)
+                    (-r_cent_i
+                        + s_i * damped_slack_stationarity_residual(system, index)
+                        + z_i * ds_i)
                         / s_i
                 })
                 .collect::<Vec<_>>();
@@ -6756,7 +8104,7 @@ fn solve_reduced_kkt_with_sparse_qdldl(
                     let ds = jacobian_dx
                         .iter()
                         .zip(system.r_ineq.iter())
-                        .map(|(gdx_i, r_ineq_i)| -r_ineq_i - gdx_i)
+                        .map(|(gdx_i, r_ineq_i)| r_ineq_i + gdx_i)
                         .collect::<Vec<_>>();
                     let d_ineq = ds
                         .iter()
@@ -6765,8 +8113,9 @@ fn solve_reduced_kkt_with_sparse_qdldl(
                         .zip(system.slack.iter())
                         .enumerate()
                         .map(|(index, (((ds_i, r_cent_i), z_i), s_i))| {
-                            (-r_cent_i + s_i * damped_slack_stationarity_residual(system, index)
-                                - z_i * ds_i)
+                            (-r_cent_i
+                                + s_i * damped_slack_stationarity_residual(system, index)
+                                + z_i * ds_i)
                                 / s_i
                         })
                         .collect::<Vec<_>>();
@@ -6822,6 +8171,7 @@ fn solve_reduced_kkt(
     native_spral_workspace: Option<&mut NativeSpralAugmentedKktWorkspace>,
     profiling: &mut InteriorPointProfiling,
     verbose: bool,
+    allow_inexact: bool,
 ) -> std::result::Result<NewtonDirection, InteriorPointSolveError> {
     let preferred_solver = preferred_linear_solver(
         system.solver,
@@ -6836,11 +8186,16 @@ fn solve_reduced_kkt(
     if preferred_solver == InteriorPointLinearSolver::SpralSrc
         && let Some(workspace) = native_spral_workspace
     {
-        return solve_reduced_kkt_with_spral_src(system, workspace, profiling, verbose).map_err(
-            |attempts| {
-                linear_solve_error(preferred_solver, workspace.pattern.dimension(), attempts)
-            },
-        );
+        return solve_reduced_kkt_with_spral_src(
+            system,
+            workspace,
+            profiling,
+            verbose,
+            allow_inexact,
+        )
+        .map_err(|attempts| {
+            linear_solve_error(preferred_solver, workspace.pattern.dimension(), attempts)
+        });
     }
 
     if preferred_solver == InteriorPointLinearSolver::SsidsRs
@@ -7024,6 +8379,7 @@ fn nlip_log_snapshot(log: &InteriorPointIterationLog) -> InteriorPointIterationS
         watchdog_active: log.flags.watchdog_active,
         line_search: None,
         direction_diagnostics: None,
+        step_direction: None,
         linear_debug: None,
         linear_solver: InteriorPointLinearSolver::Auto,
         linear_solve_time: log.linear_time_secs.map(Duration::from_secs_f64),
@@ -7258,6 +8614,7 @@ mod tests {
             watchdog_active: false,
             line_search: None,
             direction_diagnostics: None,
+            step_direction: None,
             linear_debug: None,
             linear_solver: InteriorPointLinearSolver::Auto,
             linear_solve_time: None,
@@ -7330,6 +8687,20 @@ mod tests {
             assert!(compl <= kappa_sigma * mu + 1e-12);
             assert!(compl >= mu / kappa_sigma - 1e-12);
         }
+    }
+
+    #[test]
+    fn bound_multiplier_correction_keeps_ipopt_step_order() {
+        let mu = 1.7646745086707415e-7;
+        let kappa_sigma = 5.918795724267679;
+        let slack = vec![0.2958312539029896];
+        let z = vec![278.59313097706615];
+
+        let (corrected_z, _) = correct_bound_multiplier_estimate(&z, &slack, mu, kappa_sigma);
+        let direct_endpoint = (kappa_sigma * mu) / slack[0];
+
+        assert_eq!(corrected_z[0].to_bits(), 0x3ecd_9dff_f800_0000);
+        assert_eq!(direct_endpoint.to_bits(), 0x3ecd_9dff_fa07_9d96);
     }
 
     #[test]
@@ -7418,11 +8789,346 @@ mod tests {
     }
 
     #[test]
+    fn alpha_for_y_min_max_keep_ipopt_dual_first_tie_order() {
+        let direction = test_direction(&[1.0], &[1.0]);
+        let mut options = InteriorPointOptions {
+            alpha_for_y: InteriorPointAlphaForYStrategy::Min,
+            ..InteriorPointOptions::default()
+        };
+
+        assert_eq!(
+            alpha_for_y(-0.0, 0.0, &direction, &options).to_bits(),
+            0.0_f64.to_bits()
+        );
+
+        options.alpha_for_y = InteriorPointAlphaForYStrategy::Max;
+        assert_eq!(
+            alpha_for_y(-0.0, 0.0, &direction, &options).to_bits(),
+            0.0_f64.to_bits()
+        );
+    }
+
+    #[test]
+    fn monotone_mu_floor_ignores_adaptive_mu_min() {
+        let options = InteriorPointOptions {
+            overall_tol: 1e-12,
+            complementarity_tol: 1e-12,
+            mu_min: 1e-2,
+            ..InteriorPointOptions::default()
+        };
+
+        // IPOPT IpMonotoneMuUpdate::CalcNewMuAndTau does not include mu_min
+        // in the monotone lower bound. With mu=1e-4, the next value is
+        // min(0.2*mu, mu^1.5) = 1e-6, not the larger adaptive mu_min.
+        let next = next_barrier_parameter_once(1e-4, &options);
+
+        assert!((next - 1e-6).abs() <= 10.0 * f64::EPSILON);
+    }
+
+    #[test]
+    fn monotone_mu_initialization_uses_mu_init_exactly() {
+        let options = InteriorPointOptions {
+            mu_init: 1e-1,
+            mu_min: 1e-2,
+            mu_target: 1e-4,
+            ..InteriorPointOptions::default()
+        };
+
+        // IPOPT IpMonotoneMuUpdate::Initialize sets mu_init_ directly instead
+        // of clamping through current complementarity, mu_min, or mu_target.
+        assert_eq!(
+            initial_monotone_barrier_parameter(true, &options).to_bits(),
+            options.mu_init.to_bits()
+        );
+        assert_eq!(
+            initial_monotone_barrier_parameter(false, &options).to_bits(),
+            0.0_f64.to_bits()
+        );
+    }
+
+    #[test]
+    fn monotone_mu_tiny_step_forces_only_one_drop() {
+        let options = InteriorPointOptions::default();
+
+        // IPOPT IpMonotoneMuUpdate::UpdateBarrierParameter consumes
+        // tiny_step_flag after the first loop pass. A large barrier error
+        // therefore stops after the forced one-step update.
+        let next = next_barrier_parameter(1e-1, true, true, &options, |_| 1e6);
+
+        assert!((next - 2e-2).abs() <= f64::EPSILON);
+    }
+
+    #[test]
+    fn monotone_mu_first_call_can_fast_decrease_even_when_disabled() {
+        let options = InteriorPointOptions {
+            overall_tol: 1e-12,
+            complementarity_tol: 1e-12,
+            mu_allow_fast_monotone_decrease: false,
+            ..InteriorPointOptions::default()
+        };
+
+        // IPOPT keeps initialized_=false until the end of the first
+        // UpdateBarrierParameter call, so the first call can still take the
+        // fast monotone loop even when later calls would stop after one drop.
+        let first_call = next_barrier_parameter(1e-1, false, false, &options, |_| 0.0);
+        let later_call = next_barrier_parameter(1e-1, false, true, &options, |_| 0.0);
+
+        assert!((first_call - 1e-12 / 11.0).abs() <= f64::EPSILON);
+        assert!((later_call - 2e-2).abs() <= f64::EPSILON);
+    }
+
+    #[test]
+    fn monotone_mu_change_detection_has_no_local_tolerance() {
+        let options = InteriorPointOptions {
+            overall_tol: 1e-12,
+            complementarity_tol: 1e-12,
+            ..InteriorPointOptions::default()
+        };
+        let floor = minimum_monotone_barrier_parameter(&options);
+        let just_above_floor = f64::from_bits(floor.to_bits() + 1);
+
+        // IPOPT IpMonotoneMuUpdate::UpdateBarrierParameter tests
+        // `mu != new_mu` exactly before accepting a barrier update and
+        // resetting the line search. Even a one-ulp drop to the monotone floor
+        // is therefore source-visible.
+        let next = next_barrier_parameter(just_above_floor, false, true, &options, |_| 0.0);
+
+        assert_eq!(next.to_bits(), floor.to_bits());
+    }
+
+    #[test]
+    fn push_scalar_to_bounds_interior_keeps_ipopt_tiny_margin_order() {
+        let lower = 0.0;
+        let upper = 1.0e-305;
+        let bound_push = 1.0;
+        let bound_frac = 0.5;
+        let tiny_double = 100.0 * f64::MIN_POSITIVE;
+
+        let pushed_from_lower =
+            push_scalar_to_bounds_interior(lower, Some(lower), Some(upper), bound_push, bound_frac);
+        let pushed_from_upper =
+            push_scalar_to_bounds_interior(upper, Some(lower), Some(upper), bound_push, bound_frac);
+
+        // Ipopt::DefaultIterateInitializer::push_variables subtracts
+        // tiny_double from the lower-side fraction margin, then adds it back
+        // only for the upper-side margin.
+        assert_eq!(
+            pushed_from_lower.to_bits(),
+            (bound_frac * (upper - lower) - tiny_double).to_bits()
+        );
+        assert_eq!(
+            pushed_from_upper.to_bits(),
+            (upper - bound_frac * (upper - lower)).to_bits()
+        );
+    }
+
+    #[test]
+    fn push_scalar_to_bounds_interior_snaps_before_pushing() {
+        let pushed = push_scalar_to_bounds_interior(-10.0, Some(2.0), Some(8.0), 1.0e-1, 1.0e-1);
+
+        assert_eq!(pushed, 2.2);
+    }
+
+    #[test]
+    fn push_scalar_to_bounds_interior_without_bound_frac_only_snaps() {
+        let pushed = push_scalar_to_bounds_interior(-10.0, Some(2.0), Some(8.0), 1.0e-1, 0.0);
+
+        assert_eq!(pushed, 2.0);
+    }
+
+    #[test]
     fn filter_alpha_min_keeps_ipopt_formula_near_feasibility() {
         let options = InteriorPointOptions::default();
         let alpha_min = calculate_filter_alpha_min(1.0e-3, 1.0e-2, -1.0e-2, &options);
 
-        assert_eq!(alpha_min, options.min_step);
+        assert!((alpha_min - 5.0e-11).abs() <= 1.0e-25);
+        assert!(alpha_min < options.min_step);
+    }
+
+    #[test]
+    fn barrier_objective_accumulates_components_in_ipopt_order() {
+        let bounds = BoundConstraints {
+            lower_indices: vec![0, 1],
+            lower_values: vec![0.125, -2.0],
+            upper_indices: vec![1, 2],
+            upper_values: vec![3.0, 5.0],
+        };
+        let x = vec![1.25, 0.5, 2.0];
+        let slack = vec![0.03125, 1.5, 4.0];
+        let objective = 7.25;
+        let mu = 0.125;
+        let kappa_d = 1.0e-5;
+
+        let actual = barrier_objective_value(objective, &slack, &x, &bounds, mu, kappa_d);
+
+        // IpoptCalculatedQuantities::CalcBarrierTerm accumulates SumLogs in
+        // x_L, x_U, s_L, s_U order, then adds damping in the same order.
+        let mut barrier_term = 0.0;
+        barrier_term += native_lower_bound_log_sum(&x, &bounds);
+        barrier_term += native_upper_bound_log_sum(&x, &bounds);
+        barrier_term += slack.iter().map(|value| value.ln()).sum::<f64>();
+        let mut expected = objective + (-mu * barrier_term);
+        let damping_weight = mu * kappa_d;
+        expected += damping_weight * native_lower_bound_damping_sum(&x, &bounds);
+        expected += damping_weight * native_upper_bound_damping_sum(&x, &bounds);
+        expected += damping_weight * slack.iter().sum::<f64>();
+
+        assert_eq!(actual.to_bits(), expected.to_bits());
+    }
+
+    #[test]
+    fn barrier_directional_derivative_uses_ipopt_gradient_dot_order() {
+        let bounds = BoundConstraints {
+            lower_indices: vec![0, 1],
+            lower_values: vec![0.125, -2.0],
+            upper_indices: vec![1, 2],
+            upper_values: vec![3.0, 5.0],
+        };
+        let gradient = vec![1.5, -2.25, 0.75];
+        let x = vec![1.25, 0.5, 2.0];
+        let dx = vec![0.03125, -0.5, 0.125];
+        let slack = vec![0.03125, 1.5, 4.0];
+        let ds = vec![-0.0625, 0.25, -0.125];
+        let mu = 0.125;
+        let kappa_d = 1.0e-5;
+
+        let actual = barrier_objective_directional_derivative(
+            &gradient, &slack, &x, &bounds, &dx, &ds, mu, kappa_d,
+        );
+
+        // IpoptCalculatedQuantities::curr_gradBarrTDelta first builds
+        // curr_grad_barrier_obj_x and curr_grad_barrier_obj_s in source order,
+        // then computes grad_x.dot(delta_x) + grad_s.dot(delta_s).
+        let mut grad_x = gradient.clone();
+        for (&index, &lower) in bounds.lower_indices.iter().zip(bounds.lower_values.iter()) {
+            grad_x[index] += -mu / native_lower_bound_slack(&x, index, lower);
+        }
+        for (&index, &upper) in bounds.upper_indices.iter().zip(bounds.upper_values.iter()) {
+            grad_x[index] += mu / native_upper_bound_slack(&x, index, upper);
+        }
+        let damping_weight = mu * kappa_d;
+        for &index in bounds
+            .lower_indices
+            .iter()
+            .filter(|index| !bounds.upper_indices.contains(index))
+        {
+            grad_x[index] += damping_weight;
+        }
+        for &index in bounds
+            .upper_indices
+            .iter()
+            .filter(|index| !bounds.lower_indices.contains(index))
+        {
+            grad_x[index] -= damping_weight;
+        }
+        let x_dot = grad_x
+            .iter()
+            .zip(dx.iter())
+            .map(|(gradient_i, dx_i)| gradient_i * dx_i)
+            .sum::<f64>();
+        let mut grad_s = slack.iter().map(|slack_i| mu / slack_i).collect::<Vec<_>>();
+        for grad_i in &mut grad_s {
+            *grad_i -= damping_weight;
+        }
+        let s_dot = grad_s
+            .iter()
+            .zip(ds.iter())
+            .map(|(gradient_i, ds_i)| gradient_i * ds_i)
+            .sum::<f64>();
+
+        assert_eq!(actual.to_bits(), (x_dot + s_dot).to_bits());
+    }
+
+    #[test]
+    fn ipopt_optimality_scaling_vectors_use_bound_before_slack_order() {
+        let all_dual =
+            ipopt_all_dual_multiplier_vector(&[1.0, 2.0], &[3.0], &[4.0, 5.0], &[6.0], &[7.0, 8.0]);
+        let complementarity =
+            ipopt_complementarity_multiplier_vector(&[4.0, 5.0], &[6.0], &[7.0, 8.0]);
+
+        // IpoptCalculatedQuantities::ComputeOptimalityErrorScaling accumulates
+        // y_c, y_d, z_L, z_U, v_L, v_U; curr_complementarity uses z_L, z_U,
+        // v_L, v_U. NLIP omits v_L but keeps v_U after variable bounds.
+        assert_eq!(all_dual, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(complementarity, vec![4.0, 5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn fraction_to_boundary_candidate_keeps_ipopt_operation_order() {
+        let tau = 0.7782901536485674;
+        let value = 2.59793708066258e-11;
+        let delta = -2.2047607129366904e-6;
+
+        let ipopt_order = ipopt_dense_frac_to_bound_candidate(tau, value, delta);
+        let old_nlip_order = -tau * value / delta;
+
+        assert_eq!(ipopt_order.to_bits(), 0x3ee3_3b8d_73e4_0424);
+        assert_eq!(old_nlip_order.to_bits(), 0x3ee3_3b8d_73e4_0425);
+    }
+
+    #[test]
+    fn current_plus_step_copies_on_zero_alpha_like_ipopt() {
+        let value = -0.0_f64;
+        let delta = 42.0_f64;
+        let ipopt_order = ipopt_dense_current_plus_step(value, 0.0, delta);
+        let old_nlip_order = value + 0.0 * delta;
+
+        assert_eq!(ipopt_order.to_bits(), (-0.0_f64).to_bits());
+        assert_eq!(old_nlip_order.to_bits(), 0.0_f64.to_bits());
+    }
+
+    #[test]
+    fn augmented_diagonal_shift_groups_like_ipopt() {
+        let hessian_diagonal = 1.0e16;
+        let diagonal = 1.0;
+        let shift = -1.0e16;
+
+        let ipopt_order = hessian_diagonal + ipopt_augmented_diagonal_with_shift(diagonal, shift);
+        let old_nlip_order = (hessian_diagonal + shift) + diagonal;
+
+        assert_eq!(ipopt_order.to_bits(), 0.0_f64.to_bits());
+        assert_eq!(old_nlip_order.to_bits(), 1.0_f64.to_bits());
+    }
+
+    #[test]
+    fn fraction_to_boundary_min_keeps_ipopt_first_argument_on_tie() {
+        let first_limiter = InteriorPointBoundaryLimiter {
+            kind: InteriorPointBoundaryLimiterKind::VariableLowerBound,
+            index: 1,
+            value: 2.0,
+            direction: -4.0,
+            alpha: 0.125,
+        };
+        let second_limiter = InteriorPointBoundaryLimiter {
+            kind: InteriorPointBoundaryLimiterKind::Slack,
+            index: 2,
+            value: 4.0,
+            direction: -8.0,
+            alpha: 0.125,
+        };
+
+        let (_, limiter) = ipopt_min_boundary_candidate(
+            (0.125, Some(first_limiter.clone())),
+            (0.125, Some(second_limiter)),
+        );
+
+        assert_eq!(limiter, Some(first_limiter));
+    }
+
+    #[test]
+    fn dual_fraction_to_boundary_uses_ipopt_bound_then_slack_order() {
+        let (alpha, limiter) = ipopt_dual_fraction_to_boundary_with_limiter(
+            &[2.0],
+            &[-4.0],
+            &[],
+            &[],
+            &[4.0],
+            &[-8.0],
+            0.25,
+        );
+
+        assert_eq!(alpha, 0.125);
+        assert_eq!(limiter.expect("expected limiter").value, 2.0);
     }
 }
 
@@ -7961,13 +9667,13 @@ where
     let trial_evaluation_context = TrialEvaluationContext {
         equality_jacobian_structure: &equality_jacobian_structure,
         inequality_jacobian_structure: &inequality_jacobian_structure,
-        options,
     };
     let mut lambda_eq = vec![0.0; equality_count];
     let mut z = vec![1.0; augmented_inequality_count];
     let mut z_lower = vec![1.0; bounds.lower_indices.len()];
     let mut z_upper = vec![1.0; bounds.upper_indices.len()];
     let mut slack = vec![1.0; augmented_inequality_count];
+    let slack_upper_bounds = slack_upper_bound_values(augmented_inequality_count, options);
     let mut event_state = SqpEventLegendState::default();
     let mut last_adapter_timing = problem.adapter_timing_snapshot();
     profiling.adapter_timing = last_adapter_timing;
@@ -7986,10 +9692,11 @@ where
     profiling.preprocessing_time += setup_started.elapsed().saturating_sub(setup_callback_time);
     initialise_slacks(
         &initial_state.augmented_inequality_values,
+        &slack_upper_bounds,
         &mut slack,
         options,
     );
-    let initial_slack_barrier = slack_barrier_values(&slack);
+    let initial_slack_barrier = slack_barrier_values(&slack, &slack_upper_bounds);
     match options.bound_mult_init_method {
         InteriorPointBoundMultiplierInitMethod::Constant => {
             z.fill(options.bound_mult_init_val);
@@ -8040,6 +9747,7 @@ where
         let (initial_lambda_eq, initial_lambda_ineq) = least_squares_constraint_multipliers(
             &initial_linear_state,
             &z,
+            hessian_structure.as_ref(),
             options.regularization,
             options.linear_solver,
         );
@@ -8073,22 +9781,18 @@ where
     let theta_scale = initial_theta.max(1.0);
     let theta_max = options.theta_max_fact * theta_scale;
     let theta_min = options.theta_min_fact * theta_scale;
-    let mut barrier_parameter_value = if barrier_pair_count > 0 {
-        let initial_complementarity =
-            combined_barrier_parameter(&initial_slack_barrier, &z, &x, &bounds, &z_lower, &z_upper);
-        options
-            .mu_target
-            .max(options.mu_min)
-            .max(initial_complementarity.min(options.mu_init))
-    } else {
-        0.0
-    };
+    let mut barrier_parameter_value =
+        initial_monotone_barrier_parameter(barrier_pair_count > 0, options);
     let mut watchdog_state = InteriorPointWatchdogState::default();
+    let mut monotone_mu_update_initialized = false;
     let mut pending_iteration_events = Vec::new();
 
     if options.max_iters == 0 {
         let equality_inf = inf_norm(&initial_state.equality_values);
-        let inequality_inf = positive_part_inf_norm(&initial_state.augmented_inequality_values);
+        let inequality_inf = inequality_upper_bound_inf_norm(
+            &initial_state.augmented_inequality_values,
+            &slack_upper_bounds,
+        );
         let initial_inequality_residual =
             slack_form_inequality_residuals(&initial_state.augmented_inequality_values, &slack);
         let initial_dual_residual = lagrangian_gradient_sparse(
@@ -8130,15 +9834,10 @@ where
             options.kappa_d,
         );
         let current_filter_entry = super::filter::entry(current_barrier_objective, current_theta);
-        let all_dual_multipliers = combined_multiplier_vector([
-            lambda_eq.as_slice(),
-            lambda_ineq.as_slice(),
-            z.as_slice(),
-            z_lower.as_slice(),
-            z_upper.as_slice(),
-        ]);
+        let all_dual_multipliers =
+            ipopt_all_dual_multiplier_vector(&lambda_eq, &lambda_ineq, &z_lower, &z_upper, &z);
         let complementarity_multipliers =
-            combined_multiplier_vector([z.as_slice(), z_lower.as_slice(), z_upper.as_slice()]);
+            ipopt_complementarity_multiplier_vector(&z_lower, &z_upper, &z);
         let overall_inf = scaled_overall_inf_norm(
             current_theta,
             dual_inf,
@@ -8192,6 +9891,7 @@ where
                 && watchdog_state.remaining_iters > 0,
             line_search: None,
             direction_diagnostics: None,
+            step_direction: None,
             linear_debug: None,
             linear_solver: last_linear_solver,
             linear_solve_time: None,
@@ -8279,10 +9979,13 @@ where
             &mut iteration_callback_time,
         );
         let equality_inf = inf_norm(&state.equality_values);
-        let inequality_inf = positive_part_inf_norm(&state.augmented_inequality_values);
+        let inequality_inf = inequality_upper_bound_inf_norm(
+            &state.augmented_inequality_values,
+            &slack_upper_bounds,
+        );
         let inequality_residual =
             slack_form_inequality_residuals(&state.augmented_inequality_values, &slack);
-        let slack_barrier = slack_barrier_values(&slack);
+        let slack_barrier = slack_barrier_values(&slack, &slack_upper_bounds);
         let internal_inequality_inf = inf_norm(&inequality_residual);
         let primal_inf = equality_inf.max(internal_inequality_inf);
         let full_dual_residual = lagrangian_gradient_sparse(
@@ -8387,15 +10090,10 @@ where
         } else {
             0.0
         };
-        let all_dual_multipliers = combined_multiplier_vector([
-            lambda_eq.as_slice(),
-            lambda_ineq.as_slice(),
-            z.as_slice(),
-            z_lower.as_slice(),
-            z_upper.as_slice(),
-        ]);
+        let all_dual_multipliers =
+            ipopt_all_dual_multiplier_vector(&lambda_eq, &lambda_ineq, &z_lower, &z_upper, &z);
         let complementarity_multipliers =
-            combined_multiplier_vector([z.as_slice(), z_lower.as_slice(), z_upper.as_slice()]);
+            ipopt_complementarity_multiplier_vector(&z_lower, &z_upper, &z);
         let overall_inf = scaled_overall_inf_norm(
             primal_inf,
             dual_inf,
@@ -8404,7 +10102,7 @@ where
             &complementarity_multipliers,
             options.overall_scale_max,
         );
-        let current_barrier_objective = barrier_objective_value(
+        let mut current_barrier_objective = barrier_objective_value(
             state.objective_value,
             &slack_barrier,
             &x,
@@ -8417,7 +10115,8 @@ where
             &state.augmented_inequality_values,
             &slack,
         );
-        let current_filter_entry = super::filter::entry(current_barrier_objective, current_theta);
+        let mut current_filter_entry =
+            super::filter::entry(current_barrier_objective, current_theta);
         let mut current_snapshot = InteriorPointIterationSnapshot {
             iteration,
             phase: if iteration == 0 {
@@ -8467,6 +10166,7 @@ where
                 && watchdog_state.remaining_iters > 0,
             line_search: None,
             direction_diagnostics: None,
+            step_direction: None,
             linear_debug: None,
             linear_solver: last_linear_solver,
             linear_solve_time: None,
@@ -8567,6 +10267,7 @@ where
                 watchdog_active: false,
                 line_search: None,
                 direction_diagnostics: None,
+                step_direction: None,
                 linear_debug: None,
                 linear_solver: last_linear_solver,
                 linear_solve_time: None,
@@ -8656,6 +10357,82 @@ where
         }
         last_objective_value = state.objective_value;
 
+        if barrier_pair_count > 0 {
+            let previous_barrier_parameter = barrier_parameter_value;
+            let next_barrier_parameter_value = next_barrier_parameter(
+                barrier_parameter_value,
+                watchdog_state.tiny_step_last_iteration,
+                monotone_mu_update_initialized,
+                options,
+                |candidate_barrier_parameter| {
+                    let current_target_complementarity_inf =
+                        combined_complementarity_target_inf_norm(
+                            &slack_barrier,
+                            &z,
+                            &x,
+                            &bounds,
+                            &z_lower,
+                            &z_upper,
+                            candidate_barrier_parameter,
+                        );
+                    scaled_overall_inf_norm(
+                        primal_inf,
+                        dual_inf,
+                        current_target_complementarity_inf,
+                        &all_dual_multipliers,
+                        &complementarity_multipliers,
+                        options.overall_scale_max,
+                    )
+                },
+            );
+            monotone_mu_update_initialized = true;
+            if next_barrier_parameter_value != previous_barrier_parameter {
+                // IPOPT calls MonotoneMuUpdate::UpdateBarrierParameter before
+                // ComputeSearchDirection.  When mu changes, it calls
+                // BacktrackingLineSearch::Reset, clearing the filter acceptor;
+                // the subsequent FindAcceptableTrialPoint mu check clears the
+                // watchdog counters before trial search starts.
+                barrier_parameter_value = next_barrier_parameter_value;
+                filter_entries.clear();
+                successive_filter_rejections = 0;
+                watchdog_state = InteriorPointWatchdogState::default();
+                push_unique_nlip_event(
+                    &mut iteration_events,
+                    InteriorPointIterationEvent::BarrierParameterUpdated,
+                );
+                current_barrier_objective = barrier_objective_value(
+                    state.objective_value,
+                    &slack_barrier,
+                    &x,
+                    &bounds,
+                    barrier_parameter_value,
+                    options.kappa_d,
+                );
+                current_filter_entry =
+                    super::filter::entry(current_barrier_objective, current_theta);
+                current_snapshot.barrier_objective = Some(current_barrier_objective);
+                current_snapshot.barrier_parameter = Some(barrier_parameter_value);
+                current_snapshot.kkt_slack_stationarity =
+                    Some(damped_slack_stationarity_residuals(
+                        &lambda_ineq,
+                        &z,
+                        barrier_parameter_value,
+                        options.kappa_d,
+                    ));
+                current_snapshot.kkt_slack_complementarity = Some(slack_complementarity_residuals(
+                    &slack_barrier,
+                    &z,
+                    barrier_parameter_value,
+                ));
+                current_snapshot.filter = Some(FilterInfo {
+                    current: current_filter_entry.clone(),
+                    entries: filter_entries.clone(),
+                    accepted_mode: None,
+                });
+                current_snapshot.events = iteration_events.clone();
+            }
+        }
+
         let hessian_started = Instant::now();
         let mut hessian_values = vec![0.0; problem.lagrangian_hessian_ccs().nnz()];
         time_callback(
@@ -8719,6 +10496,13 @@ where
             inequality_jacobian: &linear_inequality_jacobian,
             bound_diagonal: &bound_diagonal,
             bound_rhs: &bound_rhs,
+            bound_data: Some(ReducedBoundKktData {
+                x: &x,
+                bounds: &bounds,
+                fixed_variables: &fixed_variables,
+                z_lower: &z_lower,
+                z_upper: &z_upper,
+            }),
             slack: &slack_barrier,
             multipliers: &z,
             r_dual: &dual_residual,
@@ -8816,6 +10600,7 @@ where
             native_spral_workspace.as_mut(),
             &mut profiling,
             options.verbose,
+            false,
         );
         let mut direction = match solve_result {
             Ok(mut direction) => {
@@ -8841,7 +10626,12 @@ where
                 {
                     let report =
                         run_linear_debug_report_on_success(&snapshot, &direction, debug_state);
-                    dump_linear_debug_snapshot(&debug_state.options, &snapshot, &report);
+                    dump_linear_debug_snapshot(
+                        &debug_state.options,
+                        &snapshot,
+                        &report,
+                        Some(&direction),
+                    );
                     current_snapshot.linear_debug = Some(report.clone());
                     direction.linear_debug = Some(report);
                 }
@@ -8885,7 +10675,7 @@ where
                             &diagnostics.attempts,
                             debug_state,
                         );
-                        dump_linear_debug_snapshot(&debug_state.options, &snapshot, &report);
+                        dump_linear_debug_snapshot(&debug_state.options, &snapshot, &report, None);
                         current_snapshot.linear_debug = Some(report.clone());
                         error = with_linear_debug_report(error, report);
                     }
@@ -8903,17 +10693,19 @@ where
             }
         };
         direction.dx = fixed_variables.expand_direction(&direction.dx);
-        let (dz_lower_direction, dz_upper_direction) = native_bound_multiplier_steps(
-            &x,
-            &direction.dx,
-            &bounds,
-            &z_lower,
-            &z_upper,
-            barrier_parameter_value,
-            sigma,
-        );
-        direction.dz_lower = dz_lower_direction;
-        direction.dz_upper = dz_upper_direction;
+        if direction.dz_lower.is_empty() && direction.dz_upper.is_empty() {
+            let (dz_lower_direction, dz_upper_direction) = native_bound_multiplier_steps(
+                &x,
+                &direction.dx,
+                &bounds,
+                &z_lower,
+                &z_upper,
+                barrier_parameter_value,
+                sigma,
+            );
+            direction.dz_lower = dz_lower_direction;
+            direction.dz_upper = dz_upper_direction;
+        }
         last_linear_solver = direction.solver_used;
         let linear_elapsed = linear_started.elapsed();
         profiling.linear_solves += 1;
@@ -8934,10 +10726,11 @@ where
 
         let fraction_to_boundary_tau =
             current_fraction_to_boundary_tau(barrier_parameter_value, options);
+        let slack_barrier_direction = slack_barrier_direction_values(&direction.ds);
         let (slack_alpha_pr, slack_alpha_pr_limiter) = if augmented_inequality_count > 0 {
             fraction_to_boundary_with_limiter(
                 &slack_barrier,
-                &direction.ds,
+                &slack_barrier_direction,
                 fraction_to_boundary_tau,
                 InteriorPointBoundaryLimiterKind::Slack,
             )
@@ -8950,24 +10743,29 @@ where
             &bounds,
             fraction_to_boundary_tau,
         );
-        let (alpha_pr, alpha_pr_limiter) = if bound_alpha_pr < slack_alpha_pr {
-            (bound_alpha_pr, bound_alpha_pr_limiter)
-        } else {
-            (slack_alpha_pr, slack_alpha_pr_limiter)
-        };
+        let (alpha_pr, alpha_pr_limiter) = ipopt_min_boundary_candidate(
+            (bound_alpha_pr, bound_alpha_pr_limiter),
+            (slack_alpha_pr, slack_alpha_pr_limiter),
+        );
+        // IpoptCalculatedQuantities::dual_frac_to_the_bound checks bound
+        // multipliers before slack multipliers: z_L, z_U, v_L, then v_U.
+        // NLIP has no lower slack multiplier block, so keep z_L, z_U, v_U.
         let combined_z =
-            combined_multiplier_vector([z.as_slice(), z_lower.as_slice(), z_upper.as_slice()]);
+            combined_multiplier_vector([z_lower.as_slice(), z_upper.as_slice(), z.as_slice()]);
         let combined_dz = combined_multiplier_vector([
-            direction.dz.as_slice(),
             direction.dz_lower.as_slice(),
             direction.dz_upper.as_slice(),
+            direction.dz.as_slice(),
         ]);
         let (alpha_du, alpha_du_limiter) = if barrier_pair_count > 0 {
-            fraction_to_boundary_with_limiter(
-                &combined_z,
-                &combined_dz,
+            ipopt_dual_fraction_to_boundary_with_limiter(
+                &z_lower,
+                &direction.dz_lower,
+                &z_upper,
+                &direction.dz_upper,
+                &z,
+                &direction.dz,
                 fraction_to_boundary_tau,
-                InteriorPointBoundaryLimiterKind::Multiplier,
             )
         } else {
             (1.0, None)
@@ -9089,7 +10887,10 @@ where
             && is_tiny_ip_step(&x, &slack_barrier, &direction, primal_inf, options);
         let tiny_step_barrier_update =
             tiny_step_unchecked_accept && watchdog_state.tiny_step_last_iteration;
-        while alpha >= alpha_min {
+        // IPOPT `BacktrackingLineSearch::DoBacktrackingLineSearch` uses
+        // `alpha_primal > alpha_min || n_steps == 0`, so the initial trial is
+        // evaluated even when the maximum feasible step is already tiny.
+        while alpha > alpha_min || line_search_iterations == 0 {
             let trial_alpha_pr = alpha;
             let trial_alpha_du = dual_alpha_limit;
             let trial_alpha_y = alpha_for_y(trial_alpha_pr, trial_alpha_du, &direction, options);
@@ -9098,38 +10899,38 @@ where
             let trial_x = x
                 .iter()
                 .zip(direction.dx.iter())
-                .map(|(value, delta)| value + trial_alpha_pr * delta)
+                .map(|(value, delta)| ipopt_dense_current_plus_step(*value, trial_alpha_pr, *delta))
                 .collect::<Vec<_>>();
             let trial_lambda = lambda_eq
                 .iter()
                 .zip(direction.d_lambda.iter())
-                .map(|(value, delta)| value + trial_alpha_y * delta)
+                .map(|(value, delta)| ipopt_dense_current_plus_step(*value, trial_alpha_y, *delta))
                 .collect::<Vec<_>>();
             let trial_lambda_ineq = lambda_ineq
                 .iter()
                 .zip(direction.d_ineq.iter())
-                .map(|(value, delta)| value + trial_alpha_y * delta)
+                .map(|(value, delta)| ipopt_dense_current_plus_step(*value, trial_alpha_y, *delta))
                 .collect::<Vec<_>>();
             let trial_slack = slack
                 .iter()
                 .zip(direction.ds.iter())
-                .map(|(value, delta)| value + trial_alpha_pr * delta)
+                .map(|(value, delta)| ipopt_dense_current_plus_step(*value, trial_alpha_pr, *delta))
                 .collect::<Vec<_>>();
-            let trial_slack_barrier = slack_barrier_values(&trial_slack);
+            let trial_slack_barrier = slack_barrier_values(&trial_slack, &slack_upper_bounds);
             let trial_z = z
                 .iter()
                 .zip(direction.dz.iter())
-                .map(|(value, delta)| value + trial_alpha_du * delta)
+                .map(|(value, delta)| ipopt_dense_current_plus_step(*value, trial_alpha_du, *delta))
                 .collect::<Vec<_>>();
             let trial_z_lower = z_lower
                 .iter()
                 .zip(direction.dz_lower.iter())
-                .map(|(value, delta)| value + trial_alpha_du * delta)
+                .map(|(value, delta)| ipopt_dense_current_plus_step(*value, trial_alpha_du, *delta))
                 .collect::<Vec<_>>();
             let trial_z_upper = z_upper
                 .iter()
                 .zip(direction.dz_upper.iter())
-                .map(|(value, delta)| value + trial_alpha_du * delta)
+                .map(|(value, delta)| ipopt_dense_current_plus_step(*value, trial_alpha_du, *delta))
                 .collect::<Vec<_>>();
             let trial_bounds_positive = bounds
                 .lower_indices
@@ -9185,7 +10986,10 @@ where
                 &mut trial_callback_time,
             );
             let trial_eq_inf = inf_norm(&trial_state.equality_values);
-            let trial_ineq_inf = positive_part_inf_norm(&trial_state.augmented_inequality_values);
+            let trial_ineq_inf = inequality_upper_bound_inf_norm(
+                &trial_state.augmented_inequality_values,
+                &slack_upper_bounds,
+            );
             let trial_internal_ineq_inf = slack_form_inequality_inf_norm(
                 &trial_state.augmented_inequality_values,
                 &trial_slack,
@@ -9232,18 +11036,15 @@ where
                 trial_comp_inf,
                 barrier_parameter_value,
             );
-            let trial_all_dual_multipliers = combined_multiplier_vector([
-                trial_lambda.as_slice(),
-                trial_lambda_ineq.as_slice(),
-                trial_z.as_slice(),
-                trial_z_lower.as_slice(),
-                trial_z_upper.as_slice(),
-            ]);
-            let trial_complementarity_multipliers = combined_multiplier_vector([
-                trial_z.as_slice(),
-                trial_z_lower.as_slice(),
-                trial_z_upper.as_slice(),
-            ]);
+            let trial_all_dual_multipliers = ipopt_all_dual_multiplier_vector(
+                &trial_lambda,
+                &trial_lambda_ineq,
+                &trial_z_lower,
+                &trial_z_upper,
+                &trial_z,
+            );
+            let trial_complementarity_multipliers =
+                ipopt_complementarity_multiplier_vector(&trial_z_lower, &trial_z_upper, &trial_z);
             let trial_overall_inf = scaled_overall_inf_norm(
                 trial_primal_inf,
                 trial_dual_inf,
@@ -9294,18 +11095,19 @@ where
                         &corrected.z_lower,
                         &corrected.z_upper,
                     );
-                    let corrected_complementarity_multipliers = combined_multiplier_vector([
-                        corrected.z.as_slice(),
-                        corrected.z_lower.as_slice(),
-                        corrected.z_upper.as_slice(),
-                    ]);
-                    let corrected_all_dual_multipliers = combined_multiplier_vector([
-                        trial_lambda.as_slice(),
-                        trial_lambda_ineq.as_slice(),
-                        corrected.z.as_slice(),
-                        corrected.z_lower.as_slice(),
-                        corrected.z_upper.as_slice(),
-                    ]);
+                    let corrected_complementarity_multipliers =
+                        ipopt_complementarity_multiplier_vector(
+                            &corrected.z_lower,
+                            &corrected.z_upper,
+                            &corrected.z,
+                        );
+                    let corrected_all_dual_multipliers = ipopt_all_dual_multiplier_vector(
+                        &trial_lambda,
+                        &trial_lambda_ineq,
+                        &corrected.z_lower,
+                        &corrected.z_upper,
+                        &corrected.z,
+                    );
                     let corrected_overall_inf = scaled_overall_inf_norm(
                         trial_primal_inf,
                         corrected.dual_inf,
@@ -9364,7 +11166,6 @@ where
                     barrier_objective: trial_barrier_objective,
                     equality_inf: trial_eq_inf,
                     inequality_inf: trial_ineq_inf,
-                    primal_inf: trial_primal_inf,
                     dual_inf: accepted_dual_inf,
                     complementarity_inf: accepted_comp_inf,
                     overall_inf: accepted_overall_inf,
@@ -9375,6 +11176,7 @@ where
                     filter_acceptance_mode: None,
                     step_kind: InteriorPointStepKind::Tiny,
                     step_tag: if tiny_step_barrier_update { 'T' } else { 't' },
+                    step_direction: Some(step_direction_snapshot(&direction)),
                     phase: InteriorPointIterationPhase::AcceptedStep,
                     accepted_alpha_pr: trial_alpha_pr,
                     accepted_alpha_du: Some(trial_alpha_du),
@@ -9386,7 +11188,6 @@ where
                     second_order_correction_used: false,
                     watchdog_accepted: false,
                     tiny_step: true,
-                    tiny_step_barrier_update,
                     bound_multiplier_corrected,
                 });
                 break;
@@ -9447,18 +11248,19 @@ where
                         &corrected.z_lower,
                         &corrected.z_upper,
                     );
-                    let corrected_complementarity_multipliers = combined_multiplier_vector([
-                        corrected.z.as_slice(),
-                        corrected.z_lower.as_slice(),
-                        corrected.z_upper.as_slice(),
-                    ]);
-                    let corrected_all_dual_multipliers = combined_multiplier_vector([
-                        trial_lambda.as_slice(),
-                        trial_lambda_ineq.as_slice(),
-                        corrected.z.as_slice(),
-                        corrected.z_lower.as_slice(),
-                        corrected.z_upper.as_slice(),
-                    ]);
+                    let corrected_complementarity_multipliers =
+                        ipopt_complementarity_multiplier_vector(
+                            &corrected.z_lower,
+                            &corrected.z_upper,
+                            &corrected.z,
+                        );
+                    let corrected_all_dual_multipliers = ipopt_all_dual_multiplier_vector(
+                        &trial_lambda,
+                        &trial_lambda_ineq,
+                        &corrected.z_lower,
+                        &corrected.z_upper,
+                        &corrected.z,
+                    );
                     let corrected_overall_inf = scaled_overall_inf_norm(
                         trial_primal_inf,
                         corrected.dual_inf,
@@ -9517,7 +11319,6 @@ where
                     barrier_objective: trial_barrier_objective,
                     equality_inf: trial_eq_inf,
                     inequality_inf: trial_ineq_inf,
-                    primal_inf: trial_primal_inf,
                     dual_inf: accepted_dual_inf,
                     complementarity_inf: accepted_comp_inf,
                     overall_inf: accepted_overall_inf,
@@ -9537,6 +11338,7 @@ where
                     filter_acceptance_mode,
                     step_kind,
                     step_tag,
+                    step_direction: Some(step_direction_snapshot(&direction)),
                     phase: InteriorPointIterationPhase::AcceptedStep,
                     accepted_alpha_pr: trial_alpha_pr,
                     accepted_alpha_du: Some(trial_alpha_du),
@@ -9548,7 +11350,6 @@ where
                     second_order_correction_used: false,
                     watchdog_accepted: false,
                     tiny_step: false,
-                    tiny_step_barrier_update: false,
                     bound_multiplier_corrected,
                 });
                 break;
@@ -9599,12 +11400,18 @@ where
                             direction.dual_regularization_used,
                         );
                     let soc_linear_started = Instant::now();
+                    // IpFilterLSAcceptor::TrySecondOrderCorrection passes
+                    // allow_inexact=true to PDSystemSolver::Solve; then
+                    // IpPDFullSpaceSolver::Solve accepts SolveOnce without
+                    // full-space iterative refinement or residual safety
+                    // checks.
                     let mut soc_direction = match solve_reduced_kkt(
                         &soc_reduced_kkt_system,
                         spral_workspace.as_mut(),
                         native_spral_workspace.as_mut(),
                         &mut profiling,
                         options.verbose,
+                        true,
                     ) {
                         Ok(direction) => direction,
                         Err(_) => break,
@@ -9626,22 +11433,26 @@ where
                         );
                     }
                     soc_direction.dx = fixed_variables.expand_direction(&soc_direction.dx);
-                    let (soc_dz_lower, soc_dz_upper) = native_bound_multiplier_steps(
-                        &x,
-                        &soc_direction.dx,
-                        &bounds,
-                        &z_lower,
-                        &z_upper,
-                        barrier_parameter_value,
-                        sigma,
-                    );
-                    soc_direction.dz_lower = soc_dz_lower;
-                    soc_direction.dz_upper = soc_dz_upper;
+                    if soc_direction.dz_lower.is_empty() && soc_direction.dz_upper.is_empty() {
+                        let (soc_dz_lower, soc_dz_upper) = native_bound_multiplier_steps(
+                            &x,
+                            &soc_direction.dx,
+                            &bounds,
+                            &z_lower,
+                            &z_upper,
+                            barrier_parameter_value,
+                            sigma,
+                        );
+                        soc_direction.dz_lower = soc_dz_lower;
+                        soc_direction.dz_upper = soc_dz_upper;
+                    }
 
                     let (soc_slack_alpha_pr, _) = if augmented_inequality_count > 0 {
+                        let soc_slack_barrier_direction =
+                            slack_barrier_direction_values(&soc_direction.ds);
                         fraction_to_boundary_with_limiter(
                             &slack_barrier,
-                            &soc_direction.ds,
+                            &soc_slack_barrier_direction,
                             fraction_to_boundary_tau,
                             InteriorPointBoundaryLimiterKind::Slack,
                         )
@@ -9654,7 +11465,12 @@ where
                         &bounds,
                         fraction_to_boundary_tau,
                     );
-                    soc_alpha_pr = soc_slack_alpha_pr.min(soc_bound_alpha_pr).clamp(0.0, 1.0);
+                    soc_alpha_pr = ipopt_min_boundary_candidate(
+                        (soc_bound_alpha_pr, None),
+                        (soc_slack_alpha_pr, None),
+                    )
+                    .0
+                    .clamp(0.0, 1.0);
                     if soc_alpha_pr <= 0.0 {
                         break;
                     }
@@ -9662,14 +11478,19 @@ where
                     let corrected_x = x
                         .iter()
                         .zip(soc_direction.dx.iter())
-                        .map(|(value, delta)| value + soc_alpha_pr * delta)
+                        .map(|(value, delta)| {
+                            ipopt_dense_current_plus_step(*value, soc_alpha_pr, *delta)
+                        })
                         .collect::<Vec<_>>();
                     let corrected_slack = slack
                         .iter()
                         .zip(soc_direction.ds.iter())
-                        .map(|(value, delta)| value + soc_alpha_pr * delta)
+                        .map(|(value, delta)| {
+                            ipopt_dense_current_plus_step(*value, soc_alpha_pr, *delta)
+                        })
                         .collect::<Vec<_>>();
-                    let corrected_slack_barrier = slack_barrier_values(&corrected_slack);
+                    let corrected_slack_barrier =
+                        slack_barrier_values(&corrected_slack, &slack_upper_bounds);
                     let corrected_bounds_positive = bounds
                         .lower_indices
                         .iter()
@@ -9696,8 +11517,10 @@ where
                         &mut corrected_callback_time,
                     );
                     let corrected_eq_inf = inf_norm(&corrected_state.equality_values);
-                    let corrected_ineq_inf =
-                        positive_part_inf_norm(&corrected_state.augmented_inequality_values);
+                    let corrected_ineq_inf = inequality_upper_bound_inf_norm(
+                        &corrected_state.augmented_inequality_values,
+                        &slack_upper_bounds,
+                    );
                     let corrected_primal_inf =
                         corrected_eq_inf.max(slack_form_inequality_inf_norm(
                             &corrected_state.augmented_inequality_values,
@@ -9749,22 +11572,15 @@ where
 
                     if let Some(corrected_filter_acceptance_mode) = corrected_filter_acceptance_mode
                     {
-                        let soc_combined_z = combined_multiplier_vector([
-                            z.as_slice(),
-                            z_lower.as_slice(),
-                            z_upper.as_slice(),
-                        ]);
-                        let soc_combined_dz = combined_multiplier_vector([
-                            soc_direction.dz.as_slice(),
-                            soc_direction.dz_lower.as_slice(),
-                            soc_direction.dz_upper.as_slice(),
-                        ]);
                         let soc_alpha_du = if barrier_pair_count > 0 {
-                            fraction_to_boundary_with_limiter(
-                                &soc_combined_z,
-                                &soc_combined_dz,
+                            ipopt_dual_fraction_to_boundary_with_limiter(
+                                &z_lower,
+                                &soc_direction.dz_lower,
+                                &z_upper,
+                                &soc_direction.dz_upper,
+                                &z,
+                                &soc_direction.dz,
                                 fraction_to_boundary_tau,
-                                InteriorPointBoundaryLimiterKind::Multiplier,
                             )
                             .0
                             .clamp(0.0, 1.0)
@@ -9776,27 +11592,37 @@ where
                         let corrected_lambda = lambda_eq
                             .iter()
                             .zip(soc_direction.d_lambda.iter())
-                            .map(|(value, delta)| value + soc_alpha_y * delta)
+                            .map(|(value, delta)| {
+                                ipopt_dense_current_plus_step(*value, soc_alpha_y, *delta)
+                            })
                             .collect::<Vec<_>>();
                         let corrected_lambda_ineq = lambda_ineq
                             .iter()
                             .zip(soc_direction.d_ineq.iter())
-                            .map(|(value, delta)| value + soc_alpha_y * delta)
+                            .map(|(value, delta)| {
+                                ipopt_dense_current_plus_step(*value, soc_alpha_y, *delta)
+                            })
                             .collect::<Vec<_>>();
                         let corrected_z = z
                             .iter()
                             .zip(soc_direction.dz.iter())
-                            .map(|(value, delta)| value + soc_alpha_du * delta)
+                            .map(|(value, delta)| {
+                                ipopt_dense_current_plus_step(*value, soc_alpha_du, *delta)
+                            })
                             .collect::<Vec<_>>();
                         let corrected_z_lower = z_lower
                             .iter()
                             .zip(soc_direction.dz_lower.iter())
-                            .map(|(value, delta)| value + soc_alpha_du * delta)
+                            .map(|(value, delta)| {
+                                ipopt_dense_current_plus_step(*value, soc_alpha_du, *delta)
+                            })
                             .collect::<Vec<_>>();
                         let corrected_z_upper = z_upper
                             .iter()
                             .zip(soc_direction.dz_upper.iter())
-                            .map(|(value, delta)| value + soc_alpha_du * delta)
+                            .map(|(value, delta)| {
+                                ipopt_dense_current_plus_step(*value, soc_alpha_du, *delta)
+                            })
                             .collect::<Vec<_>>();
                         let corrected_raw_dual_residual = lagrangian_gradient_sparse(
                             &corrected_state.gradient,
@@ -9842,18 +11668,19 @@ where
                         } else {
                             'F'
                         };
-                        let corrected_all_dual_multipliers = combined_multiplier_vector([
-                            corrected_lambda.as_slice(),
-                            corrected_lambda_ineq.as_slice(),
-                            corrected_z.as_slice(),
-                            corrected_z_lower.as_slice(),
-                            corrected_z_upper.as_slice(),
-                        ]);
-                        let corrected_complementarity_multipliers = combined_multiplier_vector([
-                            corrected_z.as_slice(),
-                            corrected_z_lower.as_slice(),
-                            corrected_z_upper.as_slice(),
-                        ]);
+                        let corrected_all_dual_multipliers = ipopt_all_dual_multiplier_vector(
+                            &corrected_lambda,
+                            &corrected_lambda_ineq,
+                            &corrected_z_lower,
+                            &corrected_z_upper,
+                            &corrected_z,
+                        );
+                        let corrected_complementarity_multipliers =
+                            ipopt_complementarity_multiplier_vector(
+                                &corrected_z_lower,
+                                &corrected_z_upper,
+                                &corrected_z,
+                            );
                         let corrected_overall_inf = scaled_overall_inf_norm(
                             corrected_primal_inf,
                             corrected_dual_inf,
@@ -9895,18 +11722,18 @@ where
                                 &corrected.z_upper,
                             );
                             let corrected_complementarity_multipliers =
-                                combined_multiplier_vector([
-                                    corrected.z.as_slice(),
-                                    corrected.z_lower.as_slice(),
-                                    corrected.z_upper.as_slice(),
-                                ]);
-                            let corrected_all_dual_multipliers = combined_multiplier_vector([
-                                corrected_lambda.as_slice(),
-                                corrected_lambda_ineq.as_slice(),
-                                corrected.z.as_slice(),
-                                corrected.z_lower.as_slice(),
-                                corrected.z_upper.as_slice(),
-                            ]);
+                                ipopt_complementarity_multiplier_vector(
+                                    &corrected.z_lower,
+                                    &corrected.z_upper,
+                                    &corrected.z,
+                                );
+                            let corrected_all_dual_multipliers = ipopt_all_dual_multiplier_vector(
+                                &corrected_lambda,
+                                &corrected_lambda_ineq,
+                                &corrected.z_lower,
+                                &corrected.z_upper,
+                                &corrected.z,
+                            );
                             let corrected_overall_inf = scaled_overall_inf_norm(
                                 corrected_primal_inf,
                                 corrected.dual_inf,
@@ -9968,7 +11795,6 @@ where
                             barrier_objective: corrected_barrier_objective,
                             equality_inf: corrected_eq_inf,
                             inequality_inf: corrected_ineq_inf,
-                            primal_inf: corrected_primal_inf,
                             dual_inf: accepted_dual_inf,
                             complementarity_inf: accepted_comp_inf,
                             overall_inf: accepted_overall_inf,
@@ -9987,6 +11813,7 @@ where
                             filter_acceptance_mode: Some(corrected_filter_acceptance_mode),
                             step_kind,
                             step_tag,
+                            step_direction: Some(step_direction_snapshot(&soc_direction)),
                             phase: InteriorPointIterationPhase::AcceptedStep,
                             accepted_alpha_pr: soc_alpha_pr,
                             accepted_alpha_du: Some(soc_alpha_du),
@@ -9998,7 +11825,6 @@ where
                             second_order_correction_used: true,
                             watchdog_accepted: false,
                             tiny_step: false,
-                            tiny_step_barrier_update: false,
                             bound_multiplier_corrected,
                         });
                         break;
@@ -10115,18 +11941,19 @@ where
                         &corrected.z_lower,
                         &corrected.z_upper,
                     );
-                    let corrected_complementarity_multipliers = combined_multiplier_vector([
-                        corrected.z.as_slice(),
-                        corrected.z_lower.as_slice(),
-                        corrected.z_upper.as_slice(),
-                    ]);
-                    let corrected_all_dual_multipliers = combined_multiplier_vector([
-                        trial_lambda.as_slice(),
-                        trial_lambda_ineq.as_slice(),
-                        corrected.z.as_slice(),
-                        corrected.z_lower.as_slice(),
-                        corrected.z_upper.as_slice(),
-                    ]);
+                    let corrected_complementarity_multipliers =
+                        ipopt_complementarity_multiplier_vector(
+                            &corrected.z_lower,
+                            &corrected.z_upper,
+                            &corrected.z,
+                        );
+                    let corrected_all_dual_multipliers = ipopt_all_dual_multiplier_vector(
+                        &trial_lambda,
+                        &trial_lambda_ineq,
+                        &corrected.z_lower,
+                        &corrected.z_upper,
+                        &corrected.z,
+                    );
                     let corrected_overall_inf = scaled_overall_inf_norm(
                         trial_primal_inf,
                         corrected.dual_inf,
@@ -10185,7 +12012,6 @@ where
                     barrier_objective: trial_barrier_objective,
                     equality_inf: trial_eq_inf,
                     inequality_inf: trial_ineq_inf,
-                    primal_inf: trial_primal_inf,
                     dual_inf: accepted_dual_inf,
                     complementarity_inf: accepted_comp_inf,
                     overall_inf: accepted_overall_inf,
@@ -10205,6 +12031,7 @@ where
                     filter_acceptance_mode: None,
                     step_kind,
                     step_tag,
+                    step_direction: Some(step_direction_snapshot(&direction)),
                     phase: InteriorPointIterationPhase::AcceptedStep,
                     accepted_alpha_pr: trial_alpha_pr,
                     accepted_alpha_du: Some(trial_alpha_du),
@@ -10216,7 +12043,6 @@ where
                     second_order_correction_used: false,
                     watchdog_accepted: true,
                     tiny_step: false,
-                    tiny_step_barrier_update: false,
                     bound_multiplier_corrected,
                 });
                 break;
@@ -10297,6 +12123,7 @@ where
                 let (restored_lambda, restored_lambda_ineq) = least_squares_constraint_multipliers(
                     &restored_linear_state,
                     &[],
+                    hessian_structure.as_ref(),
                     options.regularization,
                     options.linear_solver,
                 );
@@ -10327,18 +12154,15 @@ where
                 } else {
                     0.0
                 };
-                let restored_all_dual_multipliers = combined_multiplier_vector([
-                    restored_lambda.as_slice(),
-                    restored_lambda_ineq.as_slice(),
-                    z.as_slice(),
-                    z_lower.as_slice(),
-                    z_upper.as_slice(),
-                ]);
-                let restored_complementarity_multipliers = combined_multiplier_vector([
-                    z.as_slice(),
-                    z_lower.as_slice(),
-                    z_upper.as_slice(),
-                ]);
+                let restored_all_dual_multipliers = ipopt_all_dual_multiplier_vector(
+                    &restored_lambda,
+                    &restored_lambda_ineq,
+                    &z_lower,
+                    &z_upper,
+                    &z,
+                );
+                let restored_complementarity_multipliers =
+                    ipopt_complementarity_multiplier_vector(&z_lower, &z_upper, &z);
                 let restored_overall_inf = scaled_overall_inf_norm(
                     restored_primal_inf,
                     restored_dual_inf,
@@ -10395,7 +12219,6 @@ where
                         barrier_objective: restored_barrier_objective,
                         equality_inf: restored_eq_inf,
                         inequality_inf: restored_ineq_inf,
-                        primal_inf: restored_primal_inf,
                         dual_inf: restored_dual_inf,
                         complementarity_inf: restored_complementarity_inf,
                         overall_inf: restored_overall_inf,
@@ -10411,6 +12234,7 @@ where
                         filter_acceptance_mode: None,
                         step_kind: InteriorPointStepKind::Feasibility,
                         step_tag: 'r',
+                        step_direction: None,
                         phase: InteriorPointIterationPhase::AcceptedStep,
                         accepted_alpha_pr: last_tried_alpha_pr,
                         accepted_alpha_du: Some(0.0),
@@ -10422,7 +12246,6 @@ where
                         second_order_correction_used: false,
                         watchdog_accepted: false,
                         tiny_step: false,
-                        tiny_step_barrier_update: false,
                         bound_multiplier_corrected: false,
                     });
                 }
@@ -10582,60 +12405,6 @@ where
         if let Some(entry) = accepted_trial.filter_augment_entry.clone() {
             super::filter::update_frontier(&mut next_filter_entries, entry);
         }
-        let previous_barrier_parameter = barrier_parameter_value;
-        let mut next_barrier_parameter_value = barrier_parameter_value;
-        if barrier_pair_count > 0 {
-            let accepted_slack_barrier = slack_barrier_values(&accepted_trial.slack);
-            let accepted_all_dual_multipliers = combined_multiplier_vector([
-                accepted_trial.lambda.as_slice(),
-                accepted_trial.inequality_multipliers.as_slice(),
-                accepted_trial.z.as_slice(),
-                accepted_trial.z_lower.as_slice(),
-                accepted_trial.z_upper.as_slice(),
-            ]);
-            let accepted_complementarity_multipliers = combined_multiplier_vector([
-                accepted_trial.z.as_slice(),
-                accepted_trial.z_lower.as_slice(),
-                accepted_trial.z_upper.as_slice(),
-            ]);
-            next_barrier_parameter_value = next_barrier_parameter(
-                barrier_parameter_value,
-                accepted_trial.tiny_step_barrier_update,
-                options,
-                |candidate_barrier_parameter| {
-                    let accepted_target_complementarity_inf =
-                        combined_complementarity_target_inf_norm(
-                            &accepted_slack_barrier,
-                            &accepted_trial.z,
-                            &accepted_trial.x,
-                            &bounds,
-                            &accepted_trial.z_lower,
-                            &accepted_trial.z_upper,
-                            candidate_barrier_parameter,
-                        );
-                    scaled_overall_inf_norm(
-                        accepted_trial.primal_inf,
-                        accepted_trial.dual_inf,
-                        accepted_target_complementarity_inf,
-                        &accepted_all_dual_multipliers,
-                        &accepted_complementarity_multipliers,
-                        options.overall_scale_max,
-                    )
-                },
-            );
-        }
-        let barrier_parameter_updated = next_barrier_parameter_value
-            < previous_barrier_parameter - 1e-18 * previous_barrier_parameter.abs().max(1.0);
-        if barrier_parameter_updated {
-            next_filter_entries.clear();
-        }
-
-        if barrier_parameter_updated {
-            push_unique_nlip_event(
-                &mut events,
-                InteriorPointIterationEvent::BarrierParameterUpdated,
-            );
-        }
         let adapter_timing = adapter_timing_delta(problem, &mut last_adapter_timing);
         profiling.adapter_timing = last_adapter_timing;
         let iteration_total = iteration_started.elapsed();
@@ -10723,6 +12492,7 @@ where
             watchdog_active: accepted_trial.watchdog_accepted || watchdog_active,
             line_search: Some(line_search_info.clone()),
             direction_diagnostics: accepted_direction_diagnostics.clone(),
+            step_direction: accepted_trial.step_direction.clone(),
             linear_debug: direction.linear_debug.clone(),
             linear_solver: direction.solver_used,
             linear_solve_time: Some(iteration_linear_solve_time),
@@ -10760,14 +12530,7 @@ where
         z_lower = accepted_trial.z_lower;
         z_upper = accepted_trial.z_upper;
         filter_entries = next_filter_entries;
-        if barrier_pair_count > 0 {
-            barrier_parameter_value = next_barrier_parameter_value;
-        }
         nonlinear_inequality_multipliers = lambda_ineq.clone();
-        if barrier_parameter_updated {
-            watchdog_state = InteriorPointWatchdogState::default();
-            continue;
-        }
         if shortened_step {
             watchdog_state.shortened_step_streak += 1;
         } else {

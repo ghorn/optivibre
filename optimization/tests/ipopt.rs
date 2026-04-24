@@ -47,7 +47,7 @@ fn solve_ok<P: optimization::CompiledNlpProblem>(
     }
 }
 
-fn local_native_spral_ipopt_options() -> IpoptOptions {
+fn source_built_spral_ipopt_options() -> IpoptOptions {
     let mut options = IpoptOptions::default();
     apply_native_spral_parity_to_ipopt_options(&mut options);
     options
@@ -80,13 +80,13 @@ fn maybe_print_ipopt_trace(problem_name: &str, snapshots: &[IpoptIterationSnapsh
     }
 }
 
-fn local_native_spral_ipopt_available() -> bool {
-    match optimization::validate_native_spral_parity_preflight() {
+fn source_built_spral_ipopt_available() -> bool {
+    match optimization::validate_source_built_spral_parity_preflight() {
         Ok(_) => true,
         Err(errors) => {
             if optimization::native_spral_parity_fail_closed_requested() {
                 panic!(
-                    "native-SPRAL parity preflight is required:\n{}",
+                    "source-built SPRAL parity preflight is required:\n{}",
                     errors
                         .iter()
                         .map(|error| format!("  - {error}"))
@@ -95,7 +95,7 @@ fn local_native_spral_ipopt_available() -> bool {
                 );
             }
             eprintln!(
-                "skipping local native-SPRAL IPOPT profile test: {}",
+                "skipping source-built SPRAL IPOPT profile test: {}",
                 errors.join("; ")
             );
             false
@@ -183,10 +183,10 @@ fn ipopt_solves_casadi_rosenbrock_example(
 }
 
 #[rstest]
-fn ipopt_solves_casadi_rosenbrock_with_local_native_spral_profile(
+fn ipopt_solves_casadi_rosenbrock_with_source_built_spral_profile(
     #[values(CallbackBackend::Aot, CallbackBackend::Jit)] backend: CallbackBackend,
 ) {
-    if !local_native_spral_ipopt_available() {
+    if !source_built_spral_ipopt_available() {
         return;
     }
     let problem = build_problem_ok(casadi_rosenbrock_nlp_problem(backend), backend);
@@ -195,10 +195,10 @@ fn ipopt_solves_casadi_rosenbrock_with_local_native_spral_profile(
         &problem,
         &[2.5, 3.0, 0.75],
         &[],
-        &local_native_spral_ipopt_options(),
+        &source_built_spral_ipopt_options(),
         |snapshot| snapshots.push(snapshot.clone()),
     );
-    maybe_print_ipopt_trace("casadi_rosenbrock/native_spral_profile", &snapshots);
+    maybe_print_ipopt_trace("casadi_rosenbrock/source_built_spral_profile", &snapshots);
     assert!(solve_result.is_ok(), "Ipopt solve failed: {solve_result:?}");
     let summary = solve_result.expect("asserted success");
 
@@ -225,10 +225,10 @@ fn ipopt_solves_casadi_simple_nlp_example(
 }
 
 #[rstest]
-fn ipopt_solves_simple_nlp_with_local_native_spral_profile(
+fn ipopt_solves_simple_nlp_with_source_built_spral_profile(
     #[values(CallbackBackend::Aot, CallbackBackend::Jit)] backend: CallbackBackend,
 ) {
-    if !local_native_spral_ipopt_available() {
+    if !source_built_spral_ipopt_available() {
         return;
     }
     let problem = build_problem_ok(simple_nlp_problem(backend), backend);
@@ -236,22 +236,29 @@ fn ipopt_solves_simple_nlp_with_local_native_spral_profile(
         &problem,
         &[0.0, 0.0],
         &[],
-        local_native_spral_ipopt_options(),
+        source_built_spral_ipopt_options(),
     );
 
     assert_eq!(
         summary
             .provenance
             .as_ref()
-            .and_then(|value| value.pkg_config_version.as_deref()),
+            .and_then(|value| value.linked_solver_stack.as_deref()),
+        Some("source-built-spral")
+    );
+    assert_eq!(
+        summary
+            .provenance
+            .as_ref()
+            .and_then(|value| value.linked_ipopt_version.as_deref()),
         Some("3.14.20")
     );
     assert_eq!(
         summary
             .provenance
             .as_ref()
-            .and_then(|value| value.linear_solver_default.as_deref()),
-        Some("spral")
+            .and_then(|value| value.linked_static_solver_math),
+        Some(true)
     );
     assert_abs_diff_eq!(summary.x[0], 5.0, epsilon = 1e-7);
     assert_abs_diff_eq!(summary.x[1], 5.0, epsilon = 1e-7);

@@ -281,6 +281,17 @@ fn expand_ipopt_fixed_variable_snapshot(
         snapshot.upper_bound_multipliers =
             expand_compact_ipopt_vector(&snapshot.upper_bound_multipliers, &fixed_mask);
     }
+    if snapshot.direction_x.len() == reduced_dimension {
+        snapshot.direction_x = expand_compact_ipopt_vector(&snapshot.direction_x, &fixed_mask);
+    }
+    if snapshot.direction_lower_bound_multipliers.len() == reduced_dimension {
+        snapshot.direction_lower_bound_multipliers =
+            expand_compact_ipopt_vector(&snapshot.direction_lower_bound_multipliers, &fixed_mask);
+    }
+    if snapshot.direction_upper_bound_multipliers.len() == reduced_dimension {
+        snapshot.direction_upper_bound_multipliers =
+            expand_compact_ipopt_vector(&snapshot.direction_upper_bound_multipliers, &fixed_mask);
+    }
     if snapshot.kkt_x_stationarity.len() == reduced_dimension {
         snapshot.kkt_x_stationarity =
             expand_compact_ipopt_vector(&snapshot.kkt_x_stationarity, &fixed_mask);
@@ -2781,6 +2792,20 @@ impl AppliedNlpScaling {
             .upper_bound_multipliers
             .as_ref()
             .map(|multipliers| self.unscale_bound_multipliers(multipliers));
+        if let Some(direction) = snapshot.step_direction.as_mut() {
+            direction.x = self.unscale_x(&direction.x);
+            direction.slack = self.unscale_inequality_values(&direction.slack);
+            direction.equality_multipliers =
+                self.unscale_equality_multipliers(&direction.equality_multipliers);
+            direction.inequality_multipliers =
+                self.unscale_inequality_multipliers(&direction.inequality_multipliers);
+            direction.slack_multipliers =
+                self.unscale_inequality_multipliers(&direction.slack_multipliers);
+            direction.lower_bound_multipliers =
+                self.unscale_bound_multipliers(&direction.lower_bound_multipliers);
+            direction.upper_bound_multipliers =
+                self.unscale_bound_multipliers(&direction.upper_bound_multipliers);
+        }
         // KKT diagnostic vectors are intentionally left in internal solver units so NLIP and
         // IPOPT can be compared before user-unit scaling is applied to display quantities.
         snapshot.objective = self.unscale_objective(snapshot.objective);
@@ -2847,8 +2872,23 @@ impl AppliedNlpScaling {
             self.unscale_inequality_multipliers(&snapshot.slack_lower_bound_multipliers);
         snapshot.slack_upper_bound_multipliers =
             self.unscale_inequality_multipliers(&snapshot.slack_upper_bound_multipliers);
-        // KKT diagnostic vectors remain in IPOPT's internal solver units. Only the slack distance
-        // is state-like and is scaled back for direct comparison against NLIP's positive slack.
+        snapshot.direction_x = self.unscale_x(&snapshot.direction_x);
+        snapshot.direction_slack = self.unscale_inequality_values(&snapshot.direction_slack);
+        snapshot.direction_equality_multipliers =
+            self.unscale_equality_multipliers(&snapshot.direction_equality_multipliers);
+        snapshot.direction_inequality_multipliers =
+            self.unscale_inequality_multipliers(&snapshot.direction_inequality_multipliers);
+        snapshot.direction_lower_bound_multipliers =
+            self.unscale_bound_multipliers(&snapshot.direction_lower_bound_multipliers);
+        snapshot.direction_upper_bound_multipliers =
+            self.unscale_bound_multipliers(&snapshot.direction_upper_bound_multipliers);
+        snapshot.direction_slack_lower_bound_multipliers =
+            self.unscale_inequality_multipliers(&snapshot.direction_slack_lower_bound_multipliers);
+        snapshot.direction_slack_upper_bound_multipliers =
+            self.unscale_inequality_multipliers(&snapshot.direction_slack_upper_bound_multipliers);
+        // KKT diagnostic vectors remain in IPOPT's internal solver units. The slack distance is
+        // state-like and is scaled back for direct comparison against NLIP's internal slack via
+        // the upper-bound distance conversion.
         snapshot.kkt_slack_distance = self.unscale_inequality_values(&snapshot.kkt_slack_distance);
         snapshot.objective = self.unscale_objective(snapshot.objective);
         snapshot

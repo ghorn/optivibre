@@ -7,19 +7,26 @@ regression test.
 
 ## Preflight
 
-Normal distribution builds should use `spral-src` / `ipopt-src` and must not
-depend on Homebrew, `/usr/local`, or `/Users/greg/local/ipopt-spral`.
-Parity acceptance must force NLIP `InteriorPointLinearSolver::SpralSrc` and
-IPOPT `linear_solver=spral`; `Auto`, QDLDL, MUMPS, and MKL-backed IPOPT modes
-are runtime/compatibility choices only and must fail parity preflight.
+Normal nonlinear parity and distribution builds should use `spral-src` /
+`ipopt-src` and must not depend on Homebrew, `/usr/local`, or
+`/Users/greg/local/ipopt-spral`. Parity acceptance must force NLIP
+`InteriorPointLinearSolver::SpralSrc` and IPOPT `linear_solver=spral`; `Auto`,
+QDLDL, MUMPS, and MKL-backed IPOPT modes are runtime/compatibility choices only
+and must fail parity preflight.
 
-Run parity acceptance commands through:
+Source-built NLIP/IPOPT parity runs require `OMP_CANCELLATION=true`,
+`RAYON_NUM_THREADS=1`, and `OMP_NUM_THREADS=1`. NLIP must use
+`InteriorPointLinearSolver::SpralSrc`; IPOPT must use `linear_solver=spral`.
+The linked provenance should report `linked_solver_stack=source-built-spral`,
+IPOPT `3.14.20`, source-built SPRAL, and static solver/math libraries.
+
+Dynamic native SPRAL parity diagnostics can still run through:
 
 ```sh
 scripts/native_spral_parity_preflight.sh <command>
 ```
 
-The preflight sources `scripts/use_local_ipopt_spral_env.sh`, requires IPOPT
+That preflight sources `scripts/use_local_ipopt_spral_env.sh`, requires IPOPT
 3.14.20 from `/Users/greg/local/ipopt-spral`, pins `SPRAL_SSIDS_NATIVE_LIB` to
 the local `libspral.dylib`, sets `RAYON_NUM_THREADS=1` and `OMP_NUM_THREADS=1`
 by default, enables `AD_CODEGEN_REQUIRE_NATIVE_SPRAL_PARITY=1`, and records the
@@ -35,12 +42,18 @@ feature; source-built native SPRAL is `native-spral-src`.
 
 | Rust area | Upstream oracle | Accepted deviations |
 | --- | --- | --- |
-| `apply_native_spral_parity_to_nlip_options` / `apply_native_spral_parity_to_ipopt_options` | `IpSpralSolverInterface.cpp`, IPOPT option registration | None for parity runs: both lanes must use native SPRAL/SPRAL with matching order, matching scaling, block APP, `small=1e-20`, `u=1e-8`, `umax=1e-4`, GPU off. |
+| `apply_native_spral_parity_to_nlip_options` / `apply_native_spral_parity_to_ipopt_options` | `IpSpralSolverInterface.cpp::PivotMethodNameToNum`, IPOPT option registration; SPRAL `include/spral_ssids.h`, `src/ssids/datatypes.f90` | None for parity runs: both lanes must use native SPRAL/SPRAL with matching order, matching scaling, IPOPT option `spral_pivot_method=block`, `small=1e-20`, `u=1e-8`, `umax=1e-4`, GPU off. IPOPT 3.14.20 writes raw `control_.pivot_method=1` for `block`; SPRAL 2025.09.18 documents C/Fortran value `1` as aggressive APP, so NLIP's parity profile uses the same raw-control equivalent. |
+| `SpralSrc` single-RHS solve entrypoint | `IpSpralSolverInterface.cpp::MultiSolve`; SPRAL `interfaces/C/ssids.f90::spral_ssids_solve` | NLIP's source-built SPRAL path calls `spral_ssids_solve` with `nrhs=1` and `ldx=n`, matching IPOPT even for one RHS. The existing `solve1` wrapper remains available for native wrapper smoke tests and Rust/native SSIDS parity diagnostics, but not for NLIP/IPOPT `SpralSrc` acceptance. |
 | Full-space KKT assembly and slack signs | `IpPDFullSpaceSolver.cpp`, `IpPDSearchDirCalc.cpp`, `IpIpoptCalculatedQuantities.cpp` | Rust may expose user-facing slack step signs, but the internal linear system must match IPOPT before conversion. |
-| Linear residual and iterative refinement | `IpPDFullSpaceSolver.cpp` | None. Use IPOPT's full-system residual ratio, min/max refinement steps, improvement test, quality retry, and pretend-singular semantics. |
+| Inequality slack internal sign convention | `IpIpoptCalculatedQuantities.cpp::curr_slack_s_U`, `curr_grad_lag_s`, `curr_sigma_s`; `IpDefaultIterateInitializer.cpp::push_variables`; `IpOrigIpoptNLP.cpp::relax_bounds`; `IpPDFullSpaceSolver.cpp::SolveOnce` | NLIP stores inequality slacks in IPOPT's upper-bound internal sign (`d(x) - s = 0`, `s <= d_U`) and converts explicitly to upper-slack distance `d_U - s` for barrier/complementarity calculations. The normalized one-sided inequality rows now keep raw `d(x)` values while `d_U` carries the zero-bound relaxation amount. |
+| Linear residual and iterative refinement | `IpPDFullSpaceSolver.cpp::ComputeResiduals`, `SolveOnce`, `ComputeResidualRatio`; `IpSpralSolverInterface.cpp::IncreaseQuality` | The live `SpralSrc` path reconstructs IPOPT full-space residual rows, including upper-slack and variable-bound multiplier rows, before converting them back to the augmented correction RHS. Failed refinement asks native SPRAL to increase quality once, then uses IPOPT's `residual_ratio_singular` split between accepting the current solution and pretending singular. Snapshot replay uses the eliminated bound branch until snapshots carry variable-bound state. |
+| Barrier parameter update and reset state | `IpMonotoneMuUpdate.cpp::UpdateBarrierParameter`, `IpMonotoneMuUpdate.cpp::CalcNewMuAndTau`, `IpBacktrackingLineSearch.cpp::Reset`, `IpBacktrackingLineSearch.cpp::FindAcceptableTrialPoint`, `IpFilterLSAcceptor.cpp::Reset` | Monotone mu updates use IPOPT's `mu_target` plus `tol/compl_inf_tol` floor, not the adaptive `mu_min` option. The tiny-step force is consumed after one update-loop pass, and the first call keeps IPOPT's `initialized_ == false` fast-loop behavior. On monotone mu changes, NLIP clears filter entries and rejection state like IPOPT's line-search reset, then clears watchdog/tiny-step counters like IPOPT's `last_mu_ != curr_mu` line-search check. |
+| Initial point bound/slack push | `IpDefaultIterateInitializer.cpp::push_variables` | Scalar NLIP bound and slack initialization mirrors IPOPT's snap-to-bound pass, lower-side `tiny_double` subtraction, and upper-side `tiny_double` restoration before computing the first KKT system. |
+| OCP NLIP tolerance wiring | `IpMonotoneMuUpdate.cpp::CalcNewMuAndTau`, `IpIpoptData::tol` | OCP NLIP options set `overall_tol` from the same minimum component tolerance used as IPOPT `tol`, so the monotone barrier lower bound uses the same scalar tolerance. |
 | Hessian/Jacobian perturbation and inertia retries | `IpPDPerturbationHandler.cpp` | None for accepted state changes. Diagnostic experiments must not be committed as parity fixes. |
 | Augmented-system solve and inertia checks | `IpStdAugSystemSolver.cpp`, `IpSpralSolverInterface.cpp` | None in native-SPRAL parity acceptance. `Auto`, `SparseQdldl`, and fallback solves are diagnostic only. |
-| Line search, `alpha_for_y`, filter, watchdog, SOC, restoration | IPOPT `Algorithm/` source for the corresponding component | Change only after direction/KKT parity evidence says the divergence has moved above the linear solve. |
+| Accepted trial bound multiplier safeguard | `IpIpoptAlg.cpp::AcceptTrialPoint`, `IpIpoptAlg.cpp::correct_bound_multiplier` | `SpralSrc` parity mirrors IPOPT's correction-vector arithmetic for clamping trial bound multipliers into the `kappa_sigma` complementarity band. |
+| Line search, `alpha_for_y`, filter, watchdog, SOC, restoration | `IpFilterLSAcceptor.cpp::CalculateAlphaMin`, `IpBacktrackingLineSearch.cpp::DoBacktrackingLineSearch`, `IpIpoptCalculatedQuantities.cpp::CalcFracToBound`, `IpDenseVector.cpp::FracToBoundImpl`, IPOPT `Algorithm/` source for the corresponding component | `SpralSrc` parity mirrors IPOPT's filter alpha-min formula, first-trial backtracking guard, and dense fraction-to-boundary operation order. Remaining line-search behavior should change only when direction/KKT parity evidence says the divergence has moved above the linear solve. |
 
 ## Rust SPRAL vs Native SPRAL Lane
 

@@ -222,6 +222,22 @@ CNLP_Bool hs071_intermediate_callback(enum CNLP_AlgorithmMode alg_mod,
                                  const CNLP_Number* v_l,
                                  CNLP_Index v_u_count,
                                  const CNLP_Number* v_u,
+                                 CNLP_Index delta_x_count,
+                                 const CNLP_Number* delta_x,
+                                 CNLP_Index delta_s_count,
+                                 const CNLP_Number* delta_s,
+                                 CNLP_Index delta_y_c_count,
+                                 const CNLP_Number* delta_y_c,
+                                 CNLP_Index delta_y_d_count,
+                                 const CNLP_Number* delta_y_d,
+                                 CNLP_Index delta_z_l_count,
+                                 const CNLP_Number* delta_z_l,
+                                 CNLP_Index delta_z_u_count,
+                                 const CNLP_Number* delta_z_u,
+                                 CNLP_Index delta_v_l_count,
+                                 const CNLP_Number* delta_v_l,
+                                 CNLP_Index delta_v_u_count,
+                                 const CNLP_Number* delta_v_u,
                                  CNLP_Index kkt_x_stationarity_count,
                                  const CNLP_Number* kkt_x_stationarity,
                                  CNLP_Index kkt_slack_stationarity_count,
@@ -254,6 +270,22 @@ CNLP_Bool hs071_intermediate_callback(enum CNLP_AlgorithmMode alg_mod,
   (void)v_l;
   (void)v_u_count;
   (void)v_u;
+  (void)delta_x_count;
+  (void)delta_x;
+  (void)delta_s_count;
+  (void)delta_s;
+  (void)delta_y_c_count;
+  (void)delta_y_c;
+  (void)delta_y_d_count;
+  (void)delta_y_d;
+  (void)delta_z_l_count;
+  (void)delta_z_l;
+  (void)delta_z_u_count;
+  (void)delta_z_u;
+  (void)delta_v_l_count;
+  (void)delta_v_l;
+  (void)delta_v_u_count;
+  (void)delta_v_u;
   (void)kkt_x_stationarity_count;
   (void)kkt_x_stationarity;
   (void)kkt_slack_stationarity_count;
