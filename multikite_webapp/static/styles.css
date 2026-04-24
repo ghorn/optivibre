@@ -30,15 +30,17 @@ body {
 }
 
 .layout {
+  --top-workbench-height: clamp(560px, 64vh, 820px);
   display: grid;
   gap: 16px;
   padding: 16px;
-  grid-template-columns: 320px minmax(0, 1fr) minmax(260px, 280px);
+  grid-template-columns: minmax(280px, 340px) minmax(0, 1fr);
+  grid-template-rows: var(--top-workbench-height) auto auto;
   grid-template-areas:
-    "controls scene scene"
-    "controls runtime runtime"
-    "controls docs docs";
-  align-items: start;
+    "controls scene"
+    "controls runtime"
+    "controls docs";
+  align-items: stretch;
 }
 
 .panel {
@@ -55,11 +57,14 @@ body {
   background:
     linear-gradient(180deg, rgba(17, 34, 49, 0.98) 0%, rgba(9, 18, 27, 0.94) 100%);
   min-width: 0;
+  min-height: calc(100vh - 32px);
+  overflow: visible;
 }
 
 .scene {
   grid-area: scene;
-  min-height: 620px;
+  display: flex;
+  min-height: 0;
   overflow: hidden;
   min-width: 0;
 }
@@ -250,9 +255,10 @@ button:hover {
 }
 
 #viewport {
+  flex: 1;
   width: 100%;
   height: 100%;
-  min-height: 620px;
+  min-height: 0;
 }
 
 .summary {
@@ -565,6 +571,116 @@ button:hover {
   background: rgba(115, 146, 168, 0.08);
 }
 
+.plot-signal-legend {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.plot-signal-legend.empty,
+.plot-signal-legend:empty {
+  display: none;
+}
+
+.plot-signal-legend-title {
+  display: none;
+  padding-top: 8px;
+  color: #9db4c8;
+  font-size: 0.68rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.plot-signal-toggle-group {
+  display: flex;
+  flex: 1;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-width: 0;
+}
+
+.plot-signal-toggle {
+  --signal-color: #45d7a7;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: min(260px, 100%);
+  min-height: 24px;
+  padding: 4px 7px;
+  border: 1px solid color-mix(in srgb, var(--signal-color) 26%, rgba(115, 146, 168, 0.14));
+  border-radius: 999px;
+  background:
+    linear-gradient(180deg,
+      color-mix(in srgb, var(--signal-color) 10%, rgba(7, 16, 24, 0.94)) 0%,
+      rgba(4, 10, 16, 0.92) 100%);
+  color: #d9ecfb;
+  cursor: pointer;
+  font-size: 0.66rem;
+  font-weight: 700;
+  line-height: 1;
+  transition:
+    border-color 140ms ease,
+    opacity 140ms ease,
+    transform 140ms ease;
+}
+
+.plot-signal-toggle:hover {
+  border-color: color-mix(in srgb, var(--signal-color) 48%, rgba(115, 146, 168, 0.16));
+  transform: translateY(-1px);
+}
+
+.plot-signal-toggle.muted {
+  opacity: 0.48;
+  background: rgba(6, 14, 22, 0.82);
+  border-color: rgba(115, 146, 168, 0.13);
+}
+
+.plot-signal-swatch {
+  width: 18px;
+  height: 0;
+  border-top: 3px solid var(--signal-color);
+  border-radius: 999px;
+  box-shadow: 0 0 10px color-mix(in srgb, var(--signal-color) 46%, transparent);
+  flex: 0 0 auto;
+}
+
+.plot-signal-swatch.dash-dash,
+.plot-signal-swatch.dash-longdash,
+.plot-signal-swatch.dash-dashdot {
+  border-top-style: dashed;
+}
+
+.plot-signal-swatch.dash-dot {
+  border-top-style: dotted;
+}
+
+.plot-signal-label-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plot-signal-state {
+  display: none;
+  padding: 3px 6px;
+  border-radius: 999px;
+  color: color-mix(in srgb, var(--signal-color) 66%, #eaf6ff);
+  background: color-mix(in srgb, var(--signal-color) 10%, rgba(255, 255, 255, 0.04));
+  font-size: 0.58rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.plot-signal-toggle.muted .plot-signal-state {
+  color: #7f93a4;
+  background: rgba(115, 146, 168, 0.08);
+}
+
 @media (max-width: 680px) {
   .plot-kite-controls {
     align-items: flex-start;
@@ -573,6 +689,10 @@ button:hover {
 
   .plot-kite-toggle-group {
     justify-content: flex-start;
+  }
+
+  .plot-signal-legend {
+    flex-direction: column;
   }
 }
 
@@ -851,6 +971,14 @@ button:hover {
   align-items: center;
 }
 
+.plot-section-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+
 .plot-section-copy {
   display: grid;
   gap: 4px;
@@ -872,18 +1000,97 @@ button:hover {
   max-width: 88ch;
 }
 
+.plot-section-collapse {
+  appearance: none;
+  border: 1px solid rgba(115, 146, 168, 0.22);
+  border-radius: 12px;
+  padding: 8px 10px;
+  background:
+    linear-gradient(180deg, rgba(13, 28, 40, 0.96) 0%, rgba(5, 12, 18, 0.96) 100%);
+  color: #cfe3f2;
+  font-size: 0.68rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    border-color 140ms ease,
+    color 140ms ease,
+    transform 140ms ease,
+    background 140ms ease;
+}
+
+.plot-section-collapse:hover {
+  border-color: rgba(102, 184, 255, 0.46);
+  color: #f1f8ff;
+  transform: translateY(-1px);
+}
+
+.plot-section.collapsed .plot-section-head {
+  border-bottom-color: transparent;
+}
+
+.plot-section-body {
+  padding: 0;
+}
+
+.plot-group-grid {
+  --plot-columns: 1;
+  display: grid;
+  grid-template-columns: repeat(var(--plot-columns), minmax(0, 1fr));
+  gap: 14px;
+  padding: 14px;
+}
+
+.plot-group-card {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid rgba(115, 146, 168, 0.15);
+  border-radius: 13px;
+  background:
+    linear-gradient(180deg, rgba(5, 12, 18, 0.78) 0%, rgba(3, 8, 12, 0.9) 100%);
+}
+
+.plot-group-head {
+  display: grid;
+  gap: 8px;
+  padding: 10px 11px 4px;
+}
+
+.plot-group-title {
+  color: #d9ecfb;
+  font-size: 0.82rem;
+  font-weight: 800;
+  line-height: 1.2;
+  text-align: center;
+}
+
 .plot-canvas {
-  min-height: 320px;
+  width: 100%;
+  min-height: 300px;
 }
 
 @media (max-width: 980px) {
   .layout {
+    --top-workbench-height: auto;
     grid-template-columns: 1fr;
+    grid-template-rows: auto;
     grid-template-areas:
       "controls"
       "scene"
       "runtime"
       "docs";
+  }
+
+  .controls {
+    min-height: 0;
+    max-height: none;
+    overflow: visible;
+  }
+
+  .scene {
+    min-height: 560px;
   }
 
   .failure-head {
@@ -901,7 +1108,20 @@ button:hover {
     align-items: stretch;
   }
 
+  .plot-section-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
   .plot-section-head .plot-kite-controls {
     justify-content: flex-start;
+  }
+
+  .plot-section-collapse {
+    align-self: flex-start;
+  }
+
+  .plot-group-grid {
+    grid-template-columns: 1fr;
   }
 }

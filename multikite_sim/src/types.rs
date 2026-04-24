@@ -15,6 +15,7 @@ pub enum Preset {
     FreeFlight1,
     Star1,
     Y2,
+    Y2Reference,
     Star3,
     Star4,
     SimpleTether,

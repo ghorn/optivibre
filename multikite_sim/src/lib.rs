@@ -15,8 +15,10 @@ pub use runtime::{
     simulate_simple_tether_with_progress, simulate_star1, simulate_star1_with_callbacks,
     simulate_star1_with_progress, simulate_star3, simulate_star3_with_callbacks,
     simulate_star3_with_progress, simulate_star4, simulate_star4_with_callbacks,
-    simulate_star4_with_progress, simulate_y2, simulate_y2_with_callbacks,
-    simulate_y2_with_progress, star_configuration, y_configuration,
+    simulate_star4_with_progress, simulate_y2, simulate_y2_reference,
+    simulate_y2_reference_with_callbacks, simulate_y2_reference_with_progress,
+    simulate_y2_with_callbacks, simulate_y2_with_progress, star_configuration, y_configuration,
+    y_reference_configuration,
 };
 pub use types::{
     AeroParams, BodyState, ControlSurfaces, ControllerGains, Controls, Diagnostics, Environment,

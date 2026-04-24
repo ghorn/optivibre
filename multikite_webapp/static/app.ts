@@ -2,7 +2,14 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
 type PhaseMode = "adaptive" | "open_loop";
-type Preset = "free_flight1" | "star1" | "y2" | "star3" | "star4" | "simple_tether";
+type Preset =
+  | "free_flight1"
+  | "star1"
+  | "y2"
+  | "y2_reference"
+  | "star3"
+  | "star4"
+  | "simple_tether";
 type TimeDilationPreset = "fast" | "1" | "0.5" | "0.1";
 type CameraFollowTarget = "manual" | "disk_center" | `kite:${number}`;
 type RuntimeTab = "console" | "plots";
@@ -639,6 +646,8 @@ type PlotDash = "solid" | "dash" | "dot" | "dashdot" | "longdash";
 interface PlotTraceDefinition {
   name: string;
   color: string;
+  signalKey?: string;
+  legendName?: string;
   kiteIndex?: number;
   dash?: PlotDash;
   width?: number;
@@ -659,9 +668,9 @@ interface PlotSectionDefinition {
 }
 
 interface ActivePlotSection {
-  definition: PlotSectionDefinition;
   host: HTMLElement;
   plot: HTMLElement;
+  traces: PlotTraceDefinition[];
   traceIndices: number[];
 }
 
@@ -675,9 +684,11 @@ const REF_ALPHA = 0.6;
 const LIMIT_COLOR = "rgba(255, 94, 94, 0.72)";
 const ZERO_REF_COLOR = "rgba(211, 228, 245, 0.38)";
 const MAX_PLOT_COLUMNS = 3;
-const PLOT_SECTION_ROW_HEIGHT_PX = 292;
+const PLOT_GROUP_HEIGHT_PX = 330;
 let activePlotSections: ActivePlotSection[] = [];
 let plotKiteVisibility: boolean[] = [];
+let plotSignalVisibility = new Map<string, boolean>();
+let collapsedPlotSections = new Set<string>();
 let syncingPlotXAxes = false;
 
 interface KiteBreakdownTraceDefinition {
@@ -1281,6 +1292,7 @@ function presetKiteCount(preset: Preset): number {
     case "star1":
       return 1;
     case "y2":
+    case "y2_reference":
       return 2;
     case "star3":
       return 3;
@@ -1392,14 +1404,28 @@ function ensurePlotKiteVisibility(kiteCount: number): void {
   );
 }
 
-function plotTraceVisible(trace: PlotTraceDefinition): boolean {
+function plotSignalKey(trace: PlotTraceDefinition): string {
+  return trace.signalKey ?? trace.legendName ?? trace.name;
+}
+
+function plotSignalVisible(trace: PlotTraceDefinition): boolean {
+  return plotSignalVisibility.get(plotSignalKey(trace)) ?? true;
+}
+
+function plotKiteTraceVisible(trace: PlotTraceDefinition): boolean {
   return trace.kiteIndex === undefined || (plotKiteVisibility[trace.kiteIndex] ?? true);
 }
 
-function sectionTraceVisibility(definition: PlotSectionDefinition): boolean[] {
-  return definition.groups.flatMap((group) =>
-    group.traces.map((trace) => plotTraceVisible(trace))
-  );
+function plotTraceVisible(trace: PlotTraceDefinition): boolean {
+  return plotSignalVisible(trace) && plotKiteTraceVisible(trace);
+}
+
+function plotGroupTraces(groups: PlotGroupDefinition[]): PlotTraceDefinition[] {
+  return groups.flatMap((group) => group.traces);
+}
+
+function plotTraceVisibility(traces: PlotTraceDefinition[]): boolean[] {
+  return traces.map((trace) => plotTraceVisible(trace));
 }
 
 function syncPlotKiteControlUi(): void {
@@ -1426,18 +1452,19 @@ function applyPlotKiteVisibility(): void {
     return;
   }
   syncPlotKiteControlUi();
+  syncPlotSignalLegendUi();
 
   const updates = activePlotSections.map((section) =>
     Plotly.restyle(
       section.plot,
-      { visible: sectionTraceVisibility(section.definition) },
+      { visible: plotTraceVisibility(section.traces) },
       section.traceIndices
     )
   );
 
   void Promise.all(updates).catch((error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
-    appendConsole(`plot kite visibility update failed: ${message}`);
+    appendConsole(`plot visibility update failed: ${message}`);
   });
 }
 
@@ -1489,6 +1516,106 @@ function renderPlotKiteControls(container: HTMLElement, kiteCount: number): void
   }
 }
 
+interface PlotSignalLegendItem {
+  key: string;
+  label: string;
+  color: string;
+  dash?: PlotDash;
+}
+
+function plotSignalLegendItems(traces: PlotTraceDefinition[]): PlotSignalLegendItem[] {
+  const items: PlotSignalLegendItem[] = [];
+  const seen = new Set<string>();
+  for (const trace of traces) {
+    const key = plotSignalKey(trace);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    items.push({
+      key,
+      label: trace.legendName ?? trace.name,
+      color: trace.color,
+      dash: trace.dash
+    });
+  }
+  return items;
+}
+
+function syncPlotSignalLegendUi(): void {
+  document.querySelectorAll<HTMLButtonElement>(".plot-signal-toggle").forEach((button) => {
+    const signalKey = button.dataset.signalKey;
+    if (!signalKey) {
+      return;
+    }
+    const visible = plotSignalVisibility.get(signalKey) ?? true;
+    const state = button.querySelector<HTMLElement>(".plot-signal-state");
+    button.classList.toggle("muted", !visible);
+    button.setAttribute("aria-pressed", String(visible));
+    if (state) {
+      state.textContent = visible ? "shown" : "hidden";
+    }
+  });
+}
+
+function renderPlotSignalLegend(container: HTMLElement, traces: PlotTraceDefinition[]): void {
+  container.innerHTML = "";
+  const items = plotSignalLegendItems(traces);
+  container.classList.toggle("empty", items.length === 0);
+  if (items.length === 0) {
+    return;
+  }
+
+  const title = document.createElement("div");
+  title.className = "plot-signal-legend-title";
+  title.textContent = "Signals";
+  container.append(title);
+
+  const group = document.createElement("div");
+  group.className = "plot-signal-toggle-group";
+  container.append(group);
+
+  for (const item of items) {
+    const button = document.createElement("button");
+    button.className = "plot-signal-toggle";
+    button.type = "button";
+    button.dataset.signalKey = item.key;
+    button.title = item.label;
+    button.style.setProperty("--signal-color", item.color);
+
+    const swatch = document.createElement("span");
+    swatch.className = `plot-signal-swatch ${item.dash ? `dash-${item.dash}` : ""}`;
+
+    const text = document.createElement("span");
+    text.className = "plot-signal-label-text";
+    text.textContent = item.label;
+
+    const state = document.createElement("span");
+    state.className = "plot-signal-state";
+    state.textContent = "shown";
+
+    button.addEventListener("click", () => {
+      const nextVisible = !(plotSignalVisibility.get(item.key) ?? true);
+      plotSignalVisibility.set(item.key, nextVisible);
+      applyPlotKiteVisibility();
+    });
+
+    button.append(swatch, text, state);
+    group.append(button);
+  }
+  syncPlotSignalLegendUi();
+}
+
+function plotLegendBaseTitle(title: string): string {
+  const strippedUnits = title.replace(/\s*\([^)]*\)\s*$/, "");
+  const strippedComparison = strippedUnits.replace(
+    /\s+Desired vs (Actual|Estimated)$/i,
+    ""
+  );
+  const strippedSuffix = strippedComparison.replace(/\s+(Breakdown|Terms)$/i, "");
+  return strippedSuffix.trim() || title;
+}
+
 function buildPerKiteGroup(
   kiteCount: number,
   title: string,
@@ -1498,11 +1625,16 @@ function buildPerKiteGroup(
   extraTraces: PlotTraceDefinition[] = []
 ): PlotGroupDefinition {
   const traces: PlotTraceDefinition[] = [];
+  const actualSignalKey = `${title}:actual`;
+  const referenceSignalKey = `${title}:reference`;
+  const legendBase = plotLegendBaseTitle(title);
   for (let kiteIndex = 0; kiteIndex < kiteCount; kiteIndex += 1) {
     const color = kiteColor(kiteIndex);
     traces.push({
       name: `Kite ${kiteIndex + 1}`,
       color,
+      signalKey: actualSignalKey,
+      legendName: `${legendBase} actual`,
       kiteIndex,
       value: (frame) => actualValue(frame, kiteIndex)
     });
@@ -1510,6 +1642,8 @@ function buildPerKiteGroup(
       traces.push({
         name: `Kite ${kiteIndex + 1} Ref`,
         color: hexToRgba(color, REF_ALPHA),
+        signalKey: referenceSignalKey,
+        legendName: `${legendBase} ref`,
         kiteIndex,
         dash: "dash",
         value: (frame) => referenceValue(frame, kiteIndex)
@@ -1519,7 +1653,14 @@ function buildPerKiteGroup(
   return {
     title,
     yTitle,
-    traces: [...traces, ...extraTraces]
+    traces: [
+      ...traces,
+      ...extraTraces.map((trace) => ({
+        ...trace,
+        signalKey: trace.signalKey ?? `${title}:${trace.name}`,
+        legendName: trace.legendName ?? `${legendBase} ${trace.name}`
+      }))
+    ]
   };
 }
 
@@ -1530,12 +1671,15 @@ function buildPerKiteBreakdownGroup(
   tracesByKite: KiteBreakdownTraceDefinition[]
 ): PlotGroupDefinition {
   const traces: PlotTraceDefinition[] = [];
+  const legendBase = plotLegendBaseTitle(title);
   for (let kiteIndex = 0; kiteIndex < kiteCount; kiteIndex += 1) {
     const color = kiteColor(kiteIndex);
     for (const trace of tracesByKite) {
       traces.push({
         name: `Kite ${kiteIndex + 1} ${trace.name}`,
         color: hexToRgba(color, trace.alpha ?? 0.9),
+        signalKey: `${title}:${trace.name}`,
+        legendName: `${legendBase} ${trace.name}`,
         kiteIndex,
         dash: trace.dash,
         width: trace.width,
@@ -1596,6 +1740,119 @@ function buildEnergyGroups(): PlotGroupDefinition[] {
   ];
 }
 
+function buildAirspeedCommandGroup(kiteCount: number): PlotGroupDefinition {
+  return buildPerKiteGroup(
+    kiteCount,
+    "Airspeed Desired vs Actual (m/s)",
+    "m/s",
+    (frame, kiteIndex) => frame.airspeed[kiteIndex] ?? 0,
+    (frame, kiteIndex) => frame.speed_target[kiteIndex] ?? 0
+  );
+}
+
+function buildAltitudeCommandGroup(kiteCount: number): PlotGroupDefinition {
+  return buildPerKiteGroup(
+    kiteCount,
+    "Altitude Desired vs Actual (m)",
+    "m",
+    (frame, kiteIndex) => frame.altitude[kiteIndex] ?? 0,
+    (frame, kiteIndex) => frame.altitude_ref[kiteIndex] ?? 0
+  );
+}
+
+function buildRollCommandGroup(kiteCount: number): PlotGroupDefinition {
+  return buildPerKiteGroup(
+    kiteCount,
+    "Desired Roll vs Actual (deg)",
+    "deg",
+    (frame, kiteIndex) => frame.kite_attitudes_rpy_deg[kiteIndex]?.[0] ?? 0,
+    (frame, kiteIndex) => frame.roll_ref_deg[kiteIndex] ?? 0
+  );
+}
+
+function buildPitchCommandGroup(kiteCount: number): PlotGroupDefinition {
+  return buildPerKiteGroup(
+    kiteCount,
+    "Desired Pitch vs Actual (deg)",
+    "deg",
+    (frame, kiteIndex) => frame.kite_attitudes_rpy_deg[kiteIndex]?.[1] ?? 0,
+    (frame, kiteIndex) => frame.pitch_ref_deg[kiteIndex] ?? 0
+  );
+}
+
+function buildOrbitRadiusGroup(kiteCount: number): PlotGroupDefinition {
+  return buildPerKiteGroup(
+    kiteCount,
+    "Orbit Radius (m)",
+    "m",
+    (frame, kiteIndex) => frame.orbit_radius[kiteIndex] ?? 0,
+    (frame, kiteIndex) => frame.rabbit_radius[kiteIndex] ?? 0
+  );
+}
+
+function buildPhaseErrorGroup(kiteCount: number): PlotGroupDefinition {
+  return buildPerKiteGroup(
+    kiteCount,
+    "Phase Error (rad)",
+    "rad",
+    (frame, kiteIndex) => frame.phase_error[kiteIndex] ?? 0,
+    undefined,
+    [
+      {
+        name: "Zero Ref",
+        color: ZERO_REF_COLOR,
+        dash: "dash",
+        value: () => 0
+      }
+    ]
+  );
+}
+
+function buildAileronCommandGroup(kiteCount: number): PlotGroupDefinition {
+  return buildPerKiteGroup(
+    kiteCount,
+    "Aileron Command (deg)",
+    "deg",
+    (frame, kiteIndex) => frame.aileron_cmd_deg[kiteIndex] ?? 0
+  );
+}
+
+function buildRudderCommandGroup(kiteCount: number): PlotGroupDefinition {
+  return buildPerKiteGroup(
+    kiteCount,
+    "Rudder Command (deg)",
+    "deg",
+    (frame, kiteIndex) => frame.rudder_cmd_deg[kiteIndex] ?? 0
+  );
+}
+
+function buildElevatorCommandGroup(kiteCount: number): PlotGroupDefinition {
+  return buildPerKiteGroup(
+    kiteCount,
+    "Elevator Command (deg)",
+    "deg",
+    (frame, kiteIndex) => frame.elevator_cmd_deg[kiteIndex] ?? 0
+  );
+}
+
+function buildMotorTorqueCommandGroup(kiteCount: number): PlotGroupDefinition {
+  return buildPerKiteGroup(
+    kiteCount,
+    "Motor Torque Command (N m)",
+    "N m",
+    (frame, kiteIndex) => frame.motor_torque[kiteIndex] ?? 0
+  );
+}
+
+function buildTecsPitchCommandGroup(kiteCount: number): PlotGroupDefinition {
+  return buildPerKiteGroup(
+    kiteCount,
+    "TECS Pitch Command (deg)",
+    "deg",
+    (frame, kiteIndex) => frame.pitch_ref_deg[kiteIndex] ?? 0
+  );
+}
+
 function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
   if (kiteCount === 0) {
     return [
@@ -1609,23 +1866,52 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
 
   return [
     {
+      title: "Controller / Summary",
+      description:
+        "Top-level commanded quantities and their plant responses. Use this first to see whether the main loops are tracking before drilling into the actuator and physics sections.",
+      groups: [
+        buildAirspeedCommandGroup(kiteCount),
+        buildAltitudeCommandGroup(kiteCount),
+        buildRollCommandGroup(kiteCount),
+        buildPitchCommandGroup(kiteCount),
+        buildOrbitRadiusGroup(kiteCount),
+        buildPhaseErrorGroup(kiteCount)
+      ],
+      maxColumns: 2
+    },
+    {
       title: "Controller / 1. Lateral Inner Loop",
       description:
         "Innermost lateral channel first. Desired path curvature is turned into a coordinated-turn roll feedforward plus a smaller curvature-error PI correction; the aileron then closes roll with body-rate damping. Rudder now closes a coordinated-turn / sideslip loop using desired world-Z turn rate together with beta regulation.",
       groups: [
+        buildRollCommandGroup(kiteCount),
+        buildPerKiteGroup(
+          kiteCount,
+          "Body Rate p (rad/s)",
+          "rad/s",
+          (frame, kiteIndex) => frame.body_omega_b[kiteIndex]?.[0] ?? 0
+        ),
+        buildAileronCommandGroup(kiteCount),
+        buildPerKiteGroup(
+          kiteCount,
+          "Sideslip Beta (deg)",
+          "deg",
+          (frame, kiteIndex) => frame.beta_deg[kiteIndex] ?? 0,
+          (frame, kiteIndex) => frame.beta_ref_deg[kiteIndex] ?? 0
+        ),
+        buildPerKiteGroup(
+          kiteCount,
+          "Body Rate r (rad/s)",
+          "rad/s",
+          (frame, kiteIndex) => frame.body_omega_b[kiteIndex]?.[2] ?? 0
+        ),
+        buildRudderCommandGroup(kiteCount),
         buildPerKiteGroup(
           kiteCount,
           "Curvature Y Desired vs Estimated (1/m)",
           "1/m",
           (frame, kiteIndex) => frame.curvature_y_est[kiteIndex] ?? 0,
           (frame, kiteIndex) => frame.curvature_y_ref[kiteIndex] ?? 0
-        ),
-        buildPerKiteGroup(
-          kiteCount,
-          "Desired Roll vs Actual (deg)",
-          "deg",
-          (frame, kiteIndex) => frame.kite_attitudes_rpy_deg[kiteIndex]?.[0] ?? 0,
-          (frame, kiteIndex) => frame.roll_ref_deg[kiteIndex] ?? 0
         ),
         buildPerKiteGroup(
           kiteCount,
@@ -1639,37 +1925,6 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
           "rad/s",
           (frame, kiteIndex) => frame.omega_world_z[kiteIndex] ?? 0,
           (frame, kiteIndex) => frame.omega_world_z_ref[kiteIndex] ?? 0
-        ),
-        buildPerKiteGroup(
-          kiteCount,
-          "Sideslip Beta (deg)",
-          "deg",
-          (frame, kiteIndex) => frame.beta_deg[kiteIndex] ?? 0,
-          (frame, kiteIndex) => frame.beta_ref_deg[kiteIndex] ?? 0
-        ),
-        buildPerKiteGroup(
-          kiteCount,
-          "Body Rate p (rad/s)",
-          "rad/s",
-          (frame, kiteIndex) => frame.body_omega_b[kiteIndex]?.[0] ?? 0
-        ),
-        buildPerKiteGroup(
-          kiteCount,
-          "Body Rate r (rad/s)",
-          "rad/s",
-          (frame, kiteIndex) => frame.body_omega_b[kiteIndex]?.[2] ?? 0
-        ),
-        buildPerKiteGroup(
-          kiteCount,
-          "Aileron Command (deg)",
-          "deg",
-          (frame, kiteIndex) => frame.aileron_cmd_deg[kiteIndex] ?? 0
-        ),
-        buildPerKiteGroup(
-          kiteCount,
-          "Rudder Command (deg)",
-          "deg",
-          (frame, kiteIndex) => frame.rudder_cmd_deg[kiteIndex] ?? 0
         )
       ]
     },
@@ -1678,28 +1933,8 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
       description:
         "Outer lateral path loop. Phase coordination biases the rabbit radius and speed scheduling; the path-tracking output into the inner loop is the rabbit-radius command.",
       groups: [
-        buildPerKiteGroup(
-          kiteCount,
-          "Orbit Radius (m)",
-          "m",
-          (frame, kiteIndex) => frame.orbit_radius[kiteIndex] ?? 0,
-          (frame, kiteIndex) => frame.rabbit_radius[kiteIndex] ?? 0
-        ),
-        buildPerKiteGroup(
-          kiteCount,
-          "Phase Error (rad)",
-          "rad",
-          (frame, kiteIndex) => frame.phase_error[kiteIndex] ?? 0,
-          undefined,
-          [
-            {
-              name: "Zero Ref",
-              color: ZERO_REF_COLOR,
-              dash: "dash",
-              value: () => 0
-            }
-          ]
-        )
+        buildOrbitRadiusGroup(kiteCount),
+        buildPhaseErrorGroup(kiteCount)
       ]
     },
     {
@@ -1707,20 +1942,7 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
       description:
         "Specific kinetic and potential energy loops. Airspeed error is mapped to kinetic-energy error and closed with motor torque; altitude error is saturated, converted to potential-energy error, and pitch trades potential energy against kinetic energy.",
       groups: [
-        buildPerKiteGroup(
-          kiteCount,
-          "Airspeed Desired vs Actual (m/s)",
-          "m/s",
-          (frame, kiteIndex) => frame.airspeed[kiteIndex] ?? 0,
-          (frame, kiteIndex) => frame.speed_target[kiteIndex] ?? 0
-        ),
-        buildPerKiteGroup(
-          kiteCount,
-          "Altitude Desired vs Actual (m)",
-          "m",
-          (frame, kiteIndex) => frame.altitude[kiteIndex] ?? 0,
-          (frame, kiteIndex) => frame.altitude_ref[kiteIndex] ?? 0
-        ),
+        buildAirspeedCommandGroup(kiteCount),
         buildPerKiteGroup(
           kiteCount,
           "Specific Kinetic Energy Desired vs Actual (m²/s²)",
@@ -1728,6 +1950,8 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
           (frame, kiteIndex) => frame.kinetic_energy_specific[kiteIndex] ?? 0,
           (frame, kiteIndex) => frame.kinetic_energy_ref_specific[kiteIndex] ?? 0
         ),
+        buildMotorTorqueCommandGroup(kiteCount),
+        buildAltitudeCommandGroup(kiteCount),
         buildPerKiteGroup(
           kiteCount,
           "Specific Potential Energy Desired vs Actual (m²/s²)",
@@ -1735,6 +1959,7 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
           (frame, kiteIndex) => frame.potential_energy_specific[kiteIndex] ?? 0,
           (frame, kiteIndex) => frame.potential_energy_ref_specific[kiteIndex] ?? 0
         ),
+        buildTecsPitchCommandGroup(kiteCount),
         buildPerKiteGroup(
           kiteCount,
           "Specific Total Energy Desired vs Actual (m²/s²)",
@@ -1792,19 +2017,7 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
                 ((frame.pitch_energy_integrator[kiteIndex] ?? 0) * 180) / Math.PI
             }
           ]
-        ),
-        buildPerKiteGroup(
-          kiteCount,
-          "Motor Torque Command (N m)",
-          "N m",
-          (frame, kiteIndex) => frame.motor_torque[kiteIndex] ?? 0
-        ),
-        buildPerKiteGroup(
-          kiteCount,
-          "TECS Pitch Command (deg)",
-          "deg",
-          (frame, kiteIndex) => frame.pitch_ref_deg[kiteIndex] ?? 0
-        ),
+        )
       ]
     },
     {
@@ -1812,25 +2025,14 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
       description:
         "The TECS energy-balance output is a desired pitch angle. The elevator closes pitch with q damping. Flap is held at trim for now so the elevator loop can be tuned in isolation.",
       groups: [
-        buildPerKiteGroup(
-          kiteCount,
-          "Desired Pitch vs Actual (deg)",
-          "deg",
-          (frame, kiteIndex) => frame.kite_attitudes_rpy_deg[kiteIndex]?.[1] ?? 0,
-          (frame, kiteIndex) => frame.pitch_ref_deg[kiteIndex] ?? 0
-        ),
+        buildPitchCommandGroup(kiteCount),
         buildPerKiteGroup(
           kiteCount,
           "Body Rate q (rad/s)",
           "rad/s",
           (frame, kiteIndex) => frame.body_omega_b[kiteIndex]?.[1] ?? 0
         ),
-        buildPerKiteGroup(
-          kiteCount,
-          "Elevator Command (deg)",
-          "deg",
-          (frame, kiteIndex) => frame.elevator_cmd_deg[kiteIndex] ?? 0
-        ),
+        buildElevatorCommandGroup(kiteCount),
         buildPerKiteGroup(
           kiteCount,
           "Flap Command (deg)",
@@ -1842,14 +2044,8 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
     {
       title: "Physics / Plant State",
       description:
-        "Plant outputs that are not direct controller reference signals in the current implementation: aero angles, yaw response, tether load, and other state that help explain why a run diverged.",
+        "Plant outputs that are not direct top-level controller tracking plots: aero angles, yaw response, tether load, and other state that help explain why a run diverged.",
       groups: [
-        buildPerKiteGroup(
-          kiteCount,
-          "Airspeed (m/s)",
-          "m/s",
-          (frame, kiteIndex) => frame.airspeed[kiteIndex] ?? 0
-        ),
         buildPerKiteGroup(
           kiteCount,
           "Yaw (deg)",
@@ -3471,36 +3667,34 @@ function sectionPlotColumns(groupCount: number, maxColumns?: number): number {
   return Math.min(groupCount, availableColumns);
 }
 
-function sectionPlotData(groups: PlotGroupDefinition[], frames: ApiFrame[]): PlotlyDatum[] {
+function plotGroupHeight(): number {
+  return PLOT_GROUP_HEIGHT_PX;
+}
+
+function plotGroupData(group: PlotGroupDefinition, frames: ApiFrame[]): PlotlyDatum[] {
   const frameTimes = frames.map((frame) => frame.time);
-  return groups.flatMap((group, groupIndex) =>
-    group.traces.map((trace) => ({
-      type: "scatter",
-      mode: "lines",
-      name: trace.name,
-      x: frameTimes,
-      y: frames.map((frame) => trace.value(frame)),
-      line: {
-        color: trace.color,
-        width: trace.width ?? 2,
-        dash: trace.dash ?? "solid"
-      },
-      visible: plotTraceVisible(trace),
-      xaxis: groupIndex === 0 ? "x" : `x${groupIndex + 1}`,
-      yaxis: groupIndex === 0 ? "y" : `y${groupIndex + 1}`,
-      hovertemplate: `${trace.name}<br>t=%{x:.2f}s<br>%{y:.4f}<extra></extra>`
-    }))
+  return group.traces.map((trace) => ({
+    type: "scatter",
+    mode: "lines",
+    name: trace.name,
+    x: frameTimes,
+    y: frames.map((frame) => trace.value(frame)),
+    line: {
+      color: trace.color,
+      width: trace.width ?? 2,
+      dash: trace.dash ?? "solid"
+    },
+    visible: plotTraceVisible(trace),
+    hovertemplate: `${trace.name}<br>t=%{x:.2f}s<br>%{y:.4f}<extra></extra>`
+  })
   );
 }
 
-function sectionPlotLayout(definition: PlotSectionDefinition): PlotlyDatum {
-  const { groups } = definition;
-  const columns = sectionPlotColumns(groups.length, definition.maxColumns);
-  const rows = Math.max(1, Math.ceil(groups.length / columns));
-  const layout: PlotlyDatum = {
+function plotGroupLayout(group: PlotGroupDefinition): PlotlyDatum {
+  return {
     autosize: true,
-    height: Math.max(260, rows * PLOT_SECTION_ROW_HEIGHT_PX),
-    margin: { l: 54, r: 18, t: 30, b: 50 },
+    height: plotGroupHeight(),
+    margin: { l: 54, r: 18, t: 18, b: 48 },
     paper_bgcolor: "rgba(0,0,0,0)",
     plot_bgcolor: "#081018",
     font: {
@@ -3508,76 +3702,32 @@ function sectionPlotLayout(definition: PlotSectionDefinition): PlotlyDatum {
       color: "#d9ecfb"
     },
     showlegend: false,
-    grid: {
-      rows,
-      columns,
-      pattern: "independent",
-      xgap: 0.09,
-      ygap: 0.18
+    xaxis: {
+      title: { text: "Time (s)", standoff: 6 },
+      gridcolor: "#243b4a",
+      zerolinecolor: "#243b4a",
+      linecolor: "#345266",
+      mirror: true,
+      automargin: true
     },
-    annotations: groups.map((group, index) => {
-      const suffix = index === 0 ? "" : String(index + 1);
-      return {
-        text: `<b>${group.title}</b>`,
-        xref: `x${suffix} domain`,
-        yref: `y${suffix} domain`,
-        x: 0.5,
-        y: 1.04,
-        xanchor: "center",
-        yanchor: "bottom",
-        showarrow: false,
-        align: "center",
-        font: {
-          family: "IBM Plex Sans, Helvetica Neue, sans-serif",
-          size: 13,
-          color: "#d9ecfb"
-        }
-      };
-    })
-  };
-
-  for (let index = 1; index <= groups.length; index += 1) {
-    const suffix = index === 1 ? "" : String(index);
-    const zeroBased = index - 1;
-    const row = Math.floor(zeroBased / columns);
-    const isBottomRow = row === rows - 1;
-    layout[`xaxis${suffix}`] = {
-      title: isBottomRow ? { text: "Time (s)", standoff: 6 } : undefined,
-      showticklabels: isBottomRow,
-      gridcolor: "#243b4a",
-      zerolinecolor: "#243b4a",
-      linecolor: "#345266",
-      matches: index === 1 ? undefined : "x",
-      mirror: true,
-      automargin: true
-    };
-    layout[`yaxis${suffix}`] = {
-      title: { text: groups[zeroBased].yTitle, standoff: 8 },
+    yaxis: {
+      title: { text: group.yTitle, standoff: 8 },
       gridcolor: "#243b4a",
       zerolinecolor: "#243b4a",
       linecolor: "#345266",
       mirror: true,
       automargin: true
-    };
-  }
-
-  return layout;
-}
-
-function xAxisName(index: number): string {
-  return index === 1 ? "xaxis" : `xaxis${index}`;
-}
-
-function linkedXAxisUpdate(groupCount: number, range: [number, number] | null): PlotlyDatum {
-  const update: PlotlyDatum = {};
-  for (let index = 1; index <= groupCount; index += 1) {
-    const axis = xAxisName(index);
-    if (range) {
-      update[`${axis}.range`] = range;
-      update[`${axis}.autorange`] = false;
-    } else {
-      update[`${axis}.autorange`] = true;
     }
+  };
+}
+
+function linkedXAxisUpdate(range: [number, number] | null): PlotlyDatum {
+  const update: PlotlyDatum = {};
+  if (range) {
+    update["xaxis.range"] = range;
+    update["xaxis.autorange"] = false;
+  } else {
+    update["xaxis.autorange"] = true;
   }
   return update;
 }
@@ -3630,10 +3780,7 @@ function syncPlotXAxes(event: PlotlyRelayoutEvent): void {
 
   syncingPlotXAxes = true;
   const updates = activePlotSections.map((section) =>
-    Plotly.relayout(
-      section.plot,
-      linkedXAxisUpdate(section.definition.groups.length, range)
-    )
+    Plotly.relayout(section.plot, linkedXAxisUpdate(range))
   );
   void Promise.all(updates)
     .catch((error: unknown) => {
@@ -3653,6 +3800,30 @@ function registerPlotXAxisSync(plot: HTMLElement): void {
   plotElement.on("plotly_relayout", syncPlotXAxes);
 }
 
+function plotSectionKey(definition: PlotSectionDefinition): string {
+  return definition.title;
+}
+
+function applyPlotSectionCollapsed(
+  host: HTMLElement,
+  body: HTMLElement,
+  toggle: HTMLButtonElement,
+  plots: HTMLElement[],
+  collapsed: boolean
+): void {
+  host.classList.toggle("collapsed", collapsed);
+  body.hidden = collapsed;
+  toggle.setAttribute("aria-expanded", String(!collapsed));
+  toggle.textContent = collapsed ? "Show plots" : "Hide plots";
+  if (!collapsed) {
+    plots.forEach((plot) => {
+      if (plot.childElementCount > 0) {
+        Plotly.Plots?.resize(plot);
+      }
+    });
+  }
+}
+
 function clearPlots(message: string): void {
   activePlotSections.forEach((section) => {
     Plotly.purge(section.plot);
@@ -3670,6 +3841,8 @@ async function renderFinalPlots(frames: ApiFrame[], kiteCount: number): Promise<
     Plotly.purge(section.plot);
   });
   activePlotSections = [];
+  plotSignalVisibility = new Map<string, boolean>();
+  collapsedPlotSections = new Set<string>();
   plotsNode.innerHTML = "";
   ensurePlotKiteVisibility(kiteCount);
 
@@ -3688,40 +3861,94 @@ async function renderFinalPlots(frames: ApiFrame[], kiteCount: number): Promise<
     const description = document.createElement("div");
     description.className = "plot-section-note";
     description.textContent = definition.description;
+    const headerActions = document.createElement("div");
+    headerActions.className = "plot-section-actions";
     const controls = document.createElement("div");
     controls.className = "plot-kite-controls";
     renderPlotKiteControls(controls, kiteCount);
+    const collapseButton = document.createElement("button");
+    collapseButton.className = "plot-section-collapse";
+    collapseButton.type = "button";
 
-    const plot = document.createElement("div");
-    plot.className = "plot-canvas";
+    const body = document.createElement("div");
+    body.className = "plot-section-body";
+    const plotGrid = document.createElement("div");
+    plotGrid.className = "plot-group-grid";
+    plotGrid.style.setProperty(
+      "--plot-columns",
+      String(sectionPlotColumns(definition.groups.length, definition.maxColumns))
+    );
 
     headerCopy.append(title, description);
-    header.append(headerCopy, controls);
-    host.append(header, plot);
+    headerActions.append(controls, collapseButton);
+    header.append(headerCopy, headerActions);
+    body.append(plotGrid);
+    host.append(header, body);
     plotsNode.append(host);
 
-    const data = sectionPlotData(definition.groups, frames);
-    const traceIndices = data.map((_, index) => index);
+    const sectionPlots: HTMLElement[] = [];
 
-    const activeSection: ActivePlotSection = {
-      definition,
+    const sectionKey = plotSectionKey(definition);
+    applyPlotSectionCollapsed(
       host,
-      plot,
-      traceIndices
-    };
-
-    await Plotly.newPlot(plot, data, sectionPlotLayout(definition), {
-      responsive: true,
-      displaylogo: false,
-      modeBarButtonsToRemove: [
-        "select2d",
-        "lasso2d",
-        "autoScale2d",
-        "toggleSpikelines"
-      ]
+      body,
+      collapseButton,
+      sectionPlots,
+      collapsedPlotSections.has(sectionKey)
+    );
+    collapseButton.addEventListener("click", () => {
+      const nextCollapsed = !collapsedPlotSections.has(sectionKey);
+      if (nextCollapsed) {
+        collapsedPlotSections.add(sectionKey);
+      } else {
+        collapsedPlotSections.delete(sectionKey);
+      }
+      applyPlotSectionCollapsed(host, body, collapseButton, sectionPlots, nextCollapsed);
     });
-    activePlotSections.push(activeSection);
-    registerPlotXAxisSync(plot);
+
+    const plotPromises = definition.groups.map(async (group) => {
+      const groupCard = document.createElement("div");
+      groupCard.className = "plot-group-card";
+      const groupHead = document.createElement("div");
+      groupHead.className = "plot-group-head";
+      const groupTitle = document.createElement("div");
+      groupTitle.className = "plot-group-title";
+      groupTitle.textContent = group.title;
+      const signalLegend = document.createElement("div");
+      signalLegend.className = "plot-signal-legend";
+      renderPlotSignalLegend(signalLegend, group.traces);
+      const plot = document.createElement("div");
+      plot.className = "plot-canvas";
+      plot.style.height = `${plotGroupHeight()}px`;
+
+      groupHead.append(groupTitle, signalLegend);
+      groupCard.append(groupHead, plot);
+      plotGrid.append(groupCard);
+      sectionPlots.push(plot);
+
+      const data = plotGroupData(group, frames);
+      const traceIndices = data.map((_, index) => index);
+      const activeSection: ActivePlotSection = {
+        host,
+        plot,
+        traces: group.traces,
+        traceIndices
+      };
+
+      await Plotly.newPlot(plot, data, plotGroupLayout(group), {
+        responsive: true,
+        displaylogo: false,
+        modeBarButtonsToRemove: [
+          "select2d",
+          "lasso2d",
+          "autoScale2d",
+          "toggleSpikelines"
+        ]
+      });
+      activePlotSections.push(activeSection);
+      registerPlotXAxisSync(plot);
+    });
+    await Promise.all(plotPromises);
   });
 
   await Promise.all(sectionPromises);

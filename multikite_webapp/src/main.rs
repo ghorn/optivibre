@@ -15,6 +15,7 @@ use multikite_sim::{
     simulate_simple_tether_with_callbacks, simulate_simple_tether_with_progress,
     simulate_star1_with_callbacks, simulate_star1_with_progress, simulate_star3_with_callbacks,
     simulate_star3_with_progress, simulate_star4_with_callbacks, simulate_star4_with_progress,
+    simulate_y2_reference_with_callbacks, simulate_y2_reference_with_progress,
     simulate_y2_with_callbacks, simulate_y2_with_progress,
 };
 use nalgebra::UnitQuaternion;
@@ -877,6 +878,16 @@ fn run_preset_with_progress<F: FnMut(SimulationProgress)>(
                     .collect(),
             )
         }
+        Preset::Y2Reference => {
+            let run = simulate_y2_reference_with_progress(&init, &config, progress_cb)?;
+            (
+                run.summary,
+                run.frames
+                    .into_iter()
+                    .map(|frame| to_api_frame(&frame))
+                    .collect(),
+            )
+        }
         Preset::Star3 => {
             let run = simulate_star3_with_progress(&init, &config, progress_cb)?;
             (
@@ -1081,6 +1092,13 @@ fn run_preset_streaming<P: FnMut(SimulationProgress), G: FnMut(ApiFrame)>(
                 frame_cb(to_api_frame(&frame));
             };
             simulate_y2_with_callbacks(&init, &config, progress_cb, &mut send_frame)?.summary
+        }
+        Preset::Y2Reference => {
+            let mut send_frame = |frame: SimulationFrame<f64, 2, COMMON_NODES, UPPER_NODES>| {
+                frame_cb(to_api_frame(&frame));
+            };
+            simulate_y2_reference_with_callbacks(&init, &config, progress_cb, &mut send_frame)?
+                .summary
         }
         Preset::Star3 => {
             let mut send_frame = |frame: SimulationFrame<f64, 3, COMMON_NODES, UPPER_NODES>| {

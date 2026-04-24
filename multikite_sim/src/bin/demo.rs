@@ -3,6 +3,7 @@ use clap::{Parser, ValueEnum};
 use multikite_sim::{
     InitRequest, PhaseMode, Preset, SimulationConfig, simulate_free_flight1,
     simulate_simple_tether, simulate_star1, simulate_star3, simulate_star4, simulate_y2,
+    simulate_y2_reference,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -10,6 +11,7 @@ enum PresetArg {
     FreeFlight1,
     Star1,
     Y2,
+    Y2Reference,
     Star3,
     Star4,
     SimpleTether,
@@ -50,6 +52,7 @@ fn main() -> Result<()> {
             PresetArg::FreeFlight1 => Preset::FreeFlight1,
             PresetArg::Star1 => Preset::Star1,
             PresetArg::Y2 => Preset::Y2,
+            PresetArg::Y2Reference => Preset::Y2Reference,
             PresetArg::Star3 => Preset::Star3,
             PresetArg::Star4 => Preset::Star4,
             PresetArg::SimpleTether => Preset::SimpleTether,
@@ -61,6 +64,7 @@ fn main() -> Result<()> {
         PresetArg::FreeFlight1 => simulate_free_flight1(&init, &config)?.summary,
         PresetArg::Star1 => simulate_star1(&init, &config)?.summary,
         PresetArg::Y2 => simulate_y2(&init, &config)?.summary,
+        PresetArg::Y2Reference => simulate_y2_reference(&init, &config)?.summary,
         PresetArg::Star3 => simulate_star3(&init, &config)?.summary,
         PresetArg::Star4 => simulate_star4(&init, &config)?.summary,
         PresetArg::SimpleTether => simulate_simple_tether(&init, &config)?.summary,

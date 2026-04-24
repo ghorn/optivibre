@@ -228,6 +228,75 @@ pub fn y_configuration<const N_COMMON: usize, const N_UPPER: usize>(
     star_configuration(params)
 }
 
+pub fn y_reference_configuration<const N_COMMON: usize, const N_UPPER: usize>(
+    params: &Params<f64, 2>,
+) -> State<f64, 2, N_COMMON, N_UPPER> {
+    let ground_altitude = params.kites[0].tether.contact.ground_altitude;
+    let payload = TetherNode {
+        pos_n: Vector3::new(0.0, 0.0, -ground_altitude),
+        vel_n: Vector3::zeros(),
+    };
+    let splitter_altitude = ground_altitude + params.common_tether.natural_length;
+    let splitter = TetherNode {
+        pos_n: Vector3::new(0.0, 0.0, -splitter_altitude),
+        vel_n: Vector3::zeros(),
+    };
+
+    let target_cad_z = params.controller.disk_center_n[2];
+    let target_cad_altitude = -target_cad_z;
+    let bridle_vertical_offset_b =
+        params.kites[0].bridle.radius + params.kites[0].bridle.pivot_b[2];
+    let bridle_altitude = target_cad_altitude - bridle_vertical_offset_b;
+    let upper_vertical = bridle_altitude - splitter_altitude;
+    let upper_length = params.kites[0].tether.natural_length;
+    let bridle_orbit_radius = (upper_length * upper_length - upper_vertical * upper_vertical)
+        .max(0.0)
+        .sqrt();
+
+    let kites = from_fn(|index| {
+        let theta = 2.0 * std::f64::consts::PI * index as f64 / 2.0;
+        let quat_n2b = yaw_quaternion_n2b(theta + std::f64::consts::FRAC_PI_2);
+        let apparent_air_n = rotate_body_to_nav(
+            &quat_n2b,
+            &Vector3::new(params.controller.speed_ref, 0.0, 0.0),
+        );
+        let body_velocity_n = params.environment.wind_n + apparent_air_n;
+        let body_vel_b = rotate_nav_to_body(&quat_n2b, &body_velocity_n);
+        let bridle_pos_n = Vector3::new(
+            params.controller.disk_center_n[0] + bridle_orbit_radius * theta.cos(),
+            params.controller.disk_center_n[1] + bridle_orbit_radius * theta.sin(),
+            -bridle_altitude,
+        );
+        let bridle_to_body_b =
+            -(params.kites[index].bridle.pivot_b + params.kites[index].rigid_body.cad_offset_b);
+        let body_pos_n = bridle_pos_n
+            + Vector3::new(0.0, 0.0, -params.kites[index].bridle.radius)
+            + crate::math::rotate_body_to_nav(&quat_n2b, &bridle_to_body_b);
+        let body = BodyState {
+            pos_n: body_pos_n,
+            vel_b: body_vel_b,
+            quat_n2b,
+            omega_b: Vector3::zeros(),
+        };
+        let top = TetherNode {
+            pos_n: bridle_pos_n,
+            vel_n: body_velocity_n,
+        };
+        KiteState {
+            body,
+            tether: interpolate_nodes(&splitter, &top),
+        }
+    });
+
+    State {
+        kites,
+        splitter: splitter.clone(),
+        common_tether: interpolate_nodes(&payload, &splitter),
+        payload,
+        total_work: 0.0,
+    }
+}
+
 pub fn free_flight_configuration<const N_COMMON: usize, const N_UPPER: usize>(
     params: &Params<f64, 1>,
 ) -> State<f64, 1, N_COMMON, N_UPPER> {
@@ -828,6 +897,14 @@ pub fn available_presets() -> Vec<PresetInfo> {
             upper_nodes: UPPER_NODES,
         },
         PresetInfo {
+            preset: Preset::Y2Reference,
+            name: "Y2Ref",
+            description: "Two-kite Y preset initialized at controller reference airspeed and altitude.",
+            kites: 2,
+            common_nodes: COMMON_NODES,
+            upper_nodes: UPPER_NODES,
+        },
+        PresetInfo {
             preset: Preset::Star3,
             name: "Star3",
             description: "Three-kite equal-phase star preset.",
@@ -998,6 +1075,54 @@ pub fn simulate_y2_with_callbacks<
     )
 }
 
+pub fn simulate_y2_reference(
+    init: &InitRequest,
+    config: &SimulationConfig,
+) -> Result<RunResult<2, COMMON_NODES, UPPER_NODES>> {
+    let mut progress_cb = |_| {};
+    let mut frame_cb = |_| {};
+    simulate::<2, COMMON_NODES, UPPER_NODES, _, _>(
+        init,
+        config,
+        y_reference_configuration::<COMMON_NODES, UPPER_NODES>,
+        &mut progress_cb,
+        &mut frame_cb,
+    )
+}
+
+pub fn simulate_y2_reference_with_progress<F: FnMut(SimulationProgress)>(
+    init: &InitRequest,
+    config: &SimulationConfig,
+    progress_cb: &mut F,
+) -> Result<RunResult<2, COMMON_NODES, UPPER_NODES>> {
+    let mut frame_cb = |_| {};
+    simulate::<2, COMMON_NODES, UPPER_NODES, _, _>(
+        init,
+        config,
+        y_reference_configuration::<COMMON_NODES, UPPER_NODES>,
+        progress_cb,
+        &mut frame_cb,
+    )
+}
+
+pub fn simulate_y2_reference_with_callbacks<
+    P: FnMut(SimulationProgress),
+    G: FnMut(SimulationFrame<f64, 2, COMMON_NODES, UPPER_NODES>),
+>(
+    init: &InitRequest,
+    config: &SimulationConfig,
+    progress_cb: &mut P,
+    frame_cb: &mut G,
+) -> Result<RunResult<2, COMMON_NODES, UPPER_NODES>> {
+    simulate::<2, COMMON_NODES, UPPER_NODES, _, _>(
+        init,
+        config,
+        y_reference_configuration::<COMMON_NODES, UPPER_NODES>,
+        progress_cb,
+        frame_cb,
+    )
+}
+
 pub fn simulate_star3(
     init: &InitRequest,
     config: &SimulationConfig,
@@ -1144,7 +1269,10 @@ pub fn simulate_simple_tether_with_callbacks<
 
 #[cfg(test)]
 mod tests {
-    use crate::controller::{FreeFlightReference, controller_step_with_free_flight_reference};
+    use crate::controller::{
+        FreeFlightReference, controller_step, controller_step_with_free_flight_reference,
+    };
+    use crate::types::PhaseMode;
 
     use super::*;
     use nalgebra::UnitQuaternion;
@@ -1181,6 +1309,78 @@ mod tests {
             ROLL_STEP_RAD
         } else {
             0.0
+        }
+    }
+
+    #[test]
+    fn y2_reference_initializes_on_controller_speed_and_altitude_refs() {
+        let init = InitRequest {
+            preset: Preset::Y2Reference,
+            payload_mass_kg: None,
+            wind_speed_mps: None,
+        };
+        let params = base_params::<2>(&init).expect("Y2 reference params");
+        let state = y_reference_configuration::<COMMON_NODES, UPPER_NODES>(&params);
+        let controls = initial_controls(&params);
+        let rhs = CompiledRhs::<2, COMMON_NODES, UPPER_NODES>::shared()
+            .expect("compiled Y2 reference rhs");
+        let (_, mut diagnostics) = rhs
+            .eval(&state, &controls, &params)
+            .expect("initial Y2 reference diagnostics");
+        let mut controller_state = ControllerState::<2>::new(&diagnostics);
+        let (_, trace) = controller_step(
+            &mut controller_state,
+            &state,
+            &diagnostics,
+            &params,
+            TEST_DT_CONTROL,
+            PhaseMode::Adaptive,
+            0.0,
+        );
+        apply_trace(&mut diagnostics, &trace);
+
+        let expected_altitude =
+            -params.controller.disk_center_n[2] - params.kites[0].tether.contact.ground_altitude;
+        let expected_speed = params.controller.speed_ref;
+
+        for (index, kite_diag) in diagnostics.kites.iter().enumerate() {
+            let altitude_error = (kite_diag.altitude - kite_diag.altitude_ref).abs();
+            let speed_error = (kite_diag.airspeed - kite_diag.speed_target).abs();
+            let reference_altitude_error = (kite_diag.altitude_ref - expected_altitude).abs();
+            let reference_speed_error = (kite_diag.speed_target - expected_speed).abs();
+
+            assert!(
+                altitude_error < 1.0e-9,
+                "kite {index} initial altitude is not on reference: altitude={:.9}, ref={:.9}, error={altitude_error:e}",
+                kite_diag.altitude,
+                kite_diag.altitude_ref,
+            );
+            assert!(
+                speed_error < 1.0e-6,
+                "kite {index} initial airspeed is not on reference: airspeed={:.9}, ref={:.9}, error={speed_error:e}",
+                kite_diag.airspeed,
+                kite_diag.speed_target,
+            );
+            assert!(
+                reference_altitude_error < 1.0e-9,
+                "kite {index} initial altitude reference is not the disk-center elevation: ref={:.9}, expected={expected_altitude:.9}, error={reference_altitude_error:e}",
+                kite_diag.altitude_ref,
+            );
+            assert!(
+                reference_speed_error < 1.0e-9,
+                "kite {index} initial speed reference is not controller speed_ref: ref={:.9}, expected={expected_speed:.9}, error={reference_speed_error:e}",
+                kite_diag.speed_target,
+            );
+            assert!(
+                kite_diag.alpha.abs().to_degrees() < 1.0e-9,
+                "kite {index} expected zero initial alpha, got {:.9} deg",
+                kite_diag.alpha.to_degrees(),
+            );
+            assert!(
+                kite_diag.beta.abs().to_degrees() < 1.0e-9,
+                "kite {index} expected zero initial beta, got {:.9} deg",
+                kite_diag.beta.to_degrees(),
+            );
         }
     }
 
