@@ -1,0 +1,14 @@
+{
+  "reference_source_commits": {
+    "physics": "78691bbb0",
+    "controller": "e18990d54",
+    "initialization": "e18990d54"
+  },
+  "exports": [
+    {
+      "id": "reference_multikite_export",
+      "path": "reference_export.json",
+      "description": "Rust-native frozen Reference rigid-body, tether, rotor, aero, and controller export used by multikite_sim."
+    }
+  ]
+}

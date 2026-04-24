@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Multikite Sim favicon">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#12263a" />
+      <stop offset="100%" stop-color="#071019" />
+    </linearGradient>
+    <linearGradient id="kite" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#7cecff" />
+      <stop offset="100%" stop-color="#3aa8ff" />
+    </linearGradient>
+    <linearGradient id="flame" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#ffe06b" />
+      <stop offset="60%" stop-color="#ff9850" />
+      <stop offset="100%" stop-color="#ff5b4d" />
+    </linearGradient>
+  </defs>
+
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#bg)" />
+
+  <g transform="translate(31.5 31.5) rotate(-12)">
+    <path
+      d="M0 -19 L14 0 L0 19 L-14 0 Z"
+      fill="url(#kite)"
+      stroke="#d8f9ff"
+      stroke-width="2"
+      stroke-linejoin="round"
+    />
+    <path
+      d="M0 -16 L0 16 M-11 0 L11 0"
+      fill="none"
+      stroke="#eafcff"
+      stroke-width="2.2"
+      stroke-linecap="round"
+      opacity="0.92"
+    />
+
+    <g transform="translate(9.5 7.5) rotate(18)">
+      <path
+        d="M8 0 C13 -2 17 -2 21 0 C17 2 13 2 8 0 Z"
+        fill="url(#flame)"
+        opacity="0.95"
+      />
+      <rect
+        x="-3"
+        y="-4"
+        width="13"
+        height="8"
+        rx="3"
+        fill="#c7d2da"
+        stroke="#eef7fb"
+        stroke-width="1.2"
+      />
+      <circle cx="0" cy="0" r="1.3" fill="#8aa4b8" />
+    </g>
+
+    <path
+      d="M0 19 C-3 23 -5 27 -5 31 C-5 35 -3 38 0 41"
+      fill="none"
+      stroke="#ffcf85"
+      stroke-width="2"
+      stroke-linecap="round"
+      opacity="0.9"
+    />
+    <circle cx="-5.4" cy="28.5" r="1.4" fill="#ffcf85" opacity="0.92" />
+    <circle cx="0.4" cy="36.8" r="1.2" fill="#ffcf85" opacity="0.92" />
+  </g>
+</svg>

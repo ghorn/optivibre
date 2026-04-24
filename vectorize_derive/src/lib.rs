@@ -2,8 +2,8 @@ use proc_macro::TokenStream;
 use proc_macro_crate::{FoundCrate, crate_name};
 use quote::{format_ident, quote};
 use syn::{
-    Data, DeriveInput, Fields, GenericParam, Generics, Ident, Index, Type, parse_macro_input,
-    parse_quote,
+    Data, DeriveInput, Fields, GenericArgument, GenericParam, Generics, Ident, Index,
+    PathArguments, Type, parse_macro_input, parse_quote,
 };
 
 #[proc_macro_derive(Vectorize)]
@@ -70,7 +70,13 @@ fn derive_vectorize_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenSt
             |name| quote!(#name),
         );
         let value_expr = construct_value_expr(&field.ty, &leaf_ident);
-        quote! { #access: #value_expr }
+        let field_rebind_ty = rebind_type(&field.ty, &leaf_ident, &replacement);
+        quote! {
+            #access: {
+                let value: #field_rebind_ty = #value_expr;
+                value
+            }
+        }
     });
     let layout_name_statements = data.fields.iter().enumerate().map(|(index, field)| {
         let component = field
@@ -404,6 +410,20 @@ fn construct_value_expr(ty: &Type, leaf_ident: &Ident) -> proc_macro2::TokenStre
     if let Type::Array(array) = ty {
         let value_expr = construct_value_expr(&array.elem, leaf_ident);
         quote!(::std::array::from_fn(|_| #value_expr))
+    } else if let Type::Path(path) = ty {
+        let ident = &path
+            .path
+            .segments
+            .last()
+            .expect("type path should contain at least one segment")
+            .ident;
+        if ident == "Vector3" {
+            quote!(::nalgebra::Vector3::new(f(), f(), f()))
+        } else if ident == "Quaternion" {
+            quote!(::nalgebra::Quaternion::new(f(), f(), f(), f()))
+        } else {
+            quote!(<#ty>::__vectorize_from_flat::<U>(f))
+        }
     } else {
         quote!(<#ty>::__vectorize_from_flat::<U>(f))
     }
@@ -419,4 +439,31 @@ fn construct_view_expr(ty: &Type, leaf_ident: &Ident) -> proc_macro2::TokenStrea
     }
     let support_crate = support_crate_path().expect("support crate path should resolve");
     quote!(<#ty as #support_crate::Vectorize<#leaf_ident>>::view_from_flat_slice(slice, index))
+}
+
+fn rebind_type(ty: &Type, leaf_ident: &Ident, replacement: &Type) -> Type {
+    match ty {
+        Type::Path(path) if path.qself.is_none() && path.path.is_ident(leaf_ident) => {
+            replacement.clone()
+        }
+        Type::Array(array) => {
+            let mut rebound = array.clone();
+            rebound.elem = Box::new(rebind_type(&array.elem, leaf_ident, replacement));
+            Type::Array(rebound)
+        }
+        Type::Path(path) => {
+            let mut rebound = path.clone();
+            for segment in &mut rebound.path.segments {
+                if let PathArguments::AngleBracketed(arguments) = &mut segment.arguments {
+                    for argument in &mut arguments.args {
+                        if let GenericArgument::Type(argument_ty) = argument {
+                            *argument_ty = rebind_type(argument_ty, leaf_ident, replacement);
+                        }
+                    }
+                }
+            }
+            Type::Path(rebound)
+        }
+        _ => ty.clone(),
+    }
 }

@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#081018" />
+    <title>Multikite Sim</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css" />
+    <script>
+      window.MathJax = {
+        tex: {
+          inlineMath: [["\\(", "\\)"]],
+          displayMath: [["\\[", "\\]"]]
+        },
+        svg: {
+          fontCache: "global"
+        },
+        startup: {
+          ready() {
+            MathJax.startup.defaultReady();
+            window.dispatchEvent(new Event("mathjax-ready"));
+          }
+        }
+      };
+    </script>
+    <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+    <script
+      defer
+      src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"
+      onload="window.dispatchEvent(new Event('mermaid-ready'))"
+    ></script>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.179.1/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.179.1/examples/jsm/"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <main class="layout">
+      <section class="panel controls">
+        <h1>Multikite Sim</h1>
+        <form id="run-form">
+          <label>
+            Preset
+            <select id="preset"></select>
+          </label>
+          <label>
+            Duration (s)
+            <input id="duration" type="number" min="1" step="1" value="10" />
+          </label>
+          <label>
+            Phase Mode
+            <select id="phase-mode">
+              <option value="adaptive">Adaptive</option>
+              <option value="open_loop">Open Loop</option>
+            </select>
+          </label>
+          <label>
+            Payload (kg)
+            <input id="payload-mass" type="number" min="1" step="1" value="100" />
+          </label>
+          <label>
+            Wind (m/s)
+            <input id="wind-speed" type="number" min="0" step="0.5" value="5" />
+          </label>
+          <label>
+            Time Dilation
+            <select id="time-dilation">
+              <option value="fast">Fast as possible</option>
+              <option value="1">1x</option>
+              <option value="0.5">0.5x</option>
+              <option value="0.1">0.1x</option>
+            </select>
+          </label>
+          <div class="form-section">
+            <div class="form-section-title">View Follow</div>
+            <label>
+              Camera Target
+              <select id="camera-follow-target">
+                <option value="manual">Manual</option>
+                <option value="disk_center">Disk Center</option>
+              </select>
+            </label>
+            <label class="checkbox-label">
+              <input id="camera-follow-yaw" type="checkbox" />
+              <span>Follow Kite Yaw</span>
+            </label>
+          </div>
+          <button id="run-button" type="submit">Run</button>
+        </form>
+        <div id="failure-pill" class="failure-pill"></div>
+        <section class="summary">
+          <h2>Summary</h2>
+          <div id="summary"></div>
+        </section>
+      </section>
+      <section class="panel scene">
+        <div id="viewport"></div>
+      </section>
+      <section class="panel runtime-panel">
+        <div class="runtime-tabs" role="tablist" aria-label="Run output">
+          <button id="runtime-tab-console" class="runtime-tab active" type="button">Console Log</button>
+          <button id="runtime-tab-plots" class="runtime-tab" type="button">Plots</button>
+        </div>
+        <div id="runtime-console-view" class="runtime-view active">
+          <pre id="console"></pre>
+        </div>
+        <div id="runtime-plots-view" class="runtime-view">
+          <div id="plots"></div>
+        </div>
+      </section>
+      <section class="panel docs-panel">
+        <div class="docs-head">
+          <div class="docs-eyebrow">Controller Math</div>
+          <h2>Control Laws</h2>
+          <div class="docs-subtitle">Rendered from the current Rust implementation, not the historical intent.</div>
+        </div>
+        <div id="controller-docs"></div>
+      </section>
+    </main>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
