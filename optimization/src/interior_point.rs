@@ -801,11 +801,23 @@ pub struct InteriorPointIterationSnapshot {
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub kkt_inequality_residual: Option<Vec<f64>>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub kkt_x_stationarity: Option<Vec<f64>>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub kkt_slack_stationarity: Option<Vec<f64>>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub kkt_slack_complementarity: Option<Vec<f64>>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub kkt_slack_sigma: Option<Vec<f64>>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub curr_grad_f: Option<Vec<f64>>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub curr_jac_c_t_y_c: Option<Vec<f64>>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub curr_jac_d_t_y_d: Option<Vec<f64>>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub curr_grad_lag_x: Option<Vec<f64>>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub curr_grad_lag_s: Option<Vec<f64>>,
     pub objective: f64,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub barrier_objective: Option<f64>,
@@ -814,6 +826,14 @@ pub struct InteriorPointIterationSnapshot {
     pub dual_inf: f64,
     pub comp_inf: Option<f64>,
     pub overall_inf: f64,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub barrier_primal_inf: Option<f64>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub barrier_dual_inf: Option<f64>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub barrier_complementarity_inf: Option<f64>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub barrier_subproblem_error: Option<f64>,
     pub barrier_parameter: Option<f64>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub filter_theta: Option<f64>,
@@ -823,6 +843,8 @@ pub struct InteriorPointIterationSnapshot {
     pub alpha_pr: Option<f64>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub alpha_du: Option<f64>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub alpha_y: Option<f64>,
     pub line_search_iterations: Option<Index>,
     pub line_search_trials: Index,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
@@ -984,12 +1006,18 @@ pub struct InteriorPointLineSearchInfo {
     pub initial_alpha_pr: f64,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub initial_alpha_du: Option<f64>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub initial_alpha_y: Option<f64>,
     pub accepted_alpha: Option<f64>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub accepted_alpha_du: Option<f64>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub accepted_alpha_y: Option<f64>,
     pub last_tried_alpha: f64,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub last_tried_alpha_du: Option<f64>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub last_tried_alpha_y: Option<f64>,
     pub backtrack_count: Index,
     pub sigma: f64,
     pub current_merit: f64,
@@ -1063,6 +1091,7 @@ struct NewtonDirection {
     dual_regularization_used: f64,
     primal_diagonal_shift_used: f64,
     linear_solution: Vec<f64>,
+    linear_trace: Option<IpoptLinearSolveTrace>,
     backend_stats: LinearBackendRunStats,
     linear_debug: Option<InteriorPointLinearDebugReport>,
 }
@@ -1076,9 +1105,15 @@ struct AcceptedInteriorPointTrial {
     z_lower: Vec<f64>,
     z_upper: Vec<f64>,
     kkt_inequality_residual: Vec<f64>,
+    kkt_x_stationarity: Vec<f64>,
     kkt_slack_stationarity: Vec<f64>,
     kkt_slack_complementarity: Vec<f64>,
     kkt_slack_sigma: Vec<f64>,
+    curr_grad_f: Vec<f64>,
+    curr_jac_c_t_y_c: Vec<f64>,
+    curr_jac_d_t_y_d: Vec<f64>,
+    curr_grad_lag_x: Vec<f64>,
+    curr_grad_lag_s: Vec<f64>,
     objective: f64,
     barrier_objective: f64,
     equality_inf: f64,
@@ -1086,6 +1121,10 @@ struct AcceptedInteriorPointTrial {
     dual_inf: f64,
     complementarity_inf: f64,
     overall_inf: f64,
+    barrier_primal_inf: f64,
+    barrier_dual_inf: f64,
+    barrier_complementarity_inf: f64,
+    barrier_subproblem_error: f64,
     mu: f64,
     filter_entry: super::FilterEntry,
     filter_augment_entry: Option<super::FilterEntry>,
@@ -1097,10 +1136,13 @@ struct AcceptedInteriorPointTrial {
     phase: InteriorPointIterationPhase,
     accepted_alpha_pr: f64,
     accepted_alpha_du: Option<f64>,
+    accepted_alpha_y: Option<f64>,
     line_search_initial_alpha_pr: f64,
     line_search_initial_alpha_du: Option<f64>,
+    line_search_initial_alpha_y: Option<f64>,
     line_search_last_alpha_pr: f64,
     line_search_last_alpha_du: Option<f64>,
+    line_search_last_alpha_y: Option<f64>,
     line_search_backtrack_count: Index,
     second_order_correction_used: bool,
     watchdog_accepted: bool,
@@ -1820,6 +1862,7 @@ struct InteriorPointKktSnapshot {
     primary_solver: InteriorPointLinearSolver,
     matrix_dimension: usize,
     x_dimension: usize,
+    x_full_indices: Vec<usize>,
     equality_dimension: usize,
     inequality_dimension: usize,
     hessian: SparseSymmetricMatrix,
@@ -1880,6 +1923,23 @@ struct SpralSrcFullSpaceSolution {
     lower_bound_multiplier_step: Vec<f64>,
     upper_bound_multiplier_step: Vec<f64>,
     upper_slack_multiplier_step: Vec<f64>,
+}
+
+#[derive(Clone, Debug)]
+struct IpoptLinearSolveTrace {
+    rhs_prefinal: Vec<f64>,
+    solution_prefinal_unrefined: Vec<f64>,
+    refinement_steps: Vec<IpoptLinearRefinementStepTrace>,
+}
+
+#[derive(Clone, Debug)]
+struct IpoptLinearRefinementStepTrace {
+    correction_rhs: Vec<f64>,
+    correction_solution: Vec<f64>,
+    solution_prefinal_after: Vec<f64>,
+    full_residual: Option<IpoptFullSpaceResidualTrace>,
+    residual_ratio_before: f64,
+    residual_ratio_after: f64,
 }
 
 struct InteriorPointLinearDebugState {
@@ -2218,6 +2278,10 @@ fn build_interior_point_kkt_snapshot(
         primary_solver,
         matrix_dimension: pattern.dimension(),
         x_dimension: n,
+        x_full_indices: system.bound_data.map_or_else(
+            || (0..n).collect(),
+            |bound_data| bound_data.fixed_variables.free_indices.clone(),
+        ),
         equality_dimension: meq,
         inequality_dimension: mineq,
         hessian: system.hessian.clone(),
@@ -2401,6 +2465,7 @@ fn newton_direction_from_augmented_solution(
         dual_regularization_used: snapshot.dual_regularization,
         primal_diagonal_shift_used: snapshot.primal_diagonal_shift,
         linear_solution: solution,
+        linear_trace: None,
         backend_stats,
         linear_debug: None,
     }
@@ -2525,11 +2590,12 @@ fn replay_snapshot_with_solver(
                     rhs_orientation: IpoptLinearRhsOrientation::PreFinal,
                     allow_inexact: false,
                     native_spral_quality_was_increased: false,
+                    capture_trace: false,
                 },
                 &mut scratch_profiling,
                 false,
             )
-            .map(|(solution, backend_stats)| {
+            .map(|(solution, _linear_trace, backend_stats)| {
                 newton_direction_from_augmented_solution(
                     snapshot,
                     solver,
@@ -2778,12 +2844,14 @@ fn dump_linear_debug_snapshot(
         body.push_str(&format!("note={note}\n"));
     }
     body.push_str(&format!(
-        "col_ptrs={:?}\nrow_indices={:?}\nvalues={:?}\nrhs={:?}\nr_dual={:?}\nbound_rhs={:?}\nslack={:?}\nmultipliers={:?}\n",
+        "x_full_indices={:?}\ncol_ptrs={:?}\nrow_indices={:?}\nvalues={:?}\nrhs={:?}\nr_dual={:?}\nbound_diagonal={:?}\nbound_rhs={:?}\nslack={:?}\nmultipliers={:?}\n",
+        snapshot.x_full_indices,
         snapshot.augmented_pattern.ccs.col_ptrs,
         snapshot.augmented_pattern.ccs.row_indices,
         snapshot.augmented_values,
         snapshot.augmented_rhs,
         snapshot.r_dual,
+        snapshot.bound_diagonal,
         snapshot.bound_rhs,
         snapshot.slack,
         snapshot.multipliers,
@@ -2803,6 +2871,207 @@ fn dump_linear_debug_snapshot(
             "linear_solution_final={:?}\nlinear_solution_prefinal={:?}\n",
             direction.linear_solution, prefinal_solution,
         ));
+        if let Some(trace) = direction.linear_trace.as_ref() {
+            let refinement_rhs = trace
+                .refinement_steps
+                .iter()
+                .map(|step| step.correction_rhs.clone())
+                .collect::<Vec<_>>();
+            let refinement_solution = trace
+                .refinement_steps
+                .iter()
+                .map(|step| step.correction_solution.clone())
+                .collect::<Vec<_>>();
+            let refinement_accumulated_solution = trace
+                .refinement_steps
+                .iter()
+                .map(|step| step.solution_prefinal_after.clone())
+                .collect::<Vec<_>>();
+            let refinement_residual_ratios = trace
+                .refinement_steps
+                .iter()
+                .map(|step| [step.residual_ratio_before, step.residual_ratio_after])
+                .collect::<Vec<_>>();
+            let refinement_residual_x = trace
+                .refinement_steps
+                .iter()
+                .filter_map(|step| {
+                    step.full_residual
+                        .as_ref()
+                        .map(|residual| residual.x.clone())
+                })
+                .collect::<Vec<_>>();
+            let refinement_residual_x_after_w = trace
+                .refinement_steps
+                .iter()
+                .filter_map(|step| {
+                    step.full_residual
+                        .as_ref()
+                        .map(|residual| residual.x_after_w.clone())
+                })
+                .collect::<Vec<_>>();
+            let refinement_residual_x_after_jc = trace
+                .refinement_steps
+                .iter()
+                .filter_map(|step| {
+                    step.full_residual
+                        .as_ref()
+                        .map(|residual| residual.x_after_jc.clone())
+                })
+                .collect::<Vec<_>>();
+            let refinement_residual_x_after_jd = trace
+                .refinement_steps
+                .iter()
+                .filter_map(|step| {
+                    step.full_residual
+                        .as_ref()
+                        .map(|residual| residual.x_after_jd.clone())
+                })
+                .collect::<Vec<_>>();
+            let refinement_residual_x_after_pxl = trace
+                .refinement_steps
+                .iter()
+                .filter_map(|step| {
+                    step.full_residual
+                        .as_ref()
+                        .map(|residual| residual.x_after_pxl.clone())
+                })
+                .collect::<Vec<_>>();
+            let refinement_residual_x_after_pxu = trace
+                .refinement_steps
+                .iter()
+                .filter_map(|step| {
+                    step.full_residual
+                        .as_ref()
+                        .map(|residual| residual.x_after_pxu.clone())
+                })
+                .collect::<Vec<_>>();
+            let refinement_residual_x_after_add_two_vectors = trace
+                .refinement_steps
+                .iter()
+                .filter_map(|step| {
+                    step.full_residual
+                        .as_ref()
+                        .map(|residual| residual.x_after_add_two_vectors.clone())
+                })
+                .collect::<Vec<_>>();
+            let refinement_residual_s = trace
+                .refinement_steps
+                .iter()
+                .filter_map(|step| {
+                    step.full_residual
+                        .as_ref()
+                        .map(|residual| residual.s.clone())
+                })
+                .collect::<Vec<_>>();
+            let refinement_residual_s_after_pdu = trace
+                .refinement_steps
+                .iter()
+                .filter_map(|step| {
+                    step.full_residual
+                        .as_ref()
+                        .map(|residual| residual.s_after_pdu.clone())
+                })
+                .collect::<Vec<_>>();
+            let refinement_residual_s_after_pdl = trace
+                .refinement_steps
+                .iter()
+                .filter_map(|step| {
+                    step.full_residual
+                        .as_ref()
+                        .map(|residual| residual.s_after_pdl.clone())
+                })
+                .collect::<Vec<_>>();
+            let refinement_residual_s_after_add_two_vectors = trace
+                .refinement_steps
+                .iter()
+                .filter_map(|step| {
+                    step.full_residual
+                        .as_ref()
+                        .map(|residual| residual.s_after_add_two_vectors.clone())
+                })
+                .collect::<Vec<_>>();
+            let refinement_residual_s_after_delta = trace
+                .refinement_steps
+                .iter()
+                .filter_map(|step| {
+                    step.full_residual
+                        .as_ref()
+                        .map(|residual| residual.s_after_delta.clone())
+                })
+                .collect::<Vec<_>>();
+            let refinement_residual_c = trace
+                .refinement_steps
+                .iter()
+                .filter_map(|step| {
+                    step.full_residual
+                        .as_ref()
+                        .map(|residual| residual.c.clone())
+                })
+                .collect::<Vec<_>>();
+            let refinement_residual_d = trace
+                .refinement_steps
+                .iter()
+                .filter_map(|step| {
+                    step.full_residual
+                        .as_ref()
+                        .map(|residual| residual.d.clone())
+                })
+                .collect::<Vec<_>>();
+            let refinement_residual_z_lower = trace
+                .refinement_steps
+                .iter()
+                .filter_map(|step| {
+                    step.full_residual
+                        .as_ref()
+                        .map(|residual| residual.z_lower.clone())
+                })
+                .collect::<Vec<_>>();
+            let refinement_residual_z_upper = trace
+                .refinement_steps
+                .iter()
+                .filter_map(|step| {
+                    step.full_residual
+                        .as_ref()
+                        .map(|residual| residual.z_upper.clone())
+                })
+                .collect::<Vec<_>>();
+            let refinement_residual_v_upper = trace
+                .refinement_steps
+                .iter()
+                .filter_map(|step| {
+                    step.full_residual
+                        .as_ref()
+                        .map(|residual| residual.v_upper.clone())
+                })
+                .collect::<Vec<_>>();
+            body.push_str(&format!(
+                "linear_trace_rhs_prefinal={:?}\nlinear_trace_solution_prefinal_unrefined={:?}\nlinear_trace_refinement_rhs={:?}\nlinear_trace_refinement_solution={:?}\nlinear_trace_refinement_accumulated_solution={:?}\nlinear_trace_refinement_residual_ratios={:?}\nlinear_trace_refinement_residual_x={:?}\nlinear_trace_refinement_residual_x_after_w={:?}\nlinear_trace_refinement_residual_x_after_jc={:?}\nlinear_trace_refinement_residual_x_after_jd={:?}\nlinear_trace_refinement_residual_x_after_pxl={:?}\nlinear_trace_refinement_residual_x_after_pxu={:?}\nlinear_trace_refinement_residual_x_after_add_two_vectors={:?}\nlinear_trace_refinement_residual_s={:?}\nlinear_trace_refinement_residual_s_after_pdu={:?}\nlinear_trace_refinement_residual_s_after_pdl={:?}\nlinear_trace_refinement_residual_s_after_add_two_vectors={:?}\nlinear_trace_refinement_residual_s_after_delta={:?}\nlinear_trace_refinement_residual_c={:?}\nlinear_trace_refinement_residual_d={:?}\nlinear_trace_refinement_residual_z_lower={:?}\nlinear_trace_refinement_residual_z_upper={:?}\nlinear_trace_refinement_residual_v_upper={:?}\n",
+                trace.rhs_prefinal,
+                trace.solution_prefinal_unrefined,
+                refinement_rhs,
+                refinement_solution,
+                refinement_accumulated_solution,
+                refinement_residual_ratios,
+                refinement_residual_x,
+                refinement_residual_x_after_w,
+                refinement_residual_x_after_jc,
+                refinement_residual_x_after_jd,
+                refinement_residual_x_after_pxl,
+                refinement_residual_x_after_pxu,
+                refinement_residual_x_after_add_two_vectors,
+                refinement_residual_s,
+                refinement_residual_s_after_pdu,
+                refinement_residual_s_after_pdl,
+                refinement_residual_s_after_add_two_vectors,
+                refinement_residual_s_after_delta,
+                refinement_residual_c,
+                refinement_residual_d,
+                refinement_residual_z_lower,
+                refinement_residual_z_upper,
+                refinement_residual_v_upper,
+            ));
+        }
     }
     let _ = fs::write(path, body);
 }
@@ -3137,7 +3406,7 @@ fn ipopt_prefinal_upper_slack_bound_multiplier_step(
 ) -> f64 {
     // Mirrors IPOPT PDFullSpaceSolver::SolveOnce Pd_U.SinvBlrmZMTdBr(1., ...)
     // before PDSearchDirCalc's final Solve(-1., 0., ...) scaling.
-    (complementarity_residual + multiplier * ipopt_internal_slack_step) / slack
+    multiplier.mul_add(ipopt_internal_slack_step, complementarity_residual) / slack
 }
 
 fn ipopt_oriented_upper_slack_bound_multiplier_step(
@@ -3149,7 +3418,7 @@ fn ipopt_oriented_upper_slack_bound_multiplier_step(
     // Mirrors ExpansionMatrix::SinvBlrmZMTdBrImpl for the upper slack block:
     // X[i] = (R[i] + Z[i] * D[exp_pos[i]]) / S[i].  The caller passes R and D
     // in the same orientation as the current PDFullSpaceSolver rhs/res vector.
-    (oriented_complementarity_rhs + multiplier * oriented_slack_step) / slack
+    multiplier.mul_add(oriented_slack_step, oriented_complementarity_rhs) / slack
 }
 
 fn ipopt_oriented_lower_bound_multiplier_step(
@@ -3160,7 +3429,7 @@ fn ipopt_oriented_lower_bound_multiplier_step(
 ) -> f64 {
     // Mirrors IPOPT PDFullSpaceSolver::SolveOnce:
     // Px_L.SinvBlrmZMTdBr(-1., slack_x_L, rhs.z_L, z_L, sol.x, sol.z_L).
-    (oriented_complementarity_rhs - multiplier * oriented_primal_step) / slack
+    (-multiplier).mul_add(oriented_primal_step, oriented_complementarity_rhs) / slack
 }
 
 fn ipopt_oriented_upper_bound_multiplier_step(
@@ -3171,7 +3440,7 @@ fn ipopt_oriented_upper_bound_multiplier_step(
 ) -> f64 {
     // Mirrors IPOPT PDFullSpaceSolver::SolveOnce:
     // Px_U.SinvBlrmZMTdBr(1., slack_x_U, rhs.z_U, z_U, sol.x, sol.z_U).
-    (oriented_complementarity_rhs + multiplier * oriented_primal_step) / slack
+    multiplier.mul_add(oriented_primal_step, oriented_complementarity_rhs) / slack
 }
 
 fn ipopt_bound_multiplier_steps_for_orientation(
@@ -3743,8 +4012,9 @@ fn ipopt_dense_frac_to_bound_candidate(tau: f64, value: f64, delta: f64) -> f64 
 fn ipopt_dense_current_plus_step(value: f64, alpha: f64, delta: f64) -> f64 {
     // IpIpoptData.cpp::SetTrial*FromStep calls DenseVector::AddTwoVectors
     // with a=1, b=alpha, c=0. IpDenseVector.cpp special-cases b before
-    // falling back to `value + alpha * delta`; mirror those branches to avoid
-    // an extra multiply by exactly +/-1 on accepted full steps.
+    // falling back to `value + alpha * delta`. The source-built IPOPT C++ path
+    // contracts that general multiply-add, while the exact alpha==0/1/-1
+    // branches are plain copies/adds/subtracts.
     if alpha == 0.0 {
         value
     } else if alpha == 1.0 {
@@ -3752,7 +4022,23 @@ fn ipopt_dense_current_plus_step(value: f64, alpha: f64, delta: f64) -> f64 {
     } else if alpha == -1.0 {
         value - delta
     } else {
-        value + alpha * delta
+        alpha.mul_add(delta, value)
+    }
+}
+
+fn ipopt_soc_constraint_accumulator(trial: f64, alpha: f64, previous: f64) -> f64 {
+    // IpFilterLSAcceptor::TrySecondOrderCorrection calls
+    // c_soc->AddOneVector(1.0, trial, alpha), starting from the previous
+    // SOC accumulator. DenseVector keeps exact alpha branches before the
+    // general fused multiply-add path.
+    if alpha == 0.0 {
+        trial
+    } else if alpha == 1.0 {
+        ipopt_blas_axpy_value(previous, 1.0, trial)
+    } else if alpha == -1.0 {
+        trial - previous
+    } else {
+        alpha.mul_add(previous, trial)
     }
 }
 
@@ -3916,6 +4202,137 @@ fn add_native_bound_multiplier_terms(
     for (&index, &z_i) in bounds.upper_indices.iter().zip(z_upper.iter()) {
         residual[index] += z_i;
     }
+}
+
+fn add_native_bound_damping_terms(
+    residual: &mut [f64],
+    bounds: &BoundConstraints,
+    barrier_parameter: f64,
+    kappa_d: f64,
+) {
+    let damping = positive_slack_damping(barrier_parameter, kappa_d);
+    if damping == 0.0 {
+        return;
+    }
+    // Mirrors IpoptCalculatedQuantities::curr_grad_lag_with_damping_x:
+    // Px_L adds kappa_d*mu for lower-only bounds, then Px_U adds
+    // -kappa_d*mu for upper-only bounds. Two-sided relaxed bounds cancel in
+    // IPOPT's damping indicators and receive no x damping.
+    for &index in bounds
+        .lower_indices
+        .iter()
+        .filter(|index| !bounds.upper_indices.contains(index))
+    {
+        residual[index] += damping;
+    }
+    for &index in bounds
+        .upper_indices
+        .iter()
+        .filter(|index| !bounds.lower_indices.contains(index))
+    {
+        residual[index] -= damping;
+    }
+}
+
+fn damped_lagrangian_gradient_x(
+    lagrangian_gradient_x: &[f64],
+    bounds: &BoundConstraints,
+    barrier_parameter: f64,
+    kappa_d: f64,
+) -> Vec<f64> {
+    let mut result = lagrangian_gradient_x.to_vec();
+    add_native_bound_damping_terms(&mut result, bounds, barrier_parameter, kappa_d);
+    result
+}
+
+fn lagrangian_gradient_x_with_bound_terms(
+    raw_lagrangian_gradient_x: &[f64],
+    bounds: &BoundConstraints,
+    z_lower: &[f64],
+    z_upper: &[f64],
+) -> Vec<f64> {
+    let mut result = raw_lagrangian_gradient_x.to_vec();
+    add_native_bound_multiplier_terms(&mut result, bounds, z_lower, z_upper);
+    result
+}
+
+fn damped_lagrangian_gradient_x_with_bound_terms(
+    raw_lagrangian_gradient_x: &[f64],
+    bounds: &BoundConstraints,
+    z_lower: &[f64],
+    z_upper: &[f64],
+    barrier_parameter: f64,
+    kappa_d: f64,
+) -> Vec<f64> {
+    let mut result =
+        lagrangian_gradient_x_with_bound_terms(raw_lagrangian_gradient_x, bounds, z_lower, z_upper);
+    add_native_bound_damping_terms(&mut result, bounds, barrier_parameter, kappa_d);
+    result
+}
+
+fn zero_fixed_entries(values: &mut [f64], fixed_variables: &FixedVariableElimination) {
+    if !fixed_variables.has_fixed() {
+        return;
+    }
+    for &index in &fixed_variables.fixed_indices {
+        values[index] = 0.0;
+    }
+}
+
+fn snapshot_x_component_vector(
+    values: &[f64],
+    fixed_variables: &FixedVariableElimination,
+) -> Vec<f64> {
+    let mut result = values.to_vec();
+    zero_fixed_entries(&mut result, fixed_variables);
+    result
+}
+
+fn snapshot_lagrangian_gradient_x_with_bound_terms(
+    raw_lagrangian_gradient_x: &[f64],
+    bounds: &BoundConstraints,
+    fixed_variables: &FixedVariableElimination,
+    z_lower: &[f64],
+    z_upper: &[f64],
+) -> Vec<f64> {
+    let mut result =
+        lagrangian_gradient_x_with_bound_terms(raw_lagrangian_gradient_x, bounds, z_lower, z_upper);
+    zero_fixed_entries(&mut result, fixed_variables);
+    result
+}
+
+fn snapshot_damped_lagrangian_gradient_x(
+    lagrangian_gradient_x: &[f64],
+    bounds: &BoundConstraints,
+    fixed_variables: &FixedVariableElimination,
+    barrier_parameter: f64,
+    kappa_d: f64,
+) -> Vec<f64> {
+    let mut result =
+        damped_lagrangian_gradient_x(lagrangian_gradient_x, bounds, barrier_parameter, kappa_d);
+    zero_fixed_entries(&mut result, fixed_variables);
+    result
+}
+
+fn snapshot_damped_lagrangian_gradient_x_with_bound_terms(
+    raw_lagrangian_gradient_x: &[f64],
+    bounds: &BoundConstraints,
+    fixed_variables: &FixedVariableElimination,
+    z_lower: &[f64],
+    z_upper: &[f64],
+    barrier_parameter: f64,
+    kappa_d: f64,
+) -> Vec<f64> {
+    let mut result = damped_lagrangian_gradient_x_with_bound_terms(
+        raw_lagrangian_gradient_x,
+        bounds,
+        z_lower,
+        z_upper,
+        barrier_parameter,
+        kappa_d,
+    );
+    zero_fixed_entries(&mut result, fixed_variables);
+    result
 }
 
 #[expect(
@@ -4100,6 +4517,47 @@ fn combined_complementarity_target_inf_norm(
         })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "IPOPT barrier-error scaling depends on every multiplier block."
+)]
+fn barrier_subproblem_error_components(
+    primal_inf: f64,
+    dual_inf: f64,
+    slack: &[f64],
+    z: &[f64],
+    x: &[f64],
+    bounds: &BoundConstraints,
+    z_lower: &[f64],
+    z_upper: &[f64],
+    lambda_eq: &[f64],
+    lambda_ineq: &[f64],
+    barrier_parameter: f64,
+    options: &InteriorPointOptions,
+) -> (f64, f64) {
+    let complementarity_inf = combined_complementarity_target_inf_norm(
+        slack,
+        z,
+        x,
+        bounds,
+        z_lower,
+        z_upper,
+        barrier_parameter,
+    );
+    let all_dual_multipliers =
+        ipopt_all_dual_multiplier_vector(lambda_eq, lambda_ineq, z_lower, z_upper, z);
+    let complementarity_multipliers = ipopt_complementarity_multiplier_vector(z_lower, z_upper, z);
+    let error = scaled_overall_inf_norm(
+        primal_inf,
+        dual_inf,
+        complementarity_inf,
+        &all_dual_multipliers,
+        &complementarity_multipliers,
+        options.overall_scale_max,
+    );
+    (complementarity_inf, error)
+}
+
 fn combined_multiplier_vector<'a>(slices: impl IntoIterator<Item = &'a [f64]>) -> Vec<f64> {
     slices
         .into_iter()
@@ -4159,14 +4617,16 @@ fn correct_bound_multiplier_estimate(
         // IPOPT `IpoptAlgorithm::correct_bound_multiplier` computes a
         // correction vector using one_over_s, then adds the negative/positive
         // correction back to z.  Preserve that order instead of assigning the
-        // mathematically equivalent clamp endpoints directly.
+        // mathematically equivalent clamp endpoints directly. The correction
+        // vector is built through DenseVector::AddTwoVectors, so the native C++
+        // build contracts the multiply-subtract in the general branch.
         let one_over_s = 1.0 / *slack_i;
-        let step_to_upper = upper_complementarity * one_over_s - *z_i;
+        let step_to_upper = upper_complementarity.mul_add(one_over_s, -*z_i);
         let max_correction_up = (-step_to_upper).max(0.0);
         if step_to_upper < 0.0 {
             *z_i += step_to_upper;
         }
-        let step_to_lower = lower_complementarity * one_over_s - *z_i;
+        let step_to_lower = lower_complementarity.mul_add(one_over_s, -*z_i);
         let max_correction_low = step_to_lower.max(0.0);
         if step_to_lower > 0.0 {
             *z_i += step_to_lower;
@@ -4561,12 +5021,12 @@ fn sparse_add_transpose_mat_vec_ipopt_order(
     debug_assert_eq!(matrix.nrows(), vector.len());
     debug_assert_eq!(matrix.ncols(), out.len());
     // IpGenTMatrix.cpp::TransMultVectorImpl accumulates directly into y in
-    // the stored triplet order.  The source-built parity path receives the
-    // same column-major triplets from ccs_triplet_indices, so avoid changing
-    // rounding by first reducing each column into a temporary dot product.
+    // the stored triplet order.  The observed source-built IPOPT C++ path contracts
+    // `y += value * x` to FMA, so use `mul_add` in this IPOPT-parity helper.
     for (col, out_col) in out.iter_mut().enumerate().take(matrix.ncols()) {
         for index in matrix.structure.ccs.col_ptrs[col]..matrix.structure.ccs.col_ptrs[col + 1] {
-            *out_col += matrix.values[index] * vector[matrix.structure.ccs.row_indices[index]];
+            *out_col = matrix.values[index]
+                .mul_add(vector[matrix.structure.ccs.row_indices[index]], *out_col);
         }
     }
 }
@@ -4589,10 +5049,12 @@ fn sparse_mat_vec_ipopt_order(matrix: &SparseMatrix, vector: &[f64]) -> Vec<f64>
     debug_assert_eq!(matrix.ncols(), vector.len());
     let mut product = vec![0.0; matrix.nrows()];
     // IpGenTMatrix.cpp::MultVectorImpl visits every stored nonzero in triplet
-    // order, even when the corresponding dense-vector entry is exactly zero.
+    // order, even when the corresponding dense-vector entry is exactly zero,
+    // and the observed source-built IPOPT C++ path contracts the multiply-add.
     for (col, &x) in vector.iter().enumerate().take(matrix.ncols()) {
         for index in matrix.structure.ccs.col_ptrs[col]..matrix.structure.ccs.col_ptrs[col + 1] {
-            product[matrix.structure.ccs.row_indices[index]] += matrix.values[index] * x;
+            let row = matrix.structure.ccs.row_indices[index];
+            product[row] = matrix.values[index].mul_add(x, product[row]);
         }
     }
     product
@@ -4618,6 +5080,75 @@ fn symmetric_ccs_lower_mat_vec(ccs: &CCS, values: &[f64], vector: &[f64]) -> Vec
         }
     }
     product
+}
+
+fn symmetric_ccs_lower_mat_vec_ipopt_order(ccs: &CCS, values: &[f64], vector: &[f64]) -> Vec<f64> {
+    debug_assert_eq!(ccs.nrow, ccs.ncol);
+    debug_assert_eq!(ccs.nrow, vector.len());
+    debug_assert_eq!(ccs.nnz(), values.len());
+    let mut product = vec![0.0; ccs.nrow];
+    // IpSymTMatrix.cpp::MultVectorImpl traverses the lower-triangular triplets
+    // in storage order and accumulates directly into the dense output.  The
+    // full-space residual replay uses the alpha=1 branch, so the source
+    // expression reduces to `y += value * x` for each diagonal and mirrored
+    // off-diagonal contribution.
+    for col in 0..ccs.ncol {
+        let x_col = vector[col];
+        let start = ccs.col_ptrs[col];
+        let end = ccs.col_ptrs[col + 1];
+        for (&row, &value) in ccs.row_indices[start..end]
+            .iter()
+            .zip(values[start..end].iter())
+        {
+            product[row] = value.mul_add(x_col, product[row]);
+            if row != col {
+                product[col] = value.mul_add(vector[row], product[col]);
+            }
+        }
+    }
+    product
+}
+
+fn ipopt_add_delta_minus_rhs(values: &mut [f64], delta_scale: f64, delta: &[f64], rhs: &[f64]) {
+    debug_assert_eq!(values.len(), delta.len());
+    debug_assert_eq!(values.len(), rhs.len());
+
+    // Mirror IpDenseVector.cpp::AddTwoVectorsImpl for c=1, b=-1. IPOPT takes
+    // a BLAS axpy branch when a==0, so the delta vector is not evaluated. In
+    // the general source-built C++ branch, `a * v1 - v2` is contracted before
+    // adding into the destination.
+    if delta_scale == 0.0 {
+        for (value, rhs_i) in values.iter_mut().zip(rhs.iter()) {
+            *value -= *rhs_i;
+        }
+    } else {
+        for ((value, delta_i), rhs_i) in values.iter_mut().zip(delta.iter()).zip(rhs.iter()) {
+            *value += delta_scale.mul_add(*delta_i, -*rhs_i);
+        }
+    }
+}
+
+fn ipopt_blas_axpy_value(value: f64, alpha: f64, delta: f64) -> f64 {
+    // DenseVector::AxpyImpl dispatches to IpBlasAxpy for dense vectors on this
+    // path. The source-built BLAS DAXPY contracts the multiply-add; keep the
+    // alpha==0 branch inactive just as IPOPT skips perturbation Axpy calls.
+    if alpha == 0.0 {
+        value
+    } else {
+        alpha.mul_add(delta, value)
+    }
+}
+
+fn ipopt_lower_bound_residual_z(slack: f64, dz: f64, z: f64, dx: f64, rhs_z: f64) -> f64 {
+    let mut residual = slack * dz;
+    residual += z * dx - rhs_z;
+    residual
+}
+
+fn ipopt_upper_bound_residual_z(slack: f64, dz: f64, z: f64, dx: f64, rhs_z: f64) -> f64 {
+    let mut residual = slack * dz;
+    residual += -(z * dx) - rhs_z;
+    residual
 }
 
 fn symmetric_ccs_lower_abs_mat_vec(ccs: &CCS, values: &[f64], vector_abs: &[f64]) -> Vec<f64> {
@@ -4805,6 +5336,53 @@ fn build_spral_augmented_kkt_pattern(
     })
 }
 
+#[derive(Clone, Debug)]
+struct LagrangianGradientComponents {
+    curr_grad_f: Vec<f64>,
+    curr_jac_c_t_y_c: Vec<f64>,
+    curr_jac_d_t_y_d: Vec<f64>,
+    curr_grad_lag_x: Vec<f64>,
+}
+
+fn lagrangian_gradient_components(
+    gradient: &[f64],
+    equality_jacobian: &SparseMatrix,
+    equality_multipliers: &[f64],
+    inequality_jacobian: &SparseMatrix,
+    inequality_multipliers: &[f64],
+) -> LagrangianGradientComponents {
+    let curr_grad_f = gradient.to_vec();
+    let mut curr_jac_c_t_y_c = vec![0.0; gradient.len()];
+    let mut curr_jac_d_t_y_d = vec![0.0; gradient.len()];
+    sparse_add_transpose_mat_vec_ipopt_order(
+        &mut curr_jac_c_t_y_c,
+        equality_jacobian,
+        equality_multipliers,
+    );
+    sparse_add_transpose_mat_vec_ipopt_order(
+        &mut curr_jac_d_t_y_d,
+        inequality_jacobian,
+        inequality_multipliers,
+    );
+    // Mirrors IpIpoptCalculatedQuantities.cpp::curr_grad_lag_x:
+    // tmp starts as curr_grad_f(), then AddTwoVectors(1., jac_cT*y_c,
+    // 1., jac_dT*y_d, 1.) accumulates both multiplier products in one pass.
+    let mut curr_grad_lag_x = curr_grad_f.clone();
+    for ((residual_i, equality_i), inequality_i) in curr_grad_lag_x
+        .iter_mut()
+        .zip(curr_jac_c_t_y_c.iter())
+        .zip(curr_jac_d_t_y_d.iter())
+    {
+        *residual_i += *equality_i + *inequality_i;
+    }
+    LagrangianGradientComponents {
+        curr_grad_f,
+        curr_jac_c_t_y_c,
+        curr_jac_d_t_y_d,
+        curr_grad_lag_x,
+    }
+}
+
 fn lagrangian_gradient_sparse(
     gradient: &[f64],
     equality_jacobian: &SparseMatrix,
@@ -4812,30 +5390,14 @@ fn lagrangian_gradient_sparse(
     inequality_jacobian: &SparseMatrix,
     inequality_multipliers: &[f64],
 ) -> Vec<f64> {
-    let mut residual = gradient.to_vec();
-    let mut equality_term = vec![0.0; gradient.len()];
-    let mut inequality_term = vec![0.0; gradient.len()];
-    sparse_add_transpose_mat_vec_ipopt_order(
-        &mut equality_term,
+    lagrangian_gradient_components(
+        gradient,
         equality_jacobian,
         equality_multipliers,
-    );
-    sparse_add_transpose_mat_vec_ipopt_order(
-        &mut inequality_term,
         inequality_jacobian,
         inequality_multipliers,
-    );
-    // Mirrors IpIpoptCalculatedQuantities.cpp::curr_grad_lag_x:
-    // tmp starts as curr_grad_f(), then AddTwoVectors(1., jac_cT*y_c,
-    // 1., jac_dT*y_d, 1.) accumulates both multiplier products in one pass.
-    for ((residual_i, equality_i), inequality_i) in residual
-        .iter_mut()
-        .zip(equality_term.iter())
-        .zip(inequality_term.iter())
-    {
-        *residual_i += *equality_i + *inequality_i;
-    }
-    residual
+    )
+    .curr_grad_lag_x
 }
 
 struct TrialEvaluationContext<'a> {
@@ -5437,6 +5999,7 @@ struct IpoptFullSpaceResidual {
     residual_z_lower: Vec<f64>,
     residual_z_upper: Vec<f64>,
     residual_vu: Vec<f64>,
+    trace: Option<IpoptFullSpaceResidualTrace>,
     residual_ratio: f64,
     rhs_inf: f64,
     solution_inf: f64,
@@ -5449,7 +6012,28 @@ struct IpoptFullSpaceResidual {
     residual_vu_inf: f64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
+struct IpoptFullSpaceResidualTrace {
+    x_after_w: Vec<f64>,
+    x_after_jc: Vec<f64>,
+    x_after_jd: Vec<f64>,
+    x_after_pxl: Vec<f64>,
+    x_after_pxu: Vec<f64>,
+    x_after_add_two_vectors: Vec<f64>,
+    x: Vec<f64>,
+    s_after_pdu: Vec<f64>,
+    s_after_pdl: Vec<f64>,
+    s_after_add_two_vectors: Vec<f64>,
+    s_after_delta: Vec<f64>,
+    s: Vec<f64>,
+    c: Vec<f64>,
+    d: Vec<f64>,
+    z_lower: Vec<f64>,
+    z_upper: Vec<f64>,
+    v_upper: Vec<f64>,
+}
+
+#[derive(Clone, Debug)]
 struct IpoptRefinementReport {
     steps: usize,
     initial_residual_ratio: f64,
@@ -5460,6 +6044,7 @@ struct IpoptRefinementReport {
     first_correction_rhs_blocks: Option<IpoptAugmentedBlockFingerprints>,
     first_correction_solution: Option<VectorFingerprint>,
     first_correction_solution_blocks: Option<IpoptAugmentedBlockFingerprints>,
+    trace_steps: Vec<IpoptLinearRefinementStepTrace>,
     failed: bool,
 }
 
@@ -5617,6 +6202,7 @@ struct IpoptLinearSolveContext {
     rhs_orientation: IpoptLinearRhsOrientation,
     allow_inexact: bool,
     native_spral_quality_was_increased: bool,
+    capture_trace: bool,
 }
 
 fn ipopt_full_space_residual_ratio(
@@ -5625,6 +6211,7 @@ fn ipopt_full_space_residual_ratio(
     full_solution: &SpralSrcFullSpaceSolution,
     rhs_orientation: IpoptLinearRhsOrientation,
     shifts: IpoptLinearRefinementShifts,
+    capture_trace: bool,
 ) -> IpoptFullSpaceResidual {
     let n = system.hessian.lower_triangle.nrow;
     let meq = system.equality_jacobian.nrows();
@@ -5637,13 +6224,16 @@ fn ipopt_full_space_residual_ratio(
     let prefinal_orientation = rhs_orientation == IpoptLinearRhsOrientation::PreFinal;
     debug_assert_eq!(full_solution.upper_slack_multiplier_step.len(), mineq);
 
-    let mut residual_x = symmetric_ccs_lower_mat_vec(
+    let mut residual_x = symmetric_ccs_lower_mat_vec_ipopt_order(
         system.hessian.lower_triangle.as_ref(),
         &system.hessian.values,
         dx,
     );
+    let residual_x_after_w = capture_trace.then(|| residual_x.clone());
     sparse_add_transpose_mat_vec_ipopt_order(&mut residual_x, system.equality_jacobian, d_lambda);
+    let residual_x_after_jc = capture_trace.then(|| residual_x.clone());
     sparse_add_transpose_mat_vec_ipopt_order(&mut residual_x, system.inequality_jacobian, d_ineq);
+    let residual_x_after_jd = capture_trace.then(|| residual_x.clone());
 
     let equality_dx = sparse_mat_vec_ipopt_order(system.equality_jacobian, dx);
     let inequality_dx = sparse_mat_vec_ipopt_order(system.inequality_jacobian, dx);
@@ -5666,6 +6256,8 @@ fn ipopt_full_space_residual_ratio(
         );
         vec![0.0; bound_data.bounds.upper_indices.len()]
     });
+    let residual_x_after_pxl;
+    let residual_x_after_pxu;
 
     if let Some(bound_data) = system.bound_data {
         let mut rhs_x = system
@@ -5694,11 +6286,13 @@ fn ipopt_full_space_residual_ratio(
             let slack = native_lower_bound_slack(bound_data.x, index, lower);
             let complementarity = slack * z_i - system.barrier_parameter;
             let dz_i = full_solution.lower_bound_multiplier_step[bound_position];
-            let residual_z = if prefinal_orientation {
-                slack * dz_i + z_i * dx[reduced_index] - complementarity
+            let rhs_z = if prefinal_orientation {
+                complementarity
             } else {
-                slack * dz_i + z_i * dx[reduced_index] + complementarity
+                -complementarity
             };
+            let residual_z =
+                ipopt_lower_bound_residual_z(slack, dz_i, z_i, dx[reduced_index], rhs_z);
             residual_z_lower[bound_position] = residual_z;
             residual_x[reduced_index] -= dz_i;
             if damping > 0.0 && !bound_data.bounds.upper_indices.contains(&index) {
@@ -5708,11 +6302,11 @@ fn ipopt_full_space_residual_ratio(
                     -damping
                 };
             }
-            augmented_correction_rhs[reduced_index] += residual_z / slack;
             bound_residual_inf = bound_residual_inf.max(residual_z.abs());
             rhs_inf = rhs_inf.max(complementarity.abs());
             solution_inf = solution_inf.max(dz_i.abs());
         }
+        residual_x_after_pxl = capture_trace.then(|| residual_x.clone());
         for (bound_position, ((&index, &upper), &z_i)) in bound_data
             .bounds
             .upper_indices
@@ -5727,11 +6321,13 @@ fn ipopt_full_space_residual_ratio(
             let slack = native_upper_bound_slack(bound_data.x, index, upper);
             let complementarity = slack * z_i - system.barrier_parameter;
             let dz_i = full_solution.upper_bound_multiplier_step[bound_position];
-            let residual_z = if prefinal_orientation {
-                slack * dz_i - z_i * dx[reduced_index] - complementarity
+            let rhs_z = if prefinal_orientation {
+                complementarity
             } else {
-                slack * dz_i - z_i * dx[reduced_index] + complementarity
+                -complementarity
             };
+            let residual_z =
+                ipopt_upper_bound_residual_z(slack, dz_i, z_i, dx[reduced_index], rhs_z);
             residual_z_upper[bound_position] = residual_z;
             residual_x[reduced_index] += dz_i;
             if damping > 0.0 && !bound_data.bounds.lower_indices.contains(&index) {
@@ -5741,25 +6337,54 @@ fn ipopt_full_space_residual_ratio(
                     damping
                 };
             }
-            augmented_correction_rhs[reduced_index] -= residual_z / slack;
             bound_residual_inf = bound_residual_inf.max(residual_z.abs());
             rhs_inf = rhs_inf.max(complementarity.abs());
             solution_inf = solution_inf.max(dz_i.abs());
         }
+        residual_x_after_pxu = capture_trace.then(|| residual_x.clone());
         // Mirror IpPDFullSpaceSolver.cpp::ComputeResiduals: W/J/bound terms are
         // accumulated first, and the primal perturbation plus rhs.x contribution
         // is applied last with AddTwoVectors(delta_x, res.x, -1., rhs.x, 1.).
-        for (index, (residual_i, rhs_i)) in residual_x.iter_mut().zip(rhs_x.iter()).enumerate() {
-            *residual_i += shifts.primal * dx[index] - rhs_i;
-        }
+        ipopt_add_delta_minus_rhs(&mut residual_x, shifts.primal, dx, &rhs_x);
         for (rhs_i, residual_i) in augmented_correction_rhs[..n]
             .iter_mut()
             .zip(residual_x.iter())
         {
-            *rhs_i += *residual_i;
+            *rhs_i = *residual_i;
+        }
+        // Mirror PDFullSpaceSolver::SolveOnce augmented x-RHS construction:
+        // start with resid.x, then apply Px_L.AddMSinvZ(+1) followed by
+        // Px_U.AddMSinvZ(-1).  The order is observable at glider precision.
+        for (bound_position, (&index, &lower)) in bound_data
+            .bounds
+            .lower_indices
+            .iter()
+            .zip(bound_data.bounds.lower_values.iter())
+            .enumerate()
+        {
+            let Some(reduced_index) = bound_data.fixed_variables.free_position[index] else {
+                continue;
+            };
+            let slack = native_lower_bound_slack(bound_data.x, index, lower);
+            augmented_correction_rhs[reduced_index] += residual_z_lower[bound_position] / slack;
+        }
+        for (bound_position, (&index, &upper)) in bound_data
+            .bounds
+            .upper_indices
+            .iter()
+            .zip(bound_data.bounds.upper_values.iter())
+            .enumerate()
+        {
+            let Some(reduced_index) = bound_data.fixed_variables.free_position[index] else {
+                continue;
+            };
+            let slack = native_upper_bound_slack(bound_data.x, index, upper);
+            augmented_correction_rhs[reduced_index] -= residual_z_upper[bound_position] / slack;
         }
         rhs_inf = rhs_inf.max(step_inf_norm(&rhs_x));
     } else {
+        residual_x_after_pxl = residual_x_after_jd.clone();
+        residual_x_after_pxu = residual_x_after_jd.clone();
         for (residual_i, (r_dual_i, bound_rhs_i)) in residual_x
             .iter_mut()
             .zip(system.r_dual.iter().zip(system.bound_rhs.iter()))
@@ -5785,12 +6410,20 @@ fn ipopt_full_space_residual_ratio(
                 acc.max((*r_dual_i - *bound_rhs_i).abs())
             });
     }
+    let residual_x_after_add_two_vectors = capture_trace.then(|| residual_x.clone());
 
     let mut residual_inf = step_inf_norm(&residual_x).max(bound_residual_inf);
     let mut residual_s_inf = 0.0_f64;
     let mut residual_d_inf = 0.0_f64;
     let mut residual_vu_inf = 0.0_f64;
     let mut residual_vu = vec![0.0; mineq];
+    let mut residual_s_trace = capture_trace.then(|| Vec::with_capacity(mineq));
+    let mut residual_s_after_pdu_trace = capture_trace.then(|| Vec::with_capacity(mineq));
+    let mut residual_s_after_pdl_trace = capture_trace.then(|| Vec::with_capacity(mineq));
+    let mut residual_s_after_add_two_vectors_trace =
+        capture_trace.then(|| Vec::with_capacity(mineq));
+    let mut residual_s_after_delta_trace = capture_trace.then(|| Vec::with_capacity(mineq));
+    let mut residual_d_trace = capture_trace.then(|| Vec::with_capacity(mineq));
 
     for row in 0..mineq {
         let slack = system.slack[row];
@@ -5815,14 +6448,36 @@ fn ipopt_full_space_residual_ratio(
         // DenseVector::AddTwoVectorsImpl grouping for the s, v_U, and y_d
         // blocks: start from the matrix product, add `-res - rhs` as one
         // expression, then apply the perturbation Axpy separately.
-        let mut residual_s = dz_i + (-d_ineq[row] - rhs_s_i);
+        let residual_s_after_pdu = dz_i;
+        let residual_s_after_pdl = residual_s_after_pdu;
+        let residual_s_after_add_two_vectors = residual_s_after_pdl + (-d_ineq[row] - rhs_s_i);
+        let mut residual_s = residual_s_after_add_two_vectors;
         if shifts.slack != 0.0 {
-            residual_s += shifts.slack * ipopt_ds_i;
+            residual_s = ipopt_blas_axpy_value(residual_s, shifts.slack, ipopt_ds_i);
         }
+        let residual_s_after_delta = residual_s;
         let residual_v = (slack * dz_i) + (-(multiplier * ipopt_ds_i) - rhs_v_i);
         let mut residual_d = inequality_dx[row] + (-ipopt_ds_i - rhs_d_i);
         if shifts.dual != 0.0 {
-            residual_d += -shifts.dual * d_ineq[row];
+            residual_d = ipopt_blas_axpy_value(residual_d, -shifts.dual, d_ineq[row]);
+        }
+        if let Some(trace) = residual_s_after_pdu_trace.as_mut() {
+            trace.push(residual_s_after_pdu);
+        }
+        if let Some(trace) = residual_s_after_pdl_trace.as_mut() {
+            trace.push(residual_s_after_pdl);
+        }
+        if let Some(trace) = residual_s_after_add_two_vectors_trace.as_mut() {
+            trace.push(residual_s_after_add_two_vectors);
+        }
+        if let Some(trace) = residual_s_after_delta_trace.as_mut() {
+            trace.push(residual_s_after_delta);
+        }
+        if let Some(trace) = residual_s_trace.as_mut() {
+            trace.push(residual_s);
+        }
+        if let Some(trace) = residual_d_trace.as_mut() {
+            trace.push(residual_d);
         }
         residual_vu[row] = residual_v;
         residual_s_inf = residual_s_inf.max(residual_s.abs());
@@ -5848,6 +6503,7 @@ fn ipopt_full_space_residual_ratio(
     }
 
     let mut residual_c_inf = 0.0_f64;
+    let mut residual_c_trace = capture_trace.then(|| Vec::with_capacity(meq));
     for row in 0..meq {
         let rhs_c_i = if prefinal_orientation {
             system.r_eq[row]
@@ -5856,9 +6512,14 @@ fn ipopt_full_space_residual_ratio(
         };
         // IpPDFullSpaceSolver.cpp::ComputeResiduals forms this with
         // AddTwoVectors(-delta_c, res.y_c, -1., rhs.y_c, 1.).
-        let mut residual_c = equality_dx[row] - rhs_c_i;
-        if shifts.dual != 0.0 {
-            residual_c += -shifts.dual * d_lambda[row];
+        let mut residual_c = equality_dx[row];
+        if shifts.dual == 0.0 {
+            residual_c -= rhs_c_i;
+        } else {
+            residual_c += (-shifts.dual).mul_add(d_lambda[row], -rhs_c_i);
+        }
+        if let Some(trace) = residual_c_trace.as_mut() {
+            trace.push(residual_c);
         }
         augmented_correction_rhs[pattern.lambda_offset + row] = residual_c;
         residual_c_inf = residual_c_inf.max(residual_c.abs());
@@ -5873,11 +6534,32 @@ fn ipopt_full_space_residual_ratio(
         let denominator = solution_inf.min(IPOPT_LINEAR_RESIDUAL_MAX_COND * rhs_inf) + rhs_inf;
         residual_inf / denominator
     };
+    let trace = capture_trace.then(|| IpoptFullSpaceResidualTrace {
+        x_after_w: residual_x_after_w.unwrap_or_default(),
+        x_after_jc: residual_x_after_jc.unwrap_or_default(),
+        x_after_jd: residual_x_after_jd.unwrap_or_default(),
+        x_after_pxl: residual_x_after_pxl.unwrap_or_default(),
+        x_after_pxu: residual_x_after_pxu.unwrap_or_default(),
+        x_after_add_two_vectors: residual_x_after_add_two_vectors.unwrap_or_default(),
+        x: residual_x.clone(),
+        s_after_pdu: residual_s_after_pdu_trace.unwrap_or_default(),
+        s_after_pdl: residual_s_after_pdl_trace.unwrap_or_default(),
+        s_after_add_two_vectors: residual_s_after_add_two_vectors_trace.unwrap_or_default(),
+        s_after_delta: residual_s_after_delta_trace.unwrap_or_default(),
+        s: residual_s_trace.unwrap_or_default(),
+        c: residual_c_trace.unwrap_or_default(),
+        d: residual_d_trace.unwrap_or_default(),
+        z_lower: residual_z_lower.clone(),
+        z_upper: residual_z_upper.clone(),
+        v_upper: residual_vu.clone(),
+    });
+
     IpoptFullSpaceResidual {
         augmented_correction_rhs,
         residual_z_lower,
         residual_z_upper,
         residual_vu,
+        trace,
         residual_ratio,
         rhs_inf,
         solution_inf,
@@ -5895,8 +6577,7 @@ fn refine_ipopt_full_space_solution<E>(
     system: &ReducedKktSystem<'_>,
     pattern: &SpralAugmentedKktPattern,
     solution: &mut SpralSrcFullSpaceSolution,
-    rhs_orientation: IpoptLinearRhsOrientation,
-    shifts: IpoptLinearRefinementShifts,
+    context: &IpoptLinearSolveContext,
     solve_time: &mut Duration,
     mut solve_correction: impl FnMut(&[f64]) -> Result<Vec<f64>, E>,
 ) -> Result<IpoptRefinementReport, E> {
@@ -5905,8 +6586,14 @@ fn refine_ipopt_full_space_solution<E>(
     // matrix residual; see IpPDFullSpaceSolver.cpp::ComputeResiduals,
     // SolveOnce, and ComputeResidualRatio.
     let mut steps = 0;
-    let mut residual =
-        ipopt_full_space_residual_ratio(system, pattern, solution, rhs_orientation, shifts);
+    let mut residual = ipopt_full_space_residual_ratio(
+        system,
+        pattern,
+        solution,
+        context.rhs_orientation,
+        context.shifts,
+        context.capture_trace,
+    );
     let mut residual_ratio = residual.residual_ratio;
     let initial_residual_ratio = residual_ratio;
     let initial_residual = residual.metrics();
@@ -5915,6 +6602,7 @@ fn refine_ipopt_full_space_solution<E>(
     let mut first_correction_rhs_blocks = None;
     let mut first_correction_solution = None;
     let mut first_correction_solution_blocks = None;
+    let mut trace_steps = Vec::new();
     let mut failed = false;
     while steps < IPOPT_LINEAR_MIN_REFINEMENT_STEPS
         || residual_ratio > IPOPT_LINEAR_RESIDUAL_RATIO_MAX
@@ -5929,6 +6617,18 @@ fn refine_ipopt_full_space_solution<E>(
         let correction_started = Instant::now();
         let correction = solve_correction(&residual.augmented_correction_rhs)?;
         *solve_time += correction_started.elapsed();
+        let trace_correction_rhs = context
+            .capture_trace
+            .then(|| residual.augmented_correction_rhs.clone());
+        let trace_correction_solution = context.capture_trace.then(|| correction.clone());
+        let trace_full_residual = context.capture_trace.then(|| {
+            residual
+                .trace
+                .as_ref()
+                .expect("captured full residual")
+                .clone()
+        });
+        let trace_residual_ratio_before = residual_ratio;
         if steps == 0 {
             first_correction_solution = Some(vector_fingerprint(&correction));
             first_correction_solution_blocks =
@@ -5953,7 +6653,11 @@ fn refine_ipopt_full_space_solution<E>(
                     residual.residual_z_lower[bound_position],
                     correction[reduced_index],
                 );
-                solution.lower_bound_multiplier_step[bound_position] -= correction_z;
+                solution.lower_bound_multiplier_step[bound_position] = ipopt_blas_axpy_value(
+                    solution.lower_bound_multiplier_step[bound_position],
+                    -1.0,
+                    correction_z,
+                );
             }
             for (bound_position, ((&index, &upper), &z_i)) in bound_data
                 .bounds
@@ -5973,7 +6677,11 @@ fn refine_ipopt_full_space_solution<E>(
                     residual.residual_z_upper[bound_position],
                     correction[reduced_index],
                 );
-                solution.upper_bound_multiplier_step[bound_position] -= correction_z;
+                solution.upper_bound_multiplier_step[bound_position] = ipopt_blas_axpy_value(
+                    solution.upper_bound_multiplier_step[bound_position],
+                    -1.0,
+                    correction_z,
+                );
             }
         }
         for (row, upper_step_i) in solution.upper_slack_multiplier_step.iter_mut().enumerate() {
@@ -5989,19 +6697,37 @@ fn refine_ipopt_full_space_solution<E>(
                 residual.residual_vu[row],
                 correction_s,
             );
-            *upper_step_i -= correction_vu;
+            *upper_step_i = ipopt_blas_axpy_value(*upper_step_i, -1.0, correction_vu);
         }
         for (solution_i, correction_i) in solution
             .augmented_solution
             .iter_mut()
             .zip(correction.iter())
         {
-            *solution_i -= correction_i;
+            *solution_i = ipopt_blas_axpy_value(*solution_i, -1.0, *correction_i);
         }
         steps += 1;
-        let new_residual =
-            ipopt_full_space_residual_ratio(system, pattern, solution, rhs_orientation, shifts);
+        let new_residual = ipopt_full_space_residual_ratio(
+            system,
+            pattern,
+            solution,
+            context.rhs_orientation,
+            context.shifts,
+            context.capture_trace,
+        );
         let new_residual_ratio = new_residual.residual_ratio;
+        if let (Some(correction_rhs), Some(correction_solution)) =
+            (trace_correction_rhs, trace_correction_solution)
+        {
+            trace_steps.push(IpoptLinearRefinementStepTrace {
+                correction_rhs,
+                correction_solution,
+                solution_prefinal_after: solution.augmented_solution.clone(),
+                full_residual: trace_full_residual,
+                residual_ratio_before: trace_residual_ratio_before,
+                residual_ratio_after: new_residual_ratio,
+            });
+        }
         residual_ratio = new_residual_ratio;
         if new_residual_ratio > IPOPT_LINEAR_RESIDUAL_RATIO_MAX
             && steps > IPOPT_LINEAR_MIN_REFINEMENT_STEPS
@@ -6026,6 +6752,7 @@ fn refine_ipopt_full_space_solution<E>(
         first_correction_rhs_blocks,
         first_correction_solution,
         first_correction_solution_blocks,
+        trace_steps,
         failed,
     })
 }
@@ -7185,7 +7912,11 @@ fn factor_solve_spral_src(
     profiling: &mut InteriorPointProfiling,
     verbose: bool,
 ) -> std::result::Result<
-    (SpralSrcFullSpaceSolution, LinearBackendRunStats),
+    (
+        SpralSrcFullSpaceSolution,
+        Option<IpoptLinearSolveTrace>,
+        LinearBackendRunStats,
+    ),
     InteriorPointLinearSolveAttempt,
 > {
     let matrix = SpralSymmetricCscMatrix::new(
@@ -7306,6 +8037,7 @@ fn factor_solve_spral_src(
             error,
         )
     })?;
+    let solution_prefinal_unrefined = context.capture_trace.then(|| solution.clone());
     let pre_refinement_solution_fingerprint = vector_fingerprint(&solution);
     let pre_refinement_solution_block_fingerprints =
         ipopt_augmented_block_fingerprints(&workspace.pattern, &solution);
@@ -7343,8 +8075,7 @@ fn factor_solve_spral_src(
             system,
             &workspace.pattern,
             &mut full_space_solution,
-            context.rhs_orientation,
-            context.shifts,
+            &context,
             &mut solve_time,
             |residual| {
                 session.solve_ipopt_single_rhs(residual).map_err(|error| {
@@ -7357,6 +8088,14 @@ fn factor_solve_spral_src(
             },
         )?)
     };
+    let linear_trace = context.capture_trace.then(|| IpoptLinearSolveTrace {
+        rhs_prefinal: rhs.to_vec(),
+        solution_prefinal_unrefined: solution_prefinal_unrefined
+            .expect("captured unrefined solution when trace is enabled"),
+        refinement_steps: refinement
+            .as_ref()
+            .map_or_else(Vec::new, |report| report.trace_steps.clone()),
+    });
     let post_refinement_prefinal_solution_fingerprint =
         vector_fingerprint(&full_space_solution.augmented_solution);
     let post_refinement_prefinal_solution_block_fingerprints = ipopt_augmented_block_fingerprints(
@@ -7552,6 +8291,7 @@ fn factor_solve_spral_src(
         };
         return Ok((
             full_space_solution,
+            linear_trace,
             LinearBackendRunStats {
                 solver: InteriorPointLinearSolver::SpralSrc,
                 factorization_time,
@@ -7569,6 +8309,7 @@ fn factor_solve_spral_src(
         .map(|assessment| {
             (
                 full_space_solution,
+                linear_trace,
                 LinearBackendRunStats {
                     solver: InteriorPointLinearSolver::SpralSrc,
                     factorization_time,
@@ -7594,6 +8335,7 @@ fn solve_reduced_kkt_with_spral_src(
     profiling: &mut InteriorPointProfiling,
     verbose: bool,
     allow_inexact: bool,
+    capture_trace: bool,
 ) -> std::result::Result<NewtonDirection, Vec<InteriorPointLinearSolveAttempt>> {
     let n = system.hessian.lower_triangle.nrow;
     let meq = system.equality_jacobian.nrows();
@@ -7644,11 +8386,12 @@ fn solve_reduced_kkt_with_spral_src(
                 rhs_orientation: IpoptLinearRhsOrientation::PreFinal,
                 allow_inexact,
                 native_spral_quality_was_increased: solver_quality_improved,
+                capture_trace,
             },
             profiling,
             verbose,
         ) {
-            Ok((solution, mut backend_stats)) => {
+            Ok((solution, linear_trace, mut backend_stats)) => {
                 if !attempts.is_empty() {
                     let attempt_detail = attempts
                         .iter()
@@ -7707,6 +8450,7 @@ fn solve_reduced_kkt_with_spral_src(
                     dual_regularization_used: current_jacobian_regularization,
                     primal_diagonal_shift_used: primal_shift,
                     linear_solution: solution,
+                    linear_trace,
                     backend_stats,
                     linear_debug: None,
                 });
@@ -7850,6 +8594,7 @@ fn solve_reduced_kkt_with_spral_ssids(
                     dual_regularization_used: dual_shift,
                     primal_diagonal_shift_used: primal_shift,
                     linear_solution: solution,
+                    linear_trace: None,
                     backend_stats,
                     linear_debug: None,
                 });
@@ -8036,6 +8781,7 @@ fn solve_reduced_kkt_with_sparse_qdldl(
             dual_regularization_used: regularization_used,
             primal_diagonal_shift_used: regularization_used,
             linear_solution: solution,
+            linear_trace: None,
             backend_stats,
             linear_debug: None,
         });
@@ -8143,6 +8889,7 @@ fn solve_reduced_kkt_with_sparse_qdldl(
                     dual_regularization_used: current_regularization,
                     primal_diagonal_shift_used: primal_shift,
                     linear_solution: solution,
+                    linear_trace: None,
                     backend_stats,
                     linear_debug: None,
                 });
@@ -8172,6 +8919,7 @@ fn solve_reduced_kkt(
     profiling: &mut InteriorPointProfiling,
     verbose: bool,
     allow_inexact: bool,
+    capture_trace: bool,
 ) -> std::result::Result<NewtonDirection, InteriorPointSolveError> {
     let preferred_solver = preferred_linear_solver(
         system.solver,
@@ -8192,6 +8940,7 @@ fn solve_reduced_kkt(
             profiling,
             verbose,
             allow_inexact,
+            capture_trace,
         )
         .map_err(|attempts| {
             linear_solve_error(preferred_solver, workspace.pattern.dimension(), attempts)
@@ -8324,6 +9073,7 @@ struct InteriorPointIterationLog {
     alpha: Option<f64>,
     alpha_pr: Option<f64>,
     alpha_du: Option<f64>,
+    alpha_y: Option<f64>,
     line_search_iterations: Option<Index>,
     regularization_size: Option<f64>,
     step_kind: Option<InteriorPointStepKind>,
@@ -8355,9 +9105,15 @@ fn nlip_log_snapshot(log: &InteriorPointIterationLog) -> InteriorPointIterationS
         lower_bound_multipliers: None,
         upper_bound_multipliers: None,
         kkt_inequality_residual: None,
+        kkt_x_stationarity: None,
         kkt_slack_stationarity: None,
         kkt_slack_complementarity: None,
         kkt_slack_sigma: None,
+        curr_grad_f: None,
+        curr_jac_c_t_y_c: None,
+        curr_jac_d_t_y_d: None,
+        curr_grad_lag_x: None,
+        curr_grad_lag_s: None,
         objective: log.objective_value,
         barrier_objective: Some(log.barrier_objective),
         eq_inf: Some(log.equality_inf),
@@ -8365,12 +9121,17 @@ fn nlip_log_snapshot(log: &InteriorPointIterationLog) -> InteriorPointIterationS
         dual_inf: log.dual_inf,
         comp_inf: Some(log.complementarity_inf),
         overall_inf: log.overall_inf,
+        barrier_primal_inf: None,
+        barrier_dual_inf: None,
+        barrier_complementarity_inf: None,
+        barrier_subproblem_error: None,
         barrier_parameter: Some(log.barrier_parameter),
         filter_theta: Some(log.equality_inf.max(log.inequality_inf)),
         step_inf: None,
         alpha: log.alpha,
         alpha_pr: log.alpha_pr,
         alpha_du: log.alpha_du,
+        alpha_y: log.alpha_y,
         line_search_iterations: log.line_search_iterations,
         line_search_trials: log.line_search_iterations.unwrap_or(0),
         regularization_size: log.regularization_size,
@@ -8590,9 +9351,15 @@ mod tests {
             lower_bound_multipliers: None,
             upper_bound_multipliers: None,
             kkt_inequality_residual: None,
+            kkt_x_stationarity: None,
             kkt_slack_stationarity: None,
             kkt_slack_complementarity: None,
             kkt_slack_sigma: None,
+            curr_grad_f: None,
+            curr_jac_c_t_y_c: None,
+            curr_jac_d_t_y_d: None,
+            curr_grad_lag_x: None,
+            curr_grad_lag_s: None,
             objective: 0.0,
             barrier_objective: None,
             eq_inf: None,
@@ -8600,12 +9367,17 @@ mod tests {
             dual_inf: 0.0,
             comp_inf: None,
             overall_inf: 0.0,
+            barrier_primal_inf: None,
+            barrier_dual_inf: None,
+            barrier_complementarity_inf: None,
+            barrier_subproblem_error: None,
             barrier_parameter: None,
             filter_theta: None,
             step_inf: None,
             alpha: None,
             alpha_pr: None,
             alpha_du: None,
+            alpha_y: None,
             line_search_iterations: None,
             line_search_trials: 0,
             regularization_size: None,
@@ -8672,6 +9444,111 @@ mod tests {
     }
 
     #[test]
+    fn ipopt_order_sparse_matvecs_use_fused_multiply_add() {
+        let transpose_ccs = CCS::new(2, 1, vec![0, 2], vec![1, 0]);
+        let transpose_matrix = SparseMatrix {
+            structure: Arc::new(sparse_structure_from_ccs(&transpose_ccs)),
+            values: vec![-1.0, 1.0e308],
+        };
+        let mut transpose_product = vec![0.0];
+
+        sparse_add_transpose_mat_vec_ipopt_order(
+            &mut transpose_product,
+            &transpose_matrix,
+            &[1.0e-308, 1.0],
+        );
+
+        assert_eq!(
+            transpose_product[0].to_bits(),
+            1.0e308_f64.mul_add(1.0e-308, -1.0).to_bits()
+        );
+        assert_ne!(
+            transpose_product[0].to_bits(),
+            ((1.0e308_f64 * 1.0e-308) - 1.0).to_bits()
+        );
+
+        let forward_ccs = CCS::new(1, 2, vec![0, 1, 2], vec![0, 0]);
+        let forward_matrix = SparseMatrix {
+            structure: Arc::new(sparse_structure_from_ccs(&forward_ccs)),
+            values: vec![-1.0, 1.0e308],
+        };
+        let forward_product = sparse_mat_vec_ipopt_order(&forward_matrix, &[1.0, 1.0e-308]);
+
+        assert_eq!(forward_product[0].to_bits(), transpose_product[0].to_bits());
+    }
+
+    #[test]
+    fn ipopt_order_symmetric_hessian_matvec_uses_fused_multiply_add() {
+        let ccs = CCS::new(2, 2, vec![0, 2, 2], vec![0, 1]);
+        let values = vec![-1.0, 1.0e308];
+        let vector = vec![1.0, 1.0e-308];
+
+        let ipopt_order = symmetric_ccs_lower_mat_vec_ipopt_order(&ccs, &values, &vector);
+        let old_order = symmetric_ccs_lower_mat_vec(&ccs, &values, &vector);
+
+        assert_eq!(
+            ipopt_order[0].to_bits(),
+            1.0e308_f64.mul_add(1.0e-308, -1.0).to_bits()
+        );
+        assert_ne!(ipopt_order[0].to_bits(), old_order[0].to_bits());
+    }
+
+    #[test]
+    fn ipopt_order_add_delta_minus_rhs_zero_scale_skips_delta() {
+        let mut zero_scale_values = vec![1.0];
+        ipopt_add_delta_minus_rhs(&mut zero_scale_values, 0.0, &[f64::INFINITY], &[0.25]);
+        assert_eq!(zero_scale_values[0].to_bits(), 0.75_f64.to_bits());
+    }
+
+    #[test]
+    fn ipopt_order_add_delta_minus_rhs_contracts_multiply_subtract() {
+        let mut values = vec![0.5330491410581917];
+        let delta = [-0.25905737736536555];
+        let rhs = [-0.15777053191611318];
+        ipopt_add_delta_minus_rhs(&mut values, 2.6666666666666665, &delta, &rhs);
+
+        let expected = 0.5330491410581917
+            + 2.6666666666666665_f64.mul_add(-0.25905737736536555, 0.15777053191611318);
+        let separate = 0.5330491410581917
+            + (2.6666666666666665_f64 * -0.25905737736536555 + 0.15777053191611318);
+
+        assert_eq!(values[0].to_bits(), expected.to_bits());
+        assert_ne!(values[0].to_bits(), separate.to_bits());
+    }
+
+    #[test]
+    fn ipopt_order_axpy_contracts_multiply_add() {
+        let value = -0.5082563016279674;
+        let alpha = 2.6666666666666665;
+        let delta = 0.19059611311048785;
+
+        let ipopt_order = ipopt_blas_axpy_value(value, alpha, delta);
+        let separate = value + alpha * delta;
+
+        assert_eq!(ipopt_order.to_bits(), 1.5682327834694952e-16_f64.to_bits());
+        assert_ne!(ipopt_order.to_bits(), separate.to_bits());
+        assert_eq!(ipopt_blas_axpy_value(value, 0.0, f64::INFINITY), value);
+    }
+
+    #[test]
+    fn ipopt_order_bound_residual_contracts_add_two_vectors_term() {
+        let slack = 1.0;
+        let dz = -7.582200803883872e-13;
+        let z = 1.0;
+        let dx = -3.346096292797418e-13;
+        let rhs_z = 4.4296881516653666e-13;
+
+        let ipopt_order = ipopt_lower_bound_residual_z(slack, dz, z, dx, rhs_z);
+        let left_associative = slack * dz + z * dx - rhs_z;
+
+        assert_eq!(
+            ipopt_order.to_bits(),
+            (-1.5357985248346656e-12_f64).to_bits()
+        );
+        assert_ne!(ipopt_order.to_bits(), left_associative.to_bits());
+    }
+
+    #[test]
     fn bound_multiplier_correction_clamps_complementarity_band() {
         let slack = vec![2.0, 4.0];
         let z = vec![100.0, 1e-6];
@@ -8701,6 +9578,28 @@ mod tests {
 
         assert_eq!(corrected_z[0].to_bits(), 0x3ecd_9dff_f800_0000);
         assert_eq!(direct_endpoint.to_bits(), 0x3ecd_9dff_fa07_9d96);
+    }
+
+    #[test]
+    fn expansion_matrix_multiplier_steps_use_fused_multiply_add() {
+        let slack = 1.0;
+        let multiplier = 1.0e308;
+        let step = 1.0e-308;
+
+        let upper_step =
+            ipopt_oriented_upper_slack_bound_multiplier_step(slack, multiplier, -1.0, step);
+        assert_eq!(
+            upper_step.to_bits(),
+            multiplier.mul_add(step, -1.0).to_bits()
+        );
+        assert_ne!(upper_step.to_bits(), ((multiplier * step) - 1.0).to_bits());
+
+        let lower_step = ipopt_oriented_lower_bound_multiplier_step(slack, multiplier, 1.0, step);
+        assert_eq!(
+            lower_step.to_bits(),
+            (-multiplier).mul_add(step, 1.0).to_bits()
+        );
+        assert_ne!(lower_step.to_bits(), (1.0 - multiplier * step).to_bits());
     }
 
     #[test]
@@ -8748,6 +9647,7 @@ mod tests {
             dual_regularization_used: 0.0,
             primal_diagonal_shift_used: 0.0,
             linear_solution: dx.iter().chain(ds.iter()).copied().collect(),
+            linear_trace: None,
             backend_stats: LinearBackendRunStats {
                 solver: InteriorPointLinearSolver::SparseQdldl,
                 factorization_time: Duration::ZERO,
@@ -8946,6 +9846,20 @@ mod tests {
     }
 
     #[test]
+    fn filter_barrier_objective_increase_guard_matches_ipopt_log10_threshold() {
+        assert!(!barrier_objective_increase_too_large(
+            20.0,
+            20.0 + 2.0e6,
+            5.0
+        ));
+        assert!(barrier_objective_increase_too_large(
+            20.0,
+            20.0 + 2.0e6 + 1.0,
+            5.0
+        ));
+    }
+
+    #[test]
     fn barrier_objective_accumulates_components_in_ipopt_order() {
         let bounds = BoundConstraints {
             lower_indices: vec![0, 1],
@@ -9075,6 +9989,48 @@ mod tests {
 
         assert_eq!(ipopt_order.to_bits(), (-0.0_f64).to_bits());
         assert_eq!(old_nlip_order.to_bits(), 0.0_f64.to_bits());
+    }
+
+    #[test]
+    fn current_plus_step_general_branch_uses_fused_multiply_add() {
+        let value = -1.0;
+        let alpha = 1.0e308_f64;
+        let delta = 1.0e-308_f64;
+
+        let ipopt_order = ipopt_dense_current_plus_step(value, alpha, delta);
+        let separate = value + alpha * delta;
+
+        assert_eq!(ipopt_order.to_bits(), alpha.mul_add(delta, value).to_bits());
+        assert_ne!(ipopt_order.to_bits(), separate.to_bits());
+    }
+
+    #[test]
+    fn ipopt_order_soc_constraint_accumulator_matches_add_one_vector() {
+        let trial = -1.0;
+        let alpha = 1.0e308_f64;
+        let previous = 1.0e-308_f64;
+
+        let ipopt_order = ipopt_soc_constraint_accumulator(trial, alpha, previous);
+        let separate = trial + alpha * previous;
+
+        assert_eq!(
+            ipopt_order.to_bits(),
+            alpha.mul_add(previous, trial).to_bits()
+        );
+        assert_ne!(ipopt_order.to_bits(), separate.to_bits());
+
+        assert_eq!(
+            ipopt_soc_constraint_accumulator(-0.0, 0.0, 42.0).to_bits(),
+            (-0.0_f64).to_bits()
+        );
+        assert_eq!(
+            ipopt_soc_constraint_accumulator(trial, 1.0, previous).to_bits(),
+            ipopt_blas_axpy_value(previous, 1.0, trial).to_bits()
+        );
+        assert_eq!(
+            ipopt_soc_constraint_accumulator(trial, -1.0, previous).to_bits(),
+            (trial - previous).to_bits()
+        );
     }
 
     #[test]
@@ -9795,14 +10751,15 @@ where
         );
         let initial_inequality_residual =
             slack_form_inequality_residuals(&initial_state.augmented_inequality_values, &slack);
-        let initial_dual_residual = lagrangian_gradient_sparse(
+        let initial_primal_inf = equality_inf.max(inf_norm(&initial_inequality_residual));
+        let initial_lagrangian_components = lagrangian_gradient_components(
             &initial_state.gradient,
             &initial_state.equality_jacobian,
             &lambda_eq,
             &initial_state.inequality_jacobian,
             &lambda_ineq,
         );
-        let mut initial_dual_residual = initial_dual_residual;
+        let mut initial_dual_residual = initial_lagrangian_components.curr_grad_lag_x.clone();
         add_native_bound_multiplier_terms(&mut initial_dual_residual, &bounds, &z_lower, &z_upper);
         let initial_slack_stationarity_inf = slack_stationarity_inf_norm(&lambda_ineq, &z);
         let dual_inf = fixed_variables
@@ -9816,6 +10773,19 @@ where
                 &bounds,
                 &z_lower,
                 &z_upper,
+            )
+        } else {
+            0.0
+        };
+        let barrier_complementarity_inf = if barrier_pair_count > 0 {
+            combined_complementarity_target_inf_norm(
+                &initial_slack_barrier,
+                &z,
+                &x,
+                &bounds,
+                &z_lower,
+                &z_upper,
+                barrier_parameter_value,
             )
         } else {
             0.0
@@ -9846,6 +10816,14 @@ where
             &complementarity_multipliers,
             options.overall_scale_max,
         );
+        let barrier_subproblem_error = scaled_overall_inf_norm(
+            initial_primal_inf,
+            dual_inf,
+            barrier_complementarity_inf,
+            &all_dual_multipliers,
+            &complementarity_multipliers,
+            options.overall_scale_max,
+        );
         let snapshot = InteriorPointIterationSnapshot {
             iteration: 0,
             phase: InteriorPointIterationPhase::Initial,
@@ -9857,6 +10835,13 @@ where
             lower_bound_multipliers: Some(z_lower.clone()),
             upper_bound_multipliers: Some(z_upper.clone()),
             kkt_inequality_residual: Some(initial_inequality_residual),
+            kkt_x_stationarity: Some(snapshot_damped_lagrangian_gradient_x(
+                &initial_dual_residual,
+                &bounds,
+                &fixed_variables,
+                barrier_parameter_value,
+                options.kappa_d,
+            )),
             kkt_slack_stationarity: Some(damped_slack_stationarity_residuals(
                 &lambda_ineq,
                 &z,
@@ -9869,6 +10854,23 @@ where
                 barrier_parameter_value,
             )),
             kkt_slack_sigma: Some(slack_sigma_values(&initial_slack_barrier, &z)),
+            curr_grad_f: Some(snapshot_x_component_vector(
+                &initial_lagrangian_components.curr_grad_f,
+                &fixed_variables,
+            )),
+            curr_jac_c_t_y_c: Some(snapshot_x_component_vector(
+                &initial_lagrangian_components.curr_jac_c_t_y_c,
+                &fixed_variables,
+            )),
+            curr_jac_d_t_y_d: Some(snapshot_x_component_vector(
+                &initial_lagrangian_components.curr_jac_d_t_y_d,
+                &fixed_variables,
+            )),
+            curr_grad_lag_x: Some(snapshot_x_component_vector(
+                &initial_dual_residual,
+                &fixed_variables,
+            )),
+            curr_grad_lag_s: Some(slack_stationarity_residuals(&lambda_ineq, &z)),
             objective: initial_state.objective_value,
             barrier_objective: Some(current_barrier_objective),
             eq_inf: (equality_count > 0).then_some(equality_inf),
@@ -9876,12 +10878,18 @@ where
             dual_inf,
             comp_inf: (barrier_pair_count > 0).then_some(complementarity_inf),
             overall_inf,
+            barrier_primal_inf: Some(initial_primal_inf),
+            barrier_dual_inf: Some(dual_inf),
+            barrier_complementarity_inf: (barrier_pair_count > 0)
+                .then_some(barrier_complementarity_inf),
+            barrier_subproblem_error: Some(barrier_subproblem_error),
             barrier_parameter: (barrier_pair_count > 0).then_some(barrier_parameter_value),
             filter_theta: Some(current_theta),
             step_inf: None,
             alpha: None,
             alpha_pr: None,
             alpha_du: None,
+            alpha_y: None,
             line_search_iterations: None,
             line_search_trials: 0,
             regularization_size: Some(options.regularization),
@@ -9941,6 +10949,7 @@ where
                     alpha: None,
                     alpha_pr: None,
                     alpha_du: None,
+                    alpha_y: None,
                     line_search_iterations: None,
                     regularization_size: Some(options.regularization),
                     step_kind: None,
@@ -9988,14 +10997,14 @@ where
         let slack_barrier = slack_barrier_values(&slack, &slack_upper_bounds);
         let internal_inequality_inf = inf_norm(&inequality_residual);
         let primal_inf = equality_inf.max(internal_inequality_inf);
-        let full_dual_residual = lagrangian_gradient_sparse(
+        let current_lagrangian_components = lagrangian_gradient_components(
             &state.gradient,
             &state.equality_jacobian,
             &lambda_eq,
             &state.inequality_jacobian,
             &lambda_ineq,
         );
-        let mut full_dual_residual = full_dual_residual;
+        let mut full_dual_residual = current_lagrangian_components.curr_grad_lag_x.clone();
         add_native_bound_multiplier_terms(&mut full_dual_residual, &bounds, &z_lower, &z_upper);
         let dual_residual = fixed_variables.reduce_vector(&full_dual_residual);
         let slack_stationarity_residual = slack_stationarity_residuals(&lambda_ineq, &z);
@@ -10090,6 +11099,19 @@ where
         } else {
             0.0
         };
+        let mut barrier_complementarity_inf = if barrier_pair_count > 0 {
+            combined_complementarity_target_inf_norm(
+                &slack_barrier,
+                &z,
+                &x,
+                &bounds,
+                &z_lower,
+                &z_upper,
+                barrier_parameter_value,
+            )
+        } else {
+            0.0
+        };
         let all_dual_multipliers =
             ipopt_all_dual_multiplier_vector(&lambda_eq, &lambda_ineq, &z_lower, &z_upper, &z);
         let complementarity_multipliers =
@@ -10098,6 +11120,14 @@ where
             primal_inf,
             dual_inf,
             complementarity_inf,
+            &all_dual_multipliers,
+            &complementarity_multipliers,
+            options.overall_scale_max,
+        );
+        let mut barrier_subproblem_error = scaled_overall_inf_norm(
+            primal_inf,
+            dual_inf,
+            barrier_complementarity_inf,
             &all_dual_multipliers,
             &complementarity_multipliers,
             options.overall_scale_max,
@@ -10132,6 +11162,13 @@ where
             lower_bound_multipliers: Some(z_lower.clone()),
             upper_bound_multipliers: Some(z_upper.clone()),
             kkt_inequality_residual: Some(inequality_residual.clone()),
+            kkt_x_stationarity: Some(snapshot_damped_lagrangian_gradient_x(
+                &full_dual_residual,
+                &bounds,
+                &fixed_variables,
+                barrier_parameter_value,
+                options.kappa_d,
+            )),
             kkt_slack_stationarity: Some(damped_slack_stationarity_residuals(
                 &lambda_ineq,
                 &z,
@@ -10144,6 +11181,23 @@ where
                 barrier_parameter_value,
             )),
             kkt_slack_sigma: Some(slack_sigma_values(&slack_barrier, &z)),
+            curr_grad_f: Some(snapshot_x_component_vector(
+                &current_lagrangian_components.curr_grad_f,
+                &fixed_variables,
+            )),
+            curr_jac_c_t_y_c: Some(snapshot_x_component_vector(
+                &current_lagrangian_components.curr_jac_c_t_y_c,
+                &fixed_variables,
+            )),
+            curr_jac_d_t_y_d: Some(snapshot_x_component_vector(
+                &current_lagrangian_components.curr_jac_d_t_y_d,
+                &fixed_variables,
+            )),
+            curr_grad_lag_x: Some(snapshot_x_component_vector(
+                &full_dual_residual,
+                &fixed_variables,
+            )),
+            curr_grad_lag_s: Some(slack_stationarity_residuals(&lambda_ineq, &z)),
             objective: state.objective_value,
             barrier_objective: Some(current_barrier_objective),
             eq_inf: (equality_count > 0).then_some(equality_inf),
@@ -10151,12 +11205,18 @@ where
             dual_inf,
             comp_inf: (barrier_pair_count > 0).then_some(complementarity_inf),
             overall_inf,
+            barrier_primal_inf: Some(primal_inf),
+            barrier_dual_inf: Some(dual_inf),
+            barrier_complementarity_inf: (barrier_pair_count > 0)
+                .then_some(barrier_complementarity_inf),
+            barrier_subproblem_error: Some(barrier_subproblem_error),
             barrier_parameter: (barrier_pair_count > 0).then_some(barrier_parameter_value),
             filter_theta: Some(current_theta),
             step_inf: None,
             alpha: None,
             alpha_pr: None,
             alpha_du: None,
+            alpha_y: None,
             line_search_iterations: None,
             line_search_trials: 0,
             regularization_size: Some(options.regularization),
@@ -10234,6 +11294,13 @@ where
                 lower_bound_multipliers: Some(z_lower.clone()),
                 upper_bound_multipliers: Some(z_upper.clone()),
                 kkt_inequality_residual: Some(inequality_residual.clone()),
+                kkt_x_stationarity: Some(snapshot_damped_lagrangian_gradient_x(
+                    &full_dual_residual,
+                    &bounds,
+                    &fixed_variables,
+                    barrier_parameter_value,
+                    options.kappa_d,
+                )),
                 kkt_slack_stationarity: Some(damped_slack_stationarity_residuals(
                     &lambda_ineq,
                     &z,
@@ -10246,6 +11313,23 @@ where
                     barrier_parameter_value,
                 )),
                 kkt_slack_sigma: Some(slack_sigma_values(&slack_barrier, &z)),
+                curr_grad_f: Some(snapshot_x_component_vector(
+                    &current_lagrangian_components.curr_grad_f,
+                    &fixed_variables,
+                )),
+                curr_jac_c_t_y_c: Some(snapshot_x_component_vector(
+                    &current_lagrangian_components.curr_jac_c_t_y_c,
+                    &fixed_variables,
+                )),
+                curr_jac_d_t_y_d: Some(snapshot_x_component_vector(
+                    &current_lagrangian_components.curr_jac_d_t_y_d,
+                    &fixed_variables,
+                )),
+                curr_grad_lag_x: Some(snapshot_x_component_vector(
+                    &full_dual_residual,
+                    &fixed_variables,
+                )),
+                curr_grad_lag_s: Some(slack_stationarity_residuals(&lambda_ineq, &z)),
                 objective: state.objective_value,
                 barrier_objective: Some(current_barrier_objective),
                 eq_inf: (equality_count > 0).then_some(equality_inf),
@@ -10253,12 +11337,18 @@ where
                 dual_inf,
                 comp_inf: (barrier_pair_count > 0).then_some(complementarity_inf),
                 overall_inf,
+                barrier_primal_inf: Some(primal_inf),
+                barrier_dual_inf: Some(dual_inf),
+                barrier_complementarity_inf: (barrier_pair_count > 0)
+                    .then_some(barrier_complementarity_inf),
+                barrier_subproblem_error: Some(barrier_subproblem_error),
                 barrier_parameter: (barrier_pair_count > 0).then_some(barrier_parameter_value),
                 filter_theta: Some(current_theta),
                 step_inf: None,
                 alpha: None,
                 alpha_pr: None,
                 alpha_du: None,
+                alpha_y: None,
                 line_search_iterations: None,
                 line_search_trials: 0,
                 regularization_size: Some(options.regularization),
@@ -10343,6 +11433,7 @@ where
                         alpha: None,
                         alpha_pr: None,
                         alpha_du: None,
+                        alpha_y: None,
                         line_search_iterations: None,
                         regularization_size: Some(options.regularization),
                         step_kind: None,
@@ -10408,10 +11499,36 @@ where
                     barrier_parameter_value,
                     options.kappa_d,
                 );
+                barrier_complementarity_inf = combined_complementarity_target_inf_norm(
+                    &slack_barrier,
+                    &z,
+                    &x,
+                    &bounds,
+                    &z_lower,
+                    &z_upper,
+                    barrier_parameter_value,
+                );
+                barrier_subproblem_error = scaled_overall_inf_norm(
+                    primal_inf,
+                    dual_inf,
+                    barrier_complementarity_inf,
+                    &all_dual_multipliers,
+                    &complementarity_multipliers,
+                    options.overall_scale_max,
+                );
                 current_filter_entry =
                     super::filter::entry(current_barrier_objective, current_theta);
                 current_snapshot.barrier_objective = Some(current_barrier_objective);
                 current_snapshot.barrier_parameter = Some(barrier_parameter_value);
+                current_snapshot.barrier_complementarity_inf = Some(barrier_complementarity_inf);
+                current_snapshot.barrier_subproblem_error = Some(barrier_subproblem_error);
+                current_snapshot.kkt_x_stationarity = Some(snapshot_damped_lagrangian_gradient_x(
+                    &full_dual_residual,
+                    &bounds,
+                    &fixed_variables,
+                    barrier_parameter_value,
+                    options.kappa_d,
+                ));
                 current_snapshot.kkt_slack_stationarity =
                     Some(damped_slack_stationarity_residuals(
                         &lambda_ineq,
@@ -10601,6 +11718,10 @@ where
             &mut profiling,
             options.verbose,
             false,
+            options
+                .linear_debug
+                .as_ref()
+                .is_some_and(|linear_debug| linear_debug.dump_dir.is_some()),
         );
         let mut direction = match solve_result {
             Ok(mut direction) => {
@@ -10794,6 +11915,7 @@ where
         let watchdog_reference = watchdog_state.reference.clone();
         let dual_alpha_limit = alpha_du.clamp(0.0, 1.0);
         let mut alpha = alpha_pr.clamp(0.0, 1.0);
+        let initial_alpha_y = alpha_for_y(alpha, dual_alpha_limit, &direction, options);
         if alpha <= 0.0 {
             return Err(InteriorPointSolveError::LineSearchFailed {
                 merit: merit_residual(
@@ -10814,10 +11936,13 @@ where
                     Some(InteriorPointLineSearchInfo {
                         initial_alpha_pr: alpha_pr,
                         initial_alpha_du: Some(alpha_du),
+                        initial_alpha_y: Some(initial_alpha_y),
                         accepted_alpha: None,
                         accepted_alpha_du: None,
+                        accepted_alpha_y: None,
                         last_tried_alpha: 0.0,
                         last_tried_alpha_du: Some(0.0),
+                        last_tried_alpha_y: None,
                         backtrack_count: 0,
                         sigma,
                         current_merit: merit_residual(
@@ -10879,6 +12004,7 @@ where
         let mut accepted = None;
         let mut last_tried_alpha_pr = alpha;
         let mut last_tried_alpha_du = dual_alpha_limit.min(alpha);
+        let mut last_tried_alpha_y = initial_alpha_y;
         let mut rejected_trials = Vec::new();
         let mut second_order_correction_attempted = false;
         let mut second_order_correction_used = false;
@@ -10896,6 +12022,7 @@ where
             let trial_alpha_y = alpha_for_y(trial_alpha_pr, trial_alpha_du, &direction, options);
             last_tried_alpha_pr = trial_alpha_pr;
             last_tried_alpha_du = trial_alpha_du;
+            last_tried_alpha_y = trial_alpha_y;
             let trial_x = x
                 .iter()
                 .zip(direction.dx.iter())
@@ -10994,13 +12121,14 @@ where
                 &trial_state.augmented_inequality_values,
                 &trial_slack,
             );
-            let trial_raw_dual_residual = lagrangian_gradient_sparse(
+            let trial_lagrangian_components = lagrangian_gradient_components(
                 &trial_state.gradient,
                 &trial_state.equality_jacobian,
                 &trial_lambda,
                 &trial_state.inequality_jacobian,
                 &trial_lambda_ineq,
             );
+            let trial_raw_dual_residual = trial_lagrangian_components.curr_grad_lag_x.clone();
             let mut trial_dual_residual = trial_raw_dual_residual.clone();
             add_native_bound_multiplier_terms(
                 &mut trial_dual_residual,
@@ -11138,6 +12266,21 @@ where
                         false,
                     )
                 };
+                let (accepted_barrier_complementarity_inf, accepted_barrier_subproblem_error) =
+                    barrier_subproblem_error_components(
+                        trial_primal_inf,
+                        accepted_dual_inf,
+                        &trial_slack_barrier,
+                        &accepted_z,
+                        &trial_x,
+                        &bounds,
+                        &accepted_z_lower,
+                        &accepted_z_upper,
+                        &trial_lambda,
+                        &trial_lambda_ineq,
+                        barrier_parameter_value,
+                        options,
+                    );
                 accepted = Some(AcceptedInteriorPointTrial {
                     x: trial_x,
                     lambda: trial_lambda,
@@ -11145,6 +12288,15 @@ where
                     kkt_inequality_residual: slack_form_inequality_residuals(
                         &trial_state.augmented_inequality_values,
                         &trial_slack,
+                    ),
+                    kkt_x_stationarity: snapshot_damped_lagrangian_gradient_x_with_bound_terms(
+                        &trial_raw_dual_residual,
+                        &bounds,
+                        &fixed_variables,
+                        &accepted_z_lower,
+                        &accepted_z_upper,
+                        barrier_parameter_value,
+                        options.kappa_d,
                     ),
                     kkt_slack_stationarity: damped_slack_stationarity_residuals(
                         &trial_lambda_ineq,
@@ -11158,6 +12310,26 @@ where
                         barrier_parameter_value,
                     ),
                     kkt_slack_sigma: slack_sigma_values(&trial_slack_barrier, &accepted_z),
+                    curr_grad_f: snapshot_x_component_vector(
+                        &trial_lagrangian_components.curr_grad_f,
+                        &fixed_variables,
+                    ),
+                    curr_jac_c_t_y_c: snapshot_x_component_vector(
+                        &trial_lagrangian_components.curr_jac_c_t_y_c,
+                        &fixed_variables,
+                    ),
+                    curr_jac_d_t_y_d: snapshot_x_component_vector(
+                        &trial_lagrangian_components.curr_jac_d_t_y_d,
+                        &fixed_variables,
+                    ),
+                    curr_grad_lag_x: snapshot_lagrangian_gradient_x_with_bound_terms(
+                        &trial_raw_dual_residual,
+                        &bounds,
+                        &fixed_variables,
+                        &accepted_z_lower,
+                        &accepted_z_upper,
+                    ),
+                    curr_grad_lag_s: slack_stationarity_residuals(&trial_lambda_ineq, &accepted_z),
                     slack: trial_slack,
                     z: accepted_z,
                     z_lower: accepted_z_lower,
@@ -11169,6 +12341,10 @@ where
                     dual_inf: accepted_dual_inf,
                     complementarity_inf: accepted_comp_inf,
                     overall_inf: accepted_overall_inf,
+                    barrier_primal_inf: trial_primal_inf,
+                    barrier_dual_inf: accepted_dual_inf,
+                    barrier_complementarity_inf: accepted_barrier_complementarity_inf,
+                    barrier_subproblem_error: accepted_barrier_subproblem_error,
                     mu: accepted_mu,
                     filter_theta: trial_filter_theta,
                     filter_entry: trial_filter_entry.clone(),
@@ -11180,10 +12356,13 @@ where
                     phase: InteriorPointIterationPhase::AcceptedStep,
                     accepted_alpha_pr: trial_alpha_pr,
                     accepted_alpha_du: Some(trial_alpha_du),
+                    accepted_alpha_y: Some(trial_alpha_y),
                     line_search_initial_alpha_pr: alpha_pr,
                     line_search_initial_alpha_du: Some(alpha_du),
+                    line_search_initial_alpha_y: Some(initial_alpha_y),
                     line_search_last_alpha_pr: trial_alpha_pr,
                     line_search_last_alpha_du: Some(trial_alpha_du),
+                    line_search_last_alpha_y: Some(trial_alpha_y),
                     line_search_backtrack_count: 0,
                     second_order_correction_used: false,
                     watchdog_accepted: false,
@@ -11291,6 +12470,21 @@ where
                         false,
                     )
                 };
+                let (accepted_barrier_complementarity_inf, accepted_barrier_subproblem_error) =
+                    barrier_subproblem_error_components(
+                        trial_primal_inf,
+                        accepted_dual_inf,
+                        &trial_slack_barrier,
+                        &accepted_z,
+                        &trial_x,
+                        &bounds,
+                        &accepted_z_lower,
+                        &accepted_z_upper,
+                        &trial_lambda,
+                        &trial_lambda_ineq,
+                        barrier_parameter_value,
+                        options,
+                    );
                 accepted = Some(AcceptedInteriorPointTrial {
                     x: trial_x,
                     lambda: trial_lambda,
@@ -11298,6 +12492,15 @@ where
                     kkt_inequality_residual: slack_form_inequality_residuals(
                         &trial_state.augmented_inequality_values,
                         &trial_slack,
+                    ),
+                    kkt_x_stationarity: snapshot_damped_lagrangian_gradient_x_with_bound_terms(
+                        &trial_raw_dual_residual,
+                        &bounds,
+                        &fixed_variables,
+                        &accepted_z_lower,
+                        &accepted_z_upper,
+                        barrier_parameter_value,
+                        options.kappa_d,
                     ),
                     kkt_slack_stationarity: damped_slack_stationarity_residuals(
                         &trial_lambda_ineq,
@@ -11311,6 +12514,26 @@ where
                         barrier_parameter_value,
                     ),
                     kkt_slack_sigma: slack_sigma_values(&trial_slack_barrier, &accepted_z),
+                    curr_grad_f: snapshot_x_component_vector(
+                        &trial_lagrangian_components.curr_grad_f,
+                        &fixed_variables,
+                    ),
+                    curr_jac_c_t_y_c: snapshot_x_component_vector(
+                        &trial_lagrangian_components.curr_jac_c_t_y_c,
+                        &fixed_variables,
+                    ),
+                    curr_jac_d_t_y_d: snapshot_x_component_vector(
+                        &trial_lagrangian_components.curr_jac_d_t_y_d,
+                        &fixed_variables,
+                    ),
+                    curr_grad_lag_x: snapshot_lagrangian_gradient_x_with_bound_terms(
+                        &trial_raw_dual_residual,
+                        &bounds,
+                        &fixed_variables,
+                        &accepted_z_lower,
+                        &accepted_z_upper,
+                    ),
+                    curr_grad_lag_s: slack_stationarity_residuals(&trial_lambda_ineq, &accepted_z),
                     slack: trial_slack,
                     z: accepted_z,
                     z_lower: accepted_z_lower,
@@ -11322,6 +12545,10 @@ where
                     dual_inf: accepted_dual_inf,
                     complementarity_inf: accepted_comp_inf,
                     overall_inf: accepted_overall_inf,
+                    barrier_primal_inf: trial_primal_inf,
+                    barrier_dual_inf: accepted_dual_inf,
+                    barrier_complementarity_inf: accepted_barrier_complementarity_inf,
+                    barrier_subproblem_error: accepted_barrier_subproblem_error,
                     mu: accepted_mu,
                     filter_theta: trial_filter_theta,
                     filter_entry: trial_filter_entry.clone(),
@@ -11342,10 +12569,13 @@ where
                     phase: InteriorPointIterationPhase::AcceptedStep,
                     accepted_alpha_pr: trial_alpha_pr,
                     accepted_alpha_du: Some(trial_alpha_du),
+                    accepted_alpha_y: Some(trial_alpha_y),
                     line_search_initial_alpha_pr: alpha_pr,
                     line_search_initial_alpha_du: Some(alpha_du),
+                    line_search_initial_alpha_y: Some(initial_alpha_y),
                     line_search_last_alpha_pr: trial_alpha_pr,
                     line_search_last_alpha_du: Some(trial_alpha_du),
+                    line_search_last_alpha_y: Some(trial_alpha_y),
                     line_search_backtrack_count: line_search_iterations,
                     second_order_correction_used: false,
                     watchdog_accepted: false,
@@ -11382,12 +12612,16 @@ where
                     let soc_eq_residual = soc_trial_eq_values
                         .iter()
                         .zip(soc_eq_accumulator.iter())
-                        .map(|(trial_i, previous_i)| trial_i + soc_alpha_pr * previous_i)
+                        .map(|(trial_i, previous_i)| {
+                            ipopt_soc_constraint_accumulator(*trial_i, soc_alpha_pr, *previous_i)
+                        })
                         .collect::<Vec<_>>();
                     let soc_ineq_residual = soc_trial_ineq_residual
                         .iter()
                         .zip(soc_ineq_accumulator.iter())
-                        .map(|(trial_i, previous_i)| trial_i + soc_alpha_pr * previous_i)
+                        .map(|(trial_i, previous_i)| {
+                            ipopt_soc_constraint_accumulator(*trial_i, soc_alpha_pr, *previous_i)
+                        })
                         .collect::<Vec<_>>();
                     soc_eq_accumulator = soc_eq_residual.clone();
                     soc_ineq_accumulator = soc_ineq_residual.clone();
@@ -11412,6 +12646,7 @@ where
                         &mut profiling,
                         options.verbose,
                         true,
+                        false,
                     ) {
                         Ok(direction) => direction,
                         Err(_) => break,
@@ -11624,13 +12859,15 @@ where
                                 ipopt_dense_current_plus_step(*value, soc_alpha_du, *delta)
                             })
                             .collect::<Vec<_>>();
-                        let corrected_raw_dual_residual = lagrangian_gradient_sparse(
+                        let corrected_lagrangian_components = lagrangian_gradient_components(
                             &corrected_state.gradient,
                             &corrected_state.equality_jacobian,
                             &corrected_lambda,
                             &corrected_state.inequality_jacobian,
                             &corrected_lambda_ineq,
                         );
+                        let corrected_raw_dual_residual =
+                            corrected_lagrangian_components.curr_grad_lag_x.clone();
                         let mut corrected_dual_residual = corrected_raw_dual_residual.clone();
                         add_native_bound_multiplier_terms(
                             &mut corrected_dual_residual,
@@ -11764,6 +13001,23 @@ where
                                 false,
                             )
                         };
+                        let (
+                            accepted_barrier_complementarity_inf,
+                            accepted_barrier_subproblem_error,
+                        ) = barrier_subproblem_error_components(
+                            corrected_primal_inf,
+                            accepted_dual_inf,
+                            &corrected_slack_barrier,
+                            &accepted_z,
+                            &corrected_x,
+                            &bounds,
+                            &accepted_z_lower,
+                            &accepted_z_upper,
+                            &corrected_lambda,
+                            &corrected_lambda_ineq,
+                            barrier_parameter_value,
+                            options,
+                        );
                         accepted = Some(AcceptedInteriorPointTrial {
                             x: corrected_x,
                             lambda: corrected_lambda,
@@ -11772,6 +13026,16 @@ where
                                 &corrected_state.augmented_inequality_values,
                                 &corrected_slack,
                             ),
+                            kkt_x_stationarity:
+                                snapshot_damped_lagrangian_gradient_x_with_bound_terms(
+                                    &corrected_raw_dual_residual,
+                                    &bounds,
+                                    &fixed_variables,
+                                    &accepted_z_lower,
+                                    &accepted_z_upper,
+                                    barrier_parameter_value,
+                                    options.kappa_d,
+                                ),
                             kkt_slack_stationarity: damped_slack_stationarity_residuals(
                                 &corrected_lambda_ineq,
                                 &accepted_z,
@@ -11787,6 +13051,29 @@ where
                                 &corrected_slack_barrier,
                                 &accepted_z,
                             ),
+                            curr_grad_f: snapshot_x_component_vector(
+                                &corrected_lagrangian_components.curr_grad_f,
+                                &fixed_variables,
+                            ),
+                            curr_jac_c_t_y_c: snapshot_x_component_vector(
+                                &corrected_lagrangian_components.curr_jac_c_t_y_c,
+                                &fixed_variables,
+                            ),
+                            curr_jac_d_t_y_d: snapshot_x_component_vector(
+                                &corrected_lagrangian_components.curr_jac_d_t_y_d,
+                                &fixed_variables,
+                            ),
+                            curr_grad_lag_x: snapshot_lagrangian_gradient_x_with_bound_terms(
+                                &corrected_raw_dual_residual,
+                                &bounds,
+                                &fixed_variables,
+                                &accepted_z_lower,
+                                &accepted_z_upper,
+                            ),
+                            curr_grad_lag_s: slack_stationarity_residuals(
+                                &corrected_lambda_ineq,
+                                &accepted_z,
+                            ),
                             slack: corrected_slack,
                             z: accepted_z,
                             z_lower: accepted_z_lower,
@@ -11798,6 +13085,10 @@ where
                             dual_inf: accepted_dual_inf,
                             complementarity_inf: accepted_comp_inf,
                             overall_inf: accepted_overall_inf,
+                            barrier_primal_inf: corrected_primal_inf,
+                            barrier_dual_inf: accepted_dual_inf,
+                            barrier_complementarity_inf: accepted_barrier_complementarity_inf,
+                            barrier_subproblem_error: accepted_barrier_subproblem_error,
                             mu: accepted_mu,
                             filter_theta: corrected_filter_theta,
                             filter_entry: corrected_filter_entry.clone(),
@@ -11817,10 +13108,13 @@ where
                             phase: InteriorPointIterationPhase::AcceptedStep,
                             accepted_alpha_pr: soc_alpha_pr,
                             accepted_alpha_du: Some(soc_alpha_du),
+                            accepted_alpha_y: Some(soc_alpha_y),
                             line_search_initial_alpha_pr: alpha_pr,
                             line_search_initial_alpha_du: Some(alpha_du),
+                            line_search_initial_alpha_y: Some(initial_alpha_y),
                             line_search_last_alpha_pr: soc_alpha_pr,
                             line_search_last_alpha_du: Some(soc_alpha_du),
+                            line_search_last_alpha_y: Some(soc_alpha_y),
                             line_search_backtrack_count: line_search_iterations,
                             second_order_correction_used: true,
                             watchdog_accepted: false,
@@ -11984,6 +13278,21 @@ where
                         false,
                     )
                 };
+                let (accepted_barrier_complementarity_inf, accepted_barrier_subproblem_error) =
+                    barrier_subproblem_error_components(
+                        trial_primal_inf,
+                        accepted_dual_inf,
+                        &trial_slack_barrier,
+                        &accepted_z,
+                        &trial_x,
+                        &bounds,
+                        &accepted_z_lower,
+                        &accepted_z_upper,
+                        &trial_lambda,
+                        &trial_lambda_ineq,
+                        barrier_parameter_value,
+                        options,
+                    );
                 accepted = Some(AcceptedInteriorPointTrial {
                     x: trial_x,
                     lambda: trial_lambda,
@@ -11991,6 +13300,15 @@ where
                     kkt_inequality_residual: slack_form_inequality_residuals(
                         &trial_state.augmented_inequality_values,
                         &trial_slack,
+                    ),
+                    kkt_x_stationarity: snapshot_damped_lagrangian_gradient_x_with_bound_terms(
+                        &trial_raw_dual_residual,
+                        &bounds,
+                        &fixed_variables,
+                        &accepted_z_lower,
+                        &accepted_z_upper,
+                        barrier_parameter_value,
+                        options.kappa_d,
                     ),
                     kkt_slack_stationarity: damped_slack_stationarity_residuals(
                         &trial_lambda_ineq,
@@ -12004,6 +13322,26 @@ where
                         barrier_parameter_value,
                     ),
                     kkt_slack_sigma: slack_sigma_values(&trial_slack_barrier, &accepted_z),
+                    curr_grad_f: snapshot_x_component_vector(
+                        &trial_lagrangian_components.curr_grad_f,
+                        &fixed_variables,
+                    ),
+                    curr_jac_c_t_y_c: snapshot_x_component_vector(
+                        &trial_lagrangian_components.curr_jac_c_t_y_c,
+                        &fixed_variables,
+                    ),
+                    curr_jac_d_t_y_d: snapshot_x_component_vector(
+                        &trial_lagrangian_components.curr_jac_d_t_y_d,
+                        &fixed_variables,
+                    ),
+                    curr_grad_lag_x: snapshot_lagrangian_gradient_x_with_bound_terms(
+                        &trial_raw_dual_residual,
+                        &bounds,
+                        &fixed_variables,
+                        &accepted_z_lower,
+                        &accepted_z_upper,
+                    ),
+                    curr_grad_lag_s: slack_stationarity_residuals(&trial_lambda_ineq, &accepted_z),
                     slack: trial_slack,
                     z: accepted_z,
                     z_lower: accepted_z_lower,
@@ -12015,6 +13353,10 @@ where
                     dual_inf: accepted_dual_inf,
                     complementarity_inf: accepted_comp_inf,
                     overall_inf: accepted_overall_inf,
+                    barrier_primal_inf: trial_primal_inf,
+                    barrier_dual_inf: accepted_dual_inf,
+                    barrier_complementarity_inf: accepted_barrier_complementarity_inf,
+                    barrier_subproblem_error: accepted_barrier_subproblem_error,
                     mu: accepted_mu,
                     filter_theta: trial_filter_theta,
                     filter_entry: trial_filter_entry.clone(),
@@ -12035,10 +13377,13 @@ where
                     phase: InteriorPointIterationPhase::AcceptedStep,
                     accepted_alpha_pr: trial_alpha_pr,
                     accepted_alpha_du: Some(trial_alpha_du),
+                    accepted_alpha_y: Some(trial_alpha_y),
                     line_search_initial_alpha_pr: alpha_pr,
                     line_search_initial_alpha_du: Some(alpha_du),
+                    line_search_initial_alpha_y: Some(initial_alpha_y),
                     line_search_last_alpha_pr: trial_alpha_pr,
                     line_search_last_alpha_du: Some(trial_alpha_du),
+                    line_search_last_alpha_y: Some(trial_alpha_y),
                     line_search_backtrack_count: line_search_iterations,
                     second_order_correction_used: false,
                     watchdog_accepted: true,
@@ -12127,14 +13472,15 @@ where
                     options.regularization,
                     options.linear_solver,
                 );
-                let restored_raw_dual_residual = lagrangian_gradient_sparse(
+                let restored_lagrangian_components = lagrangian_gradient_components(
                     &restored_state.gradient,
                     &restored_state.equality_jacobian,
                     &restored_lambda,
                     &restored_state.inequality_jacobian,
                     &restored_lambda_ineq,
                 );
-                let mut restored_dual_residual = restored_raw_dual_residual;
+                let mut restored_dual_residual =
+                    restored_lagrangian_components.curr_grad_lag_x.clone();
                 add_native_bound_multiplier_terms(
                     &mut restored_dual_residual,
                     &bounds,
@@ -12199,6 +13545,21 @@ where
                 if restoration_filter_assessment.current_iterate_acceptable
                     && restoration_filter_assessment.filter_acceptable
                 {
+                    let (restored_barrier_complementarity_inf, restored_barrier_subproblem_error) =
+                        barrier_subproblem_error_components(
+                            restored_primal_inf,
+                            restored_dual_inf,
+                            &[],
+                            &z,
+                            &restored_x,
+                            &bounds,
+                            &z_lower,
+                            &z_upper,
+                            &restored_lambda,
+                            &restored_lambda_ineq,
+                            barrier_parameter_value,
+                            options,
+                        );
                     push_unique_nlip_event(
                         &mut iteration_events,
                         InteriorPointIterationEvent::RestorationPhaseAccepted,
@@ -12212,9 +13573,33 @@ where
                         z_lower: z_lower.clone(),
                         z_upper: z_upper.clone(),
                         kkt_inequality_residual: Vec::new(),
+                        kkt_x_stationarity: snapshot_damped_lagrangian_gradient_x(
+                            &restored_dual_residual,
+                            &bounds,
+                            &fixed_variables,
+                            barrier_parameter_value,
+                            options.kappa_d,
+                        ),
                         kkt_slack_stationarity: Vec::new(),
                         kkt_slack_complementarity: Vec::new(),
                         kkt_slack_sigma: Vec::new(),
+                        curr_grad_f: snapshot_x_component_vector(
+                            &restored_lagrangian_components.curr_grad_f,
+                            &fixed_variables,
+                        ),
+                        curr_jac_c_t_y_c: snapshot_x_component_vector(
+                            &restored_lagrangian_components.curr_jac_c_t_y_c,
+                            &fixed_variables,
+                        ),
+                        curr_jac_d_t_y_d: snapshot_x_component_vector(
+                            &restored_lagrangian_components.curr_jac_d_t_y_d,
+                            &fixed_variables,
+                        ),
+                        curr_grad_lag_x: snapshot_x_component_vector(
+                            &restored_dual_residual,
+                            &fixed_variables,
+                        ),
+                        curr_grad_lag_s: Vec::new(),
                         objective: restored_state.objective_value,
                         barrier_objective: restored_barrier_objective,
                         equality_inf: restored_eq_inf,
@@ -12222,6 +13607,10 @@ where
                         dual_inf: restored_dual_inf,
                         complementarity_inf: restored_complementarity_inf,
                         overall_inf: restored_overall_inf,
+                        barrier_primal_inf: restored_primal_inf,
+                        barrier_dual_inf: restored_dual_inf,
+                        barrier_complementarity_inf: restored_barrier_complementarity_inf,
+                        barrier_subproblem_error: restored_barrier_subproblem_error,
                         mu: barrier_parameter_value,
                         filter_entry: restored_filter_entry,
                         filter_augment_entry: Some(super::filter::augment_entry(
@@ -12238,10 +13627,13 @@ where
                         phase: InteriorPointIterationPhase::AcceptedStep,
                         accepted_alpha_pr: last_tried_alpha_pr,
                         accepted_alpha_du: Some(0.0),
+                        accepted_alpha_y: None,
                         line_search_initial_alpha_pr: alpha_pr,
                         line_search_initial_alpha_du: Some(alpha_du),
+                        line_search_initial_alpha_y: Some(initial_alpha_y),
                         line_search_last_alpha_pr: last_tried_alpha_pr,
                         line_search_last_alpha_du: Some(last_tried_alpha_du),
+                        line_search_last_alpha_y: Some(last_tried_alpha_y),
                         line_search_backtrack_count: line_search_iterations,
                         second_order_correction_used: false,
                         watchdog_accepted: false,
@@ -12268,10 +13660,13 @@ where
                     Some(InteriorPointLineSearchInfo {
                         initial_alpha_pr: alpha_pr,
                         initial_alpha_du: Some(alpha_du),
+                        initial_alpha_y: Some(initial_alpha_y),
                         accepted_alpha: None,
                         accepted_alpha_du: None,
+                        accepted_alpha_y: None,
                         last_tried_alpha: last_tried_alpha_pr,
                         last_tried_alpha_du: Some(last_tried_alpha_du),
+                        last_tried_alpha_y: Some(last_tried_alpha_y),
                         backtrack_count: line_search_iterations,
                         sigma,
                         current_merit,
@@ -12318,10 +13713,13 @@ where
         let line_search_info = InteriorPointLineSearchInfo {
             initial_alpha_pr: accepted_trial.line_search_initial_alpha_pr,
             initial_alpha_du: accepted_trial.line_search_initial_alpha_du,
+            initial_alpha_y: accepted_trial.line_search_initial_alpha_y,
             accepted_alpha: Some(accepted_trial.accepted_alpha_pr),
             accepted_alpha_du: accepted_trial.accepted_alpha_du,
+            accepted_alpha_y: accepted_trial.accepted_alpha_y,
             last_tried_alpha: accepted_trial.line_search_last_alpha_pr,
             last_tried_alpha_du: accepted_trial.line_search_last_alpha_du,
+            last_tried_alpha_y: accepted_trial.line_search_last_alpha_y,
             backtrack_count: accepted_trial.line_search_backtrack_count,
             sigma,
             current_merit,
@@ -12445,6 +13843,7 @@ where
                     alpha: Some(accepted_trial.accepted_alpha_pr),
                     alpha_pr: Some(accepted_trial.accepted_alpha_pr),
                     alpha_du: accepted_trial.accepted_alpha_du,
+                    alpha_y: accepted_trial.accepted_alpha_y,
                     line_search_iterations: Some(accepted_trial.line_search_backtrack_count),
                     regularization_size: accepted_regularization_size,
                     step_kind: Some(accepted_trial.step_kind),
@@ -12468,9 +13867,15 @@ where
             lower_bound_multipliers: Some(accepted_trial.z_lower.clone()),
             upper_bound_multipliers: Some(accepted_trial.z_upper.clone()),
             kkt_inequality_residual: Some(accepted_trial.kkt_inequality_residual.clone()),
+            kkt_x_stationarity: Some(accepted_trial.kkt_x_stationarity.clone()),
             kkt_slack_stationarity: Some(accepted_trial.kkt_slack_stationarity.clone()),
             kkt_slack_complementarity: Some(accepted_trial.kkt_slack_complementarity.clone()),
             kkt_slack_sigma: Some(accepted_trial.kkt_slack_sigma.clone()),
+            curr_grad_f: Some(accepted_trial.curr_grad_f.clone()),
+            curr_jac_c_t_y_c: Some(accepted_trial.curr_jac_c_t_y_c.clone()),
+            curr_jac_d_t_y_d: Some(accepted_trial.curr_jac_d_t_y_d.clone()),
+            curr_grad_lag_x: Some(accepted_trial.curr_grad_lag_x.clone()),
+            curr_grad_lag_s: Some(accepted_trial.curr_grad_lag_s.clone()),
             objective: accepted_trial.objective,
             barrier_objective: Some(accepted_trial.barrier_objective),
             eq_inf: (equality_count > 0).then_some(accepted_trial.equality_inf),
@@ -12478,12 +13883,18 @@ where
             dual_inf: accepted_trial.dual_inf,
             comp_inf: (barrier_pair_count > 0).then_some(accepted_trial.complementarity_inf),
             overall_inf: accepted_trial.overall_inf,
+            barrier_primal_inf: Some(accepted_trial.barrier_primal_inf),
+            barrier_dual_inf: Some(accepted_trial.barrier_dual_inf),
+            barrier_complementarity_inf: (barrier_pair_count > 0)
+                .then_some(accepted_trial.barrier_complementarity_inf),
+            barrier_subproblem_error: Some(accepted_trial.barrier_subproblem_error),
             barrier_parameter: (barrier_pair_count > 0).then_some(accepted_trial.mu),
             filter_theta: Some(accepted_trial.filter_theta),
             step_inf: Some(step_inf),
             alpha: Some(accepted_trial.accepted_alpha_pr),
             alpha_pr: Some(accepted_trial.accepted_alpha_pr),
             alpha_du: accepted_trial.accepted_alpha_du,
+            alpha_y: accepted_trial.accepted_alpha_y,
             line_search_iterations: Some(accepted_trial.line_search_backtrack_count),
             line_search_trials: accepted_trial.line_search_backtrack_count,
             regularization_size: accepted_regularization_size,

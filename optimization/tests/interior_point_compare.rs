@@ -782,6 +782,96 @@ fn maybe_print_native_trace(
     }
 }
 
+fn assert_ipopt_component_snapshots(problem_name: &str, summary: &optimization::IpoptSummary) {
+    assert!(
+        !summary.snapshots.is_empty(),
+        "{problem_name} IPOPT comparison produced no iteration snapshots"
+    );
+    for snapshot in &summary.snapshots {
+        assert_eq!(
+            snapshot.curr_grad_f.len(),
+            snapshot.x.len(),
+            "{problem_name} IPOPT curr_grad_f length mismatch at iteration {}",
+            snapshot.iteration
+        );
+        assert_eq!(
+            snapshot.curr_jac_c_t_y_c.len(),
+            snapshot.x.len(),
+            "{problem_name} IPOPT curr_jac_c_t_y_c length mismatch at iteration {}",
+            snapshot.iteration
+        );
+        assert_eq!(
+            snapshot.curr_jac_d_t_y_d.len(),
+            snapshot.x.len(),
+            "{problem_name} IPOPT curr_jac_d_t_y_d length mismatch at iteration {}",
+            snapshot.iteration
+        );
+        assert_eq!(
+            snapshot.curr_grad_lag_x.len(),
+            snapshot.x.len(),
+            "{problem_name} IPOPT curr_grad_lag_x length mismatch at iteration {}",
+            snapshot.iteration
+        );
+        assert_eq!(
+            snapshot.kkt_x_stationarity.len(),
+            snapshot.x.len(),
+            "{problem_name} IPOPT kkt_x_stationarity length mismatch at iteration {}",
+            snapshot.iteration
+        );
+        assert_eq!(
+            snapshot.curr_grad_lag_s.len(),
+            snapshot.internal_slack.len(),
+            "{problem_name} IPOPT curr_grad_lag_s length mismatch at iteration {}",
+            snapshot.iteration
+        );
+        assert_eq!(
+            snapshot.kkt_slack_stationarity.len(),
+            snapshot.internal_slack.len(),
+            "{problem_name} IPOPT kkt_slack_stationarity length mismatch at iteration {}",
+            snapshot.iteration
+        );
+        assert_eq!(
+            snapshot.kkt_equality_residual.len(),
+            snapshot.equality_multipliers.len(),
+            "{problem_name} IPOPT equality residual length mismatch at iteration {}",
+            snapshot.iteration
+        );
+        assert_eq!(
+            snapshot.kkt_inequality_residual.len(),
+            snapshot.inequality_multipliers.len(),
+            "{problem_name} IPOPT inequality residual length mismatch at iteration {}",
+            snapshot.iteration
+        );
+        assert_eq!(
+            snapshot.kkt_slack_complementarity.len(),
+            snapshot.internal_slack.len(),
+            "{problem_name} IPOPT slack complementarity length mismatch at iteration {}",
+            snapshot.iteration
+        );
+        assert_eq!(
+            snapshot.kkt_slack_sigma.len(),
+            snapshot.internal_slack.len(),
+            "{problem_name} IPOPT slack sigma length mismatch at iteration {}",
+            snapshot.iteration
+        );
+        assert_eq!(
+            snapshot.kkt_slack_distance.len(),
+            snapshot.internal_slack.len(),
+            "{problem_name} IPOPT slack distance length mismatch at iteration {}",
+            snapshot.iteration
+        );
+        assert!(
+            snapshot.curr_barrier_error.is_finite()
+                && snapshot.curr_primal_infeasibility.is_finite()
+                && snapshot.curr_dual_infeasibility.is_finite()
+                && snapshot.curr_complementarity.is_finite()
+                && snapshot.curr_nlp_error.is_finite(),
+            "{problem_name} IPOPT component scalar snapshot is not finite at iteration {}",
+            snapshot.iteration
+        );
+    }
+}
+
 fn assert_native_matches_ipopt(
     problem_name: &str,
     backend: Option<CallbackBackend>,
@@ -796,6 +886,7 @@ fn assert_native_matches_ipopt(
         optimization::InteriorPointLinearSolver::SpralSrc
     );
     assert_source_built_spral_ipopt_provenance(ipopt);
+    assert_ipopt_component_snapshots(problem_name, ipopt);
     assert_abs_diff_eq!(
         native.objective,
         ipopt.objective,

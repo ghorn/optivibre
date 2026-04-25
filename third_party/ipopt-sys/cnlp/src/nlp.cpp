@@ -5,8 +5,13 @@
 #include <coin/IpIpoptData.hpp>
 #include <coin/IpIteratesVector.hpp>
 #include <coin/IpDenseVector.hpp>
+#include <coin/IpGenTMatrix.hpp>
 
 #include <algorithm>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace {
 
@@ -27,6 +32,158 @@ DenseVectorView dense_vector_view(const Ipopt::SmartPtr<const Ipopt::Vector>& ve
         }
     }
     return view;
+}
+
+void print_double_bits(FILE* file, double value)
+{
+    std::uint64_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    std::fprintf(file, "0x%016" PRIx64, bits);
+}
+
+void dump_index_array(FILE* file, const char* name, Ipopt::Index count, const Ipopt::Index* values)
+{
+    std::fprintf(file, "%s=[", name);
+    for (Ipopt::Index i = 0; i < count; i++) {
+        std::fprintf(file, "%s%lld", i == 0 ? "" : ",", static_cast<long long>(values[i]));
+    }
+    std::fprintf(file, "]\n");
+}
+
+void dump_number_array(FILE* file, const char* name, Ipopt::Index count, const Ipopt::Number* values)
+{
+    std::fprintf(file, "%s=[", name);
+    for (Ipopt::Index i = 0; i < count; i++) {
+        std::fprintf(file, "%s%.17e", i == 0 ? "" : ",", values[i]);
+    }
+    std::fprintf(file, "]\n");
+
+    std::fprintf(file, "%s_bits=[", name);
+    for (Ipopt::Index i = 0; i < count; i++) {
+        if (i != 0) {
+            std::fprintf(file, ",");
+        }
+        print_double_bits(file, values[i]);
+    }
+    std::fprintf(file, "]\n");
+}
+
+bool dump_iter_requested(Ipopt::Index iter)
+{
+    const char* iter_text = std::getenv("GLIDER_PARITY_IPOPT_JAC_DUMP_ITER");
+    if (iter_text == nullptr || iter_text[0] == '\0') {
+        return true;
+    }
+    char* end = nullptr;
+    const long long requested = std::strtoll(iter_text, &end, 10);
+    return end != iter_text && requested == static_cast<long long>(iter);
+}
+
+FILE* open_jacobian_dump(Ipopt::Index iter)
+{
+    const char* dump_dir = std::getenv("GLIDER_PARITY_IPOPT_JAC_DUMP_DIR");
+    if (dump_dir == nullptr || dump_dir[0] == '\0' || !dump_iter_requested(iter)) {
+        return nullptr;
+    }
+
+    char path[4096];
+    std::snprintf(
+        path,
+        sizeof(path),
+        "%s/ipopt_jac_iter_%04lld.txt",
+        dump_dir,
+        static_cast<long long>(iter));
+    return std::fopen(path, "w");
+}
+
+void dump_gen_t_matrix(FILE* file, const char* prefix, const Ipopt::SmartPtr<const Ipopt::Matrix>& matrix)
+{
+    const auto* gen = dynamic_cast<const Ipopt::GenTMatrix*>(Ipopt::GetRawPtr(matrix));
+    if (gen == nullptr) {
+        std::fprintf(file, "%s_kind=unavailable\n", prefix);
+        return;
+    }
+
+    std::fprintf(file, "%s_kind=GenTMatrix\n", prefix);
+    std::fprintf(file, "%s_rows=%lld\n", prefix, static_cast<long long>(gen->NRows()));
+    std::fprintf(file, "%s_cols=%lld\n", prefix, static_cast<long long>(gen->NCols()));
+    std::fprintf(file, "%s_nonzeros=%lld\n", prefix, static_cast<long long>(gen->Nonzeros()));
+
+    char name[128];
+    std::snprintf(name, sizeof(name), "%s_irows", prefix);
+    dump_index_array(file, name, gen->Nonzeros(), gen->Irows());
+    std::snprintf(name, sizeof(name), "%s_jcols", prefix);
+    dump_index_array(file, name, gen->Nonzeros(), gen->Jcols());
+    std::snprintf(name, sizeof(name), "%s_values", prefix);
+    dump_number_array(file, name, gen->Nonzeros(), gen->Values());
+}
+
+void dump_forced_transpose_product(
+    FILE* file,
+    const char* name,
+    const Ipopt::SmartPtr<const Ipopt::Matrix>& matrix,
+    const Ipopt::SmartPtr<const Ipopt::Vector>& vector,
+    const Ipopt::SmartPtr<const Ipopt::Vector>& output_space)
+{
+    if (!Ipopt::IsValid(matrix) || !Ipopt::IsValid(vector) || !Ipopt::IsValid(output_space)) {
+        std::fprintf(file, "%s_count=0\n", name);
+        return;
+    }
+
+    Ipopt::SmartPtr<Ipopt::Vector> product = output_space->MakeNew();
+    matrix->TransMultVector(1.0, *vector, 0.0, *product);
+    const auto* dense_product =
+        dynamic_cast<const Ipopt::DenseVector*>(Ipopt::GetRawPtr(product));
+    if (dense_product == nullptr) {
+        std::fprintf(file, "%s_count=0\n", name);
+        return;
+    }
+
+    std::fprintf(file, "%s_count=%lld\n", name, static_cast<long long>(dense_product->Dim()));
+    dump_number_array(file, name, dense_product->Dim(), dense_product->ExpandedValues());
+}
+
+void dump_jacobian_state(
+    Ipopt::Index iter,
+    Ipopt::Number mu,
+    const Ipopt::IpoptData* ip_data,
+    Ipopt::IpoptCalculatedQuantities* ip_cq,
+    const DenseVectorView& y_c_view,
+    const DenseVectorView& y_d_view,
+    const DenseVectorView& curr_jac_cT_y_c_view,
+    const DenseVectorView& curr_jac_dT_y_d_view)
+{
+    FILE* file = open_jacobian_dump(iter);
+    if (file == nullptr) {
+        return;
+    }
+
+    std::fprintf(file, "version=1\n");
+    std::fprintf(file, "iter=%lld\n", static_cast<long long>(iter));
+    std::fprintf(file, "mu=%.17e\n", mu);
+    dump_number_array(file, "y_c", y_c_view.count, y_c_view.values);
+    dump_number_array(file, "y_d", y_d_view.count, y_d_view.values);
+    dump_number_array(file, "curr_jac_cT_y_c", curr_jac_cT_y_c_view.count, curr_jac_cT_y_c_view.values);
+    dump_number_array(file, "curr_jac_dT_y_d", curr_jac_dT_y_d_view.count, curr_jac_dT_y_d_view.values);
+    Ipopt::SmartPtr<const Ipopt::Matrix> jac_c = ip_cq->curr_jac_c();
+    Ipopt::SmartPtr<const Ipopt::Matrix> jac_d = ip_cq->curr_jac_d();
+    dump_gen_t_matrix(file, "jac_c", jac_c);
+    dump_gen_t_matrix(file, "jac_d", jac_d);
+    if (ip_data != nullptr && Ipopt::IsValid(ip_data->curr())) {
+        dump_forced_transpose_product(
+                file,
+                "forced_curr_jac_cT_y_c",
+                jac_c,
+                ip_data->curr()->y_c(),
+                ip_data->curr()->x());
+        dump_forced_transpose_product(
+                file,
+                "forced_curr_jac_dT_y_d",
+                jac_d,
+                ip_data->curr()->y_d(),
+                ip_data->curr()->x());
+    }
+    std::fclose(file);
 }
 
 } // namespace
@@ -378,6 +535,16 @@ bool CNLP_Problem::intermediate_callback(
         DenseVectorView kkt_slack_complementarity_view;
         DenseVectorView kkt_slack_sigma_view;
         DenseVectorView kkt_slack_distance_view;
+        DenseVectorView curr_grad_f_view;
+        DenseVectorView curr_jac_cT_y_c_view;
+        DenseVectorView curr_jac_dT_y_d_view;
+        DenseVectorView curr_grad_lag_x_view;
+        DenseVectorView curr_grad_lag_s_view;
+        Ipopt::Number curr_barrier_error = 0.0;
+        Ipopt::Number curr_primal_infeasibility = 0.0;
+        Ipopt::Number curr_dual_infeasibility = 0.0;
+        Ipopt::Number curr_complementarity = 0.0;
+        Ipopt::Number curr_nlp_error = 0.0;
         Ipopt::SmartPtr<const Ipopt::Vector> kkt_x_stationarity;
         Ipopt::SmartPtr<const Ipopt::Vector> kkt_slack_stationarity;
         Ipopt::SmartPtr<const Ipopt::Vector> kkt_equality_residual;
@@ -385,6 +552,11 @@ bool CNLP_Problem::intermediate_callback(
         Ipopt::SmartPtr<const Ipopt::Vector> kkt_slack_complementarity;
         Ipopt::SmartPtr<const Ipopt::Vector> kkt_slack_sigma;
         Ipopt::SmartPtr<const Ipopt::Vector> kkt_slack_distance;
+        Ipopt::SmartPtr<const Ipopt::Vector> curr_grad_f;
+        Ipopt::SmartPtr<const Ipopt::Vector> curr_jac_cT_y_c;
+        Ipopt::SmartPtr<const Ipopt::Vector> curr_jac_dT_y_d;
+        Ipopt::SmartPtr<const Ipopt::Vector> curr_grad_lag_x;
+        Ipopt::SmartPtr<const Ipopt::Vector> curr_grad_lag_s;
         if (ip_data != nullptr) {
             Ipopt::SmartPtr<const Ipopt::IteratesVector> current_iterates = ip_data->curr();
             if (Ipopt::IsValid(current_iterates)) {
@@ -412,6 +584,11 @@ bool CNLP_Problem::intermediate_callback(
             }
         }
         if (ip_cq != nullptr) {
+            curr_grad_f = ip_cq->curr_grad_f();
+            curr_jac_cT_y_c = ip_cq->curr_jac_cT_times_curr_y_c();
+            curr_jac_dT_y_d = ip_cq->curr_jac_dT_times_curr_y_d();
+            curr_grad_lag_x = ip_cq->curr_grad_lag_x();
+            curr_grad_lag_s = ip_cq->curr_grad_lag_s();
             kkt_x_stationarity = ip_cq->curr_grad_lag_with_damping_x();
             kkt_slack_stationarity = ip_cq->curr_grad_lag_with_damping_s();
             kkt_equality_residual = ip_cq->curr_c();
@@ -419,6 +596,11 @@ bool CNLP_Problem::intermediate_callback(
             kkt_slack_complementarity = ip_cq->curr_relaxed_compl_s_U();
             kkt_slack_sigma = ip_cq->curr_sigma_s();
             kkt_slack_distance = ip_cq->curr_slack_s_U();
+            curr_grad_f_view = dense_vector_view(curr_grad_f);
+            curr_jac_cT_y_c_view = dense_vector_view(curr_jac_cT_y_c);
+            curr_jac_dT_y_d_view = dense_vector_view(curr_jac_dT_y_d);
+            curr_grad_lag_x_view = dense_vector_view(curr_grad_lag_x);
+            curr_grad_lag_s_view = dense_vector_view(curr_grad_lag_s);
             kkt_x_stationarity_view = dense_vector_view(kkt_x_stationarity);
             kkt_slack_stationarity_view = dense_vector_view(kkt_slack_stationarity);
             kkt_equality_residual_view = dense_vector_view(kkt_equality_residual);
@@ -426,6 +608,20 @@ bool CNLP_Problem::intermediate_callback(
             kkt_slack_complementarity_view = dense_vector_view(kkt_slack_complementarity);
             kkt_slack_sigma_view = dense_vector_view(kkt_slack_sigma);
             kkt_slack_distance_view = dense_vector_view(kkt_slack_distance);
+            curr_barrier_error = ip_cq->curr_barrier_error();
+            curr_primal_infeasibility = ip_cq->curr_primal_infeasibility(Ipopt::NORM_MAX);
+            curr_dual_infeasibility = ip_cq->curr_dual_infeasibility(Ipopt::NORM_MAX);
+            curr_complementarity = ip_cq->curr_complementarity(mu, Ipopt::NORM_MAX);
+            curr_nlp_error = ip_cq->curr_nlp_error();
+            dump_jacobian_state(
+                    iter,
+                    mu,
+                    ip_data,
+                    ip_cq,
+                    y_c_view,
+                    y_d_view,
+                    curr_jac_cT_y_c_view,
+                    curr_jac_dT_y_d_view);
         }
         retval = (**m_intermediate_cb)(convert_algorithm_mode(mode), iter, obj_value, inf_pr, inf_du,
                 mu, d_norm, regularization_size, alpha_du,
@@ -452,6 +648,16 @@ bool CNLP_Problem::intermediate_callback(
                 kkt_slack_complementarity_view.count, kkt_slack_complementarity_view.values,
                 kkt_slack_sigma_view.count, kkt_slack_sigma_view.values,
                 kkt_slack_distance_view.count, kkt_slack_distance_view.values,
+                curr_grad_f_view.count, curr_grad_f_view.values,
+                curr_jac_cT_y_c_view.count, curr_jac_cT_y_c_view.values,
+                curr_jac_dT_y_d_view.count, curr_jac_dT_y_d_view.values,
+                curr_grad_lag_x_view.count, curr_grad_lag_x_view.values,
+                curr_grad_lag_s_view.count, curr_grad_lag_s_view.values,
+                curr_barrier_error,
+                curr_primal_infeasibility,
+                curr_dual_infeasibility,
+                curr_complementarity,
+                curr_nlp_error,
                 m_user_data);
     }
     return (retval!=0);

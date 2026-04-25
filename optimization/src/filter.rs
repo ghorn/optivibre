@@ -234,6 +234,29 @@ mod tests {
     }
 
     #[test]
+    fn globally_filter_acceptable_trial_still_needs_current_iterate_reduction() {
+        let current = entry(-77.86554647868056, 0.7745892725147452);
+        let trial = entry(-77.86554647858056, 0.7745865463704033);
+        let assessment = assess_trial(
+            &[],
+            &current,
+            &trial,
+            3.519480160114129e-6,
+            -1.0e-2,
+            false,
+            false,
+            params(1.0e4, 1.0e-8),
+        );
+
+        assert!(assessment.filter_acceptable);
+        assert!(!assessment.filter_dominated);
+        assert!(!assessment.filter_sufficient_objective_reduction);
+        assert!(!assessment.filter_sufficient_violation_reduction);
+        assert!(!assessment.current_iterate_acceptable);
+        assert_eq!(assessment.acceptance_mode, None);
+    }
+
+    #[test]
     fn feasibility_reducing_h_step_is_accepted() {
         let current = entry(0.0, 10.0);
         let trial = entry(1.0, 5.0);

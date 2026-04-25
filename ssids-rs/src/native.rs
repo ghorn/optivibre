@@ -710,7 +710,7 @@ impl NativeSpral {
         }
         let analysis_order = order_storage
             .as_deref()
-            .map(decode_native_analysis_order)
+            .map(|order| decode_native_analysis_order(order, order_array_base))
             .transpose()?;
         let scaling = (options.scaling != 0).then(|| vec![0.0; matrix.dimension()]);
         Ok(NativeSpralSession {
@@ -844,19 +844,23 @@ fn apply_native_ordering(
     Ok(())
 }
 
-fn decode_native_analysis_order(order: &[i32]) -> Result<Vec<usize>, NativeSpralError> {
+fn decode_native_analysis_order(
+    order: &[i32],
+    array_base: i32,
+) -> Result<Vec<usize>, NativeSpralError> {
     let dimension = order.len();
     let mut seen = vec![false; dimension];
     let mut decoded = Vec::with_capacity(dimension);
-    for (original, &position) in order.iter().enumerate() {
+    for (original, &raw_position) in order.iter().enumerate() {
+        let position = raw_position - array_base;
         let position = usize::try_from(position).map_err(|_| {
             NativeSpralError::InvalidOrdering(format!(
-                "native analysis order[{original}]={position} is negative"
+                "native analysis order[{original}]={raw_position} with array_base={array_base} is negative"
             ))
         })?;
         if position >= dimension {
             return Err(NativeSpralError::InvalidOrdering(format!(
-                "native analysis order[{original}]={position} is out of bounds for {dimension} columns"
+                "native analysis order[{original}]={raw_position} with array_base={array_base} decodes to {position}, out of bounds for {dimension} columns"
             )));
         }
         if seen[position] {

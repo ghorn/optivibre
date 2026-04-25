@@ -154,6 +154,13 @@ fn native_spral_session_solves_through_ipopt_ptr32_entrypoints() {
             NativeOrdering::Matching,
         )
         .expect("analyse through IPOPT-compatible ptr32 entrypoint");
+    let analysis_order = session
+        .analysis_order()
+        .expect("IPOPT-compatible matching analyse should expose a decoded order");
+    assert_eq!(analysis_order.len(), dense.len());
+    let mut sorted_order = analysis_order.to_vec();
+    sorted_order.sort_unstable();
+    assert_eq!(sorted_order, (0..dense.len()).collect::<Vec<_>>());
     session
         .factorize(matrix)
         .expect("factorize through IPOPT-compatible ptr32 entrypoint");

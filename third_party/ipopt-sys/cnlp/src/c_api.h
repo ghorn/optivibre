@@ -194,6 +194,16 @@ extern "C"
             const CNLP_Number* kkt_slack_complementarity,
             CNLP_Index kkt_slack_sigma_count, const CNLP_Number* kkt_slack_sigma,
             CNLP_Index kkt_slack_distance_count, const CNLP_Number* kkt_slack_distance,
+            CNLP_Index curr_grad_f_count, const CNLP_Number* curr_grad_f,
+            CNLP_Index curr_jac_cT_y_c_count, const CNLP_Number* curr_jac_cT_y_c,
+            CNLP_Index curr_jac_dT_y_d_count, const CNLP_Number* curr_jac_dT_y_d,
+            CNLP_Index curr_grad_lag_x_count, const CNLP_Number* curr_grad_lag_x,
+            CNLP_Index curr_grad_lag_s_count, const CNLP_Number* curr_grad_lag_s,
+            CNLP_Number curr_barrier_error,
+            CNLP_Number curr_primal_infeasibility,
+            CNLP_Number curr_dual_infeasibility,
+            CNLP_Number curr_complementarity,
+            CNLP_Number curr_nlp_error,
             CNLP_UserDataPtr user_data);
 
     /** Enum reporting the status of problem creation */

@@ -602,6 +602,26 @@ pub struct IntermediateCallbackData<'a> {
     pub kkt_slack_sigma: &'a [Number],
     /// IPOPT's current upper-slack distance.
     pub kkt_slack_distance: &'a [Number],
+    /// IPOPT's current objective gradient component.
+    pub curr_grad_f: &'a [Number],
+    /// IPOPT's current equality-Jacobian transpose times equality multipliers.
+    pub curr_jac_c_t_y_c: &'a [Number],
+    /// IPOPT's current inequality-Jacobian transpose times inequality multipliers.
+    pub curr_jac_d_t_y_d: &'a [Number],
+    /// IPOPT's current undamped Lagrangian gradient for primal variables.
+    pub curr_grad_lag_x: &'a [Number],
+    /// IPOPT's current undamped Lagrangian gradient for internal slack variables.
+    pub curr_grad_lag_s: &'a [Number],
+    /// IPOPT's current barrier subproblem optimality error.
+    pub curr_barrier_error: Number,
+    /// IPOPT's current primal infeasibility in max norm.
+    pub curr_primal_infeasibility: Number,
+    /// IPOPT's current dual infeasibility in max norm.
+    pub curr_dual_infeasibility: Number,
+    /// IPOPT's current complementarity residual at the active barrier parameter.
+    pub curr_complementarity: Number,
+    /// IPOPT's current original-NLP optimality error.
+    pub curr_nlp_error: Number,
 }
 
 /// A data structure to store data returned by the solver.
@@ -1116,6 +1136,21 @@ impl<P: BasicProblem> Ipopt<P> {
         kkt_slack_sigma: *const Number,
         kkt_slack_distance_count: Index,
         kkt_slack_distance: *const Number,
+        curr_grad_f_count: Index,
+        curr_grad_f: *const Number,
+        curr_jac_c_t_y_c_count: Index,
+        curr_jac_c_t_y_c: *const Number,
+        curr_jac_d_t_y_d_count: Index,
+        curr_jac_d_t_y_d: *const Number,
+        curr_grad_lag_x_count: Index,
+        curr_grad_lag_x: *const Number,
+        curr_grad_lag_s_count: Index,
+        curr_grad_lag_s: *const Number,
+        curr_barrier_error: Number,
+        curr_primal_infeasibility: Number,
+        curr_dual_infeasibility: Number,
+        curr_complementarity: Number,
+        curr_nlp_error: Number,
         user_data: ffi::CNLP_UserDataPtr,
     ) -> Bool {
         let ip = &mut (*(user_data as *mut Ipopt<P>));
@@ -1156,6 +1191,11 @@ impl<P: BasicProblem> Ipopt<P> {
                 optional_slice(kkt_slack_complementarity, kkt_slack_complementarity_count);
             let kkt_slack_sigma = optional_slice(kkt_slack_sigma, kkt_slack_sigma_count);
             let kkt_slack_distance = optional_slice(kkt_slack_distance, kkt_slack_distance_count);
+            let curr_grad_f = optional_slice(curr_grad_f, curr_grad_f_count);
+            let curr_jac_c_t_y_c = optional_slice(curr_jac_c_t_y_c, curr_jac_c_t_y_c_count);
+            let curr_jac_d_t_y_d = optional_slice(curr_jac_d_t_y_d, curr_jac_d_t_y_d_count);
+            let curr_grad_lag_x = optional_slice(curr_grad_lag_x, curr_grad_lag_x_count);
+            let curr_grad_lag_s = optional_slice(curr_grad_lag_s, curr_grad_lag_s_count);
             (callback)(
                 &mut ip.nlp_interface,
                 IntermediateCallbackData {
@@ -1196,6 +1236,16 @@ impl<P: BasicProblem> Ipopt<P> {
                     kkt_slack_complementarity,
                     kkt_slack_sigma,
                     kkt_slack_distance,
+                    curr_grad_f,
+                    curr_jac_c_t_y_c,
+                    curr_jac_d_t_y_d,
+                    curr_grad_lag_x,
+                    curr_grad_lag_s,
+                    curr_barrier_error,
+                    curr_primal_infeasibility,
+                    curr_dual_infeasibility,
+                    curr_complementarity,
+                    curr_nlp_error,
                 },
             ) as Bool
         } else {

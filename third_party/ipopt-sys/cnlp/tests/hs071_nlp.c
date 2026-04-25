@@ -252,6 +252,21 @@ CNLP_Bool hs071_intermediate_callback(enum CNLP_AlgorithmMode alg_mod,
                                  const CNLP_Number* kkt_slack_sigma,
                                  CNLP_Index kkt_slack_distance_count,
                                  const CNLP_Number* kkt_slack_distance,
+                                 CNLP_Index curr_grad_f_count,
+                                 const CNLP_Number* curr_grad_f,
+                                 CNLP_Index curr_jac_cT_y_c_count,
+                                 const CNLP_Number* curr_jac_cT_y_c,
+                                 CNLP_Index curr_jac_dT_y_d_count,
+                                 const CNLP_Number* curr_jac_dT_y_d,
+                                 CNLP_Index curr_grad_lag_x_count,
+                                 const CNLP_Number* curr_grad_lag_x,
+                                 CNLP_Index curr_grad_lag_s_count,
+                                 const CNLP_Number* curr_grad_lag_s,
+                                 CNLP_Number curr_barrier_error,
+                                 CNLP_Number curr_primal_infeasibility,
+                                 CNLP_Number curr_dual_infeasibility,
+                                 CNLP_Number curr_complementarity,
+                                 CNLP_Number curr_nlp_error,
                                  CNLP_UserDataPtr user_data)
 {
   (void)x_count;
@@ -300,6 +315,21 @@ CNLP_Bool hs071_intermediate_callback(enum CNLP_AlgorithmMode alg_mod,
   (void)kkt_slack_sigma;
   (void)kkt_slack_distance_count;
   (void)kkt_slack_distance;
+  (void)curr_grad_f_count;
+  (void)curr_grad_f;
+  (void)curr_jac_cT_y_c_count;
+  (void)curr_jac_cT_y_c;
+  (void)curr_jac_dT_y_d_count;
+  (void)curr_jac_dT_y_d;
+  (void)curr_grad_lag_x_count;
+  (void)curr_grad_lag_x;
+  (void)curr_grad_lag_s_count;
+  (void)curr_grad_lag_s;
+  (void)curr_barrier_error;
+  (void)curr_primal_infeasibility;
+  (void)curr_dual_infeasibility;
+  (void)curr_complementarity;
+  (void)curr_nlp_error;
   (void)user_data;
   return inf_pr >= 1e-4;
 }

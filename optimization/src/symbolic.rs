@@ -296,6 +296,21 @@ fn expand_ipopt_fixed_variable_snapshot(
         snapshot.kkt_x_stationarity =
             expand_compact_ipopt_vector(&snapshot.kkt_x_stationarity, &fixed_mask);
     }
+    if snapshot.curr_grad_f.len() == reduced_dimension {
+        snapshot.curr_grad_f = expand_compact_ipopt_vector(&snapshot.curr_grad_f, &fixed_mask);
+    }
+    if snapshot.curr_jac_c_t_y_c.len() == reduced_dimension {
+        snapshot.curr_jac_c_t_y_c =
+            expand_compact_ipopt_vector(&snapshot.curr_jac_c_t_y_c, &fixed_mask);
+    }
+    if snapshot.curr_jac_d_t_y_d.len() == reduced_dimension {
+        snapshot.curr_jac_d_t_y_d =
+            expand_compact_ipopt_vector(&snapshot.curr_jac_d_t_y_d, &fixed_mask);
+    }
+    if snapshot.curr_grad_lag_x.len() == reduced_dimension {
+        snapshot.curr_grad_lag_x =
+            expand_compact_ipopt_vector(&snapshot.curr_grad_lag_x, &fixed_mask);
+    }
     snapshot
 }
 
