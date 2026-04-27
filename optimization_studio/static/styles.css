@@ -934,8 +934,9 @@ select {
 
 .solver-phase-detail-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(116px, 1fr));
   gap: 8px;
+  align-items: start;
 }
 
 .solver-phase-detail {
@@ -954,6 +955,52 @@ select {
 .solver-phase-detail-value {
   font-family: Menlo, Monaco, Consolas, monospace;
   font-size: 0.82rem;
+  overflow-wrap: anywhere;
+}
+
+.solver-phase-detail-wide {
+  grid-column: 1 / -1;
+}
+
+.solver-phase-detail-collapsible {
+  padding: 0;
+  overflow: hidden;
+}
+
+.solver-phase-detail-summary {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 8px 9px;
+  cursor: pointer;
+  list-style-position: inside;
+}
+
+.solver-phase-detail-summary .solver-phase-detail-label {
+  margin-bottom: 0;
+}
+
+.solver-phase-detail-preview {
+  min-width: 0;
+  color: var(--ink);
+  font-family: Menlo, Monaco, Consolas, monospace;
+  font-size: 0.78rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.solver-phase-detail-code {
+  margin: 0;
+  padding: 0 9px 9px;
+  max-height: 180px;
+  overflow: auto;
+  color: var(--ink);
+  font-family: Menlo, Monaco, Consolas, monospace;
+  font-size: 0.78rem;
+  line-height: 1.35;
+  white-space: pre;
 }
 
 .solver-phase-note {

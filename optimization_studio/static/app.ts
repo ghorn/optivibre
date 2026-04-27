@@ -4466,6 +4466,11 @@ function createPhaseDetailsGrid(
   const grid = document.createElement("div");
   grid.className = "solver-phase-detail-grid";
   for (const detail of details) {
+    if (isLongSolverPhaseDetail(detail)) {
+      grid.appendChild(createLongSolverPhaseDetail(detail));
+      continue;
+    }
+
     const item = document.createElement("div");
     item.className = "solver-phase-detail";
 
@@ -4482,6 +4487,45 @@ function createPhaseDetailsGrid(
     grid.appendChild(item);
   }
   return grid;
+}
+
+function isLongSolverPhaseDetail(detail: SolverPhaseDetail): boolean {
+  return detail.label === "Settings" || detail.value.length > 80 || detail.value.includes("\n");
+}
+
+function solverDetailPreview(value: string): string {
+  const compact = value.replace(/\s+/g, " ").trim();
+  if (compact.length <= 72) {
+    return compact;
+  }
+  return `${compact.slice(0, 69).trimEnd()}...`;
+}
+
+function createLongSolverPhaseDetail(detail: SolverPhaseDetail): HTMLElement {
+  const item = document.createElement("details");
+  item.className = "solver-phase-detail solver-phase-detail-wide solver-phase-detail-collapsible";
+
+  const summary = document.createElement("summary");
+  summary.className = "solver-phase-detail-summary";
+
+  const label = document.createElement("span");
+  label.className = "solver-phase-detail-label";
+  label.textContent = detail.label;
+  summary.appendChild(label);
+
+  const preview = document.createElement("span");
+  preview.className = "solver-phase-detail-preview";
+  preview.textContent = solverDetailPreview(detail.value);
+  summary.appendChild(preview);
+
+  item.appendChild(summary);
+
+  const value = document.createElement("pre");
+  value.className = "solver-phase-detail-code";
+  value.textContent = detail.value;
+  item.appendChild(value);
+
+  return item;
 }
 
 function createSolverPhaseCard(options: {

@@ -918,7 +918,7 @@ fn spawn_stdio_reader(
                 Ok(0) => break,
                 Ok(_) => {
                     let trimmed = line.trim_end_matches(['\n', '\r']);
-                    if !trimmed.is_empty() {
+                    if should_forward_console_line(trimmed) {
                         send_stream_log(&sender, SolveLogLevel::Console, trimmed);
                     }
                 }
@@ -926,6 +926,14 @@ fn spawn_stdio_reader(
             }
         }
     })
+}
+
+fn should_forward_console_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    !trimmed.starts_with("[NLIP][SPRAL]") && !trimmed.starts_with("[NLIP][Native-SPRAL]")
 }
 
 #[cfg(test)]
@@ -950,6 +958,21 @@ mod tests {
             solver_method_for_values(ProblemId::OptimalDistanceGlider, &values),
             Some(SolverMethod::Ipopt)
         );
+    }
+
+    #[test]
+    fn console_stream_filters_internal_nlip_spral_debug_lines() {
+        assert!(!should_forward_console_line(""));
+        assert!(!should_forward_console_line(
+            "[NLIP][Native-SPRAL] Starting numeric factorization: dim=3958 nnz=12856 reg=1.000e-6",
+        ));
+        assert!(!should_forward_console_line(
+            "[NLIP][SPRAL] Numeric factorization completed in 10ms",
+        ));
+        assert!(should_forward_console_line(
+            "  70   FsS        -3.28e+01    7.29e-02"
+        ));
+        assert!(should_forward_console_line("EXIT: Optimal Solution Found."));
     }
 
     #[test]
