@@ -159,6 +159,9 @@ Release performance notes on dense case 58:
   a time with NEON while preserving each row's prior-column dot order and
   in-group triangular update order. Dense case-58 `app_triangular` now measures
   around `12-14us` in release profile runs.
+- On AArch64, the in-block APP 1x1 and 2x2 update kernels now use two-row NEON
+  updates while preserving each entry's source expression. Dense case-58
+  `app_pivot` now measures around `51us` on the saved-scaling path.
 - The APP factor profile now separates block backup/restore from the accepted
   trailing update. Dense case 58 shows backup/restore are small; the hot path is
   the source-equivalent `calcLD + host_gemm(OP_N, OP_T)` update. Rust now walks

@@ -2713,18 +2713,108 @@ fn app_update_one_by_one(
     update_end: usize,
     workspace: &[f64],
 ) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: the NEON helper only performs two-lane row loads/stores when
+        // `row + 1 < update_end`; scalar tails handle the remaining row.
+        unsafe {
+            app_update_one_by_one_neon(matrix, size, pivot, update_end, workspace);
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        app_update_one_by_one_scalar(matrix, size, pivot, update_end, workspace);
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn app_update_one_by_one_scalar(
+    matrix: &mut [f64],
+    size: usize,
+    pivot: usize,
+    update_end: usize,
+    workspace: &[f64],
+) {
     let ld = &workspace[pivot * size..(pivot + 1) * size];
     for (col, &preserved) in ld.iter().enumerate().take(update_end).skip(pivot + 1) {
         for row in col..update_end {
-            let update_entry = dense_lower_offset(size, row, col);
-            let multiplier = matrix[dense_lower_offset(size, row, pivot)];
-            // Clang contracts SPRAL's scalar SimdVec update on the local build.
-            matrix[update_entry] = (-preserved).mul_add(multiplier, matrix[update_entry]);
+            app_update_one_by_one_scalar_entry(matrix, size, pivot, col, row, preserved);
+        }
+    }
+}
+
+fn app_update_one_by_one_scalar_entry(
+    matrix: &mut [f64],
+    size: usize,
+    pivot: usize,
+    col: usize,
+    row: usize,
+    preserved: f64,
+) {
+    let update_entry = dense_lower_offset(size, row, col);
+    let multiplier = matrix[dense_lower_offset(size, row, pivot)];
+    // Clang contracts SPRAL's scalar SimdVec update on the local build.
+    matrix[update_entry] = (-preserved).mul_add(multiplier, matrix[update_entry]);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn app_update_one_by_one_neon(
+    matrix: &mut [f64],
+    size: usize,
+    pivot: usize,
+    update_end: usize,
+    workspace: &[f64],
+) {
+    use core::arch::aarch64::{vdupq_n_f64, vfmaq_f64, vld1q_f64, vst1q_f64};
+
+    let matrix_ptr = matrix.as_mut_ptr();
+    let ld = &workspace[pivot * size..(pivot + 1) * size];
+    for (col, &preserved) in ld.iter().enumerate().take(update_end).skip(pivot + 1) {
+        let mut row = col;
+        let neg_preserved = vdupq_n_f64(-preserved);
+        while row + 1 < update_end {
+            // SAFETY: `row + 1 < update_end <= size`; dense columns are
+            // contiguous by row.
+            let multiplier = unsafe { vld1q_f64(matrix_ptr.add(pivot * size + row)) };
+            let current = unsafe { vld1q_f64(matrix_ptr.add(col * size + row)) };
+            let updated = vfmaq_f64(current, multiplier, neg_preserved);
+            // SAFETY: same bounds as the load above.
+            unsafe {
+                vst1q_f64(matrix_ptr.add(col * size + row), updated);
+            }
+            row += 2;
+        }
+        while row < update_end {
+            app_update_one_by_one_scalar_entry(matrix, size, pivot, col, row, preserved);
+            row += 1;
         }
     }
 }
 
 fn app_update_two_by_two(
+    matrix: &mut [f64],
+    size: usize,
+    pivot: usize,
+    update_end: usize,
+    workspace: &[f64],
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: the NEON helper only performs two-lane row loads/stores when
+        // `row + 1 < update_end`; scalar tails handle the remaining row.
+        unsafe {
+            app_update_two_by_two_neon(matrix, size, pivot, update_end, workspace);
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        app_update_two_by_two_scalar(matrix, size, pivot, update_end, workspace);
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn app_update_two_by_two_scalar(
     matrix: &mut [f64],
     size: usize,
     pivot: usize,
@@ -2737,15 +2827,84 @@ fn app_update_two_by_two(
         let first_preserved = first_ld[col];
         let second_preserved = second_ld[col];
         for row in col..update_end {
-            let update_entry = dense_lower_offset(size, row, col);
-            let first_multiplier = matrix[dense_lower_offset(size, row, pivot)];
-            let second_multiplier = matrix[dense_lower_offset(size, row, pivot + 1)];
-            // block_ldlt.hxx::update_2x2 forms the two-product update under
-            // `#pragma omp simd`; the local optimized native path contracts the
-            // first product into the second product before subtracting it.
-            let combined =
-                first_preserved.mul_add(first_multiplier, second_preserved * second_multiplier);
-            matrix[update_entry] -= combined;
+            app_update_two_by_two_scalar_entry(
+                matrix,
+                size,
+                pivot,
+                col,
+                row,
+                first_preserved,
+                second_preserved,
+            );
+        }
+    }
+}
+
+fn app_update_two_by_two_scalar_entry(
+    matrix: &mut [f64],
+    size: usize,
+    pivot: usize,
+    col: usize,
+    row: usize,
+    first_preserved: f64,
+    second_preserved: f64,
+) {
+    let update_entry = dense_lower_offset(size, row, col);
+    let first_multiplier = matrix[dense_lower_offset(size, row, pivot)];
+    let second_multiplier = matrix[dense_lower_offset(size, row, pivot + 1)];
+    // block_ldlt.hxx::update_2x2 forms the two-product update under
+    // `#pragma omp simd`; the local optimized native path contracts the
+    // first product into the second product before subtracting it.
+    let combined = first_preserved.mul_add(first_multiplier, second_preserved * second_multiplier);
+    matrix[update_entry] -= combined;
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn app_update_two_by_two_neon(
+    matrix: &mut [f64],
+    size: usize,
+    pivot: usize,
+    update_end: usize,
+    workspace: &[f64],
+) {
+    use core::arch::aarch64::{vdupq_n_f64, vfmaq_f64, vld1q_f64, vmulq_f64, vst1q_f64, vsubq_f64};
+
+    let matrix_ptr = matrix.as_mut_ptr();
+    let first_ld = &workspace[pivot * size..(pivot + 1) * size];
+    let second_ld = &workspace[(pivot + 1) * size..(pivot + 2) * size];
+    for col in (pivot + 2)..update_end {
+        let first_preserved = first_ld[col];
+        let second_preserved = second_ld[col];
+        let first_preserved_vec = vdupq_n_f64(first_preserved);
+        let second_preserved_vec = vdupq_n_f64(second_preserved);
+        let mut row = col;
+        while row + 1 < update_end {
+            // SAFETY: `row + 1 < update_end <= size`; dense columns are
+            // contiguous by row.
+            let first_multiplier = unsafe { vld1q_f64(matrix_ptr.add(pivot * size + row)) };
+            let second_multiplier = unsafe { vld1q_f64(matrix_ptr.add((pivot + 1) * size + row)) };
+            let second_product = vmulq_f64(second_multiplier, second_preserved_vec);
+            let combined = vfmaq_f64(second_product, first_multiplier, first_preserved_vec);
+            let current = unsafe { vld1q_f64(matrix_ptr.add(col * size + row)) };
+            let updated = vsubq_f64(current, combined);
+            // SAFETY: same bounds as the load above.
+            unsafe {
+                vst1q_f64(matrix_ptr.add(col * size + row), updated);
+            }
+            row += 2;
+        }
+        while row < update_end {
+            app_update_two_by_two_scalar_entry(
+                matrix,
+                size,
+                pivot,
+                col,
+                row,
+                first_preserved,
+                second_preserved,
+            );
+            row += 1;
         }
     }
 }
