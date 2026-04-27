@@ -3336,6 +3336,30 @@ fn app_apply_accepted_prefix_update_with_workspace(
         for row in col..size {
             let mut update = 0.0;
             let mut relative_pivot = 0;
+            while relative_pivot + 4 <= accepted_width {
+                // SAFETY: `accepted_width <= APP_INNER_BLOCK_SIZE`, `row < size`,
+                // and `ld_values` was sliced to `accepted_width * size` above.
+                let row_ld0 = unsafe { *ld_values.get_unchecked(relative_pivot * size + row) };
+                let col_l0 = unsafe { *column_l_values.get_unchecked(relative_pivot) };
+                update = row_ld0.mul_add(col_l0, update);
+
+                let pivot1 = relative_pivot + 1;
+                let row_ld1 = unsafe { *ld_values.get_unchecked(pivot1 * size + row) };
+                let col_l1 = unsafe { *column_l_values.get_unchecked(pivot1) };
+                update = row_ld1.mul_add(col_l1, update);
+
+                let pivot2 = relative_pivot + 2;
+                let row_ld2 = unsafe { *ld_values.get_unchecked(pivot2 * size + row) };
+                let col_l2 = unsafe { *column_l_values.get_unchecked(pivot2) };
+                update = row_ld2.mul_add(col_l2, update);
+
+                let pivot3 = relative_pivot + 3;
+                let row_ld3 = unsafe { *ld_values.get_unchecked(pivot3 * size + row) };
+                let col_l3 = unsafe { *column_l_values.get_unchecked(pivot3) };
+                update = row_ld3.mul_add(col_l3, update);
+
+                relative_pivot += 4;
+            }
             while relative_pivot < accepted_width {
                 // SAFETY: `accepted_width <= APP_INNER_BLOCK_SIZE`, `row < size`,
                 // and `ld_values` was sliced to `accepted_width * size` above.

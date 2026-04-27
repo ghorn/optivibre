@@ -147,7 +147,10 @@ Release performance notes on dense case 58:
   dense-front work, especially the accepted-prefix trailing update, rather than
   saved scaling or sparse front assembly.
 - The APP accepted-prefix update now reuses the dense-front scratch buffer for
-  its LD workspace in production; the allocating wrapper remains test-only.
+  its LD workspace in production; the allocating wrapper remains test-only. Its
+  inner accepted-pivot dot keeps the source-faithful `mul_add` sequence but is
+  unrolled by four, moving the dense case-58 accepted-update phase from roughly
+  `0.17ms` to roughly `0.13ms` while preserving bitwise parity.
 - The APP factor profile now separates block backup/restore from the accepted
   trailing update. Dense case 58 shows backup/restore are small; the hot path is
   the source-equivalent `calcLD + host_gemm(OP_N, OP_T)` update. Rust now walks
