@@ -155,6 +155,10 @@ Release performance notes on dense case 58:
   group-of-four triangular solve while preserving each column's prior-dot order
   and the intra-group update sequence. Dense case-58 `app_triangular` moved
   from roughly `0.095ms` to roughly `0.041ms`.
+- On AArch64, that same APP triangular apply now processes two trailing rows at
+  a time with NEON while preserving each row's prior-column dot order and
+  in-group triangular update order. Dense case-58 `app_triangular` now measures
+  around `12-14us` in release profile runs.
 - The APP factor profile now separates block backup/restore from the accepted
   trailing update. Dense case 58 shows backup/restore are small; the hot path is
   the source-equivalent `calcLD + host_gemm(OP_N, OP_T)` update. Rust now walks

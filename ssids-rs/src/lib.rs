@@ -2926,81 +2926,279 @@ fn app_solve_block_triangular_to_trailing_rows(
     // OP_N applies a diagonal block to rows below the eliminated columns, where
     // SPRAL's column-major `aval[col * lda + row]` matches our dense storage.
     let triangular_started = profile_enabled.then(Instant::now);
+    app_solve_block_triangular_to_trailing_rows_impl(matrix, size, block_start, block_end);
+    triangular_started.map_or(Duration::default(), |started| started.elapsed())
+}
+
+#[cfg(target_arch = "aarch64")]
+fn app_solve_block_triangular_to_trailing_rows_impl(
+    matrix: &mut [f64],
+    size: usize,
+    block_start: usize,
+    block_end: usize,
+) {
+    // SAFETY: the helper bounds every two-lane load/store by `row + 1 < size`;
+    // scalar tails handle all remaining shapes.
+    unsafe {
+        app_solve_block_triangular_to_trailing_rows_neon(matrix, size, block_start, block_end);
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn app_solve_block_triangular_to_trailing_rows_impl(
+    matrix: &mut [f64],
+    size: usize,
+    block_start: usize,
+    block_end: usize,
+) {
+    app_solve_block_triangular_to_trailing_rows_scalar(matrix, size, block_start, block_end);
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn app_solve_block_triangular_to_trailing_rows_scalar(
+    matrix: &mut [f64],
+    size: usize,
+    block_start: usize,
+    block_end: usize,
+) {
     const OPENBLAS_DTRSM_UNROLL_N: usize = 4;
     for row in block_end..size {
         let mut group_start = block_start;
         while group_start < block_end {
             let group_end = (group_start + OPENBLAS_DTRSM_UNROLL_N).min(block_end);
-            if group_end - group_start == 4 {
-                let col0 = group_start;
-                let col1 = group_start + 1;
-                let col2 = group_start + 2;
-                let col3 = group_start + 3;
+            app_solve_block_triangular_row_group_scalar(
+                matrix,
+                size,
+                block_start,
+                group_start,
+                group_end,
+                row,
+            );
+            group_start = group_end;
+        }
+    }
+}
 
-                let mut value0 = matrix[col0 * size + row];
-                let mut value1 = matrix[col1 * size + row];
-                let mut value2 = matrix[col2 * size + row];
-                let mut value3 = matrix[col3 * size + row];
-                if group_start > block_start {
-                    let mut dot0 = 0.0;
-                    let mut dot1 = 0.0;
-                    let mut dot2 = 0.0;
-                    let mut dot3 = 0.0;
-                    for prior in block_start..group_start {
-                        let prior_value = matrix[prior * size + row];
-                        dot0 = prior_value.mul_add(matrix[prior * size + col0], dot0);
-                        dot1 = prior_value.mul_add(matrix[prior * size + col1], dot1);
-                        dot2 = prior_value.mul_add(matrix[prior * size + col2], dot2);
-                        dot3 = prior_value.mul_add(matrix[prior * size + col3], dot3);
-                    }
-                    value0 = dot0.mul_add(-1.0, value0);
-                    value1 = dot1.mul_add(-1.0, value1);
-                    value2 = dot2.mul_add(-1.0, value2);
-                    value3 = dot3.mul_add(-1.0, value3);
-                }
+fn app_solve_block_triangular_row_group_scalar(
+    matrix: &mut [f64],
+    size: usize,
+    block_start: usize,
+    group_start: usize,
+    group_end: usize,
+    row: usize,
+) {
+    if group_end - group_start == 4 {
+        let col0 = group_start;
+        let col1 = group_start + 1;
+        let col2 = group_start + 2;
+        let col3 = group_start + 3;
 
-                value1 = (-value0).mul_add(matrix[col0 * size + col1], value1);
-                value2 = (-value0).mul_add(matrix[col0 * size + col2], value2);
-                value3 = (-value0).mul_add(matrix[col0 * size + col3], value3);
-                value2 = (-value1).mul_add(matrix[col1 * size + col2], value2);
-                value3 = (-value1).mul_add(matrix[col1 * size + col3], value3);
-                value3 = (-value2).mul_add(matrix[col2 * size + col3], value3);
+        let mut value0 = matrix[col0 * size + row];
+        let mut value1 = matrix[col1 * size + row];
+        let mut value2 = matrix[col2 * size + row];
+        let mut value3 = matrix[col3 * size + row];
+        if group_start > block_start {
+            let mut dot0 = 0.0;
+            let mut dot1 = 0.0;
+            let mut dot2 = 0.0;
+            let mut dot3 = 0.0;
+            for prior in block_start..group_start {
+                let prior_value = matrix[prior * size + row];
+                dot0 = prior_value.mul_add(matrix[prior * size + col0], dot0);
+                dot1 = prior_value.mul_add(matrix[prior * size + col1], dot1);
+                dot2 = prior_value.mul_add(matrix[prior * size + col2], dot2);
+                dot3 = prior_value.mul_add(matrix[prior * size + col3], dot3);
+            }
+            value0 = dot0.mul_add(-1.0, value0);
+            value1 = dot1.mul_add(-1.0, value1);
+            value2 = dot2.mul_add(-1.0, value2);
+            value3 = dot3.mul_add(-1.0, value3);
+        }
 
-                matrix[col0 * size + row] = value0;
-                matrix[col1 * size + row] = value1;
-                matrix[col2 * size + row] = value2;
-                matrix[col3 * size + row] = value3;
+        value1 = (-value0).mul_add(matrix[col0 * size + col1], value1);
+        value2 = (-value0).mul_add(matrix[col0 * size + col2], value2);
+        value3 = (-value0).mul_add(matrix[col0 * size + col3], value3);
+        value2 = (-value1).mul_add(matrix[col1 * size + col2], value2);
+        value3 = (-value1).mul_add(matrix[col1 * size + col3], value3);
+        value3 = (-value2).mul_add(matrix[col2 * size + col3], value3);
+
+        matrix[col0 * size + row] = value0;
+        matrix[col1 * size + row] = value1;
+        matrix[col2 * size + row] = value2;
+        matrix[col3 * size + row] = value3;
+        return;
+    }
+
+    for col in group_start..group_end {
+        let entry = col * size + row;
+        let mut value = matrix[entry];
+        if group_start > block_start {
+            let mut dot = 0.0;
+            for prior in block_start..group_start {
+                let prior_value = matrix[prior * size + row];
+                let lower_value = matrix[prior * size + col];
+                dot = prior_value.mul_add(lower_value, dot);
+            }
+            value = dot.mul_add(-1.0, value);
+        }
+        matrix[entry] = value;
+    }
+
+    for col in group_start..group_end {
+        let value = matrix[col * size + row];
+        for target_col in (col + 1)..group_end {
+            let target_entry = target_col * size + row;
+            let lower_value = matrix[col * size + target_col];
+            matrix[target_entry] = (-value).mul_add(lower_value, matrix[target_entry]);
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn app_solve_block_triangular_to_trailing_rows_neon(
+    matrix: &mut [f64],
+    size: usize,
+    block_start: usize,
+    block_end: usize,
+) {
+    use core::arch::aarch64::{vdupq_n_f64, vfmaq_f64, vld1q_f64, vst1q_f64};
+
+    const OPENBLAS_DTRSM_UNROLL_N: usize = 4;
+    let matrix_ptr = matrix.as_mut_ptr();
+    let mut row = block_end;
+    while row + 1 < size {
+        let mut group_start = block_start;
+        while group_start < block_end {
+            let group_end = (group_start + OPENBLAS_DTRSM_UNROLL_N).min(block_end);
+            if group_end - group_start != 4 {
+                app_solve_block_triangular_row_group_scalar(
+                    matrix,
+                    size,
+                    block_start,
+                    group_start,
+                    group_end,
+                    row,
+                );
+                app_solve_block_triangular_row_group_scalar(
+                    matrix,
+                    size,
+                    block_start,
+                    group_start,
+                    group_end,
+                    row + 1,
+                );
                 group_start = group_end;
                 continue;
             }
 
-            for col in group_start..group_end {
-                let entry = col * size + row;
-                let mut value = matrix[entry];
-                if group_start > block_start {
-                    let mut dot = 0.0;
-                    for prior in block_start..group_start {
-                        let prior_value = matrix[prior * size + row];
-                        let lower_value = matrix[prior * size + col];
-                        dot = prior_value.mul_add(lower_value, dot);
-                    }
-                    value = dot.mul_add(-1.0, value);
+            let col0 = group_start;
+            let col1 = group_start + 1;
+            let col2 = group_start + 2;
+            let col3 = group_start + 3;
+
+            // SAFETY: `row + 1 < size`; each column is stored contiguously by
+            // row in the dense lower-column buffer.
+            let mut value0 = unsafe { vld1q_f64(matrix_ptr.add(col0 * size + row)) };
+            let mut value1 = unsafe { vld1q_f64(matrix_ptr.add(col1 * size + row)) };
+            let mut value2 = unsafe { vld1q_f64(matrix_ptr.add(col2 * size + row)) };
+            let mut value3 = unsafe { vld1q_f64(matrix_ptr.add(col3 * size + row)) };
+
+            if group_start > block_start {
+                let mut dot0 = vdupq_n_f64(0.0);
+                let mut dot1 = vdupq_n_f64(0.0);
+                let mut dot2 = vdupq_n_f64(0.0);
+                let mut dot3 = vdupq_n_f64(0.0);
+                for prior in block_start..group_start {
+                    // SAFETY: same `row + 1 < size` bound as above.
+                    let prior_value = unsafe { vld1q_f64(matrix_ptr.add(prior * size + row)) };
+                    dot0 = vfmaq_f64(
+                        dot0,
+                        prior_value,
+                        vdupq_n_f64(unsafe { *matrix_ptr.add(prior * size + col0) }),
+                    );
+                    dot1 = vfmaq_f64(
+                        dot1,
+                        prior_value,
+                        vdupq_n_f64(unsafe { *matrix_ptr.add(prior * size + col1) }),
+                    );
+                    dot2 = vfmaq_f64(
+                        dot2,
+                        prior_value,
+                        vdupq_n_f64(unsafe { *matrix_ptr.add(prior * size + col2) }),
+                    );
+                    dot3 = vfmaq_f64(
+                        dot3,
+                        prior_value,
+                        vdupq_n_f64(unsafe { *matrix_ptr.add(prior * size + col3) }),
+                    );
                 }
-                matrix[entry] = value;
+                let minus_one = vdupq_n_f64(-1.0);
+                value0 = vfmaq_f64(value0, dot0, minus_one);
+                value1 = vfmaq_f64(value1, dot1, minus_one);
+                value2 = vfmaq_f64(value2, dot2, minus_one);
+                value3 = vfmaq_f64(value3, dot3, minus_one);
             }
 
-            for col in group_start..group_end {
-                let value = matrix[col * size + row];
-                for target_col in (col + 1)..group_end {
-                    let target_entry = target_col * size + row;
-                    let lower_value = matrix[col * size + target_col];
-                    matrix[target_entry] = (-value).mul_add(lower_value, matrix[target_entry]);
-                }
+            value1 = vfmaq_f64(
+                value1,
+                value0,
+                vdupq_n_f64(-unsafe { *matrix_ptr.add(col0 * size + col1) }),
+            );
+            value2 = vfmaq_f64(
+                value2,
+                value0,
+                vdupq_n_f64(-unsafe { *matrix_ptr.add(col0 * size + col2) }),
+            );
+            value3 = vfmaq_f64(
+                value3,
+                value0,
+                vdupq_n_f64(-unsafe { *matrix_ptr.add(col0 * size + col3) }),
+            );
+            value2 = vfmaq_f64(
+                value2,
+                value1,
+                vdupq_n_f64(-unsafe { *matrix_ptr.add(col1 * size + col2) }),
+            );
+            value3 = vfmaq_f64(
+                value3,
+                value1,
+                vdupq_n_f64(-unsafe { *matrix_ptr.add(col1 * size + col3) }),
+            );
+            value3 = vfmaq_f64(
+                value3,
+                value2,
+                vdupq_n_f64(-unsafe { *matrix_ptr.add(col2 * size + col3) }),
+            );
+
+            // SAFETY: same `row + 1 < size` bound as the loads.
+            unsafe {
+                vst1q_f64(matrix_ptr.add(col0 * size + row), value0);
+                vst1q_f64(matrix_ptr.add(col1 * size + row), value1);
+                vst1q_f64(matrix_ptr.add(col2 * size + row), value2);
+                vst1q_f64(matrix_ptr.add(col3 * size + row), value3);
             }
             group_start = group_end;
         }
+        row += 2;
     }
-    triangular_started.map_or(Duration::default(), |started| started.elapsed())
+
+    while row < size {
+        let mut group_start = block_start;
+        while group_start < block_end {
+            let group_end = (group_start + OPENBLAS_DTRSM_UNROLL_N).min(block_end);
+            app_solve_block_triangular_row_group_scalar(
+                matrix,
+                size,
+                block_start,
+                group_start,
+                group_end,
+                row,
+            );
+            group_start = group_end;
+        }
+        row += 1;
+    }
 }
 
 fn app_apply_block_diagonal_to_trailing_rows(
