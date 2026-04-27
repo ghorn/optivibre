@@ -1333,7 +1333,14 @@ fn permute_graph(graph: &CsrGraph, permutation: &Permutation) -> CsrGraph {
     if is_identity_order(permutation.perm()) {
         return graph.clone();
     }
+    if graph.vertex_count() <= 2048 {
+        return permute_graph_with_bitsets(graph, permutation);
+    }
 
+    permute_graph_with_sorted_edges(graph, permutation)
+}
+
+fn permute_graph_with_sorted_edges(graph: &CsrGraph, permutation: &Permutation) -> CsrGraph {
     let dimension = graph.vertex_count();
     let inverse = permutation.inverse();
     let mut degrees = vec![0_usize; dimension];
@@ -1367,6 +1374,54 @@ fn permute_graph(graph: &CsrGraph, permutation: &Permutation) -> CsrGraph {
     }
     for vertex in 0..dimension {
         neighbors[offsets[vertex]..offsets[vertex + 1]].sort_unstable();
+    }
+    CsrGraph::new(offsets, neighbors).expect("permutation preserves graph shape")
+}
+
+fn permute_graph_with_bitsets(graph: &CsrGraph, permutation: &Permutation) -> CsrGraph {
+    let dimension = graph.vertex_count();
+    let words_per_row = dimension.div_ceil(64);
+    let inverse = permutation.inverse();
+    let mut edge_bits = vec![0_u64; dimension * words_per_row];
+    for vertex in 0..dimension {
+        for &neighbor in graph.neighbors(vertex) {
+            if vertex < neighbor {
+                let lhs = inverse[vertex];
+                let rhs = inverse[neighbor];
+                symbolic_edge_set(&mut edge_bits, words_per_row, lhs, rhs);
+                symbolic_edge_set(&mut edge_bits, words_per_row, rhs, lhs);
+            }
+        }
+    }
+
+    let mut offsets = Vec::with_capacity(dimension + 1);
+    offsets.push(0);
+    for vertex in 0..dimension {
+        let row_start = vertex * words_per_row;
+        let degree = edge_bits[row_start..row_start + words_per_row]
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum::<usize>();
+        offsets.push(offsets[vertex] + degree);
+    }
+
+    let mut neighbors = Vec::with_capacity(offsets[dimension]);
+    for vertex in 0..dimension {
+        let row_start = vertex * words_per_row;
+        for (word_index, &word) in edge_bits[row_start..row_start + words_per_row]
+            .iter()
+            .enumerate()
+        {
+            let mut bits = word;
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                let neighbor = word_index * 64 + bit;
+                if neighbor < dimension {
+                    neighbors.push(neighbor);
+                }
+                bits &= bits - 1;
+            }
+        }
     }
     CsrGraph::new(offsets, neighbors).expect("permutation preserves graph shape")
 }
@@ -1941,20 +1996,22 @@ fn symbolic_factor_pattern(graph: &CsrGraph) -> (Vec<Option<usize>>, Vec<usize>,
     let mut active_words = vec![0_u64; words_per_row];
     let mut elimination_tree = vec![None; dimension];
     let mut column_counts = vec![1; dimension];
-    let mut column_pattern = vec![Vec::new(); dimension];
+    let mut column_pattern = Vec::with_capacity(dimension);
     for column in 0..dimension {
         symbolic_trailing_row_bits(&edge_bits, words_per_row, column, &mut active_words);
-        let active_neighbors = symbolic_bits_to_vertices(&active_words, dimension);
-        elimination_tree[column] = active_neighbors.first().copied();
-        column_counts[column] = active_neighbors.len() + 1;
-        column_pattern[column].push(column);
-        column_pattern[column].extend(active_neighbors.iter().copied());
-        for &neighbor in &active_neighbors {
+        let active_count = symbolic_bit_count(&active_words);
+        let mut pattern = Vec::with_capacity(active_count + 1);
+        pattern.push(column);
+        symbolic_push_vertices(&active_words, dimension, &mut pattern);
+        elimination_tree[column] = pattern.get(1).copied();
+        column_counts[column] = active_count + 1;
+        for &neighbor in &pattern[1..] {
             let row_start = neighbor * words_per_row;
             for word in 0..words_per_row {
                 edge_bits[row_start + word] |= active_words[word];
             }
         }
+        column_pattern.push(pattern);
     }
     (elimination_tree, column_counts, column_pattern)
 }
@@ -1979,8 +2036,11 @@ fn symbolic_trailing_row_bits(
     }
 }
 
-fn symbolic_bits_to_vertices(words: &[u64], dimension: usize) -> Vec<usize> {
-    let mut vertices = Vec::new();
+fn symbolic_bit_count(words: &[u64]) -> usize {
+    words.iter().map(|word| word.count_ones() as usize).sum()
+}
+
+fn symbolic_push_vertices(words: &[u64], dimension: usize, vertices: &mut Vec<usize>) {
     for (word_index, &word) in words.iter().enumerate() {
         let mut bits = word;
         while bits != 0 {
@@ -1992,7 +2052,6 @@ fn symbolic_bits_to_vertices(words: &[u64], dimension: usize) -> Vec<usize> {
             bits &= bits - 1;
         }
     }
-    vertices
 }
 
 fn symbolic_edge_set(edge_bits: &mut [u64], words_per_row: usize, row: usize, col: usize) {
@@ -3011,6 +3070,7 @@ fn app_original_one_by_one_diagonal(inverse_diagonal: f64) -> f64 {
     }
 }
 
+#[cfg(test)]
 fn app_build_ld_workspace(
     matrix: &[f64],
     size: usize,
@@ -3018,10 +3078,32 @@ fn app_build_ld_workspace(
     accepted_end: usize,
     block_records: &[FactorBlockRecord],
 ) -> Vec<f64> {
+    let accepted_width = accepted_end - block_start;
+    let mut ld_values = vec![0.0; accepted_width * size];
+    app_build_ld_workspace_into(
+        matrix,
+        size,
+        block_start,
+        accepted_end,
+        block_records,
+        &mut ld_values,
+    );
+    ld_values
+}
+
+fn app_build_ld_workspace_into(
+    matrix: &[f64],
+    size: usize,
+    block_start: usize,
+    accepted_end: usize,
+    block_records: &[FactorBlockRecord],
+    ld_values: &mut [f64],
+) {
     // Accepted-update operands are below the eliminated prefix, so SPRAL's
     // column-major `aval[col * lda + row]` matches the dense lower storage.
     let accepted_width = accepted_end - block_start;
-    let mut ld_values = vec![0.0; accepted_width * size];
+    debug_assert!(ld_values.len() >= accepted_width * size);
+    let ld_values = &mut ld_values[..accepted_width * size];
     let mut pivot = block_start;
     for block in block_records {
         let relative_pivot = pivot - block_start;
@@ -3064,7 +3146,6 @@ fn app_build_ld_workspace(
         }
     }
     debug_assert_eq!(pivot, accepted_end);
-    ld_values
 }
 
 #[cfg(test)]
@@ -3128,6 +3209,7 @@ struct AppAcceptedUpdateContext<'a> {
     ld_values: &'a [f64],
 }
 
+#[cfg(test)]
 fn app_apply_accepted_prefix_update(
     matrix: &mut [f64],
     size: usize,
@@ -3135,10 +3217,37 @@ fn app_apply_accepted_prefix_update(
     accepted_end: usize,
     block_records: &[FactorBlockRecord],
 ) {
+    let accepted_width = accepted_end - block_start;
+    let mut ld_values = vec![0.0; accepted_width * size];
+    app_apply_accepted_prefix_update_with_workspace(
+        matrix,
+        size,
+        block_start,
+        accepted_end,
+        block_records,
+        &mut ld_values,
+    );
+}
+
+fn app_apply_accepted_prefix_update_with_workspace(
+    matrix: &mut [f64],
+    size: usize,
+    block_start: usize,
+    accepted_end: usize,
+    block_records: &[FactorBlockRecord],
+    ld_values: &mut [f64],
+) {
     if accepted_end >= size {
         return;
     }
-    let ld_values = app_build_ld_workspace(matrix, size, block_start, accepted_end, block_records);
+    app_build_ld_workspace_into(
+        matrix,
+        size,
+        block_start,
+        accepted_end,
+        block_records,
+        ld_values,
+    );
     if accepted_end + 1 == size {
         let row = accepted_end;
         let entry = row * size + row;
@@ -3174,7 +3283,7 @@ fn app_apply_accepted_prefix_update(
                         block_start,
                         accepted_end,
                         block_records,
-                        ld_values: &ld_values,
+                        ld_values,
                     },
                     row,
                     col,
@@ -4077,12 +4186,13 @@ fn factorize_dense_front(
             profile.app_restore_time += started.elapsed();
         }
         let started = profile_enabled.then(Instant::now);
-        app_apply_accepted_prefix_update(
+        app_apply_accepted_prefix_update_with_workspace(
             &mut dense,
             size,
             block_start,
             accepted_end,
             &accepted_blocks,
+            &mut scratch,
         );
         if let Some(started) = started {
             profile.app_accepted_update_time += started.elapsed();
@@ -5259,7 +5369,8 @@ mod tests {
         factorize_dense_tpp_tail_in_place, native_column_counts, native_postorder_permutation,
         native_supernode_layout, openblas_gemv_n_update_like_native,
         openblas_gemv_t_dot_like_contiguous, openblas_trsv_lower_unit_op_n_like_native,
-        openblas_trsv_lower_unit_op_t_like_native, permute_graph, reset_ldwork_column_tail,
+        openblas_trsv_lower_unit_op_t_like_native, permute_graph, permute_graph_with_bitsets,
+        permute_graph_with_sorted_edges, reset_ldwork_column_tail,
         solve_diagonal_and_lower_transpose_front_panels_like_native,
         solve_forward_front_panels_like_native, solve_two_by_two_block_in_place,
         symbolic_factor_pattern, zero_dense_column_until,
@@ -10086,6 +10197,35 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         assert_eq!(
             native_counts,
             column_pattern.iter().map(Vec::len).collect::<Vec<usize>>()
+        );
+    }
+
+    #[test]
+    fn bitset_permute_graph_matches_sorted_edge_path() {
+        let edges = vec![
+            (0, 1),
+            (0, 4),
+            (1, 2),
+            (1, 5),
+            (2, 3),
+            (2, 6),
+            (3, 7),
+            (4, 5),
+            (5, 6),
+            (6, 7),
+            (0, 7),
+        ];
+        let graph = CsrGraph::from_edges(8, &edges).expect("valid graph");
+        let permutation =
+            Permutation::new(vec![6, 2, 7, 1, 4, 0, 5, 3]).expect("valid permutation");
+
+        assert_eq!(
+            permute_graph_with_bitsets(&graph, &permutation),
+            permute_graph_with_sorted_edges(&graph, &permutation)
+        );
+        assert_eq!(
+            permute_graph(&graph, &permutation),
+            permute_graph_with_sorted_edges(&graph, &permutation)
         );
     }
 

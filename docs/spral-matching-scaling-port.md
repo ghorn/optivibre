@@ -117,7 +117,10 @@ Release performance notes on dense case 58:
   column counts in release builds and short-circuiting SPRAL's row-list result
   for the single full-rank supernode case. The debug/test build still checks
   the source-faithful `find_col_counts` port against the symbolic counts.
-- Rust `SpralMatching` analyse is now roughly `1.0-1.2ms` on the same witness;
+- Rust captured-order/no-scaling analyse then moved to roughly `0.4ms` after
+  switching small/medium graph permutation to a sorted bitset construction and
+  removing a per-column temporary allocation in symbolic fill simulation.
+- Rust `SpralMatching` analyse is now roughly `0.9-1.0ms` on the same witness;
   the remaining matching/scaling overhead is still close to native's own
   matching/scaling overhead.
 - Native SPRAL still analyses the captured explicit-order witness in roughly
@@ -127,3 +130,5 @@ Release performance notes on dense case 58:
   Dense case 58 currently localizes most remaining Rust factor time to APP
   dense-front work, especially the accepted-prefix trailing update, rather than
   saved scaling or sparse front assembly.
+- The APP accepted-prefix update now reuses the dense-front scratch buffer for
+  its LD workspace in production; the allocating wrapper remains test-only.
