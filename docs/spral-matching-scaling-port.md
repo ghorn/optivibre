@@ -137,6 +137,7 @@ Release performance notes on dense case 58:
   the source-equivalent `calcLD + host_gemm(OP_N, OP_T)` update. Rust now walks
   the target lower triangle in dense column order and caches each accepted
   column's L values while preserving the exact per-entry pivot accumulation
-  order and the singleton incremental branch. This trims the scalar accepted
-  update to roughly `0.21ms` on the dense witness, with the remaining gap
-  attributable to native SPRAL dispatching the same operation to BLAS.
+  order and the singleton incremental branch. Flattening the inner loop over
+  accepted pivot columns trims the scalar accepted update to roughly `0.13ms`
+  on the dense witness, with the remaining gap attributable to native SPRAL
+  dispatching the same operation to BLAS.

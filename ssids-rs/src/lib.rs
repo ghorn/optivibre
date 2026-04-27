@@ -3303,25 +3303,16 @@ fn app_apply_accepted_prefix_update_with_workspace(
         }
         for row in col..size {
             let mut update = 0.0;
-            let mut pivot = block_start;
-            for block in block_records {
-                let relative_pivot = pivot - block_start;
-                if block.size == 1 {
-                    let col_l = column_l_values[relative_pivot];
-                    let row_ld = ld_values[relative_pivot * size + row];
-                    update = row_ld.mul_add(col_l, update);
-                    pivot += 1;
-                } else {
-                    let col_l1 = column_l_values[relative_pivot];
-                    let col_l2 = column_l_values[relative_pivot + 1];
-                    let row_ld1 = ld_values[relative_pivot * size + row];
-                    let row_ld2 = ld_values[(relative_pivot + 1) * size + row];
-                    update = row_ld1.mul_add(col_l1, update);
-                    update = row_ld2.mul_add(col_l2, update);
-                    pivot += 2;
-                }
+            let mut relative_pivot = 0;
+            while relative_pivot < accepted_width {
+                // SAFETY: `accepted_width <= APP_INNER_BLOCK_SIZE`, `row < size`,
+                // and `ld_values` was sliced to `accepted_width * size` above.
+                let row_ld = unsafe { *ld_values.get_unchecked(relative_pivot * size + row) };
+                // SAFETY: same `accepted_width <= APP_INNER_BLOCK_SIZE` bound.
+                let col_l = unsafe { *column_l_values.get_unchecked(relative_pivot) };
+                update = row_ld.mul_add(col_l, update);
+                relative_pivot += 1;
             }
-            debug_assert_eq!(pivot, accepted_end);
             let entry = col * size + row;
             matrix[entry] = update.mul_add(-1.0, matrix[entry]);
         }
