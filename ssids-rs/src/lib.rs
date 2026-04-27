@@ -991,7 +991,7 @@ fn graph_from_lower_csc(matrix: SymmetricCscMatrix<'_>) -> Result<CsrGraph, Ssid
         }
     }
     debug_assert_eq!(&write, &offsets[1..]);
-    CsrGraph::new(offsets, neighbors).map_err(SsidsError::Ordering)
+    Ok(CsrGraph::from_trusted_sorted_adjacency(offsets, neighbors))
 }
 
 pub fn analyse(
@@ -1410,7 +1410,7 @@ fn permute_graph_with_sorted_edges(graph: &CsrGraph, permutation: &Permutation) 
     for vertex in 0..dimension {
         neighbors[offsets[vertex]..offsets[vertex + 1]].sort_unstable();
     }
-    CsrGraph::new(offsets, neighbors).expect("permutation preserves graph shape")
+    CsrGraph::from_trusted_sorted_adjacency(offsets, neighbors)
 }
 
 fn permute_graph_with_bitsets(graph: &CsrGraph, permutation: &Permutation) -> CsrGraph {
@@ -1458,7 +1458,7 @@ fn permute_graph_with_bitsets(graph: &CsrGraph, permutation: &Permutation) -> Cs
             }
         }
     }
-    CsrGraph::new(offsets, neighbors).expect("permutation preserves graph shape")
+    CsrGraph::from_trusted_sorted_adjacency(offsets, neighbors)
 }
 
 fn build_symbolic_result_with_native_order(

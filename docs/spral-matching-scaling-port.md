@@ -123,10 +123,12 @@ Release performance notes on dense case 58:
 - `ssids-rs` now builds its analysis CSR graph directly from the validated
   lower CSC matrix accepted by `SymmetricCscMatrix`, avoiding the public
   `metis_ordering::CsrGraph::from_symmetric_csc` sort/dedup path in SSIDS
-  analyse. Dense case-58 release timings are now roughly `0.33ms` for
-  captured-order/no-scaling analyse and roughly `0.89ms` for `SpralMatching`
-  saved-scaling analyse.
-- Rust `SpralMatching` analyse is now roughly `0.9-1.0ms` on the same witness;
+  analyse. Internally constructed SSIDS CSR graphs now use a hidden trusted
+  constructor that still checks invariants in debug builds. Dense case-58
+  release timings are now roughly `0.20-0.23ms` for captured-order/no-scaling
+  analyse and roughly `0.79-0.86ms` for `SpralMatching` saved-scaling analyse,
+  effectively matching native analyse timing on this witness.
+- Rust `SpralMatching` analyse is now roughly native-speed on the same witness;
   the remaining matching/scaling overhead is still close to native's own
   matching/scaling overhead.
 - `SPRAL_SSIDS_DEBUG_MATCHING=1` now splits the Rust SPRAL matching ladder into

@@ -63,6 +63,16 @@ impl CsrGraph {
         Ok(Self { offsets, neighbors })
     }
 
+    #[doc(hidden)]
+    pub fn from_trusted_sorted_adjacency(offsets: Vec<usize>, neighbors: Vec<usize>) -> Self {
+        #[cfg(debug_assertions)]
+        {
+            Self::new(offsets.clone(), neighbors.clone())
+                .expect("trusted CSR graph must already be valid and sorted");
+        }
+        Self { offsets, neighbors }
+    }
+
     pub fn from_edges(
         vertex_count: usize,
         edges: &[(usize, usize)],
