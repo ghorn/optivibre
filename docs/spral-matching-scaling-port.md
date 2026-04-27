@@ -23,9 +23,12 @@ native METIS; those libraries are oracles for parity tests only.
 | METIS `separator.c::ConstructSeparator`, `srefine.c::Compute2WayNodePartitionParams`, `sfm.c::FM_2WayNodeRefine*` coarse separator refinement | `metis_debug_l1_construct_separator_from_lower_csc` | `metis_l1_construct_separator_matches_native_*`, `native_metis_node_bisection_stage_phase_tests` | Native-matching for path/star and the 54-vertex Match_RM coarse separator; `ctrl->compress` rollback limits are ported |
 | METIS `srefine.c::Project2WayNodePartition`, `Refine2WayNode`, active `FM_2WayNodeBalance` | `project_node_separator_state_through_coarsening`, `metis_l1_projected_separator_trace`, `fm_2way_node_balance` | `metis_l1_projected_separator_matches_native_path_54_fixture`, `native_metis_node_nd_fixture_phase_tests` | Native-matching for path/star no-op projection plus multi-level path projections through `path_1000` and L2 projection on `path_5000` |
 | METIS `ometis.c::MlevelNodeBisectionL2` large-graph separator path | `metis_l2_node_bisection_trace_with_rng`, `metis_coarsen_graph_nlevels_with_maps` | `metis_node_nd_orders_path_5000_l2_fixture`, `native_metis_node_nd_top_separator_compression_retry_phase_test`, `native_metis_node_nd_fixture_phase_tests` | Native-matching on `path_5000`: four-level pre-coarsening, five L1 retry runs, best-separator restore, and final projection are pinned |
-| METIS `ometis.c::MlevelNestedDissection` recursive separator plus MMD leaves | `metis_recursive_node_nd_order`, `assign_nested_dissection_positions` | `native_metis_node_nd_fixture_phase_tests` | Native-matching on complete-compressed, empty zero-edge, path, star, `path_54`, `path_121`, `path_300`, `path_1000`, compressed `twin_path_2400`, and L2 `path_5000`; `ccorder` remains unported |
+| METIS `ometis.c::MlevelNestedDissection` recursive separator plus MMD leaves | `metis_recursive_node_nd_order`, `assign_nested_dissection_positions` | `native_metis_node_nd_fixture_phase_tests` | Native-matching on complete-compressed, empty zero-edge, path, star, `path_54`, `path_121`, `path_300`, `path_1000`, compressed `twin_path_2400`, and L2 `path_5000` |
+| METIS `ometis.c::MlevelNestedDissectionCC`, `contig.c::FindSepInducedComponents`, `ometis.c::SplitGraphOrderCC` | `metis_recursive_node_nd_order_cc`, `find_separator_induced_components`, `split_graph_order_cc` | `native_metis_cc_component_phase_tests`, `native_metis_node_nd_non_default_option_phase_tests` | Native-matching for `ccorder=true` separator-induced component CSR, shuffled component order, split subgraph labels/CSR, final star order, compressed `twin_path_256`, and combined pruning+CC |
+| METIS `compress.c::PruneGraph` and `ometis.c` pruned-order expansion | `prune_metis_node_nd_graph`, `MetisNodeNdExpansion::Pruned` | `native_metis_prune_phase_tests`, `native_metis_node_nd_non_default_option_phase_tests` | Native-matching for no-prune reset, all-pruned ignored reset, partial hub pruning, compression disablement after real pruning, and final expansion of pruned vertices |
 | METIS `ometis.c::MlevelNodeBisectionMultiple` top separator state and `nseps` retry semantics | `metis_node_bisection_multiple_trace_with_rng`, `metis_debug_node_nd_top_separator_from_lower_csc` | `native_metis_separator_fixture_phase_tests`, `native_metis_node_nd_top_separator_compression_retry_phase_test` direct internal native oracle | Pinned for path/star, `path_54`, compressed `twin_path_2400`, and L2 `path_5000`: separator labels, boundary nodes, mincut, part weights, compression map, equal-mincut retry tie behavior, and L2 separator projection are fail-closed native expectations |
-| `metis5_wrapper.F90::metis_order` calling METIS `NodeND` | `metis_ordering::metis_node_nd_order` | `metis_node_nd_*` unit tests, dense native trace, direct native fixture oracle | Dense-compression, `<5000` L1 multilevel, compression retry, and `>=5000` L2 path fixtures integrated; full METIS 5.2.1 parity is not closed |
+| METIS `ometis.c::METIS_NodeND` option branches `COMPRESS`, `CCORDER`, `PFACTOR` | `metis_node_nd_order_with_options`, `MetisNodeNdOptions` | `native_metis_node_nd_non_default_option_phase_tests` source-built C shim | Native-matching for SPRAL default regression, forced `compress=false`, `ccorder=true`, no-prune `pfactor`, partial-prune `pfactor`, all-pruned ignored `pfactor`, pruning+CC, and compression+CC |
+| `metis5_wrapper.F90::metis_order` calling METIS `NodeND` | `metis_ordering::metis_node_nd_order` | `metis_node_nd_*` unit tests, dense native trace, direct native fixture oracle | Dense-compression, `<5000` L1 multilevel, compression retry, `>=5000` L2 path fixtures, and documented non-default NodeND option branches integrated; SPRAL's wrapper still uses METIS defaults |
 | `ssids.f90` analyse saved scaling | `SymbolicFactor::saved_matching_scaling` | `spral_matching_analysis_requires_values_and_reports_kind` | Integrated behind `OrderingStrategy::SpralMatching` |
 | `ssids.f90` factor `case(3)` scaling permutation | `numeric_scaling_for_symbolic` | `saved_matching_scaling_is_explicit_and_solves_in_original_coordinates` | Integrated behind `NumericScalingStrategy::SavedMatching` |
 | `assemble.hxx::add_a_block` scaled values | `apply_permuted_symmetric_scaling` | `permuted_symmetric_scaling_uses_spral_multiplication_order`, dense native trace | Integrated |
@@ -33,26 +36,31 @@ native METIS; those libraries are oracles for parity tests only.
 
 Open parity work:
 
-- Port remaining METIS 5.2.1 `METIS_NodeND` internals source-faithfully:
-  default `ccorder = 0` no longer needs the disconnected component-ordering
-  path, and default `pfactor = 0` does not prune high-degree vertices. Those
-  non-default branches remain unported. Compression-driven `nseps` retry
-  selection is now pinned by `twin_path_2400_compression_nseps_retry`,
+- METIS 5.2.1 `METIS_NodeND` internals are now source-ported for the SPRAL
+  default path plus the non-default `COMPRESS`, `CCORDER`, and `PFACTOR`
+  branches exposed by `MetisNodeNdOptions`. SPRAL's production wrapper still
+  calls `METIS_SetDefaultOptions` and uses default `compress = true`,
+  `ccorder = false`, and `pfactor = 0`; the configurable Rust API exists to
+  keep the source branch audit fail-closed, not to change SPRAL defaults.
+  Compression-driven `nseps` retry selection is pinned by
+  `twin_path_2400_compression_nseps_retry`,
   including the source tie behavior that keeps the final equal-mincut trial.
   The zero-edge `RandomBisection` branch is pinned by `empty_3`, and the
   `MlevelNodeBisectionL2` branch is pinned by `path_5000_l2_projection`. The
   standalone `genmmd` leaf routine, `Match_RM`, `Match_2Hop`, `Match_SHEM`,
   multi-level projection, active node balance, recursive L1 nested dissection,
-  and L2 large-graph separator path are now ported and native-oracle tested.
+  L2 large-graph separator path, `MlevelNestedDissectionCC`, `PruneGraph`, and
+  pruned-order expansion are now ported and native-oracle tested.
 - Direct native `metis_order` fixture oracle status:
   `complete_69_compresses_to_single_component`, `path_6`, `star_7`, and
   path fixtures `54`, `121`, `300`, and `1000` now match. The compressed
   `twin_path_2400` fixture also matches after exercising `cfactor > 1.5`,
   `nseps = 2`, retry tie handling, and compressed FM rollback limits.
-  `empty_3` matches after exercising the zero-edge `RandomBisection` path.
-  `path_5000` matches after exercising `MlevelNodeBisectionL2`. The remaining
-  unported branches are non-default `ccorder` component ordering and
-  non-default pruning.
+  `empty_3` matches after exercising the zero-edge `RandomBisection` path, and
+  `path_5000` matches after exercising `MlevelNodeBisectionL2`. The additional
+  source-built C `METIS_NodeND` shim now pins non-default forced
+  no-compression, `ccorder`, pruning, all-pruned ignored, pruning+CC, and
+  compression+CC fixtures.
 - Direct native separator fixture status:
   `path_6` top separator is vertex `2` with `where=[1,1,2,0,0,0]`;
   `star_7` top separator is vertex `0` with `where=[2,0,1,0,1,1,0]`;

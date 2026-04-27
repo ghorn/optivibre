@@ -323,6 +323,29 @@ pub fn approximate_minimum_degree_order(
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetisNodeNdOptions {
+    pub compress: bool,
+    pub ccorder: bool,
+    pub pfactor: usize,
+}
+
+impl MetisNodeNdOptions {
+    pub const fn spral_default() -> Self {
+        Self {
+            compress: true,
+            ccorder: false,
+            pfactor: 0,
+        }
+    }
+}
+
+impl Default for MetisNodeNdOptions {
+    fn default() -> Self {
+        Self::spral_default()
+    }
+}
+
 /// Rust production boundary for the METIS `NodeND` ordering used by SPRAL's
 /// matching-order path.
 ///
@@ -331,10 +354,24 @@ pub fn approximate_minimum_degree_order(
 /// `docs/spral-matching-scaling-port.md`; callers that need native-oracle
 /// parity must keep using the fail-closed parity tests until that audit closes.
 pub fn metis_node_nd_order(graph: &CsrGraph) -> Result<OrderingSummary, OrderingError> {
-    metis_node_nd_order_raw(&MetisGraph::from_csr_graph(graph))
+    metis_node_nd_order_with_options(graph, MetisNodeNdOptions::spral_default())
+}
+
+pub fn metis_node_nd_order_with_options(
+    graph: &CsrGraph,
+    options: MetisNodeNdOptions,
+) -> Result<OrderingSummary, OrderingError> {
+    metis_node_nd_order_raw_with_options(&MetisGraph::from_csr_graph(graph), options)
 }
 
 fn metis_node_nd_order_raw(graph: &MetisGraph) -> Result<OrderingSummary, OrderingError> {
+    metis_node_nd_order_raw_with_options(graph, MetisNodeNdOptions::spral_default())
+}
+
+fn metis_node_nd_order_raw_with_options(
+    graph: &MetisGraph,
+    options: MetisNodeNdOptions,
+) -> Result<OrderingSummary, OrderingError> {
     if graph.vertex_count() == 0 {
         return Ok(OrderingSummary {
             permutation: Permutation::identity(0),
@@ -360,32 +397,22 @@ fn metis_node_nd_order_raw(graph: &MetisGraph) -> Result<OrderingSummary, Orderi
         });
     }
 
-    let compressed = compress_metis_node_nd_graph(graph)?;
+    let prepared = prepare_metis_node_nd_graph(graph, options)?;
     let config = MetisNodeNdConfig {
-        compression_active: compressed.compression_active,
-        nseps: if compressed.compression_active
-            && (graph.vertex_count() as f64 / compressed.graph.vertex_count() as f64) > 1.5
-        {
-            2
-        } else {
-            1
-        },
+        compression_active: prepared.compression_active,
+        ccorder: options.ccorder,
+        nseps: prepared.nseps,
     };
-    let base_summary = if compressed.graph.vertex_count() <= 53 {
-        metis_one_level_node_nd_order(&compressed.graph, config)?
+    let base_summary = if options.ccorder {
+        metis_recursive_node_nd_order_cc(&prepared.graph, config)?
+    } else if prepared.graph.vertex_count() <= 53 {
+        metis_one_level_node_nd_order(&prepared.graph, config)?
     } else {
-        metis_recursive_node_nd_order(&compressed.graph, config)?
+        metis_recursive_node_nd_order(&prepared.graph, config)?
     };
 
-    let mut expanded_order = Vec::with_capacity(graph.vertex_count());
-    for &compressed_vertex in base_summary.permutation.perm() {
-        expanded_order.extend(
-            compressed.original_vertices[compressed_vertex]
-                .iter()
-                .copied(),
-        );
-    }
-    let permutation = Permutation::new(expanded_order)?;
+    let permutation =
+        expand_metis_node_nd_permutation(base_summary.permutation, prepared.expansion)?;
     Ok(OrderingSummary {
         permutation,
         stats: OrderingStats {
@@ -401,13 +428,121 @@ fn metis_node_nd_order_raw(graph: &MetisGraph) -> Result<OrderingSummary, Orderi
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MetisNodeNdConfig {
     compression_active: bool,
+    ccorder: bool,
     nseps: usize,
+}
+
+struct PreparedMetisNodeNdGraph {
+    graph: MetisGraph,
+    compression_active: bool,
+    nseps: usize,
+    expansion: MetisNodeNdExpansion,
+}
+
+enum MetisNodeNdExpansion {
+    Identity,
+    Compressed {
+        original_vertices: Vec<Vec<usize>>,
+    },
+    Pruned {
+        original_vertex_count: usize,
+        kept_vertex_count: usize,
+        piperm: Vec<usize>,
+    },
+}
+
+fn prepare_metis_node_nd_graph(
+    graph: &MetisGraph,
+    options: MetisNodeNdOptions,
+) -> Result<PreparedMetisNodeNdGraph, OrderingError> {
+    if options.pfactor > 0
+        && let Some(pruned) = prune_metis_node_nd_graph(graph, options.pfactor)?
+    {
+        return Ok(PreparedMetisNodeNdGraph {
+            graph: pruned.graph,
+            compression_active: false,
+            nseps: 1,
+            expansion: MetisNodeNdExpansion::Pruned {
+                original_vertex_count: graph.vertex_count(),
+                kept_vertex_count: pruned.kept_vertex_count,
+                piperm: pruned.piperm,
+            },
+        });
+    }
+
+    if options.compress {
+        let compressed = compress_metis_node_nd_graph(graph)?;
+        if compressed.compression_active {
+            let nseps =
+                if (graph.vertex_count() as f64 / compressed.graph.vertex_count() as f64) > 1.5 {
+                    2
+                } else {
+                    1
+                };
+            return Ok(PreparedMetisNodeNdGraph {
+                graph: compressed.graph,
+                compression_active: true,
+                nseps,
+                expansion: MetisNodeNdExpansion::Compressed {
+                    original_vertices: compressed.original_vertices,
+                },
+            });
+        }
+    }
+
+    Ok(PreparedMetisNodeNdGraph {
+        graph: graph.clone(),
+        compression_active: false,
+        nseps: 1,
+        expansion: MetisNodeNdExpansion::Identity,
+    })
+}
+
+fn expand_metis_node_nd_permutation(
+    base: Permutation,
+    expansion: MetisNodeNdExpansion,
+) -> Result<Permutation, OrderingError> {
+    match expansion {
+        MetisNodeNdExpansion::Identity => Ok(base),
+        MetisNodeNdExpansion::Compressed { original_vertices } => {
+            let original_vertex_count = original_vertices.iter().map(Vec::len).sum();
+            let mut expanded_order = Vec::with_capacity(original_vertex_count);
+            for &compressed_vertex in base.perm() {
+                expanded_order.extend(original_vertices[compressed_vertex].iter().copied());
+            }
+            Permutation::new(expanded_order)
+        }
+        MetisNodeNdExpansion::Pruned {
+            original_vertex_count,
+            kept_vertex_count,
+            piperm,
+        } => {
+            let mut old_to_new = vec![usize::MAX; original_vertex_count];
+            for (kept, &original) in piperm.iter().take(kept_vertex_count).enumerate() {
+                old_to_new[original] = base.inverse()[kept];
+            }
+            for (position, &original) in piperm.iter().enumerate().skip(kept_vertex_count) {
+                old_to_new[original] = position;
+            }
+            let mut new_to_old = vec![usize::MAX; original_vertex_count];
+            for (old, &new) in old_to_new.iter().enumerate() {
+                if new == usize::MAX || new >= original_vertex_count {
+                    return Err(OrderingError::Algorithm(
+                        "METIS NodeND pruning expansion produced invalid position".into(),
+                    ));
+                }
+                new_to_old[new] = old;
+            }
+            Permutation::new(new_to_old)
+        }
+    }
 }
 
 fn metis_one_level_node_nd_order(
     graph: &MetisGraph,
     config: MetisNodeNdConfig,
 ) -> Result<OrderingSummary, OrderingError> {
+    debug_assert!(!config.ccorder);
     let vertex_count = graph.vertex_count();
     if vertex_count <= 1 {
         return Ok(OrderingSummary {
@@ -476,6 +611,7 @@ fn metis_recursive_node_nd_order(
     graph: &MetisGraph,
     config: MetisNodeNdConfig,
 ) -> Result<OrderingSummary, OrderingError> {
+    debug_assert!(!config.ccorder);
     let vertex_count = graph.vertex_count();
     let mut old_to_new = vec![usize::MAX; vertex_count];
     let labels = (0..vertex_count).collect::<Vec<_>>();
@@ -504,6 +640,52 @@ fn metis_recursive_node_nd_order(
     {
         return Err(OrderingError::Algorithm(format!(
             "METIS recursive NodeND vertex {vertex} unordered"
+        )));
+    }
+
+    let mut new_to_old = vec![0usize; vertex_count];
+    for (old, &new) in old_to_new.iter().enumerate() {
+        new_to_old[new] = old;
+    }
+    Ok(OrderingSummary {
+        permutation: Permutation::new(new_to_old)?,
+        stats,
+    })
+}
+
+fn metis_recursive_node_nd_order_cc(
+    graph: &MetisGraph,
+    config: MetisNodeNdConfig,
+) -> Result<OrderingSummary, OrderingError> {
+    debug_assert!(config.ccorder);
+    let vertex_count = graph.vertex_count();
+    let mut old_to_new = vec![usize::MAX; vertex_count];
+    let labels = (0..vertex_count).collect::<Vec<_>>();
+    let mut rng = MetisRng::with_metis_seed(-1);
+    let mut stats = OrderingStats {
+        connected_components: 0,
+        separator_calls: 0,
+        leaf_calls: 0,
+        separator_vertices: 0,
+        max_separator_size: 0,
+    };
+    assign_nested_dissection_positions_cc(
+        graph,
+        &labels,
+        vertex_count,
+        &mut old_to_new,
+        &mut rng,
+        config,
+        &mut stats,
+    )?;
+
+    if let Some((vertex, _)) = old_to_new
+        .iter()
+        .enumerate()
+        .find(|&(_, &position)| position == usize::MAX)
+    {
+        return Err(OrderingError::Algorithm(format!(
+            "METIS recursive CC NodeND vertex {vertex} unordered"
         )));
     }
 
@@ -575,6 +757,59 @@ fn assign_nested_dissection_positions(
         assign_mmd_graph_positions(&right_graph, &right_labels, next_last_vertex, old_to_new)?;
         stats.leaf_calls += usize::from(right_graph.vertex_count() > 0);
     }
+    Ok(())
+}
+
+fn assign_nested_dissection_positions_cc(
+    graph: &MetisGraph,
+    labels: &[usize],
+    last_vertex: usize,
+    old_to_new: &mut [usize],
+    rng: &mut MetisRng,
+    config: MetisNodeNdConfig,
+    stats: &mut OrderingStats,
+) -> Result<(), OrderingError> {
+    debug_assert_eq!(graph.vertex_count(), labels.len());
+    if graph.vertex_count() == 0 {
+        return Ok(());
+    }
+
+    let separator = metis_node_bisection_multiple_trace_with_rng(graph, config, rng)?;
+    stats.separator_calls += 1;
+    stats.separator_vertices += separator.boundary.len();
+    stats.max_separator_size = stats.max_separator_size.max(separator.boundary.len());
+
+    let mut next_last_vertex = last_vertex;
+    for &separator_vertex in &separator.boundary {
+        next_last_vertex -= 1;
+        old_to_new[labels[separator_vertex]] = next_last_vertex;
+    }
+
+    let mut components = find_separator_induced_components(graph, &separator);
+    stats.connected_components += components.len().saturating_sub(1);
+    let subgraphs = split_graph_order_cc(graph, labels, &separator, &mut components, rng)?;
+
+    let mut removed_vertices = 0usize;
+    for (subgraph, sublabels) in subgraphs {
+        let subgraph_vertex_count = subgraph.vertex_count();
+        let subgraph_last_vertex = next_last_vertex - removed_vertices;
+        if subgraph.vertex_count() > 120 && subgraph.directed_edge_count() > 0 {
+            assign_nested_dissection_positions_cc(
+                &subgraph,
+                &sublabels,
+                subgraph_last_vertex,
+                old_to_new,
+                rng,
+                config,
+                stats,
+            )?;
+        } else {
+            assign_mmd_graph_positions(&subgraph, &sublabels, subgraph_last_vertex, old_to_new)?;
+            stats.leaf_calls += usize::from(subgraph.vertex_count() > 0);
+        }
+        removed_vertices += subgraph_vertex_count;
+    }
+
     Ok(())
 }
 
@@ -652,6 +887,144 @@ fn split_graph_order_part(
         vertex_weights,
         edge_weights,
     }
+}
+
+fn find_separator_induced_components(
+    graph: &MetisGraph,
+    separator: &MetisNodeSeparatorTrace,
+) -> Vec<Vec<usize>> {
+    let vertex_count = graph.vertex_count();
+    let mut touched = vec![false; vertex_count];
+    for &boundary in &separator.boundary {
+        touched[boundary] = true;
+    }
+
+    let non_separator_count = separator
+        .where_part
+        .iter()
+        .filter(|&&part| part != 2)
+        .count();
+    if non_separator_count == 0 {
+        return Vec::new();
+    }
+
+    let mut queue = Vec::with_capacity(non_separator_count);
+    let mut first_start = 0usize;
+    while first_start < vertex_count && separator.where_part[first_start] == 2 {
+        first_start += 1;
+    }
+    if first_start == vertex_count {
+        return Vec::new();
+    }
+    touched[first_start] = true;
+    queue.push(first_start);
+
+    let mut first = 0usize;
+    let mut last = 1usize;
+    let mut component_starts = vec![0usize];
+    while first != non_separator_count {
+        if first == last {
+            component_starts.push(first);
+            let mut next_start = 0usize;
+            while next_start < vertex_count && touched[next_start] {
+                next_start += 1;
+            }
+            if next_start == vertex_count {
+                break;
+            }
+            queue.push(next_start);
+            touched[next_start] = true;
+            last += 1;
+        }
+
+        let vertex = queue[first];
+        first += 1;
+        for &neighbor in graph.neighbors(vertex) {
+            if !touched[neighbor] {
+                queue.push(neighbor);
+                touched[neighbor] = true;
+                last += 1;
+            }
+        }
+    }
+    component_starts.push(first);
+
+    component_starts
+        .windows(2)
+        .map(|window| queue[window[0]..window[1]].to_vec())
+        .collect()
+}
+
+fn split_graph_order_cc(
+    graph: &MetisGraph,
+    labels: &[usize],
+    separator: &MetisNodeSeparatorTrace,
+    components: &mut [Vec<usize>],
+    rng: &mut MetisRng,
+) -> Result<Vec<(MetisGraph, Vec<usize>)>, OrderingError> {
+    let mut boundary_neighbor = vec![false; graph.vertex_count()];
+    for &boundary in &separator.boundary {
+        for &neighbor in graph.neighbors(boundary) {
+            boundary_neighbor[neighbor] = true;
+        }
+    }
+
+    let mut subgraphs = Vec::with_capacity(components.len());
+    for component in components {
+        let component_len = component.len();
+        rng.rand_array_permute(component, component_len, false);
+        let mut rename = vec![usize::MAX; graph.vertex_count()];
+        for (local, &global) in component.iter().enumerate() {
+            rename[global] = local;
+        }
+
+        let mut offsets = Vec::with_capacity(component.len() + 1);
+        let mut neighbors = Vec::new();
+        let mut vertex_weights = Vec::with_capacity(component.len());
+        let mut sublabels = Vec::with_capacity(component.len());
+        offsets.push(0);
+        for &global in component.iter() {
+            vertex_weights.push(graph.vertex_weight(global));
+            sublabels.push(labels[global]);
+            if boundary_neighbor[global] {
+                for &neighbor in graph.neighbors(global) {
+                    if separator.where_part[neighbor] != 2 {
+                        let local_neighbor = rename[neighbor];
+                        if local_neighbor == usize::MAX {
+                            return Err(OrderingError::Algorithm(
+                                "METIS CC split found edge across separator-induced components"
+                                    .into(),
+                            ));
+                        }
+                        neighbors.push(local_neighbor);
+                    }
+                }
+            } else {
+                for &neighbor in graph.neighbors(global) {
+                    let local_neighbor = rename[neighbor];
+                    if local_neighbor == usize::MAX {
+                        return Err(OrderingError::Algorithm(
+                            "METIS CC split interior edge left its component".into(),
+                        ));
+                    }
+                    neighbors.push(local_neighbor);
+                }
+            }
+            offsets.push(neighbors.len());
+        }
+        let edge_weights = vec![1; neighbors.len()];
+        subgraphs.push((
+            MetisGraph {
+                offsets,
+                neighbors,
+                vertex_weights,
+                edge_weights,
+            },
+            sublabels,
+        ));
+    }
+
+    Ok(subgraphs)
 }
 
 fn assign_mmd_leaf_positions(
@@ -758,6 +1131,16 @@ pub struct MetisNodeNdTopSeparatorTrace {
     pub separator: MetisNodeSeparatorTrace,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetisCcComponentsTrace {
+    pub separator: MetisNodeSeparatorTrace,
+    pub cptr: Vec<usize>,
+    pub cind: Vec<usize>,
+    pub subgraph_labels: Vec<Vec<usize>>,
+    pub subgraph_offsets: Vec<Vec<usize>>,
+    pub subgraph_neighbors: Vec<Vec<usize>>,
+}
+
 #[doc(hidden)]
 pub fn metis_debug_l1_edge_bisection_from_lower_csc(
     dimension: usize,
@@ -816,29 +1199,96 @@ pub fn metis_debug_node_nd_top_separator_from_lower_csc(
     col_ptrs: &[usize],
     row_indices: &[usize],
 ) -> Result<MetisNodeNdTopSeparatorTrace, OrderingError> {
+    metis_debug_node_nd_top_separator_from_lower_csc_with_options(
+        dimension,
+        col_ptrs,
+        row_indices,
+        MetisNodeNdOptions::spral_default(),
+    )
+}
+
+#[doc(hidden)]
+pub fn metis_debug_node_nd_top_separator_from_lower_csc_with_options(
+    dimension: usize,
+    col_ptrs: &[usize],
+    row_indices: &[usize],
+    options: MetisNodeNdOptions,
+) -> Result<MetisNodeNdTopSeparatorTrace, OrderingError> {
     let graph = spral_half_to_full_drop_diag(dimension, col_ptrs, row_indices)?;
-    let compressed = compress_metis_node_nd_graph(&graph)?;
-    let nseps = if compressed.compression_active
-        && (graph.vertex_count() as f64 / compressed.graph.vertex_count() as f64) > 1.5
-    {
-        2
-    } else {
-        1
-    };
+    let prepared = prepare_metis_node_nd_graph(&graph, options)?;
     let config = MetisNodeNdConfig {
-        compression_active: compressed.compression_active,
-        nseps,
+        compression_active: prepared.compression_active,
+        ccorder: options.ccorder,
+        nseps: prepared.nseps,
     };
     let mut rng = MetisRng::with_metis_seed(-1);
     let separator =
-        metis_node_bisection_multiple_trace_with_rng(&compressed.graph, config, &mut rng)?;
+        metis_node_bisection_multiple_trace_with_rng(&prepared.graph, config, &mut rng)?;
+    let compressed_original_vertices = match prepared.expansion {
+        MetisNodeNdExpansion::Compressed { original_vertices } => original_vertices,
+        MetisNodeNdExpansion::Identity => (0..prepared.graph.vertex_count())
+            .map(|vertex| vec![vertex])
+            .collect(),
+        MetisNodeNdExpansion::Pruned { .. } => (0..prepared.graph.vertex_count())
+            .map(|vertex| vec![vertex])
+            .collect(),
+    };
     Ok(MetisNodeNdTopSeparatorTrace {
-        compression_active: compressed.compression_active,
-        nseps,
-        compressed_vertex_count: compressed.graph.vertex_count(),
-        compressed_directed_edge_count: compressed.graph.directed_edge_count(),
-        compressed_original_vertices: compressed.original_vertices,
+        compression_active: prepared.compression_active,
+        nseps: prepared.nseps,
+        compressed_vertex_count: prepared.graph.vertex_count(),
+        compressed_directed_edge_count: prepared.graph.directed_edge_count(),
+        compressed_original_vertices,
         separator,
+    })
+}
+
+#[doc(hidden)]
+pub fn metis_debug_cc_components_from_lower_csc_with_options(
+    dimension: usize,
+    col_ptrs: &[usize],
+    row_indices: &[usize],
+    options: MetisNodeNdOptions,
+) -> Result<MetisCcComponentsTrace, OrderingError> {
+    let graph = spral_half_to_full_drop_diag(dimension, col_ptrs, row_indices)?;
+    let prepared = prepare_metis_node_nd_graph(&graph, options)?;
+    let config = MetisNodeNdConfig {
+        compression_active: prepared.compression_active,
+        ccorder: options.ccorder,
+        nseps: prepared.nseps,
+    };
+    let mut rng = MetisRng::with_metis_seed(-1);
+    let separator =
+        metis_node_bisection_multiple_trace_with_rng(&prepared.graph, config, &mut rng)?;
+    let labels = (0..prepared.graph.vertex_count()).collect::<Vec<_>>();
+    let mut components = find_separator_induced_components(&prepared.graph, &separator);
+    let subgraphs = split_graph_order_cc(
+        &prepared.graph,
+        &labels,
+        &separator,
+        &mut components,
+        &mut rng,
+    )?;
+    let mut cptr = Vec::with_capacity(components.len() + 1);
+    let mut cind = Vec::new();
+    cptr.push(0);
+    for component in &components {
+        cind.extend(component.iter().copied());
+        cptr.push(cind.len());
+    }
+    Ok(MetisCcComponentsTrace {
+        separator,
+        cptr,
+        cind,
+        subgraph_labels: subgraphs.iter().map(|(_, labels)| labels.clone()).collect(),
+        subgraph_offsets: subgraphs
+            .iter()
+            .map(|(graph, _)| graph.offsets.clone())
+            .collect(),
+        subgraph_neighbors: subgraphs
+            .iter()
+            .map(|(graph, _)| graph.neighbors.clone())
+            .collect(),
     })
 }
 
@@ -849,6 +1299,16 @@ pub fn metis_node_nd_order_from_lower_csc(
 ) -> Result<OrderingSummary, OrderingError> {
     let graph = spral_half_to_full_drop_diag(dimension, col_ptrs, row_indices)?;
     metis_node_nd_order_raw(&graph)
+}
+
+pub fn metis_node_nd_order_from_lower_csc_with_options(
+    dimension: usize,
+    col_ptrs: &[usize],
+    row_indices: &[usize],
+    options: MetisNodeNdOptions,
+) -> Result<OrderingSummary, OrderingError> {
+    let graph = spral_half_to_full_drop_diag(dimension, col_ptrs, row_indices)?;
+    metis_node_nd_order_raw_with_options(&graph, options)
 }
 
 #[doc(hidden)]
@@ -1003,6 +1463,22 @@ struct CompressedNodeNdGraph {
     compression_active: bool,
 }
 
+struct PrunedNodeNdGraph {
+    graph: MetisGraph,
+    kept_vertex_count: usize,
+    piperm: Vec<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetisPruneTrace {
+    pub pruning_active: bool,
+    pub kept_vertex_count: usize,
+    pub piperm: Vec<usize>,
+    pub offsets: Vec<usize>,
+    pub neighbors: Vec<usize>,
+    pub vertex_weights: Vec<isize>,
+}
+
 fn compress_metis_node_nd_graph(
     graph: &MetisGraph,
 ) -> Result<CompressedNodeNdGraph, OrderingError> {
@@ -1103,6 +1579,99 @@ fn compress_metis_node_nd_graph(
         original_vertices,
         compression_active: true,
     })
+}
+
+fn prune_metis_node_nd_graph(
+    graph: &MetisGraph,
+    pfactor: usize,
+) -> Result<Option<PrunedNodeNdGraph>, OrderingError> {
+    let vertex_count = graph.vertex_count();
+    if vertex_count == 0 {
+        return Ok(None);
+    }
+
+    let threshold = 0.1 * pfactor as f64 * graph.directed_edge_count() as f64 / vertex_count as f64;
+    let mut perm = vec![usize::MAX; vertex_count];
+    let mut piperm = vec![usize::MAX; vertex_count];
+    let mut kept_vertex_count = 0usize;
+    let mut pruned_count = 0usize;
+    let mut kept_directed_edges = 0usize;
+
+    for (vertex, mapped_vertex) in perm.iter_mut().enumerate().take(vertex_count) {
+        if (graph.degree(vertex) as f64) < threshold {
+            *mapped_vertex = kept_vertex_count;
+            piperm[kept_vertex_count] = vertex;
+            kept_vertex_count += 1;
+            kept_directed_edges += graph.degree(vertex);
+        } else {
+            pruned_count += 1;
+            let position = vertex_count - pruned_count;
+            *mapped_vertex = position;
+            piperm[position] = vertex;
+        }
+    }
+
+    if pruned_count == 0 || pruned_count == vertex_count {
+        return Ok(None);
+    }
+
+    let mut offsets = Vec::with_capacity(kept_vertex_count + 1);
+    let mut neighbors = Vec::with_capacity(kept_directed_edges);
+    let mut vertex_weights = Vec::with_capacity(kept_vertex_count);
+    offsets.push(0);
+    for vertex in 0..vertex_count {
+        if (graph.degree(vertex) as f64) < threshold {
+            vertex_weights.push(graph.vertex_weight(vertex));
+            for &neighbor in graph.neighbors(vertex) {
+                let mapped = perm[neighbor];
+                if mapped < kept_vertex_count {
+                    neighbors.push(mapped);
+                }
+            }
+            offsets.push(neighbors.len());
+        }
+    }
+    let edge_weights = vec![1; neighbors.len()];
+    Ok(Some(PrunedNodeNdGraph {
+        graph: MetisGraph {
+            offsets,
+            neighbors,
+            vertex_weights,
+            edge_weights,
+        },
+        kept_vertex_count,
+        piperm,
+    }))
+}
+
+#[doc(hidden)]
+pub fn metis_debug_prune_from_lower_csc(
+    dimension: usize,
+    col_ptrs: &[usize],
+    row_indices: &[usize],
+    pfactor: usize,
+) -> Result<MetisPruneTrace, OrderingError> {
+    let graph = spral_half_to_full_drop_diag(dimension, col_ptrs, row_indices)?;
+    let pruned = prune_metis_node_nd_graph(&graph, pfactor)?;
+    if let Some(pruned) = pruned {
+        Ok(MetisPruneTrace {
+            pruning_active: true,
+            kept_vertex_count: pruned.kept_vertex_count,
+            piperm: pruned.piperm,
+            offsets: pruned.graph.offsets,
+            neighbors: pruned.graph.neighbors,
+            vertex_weights: pruned.graph.vertex_weights,
+        })
+    } else {
+        Ok(MetisPruneTrace {
+            pruning_active: false,
+            kept_vertex_count: dimension,
+            piperm: (0..dimension).collect(),
+            offsets: graph.offsets,
+            neighbors: graph.neighbors,
+            vertex_weights: graph.vertex_weights,
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1429,6 +1998,7 @@ fn metis_l1_projected_separator_trace_with_rng(
         graph,
         MetisNodeNdConfig {
             compression_active: false,
+            ccorder: false,
             nseps: 1,
         },
         7,
@@ -4049,8 +4619,64 @@ mod tests {
         let graph = CsrGraph::from_edges(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]).unwrap();
         let summary = metis_node_nd_order(&graph).unwrap();
         assert_permutation(&summary, 5);
+        let explicit =
+            metis_node_nd_order_with_options(&graph, MetisNodeNdOptions::spral_default()).unwrap();
+        assert_eq!(summary, explicit);
         let amd = approximate_minimum_degree_order(&graph).unwrap();
         assert_permutation(&amd, 5);
+    }
+
+    #[test]
+    fn metis_node_nd_options_can_force_no_compression() {
+        let dimension = 69;
+        let mut col_ptrs = Vec::with_capacity(dimension + 1);
+        let mut row_indices = Vec::new();
+        col_ptrs.push(0);
+        for col in 0..dimension {
+            row_indices.extend(col..dimension);
+            col_ptrs.push(row_indices.len());
+        }
+        let default_summary =
+            metis_node_nd_order_from_lower_csc(dimension, &col_ptrs, &row_indices).unwrap();
+        let no_compress = metis_node_nd_order_from_lower_csc_with_options(
+            dimension,
+            &col_ptrs,
+            &row_indices,
+            MetisNodeNdOptions {
+                compress: false,
+                ..MetisNodeNdOptions::spral_default()
+            },
+        )
+        .unwrap();
+        assert_permutation(&default_summary, dimension);
+        assert_permutation(&no_compress, dimension);
+        assert_ne!(default_summary.permutation, no_compress.permutation);
+    }
+
+    #[test]
+    fn metis_node_nd_prune_trace_covers_no_partial_and_all_pruned() {
+        let star_edges = (1..10).map(|leaf| (0, leaf)).collect::<Vec<_>>();
+        let (col_ptrs, row_indices) = lower_csc_pattern_from_edges(10, &star_edges);
+
+        let no_prune = metis_debug_prune_from_lower_csc(10, &col_ptrs, &row_indices, 100).unwrap();
+        assert!(!no_prune.pruning_active);
+        assert_eq!(no_prune.kept_vertex_count, 10);
+        assert_eq!(
+            no_prune.offsets,
+            &[0, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+        );
+
+        let partial = metis_debug_prune_from_lower_csc(10, &col_ptrs, &row_indices, 20).unwrap();
+        assert!(partial.pruning_active);
+        assert_eq!(partial.kept_vertex_count, 9);
+        assert_eq!(partial.piperm, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 0]);
+        assert_eq!(partial.offsets, &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(partial.neighbors.is_empty());
+        assert_eq!(partial.vertex_weights, &[1; 9]);
+
+        let all_pruned = metis_debug_prune_from_lower_csc(10, &col_ptrs, &row_indices, 1).unwrap();
+        assert!(!all_pruned.pruning_active);
+        assert_eq!(all_pruned.kept_vertex_count, 10);
     }
 
     #[test]

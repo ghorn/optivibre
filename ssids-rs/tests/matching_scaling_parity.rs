@@ -331,6 +331,23 @@ struct NativeMetisRun {
     feature = "native-spral-src-pthreads",
     feature = "native-spral-src-openmp"
 ))]
+struct NativeMetisPruneRun {
+    stat: i32,
+    pruning_active: bool,
+    kept_vertex_count: usize,
+    directed_edge_count: usize,
+    piperm: Vec<usize>,
+    offsets: Vec<usize>,
+    neighbors: Vec<usize>,
+    vertex_weights: Vec<isize>,
+}
+
+#[derive(Debug)]
+#[cfg(any(
+    feature = "native-spral-src",
+    feature = "native-spral-src-pthreads",
+    feature = "native-spral-src-openmp"
+))]
 struct NativeMmdRun {
     stat: i32,
     perm: Vec<usize>,
@@ -366,6 +383,22 @@ struct NativeNodeNdTopSeparatorRun {
     compressed_cptr: Vec<usize>,
     compressed_cind: Vec<usize>,
     separator: NativeSeparatorRun,
+}
+
+#[derive(Debug)]
+#[cfg(any(
+    feature = "native-spral-src",
+    feature = "native-spral-src-pthreads",
+    feature = "native-spral-src-openmp"
+))]
+struct NativeMetisCcComponentsRun {
+    stat: i32,
+    separator: NativeSeparatorRun,
+    cptr: Vec<usize>,
+    cind: Vec<usize>,
+    subgraph_labels: Vec<Vec<usize>>,
+    subgraph_offsets: Vec<Vec<usize>>,
+    subgraph_neighbors: Vec<Vec<usize>>,
 }
 
 #[derive(Debug)]
@@ -565,6 +598,426 @@ program spral_metis_order_shim
      write(*, '(I0)') invp(i)
   end do
 end program spral_metis_order_shim
+"#;
+
+#[cfg(any(
+    feature = "native-spral-src",
+    feature = "native-spral-src-pthreads",
+    feature = "native-spral-src-openmp"
+))]
+const NATIVE_METIS_NODE_ND_OPTIONS_SHIM_SOURCE: &str = r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include "metis.h"
+
+static int lower_to_full(idx_t n, idx_t ne, idx_t *ptr, idx_t *rows,
+    idx_t **r_xadj, idx_t **r_adjncy) {
+  idx_t i, j, col, row, total;
+  idx_t *counts, *next, *xadj, *adjncy;
+
+  counts = calloc((size_t)n, sizeof(idx_t));
+  next = calloc((size_t)n, sizeof(idx_t));
+  if (!counts || !next) return 3;
+
+  for (col = 0; col < n; col++) {
+    for (j = ptr[col]; j < ptr[col + 1]; j++) {
+      row = rows[j];
+      if (row != col) {
+        counts[row]++;
+        counts[col]++;
+      }
+    }
+  }
+
+  total = 0;
+  for (i = 0; i < n; i++) {
+    total += counts[i];
+    next[i] = total;
+  }
+
+  xadj = calloc((size_t)n + 1, sizeof(idx_t));
+  adjncy = calloc((size_t)total, sizeof(idx_t));
+  if (!xadj || !adjncy) return 3;
+
+  for (col = 0; col < n; col++) {
+    for (j = ptr[col]; j < ptr[col + 1]; j++) {
+      row = rows[j];
+      if (row == col) continue;
+      next[row]--;
+      adjncy[next[row]] = col;
+      next[col]--;
+      adjncy[next[col]] = row;
+    }
+  }
+  for (i = 0; i < n; i++) xadj[i] = next[i];
+  xadj[n] = total;
+
+  free(counts);
+  free(next);
+  *r_xadj = xadj;
+  *r_adjncy = adjncy;
+  return 0;
+}
+
+int main(int argc, char **argv) {
+  FILE *input;
+  idx_t n, ne, i, compress, ccorder, pfactor, options[METIS_NOPTIONS];
+  idx_t *ptr, *rows, *xadj, *adjncy, *perm, *iperm;
+  int status;
+
+  if (argc != 2) {
+    fprintf(stderr, "usage: %s input\n", argv[0]);
+    return 2;
+  }
+  input = fopen(argv[1], "r");
+  if (input == NULL) {
+    perror("open input");
+    return 2;
+  }
+  if (fscanf(input, "%" SCIDX " %" SCIDX " %" SCIDX " %" SCIDX " %" SCIDX,
+      &n, &ne, &compress, &ccorder, &pfactor) != 5) {
+    fprintf(stderr, "failed to read header\n");
+    return 2;
+  }
+
+  ptr = calloc((size_t)n + 1, sizeof(idx_t));
+  rows = calloc((size_t)ne, sizeof(idx_t));
+  perm = calloc((size_t)n, sizeof(idx_t));
+  iperm = calloc((size_t)n, sizeof(idx_t));
+  if (!ptr || !rows || !perm || !iperm) return 3;
+
+  for (i = 0; i < n + 1; i++) {
+    if (fscanf(input, "%" SCIDX, &ptr[i]) != 1) return 2;
+    ptr[i]--;
+  }
+  for (i = 0; i < ne; i++) {
+    if (fscanf(input, "%" SCIDX, &rows[i]) != 1) return 2;
+    rows[i]--;
+  }
+  fclose(input);
+
+  if (lower_to_full(n, ne, ptr, rows, &xadj, &adjncy) != 0) return 3;
+
+  METIS_SetDefaultOptions(options);
+  options[METIS_OPTION_NUMBERING] = 0;
+  options[METIS_OPTION_COMPRESS] = compress;
+  options[METIS_OPTION_CCORDER] = ccorder;
+  options[METIS_OPTION_PFACTOR] = pfactor;
+  status = METIS_NodeND(&n, xadj, adjncy, NULL, options, perm, iperm);
+
+  printf("%d\n", status);
+  printf("0\n");
+  for (i = 0; i < n; i++) printf("%" PRIDX "\n", iperm[i] + 1);
+  for (i = 0; i < n; i++) printf("%" PRIDX "\n", perm[i] + 1);
+
+  free(ptr); free(rows); free(xadj); free(adjncy); free(perm); free(iperm);
+  return 0;
+}
+"#;
+
+#[cfg(any(
+    feature = "native-spral-src",
+    feature = "native-spral-src-pthreads",
+    feature = "native-spral-src-openmp"
+))]
+const NATIVE_METIS_PRUNE_SHIM_SOURCE: &str = r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include "metislib.h"
+
+static int lower_to_full(idx_t n, idx_t ne, idx_t *ptr, idx_t *rows,
+    idx_t **r_xadj, idx_t **r_adjncy) {
+  idx_t i, j, col, row, total;
+  idx_t *counts, *next, *xadj, *adjncy;
+
+  counts = calloc((size_t)n, sizeof(idx_t));
+  next = calloc((size_t)n, sizeof(idx_t));
+  if (!counts || !next) return 3;
+
+  for (col = 0; col < n; col++) {
+    for (j = ptr[col]; j < ptr[col + 1]; j++) {
+      row = rows[j];
+      if (row != col) {
+        counts[row]++;
+        counts[col]++;
+      }
+    }
+  }
+
+  total = 0;
+  for (i = 0; i < n; i++) {
+    total += counts[i];
+    next[i] = total;
+  }
+
+  xadj = calloc((size_t)n + 1, sizeof(idx_t));
+  adjncy = calloc((size_t)total, sizeof(idx_t));
+  if (!xadj || !adjncy) return 3;
+
+  for (col = 0; col < n; col++) {
+    for (j = ptr[col]; j < ptr[col + 1]; j++) {
+      row = rows[j];
+      if (row == col) continue;
+      next[row]--;
+      adjncy[next[row]] = col;
+      next[col]--;
+      adjncy[next[col]] = row;
+    }
+  }
+  for (i = 0; i < n; i++) xadj[i] = next[i];
+  xadj[n] = total;
+
+  free(counts);
+  free(next);
+  *r_xadj = xadj;
+  *r_adjncy = adjncy;
+  return 0;
+}
+
+int main(int argc, char **argv) {
+  FILE *input;
+  ctrl_t *ctrl;
+  graph_t *graph;
+  idx_t n, ne, i, pfactor, options[METIS_NOPTIONS];
+  idx_t *ptr, *rows, *xadj, *adjncy, *piperm;
+
+  if (argc != 2) {
+    fprintf(stderr, "usage: %s input\n", argv[0]);
+    return 2;
+  }
+  input = fopen(argv[1], "r");
+  if (input == NULL) {
+    perror("open input");
+    return 2;
+  }
+  if (fscanf(input, "%" SCIDX " %" SCIDX " %" SCIDX, &n, &ne, &pfactor) != 3) {
+    fprintf(stderr, "failed to read header\n");
+    return 2;
+  }
+  ptr = calloc((size_t)n + 1, sizeof(idx_t));
+  rows = calloc((size_t)ne, sizeof(idx_t));
+  piperm = calloc((size_t)n, sizeof(idx_t));
+  if (!ptr || !rows || !piperm) return 3;
+
+  for (i = 0; i < n + 1; i++) {
+    if (fscanf(input, "%" SCIDX, &ptr[i]) != 1) return 2;
+    ptr[i]--;
+  }
+  for (i = 0; i < ne; i++) {
+    if (fscanf(input, "%" SCIDX, &rows[i]) != 1) return 2;
+    rows[i]--;
+  }
+  fclose(input);
+
+  if (lower_to_full(n, ne, ptr, rows, &xadj, &adjncy) != 0) return 3;
+
+  if (!gk_malloc_init()) return 3;
+  METIS_SetDefaultOptions(options);
+  ctrl = SetupCtrl(METIS_OP_OMETIS, options, 1, 3, NULL, NULL);
+  if (ctrl == NULL) return 4;
+  graph = PruneGraph(ctrl, n, xadj, adjncy, NULL, piperm, 0.1 * (real_t)pfactor);
+
+  printf("0\n");
+  printf("%d\n", graph != NULL);
+  printf("%" PRIDX "\n", graph != NULL ? graph->nvtxs : n);
+  printf("%" PRIDX "\n", graph != NULL ? graph->nedges : xadj[n]);
+  for (i = 0; i < n; i++) printf("%" PRIDX "\n", graph != NULL ? piperm[i] : i);
+  if (graph != NULL) {
+    for (i = 0; i < graph->nvtxs + 1; i++) printf("%" PRIDX "\n", graph->xadj[i]);
+    for (i = 0; i < graph->nedges; i++) printf("%" PRIDX "\n", graph->adjncy[i]);
+    for (i = 0; i < graph->nvtxs; i++) printf("%" PRIDX "\n", graph->vwgt[i]);
+    FreeGraph(&graph);
+  }
+
+  FreeCtrl(&ctrl);
+  free(ptr); free(rows); free(xadj); free(adjncy); free(piperm);
+  gk_malloc_cleanup(0);
+  return 0;
+}
+"#;
+
+#[cfg(any(
+    feature = "native-spral-src",
+    feature = "native-spral-src-pthreads",
+    feature = "native-spral-src-openmp"
+))]
+const NATIVE_METIS_CC_COMPONENTS_SHIM_SOURCE: &str = r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include "metislib.h"
+
+static int lower_to_full(idx_t n, idx_t ne, idx_t *ptr, idx_t *rows,
+    idx_t **r_xadj, idx_t **r_adjncy) {
+  idx_t i, j, col, row, total;
+  idx_t *counts, *next, *xadj, *adjncy;
+
+  counts = calloc((size_t)n, sizeof(idx_t));
+  next = calloc((size_t)n, sizeof(idx_t));
+  if (!counts || !next) return 3;
+
+  for (col = 0; col < n; col++) {
+    for (j = ptr[col]; j < ptr[col + 1]; j++) {
+      row = rows[j];
+      if (row != col) {
+        counts[row]++;
+        counts[col]++;
+      }
+    }
+  }
+
+  total = 0;
+  for (i = 0; i < n; i++) {
+    total += counts[i];
+    next[i] = total;
+  }
+
+  xadj = calloc((size_t)n + 1, sizeof(idx_t));
+  adjncy = calloc((size_t)total, sizeof(idx_t));
+  if (!xadj || !adjncy) return 3;
+
+  for (col = 0; col < n; col++) {
+    for (j = ptr[col]; j < ptr[col + 1]; j++) {
+      row = rows[j];
+      if (row == col) continue;
+      next[row]--;
+      adjncy[next[row]] = col;
+      next[col]--;
+      adjncy[next[col]] = row;
+    }
+  }
+  for (i = 0; i < n; i++) xadj[i] = next[i];
+  xadj[n] = total;
+
+  free(counts);
+  free(next);
+  *r_xadj = xadj;
+  *r_adjncy = adjncy;
+  return 0;
+}
+
+static graph_t *prepare_graph(ctrl_t *ctrl, idx_t n, idx_t *xadj, idx_t *adjncy) {
+  graph_t *graph = NULL;
+  idx_t nnvtxs = 0;
+  idx_t *piperm = NULL, *cptr = NULL, *cind = NULL;
+
+  if (ctrl->pfactor > 0.0) {
+    piperm = imalloc(n, "cc shim piperm");
+    graph = PruneGraph(ctrl, n, xadj, adjncy, NULL, piperm, ctrl->pfactor);
+    if (graph == NULL) {
+      gk_free((void **)&piperm, LTERM);
+      ctrl->pfactor = 0.0;
+    } else {
+      nnvtxs = graph->nvtxs;
+      ctrl->compress = 0;
+    }
+  }
+
+  if (ctrl->compress) {
+    cptr = imalloc(n + 1, "cc shim cptr");
+    cind = imalloc(n, "cc shim cind");
+    graph = CompressGraph(ctrl, n, xadj, adjncy, NULL, cptr, cind);
+    if (graph == NULL) {
+      gk_free((void **)&cptr, &cind, LTERM);
+      ctrl->compress = 0;
+    } else {
+      nnvtxs = graph->nvtxs;
+      ctrl->cfactor = 1.0 * n / nnvtxs;
+      if (ctrl->cfactor > 1.5 && ctrl->nseps == 1)
+        ctrl->nseps = 2;
+    }
+  }
+
+  if (ctrl->pfactor == 0.0 && ctrl->compress == 0)
+    graph = SetupGraph(ctrl, n, 1, xadj, adjncy, NULL, NULL, NULL);
+
+  gk_free((void **)&piperm, &cptr, &cind, LTERM);
+  return graph;
+}
+
+int main(int argc, char **argv) {
+  FILE *input;
+  ctrl_t *ctrl;
+  graph_t *graph, **sgraphs;
+  idx_t n, ne, i, j, k, compress, ccorder, pfactor, options[METIS_NOPTIONS], ncmps;
+  idx_t *ptr, *rows, *xadj, *adjncy, *cptr, *cind;
+
+  if (argc != 2) {
+    fprintf(stderr, "usage: %s input\n", argv[0]);
+    return 2;
+  }
+  input = fopen(argv[1], "r");
+  if (input == NULL) {
+    perror("open input");
+    return 2;
+  }
+  if (fscanf(input, "%" SCIDX " %" SCIDX " %" SCIDX " %" SCIDX " %" SCIDX,
+      &n, &ne, &compress, &ccorder, &pfactor) != 5) {
+    fprintf(stderr, "failed to read header\n");
+    return 2;
+  }
+  ptr = calloc((size_t)n + 1, sizeof(idx_t));
+  rows = calloc((size_t)ne, sizeof(idx_t));
+  if (!ptr || !rows) return 3;
+
+  for (i = 0; i < n + 1; i++) {
+    if (fscanf(input, "%" SCIDX, &ptr[i]) != 1) return 2;
+    ptr[i]--;
+  }
+  for (i = 0; i < ne; i++) {
+    if (fscanf(input, "%" SCIDX, &rows[i]) != 1) return 2;
+    rows[i]--;
+  }
+  fclose(input);
+
+  if (lower_to_full(n, ne, ptr, rows, &xadj, &adjncy) != 0) return 3;
+
+  if (!gk_malloc_init()) return 3;
+  METIS_SetDefaultOptions(options);
+  options[METIS_OPTION_NUMBERING] = 0;
+  options[METIS_OPTION_COMPRESS] = compress;
+  options[METIS_OPTION_CCORDER] = ccorder;
+  options[METIS_OPTION_PFACTOR] = pfactor;
+  ctrl = SetupCtrl(METIS_OP_OMETIS, options, 1, 3, NULL, NULL);
+  if (ctrl == NULL) return 4;
+
+  graph = prepare_graph(ctrl, n, xadj, adjncy);
+  if (graph == NULL) return 4;
+  AllocateWorkSpace(ctrl, graph);
+  MlevelNodeBisectionMultiple(ctrl, graph);
+
+  cptr = iwspacemalloc(ctrl, graph->nvtxs + 1);
+  cind = iwspacemalloc(ctrl, graph->nvtxs);
+  ncmps = FindSepInducedComponents(ctrl, graph, cptr, cind);
+  sgraphs = SplitGraphOrderCC(ctrl, graph, ncmps, cptr, cind);
+
+  printf("0\n");
+  printf("%" PRIDX "\n", graph->nvtxs);
+  printf("%" PRIDX "\n", graph->mincut);
+  printf("%" PRIDX "\n", graph->pwgts[0]);
+  printf("%" PRIDX "\n", graph->pwgts[1]);
+  printf("%" PRIDX "\n", graph->pwgts[2]);
+  printf("%" PRIDX "\n", graph->nbnd);
+  for (i = 0; i < graph->nvtxs; i++) printf("%" PRIDX "\n", graph->where[i]);
+  for (i = 0; i < graph->nbnd; i++) printf("%" PRIDX "\n", graph->bndind[i]);
+  printf("%" PRIDX "\n", ncmps);
+  for (i = 0; i < ncmps + 1; i++) printf("%" PRIDX "\n", cptr[i]);
+  for (i = 0; i < cptr[ncmps]; i++) printf("%" PRIDX "\n", cind[i]);
+  for (i = 0; i < ncmps; i++) {
+    printf("%" PRIDX "\n", sgraphs[i]->nvtxs);
+    printf("%" PRIDX "\n", sgraphs[i]->nedges);
+    for (j = 0; j < sgraphs[i]->nvtxs; j++) printf("%" PRIDX "\n", sgraphs[i]->label[j]);
+    for (j = 0; j < sgraphs[i]->nvtxs + 1; j++) printf("%" PRIDX "\n", sgraphs[i]->xadj[j]);
+    for (k = 0; k < sgraphs[i]->nedges; k++) printf("%" PRIDX "\n", sgraphs[i]->adjncy[k]);
+  }
+
+  for (i = 0; i < ncmps; i++) FreeGraph(&sgraphs[i]);
+  gk_free((void **)&sgraphs, LTERM);
+  FreeGraph(&graph);
+  FreeCtrl(&ctrl);
+  free(ptr); free(rows); free(xadj); free(adjncy);
+  gk_malloc_cleanup(0);
+  return 0;
+}
 "#;
 
 #[cfg(any(
@@ -1281,6 +1734,105 @@ fn run_native_metis_order_lower_csc(
     feature = "native-spral-src-pthreads",
     feature = "native-spral-src-openmp"
 ))]
+fn run_native_metis_node_nd_options_lower_csc(
+    dimension: usize,
+    col_ptrs: &[usize],
+    row_indices: &[usize],
+    options: metis_ordering::MetisNodeNdOptions,
+) -> Result<NativeMetisRun, String> {
+    let shim = native_metis_node_nd_options_shim()?;
+    let input = native_metis_node_nd_options_input(dimension, col_ptrs, row_indices, options);
+    let input_path = unique_shim_input_path(&shim, "spral-metis-node-nd-options-input");
+    fs::write(&input_path, input)
+        .map_err(|error| format!("failed to write {}: {error}", input_path.display()))?;
+    let output = Command::new(&shim)
+        .arg(&input_path)
+        .envs(native_match_order_runtime_env()?)
+        .output()
+        .map_err(|error| format!("failed to run {}: {error}", shim.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            shim.display(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    parse_native_metis_order_output(dimension, &output.stdout)
+}
+
+#[cfg(any(
+    feature = "native-spral-src",
+    feature = "native-spral-src-pthreads",
+    feature = "native-spral-src-openmp"
+))]
+fn run_native_metis_prune_lower_csc(
+    dimension: usize,
+    col_ptrs: &[usize],
+    row_indices: &[usize],
+    pfactor: usize,
+) -> Result<NativeMetisPruneRun, String> {
+    let shim = native_metis_prune_shim()?;
+    let input = native_metis_prune_input(dimension, col_ptrs, row_indices, pfactor);
+    let input_path = unique_shim_input_path(&shim, "spral-metis-prune-input");
+    fs::write(&input_path, input)
+        .map_err(|error| format!("failed to write {}: {error}", input_path.display()))?;
+    let output = Command::new(&shim)
+        .arg(&input_path)
+        .envs(native_match_order_runtime_env()?)
+        .output()
+        .map_err(|error| format!("failed to run {}: {error}", shim.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            shim.display(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    parse_native_metis_prune_output(dimension, &output.stdout)
+}
+
+#[cfg(any(
+    feature = "native-spral-src",
+    feature = "native-spral-src-pthreads",
+    feature = "native-spral-src-openmp"
+))]
+fn run_native_metis_cc_components_lower_csc(
+    dimension: usize,
+    col_ptrs: &[usize],
+    row_indices: &[usize],
+    options: metis_ordering::MetisNodeNdOptions,
+) -> Result<NativeMetisCcComponentsRun, String> {
+    let shim = native_metis_cc_components_shim()?;
+    let input = native_metis_node_nd_options_input(dimension, col_ptrs, row_indices, options);
+    let input_path = unique_shim_input_path(&shim, "spral-metis-cc-components-input");
+    fs::write(&input_path, input)
+        .map_err(|error| format!("failed to write {}: {error}", input_path.display()))?;
+    let output = Command::new(&shim)
+        .arg(&input_path)
+        .envs(native_match_order_runtime_env()?)
+        .output()
+        .map_err(|error| format!("failed to run {}: {error}", shim.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            shim.display(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    parse_native_metis_cc_components_output(&output.stdout)
+}
+
+#[cfg(any(
+    feature = "native-spral-src",
+    feature = "native-spral-src-pthreads",
+    feature = "native-spral-src-openmp"
+))]
 fn run_native_mmd_order_lower_csc(
     dimension: usize,
     col_ptrs: &[usize],
@@ -1495,6 +2047,62 @@ fn native_metis_order_input(dimension: usize, col_ptrs: &[usize], row_indices: &
     feature = "native-spral-src-pthreads",
     feature = "native-spral-src-openmp"
 ))]
+fn native_metis_node_nd_options_input(
+    dimension: usize,
+    col_ptrs: &[usize],
+    row_indices: &[usize],
+    options: metis_ordering::MetisNodeNdOptions,
+) -> String {
+    let mut input = String::new();
+    input.push_str(&format!(
+        "{} {} {} {} {}\n",
+        dimension,
+        row_indices.len(),
+        usize::from(options.compress),
+        usize::from(options.ccorder),
+        options.pfactor
+    ));
+    for &entry in col_ptrs {
+        input.push_str(&format!("{}\n", entry + 1));
+    }
+    for &entry in row_indices {
+        input.push_str(&format!("{}\n", entry + 1));
+    }
+    input
+}
+
+#[cfg(any(
+    feature = "native-spral-src",
+    feature = "native-spral-src-pthreads",
+    feature = "native-spral-src-openmp"
+))]
+fn native_metis_prune_input(
+    dimension: usize,
+    col_ptrs: &[usize],
+    row_indices: &[usize],
+    pfactor: usize,
+) -> String {
+    let mut input = String::new();
+    input.push_str(&format!(
+        "{} {} {}\n",
+        dimension,
+        row_indices.len(),
+        pfactor
+    ));
+    for &entry in col_ptrs {
+        input.push_str(&format!("{}\n", entry + 1));
+    }
+    for &entry in row_indices {
+        input.push_str(&format!("{}\n", entry + 1));
+    }
+    input
+}
+
+#[cfg(any(
+    feature = "native-spral-src",
+    feature = "native-spral-src-pthreads",
+    feature = "native-spral-src-openmp"
+))]
 fn parse_native_metis_order_output(
     dimension: usize,
     output: &[u8],
@@ -1541,6 +2149,279 @@ fn parse_native_metis_order_output(
         stat,
         perm,
         invp,
+    })
+}
+
+#[cfg(any(
+    feature = "native-spral-src",
+    feature = "native-spral-src-pthreads",
+    feature = "native-spral-src-openmp"
+))]
+fn parse_native_metis_prune_output(
+    dimension: usize,
+    output: &[u8],
+) -> Result<NativeMetisPruneRun, String> {
+    let stdout = String::from_utf8(output.to_vec())
+        .map_err(|error| format!("native METIS prune output was not UTF-8: {error}"))?;
+    let mut tokens = stdout.split_whitespace();
+    let stat = tokens
+        .next()
+        .ok_or_else(|| "native METIS prune output missing stat".to_string())?
+        .parse::<i32>()
+        .map_err(|error| format!("native METIS prune stat parse failed: {error}"))?;
+    let active = tokens
+        .next()
+        .ok_or_else(|| "native METIS prune output missing active flag".to_string())?
+        .parse::<i32>()
+        .map_err(|error| format!("native METIS prune active parse failed: {error}"))?
+        != 0;
+    let kept_vertex_count = tokens
+        .next()
+        .ok_or_else(|| "native METIS prune output missing kept count".to_string())?
+        .parse::<usize>()
+        .map_err(|error| format!("native METIS prune kept count parse failed: {error}"))?;
+    let directed_edge_count = tokens
+        .next()
+        .ok_or_else(|| "native METIS prune output missing edge count".to_string())?
+        .parse::<usize>()
+        .map_err(|error| format!("native METIS prune edge count parse failed: {error}"))?;
+    let mut piperm = Vec::with_capacity(dimension);
+    for index in 0..dimension {
+        piperm.push(
+            tokens
+                .next()
+                .ok_or_else(|| format!("native METIS prune output missing piperm[{index}]"))?
+                .parse::<usize>()
+                .map_err(|error| format!("native METIS prune piperm parse failed: {error}"))?,
+        );
+    }
+    let mut offsets = Vec::new();
+    let mut neighbors = Vec::new();
+    let mut vertex_weights = Vec::new();
+    if active {
+        while offsets.len() < kept_vertex_count + 1 {
+            let entry = tokens
+                .next()
+                .ok_or_else(|| {
+                    format!(
+                        "native METIS prune output missing offsets[{}]",
+                        offsets.len()
+                    )
+                })?
+                .parse::<usize>()
+                .map_err(|error| format!("native METIS prune offset parse failed: {error}"))?;
+            offsets.push(entry);
+        }
+        while neighbors.len() < directed_edge_count {
+            let entry = tokens
+                .next()
+                .ok_or_else(|| {
+                    format!(
+                        "native METIS prune output missing neighbors[{}]",
+                        neighbors.len()
+                    )
+                })?
+                .parse::<usize>()
+                .map_err(|error| format!("native METIS prune neighbor parse failed: {error}"))?;
+            neighbors.push(entry);
+        }
+        while vertex_weights.len() < kept_vertex_count {
+            let entry = tokens
+                .next()
+                .ok_or_else(|| {
+                    format!(
+                        "native METIS prune output missing vertex_weights[{}]",
+                        vertex_weights.len()
+                    )
+                })?
+                .parse::<isize>()
+                .map_err(|error| {
+                    format!("native METIS prune vertex weight parse failed: {error}")
+                })?;
+            vertex_weights.push(entry);
+        }
+    }
+    Ok(NativeMetisPruneRun {
+        stat,
+        pruning_active: active,
+        kept_vertex_count,
+        directed_edge_count,
+        piperm,
+        offsets,
+        neighbors,
+        vertex_weights,
+    })
+}
+
+#[cfg(any(
+    feature = "native-spral-src",
+    feature = "native-spral-src-pthreads",
+    feature = "native-spral-src-openmp"
+))]
+fn parse_native_metis_cc_components_output(
+    output: &[u8],
+) -> Result<NativeMetisCcComponentsRun, String> {
+    let stdout = String::from_utf8(output.to_vec())
+        .map_err(|error| format!("native METIS CC output was not UTF-8: {error}"))?;
+    let mut tokens = stdout.split_whitespace();
+    let stat = tokens
+        .next()
+        .ok_or_else(|| "native METIS CC output missing stat".to_string())?
+        .parse::<i32>()
+        .map_err(|error| format!("native METIS CC stat parse failed: {error}"))?;
+    let vertex_count = tokens
+        .next()
+        .ok_or_else(|| "native METIS CC output missing vertex count".to_string())?
+        .parse::<usize>()
+        .map_err(|error| format!("native METIS CC vertex count parse failed: {error}"))?;
+    let mincut = tokens
+        .next()
+        .ok_or_else(|| "native METIS CC output missing mincut".to_string())?
+        .parse::<isize>()
+        .map_err(|error| format!("native METIS CC mincut parse failed: {error}"))?;
+    let part_weights = [
+        tokens
+            .next()
+            .ok_or_else(|| "native METIS CC output missing part weight 0".to_string())?
+            .parse::<isize>()
+            .map_err(|error| format!("native METIS CC part weight parse failed: {error}"))?,
+        tokens
+            .next()
+            .ok_or_else(|| "native METIS CC output missing part weight 1".to_string())?
+            .parse::<isize>()
+            .map_err(|error| format!("native METIS CC part weight parse failed: {error}"))?,
+        tokens
+            .next()
+            .ok_or_else(|| "native METIS CC output missing part weight 2".to_string())?
+            .parse::<isize>()
+            .map_err(|error| format!("native METIS CC part weight parse failed: {error}"))?,
+    ];
+    let boundary_len = tokens
+        .next()
+        .ok_or_else(|| "native METIS CC output missing boundary length".to_string())?
+        .parse::<usize>()
+        .map_err(|error| format!("native METIS CC boundary length parse failed: {error}"))?;
+    let where_len = vertex_count;
+    let mut where_part = Vec::with_capacity(where_len);
+    for index in 0..where_len {
+        where_part.push(
+            tokens
+                .next()
+                .ok_or_else(|| format!("native METIS CC output missing where[{index}]"))?
+                .parse::<usize>()
+                .map_err(|error| format!("native METIS CC where parse failed: {error}"))?,
+        );
+    }
+    let mut boundary = Vec::with_capacity(boundary_len);
+    for index in 0..boundary_len {
+        boundary.push(
+            tokens
+                .next()
+                .ok_or_else(|| format!("native METIS CC output missing boundary[{index}]"))?
+                .parse::<usize>()
+                .map_err(|error| format!("native METIS CC boundary parse failed: {error}"))?,
+        );
+    }
+    let ncmps = tokens
+        .next()
+        .ok_or_else(|| "native METIS CC output missing component count".to_string())?
+        .parse::<usize>()
+        .map_err(|error| format!("native METIS CC component count parse failed: {error}"))?;
+    let mut cptr = Vec::with_capacity(ncmps + 1);
+    for index in 0..=ncmps {
+        cptr.push(
+            tokens
+                .next()
+                .ok_or_else(|| format!("native METIS CC output missing cptr[{index}]"))?
+                .parse::<usize>()
+                .map_err(|error| format!("native METIS CC cptr parse failed: {error}"))?,
+        );
+    }
+    let mut cind = Vec::with_capacity(*cptr.last().unwrap_or(&0));
+    for index in 0..*cptr.last().unwrap_or(&0) {
+        cind.push(
+            tokens
+                .next()
+                .ok_or_else(|| format!("native METIS CC output missing cind[{index}]"))?
+                .parse::<usize>()
+                .map_err(|error| format!("native METIS CC cind parse failed: {error}"))?,
+        );
+    }
+    let mut subgraph_labels = Vec::with_capacity(ncmps);
+    let mut subgraph_offsets = Vec::with_capacity(ncmps);
+    let mut subgraph_neighbors = Vec::with_capacity(ncmps);
+    for component in 0..ncmps {
+        let nvtxs = tokens
+            .next()
+            .ok_or_else(|| format!("native METIS CC output missing subgraph {component} nvtxs"))?
+            .parse::<usize>()
+            .map_err(|error| format!("native METIS CC subgraph nvtxs parse failed: {error}"))?;
+        let nedges = tokens
+            .next()
+            .ok_or_else(|| format!("native METIS CC output missing subgraph {component} nedges"))?
+            .parse::<usize>()
+            .map_err(|error| format!("native METIS CC subgraph nedges parse failed: {error}"))?;
+        let mut labels = Vec::with_capacity(nvtxs);
+        for index in 0..nvtxs {
+            labels.push(
+                tokens
+                    .next()
+                    .ok_or_else(|| {
+                        format!(
+                            "native METIS CC output missing subgraph {component} label[{index}]"
+                        )
+                    })?
+                    .parse::<usize>()
+                    .map_err(|error| format!("native METIS CC label parse failed: {error}"))?,
+            );
+        }
+        let mut offsets = Vec::with_capacity(nvtxs + 1);
+        for index in 0..=nvtxs {
+            offsets.push(
+                tokens
+                    .next()
+                    .ok_or_else(|| {
+                        format!(
+                            "native METIS CC output missing subgraph {component} offset[{index}]"
+                        )
+                    })?
+                    .parse::<usize>()
+                    .map_err(|error| format!("native METIS CC offset parse failed: {error}"))?,
+            );
+        }
+        let mut neighbors = Vec::with_capacity(nedges);
+        for index in 0..nedges {
+            neighbors.push(
+                tokens
+                    .next()
+                    .ok_or_else(|| {
+                        format!(
+                            "native METIS CC output missing subgraph {component} neighbor[{index}]"
+                        )
+                    })?
+                    .parse::<usize>()
+                    .map_err(|error| format!("native METIS CC neighbor parse failed: {error}"))?,
+            );
+        }
+        subgraph_labels.push(labels);
+        subgraph_offsets.push(offsets);
+        subgraph_neighbors.push(neighbors);
+    }
+
+    Ok(NativeMetisCcComponentsRun {
+        stat,
+        separator: NativeSeparatorRun {
+            stat,
+            mincut,
+            part_weights,
+            where_part,
+            boundary,
+        },
+        cptr,
+        cind,
+        subgraph_labels,
+        subgraph_offsets,
+        subgraph_neighbors,
     })
 }
 
@@ -2236,6 +3117,38 @@ fn native_metis_order_shim() -> Result<PathBuf, String> {
     feature = "native-spral-src-pthreads",
     feature = "native-spral-src-openmp"
 ))]
+fn native_metis_node_nd_options_shim() -> Result<PathBuf, String> {
+    static SHIM: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+    SHIM.get_or_init(build_native_metis_node_nd_options_shim)
+        .clone()
+}
+
+#[cfg(any(
+    feature = "native-spral-src",
+    feature = "native-spral-src-pthreads",
+    feature = "native-spral-src-openmp"
+))]
+fn native_metis_prune_shim() -> Result<PathBuf, String> {
+    static SHIM: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+    SHIM.get_or_init(build_native_metis_prune_shim).clone()
+}
+
+#[cfg(any(
+    feature = "native-spral-src",
+    feature = "native-spral-src-pthreads",
+    feature = "native-spral-src-openmp"
+))]
+fn native_metis_cc_components_shim() -> Result<PathBuf, String> {
+    static SHIM: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+    SHIM.get_or_init(build_native_metis_cc_components_shim)
+        .clone()
+}
+
+#[cfg(any(
+    feature = "native-spral-src",
+    feature = "native-spral-src-pthreads",
+    feature = "native-spral-src-openmp"
+))]
 fn native_mmd_order_shim() -> Result<PathBuf, String> {
     static SHIM: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     SHIM.get_or_init(build_native_mmd_order_shim).clone()
@@ -2387,6 +3300,152 @@ fn build_native_metis_order_shim() -> Result<PathBuf, String> {
     if !output.status.success() {
         return Err(format!(
             "native metis_order shim compile failed with status {:?}\ncommand: {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            command,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(exe)
+}
+
+#[cfg(any(
+    feature = "native-spral-src",
+    feature = "native-spral-src-pthreads",
+    feature = "native-spral-src-openmp"
+))]
+fn build_native_metis_node_nd_options_shim() -> Result<PathBuf, String> {
+    let metadata = spral_src_metadata()?;
+    let workspace = workspace_root();
+    let shim_dir = workspace.join("target/spral-match-order-parity-shim");
+    fs::create_dir_all(&shim_dir)
+        .map_err(|error| format!("failed to create {}: {error}", shim_dir.display()))?;
+    let source = shim_dir.join("spral_metis_node_nd_options_shim.c");
+    let exe = shim_dir.join("spral_metis_node_nd_options_shim");
+    fs::write(&source, NATIVE_METIS_NODE_ND_OPTIONS_SHIM_SOURCE)
+        .map_err(|error| format!("failed to write {}: {error}", source.display()))?;
+
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    let mut command = Command::new(cc);
+    command
+        .arg("-O0")
+        .arg("-g")
+        .arg("-DIDXTYPEWIDTH=32")
+        .arg("-DREALTYPEWIDTH=32")
+        .arg("-I")
+        .arg(&metadata.metis_include_dir)
+        .arg(&source);
+    for flag in metadata.spral_lflags.split_whitespace() {
+        command.arg(flag);
+    }
+    command.arg("-o").arg(&exe);
+    command.current_dir(&shim_dir);
+    let output = command
+        .output()
+        .map_err(|error| format!("failed to compile native METIS NodeND options shim: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "native METIS NodeND options shim compile failed with status {:?}\ncommand: {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            command,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(exe)
+}
+
+#[cfg(any(
+    feature = "native-spral-src",
+    feature = "native-spral-src-pthreads",
+    feature = "native-spral-src-openmp"
+))]
+fn build_native_metis_prune_shim() -> Result<PathBuf, String> {
+    let metadata = spral_src_metadata()?;
+    let workspace = workspace_root();
+    let shim_dir = workspace.join("target/spral-match-order-parity-shim");
+    fs::create_dir_all(&shim_dir)
+        .map_err(|error| format!("failed to create {}: {error}", shim_dir.display()))?;
+    let source = shim_dir.join("spral_metis_prune_shim.c");
+    let exe = shim_dir.join("spral_metis_prune_shim");
+    fs::write(&source, NATIVE_METIS_PRUNE_SHIM_SOURCE)
+        .map_err(|error| format!("failed to write {}: {error}", source.display()))?;
+
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    let mut command = Command::new(cc);
+    command
+        .arg("-O0")
+        .arg("-g")
+        .arg("-DIDXTYPEWIDTH=32")
+        .arg("-DREALTYPEWIDTH=32")
+        .arg("-I")
+        .arg(&metadata.metis_include_dir)
+        .arg("-I")
+        .arg(&metadata.metis_source_lib_dir)
+        .arg("-I")
+        .arg(&metadata.gklib_include_dir)
+        .arg(&source);
+    for flag in metadata.spral_lflags.split_whitespace() {
+        command.arg(flag);
+    }
+    command.arg("-o").arg(&exe);
+    command.current_dir(&shim_dir);
+    let output = command
+        .output()
+        .map_err(|error| format!("failed to compile native METIS prune shim: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "native METIS prune shim compile failed with status {:?}\ncommand: {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            command,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(exe)
+}
+
+#[cfg(any(
+    feature = "native-spral-src",
+    feature = "native-spral-src-pthreads",
+    feature = "native-spral-src-openmp"
+))]
+fn build_native_metis_cc_components_shim() -> Result<PathBuf, String> {
+    let metadata = spral_src_metadata()?;
+    let workspace = workspace_root();
+    let shim_dir = workspace.join("target/spral-match-order-parity-shim");
+    fs::create_dir_all(&shim_dir)
+        .map_err(|error| format!("failed to create {}: {error}", shim_dir.display()))?;
+    let source = shim_dir.join("spral_metis_cc_components_shim.c");
+    let exe = shim_dir.join("spral_metis_cc_components_shim");
+    fs::write(&source, NATIVE_METIS_CC_COMPONENTS_SHIM_SOURCE)
+        .map_err(|error| format!("failed to write {}: {error}", source.display()))?;
+
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    let mut command = Command::new(cc);
+    command
+        .arg("-O0")
+        .arg("-g")
+        .arg("-DIDXTYPEWIDTH=32")
+        .arg("-DREALTYPEWIDTH=32")
+        .arg("-I")
+        .arg(&metadata.metis_include_dir)
+        .arg("-I")
+        .arg(&metadata.metis_source_lib_dir)
+        .arg("-I")
+        .arg(&metadata.gklib_include_dir)
+        .arg(&source);
+    for flag in metadata.spral_lflags.split_whitespace() {
+        command.arg(flag);
+    }
+    command.arg("-o").arg(&exe);
+    command.current_dir(&shim_dir);
+    let output = command
+        .output()
+        .map_err(|error| format!("failed to compile native METIS CC components shim: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "native METIS CC components shim compile failed with status {:?}\ncommand: {:?}\nstdout:\n{}\nstderr:\n{}",
             output.status.code(),
             command,
             String::from_utf8_lossy(&output.stdout),
@@ -3174,6 +4233,256 @@ fn native_metis_node_nd_fixture_phase_tests() {
             assert!(invp_eq, "native/Rust METIS invp mismatch for {name}");
         }
     }
+}
+
+#[cfg(any(
+    feature = "native-spral-src",
+    feature = "native-spral-src-pthreads",
+    feature = "native-spral-src-openmp"
+))]
+#[test]
+#[ignore = "manual native METIS NodeND non-default option oracle"]
+fn native_metis_node_nd_non_default_option_phase_tests() {
+    let mut complete_col_ptrs = Vec::with_capacity(70);
+    let mut complete_row_indices = Vec::new();
+    complete_col_ptrs.push(0);
+    for col in 0..69 {
+        complete_row_indices.extend(col..69);
+        complete_col_ptrs.push(complete_row_indices.len());
+    }
+
+    let star_edges = (1..10).map(|leaf| (0, leaf)).collect::<Vec<_>>();
+    let (star_col_ptrs, star_row_indices) = lower_csc_pattern_from_edges(10, &star_edges);
+
+    let path_edges = (0..5)
+        .map(|vertex| (vertex, vertex + 1))
+        .collect::<Vec<_>>();
+    let (path_col_ptrs, path_row_indices) = lower_csc_pattern_from_edges(6, &path_edges);
+
+    let twin_edges = twin_path_edges(128);
+    let (twin_col_ptrs, twin_row_indices) = lower_csc_pattern_from_edges(256, &twin_edges);
+
+    let fixtures = vec![
+        (
+            "complete_69_default_regression",
+            69,
+            complete_col_ptrs.clone(),
+            complete_row_indices.clone(),
+            metis_ordering::MetisNodeNdOptions::spral_default(),
+        ),
+        (
+            "complete_69_forced_no_compression",
+            69,
+            complete_col_ptrs,
+            complete_row_indices,
+            metis_ordering::MetisNodeNdOptions {
+                compress: false,
+                ..metis_ordering::MetisNodeNdOptions::spral_default()
+            },
+        ),
+        (
+            "star_10_ccorder_components",
+            10,
+            star_col_ptrs.clone(),
+            star_row_indices.clone(),
+            metis_ordering::MetisNodeNdOptions {
+                compress: false,
+                ccorder: true,
+                pfactor: 0,
+            },
+        ),
+        (
+            "star_10_pfactor_no_prune",
+            10,
+            star_col_ptrs.clone(),
+            star_row_indices.clone(),
+            metis_ordering::MetisNodeNdOptions {
+                pfactor: 100,
+                ..metis_ordering::MetisNodeNdOptions::spral_default()
+            },
+        ),
+        (
+            "star_10_pfactor_partial_prune_disables_compression",
+            10,
+            star_col_ptrs.clone(),
+            star_row_indices.clone(),
+            metis_ordering::MetisNodeNdOptions {
+                pfactor: 20,
+                ..metis_ordering::MetisNodeNdOptions::spral_default()
+            },
+        ),
+        (
+            "path_6_pfactor_all_pruned_ignored",
+            6,
+            path_col_ptrs,
+            path_row_indices,
+            metis_ordering::MetisNodeNdOptions {
+                pfactor: 1,
+                ..metis_ordering::MetisNodeNdOptions::spral_default()
+            },
+        ),
+        (
+            "star_10_ccorder_with_pruning",
+            10,
+            star_col_ptrs,
+            star_row_indices,
+            metis_ordering::MetisNodeNdOptions {
+                compress: true,
+                ccorder: true,
+                pfactor: 20,
+            },
+        ),
+        (
+            "twin_path_256_ccorder_with_compression",
+            256,
+            twin_col_ptrs,
+            twin_row_indices,
+            metis_ordering::MetisNodeNdOptions {
+                ccorder: true,
+                ..metis_ordering::MetisNodeNdOptions::spral_default()
+            },
+        ),
+    ];
+
+    for (name, dimension, col_ptrs, row_indices, options) in fixtures {
+        let native =
+            run_native_metis_node_nd_options_lower_csc(dimension, &col_ptrs, &row_indices, options)
+                .unwrap_or_else(|error| {
+                    panic!("native METIS NodeND option fixture {name} failed: {error}")
+                });
+        assert_eq!(native.flag, 1, "native METIS status for {name}");
+        assert_eq!(native.stat, 0, "native METIS stat for {name}");
+        let rust = metis_ordering::metis_node_nd_order_from_lower_csc_with_options(
+            dimension,
+            &col_ptrs,
+            &row_indices,
+            options,
+        )
+        .unwrap_or_else(|error| panic!("Rust METIS NodeND option fixture {name} failed: {error}"))
+        .permutation;
+        let rust_perm = rust.inverse();
+        let rust_invp = rust.perm();
+        eprintln!(
+            "metis_option_fixture name={name} dim={dimension} options={options:?} native_perm_hash=0x{:016x} rust_perm_hash=0x{:016x} native_invp_hash=0x{:016x} rust_invp_hash=0x{:016x}",
+            hash_usize(&native.perm),
+            hash_usize(rust_perm),
+            hash_usize(&native.invp),
+            hash_usize(rust_invp),
+        );
+        assert_eq!(
+            native.perm, rust_perm,
+            "native/Rust METIS perm mismatch for {name}"
+        );
+        assert_eq!(
+            native.invp, rust_invp,
+            "native/Rust METIS invp mismatch for {name}"
+        );
+    }
+}
+
+#[cfg(any(
+    feature = "native-spral-src",
+    feature = "native-spral-src-pthreads",
+    feature = "native-spral-src-openmp"
+))]
+#[test]
+#[ignore = "manual native METIS PruneGraph oracle"]
+fn native_metis_prune_phase_tests() {
+    let star_edges = (1..10).map(|leaf| (0, leaf)).collect::<Vec<_>>();
+    let (star_col_ptrs, star_row_indices) = lower_csc_pattern_from_edges(10, &star_edges);
+    for (name, pfactor) in [
+        ("star_10_no_prune", 100usize),
+        ("star_10_partial_prune", 20usize),
+    ] {
+        let native =
+            run_native_metis_prune_lower_csc(10, &star_col_ptrs, &star_row_indices, pfactor)
+                .unwrap_or_else(|error| {
+                    panic!("native METIS prune fixture {name} failed: {error}")
+                });
+        let rust = metis_ordering::metis_debug_prune_from_lower_csc(
+            10,
+            &star_col_ptrs,
+            &star_row_indices,
+            pfactor,
+        )
+        .unwrap_or_else(|error| panic!("Rust METIS prune fixture {name} failed: {error}"));
+        eprintln!(
+            "metis_prune name={name} pfactor={pfactor} native_active={} rust_active={} native_kept={} rust_kept={} native_edges={} rust_edges={}",
+            native.pruning_active,
+            rust.pruning_active,
+            native.kept_vertex_count,
+            rust.kept_vertex_count,
+            native.directed_edge_count,
+            rust.neighbors.len()
+        );
+        assert_eq!(native.stat, 0);
+        assert_eq!(native.pruning_active, rust.pruning_active);
+        assert_eq!(native.kept_vertex_count, rust.kept_vertex_count);
+        if native.pruning_active {
+            assert_eq!(native.directed_edge_count, rust.neighbors.len());
+            assert_eq!(native.piperm, rust.piperm);
+            assert_eq!(native.offsets, rust.offsets);
+            assert_eq!(native.neighbors, rust.neighbors);
+            assert_eq!(native.vertex_weights, rust.vertex_weights);
+        }
+    }
+
+    let path_edges = (0..5)
+        .map(|vertex| (vertex, vertex + 1))
+        .collect::<Vec<_>>();
+    let (path_col_ptrs, path_row_indices) = lower_csc_pattern_from_edges(6, &path_edges);
+    let native = run_native_metis_prune_lower_csc(6, &path_col_ptrs, &path_row_indices, 1)
+        .unwrap_or_else(|error| panic!("native METIS all-pruned fixture failed: {error}"));
+    let rust =
+        metis_ordering::metis_debug_prune_from_lower_csc(6, &path_col_ptrs, &path_row_indices, 1)
+            .unwrap_or_else(|error| panic!("Rust METIS all-pruned fixture failed: {error}"));
+    assert_eq!(native.stat, 0);
+    assert!(!native.pruning_active);
+    assert!(!rust.pruning_active);
+    assert_eq!(native.kept_vertex_count, 6);
+    assert_eq!(rust.kept_vertex_count, 6);
+}
+
+#[cfg(any(
+    feature = "native-spral-src",
+    feature = "native-spral-src-pthreads",
+    feature = "native-spral-src-openmp"
+))]
+#[test]
+#[ignore = "manual native METIS CC component split oracle"]
+fn native_metis_cc_component_phase_tests() {
+    let star_edges = (1..10).map(|leaf| (0, leaf)).collect::<Vec<_>>();
+    let (star_col_ptrs, star_row_indices) = lower_csc_pattern_from_edges(10, &star_edges);
+    let options = metis_ordering::MetisNodeNdOptions {
+        compress: false,
+        ccorder: true,
+        pfactor: 0,
+    };
+    let native =
+        run_native_metis_cc_components_lower_csc(10, &star_col_ptrs, &star_row_indices, options)
+            .unwrap_or_else(|error| panic!("native METIS CC component fixture failed: {error}"));
+    let rust = metis_ordering::metis_debug_cc_components_from_lower_csc_with_options(
+        10,
+        &star_col_ptrs,
+        &star_row_indices,
+        options,
+    )
+    .unwrap_or_else(|error| panic!("Rust METIS CC component fixture failed: {error}"));
+
+    eprintln!(
+        "metis_cc_components native_cptr={:?} rust_cptr={:?} native_cind={:?} rust_cind={:?}",
+        native.cptr, rust.cptr, native.cind, rust.cind
+    );
+    assert_eq!(native.stat, 0);
+    assert_eq!(native.separator.mincut, rust.separator.mincut);
+    assert_eq!(native.separator.part_weights, rust.separator.part_weights);
+    assert_eq!(native.separator.where_part, rust.separator.where_part);
+    assert_eq!(native.separator.boundary, rust.separator.boundary);
+    assert_eq!(native.cptr, rust.cptr);
+    assert_eq!(native.cind, rust.cind);
+    assert_eq!(native.subgraph_labels, rust.subgraph_labels);
+    assert_eq!(native.subgraph_offsets, rust.subgraph_offsets);
+    assert_eq!(native.subgraph_neighbors, rust.subgraph_neighbors);
 }
 
 #[cfg(any(
