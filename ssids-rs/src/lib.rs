@@ -2925,6 +2925,49 @@ fn app_solve_block_triangular_to_trailing_rows(
         let mut group_start = block_start;
         while group_start < block_end {
             let group_end = (group_start + OPENBLAS_DTRSM_UNROLL_N).min(block_end);
+            if group_end - group_start == 4 {
+                let col0 = group_start;
+                let col1 = group_start + 1;
+                let col2 = group_start + 2;
+                let col3 = group_start + 3;
+
+                let mut value0 = matrix[col0 * size + row];
+                let mut value1 = matrix[col1 * size + row];
+                let mut value2 = matrix[col2 * size + row];
+                let mut value3 = matrix[col3 * size + row];
+                if group_start > block_start {
+                    let mut dot0 = 0.0;
+                    let mut dot1 = 0.0;
+                    let mut dot2 = 0.0;
+                    let mut dot3 = 0.0;
+                    for prior in block_start..group_start {
+                        let prior_value = matrix[prior * size + row];
+                        dot0 = prior_value.mul_add(matrix[prior * size + col0], dot0);
+                        dot1 = prior_value.mul_add(matrix[prior * size + col1], dot1);
+                        dot2 = prior_value.mul_add(matrix[prior * size + col2], dot2);
+                        dot3 = prior_value.mul_add(matrix[prior * size + col3], dot3);
+                    }
+                    value0 = dot0.mul_add(-1.0, value0);
+                    value1 = dot1.mul_add(-1.0, value1);
+                    value2 = dot2.mul_add(-1.0, value2);
+                    value3 = dot3.mul_add(-1.0, value3);
+                }
+
+                value1 = (-value0).mul_add(matrix[col0 * size + col1], value1);
+                value2 = (-value0).mul_add(matrix[col0 * size + col2], value2);
+                value3 = (-value0).mul_add(matrix[col0 * size + col3], value3);
+                value2 = (-value1).mul_add(matrix[col1 * size + col2], value2);
+                value3 = (-value1).mul_add(matrix[col1 * size + col3], value3);
+                value3 = (-value2).mul_add(matrix[col2 * size + col3], value3);
+
+                matrix[col0 * size + row] = value0;
+                matrix[col1 * size + row] = value1;
+                matrix[col2 * size + row] = value2;
+                matrix[col3 * size + row] = value3;
+                group_start = group_end;
+                continue;
+            }
+
             for col in group_start..group_end {
                 let entry = col * size + row;
                 let mut value = matrix[entry];

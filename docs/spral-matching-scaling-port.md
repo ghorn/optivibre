@@ -151,6 +151,10 @@ Release performance notes on dense case 58:
   inner accepted-pivot dot keeps the source-faithful `mul_add` sequence but is
   unrolled by four, moving the dense case-58 accepted-update phase from roughly
   `0.17ms` to roughly `0.13ms` while preserving bitwise parity.
+- The APP `host_trsm`-equivalent apply now specializes the common full
+  group-of-four triangular solve while preserving each column's prior-dot order
+  and the intra-group update sequence. Dense case-58 `app_triangular` moved
+  from roughly `0.095ms` to roughly `0.041ms`.
 - The APP factor profile now separates block backup/restore from the accepted
   trailing update. Dense case 58 shows backup/restore are small; the hot path is
   the source-equivalent `calcLD + host_gemm(OP_N, OP_T)` update. Rust now walks
