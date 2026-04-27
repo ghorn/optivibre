@@ -164,3 +164,14 @@ Release performance notes on dense case 58:
   accepted pivot columns trims the scalar accepted update to roughly `0.13ms`
   on the dense witness, with the remaining gap attributable to native SPRAL
   dispatching the same operation to BLAS.
+- `SPRAL_SSIDS_DEBUG_FACTOR=1` now splits that accepted update into LD build and
+  GEMM-equivalent buckets. Dense case 58 shows LD construction at roughly `4us`
+  and the scalar GEMM-equivalent update at roughly `125us`, so further factor
+  performance work should target the `host_gemm(OP_N, OP_T)` equivalent rather
+  than matching/scaling, LD generation, or restore logic.
+- On AArch64, the accepted-update kernel now processes four target rows with
+  two NEON accumulators, then falls back to the two-row and scalar tails. Each
+  lane keeps the same per-entry accepted-pivot accumulation order as the scalar
+  path, while dense case 58 moves the GEMM-equivalent bucket to roughly `60us`
+  and the full accepted-update bucket to roughly `65us` while keeping native
+  matching/scaling solve bits exact.

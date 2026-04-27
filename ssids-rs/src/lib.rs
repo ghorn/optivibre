@@ -75,6 +75,8 @@ pub struct FactorProfile {
     pub app_backup_time: Duration,
     pub app_restore_time: Duration,
     pub app_accepted_update_time: Duration,
+    pub app_accepted_ld_time: Duration,
+    pub app_accepted_gemm_time: Duration,
     pub app_column_storage_time: Duration,
     pub solve_panel_build_time: Duration,
     pub root_delayed_factorization_time: Duration,
@@ -118,6 +120,8 @@ impl FactorProfile {
         self.app_backup_time += other.app_backup_time;
         self.app_restore_time += other.app_restore_time;
         self.app_accepted_update_time += other.app_accepted_update_time;
+        self.app_accepted_ld_time += other.app_accepted_ld_time;
+        self.app_accepted_gemm_time += other.app_accepted_gemm_time;
         self.app_column_storage_time += other.app_column_storage_time;
         self.solve_panel_build_time += other.solve_panel_build_time;
         self.root_delayed_factorization_time += other.root_delayed_factorization_time;
@@ -1300,7 +1304,7 @@ fn factorize_impl(
     )?;
     if let Some(started) = factor_started {
         factor_debug_log(format!(
-            "[ssids_rs::factorize] dim={} supernodes={} scaling={:?} total={:.6}s symbolic_front_tree={:.6}s permuted_pattern={:.6}s permuted_values={:.6}s front_factorization={:.6}s front_assembly={:.6}s dense_front={:.6}s tpp={:.6}s app_pivot={:.6}s app_apply={:.6}s app_triangular={:.6}s app_diagonal={:.6}s app_failed_scan={:.6}s app_backup={:.6}s app_restore={:.6}s app_accepted_update={:.6}s app_column_storage={:.6}s solve_panel_build={:.6}s root_delayed={:.6}s factor_inverse={:.6}s lower_storage={:.6}s solve_panel_storage={:.6}s diagonal_storage={:.6}s factor_bytes={:.6}s fronts={} local_dense_entries={}",
+            "[ssids_rs::factorize] dim={} supernodes={} scaling={:?} total={:.6}s symbolic_front_tree={:.6}s permuted_pattern={:.6}s permuted_values={:.6}s front_factorization={:.6}s front_assembly={:.6}s dense_front={:.6}s tpp={:.6}s app_pivot={:.6}s app_apply={:.6}s app_triangular={:.6}s app_diagonal={:.6}s app_failed_scan={:.6}s app_backup={:.6}s app_restore={:.6}s app_accepted_update={:.6}s app_accepted_ld={:.6}s app_accepted_gemm={:.6}s app_column_storage={:.6}s solve_panel_build={:.6}s root_delayed={:.6}s factor_inverse={:.6}s lower_storage={:.6}s solve_panel_storage={:.6}s diagonal_storage={:.6}s factor_bytes={:.6}s fronts={} local_dense_entries={}",
             matrix.dimension(),
             symbolic.supernodes.len(),
             options.scaling,
@@ -1320,6 +1324,8 @@ fn factorize_impl(
             profile_ref.app_backup_time.as_secs_f64(),
             profile_ref.app_restore_time.as_secs_f64(),
             profile_ref.app_accepted_update_time.as_secs_f64(),
+            profile_ref.app_accepted_ld_time.as_secs_f64(),
+            profile_ref.app_accepted_gemm_time.as_secs_f64(),
             profile_ref.app_column_storage_time.as_secs_f64(),
             profile_ref.solve_panel_build_time.as_secs_f64(),
             profile_ref.root_delayed_factorization_time.as_secs_f64(),
@@ -3304,6 +3310,7 @@ fn app_apply_accepted_prefix_update(
         accepted_end,
         block_records,
         &mut ld_values,
+        false,
     );
 }
 
@@ -3314,10 +3321,12 @@ fn app_apply_accepted_prefix_update_with_workspace(
     accepted_end: usize,
     block_records: &[FactorBlockRecord],
     ld_values: &mut [f64],
-) {
+    profile_enabled: bool,
+) -> (Duration, Duration) {
     if accepted_end >= size {
-        return;
+        return (Duration::default(), Duration::default());
     }
+    let ld_started = profile_enabled.then(Instant::now);
     app_build_ld_workspace_into(
         matrix,
         size,
@@ -3326,6 +3335,8 @@ fn app_apply_accepted_prefix_update_with_workspace(
         block_records,
         ld_values,
     );
+    let ld_time = ld_started.map_or(Duration::default(), |started| started.elapsed());
+    let update_started = profile_enabled.then(Instant::now);
     if accepted_end + 1 == size {
         let row = accepted_end;
         let entry = row * size + row;
@@ -3348,12 +3359,14 @@ fn app_apply_accepted_prefix_update_with_workspace(
             }
         }
         debug_assert_eq!(pivot, accepted_end);
-        return;
+        let update_time = update_started.map_or(Duration::default(), |started| started.elapsed());
+        return (ld_time, update_time);
     }
     let accepted_width = accepted_end - block_start;
     debug_assert!(accepted_width <= APP_INNER_BLOCK_SIZE);
     let incremental_column = app_gemv_forward_singleton_column(size, accepted_end);
     let mut column_l_values = [0.0; APP_INNER_BLOCK_SIZE];
+
     for col in accepted_end..size {
         if incremental_column == Some(col) {
             for row in col..size {
@@ -3376,46 +3389,190 @@ fn app_apply_accepted_prefix_update_with_workspace(
         for relative_pivot in 0..accepted_width {
             column_l_values[relative_pivot] = matrix[(block_start + relative_pivot) * size + col];
         }
-        for row in col..size {
-            let mut update = 0.0;
-            let mut relative_pivot = 0;
-            while relative_pivot + 4 <= accepted_width {
-                // SAFETY: `accepted_width <= APP_INNER_BLOCK_SIZE`, `row < size`,
-                // and `ld_values` was sliced to `accepted_width * size` above.
-                let row_ld0 = unsafe { *ld_values.get_unchecked(relative_pivot * size + row) };
-                let col_l0 = unsafe { *column_l_values.get_unchecked(relative_pivot) };
-                update = row_ld0.mul_add(col_l0, update);
-
-                let pivot1 = relative_pivot + 1;
-                let row_ld1 = unsafe { *ld_values.get_unchecked(pivot1 * size + row) };
-                let col_l1 = unsafe { *column_l_values.get_unchecked(pivot1) };
-                update = row_ld1.mul_add(col_l1, update);
-
-                let pivot2 = relative_pivot + 2;
-                let row_ld2 = unsafe { *ld_values.get_unchecked(pivot2 * size + row) };
-                let col_l2 = unsafe { *column_l_values.get_unchecked(pivot2) };
-                update = row_ld2.mul_add(col_l2, update);
-
-                let pivot3 = relative_pivot + 3;
-                let row_ld3 = unsafe { *ld_values.get_unchecked(pivot3 * size + row) };
-                let col_l3 = unsafe { *column_l_values.get_unchecked(pivot3) };
-                update = row_ld3.mul_add(col_l3, update);
-
-                relative_pivot += 4;
-            }
-            while relative_pivot < accepted_width {
-                // SAFETY: `accepted_width <= APP_INNER_BLOCK_SIZE`, `row < size`,
-                // and `ld_values` was sliced to `accepted_width * size` above.
-                let row_ld = unsafe { *ld_values.get_unchecked(relative_pivot * size + row) };
-                // SAFETY: same `accepted_width <= APP_INNER_BLOCK_SIZE` bound.
-                let col_l = unsafe { *column_l_values.get_unchecked(relative_pivot) };
-                update = row_ld.mul_add(col_l, update);
-                relative_pivot += 1;
-            }
-            let entry = col * size + row;
-            matrix[entry] = update.mul_add(-1.0, matrix[entry]);
-        }
+        app_apply_accepted_prefix_update_column(
+            matrix,
+            size,
+            col,
+            accepted_width,
+            ld_values,
+            &column_l_values,
+        );
     }
+    let update_time = update_started.map_or(Duration::default(), |started| started.elapsed());
+    (ld_time, update_time)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn app_apply_accepted_prefix_update_column(
+    matrix: &mut [f64],
+    size: usize,
+    col: usize,
+    accepted_width: usize,
+    ld_values: &[f64],
+    column_l_values: &[f64; APP_INNER_BLOCK_SIZE],
+) {
+    unsafe {
+        app_apply_accepted_prefix_update_column_neon(
+            matrix,
+            size,
+            col,
+            accepted_width,
+            ld_values,
+            column_l_values,
+        );
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn app_apply_accepted_prefix_update_column_neon(
+    matrix: &mut [f64],
+    size: usize,
+    col: usize,
+    accepted_width: usize,
+    ld_values: &[f64],
+    column_l_values: &[f64; APP_INNER_BLOCK_SIZE],
+) {
+    use core::arch::aarch64::{vdupq_n_f64, vfmaq_f64, vld1q_f64, vst1q_f64};
+
+    let matrix_ptr = matrix.as_mut_ptr();
+    let ld_ptr = ld_values.as_ptr();
+    let col_l_ptr = column_l_values.as_ptr();
+    let mut row = col;
+    while row + 3 < size {
+        let mut update0 = vdupq_n_f64(0.0);
+        let mut update1 = vdupq_n_f64(0.0);
+        let mut relative_pivot = 0;
+        while relative_pivot < accepted_width {
+            // SAFETY: caller passes `row + 3 < size`, `relative_pivot < accepted_width`,
+            // and `ld_values` contains at least `accepted_width * size` entries.
+            let row_ld0 = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row)) };
+            let row_ld1 = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row + 2)) };
+            // SAFETY: `relative_pivot < accepted_width <= APP_INNER_BLOCK_SIZE`.
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(relative_pivot) });
+            update0 = vfmaq_f64(update0, row_ld0, col_l);
+            update1 = vfmaq_f64(update1, row_ld1, col_l);
+            relative_pivot += 1;
+        }
+        let entry = col * size + row;
+        // SAFETY: `row + 3 < size`, so both two-lane load/stores stay inside
+        // the dense column `col`.
+        let current0 = unsafe { vld1q_f64(matrix_ptr.add(entry)) };
+        let current1 = unsafe { vld1q_f64(matrix_ptr.add(entry + 2)) };
+        let minus_one = vdupq_n_f64(-1.0);
+        let updated0 = vfmaq_f64(current0, update0, minus_one);
+        let updated1 = vfmaq_f64(current1, update1, minus_one);
+        // SAFETY: same bounds as the loads above.
+        unsafe {
+            vst1q_f64(matrix_ptr.add(entry), updated0);
+            vst1q_f64(matrix_ptr.add(entry + 2), updated1);
+        }
+        row += 4;
+    }
+    while row + 1 < size {
+        let mut update = vdupq_n_f64(0.0);
+        let mut relative_pivot = 0;
+        while relative_pivot < accepted_width {
+            // SAFETY: caller passes `row + 1 < size`, `relative_pivot < accepted_width`,
+            // and `ld_values` contains at least `accepted_width * size` entries.
+            let row_ld = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row)) };
+            // SAFETY: `relative_pivot < accepted_width <= APP_INNER_BLOCK_SIZE`.
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(relative_pivot) });
+            update = vfmaq_f64(update, row_ld, col_l);
+            relative_pivot += 1;
+        }
+        let entry = col * size + row;
+        // SAFETY: `row + 1 < size`, so the two-lane load/store stays inside the
+        // dense column `col`.
+        let current = unsafe { vld1q_f64(matrix_ptr.add(entry)) };
+        let updated = vfmaq_f64(current, update, vdupq_n_f64(-1.0));
+        // SAFETY: same bounds as the load above.
+        unsafe { vst1q_f64(matrix_ptr.add(entry), updated) };
+        row += 2;
+    }
+    if row < size {
+        app_apply_accepted_prefix_update_scalar_row(
+            matrix,
+            size,
+            col,
+            row,
+            accepted_width,
+            ld_values,
+            column_l_values,
+        );
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn app_apply_accepted_prefix_update_column(
+    matrix: &mut [f64],
+    size: usize,
+    col: usize,
+    accepted_width: usize,
+    ld_values: &[f64],
+    column_l_values: &[f64; APP_INNER_BLOCK_SIZE],
+) {
+    for row in col..size {
+        app_apply_accepted_prefix_update_scalar_row(
+            matrix,
+            size,
+            col,
+            row,
+            accepted_width,
+            ld_values,
+            column_l_values,
+        );
+    }
+}
+
+#[inline(always)]
+fn app_apply_accepted_prefix_update_scalar_row(
+    matrix: &mut [f64],
+    size: usize,
+    col: usize,
+    row: usize,
+    accepted_width: usize,
+    ld_values: &[f64],
+    column_l_values: &[f64; APP_INNER_BLOCK_SIZE],
+) {
+    let mut update = 0.0;
+    let mut relative_pivot = 0;
+    while relative_pivot + 4 <= accepted_width {
+        // SAFETY: `accepted_width <= APP_INNER_BLOCK_SIZE`, `row < size`,
+        // and `ld_values` was sliced to `accepted_width * size` above.
+        let row_ld0 = unsafe { *ld_values.get_unchecked(relative_pivot * size + row) };
+        let col_l0 = unsafe { *column_l_values.get_unchecked(relative_pivot) };
+        update = row_ld0.mul_add(col_l0, update);
+
+        let pivot1 = relative_pivot + 1;
+        let row_ld1 = unsafe { *ld_values.get_unchecked(pivot1 * size + row) };
+        let col_l1 = unsafe { *column_l_values.get_unchecked(pivot1) };
+        update = row_ld1.mul_add(col_l1, update);
+
+        let pivot2 = relative_pivot + 2;
+        let row_ld2 = unsafe { *ld_values.get_unchecked(pivot2 * size + row) };
+        let col_l2 = unsafe { *column_l_values.get_unchecked(pivot2) };
+        update = row_ld2.mul_add(col_l2, update);
+
+        let pivot3 = relative_pivot + 3;
+        let row_ld3 = unsafe { *ld_values.get_unchecked(pivot3 * size + row) };
+        let col_l3 = unsafe { *column_l_values.get_unchecked(pivot3) };
+        update = row_ld3.mul_add(col_l3, update);
+
+        relative_pivot += 4;
+    }
+    while relative_pivot < accepted_width {
+        // SAFETY: `accepted_width <= APP_INNER_BLOCK_SIZE`, `row < size`,
+        // and `ld_values` was sliced to `accepted_width * size` above.
+        let row_ld = unsafe { *ld_values.get_unchecked(relative_pivot * size + row) };
+        // SAFETY: same `accepted_width <= APP_INNER_BLOCK_SIZE` bound.
+        let col_l = unsafe { *column_l_values.get_unchecked(relative_pivot) };
+        update = row_ld.mul_add(col_l, update);
+        relative_pivot += 1;
+    }
+    let entry = col * size + row;
+    matrix[entry] = update.mul_add(-1.0, matrix[entry]);
 }
 
 fn app_gemv_forward_singleton_column(size: usize, accepted_end: usize) -> Option<usize> {
@@ -4292,16 +4449,20 @@ fn factorize_dense_front(
             profile.app_restore_time += started.elapsed();
         }
         let started = profile_enabled.then(Instant::now);
-        app_apply_accepted_prefix_update_with_workspace(
-            &mut dense,
-            size,
-            block_start,
-            accepted_end,
-            &accepted_blocks,
-            &mut scratch,
-        );
+        let (accepted_ld_time, accepted_gemm_time) =
+            app_apply_accepted_prefix_update_with_workspace(
+                &mut dense,
+                size,
+                block_start,
+                accepted_end,
+                &accepted_blocks,
+                &mut scratch,
+                profile_enabled,
+            );
         if let Some(started) = started {
             profile.app_accepted_update_time += started.elapsed();
+            profile.app_accepted_ld_time += accepted_ld_time;
+            profile.app_accepted_gemm_time += accepted_gemm_time;
         }
 
         factor_order.extend(rows[block_start..accepted_end].iter().copied());
