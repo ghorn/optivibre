@@ -182,3 +182,10 @@ Release performance notes on dense case 58:
   path, while dense case 58 moves the GEMM-equivalent bucket to roughly `60us`
   and the full accepted-update bucket to roughly `65us` while keeping native
   matching/scaling solve bits exact.
+- The AArch64 accepted-update kernel now also pairs adjacent target columns,
+  reusing each LD row load for both columns while preserving the exact
+  per-entry accepted-pivot FMA order. On the 160x160 dense witness
+  `seed=0x7061726974792026, case=59`, the saved-scaling APP
+  GEMM-equivalent bucket now measures roughly `53-58us`, and the saved-scaling
+  factor path is roughly `0.32-0.36ms` in release profile runs with native
+  matching/scaling solve bits still exact.

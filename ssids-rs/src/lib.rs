@@ -3723,8 +3723,10 @@ fn app_apply_accepted_prefix_update_with_workspace(
     debug_assert!(accepted_width <= APP_INNER_BLOCK_SIZE);
     let incremental_column = app_gemv_forward_singleton_column(size, accepted_end);
     let mut column_l_values = [0.0; APP_INNER_BLOCK_SIZE];
+    let mut next_column_l_values = [0.0; APP_INNER_BLOCK_SIZE];
 
-    for col in accepted_end..size {
+    let mut col = accepted_end;
+    while col < size {
         if incremental_column == Some(col) {
             for row in col..size {
                 app_apply_accepted_prefix_update_entry_incremental(
@@ -3740,11 +3742,35 @@ fn app_apply_accepted_prefix_update_with_workspace(
                     col,
                 );
             }
+            col += 1;
             continue;
         }
 
         for relative_pivot in 0..accepted_width {
             column_l_values[relative_pivot] = matrix[(block_start + relative_pivot) * size + col];
+        }
+        #[cfg(target_arch = "aarch64")]
+        if col + 1 < size && incremental_column != Some(col + 1) {
+            for relative_pivot in 0..accepted_width {
+                next_column_l_values[relative_pivot] =
+                    matrix[(block_start + relative_pivot) * size + col + 1];
+            }
+            // SAFETY: the helper handles the first column's diagonal entry
+            // separately and only uses vector loads/stores for rows inside both
+            // target columns.
+            unsafe {
+                app_apply_accepted_prefix_update_two_columns_neon(
+                    matrix,
+                    size,
+                    col,
+                    accepted_width,
+                    ld_values,
+                    &column_l_values,
+                    &next_column_l_values,
+                );
+            }
+            col += 2;
+            continue;
         }
         app_apply_accepted_prefix_update_column(
             matrix,
@@ -3754,9 +3780,209 @@ fn app_apply_accepted_prefix_update_with_workspace(
             ld_values,
             &column_l_values,
         );
+        col += 1;
     }
     let update_time = update_started.map_or(Duration::default(), |started| started.elapsed());
     (ld_time, update_time)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn app_apply_accepted_prefix_update_two_columns_neon(
+    matrix: &mut [f64],
+    size: usize,
+    col: usize,
+    accepted_width: usize,
+    ld_values: &[f64],
+    column_l_values: &[f64; APP_INNER_BLOCK_SIZE],
+    next_column_l_values: &[f64; APP_INNER_BLOCK_SIZE],
+) {
+    use core::arch::aarch64::{vdupq_n_f64, vfmaq_f64, vld1q_f64, vst1q_f64};
+
+    app_apply_accepted_prefix_update_scalar_row(
+        matrix,
+        size,
+        col,
+        col,
+        accepted_width,
+        ld_values,
+        column_l_values,
+    );
+
+    let matrix_ptr = matrix.as_mut_ptr();
+    let ld_ptr = ld_values.as_ptr();
+    let col_l_ptr = column_l_values.as_ptr();
+    let next_col_l_ptr = next_column_l_values.as_ptr();
+    let next_col = col + 1;
+    let mut row = next_col;
+    while row + 3 < size {
+        let mut update0 = vdupq_n_f64(0.0);
+        let mut update1 = vdupq_n_f64(0.0);
+        let mut next_update0 = vdupq_n_f64(0.0);
+        let mut next_update1 = vdupq_n_f64(0.0);
+        let mut relative_pivot = 0;
+        while relative_pivot + 4 <= accepted_width {
+            // SAFETY: caller passes `row + 3 < size`, the four unrolled pivots
+            // are below `accepted_width`, and the LD workspace is full-width.
+            let row_ld0 = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row)) };
+            let row_ld1 = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row + 2)) };
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(relative_pivot) });
+            let next_col_l = vdupq_n_f64(unsafe { *next_col_l_ptr.add(relative_pivot) });
+            update0 = vfmaq_f64(update0, row_ld0, col_l);
+            update1 = vfmaq_f64(update1, row_ld1, col_l);
+            next_update0 = vfmaq_f64(next_update0, row_ld0, next_col_l);
+            next_update1 = vfmaq_f64(next_update1, row_ld1, next_col_l);
+
+            let pivot1 = relative_pivot + 1;
+            let row_ld0 = unsafe { vld1q_f64(ld_ptr.add(pivot1 * size + row)) };
+            let row_ld1 = unsafe { vld1q_f64(ld_ptr.add(pivot1 * size + row + 2)) };
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(pivot1) });
+            let next_col_l = vdupq_n_f64(unsafe { *next_col_l_ptr.add(pivot1) });
+            update0 = vfmaq_f64(update0, row_ld0, col_l);
+            update1 = vfmaq_f64(update1, row_ld1, col_l);
+            next_update0 = vfmaq_f64(next_update0, row_ld0, next_col_l);
+            next_update1 = vfmaq_f64(next_update1, row_ld1, next_col_l);
+
+            let pivot2 = relative_pivot + 2;
+            let row_ld0 = unsafe { vld1q_f64(ld_ptr.add(pivot2 * size + row)) };
+            let row_ld1 = unsafe { vld1q_f64(ld_ptr.add(pivot2 * size + row + 2)) };
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(pivot2) });
+            let next_col_l = vdupq_n_f64(unsafe { *next_col_l_ptr.add(pivot2) });
+            update0 = vfmaq_f64(update0, row_ld0, col_l);
+            update1 = vfmaq_f64(update1, row_ld1, col_l);
+            next_update0 = vfmaq_f64(next_update0, row_ld0, next_col_l);
+            next_update1 = vfmaq_f64(next_update1, row_ld1, next_col_l);
+
+            let pivot3 = relative_pivot + 3;
+            let row_ld0 = unsafe { vld1q_f64(ld_ptr.add(pivot3 * size + row)) };
+            let row_ld1 = unsafe { vld1q_f64(ld_ptr.add(pivot3 * size + row + 2)) };
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(pivot3) });
+            let next_col_l = vdupq_n_f64(unsafe { *next_col_l_ptr.add(pivot3) });
+            update0 = vfmaq_f64(update0, row_ld0, col_l);
+            update1 = vfmaq_f64(update1, row_ld1, col_l);
+            next_update0 = vfmaq_f64(next_update0, row_ld0, next_col_l);
+            next_update1 = vfmaq_f64(next_update1, row_ld1, next_col_l);
+
+            relative_pivot += 4;
+        }
+        while relative_pivot < accepted_width {
+            // SAFETY: caller passes `row + 3 < size`, `relative_pivot < accepted_width`,
+            // and `ld_values` contains at least `accepted_width * size` entries.
+            let row_ld0 = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row)) };
+            let row_ld1 = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row + 2)) };
+            // SAFETY: `relative_pivot < accepted_width <= APP_INNER_BLOCK_SIZE`.
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(relative_pivot) });
+            let next_col_l = vdupq_n_f64(unsafe { *next_col_l_ptr.add(relative_pivot) });
+            update0 = vfmaq_f64(update0, row_ld0, col_l);
+            update1 = vfmaq_f64(update1, row_ld1, col_l);
+            next_update0 = vfmaq_f64(next_update0, row_ld0, next_col_l);
+            next_update1 = vfmaq_f64(next_update1, row_ld1, next_col_l);
+            relative_pivot += 1;
+        }
+        let entry = col * size + row;
+        let next_entry = next_col * size + row;
+        // SAFETY: `row + 3 < size`, so both two-lane load/stores stay inside
+        // both dense target columns.
+        let current0 = unsafe { vld1q_f64(matrix_ptr.add(entry)) };
+        let current1 = unsafe { vld1q_f64(matrix_ptr.add(entry + 2)) };
+        let next_current0 = unsafe { vld1q_f64(matrix_ptr.add(next_entry)) };
+        let next_current1 = unsafe { vld1q_f64(matrix_ptr.add(next_entry + 2)) };
+        let minus_one = vdupq_n_f64(-1.0);
+        let updated0 = vfmaq_f64(current0, update0, minus_one);
+        let updated1 = vfmaq_f64(current1, update1, minus_one);
+        let next_updated0 = vfmaq_f64(next_current0, next_update0, minus_one);
+        let next_updated1 = vfmaq_f64(next_current1, next_update1, minus_one);
+        // SAFETY: same bounds as the loads above.
+        unsafe {
+            vst1q_f64(matrix_ptr.add(entry), updated0);
+            vst1q_f64(matrix_ptr.add(entry + 2), updated1);
+            vst1q_f64(matrix_ptr.add(next_entry), next_updated0);
+            vst1q_f64(matrix_ptr.add(next_entry + 2), next_updated1);
+        }
+        row += 4;
+    }
+    while row + 1 < size {
+        let mut update = vdupq_n_f64(0.0);
+        let mut next_update = vdupq_n_f64(0.0);
+        let mut relative_pivot = 0;
+        while relative_pivot + 4 <= accepted_width {
+            // SAFETY: caller passes `row + 1 < size`, the four unrolled pivots
+            // are below `accepted_width`, and the LD workspace is full-width.
+            let row_ld = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row)) };
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(relative_pivot) });
+            let next_col_l = vdupq_n_f64(unsafe { *next_col_l_ptr.add(relative_pivot) });
+            update = vfmaq_f64(update, row_ld, col_l);
+            next_update = vfmaq_f64(next_update, row_ld, next_col_l);
+
+            let pivot1 = relative_pivot + 1;
+            let row_ld = unsafe { vld1q_f64(ld_ptr.add(pivot1 * size + row)) };
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(pivot1) });
+            let next_col_l = vdupq_n_f64(unsafe { *next_col_l_ptr.add(pivot1) });
+            update = vfmaq_f64(update, row_ld, col_l);
+            next_update = vfmaq_f64(next_update, row_ld, next_col_l);
+
+            let pivot2 = relative_pivot + 2;
+            let row_ld = unsafe { vld1q_f64(ld_ptr.add(pivot2 * size + row)) };
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(pivot2) });
+            let next_col_l = vdupq_n_f64(unsafe { *next_col_l_ptr.add(pivot2) });
+            update = vfmaq_f64(update, row_ld, col_l);
+            next_update = vfmaq_f64(next_update, row_ld, next_col_l);
+
+            let pivot3 = relative_pivot + 3;
+            let row_ld = unsafe { vld1q_f64(ld_ptr.add(pivot3 * size + row)) };
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(pivot3) });
+            let next_col_l = vdupq_n_f64(unsafe { *next_col_l_ptr.add(pivot3) });
+            update = vfmaq_f64(update, row_ld, col_l);
+            next_update = vfmaq_f64(next_update, row_ld, next_col_l);
+
+            relative_pivot += 4;
+        }
+        while relative_pivot < accepted_width {
+            // SAFETY: caller passes `row + 1 < size`, `relative_pivot < accepted_width`,
+            // and `ld_values` contains at least `accepted_width * size` entries.
+            let row_ld = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row)) };
+            // SAFETY: `relative_pivot < accepted_width <= APP_INNER_BLOCK_SIZE`.
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(relative_pivot) });
+            let next_col_l = vdupq_n_f64(unsafe { *next_col_l_ptr.add(relative_pivot) });
+            update = vfmaq_f64(update, row_ld, col_l);
+            next_update = vfmaq_f64(next_update, row_ld, next_col_l);
+            relative_pivot += 1;
+        }
+        let entry = col * size + row;
+        let next_entry = next_col * size + row;
+        // SAFETY: `row + 1 < size`, so the two-lane load/store stays inside
+        // both dense target columns.
+        let current = unsafe { vld1q_f64(matrix_ptr.add(entry)) };
+        let next_current = unsafe { vld1q_f64(matrix_ptr.add(next_entry)) };
+        let updated = vfmaq_f64(current, update, vdupq_n_f64(-1.0));
+        let next_updated = vfmaq_f64(next_current, next_update, vdupq_n_f64(-1.0));
+        // SAFETY: same bounds as the load above.
+        unsafe {
+            vst1q_f64(matrix_ptr.add(entry), updated);
+            vst1q_f64(matrix_ptr.add(next_entry), next_updated);
+        }
+        row += 2;
+    }
+    if row < size {
+        app_apply_accepted_prefix_update_scalar_row(
+            matrix,
+            size,
+            col,
+            row,
+            accepted_width,
+            ld_values,
+            column_l_values,
+        );
+        app_apply_accepted_prefix_update_scalar_row(
+            matrix,
+            size,
+            next_col,
+            row,
+            accepted_width,
+            ld_values,
+            next_column_l_values,
+        );
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
