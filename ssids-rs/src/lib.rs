@@ -72,6 +72,7 @@ pub struct FactorProfile {
     pub app_block_triangular_solve_time: Duration,
     pub app_block_diagonal_apply_time: Duration,
     pub app_failed_pivot_scan_time: Duration,
+    pub app_backup_time: Duration,
     pub app_restore_time: Duration,
     pub app_accepted_update_time: Duration,
     pub app_column_storage_time: Duration,
@@ -114,6 +115,7 @@ impl FactorProfile {
         self.app_block_triangular_solve_time += other.app_block_triangular_solve_time;
         self.app_block_diagonal_apply_time += other.app_block_diagonal_apply_time;
         self.app_failed_pivot_scan_time += other.app_failed_pivot_scan_time;
+        self.app_backup_time += other.app_backup_time;
         self.app_restore_time += other.app_restore_time;
         self.app_accepted_update_time += other.app_accepted_update_time;
         self.app_column_storage_time += other.app_column_storage_time;
@@ -1266,7 +1268,7 @@ fn factorize_impl(
     )?;
     if let Some(started) = factor_started {
         factor_debug_log(format!(
-            "[ssids_rs::factorize] dim={} supernodes={} scaling={:?} total={:.6}s symbolic_front_tree={:.6}s permuted_pattern={:.6}s permuted_values={:.6}s front_factorization={:.6}s front_assembly={:.6}s dense_front={:.6}s tpp={:.6}s app_pivot={:.6}s app_apply={:.6}s app_triangular={:.6}s app_diagonal={:.6}s app_failed_scan={:.6}s app_restore={:.6}s app_accepted_update={:.6}s app_column_storage={:.6}s solve_panel_build={:.6}s root_delayed={:.6}s factor_inverse={:.6}s lower_storage={:.6}s solve_panel_storage={:.6}s diagonal_storage={:.6}s factor_bytes={:.6}s fronts={} local_dense_entries={}",
+            "[ssids_rs::factorize] dim={} supernodes={} scaling={:?} total={:.6}s symbolic_front_tree={:.6}s permuted_pattern={:.6}s permuted_values={:.6}s front_factorization={:.6}s front_assembly={:.6}s dense_front={:.6}s tpp={:.6}s app_pivot={:.6}s app_apply={:.6}s app_triangular={:.6}s app_diagonal={:.6}s app_failed_scan={:.6}s app_backup={:.6}s app_restore={:.6}s app_accepted_update={:.6}s app_column_storage={:.6}s solve_panel_build={:.6}s root_delayed={:.6}s factor_inverse={:.6}s lower_storage={:.6}s solve_panel_storage={:.6}s diagonal_storage={:.6}s factor_bytes={:.6}s fronts={} local_dense_entries={}",
             matrix.dimension(),
             symbolic.supernodes.len(),
             options.scaling,
@@ -1283,6 +1285,7 @@ fn factorize_impl(
             profile_ref.app_block_triangular_solve_time.as_secs_f64(),
             profile_ref.app_block_diagonal_apply_time.as_secs_f64(),
             profile_ref.app_failed_pivot_scan_time.as_secs_f64(),
+            profile_ref.app_backup_time.as_secs_f64(),
             profile_ref.app_restore_time.as_secs_f64(),
             profile_ref.app_accepted_update_time.as_secs_f64(),
             profile_ref.app_column_storage_time.as_secs_f64(),
@@ -3272,10 +3275,13 @@ fn app_apply_accepted_prefix_update_with_workspace(
         debug_assert_eq!(pivot, accepted_end);
         return;
     }
+    let accepted_width = accepted_end - block_start;
+    debug_assert!(accepted_width <= APP_INNER_BLOCK_SIZE);
     let incremental_column = app_gemv_forward_singleton_column(size, accepted_end);
-    for row in accepted_end..size {
-        for col in accepted_end..=row {
-            if incremental_column == Some(col) {
+    let mut column_l_values = [0.0; APP_INNER_BLOCK_SIZE];
+    for col in accepted_end..size {
+        if incremental_column == Some(col) {
+            for row in col..size {
                 app_apply_accepted_prefix_update_entry_incremental(
                     matrix,
                     AppAcceptedUpdateContext {
@@ -3288,20 +3294,26 @@ fn app_apply_accepted_prefix_update_with_workspace(
                     row,
                     col,
                 );
-                continue;
             }
+            continue;
+        }
+
+        for relative_pivot in 0..accepted_width {
+            column_l_values[relative_pivot] = matrix[(block_start + relative_pivot) * size + col];
+        }
+        for row in col..size {
             let mut update = 0.0;
             let mut pivot = block_start;
             for block in block_records {
                 let relative_pivot = pivot - block_start;
                 if block.size == 1 {
-                    let col_l = matrix[pivot * size + col];
+                    let col_l = column_l_values[relative_pivot];
                     let row_ld = ld_values[relative_pivot * size + row];
                     update = row_ld.mul_add(col_l, update);
                     pivot += 1;
                 } else {
-                    let col_l1 = matrix[pivot * size + col];
-                    let col_l2 = matrix[(pivot + 1) * size + col];
+                    let col_l1 = column_l_values[relative_pivot];
+                    let col_l2 = column_l_values[relative_pivot + 1];
                     let row_ld1 = ld_values[relative_pivot * size + row];
                     let row_ld2 = ld_values[(relative_pivot + 1) * size + row];
                     update = row_ld1.mul_add(col_l1, update);
@@ -3994,8 +4006,12 @@ fn factorize_dense_front(
     while active_candidate_end - pivot >= APP_INNER_BLOCK_SIZE {
         let block_start = pivot;
         let block_end = pivot + APP_INNER_BLOCK_SIZE;
+        let started = profile_enabled.then(Instant::now);
         let rows_before_block = rows.clone();
         let dense_before_block = dense.clone();
+        if let Some(started) = started {
+            profile.app_backup_time += started.elapsed();
+        }
         let mut local_stats = PanelFactorStats::default();
         let mut local_blocks = Vec::new();
         let mut block_pivot = block_start;
