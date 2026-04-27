@@ -123,6 +123,9 @@ Release performance notes on dense case 58:
 - Rust `SpralMatching` analyse is now roughly `0.9-1.0ms` on the same witness;
   the remaining matching/scaling overhead is still close to native's own
   matching/scaling overhead.
+- The production and trace matching paths now feed the already compact
+  absolute-value matrix directly into `mo_match`; the `mo_scale` boundary helper
+  remains test-only for phase coverage of SPRAL's zero-removal/abs transform.
 - Native SPRAL still analyses the captured explicit-order witness in roughly
   `0.2ms`, so the remaining performance gap is in the Rust symbolic-analysis
   implementation rather than in the matching/scaling phase itself.

@@ -45,7 +45,7 @@ pub(crate) fn spral_matching_order(
 ) -> Result<SpralMatchingOrder, SsidsError> {
     let expanded = expand_lower_to_full_spral(matrix)?;
     let compact_abs = remove_explicit_zeroes_and_abs(&expanded);
-    let (scale_logs, matching) = mo_scale(&compact_abs)?;
+    let (scale_logs, matching) = mo_match(&compact_abs)?;
     let order = mo_split(&compact_abs, &matching)?;
     let scaling = scale_logs.into_iter().map(f64::exp).collect();
     Ok(SpralMatchingOrder { order, scaling })
@@ -57,7 +57,7 @@ pub fn spral_matching_trace(
 ) -> Result<SpralMatchingTrace, SsidsError> {
     let expanded = expand_lower_to_full_spral(matrix)?;
     let compact_abs = remove_explicit_zeroes_and_abs(&expanded);
-    let (scale_logs, matching) = mo_scale(&compact_abs)?;
+    let (scale_logs, matching) = mo_match(&compact_abs)?;
     let split = mo_split_trace(&compact_abs, &matching)?;
     let scaling = scale_logs.iter().copied().map(f64::exp).collect();
 
@@ -167,6 +167,7 @@ fn remove_explicit_zeroes_and_abs(matrix: &FullCscMatrix) -> FullCscMatrix {
     }
 }
 
+#[cfg(test)]
 fn mo_scale(matrix: &FullCscMatrix) -> Result<(Vec<f64>, Vec<Option<usize>>), SsidsError> {
     let compact = remove_explicit_zeroes_and_abs(matrix);
     mo_match(&compact)
