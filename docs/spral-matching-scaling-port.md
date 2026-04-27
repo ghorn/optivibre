@@ -123,6 +123,11 @@ Release performance notes on dense case 58:
 - Rust `SpralMatching` analyse is now roughly `0.9-1.0ms` on the same witness;
   the remaining matching/scaling overhead is still close to native's own
   matching/scaling overhead.
+- `SPRAL_SSIDS_DEBUG_MATCHING=1` now splits the Rust SPRAL matching ladder into
+  expand, zero-removal/abs compaction, `mo_match`, `mo_split`, and scaling-exp
+  phases. On dense case 58 the `mo_match` phase is dominated by source-faithful
+  cost construction plus the Hungarian walk; the CSC buffers now reserve the
+  exact nonzero-sized capacity used by the upstream array path.
 - The production and trace matching paths now feed the already compact
   absolute-value matrix directly into `mo_match`; the `mo_scale` boundary helper
   remains test-only for phase coverage of SPRAL's zero-removal/abs transform.
