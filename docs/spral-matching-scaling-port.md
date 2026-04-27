@@ -112,9 +112,18 @@ Release performance notes on dense case 58:
   after reusing the initial symbolic pattern when SPRAL-style postorder is
   identity, replacing per-fill-edge linear membership checks with word-wise
   bitset fill propagation, and building permuted CSR graphs directly.
-- Rust captured-order/no-scaling analyse moved to roughly `0.7ms`; the
-  remaining matching/scaling overhead is therefore about `0.5-0.6ms`, close to
-  the native matching/scaling overhead on the same witness.
+- Rust captured-order/no-scaling analyse moved further to roughly
+  `0.5-0.65ms` on this witness after using the already-computed symbolic
+  column counts in release builds and short-circuiting SPRAL's row-list result
+  for the single full-rank supernode case. The debug/test build still checks
+  the source-faithful `find_col_counts` port against the symbolic counts.
+- Rust `SpralMatching` analyse is now roughly `1.0-1.2ms` on the same witness;
+  the remaining matching/scaling overhead is still close to native's own
+  matching/scaling overhead.
 - Native SPRAL still analyses the captured explicit-order witness in roughly
   `0.2ms`, so the remaining performance gap is in the Rust symbolic-analysis
   implementation rather than in the matching/scaling phase itself.
+- `SPRAL_SSIDS_DEBUG_FACTOR=1` now prints an env-gated Rust factor profile.
+  Dense case 58 currently localizes most remaining Rust factor time to APP
+  dense-front work, especially the accepted-prefix trailing update, rather than
+  saved scaling or sparse front assembly.
