@@ -445,7 +445,7 @@ fn spral_hungarian_match(m: usize, n: usize, cost: &CostCsc) -> SpralHungarianRe
                 } else {
                     qlen += 1;
                     l[i] = qlen;
-                    heap_update(i, q.len() - 1, &mut q, &d, &mut l);
+                    heap_update(i, &mut q, &d, &mut l);
                 }
                 let jj = iperm[i];
                 out[jj] = klong;
@@ -467,7 +467,7 @@ fn spral_hungarian_match(m: usize, n: usize, cost: &CostCsc) -> SpralHungarianRe
                         if d[i] > dmin {
                             break;
                         }
-                        let i = heap_pop(&mut qlen, q.len() - 1, &mut q, &d, &mut l);
+                        let i = heap_pop(&mut qlen, &mut q, &d, &mut l);
                         low -= 1;
                         q[low] = i;
                         l[i] = low;
@@ -508,7 +508,7 @@ fn spral_hungarian_match(m: usize, n: usize, cost: &CostCsc) -> SpralHungarianRe
                         if dnew <= dmin {
                             let lpos = l[i];
                             if lpos != 0 {
-                                heap_delete(lpos, &mut qlen, q.len() - 1, &mut q, &d, &mut l);
+                                heap_delete(lpos, &mut qlen, &mut q, &d, &mut l);
                             }
                             low -= 1;
                             q[low] = i;
@@ -518,7 +518,7 @@ fn spral_hungarian_match(m: usize, n: usize, cost: &CostCsc) -> SpralHungarianRe
                                 qlen += 1;
                                 l[i] = qlen;
                             }
-                            heap_update(i, q.len() - 1, &mut q, &d, &mut l);
+                            heap_update(i, &mut q, &d, &mut l);
                         }
                         let jj = iperm[i];
                         out[jj] = klong;
@@ -697,7 +697,7 @@ fn spral_hungarian_init_heuristic(
     }
 }
 
-fn heap_update(idx: usize, _n: usize, q: &mut [usize], val: &[f64], l: &mut [usize]) {
+fn heap_update(idx: usize, q: &mut [usize], val: &[f64], l: &mut [usize]) {
     let mut pos = l[idx];
     if pos <= 1 {
         q[pos] = idx;
@@ -719,20 +719,13 @@ fn heap_update(idx: usize, _n: usize, q: &mut [usize], val: &[f64], l: &mut [usi
     l[idx] = pos;
 }
 
-fn heap_pop(qlen: &mut usize, n: usize, q: &mut [usize], val: &[f64], l: &mut [usize]) -> usize {
+fn heap_pop(qlen: &mut usize, q: &mut [usize], val: &[f64], l: &mut [usize]) -> usize {
     let popped = q[1];
-    heap_delete(1, qlen, n, q, val, l);
+    heap_delete(1, qlen, q, val, l);
     popped
 }
 
-fn heap_delete(
-    pos0: usize,
-    qlen: &mut usize,
-    _n: usize,
-    q: &mut [usize],
-    d: &[f64],
-    l: &mut [usize],
-) {
+fn heap_delete(pos0: usize, qlen: &mut usize, q: &mut [usize], d: &[f64], l: &mut [usize]) {
     if *qlen == pos0 {
         *qlen -= 1;
         return;
