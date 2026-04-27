@@ -312,9 +312,7 @@ impl CostCsc {
             ptr[col + 1] = row.len();
             for entry in matrix.col_ptrs[col]..matrix.col_ptrs[col + 1] {
                 let value = matrix.values[entry];
-                if value == 0.0 {
-                    continue;
-                }
+                debug_assert!(value != 0.0, "SPRAL mo_match expects compact nonzero costs");
                 row.push(matrix.row_indices[entry] + 1);
                 val.push(cmax[col] - value.ln());
             }
