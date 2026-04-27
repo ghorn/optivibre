@@ -5539,11 +5539,17 @@ fn multifrontal_factorize_with_tree(
         profile.factor_inverse_time += started.elapsed();
     }
     let started = profile_enabled.then(Instant::now);
+    let lower_entry_count = factor_columns
+        .iter()
+        .map(|column| column.entries.len())
+        .sum::<usize>();
     buffers.lower_col_ptrs.clear();
     buffers.lower_col_ptrs.reserve(dimension + 1);
     buffers.lower_col_ptrs.push(0);
     buffers.lower_row_indices.clear();
+    buffers.lower_row_indices.reserve(lower_entry_count);
     buffers.lower_values.clear();
+    buffers.lower_values.reserve(lower_entry_count);
     for (column_position, column) in factor_columns.iter().enumerate() {
         if column.global_column != buffers.factor_order[column_position] {
             return Err(SsidsError::NumericalBreakdown {
@@ -5607,10 +5613,7 @@ fn multifrontal_factorize_with_tree(
 
     let started = profile_enabled.then(Instant::now);
     let stored_nnz = dimension
-        + factor_columns
-            .iter()
-            .map(|column| column.entries.len())
-            .sum::<usize>()
+        + lower_entry_count
         + buffers
             .diagonal_blocks
             .iter()

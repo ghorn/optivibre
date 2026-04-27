@@ -189,3 +189,7 @@ Release performance notes on dense case 58:
   GEMM-equivalent bucket now measures roughly `53-58us`, and the saved-scaling
   factor path is roughly `0.32-0.36ms` in release profile runs with native
   matching/scaling solve bits still exact.
+- Final lower-factor storage now reserves the exact number of off-diagonal
+  entries before filling the CSC buffers. On the same 160x160 witness this
+  trims the `lower_storage` profile bucket into the roughly `19-27us` range
+  without changing numeric data or solve order.
