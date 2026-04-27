@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+mod match_order;
 mod native;
 
 use metis_ordering::{
@@ -11,6 +12,8 @@ use metis_ordering::{
 use rayon::prelude::*;
 use thiserror::Error;
 
+#[doc(hidden)]
+pub use match_order::{SpralCscTrace, SpralMatchingTrace, spral_matching_trace};
 pub use native::{
     NativeOrdering, NativeSpral, NativeSpralAnalyseInfo, NativeSpralError, NativeSpralFactorInfo,
     NativeSpralIndefEnquiry, NativeSpralSession,
@@ -231,6 +234,11 @@ pub enum OrderingStrategy {
     Natural,
     ApproximateMinimumDegree,
     NestedDissection(NestedDissectionOptions),
+    /// Mirror SPRAL SSIDS `options%ordering = 2`: matching-based scaling,
+    /// cycle splitting, compressed METIS-style ordering, then native symbolic
+    /// analyse. The saved analyse-time scaling is only used when numeric
+    /// factorization opts into `NumericScalingStrategy::SavedMatching`.
+    SpralMatching,
     /// Choose the ordering with the lowest estimated symbolic fill among
     /// natural, AMD, and Rust nested dissection.
     Auto(NestedDissectionOptions),
@@ -249,11 +257,25 @@ impl Default for SsidsOptions {
     }
 }
 
+impl SsidsOptions {
+    pub fn spral_default() -> Self {
+        Self {
+            ordering: OrderingStrategy::SpralMatching,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PivotMethod {
     AggressiveAposteriori,
     BlockAposteriori,
     ThresholdPartial,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NumericScalingStrategy {
+    None,
+    SavedMatching,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -263,6 +285,7 @@ pub struct NumericFactorOptions {
     pub small_pivot_tolerance: f64,
     pub threshold_pivot_u: f64,
     pub inertia_zero_tol: f64,
+    pub scaling: NumericScalingStrategy,
 }
 
 impl Default for NumericFactorOptions {
@@ -273,6 +296,16 @@ impl Default for NumericFactorOptions {
             small_pivot_tolerance: 1e-20,
             threshold_pivot_u: 1e-8,
             inertia_zero_tol: 0.0,
+            scaling: NumericScalingStrategy::None,
+        }
+    }
+}
+
+impl NumericFactorOptions {
+    pub fn spral_default() -> Self {
+        Self {
+            scaling: NumericScalingStrategy::SavedMatching,
+            ..Self::default()
         }
     }
 }
@@ -382,13 +415,14 @@ impl Supernode {
 const RELAXED_NODE_AMALGAMATION_NEMIN: usize = 32;
 const APP_INNER_BLOCK_SIZE: usize = 32;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SymbolicFactor {
     pub permutation: Permutation,
     pub elimination_tree: Vec<Option<usize>>,
     pub column_counts: Vec<usize>,
     pub column_pattern: Vec<Vec<usize>>,
     pub supernodes: Vec<Supernode>,
+    saved_matching_scaling: Option<Vec<f64>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -627,6 +661,7 @@ pub struct NumericFactor {
     inertia: Inertia,
     pivot_stats: PivotStats,
     options: NumericFactorOptions,
+    scaling: Option<Vec<f64>>,
     factor_order: Vec<usize>,
     factor_inverse: Vec<usize>,
     lower_col_ptrs: Vec<usize>,
@@ -731,7 +766,11 @@ impl NumericFactor {
 
         let started = profile_enabled.then(Instant::now);
         for (factor_position, &ordered_index) in self.factor_order.iter().enumerate() {
-            factor_rhs[factor_position] = rhs[self.permutation.perm()[ordered_index]];
+            let mut value = rhs[self.permutation.perm()[ordered_index]];
+            if let Some(scaling) = &self.scaling {
+                value *= scaling[ordered_index];
+            }
+            factor_rhs[factor_position] = value;
         }
         if let Some(started) = started {
             profile
@@ -785,7 +824,11 @@ impl NumericFactor {
         }
         let started = profile_enabled.then(Instant::now);
         for (factor_position, &ordered_index) in self.factor_order.iter().enumerate() {
-            rhs[self.permutation.perm()[ordered_index]] = factor_rhs[factor_position];
+            let mut value = factor_rhs[factor_position];
+            if let Some(scaling) = &self.scaling {
+                value *= scaling[ordered_index];
+            }
+            rhs[self.permutation.perm()[ordered_index]] = value;
         }
         if let Some(started) = started {
             profile
@@ -833,11 +876,13 @@ impl NumericFactor {
         profile: Option<&mut FactorProfile>,
     ) -> Result<FactorInfo, SsidsError> {
         let profile_enabled = profile.is_some();
+        let scaling = self.scaling.clone();
         let factorization = multifrontal_factorize_with_tree(
             matrix,
             &self.permutation,
             &self.symbolic_front_tree,
             self.options,
+            scaling.as_deref(),
             NumericFactorBuffers {
                 factor_order: &mut self.factor_order,
                 factor_inverse: &mut self.factor_inverse,
@@ -888,6 +933,8 @@ pub enum SsidsError {
     SolveDimensionMismatch { expected: usize, actual: usize },
     #[error("numeric factorization broke down at pivot {pivot}: {detail}")]
     NumericalBreakdown { pivot: usize, detail: String },
+    #[error("saved matching scaling is required but symbolic analyse did not produce it")]
+    MissingSavedMatchingScaling,
 }
 
 fn analyse_debug_enabled() -> bool {
@@ -971,6 +1018,30 @@ pub fn analyse(
             )?;
             analyse_debug_log(format!(
                 "[ssids_rs::analyse] strategy=nested_dissection done in {:.3}s fill={} supernodes={}",
+                analyse_started.elapsed().as_secs_f64(),
+                result.1.estimated_fill_nnz,
+                result.1.supernode_count,
+            ));
+            Ok(result)
+        }
+        OrderingStrategy::SpralMatching => {
+            analyse_debug_log(format!(
+                "[ssids_rs::analyse] strategy=spral_matching dim={} nnz={} start",
+                matrix.dimension(),
+                matrix.row_indices().len(),
+            ));
+            let matching = match_order::spral_matching_order(matrix)?;
+            let permutation = permutation_from_native_order(matrix.dimension(), &matching.order)?;
+            let result = build_symbolic_result_with_native_order_and_scaling(
+                matrix,
+                &graph,
+                permutation,
+                &column_has_entries,
+                "spral_matching",
+                Some(matching.scaling),
+            )?;
+            analyse_debug_log(format!(
+                "[ssids_rs::analyse] strategy=spral_matching done in {:.3}s fill={} supernodes={}",
                 analyse_started.elapsed().as_secs_f64(),
                 result.1.estimated_fill_nnz,
                 result.1.supernode_count,
@@ -1125,6 +1196,7 @@ fn factorize_impl(
             actual: matrix.dimension(),
         });
     }
+    let numeric_scaling = numeric_scaling_for_symbolic(symbolic, options)?;
     let profile_enabled = profile.is_some();
     let started = profile_enabled.then(Instant::now);
     let front_tree = build_symbolic_front_tree(symbolic);
@@ -1148,6 +1220,7 @@ fn factorize_impl(
             delayed_pivots: 0,
         },
         options: *options,
+        scaling: numeric_scaling,
         factor_order: Vec::with_capacity(matrix.dimension()),
         factor_inverse: Vec::with_capacity(matrix.dimension()),
         lower_col_ptrs: Vec::with_capacity(matrix.dimension() + 1),
@@ -1174,57 +1247,214 @@ fn factorize_impl(
     Ok((factor, info))
 }
 
+fn numeric_scaling_for_symbolic(
+    symbolic: &SymbolicFactor,
+    options: &NumericFactorOptions,
+) -> Result<Option<Vec<f64>>, SsidsError> {
+    match options.scaling {
+        NumericScalingStrategy::None => Ok(None),
+        NumericScalingStrategy::SavedMatching => {
+            let saved = symbolic
+                .saved_matching_scaling
+                .as_ref()
+                .ok_or(SsidsError::MissingSavedMatchingScaling)?;
+            if saved.len() != symbolic.permutation.len() {
+                return Err(SsidsError::DimensionMismatch {
+                    expected: symbolic.permutation.len(),
+                    actual: saved.len(),
+                });
+            }
+            Ok(Some(
+                symbolic
+                    .permutation
+                    .perm()
+                    .iter()
+                    .map(|&original| saved[original])
+                    .collect(),
+            ))
+        }
+    }
+}
+
 fn permute_graph(graph: &CsrGraph, permutation: &Permutation) -> CsrGraph {
-    let edges = (0..graph.vertex_count())
-        .flat_map(|vertex| {
-            graph
-                .neighbors(vertex)
-                .iter()
-                .copied()
-                .filter_map(move |neighbor| {
-                    (vertex < neighbor).then_some((
-                        permutation.inverse()[vertex],
-                        permutation.inverse()[neighbor],
-                    ))
-                })
-        })
-        .collect::<Vec<_>>();
-    CsrGraph::from_edges(graph.vertex_count(), &edges).expect("permutation preserves graph shape")
+    if is_identity_order(permutation.perm()) {
+        return graph.clone();
+    }
+
+    let dimension = graph.vertex_count();
+    let inverse = permutation.inverse();
+    let mut degrees = vec![0_usize; dimension];
+    for vertex in 0..dimension {
+        for &neighbor in graph.neighbors(vertex) {
+            if vertex < neighbor {
+                degrees[inverse[vertex]] += 1;
+                degrees[inverse[neighbor]] += 1;
+            }
+        }
+    }
+
+    let mut offsets = vec![0_usize; dimension + 1];
+    for vertex in 0..dimension {
+        offsets[vertex + 1] = offsets[vertex] + degrees[vertex];
+    }
+
+    let mut cursors = offsets[..dimension].to_vec();
+    let mut neighbors = vec![0_usize; offsets[dimension]];
+    for vertex in 0..dimension {
+        for &neighbor in graph.neighbors(vertex) {
+            if vertex < neighbor {
+                let lhs = inverse[vertex];
+                let rhs = inverse[neighbor];
+                neighbors[cursors[lhs]] = rhs;
+                cursors[lhs] += 1;
+                neighbors[cursors[rhs]] = lhs;
+                cursors[rhs] += 1;
+            }
+        }
+    }
+    for vertex in 0..dimension {
+        neighbors[offsets[vertex]..offsets[vertex + 1]].sort_unstable();
+    }
+    CsrGraph::new(offsets, neighbors).expect("permutation preserves graph shape")
 }
 
 fn build_symbolic_result_with_native_order(
     matrix: SymmetricCscMatrix<'_>,
     graph: &CsrGraph,
-    mut current_permutation: Permutation,
+    current_permutation: Permutation,
     column_has_entries: &[bool],
     ordering_kind: &'static str,
 ) -> Result<(SymbolicFactor, AnalyseInfo), SsidsError> {
+    build_symbolic_result_with_native_order_and_scaling(
+        matrix,
+        graph,
+        current_permutation,
+        column_has_entries,
+        ordering_kind,
+        None,
+    )
+}
+
+fn build_symbolic_result_with_native_order_and_scaling(
+    matrix: SymmetricCscMatrix<'_>,
+    graph: &CsrGraph,
+    mut current_permutation: Permutation,
+    column_has_entries: &[bool],
+    ordering_kind: &'static str,
+    saved_matching_scaling: Option<Vec<f64>>,
+) -> Result<(SymbolicFactor, AnalyseInfo), SsidsError> {
+    let trace = analyse_debug_enabled();
+    let symbolic_started = Instant::now();
     let expanded_pattern = expand_symmetric_pattern(matrix);
+    if trace {
+        analyse_debug_log(format!(
+            "[ssids_rs::analyse] symbolic expand_pattern elapsed={:.6}s",
+            symbolic_started.elapsed().as_secs_f64(),
+        ));
+    }
+    let phase_started = Instant::now();
     let mut current_graph = permute_graph(graph, &current_permutation);
-    let (initial_tree, _, _) = symbolic_factor_pattern(&current_graph);
+    if trace {
+        analyse_debug_log(format!(
+            "[ssids_rs::analyse] symbolic initial_permute_graph elapsed={:.6}s total={:.6}s",
+            phase_started.elapsed().as_secs_f64(),
+            symbolic_started.elapsed().as_secs_f64(),
+        ));
+    }
+    let phase_started = Instant::now();
+    let (initial_tree, initial_column_counts, initial_column_pattern) =
+        symbolic_factor_pattern(&current_graph);
+    if trace {
+        analyse_debug_log(format!(
+            "[ssids_rs::analyse] symbolic initial_factor_pattern elapsed={:.6}s total={:.6}s",
+            phase_started.elapsed().as_secs_f64(),
+            symbolic_started.elapsed().as_secs_f64(),
+        ));
+    }
+    let phase_started = Instant::now();
     let (postorder_permutation, realn) =
         native_postorder_permutation(&initial_tree, &current_permutation, column_has_entries);
-    if !is_identity_order(&postorder_permutation) {
+    if trace {
+        analyse_debug_log(format!(
+            "[ssids_rs::analyse] symbolic postorder elapsed={:.6}s realn={} total={:.6}s",
+            phase_started.elapsed().as_secs_f64(),
+            realn,
+            symbolic_started.elapsed().as_secs_f64(),
+        ));
+    }
+    let postorder_is_identity = is_identity_order(&postorder_permutation);
+    if !postorder_is_identity {
+        let phase_started = Instant::now();
         current_permutation = compose_ordering_with_symbolic_permutation(
             &current_permutation,
             &postorder_permutation,
         )?;
         current_graph = permute_graph(graph, &current_permutation);
+        if trace {
+            analyse_debug_log(format!(
+                "[ssids_rs::analyse] symbolic postorder_apply elapsed={:.6}s total={:.6}s",
+                phase_started.elapsed().as_secs_f64(),
+                symbolic_started.elapsed().as_secs_f64(),
+            ));
+        }
     }
 
-    let (elimination_tree, simulated_column_counts, column_pattern) =
-        symbolic_factor_pattern(&current_graph);
+    let (elimination_tree, simulated_column_counts, column_pattern) = if postorder_is_identity {
+        if trace {
+            analyse_debug_log(format!(
+                "[ssids_rs::analyse] symbolic final_factor_pattern reused_initial=true total={:.6}s",
+                symbolic_started.elapsed().as_secs_f64(),
+            ));
+        }
+        (initial_tree, initial_column_counts, initial_column_pattern)
+    } else {
+        let phase_started = Instant::now();
+        let factor_pattern = symbolic_factor_pattern(&current_graph);
+        if trace {
+            analyse_debug_log(format!(
+                "[ssids_rs::analyse] symbolic final_factor_pattern elapsed={:.6}s total={:.6}s",
+                phase_started.elapsed().as_secs_f64(),
+                symbolic_started.elapsed().as_secs_f64(),
+            ));
+        }
+        factor_pattern
+    };
+    let phase_started = Instant::now();
     let column_counts =
         native_column_counts(&expanded_pattern, &current_permutation, &elimination_tree);
     debug_assert_eq!(column_counts, simulated_column_counts);
+    if trace {
+        analyse_debug_log(format!(
+            "[ssids_rs::analyse] symbolic native_column_counts elapsed={:.6}s total={:.6}s",
+            phase_started.elapsed().as_secs_f64(),
+            symbolic_started.elapsed().as_secs_f64(),
+        ));
+    }
+    let phase_started = Instant::now();
     let supernode_layout = native_supernode_layout(&elimination_tree, &column_counts, realn);
+    if trace {
+        analyse_debug_log(format!(
+            "[ssids_rs::analyse] symbolic supernode_layout elapsed={:.6}s ranges={} total={:.6}s",
+            phase_started.elapsed().as_secs_f64(),
+            supernode_layout.ranges.len(),
+            symbolic_started.elapsed().as_secs_f64(),
+        ));
+    }
     if is_identity_order(&supernode_layout.permutation) {
+        let phase_started = Instant::now();
         let supernodes = build_native_row_list_supernodes(
             &expanded_pattern,
             &current_permutation,
             &supernode_layout,
             &column_pattern,
         );
+        if trace {
+            analyse_debug_log(format!(
+                "[ssids_rs::analyse] symbolic row_lists elapsed={:.6}s total={:.6}s",
+                phase_started.elapsed().as_secs_f64(),
+                symbolic_started.elapsed().as_secs_f64(),
+            ));
+        }
         return Ok(build_symbolic_result(
             current_permutation,
             elimination_tree,
@@ -1232,23 +1462,56 @@ fn build_symbolic_result_with_native_order(
             column_pattern,
             supernodes,
             ordering_kind,
+            saved_matching_scaling,
         ));
     }
 
+    let phase_started = Instant::now();
     let final_permutation = compose_ordering_with_symbolic_permutation(
         &current_permutation,
         &supernode_layout.permutation,
     )?;
     let final_graph = permute_graph(graph, &final_permutation);
+    if trace {
+        analyse_debug_log(format!(
+            "[ssids_rs::analyse] symbolic supernode_apply elapsed={:.6}s total={:.6}s",
+            phase_started.elapsed().as_secs_f64(),
+            symbolic_started.elapsed().as_secs_f64(),
+        ));
+    }
+    let phase_started = Instant::now();
     let (final_tree, simulated_final_counts, final_pattern) = symbolic_factor_pattern(&final_graph);
+    if trace {
+        analyse_debug_log(format!(
+            "[ssids_rs::analyse] symbolic supernode_factor_pattern elapsed={:.6}s total={:.6}s",
+            phase_started.elapsed().as_secs_f64(),
+            symbolic_started.elapsed().as_secs_f64(),
+        ));
+    }
+    let phase_started = Instant::now();
     let final_counts = native_column_counts(&expanded_pattern, &final_permutation, &final_tree);
     debug_assert_eq!(final_counts, simulated_final_counts);
+    if trace {
+        analyse_debug_log(format!(
+            "[ssids_rs::analyse] symbolic final_column_counts elapsed={:.6}s total={:.6}s",
+            phase_started.elapsed().as_secs_f64(),
+            symbolic_started.elapsed().as_secs_f64(),
+        ));
+    }
+    let phase_started = Instant::now();
     let final_supernodes = build_native_row_list_supernodes(
         &expanded_pattern,
         &final_permutation,
         &supernode_layout,
         &final_pattern,
     );
+    if trace {
+        analyse_debug_log(format!(
+            "[ssids_rs::analyse] symbolic final_row_lists elapsed={:.6}s total={:.6}s",
+            phase_started.elapsed().as_secs_f64(),
+            symbolic_started.elapsed().as_secs_f64(),
+        ));
+    }
     Ok(build_symbolic_result(
         final_permutation,
         final_tree,
@@ -1256,6 +1519,7 @@ fn build_symbolic_result_with_native_order(
         final_pattern,
         final_supernodes,
         ordering_kind,
+        saved_matching_scaling,
     ))
 }
 
@@ -1600,40 +1864,76 @@ fn native_virtual_forest_find(virtual_forest: &mut [Option<usize>], node: usize)
 
 fn symbolic_factor_pattern(graph: &CsrGraph) -> (Vec<Option<usize>>, Vec<usize>, Vec<Vec<usize>>) {
     let dimension = graph.vertex_count();
-    let mut adjacency = (0..dimension)
-        .map(|vertex| graph.neighbors(vertex).to_vec())
-        .collect::<Vec<_>>();
+    let words_per_row = dimension.div_ceil(64);
+    let mut edge_bits = vec![0_u64; dimension * words_per_row];
+    for vertex in 0..dimension {
+        for &neighbor in graph.neighbors(vertex) {
+            symbolic_edge_set(&mut edge_bits, words_per_row, vertex, neighbor);
+        }
+    }
+    let mut active_words = vec![0_u64; words_per_row];
     let mut elimination_tree = vec![None; dimension];
     let mut column_counts = vec![1; dimension];
     let mut column_pattern = vec![Vec::new(); dimension];
     for column in 0..dimension {
-        let mut active_neighbors = adjacency[column]
-            .iter()
-            .copied()
-            .filter(|&neighbor| neighbor > column)
-            .collect::<Vec<_>>();
-        active_neighbors.sort_unstable();
-        active_neighbors.dedup();
+        symbolic_trailing_row_bits(&edge_bits, words_per_row, column, &mut active_words);
+        let active_neighbors = symbolic_bits_to_vertices(&active_words, dimension);
         elimination_tree[column] = active_neighbors.first().copied();
         column_counts[column] = active_neighbors.len() + 1;
         column_pattern[column].push(column);
         column_pattern[column].extend(active_neighbors.iter().copied());
-        for idx in 0..active_neighbors.len() {
-            for jdx in (idx + 1)..active_neighbors.len() {
-                let lhs = active_neighbors[idx];
-                let rhs = active_neighbors[jdx];
-                if !adjacency[lhs].contains(&rhs) {
-                    adjacency[lhs].push(rhs);
-                    adjacency[lhs].sort_unstable();
-                }
-                if !adjacency[rhs].contains(&lhs) {
-                    adjacency[rhs].push(lhs);
-                    adjacency[rhs].sort_unstable();
-                }
+        for &neighbor in &active_neighbors {
+            let row_start = neighbor * words_per_row;
+            for word in 0..words_per_row {
+                edge_bits[row_start + word] |= active_words[word];
             }
         }
     }
     (elimination_tree, column_counts, column_pattern)
+}
+
+fn symbolic_trailing_row_bits(
+    edge_bits: &[u64],
+    words_per_row: usize,
+    row: usize,
+    active_words: &mut [u64],
+) {
+    let row_start = row * words_per_row;
+    active_words.copy_from_slice(&edge_bits[row_start..row_start + words_per_row]);
+    let word = row / 64;
+    active_words[..word].fill(0);
+    if let Some(current_word) = active_words.get_mut(word) {
+        let bit = row % 64;
+        *current_word &= if bit == 63 {
+            0
+        } else {
+            !((1_u64 << (bit + 1)) - 1)
+        };
+    }
+}
+
+fn symbolic_bits_to_vertices(words: &[u64], dimension: usize) -> Vec<usize> {
+    let mut vertices = Vec::new();
+    for (word_index, &word) in words.iter().enumerate() {
+        let mut bits = word;
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as usize;
+            let vertex = word_index * 64 + bit;
+            if vertex < dimension {
+                vertices.push(vertex);
+            }
+            bits &= bits - 1;
+        }
+    }
+    vertices
+}
+
+fn symbolic_edge_set(edge_bits: &mut [u64], words_per_row: usize, row: usize, col: usize) {
+    if words_per_row == 0 {
+        return;
+    }
+    let offset = row * words_per_row + col / 64;
+    edge_bits[offset] |= 1_u64 << (col % 64);
 }
 
 fn build_native_row_list_supernodes(
@@ -1758,6 +2058,7 @@ fn build_symbolic_result(
     column_pattern: Vec<Vec<usize>>,
     supernodes: Vec<Supernode>,
     ordering_kind: &'static str,
+    saved_matching_scaling: Option<Vec<f64>>,
 ) -> (SymbolicFactor, AnalyseInfo) {
     let supernode_count = supernodes.len();
     let max_supernode_width = supernodes.iter().map(Supernode::width).max().unwrap_or(0);
@@ -1773,6 +2074,7 @@ fn build_symbolic_result(
         column_counts,
         column_pattern,
         supernodes,
+        saved_matching_scaling,
     };
     (symbolic, info)
 }
@@ -1916,6 +2218,44 @@ fn fill_permuted_lower_csc_values(
             )));
         }
         values[index] = value;
+    }
+    Ok(())
+}
+
+fn apply_permuted_symmetric_scaling(
+    col_ptrs: &[usize],
+    row_indices: &[usize],
+    values: &mut [f64],
+    scaling: &[f64],
+) -> Result<(), SsidsError> {
+    if col_ptrs.len() != scaling.len() + 1 {
+        return Err(SsidsError::DimensionMismatch {
+            expected: col_ptrs.len().saturating_sub(1),
+            actual: scaling.len(),
+        });
+    }
+    if row_indices.len() != values.len() {
+        return Err(SsidsError::PatternMismatch(
+            "permuted matrix row/value length mismatch".into(),
+        ));
+    }
+    for (col, window) in col_ptrs.windows(2).enumerate() {
+        let col_scale = scaling[col];
+        if !col_scale.is_finite() {
+            return Err(SsidsError::InvalidMatrix(format!(
+                "scaling value for permuted column {col} is not finite"
+            )));
+        }
+        for entry in window[0]..window[1] {
+            let row = row_indices[entry];
+            let row_scale = scaling[row];
+            if !row_scale.is_finite() {
+                return Err(SsidsError::InvalidMatrix(format!(
+                    "scaling value for permuted row {row} is not finite"
+                )));
+            }
+            values[entry] = row_scale * values[entry] * col_scale;
+        }
     }
     Ok(())
 }
@@ -3943,6 +4283,7 @@ fn multifrontal_factorize_with_tree(
     permutation: &Permutation,
     tree: &SymbolicFrontTree,
     options: NumericFactorOptions,
+    scaling: Option<&[f64]>,
     buffers: NumericFactorBuffers<'_>,
     profile_enabled: bool,
 ) -> Result<MultifrontalFactorizationOutcome, SsidsError> {
@@ -3969,6 +4310,14 @@ fn multifrontal_factorize_with_tree(
         buffers.permuted_matrix_source_positions,
         buffers.permuted_matrix_values,
     )?;
+    if let Some(scaling) = scaling {
+        apply_permuted_symmetric_scaling(
+            buffers.permuted_matrix_col_ptrs,
+            buffers.permuted_matrix_row_indices,
+            buffers.permuted_matrix_values,
+            scaling,
+        )?;
+    }
     if let Some(started) = started {
         profile.permuted_values_time += started.elapsed();
     }
@@ -4805,13 +5154,13 @@ mod tests {
         app_build_ld_workspace, app_first_failed_trailing_column,
         app_restore_trailing_from_block_backup, app_solve_block_triangular_to_trailing_rows,
         app_truncate_records_to_prefix, app_two_by_two_inverse, app_update_one_by_one,
-        app_update_two_by_two, build_symbolic_front_tree, dense_find_maxloc, dense_lower_offset,
-        dense_symmetric_swap_with_workspace, expand_symmetric_pattern, factor_one_by_one_common,
-        factor_two_by_two_common, factorize, factorize_dense_front,
-        factorize_dense_tpp_tail_in_place, native_column_counts, native_postorder_permutation,
-        openblas_gemv_n_update_like_native, openblas_gemv_t_dot_like_contiguous,
-        openblas_trsv_lower_unit_op_n_like_native, openblas_trsv_lower_unit_op_t_like_native,
-        permute_graph, reset_ldwork_column_tail,
+        app_update_two_by_two, apply_permuted_symmetric_scaling, build_symbolic_front_tree,
+        dense_find_maxloc, dense_lower_offset, dense_symmetric_swap_with_workspace,
+        expand_symmetric_pattern, factor_one_by_one_common, factor_two_by_two_common, factorize,
+        factorize_dense_front, factorize_dense_tpp_tail_in_place, native_column_counts,
+        native_postorder_permutation, openblas_gemv_n_update_like_native,
+        openblas_gemv_t_dot_like_contiguous, openblas_trsv_lower_unit_op_n_like_native,
+        openblas_trsv_lower_unit_op_t_like_native, permute_graph, reset_ldwork_column_tail,
         solve_diagonal_and_lower_transpose_front_panels_like_native,
         solve_forward_front_panels_like_native, solve_two_by_two_block_in_place,
         symbolic_factor_pattern, zero_dense_column_until,
@@ -8208,6 +8557,29 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             rust_bits: rust.len() as u64,
             native_bits: native.len() as u64,
         })
+    }
+
+    #[test]
+    fn permuted_symmetric_scaling_uses_spral_multiplication_order() {
+        let col_ptrs = [0, 1, 1];
+        let row_indices = [1];
+        let original_value = f64::from_bits(0x3fd8_b332_7756_0eaf);
+        let col_scale = f64::from_bits(0x3fc9_5124_5767_cd7a);
+        let row_scale = f64::from_bits(0x3f52_62eb_bdd2_832b);
+        let mut values = [original_value];
+        let product_first_order = original_value * (row_scale * col_scale);
+
+        apply_permuted_symmetric_scaling(
+            &col_ptrs,
+            &row_indices,
+            &mut values,
+            &[col_scale, row_scale],
+        )
+        .unwrap();
+
+        let spral_order = row_scale * original_value * col_scale;
+        assert_eq!(values[0].to_bits(), spral_order.to_bits());
+        assert_ne!(values[0].to_bits(), product_first_order.to_bits());
     }
 
     #[test]

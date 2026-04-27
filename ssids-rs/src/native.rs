@@ -852,8 +852,12 @@ fn decode_native_analysis_order(
     let mut seen = vec![false; dimension];
     let mut decoded = Vec::with_capacity(dimension);
     for (original, &raw_position) in order.iter().enumerate() {
-        let position = raw_position - array_base;
-        let position = usize::try_from(position).map_err(|_| {
+        let zero_based = raw_position.checked_sub(array_base).ok_or_else(|| {
+            NativeSpralError::InvalidOrdering(format!(
+                "native analysis order[{original}]={raw_position} is below array base {array_base}"
+            ))
+        })?;
+        let position = usize::try_from(zero_based).map_err(|_| {
             NativeSpralError::InvalidOrdering(format!(
                 "native analysis order[{original}]={raw_position} with array_base={array_base} is negative"
             ))

@@ -1,7 +1,7 @@
 use approx::assert_abs_diff_eq;
 use ssids_rs::{
-    Inertia, NumericFactorOptions, OrderingStrategy, SsidsError, SsidsOptions, SymmetricCscMatrix,
-    analyse, factorize,
+    Inertia, NumericFactorOptions, NumericScalingStrategy, OrderingStrategy, SsidsError,
+    SsidsOptions, SymmetricCscMatrix, analyse, factorize,
 };
 
 fn dense_mul(matrix: &[Vec<f64>], x: &[f64]) -> Vec<f64> {
@@ -172,6 +172,40 @@ fn saddle_kkt_dense(shift: f64) -> Vec<Vec<f64>> {
             -0.2 - 0.02 * shift,
         ],
     ]
+}
+
+#[test]
+fn saved_matching_scaling_is_explicit_and_solves_in_original_coordinates() {
+    let dense = vec![vec![4.0, 0.0], vec![0.0, 9.0]];
+    let expected = vec![2.0, -3.0];
+    let rhs = dense_mul(&dense, &expected);
+    let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+    let matrix = SymmetricCscMatrix::new(2, &col_ptrs, &row_indices, Some(&values)).expect("csc");
+
+    let (symbolic, _) = analyse(matrix, &SsidsOptions::spral_default()).expect("analyse");
+    let (mut factor, _) =
+        factorize(matrix, &symbolic, &NumericFactorOptions::spral_default()).expect("factorize");
+    let solution = factor.solve(&rhs).expect("solve");
+    assert_abs_diff_eq!(solution[0], expected[0], epsilon = 1e-12);
+    assert_abs_diff_eq!(solution[1], expected[1], epsilon = 1e-12);
+
+    let (natural_symbolic, _) = analyse(
+        matrix,
+        &SsidsOptions {
+            ordering: OrderingStrategy::Natural,
+        },
+    )
+    .expect("natural analyse");
+    let error = factorize(
+        matrix,
+        &natural_symbolic,
+        &NumericFactorOptions {
+            scaling: NumericScalingStrategy::SavedMatching,
+            ..NumericFactorOptions::default()
+        },
+    )
+    .expect_err("saved matching scaling should require matching analyse");
+    assert!(matches!(error, SsidsError::MissingSavedMatchingScaling));
 }
 
 #[test]

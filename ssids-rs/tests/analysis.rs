@@ -45,6 +45,24 @@ fn grid_pattern(rows: usize, cols: usize) -> (Vec<usize>, Vec<usize>) {
 }
 
 #[test]
+fn spral_matching_analysis_requires_values_and_reports_kind() {
+    let col_ptrs = [0, 1, 2, 3];
+    let row_indices = [0, 1, 2];
+    let values = [4.0, 9.0, 16.0];
+    let missing_values =
+        SymmetricCscMatrix::new(3, &col_ptrs, &row_indices, None).expect("valid matrix");
+    let error = analyse(missing_values, &SsidsOptions::spral_default())
+        .expect_err("SPRAL matching analyse needs numeric values");
+    assert!(matches!(error, ssids_rs::SsidsError::MissingValues));
+
+    let matrix =
+        SymmetricCscMatrix::new(3, &col_ptrs, &row_indices, Some(&values)).expect("valid matrix");
+    let (symbolic, info) = analyse(matrix, &SsidsOptions::spral_default()).expect("analyse");
+    assert_eq!(symbolic.permutation.len(), 3);
+    assert_eq!(info.ordering_kind, "spral_matching");
+}
+
+#[test]
 fn symbolic_analysis_returns_valid_factor_metadata() {
     let (col_ptrs, row_indices) = tridiagonal_pattern(8);
     let matrix = SymmetricCscMatrix::new(8, &col_ptrs, &row_indices, None).expect("valid matrix");
