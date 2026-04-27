@@ -2768,9 +2768,21 @@ unsafe fn app_update_one_by_one_neon(
 ) {
     use core::arch::aarch64::{vdupq_n_f64, vfmaq_f64, vld1q_f64, vst1q_f64};
 
+    const NEON_F64_LANES: usize = 2;
+    const SOURCE_UNROLL: usize = 4;
+
     let matrix_ptr = matrix.as_mut_ptr();
     let ld = &workspace[pivot * size..(pivot + 1) * size];
-    for (col, &preserved) in ld.iter().enumerate().take(update_end).skip(pivot + 1) {
+    let block_start = update_end.saturating_sub(APP_INNER_BLOCK_SIZE);
+    let local_pivot = pivot - block_start;
+    let source_unroll_start = block_start + SOURCE_UNROLL * (local_pivot / SOURCE_UNROLL + 1);
+
+    for (col, &preserved) in ld
+        .iter()
+        .enumerate()
+        .take(source_unroll_start.min(update_end))
+        .skip(pivot + 1)
+    {
         let mut row = col;
         let neg_preserved = vdupq_n_f64(-preserved);
         while row + 1 < update_end {
@@ -2780,6 +2792,65 @@ unsafe fn app_update_one_by_one_neon(
             let current = unsafe { vld1q_f64(matrix_ptr.add(col * size + row)) };
             let updated = vfmaq_f64(current, multiplier, neg_preserved);
             // SAFETY: same bounds as the load above.
+            unsafe {
+                vst1q_f64(matrix_ptr.add(col * size + row), updated);
+            }
+            row += 2;
+        }
+        while row < update_end {
+            app_update_one_by_one_scalar_entry(matrix, size, pivot, col, row, preserved);
+            row += 1;
+        }
+    }
+
+    let mut col = source_unroll_start;
+    while col + SOURCE_UNROLL <= update_end {
+        let neg0 = vdupq_n_f64(-ld[col]);
+        let neg1 = vdupq_n_f64(-ld[col + 1]);
+        let neg2 = vdupq_n_f64(-ld[col + 2]);
+        let neg3 = vdupq_n_f64(-ld[col + 3]);
+        let local_col = col - block_start;
+        let mut row = block_start + NEON_F64_LANES * (local_col / NEON_F64_LANES);
+        while row + 1 < update_end {
+            // Mirrors block_ldlt.hxx::update_1x1: the same pivot-column
+            // vector feeds four target columns. Lanes above a target
+            // column's diagonal land in unused upper storage.
+            let multiplier = unsafe { vld1q_f64(matrix_ptr.add(pivot * size + row)) };
+            let current0 = unsafe { vld1q_f64(matrix_ptr.add(col * size + row)) };
+            let current1 = unsafe { vld1q_f64(matrix_ptr.add((col + 1) * size + row)) };
+            let current2 = unsafe { vld1q_f64(matrix_ptr.add((col + 2) * size + row)) };
+            let current3 = unsafe { vld1q_f64(matrix_ptr.add((col + 3) * size + row)) };
+            let updated0 = vfmaq_f64(current0, multiplier, neg0);
+            let updated1 = vfmaq_f64(current1, multiplier, neg1);
+            let updated2 = vfmaq_f64(current2, multiplier, neg2);
+            let updated3 = vfmaq_f64(current3, multiplier, neg3);
+            unsafe {
+                vst1q_f64(matrix_ptr.add(col * size + row), updated0);
+                vst1q_f64(matrix_ptr.add((col + 1) * size + row), updated1);
+                vst1q_f64(matrix_ptr.add((col + 2) * size + row), updated2);
+                vst1q_f64(matrix_ptr.add((col + 3) * size + row), updated3);
+            }
+            row += NEON_F64_LANES;
+        }
+        for (target_col, &preserved) in ld.iter().enumerate().skip(col).take(SOURCE_UNROLL) {
+            let mut scalar_row = row.max(target_col);
+            while scalar_row < update_end {
+                app_update_one_by_one_scalar_entry(
+                    matrix, size, pivot, target_col, scalar_row, preserved,
+                );
+                scalar_row += 1;
+            }
+        }
+        col += SOURCE_UNROLL;
+    }
+
+    for (col, &preserved) in ld.iter().enumerate().take(update_end).skip(col) {
+        let mut row = col;
+        let neg_preserved = vdupq_n_f64(-preserved);
+        while row + 1 < update_end {
+            let multiplier = unsafe { vld1q_f64(matrix_ptr.add(pivot * size + row)) };
+            let current = unsafe { vld1q_f64(matrix_ptr.add(col * size + row)) };
+            let updated = vfmaq_f64(current, multiplier, neg_preserved);
             unsafe {
                 vst1q_f64(matrix_ptr.add(col * size + row), updated);
             }

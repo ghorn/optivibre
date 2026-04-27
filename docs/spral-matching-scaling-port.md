@@ -193,3 +193,9 @@ Release performance notes on dense case 58:
   entries before filling the CSC buffers. On the same 160x160 witness this
   trims the `lower_storage` profile bucket into the roughly `19-27us` range
   without changing numeric data or solve order.
+- The AArch64 in-block APP 1x1 update now mirrors
+  `block_ldlt.hxx::update_1x1`'s four-column source unroll, reusing each
+  pivot-column NEON vector across four target columns while leaving each
+  lower-triangle entry's FMA expression unchanged. On the same witness,
+  saved-scaling `app_pivot` samples around `51-53us` and factor time around
+  `0.33-0.35ms`, with native matching/scaling solve bits still exact.
