@@ -959,12 +959,46 @@ fn factor_debug_log(message: impl AsRef<str>) {
     }
 }
 
+fn graph_from_lower_csc(matrix: SymmetricCscMatrix<'_>) -> Result<CsrGraph, SsidsError> {
+    let dimension = matrix.dimension();
+    let mut degree = vec![0usize; dimension];
+    for col in 0..dimension {
+        for &row in &matrix.row_indices()[matrix.col_ptrs()[col]..matrix.col_ptrs()[col + 1]] {
+            if row == col {
+                continue;
+            }
+            degree[col] += 1;
+            degree[row] += 1;
+        }
+    }
+
+    let mut offsets = Vec::with_capacity(dimension + 1);
+    offsets.push(0);
+    for &degree in &degree {
+        offsets.push(offsets[offsets.len() - 1] + degree);
+    }
+    let mut write = offsets[..dimension].to_vec();
+    let mut neighbors = vec![0usize; offsets[dimension]];
+    for col in 0..dimension {
+        for &row in &matrix.row_indices()[matrix.col_ptrs()[col]..matrix.col_ptrs()[col + 1]] {
+            if row == col {
+                continue;
+            }
+            neighbors[write[row]] = col;
+            write[row] += 1;
+            neighbors[write[col]] = row;
+            write[col] += 1;
+        }
+    }
+    debug_assert_eq!(&write, &offsets[1..]);
+    CsrGraph::new(offsets, neighbors).map_err(SsidsError::Ordering)
+}
+
 pub fn analyse(
     matrix: SymmetricCscMatrix<'_>,
     options: &SsidsOptions,
 ) -> Result<(SymbolicFactor, AnalyseInfo), SsidsError> {
-    let graph =
-        CsrGraph::from_symmetric_csc(matrix.dimension(), matrix.col_ptrs(), matrix.row_indices())?;
+    let graph = graph_from_lower_csc(matrix)?;
     let column_has_entries = (0..matrix.dimension())
         .map(|col| matrix.col_ptrs()[col + 1] > matrix.col_ptrs()[col])
         .collect::<Vec<_>>();
@@ -1153,8 +1187,7 @@ pub fn analyse_with_user_ordering(
     matrix: SymmetricCscMatrix<'_>,
     order: &[usize],
 ) -> Result<(SymbolicFactor, AnalyseInfo), SsidsError> {
-    let graph =
-        CsrGraph::from_symmetric_csc(matrix.dimension(), matrix.col_ptrs(), matrix.row_indices())?;
+    let graph = graph_from_lower_csc(matrix)?;
     let column_has_entries = (0..matrix.dimension())
         .map(|col| matrix.col_ptrs()[col + 1] > matrix.col_ptrs()[col])
         .collect::<Vec<_>>();
@@ -1171,8 +1204,7 @@ pub fn analyse_with_user_ordering(
 pub fn approximate_minimum_degree_permutation(
     matrix: SymmetricCscMatrix<'_>,
 ) -> Result<Permutation, SsidsError> {
-    let graph =
-        CsrGraph::from_symmetric_csc(matrix.dimension(), matrix.col_ptrs(), matrix.row_indices())?;
+    let graph = graph_from_lower_csc(matrix)?;
     Ok(approximate_minimum_degree_order(&graph)?.permutation)
 }
 

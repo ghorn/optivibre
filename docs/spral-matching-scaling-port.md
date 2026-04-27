@@ -120,6 +120,12 @@ Release performance notes on dense case 58:
 - Rust captured-order/no-scaling analyse then moved to roughly `0.4ms` after
   switching small/medium graph permutation to a sorted bitset construction and
   removing a per-column temporary allocation in symbolic fill simulation.
+- `ssids-rs` now builds its analysis CSR graph directly from the validated
+  lower CSC matrix accepted by `SymmetricCscMatrix`, avoiding the public
+  `metis_ordering::CsrGraph::from_symmetric_csc` sort/dedup path in SSIDS
+  analyse. Dense case-58 release timings are now roughly `0.33ms` for
+  captured-order/no-scaling analyse and roughly `0.89ms` for `SpralMatching`
+  saved-scaling analyse.
 - Rust `SpralMatching` analyse is now roughly `0.9-1.0ms` on the same witness;
   the remaining matching/scaling overhead is still close to native's own
   matching/scaling overhead.
