@@ -199,3 +199,7 @@ Release performance notes on dense case 58:
   lower-triangle entry's FMA expression unchanged. On the same witness,
   saved-scaling `app_pivot` samples around `51-53us` and factor time around
   `0.33-0.35ms`, with native matching/scaling solve bits still exact.
+- Saved analyse scaling is now applied while filling the permuted CSC values,
+  avoiding a second production pass over the same entries. A unit test pins
+  the fused path bit-for-bit against the previous fill-then-scale path,
+  including SPRAL's `row_scale * value * col_scale` multiplication order.

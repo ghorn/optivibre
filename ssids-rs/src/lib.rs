@@ -2412,6 +2412,62 @@ fn fill_permuted_lower_csc_values(
     Ok(())
 }
 
+fn fill_scaled_permuted_lower_csc_values(
+    matrix: SymmetricCscMatrix<'_>,
+    col_ptrs: &[usize],
+    row_indices: &[usize],
+    source_positions: &[usize],
+    scaling: &[f64],
+    values: &mut Vec<f64>,
+) -> Result<(), SsidsError> {
+    let source_values = matrix.values().ok_or(SsidsError::MissingValues)?;
+    if col_ptrs.len() != scaling.len() + 1 {
+        return Err(SsidsError::DimensionMismatch {
+            expected: col_ptrs.len().saturating_sub(1),
+            actual: scaling.len(),
+        });
+    }
+    if row_indices.len() != source_positions.len() {
+        return Err(SsidsError::PatternMismatch(
+            "permuted matrix row/source length mismatch".into(),
+        ));
+    }
+    values.clear();
+    values.resize(source_positions.len(), 0.0);
+    for (col, window) in col_ptrs.windows(2).enumerate() {
+        let col_scale = scaling[col];
+        if !col_scale.is_finite() {
+            return Err(SsidsError::InvalidMatrix(format!(
+                "scaling value for permuted column {col} is not finite"
+            )));
+        }
+        for entry in window[0]..window[1] {
+            let source_index = source_positions[entry];
+            let value = source_values[source_index];
+            if !value.is_finite() {
+                let row = matrix.row_indices()[source_index];
+                let col = matrix
+                    .col_ptrs()
+                    .partition_point(|&pointer| pointer <= source_index)
+                    .saturating_sub(1);
+                return Err(SsidsError::InvalidMatrix(format!(
+                    "numeric value at ({row}, {col}) is not finite"
+                )));
+            }
+            let row = row_indices[entry];
+            let row_scale = scaling[row];
+            if !row_scale.is_finite() {
+                return Err(SsidsError::InvalidMatrix(format!(
+                    "scaling value for permuted row {row} is not finite"
+                )));
+            }
+            values[entry] = row_scale * value * col_scale;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn apply_permuted_symmetric_scaling(
     col_ptrs: &[usize],
     row_indices: &[usize],
@@ -5433,17 +5489,20 @@ fn multifrontal_factorize_with_tree(
         }
     }
     let started = profile_enabled.then(Instant::now);
-    fill_permuted_lower_csc_values(
-        matrix,
-        buffers.permuted_matrix_source_positions,
-        buffers.permuted_matrix_values,
-    )?;
     if let Some(scaling) = scaling {
-        apply_permuted_symmetric_scaling(
+        fill_scaled_permuted_lower_csc_values(
+            matrix,
             buffers.permuted_matrix_col_ptrs,
             buffers.permuted_matrix_row_indices,
-            buffers.permuted_matrix_values,
+            buffers.permuted_matrix_source_positions,
             scaling,
+            buffers.permuted_matrix_values,
+        )?;
+    } else {
+        fill_permuted_lower_csc_values(
+            matrix,
+            buffers.permuted_matrix_source_positions,
+            buffers.permuted_matrix_values,
         )?;
     }
     if let Some(started) = started {
@@ -6287,10 +6346,12 @@ mod tests {
         app_solve_block_triangular_to_trailing_rows, app_target_block_uses_gemv_forward,
         app_truncate_records_to_prefix, app_two_by_two_inverse, app_update_one_by_one,
         app_update_two_by_two, apply_permuted_symmetric_scaling, build_native_row_list_supernodes,
-        build_native_row_list_supernodes_fast, build_symbolic_front_tree, dense_find_maxloc,
-        dense_lower_offset, dense_symmetric_swap_with_workspace, expand_symmetric_pattern,
-        factor_one_by_one_common, factor_two_by_two_common, factorize, factorize_dense_front,
-        factorize_dense_tpp_tail_in_place, native_column_counts, native_postorder_permutation,
+        build_native_row_list_supernodes_fast, build_permuted_lower_csc_pattern,
+        build_symbolic_front_tree, dense_find_maxloc, dense_lower_offset,
+        dense_symmetric_swap_with_workspace, expand_symmetric_pattern, factor_one_by_one_common,
+        factor_two_by_two_common, factorize, factorize_dense_front,
+        factorize_dense_tpp_tail_in_place, fill_permuted_lower_csc_values,
+        fill_scaled_permuted_lower_csc_values, native_column_counts, native_postorder_permutation,
         native_supernode_layout, openblas_gemv_n_update_like_native,
         openblas_gemv_t_dot_like_contiguous, openblas_trsv_lower_unit_op_n_like_native,
         openblas_trsv_lower_unit_op_t_like_native, permute_graph, permute_graph_with_bitsets,
@@ -9714,6 +9775,86 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         let spral_order = row_scale * original_value * col_scale;
         assert_eq!(values[0].to_bits(), spral_order.to_bits());
         assert_ne!(values[0].to_bits(), product_first_order.to_bits());
+    }
+
+    #[test]
+    fn fused_scaled_permuted_values_match_fill_then_scale_bits() {
+        let dense = vec![
+            vec![f64::from_bits(0x3ff0_0000_0000_0001), 0.0, 0.0, 0.0],
+            vec![
+                f64::from_bits(0xbfd8_0000_0000_0003),
+                f64::from_bits(0x3fe8_0000_0000_0005),
+                0.0,
+                0.0,
+            ],
+            vec![
+                f64::from_bits(0x3fb9_9999_9999_999a),
+                f64::from_bits(0xbfc4_0000_0000_0007),
+                f64::from_bits(0x3ff8_0000_0000_000b),
+                0.0,
+            ],
+            vec![
+                f64::from_bits(0xbfa0_0000_0000_000d),
+                f64::from_bits(0x3fd0_0000_0000_000f),
+                f64::from_bits(0xbfe0_0000_0000_0011),
+                f64::from_bits(0x3fc8_0000_0000_0013),
+            ],
+        ];
+        let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+        let matrix = SymmetricCscMatrix::new(4, &col_ptrs, &row_indices, Some(&values))
+            .expect("valid matrix");
+        let permutation = Permutation::new(vec![2, 0, 3, 1]).expect("valid permutation");
+        let scaling = [
+            f64::from_bits(0x3fb9_5124_5767_cd7a),
+            f64::from_bits(0x3fc2_62eb_bdd2_832b),
+            f64::from_bits(0x3fd1_f3b6_45a1_c935),
+            f64::from_bits(0x3fc8_b332_7756_0eaf),
+        ];
+
+        let mut permuted_col_ptrs = Vec::new();
+        let mut permuted_row_indices = Vec::new();
+        let mut source_positions = Vec::new();
+        build_permuted_lower_csc_pattern(
+            matrix,
+            &permutation,
+            &mut permuted_col_ptrs,
+            &mut permuted_row_indices,
+            &mut source_positions,
+        )
+        .expect("permuted pattern");
+
+        let mut separate = Vec::new();
+        fill_permuted_lower_csc_values(matrix, &source_positions, &mut separate)
+            .expect("fill values");
+        apply_permuted_symmetric_scaling(
+            &permuted_col_ptrs,
+            &permuted_row_indices,
+            &mut separate,
+            &scaling,
+        )
+        .expect("apply scaling");
+
+        let mut fused = Vec::new();
+        fill_scaled_permuted_lower_csc_values(
+            matrix,
+            &permuted_col_ptrs,
+            &permuted_row_indices,
+            &source_positions,
+            &scaling,
+            &mut fused,
+        )
+        .expect("fused fill");
+
+        assert_eq!(
+            fused
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            separate
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
