@@ -3611,16 +3611,27 @@ fn app_backup_trailing_lower(matrix: &[f64], size: usize, backup_start: usize) -
     backup
 }
 
+#[derive(Clone, Copy)]
+struct AppRestoreRange {
+    backup_start: usize,
+    block_end: usize,
+    trailing_start: usize,
+}
+
 fn app_restore_trailing_from_block_backup(
     rows: &[usize],
     rows_before_block: &[usize],
     matrix: &mut [f64],
     matrix_before_block: &[f64],
     size: usize,
-    backup_start: usize,
-    trailing_start: usize,
+    range: AppRestoreRange,
 ) {
-    if trailing_start >= size {
+    let AppRestoreRange {
+        backup_start,
+        block_end,
+        trailing_start,
+    } = range;
+    if trailing_start >= size || trailing_start >= block_end {
         return;
     }
     let backup_size = size - backup_start;
@@ -5624,8 +5635,11 @@ fn factorize_dense_front(
             &mut dense,
             &dense_before_block,
             size,
-            block_start,
-            accepted_end,
+            AppRestoreRange {
+                backup_start: block_start,
+                block_end,
+                trailing_start: accepted_end,
+            },
         );
         if let Some(started) = started {
             profile.app_restore_time += started.elapsed();
@@ -6808,10 +6822,10 @@ mod tests {
     use proptest::test_runner::{Config, RngAlgorithm, RngSeed, TestRng, TestRunner};
 
     use super::{
-        APP_INNER_BLOCK_SIZE, DenseTppTailRequest, DenseUpdateBounds, DiagonalBlock,
-        FactorBlockRecord, NativeOrdering, NativeSpral, NumericFactorOptions, OrderingStrategy,
-        PanelFactorStats, PivotMethod, SolvePanel, SsidsError, SsidsOptions, SymmetricCscMatrix,
-        analyse, app_adjust_passed_prefix, app_apply_accepted_prefix_update,
+        APP_INNER_BLOCK_SIZE, AppRestoreRange, DenseTppTailRequest, DenseUpdateBounds,
+        DiagonalBlock, FactorBlockRecord, NativeOrdering, NativeSpral, NumericFactorOptions,
+        OrderingStrategy, PanelFactorStats, PivotMethod, SolvePanel, SsidsError, SsidsOptions,
+        SymmetricCscMatrix, analyse, app_adjust_passed_prefix, app_apply_accepted_prefix_update,
         app_apply_block_pivots_to_trailing_rows, app_backup_trailing_lower,
         app_build_ld_tile_workspace, app_build_ld_workspace, app_first_failed_trailing_column,
         app_gemv_forward_singleton_column, app_restore_trailing_from_block_backup,
@@ -10119,8 +10133,11 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             &mut matrix,
             &backup,
             size,
-            backup_start,
-            trailing_start,
+            AppRestoreRange {
+                backup_start,
+                block_end: 6,
+                trailing_start,
+            },
         );
 
         for row in trailing_start..size {
@@ -10136,6 +10153,43 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
                 );
             }
         }
+    }
+
+    #[test]
+    fn app_block_backup_skips_restore_after_full_pass() {
+        let size = 8;
+        let backup_start = 2;
+        let block_end = 4;
+        let trailing_start = block_end;
+        let mut original = vec![0.0; size * size];
+        for col in 0..size {
+            for row in col..size {
+                original[dense_lower_offset(size, row, col)] = (10 * col + row) as f64;
+            }
+        }
+        let backup = app_backup_trailing_lower(&original, size, backup_start);
+        let rows = (0..size).collect::<Vec<_>>();
+        let mut matrix = original.clone();
+        matrix[dense_lower_offset(size, trailing_start, trailing_start)] = -99.0;
+
+        app_restore_trailing_from_block_backup(
+            &rows,
+            &rows,
+            &mut matrix,
+            &backup,
+            size,
+            AppRestoreRange {
+                backup_start,
+                block_end,
+                trailing_start,
+            },
+        );
+
+        assert_eq!(
+            matrix[dense_lower_offset(size, trailing_start, trailing_start)].to_bits(),
+            (-99.0f64).to_bits(),
+            "full-pass APP restore should be a no-op"
+        );
     }
 
     fn first_block_prefix_trace_mismatch(
@@ -12445,8 +12499,11 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             &mut lower_dense,
             &before_block,
             size,
-            block_start,
-            accepted_end,
+            AppRestoreRange {
+                backup_start: block_start,
+                block_end,
+                trailing_start: accepted_end,
+            },
         );
         let restored = lower_dense.clone();
         app_apply_accepted_prefix_update(
@@ -15488,8 +15545,11 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             &mut lower_dense,
             &dense_restore_backup,
             dimension,
-            block_start,
-            accepted_end,
+            AppRestoreRange {
+                backup_start: block_start,
+                block_end,
+                trailing_start: accepted_end,
+            },
         );
         let restored_lower_dense = lower_dense.clone();
         let tail_size = dimension - accepted_end;
