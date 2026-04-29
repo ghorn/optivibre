@@ -199,6 +199,11 @@ Release performance notes on dense case 58:
   lower-triangle entry's FMA expression unchanged. On the same witness,
   saved-scaling `app_pivot` samples around `51-53us` and factor time around
   `0.33-0.35ms`, with native matching/scaling solve bits still exact.
+- The APP maxloc scan now keeps the same source-shaped two-lane walk and
+  strict tie behavior while indexing dense lower-triangle entries directly.
+  An eleven-repeat release profile on the same witness moved saved-scaling
+  `app_pivot` to about `45us` and factor time to about `274us`, with native
+  matching/scaling solve bits still exact.
 - Saved analyse scaling is now applied while filling the permuted CSC values,
   avoiding a second production pass over the same entries. A unit test pins
   the fused path bit-for-bit against the previous fill-then-scale path,
