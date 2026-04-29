@@ -2,11 +2,14 @@
 
 use approx::assert_abs_diff_eq;
 use optimization::{
-    CCS, CompiledNlpProblem, ConstraintBounds, FilterAcceptanceMode, InteriorPointIterationPhase,
-    InteriorPointIterationSnapshot, InteriorPointOptions, InteriorPointStepKind,
-    IpoptIterationSnapshot, IpoptOptions, ParameterMatrix,
-    apply_native_spral_parity_to_ipopt_options, apply_native_spral_parity_to_nlip_options,
-    solve_nlp_interior_point, solve_nlp_interior_point_with_callback, solve_nlp_ipopt,
+    CCS, CompiledNlpProblem, ConstraintBounds, FilterAcceptanceMode,
+    InteriorPointAlphaForYStrategy, InteriorPointBoundMultiplierInitMethod,
+    InteriorPointIterationEvent, InteriorPointIterationPhase, InteriorPointIterationSnapshot,
+    InteriorPointOptions, InteriorPointSolveError, InteriorPointStatusKind, InteriorPointStepKind,
+    InteriorPointTermination, IpoptIterationSnapshot, IpoptOptions, IpoptRawOption, IpoptRawStatus,
+    IpoptSolveError, ParameterMatrix, apply_native_spral_parity_to_ipopt_options,
+    apply_native_spral_parity_to_nlip_options, solve_nlp_interior_point,
+    solve_nlp_interior_point_with_callback, solve_nlp_ipopt,
 };
 use rstest::rstest;
 use std::collections::BTreeMap;
@@ -105,6 +108,178 @@ impl CompiledNlpProblem for BoundConstrainedQuadraticProblem {
         out: &mut [f64],
     ) {
         out.copy_from_slice(&[2.0, 0.0, 2.0]);
+    }
+}
+
+struct FixedVariableQuadraticProblem;
+
+impl CompiledNlpProblem for FixedVariableQuadraticProblem {
+    fn dimension(&self) -> usize {
+        2
+    }
+
+    fn parameter_count(&self) -> usize {
+        0
+    }
+
+    fn parameter_ccs(&self, _parameter_index: usize) -> &CCS {
+        unreachable!("fixed-variable quadratic problem has no parameters")
+    }
+
+    fn variable_bounds(&self) -> Option<ConstraintBounds> {
+        Some(ConstraintBounds {
+            lower: Some(vec![Some(1.0), None]),
+            upper: Some(vec![Some(1.0), None]),
+        })
+    }
+
+    fn equality_count(&self) -> usize {
+        0
+    }
+
+    fn inequality_count(&self) -> usize {
+        0
+    }
+
+    fn objective_value(&self, x: &[f64], _parameters: &[ParameterMatrix<'_>]) -> f64 {
+        (x[0] - 1.0).powi(2) + (x[1] - 3.0).powi(2)
+    }
+
+    fn objective_gradient(&self, x: &[f64], _parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
+        out.copy_from_slice(&[2.0 * (x[0] - 1.0), 2.0 * (x[1] - 3.0)]);
+    }
+
+    fn equality_jacobian_ccs(&self) -> &CCS {
+        static EMPTY: std::sync::OnceLock<CCS> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(|| CCS::empty(0, 2))
+    }
+
+    fn equality_values(&self, _x: &[f64], _parameters: &[ParameterMatrix<'_>], _out: &mut [f64]) {}
+
+    fn equality_jacobian_values(
+        &self,
+        _x: &[f64],
+        _parameters: &[ParameterMatrix<'_>],
+        _out: &mut [f64],
+    ) {
+    }
+
+    fn inequality_jacobian_ccs(&self) -> &CCS {
+        static EMPTY: std::sync::OnceLock<CCS> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(|| CCS::empty(0, 2))
+    }
+
+    fn inequality_values(&self, _x: &[f64], _parameters: &[ParameterMatrix<'_>], _out: &mut [f64]) {
+    }
+
+    fn inequality_jacobian_values(
+        &self,
+        _x: &[f64],
+        _parameters: &[ParameterMatrix<'_>],
+        _out: &mut [f64],
+    ) {
+    }
+
+    fn lagrangian_hessian_ccs(&self) -> &CCS {
+        static HESSIAN_CCS: std::sync::OnceLock<CCS> = std::sync::OnceLock::new();
+        HESSIAN_CCS.get_or_init(|| CCS::lower_triangular_dense(2))
+    }
+
+    fn lagrangian_hessian_values(
+        &self,
+        _x: &[f64],
+        _parameters: &[ParameterMatrix<'_>],
+        _equality_multipliers: &[f64],
+        _inequality_multipliers: &[f64],
+        out: &mut [f64],
+    ) {
+        out.copy_from_slice(&[2.0, 0.0, 2.0]);
+    }
+}
+
+struct SquareEqualityQuadraticProblem;
+
+impl CompiledNlpProblem for SquareEqualityQuadraticProblem {
+    fn dimension(&self) -> usize {
+        2
+    }
+
+    fn parameter_count(&self) -> usize {
+        0
+    }
+
+    fn parameter_ccs(&self, _parameter_index: usize) -> &CCS {
+        unreachable!("square equality quadratic problem has no parameters")
+    }
+
+    fn variable_bounds(&self) -> Option<ConstraintBounds> {
+        None
+    }
+
+    fn equality_count(&self) -> usize {
+        2
+    }
+
+    fn inequality_count(&self) -> usize {
+        0
+    }
+
+    fn objective_value(&self, x: &[f64], _parameters: &[ParameterMatrix<'_>]) -> f64 {
+        (x[0] - 4.0).powi(2) + 3.0 * (x[1] + 2.0).powi(2)
+    }
+
+    fn objective_gradient(&self, x: &[f64], _parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
+        out.copy_from_slice(&[2.0 * (x[0] - 4.0), 6.0 * (x[1] + 2.0)]);
+    }
+
+    fn equality_jacobian_ccs(&self) -> &CCS {
+        static JAC: std::sync::OnceLock<CCS> = std::sync::OnceLock::new();
+        JAC.get_or_init(|| CCS::new(2, 2, vec![0, 1, 2], vec![0, 1]))
+    }
+
+    fn equality_values(&self, x: &[f64], _parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
+        out.copy_from_slice(&[x[0] - 1.0, x[1] - 2.0]);
+    }
+
+    fn equality_jacobian_values(
+        &self,
+        _x: &[f64],
+        _parameters: &[ParameterMatrix<'_>],
+        out: &mut [f64],
+    ) {
+        out.copy_from_slice(&[1.0, 1.0]);
+    }
+
+    fn inequality_jacobian_ccs(&self) -> &CCS {
+        static EMPTY: std::sync::OnceLock<CCS> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(|| CCS::empty(0, 2))
+    }
+
+    fn inequality_values(&self, _x: &[f64], _parameters: &[ParameterMatrix<'_>], _out: &mut [f64]) {
+    }
+
+    fn inequality_jacobian_values(
+        &self,
+        _x: &[f64],
+        _parameters: &[ParameterMatrix<'_>],
+        _out: &mut [f64],
+    ) {
+    }
+
+    fn lagrangian_hessian_ccs(&self) -> &CCS {
+        static HESSIAN_CCS: std::sync::OnceLock<CCS> = std::sync::OnceLock::new();
+        HESSIAN_CCS.get_or_init(|| CCS::lower_triangular_dense(2))
+    }
+
+    fn lagrangian_hessian_values(
+        &self,
+        _x: &[f64],
+        _parameters: &[ParameterMatrix<'_>],
+        _equality_multipliers: &[f64],
+        _inequality_multipliers: &[f64],
+        out: &mut [f64],
+    ) {
+        out.copy_from_slice(&[2.0, 0.0, 6.0]);
     }
 }
 
@@ -488,6 +663,20 @@ fn assert_accepted_trace_parity(
     );
 }
 
+fn assert_native_event_seen(
+    problem_name: &str,
+    summary: &optimization::InteriorPointSummary,
+    event: InteriorPointIterationEvent,
+) {
+    assert!(
+        summary
+            .snapshots
+            .iter()
+            .any(|snapshot| snapshot.events.contains(&event)),
+        "{problem_name} did not exercise expected NLIP event {event:?}"
+    );
+}
+
 fn print_accepted_trace_comparison(
     problem_name: &str,
     native_trace: &[AcceptedTracePoint],
@@ -612,6 +801,12 @@ fn native_options() -> InteriorPointOptions {
     options
 }
 
+fn native_options_with(configure: impl FnOnce(&mut InteriorPointOptions)) -> InteriorPointOptions {
+    let mut options = native_options();
+    configure(&mut options);
+    options
+}
+
 fn hs071_native_options() -> InteriorPointOptions {
     let mut options = InteriorPointOptions {
         max_iters: 300,
@@ -634,6 +829,12 @@ fn ipopt_options() -> IpoptOptions {
         ..IpoptOptions::default()
     };
     apply_native_spral_parity_to_ipopt_options(&mut options);
+    options
+}
+
+fn ipopt_options_with(configure: impl FnOnce(&mut IpoptOptions)) -> IpoptOptions {
+    let mut options = ipopt_options();
+    configure(&mut options);
     options
 }
 
@@ -872,6 +1073,16 @@ fn assert_ipopt_component_snapshots(problem_name: &str, summary: &optimization::
     }
 }
 
+#[derive(Clone, Copy)]
+struct FinalParityTolerances {
+    x: f64,
+    objective: f64,
+    primal: f64,
+    native_dual: f64,
+    ipopt_dual: f64,
+    complementarity: f64,
+}
+
 fn assert_native_matches_ipopt(
     problem_name: &str,
     backend: Option<CallbackBackend>,
@@ -879,6 +1090,29 @@ fn assert_native_matches_ipopt(
     ipopt: &optimization::IpoptSummary,
     x_epsilon: f64,
     objective_epsilon: f64,
+) {
+    assert_native_matches_ipopt_with_final_tolerances(
+        problem_name,
+        backend,
+        native,
+        ipopt,
+        FinalParityTolerances {
+            x: x_epsilon,
+            objective: objective_epsilon,
+            primal: 1e-5,
+            native_dual: 1e-4,
+            ipopt_dual: 1e-5,
+            complementarity: 1e-5,
+        },
+    );
+}
+
+fn assert_native_matches_ipopt_with_final_tolerances(
+    problem_name: &str,
+    backend: Option<CallbackBackend>,
+    native: &optimization::InteriorPointSummary,
+    ipopt: &optimization::IpoptSummary,
+    tolerances: FinalParityTolerances,
 ) {
     print_compare_summary(problem_name, backend, native, ipopt);
     assert_eq!(
@@ -890,21 +1124,21 @@ fn assert_native_matches_ipopt(
     assert_abs_diff_eq!(
         native.objective,
         ipopt.objective,
-        epsilon = objective_epsilon
+        epsilon = tolerances.objective
     );
     assert!(
-        max_abs_diff(&native.x, &ipopt.x) <= x_epsilon,
+        max_abs_diff(&native.x, &ipopt.x) <= tolerances.x,
         "native/ipopt x mismatch for {problem_name} backend={}: native={:?} ipopt={:?}",
         backend.map_or("direct", CallbackBackend::label),
         native.x,
         ipopt.x,
     );
-    assert!(native.primal_inf_norm <= 1e-5);
-    assert!(native.dual_inf_norm <= 1e-4);
-    assert!(native.complementarity_inf_norm <= 1e-5);
-    assert!(ipopt.primal_inf_norm <= 1e-5);
-    assert!(ipopt.dual_inf_norm <= 1e-5);
-    assert!(ipopt.complementarity_inf_norm <= 1e-5);
+    assert!(native.primal_inf_norm <= tolerances.primal);
+    assert!(native.dual_inf_norm <= tolerances.native_dual);
+    assert!(native.complementarity_inf_norm <= tolerances.complementarity);
+    assert!(ipopt.primal_inf_norm <= tolerances.primal);
+    assert!(ipopt.dual_inf_norm <= tolerances.ipopt_dual);
+    assert!(ipopt.complementarity_inf_norm <= tolerances.complementarity);
 }
 
 fn solve_native_ok<P: CompiledNlpProblem>(
@@ -942,8 +1176,17 @@ fn solve_ipopt_ok<P: CompiledNlpProblem>(
     x0: &[f64],
     parameters: &[ParameterMatrix<'_>],
 ) -> optimization::IpoptSummary {
+    solve_ipopt_with_options_ok(problem, x0, parameters, ipopt_options())
+}
+
+fn solve_ipopt_with_options_ok<P: CompiledNlpProblem>(
+    problem: &P,
+    x0: &[f64],
+    parameters: &[ParameterMatrix<'_>],
+    options: IpoptOptions,
+) -> optimization::IpoptSummary {
     optimization::assert_source_built_spral_parity_preflight();
-    let solve_result = solve_nlp_ipopt(problem, x0, parameters, &ipopt_options());
+    let solve_result = solve_nlp_ipopt(problem, x0, parameters, &options);
     assert!(solve_result.is_ok(), "Ipopt solve failed: {solve_result:?}");
     match solve_result {
         Ok(summary) => {
@@ -1033,6 +1276,16 @@ fn compare_native_and_ipopt_on_hs071(
         solve_native_with_options_ok(&problem, &[1.0, 5.0, 5.0, 1.0], &[], hs071_native_options());
     let ipopt = solve_ipopt_ok(&problem, &[1.0, 5.0, 5.0, 1.0], &[]);
     assert_native_matches_ipopt("hs071", Some(backend), &native, &ipopt, 5e-3, 1e-4);
+    assert_native_event_seen(
+        "hs071",
+        &native,
+        InteriorPointIterationEvent::FilterAccepted,
+    );
+    assert_native_event_seen(
+        "hs071",
+        &native,
+        InteriorPointIterationEvent::BarrierParameterUpdated,
+    );
 }
 
 #[rstest]
@@ -1082,6 +1335,26 @@ fn compare_native_and_ipopt_on_hanging_chain(
             max_regularization_log_gap: 0.05,
         },
     );
+    assert_native_event_seen(
+        "hanging_chain",
+        &native,
+        InteriorPointIterationEvent::LongLineSearch,
+    );
+    assert_native_event_seen(
+        "hanging_chain",
+        &native,
+        InteriorPointIterationEvent::FilterAccepted,
+    );
+    assert_native_event_seen(
+        "hanging_chain",
+        &native,
+        InteriorPointIterationEvent::SecondOrderCorrectionAttempted,
+    );
+    assert_native_event_seen(
+        "hanging_chain",
+        &native,
+        InteriorPointIterationEvent::AdaptiveRegularizationUsed,
+    );
 }
 
 #[test]
@@ -1091,6 +1364,69 @@ fn compare_native_and_ipopt_on_box_bounds_regression() {
     let native = solve_native_ok(&problem, &[-10.0, 10.0], &[]);
     let ipopt = solve_ipopt_ok(&problem, &[-10.0, 10.0], &[]);
     assert_native_matches_ipopt("box_bounds_quadratic", None, &native, &ipopt, 1e-4, 1e-4);
+}
+
+#[test]
+fn compare_native_and_ipopt_on_fixed_variable_quadratic() {
+    skip_without_native_spral!();
+    let problem = FixedVariableQuadraticProblem;
+    let native = solve_native_ok(&problem, &[4.0, -5.0], &[]);
+    let ipopt = solve_ipopt_ok(&problem, &[4.0, -5.0], &[]);
+    assert_abs_diff_eq!(native.x[0], 1.0, epsilon = 1e-12);
+    assert_abs_diff_eq!(ipopt.x[0], 1.0, epsilon = 1e-12);
+    assert_native_matches_ipopt(
+        "fixed_variable_quadratic",
+        None,
+        &native,
+        &ipopt,
+        1e-6,
+        1e-6,
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_on_square_equality_quadratic() {
+    skip_without_native_spral!();
+    let problem = SquareEqualityQuadraticProblem;
+    let native = solve_native_ok(&problem, &[8.0, -3.0], &[]);
+    let ipopt = solve_ipopt_ok(&problem, &[8.0, -3.0], &[]);
+    assert_abs_diff_eq!(native.x[0], 1.0, epsilon = 1e-8);
+    assert_abs_diff_eq!(native.x[1], 2.0, epsilon = 1e-8);
+    assert_abs_diff_eq!(ipopt.x[0], 1.0, epsilon = 1e-8);
+    assert_abs_diff_eq!(ipopt.x[1], 2.0, epsilon = 1e-8);
+    assert_native_matches_ipopt(
+        "square_equality_quadratic",
+        None,
+        &native,
+        &ipopt,
+        1e-6,
+        1e-6,
+    );
+
+    let initial_state = solve_nlp_interior_point(
+        &problem,
+        &[8.0, -3.0],
+        &[],
+        &native_options_with(|options| {
+            options.max_iters = 0;
+        }),
+    );
+    match initial_state {
+        Err(InteriorPointSolveError::MaxIterations { context, .. }) => {
+            let final_state = context
+                .final_state
+                .as_ref()
+                .expect("max-iteration failure should retain initialized square state");
+            assert!(
+                final_state
+                    .equality_multipliers
+                    .as_ref()
+                    .is_some_and(|multipliers| multipliers.iter().all(|value| *value == 0.0)),
+                "NLIP should mirror IpDefaultIterateInitializer::least_square_mults and zero square-problem initial y_c"
+            );
+        }
+        other => panic!("square equality max-iteration probe mismatch: {other:?}"),
+    }
 }
 
 #[test]
@@ -1120,6 +1456,775 @@ fn compare_native_and_ipopt_on_linearly_constrained_quadratic_trace() {
             max_regularization_log_gap: 1.0,
         },
     );
+}
+
+#[test]
+fn compare_native_and_ipopt_with_mu_based_bound_multiplier_init() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        native_options_with(|options| {
+            options.bound_mult_init_method = InteriorPointBoundMultiplierInitMethod::MuBased;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        ipopt_options_with(|options| {
+            options
+                .raw_options
+                .push(IpoptRawOption::text("bound_mult_init_method", "mu-based"));
+        }),
+    );
+    assert_native_matches_ipopt(
+        "linearly_constrained_quadratic_bound_mult_mu_based",
+        None,
+        &native,
+        &ipopt,
+        1e-6,
+        1e-6,
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_with_disabled_constraint_multiplier_init() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        native_options_with(|options| {
+            // IpDefaultIterateInitializer::least_square_mults sets y_c/y_d to
+            // zero when constr_mult_init_max <= 0 instead of using the bound
+            // multiplier initialization as a substitute.
+            options.constr_mult_init_max = 0.0;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        ipopt_options_with(|options| {
+            options
+                .raw_options
+                .push(IpoptRawOption::number("constr_mult_init_max", 0.0));
+        }),
+    );
+    assert_native_matches_ipopt(
+        "linearly_constrained_quadratic_constr_mult_init_disabled",
+        None,
+        &native,
+        &ipopt,
+        1e-6,
+        1e-6,
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_with_constraint_multiplier_init_rejected_by_cap() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        native_options_with(|options| {
+            // IpDefaultIterateInitializer::least_square_mults computes
+            // y_c/y_d, then discards them when max-norm exceeds this cap.
+            options.constr_mult_init_max = 1.0e-12;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        ipopt_options_with(|options| {
+            options
+                .raw_options
+                .push(IpoptRawOption::number("constr_mult_init_max", 1.0e-12));
+        }),
+    );
+    assert_native_matches_ipopt(
+        "linearly_constrained_quadratic_constr_mult_init_cap",
+        None,
+        &native,
+        &ipopt,
+        1e-6,
+        1e-6,
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_with_nondefault_initializer_pushes_and_multiplier_value() {
+    skip_without_native_spral!();
+
+    let bound_problem = BoundConstrainedQuadraticProblem;
+    let native_bound = solve_native_with_options_ok(
+        &bound_problem,
+        &[-10.0, 10.0],
+        &[],
+        native_options_with(|options| {
+            options.bound_push = 5e-2;
+            options.bound_frac = 2e-2;
+            options.bound_mult_init_val = 2.5;
+        }),
+    );
+    let ipopt_bound = solve_ipopt_with_options_ok(
+        &bound_problem,
+        &[-10.0, 10.0],
+        &[],
+        ipopt_options_with(|options| {
+            options
+                .raw_options
+                .push(IpoptRawOption::number("bound_push", 5e-2));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("bound_frac", 2e-2));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("bound_mult_init_val", 2.5));
+        }),
+    );
+    assert_native_matches_ipopt(
+        "box_bounds_quadratic_initializer_pushes",
+        None,
+        &native_bound,
+        &ipopt_bound,
+        1e-4,
+        1e-4,
+    );
+
+    let slack_problem = LinearlyConstrainedQuadraticProblem;
+    let native_slack = solve_native_with_options_ok(
+        &slack_problem,
+        &[0.1, 0.9],
+        &[],
+        native_options_with(|options| {
+            options.slack_bound_push = 5e-2;
+            options.slack_bound_frac = 2e-2;
+            options.bound_mult_init_val = 2.5;
+        }),
+    );
+    let ipopt_slack = solve_ipopt_with_options_ok(
+        &slack_problem,
+        &[0.1, 0.9],
+        &[],
+        ipopt_options_with(|options| {
+            options
+                .raw_options
+                .push(IpoptRawOption::number("slack_bound_push", 5e-2));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("slack_bound_frac", 2e-2));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("bound_mult_init_val", 2.5));
+        }),
+    );
+    assert_native_matches_ipopt(
+        "linearly_constrained_quadratic_initializer_pushes",
+        None,
+        &native_slack,
+        &ipopt_slack,
+        1e-6,
+        1e-6,
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_with_zero_damping_and_bound_relaxation_disabled() {
+    skip_without_native_spral!();
+    let problem = BoundConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[-10.0, 10.0],
+        &[],
+        native_options_with(|options| {
+            options.kappa_d = 0.0;
+            options.bound_relax_factor = 0.0;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[-10.0, 10.0],
+        &[],
+        ipopt_options_with(|options| {
+            options.kappa_d = 0.0;
+            options
+                .raw_options
+                .push(IpoptRawOption::number("bound_relax_factor", 0.0));
+        }),
+    );
+    assert_native_matches_ipopt(
+        "box_bounds_quadratic_zero_damping_no_relaxation",
+        None,
+        &native,
+        &ipopt,
+        1e-4,
+        1e-4,
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_with_bound_multiplier_safeguard() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        native_options_with(|options| {
+            // IpoptAlgorithm::correct_bound_multiplier is normally dormant
+            // because kappa_sigma is huge. Tightening it forces the accepted
+            // trial multipliers back onto the mu/slack complementarity band.
+            options.kappa_sigma = 1.0;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        ipopt_options_with(|options| {
+            options
+                .raw_options
+                .push(IpoptRawOption::number("kappa_sigma", 1.0));
+        }),
+    );
+    assert_native_event_seen(
+        "linearly_constrained_quadratic_kappa_sigma",
+        &native,
+        InteriorPointIterationEvent::BoundMultiplierSafeguardApplied,
+    );
+    assert_native_matches_ipopt(
+        "linearly_constrained_quadratic_kappa_sigma",
+        None,
+        &native,
+        &ipopt,
+        1e-6,
+        1e-6,
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_with_globalization_option_toggles() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        native_options_with(|options| {
+            options.max_iters = 200;
+            options.mu_allow_fast_monotone_decrease = false;
+            options.second_order_correction = false;
+            options.max_second_order_corrections = 0;
+            options.watchdog_shortened_iter_trigger = 0;
+            options.tiny_step_tol = 0.0;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        ipopt_options_with(|options| {
+            options.max_iters = 200;
+            options.raw_options.push(IpoptRawOption::text(
+                "mu_allow_fast_monotone_decrease",
+                "no",
+            ));
+            options
+                .raw_options
+                .push(IpoptRawOption::integer("max_soc", 0));
+            options.raw_options.push(IpoptRawOption::integer(
+                "watchdog_shortened_iter_trigger",
+                0,
+            ));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("tiny_step_tol", 0.0));
+        }),
+    );
+    assert_native_matches_ipopt(
+        "linearly_constrained_quadratic_globalization_toggles",
+        None,
+        &native,
+        &ipopt,
+        1e-6,
+        1e-6,
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_with_watchdog_trigger_profile() {
+    skip_without_native_spral!();
+    let backend = CallbackBackend::Aot;
+    let problem = build_problem_ok(hanging_chain_problem(backend), backend);
+    let x0 = hanging_chain_initial_guess();
+    let native = solve_native_with_options_ok(
+        &problem,
+        &x0,
+        &[],
+        native_options_with(|options| {
+            // BacktrackingLineSearch::StartWatchDog is only reached after
+            // repeated shortened non-tiny line searches. Lower the trigger on
+            // the existing hanging-chain witness rather than changing the NLP.
+            options.watchdog_shortened_iter_trigger = 3;
+            options.watchdog_trial_iter_max = 3;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &x0,
+        &[],
+        ipopt_options_with(|options| {
+            options.raw_options.push(IpoptRawOption::integer(
+                "watchdog_shortened_iter_trigger",
+                3,
+            ));
+            options
+                .raw_options
+                .push(IpoptRawOption::integer("watchdog_trial_iter_max", 3));
+        }),
+    );
+    assert_native_event_seen(
+        "hanging_chain_watchdog",
+        &native,
+        InteriorPointIterationEvent::WatchdogArmed,
+    );
+    assert_native_matches_ipopt(
+        "hanging_chain_watchdog",
+        Some(backend),
+        &native,
+        &ipopt,
+        1e-3,
+        1e-4,
+    );
+    assert_accepted_trace_parity(
+        "hanging_chain_watchdog",
+        &native,
+        &ipopt,
+        AcceptedTraceParityTolerances {
+            max_iteration_gap: 0,
+            max_step_tag_mismatches: 0,
+            max_primal_log_gap: 0.05,
+            max_dual_log_gap: 0.05,
+            max_mu_log_gap: 0.05,
+            max_regularization_log_gap: 0.05,
+        },
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_with_nondefault_line_search_reduction_factor() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        native_options_with(|options| {
+            options.line_search_beta = 0.25;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        ipopt_options_with(|options| {
+            options
+                .raw_options
+                .push(IpoptRawOption::number("alpha_red_factor", 0.25));
+        }),
+    );
+    assert_native_matches_ipopt(
+        "linearly_constrained_quadratic_alpha_red_factor",
+        None,
+        &native,
+        &ipopt,
+        1e-6,
+        1e-6,
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_with_positive_mu_target() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        native_options_with(|options| {
+            options.mu_target = 1e-4;
+            options.complementarity_tol = 5e-4;
+            options.overall_tol = 5e-4;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        ipopt_options_with(|options| {
+            options.tol = 5e-4;
+            options.complementarity_tol = Some(5e-4);
+            options
+                .raw_options
+                .push(IpoptRawOption::number("mu_target", 1e-4));
+        }),
+    );
+    assert_native_matches_ipopt_with_final_tolerances(
+        "linearly_constrained_quadratic_positive_mu_target",
+        None,
+        &native,
+        &ipopt,
+        FinalParityTolerances {
+            x: 1e-4,
+            objective: 1e-4,
+            primal: 5e-4,
+            native_dual: 5e-4,
+            ipopt_dual: 5e-4,
+            complementarity: 5e-4,
+        },
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_alpha_for_y_option_profiles() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    for (profile_name, strategy, ipopt_value, alpha_for_y_tol) in [
+        (
+            "bound_mult",
+            InteriorPointAlphaForYStrategy::BoundMultiplier,
+            "bound-mult",
+            None,
+        ),
+        ("min", InteriorPointAlphaForYStrategy::Min, "min", None),
+        ("max", InteriorPointAlphaForYStrategy::Max, "max", None),
+        ("full", InteriorPointAlphaForYStrategy::Full, "full", None),
+        (
+            "primal_and_full",
+            InteriorPointAlphaForYStrategy::PrimalAndFull,
+            "primal-and-full",
+            None,
+        ),
+        (
+            "primal_and_full_strict_tol",
+            InteriorPointAlphaForYStrategy::PrimalAndFull,
+            "primal-and-full",
+            Some(0.0),
+        ),
+        (
+            "dual_and_full",
+            InteriorPointAlphaForYStrategy::DualAndFull,
+            "dual-and-full",
+            None,
+        ),
+        (
+            "dual_and_full_strict_tol",
+            InteriorPointAlphaForYStrategy::DualAndFull,
+            "dual-and-full",
+            Some(0.0),
+        ),
+    ] {
+        let native = solve_native_with_options_ok(
+            &problem,
+            &[0.1, 0.9],
+            &[],
+            native_options_with(|options| {
+                options.alpha_for_y = strategy;
+                if let Some(value) = alpha_for_y_tol {
+                    options.alpha_for_y_tol = value;
+                }
+            }),
+        );
+        let ipopt = solve_ipopt_with_options_ok(
+            &problem,
+            &[0.1, 0.9],
+            &[],
+            ipopt_options_with(|options| {
+                options
+                    .raw_options
+                    .push(IpoptRawOption::text("alpha_for_y", ipopt_value));
+                if let Some(value) = alpha_for_y_tol {
+                    options
+                        .raw_options
+                        .push(IpoptRawOption::number("alpha_for_y_tol", value));
+                }
+            }),
+        );
+        let problem_name = format!("linearly_constrained_quadratic_alpha_for_y_{profile_name}");
+        assert_native_matches_ipopt(&problem_name, None, &native, &ipopt, 1e-6, 1e-6);
+    }
+}
+
+#[test]
+fn compare_native_and_ipopt_max_iterations_status() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_nlp_interior_point(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        &native_options_with(|options| {
+            options.max_iters = 0;
+        }),
+    );
+    let ipopt = solve_nlp_ipopt(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        &ipopt_options_with(|options| {
+            options.max_iters = 0;
+        }),
+    );
+
+    match native {
+        Err(InteriorPointSolveError::MaxIterations {
+            iterations,
+            context,
+        }) => {
+            assert_eq!(iterations, 0);
+            let final_state = context
+                .final_state
+                .as_ref()
+                .expect("native max-iteration failure should retain iteration-0 state");
+            assert_eq!(final_state.iteration, 0);
+            assert_eq!(final_state.phase, InteriorPointIterationPhase::Initial);
+            assert!(
+                final_state
+                    .events
+                    .contains(&InteriorPointIterationEvent::MaxIterationsReached),
+                "native iteration-0 state should record max-iteration event: {:?}",
+                final_state.events
+            );
+        }
+        other => panic!("native max-iteration status mismatch: {other:?}"),
+    }
+
+    match ipopt {
+        Err(IpoptSolveError::Solve {
+            status,
+            iterations,
+            snapshots,
+            partial_solution,
+            ..
+        }) => {
+            assert_eq!(status, IpoptRawStatus::MaximumIterationsExceeded);
+            assert_eq!(iterations, 0);
+            assert!(
+                partial_solution.is_some(),
+                "IPOPT max-iteration failure should retain a partial solution"
+            );
+            assert!(
+                snapshots
+                    .iter()
+                    .any(|snapshot| snapshot.phase == optimization::IpoptIterationPhase::Regular),
+                "IPOPT max-iteration failure should retain an initial snapshot: {snapshots:?}"
+            );
+        }
+        other => panic!("IPOPT max-iteration status mismatch: {other:?}"),
+    }
+}
+
+#[test]
+fn compare_native_and_ipopt_max_iterations_after_accepted_step_status() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_nlp_interior_point(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        &native_options_with(|options| {
+            options.max_iters = 1;
+        }),
+    );
+    let ipopt = solve_nlp_ipopt(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        &ipopt_options_with(|options| {
+            options.max_iters = 1;
+        }),
+    );
+
+    match native {
+        Err(InteriorPointSolveError::MaxIterations {
+            iterations,
+            context,
+        }) => {
+            assert_eq!(iterations, 1);
+            let final_state = context
+                .final_state
+                .as_ref()
+                .expect("native max-iteration failure should retain last accepted state");
+            assert_eq!(final_state.iteration, 0);
+            assert_eq!(final_state.phase, InteriorPointIterationPhase::AcceptedStep);
+            assert!(
+                final_state
+                    .events
+                    .contains(&InteriorPointIterationEvent::MaxIterationsReached),
+                "native accepted state should record max-iteration event: {:?}",
+                final_state.events
+            );
+        }
+        other => panic!("native accepted-step max-iteration status mismatch: {other:?}"),
+    }
+
+    match ipopt {
+        Err(IpoptSolveError::Solve {
+            status,
+            iterations,
+            snapshots,
+            partial_solution,
+            ..
+        }) => {
+            assert_eq!(status, IpoptRawStatus::MaximumIterationsExceeded);
+            assert_eq!(iterations, 1);
+            assert!(
+                partial_solution.is_some(),
+                "IPOPT accepted-step max-iteration failure should retain a partial solution"
+            );
+            assert!(
+                snapshots.iter().any(|snapshot| snapshot.iteration == 1
+                    && snapshot.phase == optimization::IpoptIterationPhase::Regular),
+                "IPOPT accepted-step max-iteration failure should retain iteration-1 diagnostics: {snapshots:?}"
+            );
+        }
+        other => panic!("IPOPT accepted-step max-iteration status mismatch: {other:?}"),
+    }
+}
+
+#[test]
+fn compare_native_and_ipopt_acceptable_termination_status() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        native_options_with(|options| {
+            options.overall_tol = 1e-14;
+            options.dual_tol = 1e-14;
+            options.constraint_tol = 1e-14;
+            options.complementarity_tol = 1e-14;
+            options.acceptable_tol = 1e-6;
+            options.acceptable_dual_inf_tol = 1e-6;
+            options.acceptable_constr_viol_tol = 1e-6;
+            options.acceptable_compl_inf_tol = 1e-6;
+            options.acceptable_obj_change_tol = 1e20;
+            options.acceptable_iter = 1;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        ipopt_options_with(|options| {
+            options.tol = 1e-14;
+            options.dual_tol = Some(1e-14);
+            options.constraint_tol = Some(1e-14);
+            options.complementarity_tol = Some(1e-14);
+            options.acceptable_tol = Some(1e-6);
+            options
+                .raw_options
+                .push(IpoptRawOption::integer("acceptable_iter", 1));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("acceptable_dual_inf_tol", 1e-6));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("acceptable_constr_viol_tol", 1e-6));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("acceptable_compl_inf_tol", 1e-6));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("acceptable_obj_change_tol", 1e20));
+        }),
+    );
+
+    assert_eq!(native.termination, InteriorPointTermination::Acceptable);
+    assert_eq!(native.status_kind, InteriorPointStatusKind::Warning);
+    assert_eq!(ipopt.status, IpoptRawStatus::SolvedToAcceptableLevel);
+    assert_native_matches_ipopt(
+        "linearly_constrained_quadratic_acceptable_termination",
+        None,
+        &native,
+        &ipopt,
+        1e-6,
+        1e-6,
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_forced_tiny_step_acceptance() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        native_options_with(|options| {
+            options.tiny_step_tol = 1e6;
+            options.tiny_step_y_tol = 1e6;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        ipopt_options_with(|options| {
+            options
+                .raw_options
+                .push(IpoptRawOption::number("tiny_step_tol", 1e6));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("tiny_step_y_tol", 1e6));
+        }),
+    );
+
+    assert!(
+        native.snapshots.iter().any(|snapshot| snapshot
+            .events
+            .contains(&InteriorPointIterationEvent::TinyStep)),
+        "forced tiny-step profile should exercise the NLIP tiny-step branch"
+    );
+    assert_native_matches_ipopt(
+        "linearly_constrained_quadratic_forced_tiny_step",
+        None,
+        &native,
+        &ipopt,
+        1e-6,
+        1e-6,
+    );
+}
+
+#[test]
+fn native_rejects_unported_least_square_dual_initialization() {
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let result = solve_nlp_interior_point(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        &native_options_with(|options| {
+            options.least_square_init_duals = true;
+        }),
+    );
+    match result {
+        Err(InteriorPointSolveError::InvalidInput(message)) => {
+            assert!(
+                message.contains("DefaultIterateInitializer::CalculateLeastSquareDuals"),
+                "unexpected unsupported-branch error: {message}"
+            );
+        }
+        other => panic!("least_square_init_duals should be guarded until ported: {other:?}"),
+    }
 }
 
 #[test]

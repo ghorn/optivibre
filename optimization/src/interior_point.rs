@@ -10519,6 +10519,11 @@ fn validate_interior_point_options(
             options.overall_scale_max
         )));
     }
+    if options.least_square_init_duals {
+        return Err(InteriorPointSolveError::InvalidInput(
+            "least_square_init_duals mirrors IPOPT DefaultIterateInitializer::CalculateLeastSquareDuals and is not implemented in NLIP yet".into(),
+        ));
+    }
     if let Some(linear_debug) = options.linear_debug.as_ref()
         && linear_debug
             .compare_solvers
@@ -10681,8 +10686,11 @@ where
             }
         }
     }
-    let mut lambda_ineq = z.clone();
-    if (equality_count > 0 || augmented_inequality_count > 0) && options.constr_mult_init_max > 0.0
+    let mut lambda_ineq = vec![0.0; augmented_inequality_count];
+    let square_equality_problem = equality_count == fixed_variables.reduced_dimension();
+    if !square_equality_problem
+        && (equality_count > 0 || augmented_inequality_count > 0)
+        && options.constr_mult_init_max > 0.0
     {
         let mut initial_ls_gradient = initial_state.gradient.clone();
         add_native_bound_multiplier_terms(&mut initial_ls_gradient, &bounds, &z_lower, &z_upper);

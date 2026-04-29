@@ -15,6 +15,13 @@ const IPOPT_URL: &str =
     "https://github.com/coin-or/Ipopt/archive/4667204c76e534d3e4df6b1462f258a4f9c681bd.tar.gz";
 const IPOPT_SHA256: &str = "ca552a9ca9d457fd4ff72405a5fee3a70e8a52016d2d5dba58453980db66c667";
 const IPOPT_SPRAL_PARITY_PATCH_VERSION: &str = "optivibre-ipopt-spral-dump-v12";
+const IPOPT_LLVM_COVERAGE_ENV: &str = "IPOPT_SRC_LLVM_COVERAGE";
+const IPOPT_LLVM_COVERAGE_CC_ENV: &str = "IPOPT_SRC_LLVM_COVERAGE_CC";
+const IPOPT_LLVM_COVERAGE_CXX_ENV: &str = "IPOPT_SRC_LLVM_COVERAGE_CXX";
+const IPOPT_LLVM_COVERAGE_CXXFLAGS_ENV: &str = "IPOPT_SRC_LLVM_COVERAGE_CXXFLAGS";
+const IPOPT_LLVM_COVERAGE_LDFLAGS_ENV: &str = "IPOPT_SRC_LLVM_COVERAGE_LDFLAGS";
+const IPOPT_LLVM_COVERAGE_FLAGS: &str = "-fprofile-instr-generate -fcoverage-mapping";
+const IPOPT_LLVM_COVERAGE_BUILD_VERSION: &str = "llvm-cov-v2";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -32,6 +39,11 @@ fn main() {
         "LIBRARY_PATH",
         "DYLD_LIBRARY_PATH",
         "DYLD_FALLBACK_LIBRARY_PATH",
+        IPOPT_LLVM_COVERAGE_ENV,
+        IPOPT_LLVM_COVERAGE_CC_ENV,
+        IPOPT_LLVM_COVERAGE_CXX_ENV,
+        IPOPT_LLVM_COVERAGE_CXXFLAGS_ENV,
+        IPOPT_LLVM_COVERAGE_LDFLAGS_ENV,
     ] {
         println!("cargo:rerun-if-env-changed={var}");
     }
@@ -42,9 +54,18 @@ fn main() {
     println!("cargo:rustc-env=IPOPT_SRC_SYSTEM_SOLVER_MATH_FALLBACKS=false");
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set"));
+    let llvm_coverage = llvm_coverage_requested();
     let source_dir = out_dir.join("sources");
-    let build_dir = out_dir.join("build").join("ipopt");
-    let install_dir = out_dir.join("install");
+    let build_dir = out_dir.join("build").join(if llvm_coverage {
+        "ipopt-llvm-cov"
+    } else {
+        "ipopt"
+    });
+    let install_dir = out_dir.join(if llvm_coverage {
+        "install-llvm-cov"
+    } else {
+        "install"
+    });
     fs::create_dir_all(&source_dir).expect("failed to create IPOPT source directory");
     fs::create_dir_all(&build_dir).expect("failed to create IPOPT build directory");
     fs::create_dir_all(&install_dir).expect("failed to create IPOPT install directory");
@@ -63,11 +84,15 @@ fn main() {
     patch_ipopt_tsym_linear_solver(&source);
     patch_ipopt_pdfull_space_solver(&source);
     let libipopt = install_dir.join("lib").join(static_archive_name("ipopt"));
-    let parity_patch_marker = install_dir.join(format!(".{IPOPT_SPRAL_PARITY_PATCH_VERSION}"));
+    let parity_patch_marker =
+        install_dir.join(format!(".{}", parity_patch_marker_name(llvm_coverage)));
     if !libipopt.exists() || !parity_patch_marker.exists() {
-        configure_and_build_ipopt(&source, &build_dir, &install_dir, &spral);
-        fs::write(&parity_patch_marker, IPOPT_SPRAL_PARITY_PATCH_VERSION)
-            .expect("failed to write IPOPT SPRAL parity patch marker");
+        configure_and_build_ipopt(&source, &build_dir, &install_dir, &spral, llvm_coverage);
+        fs::write(
+            &parity_patch_marker,
+            parity_patch_marker_name(llvm_coverage),
+        )
+        .expect("failed to write IPOPT SPRAL parity patch marker");
     }
 
     assert_inside(&out_dir, &libipopt, "IPOPT archive");
@@ -189,6 +214,7 @@ fn configure_and_build_ipopt(
     build_dir: &Path,
     install_dir: &Path,
     spral: &SpralMetadata,
+    llvm_coverage: bool,
 ) {
     if build_dir.exists() {
         fs::remove_dir_all(build_dir).expect("failed to clear stale IPOPT build directory");
@@ -214,19 +240,19 @@ fn configure_and_build_ipopt(
         .arg(format!("--with-spral-cflags={}", spral.spral_cflags))
         .arg(format!("--with-spral-lflags={}", spral.spral_lflags))
         .arg(format!("--with-lapack-lflags={}", spral.lapack_lflags));
-    configure_fail_closed_env(&mut command, &empty_pkg_config, spral);
+    configure_fail_closed_env(&mut command, &empty_pkg_config, spral, llvm_coverage);
     run(&mut command, "IPOPT configure");
 
     let make = env::var("MAKE").unwrap_or_else(|_| "make".to_string());
     let jobs = env::var("NUM_JOBS").unwrap_or_else(|_| "1".to_string());
     let mut build = Command::new(&make);
     build.current_dir(build_dir).arg(format!("-j{jobs}"));
-    configure_fail_closed_env(&mut build, &empty_pkg_config, spral);
+    configure_fail_closed_env(&mut build, &empty_pkg_config, spral, llvm_coverage);
     run(&mut build, "IPOPT make");
 
     let mut install = Command::new(&make);
     install.current_dir(build_dir).arg("install");
-    configure_fail_closed_env(&mut install, &empty_pkg_config, spral);
+    configure_fail_closed_env(&mut install, &empty_pkg_config, spral, llvm_coverage);
     run(&mut install, "IPOPT make install");
 }
 
@@ -234,6 +260,7 @@ fn configure_fail_closed_env(
     command: &mut Command,
     empty_pkg_config: &Path,
     spral: &SpralMetadata,
+    llvm_coverage: bool,
 ) {
     command
         .env("PKG_CONFIG_LIBDIR", empty_pkg_config)
@@ -242,10 +269,87 @@ fn configure_fail_closed_env(
         .env_remove("LIBRARY_PATH")
         .env_remove("DYLD_LIBRARY_PATH")
         .env_remove("DYLD_FALLBACK_LIBRARY_PATH")
-        .env("CC", &spral.cc)
-        .env("CXX", &spral.cxx)
+        .env(
+            "CC",
+            coverage_tool_or_spral(IPOPT_LLVM_COVERAGE_CC_ENV, &spral.cc, llvm_coverage),
+        )
+        .env(
+            "CXX",
+            coverage_tool_or_spral(IPOPT_LLVM_COVERAGE_CXX_ENV, &spral.cxx, llvm_coverage),
+        )
         .env("FC", &spral.fc)
         .env("F77", &spral.fc);
+    if llvm_coverage {
+        command.env(
+            "CFLAGS",
+            combined_flag_env("CFLAGS", IPOPT_LLVM_COVERAGE_FLAGS, &[]),
+        );
+        command.env(
+            "CXXFLAGS",
+            combined_flag_env(
+                "CXXFLAGS",
+                IPOPT_LLVM_COVERAGE_FLAGS,
+                &[IPOPT_LLVM_COVERAGE_CXXFLAGS_ENV],
+            ),
+        );
+        command.env(
+            "LDFLAGS",
+            combined_flag_env(
+                "LDFLAGS",
+                IPOPT_LLVM_COVERAGE_FLAGS,
+                &[IPOPT_LLVM_COVERAGE_LDFLAGS_ENV],
+            ),
+        );
+    }
+}
+
+fn coverage_tool_or_spral(env_name: &str, fallback: &str, llvm_coverage: bool) -> String {
+    if llvm_coverage && let Ok(value) = env::var(env_name) {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    fallback.to_string()
+}
+
+fn llvm_coverage_requested() -> bool {
+    env::var(IPOPT_LLVM_COVERAGE_ENV).ok().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn parity_patch_marker_name(llvm_coverage: bool) -> String {
+    if llvm_coverage {
+        format!("{IPOPT_SPRAL_PARITY_PATCH_VERSION}-{IPOPT_LLVM_COVERAGE_BUILD_VERSION}")
+    } else {
+        IPOPT_SPRAL_PARITY_PATCH_VERSION.to_string()
+    }
+}
+
+fn combined_flag_env(base_name: &str, required_flags: &str, optional_sources: &[&str]) -> String {
+    let mut value = env::var(base_name).unwrap_or_default();
+    append_flags(&mut value, required_flags);
+    for source in optional_sources {
+        if let Ok(flags) = env::var(source) {
+            append_flags(&mut value, flags.trim());
+        }
+    }
+    value
+}
+
+fn append_flags(value: &mut String, flags: &str) {
+    let flags = flags.trim();
+    if flags.is_empty() {
+        return;
+    }
+    if !value.trim().is_empty() {
+        value.push(' ');
+    }
+    value.push_str(flags);
 }
 
 fn download_and_unpack(

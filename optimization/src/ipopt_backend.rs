@@ -121,6 +121,44 @@ impl IpoptSpralScaling {
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+pub enum IpoptRawOptionValue {
+    Number(f64),
+    Integer(i32),
+    Text(String),
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct IpoptRawOption {
+    pub name: String,
+    pub value: IpoptRawOptionValue,
+}
+
+impl IpoptRawOption {
+    pub fn number(name: impl Into<String>, value: f64) -> Self {
+        Self {
+            name: name.into(),
+            value: IpoptRawOptionValue::Number(value),
+        }
+    }
+
+    pub fn integer(name: impl Into<String>, value: i32) -> Self {
+        Self {
+            name: name.into(),
+            value: IpoptRawOptionValue::Integer(value),
+        }
+    }
+
+    pub fn text(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: IpoptRawOptionValue::Text(value.into()),
+        }
+    }
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IpoptProvenance {
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
@@ -190,6 +228,11 @@ pub struct IpoptOptions {
     pub spral_pivot_tolerance_max: Option<f64>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub spral_use_gpu: Option<bool>,
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub raw_options: Vec<IpoptRawOption>,
     pub capture_provenance: bool,
 }
 
@@ -215,6 +258,7 @@ impl Default for IpoptOptions {
             spral_threshold_pivot_u: None,
             spral_pivot_tolerance_max: None,
             spral_use_gpu: None,
+            raw_options: Vec::new(),
             capture_provenance: false,
         }
     }
@@ -222,7 +266,7 @@ impl Default for IpoptOptions {
 
 pub fn format_ipopt_settings_summary(options: &IpoptOptions) -> String {
     format!(
-        "mu_strategy={}; nlp_scaling={}; kappa_d={:.1e}; acceptable_tol={}; print_level={}; banner={}; linear_solver={}; spral_pivot={}; spral_order={}; spral_scaling={}; spral_small={}; spral_u={}; spral_umax={}; spral_gpu={}; provenance={}",
+        "mu_strategy={}; nlp_scaling={}; kappa_d={:.1e}; acceptable_tol={}; print_level={}; banner={}; linear_solver={}; spral_pivot={}; spral_order={}; spral_scaling={}; spral_small={}; spral_u={}; spral_umax={}; spral_gpu={}; raw_options={}; provenance={}",
         options.mu_strategy.as_str(),
         options
             .nlp_scaling_method
@@ -266,6 +310,7 @@ pub fn format_ipopt_settings_summary(options: &IpoptOptions) -> String {
             .spral_use_gpu
             .map(|value| if value { "yes" } else { "no" }.to_string())
             .unwrap_or_else(|| "default".to_string()),
+        options.raw_options.len(),
         if options.capture_provenance {
             "on"
         } else {
@@ -1137,6 +1182,19 @@ where
     }
     if let Some(value) = options.spral_use_gpu {
         set_ipopt_option(solver, "spral_use_gpu", if value { "yes" } else { "no" })?;
+    }
+    for raw_option in &options.raw_options {
+        match &raw_option.value {
+            IpoptRawOptionValue::Number(value) => {
+                set_ipopt_option(solver, raw_option.name.as_str(), *value)?;
+            }
+            IpoptRawOptionValue::Integer(value) => {
+                set_ipopt_option(solver, raw_option.name.as_str(), *value)?;
+            }
+            IpoptRawOptionValue::Text(value) => {
+                set_ipopt_option(solver, raw_option.name.as_str(), value.as_str())?;
+            }
+        }
     }
     if options.suppress_banner {
         set_ipopt_option(solver, "sb", "yes")?;

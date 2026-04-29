@@ -36,6 +36,7 @@ pub use filter::{
     FilterInfo as SqpFilterInfo,
 };
 pub use interior_point::{
+    InteriorPointAlphaForYStrategy, InteriorPointBoundMultiplierInitMethod,
     InteriorPointBoundaryLimiter, InteriorPointBoundaryLimiterKind,
     InteriorPointDirectionDiagnostics, InteriorPointFailureContext, InteriorPointIterationEvent,
     InteriorPointIterationPhase, InteriorPointIterationSnapshot, InteriorPointIterationTiming,
@@ -57,9 +58,10 @@ pub use ipopt::SolveStatus as IpoptSolveStatus;
 pub use ipopt_backend::{
     IpoptIterationPhase, IpoptIterationSnapshot, IpoptIterationTiming, IpoptLinearSolver,
     IpoptMuStrategy, IpoptNlpScalingMethod, IpoptOptions, IpoptPartialSolution, IpoptProfiling,
-    IpoptProvenance, IpoptRawStatus, IpoptSolveError, IpoptSpralOrdering, IpoptSpralPivotMethod,
-    IpoptSpralScaling, IpoptSummary, capture_ipopt_provenance, format_ipopt_settings_summary,
-    solve_nlp_ipopt, solve_nlp_ipopt_with_callback,
+    IpoptProvenance, IpoptRawOption, IpoptRawOptionValue, IpoptRawStatus, IpoptSolveError,
+    IpoptSpralOrdering, IpoptSpralPivotMethod, IpoptSpralScaling, IpoptSummary,
+    capture_ipopt_provenance, format_ipopt_settings_summary, solve_nlp_ipopt,
+    solve_nlp_ipopt_with_callback,
 };
 pub use symbolic::{
     ConstraintBounds, DynamicCompiledJitNlp, DynamicSymbolicNlp, RuntimeBoundedJitNlp,
