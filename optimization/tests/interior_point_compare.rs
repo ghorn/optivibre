@@ -2233,6 +2233,80 @@ fn compare_native_and_ipopt_with_lowercase_watchdog_trial_profile() {
     );
 }
 
+fn run_watchdog_tiny_stop_sweep_case<P: CompiledNlpProblem>(
+    case_name: &str,
+    problem: &P,
+    x0: &[f64],
+    parameters: &[ParameterMatrix<'_>],
+    profile: WatchdogActivationProfile,
+    tiny_step_tol: f64,
+) {
+    let native = solve_nlp_interior_point_with_callback(
+        problem,
+        x0,
+        parameters,
+        &native_options_with(|options| {
+            profile.apply_native(options);
+            options.tiny_step_tol = tiny_step_tol;
+        }),
+        |_| {},
+    );
+    let ipopt = solve_nlp_ipopt(
+        problem,
+        x0,
+        parameters,
+        &ipopt_options_with(|options| {
+            profile.apply_ipopt(options);
+            options.print_level = 0;
+            options
+                .raw_options
+                .push(IpoptRawOption::number("tiny_step_tol", tiny_step_tol));
+        }),
+    );
+    let native = match native {
+        Ok(summary) => summary,
+        Err(error) => {
+            println!(
+                "[watchdog-tiny-sweep] {case_name}/{} tol={tiny_step_tol:.1e} native_failed={error:?}",
+                profile.label()
+            );
+            return;
+        }
+    };
+    let ipopt = match ipopt {
+        Ok(summary) => summary,
+        Err(error) => {
+            println!(
+                "[watchdog-tiny-sweep] {case_name}/{} tol={tiny_step_tol:.1e} ipopt_failed={error:?}",
+                profile.label()
+            );
+            return;
+        }
+    };
+    assert_source_built_spral_ipopt_provenance(&ipopt);
+    let native_trace = nlip_accepted_trace(&native);
+    let ipopt_trace = ipopt_accepted_trace(&ipopt);
+    let native_stop = native.snapshots.iter().any(|snapshot| {
+        snapshot
+            .events
+            .contains(&InteriorPointIterationEvent::WatchdogStoppedBeforeLineSearch)
+    });
+    let native_tiny = native.snapshots.iter().any(|snapshot| {
+        snapshot
+            .events
+            .contains(&InteriorPointIterationEvent::TinyStep)
+    });
+    println!(
+        "[watchdog-tiny-sweep] {case_name}/{} tol={tiny_step_tol:.1e} native_stop={native_stop} native_tiny={native_tiny} nlip_steps={} ipopt_steps={} nlip_tags={} ipopt_tags={} ipopt_info={}",
+        profile.label(),
+        native_trace.len(),
+        ipopt_trace.len(),
+        step_tag_summary(&native_trace),
+        step_tag_summary(&ipopt_trace),
+        ipopt_info_marker_summary(&ipopt),
+    );
+}
+
 #[test]
 #[ignore = "diagnostic sweep for finding trace-clean IPOPT watchdog activation witnesses"]
 fn print_watchdog_activation_profile_sweep() {
@@ -2351,6 +2425,128 @@ fn print_watchdog_activation_profile_sweep() {
         found_clean_activation,
         "no trace-clean WatchdogActivated/IPOPT-W witness found in this reduced profile sweep"
     );
+}
+
+#[test]
+#[ignore = "diagnostic sweep for finding active-watchdog tiny-step StopWatchDog witnesses"]
+fn print_watchdog_tiny_stop_profile_sweep() {
+    skip_without_native_spral!();
+    let backend = CallbackBackend::Aot;
+    let hanging_chain = build_problem_ok(hanging_chain_problem(backend), backend);
+    let hanging_chain_x0 = hanging_chain_initial_guess();
+    let equality_rosenbrock = build_problem_ok(constrained_rosenbrock_problem(backend), backend);
+    let casadi_rosenbrock = build_problem_ok(casadi_rosenbrock_nlp_problem(backend), backend);
+    let hs071 = build_problem_ok(hs071_problem(backend), backend);
+    let profiles = [
+        WatchdogActivationProfile {
+            trigger: 1,
+            trial_max: 1,
+            beta: 0.5,
+            max_soc: 4,
+            disable_fast_mu: false,
+            disable_tiny_step: false,
+        },
+        WatchdogActivationProfile {
+            trigger: 1,
+            trial_max: 3,
+            beta: 0.5,
+            max_soc: 4,
+            disable_fast_mu: false,
+            disable_tiny_step: false,
+        },
+        WatchdogActivationProfile {
+            trigger: 3,
+            trial_max: 3,
+            beta: 0.5,
+            max_soc: 4,
+            disable_fast_mu: false,
+            disable_tiny_step: false,
+        },
+        WatchdogActivationProfile {
+            trigger: 1,
+            trial_max: 3,
+            beta: 0.25,
+            max_soc: 4,
+            disable_fast_mu: false,
+            disable_tiny_step: false,
+        },
+        WatchdogActivationProfile {
+            trigger: 1,
+            trial_max: 3,
+            beta: 0.5,
+            max_soc: 4,
+            disable_fast_mu: true,
+            disable_tiny_step: false,
+        },
+        WatchdogActivationProfile {
+            trigger: 1,
+            trial_max: 8,
+            beta: 0.5,
+            max_soc: 4,
+            disable_fast_mu: false,
+            disable_tiny_step: false,
+        },
+        WatchdogActivationProfile {
+            trigger: 1,
+            trial_max: 16,
+            beta: 0.5,
+            max_soc: 4,
+            disable_fast_mu: false,
+            disable_tiny_step: false,
+        },
+        WatchdogActivationProfile {
+            trigger: 2,
+            trial_max: 16,
+            beta: 0.5,
+            max_soc: 4,
+            disable_fast_mu: false,
+            disable_tiny_step: false,
+        },
+    ];
+    for profile in profiles {
+        for tiny_step_tol in [1e-12, 1e-10, 1e-8, 1e-6, 1e-4, 1e-2, 1.0, 1e2] {
+            run_watchdog_tiny_stop_sweep_case(
+                "hanging_chain",
+                &hanging_chain,
+                &hanging_chain_x0,
+                &[],
+                profile,
+                tiny_step_tol,
+            );
+            run_watchdog_tiny_stop_sweep_case(
+                "equality_rosenbrock",
+                &equality_rosenbrock,
+                &[1.2, 1.2],
+                &[],
+                profile,
+                tiny_step_tol,
+            );
+            run_watchdog_tiny_stop_sweep_case(
+                "casadi_rosenbrock",
+                &casadi_rosenbrock,
+                &[2.5, 3.0, 0.75],
+                &[],
+                profile,
+                tiny_step_tol,
+            );
+            run_watchdog_tiny_stop_sweep_case(
+                "hs071",
+                &hs071,
+                &[1.0, 5.0, 5.0, 1.0],
+                &[],
+                profile,
+                tiny_step_tol,
+            );
+            run_watchdog_tiny_stop_sweep_case(
+                "linearly_constrained_quadratic",
+                &LinearlyConstrainedQuadraticProblem,
+                &[0.1, 0.9],
+                &[],
+                profile,
+                tiny_step_tol,
+            );
+        }
+    }
 }
 
 #[test]

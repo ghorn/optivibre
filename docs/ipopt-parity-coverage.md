@@ -135,7 +135,7 @@ source option.
 | Alpha-for-y and dual step | `IpBacktrackingLineSearch.cpp::PerformDualStep` | `alpha_y`, `alpha_du`, multiplier step application | Mirrors IPOPT for the default primal strategy, implemented option-profile strategies, and `alpha_for_y_tol` threshold profiles covered by focused tests |
 | SOC | `IpFilterLSAcceptor.cpp::TrySecondOrderCorrection` | SOC trial loop and corrected accepted trial | Mirrors active IPOPT branch including dense `AddOneVector` order; fallback corrector variants are unreachable |
 | Primal-dual corrector | `IpFilterLSAcceptor.cpp::TryCorrector` | none under parity options | Unreachable under the current parity option profile, which keeps `corrector_type=none`; do not enable IPOPT `corrector_type` raw options for parity acceptance until the full branch is ported source-faithfully |
-| Watchdog | `IpBacktrackingLineSearch.cpp` watchdog gates | watchdog reference, shortened-step streak, successful watchdog exit, lowercase watchdog trial, StopWatchDog restore/retry, and watchdog trial diagnostics | Mirrors IPOPT state machine for arming after current-direction construction, active-watchdog max-step-only trial search, successful `W` exit under the trace-clean `watchdog_shortened_iter_trigger=3` hanging-chain profile, lowercase `w` non-success trial acceptance, and trial-budget `StopWatchDog` restore/retry under a focused CasADi Rosenbrock profile; the remaining uncovered watchdog branches are the pre-line-search stop on active-watchdog restoration/tiny-step and the evaluation-error side of the same restore hook |
+| Watchdog | `IpBacktrackingLineSearch.cpp` watchdog gates | watchdog reference, shortened-step streak, successful watchdog exit, lowercase watchdog trial, StopWatchDog restore/retry, and watchdog trial diagnostics | Mirrors IPOPT state machine for arming after current-direction construction, active-watchdog max-step-only trial search, successful `W` exit under the trace-clean `watchdog_shortened_iter_trigger=3` hanging-chain profile, lowercase `w` non-success trial acceptance, and trial-budget `StopWatchDog` restore/retry under a focused CasADi Rosenbrock profile; the active-watchdog pre-line-search tiny-step stop is implemented with the source distinction that it does not set `skip_first_trial_point`, but no natural end-to-end witness has been found yet. The remaining watchdog gap is the evaluation-error/restoration side of the same pre-line restore hook |
 | Tiny step | `IpBacktrackingLineSearch.cpp::DetectTinyStep` | tiny-step acceptance and barrier-update tag | Mirrors IPOPT; focused tests exercise unchecked tiny-step acceptance, while the `tiny_step_tol=0` witness covers the disabled branch |
 | Acceptable termination | `IpOptErrorConvCheck.cpp::CurrentIsAcceptable`, `IpIpoptAlg.cpp::CONVERGED_TO_ACCEPTABLE_POINT` | `InteriorPointTermination::Acceptable` and warning status | Mirrors IPOPT for `acceptable_iter=1` under intentionally tighter strict tolerances |
 | Max-iteration exit | `IpIpoptAlg.cpp::ConvergenceCheck::MAXITER_EXCEEDED` | `InteriorPointSolveError::MaxIterations` and failure context | Mirrors IPOPT status for deterministic `max_iter=0` and accepted-step `max_iter=1`; focused tests require both solvers to retain diagnostics and partial state |
@@ -172,9 +172,15 @@ Known uncovered source-backed parity work:
 - IPOPT active-watchdog `StopWatchDog` after trial-budget exhaustion is now
   covered: NLIP restores the stored watchdog iterate and direction, clears the
   active watchdog state, skips the already-tested first trial, and retries from
-  the stored line-search reference. The remaining watchdog gaps are the
-  pre-line-search `in_watchdog_ && (goto_resto || tiny_step)` stop and the
-  evaluation-error side of the same restore hook.
+  the stored line-search reference. NLIP also carries the pre-line-search
+  `in_watchdog_ && tiny_step` stop path from
+  `IpBacktrackingLineSearch.cpp::FindAcceptableTrialPoint`; unlike the
+  trial-budget branch, this path retries the stored direction at the stored
+  maximum step without setting `skip_first_trial_point`, and the rule is pinned
+  by a focused unit test plus the ignored `print_watchdog_tiny_stop_profile_sweep`
+  search harness. The current empirical sweep did not find a natural source-built
+  problem witness for that path. The remaining watchdog gap is the
+  `goto_resto`/evaluation-error side of the same pre-line restore hook.
 
 The generated `branch-ledger.md` report is the working checklist for this
 audit. IPOPT uncovered branches in the watched routines should either gain a

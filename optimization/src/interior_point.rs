@@ -620,6 +620,7 @@ pub enum InteriorPointIterationEvent {
     SecondOrderCorrectionAccepted,
     WatchdogArmed,
     WatchdogActivated,
+    WatchdogStoppedBeforeLineSearch,
     FilterReset,
     LinearSolverQualityIncreased,
     BoundMultiplierSafeguardApplied,
@@ -656,6 +657,10 @@ pub fn nlip_event_legend_entries_for_events(
             InteriorPointIterationEvent::WatchdogActivated => {
                 entries.push(('W', "W=watchdog accepted a residual-improving step"))
             }
+            InteriorPointIterationEvent::WatchdogStoppedBeforeLineSearch => entries.push((
+                'w',
+                "w=watchdog restored its reference iterate before line search",
+            )),
             InteriorPointIterationEvent::FilterReset => entries.push((
                 'X',
                 "X=IPOPT filter reset heuristic cleared the previous filter frontier",
@@ -713,8 +718,8 @@ pub fn nlip_event_codes(snapshot: &InteriorPointIterationSnapshot) -> String {
     nlip_event_codes_for_events(&snapshot.events)
 }
 
-const NLIP_EVENT_SLOT_ORDER: [char; 14] = [
-    'L', 'F', 's', 'S', 'A', 'W', 'X', 'q', 'B', 'U', 'V', 'R', 'T', 'M',
+const NLIP_EVENT_SLOT_ORDER: [char; 15] = [
+    'L', 'F', 's', 'S', 'A', 'W', 'w', 'X', 'q', 'B', 'U', 'V', 'R', 'T', 'M',
 ];
 const NLIP_EVENT_CELL_WIDTH: usize = NLIP_EVENT_SLOT_ORDER.len();
 
@@ -1205,6 +1210,12 @@ struct InteriorPointWatchdogState {
     remaining_iters: Index,
     shortened_step_streak: Index,
     tiny_step_last_iteration: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchdogStopKind {
+    PreLineSearch,
+    TrialBudget,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3877,6 +3888,17 @@ fn is_tiny_ip_step(
             acc.max(delta.abs() / (1.0 + value.abs()))
         });
     max_s <= options.tiny_step_tol
+}
+
+fn watchdog_restore_retry_alpha(
+    stored_alpha_pr: f64,
+    stop_kind: WatchdogStopKind,
+    options: &InteriorPointOptions,
+) -> f64 {
+    match stop_kind {
+        WatchdogStopKind::PreLineSearch => stored_alpha_pr,
+        WatchdogStopKind::TrialBudget => stored_alpha_pr * options.line_search_beta,
+    }
 }
 
 fn alpha_for_y(
@@ -9441,12 +9463,17 @@ mod tests {
         let barrier_update =
             snapshot_with_events(vec![InteriorPointIterationEvent::BarrierParameterUpdated]);
 
-        assert_eq!(nlip_event_slot_codes(&filter_soc), " F S          ");
-        assert_eq!(nlip_event_slot_codes(&filter_watchdog), " F   W        ");
-        assert_eq!(nlip_event_slot_codes(&filter_reset), "      X       ");
-        assert_eq!(nlip_event_slot_codes(&watchdog_only), "     W        ");
-        assert_eq!(nlip_event_slot_codes(&linear_quality), "       q      ");
-        assert_eq!(nlip_event_slot_codes(&barrier_update), "         U    ");
+        let watchdog_stop = snapshot_with_events(vec![
+            InteriorPointIterationEvent::WatchdogStoppedBeforeLineSearch,
+        ]);
+
+        assert_eq!(nlip_event_slot_codes(&filter_soc), " F S           ");
+        assert_eq!(nlip_event_slot_codes(&filter_watchdog), " F   W         ");
+        assert_eq!(nlip_event_slot_codes(&watchdog_stop), "      w        ");
+        assert_eq!(nlip_event_slot_codes(&filter_reset), "       X       ");
+        assert_eq!(nlip_event_slot_codes(&watchdog_only), "     W         ");
+        assert_eq!(nlip_event_slot_codes(&linear_quality), "        q      ");
+        assert_eq!(nlip_event_slot_codes(&barrier_update), "          U    ");
     }
 
     #[test]
@@ -9883,6 +9910,23 @@ mod tests {
             20.0 + 2.0e6 + 1.0,
             5.0
         ));
+    }
+
+    #[test]
+    fn watchdog_pre_line_stop_retries_stored_max_alpha_without_skip() {
+        let options = InteriorPointOptions {
+            line_search_beta: 0.25,
+            ..InteriorPointOptions::default()
+        };
+
+        assert_eq!(
+            watchdog_restore_retry_alpha(0.8, WatchdogStopKind::PreLineSearch, &options).to_bits(),
+            0.8_f64.to_bits()
+        );
+        assert_eq!(
+            watchdog_restore_retry_alpha(0.8, WatchdogStopKind::TrialBudget, &options).to_bits(),
+            0.2_f64.to_bits()
+        );
     }
 
     #[test]
@@ -11947,9 +11991,9 @@ where
         let mut watchdog_active =
             watchdog_state.reference.is_some() && watchdog_state.remaining_iters > 0;
         let mut watchdog_reference = watchdog_state.reference.clone();
-        let dual_alpha_limit = alpha_du.clamp(0.0, 1.0);
+        let mut dual_alpha_limit = alpha_du.clamp(0.0, 1.0);
         let mut alpha = alpha_pr.clamp(0.0, 1.0);
-        let initial_alpha_y = alpha_for_y(alpha, dual_alpha_limit, &direction, options);
+        let mut initial_alpha_y = alpha_for_y(alpha, dual_alpha_limit, &direction, options);
         if alpha <= 0.0 {
             return Err(InteriorPointSolveError::LineSearchFailed {
                 merit: merit_residual(
@@ -12054,8 +12098,21 @@ where
         let mut second_order_correction_attempted = false;
         let mut second_order_correction_used = false;
         let mut watchdog_accepted = false;
-        let tiny_step_unchecked_accept = !watchdog_active
-            && is_tiny_ip_step(&x, &slack_barrier, &direction, primal_inf, options);
+        let tiny_step_detected =
+            is_tiny_ip_step(&x, &slack_barrier, &direction, primal_inf, options);
+        let mut watchdog_stop_restore: Option<(WatchdogStoredPoint, WatchdogStopKind)> = None;
+        if watchdog_active
+            && tiny_step_detected
+            && let Some(stored) = watchdog_state.stored_point.clone()
+        {
+            // IPOPT BacktrackingLineSearch::FindAcceptableTrialPoint calls
+            // StopWatchDog before the line search when the active watchdog
+            // direction becomes tiny, then retries from watchdog_delta without
+            // skipping the first trial point.
+            watchdog_stop_restore = Some((stored, WatchdogStopKind::PreLineSearch));
+        }
+        let tiny_step_unchecked_accept =
+            !watchdog_active && watchdog_stop_restore.is_none() && tiny_step_detected;
         let tiny_step_barrier_update =
             tiny_step_unchecked_accept && watchdog_state.tiny_step_last_iteration;
         if !watchdog_active
@@ -12116,7 +12173,8 @@ where
         // IPOPT `BacktrackingLineSearch::DoBacktrackingLineSearch` uses
         // `alpha_primal > alpha_min || n_steps == 0`, so the initial trial is
         // evaluated even when the maximum feasible step is already tiny.
-        while alpha > alpha_min || line_search_iterations == 0 {
+        while watchdog_stop_restore.is_none() && (alpha > alpha_min || line_search_iterations == 0)
+        {
             let trial_alpha_pr = alpha;
             let trial_alpha_du = dual_alpha_limit;
             let trial_alpha_y = alpha_for_y(trial_alpha_pr, trial_alpha_du, &direction, options);
@@ -12457,9 +12515,9 @@ where
                     accepted_alpha_pr: trial_alpha_pr,
                     accepted_alpha_du: Some(trial_alpha_du),
                     accepted_alpha_y: Some(trial_alpha_y),
-                    line_search_initial_alpha_pr: alpha_pr,
-                    line_search_initial_alpha_du: Some(alpha_du),
-                    line_search_initial_alpha_y: Some(initial_alpha_y),
+                    line_search_initial_alpha_pr,
+                    line_search_initial_alpha_du: Some(line_search_initial_alpha_du),
+                    line_search_initial_alpha_y: Some(line_search_initial_alpha_y),
                     line_search_last_alpha_pr: trial_alpha_pr,
                     line_search_last_alpha_du: Some(trial_alpha_du),
                     line_search_last_alpha_y: Some(trial_alpha_y),
@@ -12670,9 +12728,9 @@ where
                     accepted_alpha_pr: trial_alpha_pr,
                     accepted_alpha_du: Some(trial_alpha_du),
                     accepted_alpha_y: Some(trial_alpha_y),
-                    line_search_initial_alpha_pr: alpha_pr,
-                    line_search_initial_alpha_du: Some(alpha_du),
-                    line_search_initial_alpha_y: Some(initial_alpha_y),
+                    line_search_initial_alpha_pr,
+                    line_search_initial_alpha_du: Some(line_search_initial_alpha_du),
+                    line_search_initial_alpha_y: Some(line_search_initial_alpha_y),
                     line_search_last_alpha_pr: trial_alpha_pr,
                     line_search_last_alpha_du: Some(trial_alpha_du),
                     line_search_last_alpha_y: Some(trial_alpha_y),
@@ -13213,9 +13271,9 @@ where
                             accepted_alpha_pr: soc_alpha_pr,
                             accepted_alpha_du: Some(soc_alpha_du),
                             accepted_alpha_y: Some(soc_alpha_y),
-                            line_search_initial_alpha_pr: alpha_pr,
-                            line_search_initial_alpha_du: Some(alpha_du),
-                            line_search_initial_alpha_y: Some(initial_alpha_y),
+                            line_search_initial_alpha_pr,
+                            line_search_initial_alpha_du: Some(line_search_initial_alpha_du),
+                            line_search_initial_alpha_y: Some(line_search_initial_alpha_y),
                             line_search_last_alpha_pr: soc_alpha_pr,
                             line_search_last_alpha_du: Some(soc_alpha_du),
                             line_search_last_alpha_y: Some(soc_alpha_y),
@@ -13501,9 +13559,9 @@ where
                     accepted_alpha_pr: trial_alpha_pr,
                     accepted_alpha_du: Some(trial_alpha_du),
                     accepted_alpha_y: Some(trial_alpha_y),
-                    line_search_initial_alpha_pr: alpha_pr,
-                    line_search_initial_alpha_du: Some(alpha_du),
-                    line_search_initial_alpha_y: Some(initial_alpha_y),
+                    line_search_initial_alpha_pr,
+                    line_search_initial_alpha_du: Some(line_search_initial_alpha_du),
+                    line_search_initial_alpha_y: Some(line_search_initial_alpha_y),
                     line_search_last_alpha_pr: trial_alpha_pr,
                     line_search_last_alpha_du: Some(trial_alpha_du),
                     line_search_last_alpha_y: Some(trial_alpha_y),
@@ -13550,14 +13608,21 @@ where
             line_search_iterations += 1;
         }
         if accepted.is_none()
+            && watchdog_stop_restore.is_none()
             && watchdog_active
             && watchdog_state.remaining_iters <= 1
             && let Some(stored) = watchdog_state.stored_point.clone()
         {
+            watchdog_stop_restore = Some((stored, WatchdogStopKind::TrialBudget));
+        }
+        if accepted.is_none()
+            && let Some((stored, stop_kind)) = watchdog_stop_restore
+        {
             // IPOPT BacktrackingLineSearch::StopWatchDog restores the
             // reference iterate, swaps back to the stored search direction,
-            // clears watchdog mode, and retries the line search with the first
-            // trial skipped.
+            // clears watchdog mode, and retries the line search. The trial
+            // budget branch sets skip_first_trial_point; the pre-line tiny
+            // branch starts from the stored maximum step.
             watchdog_active = false;
             watchdog_reference = None;
             watchdog_state.reference = None;
@@ -13595,7 +13660,20 @@ where
             line_search_initial_alpha_pr = restore_initial_alpha_pr;
             line_search_initial_alpha_du = restore_dual_alpha_limit;
             line_search_initial_alpha_y = restore_initial_alpha_y;
-            let mut restore_alpha = restore_initial_alpha_pr * options.line_search_beta;
+            dual_alpha_limit = restore_dual_alpha_limit;
+            alpha = restore_initial_alpha_pr;
+            initial_alpha_y = restore_initial_alpha_y;
+            last_tried_alpha_pr = alpha;
+            last_tried_alpha_du = dual_alpha_limit;
+            last_tried_alpha_y = initial_alpha_y;
+            if stop_kind == WatchdogStopKind::PreLineSearch {
+                push_unique_nlip_event(
+                    &mut iteration_events,
+                    InteriorPointIterationEvent::WatchdogStoppedBeforeLineSearch,
+                );
+            }
+            let mut restore_alpha =
+                watchdog_restore_retry_alpha(restore_initial_alpha_pr, stop_kind, options);
             let mut restore_line_search_iterations = 0;
             while restore_alpha > alpha_min || restore_line_search_iterations == 0 {
                 let trial_alpha_pr = restore_alpha;
@@ -14294,9 +14372,9 @@ where
                     last_accepted_state.clone(),
                     None,
                     Some(InteriorPointLineSearchInfo {
-                        initial_alpha_pr: alpha_pr,
-                        initial_alpha_du: Some(alpha_du),
-                        initial_alpha_y: Some(initial_alpha_y),
+                        initial_alpha_pr: line_search_initial_alpha_pr,
+                        initial_alpha_du: Some(line_search_initial_alpha_du),
+                        initial_alpha_y: Some(line_search_initial_alpha_y),
                         accepted_alpha: None,
                         accepted_alpha_du: None,
                         accepted_alpha_y: None,

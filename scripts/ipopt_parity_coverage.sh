@@ -389,19 +389,21 @@ def classify_rust_line(path, line_no, text):
             return "diagnostic linear replay"
         if 2400 <= line_no <= 2910:
             return "diagnostic linear replay"
-        if 3075 <= line_no <= 3135:
+        if 3075 <= line_no <= 3150:
             return "diagnostic factorization progress"
-        if 3745 <= line_no <= 3785:
+        if 3745 <= line_no <= 3810:
             return "monotone barrier update"
+        if "WatchdogStopKind::" in text:
+            return "watchdog globalization branch"
         if 3850 <= line_no <= 3910 and "InteriorPointAlphaForYStrategy::" in text:
             return "covered by alpha_for_y option-profile witness"
-        if 3900 <= line_no <= 4070:
+        if 3900 <= line_no <= 4100:
             return "termination display/tolerance reporting"
-        if 4200 <= line_no <= 5080:
+        if 4200 <= line_no <= 5100:
             return "bounds, fixed-variable, and sparse-preprocessing helper"
-        if 5180 <= line_no <= 5300:
+        if 5180 <= line_no <= 5320:
             return "KKT pattern validation/preprocessing"
-        if 5550 <= line_no <= 6965:
+        if 5550 <= line_no <= 6990:
             return "full-space residual/refinement helper"
         if 6930 <= line_no <= 6945:
             return "full-space residual/refinement helper"
@@ -409,15 +411,15 @@ def classify_rust_line(path, line_no, text):
             return "linear solver dispatch, retry, and diagnostics"
         if 8485 <= line_no <= 8958:
             return "linear solver fallback/retry path"
-        if 8970 <= line_no <= 9355:
+        if 8970 <= line_no <= 9380:
             return "iteration log formatting/reporting"
-        if 9560 <= line_no <= 9980:
+        if 9560 <= line_no <= 10030:
             return "bound/slack stationarity helper alternate branch"
-        if 10200 <= line_no <= 10520:
+        if 10200 <= line_no <= 10570:
             return "solve summary/reporting"
-        if 10650 <= line_no <= 10990:
+        if 10650 <= line_no <= 11050:
             return "initialization and max-iteration witness branch"
-        if 11640 <= line_no <= 11740:
+        if 11640 <= line_no <= 11790:
             return "linear solver workspace selection"
         if 11980 <= line_no <= 12120:
             return "watchdog globalization start gate"
