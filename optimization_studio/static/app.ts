@@ -4194,8 +4194,8 @@ function flattenProfilingSection(
   });
   const nextAncestors = root ? [] : [...ancestorHasNext, !isLast];
   const children = [
-    ...section.children.map((child) => ({ kind: "section" as const, section: child })),
     ...section.items.map((item) => ({ kind: "item" as const, item })),
+    ...section.children.map((child) => ({ kind: "section" as const, section: child })),
   ];
   for (const [index, child] of children.entries()) {
     const childIsLast = index === children.length - 1;
@@ -4283,9 +4283,26 @@ function buildSolveProfilingSections(solver: SolverReport): ProfilingSection[] {
     "QP Solve",
     "Multiplier Estimation",
     "KKT Assembly",
-    "Linear Solve",
     "Subproblem Solve Other",
   ]);
+  const linearSolveTotal = takeFirstProfilingLeaf(solvePool, "Linear Solve");
+  const linearSolveItems = takeProfilingLeaves(solvePool, [
+    "Linear RHS Assembly",
+    "Linear KKT Values",
+    "Linear Symbolic Analysis",
+    "Linear Numeric Factorization",
+    "Linear Numeric Refactorization",
+    "Linear Backsolve / Refinement",
+    "Linear Solve Other",
+  ]);
+  const linearSolveSection = createProfilingSection(
+    "Linear Solve",
+    linearSolveTotal?.durationMs ?? null,
+    linearSolveItems,
+  );
+  const subproblemSections = [
+    linearSolveSection,
+  ].filter((section): section is ProfilingSection => section != null);
   const lineSearchTotal = takeFirstProfilingLeaf(solvePool, "Line Search");
   const lineSearchItems = takeProfilingLeaves(solvePool, [
     "Line Search Eval",
@@ -4319,7 +4336,12 @@ function buildSolveProfilingSections(solver: SolverReport): ProfilingSection[] {
       preprocessTotal?.durationMs ?? null,
       preprocessItems,
     ),
-    createProfilingSection("Subproblem Solve", subproblemTotal?.durationMs ?? null, subproblemItems),
+    createProfilingSection(
+      "Subproblem Solve",
+      subproblemTotal?.durationMs ?? null,
+      subproblemItems,
+      subproblemSections,
+    ),
     createProfilingSection("Line Search", lineSearchTotal?.durationMs ?? null, lineSearchItems),
     createProfilingSection("Convergence", convergenceTotal?.durationMs ?? null, convergenceItems),
     createProfilingSection("Accounting", null, accountingItems),

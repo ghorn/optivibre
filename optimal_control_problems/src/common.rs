@@ -8787,6 +8787,17 @@ fn adapter_total_time(timing: Option<optimization::SolverAdapterTiming>) -> Dura
     })
 }
 
+fn nlip_linear_solve_other_time(profiling: &InteriorPointProfiling) -> Duration {
+    profiling.linear_solve_time.saturating_sub(
+        profiling.linear_rhs_assembly_time
+            + profiling.linear_kkt_value_assembly_time
+            + profiling.sparse_symbolic_analysis_time
+            + profiling.sparse_numeric_factorization_time
+            + profiling.sparse_numeric_refactorization_time
+            + profiling.linear_backsolve_time,
+    )
+}
+
 fn sqp_evaluation_other_time(profiling: &ClarabelSqpProfiling) -> Duration {
     let callback_total = profiling.objective_value.total_time
         + profiling.objective_gradient.total_time
@@ -9048,6 +9059,48 @@ fn nlip_solve_phase_details(profiling: &InteriorPointProfiling) -> Vec<SolverPha
         "Linear Solve",
         profiling.linear_solves,
         profiling.linear_solve_time,
+    );
+    push_optional_timing_detail(
+        &mut details,
+        "Linear RHS Assembly",
+        profiling.linear_rhs_assemblies,
+        profiling.linear_rhs_assembly_time,
+    );
+    push_optional_timing_detail(
+        &mut details,
+        "Linear KKT Values",
+        profiling.linear_kkt_value_assemblies,
+        profiling.linear_kkt_value_assembly_time,
+    );
+    push_optional_timing_detail(
+        &mut details,
+        "Linear Symbolic Analysis",
+        profiling.sparse_symbolic_analyses,
+        profiling.sparse_symbolic_analysis_time,
+    );
+    push_optional_timing_detail(
+        &mut details,
+        "Linear Numeric Factorization",
+        profiling.sparse_numeric_factorizations,
+        profiling.sparse_numeric_factorization_time,
+    );
+    push_optional_timing_detail(
+        &mut details,
+        "Linear Numeric Refactorization",
+        profiling.sparse_numeric_refactorizations,
+        profiling.sparse_numeric_refactorization_time,
+    );
+    push_optional_timing_detail(
+        &mut details,
+        "Linear Backsolve / Refinement",
+        profiling.linear_backsolves,
+        profiling.linear_backsolve_time,
+    );
+    push_optional_timing_detail(
+        &mut details,
+        "Linear Solve Other",
+        0,
+        nlip_linear_solve_other_time(profiling),
     );
     push_optional_timing_detail(&mut details, "Unaccounted", 0, profiling.unaccounted_time);
     push_optional_timing_detail(&mut details, "Total", 0, profiling.total_time);
@@ -10169,6 +10222,18 @@ mod tests {
             kkt_assembly_time: Duration::from_millis(55),
             linear_solves: 6,
             linear_solve_time: Duration::from_millis(89),
+            linear_rhs_assemblies: 6,
+            linear_rhs_assembly_time: Duration::from_millis(3),
+            linear_kkt_value_assemblies: 7,
+            linear_kkt_value_assembly_time: Duration::from_millis(4),
+            sparse_symbolic_analyses: 1,
+            sparse_symbolic_analysis_time: Duration::from_millis(5),
+            sparse_numeric_factorizations: 2,
+            sparse_numeric_factorization_time: Duration::from_millis(11),
+            sparse_numeric_refactorizations: 4,
+            sparse_numeric_refactorization_time: Duration::from_millis(13),
+            linear_backsolves: 6,
+            linear_backsolve_time: Duration::from_millis(17),
             preprocessing_steps: 2,
             preprocessing_time: Duration::from_millis(13),
             total_time: Duration::from_secs_f64(0.321),
@@ -10251,6 +10316,45 @@ mod tests {
                 .solve
                 .iter()
                 .any(|detail| detail.label == "Linear Solve" && detail.count == 6)
+        );
+        assert!(
+            report
+                .phase_details
+                .solve
+                .iter()
+                .any(|detail| detail.label == "Linear RHS Assembly" && detail.count == 6)
+        );
+        assert!(
+            report
+                .phase_details
+                .solve
+                .iter()
+                .any(|detail| detail.label == "Linear KKT Values" && detail.count == 7)
+        );
+        assert!(
+            report
+                .phase_details
+                .solve
+                .iter()
+                .any(|detail| detail.label == "Linear Symbolic Analysis" && detail.count == 1)
+        );
+        assert!(
+            report
+                .phase_details
+                .solve
+                .iter()
+                .any(|detail| detail.label == "Linear Numeric Factorization" && detail.count == 2)
+        );
+        assert!(report.phase_details.solve.iter().any(|detail| {
+            detail.label == "Linear Numeric Refactorization" && detail.count == 4
+        }));
+        assert!(report.phase_details.solve.iter().any(|detail| {
+            detail.label == "Linear Backsolve / Refinement" && detail.count == 6
+        }));
+        assert!(
+            report.phase_details.solve.iter().any(|detail| {
+                detail.label == "Linear Solve Other" && detail.value == "36.0 ms"
+            })
         );
         assert!(
             report

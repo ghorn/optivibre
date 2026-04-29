@@ -589,6 +589,15 @@ pub struct InteriorPointProfiling {
     pub linear_solves: Index,
     #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
     pub linear_solve_time: Duration,
+    pub linear_rhs_assemblies: Index,
+    #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
+    pub linear_rhs_assembly_time: Duration,
+    pub linear_kkt_value_assemblies: Index,
+    #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
+    pub linear_kkt_value_assembly_time: Duration,
+    pub linear_backsolves: Index,
+    #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
+    pub linear_backsolve_time: Duration,
     pub sparse_symbolic_analyses: Index,
     #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
     pub sparse_symbolic_analysis_time: Duration,
@@ -9108,6 +9117,8 @@ fn factor_solve_spral_ssids(
             })
         },
     )?;
+    profiling.linear_backsolves += 1;
+    profiling.linear_backsolve_time += solve_time;
     let assessment =
         assess_linear_solution_ccs(&workspace.pattern.ccs, &workspace.values, rhs, &solution);
     assessment
@@ -9319,6 +9330,8 @@ fn factor_solve_spral_src(
             },
         )?)
     };
+    profiling.linear_backsolves += 1;
+    profiling.linear_backsolve_time += solve_time;
     let linear_trace = context.capture_trace.then(|| IpoptLinearSolveTrace {
         rhs_prefinal: rhs.to_vec(),
         solution_prefinal_unrefined: solution_prefinal_unrefined
@@ -9571,11 +9584,14 @@ fn solve_reduced_kkt_with_spral_src(
     let n = system.hessian.lower_triangle.nrow;
     let meq = system.equality_jacobian.nrows();
     let mineq = system.inequality_jacobian.nrows();
+    let rhs_started = Instant::now();
     let rhs = build_ipopt_augmented_kkt_rhs(
         system,
         &workspace.pattern,
         IpoptLinearRhsOrientation::PreFinal,
     );
+    profiling.linear_rhs_assemblies += 1;
+    profiling.linear_rhs_assembly_time += rhs_started.elapsed();
 
     let mut attempts: Vec<InteriorPointLinearSolveAttempt> = Vec::new();
     let mut current_regularization = system.regularization.max(0.0);
@@ -9595,6 +9611,7 @@ fn solve_reduced_kkt_with_spral_src(
         let primal_shift = current_regularization;
         let slack_shift = current_regularization;
         let dual_shift = current_jacobian_regularization;
+        let values_started = Instant::now();
         fill_spral_augmented_kkt_values(
             &workspace.pattern,
             &mut workspace.values,
@@ -9603,6 +9620,8 @@ fn solve_reduced_kkt_with_spral_src(
             slack_shift,
             dual_shift,
         );
+        profiling.linear_kkt_value_assemblies += 1;
+        profiling.linear_kkt_value_assembly_time += values_started.elapsed();
         match factor_solve_spral_src(
             system,
             workspace,
@@ -9756,11 +9775,14 @@ fn solve_reduced_kkt_with_spral_ssids(
     let n = system.hessian.lower_triangle.nrow;
     let meq = system.equality_jacobian.nrows();
     let mineq = system.inequality_jacobian.nrows();
+    let rhs_started = Instant::now();
     let rhs = build_ipopt_augmented_kkt_rhs(
         system,
         &workspace.pattern,
         IpoptLinearRhsOrientation::FinalDirection,
     );
+    profiling.linear_rhs_assemblies += 1;
+    profiling.linear_rhs_assembly_time += rhs_started.elapsed();
 
     let mut attempts = Vec::new();
     let mut current_regularization = if system.forced_jacobian_regularization.is_some() {
@@ -9775,6 +9797,7 @@ fn solve_reduced_kkt_with_spral_ssids(
         let dual_shift = system
             .forced_jacobian_regularization
             .unwrap_or_else(|| current_regularization.max(1e-8));
+        let values_started = Instant::now();
         assemble_spral_augmented_kkt_values(
             workspace,
             system,
@@ -9782,6 +9805,8 @@ fn solve_reduced_kkt_with_spral_ssids(
             slack_shift,
             dual_shift,
         );
+        profiling.linear_kkt_value_assemblies += 1;
+        profiling.linear_kkt_value_assembly_time += values_started.elapsed();
         match factor_solve_spral_ssids(
             system,
             workspace,
