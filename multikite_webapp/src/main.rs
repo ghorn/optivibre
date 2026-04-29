@@ -29,8 +29,6 @@ const TEXT_CSS_UTF8: &str = "text/css; charset=utf-8";
 const IMAGE_SVG_XML: &str = "image/svg+xml";
 const APPLICATION_NDJSON_UTF8: &str = "application/x-ndjson; charset=utf-8";
 const GENERATED_APP_JS: &str = include_str!(concat!(env!("OUT_DIR"), "/app.js"));
-const STREAM_SCENE_FRAME_STRIDE: usize = 10;
-
 static LAST_SUMMARY: OnceLock<Mutex<Option<RunSummary>>> = OnceLock::new();
 
 #[derive(Debug, Parser)]
@@ -51,6 +49,14 @@ struct RunRequest {
     payload_mass_kg: Option<f64>,
     wind_speed_mps: Option<f64>,
     sample_stride: Option<usize>,
+    #[serde(default)]
+    sim_noise_enabled: bool,
+    #[serde(default = "default_true")]
+    bridle_enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -127,6 +133,7 @@ struct ApiFrame {
     total_moment_b: Vec<[f64; 3]>,
     aero_moment_b: Vec<[f64; 3]>,
     tether_moment_b: Vec<[f64; 3]>,
+    motor_moment_b: Vec<[f64; 3]>,
     cl_total: Vec<f64>,
     cl_0_term: Vec<f64>,
     cl_alpha_term: Vec<f64>,
@@ -162,9 +169,12 @@ struct ApiFrame {
     rudder_cmd_deg: Vec<f64>,
     motor_torque: Vec<f64>,
     total_work: f64,
+    total_dissipated_work: f64,
     total_kinetic_energy: f64,
     total_potential_energy: f64,
     total_tether_strain_energy: f64,
+    total_mechanical_energy: f64,
+    energy_conservation_residual: f64,
     work_minus_potential: f64,
 }
 
@@ -255,6 +265,8 @@ fn config_from_request(request: &RunRequest) -> (InitRequest, SimulationConfig) 
             duration: request.duration,
             phase_mode: request.phase_mode,
             sample_stride: request.sample_stride.unwrap_or(1).max(1),
+            sim_noise_enabled: request.sim_noise_enabled,
+            bridle_enabled: request.bridle_enabled,
             ..SimulationConfig::default()
         },
     )
@@ -615,6 +627,12 @@ fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
             .iter()
             .map(|diag| vec3(diag.tether_moment_b))
             .collect(),
+        motor_moment_b: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| vec3(diag.motor_moment_b))
+            .collect(),
         cl_total: frame
             .diagnostics
             .kites
@@ -820,9 +838,12 @@ fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
             .map(|control| control.motor_torque)
             .collect(),
         total_work: frame.state.total_work,
+        total_dissipated_work: frame.state.total_dissipated_work,
         total_kinetic_energy: frame.diagnostics.total_kinetic_energy,
         total_potential_energy: frame.diagnostics.total_potential_energy,
         total_tether_strain_energy: frame.diagnostics.total_tether_strain_energy,
+        total_mechanical_energy: frame.diagnostics.total_mechanical_energy,
+        energy_conservation_residual: frame.diagnostics.energy_conservation_residual,
         work_minus_potential: frame.diagnostics.work_minus_potential,
     }
 }
@@ -936,7 +957,7 @@ async fn run(
 async fn run_stream(
     Json(request): Json<RunRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let (sender, receiver) = mpsc::channel::<Result<Bytes, Infallible>>(64);
+    let (sender, receiver) = mpsc::channel::<Result<Bytes, Infallible>>(256);
     tokio::spawn(async move {
         let _ = send_stream_event(
             &sender,
@@ -959,26 +980,12 @@ async fn run_stream(
                 );
             };
             let mut plot_buffer = Vec::<ApiFrame>::new();
-            let mut latest_scene_frame = None::<ApiFrame>;
-            let mut frames_since_scene_flush = 0usize;
-            let flush_scene_frame = |latest_scene_frame: &mut Option<ApiFrame>| {
-                if let Some(frame) = latest_scene_frame.take() {
-                    let _ =
-                        send_stream_event_blocking(&progress_sender, StreamEvent::Frame { frame });
-                }
-            };
             let mut frame_cb = |frame: ApiFrame| {
                 plot_buffer.push(frame.clone());
-                latest_scene_frame = Some(frame);
-                frames_since_scene_flush += 1;
-                if frames_since_scene_flush >= STREAM_SCENE_FRAME_STRIDE {
-                    flush_scene_frame(&mut latest_scene_frame);
-                    frames_since_scene_flush = 0;
-                }
+                let _ = send_stream_event_blocking(&progress_sender, StreamEvent::Frame { frame });
             };
             let result = run_preset_streaming(&request_for_run, &mut progress_cb, &mut frame_cb);
             drop(frame_cb);
-            flush_scene_frame(&mut latest_scene_frame);
             result.map(|summary| (summary, plot_buffer))
         })
         .await;

@@ -68,6 +68,19 @@
             Wind (m/s)
             <input id="wind-speed" type="number" min="0" step="0.5" value="5" />
           </label>
+          <div class="form-section">
+            <div class="form-section-title">Model Options</div>
+            <label class="checkbox-label">
+              <input id="bridle-enabled" type="checkbox" checked />
+              <span>Enable bridle model</span>
+            </label>
+            <div class="form-hint">When off, upper tethers attach at each kite CG with zero bridle moment.</div>
+            <label class="checkbox-label">
+              <input id="sim-noise" type="checkbox" />
+              <span>Enable Dryden gusts</span>
+            </label>
+            <div class="form-hint">Off by default. Wind remains steady unless this is enabled.</div>
+          </div>
           <label>
             Time Dilation
             <select id="time-dilation">

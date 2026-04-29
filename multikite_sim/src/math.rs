@@ -17,7 +17,6 @@ pub trait Scalar:
     fn from_f64(value: f64) -> Self;
     fn sqrt(self) -> Self;
     fn atan2(self, rhs: Self) -> Self;
-    fn abs(self) -> Self;
     fn min(self, rhs: Self) -> Self;
     fn max(self, rhs: Self) -> Self;
 }
@@ -41,10 +40,6 @@ impl Scalar for f64 {
 
     fn atan2(self, rhs: Self) -> Self {
         self.atan2(rhs)
-    }
-
-    fn abs(self) -> Self {
-        self.abs()
     }
 
     fn min(self, rhs: Self) -> Self {
@@ -75,10 +70,6 @@ impl Scalar for SX {
 
     fn atan2(self, rhs: Self) -> Self {
         self.atan2(rhs)
-    }
-
-    fn abs(self) -> Self {
-        self.abs()
     }
 
     fn min(self, rhs: Self) -> Self {
@@ -130,8 +121,12 @@ pub fn norm<T: Scalar>(value: &Vector3<T>) -> T {
     (norm_squared(value) + T::from_f64(1.0e-9)).sqrt()
 }
 
-pub fn normalize<T: Scalar>(value: &Vector3<T>) -> Vector3<T> {
-    scale(value, T::one() / norm(value))
+pub fn norm_exact<T: Scalar>(value: &Vector3<T>) -> T {
+    norm_squared(value).sqrt()
+}
+
+pub fn normalize_exact<T: Scalar>(value: &Vector3<T>) -> Vector3<T> {
+    scale(value, T::one() / norm_exact(value))
 }
 
 pub fn quaternion_conjugate<T: Scalar>(quat: &Quaternion<T>) -> Quaternion<T> {

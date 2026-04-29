@@ -1,6 +1,6 @@
 {
   "reference_source_commits": {
-    "physics": "78691bbb0",
+    "physics": "2052ae8e69af45be8a2aee4eee14edd9c88ff68f",
     "controller": "e18990d54",
     "initialization": "e18990d54"
   },
@@ -9,6 +9,16 @@
       "id": "reference_multikite_export",
       "path": "reference_export.json",
       "description": "Rust-native frozen Reference rigid-body, tether, rotor, aero, and controller export used by multikite_sim."
+    },
+    {
+      "id": "reference_avl_fit",
+      "path": "AVL_Reference_fit.json",
+      "description": "Pinned Reference AVL aero polynomial fit from reference_source aero/fits/AVL_Reference_fit.json."
+    },
+    {
+      "id": "reference_xrotor_fit",
+      "path": "XROTOR_Reference_fit.json",
+      "description": "Pinned Reference XROTOR polynomial fit from reference_source aero/fits/XROTOR_Reference_fit.json."
     }
   ]
 }

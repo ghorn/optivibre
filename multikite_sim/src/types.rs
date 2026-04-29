@@ -30,6 +30,8 @@ pub struct SimulationConfig {
     pub max_substeps: usize,
     pub phase_mode: PhaseMode,
     pub sample_stride: usize,
+    pub sim_noise_enabled: bool,
+    pub bridle_enabled: bool,
 }
 
 impl Default for SimulationConfig {
@@ -42,6 +44,8 @@ impl Default for SimulationConfig {
             max_substeps: 4096,
             phase_mode: PhaseMode::Adaptive,
             sample_stride: 1,
+            sim_noise_enabled: false,
+            bridle_enabled: true,
         }
     }
 }
@@ -131,6 +135,7 @@ pub struct BodyState<T> {
 #[derive(Clone, Debug, Vectorize)]
 pub struct KiteState<T, const N_UPPER: usize> {
     pub body: BodyState<T>,
+    pub rotor_speed: T,
     pub tether: [TetherNode<T>; N_UPPER],
 }
 
@@ -141,6 +146,8 @@ pub struct State<T, const NK: usize, const N_COMMON: usize, const N_UPPER: usize
     pub common_tether: [TetherNode<T>; N_COMMON],
     pub payload: TetherNode<T>,
     pub total_work: T,
+    pub total_dissipated_work: T,
+    pub mechanical_energy_reference: T,
 }
 
 impl<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>
@@ -228,9 +235,11 @@ pub struct AeroParams<T> {
 #[derive(Clone, Debug, Vectorize)]
 pub struct RotorParams<T> {
     pub axis_b: Vector3<T>,
+    pub position_b: Vector3<T>,
     pub radius: T,
-    pub torque_to_force: T,
-    pub force_to_power: T,
+    pub inertia: T,
+    pub sign: T,
+    pub initial_speed: T,
 }
 
 #[derive(Clone, Debug, Vectorize)]
@@ -321,6 +330,8 @@ pub struct KiteDiagnostics<T> {
     pub curvature_z_ref: T,
     pub motor_force: T,
     pub motor_power: T,
+    pub aero_dissipated_power: T,
+    pub tether_dissipated_power: T,
     pub total_force_b: Vector3<T>,
     pub aero_force_b: Vector3<T>,
     pub aero_force_drag_b: Vector3<T>,
@@ -332,6 +343,7 @@ pub struct KiteDiagnostics<T> {
     pub total_moment_b: Vector3<T>,
     pub aero_moment_b: Vector3<T>,
     pub tether_moment_b: Vector3<T>,
+    pub motor_moment_b: Vector3<T>,
     pub cl_total: T,
     pub cl_0_term: T,
     pub cl_alpha_term: T,
@@ -374,6 +386,9 @@ pub struct Diagnostics<T, const NK: usize> {
     pub total_potential_energy: T,
     pub total_tether_strain_energy: T,
     pub total_motor_power: T,
+    pub total_dissipated_power: T,
+    pub total_mechanical_energy: T,
+    pub energy_conservation_residual: T,
     pub work_minus_potential: T,
 }
 
@@ -405,9 +420,12 @@ pub struct RunSummary {
     pub rejected_steps: usize,
     pub max_phase_error: f64,
     pub final_total_work: f64,
+    pub final_total_dissipated_work: f64,
     pub final_total_kinetic_energy: f64,
     pub final_total_potential_energy: f64,
     pub final_total_tether_strain_energy: f64,
+    pub final_total_mechanical_energy: f64,
+    pub final_energy_conservation_residual: f64,
     pub failure: Option<SimulationFailure>,
 }
 

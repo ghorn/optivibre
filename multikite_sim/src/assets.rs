@@ -4,6 +4,8 @@ use std::sync::OnceLock;
 
 static ASSET_MANIFEST_CACHE: OnceLock<Result<AssetManifest, String>> = OnceLock::new();
 static REFERENCE_EXPORT_CACHE: OnceLock<Result<ReferenceExport, String>> = OnceLock::new();
+static REFERENCE_AVL_FIT_CACHE: OnceLock<Result<AeroCoeffModelExport, String>> = OnceLock::new();
+static REFERENCE_ROTOR_FIT_CACHE: OnceLock<Result<RotorCoeffFitsExport, String>> = OnceLock::new();
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct AssetManifest {
@@ -77,9 +79,11 @@ pub struct AeroExport {
 #[derive(Clone, Debug, Deserialize)]
 pub struct RotorExport {
     pub axis_b: [f64; 3],
+    pub position_b: [f64; 3],
     pub radius: f64,
-    pub torque_to_force: f64,
-    pub force_to_power: f64,
+    pub inertia: f64,
+    pub sign: f64,
+    pub initial_speed: f64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -142,6 +146,98 @@ pub struct EnvironmentExport {
     pub wind_n: [f64; 3],
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct AeroCoeffModelExport {
+    #[serde(rename = "acmNominal")]
+    pub nominal: ForceMomentQuartic2Export,
+    #[serde(rename = "acmPqr")]
+    pub pqr: [ForceMomentQuartic2Export; 3],
+    #[serde(rename = "acmFlaps")]
+    pub flaps: AeroFlapsExport,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AeroFlapsExport {
+    #[serde(rename = "uRAileron")]
+    pub r_aileron: ForceMomentFlapPolynomialExport,
+    #[serde(rename = "uFlap")]
+    pub flap: ForceMomentFlapPolynomialExport,
+    #[serde(rename = "uWinglet")]
+    pub winglet: ForceMomentFlapPolynomialExport,
+    #[serde(rename = "uElevator")]
+    pub elevator: ForceMomentFlapPolynomialExport,
+    #[serde(rename = "uRudder")]
+    pub rudder: ForceMomentFlapPolynomialExport,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ForceMomentQuartic2Export {
+    #[serde(rename = "fmForce")]
+    pub force: [Quartic2Export; 3],
+    #[serde(rename = "fmMoment")]
+    pub moment: [Quartic2Export; 3],
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ForceMomentFlapPolynomialExport {
+    #[serde(rename = "fmForce")]
+    pub force: [FlapPolynomialExport; 3],
+    #[serde(rename = "fmMoment")]
+    pub moment: [FlapPolynomialExport; 3],
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct Quartic2Export {
+    pub p42x0y0: f64,
+    pub p42x1y0: f64,
+    pub p42x0y1: f64,
+    pub p42x0y2: f64,
+    pub p42x1y1: f64,
+    pub p42x2y0: f64,
+    pub p42x0y3: f64,
+    pub p42x1y2: f64,
+    pub p42x2y1: f64,
+    pub p42x3y0: f64,
+    pub p42x0y4: f64,
+    pub p42x1y3: f64,
+    pub p42x2y2: f64,
+    pub p42x3y1: f64,
+    pub p42x4y0: f64,
+}
+
+#[allow(non_snake_case)]
+#[derive(Clone, Debug, Deserialize)]
+pub struct FlapPolynomialExport {
+    pub fpA0B0D1: f64,
+    pub fpA0B0D2: f64,
+    pub fpA1B0D1: f64,
+    pub fpA0B1D1: f64,
+    pub fpA0B0D3: f64,
+    pub fpA0B1D2: f64,
+    pub fpA1B0D2: f64,
+    pub fpA1B1D1: f64,
+    pub fpA0B2D1: f64,
+    pub fpA2B0D1: f64,
+    pub fpA0B0D4: f64,
+    pub fpA1B0D3: f64,
+    pub fpA0B1D3: f64,
+    pub fpA2B0D2: f64,
+    pub fpA0B2D2: f64,
+    pub fpA1B1D2: f64,
+    pub fpA3B0D1: f64,
+    pub fpA2B1D1: f64,
+    pub fpA1B2D1: f64,
+    pub fpA0B3D1: f64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct RotorCoeffFitsExport {
+    #[serde(rename = "rcAeroThrust")]
+    pub aero_thrust: Quartic2Export,
+    #[serde(rename = "rcAeroTorque")]
+    pub aero_torque: Quartic2Export,
+}
+
 pub fn asset_manifest() -> Result<AssetManifest> {
     match ASSET_MANIFEST_CACHE.get_or_init(|| {
         serde_json::from_str(include_str!("../assets/asset_manifest.json"))
@@ -159,5 +255,39 @@ pub fn reference_export() -> Result<ReferenceExport> {
     }) {
         Ok(export) => Ok(export.clone()),
         Err(error) => Err(anyhow!(error.clone())),
+    }
+}
+
+pub fn reference_avl_fit_ref() -> &'static AeroCoeffModelExport {
+    match REFERENCE_AVL_FIT_CACHE.get_or_init(|| {
+        serde_json::from_str(include_str!("../assets/AVL_Reference_fit.json"))
+            .map_err(|e| e.to_string())
+    }) {
+        Ok(fit) => fit,
+        Err(error) => panic!("failed to parse AVL_Reference_fit.json: {error}"),
+    }
+}
+
+pub fn reference_rotor_fit_ref() -> &'static RotorCoeffFitsExport {
+    match REFERENCE_ROTOR_FIT_CACHE.get_or_init(|| {
+        serde_json::from_str(include_str!("../assets/XROTOR_Reference_fit.json"))
+            .map_err(|e| e.to_string())
+    }) {
+        Ok(fit) => fit,
+        Err(error) => panic!("failed to parse XROTOR_Reference_fit.json: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::asset_manifest;
+
+    #[test]
+    fn manifest_pins_pre_removal_physics_commit() {
+        let manifest = asset_manifest().expect("asset manifest");
+        assert_eq!(
+            manifest.reference_source_commits.physics,
+            "2052ae8e69af45be8a2aee4eee14edd9c88ff68f"
+        );
     }
 }

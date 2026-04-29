@@ -83,9 +83,12 @@ interface RunSummary {
   rejected_steps: number;
   max_phase_error: number;
   final_total_work: number;
+  final_total_dissipated_work: number;
   final_total_kinetic_energy: number;
   final_total_potential_energy: number;
   final_total_tether_strain_energy: number;
+  final_total_mechanical_energy: number;
+  final_energy_conservation_residual: number;
   failure?: SimulationFailure | null;
 }
 
@@ -182,6 +185,7 @@ interface ApiFrame {
   total_moment_b: [number, number, number][];
   aero_moment_b: [number, number, number][];
   tether_moment_b: [number, number, number][];
+  motor_moment_b: [number, number, number][];
   cl_total: number[];
   cl_0_term: number[];
   cl_alpha_term: number[];
@@ -217,9 +221,12 @@ interface ApiFrame {
   rudder_cmd_deg: number[];
   motor_torque: number[];
   total_work: number;
+  total_dissipated_work: number;
   total_kinetic_energy: number;
   total_potential_energy: number;
   total_tether_strain_energy: number;
+  total_mechanical_energy: number;
+  energy_conservation_residual: number;
   work_minus_potential: number;
 }
 
@@ -259,6 +266,8 @@ const durationInput = document.querySelector<HTMLInputElement>("#duration")!;
 const phaseModeSelect = document.querySelector<HTMLSelectElement>("#phase-mode")!;
 const payloadInput = document.querySelector<HTMLInputElement>("#payload-mass")!;
 const windInput = document.querySelector<HTMLInputElement>("#wind-speed")!;
+const bridleEnabledInput = document.querySelector<HTMLInputElement>("#bridle-enabled")!;
+const simNoiseInput = document.querySelector<HTMLInputElement>("#sim-noise")!;
 const timeDilationSelect = document.querySelector<HTMLSelectElement>("#time-dilation")!;
 const cameraFollowTargetSelect = document.querySelector<HTMLSelectElement>("#camera-follow-target")!;
 const cameraFollowYawInput = document.querySelector<HTMLInputElement>("#camera-follow-yaw")!;
@@ -621,7 +630,12 @@ let framesRendered = 0;
 let pendingPlaybackFrames: ApiFrame[] = [];
 let pendingSummary: RunSummary | null = null;
 let latestProgressState: SimulationProgress | null = null;
-let activeSummaryRequest: { preset: string; phase_mode: PhaseMode } | null = null;
+let activeSummaryRequest: {
+  preset: string;
+  phase_mode: PhaseMode;
+  sim_noise_enabled: boolean;
+  bridle_enabled: boolean;
+} | null = null;
 let currentPlaybackRate: number | null = null;
 let currentPlaybackLabel = "Fast as possible";
 let playbackStartWallTimeMs: number | null = null;
@@ -1701,23 +1715,33 @@ function bodyComponent(
 function buildEnergyGroups(): PlotGroupDefinition[] {
   return [
     {
-      title: "Total Work / Residual (J)",
+      title: "Energy Conservation Check (J)",
       yTitle: "J",
       traces: [
         {
-          name: "Total Work",
+          name: "Mechanical Energy",
           color: "#87d37c",
+          value: (frame) => frame.total_mechanical_energy
+        },
+        {
+          name: "Motor Work",
+          color: "#66b8ff",
           value: (frame) => frame.total_work
         },
         {
-          name: "Work - Potential",
+          name: "Dissipated Work",
+          color: "#ffbe6b",
+          value: (frame) => frame.total_dissipated_work
+        },
+        {
+          name: "E - W + D",
           color: "#c28dff",
-          value: (frame) => frame.work_minus_potential
+          value: (frame) => frame.energy_conservation_residual
         }
       ]
     },
     {
-      title: "Energies (J)",
+      title: "Mechanical Energy Breakdown (J)",
       yTitle: "J",
       traces: [
         {
@@ -2242,6 +2266,13 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
             width: 1.9,
             alpha: 0.84,
             value: (frame, kiteIndex) => bodyComponent(frame.tether_moment_b, kiteIndex, 0)
+          },
+          {
+            name: "Motor",
+            dash: "dashdot",
+            width: 1.8,
+            alpha: 0.72,
+            value: (frame, kiteIndex) => bodyComponent(frame.motor_moment_b, kiteIndex, 0)
           }
         ]),
         buildPerKiteBreakdownGroup(kiteCount, "Body Pitch Moment Breakdown (N m)", "N m", [
@@ -2264,6 +2295,13 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
             width: 1.9,
             alpha: 0.84,
             value: (frame, kiteIndex) => bodyComponent(frame.tether_moment_b, kiteIndex, 1)
+          },
+          {
+            name: "Motor",
+            dash: "dashdot",
+            width: 1.8,
+            alpha: 0.72,
+            value: (frame, kiteIndex) => bodyComponent(frame.motor_moment_b, kiteIndex, 1)
           }
         ]),
         buildPerKiteBreakdownGroup(kiteCount, "Body Yaw Moment Breakdown (N m)", "N m", [
@@ -2286,6 +2324,13 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
             width: 1.9,
             alpha: 0.84,
             value: (frame, kiteIndex) => bodyComponent(frame.tether_moment_b, kiteIndex, 2)
+          },
+          {
+            name: "Motor",
+            dash: "dashdot",
+            width: 1.8,
+            alpha: 0.72,
+            value: (frame, kiteIndex) => bodyComponent(frame.motor_moment_b, kiteIndex, 2)
           }
         ])
       ],
@@ -2349,7 +2394,12 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
 }
 
 function formatProgressSummary(
-  request: { preset: string; phase_mode: PhaseMode },
+  request: {
+    preset: string;
+    phase_mode: PhaseMode;
+    sim_noise_enabled: boolean;
+    bridle_enabled: boolean;
+  },
   progress: SimulationProgress,
   receivedFrames: number,
   renderedFrames: number,
@@ -2365,6 +2415,8 @@ function formatProgressSummary(
       { label: "Progress", value: `${pct.toFixed(1)}%` },
       { label: "Preset", value: request.preset },
       { label: "Phase Mode", value: request.phase_mode },
+      { label: "Bridle", value: request.bridle_enabled ? "Enabled" : "CG attach" },
+      { label: "Sim Noise", value: request.sim_noise_enabled ? "Dryden gusts" : "Off" },
       { label: "Time Dilation", value: playbackLabel },
       { label: "Iteration", value: String(progress.iteration) },
       { label: "Frames", value: `${receivedFrames} received / ${renderedFrames} rendered` },
@@ -2404,7 +2456,11 @@ function formatRunSummary(
         value: `${summary.accepted_steps} / ${summary.rejected_steps}`
       },
       { label: "Max Phase Error", value: summary.max_phase_error.toFixed(4) },
-      { label: "Final Work", value: summary.final_total_work.toFixed(3) },
+      { label: "Final Motor Work", value: summary.final_total_work.toFixed(3) },
+      {
+        label: "Final Dissipated Work",
+        value: summary.final_total_dissipated_work.toFixed(3)
+      },
       {
         label: "Final Kinetic Energy",
         value: summary.final_total_kinetic_energy.toFixed(3)
@@ -2416,6 +2472,14 @@ function formatRunSummary(
       {
         label: "Final Tether Strain Energy",
         value: summary.final_total_tether_strain_energy.toFixed(3)
+      },
+      {
+        label: "Final Mechanical Energy",
+        value: summary.final_total_mechanical_energy.toFixed(3)
+      },
+      {
+        label: "Final E - W + D",
+        value: summary.final_energy_conservation_residual.toFixed(3)
       }
     ],
     summary.failure ? "Ended early on a protection limit" : "Run finished normally"
@@ -4017,13 +4081,17 @@ async function runSimulation(): Promise<void> {
     phase_mode: phaseModeSelect.value as PhaseMode,
     payload_mass_kg: Number(payloadInput.value),
     wind_speed_mps: Number(windInput.value),
+    bridle_enabled: bridleEnabledInput.checked,
+    sim_noise_enabled: simNoiseInput.checked,
     sample_stride: 1
   };
   runButton.disabled = true;
   runButton.textContent = "Running...";
   activeSummaryRequest = {
     preset: request.preset,
-    phase_mode: request.phase_mode
+    phase_mode: request.phase_mode,
+    sim_noise_enabled: request.sim_noise_enabled,
+    bridle_enabled: request.bridle_enabled
   };
   resetPlaybackState(playbackLabel, playbackRate);
   const kiteCount = presetKiteCount(request.preset as Preset);
@@ -4037,6 +4105,8 @@ async function runSimulation(): Promise<void> {
     [
       { label: "Preset", value: request.preset },
       { label: "Phase Mode", value: request.phase_mode },
+      { label: "Bridle", value: request.bridle_enabled ? "Enabled" : "CG attach" },
+      { label: "Sim Noise", value: request.sim_noise_enabled ? "Dryden gusts" : "Off" },
       { label: "Time Dilation", value: playbackLabel },
       { label: "Iteration", value: "0" },
       { label: "Frames", value: "0 received / 0 rendered" },
@@ -4049,7 +4119,7 @@ async function runSimulation(): Promise<void> {
     "Run requested"
   );
   appendConsole(
-    `run requested: preset=${request.preset}, duration=${request.duration}s, phase=${request.phase_mode}, time_dilation=${playbackLabel}`
+    `run requested: preset=${request.preset}, duration=${request.duration}s, phase=${request.phase_mode}, bridle=${request.bridle_enabled ? "enabled" : "cg_attach"}, noise=${request.sim_noise_enabled ? "dryden" : "off"}, time_dilation=${playbackLabel}`
   );
 
   try {
@@ -4142,6 +4212,7 @@ async function runSimulation(): Promise<void> {
       }
     }
 
+    await waitForPlaybackDrain();
     if (finalPlotFrames && finalPlotFrames.length > 0) {
       appendConsole(`rendering plots from ${finalPlotFrames.length} samples`);
       try {
@@ -4156,7 +4227,6 @@ async function runSimulation(): Promise<void> {
       clearPlots("No plot samples were returned for this run.");
       appendConsole("no final plot buffer received");
     }
-    await waitForPlaybackDrain();
     if (pendingSummary) {
       summaryNode.innerHTML = formatRunSummary(
         pendingSummary,

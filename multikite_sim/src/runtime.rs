@@ -64,6 +64,10 @@ fn base_params<const NK: usize>(init: &InitRequest) -> Result<Params<f64, NK>> {
         },
         motor_torque: export.controller.trim_motor_torque,
     };
+    let speed_ref = match init.preset {
+        Preset::Y2Reference => 20.0,
+        _ => export.controller.speed_ref,
+    };
     let kite = KiteParams {
         rigid_body: crate::types::RigidBodyParams {
             mass: export.rigid_body.mass,
@@ -104,12 +108,14 @@ fn base_params<const NK: usize>(init: &InitRequest) -> Result<Params<f64, NK>> {
         tether: upper.clone(),
         rotor: RotorParams {
             axis_b: vec3(export.rotor.axis_b),
+            position_b: vec3(export.rotor.position_b),
             radius: export.rotor.radius,
-            torque_to_force: export.rotor.torque_to_force,
-            force_to_power: export.rotor.force_to_power,
+            inertia: export.rotor.inertia,
+            sign: export.rotor.sign,
+            initial_speed: export.rotor.initial_speed,
         },
     };
-    Ok(Params {
+    let mut params = Params {
         kites: from_fn(|_| kite.clone()),
         common_tether: common.clone(),
         splitter_mass: 0.1,
@@ -132,11 +138,48 @@ fn base_params<const NK: usize>(init: &InitRequest) -> Result<Params<f64, NK>> {
             vert_vel_to_rabbit_height: export.controller.vert_vel_to_rabbit_height,
             gain_int_y: export.controller.gain_int_y,
             gain_int_z: export.controller.gain_int_z,
-            speed_ref: export.controller.speed_ref,
+            speed_ref,
             disk_center_n: vec3(export.controller.disk_center_n),
             disk_radius: export.controller.disk_radius,
         },
-    })
+    };
+    if matches!(init.preset, Preset::Y2Reference) {
+        apply_y2_reference_overrides(&mut params);
+    }
+    Ok(params)
+}
+
+fn apply_y2_reference_overrides<const NK: usize>(params: &mut Params<f64, NK>) {
+    let ground_altitude = params.kites[0].tether.contact.ground_altitude;
+    let splitter_altitude = ground_altitude + params.common_tether.natural_length;
+    let target_cad_altitude = -params.controller.disk_center_n[2];
+    let bridle_vertical_offset_b =
+        params.kites[0].bridle.radius + params.kites[0].bridle.pivot_b[2];
+    let bridle_altitude = target_cad_altitude - bridle_vertical_offset_b;
+    let upper_vertical = bridle_altitude - splitter_altitude;
+    params.controller.disk_radius = (params.kites[0].tether.natural_length
+        * params.kites[0].tether.natural_length
+        - upper_vertical * upper_vertical)
+        .max(1.0)
+        .sqrt();
+    params.controller.rabbit_distance = 90.0;
+    params.controller.phase_lag_to_radius = -1.2;
+}
+
+fn apply_simulation_config_to_params<const NK: usize>(
+    params: &mut Params<f64, NK>,
+    config: &SimulationConfig,
+    preset: Preset,
+) {
+    if !config.bridle_enabled {
+        for kite in &mut params.kites {
+            kite.bridle.pivot_b = -kite.rigid_body.cad_offset_b;
+            kite.bridle.radius = 0.0;
+        }
+    }
+    if matches!(preset, Preset::Y2Reference) {
+        apply_y2_reference_overrides(params);
+    }
 }
 
 fn simple_tether_params(init: &InitRequest) -> Result<Params<f64, 0>> {
@@ -158,6 +201,47 @@ fn interpolate_nodes<const N: usize>(
             vel_n: bottom.vel_n * (1.0 - frac) + top.vel_n * frac,
         }
     })
+}
+
+fn kite_with_consistent_tether<const N_UPPER: usize>(
+    mut body: BodyState<f64>,
+    splitter: &TetherNode<f64>,
+    params: &KiteParams<f64>,
+    top_guess: TetherNode<f64>,
+    use_bridle_velocity: bool,
+) -> KiteState<f64, N_UPPER> {
+    let mut top = top_guess.clone();
+    for _ in 0..8 {
+        let kite = KiteState {
+            body: body.clone(),
+            rotor_speed: params.rotor.initial_speed,
+            tether: interpolate_nodes::<N_UPPER>(splitter, &top),
+        };
+        let bridle_node = compute_bridle_node(&kite, params);
+        let position_error = top_guess.pos_n - bridle_node.pos_n;
+        body.pos_n += position_error;
+        if position_error.norm() < 1.0e-9 {
+            break;
+        }
+    }
+
+    let kite = KiteState {
+        body: body.clone(),
+        rotor_speed: params.rotor.initial_speed,
+        tether: interpolate_nodes::<N_UPPER>(splitter, &top),
+    };
+    let bridle_node = compute_bridle_node(&kite, params);
+    top.vel_n = if use_bridle_velocity {
+        bridle_node.vel_n
+    } else {
+        Vector3::zeros()
+    };
+
+    KiteState {
+        body,
+        rotor_speed: params.rotor.initial_speed,
+        tether: interpolate_nodes::<N_UPPER>(splitter, &top),
+    }
 }
 
 pub fn star_configuration<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
@@ -187,12 +271,8 @@ pub fn star_configuration<const NK: usize, const N_COMMON: usize, const N_UPPER:
             bridle_radius * theta.sin(),
             -bridle_altitude,
         );
-        let path_quat_n2b = yaw_quaternion_n2b(theta + std::f64::consts::FRAC_PI_2);
-        let body_velocity_n =
-            rotate_body_to_nav(&path_quat_n2b, &Vector3::new(BODY_SPEED_0_MPS, 0.0, 0.0));
-        let apparent_air_n = body_velocity_n - params.environment.wind_n;
-        let quat_n2b = yaw_quaternion_n2b((-apparent_air_n[1]).atan2(apparent_air_n[0]));
-        let body_vel_b = rotate_nav_to_body(&quat_n2b, &body_velocity_n);
+        let quat_n2b = yaw_quaternion_n2b(theta + std::f64::consts::FRAC_PI_2);
+        let body_vel_b = Vector3::new(BODY_SPEED_0_MPS, 0.0, 0.0);
         let bridle_to_body_b =
             -(params.kites[index].bridle.pivot_b + params.kites[index].rigid_body.cad_offset_b);
         let body_pos_n = bridle_pos_n
@@ -206,12 +286,9 @@ pub fn star_configuration<const NK: usize, const N_COMMON: usize, const N_UPPER:
         };
         let top = TetherNode {
             pos_n: bridle_pos_n,
-            vel_n: body_velocity_n,
+            vel_n: Vector3::zeros(),
         };
-        KiteState {
-            body,
-            tether: interpolate_nodes(&splitter, &top),
-        }
+        kite_with_consistent_tether(body, &splitter, &params.kites[index], top, false)
     });
     State {
         kites,
@@ -219,6 +296,8 @@ pub fn star_configuration<const NK: usize, const N_COMMON: usize, const N_UPPER:
         common_tether: interpolate_nodes(&payload, &splitter),
         payload,
         total_work: 0.0,
+        total_dissipated_work: 0.0,
+        mechanical_energy_reference: 0.0,
     }
 }
 
@@ -252,10 +331,10 @@ pub fn y_reference_configuration<const N_COMMON: usize, const N_UPPER: usize>(
     let bridle_orbit_radius = (upper_length * upper_length - upper_vertical * upper_vertical)
         .max(0.0)
         .sqrt();
-
     let kites = from_fn(|index| {
         let theta = 2.0 * std::f64::consts::PI * index as f64 / 2.0;
-        let quat_n2b = yaw_quaternion_n2b(theta + std::f64::consts::FRAC_PI_2);
+        let yaw = theta + std::f64::consts::FRAC_PI_2;
+        let quat_n2b = yaw_quaternion_n2b(yaw);
         let apparent_air_n = rotate_body_to_nav(
             &quat_n2b,
             &Vector3::new(params.controller.speed_ref, 0.0, 0.0),
@@ -280,12 +359,9 @@ pub fn y_reference_configuration<const N_COMMON: usize, const N_UPPER: usize>(
         };
         let top = TetherNode {
             pos_n: bridle_pos_n,
-            vel_n: body_velocity_n,
+            vel_n: Vector3::zeros(),
         };
-        KiteState {
-            body,
-            tether: interpolate_nodes(&splitter, &top),
-        }
+        kite_with_consistent_tether(body, &splitter, &params.kites[index], top, true)
     });
 
     State {
@@ -294,6 +370,8 @@ pub fn y_reference_configuration<const N_COMMON: usize, const N_UPPER: usize>(
         common_tether: interpolate_nodes(&payload, &splitter),
         payload,
         total_work: 0.0,
+        total_dissipated_work: 0.0,
+        mechanical_energy_reference: 0.0,
     }
 }
 
@@ -313,6 +391,7 @@ pub fn free_flight_configuration<const N_COMMON: usize, const N_UPPER: usize>(
     State {
         kites: [KiteState {
             body,
+            rotor_speed: params.kites[0].rotor.initial_speed,
             tether: std::array::from_fn(|_| TetherNode {
                 pos_n: Vector3::zeros(),
                 vel_n: Vector3::zeros(),
@@ -331,6 +410,8 @@ pub fn free_flight_configuration<const N_COMMON: usize, const N_UPPER: usize>(
             vel_n: Vector3::zeros(),
         },
         total_work: 0.0,
+        total_dissipated_work: 0.0,
+        mechanical_energy_reference: 0.0,
     }
 }
 
@@ -351,6 +432,8 @@ pub fn simple_tether_configuration<const N_COMMON: usize, const N_UPPER: usize>(
         common_tether: interpolate_nodes(&payload, &anchor),
         payload,
         total_work: 0.0,
+        total_dissipated_work: 0.0,
+        mechanical_energy_reference: 0.0,
     }
 }
 
@@ -560,9 +643,12 @@ fn finalize_summary<const NK: usize, const N_COMMON: usize, const N_UPPER: usize
         rejected_steps,
         max_phase_error,
         final_total_work: final_frame.state.total_work,
+        final_total_dissipated_work: final_frame.state.total_dissipated_work,
         final_total_kinetic_energy: final_frame.diagnostics.total_kinetic_energy,
         final_total_potential_energy: final_frame.diagnostics.total_potential_energy,
         final_total_tether_strain_energy: final_frame.diagnostics.total_tether_strain_energy,
+        final_total_mechanical_energy: final_frame.diagnostics.total_mechanical_energy,
+        final_energy_conservation_residual: final_frame.diagnostics.energy_conservation_residual,
         failure,
     }
 }
@@ -669,12 +755,18 @@ fn simulate<
     frame_cb: &mut G,
 ) -> Result<RunResult<NK, N_COMMON, N_UPPER>> {
     let mut params = base_params::<NK>(init)?;
+    apply_simulation_config_to_params(&mut params, config, init.preset);
     let mut dryden = DrydenField::<NK>::new(0xD15E_A5E0_u64 ^ NK as u64);
-    params.kite_gusts_n = dryden.gusts_n();
+    params.kite_gusts_n = if config.sim_noise_enabled {
+        dryden.gusts_n()
+    } else {
+        from_fn(|_| Vector3::zeros())
+    };
     let rhs = CompiledRhs::<NK, N_COMMON, N_UPPER>::shared()?;
     let mut state = initializer(&params);
     let mut controls = initial_controls(&params);
     let (_, initial_diag) = rhs.eval(&state, &controls, &params)?;
+    state.mechanical_energy_reference = initial_diag.total_mechanical_energy;
     let mut controller_state = ControllerState::<NK>::new(&initial_diag);
     let mut frames = Vec::new();
     let mut time = 0.0_f64;
@@ -751,13 +843,17 @@ fn simulate<
         let step = (config.duration - time).min(config.dt_control);
         let (next_state, _, accepted, rejected, substeps) =
             integrate_interval(rhs.as_ref(), &state, &next_controls, &params, step, config)?;
-        dryden.advance(
-            step,
-            &diagnostics,
-            &params.environment.wind_n,
-            params.common_tether.contact.ground_altitude,
-        );
-        params.kite_gusts_n = dryden.gusts_n();
+        if config.sim_noise_enabled {
+            dryden.advance(
+                step,
+                &diagnostics,
+                &params.environment.wind_n,
+                params.common_tether.contact.ground_altitude,
+            );
+            params.kite_gusts_n = dryden.gusts_n();
+        } else {
+            params.kite_gusts_n = from_fn(|_| Vector3::zeros());
+        }
         state = next_state;
         controls = next_controls;
         time = zero_if_nan(time + step);
@@ -781,15 +877,18 @@ fn simulate_passive<
     P: FnMut(SimulationProgress),
     G: FnMut(SimulationFrame<f64, NK, N_COMMON, N_UPPER>),
 >(
-    params: Params<f64, NK>,
+    mut params: Params<f64, NK>,
     config: &SimulationConfig,
     initializer: fn(&Params<f64, NK>) -> State<f64, NK, N_COMMON, N_UPPER>,
     progress_cb: &mut P,
     frame_cb: &mut G,
 ) -> Result<RunResult<NK, N_COMMON, N_UPPER>> {
+    apply_simulation_config_to_params(&mut params, config, Preset::SimpleTether);
     let rhs = CompiledRhs::<NK, N_COMMON, N_UPPER>::shared()?;
     let mut state = initializer(&params);
     let controls = initial_controls(&params);
+    let (_, initial_diag) = rhs.eval(&state, &controls, &params)?;
+    state.mechanical_energy_reference = initial_diag.total_mechanical_energy;
     let mut frames = Vec::new();
     let mut time = 0.0_f64;
     let mut iteration = 0usize;
@@ -1287,7 +1386,7 @@ mod tests {
         body.omega_b[0] = 0.0;
         body.omega_b[2] = 0.0;
 
-        let (_, pitch, _) = UnitQuaternion::from_quaternion(body.quat_n2b).euler_angles();
+        let pitch = pitch_angle_from_quat_n2b(&body.quat_n2b);
         body.quat_n2b = *UnitQuaternion::from_euler_angles(0.0, pitch, 0.0).quaternion();
         state.renormalize_attitudes();
     }
@@ -1296,6 +1395,16 @@ mod tests {
         controls.kites[0].surfaces.aileron = params.controller.trim.surfaces.aileron;
         controls.kites[0].surfaces.rudder = params.controller.trim.surfaces.rudder;
         controls.kites[0].surfaces.winglet = params.controller.trim.surfaces.winglet;
+    }
+
+    fn roll_angle_from_quat_n2b(quat_n2b: &nalgebra::Quaternion<f64>) -> f64 {
+        let down_b = rotate_nav_to_body(quat_n2b, &Vector3::new(0.0, 0.0, 1.0));
+        down_b[1].atan2(down_b[2])
+    }
+
+    fn pitch_angle_from_quat_n2b(quat_n2b: &nalgebra::Quaternion<f64>) -> f64 {
+        let down_b = rotate_nav_to_body(quat_n2b, &Vector3::new(0.0, 0.0, 1.0));
+        (-down_b[0]).atan2((down_b[1] * down_b[1] + down_b[2] * down_b[2]).sqrt())
     }
 
     fn roll_reversal_reference(time: f64) -> f64 {
@@ -1465,8 +1574,7 @@ mod tests {
             max_abs_alpha = max_abs_alpha.max(kite_diag.alpha.abs());
             max_abs_beta = max_abs_beta.max(kite_diag.beta.abs());
             max_abs_y = max_abs_y.max(state.kites[0].body.pos_n[1].abs());
-            let (roll, _, _) =
-                UnitQuaternion::from_quaternion(state.kites[0].body.quat_n2b).euler_angles();
+            let roll = roll_angle_from_quat_n2b(&state.kites[0].body.quat_n2b);
             max_abs_roll = max_abs_roll.max(roll.abs());
 
             final_altitude = kite_diag.altitude;
@@ -1583,8 +1691,7 @@ mod tests {
             apply_trace(&mut diagnostics, &trace);
 
             let kite_diag = &diagnostics.kites[0];
-            let (roll, _, _) =
-                UnitQuaternion::from_quaternion(state.kites[0].body.quat_n2b).euler_angles();
+            let roll = roll_angle_from_quat_n2b(&state.kites[0].body.quat_n2b);
             let roll_ref = trace.roll_refs[0];
             let settled = (2.2..3.0).contains(&time)
                 || (4.2..5.0).contains(&time)
@@ -1598,7 +1705,8 @@ mod tests {
             max_abs_roll = max_abs_roll.max(roll.abs());
             if settled {
                 settled_samples += 1;
-                max_settled_roll_error = max_settled_roll_error.max((roll - roll_ref).abs());
+                max_settled_roll_error =
+                    max_settled_roll_error.max(crate::math::wrap_angle(roll - roll_ref).abs());
             }
 
             if time >= config.duration - 1.0e-12 {
