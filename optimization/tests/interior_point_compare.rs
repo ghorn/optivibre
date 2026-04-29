@@ -2155,6 +2155,59 @@ fn compare_native_and_ipopt_with_watchdog_trigger_profile() {
 }
 
 #[test]
+fn compare_native_and_ipopt_with_lowercase_watchdog_trial_profile() {
+    skip_without_native_spral!();
+    let backend = CallbackBackend::Aot;
+    let problem = build_problem_ok(casadi_rosenbrock_nlp_problem(backend), backend);
+    let profile = WatchdogActivationProfile {
+        trigger: 1,
+        trial_max: 1,
+        beta: 0.5,
+        max_soc: 4,
+        disable_fast_mu: false,
+        disable_tiny_step: false,
+    };
+    let native = solve_nlp_interior_point_with_callback(
+        &problem,
+        &[2.5, 3.0, 0.75],
+        &[],
+        &native_options_with(|options| profile.apply_native(options)),
+        |_| {},
+    )
+    .expect("casadi rosenbrock lowercase watchdog witness should solve in NLIP");
+    let ipopt = solve_nlp_ipopt(
+        &problem,
+        &[2.5, 3.0, 0.75],
+        &[],
+        &ipopt_options_with(|options| profile.apply_ipopt(options)),
+    )
+    .expect("casadi rosenbrock lowercase watchdog witness should solve in IPOPT");
+    assert_source_built_spral_ipopt_provenance(&ipopt);
+    assert!(
+        ipopt_accepted_trace(&ipopt)
+            .iter()
+            .any(|point| point.step_tag.as_deref() == Some("w")),
+        "IPOPT witness should exercise lowercase BacktrackingLineSearch watchdog trial"
+    );
+    let lowercase_watchdog_trial = native
+        .snapshots
+        .iter()
+        .find(|snapshot| snapshot.step_tag == Some('w'))
+        .expect("NLIP should mirror IPOPT's lowercase watchdog trial acceptance");
+    let line_search = lowercase_watchdog_trial
+        .line_search
+        .as_ref()
+        .expect("lowercase watchdog trial should retain line-search diagnostics");
+    assert!(line_search.watchdog_active);
+    assert!(!line_search.watchdog_accepted);
+    assert_eq!(line_search.backtrack_count, 0);
+    assert!(
+        !line_search.second_order_correction_attempted,
+        "IPOPT breaks out of DoBacktrackingLineSearch before SOC while in_watchdog_ is active"
+    );
+}
+
+#[test]
 #[ignore = "diagnostic sweep for finding trace-clean IPOPT watchdog activation witnesses"]
 fn print_watchdog_activation_profile_sweep() {
     skip_without_native_spral!();

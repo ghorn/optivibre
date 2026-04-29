@@ -12037,7 +12037,10 @@ where
                 barrier_directional_derivative,
             };
             watchdog_state.reference = Some(reference.clone());
-            watchdog_state.remaining_iters = options.watchdog_trial_iter_max;
+            // IPOPT permits `watchdog_trial_iter_max` non-success watchdog
+            // trial steps before `StopWatchDog` restores the stored iterate.
+            // Keep one extra sentinel count for the restore attempt itself.
+            watchdog_state.remaining_iters = options.watchdog_trial_iter_max.saturating_add(1);
             watchdog_reference = Some(reference);
             watchdog_active = true;
             push_unique_nlip_event(
@@ -12627,6 +12630,7 @@ where
             }
             if options.second_order_correction
                 && options.max_second_order_corrections > 0
+                && !watchdog_active
                 && !second_order_correction_attempted
                 && line_search_iterations == 0
                 && current_theta <= trial_filter_theta
@@ -13209,44 +13213,60 @@ where
                         options.obj_max_inc,
                     ) && watchdog_assessment.acceptance_mode.is_some()
                 });
-            if watchdog_accept {
-                let step_kind = if let Some(reference) = &watchdog_reference {
-                    let watchdog_filter_entry =
-                        super::filter::entry(reference.barrier_objective, reference.filter_theta);
-                    let watchdog_switching_condition = switching_condition_satisfied(
-                        reference.filter_theta,
-                        reference.barrier_directional_derivative,
-                        trial_alpha_pr,
-                        options,
-                    );
-                    let watchdog_armijo_required = trial_alpha_pr > 0.0
-                        && watchdog_switching_condition
-                        && reference.filter_theta <= theta_min;
-                    let watchdog_assessment = super::filter::assess_trial(
-                        &filter_entries,
-                        &watchdog_filter_entry,
-                        &trial_filter_entry,
-                        trial_alpha_pr,
-                        reference.barrier_directional_derivative,
-                        watchdog_switching_condition,
-                        watchdog_armijo_required,
-                        filter_parameters,
-                    );
-                    if watchdog_assessment.acceptance_mode
-                        == Some(FilterAcceptanceMode::ObjectiveArmijo)
-                    {
-                        InteriorPointStepKind::Objective
+            let watchdog_forced_trial =
+                watchdog_active && !watchdog_accept && watchdog_state.remaining_iters > 1;
+            if watchdog_accept || watchdog_forced_trial {
+                let step_kind = if watchdog_accept {
+                    if let Some(reference) = &watchdog_reference {
+                        let watchdog_filter_entry = super::filter::entry(
+                            reference.barrier_objective,
+                            reference.filter_theta,
+                        );
+                        let watchdog_switching_condition = switching_condition_satisfied(
+                            reference.filter_theta,
+                            reference.barrier_directional_derivative,
+                            trial_alpha_pr,
+                            options,
+                        );
+                        let watchdog_armijo_required = trial_alpha_pr > 0.0
+                            && watchdog_switching_condition
+                            && reference.filter_theta <= theta_min;
+                        let watchdog_assessment = super::filter::assess_trial(
+                            &filter_entries,
+                            &watchdog_filter_entry,
+                            &trial_filter_entry,
+                            trial_alpha_pr,
+                            reference.barrier_directional_derivative,
+                            watchdog_switching_condition,
+                            watchdog_armijo_required,
+                            filter_parameters,
+                        );
+                        if watchdog_assessment.acceptance_mode
+                            == Some(FilterAcceptanceMode::ObjectiveArmijo)
+                        {
+                            InteriorPointStepKind::Objective
+                        } else {
+                            InteriorPointStepKind::Feasibility
+                        }
                     } else {
                         InteriorPointStepKind::Feasibility
                     }
                 } else {
                     InteriorPointStepKind::Feasibility
                 };
-                watchdog_accepted = true;
-                let step_tag = if step_kind == InteriorPointStepKind::Feasibility {
-                    'h'
+                watchdog_accepted = watchdog_accept;
+                let step_tag = if watchdog_accept {
+                    if step_kind == InteriorPointStepKind::Feasibility {
+                        'h'
+                    } else {
+                        'f'
+                    }
                 } else {
-                    'f'
+                    // `DoBacktrackingLineSearch` returns `accept=false` while
+                    // `in_watchdog_` is active; `FindAcceptableTrialPoint`
+                    // then accepts the trial anyway, leaving the watchdog
+                    // armed and reporting lowercase `w`.
+                    'w'
                 };
                 let corrected_bound_multipliers = apply_bound_multiplier_safeguard(
                     &trial_lambda_ineq,
@@ -13404,16 +13424,16 @@ where
                     mu: accepted_mu,
                     filter_theta: trial_filter_theta,
                     filter_entry: trial_filter_entry.clone(),
-                    filter_augment_entry: (step_kind == InteriorPointStepKind::Feasibility).then(
-                        || {
+                    filter_augment_entry: (watchdog_accept
+                        && step_kind == InteriorPointStepKind::Feasibility)
+                        .then(|| {
                             super::filter::augment_entry(
                                 current_barrier_objective,
                                 current_theta,
                                 options.filter_gamma_objective,
                                 options.filter_gamma_violation,
                             )
-                        },
-                    ),
+                        }),
                     filter_acceptance_mode: None,
                     step_kind,
                     step_tag,
@@ -13430,7 +13450,7 @@ where
                     line_search_last_alpha_y: Some(trial_alpha_y),
                     line_search_backtrack_count: line_search_iterations,
                     second_order_correction_used: false,
-                    watchdog_accepted: true,
+                    watchdog_accepted: watchdog_accept,
                     tiny_step: false,
                     bound_multiplier_corrected,
                 });
@@ -13988,6 +14008,8 @@ where
             // after any successful watchdog trial and appends "W".
             watchdog_state.reference = None;
             watchdog_state.remaining_iters = 0;
+        } else if accepted_trial.step_tag == 'w' {
+            watchdog_state.remaining_iters = watchdog_state.remaining_iters.saturating_sub(1);
         } else if !shortened_step && !tiny_step {
             watchdog_state.reference = None;
             watchdog_state.remaining_iters = 0;
