@@ -471,6 +471,38 @@ fn ipopt_info_string_seen(summary: &optimization::IpoptSummary, marker: char) ->
         .any(|info| info.contains(marker))
 }
 
+fn ipopt_info_marker_summary(summary: &optimization::IpoptSummary) -> String {
+    let info_strings = parse_ipopt_info_strings(summary.journal_output.as_deref());
+    ["W", "w", "Tmax", "F+", "F-", "MaxS", "e"]
+        .into_iter()
+        .filter_map(|marker| {
+            let count = info_strings
+                .values()
+                .filter(|info| info.contains(marker))
+                .count();
+            (count > 0).then(|| format!("{marker}:{count}"))
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn step_tag_summary(trace: &[AcceptedTracePoint]) -> String {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for point in trace {
+        let tag = point
+            .step_tag
+            .as_deref()
+            .filter(|tag| !tag.is_empty())
+            .unwrap_or("-");
+        *counts.entry(tag.to_string()).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(tag, count)| format!("{tag}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn nlip_step_tag(snapshot: &optimization::InteriorPointIterationSnapshot) -> Option<String> {
     snapshot
         .step_tag
@@ -1432,11 +1464,16 @@ fn run_watchdog_activation_sweep_case<P: CompiledNlpProblem>(
             .contains(&InteriorPointIterationEvent::WatchdogActivated)
     });
     let ipopt_w = ipopt_info_string_seen(&ipopt, 'W');
+    let native_trace = nlip_accepted_trace(&native);
+    let ipopt_trace = ipopt_accepted_trace(&ipopt);
     let trace_clean = accepted_trace_strictly_clean(&native, &ipopt);
-    let native_steps = nlip_accepted_trace(&native).len();
-    let ipopt_steps = ipopt_accepted_trace(&ipopt).len();
+    let native_steps = native_trace.len();
+    let ipopt_steps = ipopt_trace.len();
+    let ipopt_info = ipopt_info_marker_summary(&ipopt);
+    let native_tags = step_tag_summary(&native_trace);
+    let ipopt_tags = step_tag_summary(&ipopt_trace);
     println!(
-        "[watchdog-sweep] {case_name}/{} nlip_steps={native_steps} ipopt_steps={ipopt_steps} nlip_armed={nlip_armed} nlip_activated={nlip_activated} ipopt_w={ipopt_w} trace_clean={trace_clean}",
+        "[watchdog-sweep] {case_name}/{} nlip_steps={native_steps} ipopt_steps={ipopt_steps} nlip_armed={nlip_armed} nlip_activated={nlip_activated} ipopt_w={ipopt_w} trace_clean={trace_clean} nlip_tags={native_tags} ipopt_tags={ipopt_tags} ipopt_info={ipopt_info}",
         profile.label(),
     );
     nlip_activated && ipopt_w && trace_clean

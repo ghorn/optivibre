@@ -44,8 +44,8 @@ Reports are written to `target/reports/ipopt-parity-coverage/`:
 
 Latest generated profile snapshot, from the source-built nonlinear parity run:
 
-- IPOPT Algorithm C++: `9728 / 18642` lines and `1209 / 3556` branches hit.
-- Rust NLIP core: `5890 / 10514` lines hit, with `0` unhit branch-like lines
+- IPOPT Algorithm C++: `9784 / 18642` lines and `1211 / 3556` branches hit.
+- Rust NLIP core: `5898 / 10503` lines hit, with `0` unhit branch-like lines
   still classified as `needs audit`.
 - `IpBacktrackingLineSearch.cpp`: `610 / 993` lines and `142 / 252` branches
   hit, with active-watch uncovered branch lines reduced to `45 / 74`.
@@ -85,7 +85,8 @@ The latest focused run added source-option witnesses for:
   and IPOPT kept matching accepted-step counts and trace parity. The same
   profile also covers IPOPT's successful-watchdog `Append_info_string("W")`
   path; NLIP now marks filter/SOC trial acceptance as a watchdog success when
-  the outer line-search state is already in watchdog mode.
+  the outer line-search state is already in watchdog mode and clears watchdog
+  state immediately, matching `BacktrackingLineSearch::FindAcceptableTrialPoint`.
   (`trigger=1` and `trigger=2` were rejected as witnesses because they exposed
   accepted-step count drift despite close final values)
 - `IpBacktrackingLineSearch.cpp::tiny_step_tol=0`
@@ -121,7 +122,7 @@ source option.
 | Alpha-for-y and dual step | `IpBacktrackingLineSearch.cpp::PerformDualStep` | `alpha_y`, `alpha_du`, multiplier step application | Mirrors IPOPT for the default primal strategy, implemented option-profile strategies, and `alpha_for_y_tol` threshold profiles covered by focused tests |
 | SOC | `IpFilterLSAcceptor.cpp::TrySecondOrderCorrection` | SOC trial loop and corrected accepted trial | Mirrors active IPOPT branch including dense `AddOneVector` order; fallback corrector variants are unreachable |
 | Primal-dual corrector | `IpFilterLSAcceptor.cpp::TryCorrector` | none under parity options | Unreachable under the current parity option profile, which keeps `corrector_type=none`; do not enable IPOPT `corrector_type` raw options for parity acceptance until the full branch is ported source-faithfully |
-| Watchdog | `IpBacktrackingLineSearch.cpp` watchdog gates | watchdog reference, shortened-step streak, successful watchdog exit, and watchdog trial diagnostics | Mirrors IPOPT state machine for arming and successful `W` exit under the trace-clean `watchdog_shortened_iter_trigger=3` hanging-chain profile; non-success watchdog trial steps still require a separate reduced witness before accepted-state behavior changes |
+| Watchdog | `IpBacktrackingLineSearch.cpp` watchdog gates | watchdog reference, shortened-step streak, successful watchdog exit, and watchdog trial diagnostics | Mirrors IPOPT state machine for arming and successful `W` exit under the trace-clean `watchdog_shortened_iter_trigger=3` hanging-chain profile; the ignored watchdog sweep prints IPOPT lowercase `w`, `Tmax`, and step-tag summaries so non-success watchdog trial / `StopWatchDog` profiles stay visible before accepted-state behavior changes |
 | Tiny step | `IpBacktrackingLineSearch.cpp::DetectTinyStep` | tiny-step acceptance and barrier-update tag | Mirrors IPOPT; focused tests exercise unchecked tiny-step acceptance, while the `tiny_step_tol=0` witness covers the disabled branch |
 | Acceptable termination | `IpOptErrorConvCheck.cpp::CurrentIsAcceptable`, `IpIpoptAlg.cpp::CONVERGED_TO_ACCEPTABLE_POINT` | `InteriorPointTermination::Acceptable` and warning status | Mirrors IPOPT for `acceptable_iter=1` under intentionally tighter strict tolerances |
 | Max-iteration exit | `IpIpoptAlg.cpp::ConvergenceCheck::MAXITER_EXCEEDED` | `InteriorPointSolveError::MaxIterations` and failure context | Mirrors IPOPT status for deterministic `max_iter=0` and accepted-step `max_iter=1`; focused tests require both solvers to retain diagnostics and partial state |
@@ -155,6 +156,15 @@ Known uncovered source-backed parity work:
   this IPOPT routine, so the unported branch cannot silently run with different
   semantics. Do not add a passing parity witness for this option until the full
   IPOPT branch is ported source-faithfully.
+- IPOPT lowercase watchdog trials enter
+  `IpBacktrackingLineSearch.cpp::DoBacktrackingLineSearch` with `in_watchdog_`
+  active, set the alpha-primal tag to `w`, and may later call
+  `BacktrackingLineSearch::StopWatchDog` to restore the stored watchdog iterate
+  and retry from the stored watchdog direction. The current trace-clean
+  accepted witness covers the successful `W` exit, while reduced trigger-1/2
+  profiles expose lowercase `w` / `Tmax` IPOPT markers and accepted-step count
+  drift. Porting this branch requires carrying the full stored watchdog iterate
+  and direction, not just accepting the failed trial.
 
 The generated `branch-ledger.md` report is the working checklist for this
 audit. IPOPT uncovered branches in the watched routines should either gain a

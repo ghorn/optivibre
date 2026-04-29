@@ -13715,7 +13715,8 @@ where
         } else {
             0
         };
-        let watchdog_will_arm = !accepted_trial.watchdog_accepted
+        let watchdog_will_arm = !watchdog_active
+            && !accepted_trial.watchdog_accepted
             && options.watchdog_trial_iter_max > 0
             && options.watchdog_shortened_iter_trigger > 0
             && next_shortened_step_streak >= options.watchdog_shortened_iter_trigger;
@@ -13966,24 +13967,10 @@ where
         watchdog_state.tiny_step_last_iteration =
             tiny_step && dual_step_norm < options.tiny_step_y_tol;
         if accepted_trial.watchdog_accepted {
-            if watchdog_state.remaining_iters > 0 {
-                watchdog_state.remaining_iters -= 1;
-            }
-            let keep_watchdog = watchdog_state.reference.as_ref().is_some_and(|reference| {
-                accepted_trial.filter_theta
-                    >= reference.filter_theta
-                        - 1e-12
-                            * reference
-                                .filter_theta
-                                .abs()
-                                .max(accepted_trial.filter_theta.abs())
-                                .max(1.0)
-                    && watchdog_state.remaining_iters > 0
-            });
-            if !keep_watchdog {
-                watchdog_state.reference = None;
-                watchdog_state.remaining_iters = 0;
-            }
+            // IPOPT BacktrackingLineSearch clears in_watchdog_ immediately
+            // after any successful watchdog trial and appends "W".
+            watchdog_state.reference = None;
+            watchdog_state.remaining_iters = 0;
         } else if options.watchdog_trial_iter_max > 0
             && options.watchdog_shortened_iter_trigger > 0
             && watchdog_state.shortened_step_streak >= options.watchdog_shortened_iter_trigger
