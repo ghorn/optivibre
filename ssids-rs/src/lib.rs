@@ -4809,6 +4809,7 @@ fn app_apply_accepted_prefix_update_entry_incremental(
     debug_assert_eq!(pivot, context.accepted_end);
 }
 
+#[cfg(test)]
 fn app_build_factor_columns_for_prefix(
     rows: &[usize],
     matrix: &[f64],
@@ -4817,6 +4818,19 @@ fn app_build_factor_columns_for_prefix(
     end: usize,
 ) -> Vec<FactorColumn> {
     let mut columns = Vec::with_capacity(end.saturating_sub(start));
+    app_extend_factor_columns_for_prefix(&mut columns, rows, matrix, size, start, end);
+    columns
+}
+
+fn app_extend_factor_columns_for_prefix(
+    columns: &mut Vec<FactorColumn>,
+    rows: &[usize],
+    matrix: &[f64],
+    size: usize,
+    start: usize,
+    end: usize,
+) {
+    columns.reserve(end.saturating_sub(start));
     for col in start..end {
         let mut entries = Vec::with_capacity(size.saturating_sub(col + 1));
         for row in (col + 1)..size {
@@ -4827,7 +4841,6 @@ fn app_build_factor_columns_for_prefix(
             entries,
         });
     }
-    columns
 }
 
 fn tpp_factor_one_by_one(
@@ -5056,7 +5069,7 @@ fn factorize_dense_tpp_tail_in_place(
     let mut stats = PanelFactorStats::default();
     let mut factor_order = Vec::with_capacity(size);
     let mut factor_columns = Vec::with_capacity(size);
-    let mut block_records = Vec::new();
+    let mut block_records = Vec::with_capacity(size);
     let mut pivot = request.start_pivot;
     let active_candidate_end = (request.start_pivot + request.candidate_len).min(size);
 
@@ -5340,6 +5353,49 @@ fn build_factor_solve_panel_record(
     }))
 }
 
+fn build_dense_front_solve_panel_record(
+    factor_order: &[usize],
+    trailing_rows: &[usize],
+    dense: &[f64],
+    size: usize,
+    eliminated_len: usize,
+) -> Result<Option<FactorSolvePanelRecord>, SsidsError> {
+    if eliminated_len == 0 {
+        return Ok(None);
+    }
+    if eliminated_len > size || factor_order.len() != eliminated_len {
+        return Err(SsidsError::NumericalBreakdown {
+            pivot: eliminated_len,
+            detail: "dense solve panel request does not match eliminated front width".into(),
+        });
+    }
+    let local_size = factor_order.len() + trailing_rows.len();
+    if local_size != size {
+        return Err(SsidsError::NumericalBreakdown {
+            pivot: eliminated_len,
+            detail: format!("dense solve panel has {local_size} row ids for a {size} row front"),
+        });
+    }
+
+    let mut row_ids = Vec::with_capacity(size);
+    row_ids.extend_from_slice(factor_order);
+    row_ids.extend_from_slice(trailing_rows);
+
+    let mut values = vec![0.0; size * eliminated_len];
+    for local_col in 0..eliminated_len {
+        values[local_col * size + local_col] = 1.0;
+        for row in (local_col + 1)..size {
+            values[local_col * size + row] = dense[dense_lower_offset(size, row, local_col)];
+        }
+    }
+
+    Ok(Some(FactorSolvePanelRecord {
+        eliminated_len,
+        row_ids,
+        values,
+    }))
+}
+
 fn zero_dense_column(matrix: &mut [f64], size: usize, pivot: usize) {
     for row in pivot..size {
         matrix[dense_lower_offset(size, row, pivot)] = 0.0;
@@ -5436,9 +5492,9 @@ fn factorize_dense_front(
 
     let mut stats = PanelFactorStats::default();
     let mut profile = FactorProfile::default();
-    let mut factor_order = Vec::new();
-    let mut factor_columns = Vec::new();
-    let mut block_records = Vec::new();
+    let mut factor_order = Vec::with_capacity(active_candidate_end);
+    let mut factor_columns = Vec::with_capacity(active_candidate_end);
+    let mut block_records = Vec::with_capacity(active_candidate_end);
     let mut scratch = vec![0.0; size.saturating_mul(size).max(1)];
     let mut pivot = 0;
 
@@ -5663,13 +5719,14 @@ fn factorize_dense_front(
 
         factor_order.extend(rows[block_start..accepted_end].iter().copied());
         let started = profile_enabled.then(Instant::now);
-        factor_columns.extend(app_build_factor_columns_for_prefix(
+        app_extend_factor_columns_for_prefix(
+            &mut factor_columns,
             &rows,
             &dense,
             size,
             block_start,
             accepted_end,
-        ));
+        );
         if let Some(started) = started {
             profile.app_column_storage_time += started.elapsed();
         }
@@ -5747,9 +5804,13 @@ fn factorize_dense_front(
     };
     let mut solve_panels = Vec::new();
     let started = profile_enabled.then(Instant::now);
-    if let Some(panel) =
-        build_factor_solve_panel_record(&factor_order, &factor_columns, &contribution.row_ids)?
-    {
+    if let Some(panel) = build_dense_front_solve_panel_record(
+        &factor_order,
+        &contribution.row_ids,
+        &dense,
+        size,
+        pivot,
+    )? {
         solve_panels.push(panel);
     }
     if let Some(started) = started {
@@ -5805,10 +5866,11 @@ fn factor_front_recursive(
             collected
         };
 
-    let mut factor_order = Vec::new();
-    let mut factor_columns = Vec::new();
-    let mut block_records = Vec::new();
-    let mut solve_panels = Vec::new();
+    let front_elimination_capacity = front.columns.len() + front.interface_rows.len();
+    let mut factor_order = Vec::with_capacity(front_elimination_capacity);
+    let mut factor_columns = Vec::with_capacity(front_elimination_capacity);
+    let mut block_records = Vec::with_capacity(front_elimination_capacity);
+    let mut solve_panels = Vec::with_capacity(child_results.len() + 1);
     let mut child_contributions = Vec::with_capacity(child_results.len());
     let mut stats = PanelFactorStats::default();
     let mut profile = FactorProfile::default();
@@ -6065,7 +6127,7 @@ fn multifrontal_factorize_with_tree(
 
     let mut factor_order = Vec::with_capacity(dimension);
     let mut factor_columns = Vec::with_capacity(dimension);
-    let mut block_records = Vec::new();
+    let mut block_records = Vec::with_capacity(dimension);
     let mut solve_panel_records = Vec::new();
     let mut stats = PanelFactorStats::default();
     let mut pending_root_contributions = Vec::new();
@@ -6827,15 +6889,16 @@ mod tests {
         OrderingStrategy, PanelFactorStats, PivotMethod, SolvePanel, SsidsError, SsidsOptions,
         SymmetricCscMatrix, analyse, app_adjust_passed_prefix, app_apply_accepted_prefix_update,
         app_apply_block_pivots_to_trailing_rows, app_backup_trailing_lower,
-        app_build_ld_tile_workspace, app_build_ld_workspace, app_first_failed_trailing_column,
-        app_gemv_forward_singleton_column, app_restore_trailing_from_block_backup,
-        app_solve_block_triangular_to_trailing_rows, app_target_block_uses_gemv_forward,
-        app_truncate_records_to_prefix, app_two_by_two_inverse, app_update_one_by_one,
-        app_update_two_by_two, apply_permuted_symmetric_scaling, build_native_row_list_supernodes,
-        build_native_row_list_supernodes_fast, build_permuted_lower_csc_pattern,
-        build_symbolic_front_tree, dense_find_maxloc, dense_lower_offset,
-        dense_symmetric_swap_with_workspace, expand_symmetric_pattern, factor_one_by_one_common,
-        factor_two_by_two_common, factorize, factorize_dense_front,
+        app_build_factor_columns_for_prefix, app_build_ld_tile_workspace, app_build_ld_workspace,
+        app_first_failed_trailing_column, app_gemv_forward_singleton_column,
+        app_restore_trailing_from_block_backup, app_solve_block_triangular_to_trailing_rows,
+        app_target_block_uses_gemv_forward, app_truncate_records_to_prefix, app_two_by_two_inverse,
+        app_update_one_by_one, app_update_two_by_two, apply_permuted_symmetric_scaling,
+        build_dense_front_solve_panel_record, build_factor_solve_panel_record,
+        build_native_row_list_supernodes, build_native_row_list_supernodes_fast,
+        build_permuted_lower_csc_pattern, build_symbolic_front_tree, dense_find_maxloc,
+        dense_lower_offset, dense_symmetric_swap_with_workspace, expand_symmetric_pattern,
+        factor_one_by_one_common, factor_two_by_two_common, factorize, factorize_dense_front,
         factorize_dense_tpp_tail_in_place, fill_permuted_lower_csc_values,
         fill_scaled_permuted_lower_csc_values, native_column_counts, native_postorder_permutation,
         native_supernode_layout, openblas_gemv_n_update_like_native,
@@ -10190,6 +10253,41 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             (-99.0f64).to_bits(),
             "full-pass APP restore should be a no-op"
         );
+    }
+
+    #[test]
+    fn dense_front_solve_panel_record_matches_generic_factor_columns() {
+        let size = 5;
+        let eliminated_len = 3;
+        let rows = vec![3, 1, 4, 0, 2];
+        let mut dense = vec![0.0; size * size];
+        for col in 0..size {
+            for row in col..size {
+                dense[dense_lower_offset(size, row, col)] =
+                    ((17 * (col + 1) + 5 * (row + 3)) as f64) / 13.0;
+            }
+        }
+
+        let factor_columns =
+            app_build_factor_columns_for_prefix(&rows, &dense, size, 0, eliminated_len);
+        let generic = build_factor_solve_panel_record(
+            &rows[..eliminated_len],
+            &factor_columns,
+            &rows[eliminated_len..],
+        )
+        .unwrap()
+        .unwrap();
+        let direct = build_dense_front_solve_panel_record(
+            &rows[..eliminated_len],
+            &rows[eliminated_len..],
+            &dense,
+            size,
+            eliminated_len,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(direct, generic);
     }
 
     fn first_block_prefix_trace_mismatch(
