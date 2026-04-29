@@ -302,3 +302,10 @@ Release performance notes on dense case 58:
   and row order. A five-repeat case-59 release profile measured native/Rust
   saved-scaling factor medians at about `254us`/`264us`, with Rust
   `app_accepted_ld` around `3us` and `app_accepted_update` around `41us`.
+- The APP pivot profile now splits the in-block bucket into `app_maxloc`,
+  `app_swap`, and `app_pivot_update`. These are Rust-only attribution buckets
+  under the existing `app_pivot` total; they do not change pivot selection,
+  swap order, or update arithmetic, but they localize the remaining dense-front
+  gap before another kernel change is attempted. The fine-grained timers are
+  opt-in via `SPRAL_SSIDS_DEBUG_FACTOR_APP_SUBPHASES=1` so default side-by-side
+  release profiles keep their existing timing overhead.

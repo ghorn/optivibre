@@ -2765,9 +2765,12 @@ mod tests {
                 profile.root_delayed_blocks,
             );
             println!(
-                "  rust_spral dense_front_profile tpp={:?} app_pivot_factor={:?} app_block_apply={:?} app_block_trsm={:?} app_block_diag={:?} app_failed_scan={:?} app_restore={:?} app_accepted_update={:?} app_column_storage={:?} solve_panel_build={:?}",
+                "  rust_spral dense_front_profile tpp={:?} app_pivot_factor={:?} app_maxloc={:?} app_swap={:?} app_pivot_update={:?} app_block_apply={:?} app_block_trsm={:?} app_block_diag={:?} app_failed_scan={:?} app_restore={:?} app_accepted_update={:?} app_column_storage={:?} solve_panel_build={:?}",
                 profile.tpp_factorization_time,
                 profile.app_pivot_factor_time,
+                profile.app_maxloc_time,
+                profile.app_symmetric_swap_time,
+                profile.app_pivot_update_time,
                 profile.app_block_pivot_apply_time,
                 profile.app_block_triangular_solve_time,
                 profile.app_block_diagonal_apply_time,
@@ -2959,11 +2962,16 @@ mod tests {
             rust_factor_profiles[0].root_delayed_blocks,
         );
         println!(
-            "  rust_spral dense_front_profile tpp={:?} app_pivot_factor={:?} app_block_apply={:?} app_block_trsm={:?} app_block_diag={:?} app_failed_scan={:?} app_restore={:?} app_accepted_update={:?} app_column_storage={:?} solve_panel_build={:?}",
+            "  rust_spral dense_front_profile tpp={:?} app_pivot_factor={:?} app_maxloc={:?} app_swap={:?} app_pivot_update={:?} app_block_apply={:?} app_block_trsm={:?} app_block_diag={:?} app_failed_scan={:?} app_restore={:?} app_accepted_update={:?} app_column_storage={:?} solve_panel_build={:?}",
             median_profile_duration(&rust_factor_profiles, |profile| profile
                 .tpp_factorization_time),
             median_profile_duration(&rust_factor_profiles, |profile| profile
                 .app_pivot_factor_time),
+            median_profile_duration(&rust_factor_profiles, |profile| profile.app_maxloc_time),
+            median_profile_duration(&rust_factor_profiles, |profile| profile
+                .app_symmetric_swap_time),
+            median_profile_duration(&rust_factor_profiles, |profile| profile
+                .app_pivot_update_time),
             median_profile_duration(&rust_factor_profiles, |profile| profile
                 .app_block_pivot_apply_time),
             median_profile_duration(&rust_factor_profiles, |profile| profile

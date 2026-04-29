@@ -82,6 +82,9 @@ pub struct FactorProfile {
     pub dense_front_factorization_time: Duration,
     pub tpp_factorization_time: Duration,
     pub app_pivot_factor_time: Duration,
+    pub app_maxloc_time: Duration,
+    pub app_symmetric_swap_time: Duration,
+    pub app_pivot_update_time: Duration,
     pub app_block_pivot_apply_time: Duration,
     pub app_block_triangular_solve_time: Duration,
     pub app_block_diagonal_apply_time: Duration,
@@ -115,7 +118,9 @@ impl FactorProfile {
         {
             hits.push("ssids.factor.app_dense.block_ldlt");
         }
-        if self.app_failed_pivot_scan_time > Duration::default() {
+        if self.app_maxloc_time > Duration::default()
+            || self.app_failed_pivot_scan_time > Duration::default()
+        {
             hits.push("ssids.factor.app_dense.maxloc");
         }
         if self.app_accepted_update_time > Duration::default()
@@ -148,6 +153,9 @@ impl FactorProfile {
         self.dense_front_factorization_time += other.dense_front_factorization_time;
         self.tpp_factorization_time += other.tpp_factorization_time;
         self.app_pivot_factor_time += other.app_pivot_factor_time;
+        self.app_maxloc_time += other.app_maxloc_time;
+        self.app_symmetric_swap_time += other.app_symmetric_swap_time;
+        self.app_pivot_update_time += other.app_pivot_update_time;
         self.app_block_pivot_apply_time += other.app_block_pivot_apply_time;
         self.app_block_triangular_solve_time += other.app_block_triangular_solve_time;
         self.app_block_diagonal_apply_time += other.app_block_diagonal_apply_time;
@@ -992,6 +1000,15 @@ fn factor_debug_enabled() -> bool {
     std::env::var_os("SPRAL_SSIDS_DEBUG_FACTOR").is_some()
 }
 
+fn factor_app_subphase_debug_enabled() -> bool {
+    matches!(
+        std::env::var("SPRAL_SSIDS_DEBUG_FACTOR_APP_SUBPHASES")
+            .as_deref()
+            .map(str::to_ascii_lowercase),
+        Ok(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on")
+    )
+}
+
 fn factor_debug_log(message: impl AsRef<str>) {
     if factor_debug_enabled() {
         eprintln!("{}", message.as_ref());
@@ -1339,7 +1356,7 @@ fn factorize_impl(
     )?;
     if let Some(started) = factor_started {
         factor_debug_log(format!(
-            "[ssids_rs::factorize] dim={} supernodes={} scaling={:?} total={:.6}s symbolic_front_tree={:.6}s permuted_pattern={:.6}s permuted_values={:.6}s front_factorization={:.6}s front_assembly={:.6}s dense_front={:.6}s tpp={:.6}s app_pivot={:.6}s app_apply={:.6}s app_triangular={:.6}s app_diagonal={:.6}s app_failed_scan={:.6}s app_backup={:.6}s app_restore={:.6}s app_accepted_update={:.6}s app_accepted_ld={:.6}s app_accepted_gemm={:.6}s app_column_storage={:.6}s solve_panel_build={:.6}s root_delayed={:.6}s factor_inverse={:.6}s lower_storage={:.6}s solve_panel_storage={:.6}s diagonal_storage={:.6}s factor_bytes={:.6}s fronts={} local_dense_entries={}",
+            "[ssids_rs::factorize] dim={} supernodes={} scaling={:?} total={:.6}s symbolic_front_tree={:.6}s permuted_pattern={:.6}s permuted_values={:.6}s front_factorization={:.6}s front_assembly={:.6}s dense_front={:.6}s tpp={:.6}s app_pivot={:.6}s app_maxloc={:.6}s app_swap={:.6}s app_pivot_update={:.6}s app_apply={:.6}s app_triangular={:.6}s app_diagonal={:.6}s app_failed_scan={:.6}s app_backup={:.6}s app_restore={:.6}s app_accepted_update={:.6}s app_accepted_ld={:.6}s app_accepted_gemm={:.6}s app_column_storage={:.6}s solve_panel_build={:.6}s root_delayed={:.6}s factor_inverse={:.6}s lower_storage={:.6}s solve_panel_storage={:.6}s diagonal_storage={:.6}s factor_bytes={:.6}s fronts={} local_dense_entries={}",
             matrix.dimension(),
             symbolic.supernodes.len(),
             options.scaling,
@@ -1352,6 +1369,9 @@ fn factorize_impl(
             profile_ref.dense_front_factorization_time.as_secs_f64(),
             profile_ref.tpp_factorization_time.as_secs_f64(),
             profile_ref.app_pivot_factor_time.as_secs_f64(),
+            profile_ref.app_maxloc_time.as_secs_f64(),
+            profile_ref.app_symmetric_swap_time.as_secs_f64(),
+            profile_ref.app_pivot_update_time.as_secs_f64(),
             profile_ref.app_block_pivot_apply_time.as_secs_f64(),
             profile_ref.app_block_triangular_solve_time.as_secs_f64(),
             profile_ref.app_block_diagonal_apply_time.as_secs_f64(),
@@ -5938,6 +5958,7 @@ fn factorize_dense_front(
     // use the dense front lda, so workspace helpers take the current block's
     // row offset.
     let mut scratch = vec![0.0; APP_INNER_BLOCK_SIZE.saturating_mul(size).max(1)];
+    let app_subphase_profile_enabled = profile_enabled && factor_app_subphase_debug_enabled();
     let mut rows_before_block = Vec::with_capacity(size);
     let mut dense_before_block = Vec::new();
     let mut pivot = 0;
@@ -5958,9 +5979,12 @@ fn factorize_dense_front(
 
         let started = profile_enabled.then(Instant::now);
         while block_pivot < block_end {
-            let Some((best_abs, best_row, best_col)) =
-                dense_find_maxloc(&dense, size, block_pivot, block_end)
-            else {
+            let maxloc_started = app_subphase_profile_enabled.then(Instant::now);
+            let maxloc = dense_find_maxloc(&dense, size, block_pivot, block_end);
+            if let Some(started) = maxloc_started {
+                profile.app_maxloc_time += started.elapsed();
+            }
+            let Some((best_abs, best_row, best_col)) = maxloc else {
                 break;
             };
             if best_abs < options.small_pivot_tolerance {
@@ -5990,6 +6014,7 @@ fn factorize_dense_front(
 
             if best_row == best_col {
                 if best_col != block_pivot {
+                    let swap_started = app_subphase_profile_enabled.then(Instant::now);
                     dense_symmetric_swap_with_workspace_row_offset(
                         &mut dense,
                         size,
@@ -5999,7 +6024,11 @@ fn factorize_dense_front(
                         block_start,
                     );
                     rows.swap(best_col, block_pivot);
+                    if let Some(started) = swap_started {
+                        profile.app_symmetric_swap_time += started.elapsed();
+                    }
                 }
+                let update_started = app_subphase_profile_enabled.then(Instant::now);
                 let block = factor_one_by_one_common_with_workspace_offset(
                     &rows,
                     &mut dense,
@@ -6011,7 +6040,11 @@ fn factorize_dense_front(
                         values: &mut scratch,
                         row_offset: block_start,
                     },
-                )?;
+                );
+                if let Some(started) = update_started {
+                    profile.app_pivot_update_time += started.elapsed();
+                }
+                let block = block?;
                 local_blocks.push(block);
                 block_pivot += 1;
                 continue;
@@ -6039,6 +6072,7 @@ fn factorize_dense_front(
 
             if let Some(index) = one_by_one_index {
                 if index != block_pivot {
+                    let swap_started = app_subphase_profile_enabled.then(Instant::now);
                     dense_symmetric_swap_with_workspace_row_offset(
                         &mut dense,
                         size,
@@ -6048,7 +6082,11 @@ fn factorize_dense_front(
                         block_start,
                     );
                     rows.swap(index, block_pivot);
+                    if let Some(started) = swap_started {
+                        profile.app_symmetric_swap_time += started.elapsed();
+                    }
                 }
+                let update_started = app_subphase_profile_enabled.then(Instant::now);
                 let block = factor_one_by_one_common_with_workspace_offset(
                     &rows,
                     &mut dense,
@@ -6060,7 +6098,11 @@ fn factorize_dense_front(
                         values: &mut scratch,
                         row_offset: block_start,
                     },
-                )?;
+                );
+                if let Some(started) = update_started {
+                    profile.app_pivot_update_time += started.elapsed();
+                }
+                let block = block?;
                 local_blocks.push(block);
                 block_pivot += 1;
                 continue;
@@ -6068,6 +6110,7 @@ fn factorize_dense_front(
 
             if let Some(inverse) = two_by_two_inverse {
                 if first != block_pivot {
+                    let swap_started = app_subphase_profile_enabled.then(Instant::now);
                     dense_symmetric_swap_with_workspace_row_offset(
                         &mut dense,
                         size,
@@ -6080,8 +6123,12 @@ fn factorize_dense_front(
                     if second == block_pivot {
                         second = first;
                     }
+                    if let Some(started) = swap_started {
+                        profile.app_symmetric_swap_time += started.elapsed();
+                    }
                 }
                 if second != block_pivot + 1 {
+                    let swap_started = app_subphase_profile_enabled.then(Instant::now);
                     dense_symmetric_swap_with_workspace_row_offset(
                         &mut dense,
                         size,
@@ -6091,7 +6138,11 @@ fn factorize_dense_front(
                         block_start,
                     );
                     rows.swap(second, block_pivot + 1);
+                    if let Some(started) = swap_started {
+                        profile.app_symmetric_swap_time += started.elapsed();
+                    }
                 }
+                let update_started = app_subphase_profile_enabled.then(Instant::now);
                 let block = factor_two_by_two_common_with_workspace_offset(
                     &rows,
                     &mut dense,
@@ -6106,7 +6157,11 @@ fn factorize_dense_front(
                         values: &mut scratch,
                         row_offset: block_start,
                     },
-                )?;
+                );
+                if let Some(started) = update_started {
+                    profile.app_pivot_update_time += started.elapsed();
+                }
+                let block = block?;
                 local_blocks.push(block);
                 block_pivot += 2;
                 continue;
