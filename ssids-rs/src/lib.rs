@@ -3597,17 +3597,33 @@ fn app_truncate_records_to_prefix(
     accepted
 }
 
+fn app_backup_trailing_lower(matrix: &[f64], size: usize, backup_start: usize) -> Vec<f64> {
+    let backup_size = size - backup_start;
+    let mut backup = vec![0.0; packed_lower_len(backup_size)];
+    for local_col in 0..backup_size {
+        let source_col = backup_start + local_col;
+        let len = backup_size - local_col;
+        let source_start = dense_lower_offset(size, source_col, source_col);
+        let backup_offset = packed_lower_offset(backup_size, local_col, local_col);
+        backup[backup_offset..backup_offset + len]
+            .copy_from_slice(&matrix[source_start..source_start + len]);
+    }
+    backup
+}
+
 fn app_restore_trailing_from_block_backup(
     rows: &[usize],
     rows_before_block: &[usize],
     matrix: &mut [f64],
     matrix_before_block: &[f64],
     size: usize,
+    backup_start: usize,
     trailing_start: usize,
 ) {
     if trailing_start >= size {
         return;
     }
+    let backup_size = size - backup_start;
     let mut old_positions = vec![
         usize::MAX;
         rows.iter()
@@ -3624,8 +3640,17 @@ fn app_restore_trailing_from_block_backup(
         let old_row = old_positions[rows[row]];
         for col in trailing_start..=row {
             let old_col = old_positions[rows[col]];
+            debug_assert!(old_row >= backup_start);
+            debug_assert!(old_col >= backup_start);
+            let local_old_row = old_row - backup_start;
+            let local_old_col = old_col - backup_start;
+            let (backup_row, backup_col) = if local_old_row >= local_old_col {
+                (local_old_row, local_old_col)
+            } else {
+                (local_old_col, local_old_row)
+            };
             matrix[dense_lower_offset(size, row, col)] =
-                matrix_before_block[dense_lower_offset(size, old_row, old_col)];
+                matrix_before_block[packed_lower_offset(backup_size, backup_row, backup_col)];
         }
     }
 }
@@ -5411,7 +5436,7 @@ fn factorize_dense_front(
         let block_end = pivot + APP_INNER_BLOCK_SIZE;
         let started = profile_enabled.then(Instant::now);
         let rows_before_block = rows.clone();
-        let dense_before_block = dense.clone();
+        let dense_before_block = app_backup_trailing_lower(&dense, size, block_start);
         if let Some(started) = started {
             profile.app_backup_time += started.elapsed();
         }
@@ -5599,6 +5624,7 @@ fn factorize_dense_front(
             &mut dense,
             &dense_before_block,
             size,
+            block_start,
             accepted_end,
         );
         if let Some(started) = started {
@@ -6786,8 +6812,8 @@ mod tests {
         FactorBlockRecord, NativeOrdering, NativeSpral, NumericFactorOptions, OrderingStrategy,
         PanelFactorStats, PivotMethod, SolvePanel, SsidsError, SsidsOptions, SymmetricCscMatrix,
         analyse, app_adjust_passed_prefix, app_apply_accepted_prefix_update,
-        app_apply_block_pivots_to_trailing_rows, app_build_ld_tile_workspace,
-        app_build_ld_workspace, app_first_failed_trailing_column,
+        app_apply_block_pivots_to_trailing_rows, app_backup_trailing_lower,
+        app_build_ld_tile_workspace, app_build_ld_workspace, app_first_failed_trailing_column,
         app_gemv_forward_singleton_column, app_restore_trailing_from_block_backup,
         app_solve_block_triangular_to_trailing_rows, app_target_block_uses_gemv_forward,
         app_truncate_records_to_prefix, app_two_by_two_inverse, app_update_one_by_one,
@@ -10065,6 +10091,53 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         Ok(())
     }
 
+    #[test]
+    fn app_packed_block_backup_restores_permuted_trailing_lower() {
+        let size = 8;
+        let backup_start = 2;
+        let trailing_start = 4;
+        let mut original = vec![0.0; size * size];
+        for col in 0..size {
+            for row in col..size {
+                original[dense_lower_offset(size, row, col)] = (100 * col + row) as f64 + 0.25;
+            }
+        }
+
+        let rows_before_block = (0..size).collect::<Vec<_>>();
+        let rows = vec![0, 1, 5, 3, 2, 4, 6, 7];
+        let backup = app_backup_trailing_lower(&original, size, backup_start);
+        let mut matrix = original.clone();
+        for row in trailing_start..size {
+            for col in trailing_start..=row {
+                matrix[dense_lower_offset(size, row, col)] = -1.0;
+            }
+        }
+
+        app_restore_trailing_from_block_backup(
+            &rows,
+            &rows_before_block,
+            &mut matrix,
+            &backup,
+            size,
+            backup_start,
+            trailing_start,
+        );
+
+        for row in trailing_start..size {
+            for col in trailing_start..=row {
+                let old_row = rows[row];
+                let old_col = rows[col];
+                let expected = original[dense_lower_offset(size, old_row, old_col)];
+                let actual = matrix[dense_lower_offset(size, row, col)];
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "restored value mismatch row={row} col={col} old_row={old_row} old_col={old_col}"
+                );
+            }
+        }
+    }
+
     fn first_block_prefix_trace_mismatch(
         rust: &[BlockPrefixSnapshot],
         native: &[BlockPrefixSnapshot],
@@ -12213,7 +12286,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             APP_INNER_BLOCK_SIZE,
             "debug APP replay expects a full APP block"
         );
-        let before_block = lower_dense.clone();
+        let before_block = app_backup_trailing_lower(&lower_dense, size, block_start);
         let rows_before_block = rows.clone();
         let mut scratch = vec![0.0; size.saturating_mul(size).max(1)];
         let mut local_stats = PanelFactorStats::default();
@@ -12372,6 +12445,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             &mut lower_dense,
             &before_block,
             size,
+            block_start,
             accepted_end,
         );
         let restored = lower_dense.clone();
@@ -14794,6 +14868,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         let block_end = APP_INNER_BLOCK_SIZE;
         let rows_before_block = rows.clone();
         let dense_before_block = lower_dense.clone();
+        let dense_restore_backup = app_backup_trailing_lower(&lower_dense, dimension, block_start);
         let mut local_stats = PanelFactorStats::default();
         let mut local_blocks = Vec::new();
         let mut block_pivot = block_start;
@@ -15411,8 +15486,9 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             &rows,
             &rows_before_block,
             &mut lower_dense,
-            &dense_before_block,
+            &dense_restore_backup,
             dimension,
+            block_start,
             accepted_end,
         );
         let restored_lower_dense = lower_dense.clone();
