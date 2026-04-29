@@ -309,3 +309,15 @@ Release performance notes on dense case 58:
   gap before another kernel change is attempted. The fine-grained timers are
   opt-in via `SPRAL_SSIDS_DEBUG_FACTOR_APP_SUBPHASES=1` so default side-by-side
   release profiles keep their existing timing overhead.
+- APP factor profiles now also report low-overhead front-shape counters when
+  profiling is enabled: APP front count, panel count, maxloc calls, symmetric
+  swaps, 1x1/2x2/zero pivot counts, and an eight-bucket APP front-size
+  histogram. These are counted only on profiled runs and are parsed by
+  `scripts/ssids_rs_release_profile.sh` as integer attribution metrics, not as
+  native timing comparisons.
+- The glider exact augmented replay currently exercises 88 APP fronts and 88
+  APP panels: 75 fronts in the 33-64 bucket and 13 in the 65-96 bucket. The
+  observed pivot mix is all 1x1 (`2816` pivots), with `0` 2x2 or zero pivots,
+  `2816` maxloc calls, and roughly `2420` symmetric swaps. That makes glider's
+  remaining factor gap a many-small-front APP path rather than the dense
+  case-59 two-by-two-heavy path.

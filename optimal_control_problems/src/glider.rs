@@ -1924,6 +1924,16 @@ mod tests {
         median_duration(&values)
     }
 
+    fn median_profile_usize(
+        profiles: &[FactorProfile],
+        select: impl Fn(&FactorProfile) -> usize,
+    ) -> usize {
+        assert!(!profiles.is_empty());
+        let mut values = profiles.iter().map(select).collect::<Vec<_>>();
+        values.sort_unstable();
+        values[values.len() / 2]
+    }
+
     fn median_solve_profile_duration(
         profiles: &[SolveProfile],
         select: impl Fn(&SolveProfile) -> Duration,
@@ -2780,6 +2790,24 @@ mod tests {
                 profile.app_column_storage_time,
                 profile.solve_panel_build_time,
             );
+            println!(
+                "  rust_spral dense_front_counters app_fronts={} app_panels={} app_maxloc_calls={} app_swaps={} app_1x1={} app_2x2={} app_zero={} app_front_le32={} app_front_33_64={} app_front_65_96={} app_front_97_128={} app_front_129_160={} app_front_161_256={} app_front_257_512={} app_front_gt512={}",
+                profile.app_front_count,
+                profile.app_panel_count,
+                profile.app_maxloc_calls,
+                profile.app_symmetric_swaps,
+                profile.app_one_by_one_pivots,
+                profile.app_two_by_two_pivots,
+                profile.app_zero_pivots,
+                profile.app_front_size_histogram[0],
+                profile.app_front_size_histogram[1],
+                profile.app_front_size_histogram[2],
+                profile.app_front_size_histogram[3],
+                profile.app_front_size_histogram[4],
+                profile.app_front_size_histogram[5],
+                profile.app_front_size_histogram[6],
+                profile.app_front_size_histogram[7],
+            );
         }
         if let Some(profile) = &rust_exact.solve_profile {
             println!(
@@ -2987,6 +3015,34 @@ mod tests {
                 .app_column_storage_time),
             median_profile_duration(&rust_factor_profiles, |profile| profile
                 .solve_panel_build_time),
+        );
+        println!(
+            "  rust_spral dense_front_counters app_fronts={} app_panels={} app_maxloc_calls={} app_swaps={} app_1x1={} app_2x2={} app_zero={} app_front_le32={} app_front_33_64={} app_front_65_96={} app_front_97_128={} app_front_129_160={} app_front_161_256={} app_front_257_512={} app_front_gt512={}",
+            median_profile_usize(&rust_factor_profiles, |profile| profile.app_front_count),
+            median_profile_usize(&rust_factor_profiles, |profile| profile.app_panel_count),
+            median_profile_usize(&rust_factor_profiles, |profile| profile.app_maxloc_calls),
+            median_profile_usize(&rust_factor_profiles, |profile| profile.app_symmetric_swaps),
+            median_profile_usize(&rust_factor_profiles, |profile| profile
+                .app_one_by_one_pivots),
+            median_profile_usize(&rust_factor_profiles, |profile| profile
+                .app_two_by_two_pivots),
+            median_profile_usize(&rust_factor_profiles, |profile| profile.app_zero_pivots),
+            median_profile_usize(&rust_factor_profiles, |profile| profile
+                .app_front_size_histogram[0]),
+            median_profile_usize(&rust_factor_profiles, |profile| profile
+                .app_front_size_histogram[1]),
+            median_profile_usize(&rust_factor_profiles, |profile| profile
+                .app_front_size_histogram[2]),
+            median_profile_usize(&rust_factor_profiles, |profile| profile
+                .app_front_size_histogram[3]),
+            median_profile_usize(&rust_factor_profiles, |profile| profile
+                .app_front_size_histogram[4]),
+            median_profile_usize(&rust_factor_profiles, |profile| profile
+                .app_front_size_histogram[5]),
+            median_profile_usize(&rust_factor_profiles, |profile| profile
+                .app_front_size_histogram[6]),
+            median_profile_usize(&rust_factor_profiles, |profile| profile
+                .app_front_size_histogram[7]),
         );
         println!(
             "  rust_spral solve_profile input_perm={:?} forward={:?} diagonal={:?} backward={:?} output_perm={:?} recorded={:?}",
