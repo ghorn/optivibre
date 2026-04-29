@@ -4154,12 +4154,42 @@ unsafe fn app_apply_accepted_prefix_update_column_neon(
         let mut update0 = vdupq_n_f64(0.0);
         let mut update1 = vdupq_n_f64(0.0);
         let mut relative_pivot = 0;
-        while relative_pivot < accepted_width {
+        while relative_pivot + 4 <= accepted_width {
             // SAFETY: caller passes `row + 3 < size`, `relative_pivot < accepted_width`,
             // and `ld_values` contains at least `accepted_width * size` entries.
             let row_ld0 = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row)) };
             let row_ld1 = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row + 2)) };
             // SAFETY: `relative_pivot < accepted_width <= APP_INNER_BLOCK_SIZE`.
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(relative_pivot) });
+            update0 = vfmaq_f64(update0, row_ld0, col_l);
+            update1 = vfmaq_f64(update1, row_ld1, col_l);
+
+            let pivot1 = relative_pivot + 1;
+            let row_ld0 = unsafe { vld1q_f64(ld_ptr.add(pivot1 * size + row)) };
+            let row_ld1 = unsafe { vld1q_f64(ld_ptr.add(pivot1 * size + row + 2)) };
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(pivot1) });
+            update0 = vfmaq_f64(update0, row_ld0, col_l);
+            update1 = vfmaq_f64(update1, row_ld1, col_l);
+
+            let pivot2 = relative_pivot + 2;
+            let row_ld0 = unsafe { vld1q_f64(ld_ptr.add(pivot2 * size + row)) };
+            let row_ld1 = unsafe { vld1q_f64(ld_ptr.add(pivot2 * size + row + 2)) };
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(pivot2) });
+            update0 = vfmaq_f64(update0, row_ld0, col_l);
+            update1 = vfmaq_f64(update1, row_ld1, col_l);
+
+            let pivot3 = relative_pivot + 3;
+            let row_ld0 = unsafe { vld1q_f64(ld_ptr.add(pivot3 * size + row)) };
+            let row_ld1 = unsafe { vld1q_f64(ld_ptr.add(pivot3 * size + row + 2)) };
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(pivot3) });
+            update0 = vfmaq_f64(update0, row_ld0, col_l);
+            update1 = vfmaq_f64(update1, row_ld1, col_l);
+
+            relative_pivot += 4;
+        }
+        while relative_pivot < accepted_width {
+            let row_ld0 = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row)) };
+            let row_ld1 = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row + 2)) };
             let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(relative_pivot) });
             update0 = vfmaq_f64(update0, row_ld0, col_l);
             update1 = vfmaq_f64(update1, row_ld1, col_l);
@@ -4183,11 +4213,33 @@ unsafe fn app_apply_accepted_prefix_update_column_neon(
     while row + 1 < size {
         let mut update = vdupq_n_f64(0.0);
         let mut relative_pivot = 0;
-        while relative_pivot < accepted_width {
+        while relative_pivot + 4 <= accepted_width {
             // SAFETY: caller passes `row + 1 < size`, `relative_pivot < accepted_width`,
             // and `ld_values` contains at least `accepted_width * size` entries.
             let row_ld = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row)) };
             // SAFETY: `relative_pivot < accepted_width <= APP_INNER_BLOCK_SIZE`.
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(relative_pivot) });
+            update = vfmaq_f64(update, row_ld, col_l);
+
+            let pivot1 = relative_pivot + 1;
+            let row_ld = unsafe { vld1q_f64(ld_ptr.add(pivot1 * size + row)) };
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(pivot1) });
+            update = vfmaq_f64(update, row_ld, col_l);
+
+            let pivot2 = relative_pivot + 2;
+            let row_ld = unsafe { vld1q_f64(ld_ptr.add(pivot2 * size + row)) };
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(pivot2) });
+            update = vfmaq_f64(update, row_ld, col_l);
+
+            let pivot3 = relative_pivot + 3;
+            let row_ld = unsafe { vld1q_f64(ld_ptr.add(pivot3 * size + row)) };
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(pivot3) });
+            update = vfmaq_f64(update, row_ld, col_l);
+
+            relative_pivot += 4;
+        }
+        while relative_pivot < accepted_width {
+            let row_ld = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row)) };
             let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(relative_pivot) });
             update = vfmaq_f64(update, row_ld, col_l);
             relative_pivot += 1;
@@ -12134,6 +12186,58 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             col_tile_start += APP_INNER_BLOCK_SIZE;
         }
         None
+    }
+
+    fn assert_first_app_accepted_update_matches_native_host_gemm_tiles(
+        shim: &NativeKernelShim,
+        seed: u64,
+        case_index: usize,
+        expected_dimension: usize,
+    ) {
+        let (dimension, dense, _) = dense_boundary_case_matrix_and_solution(seed, case_index);
+        assert_eq!(dimension, expected_dimension);
+        let mut lower_dense = vec![0.0; dimension * dimension];
+        for col in 0..dimension {
+            for row in col..dimension {
+                lower_dense[dense_lower_offset(dimension, row, col)] = dense[row][col];
+            }
+        }
+
+        let options = NumericFactorOptions::default();
+        let replay = replay_app_block_for_debug((0..dimension).collect(), lower_dense, 0, options);
+        assert!(
+            replay.accepted_end > 0 && replay.accepted_end < dimension,
+            "fixture must exercise accepted-prefix trailing update"
+        );
+
+        // This pins the same source boundary as
+        // ldlt_app.cxx::Block::update: calcLD<OP_N> followed by
+        // host_gemm(OP_N, OP_T) over APP row/column tiles.
+        assert_eq!(
+            first_native_accepted_update_mismatch(shim, &replay, 0),
+            None,
+            "dense seed={seed:#x} case={case_index} accepted APP update diverged from native tiled calcLD/host_gemm"
+        );
+    }
+
+    #[test]
+    fn app_accepted_update_dense_witnesses_match_native_host_gemm_tiles() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+
+        assert_first_app_accepted_update_matches_native_host_gemm_tiles(
+            shim,
+            0x7061_7269_7479,
+            58,
+            137,
+        );
+        assert_first_app_accepted_update_matches_native_host_gemm_tiles(
+            shim,
+            0x7061_7269_7479_2026,
+            59,
+            160,
+        );
     }
 
     fn assert_no_bit_mismatch(left: &[f64], right: &[f64], label: &str) {

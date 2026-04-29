@@ -203,3 +203,13 @@ Release performance notes on dense case 58:
   avoiding a second production pass over the same entries. A unit test pins
   the fused path bit-for-bit against the previous fill-then-scale path,
   including SPRAL's `row_scale * value * col_scale` multiplication order.
+- Added `scripts/ssids_rs_release_profile.sh` as the repeatable release profile
+  loop for dense APP witnesses and the glider exact replay. It reports medians
+  for Rust/native analyse, factor, solve, and the Rust factor-profile buckets
+  instead of relying on a single noisy timing sample.
+- The remaining dense-front factor hot path is source-anchored to
+  `ldlt_app.cxx::Block::update`, which builds an APP LD tile with
+  `calcLD<OP_N>` and applies `host_gemm(OP_N, OP_T)`. The
+  `app_accepted_update_dense_witnesses_match_native_host_gemm_tiles` unit test
+  extracts dense witnesses and compares Rust's accepted-prefix trailing update
+  against those native source kernels tile-by-tile before further kernel work.
