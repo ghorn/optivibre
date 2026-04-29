@@ -282,3 +282,10 @@ Release performance notes on dense case 58:
   every candidate through a helper. A five-repeat case-59 release profile put
   saved-scaling `app_pivot` around `46us`, with native/Rust saved-scaling
   factor medians at about `232us`/`259us`.
+- The AArch64 four-column accepted-update microkernel now has an eight-row
+  path. Each lower-triangle entry still accumulates accepted pivots in the same
+  order as the scalar/source-shaped path, but the kernel reuses each accepted L
+  broadcast across twice as many target rows. A five-repeat profile measured
+  case 59 native/Rust saved-scaling factor medians at about `257us`/`278us`,
+  with Rust `app_accepted_gemm` around `40us` and `app_accepted_update` around
+  `45us`; case 58 was effectively tied at about `226us`/`228us`.
