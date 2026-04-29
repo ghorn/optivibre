@@ -277,3 +277,8 @@ Release performance notes on dense case 58:
   writes the same lower-CSC values into the dense front with identity local
   row/column numbering; short case-59 profiles put `front_assembly` around
   `14us` and `permuted_pattern` around `38us`.
+- The APP `find_maxloc` scan now keeps the source-faithful two-lane max/tie
+  order but writes the fixed 32x32 lower-block scan directly instead of routing
+  every candidate through a helper. A five-repeat case-59 release profile put
+  saved-scaling `app_pivot` around `46us`, with native/Rust saved-scaling
+  factor medians at about `232us`/`259us`.

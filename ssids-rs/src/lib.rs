@@ -2713,63 +2713,34 @@ fn dense_find_maxloc(
     let mut primary = (-1.0_f64, to, to);
     let mut secondary = (-1.0_f64, to, to);
 
-    #[inline(always)]
-    fn update_dense_maxloc_slot(
-        slot: &mut (f64, usize, usize),
-        matrix: &[f64],
-        size: usize,
-        block_start: usize,
-        local_row: usize,
-        local_col: usize,
-    ) {
-        let row = block_start + local_row;
-        let col = block_start + local_col;
-        debug_assert!(row >= col);
-        let value = matrix[col * size + row].abs();
-        if value > slot.0 {
-            *slot = (value, row, col);
-        }
-    }
-
     // Native SPRAL's non-AVX SimdVec path still uses two per-lane maxima. Equal
     // values keep their existing lane, so ties are not column-major.
     for local_col in local_from..APP_INNER_BLOCK_SIZE {
-        update_dense_maxloc_slot(
-            &mut primary,
-            matrix,
-            size,
-            block_start,
-            local_col,
-            local_col,
-        );
+        let col = block_start + local_col;
+        let column_offset = col * size;
+        let diag_value = matrix[column_offset + col].abs();
+        if diag_value > primary.0 {
+            primary = (diag_value, col, col);
+        }
         if local_col + 1 < 2 * (local_col / 2 + 1) {
-            update_dense_maxloc_slot(
-                &mut primary,
-                matrix,
-                size,
-                block_start,
-                local_col + 1,
-                local_col,
-            );
+            let row = col + 1;
+            let value = matrix[column_offset + row].abs();
+            if value > primary.0 {
+                primary = (value, row, col);
+            }
         }
         let mut local_row = 2 * (local_col / 2 + 1);
         while local_row < APP_INNER_BLOCK_SIZE {
-            update_dense_maxloc_slot(
-                &mut primary,
-                matrix,
-                size,
-                block_start,
-                local_row,
-                local_col,
-            );
-            update_dense_maxloc_slot(
-                &mut secondary,
-                matrix,
-                size,
-                block_start,
-                local_row + 1,
-                local_col,
-            );
+            let row = block_start + local_row;
+            let value = matrix[column_offset + row].abs();
+            if value > primary.0 {
+                primary = (value, row, col);
+            }
+            let next_row = row + 1;
+            let next_value = matrix[column_offset + next_row].abs();
+            if next_value > secondary.0 {
+                secondary = (next_value, next_row, col);
+            }
             local_row += 2;
         }
     }
