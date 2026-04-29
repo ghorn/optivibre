@@ -1,4 +1,5 @@
 use metis_ordering::{OrderingError, metis_node_nd_order_from_lower_csc};
+use std::time::Instant;
 
 use crate::{SsidsError, SymmetricCscMatrix};
 
@@ -43,11 +44,36 @@ struct FullCscMatrix {
 pub(crate) fn spral_matching_order(
     matrix: SymmetricCscMatrix<'_>,
 ) -> Result<SpralMatchingOrder, SsidsError> {
+    let trace = matching_debug_enabled();
+    let total_started = trace.then(Instant::now);
+    if trace {
+        matching_debug_log(format!(
+            "[ssids_rs::matching] start dim={} nnz={}",
+            matrix.dimension(),
+            matrix.row_indices().len()
+        ));
+    }
+    let started = trace.then(Instant::now);
     let expanded = expand_lower_to_full_spral(matrix)?;
+    matching_debug_log_elapsed("expand_lower_to_full_spral", started);
+    let started = trace.then(Instant::now);
     let compact_abs = remove_explicit_zeroes_and_abs(&expanded);
-    let (scale_logs, matching) = mo_scale(&compact_abs)?;
+    matching_debug_log_elapsed("remove_explicit_zeroes_and_abs", started);
+    let started = trace.then(Instant::now);
+    let (scale_logs, matching) = mo_match(&compact_abs)?;
+    matching_debug_log_elapsed("mo_match", started);
+    let started = trace.then(Instant::now);
     let order = mo_split(&compact_abs, &matching)?;
+    matching_debug_log_elapsed("mo_split", started);
+    let started = trace.then(Instant::now);
     let scaling = scale_logs.into_iter().map(f64::exp).collect();
+    matching_debug_log_elapsed("scaling_exp", started);
+    if let Some(started) = total_started {
+        matching_debug_log(format!(
+            "[ssids_rs::matching] done elapsed={:.6}s",
+            started.elapsed().as_secs_f64()
+        ));
+    }
     Ok(SpralMatchingOrder { order, scaling })
 }
 
@@ -57,7 +83,7 @@ pub fn spral_matching_trace(
 ) -> Result<SpralMatchingTrace, SsidsError> {
     let expanded = expand_lower_to_full_spral(matrix)?;
     let compact_abs = remove_explicit_zeroes_and_abs(&expanded);
-    let (scale_logs, matching) = mo_scale(&compact_abs)?;
+    let (scale_logs, matching) = mo_match(&compact_abs)?;
     let split = mo_split_trace(&compact_abs, &matching)?;
     let scaling = scale_logs.iter().copied().map(f64::exp).collect();
 
@@ -83,6 +109,25 @@ impl SpralCscTrace {
             row_indices: matrix.row_indices.clone(),
             values: matrix.values.clone(),
         }
+    }
+}
+
+fn matching_debug_enabled() -> bool {
+    std::env::var_os("SPRAL_SSIDS_DEBUG_MATCHING").is_some()
+}
+
+fn matching_debug_log(message: impl AsRef<str>) {
+    if matching_debug_enabled() {
+        eprintln!("{}", message.as_ref());
+    }
+}
+
+fn matching_debug_log_elapsed(label: &str, started: Option<Instant>) {
+    if let Some(started) = started {
+        matching_debug_log(format!(
+            "[ssids_rs::matching] {label} elapsed={:.6}s",
+            started.elapsed().as_secs_f64()
+        ));
     }
 }
 
@@ -145,8 +190,8 @@ fn expand_lower_to_full_spral(matrix: SymmetricCscMatrix<'_>) -> Result<FullCscM
 
 fn remove_explicit_zeroes_and_abs(matrix: &FullCscMatrix) -> FullCscMatrix {
     let mut col_ptrs = Vec::with_capacity(matrix.dimension + 1);
-    let mut row_indices = Vec::new();
-    let mut values = Vec::new();
+    let mut row_indices = Vec::with_capacity(matrix.row_indices.len());
+    let mut values = Vec::with_capacity(matrix.values.len());
     col_ptrs.push(0);
     for col in 0..matrix.dimension {
         for entry in matrix.col_ptrs[col]..matrix.col_ptrs[col + 1] {
@@ -167,6 +212,7 @@ fn remove_explicit_zeroes_and_abs(matrix: &FullCscMatrix) -> FullCscMatrix {
     }
 }
 
+#[cfg(test)]
 fn mo_scale(matrix: &FullCscMatrix) -> Result<(Vec<f64>, Vec<Option<usize>>), SsidsError> {
     let compact = remove_explicit_zeroes_and_abs(matrix);
     mo_match(&compact)
@@ -177,6 +223,8 @@ fn mo_match(matrix: &FullCscMatrix) -> Result<(Vec<f64>, Vec<Option<usize>>), Ss
     if n == 0 {
         return Ok((Vec::new(), Vec::new()));
     }
+    let trace = matching_debug_enabled();
+    let started = trace.then(Instant::now);
     let mut cmax = vec![0.0_f64; n];
     for (col, cmax_col) in cmax.iter_mut().enumerate() {
         let max_entry = matrix.values[matrix.col_ptrs[col]..matrix.col_ptrs[col + 1]]
@@ -189,20 +237,28 @@ fn mo_match(matrix: &FullCscMatrix) -> Result<(Vec<f64>, Vec<Option<usize>>), Ss
             0.0
         };
     }
+    matching_debug_log_elapsed("mo_match_cmax", started);
 
+    let started = trace.then(Instant::now);
     let costs = CostCsc::from_matrix(matrix, &cmax);
+    matching_debug_log_elapsed("mo_match_costs", started);
+    let started = trace.then(Instant::now);
     let hungarian = spral_hungarian_match(n, n, &costs);
+    matching_debug_log_elapsed("mo_match_hungarian", started);
     let rank = hungarian.matched;
 
     if rank == n {
+        let started = trace.then(Instant::now);
         let scaling = (0..n)
             .map(|index| {
                 (hungarian.row_dual[index] + hungarian.col_dual[index] - cmax[index]) / 2.0
             })
             .collect();
+        matching_debug_log_elapsed("mo_match_scaling_full_rank", started);
         return Ok((scaling, hungarian.assignment));
     }
 
+    let started = trace.then(Instant::now);
     let mut old_to_new = vec![usize::MAX; n];
     let mut new_to_old = Vec::with_capacity(rank);
     for (row, matched_col) in hungarian.assignment.iter().enumerate() {
@@ -212,8 +268,12 @@ fn mo_match(matrix: &FullCscMatrix) -> Result<(Vec<f64>, Vec<Option<usize>>), Ss
         }
     }
     let reduced_costs = costs.reduce_to_matched_submatrix(&old_to_new, rank);
+    matching_debug_log_elapsed("mo_match_reduce_singular", started);
+    let started = trace.then(Instant::now);
     let reduced_hungarian = spral_hungarian_match(rank, rank, &reduced_costs);
+    matching_debug_log_elapsed("mo_match_hungarian_singular", started);
 
+    let started = trace.then(Instant::now);
     let mut scaling = vec![-f64::MAX; n];
     let mut matching = vec![None; n];
     for reduced_row in 0..rank {
@@ -228,6 +288,7 @@ fn mo_match(matrix: &FullCscMatrix) -> Result<(Vec<f64>, Vec<Option<usize>>), Ss
             / 2.0;
         matching[old_row] = Some(old_col);
     }
+    matching_debug_log_elapsed("mo_match_scaling_singular", started);
 
     Ok((scaling, matching))
 }
@@ -242,15 +303,16 @@ impl CostCsc {
     fn from_matrix(matrix: &FullCscMatrix, cmax: &[f64]) -> Self {
         let n = matrix.dimension;
         let mut ptr = vec![0usize; n + 2];
-        let mut row = vec![0usize];
-        let mut val = vec![0.0f64];
+        let capacity = matrix.row_indices.len() + 1;
+        let mut row = Vec::with_capacity(capacity);
+        let mut val = Vec::with_capacity(capacity);
+        row.push(0);
+        val.push(0.0);
         for col in 0..n {
             ptr[col + 1] = row.len();
             for entry in matrix.col_ptrs[col]..matrix.col_ptrs[col + 1] {
                 let value = matrix.values[entry];
-                if value == 0.0 {
-                    continue;
-                }
+                debug_assert!(value != 0.0, "SPRAL mo_match expects compact nonzero costs");
                 row.push(matrix.row_indices[entry] + 1);
                 val.push(cmax[col] - value.ln());
             }
@@ -261,8 +323,10 @@ impl CostCsc {
 
     fn reduce_to_matched_submatrix(&self, old_to_new: &[usize], reduced_dimension: usize) -> Self {
         let mut ptr = vec![0usize; reduced_dimension + 2];
-        let mut row = vec![0usize];
-        let mut val = vec![0.0f64];
+        let mut row = Vec::with_capacity(self.row.len());
+        let mut val = Vec::with_capacity(self.val.len());
+        row.push(0);
+        val.push(0.0);
         for old_col in 0..old_to_new.len() {
             let new_col = old_to_new[old_col];
             if new_col == usize::MAX {
@@ -381,7 +445,7 @@ fn spral_hungarian_match(m: usize, n: usize, cost: &CostCsc) -> SpralHungarianRe
                 } else {
                     qlen += 1;
                     l[i] = qlen;
-                    heap_update(i, q.len() - 1, &mut q, &d, &mut l);
+                    heap_update(i, &mut q, &d, &mut l);
                 }
                 let jj = iperm[i];
                 out[jj] = klong;
@@ -403,7 +467,7 @@ fn spral_hungarian_match(m: usize, n: usize, cost: &CostCsc) -> SpralHungarianRe
                         if d[i] > dmin {
                             break;
                         }
-                        let i = heap_pop(&mut qlen, q.len() - 1, &mut q, &d, &mut l);
+                        let i = heap_pop(&mut qlen, &mut q, &d, &mut l);
                         low -= 1;
                         q[low] = i;
                         l[i] = low;
@@ -444,7 +508,7 @@ fn spral_hungarian_match(m: usize, n: usize, cost: &CostCsc) -> SpralHungarianRe
                         if dnew <= dmin {
                             let lpos = l[i];
                             if lpos != 0 {
-                                heap_delete(lpos, &mut qlen, q.len() - 1, &mut q, &d, &mut l);
+                                heap_delete(lpos, &mut qlen, &mut q, &d, &mut l);
                             }
                             low -= 1;
                             q[low] = i;
@@ -454,7 +518,7 @@ fn spral_hungarian_match(m: usize, n: usize, cost: &CostCsc) -> SpralHungarianRe
                                 qlen += 1;
                                 l[i] = qlen;
                             }
-                            heap_update(i, q.len() - 1, &mut q, &d, &mut l);
+                            heap_update(i, &mut q, &d, &mut l);
                         }
                         let jj = iperm[i];
                         out[jj] = klong;
@@ -633,7 +697,7 @@ fn spral_hungarian_init_heuristic(
     }
 }
 
-fn heap_update(idx: usize, _n: usize, q: &mut [usize], val: &[f64], l: &mut [usize]) {
+fn heap_update(idx: usize, q: &mut [usize], val: &[f64], l: &mut [usize]) {
     let mut pos = l[idx];
     if pos <= 1 {
         q[pos] = idx;
@@ -655,20 +719,13 @@ fn heap_update(idx: usize, _n: usize, q: &mut [usize], val: &[f64], l: &mut [usi
     l[idx] = pos;
 }
 
-fn heap_pop(qlen: &mut usize, n: usize, q: &mut [usize], val: &[f64], l: &mut [usize]) -> usize {
+fn heap_pop(qlen: &mut usize, q: &mut [usize], val: &[f64], l: &mut [usize]) -> usize {
     let popped = q[1];
-    heap_delete(1, qlen, n, q, val, l);
+    heap_delete(1, qlen, q, val, l);
     popped
 }
 
-fn heap_delete(
-    pos0: usize,
-    qlen: &mut usize,
-    _n: usize,
-    q: &mut [usize],
-    d: &[f64],
-    l: &mut [usize],
-) {
+fn heap_delete(pos0: usize, qlen: &mut usize, q: &mut [usize], d: &[f64], l: &mut [usize]) {
     if *qlen == pos0 {
         *qlen -= 1;
         return;
@@ -893,8 +950,9 @@ fn compressed_lower_pattern(
 
 fn build_full_csc_from_columns(dimension: usize, cols: Vec<Vec<(usize, f64)>>) -> FullCscMatrix {
     let mut col_ptrs = Vec::with_capacity(dimension + 1);
-    let mut row_indices = Vec::new();
-    let mut values = Vec::new();
+    let nnz = cols.iter().map(Vec::len).sum();
+    let mut row_indices = Vec::with_capacity(nnz);
+    let mut values = Vec::with_capacity(nnz);
     col_ptrs.push(0);
     for col in cols {
         for (row, value) in col {

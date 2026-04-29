@@ -23,9 +23,12 @@ native METIS; those libraries are oracles for parity tests only.
 | METIS `separator.c::ConstructSeparator`, `srefine.c::Compute2WayNodePartitionParams`, `sfm.c::FM_2WayNodeRefine*` coarse separator refinement | `metis_debug_l1_construct_separator_from_lower_csc` | `metis_l1_construct_separator_matches_native_*`, `native_metis_node_bisection_stage_phase_tests` | Native-matching for path/star and the 54-vertex Match_RM coarse separator; `ctrl->compress` rollback limits are ported |
 | METIS `srefine.c::Project2WayNodePartition`, `Refine2WayNode`, active `FM_2WayNodeBalance` | `project_node_separator_state_through_coarsening`, `metis_l1_projected_separator_trace`, `fm_2way_node_balance` | `metis_l1_projected_separator_matches_native_path_54_fixture`, `native_metis_node_nd_fixture_phase_tests` | Native-matching for path/star no-op projection plus multi-level path projections through `path_1000` and L2 projection on `path_5000` |
 | METIS `ometis.c::MlevelNodeBisectionL2` large-graph separator path | `metis_l2_node_bisection_trace_with_rng`, `metis_coarsen_graph_nlevels_with_maps` | `metis_node_nd_orders_path_5000_l2_fixture`, `native_metis_node_nd_top_separator_compression_retry_phase_test`, `native_metis_node_nd_fixture_phase_tests` | Native-matching on `path_5000`: four-level pre-coarsening, five L1 retry runs, best-separator restore, and final projection are pinned |
-| METIS `ometis.c::MlevelNestedDissection` recursive separator plus MMD leaves | `metis_recursive_node_nd_order`, `assign_nested_dissection_positions` | `native_metis_node_nd_fixture_phase_tests` | Native-matching on complete-compressed, empty zero-edge, path, star, `path_54`, `path_121`, `path_300`, `path_1000`, compressed `twin_path_2400`, and L2 `path_5000`; `ccorder` remains unported |
+| METIS `ometis.c::MlevelNestedDissection` recursive separator plus MMD leaves | `metis_recursive_node_nd_order`, `assign_nested_dissection_positions` | `native_metis_node_nd_fixture_phase_tests` | Native-matching on complete-compressed, empty zero-edge, path, star, `path_54`, `path_121`, `path_300`, `path_1000`, compressed `twin_path_2400`, and L2 `path_5000` |
+| METIS `ometis.c::MlevelNestedDissectionCC`, `contig.c::FindSepInducedComponents`, `ometis.c::SplitGraphOrderCC` | `metis_recursive_node_nd_order_cc`, `find_separator_induced_components`, `split_graph_order_cc` | `native_metis_cc_component_phase_tests`, `native_metis_node_nd_non_default_option_phase_tests` | Native-matching for `ccorder=true` separator-induced component CSR, shuffled component order, split subgraph labels/CSR, final star order, compressed `twin_path_256`, and combined pruning+CC |
+| METIS `compress.c::PruneGraph` and `ometis.c` pruned-order expansion | `prune_metis_node_nd_graph`, `MetisNodeNdExpansion::Pruned` | `native_metis_prune_phase_tests`, `native_metis_node_nd_non_default_option_phase_tests` | Native-matching for no-prune reset, all-pruned ignored reset, partial hub pruning, compression disablement after real pruning, and final expansion of pruned vertices |
 | METIS `ometis.c::MlevelNodeBisectionMultiple` top separator state and `nseps` retry semantics | `metis_node_bisection_multiple_trace_with_rng`, `metis_debug_node_nd_top_separator_from_lower_csc` | `native_metis_separator_fixture_phase_tests`, `native_metis_node_nd_top_separator_compression_retry_phase_test` direct internal native oracle | Pinned for path/star, `path_54`, compressed `twin_path_2400`, and L2 `path_5000`: separator labels, boundary nodes, mincut, part weights, compression map, equal-mincut retry tie behavior, and L2 separator projection are fail-closed native expectations |
-| `metis5_wrapper.F90::metis_order` calling METIS `NodeND` | `metis_ordering::metis_node_nd_order` | `metis_node_nd_*` unit tests, dense native trace, direct native fixture oracle | Dense-compression, `<5000` L1 multilevel, compression retry, and `>=5000` L2 path fixtures integrated; full METIS 5.2.1 parity is not closed |
+| METIS `ometis.c::METIS_NodeND` option branches `COMPRESS`, `CCORDER`, `PFACTOR` | `metis_node_nd_order_with_options`, `MetisNodeNdOptions` | `native_metis_node_nd_non_default_option_phase_tests` source-built C shim | Native-matching for SPRAL default regression, forced `compress=false`, `ccorder=true`, no-prune `pfactor`, partial-prune `pfactor`, all-pruned ignored `pfactor`, pruning+CC, and compression+CC |
+| `metis5_wrapper.F90::metis_order` calling METIS `NodeND` | `metis_ordering::metis_node_nd_order` | `metis_node_nd_*` unit tests, dense native trace, direct native fixture oracle | Dense-compression, `<5000` L1 multilevel, compression retry, `>=5000` L2 path fixtures, and documented non-default NodeND option branches integrated; SPRAL's wrapper still uses METIS defaults |
 | `ssids.f90` analyse saved scaling | `SymbolicFactor::saved_matching_scaling` | `spral_matching_analysis_requires_values_and_reports_kind` | Integrated behind `OrderingStrategy::SpralMatching` |
 | `ssids.f90` factor `case(3)` scaling permutation | `numeric_scaling_for_symbolic` | `saved_matching_scaling_is_explicit_and_solves_in_original_coordinates` | Integrated behind `NumericScalingStrategy::SavedMatching` |
 | `assemble.hxx::add_a_block` scaled values | `apply_permuted_symmetric_scaling` | `permuted_symmetric_scaling_uses_spral_multiplication_order`, dense native trace | Integrated |
@@ -33,26 +36,31 @@ native METIS; those libraries are oracles for parity tests only.
 
 Open parity work:
 
-- Port remaining METIS 5.2.1 `METIS_NodeND` internals source-faithfully:
-  default `ccorder = 0` no longer needs the disconnected component-ordering
-  path, and default `pfactor = 0` does not prune high-degree vertices. Those
-  non-default branches remain unported. Compression-driven `nseps` retry
-  selection is now pinned by `twin_path_2400_compression_nseps_retry`,
+- METIS 5.2.1 `METIS_NodeND` internals are now source-ported for the SPRAL
+  default path plus the non-default `COMPRESS`, `CCORDER`, and `PFACTOR`
+  branches exposed by `MetisNodeNdOptions`. SPRAL's production wrapper still
+  calls `METIS_SetDefaultOptions` and uses default `compress = true`,
+  `ccorder = false`, and `pfactor = 0`; the configurable Rust API exists to
+  keep the source branch audit fail-closed, not to change SPRAL defaults.
+  Compression-driven `nseps` retry selection is pinned by
+  `twin_path_2400_compression_nseps_retry`,
   including the source tie behavior that keeps the final equal-mincut trial.
   The zero-edge `RandomBisection` branch is pinned by `empty_3`, and the
   `MlevelNodeBisectionL2` branch is pinned by `path_5000_l2_projection`. The
   standalone `genmmd` leaf routine, `Match_RM`, `Match_2Hop`, `Match_SHEM`,
   multi-level projection, active node balance, recursive L1 nested dissection,
-  and L2 large-graph separator path are now ported and native-oracle tested.
+  L2 large-graph separator path, `MlevelNestedDissectionCC`, `PruneGraph`, and
+  pruned-order expansion are now ported and native-oracle tested.
 - Direct native `metis_order` fixture oracle status:
   `complete_69_compresses_to_single_component`, `path_6`, `star_7`, and
   path fixtures `54`, `121`, `300`, and `1000` now match. The compressed
   `twin_path_2400` fixture also matches after exercising `cfactor > 1.5`,
   `nseps = 2`, retry tie handling, and compressed FM rollback limits.
-  `empty_3` matches after exercising the zero-edge `RandomBisection` path.
-  `path_5000` matches after exercising `MlevelNodeBisectionL2`. The remaining
-  unported branches are non-default `ccorder` component ordering and
-  non-default pruning.
+  `empty_3` matches after exercising the zero-edge `RandomBisection` path, and
+  `path_5000` matches after exercising `MlevelNodeBisectionL2`. The additional
+  source-built C `METIS_NodeND` shim now pins non-default forced
+  no-compression, `ccorder`, pruning, all-pruned ignored, pruning+CC, and
+  compression+CC fixtures.
 - Direct native separator fixture status:
   `path_6` top separator is vertex `2` with `where=[1,1,2,0,0,0]`;
   `star_7` top separator is vertex `0` with `where=[2,0,1,0,1,1,0]`;
@@ -104,9 +112,94 @@ Release performance notes on dense case 58:
   after reusing the initial symbolic pattern when SPRAL-style postorder is
   identity, replacing per-fill-edge linear membership checks with word-wise
   bitset fill propagation, and building permuted CSR graphs directly.
-- Rust captured-order/no-scaling analyse moved to roughly `0.7ms`; the
-  remaining matching/scaling overhead is therefore about `0.5-0.6ms`, close to
-  the native matching/scaling overhead on the same witness.
+- Rust captured-order/no-scaling analyse moved further to roughly
+  `0.5-0.65ms` on this witness after using the already-computed symbolic
+  column counts in release builds and short-circuiting SPRAL's row-list result
+  for the single full-rank supernode case. The debug/test build still checks
+  the source-faithful `find_col_counts` port against the symbolic counts.
+- Rust captured-order/no-scaling analyse then moved to roughly `0.4ms` after
+  switching small/medium graph permutation to a sorted bitset construction and
+  removing a per-column temporary allocation in symbolic fill simulation.
+- `ssids-rs` now builds its analysis CSR graph directly from the validated
+  lower CSC matrix accepted by `SymmetricCscMatrix`, avoiding the public
+  `metis_ordering::CsrGraph::from_symmetric_csc` sort/dedup path in SSIDS
+  analyse. Internally constructed SSIDS CSR graphs now use a hidden trusted
+  constructor that still checks invariants in debug builds. Dense case-58
+  release timings are now roughly `0.20-0.23ms` for captured-order/no-scaling
+  analyse and roughly `0.79-0.86ms` for `SpralMatching` saved-scaling analyse,
+  effectively matching native analyse timing on this witness.
+- Rust `SpralMatching` analyse is now roughly native-speed on the same witness;
+  the remaining matching/scaling overhead is still close to native's own
+  matching/scaling overhead.
+- `SPRAL_SSIDS_DEBUG_MATCHING=1` now splits the Rust SPRAL matching ladder into
+  expand, zero-removal/abs compaction, `mo_match`, `mo_split`, and scaling-exp
+  phases. On dense case 58 the `mo_match` phase is dominated by source-faithful
+  cost construction plus the Hungarian walk; the CSC buffers now reserve the
+  exact nonzero-sized capacity used by the upstream array path.
+- The production and trace matching paths now feed the already compact
+  absolute-value matrix directly into `mo_match`; the `mo_scale` boundary helper
+  remains test-only for phase coverage of SPRAL's zero-removal/abs transform.
 - Native SPRAL still analyses the captured explicit-order witness in roughly
   `0.2ms`, so the remaining performance gap is in the Rust symbolic-analysis
   implementation rather than in the matching/scaling phase itself.
+- `SPRAL_SSIDS_DEBUG_FACTOR=1` now prints an env-gated Rust factor profile.
+  Dense case 58 currently localizes most remaining Rust factor time to APP
+  dense-front work, especially the accepted-prefix trailing update, rather than
+  saved scaling or sparse front assembly.
+- The APP accepted-prefix update now reuses the dense-front scratch buffer for
+  its LD workspace in production; the allocating wrapper remains test-only. Its
+  inner accepted-pivot dot keeps the source-faithful `mul_add` sequence but is
+  unrolled by four, moving the dense case-58 accepted-update phase from roughly
+  `0.17ms` to roughly `0.13ms` while preserving bitwise parity.
+- The APP `host_trsm`-equivalent apply now specializes the common full
+  group-of-four triangular solve while preserving each column's prior-dot order
+  and the intra-group update sequence. Dense case-58 `app_triangular` moved
+  from roughly `0.095ms` to roughly `0.041ms`.
+- On AArch64, that same APP triangular apply now processes two trailing rows at
+  a time with NEON while preserving each row's prior-column dot order and
+  in-group triangular update order. Dense case-58 `app_triangular` now measures
+  around `12-14us` in release profile runs.
+- On AArch64, the in-block APP 1x1 and 2x2 update kernels now use two-row NEON
+  updates while preserving each entry's source expression. Dense case-58
+  `app_pivot` now measures around `51us` on the saved-scaling path.
+- The APP factor profile now separates block backup/restore from the accepted
+  trailing update. Dense case 58 shows backup/restore are small; the hot path is
+  the source-equivalent `calcLD + host_gemm(OP_N, OP_T)` update. Rust now walks
+  the target lower triangle in dense column order and caches each accepted
+  column's L values while preserving the exact per-entry pivot accumulation
+  order and the singleton incremental branch. Flattening the inner loop over
+  accepted pivot columns trims the scalar accepted update to roughly `0.13ms`
+  on the dense witness, with the remaining gap attributable to native SPRAL
+  dispatching the same operation to BLAS.
+- `SPRAL_SSIDS_DEBUG_FACTOR=1` now splits that accepted update into LD build and
+  GEMM-equivalent buckets. Dense case 58 shows LD construction at roughly `4us`
+  and the scalar GEMM-equivalent update at roughly `125us`, so further factor
+  performance work should target the `host_gemm(OP_N, OP_T)` equivalent rather
+  than matching/scaling, LD generation, or restore logic.
+- On AArch64, the accepted-update kernel now processes four target rows with
+  two NEON accumulators, then falls back to the two-row and scalar tails. Each
+  lane keeps the same per-entry accepted-pivot accumulation order as the scalar
+  path, while dense case 58 moves the GEMM-equivalent bucket to roughly `60us`
+  and the full accepted-update bucket to roughly `65us` while keeping native
+  matching/scaling solve bits exact.
+- The AArch64 accepted-update kernel now also pairs adjacent target columns,
+  reusing each LD row load for both columns while preserving the exact
+  per-entry accepted-pivot FMA order. On the 160x160 dense witness
+  `seed=0x7061726974792026, case=59`, the saved-scaling APP
+  GEMM-equivalent bucket now measures roughly `53-58us`, and the saved-scaling
+  factor path is roughly `0.32-0.36ms` in release profile runs with native
+  matching/scaling solve bits still exact.
+- Final lower-factor storage now reserves the exact number of off-diagonal
+  entries before filling the CSC buffers. On the same 160x160 witness this
+  trims the `lower_storage` profile bucket into the roughly `19-27us` range
+  without changing numeric data or solve order.
+- The AArch64 in-block APP 1x1 update now mirrors
+  `block_ldlt.hxx::update_1x1`'s four-column source unroll, reusing each
+  pivot-column NEON vector across four target columns while leaving each
+  lower-triangle entry's FMA expression unchanged. On the same witness,
+  saved-scaling `app_pivot` samples around `51-53us` and factor time around
+  `0.33-0.35ms`, with native matching/scaling solve bits still exact.
+- Saved analyse scaling is now applied while filling the permuted CSC values,
+  avoiding a second production pass over the same entries. A unit test pins
+  the fused path bit-for-bit against the previous fill-then-scale path,
+  including SPRAL's `row_scale * value * col_scale` multiplication order.

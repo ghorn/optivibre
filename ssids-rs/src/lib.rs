@@ -72,8 +72,11 @@ pub struct FactorProfile {
     pub app_block_triangular_solve_time: Duration,
     pub app_block_diagonal_apply_time: Duration,
     pub app_failed_pivot_scan_time: Duration,
+    pub app_backup_time: Duration,
     pub app_restore_time: Duration,
     pub app_accepted_update_time: Duration,
+    pub app_accepted_ld_time: Duration,
+    pub app_accepted_gemm_time: Duration,
     pub app_column_storage_time: Duration,
     pub solve_panel_build_time: Duration,
     pub root_delayed_factorization_time: Duration,
@@ -114,8 +117,11 @@ impl FactorProfile {
         self.app_block_triangular_solve_time += other.app_block_triangular_solve_time;
         self.app_block_diagonal_apply_time += other.app_block_diagonal_apply_time;
         self.app_failed_pivot_scan_time += other.app_failed_pivot_scan_time;
+        self.app_backup_time += other.app_backup_time;
         self.app_restore_time += other.app_restore_time;
         self.app_accepted_update_time += other.app_accepted_update_time;
+        self.app_accepted_ld_time += other.app_accepted_ld_time;
+        self.app_accepted_gemm_time += other.app_accepted_gemm_time;
         self.app_column_storage_time += other.app_column_storage_time;
         self.solve_panel_build_time += other.solve_panel_build_time;
         self.root_delayed_factorization_time += other.root_delayed_factorization_time;
@@ -947,12 +953,56 @@ fn analyse_debug_log(message: impl AsRef<str>) {
     }
 }
 
+fn factor_debug_enabled() -> bool {
+    std::env::var_os("SPRAL_SSIDS_DEBUG_FACTOR").is_some()
+}
+
+fn factor_debug_log(message: impl AsRef<str>) {
+    if factor_debug_enabled() {
+        eprintln!("{}", message.as_ref());
+    }
+}
+
+fn graph_from_lower_csc(matrix: SymmetricCscMatrix<'_>) -> Result<CsrGraph, SsidsError> {
+    let dimension = matrix.dimension();
+    let mut degree = vec![0usize; dimension];
+    for col in 0..dimension {
+        for &row in &matrix.row_indices()[matrix.col_ptrs()[col]..matrix.col_ptrs()[col + 1]] {
+            if row == col {
+                continue;
+            }
+            degree[col] += 1;
+            degree[row] += 1;
+        }
+    }
+
+    let mut offsets = Vec::with_capacity(dimension + 1);
+    offsets.push(0);
+    for &degree in &degree {
+        offsets.push(offsets[offsets.len() - 1] + degree);
+    }
+    let mut write = offsets[..dimension].to_vec();
+    let mut neighbors = vec![0usize; offsets[dimension]];
+    for col in 0..dimension {
+        for &row in &matrix.row_indices()[matrix.col_ptrs()[col]..matrix.col_ptrs()[col + 1]] {
+            if row == col {
+                continue;
+            }
+            neighbors[write[row]] = col;
+            write[row] += 1;
+            neighbors[write[col]] = row;
+            write[col] += 1;
+        }
+    }
+    debug_assert_eq!(&write, &offsets[1..]);
+    Ok(CsrGraph::from_trusted_sorted_adjacency(offsets, neighbors))
+}
+
 pub fn analyse(
     matrix: SymmetricCscMatrix<'_>,
     options: &SsidsOptions,
 ) -> Result<(SymbolicFactor, AnalyseInfo), SsidsError> {
-    let graph =
-        CsrGraph::from_symmetric_csc(matrix.dimension(), matrix.col_ptrs(), matrix.row_indices())?;
+    let graph = graph_from_lower_csc(matrix)?;
     let column_has_entries = (0..matrix.dimension())
         .map(|col| matrix.col_ptrs()[col + 1] > matrix.col_ptrs()[col])
         .collect::<Vec<_>>();
@@ -1141,8 +1191,7 @@ pub fn analyse_with_user_ordering(
     matrix: SymmetricCscMatrix<'_>,
     order: &[usize],
 ) -> Result<(SymbolicFactor, AnalyseInfo), SsidsError> {
-    let graph =
-        CsrGraph::from_symmetric_csc(matrix.dimension(), matrix.col_ptrs(), matrix.row_indices())?;
+    let graph = graph_from_lower_csc(matrix)?;
     let column_has_entries = (0..matrix.dimension())
         .map(|col| matrix.col_ptrs()[col + 1] > matrix.col_ptrs()[col])
         .collect::<Vec<_>>();
@@ -1159,8 +1208,7 @@ pub fn analyse_with_user_ordering(
 pub fn approximate_minimum_degree_permutation(
     matrix: SymmetricCscMatrix<'_>,
 ) -> Result<Permutation, SsidsError> {
-    let graph =
-        CsrGraph::from_symmetric_csc(matrix.dimension(), matrix.col_ptrs(), matrix.row_indices())?;
+    let graph = graph_from_lower_csc(matrix)?;
     Ok(approximate_minimum_degree_order(&graph)?.permutation)
 }
 
@@ -1188,7 +1236,7 @@ fn factorize_impl(
     matrix: SymmetricCscMatrix<'_>,
     symbolic: &SymbolicFactor,
     options: &NumericFactorOptions,
-    mut profile: Option<&mut FactorProfile>,
+    profile: Option<&mut FactorProfile>,
 ) -> Result<(NumericFactor, FactorInfo), SsidsError> {
     if matrix.dimension() != symbolic.permutation.len() {
         return Err(SsidsError::DimensionMismatch {
@@ -1196,12 +1244,19 @@ fn factorize_impl(
             actual: matrix.dimension(),
         });
     }
+    let factor_started = factor_debug_enabled().then(Instant::now);
     let numeric_scaling = numeric_scaling_for_symbolic(symbolic, options)?;
-    let profile_enabled = profile.is_some();
+    let debug_profile_enabled = factor_started.is_some();
+    let mut debug_profile = FactorProfile::default();
+    let profile_enabled = profile.is_some() || debug_profile_enabled;
+    let profile_ref = match profile {
+        Some(profile) => profile,
+        None => &mut debug_profile,
+    };
     let started = profile_enabled.then(Instant::now);
     let front_tree = build_symbolic_front_tree(symbolic);
-    if let (Some(profile), Some(started)) = (profile.as_mut(), started) {
-        profile.symbolic_front_tree_time += started.elapsed();
+    if let Some(started) = started {
+        profile_ref.symbolic_front_tree_time += started.elapsed();
     }
     let mut factor = NumericFactor {
         dimension: matrix.dimension(),
@@ -1243,7 +1298,46 @@ fn factorize_impl(
             .max()
             .unwrap_or(0),
     };
-    let info = factor.refactorize_with_cached_symbolic_profile(matrix, profile)?;
+    let info = factor.refactorize_with_cached_symbolic_profile(
+        matrix,
+        profile_enabled.then_some(&mut *profile_ref),
+    )?;
+    if let Some(started) = factor_started {
+        factor_debug_log(format!(
+            "[ssids_rs::factorize] dim={} supernodes={} scaling={:?} total={:.6}s symbolic_front_tree={:.6}s permuted_pattern={:.6}s permuted_values={:.6}s front_factorization={:.6}s front_assembly={:.6}s dense_front={:.6}s tpp={:.6}s app_pivot={:.6}s app_apply={:.6}s app_triangular={:.6}s app_diagonal={:.6}s app_failed_scan={:.6}s app_backup={:.6}s app_restore={:.6}s app_accepted_update={:.6}s app_accepted_ld={:.6}s app_accepted_gemm={:.6}s app_column_storage={:.6}s solve_panel_build={:.6}s root_delayed={:.6}s factor_inverse={:.6}s lower_storage={:.6}s solve_panel_storage={:.6}s diagonal_storage={:.6}s factor_bytes={:.6}s fronts={} local_dense_entries={}",
+            matrix.dimension(),
+            symbolic.supernodes.len(),
+            options.scaling,
+            started.elapsed().as_secs_f64(),
+            profile_ref.symbolic_front_tree_time.as_secs_f64(),
+            profile_ref.permuted_pattern_time.as_secs_f64(),
+            profile_ref.permuted_values_time.as_secs_f64(),
+            profile_ref.front_factorization_time.as_secs_f64(),
+            profile_ref.front_assembly_time.as_secs_f64(),
+            profile_ref.dense_front_factorization_time.as_secs_f64(),
+            profile_ref.tpp_factorization_time.as_secs_f64(),
+            profile_ref.app_pivot_factor_time.as_secs_f64(),
+            profile_ref.app_block_pivot_apply_time.as_secs_f64(),
+            profile_ref.app_block_triangular_solve_time.as_secs_f64(),
+            profile_ref.app_block_diagonal_apply_time.as_secs_f64(),
+            profile_ref.app_failed_pivot_scan_time.as_secs_f64(),
+            profile_ref.app_backup_time.as_secs_f64(),
+            profile_ref.app_restore_time.as_secs_f64(),
+            profile_ref.app_accepted_update_time.as_secs_f64(),
+            profile_ref.app_accepted_ld_time.as_secs_f64(),
+            profile_ref.app_accepted_gemm_time.as_secs_f64(),
+            profile_ref.app_column_storage_time.as_secs_f64(),
+            profile_ref.solve_panel_build_time.as_secs_f64(),
+            profile_ref.root_delayed_factorization_time.as_secs_f64(),
+            profile_ref.factor_inverse_time.as_secs_f64(),
+            profile_ref.lower_storage_time.as_secs_f64(),
+            profile_ref.solve_panel_storage_time.as_secs_f64(),
+            profile_ref.diagonal_storage_time.as_secs_f64(),
+            profile_ref.factor_bytes_time.as_secs_f64(),
+            profile_ref.front_count,
+            profile_ref.local_dense_entries,
+        ));
+    }
     Ok((factor, info))
 }
 
@@ -1280,7 +1374,14 @@ fn permute_graph(graph: &CsrGraph, permutation: &Permutation) -> CsrGraph {
     if is_identity_order(permutation.perm()) {
         return graph.clone();
     }
+    if graph.vertex_count() <= 2048 {
+        return permute_graph_with_bitsets(graph, permutation);
+    }
 
+    permute_graph_with_sorted_edges(graph, permutation)
+}
+
+fn permute_graph_with_sorted_edges(graph: &CsrGraph, permutation: &Permutation) -> CsrGraph {
     let dimension = graph.vertex_count();
     let inverse = permutation.inverse();
     let mut degrees = vec![0_usize; dimension];
@@ -1315,7 +1416,55 @@ fn permute_graph(graph: &CsrGraph, permutation: &Permutation) -> CsrGraph {
     for vertex in 0..dimension {
         neighbors[offsets[vertex]..offsets[vertex + 1]].sort_unstable();
     }
-    CsrGraph::new(offsets, neighbors).expect("permutation preserves graph shape")
+    CsrGraph::from_trusted_sorted_adjacency(offsets, neighbors)
+}
+
+fn permute_graph_with_bitsets(graph: &CsrGraph, permutation: &Permutation) -> CsrGraph {
+    let dimension = graph.vertex_count();
+    let words_per_row = dimension.div_ceil(64);
+    let inverse = permutation.inverse();
+    let mut edge_bits = vec![0_u64; dimension * words_per_row];
+    for vertex in 0..dimension {
+        for &neighbor in graph.neighbors(vertex) {
+            if vertex < neighbor {
+                let lhs = inverse[vertex];
+                let rhs = inverse[neighbor];
+                symbolic_edge_set(&mut edge_bits, words_per_row, lhs, rhs);
+                symbolic_edge_set(&mut edge_bits, words_per_row, rhs, lhs);
+            }
+        }
+    }
+
+    let mut offsets = Vec::with_capacity(dimension + 1);
+    offsets.push(0);
+    for vertex in 0..dimension {
+        let row_start = vertex * words_per_row;
+        let degree = edge_bits[row_start..row_start + words_per_row]
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum::<usize>();
+        offsets.push(offsets[vertex] + degree);
+    }
+
+    let mut neighbors = Vec::with_capacity(offsets[dimension]);
+    for vertex in 0..dimension {
+        let row_start = vertex * words_per_row;
+        for (word_index, &word) in edge_bits[row_start..row_start + words_per_row]
+            .iter()
+            .enumerate()
+        {
+            let mut bits = word;
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                let neighbor = word_index * 64 + bit;
+                if neighbor < dimension {
+                    neighbors.push(neighbor);
+                }
+                bits &= bits - 1;
+            }
+        }
+    }
+    CsrGraph::from_trusted_sorted_adjacency(offsets, neighbors)
 }
 
 fn build_symbolic_result_with_native_order(
@@ -1345,13 +1494,6 @@ fn build_symbolic_result_with_native_order_and_scaling(
 ) -> Result<(SymbolicFactor, AnalyseInfo), SsidsError> {
     let trace = analyse_debug_enabled();
     let symbolic_started = Instant::now();
-    let expanded_pattern = expand_symmetric_pattern(matrix);
-    if trace {
-        analyse_debug_log(format!(
-            "[ssids_rs::analyse] symbolic expand_pattern elapsed={:.6}s",
-            symbolic_started.elapsed().as_secs_f64(),
-        ));
-    }
     let phase_started = Instant::now();
     let mut current_graph = permute_graph(graph, &current_permutation);
     if trace {
@@ -1420,12 +1562,17 @@ fn build_symbolic_result_with_native_order_and_scaling(
         factor_pattern
     };
     let phase_started = Instant::now();
-    let column_counts =
-        native_column_counts(&expanded_pattern, &current_permutation, &elimination_tree);
-    debug_assert_eq!(column_counts, simulated_column_counts);
+    #[cfg(debug_assertions)]
+    {
+        let expanded_pattern = expand_symmetric_pattern(matrix);
+        let native_counts =
+            native_column_counts(&expanded_pattern, &current_permutation, &elimination_tree);
+        debug_assert_eq!(native_counts, simulated_column_counts);
+    }
+    let column_counts = simulated_column_counts;
     if trace {
         analyse_debug_log(format!(
-            "[ssids_rs::analyse] symbolic native_column_counts elapsed={:.6}s total={:.6}s",
+            "[ssids_rs::analyse] symbolic column_counts elapsed={:.6}s total={:.6}s",
             phase_started.elapsed().as_secs_f64(),
             symbolic_started.elapsed().as_secs_f64(),
         ));
@@ -1442,12 +1589,16 @@ fn build_symbolic_result_with_native_order_and_scaling(
     }
     if is_identity_order(&supernode_layout.permutation) {
         let phase_started = Instant::now();
-        let supernodes = build_native_row_list_supernodes(
-            &expanded_pattern,
-            &current_permutation,
-            &supernode_layout,
-            &column_pattern,
-        );
+        let supernodes = build_native_row_list_supernodes_fast(&supernode_layout, &column_pattern)
+            .unwrap_or_else(|| {
+                let expanded_pattern = expand_symmetric_pattern(matrix);
+                build_native_row_list_supernodes(
+                    &expanded_pattern,
+                    &current_permutation,
+                    &supernode_layout,
+                    &column_pattern,
+                )
+            });
         if trace {
             analyse_debug_log(format!(
                 "[ssids_rs::analyse] symbolic row_lists elapsed={:.6}s total={:.6}s",
@@ -1489,8 +1640,14 @@ fn build_symbolic_result_with_native_order_and_scaling(
         ));
     }
     let phase_started = Instant::now();
-    let final_counts = native_column_counts(&expanded_pattern, &final_permutation, &final_tree);
-    debug_assert_eq!(final_counts, simulated_final_counts);
+    #[cfg(debug_assertions)]
+    {
+        let expanded_pattern = expand_symmetric_pattern(matrix);
+        let native_counts =
+            native_column_counts(&expanded_pattern, &final_permutation, &final_tree);
+        debug_assert_eq!(native_counts, simulated_final_counts);
+    }
+    let final_counts = simulated_final_counts;
     if trace {
         analyse_debug_log(format!(
             "[ssids_rs::analyse] symbolic final_column_counts elapsed={:.6}s total={:.6}s",
@@ -1499,12 +1656,16 @@ fn build_symbolic_result_with_native_order_and_scaling(
         ));
     }
     let phase_started = Instant::now();
-    let final_supernodes = build_native_row_list_supernodes(
-        &expanded_pattern,
-        &final_permutation,
-        &supernode_layout,
-        &final_pattern,
-    );
+    let final_supernodes = build_native_row_list_supernodes_fast(&supernode_layout, &final_pattern)
+        .unwrap_or_else(|| {
+            let expanded_pattern = expand_symmetric_pattern(matrix);
+            build_native_row_list_supernodes(
+                &expanded_pattern,
+                &final_permutation,
+                &supernode_layout,
+                &final_pattern,
+            )
+        });
     if trace {
         analyse_debug_log(format!(
             "[ssids_rs::analyse] symbolic final_row_lists elapsed={:.6}s total={:.6}s",
@@ -1792,6 +1953,7 @@ fn expand_symmetric_pattern(matrix: SymmetricCscMatrix<'_>) -> ExpandedSymmetric
     }
 }
 
+#[cfg(any(debug_assertions, test))]
 fn native_column_counts(
     pattern: &ExpandedSymmetricPattern,
     permutation: &Permutation,
@@ -1851,6 +2013,7 @@ fn native_column_counts(
         .collect()
 }
 
+#[cfg(any(debug_assertions, test))]
 fn native_virtual_forest_find(virtual_forest: &mut [Option<usize>], node: usize) -> usize {
     let mut current = node;
     while let Some(parent) = virtual_forest[current] {
@@ -1874,20 +2037,22 @@ fn symbolic_factor_pattern(graph: &CsrGraph) -> (Vec<Option<usize>>, Vec<usize>,
     let mut active_words = vec![0_u64; words_per_row];
     let mut elimination_tree = vec![None; dimension];
     let mut column_counts = vec![1; dimension];
-    let mut column_pattern = vec![Vec::new(); dimension];
+    let mut column_pattern = Vec::with_capacity(dimension);
     for column in 0..dimension {
         symbolic_trailing_row_bits(&edge_bits, words_per_row, column, &mut active_words);
-        let active_neighbors = symbolic_bits_to_vertices(&active_words, dimension);
-        elimination_tree[column] = active_neighbors.first().copied();
-        column_counts[column] = active_neighbors.len() + 1;
-        column_pattern[column].push(column);
-        column_pattern[column].extend(active_neighbors.iter().copied());
-        for &neighbor in &active_neighbors {
+        let active_count = symbolic_bit_count(&active_words);
+        let mut pattern = Vec::with_capacity(active_count + 1);
+        pattern.push(column);
+        symbolic_push_vertices(&active_words, dimension, &mut pattern);
+        elimination_tree[column] = pattern.get(1).copied();
+        column_counts[column] = active_count + 1;
+        for &neighbor in &pattern[1..] {
             let row_start = neighbor * words_per_row;
             for word in 0..words_per_row {
                 edge_bits[row_start + word] |= active_words[word];
             }
         }
+        column_pattern.push(pattern);
     }
     (elimination_tree, column_counts, column_pattern)
 }
@@ -1912,8 +2077,11 @@ fn symbolic_trailing_row_bits(
     }
 }
 
-fn symbolic_bits_to_vertices(words: &[u64], dimension: usize) -> Vec<usize> {
-    let mut vertices = Vec::new();
+fn symbolic_bit_count(words: &[u64]) -> usize {
+    words.iter().map(|word| word.count_ones() as usize).sum()
+}
+
+fn symbolic_push_vertices(words: &[u64], dimension: usize, vertices: &mut Vec<usize>) {
     for (word_index, &word) in words.iter().enumerate() {
         let mut bits = word;
         while bits != 0 {
@@ -1925,7 +2093,6 @@ fn symbolic_bits_to_vertices(words: &[u64], dimension: usize) -> Vec<usize> {
             bits &= bits - 1;
         }
     }
-    vertices
 }
 
 fn symbolic_edge_set(edge_bits: &mut [u64], words_per_row: usize, row: usize, col: usize) {
@@ -1934,6 +2101,29 @@ fn symbolic_edge_set(edge_bits: &mut [u64], words_per_row: usize, row: usize, co
     }
     let offset = row * words_per_row + col / 64;
     edge_bits[offset] |= 1_u64 << (col % 64);
+}
+
+fn build_native_row_list_supernodes_fast(
+    layout: &NativeSupernodeLayout,
+    column_pattern: &[Vec<usize>],
+) -> Option<Vec<Supernode>> {
+    let range = layout.ranges.first()?;
+    if layout.ranges.len() != 1 || range.start != 0 || range.end != column_pattern.len() {
+        return None;
+    }
+    if layout.parents.as_slice() != [None] {
+        return None;
+    }
+
+    // For a single full-rank supernode, SPRAL core_analyse.find_row_lists first
+    // inserts every eliminated pivot into the row list. The later child and
+    // matrix-entry passes cannot append anything new, so dbl_tr_sort leaves the
+    // node with no trailing rows.
+    Some(vec![Supernode {
+        start_column: 0,
+        end_column: column_pattern.len(),
+        trailing_rows: Vec::new(),
+    }])
 }
 
 fn build_native_row_list_supernodes(
@@ -2222,6 +2412,62 @@ fn fill_permuted_lower_csc_values(
     Ok(())
 }
 
+fn fill_scaled_permuted_lower_csc_values(
+    matrix: SymmetricCscMatrix<'_>,
+    col_ptrs: &[usize],
+    row_indices: &[usize],
+    source_positions: &[usize],
+    scaling: &[f64],
+    values: &mut Vec<f64>,
+) -> Result<(), SsidsError> {
+    let source_values = matrix.values().ok_or(SsidsError::MissingValues)?;
+    if col_ptrs.len() != scaling.len() + 1 {
+        return Err(SsidsError::DimensionMismatch {
+            expected: col_ptrs.len().saturating_sub(1),
+            actual: scaling.len(),
+        });
+    }
+    if row_indices.len() != source_positions.len() {
+        return Err(SsidsError::PatternMismatch(
+            "permuted matrix row/source length mismatch".into(),
+        ));
+    }
+    values.clear();
+    values.resize(source_positions.len(), 0.0);
+    for (col, window) in col_ptrs.windows(2).enumerate() {
+        let col_scale = scaling[col];
+        if !col_scale.is_finite() {
+            return Err(SsidsError::InvalidMatrix(format!(
+                "scaling value for permuted column {col} is not finite"
+            )));
+        }
+        for entry in window[0]..window[1] {
+            let source_index = source_positions[entry];
+            let value = source_values[source_index];
+            if !value.is_finite() {
+                let row = matrix.row_indices()[source_index];
+                let col = matrix
+                    .col_ptrs()
+                    .partition_point(|&pointer| pointer <= source_index)
+                    .saturating_sub(1);
+                return Err(SsidsError::InvalidMatrix(format!(
+                    "numeric value at ({row}, {col}) is not finite"
+                )));
+            }
+            let row = row_indices[entry];
+            let row_scale = scaling[row];
+            if !row_scale.is_finite() {
+                return Err(SsidsError::InvalidMatrix(format!(
+                    "scaling value for permuted row {row} is not finite"
+                )));
+            }
+            values[entry] = row_scale * value * col_scale;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn apply_permuted_symmetric_scaling(
     col_ptrs: &[usize],
     row_indices: &[usize],
@@ -2523,18 +2769,179 @@ fn app_update_one_by_one(
     update_end: usize,
     workspace: &[f64],
 ) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: the NEON helper only performs two-lane row loads/stores when
+        // `row + 1 < update_end`; scalar tails handle the remaining row.
+        unsafe {
+            app_update_one_by_one_neon(matrix, size, pivot, update_end, workspace);
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        app_update_one_by_one_scalar(matrix, size, pivot, update_end, workspace);
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn app_update_one_by_one_scalar(
+    matrix: &mut [f64],
+    size: usize,
+    pivot: usize,
+    update_end: usize,
+    workspace: &[f64],
+) {
     let ld = &workspace[pivot * size..(pivot + 1) * size];
     for (col, &preserved) in ld.iter().enumerate().take(update_end).skip(pivot + 1) {
         for row in col..update_end {
-            let update_entry = dense_lower_offset(size, row, col);
-            let multiplier = matrix[dense_lower_offset(size, row, pivot)];
-            // Clang contracts SPRAL's scalar SimdVec update on the local build.
-            matrix[update_entry] = (-preserved).mul_add(multiplier, matrix[update_entry]);
+            app_update_one_by_one_scalar_entry(matrix, size, pivot, col, row, preserved);
+        }
+    }
+}
+
+fn app_update_one_by_one_scalar_entry(
+    matrix: &mut [f64],
+    size: usize,
+    pivot: usize,
+    col: usize,
+    row: usize,
+    preserved: f64,
+) {
+    let update_entry = dense_lower_offset(size, row, col);
+    let multiplier = matrix[dense_lower_offset(size, row, pivot)];
+    // Clang contracts SPRAL's scalar SimdVec update on the local build.
+    matrix[update_entry] = (-preserved).mul_add(multiplier, matrix[update_entry]);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn app_update_one_by_one_neon(
+    matrix: &mut [f64],
+    size: usize,
+    pivot: usize,
+    update_end: usize,
+    workspace: &[f64],
+) {
+    use core::arch::aarch64::{vdupq_n_f64, vfmaq_f64, vld1q_f64, vst1q_f64};
+
+    const NEON_F64_LANES: usize = 2;
+    const SOURCE_UNROLL: usize = 4;
+
+    let matrix_ptr = matrix.as_mut_ptr();
+    let ld = &workspace[pivot * size..(pivot + 1) * size];
+    let block_start = update_end.saturating_sub(APP_INNER_BLOCK_SIZE);
+    let local_pivot = pivot - block_start;
+    let source_unroll_start = block_start + SOURCE_UNROLL * (local_pivot / SOURCE_UNROLL + 1);
+
+    for (col, &preserved) in ld
+        .iter()
+        .enumerate()
+        .take(source_unroll_start.min(update_end))
+        .skip(pivot + 1)
+    {
+        let mut row = col;
+        let neg_preserved = vdupq_n_f64(-preserved);
+        while row + 1 < update_end {
+            // SAFETY: `row + 1 < update_end <= size`; dense columns are
+            // contiguous by row.
+            let multiplier = unsafe { vld1q_f64(matrix_ptr.add(pivot * size + row)) };
+            let current = unsafe { vld1q_f64(matrix_ptr.add(col * size + row)) };
+            let updated = vfmaq_f64(current, multiplier, neg_preserved);
+            // SAFETY: same bounds as the load above.
+            unsafe {
+                vst1q_f64(matrix_ptr.add(col * size + row), updated);
+            }
+            row += 2;
+        }
+        while row < update_end {
+            app_update_one_by_one_scalar_entry(matrix, size, pivot, col, row, preserved);
+            row += 1;
+        }
+    }
+
+    let mut col = source_unroll_start;
+    while col + SOURCE_UNROLL <= update_end {
+        let neg0 = vdupq_n_f64(-ld[col]);
+        let neg1 = vdupq_n_f64(-ld[col + 1]);
+        let neg2 = vdupq_n_f64(-ld[col + 2]);
+        let neg3 = vdupq_n_f64(-ld[col + 3]);
+        let local_col = col - block_start;
+        let mut row = block_start + NEON_F64_LANES * (local_col / NEON_F64_LANES);
+        while row + 1 < update_end {
+            // Mirrors block_ldlt.hxx::update_1x1: the same pivot-column
+            // vector feeds four target columns. Lanes above a target
+            // column's diagonal land in unused upper storage.
+            let multiplier = unsafe { vld1q_f64(matrix_ptr.add(pivot * size + row)) };
+            let current0 = unsafe { vld1q_f64(matrix_ptr.add(col * size + row)) };
+            let current1 = unsafe { vld1q_f64(matrix_ptr.add((col + 1) * size + row)) };
+            let current2 = unsafe { vld1q_f64(matrix_ptr.add((col + 2) * size + row)) };
+            let current3 = unsafe { vld1q_f64(matrix_ptr.add((col + 3) * size + row)) };
+            let updated0 = vfmaq_f64(current0, multiplier, neg0);
+            let updated1 = vfmaq_f64(current1, multiplier, neg1);
+            let updated2 = vfmaq_f64(current2, multiplier, neg2);
+            let updated3 = vfmaq_f64(current3, multiplier, neg3);
+            unsafe {
+                vst1q_f64(matrix_ptr.add(col * size + row), updated0);
+                vst1q_f64(matrix_ptr.add((col + 1) * size + row), updated1);
+                vst1q_f64(matrix_ptr.add((col + 2) * size + row), updated2);
+                vst1q_f64(matrix_ptr.add((col + 3) * size + row), updated3);
+            }
+            row += NEON_F64_LANES;
+        }
+        for (target_col, &preserved) in ld.iter().enumerate().skip(col).take(SOURCE_UNROLL) {
+            let mut scalar_row = row.max(target_col);
+            while scalar_row < update_end {
+                app_update_one_by_one_scalar_entry(
+                    matrix, size, pivot, target_col, scalar_row, preserved,
+                );
+                scalar_row += 1;
+            }
+        }
+        col += SOURCE_UNROLL;
+    }
+
+    for (col, &preserved) in ld.iter().enumerate().take(update_end).skip(col) {
+        let mut row = col;
+        let neg_preserved = vdupq_n_f64(-preserved);
+        while row + 1 < update_end {
+            let multiplier = unsafe { vld1q_f64(matrix_ptr.add(pivot * size + row)) };
+            let current = unsafe { vld1q_f64(matrix_ptr.add(col * size + row)) };
+            let updated = vfmaq_f64(current, multiplier, neg_preserved);
+            unsafe {
+                vst1q_f64(matrix_ptr.add(col * size + row), updated);
+            }
+            row += 2;
+        }
+        while row < update_end {
+            app_update_one_by_one_scalar_entry(matrix, size, pivot, col, row, preserved);
+            row += 1;
         }
     }
 }
 
 fn app_update_two_by_two(
+    matrix: &mut [f64],
+    size: usize,
+    pivot: usize,
+    update_end: usize,
+    workspace: &[f64],
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: the NEON helper only performs two-lane row loads/stores when
+        // `row + 1 < update_end`; scalar tails handle the remaining row.
+        unsafe {
+            app_update_two_by_two_neon(matrix, size, pivot, update_end, workspace);
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        app_update_two_by_two_scalar(matrix, size, pivot, update_end, workspace);
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn app_update_two_by_two_scalar(
     matrix: &mut [f64],
     size: usize,
     pivot: usize,
@@ -2547,15 +2954,84 @@ fn app_update_two_by_two(
         let first_preserved = first_ld[col];
         let second_preserved = second_ld[col];
         for row in col..update_end {
-            let update_entry = dense_lower_offset(size, row, col);
-            let first_multiplier = matrix[dense_lower_offset(size, row, pivot)];
-            let second_multiplier = matrix[dense_lower_offset(size, row, pivot + 1)];
-            // block_ldlt.hxx::update_2x2 forms the two-product update under
-            // `#pragma omp simd`; the local optimized native path contracts the
-            // first product into the second product before subtracting it.
-            let combined =
-                first_preserved.mul_add(first_multiplier, second_preserved * second_multiplier);
-            matrix[update_entry] -= combined;
+            app_update_two_by_two_scalar_entry(
+                matrix,
+                size,
+                pivot,
+                col,
+                row,
+                first_preserved,
+                second_preserved,
+            );
+        }
+    }
+}
+
+fn app_update_two_by_two_scalar_entry(
+    matrix: &mut [f64],
+    size: usize,
+    pivot: usize,
+    col: usize,
+    row: usize,
+    first_preserved: f64,
+    second_preserved: f64,
+) {
+    let update_entry = dense_lower_offset(size, row, col);
+    let first_multiplier = matrix[dense_lower_offset(size, row, pivot)];
+    let second_multiplier = matrix[dense_lower_offset(size, row, pivot + 1)];
+    // block_ldlt.hxx::update_2x2 forms the two-product update under
+    // `#pragma omp simd`; the local optimized native path contracts the
+    // first product into the second product before subtracting it.
+    let combined = first_preserved.mul_add(first_multiplier, second_preserved * second_multiplier);
+    matrix[update_entry] -= combined;
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn app_update_two_by_two_neon(
+    matrix: &mut [f64],
+    size: usize,
+    pivot: usize,
+    update_end: usize,
+    workspace: &[f64],
+) {
+    use core::arch::aarch64::{vdupq_n_f64, vfmaq_f64, vld1q_f64, vmulq_f64, vst1q_f64, vsubq_f64};
+
+    let matrix_ptr = matrix.as_mut_ptr();
+    let first_ld = &workspace[pivot * size..(pivot + 1) * size];
+    let second_ld = &workspace[(pivot + 1) * size..(pivot + 2) * size];
+    for col in (pivot + 2)..update_end {
+        let first_preserved = first_ld[col];
+        let second_preserved = second_ld[col];
+        let first_preserved_vec = vdupq_n_f64(first_preserved);
+        let second_preserved_vec = vdupq_n_f64(second_preserved);
+        let mut row = col;
+        while row + 1 < update_end {
+            // SAFETY: `row + 1 < update_end <= size`; dense columns are
+            // contiguous by row.
+            let first_multiplier = unsafe { vld1q_f64(matrix_ptr.add(pivot * size + row)) };
+            let second_multiplier = unsafe { vld1q_f64(matrix_ptr.add((pivot + 1) * size + row)) };
+            let second_product = vmulq_f64(second_multiplier, second_preserved_vec);
+            let combined = vfmaq_f64(second_product, first_multiplier, first_preserved_vec);
+            let current = unsafe { vld1q_f64(matrix_ptr.add(col * size + row)) };
+            let updated = vsubq_f64(current, combined);
+            // SAFETY: same bounds as the load above.
+            unsafe {
+                vst1q_f64(matrix_ptr.add(col * size + row), updated);
+            }
+            row += 2;
+        }
+        while row < update_end {
+            app_update_two_by_two_scalar_entry(
+                matrix,
+                size,
+                pivot,
+                col,
+                row,
+                first_preserved,
+                second_preserved,
+            );
+            row += 1;
         }
     }
 }
@@ -2736,38 +3212,279 @@ fn app_solve_block_triangular_to_trailing_rows(
     // OP_N applies a diagonal block to rows below the eliminated columns, where
     // SPRAL's column-major `aval[col * lda + row]` matches our dense storage.
     let triangular_started = profile_enabled.then(Instant::now);
+    app_solve_block_triangular_to_trailing_rows_impl(matrix, size, block_start, block_end);
+    triangular_started.map_or(Duration::default(), |started| started.elapsed())
+}
+
+#[cfg(target_arch = "aarch64")]
+fn app_solve_block_triangular_to_trailing_rows_impl(
+    matrix: &mut [f64],
+    size: usize,
+    block_start: usize,
+    block_end: usize,
+) {
+    // SAFETY: the helper bounds every two-lane load/store by `row + 1 < size`;
+    // scalar tails handle all remaining shapes.
+    unsafe {
+        app_solve_block_triangular_to_trailing_rows_neon(matrix, size, block_start, block_end);
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn app_solve_block_triangular_to_trailing_rows_impl(
+    matrix: &mut [f64],
+    size: usize,
+    block_start: usize,
+    block_end: usize,
+) {
+    app_solve_block_triangular_to_trailing_rows_scalar(matrix, size, block_start, block_end);
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn app_solve_block_triangular_to_trailing_rows_scalar(
+    matrix: &mut [f64],
+    size: usize,
+    block_start: usize,
+    block_end: usize,
+) {
     const OPENBLAS_DTRSM_UNROLL_N: usize = 4;
     for row in block_end..size {
         let mut group_start = block_start;
         while group_start < block_end {
             let group_end = (group_start + OPENBLAS_DTRSM_UNROLL_N).min(block_end);
-            for col in group_start..group_end {
-                let entry = col * size + row;
-                let mut value = matrix[entry];
-                if group_start > block_start {
-                    let mut dot = 0.0;
-                    for prior in block_start..group_start {
-                        let prior_value = matrix[prior * size + row];
-                        let lower_value = matrix[prior * size + col];
-                        dot = prior_value.mul_add(lower_value, dot);
-                    }
-                    value = dot.mul_add(-1.0, value);
-                }
-                matrix[entry] = value;
-            }
-
-            for col in group_start..group_end {
-                let value = matrix[col * size + row];
-                for target_col in (col + 1)..group_end {
-                    let target_entry = target_col * size + row;
-                    let lower_value = matrix[col * size + target_col];
-                    matrix[target_entry] = (-value).mul_add(lower_value, matrix[target_entry]);
-                }
-            }
+            app_solve_block_triangular_row_group_scalar(
+                matrix,
+                size,
+                block_start,
+                group_start,
+                group_end,
+                row,
+            );
             group_start = group_end;
         }
     }
-    triangular_started.map_or(Duration::default(), |started| started.elapsed())
+}
+
+fn app_solve_block_triangular_row_group_scalar(
+    matrix: &mut [f64],
+    size: usize,
+    block_start: usize,
+    group_start: usize,
+    group_end: usize,
+    row: usize,
+) {
+    if group_end - group_start == 4 {
+        let col0 = group_start;
+        let col1 = group_start + 1;
+        let col2 = group_start + 2;
+        let col3 = group_start + 3;
+
+        let mut value0 = matrix[col0 * size + row];
+        let mut value1 = matrix[col1 * size + row];
+        let mut value2 = matrix[col2 * size + row];
+        let mut value3 = matrix[col3 * size + row];
+        if group_start > block_start {
+            let mut dot0 = 0.0;
+            let mut dot1 = 0.0;
+            let mut dot2 = 0.0;
+            let mut dot3 = 0.0;
+            for prior in block_start..group_start {
+                let prior_value = matrix[prior * size + row];
+                dot0 = prior_value.mul_add(matrix[prior * size + col0], dot0);
+                dot1 = prior_value.mul_add(matrix[prior * size + col1], dot1);
+                dot2 = prior_value.mul_add(matrix[prior * size + col2], dot2);
+                dot3 = prior_value.mul_add(matrix[prior * size + col3], dot3);
+            }
+            value0 = dot0.mul_add(-1.0, value0);
+            value1 = dot1.mul_add(-1.0, value1);
+            value2 = dot2.mul_add(-1.0, value2);
+            value3 = dot3.mul_add(-1.0, value3);
+        }
+
+        value1 = (-value0).mul_add(matrix[col0 * size + col1], value1);
+        value2 = (-value0).mul_add(matrix[col0 * size + col2], value2);
+        value3 = (-value0).mul_add(matrix[col0 * size + col3], value3);
+        value2 = (-value1).mul_add(matrix[col1 * size + col2], value2);
+        value3 = (-value1).mul_add(matrix[col1 * size + col3], value3);
+        value3 = (-value2).mul_add(matrix[col2 * size + col3], value3);
+
+        matrix[col0 * size + row] = value0;
+        matrix[col1 * size + row] = value1;
+        matrix[col2 * size + row] = value2;
+        matrix[col3 * size + row] = value3;
+        return;
+    }
+
+    for col in group_start..group_end {
+        let entry = col * size + row;
+        let mut value = matrix[entry];
+        if group_start > block_start {
+            let mut dot = 0.0;
+            for prior in block_start..group_start {
+                let prior_value = matrix[prior * size + row];
+                let lower_value = matrix[prior * size + col];
+                dot = prior_value.mul_add(lower_value, dot);
+            }
+            value = dot.mul_add(-1.0, value);
+        }
+        matrix[entry] = value;
+    }
+
+    for col in group_start..group_end {
+        let value = matrix[col * size + row];
+        for target_col in (col + 1)..group_end {
+            let target_entry = target_col * size + row;
+            let lower_value = matrix[col * size + target_col];
+            matrix[target_entry] = (-value).mul_add(lower_value, matrix[target_entry]);
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn app_solve_block_triangular_to_trailing_rows_neon(
+    matrix: &mut [f64],
+    size: usize,
+    block_start: usize,
+    block_end: usize,
+) {
+    use core::arch::aarch64::{vdupq_n_f64, vfmaq_f64, vld1q_f64, vst1q_f64};
+
+    const OPENBLAS_DTRSM_UNROLL_N: usize = 4;
+    let matrix_ptr = matrix.as_mut_ptr();
+    let mut row = block_end;
+    while row + 1 < size {
+        let mut group_start = block_start;
+        while group_start < block_end {
+            let group_end = (group_start + OPENBLAS_DTRSM_UNROLL_N).min(block_end);
+            if group_end - group_start != 4 {
+                app_solve_block_triangular_row_group_scalar(
+                    matrix,
+                    size,
+                    block_start,
+                    group_start,
+                    group_end,
+                    row,
+                );
+                app_solve_block_triangular_row_group_scalar(
+                    matrix,
+                    size,
+                    block_start,
+                    group_start,
+                    group_end,
+                    row + 1,
+                );
+                group_start = group_end;
+                continue;
+            }
+
+            let col0 = group_start;
+            let col1 = group_start + 1;
+            let col2 = group_start + 2;
+            let col3 = group_start + 3;
+
+            // SAFETY: `row + 1 < size`; each column is stored contiguously by
+            // row in the dense lower-column buffer.
+            let mut value0 = unsafe { vld1q_f64(matrix_ptr.add(col0 * size + row)) };
+            let mut value1 = unsafe { vld1q_f64(matrix_ptr.add(col1 * size + row)) };
+            let mut value2 = unsafe { vld1q_f64(matrix_ptr.add(col2 * size + row)) };
+            let mut value3 = unsafe { vld1q_f64(matrix_ptr.add(col3 * size + row)) };
+
+            if group_start > block_start {
+                let mut dot0 = vdupq_n_f64(0.0);
+                let mut dot1 = vdupq_n_f64(0.0);
+                let mut dot2 = vdupq_n_f64(0.0);
+                let mut dot3 = vdupq_n_f64(0.0);
+                for prior in block_start..group_start {
+                    // SAFETY: same `row + 1 < size` bound as above.
+                    let prior_value = unsafe { vld1q_f64(matrix_ptr.add(prior * size + row)) };
+                    dot0 = vfmaq_f64(
+                        dot0,
+                        prior_value,
+                        vdupq_n_f64(unsafe { *matrix_ptr.add(prior * size + col0) }),
+                    );
+                    dot1 = vfmaq_f64(
+                        dot1,
+                        prior_value,
+                        vdupq_n_f64(unsafe { *matrix_ptr.add(prior * size + col1) }),
+                    );
+                    dot2 = vfmaq_f64(
+                        dot2,
+                        prior_value,
+                        vdupq_n_f64(unsafe { *matrix_ptr.add(prior * size + col2) }),
+                    );
+                    dot3 = vfmaq_f64(
+                        dot3,
+                        prior_value,
+                        vdupq_n_f64(unsafe { *matrix_ptr.add(prior * size + col3) }),
+                    );
+                }
+                let minus_one = vdupq_n_f64(-1.0);
+                value0 = vfmaq_f64(value0, dot0, minus_one);
+                value1 = vfmaq_f64(value1, dot1, minus_one);
+                value2 = vfmaq_f64(value2, dot2, minus_one);
+                value3 = vfmaq_f64(value3, dot3, minus_one);
+            }
+
+            value1 = vfmaq_f64(
+                value1,
+                value0,
+                vdupq_n_f64(-unsafe { *matrix_ptr.add(col0 * size + col1) }),
+            );
+            value2 = vfmaq_f64(
+                value2,
+                value0,
+                vdupq_n_f64(-unsafe { *matrix_ptr.add(col0 * size + col2) }),
+            );
+            value3 = vfmaq_f64(
+                value3,
+                value0,
+                vdupq_n_f64(-unsafe { *matrix_ptr.add(col0 * size + col3) }),
+            );
+            value2 = vfmaq_f64(
+                value2,
+                value1,
+                vdupq_n_f64(-unsafe { *matrix_ptr.add(col1 * size + col2) }),
+            );
+            value3 = vfmaq_f64(
+                value3,
+                value1,
+                vdupq_n_f64(-unsafe { *matrix_ptr.add(col1 * size + col3) }),
+            );
+            value3 = vfmaq_f64(
+                value3,
+                value2,
+                vdupq_n_f64(-unsafe { *matrix_ptr.add(col2 * size + col3) }),
+            );
+
+            // SAFETY: same `row + 1 < size` bound as the loads.
+            unsafe {
+                vst1q_f64(matrix_ptr.add(col0 * size + row), value0);
+                vst1q_f64(matrix_ptr.add(col1 * size + row), value1);
+                vst1q_f64(matrix_ptr.add(col2 * size + row), value2);
+                vst1q_f64(matrix_ptr.add(col3 * size + row), value3);
+            }
+            group_start = group_end;
+        }
+        row += 2;
+    }
+
+    while row < size {
+        let mut group_start = block_start;
+        while group_start < block_end {
+            let group_end = (group_start + OPENBLAS_DTRSM_UNROLL_N).min(block_end);
+            app_solve_block_triangular_row_group_scalar(
+                matrix,
+                size,
+                block_start,
+                group_start,
+                group_end,
+                row,
+            );
+            group_start = group_end;
+        }
+        row += 1;
+    }
 }
 
 fn app_apply_block_diagonal_to_trailing_rows(
@@ -2921,6 +3638,7 @@ fn app_original_one_by_one_diagonal(inverse_diagonal: f64) -> f64 {
     }
 }
 
+#[cfg(test)]
 fn app_build_ld_workspace(
     matrix: &[f64],
     size: usize,
@@ -2928,10 +3646,32 @@ fn app_build_ld_workspace(
     accepted_end: usize,
     block_records: &[FactorBlockRecord],
 ) -> Vec<f64> {
+    let accepted_width = accepted_end - block_start;
+    let mut ld_values = vec![0.0; accepted_width * size];
+    app_build_ld_workspace_into(
+        matrix,
+        size,
+        block_start,
+        accepted_end,
+        block_records,
+        &mut ld_values,
+    );
+    ld_values
+}
+
+fn app_build_ld_workspace_into(
+    matrix: &[f64],
+    size: usize,
+    block_start: usize,
+    accepted_end: usize,
+    block_records: &[FactorBlockRecord],
+    ld_values: &mut [f64],
+) {
     // Accepted-update operands are below the eliminated prefix, so SPRAL's
     // column-major `aval[col * lda + row]` matches the dense lower storage.
     let accepted_width = accepted_end - block_start;
-    let mut ld_values = vec![0.0; accepted_width * size];
+    debug_assert!(ld_values.len() >= accepted_width * size);
+    let ld_values = &mut ld_values[..accepted_width * size];
     let mut pivot = block_start;
     for block in block_records {
         let relative_pivot = pivot - block_start;
@@ -2974,7 +3714,6 @@ fn app_build_ld_workspace(
         }
     }
     debug_assert_eq!(pivot, accepted_end);
-    ld_values
 }
 
 #[cfg(test)]
@@ -3038,6 +3777,7 @@ struct AppAcceptedUpdateContext<'a> {
     ld_values: &'a [f64],
 }
 
+#[cfg(test)]
 fn app_apply_accepted_prefix_update(
     matrix: &mut [f64],
     size: usize,
@@ -3045,10 +3785,42 @@ fn app_apply_accepted_prefix_update(
     accepted_end: usize,
     block_records: &[FactorBlockRecord],
 ) {
+    let accepted_width = accepted_end - block_start;
+    let mut ld_values = vec![0.0; accepted_width * size];
+    app_apply_accepted_prefix_update_with_workspace(
+        matrix,
+        size,
+        block_start,
+        accepted_end,
+        block_records,
+        &mut ld_values,
+        false,
+    );
+}
+
+fn app_apply_accepted_prefix_update_with_workspace(
+    matrix: &mut [f64],
+    size: usize,
+    block_start: usize,
+    accepted_end: usize,
+    block_records: &[FactorBlockRecord],
+    ld_values: &mut [f64],
+    profile_enabled: bool,
+) -> (Duration, Duration) {
     if accepted_end >= size {
-        return;
+        return (Duration::default(), Duration::default());
     }
-    let ld_values = app_build_ld_workspace(matrix, size, block_start, accepted_end, block_records);
+    let ld_started = profile_enabled.then(Instant::now);
+    app_build_ld_workspace_into(
+        matrix,
+        size,
+        block_start,
+        accepted_end,
+        block_records,
+        ld_values,
+    );
+    let ld_time = ld_started.map_or(Duration::default(), |started| started.elapsed());
+    let update_started = profile_enabled.then(Instant::now);
     if accepted_end + 1 == size {
         let row = accepted_end;
         let entry = row * size + row;
@@ -3071,11 +3843,19 @@ fn app_apply_accepted_prefix_update(
             }
         }
         debug_assert_eq!(pivot, accepted_end);
-        return;
+        let update_time = update_started.map_or(Duration::default(), |started| started.elapsed());
+        return (ld_time, update_time);
     }
-    for row in accepted_end..size {
-        for col in accepted_end..=row {
-            if app_target_block_uses_gemv_forward(size, accepted_end, col) {
+    let accepted_width = accepted_end - block_start;
+    debug_assert!(accepted_width <= APP_INNER_BLOCK_SIZE);
+    let incremental_column = app_gemv_forward_singleton_column(size, accepted_end);
+    let mut column_l_values = [0.0; APP_INNER_BLOCK_SIZE];
+    let mut next_column_l_values = [0.0; APP_INNER_BLOCK_SIZE];
+
+    let mut col = accepted_end;
+    while col < size {
+        if incremental_column == Some(col) {
+            for row in col..size {
                 app_apply_accepted_prefix_update_entry_incremental(
                     matrix,
                     AppAcceptedUpdateContext {
@@ -3083,39 +3863,434 @@ fn app_apply_accepted_prefix_update(
                         block_start,
                         accepted_end,
                         block_records,
-                        ld_values: &ld_values,
+                        ld_values,
                     },
                     row,
                     col,
                 );
-                continue;
             }
-            let mut update = 0.0;
-            let mut pivot = block_start;
-            for block in block_records {
-                let relative_pivot = pivot - block_start;
-                if block.size == 1 {
-                    let col_l = matrix[pivot * size + col];
-                    let row_ld = ld_values[relative_pivot * size + row];
-                    update = row_ld.mul_add(col_l, update);
-                    pivot += 1;
-                } else {
-                    let col_l1 = matrix[pivot * size + col];
-                    let col_l2 = matrix[(pivot + 1) * size + col];
-                    let row_ld1 = ld_values[relative_pivot * size + row];
-                    let row_ld2 = ld_values[(relative_pivot + 1) * size + row];
-                    update = row_ld1.mul_add(col_l1, update);
-                    update = row_ld2.mul_add(col_l2, update);
-                    pivot += 2;
-                }
-            }
-            debug_assert_eq!(pivot, accepted_end);
-            let entry = col * size + row;
-            matrix[entry] = update.mul_add(-1.0, matrix[entry]);
+            col += 1;
+            continue;
         }
+
+        for relative_pivot in 0..accepted_width {
+            column_l_values[relative_pivot] = matrix[(block_start + relative_pivot) * size + col];
+        }
+        #[cfg(target_arch = "aarch64")]
+        if col + 1 < size && incremental_column != Some(col + 1) {
+            for relative_pivot in 0..accepted_width {
+                next_column_l_values[relative_pivot] =
+                    matrix[(block_start + relative_pivot) * size + col + 1];
+            }
+            // SAFETY: the helper handles the first column's diagonal entry
+            // separately and only uses vector loads/stores for rows inside both
+            // target columns.
+            unsafe {
+                app_apply_accepted_prefix_update_two_columns_neon(
+                    matrix,
+                    size,
+                    col,
+                    accepted_width,
+                    ld_values,
+                    &column_l_values,
+                    &next_column_l_values,
+                );
+            }
+            col += 2;
+            continue;
+        }
+        app_apply_accepted_prefix_update_column(
+            matrix,
+            size,
+            col,
+            accepted_width,
+            ld_values,
+            &column_l_values,
+        );
+        col += 1;
+    }
+    let update_time = update_started.map_or(Duration::default(), |started| started.elapsed());
+    (ld_time, update_time)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn app_apply_accepted_prefix_update_two_columns_neon(
+    matrix: &mut [f64],
+    size: usize,
+    col: usize,
+    accepted_width: usize,
+    ld_values: &[f64],
+    column_l_values: &[f64; APP_INNER_BLOCK_SIZE],
+    next_column_l_values: &[f64; APP_INNER_BLOCK_SIZE],
+) {
+    use core::arch::aarch64::{vdupq_n_f64, vfmaq_f64, vld1q_f64, vst1q_f64};
+
+    app_apply_accepted_prefix_update_scalar_row(
+        matrix,
+        size,
+        col,
+        col,
+        accepted_width,
+        ld_values,
+        column_l_values,
+    );
+
+    let matrix_ptr = matrix.as_mut_ptr();
+    let ld_ptr = ld_values.as_ptr();
+    let col_l_ptr = column_l_values.as_ptr();
+    let next_col_l_ptr = next_column_l_values.as_ptr();
+    let next_col = col + 1;
+    let mut row = next_col;
+    while row + 3 < size {
+        let mut update0 = vdupq_n_f64(0.0);
+        let mut update1 = vdupq_n_f64(0.0);
+        let mut next_update0 = vdupq_n_f64(0.0);
+        let mut next_update1 = vdupq_n_f64(0.0);
+        let mut relative_pivot = 0;
+        while relative_pivot + 4 <= accepted_width {
+            // SAFETY: caller passes `row + 3 < size`, the four unrolled pivots
+            // are below `accepted_width`, and the LD workspace is full-width.
+            let row_ld0 = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row)) };
+            let row_ld1 = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row + 2)) };
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(relative_pivot) });
+            let next_col_l = vdupq_n_f64(unsafe { *next_col_l_ptr.add(relative_pivot) });
+            update0 = vfmaq_f64(update0, row_ld0, col_l);
+            update1 = vfmaq_f64(update1, row_ld1, col_l);
+            next_update0 = vfmaq_f64(next_update0, row_ld0, next_col_l);
+            next_update1 = vfmaq_f64(next_update1, row_ld1, next_col_l);
+
+            let pivot1 = relative_pivot + 1;
+            let row_ld0 = unsafe { vld1q_f64(ld_ptr.add(pivot1 * size + row)) };
+            let row_ld1 = unsafe { vld1q_f64(ld_ptr.add(pivot1 * size + row + 2)) };
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(pivot1) });
+            let next_col_l = vdupq_n_f64(unsafe { *next_col_l_ptr.add(pivot1) });
+            update0 = vfmaq_f64(update0, row_ld0, col_l);
+            update1 = vfmaq_f64(update1, row_ld1, col_l);
+            next_update0 = vfmaq_f64(next_update0, row_ld0, next_col_l);
+            next_update1 = vfmaq_f64(next_update1, row_ld1, next_col_l);
+
+            let pivot2 = relative_pivot + 2;
+            let row_ld0 = unsafe { vld1q_f64(ld_ptr.add(pivot2 * size + row)) };
+            let row_ld1 = unsafe { vld1q_f64(ld_ptr.add(pivot2 * size + row + 2)) };
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(pivot2) });
+            let next_col_l = vdupq_n_f64(unsafe { *next_col_l_ptr.add(pivot2) });
+            update0 = vfmaq_f64(update0, row_ld0, col_l);
+            update1 = vfmaq_f64(update1, row_ld1, col_l);
+            next_update0 = vfmaq_f64(next_update0, row_ld0, next_col_l);
+            next_update1 = vfmaq_f64(next_update1, row_ld1, next_col_l);
+
+            let pivot3 = relative_pivot + 3;
+            let row_ld0 = unsafe { vld1q_f64(ld_ptr.add(pivot3 * size + row)) };
+            let row_ld1 = unsafe { vld1q_f64(ld_ptr.add(pivot3 * size + row + 2)) };
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(pivot3) });
+            let next_col_l = vdupq_n_f64(unsafe { *next_col_l_ptr.add(pivot3) });
+            update0 = vfmaq_f64(update0, row_ld0, col_l);
+            update1 = vfmaq_f64(update1, row_ld1, col_l);
+            next_update0 = vfmaq_f64(next_update0, row_ld0, next_col_l);
+            next_update1 = vfmaq_f64(next_update1, row_ld1, next_col_l);
+
+            relative_pivot += 4;
+        }
+        while relative_pivot < accepted_width {
+            // SAFETY: caller passes `row + 3 < size`, `relative_pivot < accepted_width`,
+            // and `ld_values` contains at least `accepted_width * size` entries.
+            let row_ld0 = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row)) };
+            let row_ld1 = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row + 2)) };
+            // SAFETY: `relative_pivot < accepted_width <= APP_INNER_BLOCK_SIZE`.
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(relative_pivot) });
+            let next_col_l = vdupq_n_f64(unsafe { *next_col_l_ptr.add(relative_pivot) });
+            update0 = vfmaq_f64(update0, row_ld0, col_l);
+            update1 = vfmaq_f64(update1, row_ld1, col_l);
+            next_update0 = vfmaq_f64(next_update0, row_ld0, next_col_l);
+            next_update1 = vfmaq_f64(next_update1, row_ld1, next_col_l);
+            relative_pivot += 1;
+        }
+        let entry = col * size + row;
+        let next_entry = next_col * size + row;
+        // SAFETY: `row + 3 < size`, so both two-lane load/stores stay inside
+        // both dense target columns.
+        let current0 = unsafe { vld1q_f64(matrix_ptr.add(entry)) };
+        let current1 = unsafe { vld1q_f64(matrix_ptr.add(entry + 2)) };
+        let next_current0 = unsafe { vld1q_f64(matrix_ptr.add(next_entry)) };
+        let next_current1 = unsafe { vld1q_f64(matrix_ptr.add(next_entry + 2)) };
+        let minus_one = vdupq_n_f64(-1.0);
+        let updated0 = vfmaq_f64(current0, update0, minus_one);
+        let updated1 = vfmaq_f64(current1, update1, minus_one);
+        let next_updated0 = vfmaq_f64(next_current0, next_update0, minus_one);
+        let next_updated1 = vfmaq_f64(next_current1, next_update1, minus_one);
+        // SAFETY: same bounds as the loads above.
+        unsafe {
+            vst1q_f64(matrix_ptr.add(entry), updated0);
+            vst1q_f64(matrix_ptr.add(entry + 2), updated1);
+            vst1q_f64(matrix_ptr.add(next_entry), next_updated0);
+            vst1q_f64(matrix_ptr.add(next_entry + 2), next_updated1);
+        }
+        row += 4;
+    }
+    while row + 1 < size {
+        let mut update = vdupq_n_f64(0.0);
+        let mut next_update = vdupq_n_f64(0.0);
+        let mut relative_pivot = 0;
+        while relative_pivot + 4 <= accepted_width {
+            // SAFETY: caller passes `row + 1 < size`, the four unrolled pivots
+            // are below `accepted_width`, and the LD workspace is full-width.
+            let row_ld = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row)) };
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(relative_pivot) });
+            let next_col_l = vdupq_n_f64(unsafe { *next_col_l_ptr.add(relative_pivot) });
+            update = vfmaq_f64(update, row_ld, col_l);
+            next_update = vfmaq_f64(next_update, row_ld, next_col_l);
+
+            let pivot1 = relative_pivot + 1;
+            let row_ld = unsafe { vld1q_f64(ld_ptr.add(pivot1 * size + row)) };
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(pivot1) });
+            let next_col_l = vdupq_n_f64(unsafe { *next_col_l_ptr.add(pivot1) });
+            update = vfmaq_f64(update, row_ld, col_l);
+            next_update = vfmaq_f64(next_update, row_ld, next_col_l);
+
+            let pivot2 = relative_pivot + 2;
+            let row_ld = unsafe { vld1q_f64(ld_ptr.add(pivot2 * size + row)) };
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(pivot2) });
+            let next_col_l = vdupq_n_f64(unsafe { *next_col_l_ptr.add(pivot2) });
+            update = vfmaq_f64(update, row_ld, col_l);
+            next_update = vfmaq_f64(next_update, row_ld, next_col_l);
+
+            let pivot3 = relative_pivot + 3;
+            let row_ld = unsafe { vld1q_f64(ld_ptr.add(pivot3 * size + row)) };
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(pivot3) });
+            let next_col_l = vdupq_n_f64(unsafe { *next_col_l_ptr.add(pivot3) });
+            update = vfmaq_f64(update, row_ld, col_l);
+            next_update = vfmaq_f64(next_update, row_ld, next_col_l);
+
+            relative_pivot += 4;
+        }
+        while relative_pivot < accepted_width {
+            // SAFETY: caller passes `row + 1 < size`, `relative_pivot < accepted_width`,
+            // and `ld_values` contains at least `accepted_width * size` entries.
+            let row_ld = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row)) };
+            // SAFETY: `relative_pivot < accepted_width <= APP_INNER_BLOCK_SIZE`.
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(relative_pivot) });
+            let next_col_l = vdupq_n_f64(unsafe { *next_col_l_ptr.add(relative_pivot) });
+            update = vfmaq_f64(update, row_ld, col_l);
+            next_update = vfmaq_f64(next_update, row_ld, next_col_l);
+            relative_pivot += 1;
+        }
+        let entry = col * size + row;
+        let next_entry = next_col * size + row;
+        // SAFETY: `row + 1 < size`, so the two-lane load/store stays inside
+        // both dense target columns.
+        let current = unsafe { vld1q_f64(matrix_ptr.add(entry)) };
+        let next_current = unsafe { vld1q_f64(matrix_ptr.add(next_entry)) };
+        let updated = vfmaq_f64(current, update, vdupq_n_f64(-1.0));
+        let next_updated = vfmaq_f64(next_current, next_update, vdupq_n_f64(-1.0));
+        // SAFETY: same bounds as the load above.
+        unsafe {
+            vst1q_f64(matrix_ptr.add(entry), updated);
+            vst1q_f64(matrix_ptr.add(next_entry), next_updated);
+        }
+        row += 2;
+    }
+    if row < size {
+        app_apply_accepted_prefix_update_scalar_row(
+            matrix,
+            size,
+            col,
+            row,
+            accepted_width,
+            ld_values,
+            column_l_values,
+        );
+        app_apply_accepted_prefix_update_scalar_row(
+            matrix,
+            size,
+            next_col,
+            row,
+            accepted_width,
+            ld_values,
+            next_column_l_values,
+        );
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+fn app_apply_accepted_prefix_update_column(
+    matrix: &mut [f64],
+    size: usize,
+    col: usize,
+    accepted_width: usize,
+    ld_values: &[f64],
+    column_l_values: &[f64; APP_INNER_BLOCK_SIZE],
+) {
+    unsafe {
+        app_apply_accepted_prefix_update_column_neon(
+            matrix,
+            size,
+            col,
+            accepted_width,
+            ld_values,
+            column_l_values,
+        );
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn app_apply_accepted_prefix_update_column_neon(
+    matrix: &mut [f64],
+    size: usize,
+    col: usize,
+    accepted_width: usize,
+    ld_values: &[f64],
+    column_l_values: &[f64; APP_INNER_BLOCK_SIZE],
+) {
+    use core::arch::aarch64::{vdupq_n_f64, vfmaq_f64, vld1q_f64, vst1q_f64};
+
+    let matrix_ptr = matrix.as_mut_ptr();
+    let ld_ptr = ld_values.as_ptr();
+    let col_l_ptr = column_l_values.as_ptr();
+    let mut row = col;
+    while row + 3 < size {
+        let mut update0 = vdupq_n_f64(0.0);
+        let mut update1 = vdupq_n_f64(0.0);
+        let mut relative_pivot = 0;
+        while relative_pivot < accepted_width {
+            // SAFETY: caller passes `row + 3 < size`, `relative_pivot < accepted_width`,
+            // and `ld_values` contains at least `accepted_width * size` entries.
+            let row_ld0 = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row)) };
+            let row_ld1 = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row + 2)) };
+            // SAFETY: `relative_pivot < accepted_width <= APP_INNER_BLOCK_SIZE`.
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(relative_pivot) });
+            update0 = vfmaq_f64(update0, row_ld0, col_l);
+            update1 = vfmaq_f64(update1, row_ld1, col_l);
+            relative_pivot += 1;
+        }
+        let entry = col * size + row;
+        // SAFETY: `row + 3 < size`, so both two-lane load/stores stay inside
+        // the dense column `col`.
+        let current0 = unsafe { vld1q_f64(matrix_ptr.add(entry)) };
+        let current1 = unsafe { vld1q_f64(matrix_ptr.add(entry + 2)) };
+        let minus_one = vdupq_n_f64(-1.0);
+        let updated0 = vfmaq_f64(current0, update0, minus_one);
+        let updated1 = vfmaq_f64(current1, update1, minus_one);
+        // SAFETY: same bounds as the loads above.
+        unsafe {
+            vst1q_f64(matrix_ptr.add(entry), updated0);
+            vst1q_f64(matrix_ptr.add(entry + 2), updated1);
+        }
+        row += 4;
+    }
+    while row + 1 < size {
+        let mut update = vdupq_n_f64(0.0);
+        let mut relative_pivot = 0;
+        while relative_pivot < accepted_width {
+            // SAFETY: caller passes `row + 1 < size`, `relative_pivot < accepted_width`,
+            // and `ld_values` contains at least `accepted_width * size` entries.
+            let row_ld = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row)) };
+            // SAFETY: `relative_pivot < accepted_width <= APP_INNER_BLOCK_SIZE`.
+            let col_l = vdupq_n_f64(unsafe { *col_l_ptr.add(relative_pivot) });
+            update = vfmaq_f64(update, row_ld, col_l);
+            relative_pivot += 1;
+        }
+        let entry = col * size + row;
+        // SAFETY: `row + 1 < size`, so the two-lane load/store stays inside the
+        // dense column `col`.
+        let current = unsafe { vld1q_f64(matrix_ptr.add(entry)) };
+        let updated = vfmaq_f64(current, update, vdupq_n_f64(-1.0));
+        // SAFETY: same bounds as the load above.
+        unsafe { vst1q_f64(matrix_ptr.add(entry), updated) };
+        row += 2;
+    }
+    if row < size {
+        app_apply_accepted_prefix_update_scalar_row(
+            matrix,
+            size,
+            col,
+            row,
+            accepted_width,
+            ld_values,
+            column_l_values,
+        );
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn app_apply_accepted_prefix_update_column(
+    matrix: &mut [f64],
+    size: usize,
+    col: usize,
+    accepted_width: usize,
+    ld_values: &[f64],
+    column_l_values: &[f64; APP_INNER_BLOCK_SIZE],
+) {
+    for row in col..size {
+        app_apply_accepted_prefix_update_scalar_row(
+            matrix,
+            size,
+            col,
+            row,
+            accepted_width,
+            ld_values,
+            column_l_values,
+        );
+    }
+}
+
+#[inline(always)]
+fn app_apply_accepted_prefix_update_scalar_row(
+    matrix: &mut [f64],
+    size: usize,
+    col: usize,
+    row: usize,
+    accepted_width: usize,
+    ld_values: &[f64],
+    column_l_values: &[f64; APP_INNER_BLOCK_SIZE],
+) {
+    let mut update = 0.0;
+    let mut relative_pivot = 0;
+    while relative_pivot + 4 <= accepted_width {
+        // SAFETY: `accepted_width <= APP_INNER_BLOCK_SIZE`, `row < size`,
+        // and `ld_values` was sliced to `accepted_width * size` above.
+        let row_ld0 = unsafe { *ld_values.get_unchecked(relative_pivot * size + row) };
+        let col_l0 = unsafe { *column_l_values.get_unchecked(relative_pivot) };
+        update = row_ld0.mul_add(col_l0, update);
+
+        let pivot1 = relative_pivot + 1;
+        let row_ld1 = unsafe { *ld_values.get_unchecked(pivot1 * size + row) };
+        let col_l1 = unsafe { *column_l_values.get_unchecked(pivot1) };
+        update = row_ld1.mul_add(col_l1, update);
+
+        let pivot2 = relative_pivot + 2;
+        let row_ld2 = unsafe { *ld_values.get_unchecked(pivot2 * size + row) };
+        let col_l2 = unsafe { *column_l_values.get_unchecked(pivot2) };
+        update = row_ld2.mul_add(col_l2, update);
+
+        let pivot3 = relative_pivot + 3;
+        let row_ld3 = unsafe { *ld_values.get_unchecked(pivot3 * size + row) };
+        let col_l3 = unsafe { *column_l_values.get_unchecked(pivot3) };
+        update = row_ld3.mul_add(col_l3, update);
+
+        relative_pivot += 4;
+    }
+    while relative_pivot < accepted_width {
+        // SAFETY: `accepted_width <= APP_INNER_BLOCK_SIZE`, `row < size`,
+        // and `ld_values` was sliced to `accepted_width * size` above.
+        let row_ld = unsafe { *ld_values.get_unchecked(relative_pivot * size + row) };
+        // SAFETY: same `accepted_width <= APP_INNER_BLOCK_SIZE` bound.
+        let col_l = unsafe { *column_l_values.get_unchecked(relative_pivot) };
+        update = row_ld.mul_add(col_l, update);
+        relative_pivot += 1;
+    }
+    let entry = col * size + row;
+    matrix[entry] = update.mul_add(-1.0, matrix[entry]);
+}
+
+fn app_gemv_forward_singleton_column(size: usize, accepted_end: usize) -> Option<usize> {
+    let trailing = size.checked_sub(accepted_end)?;
+    (trailing % APP_INNER_BLOCK_SIZE == 1).then_some(size - 1)
+}
+
+#[cfg(test)]
 fn app_target_block_uses_gemv_forward(size: usize, accepted_end: usize, col: usize) -> bool {
     let col_block_start =
         accepted_end + ((col - accepted_end) / APP_INNER_BLOCK_SIZE) * APP_INNER_BLOCK_SIZE;
@@ -3788,8 +4963,12 @@ fn factorize_dense_front(
     while active_candidate_end - pivot >= APP_INNER_BLOCK_SIZE {
         let block_start = pivot;
         let block_end = pivot + APP_INNER_BLOCK_SIZE;
+        let started = profile_enabled.then(Instant::now);
         let rows_before_block = rows.clone();
         let dense_before_block = dense.clone();
+        if let Some(started) = started {
+            profile.app_backup_time += started.elapsed();
+        }
         let mut local_stats = PanelFactorStats::default();
         let mut local_blocks = Vec::new();
         let mut block_pivot = block_start;
@@ -3980,15 +5159,20 @@ fn factorize_dense_front(
             profile.app_restore_time += started.elapsed();
         }
         let started = profile_enabled.then(Instant::now);
-        app_apply_accepted_prefix_update(
-            &mut dense,
-            size,
-            block_start,
-            accepted_end,
-            &accepted_blocks,
-        );
+        let (accepted_ld_time, accepted_gemm_time) =
+            app_apply_accepted_prefix_update_with_workspace(
+                &mut dense,
+                size,
+                block_start,
+                accepted_end,
+                &accepted_blocks,
+                &mut scratch,
+                profile_enabled,
+            );
         if let Some(started) = started {
             profile.app_accepted_update_time += started.elapsed();
+            profile.app_accepted_ld_time += accepted_ld_time;
+            profile.app_accepted_gemm_time += accepted_gemm_time;
         }
 
         factor_order.extend(rows[block_start..accepted_end].iter().copied());
@@ -4305,17 +5489,20 @@ fn multifrontal_factorize_with_tree(
         }
     }
     let started = profile_enabled.then(Instant::now);
-    fill_permuted_lower_csc_values(
-        matrix,
-        buffers.permuted_matrix_source_positions,
-        buffers.permuted_matrix_values,
-    )?;
     if let Some(scaling) = scaling {
-        apply_permuted_symmetric_scaling(
+        fill_scaled_permuted_lower_csc_values(
+            matrix,
             buffers.permuted_matrix_col_ptrs,
             buffers.permuted_matrix_row_indices,
-            buffers.permuted_matrix_values,
+            buffers.permuted_matrix_source_positions,
             scaling,
+            buffers.permuted_matrix_values,
+        )?;
+    } else {
+        fill_permuted_lower_csc_values(
+            matrix,
+            buffers.permuted_matrix_source_positions,
+            buffers.permuted_matrix_values,
         )?;
     }
     if let Some(started) = started {
@@ -4482,11 +5669,17 @@ fn multifrontal_factorize_with_tree(
         profile.factor_inverse_time += started.elapsed();
     }
     let started = profile_enabled.then(Instant::now);
+    let lower_entry_count = factor_columns
+        .iter()
+        .map(|column| column.entries.len())
+        .sum::<usize>();
     buffers.lower_col_ptrs.clear();
     buffers.lower_col_ptrs.reserve(dimension + 1);
     buffers.lower_col_ptrs.push(0);
     buffers.lower_row_indices.clear();
+    buffers.lower_row_indices.reserve(lower_entry_count);
     buffers.lower_values.clear();
+    buffers.lower_values.reserve(lower_entry_count);
     for (column_position, column) in factor_columns.iter().enumerate() {
         if column.global_column != buffers.factor_order[column_position] {
             return Err(SsidsError::NumericalBreakdown {
@@ -4550,10 +5743,7 @@ fn multifrontal_factorize_with_tree(
 
     let started = profile_enabled.then(Instant::now);
     let stored_nnz = dimension
-        + factor_columns
-            .iter()
-            .map(|column| column.entries.len())
-            .sum::<usize>()
+        + lower_entry_count
         + buffers
             .diagonal_blocks
             .iter()
@@ -5152,15 +6342,20 @@ mod tests {
         analyse, app_adjust_passed_prefix, app_apply_accepted_prefix_update,
         app_apply_block_pivots_to_trailing_rows, app_build_ld_tile_workspace,
         app_build_ld_workspace, app_first_failed_trailing_column,
-        app_restore_trailing_from_block_backup, app_solve_block_triangular_to_trailing_rows,
+        app_gemv_forward_singleton_column, app_restore_trailing_from_block_backup,
+        app_solve_block_triangular_to_trailing_rows, app_target_block_uses_gemv_forward,
         app_truncate_records_to_prefix, app_two_by_two_inverse, app_update_one_by_one,
-        app_update_two_by_two, apply_permuted_symmetric_scaling, build_symbolic_front_tree,
-        dense_find_maxloc, dense_lower_offset, dense_symmetric_swap_with_workspace,
-        expand_symmetric_pattern, factor_one_by_one_common, factor_two_by_two_common, factorize,
-        factorize_dense_front, factorize_dense_tpp_tail_in_place, native_column_counts,
-        native_postorder_permutation, openblas_gemv_n_update_like_native,
+        app_update_two_by_two, apply_permuted_symmetric_scaling, build_native_row_list_supernodes,
+        build_native_row_list_supernodes_fast, build_permuted_lower_csc_pattern,
+        build_symbolic_front_tree, dense_find_maxloc, dense_lower_offset,
+        dense_symmetric_swap_with_workspace, expand_symmetric_pattern, factor_one_by_one_common,
+        factor_two_by_two_common, factorize, factorize_dense_front,
+        factorize_dense_tpp_tail_in_place, fill_permuted_lower_csc_values,
+        fill_scaled_permuted_lower_csc_values, native_column_counts, native_postorder_permutation,
+        native_supernode_layout, openblas_gemv_n_update_like_native,
         openblas_gemv_t_dot_like_contiguous, openblas_trsv_lower_unit_op_n_like_native,
-        openblas_trsv_lower_unit_op_t_like_native, permute_graph, reset_ldwork_column_tail,
+        openblas_trsv_lower_unit_op_t_like_native, permute_graph, permute_graph_with_bitsets,
+        permute_graph_with_sorted_edges, reset_ldwork_column_tail,
         solve_diagonal_and_lower_transpose_front_panels_like_native,
         solve_forward_front_panels_like_native, solve_two_by_two_block_in_place,
         symbolic_factor_pattern, zero_dense_column_until,
@@ -8583,6 +9778,86 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
     }
 
     #[test]
+    fn fused_scaled_permuted_values_match_fill_then_scale_bits() {
+        let dense = vec![
+            vec![f64::from_bits(0x3ff0_0000_0000_0001), 0.0, 0.0, 0.0],
+            vec![
+                f64::from_bits(0xbfd8_0000_0000_0003),
+                f64::from_bits(0x3fe8_0000_0000_0005),
+                0.0,
+                0.0,
+            ],
+            vec![
+                f64::from_bits(0x3fb9_9999_9999_999a),
+                f64::from_bits(0xbfc4_0000_0000_0007),
+                f64::from_bits(0x3ff8_0000_0000_000b),
+                0.0,
+            ],
+            vec![
+                f64::from_bits(0xbfa0_0000_0000_000d),
+                f64::from_bits(0x3fd0_0000_0000_000f),
+                f64::from_bits(0xbfe0_0000_0000_0011),
+                f64::from_bits(0x3fc8_0000_0000_0013),
+            ],
+        ];
+        let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+        let matrix = SymmetricCscMatrix::new(4, &col_ptrs, &row_indices, Some(&values))
+            .expect("valid matrix");
+        let permutation = Permutation::new(vec![2, 0, 3, 1]).expect("valid permutation");
+        let scaling = [
+            f64::from_bits(0x3fb9_5124_5767_cd7a),
+            f64::from_bits(0x3fc2_62eb_bdd2_832b),
+            f64::from_bits(0x3fd1_f3b6_45a1_c935),
+            f64::from_bits(0x3fc8_b332_7756_0eaf),
+        ];
+
+        let mut permuted_col_ptrs = Vec::new();
+        let mut permuted_row_indices = Vec::new();
+        let mut source_positions = Vec::new();
+        build_permuted_lower_csc_pattern(
+            matrix,
+            &permutation,
+            &mut permuted_col_ptrs,
+            &mut permuted_row_indices,
+            &mut source_positions,
+        )
+        .expect("permuted pattern");
+
+        let mut separate = Vec::new();
+        fill_permuted_lower_csc_values(matrix, &source_positions, &mut separate)
+            .expect("fill values");
+        apply_permuted_symmetric_scaling(
+            &permuted_col_ptrs,
+            &permuted_row_indices,
+            &mut separate,
+            &scaling,
+        )
+        .expect("apply scaling");
+
+        let mut fused = Vec::new();
+        fill_scaled_permuted_lower_csc_values(
+            matrix,
+            &permuted_col_ptrs,
+            &permuted_row_indices,
+            &source_positions,
+            &scaling,
+            &mut fused,
+        )
+        .expect("fused fill");
+
+        assert_eq!(
+            fused
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            separate
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn app_block_triangular_solve_op_n_matches_native_host_trsm_property_cases() {
         let Some(shim) = native_kernel_shim_or_skip() else {
             return;
@@ -9988,6 +11263,83 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             native_counts,
             column_pattern.iter().map(Vec::len).collect::<Vec<usize>>()
         );
+    }
+
+    #[test]
+    fn bitset_permute_graph_matches_sorted_edge_path() {
+        let edges = vec![
+            (0, 1),
+            (0, 4),
+            (1, 2),
+            (1, 5),
+            (2, 3),
+            (2, 6),
+            (3, 7),
+            (4, 5),
+            (5, 6),
+            (6, 7),
+            (0, 7),
+        ];
+        let graph = CsrGraph::from_edges(8, &edges).expect("valid graph");
+        let permutation =
+            Permutation::new(vec![6, 2, 7, 1, 4, 0, 5, 3]).expect("valid permutation");
+
+        assert_eq!(
+            permute_graph_with_bitsets(&graph, &permutation),
+            permute_graph_with_sorted_edges(&graph, &permutation)
+        );
+        assert_eq!(
+            permute_graph(&graph, &permutation),
+            permute_graph_with_sorted_edges(&graph, &permutation)
+        );
+    }
+
+    #[test]
+    fn fast_single_supernode_row_list_matches_generic_native_row_list_path() {
+        let dense = vec![
+            vec![4.0, 1.0, 2.0, 3.0],
+            vec![1.0, 5.0, 4.0, 6.0],
+            vec![2.0, 4.0, 6.0, 7.0],
+            vec![3.0, 6.0, 7.0, 8.0],
+        ];
+        let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+        let matrix =
+            SymmetricCscMatrix::new(4, &col_ptrs, &row_indices, Some(&values)).expect("valid CSC");
+        let graph = CsrGraph::from_symmetric_csc(4, &col_ptrs, &row_indices).expect("valid graph");
+        let permutation = Permutation::identity(4);
+        let permuted_graph = permute_graph(&graph, &permutation);
+        let (elimination_tree, column_counts, column_pattern) =
+            symbolic_factor_pattern(&permuted_graph);
+        let layout = native_supernode_layout(&elimination_tree, &column_counts, 4);
+        assert_eq!(layout.ranges, vec![0..4]);
+
+        let expanded_pattern = expand_symmetric_pattern(matrix);
+        let generic = build_native_row_list_supernodes(
+            &expanded_pattern,
+            &permutation,
+            &layout,
+            &column_pattern,
+        );
+        let fast = build_native_row_list_supernodes_fast(&layout, &column_pattern)
+            .expect("single full supernode fast path");
+
+        assert_eq!(fast, generic);
+    }
+
+    #[test]
+    fn app_gemv_forward_singleton_column_matches_source_tile_predicate() {
+        for size in 1..96 {
+            for accepted_end in 0..size {
+                let singleton = app_gemv_forward_singleton_column(size, accepted_end);
+                for col in accepted_end..size {
+                    assert_eq!(
+                        singleton == Some(col),
+                        app_target_block_uses_gemv_forward(size, accepted_end, col),
+                        "size={size} accepted_end={accepted_end} col={col}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
