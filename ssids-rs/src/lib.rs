@@ -35,6 +35,20 @@ pub struct SolveProfile {
 }
 
 impl SolveProfile {
+    #[doc(hidden)]
+    pub fn debug_branch_hits(&self) -> Vec<&'static str> {
+        let mut hits = Vec::new();
+        if self.forward_substitution_time > Duration::default()
+            || self.diagonal_solve_time > Duration::default()
+            || self.backward_substitution_time > Duration::default()
+            || self.backward_trailing_update_columns > 0
+            || self.backward_triangular_columns > 0
+        {
+            hits.push("ssids.solve.app_dense.forward_diag_backward");
+        }
+        hits
+    }
+
     pub fn total_recorded_time(&self) -> Duration {
         self.input_permutation_time
             + self.forward_substitution_time
@@ -91,6 +105,27 @@ pub struct FactorProfile {
 }
 
 impl FactorProfile {
+    #[doc(hidden)]
+    pub fn debug_branch_hits(&self) -> Vec<&'static str> {
+        let mut hits = Vec::new();
+        if self.app_pivot_factor_time > Duration::default()
+            || self.app_block_pivot_apply_time > Duration::default()
+            || self.app_block_triangular_solve_time > Duration::default()
+            || self.app_block_diagonal_apply_time > Duration::default()
+        {
+            hits.push("ssids.factor.app_dense.block_ldlt");
+        }
+        if self.app_failed_pivot_scan_time > Duration::default() {
+            hits.push("ssids.factor.app_dense.maxloc");
+        }
+        if self.app_accepted_update_time > Duration::default()
+            || self.app_accepted_gemm_time > Duration::default()
+        {
+            hits.push("ssids.factor.app_dense.accepted_update");
+        }
+        hits
+    }
+
     pub fn total_recorded_time(&self) -> Duration {
         self.symbolic_front_tree_time
             + self.permuted_pattern_time

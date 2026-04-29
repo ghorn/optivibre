@@ -52,6 +52,10 @@ Branch telemetry status:
   no-prune/all-pruned/partial-prune cases, identity/compressed/pruned
   expansion, recursive L1/L2 nested dissection, MMD leaves, compression retry,
   and the zero-edge bisection path.
+- The existing factor and solve profiles now expose test-only branch-hit
+  classifiers for the dense APP factor path and forward/diagonal/backward solve
+  path. The branch fixture asserts that a dense APP witness hits block LDLT,
+  maxloc, accepted-prefix update, and the combined solve kernel sequence.
 - The same ledger records the existing native-oracle METIS, APP dense factor,
   and solve-kernel branch fixtures. Native METIS/APP branches are still proven
   by source-backed phase/output assertions rather than native branch counters;

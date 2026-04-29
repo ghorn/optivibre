@@ -31,7 +31,7 @@ use std::sync::{
 use ssids_rs::{
     NativeOrdering, NativeSpral, NativeSpralAnalyseInfo, NativeSpralFactorInfo,
     NumericFactorOptions, SpralCscTrace, SpralMatchingTrace, SsidsOptions, SymmetricCscMatrix,
-    analyse, analyse_with_user_ordering, factorize, spral_matching_trace,
+    analyse, analyse_with_user_ordering, factorize, factorize_with_profile, spral_matching_trace,
 };
 
 const LINEAR_SSIDS_BRANCH_LEDGER: &[(&str, &str, &str)] = &[
@@ -717,6 +717,42 @@ fn rust_metis_node_nd_branch_telemetry_covers_default_and_option_fixtures() {
             "metis.node_nd.l1_nested_dissection",
             "metis.node_nd.zero_edge_random_bisection",
         ],
+    );
+}
+
+#[test]
+fn rust_app_factor_and_solve_branch_telemetry_covers_dense_kernel_witness() {
+    let (dimension, dense_matrix, expected_solution) =
+        dense_boundary_case(0x7061_7269_7479_2026, 59);
+    let rhs = dense_mul(&dense_matrix, &expected_solution);
+    let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense_matrix);
+    let matrix = SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
+        .expect("valid dense APP branch fixture");
+    let (symbolic, _) = analyse(matrix, &SsidsOptions::spral_default()).expect("rust analyse");
+    let matrix = SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
+        .expect("valid dense APP branch fixture");
+    let (mut factor, _, factor_profile) =
+        factorize_with_profile(matrix, &symbolic, &NumericFactorOptions::spral_default())
+            .expect("rust factorize with profile");
+    let factor_hits = factor_profile.debug_branch_hits();
+    assert_branch_hits_include(
+        "dense_case_59_factor_profile",
+        &factor_hits,
+        &[
+            "ssids.factor.app_dense.block_ldlt",
+            "ssids.factor.app_dense.accepted_update",
+            "ssids.factor.app_dense.maxloc",
+        ],
+    );
+
+    let (_solution, solve_profile) = factor
+        .solve_with_profile(&rhs)
+        .expect("rust solve with profile");
+    let solve_hits = solve_profile.debug_branch_hits();
+    assert_branch_hits_include(
+        "dense_case_59_solve_profile",
+        &solve_hits,
+        &["ssids.solve.app_dense.forward_diag_backward"],
     );
 }
 
