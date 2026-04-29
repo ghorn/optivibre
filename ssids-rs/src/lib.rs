@@ -2535,6 +2535,7 @@ fn dense_symmetric_swap(matrix: &mut [f64], size: usize, lhs: usize, rhs: usize)
     matrix.swap(lhs_diag, rhs_diag);
 }
 
+#[cfg(test)]
 fn dense_symmetric_swap_with_workspace(
     matrix: &mut [f64],
     size: usize,
@@ -2542,12 +2543,25 @@ fn dense_symmetric_swap_with_workspace(
     rhs: usize,
     workspace: &mut [f64],
 ) {
+    dense_symmetric_swap_with_workspace_row_offset(matrix, size, lhs, rhs, workspace, 0);
+}
+
+fn dense_symmetric_swap_with_workspace_row_offset(
+    matrix: &mut [f64],
+    size: usize,
+    lhs: usize,
+    rhs: usize,
+    workspace: &mut [f64],
+    workspace_row_offset: usize,
+) {
     if lhs == rhs {
         return;
     }
     let (lhs, rhs) = if lhs < rhs { (lhs, rhs) } else { (rhs, lhs) };
-    for work_row in 0..lhs {
-        workspace.swap(work_row * size + lhs, work_row * size + rhs);
+    debug_assert!(lhs >= workspace_row_offset);
+    for work_row in workspace_row_offset..lhs {
+        let work_start = (work_row - workspace_row_offset) * size;
+        workspace.swap(work_start + lhs, work_start + rhs);
     }
     dense_symmetric_swap(matrix, size, lhs, rhs);
 }
@@ -2629,8 +2643,21 @@ fn one_by_one_inverse_diagonal(values: &[f64]) -> Result<f64, String> {
     }
 }
 
+#[cfg(test)]
 fn reset_ldwork_column_tail(workspace: &mut [f64], size: usize, col: usize, from: usize) {
-    let column = &mut workspace[col * size..(col + 1) * size];
+    reset_ldwork_column_tail_with_row_offset(workspace, size, col, from, 0);
+}
+
+fn reset_ldwork_column_tail_with_row_offset(
+    workspace: &mut [f64],
+    size: usize,
+    col: usize,
+    from: usize,
+    workspace_row_offset: usize,
+) {
+    debug_assert!(col >= workspace_row_offset);
+    let column_start = (col - workspace_row_offset) * size;
+    let column = &mut workspace[column_start..column_start + size];
     column[from..].fill(0.0);
 }
 
@@ -2762,6 +2789,7 @@ fn tpp_test_two_by_two(
     }
 }
 
+#[cfg(test)]
 fn app_update_one_by_one(
     matrix: &mut [f64],
     size: usize,
@@ -2769,17 +2797,42 @@ fn app_update_one_by_one(
     update_end: usize,
     workspace: &[f64],
 ) {
+    app_update_one_by_one_with_row_offset(matrix, size, pivot, update_end, workspace, 0);
+}
+
+fn app_update_one_by_one_with_row_offset(
+    matrix: &mut [f64],
+    size: usize,
+    pivot: usize,
+    update_end: usize,
+    workspace: &[f64],
+    workspace_row_offset: usize,
+) {
     #[cfg(target_arch = "aarch64")]
     {
         // SAFETY: the NEON helper only performs two-lane row loads/stores when
         // `row + 1 < update_end`; scalar tails handle the remaining row.
         unsafe {
-            app_update_one_by_one_neon(matrix, size, pivot, update_end, workspace);
+            app_update_one_by_one_neon(
+                matrix,
+                size,
+                pivot,
+                update_end,
+                workspace,
+                workspace_row_offset,
+            );
         }
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
-        app_update_one_by_one_scalar(matrix, size, pivot, update_end, workspace);
+        app_update_one_by_one_scalar(
+            matrix,
+            size,
+            pivot,
+            update_end,
+            workspace,
+            workspace_row_offset,
+        );
     }
 }
 
@@ -2790,8 +2843,11 @@ fn app_update_one_by_one_scalar(
     pivot: usize,
     update_end: usize,
     workspace: &[f64],
+    workspace_row_offset: usize,
 ) {
-    let ld = &workspace[pivot * size..(pivot + 1) * size];
+    debug_assert!(pivot >= workspace_row_offset);
+    let workspace_pivot = pivot - workspace_row_offset;
+    let ld = &workspace[workspace_pivot * size..(workspace_pivot + 1) * size];
     for (col, &preserved) in ld.iter().enumerate().take(update_end).skip(pivot + 1) {
         for row in col..update_end {
             app_update_one_by_one_scalar_entry(matrix, size, pivot, col, row, preserved);
@@ -2821,6 +2877,7 @@ unsafe fn app_update_one_by_one_neon(
     pivot: usize,
     update_end: usize,
     workspace: &[f64],
+    workspace_row_offset: usize,
 ) {
     use core::arch::aarch64::{vdupq_n_f64, vfmaq_f64, vld1q_f64, vst1q_f64};
 
@@ -2828,7 +2885,9 @@ unsafe fn app_update_one_by_one_neon(
     const SOURCE_UNROLL: usize = 4;
 
     let matrix_ptr = matrix.as_mut_ptr();
-    let ld = &workspace[pivot * size..(pivot + 1) * size];
+    debug_assert!(pivot >= workspace_row_offset);
+    let workspace_pivot = pivot - workspace_row_offset;
+    let ld = &workspace[workspace_pivot * size..(workspace_pivot + 1) * size];
     let block_start = update_end.saturating_sub(APP_INNER_BLOCK_SIZE);
     let local_pivot = pivot - block_start;
     let source_unroll_start = block_start + SOURCE_UNROLL * (local_pivot / SOURCE_UNROLL + 1);
@@ -2919,6 +2978,7 @@ unsafe fn app_update_one_by_one_neon(
     }
 }
 
+#[cfg(test)]
 fn app_update_two_by_two(
     matrix: &mut [f64],
     size: usize,
@@ -2926,17 +2986,42 @@ fn app_update_two_by_two(
     update_end: usize,
     workspace: &[f64],
 ) {
+    app_update_two_by_two_with_row_offset(matrix, size, pivot, update_end, workspace, 0);
+}
+
+fn app_update_two_by_two_with_row_offset(
+    matrix: &mut [f64],
+    size: usize,
+    pivot: usize,
+    update_end: usize,
+    workspace: &[f64],
+    workspace_row_offset: usize,
+) {
     #[cfg(target_arch = "aarch64")]
     {
         // SAFETY: the NEON helper only performs two-lane row loads/stores when
         // `row + 1 < update_end`; scalar tails handle the remaining row.
         unsafe {
-            app_update_two_by_two_neon(matrix, size, pivot, update_end, workspace);
+            app_update_two_by_two_neon(
+                matrix,
+                size,
+                pivot,
+                update_end,
+                workspace,
+                workspace_row_offset,
+            );
         }
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
-        app_update_two_by_two_scalar(matrix, size, pivot, update_end, workspace);
+        app_update_two_by_two_scalar(
+            matrix,
+            size,
+            pivot,
+            update_end,
+            workspace,
+            workspace_row_offset,
+        );
     }
 }
 
@@ -2947,9 +3032,12 @@ fn app_update_two_by_two_scalar(
     pivot: usize,
     update_end: usize,
     workspace: &[f64],
+    workspace_row_offset: usize,
 ) {
-    let first_ld = &workspace[pivot * size..(pivot + 1) * size];
-    let second_ld = &workspace[(pivot + 1) * size..(pivot + 2) * size];
+    debug_assert!(pivot >= workspace_row_offset);
+    let workspace_pivot = pivot - workspace_row_offset;
+    let first_ld = &workspace[workspace_pivot * size..(workspace_pivot + 1) * size];
+    let second_ld = &workspace[(workspace_pivot + 1) * size..(workspace_pivot + 2) * size];
     for col in (pivot + 2)..update_end {
         let first_preserved = first_ld[col];
         let second_preserved = second_ld[col];
@@ -2986,6 +3074,11 @@ fn app_update_two_by_two_scalar_entry(
     matrix[update_entry] -= combined;
 }
 
+struct AppWorkspaceMut<'a> {
+    values: &'a mut [f64],
+    row_offset: usize,
+}
+
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn app_update_two_by_two_neon(
@@ -2994,12 +3087,15 @@ unsafe fn app_update_two_by_two_neon(
     pivot: usize,
     update_end: usize,
     workspace: &[f64],
+    workspace_row_offset: usize,
 ) {
     use core::arch::aarch64::{vdupq_n_f64, vfmaq_f64, vld1q_f64, vmulq_f64, vst1q_f64, vsubq_f64};
 
     let matrix_ptr = matrix.as_mut_ptr();
-    let first_ld = &workspace[pivot * size..(pivot + 1) * size];
-    let second_ld = &workspace[(pivot + 1) * size..(pivot + 2) * size];
+    debug_assert!(pivot >= workspace_row_offset);
+    let workspace_pivot = pivot - workspace_row_offset;
+    let first_ld = &workspace[workspace_pivot * size..(workspace_pivot + 1) * size];
+    let second_ld = &workspace[(workspace_pivot + 1) * size..(workspace_pivot + 2) * size];
     for col in (pivot + 2)..update_end {
         let first_preserved = first_ld[col];
         let second_preserved = second_ld[col];
@@ -3036,6 +3132,7 @@ unsafe fn app_update_two_by_two_neon(
     }
 }
 
+#[cfg(test)]
 fn factor_one_by_one_common(
     rows: &[usize],
     matrix: &mut [f64],
@@ -3045,7 +3142,33 @@ fn factor_one_by_one_common(
     stats: &mut PanelFactorStats,
     scratch: &mut [f64],
 ) -> Result<FactorBlockRecord, SsidsError> {
-    let work = &mut scratch[pivot * size..(pivot + 1) * size];
+    factor_one_by_one_common_with_workspace_offset(
+        rows,
+        matrix,
+        size,
+        pivot,
+        update_end,
+        stats,
+        AppWorkspaceMut {
+            values: scratch,
+            row_offset: 0,
+        },
+    )
+}
+
+fn factor_one_by_one_common_with_workspace_offset(
+    rows: &[usize],
+    matrix: &mut [f64],
+    size: usize,
+    pivot: usize,
+    update_end: usize,
+    stats: &mut PanelFactorStats,
+    workspace: AppWorkspaceMut<'_>,
+) -> Result<FactorBlockRecord, SsidsError> {
+    let workspace_row_offset = workspace.row_offset;
+    debug_assert!(pivot >= workspace_row_offset);
+    let workspace_pivot = pivot - workspace_row_offset;
+    let work = &mut workspace.values[workspace_pivot * size..(workspace_pivot + 1) * size];
     let diagonal_index = dense_lower_offset(size, pivot, pivot);
     let original_diagonal = matrix[diagonal_index];
     if !original_diagonal.is_finite() {
@@ -3083,7 +3206,14 @@ fn factor_one_by_one_common(
         matrix[entry_index] = value;
     }
 
-    app_update_one_by_one(matrix, size, pivot, update_end, scratch);
+    app_update_one_by_one_with_row_offset(
+        matrix,
+        size,
+        pivot,
+        update_end,
+        workspace.values,
+        workspace_row_offset,
+    );
 
     Ok(FactorBlockRecord {
         size: 1,
@@ -3091,6 +3221,7 @@ fn factor_one_by_one_common(
     })
 }
 
+#[cfg(test)]
 fn factor_two_by_two_common(
     rows: &[usize],
     matrix: &mut [f64],
@@ -3100,11 +3231,38 @@ fn factor_two_by_two_common(
     stats: &mut PanelFactorStats,
     scratch: &mut [f64],
 ) -> Result<FactorBlockRecord, SsidsError> {
+    factor_two_by_two_common_with_workspace_offset(
+        rows,
+        matrix,
+        bounds,
+        pivot,
+        inverse,
+        stats,
+        AppWorkspaceMut {
+            values: scratch,
+            row_offset: 0,
+        },
+    )
+}
+
+fn factor_two_by_two_common_with_workspace_offset(
+    rows: &[usize],
+    matrix: &mut [f64],
+    bounds: DenseUpdateBounds,
+    pivot: usize,
+    inverse: (f64, f64, f64),
+    stats: &mut PanelFactorStats,
+    workspace: AppWorkspaceMut<'_>,
+) -> Result<FactorBlockRecord, SsidsError> {
     let size = bounds.size;
     let update_end = bounds.update_end;
-    let second_start = (pivot + 1) * size;
-    let (first_prefix, second_suffix) = scratch.split_at_mut(second_start);
-    let first_scratch = &mut first_prefix[pivot * size..second_start];
+    let workspace_row_offset = workspace.row_offset;
+    debug_assert!(pivot >= workspace_row_offset);
+    let workspace_pivot = pivot - workspace_row_offset;
+    let first_start = workspace_pivot * size;
+    let second_start = (workspace_pivot + 1) * size;
+    let (first_prefix, second_suffix) = workspace.values.split_at_mut(second_start);
+    let first_scratch = &mut first_prefix[first_start..second_start];
     let second_scratch = &mut second_suffix[..size];
     let (inv11, inv12, inv22) = inverse;
     stats.two_by_two_pivots += 1;
@@ -3147,7 +3305,14 @@ fn factor_two_by_two_common(
         matrix[dense_lower_offset(size, row, pivot + 1)] = l2;
     }
 
-    app_update_two_by_two(matrix, size, pivot, update_end, scratch);
+    app_update_two_by_two_with_row_offset(
+        matrix,
+        size,
+        pivot,
+        update_end,
+        workspace.values,
+        workspace_row_offset,
+    );
 
     Ok(FactorBlockRecord {
         size: 2,
@@ -5495,7 +5660,10 @@ fn factorize_dense_front(
     let mut factor_order = Vec::with_capacity(active_candidate_end);
     let mut factor_columns = Vec::with_capacity(active_candidate_end);
     let mut block_records = Vec::with_capacity(active_candidate_end);
-    let mut scratch = vec![0.0; size.saturating_mul(size).max(1)];
+    // SPRAL's block_ldlt<32> uses a local 32-row ldwork block; columns still
+    // use the dense front lda, so workspace helpers take the current block's
+    // row offset.
+    let mut scratch = vec![0.0; APP_INNER_BLOCK_SIZE.saturating_mul(size).max(1)];
     let mut pivot = 0;
 
     while active_candidate_end - pivot >= APP_INNER_BLOCK_SIZE {
@@ -5527,7 +5695,13 @@ fn factorize_dense_front(
                 }
                 while block_pivot < block_end {
                     zero_dense_column_until(&mut dense, size, block_pivot, block_end);
-                    reset_ldwork_column_tail(&mut scratch, size, block_pivot, block_pivot);
+                    reset_ldwork_column_tail_with_row_offset(
+                        &mut scratch,
+                        size,
+                        block_pivot,
+                        block_pivot,
+                        block_start,
+                    );
                     local_blocks.push(FactorBlockRecord {
                         size: 1,
                         values: [0.0, 0.0, 0.0, 0.0],
@@ -5539,23 +5713,27 @@ fn factorize_dense_front(
 
             if best_row == best_col {
                 if best_col != block_pivot {
-                    dense_symmetric_swap_with_workspace(
+                    dense_symmetric_swap_with_workspace_row_offset(
                         &mut dense,
                         size,
                         best_col,
                         block_pivot,
                         &mut scratch,
+                        block_start,
                     );
                     rows.swap(best_col, block_pivot);
                 }
-                let block = factor_one_by_one_common(
+                let block = factor_one_by_one_common_with_workspace_offset(
                     &rows,
                     &mut dense,
                     size,
                     block_pivot,
                     block_end,
                     &mut local_stats,
-                    &mut scratch,
+                    AppWorkspaceMut {
+                        values: &mut scratch,
+                        row_offset: block_start,
+                    },
                 )?;
                 local_blocks.push(block);
                 block_pivot += 1;
@@ -5584,23 +5762,27 @@ fn factorize_dense_front(
 
             if let Some(index) = one_by_one_index {
                 if index != block_pivot {
-                    dense_symmetric_swap_with_workspace(
+                    dense_symmetric_swap_with_workspace_row_offset(
                         &mut dense,
                         size,
                         index,
                         block_pivot,
                         &mut scratch,
+                        block_start,
                     );
                     rows.swap(index, block_pivot);
                 }
-                let block = factor_one_by_one_common(
+                let block = factor_one_by_one_common_with_workspace_offset(
                     &rows,
                     &mut dense,
                     size,
                     block_pivot,
                     block_end,
                     &mut local_stats,
-                    &mut scratch,
+                    AppWorkspaceMut {
+                        values: &mut scratch,
+                        row_offset: block_start,
+                    },
                 )?;
                 local_blocks.push(block);
                 block_pivot += 1;
@@ -5609,12 +5791,13 @@ fn factorize_dense_front(
 
             if let Some(inverse) = two_by_two_inverse {
                 if first != block_pivot {
-                    dense_symmetric_swap_with_workspace(
+                    dense_symmetric_swap_with_workspace_row_offset(
                         &mut dense,
                         size,
                         first,
                         block_pivot,
                         &mut scratch,
+                        block_start,
                     );
                     rows.swap(first, block_pivot);
                     if second == block_pivot {
@@ -5622,16 +5805,17 @@ fn factorize_dense_front(
                     }
                 }
                 if second != block_pivot + 1 {
-                    dense_symmetric_swap_with_workspace(
+                    dense_symmetric_swap_with_workspace_row_offset(
                         &mut dense,
                         size,
                         second,
                         block_pivot + 1,
                         &mut scratch,
+                        block_start,
                     );
                     rows.swap(second, block_pivot + 1);
                 }
-                let block = factor_two_by_two_common(
+                let block = factor_two_by_two_common_with_workspace_offset(
                     &rows,
                     &mut dense,
                     DenseUpdateBounds {
@@ -5641,7 +5825,10 @@ fn factorize_dense_front(
                     block_pivot,
                     inverse,
                     &mut local_stats,
-                    &mut scratch,
+                    AppWorkspaceMut {
+                        values: &mut scratch,
+                        row_offset: block_start,
+                    },
                 )?;
                 local_blocks.push(block);
                 block_pivot += 2;
