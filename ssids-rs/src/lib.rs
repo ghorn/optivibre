@@ -3834,9 +3834,22 @@ fn app_truncate_records_to_prefix(
     accepted
 }
 
+#[cfg(test)]
 fn app_backup_trailing_lower(matrix: &[f64], size: usize, backup_start: usize) -> Vec<f64> {
+    let mut backup = Vec::new();
+    app_backup_trailing_lower_into(matrix, size, backup_start, &mut backup);
+    backup
+}
+
+fn app_backup_trailing_lower_into(
+    matrix: &[f64],
+    size: usize,
+    backup_start: usize,
+    backup: &mut Vec<f64>,
+) {
     let backup_size = size - backup_start;
-    let mut backup = vec![0.0; packed_lower_len(backup_size)];
+    backup.clear();
+    backup.resize(packed_lower_len(backup_size), 0.0);
     for local_col in 0..backup_size {
         let source_col = backup_start + local_col;
         let len = backup_size - local_col;
@@ -3845,7 +3858,6 @@ fn app_backup_trailing_lower(matrix: &[f64], size: usize, backup_start: usize) -
         backup[backup_offset..backup_offset + len]
             .copy_from_slice(&matrix[source_start..source_start + len]);
     }
-    backup
 }
 
 #[derive(Clone, Copy)]
@@ -5736,14 +5748,17 @@ fn factorize_dense_front(
     // use the dense front lda, so workspace helpers take the current block's
     // row offset.
     let mut scratch = vec![0.0; APP_INNER_BLOCK_SIZE.saturating_mul(size).max(1)];
+    let mut rows_before_block = Vec::with_capacity(size);
+    let mut dense_before_block = Vec::new();
     let mut pivot = 0;
 
     while active_candidate_end - pivot >= APP_INNER_BLOCK_SIZE {
         let block_start = pivot;
         let block_end = pivot + APP_INNER_BLOCK_SIZE;
         let started = profile_enabled.then(Instant::now);
-        let rows_before_block = rows.clone();
-        let dense_before_block = app_backup_trailing_lower(&dense, size, block_start);
+        rows_before_block.clear();
+        rows_before_block.extend_from_slice(&rows);
+        app_backup_trailing_lower_into(&dense, size, block_start, &mut dense_before_block);
         if let Some(started) = started {
             profile.app_backup_time += started.elapsed();
         }

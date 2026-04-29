@@ -253,3 +253,9 @@ Release performance notes on dense case 58:
   `227us` and case 59 to about `313us`; case 59's saved-scaling
   `app_accepted_update` bucket dropped to about `48us`. The next measured
   dense-front buckets are APP pivot work and restore/storage overhead.
+- The APP dense-front loop now reuses its row-order and packed trailing-lower
+  backup buffers across 32-column blocks. The copied data and restore order are
+  unchanged, but allocation churn is removed from the backup bucket. A short
+  three-repeat release profile on the same case-59 witness measured native
+  matching/scaling factor at about `226us` and Rust saved-scaling factor at
+  about `290us`, with Rust's `app_backup` bucket reduced to about `10us`.
