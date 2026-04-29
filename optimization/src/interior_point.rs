@@ -12002,7 +12002,7 @@ where
             eta_phi: options.eta_phi,
             theta_max,
         };
-        let alpha_min = calculate_filter_alpha_min(
+        let mut alpha_min = calculate_filter_alpha_min(
             current_theta,
             theta_min,
             barrier_directional_derivative,
@@ -12044,6 +12044,12 @@ where
                 &mut iteration_events,
                 InteriorPointIterationEvent::WatchdogArmed,
             );
+        }
+        if watchdog_active {
+            // IPOPT BacktrackingLineSearch::DoBacktrackingLineSearch keeps
+            // alpha_min at alpha_primal_max while in_watchdog_, so the active
+            // watchdog search evaluates the max feasible step exactly once.
+            alpha_min = alpha;
         }
         // IPOPT `BacktrackingLineSearch::DoBacktrackingLineSearch` uses
         // `alpha_primal > alpha_min || n_steps == 0`, so the initial trial is

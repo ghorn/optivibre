@@ -2112,6 +2112,24 @@ fn compare_native_and_ipopt_with_watchdog_trigger_profile() {
         first_watchdog_armed_iter, first_watchdog_activated_iter,
         "NLIP watchdog should arm in the same line search that activates it, mirroring BacktrackingLineSearch::StartWatchDog"
     );
+    let watchdog_line_search = native
+        .snapshots
+        .iter()
+        .find(|snapshot| {
+            snapshot
+                .events
+                .contains(&InteriorPointIterationEvent::WatchdogActivated)
+        })
+        .and_then(|snapshot| snapshot.line_search.as_ref())
+        .expect("hanging_chain_watchdog should retain watchdog line-search diagnostics");
+    assert_eq!(
+        watchdog_line_search.backtrack_count, 0,
+        "IPOPT keeps alpha_min at alpha_primal_max while in_watchdog_, so the successful W trial should not backtrack"
+    );
+    assert!(
+        watchdog_line_search.rejected_trials.is_empty(),
+        "IPOPT's active watchdog DoBacktrackingLineSearch returns after one max-step trial"
+    );
     assert_ipopt_info_string_seen("hanging_chain_watchdog", &ipopt, 'W');
     assert_native_matches_ipopt(
         "hanging_chain_watchdog",
