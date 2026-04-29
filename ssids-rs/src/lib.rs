@@ -6304,24 +6304,28 @@ fn factor_front_recursive(
     }
 
     let assembly_started = profile_enabled.then(Instant::now);
-    let identity_leaf_front = child_contributions.is_empty()
+    let contiguous_leaf_front = child_contributions.is_empty()
         && front.interface_rows.is_empty()
         && front
             .columns
-            .iter()
-            .enumerate()
-            .all(|(position, &row)| row == position);
-    let (local_rows, local_dense) = if identity_leaf_front {
+            .windows(2)
+            .all(|window| window[1] == window[0] + 1);
+    let (local_rows, local_dense) = if contiguous_leaf_front {
         let local_rows = front.columns.clone();
         let local_size = local_rows.len();
         let mut local_dense = vec![0.0; local_size * local_size];
+        let first_row = local_rows.first().copied().unwrap_or(0);
+        let row_limit = first_row + local_size;
         for &column in &front.columns {
+            let local_column = column - first_row;
             for entry in matrix.col_ptrs[column]..matrix.col_ptrs[column + 1] {
                 let row = matrix.row_indices[entry];
-                if row < local_size {
-                    // In this guarded path the local row/column numbering is
-                    // already identity and the permuted matrix is lower CSC.
-                    local_dense[column * local_size + row] = matrix.values[entry];
+                if row >= first_row && row < row_limit {
+                    // In this guarded path local numbering is a contiguous
+                    // offset of the permuted lower CSC numbering.
+                    let local_row = row - first_row;
+                    local_dense[dense_lower_offset(local_size, local_row, local_column)] =
+                        matrix.values[entry];
                 }
             }
         }

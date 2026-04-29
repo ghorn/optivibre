@@ -4,9 +4,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 REPEATS="${SSIDS_PROFILE_REPEATS:-7}"
-DENSE_CASES="${SSIDS_PROFILE_DENSE_CASES:-0x0000706172697479:58 0x7061726974792026:59}"
+DEFAULT_DENSE_CASES="0x0000706172697479:58 0x7061726974792026:59"
+DENSE_CASES="${SSIDS_PROFILE_DENSE_CASES-$DEFAULT_DENSE_CASES}"
+if [[ "$DENSE_CASES" == "none" || "$DENSE_CASES" == "0" ]]; then
+  DENSE_CASES=""
+fi
 GLIDER_REPEATS="${SSIDS_PROFILE_GLIDER_REPEATS:-1}"
 RUN_GLIDER="${SSIDS_PROFILE_GLIDER:-1}"
+GLIDER_TEST="${SSIDS_PROFILE_GLIDER_TEST:-print_current_glider_nlip_iteration0_augmented_compare}"
 
 require_native_env=(
   RAYON_NUM_THREADS=1
@@ -46,7 +51,7 @@ run_glider() {
       env "${require_native_env[@]}" \
         cargo test -p optimal_control_problems --release \
           --features ipopt,native-spral-src \
-          glider_native_spral_exact_augmented_replay_matches_rust_to_machine_precision \
+          "$GLIDER_TEST" \
           -- --ignored --nocapture
     } 2>&1 | tee -a "$tmp"
   done
@@ -71,8 +76,8 @@ micro = "\N{MICRO SIGN}"
 duration_re = re.compile(f"^([0-9.]+)(ns|{micro}s|us|ms|s)$")
 factor_re = re.compile(r"^\[ssids_rs::factorize\].*scaling=([^ ]+) (.*)$")
 dense_re = re.compile(r"^(native_matching_scaling|native_captured_order_no_scaling|rust_captured_order_no_scaling|rust_spral_matching_saved_scaling) (.*)$")
-glider_factor_re = re.compile(r"^\s+(rust_spral|native_spral) factor=([^ ]+) solve=([^ ]+)")
-glider_dense_re = re.compile(r"^\s+rust_spral dense_front_profile (.*)$")
+glider_factor_re = re.compile(r"^\s*(rust_spral|native_spral) factor=([^ ]+) solve=([^ ]+)")
+glider_dense_re = re.compile(r"^\s*rust_spral dense_front_profile (.*)$")
 repeat_re = re.compile(r"\s+repeat=\d+\b")
 
 
