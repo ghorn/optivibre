@@ -46,11 +46,17 @@ Branch telemetry status:
   Hungarian matching, singleton/unmatched/two-cycle/long-cycle `mo_split`
   behavior, compressed graph construction, METIS `NodeND` entry, and saved
   scaling exponentiation.
+- Rust `METIS_NodeND` now exposes a test-only branch-hit trace for default and
+  configured option paths. The parity fixtures assert classified hits for the
+  SPRAL default compression path, forced no-compression, `ccorder`, `pfactor`
+  no-prune/all-pruned/partial-prune cases, identity/compressed/pruned
+  expansion, recursive L1/L2 nested dissection, MMD leaves, compression retry,
+  and the zero-edge bisection path.
 - The same ledger records the existing native-oracle METIS, APP dense factor,
-  and solve-kernel branch fixtures. Those branches are currently proven by
-  phase/output assertions rather than native branch counters; adding native
-  internal branch counters remains optional unless a fixture begins to
-  localize poorly.
+  and solve-kernel branch fixtures. Native METIS/APP branches are still proven
+  by source-backed phase/output assertions rather than native branch counters;
+  adding native internal branch counters remains optional unless a fixture
+  begins to localize poorly.
 
 Open parity work:
 

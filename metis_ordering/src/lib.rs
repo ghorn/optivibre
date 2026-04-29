@@ -1254,6 +1254,17 @@ pub fn metis_debug_node_nd_top_separator_from_lower_csc_with_options(
 }
 
 #[doc(hidden)]
+pub fn metis_debug_node_nd_branch_hits_from_lower_csc_with_options(
+    dimension: usize,
+    col_ptrs: &[usize],
+    row_indices: &[usize],
+    options: MetisNodeNdOptions,
+) -> Result<Vec<&'static str>, OrderingError> {
+    let graph = spral_half_to_full_drop_diag(dimension, col_ptrs, row_indices)?;
+    metis_node_nd_branch_hits_raw(&graph, options)
+}
+
+#[doc(hidden)]
 pub fn metis_debug_cc_components_from_lower_csc_with_options(
     dimension: usize,
     col_ptrs: &[usize],
@@ -1652,6 +1663,112 @@ fn prune_metis_node_nd_graph(
         kept_vertex_count,
         piperm,
     }))
+}
+
+fn metis_node_nd_branch_hits_raw(
+    graph: &MetisGraph,
+    options: MetisNodeNdOptions,
+) -> Result<Vec<&'static str>, OrderingError> {
+    let vertex_count = graph.vertex_count();
+    let mut hits = Vec::new();
+    if vertex_count == 0 {
+        hits.push("metis.node_nd.empty");
+        return Ok(hits);
+    }
+    if vertex_count == 1 {
+        hits.push("metis.node_nd.single_vertex");
+        return Ok(hits);
+    }
+
+    if options.pfactor == 0 {
+        hits.push("metis.node_nd.pfactor.default_zero");
+    } else {
+        hits.push(metis_prune_branch_id(graph, options.pfactor));
+    }
+    if options.compress {
+        hits.push("metis.node_nd.compress.default");
+    } else {
+        hits.push("metis.node_nd.compress.forced_disabled");
+    }
+    if options.ccorder {
+        hits.push("metis.node_nd.ccorder.enabled");
+    } else {
+        hits.push("metis.node_nd.ccorder.disabled");
+    }
+
+    let prepared = prepare_metis_node_nd_graph(graph, options)?;
+    match &prepared.expansion {
+        MetisNodeNdExpansion::Identity => hits.push("metis.node_nd.expansion.identity"),
+        MetisNodeNdExpansion::Compressed { .. } => {
+            hits.push("metis.node_nd.compress.active");
+            hits.push("metis.node_nd.expansion.compressed");
+        }
+        MetisNodeNdExpansion::Pruned { .. } => {
+            hits.push("metis.node_nd.pfactor.partial_prune_disables_compression");
+            hits.push("metis.node_nd.expansion.pruned");
+        }
+    }
+    if options.compress && !prepared.compression_active {
+        hits.push("metis.node_nd.compress.inactive");
+    }
+    if prepared.nseps > 1 {
+        hits.push("metis.node_nd.nseps_retry");
+    }
+
+    let config = MetisNodeNdConfig {
+        compression_active: prepared.compression_active,
+        ccorder: options.ccorder,
+        nseps: prepared.nseps,
+    };
+    let base_summary = if options.ccorder {
+        hits.push("metis.node_nd.recursive_cc");
+        metis_recursive_node_nd_order_cc(&prepared.graph, config)?
+    } else if prepared.graph.vertex_count() <= 53 {
+        hits.push("metis.node_nd.one_level");
+        metis_one_level_node_nd_order(&prepared.graph, config)?
+    } else {
+        hits.push("metis.node_nd.recursive");
+        metis_recursive_node_nd_order(&prepared.graph, config)?
+    };
+
+    let stats = base_summary.stats.clone();
+    if stats.separator_calls > 0 {
+        if prepared.graph.vertex_count() >= 5000 {
+            hits.push("metis.node_nd.l2_nested_dissection");
+        } else {
+            hits.push("metis.node_nd.l1_nested_dissection");
+        }
+        if graph.directed_edge_count() == 0 {
+            hits.push("metis.node_nd.zero_edge_random_bisection");
+        }
+    }
+    if stats.leaf_calls > 0 && prepared.graph.vertex_count() > 1 {
+        hits.push("metis.node_nd.mmd_leaf");
+    }
+    if options.ccorder && stats.connected_components > 0 {
+        hits.push("metis.node_nd.ccorder.components");
+    }
+
+    let _ = expand_metis_node_nd_permutation(base_summary.permutation, prepared.expansion)?;
+    Ok(hits)
+}
+
+fn metis_prune_branch_id(graph: &MetisGraph, pfactor: usize) -> &'static str {
+    let vertex_count = graph.vertex_count();
+    if vertex_count == 0 {
+        return "metis.node_nd.pfactor.no_prune";
+    }
+    let threshold = 0.1 * pfactor as f64 * graph.directed_edge_count() as f64 / vertex_count as f64;
+    let pruned_count = (0..vertex_count)
+        .filter(|&vertex| (graph.degree(vertex) as f64) >= threshold)
+        .count();
+    if pruned_count == 0 {
+        "metis.node_nd.pfactor.no_prune"
+    } else if pruned_count == vertex_count {
+        "metis.node_nd.pfactor.all_pruned_ignored"
+    } else {
+        "metis.node_nd.pfactor.partial_prune"
+    }
 }
 
 #[doc(hidden)]
@@ -4661,6 +4778,72 @@ mod tests {
         assert_permutation(&default_summary, dimension);
         assert_permutation(&no_compress, dimension);
         assert_ne!(default_summary.permutation, no_compress.permutation);
+    }
+
+    #[test]
+    fn metis_node_nd_branch_hits_classify_default_and_option_paths() {
+        let complete_dimension = 69;
+        let mut complete_col_ptrs = Vec::with_capacity(complete_dimension + 1);
+        let mut complete_row_indices = Vec::new();
+        complete_col_ptrs.push(0);
+        for col in 0..complete_dimension {
+            complete_row_indices.extend(col..complete_dimension);
+            complete_col_ptrs.push(complete_row_indices.len());
+        }
+        let complete_hits = metis_debug_node_nd_branch_hits_from_lower_csc_with_options(
+            complete_dimension,
+            &complete_col_ptrs,
+            &complete_row_indices,
+            MetisNodeNdOptions::spral_default(),
+        )
+        .unwrap();
+        assert!(complete_hits.contains(&"metis.node_nd.compress.active"));
+        assert!(complete_hits.contains(&"metis.node_nd.expansion.compressed"));
+        assert!(complete_hits.contains(&"metis.node_nd.one_level"));
+
+        let forced_hits = metis_debug_node_nd_branch_hits_from_lower_csc_with_options(
+            complete_dimension,
+            &complete_col_ptrs,
+            &complete_row_indices,
+            MetisNodeNdOptions {
+                compress: false,
+                ..MetisNodeNdOptions::spral_default()
+            },
+        )
+        .unwrap();
+        assert!(forced_hits.contains(&"metis.node_nd.compress.forced_disabled"));
+        assert!(forced_hits.contains(&"metis.node_nd.expansion.identity"));
+        assert!(forced_hits.contains(&"metis.node_nd.recursive"));
+
+        let star_edges = (1..10).map(|leaf| (0, leaf)).collect::<Vec<_>>();
+        let (star_col_ptrs, star_row_indices) = lower_csc_pattern_from_edges(10, &star_edges);
+        let pruned_hits = metis_debug_node_nd_branch_hits_from_lower_csc_with_options(
+            10,
+            &star_col_ptrs,
+            &star_row_indices,
+            MetisNodeNdOptions {
+                pfactor: 20,
+                ..MetisNodeNdOptions::spral_default()
+            },
+        )
+        .unwrap();
+        assert!(pruned_hits.contains(&"metis.node_nd.pfactor.partial_prune"));
+        assert!(pruned_hits.contains(&"metis.node_nd.expansion.pruned"));
+        assert!(pruned_hits.contains(&"metis.node_nd.pfactor.partial_prune_disables_compression"));
+
+        let cc_hits = metis_debug_node_nd_branch_hits_from_lower_csc_with_options(
+            10,
+            &star_col_ptrs,
+            &star_row_indices,
+            MetisNodeNdOptions {
+                compress: false,
+                ccorder: true,
+                pfactor: 0,
+            },
+        )
+        .unwrap();
+        assert!(cc_hits.contains(&"metis.node_nd.ccorder.enabled"));
+        assert!(cc_hits.contains(&"metis.node_nd.recursive_cc"));
     }
 
     #[test]

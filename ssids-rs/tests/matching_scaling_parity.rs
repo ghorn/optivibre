@@ -106,14 +106,60 @@ const LINEAR_SSIDS_BRANCH_LEDGER: &[(&str, &str, &str)] = &[
         "complete and dense compressed fixtures",
     ),
     (
+        "metis.node_nd.compress.active",
+        "hit",
+        "complete compressed fixture",
+    ),
+    (
         "metis.node_nd.compress.forced_disabled",
         "hit",
         "native non-default option fixture",
     ),
     (
+        "metis.node_nd.compress.inactive",
+        "hit",
+        "no-compression-candidate fixtures",
+    ),
+    (
+        "metis.node_nd.ccorder.disabled",
+        "hit",
+        "SPRAL default NodeND fixtures",
+    ),
+    (
         "metis.node_nd.ccorder.enabled",
         "hit",
         "native non-default option fixture",
+    ),
+    (
+        "metis.node_nd.ccorder.components",
+        "hit",
+        "native CC component fixture",
+    ),
+    ("metis.node_nd.empty", "guarded", "empty graph fast path"),
+    (
+        "metis.node_nd.single_vertex",
+        "hit",
+        "single-vertex fast path",
+    ),
+    (
+        "metis.node_nd.expansion.identity",
+        "hit",
+        "no-compression NodeND fixtures",
+    ),
+    (
+        "metis.node_nd.expansion.compressed",
+        "hit",
+        "compressed NodeND fixtures",
+    ),
+    (
+        "metis.node_nd.expansion.pruned",
+        "hit",
+        "partial pruning NodeND fixture",
+    ),
+    (
+        "metis.node_nd.pfactor.default_zero",
+        "hit",
+        "SPRAL default NodeND fixtures",
     ),
     (
         "metis.node_nd.pfactor.no_prune",
@@ -131,6 +177,31 @@ const LINEAR_SSIDS_BRANCH_LEDGER: &[(&str, &str, &str)] = &[
         "native prune fixture",
     ),
     (
+        "metis.node_nd.pfactor.partial_prune_disables_compression",
+        "hit",
+        "native pruning+compression fixture",
+    ),
+    (
+        "metis.node_nd.one_level",
+        "hit",
+        "small compressed/leaf fixtures",
+    ),
+    (
+        "metis.node_nd.recursive",
+        "hit",
+        "recursive NodeND fixtures",
+    ),
+    (
+        "metis.node_nd.recursive_cc",
+        "hit",
+        "ccorder NodeND fixtures",
+    ),
+    (
+        "metis.node_nd.nseps_retry",
+        "hit",
+        "compressed twin path fixture",
+    ),
+    (
         "metis.node_nd.mmd_leaf",
         "hit",
         "native MMD and recursive NodeND fixtures",
@@ -144,6 +215,11 @@ const LINEAR_SSIDS_BRANCH_LEDGER: &[(&str, &str, &str)] = &[
         "metis.node_nd.l2_nested_dissection",
         "hit",
         "native path_5000 fixture",
+    ),
+    (
+        "metis.node_nd.zero_edge_random_bisection",
+        "hit",
+        "empty graph fixture",
     ),
     (
         "metis.balance.general_2way",
@@ -330,6 +406,16 @@ fn assert_branch_hits_are_classified(name: &str, hits: &[&'static str]) {
     }
 }
 
+fn assert_branch_hits_include(name: &str, hits: &[&'static str], expected: &[&'static str]) {
+    assert_branch_hits_are_classified(name, hits);
+    for branch_id in expected {
+        assert!(
+            hits.contains(branch_id),
+            "fixture {name} missed expected linear SSIDS branch {branch_id}; hits={hits:?}"
+        );
+    }
+}
+
 #[test]
 fn linear_ssids_branch_ledger_has_no_unclassified_scoped_entries() {
     let allowed = ["hit", "guarded", "unreachable-for-SPRAL", "out-of-scope"];
@@ -392,6 +478,246 @@ fn rust_matching_branch_telemetry_covers_dense_and_singular_fixtures() {
     let path = spral_matching_trace(path).expect("path singular matching trace");
     assert_branch_hits_are_classified("path3_no_diagonal", &path.branch_hits);
     assert!(path.branch_hits.contains(&"match_order.mo_split.two_cycle"));
+}
+
+#[test]
+fn rust_metis_node_nd_branch_telemetry_covers_default_and_option_fixtures() {
+    let mut complete_col_ptrs = Vec::with_capacity(70);
+    let mut complete_row_indices = Vec::new();
+    complete_col_ptrs.push(0);
+    for col in 0..69 {
+        complete_row_indices.extend(col..69);
+        complete_col_ptrs.push(complete_row_indices.len());
+    }
+    let complete_hits =
+        metis_ordering::metis_debug_node_nd_branch_hits_from_lower_csc_with_options(
+            69,
+            &complete_col_ptrs,
+            &complete_row_indices,
+            metis_ordering::MetisNodeNdOptions::spral_default(),
+        )
+        .expect("complete graph METIS branch trace");
+    assert_branch_hits_include(
+        "complete_69_default",
+        &complete_hits,
+        &[
+            "metis.node_nd.pfactor.default_zero",
+            "metis.node_nd.compress.default",
+            "metis.node_nd.compress.active",
+            "metis.node_nd.ccorder.disabled",
+            "metis.node_nd.expansion.compressed",
+            "metis.node_nd.one_level",
+        ],
+    );
+
+    let no_compress_hits =
+        metis_ordering::metis_debug_node_nd_branch_hits_from_lower_csc_with_options(
+            69,
+            &complete_col_ptrs,
+            &complete_row_indices,
+            metis_ordering::MetisNodeNdOptions {
+                compress: false,
+                ..metis_ordering::MetisNodeNdOptions::spral_default()
+            },
+        )
+        .expect("forced no-compression METIS branch trace");
+    assert_branch_hits_include(
+        "complete_69_forced_no_compression",
+        &no_compress_hits,
+        &[
+            "metis.node_nd.compress.forced_disabled",
+            "metis.node_nd.expansion.identity",
+            "metis.node_nd.recursive",
+            "metis.node_nd.l1_nested_dissection",
+            "metis.node_nd.mmd_leaf",
+        ],
+    );
+
+    let star_edges = (1..10).map(|leaf| (0, leaf)).collect::<Vec<_>>();
+    let (star_col_ptrs, star_row_indices) = lower_csc_pattern_from_edges(10, &star_edges);
+    let no_prune_hits =
+        metis_ordering::metis_debug_node_nd_branch_hits_from_lower_csc_with_options(
+            10,
+            &star_col_ptrs,
+            &star_row_indices,
+            metis_ordering::MetisNodeNdOptions {
+                pfactor: 60,
+                ..metis_ordering::MetisNodeNdOptions::spral_default()
+            },
+        )
+        .expect("no-prune METIS branch trace");
+    assert_branch_hits_include(
+        "star_10_pfactor_no_prune",
+        &no_prune_hits,
+        &["metis.node_nd.pfactor.no_prune"],
+    );
+
+    let all_pruned_hits =
+        metis_ordering::metis_debug_node_nd_branch_hits_from_lower_csc_with_options(
+            10,
+            &star_col_ptrs,
+            &star_row_indices,
+            metis_ordering::MetisNodeNdOptions {
+                pfactor: 5,
+                ..metis_ordering::MetisNodeNdOptions::spral_default()
+            },
+        )
+        .expect("all-pruned METIS branch trace");
+    assert_branch_hits_include(
+        "star_10_pfactor_all_pruned_ignored",
+        &all_pruned_hits,
+        &["metis.node_nd.pfactor.all_pruned_ignored"],
+    );
+
+    let pruned_hits = metis_ordering::metis_debug_node_nd_branch_hits_from_lower_csc_with_options(
+        10,
+        &star_col_ptrs,
+        &star_row_indices,
+        metis_ordering::MetisNodeNdOptions {
+            pfactor: 20,
+            ..metis_ordering::MetisNodeNdOptions::spral_default()
+        },
+    )
+    .expect("partial-prune METIS branch trace");
+    assert_branch_hits_include(
+        "star_10_pfactor_partial_prune",
+        &pruned_hits,
+        &[
+            "metis.node_nd.pfactor.partial_prune",
+            "metis.node_nd.pfactor.partial_prune_disables_compression",
+            "metis.node_nd.expansion.pruned",
+        ],
+    );
+
+    let cc_hits = metis_ordering::metis_debug_node_nd_branch_hits_from_lower_csc_with_options(
+        10,
+        &star_col_ptrs,
+        &star_row_indices,
+        metis_ordering::MetisNodeNdOptions {
+            compress: false,
+            ccorder: true,
+            pfactor: 0,
+        },
+    )
+    .expect("ccorder METIS branch trace");
+    assert_branch_hits_include(
+        "star_10_ccorder",
+        &cc_hits,
+        &[
+            "metis.node_nd.ccorder.enabled",
+            "metis.node_nd.recursive_cc",
+            "metis.node_nd.ccorder.components",
+        ],
+    );
+
+    let empty_hits = metis_ordering::metis_debug_node_nd_branch_hits_from_lower_csc_with_options(
+        0,
+        &[0],
+        &[],
+        metis_ordering::MetisNodeNdOptions::spral_default(),
+    )
+    .expect("empty METIS branch trace");
+    assert_branch_hits_include("empty_0", &empty_hits, &["metis.node_nd.empty"]);
+
+    let (single_col_ptrs, single_row_indices) = lower_csc_pattern_from_edges(1, &[]);
+    let single_hits = metis_ordering::metis_debug_node_nd_branch_hits_from_lower_csc_with_options(
+        1,
+        &single_col_ptrs,
+        &single_row_indices,
+        metis_ordering::MetisNodeNdOptions::spral_default(),
+    )
+    .expect("single-vertex METIS branch trace");
+    assert_branch_hits_include(
+        "single_vertex",
+        &single_hits,
+        &["metis.node_nd.single_vertex"],
+    );
+
+    let path_300_edges = (0..299)
+        .map(|vertex| (vertex, vertex + 1))
+        .collect::<Vec<_>>();
+    let (path_300_col_ptrs, path_300_row_indices) =
+        lower_csc_pattern_from_edges(300, &path_300_edges);
+    let path_300_hits =
+        metis_ordering::metis_debug_node_nd_branch_hits_from_lower_csc_with_options(
+            300,
+            &path_300_col_ptrs,
+            &path_300_row_indices,
+            metis_ordering::MetisNodeNdOptions::spral_default(),
+        )
+        .expect("path_300 METIS branch trace");
+    assert_branch_hits_include(
+        "path_300_l1",
+        &path_300_hits,
+        &[
+            "metis.node_nd.recursive",
+            "metis.node_nd.l1_nested_dissection",
+            "metis.node_nd.mmd_leaf",
+        ],
+    );
+
+    let twin_path_2400_edges = twin_path_edges(1200);
+    let (twin_path_2400_col_ptrs, twin_path_2400_row_indices) =
+        lower_csc_pattern_from_edges(2400, &twin_path_2400_edges);
+    let twin_path_2400_hits =
+        metis_ordering::metis_debug_node_nd_branch_hits_from_lower_csc_with_options(
+            2400,
+            &twin_path_2400_col_ptrs,
+            &twin_path_2400_row_indices,
+            metis_ordering::MetisNodeNdOptions::spral_default(),
+        )
+        .expect("twin_path_2400 METIS branch trace");
+    assert_branch_hits_include(
+        "twin_path_2400_nseps_retry",
+        &twin_path_2400_hits,
+        &[
+            "metis.node_nd.nseps_retry",
+            "metis.node_nd.l1_nested_dissection",
+        ],
+    );
+
+    let path_5000_edges = (0..4999)
+        .map(|vertex| (vertex, vertex + 1))
+        .collect::<Vec<_>>();
+    let (path_5000_col_ptrs, path_5000_row_indices) =
+        lower_csc_pattern_from_edges(5000, &path_5000_edges);
+    let path_5000_hits =
+        metis_ordering::metis_debug_node_nd_branch_hits_from_lower_csc_with_options(
+            5000,
+            &path_5000_col_ptrs,
+            &path_5000_row_indices,
+            metis_ordering::MetisNodeNdOptions::spral_default(),
+        )
+        .expect("path_5000 METIS branch trace");
+    assert_branch_hits_include(
+        "path_5000_l2",
+        &path_5000_hits,
+        &[
+            "metis.node_nd.recursive",
+            "metis.node_nd.l2_nested_dissection",
+        ],
+    );
+
+    let (isolated_54_col_ptrs, isolated_54_row_indices) = lower_csc_pattern_from_edges(54, &[]);
+    let isolated_54_hits =
+        metis_ordering::metis_debug_node_nd_branch_hits_from_lower_csc_with_options(
+            54,
+            &isolated_54_col_ptrs,
+            &isolated_54_row_indices,
+            metis_ordering::MetisNodeNdOptions {
+                compress: false,
+                ..metis_ordering::MetisNodeNdOptions::spral_default()
+            },
+        )
+        .expect("isolated_54 METIS branch trace");
+    assert_branch_hits_include(
+        "isolated_54_zero_edge",
+        &isolated_54_hits,
+        &[
+            "metis.node_nd.l1_nested_dissection",
+            "metis.node_nd.zero_edge_random_bisection",
+        ],
+    );
 }
 
 fn parse_u64(value: &str) -> Option<u64> {
