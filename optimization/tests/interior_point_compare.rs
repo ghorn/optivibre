@@ -2189,6 +2189,10 @@ fn compare_native_and_ipopt_with_lowercase_watchdog_trial_profile() {
             .any(|point| point.step_tag.as_deref() == Some("w")),
         "IPOPT witness should exercise lowercase BacktrackingLineSearch watchdog trial"
     );
+    assert!(
+        ipopt_info_string_seen(&ipopt, 'w'),
+        "IPOPT witness should append StopWatchDog's lowercase info marker"
+    );
     let lowercase_watchdog_trial = native
         .snapshots
         .iter()
@@ -2204,6 +2208,28 @@ fn compare_native_and_ipopt_with_lowercase_watchdog_trial_profile() {
     assert!(
         !line_search.second_order_correction_attempted,
         "IPOPT breaks out of DoBacktrackingLineSearch before SOC while in_watchdog_ is active"
+    );
+    let restored_retry = native
+        .snapshots
+        .windows(2)
+        .find_map(|pair| {
+            let previous = &pair[0];
+            let current = &pair[1];
+            let line_search = current.line_search.as_ref()?;
+            (previous.step_tag == Some('w')
+                && current.step_tag == Some('h')
+                && !line_search.watchdog_active
+                && !line_search.watchdog_accepted
+                && line_search.backtrack_count > 0
+                && current.alpha_pr.is_some_and(|alpha| alpha < 1.0))
+            .then_some(line_search)
+        })
+        .expect(
+            "NLIP should accept a restored non-watchdog retry after a lowercase watchdog trial",
+        );
+    assert_eq!(
+        restored_retry.initial_alpha_pr, 1.0,
+        "StopWatchDog retry keeps the stored direction's max primal step before skipping the first trial"
     );
 }
 

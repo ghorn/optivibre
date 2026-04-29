@@ -385,23 +385,23 @@ def classify_rust_line(path, line_no, text):
             return "unreachable: non-parity linear solver/debug branch"
         if 2030 <= line_no <= 2145:
             return "linear-solver workspace setup"
-        if 2200 <= line_no <= 2230:
+        if 2200 <= line_no <= 2250:
             return "diagnostic linear replay"
-        if 2400 <= line_no <= 2865:
+        if 2400 <= line_no <= 2910:
             return "diagnostic linear replay"
-        if 3075 <= line_no <= 3120:
+        if 3075 <= line_no <= 3135:
             return "diagnostic factorization progress"
         if 3745 <= line_no <= 3785:
             return "monotone barrier update"
-        if 3850 <= line_no <= 3885 and "InteriorPointAlphaForYStrategy::" in text:
+        if 3850 <= line_no <= 3910 and "InteriorPointAlphaForYStrategy::" in text:
             return "covered by alpha_for_y option-profile witness"
-        if 3900 <= line_no <= 4055:
+        if 3900 <= line_no <= 4070:
             return "termination display/tolerance reporting"
-        if 4200 <= line_no <= 5050:
+        if 4200 <= line_no <= 5080:
             return "bounds, fixed-variable, and sparse-preprocessing helper"
-        if 5180 <= line_no <= 5275:
+        if 5180 <= line_no <= 5300:
             return "KKT pattern validation/preprocessing"
-        if 5550 <= line_no <= 6915:
+        if 5550 <= line_no <= 6965:
             return "full-space residual/refinement helper"
         if 6930 <= line_no <= 6945:
             return "full-space residual/refinement helper"
@@ -409,21 +409,21 @@ def classify_rust_line(path, line_no, text):
             return "linear solver dispatch, retry, and diagnostics"
         if 8485 <= line_no <= 8958:
             return "linear solver fallback/retry path"
-        if 8970 <= line_no <= 9330:
+        if 8970 <= line_no <= 9355:
             return "iteration log formatting/reporting"
-        if 9560 <= line_no <= 9955:
+        if 9560 <= line_no <= 9980:
             return "bound/slack stationarity helper alternate branch"
-        if 10200 <= line_no <= 10490:
+        if 10200 <= line_no <= 10520:
             return "solve summary/reporting"
-        if 10650 <= line_no <= 10970:
+        if 10650 <= line_no <= 10990:
             return "initialization and max-iteration witness branch"
-        if 11640 <= line_no <= 11720:
+        if 11640 <= line_no <= 11740:
             return "linear solver workspace selection"
-        if 11980 <= line_no <= 12045:
+        if 11980 <= line_no <= 12120:
             return "watchdog globalization start gate"
-        if 12800 <= line_no <= 13430:
+        if 12800 <= line_no <= 14150:
             return "SOC/watchdog globalization branch"
-        if 13835 <= line_no <= 13985:
+        if 14330 <= line_no <= 14620:
             return "accepted-step and watchdog state bookkeeping"
     if any(token in text for token in ["SparseQdldl", "SsidsRs", "Auto", "compare_solvers"]):
         return "unreachable: non-parity linear solver/debug branch"
