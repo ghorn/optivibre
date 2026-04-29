@@ -3821,21 +3821,26 @@ fn app_adjust_passed_prefix(block_records: &[FactorBlockRecord], local_prefix: u
     }
 }
 
-fn app_truncate_records_to_prefix(
-    block_records: &[FactorBlockRecord],
-    local_prefix: usize,
-) -> Vec<FactorBlockRecord> {
-    let mut accepted = Vec::new();
+fn app_record_count_for_prefix(block_records: &[FactorBlockRecord], local_prefix: usize) -> usize {
+    let mut count = 0;
     let mut cursor = 0;
     for block in block_records {
         if cursor + block.size > local_prefix {
             break;
         }
-        accepted.push(block.clone());
+        count += 1;
         cursor += block.size;
     }
     debug_assert_eq!(cursor, local_prefix);
-    accepted
+    count
+}
+
+#[cfg(test)]
+fn app_truncate_records_to_prefix(
+    block_records: &[FactorBlockRecord],
+    local_prefix: usize,
+) -> Vec<FactorBlockRecord> {
+    block_records[..app_record_count_for_prefix(block_records, local_prefix)].to_vec()
 }
 
 #[cfg(test)]
@@ -3852,15 +3857,32 @@ fn app_backup_trailing_lower_into(
     backup: &mut Vec<f64>,
 ) {
     let backup_size = size - backup_start;
+    let backup_len = packed_lower_len(backup_size);
     backup.clear();
-    backup.resize(packed_lower_len(backup_size), 0.0);
+    if backup.capacity() < backup_len {
+        backup.reserve(backup_len);
+    }
+    let backup_ptr = backup.as_mut_ptr();
     for local_col in 0..backup_size {
         let source_col = backup_start + local_col;
         let len = backup_size - local_col;
         let source_start = dense_lower_offset(size, source_col, source_col);
         let backup_offset = packed_lower_offset(backup_size, local_col, local_col);
-        backup[backup_offset..backup_offset + len]
-            .copy_from_slice(&matrix[source_start..source_start + len]);
+        // SAFETY: the packed lower-triangle column ranges are disjoint and
+        // cover exactly `backup_len` entries. Each source range is a contiguous
+        // lower-column suffix inside the dense front.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                matrix.as_ptr().add(source_start),
+                backup_ptr.add(backup_offset),
+                len,
+            );
+        }
+    }
+    // SAFETY: every packed entry is initialized exactly once by the column
+    // copies above. For an empty suffix, both capacity and length are zero.
+    unsafe {
+        backup.set_len(backup_len);
     }
 }
 
@@ -6120,7 +6142,8 @@ fn factorize_dense_front(
         );
         let local_passed = app_adjust_passed_prefix(&local_blocks, first_failed - block_start);
         let accepted_end = block_start + local_passed;
-        let accepted_blocks = app_truncate_records_to_prefix(&local_blocks, local_passed);
+        let accepted_block_count = app_record_count_for_prefix(&local_blocks, local_passed);
+        let accepted_blocks = &local_blocks[..accepted_block_count];
         if let Some(started) = started {
             profile.app_failed_pivot_scan_time += started.elapsed();
         }
@@ -6148,7 +6171,7 @@ fn factorize_dense_front(
                 size,
                 block_start,
                 accepted_end,
-                &accepted_blocks,
+                accepted_blocks,
                 &mut scratch,
                 profile_enabled,
             );
@@ -6176,7 +6199,7 @@ fn factorize_dense_front(
             .filter(|block| block.size == 2)
             .count();
         stats.max_residual = stats.max_residual.max(local_stats.max_residual);
-        block_records.extend(accepted_blocks);
+        block_records.extend_from_slice(accepted_blocks);
         pivot = accepted_end;
 
         if pivot < block_end {
