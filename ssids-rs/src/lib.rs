@@ -2651,10 +2651,14 @@ fn dense_symmetric_swap(matrix: &mut [f64], size: usize, lhs: usize, rhs: usize)
         matrix.swap(lhs_offset, rhs_offset);
     }
 
-    for row in (rhs + 1)..size {
-        let lhs_offset = lhs * size + row;
-        let rhs_offset = rhs * size + row;
-        matrix.swap(lhs_offset, rhs_offset);
+    let tail_len = size.saturating_sub(rhs + 1);
+    if tail_len > 0 {
+        let lhs_tail_start = lhs * size + rhs + 1;
+        let rhs_tail_start = rhs * size + rhs + 1;
+        let (before_rhs_tail, rhs_tail_and_after) = matrix.split_at_mut(rhs_tail_start);
+        let lhs_tail = &mut before_rhs_tail[lhs_tail_start..lhs_tail_start + tail_len];
+        let rhs_tail = &mut rhs_tail_and_after[..tail_len];
+        lhs_tail.swap_with_slice(rhs_tail);
     }
 
     let lhs_diag = lhs * size + lhs;

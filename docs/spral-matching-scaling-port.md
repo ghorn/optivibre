@@ -328,3 +328,12 @@ Release performance notes on dense case 58:
   dense APP fixtures for the two 1x1 variants and case-59 coverage for the
   2x2 path, so future glider-specific APP changes can fail closed on the exact
   pivot-shape branch they are trying to optimize.
+- Dense symmetric swaps now exchange the row-tail part of the dense front as
+  one contiguous slice while preserving the same column/row swap order and the
+  same diagonal/cross-term handling. A five-repeat case-59 release profile
+  measured native/Rust saved-scaling factor medians at about `277us`/`287us`
+  with bitwise-identical solves. A glider exact augmented replay measured
+  native/Rust factor at about `967us`/`3.51ms` and solve at about
+  `1.97ms`/`2.37ms`; the exact augmented solution delta remained
+  `6.94e-18`, and the remaining glider factor gap is still the many-small-front
+  APP path as a whole rather than the symmetric swap tail alone.
