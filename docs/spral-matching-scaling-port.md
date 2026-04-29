@@ -317,7 +317,14 @@ Release performance notes on dense case 58:
   native timing comparisons.
 - The glider exact augmented replay currently exercises 88 APP fronts and 88
   APP panels: 75 fronts in the 33-64 bucket and 13 in the 65-96 bucket. The
-  observed pivot mix is all 1x1 (`2816` pivots), with `0` 2x2 or zero pivots,
-  `2816` maxloc calls, and roughly `2420` symmetric swaps. That makes glider's
-  remaining factor gap a many-small-front APP path rather than the dense
-  case-59 two-by-two-heavy path.
+  observed pivot mix is all diagonal-maxloc 1x1 (`2816` pivots), with `0`
+  off-diagonal 1x1 fallbacks, 2x2 pivots, or zero pivots, `2816` maxloc calls,
+  and roughly `2420` symmetric swaps. That makes glider's remaining factor gap
+  a many-small-front diagonal-1x1 APP path rather than the dense case-59
+  two-by-two-heavy path.
+- APP branch telemetry now separates diagonal 1x1 choices from unstable
+  off-diagonal maxloc entries that fall back to a 1x1 pivot, and keeps a
+  separate 2x2/zero-pivot classification. The branch ledger has deterministic
+  dense APP fixtures for the two 1x1 variants and case-59 coverage for the
+  2x2 path, so future glider-specific APP changes can fail closed on the exact
+  pivot-shape branch they are trying to optimize.

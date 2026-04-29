@@ -2775,7 +2775,7 @@ mod tests {
                 profile.root_delayed_blocks,
             );
             println!(
-                "  rust_spral dense_front_profile tpp={:?} app_pivot_factor={:?} app_maxloc={:?} app_swap={:?} app_pivot_update={:?} app_block_apply={:?} app_block_trsm={:?} app_block_diag={:?} app_failed_scan={:?} app_restore={:?} app_accepted_update={:?} app_column_storage={:?} solve_panel_build={:?}",
+                "  rust_spral dense_front_profile tpp={:?} app_pivot_factor={:?} app_maxloc={:?} app_swap={:?} app_pivot_update={:?} app_block_apply={:?} app_block_trsm={:?} app_block_diag={:?} app_failed_scan={:?} app_backup={:?} app_restore={:?} app_accepted_update={:?} app_accepted_ld={:?} app_accepted_gemm={:?} app_column_storage={:?} solve_panel_build={:?}",
                 profile.tpp_factorization_time,
                 profile.app_pivot_factor_time,
                 profile.app_maxloc_time,
@@ -2785,13 +2785,16 @@ mod tests {
                 profile.app_block_triangular_solve_time,
                 profile.app_block_diagonal_apply_time,
                 profile.app_failed_pivot_scan_time,
+                profile.app_backup_time,
                 profile.app_restore_time,
                 profile.app_accepted_update_time,
+                profile.app_accepted_ld_time,
+                profile.app_accepted_gemm_time,
                 profile.app_column_storage_time,
                 profile.solve_panel_build_time,
             );
             println!(
-                "  rust_spral dense_front_counters app_fronts={} app_panels={} app_maxloc_calls={} app_swaps={} app_1x1={} app_2x2={} app_zero={} app_front_le32={} app_front_33_64={} app_front_65_96={} app_front_97_128={} app_front_129_160={} app_front_161_256={} app_front_257_512={} app_front_gt512={}",
+                "  rust_spral dense_front_counters app_fronts={} app_panels={} app_maxloc_calls={} app_swaps={} app_1x1={} app_2x2={} app_zero={} app_diag_1x1={} app_offdiag_1x1={} app_front_le32={} app_front_33_64={} app_front_65_96={} app_front_97_128={} app_front_129_160={} app_front_161_256={} app_front_257_512={} app_front_gt512={}",
                 profile.app_front_count,
                 profile.app_panel_count,
                 profile.app_maxloc_calls,
@@ -2799,6 +2802,8 @@ mod tests {
                 profile.app_one_by_one_pivots,
                 profile.app_two_by_two_pivots,
                 profile.app_zero_pivots,
+                profile.app_diagonal_one_by_one_pivots,
+                profile.app_offdiag_one_by_one_fallbacks,
                 profile.app_front_size_histogram[0],
                 profile.app_front_size_histogram[1],
                 profile.app_front_size_histogram[2],
@@ -2990,7 +2995,7 @@ mod tests {
             rust_factor_profiles[0].root_delayed_blocks,
         );
         println!(
-            "  rust_spral dense_front_profile tpp={:?} app_pivot_factor={:?} app_maxloc={:?} app_swap={:?} app_pivot_update={:?} app_block_apply={:?} app_block_trsm={:?} app_block_diag={:?} app_failed_scan={:?} app_restore={:?} app_accepted_update={:?} app_column_storage={:?} solve_panel_build={:?}",
+            "  rust_spral dense_front_profile tpp={:?} app_pivot_factor={:?} app_maxloc={:?} app_swap={:?} app_pivot_update={:?} app_block_apply={:?} app_block_trsm={:?} app_block_diag={:?} app_failed_scan={:?} app_backup={:?} app_restore={:?} app_accepted_update={:?} app_accepted_ld={:?} app_accepted_gemm={:?} app_column_storage={:?} solve_panel_build={:?}",
             median_profile_duration(&rust_factor_profiles, |profile| profile
                 .tpp_factorization_time),
             median_profile_duration(&rust_factor_profiles, |profile| profile
@@ -3008,16 +3013,21 @@ mod tests {
                 .app_block_diagonal_apply_time),
             median_profile_duration(&rust_factor_profiles, |profile| profile
                 .app_failed_pivot_scan_time),
+            median_profile_duration(&rust_factor_profiles, |profile| profile.app_backup_time),
             median_profile_duration(&rust_factor_profiles, |profile| profile.app_restore_time),
             median_profile_duration(&rust_factor_profiles, |profile| profile
                 .app_accepted_update_time),
+            median_profile_duration(&rust_factor_profiles, |profile| profile
+                .app_accepted_ld_time),
+            median_profile_duration(&rust_factor_profiles, |profile| profile
+                .app_accepted_gemm_time),
             median_profile_duration(&rust_factor_profiles, |profile| profile
                 .app_column_storage_time),
             median_profile_duration(&rust_factor_profiles, |profile| profile
                 .solve_panel_build_time),
         );
         println!(
-            "  rust_spral dense_front_counters app_fronts={} app_panels={} app_maxloc_calls={} app_swaps={} app_1x1={} app_2x2={} app_zero={} app_front_le32={} app_front_33_64={} app_front_65_96={} app_front_97_128={} app_front_129_160={} app_front_161_256={} app_front_257_512={} app_front_gt512={}",
+            "  rust_spral dense_front_counters app_fronts={} app_panels={} app_maxloc_calls={} app_swaps={} app_1x1={} app_2x2={} app_zero={} app_diag_1x1={} app_offdiag_1x1={} app_front_le32={} app_front_33_64={} app_front_65_96={} app_front_97_128={} app_front_129_160={} app_front_161_256={} app_front_257_512={} app_front_gt512={}",
             median_profile_usize(&rust_factor_profiles, |profile| profile.app_front_count),
             median_profile_usize(&rust_factor_profiles, |profile| profile.app_panel_count),
             median_profile_usize(&rust_factor_profiles, |profile| profile.app_maxloc_calls),
@@ -3027,6 +3037,10 @@ mod tests {
             median_profile_usize(&rust_factor_profiles, |profile| profile
                 .app_two_by_two_pivots),
             median_profile_usize(&rust_factor_profiles, |profile| profile.app_zero_pivots),
+            median_profile_usize(&rust_factor_profiles, |profile| profile
+                .app_diagonal_one_by_one_pivots),
+            median_profile_usize(&rust_factor_profiles, |profile| profile
+                .app_offdiag_one_by_one_fallbacks),
             median_profile_usize(&rust_factor_profiles, |profile| profile
                 .app_front_size_histogram[0]),
             median_profile_usize(&rust_factor_profiles, |profile| profile

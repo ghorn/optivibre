@@ -92,6 +92,8 @@ pub struct FactorProfile {
     pub app_one_by_one_pivots: usize,
     pub app_two_by_two_pivots: usize,
     pub app_zero_pivots: usize,
+    pub app_diagonal_one_by_one_pivots: usize,
+    pub app_offdiag_one_by_one_fallbacks: usize,
     pub app_front_size_histogram: [usize; 8],
     pub app_block_pivot_apply_time: Duration,
     pub app_block_triangular_solve_time: Duration,
@@ -136,6 +138,21 @@ impl FactorProfile {
         {
             hits.push("ssids.factor.app_dense.accepted_update");
         }
+        if self.app_one_by_one_pivots > 0 {
+            hits.push("ssids.factor.app_dense.one_by_one_pivots");
+        }
+        if self.app_two_by_two_pivots > 0 {
+            hits.push("ssids.factor.app_dense.two_by_two_pivots");
+        }
+        if self.app_zero_pivots > 0 {
+            hits.push("ssids.factor.app_dense.zero_pivots");
+        }
+        if self.app_diagonal_one_by_one_pivots > 0 {
+            hits.push("ssids.factor.app_dense.diagonal_one_by_one");
+        }
+        if self.app_offdiag_one_by_one_fallbacks > 0 {
+            hits.push("ssids.factor.app_dense.offdiag_one_by_one_fallback");
+        }
         hits
     }
 
@@ -171,6 +188,8 @@ impl FactorProfile {
         self.app_one_by_one_pivots += other.app_one_by_one_pivots;
         self.app_two_by_two_pivots += other.app_two_by_two_pivots;
         self.app_zero_pivots += other.app_zero_pivots;
+        self.app_diagonal_one_by_one_pivots += other.app_diagonal_one_by_one_pivots;
+        self.app_offdiag_one_by_one_fallbacks += other.app_offdiag_one_by_one_fallbacks;
         for (lhs, rhs) in self
             .app_front_size_histogram
             .iter_mut()
@@ -1391,7 +1410,7 @@ fn factorize_impl(
     )?;
     if let Some(started) = factor_started {
         factor_debug_log(format!(
-            "[ssids_rs::factorize] dim={} supernodes={} scaling={:?} total={:.6}s symbolic_front_tree={:.6}s permuted_pattern={:.6}s permuted_values={:.6}s front_factorization={:.6}s front_assembly={:.6}s dense_front={:.6}s tpp={:.6}s app_pivot={:.6}s app_maxloc={:.6}s app_swap={:.6}s app_pivot_update={:.6}s app_apply={:.6}s app_triangular={:.6}s app_diagonal={:.6}s app_failed_scan={:.6}s app_backup={:.6}s app_restore={:.6}s app_accepted_update={:.6}s app_accepted_ld={:.6}s app_accepted_gemm={:.6}s app_column_storage={:.6}s solve_panel_build={:.6}s root_delayed={:.6}s factor_inverse={:.6}s lower_storage={:.6}s solve_panel_storage={:.6}s diagonal_storage={:.6}s factor_bytes={:.6}s fronts={} local_dense_entries={} app_fronts={} app_panels={} app_maxloc_calls={} app_swaps={} app_1x1={} app_2x2={} app_zero={} app_front_le32={} app_front_33_64={} app_front_65_96={} app_front_97_128={} app_front_129_160={} app_front_161_256={} app_front_257_512={} app_front_gt512={}",
+            "[ssids_rs::factorize] dim={} supernodes={} scaling={:?} total={:.6}s symbolic_front_tree={:.6}s permuted_pattern={:.6}s permuted_values={:.6}s front_factorization={:.6}s front_assembly={:.6}s dense_front={:.6}s tpp={:.6}s app_pivot={:.6}s app_maxloc={:.6}s app_swap={:.6}s app_pivot_update={:.6}s app_apply={:.6}s app_triangular={:.6}s app_diagonal={:.6}s app_failed_scan={:.6}s app_backup={:.6}s app_restore={:.6}s app_accepted_update={:.6}s app_accepted_ld={:.6}s app_accepted_gemm={:.6}s app_column_storage={:.6}s solve_panel_build={:.6}s root_delayed={:.6}s factor_inverse={:.6}s lower_storage={:.6}s solve_panel_storage={:.6}s diagonal_storage={:.6}s factor_bytes={:.6}s fronts={} local_dense_entries={} app_fronts={} app_panels={} app_maxloc_calls={} app_swaps={} app_1x1={} app_2x2={} app_zero={} app_diag_1x1={} app_offdiag_1x1={} app_front_le32={} app_front_33_64={} app_front_65_96={} app_front_97_128={} app_front_129_160={} app_front_161_256={} app_front_257_512={} app_front_gt512={}",
             matrix.dimension(),
             symbolic.supernodes.len(),
             options.scaling,
@@ -1433,6 +1452,8 @@ fn factorize_impl(
             profile_ref.app_one_by_one_pivots,
             profile_ref.app_two_by_two_pivots,
             profile_ref.app_zero_pivots,
+            profile_ref.app_diagonal_one_by_one_pivots,
+            profile_ref.app_offdiag_one_by_one_fallbacks,
             profile_ref.app_front_size_histogram[0],
             profile_ref.app_front_size_histogram[1],
             profile_ref.app_front_size_histogram[2],
@@ -6113,6 +6134,7 @@ fn factorize_dense_front(
                 let block = block?;
                 if profile_enabled {
                     profile.app_one_by_one_pivots += 1;
+                    profile.app_diagonal_one_by_one_pivots += 1;
                 }
                 local_blocks.push(block);
                 block_pivot += 1;
@@ -6177,6 +6199,7 @@ fn factorize_dense_front(
                 let block = block?;
                 if profile_enabled {
                     profile.app_one_by_one_pivots += 1;
+                    profile.app_offdiag_one_by_one_fallbacks += 1;
                 }
                 local_blocks.push(block);
                 block_pivot += 1;
