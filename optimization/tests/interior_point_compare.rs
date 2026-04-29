@@ -2088,6 +2088,30 @@ fn compare_native_and_ipopt_with_watchdog_trigger_profile() {
         &native,
         InteriorPointIterationEvent::WatchdogActivated,
     );
+    let first_watchdog_armed_iter = native
+        .snapshots
+        .iter()
+        .find(|snapshot| {
+            snapshot
+                .events
+                .contains(&InteriorPointIterationEvent::WatchdogArmed)
+        })
+        .map(|snapshot| snapshot.iteration)
+        .expect("hanging_chain_watchdog should arm NLIP watchdog");
+    let first_watchdog_activated_iter = native
+        .snapshots
+        .iter()
+        .find(|snapshot| {
+            snapshot
+                .events
+                .contains(&InteriorPointIterationEvent::WatchdogActivated)
+        })
+        .map(|snapshot| snapshot.iteration)
+        .expect("hanging_chain_watchdog should activate NLIP watchdog");
+    assert_eq!(
+        first_watchdog_armed_iter, first_watchdog_activated_iter,
+        "NLIP watchdog should arm in the same line search that activates it, mirroring BacktrackingLineSearch::StartWatchDog"
+    );
     assert_ipopt_info_string_seen("hanging_chain_watchdog", &ipopt, 'W');
     assert_native_matches_ipopt(
         "hanging_chain_watchdog",

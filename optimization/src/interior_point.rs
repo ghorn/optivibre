@@ -11918,9 +11918,9 @@ where
             alpha_pr_limiters,
             alpha_du_limiters,
         ));
-        let watchdog_active =
+        let mut watchdog_active =
             watchdog_state.reference.is_some() && watchdog_state.remaining_iters > 0;
-        let watchdog_reference = watchdog_state.reference.clone();
+        let mut watchdog_reference = watchdog_state.reference.clone();
         let dual_alpha_limit = alpha_du.clamp(0.0, 1.0);
         let mut alpha = alpha_pr.clamp(0.0, 1.0);
         let initial_alpha_y = alpha_for_y(alpha, dual_alpha_limit, &direction, options);
@@ -12021,6 +12021,30 @@ where
             && is_tiny_ip_step(&x, &slack_barrier, &direction, primal_inf, options);
         let tiny_step_barrier_update =
             tiny_step_unchecked_accept && watchdog_state.tiny_step_last_iteration;
+        if !watchdog_active
+            && !tiny_step_unchecked_accept
+            && options.watchdog_trial_iter_max > 0
+            && options.watchdog_shortened_iter_trigger > 0
+            && watchdog_state.shortened_step_streak >= options.watchdog_shortened_iter_trigger
+        {
+            // IPOPT BacktrackingLineSearch::StartWatchDog runs after the new
+            // direction exists, so FilterLSAcceptor's watchdog reference uses
+            // the current grad-barrier dot delta, not the derivative from the
+            // previously accepted shortened step.
+            let reference = WatchdogReferencePoint {
+                barrier_objective: current_barrier_objective,
+                filter_theta: current_theta,
+                barrier_directional_derivative,
+            };
+            watchdog_state.reference = Some(reference.clone());
+            watchdog_state.remaining_iters = options.watchdog_trial_iter_max;
+            watchdog_reference = Some(reference);
+            watchdog_active = true;
+            push_unique_nlip_event(
+                &mut iteration_events,
+                InteriorPointIterationEvent::WatchdogArmed,
+            );
+        }
         // IPOPT `BacktrackingLineSearch::DoBacktrackingLineSearch` uses
         // `alpha_primal > alpha_min || n_steps == 0`, so the initial trial is
         // evaluated even when the maximum feasible step is already tiny.
@@ -13710,16 +13734,6 @@ where
             accepted_trial.accepted_alpha_du,
             accepted_trial.line_search_backtrack_count,
         );
-        let next_shortened_step_streak = if shortened_step {
-            watchdog_state.shortened_step_streak + 1
-        } else {
-            0
-        };
-        let watchdog_will_arm = !watchdog_active
-            && !accepted_trial.watchdog_accepted
-            && options.watchdog_trial_iter_max > 0
-            && options.watchdog_shortened_iter_trigger > 0
-            && next_shortened_step_streak >= options.watchdog_shortened_iter_trigger;
 
         let accepted_rejected_trials = rejected_trials.clone();
         let last_rejection_due_to_filter = accepted_rejected_trials.last().is_some_and(|trial| {
@@ -13779,9 +13793,6 @@ where
                 &mut events,
                 InteriorPointIterationEvent::BoundMultiplierSafeguardApplied,
             );
-        }
-        if watchdog_will_arm {
-            push_unique_nlip_event(&mut events, InteriorPointIterationEvent::WatchdogArmed);
         }
         if tiny_step {
             push_unique_nlip_event(&mut events, InteriorPointIterationEvent::TinyStep);
@@ -13971,16 +13982,6 @@ where
             // after any successful watchdog trial and appends "W".
             watchdog_state.reference = None;
             watchdog_state.remaining_iters = 0;
-        } else if options.watchdog_trial_iter_max > 0
-            && options.watchdog_shortened_iter_trigger > 0
-            && watchdog_state.shortened_step_streak >= options.watchdog_shortened_iter_trigger
-        {
-            watchdog_state.reference = Some(WatchdogReferencePoint {
-                barrier_objective: accepted_trial.barrier_objective,
-                filter_theta: accepted_trial.filter_theta,
-                barrier_directional_derivative,
-            });
-            watchdog_state.remaining_iters = options.watchdog_trial_iter_max;
         } else if !shortened_step && !tiny_step {
             watchdog_state.reference = None;
             watchdog_state.remaining_iters = 0;

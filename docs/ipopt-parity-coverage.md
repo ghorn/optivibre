@@ -45,7 +45,7 @@ Reports are written to `target/reports/ipopt-parity-coverage/`:
 Latest generated profile snapshot, from the source-built nonlinear parity run:
 
 - IPOPT Algorithm C++: `9784 / 18642` lines and `1211 / 3556` branches hit.
-- Rust NLIP core: `5898 / 10503` lines hit, with `0` unhit branch-like lines
+- Rust NLIP core: `5900 / 10506` lines hit, with `0` unhit branch-like lines
   still classified as `needs audit`.
 - `IpBacktrackingLineSearch.cpp`: `610 / 993` lines and `142 / 252` branches
   hit, with active-watch uncovered branch lines reduced to `45 / 74`.
@@ -84,9 +84,12 @@ The latest focused run added source-option witnesses for:
   profile with `watchdog_shortened_iter_trigger=3`, retained only after NLIP
   and IPOPT kept matching accepted-step counts and trace parity. The same
   profile also covers IPOPT's successful-watchdog `Append_info_string("W")`
-  path; NLIP now marks filter/SOC trial acceptance as a watchdog success when
-  the outer line-search state is already in watchdog mode and clears watchdog
-  state immediately, matching `BacktrackingLineSearch::FindAcceptableTrialPoint`.
+  path; NLIP now arms the watchdog after the current direction is computed,
+  so the stored filter reference uses the same grad-barrier dot direction as
+  `BacktrackingLineSearch::StartWatchDog`. It also marks filter/SOC trial
+  acceptance as a watchdog success when the outer line-search state is already
+  in watchdog mode and clears watchdog state immediately, matching
+  `BacktrackingLineSearch::FindAcceptableTrialPoint`.
   (`trigger=1` and `trigger=2` were rejected as witnesses because they exposed
   accepted-step count drift despite close final values)
 - `IpBacktrackingLineSearch.cpp::tiny_step_tol=0`
@@ -122,7 +125,7 @@ source option.
 | Alpha-for-y and dual step | `IpBacktrackingLineSearch.cpp::PerformDualStep` | `alpha_y`, `alpha_du`, multiplier step application | Mirrors IPOPT for the default primal strategy, implemented option-profile strategies, and `alpha_for_y_tol` threshold profiles covered by focused tests |
 | SOC | `IpFilterLSAcceptor.cpp::TrySecondOrderCorrection` | SOC trial loop and corrected accepted trial | Mirrors active IPOPT branch including dense `AddOneVector` order; fallback corrector variants are unreachable |
 | Primal-dual corrector | `IpFilterLSAcceptor.cpp::TryCorrector` | none under parity options | Unreachable under the current parity option profile, which keeps `corrector_type=none`; do not enable IPOPT `corrector_type` raw options for parity acceptance until the full branch is ported source-faithfully |
-| Watchdog | `IpBacktrackingLineSearch.cpp` watchdog gates | watchdog reference, shortened-step streak, successful watchdog exit, and watchdog trial diagnostics | Mirrors IPOPT state machine for arming and successful `W` exit under the trace-clean `watchdog_shortened_iter_trigger=3` hanging-chain profile; the ignored watchdog sweep prints IPOPT lowercase `w`, `Tmax`, and step-tag summaries so non-success watchdog trial / `StopWatchDog` profiles stay visible before accepted-state behavior changes |
+| Watchdog | `IpBacktrackingLineSearch.cpp` watchdog gates | watchdog reference, shortened-step streak, successful watchdog exit, and watchdog trial diagnostics | Mirrors IPOPT state machine for arming after current-direction construction and successful `W` exit under the trace-clean `watchdog_shortened_iter_trigger=3` hanging-chain profile; the ignored watchdog sweep prints IPOPT lowercase `w`, `Tmax`, and step-tag summaries so non-success watchdog trial / `StopWatchDog` profiles stay visible before accepted-state behavior changes |
 | Tiny step | `IpBacktrackingLineSearch.cpp::DetectTinyStep` | tiny-step acceptance and barrier-update tag | Mirrors IPOPT; focused tests exercise unchecked tiny-step acceptance, while the `tiny_step_tol=0` witness covers the disabled branch |
 | Acceptable termination | `IpOptErrorConvCheck.cpp::CurrentIsAcceptable`, `IpIpoptAlg.cpp::CONVERGED_TO_ACCEPTABLE_POINT` | `InteriorPointTermination::Acceptable` and warning status | Mirrors IPOPT for `acceptable_iter=1` under intentionally tighter strict tolerances |
 | Max-iteration exit | `IpIpoptAlg.cpp::ConvergenceCheck::MAXITER_EXCEEDED` | `InteriorPointSolveError::MaxIterations` and failure context | Mirrors IPOPT status for deterministic `max_iter=0` and accepted-step `max_iter=1`; focused tests require both solvers to retain diagnostics and partial state |

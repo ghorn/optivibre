@@ -419,7 +419,9 @@ def classify_rust_line(path, line_no, text):
             return "initialization and max-iteration witness branch"
         if 11640 <= line_no <= 11720:
             return "linear solver workspace selection"
-        if 12800 <= line_no <= 13250:
+        if 11980 <= line_no <= 12045:
+            return "watchdog globalization start gate"
+        if 12800 <= line_no <= 13430:
             return "SOC/watchdog globalization branch"
         if 13835 <= line_no <= 13985:
             return "accepted-step and watchdog state bookkeeping"
