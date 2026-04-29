@@ -34,6 +34,24 @@ native METIS; those libraries are oracles for parity tests only.
 | `assemble.hxx::add_a_block` scaled values | `apply_permuted_symmetric_scaling` | `permuted_symmetric_scaling_uses_spral_multiplication_order`, dense native trace | Integrated |
 | `fkeep.F90::inner_solve_cpu` RHS/solution scaling | `NumericFactor::solve_in_place_impl` | same numeric saved-scaling test | Integrated |
 
+Branch telemetry status:
+
+- `SpralMatchingTrace` now carries deterministic `branch_hits` for the
+  matching/scaling ladder. `matching_scaling_parity.rs` keeps the scoped branch
+  ledger fail-closed: every emitted branch must be classified as `hit`,
+  `guarded`, `unreachable-for-SPRAL`, or `out-of-scope`, and no `needs-port`
+  classification is allowed.
+- Current emitted matching/scaling branches distinguish empty vs non-empty
+  expansion, explicit-zero removal vs no zero removal, full-rank vs singular
+  Hungarian matching, singleton/unmatched/two-cycle/long-cycle `mo_split`
+  behavior, compressed graph construction, METIS `NodeND` entry, and saved
+  scaling exponentiation.
+- The same ledger records the existing native-oracle METIS, APP dense factor,
+  and solve-kernel branch fixtures. Those branches are currently proven by
+  phase/output assertions rather than native branch counters; adding native
+  internal branch counters remains optional unless a fixture begins to
+  localize poorly.
+
 Open parity work:
 
 - METIS 5.2.1 `METIS_NodeND` internals are now source-ported for the SPRAL

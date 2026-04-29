@@ -31,6 +31,7 @@ pub struct SpralMatchingTrace {
     pub compressed_position_component: Vec<usize>,
     pub final_order: Vec<usize>,
     pub scaling: Vec<f64>,
+    pub branch_hits: Vec<&'static str>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -86,6 +87,7 @@ pub fn spral_matching_trace(
     let (scale_logs, matching) = mo_match(&compact_abs)?;
     let split = mo_split_trace(&compact_abs, &matching)?;
     let scaling = scale_logs.iter().copied().map(f64::exp).collect();
+    let branch_hits = spral_matching_branch_hits(&expanded, &compact_abs, &matching, &split);
 
     Ok(SpralMatchingTrace {
         expanded_full: SpralCscTrace::from_full(&expanded),
@@ -98,6 +100,7 @@ pub fn spral_matching_trace(
         compressed_position_component: split.compressed_position_component,
         final_order: split.order,
         scaling,
+        branch_hits,
     })
 }
 
@@ -900,6 +903,88 @@ fn mo_split_trace(
     })
 }
 
+fn spral_matching_branch_hits(
+    expanded: &FullCscMatrix,
+    compact_abs: &FullCscMatrix,
+    matching: &[Option<usize>],
+    split: &MoSplitTrace,
+) -> Vec<&'static str> {
+    let mut hits = Vec::new();
+    if expanded.dimension == 0 {
+        hits.push("match_order.expand.empty");
+    } else {
+        hits.push("match_order.expand.nonempty");
+    }
+    if compact_abs.values.len() == expanded.values.len() {
+        hits.push("match_order.zero_removal.no_explicit_zeroes");
+    } else {
+        hits.push("match_order.zero_removal.explicit_zeroes_removed");
+    }
+    if matching.iter().all(Option::is_some) {
+        hits.push("scaling.mo_match.full_rank");
+    } else {
+        hits.push("scaling.mo_match.structurally_singular");
+    }
+    if matching
+        .iter()
+        .enumerate()
+        .any(|(row, matched)| *matched == Some(row))
+    {
+        hits.push("match_order.mo_split.singleton");
+    }
+    if matching.iter().any(Option::is_none) {
+        hits.push("match_order.mo_split.unmatched");
+    }
+    if matching.iter().enumerate().any(|(row, matched)| {
+        let Some(col) = matched else {
+            return false;
+        };
+        *col != row && matching.get(*col) == Some(&Some(row))
+    }) {
+        hits.push("match_order.mo_split.two_cycle");
+    }
+    if matching_has_long_cycle(matching) {
+        hits.push("match_order.mo_split.long_cycle_split");
+    }
+    if split.compressed_lower.dimension == 0 {
+        hits.push("match_order.compressed_graph.empty");
+    } else {
+        hits.push("match_order.compressed_graph.nonempty");
+        hits.push("metis.node_nd.called");
+    }
+    hits.push("ssids.analyse.saved_scaling.exp");
+    hits
+}
+
+fn matching_has_long_cycle(matching: &[Option<usize>]) -> bool {
+    let n = matching.len();
+    let mut globally_seen = vec![false; n];
+    for start in 0..n {
+        if globally_seen[start] {
+            continue;
+        }
+        let mut path = Vec::new();
+        let mut current = start;
+        loop {
+            if globally_seen[current] {
+                break;
+            }
+            if let Some(position) = path.iter().position(|&entry| entry == current) {
+                return path.len() - position > 2;
+            }
+            path.push(current);
+            match matching[current] {
+                Some(next) if next < n => current = next,
+                _ => break,
+            }
+        }
+        for vertex in path {
+            globally_seen[vertex] = true;
+        }
+    }
+    false
+}
+
 fn compressed_lower_pattern(
     matrix: &FullCscMatrix,
     cperm: &[isize],
@@ -1062,6 +1147,20 @@ mod tests {
         assert!(order[0].abs_diff(order[1]) == 1, "{order:?}");
         assert!(order[2] < 4);
         assert!(order[3] < 4);
+    }
+
+    #[test]
+    fn spral_matching_branch_hits_classify_long_cycle_split() {
+        let full = FullCscMatrix {
+            dimension: 3,
+            col_ptrs: vec![0, 3, 6, 9],
+            row_indices: vec![0, 1, 2, 0, 1, 2, 0, 1, 2],
+            values: vec![1.0; 9],
+        };
+        let matching = [Some(1), Some(2), Some(0)];
+        let split = mo_split_trace(&full, &matching).unwrap();
+        let hits = spral_matching_branch_hits(&full, &full, &matching, &split);
+        assert!(hits.contains(&"match_order.mo_split.long_cycle_split"));
     }
 
     #[test]

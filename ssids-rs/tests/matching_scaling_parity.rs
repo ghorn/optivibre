@@ -34,6 +34,174 @@ use ssids_rs::{
     analyse, analyse_with_user_ordering, factorize, spral_matching_trace,
 };
 
+const LINEAR_SSIDS_BRANCH_LEDGER: &[(&str, &str, &str)] = &[
+    (
+        "match_order.expand.empty",
+        "guarded",
+        "zero-dimension matching input",
+    ),
+    (
+        "match_order.expand.nonempty",
+        "hit",
+        "dense and singular matching fixtures",
+    ),
+    (
+        "match_order.zero_removal.no_explicit_zeroes",
+        "hit",
+        "singular matching fixtures",
+    ),
+    (
+        "match_order.zero_removal.explicit_zeroes_removed",
+        "hit",
+        "dense case 58 native phase trace",
+    ),
+    (
+        "scaling.mo_match.full_rank",
+        "hit",
+        "dense case 58 native phase trace",
+    ),
+    (
+        "scaling.mo_match.structurally_singular",
+        "hit",
+        "isolated/path singular native fixtures",
+    ),
+    (
+        "match_order.mo_split.singleton",
+        "hit",
+        "isolated singular native fixture",
+    ),
+    (
+        "match_order.mo_split.unmatched",
+        "hit",
+        "singular native fixtures",
+    ),
+    (
+        "match_order.mo_split.two_cycle",
+        "hit",
+        "path singular native fixture",
+    ),
+    (
+        "match_order.mo_split.long_cycle_split",
+        "hit",
+        "unit long-cycle split fixture",
+    ),
+    (
+        "match_order.compressed_graph.empty",
+        "guarded",
+        "zero-component matching input",
+    ),
+    (
+        "match_order.compressed_graph.nonempty",
+        "hit",
+        "dense and singular matching fixtures",
+    ),
+    (
+        "metis.node_nd.called",
+        "hit",
+        "compressed graph fixtures call METIS NodeND",
+    ),
+    (
+        "metis.node_nd.compress.default",
+        "hit",
+        "complete and dense compressed fixtures",
+    ),
+    (
+        "metis.node_nd.compress.forced_disabled",
+        "hit",
+        "native non-default option fixture",
+    ),
+    (
+        "metis.node_nd.ccorder.enabled",
+        "hit",
+        "native non-default option fixture",
+    ),
+    (
+        "metis.node_nd.pfactor.no_prune",
+        "hit",
+        "native prune fixture",
+    ),
+    (
+        "metis.node_nd.pfactor.partial_prune",
+        "hit",
+        "native prune fixture",
+    ),
+    (
+        "metis.node_nd.pfactor.all_pruned_ignored",
+        "hit",
+        "native prune fixture",
+    ),
+    (
+        "metis.node_nd.mmd_leaf",
+        "hit",
+        "native MMD and recursive NodeND fixtures",
+    ),
+    (
+        "metis.node_nd.l1_nested_dissection",
+        "hit",
+        "native path/star/path_1000 fixtures",
+    ),
+    (
+        "metis.node_nd.l2_nested_dissection",
+        "hit",
+        "native path_5000 fixture",
+    ),
+    (
+        "metis.balance.general_2way",
+        "guarded",
+        "Rust returns a fail-closed error if reached",
+    ),
+    (
+        "metis.balance.boundary_2way",
+        "guarded",
+        "Rust returns a fail-closed error if reached",
+    ),
+    (
+        "metis.general.vertex_weights",
+        "out-of-scope",
+        "not used by SPRAL NodeND wrapper",
+    ),
+    (
+        "metis.general.numbering_one",
+        "out-of-scope",
+        "SPRAL wrapper uses zero-based numbering",
+    ),
+    (
+        "ssids.analyse.saved_scaling.exp",
+        "hit",
+        "SpralMatching trace and saved scaling solve tests",
+    ),
+    (
+        "ssids.factor.saved_scaling.permuted_csc",
+        "hit",
+        "saved scaling numeric parity tests",
+    ),
+    (
+        "ssids.solve.saved_scaling.rhs_solution",
+        "hit",
+        "saved scaling solve tests",
+    ),
+    (
+        "ssids.factor.app_dense.block_ldlt",
+        "hit",
+        "native APP prefix trace tests",
+    ),
+    (
+        "ssids.factor.app_dense.accepted_update",
+        "hit",
+        "native accepted-update tile tests",
+    ),
+    (
+        "ssids.factor.app_dense.maxloc",
+        "hit",
+        "native APP maxloc tests",
+    ),
+    (
+        "ssids.solve.app_dense.forward_diag_backward",
+        "hit",
+        "native APP solve kernel tests",
+    ),
+];
+
 fn dense_mul(matrix: &[Vec<f64>], x: &[f64]) -> Vec<f64> {
     matrix
         .iter()
@@ -145,6 +313,85 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .ok()
         .and_then(|value| parse_u64(&value))
         .unwrap_or(default)
+}
+
+fn branch_ledger_status(branch_id: &str) -> Option<&'static str> {
+    LINEAR_SSIDS_BRANCH_LEDGER
+        .iter()
+        .find_map(|(id, status, _)| (*id == branch_id).then_some(*status))
+}
+
+fn assert_branch_hits_are_classified(name: &str, hits: &[&'static str]) {
+    for branch_id in hits {
+        assert!(
+            branch_ledger_status(branch_id).is_some(),
+            "fixture {name} hit unclassified linear SSIDS branch {branch_id}"
+        );
+    }
+}
+
+#[test]
+fn linear_ssids_branch_ledger_has_no_unclassified_scoped_entries() {
+    let allowed = ["hit", "guarded", "unreachable-for-SPRAL", "out-of-scope"];
+    let mut seen = Vec::new();
+    for (branch_id, status, _) in LINEAR_SSIDS_BRANCH_LEDGER {
+        assert!(
+            allowed.contains(status),
+            "linear SSIDS branch {branch_id} has invalid status {status}"
+        );
+        assert_ne!(
+            *status, "needs-port",
+            "linear SSIDS branch {branch_id} still needs porting"
+        );
+        assert!(
+            !seen.contains(branch_id),
+            "linear SSIDS branch ledger contains duplicate entry {branch_id}"
+        );
+        seen.push(*branch_id);
+    }
+}
+
+#[test]
+fn rust_matching_branch_telemetry_covers_dense_and_singular_fixtures() {
+    let (dimension, dense_matrix, _) = dense_boundary_case(0x7061_7269_7479, 58);
+    let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense_matrix);
+    let dense_matrix = SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
+        .expect("valid dense branch fixture");
+    let dense = spral_matching_trace(dense_matrix).expect("dense matching trace");
+    assert_branch_hits_are_classified("dense_case_58", &dense.branch_hits);
+    assert!(dense.branch_hits.contains(&"scaling.mo_match.full_rank"));
+    assert!(
+        dense
+            .branch_hits
+            .contains(&"match_order.zero_removal.explicit_zeroes_removed")
+    );
+    assert!(dense.branch_hits.contains(&"metis.node_nd.called"));
+
+    let isolated = SymmetricCscMatrix::new(3, &[0, 1, 2, 2], &[0, 1], Some(&[4.0, 9.0]))
+        .expect("valid isolated singular branch fixture");
+    let isolated = spral_matching_trace(isolated).expect("isolated singular matching trace");
+    assert_branch_hits_are_classified("isolated_missing_column", &isolated.branch_hits);
+    assert!(
+        isolated
+            .branch_hits
+            .contains(&"scaling.mo_match.structurally_singular")
+    );
+    assert!(
+        isolated
+            .branch_hits
+            .contains(&"match_order.mo_split.unmatched")
+    );
+    assert!(
+        isolated
+            .branch_hits
+            .contains(&"match_order.mo_split.singleton")
+    );
+
+    let path = SymmetricCscMatrix::new(3, &[0, 1, 2, 2], &[1, 2], Some(&[2.0, 3.0]))
+        .expect("valid path singular branch fixture");
+    let path = spral_matching_trace(path).expect("path singular matching trace");
+    assert_branch_hits_are_classified("path3_no_diagonal", &path.branch_hits);
+    assert!(path.branch_hits.contains(&"match_order.mo_split.two_cycle"));
 }
 
 fn parse_u64(value: &str) -> Option<u64> {
@@ -5252,6 +5499,7 @@ fn print_rust_matching_trace(trace: &SpralMatchingTrace) {
         scaling_max,
         &trace.scaling[..trace.scaling.len().min(8)]
     );
+    eprintln!("rust_phase branch_hits={:?}", trace.branch_hits);
 }
 
 fn assert_native_singular_match_order_fixture(

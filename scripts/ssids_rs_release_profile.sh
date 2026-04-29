@@ -138,19 +138,86 @@ with open(path, "r", encoding="utf-8", errors="replace") as handle:
 
 
 def fmt(value):
+    sign = "-" if value < 0 else ""
+    value = abs(value)
     if value < 1e-6:
-        return f"{value * 1e9:.1f}ns"
+        return f"{sign}{value * 1e9:.1f}ns"
     if value < 1e-3:
-        return f"{value * 1e6:.3f}us"
+        return f"{sign}{value * 1e6:.3f}us"
     if value < 1:
-        return f"{value * 1e3:.3f}ms"
-    return f"{value:.3f}s"
+        return f"{sign}{value * 1e3:.3f}ms"
+    return f"{sign}{value:.3f}s"
 
 
-print("\n== median profile summary ==")
-for (case, label, key), values in sorted(series.items()):
+medians = {}
+counts = {}
+for key, values in series.items():
     clean = [value for value in values if value is not None]
     if not clean:
         continue
-    print(f"{case} | {label} | {key} | n={len(clean)} median={fmt(statistics.median(clean))}")
+    medians[key] = statistics.median(clean)
+    counts[key] = len(clean)
+
+
+def side_by_side(case, name, native_label, rust_label, metrics):
+    printed = False
+    for metric in metrics:
+        native_key = (case, native_label, metric)
+        rust_key = (case, rust_label, metric)
+        if native_key not in medians or rust_key not in medians:
+            continue
+        if not printed:
+            printed = True
+        native = medians[native_key]
+        rust = medians[rust_key]
+        ratio = rust / native if native else float("inf")
+        delta = rust - native
+        print(
+            f"{case} | {name} | {metric} | "
+            f"native={fmt(native)} n={counts[native_key]} | "
+            f"rust={fmt(rust)} n={counts[rust_key]} | "
+            f"rust/native={ratio:.3f}x | delta={fmt(delta)}"
+        )
+    return printed
+
+
+print("\n== native/rust side-by-side medians ==")
+printed_any = False
+for case in sorted({case for case, _, _ in medians}):
+    printed_any |= side_by_side(
+        case,
+        "matching_scaling",
+        "native_matching_scaling",
+        "rust_spral_matching_saved_scaling",
+        ["analyse", "factor", "solve"],
+    )
+    printed_any |= side_by_side(
+        case,
+        "captured_order_no_scaling",
+        "native_captured_order_no_scaling",
+        "rust_captured_order_no_scaling",
+        ["analyse", "factor", "solve"],
+    )
+    printed_any |= side_by_side(
+        case,
+        "glider",
+        "glider_native_spral",
+        "glider_rust_spral",
+        ["factor", "solve"],
+    )
+if not printed_any:
+    print("(no native/rust pairs found)")
+
+print("\n== rust-only attribution bucket medians ==")
+for (case, label, key), value in sorted(medians.items()):
+    if not (
+        label.startswith("rust_factor_profile[")
+        or label == "glider_rust_dense_front_profile"
+    ):
+        continue
+    print(f"{case} | {label} | {key} | n={counts[(case, label, key)]} median={fmt(value)}")
+
+print("\n== all raw medians ==")
+for (case, label, key), value in sorted(medians.items()):
+    print(f"{case} | {label} | {key} | n={counts[(case, label, key)]} median={fmt(value)}")
 PY
