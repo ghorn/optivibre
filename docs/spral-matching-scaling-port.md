@@ -289,3 +289,10 @@ Release performance notes on dense case 58:
   case 59 native/Rust saved-scaling factor medians at about `257us`/`278us`,
   with Rust `app_accepted_gemm` around `40us` and `app_accepted_update` around
   `45us`; case 58 was effectively tied at about `226us`/`228us`.
+- Dense solve-panel construction now initializes each panel column once instead
+  of zero-filling the full panel and then overwriting the lower part. The
+  existing bit-for-bit equivalence test pins it against the generic
+  factor-column path. A glider exact augmented replay repeat measured Rust
+  factor around `3.46ms` vs native `1.06ms`, with Rust `solve_panel_build`
+  around `292us`; the remaining glider factor gap is still mostly dense-front
+  work across many small fronts rather than this panel copy.

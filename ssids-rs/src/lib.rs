@@ -5742,15 +5742,38 @@ fn build_dense_front_solve_panel_record(
     row_ids.extend_from_slice(factor_order);
     row_ids.extend_from_slice(trailing_rows);
 
-    let mut values = vec![0.0; size * eliminated_len];
+    let mut values = Vec::<f64>::with_capacity(size * eliminated_len);
+    let values_ptr = values.as_mut_ptr();
     for local_col in 0..eliminated_len {
         let column_start = local_col * size;
-        values[column_start + local_col] = 1.0;
+        for row in 0..local_col {
+            // SAFETY: `values` has capacity for every panel entry and each
+            // column range is written exactly once before length is exposed.
+            unsafe {
+                values_ptr.add(column_start + row).write(0.0);
+            }
+        }
+        // SAFETY: same one-pass initialization invariant as above.
+        unsafe {
+            values_ptr.add(column_start + local_col).write(1.0);
+        }
         let below_diagonal_start = local_col + 1;
         if below_diagonal_start < size {
-            values[column_start + below_diagonal_start..column_start + size]
-                .copy_from_slice(&dense[column_start + below_diagonal_start..column_start + size]);
+            let entry_count = size - below_diagonal_start;
+            // SAFETY: source and destination are in-bounds for the dense
+            // column and the uninitialized panel column tail respectively.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    dense.as_ptr().add(column_start + below_diagonal_start),
+                    values_ptr.add(column_start + below_diagonal_start),
+                    entry_count,
+                );
+            }
         }
+    }
+    // SAFETY: every column wrote `size` entries above.
+    unsafe {
+        values.set_len(size * eliminated_len);
     }
 
     Ok(Some(FactorSolvePanelRecord {
