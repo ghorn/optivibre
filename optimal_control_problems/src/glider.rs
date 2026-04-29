@@ -1309,8 +1309,8 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use serde::de::DeserializeOwned;
     use ssids_rs::{
-        FactorProfile, NativeSpral, NumericFactorOptions, OrderingStrategy, SolveProfile,
-        SsidsOptions, SymmetricCscMatrix, analyse as spral_analyse,
+        FactorProfile, NativeSpral, NativeSpralSession, NumericFactorOptions, OrderingStrategy,
+        SolveProfile, SsidsOptions, SymbolicFactor, SymmetricCscMatrix, analyse as spral_analyse,
         approximate_minimum_degree_permutation as spral_amd_permutation,
         factorize as spral_factorize, factorize_with_profile as spral_factorize_with_profile,
     };
@@ -1737,13 +1737,6 @@ mod tests {
             None,
         )
         .expect("dumped augmented CSC should validate");
-        let numeric = SymmetricCscMatrix::new(
-            dump.matrix_dimension,
-            &dump.col_ptrs,
-            &dump.row_indices,
-            Some(&dump.values),
-        )
-        .expect("dumped augmented CSC values should validate");
         let (symbolic, _) = spral_analyse(
             structure,
             &SsidsOptions {
@@ -1751,9 +1744,23 @@ mod tests {
             },
         )
         .expect("rust spral analyse should succeed on dumped KKT");
+        replay_rust_augmented_spral_with_symbolic(dump, &symbolic)
+    }
+
+    fn replay_rust_augmented_spral_with_symbolic(
+        dump: &GliderLinearDebugDump,
+        symbolic: &SymbolicFactor,
+    ) -> ExactAugmentedReplay {
         let factor_started = Instant::now();
+        let numeric = SymmetricCscMatrix::new(
+            dump.matrix_dimension,
+            &dump.col_ptrs,
+            &dump.row_indices,
+            Some(&dump.values),
+        )
+        .expect("dumped augmented CSC values should validate");
         let (mut factor, _, factor_profile) =
-            spral_factorize_with_profile(numeric, &symbolic, &NumericFactorOptions::default())
+            spral_factorize_with_profile(numeric, symbolic, &NumericFactorOptions::default())
                 .expect("rust spral factorization should succeed on dumped KKT");
         let factor_time = factor_started.elapsed();
         let solve_started = Instant::now();
@@ -1796,13 +1803,6 @@ mod tests {
             None,
         )
         .expect("dumped augmented CSC should validate");
-        let numeric = SymmetricCscMatrix::new(
-            dump.matrix_dimension,
-            &dump.col_ptrs,
-            &dump.row_indices,
-            Some(&dump.values),
-        )
-        .expect("dumped augmented CSC values should validate");
         let native = NativeSpral::load().expect("native SPRAL should be available locally");
         let rust_initial_order =
             spral_amd_permutation(structure).expect("rust AMD order should succeed on dumped KKT");
@@ -1813,7 +1813,21 @@ mod tests {
                 rust_initial_order.inverse(),
             )
             .expect("native spral analyse should succeed on dumped KKT");
+        replay_native_augmented_spral_with_session(dump, &mut session)
+    }
+
+    fn replay_native_augmented_spral_with_session(
+        dump: &GliderLinearDebugDump,
+        session: &mut NativeSpralSession,
+    ) -> ExactAugmentedReplay {
         let factor_started = Instant::now();
+        let numeric = SymmetricCscMatrix::new(
+            dump.matrix_dimension,
+            &dump.col_ptrs,
+            &dump.row_indices,
+            Some(&dump.values),
+        )
+        .expect("dumped augmented CSC values should validate");
         let factor_info = session
             .factorize(numeric)
             .expect("native spral factorization should succeed on dumped KKT");
@@ -1847,6 +1861,75 @@ mod tests {
             factor_profile: None,
             solve_profile: None,
         }
+    }
+
+    fn load_current_glider_iteration0_augmented_dump() -> GliderLinearDebugDump {
+        let params = Params {
+            launch_speed_mps: 30.0,
+            initial_alpha_deg: 6.0,
+            max_alpha_rate_deg_s: 12.0,
+            solver_method: SolverMethod::Nlip,
+            ..Params::default()
+        };
+        let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
+            .expect("glider direct collocation should compile");
+        let compiled = compiled.compiled.borrow();
+        let runtime = dc_runtime(&params);
+        let dump_dir = TempDir::new().expect("temp dump dir should create");
+        let mut options = crate::common::nlip_options(&params.solver);
+        options.linear_solver = optimization::InteriorPointLinearSolver::SsidsRs;
+        options.max_iters = 1;
+        options.acceptable_iter = 0;
+        options.verbose = false;
+        options.linear_debug = Some(optimization::InteriorPointLinearDebugOptions {
+            compare_solvers: vec![optimization::InteriorPointLinearSolver::SpralSrc],
+            schedule: optimization::InteriorPointLinearDebugSchedule::FirstIteration,
+            dump_dir: Some(dump_dir.path().to_path_buf()),
+        });
+
+        let _ = compiled.solve_interior_point_with_callback(&runtime, &options, |_snapshot| {});
+        load_glider_linear_debug_dump(&dump_dir.path().join("nlip_kkt_iter_0000.txt"))
+    }
+
+    fn glider_iteration0_rust_symbolic(dump: &GliderLinearDebugDump) -> SymbolicFactor {
+        let structure = SymmetricCscMatrix::new(
+            dump.matrix_dimension,
+            &dump.col_ptrs,
+            &dump.row_indices,
+            None,
+        )
+        .expect("dumped augmented CSC should validate");
+        spral_analyse(
+            structure,
+            &SsidsOptions {
+                ordering: OrderingStrategy::ApproximateMinimumDegree,
+            },
+        )
+        .expect("rust spral analyse should succeed on dumped KKT")
+        .0
+    }
+
+    fn median_duration(values: &[Duration]) -> Duration {
+        assert!(!values.is_empty());
+        let mut values = values.to_vec();
+        values.sort_unstable();
+        values[values.len() / 2]
+    }
+
+    fn median_profile_duration(
+        profiles: &[FactorProfile],
+        select: impl Fn(&FactorProfile) -> Duration,
+    ) -> Duration {
+        let values = profiles.iter().map(select).collect::<Vec<_>>();
+        median_duration(&values)
+    }
+
+    fn median_solve_profile_duration(
+        profiles: &[SolveProfile],
+        select: impl Fn(&SolveProfile) -> Duration,
+    ) -> Duration {
+        let values = profiles.iter().map(select).collect::<Vec<_>>();
+        median_duration(&values)
     }
 
     fn native_spral_debug_result(
@@ -2731,6 +2814,218 @@ mod tests {
             delta_inf(&rust_blocks.ds, &native_blocks.ds),
             delta_inf(&rust_blocks.d_lambda, &native_blocks.d_lambda),
             delta_inf(&rust_blocks.dz, &native_blocks.dz),
+        );
+    }
+
+    #[test]
+    #[ignore = "manual in-process glider SSIDS native-vs-rust timing helper"]
+    fn print_current_glider_nlip_iteration0_augmented_inprocess_profile() {
+        if NativeSpral::load().is_err() {
+            eprintln!("skipping glider in-process SPRAL profile: native library unavailable");
+            return;
+        }
+        let repeats = std::env::var("SSIDS_GLIDER_INPROCESS_REPEATS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(15)
+            .max(1);
+        let dump = load_current_glider_iteration0_augmented_dump();
+        let symbolic = glider_iteration0_rust_symbolic(&dump);
+        let structure = SymmetricCscMatrix::new(
+            dump.matrix_dimension,
+            &dump.col_ptrs,
+            &dump.row_indices,
+            None,
+        )
+        .expect("dumped augmented CSC should validate");
+        let native = NativeSpral::load().expect("native SPRAL should be available locally");
+        let rust_initial_order =
+            spral_amd_permutation(structure).expect("rust AMD order should succeed on dumped KKT");
+        let mut native_session = native
+            .analyse_with_options_and_user_ordering(
+                structure,
+                &NumericFactorOptions::default(),
+                rust_initial_order.inverse(),
+            )
+            .expect("native spral analyse should succeed on dumped KKT");
+
+        let warmup_rust = replay_rust_augmented_spral_with_symbolic(&dump, &symbolic);
+        let warmup_native = replay_native_augmented_spral_with_session(&dump, &mut native_session);
+        assert_eq!(warmup_rust.inertia, warmup_native.inertia);
+        assert!(
+            delta_inf(&warmup_rust.solution, &warmup_native.solution) <= 1e-12,
+            "warmup augmented solution delta too large"
+        );
+
+        let mut rust_factor_times = Vec::with_capacity(repeats);
+        let mut rust_solve_times = Vec::with_capacity(repeats);
+        let mut native_factor_times = Vec::with_capacity(repeats);
+        let mut native_solve_times = Vec::with_capacity(repeats);
+        let mut rust_factor_profiles = Vec::with_capacity(repeats);
+        let mut rust_solve_profiles = Vec::with_capacity(repeats);
+        let mut final_solution_delta = 0.0;
+        let mut final_dx_delta = 0.0;
+        let mut final_dp_delta = 0.0;
+        let mut final_ds_delta = 0.0;
+        let mut final_dlambda_delta = 0.0;
+        let mut final_dz_delta = 0.0;
+
+        for _ in 0..repeats {
+            let rust_exact = replay_rust_augmented_spral_with_symbolic(&dump, &symbolic);
+            let native_exact =
+                replay_native_augmented_spral_with_session(&dump, &mut native_session);
+            assert_eq!(rust_exact.inertia, native_exact.inertia);
+            assert!(
+                rust_exact.residual_inf <= 1e-10,
+                "rust residual too large: {rust_exact:?}"
+            );
+            assert!(
+                native_exact.residual_inf <= 1e-10,
+                "native residual too large: {native_exact:?}"
+            );
+            let rust_blocks = augmented_step_blocks(&dump, &rust_exact.solution);
+            let native_blocks = augmented_step_blocks(&dump, &native_exact.solution);
+            final_solution_delta = delta_inf(&rust_exact.solution, &native_exact.solution);
+            final_dx_delta = delta_inf(&rust_blocks.dx, &native_blocks.dx);
+            final_dp_delta = delta_inf(&rust_blocks.p, &native_blocks.p);
+            final_ds_delta = delta_inf(&rust_blocks.ds, &native_blocks.ds);
+            final_dlambda_delta = delta_inf(&rust_blocks.d_lambda, &native_blocks.d_lambda);
+            final_dz_delta = delta_inf(&rust_blocks.dz, &native_blocks.dz);
+            assert!(
+                final_solution_delta <= 1e-12,
+                "augmented solution delta too large"
+            );
+
+            rust_factor_times.push(rust_exact.factor_time);
+            rust_solve_times.push(rust_exact.solve_time);
+            native_factor_times.push(native_exact.factor_time);
+            native_solve_times.push(native_exact.solve_time);
+            rust_factor_profiles.push(rust_exact.factor_profile.expect("rust factor profile"));
+            rust_solve_profiles.push(rust_exact.solve_profile.expect("rust solve profile"));
+        }
+
+        let rust_factor = median_duration(&rust_factor_times);
+        let rust_solve = median_duration(&rust_solve_times);
+        let native_factor = median_duration(&native_factor_times);
+        let native_solve = median_duration(&native_solve_times);
+        println!("\n=== glider NLIP iteration-0 in-process augmented profile ===");
+        println!(
+            "  repeats={} dimension={} nnz={}",
+            repeats,
+            dump.matrix_dimension,
+            dump.values.len()
+        );
+        println!(
+            "  rust_spral factor={:?} solve={:?} residual={:.3e} solution_inf={:.3e} inertia={}",
+            rust_factor,
+            rust_solve,
+            warmup_rust.residual_inf,
+            warmup_rust.solution_inf,
+            warmup_rust.inertia,
+        );
+        println!(
+            "  rust_spral factor_profile symbolic_tree={:?} pattern={:?} values={:?} fronts={:?} root_delayed={:?} inverse={:?} lower_storage={:?} solve_panel_storage={:?} diagonal_storage={:?} bytes={:?} recorded={:?}",
+            median_profile_duration(&rust_factor_profiles, |profile| profile
+                .symbolic_front_tree_time),
+            median_profile_duration(&rust_factor_profiles, |profile| profile
+                .permuted_pattern_time),
+            median_profile_duration(&rust_factor_profiles, |profile| profile
+                .permuted_values_time),
+            median_profile_duration(&rust_factor_profiles, |profile| profile
+                .front_factorization_time),
+            median_profile_duration(&rust_factor_profiles, |profile| profile
+                .root_delayed_factorization_time),
+            median_profile_duration(&rust_factor_profiles, |profile| profile.factor_inverse_time),
+            median_profile_duration(&rust_factor_profiles, |profile| profile.lower_storage_time),
+            median_profile_duration(&rust_factor_profiles, |profile| profile
+                .solve_panel_storage_time),
+            median_profile_duration(&rust_factor_profiles, |profile| profile
+                .diagonal_storage_time),
+            median_profile_duration(&rust_factor_profiles, |profile| profile.factor_bytes_time),
+            median_duration(
+                &rust_factor_profiles
+                    .iter()
+                    .map(FactorProfile::total_recorded_time)
+                    .collect::<Vec<_>>()
+            ),
+        );
+        println!(
+            "  rust_spral front_profile assembly={:?} dense_factor={:?} fronts={} local_dense_entries={} root_delayed_blocks={}",
+            median_profile_duration(&rust_factor_profiles, |profile| profile.front_assembly_time),
+            median_profile_duration(&rust_factor_profiles, |profile| profile
+                .dense_front_factorization_time),
+            rust_factor_profiles[0].front_count,
+            rust_factor_profiles[0].local_dense_entries,
+            rust_factor_profiles[0].root_delayed_blocks,
+        );
+        println!(
+            "  rust_spral dense_front_profile tpp={:?} app_pivot_factor={:?} app_block_apply={:?} app_block_trsm={:?} app_block_diag={:?} app_failed_scan={:?} app_restore={:?} app_accepted_update={:?} app_column_storage={:?} solve_panel_build={:?}",
+            median_profile_duration(&rust_factor_profiles, |profile| profile
+                .tpp_factorization_time),
+            median_profile_duration(&rust_factor_profiles, |profile| profile
+                .app_pivot_factor_time),
+            median_profile_duration(&rust_factor_profiles, |profile| profile
+                .app_block_pivot_apply_time),
+            median_profile_duration(&rust_factor_profiles, |profile| profile
+                .app_block_triangular_solve_time),
+            median_profile_duration(&rust_factor_profiles, |profile| profile
+                .app_block_diagonal_apply_time),
+            median_profile_duration(&rust_factor_profiles, |profile| profile
+                .app_failed_pivot_scan_time),
+            median_profile_duration(&rust_factor_profiles, |profile| profile.app_restore_time),
+            median_profile_duration(&rust_factor_profiles, |profile| profile
+                .app_accepted_update_time),
+            median_profile_duration(&rust_factor_profiles, |profile| profile
+                .app_column_storage_time),
+            median_profile_duration(&rust_factor_profiles, |profile| profile
+                .solve_panel_build_time),
+        );
+        println!(
+            "  rust_spral solve_profile input_perm={:?} forward={:?} diagonal={:?} backward={:?} output_perm={:?} recorded={:?}",
+            median_solve_profile_duration(&rust_solve_profiles, |profile| profile
+                .input_permutation_time),
+            median_solve_profile_duration(&rust_solve_profiles, |profile| profile
+                .forward_substitution_time),
+            median_solve_profile_duration(&rust_solve_profiles, |profile| profile
+                .diagonal_solve_time),
+            median_solve_profile_duration(&rust_solve_profiles, |profile| profile
+                .backward_substitution_time),
+            median_solve_profile_duration(&rust_solve_profiles, |profile| profile
+                .output_permutation_time),
+            median_duration(
+                &rust_solve_profiles
+                    .iter()
+                    .map(SolveProfile::total_recorded_time)
+                    .collect::<Vec<_>>()
+            ),
+        );
+        println!(
+            "  rust_spral backward_profile trailing_update={:?} triangular={:?} trailing_columns={} trailing_dense_entries={} triangular_columns={} triangular_dense_entries={}",
+            median_solve_profile_duration(&rust_solve_profiles, |profile| profile
+                .backward_trailing_update_time),
+            median_solve_profile_duration(&rust_solve_profiles, |profile| profile
+                .backward_triangular_solve_time),
+            rust_solve_profiles[0].backward_trailing_update_columns,
+            rust_solve_profiles[0].backward_trailing_update_dense_entries,
+            rust_solve_profiles[0].backward_triangular_columns,
+            rust_solve_profiles[0].backward_triangular_dense_entries,
+        );
+        println!(
+            "  native_spral factor={:?} solve={:?} residual={:.3e} solution_inf={:.3e} inertia={}",
+            native_factor,
+            native_solve,
+            warmup_native.residual_inf,
+            warmup_native.solution_inf,
+            warmup_native.inertia,
+        );
+        println!(
+            "  augmented deltas: solution={:.6e} dx={:.6e} dp={:.6e} ds={:.6e} dlambda={:.6e} dz={:.6e}",
+            final_solution_delta,
+            final_dx_delta,
+            final_dp_delta,
+            final_ds_delta,
+            final_dlambda_delta,
+            final_dz_delta,
         );
     }
 

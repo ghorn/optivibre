@@ -12,12 +12,17 @@ fi
 GLIDER_REPEATS="${SSIDS_PROFILE_GLIDER_REPEATS:-1}"
 RUN_GLIDER="${SSIDS_PROFILE_GLIDER:-1}"
 GLIDER_TEST="${SSIDS_PROFILE_GLIDER_TEST:-print_current_glider_nlip_iteration0_augmented_compare}"
+GLIDER_INPROCESS_REPEATS="${SSIDS_PROFILE_GLIDER_INPROCESS_REPEATS:-15}"
+if [[ "${SSIDS_PROFILE_GLIDER_INPROCESS:-0}" != "0" ]]; then
+  GLIDER_TEST="print_current_glider_nlip_iteration0_augmented_inprocess_profile"
+fi
 
 require_native_env=(
   RAYON_NUM_THREADS=1
   OMP_NUM_THREADS=1
   OMP_CANCELLATION=true
   AD_CODEGEN_REQUIRE_NATIVE_SPRAL_PARITY=1
+  SSIDS_GLIDER_INPROCESS_REPEATS="$GLIDER_INPROCESS_REPEATS"
 )
 
 tmp="$(mktemp -t ssids-rs-release-profile.XXXXXX)"
