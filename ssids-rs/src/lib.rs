@@ -2621,6 +2621,24 @@ fn packed_lower_offset(size: usize, row: usize, col: usize) -> usize {
     col * size - col * (col.saturating_sub(1)) / 2 + (row - col)
 }
 
+fn pack_dense_lower_suffix(
+    matrix: &[f64],
+    size: usize,
+    start: usize,
+    suffix_size: usize,
+) -> Vec<f64> {
+    let mut packed = vec![0.0; packed_lower_len(suffix_size)];
+    for local_col in 0..suffix_size {
+        let source_col = start + local_col;
+        let len = suffix_size - local_col;
+        let source_start = dense_lower_offset(size, source_col, source_col);
+        let packed_offset = packed_lower_offset(suffix_size, local_col, local_col);
+        packed[packed_offset..packed_offset + len]
+            .copy_from_slice(&matrix[source_start..source_start + len]);
+    }
+    packed
+}
+
 fn aggregate_panel_stats(target: &mut PanelFactorStats, source: PanelFactorStats) {
     target.two_by_two_pivots += source.two_by_two_pivots;
     target.delayed_pivots += source.delayed_pivots;
@@ -5616,13 +5634,7 @@ fn factorize_dense_tpp_tail_in_place(
         .saturating_sub(pivot)
         .min(remaining_size);
     stats.delayed_pivots += delayed_count;
-    let mut contribution_dense = vec![0.0; packed_lower_len(remaining_size)];
-    for row in 0..remaining_size {
-        for col in 0..=row {
-            let value = dense[dense_lower_offset(size, pivot + row, pivot + col)];
-            contribution_dense[packed_lower_offset(remaining_size, row, col)] = value;
-        }
-    }
+    let contribution_dense = pack_dense_lower_suffix(dense, size, pivot, remaining_size);
 
     let mut profile = FactorProfile::default();
     if let Some(started) = started {
@@ -6202,14 +6214,8 @@ fn factorize_dense_front(
         });
     }
 
-    let mut contribution_dense = vec![0.0; packed_lower_len(remaining_size)];
+    let contribution_dense = pack_dense_lower_suffix(&dense, size, pivot, remaining_size);
     stats.delayed_pivots += delayed_count;
-    for row in 0..remaining_size {
-        for col in 0..=row {
-            let value = dense[dense_lower_offset(size, pivot + row, pivot + col)];
-            contribution_dense[packed_lower_offset(remaining_size, row, col)] = value;
-        }
-    }
 
     let contribution = ContributionBlock {
         row_ids: remaining_rows,
