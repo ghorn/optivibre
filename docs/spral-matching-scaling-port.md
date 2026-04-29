@@ -271,3 +271,9 @@ Release performance notes on dense case 58:
   storage instead of indexing every row through `dense_lower_offset`. The
   generic factor-column equivalence test pins the exact emitted panel values;
   short case-59 profiles put `solve_panel_build` around `7us`.
+- Factor setup now hoists invariant permutation lookups while building the
+  permuted lower CSC pattern and uses a guarded identity leaf-front assembly
+  path when a front has no child contributions or interface rows. The fast path
+  writes the same lower-CSC values into the dense front with identity local
+  row/column numbering; short case-59 profiles put `front_assembly` around
+  `14us` and `permuted_pattern` around `38us`.

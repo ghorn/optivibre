@@ -2384,10 +2384,10 @@ fn build_permuted_lower_csc_pattern(
     let nnz = matrix.row_indices().len();
     let mut counts = vec![0usize; dimension];
     for col in 0..dimension {
+        let permuted_col = inverse[col];
         let start = matrix.col_ptrs()[col];
         let end = matrix.col_ptrs()[col + 1];
         for &row in &matrix.row_indices()[start..end] {
-            let permuted_col = inverse[col];
             let permuted_row = inverse[row];
             counts[permuted_col.min(permuted_row)] += 1;
         }
@@ -2405,11 +2405,11 @@ fn build_permuted_lower_csc_pattern(
     source_positions.resize(nnz, 0);
     let mut next = col_ptrs[..dimension].to_vec();
     for col in 0..dimension {
+        let permuted_col = inverse[col];
         let start = matrix.col_ptrs()[col];
         let end = matrix.col_ptrs()[col + 1];
         for source_index in start..end {
             let row = matrix.row_indices()[source_index];
-            let permuted_col = inverse[col];
             let permuted_row = inverse[row];
             let target_col = permuted_col.min(permuted_row);
             let target_row = permuted_col.max(permuted_row);
@@ -6185,75 +6185,101 @@ fn factor_front_recursive(
     }
 
     let assembly_started = profile_enabled.then(Instant::now);
-    let mut row_state = vec![0_u8; matrix.dimension];
-    let mut candidate_rows = Vec::with_capacity(front.columns.len());
-    for &row in &front.columns {
-        if row_state[row] == 0 {
-            row_state[row] = 1;
-            candidate_rows.push(row);
+    let identity_leaf_front = child_contributions.is_empty()
+        && front.interface_rows.is_empty()
+        && front
+            .columns
+            .iter()
+            .enumerate()
+            .all(|(position, &row)| row == position);
+    let (local_rows, local_dense) = if identity_leaf_front {
+        let local_rows = front.columns.clone();
+        let local_size = local_rows.len();
+        let mut local_dense = vec![0.0; local_size * local_size];
+        for &column in &front.columns {
+            for entry in matrix.col_ptrs[column]..matrix.col_ptrs[column + 1] {
+                let row = matrix.row_indices[entry];
+                if row < local_size {
+                    // In this guarded path the local row/column numbering is
+                    // already identity and the permuted matrix is lower CSC.
+                    local_dense[column * local_size + row] = matrix.values[entry];
+                }
+            }
         }
-    }
-    for contribution in &child_contributions {
-        for &row in contribution.row_ids.iter().take(contribution.delayed_count) {
+        (local_rows, local_dense)
+    } else {
+        let mut row_state = vec![0_u8; matrix.dimension];
+        let mut candidate_rows = Vec::with_capacity(front.columns.len());
+        for &row in &front.columns {
             if row_state[row] == 0 {
                 row_state[row] = 1;
                 candidate_rows.push(row);
             }
         }
-    }
-    let mut interface_rows = Vec::with_capacity(front.interface_rows.len());
-    for &row in &front.interface_rows {
-        if row_state[row] == 0 {
-            row_state[row] = 2;
-            interface_rows.push(row);
+        for contribution in &child_contributions {
+            for &row in contribution.row_ids.iter().take(contribution.delayed_count) {
+                if row_state[row] == 0 {
+                    row_state[row] = 1;
+                    candidate_rows.push(row);
+                }
+            }
         }
-    }
-    for contribution in &child_contributions {
-        for &row in &contribution.row_ids {
+        let mut interface_rows = Vec::with_capacity(front.interface_rows.len());
+        for &row in &front.interface_rows {
             if row_state[row] == 0 {
                 row_state[row] = 2;
                 interface_rows.push(row);
             }
         }
-    }
-    interface_rows.sort_unstable();
-    let mut local_rows = candidate_rows;
-    local_rows.extend(interface_rows);
+        for contribution in &child_contributions {
+            for &row in &contribution.row_ids {
+                if row_state[row] == 0 {
+                    row_state[row] = 2;
+                    interface_rows.push(row);
+                }
+            }
+        }
+        interface_rows.sort_unstable();
+        let mut local_rows = candidate_rows;
+        local_rows.extend(interface_rows);
+        let local_size = local_rows.len();
+        let mut local_dense = vec![0.0; local_size * local_size];
+        let mut local_positions = vec![usize::MAX; matrix.dimension];
+        for (position, &row) in local_rows.iter().enumerate() {
+            local_positions[row] = position;
+        }
+        for &column in &front.columns {
+            let local_column = local_positions[column];
+            for entry in matrix.col_ptrs[column]..matrix.col_ptrs[column + 1] {
+                let row = matrix.row_indices[entry];
+                let local_row = local_positions[row];
+                if local_row == usize::MAX {
+                    continue;
+                }
+                let value = matrix.values[entry];
+                let offset = dense_lower_offset(local_size, local_row, local_column);
+                // Mirrors SPRAL ssids/cpu/kernels/assemble.hxx::add_a_block:
+                // original A entries are assigned into the node. Contributions
+                // from children are accumulated separately below.
+                local_dense[offset] = value;
+            }
+        }
+        for contribution in &child_contributions {
+            let size = contribution.row_ids.len();
+            for row in 0..size {
+                let local_row = local_positions[contribution.row_ids[row]];
+                for col in 0..=row {
+                    let local_col = local_positions[contribution.row_ids[col]];
+                    let value = contribution.dense[packed_lower_offset(size, row, col)];
+                    let offset = dense_lower_offset(local_size, local_row, local_col);
+                    local_dense[offset] += value;
+                }
+            }
+        }
+        (local_rows, local_dense)
+    };
     let local_size = local_rows.len();
     max_front_size = max_front_size.max(local_size);
-    let mut local_dense = vec![0.0; local_size * local_size];
-    let mut local_positions = vec![usize::MAX; matrix.dimension];
-    for (position, &row) in local_rows.iter().enumerate() {
-        local_positions[row] = position;
-    }
-    for &column in &front.columns {
-        let local_column = local_positions[column];
-        for entry in matrix.col_ptrs[column]..matrix.col_ptrs[column + 1] {
-            let row = matrix.row_indices[entry];
-            let local_row = local_positions[row];
-            if local_row == usize::MAX {
-                continue;
-            }
-            let value = matrix.values[entry];
-            let offset = dense_lower_offset(local_size, local_row, local_column);
-            // Mirrors SPRAL ssids/cpu/kernels/assemble.hxx::add_a_block:
-            // original A entries are assigned into the node. Contributions
-            // from children are accumulated separately below.
-            local_dense[offset] = value;
-        }
-    }
-    for contribution in &child_contributions {
-        let size = contribution.row_ids.len();
-        for row in 0..size {
-            let local_row = local_positions[contribution.row_ids[row]];
-            for col in 0..=row {
-                let local_col = local_positions[contribution.row_ids[col]];
-                let value = contribution.dense[packed_lower_offset(size, row, col)];
-                let offset = dense_lower_offset(local_size, local_row, local_col);
-                local_dense[offset] += value;
-            }
-        }
-    }
     if let Some(started) = assembly_started {
         profile.front_assembly_time += started.elapsed();
         profile.front_count += 1;
