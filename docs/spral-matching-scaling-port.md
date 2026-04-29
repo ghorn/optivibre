@@ -296,3 +296,9 @@ Release performance notes on dense case 58:
   factor around `3.46ms` vs native `1.06ms`, with Rust `solve_panel_build`
   around `292us`; the remaining glider factor gap is still mostly dense-front
   work across many small fronts rather than this panel copy.
+- APP accepted-update LD construction now iterates explicitly over
+  `APP_INNER_BLOCK_SIZE` row tiles instead of recomputing the tile by division
+  for every row. This preserves the source `calcLD<OP_N>` vector/scalar split
+  and row order. A five-repeat case-59 release profile measured native/Rust
+  saved-scaling factor medians at about `254us`/`264us`, with Rust
+  `app_accepted_ld` around `3us` and `app_accepted_update` around `41us`.

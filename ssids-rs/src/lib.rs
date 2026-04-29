@@ -3946,25 +3946,27 @@ fn app_build_ld_workspace_into(
             let d11 = inv11 / det;
             let d21 = inv21 / det;
             let d22 = inv22 / det;
-            for row in accepted_end..size {
-                let row_l1 = matrix[pivot * size + row];
-                let row_l2 = matrix[(pivot + 1) * size + row];
-                // Mirrors ldlt_app.cxx::Block::update: calcLD<OP_N> is
-                // called separately for each target block, so the local
-                // vector/scalar split resets at every APP_INNER_BLOCK_SIZE
-                // row tile rather than once for the full trailing tail.
-                let tile_start = accepted_end
-                    + ((row - accepted_end) / APP_INNER_BLOCK_SIZE) * APP_INNER_BLOCK_SIZE;
+            // Mirrors ldlt_app.cxx::Block::update: calcLD<OP_N> is called
+            // separately for each target block, so the vector/scalar split
+            // resets at every APP_INNER_BLOCK_SIZE row tile.
+            let mut tile_start = accepted_end;
+            while tile_start < size {
                 let tile_end = (tile_start + APP_INNER_BLOCK_SIZE).min(size);
                 let tile_rows = tile_end - tile_start;
                 let vector_rows = if tile_rows > 4 { tile_rows & !1 } else { 0 };
-                let local_row = row - tile_start;
-                ld_values[relative_pivot * size + row] = if local_row < vector_rows {
-                    (-d21).mul_add(row_l2, d22 * row_l1)
-                } else {
-                    d22.mul_add(row_l1, -(d21 * row_l2))
-                };
-                ld_values[(relative_pivot + 1) * size + row] = (-d21).mul_add(row_l1, d11 * row_l2);
+                for row in tile_start..tile_end {
+                    let local_row = row - tile_start;
+                    let row_l1 = matrix[pivot * size + row];
+                    let row_l2 = matrix[(pivot + 1) * size + row];
+                    ld_values[relative_pivot * size + row] = if local_row < vector_rows {
+                        (-d21).mul_add(row_l2, d22 * row_l1)
+                    } else {
+                        d22.mul_add(row_l1, -(d21 * row_l2))
+                    };
+                    ld_values[(relative_pivot + 1) * size + row] =
+                        (-d21).mul_add(row_l1, d11 * row_l2);
+                }
+                tile_start = tile_end;
             }
             pivot += 2;
         }
