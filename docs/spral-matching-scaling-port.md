@@ -259,3 +259,10 @@ Release performance notes on dense case 58:
   three-repeat release profile on the same case-59 witness measured native
   matching/scaling factor at about `226us` and Rust saved-scaling factor at
   about `290us`, with Rust's `app_backup` bucket reduced to about `10us`.
+- APP factor-column capture and final lower-factor storage now use exact
+  capacity plus direct initialized writes for already validated copy paths.
+  Entry order, row mapping checks, and factor values are unchanged. Short
+  five-repeat case-59 profiles put saved-scaling `app_column_storage` around
+  `13-15us` and `lower_storage` around `13us`; total factor timing remains
+  noisy but the storage buckets are smaller than the previous roughly
+  `20us`-class copies.

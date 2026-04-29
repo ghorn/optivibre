@@ -5079,11 +5079,29 @@ fn app_extend_factor_columns_for_prefix(
     start: usize,
     end: usize,
 ) {
+    debug_assert!(rows.len() >= size);
+    debug_assert_eq!(matrix.len(), size * size);
     columns.reserve(end.saturating_sub(start));
     for col in start..end {
-        let mut entries = Vec::with_capacity(size.saturating_sub(col + 1));
-        for row in (col + 1)..size {
-            entries.push((rows[row], matrix[col * size + row]));
+        let entry_count = size.saturating_sub(col + 1);
+        let mut entries: Vec<(usize, f64)> = Vec::with_capacity(entry_count);
+        let entry_ptr = entries.as_mut_ptr();
+        let column_offset = col * size;
+        for (offset, row) in ((col + 1)..size).enumerate() {
+            // SAFETY: debug assertions and loop bounds ensure `row < size`,
+            // `offset < entry_count`, and both source slices cover the APP
+            // dense-front storage. `(usize, f64)` is fully initialized here
+            // before the vector length is exposed.
+            unsafe {
+                entry_ptr.add(offset).write((
+                    *rows.get_unchecked(row),
+                    *matrix.get_unchecked(column_offset + row),
+                ));
+            }
+        }
+        // SAFETY: the loop above initializes exactly `entry_count` entries.
+        unsafe {
+            entries.set_len(entry_count);
         }
         columns.push(FactorColumn {
             global_column: rows[col],
@@ -6502,6 +6520,9 @@ fn multifrontal_factorize_with_tree(
     buffers.lower_row_indices.reserve(lower_entry_count);
     buffers.lower_values.clear();
     buffers.lower_values.reserve(lower_entry_count);
+    let row_position_ptr = buffers.lower_row_indices.as_mut_ptr();
+    let value_ptr = buffers.lower_values.as_mut_ptr();
+    let mut lower_entry_cursor = 0;
     for (column_position, column) in factor_columns.iter().enumerate() {
         if column.global_column != buffers.factor_order[column_position] {
             return Err(SsidsError::NumericalBreakdown {
@@ -6517,10 +6538,25 @@ fn multifrontal_factorize_with_tree(
                     detail: "factor column referenced an invalid trailing row".into(),
                 });
             }
-            buffers.lower_row_indices.push(row_position);
-            buffers.lower_values.push(value);
+            debug_assert!(lower_entry_cursor < lower_entry_count);
+            // SAFETY: `reserve(lower_entry_count)` above gives both output
+            // vectors enough capacity for every validated factor entry. The
+            // cursor is advanced exactly once per entry, and lengths are
+            // exposed only after all writes complete.
+            unsafe {
+                row_position_ptr.add(lower_entry_cursor).write(row_position);
+                value_ptr.add(lower_entry_cursor).write(value);
+            }
+            lower_entry_cursor += 1;
         }
-        buffers.lower_col_ptrs.push(buffers.lower_row_indices.len());
+        buffers.lower_col_ptrs.push(lower_entry_cursor);
+    }
+    debug_assert_eq!(lower_entry_cursor, lower_entry_count);
+    // SAFETY: the loop above initialized exactly `lower_entry_cursor` entries
+    // in both vectors.
+    unsafe {
+        buffers.lower_row_indices.set_len(lower_entry_cursor);
+        buffers.lower_values.set_len(lower_entry_cursor);
     }
     if let Some(started) = started {
         profile.lower_storage_time += started.elapsed();
