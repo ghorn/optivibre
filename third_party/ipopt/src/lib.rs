@@ -1667,6 +1667,11 @@ pub enum SolveStatus {
     /// the option
     /// [`max_cpu_time`](https://www.coin-or.org/Ipopt/documentation/node42.html#opt:max_cpu_time).
     MaximumCpuTimeExceeded,
+    /// Console Message: `EXIT: Maximum wallclock time exceeded.`
+    ///
+    /// This indicates that IPOPT has exceeded the maximum number of wallclock seconds as specified
+    /// by the option `max_wall_time`.
+    MaximumWallTimeExceeded,
     /// Console Message: `EXIT: Restoration Failed!`
     ///
     /// This indicates that the restoration phase failed to find a feasible point that was
@@ -1789,6 +1794,11 @@ impl Display for SolveStatus {
                 This indicates that IPOPT has exceeded the maximum number of CPU seconds as specified \
                 by the option `max_cpu_time`."),
 
+            SolveStatus::MaximumWallTimeExceeded => write!(f, "
+                Console Message: `EXIT: Maximum wallclock time exceeded.`\n\n\
+                This indicates that IPOPT has exceeded the maximum number of wallclock seconds as \
+                specified by the option `max_wall_time`."),
+
             SolveStatus::RestorationFailed => write!(f, "
                 Console Message: `EXIT: Restoration Failed!`\n\n\
                 This indicates that the restoration phase failed to find a feasible point that was \
@@ -1878,6 +1888,9 @@ impl SolveStatus {
             }
             ffi::CNLP_ApplicationReturnStatus_CNLP_MAXIMUM_CPUTIME_EXCEEDED => {
                 RS::MaximumCpuTimeExceeded
+            }
+            ffi::CNLP_ApplicationReturnStatus_CNLP_MAXIMUM_WALLTIME_EXCEEDED => {
+                RS::MaximumWallTimeExceeded
             }
             ffi::CNLP_ApplicationReturnStatus_CNLP_NOT_ENOUGH_DEGREES_OF_FREEDOM => {
                 RS::NotEnoughDegreesOfFreedom

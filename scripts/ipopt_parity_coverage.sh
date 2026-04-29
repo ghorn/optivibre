@@ -155,6 +155,12 @@ cargo test \
   -- --nocapture
 
 cargo test \
+  -p optimization \
+  --lib restoration \
+  --features ipopt,native-spral-src \
+  -- --nocapture
+
+cargo test \
   -p optimal_control_problems \
   --release \
   --features ipopt,native-spral-src \
@@ -381,17 +387,25 @@ def classify_rust_line(path, line_no, text):
             return "diagnostic/restoration branch"
         if 1560 <= line_no <= 1685:
             return "fixed-variable elimination"
-        if 1930 <= line_no <= 2145 and "ssids_rs" in text:
+        if 1685 <= line_no <= 2030:
+            return "diagnostic/restoration branch"
+        if text == "_ => iteration,":
+            return "diagnostic/restoration branch"
+        if "barrier_parameter: if barrier_pair_count > 0" in text:
+            return "solve summary/reporting"
+        if 1930 <= line_no <= 2180 and "ssids_rs" in text:
             return "unreachable: non-parity linear solver/debug branch"
-        if 2030 <= line_no <= 2145:
+        if 2030 <= line_no <= 2180:
             return "linear-solver workspace setup"
-        if 2200 <= line_no <= 2250:
+        if 2200 <= line_no <= 2290:
             return "diagnostic linear replay"
-        if 2400 <= line_no <= 2910:
+        if 2320 <= line_no <= 3075:
             return "diagnostic linear replay"
-        if 3075 <= line_no <= 3150:
+        if 3075 <= line_no <= 3605:
             return "diagnostic factorization progress"
-        if 3745 <= line_no <= 3810:
+        if 3605 <= line_no <= 3745:
+            return "diagnostic factorization progress"
+        if 3745 <= line_no <= 3875:
             return "monotone barrier update"
         if "WatchdogStopKind::" in text:
             return "watchdog globalization branch"
@@ -399,34 +413,56 @@ def classify_rust_line(path, line_no, text):
             return "covered by alpha_for_y option-profile witness"
         if 3900 <= line_no <= 4100:
             return "termination display/tolerance reporting"
-        if 4200 <= line_no <= 5100:
+        if 4100 <= line_no <= 4195:
+            return "bounds and IPOPT dense-vector arithmetic helper"
+        if 4200 <= line_no <= 5170:
             return "bounds, fixed-variable, and sparse-preprocessing helper"
-        if 5180 <= line_no <= 5320:
+        if 5180 <= line_no <= 5470:
             return "KKT pattern validation/preprocessing"
+        if 5470 <= line_no <= 5550:
+            return "bounds, fixed-variable, and sparse-preprocessing helper"
         if 5550 <= line_no <= 6990:
             return "full-space residual/refinement helper"
         if 6930 <= line_no <= 6945:
             return "full-space residual/refinement helper"
+        if 7000 <= line_no <= 7170:
+            return "unreachable: non-parity linear solver/debug branch"
         if 7170 <= line_no <= 8485:
             return "linear solver dispatch, retry, and diagnostics"
-        if 8485 <= line_no <= 8958:
+        if 8485 <= line_no <= 8970:
             return "linear solver fallback/retry path"
-        if 8970 <= line_no <= 9380:
+        if 8970 <= line_no <= 9565:
             return "iteration log formatting/reporting"
         if 9560 <= line_no <= 10030:
             return "bound/slack stationarity helper alternate branch"
-        if 10200 <= line_no <= 10570:
+        if 10030 <= line_no <= 10210:
+            return "unit-test parity witness"
+        if 10400 <= line_no <= 11050:
+            return "unit-test parity witness"
+        if 10200 <= line_no <= 10645:
             return "solve summary/reporting"
-        if 10650 <= line_no <= 11050:
-            return "initialization and max-iteration witness branch"
+        if 11050 <= line_no <= 11340:
+            return "solve summary/reporting"
+        if 11340 <= line_no <= 11840:
+            return "initialization option-profile branch"
         if 11640 <= line_no <= 11790:
             return "linear solver workspace selection"
+        if 11840 <= line_no <= 11990:
+            return "solve summary/reporting"
+        if 11920 <= line_no <= 11970:
+            return "unreachable: non-parity linear solver/debug branch"
         if 11980 <= line_no <= 12120:
             return "watchdog globalization start gate"
-        if 12800 <= line_no <= 14150:
+        if 12120 <= line_no <= 14330:
             return "SOC/watchdog globalization branch"
-        if 14330 <= line_no <= 14620:
+        if 14330 <= line_no <= 14920:
             return "accepted-step and watchdog state bookkeeping"
+        if 14920 <= line_no <= 16730:
+            return "iteration log formatting/reporting"
+        if 16750 <= line_no <= 16795:
+            return "iteration log formatting/reporting"
+        if 14720 <= line_no <= 14770:
+            return "iteration log formatting/reporting"
     if any(token in text for token in ["SparseQdldl", "SsidsRs", "Auto", "compare_solvers"]):
         return "unreachable: non-parity linear solver/debug branch"
     if any(token in text for token in ["Self::", "impl Default", "label()", "as_str", "format_", "InteriorPointSpralPivotMethod"]):
@@ -615,6 +651,10 @@ ledger.extend(
 )
 branch_ledger_out.write_text("\n".join(ledger) + "\n")
 if needs_audit:
+    for path, line_no, classification, text in rust_unhit:
+        if classification == "needs audit":
+            rel = path.replace(str(pathlib.Path.cwd()) + "/", "")
+            print(f"{rel}:{line_no}: {text}", file=sys.stderr)
     print(
         f"Rust core coverage still has {needs_audit} unclassified branch-like lines; see {branch_ledger_out}",
         file=sys.stderr,

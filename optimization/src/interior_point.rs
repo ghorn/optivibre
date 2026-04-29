@@ -12,6 +12,7 @@ use ssids_rs::{
     current_factorization_progress as spral_current_factorization_progress,
     factorize as spral_factorize,
 };
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -28,10 +29,9 @@ use super::{
     SqpEventLegendState, boxed_line, choose_summary_duration_unit, compact_duration_text,
     complementarity_inf_norm, declared_box_constraint_count, dense_fill_percent,
     fmt_duration_in_unit, fmt_optional_duration_in_unit, inf_norm, log_boxed_section,
-    lower_tri_fill_percent, positive_part_inf_norm, scaled_overall_inf_norm, sci_text, style_bold,
-    style_cyan_bold, style_green_bold, style_iteration_label_cell, style_metric_against_tolerance,
-    style_red_bold, style_yellow_bold, time_callback, validate_nlp_problem_shapes,
-    validate_parameter_inputs,
+    lower_tri_fill_percent, scaled_overall_inf_norm, sci_text, style_bold, style_cyan_bold,
+    style_green_bold, style_iteration_label_cell, style_metric_against_tolerance, style_red_bold,
+    style_yellow_bold, time_callback, validate_nlp_problem_shapes, validate_parameter_inputs,
 };
 
 const IP_COMP_INF_LABEL: &str = "‖s∘z‖∞";
@@ -203,9 +203,28 @@ impl InteriorPointBoundMultiplierInitMethod {
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InteriorPointSecondOrderCorrectionMethod {
+    ImplementationPaper,
+    ScaledPrimalDualRows,
+}
+
+impl InteriorPointSecondOrderCorrectionMethod {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ImplementationPaper => "implementation-paper",
+            Self::ScaledPrimalDualRows => "scaled-primal-dual-rows",
+        }
+    }
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug)]
 pub struct InteriorPointOptions {
     pub max_iters: Index,
+    pub diverging_iterates_tol: f64,
+    pub max_cpu_time: f64,
+    pub max_wall_time: f64,
     pub dual_tol: f64,
     pub constraint_tol: f64,
     pub complementarity_tol: f64,
@@ -216,6 +235,7 @@ pub struct InteriorPointOptions {
     pub alpha_for_y_tol: f64,
     pub bound_mult_init_method: InteriorPointBoundMultiplierInitMethod,
     pub bound_mult_init_val: f64,
+    pub least_square_init_primal: bool,
     pub least_square_init_duals: bool,
     pub constr_mult_init_max: f64,
     pub bound_push: f64,
@@ -225,6 +245,9 @@ pub struct InteriorPointOptions {
     pub bound_relax_factor: f64,
     pub line_search_beta: f64,
     pub line_search_c1: f64,
+    pub accept_every_trial_step: bool,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub accept_after_max_steps: Option<Index>,
     pub min_step: f64,
     pub filter_gamma_objective: f64,
     pub filter_gamma_violation: f64,
@@ -263,8 +286,16 @@ pub struct InteriorPointOptions {
     pub jacobian_regularization_exponent: f64,
     pub second_order_correction: bool,
     pub max_second_order_corrections: Index,
+    pub second_order_correction_method: InteriorPointSecondOrderCorrectionMethod,
     pub second_order_correction_reduction_factor: f64,
     pub restoration_phase: bool,
+    pub start_with_restoration: bool,
+    pub expect_infeasible_problem: bool,
+    pub expect_infeasible_problem_ctol: f64,
+    pub expect_infeasible_problem_ytol: f64,
+    pub soft_restoration_pderror_reduction_factor: f64,
+    pub max_soft_restoration_iters: Index,
+    pub max_restoration_iters: Index,
     pub tiny_step_tol: f64,
     pub tiny_step_y_tol: f64,
     pub watchdog_shortened_iter_trigger: Index,
@@ -285,6 +316,9 @@ impl Default for InteriorPointOptions {
     fn default() -> Self {
         Self {
             max_iters: 80,
+            diverging_iterates_tol: 1e20,
+            max_cpu_time: 1e20,
+            max_wall_time: 1e20,
             dual_tol: 2e-6,
             constraint_tol: 1e-6,
             complementarity_tol: 1e-6,
@@ -295,6 +329,7 @@ impl Default for InteriorPointOptions {
             alpha_for_y_tol: 10.0,
             bound_mult_init_method: InteriorPointBoundMultiplierInitMethod::Constant,
             bound_mult_init_val: 1.0,
+            least_square_init_primal: false,
             least_square_init_duals: false,
             constr_mult_init_max: 1e3,
             bound_push: 1e-2,
@@ -304,6 +339,8 @@ impl Default for InteriorPointOptions {
             bound_relax_factor: 1e-8,
             line_search_beta: 0.5,
             line_search_c1: 1e-4,
+            accept_every_trial_step: false,
+            accept_after_max_steps: None,
             min_step: 1e-8,
             filter_gamma_objective: 1e-8,
             filter_gamma_violation: 1e-5,
@@ -342,8 +379,17 @@ impl Default for InteriorPointOptions {
             jacobian_regularization_exponent: 0.25,
             second_order_correction: true,
             max_second_order_corrections: 4,
+            second_order_correction_method:
+                InteriorPointSecondOrderCorrectionMethod::ImplementationPaper,
             second_order_correction_reduction_factor: 0.99,
             restoration_phase: true,
+            start_with_restoration: false,
+            expect_infeasible_problem: false,
+            expect_infeasible_problem_ctol: 1e-3,
+            expect_infeasible_problem_ytol: 1e8,
+            soft_restoration_pderror_reduction_factor: 1.0 - 1e-4,
+            max_soft_restoration_iters: 10,
+            max_restoration_iters: 3_000_000,
             tiny_step_tol: 10.0 * f64::EPSILON,
             tiny_step_y_tol: 1e-2,
             watchdog_shortened_iter_trigger: 10,
@@ -363,7 +409,7 @@ impl Default for InteriorPointOptions {
 
 pub fn format_nlip_settings_summary(options: &InteriorPointOptions) -> String {
     format!(
-        "filter={}; linear_solver={}; linear_debug={}; spral=[pivot={}, action={}, small={}, u={}, umax={}]; beta={}; c1={}; min_step={}; tau={}; alpha_y=[strategy={}, tol={}] ; init=[bound_push={}, bound_frac={}, slack_push={}, slack_frac={}, bound_relax={}]; dual_init=[method={}, val={}, least_square={}, max={}] ; regularization={} (first={}, first_growth={}, retries={}, growth={}, decay={}, max={}, jacobian={}, jac_exp={}); soc={} (max={}, kappa={}); restoration={}; watchdog=[trigger={}, max={}]; filter_reset=[max={}, trigger={}]; tiny_step=[x={}, y={}]; mu=[init={}, target={}, min={}, barrier_tol={}, linear={}, superlinear={}, fast={}, kappa_d={}]; theta=[{}, {}]; acceptable_iter={}",
+        "filter={}; linear_solver={}; linear_debug={}; spral=[pivot={}, action={}, small={}, u={}, umax={}]; beta={}; c1={}; force_accept=[every={}, after={}]; min_step={}; diverging_tol={}; max_cpu_time={}; max_wall_time={}; tau={}; alpha_y=[strategy={}, tol={}] ; init=[least_square_primal={}, bound_push={}, bound_frac={}, slack_push={}, slack_frac={}, bound_relax={}]; dual_init=[method={}, val={}, least_square={}, max={}] ; regularization={} (first={}, first_growth={}, retries={}, growth={}, decay={}, max={}, jacobian={}, jac_exp={}); soc={} (max={}, method={}, kappa={}); restoration=[on={}, start={}, expect_infeasible={}, ctol={}, ytol={}, soft_factor={}, max_soft={}, max_iters={}]; watchdog=[trigger={}, max={}]; filter_reset=[max={}, trigger={}]; tiny_step=[x={}, y={}]; mu=[init={}, target={}, min={}, barrier_tol={}, linear={}, superlinear={}, fast={}, kappa_d={}]; theta=[{}, {}]; acceptable_iter={}",
         "on",
         options.linear_solver.label(),
         format_nlip_linear_debug_summary(options.linear_debug.as_ref()),
@@ -378,10 +424,26 @@ pub fn format_nlip_settings_summary(options: &InteriorPointOptions) -> String {
         sci_text(options.spral_pivot_tolerance_max),
         sci_text(options.line_search_beta),
         sci_text(options.line_search_c1),
+        if options.accept_every_trial_step {
+            "yes"
+        } else {
+            "no"
+        },
+        options
+            .accept_after_max_steps
+            .map_or_else(|| "-".to_string(), |value| value.to_string()),
         sci_text(options.min_step),
+        sci_text(options.diverging_iterates_tol),
+        sci_text(options.max_cpu_time),
+        sci_text(options.max_wall_time),
         sci_text(options.fraction_to_boundary),
         options.alpha_for_y.label(),
         sci_text(options.alpha_for_y_tol),
+        if options.least_square_init_primal {
+            "yes"
+        } else {
+            "no"
+        },
         sci_text(options.bound_push),
         sci_text(options.bound_frac),
         sci_text(options.slack_bound_push),
@@ -410,12 +472,28 @@ pub fn format_nlip_settings_summary(options: &InteriorPointOptions) -> String {
             "off"
         },
         options.max_second_order_corrections,
+        options.second_order_correction_method.label(),
         sci_text(options.second_order_correction_reduction_factor),
         if options.restoration_phase {
             "on"
         } else {
             "off"
         },
+        if options.start_with_restoration {
+            "yes"
+        } else {
+            "no"
+        },
+        if options.expect_infeasible_problem {
+            "yes"
+        } else {
+            "no"
+        },
+        sci_text(options.expect_infeasible_problem_ctol),
+        sci_text(options.expect_infeasible_problem_ytol),
+        sci_text(options.soft_restoration_pderror_reduction_factor),
+        options.max_soft_restoration_iters,
+        options.max_restoration_iters,
         options.watchdog_shortened_iter_trigger,
         options.watchdog_trial_iter_max,
         options.max_filter_resets,
@@ -586,6 +664,7 @@ pub struct InteriorPointSummary {
 pub enum InteriorPointTermination {
     Converged,
     Acceptable,
+    FeasiblePointFound,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -597,9 +676,32 @@ pub enum InteriorPointStatusKind {
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InteriorPointRestorationFailureStatus {
+    RestorationFailed,
+    ConvergedToFeasiblePoint,
+    CpuTimeExceeded,
+    WallTimeExceeded,
+    UserRequestedStop,
+    RecoverableFailure,
+}
+
+fn interior_point_status_kind_for_termination(
+    termination: InteriorPointTermination,
+) -> InteriorPointStatusKind {
+    match termination {
+        InteriorPointTermination::Converged => InteriorPointStatusKind::Success,
+        InteriorPointTermination::Acceptable | InteriorPointTermination::FeasiblePointFound => {
+            InteriorPointStatusKind::Warning
+        }
+    }
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InteriorPointIterationPhase {
     Initial,
     AcceptedStep,
+    Restoration,
     Converged,
 }
 
@@ -1076,6 +1178,37 @@ pub enum InteriorPointSolveError {
         step_inf_norm: f64,
         context: Box<InteriorPointFailureContext>,
     },
+    #[error("NLIP restoration failed ({status:?})")]
+    RestorationFailed {
+        status: InteriorPointRestorationFailureStatus,
+        context: Box<InteriorPointFailureContext>,
+    },
+    #[error("NLIP detected local infeasibility")]
+    LocalInfeasibility {
+        context: Box<InteriorPointFailureContext>,
+    },
+    #[error("NLIP iterates are diverging (max |x| {max_abs_x}, threshold {threshold})")]
+    DivergingIterates {
+        max_abs_x: f64,
+        threshold: f64,
+        context: Box<InteriorPointFailureContext>,
+    },
+    #[error("NLIP maximum CPU time exceeded (elapsed {elapsed_seconds}, limit {limit_seconds})")]
+    CpuTimeExceeded {
+        elapsed_seconds: f64,
+        limit_seconds: f64,
+        context: Box<InteriorPointFailureContext>,
+    },
+    #[error("NLIP maximum wall time exceeded (elapsed {elapsed_seconds}, limit {limit_seconds})")]
+    WallTimeExceeded {
+        elapsed_seconds: f64,
+        limit_seconds: f64,
+        context: Box<InteriorPointFailureContext>,
+    },
+    #[error("NLIP stopped at current point as requested by user")]
+    UserRequestedStop {
+        context: Box<InteriorPointFailureContext>,
+    },
     #[error("NLIP failed to converge in {iterations} iterations")]
     MaxIterations {
         iterations: Index,
@@ -1154,6 +1287,7 @@ struct AcceptedInteriorPointTrial {
     watchdog_accepted: bool,
     tiny_step: bool,
     bound_multiplier_corrected: bool,
+    forced_termination: Option<InteriorPointTermination>,
 }
 
 struct AcceptedTrialMultiplierState {
@@ -1191,6 +1325,7 @@ struct WatchdogStoredPoint {
     direction: NewtonDirection,
     direction_diagnostics: Option<InteriorPointDirectionDiagnostics>,
     state_equality_values: Vec<f64>,
+    state_inequality_residuals: Vec<f64>,
     barrier_objective: f64,
     filter_entry: super::FilterEntry,
     filter_theta: f64,
@@ -1215,6 +1350,7 @@ struct InteriorPointWatchdogState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WatchdogStopKind {
     PreLineSearch,
+    EvaluationError,
     TrialBudget,
 }
 
@@ -1236,10 +1372,11 @@ struct EqualityRestorationNlp<'a> {
     x_ref: Vec<f64>,
     dr2_x: Vec<f64>,
     rho: f64,
-    eta: f64,
+    eta: Cell<f64>,
     equality_jacobian_ccs: CCS,
     equality_jacobian_entries: Vec<RestorationJacobianEntry>,
     inequality_jacobian_ccs: CCS,
+    inequality_jacobian_entries: Vec<RestorationJacobianEntry>,
     lagrangian_hessian_ccs: CCS,
     lagrangian_hessian_entries: Vec<RestorationHessianEntry>,
     bounds: ConstraintBounds,
@@ -1252,15 +1389,13 @@ impl<'a> EqualityRestorationNlp<'a> {
         rho: f64,
         eta: f64,
     ) -> Option<Self> {
-        if original.inequality_count() != 0 {
-            return None;
-        }
         let dimension = original.dimension();
         let equality_count = original.equality_count();
-        if equality_count == 0 {
+        let inequality_count = original.inequality_count();
+        if equality_count == 0 && inequality_count == 0 {
             return None;
         }
-        let total_dimension = dimension + 2 * equality_count;
+        let total_dimension = dimension + 2 * equality_count + 2 * inequality_count;
         let dr2_x = x_ref
             .iter()
             .map(|value| {
@@ -1268,8 +1403,18 @@ impl<'a> EqualityRestorationNlp<'a> {
                 1.0 / (scale * scale)
             })
             .collect::<Vec<_>>();
-        let (equality_jacobian_ccs, equality_jacobian_entries) =
-            build_equality_restoration_jacobian_ccs(original.equality_jacobian_ccs());
+        let (equality_jacobian_ccs, equality_jacobian_entries) = build_restoration_jacobian_ccs(
+            original.equality_jacobian_ccs(),
+            total_dimension,
+            dimension,
+            dimension + equality_count,
+        );
+        let (inequality_jacobian_ccs, inequality_jacobian_entries) = build_restoration_jacobian_ccs(
+            original.inequality_jacobian_ccs(),
+            total_dimension,
+            dimension + 2 * equality_count,
+            dimension + 2 * equality_count + inequality_count,
+        );
         let (lagrangian_hessian_ccs, lagrangian_hessian_entries) =
             build_equality_restoration_hessian_ccs(
                 original.lagrangian_hessian_ccs(),
@@ -1298,10 +1443,11 @@ impl<'a> EqualityRestorationNlp<'a> {
             x_ref: x_ref.to_vec(),
             dr2_x,
             rho,
-            eta,
+            eta: Cell::new(eta),
             equality_jacobian_ccs,
             equality_jacobian_entries,
-            inequality_jacobian_ccs: CCS::empty(0, total_dimension),
+            inequality_jacobian_ccs,
+            inequality_jacobian_entries,
             lagrangian_hessian_ccs,
             lagrangian_hessian_entries,
             bounds: ConstraintBounds {
@@ -1319,16 +1465,37 @@ impl<'a> EqualityRestorationNlp<'a> {
         self.original.equality_count()
     }
 
-    fn split_x<'x>(&self, x: &'x [f64]) -> (&'x [f64], &'x [f64], &'x [f64]) {
+    fn inequality_residual_count(&self) -> Index {
+        self.original.inequality_count()
+    }
+
+    #[expect(
+        clippy::type_complexity,
+        reason = "The restoration NLP source variable blocks are easier to audit when split explicitly."
+    )]
+    fn split_x<'x>(&self, x: &'x [f64]) -> (&'x [f64], &'x [f64], &'x [f64], &'x [f64], &'x [f64]) {
         let n = self.original_dimension();
-        let m = self.equality_residual_count();
-        (&x[..n], &x[n..n + m], &x[n + m..n + 2 * m])
+        let meq = self.equality_residual_count();
+        let mineq = self.inequality_residual_count();
+        let nc_offset = n;
+        let pc_offset = nc_offset + meq;
+        let nd_offset = pc_offset + meq;
+        let pd_offset = nd_offset + mineq;
+        (
+            &x[..n],
+            &x[nc_offset..pc_offset],
+            &x[pc_offset..nd_offset],
+            &x[nd_offset..pd_offset],
+            &x[pd_offset..pd_offset + mineq],
+        )
     }
 }
 
 impl CompiledNlpProblem for EqualityRestorationNlp<'_> {
     fn dimension(&self) -> Index {
-        self.original_dimension() + 2 * self.equality_residual_count()
+        self.original_dimension()
+            + 2 * self.equality_residual_count()
+            + 2 * self.inequality_residual_count()
     }
 
     fn parameter_count(&self) -> Index {
@@ -1348,29 +1515,39 @@ impl CompiledNlpProblem for EqualityRestorationNlp<'_> {
     }
 
     fn inequality_count(&self) -> Index {
-        0
+        self.inequality_residual_count()
     }
 
-    fn objective_value(&self, x: &[f64], _parameters: &[ParameterMatrix<'_>]) -> f64 {
-        let (x_original, negative_residual, positive_residual) = self.split_x(x);
-        let residual_penalty =
-            negative_residual.iter().sum::<f64>() + positive_residual.iter().sum::<f64>();
+    fn objective_value(&self, x: &[f64], parameters: &[ParameterMatrix<'_>]) -> f64 {
+        let (x_original, nc, pc, nd, pd) = self.split_x(x);
+        let eta = self.eta.get();
+        let residual_penalty = nc.iter().sum::<f64>()
+            + pc.iter().sum::<f64>()
+            + nd.iter().sum::<f64>()
+            + pd.iter().sum::<f64>();
         let proximity = x_original
             .iter()
             .zip(self.x_ref.iter())
             .zip(self.dr2_x.iter())
             .map(|((value, reference), dr2)| dr2 * (value - reference).powi(2))
             .sum::<f64>();
-        self.rho * residual_penalty + 0.5 * self.eta * proximity
+        // RestoIpoptNLP::f evaluates the original objective at restoration
+        // trial points when evaluate_orig_obj_at_resto_trial=yes, but discards
+        // the value unless the original problem reports an evaluation error.
+        let original_objective = self.original.objective_value(x_original, parameters);
+        if !original_objective.is_finite() {
+            return original_objective;
+        }
+        self.rho * residual_penalty + 0.5 * eta * proximity
     }
 
     fn objective_gradient(&self, x: &[f64], _parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
         let n = self.original_dimension();
-        let m = self.equality_residual_count();
+        let eta = self.eta.get();
         for index in 0..n {
-            out[index] = self.eta * self.dr2_x[index] * (x[index] - self.x_ref[index]);
+            out[index] = eta * self.dr2_x[index] * (x[index] - self.x_ref[index]);
         }
-        for value in &mut out[n..n + 2 * m] {
+        for value in &mut out[n..] {
             *value = self.rho;
         }
     }
@@ -1380,14 +1557,10 @@ impl CompiledNlpProblem for EqualityRestorationNlp<'_> {
     }
 
     fn equality_values(&self, x: &[f64], parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
-        let (x_original, negative_residual, positive_residual) = self.split_x(x);
+        let (x_original, nc, pc, _nd, _pd) = self.split_x(x);
         self.original.equality_values(x_original, parameters, out);
-        for ((value, negative), positive) in out
-            .iter_mut()
-            .zip(negative_residual.iter())
-            .zip(positive_residual.iter())
-        {
-            *value += negative - positive;
+        for ((value, n_i), p_i) in out.iter_mut().zip(nc.iter()).zip(pc.iter()) {
+            *value += n_i - p_i;
         }
     }
 
@@ -1415,15 +1588,32 @@ impl CompiledNlpProblem for EqualityRestorationNlp<'_> {
         &self.inequality_jacobian_ccs
     }
 
-    fn inequality_values(&self, _x: &[f64], _parameters: &[ParameterMatrix<'_>], _out: &mut [f64]) {
+    fn inequality_values(&self, x: &[f64], parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
+        let (x_original, _nc, _pc, nd, pd) = self.split_x(x);
+        self.original.inequality_values(x_original, parameters, out);
+        for ((value, n_i), p_i) in out.iter_mut().zip(nd.iter()).zip(pd.iter()) {
+            *value += n_i - p_i;
+        }
     }
 
     fn inequality_jacobian_values(
         &self,
-        _x: &[f64],
-        _parameters: &[ParameterMatrix<'_>],
-        _out: &mut [f64],
+        x: &[f64],
+        parameters: &[ParameterMatrix<'_>],
+        out: &mut [f64],
     ) {
+        let n = self.original_dimension();
+        let original_nnz = self.original.inequality_jacobian_ccs().nnz();
+        let mut original_values = vec![0.0; original_nnz];
+        self.original
+            .inequality_jacobian_values(&x[..n], parameters, &mut original_values);
+        for (slot, entry) in out.iter_mut().zip(self.inequality_jacobian_entries.iter()) {
+            *slot = match entry {
+                RestorationJacobianEntry::Original(index) => original_values[*index],
+                RestorationJacobianEntry::PositiveResidual => 1.0,
+                RestorationJacobianEntry::NegativeResidual => -1.0,
+            };
+        }
     }
 
     fn lagrangian_hessian_ccs(&self) -> &CCS {
@@ -1435,7 +1625,7 @@ impl CompiledNlpProblem for EqualityRestorationNlp<'_> {
         x: &[f64],
         parameters: &[ParameterMatrix<'_>],
         equality_multipliers: &[f64],
-        _inequality_multipliers: &[f64],
+        inequality_multipliers: &[f64],
         out: &mut [f64],
     ) {
         let n = self.original_dimension();
@@ -1446,14 +1636,16 @@ impl CompiledNlpProblem for EqualityRestorationNlp<'_> {
             &x[..n],
             parameters,
             equality_multipliers,
-            &[],
+            inequality_multipliers,
             &mut with_constraints,
         );
+        let zero_equality_multipliers = vec![0.0; equality_multipliers.len()];
+        let zero_inequality_multipliers = vec![0.0; inequality_multipliers.len()];
         self.original.lagrangian_hessian_values(
             &x[..n],
             parameters,
-            &vec![0.0; equality_multipliers.len()],
-            &[],
+            &zero_equality_multipliers,
+            &zero_inequality_multipliers,
             &mut objective_only,
         );
         for (slot, entry) in out.iter_mut().zip(self.lagrangian_hessian_entries.iter()) {
@@ -1462,36 +1654,46 @@ impl CompiledNlpProblem for EqualityRestorationNlp<'_> {
                 .map(|index| with_constraints[index] - objective_only[index])
                 .unwrap_or(0.0);
             if let Some(index) = entry.proximity_diagonal_index {
-                value += self.eta * self.dr2_x[index];
+                value += self.eta.get() * self.dr2_x[index];
             }
             *slot = value;
         }
     }
+
+    fn interior_point_set_barrier_parameter(&self, barrier_parameter: f64) {
+        // RestoIpoptNLP::Eta(mu) scales the proximity term by
+        // resto_proximity_weight * sqrt(mu).  NLIP currently mirrors the
+        // IPOPT default resto_proximity_weight=1.
+        self.eta.set(barrier_parameter.max(0.0).sqrt());
+    }
 }
 
-fn build_equality_restoration_jacobian_ccs(original: &CCS) -> (CCS, Vec<RestorationJacobianEntry>) {
-    let n = original.ncol;
+fn build_restoration_jacobian_ccs(
+    original: &CCS,
+    total_dimension: Index,
+    positive_offset: Index,
+    negative_offset: Index,
+) -> (CCS, Vec<RestorationJacobianEntry>) {
     let m = original.nrow;
-    let total_dimension = n + 2 * m;
     let mut col_ptrs = Vec::with_capacity(total_dimension + 1);
     let mut row_indices = Vec::with_capacity(original.nnz() + 2 * m);
     let mut entries = Vec::with_capacity(original.nnz() + 2 * m);
     col_ptrs.push(0);
-    for col in 0..n {
-        for index in original.col_ptrs[col]..original.col_ptrs[col + 1] {
-            row_indices.push(original.row_indices[index]);
-            entries.push(RestorationJacobianEntry::Original(index));
+    for col in 0..total_dimension {
+        if col < original.ncol {
+            for index in original.col_ptrs[col]..original.col_ptrs[col + 1] {
+                row_indices.push(original.row_indices[index]);
+                entries.push(RestorationJacobianEntry::Original(index));
+            }
         }
-        col_ptrs.push(row_indices.len());
-    }
-    for row in 0..m {
-        row_indices.push(row);
-        entries.push(RestorationJacobianEntry::PositiveResidual);
-        col_ptrs.push(row_indices.len());
-    }
-    for row in 0..m {
-        row_indices.push(row);
-        entries.push(RestorationJacobianEntry::NegativeResidual);
+        if (positive_offset..positive_offset + m).contains(&col) {
+            row_indices.push(col - positive_offset);
+            entries.push(RestorationJacobianEntry::PositiveResidual);
+        }
+        if (negative_offset..negative_offset + m).contains(&col) {
+            row_indices.push(col - negative_offset);
+            entries.push(RestorationJacobianEntry::NegativeResidual);
+        }
         col_ptrs.push(row_indices.len());
     }
     (CCS::new(m, total_dimension, col_ptrs, row_indices), entries)
@@ -1547,50 +1749,401 @@ fn build_equality_restoration_hessian_ccs(
 fn equality_restoration_initial_guess(
     x: &[f64],
     equality_values: &[f64],
-    bound_push: f64,
+    inequality_residuals: &[f64],
+    restoration_mu: f64,
+    rho: f64,
 ) -> Vec<f64> {
-    let push = bound_push.max(1.0e-8);
-    let mut restoration_x = Vec::with_capacity(x.len() + 2 * equality_values.len());
+    let mut restoration_x =
+        Vec::with_capacity(x.len() + 2 * equality_values.len() + 2 * inequality_residuals.len());
     restoration_x.extend_from_slice(x);
+    let barrier_shift = restoration_mu / (2.0 * rho);
+    let residual_pair = |value: f64| {
+        let a = barrier_shift - 0.5 * value;
+        let b = value * barrier_shift;
+        let negative = a.mul_add(a, b).sqrt() + a;
+        (negative, value + negative)
+    };
+    let mut negative_residuals = Vec::with_capacity(equality_values.len());
     for &value in equality_values {
-        restoration_x.push(if value < 0.0 { -value + push } else { push });
+        // IpRestoIterateInitializer::SetInitialIterates initializes n_c from
+        // solve_quadratic(a, b), with a=mu/(2*rho)-0.5*c and
+        // b=c*mu/(2*rho), then sets p_c=c+n_c.
+        negative_residuals.push(residual_pair(value).0);
     }
-    for &value in equality_values {
-        restoration_x.push(if value >= 0.0 { value + push } else { push });
+    restoration_x.extend_from_slice(&negative_residuals);
+    for (&value, &negative) in equality_values.iter().zip(negative_residuals.iter()) {
+        restoration_x.push(value + negative);
+    }
+    let mut negative_inequality_residuals = Vec::with_capacity(inequality_residuals.len());
+    for &value in inequality_residuals {
+        negative_inequality_residuals.push(residual_pair(value).0);
+    }
+    restoration_x.extend_from_slice(&negative_inequality_residuals);
+    for (&value, &negative) in inequality_residuals
+        .iter()
+        .zip(negative_inequality_residuals.iter())
+    {
+        restoration_x.push(value + negative);
     }
     restoration_x
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The restoration subproblem launch mirrors IPOPT's outer-state inputs explicitly."
+)]
 fn solve_equality_restoration_problem<P>(
     problem: &P,
     x: &[f64],
     equality_values: &[f64],
+    inequality_residuals: &[f64],
     parameters: &[ParameterMatrix<'_>],
     options: &InteriorPointOptions,
     current_primal_inf: f64,
-) -> Option<InteriorPointSummary>
+    restoration_iteration_offset: Index,
+    restoration_depth: Index,
+    callback: &mut dyn FnMut(&InteriorPointIterationSnapshot) -> bool,
+) -> Option<std::result::Result<InteriorPointSummary, InteriorPointSolveError>>
 where
     P: CompiledNlpProblem,
 {
     let restoration_mu = current_primal_inf.max(options.mu_init).max(1.0e-8);
-    let restoration_problem =
-        EqualityRestorationNlp::new(problem, x, 1.0e3, restoration_mu.sqrt())?;
-    let restoration_x0 = equality_restoration_initial_guess(x, equality_values, options.bound_push);
+    let rho = 1.0e3;
+    let restoration_problem = EqualityRestorationNlp::new(problem, x, rho, restoration_mu.sqrt())?;
+    let restoration_x0 = equality_restoration_initial_guess(
+        x,
+        equality_values,
+        inequality_residuals,
+        restoration_mu,
+        rho,
+    );
     let mut restoration_options = options.clone();
-    restoration_options.restoration_phase = false;
+    // MinC_1NrmRestorationPhase keeps the nested restoration algorithm
+    // available for the first restoration NLP, which is visible as an `R`
+    // branch inside IPOPT's restoration phase. Bound the Rust recursion until
+    // deeper nested launches are proven by a witness.
+    restoration_options.restoration_phase =
+        options.restoration_phase && restoration_depth < 1 && options.max_restoration_iters > 0;
+    // It also clears resto.start_with_resto to avoid immediate recursion on
+    // the first inner iteration.
+    restoration_options.start_with_restoration = false;
     restoration_options.verbose = false;
     restoration_options.linear_debug = None;
-    restoration_options.max_iters = options.max_iters.clamp(10, 30);
+    // MinC_1NrmRestorationPhase raises the restoration filter's default
+    // theta_max_fact unless a resto-prefixed option overrides it.
+    restoration_options.theta_max_fact = 1.0e8;
+    // RestoIterateInitializer::SetInitialIterates constructs the restoration
+    // p/n variables directly from the original residuals, then accepts that
+    // trial point. It does not run DefaultIterateInitializer::push_variables on
+    // the restoration-only lower-bounded variables.
+    restoration_options.bound_push = 0.0;
+    restoration_options.bound_frac = 0.0;
+    // RestoIterateInitializer::InitializeImpl defaults
+    // resto.constr_mult_init_max to zero when no resto-prefixed override is
+    // supplied, avoiding DefaultIterateInitializer::least_square_mults for the
+    // restoration equality multipliers.
+    restoration_options.constr_mult_init_max = 0.0;
+    // MinC_1NrmRestorationPhase seeds the nested IpoptData iter_count with
+    // outer_iter_count + 1, and RestoConvCheck compares that absolute counter
+    // against max_iter. NLIP uses local loop counters, so pass only the
+    // remaining absolute budget into the restoration solve.
+    restoration_options.max_iters = options
+        .max_iters
+        .saturating_sub(restoration_iteration_offset);
     restoration_options.acceptable_iter = 0;
     restoration_options.mu_init = restoration_mu;
     restoration_options.mu_target = 0.0;
-    solve_nlp_interior_point(
+    let mut max_restoration_iters_exceeded = false;
+    let mut max_restoration_iter_count = 0usize;
+    let mut restoration_callback = |snapshot: &InteriorPointIterationSnapshot| {
+        // IpRestoConvCheck::CheckConvergence invokes the user intermediate
+        // callback in RestorationPhaseMode with the restoration NLP's
+        // current iterate vectors.
+        let mut restoration_snapshot = snapshot.clone();
+        restoration_snapshot.phase = InteriorPointIterationPhase::Restoration;
+        // MinC_1NrmRestorationPhase seeds the restoration IpoptData
+        // iteration counter with outer_iter_count + 1 before launching the
+        // nested algorithm.
+        restoration_snapshot.iteration = restoration_iteration_offset + snapshot.iteration;
+        if !callback(&restoration_snapshot) {
+            return false;
+        }
+        // IpRestoConvCheck checks max_resto_iter after the user callback
+        // and after max_iter, then increments successive_resto_iter_.
+        if snapshot.iteration > options.max_restoration_iters {
+            max_restoration_iters_exceeded = true;
+            max_restoration_iter_count = restoration_snapshot.iteration;
+            return false;
+        }
+        true
+    };
+    let result = solve_nlip_interior_point_with_control_callback_at_restoration_depth(
         &restoration_problem,
         &restoration_x0,
         parameters,
         &restoration_options,
-    )
-    .ok()
+        restoration_depth + 1,
+        &mut restoration_callback,
+    );
+    Some(match result {
+        Err(InteriorPointSolveError::UserRequestedStop { context })
+            if max_restoration_iters_exceeded =>
+        {
+            Err(InteriorPointSolveError::MaxIterations {
+                iterations: max_restoration_iter_count,
+                context,
+            })
+        }
+        other => other,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestorationOriginalProgressStatus {
+    Continue,
+    Accept,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+enum IpoptRestorationSubproblemStatus {
+    Success,
+    StopAtTinyStep,
+    StopAtAcceptablePoint,
+    MaxIterationsExceeded,
+    CpuTimeExceeded,
+    WallTimeExceeded,
+    LocalInfeasibility,
+    RestorationFailure,
+    ErrorInStepComputation,
+    UserRequestedStop,
+    InvalidNumberDetected,
+    Unexpected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IpoptRestorationPhaseStatus {
+    AcceptRestoredTrial,
+    FeasiblePointFound,
+    RestorationConvergedToFeasiblePoint,
+    LocallyInfeasible,
+    MaxIterationsExceeded,
+    CpuTimeExceeded,
+    WallTimeExceeded,
+    RestorationFailed,
+    UserRequestedStop,
+    RecoverableFailure,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IpoptRestorationAlgorithmStatus {
+    AcceptRestoredTrial,
+    FeasiblePointFound,
+    LocalInfeasibility,
+    MaxIterationsExceeded,
+    UserRequestedStop,
+    RestorationFailed(InteriorPointRestorationFailureStatus),
+}
+
+fn ipopt_restoration_subproblem_status(
+    summary: &InteriorPointSummary,
+) -> IpoptRestorationSubproblemStatus {
+    match summary.termination {
+        InteriorPointTermination::Converged | InteriorPointTermination::FeasiblePointFound => {
+            IpoptRestorationSubproblemStatus::Success
+        }
+        InteriorPointTermination::Acceptable => {
+            IpoptRestorationSubproblemStatus::StopAtAcceptablePoint
+        }
+    }
+}
+
+fn ipopt_restoration_subproblem_error_status(
+    error: &InteriorPointSolveError,
+) -> Option<IpoptRestorationSubproblemStatus> {
+    match error {
+        InteriorPointSolveError::LinearSolve { .. }
+        | InteriorPointSolveError::LineSearchFailed { .. } => {
+            Some(IpoptRestorationSubproblemStatus::ErrorInStepComputation)
+        }
+        InteriorPointSolveError::RestorationFailed { .. }
+        | InteriorPointSolveError::DivergingIterates { .. } => {
+            Some(IpoptRestorationSubproblemStatus::RestorationFailure)
+        }
+        InteriorPointSolveError::CpuTimeExceeded { .. } => {
+            Some(IpoptRestorationSubproblemStatus::CpuTimeExceeded)
+        }
+        InteriorPointSolveError::WallTimeExceeded { .. } => {
+            Some(IpoptRestorationSubproblemStatus::WallTimeExceeded)
+        }
+        InteriorPointSolveError::UserRequestedStop { .. } => {
+            Some(IpoptRestorationSubproblemStatus::UserRequestedStop)
+        }
+        InteriorPointSolveError::LocalInfeasibility { .. } => {
+            Some(IpoptRestorationSubproblemStatus::LocalInfeasibility)
+        }
+        InteriorPointSolveError::MaxIterations { .. } => {
+            Some(IpoptRestorationSubproblemStatus::MaxIterationsExceeded)
+        }
+        InteriorPointSolveError::InvalidInput(_) => None,
+    }
+}
+
+fn ipopt_min_c_1nrm_restoration_phase_status(
+    square_problem: bool,
+    restoration_status: IpoptRestorationSubproblemStatus,
+    original_primal_inf: f64,
+    constr_viol_tol: f64,
+    resto_failure_feasibility_threshold: f64,
+) -> IpoptRestorationPhaseStatus {
+    match restoration_status {
+        IpoptRestorationSubproblemStatus::Success => {
+            if square_problem && original_primal_inf <= constr_viol_tol {
+                IpoptRestorationPhaseStatus::FeasiblePointFound
+            } else {
+                IpoptRestorationPhaseStatus::AcceptRestoredTrial
+            }
+        }
+        IpoptRestorationSubproblemStatus::StopAtAcceptablePoint
+            if square_problem && original_primal_inf < constr_viol_tol =>
+        {
+            IpoptRestorationPhaseStatus::FeasiblePointFound
+        }
+        IpoptRestorationSubproblemStatus::StopAtTinyStep
+        | IpoptRestorationSubproblemStatus::StopAtAcceptablePoint => {
+            if original_primal_inf <= resto_failure_feasibility_threshold {
+                IpoptRestorationPhaseStatus::RestorationConvergedToFeasiblePoint
+            } else {
+                IpoptRestorationPhaseStatus::LocallyInfeasible
+            }
+        }
+        IpoptRestorationSubproblemStatus::MaxIterationsExceeded => {
+            IpoptRestorationPhaseStatus::MaxIterationsExceeded
+        }
+        IpoptRestorationSubproblemStatus::CpuTimeExceeded => {
+            IpoptRestorationPhaseStatus::CpuTimeExceeded
+        }
+        IpoptRestorationSubproblemStatus::WallTimeExceeded => {
+            IpoptRestorationPhaseStatus::WallTimeExceeded
+        }
+        IpoptRestorationSubproblemStatus::LocalInfeasibility => {
+            IpoptRestorationPhaseStatus::LocallyInfeasible
+        }
+        IpoptRestorationSubproblemStatus::RestorationFailure
+        | IpoptRestorationSubproblemStatus::ErrorInStepComputation => {
+            IpoptRestorationPhaseStatus::RestorationFailed
+        }
+        IpoptRestorationSubproblemStatus::UserRequestedStop => {
+            IpoptRestorationPhaseStatus::UserRequestedStop
+        }
+        IpoptRestorationSubproblemStatus::InvalidNumberDetected
+        | IpoptRestorationSubproblemStatus::Unexpected => {
+            IpoptRestorationPhaseStatus::RecoverableFailure
+        }
+    }
+}
+
+fn ipopt_algorithm_restoration_status(
+    square_problem: bool,
+    restoration_phase_status: IpoptRestorationPhaseStatus,
+) -> IpoptRestorationAlgorithmStatus {
+    match restoration_phase_status {
+        IpoptRestorationPhaseStatus::AcceptRestoredTrial => {
+            IpoptRestorationAlgorithmStatus::AcceptRestoredTrial
+        }
+        IpoptRestorationPhaseStatus::FeasiblePointFound => {
+            IpoptRestorationAlgorithmStatus::FeasiblePointFound
+        }
+        IpoptRestorationPhaseStatus::RestorationConvergedToFeasiblePoint => {
+            if square_problem {
+                IpoptRestorationAlgorithmStatus::FeasiblePointFound
+            } else {
+                IpoptRestorationAlgorithmStatus::RestorationFailed(
+                    InteriorPointRestorationFailureStatus::ConvergedToFeasiblePoint,
+                )
+            }
+        }
+        IpoptRestorationPhaseStatus::LocallyInfeasible => {
+            IpoptRestorationAlgorithmStatus::LocalInfeasibility
+        }
+        IpoptRestorationPhaseStatus::MaxIterationsExceeded => {
+            IpoptRestorationAlgorithmStatus::MaxIterationsExceeded
+        }
+        IpoptRestorationPhaseStatus::CpuTimeExceeded => {
+            IpoptRestorationAlgorithmStatus::RestorationFailed(
+                InteriorPointRestorationFailureStatus::CpuTimeExceeded,
+            )
+        }
+        IpoptRestorationPhaseStatus::WallTimeExceeded => {
+            IpoptRestorationAlgorithmStatus::RestorationFailed(
+                InteriorPointRestorationFailureStatus::WallTimeExceeded,
+            )
+        }
+        IpoptRestorationPhaseStatus::RestorationFailed => {
+            IpoptRestorationAlgorithmStatus::RestorationFailed(
+                InteriorPointRestorationFailureStatus::RestorationFailed,
+            )
+        }
+        IpoptRestorationPhaseStatus::UserRequestedStop => {
+            IpoptRestorationAlgorithmStatus::UserRequestedStop
+        }
+        IpoptRestorationPhaseStatus::RecoverableFailure => {
+            IpoptRestorationAlgorithmStatus::RestorationFailed(
+                InteriorPointRestorationFailureStatus::RecoverableFailure,
+            )
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The restoration return gate mirrors IpRestoConvCheck branch inputs explicitly."
+)]
+fn ipopt_restoration_original_progress_status(
+    first_resto_iter: bool,
+    square_problem: bool,
+    required_infeasibility_reduction: f64,
+    orig_curr_inf_pr: f64,
+    orig_trial_inf_pr: f64,
+    tol: f64,
+    constr_viol_tol: f64,
+    original_filter_entries: &[super::filter::FilterEntry],
+    original_current_filter_entry: &super::filter::FilterEntry,
+    original_trial_filter_entry: &super::filter::FilterEntry,
+    filter_parameters: super::filter::FilterParameters,
+) -> RestorationOriginalProgressStatus {
+    if first_resto_iter {
+        return RestorationOriginalProgressStatus::Continue;
+    }
+
+    if square_problem && orig_trial_inf_pr <= tol.min(constr_viol_tol) {
+        return RestorationOriginalProgressStatus::Accept;
+    }
+
+    let orig_inf_pr_max = if required_infeasibility_reduction == 0.0 {
+        0.0
+    } else {
+        (required_infeasibility_reduction * orig_curr_inf_pr).max(tol.min(constr_viol_tol))
+    };
+    if orig_trial_inf_pr > orig_inf_pr_max {
+        return RestorationOriginalProgressStatus::Continue;
+    }
+
+    let original_progress = super::filter::assess_trial(
+        original_filter_entries,
+        original_current_filter_entry,
+        original_trial_filter_entry,
+        0.0,
+        0.0,
+        false,
+        false,
+        filter_parameters,
+    );
+    if original_progress.filter_acceptable && original_progress.current_iterate_acceptable {
+        RestorationOriginalProgressStatus::Accept
+    } else {
+        RestorationOriginalProgressStatus::Continue
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1736,6 +2289,7 @@ struct ReducedKktSystem<'a> {
     r_ineq: &'a [f64],
     r_slack_stationarity: &'a [f64],
     r_cent: &'a [f64],
+    primal_dual_rhs_scale: f64,
     barrier_parameter: f64,
     kappa_d: f64,
     solver: InteriorPointLinearSolver,
@@ -1780,6 +2334,48 @@ impl<'a> ReducedKktSystem<'a> {
             r_ineq,
             r_slack_stationarity: self.r_slack_stationarity,
             r_cent: self.r_cent,
+            primal_dual_rhs_scale: self.primal_dual_rhs_scale,
+            barrier_parameter: self.barrier_parameter,
+            kappa_d: self.kappa_d,
+            solver: self.solver,
+            regularization: self.regularization,
+            first_hessian_perturbation: self.first_hessian_perturbation,
+            previous_hessian_perturbation: self.previous_hessian_perturbation,
+            regularization_first_growth_factor: self.regularization_first_growth_factor,
+            adaptive_regularization_retries: self.adaptive_regularization_retries,
+            regularization_growth_factor: self.regularization_growth_factor,
+            regularization_decay_factor: self.regularization_decay_factor,
+            regularization_max: self.regularization_max,
+            jacobian_regularization_value: self.jacobian_regularization_value,
+            jacobian_regularization_exponent: self.jacobian_regularization_exponent,
+            forced_jacobian_regularization: self.forced_jacobian_regularization,
+            spral_pivot_method: self.spral_pivot_method,
+            spral_action_on_zero_pivot: self.spral_action_on_zero_pivot,
+            spral_small_pivot_tolerance: self.spral_small_pivot_tolerance,
+            spral_threshold_pivot_u: self.spral_threshold_pivot_u,
+            spral_pivot_tolerance_max: self.spral_pivot_tolerance_max,
+        }
+    }
+
+    fn with_primal_dual_rhs_scale<'b>(&'b self, scale: f64) -> ReducedKktSystem<'b>
+    where
+        'a: 'b,
+    {
+        ReducedKktSystem {
+            hessian: self.hessian,
+            equality_jacobian: self.equality_jacobian,
+            inequality_jacobian: self.inequality_jacobian,
+            bound_diagonal: self.bound_diagonal,
+            bound_rhs: self.bound_rhs,
+            bound_data: self.bound_data,
+            slack: self.slack,
+            multipliers: self.multipliers,
+            r_dual: self.r_dual,
+            r_eq: self.r_eq,
+            r_ineq: self.r_ineq,
+            r_slack_stationarity: self.r_slack_stationarity,
+            r_cent: self.r_cent,
+            primal_dual_rhs_scale: scale,
             barrier_parameter: self.barrier_parameter,
             kappa_d: self.kappa_d,
             solver: self.solver,
@@ -1825,6 +2421,7 @@ impl<'a> ReducedKktSystem<'a> {
             r_ineq: self.r_ineq,
             r_slack_stationarity: self.r_slack_stationarity,
             r_cent: self.r_cent,
+            primal_dual_rhs_scale: self.primal_dual_rhs_scale,
             barrier_parameter: self.barrier_parameter,
             kappa_d: self.kappa_d,
             solver: self.solver,
@@ -1960,6 +2557,119 @@ struct SpralSrcFullSpaceSolution {
     lower_bound_multiplier_step: Vec<f64>,
     upper_bound_multiplier_step: Vec<f64>,
     upper_slack_multiplier_step: Vec<f64>,
+}
+
+struct LeastSquareDualInitialization {
+    lambda_eq: Vec<f64>,
+    lambda_ineq: Vec<f64>,
+    z: Vec<f64>,
+    z_lower: Vec<f64>,
+    z_upper: Vec<f64>,
+}
+
+fn least_square_primal_initialization(
+    state: &EvalState,
+    hessian_structure: &CCS,
+    regularization: f64,
+    solver: InteriorPointLinearSolver,
+) -> Option<Vec<f64>> {
+    let n = state.gradient.len();
+    let meq = state.equality_values.len();
+    let mineq = state.augmented_inequality_values.len();
+    debug_assert_eq!(state.equality_jacobian.ncols(), n);
+    debug_assert_eq!(state.inequality_jacobian.ncols(), n);
+
+    let slack_offset = n;
+    let lambda_offset = slack_offset + mineq;
+    let ineq_offset = lambda_offset + meq;
+    let dimension = ineq_offset + mineq;
+    if dimension == 0 {
+        return Some(Vec::new());
+    }
+
+    let mut rows = Vec::new();
+    let mut cols = Vec::new();
+    let mut values = Vec::new();
+    let mut rhs = vec![0.0; dimension];
+    rhs[lambda_offset..lambda_offset + meq].copy_from_slice(&state.equality_values);
+    rhs[ineq_offset..ineq_offset + mineq].copy_from_slice(&state.augmented_inequality_values);
+
+    // Mirrors IpDefaultIterateInitializer::CalculateLeastSquarePrimals:
+    // StdAugSystemSolver receives IpNLP().uninitialized_h() with W_factor=0,
+    // delta_x=1, delta_s=1, and zero constraint perturbation diagonals.
+    for col in 0..hessian_structure.ncol {
+        for index in hessian_structure.col_ptrs[col]..hessian_structure.col_ptrs[col + 1] {
+            let row = hessian_structure.row_indices[index];
+            rows.push(col.min(row));
+            cols.push(col.max(row));
+            values.push(0.0);
+        }
+    }
+    for diag in 0..n {
+        rows.push(diag);
+        cols.push(diag);
+        values.push(1.0);
+    }
+    for diag in 0..mineq {
+        let index = slack_offset + diag;
+        rows.push(index);
+        cols.push(index);
+        values.push(1.0);
+    }
+    for col in 0..n {
+        for index in state.equality_jacobian.structure.ccs.col_ptrs[col]
+            ..state.equality_jacobian.structure.ccs.col_ptrs[col + 1]
+        {
+            let dual_col = lambda_offset + state.equality_jacobian.structure.ccs.row_indices[index];
+            rows.push(col.min(dual_col));
+            cols.push(col.max(dual_col));
+            values.push(state.equality_jacobian.values[index]);
+        }
+        for index in state.inequality_jacobian.structure.ccs.col_ptrs[col]
+            ..state.inequality_jacobian.structure.ccs.col_ptrs[col + 1]
+        {
+            let dual_col = ineq_offset + state.inequality_jacobian.structure.ccs.row_indices[index];
+            rows.push(col.min(dual_col));
+            cols.push(col.max(dual_col));
+            values.push(state.inequality_jacobian.values[index]);
+        }
+    }
+    for row in 0..mineq {
+        let slack_index = slack_offset + row;
+        let dual_index = ineq_offset + row;
+        rows.push(slack_index.min(dual_index));
+        cols.push(slack_index.max(dual_index));
+        values.push(-1.0);
+    }
+    for row in 0..meq {
+        let index = lambda_offset + row;
+        rows.push(index);
+        cols.push(index);
+        values.push(0.0);
+    }
+    for row in 0..mineq {
+        let index = ineq_offset + row;
+        rows.push(index);
+        cols.push(index);
+        values.push(0.0);
+    }
+
+    let augmented_matrix = CscMatrix::new_from_triplets(dimension, dimension, rows, cols, values);
+    let dsigns = quasidefinite_dsigns(n + mineq, meq + mineq);
+    let solution = try_solve_symmetric_system_with_metrics(
+        solver,
+        &augmented_matrix,
+        &rhs,
+        regularization.max(1e-12),
+        Some(&dsigns),
+        0,
+        1.0,
+        regularization.max(1e-12),
+    )
+    .ok()
+    .map(|(solution, _stats, _regularization_used)| solution)?;
+
+    Some(solution[..n].iter().map(|value| -*value).collect())
 }
 
 #[derive(Clone, Debug)]
@@ -2196,6 +2906,7 @@ impl InteriorPointKktSnapshot {
             r_ineq: &self.r_ineq,
             r_slack_stationarity: &self.r_slack_stationarity,
             r_cent: &self.r_cent,
+            primal_dual_rhs_scale: 1.0,
             barrier_parameter: self.barrier_parameter,
             kappa_d: self.kappa_d,
             solver,
@@ -3181,6 +3892,79 @@ struct EvalState {
     inequality_jacobian: SparseMatrix,
 }
 
+fn eval_state_is_finite(state: &EvalState) -> bool {
+    state.objective_value.is_finite()
+        && state.gradient.iter().all(|value| value.is_finite())
+        && state.equality_values.iter().all(|value| value.is_finite())
+        && state
+            .augmented_inequality_values
+            .iter()
+            .all(|value| value.is_finite())
+        && state
+            .equality_jacobian
+            .values
+            .iter()
+            .all(|value| value.is_finite())
+        && state
+            .inequality_jacobian
+            .values
+            .iter()
+            .all(|value| value.is_finite())
+}
+
+fn evaluation_error_line_search_trial(
+    alpha_pr: f64,
+    alpha_du: f64,
+    slack_positive: bool,
+    multipliers_positive: bool,
+) -> InteriorPointLineSearchTrial {
+    InteriorPointLineSearchTrial {
+        alpha: alpha_pr,
+        alpha_du: Some(alpha_du),
+        slack_positive,
+        multipliers_positive,
+        objective: None,
+        barrier_objective: None,
+        merit: None,
+        eq_inf: None,
+        ineq_inf: None,
+        primal_inf: None,
+        dual_inf: None,
+        comp_inf: None,
+        mu: None,
+        local_filter_acceptable: None,
+        filter_acceptable: None,
+        filter_dominated: None,
+        filter_sufficient_objective_reduction: None,
+        filter_sufficient_violation_reduction: None,
+        switching_condition_satisfied: None,
+    }
+}
+
+fn ipopt_last_rejection_due_to_filter(rejected_trials: &[InteriorPointLineSearchTrial]) -> bool {
+    let mut last_rejection_due_to_filter = false;
+    for trial in rejected_trials {
+        match (
+            trial.local_filter_acceptable,
+            trial.filter_acceptable,
+            trial.objective.is_some(),
+        ) {
+            (Some(true), Some(false), _) => {
+                last_rejection_due_to_filter = true;
+            }
+            (Some(false), _, _) => {
+                last_rejection_due_to_filter = false;
+            }
+            (None, None, false) => {
+                // BacktrackingLineSearch catches Eval_Error without touching
+                // FilterLSAcceptor::last_rejection_due_to_filter_.
+            }
+            _ => {}
+        }
+    }
+    last_rejection_due_to_filter
+}
+
 fn merit_residual(primal_inf: f64, dual_inf: f64, complementarity_inf: f64, mu: f64) -> f64 {
     primal_inf.max(dual_inf).max(complementarity_inf).max(mu)
 }
@@ -3331,10 +4115,11 @@ fn damped_slack_stationarity_residual(system: &ReducedKktSystem<'_>, index: usiz
 }
 
 fn fill_ipopt_augmented_x_rhs(rhs: &mut [f64], system: &ReducedKktSystem<'_>, sign: f64) {
+    let rhs_scale = system.primal_dual_rhs_scale;
     if let Some(bound_data) = system.bound_data {
         rhs.iter_mut()
             .zip(system.r_dual.iter())
-            .for_each(|(rhs_i, r_i)| *rhs_i = sign * *r_i);
+            .for_each(|(rhs_i, r_i)| *rhs_i = sign * rhs_scale * *r_i);
         let damping = system_positive_slack_damping(system);
         // Mirrors IpPDSearchDirCalc.cpp::ComputeSearchDirection followed by
         // IpPDFullSpaceSolver.cpp::SolveOnce: `augRhs_x` starts as
@@ -3351,7 +4136,7 @@ fn fill_ipopt_augmented_x_rhs(rhs: &mut [f64], system: &ReducedKktSystem<'_>, si
                 continue;
             };
             if damping > 0.0 && !bound_data.bounds.upper_indices.contains(&index) {
-                rhs[reduced_index] += sign * damping;
+                rhs[reduced_index] += sign * rhs_scale * damping;
             }
             let slack = native_lower_bound_slack(bound_data.x, index, lower);
             let mut relaxed_complementarity = slack * z_i;
@@ -3369,7 +4154,7 @@ fn fill_ipopt_augmented_x_rhs(rhs: &mut [f64], system: &ReducedKktSystem<'_>, si
                 continue;
             };
             if damping > 0.0 && !bound_data.bounds.lower_indices.contains(&index) {
-                rhs[reduced_index] += sign * -damping;
+                rhs[reduced_index] += sign * rhs_scale * -damping;
             }
             let slack = native_upper_bound_slack(bound_data.x, index, upper);
             let mut relaxed_complementarity = slack * z_i;
@@ -3380,7 +4165,9 @@ fn fill_ipopt_augmented_x_rhs(rhs: &mut [f64], system: &ReducedKktSystem<'_>, si
         rhs.iter_mut()
             .zip(system.r_dual.iter())
             .zip(system.bound_rhs.iter())
-            .for_each(|((rhs_i, r_i), bound_rhs_i)| *rhs_i = sign * (*r_i - *bound_rhs_i));
+            .for_each(|((rhs_i, r_i), bound_rhs_i)| {
+                *rhs_i = sign * (rhs_scale * *r_i - *bound_rhs_i)
+            });
     }
 }
 
@@ -3403,7 +4190,8 @@ fn build_ipopt_augmented_kkt_rhs(
         // rhs.s(), then Pd_U.AddMSinvZ(-1.0, slack_s_U, rhs.v_U(), augRhs_s)
         // applies `rhs_s -= rhs_v / slack`. This avoids the different rounding
         // from the algebraically equivalent `-(rhs_v / slack - rhs_s)`.
-        let mut rhs_s = sign * damped_slack_stationarity_residual(system, row);
+        let mut rhs_s =
+            sign * system.primal_dual_rhs_scale * damped_slack_stationarity_residual(system, row);
         rhs_s -= (sign * system.r_cent[row]) / system.slack[row];
         rhs[pattern.p_offset + row] = rhs_s;
     }
@@ -3897,6 +4685,7 @@ fn watchdog_restore_retry_alpha(
 ) -> f64 {
     match stop_kind {
         WatchdogStopKind::PreLineSearch => stored_alpha_pr,
+        WatchdogStopKind::EvaluationError => stored_alpha_pr * options.line_search_beta,
         WatchdogStopKind::TrialBudget => stored_alpha_pr * options.line_search_beta,
     }
 }
@@ -3993,7 +4782,9 @@ impl InteriorPointDisplayMode {
         let strict =
             interior_point_display_tolerances(options, InteriorPointTermination::Converged);
         match termination {
-            InteriorPointTermination::Converged => Self::Strict(strict),
+            InteriorPointTermination::Converged | InteriorPointTermination::FeasiblePointFound => {
+                Self::Strict(strict)
+            }
             InteriorPointTermination::Acceptable => Self::Acceptable {
                 strict,
                 acceptable: interior_point_display_tolerances(options, termination),
@@ -4021,6 +4812,12 @@ fn interior_point_display_tolerances(
 ) -> InteriorPointDisplayTolerances {
     match termination {
         InteriorPointTermination::Converged => InteriorPointDisplayTolerances {
+            constraint: options.constraint_tol,
+            dual: options.dual_tol,
+            complementarity: options.complementarity_tol,
+            overall: options.overall_tol,
+        },
+        InteriorPointTermination::FeasiblePointFound => InteriorPointDisplayTolerances {
             constraint: options.constraint_tol,
             dual: options.dual_tol,
             complementarity: options.complementarity_tol,
@@ -4469,6 +5266,124 @@ fn native_bound_multiplier_steps(
         })
         .collect::<Vec<_>>();
     (dz_lower, dz_upper)
+}
+
+fn ipopt_restoration_bound_multiplier_step(
+    current_multiplier: f64,
+    current_slack: f64,
+    trial_slack: f64,
+    barrier_parameter: f64,
+) -> f64 {
+    // Mirrors Ipopt::MinC_1NrmRestorationPhase::ComputeBoundMultiplierStep.
+    let mut delta = current_slack;
+    delta -= trial_slack;
+    delta *= current_multiplier;
+    delta += barrier_parameter;
+    delta /= current_slack;
+    delta - current_multiplier
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "IPOPT restoration multiplier reset touches each bound block explicitly."
+)]
+fn ipopt_restoration_bound_multiplier_update(
+    current_x: &[f64],
+    trial_x: &[f64],
+    bounds: &BoundConstraints,
+    current_slack_barrier: &[f64],
+    trial_slack_barrier: &[f64],
+    current_z_lower: &[f64],
+    current_z_upper: &[f64],
+    current_z: &[f64],
+    barrier_parameter: f64,
+    tau: f64,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>, f64, bool) {
+    const BOUND_MULT_RESET_THRESHOLD: f64 = 1.0e3;
+
+    let dz_lower = bounds
+        .lower_indices
+        .iter()
+        .zip(bounds.lower_values.iter())
+        .zip(current_z_lower.iter())
+        .map(|((&index, &lower), &z_i)| {
+            ipopt_restoration_bound_multiplier_step(
+                z_i,
+                native_lower_bound_slack(current_x, index, lower),
+                native_lower_bound_slack(trial_x, index, lower),
+                barrier_parameter,
+            )
+        })
+        .collect::<Vec<_>>();
+    let dz_upper = bounds
+        .upper_indices
+        .iter()
+        .zip(bounds.upper_values.iter())
+        .zip(current_z_upper.iter())
+        .map(|((&index, &upper), &z_i)| {
+            ipopt_restoration_bound_multiplier_step(
+                z_i,
+                native_upper_bound_slack(current_x, index, upper),
+                native_upper_bound_slack(trial_x, index, upper),
+                barrier_parameter,
+            )
+        })
+        .collect::<Vec<_>>();
+    let dz = current_z
+        .iter()
+        .zip(current_slack_barrier.iter())
+        .zip(trial_slack_barrier.iter())
+        .map(|((&z_i, &current_slack), &trial_slack)| {
+            ipopt_restoration_bound_multiplier_step(
+                z_i,
+                current_slack,
+                trial_slack,
+                barrier_parameter,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let alpha_dual = ipopt_dual_fraction_to_boundary_with_limiter(
+        current_z_lower,
+        &dz_lower,
+        current_z_upper,
+        &dz_upper,
+        current_z,
+        &dz,
+        tau,
+    )
+    .0
+    .clamp(0.0, 1.0);
+
+    let mut trial_z_lower = current_z_lower
+        .iter()
+        .zip(dz_lower.iter())
+        .map(|(value, delta)| ipopt_dense_current_plus_step(*value, alpha_dual, *delta))
+        .collect::<Vec<_>>();
+    let mut trial_z_upper = current_z_upper
+        .iter()
+        .zip(dz_upper.iter())
+        .map(|(value, delta)| ipopt_dense_current_plus_step(*value, alpha_dual, *delta))
+        .collect::<Vec<_>>();
+    let mut trial_z = current_z
+        .iter()
+        .zip(dz.iter())
+        .map(|(value, delta)| ipopt_dense_current_plus_step(*value, alpha_dual, *delta))
+        .collect::<Vec<_>>();
+
+    let bound_mult_max = trial_z_lower
+        .iter()
+        .chain(trial_z_upper.iter())
+        .chain(trial_z.iter())
+        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    let reset = bound_mult_max > BOUND_MULT_RESET_THRESHOLD;
+    if reset {
+        trial_z_lower.fill(1.0);
+        trial_z_upper.fill(1.0);
+        trial_z.fill(1.0);
+    }
+
+    (trial_z_lower, trial_z_upper, trial_z, alpha_dual, reset)
 }
 
 fn interior_point_direction_diagnostics(
@@ -5750,6 +6665,183 @@ fn least_squares_constraint_multipliers(
             (vec![0.0; meq], vec![0.0; mineq])
         }
     }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "IPOPT dual initializer maps every multiplier block explicitly."
+)]
+fn least_square_dual_initialization(
+    state: &EvalState,
+    bounds: &BoundConstraints,
+    fixed_variables: &FixedVariableElimination,
+    trial_z: &[f64],
+    trial_z_lower: &[f64],
+    trial_z_upper: &[f64],
+    hessian_structure: &CCS,
+    regularization: f64,
+    solver: InteriorPointLinearSolver,
+) -> Option<LeastSquareDualInitialization> {
+    let n = state.gradient.len();
+    let meq = state.equality_values.len();
+    let mineq = state.augmented_inequality_values.len();
+    debug_assert_eq!(state.equality_jacobian.ncols(), n);
+    debug_assert_eq!(state.inequality_jacobian.ncols(), n);
+    debug_assert_eq!(trial_z.len(), mineq);
+    debug_assert_eq!(trial_z_lower.len(), bounds.lower_indices.len());
+    debug_assert_eq!(trial_z_upper.len(), bounds.upper_indices.len());
+
+    let p_offset = n;
+    let lambda_offset = p_offset + mineq;
+    let z_offset = lambda_offset + meq;
+    let dimension = z_offset + mineq;
+    if dimension == 0 {
+        return Some(LeastSquareDualInitialization {
+            lambda_eq: Vec::new(),
+            lambda_ineq: Vec::new(),
+            z: Vec::new(),
+            z_lower: Vec::new(),
+            z_upper: Vec::new(),
+        });
+    }
+
+    let mut x_diagonal = vec![0.0; n];
+    for &index in &bounds.lower_indices {
+        if let Some(reduced_index) = fixed_variables.free_position[index] {
+            x_diagonal[reduced_index] -= 1.0;
+        }
+    }
+    for &index in &bounds.upper_indices {
+        if let Some(reduced_index) = fixed_variables.free_position[index] {
+            x_diagonal[reduced_index] -= 1.0;
+        }
+    }
+
+    let mut rows = Vec::new();
+    let mut cols = Vec::new();
+    let mut values = Vec::new();
+    let mut rhs = vec![0.0; dimension];
+    rhs[..n].copy_from_slice(&state.gradient);
+
+    // Mirrors IpDefaultIterateInitializer::CalculateLeastSquareDuals:
+    // StdAugSystemSolver receives IpNLP().uninitialized_h() with W_factor=0,
+    // so Hessian structure is present but contributes zero numerically.
+    for col in 0..hessian_structure.ncol {
+        for index in hessian_structure.col_ptrs[col]..hessian_structure.col_ptrs[col + 1] {
+            let row = hessian_structure.row_indices[index];
+            rows.push(col.min(row));
+            cols.push(col.max(row));
+            values.push(0.0);
+        }
+    }
+    for (diag, &value) in x_diagonal.iter().enumerate() {
+        rows.push(diag);
+        cols.push(diag);
+        values.push(value);
+    }
+    for diag in 0..mineq {
+        let index = p_offset + diag;
+        rows.push(index);
+        cols.push(index);
+        // NLIP stores inequality slacks in IPOPT's upper-bound convention, so
+        // Ds is exactly -Pd_U*ones for every internal inequality slack.
+        values.push(-1.0);
+    }
+    for col in 0..n {
+        for index in state.equality_jacobian.structure.ccs.col_ptrs[col]
+            ..state.equality_jacobian.structure.ccs.col_ptrs[col + 1]
+        {
+            let dual_col = lambda_offset + state.equality_jacobian.structure.ccs.row_indices[index];
+            rows.push(col.min(dual_col));
+            cols.push(col.max(dual_col));
+            values.push(state.equality_jacobian.values[index]);
+        }
+        for index in state.inequality_jacobian.structure.ccs.col_ptrs[col]
+            ..state.inequality_jacobian.structure.ccs.col_ptrs[col + 1]
+        {
+            let dual_col = z_offset + state.inequality_jacobian.structure.ccs.row_indices[index];
+            rows.push(col.min(dual_col));
+            cols.push(col.max(dual_col));
+            values.push(state.inequality_jacobian.values[index]);
+        }
+    }
+    for row in 0..mineq {
+        let slack_index = p_offset + row;
+        let dual_index = z_offset + row;
+        rows.push(slack_index.min(dual_index));
+        cols.push(slack_index.max(dual_index));
+        values.push(-1.0);
+    }
+    for row in 0..meq {
+        let index = lambda_offset + row;
+        rows.push(index);
+        cols.push(index);
+        values.push(0.0);
+    }
+    for row in 0..mineq {
+        let index = z_offset + row;
+        rows.push(index);
+        cols.push(index);
+        values.push(0.0);
+    }
+
+    let augmented_matrix = CscMatrix::new_from_triplets(dimension, dimension, rows, cols, values);
+    let solution = try_solve_symmetric_system_with_metrics(
+        solver,
+        &augmented_matrix,
+        &rhs,
+        regularization.max(1e-12),
+        None,
+        0,
+        1.0,
+        regularization.max(1e-12),
+    )
+    .ok()
+    .map(|(solution, _stats, _regularization_used)| solution)?;
+
+    let sol_x = &solution[..n];
+    let sol_s = &solution[p_offset..p_offset + mineq];
+    let lambda_eq = solution[lambda_offset..lambda_offset + meq]
+        .iter()
+        .map(|value| -*value)
+        .collect::<Vec<_>>();
+    let lambda_ineq = solution[z_offset..z_offset + mineq]
+        .iter()
+        .map(|value| -*value)
+        .collect::<Vec<_>>();
+    let z_lower = bounds
+        .lower_indices
+        .iter()
+        .zip(trial_z_lower.iter())
+        .map(|(&index, &trial)| {
+            fixed_variables.free_position[index]
+                .map(|reduced_index| (-sol_x[reduced_index]).max(trial))
+                .unwrap_or(trial)
+        })
+        .collect::<Vec<_>>();
+    let z_upper = bounds
+        .upper_indices
+        .iter()
+        .zip(trial_z_upper.iter())
+        .map(|(&index, &trial)| {
+            fixed_variables.free_position[index]
+                .map(|reduced_index| sol_x[reduced_index].max(trial))
+                .unwrap_or(trial)
+        })
+        .collect::<Vec<_>>();
+    let z = sol_s
+        .iter()
+        .zip(trial_z.iter())
+        .map(|(&candidate, &trial)| candidate.max(trial))
+        .collect::<Vec<_>>();
+
+    Some(LeastSquareDualInitialization {
+        lambda_eq,
+        lambda_ineq,
+        z,
+        z_lower,
+        z_upper,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -7410,6 +8502,97 @@ fn with_interior_point_failure_profiling(
                 solve_started,
             ),
         },
+        InteriorPointSolveError::RestorationFailed { status, context } => {
+            InteriorPointSolveError::RestorationFailed {
+                status,
+                context: interior_point_failure_context(
+                    final_state.or(context.final_state),
+                    last_accepted_state.or(context.last_accepted_state),
+                    context.failed_linear_solve,
+                    context.failed_line_search,
+                    context.failed_direction_diagnostics,
+                    profiling,
+                    solve_started,
+                ),
+            }
+        }
+        InteriorPointSolveError::LocalInfeasibility { context } => {
+            InteriorPointSolveError::LocalInfeasibility {
+                context: interior_point_failure_context(
+                    final_state.or(context.final_state),
+                    last_accepted_state.or(context.last_accepted_state),
+                    context.failed_linear_solve,
+                    context.failed_line_search,
+                    context.failed_direction_diagnostics,
+                    profiling,
+                    solve_started,
+                ),
+            }
+        }
+        InteriorPointSolveError::DivergingIterates {
+            max_abs_x,
+            threshold,
+            context,
+        } => InteriorPointSolveError::DivergingIterates {
+            max_abs_x,
+            threshold,
+            context: interior_point_failure_context(
+                final_state.or(context.final_state),
+                last_accepted_state.or(context.last_accepted_state),
+                context.failed_linear_solve,
+                context.failed_line_search,
+                context.failed_direction_diagnostics,
+                profiling,
+                solve_started,
+            ),
+        },
+        InteriorPointSolveError::CpuTimeExceeded {
+            elapsed_seconds,
+            limit_seconds,
+            context,
+        } => InteriorPointSolveError::CpuTimeExceeded {
+            elapsed_seconds,
+            limit_seconds,
+            context: interior_point_failure_context(
+                final_state.or(context.final_state),
+                last_accepted_state.or(context.last_accepted_state),
+                context.failed_linear_solve,
+                context.failed_line_search,
+                context.failed_direction_diagnostics,
+                profiling,
+                solve_started,
+            ),
+        },
+        InteriorPointSolveError::WallTimeExceeded {
+            elapsed_seconds,
+            limit_seconds,
+            context,
+        } => InteriorPointSolveError::WallTimeExceeded {
+            elapsed_seconds,
+            limit_seconds,
+            context: interior_point_failure_context(
+                final_state.or(context.final_state),
+                last_accepted_state.or(context.last_accepted_state),
+                context.failed_linear_solve,
+                context.failed_line_search,
+                context.failed_direction_diagnostics,
+                profiling,
+                solve_started,
+            ),
+        },
+        InteriorPointSolveError::UserRequestedStop { context } => {
+            InteriorPointSolveError::UserRequestedStop {
+                context: interior_point_failure_context(
+                    final_state.or(context.final_state),
+                    last_accepted_state.or(context.last_accepted_state),
+                    context.failed_linear_solve,
+                    context.failed_line_search,
+                    context.failed_direction_diagnostics,
+                    profiling,
+                    solve_started,
+                ),
+            }
+        }
         InteriorPointSolveError::MaxIterations {
             iterations,
             context,
@@ -9298,6 +10481,7 @@ fn log_interior_point_iteration(
     let iteration_label = match log.phase {
         InteriorPointIterationPhase::Initial => "pre".to_string(),
         InteriorPointIterationPhase::AcceptedStep => log.iteration.to_string(),
+        InteriorPointIterationPhase::Restoration => format!("{}r", log.iteration),
         InteriorPointIterationPhase::Converged => "post".to_string(),
     };
     let row = [
@@ -9442,6 +10626,17 @@ mod tests {
             timing: InteriorPointIterationTiming::default(),
             events: events.into(),
         }
+    }
+
+    fn empty_failure_context() -> Box<InteriorPointFailureContext> {
+        Box::new(InteriorPointFailureContext {
+            final_state: None,
+            last_accepted_state: None,
+            failed_linear_solve: None,
+            failed_line_search: None,
+            failed_direction_diagnostics: None,
+            profiling: InteriorPointProfiling::default(),
+        })
     }
 
     #[test]
@@ -9631,6 +10826,430 @@ mod tests {
 
         assert_eq!(corrected_z[0].to_bits(), 0x3ecd_9dff_f800_0000);
         assert_eq!(direct_endpoint.to_bits(), 0x3ecd_9dff_fa07_9d96);
+    }
+
+    #[test]
+    fn restoration_bound_multiplier_step_matches_ipopt_formula() {
+        let mut expected: f64 = 5.0;
+        expected -= 3.0;
+        expected *= 2.0;
+        expected += 0.1;
+        expected /= 5.0;
+        expected -= 2.0;
+
+        let step = ipopt_restoration_bound_multiplier_step(2.0, 5.0, 3.0, 0.1);
+
+        assert_eq!(step.to_bits(), expected.to_bits());
+    }
+
+    #[test]
+    fn restoration_bound_multiplier_update_uses_dual_fraction_and_reset_threshold() {
+        let bounds = BoundConstraints {
+            lower_indices: vec![0],
+            lower_values: vec![0.0],
+            upper_indices: vec![1],
+            upper_values: vec![10.0],
+        };
+        let (z_lower, z_upper, z, alpha_dual, reset) = ipopt_restoration_bound_multiplier_update(
+            &[2.0, 8.0],
+            &[3.0, 7.0],
+            &bounds,
+            &[4.0],
+            &[2.0],
+            &[2.0],
+            &[3.0],
+            &[5.0],
+            0.1,
+            0.99,
+        );
+        let expected_dz_lower = ipopt_restoration_bound_multiplier_step(2.0, 2.0, 3.0, 0.1);
+        let expected_dz_upper = ipopt_restoration_bound_multiplier_step(3.0, 2.0, 3.0, 0.1);
+        let expected_dz = ipopt_restoration_bound_multiplier_step(5.0, 4.0, 2.0, 0.1);
+        let expected_alpha = ipopt_dual_fraction_to_boundary_with_limiter(
+            &[2.0],
+            &[expected_dz_lower],
+            &[3.0],
+            &[expected_dz_upper],
+            &[5.0],
+            &[expected_dz],
+            0.99,
+        )
+        .0;
+
+        assert!(!reset);
+        assert_eq!(alpha_dual.to_bits(), expected_alpha.to_bits());
+        assert_eq!(
+            z_lower[0].to_bits(),
+            ipopt_dense_current_plus_step(2.0, expected_alpha, expected_dz_lower).to_bits()
+        );
+        assert_eq!(
+            z_upper[0].to_bits(),
+            ipopt_dense_current_plus_step(3.0, expected_alpha, expected_dz_upper).to_bits()
+        );
+        assert_eq!(
+            z[0].to_bits(),
+            ipopt_dense_current_plus_step(5.0, expected_alpha, expected_dz).to_bits()
+        );
+
+        let (_, _, reset_z, _, reset) = ipopt_restoration_bound_multiplier_update(
+            &[],
+            &[],
+            &BoundConstraints::default(),
+            &[1.0],
+            &[0.5],
+            &[],
+            &[],
+            &[1.5e3],
+            1.5e3,
+            0.99,
+        );
+        assert!(reset);
+        assert_eq!(reset_z, vec![1.0]);
+    }
+
+    fn restoration_filter_parameters() -> crate::filter::FilterParameters {
+        crate::filter::FilterParameters {
+            gamma_phi: 1.0e-8,
+            gamma_theta: 1.0e-5,
+            eta_phi: 1.0e-8,
+            theta_max: 1.0e4,
+        }
+    }
+
+    #[test]
+    fn restoration_original_progress_gate_keeps_ipopt_first_iter_and_reduction_order() {
+        let current = crate::filter::entry(10.0, 10.0);
+        let acceptable_trial = crate::filter::entry(9.0, 9.0);
+
+        assert_eq!(
+            ipopt_restoration_original_progress_status(
+                true,
+                false,
+                0.9,
+                10.0,
+                1.0,
+                1.0e-6,
+                1.0e-6,
+                &[],
+                &current,
+                &acceptable_trial,
+                restoration_filter_parameters(),
+            ),
+            RestorationOriginalProgressStatus::Continue
+        );
+        assert_eq!(
+            ipopt_restoration_original_progress_status(
+                false,
+                false,
+                0.9,
+                10.0,
+                9.0_f64.next_up(),
+                1.0e-6,
+                1.0e-6,
+                &[],
+                &current,
+                &acceptable_trial,
+                restoration_filter_parameters(),
+            ),
+            RestorationOriginalProgressStatus::Continue
+        );
+        assert_eq!(
+            ipopt_restoration_original_progress_status(
+                false,
+                false,
+                0.9,
+                10.0,
+                9.0,
+                1.0e-6,
+                1.0e-6,
+                &[],
+                &current,
+                &acceptable_trial,
+                restoration_filter_parameters(),
+            ),
+            RestorationOriginalProgressStatus::Accept
+        );
+    }
+
+    #[test]
+    fn restoration_original_progress_gate_keeps_square_and_filter_branches() {
+        let current = crate::filter::entry(10.0, 10.0);
+        let dominated_trial = crate::filter::entry(11.0, 1.0);
+        let dominating_filter_entry = crate::filter::entry(10.5, 0.5);
+
+        assert_eq!(
+            ipopt_restoration_original_progress_status(
+                false,
+                true,
+                0.0,
+                10.0,
+                1.0e-7,
+                1.0e-6,
+                1.0e-6,
+                std::slice::from_ref(&dominating_filter_entry),
+                &current,
+                &dominated_trial,
+                restoration_filter_parameters(),
+            ),
+            RestorationOriginalProgressStatus::Accept
+        );
+        assert_eq!(
+            ipopt_restoration_original_progress_status(
+                false,
+                false,
+                0.9,
+                10.0,
+                1.0,
+                1.0e-6,
+                1.0e-6,
+                &[dominating_filter_entry],
+                &current,
+                &dominated_trial,
+                restoration_filter_parameters(),
+            ),
+            RestorationOriginalProgressStatus::Continue
+        );
+    }
+
+    #[test]
+    fn restoration_phase_status_mapping_matches_ipopt_min_c_1nrm() {
+        assert_eq!(
+            ipopt_min_c_1nrm_restoration_phase_status(
+                true,
+                IpoptRestorationSubproblemStatus::Success,
+                1.0e-6,
+                1.0e-6,
+                1.0e-4,
+            ),
+            IpoptRestorationPhaseStatus::FeasiblePointFound
+        );
+        assert_eq!(
+            ipopt_min_c_1nrm_restoration_phase_status(
+                true,
+                IpoptRestorationSubproblemStatus::StopAtAcceptablePoint,
+                1.0e-6,
+                1.0e-6,
+                1.0e-4,
+            ),
+            IpoptRestorationPhaseStatus::RestorationConvergedToFeasiblePoint
+        );
+        assert_eq!(
+            ipopt_min_c_1nrm_restoration_phase_status(
+                true,
+                IpoptRestorationSubproblemStatus::StopAtAcceptablePoint,
+                1.0e-6_f64.next_down(),
+                1.0e-6,
+                1.0e-4,
+            ),
+            IpoptRestorationPhaseStatus::FeasiblePointFound
+        );
+        assert_eq!(
+            ipopt_min_c_1nrm_restoration_phase_status(
+                false,
+                IpoptRestorationSubproblemStatus::StopAtTinyStep,
+                1.0e-5,
+                1.0e-6,
+                1.0e-4,
+            ),
+            IpoptRestorationPhaseStatus::RestorationConvergedToFeasiblePoint
+        );
+        assert_eq!(
+            ipopt_min_c_1nrm_restoration_phase_status(
+                false,
+                IpoptRestorationSubproblemStatus::StopAtTinyStep,
+                1.0e-3,
+                1.0e-6,
+                1.0e-4,
+            ),
+            IpoptRestorationPhaseStatus::LocallyInfeasible
+        );
+        assert_eq!(
+            ipopt_min_c_1nrm_restoration_phase_status(
+                false,
+                IpoptRestorationSubproblemStatus::ErrorInStepComputation,
+                1.0e-5,
+                1.0e-6,
+                1.0e-4,
+            ),
+            IpoptRestorationPhaseStatus::RestorationFailed
+        );
+        assert_eq!(
+            ipopt_min_c_1nrm_restoration_phase_status(
+                false,
+                IpoptRestorationSubproblemStatus::UserRequestedStop,
+                1.0e-5,
+                1.0e-6,
+                1.0e-4,
+            ),
+            IpoptRestorationPhaseStatus::UserRequestedStop
+        );
+        assert_eq!(
+            ipopt_min_c_1nrm_restoration_phase_status(
+                false,
+                IpoptRestorationSubproblemStatus::InvalidNumberDetected,
+                1.0e-5,
+                1.0e-6,
+                1.0e-4,
+            ),
+            IpoptRestorationPhaseStatus::RecoverableFailure
+        );
+    }
+
+    #[test]
+    fn restoration_algorithm_status_mapping_matches_ipopt_alg_catches() {
+        assert_eq!(
+            ipopt_algorithm_restoration_status(
+                false,
+                IpoptRestorationPhaseStatus::AcceptRestoredTrial,
+            ),
+            IpoptRestorationAlgorithmStatus::AcceptRestoredTrial
+        );
+        assert_eq!(
+            ipopt_algorithm_restoration_status(
+                false,
+                IpoptRestorationPhaseStatus::FeasiblePointFound
+            ),
+            IpoptRestorationAlgorithmStatus::FeasiblePointFound
+        );
+        assert_eq!(
+            ipopt_algorithm_restoration_status(
+                false,
+                IpoptRestorationPhaseStatus::RestorationConvergedToFeasiblePoint,
+            ),
+            IpoptRestorationAlgorithmStatus::RestorationFailed(
+                InteriorPointRestorationFailureStatus::ConvergedToFeasiblePoint,
+            )
+        );
+        assert_eq!(
+            ipopt_algorithm_restoration_status(
+                true,
+                IpoptRestorationPhaseStatus::RestorationConvergedToFeasiblePoint,
+            ),
+            IpoptRestorationAlgorithmStatus::FeasiblePointFound
+        );
+        assert_eq!(
+            ipopt_algorithm_restoration_status(
+                false,
+                IpoptRestorationPhaseStatus::LocallyInfeasible
+            ),
+            IpoptRestorationAlgorithmStatus::LocalInfeasibility
+        );
+        assert_eq!(
+            ipopt_algorithm_restoration_status(
+                false,
+                IpoptRestorationPhaseStatus::MaxIterationsExceeded,
+            ),
+            IpoptRestorationAlgorithmStatus::MaxIterationsExceeded
+        );
+        assert_eq!(
+            ipopt_algorithm_restoration_status(
+                false,
+                IpoptRestorationPhaseStatus::RestorationFailed
+            ),
+            IpoptRestorationAlgorithmStatus::RestorationFailed(
+                InteriorPointRestorationFailureStatus::RestorationFailed,
+            )
+        );
+        assert_eq!(
+            ipopt_algorithm_restoration_status(
+                false,
+                IpoptRestorationPhaseStatus::UserRequestedStop
+            ),
+            IpoptRestorationAlgorithmStatus::UserRequestedStop
+        );
+        assert_eq!(
+            ipopt_algorithm_restoration_status(
+                false,
+                IpoptRestorationPhaseStatus::RecoverableFailure
+            ),
+            IpoptRestorationAlgorithmStatus::RestorationFailed(
+                InteriorPointRestorationFailureStatus::RecoverableFailure,
+            )
+        );
+    }
+
+    #[test]
+    fn restoration_subproblem_error_status_mapping_matches_ipopt_min_c_1nrm() {
+        assert_eq!(
+            ipopt_restoration_subproblem_error_status(&InteriorPointSolveError::LinearSolve {
+                solver: InteriorPointLinearSolver::SpralSrc,
+                context: empty_failure_context(),
+            }),
+            Some(IpoptRestorationSubproblemStatus::ErrorInStepComputation)
+        );
+        assert_eq!(
+            ipopt_restoration_subproblem_error_status(&InteriorPointSolveError::LineSearchFailed {
+                merit: 0.0,
+                mu: 0.0,
+                step_inf_norm: 0.0,
+                context: empty_failure_context(),
+            }),
+            Some(IpoptRestorationSubproblemStatus::ErrorInStepComputation)
+        );
+        assert_eq!(
+            ipopt_restoration_subproblem_error_status(
+                &InteriorPointSolveError::RestorationFailed {
+                    status: InteriorPointRestorationFailureStatus::RestorationFailed,
+                    context: empty_failure_context(),
+                },
+            ),
+            Some(IpoptRestorationSubproblemStatus::RestorationFailure)
+        );
+        assert_eq!(
+            ipopt_restoration_subproblem_error_status(
+                &InteriorPointSolveError::DivergingIterates {
+                    max_abs_x: 2.0,
+                    threshold: 1.0,
+                    context: empty_failure_context(),
+                },
+            ),
+            Some(IpoptRestorationSubproblemStatus::RestorationFailure)
+        );
+        assert_eq!(
+            ipopt_restoration_subproblem_error_status(&InteriorPointSolveError::WallTimeExceeded {
+                elapsed_seconds: 1.0,
+                limit_seconds: 0.5,
+                context: empty_failure_context(),
+            },),
+            Some(IpoptRestorationSubproblemStatus::WallTimeExceeded)
+        );
+        assert_eq!(
+            ipopt_restoration_subproblem_error_status(&InteriorPointSolveError::CpuTimeExceeded {
+                elapsed_seconds: 1.0,
+                limit_seconds: 0.5,
+                context: empty_failure_context(),
+            },),
+            Some(IpoptRestorationSubproblemStatus::CpuTimeExceeded)
+        );
+        assert_eq!(
+            ipopt_restoration_subproblem_error_status(
+                &InteriorPointSolveError::UserRequestedStop {
+                    context: empty_failure_context(),
+                },
+            ),
+            Some(IpoptRestorationSubproblemStatus::UserRequestedStop)
+        );
+        assert_eq!(
+            ipopt_restoration_subproblem_error_status(
+                &InteriorPointSolveError::LocalInfeasibility {
+                    context: empty_failure_context(),
+                },
+            ),
+            Some(IpoptRestorationSubproblemStatus::LocalInfeasibility)
+        );
+        assert_eq!(
+            ipopt_restoration_subproblem_error_status(&InteriorPointSolveError::MaxIterations {
+                iterations: 3,
+                context: empty_failure_context(),
+            }),
+            Some(IpoptRestorationSubproblemStatus::MaxIterationsExceeded)
+        );
+        assert_eq!(
+            ipopt_restoration_subproblem_error_status(&InteriorPointSolveError::InvalidInput(
+                "bad restoration input".into(),
+            )),
+            None
+        );
     }
 
     #[test]
@@ -9889,6 +11508,283 @@ mod tests {
         assert_eq!(pushed, 2.0);
     }
 
+    struct RestorationMockProblem;
+
+    impl CompiledNlpProblem for RestorationMockProblem {
+        fn dimension(&self) -> Index {
+            2
+        }
+
+        fn parameter_count(&self) -> Index {
+            0
+        }
+
+        fn parameter_ccs(&self, _parameter_index: Index) -> &CCS {
+            static EMPTY: std::sync::OnceLock<CCS> = std::sync::OnceLock::new();
+            EMPTY.get_or_init(|| CCS::empty(0, 0))
+        }
+
+        fn equality_count(&self) -> Index {
+            1
+        }
+
+        fn inequality_count(&self) -> Index {
+            1
+        }
+
+        fn objective_value(&self, x: &[f64], _parameters: &[ParameterMatrix<'_>]) -> f64 {
+            if x[0] < 0.0 {
+                return f64::NAN;
+            }
+            x[0] * x[0] + 3.0 * x[1] * x[1]
+        }
+
+        fn objective_gradient(
+            &self,
+            x: &[f64],
+            _parameters: &[ParameterMatrix<'_>],
+            out: &mut [f64],
+        ) {
+            out[0] = 2.0 * x[0];
+            out[1] = 6.0 * x[1];
+        }
+
+        fn equality_jacobian_ccs(&self) -> &CCS {
+            static JAC: std::sync::OnceLock<CCS> = std::sync::OnceLock::new();
+            JAC.get_or_init(|| CCS::new(1, 2, vec![0, 1, 2], vec![0, 0]))
+        }
+
+        fn equality_values(&self, x: &[f64], _parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
+            out[0] = x[0] + 2.0 * x[1] - 3.0;
+        }
+
+        fn equality_jacobian_values(
+            &self,
+            _x: &[f64],
+            _parameters: &[ParameterMatrix<'_>],
+            out: &mut [f64],
+        ) {
+            out.copy_from_slice(&[1.0, 2.0]);
+        }
+
+        fn inequality_jacobian_ccs(&self) -> &CCS {
+            static JAC: std::sync::OnceLock<CCS> = std::sync::OnceLock::new();
+            JAC.get_or_init(|| CCS::new(1, 2, vec![0, 1, 2], vec![0, 0]))
+        }
+
+        fn inequality_values(
+            &self,
+            x: &[f64],
+            _parameters: &[ParameterMatrix<'_>],
+            out: &mut [f64],
+        ) {
+            out[0] = x[0] - x[1] + 1.0;
+        }
+
+        fn inequality_jacobian_values(
+            &self,
+            _x: &[f64],
+            _parameters: &[ParameterMatrix<'_>],
+            out: &mut [f64],
+        ) {
+            out.copy_from_slice(&[1.0, -1.0]);
+        }
+
+        fn lagrangian_hessian_ccs(&self) -> &CCS {
+            static HESSIAN: std::sync::OnceLock<CCS> = std::sync::OnceLock::new();
+            HESSIAN.get_or_init(|| CCS::lower_triangular_dense(2))
+        }
+
+        fn lagrangian_hessian_values(
+            &self,
+            _x: &[f64],
+            _parameters: &[ParameterMatrix<'_>],
+            _equality_multipliers: &[f64],
+            _inequality_multipliers: &[f64],
+            out: &mut [f64],
+        ) {
+            out.copy_from_slice(&[2.0, 0.0, 6.0]);
+        }
+    }
+
+    #[test]
+    fn equality_restoration_initial_guess_matches_ipopt_quadratic_initializer() {
+        let x = [4.0, -2.0];
+        let equality_values = [-3.0, 0.0, 2.0];
+        let inequality_residuals = [1.5, -0.25];
+        let restoration_mu = 0.2;
+        let rho = 1.0e3;
+        let guess = equality_restoration_initial_guess(
+            &x,
+            &equality_values,
+            &inequality_residuals,
+            restoration_mu,
+            rho,
+        );
+
+        assert_eq!(&guess[..x.len()], x.as_slice());
+        let shift = restoration_mu / (2.0 * rho);
+        let assert_residual_pair =
+            |guess: &[f64], residuals: &[f64], negative_offset: usize, positive_offset: usize| {
+                for (row, &constraint_value) in residuals.iter().enumerate() {
+                    let a = shift - 0.5 * constraint_value;
+                    let b = constraint_value * shift;
+                    let expected_negative = a.mul_add(a, b).sqrt() + a;
+                    let negative = guess[negative_offset + row];
+                    let positive = guess[positive_offset + row];
+
+                    assert_eq!(negative.to_bits(), expected_negative.to_bits());
+                    assert_eq!(
+                        positive.to_bits(),
+                        (constraint_value + expected_negative).to_bits()
+                    );
+                    assert!((constraint_value + negative - positive).abs() <= f64::EPSILON);
+                    assert!(negative > 0.0);
+                    assert!(positive > 0.0);
+                }
+            };
+        assert_residual_pair(
+            &guess,
+            &equality_values,
+            x.len(),
+            x.len() + equality_values.len(),
+        );
+        assert_residual_pair(
+            &guess,
+            &inequality_residuals,
+            x.len() + 2 * equality_values.len(),
+            x.len() + 2 * equality_values.len() + inequality_residuals.len(),
+        );
+    }
+
+    #[test]
+    fn restoration_nlp_includes_inequality_residual_blocks() {
+        let problem = RestorationMockProblem;
+        let nlp = EqualityRestorationNlp::new(&problem, &[2.0, -4.0], 1.0e3, 0.25).unwrap();
+
+        assert_eq!(nlp.dimension(), 6);
+        assert_eq!(nlp.equality_count(), 1);
+        assert_eq!(nlp.inequality_count(), 1);
+        assert_eq!(
+            nlp.equality_jacobian_ccs(),
+            &CCS::new(1, 6, vec![0, 1, 2, 3, 4, 4, 4], vec![0, 0, 0, 0])
+        );
+        assert_eq!(
+            nlp.inequality_jacobian_ccs(),
+            &CCS::new(1, 6, vec![0, 1, 2, 2, 2, 3, 4], vec![0, 0, 0, 0])
+        );
+
+        let x = [1.0, 2.0, 0.3, 0.4, 0.5, 0.6];
+        let mut equality_values = vec![0.0; nlp.equality_count()];
+        let mut inequality_values = vec![0.0; nlp.inequality_count()];
+        let mut equality_jacobian_values = vec![0.0; nlp.equality_jacobian_ccs().nnz()];
+        let mut inequality_jacobian_values = vec![0.0; nlp.inequality_jacobian_ccs().nnz()];
+        let mut hessian_values = vec![0.0; nlp.lagrangian_hessian_ccs().nnz()];
+
+        nlp.equality_values(&x, &[], &mut equality_values);
+        nlp.inequality_values(&x, &[], &mut inequality_values);
+        nlp.equality_jacobian_values(&x, &[], &mut equality_jacobian_values);
+        nlp.inequality_jacobian_values(&x, &[], &mut inequality_jacobian_values);
+        nlp.lagrangian_hessian_values(&x, &[], &[7.0], &[11.0], &mut hessian_values);
+
+        assert!((equality_values[0] - 1.9).abs() <= f64::EPSILON);
+        assert!((inequality_values[0] + 0.1).abs() <= f64::EPSILON);
+        assert_eq!(equality_jacobian_values, [1.0, 2.0, 1.0, -1.0]);
+        assert_eq!(inequality_jacobian_values, [1.0, -1.0, 1.0, -1.0]);
+
+        let objective = nlp.objective_value(&x, &[]);
+        assert!((objective - 1800.3125).abs() <= 1.0e-12);
+
+        let mut gradient = vec![0.0; nlp.dimension()];
+        nlp.objective_gradient(&x, &[], &mut gradient);
+        assert_eq!(
+            gradient,
+            [
+                -(0.25 * 0.25),
+                0.25 * (1.0 / 16.0) * 6.0,
+                1.0e3,
+                1.0e3,
+                1.0e3,
+                1.0e3
+            ]
+        );
+
+        assert_eq!(hessian_values, [0.25 * 0.25, 0.0, 0.25 * (1.0 / 16.0)]);
+    }
+
+    #[test]
+    fn restoration_nlp_updates_proximity_weight_from_barrier_parameter() {
+        let problem = RestorationMockProblem;
+        let nlp = EqualityRestorationNlp::new(&problem, &[2.0, -4.0], 1.0e3, 2.0).unwrap();
+        let x = [1.0, 2.0, 0.3, 0.4, 0.5, 0.6];
+
+        assert!((nlp.objective_value(&x, &[]) - 1802.5).abs() <= 1.0e-12);
+
+        nlp.interior_point_set_barrier_parameter(0.25);
+
+        let objective = nlp.objective_value(&x, &[]);
+        assert!((objective - 1800.625).abs() <= 1.0e-12);
+
+        let mut gradient = vec![0.0; nlp.dimension()];
+        nlp.objective_gradient(&x, &[], &mut gradient);
+        assert_eq!(gradient[0], -0.5 * 0.25);
+        assert_eq!(gradient[1], 0.5 * (1.0 / 16.0) * 6.0);
+
+        let mut hessian_values = vec![0.0; nlp.lagrangian_hessian_ccs().nnz()];
+        nlp.lagrangian_hessian_values(&x, &[], &[7.0], &[11.0], &mut hessian_values);
+        assert_eq!(hessian_values, [0.5 * 0.25, 0.0, 0.5 * (1.0 / 16.0)]);
+    }
+
+    #[test]
+    fn restoration_nlp_propagates_original_objective_eval_errors() {
+        let problem = RestorationMockProblem;
+        let nlp = EqualityRestorationNlp::new(&problem, &[2.0, -4.0], 1.0e3, 0.25).unwrap();
+        let x = [-1.0, 2.0, 0.3, 0.4, 0.5, 0.6];
+
+        assert!(nlp.objective_value(&x, &[]).is_nan());
+    }
+
+    #[test]
+    fn filter_rejection_state_survives_eval_error_cutbacks_like_ipopt() {
+        let filter_rejection = InteriorPointLineSearchTrial {
+            alpha: 1.0,
+            alpha_du: Some(1.0),
+            slack_positive: true,
+            multipliers_positive: true,
+            objective: Some(1.0),
+            barrier_objective: Some(1.0),
+            merit: Some(1.0),
+            eq_inf: Some(1.0),
+            ineq_inf: Some(0.0),
+            primal_inf: Some(1.0),
+            dual_inf: Some(1.0),
+            comp_inf: Some(0.0),
+            mu: Some(0.1),
+            local_filter_acceptable: Some(true),
+            filter_acceptable: Some(false),
+            filter_dominated: Some(true),
+            filter_sufficient_objective_reduction: Some(true),
+            filter_sufficient_violation_reduction: Some(false),
+            switching_condition_satisfied: Some(false),
+        };
+        let current_iterate_rejection = InteriorPointLineSearchTrial {
+            local_filter_acceptable: Some(false),
+            filter_acceptable: Some(true),
+            ..filter_rejection.clone()
+        };
+        let eval_error = evaluation_error_line_search_trial(0.5, 0.5, true, true);
+
+        assert!(ipopt_last_rejection_due_to_filter(&[
+            filter_rejection.clone(),
+            eval_error.clone()
+        ]));
+        assert!(!ipopt_last_rejection_due_to_filter(&[
+            filter_rejection,
+            eval_error,
+            current_iterate_rejection,
+        ]));
+    }
+
     #[test]
     fn filter_alpha_min_keeps_ipopt_formula_near_feasibility() {
         let options = InteriorPointOptions::default();
@@ -9925,6 +11821,11 @@ mod tests {
         );
         assert_eq!(
             watchdog_restore_retry_alpha(0.8, WatchdogStopKind::TrialBudget, &options).to_bits(),
+            0.2_f64.to_bits()
+        );
+        assert_eq!(
+            watchdog_restore_retry_alpha(0.8, WatchdogStopKind::EvaluationError, &options)
+                .to_bits(),
             0.2_f64.to_bits()
         );
     }
@@ -10241,8 +12142,12 @@ fn log_interior_point_problem_header<P>(
         boxed_line(
             "iteration",
             format!(
-                "max_iters={}  verbose={}",
-                options.max_iters, options.verbose
+                "max_iters={}  diverging_tol={}  max_cpu_time={}  max_wall_time={}  verbose={}",
+                options.max_iters,
+                sci_text(options.diverging_iterates_tol),
+                sci_text(options.max_cpu_time),
+                sci_text(options.max_wall_time),
+                options.verbose
             ),
         ),
     ];
@@ -10553,6 +12458,11 @@ fn log_interior_point_status_summary(
         InteriorPointTermination::Converged => {
             log_boxed_section("Interior-point converged", &lines, style_green_bold)
         }
+        InteriorPointTermination::FeasiblePointFound => log_boxed_section(
+            "Interior-point found feasible point",
+            &lines,
+            style_yellow_bold,
+        ),
         InteriorPointTermination::Acceptable => log_boxed_section(
             "Interior-point reached acceptable level",
             &lines,
@@ -10589,10 +12499,23 @@ fn validate_interior_point_options(
             options.overall_scale_max
         )));
     }
-    if options.least_square_init_duals {
-        return Err(InteriorPointSolveError::InvalidInput(
-            "least_square_init_duals mirrors IPOPT DefaultIterateInitializer::CalculateLeastSquareDuals and is not implemented in NLIP yet".into(),
-        ));
+    if !options.diverging_iterates_tol.is_finite() || options.diverging_iterates_tol < 0.0 {
+        return Err(InteriorPointSolveError::InvalidInput(format!(
+            "diverging_iterates_tol must be finite and non-negative, got {}",
+            options.diverging_iterates_tol
+        )));
+    }
+    if !options.max_cpu_time.is_finite() || options.max_cpu_time <= 0.0 {
+        return Err(InteriorPointSolveError::InvalidInput(format!(
+            "max_cpu_time must be finite and positive, got {}",
+            options.max_cpu_time
+        )));
+    }
+    if !options.max_wall_time.is_finite() || options.max_wall_time <= 0.0 {
+        return Err(InteriorPointSolveError::InvalidInput(format!(
+            "max_wall_time must be finite and positive, got {}",
+            options.max_wall_time
+        )));
     }
     if let Some(linear_debug) = options.linear_debug.as_ref()
         && linear_debug
@@ -10604,6 +12527,26 @@ fn validate_interior_point_options(
         ));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn process_cpu_seconds() -> f64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return 0.0;
+    }
+    let usage = unsafe { usage.assume_init() };
+    timeval_seconds(usage.ru_utime) + timeval_seconds(usage.ru_stime)
+}
+
+#[cfg(not(unix))]
+fn process_cpu_seconds() -> f64 {
+    0.0
+}
+
+#[cfg(unix)]
+fn timeval_seconds(timeval: libc::timeval) -> f64 {
+    timeval.tv_sec as f64 + timeval.tv_usec as f64 * 1.0e-6
 }
 
 pub fn solve_nlp_interior_point<P>(
@@ -10629,7 +12572,47 @@ where
     P: CompiledNlpProblem,
     C: FnMut(&InteriorPointIterationSnapshot),
 {
+    solve_nlp_interior_point_with_control_callback(problem, x0, parameters, options, |snapshot| {
+        callback(snapshot);
+        true
+    })
+}
+
+pub fn solve_nlp_interior_point_with_control_callback<P, C>(
+    problem: &P,
+    x0: &[f64],
+    parameters: &[ParameterMatrix<'_>],
+    options: &InteriorPointOptions,
+    mut callback: C,
+) -> std::result::Result<InteriorPointSummary, InteriorPointSolveError>
+where
+    P: CompiledNlpProblem,
+    C: FnMut(&InteriorPointIterationSnapshot) -> bool,
+{
+    solve_nlip_interior_point_with_control_callback_at_restoration_depth(
+        problem,
+        x0,
+        parameters,
+        options,
+        0,
+        &mut callback,
+    )
+}
+
+fn solve_nlip_interior_point_with_control_callback_at_restoration_depth<P, C>(
+    problem: &P,
+    x0: &[f64],
+    parameters: &[ParameterMatrix<'_>],
+    options: &InteriorPointOptions,
+    restoration_depth: Index,
+    callback: &mut C,
+) -> std::result::Result<InteriorPointSummary, InteriorPointSolveError>
+where
+    P: CompiledNlpProblem,
+    C: FnMut(&InteriorPointIterationSnapshot) -> bool,
+{
     let solve_started = Instant::now();
+    let solve_started_cpu_seconds = process_cpu_seconds();
     let mut profiling = InteriorPointProfiling {
         backend_timing: problem.backend_timing_metadata(),
         ..InteriorPointProfiling::default()
@@ -10693,7 +12676,9 @@ where
                 native_workspace_error: None,
             });
     let mut x = x0.to_vec();
-    project_initial_point_into_box_interior(&mut x, &bounds, options);
+    if !options.least_square_init_primal {
+        project_initial_point_into_box_interior(&mut x, &bounds, options);
+    }
     fixed_variables.project_fixed_values(&mut x);
     let trial_evaluation_context = TrialEvaluationContext {
         equality_jacobian_structure: &equality_jacobian_structure,
@@ -10711,7 +12696,7 @@ where
 
     let setup_started = Instant::now();
     let mut setup_callback_time = Duration::ZERO;
-    let initial_state = trial_state(
+    let mut initial_state = trial_state(
         problem,
         &x,
         parameters,
@@ -10719,7 +12704,45 @@ where
         &mut profiling,
         &mut setup_callback_time,
     );
-    profiling.preprocessing_steps += 1;
+    let mut preprocessing_steps = 1;
+    if options.least_square_init_primal {
+        let initial_linear_state = EvalState {
+            objective_value: initial_state.objective_value,
+            gradient: fixed_variables.reduce_vector(&initial_state.gradient),
+            equality_values: initial_state.equality_values.clone(),
+            augmented_inequality_values: initial_state.augmented_inequality_values.clone(),
+            equality_jacobian: reduce_sparse_matrix_columns(
+                &initial_state.equality_jacobian,
+                &equality_column_reduction,
+            ),
+            inequality_jacobian: reduce_sparse_matrix_columns(
+                &initial_state.inequality_jacobian,
+                &inequality_column_reduction,
+            ),
+        };
+        if let Some(initial_x) = least_square_primal_initialization(
+            &initial_linear_state,
+            hessian_structure.as_ref(),
+            options.regularization,
+            options.linear_solver,
+        ) {
+            for (&index, &value) in fixed_variables.free_indices.iter().zip(initial_x.iter()) {
+                x[index] = value;
+            }
+        }
+        project_initial_point_into_box_interior(&mut x, &bounds, options);
+        fixed_variables.project_fixed_values(&mut x);
+        initial_state = trial_state(
+            problem,
+            &x,
+            parameters,
+            &trial_evaluation_context,
+            &mut profiling,
+            &mut setup_callback_time,
+        );
+        preprocessing_steps += 1;
+    }
+    profiling.preprocessing_steps += preprocessing_steps;
     profiling.preprocessing_time += setup_started.elapsed().saturating_sub(setup_callback_time);
     initialise_slacks(
         &initial_state.augmented_inequality_values,
@@ -10757,8 +12780,44 @@ where
         }
     }
     let mut lambda_ineq = vec![0.0; augmented_inequality_count];
+    let mut call_least_square_mults = true;
+    if options.least_square_init_duals {
+        let initial_linear_state = EvalState {
+            objective_value: initial_state.objective_value,
+            gradient: fixed_variables.reduce_vector(&initial_state.gradient),
+            equality_values: initial_state.equality_values.clone(),
+            augmented_inequality_values: initial_state.augmented_inequality_values.clone(),
+            equality_jacobian: reduce_sparse_matrix_columns(
+                &initial_state.equality_jacobian,
+                &equality_column_reduction,
+            ),
+            inequality_jacobian: reduce_sparse_matrix_columns(
+                &initial_state.inequality_jacobian,
+                &inequality_column_reduction,
+            ),
+        };
+        if let Some(initial_duals) = least_square_dual_initialization(
+            &initial_linear_state,
+            &bounds,
+            &fixed_variables,
+            &z,
+            &z_lower,
+            &z_upper,
+            hessian_structure.as_ref(),
+            options.regularization,
+            options.linear_solver,
+        ) {
+            lambda_eq = initial_duals.lambda_eq;
+            lambda_ineq = initial_duals.lambda_ineq;
+            z = initial_duals.z;
+            z_lower = initial_duals.z_lower;
+            z_upper = initial_duals.z_upper;
+            call_least_square_mults = false;
+        }
+    }
     let square_equality_problem = equality_count == fixed_variables.reduced_dimension();
-    if !square_equality_problem
+    if call_least_square_mults
+        && !square_equality_problem
         && (equality_count > 0 || augmented_inequality_count > 0)
         && options.constr_mult_init_max > 0.0
     {
@@ -10817,7 +12876,12 @@ where
     let theta_min = options.theta_min_fact * theta_scale;
     let mut barrier_parameter_value =
         initial_monotone_barrier_parameter(barrier_pair_count > 0, options);
+    problem.interior_point_set_barrier_parameter(barrier_parameter_value);
     let mut watchdog_state = InteriorPointWatchdogState::default();
+    let mut expect_infeasible_problem = options.expect_infeasible_problem;
+    let mut in_soft_restoration_phase = false;
+    let mut soft_restoration_counter = 0usize;
+    let mut restoration_call_count = 0usize;
     let mut monotone_mu_update_initialized = false;
     let mut pending_iteration_events = Vec::new();
 
@@ -10997,7 +13061,19 @@ where
             events: vec![InteriorPointIterationEvent::MaxIterationsReached],
         };
         snapshots.push(snapshot.clone());
-        callback(&snapshot);
+        if !callback(&snapshot) {
+            return Err(InteriorPointSolveError::UserRequestedStop {
+                context: interior_point_failure_context(
+                    Some(snapshot),
+                    last_accepted_state.clone(),
+                    None,
+                    None,
+                    None,
+                    &profiling,
+                    solve_started,
+                ),
+            });
+        }
         if options.verbose {
             let flags = InteriorPointIterationLogFlags {
                 has_equalities: equality_count > 0,
@@ -11057,6 +13133,7 @@ where
         let mut iteration_callback_time = Duration::ZERO;
         let mut iteration_kkt_assembly_time = Duration::ZERO;
         let mut iteration_linear_solve_time = Duration::ZERO;
+        problem.interior_point_set_barrier_parameter(barrier_parameter_value);
         let state = trial_state(
             problem,
             &x,
@@ -11455,7 +13532,19 @@ where
                 events: iteration_events.clone(),
             };
             snapshots.push(snapshot.clone());
-            callback(&snapshot);
+            if !callback(&snapshot) {
+                return Err(InteriorPointSolveError::UserRequestedStop {
+                    context: interior_point_failure_context(
+                        Some(snapshot),
+                        last_accepted_state.clone(),
+                        None,
+                        None,
+                        None,
+                        &profiling,
+                        solve_started,
+                    ),
+                });
+            }
             let summary = InteriorPointSummary {
                 x,
                 equality_multipliers: lambda_eq,
@@ -11473,10 +13562,7 @@ where
                 overall_inf_norm: overall_inf,
                 barrier_parameter: barrier_parameter_value,
                 termination,
-                status_kind: match termination {
-                    InteriorPointTermination::Converged => InteriorPointStatusKind::Success,
-                    InteriorPointTermination::Acceptable => InteriorPointStatusKind::Warning,
-                },
+                status_kind: interior_point_status_kind_for_termination(termination),
                 snapshots,
                 final_state: snapshot.clone(),
                 last_accepted_state: last_accepted_state.clone(),
@@ -11524,6 +13610,67 @@ where
             }
             return Ok(summary);
         }
+        let max_abs_x = fixed_variables.free_inf_norm(&x);
+        if max_abs_x > options.diverging_iterates_tol {
+            return Err(InteriorPointSolveError::DivergingIterates {
+                max_abs_x,
+                threshold: options.diverging_iterates_tol,
+                context: interior_point_failure_context(
+                    Some(snapshot_with_nlip_events(
+                        current_snapshot.clone(),
+                        &iteration_events,
+                    )),
+                    last_accepted_state.clone(),
+                    None,
+                    None,
+                    None,
+                    &profiling,
+                    solve_started,
+                ),
+            });
+        }
+        if options.max_cpu_time < 1e20 {
+            let elapsed_seconds = process_cpu_seconds() - solve_started_cpu_seconds;
+            if elapsed_seconds >= options.max_cpu_time {
+                return Err(InteriorPointSolveError::CpuTimeExceeded {
+                    elapsed_seconds,
+                    limit_seconds: options.max_cpu_time,
+                    context: interior_point_failure_context(
+                        Some(snapshot_with_nlip_events(
+                            current_snapshot.clone(),
+                            &iteration_events,
+                        )),
+                        last_accepted_state.clone(),
+                        None,
+                        None,
+                        None,
+                        &profiling,
+                        solve_started,
+                    ),
+                });
+            }
+        }
+        if options.max_wall_time < 1e20 {
+            let elapsed_seconds = solve_started.elapsed().as_secs_f64();
+            if elapsed_seconds >= options.max_wall_time {
+                return Err(InteriorPointSolveError::WallTimeExceeded {
+                    elapsed_seconds,
+                    limit_seconds: options.max_wall_time,
+                    context: interior_point_failure_context(
+                        Some(snapshot_with_nlip_events(
+                            current_snapshot.clone(),
+                            &iteration_events,
+                        )),
+                        last_accepted_state.clone(),
+                        None,
+                        None,
+                        None,
+                        &profiling,
+                        solve_started,
+                    ),
+                });
+            }
+        }
         last_objective_value = state.objective_value;
 
         if barrier_pair_count > 0 {
@@ -11562,9 +13709,12 @@ where
                 // the subsequent FindAcceptableTrialPoint mu check clears the
                 // watchdog counters before trial search starts.
                 barrier_parameter_value = next_barrier_parameter_value;
+                problem.interior_point_set_barrier_parameter(barrier_parameter_value);
                 filter_entries.clear();
                 successive_filter_rejections = 0;
                 watchdog_state = InteriorPointWatchdogState::default();
+                in_soft_restoration_phase = false;
+                soft_restoration_counter = 0;
                 push_unique_nlip_event(
                     &mut iteration_events,
                     InteriorPointIterationEvent::BarrierParameterUpdated,
@@ -11705,6 +13855,7 @@ where
             r_ineq: &inequality_residual,
             r_slack_stationarity: &slack_stationarity_residual,
             r_cent: &r_cent,
+            primal_dual_rhs_scale: 1.0,
             barrier_parameter: barrier_parameter_value,
             kappa_d: options.kappa_d,
             solver: options.linear_solver,
@@ -11801,6 +13952,8 @@ where
                 .as_ref()
                 .is_some_and(|linear_debug| linear_debug.dump_dir.is_some()),
         );
+        let mut emergency_restoration = false;
+        let mut emergency_failed_linear_solve = None;
         let mut direction = match solve_result {
             Ok(mut direction) => {
                 current_snapshot.linear_solver = direction.solver_used;
@@ -11879,16 +14032,56 @@ where
                         error = with_linear_debug_report(error, report);
                     }
                 }
-                return Err(with_interior_point_failure_profiling(
-                    error,
-                    Some(snapshot_with_nlip_events(
-                        current_snapshot.clone(),
-                        &iteration_events,
-                    )),
-                    last_accepted_state.clone(),
-                    &profiling,
-                    solve_started,
-                ));
+                if options.restoration_phase && equality_count + augmented_inequality_count > 0 {
+                    // IpoptAlgorithm::Optimize treats a failed
+                    // ComputeSearchDirection as emergency mode.  If the
+                    // backtracking line search has constraints and a
+                    // restoration phase, ActivateFallbackMechanism installs a
+                    // zero delta and jumps directly to restoration instead of
+                    // returning ERROR_IN_STEP_COMPUTATION.
+                    if let InteriorPointSolveError::LinearSolve { solver, context } = &error {
+                        current_snapshot.linear_solver = *solver;
+                        emergency_failed_linear_solve = context.failed_linear_solve.clone();
+                    }
+                    emergency_restoration = true;
+                    NewtonDirection {
+                        dx: vec![0.0; fixed_variables.reduced_dimension()],
+                        d_lambda: vec![0.0; equality_count],
+                        d_ineq: vec![0.0; augmented_inequality_count],
+                        ds: vec![0.0; augmented_inequality_count],
+                        dz: vec![0.0; barrier_pair_count],
+                        dz_lower: vec![0.0; bounds.lower_indices.len()],
+                        dz_upper: vec![0.0; bounds.upper_indices.len()],
+                        solver_used: preferred_solver,
+                        regularization_used: kkt_regularization,
+                        dual_regularization_used: 0.0,
+                        primal_diagonal_shift_used: 0.0,
+                        linear_solution: Vec::new(),
+                        linear_trace: None,
+                        backend_stats: LinearBackendRunStats {
+                            solver: preferred_solver,
+                            factorization_time: Duration::ZERO,
+                            solve_time: Duration::ZERO,
+                            reused_symbolic: None,
+                            inertia: None,
+                            residual_inf: 0.0,
+                            solution_inf: 0.0,
+                            detail: Some("emergency_restoration".to_string()),
+                        },
+                        linear_debug: current_snapshot.linear_debug.clone(),
+                    }
+                } else {
+                    return Err(with_interior_point_failure_profiling(
+                        error,
+                        Some(snapshot_with_nlip_events(
+                            current_snapshot.clone(),
+                            &iteration_events,
+                        )),
+                        last_accepted_state.clone(),
+                        &profiling,
+                        solve_started,
+                    ));
+                }
             }
         };
         direction.dx = fixed_variables.expand_direction(&direction.dx);
@@ -11994,7 +14187,30 @@ where
         let mut dual_alpha_limit = alpha_du.clamp(0.0, 1.0);
         let mut alpha = alpha_pr.clamp(0.0, 1.0);
         let mut initial_alpha_y = alpha_for_y(alpha, dual_alpha_limit, &direction, options);
-        if alpha <= 0.0 {
+        let mut goto_restoration = false;
+        if options.start_with_restoration
+            && iteration == 0
+            && options.restoration_phase
+            && equality_count + augmented_inequality_count > 0
+        {
+            // IPOPT BacktrackingLineSearch::FindAcceptableTrialPoint honors
+            // start_with_resto before DetectTinyStep or regular trial
+            // evaluation, and resets the flag after the first line search.
+            goto_restoration = true;
+        }
+        if expect_infeasible_problem
+            && options.restoration_phase
+            && equality_count + augmented_inequality_count > 0
+            && inf_norm(&lambda_eq).max(inf_norm(&lambda_ineq))
+                > options.expect_infeasible_problem_ytol
+        {
+            // IPOPT BacktrackingLineSearch::FindAcceptableTrialPoint enters
+            // restoration early when expect_infeasible_problem is active and
+            // the current constraint multiplier max-norm exceeds ytol.
+            goto_restoration = true;
+        }
+        emergency_restoration |= goto_restoration;
+        if alpha <= 0.0 && !emergency_restoration {
             return Err(InteriorPointSolveError::LineSearchFailed {
                 merit: merit_residual(
                     primal_inf,
@@ -12010,7 +14226,7 @@ where
                         &iteration_events,
                     )),
                     last_accepted_state.clone(),
-                    None,
+                    emergency_failed_linear_solve.clone(),
                     Some(InteriorPointLineSearchInfo {
                         initial_alpha_pr: alpha_pr,
                         initial_alpha_du: Some(alpha_du),
@@ -12073,10 +14289,10 @@ where
             options.kappa_d,
         );
         let mut line_search_base_equality_values = state.equality_values.clone();
+        let mut line_search_base_inequality_residuals = inequality_residual.clone();
         let mut line_search_base_barrier_objective = current_barrier_objective;
         let mut line_search_base_filter_theta = current_theta;
         let mut line_search_base_filter_entry = current_filter_entry.clone();
-        let mut line_search_base_directional_derivative = barrier_directional_derivative;
         let filter_parameters = super::filter::FilterParameters {
             gamma_phi: options.filter_gamma_objective,
             gamma_theta: options.filter_gamma_violation,
@@ -12102,16 +14318,17 @@ where
             is_tiny_ip_step(&x, &slack_barrier, &direction, primal_inf, options);
         let mut watchdog_stop_restore: Option<(WatchdogStoredPoint, WatchdogStopKind)> = None;
         if watchdog_active
-            && tiny_step_detected
+            && (goto_restoration || tiny_step_detected)
             && let Some(stored) = watchdog_state.stored_point.clone()
         {
             // IPOPT BacktrackingLineSearch::FindAcceptableTrialPoint calls
-            // StopWatchDog before the line search when the active watchdog
-            // direction becomes tiny, then retries from watchdog_delta without
-            // skipping the first trial point.
+            // StopWatchDog before the line search when an active watchdog
+            // direction becomes tiny or requests restoration, then retries
+            // from watchdog_delta without skipping the first trial point.
             watchdog_stop_restore = Some((stored, WatchdogStopKind::PreLineSearch));
+            emergency_restoration = false;
         }
-        let tiny_step_unchecked_accept =
+        let mut tiny_step_unchecked_accept =
             !watchdog_active && watchdog_stop_restore.is_none() && tiny_step_detected;
         let tiny_step_barrier_update =
             tiny_step_unchecked_accept && watchdog_state.tiny_step_last_iteration;
@@ -12119,6 +14336,7 @@ where
             && !tiny_step_unchecked_accept
             && options.watchdog_trial_iter_max > 0
             && options.watchdog_shortened_iter_trigger > 0
+            && !expect_infeasible_problem
             && watchdog_state.shortened_step_streak >= options.watchdog_shortened_iter_trigger
         {
             // IPOPT BacktrackingLineSearch::StartWatchDog runs after the new
@@ -12142,6 +14360,7 @@ where
                 direction: direction.clone(),
                 direction_diagnostics: current_direction_diagnostics.clone(),
                 state_equality_values: state.equality_values.clone(),
+                state_inequality_residuals: inequality_residual.clone(),
                 barrier_objective: current_barrier_objective,
                 filter_entry: current_filter_entry.clone(),
                 filter_theta: current_theta,
@@ -12173,7 +14392,10 @@ where
         // IPOPT `BacktrackingLineSearch::DoBacktrackingLineSearch` uses
         // `alpha_primal > alpha_min || n_steps == 0`, so the initial trial is
         // evaluated even when the maximum feasible step is already tiny.
-        while watchdog_stop_restore.is_none() && (alpha > alpha_min || line_search_iterations == 0)
+        while !emergency_restoration
+            && watchdog_stop_restore.is_none()
+            && !in_soft_restoration_phase
+            && (alpha > alpha_min || line_search_iterations == 0)
         {
             let trial_alpha_pr = alpha;
             let trial_alpha_du = dual_alpha_limit;
@@ -12234,6 +14456,14 @@ where
                 || !trial_bounds_positive
                 || !trial_bound_multipliers_positive
             {
+                if tiny_step_unchecked_accept {
+                    // BacktrackingLineSearch::FindAcceptableTrialPoint first
+                    // tries the tiny step unchecked. If that trial cannot be
+                    // evaluated, IPOPT clears the tiny-step flag and enters
+                    // the normal backtracking loop at the same alpha.
+                    tiny_step_unchecked_accept = false;
+                    continue;
+                }
                 rejected_trials.push(InteriorPointLineSearchTrial {
                     alpha: trial_alpha_pr,
                     alpha_du: Some(trial_alpha_du),
@@ -12270,6 +14500,36 @@ where
                 &mut profiling,
                 &mut trial_callback_time,
             );
+            if !eval_state_is_finite(&trial_state) {
+                if tiny_step_unchecked_accept {
+                    // Match the tiny-step precheck: evaluation failure only
+                    // disables the unchecked tiny-step path. The regular line
+                    // search then retries the same alpha and performs the
+                    // normal evaluation-error cutback.
+                    tiny_step_unchecked_accept = false;
+                    continue;
+                }
+                // Mirrors IpBacktrackingLineSearch::DoBacktrackingLineSearch:
+                // an evaluation error rejects the trial, skips SOC, and cuts
+                // alpha.  If the watchdog is active, the outer line search
+                // immediately stops the watchdog and retries from the stored
+                // direction with skip_first_trial_point=true.
+                rejected_trials.push(evaluation_error_line_search_trial(
+                    trial_alpha_pr,
+                    trial_alpha_du,
+                    true,
+                    true,
+                ));
+                if watchdog_active {
+                    if let Some(stored) = watchdog_state.stored_point.clone() {
+                        watchdog_stop_restore = Some((stored, WatchdogStopKind::EvaluationError));
+                    }
+                    break;
+                }
+                alpha *= options.line_search_beta;
+                line_search_iterations += 1;
+                continue;
+            }
             let trial_eq_inf = inf_norm(&trial_state.equality_values);
             let trial_ineq_inf = inequality_upper_bound_inf_norm(
                 &trial_state.augmented_inequality_values,
@@ -12526,6 +14786,7 @@ where
                     watchdog_accepted: false,
                     tiny_step: true,
                     bound_multiplier_corrected,
+                    forced_termination: None,
                 });
                 break;
             }
@@ -12555,13 +14816,34 @@ where
             let filter_acceptance_mode = (!barrier_objective_too_large)
                 .then_some(filter_assessment.acceptance_mode)
                 .flatten();
-            if filter_acceptance_mode.is_some() {
-                let step_kind =
-                    if filter_acceptance_mode == Some(FilterAcceptanceMode::ObjectiveArmijo) {
-                        InteriorPointStepKind::Objective
+            let forced_acceptance = options.accept_every_trial_step
+                || options
+                    .accept_after_max_steps
+                    .is_some_and(|max_steps| line_search_iterations >= max_steps);
+            let accepted_filter_mode = if forced_acceptance {
+                // IPOPT BacktrackingLineSearch::DoBacktrackingLineSearch
+                // bypasses CheckAcceptabilityOfTrialPoint for
+                // accept_every_trial_step/accept_after_max_steps, but still
+                // evaluates the trial and calls FilterLSAcceptor::
+                // UpdateForNextIteration. That method returns `f` only for an
+                // f-type step that satisfies Armijo; otherwise it augments the
+                // filter and returns `h`.
+                Some(
+                    if switching_condition && filter_assessment.objective_armijo_satisfied {
+                        FilterAcceptanceMode::ObjectiveArmijo
                     } else {
-                        InteriorPointStepKind::Feasibility
-                    };
+                        FilterAcceptanceMode::ViolationReduction
+                    },
+                )
+            } else {
+                filter_acceptance_mode
+            };
+            if let Some(filter_acceptance_mode) = accepted_filter_mode {
+                let step_kind = if filter_acceptance_mode == FilterAcceptanceMode::ObjectiveArmijo {
+                    InteriorPointStepKind::Objective
+                } else {
+                    InteriorPointStepKind::Feasibility
+                };
                 let step_tag = if step_kind == InteriorPointStepKind::Feasibility {
                     'h'
                 } else {
@@ -12720,7 +15002,7 @@ where
                             )
                         },
                     ),
-                    filter_acceptance_mode,
+                    filter_acceptance_mode: Some(filter_acceptance_mode),
                     step_kind,
                     step_tag,
                     step_direction: Some(step_direction_snapshot(&direction)),
@@ -12742,7 +15024,14 @@ where
                     watchdog_accepted: watchdog_active,
                     tiny_step: false,
                     bound_multiplier_corrected,
+                    forced_termination: None,
                 });
+                break;
+            }
+            if expect_infeasible_problem && watchdog_state.shortened_step_streak >= 5 {
+                // IPOPT's expect-infeasible shortcut exits regular
+                // backtracking before SOC once enough consecutive shortened
+                // steps suggest infeasibility, sending control to restoration.
                 break;
             }
             if options.second_order_correction
@@ -12790,11 +15079,21 @@ where
 
                     let soc_constraint_kkt_system = reduced_kkt_system
                         .with_constraint_residuals(&soc_eq_residual, &soc_ineq_residual);
-                    let soc_reduced_kkt_system = soc_constraint_kkt_system
-                        .with_forced_perturbations(
-                            direction.primal_diagonal_shift_used,
-                            direction.dual_regularization_used,
-                        );
+                    let soc_scaled_kkt_system = if options.second_order_correction_method
+                        == InteriorPointSecondOrderCorrectionMethod::ScaledPrimalDualRows
+                    {
+                        // IpFilterLSAcceptor::TrySecondOrderCorrection with
+                        // soc_method=1 scales rhs.x and rhs.s by the current
+                        // SOC alpha before PDFullSpaceSolver adds the
+                        // complementarity rows to the augmented RHS.
+                        soc_constraint_kkt_system.with_primal_dual_rhs_scale(soc_alpha_pr)
+                    } else {
+                        soc_constraint_kkt_system
+                    };
+                    let soc_reduced_kkt_system = soc_scaled_kkt_system.with_forced_perturbations(
+                        direction.primal_diagonal_shift_used,
+                        direction.dual_regularization_used,
+                    );
                     let soc_linear_started = Instant::now();
                     // IpFilterLSAcceptor::TrySecondOrderCorrection passes
                     // allow_inexact=true to PDSystemSolver::Solve; then
@@ -12913,6 +15212,9 @@ where
                         &mut profiling,
                         &mut corrected_callback_time,
                     );
+                    if !eval_state_is_finite(&corrected_state) {
+                        break;
+                    }
                     let corrected_eq_inf = inf_norm(&corrected_state.equality_values);
                     let corrected_ineq_inf = inequality_upper_bound_inf_norm(
                         &corrected_state.augmented_inequality_values,
@@ -13285,6 +15587,7 @@ where
                             watchdog_accepted: watchdog_active,
                             tiny_step: false,
                             bound_multiplier_corrected,
+                            forced_termination: None,
                         });
                         break;
                     }
@@ -13570,6 +15873,7 @@ where
                     watchdog_accepted: watchdog_accept,
                     tiny_step: false,
                     bound_multiplier_corrected,
+                    forced_termination: None,
                 });
                 break;
             }
@@ -13616,7 +15920,7 @@ where
             watchdog_stop_restore = Some((stored, WatchdogStopKind::TrialBudget));
         }
         if accepted.is_none()
-            && let Some((stored, stop_kind)) = watchdog_stop_restore
+            && let Some((stored, stop_kind)) = watchdog_stop_restore.take()
         {
             // IPOPT BacktrackingLineSearch::StopWatchDog restores the
             // reference iterate, swaps back to the stored search direction,
@@ -13644,10 +15948,10 @@ where
             line_search_current_barrier_objective = stored.barrier_objective;
             line_search_current_primal_inf = stored.primal_inf;
             line_search_base_equality_values = stored.state_equality_values.clone();
+            line_search_base_inequality_residuals = stored.state_inequality_residuals.clone();
             line_search_base_barrier_objective = stored.barrier_objective;
             line_search_base_filter_theta = stored.filter_theta;
             line_search_base_filter_entry = stored.filter_entry.clone();
-            line_search_base_directional_derivative = stored.barrier_directional_derivative;
             alpha_min = calculate_filter_alpha_min(
                 stored.filter_theta,
                 theta_min,
@@ -13794,6 +16098,17 @@ where
                     &mut profiling,
                     &mut trial_callback_time,
                 );
+                if !eval_state_is_finite(&trial_state) {
+                    rejected_trials.push(evaluation_error_line_search_trial(
+                        trial_alpha_pr,
+                        trial_alpha_du,
+                        true,
+                        true,
+                    ));
+                    restore_alpha *= options.line_search_beta;
+                    restore_line_search_iterations += 1;
+                    continue;
+                }
                 let trial_eq_inf = inf_norm(&trial_state.equality_values);
                 let trial_ineq_inf = inequality_upper_bound_inf_norm(
                     &trial_state.augmented_inequality_values,
@@ -14101,6 +16416,7 @@ where
                         watchdog_accepted: false,
                         tiny_step: false,
                         bound_multiplier_corrected,
+                        forced_termination: None,
                     });
                     line_search_iterations = restore_line_search_iterations;
                     break;
@@ -14136,56 +16452,771 @@ where
                 restore_line_search_iterations += 1;
             }
         }
+        if accepted.is_none() && watchdog_stop_restore.is_none() && !emergency_restoration {
+            let mut try_soft_restoration = false;
+            let mut starting_soft_restoration = false;
+            let mut soft_filter_augment_entry = None;
+            if in_soft_restoration_phase {
+                soft_restoration_counter += 1;
+                try_soft_restoration =
+                    soft_restoration_counter <= options.max_soft_restoration_iters;
+            } else if !goto_restoration
+                && !expect_infeasible_problem
+                && options.soft_restoration_pderror_reduction_factor > 0.0
+            {
+                // IPOPT BacktrackingLineSearch::FindAcceptableTrialPoint
+                // calls PrepareRestoPhaseStart before trying the current
+                // damped primal-dual step as a soft restoration step.
+                starting_soft_restoration = true;
+                try_soft_restoration = true;
+                soft_filter_augment_entry = Some(super::filter::augment_entry(
+                    line_search_base_barrier_objective,
+                    line_search_base_filter_theta,
+                    options.filter_gamma_objective,
+                    options.filter_gamma_violation,
+                ));
+            }
+
+            if try_soft_restoration {
+                let soft_alpha_pr = line_search_initial_alpha_pr
+                    .min(line_search_initial_alpha_du)
+                    .clamp(0.0, 1.0);
+                let soft_alpha_du = soft_alpha_pr;
+                let soft_alpha_y = alpha_for_y(soft_alpha_pr, soft_alpha_du, &direction, options);
+                last_tried_alpha_pr = soft_alpha_pr;
+                last_tried_alpha_du = soft_alpha_du;
+                last_tried_alpha_y = soft_alpha_y;
+                let trial_x = x
+                    .iter()
+                    .zip(direction.dx.iter())
+                    .map(|(value, delta)| {
+                        ipopt_dense_current_plus_step(*value, soft_alpha_pr, *delta)
+                    })
+                    .collect::<Vec<_>>();
+                let trial_lambda = lambda_eq
+                    .iter()
+                    .zip(direction.d_lambda.iter())
+                    .map(|(value, delta)| {
+                        ipopt_dense_current_plus_step(*value, soft_alpha_y, *delta)
+                    })
+                    .collect::<Vec<_>>();
+                let trial_lambda_ineq = lambda_ineq
+                    .iter()
+                    .zip(direction.d_ineq.iter())
+                    .map(|(value, delta)| {
+                        ipopt_dense_current_plus_step(*value, soft_alpha_y, *delta)
+                    })
+                    .collect::<Vec<_>>();
+                let trial_slack = slack
+                    .iter()
+                    .zip(direction.ds.iter())
+                    .map(|(value, delta)| {
+                        ipopt_dense_current_plus_step(*value, soft_alpha_pr, *delta)
+                    })
+                    .collect::<Vec<_>>();
+                let trial_slack_barrier = slack_barrier_values(&trial_slack, &slack_upper_bounds);
+                let trial_z = z
+                    .iter()
+                    .zip(direction.dz.iter())
+                    .map(|(value, delta)| {
+                        ipopt_dense_current_plus_step(*value, soft_alpha_du, *delta)
+                    })
+                    .collect::<Vec<_>>();
+                let trial_z_lower = z_lower
+                    .iter()
+                    .zip(direction.dz_lower.iter())
+                    .map(|(value, delta)| {
+                        ipopt_dense_current_plus_step(*value, soft_alpha_du, *delta)
+                    })
+                    .collect::<Vec<_>>();
+                let trial_z_upper = z_upper
+                    .iter()
+                    .zip(direction.dz_upper.iter())
+                    .map(|(value, delta)| {
+                        ipopt_dense_current_plus_step(*value, soft_alpha_du, *delta)
+                    })
+                    .collect::<Vec<_>>();
+                let trial_bounds_positive = bounds
+                    .lower_indices
+                    .iter()
+                    .zip(bounds.lower_values.iter())
+                    .all(|(&index, &lower)| trial_x[index] > lower)
+                    && bounds
+                        .upper_indices
+                        .iter()
+                        .zip(bounds.upper_values.iter())
+                        .all(|(&index, &upper)| trial_x[index] < upper);
+                let trial_bound_multipliers_positive =
+                    trial_z_lower.iter().all(|value| *value > 0.0)
+                        && trial_z_upper.iter().all(|value| *value > 0.0);
+                if trial_slack_barrier.iter().any(|value| *value <= 0.0)
+                    || trial_z.iter().any(|value| *value <= 0.0)
+                    || !trial_bounds_positive
+                    || !trial_bound_multipliers_positive
+                {
+                    rejected_trials.push(InteriorPointLineSearchTrial {
+                        alpha: soft_alpha_pr,
+                        alpha_du: Some(soft_alpha_du),
+                        slack_positive: trial_slack_barrier.iter().all(|value| *value > 0.0)
+                            && trial_bounds_positive,
+                        multipliers_positive: trial_z.iter().all(|value| *value > 0.0)
+                            && trial_bound_multipliers_positive,
+                        objective: None,
+                        barrier_objective: None,
+                        merit: None,
+                        eq_inf: None,
+                        ineq_inf: None,
+                        primal_inf: None,
+                        dual_inf: None,
+                        comp_inf: None,
+                        mu: None,
+                        local_filter_acceptable: None,
+                        filter_acceptable: None,
+                        filter_dominated: None,
+                        filter_sufficient_objective_reduction: None,
+                        filter_sufficient_violation_reduction: None,
+                        switching_condition_satisfied: None,
+                    });
+                } else {
+                    let mut trial_callback_time = Duration::ZERO;
+                    let trial_state = trial_state(
+                        problem,
+                        &trial_x,
+                        parameters,
+                        &trial_evaluation_context,
+                        &mut profiling,
+                        &mut trial_callback_time,
+                    );
+                    if !eval_state_is_finite(&trial_state) {
+                        rejected_trials.push(evaluation_error_line_search_trial(
+                            soft_alpha_pr,
+                            soft_alpha_du,
+                            true,
+                            true,
+                        ));
+                    } else {
+                        let trial_eq_inf = inf_norm(&trial_state.equality_values);
+                        let trial_ineq_inf = inequality_upper_bound_inf_norm(
+                            &trial_state.augmented_inequality_values,
+                            &slack_upper_bounds,
+                        );
+                        let trial_internal_ineq_inf = slack_form_inequality_inf_norm(
+                            &trial_state.augmented_inequality_values,
+                            &trial_slack,
+                        );
+                        let trial_lagrangian_components = lagrangian_gradient_components(
+                            &trial_state.gradient,
+                            &trial_state.equality_jacobian,
+                            &trial_lambda,
+                            &trial_state.inequality_jacobian,
+                            &trial_lambda_ineq,
+                        );
+                        let trial_raw_dual_residual =
+                            trial_lagrangian_components.curr_grad_lag_x.clone();
+                        let mut trial_dual_residual = trial_raw_dual_residual.clone();
+                        add_native_bound_multiplier_terms(
+                            &mut trial_dual_residual,
+                            &bounds,
+                            &trial_z_lower,
+                            &trial_z_upper,
+                        );
+                        let trial_dual_x_inf = fixed_variables.free_inf_norm(&trial_dual_residual);
+                        let trial_slack_stationarity_inf =
+                            slack_stationarity_inf_norm(&trial_lambda_ineq, &trial_z);
+                        let trial_dual_inf = trial_dual_x_inf.max(trial_slack_stationarity_inf);
+                        let trial_comp_inf = if barrier_pair_count > 0 {
+                            combined_complementarity_inf_norm(
+                                &trial_slack_barrier,
+                                &trial_z,
+                                &trial_x,
+                                &bounds,
+                                &trial_z_lower,
+                                &trial_z_upper,
+                            )
+                        } else {
+                            0.0
+                        };
+                        let trial_primal_inf = trial_eq_inf.max(trial_internal_ineq_inf);
+                        let trial_filter_theta = filter_theta_l1_norm(
+                            &trial_state.equality_values,
+                            &trial_state.augmented_inequality_values,
+                            &trial_slack,
+                        );
+                        let trial_merit = merit_residual(
+                            trial_primal_inf,
+                            trial_dual_inf,
+                            trial_comp_inf,
+                            barrier_parameter_value,
+                        );
+                        let trial_all_dual_multipliers = ipopt_all_dual_multiplier_vector(
+                            &trial_lambda,
+                            &trial_lambda_ineq,
+                            &trial_z_lower,
+                            &trial_z_upper,
+                            &trial_z,
+                        );
+                        let trial_complementarity_multipliers =
+                            ipopt_complementarity_multiplier_vector(
+                                &trial_z_lower,
+                                &trial_z_upper,
+                                &trial_z,
+                            );
+                        let trial_overall_inf = scaled_overall_inf_norm(
+                            trial_primal_inf,
+                            trial_dual_inf,
+                            trial_comp_inf,
+                            &trial_all_dual_multipliers,
+                            &trial_complementarity_multipliers,
+                            options.overall_scale_max,
+                        );
+                        let corrected_bound_multipliers = apply_bound_multiplier_safeguard(
+                            &trial_lambda_ineq,
+                            &trial_raw_dual_residual,
+                            &fixed_variables,
+                            &trial_x,
+                            &bounds,
+                            &trial_slack_barrier,
+                            &trial_z,
+                            &trial_z_lower,
+                            &trial_z_upper,
+                            barrier_parameter_value,
+                            options,
+                        );
+                        let trial_barrier_objective = barrier_objective_value(
+                            trial_state.objective_value,
+                            &trial_slack_barrier,
+                            &trial_x,
+                            &bounds,
+                            barrier_parameter_value,
+                            options.kappa_d,
+                        );
+                        let trial_filter_entry =
+                            super::filter::entry(trial_barrier_objective, trial_filter_theta);
+                        let mut soft_filter_entries = filter_entries.clone();
+                        if let Some(entry) = soft_filter_augment_entry.clone() {
+                            super::filter::update_frontier(&mut soft_filter_entries, entry);
+                        }
+                        let soft_switching_condition = switching_condition_satisfied(
+                            current_theta,
+                            barrier_directional_derivative,
+                            0.0,
+                            options,
+                        );
+                        let soft_filter_assessment = super::filter::assess_trial(
+                            &soft_filter_entries,
+                            &current_filter_entry,
+                            &trial_filter_entry,
+                            0.0,
+                            barrier_directional_derivative,
+                            soft_switching_condition,
+                            false,
+                            filter_parameters,
+                        );
+                        let barrier_objective_too_large = barrier_objective_increase_too_large(
+                            current_barrier_objective,
+                            trial_barrier_objective,
+                            options.obj_max_inc,
+                        );
+                        let satisfies_original_criterion = !barrier_objective_too_large
+                            && soft_filter_assessment.acceptance_mode.is_some();
+                        let (_trial_barrier_complementarity_inf, trial_barrier_subproblem_error) =
+                            barrier_subproblem_error_components(
+                                trial_primal_inf,
+                                trial_dual_inf,
+                                &trial_slack_barrier,
+                                &trial_z,
+                                &trial_x,
+                                &bounds,
+                                &trial_z_lower,
+                                &trial_z_upper,
+                                &trial_lambda,
+                                &trial_lambda_ineq,
+                                barrier_parameter_value,
+                                options,
+                            );
+                        let soft_reduction_acceptable = trial_barrier_subproblem_error
+                            <= options.soft_restoration_pderror_reduction_factor
+                                * barrier_subproblem_error;
+                        if satisfies_original_criterion || soft_reduction_acceptable {
+                            let filter_acceptance_mode = satisfies_original_criterion.then_some(
+                                soft_filter_assessment
+                                    .acceptance_mode
+                                    .unwrap_or(FilterAcceptanceMode::ViolationReduction),
+                            );
+                            let step_kind = if filter_acceptance_mode
+                                == Some(FilterAcceptanceMode::ObjectiveArmijo)
+                            {
+                                InteriorPointStepKind::Objective
+                            } else {
+                                InteriorPointStepKind::Feasibility
+                            };
+                            let (
+                                accepted_z,
+                                accepted_z_lower,
+                                accepted_z_upper,
+                                accepted_dual_inf,
+                                accepted_comp_inf,
+                                accepted_mu,
+                                accepted_overall_inf,
+                                bound_multiplier_corrected,
+                            ) = if let Some(corrected) = corrected_bound_multipliers {
+                                let corrected_comp_inf = combined_complementarity_inf_norm(
+                                    &trial_slack_barrier,
+                                    &corrected.z,
+                                    &trial_x,
+                                    &bounds,
+                                    &corrected.z_lower,
+                                    &corrected.z_upper,
+                                );
+                                let corrected_complementarity_multipliers =
+                                    ipopt_complementarity_multiplier_vector(
+                                        &corrected.z_lower,
+                                        &corrected.z_upper,
+                                        &corrected.z,
+                                    );
+                                let corrected_all_dual_multipliers =
+                                    ipopt_all_dual_multiplier_vector(
+                                        &trial_lambda,
+                                        &trial_lambda_ineq,
+                                        &corrected.z_lower,
+                                        &corrected.z_upper,
+                                        &corrected.z,
+                                    );
+                                let corrected_overall_inf = scaled_overall_inf_norm(
+                                    trial_primal_inf,
+                                    corrected.dual_inf,
+                                    corrected_comp_inf,
+                                    &corrected_all_dual_multipliers,
+                                    &corrected_complementarity_multipliers,
+                                    options.overall_scale_max,
+                                );
+                                (
+                                    corrected.z,
+                                    corrected.z_lower,
+                                    corrected.z_upper,
+                                    corrected.dual_inf,
+                                    corrected_comp_inf,
+                                    barrier_parameter_value,
+                                    corrected_overall_inf,
+                                    true,
+                                )
+                            } else {
+                                (
+                                    trial_z,
+                                    trial_z_lower,
+                                    trial_z_upper,
+                                    trial_dual_inf,
+                                    trial_comp_inf,
+                                    barrier_parameter_value,
+                                    trial_overall_inf,
+                                    false,
+                                )
+                            };
+                            let (
+                                accepted_barrier_complementarity_inf,
+                                accepted_barrier_subproblem_error,
+                            ) = barrier_subproblem_error_components(
+                                trial_primal_inf,
+                                accepted_dual_inf,
+                                &trial_slack_barrier,
+                                &accepted_z,
+                                &trial_x,
+                                &bounds,
+                                &accepted_z_lower,
+                                &accepted_z_upper,
+                                &trial_lambda,
+                                &trial_lambda_ineq,
+                                barrier_parameter_value,
+                                options,
+                            );
+                            accepted = Some(AcceptedInteriorPointTrial {
+                                x: trial_x,
+                                lambda: trial_lambda,
+                                inequality_multipliers: trial_lambda_ineq.clone(),
+                                kkt_inequality_residual: slack_form_inequality_residuals(
+                                    &trial_state.augmented_inequality_values,
+                                    &trial_slack,
+                                ),
+                                kkt_x_stationarity:
+                                    snapshot_damped_lagrangian_gradient_x_with_bound_terms(
+                                        &trial_raw_dual_residual,
+                                        &bounds,
+                                        &fixed_variables,
+                                        &accepted_z_lower,
+                                        &accepted_z_upper,
+                                        barrier_parameter_value,
+                                        options.kappa_d,
+                                    ),
+                                kkt_slack_stationarity: damped_slack_stationarity_residuals(
+                                    &trial_lambda_ineq,
+                                    &accepted_z,
+                                    barrier_parameter_value,
+                                    options.kappa_d,
+                                ),
+                                kkt_slack_complementarity: slack_complementarity_residuals(
+                                    &trial_slack_barrier,
+                                    &accepted_z,
+                                    barrier_parameter_value,
+                                ),
+                                kkt_slack_sigma: slack_sigma_values(
+                                    &trial_slack_barrier,
+                                    &accepted_z,
+                                ),
+                                curr_grad_f: snapshot_x_component_vector(
+                                    &trial_lagrangian_components.curr_grad_f,
+                                    &fixed_variables,
+                                ),
+                                curr_jac_c_t_y_c: snapshot_x_component_vector(
+                                    &trial_lagrangian_components.curr_jac_c_t_y_c,
+                                    &fixed_variables,
+                                ),
+                                curr_jac_d_t_y_d: snapshot_x_component_vector(
+                                    &trial_lagrangian_components.curr_jac_d_t_y_d,
+                                    &fixed_variables,
+                                ),
+                                curr_grad_lag_x: snapshot_lagrangian_gradient_x_with_bound_terms(
+                                    &trial_raw_dual_residual,
+                                    &bounds,
+                                    &fixed_variables,
+                                    &accepted_z_lower,
+                                    &accepted_z_upper,
+                                ),
+                                curr_grad_lag_s: slack_stationarity_residuals(
+                                    &trial_lambda_ineq,
+                                    &accepted_z,
+                                ),
+                                slack: trial_slack,
+                                z: accepted_z,
+                                z_lower: accepted_z_lower,
+                                z_upper: accepted_z_upper,
+                                objective: trial_state.objective_value,
+                                barrier_objective: trial_barrier_objective,
+                                equality_inf: trial_eq_inf,
+                                inequality_inf: trial_ineq_inf,
+                                dual_inf: accepted_dual_inf,
+                                complementarity_inf: accepted_comp_inf,
+                                overall_inf: accepted_overall_inf,
+                                barrier_primal_inf: trial_primal_inf,
+                                barrier_dual_inf: accepted_dual_inf,
+                                barrier_complementarity_inf: accepted_barrier_complementarity_inf,
+                                barrier_subproblem_error: accepted_barrier_subproblem_error,
+                                mu: accepted_mu,
+                                filter_theta: trial_filter_theta,
+                                filter_entry: trial_filter_entry.clone(),
+                                filter_augment_entry: soft_filter_augment_entry.clone(),
+                                filter_acceptance_mode,
+                                step_kind,
+                                step_tag: if satisfies_original_criterion {
+                                    'S'
+                                } else {
+                                    's'
+                                },
+                                step_direction: Some(step_direction_snapshot(&direction)),
+                                phase: InteriorPointIterationPhase::AcceptedStep,
+                                accepted_alpha_pr: soft_alpha_pr,
+                                accepted_alpha_du: Some(soft_alpha_du),
+                                accepted_alpha_y: Some(soft_alpha_y),
+                                line_search_initial_alpha_pr,
+                                line_search_initial_alpha_du: Some(line_search_initial_alpha_du),
+                                line_search_initial_alpha_y: Some(line_search_initial_alpha_y),
+                                line_search_last_alpha_pr: soft_alpha_pr,
+                                line_search_last_alpha_du: Some(soft_alpha_du),
+                                line_search_last_alpha_y: Some(soft_alpha_y),
+                                line_search_backtrack_count: line_search_iterations,
+                                second_order_correction_used: false,
+                                watchdog_accepted: false,
+                                tiny_step: false,
+                                bound_multiplier_corrected,
+                                forced_termination: None,
+                            });
+                            if satisfies_original_criterion {
+                                in_soft_restoration_phase = false;
+                                soft_restoration_counter = 0;
+                            } else if starting_soft_restoration {
+                                in_soft_restoration_phase = true;
+                                soft_restoration_counter = 0;
+                            }
+                        } else {
+                            rejected_trials.push(InteriorPointLineSearchTrial {
+                                alpha: soft_alpha_pr,
+                                alpha_du: Some(soft_alpha_du),
+                                slack_positive: true,
+                                multipliers_positive: true,
+                                objective: Some(trial_state.objective_value),
+                                barrier_objective: Some(trial_barrier_objective),
+                                merit: Some(trial_merit),
+                                eq_inf: Some(trial_eq_inf),
+                                ineq_inf: Some(trial_ineq_inf),
+                                primal_inf: Some(trial_primal_inf),
+                                dual_inf: Some(trial_dual_inf),
+                                comp_inf: Some(trial_comp_inf),
+                                mu: Some(barrier_parameter_value),
+                                local_filter_acceptable: Some(
+                                    soft_filter_assessment.current_iterate_acceptable,
+                                ),
+                                filter_acceptable: Some(
+                                    soft_filter_assessment.filter_acceptable
+                                        && !barrier_objective_too_large,
+                                ),
+                                filter_dominated: Some(soft_filter_assessment.filter_dominated),
+                                filter_sufficient_objective_reduction: Some(
+                                    soft_filter_assessment.filter_sufficient_objective_reduction,
+                                ),
+                                filter_sufficient_violation_reduction: Some(
+                                    soft_filter_assessment.filter_sufficient_violation_reduction,
+                                ),
+                                switching_condition_satisfied: Some(soft_switching_condition),
+                            });
+                        }
+                    }
+                }
+            }
+        }
         if accepted.is_none()
             && options.restoration_phase
-            && augmented_inequality_count == 0
-            && let Some(restoration_summary) = solve_equality_restoration_problem(
+            && let Some(restoration_result) = solve_equality_restoration_problem(
                 problem,
                 &x,
                 &line_search_base_equality_values,
+                &line_search_base_inequality_residuals,
                 parameters,
                 options,
                 line_search_current_primal_inf,
+                iteration + 1,
+                restoration_depth,
+                callback,
             )
         {
-            let restored_x = restoration_summary.x[..problem.dimension()].to_vec();
-            let restored_state = trial_state(
-                problem,
-                &restored_x,
-                parameters,
-                &trial_evaluation_context,
-                &mut profiling,
-                &mut iteration_callback_time,
-            );
-            let restored_eq_inf = inf_norm(&restored_state.equality_values);
-            let restored_ineq_inf =
-                positive_part_inf_norm(&restored_state.augmented_inequality_values);
-            let restored_primal_inf = restored_eq_inf.max(restored_ineq_inf);
-            if restored_primal_inf
-                <= 0.9 * line_search_current_primal_inf.max(options.constraint_tol)
-                    + 100.0 * f64::EPSILON * line_search_current_primal_inf.abs().max(1.0)
+            restoration_call_count += 1;
+            let restoration_required_infeasibility_reduction = if square_equality_problem {
+                0.0
+            } else if expect_infeasible_problem
+                && restoration_call_count == 1
+                && line_search_current_primal_inf > 1.0e-3
             {
-                let restored_linear_state = EvalState {
-                    objective_value: restored_state.objective_value,
-                    gradient: fixed_variables.reduce_vector(&restored_state.gradient),
-                    equality_values: restored_state.equality_values.clone(),
-                    augmented_inequality_values: restored_state.augmented_inequality_values.clone(),
-                    equality_jacobian: reduce_sparse_matrix_columns(
-                        &restored_state.equality_jacobian,
-                        &equality_column_reduction,
-                    ),
-                    inequality_jacobian: reduce_sparse_matrix_columns(
-                        &restored_state.inequality_jacobian,
-                        &inequality_column_reduction,
-                    ),
-                };
-                let (restored_lambda, restored_lambda_ineq) = least_squares_constraint_multipliers(
-                    &restored_linear_state,
-                    &[],
-                    hessian_structure.as_ref(),
-                    options.regularization,
-                    options.linear_solver,
+                // MinC_1NrmRestorationPhase tightens the first restoration
+                // return gate when expect_infeasible_problem is active.
+                1.0e-3
+            } else {
+                0.9
+            };
+            let restoration_summary = match restoration_result {
+                Ok(restoration_summary) => restoration_summary,
+                Err(restoration_error) => {
+                    let Some(restoration_subproblem_status) =
+                        ipopt_restoration_subproblem_error_status(&restoration_error)
+                    else {
+                        return Err(restoration_error);
+                    };
+                    let restoration_phase_status = ipopt_min_c_1nrm_restoration_phase_status(
+                        square_equality_problem,
+                        restoration_subproblem_status,
+                        line_search_current_primal_inf,
+                        options.constraint_tol,
+                        1.0e2 * options.overall_tol,
+                    );
+                    let restoration_algorithm_status = ipopt_algorithm_restoration_status(
+                        square_equality_problem,
+                        restoration_phase_status,
+                    );
+                    let failure_context = interior_point_failure_context(
+                        Some(snapshot_with_nlip_events(
+                            current_snapshot.clone(),
+                            &iteration_events,
+                        )),
+                        last_accepted_state.clone(),
+                        emergency_failed_linear_solve.clone(),
+                        Some(InteriorPointLineSearchInfo {
+                            initial_alpha_pr: line_search_initial_alpha_pr,
+                            initial_alpha_du: Some(line_search_initial_alpha_du),
+                            initial_alpha_y: Some(line_search_initial_alpha_y),
+                            accepted_alpha: None,
+                            accepted_alpha_du: None,
+                            accepted_alpha_y: None,
+                            last_tried_alpha: last_tried_alpha_pr,
+                            last_tried_alpha_du: Some(last_tried_alpha_du),
+                            last_tried_alpha_y: Some(last_tried_alpha_y),
+                            backtrack_count: line_search_iterations,
+                            sigma,
+                            current_merit: line_search_current_merit,
+                            current_barrier_objective: line_search_current_barrier_objective,
+                            current_primal_inf: line_search_current_primal_inf,
+                            alpha_min,
+                            second_order_correction_attempted,
+                            second_order_correction_used,
+                            watchdog_active,
+                            watchdog_accepted,
+                            tiny_step: false,
+                            filter_acceptance_mode: None,
+                            step_kind: None,
+                            step_tag: None,
+                            rejected_trials: rejected_trials.clone(),
+                        }),
+                        current_direction_diagnostics.clone(),
+                        &profiling,
+                        solve_started,
+                    );
+                    return Err(match restoration_algorithm_status {
+                        IpoptRestorationAlgorithmStatus::MaxIterationsExceeded => {
+                            let iterations = match restoration_error {
+                                InteriorPointSolveError::MaxIterations { iterations, .. } => {
+                                    if options.max_restoration_iters < options.max_iters {
+                                        // max_resto_iter is checked inside
+                                        // RestoConvCheck after the callback
+                                        // has already received the absolute
+                                        // restoration-phase iter_count.
+                                        iterations
+                                    } else {
+                                        // The nested restoration algorithm's
+                                        // local loop starts from zero, while
+                                        // IPOPT seeds IpData.iter_count to
+                                        // outer_iter_count + 1 before checking
+                                        // max_iter.
+                                        iteration + 1 + iterations
+                                    }
+                                }
+                                _ => iteration,
+                            };
+                            InteriorPointSolveError::MaxIterations {
+                                // RestoConvCheck reports the restoration
+                                // IpoptData iteration counter, seeded as
+                                // outer_iter_count + 1.
+                                iterations,
+                                context: failure_context,
+                            }
+                        }
+                        IpoptRestorationAlgorithmStatus::LocalInfeasibility => {
+                            InteriorPointSolveError::LocalInfeasibility {
+                                context: failure_context,
+                            }
+                        }
+                        IpoptRestorationAlgorithmStatus::UserRequestedStop => {
+                            InteriorPointSolveError::UserRequestedStop {
+                                context: failure_context,
+                            }
+                        }
+                        IpoptRestorationAlgorithmStatus::RestorationFailed(status) => {
+                            InteriorPointSolveError::RestorationFailed {
+                                status,
+                                context: failure_context,
+                            }
+                        }
+                        IpoptRestorationAlgorithmStatus::AcceptRestoredTrial
+                        | IpoptRestorationAlgorithmStatus::FeasiblePointFound => {
+                            InteriorPointSolveError::RestorationFailed {
+                                status: InteriorPointRestorationFailureStatus::RecoverableFailure,
+                                context: failure_context,
+                            }
+                        }
+                    });
+                }
+            };
+            let restoration_subproblem_status =
+                ipopt_restoration_subproblem_status(&restoration_summary);
+            let restored_x = restoration_summary.x[..problem.dimension()].to_vec();
+            if restoration_summary.slack.len() == slack.len() {
+                let restored_slack = restoration_summary.slack;
+                let restored_state = trial_state(
+                    problem,
+                    &restored_x,
+                    parameters,
+                    &trial_evaluation_context,
+                    &mut profiling,
+                    &mut iteration_callback_time,
                 );
+                let restored_eq_inf = inf_norm(&restored_state.equality_values);
+                let restored_inequality_residual = slack_form_inequality_residuals(
+                    &restored_state.augmented_inequality_values,
+                    &restored_slack,
+                );
+                let restored_ineq_inf = inf_norm(&restored_inequality_residual);
+                let restored_slack_barrier =
+                    slack_barrier_values(&restored_slack, &slack_upper_bounds);
+                let restored_primal_inf = restored_eq_inf.max(restored_ineq_inf);
+                let (
+                    mut restored_z_lower,
+                    mut restored_z_upper,
+                    mut restored_z,
+                    _restoration_alpha_du,
+                    _restoration_bound_multiplier_reset,
+                ) = if barrier_pair_count > 0 {
+                    ipopt_restoration_bound_multiplier_update(
+                        &x,
+                        &restored_x,
+                        &bounds,
+                        &slack_barrier,
+                        &restored_slack_barrier,
+                        &z_lower,
+                        &z_upper,
+                        &z,
+                        barrier_parameter_value,
+                        fraction_to_boundary_tau,
+                    )
+                } else {
+                    (Vec::new(), Vec::new(), Vec::new(), 1.0, false)
+                };
+                // Ipopt::MinC_1NrmRestorationPhase uses
+                // DefaultIterateInitializer::least_square_mults with
+                // resto.constr_mult_init_max defaulting to zero, so the
+                // original constraint multipliers are reset to zero after
+                // a normal restoration return.
+                let mut restored_lambda = vec![0.0; equality_count];
+                let mut restored_lambda_ineq = vec![0.0; augmented_inequality_count];
+                let restoration_phase_status = ipopt_min_c_1nrm_restoration_phase_status(
+                    square_equality_problem,
+                    restoration_subproblem_status,
+                    restored_primal_inf,
+                    options.constraint_tol,
+                    1.0e2 * options.overall_tol,
+                );
+                let restoration_algorithm_status = ipopt_algorithm_restoration_status(
+                    square_equality_problem,
+                    restoration_phase_status,
+                );
+                if square_equality_problem
+                    && matches!(
+                        restoration_algorithm_status,
+                        IpoptRestorationAlgorithmStatus::FeasiblePointFound
+                    )
+                {
+                    // IpoptAlgorithm::ComputeFeasibilityMultipliersPostprocess
+                    // zeros all bound/slack multipliers and recomputes
+                    // equality/inequality multipliers for square feasibility
+                    // returns before reporting the final status.
+                    restored_z_lower.fill(0.0);
+                    restored_z_upper.fill(0.0);
+                    restored_z.fill(0.0);
+                    let mut postprocess_gradient = restored_state.gradient.clone();
+                    add_native_bound_multiplier_terms(
+                        &mut postprocess_gradient,
+                        &bounds,
+                        &restored_z_lower,
+                        &restored_z_upper,
+                    );
+                    let postprocess_state = EvalState {
+                        objective_value: restored_state.objective_value,
+                        gradient: fixed_variables.reduce_vector(&postprocess_gradient),
+                        equality_values: restored_state.equality_values.clone(),
+                        augmented_inequality_values: restored_state
+                            .augmented_inequality_values
+                            .clone(),
+                        equality_jacobian: reduce_sparse_matrix_columns(
+                            &restored_state.equality_jacobian,
+                            &equality_column_reduction,
+                        ),
+                        inequality_jacobian: reduce_sparse_matrix_columns(
+                            &restored_state.inequality_jacobian,
+                            &inequality_column_reduction,
+                        ),
+                    };
+                    (restored_lambda, restored_lambda_ineq) = least_squares_constraint_multipliers(
+                        &postprocess_state,
+                        &restored_z,
+                        hessian_structure.as_ref(),
+                        options.regularization,
+                        options.linear_solver,
+                    );
+                }
                 let restored_lagrangian_components = lagrangian_gradient_components(
                     &restored_state.gradient,
                     &restored_state.equality_jacobian,
@@ -14198,18 +17229,22 @@ where
                 add_native_bound_multiplier_terms(
                     &mut restored_dual_residual,
                     &bounds,
-                    &z_lower,
-                    &z_upper,
+                    &restored_z_lower,
+                    &restored_z_upper,
                 );
-                let restored_dual_inf = fixed_variables.free_inf_norm(&restored_dual_residual);
+                let restored_slack_stationarity =
+                    slack_stationarity_residuals(&restored_lambda_ineq, &restored_z);
+                let restored_dual_inf = fixed_variables.free_inf_norm(&restored_dual_residual).max(
+                    slack_stationarity_inf_norm(&restored_lambda_ineq, &restored_z),
+                );
                 let restored_complementarity_inf = if barrier_pair_count > 0 {
                     combined_complementarity_inf_norm(
-                        &[],
-                        &[],
+                        &restored_slack_barrier,
+                        &restored_z,
                         &restored_x,
                         &bounds,
-                        &z_lower,
-                        &z_upper,
+                        &restored_z_lower,
+                        &restored_z_upper,
                     )
                 } else {
                     0.0
@@ -14217,12 +17252,15 @@ where
                 let restored_all_dual_multipliers = ipopt_all_dual_multiplier_vector(
                     &restored_lambda,
                     &restored_lambda_ineq,
-                    &z_lower,
-                    &z_upper,
-                    &z,
+                    &restored_z_lower,
+                    &restored_z_upper,
+                    &restored_z,
                 );
-                let restored_complementarity_multipliers =
-                    ipopt_complementarity_multiplier_vector(&z_lower, &z_upper, &z);
+                let restored_complementarity_multipliers = ipopt_complementarity_multiplier_vector(
+                    &restored_z_lower,
+                    &restored_z_upper,
+                    &restored_z,
+                );
                 let restored_overall_inf = scaled_overall_inf_norm(
                     restored_primal_inf,
                     restored_dual_inf,
@@ -14234,11 +17272,11 @@ where
                 let restored_filter_theta = filter_theta_l1_norm(
                     &restored_state.equality_values,
                     &restored_state.augmented_inequality_values,
-                    &[],
+                    &restored_slack,
                 );
                 let restored_barrier_objective = barrier_objective_value(
                     restored_state.objective_value,
-                    &[],
+                    &restored_slack_barrier,
                     &restored_x,
                     &bounds,
                     barrier_parameter_value,
@@ -14246,29 +17284,158 @@ where
                 );
                 let restored_filter_entry =
                     super::filter::entry(restored_barrier_objective, restored_filter_theta);
-                let restoration_filter_assessment = super::filter::assess_trial(
+                match restoration_algorithm_status {
+                    IpoptRestorationAlgorithmStatus::LocalInfeasibility => {
+                        return Err(InteriorPointSolveError::LocalInfeasibility {
+                            context: interior_point_failure_context(
+                                Some(snapshot_with_nlip_events(
+                                    current_snapshot.clone(),
+                                    &iteration_events,
+                                )),
+                                last_accepted_state.clone(),
+                                emergency_failed_linear_solve.clone(),
+                                None,
+                                current_direction_diagnostics.clone(),
+                                &profiling,
+                                solve_started,
+                            ),
+                        });
+                    }
+                    IpoptRestorationAlgorithmStatus::MaxIterationsExceeded => {
+                        return Err(InteriorPointSolveError::MaxIterations {
+                            // The restoration IpoptData iteration counter is
+                            // seeded as outer_iter_count + 1.
+                            iterations: iteration + 1 + restoration_summary.iterations,
+                            context: interior_point_failure_context(
+                                Some(snapshot_with_nlip_events(
+                                    current_snapshot.clone(),
+                                    &iteration_events,
+                                )),
+                                last_accepted_state.clone(),
+                                emergency_failed_linear_solve.clone(),
+                                None,
+                                current_direction_diagnostics.clone(),
+                                &profiling,
+                                solve_started,
+                            ),
+                        });
+                    }
+                    IpoptRestorationAlgorithmStatus::UserRequestedStop => {
+                        return Err(InteriorPointSolveError::UserRequestedStop {
+                            context: interior_point_failure_context(
+                                Some(snapshot_with_nlip_events(
+                                    current_snapshot.clone(),
+                                    &iteration_events,
+                                )),
+                                last_accepted_state.clone(),
+                                emergency_failed_linear_solve.clone(),
+                                None,
+                                current_direction_diagnostics.clone(),
+                                &profiling,
+                                solve_started,
+                            ),
+                        });
+                    }
+                    IpoptRestorationAlgorithmStatus::RestorationFailed(status) => {
+                        return Err(InteriorPointSolveError::RestorationFailed {
+                            status,
+                            context: interior_point_failure_context(
+                                Some(snapshot_with_nlip_events(
+                                    current_snapshot.clone(),
+                                    &iteration_events,
+                                )),
+                                last_accepted_state.clone(),
+                                emergency_failed_linear_solve.clone(),
+                                None,
+                                current_direction_diagnostics.clone(),
+                                &profiling,
+                                solve_started,
+                            ),
+                        });
+                    }
+                    IpoptRestorationAlgorithmStatus::AcceptRestoredTrial
+                    | IpoptRestorationAlgorithmStatus::FeasiblePointFound => {}
+                }
+                let forced_restoration_termination = match restoration_algorithm_status {
+                    IpoptRestorationAlgorithmStatus::FeasiblePointFound
+                        if restored_primal_inf <= options.constraint_tol
+                            && restored_dual_inf <= options.dual_tol
+                            && restored_complementarity_inf <= options.complementarity_tol
+                            && restored_overall_inf <= options.overall_tol =>
+                    {
+                        Some(InteriorPointTermination::Converged)
+                    }
+                    IpoptRestorationAlgorithmStatus::FeasiblePointFound => {
+                        Some(InteriorPointTermination::FeasiblePointFound)
+                    }
+                    _ => None,
+                };
+                let restoration_progress_status = ipopt_restoration_original_progress_status(
+                    false,
+                    square_equality_problem,
+                    restoration_required_infeasibility_reduction,
+                    line_search_current_primal_inf,
+                    restored_primal_inf,
+                    options.overall_tol,
+                    options.constraint_tol,
                     &filter_entries,
                     &line_search_base_filter_entry,
                     &restored_filter_entry,
-                    0.0,
-                    line_search_base_directional_derivative,
-                    false,
-                    false,
                     filter_parameters,
                 );
-                if restoration_filter_assessment.current_iterate_acceptable
-                    && restoration_filter_assessment.filter_acceptable
+                if restoration_progress_status == RestorationOriginalProgressStatus::Continue
+                    && matches!(
+                        restoration_algorithm_status,
+                        IpoptRestorationAlgorithmStatus::AcceptRestoredTrial
+                            | IpoptRestorationAlgorithmStatus::FeasiblePointFound
+                    )
+                {
+                    // Mirrors IpRestoConvCheck::CheckConvergence: if the
+                    // restoration NLP itself is solved but the original
+                    // iterate still cannot return through the filter/progress
+                    // gate, IPOPT reports either local infeasibility or the
+                    // special "restoration converged to feasible point"
+                    // failure instead of falling back to a generic line-search
+                    // failure.
+                    let failure_context = interior_point_failure_context(
+                        Some(snapshot_with_nlip_events(
+                            current_snapshot.clone(),
+                            &iteration_events,
+                        )),
+                        last_accepted_state.clone(),
+                        emergency_failed_linear_solve.clone(),
+                        None,
+                        current_direction_diagnostics.clone(),
+                        &profiling,
+                        solve_started,
+                    );
+                    if restored_primal_inf <= 1.0e2 * options.overall_tol {
+                        return Err(InteriorPointSolveError::RestorationFailed {
+                            status: InteriorPointRestorationFailureStatus::ConvergedToFeasiblePoint,
+                            context: failure_context,
+                        });
+                    }
+                    return Err(InteriorPointSolveError::LocalInfeasibility {
+                        context: failure_context,
+                    });
+                }
+                if restoration_progress_status == RestorationOriginalProgressStatus::Accept
+                    && matches!(
+                        restoration_algorithm_status,
+                        IpoptRestorationAlgorithmStatus::AcceptRestoredTrial
+                            | IpoptRestorationAlgorithmStatus::FeasiblePointFound
+                    )
                 {
                     let (restored_barrier_complementarity_inf, restored_barrier_subproblem_error) =
                         barrier_subproblem_error_components(
                             restored_primal_inf,
                             restored_dual_inf,
-                            &[],
-                            &z,
+                            &restored_slack_barrier,
+                            &restored_z,
                             &restored_x,
                             &bounds,
-                            &z_lower,
-                            &z_upper,
+                            &restored_z_lower,
+                            &restored_z_upper,
                             &restored_lambda,
                             &restored_lambda_ineq,
                             barrier_parameter_value,
@@ -14278,15 +17445,20 @@ where
                         &mut iteration_events,
                         InteriorPointIterationEvent::RestorationPhaseAccepted,
                     );
+                    if expect_infeasible_problem {
+                        expect_infeasible_problem = false;
+                    }
+                    in_soft_restoration_phase = false;
+                    soft_restoration_counter = 0;
                     accepted = Some(AcceptedInteriorPointTrial {
                         x: restored_x,
                         lambda: restored_lambda,
                         inequality_multipliers: restored_lambda_ineq.clone(),
-                        slack: Vec::new(),
-                        z: z.clone(),
-                        z_lower: z_lower.clone(),
-                        z_upper: z_upper.clone(),
-                        kkt_inequality_residual: Vec::new(),
+                        slack: restored_slack,
+                        z: restored_z.clone(),
+                        z_lower: restored_z_lower.clone(),
+                        z_upper: restored_z_upper.clone(),
+                        kkt_inequality_residual: restored_inequality_residual,
                         kkt_x_stationarity: snapshot_damped_lagrangian_gradient_x(
                             &restored_dual_residual,
                             &bounds,
@@ -14294,9 +17466,18 @@ where
                             barrier_parameter_value,
                             options.kappa_d,
                         ),
-                        kkt_slack_stationarity: Vec::new(),
-                        kkt_slack_complementarity: Vec::new(),
-                        kkt_slack_sigma: Vec::new(),
+                        kkt_slack_stationarity: damped_slack_stationarity_residuals(
+                            &restored_lambda_ineq,
+                            &restored_z,
+                            barrier_parameter_value,
+                            options.kappa_d,
+                        ),
+                        kkt_slack_complementarity: slack_complementarity_residuals(
+                            &restored_slack_barrier,
+                            &restored_z,
+                            barrier_parameter_value,
+                        ),
+                        kkt_slack_sigma: slack_sigma_values(&restored_slack_barrier, &restored_z),
                         curr_grad_f: snapshot_x_component_vector(
                             &restored_lagrangian_components.curr_grad_f,
                             &fixed_variables,
@@ -14313,7 +17494,7 @@ where
                             &restored_dual_residual,
                             &fixed_variables,
                         ),
-                        curr_grad_lag_s: Vec::new(),
+                        curr_grad_lag_s: restored_slack_stationarity,
                         objective: restored_state.objective_value,
                         barrier_objective: restored_barrier_objective,
                         equality_inf: restored_eq_inf,
@@ -14346,13 +17527,14 @@ where
                         line_search_initial_alpha_du: Some(line_search_initial_alpha_du),
                         line_search_initial_alpha_y: Some(line_search_initial_alpha_y),
                         line_search_last_alpha_pr: last_tried_alpha_pr,
-                        line_search_last_alpha_du: Some(last_tried_alpha_du),
+                        line_search_last_alpha_du: Some(0.0),
                         line_search_last_alpha_y: Some(last_tried_alpha_y),
                         line_search_backtrack_count: line_search_iterations,
                         second_order_correction_used: false,
                         watchdog_accepted: false,
                         tiny_step: false,
                         bound_multiplier_corrected: false,
+                        forced_termination: forced_restoration_termination,
                     });
                 }
             }
@@ -14405,16 +17587,19 @@ where
         };
         let step_inf = ipopt_primal_step_inf_norm(&direction);
         let tiny_step = accepted_trial.tiny_step;
-        let shortened_step = is_shortened_ip_step(
-            accepted_trial.accepted_alpha_pr,
-            accepted_trial.accepted_alpha_du,
-            accepted_trial.line_search_backtrack_count,
-        );
+        let forced_termination = accepted_trial.forced_termination;
+        // BacktrackingLineSearch skips the normal shortened-step/watchdog
+        // update while it remains in the soft-restoration phase.
+        let shortened_step = accepted_trial.step_tag != 's'
+            && is_shortened_ip_step(
+                accepted_trial.accepted_alpha_pr,
+                accepted_trial.accepted_alpha_du,
+                accepted_trial.line_search_backtrack_count,
+            );
 
         let accepted_rejected_trials = rejected_trials.clone();
-        let last_rejection_due_to_filter = accepted_rejected_trials.last().is_some_and(|trial| {
-            trial.local_filter_acceptable == Some(true) && trial.filter_acceptable == Some(false)
-        });
+        let last_rejection_due_to_filter =
+            ipopt_last_rejection_due_to_filter(&accepted_rejected_trials);
         let line_search_info = InteriorPointLineSearchInfo {
             initial_alpha_pr: accepted_trial.line_search_initial_alpha_pr,
             initial_alpha_du: accepted_trial.line_search_initial_alpha_du,
@@ -14625,8 +17810,20 @@ where
             events: events.clone(),
         };
         snapshots.push(accepted_snapshot.clone());
-        callback(&accepted_snapshot);
-        last_accepted_state = Some(accepted_snapshot);
+        if !callback(&accepted_snapshot) {
+            return Err(InteriorPointSolveError::UserRequestedStop {
+                context: interior_point_failure_context(
+                    Some(accepted_snapshot.clone()),
+                    Some(accepted_snapshot),
+                    None,
+                    None,
+                    None,
+                    &profiling,
+                    solve_started,
+                ),
+            });
+        }
+        last_accepted_state = Some(accepted_snapshot.clone());
         if direction.primal_diagonal_shift_used > 0.0 {
             previous_hessian_perturbation = Some(direction.primal_diagonal_shift_used);
         }
@@ -14635,6 +17832,17 @@ where
         profiling.preprocessing_time += iteration_started.elapsed().saturating_sub(
             iteration_callback_time + iteration_kkt_assembly_time + iteration_linear_solve_time,
         );
+        let expect_infeasible_ctol = if square_equality_problem {
+            // BacktrackingLineSearch::FindAcceptableTrialPoint sets the
+            // square-problem expect-infeasible ctol to zero.
+            0.0
+        } else {
+            options.expect_infeasible_problem_ctol
+        };
+        if expect_infeasible_problem && accepted_trial.barrier_primal_inf <= expect_infeasible_ctol
+        {
+            expect_infeasible_problem = false;
+        }
         x = accepted_trial.x;
         lambda_eq = accepted_trial.lambda;
         lambda_ineq = accepted_trial.inequality_multipliers;
@@ -14644,6 +17852,39 @@ where
         z_upper = accepted_trial.z_upper;
         filter_entries = next_filter_entries;
         nonlinear_inequality_multipliers = lambda_ineq.clone();
+        if let Some(termination) = forced_termination {
+            let mut summary = InteriorPointSummary {
+                x: x.clone(),
+                equality_multipliers: lambda_eq.clone(),
+                inequality_multipliers: lambda_ineq.clone(),
+                lower_bound_multipliers: z_lower.clone(),
+                upper_bound_multipliers: z_upper.clone(),
+                slack: slack.clone(),
+                objective: accepted_snapshot.objective,
+                iterations: iteration + 1,
+                equality_inf_norm: accepted_snapshot.eq_inf.unwrap_or(0.0),
+                inequality_inf_norm: accepted_snapshot.ineq_inf.unwrap_or(0.0),
+                primal_inf_norm: accepted_snapshot.barrier_primal_inf.unwrap_or(0.0),
+                dual_inf_norm: accepted_snapshot.dual_inf,
+                complementarity_inf_norm: accepted_snapshot.comp_inf.unwrap_or(0.0),
+                overall_inf_norm: accepted_snapshot.overall_inf,
+                barrier_parameter: accepted_snapshot
+                    .barrier_parameter
+                    .unwrap_or(barrier_parameter_value),
+                termination,
+                status_kind: interior_point_status_kind_for_termination(termination),
+                snapshots,
+                final_state: accepted_snapshot.clone(),
+                last_accepted_state,
+                profiling,
+                linear_solver: last_linear_solver,
+            };
+            finalise_interior_point_profiling(&mut summary.profiling, solve_started);
+            if options.verbose {
+                log_interior_point_status_summary(&summary, options);
+            }
+            return Ok(summary);
+        }
         if shortened_step {
             watchdog_state.shortened_step_streak += 1;
         } else {

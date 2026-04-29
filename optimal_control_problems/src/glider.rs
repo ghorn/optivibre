@@ -1633,6 +1633,12 @@ mod tests {
         let context = match error {
             optimization::InteriorPointSolveError::LinearSolve { context, .. }
             | optimization::InteriorPointSolveError::LineSearchFailed { context, .. }
+            | optimization::InteriorPointSolveError::RestorationFailed { context, .. }
+            | optimization::InteriorPointSolveError::LocalInfeasibility { context }
+            | optimization::InteriorPointSolveError::DivergingIterates { context, .. }
+            | optimization::InteriorPointSolveError::CpuTimeExceeded { context, .. }
+            | optimization::InteriorPointSolveError::WallTimeExceeded { context, .. }
+            | optimization::InteriorPointSolveError::UserRequestedStop { context }
             | optimization::InteriorPointSolveError::MaxIterations { context, .. } => context,
             optimization::InteriorPointSolveError::InvalidInput(_) => return None,
         };
@@ -9339,6 +9345,12 @@ mod tests {
             let context = match err {
                 optimization::InteriorPointSolveError::LinearSolve { context, .. }
                 | optimization::InteriorPointSolveError::LineSearchFailed { context, .. }
+                | optimization::InteriorPointSolveError::RestorationFailed { context, .. }
+                | optimization::InteriorPointSolveError::LocalInfeasibility { context }
+                | optimization::InteriorPointSolveError::DivergingIterates { context, .. }
+                | optimization::InteriorPointSolveError::CpuTimeExceeded { context, .. }
+                | optimization::InteriorPointSolveError::WallTimeExceeded { context, .. }
+                | optimization::InteriorPointSolveError::UserRequestedStop { context }
                 | optimization::InteriorPointSolveError::MaxIterations { context, .. } => {
                     Some(context.as_ref())
                 }

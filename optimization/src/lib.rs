@@ -46,11 +46,13 @@ pub use interior_point::{
     InteriorPointLinearDebugVerdict, InteriorPointLinearInertia, InteriorPointLinearSolveAttempt,
     InteriorPointLinearSolveDiagnostics, InteriorPointLinearSolveFailureKind,
     InteriorPointLinearSolver, InteriorPointOptions, InteriorPointProfiling,
+    InteriorPointRestorationFailureStatus, InteriorPointSecondOrderCorrectionMethod,
     InteriorPointSolveError, InteriorPointSpralPivotMethod, InteriorPointStatusKind,
     InteriorPointStepDirectionSnapshot, InteriorPointStepKind, InteriorPointSummary,
     InteriorPointTermination, format_nlip_settings_summary, nlip_event_codes,
     nlip_event_codes_for_events, nlip_event_legend_entries, nlip_event_legend_entries_for_events,
     solve_nlp_interior_point, solve_nlp_interior_point_with_callback,
+    solve_nlp_interior_point_with_control_callback,
 };
 #[cfg(feature = "ipopt")]
 pub use ipopt::SolveStatus as IpoptSolveStatus;
@@ -61,7 +63,7 @@ pub use ipopt_backend::{
     IpoptProvenance, IpoptRawOption, IpoptRawOptionValue, IpoptRawStatus, IpoptSolveError,
     IpoptSpralOrdering, IpoptSpralPivotMethod, IpoptSpralScaling, IpoptSummary,
     capture_ipopt_provenance, format_ipopt_settings_summary, solve_nlp_ipopt,
-    solve_nlp_ipopt_with_callback,
+    solve_nlp_ipopt_with_callback, solve_nlp_ipopt_with_control_callback,
 };
 pub use symbolic::{
     ConstraintBounds, DynamicCompiledJitNlp, DynamicSymbolicNlp, RuntimeBoundedJitNlp,
@@ -1197,6 +1199,7 @@ pub trait CompiledNlpProblem {
     fn ipopt_nlp_scaling_method(&self) -> Option<&'static str> {
         None
     }
+    fn interior_point_set_barrier_parameter(&self, _barrier_parameter: f64) {}
     fn sqp_adapter_timing_snapshot(&self) -> Option<SqpAdapterTiming> {
         None
     }

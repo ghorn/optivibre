@@ -911,6 +911,7 @@ fn nlip_filter_replay_from_snapshots(
             let phase = match snapshot.phase {
                 optimization::InteriorPointIterationPhase::Initial => "initial",
                 optimization::InteriorPointIterationPhase::AcceptedStep => "accepted_step",
+                optimization::InteriorPointIterationPhase::Restoration => "restoration",
                 optimization::InteriorPointIterationPhase::Converged => "converged",
             };
             Some(FilterReplayFrame {
@@ -1047,6 +1048,12 @@ fn metrics_from_ip_error(error: &InteriorPointSolveError) -> SolverMetrics {
         InteriorPointSolveError::InvalidInput(_) => return SolverMetrics::default(),
         InteriorPointSolveError::LinearSolve { context, .. }
         | InteriorPointSolveError::LineSearchFailed { context, .. }
+        | InteriorPointSolveError::RestorationFailed { context, .. }
+        | InteriorPointSolveError::LocalInfeasibility { context }
+        | InteriorPointSolveError::DivergingIterates { context, .. }
+        | InteriorPointSolveError::CpuTimeExceeded { context, .. }
+        | InteriorPointSolveError::WallTimeExceeded { context, .. }
+        | InteriorPointSolveError::UserRequestedStop { context }
         | InteriorPointSolveError::MaxIterations { context, .. } => context.as_ref(),
     };
     let snapshot = context
@@ -1480,6 +1487,7 @@ fn render_nlip_transcript(
         let phase = match snapshot.phase {
             optimization::InteriorPointIterationPhase::Initial => "start",
             optimization::InteriorPointIterationPhase::AcceptedStep => "accept",
+            optimization::InteriorPointIterationPhase::Restoration => "restore",
             optimization::InteriorPointIterationPhase::Converged => "final",
         };
         let events = if snapshot.events.is_empty() {
@@ -1522,6 +1530,7 @@ fn render_nlip_transcript(
         let termination = match summary.termination {
             optimization::InteriorPointTermination::Converged => "converged",
             optimization::InteriorPointTermination::Acceptable => "acceptable",
+            optimization::InteriorPointTermination::FeasiblePointFound => "feasible_point_found",
         };
         let _ = writeln!(out, "\ntermination: {termination}");
         let _ = writeln!(out, "linear_solver: {}", summary.linear_solver.label());
@@ -1533,6 +1542,12 @@ fn render_nlip_transcript(
             InteriorPointSolveError::InvalidInput(_) => None,
             InteriorPointSolveError::LinearSolve { context, .. }
             | InteriorPointSolveError::LineSearchFailed { context, .. }
+            | InteriorPointSolveError::RestorationFailed { context, .. }
+            | InteriorPointSolveError::LocalInfeasibility { context }
+            | InteriorPointSolveError::DivergingIterates { context, .. }
+            | InteriorPointSolveError::CpuTimeExceeded { context, .. }
+            | InteriorPointSolveError::WallTimeExceeded { context, .. }
+            | InteriorPointSolveError::UserRequestedStop { context }
             | InteriorPointSolveError::MaxIterations { context, .. } => Some(context.as_ref()),
         };
         if let Some(context) = context {
@@ -1735,6 +1750,7 @@ fn ipopt_error_code(error: &IpoptSolveError) -> &'static str {
             IpoptRawStatus::UserRequestedStop => "user_stop",
             IpoptRawStatus::MaximumIterationsExceeded => "max_iters",
             IpoptRawStatus::MaximumCpuTimeExceeded => "max_cpu_time",
+            IpoptRawStatus::MaximumWallTimeExceeded => "max_wall_time",
             IpoptRawStatus::RestorationFailed => "restoration_failed",
             IpoptRawStatus::ErrorInStepComputation => "step_computation",
             IpoptRawStatus::NotEnoughDegreesOfFreedom => "not_enough_dof",
@@ -1770,6 +1786,12 @@ fn nlip_error_code(error: &InteriorPointSolveError) -> &'static str {
         InteriorPointSolveError::InvalidInput(_) => "invalid_input",
         InteriorPointSolveError::LinearSolve { .. } => "linear_solve",
         InteriorPointSolveError::LineSearchFailed { .. } => "line_search",
+        InteriorPointSolveError::RestorationFailed { .. } => "restoration",
+        InteriorPointSolveError::LocalInfeasibility { .. } => "local_infeasible",
+        InteriorPointSolveError::DivergingIterates { .. } => "diverging_iterates",
+        InteriorPointSolveError::CpuTimeExceeded { .. } => "max_cpu_time",
+        InteriorPointSolveError::WallTimeExceeded { .. } => "max_wall_time",
+        InteriorPointSolveError::UserRequestedStop { .. } => "user_stop",
         InteriorPointSolveError::MaxIterations { .. } => "max_iters",
     }
 }

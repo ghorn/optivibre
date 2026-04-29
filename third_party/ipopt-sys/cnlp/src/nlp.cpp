@@ -210,6 +210,7 @@ CNLP_ApplicationReturnStatus convert_application_status(Ipopt::ApplicationReturn
         case Restoration_Failed:                return CNLP_RESTORATION_FAILED;
         case Error_In_Step_Computation:         return CNLP_ERROR_IN_STEP_COMPUTATION;
         case Maximum_CpuTime_Exceeded:          return CNLP_MAXIMUM_CPUTIME_EXCEEDED;
+        case Maximum_WallTime_Exceeded:         return CNLP_MAXIMUM_WALLTIME_EXCEEDED;
         case Not_Enough_Degrees_Of_Freedom:     return CNLP_NOT_ENOUGH_DEGREES_OF_FREEDOM;
         case Invalid_Problem_Definition:        return CNLP_INVALID_PROBLEM_DEFINITION;
         case Invalid_Option:                    return CNLP_INVALID_OPTION;

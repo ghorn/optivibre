@@ -828,6 +828,7 @@ fn fmt_nlip_phase(phase: optimization::InteriorPointIterationPhase) -> &'static 
     match phase {
         optimization::InteriorPointIterationPhase::Initial => "initial",
         optimization::InteriorPointIterationPhase::AcceptedStep => "accepted_step",
+        optimization::InteriorPointIterationPhase::Restoration => "restoration",
         optimization::InteriorPointIterationPhase::Converged => "converged",
     }
 }
@@ -1491,6 +1492,12 @@ fn nlip_failure_diagnostic_lines(error: &InteriorPointSolveError) -> Vec<String>
         InteriorPointSolveError::InvalidInput(_) => return Vec::new(),
         InteriorPointSolveError::LinearSolve { context, .. }
         | InteriorPointSolveError::LineSearchFailed { context, .. }
+        | InteriorPointSolveError::RestorationFailed { context, .. }
+        | InteriorPointSolveError::LocalInfeasibility { context }
+        | InteriorPointSolveError::DivergingIterates { context, .. }
+        | InteriorPointSolveError::CpuTimeExceeded { context, .. }
+        | InteriorPointSolveError::WallTimeExceeded { context, .. }
+        | InteriorPointSolveError::UserRequestedStop { context }
         | InteriorPointSolveError::MaxIterations { context, .. } => context.as_ref(),
     };
     let mut lines = vec![String::new(), "failure diagnostics (NLIP):".to_string()];
@@ -1501,6 +1508,42 @@ fn nlip_failure_diagnostic_lines(error: &InteriorPointSolveError) -> Vec<String>
         )),
         InteriorPointSolveError::LineSearchFailed { .. } => {
             lines.push("  termination=line_search".to_string())
+        }
+        InteriorPointSolveError::RestorationFailed { status, .. } => {
+            lines.push(format!("  termination=restoration status={status:?}"))
+        }
+        InteriorPointSolveError::LocalInfeasibility { .. } => {
+            lines.push("  termination=local_infeasibility".to_string())
+        }
+        InteriorPointSolveError::DivergingIterates {
+            max_abs_x,
+            threshold,
+            ..
+        } => lines.push(format!(
+            "  termination=diverging_iterates max_abs_x={} threshold={}",
+            fmt_diag_sci(*max_abs_x),
+            fmt_diag_sci(*threshold)
+        )),
+        InteriorPointSolveError::CpuTimeExceeded {
+            elapsed_seconds,
+            limit_seconds,
+            ..
+        } => lines.push(format!(
+            "  termination=cpu_time elapsed={} limit={}",
+            fmt_diag_sci(*elapsed_seconds),
+            fmt_diag_sci(*limit_seconds)
+        )),
+        InteriorPointSolveError::WallTimeExceeded {
+            elapsed_seconds,
+            limit_seconds,
+            ..
+        } => lines.push(format!(
+            "  termination=wall_time elapsed={} limit={}",
+            fmt_diag_sci(*elapsed_seconds),
+            fmt_diag_sci(*limit_seconds)
+        )),
+        InteriorPointSolveError::UserRequestedStop { .. } => {
+            lines.push("  termination=user_requested_stop".to_string())
         }
         InteriorPointSolveError::MaxIterations { iterations, .. } => {
             lines.push(format!("  termination=max_iterations limit={iterations}"))
@@ -8463,6 +8506,7 @@ pub fn nlip_progress(snapshot: &InteriorPointIterationSnapshot) -> SolveProgress
         phase: match snapshot.phase {
             optimization::InteriorPointIterationPhase::Initial => SolvePhase::Initial,
             optimization::InteriorPointIterationPhase::AcceptedStep => SolvePhase::AcceptedStep,
+            optimization::InteriorPointIterationPhase::Restoration => SolvePhase::Restoration,
             optimization::InteriorPointIterationPhase::Converged => SolvePhase::Converged,
         },
         objective: snapshot.objective,
@@ -8570,6 +8614,9 @@ pub fn nlip_termination_label(summary: &InteriorPointSummary) -> String {
         optimization::InteriorPointTermination::Converged => "Converged".to_string(),
         optimization::InteriorPointTermination::Acceptable => {
             "Converged to acceptable level".to_string()
+        }
+        optimization::InteriorPointTermination::FeasiblePointFound => {
+            "Feasible point found".to_string()
         }
     }
 }
@@ -9136,6 +9183,78 @@ pub fn nlip_failure_solver_report(
         ),
         InteriorPointSolveError::LineSearchFailed { context, .. } => (
             "Failed: line search".to_string(),
+            context
+                .final_state
+                .as_ref()
+                .map(|state| state.iteration as usize),
+            &context.profiling,
+        ),
+        InteriorPointSolveError::RestorationFailed { status, context } => (
+            format!("Failed: restoration ({status:?})"),
+            context
+                .final_state
+                .as_ref()
+                .map(|state| state.iteration as usize),
+            &context.profiling,
+        ),
+        InteriorPointSolveError::LocalInfeasibility { context } => (
+            "Failed: local infeasibility".to_string(),
+            context
+                .final_state
+                .as_ref()
+                .map(|state| state.iteration as usize),
+            &context.profiling,
+        ),
+        InteriorPointSolveError::DivergingIterates {
+            max_abs_x,
+            threshold,
+            context,
+        } => (
+            format!(
+                "Failed: diverging iterates (max |x| {}, limit {})",
+                fmt_diag_sci(*max_abs_x),
+                fmt_diag_sci(*threshold)
+            ),
+            context
+                .final_state
+                .as_ref()
+                .map(|state| state.iteration as usize),
+            &context.profiling,
+        ),
+        InteriorPointSolveError::WallTimeExceeded {
+            elapsed_seconds,
+            limit_seconds,
+            context,
+        } => (
+            format!(
+                "Failed: wall time exceeded (elapsed {}, limit {})",
+                fmt_diag_sci(*elapsed_seconds),
+                fmt_diag_sci(*limit_seconds)
+            ),
+            context
+                .final_state
+                .as_ref()
+                .map(|state| state.iteration as usize),
+            &context.profiling,
+        ),
+        InteriorPointSolveError::CpuTimeExceeded {
+            elapsed_seconds,
+            limit_seconds,
+            context,
+        } => (
+            format!(
+                "Failed: CPU time exceeded (elapsed {}, limit {})",
+                fmt_diag_sci(*elapsed_seconds),
+                fmt_diag_sci(*limit_seconds)
+            ),
+            context
+                .final_state
+                .as_ref()
+                .map(|state| state.iteration as usize),
+            &context.profiling,
+        ),
+        InteriorPointSolveError::UserRequestedStop { context } => (
+            "Stopped: user requested stop".to_string(),
             context
                 .final_state
                 .as_ref()

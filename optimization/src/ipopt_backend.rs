@@ -207,6 +207,8 @@ pub struct IpoptOptions {
     pub complementarity_tol: Option<f64>,
     pub dual_tol: Option<f64>,
     pub print_level: i32,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub journal_print_level: Option<i32>,
     pub suppress_banner: bool,
     pub mu_strategy: IpoptMuStrategy,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
@@ -246,6 +248,7 @@ impl Default for IpoptOptions {
             complementarity_tol: Some(1e-8),
             dual_tol: Some(1e-8),
             print_level: 0,
+            journal_print_level: None,
             suppress_banner: true,
             mu_strategy: IpoptMuStrategy::Adaptive,
             nlp_scaling_method: None,
@@ -266,7 +269,7 @@ impl Default for IpoptOptions {
 
 pub fn format_ipopt_settings_summary(options: &IpoptOptions) -> String {
     format!(
-        "mu_strategy={}; nlp_scaling={}; kappa_d={:.1e}; acceptable_tol={}; print_level={}; banner={}; linear_solver={}; spral_pivot={}; spral_order={}; spral_scaling={}; spral_small={}; spral_u={}; spral_umax={}; spral_gpu={}; raw_options={}; provenance={}",
+        "mu_strategy={}; nlp_scaling={}; kappa_d={:.1e}; acceptable_tol={}; print_level={}; journal_print_level={}; banner={}; linear_solver={}; spral_pivot={}; spral_order={}; spral_scaling={}; spral_small={}; spral_u={}; spral_umax={}; spral_gpu={}; raw_options={}; provenance={}",
         options.mu_strategy.as_str(),
         options
             .nlp_scaling_method
@@ -277,6 +280,10 @@ pub fn format_ipopt_settings_summary(options: &IpoptOptions) -> String {
             .map(|value| format!("{value:.3e}"))
             .unwrap_or_else(|| "off".to_string()),
         options.print_level,
+        options
+            .journal_print_level
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "same".to_string()),
         if options.suppress_banner { "off" } else { "on" },
         options
             .linear_solver
@@ -347,6 +354,7 @@ pub enum IpoptRawStatus {
     UserRequestedStop,
     MaximumIterationsExceeded,
     MaximumCpuTimeExceeded,
+    MaximumWallTimeExceeded,
     RestorationFailed,
     ErrorInStepComputation,
     InvalidOption,
@@ -372,6 +380,7 @@ impl From<SolveStatus> for IpoptRawStatus {
             SolveStatus::UserRequestedStop => Self::UserRequestedStop,
             SolveStatus::MaximumIterationsExceeded => Self::MaximumIterationsExceeded,
             SolveStatus::MaximumCpuTimeExceeded => Self::MaximumCpuTimeExceeded,
+            SolveStatus::MaximumWallTimeExceeded => Self::MaximumWallTimeExceeded,
             SolveStatus::RestorationFailed => Self::RestorationFailed,
             SolveStatus::ErrorInStepComputation => Self::ErrorInStepComputation,
             SolveStatus::InvalidOption => Self::InvalidOption,
@@ -598,21 +607,35 @@ struct IpoptRuntimeState {
 }
 
 trait IpoptIterationConsumer {
-    fn accept(&mut self, snapshot: &IpoptIterationSnapshot);
+    fn accept(&mut self, snapshot: &IpoptIterationSnapshot) -> bool;
 }
 
 struct NoopIpoptIterationConsumer;
 
 impl IpoptIterationConsumer for NoopIpoptIterationConsumer {
-    fn accept(&mut self, _snapshot: &IpoptIterationSnapshot) {}
+    fn accept(&mut self, _snapshot: &IpoptIterationSnapshot) -> bool {
+        true
+    }
 }
 
 impl<F> IpoptIterationConsumer for F
 where
     F: FnMut(&IpoptIterationSnapshot),
 {
-    fn accept(&mut self, snapshot: &IpoptIterationSnapshot) {
+    fn accept(&mut self, snapshot: &IpoptIterationSnapshot) -> bool {
         self(snapshot);
+        true
+    }
+}
+
+struct IpoptControlIterationConsumer<F>(F);
+
+impl<F> IpoptIterationConsumer for IpoptControlIterationConsumer<F>
+where
+    F: FnMut(&IpoptIterationSnapshot) -> bool,
+{
+    fn accept(&mut self, snapshot: &IpoptIterationSnapshot) -> bool {
+        self.0(snapshot)
     }
 }
 
@@ -676,6 +699,10 @@ struct IpoptProblemAdapter<'a, P, C = NoopIpoptIterationConsumer> {
     snapshots: Vec<IpoptIterationSnapshot>,
     runtime: RefCell<IpoptRuntimeState>,
     callback: C,
+}
+
+fn ipopt_values_are_finite(values: &[Number]) -> bool {
+    values.iter().all(|value| value.is_finite())
 }
 
 impl<'a, P, C> IpoptProblemAdapter<'a, P, C>
@@ -776,9 +803,9 @@ where
             line_search_trials: data.ls_trials as usize,
             timing,
         };
-        self.callback.accept(&snapshot);
+        let should_continue = self.callback.accept(&snapshot);
         self.snapshots.push(snapshot);
-        true
+        should_continue
     }
 
     fn objective_hessian_values(&self, x: &[Number], vals: &mut [Number]) -> bool {
@@ -797,7 +824,7 @@ where
             .profiling
             .hessian_values
             .record(started.elapsed());
-        true
+        ipopt_values_are_finite(vals)
     }
 
     fn profiling(&self) -> IpoptProfiling {
@@ -851,7 +878,7 @@ where
             .profiling
             .objective_value
             .record(started.elapsed());
-        true
+        obj.is_finite()
     }
 
     fn objective_grad(&self, x: &[Number], _new_x: bool, grad_f: &mut [Number]) -> bool {
@@ -862,7 +889,7 @@ where
             .profiling
             .objective_gradient
             .record(started.elapsed());
-        true
+        ipopt_values_are_finite(grad_f)
     }
 }
 
@@ -912,7 +939,7 @@ where
             .profiling
             .constraint_values
             .record(started.elapsed());
-        true
+        ipopt_values_are_finite(g)
     }
 
     fn constraint_bounds(&self, g_l: &mut [Number], g_u: &mut [Number]) -> bool {
@@ -949,7 +976,7 @@ where
             .profiling
             .constraint_jacobian_values
             .record(started.elapsed());
-        true
+        ipopt_values_are_finite(vals)
     }
 
     fn num_hessian_non_zeros(&self) -> usize {
@@ -996,7 +1023,7 @@ where
             .profiling
             .hessian_values
             .record(started.elapsed());
-        true
+        ipopt_values_are_finite(vals)
     }
 }
 
@@ -1024,6 +1051,10 @@ fn solve_status_is_success(status: SolveStatus) -> bool {
             | SolveStatus::SolvedToAcceptableLevel
             | SolveStatus::FeasiblePointFound
     )
+}
+
+fn ipopt_journal_print_level(options: &IpoptOptions) -> i32 {
+    options.journal_print_level.unwrap_or(options.print_level)
 }
 
 fn open_ipopt_journal<P>(solver: &mut Ipopt<P>, print_level: i32) -> Option<PathBuf>
@@ -1225,6 +1256,40 @@ where
     P: CompiledNlpProblem,
     C: FnMut(&IpoptIterationSnapshot),
 {
+    solve_nlp_ipopt_with_iteration_consumer(problem, x0, parameters, options, callback)
+}
+
+pub fn solve_nlp_ipopt_with_control_callback<'a, P, C>(
+    problem: &'a P,
+    x0: &'a [f64],
+    parameters: &'a [ParameterMatrix<'a>],
+    options: &IpoptOptions,
+    callback: C,
+) -> std::result::Result<IpoptSummary, IpoptSolveError>
+where
+    P: CompiledNlpProblem,
+    C: FnMut(&IpoptIterationSnapshot) -> bool,
+{
+    solve_nlp_ipopt_with_iteration_consumer(
+        problem,
+        x0,
+        parameters,
+        options,
+        IpoptControlIterationConsumer(callback),
+    )
+}
+
+fn solve_nlp_ipopt_with_iteration_consumer<'a, P, C>(
+    problem: &'a P,
+    x0: &'a [f64],
+    parameters: &'a [ParameterMatrix<'a>],
+    options: &IpoptOptions,
+    callback: C,
+) -> std::result::Result<IpoptSummary, IpoptSolveError>
+where
+    P: CompiledNlpProblem,
+    C: IpoptIterationConsumer,
+{
     validate_ipopt_compatibility(problem)
         .map_err(|err| IpoptSolveError::InvalidInput(err.to_string()))?;
     validate_parameter_inputs(problem, parameters)
@@ -1245,7 +1310,7 @@ where
         let mut solver =
             Ipopt::new_newton(adapter).map_err(|err| IpoptSolveError::Setup(format!("{err:?}")))?;
         apply_ipopt_options(&mut solver, problem.ipopt_nlp_scaling_method(), options)?;
-        let journal_path = open_ipopt_journal(&mut solver, options.print_level);
+        let journal_path = open_ipopt_journal(&mut solver, ipopt_journal_print_level(options));
         solver.set_intermediate_callback(Some(IpoptProblemAdapter::<P, C>::record_iteration));
         let solve_result = solver.solve();
         let status = solve_result.status;
@@ -1314,7 +1379,7 @@ where
     let mut solver =
         Ipopt::new(adapter).map_err(|err| IpoptSolveError::Setup(format!("{err:?}")))?;
     apply_ipopt_options(&mut solver, problem.ipopt_nlp_scaling_method(), options)?;
-    let journal_path = open_ipopt_journal(&mut solver, options.print_level);
+    let journal_path = open_ipopt_journal(&mut solver, ipopt_journal_print_level(options));
     solver.set_intermediate_callback(Some(IpoptProblemAdapter::<P, C>::record_iteration));
 
     let solve_result = solver.solve();
