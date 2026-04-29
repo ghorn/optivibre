@@ -266,3 +266,8 @@ Release performance notes on dense case 58:
   `13-15us` and `lower_storage` around `13us`; total factor timing remains
   noisy but the storage buckets are smaller than the previous roughly
   `20us`-class copies.
+- Dense-front solve panel construction now copies each accepted lower-column
+  tail as one contiguous slice, matching the already column-major dense-front
+  storage instead of indexing every row through `dense_lower_offset`. The
+  generic factor-column equivalence test pins the exact emitted panel values;
+  short case-59 profiles put `solve_panel_build` around `7us`.

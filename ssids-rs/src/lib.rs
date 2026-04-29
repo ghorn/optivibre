@@ -5650,9 +5650,12 @@ fn build_dense_front_solve_panel_record(
 
     let mut values = vec![0.0; size * eliminated_len];
     for local_col in 0..eliminated_len {
-        values[local_col * size + local_col] = 1.0;
-        for row in (local_col + 1)..size {
-            values[local_col * size + row] = dense[dense_lower_offset(size, row, local_col)];
+        let column_start = local_col * size;
+        values[column_start + local_col] = 1.0;
+        let below_diagonal_start = local_col + 1;
+        if below_diagonal_start < size {
+            values[column_start + below_diagonal_start..column_start + size]
+                .copy_from_slice(&dense[column_start + below_diagonal_start..column_start + size]);
         }
     }
 
