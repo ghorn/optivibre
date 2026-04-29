@@ -3851,6 +3851,8 @@ fn app_apply_accepted_prefix_update_with_workspace(
     let incremental_column = app_gemv_forward_singleton_column(size, accepted_end);
     let mut column_l_values = [0.0; APP_INNER_BLOCK_SIZE];
     let mut next_column_l_values = [0.0; APP_INNER_BLOCK_SIZE];
+    let mut third_column_l_values = [0.0; APP_INNER_BLOCK_SIZE];
+    let mut fourth_column_l_values = [0.0; APP_INNER_BLOCK_SIZE];
 
     let mut col = accepted_end;
     while col < size {
@@ -3875,6 +3877,41 @@ fn app_apply_accepted_prefix_update_with_workspace(
 
         for relative_pivot in 0..accepted_width {
             column_l_values[relative_pivot] = matrix[(block_start + relative_pivot) * size + col];
+        }
+        #[cfg(target_arch = "aarch64")]
+        if col + 3 < size
+            && incremental_column != Some(col + 1)
+            && incremental_column != Some(col + 2)
+            && incremental_column != Some(col + 3)
+        {
+            for relative_pivot in 0..accepted_width {
+                next_column_l_values[relative_pivot] =
+                    matrix[(block_start + relative_pivot) * size + col + 1];
+                third_column_l_values[relative_pivot] =
+                    matrix[(block_start + relative_pivot) * size + col + 2];
+                fourth_column_l_values[relative_pivot] =
+                    matrix[(block_start + relative_pivot) * size + col + 3];
+            }
+            // SAFETY: the helper applies the lower-triangle diagonal boundary
+            // with scalar entry updates before using vector stores in rows
+            // valid for all four target columns.
+            unsafe {
+                app_apply_accepted_prefix_update_four_columns_neon(
+                    matrix,
+                    size,
+                    col,
+                    accepted_width,
+                    ld_values,
+                    AppAcceptedFourColumnValues {
+                        first: &column_l_values,
+                        second: &next_column_l_values,
+                        third: &third_column_l_values,
+                        fourth: &fourth_column_l_values,
+                    },
+                );
+            }
+            col += 4;
+            continue;
         }
         #[cfg(target_arch = "aarch64")]
         if col + 1 < size && incremental_column != Some(col + 1) {
@@ -3911,6 +3948,363 @@ fn app_apply_accepted_prefix_update_with_workspace(
     }
     let update_time = update_started.map_or(Duration::default(), |started| started.elapsed());
     (ld_time, update_time)
+}
+
+#[cfg(target_arch = "aarch64")]
+struct AppAcceptedFourColumnValues<'a> {
+    first: &'a [f64; APP_INNER_BLOCK_SIZE],
+    second: &'a [f64; APP_INNER_BLOCK_SIZE],
+    third: &'a [f64; APP_INNER_BLOCK_SIZE],
+    fourth: &'a [f64; APP_INNER_BLOCK_SIZE],
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn app_apply_accepted_prefix_update_four_columns_neon(
+    matrix: &mut [f64],
+    size: usize,
+    col: usize,
+    accepted_width: usize,
+    ld_values: &[f64],
+    column_values: AppAcceptedFourColumnValues<'_>,
+) {
+    use core::arch::aarch64::{vdupq_n_f64, vfmaq_f64, vld1q_f64, vst1q_f64};
+
+    let column_l_values = column_values.first;
+    let next_column_l_values = column_values.second;
+    let third_column_l_values = column_values.third;
+    let fourth_column_l_values = column_values.fourth;
+
+    let col1 = col + 1;
+    let col2 = col + 2;
+    let col3 = col + 3;
+
+    app_apply_accepted_prefix_update_scalar_row(
+        matrix,
+        size,
+        col,
+        col,
+        accepted_width,
+        ld_values,
+        column_l_values,
+    );
+    app_apply_accepted_prefix_update_scalar_row(
+        matrix,
+        size,
+        col,
+        col1,
+        accepted_width,
+        ld_values,
+        column_l_values,
+    );
+    app_apply_accepted_prefix_update_scalar_row(
+        matrix,
+        size,
+        col1,
+        col1,
+        accepted_width,
+        ld_values,
+        next_column_l_values,
+    );
+    app_apply_accepted_prefix_update_scalar_row(
+        matrix,
+        size,
+        col,
+        col2,
+        accepted_width,
+        ld_values,
+        column_l_values,
+    );
+    app_apply_accepted_prefix_update_scalar_row(
+        matrix,
+        size,
+        col1,
+        col2,
+        accepted_width,
+        ld_values,
+        next_column_l_values,
+    );
+    app_apply_accepted_prefix_update_scalar_row(
+        matrix,
+        size,
+        col2,
+        col2,
+        accepted_width,
+        ld_values,
+        third_column_l_values,
+    );
+
+    let matrix_ptr = matrix.as_mut_ptr();
+    let ld_ptr = ld_values.as_ptr();
+    let col0_l_ptr = column_l_values.as_ptr();
+    let col1_l_ptr = next_column_l_values.as_ptr();
+    let col2_l_ptr = third_column_l_values.as_ptr();
+    let col3_l_ptr = fourth_column_l_values.as_ptr();
+    let mut row = col3;
+    while row + 3 < size {
+        let mut update00 = vdupq_n_f64(0.0);
+        let mut update01 = vdupq_n_f64(0.0);
+        let mut update10 = vdupq_n_f64(0.0);
+        let mut update11 = vdupq_n_f64(0.0);
+        let mut update20 = vdupq_n_f64(0.0);
+        let mut update21 = vdupq_n_f64(0.0);
+        let mut update30 = vdupq_n_f64(0.0);
+        let mut update31 = vdupq_n_f64(0.0);
+        let mut relative_pivot = 0;
+        while relative_pivot + 4 <= accepted_width {
+            // SAFETY: caller passes `row + 3 < size`, the four unrolled pivots
+            // are below `accepted_width`, and the LD workspace is full-width.
+            let row_ld0 = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row)) };
+            let row_ld1 = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row + 2)) };
+            let col0_l = vdupq_n_f64(unsafe { *col0_l_ptr.add(relative_pivot) });
+            let col1_l = vdupq_n_f64(unsafe { *col1_l_ptr.add(relative_pivot) });
+            let col2_l = vdupq_n_f64(unsafe { *col2_l_ptr.add(relative_pivot) });
+            let col3_l = vdupq_n_f64(unsafe { *col3_l_ptr.add(relative_pivot) });
+            update00 = vfmaq_f64(update00, row_ld0, col0_l);
+            update01 = vfmaq_f64(update01, row_ld1, col0_l);
+            update10 = vfmaq_f64(update10, row_ld0, col1_l);
+            update11 = vfmaq_f64(update11, row_ld1, col1_l);
+            update20 = vfmaq_f64(update20, row_ld0, col2_l);
+            update21 = vfmaq_f64(update21, row_ld1, col2_l);
+            update30 = vfmaq_f64(update30, row_ld0, col3_l);
+            update31 = vfmaq_f64(update31, row_ld1, col3_l);
+
+            let pivot1 = relative_pivot + 1;
+            let row_ld0 = unsafe { vld1q_f64(ld_ptr.add(pivot1 * size + row)) };
+            let row_ld1 = unsafe { vld1q_f64(ld_ptr.add(pivot1 * size + row + 2)) };
+            let col0_l = vdupq_n_f64(unsafe { *col0_l_ptr.add(pivot1) });
+            let col1_l = vdupq_n_f64(unsafe { *col1_l_ptr.add(pivot1) });
+            let col2_l = vdupq_n_f64(unsafe { *col2_l_ptr.add(pivot1) });
+            let col3_l = vdupq_n_f64(unsafe { *col3_l_ptr.add(pivot1) });
+            update00 = vfmaq_f64(update00, row_ld0, col0_l);
+            update01 = vfmaq_f64(update01, row_ld1, col0_l);
+            update10 = vfmaq_f64(update10, row_ld0, col1_l);
+            update11 = vfmaq_f64(update11, row_ld1, col1_l);
+            update20 = vfmaq_f64(update20, row_ld0, col2_l);
+            update21 = vfmaq_f64(update21, row_ld1, col2_l);
+            update30 = vfmaq_f64(update30, row_ld0, col3_l);
+            update31 = vfmaq_f64(update31, row_ld1, col3_l);
+
+            let pivot2 = relative_pivot + 2;
+            let row_ld0 = unsafe { vld1q_f64(ld_ptr.add(pivot2 * size + row)) };
+            let row_ld1 = unsafe { vld1q_f64(ld_ptr.add(pivot2 * size + row + 2)) };
+            let col0_l = vdupq_n_f64(unsafe { *col0_l_ptr.add(pivot2) });
+            let col1_l = vdupq_n_f64(unsafe { *col1_l_ptr.add(pivot2) });
+            let col2_l = vdupq_n_f64(unsafe { *col2_l_ptr.add(pivot2) });
+            let col3_l = vdupq_n_f64(unsafe { *col3_l_ptr.add(pivot2) });
+            update00 = vfmaq_f64(update00, row_ld0, col0_l);
+            update01 = vfmaq_f64(update01, row_ld1, col0_l);
+            update10 = vfmaq_f64(update10, row_ld0, col1_l);
+            update11 = vfmaq_f64(update11, row_ld1, col1_l);
+            update20 = vfmaq_f64(update20, row_ld0, col2_l);
+            update21 = vfmaq_f64(update21, row_ld1, col2_l);
+            update30 = vfmaq_f64(update30, row_ld0, col3_l);
+            update31 = vfmaq_f64(update31, row_ld1, col3_l);
+
+            let pivot3 = relative_pivot + 3;
+            let row_ld0 = unsafe { vld1q_f64(ld_ptr.add(pivot3 * size + row)) };
+            let row_ld1 = unsafe { vld1q_f64(ld_ptr.add(pivot3 * size + row + 2)) };
+            let col0_l = vdupq_n_f64(unsafe { *col0_l_ptr.add(pivot3) });
+            let col1_l = vdupq_n_f64(unsafe { *col1_l_ptr.add(pivot3) });
+            let col2_l = vdupq_n_f64(unsafe { *col2_l_ptr.add(pivot3) });
+            let col3_l = vdupq_n_f64(unsafe { *col3_l_ptr.add(pivot3) });
+            update00 = vfmaq_f64(update00, row_ld0, col0_l);
+            update01 = vfmaq_f64(update01, row_ld1, col0_l);
+            update10 = vfmaq_f64(update10, row_ld0, col1_l);
+            update11 = vfmaq_f64(update11, row_ld1, col1_l);
+            update20 = vfmaq_f64(update20, row_ld0, col2_l);
+            update21 = vfmaq_f64(update21, row_ld1, col2_l);
+            update30 = vfmaq_f64(update30, row_ld0, col3_l);
+            update31 = vfmaq_f64(update31, row_ld1, col3_l);
+
+            relative_pivot += 4;
+        }
+        while relative_pivot < accepted_width {
+            // SAFETY: caller passes `row + 3 < size`, `relative_pivot < accepted_width`,
+            // and `ld_values` contains at least `accepted_width * size` entries.
+            let row_ld0 = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row)) };
+            let row_ld1 = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row + 2)) };
+            let col0_l = vdupq_n_f64(unsafe { *col0_l_ptr.add(relative_pivot) });
+            let col1_l = vdupq_n_f64(unsafe { *col1_l_ptr.add(relative_pivot) });
+            let col2_l = vdupq_n_f64(unsafe { *col2_l_ptr.add(relative_pivot) });
+            let col3_l = vdupq_n_f64(unsafe { *col3_l_ptr.add(relative_pivot) });
+            update00 = vfmaq_f64(update00, row_ld0, col0_l);
+            update01 = vfmaq_f64(update01, row_ld1, col0_l);
+            update10 = vfmaq_f64(update10, row_ld0, col1_l);
+            update11 = vfmaq_f64(update11, row_ld1, col1_l);
+            update20 = vfmaq_f64(update20, row_ld0, col2_l);
+            update21 = vfmaq_f64(update21, row_ld1, col2_l);
+            update30 = vfmaq_f64(update30, row_ld0, col3_l);
+            update31 = vfmaq_f64(update31, row_ld1, col3_l);
+            relative_pivot += 1;
+        }
+
+        let entry0 = col * size + row;
+        let entry1 = col1 * size + row;
+        let entry2 = col2 * size + row;
+        let entry3 = col3 * size + row;
+        let minus_one = vdupq_n_f64(-1.0);
+        let current00 = unsafe { vld1q_f64(matrix_ptr.add(entry0)) };
+        let current01 = unsafe { vld1q_f64(matrix_ptr.add(entry0 + 2)) };
+        let current10 = unsafe { vld1q_f64(matrix_ptr.add(entry1)) };
+        let current11 = unsafe { vld1q_f64(matrix_ptr.add(entry1 + 2)) };
+        let current20 = unsafe { vld1q_f64(matrix_ptr.add(entry2)) };
+        let current21 = unsafe { vld1q_f64(matrix_ptr.add(entry2 + 2)) };
+        let current30 = unsafe { vld1q_f64(matrix_ptr.add(entry3)) };
+        let current31 = unsafe { vld1q_f64(matrix_ptr.add(entry3 + 2)) };
+        let updated00 = vfmaq_f64(current00, update00, minus_one);
+        let updated01 = vfmaq_f64(current01, update01, minus_one);
+        let updated10 = vfmaq_f64(current10, update10, minus_one);
+        let updated11 = vfmaq_f64(current11, update11, minus_one);
+        let updated20 = vfmaq_f64(current20, update20, minus_one);
+        let updated21 = vfmaq_f64(current21, update21, minus_one);
+        let updated30 = vfmaq_f64(current30, update30, minus_one);
+        let updated31 = vfmaq_f64(current31, update31, minus_one);
+        // SAFETY: `row + 3 < size`, so all two-lane stores stay inside the
+        // four lower-triangular target columns.
+        unsafe {
+            vst1q_f64(matrix_ptr.add(entry0), updated00);
+            vst1q_f64(matrix_ptr.add(entry0 + 2), updated01);
+            vst1q_f64(matrix_ptr.add(entry1), updated10);
+            vst1q_f64(matrix_ptr.add(entry1 + 2), updated11);
+            vst1q_f64(matrix_ptr.add(entry2), updated20);
+            vst1q_f64(matrix_ptr.add(entry2 + 2), updated21);
+            vst1q_f64(matrix_ptr.add(entry3), updated30);
+            vst1q_f64(matrix_ptr.add(entry3 + 2), updated31);
+        }
+        row += 4;
+    }
+    while row + 1 < size {
+        let mut update0 = vdupq_n_f64(0.0);
+        let mut update1 = vdupq_n_f64(0.0);
+        let mut update2 = vdupq_n_f64(0.0);
+        let mut update3 = vdupq_n_f64(0.0);
+        let mut relative_pivot = 0;
+        while relative_pivot + 4 <= accepted_width {
+            // SAFETY: caller passes `row + 1 < size`, the four unrolled pivots
+            // are below `accepted_width`, and the LD workspace is full-width.
+            let row_ld = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row)) };
+            let col0_l = vdupq_n_f64(unsafe { *col0_l_ptr.add(relative_pivot) });
+            let col1_l = vdupq_n_f64(unsafe { *col1_l_ptr.add(relative_pivot) });
+            let col2_l = vdupq_n_f64(unsafe { *col2_l_ptr.add(relative_pivot) });
+            let col3_l = vdupq_n_f64(unsafe { *col3_l_ptr.add(relative_pivot) });
+            update0 = vfmaq_f64(update0, row_ld, col0_l);
+            update1 = vfmaq_f64(update1, row_ld, col1_l);
+            update2 = vfmaq_f64(update2, row_ld, col2_l);
+            update3 = vfmaq_f64(update3, row_ld, col3_l);
+
+            let pivot1 = relative_pivot + 1;
+            let row_ld = unsafe { vld1q_f64(ld_ptr.add(pivot1 * size + row)) };
+            let col0_l = vdupq_n_f64(unsafe { *col0_l_ptr.add(pivot1) });
+            let col1_l = vdupq_n_f64(unsafe { *col1_l_ptr.add(pivot1) });
+            let col2_l = vdupq_n_f64(unsafe { *col2_l_ptr.add(pivot1) });
+            let col3_l = vdupq_n_f64(unsafe { *col3_l_ptr.add(pivot1) });
+            update0 = vfmaq_f64(update0, row_ld, col0_l);
+            update1 = vfmaq_f64(update1, row_ld, col1_l);
+            update2 = vfmaq_f64(update2, row_ld, col2_l);
+            update3 = vfmaq_f64(update3, row_ld, col3_l);
+
+            let pivot2 = relative_pivot + 2;
+            let row_ld = unsafe { vld1q_f64(ld_ptr.add(pivot2 * size + row)) };
+            let col0_l = vdupq_n_f64(unsafe { *col0_l_ptr.add(pivot2) });
+            let col1_l = vdupq_n_f64(unsafe { *col1_l_ptr.add(pivot2) });
+            let col2_l = vdupq_n_f64(unsafe { *col2_l_ptr.add(pivot2) });
+            let col3_l = vdupq_n_f64(unsafe { *col3_l_ptr.add(pivot2) });
+            update0 = vfmaq_f64(update0, row_ld, col0_l);
+            update1 = vfmaq_f64(update1, row_ld, col1_l);
+            update2 = vfmaq_f64(update2, row_ld, col2_l);
+            update3 = vfmaq_f64(update3, row_ld, col3_l);
+
+            let pivot3 = relative_pivot + 3;
+            let row_ld = unsafe { vld1q_f64(ld_ptr.add(pivot3 * size + row)) };
+            let col0_l = vdupq_n_f64(unsafe { *col0_l_ptr.add(pivot3) });
+            let col1_l = vdupq_n_f64(unsafe { *col1_l_ptr.add(pivot3) });
+            let col2_l = vdupq_n_f64(unsafe { *col2_l_ptr.add(pivot3) });
+            let col3_l = vdupq_n_f64(unsafe { *col3_l_ptr.add(pivot3) });
+            update0 = vfmaq_f64(update0, row_ld, col0_l);
+            update1 = vfmaq_f64(update1, row_ld, col1_l);
+            update2 = vfmaq_f64(update2, row_ld, col2_l);
+            update3 = vfmaq_f64(update3, row_ld, col3_l);
+
+            relative_pivot += 4;
+        }
+        while relative_pivot < accepted_width {
+            // SAFETY: caller passes `row + 1 < size`, `relative_pivot < accepted_width`,
+            // and `ld_values` contains at least `accepted_width * size` entries.
+            let row_ld = unsafe { vld1q_f64(ld_ptr.add(relative_pivot * size + row)) };
+            let col0_l = vdupq_n_f64(unsafe { *col0_l_ptr.add(relative_pivot) });
+            let col1_l = vdupq_n_f64(unsafe { *col1_l_ptr.add(relative_pivot) });
+            let col2_l = vdupq_n_f64(unsafe { *col2_l_ptr.add(relative_pivot) });
+            let col3_l = vdupq_n_f64(unsafe { *col3_l_ptr.add(relative_pivot) });
+            update0 = vfmaq_f64(update0, row_ld, col0_l);
+            update1 = vfmaq_f64(update1, row_ld, col1_l);
+            update2 = vfmaq_f64(update2, row_ld, col2_l);
+            update3 = vfmaq_f64(update3, row_ld, col3_l);
+            relative_pivot += 1;
+        }
+
+        let entry0 = col * size + row;
+        let entry1 = col1 * size + row;
+        let entry2 = col2 * size + row;
+        let entry3 = col3 * size + row;
+        let minus_one = vdupq_n_f64(-1.0);
+        let current0 = unsafe { vld1q_f64(matrix_ptr.add(entry0)) };
+        let current1 = unsafe { vld1q_f64(matrix_ptr.add(entry1)) };
+        let current2 = unsafe { vld1q_f64(matrix_ptr.add(entry2)) };
+        let current3 = unsafe { vld1q_f64(matrix_ptr.add(entry3)) };
+        let updated0 = vfmaq_f64(current0, update0, minus_one);
+        let updated1 = vfmaq_f64(current1, update1, minus_one);
+        let updated2 = vfmaq_f64(current2, update2, minus_one);
+        let updated3 = vfmaq_f64(current3, update3, minus_one);
+        // SAFETY: `row + 1 < size`, so all two-lane stores stay inside the
+        // four lower-triangular target columns.
+        unsafe {
+            vst1q_f64(matrix_ptr.add(entry0), updated0);
+            vst1q_f64(matrix_ptr.add(entry1), updated1);
+            vst1q_f64(matrix_ptr.add(entry2), updated2);
+            vst1q_f64(matrix_ptr.add(entry3), updated3);
+        }
+        row += 2;
+    }
+    while row < size {
+        app_apply_accepted_prefix_update_scalar_row(
+            matrix,
+            size,
+            col,
+            row,
+            accepted_width,
+            ld_values,
+            column_l_values,
+        );
+        app_apply_accepted_prefix_update_scalar_row(
+            matrix,
+            size,
+            col1,
+            row,
+            accepted_width,
+            ld_values,
+            next_column_l_values,
+        );
+        app_apply_accepted_prefix_update_scalar_row(
+            matrix,
+            size,
+            col2,
+            row,
+            accepted_width,
+            ld_values,
+            third_column_l_values,
+        );
+        app_apply_accepted_prefix_update_scalar_row(
+            matrix,
+            size,
+            col3,
+            row,
+            accepted_width,
+            ld_values,
+            fourth_column_l_values,
+        );
+        row += 1;
+    }
 }
 
 #[cfg(target_arch = "aarch64")]

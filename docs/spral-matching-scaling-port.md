@@ -213,3 +213,10 @@ Release performance notes on dense case 58:
   `app_accepted_update_dense_witnesses_match_native_host_gemm_tiles` unit test
   extracts dense witnesses and compares Rust's accepted-prefix trailing update
   against those native source kernels tile-by-tile before further kernel work.
+- The AArch64 accepted-update kernel now also processes full four-column target
+  groups, matching the source `host_gemm(OP_N, OP_T)` shape more closely while
+  using scalar prelude rows for the lower-triangle diagonal boundary. A
+  five-repeat release profile moved saved-scaling case 58 factor time to about
+  `227us` and case 59 to about `313us`; case 59's saved-scaling
+  `app_accepted_update` bucket dropped to about `48us`. The next measured
+  dense-front buckets are APP pivot work and restore/storage overhead.
