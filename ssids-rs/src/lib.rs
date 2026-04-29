@@ -2548,25 +2548,26 @@ fn dense_symmetric_swap(matrix: &mut [f64], size: usize, lhs: usize, rhs: usize)
     let (lhs, rhs) = if lhs < rhs { (lhs, rhs) } else { (rhs, lhs) };
 
     for col in 0..lhs {
-        let lhs_offset = dense_lower_offset(size, lhs, col);
-        let rhs_offset = dense_lower_offset(size, rhs, col);
+        let column_offset = col * size;
+        let lhs_offset = column_offset + lhs;
+        let rhs_offset = column_offset + rhs;
         matrix.swap(lhs_offset, rhs_offset);
     }
 
     for index in (lhs + 1)..rhs {
-        let lhs_offset = dense_lower_offset(size, index, lhs);
-        let rhs_offset = dense_lower_offset(size, rhs, index);
+        let lhs_offset = lhs * size + index;
+        let rhs_offset = index * size + rhs;
         matrix.swap(lhs_offset, rhs_offset);
     }
 
     for row in (rhs + 1)..size {
-        let lhs_offset = dense_lower_offset(size, row, lhs);
-        let rhs_offset = dense_lower_offset(size, row, rhs);
+        let lhs_offset = lhs * size + row;
+        let rhs_offset = rhs * size + row;
         matrix.swap(lhs_offset, rhs_offset);
     }
 
-    let lhs_diag = dense_lower_offset(size, lhs, lhs);
-    let rhs_diag = dense_lower_offset(size, rhs, rhs);
+    let lhs_diag = lhs * size + lhs;
+    let rhs_diag = rhs * size + rhs;
     matrix.swap(lhs_diag, rhs_diag);
 }
 
