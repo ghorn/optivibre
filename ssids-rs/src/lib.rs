@@ -2627,14 +2627,29 @@ fn pack_dense_lower_suffix(
     start: usize,
     suffix_size: usize,
 ) -> Vec<f64> {
-    let mut packed = vec![0.0; packed_lower_len(suffix_size)];
+    let packed_len = packed_lower_len(suffix_size);
+    let mut packed = Vec::<f64>::with_capacity(packed_len);
+    let packed_ptr = packed.as_mut_ptr();
     for local_col in 0..suffix_size {
         let source_col = start + local_col;
         let len = suffix_size - local_col;
         let source_start = dense_lower_offset(size, source_col, source_col);
         let packed_offset = packed_lower_offset(suffix_size, local_col, local_col);
-        packed[packed_offset..packed_offset + len]
-            .copy_from_slice(&matrix[source_start..source_start + len]);
+        // SAFETY: the packed lower-triangle column ranges are disjoint and
+        // cover exactly `packed_len` entries. Each source range is a contiguous
+        // lower-column suffix inside the dense front.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                matrix.as_ptr().add(source_start),
+                packed_ptr.add(packed_offset),
+                len,
+            );
+        }
+    }
+    // SAFETY: every packed entry is initialized exactly once by the column
+    // copies above. For an empty suffix, both capacity and length are zero.
+    unsafe {
+        packed.set_len(packed_len);
     }
     packed
 }
