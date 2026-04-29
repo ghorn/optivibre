@@ -47,16 +47,16 @@ Reports are written to `target/reports/ipopt-parity-coverage/`:
 
 Latest generated profile snapshot, from the source-built nonlinear parity run:
 
-- IPOPT Algorithm C++: `10247 / 18642` lines and `1341 / 3556` branches hit.
-- Rust NLIP core: `8731 / 14052` lines hit, with `0` unhit branch-like lines
+- IPOPT Algorithm C++: `10318 / 18642` lines and `1346 / 3556` branches hit.
+- Rust NLIP core: `8818 / 14187` lines hit, with `0` unhit branch-like lines
   still classified as `needs audit`.
 - `IpDefaultIterateInitializer.cpp`: `498 / 532` lines and `58 / 70` branches
   hit after adding the requested `least_square_init_primal=yes` witness.
 - `IpIpoptAlg.cpp` convergence-status cases for max-iteration, diverging
   iterates, CPU time, wall time, acceptable termination, and user-requested
   stop are now covered by focused witnesses.
-- `IpBacktrackingLineSearch.cpp`: `714 / 993` lines and `186 / 252` branches
-  hit, with active-watch uncovered branch lines at `36 / 53`.
+- `IpBacktrackingLineSearch.cpp`: `717 / 993` lines and `188 / 252` branches
+  hit, with active-watch uncovered branch lines at `35 / 51`.
 
 The script exits nonzero if any unhit Rust core branch-like line remains
 classified as `needs audit`; those branches must either get a focused witness or
@@ -184,6 +184,12 @@ The latest focused run added source-option witnesses for:
   `outer_iter_count + 1` restoration iteration numbering and
   `MaximumIterationsExceeded` status when successive restoration iterations
   exceed the configured limit
+- Restoration original-objective evaluation-error max-iteration status:
+  a focused synthetic restoration problem now forces nonfinite original
+  objective values at restoration trial points while SOC and soft restoration
+  are disabled. NLIP keeps accepting restoration tiny steps until
+  `InteriorPointSolveError::MaxIterations`, matching IPOPT's
+  `MaximumIterationsExceeded` status and iteration count.
 - `IpRestoMinC_1Nrm.cpp::PerformRestoration` restoration solver-return
   classification: NLIP now carries IPOPT's square-problem
   `FEASIBILITY_PROBLEM_SOLVED` path as `InteriorPointTermination::FeasiblePointFound`
@@ -235,7 +241,7 @@ source option.
 | Wall-time exit | `IpOptErrorConvCheck.cpp::max_wall_time`, `IpIpoptAlg.cpp::WALLTIME_EXCEEDED` | `InteriorPointSolveError::WallTimeExceeded` and failure context | Mirrors IPOPT's positive-option bound and termination ordering after convergence/divergence; focused test forces the iteration-0 branch with `max_wall_time=1e-12` and compares IPOPT's `MaximumWallTimeExceeded` status |
 | CPU-time exit | `IpOptErrorConvCheck.cpp::max_cpu_time`, `IpIpoptAlg.cpp::CPUTIME_EXCEEDED` | `InteriorPointSolveError::CpuTimeExceeded` and failure context | Mirrors IPOPT's positive-option bound and source termination ordering before wall time; focused test forces the iteration-0 branch with `max_cpu_time=1e-12` and compares IPOPT's `MaximumCpuTimeExceeded` status |
 | User-requested stop | `IpOptErrorConvCheck.cpp::IntermediateCallBack`, `IpRestoConvCheck.cpp::CheckConvergence`, `IpIpoptAlg.cpp::USER_STOP` / `RESTORATION_USER_STOP` | `solve_nlp_interior_point_with_control_callback` and `InteriorPointSolveError::UserRequestedStop` | Mirrors IPOPT's false intermediate-callback return path after an accepted step and inside restoration; focused tests compare both solvers' retained state and IPOPT's `UserRequestedStop` status |
-| Restoration | `IpBacktrackingLineSearch.cpp` restoration entry plus `IpRestoIpoptNLP.cpp` / `IpRestoIterateInitializer.cpp` / `IpRestoMinC_1Nrm.cpp` / `IpRestoConvCheck.cpp` / `IpIpoptAlg.cpp` emergency mode | restoration diagnostic path | Diagnostic only for current source-SPRAL parity; the restoration NLP mirrors IPOPT's `rho`, `eta=sqrt(mu)`, objective/Jacobian/Hessian shape, original-objective eval-error probe, raised `resto.theta_max_fact`, source `n_c` / `p_c` and `n_d` / `p_d` quadratic initializer for equality and `d-s` residuals. On a restoration return, NLIP now copies the restoration slack, applies IPOPT's `ComputeBoundMultiplierStep` plus the default `bound_mult_reset_threshold=1e3`, resets original constraint multipliers to zero like `resto.constr_mult_init_max=0`, gates the return through IPOPT's `RestoConvergenceCheck` original-problem progress rules with the active `max_iter` budget, `max_resto_iter` successive-iteration limit, and `expect_infeasible_problem` first-restoration return threshold, maps square-problem feasible restoration returns through `ComputeFeasibilityMultipliersPostprocess` and classifies them as `Converged` when the full KKT test is satisfied or `FeasiblePointFound` otherwise, maps restoration callback stops to `UserRequestedStop`, maps restoration iteration-limit exits to `MaxIterations`, maps emergency-restoration local infeasibility and one-shot `start_with_resto` entry to `InteriorPointSolveError::LocalInfeasibility` like IPOPT's `InfeasibleProblemDetected`, and mirrors the expect-infeasible y-multiplier restoration shortcut. Original-objective eval-error diagnostics now expose a known NLIP `RestorationFailed` vs IPOPT `MaximumIterationsExceeded` mismatch, so restoration-failed/recoverable end-to-end behavior remains open |
+| Restoration | `IpBacktrackingLineSearch.cpp` restoration entry plus `IpRestoIpoptNLP.cpp` / `IpRestoIterateInitializer.cpp` / `IpRestoMinC_1Nrm.cpp` / `IpRestoConvCheck.cpp` / `IpIpoptAlg.cpp` emergency mode | restoration diagnostic path | Mirrors IPOPT for the current source-SPRAL parity profile; the restoration NLP mirrors IPOPT's `rho`, `eta=sqrt(mu)`, objective/Jacobian/Hessian shape, original-objective eval-error probe, raised `resto.theta_max_fact`, source `n_c` / `p_c` and `n_d` / `p_d` quadratic initializer for equality and `d-s` residuals. On a restoration return, NLIP copies the restoration slack, applies IPOPT's `ComputeBoundMultiplierStep` plus the default `bound_mult_reset_threshold=1e3`, resets original constraint multipliers to zero like `resto.constr_mult_init_max=0`, gates the return through IPOPT's `RestoConvergenceCheck` original-problem progress rules with the active `max_iter` budget, `max_resto_iter` successive-iteration limit, and `expect_infeasible_problem` first-restoration return threshold, maps square-problem feasible restoration returns through `ComputeFeasibilityMultipliersPostprocess` and classifies them as `Converged` when the full KKT test is satisfied or `FeasiblePointFound` otherwise, maps restoration callback stops to `UserRequestedStop`, maps restoration iteration-limit exits to `MaxIterations`, maps restoration original-objective evaluation-error max-iteration cases to `MaxIterations`, maps emergency-restoration local infeasibility and one-shot `start_with_resto` entry to `InteriorPointSolveError::LocalInfeasibility` like IPOPT's `InfeasibleProblemDetected`, and mirrors the expect-infeasible y-multiplier restoration shortcut. No source-SPRAL restoration behavior mismatch is known after the current focused suite and glider diagnostic |
 
 ## Rust-Only Branch Audit
 
@@ -255,7 +261,7 @@ is intentionally Rust-only. Any future branch found by `rust-core.lcov` that is
 active under the `SpralSrc` parity profile must be classified here before a
 behavior change is accepted.
 
-Known uncovered source-backed parity work:
+Known remaining nonlinear parity witness searches:
 
 - IPOPT active-watchdog `StopWatchDog` after trial-budget exhaustion is now
   covered: NLIP restores the stored watchdog iterate and direction, clears the
@@ -292,18 +298,15 @@ Known uncovered source-backed parity work:
   `max_resto_iter=0` witness now pins `RestoConvCheck`'s successive restoration
   iteration limit and IPOPT's restoration iteration numbering. The restoration
   subproblem now also mirrors `MinC_1NrmRestorationPhase`'s raised default
-  `resto.theta_max_fact=1e8`. A synthetic
-  restoration original-objective eval-error case exposed a deeper restoration
-  line-search/tiny-step sensitivity: for NaN original objectives at restoration
-  trial points, source IPOPT keeps accepting tiny `r`-phase steps and reaches
-  `MaximumIterationsExceeded`, while current NLIP returns
-  `RestorationFailed`. That diagnostic is intentionally ignored until the
-  restoration line-search alpha-min/tiny-step behavior is ported source-faithfully.
-  The remaining restoration-failure work is narrower: close that
-  alpha-min/tiny-step mismatch, then find natural end-to-end witnesses for
-  IPOPT's `RESTORATION_FAILED` / recoverable restoration returns, find a natural
-  uppercase `S` soft-restoration witness, and keep the active-watchdog pre-line
-  tiny-step branch on the witness search list.
+  `resto.theta_max_fact=1e8`. The synthetic restoration original-objective
+  eval-error case now matches IPOPT's tiny restoration-step
+  `MaximumIterationsExceeded` behavior. No accepted-state-changing nonlinear
+  behavior difference is known in the source-SPRAL parity profile. Remaining
+  witness searches are for naturally occurring IPOPT `RESTORATION_FAILED` /
+  recoverable restoration returns, a natural uppercase `S` soft-restoration
+  return-to-original-criterion path, and a natural active-watchdog pre-line
+  tiny-step path; the corresponding Rust branches are implemented or classified
+  but do not currently have natural end-to-end witnesses.
 
 The generated `branch-ledger.md` report is the working checklist for this
 audit. IPOPT uncovered branches in the watched routines should either gain a
