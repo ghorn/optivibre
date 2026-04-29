@@ -12586,7 +12586,10 @@ where
                     line_search_last_alpha_y: Some(trial_alpha_y),
                     line_search_backtrack_count: line_search_iterations,
                     second_order_correction_used: false,
-                    watchdog_accepted: false,
+                    // IPOPT BacktrackingLineSearch appends "W" and leaves
+                    // watchdog mode whenever DoBacktrackingLineSearch accepts
+                    // a trial while in_watchdog_ is active.
+                    watchdog_accepted: watchdog_active,
                     tiny_step: false,
                     bound_multiplier_corrected,
                 });
@@ -13125,7 +13128,10 @@ where
                             line_search_last_alpha_y: Some(soc_alpha_y),
                             line_search_backtrack_count: line_search_iterations,
                             second_order_correction_used: true,
-                            watchdog_accepted: false,
+                            // IPOPT marks successful SOC/corrector trial
+                            // acceptance as a watchdog success if the outer
+                            // line-search state is in_watchdog_.
+                            watchdog_accepted: watchdog_active,
                             tiny_step: false,
                             bound_multiplier_corrected,
                         });

@@ -400,7 +400,7 @@ fn parse_ipopt_step_tags(journal_output: Option<&str>) -> BTreeMap<usize, String
         let Some(iteration) = tokens.first().and_then(|token| token.parse::<usize>().ok()) else {
             continue;
         };
-        let Some(alpha_pr_token) = tokens.iter().rev().nth(1).copied() else {
+        let Some(alpha_pr_token) = ipopt_alpha_primal_token(&tokens) else {
             continue;
         };
         let Some(step_char) = alpha_pr_token
@@ -413,6 +413,62 @@ fn parse_ipopt_step_tags(journal_output: Option<&str>) -> BTreeMap<usize, String
         tags.insert(iteration, step_char.to_string());
     }
     tags
+}
+
+fn ipopt_alpha_primal_token<'a>(tokens: &'a [&'a str]) -> Option<&'a str> {
+    tokens.windows(2).rev().find_map(|window| {
+        let alpha_primal = window[0];
+        let line_search_count = window[1];
+        if line_search_count.parse::<usize>().is_ok()
+            && alpha_primal.contains('e')
+            && alpha_primal
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_digit() || ch == '-' || ch == '+')
+        {
+            Some(alpha_primal)
+        } else {
+            None
+        }
+    })
+}
+
+fn parse_ipopt_info_strings(journal_output: Option<&str>) -> BTreeMap<usize, String> {
+    let mut info_strings = BTreeMap::new();
+    let Some(journal) = journal_output else {
+        return info_strings;
+    };
+    for line in journal.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || !trimmed.as_bytes()[0].is_ascii_digit() {
+            continue;
+        }
+        let tokens = trimmed.split_whitespace().collect::<Vec<_>>();
+        let Some(iteration) = tokens.first().and_then(|token| token.parse::<usize>().ok()) else {
+            continue;
+        };
+        let Some(alpha_index) = tokens.windows(2).rposition(|window| {
+            window[1].parse::<usize>().is_ok()
+                && window[0].contains('e')
+                && window[0]
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_digit() || ch == '-' || ch == '+')
+        }) else {
+            continue;
+        };
+        let info_start = alpha_index + 2;
+        if info_start < tokens.len() {
+            info_strings.insert(iteration, tokens[info_start..].join(""));
+        }
+    }
+    info_strings
+}
+
+fn ipopt_info_string_seen(summary: &optimization::IpoptSummary, marker: char) -> bool {
+    parse_ipopt_info_strings(summary.journal_output.as_deref())
+        .values()
+        .any(|info| info.contains(marker))
 }
 
 fn nlip_step_tag(snapshot: &optimization::InteriorPointIterationSnapshot) -> Option<String> {
@@ -674,6 +730,17 @@ fn assert_native_event_seen(
             .iter()
             .any(|snapshot| snapshot.events.contains(&event)),
         "{problem_name} did not exercise expected NLIP event {event:?}"
+    );
+}
+
+fn assert_ipopt_info_string_seen(
+    problem_name: &str,
+    summary: &optimization::IpoptSummary,
+    marker: char,
+) {
+    assert!(
+        ipopt_info_string_seen(summary, marker),
+        "{problem_name} did not exercise expected IPOPT info marker {marker:?}"
     );
 }
 
@@ -1195,6 +1262,184 @@ fn solve_ipopt_with_options_ok<P: CompiledNlpProblem>(
         }
         Err(err) => unreachable!("asserted success: {err}"),
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WatchdogActivationProfile {
+    trigger: usize,
+    trial_max: usize,
+    beta: f64,
+    max_soc: usize,
+    disable_fast_mu: bool,
+    disable_tiny_step: bool,
+}
+
+impl WatchdogActivationProfile {
+    fn label(self) -> String {
+        format!(
+            "tr{}_wm{}_b{:.2}_soc{}_fast{}_tiny{}",
+            self.trigger,
+            self.trial_max,
+            self.beta,
+            self.max_soc,
+            if self.disable_fast_mu { "off" } else { "on" },
+            if self.disable_tiny_step { "off" } else { "on" },
+        )
+    }
+
+    fn apply_native(self, options: &mut InteriorPointOptions) {
+        options.max_iters = 220;
+        options.watchdog_shortened_iter_trigger = self.trigger;
+        options.watchdog_trial_iter_max = self.trial_max;
+        options.line_search_beta = self.beta;
+        options.max_second_order_corrections = self.max_soc;
+        options.second_order_correction = self.max_soc > 0;
+        if self.disable_fast_mu {
+            options.mu_allow_fast_monotone_decrease = false;
+        }
+        if self.disable_tiny_step {
+            options.tiny_step_tol = 0.0;
+        }
+    }
+
+    fn apply_ipopt(self, options: &mut IpoptOptions) {
+        options.max_iters = 220;
+        options.print_level = 5;
+        options.suppress_banner = true;
+        options.raw_options.push(IpoptRawOption::integer(
+            "watchdog_shortened_iter_trigger",
+            self.trigger as i32,
+        ));
+        options.raw_options.push(IpoptRawOption::integer(
+            "watchdog_trial_iter_max",
+            self.trial_max as i32,
+        ));
+        options
+            .raw_options
+            .push(IpoptRawOption::number("alpha_red_factor", self.beta));
+        options
+            .raw_options
+            .push(IpoptRawOption::integer("max_soc", self.max_soc as i32));
+        options
+            .raw_options
+            .push(IpoptRawOption::text("print_info_string", "yes"));
+        if self.disable_fast_mu {
+            options.raw_options.push(IpoptRawOption::text(
+                "mu_allow_fast_monotone_decrease",
+                "no",
+            ));
+        }
+        if self.disable_tiny_step {
+            options
+                .raw_options
+                .push(IpoptRawOption::number("tiny_step_tol", 0.0));
+        }
+    }
+}
+
+fn accepted_trace_strictly_clean(
+    native: &optimization::InteriorPointSummary,
+    ipopt: &optimization::IpoptSummary,
+) -> bool {
+    let native_trace = nlip_accepted_trace(native);
+    let ipopt_trace = ipopt_accepted_trace(ipopt);
+    native_trace.len() == ipopt_trace.len()
+        && native_trace
+            .iter()
+            .zip(ipopt_trace.iter())
+            .all(|(native_point, ipopt_point)| {
+                let tags_match = match (&native_point.step_tag, &ipopt_point.step_tag) {
+                    (Some(native_tag), Some(ipopt_tag)) => native_tag == ipopt_tag,
+                    _ => true,
+                };
+                let alpha_match = match (native_point.alpha_pr, ipopt_point.alpha_pr) {
+                    (Some(native_alpha), Some(ipopt_alpha)) => {
+                        (native_alpha - ipopt_alpha).abs()
+                            <= 1.0e-10_f64.max(1.0e-8 * ipopt_alpha.abs())
+                    }
+                    _ => true,
+                };
+                let mu_match = !native_point.has_barrier_parameter
+                    || !ipopt_point.has_barrier_parameter
+                    || native_point
+                        .barrier_parameter
+                        .max(ipopt_point.barrier_parameter)
+                        <= 1.0e-10
+                    || log_gap(
+                        native_point.barrier_parameter,
+                        ipopt_point.barrier_parameter,
+                        1.0e-16,
+                    ) <= 0.05;
+                let regularization_match = optional_log_gap(
+                    native_point.regularization_size,
+                    ipopt_point.regularization_size,
+                    1.0e-20,
+                )
+                .is_none_or(|gap| gap <= 0.05);
+                tags_match
+                    && alpha_match
+                    && mu_match
+                    && regularization_match
+                    && native_point.line_search_trials == ipopt_point.line_search_trials
+                    && log_gap(native_point.primal_inf, ipopt_point.primal_inf, 1.0e-6) <= 0.05
+                    && log_gap(native_point.dual_inf, ipopt_point.dual_inf, 1.0e-12) <= 0.05
+            })
+}
+
+fn run_watchdog_activation_sweep_case<P: CompiledNlpProblem>(
+    case_name: &str,
+    problem: &P,
+    x0: &[f64],
+    parameters: &[ParameterMatrix<'_>],
+    profile: WatchdogActivationProfile,
+) -> bool {
+    let native = solve_nlp_interior_point_with_callback(
+        problem,
+        x0,
+        parameters,
+        &native_options_with(|options| profile.apply_native(options)),
+        |_| {},
+    );
+    let Ok(native) = native else {
+        println!(
+            "[watchdog-sweep] {case_name}/{} native_failed={native:?}",
+            profile.label()
+        );
+        return false;
+    };
+    let ipopt = solve_nlp_ipopt(
+        problem,
+        x0,
+        parameters,
+        &ipopt_options_with(|options| profile.apply_ipopt(options)),
+    );
+    let Ok(ipopt) = ipopt else {
+        println!(
+            "[watchdog-sweep] {case_name}/{} ipopt_failed={ipopt:?}",
+            profile.label()
+        );
+        return false;
+    };
+    assert_source_built_spral_ipopt_provenance(&ipopt);
+    let nlip_armed = native.snapshots.iter().any(|snapshot| {
+        snapshot
+            .events
+            .contains(&InteriorPointIterationEvent::WatchdogArmed)
+    });
+    let nlip_activated = native.snapshots.iter().any(|snapshot| {
+        snapshot
+            .events
+            .contains(&InteriorPointIterationEvent::WatchdogActivated)
+    });
+    let ipopt_w = ipopt_info_string_seen(&ipopt, 'W');
+    let trace_clean = accepted_trace_strictly_clean(&native, &ipopt);
+    let native_steps = nlip_accepted_trace(&native).len();
+    let ipopt_steps = ipopt_accepted_trace(&ipopt).len();
+    println!(
+        "[watchdog-sweep] {case_name}/{} nlip_steps={native_steps} ipopt_steps={ipopt_steps} nlip_armed={nlip_armed} nlip_activated={nlip_activated} ipopt_w={ipopt_w} trace_clean={trace_clean}",
+        profile.label(),
+    );
+    nlip_activated && ipopt_w && trace_clean
 }
 
 #[rstest]
@@ -1782,6 +2027,8 @@ fn compare_native_and_ipopt_with_watchdog_trigger_profile() {
         &x0,
         &[],
         ipopt_options_with(|options| {
+            options.print_level = 5;
+            options.suppress_banner = true;
             options.raw_options.push(IpoptRawOption::integer(
                 "watchdog_shortened_iter_trigger",
                 3,
@@ -1789,6 +2036,9 @@ fn compare_native_and_ipopt_with_watchdog_trigger_profile() {
             options
                 .raw_options
                 .push(IpoptRawOption::integer("watchdog_trial_iter_max", 3));
+            options
+                .raw_options
+                .push(IpoptRawOption::text("print_info_string", "yes"));
         }),
     );
     assert_native_event_seen(
@@ -1796,6 +2046,12 @@ fn compare_native_and_ipopt_with_watchdog_trigger_profile() {
         &native,
         InteriorPointIterationEvent::WatchdogArmed,
     );
+    assert_native_event_seen(
+        "hanging_chain_watchdog",
+        &native,
+        InteriorPointIterationEvent::WatchdogActivated,
+    );
+    assert_ipopt_info_string_seen("hanging_chain_watchdog", &ipopt, 'W');
     assert_native_matches_ipopt(
         "hanging_chain_watchdog",
         Some(backend),
@@ -1816,6 +2072,126 @@ fn compare_native_and_ipopt_with_watchdog_trigger_profile() {
             max_mu_log_gap: 0.05,
             max_regularization_log_gap: 0.05,
         },
+    );
+}
+
+#[test]
+#[ignore = "diagnostic sweep for finding trace-clean IPOPT watchdog activation witnesses"]
+fn print_watchdog_activation_profile_sweep() {
+    skip_without_native_spral!();
+    let backend = CallbackBackend::Aot;
+    let hanging_chain = build_problem_ok(hanging_chain_problem(backend), backend);
+    let hanging_chain_x0 = hanging_chain_initial_guess();
+    let equality_rosenbrock = build_problem_ok(constrained_rosenbrock_problem(backend), backend);
+    let casadi_rosenbrock = build_problem_ok(casadi_rosenbrock_nlp_problem(backend), backend);
+    let hs071 = build_problem_ok(hs071_problem(backend), backend);
+    let profiles = [
+        WatchdogActivationProfile {
+            trigger: 1,
+            trial_max: 1,
+            beta: 0.5,
+            max_soc: 4,
+            disable_fast_mu: false,
+            disable_tiny_step: false,
+        },
+        WatchdogActivationProfile {
+            trigger: 1,
+            trial_max: 3,
+            beta: 0.5,
+            max_soc: 4,
+            disable_fast_mu: false,
+            disable_tiny_step: false,
+        },
+        WatchdogActivationProfile {
+            trigger: 2,
+            trial_max: 3,
+            beta: 0.5,
+            max_soc: 4,
+            disable_fast_mu: false,
+            disable_tiny_step: false,
+        },
+        WatchdogActivationProfile {
+            trigger: 3,
+            trial_max: 3,
+            beta: 0.5,
+            max_soc: 4,
+            disable_fast_mu: false,
+            disable_tiny_step: false,
+        },
+        WatchdogActivationProfile {
+            trigger: 1,
+            trial_max: 3,
+            beta: 0.25,
+            max_soc: 4,
+            disable_fast_mu: false,
+            disable_tiny_step: false,
+        },
+        WatchdogActivationProfile {
+            trigger: 1,
+            trial_max: 3,
+            beta: 0.75,
+            max_soc: 4,
+            disable_fast_mu: false,
+            disable_tiny_step: false,
+        },
+        WatchdogActivationProfile {
+            trigger: 1,
+            trial_max: 3,
+            beta: 0.5,
+            max_soc: 0,
+            disable_fast_mu: false,
+            disable_tiny_step: false,
+        },
+        WatchdogActivationProfile {
+            trigger: 1,
+            trial_max: 3,
+            beta: 0.5,
+            max_soc: 4,
+            disable_fast_mu: true,
+            disable_tiny_step: true,
+        },
+    ];
+    let mut found_clean_activation = false;
+    for profile in profiles {
+        found_clean_activation |= run_watchdog_activation_sweep_case(
+            "hanging_chain",
+            &hanging_chain,
+            &hanging_chain_x0,
+            &[],
+            profile,
+        );
+        found_clean_activation |= run_watchdog_activation_sweep_case(
+            "equality_rosenbrock",
+            &equality_rosenbrock,
+            &[1.2, 1.2],
+            &[],
+            profile,
+        );
+        found_clean_activation |= run_watchdog_activation_sweep_case(
+            "casadi_rosenbrock",
+            &casadi_rosenbrock,
+            &[2.5, 3.0, 0.75],
+            &[],
+            profile,
+        );
+        found_clean_activation |= run_watchdog_activation_sweep_case(
+            "hs071",
+            &hs071,
+            &[1.0, 5.0, 5.0, 1.0],
+            &[],
+            profile,
+        );
+        found_clean_activation |= run_watchdog_activation_sweep_case(
+            "linearly_constrained_quadratic",
+            &LinearlyConstrainedQuadraticProblem,
+            &[0.1, 0.9],
+            &[],
+            profile,
+        );
+    }
+    assert!(
+        found_clean_activation,
+        "no trace-clean WatchdogActivated/IPOPT-W witness found in this reduced profile sweep"
     );
 }
 

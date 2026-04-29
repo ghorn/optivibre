@@ -82,7 +82,10 @@ The latest focused run added source-option witnesses for:
 - `IpBacktrackingLineSearch.cpp::watchdog_shortened_iter_trigger=0`
 - `IpBacktrackingLineSearch.cpp::StartWatchDog` through a hanging-chain
   profile with `watchdog_shortened_iter_trigger=3`, retained only after NLIP
-  and IPOPT kept matching accepted-step counts and trace parity
+  and IPOPT kept matching accepted-step counts and trace parity. The same
+  profile also covers IPOPT's successful-watchdog `Append_info_string("W")`
+  path; NLIP now marks filter/SOC trial acceptance as a watchdog success when
+  the outer line-search state is already in watchdog mode.
   (`trigger=1` and `trigger=2` were rejected as witnesses because they exposed
   accepted-step count drift despite close final values)
 - `IpBacktrackingLineSearch.cpp::tiny_step_tol=0`
@@ -118,7 +121,7 @@ source option.
 | Alpha-for-y and dual step | `IpBacktrackingLineSearch.cpp::PerformDualStep` | `alpha_y`, `alpha_du`, multiplier step application | Mirrors IPOPT for the default primal strategy, implemented option-profile strategies, and `alpha_for_y_tol` threshold profiles covered by focused tests |
 | SOC | `IpFilterLSAcceptor.cpp::TrySecondOrderCorrection` | SOC trial loop and corrected accepted trial | Mirrors active IPOPT branch including dense `AddOneVector` order; fallback corrector variants are unreachable |
 | Primal-dual corrector | `IpFilterLSAcceptor.cpp::TryCorrector` | none under parity options | Unreachable under the current parity option profile, which keeps `corrector_type=none`; do not enable IPOPT `corrector_type` raw options for parity acceptance until the full branch is ported source-faithfully |
-| Watchdog | `IpBacktrackingLineSearch.cpp` watchdog gates | watchdog reference, shortened-step streak, and accepted watchdog trial | Mirrors IPOPT state machine; the `watchdog_shortened_iter_trigger=3` hanging-chain profile covers arming with accepted-trace parity, while accept/clear variants remain active-watch until a reduced witness covers them without hiding trace drift |
+| Watchdog | `IpBacktrackingLineSearch.cpp` watchdog gates | watchdog reference, shortened-step streak, successful watchdog exit, and watchdog trial diagnostics | Mirrors IPOPT state machine for arming and successful `W` exit under the trace-clean `watchdog_shortened_iter_trigger=3` hanging-chain profile; non-success watchdog trial steps still require a separate reduced witness before accepted-state behavior changes |
 | Tiny step | `IpBacktrackingLineSearch.cpp::DetectTinyStep` | tiny-step acceptance and barrier-update tag | Mirrors IPOPT; focused tests exercise unchecked tiny-step acceptance, while the `tiny_step_tol=0` witness covers the disabled branch |
 | Acceptable termination | `IpOptErrorConvCheck.cpp::CurrentIsAcceptable`, `IpIpoptAlg.cpp::CONVERGED_TO_ACCEPTABLE_POINT` | `InteriorPointTermination::Acceptable` and warning status | Mirrors IPOPT for `acceptable_iter=1` under intentionally tighter strict tolerances |
 | Max-iteration exit | `IpIpoptAlg.cpp::ConvergenceCheck::MAXITER_EXCEEDED` | `InteriorPointSolveError::MaxIterations` and failure context | Mirrors IPOPT status for deterministic `max_iter=0` and accepted-step `max_iter=1`; focused tests require both solvers to retain diagnostics and partial state |
