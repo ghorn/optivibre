@@ -223,13 +223,13 @@ const LINEAR_SSIDS_BRANCH_LEDGER: &[(&str, &str, &str)] = &[
     ),
     (
         "metis.balance.general_2way",
-        "guarded",
-        "Rust returns a fail-closed error if reached",
+        "hit",
+        "Rust source-port fixture moves disconnected overweight vertices",
     ),
     (
         "metis.balance.boundary_2way",
-        "guarded",
-        "Rust returns a fail-closed error if reached",
+        "hit",
+        "Rust source-port fixture moves boundary overweight vertices",
     ),
     (
         "metis.general.vertex_weights",
@@ -292,7 +292,7 @@ const LINEAR_SSIDS_BRANCH_LEDGER: &[(&str, &str, &str)] = &[
         "diagonal-dominant APP branch telemetry fixture",
     ),
     (
-        "ssids.factor.app_dense.offdiag_one_by_one_fallback",
+        "ssids.factor.app_dense.offdiag_one_by_one",
         "hit",
         "unstable off-diagonal APP branch telemetry fixture",
     ),
@@ -405,7 +405,7 @@ fn diagonal_dominant_dense_app_matrix(dimension: usize) -> Vec<Vec<f64>> {
     matrix
 }
 
-fn offdiag_one_by_one_fallback_dense_app_matrix(dimension: usize) -> Vec<Vec<f64>> {
+fn offdiag_one_by_one_dense_app_matrix(dimension: usize) -> Vec<Vec<f64>> {
     let mut matrix = diagonal_dominant_dense_app_matrix(dimension);
     matrix[0][0] = 9.9;
     matrix[1][1] = 9.9;
@@ -841,23 +841,23 @@ fn rust_app_factor_branch_telemetry_covers_one_by_one_variants() {
         ],
     );
 
-    let fallback_matrix = offdiag_one_by_one_fallback_dense_app_matrix(dimension);
-    let (col_ptrs, row_indices, values) = dense_to_lower_csc(&fallback_matrix);
+    let offdiag_matrix = offdiag_one_by_one_dense_app_matrix(dimension);
+    let (col_ptrs, row_indices, values) = dense_to_lower_csc(&offdiag_matrix);
     let matrix = SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
-        .expect("valid off-diagonal fallback APP branch fixture");
+        .expect("valid off-diagonal one-by-one APP branch fixture");
     let (symbolic, _) = analyse_with_user_ordering(matrix, &order).expect("user-order analyse");
     let matrix = SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
-        .expect("valid off-diagonal fallback APP branch fixture");
+        .expect("valid off-diagonal one-by-one APP branch fixture");
     let (_, _, profile) =
         factorize_with_profile(matrix, &symbolic, &NumericFactorOptions::default())
-            .expect("off-diagonal fallback APP factor profile");
+            .expect("off-diagonal one-by-one APP factor profile");
     let hits = profile.debug_branch_hits();
     assert_branch_hits_include(
-        "offdiag_fallback_app_factor_profile",
+        "offdiag_one_by_one_app_factor_profile",
         &hits,
         &[
             "ssids.factor.app_dense.one_by_one_pivots",
-            "ssids.factor.app_dense.offdiag_one_by_one_fallback",
+            "ssids.factor.app_dense.offdiag_one_by_one",
         ],
     );
 }

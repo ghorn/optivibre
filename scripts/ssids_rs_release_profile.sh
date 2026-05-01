@@ -81,7 +81,9 @@ micro = "\N{MICRO SIGN}"
 duration_re = re.compile(f"^([0-9.]+)(ns|{micro}s|us|ms|s)$")
 factor_re = re.compile(r"^\[ssids_rs::factorize\].*scaling=([^ ]+) (.*)$")
 dense_re = re.compile(r"^(native_matching_scaling|native_captured_order_no_scaling|rust_captured_order_no_scaling|rust_spral_matching_saved_scaling) (.*)$")
-glider_factor_re = re.compile(r"^\s*(rust_spral|native_spral) factor=([^ ]+) solve=([^ ]+)")
+glider_factor_re = re.compile(r"^\s*(rust_spral(?:_unprofiled)?|native_spral) factor=([^ ]+) solve=([^ ]+)")
+glider_front_detail_re = re.compile(r"^\s*rust_spral front_detail_profile (.*)$")
+glider_small_leaf_re = re.compile(r"^\s*rust_spral small_leaf_profile (.*)$")
 glider_dense_re = re.compile(r"^\s*rust_spral dense_front_profile (.*)$")
 glider_counter_re = re.compile(r"^\s*rust_spral dense_front_counters (.*)$")
 repeat_re = re.compile(r"\s+repeat=\d+\b")
@@ -150,6 +152,16 @@ with open(path, "r", encoding="utf-8", errors="replace") as handle:
             label = f"glider_{match.group(1)}"
             add_series(current, label, "factor", seconds(match.group(2)), "duration")
             add_series(current, label, "solve", seconds(match.group(3)), "duration")
+            continue
+        match = glider_front_detail_re.match(line)
+        if match:
+            for key, (value, kind) in fields(match.group(1)).items():
+                add_series(current, "glider_rust_front_detail_profile", key, value, kind)
+            continue
+        match = glider_small_leaf_re.match(line)
+        if match:
+            for key, (value, kind) in fields(match.group(1)).items():
+                add_series(current, "glider_rust_small_leaf_profile", key, value, kind)
             continue
         match = glider_dense_re.match(line)
         if match:
@@ -234,6 +246,13 @@ for case in sorted({case for case, _, _ in medians}):
         "glider_rust_spral",
         ["factor", "solve"],
     )
+    printed_any |= side_by_side(
+        case,
+        "glider_unprofiled",
+        "glider_native_spral",
+        "glider_rust_spral_unprofiled",
+        ["factor", "solve"],
+    )
 if not printed_any:
     print("(no native/rust pairs found)")
 
@@ -241,6 +260,8 @@ print("\n== rust-only attribution bucket medians ==")
 for (case, label, key), value in sorted(medians.items()):
     if not (
         label.startswith("rust_factor_profile[")
+        or label == "glider_rust_front_detail_profile"
+        or label == "glider_rust_small_leaf_profile"
         or label == "glider_rust_dense_front_profile"
         or label == "glider_rust_dense_front_counters"
     ):

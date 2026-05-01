@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 mod match_order;
 mod native;
 
+const SPRAL_SMALL_SUBTREE_THRESHOLD_FLOPS: u64 = 4_000_000;
+
 use metis_ordering::{
     CsrGraph, NestedDissectionOptions, OrderingError, Permutation,
     approximate_minimum_degree_order, nested_dissection_order,
@@ -79,8 +81,20 @@ pub struct FactorProfile {
     pub permuted_values_time: Duration,
     pub front_factorization_time: Duration,
     pub front_assembly_time: Duration,
+    pub front_child_result_merge_time: Duration,
+    pub front_row_setup_time: Duration,
+    pub front_matrix_entry_assembly_time: Duration,
+    pub front_contribution_assembly_time: Duration,
+    pub front_local_result_merge_time: Duration,
     pub dense_front_factorization_time: Duration,
     pub tpp_factorization_time: Duration,
+    pub tpp_pivot_search_time: Duration,
+    pub tpp_pivot_factor_time: Duration,
+    pub tpp_column_storage_time: Duration,
+    pub tpp_contribution_pack_time: Duration,
+    pub tpp_front_count: usize,
+    pub tpp_pivots: usize,
+    pub tpp_factor_column_entries: usize,
     pub app_pivot_factor_time: Duration,
     pub app_maxloc_time: Duration,
     pub app_symmetric_swap_time: Duration,
@@ -93,7 +107,7 @@ pub struct FactorProfile {
     pub app_two_by_two_pivots: usize,
     pub app_zero_pivots: usize,
     pub app_diagonal_one_by_one_pivots: usize,
-    pub app_offdiag_one_by_one_fallbacks: usize,
+    pub app_offdiag_one_by_one_pivots: usize,
     pub app_front_size_histogram: [usize; 8],
     pub app_block_pivot_apply_time: Duration,
     pub app_block_triangular_solve_time: Duration,
@@ -114,6 +128,28 @@ pub struct FactorProfile {
     pub factor_bytes_time: Duration,
     pub front_count: usize,
     pub local_dense_entries: usize,
+    pub local_dense_bytes_zeroed: usize,
+    pub front_child_result_count: usize,
+    pub front_child_contribution_entries: usize,
+    pub front_child_factor_columns: usize,
+    pub front_child_solve_panels: usize,
+    pub front_local_factor_columns: usize,
+    pub front_local_solve_panels: usize,
+    pub spral_small_leaf_subtrees: usize,
+    pub spral_small_leaf_fronts: usize,
+    pub spral_small_leaf_app_fronts: usize,
+    pub spral_small_leaf_columns: usize,
+    pub spral_small_leaf_dense_entries: usize,
+    pub spral_small_leaf_tpp_time: Duration,
+    pub spral_small_leaf_pivot_search_time: Duration,
+    pub spral_small_leaf_pivot_factor_time: Duration,
+    pub spral_small_leaf_pivot_scale_time: Duration,
+    pub spral_small_leaf_pivot_update_time: Duration,
+    pub spral_small_leaf_contribution_calc_ld_time: Duration,
+    pub spral_small_leaf_contribution_gemm_time: Duration,
+    pub spral_small_leaf_contribution_pack_time: Duration,
+    pub spral_small_leaf_solve_panel_build_time: Duration,
+    pub spral_small_leaf_output_append_time: Duration,
     pub root_delayed_blocks: usize,
 }
 
@@ -150,8 +186,14 @@ impl FactorProfile {
         if self.app_diagonal_one_by_one_pivots > 0 {
             hits.push("ssids.factor.app_dense.diagonal_one_by_one");
         }
-        if self.app_offdiag_one_by_one_fallbacks > 0 {
-            hits.push("ssids.factor.app_dense.offdiag_one_by_one_fallback");
+        if self.app_offdiag_one_by_one_pivots > 0 {
+            hits.push("ssids.factor.app_dense.offdiag_one_by_one");
+        }
+        if self.tpp_front_count > 0 {
+            hits.push("ssids.factor.tpp_dense");
+        }
+        if self.spral_small_leaf_fronts > 0 {
+            hits.push("ssids.factor.symbolic.small_leaf_candidates");
         }
         hits
     }
@@ -175,8 +217,20 @@ impl FactorProfile {
         self.permuted_values_time += other.permuted_values_time;
         self.front_factorization_time += other.front_factorization_time;
         self.front_assembly_time += other.front_assembly_time;
+        self.front_child_result_merge_time += other.front_child_result_merge_time;
+        self.front_row_setup_time += other.front_row_setup_time;
+        self.front_matrix_entry_assembly_time += other.front_matrix_entry_assembly_time;
+        self.front_contribution_assembly_time += other.front_contribution_assembly_time;
+        self.front_local_result_merge_time += other.front_local_result_merge_time;
         self.dense_front_factorization_time += other.dense_front_factorization_time;
         self.tpp_factorization_time += other.tpp_factorization_time;
+        self.tpp_pivot_search_time += other.tpp_pivot_search_time;
+        self.tpp_pivot_factor_time += other.tpp_pivot_factor_time;
+        self.tpp_column_storage_time += other.tpp_column_storage_time;
+        self.tpp_contribution_pack_time += other.tpp_contribution_pack_time;
+        self.tpp_front_count += other.tpp_front_count;
+        self.tpp_pivots += other.tpp_pivots;
+        self.tpp_factor_column_entries += other.tpp_factor_column_entries;
         self.app_pivot_factor_time += other.app_pivot_factor_time;
         self.app_maxloc_time += other.app_maxloc_time;
         self.app_symmetric_swap_time += other.app_symmetric_swap_time;
@@ -189,7 +243,7 @@ impl FactorProfile {
         self.app_two_by_two_pivots += other.app_two_by_two_pivots;
         self.app_zero_pivots += other.app_zero_pivots;
         self.app_diagonal_one_by_one_pivots += other.app_diagonal_one_by_one_pivots;
-        self.app_offdiag_one_by_one_fallbacks += other.app_offdiag_one_by_one_fallbacks;
+        self.app_offdiag_one_by_one_pivots += other.app_offdiag_one_by_one_pivots;
         for (lhs, rhs) in self
             .app_front_size_histogram
             .iter_mut()
@@ -216,6 +270,32 @@ impl FactorProfile {
         self.factor_bytes_time += other.factor_bytes_time;
         self.front_count += other.front_count;
         self.local_dense_entries += other.local_dense_entries;
+        self.local_dense_bytes_zeroed += other.local_dense_bytes_zeroed;
+        self.front_child_result_count += other.front_child_result_count;
+        self.front_child_contribution_entries += other.front_child_contribution_entries;
+        self.front_child_factor_columns += other.front_child_factor_columns;
+        self.front_child_solve_panels += other.front_child_solve_panels;
+        self.front_local_factor_columns += other.front_local_factor_columns;
+        self.front_local_solve_panels += other.front_local_solve_panels;
+        self.spral_small_leaf_subtrees += other.spral_small_leaf_subtrees;
+        self.spral_small_leaf_fronts += other.spral_small_leaf_fronts;
+        self.spral_small_leaf_app_fronts += other.spral_small_leaf_app_fronts;
+        self.spral_small_leaf_columns += other.spral_small_leaf_columns;
+        self.spral_small_leaf_dense_entries += other.spral_small_leaf_dense_entries;
+        self.spral_small_leaf_tpp_time += other.spral_small_leaf_tpp_time;
+        self.spral_small_leaf_pivot_search_time += other.spral_small_leaf_pivot_search_time;
+        self.spral_small_leaf_pivot_factor_time += other.spral_small_leaf_pivot_factor_time;
+        self.spral_small_leaf_pivot_scale_time += other.spral_small_leaf_pivot_scale_time;
+        self.spral_small_leaf_pivot_update_time += other.spral_small_leaf_pivot_update_time;
+        self.spral_small_leaf_contribution_calc_ld_time +=
+            other.spral_small_leaf_contribution_calc_ld_time;
+        self.spral_small_leaf_contribution_gemm_time +=
+            other.spral_small_leaf_contribution_gemm_time;
+        self.spral_small_leaf_contribution_pack_time +=
+            other.spral_small_leaf_contribution_pack_time;
+        self.spral_small_leaf_solve_panel_build_time +=
+            other.spral_small_leaf_solve_panel_build_time;
+        self.spral_small_leaf_output_append_time += other.spral_small_leaf_output_append_time;
         self.root_delayed_blocks += other.root_delayed_blocks;
     }
 }
@@ -532,6 +612,7 @@ struct SymbolicFront {
     interface_rows: Vec<usize>,
     parent: Option<usize>,
     children: Vec<usize>,
+    has_contribution_inputs: bool,
 }
 
 impl SymbolicFront {
@@ -548,6 +629,39 @@ impl SymbolicFront {
 struct SymbolicFrontTree {
     fronts: Vec<SymbolicFront>,
     roots: Vec<usize>,
+    spral_small_leaf_fronts: Vec<bool>,
+    spral_small_leaf_subtrees: Vec<SpralSmallLeafSymbolicPlan>,
+    spral_small_leaf_subtree_by_end: Vec<Option<usize>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SpralSmallLeafSubtree {
+    start_front: usize,
+    end_front: usize,
+    parent_front: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SpralSmallLeafNodePlan {
+    front_id: usize,
+    nrow: usize,
+    ncol: usize,
+    parent_in_subtree: Option<usize>,
+    parent_row_offsets: Vec<usize>,
+    lcol_offset: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SpralSmallLeafSymbolicPlan {
+    subtree: SpralSmallLeafSubtree,
+    nodes: Vec<SpralSmallLeafNodePlan>,
+    factor_entry_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SpralPartRange {
+    start_front: usize,
+    end_front: usize,
 }
 
 #[derive(Debug)]
@@ -692,12 +806,93 @@ struct SolvePanel {
     values: Vec<f64>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct FrontFactorizationResult {
+#[derive(Debug, Default, PartialEq)]
+struct FactorOutput {
     factor_order: Vec<usize>,
     factor_columns: Vec<FactorColumn>,
     block_records: Vec<FactorBlockRecord>,
     solve_panels: Vec<FactorSolvePanelRecord>,
+}
+
+impl FactorOutput {
+    fn with_capacity(column_capacity: usize) -> Self {
+        Self {
+            factor_order: Vec::with_capacity(column_capacity),
+            factor_columns: Vec::new(),
+            block_records: Vec::with_capacity(column_capacity),
+            solve_panels: Vec::with_capacity(column_capacity),
+        }
+    }
+
+    fn append(&mut self, mut other: Self) {
+        self.factor_order.append(&mut other.factor_order);
+        self.factor_columns.append(&mut other.factor_columns);
+        self.block_records.append(&mut other.block_records);
+        self.solve_panels.append(&mut other.solve_panels);
+    }
+}
+
+#[derive(Debug)]
+struct FrontWorkspace {
+    row_state: Vec<u8>,
+    row_state_touched: Vec<usize>,
+    local_positions: Vec<usize>,
+    local_positions_touched: Vec<usize>,
+}
+
+impl FrontWorkspace {
+    fn new(dimension: usize) -> Self {
+        Self {
+            row_state: vec![0; dimension],
+            row_state_touched: Vec::new(),
+            local_positions: vec![usize::MAX; dimension],
+            local_positions_touched: Vec::new(),
+        }
+    }
+
+    fn row_state(&self, row: usize) -> u8 {
+        self.row_state[row]
+    }
+
+    fn set_row_state(&mut self, row: usize, state: u8) {
+        debug_assert_ne!(state, 0);
+        if self.row_state[row] == 0 {
+            self.row_state_touched.push(row);
+        }
+        self.row_state[row] = state;
+    }
+
+    fn reset_row_state(&mut self) {
+        for row in self.row_state_touched.drain(..) {
+            self.row_state[row] = 0;
+        }
+    }
+
+    fn set_local_position(&mut self, row: usize, position: usize) {
+        if self.local_positions[row] == usize::MAX {
+            self.local_positions_touched.push(row);
+        }
+        self.local_positions[row] = position;
+    }
+
+    fn local_position(&self, row: usize) -> usize {
+        self.local_positions[row]
+    }
+
+    fn reset_local_positions(&mut self) {
+        for row in self.local_positions_touched.drain(..) {
+            self.local_positions[row] = usize::MAX;
+        }
+    }
+}
+
+struct FrontFactorScratch<'a> {
+    output: &'a mut FactorOutput,
+    workspace: &'a mut FrontWorkspace,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct FrontFactorizationResult {
     contribution: ContributionBlock,
     stats: PanelFactorStats,
     profile: FactorProfile,
@@ -714,6 +909,39 @@ struct DenseFrontFactorization {
     contribution: ContributionBlock,
     stats: PanelFactorStats,
     profile: FactorProfile,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SpralSmallLeafNumericNode {
+    front_id: usize,
+    rows: Vec<usize>,
+    base_ncol: usize,
+    nrow: usize,
+    ncol: usize,
+    ldl: usize,
+    lcol: Vec<f64>,
+    perm: Vec<usize>,
+    contrib: Option<Vec<f64>>,
+    ndelay_in: usize,
+    ndelay_out: usize,
+    nelim: usize,
+}
+
+#[derive(Debug)]
+struct SmallLeafAssemblyScratch {
+    local_positions: Vec<usize>,
+    touched_positions: Vec<usize>,
+    numeric_work: Vec<f64>,
+}
+
+impl SmallLeafAssemblyScratch {
+    fn new(dimension: usize) -> Self {
+        Self {
+            local_positions: vec![usize::MAX; dimension],
+            touched_positions: Vec::new(),
+            numeric_work: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1410,7 +1638,7 @@ fn factorize_impl(
     )?;
     if let Some(started) = factor_started {
         factor_debug_log(format!(
-            "[ssids_rs::factorize] dim={} supernodes={} scaling={:?} total={:.6}s symbolic_front_tree={:.6}s permuted_pattern={:.6}s permuted_values={:.6}s front_factorization={:.6}s front_assembly={:.6}s dense_front={:.6}s tpp={:.6}s app_pivot={:.6}s app_maxloc={:.6}s app_swap={:.6}s app_pivot_update={:.6}s app_apply={:.6}s app_triangular={:.6}s app_diagonal={:.6}s app_failed_scan={:.6}s app_backup={:.6}s app_restore={:.6}s app_accepted_update={:.6}s app_accepted_ld={:.6}s app_accepted_gemm={:.6}s app_column_storage={:.6}s solve_panel_build={:.6}s root_delayed={:.6}s factor_inverse={:.6}s lower_storage={:.6}s solve_panel_storage={:.6}s diagonal_storage={:.6}s factor_bytes={:.6}s fronts={} local_dense_entries={} app_fronts={} app_panels={} app_maxloc_calls={} app_swaps={} app_1x1={} app_2x2={} app_zero={} app_diag_1x1={} app_offdiag_1x1={} app_front_le32={} app_front_33_64={} app_front_65_96={} app_front_97_128={} app_front_129_160={} app_front_161_256={} app_front_257_512={} app_front_gt512={}",
+            "[ssids_rs::factorize] dim={} supernodes={} scaling={:?} total={:.6}s symbolic_front_tree={:.6}s permuted_pattern={:.6}s permuted_values={:.6}s front_factorization={:.6}s front_assembly={:.6}s dense_front={:.6}s tpp={:.6}s app_pivot={:.6}s app_maxloc={:.6}s app_swap={:.6}s app_pivot_update={:.6}s app_apply={:.6}s app_triangular={:.6}s app_diagonal={:.6}s app_failed_scan={:.6}s app_backup={:.6}s app_restore={:.6}s app_accepted_update={:.6}s app_accepted_ld={:.6}s app_accepted_gemm={:.6}s app_column_storage={:.6}s solve_panel_build={:.6}s root_delayed={:.6}s factor_inverse={:.6}s lower_storage={:.6}s solve_panel_storage={:.6}s diagonal_storage={:.6}s factor_bytes={:.6}s fronts={} local_dense_entries={} small_leaf_subtrees={} small_leaf_fronts={} small_leaf_app_fronts={} small_leaf_columns={} small_leaf_dense_entries={} small_leaf_tpp={:.6}s small_leaf_pivot_search={:.6}s small_leaf_pivot_factor={:.6}s small_leaf_pivot_scale={:.6}s small_leaf_pivot_update={:.6}s small_leaf_calc_ld={:.6}s small_leaf_gemm={:.6}s small_leaf_pack={:.6}s small_leaf_solve_panel={:.6}s small_leaf_output={:.6}s app_fronts={} app_panels={} app_maxloc_calls={} app_swaps={} app_1x1={} app_2x2={} app_zero={} app_diag_1x1={} app_offdiag_1x1={} app_front_le32={} app_front_33_64={} app_front_65_96={} app_front_97_128={} app_front_129_160={} app_front_161_256={} app_front_257_512={} app_front_gt512={}",
             matrix.dimension(),
             symbolic.supernodes.len(),
             options.scaling,
@@ -1445,6 +1673,31 @@ fn factorize_impl(
             profile_ref.factor_bytes_time.as_secs_f64(),
             profile_ref.front_count,
             profile_ref.local_dense_entries,
+            profile_ref.spral_small_leaf_subtrees,
+            profile_ref.spral_small_leaf_fronts,
+            profile_ref.spral_small_leaf_app_fronts,
+            profile_ref.spral_small_leaf_columns,
+            profile_ref.spral_small_leaf_dense_entries,
+            profile_ref.spral_small_leaf_tpp_time.as_secs_f64(),
+            profile_ref.spral_small_leaf_pivot_search_time.as_secs_f64(),
+            profile_ref.spral_small_leaf_pivot_factor_time.as_secs_f64(),
+            profile_ref.spral_small_leaf_pivot_scale_time.as_secs_f64(),
+            profile_ref.spral_small_leaf_pivot_update_time.as_secs_f64(),
+            profile_ref
+                .spral_small_leaf_contribution_calc_ld_time
+                .as_secs_f64(),
+            profile_ref
+                .spral_small_leaf_contribution_gemm_time
+                .as_secs_f64(),
+            profile_ref
+                .spral_small_leaf_contribution_pack_time
+                .as_secs_f64(),
+            profile_ref
+                .spral_small_leaf_solve_panel_build_time
+                .as_secs_f64(),
+            profile_ref
+                .spral_small_leaf_output_append_time
+                .as_secs_f64(),
             profile_ref.app_front_count,
             profile_ref.app_panel_count,
             profile_ref.app_maxloc_calls,
@@ -1453,7 +1706,7 @@ fn factorize_impl(
             profile_ref.app_two_by_two_pivots,
             profile_ref.app_zero_pivots,
             profile_ref.app_diagonal_one_by_one_pivots,
-            profile_ref.app_offdiag_one_by_one_fallbacks,
+            profile_ref.app_offdiag_one_by_one_pivots,
             profile_ref.app_front_size_histogram[0],
             profile_ref.app_front_size_histogram[1],
             profile_ref.app_front_size_histogram[2],
@@ -1715,16 +1968,12 @@ fn build_symbolic_result_with_native_order_and_scaling(
     }
     if is_identity_order(&supernode_layout.permutation) {
         let phase_started = Instant::now();
-        let supernodes = build_native_row_list_supernodes_fast(&supernode_layout, &column_pattern)
-            .unwrap_or_else(|| {
-                let expanded_pattern = expand_symmetric_pattern(matrix);
-                build_native_row_list_supernodes(
-                    &expanded_pattern,
-                    &current_permutation,
-                    &supernode_layout,
-                    &column_pattern,
-                )
-            });
+        let supernodes = build_native_row_list_supernodes_guarded(
+            matrix,
+            &current_permutation,
+            &supernode_layout,
+            &column_pattern,
+        );
         if trace {
             analyse_debug_log(format!(
                 "[ssids_rs::analyse] symbolic row_lists elapsed={:.6}s total={:.6}s",
@@ -1782,16 +2031,12 @@ fn build_symbolic_result_with_native_order_and_scaling(
         ));
     }
     let phase_started = Instant::now();
-    let final_supernodes = build_native_row_list_supernodes_fast(&supernode_layout, &final_pattern)
-        .unwrap_or_else(|| {
-            let expanded_pattern = expand_symmetric_pattern(matrix);
-            build_native_row_list_supernodes(
-                &expanded_pattern,
-                &final_permutation,
-                &supernode_layout,
-                &final_pattern,
-            )
-        });
+    let final_supernodes = build_native_row_list_supernodes_guarded(
+        matrix,
+        &final_permutation,
+        &supernode_layout,
+        &final_pattern,
+    );
     if trace {
         analyse_debug_log(format!(
             "[ssids_rs::analyse] symbolic final_row_lists elapsed={:.6}s total={:.6}s",
@@ -2252,6 +2497,34 @@ fn build_native_row_list_supernodes_fast(
     }])
 }
 
+fn build_native_row_list_supernodes_guarded(
+    matrix: SymmetricCscMatrix<'_>,
+    permutation: &Permutation,
+    layout: &NativeSupernodeLayout,
+    column_pattern: &[Vec<usize>],
+) -> Vec<Supernode> {
+    if let Some(fast) = build_native_row_list_supernodes_fast(layout, column_pattern) {
+        #[cfg(debug_assertions)]
+        {
+            let expanded_pattern = expand_symmetric_pattern(matrix);
+            let generic = build_native_row_list_supernodes(
+                &expanded_pattern,
+                permutation,
+                layout,
+                column_pattern,
+            );
+            debug_assert_eq!(
+                fast, generic,
+                "single-supernode symbolic row-list shortcut diverged from source-shaped row-list builder"
+            );
+        }
+        return fast;
+    }
+
+    let expanded_pattern = expand_symmetric_pattern(matrix);
+    build_native_row_list_supernodes(&expanded_pattern, permutation, layout, column_pattern)
+}
+
 fn build_native_row_list_supernodes(
     expanded_pattern: &ExpandedSymmetricPattern,
     permutation: &Permutation,
@@ -2414,6 +2687,7 @@ fn build_symbolic_front_tree(symbolic: &SymbolicFactor) -> SymbolicFrontTree {
                 interface_rows: supernode.trailing_rows.clone(),
                 parent: None,
                 children: Vec::new(),
+                has_contribution_inputs: false,
             }
         })
         .collect::<Vec<_>>();
@@ -2439,7 +2713,215 @@ fn build_symbolic_front_tree(symbolic: &SymbolicFactor) -> SymbolicFrontTree {
         front.children.sort_by_key(|&child| start_columns[child]);
     }
     let roots = collect_root_fronts(&fronts);
-    SymbolicFrontTree { roots, fronts }
+    let root_parts = spral_root_part_ranges(&fronts);
+    apply_spral_part_contribution_input_flags(&mut fronts, &root_parts);
+    let small_leaf = classify_spral_small_leaf_fronts(&fronts);
+    let small_leaf_subtrees = small_leaf
+        .subtrees
+        .iter()
+        .copied()
+        .map(|subtree| build_spral_small_leaf_symbolic_plan(&fronts, subtree))
+        .collect::<Vec<_>>();
+    let mut small_leaf_subtree_by_end = vec![None; fronts.len()];
+    for (index, plan) in small_leaf_subtrees.iter().enumerate() {
+        small_leaf_subtree_by_end[plan.subtree.end_front] = Some(index);
+    }
+    SymbolicFrontTree {
+        fronts,
+        roots,
+        spral_small_leaf_fronts: small_leaf.fronts,
+        spral_small_leaf_subtrees: small_leaf_subtrees,
+        spral_small_leaf_subtree_by_end: small_leaf_subtree_by_end,
+    }
+}
+
+fn spral_root_part_ranges(fronts: &[SymbolicFront]) -> Vec<SpralPartRange> {
+    let mut roots = collect_root_fronts(fronts);
+    roots.sort_unstable();
+    let mut start_front = 0;
+    let mut ranges = Vec::with_capacity(roots.len());
+    for root in roots {
+        let end_front = root + 1;
+        if start_front < end_front {
+            ranges.push(SpralPartRange {
+                start_front,
+                end_front,
+            });
+        }
+        start_front = end_front;
+    }
+    ranges
+}
+
+fn apply_spral_part_contribution_input_flags(
+    fronts: &mut [SymbolicFront],
+    parts: &[SpralPartRange],
+) {
+    for front in fronts.iter_mut() {
+        front.has_contribution_inputs = false;
+    }
+    for (part_index, part) in parts.iter().copied().enumerate() {
+        if part.start_front >= part.end_front || part.end_front > fronts.len() {
+            continue;
+        }
+        let part_root = part.end_front - 1;
+        let Some(parent) = fronts[part_root].parent else {
+            continue;
+        };
+        if parent >= fronts.len() {
+            continue;
+        }
+        let parent_part = parts
+            .iter()
+            .position(|candidate| parent >= candidate.start_front && parent < candidate.end_front);
+        if parent_part.is_some_and(|parent_part| parent_part != part_index) {
+            // Mirrors anal.F90::find_subtree_partition: contrib_dest records
+            // the parent node that receives a contribution from this part.
+            // SymbolicSubtree.hxx then marks that destination node as having
+            // an expected contribution input.
+            fronts[parent].has_contribution_inputs = true;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SpralSmallLeafClassification {
+    fronts: Vec<bool>,
+    subtrees: Vec<SpralSmallLeafSubtree>,
+}
+
+fn classify_spral_small_leaf_fronts(fronts: &[SymbolicFront]) -> SpralSmallLeafClassification {
+    let mut flops = vec![0_u64; fronts.len() + 1];
+    for (index, front) in fronts.iter().enumerate() {
+        let nrow = front.width() + front.interface_rows.len();
+        for k in 0..front.width() {
+            let remaining = (nrow - k) as u64;
+            flops[index] = flops[index].saturating_add(remaining.saturating_mul(remaining));
+        }
+        if front.has_contribution_inputs {
+            // Mirrors SPRAL SymbolicSubtree.hxx: nodes with expected
+            // contribution-block inputs are forced above the small-subtree
+            // threshold because they are not true leaves of the parttree.
+            flops[index] = flops[index].saturating_add(SPRAL_SMALL_SUBTREE_THRESHOLD_FLOPS);
+        }
+        let parent = front.parent.unwrap_or(fronts.len()).min(fronts.len());
+        flops[parent] = flops[parent].saturating_add(flops[index]);
+    }
+
+    let mut small_leaf_fronts = vec![false; fronts.len()];
+    let mut subtrees = Vec::new();
+    let mut index = 0;
+    while index < fronts.len() {
+        if !fronts[index].children.is_empty() {
+            index += 1;
+            continue;
+        }
+        let mut last = index;
+        let mut current = index;
+        loop {
+            if flops[current] >= SPRAL_SMALL_SUBTREE_THRESHOLD_FLOPS {
+                break;
+            }
+            last = current;
+            match fronts[current].parent {
+                Some(parent) if parent < fronts.len() => current = parent,
+                _ => break,
+            }
+        }
+        if last == index {
+            index += 1;
+            continue;
+        }
+        for flag in small_leaf_fronts.iter_mut().take(last + 1).skip(index) {
+            *flag = true;
+        }
+        subtrees.push(SpralSmallLeafSubtree {
+            start_front: index,
+            end_front: last,
+            parent_front: fronts[last].parent,
+        });
+        index = last + 1;
+    }
+
+    SpralSmallLeafClassification {
+        fronts: small_leaf_fronts,
+        subtrees,
+    }
+}
+
+fn build_spral_small_leaf_symbolic_plan(
+    fronts: &[SymbolicFront],
+    subtree: SpralSmallLeafSubtree,
+) -> SpralSmallLeafSymbolicPlan {
+    assert!(
+        subtree.start_front <= subtree.end_front && subtree.end_front < fronts.len(),
+        "invalid small-leaf subtree range"
+    );
+    let mut factor_entry_count = 0;
+    let mut nodes = Vec::with_capacity(subtree.end_front - subtree.start_front + 1);
+    for front_id in subtree.start_front..=subtree.end_front {
+        let front = &fronts[front_id];
+        let nrow = front.width() + front.interface_rows.len();
+        let ncol = front.width();
+        let lcol_offset = factor_entry_count;
+        factor_entry_count += ncol * spral_align_lda_f64(nrow);
+        let parent_in_subtree = front
+            .parent
+            .filter(|&parent| parent >= subtree.start_front && parent <= subtree.end_front)
+            .map(|parent| parent - subtree.start_front);
+        let parent_row_offsets = if nrow == ncol {
+            Vec::new()
+        } else if let Some(parent) = front.parent {
+            let parent_rows = symbolic_front_row_ids(&fronts[parent]);
+            front
+                .interface_rows
+                .iter()
+                .map(|row| {
+                    parent_rows
+                        .iter()
+                        .position(|parent_row| parent_row == row)
+                        .expect("small-leaf interface row must appear in parent row list")
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        nodes.push(SpralSmallLeafNodePlan {
+            front_id,
+            nrow,
+            ncol,
+            parent_in_subtree,
+            parent_row_offsets,
+            lcol_offset,
+        });
+    }
+
+    SpralSmallLeafSymbolicPlan {
+        subtree,
+        nodes,
+        factor_entry_count,
+    }
+}
+
+fn symbolic_front_row_ids(front: &SymbolicFront) -> Vec<usize> {
+    let mut rows = Vec::with_capacity(front.width() + front.interface_rows.len());
+    rows.extend_from_slice(&front.columns);
+    rows.extend_from_slice(&front.interface_rows);
+    rows
+}
+
+fn spral_align_lda_f64(lda: usize) -> usize {
+    if lda == 0 {
+        return 0;
+    }
+    let talign = if cfg!(target_feature = "avx512f") {
+        8
+    } else if cfg!(target_feature = "avx") {
+        4
+    } else {
+        2
+    };
+    talign * ((lda - 1) / talign + 1)
 }
 
 fn front_work_weight(width: usize, interface_len: usize) -> u64 {
@@ -2839,45 +3321,66 @@ fn dense_find_maxloc(
     debug_assert!(from >= block_start);
     let local_from = from - block_start;
 
-    let mut primary = (-1.0_f64, to, to);
-    let mut secondary = (-1.0_f64, to, to);
+    let mut primary_abs = -1.0_f64;
+    let mut primary_row = to;
+    let mut primary_col = to;
+    let mut secondary_abs = -1.0_f64;
+    let mut secondary_row = to;
+    let mut secondary_col = to;
 
-    // Native SPRAL's non-AVX SimdVec path still uses two per-lane maxima. Equal
-    // values keep their existing lane, so ties are not column-major.
+    // Mirrors block_ldlt.hxx::find_maxloc for the local non-AVX SimdVec path:
+    // vector_length == 1, with two scalar lanes (bestv and bestv2). Keep the
+    // lane split and strict-greater tie behavior, but avoid per-column division
+    // in the hot APP pivot loop.
     for local_col in local_from..APP_INNER_BLOCK_SIZE {
         let col = block_start + local_col;
         let column_offset = col * size;
-        let diag_value = matrix[column_offset + col].abs();
-        if diag_value > primary.0 {
-            primary = (diag_value, col, col);
+        let value = matrix[column_offset + col].abs();
+        if value > primary_abs {
+            primary_abs = value;
+            primary_row = col;
+            primary_col = col;
         }
-        if local_col + 1 < 2 * (local_col / 2 + 1) {
-            let row = col + 1;
-            let value = matrix[column_offset + row].abs();
-            if value > primary.0 {
-                primary = (value, row, col);
+
+        let mut local_row = if local_col & 1 == 0 {
+            let next_local_row = local_col + 1;
+            if next_local_row < APP_INNER_BLOCK_SIZE {
+                let row = block_start + next_local_row;
+                let value = matrix[column_offset + row].abs();
+                if value > primary_abs {
+                    primary_abs = value;
+                    primary_row = row;
+                    primary_col = col;
+                }
             }
-        }
-        let mut local_row = 2 * (local_col / 2 + 1);
+            local_col + 2
+        } else {
+            local_col + 1
+        };
+
         while local_row < APP_INNER_BLOCK_SIZE {
             let row = block_start + local_row;
             let value = matrix[column_offset + row].abs();
-            if value > primary.0 {
-                primary = (value, row, col);
+            if value > primary_abs {
+                primary_abs = value;
+                primary_row = row;
+                primary_col = col;
             }
             let next_row = row + 1;
             let next_value = matrix[column_offset + next_row].abs();
-            if next_value > secondary.0 {
-                secondary = (next_value, next_row, col);
+            if next_value > secondary_abs {
+                secondary_abs = next_value;
+                secondary_row = next_row;
+                secondary_col = col;
             }
             local_row += 2;
         }
     }
 
-    let best = if secondary.0 > primary.0 {
-        secondary
+    let best = if secondary_abs > primary_abs {
+        (secondary_abs, secondary_row, secondary_col)
     } else {
-        primary
+        (primary_abs, primary_row, primary_col)
     };
     (best.2 < to).then_some(best)
 }
@@ -3490,21 +3993,6 @@ fn factor_two_by_two_common_with_workspace_offset(
         size: 2,
         values: [inv11, inv12, f64::INFINITY, inv22],
     })
-}
-
-fn remove_zero_lower_entries_targeting_row(factor_columns: &mut [FactorColumn], row: usize) {
-    let row_has_nonzero_entry = factor_columns
-        .iter()
-        .flat_map(|column| column.entries.iter())
-        .any(|&(entry_row, value)| entry_row == row && value != 0.0);
-    if row_has_nonzero_entry {
-        return;
-    }
-    for column in factor_columns {
-        column
-            .entries
-            .retain(|&(entry_row, value)| entry_row != row || value != 0.0);
-    }
 }
 
 fn app_apply_block_pivots_to_trailing_rows(
@@ -5318,6 +5806,7 @@ fn app_build_factor_columns_for_prefix(
     columns
 }
 
+#[cfg(test)]
 fn app_extend_factor_columns_for_prefix(
     columns: &mut Vec<FactorColumn>,
     rows: &[usize],
@@ -5364,7 +5853,7 @@ fn tpp_factor_one_by_one(
     pivot: usize,
     _stats: &mut PanelFactorStats,
     ld: &mut [f64],
-) -> Result<(FactorColumn, FactorBlockRecord), SsidsError> {
+) -> Result<FactorBlockRecord, SsidsError> {
     let size = bounds.size;
     let work = &mut ld[..size];
     let diagonal_index = dense_lower_offset(size, pivot, pivot);
@@ -5384,7 +5873,6 @@ fn tpp_factor_one_by_one(
     }
     matrix[diagonal_index] = 1.0;
 
-    let mut entries = Vec::new();
     for row in (pivot + 1)..size {
         let entry_index = dense_lower_offset(size, row, pivot);
         let original = matrix[entry_index];
@@ -5400,21 +5888,14 @@ fn tpp_factor_one_by_one(
             });
         }
         matrix[entry_index] = value;
-        entries.push((rows[row], value));
     }
 
     root_tpp_rank1_update(matrix, bounds, pivot + 1, pivot, work);
 
-    Ok((
-        FactorColumn {
-            global_column: rows[pivot],
-            entries,
-        },
-        FactorBlockRecord {
-            size: 1,
-            values: [inverse_diagonal, 0.0, 0.0, 0.0],
-        },
-    ))
+    Ok(FactorBlockRecord {
+        size: 1,
+        values: [inverse_diagonal, 0.0, 0.0, 0.0],
+    })
 }
 
 fn tpp_factor_two_by_two(
@@ -5425,7 +5906,7 @@ fn tpp_factor_two_by_two(
     inverse: (f64, f64, f64),
     stats: &mut PanelFactorStats,
     ld: &mut [f64],
-) -> Result<([FactorColumn; 2], FactorBlockRecord), SsidsError> {
+) -> Result<FactorBlockRecord, SsidsError> {
     let size = bounds.size;
     let (first_scratch, second_scratch) = ld.split_at_mut(size);
     let (inv11, inv12, inv22) = inverse;
@@ -5445,8 +5926,6 @@ fn tpp_factor_two_by_two(
     } else {
         0
     };
-    let mut first_entries = Vec::new();
-    let mut second_entries = Vec::new();
     for row in first_multiplier_row..size {
         let b1 = matrix[dense_lower_offset(size, row, pivot)];
         let b2 = matrix[dense_lower_offset(size, row, pivot + 1)];
@@ -5467,8 +5946,6 @@ fn tpp_factor_two_by_two(
         }
         matrix[dense_lower_offset(size, row, pivot)] = l1;
         matrix[dense_lower_offset(size, row, pivot + 1)] = l2;
-        first_entries.push((rows[row], l1));
-        second_entries.push((rows[row], l2));
     }
 
     root_tpp_rank2_update(
@@ -5481,22 +5958,10 @@ fn tpp_factor_two_by_two(
         second_scratch,
     );
 
-    Ok((
-        [
-            FactorColumn {
-                global_column: rows[pivot],
-                entries: first_entries,
-            },
-            FactorColumn {
-                global_column: rows[pivot + 1],
-                entries: second_entries,
-            },
-        ],
-        FactorBlockRecord {
-            size: 2,
-            values: [inv11, inv12, f64::INFINITY, inv22],
-        },
-    ))
+    Ok(FactorBlockRecord {
+        size: 2,
+        values: [inv11, inv12, f64::INFINITY, inv22],
+    })
 }
 
 fn root_tpp_rank1_update(
@@ -5512,17 +5977,19 @@ fn root_tpp_rank1_update(
     // round like OpenBLAS' block kernel.
     let use_scalar_fma =
         size.saturating_sub(start) == 1 || bounds.update_end.saturating_sub(start) == 1;
-    // ldlt_tpp_factor distinguishes m rows from n candidate columns; the
-    // trailing update spans all rows but only columns before n.
+    // ldlt_tpp_factor distinguishes m rows from n candidate columns. Native
+    // calls host_gemm(OP_N, OP_T) on the full trailing rectangle rooted at
+    // (start, start), so row < col entries inside that rectangle are written
+    // even though lower-triangle SSIDS paths usually ignore them.
     for (col, &preserved) in preserved_column
         .iter()
         .enumerate()
         .take(bounds.update_end)
         .skip(start)
     {
-        for row in col..size {
-            let l_row = matrix[dense_lower_offset(size, row, multiplier_column)];
-            let update_entry = dense_lower_offset(size, row, col);
+        for row in start..size {
+            let l_row = matrix[multiplier_column * size + row];
+            let update_entry = col * size + row;
             if use_scalar_fma {
                 matrix[update_entry] = (-l_row).mul_add(preserved, matrix[update_entry]);
             } else {
@@ -5544,8 +6011,8 @@ fn root_tpp_rank2_update(
     let size = bounds.size;
     let use_scalar_fma =
         size.saturating_sub(start) == 1 || bounds.update_end.saturating_sub(start) == 1;
-    // ldlt_tpp_factor distinguishes m rows from n candidate columns; the
-    // trailing update spans all rows but only columns before n.
+    // See `root_tpp_rank1_update`: this mirrors native host_gemm's full
+    // trailing rectangle, including row < col entries in the dense buffer.
     for (col, (&first_preserved, &second_preserved)) in first_preserved_column
         .iter()
         .zip(second_preserved_column.iter())
@@ -5553,10 +6020,10 @@ fn root_tpp_rank2_update(
         .take(bounds.update_end)
         .skip(start)
     {
-        for row in col..size {
-            let l1_row = matrix[dense_lower_offset(size, row, first_multiplier_column)];
-            let l2_row = matrix[dense_lower_offset(size, row, second_multiplier_column)];
-            let update_entry = dense_lower_offset(size, row, col);
+        for row in start..size {
+            let l1_row = matrix[first_multiplier_column * size + row];
+            let l2_row = matrix[second_multiplier_column * size + row];
+            let update_entry = col * size + row;
             if use_scalar_fma {
                 let updated = (-l1_row).mul_add(first_preserved, matrix[update_entry]);
                 matrix[update_entry] = (-l2_row).mul_add(second_preserved, updated);
@@ -5581,13 +6048,17 @@ fn factorize_dense_tpp_tail_in_place(
     let started = request.profile_enabled.then(Instant::now);
     let size = rows.len();
     let mut stats = PanelFactorStats::default();
+    let mut profile = FactorProfile::default();
+    if request.profile_enabled {
+        profile.tpp_front_count += 1;
+    }
     let mut factor_order = Vec::with_capacity(size);
-    let mut factor_columns = Vec::with_capacity(size);
     let mut block_records = Vec::with_capacity(size);
     let mut pivot = request.start_pivot;
     let active_candidate_end = (request.start_pivot + request.candidate_len).min(size);
 
     while pivot < active_candidate_end {
+        let mut pivot_search_started = request.profile_enabled.then(Instant::now);
         if dense_column_small(
             dense,
             size,
@@ -5601,19 +6072,19 @@ fn factorize_dense_tpp_tail_in_place(
                     detail: "TPP encountered a zero pivot with action disabled".into(),
                 });
             }
-            remove_zero_lower_entries_targeting_row(&mut factor_columns, rows[pivot]);
+            if let Some(started) = pivot_search_started.take() {
+                let elapsed = started.elapsed();
+                profile.tpp_pivot_search_time += elapsed;
+                profile.spral_small_leaf_pivot_search_time += elapsed;
+            }
             zero_dense_column(dense, size, pivot);
-            let column = FactorColumn {
-                global_column: rows[pivot],
-                entries: Vec::new(),
-            };
             let block = FactorBlockRecord {
                 size: 1,
                 values: [0.0, 0.0, 0.0, 0.0],
             };
             factor_order.push(rows[pivot]);
-            factor_columns.push(column);
             block_records.push(block);
+            profile.tpp_pivots += 1;
             pivot += 1;
             continue;
         }
@@ -5633,23 +6104,23 @@ fn factorize_dense_tpp_tail_in_place(
                         detail: "TPP encountered a zero pivot with action disabled".into(),
                     });
                 }
+                if let Some(started) = pivot_search_started.take() {
+                    let elapsed = started.elapsed();
+                    profile.tpp_pivot_search_time += elapsed;
+                    profile.spral_small_leaf_pivot_search_time += elapsed;
+                }
                 if candidate != pivot {
                     dense_symmetric_swap(dense, size, candidate, pivot);
                     rows.swap(candidate, pivot);
                 }
-                remove_zero_lower_entries_targeting_row(&mut factor_columns, rows[pivot]);
                 zero_dense_column(dense, size, pivot);
-                let column = FactorColumn {
-                    global_column: rows[pivot],
-                    entries: Vec::new(),
-                };
                 let block = FactorBlockRecord {
                     size: 1,
                     values: [0.0, 0.0, 0.0, 0.0],
                 };
                 factor_order.push(rows[pivot]);
-                factor_columns.push(column);
                 block_records.push(block);
+                profile.tpp_pivots += 1;
                 pivot += 1;
                 advanced = true;
                 break;
@@ -5667,6 +6138,9 @@ fn factorize_dense_tpp_tail_in_place(
             let mut maxp = dense_find_rc_abs_max_exclude(dense, size, second, pivot, Some(first));
 
             if let Some(inverse) = tpp_test_two_by_two(a11, a21, a22, maxt, maxp, request.options) {
+                if let Some(started) = pivot_search_started.take() {
+                    profile.tpp_pivot_search_time += started.elapsed();
+                }
                 if first != pivot {
                     dense_symmetric_swap(dense, size, first, pivot);
                     rows.swap(first, pivot);
@@ -5678,7 +6152,8 @@ fn factorize_dense_tpp_tail_in_place(
                     dense_symmetric_swap(dense, size, second, pivot + 1);
                     rows.swap(second, pivot + 1);
                 }
-                let (columns, block) = tpp_factor_two_by_two(
+                let pivot_factor_started = request.profile_enabled.then(Instant::now);
+                let block = tpp_factor_two_by_two(
                     rows,
                     dense,
                     DenseUpdateBounds {
@@ -5690,12 +6165,13 @@ fn factorize_dense_tpp_tail_in_place(
                     &mut stats,
                     ld,
                 )?;
+                if let Some(started) = pivot_factor_started {
+                    profile.tpp_pivot_factor_time += started.elapsed();
+                }
                 factor_order.push(rows[pivot]);
                 factor_order.push(rows[pivot + 1]);
-                let [first_column, second_column] = columns;
-                factor_columns.push(first_column);
-                factor_columns.push(second_column);
                 block_records.push(block);
+                profile.tpp_pivots += 2;
                 pivot += 2;
                 advanced = true;
                 break;
@@ -5703,11 +6179,15 @@ fn factorize_dense_tpp_tail_in_place(
 
             maxp = maxp.max(a21.abs());
             if a22.abs() >= request.options.threshold_pivot_u * maxp {
+                if let Some(started) = pivot_search_started.take() {
+                    profile.tpp_pivot_search_time += started.elapsed();
+                }
                 if candidate != pivot {
                     dense_symmetric_swap(dense, size, candidate, pivot);
                     rows.swap(candidate, pivot);
                 }
-                let (column, block) = tpp_factor_one_by_one(
+                let pivot_factor_started = request.profile_enabled.then(Instant::now);
+                let block = tpp_factor_one_by_one(
                     rows,
                     dense,
                     DenseUpdateBounds {
@@ -5718,9 +6198,12 @@ fn factorize_dense_tpp_tail_in_place(
                     &mut stats,
                     ld,
                 )?;
+                if let Some(started) = pivot_factor_started {
+                    profile.tpp_pivot_factor_time += started.elapsed();
+                }
                 factor_order.push(rows[pivot]);
-                factor_columns.push(column);
                 block_records.push(block);
+                profile.tpp_pivots += 1;
                 pivot += 1;
                 advanced = true;
                 break;
@@ -5734,7 +6217,11 @@ fn factorize_dense_tpp_tail_in_place(
         let current_diag = dense[dense_lower_offset(size, pivot, pivot)];
         let current_offdiag_max = dense_find_rc_abs_max_exclude(dense, size, pivot, pivot, None);
         if current_diag.abs() >= request.options.threshold_pivot_u * current_offdiag_max {
-            let (column, block) = tpp_factor_one_by_one(
+            if let Some(started) = pivot_search_started.take() {
+                profile.tpp_pivot_search_time += started.elapsed();
+            }
+            let pivot_factor_started = request.profile_enabled.then(Instant::now);
+            let block = tpp_factor_one_by_one(
                 rows,
                 dense,
                 DenseUpdateBounds {
@@ -5745,20 +6232,34 @@ fn factorize_dense_tpp_tail_in_place(
                 &mut stats,
                 ld,
             )?;
+            if let Some(started) = pivot_factor_started {
+                profile.tpp_pivot_factor_time += started.elapsed();
+            }
             factor_order.push(rows[pivot]);
-            factor_columns.push(column);
             block_records.push(block);
+            profile.tpp_pivots += 1;
             pivot += 1;
             continue;
         }
 
         if request.require_full_elimination {
+            if let Some(started) = pivot_search_started.take() {
+                profile.tpp_pivot_search_time += started.elapsed();
+            }
             return Err(SsidsError::NumericalBreakdown {
                 pivot: rows[pivot],
                 detail: "root TPP completion could not find an acceptable pivot".into(),
             });
         }
+        if let Some(started) = pivot_search_started.take() {
+            profile.tpp_pivot_search_time += started.elapsed();
+        }
         break;
+    }
+
+    if request.profile_enabled {
+        profile.tpp_factor_column_entries +=
+            solve_panel_lower_entry_count_for_range(size, request.start_pivot, pivot);
     }
 
     let remaining_rows = rows.split_off(pivot);
@@ -5767,16 +6268,19 @@ fn factorize_dense_tpp_tail_in_place(
         .saturating_sub(pivot)
         .min(remaining_size);
     stats.delayed_pivots += delayed_count;
+    let contribution_pack_started = request.profile_enabled.then(Instant::now);
     let contribution_dense = pack_dense_lower_suffix(dense, size, pivot, remaining_size);
+    if let Some(started) = contribution_pack_started {
+        profile.tpp_contribution_pack_time += started.elapsed();
+    }
 
-    let mut profile = FactorProfile::default();
     if let Some(started) = started {
         profile.tpp_factorization_time += started.elapsed();
     }
 
     Ok(DenseFrontFactorization {
         factor_order,
-        factor_columns,
+        factor_columns: Vec::new(),
         block_records,
         solve_panels: Vec::new(),
         contribution: ContributionBlock {
@@ -5789,6 +6293,7 @@ fn factorize_dense_tpp_tail_in_place(
     })
 }
 
+#[cfg(test)]
 fn build_factor_solve_panel_record(
     factor_order: &[usize],
     factor_columns: &[FactorColumn],
@@ -5930,6 +6435,59 @@ fn build_dense_front_solve_panel_record(
     }))
 }
 
+fn solve_panel_lower_entry_count(local_size: usize, eliminated_len: usize) -> usize {
+    solve_panel_lower_entry_count_for_range(local_size, 0, eliminated_len)
+}
+
+fn solve_panel_lower_entry_count_for_range(local_size: usize, start: usize, end: usize) -> usize {
+    debug_assert!(start <= end);
+    debug_assert!(end <= local_size);
+    let eliminated_len = end - start;
+    if eliminated_len == 0 {
+        return 0;
+    }
+    debug_assert!(eliminated_len <= local_size);
+    eliminated_len * local_size - (start + end - 1) * eliminated_len / 2 - eliminated_len
+}
+
+fn solve_panel_records_lower_entry_count(records: &[FactorSolvePanelRecord]) -> usize {
+    records
+        .iter()
+        .map(|record| solve_panel_lower_entry_count(record.row_ids.len(), record.eliminated_len))
+        .sum()
+}
+
+#[cfg(debug_assertions)]
+fn assemble_leaf_front_generic_for_debug(
+    front: &SymbolicFront,
+    matrix: &PermutedLowerMatrix<'_>,
+) -> (Vec<usize>, Vec<f64>) {
+    debug_assert!(front.interface_rows.is_empty());
+    let local_rows = front.columns.clone();
+    let local_size = local_rows.len();
+    let mut local_positions = vec![usize::MAX; matrix.dimension];
+    for (position, &row) in local_rows.iter().enumerate() {
+        local_positions[row] = position;
+    }
+
+    let mut local_dense = vec![0.0; local_size * local_size];
+    for &column in &front.columns {
+        let local_column = local_positions[column];
+        debug_assert_ne!(local_column, usize::MAX);
+        for entry in matrix.col_ptrs[column]..matrix.col_ptrs[column + 1] {
+            let row = matrix.row_indices[entry];
+            let local_row = local_positions[row];
+            if local_row == usize::MAX {
+                continue;
+            }
+            let offset = dense_lower_offset(local_size, local_row, local_column);
+            local_dense[offset] = matrix.values[entry];
+        }
+    }
+
+    (local_rows, local_dense)
+}
+
 fn zero_dense_column(matrix: &mut [f64], size: usize, pivot: usize) {
     for row in pivot..size {
         matrix[dense_lower_offset(size, row, pivot)] = 0.0;
@@ -5972,10 +6530,12 @@ fn factorize_root_dense_tpp(
         });
     }
     let started = profile_enabled.then(Instant::now);
-    if let Some(panel) = build_factor_solve_panel_record(
+    if let Some(panel) = build_dense_front_solve_panel_record(
         &factorization.factor_order,
-        &factorization.factor_columns,
         &factorization.contribution.row_ids,
+        &dense,
+        size,
+        factorization.factor_order.len(),
     )? {
         factorization.solve_panels.push(panel);
     }
@@ -6011,10 +6571,12 @@ fn factorize_dense_front(
             &mut tpp_ld,
         )?;
         let started = profile_enabled.then(Instant::now);
-        if let Some(panel) = build_factor_solve_panel_record(
+        if let Some(panel) = build_dense_front_solve_panel_record(
             &factorization.factor_order,
-            &factorization.factor_columns,
             &factorization.contribution.row_ids,
+            &dense,
+            size,
+            factorization.factor_order.len(),
         )? {
             factorization.solve_panels.push(panel);
         }
@@ -6031,7 +6593,6 @@ fn factorize_dense_front(
         profile.app_front_size_histogram[app_front_size_histogram_bucket(size)] += 1;
     }
     let mut factor_order = Vec::with_capacity(active_candidate_end);
-    let mut factor_columns = Vec::with_capacity(active_candidate_end);
     let mut block_records = Vec::with_capacity(active_candidate_end);
     // SPRAL's block_ldlt<32> uses a local 32-row ldwork block; columns still
     // use the dense front lda, so workspace helpers take the current block's
@@ -6203,7 +6764,7 @@ fn factorize_dense_front(
                 let block = block?;
                 if profile_enabled {
                     profile.app_one_by_one_pivots += 1;
-                    profile.app_offdiag_one_by_one_fallbacks += 1;
+                    profile.app_offdiag_one_by_one_pivots += 1;
                 }
                 local_blocks.push(block);
                 block_pivot += 1;
@@ -6349,18 +6910,6 @@ fn factorize_dense_front(
         }
 
         factor_order.extend(rows[block_start..accepted_end].iter().copied());
-        let started = profile_enabled.then(Instant::now);
-        app_extend_factor_columns_for_prefix(
-            &mut factor_columns,
-            &rows,
-            &dense,
-            size,
-            block_start,
-            accepted_end,
-        );
-        if let Some(started) = started {
-            profile.app_column_storage_time += started.elapsed();
-        }
         stats.two_by_two_pivots += accepted_blocks
             .iter()
             .filter(|block| block.size == 2)
@@ -6393,16 +6942,19 @@ fn factorize_dense_front(
             &mut tpp_ld,
         )?;
         factor_order.extend(tpp_tail.factor_order);
-        factor_columns.extend(tpp_tail.factor_columns);
         block_records.extend(tpp_tail.block_records);
         aggregate_panel_stats(&mut stats, tpp_tail.stats);
         profile.accumulate(&tpp_tail.profile);
         let contribution = tpp_tail.contribution;
         let mut solve_panels = Vec::new();
         let started = profile_enabled.then(Instant::now);
-        if let Some(panel) =
-            build_factor_solve_panel_record(&factor_order, &factor_columns, &contribution.row_ids)?
-        {
+        if let Some(panel) = build_dense_front_solve_panel_record(
+            &factor_order,
+            &contribution.row_ids,
+            &dense,
+            size,
+            factor_order.len(),
+        )? {
             solve_panels.push(panel);
         }
         if let Some(started) = started {
@@ -6410,7 +6962,7 @@ fn factorize_dense_front(
         }
         return Ok(DenseFrontFactorization {
             factor_order,
-            factor_columns,
+            factor_columns: Vec::new(),
             block_records,
             solve_panels,
             contribution,
@@ -6444,7 +6996,7 @@ fn factorize_dense_front(
 
     Ok(DenseFrontFactorization {
         factor_order,
-        factor_columns,
+        factor_columns: Vec::new(),
         block_records,
         solve_panels,
         contribution,
@@ -6453,65 +7005,1489 @@ fn factorize_dense_front(
     })
 }
 
-fn factor_front_recursive(
-    front_id: usize,
+fn small_leaf_children_by_node(plan: &SpralSmallLeafSymbolicPlan) -> Vec<Vec<usize>> {
+    let mut children = vec![Vec::new(); plan.nodes.len()];
+    for (node_index, node) in plan.nodes.iter().enumerate() {
+        if let Some(parent) = node.parent_in_subtree {
+            children[parent].push(node_index);
+        }
+    }
+    children
+}
+
+fn small_leaf_set_row_positions(
+    rows: &[usize],
+    local_positions: &mut [usize],
+    touched: &mut Vec<usize>,
+) {
+    touched.clear();
+    for (position, &row) in rows.iter().enumerate() {
+        debug_assert_eq!(local_positions[row], usize::MAX);
+        local_positions[row] = position;
+        touched.push(row);
+    }
+}
+
+fn small_leaf_reset_row_positions(local_positions: &mut [usize], touched: &mut Vec<usize>) {
+    for row in touched.drain(..) {
+        local_positions[row] = usize::MAX;
+    }
+}
+
+fn small_leaf_checked_position(local_positions: &[usize], row: usize) -> Result<usize, SsidsError> {
+    let position = local_positions.get(row).copied().unwrap_or(usize::MAX);
+    if position == usize::MAX {
+        return Err(SsidsError::NumericalBreakdown {
+            pivot: row,
+            detail: "small-leaf contribution row is absent from parent row list".into(),
+        });
+    }
+    Ok(position)
+}
+
+fn spral_small_leaf_pack_remaining_contribution(
+    node: &SpralSmallLeafNumericNode,
+    nelim: usize,
+    interface_contribution: &[f64],
+) -> (Vec<usize>, usize, Vec<f64>) {
+    let delayed_count = node.ncol - nelim;
+    let interface_dim = node.nrow - node.ncol;
+    let remaining_len = delayed_count + interface_dim;
+    let mut row_ids = Vec::with_capacity(remaining_len);
+    row_ids.extend_from_slice(&node.perm[nelim..node.ncol]);
+    row_ids.extend_from_slice(&node.rows[node.ncol..node.nrow]);
+    let mut dense = vec![0.0; packed_lower_len(remaining_len)];
+    let lcol = &node.lcol[..spral_small_leaf_d_offset(node.ldl, node.ncol)];
+    for col in 0..remaining_len {
+        for row in col..remaining_len {
+            let value = if col < delayed_count {
+                let source_col = nelim + col;
+                let source_row = if row < delayed_count {
+                    nelim + row
+                } else {
+                    node.ncol + (row - delayed_count)
+                };
+                lcol[source_col * node.ldl + source_row]
+            } else {
+                let interface_col = col - delayed_count;
+                let interface_row = row - delayed_count;
+                interface_contribution[interface_col * interface_dim + interface_row]
+            };
+            dense[packed_lower_offset(remaining_len, row, col)] = value;
+        }
+    }
+    (row_ids, delayed_count, dense)
+}
+
+#[inline]
+fn spral_small_leaf_lcol_len(ldl: usize, ncol: usize) -> usize {
+    (ldl + 2) * ncol
+}
+
+#[inline]
+fn spral_small_leaf_d_offset(ldl: usize, ncol: usize) -> usize {
+    ldl * ncol
+}
+
+#[inline(always)]
+fn spral_small_leaf_column_small(
+    lcol: &[f64],
+    m: usize,
+    ldl: usize,
+    col: usize,
+    from: usize,
+    small: f64,
+) -> bool {
+    let lcol_ptr = lcol.as_ptr();
+    for other_col in from..col {
+        // SAFETY: `lcol` has one stride-`ldl` column per candidate, and the
+        // searched row/column indices are within the active small-leaf front.
+        unsafe {
+            if (*lcol_ptr.add(other_col * ldl + col)).abs() >= small {
+                return false;
+            }
+        }
+    }
+    let col_base = col * ldl;
+    for row in col..m {
+        // SAFETY: see the loop above; `row < m <= ldl`.
+        unsafe {
+            if (*lcol_ptr.add(col_base + row)).abs() >= small {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[inline(always)]
+fn spral_small_leaf_find_row_abs_max(
+    lcol: &[f64],
+    ldl: usize,
+    col: usize,
+    from: usize,
+) -> Option<usize> {
+    if from >= col {
+        return None;
+    }
+    let lcol_ptr = lcol.as_ptr();
+    let mut best_row = from;
+    // SAFETY: `from < col`, and this probes the lower-triangle storage entry
+    // for row/column pair `(from, col)`.
+    let mut best_value = unsafe { (*lcol_ptr.add(from * ldl + col)).abs() };
+    for row in (from + 1)..col {
+        // SAFETY: same storage invariant as the initial probe.
+        let value = unsafe { (*lcol_ptr.add(row * ldl + col)).abs() };
+        if value > best_value {
+            best_value = value;
+            best_row = row;
+        }
+    }
+    Some(best_row)
+}
+
+#[inline(always)]
+fn spral_small_leaf_find_rc_abs_max_exclude(
+    lcol: &[f64],
+    m: usize,
+    ldl: usize,
+    col: usize,
+    from: usize,
+    exclude: Option<usize>,
+) -> f64 {
+    let mut best = 0.0_f64;
+    let excluded = exclude.unwrap_or(usize::MAX);
+    let lcol_ptr = lcol.as_ptr();
+    let mut other_col = from;
+    while other_col + 4 <= col {
+        if other_col != excluded {
+            unsafe {
+                best = best.max((*lcol_ptr.add(other_col * ldl + col)).abs());
+            }
+        }
+        let next_col = other_col + 1;
+        if next_col != excluded {
+            unsafe {
+                best = best.max((*lcol_ptr.add(next_col * ldl + col)).abs());
+            }
+        }
+        let next_col = other_col + 2;
+        if next_col != excluded {
+            unsafe {
+                best = best.max((*lcol_ptr.add(next_col * ldl + col)).abs());
+            }
+        }
+        let next_col = other_col + 3;
+        if next_col != excluded {
+            unsafe {
+                best = best.max((*lcol_ptr.add(next_col * ldl + col)).abs());
+            }
+        }
+        other_col += 4;
+    }
+    while other_col < col {
+        if other_col == excluded {
+            other_col += 1;
+            continue;
+        }
+        // SAFETY: `other_col < col`, so this is the stored lower-triangle
+        // entry for the row/column pair under inspection.
+        unsafe {
+            best = best.max((*lcol_ptr.add(other_col * ldl + col)).abs());
+        }
+        other_col += 1;
+    }
+    let col_base = col * ldl;
+    let mut row = col + 1;
+    while row + 4 <= m {
+        if row != excluded {
+            unsafe {
+                best = best.max((*lcol_ptr.add(col_base + row)).abs());
+            }
+        }
+        let next_row = row + 1;
+        if next_row != excluded {
+            unsafe {
+                best = best.max((*lcol_ptr.add(col_base + next_row)).abs());
+            }
+        }
+        let next_row = row + 2;
+        if next_row != excluded {
+            unsafe {
+                best = best.max((*lcol_ptr.add(col_base + next_row)).abs());
+            }
+        }
+        let next_row = row + 3;
+        if next_row != excluded {
+            unsafe {
+                best = best.max((*lcol_ptr.add(col_base + next_row)).abs());
+            }
+        }
+        row += 4;
+    }
+    while row < m {
+        if row == excluded {
+            row += 1;
+            continue;
+        }
+        // SAFETY: `row < m <= ldl`, and `col` is an active column.
+        unsafe {
+            best = best.max((*lcol_ptr.add(col_base + row)).abs());
+        }
+        row += 1;
+    }
+    best
+}
+
+fn spral_small_leaf_swap_cols(
+    lcol: &mut [f64],
+    perm: &mut [usize],
+    m: usize,
+    ldl: usize,
+    lhs: usize,
+    rhs: usize,
+) {
+    if lhs == rhs {
+        return;
+    }
+    let (lhs, rhs) = if lhs < rhs { (lhs, rhs) } else { (rhs, lhs) };
+    perm.swap(lhs, rhs);
+    for col in 0..lhs {
+        lcol.swap(col * ldl + lhs, col * ldl + rhs);
+    }
+    for index in (lhs + 1)..rhs {
+        lcol.swap(lhs * ldl + index, index * ldl + rhs);
+    }
+    for row in (rhs + 1)..m {
+        lcol.swap(lhs * ldl + row, rhs * ldl + row);
+    }
+    lcol.swap(lhs * ldl + lhs, rhs * ldl + rhs);
+}
+
+fn spral_small_leaf_zero_col(lcol: &mut [f64], m: usize, ldl: usize, pivot: usize) {
+    for row in pivot..m {
+        lcol[pivot * ldl + row] = 0.0;
+    }
+}
+
+#[inline(always)]
+fn spral_small_leaf_tpp_host_gemm_rank1_update(
+    lcol: &mut [f64],
+    m: usize,
+    n: usize,
+    ldl: usize,
+    pivot: usize,
+    ld: &[f64],
+) {
+    let start = pivot + 1;
+    let use_scalar_fma = m.saturating_sub(start) == 1 || n.saturating_sub(start) == 1;
+    let lcol_ptr = lcol.as_mut_ptr();
+    let multiplier_base = pivot * ldl;
+    // Mirrors native ldlt_tpp.cxx:
+    // host_gemm(OP_N, OP_T, m-start, n-start, 1, -1.0,
+    //           &a[pivot*lda+start], lda, &ld[start], ldld,
+    //           1.0, &a[start*lda+start], lda).
+    //
+    // Native updates the full trailing rectangle, not only the lower triangle.
+    // The row < col writes are normally unused by SSIDS' lower-triangle access
+    // paths, but keeping them populated removes a source-shape difference and
+    // lets the native trace compare the full host_gemm target rectangle.
+    for (col, &preserved) in ld.iter().enumerate().take(n).skip(start) {
+        let update_base = col * ldl;
+        for row in start..m {
+            // SAFETY: small-leaf `lcol` is allocated as `n` columns of stride
+            // `ldl`, with `ldl >= m`. The multiplier column is the eliminated
+            // pivot column and each update column is a distinct trailing column.
+            unsafe {
+                let entry = lcol_ptr.add(update_base + row);
+                let multiplier = *lcol_ptr.add(multiplier_base + row);
+                if use_scalar_fma {
+                    *entry = (-multiplier).mul_add(preserved, *entry);
+                } else {
+                    *entry -= multiplier * preserved;
+                }
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn spral_small_leaf_tpp_host_gemm_rank2_update(
+    lcol: &mut [f64],
+    m: usize,
+    n: usize,
+    ldl: usize,
+    pivot: usize,
+    ld: &[f64],
+    ldld: usize,
+) {
+    let start = pivot + 2;
+    let use_scalar_fma = m.saturating_sub(start) == 1 || n.saturating_sub(start) == 1;
+    let lcol_ptr = lcol.as_mut_ptr();
+    let first_multiplier_base = pivot * ldl;
+    let second_multiplier_base = (pivot + 1) * ldl;
+    // Mirrors native ldlt_tpp.cxx:
+    // host_gemm(OP_N, OP_T, m-start, n-start, 2, -1.0,
+    //           &a[pivot*lda+start], lda, &ld[start], ldld,
+    //           1.0, &a[start*lda+start], lda).
+    for col in start..n {
+        let first_preserved = ld[col];
+        let second_preserved = ld[ldld + col];
+        let update_base = col * ldl;
+        for row in start..m {
+            // SAFETY: see `spral_small_leaf_tpp_host_gemm_rank1_update`; the
+            // two multiplier columns are eliminated columns and the update
+            // column is trailing.
+            unsafe {
+                let entry = lcol_ptr.add(update_base + row);
+                let l1_row = *lcol_ptr.add(first_multiplier_base + row);
+                let l2_row = *lcol_ptr.add(second_multiplier_base + row);
+                if use_scalar_fma {
+                    let updated = (-l1_row).mul_add(first_preserved, *entry);
+                    *entry = (-l2_row).mul_add(second_preserved, updated);
+                } else {
+                    *entry -= l2_row.mul_add(second_preserved, l1_row * first_preserved);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SmallLeafPivotFactorTiming {
+    scale_time: Duration,
+    update_time: Duration,
+}
+
+fn spral_small_leaf_deep_profile_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("SPRAL_SSIDS_SMALL_LEAF_DEEP_PROFILE").is_some())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spral_small_leaf_factor_one_by_one(
+    lcol: &mut [f64],
+    d: &mut [f64],
+    m: usize,
+    n: usize,
+    ldl: usize,
+    pivot: usize,
+    ld: &mut [f64],
+    profile_enabled: bool,
+) -> Result<(FactorBlockRecord, SmallLeafPivotFactorTiming), SsidsError> {
+    let mut timing = SmallLeafPivotFactorTiming::default();
+    let diagonal_index = pivot * ldl + pivot;
+    let inverse_diagonal = 1.0 / lcol[diagonal_index];
+    d[2 * pivot] = inverse_diagonal;
+    d[2 * pivot + 1] = 0.0;
+    lcol[diagonal_index] = 1.0;
+
+    let scale_started = profile_enabled.then(Instant::now);
+    let lcol_ptr = lcol.as_mut_ptr();
+    let ld_ptr = ld.as_mut_ptr();
+    let pivot_base = pivot * ldl;
+    for row in (pivot + 1)..m {
+        // SAFETY: `pivot` is an active eliminated column, `row < m <= ldl`,
+        // and `ld` has at least `m` entries for the preserved column.
+        unsafe {
+            let entry = lcol_ptr.add(pivot_base + row);
+            let original = *entry;
+            *ld_ptr.add(row) = original;
+            *entry = original * inverse_diagonal;
+        }
+    }
+    if let Some(started) = scale_started {
+        timing.scale_time = started.elapsed();
+    }
+
+    let update_started = profile_enabled.then(Instant::now);
+    spral_small_leaf_tpp_host_gemm_rank1_update(lcol, m, n, ldl, pivot, ld);
+    if let Some(started) = update_started {
+        timing.update_time = started.elapsed();
+    }
+
+    Ok((
+        FactorBlockRecord {
+            size: 1,
+            values: [inverse_diagonal, 0.0, 0.0, 0.0],
+        },
+        timing,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spral_small_leaf_factor_two_by_two(
+    lcol: &mut [f64],
+    d: &mut [f64],
+    m: usize,
+    n: usize,
+    ldl: usize,
+    pivot: usize,
+    inverse: (f64, f64, f64),
+    stats: &mut PanelFactorStats,
+    ld: &mut [f64],
+    profile_enabled: bool,
+) -> Result<(FactorBlockRecord, SmallLeafPivotFactorTiming), SsidsError> {
+    let mut timing = SmallLeafPivotFactorTiming::default();
+    let (first_scratch, second_scratch) = ld.split_at_mut(m);
+    let (inv11, inv12, inv22) = inverse;
+    stats.two_by_two_pivots += 1;
+    d[2 * pivot] = inv11;
+    d[2 * pivot + 1] = inv12;
+    d[2 * pivot + 2] = f64::INFINITY;
+    d[2 * pivot + 3] = inv22;
+    lcol[pivot * ldl + pivot] = 1.0;
+    lcol[pivot * ldl + pivot + 1] = 0.0;
+    lcol[(pivot + 1) * ldl + pivot + 1] = 1.0;
+
+    let first_multiplier_row = pivot + 2;
+    let trailing_rows = m.saturating_sub(first_multiplier_row);
+    let vectorized_multiplier_rows = if trailing_rows >= 4 {
+        trailing_rows / 2 * 2
+    } else {
+        0
+    };
+    let scale_started = profile_enabled.then(Instant::now);
+    let lcol_ptr = lcol.as_mut_ptr();
+    let first_scratch_ptr = first_scratch.as_mut_ptr();
+    let second_scratch_ptr = second_scratch.as_mut_ptr();
+    let first_base = pivot * ldl;
+    let second_base = (pivot + 1) * ldl;
+    for row in first_multiplier_row..m {
+        // SAFETY: both pivot columns and scratch rows are within the active
+        // small-leaf panel; `row < m <= ldl`.
+        let (b1, b2) = unsafe {
+            let b1 = *lcol_ptr.add(first_base + row);
+            let b2 = *lcol_ptr.add(second_base + row);
+            *first_scratch_ptr.add(row) = b1;
+            *second_scratch_ptr.add(row) = b2;
+            (b1, b2)
+        };
+        let local_row = row - first_multiplier_row;
+        let l1 = if local_row < vectorized_multiplier_rows {
+            inv12.mul_add(b2, inv11 * b1)
+        } else {
+            inv11.mul_add(b1, inv12 * b2)
+        };
+        let l2 = inv12.mul_add(b1, inv22 * b2);
+        unsafe {
+            *lcol_ptr.add(first_base + row) = l1;
+            *lcol_ptr.add(second_base + row) = l2;
+        }
+    }
+    if let Some(started) = scale_started {
+        timing.scale_time = started.elapsed();
+    }
+
+    let update_started = profile_enabled.then(Instant::now);
+    spral_small_leaf_tpp_host_gemm_rank2_update(lcol, m, n, ldl, pivot, ld, m);
+    if let Some(started) = update_started {
+        timing.update_time = started.elapsed();
+    }
+
+    Ok((
+        FactorBlockRecord {
+            size: 2,
+            values: [inv11, inv12, f64::INFINITY, inv22],
+        },
+        timing,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spral_small_leaf_calc_ld_op_n(
+    lcol: &[f64],
+    d: &[f64],
+    n: usize,
+    ldl: usize,
+    nelim: usize,
+    contrib_dim: usize,
+    ld: &mut [f64],
+    ldld: usize,
+) {
+    let mut col = 0;
+    while col < nelim {
+        if col + 1 == nelim || d[2 * col + 2].is_finite() {
+            let mut d11 = d[2 * col];
+            if d11 != 0.0 {
+                d11 = 1.0 / d11;
+            }
+            for row in 0..contrib_dim {
+                ld[col * ldld + row] = d11 * lcol[col * ldl + n + row];
+            }
+            col += 1;
+        } else {
+            let mut d11 = d[2 * col];
+            let mut d21 = d[2 * col + 1];
+            let mut d22 = d[2 * col + 3];
+            let det = d11 * d22 - d21 * d21;
+            d11 /= det;
+            d21 /= det;
+            d22 /= det;
+            for row in 0..contrib_dim {
+                let a1 = lcol[col * ldl + n + row];
+                let a2 = lcol[(col + 1) * ldl + n + row];
+                ld[col * ldld + row] = d22.mul_add(a1, -(d21 * a2));
+                ld[(col + 1) * ldld + row] = (-d21).mul_add(a1, d11 * a2);
+            }
+            col += 2;
+        }
+    }
+}
+
+struct SpralSmallLeafContribution {
+    square: Vec<f64>,
+    calc_ld_time: Duration,
+    gemm_time: Duration,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spral_small_leaf_form_contribution(
+    lcol: &[f64],
+    d: &[f64],
+    m: usize,
+    n: usize,
+    ldl: usize,
+    nelim: usize,
+    profile_enabled: bool,
+    work: &mut Vec<f64>,
+) -> SpralSmallLeafContribution {
+    let contrib_dim = m - n;
+    if contrib_dim == 0 {
+        return SpralSmallLeafContribution {
+            square: Vec::new(),
+            calc_ld_time: Duration::default(),
+            gemm_time: Duration::default(),
+        };
+    }
+    let ldld = spral_align_lda_f64(contrib_dim);
+    let ld_len = nelim * ldld;
+    if work.len() < ld_len {
+        work.resize(ld_len, 0.0);
+    }
+    let ld = &mut work[..ld_len];
+    let calc_ld_started = profile_enabled.then(Instant::now);
+    spral_small_leaf_calc_ld_op_n(lcol, d, n, ldl, nelim, contrib_dim, ld, ldld);
+    let calc_ld_time = calc_ld_started
+        .map(|started| started.elapsed())
+        .unwrap_or_default();
+
+    let gemm_started = profile_enabled.then(Instant::now);
+    let mut contrib = vec![0.0; contrib_dim * contrib_dim];
+    let lcol_ptr = lcol.as_ptr();
+    let ld_ptr = ld.as_ptr();
+    let contrib_ptr = contrib.as_mut_ptr();
+    for col in 0..contrib_dim {
+        let mut row = col;
+        while row + 4 <= contrib_dim {
+            let mut value0 = 0.0;
+            let mut value1 = 0.0;
+            let mut value2 = 0.0;
+            let mut value3 = 0.0;
+            for pivot in 0..nelim {
+                // SAFETY: `ld` has `nelim` columns of stride `ldld`, and
+                // `lcol` has eliminated columns of stride `ldl` with rows
+                // `n..m` forming the contribution block.
+                let right = unsafe { *ld_ptr.add(pivot * ldld + col) };
+                let left_base = pivot * ldl + n + row;
+                unsafe {
+                    value0 -= *lcol_ptr.add(left_base) * right;
+                    value1 -= *lcol_ptr.add(left_base + 1) * right;
+                    value2 -= *lcol_ptr.add(left_base + 2) * right;
+                    value3 -= *lcol_ptr.add(left_base + 3) * right;
+                }
+            }
+            let contrib_base = col * contrib_dim + row;
+            unsafe {
+                *contrib_ptr.add(contrib_base) = value0;
+                *contrib_ptr.add(contrib_base + 1) = value1;
+                *contrib_ptr.add(contrib_base + 2) = value2;
+                *contrib_ptr.add(contrib_base + 3) = value3;
+            }
+            row += 4;
+        }
+        while row < contrib_dim {
+            let mut value = 0.0;
+            for pivot in 0..nelim {
+                // SAFETY: same bounds as the four-row microkernel above.
+                let left = unsafe { *lcol_ptr.add(pivot * ldl + n + row) };
+                let right = unsafe { *ld_ptr.add(pivot * ldld + col) };
+                value -= left * right;
+            }
+            unsafe {
+                *contrib_ptr.add(col * contrib_dim + row) = value;
+            }
+            row += 1;
+        }
+    }
+    let gemm_time = gemm_started
+        .map(|started| started.elapsed())
+        .unwrap_or_default();
+
+    SpralSmallLeafContribution {
+        square: contrib,
+        calc_ld_time,
+        gemm_time,
+    }
+}
+
+fn build_spral_small_leaf_solve_panel_record(
+    factor_order: &[usize],
+    trailing_rows: &[usize],
+    lcol: &[f64],
+    m: usize,
+    ldl: usize,
+    eliminated_len: usize,
+) -> Result<Option<FactorSolvePanelRecord>, SsidsError> {
+    if eliminated_len == 0 {
+        return Ok(None);
+    }
+    if eliminated_len > m || factor_order.len() != eliminated_len {
+        return Err(SsidsError::NumericalBreakdown {
+            pivot: eliminated_len,
+            detail: "small-leaf solve panel request does not match eliminated front width".into(),
+        });
+    }
+    let local_size = factor_order.len() + trailing_rows.len();
+    if local_size != m {
+        return Err(SsidsError::NumericalBreakdown {
+            pivot: eliminated_len,
+            detail: format!("small-leaf solve panel has {local_size} row ids for a {m} row front"),
+        });
+    }
+
+    let mut row_ids = Vec::with_capacity(m);
+    row_ids.extend_from_slice(factor_order);
+    row_ids.extend_from_slice(trailing_rows);
+
+    let mut values = Vec::<f64>::with_capacity(m * eliminated_len);
+    let values_ptr = values.as_mut_ptr();
+    let lcol_ptr = lcol.as_ptr();
+    for local_col in 0..eliminated_len {
+        let column_start = local_col * m;
+        unsafe {
+            std::ptr::write_bytes(values_ptr.add(column_start), 0, local_col);
+            values_ptr.add(column_start + local_col).write(1.0);
+            let lower_count = m - local_col - 1;
+            if lower_count > 0 {
+                std::ptr::copy_nonoverlapping(
+                    lcol_ptr.add(local_col * ldl + local_col + 1),
+                    values_ptr.add(column_start + local_col + 1),
+                    lower_count,
+                );
+            }
+        }
+    }
+    unsafe {
+        values.set_len(m * eliminated_len);
+    }
+
+    Ok(Some(FactorSolvePanelRecord {
+        eliminated_len,
+        row_ids,
+        values,
+    }))
+}
+
+fn factorize_spral_small_leaf_aligned_tpp_in_place(
+    node: &mut SpralSmallLeafNumericNode,
+    options: NumericFactorOptions,
+    profile_enabled: bool,
+    work: &mut Vec<f64>,
+    has_children: bool,
+) -> Result<DenseFrontFactorization, SsidsError> {
+    let started = profile_enabled.then(Instant::now);
+    let m = node.nrow;
+    let n = node.ncol;
+    let ldl = node.ldl;
+    let d_offset = spral_small_leaf_d_offset(ldl, n);
+    let (lcol, d) = node.lcol.split_at_mut(d_offset);
+    let d = &mut d[..2 * n];
+    let mut stats = PanelFactorStats::default();
+    let mut profile = FactorProfile::default();
+    let deep_profile_enabled = profile_enabled && spral_small_leaf_deep_profile_enabled();
+    if profile_enabled {
+        profile.tpp_front_count += 1;
+    }
+    let mut block_records = Vec::with_capacity(n);
+    let mut pivot = 0;
+    let ld_len = 2 * m.max(1);
+    if work.len() < ld_len {
+        work.resize(ld_len, 0.0);
+    }
+
+    while pivot < n {
+        let mut pivot_search_started = profile_enabled.then(Instant::now);
+        if spral_small_leaf_column_small(lcol, m, ldl, pivot, pivot, options.small_pivot_tolerance)
+        {
+            if !options.action_on_zero_pivot {
+                return Err(SsidsError::NumericalBreakdown {
+                    pivot: node.perm[pivot],
+                    detail: "small-leaf TPP encountered a zero pivot with action disabled".into(),
+                });
+            }
+            if let Some(started) = pivot_search_started.take() {
+                let elapsed = started.elapsed();
+                profile.tpp_pivot_search_time += elapsed;
+                profile.spral_small_leaf_pivot_search_time += elapsed;
+            }
+            spral_small_leaf_swap_cols(lcol, &mut node.perm, m, ldl, pivot, pivot);
+            spral_small_leaf_zero_col(lcol, m, ldl, pivot);
+            d[2 * pivot] = 0.0;
+            d[2 * pivot + 1] = 0.0;
+            block_records.push(FactorBlockRecord {
+                size: 1,
+                values: [0.0, 0.0, 0.0, 0.0],
+            });
+            profile.tpp_pivots += 1;
+            pivot += 1;
+            continue;
+        }
+
+        let mut advanced = false;
+        for candidate in (pivot + 1)..n {
+            if spral_small_leaf_column_small(
+                lcol,
+                m,
+                ldl,
+                candidate,
+                pivot,
+                options.small_pivot_tolerance,
+            ) {
+                if !options.action_on_zero_pivot {
+                    return Err(SsidsError::NumericalBreakdown {
+                        pivot: node.perm[pivot],
+                        detail: "small-leaf TPP encountered a zero pivot with action disabled"
+                            .into(),
+                    });
+                }
+                if let Some(started) = pivot_search_started.take() {
+                    let elapsed = started.elapsed();
+                    profile.tpp_pivot_search_time += elapsed;
+                    profile.spral_small_leaf_pivot_search_time += elapsed;
+                }
+                spral_small_leaf_swap_cols(lcol, &mut node.perm, m, ldl, candidate, pivot);
+                spral_small_leaf_zero_col(lcol, m, ldl, pivot);
+                d[2 * pivot] = 0.0;
+                d[2 * pivot + 1] = 0.0;
+                block_records.push(FactorBlockRecord {
+                    size: 1,
+                    values: [0.0, 0.0, 0.0, 0.0],
+                });
+                profile.tpp_pivots += 1;
+                pivot += 1;
+                advanced = true;
+                break;
+            }
+
+            let Some(first) = spral_small_leaf_find_row_abs_max(lcol, ldl, candidate, pivot) else {
+                continue;
+            };
+            let mut second = candidate;
+            let a11 = lcol[first * ldl + first];
+            let a22 = lcol[second * ldl + second];
+            let a21 = lcol[first * ldl + second];
+            let maxt =
+                spral_small_leaf_find_rc_abs_max_exclude(lcol, m, ldl, first, pivot, Some(second));
+            let mut maxp =
+                spral_small_leaf_find_rc_abs_max_exclude(lcol, m, ldl, second, pivot, Some(first));
+
+            if let Some(inverse) = tpp_test_two_by_two(a11, a21, a22, maxt, maxp, options) {
+                if let Some(started) = pivot_search_started.take() {
+                    let elapsed = started.elapsed();
+                    profile.tpp_pivot_search_time += elapsed;
+                    profile.spral_small_leaf_pivot_search_time += elapsed;
+                }
+                spral_small_leaf_swap_cols(lcol, &mut node.perm, m, ldl, first, pivot);
+                if second == pivot {
+                    second = first;
+                }
+                spral_small_leaf_swap_cols(lcol, &mut node.perm, m, ldl, second, pivot + 1);
+                let pivot_factor_started = profile_enabled.then(Instant::now);
+                let (block, pivot_timing) = spral_small_leaf_factor_two_by_two(
+                    lcol,
+                    d,
+                    m,
+                    n,
+                    ldl,
+                    pivot,
+                    inverse,
+                    &mut stats,
+                    &mut work[..ld_len],
+                    deep_profile_enabled,
+                )?;
+                if let Some(started) = pivot_factor_started {
+                    let elapsed = started.elapsed();
+                    profile.tpp_pivot_factor_time += elapsed;
+                    profile.spral_small_leaf_pivot_factor_time += elapsed;
+                    profile.spral_small_leaf_pivot_scale_time += pivot_timing.scale_time;
+                    profile.spral_small_leaf_pivot_update_time += pivot_timing.update_time;
+                }
+                block_records.push(block);
+                profile.tpp_pivots += 2;
+                pivot += 2;
+                advanced = true;
+                break;
+            }
+
+            maxp = maxp.max(a21.abs());
+            if a22.abs() >= options.threshold_pivot_u * maxp {
+                if let Some(started) = pivot_search_started.take() {
+                    let elapsed = started.elapsed();
+                    profile.tpp_pivot_search_time += elapsed;
+                    profile.spral_small_leaf_pivot_search_time += elapsed;
+                }
+                spral_small_leaf_swap_cols(lcol, &mut node.perm, m, ldl, candidate, pivot);
+                let pivot_factor_started = profile_enabled.then(Instant::now);
+                let (block, pivot_timing) = spral_small_leaf_factor_one_by_one(
+                    lcol,
+                    d,
+                    m,
+                    n,
+                    ldl,
+                    pivot,
+                    &mut work[..ld_len],
+                    deep_profile_enabled,
+                )?;
+                if let Some(started) = pivot_factor_started {
+                    let elapsed = started.elapsed();
+                    profile.tpp_pivot_factor_time += elapsed;
+                    profile.spral_small_leaf_pivot_factor_time += elapsed;
+                    profile.spral_small_leaf_pivot_scale_time += pivot_timing.scale_time;
+                    profile.spral_small_leaf_pivot_update_time += pivot_timing.update_time;
+                }
+                block_records.push(block);
+                profile.tpp_pivots += 1;
+                pivot += 1;
+                advanced = true;
+                break;
+            }
+        }
+
+        if advanced {
+            continue;
+        }
+
+        let current_diag = lcol[pivot * ldl + pivot];
+        let current_offdiag_max =
+            spral_small_leaf_find_rc_abs_max_exclude(lcol, m, ldl, pivot, pivot, None);
+        if current_diag.abs() >= options.threshold_pivot_u * current_offdiag_max {
+            if let Some(started) = pivot_search_started.take() {
+                let elapsed = started.elapsed();
+                profile.tpp_pivot_search_time += elapsed;
+                profile.spral_small_leaf_pivot_search_time += elapsed;
+            }
+            spral_small_leaf_swap_cols(lcol, &mut node.perm, m, ldl, pivot, pivot);
+            let pivot_factor_started = profile_enabled.then(Instant::now);
+            let (block, pivot_timing) = spral_small_leaf_factor_one_by_one(
+                lcol,
+                d,
+                m,
+                n,
+                ldl,
+                pivot,
+                &mut work[..ld_len],
+                deep_profile_enabled,
+            )?;
+            if let Some(started) = pivot_factor_started {
+                let elapsed = started.elapsed();
+                profile.tpp_pivot_factor_time += elapsed;
+                profile.spral_small_leaf_pivot_factor_time += elapsed;
+                profile.spral_small_leaf_pivot_scale_time += pivot_timing.scale_time;
+                profile.spral_small_leaf_pivot_update_time += pivot_timing.update_time;
+            }
+            block_records.push(block);
+            profile.tpp_pivots += 1;
+            pivot += 1;
+            continue;
+        }
+
+        if let Some(started) = pivot_search_started.take() {
+            let elapsed = started.elapsed();
+            profile.tpp_pivot_search_time += elapsed;
+            profile.spral_small_leaf_pivot_search_time += elapsed;
+        }
+        break;
+    }
+
+    let nelim = pivot;
+    if profile_enabled {
+        profile.tpp_factor_column_entries += solve_panel_lower_entry_count_for_range(m, 0, nelim);
+    }
+    stats.delayed_pivots += n - nelim;
+
+    let contribution_dim = m - n;
+    let mut contribution_calc_ld_time = Duration::default();
+    let mut contribution_gemm_time = Duration::default();
+    let empty_contribution;
+    let interface_contribution = if nelim > 0 {
+        let contribution =
+            spral_small_leaf_form_contribution(lcol, d, m, n, ldl, nelim, profile_enabled, work);
+        contribution_calc_ld_time = contribution.calc_ld_time;
+        contribution_gemm_time = contribution.gemm_time;
+        profile.spral_small_leaf_contribution_calc_ld_time += contribution_calc_ld_time;
+        profile.spral_small_leaf_contribution_gemm_time += contribution_gemm_time;
+        node.contrib = if contribution_dim > 0 {
+            Some(contribution.square)
+        } else {
+            None
+        };
+        node.contrib.as_deref().unwrap_or(&[])
+    } else {
+        if !has_children {
+            // Mirrors SmallLeafNumericSubtree::factor_node: a no-elimination
+            // leaf contributes nothing beyond its delayed lcol rows.
+            node.contrib = None;
+        }
+        if let Some(contrib) = node.contrib.as_mut() {
+            contrib.fill(0.0);
+        }
+        if let Some(contrib) = node.contrib.as_deref() {
+            contrib
+        } else {
+            empty_contribution = vec![0.0; contribution_dim * contribution_dim];
+            &empty_contribution
+        }
+    };
+    let contribution_pack_started = profile_enabled.then(Instant::now);
+    let (remaining_rows, delayed_count, contribution_dense) =
+        spral_small_leaf_pack_remaining_contribution(node, nelim, interface_contribution);
+    if let Some(started) = contribution_pack_started {
+        let elapsed = started.elapsed();
+        profile.spral_small_leaf_contribution_pack_time += elapsed;
+        profile.tpp_contribution_pack_time +=
+            contribution_calc_ld_time + contribution_gemm_time + elapsed;
+    }
+
+    if let Some(started) = started {
+        let elapsed = started.elapsed();
+        profile.tpp_factorization_time += elapsed;
+        profile.spral_small_leaf_tpp_time += elapsed;
+    }
+
+    Ok(DenseFrontFactorization {
+        factor_order: node.perm[..nelim].to_vec(),
+        factor_columns: Vec::new(),
+        block_records,
+        solve_panels: Vec::new(),
+        contribution: ContributionBlock {
+            row_ids: remaining_rows,
+            delayed_count,
+            dense: contribution_dense,
+        },
+        stats,
+        profile,
+    })
+}
+
+fn assemble_spral_small_leaf_node_pre(
+    node_index: usize,
+    plan: &SpralSmallLeafSymbolicPlan,
+    children_by_node: &[Vec<usize>],
+    fronts: &[SymbolicFront],
+    matrix: &PermutedLowerMatrix<'_>,
+    nodes: &[Option<SpralSmallLeafNumericNode>],
+    scratch: &mut SmallLeafAssemblyScratch,
+) -> Result<SpralSmallLeafNumericNode, SsidsError> {
+    let node_plan = &plan.nodes[node_index];
+    let front = &fronts[node_plan.front_id];
+    let mut delayed_rows = Vec::new();
+    for &child_index in &children_by_node[node_index] {
+        let child = nodes[child_index]
+            .as_ref()
+            .expect("small-leaf children are factored before parents");
+        debug_assert!(child.nelim + child.ndelay_out <= child.ncol);
+        delayed_rows.extend_from_slice(&child.perm[child.nelim..child.nelim + child.ndelay_out]);
+    }
+    let ndelay_in = delayed_rows.len();
+    let mut rows = Vec::with_capacity(node_plan.nrow + ndelay_in);
+    rows.extend_from_slice(&front.columns);
+    rows.extend_from_slice(&delayed_rows);
+    rows.extend_from_slice(&front.interface_rows);
+    debug_assert_eq!(node_plan.nrow, front.width() + front.interface_rows.len());
+    debug_assert_eq!(front.width(), node_plan.ncol);
+    let nrow = node_plan.nrow + ndelay_in;
+    let ncol = node_plan.ncol + ndelay_in;
+    let ldl = spral_align_lda_f64(nrow);
+    let contrib_dim = nrow - ncol;
+    let mut perm = Vec::with_capacity(ncol);
+    perm.extend_from_slice(&front.columns);
+    perm.extend_from_slice(&delayed_rows);
+    let mut node = SpralSmallLeafNumericNode {
+        front_id: node_plan.front_id,
+        rows,
+        base_ncol: node_plan.ncol,
+        nrow,
+        ncol,
+        ldl,
+        lcol: vec![0.0; spral_small_leaf_lcol_len(ldl, ncol)],
+        perm,
+        contrib: (contrib_dim > 0).then(|| vec![0.0; contrib_dim * contrib_dim]),
+        ndelay_in,
+        ndelay_out: 0,
+        nelim: 0,
+    };
+
+    small_leaf_set_row_positions(
+        &node.rows,
+        &mut scratch.local_positions,
+        &mut scratch.touched_positions,
+    );
+    for (local_col, &column) in front.columns.iter().enumerate() {
+        for entry in matrix.col_ptrs[column]..matrix.col_ptrs[column + 1] {
+            let row = matrix.row_indices[entry];
+            let local_row = scratch
+                .local_positions
+                .get(row)
+                .copied()
+                .unwrap_or(usize::MAX);
+            if local_row == usize::MAX {
+                continue;
+            }
+            node.lcol[local_col * ldl + local_row] = matrix.values[entry];
+        }
+    }
+
+    let mut delay_col = node.base_ncol;
+    for &child_index in &children_by_node[node_index] {
+        let child = nodes[child_index]
+            .as_ref()
+            .expect("small-leaf children are factored before parents");
+        for delay_index in 0..child.ndelay_out {
+            let child_col = child.nelim + delay_index;
+            let dest_base = (delay_col + delay_index) * ldl;
+            let src_base = child_col * child.ldl;
+            for delayed_row in delay_index..child.ndelay_out {
+                node.lcol[dest_base + delay_col + delayed_row] =
+                    child.lcol[src_base + child.nelim + delayed_row];
+            }
+            for child_row in child.ncol..child.nrow {
+                let parent_row =
+                    small_leaf_checked_position(&scratch.local_positions, child.rows[child_row])?;
+                let value = child.lcol[src_base + child_row];
+                if parent_row < ncol {
+                    node.lcol[parent_row * ldl + delay_col + delay_index] = value;
+                } else {
+                    node.lcol[dest_base + parent_row] = value;
+                }
+            }
+        }
+        delay_col += child.ndelay_out;
+        let Some(child_contrib) = child.contrib.as_ref() else {
+            continue;
+        };
+        let child_contrib_dim = child.nrow - child.ncol;
+        for child_col in 0..child_contrib_dim {
+            let parent_col = small_leaf_checked_position(
+                &scratch.local_positions,
+                child.rows[child.ncol + child_col],
+            )?;
+            if parent_col >= node.base_ncol {
+                continue;
+            }
+            let dest = parent_col * ldl;
+            let src = child_col * child_contrib_dim;
+            for child_row in child_col..child_contrib_dim {
+                let parent_row = small_leaf_checked_position(
+                    &scratch.local_positions,
+                    child.rows[child.ncol + child_row],
+                )?;
+                node.lcol[dest + parent_row] += child_contrib[src + child_row];
+            }
+        }
+    }
+    small_leaf_reset_row_positions(&mut scratch.local_positions, &mut scratch.touched_positions);
+
+    Ok(node)
+}
+
+fn factor_spral_small_leaf_node(
+    mut node: SpralSmallLeafNumericNode,
+    options: NumericFactorOptions,
+    profile_enabled: bool,
+    work: &mut Vec<f64>,
+    has_children: bool,
+) -> Result<(SpralSmallLeafNumericNode, DenseFrontFactorization), SsidsError> {
+    if node.ldl != spral_align_lda_f64(node.nrow)
+        || node.lcol.len() != spral_small_leaf_lcol_len(node.ldl, node.ncol)
+    {
+        return Err(SsidsError::NumericalBreakdown {
+            pivot: node.perm.first().copied().unwrap_or(node.front_id),
+            detail: format!(
+                "planned small-leaf node {} has ldl={} and lcol_len={}, expected ldl={} and lcol_len={}",
+                node.front_id,
+                node.ldl,
+                node.lcol.len(),
+                spral_align_lda_f64(node.nrow),
+                spral_small_leaf_lcol_len(spral_align_lda_f64(node.nrow), node.ncol)
+            ),
+        });
+    }
+    let mut factorization = factorize_spral_small_leaf_aligned_tpp_in_place(
+        &mut node,
+        options,
+        profile_enabled,
+        work,
+        has_children,
+    )?;
+
+    let panel_started = profile_enabled.then(Instant::now);
+    if let Some(panel) = build_spral_small_leaf_solve_panel_record(
+        &factorization.factor_order,
+        &factorization.contribution.row_ids,
+        &node.lcol,
+        node.nrow,
+        node.ldl,
+        factorization.factor_order.len(),
+    )? {
+        factorization.solve_panels.push(panel);
+    }
+    if let Some(started) = panel_started {
+        let elapsed = started.elapsed();
+        factorization.profile.solve_panel_build_time += elapsed;
+        factorization
+            .profile
+            .spral_small_leaf_solve_panel_build_time += elapsed;
+    }
+
+    node.nelim = factorization.factor_order.len();
+    node.ndelay_out = node.ncol - node.nelim;
+    let interface_rows = node.rows[node.ncol..node.nrow].to_vec();
+    node.rows.clear();
+    node.rows.extend_from_slice(&node.perm);
+    node.rows.extend_from_slice(&interface_rows);
+
+    Ok((node, factorization))
+}
+
+fn assemble_spral_small_leaf_node_post(
+    node_index: usize,
+    children_by_node: &[Vec<usize>],
+    nodes: &mut [Option<SpralSmallLeafNumericNode>],
+    scratch: &mut SmallLeafAssemblyScratch,
+) -> Result<(), SsidsError> {
+    if children_by_node[node_index].is_empty() {
+        return Ok(());
+    }
+    let parent_rows = nodes[node_index]
+        .as_ref()
+        .expect("small-leaf node must be present before post assembly")
+        .rows
+        .clone();
+    let parent_ncol = nodes[node_index].as_ref().unwrap().ncol;
+    let parent_contrib_dim = parent_rows.len() - parent_ncol;
+    if parent_contrib_dim == 0 {
+        for &child_index in &children_by_node[node_index] {
+            if let Some(child) = nodes[child_index].as_mut() {
+                child.contrib = None;
+            }
+        }
+        return Ok(());
+    }
+
+    small_leaf_set_row_positions(
+        &parent_rows,
+        &mut scratch.local_positions,
+        &mut scratch.touched_positions,
+    );
+    let mut additions = Vec::new();
+    let mut consumed_children = Vec::new();
+    for &child_index in &children_by_node[node_index] {
+        let child = nodes[child_index]
+            .as_ref()
+            .expect("small-leaf children are factored before parents");
+        let Some(child_contrib) = child.contrib.as_ref() else {
+            continue;
+        };
+        consumed_children.push(child_index);
+        let child_contrib_dim = child.nrow - child.ncol;
+        for child_col in 0..child_contrib_dim {
+            let parent_col = small_leaf_checked_position(
+                &scratch.local_positions,
+                child.rows[child.ncol + child_col],
+            )?;
+            if parent_col < parent_ncol {
+                continue;
+            }
+            for child_row in child_col..child_contrib_dim {
+                let parent_row = small_leaf_checked_position(
+                    &scratch.local_positions,
+                    child.rows[child.ncol + child_row],
+                )?;
+                additions.push((
+                    parent_row - parent_ncol,
+                    parent_col - parent_ncol,
+                    child_contrib[child_col * child_contrib_dim + child_row],
+                ));
+            }
+        }
+    }
+    small_leaf_reset_row_positions(&mut scratch.local_positions, &mut scratch.touched_positions);
+    for child_index in consumed_children {
+        if let Some(child) = nodes[child_index].as_mut() {
+            child.contrib = None;
+        }
+    }
+
+    if additions.is_empty() {
+        return Ok(());
+    }
+    let parent = nodes[node_index]
+        .as_mut()
+        .expect("small-leaf node must be present before post assembly");
+    let contrib = parent
+        .contrib
+        .as_mut()
+        .expect("small-leaf parent contribution must exist for post assembly");
+    for (row, col, value) in additions {
+        contrib[col * parent_contrib_dim + row] += value;
+    }
+    Ok(())
+}
+
+fn try_factor_spral_small_leaf_subtree_serial(
+    plan: &SpralSmallLeafSymbolicPlan,
     tree: &SymbolicFrontTree,
     matrix: &PermutedLowerMatrix<'_>,
     options: NumericFactorOptions,
-    progress: Option<&FactorizationProgressShared>,
     profile_enabled: bool,
-) -> Result<FrontFactorizationResult, SsidsError> {
-    let front = &tree.fronts[front_id];
-    let child_results =
-        if front.children.len() >= 2 && front.width() + front.interface_rows.len() >= 32 {
-            let raw = front
-                .children
-                .par_iter()
-                .map(|&child| {
-                    factor_front_recursive(child, tree, matrix, options, progress, profile_enabled)
-                })
-                .collect::<Vec<_>>();
-            let mut collected = Vec::with_capacity(raw.len());
-            for result in raw {
-                collected.push(result?);
-            }
-            collected
-        } else {
-            let mut collected = Vec::with_capacity(front.children.len());
-            for &child in &front.children {
-                collected.push(factor_front_recursive(
-                    child,
-                    tree,
-                    matrix,
-                    options,
-                    progress,
-                    profile_enabled,
-                )?);
-            }
-            collected
-        };
-
-    let front_elimination_capacity = front.columns.len() + front.interface_rows.len();
-    let mut factor_order = Vec::with_capacity(front_elimination_capacity);
-    let mut factor_columns = Vec::with_capacity(front_elimination_capacity);
-    let mut block_records = Vec::with_capacity(front_elimination_capacity);
-    let mut solve_panels = Vec::with_capacity(child_results.len() + 1);
-    let mut child_contributions = Vec::with_capacity(child_results.len());
+) -> Result<(FactorOutput, FrontFactorizationResult), SsidsError> {
+    let children_by_node = small_leaf_children_by_node(plan);
+    let mut nodes = (0..plan.nodes.len()).map(|_| None).collect::<Vec<_>>();
+    let mut assembly_scratch = SmallLeafAssemblyScratch::new(matrix.dimension);
+    let mut output = FactorOutput::default();
     let mut stats = PanelFactorStats::default();
     let mut profile = FactorProfile::default();
     let mut max_front_size = 0;
     let mut contribution_storage_bytes = 0;
 
-    for child in child_results {
-        factor_order.extend(child.factor_order);
-        factor_columns.extend(child.factor_columns);
-        block_records.extend(child.block_records);
-        solve_panels.extend(child.solve_panels);
-        child_contributions.push(child.contribution);
-        aggregate_panel_stats(&mut stats, child.stats);
-        profile.accumulate(&child.profile);
-        max_front_size = max_front_size.max(child.max_front_size);
-        contribution_storage_bytes += child.contribution_storage_bytes;
+    for node_index in 0..plan.nodes.len() {
+        let assembly_started = profile_enabled.then(Instant::now);
+        let node = assemble_spral_small_leaf_node_pre(
+            node_index,
+            plan,
+            &children_by_node,
+            &tree.fronts,
+            matrix,
+            &nodes,
+            &mut assembly_scratch,
+        )?;
+        if let Some(started) = assembly_started {
+            profile.front_assembly_time += started.elapsed();
+            profile.front_count += 1;
+            profile.local_dense_entries += node.lcol.len();
+            profile.local_dense_bytes_zeroed += node.lcol.len() * std::mem::size_of::<f64>();
+            profile.spral_small_leaf_fronts += 1;
+            profile.spral_small_leaf_columns += node.ncol;
+            profile.spral_small_leaf_dense_entries += node.lcol.len();
+            if !matches!(options.pivot_method, PivotMethod::ThresholdPartial)
+                && node.ncol.min(node.nrow) >= APP_INNER_BLOCK_SIZE
+            {
+                profile.spral_small_leaf_app_fronts += 1;
+            }
+        }
+        max_front_size = max_front_size.max(node.nrow);
+
+        let factor_started = profile_enabled.then(Instant::now);
+        let (node, local) = factor_spral_small_leaf_node(
+            node,
+            options,
+            profile_enabled,
+            &mut assembly_scratch.numeric_work,
+            !children_by_node[node_index].is_empty(),
+        )?;
+        if let Some(started) = factor_started {
+            profile.dense_front_factorization_time += started.elapsed();
+        }
+        profile.accumulate(&local.profile);
+        aggregate_panel_stats(&mut stats, local.stats);
+        contribution_storage_bytes += local.contribution.dense.len() * std::mem::size_of::<f64>();
+        let output_append_started = profile_enabled.then(Instant::now);
+        output.factor_order.extend(local.factor_order);
+        output.factor_columns.extend(local.factor_columns);
+        output.block_records.extend(local.block_records);
+        output.solve_panels.extend(local.solve_panels);
+        if let Some(started) = output_append_started {
+            let elapsed = started.elapsed();
+            profile.front_local_result_merge_time += elapsed;
+            profile.spral_small_leaf_output_append_time += elapsed;
+        }
+
+        nodes[node_index] = Some(node);
+        let post_started = profile_enabled.then(Instant::now);
+        assemble_spral_small_leaf_node_post(
+            node_index,
+            &children_by_node,
+            &mut nodes,
+            &mut assembly_scratch,
+        )?;
+        if let Some(started) = post_started {
+            profile.front_contribution_assembly_time += started.elapsed();
+        }
+    }
+
+    let root_node = nodes
+        .last()
+        .and_then(Option::as_ref)
+        .expect("small-leaf plan has at least one node");
+    let interface_dim = root_node.nrow - root_node.ncol;
+    let empty_contribution;
+    let interface_contribution = if let Some(contrib) = root_node.contrib.as_ref() {
+        contrib.as_slice()
+    } else {
+        empty_contribution = vec![0.0; interface_dim * interface_dim];
+        &empty_contribution
+    };
+    let (row_ids, delayed_count, dense) = spral_small_leaf_pack_remaining_contribution(
+        root_node,
+        root_node.nelim,
+        interface_contribution,
+    );
+    let contribution = ContributionBlock {
+        row_ids,
+        delayed_count,
+        dense,
+    };
+
+    Ok((
+        output,
+        FrontFactorizationResult {
+            contribution,
+            stats,
+            profile,
+            max_front_size,
+            contribution_storage_bytes,
+        },
+    ))
+}
+
+fn factor_front_recursive(
+    front_id: usize,
+    tree: &SymbolicFrontTree,
+    matrix: &PermutedLowerMatrix<'_>,
+    scratch: &mut FrontFactorScratch<'_>,
+    options: NumericFactorOptions,
+    progress: Option<&FactorizationProgressShared>,
+    profile_enabled: bool,
+) -> Result<FrontFactorizationResult, SsidsError> {
+    let front = &tree.fronts[front_id];
+    let mut child_contributions = Vec::with_capacity(front.children.len());
+    let mut stats = PanelFactorStats::default();
+    let mut profile = FactorProfile::default();
+    let mut max_front_size = 0;
+    let mut contribution_storage_bytes = 0;
+
+    if let Some(plan_index) = tree.spral_small_leaf_subtree_by_end[front_id] {
+        let plan = &tree.spral_small_leaf_subtrees[plan_index];
+        let (small_output, small_result) = try_factor_spral_small_leaf_subtree_serial(
+            plan,
+            tree,
+            matrix,
+            options,
+            profile_enabled,
+        )?;
+        if let Some(progress) = progress {
+            progress
+                .completed_fronts
+                .fetch_add(plan.nodes.len(), Ordering::Relaxed);
+            progress
+                .completed_pivots
+                .fetch_add(small_output.factor_order.len(), Ordering::Relaxed);
+            let weight = plan
+                .nodes
+                .iter()
+                .map(|node| {
+                    let front = &tree.fronts[node.front_id];
+                    front_work_weight(front.width(), front.interface_rows.len())
+                })
+                .sum();
+            progress
+                .completed_weight
+                .fetch_add(weight, Ordering::Relaxed);
+            if plan.subtree.parent_front.is_none() {
+                progress.completed_roots.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        scratch.output.append(small_output);
+        return Ok(small_result);
+    }
+
+    let parallel_children = rayon::current_num_threads() > 1
+        && front.children.len() >= 2
+        && front.width() + front.interface_rows.len() >= 32;
+    if parallel_children {
+        let raw = front
+            .children
+            .par_iter()
+            .map(|&child| -> Result<_, SsidsError> {
+                let mut child_output = FactorOutput::default();
+                let mut child_workspace = FrontWorkspace::new(matrix.dimension);
+                let mut child_scratch = FrontFactorScratch {
+                    output: &mut child_output,
+                    workspace: &mut child_workspace,
+                };
+                let child_result = factor_front_recursive(
+                    child,
+                    tree,
+                    matrix,
+                    &mut child_scratch,
+                    options,
+                    progress,
+                    profile_enabled,
+                )?;
+                Ok((child_output, child_result))
+            })
+            .collect::<Vec<_>>();
+        let child_result_merge_started = profile_enabled.then(Instant::now);
+        for result in raw {
+            let (child_output, child) = result?;
+            if profile_enabled {
+                profile.front_child_result_count += 1;
+                profile.front_child_contribution_entries += child.contribution.dense.len();
+                profile.front_child_factor_columns += child_output.factor_order.len();
+                profile.front_child_solve_panels += child_output.solve_panels.len();
+            }
+            scratch.output.append(child_output);
+            child_contributions.push(child.contribution);
+            aggregate_panel_stats(&mut stats, child.stats);
+            profile.accumulate(&child.profile);
+            max_front_size = max_front_size.max(child.max_front_size);
+            contribution_storage_bytes += child.contribution_storage_bytes;
+        }
+        if let Some(started) = child_result_merge_started {
+            profile.front_child_result_merge_time += started.elapsed();
+        }
+    } else {
+        for &child_id in &front.children {
+            let factor_column_start = scratch.output.factor_order.len();
+            let solve_panel_start = scratch.output.solve_panels.len();
+            let child = factor_front_recursive(
+                child_id,
+                tree,
+                matrix,
+                scratch,
+                options,
+                progress,
+                profile_enabled,
+            )?;
+            let child_result_merge_started = profile_enabled.then(Instant::now);
+            if profile_enabled {
+                profile.front_child_result_count += 1;
+                profile.front_child_contribution_entries += child.contribution.dense.len();
+                profile.front_child_factor_columns +=
+                    scratch.output.factor_order.len() - factor_column_start;
+                profile.front_child_solve_panels +=
+                    scratch.output.solve_panels.len() - solve_panel_start;
+            }
+            child_contributions.push(child.contribution);
+            aggregate_panel_stats(&mut stats, child.stats);
+            profile.accumulate(&child.profile);
+            max_front_size = max_front_size.max(child.max_front_size);
+            contribution_storage_bytes += child.contribution_storage_bytes;
+            if let Some(started) = child_result_merge_started {
+                profile.front_child_result_merge_time += started.elapsed();
+            }
+        }
     }
 
     let assembly_started = profile_enabled.then(Instant::now);
@@ -6522,11 +8498,16 @@ fn factor_front_recursive(
             .windows(2)
             .all(|window| window[1] == window[0] + 1);
     let (local_rows, local_dense) = if contiguous_leaf_front {
+        let row_setup_started = profile_enabled.then(Instant::now);
         let local_rows = front.columns.clone();
         let local_size = local_rows.len();
         let mut local_dense = vec![0.0; local_size * local_size];
         let first_row = local_rows.first().copied().unwrap_or(0);
         let row_limit = first_row + local_size;
+        if let Some(started) = row_setup_started {
+            profile.front_row_setup_time += started.elapsed();
+        }
+        let matrix_entry_started = profile_enabled.then(Instant::now);
         for &column in &front.columns {
             let local_column = column - first_row;
             for entry in matrix.col_ptrs[column]..matrix.col_ptrs[column + 1] {
@@ -6540,35 +8521,51 @@ fn factor_front_recursive(
                 }
             }
         }
+        if let Some(started) = matrix_entry_started {
+            profile.front_matrix_entry_assembly_time += started.elapsed();
+        }
+        #[cfg(debug_assertions)]
+        {
+            let (reference_rows, reference_dense) =
+                assemble_leaf_front_generic_for_debug(front, matrix);
+            debug_assert_eq!(
+                local_rows, reference_rows,
+                "contiguous leaf-front row shortcut diverged from generic assembly row order"
+            );
+            debug_assert_eq!(
+                local_dense, reference_dense,
+                "contiguous leaf-front row shortcut diverged from generic assembly values"
+            );
+        }
         (local_rows, local_dense)
     } else {
-        let mut row_state = vec![0_u8; matrix.dimension];
+        let row_setup_started = profile_enabled.then(Instant::now);
         let mut candidate_rows = Vec::with_capacity(front.columns.len());
         for &row in &front.columns {
-            if row_state[row] == 0 {
-                row_state[row] = 1;
+            if scratch.workspace.row_state(row) == 0 {
+                scratch.workspace.set_row_state(row, 1);
                 candidate_rows.push(row);
             }
         }
         for contribution in &child_contributions {
             for &row in contribution.row_ids.iter().take(contribution.delayed_count) {
-                if row_state[row] == 0 {
-                    row_state[row] = 1;
+                if scratch.workspace.row_state(row) == 0 {
+                    scratch.workspace.set_row_state(row, 1);
                     candidate_rows.push(row);
                 }
             }
         }
         let mut interface_rows = Vec::with_capacity(front.interface_rows.len());
         for &row in &front.interface_rows {
-            if row_state[row] == 0 {
-                row_state[row] = 2;
+            if scratch.workspace.row_state(row) == 0 {
+                scratch.workspace.set_row_state(row, 2);
                 interface_rows.push(row);
             }
         }
         for contribution in &child_contributions {
             for &row in &contribution.row_ids {
-                if row_state[row] == 0 {
-                    row_state[row] = 2;
+                if scratch.workspace.row_state(row) == 0 {
+                    scratch.workspace.set_row_state(row, 2);
                     interface_rows.push(row);
                 }
             }
@@ -6578,15 +8575,19 @@ fn factor_front_recursive(
         local_rows.extend(interface_rows);
         let local_size = local_rows.len();
         let mut local_dense = vec![0.0; local_size * local_size];
-        let mut local_positions = vec![usize::MAX; matrix.dimension];
         for (position, &row) in local_rows.iter().enumerate() {
-            local_positions[row] = position;
+            scratch.workspace.set_local_position(row, position);
         }
+        scratch.workspace.reset_row_state();
+        if let Some(started) = row_setup_started {
+            profile.front_row_setup_time += started.elapsed();
+        }
+        let matrix_entry_started = profile_enabled.then(Instant::now);
         for &column in &front.columns {
-            let local_column = local_positions[column];
+            let local_column = scratch.workspace.local_position(column);
             for entry in matrix.col_ptrs[column]..matrix.col_ptrs[column + 1] {
                 let row = matrix.row_indices[entry];
-                let local_row = local_positions[row];
+                let local_row = scratch.workspace.local_position(row);
                 if local_row == usize::MAX {
                     continue;
                 }
@@ -6598,18 +8599,26 @@ fn factor_front_recursive(
                 local_dense[offset] = value;
             }
         }
+        if let Some(started) = matrix_entry_started {
+            profile.front_matrix_entry_assembly_time += started.elapsed();
+        }
+        let contribution_started = profile_enabled.then(Instant::now);
         for contribution in &child_contributions {
             let size = contribution.row_ids.len();
             for row in 0..size {
-                let local_row = local_positions[contribution.row_ids[row]];
+                let local_row = scratch.workspace.local_position(contribution.row_ids[row]);
                 for col in 0..=row {
-                    let local_col = local_positions[contribution.row_ids[col]];
+                    let local_col = scratch.workspace.local_position(contribution.row_ids[col]);
                     let value = contribution.dense[packed_lower_offset(size, row, col)];
                     let offset = dense_lower_offset(local_size, local_row, local_col);
                     local_dense[offset] += value;
                 }
             }
         }
+        if let Some(started) = contribution_started {
+            profile.front_contribution_assembly_time += started.elapsed();
+        }
+        scratch.workspace.reset_local_positions();
         (local_rows, local_dense)
     };
     let local_size = local_rows.len();
@@ -6618,6 +8627,17 @@ fn factor_front_recursive(
         profile.front_assembly_time += started.elapsed();
         profile.front_count += 1;
         profile.local_dense_entries += local_size * local_size;
+        profile.local_dense_bytes_zeroed += local_size * local_size * std::mem::size_of::<f64>();
+        if tree.spral_small_leaf_fronts[front_id] {
+            profile.spral_small_leaf_fronts += 1;
+            profile.spral_small_leaf_columns += front.width();
+            profile.spral_small_leaf_dense_entries += local_size * local_size;
+            if !matches!(options.pivot_method, PivotMethod::ThresholdPartial)
+                && front.width().min(local_size) >= APP_INNER_BLOCK_SIZE
+            {
+                profile.spral_small_leaf_app_fronts += 1;
+            }
+        }
     }
 
     let factor_started = profile_enabled.then(Instant::now);
@@ -6645,18 +8665,22 @@ fn factor_front_recursive(
             progress.completed_roots.fetch_add(1, Ordering::Relaxed);
         }
     }
-    factor_order.extend(local.factor_order);
-    factor_columns.extend(local.factor_columns);
-    block_records.extend(local.block_records);
-    solve_panels.extend(local.solve_panels);
+    let local_result_merge_started = profile_enabled.then(Instant::now);
+    if profile_enabled {
+        profile.front_local_factor_columns += local.factor_order.len();
+        profile.front_local_solve_panels += local.solve_panels.len();
+    }
+    scratch.output.factor_order.extend(local.factor_order);
+    scratch.output.factor_columns.extend(local.factor_columns);
+    scratch.output.block_records.extend(local.block_records);
+    scratch.output.solve_panels.extend(local.solve_panels);
     aggregate_panel_stats(&mut stats, local.stats);
     contribution_storage_bytes += local.contribution.dense.len() * std::mem::size_of::<f64>();
+    if let Some(started) = local_result_merge_started {
+        profile.front_local_result_merge_time += started.elapsed();
+    }
 
     Ok(FrontFactorizationResult {
-        factor_order,
-        factor_columns,
-        block_records,
-        solve_panels,
         contribution: local.contribution,
         stats,
         profile,
@@ -6676,6 +8700,9 @@ fn multifrontal_factorize_with_tree(
 ) -> Result<MultifrontalFactorizationOutcome, SsidsError> {
     let dimension = matrix.dimension();
     let mut profile = FactorProfile::default();
+    if profile_enabled {
+        profile.spral_small_leaf_subtrees += tree.spral_small_leaf_subtrees.len();
+    }
     if buffers.permuted_matrix_source_positions.len() != matrix.row_indices().len()
         || buffers.permuted_matrix_col_ptrs.len() != dimension + 1
     {
@@ -6737,64 +8764,80 @@ fn multifrontal_factorize_with_tree(
         root_delayed_stage: AtomicUsize::new(RootDelayedBlockStage::Idle as usize),
     });
     let _progress_guard = install_factorization_progress(Arc::clone(&progress));
-    let root_results = if tree.roots.len() >= 2 && dimension >= 64 {
-        let started = profile_enabled.then(Instant::now);
-        let raw = tree
-            .roots
-            .par_iter()
-            .map(|&root| {
-                factor_front_recursive(
+    let mut factor_output = FactorOutput::with_capacity(dimension);
+    let mut factor_workspace = FrontWorkspace::new(dimension);
+    let root_results =
+        if rayon::current_num_threads() > 1 && tree.roots.len() >= 2 && dimension >= 64 {
+            let started = profile_enabled.then(Instant::now);
+            let raw = tree
+                .roots
+                .par_iter()
+                .map(|&root| -> Result<_, SsidsError> {
+                    let mut root_output = FactorOutput::default();
+                    let mut root_workspace = FrontWorkspace::new(dimension);
+                    let mut root_scratch = FrontFactorScratch {
+                        output: &mut root_output,
+                        workspace: &mut root_workspace,
+                    };
+                    let root_result = factor_front_recursive(
+                        root,
+                        tree,
+                        &permuted_matrix,
+                        &mut root_scratch,
+                        options,
+                        Some(&progress),
+                        profile_enabled,
+                    )?;
+                    Ok((root_output, root_result))
+                })
+                .collect::<Vec<_>>();
+            if let Some(started) = started {
+                profile.front_factorization_time += started.elapsed();
+            }
+            let mut collected = Vec::with_capacity(raw.len());
+            for result in raw {
+                let (root_output, root_result) = result?;
+                factor_output.append(root_output);
+                collected.push(root_result);
+            }
+            collected
+        } else {
+            let started = profile_enabled.then(Instant::now);
+            let mut collected = Vec::with_capacity(tree.roots.len());
+            let mut factor_scratch = FrontFactorScratch {
+                output: &mut factor_output,
+                workspace: &mut factor_workspace,
+            };
+            for &root in &tree.roots {
+                collected.push(factor_front_recursive(
                     root,
                     tree,
                     &permuted_matrix,
+                    &mut factor_scratch,
                     options,
                     Some(&progress),
                     profile_enabled,
-                )
-            })
-            .collect::<Vec<_>>();
-        if let Some(started) = started {
-            profile.front_factorization_time += started.elapsed();
-        }
-        let mut collected = Vec::with_capacity(raw.len());
-        for result in raw {
-            collected.push(result?);
-        }
-        collected
-    } else {
-        let started = profile_enabled.then(Instant::now);
-        let mut collected = Vec::with_capacity(tree.roots.len());
-        for &root in &tree.roots {
-            collected.push(factor_front_recursive(
-                root,
-                tree,
-                &permuted_matrix,
-                options,
-                Some(&progress),
-                profile_enabled,
-            )?);
-        }
-        if let Some(started) = started {
-            profile.front_factorization_time += started.elapsed();
-        }
-        collected
-    };
+                )?);
+            }
+            if let Some(started) = started {
+                profile.front_factorization_time += started.elapsed();
+            }
+            collected
+        };
 
-    let mut factor_order = Vec::with_capacity(dimension);
-    let mut factor_columns = Vec::with_capacity(dimension);
-    let mut block_records = Vec::with_capacity(dimension);
-    let mut solve_panel_records = Vec::new();
     let mut stats = PanelFactorStats::default();
     let mut pending_root_contributions = Vec::new();
     for result in root_results {
-        factor_order.extend(result.factor_order);
-        factor_columns.extend(result.factor_columns);
-        block_records.extend(result.block_records);
-        solve_panel_records.extend(result.solve_panels);
         pending_root_contributions.push(result.contribution);
         aggregate_panel_stats(&mut stats, result.stats);
         profile.accumulate(&result.profile);
     }
+    let FactorOutput {
+        mut factor_order,
+        mut block_records,
+        solve_panels: mut solve_panel_records,
+        ..
+    } = factor_output;
 
     let delayed_block_total = pending_root_contributions
         .iter()
@@ -6830,7 +8873,6 @@ fn multifrontal_factorize_with_tree(
         }
         let fully_eliminated = size - delayed_local.contribution.row_ids.len();
         factor_order.extend(delayed_local.factor_order);
-        factor_columns.extend(delayed_local.factor_columns);
         block_records.extend(delayed_local.block_records);
         solve_panel_records.extend(delayed_local.solve_panels);
         aggregate_panel_stats(&mut stats, delayed_local.stats);
@@ -6849,16 +8891,6 @@ fn multifrontal_factorize_with_tree(
             ),
         });
     }
-    if factor_columns.len() != dimension {
-        return Err(SsidsError::NumericalBreakdown {
-            pivot: factor_columns.len(),
-            detail: format!(
-                "multifrontal factorization emitted {} factor columns for a {dimension}x{dimension} matrix",
-                factor_columns.len()
-            ),
-        });
-    }
-
     let started = profile_enabled.then(Instant::now);
     buffers.factor_order.clear();
     buffers.factor_order.extend(factor_order);
@@ -6872,55 +8904,10 @@ fn multifrontal_factorize_with_tree(
         profile.factor_inverse_time += started.elapsed();
     }
     let started = profile_enabled.then(Instant::now);
-    let lower_entry_count = factor_columns
-        .iter()
-        .map(|column| column.entries.len())
-        .sum::<usize>();
     buffers.lower_col_ptrs.clear();
-    buffers.lower_col_ptrs.reserve(dimension + 1);
-    buffers.lower_col_ptrs.push(0);
     buffers.lower_row_indices.clear();
-    buffers.lower_row_indices.reserve(lower_entry_count);
     buffers.lower_values.clear();
-    buffers.lower_values.reserve(lower_entry_count);
-    let row_position_ptr = buffers.lower_row_indices.as_mut_ptr();
-    let value_ptr = buffers.lower_values.as_mut_ptr();
-    let mut lower_entry_cursor = 0;
-    for (column_position, column) in factor_columns.iter().enumerate() {
-        if column.global_column != buffers.factor_order[column_position] {
-            return Err(SsidsError::NumericalBreakdown {
-                pivot: column_position,
-                detail: "factor column order drifted away from factor elimination order".into(),
-            });
-        }
-        for &(row, value) in &column.entries {
-            let row_position = buffers.factor_inverse[row];
-            if row_position == usize::MAX || row_position <= column_position {
-                return Err(SsidsError::NumericalBreakdown {
-                    pivot: column_position,
-                    detail: "factor column referenced an invalid trailing row".into(),
-                });
-            }
-            debug_assert!(lower_entry_cursor < lower_entry_count);
-            // SAFETY: `reserve(lower_entry_count)` above gives both output
-            // vectors enough capacity for every validated factor entry. The
-            // cursor is advanced exactly once per entry, and lengths are
-            // exposed only after all writes complete.
-            unsafe {
-                row_position_ptr.add(lower_entry_cursor).write(row_position);
-                value_ptr.add(lower_entry_cursor).write(value);
-            }
-            lower_entry_cursor += 1;
-        }
-        buffers.lower_col_ptrs.push(lower_entry_cursor);
-    }
-    debug_assert_eq!(lower_entry_cursor, lower_entry_count);
-    // SAFETY: the loop above initialized exactly `lower_entry_cursor` entries
-    // in both vectors.
-    unsafe {
-        buffers.lower_row_indices.set_len(lower_entry_cursor);
-        buffers.lower_values.set_len(lower_entry_cursor);
-    }
+    let lower_entry_count = solve_panel_records_lower_entry_count(&solve_panel_records);
     if let Some(started) = started {
         profile.lower_storage_time += started.elapsed();
     }
@@ -6971,7 +8958,7 @@ fn multifrontal_factorize_with_tree(
             .map(|block| block.size)
             .sum::<usize>();
     let factor_bytes = std::mem::size_of::<f64>()
-        * (buffers.lower_values.len()
+        * (lower_entry_count
             + buffers.diagonal_values.len()
             + buffers
                 .solve_panels
@@ -6981,8 +8968,9 @@ fn multifrontal_factorize_with_tree(
         + std::mem::size_of::<usize>()
             * (buffers.factor_order.len()
                 + buffers.factor_inverse.len()
-                + buffers.lower_col_ptrs.len()
-                + buffers.lower_row_indices.len()
+                + dimension
+                + 1
+                + lower_entry_count
                 + buffers
                     .solve_panels
                     .iter()
@@ -7514,7 +9502,7 @@ fn inertia_from_blocks(
     debug_assert_eq!(diagonal_values.len(), diagonal_blocks.len() * 4);
     for (block, values) in diagonal_blocks.iter().zip(diagonal_values.chunks_exact(4)) {
         if block.size == 1 {
-            let value = one_by_one_inverse_diagonal(&values[..2]).unwrap_or(0.0);
+            let value = values[0];
             if value > zero_tol {
                 inertia.positive += 1;
             } else if value < -zero_tol {
@@ -7550,16 +9538,16 @@ mod tests {
     use std::sync::OnceLock;
 
     use libloading::Library;
-    #[cfg(unix)]
-    use libloading::os::unix::{Library as UnixLibrary, RTLD_GLOBAL, RTLD_NOW};
     use metis_ordering::{CsrGraph, Permutation};
     use proptest::prelude::*;
     use proptest::test_runner::{Config, RngAlgorithm, RngSeed, TestRng, TestRunner};
 
     use super::{
         APP_INNER_BLOCK_SIZE, AppRestoreRange, DenseTppTailRequest, DenseUpdateBounds,
-        DiagonalBlock, FactorBlockRecord, NativeOrdering, NativeSpral, NumericFactorOptions,
-        OrderingStrategy, PanelFactorStats, PivotMethod, SolvePanel, SsidsError, SsidsOptions,
+        DiagonalBlock, FactorBlockRecord, FactorOutput, FrontFactorScratch, FrontWorkspace,
+        NativeOrdering, NativeSpral, NumericFactorOptions, OrderingStrategy, PanelFactorStats,
+        PermutedLowerMatrix, PivotMethod, SmallLeafAssemblyScratch, SolvePanel, SpralPartRange,
+        SpralSmallLeafNumericNode, SsidsError, SsidsOptions, SymbolicFront, SymbolicFrontTree,
         SymmetricCscMatrix, analyse, app_adjust_passed_prefix, app_apply_accepted_prefix_update,
         app_apply_block_pivots_to_trailing_rows, app_backup_trailing_lower,
         app_build_factor_columns_for_prefix, app_build_ld_tile_workspace, app_build_ld_workspace,
@@ -7567,12 +9555,16 @@ mod tests {
         app_restore_trailing_from_block_backup, app_solve_block_triangular_to_trailing_rows,
         app_target_block_uses_gemv_forward, app_truncate_records_to_prefix, app_two_by_two_inverse,
         app_update_one_by_one, app_update_two_by_two, apply_permuted_symmetric_scaling,
+        apply_spral_part_contribution_input_flags, assemble_spral_small_leaf_node_post,
         build_dense_front_solve_panel_record, build_factor_solve_panel_record,
         build_native_row_list_supernodes, build_native_row_list_supernodes_fast,
-        build_permuted_lower_csc_pattern, build_symbolic_front_tree, dense_find_maxloc,
-        dense_lower_offset, dense_symmetric_swap_with_workspace, expand_symmetric_pattern,
-        factor_one_by_one_common, factor_two_by_two_common, factorize, factorize_dense_front,
-        factorize_dense_tpp_tail_in_place, fill_permuted_lower_csc_values,
+        build_native_row_list_supernodes_guarded, build_permuted_lower_csc_pattern,
+        build_spral_small_leaf_symbolic_plan, build_symbolic_front_tree,
+        classify_spral_small_leaf_fronts, dense_find_maxloc, dense_lower_offset,
+        dense_symmetric_swap_with_workspace, expand_symmetric_pattern, factor_front_recursive,
+        factor_one_by_one_common, factor_spral_small_leaf_node, factor_two_by_two_common,
+        factorize, factorize_dense_front, factorize_dense_tpp_tail_in_place,
+        factorize_spral_small_leaf_aligned_tpp_in_place, fill_permuted_lower_csc_values,
         fill_scaled_permuted_lower_csc_values, native_column_counts, native_postorder_permutation,
         native_supernode_layout, openblas_gemv_n_update_like_native,
         openblas_gemv_t_dot_like_contiguous, openblas_trsv_lower_unit_op_n_like_native,
@@ -7580,7 +9572,12 @@ mod tests {
         permute_graph_with_sorted_edges, reset_ldwork_column_tail,
         solve_diagonal_and_lower_transpose_front_panels_like_native,
         solve_forward_front_panels_like_native, solve_two_by_two_block_in_place,
-        symbolic_factor_pattern, zero_dense_column_until,
+        spral_align_lda_f64, spral_root_part_ranges, spral_small_leaf_column_small,
+        spral_small_leaf_d_offset, spral_small_leaf_factor_one_by_one,
+        spral_small_leaf_factor_two_by_two, spral_small_leaf_find_rc_abs_max_exclude,
+        spral_small_leaf_find_row_abs_max, spral_small_leaf_lcol_len, spral_small_leaf_swap_cols,
+        spral_small_leaf_zero_col, symbolic_factor_pattern, tpp_test_two_by_two,
+        try_factor_spral_small_leaf_subtree_serial, zero_dense_column_until,
     };
 
     #[derive(Clone, Debug)]
@@ -7633,6 +9630,720 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn small_leaf_classifier_honors_native_contribution_input_guard() {
+        let mut fronts = vec![
+            SymbolicFront {
+                columns: vec![0],
+                interface_rows: vec![1],
+                parent: Some(1),
+                children: Vec::new(),
+                has_contribution_inputs: false,
+            },
+            SymbolicFront {
+                columns: vec![1],
+                interface_rows: vec![2],
+                parent: Some(2),
+                children: vec![0],
+                has_contribution_inputs: false,
+            },
+            SymbolicFront {
+                columns: vec![2],
+                interface_rows: Vec::new(),
+                parent: None,
+                children: vec![1],
+                has_contribution_inputs: false,
+            },
+        ];
+
+        let without_guard = classify_spral_small_leaf_fronts(&fronts);
+        assert_eq!(
+            without_guard.subtrees,
+            vec![super::SpralSmallLeafSubtree {
+                start_front: 0,
+                end_front: 2,
+                parent_front: None
+            }]
+        );
+        assert_eq!(without_guard.fronts, vec![true, true, true]);
+
+        fronts[1].has_contribution_inputs = true;
+        let with_guard = classify_spral_small_leaf_fronts(&fronts);
+        assert!(
+            with_guard.subtrees.is_empty(),
+            "SPRAL forces contribution-input nodes above the small-subtree threshold"
+        );
+        assert_eq!(with_guard.fronts, vec![false, false, false]);
+    }
+
+    #[test]
+    fn small_leaf_classifier_records_native_parent_boundary() {
+        let fronts = vec![
+            SymbolicFront {
+                columns: vec![0],
+                interface_rows: vec![1],
+                parent: Some(1),
+                children: Vec::new(),
+                has_contribution_inputs: false,
+            },
+            SymbolicFront {
+                columns: vec![1],
+                interface_rows: vec![2],
+                parent: Some(2),
+                children: vec![0],
+                has_contribution_inputs: false,
+            },
+            SymbolicFront {
+                columns: vec![2],
+                interface_rows: vec![3],
+                parent: Some(3),
+                children: vec![1],
+                has_contribution_inputs: true,
+            },
+            SymbolicFront {
+                columns: vec![3],
+                interface_rows: Vec::new(),
+                parent: None,
+                children: vec![2],
+                has_contribution_inputs: false,
+            },
+        ];
+
+        let classification = classify_spral_small_leaf_fronts(&fronts);
+        assert_eq!(
+            classification.subtrees,
+            vec![super::SpralSmallLeafSubtree {
+                start_front: 0,
+                end_front: 1,
+                parent_front: Some(2)
+            }]
+        );
+        assert_eq!(classification.fronts, vec![true, true, false, false]);
+    }
+
+    #[test]
+    fn part_contribution_flags_mark_native_contrib_destinations() {
+        let mut fronts = vec![
+            SymbolicFront {
+                columns: vec![0],
+                interface_rows: vec![1],
+                parent: Some(1),
+                children: Vec::new(),
+                has_contribution_inputs: false,
+            },
+            SymbolicFront {
+                columns: vec![1],
+                interface_rows: vec![2],
+                parent: Some(2),
+                children: vec![0],
+                has_contribution_inputs: false,
+            },
+            SymbolicFront {
+                columns: vec![2],
+                interface_rows: vec![3],
+                parent: Some(3),
+                children: vec![1],
+                has_contribution_inputs: false,
+            },
+            SymbolicFront {
+                columns: vec![3],
+                interface_rows: Vec::new(),
+                parent: None,
+                children: vec![2],
+                has_contribution_inputs: false,
+            },
+        ];
+        let parts = [
+            SpralPartRange {
+                start_front: 0,
+                end_front: 2,
+            },
+            SpralPartRange {
+                start_front: 2,
+                end_front: 4,
+            },
+        ];
+
+        apply_spral_part_contribution_input_flags(&mut fronts, &parts);
+        assert_eq!(
+            fronts
+                .iter()
+                .map(|front| front.has_contribution_inputs)
+                .collect::<Vec<_>>(),
+            vec![false, false, true, false]
+        );
+
+        let classification = classify_spral_small_leaf_fronts(&fronts);
+        assert_eq!(
+            classification.subtrees,
+            vec![super::SpralSmallLeafSubtree {
+                start_front: 0,
+                end_front: 1,
+                parent_front: Some(2)
+            }]
+        );
+    }
+
+    #[test]
+    fn root_part_ranges_do_not_mark_contribution_inputs() {
+        let mut fronts = vec![
+            SymbolicFront {
+                columns: vec![0],
+                interface_rows: vec![1],
+                parent: Some(1),
+                children: Vec::new(),
+                has_contribution_inputs: false,
+            },
+            SymbolicFront {
+                columns: vec![1],
+                interface_rows: vec![2],
+                parent: Some(2),
+                children: vec![0],
+                has_contribution_inputs: false,
+            },
+            SymbolicFront {
+                columns: vec![2],
+                interface_rows: Vec::new(),
+                parent: None,
+                children: vec![1],
+                has_contribution_inputs: false,
+            },
+        ];
+
+        let parts = spral_root_part_ranges(&fronts);
+        assert_eq!(
+            parts,
+            vec![SpralPartRange {
+                start_front: 0,
+                end_front: 3
+            }]
+        );
+        apply_spral_part_contribution_input_flags(&mut fronts, &parts);
+        assert!(fronts.iter().all(|front| !front.has_contribution_inputs));
+    }
+
+    #[test]
+    fn small_leaf_symbolic_plan_records_parent_offsets_and_lcol_layout() {
+        let fronts = vec![
+            SymbolicFront {
+                columns: vec![0],
+                interface_rows: vec![1],
+                parent: Some(1),
+                children: Vec::new(),
+                has_contribution_inputs: false,
+            },
+            SymbolicFront {
+                columns: vec![1],
+                interface_rows: vec![2],
+                parent: Some(2),
+                children: vec![0],
+                has_contribution_inputs: false,
+            },
+            SymbolicFront {
+                columns: vec![2],
+                interface_rows: vec![3],
+                parent: Some(3),
+                children: vec![1],
+                has_contribution_inputs: true,
+            },
+            SymbolicFront {
+                columns: vec![3],
+                interface_rows: Vec::new(),
+                parent: None,
+                children: vec![2],
+                has_contribution_inputs: false,
+            },
+        ];
+        let subtree = super::SpralSmallLeafSubtree {
+            start_front: 0,
+            end_front: 1,
+            parent_front: Some(2),
+        };
+
+        let plan = build_spral_small_leaf_symbolic_plan(&fronts, subtree);
+        assert_eq!(plan.subtree, subtree);
+        assert_eq!(plan.factor_entry_count, 4);
+        assert_eq!(plan.nodes.len(), 2);
+        assert_eq!(plan.nodes[0].front_id, 0);
+        assert_eq!(plan.nodes[0].nrow, 2);
+        assert_eq!(plan.nodes[0].ncol, 1);
+        assert_eq!(plan.nodes[0].parent_in_subtree, Some(1));
+        assert_eq!(plan.nodes[0].parent_row_offsets, vec![0]);
+        assert_eq!(plan.nodes[0].lcol_offset, 0);
+        assert_eq!(plan.nodes[1].front_id, 1);
+        assert_eq!(plan.nodes[1].nrow, 2);
+        assert_eq!(plan.nodes[1].ncol, 1);
+        assert_eq!(plan.nodes[1].parent_in_subtree, None);
+        assert_eq!(plan.nodes[1].parent_row_offsets, vec![0]);
+        assert_eq!(plan.nodes[1].lcol_offset, 2);
+    }
+
+    #[test]
+    fn planned_small_leaf_dispatch_has_no_generic_dense_escape_hatch() {
+        let fronts = vec![
+            SymbolicFront {
+                columns: vec![0],
+                interface_rows: vec![1, 2],
+                parent: Some(1),
+                children: Vec::new(),
+                has_contribution_inputs: false,
+            },
+            SymbolicFront {
+                columns: vec![1],
+                interface_rows: vec![2],
+                parent: None,
+                children: vec![0],
+                has_contribution_inputs: false,
+            },
+        ];
+        let subtree = super::SpralSmallLeafSubtree {
+            start_front: 0,
+            end_front: 1,
+            parent_front: None,
+        };
+        let plan = build_spral_small_leaf_symbolic_plan(&fronts, subtree);
+        let small_tree = SymbolicFrontTree {
+            fronts,
+            roots: vec![1],
+            spral_small_leaf_fronts: vec![true, true],
+            spral_small_leaf_subtrees: vec![plan],
+            spral_small_leaf_subtree_by_end: vec![None, Some(0)],
+        };
+        let col_ptrs = vec![0, 3, 5, 6];
+        let row_indices = vec![0, 1, 2, 1, 2, 2];
+        let values = vec![4.0, 0.5, 0.25, 5.0, 0.75, 6.0];
+        let matrix = PermutedLowerMatrix {
+            dimension: 3,
+            col_ptrs: &col_ptrs,
+            row_indices: &row_indices,
+            values: &values,
+        };
+        let mut output = FactorOutput::default();
+        let mut workspace = FrontWorkspace::new(matrix.dimension);
+        let mut scratch = FrontFactorScratch {
+            output: &mut output,
+            workspace: &mut workspace,
+        };
+
+        let result = factor_front_recursive(
+            1,
+            &small_tree,
+            &matrix,
+            &mut scratch,
+            NumericFactorOptions {
+                pivot_method: PivotMethod::ThresholdPartial,
+                ..NumericFactorOptions::default()
+            },
+            None,
+            true,
+        )
+        .expect("planned small-leaf dispatch factorization");
+
+        assert_eq!(
+            result.profile.spral_small_leaf_fronts, 2,
+            "planned small-leaf fronts should execute through the source-shaped subtree path"
+        );
+        assert_eq!(
+            result.profile.front_local_solve_panels, 0,
+            "planned small-leaf execution must not use generic dense front solve-panel merging"
+        );
+        assert_eq!(output.factor_order, vec![0, 1]);
+        assert_eq!(output.solve_panels.len(), 2);
+    }
+
+    #[test]
+    fn small_leaf_numeric_path_applies_child_contribution_before_parent_pivot() {
+        let fronts = vec![
+            SymbolicFront {
+                columns: vec![0],
+                interface_rows: vec![1, 2],
+                parent: Some(1),
+                children: Vec::new(),
+                has_contribution_inputs: false,
+            },
+            SymbolicFront {
+                columns: vec![1],
+                interface_rows: vec![2],
+                parent: None,
+                children: vec![0],
+                has_contribution_inputs: false,
+            },
+        ];
+        let subtree = super::SpralSmallLeafSubtree {
+            start_front: 0,
+            end_front: 1,
+            parent_front: None,
+        };
+        let plan = build_spral_small_leaf_symbolic_plan(&fronts, subtree);
+        let small_tree = SymbolicFrontTree {
+            fronts,
+            roots: vec![1],
+            spral_small_leaf_fronts: vec![true, true],
+            spral_small_leaf_subtrees: vec![plan.clone()],
+            spral_small_leaf_subtree_by_end: vec![None, Some(0)],
+        };
+        let col_ptrs = vec![0, 3, 5, 6];
+        let row_indices = vec![0, 1, 2, 1, 2, 2];
+        let values = vec![4.0, 0.5, 0.25, 5.0, 0.75, 6.0];
+        let matrix = PermutedLowerMatrix {
+            dimension: 3,
+            col_ptrs: &col_ptrs,
+            row_indices: &row_indices,
+            values: &values,
+        };
+        let options = NumericFactorOptions {
+            pivot_method: PivotMethod::ThresholdPartial,
+            ..NumericFactorOptions::default()
+        };
+
+        let (small_output, small_result) = try_factor_spral_small_leaf_subtree_serial(
+            &small_tree.spral_small_leaf_subtrees[0],
+            &small_tree,
+            &matrix,
+            options,
+            false,
+        )
+        .expect("small-leaf factorization should succeed");
+
+        let child_l10 = 0.5 / 4.0;
+        let child_l20 = 0.25 / 4.0;
+        let child_contrib00 = -(child_l10 * 0.5);
+        let child_contrib10 = -(child_l20 * 0.5);
+        let child_contrib11 = -(child_l20 * 0.25);
+        let parent_diag = 5.0 + child_contrib00;
+        let parent_subdiag = 0.75 + child_contrib10;
+
+        assert_eq!(small_output.factor_order, vec![0, 1]);
+        assert_eq!(small_output.block_records[0].values[0], 0.25);
+        assert_eq!(small_output.block_records[1].values[0], 1.0 / parent_diag);
+        assert_eq!(small_output.solve_panels.len(), 2);
+        assert_eq!(
+            small_output.solve_panels[0].values,
+            vec![1.0, 0.125, 0.0625]
+        );
+        assert_eq!(
+            small_output.solve_panels[1].values,
+            vec![1.0, parent_subdiag / parent_diag]
+        );
+        assert_eq!(small_result.contribution.row_ids, vec![2]);
+        assert_eq!(
+            small_result.contribution.dense,
+            vec![-(parent_subdiag / parent_diag) * parent_subdiag + child_contrib11]
+        );
+        assert_eq!(small_result.stats, PanelFactorStats::default());
+        assert_eq!(small_result.max_front_size, 3);
+    }
+
+    #[test]
+    fn small_leaf_post_assembly_frees_child_contribution_like_native() {
+        let child = SpralSmallLeafNumericNode {
+            front_id: 0,
+            rows: vec![0, 1, 2],
+            base_ncol: 1,
+            nrow: 3,
+            ncol: 1,
+            ldl: spral_align_lda_f64(3),
+            lcol: vec![0.0; spral_small_leaf_lcol_len(spral_align_lda_f64(3), 1)],
+            perm: vec![0],
+            contrib: Some(vec![10.0, 20.0, 30.0, 40.0]),
+            ndelay_in: 0,
+            ndelay_out: 0,
+            nelim: 1,
+        };
+        let parent = SpralSmallLeafNumericNode {
+            front_id: 1,
+            rows: vec![1, 2],
+            base_ncol: 1,
+            nrow: 2,
+            ncol: 1,
+            ldl: spral_align_lda_f64(2),
+            lcol: vec![0.0; spral_small_leaf_lcol_len(spral_align_lda_f64(2), 1)],
+            perm: vec![1],
+            contrib: Some(vec![0.0]),
+            ndelay_in: 0,
+            ndelay_out: 0,
+            nelim: 1,
+        };
+        let children_by_node = vec![Vec::new(), vec![0]];
+        let mut nodes = vec![Some(child), Some(parent)];
+        let mut scratch = SmallLeafAssemblyScratch::new(3);
+
+        assemble_spral_small_leaf_node_post(1, &children_by_node, &mut nodes, &mut scratch)
+            .expect("post assembly should succeed");
+
+        assert!(
+            nodes[0].as_ref().unwrap().contrib.is_none(),
+            "SPRAL frees child contribution blocks after assemble_post consumes them"
+        );
+        assert_eq!(
+            nodes[1].as_ref().unwrap().contrib.as_deref(),
+            Some(&[40.0][..])
+        );
+
+        let child = SpralSmallLeafNumericNode {
+            front_id: 0,
+            rows: vec![0, 1],
+            base_ncol: 1,
+            nrow: 2,
+            ncol: 1,
+            ldl: spral_align_lda_f64(2),
+            lcol: vec![0.0; spral_small_leaf_lcol_len(spral_align_lda_f64(2), 1)],
+            perm: vec![0],
+            contrib: Some(vec![7.0]),
+            ndelay_in: 0,
+            ndelay_out: 0,
+            nelim: 1,
+        };
+        let parent = SpralSmallLeafNumericNode {
+            front_id: 1,
+            rows: vec![1],
+            base_ncol: 1,
+            nrow: 1,
+            ncol: 1,
+            ldl: spral_align_lda_f64(1),
+            lcol: vec![0.0; spral_small_leaf_lcol_len(spral_align_lda_f64(1), 1)],
+            perm: vec![1],
+            contrib: None,
+            ndelay_in: 0,
+            ndelay_out: 0,
+            nelim: 1,
+        };
+        let mut nodes = vec![Some(child), Some(parent)];
+        let mut scratch = SmallLeafAssemblyScratch::new(2);
+
+        assemble_spral_small_leaf_node_post(1, &children_by_node, &mut nodes, &mut scratch)
+            .expect("post assembly without generated rows should succeed");
+
+        assert!(
+            nodes[0].as_ref().unwrap().contrib.is_none(),
+            "SPRAL frees child contribution blocks even when no generated rows receive them"
+        );
+    }
+
+    #[test]
+    fn small_leaf_numeric_path_imports_child_delays_before_parent_pivot() {
+        let fronts = vec![
+            SymbolicFront {
+                columns: vec![0],
+                interface_rows: vec![1, 2],
+                parent: Some(1),
+                children: Vec::new(),
+                has_contribution_inputs: false,
+            },
+            SymbolicFront {
+                columns: vec![1],
+                interface_rows: vec![2],
+                parent: None,
+                children: vec![0],
+                has_contribution_inputs: false,
+            },
+        ];
+        let subtree = super::SpralSmallLeafSubtree {
+            start_front: 0,
+            end_front: 1,
+            parent_front: None,
+        };
+        let plan = build_spral_small_leaf_symbolic_plan(&fronts, subtree);
+        let small_tree = SymbolicFrontTree {
+            fronts,
+            roots: vec![1],
+            spral_small_leaf_fronts: vec![true, true],
+            spral_small_leaf_subtrees: vec![plan],
+            spral_small_leaf_subtree_by_end: vec![None, Some(0)],
+        };
+        let col_ptrs = vec![0, 3, 5, 6];
+        let row_indices = vec![0, 1, 2, 1, 2, 2];
+        let values = vec![0.0, 1.0, 0.25, 5.0, 0.75, 6.0];
+        let matrix = PermutedLowerMatrix {
+            dimension: 3,
+            col_ptrs: &col_ptrs,
+            row_indices: &row_indices,
+            values: &values,
+        };
+        let options = NumericFactorOptions {
+            pivot_method: PivotMethod::ThresholdPartial,
+            ..NumericFactorOptions::default()
+        };
+
+        let (small_output, small_result) = try_factor_spral_small_leaf_subtree_serial(
+            &small_tree.spral_small_leaf_subtrees[0],
+            &small_tree,
+            &matrix,
+            options,
+            false,
+        )
+        .expect("small-leaf factorization should succeed");
+
+        assert_eq!(small_output.factor_order, vec![1, 0]);
+        assert_eq!(small_output.block_records.len(), 1);
+        assert_eq!(small_output.block_records[0].size, 2);
+        assert_eq!(
+            small_output.block_records[0].values,
+            [-0.0, 1.0, f64::INFINITY, -5.0]
+        );
+        assert_eq!(small_output.solve_panels.len(), 1);
+        assert_eq!(small_output.solve_panels[0].row_ids, vec![1, 0, 2]);
+        assert_eq!(small_output.solve_panels[0].eliminated_len, 2);
+        assert_eq!(
+            small_output.solve_panels[0].values,
+            vec![1.0, 0.0, 0.25, 0.0, 1.0, -0.5]
+        );
+        assert_eq!(small_result.contribution.row_ids, vec![2]);
+        assert_eq!(small_result.contribution.delayed_count, 0);
+        assert_eq!(small_result.contribution.dense, vec![-0.0625]);
+        assert_eq!(small_result.stats.delayed_pivots, 1);
+        assert_eq!(small_result.max_front_size, 3);
+    }
+
+    #[test]
+    fn small_leaf_no_elimination_leaf_frees_generated_contribution_like_native() {
+        let nrow = 2;
+        let ncol = 1;
+        let ldl = spral_align_lda_f64(nrow);
+        let mut node = SpralSmallLeafNumericNode {
+            front_id: 0,
+            rows: vec![0, 1],
+            base_ncol: ncol,
+            nrow,
+            ncol,
+            ldl,
+            lcol: vec![0.0; spral_small_leaf_lcol_len(ldl, ncol)],
+            perm: vec![0],
+            contrib: Some(vec![0.0]),
+            ndelay_in: 0,
+            ndelay_out: 0,
+            nelim: 0,
+        };
+        node.lcol[0] = 1.0;
+        node.lcol[1] = 3.0;
+        let options = NumericFactorOptions {
+            pivot_method: PivotMethod::ThresholdPartial,
+            threshold_pivot_u: 0.5,
+            ..NumericFactorOptions::default()
+        };
+        let mut work = Vec::new();
+
+        let (node, factorization) =
+            factor_spral_small_leaf_node(node, options, false, &mut work, false)
+                .expect("small-leaf factorization should succeed");
+
+        assert_eq!(node.nelim, 0);
+        assert_eq!(node.ndelay_out, 1);
+        assert!(
+            node.contrib.is_none(),
+            "SPRAL frees no-elimination leaf contribution buffers with no first_child"
+        );
+        assert!(factorization.factor_order.is_empty());
+        assert!(factorization.solve_panels.is_empty());
+        assert_eq!(factorization.contribution.row_ids, vec![0, 1]);
+        assert_eq!(factorization.contribution.delayed_count, 1);
+        assert_eq!(factorization.contribution.dense, vec![1.0, 3.0, 0.0]);
+        assert_eq!(factorization.stats.delayed_pivots, 1);
+    }
+
+    #[test]
+    fn small_leaf_planned_layout_mismatch_fails_closed_instead_of_falling_back() {
+        let nrow = 2;
+        let ncol = 1;
+        let expected_ldl = spral_align_lda_f64(nrow);
+        let node = SpralSmallLeafNumericNode {
+            front_id: 7,
+            rows: vec![0, 1],
+            base_ncol: ncol,
+            nrow,
+            ncol,
+            ldl: expected_ldl + 1,
+            lcol: vec![0.0; spral_small_leaf_lcol_len(expected_ldl, ncol)],
+            perm: vec![0],
+            contrib: Some(vec![0.0]),
+            ndelay_in: 0,
+            ndelay_out: 0,
+            nelim: 0,
+        };
+        let mut work = Vec::new();
+
+        let error = match factor_spral_small_leaf_node(
+            node,
+            NumericFactorOptions::default(),
+            false,
+            &mut work,
+            false,
+        ) {
+            Ok(_) => panic!("planned small-leaf layout mismatch must fail closed"),
+            Err(error) => error,
+        };
+
+        match error {
+            SsidsError::NumericalBreakdown { pivot, detail } => {
+                assert_eq!(pivot, 0);
+                assert!(
+                    detail.contains("planned small-leaf node 7"),
+                    "unexpected detail: {detail}"
+                );
+                assert!(
+                    detail.contains("expected ldl"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn small_leaf_numeric_path_uses_source_tpp_under_default_options() {
+        let dimension = APP_INNER_BLOCK_SIZE + 1;
+        let fronts = vec![SymbolicFront {
+            columns: (0..dimension).collect(),
+            interface_rows: Vec::new(),
+            parent: None,
+            children: Vec::new(),
+            has_contribution_inputs: false,
+        }];
+        let subtree = super::SpralSmallLeafSubtree {
+            start_front: 0,
+            end_front: 0,
+            parent_front: None,
+        };
+        let plan = build_spral_small_leaf_symbolic_plan(&fronts, subtree);
+        let tree = SymbolicFrontTree {
+            fronts,
+            roots: vec![0],
+            spral_small_leaf_fronts: vec![true],
+            spral_small_leaf_subtrees: vec![plan],
+            spral_small_leaf_subtree_by_end: vec![Some(0)],
+        };
+        let col_ptrs = (0..=dimension).collect::<Vec<_>>();
+        let row_indices = (0..dimension).collect::<Vec<_>>();
+        let values = (0..dimension)
+            .map(|index| 2.0 + index as f64)
+            .collect::<Vec<_>>();
+        let matrix = PermutedLowerMatrix {
+            dimension,
+            col_ptrs: &col_ptrs,
+            row_indices: &row_indices,
+            values: &values,
+        };
+
+        let (small_output, small_result) = try_factor_spral_small_leaf_subtree_serial(
+            &tree.spral_small_leaf_subtrees[0],
+            &tree,
+            &matrix,
+            NumericFactorOptions::default(),
+            true,
+        )
+        .expect("small-leaf factorization should succeed");
+
+        assert_eq!(
+            small_output.factor_order,
+            (0..dimension).collect::<Vec<_>>()
+        );
+        assert_eq!(small_output.solve_panels.len(), 1);
+        assert!(small_result.contribution.row_ids.is_empty());
+        assert_eq!(small_result.profile.tpp_front_count, 1);
+        assert_eq!(small_result.profile.tpp_pivots, dimension);
+        assert_eq!(small_result.profile.app_front_count, 0);
     }
 
     type ApplyPivotOpNFn =
@@ -7744,9 +10455,28 @@ mod tests {
         *mut f64,
         c_int,
     ) -> c_int;
+    type LdltTppTraceFn = unsafe extern "C" fn(
+        c_int,
+        c_int,
+        *mut c_int,
+        *mut f64,
+        c_int,
+        *mut f64,
+        *mut f64,
+        c_int,
+        c_int,
+        f64,
+        f64,
+        c_int,
+        *mut c_int,
+        *mut c_int,
+        *mut c_int,
+        *mut c_int,
+        *mut f64,
+        *mut f64,
+    ) -> c_int;
 
     struct NativeKernelShim {
-        _libspral: Library,
         _library: Library,
         apply_pivot_op_n: ApplyPivotOpNFn,
         check_threshold_op_n: CheckThresholdOpNFn,
@@ -7775,6 +10505,7 @@ mod tests {
         block_prefix_trace_32_source: BlockPrefixTrace32Fn,
         block_ldlt_32: BlockLdlt32Fn,
         ldlt_tpp_factor: LdltTppFactorFn,
+        ldlt_tpp_trace: LdltTppTraceFn,
     }
 
     static NATIVE_KERNEL_SHIM: OnceLock<Result<NativeKernelShim, String>> = OnceLock::new();
@@ -7807,36 +10538,225 @@ mod tests {
         }
     }
 
-    fn build_native_kernel_shim() -> Result<NativeKernelShim, String> {
-        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .ok_or_else(|| "ssids_rs manifest has no parent".to_string())?
-            .to_path_buf();
-        let ssids_source = std::env::var_os("SPRAL_UPSTREAM_SSIDS_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| repo_root.join("target/native/spral-upstream/src/ssids"));
-        if !ssids_source.is_dir() {
+    fn discover_spral_upstream_ssids_source(repo_root: &Path) -> Result<PathBuf, String> {
+        if let Some(source) = std::env::var_os("SPRAL_UPSTREAM_SSIDS_DIR").map(PathBuf::from) {
+            if source.is_dir() {
+                return Ok(source);
+            }
             return Err(format!(
-                "SPRAL source anchor missing: {}",
-                ssids_source.display()
+                "SPRAL_UPSTREAM_SSIDS_DIR does not exist: {}",
+                source.display()
             ));
         }
-        let upstream_src = ssids_source
-            .parent()
-            .ok_or_else(|| format!("invalid SPRAL source anchor: {}", ssids_source.display()))?;
 
-        let libspral = std::env::var_os("SPRAL_SSIDS_NATIVE_LIB")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/Users/greg/local/ipopt-spral/lib/libspral.dylib"));
+        let native_anchor = repo_root.join("target/native/spral-upstream/src/ssids");
+        if native_anchor.is_dir() {
+            return Ok(native_anchor);
+        }
+
+        for profile in ["release", "debug"] {
+            let build_dir = repo_root.join("target").join(profile).join("build");
+            let Ok(entries) = fs::read_dir(&build_dir) else {
+                continue;
+            };
+            let mut candidates = Vec::new();
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if !name.starts_with("spral-src-") {
+                    continue;
+                }
+                let source = path.join("out/sources/spral-2025.09.18/src/ssids");
+                if source.is_dir() {
+                    candidates.push(source);
+                }
+            }
+            candidates.sort();
+            if let Some(source) = candidates.pop() {
+                return Ok(source);
+            }
+        }
+
+        Err(format!(
+            "SPRAL source anchor missing: {}",
+            native_anchor.display()
+        ))
+    }
+
+    #[derive(Debug)]
+    struct SourceBuiltSpralKernelLink {
+        spral_lflags: Vec<OsString>,
+        runtime_link_dirs: Vec<PathBuf>,
+    }
+
+    fn source_built_spral_kernel_link(
+        repo_root: &Path,
+    ) -> Result<SourceBuiltSpralKernelLink, String> {
+        let expected_threading = if cfg!(feature = "native-spral-src-pthreads") {
+            Some("pthreads")
+        } else if cfg!(feature = "native-spral-src-openmp") {
+            Some("openmp")
+        } else if cfg!(feature = "native-spral-src") {
+            Some("serial")
+        } else {
+            None
+        };
+
+        let mut candidates = Vec::new();
+        for profile in ["debug", "release"] {
+            let build_dir = repo_root.join("target").join(profile).join("build");
+            let Ok(entries) = fs::read_dir(&build_dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if !name.starts_with("spral-src-") {
+                    continue;
+                }
+                let output_path = path.join("output");
+                if !output_path.exists() {
+                    continue;
+                }
+                let output = fs::read_to_string(&output_path).map_err(|error| {
+                    format!("failed to read {}: {error}", output_path.display())
+                })?;
+                if let Some(expected) = expected_threading {
+                    let Some(threading) = cargo_metadata_line(&output, "OPENBLAS_THREADING") else {
+                        continue;
+                    };
+                    if threading != expected {
+                        continue;
+                    }
+                }
+                let Some(spral_lflags) = cargo_metadata_line(&output, "SPRAL_LFLAGS") else {
+                    continue;
+                };
+                let runtime_link_dirs = cargo_metadata_line(&output, "RUNTIME_LINK_DIRS")
+                    .map(|value| {
+                        value
+                            .split(';')
+                            .filter(|entry| !entry.is_empty())
+                            .map(PathBuf::from)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let modified = fs::metadata(&output_path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok();
+                let spral_lflags = spral_lflags
+                    .split_whitespace()
+                    .map(OsString::from)
+                    .collect::<Vec<_>>();
+                candidates.push((
+                    modified,
+                    SourceBuiltSpralKernelLink {
+                        spral_lflags,
+                        runtime_link_dirs,
+                    },
+                ));
+            }
+        }
+
+        candidates.sort_by_key(|(modified, _)| *modified);
+        candidates
+            .pop()
+            .map(|(_, metadata)| metadata)
+            .ok_or_else(|| {
+                format!(
+                    "could not find source-built spral-src link metadata under {}/target/*/build; \
+                     set SPRAL_SSIDS_NATIVE_LIB explicitly for dynamic diagnostics",
+                    repo_root.display()
+                )
+            })
+    }
+
+    fn cargo_metadata_line(output: &str, key: &str) -> Option<String> {
+        let cargo_prefix = format!("cargo:{key}=");
+        let metadata_prefix = format!("cargo::metadata={key}=");
+        output.lines().find_map(|line| {
+            line.strip_prefix(&cargo_prefix)
+                .or_else(|| line.strip_prefix(&metadata_prefix))
+                .map(str::to_string)
+        })
+    }
+
+    fn explicit_native_spral_kernel_link() -> Result<Option<SourceBuiltSpralKernelLink>, String> {
+        let Some(libspral) = std::env::var_os("SPRAL_SSIDS_NATIVE_LIB").map(PathBuf::from) else {
+            return Ok(None);
+        };
         if !libspral.is_file() {
             return Err(format!(
-                "native SPRAL library missing: {}",
+                "explicit SPRAL_SSIDS_NATIVE_LIB does not exist: {}",
                 libspral.display()
             ));
         }
         let libspral_dir = libspral
             .parent()
-            .ok_or_else(|| format!("invalid native SPRAL library path: {}", libspral.display()))?;
+            .ok_or_else(|| {
+                format!(
+                    "invalid SPRAL_SSIDS_NATIVE_LIB path: {}",
+                    libspral.display()
+                )
+            })?
+            .to_path_buf();
+        Ok(Some(SourceBuiltSpralKernelLink {
+            spral_lflags: vec![
+                OsString::from("-L"),
+                libspral_dir.clone().into_os_string(),
+                OsString::from("-lspral"),
+            ],
+            runtime_link_dirs: vec![libspral_dir],
+        }))
+    }
+
+    fn link_dirs_from_lflags(args: &[OsString]) -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            let arg_string = arg.to_string_lossy();
+            if arg_string == "-L" {
+                if let Some(dir) = iter.next() {
+                    dirs.push(PathBuf::from(dir.as_os_str()));
+                }
+            } else if let Some(dir) = arg_string.strip_prefix("-L")
+                && !dir.is_empty()
+            {
+                dirs.push(PathBuf::from(dir));
+            }
+        }
+        dirs
+    }
+
+    fn add_unique_rpath_dirs(command: &mut Command, link: &SourceBuiltSpralKernelLink) {
+        let mut dirs = link.runtime_link_dirs.clone();
+        dirs.extend(link_dirs_from_lflags(&link.spral_lflags));
+        dirs.sort();
+        dirs.dedup();
+        for dir in dirs {
+            if dir.is_dir() {
+                command.arg(format!("-Wl,-rpath,{}", dir.display()));
+            }
+        }
+    }
+
+    fn build_native_kernel_shim() -> Result<NativeKernelShim, String> {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .ok_or_else(|| "ssids_rs manifest has no parent".to_string())?
+            .to_path_buf();
+        let ssids_source = discover_spral_upstream_ssids_source(&repo_root)?;
+        let upstream_src = ssids_source
+            .parent()
+            .ok_or_else(|| format!("invalid SPRAL source anchor: {}", ssids_source.display()))?;
+        let spral_link = match explicit_native_spral_kernel_link()? {
+            Some(link) => link,
+            None => source_built_spral_kernel_link(&repo_root)?,
+        };
 
         let out_dir = repo_root.join("target/spral-kernel-parity-shim");
         fs::create_dir_all(&out_dir)
@@ -7850,22 +10770,31 @@ mod tests {
             )
         })?;
 
-        let cxx = std::env::var_os("CXX").unwrap_or_else(|| OsString::from("c++"));
+        let cxx = std::env::var_os("CXX").unwrap_or_else(|| {
+            let spral_src_cxx = Path::new("/opt/homebrew/bin/g++-15");
+            if spral_src_cxx.is_file() {
+                spral_src_cxx.as_os_str().to_os_string()
+            } else {
+                OsString::from("c++")
+            }
+        });
         let mut command = Command::new(&cxx);
         command
-            .arg("-std=c++17")
-            .arg("-ffp-contract=off")
+            .arg("-std=c++11")
+            .arg("-O3")
+            .arg("-D_GLIBCXX_ASSERTIONS=1")
+            .arg("-fopenmp")
             .arg(dynamic_library_flag())
             .arg("-fPIC")
             .arg("-I")
             .arg(upstream_src)
-            .arg(&source_path)
-            .arg("-L")
-            .arg(libspral_dir)
-            .arg("-lspral")
-            .arg(format!("-Wl,-rpath,{}", libspral_dir.display()))
-            .arg("-o")
-            .arg(&library_path);
+            .arg(upstream_src.join("ssids/cpu/kernels/ldlt_app.cxx"))
+            .arg(&source_path);
+        for arg in &spral_link.spral_lflags {
+            command.arg(arg);
+        }
+        add_unique_rpath_dirs(&mut command, &spral_link);
+        command.arg("-o").arg(&library_path);
         let output = command.output().map_err(|error| {
             format!(
                 "failed to run C++ compiler `{}`: {error}",
@@ -7881,7 +10810,6 @@ mod tests {
             ));
         }
 
-        let libspral_library = load_library_global(&libspral, "native SPRAL library")?;
         let library = unsafe {
             Library::new(&library_path).map_err(|error| {
                 format!(
@@ -8045,9 +10973,13 @@ mod tests {
                 .get::<LdltTppFactorFn>(b"spral_kernel_ldlt_tpp_factor\0")
                 .map_err(|error| format!("failed to load ldlt_tpp_factor shim: {error}"))?
         };
+        let ldlt_tpp_trace = unsafe {
+            *library
+                .get::<LdltTppTraceFn>(b"spral_kernel_ldlt_tpp_trace\0")
+                .map_err(|error| format!("failed to load ldlt_tpp_trace shim: {error}"))?
+        };
 
         Ok(NativeKernelShim {
-            _libspral: libspral_library,
             _library: library,
             apply_pivot_op_n,
             check_threshold_op_n,
@@ -8076,29 +11008,8 @@ mod tests {
             block_prefix_trace_32_source,
             block_ldlt_32,
             ldlt_tpp_factor,
+            ldlt_tpp_trace,
         })
-    }
-
-    #[cfg(unix)]
-    fn load_library_global(path: &Path, label: &str) -> Result<Library, String> {
-        let library = unsafe {
-            UnixLibrary::open(Some(path.as_os_str()), RTLD_NOW | RTLD_GLOBAL).map_err(|error| {
-                format!(
-                    "failed to load {label} {} with global symbols: {error}",
-                    path.display()
-                )
-            })?
-        };
-        Ok(Library::from(library))
-    }
-
-    #[cfg(not(unix))]
-    fn load_library_global(path: &Path, label: &str) -> Result<Library, String> {
-        let library = unsafe {
-            Library::new(path)
-                .map_err(|error| format!("failed to load {label} {}: {error}", path.display()))?
-        };
-        Ok(library)
     }
 
     #[cfg(target_os = "macos")]
@@ -8125,6 +11036,7 @@ mod tests {
         r#"
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -8303,6 +11215,241 @@ extern "C" int spral_kernel_ldlt_tpp_factor(
    return spral::ssids::cpu::ldlt_tpp_factor(
          m, n, perm, a, lda, d, ld, ldld, action != 0, u, small,
          nleft, aleft, ldleft);
+}
+
+static bool spral_kernel_tpp_check_col_small(
+      int idx, int from, int to, double const* a, int lda, double small) {
+   bool check = true;
+   for(int c=from; c<idx; ++c)
+      check = check && (fabs(a[c*lda+idx]) < small);
+   for(int r=idx; r<to; ++r)
+      check = check && (fabs(a[idx*lda+r]) < small);
+   return check;
+}
+
+static int spral_kernel_tpp_find_row_abs_max(
+      int from, int to, double const* a, int lda) {
+   if(from>=to) return -1;
+   int best_idx=from; double best_val=fabs(a[from*lda]);
+   for(int idx=from+1; idx<to; ++idx)
+      if(fabs(a[idx*lda]) > best_val) {
+         best_idx = idx;
+         best_val = fabs(a[idx*lda]);
+      }
+   return best_idx;
+}
+
+static void spral_kernel_tpp_swap_cols(
+      int col1, int col2, int m, int n, int* perm, double* a, int lda,
+      int nleft, double* aleft, int ldleft) {
+   if(col1 == col2) return;
+   if(col2<col1)
+      std::swap(col1, col2);
+
+   std::swap(perm[col1], perm[col2]);
+
+   for(int c=0; c<nleft; ++c)
+      std::swap(aleft[c*ldleft+col1], aleft[c*ldleft+col2]);
+   for(int c=0; c<col1; ++c)
+      std::swap(a[c*lda+col1], a[c*lda+col2]);
+   for(int i=col1+1; i<col2; ++i)
+      std::swap(a[col1*lda+i], a[i*lda+col2]);
+   for(int r=col2+1; r<m; ++r)
+      std::swap(a[col1*lda+r], a[col2*lda+r]);
+   std::swap(a[col1*lda+col1], a[col2*lda+col2]);
+}
+
+static double spral_kernel_tpp_find_rc_abs_max_exclude(
+      int col, int nelim, int m, double const* a, int lda, int exclude) {
+   double best = 0.0;
+   for(int c=nelim; c<col; ++c) {
+      if(c==exclude) continue;
+      best = std::max(best, fabs(a[c*lda+col]));
+   }
+   for(int r=col+1; r<m; ++r) {
+      if(r==exclude) continue;
+      best = std::max(best, fabs(a[col*lda+r]));
+   }
+   return best;
+}
+
+static bool spral_kernel_tpp_test_2x2(
+      int t, int p, double maxt, double maxp, double const* a, int lda,
+      double u, double small, double* d) {
+   double a11 = a[t*lda+t];
+   double a21 = a[t*lda+p];
+   double a22 = a[p*lda+p];
+   double maxpiv = std::max(fabs(a11), std::max(fabs(a21), fabs(a22)));
+   if(maxpiv < small) return false;
+
+   double detscale = 1/maxpiv;
+   double detpiv0 = (a11*detscale)*a22;
+   double detpiv1 = (a21*detscale)*a21;
+   double detpiv = detpiv0 - detpiv1;
+   if(fabs(detpiv) < std::max(small, std::max(fabs(detpiv0/2), fabs(detpiv1/2))))
+      return false;
+
+   d[0] = (a22*detscale)/detpiv;
+   d[1] = (-a21*detscale)/detpiv;
+   d[2] = std::numeric_limits<double>::infinity();
+   d[3] = (a11*detscale)/detpiv;
+   if(std::max(maxp, maxt) < small) return true;
+   double x1 = fabs(d[0])*maxt + fabs(d[1])*maxp;
+   double x2 = fabs(d[1])*maxt + fabs(d[3])*maxp;
+   return (u*std::max(x1, x2) < 1.0);
+}
+
+static void spral_kernel_tpp_apply_2x2(
+      int nelim, int m, double* a, int lda, double* ld, int ldld, double* d) {
+   double* a1 = &a[nelim*lda];
+   double* a2 = &a[(nelim+1)*lda];
+   a1[nelim] = 1.0;
+   a1[nelim+1] = 0.0;
+   a2[nelim+1] = 1.0;
+   double d11 = d[2*nelim];
+   double d21 = d[2*nelim+1];
+   double d22 = d[2*nelim+3];
+   for(int r=nelim+2; r<m; ++r) {
+      ld[r] = a1[r]; ld[ldld+r] = a2[r];
+      a1[r] = d11*ld[r] + d21*ld[ldld+r];
+      a2[r] = d21*ld[r] + d22*ld[ldld+r];
+   }
+}
+
+static void spral_kernel_tpp_apply_1x1(
+      int nelim, int m, double* a, int lda, double* ld, int ldld, double* d) {
+   double* a1 = &a[nelim*lda];
+   a1[nelim] = 1.0;
+   double d11 = d[2*nelim];
+   for(int r=nelim+1; r<m; ++r) {
+      ld[r] = a1[r];
+      a1[r] *= d11;
+   }
+}
+
+static void spral_kernel_tpp_zero_col(int col, int m, double* a, int lda) {
+   for(int r=col; r<m; ++r)
+      a[col*lda+r] = 0.0;
+}
+
+static void spral_kernel_tpp_record_trace(
+      int step, int from, int status, int next, int m, int n, int lda,
+      const int* perm, const double* a, const double* d,
+      int* trace_from, int* trace_status, int* trace_next, int* trace_perm,
+      double* trace_matrix, double* trace_d) {
+   trace_from[step] = from;
+   trace_status[step] = status;
+   trace_next[step] = next;
+   for(int i=0; i<n; ++i)
+      trace_perm[step*n+i] = perm[i];
+   for(int col=0; col<n; ++col)
+   for(int row=0; row<lda; ++row)
+      trace_matrix[step*n*lda + col*lda + row] = (row < m) ? a[col*lda+row] : 0.0;
+   for(int i=0; i<2*n; ++i)
+      trace_d[step*2*n+i] = d[i];
+}
+
+extern "C" int spral_kernel_ldlt_tpp_trace(
+      int m, int n, int* perm, double* a, int lda, double* d,
+      double* ld, int ldld, int action, double u, double small, int max_steps,
+      int* trace_from, int* trace_status, int* trace_next, int* trace_perm,
+      double* trace_matrix, double* trace_d) {
+   int nelim = 0;
+   int trace_len = 0;
+   while(nelim<n) {
+      int step_from = nelim;
+      if(spral_kernel_tpp_check_col_small(nelim, nelim, m, a, lda, small)) {
+         if(!action) return -1;
+         spral_kernel_tpp_swap_cols(nelim, nelim, m, n, perm, a, lda, 0, nullptr, 0);
+         spral_kernel_tpp_zero_col(nelim, m, a, lda);
+         d[2*nelim] = 0.0;
+         d[2*nelim+1] = 0.0;
+         nelim++;
+         if(trace_len < max_steps)
+            spral_kernel_tpp_record_trace(trace_len++, step_from, 1, nelim, m, n, lda,
+                  perm, a, d, trace_from, trace_status, trace_next, trace_perm,
+                  trace_matrix, trace_d);
+         continue;
+      }
+      int p;
+      for(p=nelim+1; p<n; ++p) {
+         if(spral_kernel_tpp_check_col_small(p, nelim, m, a, lda, small)) {
+            if(!action) return -1;
+            spral_kernel_tpp_swap_cols(p, nelim, m, n, perm, a, lda, 0, nullptr, 0);
+            spral_kernel_tpp_zero_col(nelim, m, a, lda);
+            d[2*nelim] = 0.0;
+            d[2*nelim+1] = 0.0;
+            nelim++;
+            if(trace_len < max_steps)
+               spral_kernel_tpp_record_trace(trace_len++, step_from, 1, nelim, m, n, lda,
+                     perm, a, d, trace_from, trace_status, trace_next, trace_perm,
+                     trace_matrix, trace_d);
+            break;
+         }
+
+         int t = spral_kernel_tpp_find_row_abs_max(nelim, p, &a[p], lda);
+         double maxt = spral_kernel_tpp_find_rc_abs_max_exclude(t, nelim, m, a, lda, p);
+         double maxp = spral_kernel_tpp_find_rc_abs_max_exclude(p, nelim, m, a, lda, t);
+         if(spral_kernel_tpp_test_2x2(t, p, maxt, maxp, a, lda, u, small, &d[2*nelim])) {
+            spral_kernel_tpp_swap_cols(t, nelim, m, n, perm, a, lda, 0, nullptr, 0);
+            spral_kernel_tpp_swap_cols(p, nelim+1, m, n, perm, a, lda, 0, nullptr, 0);
+            spral_kernel_tpp_apply_2x2(nelim, m, a, lda, ld, ldld, d);
+            spral::ssids::cpu::host_gemm<double>(
+                  spral::ssids::cpu::OP_N, spral::ssids::cpu::OP_T,
+                  m-nelim-2, n-nelim-2, 2, -1.0,
+                  &a[nelim*lda+nelim+2], lda, &ld[nelim+2], ldld,
+                  1.0, &a[(nelim+2)*lda+nelim+2], lda);
+            nelim += 2;
+            if(trace_len < max_steps)
+               spral_kernel_tpp_record_trace(trace_len++, step_from, 2, nelim, m, n, lda,
+                     perm, a, d, trace_from, trace_status, trace_next, trace_perm,
+                     trace_matrix, trace_d);
+            break;
+         }
+
+         maxp = std::max(maxp, fabs(a[t*lda+p]));
+         if(fabs(a[p*lda+p]) >= u*maxp) {
+            spral_kernel_tpp_swap_cols(p, nelim, m, n, perm, a, lda, 0, nullptr, 0);
+            d[2*nelim] = 1 / a[nelim*lda+nelim];
+            d[2*nelim+1] = 0.0;
+            spral_kernel_tpp_apply_1x1(nelim, m, a, lda, ld, ldld, d);
+            spral::ssids::cpu::host_gemm<double>(
+                  spral::ssids::cpu::OP_N, spral::ssids::cpu::OP_T,
+                  m-nelim-1, n-nelim-1, 1, -1.0,
+                  &a[nelim*lda+nelim+1], lda, &ld[nelim+1], ldld,
+                  1.0, &a[(nelim+1)*lda+nelim+1], lda);
+            nelim += 1;
+            if(trace_len < max_steps)
+               spral_kernel_tpp_record_trace(trace_len++, step_from, 1, nelim, m, n, lda,
+                     perm, a, d, trace_from, trace_status, trace_next, trace_perm,
+                     trace_matrix, trace_d);
+            break;
+         }
+      }
+      if(p>=n) {
+         p = nelim;
+         double maxp = spral_kernel_tpp_find_rc_abs_max_exclude(p, nelim, m, a, lda, -1);
+         if(fabs(a[p*lda+p]) >= u*maxp) {
+            spral_kernel_tpp_swap_cols(p, nelim, m, n, perm, a, lda, 0, nullptr, 0);
+            d[2*nelim] = 1 / a[nelim*lda+nelim];
+            d[2*nelim+1] = 0.0;
+            spral_kernel_tpp_apply_1x1(nelim, m, a, lda, ld, ldld, d);
+            spral::ssids::cpu::host_gemm<double>(
+                  spral::ssids::cpu::OP_N, spral::ssids::cpu::OP_T,
+                  m-nelim-1, n-nelim-1, 1, -1.0,
+                  &a[nelim*lda+nelim+1], lda, &ld[nelim+1], ldld,
+                  1.0, &a[(nelim+1)*lda+nelim+1], lda);
+            nelim += 1;
+            if(trace_len < max_steps)
+               spral_kernel_tpp_record_trace(trace_len++, step_from, 1, nelim, m, n, lda,
+                     perm, a, d, trace_from, trace_status, trace_next, trace_perm,
+                     trace_matrix, trace_d);
+         } else {
+            break;
+         }
+      }
+   }
+   return trace_len;
 }
 
 extern "C" void spral_kernel_block_update_1x1_32(
@@ -8720,6 +11867,26 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         eliminated: usize,
         perm: Vec<usize>,
         matrix: Vec<f64>,
+        diagonal: Vec<f64>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct SmallLeafTppKernelResult {
+        eliminated: usize,
+        perm: Vec<usize>,
+        lcol: Vec<f64>,
+        ldl: usize,
+        diagonal: Vec<f64>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct SmallLeafTppTraceStep {
+        from: usize,
+        status: usize,
+        next: usize,
+        perm: Vec<usize>,
+        lcol: Vec<f64>,
+        ldl: usize,
         diagonal: Vec<f64>,
     }
 
@@ -9465,6 +12632,58 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             );
         }
         (bestv, rloc as usize, cloc as usize)
+    }
+
+    fn dense_find_maxloc_reference_non_avx(
+        matrix: &[f64],
+        size: usize,
+        from: usize,
+        to: usize,
+    ) -> Option<(f64, usize, usize)> {
+        if from >= to {
+            return None;
+        }
+        let block_start = to - APP_INNER_BLOCK_SIZE;
+        let local_from = from - block_start;
+        let mut primary = (-1.0_f64, to, to);
+        let mut secondary = (-1.0_f64, to, to);
+
+        for local_col in local_from..APP_INNER_BLOCK_SIZE {
+            let col = block_start + local_col;
+            let column_offset = col * size;
+            let diag_value = matrix[column_offset + col].abs();
+            if diag_value > primary.0 {
+                primary = (diag_value, col, col);
+            }
+            if local_col + 1 < 2 * (local_col / 2 + 1) {
+                let row = col + 1;
+                let value = matrix[column_offset + row].abs();
+                if value > primary.0 {
+                    primary = (value, row, col);
+                }
+            }
+            let mut local_row = 2 * (local_col / 2 + 1);
+            while local_row < APP_INNER_BLOCK_SIZE {
+                let row = block_start + local_row;
+                let value = matrix[column_offset + row].abs();
+                if value > primary.0 {
+                    primary = (value, row, col);
+                }
+                let next_row = row + 1;
+                let next_value = matrix[column_offset + next_row].abs();
+                if next_value > secondary.0 {
+                    secondary = (next_value, next_row, col);
+                }
+                local_row += 2;
+            }
+        }
+
+        let best = if secondary.0 > primary.0 {
+            secondary
+        } else {
+            primary
+        };
+        (best.2 < to).then_some(best)
     }
 
     fn native_block_two_by_two_multipliers(
@@ -10392,23 +13611,16 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         let rows = (0..size).collect::<Vec<_>>();
         let factorization = factorize_dense_front(rows, size, dense.to_vec(), options, false)
             .expect("rust block factorization");
-        let mut factor_inverse = vec![usize::MAX; size];
-        for (position, &row) in factorization.factor_order.iter().enumerate() {
-            factor_inverse[row] = position;
-        }
         let mut matrix = vec![0.0; size * APP_INNER_BLOCK_SIZE];
-        for (local_col, column) in factorization
-            .factor_columns
-            .iter()
-            .take(APP_INNER_BLOCK_SIZE)
-            .enumerate()
-        {
-            matrix[local_col * size + local_col] = 1.0;
-            for &(row, value) in &column.entries {
-                let local_row = factor_inverse[row];
-                if local_row < APP_INNER_BLOCK_SIZE {
-                    matrix[local_col * size + local_row] = value;
-                }
+        let panel = factorization
+            .solve_panels
+            .first()
+            .expect("dense front factorization should emit a solve panel");
+        assert!(panel.eliminated_len >= APP_INNER_BLOCK_SIZE);
+        for local_col in 0..APP_INNER_BLOCK_SIZE {
+            let source_offset = local_col * panel.row_ids.len();
+            for local_row in local_col..APP_INNER_BLOCK_SIZE {
+                matrix[local_col * size + local_row] = panel.values[source_offset + local_row];
             }
         }
         let mut diagonal = vec![0.0; 2 * APP_INNER_BLOCK_SIZE];
@@ -10477,6 +13689,438 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             perm: perm.into_iter().map(|entry| entry as usize).collect(),
             matrix,
             diagonal,
+        }
+    }
+
+    fn copy_lower_dense_to_small_leaf_lcol(
+        dense: &[f64],
+        size: usize,
+        ncol: usize,
+    ) -> (Vec<f64>, usize) {
+        let ldl = spral_align_lda_f64(size);
+        let mut lcol = vec![0.0; spral_small_leaf_lcol_len(ldl, ncol)];
+        for col in 0..ncol {
+            for row in col..size {
+                lcol[col * ldl + row] = dense[col * size + row];
+            }
+        }
+        (lcol, ldl)
+    }
+
+    fn native_small_leaf_ldlt_tpp_factor_from_lower_dense(
+        shim: &NativeKernelShim,
+        dense: &[f64],
+        size: usize,
+        ncol: usize,
+        options: NumericFactorOptions,
+    ) -> SmallLeafTppKernelResult {
+        debug_assert_eq!(dense.len(), size * size);
+        debug_assert!(ncol <= size);
+        let (mut lcol, ldl) = copy_lower_dense_to_small_leaf_lcol(dense, size, ncol);
+        let mut perm = (0..ncol as c_int).collect::<Vec<_>>();
+        let mut diagonal = vec![0.0; 2 * ncol.max(1)];
+        let mut ld = vec![0.0; 2 * size.max(1)];
+        let eliminated = unsafe {
+            (shim.ldlt_tpp_factor)(
+                size as c_int,
+                ncol as c_int,
+                perm.as_mut_ptr(),
+                lcol.as_mut_ptr(),
+                ldl as c_int,
+                diagonal.as_mut_ptr(),
+                ld.as_mut_ptr(),
+                size as c_int,
+                i32::from(options.action_on_zero_pivot),
+                options.threshold_pivot_u,
+                options.small_pivot_tolerance,
+                0,
+                ptr::null_mut(),
+                0,
+            )
+        };
+        assert!(
+            eliminated >= 0,
+            "native small-leaf ldlt_tpp_factor returned {eliminated}"
+        );
+        SmallLeafTppKernelResult {
+            eliminated: eliminated as usize,
+            perm: perm.into_iter().map(|entry| entry as usize).collect(),
+            lcol,
+            ldl,
+            diagonal,
+        }
+    }
+
+    fn native_small_leaf_ldlt_tpp_trace_from_lower_dense(
+        shim: &NativeKernelShim,
+        dense: &[f64],
+        size: usize,
+        ncol: usize,
+        options: NumericFactorOptions,
+    ) -> Vec<SmallLeafTppTraceStep> {
+        debug_assert_eq!(dense.len(), size * size);
+        debug_assert!(ncol <= size);
+        let (mut lcol, ldl) = copy_lower_dense_to_small_leaf_lcol(dense, size, ncol);
+        let mut perm = (0..ncol as c_int).collect::<Vec<_>>();
+        let mut diagonal = vec![0.0; 2 * ncol.max(1)];
+        let mut ld = vec![0.0; 2 * size.max(1)];
+        let max_steps = ncol.max(1);
+        let mut trace_from = vec![0; max_steps];
+        let mut trace_status = vec![0; max_steps];
+        let mut trace_next = vec![0; max_steps];
+        let mut trace_perm = vec![0; max_steps * ncol.max(1)];
+        let mut trace_matrix = vec![0.0; max_steps * ncol.max(1) * ldl.max(1)];
+        let mut trace_diagonal = vec![0.0; max_steps * 2 * ncol.max(1)];
+        let trace_len = unsafe {
+            (shim.ldlt_tpp_trace)(
+                size as c_int,
+                ncol as c_int,
+                perm.as_mut_ptr(),
+                lcol.as_mut_ptr(),
+                ldl as c_int,
+                diagonal.as_mut_ptr(),
+                ld.as_mut_ptr(),
+                size as c_int,
+                i32::from(options.action_on_zero_pivot),
+                options.threshold_pivot_u,
+                options.small_pivot_tolerance,
+                max_steps as c_int,
+                trace_from.as_mut_ptr(),
+                trace_status.as_mut_ptr(),
+                trace_next.as_mut_ptr(),
+                trace_perm.as_mut_ptr(),
+                trace_matrix.as_mut_ptr(),
+                trace_diagonal.as_mut_ptr(),
+            )
+        };
+        assert!(trace_len >= 0, "native ldlt_tpp trace returned {trace_len}");
+        (0..trace_len as usize)
+            .map(|step| {
+                let perm_start = step * ncol.max(1);
+                let matrix_start = step * ncol.max(1) * ldl.max(1);
+                let diagonal_start = step * 2 * ncol.max(1);
+                SmallLeafTppTraceStep {
+                    from: trace_from[step] as usize,
+                    status: trace_status[step] as usize,
+                    next: trace_next[step] as usize,
+                    perm: trace_perm[perm_start..perm_start + ncol]
+                        .iter()
+                        .map(|entry| *entry as usize)
+                        .collect(),
+                    lcol: trace_matrix[matrix_start..matrix_start + ncol * ldl].to_vec(),
+                    ldl,
+                    diagonal: trace_diagonal[diagonal_start..diagonal_start + 2 * ncol].to_vec(),
+                }
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_small_leaf_tpp_trace_step(
+        trace: &mut Vec<SmallLeafTppTraceStep>,
+        from: usize,
+        status: usize,
+        next: usize,
+        perm: &[usize],
+        lcol: &[f64],
+        ldl: usize,
+        ncol: usize,
+        diagonal: &[f64],
+    ) {
+        trace.push(SmallLeafTppTraceStep {
+            from,
+            status,
+            next,
+            perm: perm.to_vec(),
+            lcol: lcol[..ncol * ldl].to_vec(),
+            ldl,
+            diagonal: diagonal[..2 * ncol].to_vec(),
+        });
+    }
+
+    fn rust_small_leaf_ldlt_tpp_trace_from_lower_dense(
+        dense: &[f64],
+        size: usize,
+        ncol: usize,
+        options: NumericFactorOptions,
+    ) -> Vec<SmallLeafTppTraceStep> {
+        debug_assert_eq!(dense.len(), size * size);
+        debug_assert!(ncol <= size);
+        let (full_lcol, ldl) = copy_lower_dense_to_small_leaf_lcol(dense, size, ncol);
+        let mut lcol = full_lcol[..ldl * ncol].to_vec();
+        let mut diagonal = vec![0.0; 2 * ncol.max(1)];
+        let mut perm = (0..ncol).collect::<Vec<_>>();
+        let mut stats = PanelFactorStats::default();
+        let mut work = vec![0.0; 2 * size.max(1)];
+        let mut trace = Vec::new();
+        let mut pivot = 0;
+
+        while pivot < ncol {
+            let step_from = pivot;
+            if spral_small_leaf_column_small(
+                &lcol,
+                size,
+                ldl,
+                pivot,
+                pivot,
+                options.small_pivot_tolerance,
+            ) {
+                assert!(options.action_on_zero_pivot);
+                spral_small_leaf_swap_cols(&mut lcol, &mut perm, size, ldl, pivot, pivot);
+                spral_small_leaf_zero_col(&mut lcol, size, ldl, pivot);
+                diagonal[2 * pivot] = 0.0;
+                diagonal[2 * pivot + 1] = 0.0;
+                pivot += 1;
+                push_small_leaf_tpp_trace_step(
+                    &mut trace, step_from, 1, pivot, &perm, &lcol, ldl, ncol, &diagonal,
+                );
+                continue;
+            }
+
+            let mut advanced = false;
+            for candidate in (pivot + 1)..ncol {
+                if spral_small_leaf_column_small(
+                    &lcol,
+                    size,
+                    ldl,
+                    candidate,
+                    pivot,
+                    options.small_pivot_tolerance,
+                ) {
+                    assert!(options.action_on_zero_pivot);
+                    spral_small_leaf_swap_cols(&mut lcol, &mut perm, size, ldl, candidate, pivot);
+                    spral_small_leaf_zero_col(&mut lcol, size, ldl, pivot);
+                    diagonal[2 * pivot] = 0.0;
+                    diagonal[2 * pivot + 1] = 0.0;
+                    pivot += 1;
+                    push_small_leaf_tpp_trace_step(
+                        &mut trace, step_from, 1, pivot, &perm, &lcol, ldl, ncol, &diagonal,
+                    );
+                    advanced = true;
+                    break;
+                }
+
+                let Some(first) = spral_small_leaf_find_row_abs_max(&lcol, ldl, candidate, pivot)
+                else {
+                    continue;
+                };
+                let mut second = candidate;
+                let a11 = lcol[first * ldl + first];
+                let a22 = lcol[second * ldl + second];
+                let a21 = lcol[first * ldl + second];
+                let maxt = spral_small_leaf_find_rc_abs_max_exclude(
+                    &lcol,
+                    size,
+                    ldl,
+                    first,
+                    pivot,
+                    Some(second),
+                );
+                let mut maxp = spral_small_leaf_find_rc_abs_max_exclude(
+                    &lcol,
+                    size,
+                    ldl,
+                    second,
+                    pivot,
+                    Some(first),
+                );
+
+                if let Some(inverse) = tpp_test_two_by_two(a11, a21, a22, maxt, maxp, options) {
+                    spral_small_leaf_swap_cols(&mut lcol, &mut perm, size, ldl, first, pivot);
+                    if second == pivot {
+                        second = first;
+                    }
+                    spral_small_leaf_swap_cols(&mut lcol, &mut perm, size, ldl, second, pivot + 1);
+                    spral_small_leaf_factor_two_by_two(
+                        &mut lcol,
+                        &mut diagonal,
+                        size,
+                        ncol,
+                        ldl,
+                        pivot,
+                        inverse,
+                        &mut stats,
+                        &mut work,
+                        false,
+                    )
+                    .expect("rust small-leaf trace 2x2 pivot");
+                    pivot += 2;
+                    push_small_leaf_tpp_trace_step(
+                        &mut trace, step_from, 2, pivot, &perm, &lcol, ldl, ncol, &diagonal,
+                    );
+                    advanced = true;
+                    break;
+                }
+
+                maxp = maxp.max(a21.abs());
+                if a22.abs() >= options.threshold_pivot_u * maxp {
+                    spral_small_leaf_swap_cols(&mut lcol, &mut perm, size, ldl, candidate, pivot);
+                    spral_small_leaf_factor_one_by_one(
+                        &mut lcol,
+                        &mut diagonal,
+                        size,
+                        ncol,
+                        ldl,
+                        pivot,
+                        &mut work,
+                        false,
+                    )
+                    .expect("rust small-leaf trace 1x1 pivot");
+                    pivot += 1;
+                    push_small_leaf_tpp_trace_step(
+                        &mut trace, step_from, 1, pivot, &perm, &lcol, ldl, ncol, &diagonal,
+                    );
+                    advanced = true;
+                    break;
+                }
+            }
+
+            if advanced {
+                continue;
+            }
+
+            let current_diag = lcol[pivot * ldl + pivot];
+            let current_offdiag_max =
+                spral_small_leaf_find_rc_abs_max_exclude(&lcol, size, ldl, pivot, pivot, None);
+            if current_diag.abs() >= options.threshold_pivot_u * current_offdiag_max {
+                spral_small_leaf_swap_cols(&mut lcol, &mut perm, size, ldl, pivot, pivot);
+                spral_small_leaf_factor_one_by_one(
+                    &mut lcol,
+                    &mut diagonal,
+                    size,
+                    ncol,
+                    ldl,
+                    pivot,
+                    &mut work,
+                    false,
+                )
+                .expect("rust small-leaf trace final 1x1 pivot");
+                pivot += 1;
+                push_small_leaf_tpp_trace_step(
+                    &mut trace, step_from, 1, pivot, &perm, &lcol, ldl, ncol, &diagonal,
+                );
+            } else {
+                break;
+            }
+        }
+
+        trace
+    }
+
+    fn assert_small_leaf_tpp_trace_steps_equal(
+        label: &str,
+        rust: &[SmallLeafTppTraceStep],
+        native: &[SmallLeafTppTraceStep],
+        size: usize,
+        ncol: usize,
+    ) {
+        assert_eq!(rust.len(), native.len(), "{label}: trace length mismatch");
+        for (step, (rust_step, native_step)) in rust.iter().zip(native).enumerate() {
+            assert_eq!(rust_step.from, native_step.from, "{label}: step={step}");
+            assert_eq!(rust_step.status, native_step.status, "{label}: step={step}");
+            assert_eq!(rust_step.next, native_step.next, "{label}: step={step}");
+            assert_eq!(rust_step.ldl, native_step.ldl, "{label}: step={step}");
+            assert_eq!(
+                rust_step.perm, native_step.perm,
+                "{label}: step={step}: perm mismatch"
+            );
+            for (index, (&rust_value, &native_value)) in rust_step
+                .diagonal
+                .iter()
+                .zip(&native_step.diagonal)
+                .enumerate()
+            {
+                assert_eq!(
+                    rust_value.to_bits(),
+                    native_value.to_bits(),
+                    "{label}: step={step}: d mismatch index={index} rust={rust_value:?} native={native_value:?}"
+                );
+            }
+            for col in rust_step.next..ncol {
+                for row in rust_step.next..size {
+                    let rust_value = rust_step.lcol[col * rust_step.ldl + row];
+                    let native_value = native_step.lcol[col * native_step.ldl + row];
+                    assert_eq!(
+                        rust_value.to_bits(),
+                        native_value.to_bits(),
+                        "{label}: step={step}: native host_gemm rectangle mismatch row={row} col={col} rust={rust_value:?} native={native_value:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn rust_small_leaf_ldlt_tpp_factor_from_lower_dense(
+        dense: &[f64],
+        size: usize,
+        ncol: usize,
+        options: NumericFactorOptions,
+    ) -> SmallLeafTppKernelResult {
+        debug_assert_eq!(dense.len(), size * size);
+        debug_assert!(ncol <= size);
+        let (lcol, ldl) = copy_lower_dense_to_small_leaf_lcol(dense, size, ncol);
+        let mut node = SpralSmallLeafNumericNode {
+            front_id: 0,
+            rows: (0..size).collect(),
+            base_ncol: ncol,
+            nrow: size,
+            ncol,
+            ldl,
+            lcol,
+            perm: (0..ncol).collect(),
+            contrib: (size > ncol).then(|| vec![0.0; (size - ncol) * (size - ncol)]),
+            ndelay_in: 0,
+            ndelay_out: 0,
+            nelim: 0,
+        };
+        let mut work = Vec::new();
+        let factorization = factorize_spral_small_leaf_aligned_tpp_in_place(
+            &mut node, options, false, &mut work, false,
+        )
+        .expect("rust small-leaf TPP factorization");
+        let d_offset = spral_small_leaf_d_offset(ldl, ncol);
+        SmallLeafTppKernelResult {
+            eliminated: factorization.factor_order.len(),
+            perm: node.perm,
+            lcol: node.lcol[..d_offset].to_vec(),
+            ldl,
+            diagonal: node.lcol[d_offset..d_offset + 2 * ncol].to_vec(),
+        }
+    }
+
+    fn assert_small_leaf_tpp_kernel_results_equal(
+        label: &str,
+        rust: &SmallLeafTppKernelResult,
+        native: &SmallLeafTppKernelResult,
+        size: usize,
+        ncol: usize,
+    ) {
+        assert_eq!(rust.eliminated, native.eliminated, "{label}");
+        assert_eq!(rust.ldl, native.ldl, "{label}");
+        assert_eq!(
+            &rust.perm[..rust.eliminated],
+            &native.perm[..native.eliminated],
+            "{label}: eliminated perm prefix mismatch"
+        );
+        for (index, (&rust_value, &native_value)) in
+            rust.diagonal.iter().zip(&native.diagonal).enumerate()
+        {
+            assert_eq!(
+                rust_value.to_bits(),
+                native_value.to_bits(),
+                "{label}: small-leaf ldlt_tpp d mismatch index={index} rust={rust_value:?} native={native_value:?}"
+            );
+        }
+        for col in 0..ncol {
+            for row in col..size {
+                let rust_value = rust.lcol[col * rust.ldl + row];
+                let native_value = native.lcol[col * native.ldl + row];
+                assert_eq!(
+                    rust_value.to_bits(),
+                    native_value.to_bits(),
+                    "{label}: small-leaf ldlt_tpp lcol mismatch row={row} col={col} rust={rust_value:?} native={native_value:?}"
+                );
+            }
         }
     }
 
@@ -10586,6 +14230,26 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
                     rust_value.to_bits(),
                     native_value.to_bits(),
                     "{label}: ldlt_tpp full matrix mismatch row={row} col={col} rust={rust_value:?} native={native_value:?}"
+                );
+            }
+        }
+    }
+
+    fn assert_dense_tpp_full_storage_equal(
+        label: &str,
+        rust: &DenseTppKernelResult,
+        native: &DenseTppKernelResult,
+        size: usize,
+        active_columns: usize,
+    ) {
+        for col in 0..active_columns {
+            for row in 0..size {
+                let rust_value = rust.matrix[col * size + row];
+                let native_value = native.matrix[col * size + row];
+                assert_eq!(
+                    rust_value.to_bits(),
+                    native_value.to_bits(),
+                    "{label}: ldlt_tpp full storage mismatch row={row} col={col} rust={rust_value:?} native={native_value:?}"
                 );
             }
         }
@@ -11811,6 +15475,32 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
     }
 
     #[test]
+    fn app_block_find_maxloc_matches_source_shape_without_native_shim() {
+        let cases = env_usize("SPRAL_SSIDS_KERNEL_PARITY_CASES", 4096);
+        let seed = env_u64("SPRAL_SSIDS_KERNEL_PARITY_SEED", 0xf1d0_900d_0001);
+        for case_index in 0..cases {
+            let case = block_find_maxloc_case_from_seed(seed ^ (case_index as u64));
+            let actual = dense_find_maxloc(
+                &case.matrix,
+                APP_INNER_BLOCK_SIZE,
+                case.from,
+                APP_INNER_BLOCK_SIZE,
+            );
+            let expected = dense_find_maxloc_reference_non_avx(
+                &case.matrix,
+                APP_INNER_BLOCK_SIZE,
+                case.from,
+                APP_INNER_BLOCK_SIZE,
+            );
+            assert_eq!(
+                actual, expected,
+                "optimized maxloc drifted from source-shaped non-AVX loop case_index={case_index} seed={:#x}",
+                case.seed
+            );
+        }
+    }
+
+    #[test]
     fn app_block_find_maxloc_matches_native_kernel_property_cases() {
         let Some(shim) = native_kernel_shim_or_skip() else {
             return;
@@ -12668,6 +16358,15 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             .expect("single full supernode fast path");
 
         assert_eq!(fast, generic);
+        assert_eq!(
+            build_native_row_list_supernodes_guarded(
+                matrix,
+                &permutation,
+                &layout,
+                &column_pattern
+            ),
+            generic
+        );
     }
 
     #[test]
@@ -12796,6 +16495,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         let native = native_ldlt_tpp_factor_from_lower_dense(shim, &dense, 4, 4, options);
 
         assert_dense_tpp_kernel_results_equal("4x4 hand witness", &rust, &native, 4);
+        assert_dense_tpp_full_storage_equal("4x4 hand witness", &rust, &native, 4, 4);
     }
 
     fn dense_tpp_dyadic_case_lower(case: usize) -> (usize, Vec<f64>) {
@@ -12827,6 +16527,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             &native,
             3,
         );
+        assert_dense_tpp_full_storage_equal("dyadic case=0 first two pivots", &rust, &native, 3, 2);
     }
 
     #[test]
@@ -12845,6 +16546,53 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
 
             let label = format!("dyadic case={case} dimension={dimension}");
             assert_dense_tpp_kernel_results_equal(&label, &rust, &native, dimension);
+            assert_dense_tpp_full_storage_equal(&label, &rust, &native, dimension, dimension);
+        }
+    }
+
+    #[test]
+    fn small_leaf_aligned_tpp_dyadic_cases_match_native_kernel() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let options = NumericFactorOptions::default();
+
+        for case in 0..16 {
+            let (dimension, dense) = dense_tpp_dyadic_case_lower(case);
+            for ncol in 1..=dimension {
+                let rust = rust_small_leaf_ldlt_tpp_factor_from_lower_dense(
+                    &dense, dimension, ncol, options,
+                );
+                let native = native_small_leaf_ldlt_tpp_factor_from_lower_dense(
+                    shim, &dense, dimension, ncol, options,
+                );
+                let label =
+                    format!("small-leaf dyadic case={case} dimension={dimension} ncol={ncol}");
+                assert_small_leaf_tpp_kernel_results_equal(&label, &rust, &native, dimension, ncol);
+            }
+        }
+    }
+
+    #[test]
+    fn small_leaf_aligned_tpp_prefix_trace_matches_native_kernel() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let options = NumericFactorOptions::default();
+
+        for case in 0..16 {
+            let (dimension, dense) = dense_tpp_dyadic_case_lower(case);
+            for ncol in 1..=dimension {
+                let rust = rust_small_leaf_ldlt_tpp_trace_from_lower_dense(
+                    &dense, dimension, ncol, options,
+                );
+                let native = native_small_leaf_ldlt_tpp_trace_from_lower_dense(
+                    shim, &dense, dimension, ncol, options,
+                );
+                let label =
+                    format!("small-leaf TPP trace case={case} dimension={dimension} ncol={ncol}");
+                assert_small_leaf_tpp_trace_steps_equal(&label, &rust, &native, dimension, ncol);
+            }
         }
     }
 
@@ -12866,6 +16614,13 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             &native,
             dimension,
         );
+        assert_dense_tpp_full_storage_equal(
+            "dyadic case=7 candidate_len=2",
+            &rust,
+            &native,
+            dimension,
+            2,
+        );
     }
 
     #[test]
@@ -12885,6 +16640,13 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             &rust,
             &native,
             dimension,
+        );
+        assert_dense_tpp_full_storage_equal(
+            "dyadic case=7 candidate_len=3",
+            &rust,
+            &native,
+            dimension,
+            3,
         );
     }
 
@@ -13193,7 +16955,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
                     &mut local_stats,
                     &mut scratch,
                 )
-                .expect("debug APP fallback 1x1 pivot");
+                .expect("debug APP off-diagonal 1x1 pivot");
                 local_blocks.push(block);
                 block_pivot += 1;
                 continue;
@@ -16034,19 +19796,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
                 options,
             );
         assert_eq!(
-            first_source_multiplier_continuation_mismatch,
-            Some(BlockContinuationMismatch {
-                step: 0,
-                from: 0,
-                status: 2,
-                next: 2,
-                component: "diagonal",
-                index: 7,
-                row: 0,
-                col: 0,
-                continued_bits: 0xbf2b_4429_642a_1ee2,
-                block_bits: 0xbf2b_4429_642a_1ee4,
-            }),
+            first_source_multiplier_continuation_mismatch, None,
             "dense seed09 source-multiplier native APP trace continuation boundary moved"
         );
         assert_eq!(
@@ -16071,8 +19821,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             }
         }
         assert_eq!(
-            first_source_multiplier_trace_d_mismatch,
-            Some((7, 0xbf2b_4429_642a_1ee2, 0xbf2b_4429_642a_1ee4)),
+            first_source_multiplier_trace_d_mismatch, None,
             "dense seed09 source-multiplier native APP trace/block_ldlt D boundary moved"
         );
         let mut first_source_multiplier_trace_block_mismatch = None;
@@ -16090,8 +19839,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             }
         }
         assert_eq!(
-            first_source_multiplier_trace_block_mismatch,
-            Some((2, 0, 0x3f79_e327_dcf6_7cce, 0x3f79_e327_dcf6_7ccf)),
+            first_source_multiplier_trace_block_mismatch, None,
             "dense seed09 source-multiplier native APP trace/block_ldlt matrix boundary moved"
         );
         assert_eq!(
@@ -16116,8 +19864,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             }
         }
         assert_eq!(
-            first_source_trace_d_mismatch,
-            Some((7, 0xbf2b_4429_642a_1ee2, 0xbf2b_4429_642a_1ee4)),
+            first_source_trace_d_mismatch, None,
             "dense seed09 source native APP trace/block_ldlt D boundary moved"
         );
         let mut first_source_trace_block_mismatch = None;
@@ -16133,8 +19880,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             }
         }
         assert_eq!(
-            first_source_trace_block_mismatch,
-            Some((2, 0, 0x3f79_e327_dcf6_7cce, 0x3f79_e327_dcf6_7ccf)),
+            first_source_trace_block_mismatch, None,
             "dense seed09 source native APP trace/block_ldlt matrix boundary moved"
         );
         let first_source_continuation_mismatch = first_native_block_continuation_mismatch(
@@ -16145,19 +19891,7 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             options,
         );
         assert_eq!(
-            first_source_continuation_mismatch,
-            Some(BlockContinuationMismatch {
-                step: 0,
-                from: 0,
-                status: 2,
-                next: 2,
-                component: "diagonal",
-                index: 7,
-                row: 0,
-                col: 0,
-                continued_bits: 0xbf2b_4429_642a_1ee2,
-                block_bits: 0xbf2b_4429_642a_1ee4,
-            }),
+            first_source_continuation_mismatch, None,
             "dense seed09 source native APP trace continuation boundary moved"
         );
         let mut native_source_apply_matrix = native_block.matrix.clone();
