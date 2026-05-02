@@ -28,14 +28,14 @@ the exact operation order but lets the compiler optimize the tight helper calls.
 
 | path | factor median | solve median | notes |
 | --- | ---: | ---: | --- |
-| native SPRAL | `1.009ms` | `2.086ms` | source-built `spral-src`, glider in-process median |
-| Rust `SpralMatching`, profiled | `1.416ms` | `2.374ms` | includes Rust bucket timers; use for attribution |
-| Rust `SpralMatching`, unprofiled | `1.189ms` | `2.067ms` | NLIP-like total with no Rust bucket timers |
+| native SPRAL | `1.024ms` | `2.112ms` | source-built `spral-src`, glider in-process median |
+| Rust `SpralMatching`, profiled | `1.431ms` | `2.412ms` | includes Rust bucket timers; use for attribution |
+| Rust `SpralMatching`, unprofiled | `1.179ms` | `2.082ms` | NLIP-like total with no Rust bucket timers |
 
 The in-process replay keeps the exact augmented solution delta at
 `6.938894e-18`. Correctness is tight. The real NLIP-like solve path is now
 comparable to native on this replay, while factor still trails native by about
-`179.958us` (`1.178x`). The larger profiled gap is instrumentation overhead plus
+`155.624us` (`1.152x`). The larger profiled gap is instrumentation overhead plus
 real kernel cost, so Rust-only buckets below are attribution, not native
 bucket comparisons.
 
@@ -48,13 +48,13 @@ Rust small-leaf telemetry on the same glider replay:
 | small-leaf APP fronts | `77` |
 | small-leaf columns | `3471` |
 | small-leaf dense entries | `179082` |
-| small-leaf TPP | `614.968us` |
-| small-leaf pivot factor | `328.553us` |
-| small-leaf pivot search | `76.265us` |
-| small-leaf contribution GEMM | `84.250us` |
+| small-leaf TPP | `620.827us` |
+| small-leaf pivot factor | `330.310us` |
+| small-leaf pivot search | `76.369us` |
+| small-leaf contribution GEMM | `84.492us` |
 | small-leaf contribution pack | `0ns` |
-| small-leaf solve panel extraction | `75.712us` |
-| small-leaf output append | `4.627us` |
+| small-leaf solve panel extraction | `75.083us` |
+| small-leaf output append | `4.578us` |
 
 The native sample shows the factor path spending material time in
 `SmallLeafNumericSubtree -> ldlt_tpp_factor -> host_gemm/dgemm`. Rust now routes
@@ -175,11 +175,47 @@ Rust also now mirrors native `ldlt_tpp_factor`'s full trailing
 the small-leaf path and the generic/root TPP tail, including native's
 normally-unused row-before-column writes. Native's remaining advantage is mostly
 kernel/storage efficiency: optimized `ldlt_tpp_factor`, BLAS-backed contribution
-formation and some Rust solve-panel conversion overhead. A gated deep Rust split with
-`SPRAL_SSIDS_SMALL_LEAF_DEEP_PROFILE=1` currently attributes the small-leaf
+formation and some Rust solve-panel conversion overhead. A gated deep Rust split
+with `SPRAL_SSIDS_SMALL_LEAF_DEEP_PROFILE=1` attributed the small-leaf
 pivot-factor bucket mostly to the trailing rank update (`~232us`) rather than
-multiplier scaling (`~51us`); that deep mode adds per-pivot timer overhead and
-should not be used for side-by-side totals.
+multiplier scaling (`~51us`) on the prior run; that deep mode adds per-pivot
+timer overhead and should not be used for side-by-side totals.
+
+### Small-Leaf TPP Kernel Timing
+
+The native-kernel test shim now also times native `ldlt_tpp_factor` beside the
+Rust small-leaf TPP port on deterministic glider-shaped panels. This is
+test-only attribution; it does not call native code in production.
+
+Latest release test command:
+
+```text
+SPRAL_SSIDS_SMALL_LEAF_TPP_TIMING_REPEATS=200 \
+RAYON_NUM_THREADS=1 OMP_NUM_THREADS=1 OMP_CANCELLATION=true \
+AD_CODEGEN_REQUIRE_NATIVE_SPRAL_PARITY=1 \
+cargo test -p ssids-rs --release --features native-spral-src \
+  small_leaf_aligned_tpp_glider_shape_timing_reports_native_and_rust_kernel_medians \
+  --lib -- --nocapture
+```
+
+| fixture | native `ldlt_tpp_factor` | Rust TPP kernel | ratio | delta |
+| --- | ---: | ---: | ---: | ---: |
+| size `33`, ncol `16` | `2.833us` | `0.750us` | `0.265x` | `-2.083us` |
+| size `48`, ncol `20` | `2.333us` | `1.334us` | `0.572x` | `-0.999us` |
+| size `64`, ncol `24` | `3.833us` | `2.375us` | `0.620x` | `-1.458us` |
+
+This narrows the interpretation: synthetic glider-shaped panels do not prove
+that the isolated Rust rank-update helper is slower than native. The remaining
+glider factor delta should be treated as a full small-leaf/front orchestration
+gap until we can time the exact glider panels on both sides or add native bucket
+timing for `SmallLeafNumericSubtree`.
+
+A pointer-hoisted `while`-loop rewrite of the rank-1/2 update helpers preserved
+the native prefix trace but regressed the glider unprofiled factor profile to
+`1.256ms` vs native `1.039ms` (`1.210x`). It was rejected because it was a
+Rust-only micro-optimization, not a source-shape convergence step. A future
+source-converging change may still be kept through an initial regression if it
+closes a real SPRAL implementation difference.
 
 ### Recommended Port Boundary
 
@@ -191,13 +227,12 @@ compare the full native `host_gemm(OP_N, OP_T)` target rectangle, so the previou
 lower-only update shape is closed for both small-leaf and generic/root TPP. The
 next boundary is performance-parity work inside that branch:
 
-1. Continue optimizing the source-shaped full-rectangle TPP trailing update
-   loop; it remains the largest small-leaf bucket after pointer-shaped rank
-   updates and max-scan unrolling. A simple branch-split/row-unroll version was
-   rejected because it preserved correctness but regressed the side-by-side
-   glider factor profile. The stricter
-   `small_leaf_aligned_tpp_prefix_trace_matches_native_kernel` fixture now
-   localizes the full native update rectangle after each accepted pivot.
+1. Do not continue blind Rust-only TPP loop rewrites. The release native/Rust
+   TPP timing fixture shows synthetic panels are not slower in Rust, and the
+   pointer-hoisted rewrite regressed the real glider profile. The next useful
+   step is exact-panel or native-bucket timing for `SmallLeafNumericSubtree`.
+   The stricter `small_leaf_aligned_tpp_prefix_trace_matches_native_kernel`
+   fixture remains the correctness gate for any retained kernel change.
 2. Revisit contribution formation only after TPP narrows further; the
    row-blocked pointer microkernel keeps the GEMM-equivalent bucket near
    `85us`, but native `host_gemm` is still faster.

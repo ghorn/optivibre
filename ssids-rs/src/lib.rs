@@ -9581,6 +9581,7 @@ mod tests {
     use std::process::Command;
     use std::ptr;
     use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
 
     use libloading::Library;
     use metis_ordering::{CsrGraph, Permutation};
@@ -13869,6 +13870,137 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn rust_small_leaf_ldlt_tpp_factor_kernel_in_place(
+        lcol: &mut [f64],
+        ldl: usize,
+        size: usize,
+        ncol: usize,
+        perm: &mut [usize],
+        diagonal: &mut [f64],
+        work: &mut [f64],
+        options: NumericFactorOptions,
+    ) -> usize {
+        debug_assert!(ncol <= size);
+        debug_assert!(lcol.len() >= ncol * ldl);
+        debug_assert!(diagonal.len() >= 2 * ncol);
+        debug_assert!(work.len() >= 2 * size.max(1));
+        let mut stats = PanelFactorStats::default();
+        let mut pivot = 0;
+
+        while pivot < ncol {
+            if spral_small_leaf_column_small(
+                lcol,
+                size,
+                ldl,
+                pivot,
+                pivot,
+                options.small_pivot_tolerance,
+            ) {
+                assert!(options.action_on_zero_pivot);
+                spral_small_leaf_swap_cols(lcol, perm, size, ldl, pivot, pivot);
+                spral_small_leaf_zero_col(lcol, size, ldl, pivot);
+                diagonal[2 * pivot] = 0.0;
+                diagonal[2 * pivot + 1] = 0.0;
+                pivot += 1;
+                continue;
+            }
+
+            let mut advanced = false;
+            for candidate in (pivot + 1)..ncol {
+                if spral_small_leaf_column_small(
+                    lcol,
+                    size,
+                    ldl,
+                    candidate,
+                    pivot,
+                    options.small_pivot_tolerance,
+                ) {
+                    assert!(options.action_on_zero_pivot);
+                    spral_small_leaf_swap_cols(lcol, perm, size, ldl, candidate, pivot);
+                    spral_small_leaf_zero_col(lcol, size, ldl, pivot);
+                    diagonal[2 * pivot] = 0.0;
+                    diagonal[2 * pivot + 1] = 0.0;
+                    pivot += 1;
+                    advanced = true;
+                    break;
+                }
+
+                let Some(first) = spral_small_leaf_find_row_abs_max(lcol, ldl, candidate, pivot)
+                else {
+                    continue;
+                };
+                let mut second = candidate;
+                let a11 = lcol[first * ldl + first];
+                let a22 = lcol[second * ldl + second];
+                let a21 = lcol[first * ldl + second];
+                let maxt = spral_small_leaf_find_rc_abs_max_exclude(
+                    lcol,
+                    size,
+                    ldl,
+                    first,
+                    pivot,
+                    Some(second),
+                );
+                let mut maxp = spral_small_leaf_find_rc_abs_max_exclude(
+                    lcol,
+                    size,
+                    ldl,
+                    second,
+                    pivot,
+                    Some(first),
+                );
+
+                if let Some(inverse) = tpp_test_two_by_two(a11, a21, a22, maxt, maxp, options) {
+                    spral_small_leaf_swap_cols(lcol, perm, size, ldl, first, pivot);
+                    if second == pivot {
+                        second = first;
+                    }
+                    spral_small_leaf_swap_cols(lcol, perm, size, ldl, second, pivot + 1);
+                    spral_small_leaf_factor_two_by_two(
+                        lcol, diagonal, size, ncol, ldl, pivot, inverse, &mut stats, work, false,
+                    )
+                    .expect("rust small-leaf kernel 2x2 pivot");
+                    pivot += 2;
+                    advanced = true;
+                    break;
+                }
+
+                maxp = maxp.max(a21.abs());
+                if a22.abs() >= options.threshold_pivot_u * maxp {
+                    spral_small_leaf_swap_cols(lcol, perm, size, ldl, candidate, pivot);
+                    spral_small_leaf_factor_one_by_one(
+                        lcol, diagonal, size, ncol, ldl, pivot, work, false,
+                    )
+                    .expect("rust small-leaf kernel 1x1 pivot");
+                    pivot += 1;
+                    advanced = true;
+                    break;
+                }
+            }
+
+            if advanced {
+                continue;
+            }
+
+            let current_diag = lcol[pivot * ldl + pivot];
+            let current_offdiag_max =
+                spral_small_leaf_find_rc_abs_max_exclude(lcol, size, ldl, pivot, pivot, None);
+            if current_diag.abs() >= options.threshold_pivot_u * current_offdiag_max {
+                spral_small_leaf_swap_cols(lcol, perm, size, ldl, pivot, pivot);
+                spral_small_leaf_factor_one_by_one(
+                    lcol, diagonal, size, ncol, ldl, pivot, work, false,
+                )
+                .expect("rust small-leaf kernel final 1x1 pivot");
+                pivot += 1;
+            } else {
+                break;
+            }
+        }
+
+        pivot
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn push_small_leaf_tpp_trace_step(
         trace: &mut Vec<SmallLeafTppTraceStep>,
         from: usize,
@@ -16568,6 +16700,148 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         (dimension, square_to_dense_lower(&matrix))
     }
 
+    fn small_leaf_tpp_glider_shape_lower(case: usize, size: usize) -> Vec<f64> {
+        let mut rng = DenseBoundaryRng::new(0x516c_6964_6572_5450_u64 ^ case as u64);
+        let mut dense = vec![0.0; size * size];
+        for col in 0..size {
+            for row in col..size {
+                let value = if row == col {
+                    let sign = if (row + case).is_multiple_of(5) {
+                        -1.0
+                    } else {
+                        1.0
+                    };
+                    sign * (16.0 + (row % 11) as f64 + rng.dyadic(7, 5).abs())
+                } else {
+                    rng.dyadic(31, 9) * 0.03125
+                };
+                dense[dense_lower_offset(size, row, col)] = value;
+            }
+        }
+        dense
+    }
+
+    fn small_leaf_tpp_timing_repeats() -> usize {
+        std::env::var("SPRAL_SSIDS_SMALL_LEAF_TPP_TIMING_REPEATS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|&repeats| repeats > 0)
+            .unwrap_or(40)
+    }
+
+    fn median_duration(samples: &mut [Duration]) -> Duration {
+        samples.sort_unstable();
+        samples[samples.len() / 2]
+    }
+
+    fn format_test_duration(duration: Duration) -> String {
+        let seconds = duration.as_secs_f64();
+        if seconds >= 1.0 {
+            format!("{seconds:.3}s")
+        } else if seconds >= 1e-3 {
+            format!("{:.3}ms", seconds * 1e3)
+        } else if seconds >= 1e-6 {
+            format!("{:.3}us", seconds * 1e6)
+        } else {
+            format!("{:.3}ns", seconds * 1e9)
+        }
+    }
+
+    fn time_native_small_leaf_tpp_kernel_median(
+        shim: &NativeKernelShim,
+        dense: &[f64],
+        size: usize,
+        ncol: usize,
+        options: NumericFactorOptions,
+        repeats: usize,
+    ) -> (Duration, SmallLeafTppKernelResult) {
+        let (template_lcol, ldl) = copy_lower_dense_to_small_leaf_lcol(dense, size, ncol);
+        let mut samples = Vec::with_capacity(repeats);
+        let mut last = None;
+        for _ in 0..repeats {
+            let mut lcol = template_lcol.clone();
+            let mut perm = (0..ncol as c_int).collect::<Vec<_>>();
+            let mut diagonal = vec![0.0; 2 * ncol.max(1)];
+            let mut ld = vec![0.0; 2 * size.max(1)];
+            let started = Instant::now();
+            let eliminated = unsafe {
+                (shim.ldlt_tpp_factor)(
+                    size as c_int,
+                    ncol as c_int,
+                    perm.as_mut_ptr(),
+                    lcol.as_mut_ptr(),
+                    ldl as c_int,
+                    diagonal.as_mut_ptr(),
+                    ld.as_mut_ptr(),
+                    size as c_int,
+                    i32::from(options.action_on_zero_pivot),
+                    options.threshold_pivot_u,
+                    options.small_pivot_tolerance,
+                    0,
+                    ptr::null_mut(),
+                    0,
+                )
+            };
+            let elapsed = started.elapsed();
+            std::hint::black_box(eliminated);
+            assert!(
+                eliminated >= 0,
+                "native ldlt_tpp_factor returned {eliminated}"
+            );
+            samples.push(elapsed);
+            last = Some(SmallLeafTppKernelResult {
+                eliminated: eliminated as usize,
+                perm: perm.into_iter().map(|entry| entry as usize).collect(),
+                lcol,
+                ldl,
+                diagonal,
+            });
+        }
+        let median = median_duration(&mut samples);
+        (median, last.expect("at least one timing repeat"))
+    }
+
+    fn time_rust_small_leaf_tpp_kernel_median(
+        dense: &[f64],
+        size: usize,
+        ncol: usize,
+        options: NumericFactorOptions,
+        repeats: usize,
+    ) -> (Duration, SmallLeafTppKernelResult) {
+        let (template_lcol, ldl) = copy_lower_dense_to_small_leaf_lcol(dense, size, ncol);
+        let mut samples = Vec::with_capacity(repeats);
+        let mut last = None;
+        for _ in 0..repeats {
+            let mut lcol = template_lcol.clone();
+            let mut perm = (0..ncol).collect::<Vec<_>>();
+            let mut diagonal = vec![0.0; 2 * ncol.max(1)];
+            let mut work = vec![0.0; 2 * size.max(1)];
+            let started = Instant::now();
+            let eliminated = rust_small_leaf_ldlt_tpp_factor_kernel_in_place(
+                &mut lcol,
+                ldl,
+                size,
+                ncol,
+                &mut perm,
+                &mut diagonal,
+                &mut work,
+                options,
+            );
+            let elapsed = started.elapsed();
+            std::hint::black_box(eliminated);
+            samples.push(elapsed);
+            last = Some(SmallLeafTppKernelResult {
+                eliminated,
+                perm,
+                lcol,
+                ldl,
+                diagonal,
+            });
+        }
+        let median = median_duration(&mut samples);
+        (median, last.expect("at least one timing repeat"))
+    }
+
     #[test]
     fn dense_tpp_dyadic_case0_two_pivot_prefix_matches_native_kernel() {
         let Some(shim) = native_kernel_shim_or_skip() else {
@@ -16652,6 +16926,37 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
                     format!("small-leaf TPP trace case={case} dimension={dimension} ncol={ncol}");
                 assert_small_leaf_tpp_trace_steps_equal(&label, &rust, &native, dimension, ncol);
             }
+        }
+    }
+
+    #[test]
+    fn small_leaf_aligned_tpp_glider_shape_timing_reports_native_and_rust_kernel_medians() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let options = NumericFactorOptions::default();
+        let repeats = small_leaf_tpp_timing_repeats();
+        let cases = [(0, 33, 16), (1, 48, 20), (2, 64, 24)];
+
+        eprintln!(
+            "small-leaf TPP ldlt_tpp_factor medians, repeats={repeats}: case size ncol native rust rust/native delta"
+        );
+        for (case, size, ncol) in cases {
+            let dense = small_leaf_tpp_glider_shape_lower(case, size);
+            let (native_time, native) = time_native_small_leaf_tpp_kernel_median(
+                shim, &dense, size, ncol, options, repeats,
+            );
+            let (rust_time, rust) =
+                time_rust_small_leaf_tpp_kernel_median(&dense, size, ncol, options, repeats);
+            let label = format!("small-leaf glider-shape case={case} size={size} ncol={ncol}");
+            assert_small_leaf_tpp_kernel_results_equal(&label, &rust, &native, size, ncol);
+            let ratio = rust_time.as_secs_f64() / native_time.as_secs_f64();
+            let delta_us = (rust_time.as_secs_f64() - native_time.as_secs_f64()) * 1e6;
+            eprintln!(
+                "small-leaf TPP case={case} size={size} ncol={ncol}: native={} rust={} rust/native={ratio:.3}x delta={delta_us:.3}us",
+                format_test_duration(native_time),
+                format_test_duration(rust_time),
+            );
         }
     }
 
