@@ -912,6 +912,13 @@ struct DenseFrontFactorization {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+struct SmallLeafNodeFactorization {
+    nelim: usize,
+    stats: PanelFactorStats,
+    profile: FactorProfile,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct SpralSmallLeafNumericNode {
     front_id: usize,
     rows: Vec<usize>,
@@ -7662,7 +7669,7 @@ fn spral_small_leaf_form_contribution(
 
 fn build_spral_small_leaf_solve_panel_record(
     factor_order: &[usize],
-    trailing_rows: &[usize],
+    node: &SpralSmallLeafNumericNode,
     lcol: &[f64],
     m: usize,
     ldl: usize,
@@ -7677,7 +7684,15 @@ fn build_spral_small_leaf_solve_panel_record(
             detail: "small-leaf solve panel request does not match eliminated front width".into(),
         });
     }
-    let local_size = factor_order.len() + trailing_rows.len();
+    if eliminated_len > node.ncol {
+        return Err(SsidsError::NumericalBreakdown {
+            pivot: eliminated_len,
+            detail: "small-leaf solve panel eliminated more columns than the node owns".into(),
+        });
+    }
+    let delayed_count = node.ncol - eliminated_len;
+    let interface_len = node.nrow - node.ncol;
+    let local_size = factor_order.len() + delayed_count + interface_len;
     if local_size != m {
         return Err(SsidsError::NumericalBreakdown {
             pivot: eliminated_len,
@@ -7687,7 +7702,8 @@ fn build_spral_small_leaf_solve_panel_record(
 
     let mut row_ids = Vec::with_capacity(m);
     row_ids.extend_from_slice(factor_order);
-    row_ids.extend_from_slice(trailing_rows);
+    row_ids.extend_from_slice(&node.perm[eliminated_len..node.ncol]);
+    row_ids.extend_from_slice(&node.rows[node.ncol..node.nrow]);
 
     let mut values = Vec::<f64>::with_capacity(m * eliminated_len);
     let values_ptr = values.as_mut_ptr();
@@ -7724,7 +7740,8 @@ fn factorize_spral_small_leaf_aligned_tpp_in_place(
     profile_enabled: bool,
     work: &mut Vec<f64>,
     has_children: bool,
-) -> Result<DenseFrontFactorization, SsidsError> {
+    block_records: &mut Vec<FactorBlockRecord>,
+) -> Result<SmallLeafNodeFactorization, SsidsError> {
     let started = profile_enabled.then(Instant::now);
     let m = node.nrow;
     let n = node.ncol;
@@ -7738,7 +7755,6 @@ fn factorize_spral_small_leaf_aligned_tpp_in_place(
     if profile_enabled {
         profile.tpp_front_count += 1;
     }
-    let mut block_records = Vec::with_capacity(n);
     let mut pivot = 0;
     let ld_len = 2 * m.max(1);
     if work.len() < ld_len {
@@ -7948,8 +7964,7 @@ fn factorize_spral_small_leaf_aligned_tpp_in_place(
     let contribution_dim = m - n;
     let mut contribution_calc_ld_time = Duration::default();
     let mut contribution_gemm_time = Duration::default();
-    let empty_contribution;
-    let interface_contribution = if nelim > 0 {
+    if nelim > 0 {
         if contribution_dim > 0 {
             let expected_len = contribution_dim * contribution_dim;
             if !matches!(node.contrib.as_ref(), Some(contrib) if contrib.len() == expected_len) {
@@ -7977,9 +7992,6 @@ fn factorize_spral_small_leaf_aligned_tpp_in_place(
             contribution_gemm_time = contribution.gemm_time;
             profile.spral_small_leaf_contribution_calc_ld_time += contribution_calc_ld_time;
             profile.spral_small_leaf_contribution_gemm_time += contribution_gemm_time;
-            node.contrib.as_deref().unwrap_or(&[])
-        } else {
-            &[]
         }
     } else {
         if !has_children {
@@ -7990,21 +8002,9 @@ fn factorize_spral_small_leaf_aligned_tpp_in_place(
         if let Some(contrib) = node.contrib.as_mut() {
             contrib.fill(0.0);
         }
-        if let Some(contrib) = node.contrib.as_deref() {
-            contrib
-        } else {
-            empty_contribution = vec![0.0; contribution_dim * contribution_dim];
-            &empty_contribution
-        }
-    };
-    let contribution_pack_started = profile_enabled.then(Instant::now);
-    let (remaining_rows, delayed_count, contribution_dense) =
-        spral_small_leaf_pack_remaining_contribution(node, nelim, interface_contribution);
-    if let Some(started) = contribution_pack_started {
-        let elapsed = started.elapsed();
-        profile.spral_small_leaf_contribution_pack_time += elapsed;
-        profile.tpp_contribution_pack_time +=
-            contribution_calc_ld_time + contribution_gemm_time + elapsed;
+    }
+    if profile_enabled {
+        profile.tpp_contribution_pack_time += contribution_calc_ld_time + contribution_gemm_time;
     }
 
     if let Some(started) = started {
@@ -8013,16 +8013,8 @@ fn factorize_spral_small_leaf_aligned_tpp_in_place(
         profile.spral_small_leaf_tpp_time += elapsed;
     }
 
-    Ok(DenseFrontFactorization {
-        factor_order: node.perm[..nelim].to_vec(),
-        factor_columns: Vec::new(),
-        block_records,
-        solve_panels: Vec::new(),
-        contribution: ContributionBlock {
-            row_ids: remaining_rows,
-            delayed_count,
-            dense: contribution_dense,
-        },
+    Ok(SmallLeafNodeFactorization {
+        nelim,
         stats,
         profile,
     })
@@ -8155,7 +8147,8 @@ fn factor_spral_small_leaf_node(
     profile_enabled: bool,
     work: &mut Vec<f64>,
     has_children: bool,
-) -> Result<(SpralSmallLeafNumericNode, DenseFrontFactorization), SsidsError> {
+    output: &mut FactorOutput,
+) -> Result<(SpralSmallLeafNumericNode, SmallLeafNodeFactorization), SsidsError> {
     if node.ldl != spral_align_lda_f64(node.nrow)
         || node.lcol.len() != spral_small_leaf_lcol_len(node.ldl, node.ncol)
     {
@@ -8177,18 +8170,30 @@ fn factor_spral_small_leaf_node(
         profile_enabled,
         work,
         has_children,
+        &mut output.block_records,
     )?;
+
+    let output_started = profile_enabled.then(Instant::now);
+    let factor_order_start = output.factor_order.len();
+    output
+        .factor_order
+        .extend_from_slice(&node.perm[..factorization.nelim]);
+    if let Some(started) = output_started {
+        let elapsed = started.elapsed();
+        factorization.profile.front_local_result_merge_time += elapsed;
+        factorization.profile.spral_small_leaf_output_append_time += elapsed;
+    }
 
     let panel_started = profile_enabled.then(Instant::now);
     if let Some(panel) = build_spral_small_leaf_solve_panel_record(
-        &factorization.factor_order,
-        &factorization.contribution.row_ids,
+        &output.factor_order[factor_order_start..],
+        &node,
         &node.lcol,
         node.nrow,
         node.ldl,
-        factorization.factor_order.len(),
+        factorization.nelim,
     )? {
-        factorization.solve_panels.push(panel);
+        output.solve_panels.push(panel);
     }
     if let Some(started) = panel_started {
         let elapsed = started.elapsed();
@@ -8198,7 +8203,7 @@ fn factor_spral_small_leaf_node(
             .spral_small_leaf_solve_panel_build_time += elapsed;
     }
 
-    node.nelim = factorization.factor_order.len();
+    node.nelim = factorization.nelim;
     node.ndelay_out = node.ncol - node.nelim;
     let interface_rows = node.rows[node.ncol..node.nrow].to_vec();
     node.rows.clear();
@@ -8303,7 +8308,8 @@ fn try_factor_spral_small_leaf_subtree_serial(
     let children_by_node = small_leaf_children_by_node(plan);
     let mut nodes = (0..plan.nodes.len()).map(|_| None).collect::<Vec<_>>();
     let mut assembly_scratch = SmallLeafAssemblyScratch::new(matrix.dimension);
-    let mut output = FactorOutput::default();
+    let output_capacity = plan.nodes.iter().map(|node| node.ncol).sum();
+    let mut output = FactorOutput::with_capacity(output_capacity);
     let mut stats = PanelFactorStats::default();
     let mut profile = FactorProfile::default();
     let mut max_front_size = 0;
@@ -8343,23 +8349,13 @@ fn try_factor_spral_small_leaf_subtree_serial(
             profile_enabled,
             &mut assembly_scratch.numeric_work,
             !children_by_node[node_index].is_empty(),
+            &mut output,
         )?;
         if let Some(started) = factor_started {
             profile.dense_front_factorization_time += started.elapsed();
         }
         profile.accumulate(&local.profile);
         aggregate_panel_stats(&mut stats, local.stats);
-        contribution_storage_bytes += local.contribution.dense.len() * std::mem::size_of::<f64>();
-        let output_append_started = profile_enabled.then(Instant::now);
-        output.factor_order.extend(local.factor_order);
-        output.factor_columns.extend(local.factor_columns);
-        output.block_records.extend(local.block_records);
-        output.solve_panels.extend(local.solve_panels);
-        if let Some(started) = output_append_started {
-            let elapsed = started.elapsed();
-            profile.front_local_result_merge_time += elapsed;
-            profile.spral_small_leaf_output_append_time += elapsed;
-        }
 
         nodes[node_index] = Some(node);
         let post_started = profile_enabled.then(Instant::now);
@@ -8391,6 +8387,7 @@ fn try_factor_spral_small_leaf_subtree_serial(
         root_node.nelim,
         interface_contribution,
     );
+    contribution_storage_bytes += dense.len() * std::mem::size_of::<f64>();
     let contribution = ContributionBlock {
         row_ids,
         delayed_count,
@@ -9623,7 +9620,8 @@ mod tests {
         spral_align_lda_f64, spral_root_part_ranges, spral_small_leaf_column_small,
         spral_small_leaf_d_offset, spral_small_leaf_factor_one_by_one,
         spral_small_leaf_factor_two_by_two, spral_small_leaf_find_rc_abs_max_exclude,
-        spral_small_leaf_find_row_abs_max, spral_small_leaf_lcol_len, spral_small_leaf_swap_cols,
+        spral_small_leaf_find_row_abs_max, spral_small_leaf_lcol_len,
+        spral_small_leaf_pack_remaining_contribution, spral_small_leaf_swap_cols,
         spral_small_leaf_zero_col, symbolic_factor_pattern, tpp_test_two_by_two,
         try_factor_spral_small_leaf_subtree_serial, zero_dense_column_until,
     };
@@ -10272,9 +10270,10 @@ mod tests {
             ..NumericFactorOptions::default()
         };
         let mut work = Vec::new();
+        let mut output = FactorOutput::default();
 
         let (node, factorization) =
-            factor_spral_small_leaf_node(node, options, false, &mut work, false)
+            factor_spral_small_leaf_node(node, options, false, &mut work, false, &mut output)
                 .expect("small-leaf factorization should succeed");
 
         assert_eq!(node.nelim, 0);
@@ -10283,11 +10282,15 @@ mod tests {
             node.contrib.is_none(),
             "SPRAL frees no-elimination leaf contribution buffers with no first_child"
         );
-        assert!(factorization.factor_order.is_empty());
-        assert!(factorization.solve_panels.is_empty());
-        assert_eq!(factorization.contribution.row_ids, vec![0, 1]);
-        assert_eq!(factorization.contribution.delayed_count, 1);
-        assert_eq!(factorization.contribution.dense, vec![1.0, 3.0, 0.0]);
+        assert_eq!(factorization.nelim, 0);
+        assert!(output.factor_order.is_empty());
+        assert!(output.solve_panels.is_empty());
+        let empty_contribution = vec![0.0; (node.nrow - node.ncol) * (node.nrow - node.ncol)];
+        let (row_ids, delayed_count, dense) =
+            spral_small_leaf_pack_remaining_contribution(&node, node.nelim, &empty_contribution);
+        assert_eq!(row_ids, vec![0, 1]);
+        assert_eq!(delayed_count, 1);
+        assert_eq!(dense, vec![1.0, 3.0, 0.0]);
         assert_eq!(factorization.stats.delayed_pivots, 1);
     }
 
@@ -10311,6 +10314,7 @@ mod tests {
             nelim: 0,
         };
         let mut work = Vec::new();
+        let mut output = FactorOutput::default();
 
         let error = match factor_spral_small_leaf_node(
             node,
@@ -10318,6 +10322,7 @@ mod tests {
             false,
             &mut work,
             false,
+            &mut output,
         ) {
             Ok(_) => panic!("planned small-leaf layout mismatch must fail closed"),
             Err(error) => error,
@@ -14122,13 +14127,19 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
             nelim: 0,
         };
         let mut work = Vec::new();
+        let mut block_records = Vec::new();
         let factorization = factorize_spral_small_leaf_aligned_tpp_in_place(
-            &mut node, options, false, &mut work, false,
+            &mut node,
+            options,
+            false,
+            &mut work,
+            false,
+            &mut block_records,
         )
         .expect("rust small-leaf TPP factorization");
         let d_offset = spral_small_leaf_d_offset(ldl, ncol);
         SmallLeafTppKernelResult {
-            eliminated: factorization.factor_order.len(),
+            eliminated: factorization.nelim,
             perm: node.perm,
             lcol: node.lcol[..d_offset].to_vec(),
             ldl,

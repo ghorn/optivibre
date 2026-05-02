@@ -17,6 +17,8 @@ removing Rust-only finite checks from the small-leaf TPP apply helpers, and
 porting the hot small-leaf TPP/contribution loops to source-shaped pointer
 microkernels, adding aligned small-leaf TPP native-kernel parity coverage, and
 copying solve-panel column tails from node-local `lcol` in contiguous slices.
+The current path also emits small-leaf factor output directly into subtree
+output and packs generated contribution only at the subtree root boundary.
 The native-kernel parity shim now discovers the `spral-src` upstream checkout
 under `target/{release,debug}/build`, uses the same GCC-flavored toolchain shape
 as the source-built SPRAL tree for source-clone kernel traces, and the
@@ -26,14 +28,14 @@ the exact operation order but lets the compiler optimize the tight helper calls.
 
 | path | factor median | solve median | notes |
 | --- | ---: | ---: | --- |
-| native SPRAL | `1.014ms` | `2.102ms` | source-built `spral-src`, glider in-process median |
-| Rust `SpralMatching`, profiled | `1.588ms` | `2.475ms` | includes Rust bucket timers; use for attribution |
-| Rust `SpralMatching`, unprofiled | `1.310ms` | `2.110ms` | NLIP-like total with no Rust bucket timers |
+| native SPRAL | `1.009ms` | `2.086ms` | source-built `spral-src`, glider in-process median |
+| Rust `SpralMatching`, profiled | `1.416ms` | `2.374ms` | includes Rust bucket timers; use for attribution |
+| Rust `SpralMatching`, unprofiled | `1.189ms` | `2.067ms` | NLIP-like total with no Rust bucket timers |
 
 The in-process replay keeps the exact augmented solution delta at
 `6.938894e-18`. Correctness is tight. The real NLIP-like solve path is now
 comparable to native on this replay, while factor still trails native by about
-`296.626us` (`1.293x`). The larger profiled gap is instrumentation overhead plus
+`179.958us` (`1.178x`). The larger profiled gap is instrumentation overhead plus
 real kernel cost, so Rust-only buckets below are attribution, not native
 bucket comparisons.
 
@@ -46,13 +48,13 @@ Rust small-leaf telemetry on the same glider replay:
 | small-leaf APP fronts | `77` |
 | small-leaf columns | `3471` |
 | small-leaf dense entries | `179082` |
-| small-leaf TPP | `666.013us` |
-| small-leaf pivot factor | `339.365us` |
-| small-leaf pivot search | `75.187us` |
-| small-leaf contribution GEMM | `91.629us` |
-| small-leaf contribution pack | `24.873us` |
-| small-leaf solve panel extraction | `97.832us` |
-| small-leaf output append | `35.965us` |
+| small-leaf TPP | `614.968us` |
+| small-leaf pivot factor | `328.553us` |
+| small-leaf pivot search | `76.265us` |
+| small-leaf contribution GEMM | `84.250us` |
+| small-leaf contribution pack | `0ns` |
+| small-leaf solve panel extraction | `75.712us` |
+| small-leaf output append | `4.627us` |
 
 The native sample shows the factor path spending material time in
 `SmallLeafNumericSubtree -> ldlt_tpp_factor -> host_gemm/dgemm`. Rust now routes
@@ -173,8 +175,7 @@ Rust also now mirrors native `ldlt_tpp_factor`'s full trailing
 the small-leaf path and the generic/root TPP tail, including native's
 normally-unused row-before-column writes. Native's remaining advantage is mostly
 kernel/storage efficiency: optimized `ldlt_tpp_factor`, BLAS-backed contribution
-formation, allocator behavior, and avoiding some Rust solve-panel conversion
-overhead. A gated deep Rust split with
+formation and some Rust solve-panel conversion overhead. A gated deep Rust split with
 `SPRAL_SSIDS_SMALL_LEAF_DEEP_PROFILE=1` currently attributes the small-leaf
 pivot-factor bucket mostly to the trailing rank update (`~232us`) rather than
 multiplier scaling (`~51us`); that deep mode adds per-pivot timer overhead and
@@ -199,7 +200,7 @@ next boundary is performance-parity work inside that branch:
    localizes the full native update rectangle after each accepted pivot.
 2. Revisit contribution formation only after TPP narrows further; the
    row-blocked pointer microkernel keeps the GEMM-equivalent bucket near
-   `95us`, but native `host_gemm` is still faster.
+   `85us`, but native `host_gemm` is still faster.
 3. Delayed-row import is now ported and covered by a deterministic parent/child
    witness. No-elimination contribution free/zero behavior and post-assembly
    child contribution freeing are also ported and covered. The remaining
