@@ -80,6 +80,13 @@
               <span>Enable Dryden gusts</span>
             </label>
             <div class="form-hint">Off by default. Wind remains steady unless this is enabled.</div>
+            <label class="checkbox-label">
+              <input id="max-throttle-altitude-pitch" type="checkbox" />
+              <span>Max throttle, pitch altitude</span>
+            </label>
+            <div class="form-hint">
+              Experiment mode for lateral tuning: motor torque stays at max; pitch regulates altitude.
+            </div>
           </div>
           <label>
             Time Dilation
@@ -103,7 +110,14 @@
               <input id="camera-follow-yaw" type="checkbox" />
               <span>Follow Kite Yaw</span>
             </label>
+            <label class="checkbox-label">
+              <input id="control-labels-enabled" type="checkbox" />
+              <span>Show floating control labels</span>
+            </label>
           </div>
+          <a class="secondary-action" href="/aero_analysis" target="_blank" rel="noopener">
+            Open Aero Analysis
+          </a>
           <button id="run-button" type="submit">Run</button>
         </form>
         <div id="failure-pill" class="failure-pill"></div>
@@ -114,6 +128,14 @@
       </section>
       <section class="panel scene">
         <div id="viewport"></div>
+        <div id="control-vis-legend" class="control-vis-legend" aria-label="Control visualization legend">
+          <div class="legend-title">Control Vis</div>
+          <div class="legend-row"><span class="legend-swatch lookahead"></span>Lookahead target / path</div>
+          <div class="legend-row"><span class="legend-swatch projected"></span>Projected phase point</div>
+          <div class="legend-row"><span class="legend-swatch slot"></span>Fixed phase slot</div>
+          <div class="legend-row"><span class="legend-swatch disk"></span>Control ring / center</div>
+        </div>
+        <div id="control-label-layer" class="control-label-layer" aria-hidden="true"></div>
       </section>
       <section class="panel runtime-panel">
         <div class="runtime-tabs" role="tablist" aria-label="Run output">

@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#081018" />
+    <title>Aero Analysis | Multikite Sim</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  </head>
+  <body class="analysis-body">
+    <main class="analysis-shell">
+      <header class="analysis-hero">
+        <div>
+          <div class="docs-eyebrow">Aero Analysis</div>
+          <h1>Reference Coefficient Surfaces</h1>
+          <p id="analysis-note">
+            Loading the vendored aero model and generating coefficient surfaces.
+          </p>
+        </div>
+        <a class="secondary-action compact" href="/">Back to Sim</a>
+      </header>
+
+      <section class="analysis-toolbar" aria-label="Aero analysis controls">
+        <div class="analysis-tabs" role="tablist">
+          <button class="analysis-tab active" data-analysis-mode="base" type="button">
+            Base Coefficients
+          </button>
+          <button class="analysis-tab" data-analysis-mode="rates" type="button">
+            Rate Derivatives
+          </button>
+          <button class="analysis-tab" data-analysis-mode="controls" type="button">
+            Control Surfaces
+          </button>
+        </div>
+        <label id="analysis-group-picker" class="analysis-group-picker">
+          <span>Group</span>
+          <select id="analysis-group-select"></select>
+        </label>
+      </section>
+
+      <section class="analysis-section">
+        <div class="analysis-section-head">
+          <div>
+            <h2 id="analysis-section-title">Base Coefficients</h2>
+            <p id="analysis-section-note">
+              Aerodynamic force coefficients and body/CAD moment coefficients swept over alpha and beta.
+            </p>
+          </div>
+          <div id="analysis-status" class="analysis-status">Loading</div>
+        </div>
+        <div id="analysis-grid" class="analysis-plot-grid"></div>
+      </section>
+    </main>
+    <script type="module" src="/aero_analysis.js"></script>
+  </body>
+</html>

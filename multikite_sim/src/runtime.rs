@@ -1,6 +1,6 @@
 use crate::assets::{asset_manifest, reference_export};
 use crate::controller::{ControllerState, apply_trace, controller_step};
-use crate::math::{rotate_body_to_nav, rotate_nav_to_body, yaw_quaternion_n2b, zero_if_nan};
+use crate::math::{roll_yaw_quaternion_n2b, rotate_nav_to_body, yaw_quaternion_n2b, zero_if_nan};
 use crate::model::{CompiledRhs, compute_bridle_node, compute_tether_link_tensions};
 use crate::turbulence::DrydenField;
 use crate::types::{
@@ -14,10 +14,16 @@ use nalgebra::Vector3;
 use optimization::{flatten_value, unflatten_value};
 use std::array::from_fn;
 
-pub const COMMON_NODES: usize = 5;
-pub const UPPER_NODES: usize = 5;
+const BASE_TETHER_NODES: usize = 5;
+const TETHER_NODE_MULTIPLIER: usize = 3;
+pub const COMMON_NODES: usize = BASE_TETHER_NODES * TETHER_NODE_MULTIPLIER;
+pub const UPPER_NODES: usize = BASE_TETHER_NODES * TETHER_NODE_MULTIPLIER;
 pub const FREE_COMMON_NODES: usize = 0;
 pub const FREE_UPPER_NODES: usize = 0;
+const Y2_INITIAL_TENSION_N: f64 = 0.0;
+const Y2_TARGET_PAYLOAD_ALTITUDE_M: f64 = 50.0;
+const Y2_HIGH_PAYLOAD_ALTITUDE_OFFSET_M: f64 = 50.0;
+const Y2_LAUNCH_COMMON_LENGTH_FRACTION: f64 = 0.999;
 
 fn vec3(values: [f64; 3]) -> Vector3<f64> {
     Vector3::new(values[0], values[1], values[2])
@@ -64,10 +70,7 @@ fn base_params<const NK: usize>(init: &InitRequest) -> Result<Params<f64, NK>> {
         },
         motor_torque: export.controller.trim_motor_torque,
     };
-    let speed_ref = match init.preset {
-        Preset::Y2Reference => 20.0,
-        _ => export.controller.speed_ref,
-    };
+    let speed_ref = export.controller.speed_ref;
     let kite = KiteParams {
         rigid_body: crate::types::RigidBodyParams {
             mass: export.rigid_body.mass,
@@ -143,27 +146,111 @@ fn base_params<const NK: usize>(init: &InitRequest) -> Result<Params<f64, NK>> {
             disk_radius: export.controller.disk_radius,
         },
     };
-    if matches!(init.preset, Preset::Y2Reference) {
-        apply_y2_reference_overrides(&mut params);
+    if is_y2_preset(init.preset) {
+        apply_y2_controller_overrides(&mut params);
     }
     Ok(params)
 }
 
-fn apply_y2_reference_overrides<const NK: usize>(params: &mut Params<f64, NK>) {
-    let ground_altitude = params.kites[0].tether.contact.ground_altitude;
-    let splitter_altitude = ground_altitude + params.common_tether.natural_length;
-    let target_cad_altitude = -params.controller.disk_center_n[2];
-    let bridle_vertical_offset_b =
-        params.kites[0].bridle.radius + params.kites[0].bridle.pivot_b[2];
-    let bridle_altitude = target_cad_altitude - bridle_vertical_offset_b;
-    let upper_vertical = bridle_altitude - splitter_altitude;
-    params.controller.disk_radius = (params.kites[0].tether.natural_length
-        * params.kites[0].tether.natural_length
-        - upper_vertical * upper_vertical)
-        .max(1.0)
+fn apply_y2_controller_overrides<const NK: usize>(params: &mut Params<f64, NK>) {
+    params.controller.rabbit_distance =
+        env_tuning_value("MULTIKITE_Y2_RABBIT_DISTANCE_M", 90.0).max(1.0);
+    params.controller.phase_lag_to_radius =
+        env_tuning_value("MULTIKITE_Y2_PHASE_LAG_TO_RADIUS", -2.0);
+    params.controller.speed_ref = env_tuning_value(
+        "MULTIKITE_Y2_REF_SPEED_REF_MPS",
+        params.controller.speed_ref,
+    )
+    .clamp(5.0, 80.0);
+    apply_y2_geometry_overrides(params);
+}
+
+fn apply_y2_geometry_overrides<const NK: usize>(params: &mut Params<f64, NK>) {
+    let upper_length = y2_upper_initial_length(params);
+    let disk_radius = env_tuning_value("MULTIKITE_Y2_DISK_RADIUS_M", params.controller.disk_radius)
+        .clamp(1.0, upper_length * 0.98);
+    let upper_vertical = (upper_length * upper_length - disk_radius * disk_radius)
+        .max(0.0)
         .sqrt();
-    params.controller.rabbit_distance = 90.0;
-    params.controller.phase_lag_to_radius = -1.2;
+    let ground_altitude = params.kites[0].tether.contact.ground_altitude;
+    let target_payload_altitude = y2_target_payload_altitude_m();
+    let target_cad_altitude = ground_altitude
+        + target_payload_altitude
+        + params.common_tether.natural_length
+        + upper_vertical
+        + y2_cad_altitude_offset_from_bridle(params, disk_radius);
+
+    params.controller.disk_radius = disk_radius;
+    params.controller.disk_center_n[2] = -target_cad_altitude;
+}
+
+fn y2_initial_tension_n() -> f64 {
+    std::env::var("MULTIKITE_Y2_INITIAL_TENSION_N")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(Y2_INITIAL_TENSION_N)
+        .max(0.0)
+}
+
+fn env_tuning_value(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(default)
+}
+
+fn is_y2_preset(preset: Preset) -> bool {
+    matches!(preset, Preset::Y2Low | Preset::Y2 | Preset::Y2High)
+}
+
+fn y2_target_payload_altitude_m() -> f64 {
+    env_tuning_value(
+        "MULTIKITE_Y2_TARGET_PAYLOAD_ALTITUDE_M",
+        Y2_TARGET_PAYLOAD_ALTITUDE_M,
+    )
+    .max(0.0)
+}
+
+fn y2_high_payload_altitude_m() -> f64 {
+    env_tuning_value(
+        "MULTIKITE_Y2_HIGH_PAYLOAD_ALTITUDE_M",
+        y2_target_payload_altitude_m() + Y2_HIGH_PAYLOAD_ALTITUDE_OFFSET_M,
+    )
+    .max(y2_target_payload_altitude_m())
+}
+
+fn y2_launch_common_length_fraction() -> f64 {
+    env_tuning_value(
+        "MULTIKITE_Y2_LAUNCH_COMMON_LENGTH_FRACTION",
+        Y2_LAUNCH_COMMON_LENGTH_FRACTION,
+    )
+    .clamp(0.0, 1.0)
+}
+
+fn y2_coordinated_roll<const NK: usize>(params: &Params<f64, NK>, turn_radius: f64) -> f64 {
+    (params.controller.speed_ref * params.controller.speed_ref
+        / (params.environment.g * turn_radius.max(1.0)))
+    .atan()
+    .clamp(-35.0_f64.to_radians(), 35.0_f64.to_radians())
+}
+
+fn y2_cad_altitude_offset_from_bridle<const NK: usize>(
+    params: &Params<f64, NK>,
+    turn_radius: f64,
+) -> f64 {
+    let quat_n2b = roll_yaw_quaternion_n2b(
+        y2_coordinated_roll(params, turn_radius),
+        std::f64::consts::FRAC_PI_2,
+    );
+    let pivot_n = crate::math::rotate_body_to_nav(&quat_n2b, &params.kites[0].bridle.pivot_b);
+    params.kites[0].bridle.radius + pivot_n[2]
+}
+
+fn y2_upper_initial_length<const NK: usize>(params: &Params<f64, NK>) -> f64 {
+    params.kites[0].tether.natural_length
+        * (1.0 + y2_initial_tension_n() / params.kites[0].tether.ea)
 }
 
 fn apply_simulation_config_to_params<const NK: usize>(
@@ -177,8 +264,8 @@ fn apply_simulation_config_to_params<const NK: usize>(
             kite.bridle.radius = 0.0;
         }
     }
-    if matches!(preset, Preset::Y2Reference) {
-        apply_y2_reference_overrides(params);
+    if is_y2_preset(preset) {
+        apply_y2_controller_overrides(params);
     }
 }
 
@@ -272,7 +359,8 @@ pub fn star_configuration<const NK: usize, const N_COMMON: usize, const N_UPPER:
             -bridle_altitude,
         );
         let quat_n2b = yaw_quaternion_n2b(theta + std::f64::consts::FRAC_PI_2);
-        let body_vel_b = Vector3::new(BODY_SPEED_0_MPS, 0.0, 0.0);
+        let body_vel_b = Vector3::new(BODY_SPEED_0_MPS, 0.0, 0.0)
+            + rotate_nav_to_body(&quat_n2b, &params.environment.wind_n);
         let bridle_to_body_b =
             -(params.kites[index].bridle.pivot_b + params.kites[index].rigid_body.cad_offset_b);
         let body_pos_n = bridle_pos_n
@@ -301,67 +389,92 @@ pub fn star_configuration<const NK: usize, const N_COMMON: usize, const N_UPPER:
     }
 }
 
+pub fn y_low_configuration<const N_COMMON: usize, const N_UPPER: usize>(
+    params: &Params<f64, 2>,
+) -> State<f64, 2, N_COMMON, N_UPPER> {
+    y_payload_configuration(params, 0.0, y2_launch_common_length_fraction())
+}
+
 pub fn y_configuration<const N_COMMON: usize, const N_UPPER: usize>(
     params: &Params<f64, 2>,
 ) -> State<f64, 2, N_COMMON, N_UPPER> {
-    star_configuration(params)
+    y_payload_configuration(params, y2_target_payload_altitude_m(), 1.0)
 }
 
-pub fn y_reference_configuration<const N_COMMON: usize, const N_UPPER: usize>(
+pub fn y_high_configuration<const N_COMMON: usize, const N_UPPER: usize>(
     params: &Params<f64, 2>,
 ) -> State<f64, 2, N_COMMON, N_UPPER> {
+    y_payload_configuration(params, y2_high_payload_altitude_m(), 1.0)
+}
+
+fn y_payload_configuration<const N_COMMON: usize, const N_UPPER: usize>(
+    params: &Params<f64, 2>,
+    payload_altitude_above_ground: f64,
+    common_length_fraction: f64,
+) -> State<f64, 2, N_COMMON, N_UPPER> {
     let ground_altitude = params.kites[0].tether.contact.ground_altitude;
+    let payload_altitude = ground_altitude + payload_altitude_above_ground.max(0.0);
     let payload = TetherNode {
-        pos_n: Vector3::new(0.0, 0.0, -ground_altitude),
+        pos_n: Vector3::new(0.0, 0.0, -payload_altitude),
         vel_n: Vector3::zeros(),
     };
-    let splitter_altitude = ground_altitude + params.common_tether.natural_length;
+    let common_length =
+        params.common_tether.natural_length * common_length_fraction.clamp(0.0, 1.0);
+    let splitter_altitude = payload_altitude + common_length;
     let splitter = TetherNode {
         pos_n: Vector3::new(0.0, 0.0, -splitter_altitude),
         vel_n: Vector3::zeros(),
     };
 
-    let target_cad_z = params.controller.disk_center_n[2];
-    let target_cad_altitude = -target_cad_z;
-    let bridle_vertical_offset_b =
-        params.kites[0].bridle.radius + params.kites[0].bridle.pivot_b[2];
-    let bridle_altitude = target_cad_altitude - bridle_vertical_offset_b;
-    let upper_vertical = bridle_altitude - splitter_altitude;
-    let upper_length = params.kites[0].tether.natural_length;
-    let bridle_orbit_radius = (upper_length * upper_length - upper_vertical * upper_vertical)
+    let upper_length = y2_upper_initial_length(params);
+    let bridle_orbit_radius = params
+        .controller
+        .disk_radius
+        .clamp(1.0, upper_length * 0.98);
+    let upper_vertical = (upper_length * upper_length - bridle_orbit_radius * bridle_orbit_radius)
         .max(0.0)
         .sqrt();
+    let target_cad_altitude = -params.controller.disk_center_n[2]
+        + (payload_altitude_above_ground.max(0.0) - y2_target_payload_altitude_m())
+        + (common_length - params.common_tether.natural_length);
+    let mut bridle_altitude = splitter_altitude + upper_vertical;
+    let turn_radius = bridle_orbit_radius.max(1.0);
+    let speed_ref = params.controller.speed_ref;
+    let coordinated_roll = y2_coordinated_roll(params, turn_radius);
+    let omega_world_z = speed_ref / turn_radius;
+
+    for _ in 0..8 {
+        let kite: KiteState<f64, N_UPPER> = y2_kite_state_at_phase(
+            params,
+            &splitter,
+            0,
+            0.0,
+            bridle_orbit_radius,
+            bridle_altitude,
+            speed_ref,
+            omega_world_z,
+            coordinated_roll,
+        );
+        let altitude_error = target_cad_altitude - y2_kite_cad_altitude(&kite, &params.kites[0]);
+        bridle_altitude += altitude_error;
+        if altitude_error.abs() < 1.0e-10 {
+            break;
+        }
+    }
+
     let kites = from_fn(|index| {
         let theta = 2.0 * std::f64::consts::PI * index as f64 / 2.0;
-        let yaw = theta + std::f64::consts::FRAC_PI_2;
-        let quat_n2b = yaw_quaternion_n2b(yaw);
-        let apparent_air_n = rotate_body_to_nav(
-            &quat_n2b,
-            &Vector3::new(params.controller.speed_ref, 0.0, 0.0),
-        );
-        let body_velocity_n = params.environment.wind_n + apparent_air_n;
-        let body_vel_b = rotate_nav_to_body(&quat_n2b, &body_velocity_n);
-        let bridle_pos_n = Vector3::new(
-            params.controller.disk_center_n[0] + bridle_orbit_radius * theta.cos(),
-            params.controller.disk_center_n[1] + bridle_orbit_radius * theta.sin(),
-            -bridle_altitude,
-        );
-        let bridle_to_body_b =
-            -(params.kites[index].bridle.pivot_b + params.kites[index].rigid_body.cad_offset_b);
-        let body_pos_n = bridle_pos_n
-            + Vector3::new(0.0, 0.0, -params.kites[index].bridle.radius)
-            + crate::math::rotate_body_to_nav(&quat_n2b, &bridle_to_body_b);
-        let body = BodyState {
-            pos_n: body_pos_n,
-            vel_b: body_vel_b,
-            quat_n2b,
-            omega_b: Vector3::zeros(),
-        };
-        let top = TetherNode {
-            pos_n: bridle_pos_n,
-            vel_n: Vector3::zeros(),
-        };
-        kite_with_consistent_tether(body, &splitter, &params.kites[index], top, true)
+        y2_kite_state_at_phase(
+            params,
+            &splitter,
+            index,
+            theta,
+            bridle_orbit_radius,
+            bridle_altitude,
+            speed_ref,
+            omega_world_z,
+            coordinated_roll,
+        )
     });
 
     State {
@@ -373,6 +486,56 @@ pub fn y_reference_configuration<const N_COMMON: usize, const N_UPPER: usize>(
         total_dissipated_work: 0.0,
         mechanical_energy_reference: 0.0,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn y2_kite_state_at_phase<const N_UPPER: usize>(
+    params: &Params<f64, 2>,
+    splitter: &TetherNode<f64>,
+    index: usize,
+    theta: f64,
+    bridle_orbit_radius: f64,
+    bridle_altitude: f64,
+    speed_ref: f64,
+    omega_world_z: f64,
+    coordinated_roll: f64,
+) -> KiteState<f64, N_UPPER> {
+    let yaw = theta + std::f64::consts::FRAC_PI_2;
+    let quat_n2b = roll_yaw_quaternion_n2b(coordinated_roll, yaw);
+    let omega_b = rotate_nav_to_body(&quat_n2b, &Vector3::new(0.0, 0.0, omega_world_z));
+    let body_vel_b = Vector3::new(speed_ref, 0.0, 0.0)
+        + rotate_nav_to_body(&quat_n2b, &params.environment.wind_n)
+        - omega_b.cross(&params.kites[index].rigid_body.cad_offset_b);
+    let bridle_pos_n = Vector3::new(
+        params.controller.disk_center_n[0] + bridle_orbit_radius * theta.cos(),
+        params.controller.disk_center_n[1] + bridle_orbit_radius * theta.sin(),
+        -bridle_altitude,
+    );
+    let bridle_to_body_b =
+        -(params.kites[index].bridle.pivot_b + params.kites[index].rigid_body.cad_offset_b);
+    let body_pos_n = bridle_pos_n
+        + Vector3::new(0.0, 0.0, -params.kites[index].bridle.radius)
+        + crate::math::rotate_body_to_nav(&quat_n2b, &bridle_to_body_b);
+    let body = BodyState {
+        pos_n: body_pos_n,
+        vel_b: body_vel_b,
+        quat_n2b,
+        omega_b,
+    };
+    let top = TetherNode {
+        pos_n: bridle_pos_n,
+        vel_n: Vector3::zeros(),
+    };
+    kite_with_consistent_tether(body, splitter, &params.kites[index], top, true)
+}
+
+fn y2_kite_cad_altitude<const N_UPPER: usize>(
+    kite: &KiteState<f64, N_UPPER>,
+    params: &KiteParams<f64>,
+) -> f64 {
+    let cad_pos_n = kite.body.pos_n
+        + crate::math::rotate_body_to_nav(&kite.body.quat_n2b, &params.rigid_body.cad_offset_b);
+    -cad_pos_n[2] - params.tether.contact.ground_altitude
 }
 
 pub fn free_flight_configuration<const N_COMMON: usize, const N_UPPER: usize>(
@@ -780,16 +943,18 @@ fn simulate<
     let mut interval_dt = 0.0_f64;
 
     loop {
-        let (_, mut diagnostics) = rhs.eval(&state, &controls, &params)?;
+        let (_, diagnostics_for_controller) = rhs.eval(&state, &controls, &params)?;
         let (next_controls, trace) = controller_step(
             &mut controller_state,
             &state,
-            &diagnostics,
+            &diagnostics_for_controller,
             &params,
             config.dt_control,
             config.phase_mode,
+            config.longitudinal_mode,
             time,
         );
+        let (_, mut diagnostics) = rhs.eval(&state, &next_controls, &params)?;
         apply_trace(&mut diagnostics, &trace);
         let step_failure = detect_failure(&diagnostics, time);
         if iteration % config.sample_stride == 0 {
@@ -988,17 +1153,25 @@ pub fn available_presets() -> Vec<PresetInfo> {
             upper_nodes: UPPER_NODES,
         },
         PresetInfo {
-            preset: Preset::Y2,
-            name: "Y2",
-            description: "Two-kite Y preset tuned for milestone-one circle following.",
+            preset: Preset::Y2Low,
+            name: "Y2Low",
+            description: "Two-kite Y launch case: payload starts on ground with a near-slack common tether and kites below the 50 m payload target disk.",
             kites: 2,
             common_nodes: COMMON_NODES,
             upper_nodes: UPPER_NODES,
         },
         PresetInfo {
-            preset: Preset::Y2Reference,
-            name: "Y2Ref",
-            description: "Two-kite Y preset initialized at controller reference airspeed and altitude.",
+            preset: Preset::Y2,
+            name: "Y2",
+            description: "Two-kite Y case initialized exactly on the controller disk for a 50 m payload target.",
+            kites: 2,
+            common_nodes: COMMON_NODES,
+            upper_nodes: UPPER_NODES,
+        },
+        PresetInfo {
+            preset: Preset::Y2High,
+            name: "Y2High",
+            description: "Two-kite Y descent case: payload and kites start above the 50 m payload target disk.",
             kites: 2,
             common_nodes: COMMON_NODES,
             upper_nodes: UPPER_NODES,
@@ -1126,6 +1299,54 @@ pub fn simulate_star1_with_callbacks<
     )
 }
 
+pub fn simulate_y2_low(
+    init: &InitRequest,
+    config: &SimulationConfig,
+) -> Result<RunResult<2, COMMON_NODES, UPPER_NODES>> {
+    let mut progress_cb = |_| {};
+    let mut frame_cb = |_| {};
+    simulate::<2, COMMON_NODES, UPPER_NODES, _, _>(
+        init,
+        config,
+        y_low_configuration::<COMMON_NODES, UPPER_NODES>,
+        &mut progress_cb,
+        &mut frame_cb,
+    )
+}
+
+pub fn simulate_y2_low_with_progress<F: FnMut(SimulationProgress)>(
+    init: &InitRequest,
+    config: &SimulationConfig,
+    progress_cb: &mut F,
+) -> Result<RunResult<2, COMMON_NODES, UPPER_NODES>> {
+    let mut frame_cb = |_| {};
+    simulate::<2, COMMON_NODES, UPPER_NODES, _, _>(
+        init,
+        config,
+        y_low_configuration::<COMMON_NODES, UPPER_NODES>,
+        progress_cb,
+        &mut frame_cb,
+    )
+}
+
+pub fn simulate_y2_low_with_callbacks<
+    P: FnMut(SimulationProgress),
+    G: FnMut(SimulationFrame<f64, 2, COMMON_NODES, UPPER_NODES>),
+>(
+    init: &InitRequest,
+    config: &SimulationConfig,
+    progress_cb: &mut P,
+    frame_cb: &mut G,
+) -> Result<RunResult<2, COMMON_NODES, UPPER_NODES>> {
+    simulate::<2, COMMON_NODES, UPPER_NODES, _, _>(
+        init,
+        config,
+        y_low_configuration::<COMMON_NODES, UPPER_NODES>,
+        progress_cb,
+        frame_cb,
+    )
+}
+
 pub fn simulate_y2(
     init: &InitRequest,
     config: &SimulationConfig,
@@ -1174,7 +1395,7 @@ pub fn simulate_y2_with_callbacks<
     )
 }
 
-pub fn simulate_y2_reference(
+pub fn simulate_y2_high(
     init: &InitRequest,
     config: &SimulationConfig,
 ) -> Result<RunResult<2, COMMON_NODES, UPPER_NODES>> {
@@ -1183,13 +1404,13 @@ pub fn simulate_y2_reference(
     simulate::<2, COMMON_NODES, UPPER_NODES, _, _>(
         init,
         config,
-        y_reference_configuration::<COMMON_NODES, UPPER_NODES>,
+        y_high_configuration::<COMMON_NODES, UPPER_NODES>,
         &mut progress_cb,
         &mut frame_cb,
     )
 }
 
-pub fn simulate_y2_reference_with_progress<F: FnMut(SimulationProgress)>(
+pub fn simulate_y2_high_with_progress<F: FnMut(SimulationProgress)>(
     init: &InitRequest,
     config: &SimulationConfig,
     progress_cb: &mut F,
@@ -1198,13 +1419,13 @@ pub fn simulate_y2_reference_with_progress<F: FnMut(SimulationProgress)>(
     simulate::<2, COMMON_NODES, UPPER_NODES, _, _>(
         init,
         config,
-        y_reference_configuration::<COMMON_NODES, UPPER_NODES>,
+        y_high_configuration::<COMMON_NODES, UPPER_NODES>,
         progress_cb,
         &mut frame_cb,
     )
 }
 
-pub fn simulate_y2_reference_with_callbacks<
+pub fn simulate_y2_high_with_callbacks<
     P: FnMut(SimulationProgress),
     G: FnMut(SimulationFrame<f64, 2, COMMON_NODES, UPPER_NODES>),
 >(
@@ -1216,7 +1437,7 @@ pub fn simulate_y2_reference_with_callbacks<
     simulate::<2, COMMON_NODES, UPPER_NODES, _, _>(
         init,
         config,
-        y_reference_configuration::<COMMON_NODES, UPPER_NODES>,
+        y_high_configuration::<COMMON_NODES, UPPER_NODES>,
         progress_cb,
         frame_cb,
     )
@@ -1371,7 +1592,8 @@ mod tests {
     use crate::controller::{
         FreeFlightReference, controller_step, controller_step_with_free_flight_reference,
     };
-    use crate::types::PhaseMode;
+    use crate::model::evaluate_rhs;
+    use crate::types::{LongitudinalMode, PhaseMode};
 
     use super::*;
     use nalgebra::UnitQuaternion;
@@ -1421,21 +1643,87 @@ mod tests {
         }
     }
 
+    fn beta_after_euler_step(
+        mut state: State<f64, 1, FREE_COMMON_NODES, FREE_UPPER_NODES>,
+        mut controls: Controls<f64, 1>,
+        params: &Params<f64, 1>,
+        rudder: f64,
+    ) -> f64 {
+        controls.kites[0].surfaces.rudder = rudder;
+        let (xdot, _) = evaluate_rhs(&state, &controls, params);
+        let dt = 1.0e-3;
+        state.kites[0].body.pos_n += xdot.kites[0].body.pos_n * dt;
+        state.kites[0].body.vel_b += xdot.kites[0].body.vel_b * dt;
+        state.kites[0].body.quat_n2b.coords += xdot.kites[0].body.quat_n2b.coords * dt;
+        state.kites[0].body.omega_b += xdot.kites[0].body.omega_b * dt;
+        state.kites[0].rotor_speed += xdot.kites[0].rotor_speed * dt;
+        state.renormalize_attitudes();
+        let (_, diag) = evaluate_rhs(&state, &controls, params);
+        diag.kites[0].beta
+    }
+
     #[test]
-    fn y2_reference_initializes_on_controller_speed_and_altitude_refs() {
+    fn rudder_force_and_yaw_moment_have_opposite_beta_effects() {
         let init = InitRequest {
-            preset: Preset::Y2Reference,
+            preset: Preset::FreeFlight1,
+            payload_mass_kg: None,
+            wind_speed_mps: Some(0.0),
+        };
+        let params = base_params::<1>(&init).expect("free-flight params");
+        let mut state = free_flight_configuration::<FREE_COMMON_NODES, FREE_UPPER_NODES>(&params);
+        state.kites[0].body.vel_b = Vector3::new(25.0, 25.0 * 5.0_f64.to_radians().tan(), 0.0);
+        state.kites[0].body.omega_b = Vector3::zeros();
+        let controls = initial_controls(&params);
+        let (_, initial_diag) = evaluate_rhs(&state, &controls, &params);
+        let positive = beta_after_euler_step(
+            state.clone(),
+            controls.clone(),
+            &params,
+            10.0_f64.to_radians(),
+        );
+        let negative = beta_after_euler_step(
+            state.clone(),
+            controls.clone(),
+            &params,
+            -10.0_f64.to_radians(),
+        );
+        eprintln!(
+            "beta response: initial={:.6} deg positive_rudder={:.6} deg negative_rudder={:.6} deg",
+            initial_diag.kites[0].beta.to_degrees(),
+            positive.to_degrees(),
+            negative.to_degrees()
+        );
+        assert!(
+            negative < positive,
+            "negative rudder sideforce should reduce positive beta in one tiny free-flight step"
+        );
+
+        let mut positive_controls = controls.clone();
+        positive_controls.kites[0].surfaces.rudder = 10.0_f64.to_radians();
+        let (_, positive_diag) = evaluate_rhs(&state, &positive_controls, &params);
+        let mut negative_controls = controls;
+        negative_controls.kites[0].surfaces.rudder = -10.0_f64.to_radians();
+        let (_, negative_diag) = evaluate_rhs(&state, &negative_controls, &params);
+        assert!(
+            positive_diag.kites[0].rudder_moment_b[2] < negative_diag.kites[0].rudder_moment_b[2],
+            "positive rudder should create the negative body-yaw moment needed by the Y2 beta/yaw loop"
+        );
+    }
+
+    #[test]
+    fn y2_initializes_on_controller_speed_and_altitude_refs() {
+        let init = InitRequest {
+            preset: Preset::Y2,
             payload_mass_kg: None,
             wind_speed_mps: None,
         };
-        let params = base_params::<2>(&init).expect("Y2 reference params");
-        let state = y_reference_configuration::<COMMON_NODES, UPPER_NODES>(&params);
+        let params = base_params::<2>(&init).expect("Y2 params");
+        let state = y_configuration::<COMMON_NODES, UPPER_NODES>(&params);
         let controls = initial_controls(&params);
-        let rhs = CompiledRhs::<2, COMMON_NODES, UPPER_NODES>::shared()
-            .expect("compiled Y2 reference rhs");
+        let rhs = CompiledRhs::<2, COMMON_NODES, UPPER_NODES>::shared().expect("compiled Y2 rhs");
         let (_, mut diagnostics) = rhs
             .eval(&state, &controls, &params)
-            .expect("initial Y2 reference diagnostics");
+            .expect("initial Y2 diagnostics");
         let mut controller_state = ControllerState::<2>::new(&diagnostics);
         let (_, trace) = controller_step(
             &mut controller_state,
@@ -1444,6 +1732,7 @@ mod tests {
             &params,
             TEST_DT_CONTROL,
             PhaseMode::Adaptive,
+            LongitudinalMode::TotalEnergy,
             0.0,
         );
         apply_trace(&mut diagnostics, &trace);
@@ -1451,6 +1740,14 @@ mod tests {
         let expected_altitude =
             -params.controller.disk_center_n[2] - params.kites[0].tether.contact.ground_altitude;
         let expected_speed = params.controller.speed_ref;
+        let payload_altitude =
+            -state.payload.pos_n[2] - params.kites[0].tether.contact.ground_altitude;
+
+        assert!(
+            (payload_altitude - y2_target_payload_altitude_m()).abs() < 1.0e-9,
+            "Y2 payload altitude should be {:.3} m, got {payload_altitude:.9} m",
+            y2_target_payload_altitude_m(),
+        );
 
         for (index, kite_diag) in diagnostics.kites.iter().enumerate() {
             let altitude_error = (kite_diag.altitude - kite_diag.altitude_ref).abs();
@@ -1489,6 +1786,132 @@ mod tests {
                 kite_diag.beta.abs().to_degrees() < 1.0e-9,
                 "kite {index} expected zero initial beta, got {:.9} deg",
                 kite_diag.beta.to_degrees(),
+            );
+        }
+    }
+
+    #[test]
+    fn y2_initial_altitude_variants_position_payload_and_kites_relative_to_disk() {
+        let target_init = InitRequest {
+            preset: Preset::Y2,
+            payload_mass_kg: None,
+            wind_speed_mps: None,
+        };
+        let target_params = base_params::<2>(&target_init).expect("Y2 params");
+        let disk_altitude = -target_params.controller.disk_center_n[2]
+            - target_params.kites[0].tether.contact.ground_altitude;
+        assert!(
+            (disk_altitude - 297.0).abs() < 5.0,
+            "control disk should be raised for a 50 m payload target, got {disk_altitude:.3} m",
+        );
+
+        let launch_state = y_low_configuration::<COMMON_NODES, UPPER_NODES>(&target_params);
+        let reference_state = y_configuration::<COMMON_NODES, UPPER_NODES>(&target_params);
+        let high_state = y_high_configuration::<COMMON_NODES, UPPER_NODES>(&target_params);
+
+        let payload_altitude = |state: &State<f64, 2, COMMON_NODES, UPPER_NODES>| {
+            -state.payload.pos_n[2] - target_params.kites[0].tether.contact.ground_altitude
+        };
+        let kite_altitude = |state: &State<f64, 2, COMMON_NODES, UPPER_NODES>| {
+            let cad_pos_n = state.kites[0].body.pos_n
+                + crate::math::rotate_body_to_nav(
+                    &state.kites[0].body.quat_n2b,
+                    &target_params.kites[0].rigid_body.cad_offset_b,
+                );
+            -cad_pos_n[2] - target_params.kites[0].tether.contact.ground_altitude
+        };
+
+        assert!(
+            payload_altitude(&launch_state).abs() < 1.0e-9,
+            "launch preset payload should start on the ground"
+        );
+        assert!(
+            (payload_altitude(&reference_state) - y2_target_payload_altitude_m()).abs() < 1.0e-9,
+            "reference preset payload should start at the target altitude"
+        );
+        assert!(
+            payload_altitude(&high_state) > y2_target_payload_altitude_m(),
+            "high preset payload should start above the target altitude"
+        );
+        assert!(
+            kite_altitude(&launch_state) < disk_altitude - 10.0,
+            "launch kites should start below the control disk"
+        );
+        assert!(
+            (kite_altitude(&reference_state) - disk_altitude).abs() < 1.0e-9,
+            "reference kites should start on the control disk"
+        );
+        assert!(
+            kite_altitude(&high_state) > disk_altitude + 10.0,
+            "high kites should start above the control disk"
+        );
+    }
+
+    #[test]
+    fn y2_star_initialization_is_wind_aware() {
+        let init = InitRequest {
+            preset: Preset::Y2,
+            payload_mass_kg: None,
+            wind_speed_mps: Some(5.0),
+        };
+        let params = base_params::<2>(&init).expect("Y2 params");
+        let state = y_configuration::<COMMON_NODES, UPPER_NODES>(&params);
+        let controls = initial_controls(&params);
+        let rhs = CompiledRhs::<2, COMMON_NODES, UPPER_NODES>::shared().expect("compiled Y2 rhs");
+        let (_, diagnostics) = rhs
+            .eval(&state, &controls, &params)
+            .expect("initial Y2 diagnostics");
+
+        for (index, kite_diag) in diagnostics.kites.iter().enumerate() {
+            assert!(
+                kite_diag.alpha.abs().to_degrees() < 1.0e-9,
+                "kite {index} expected wind-aware zero initial alpha, got {:.9} deg",
+                kite_diag.alpha.to_degrees(),
+            );
+            assert!(
+                kite_diag.beta.abs().to_degrees() < 1.0e-9,
+                "kite {index} expected wind-aware zero initial beta, got {:.9} deg",
+                kite_diag.beta.to_degrees(),
+            );
+        }
+    }
+
+    #[test]
+    fn max_throttle_altitude_pitch_mode_commands_motor_limit_for_y2() {
+        let init = InitRequest {
+            preset: Preset::Y2,
+            payload_mass_kg: None,
+            wind_speed_mps: None,
+        };
+        let params = base_params::<2>(&init).expect("Y2 params");
+        let state = y_configuration::<COMMON_NODES, UPPER_NODES>(&params);
+        let controls = initial_controls(&params);
+        let rhs = CompiledRhs::<2, COMMON_NODES, UPPER_NODES>::shared().expect("compiled Y2 rhs");
+        let (_, diagnostics) = rhs
+            .eval(&state, &controls, &params)
+            .expect("initial Y2 diagnostics");
+        let mut controller_state = ControllerState::<2>::new(&diagnostics);
+
+        let (next_controls, trace) = controller_step(
+            &mut controller_state,
+            &state,
+            &diagnostics,
+            &params,
+            TEST_DT_CONTROL,
+            PhaseMode::Adaptive,
+            LongitudinalMode::MaxThrottleAltitudePitch,
+            0.0,
+        );
+
+        for (index, control) in next_controls.kites.iter().enumerate() {
+            assert!(
+                (control.motor_torque - 45.6).abs() < 1.0e-12,
+                "kite {index} did not command tethered motor limit: {}",
+                control.motor_torque
+            );
+            assert!(
+                trace.thrust_energy_integrators[index] >= 45.6 - 1.0e-12,
+                "kite {index} thrust integrator should reflect max-throttle command"
             );
         }
     }
@@ -1563,6 +1986,7 @@ mod tests {
                 &params,
                 config.dt_control,
                 config.phase_mode,
+                config.longitudinal_mode,
                 time,
                 reference,
             );
@@ -1685,6 +2109,7 @@ mod tests {
                 &params,
                 config.dt_control,
                 config.phase_mode,
+                config.longitudinal_mode,
                 time,
                 reference,
             );

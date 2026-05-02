@@ -9,13 +9,14 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use multikite_sim::{
-    COMMON_NODES, FREE_COMMON_NODES, FREE_UPPER_NODES, InitRequest, PhaseMode, Preset, RunSummary,
-    SimulationConfig, SimulationFrame, SimulationProgress, UPPER_NODES, available_presets,
-    simulate_free_flight1_with_callbacks, simulate_free_flight1_with_progress,
-    simulate_simple_tether_with_callbacks, simulate_simple_tether_with_progress,
-    simulate_star1_with_callbacks, simulate_star1_with_progress, simulate_star3_with_callbacks,
-    simulate_star3_with_progress, simulate_star4_with_callbacks, simulate_star4_with_progress,
-    simulate_y2_reference_with_callbacks, simulate_y2_reference_with_progress,
+    COMMON_NODES, FREE_COMMON_NODES, FREE_UPPER_NODES, InitRequest, LongitudinalMode, PhaseMode,
+    Preset, RunSummary, SimulationConfig, SimulationFrame, SimulationProgress, UPPER_NODES,
+    available_presets, build_aero_analysis, simulate_free_flight1_with_callbacks,
+    simulate_free_flight1_with_progress, simulate_simple_tether_with_callbacks,
+    simulate_simple_tether_with_progress, simulate_star1_with_callbacks,
+    simulate_star1_with_progress, simulate_star3_with_callbacks, simulate_star3_with_progress,
+    simulate_star4_with_callbacks, simulate_star4_with_progress, simulate_y2_high_with_callbacks,
+    simulate_y2_high_with_progress, simulate_y2_low_with_callbacks, simulate_y2_low_with_progress,
     simulate_y2_with_callbacks, simulate_y2_with_progress,
 };
 use nalgebra::UnitQuaternion;
@@ -29,6 +30,8 @@ const TEXT_CSS_UTF8: &str = "text/css; charset=utf-8";
 const IMAGE_SVG_XML: &str = "image/svg+xml";
 const APPLICATION_NDJSON_UTF8: &str = "application/x-ndjson; charset=utf-8";
 const GENERATED_APP_JS: &str = include_str!(concat!(env!("OUT_DIR"), "/app.js"));
+const GENERATED_AERO_ANALYSIS_JS: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/aero_analysis.js"));
 static LAST_SUMMARY: OnceLock<Mutex<Option<RunSummary>>> = OnceLock::new();
 
 #[derive(Debug, Parser)]
@@ -46,6 +49,8 @@ struct RunRequest {
     preset: Preset,
     duration: f64,
     phase_mode: PhaseMode,
+    #[serde(default)]
+    longitudinal_mode: LongitudinalMode,
     payload_mass_kg: Option<f64>,
     wind_speed_mps: Option<f64>,
     sample_stride: Option<usize>,
@@ -88,6 +93,7 @@ struct ApiFrame {
     kite_positions_n: Vec<[f64; 3]>,
     kite_quaternions_n2b: Vec<[f64; 4]>,
     kite_attitudes_rpy_deg: Vec<[f64; 3]>,
+    kite_control_roll_pitch_deg: Vec<[f64; 2]>,
     rabbit_targets_n: Vec<[f64; 3]>,
     phase_error: Vec<f64>,
     speed_target: Vec<f64>,
@@ -105,6 +111,7 @@ struct ApiFrame {
     pitch_energy_integrator: Vec<f64>,
     inertial_speed: Vec<f64>,
     airspeed: Vec<f64>,
+    rotor_speed: Vec<f64>,
     alpha_deg: Vec<f64>,
     beta_deg: Vec<f64>,
     body_omega_b: Vec<[f64; 3]>,
@@ -132,6 +139,8 @@ struct ApiFrame {
     motor_force_b: Vec<[f64; 3]>,
     total_moment_b: Vec<[f64; 3]>,
     aero_moment_b: Vec<[f64; 3]>,
+    rudder_force_b: Vec<[f64; 3]>,
+    rudder_moment_b: Vec<[f64; 3]>,
     tether_moment_b: Vec<[f64; 3]>,
     motor_moment_b: Vec<[f64; 3]>,
     cl_total: Vec<f64>,
@@ -199,13 +208,16 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/", get(index))
+        .route("/aero_analysis", get(aero_analysis_page))
         .route("/app.js", get(app_js))
+        .route("/aero_analysis.js", get(aero_analysis_js))
         .route("/styles.css", get(styles_css))
         .route("/favicon.svg", get(favicon))
         .route("/favicon.ico", get(favicon))
         .route("/api/presets", get(presets))
         .route("/api/run", post(run))
         .route("/api/run_stream", post(run_stream))
+        .route("/api/aero_analysis", get(aero_analysis))
         .route("/api/last_summary", get(last_summary))
         .route("/healthz", get(healthz));
 
@@ -224,8 +236,16 @@ async fn index() -> impl IntoResponse {
     static_text_response(TEXT_HTML_UTF8, include_str!("../static/index.html"))
 }
 
+async fn aero_analysis_page() -> impl IntoResponse {
+    static_text_response(TEXT_HTML_UTF8, include_str!("../static/aero_analysis.html"))
+}
+
 async fn app_js() -> impl IntoResponse {
     static_text_response(TEXT_JAVASCRIPT_UTF8, GENERATED_APP_JS)
+}
+
+async fn aero_analysis_js() -> impl IntoResponse {
+    static_text_response(TEXT_JAVASCRIPT_UTF8, GENERATED_AERO_ANALYSIS_JS)
 }
 
 async fn styles_css() -> impl IntoResponse {
@@ -242,6 +262,12 @@ async fn presets() -> Json<Vec<multikite_sim::PresetInfo>> {
 
 async fn healthz() -> StatusCode {
     StatusCode::NO_CONTENT
+}
+
+async fn aero_analysis() -> Result<Json<multikite_sim::AeroAnalysis>, (StatusCode, String)> {
+    build_aero_analysis()
+        .map(Json)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
 }
 
 async fn last_summary() -> Json<Option<RunSummary>> {
@@ -264,6 +290,7 @@ fn config_from_request(request: &RunRequest) -> (InitRequest, SimulationConfig) 
         SimulationConfig {
             duration: request.duration,
             phase_mode: request.phase_mode,
+            longitudinal_mode: request.longitudinal_mode,
             sample_stride: request.sample_stride.unwrap_or(1).max(1),
             sim_noise_enabled: request.sim_noise_enabled,
             bridle_enabled: request.bridle_enabled,
@@ -356,6 +383,12 @@ fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
             .kites
             .iter()
             .map(|kite| quaternion_to_rpy_deg(kite.body.quat_n2b))
+            .collect(),
+        kite_control_roll_pitch_deg: frame
+            .state
+            .kites
+            .iter()
+            .map(|kite| control_roll_pitch_deg(kite.body.quat_n2b))
             .collect(),
         rabbit_targets_n: frame
             .diagnostics
@@ -458,6 +491,12 @@ fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
             .kites
             .iter()
             .map(|diag| diag.airspeed)
+            .collect(),
+        rotor_speed: frame
+            .state
+            .kites
+            .iter()
+            .map(|kite| kite.rotor_speed)
             .collect(),
         alpha_deg: frame
             .diagnostics
@@ -620,6 +659,18 @@ fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
             .kites
             .iter()
             .map(|diag| vec3(diag.aero_moment_b))
+            .collect(),
+        rudder_force_b: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| vec3(diag.rudder_force_b))
+            .collect(),
+        rudder_moment_b: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| vec3(diag.rudder_moment_b))
             .collect(),
         tether_moment_b: frame
             .diagnostics
@@ -858,6 +909,14 @@ fn quaternion_to_rpy_deg(quat_n2b: nalgebra::Quaternion<f64>) -> [f64; 3] {
     [roll.to_degrees(), pitch.to_degrees(), yaw.to_degrees()]
 }
 
+fn control_roll_pitch_deg(quat_n2b: nalgebra::Quaternion<f64>) -> [f64; 2] {
+    let down_b =
+        UnitQuaternion::from_quaternion(quat_n2b).transform_vector(&nalgebra::Vector3::z());
+    let roll = down_b[1].atan2(down_b[2]);
+    let pitch = (-down_b[0]).atan2((down_b[1] * down_b[1] + down_b[2] * down_b[2]).sqrt());
+    [roll.to_degrees(), pitch.to_degrees()]
+}
+
 fn run_preset(request: &RunRequest) -> Result<ApiRunResponse> {
     let mut progress_cb = |_| {};
     run_preset_with_progress(request, &mut progress_cb)
@@ -889,6 +948,16 @@ fn run_preset_with_progress<F: FnMut(SimulationProgress)>(
                     .collect(),
             )
         }
+        Preset::Y2Low => {
+            let run = simulate_y2_low_with_progress(&init, &config, progress_cb)?;
+            (
+                run.summary,
+                run.frames
+                    .into_iter()
+                    .map(|frame| to_api_frame(&frame))
+                    .collect(),
+            )
+        }
         Preset::Y2 => {
             let run = simulate_y2_with_progress(&init, &config, progress_cb)?;
             (
@@ -899,8 +968,8 @@ fn run_preset_with_progress<F: FnMut(SimulationProgress)>(
                     .collect(),
             )
         }
-        Preset::Y2Reference => {
-            let run = simulate_y2_reference_with_progress(&init, &config, progress_cb)?;
+        Preset::Y2High => {
+            let run = simulate_y2_high_with_progress(&init, &config, progress_cb)?;
             (
                 run.summary,
                 run.frames
@@ -986,11 +1055,11 @@ async fn run_stream(
             };
             let result = run_preset_streaming(&request_for_run, &mut progress_cb, &mut frame_cb);
             drop(frame_cb);
-            result.map(|summary| (summary, plot_buffer))
+            (result, plot_buffer)
         })
         .await;
         match outcome {
-            Ok(Ok((summary, plot_frames))) => {
+            Ok((Ok(summary), plot_frames)) => {
                 let _ = send_stream_event(
                     &sender,
                     StreamEvent::Log {
@@ -1024,11 +1093,28 @@ async fn run_stream(
                 )
                 .await;
             }
-            Ok(Err(error)) => {
+            Ok((Err(error), plot_frames)) => {
                 let _ = send_stream_event(
                     &sender,
                     StreamEvent::Log {
                         message: format!("run failed: {error}"),
+                    },
+                )
+                .await;
+                let _ = send_stream_event(
+                    &sender,
+                    StreamEvent::Log {
+                        message: format!(
+                            "sending final plot buffer after failure: {} samples",
+                            plot_frames.len()
+                        ),
+                    },
+                )
+                .await;
+                let _ = send_stream_event(
+                    &sender,
+                    StreamEvent::Plots {
+                        frames: plot_frames,
                     },
                 )
                 .await;
@@ -1094,18 +1180,23 @@ fn run_preset_streaming<P: FnMut(SimulationProgress), G: FnMut(ApiFrame)>(
             };
             simulate_star1_with_callbacks(&init, &config, progress_cb, &mut send_frame)?.summary
         }
+        Preset::Y2Low => {
+            let mut send_frame = |frame: SimulationFrame<f64, 2, COMMON_NODES, UPPER_NODES>| {
+                frame_cb(to_api_frame(&frame));
+            };
+            simulate_y2_low_with_callbacks(&init, &config, progress_cb, &mut send_frame)?.summary
+        }
         Preset::Y2 => {
             let mut send_frame = |frame: SimulationFrame<f64, 2, COMMON_NODES, UPPER_NODES>| {
                 frame_cb(to_api_frame(&frame));
             };
             simulate_y2_with_callbacks(&init, &config, progress_cb, &mut send_frame)?.summary
         }
-        Preset::Y2Reference => {
+        Preset::Y2High => {
             let mut send_frame = |frame: SimulationFrame<f64, 2, COMMON_NODES, UPPER_NODES>| {
                 frame_cb(to_api_frame(&frame));
             };
-            simulate_y2_reference_with_callbacks(&init, &config, progress_cb, &mut send_frame)?
-                .summary
+            simulate_y2_high_with_callbacks(&init, &config, progress_cb, &mut send_frame)?.summary
         }
         Preset::Star3 => {
             let mut send_frame = |frame: SimulationFrame<f64, 3, COMMON_NODES, UPPER_NODES>| {

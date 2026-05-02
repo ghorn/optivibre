@@ -160,8 +160,8 @@ pub fn quaternion_multiply<T: Scalar>(lhs: &Quaternion<T>, rhs: &Quaternion<T>) 
 pub fn rotate_nav_to_body<T: Scalar>(quat_n2b: &Quaternion<T>, value_n: &Vector3<T>) -> Vector3<T> {
     let pure = Quaternion::new(T::zero(), value_n[0], value_n[1], value_n[2]);
     let rotated = quaternion_multiply(
-        quat_n2b,
-        &quaternion_multiply(&pure, &quaternion_conjugate(quat_n2b)),
+        &quaternion_conjugate(quat_n2b),
+        &quaternion_multiply(&pure, quat_n2b),
     );
     Vector3::new(rotated.coords[0], rotated.coords[1], rotated.coords[2])
 }
@@ -169,8 +169,8 @@ pub fn rotate_nav_to_body<T: Scalar>(quat_n2b: &Quaternion<T>, value_n: &Vector3
 pub fn rotate_body_to_nav<T: Scalar>(quat_n2b: &Quaternion<T>, value_b: &Vector3<T>) -> Vector3<T> {
     let pure = Quaternion::new(T::zero(), value_b[0], value_b[1], value_b[2]);
     let rotated = quaternion_multiply(
-        &quaternion_conjugate(quat_n2b),
-        &quaternion_multiply(&pure, quat_n2b),
+        quat_n2b,
+        &quaternion_multiply(&pure, &quaternion_conjugate(quat_n2b)),
     );
     Vector3::new(rotated.coords[0], rotated.coords[1], rotated.coords[2])
 }
@@ -225,6 +225,111 @@ pub fn yaw_quaternion_n2b(yaw: f64) -> Quaternion<f64> {
     *UnitQuaternion::from_euler_angles(0.0, 0.0, yaw).quaternion()
 }
 
+pub fn roll_yaw_quaternion_n2b(roll: f64, yaw: f64) -> Quaternion<f64> {
+    *UnitQuaternion::from_euler_angles(roll, 0.0, yaw).quaternion()
+}
+
 pub fn zero_if_nan(value: f64) -> f64 {
     if value.is_nan() { 0.0 } else { value }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn normalized(quat: Quaternion<f64>) -> Quaternion<f64> {
+        let norm = (quat.coords[3] * quat.coords[3]
+            + quat.coords[0] * quat.coords[0]
+            + quat.coords[1] * quat.coords[1]
+            + quat.coords[2] * quat.coords[2])
+            .sqrt();
+        Quaternion::new(
+            quat.coords[3] / norm,
+            quat.coords[0] / norm,
+            quat.coords[1] / norm,
+            quat.coords[2] / norm,
+        )
+    }
+
+    fn integrate_once(quat: Quaternion<f64>, omega_b: Vector3<f64>, dt: f64) -> Quaternion<f64> {
+        let qdot = ddt_quat_n2b(&quat, &omega_b);
+        normalized(Quaternion::new(
+            quat.coords[3] + qdot.coords[3] * dt,
+            quat.coords[0] + qdot.coords[0] * dt,
+            quat.coords[1] + qdot.coords[1] * dt,
+            quat.coords[2] + qdot.coords[2] * dt,
+        ))
+    }
+
+    fn roll_pitch_from_quat(quat_n2b: &Quaternion<f64>) -> (f64, f64) {
+        let down_b = rotate_nav_to_body(quat_n2b, &Vector3::new(0.0, 0.0, 1.0));
+        let roll = down_b[1].atan2(down_b[2]);
+        let pitch = (-down_b[0]).atan2((down_b[1] * down_b[1] + down_b[2] * down_b[2]).sqrt());
+        (roll, pitch)
+    }
+
+    #[test]
+    fn body_x_rate_changes_roll_independently_of_yaw() {
+        let dt = 0.02;
+        let omega_b = Vector3::new(1.0, 0.0, 0.0);
+        for yaw in [
+            -std::f64::consts::FRAC_PI_2,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+        ] {
+            let quat = yaw_quaternion_n2b(yaw);
+            let next = integrate_once(quat, omega_b, dt);
+            let (roll, pitch) = roll_pitch_from_quat(&next);
+            assert!(
+                (roll - dt).abs() < 1.0e-4,
+                "yaw={yaw}: roll={roll}, expected {dt}"
+            );
+            assert!(
+                pitch.abs() < 1.0e-4,
+                "yaw={yaw}: body-x rate leaked into pitch={pitch}"
+            );
+        }
+    }
+
+    #[test]
+    fn body_y_rate_changes_pitch_independently_of_yaw() {
+        let dt = 0.02;
+        let omega_b = Vector3::new(0.0, 1.0, 0.0);
+        for yaw in [
+            -std::f64::consts::FRAC_PI_2,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+        ] {
+            let quat = yaw_quaternion_n2b(yaw);
+            let next = integrate_once(quat, omega_b, dt);
+            let (roll, pitch) = roll_pitch_from_quat(&next);
+            assert!(
+                roll.abs() < 1.0e-4,
+                "yaw={yaw}: body-y rate leaked into roll={roll}"
+            );
+            assert!(
+                (pitch - dt).abs() < 1.0e-4,
+                "yaw={yaw}: pitch={pitch}, expected {}",
+                dt
+            );
+        }
+    }
+
+    #[test]
+    fn roll_yaw_quaternion_preserves_bank_across_heading() {
+        let expected_roll = 30.0_f64.to_radians();
+        for yaw in [
+            -std::f64::consts::FRAC_PI_2,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+        ] {
+            let quat = roll_yaw_quaternion_n2b(expected_roll, yaw);
+            let (roll, pitch) = roll_pitch_from_quat(&quat);
+            assert!(
+                (roll - expected_roll).abs() < 1.0e-12,
+                "yaw={yaw}: roll={roll}, expected {expected_roll}"
+            );
+            assert!(pitch.abs() < 1.0e-12, "yaw={yaw}: pitch={pitch}");
+        }
+    }
 }

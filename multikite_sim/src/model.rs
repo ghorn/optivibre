@@ -41,15 +41,23 @@ struct TetherOutputs<T, const N: usize> {
 }
 
 #[derive(Clone, Debug)]
-struct AeroCoeffEval<T> {
-    total_force_w: Vector3<T>,
-    nominal_force_w: Vector3<T>,
-    pqr_force_w: Vector3<T>,
-    surface_force_w: Vector3<T>,
-    total_moment_c: Vector3<T>,
-    nominal_moment_c: Vector3<T>,
-    pqr_moment_c: Vector3<T>,
-    surface_moment_c: Vector3<T>,
+pub(crate) struct AeroCoeffEval<T> {
+    pub(crate) total_force_w: Vector3<T>,
+    pub(crate) nominal_force_w: Vector3<T>,
+    pub(crate) pqr_force_w: Vector3<T>,
+    pub(crate) surface_force_w: Vector3<T>,
+    pub(crate) flap_force_w: Vector3<T>,
+    pub(crate) elevator_force_w: Vector3<T>,
+    pub(crate) rudder_force_w: Vector3<T>,
+    pub(crate) total_moment_c: Vector3<T>,
+    pub(crate) nominal_moment_c: Vector3<T>,
+    pub(crate) pqr_moment_c: Vector3<T>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) surface_moment_c: Vector3<T>,
+    pub(crate) aileron_moment_c: Vector3<T>,
+    pub(crate) flap_moment_c: Vector3<T>,
+    pub(crate) elevator_moment_c: Vector3<T>,
+    pub(crate) rudder_moment_c: Vector3<T>,
 }
 
 fn zero_vec<T: Scalar>() -> Vector3<T> {
@@ -111,6 +119,8 @@ fn blank_kite_diag<T: Scalar>() -> KiteDiagnostics<T> {
         motor_force_b: zero_vec(),
         total_moment_b: zero_vec(),
         aero_moment_b: zero_vec(),
+        rudder_force_b: zero_vec(),
+        rudder_moment_b: zero_vec(),
         tether_moment_b: zero_vec(),
         motor_moment_b: zero_vec(),
         cl_total: T::zero(),
@@ -550,7 +560,7 @@ fn eval_flap_polynomial<T: Scalar>(coeff: &FlapPolynomialExport, alpha: T, beta:
         + T::from_f64(coeff.fpA0B3D1) * b3 * delta
 }
 
-fn eval_force_moment_quartic<T: Scalar>(
+pub(crate) fn eval_force_moment_quartic<T: Scalar>(
     coeffs: &ForceMomentQuartic2Export,
     alpha: T,
     beta: T,
@@ -569,7 +579,7 @@ fn eval_force_moment_quartic<T: Scalar>(
     )
 }
 
-fn eval_force_moment_flap<T: Scalar>(
+pub(crate) fn eval_force_moment_flap<T: Scalar>(
     coeffs: &ForceMomentFlapPolynomialExport,
     alpha: T,
     beta: T,
@@ -589,7 +599,7 @@ fn eval_force_moment_flap<T: Scalar>(
     )
 }
 
-fn eval_aero_coeffs<T: Scalar>(
+pub(crate) fn eval_aero_coeffs<T: Scalar>(
     alpha: T,
     beta: T,
     omega_b: &Vector3<T>,
@@ -613,30 +623,41 @@ fn eval_aero_coeffs<T: Scalar>(
         pqr_moment_c = add(&pqr_moment_c, &scale(&moment_c, rate_hat[index]));
     }
 
-    let surface_inputs = [
-        (&fit.flaps.r_aileron, control.surfaces.aileron),
-        (&fit.flaps.flap, control.surfaces.flap),
-        (&fit.flaps.winglet, control.surfaces.winglet),
-        (&fit.flaps.elevator, control.surfaces.elevator),
-        (&fit.flaps.rudder, control.surfaces.rudder),
-    ];
-    let mut surface_force_w = zero_vec();
-    let mut surface_moment_c = zero_vec();
-    for (surface_coeffs, delta) in surface_inputs {
-        let (force_w, moment_c) = eval_force_moment_flap(surface_coeffs, alpha, beta, delta);
-        surface_force_w = add(&surface_force_w, &force_w);
-        surface_moment_c = add(&surface_moment_c, &moment_c);
-    }
+    let (aileron_force_w, aileron_moment_c) =
+        eval_force_moment_flap(&fit.flaps.r_aileron, alpha, beta, control.surfaces.aileron);
+    let (flap_force_w, flap_moment_c) =
+        eval_force_moment_flap(&fit.flaps.flap, alpha, beta, control.surfaces.flap);
+    let (winglet_force_w, winglet_moment_c) =
+        eval_force_moment_flap(&fit.flaps.winglet, alpha, beta, control.surfaces.winglet);
+    let (elevator_force_w, elevator_moment_c) =
+        eval_force_moment_flap(&fit.flaps.elevator, alpha, beta, control.surfaces.elevator);
+    let (rudder_force_w, rudder_moment_c) =
+        eval_force_moment_flap(&fit.flaps.rudder, alpha, beta, control.surfaces.rudder);
+    let surface_force_w = add(
+        &add(&add(&aileron_force_w, &flap_force_w), &winglet_force_w),
+        &add(&elevator_force_w, &rudder_force_w),
+    );
+    let surface_moment_c = add(
+        &add(&add(&aileron_moment_c, &flap_moment_c), &winglet_moment_c),
+        &add(&elevator_moment_c, &rudder_moment_c),
+    );
 
     AeroCoeffEval {
         total_force_w: add(&add(&nominal_force_w, &pqr_force_w), &surface_force_w),
         nominal_force_w,
         pqr_force_w,
         surface_force_w,
+        flap_force_w,
+        elevator_force_w,
+        rudder_force_w,
         total_moment_c: add(&add(&nominal_moment_c, &pqr_moment_c), &surface_moment_c),
         nominal_moment_c,
         pqr_moment_c,
         surface_moment_c,
+        aileron_moment_c,
+        flap_moment_c,
+        elevator_moment_c,
+        rudder_moment_c,
     }
 }
 
@@ -730,6 +751,22 @@ fn compute_kite<T: Scalar, const N_UPPER: usize>(
         &aero_moment_coeff_b,
         &cross(&params.rigid_body.cad_offset_b, &aero_force_b),
     );
+    let rudder_force_drag_b = scale(&wind_x_b, force_scale * aero_coeffs.rudder_force_w[0]);
+    let rudder_force_side_b = scale(&wind_y_b, force_scale * aero_coeffs.rudder_force_w[1]);
+    let rudder_force_lift_b = scale(&wind_z_b, force_scale * aero_coeffs.rudder_force_w[2]);
+    let rudder_force_b = add(
+        &add(&rudder_force_drag_b, &rudder_force_side_b),
+        &rudder_force_lift_b,
+    );
+    let rudder_moment_coeff_b = Vector3::new(
+        moment_scale * params.aero.ref_span * aero_coeffs.rudder_moment_c[0],
+        moment_scale * params.aero.ref_chord * aero_coeffs.rudder_moment_c[1],
+        moment_scale * params.aero.ref_span * aero_coeffs.rudder_moment_c[2],
+    );
+    let rudder_moment_b = add(
+        &rudder_moment_coeff_b,
+        &cross(&params.rigid_body.cad_offset_b, &rudder_force_b),
+    );
 
     let rotor_fit = reference_rotor_fit_ref();
     let rotor_aero_thrust = eval_quartic2(&rotor_fit.aero_thrust, airspeed, kite.rotor_speed);
@@ -806,31 +843,31 @@ fn compute_kite<T: Scalar, const N_UPPER: usize>(
     let cl = -aero_coeffs.total_force_w[2];
     let cl_0_term = -aero_coeffs.nominal_force_w[2];
     let cl_alpha_term = -aero_coeffs.pqr_force_w[2];
-    let cl_elevator_term = -aero_coeffs.surface_force_w[2];
-    let cl_flap_term = T::zero();
+    let cl_elevator_term = -aero_coeffs.elevator_force_w[2];
+    let cl_flap_term = -aero_coeffs.flap_force_w[2];
     let cd = -aero_coeffs.total_force_w[0];
     let cd_0_term = -aero_coeffs.nominal_force_w[0];
     let cd_induced_term = -aero_coeffs.pqr_force_w[0];
     let cd_surface_term = -aero_coeffs.surface_force_w[0];
     let cy = aero_coeffs.total_force_w[1];
     let cy_beta_term = aero_coeffs.nominal_force_w[1] + aero_coeffs.pqr_force_w[1];
-    let cy_rudder_term = aero_coeffs.surface_force_w[1];
+    let cy_rudder_term = aero_coeffs.rudder_force_w[1];
     let roll_coeff = aero_coeffs.total_moment_c[0];
     let roll_beta_term = aero_coeffs.nominal_moment_c[0];
     let roll_p_term = aero_coeffs.pqr_moment_c[0];
     let roll_r_term = T::zero();
-    let roll_aileron_term = aero_coeffs.surface_moment_c[0];
+    let roll_aileron_term = aero_coeffs.aileron_moment_c[0];
     let pitch_coeff = aero_coeffs.total_moment_c[1];
     let pitch_0_term = aero_coeffs.nominal_moment_c[1];
     let pitch_alpha_term = T::zero();
     let pitch_q_term = aero_coeffs.pqr_moment_c[1];
-    let pitch_elevator_term = aero_coeffs.surface_moment_c[1];
-    let pitch_flap_term = T::zero();
+    let pitch_elevator_term = aero_coeffs.elevator_moment_c[1];
+    let pitch_flap_term = aero_coeffs.flap_moment_c[1];
     let yaw_coeff = aero_coeffs.total_moment_c[2];
     let yaw_beta_term = aero_coeffs.nominal_moment_c[2];
     let yaw_p_term = T::zero();
     let yaw_r_term = aero_coeffs.pqr_moment_c[2];
-    let yaw_rudder_term = aero_coeffs.surface_moment_c[2];
+    let yaw_rudder_term = aero_coeffs.rudder_moment_c[2];
 
     (
         KiteState {
@@ -892,6 +929,8 @@ fn compute_kite<T: Scalar, const N_UPPER: usize>(
             motor_force_b,
             total_moment_b,
             aero_moment_b,
+            rudder_force_b,
+            rudder_moment_b,
             tether_moment_b,
             motor_moment_b,
             cl_total: cl,
@@ -1482,8 +1521,8 @@ mod tests {
     fn e189_aero_fit_evaluation_matches_haskell_coeff_model() {
         // Source: reference_source@e18990d54
         // kittybutt/core/src/Kitty/Models/Aero/AeroCoeffs.hs:evalAeroCoeffs.
-        // This pins nominal quartic, p/q/r rate scaling, and direct surface
-        // polynomial summation for the vendored Reference AVL fit.
+        // This pins nominal quartic, p/q/r rate scaling, aggregate surface
+        // summation, and the per-surface splits used by diagnostics.
         let params = aero_parity_params();
         let control = KiteControls {
             surfaces: ControlSurfaces {
@@ -1533,6 +1572,33 @@ mod tests {
             1.0e-12,
         );
         assert_vec_close(
+            &coeffs.flap_force_w,
+            [
+                0.009803146761700209,
+                0.00015881348465058193,
+                0.03730943316365801,
+            ],
+            1.0e-12,
+        );
+        assert_vec_close(
+            &coeffs.elevator_force_w,
+            [
+                -0.0018733564206260703,
+                -6.354876054636381e-6,
+                -0.018321160956645748,
+            ],
+            1.0e-12,
+        );
+        assert_vec_close(
+            &coeffs.rudder_force_w,
+            [
+                0.00041311973763257924,
+                -0.010825510334254697,
+                2.6717696483084183e-5,
+            ],
+            1.0e-12,
+        );
+        assert_vec_close(
             &coeffs.total_force_w,
             [
                 -0.08158785517453948,
@@ -1569,6 +1635,42 @@ mod tests {
             1.0e-12,
         );
         assert_vec_close(
+            &coeffs.aileron_moment_c,
+            [
+                -0.020143374019398273,
+                -0.0003035529863966932,
+                0.0019165416926397825,
+            ],
+            1.0e-12,
+        );
+        assert_vec_close(
+            &coeffs.flap_moment_c,
+            [
+                -0.0002176564403476591,
+                0.0020776286146961475,
+                7.204018740408567e-6,
+            ],
+            1.0e-12,
+        );
+        assert_vec_close(
+            &coeffs.elevator_moment_c,
+            [
+                8.122636829600011e-5,
+                -0.05744796764287078,
+                -4.9033225661846796e-5,
+            ],
+            1.0e-12,
+        );
+        assert_vec_close(
+            &coeffs.rudder_moment_c,
+            [
+                -0.0009126614271370463,
+                0.00018878736881950705,
+                0.005939644448536757,
+            ],
+            1.0e-12,
+        );
+        assert_vec_close(
             &coeffs.total_moment_c,
             [
                 -0.028141189540219186,
@@ -1588,7 +1690,7 @@ mod tests {
         //
         // This is the full non-rotor aero plant path used by compute_kite:
         // CAD apparent wind -> alpha/beta -> AVL fit coefficients -> wind-axis
-        // force rotation -> qbar/Sref scaling -> reference-length moment scaling
+        // force rotation -> qbar*Sref scaling -> reference-length moment scaling
         // -> body-origin moment shift from the CAD offset. Strip/crossfade and
         // blown lift are intentionally out of scope for this milestone path.
         let kite_params = aero_parity_params();

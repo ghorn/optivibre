@@ -11,11 +11,25 @@ pub enum PhaseMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum LongitudinalMode {
+    TotalEnergy,
+    MaxThrottleAltitudePitch,
+}
+
+impl Default for LongitudinalMode {
+    fn default() -> Self {
+        Self::TotalEnergy
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Preset {
     FreeFlight1,
     Star1,
+    Y2Low,
     Y2,
-    Y2Reference,
+    Y2High,
     Star3,
     Star4,
     SimpleTether,
@@ -32,6 +46,7 @@ pub struct SimulationConfig {
     pub sample_stride: usize,
     pub sim_noise_enabled: bool,
     pub bridle_enabled: bool,
+    pub longitudinal_mode: LongitudinalMode,
 }
 
 impl Default for SimulationConfig {
@@ -46,6 +61,7 @@ impl Default for SimulationConfig {
             sample_stride: 1,
             sim_noise_enabled: false,
             bridle_enabled: true,
+            longitudinal_mode: LongitudinalMode::TotalEnergy,
         }
     }
 }
@@ -342,6 +358,8 @@ pub struct KiteDiagnostics<T> {
     pub motor_force_b: Vector3<T>,
     pub total_moment_b: Vector3<T>,
     pub aero_moment_b: Vector3<T>,
+    pub rudder_force_b: Vector3<T>,
+    pub rudder_moment_b: Vector3<T>,
     pub tether_moment_b: Vector3<T>,
     pub motor_moment_b: Vector3<T>,
     pub cl_total: T,

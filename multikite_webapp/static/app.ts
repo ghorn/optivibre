@@ -2,11 +2,13 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
 type PhaseMode = "adaptive" | "open_loop";
+type LongitudinalMode = "total_energy" | "max_throttle_altitude_pitch";
 type Preset =
   | "free_flight1"
   | "star1"
+  | "y2_low"
   | "y2"
-  | "y2_reference"
+  | "y2_high"
   | "star3"
   | "star4"
   | "simple_tether";
@@ -140,6 +142,7 @@ interface ApiFrame {
   kite_positions_n: [number, number, number][];
   kite_quaternions_n2b: [number, number, number, number][];
   kite_attitudes_rpy_deg: [number, number, number][];
+  kite_control_roll_pitch_deg: [number, number][];
   rabbit_targets_n: [number, number, number][];
   phase_error: number[];
   speed_target: number[];
@@ -157,6 +160,7 @@ interface ApiFrame {
   pitch_energy_integrator: number[];
   inertial_speed: number[];
   airspeed: number[];
+  rotor_speed: number[];
   alpha_deg: number[];
   beta_deg: number[];
   body_omega_b: [number, number, number][];
@@ -184,6 +188,8 @@ interface ApiFrame {
   motor_force_b: [number, number, number][];
   total_moment_b: [number, number, number][];
   aero_moment_b: [number, number, number][];
+  rudder_force_b: [number, number, number][];
+  rudder_moment_b: [number, number, number][];
   tether_moment_b: [number, number, number][];
   motor_moment_b: [number, number, number][];
   cl_total: number[];
@@ -268,10 +274,14 @@ const payloadInput = document.querySelector<HTMLInputElement>("#payload-mass")!;
 const windInput = document.querySelector<HTMLInputElement>("#wind-speed")!;
 const bridleEnabledInput = document.querySelector<HTMLInputElement>("#bridle-enabled")!;
 const simNoiseInput = document.querySelector<HTMLInputElement>("#sim-noise")!;
+const maxThrottleAltitudePitchInput = document.querySelector<HTMLInputElement>(
+  "#max-throttle-altitude-pitch"
+)!;
 const timeDilationSelect = document.querySelector<HTMLSelectElement>("#time-dilation")!;
 const cameraFollowTargetSelect = document.querySelector<HTMLSelectElement>("#camera-follow-target")!;
 const cameraFollowYawInput = document.querySelector<HTMLInputElement>("#camera-follow-yaw")!;
 const cameraFollowYawLabel = cameraFollowYawInput.closest<HTMLLabelElement>(".checkbox-label")!;
+const controlLabelsEnabledInput = document.querySelector<HTMLInputElement>("#control-labels-enabled")!;
 const summaryNode = document.querySelector<HTMLElement>("#summary")!;
 const failureNode = document.querySelector<HTMLElement>("#failure-pill")!;
 const runtimeConsoleTab = document.querySelector<HTMLButtonElement>("#runtime-tab-console")!;
@@ -280,6 +290,7 @@ const runtimeConsoleView = document.querySelector<HTMLElement>("#runtime-console
 const runtimePlotsView = document.querySelector<HTMLElement>("#runtime-plots-view")!;
 const plotsNode = document.querySelector<HTMLElement>("#plots")!;
 const viewport = document.querySelector<HTMLElement>("#viewport")!;
+const controlLabelLayer = document.querySelector<HTMLElement>("#control-label-layer")!;
 const runForm = document.querySelector<HTMLFormElement>("#run-form")!;
 const runButton = document.querySelector<HTMLButtonElement>("#run-button")!;
 const consoleNode = document.querySelector<HTMLElement>("#console")!;
@@ -343,28 +354,12 @@ const orbitTargetCore = new THREE.Mesh(
     metalness: 0.08
   })
 );
-const orbitTargetHalo = new THREE.Mesh(
-  new THREE.SphereGeometry(2.2, 18, 18),
-  new THREE.MeshBasicMaterial({
-    color: 0xfff0b0,
-    wireframe: true,
-    transparent: true,
-    opacity: 0.28
-  })
-);
 orbitTargetMarker.add(orbitTargetCore);
-orbitTargetMarker.add(orbitTargetHalo);
 orbitTargetMarker.visible = false;
 scene.add(orbitTargetMarker);
 
 const ORBIT_TARGET_CORE_RADIUS_WORLD = 1.0;
-const ORBIT_TARGET_HALO_RADIUS_WORLD = 2.2;
 const ORBIT_TARGET_CORE_PIXELS = 14;
-const ORBIT_TARGET_HALO_PIXELS = 34;
-const ORBIT_TARGET_CORE_RADIUS_MIN = 0.2;
-const ORBIT_TARGET_CORE_RADIUS_MAX = 2.4;
-const ORBIT_TARGET_HALO_RADIUS_MIN = 0.55;
-const ORBIT_TARGET_HALO_RADIUS_MAX = 6.0;
 
 const controlRingLine = new THREE.LineLoop(
   new THREE.BufferGeometry(),
@@ -402,6 +397,17 @@ const controlCenterMarker = new THREE.Mesh(
 );
 controlCenterMarker.visible = false;
 scene.add(controlCenterMarker);
+
+const CONTROL_VIS_COLORS = {
+  lookahead: "#ff5c74",
+  projectedPhase: "#66b8ff",
+  phaseSlot: "#ffd36b",
+  disk: "#36d5c1"
+} as const;
+const controlLookaheadColor = new THREE.Color(CONTROL_VIS_COLORS.lookahead);
+const controlProjectedPhaseColor = new THREE.Color(CONTROL_VIS_COLORS.projectedPhase);
+const controlPhaseSlotColor = new THREE.Color(CONTROL_VIS_COLORS.phaseSlot);
+const controlDiskColor = new THREE.Color(CONTROL_VIS_COLORS.disk);
 
 const kiteMeshes: THREE.Group[] = [];
 const rabbitMeshes: THREE.Mesh[] = [];
@@ -565,7 +571,7 @@ const wingtipTrailMaterial = new THREE.ShaderMaterial({
   vertexColors: true,
   blending: THREE.NormalBlending,
   uniforms: {
-    uPointSize: { value: 1.75 }
+    uPointSize: { value: 3.5 }
   },
   vertexShader: `
     attribute float alpha;
@@ -610,14 +616,10 @@ const TETHER_TENSION_MIN_N = 0;
 const TETHER_TENSION_MAX_N = 2500;
 const CONTROL_RING_SEGMENTS = 96;
 const CONTROL_AXIS_HALF_LENGTH = 10;
-const PHASE_ERROR_MAX_RAD = 0.5;
-const phaseColorLow = new THREE.Color("#45d7a7");
-const phaseColorMid = new THREE.Color("#ffbe6b");
-const phaseColorHigh = new THREE.Color("#ff5c74");
-const COMMON_SEGMENT_RADIUS = 0.46;
-const UPPER_SEGMENT_RADIUS = 0.34;
-const COMMON_NODE_RADIUS = 1.0;
-const UPPER_NODE_RADIUS = 0.78;
+const COMMON_SEGMENT_RADIUS = 0.46 / 3;
+const UPPER_SEGMENT_RADIUS = 0.34 / 3;
+const COMMON_NODE_RADIUS = 1.0 / 3;
+const UPPER_NODE_RADIUS = 0.78 / 3;
 const ambientAirColor = new THREE.Color("#6ee7ff");
 const ambientAirColorHigh = new THREE.Color("#b8f7ff");
 const gustAirColorLow = new THREE.Color("#55c5ff");
@@ -633,6 +635,7 @@ let latestProgressState: SimulationProgress | null = null;
 let activeSummaryRequest: {
   preset: string;
   phase_mode: PhaseMode;
+  longitudinal_mode: LongitudinalMode;
   sim_noise_enabled: boolean;
   bridle_enabled: boolean;
 } | null = null;
@@ -654,6 +657,7 @@ let mathTypesetRetryHandle: number | null = null;
 const pendingMermaidRoots = new Set<Element>();
 let mermaidRenderRetryHandle: number | null = null;
 let mermaidInitialized = false;
+const controlLabelNodes = new Map<string, HTMLDivElement>();
 
 type PlotDash = "solid" | "dash" | "dot" | "dashdot" | "longdash";
 
@@ -903,8 +907,26 @@ function scheduleMermaidRenderRetry(): void {
   }, 100);
 }
 
-function controllerDocsHtml(phaseMode: PhaseMode): string {
+function controllerDocsHtml(phaseMode: PhaseMode, longitudinalMode: LongitudinalMode): string {
   const modeLabel = phaseMode === "adaptive" ? "Adaptive" : "Open Loop";
+  const longitudinalLabel = longitudinalModeLabel(longitudinalMode);
+  const usesMaxThrottle = longitudinalMode === "max_throttle_altitude_pitch";
+  const verticalBlock = usesMaxThrottle
+    ? "Altitude PI<br/>pitch reference θ_i^*"
+    : "TECS<br/>specific energy errors";
+  const torqueBlock = usesMaxThrottle ? "Max motor torque<br/>τ_i=τ_max" : "Motor torque<br/>τ_i";
+  const pitchBlock = usesMaxThrottle
+    ? "Pitch reference<br/>from altitude error"
+    : "Pitch reference<br/>θ_i^*";
+  const longitudinalParagraph = usesMaxThrottle
+    ? "<p><strong>The vertical path is in max-throttle experiment mode.</strong> Motor torque is pinned at the configured limit, and pitch is driven by a saturated altitude-error PI loop. Energy traces remain useful diagnostics, but they are not commanding throttle in this mode.</p>"
+    : "<p><strong>The vertical path is TECS-style.</strong> Desired airspeed and altitude become kinetic and potential energy references. Motor torque closes kinetic-energy error, and pitch trades potential against kinetic energy.</p>";
+  const propulsionParagraph = usesMaxThrottle
+    ? "<p>The propulsion command is intentionally open-loop at maximum torque for lateral-loop tuning.</p>"
+    : "<p>The propulsion loop regulates <strong>airspeed-derived specific kinetic energy</strong>.</p>";
+  const longitudinalStructure = usesMaxThrottle
+    ? "Altitude feeds a pitch PI loop; motor torque is held at the configured maximum."
+    : "Lateral curvature feeds desired roll; airspeed and altitude feed TECS, which commands motor torque and desired pitch.";
   const phaseDiagram = String.raw`flowchart LR
     A["Measured phase<br/>φ_i"] --> B["Phase coordination<br/>phase error e_i"]
     M["Phase mode<br/>adaptive or open-loop"] --> B
@@ -912,17 +934,17 @@ function controllerDocsHtml(phaseMode: PhaseMode): string {
     B --> D["Airspeed scheduler<br/>V_i^*"]
     C --> E["Rabbit geometry<br/>p_i^r"]
     E --> H["Altitude reference<br/>h_i^*"]
-    D --> F["TECS<br/>specific energy errors"]
+    D --> F["${verticalBlock}"]
     H --> F
-    F --> G["Motor torque<br/>τ_i"]
-    F --> I["Pitch reference<br/>θ_i^*"]
+    F --> G["${torqueBlock}"]
+    F --> I["${pitchBlock}"]
     classDef block fill:#112231,stroke:#3ecf9b,color:#edf6ff;`;
   const innerLoopDiagram = String.raw`flowchart LR
     A["Rabbit target<br/>p_i^r"] --> B["Guidance block<br/>body-frame curvature references κ_y^*, κ_z^*"]
     S["Measured state<br/>position, curvature, body rates"] --> B
     B --> C["Roll-reference loop<br/>κ_y^* - κ̂_y → φ^*"]
     C --> D["Roll inner loop<br/>φ^* - φ, p → δ_a"]
-    T["TECS pitch reference<br/>θ^*"] --> E["Pitch inner loop<br/>θ^* - θ, q → δ_e"]
+    T["${pitchBlock}"] --> E["Pitch inner loop<br/>θ^* - θ, q → δ_e"]
     B --> F["Rudder coordination loop<br/>β and r damping"]
     P["AOA backoff"] --> E
     D --> G["Aileron<br/>δ_a"]
@@ -942,10 +964,11 @@ function controllerDocsHtml(phaseMode: PhaseMode): string {
         <div class="docs-grid">
           <div class="docs-prose">
             <div class="docs-phase-pill">Active UI phase mode <strong>${modeLabel}</strong></div>
-            <p>The propulsion loop now regulates <strong>airspeed-derived specific kinetic energy</strong>.</p>
+            <div class="docs-phase-pill">Active longitudinal mode <strong>${longitudinalLabel}</strong></div>
+            ${propulsionParagraph}
             <p>The controller is naturally read as a cascade: phase scheduling and rabbit geometry, body-frame lateral curvature guidance, a total-energy layer, then roll/pitch inner loops and actuator commands.</p>
             <p><strong>The lateral aileron path introduces a desired roll angle.</strong> Rudder is used as a beta/yaw-rate coordination loop.</p>
-            <p><strong>The vertical path is now TECS-style.</strong> Desired airspeed and altitude become kinetic and potential energy references. Motor torque closes kinetic-energy error, and pitch trades potential against kinetic energy.</p>
+            ${longitudinalParagraph}
             <p>The flap and winglet commands are fixed at trim.</p>
           </div>
           <div class="docs-kv">
@@ -959,7 +982,7 @@ function controllerDocsHtml(phaseMode: PhaseMode): string {
             </div>
             <div class="docs-kv-row">
               <div class="docs-kv-label">Inner-Loop Structure</div>
-              <div class="docs-kv-value">Lateral curvature feeds desired roll; airspeed and altitude feed TECS, which commands motor torque and desired pitch.</div>
+              <div class="docs-kv-value">${longitudinalStructure}</div>
             </div>
             <div class="docs-kv-row">
               <div class="docs-kv-label">Implementation Bounds</div>
@@ -1137,7 +1160,7 @@ function controllerDocsHtml(phaseMode: PhaseMode): string {
           \\delta_{f,i} &= \\delta_{f,0},\\\\
           \\delta_{w,i} &= \\delta_{w,0},\\\\
           \\delta_{e,i} &= \\delta_{e,0} - k_{e,\\theta}\\left(\\theta_i^\\star-\\theta_i\\right) + k_{e,q}\\,\\omega_{y,i} + k_{e,\\alpha}\\alpha_i^{\\mathrm{prot}},\\\\
-          \\delta_{r,i} &= \\delta_{r,0} - k_{r,\\beta}\\,\\beta_i + k_{r,\\Omega}\\left(\\Omega_{z,i}-\\Omega_{z,i}^\\star\\right).
+          \\delta_{r,i} &= \\delta_{r,0} - k_{r,\\beta}\\,\\beta_i - k_{r,r}\\,\\omega_{z,i}.
           \\end{aligned}
           \\]
         </div>
@@ -1223,7 +1246,13 @@ function controllerDocsHtml(phaseMode: PhaseMode): string {
 }
 
 function renderControllerDocs(): void {
-  controllerDocsNode.innerHTML = controllerDocsHtml(phaseModeSelect.value as PhaseMode);
+  const longitudinalMode = (maxThrottleAltitudePitchInput.checked
+    ? "max_throttle_altitude_pitch"
+    : "total_energy") as LongitudinalMode;
+  controllerDocsNode.innerHTML = controllerDocsHtml(
+    phaseModeSelect.value as PhaseMode,
+    longitudinalMode
+  );
   typesetMath(controllerDocsNode);
   renderMermaid(controllerDocsNode);
 }
@@ -1234,18 +1263,8 @@ function syncOrbitTargetMarker(): void {
   const viewportHeight = Math.max(1, viewport.clientHeight);
   const worldPerPixel =
     (2 * distance * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2)) / viewportHeight;
-  const coreRadius = THREE.MathUtils.clamp(
-    worldPerPixel * ORBIT_TARGET_CORE_PIXELS,
-    ORBIT_TARGET_CORE_RADIUS_MIN,
-    ORBIT_TARGET_CORE_RADIUS_MAX
-  );
-  const haloRadius = THREE.MathUtils.clamp(
-    worldPerPixel * ORBIT_TARGET_HALO_PIXELS,
-    ORBIT_TARGET_HALO_RADIUS_MIN,
-    ORBIT_TARGET_HALO_RADIUS_MAX
-  );
+  const coreRadius = worldPerPixel * ORBIT_TARGET_CORE_PIXELS;
   orbitTargetCore.scale.setScalar(coreRadius / ORBIT_TARGET_CORE_RADIUS_WORLD);
-  orbitTargetHalo.scale.setScalar(haloRadius / ORBIT_TARGET_HALO_RADIUS_WORLD);
 }
 
 function setOrbitTargetMarkerVisible(visible: boolean): void {
@@ -1305,8 +1324,9 @@ function presetKiteCount(preset: Preset): number {
       return 1;
     case "star1":
       return 1;
+    case "y2_low":
     case "y2":
-    case "y2_reference":
+    case "y2_high":
       return 2;
     case "star3":
       return 3;
@@ -1355,6 +1375,15 @@ function timeDilationLabel(preset: TimeDilationPreset): string {
       return "0.1x";
     default:
       return "Fast as possible";
+  }
+}
+
+function longitudinalModeLabel(mode: LongitudinalMode): string {
+  switch (mode) {
+    case "max_throttle_altitude_pitch":
+      return "Max throttle + altitude pitch";
+    default:
+      return "Total energy";
   }
 }
 
@@ -1789,7 +1818,7 @@ function buildRollCommandGroup(kiteCount: number): PlotGroupDefinition {
     kiteCount,
     "Desired Roll vs Actual (deg)",
     "deg",
-    (frame, kiteIndex) => frame.kite_attitudes_rpy_deg[kiteIndex]?.[0] ?? 0,
+    (frame, kiteIndex) => frame.kite_control_roll_pitch_deg[kiteIndex]?.[0] ?? 0,
     (frame, kiteIndex) => frame.roll_ref_deg[kiteIndex] ?? 0
   );
 }
@@ -1799,7 +1828,7 @@ function buildPitchCommandGroup(kiteCount: number): PlotGroupDefinition {
     kiteCount,
     "Desired Pitch vs Actual (deg)",
     "deg",
-    (frame, kiteIndex) => frame.kite_attitudes_rpy_deg[kiteIndex]?.[1] ?? 0,
+    (frame, kiteIndex) => frame.kite_control_roll_pitch_deg[kiteIndex]?.[1] ?? 0,
     (frame, kiteIndex) => frame.pitch_ref_deg[kiteIndex] ?? 0
   );
 }
@@ -1906,7 +1935,7 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
     {
       title: "Controller / 1. Lateral Inner Loop",
       description:
-        "Innermost lateral channel first. Desired path curvature is turned into a coordinated-turn roll feedforward plus a smaller curvature-error PI correction; the aileron then closes roll with body-rate damping. Rudder now closes a coordinated-turn / sideslip loop using desired world-Z turn rate together with beta regulation.",
+        "Innermost lateral channel first. Desired path curvature is turned into a coordinated-turn roll feedforward plus a smaller curvature-error PI correction; the aileron then closes roll with body-rate damping. Rudder is a sideslip/yaw-damper loop using beta and body z-rate.",
       groups: [
         buildRollCommandGroup(kiteCount),
         buildPerKiteGroup(
@@ -2126,6 +2155,27 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
         ),
         buildPerKiteGroup(
           kiteCount,
+          "Rotor Speed (rad/s)",
+          "rad/s",
+          (frame, kiteIndex) => frame.rotor_speed[kiteIndex] ?? 0,
+          undefined,
+          [
+            {
+              name: "Rotor Fit Soft Limit",
+              color: LIMIT_COLOR,
+              dash: "dot",
+              value: () => 500
+            },
+            {
+              name: "Rotor Fit Hard Limit",
+              color: LIMIT_COLOR,
+              dash: "dash",
+              value: () => 600
+            }
+          ]
+        ),
+        buildPerKiteGroup(
+          kiteCount,
           "Vertical Curvature Desired vs Actual (1/m)",
           "1/m",
           (frame, kiteIndex) => frame.curvature_z_b[kiteIndex] ?? 0,
@@ -2187,6 +2237,13 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
             width: 2.1,
             alpha: 0.86,
             value: (frame, kiteIndex) => bodyComponent(frame.aero_force_b, kiteIndex, 1)
+          },
+          {
+            name: "Rudder Aero",
+            dash: "dashdot",
+            width: 2.0,
+            alpha: 0.9,
+            value: (frame, kiteIndex) => bodyComponent(frame.rudder_force_b, kiteIndex, 1)
           },
           {
             name: "Tether",
@@ -2319,6 +2376,13 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
             value: (frame, kiteIndex) => bodyComponent(frame.aero_moment_b, kiteIndex, 2)
           },
           {
+            name: "Rudder Aero",
+            dash: "dashdot",
+            width: 2.1,
+            alpha: 0.92,
+            value: (frame, kiteIndex) => bodyComponent(frame.rudder_moment_b, kiteIndex, 2)
+          },
+          {
             name: "Tether",
             dash: "dot",
             width: 1.9,
@@ -2339,46 +2403,43 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
     {
       title: "Physics / Aero Model Terms",
       description:
-        "Aero coefficient breakdowns from the actual model implementation. These show which modeled source terms are contributing to lift, drag, side force, and the aerodynamic moments at each instant.",
+        "Aero coefficient breakdowns from the actual model implementation. Nominal/rate/surface labels are contribution buckets, not local linear stability derivatives.",
       groups: [
         buildPerKiteBreakdownGroup(kiteCount, "C_L Terms", "-", [
           { name: "Total", width: 3, alpha: 0.96, value: (frame, kiteIndex) => frame.cl_total[kiteIndex] ?? 0 },
-          { name: "C_L0", dash: "dash", width: 1.9, alpha: 0.82, value: (frame, kiteIndex) => frame.cl_0_term[kiteIndex] ?? 0 },
-          { name: "C_Lα", dash: "dot", width: 1.9, alpha: 0.82, value: (frame, kiteIndex) => frame.cl_alpha_term[kiteIndex] ?? 0 },
+          { name: "Nominal", dash: "dash", width: 1.9, alpha: 0.82, value: (frame, kiteIndex) => frame.cl_0_term[kiteIndex] ?? 0 },
+          { name: "Rate", dash: "dot", width: 1.9, alpha: 0.82, value: (frame, kiteIndex) => frame.cl_alpha_term[kiteIndex] ?? 0 },
           { name: "C_Lδe", dash: "dashdot", width: 1.8, alpha: 0.76, value: (frame, kiteIndex) => frame.cl_elevator_term[kiteIndex] ?? 0 },
           { name: "C_Lδf", dash: "longdash", width: 1.8, alpha: 0.76, value: (frame, kiteIndex) => frame.cl_flap_term[kiteIndex] ?? 0 }
         ]),
         buildPerKiteBreakdownGroup(kiteCount, "C_D Terms", "-", [
           { name: "Total", width: 3, alpha: 0.96, value: (frame, kiteIndex) => frame.cd_total[kiteIndex] ?? 0 },
-          { name: "C_D0", dash: "dash", width: 1.9, alpha: 0.82, value: (frame, kiteIndex) => frame.cd_0_term[kiteIndex] ?? 0 },
-          { name: "Induced", dash: "dot", width: 1.9, alpha: 0.82, value: (frame, kiteIndex) => frame.cd_induced_term[kiteIndex] ?? 0 },
-          { name: "Surface Abs", dash: "dashdot", width: 1.8, alpha: 0.76, value: (frame, kiteIndex) => frame.cd_surface_term[kiteIndex] ?? 0 }
+          { name: "Nominal", dash: "dash", width: 1.9, alpha: 0.82, value: (frame, kiteIndex) => frame.cd_0_term[kiteIndex] ?? 0 },
+          { name: "Rate", dash: "dot", width: 1.9, alpha: 0.82, value: (frame, kiteIndex) => frame.cd_induced_term[kiteIndex] ?? 0 },
+          { name: "Surface", dash: "dashdot", width: 1.8, alpha: 0.76, value: (frame, kiteIndex) => frame.cd_surface_term[kiteIndex] ?? 0 }
         ]),
-        buildPerKiteBreakdownGroup(kiteCount, "C_Y Terms", "-", [
+        buildPerKiteBreakdownGroup(kiteCount, "C_Yw Terms", "-", [
           { name: "Total", width: 3, alpha: 0.96, value: (frame, kiteIndex) => frame.cy_total[kiteIndex] ?? 0 },
-          { name: "C_Yβ", dash: "dash", width: 1.9, alpha: 0.82, value: (frame, kiteIndex) => frame.cy_beta_term[kiteIndex] ?? 0 },
-          { name: "C_Yδr", dash: "dot", width: 1.9, alpha: 0.82, value: (frame, kiteIndex) => frame.cy_rudder_term[kiteIndex] ?? 0 }
+          { name: "Nominal + Rate", dash: "dash", width: 1.9, alpha: 0.82, value: (frame, kiteIndex) => frame.cy_beta_term[kiteIndex] ?? 0 },
+          { name: "C_Ywδr", dash: "dot", width: 1.9, alpha: 0.82, value: (frame, kiteIndex) => frame.cy_rudder_term[kiteIndex] ?? 0 }
         ]),
         buildPerKiteBreakdownGroup(kiteCount, "C_l Terms", "-", [
           { name: "Total", width: 3, alpha: 0.96, value: (frame, kiteIndex) => frame.roll_coeff_total[kiteIndex] ?? 0 },
-          { name: "C_lβ", dash: "dash", width: 1.9, alpha: 0.82, value: (frame, kiteIndex) => frame.roll_beta_term[kiteIndex] ?? 0 },
-          { name: "C_lp", dash: "dot", width: 1.9, alpha: 0.82, value: (frame, kiteIndex) => frame.roll_p_term[kiteIndex] ?? 0 },
-          { name: "C_lr", dash: "dashdot", width: 1.8, alpha: 0.76, value: (frame, kiteIndex) => frame.roll_r_term[kiteIndex] ?? 0 },
+          { name: "Nominal", dash: "dash", width: 1.9, alpha: 0.82, value: (frame, kiteIndex) => frame.roll_beta_term[kiteIndex] ?? 0 },
+          { name: "Rate", dash: "dot", width: 1.9, alpha: 0.82, value: (frame, kiteIndex) => frame.roll_p_term[kiteIndex] ?? 0 },
           { name: "C_lδa", dash: "longdash", width: 1.8, alpha: 0.76, value: (frame, kiteIndex) => frame.roll_aileron_term[kiteIndex] ?? 0 }
         ]),
         buildPerKiteBreakdownGroup(kiteCount, "C_m Terms", "-", [
           { name: "Total", width: 3, alpha: 0.96, value: (frame, kiteIndex) => frame.pitch_coeff_total[kiteIndex] ?? 0 },
-          { name: "C_m0", dash: "dash", width: 1.9, alpha: 0.82, value: (frame, kiteIndex) => frame.pitch_0_term[kiteIndex] ?? 0 },
-          { name: "C_mα", dash: "dot", width: 1.9, alpha: 0.82, value: (frame, kiteIndex) => frame.pitch_alpha_term[kiteIndex] ?? 0 },
-          { name: "C_mq", dash: "dashdot", width: 1.8, alpha: 0.76, value: (frame, kiteIndex) => frame.pitch_q_term[kiteIndex] ?? 0 },
+          { name: "Nominal", dash: "dash", width: 1.9, alpha: 0.82, value: (frame, kiteIndex) => frame.pitch_0_term[kiteIndex] ?? 0 },
+          { name: "Rate", dash: "dashdot", width: 1.8, alpha: 0.76, value: (frame, kiteIndex) => frame.pitch_q_term[kiteIndex] ?? 0 },
           { name: "C_mδe", dash: "longdash", width: 1.8, alpha: 0.76, value: (frame, kiteIndex) => frame.pitch_elevator_term[kiteIndex] ?? 0 },
           { name: "C_mδf", dash: "dash", width: 1.6, alpha: 0.58, value: (frame, kiteIndex) => frame.pitch_flap_term[kiteIndex] ?? 0 }
         ]),
         buildPerKiteBreakdownGroup(kiteCount, "C_n Terms", "-", [
           { name: "Total", width: 3, alpha: 0.96, value: (frame, kiteIndex) => frame.yaw_coeff_total[kiteIndex] ?? 0 },
-          { name: "C_nβ", dash: "dash", width: 1.9, alpha: 0.82, value: (frame, kiteIndex) => frame.yaw_beta_term[kiteIndex] ?? 0 },
-          { name: "C_np", dash: "dot", width: 1.9, alpha: 0.82, value: (frame, kiteIndex) => frame.yaw_p_term[kiteIndex] ?? 0 },
-          { name: "C_nr", dash: "dashdot", width: 1.8, alpha: 0.76, value: (frame, kiteIndex) => frame.yaw_r_term[kiteIndex] ?? 0 },
+          { name: "Nominal", dash: "dash", width: 1.9, alpha: 0.82, value: (frame, kiteIndex) => frame.yaw_beta_term[kiteIndex] ?? 0 },
+          { name: "Rate", dash: "dashdot", width: 1.8, alpha: 0.76, value: (frame, kiteIndex) => frame.yaw_r_term[kiteIndex] ?? 0 },
           { name: "C_nδr", dash: "longdash", width: 1.8, alpha: 0.76, value: (frame, kiteIndex) => frame.yaw_rudder_term[kiteIndex] ?? 0 }
         ])
       ],
@@ -2397,6 +2458,7 @@ function formatProgressSummary(
   request: {
     preset: string;
     phase_mode: PhaseMode;
+    longitudinal_mode: LongitudinalMode;
     sim_noise_enabled: boolean;
     bridle_enabled: boolean;
   },
@@ -2415,6 +2477,7 @@ function formatProgressSummary(
       { label: "Progress", value: `${pct.toFixed(1)}%` },
       { label: "Preset", value: request.preset },
       { label: "Phase Mode", value: request.phase_mode },
+      { label: "Longitudinal", value: longitudinalModeLabel(request.longitudinal_mode) },
       { label: "Bridle", value: request.bridle_enabled ? "Enabled" : "CG attach" },
       { label: "Sim Noise", value: request.sim_noise_enabled ? "Dryden gusts" : "Off" },
       { label: "Time Dilation", value: playbackLabel },
@@ -2450,6 +2513,10 @@ function formatRunSummary(
     `${summary.duration.toFixed(2)} s simulated`,
     [
       { label: "Time Dilation", value: playbackLabel },
+      {
+        label: "Longitudinal",
+        value: longitudinalModeLabel(activeSummaryRequest?.longitudinal_mode ?? "total_energy")
+      },
       { label: "Frames", value: `${receivedFrames} received / ${renderedFrames} rendered` },
       {
         label: "Accepted / Rejected",
@@ -3048,15 +3115,6 @@ function tensionToColor(tensionN: number): THREE.Color {
   return tensionColorMid.clone().lerp(tensionColorHigh, (shaped - 0.55) / 0.45);
 }
 
-function phaseErrorColor(phaseErrorRad: number): THREE.Color {
-  const normalized = Math.min(1, Math.abs(phaseErrorRad) / PHASE_ERROR_MAX_RAD);
-  const shaped = Math.sqrt(normalized);
-  if (shaped <= 0.55) {
-    return phaseColorLow.clone().lerp(phaseColorMid, shaped / 0.55);
-  }
-  return phaseColorMid.clone().lerp(phaseColorHigh, (shaped - 0.55) / 0.45);
-}
-
 function setMaterialColor(
   material: THREE.Material | THREE.Material[],
   color: THREE.Color,
@@ -3144,8 +3202,8 @@ function makeProjectedPhaseMesh(): THREE.Mesh {
   return new THREE.Mesh(
     new THREE.SphereGeometry(1.75, 14, 14),
     new THREE.MeshStandardMaterial({
-      color: 0x66b8ff,
-      emissive: 0x66b8ff,
+      color: controlProjectedPhaseColor,
+      emissive: controlProjectedPhaseColor,
       emissiveIntensity: 0.32,
       roughness: 0.2,
       metalness: 0.06
@@ -3157,8 +3215,8 @@ function makePhaseSlotMesh(): THREE.Mesh {
   return new THREE.Mesh(
     new THREE.SphereGeometry(1.25, 12, 12),
     new THREE.MeshStandardMaterial({
-      color: 0xbfd8ea,
-      emissive: 0xbfd8ea,
+      color: controlPhaseSlotColor,
+      emissive: controlPhaseSlotColor,
       emissiveIntensity: 0.15,
       transparent: true,
       opacity: 0.66,
@@ -3250,18 +3308,14 @@ function updateControlRing(frame: ApiFrame): void {
   const radius = frame.control_ring_radius;
   const ringPoints = Array.from({ length: CONTROL_RING_SEGMENTS }, (_, index) => {
     const theta = (2 * Math.PI * index) / CONTROL_RING_SEGMENTS;
-    return toThree([
-      center[0] + radius * Math.cos(theta),
-      center[1] + radius * Math.sin(theta),
-      center[2]
-    ]);
+    return controlRingPoint(frame, theta, radius);
   });
   (controlRingLine.geometry as THREE.BufferGeometry).setFromPoints(ringPoints);
   controlCenterMarker.position.copy(toThree(center));
 
   const axisStart = toThree([center[0], center[1], center[2] - CONTROL_AXIS_HALF_LENGTH]);
   const axisEnd = toThree([center[0], center[1], center[2] + CONTROL_AXIS_HALF_LENGTH]);
-  updateLine(controlAxisLine, axisStart, axisEnd, new THREE.Color("#ffd36b"), 0.28);
+  updateLine(controlAxisLine, axisStart, axisEnd, controlDiskColor, 0.28);
 
   const showAdaptiveSlots = activeSummaryRequest?.phase_mode === "adaptive";
   ensureMeshCount(showAdaptiveSlots ? kiteCount : 0, phaseSlotMeshes, makePhaseSlotMesh);
@@ -3269,20 +3323,141 @@ function updateControlRing(frame: ApiFrame): void {
     for (let index = 0; index < kiteCount; index += 1) {
       const theta = (2 * Math.PI * index) / kiteCount;
       phaseSlotMeshes[index].visible = true;
-      phaseSlotMeshes[index].position.copy(
-        toThree([
-          center[0] + radius * Math.cos(theta),
-          center[1] + radius * Math.sin(theta),
-          center[2]
-        ])
-      );
+      phaseSlotMeshes[index].position.copy(controlRingPoint(frame, theta, radius));
       setMaterialColor(
         phaseSlotMeshes[index].material,
-        new THREE.Color(kiteColor(index)),
-        0.12
+        controlPhaseSlotColor,
+        0.18
       );
     }
   }
+}
+
+function controlRingPoint(frame: ApiFrame, theta: number, radius = frame.control_ring_radius): THREE.Vector3 {
+  const center = frame.control_ring_center_n;
+  return toThree([
+    center[0] + radius * Math.cos(theta),
+    center[1] + radius * Math.sin(theta),
+    center[2]
+  ]);
+}
+
+function projectedPhasePosition(
+  frame: ApiFrame,
+  kiteIndex: number,
+  position: [number, number, number]
+): THREE.Vector3 {
+  const controlCenter = frame.control_ring_center_n;
+  const dx = position[0] - controlCenter[0];
+  const dy = position[1] - controlCenter[1];
+  const phaseAngle = Math.atan2(dy, dx);
+  const orbitRadius = frame.orbit_radius[kiteIndex] ?? Math.hypot(dx, dy);
+  return controlRingPoint(frame, phaseAngle, orbitRadius);
+}
+
+function phaseSlotPosition(frame: ApiFrame, kiteIndex: number): THREE.Vector3 {
+  const kiteCount = frame.kite_positions_n.length;
+  const theta = (2 * Math.PI * kiteIndex) / Math.max(1, kiteCount);
+  return controlRingPoint(frame, theta);
+}
+
+interface ControlLabelSpec {
+  key: string;
+  text: string;
+  color: string;
+  position: THREE.Vector3;
+}
+
+function labelScreenPosition(worldPosition: THREE.Vector3): { x: number; y: number } | null {
+  const projected = worldPosition.clone().project(camera);
+  if (
+    projected.z < -1 ||
+    projected.z > 1 ||
+    projected.x < -1.1 ||
+    projected.x > 1.1 ||
+    projected.y < -1.1 ||
+    projected.y > 1.1
+  ) {
+    return null;
+  }
+  return {
+    x: (projected.x * 0.5 + 0.5) * viewport.clientWidth,
+    y: (-projected.y * 0.5 + 0.5) * viewport.clientHeight
+  };
+}
+
+function setControlLabel(spec: ControlLabelSpec): void {
+  let label = controlLabelNodes.get(spec.key);
+  if (!label) {
+    label = document.createElement("div");
+    label.className = "control-label";
+    controlLabelLayer.append(label);
+    controlLabelNodes.set(spec.key, label);
+  }
+  label.textContent = spec.text;
+  label.style.setProperty("--label-color", spec.color);
+  const screen = labelScreenPosition(spec.position);
+  if (!screen) {
+    label.style.display = "none";
+    return;
+  }
+  label.style.display = "block";
+  label.style.left = `${screen.x}px`;
+  label.style.top = `${screen.y}px`;
+}
+
+function updateControlLabels(): void {
+  const frame = lastRenderedFrame;
+  const enabled = controlLabelsEnabledInput.checked && frame && frame.kite_positions_n.length > 0;
+  controlLabelLayer.classList.toggle("visible", Boolean(enabled));
+  if (!enabled || !frame) {
+    controlLabelNodes.forEach((label) => {
+      label.style.display = "none";
+    });
+    return;
+  }
+
+  const specs: ControlLabelSpec[] = [
+    {
+      key: "disk-center",
+      text: "disk center",
+      color: CONTROL_VIS_COLORS.disk,
+      position: toThree(frame.control_ring_center_n)
+    }
+  ];
+  const showAdaptiveSlots = activeSummaryRequest?.phase_mode === "adaptive";
+
+  frame.kite_positions_n.forEach((position, kiteIndex) => {
+    const kiteLabel = `K${kiteIndex + 1}`;
+    specs.push({
+      key: `lookahead-${kiteIndex}`,
+      text: `${kiteLabel} lookahead`,
+      color: CONTROL_VIS_COLORS.lookahead,
+      position: toThree(frame.rabbit_targets_n[kiteIndex] ?? position)
+    });
+    specs.push({
+      key: `projected-${kiteIndex}`,
+      text: `${kiteLabel} projected phase`,
+      color: CONTROL_VIS_COLORS.projectedPhase,
+      position: projectedPhasePosition(frame, kiteIndex, position)
+    });
+    if (showAdaptiveSlots) {
+      specs.push({
+        key: `slot-${kiteIndex}`,
+        text: `${kiteLabel} phase slot`,
+        color: CONTROL_VIS_COLORS.phaseSlot,
+        position: phaseSlotPosition(frame, kiteIndex)
+      });
+    }
+  });
+
+  const activeKeys = new Set(specs.map((spec) => spec.key));
+  controlLabelNodes.forEach((label, key) => {
+    if (!activeKeys.has(key)) {
+      label.style.display = "none";
+    }
+  });
+  specs.forEach(setControlLabel);
 }
 
 function deriveKiteVisualDimensions(frame: ApiFrame, index: number): KiteVisualDimensions | null {
@@ -3502,7 +3677,11 @@ function ensureKites(count: number, frame: ApiFrame): void {
 
     const rabbit = new THREE.Mesh(
       new THREE.SphereGeometry(2.4, 12, 12),
-      new THREE.MeshStandardMaterial({ color: 0xffbe6b, emissive: 0xffbe6b, emissiveIntensity: 0.32 })
+      new THREE.MeshStandardMaterial({
+        color: controlLookaheadColor,
+        emissive: controlLookaheadColor,
+        emissiveIntensity: 0.32
+      })
     );
     rabbitMeshes.push(rabbit);
     scene.add(rabbit);
@@ -3511,7 +3690,7 @@ function ensureKites(count: number, frame: ApiFrame): void {
     projectedPhaseMeshes.push(projectedPhase);
     scene.add(projectedPhase);
 
-    const guidanceLine = makeSceneLine(0x66d7c5, 0.58);
+    const guidanceLine = makeSceneLine(0xff5c74, 0.58);
     guidanceLines.push(guidanceLine);
     scene.add(guidanceLine);
 
@@ -3580,27 +3759,14 @@ function renderFrame(frame: ApiFrame): void {
     mesh.setRotationFromQuaternion(quat);
     const rabbitTarget = frame.rabbit_targets_n[index] ?? position;
     const rabbitPosition = toThree(rabbitTarget);
-    const phaseColor = phaseErrorColor(frame.phase_error[index] ?? 0);
-    const projectedPhaseColor = new THREE.Color(kiteColor(index)).lerp(phaseColor, 0.4);
 
     rabbitMesh.position.copy(rabbitPosition);
-    setMaterialColor(rabbitMesh.material, phaseColor, 0.3);
+    setMaterialColor(rabbitMesh.material, controlLookaheadColor, 0.34);
 
-    const controlCenter = frame.control_ring_center_n;
-    const dx = position[0] - controlCenter[0];
-    const dy = position[1] - controlCenter[1];
-    const phaseAngle = Math.atan2(dy, dx);
-    const orbitRadius = frame.orbit_radius[index] ?? Math.hypot(dx, dy);
-    projectedPhaseMesh.position.copy(
-      toThree([
-        controlCenter[0] + orbitRadius * Math.cos(phaseAngle),
-        controlCenter[1] + orbitRadius * Math.sin(phaseAngle),
-        controlCenter[2]
-      ])
-    );
-    setMaterialColor(projectedPhaseMesh.material, projectedPhaseColor, 0.28);
+    projectedPhaseMesh.position.copy(projectedPhasePosition(frame, index, position));
+    setMaterialColor(projectedPhaseMesh.material, controlProjectedPhaseColor, 0.28);
 
-    updateLine(guidanceLine, kitePosition, rabbitPosition, phaseColor, 0.68);
+    updateLine(guidanceLine, kitePosition, rabbitPosition, controlLookaheadColor, 0.68);
 
     renderTether(
       frame.upper_tethers[index],
@@ -3714,6 +3880,7 @@ function animate(timestamp: number): void {
     refreshProgressSummary();
   }
   syncOrbitTargetMarker();
+  updateControlLabels();
   renderer.render(scene, camera);
 }
 requestAnimationFrame(animate);
@@ -4079,6 +4246,9 @@ async function runSimulation(): Promise<void> {
     preset: presetSelect.value,
     duration: durationSeconds,
     phase_mode: phaseModeSelect.value as PhaseMode,
+    longitudinal_mode: (maxThrottleAltitudePitchInput.checked
+      ? "max_throttle_altitude_pitch"
+      : "total_energy") as LongitudinalMode,
     payload_mass_kg: Number(payloadInput.value),
     wind_speed_mps: Number(windInput.value),
     bridle_enabled: bridleEnabledInput.checked,
@@ -4090,6 +4260,7 @@ async function runSimulation(): Promise<void> {
   activeSummaryRequest = {
     preset: request.preset,
     phase_mode: request.phase_mode,
+    longitudinal_mode: request.longitudinal_mode,
     sim_noise_enabled: request.sim_noise_enabled,
     bridle_enabled: request.bridle_enabled
   };
@@ -4105,6 +4276,7 @@ async function runSimulation(): Promise<void> {
     [
       { label: "Preset", value: request.preset },
       { label: "Phase Mode", value: request.phase_mode },
+      { label: "Longitudinal", value: longitudinalModeLabel(request.longitudinal_mode) },
       { label: "Bridle", value: request.bridle_enabled ? "Enabled" : "CG attach" },
       { label: "Sim Noise", value: request.sim_noise_enabled ? "Dryden gusts" : "Off" },
       { label: "Time Dilation", value: playbackLabel },
@@ -4119,7 +4291,7 @@ async function runSimulation(): Promise<void> {
     "Run requested"
   );
   appendConsole(
-    `run requested: preset=${request.preset}, duration=${request.duration}s, phase=${request.phase_mode}, bridle=${request.bridle_enabled ? "enabled" : "cg_attach"}, noise=${request.sim_noise_enabled ? "dryden" : "off"}, time_dilation=${playbackLabel}`
+    `run requested: preset=${request.preset}, duration=${request.duration}s, phase=${request.phase_mode}, longitudinal=${request.longitudinal_mode}, bridle=${request.bridle_enabled ? "enabled" : "cg_attach"}, noise=${request.sim_noise_enabled ? "dryden" : "off"}, time_dilation=${playbackLabel}`
   );
 
   try {
@@ -4274,6 +4446,10 @@ phaseModeSelect.addEventListener("change", () => {
   renderControllerDocs();
 });
 
+maxThrottleAltitudePitchInput.addEventListener("change", () => {
+  renderControllerDocs();
+});
+
 cameraFollowTargetSelect.addEventListener("change", () => {
   updateCameraFollowUiState();
   shouldSnapOrbitTargetToFrame = true;
@@ -4286,6 +4462,10 @@ cameraFollowTargetSelect.addEventListener("change", () => {
 
 cameraFollowYawInput.addEventListener("change", () => {
   resetCameraFollowState();
+});
+
+controlLabelsEnabledInput.addEventListener("change", () => {
+  updateControlLabels();
 });
 
 window.addEventListener("mathjax-ready", () => {
@@ -4312,6 +4492,7 @@ window.addEventListener("resize", () => {
   camera.aspect = viewport.clientWidth / viewport.clientHeight;
   camera.updateProjectionMatrix();
   syncOrbitTargetMarker();
+  updateControlLabels();
   activePlotSections.forEach((section) => {
     Plotly.Plots?.resize(section.plot);
   });
