@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 use optimization::{
-    CallPolicy, CallPolicyConfig, ClarabelSqpOptions, ConstraintBounds,
+    CallPolicy, CallPolicyConfig, ClarabelSqpOptions, CompiledNlpProblem, ConstraintBounds,
     FiniteDifferenceValidationOptions, FunctionCompileOptions, InteriorPointLinearSolver,
     InteriorPointOptions, LlvmOptimizationLevel, NlpEvaluationBenchmarkOptions, RuntimeNlpBounds,
     RuntimeNlpScaling, SqpGlobalization, SymbolicCompileProgress, SymbolicCompileStage,
@@ -61,6 +61,18 @@ fn dynamic_parameterized_problem() -> optimization::DynamicSymbolicNlp {
     .expect("dynamic symbolic NLP should build")
 }
 
+fn sparse_hessian_value(ccs: &optimization::CCS, values: &[f64], row: usize, col: usize) -> f64 {
+    for (&entry_row, &value) in ccs.row_indices[ccs.col_ptrs[col]..ccs.col_ptrs[col + 1]]
+        .iter()
+        .zip(values[ccs.col_ptrs[col]..ccs.col_ptrs[col + 1]].iter())
+    {
+        if entry_row == row {
+            return value;
+        }
+    }
+    0.0
+}
+
 #[derive(Clone, optimization::Vectorize)]
 struct TinyMs<T> {
     x0: T,
@@ -68,6 +80,69 @@ struct TinyMs<T> {
     x2: T,
     u0: T,
     u1: T,
+}
+
+#[test]
+fn dynamic_jit_lagrangian_hessian_honors_objective_factor() {
+    let compiled = dynamic_parameterized_problem()
+        .compile_jit()
+        .expect("JIT compile should succeed");
+    let parameters = compiled
+        .parameter_storage(Some(&[1.5, -0.5]))
+        .expect("parameter storage should match");
+    let x = [0.3, -0.2];
+    let equality_multipliers = [7.0];
+    let inequality_multipliers = [11.0, 13.0];
+    let ccs = compiled.lagrangian_hessian_ccs().clone();
+    let mut values = vec![0.0; ccs.nnz()];
+
+    compiled.lagrangian_hessian_values_with_objective_factor(
+        &x,
+        &parameters,
+        0.0,
+        &equality_multipliers,
+        &inequality_multipliers,
+        &mut values,
+    );
+    assert_abs_diff_eq!(
+        sparse_hessian_value(&ccs, &values, 0, 0),
+        22.0,
+        epsilon = 1.0e-12
+    );
+    assert_abs_diff_eq!(
+        sparse_hessian_value(&ccs, &values, 1, 0),
+        0.0,
+        epsilon = 1.0e-12
+    );
+    assert_abs_diff_eq!(
+        sparse_hessian_value(&ccs, &values, 1, 1),
+        22.0,
+        epsilon = 1.0e-12
+    );
+
+    compiled.lagrangian_hessian_values_with_objective_factor(
+        &x,
+        &parameters,
+        2.5,
+        &equality_multipliers,
+        &inequality_multipliers,
+        &mut values,
+    );
+    assert_abs_diff_eq!(
+        sparse_hessian_value(&ccs, &values, 0, 0),
+        27.0,
+        epsilon = 1.0e-12
+    );
+    assert_abs_diff_eq!(
+        sparse_hessian_value(&ccs, &values, 1, 0),
+        0.0,
+        epsilon = 1.0e-12
+    );
+    assert_abs_diff_eq!(
+        sparse_hessian_value(&ccs, &values, 1, 1),
+        27.0,
+        epsilon = 1.0e-12
+    );
 }
 
 #[test]

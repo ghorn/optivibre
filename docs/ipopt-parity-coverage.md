@@ -47,16 +47,16 @@ Reports are written to `target/reports/ipopt-parity-coverage/`:
 
 Latest generated profile snapshot, from the source-built nonlinear parity run:
 
-- IPOPT Algorithm C++: `10318 / 18642` lines and `1346 / 3556` branches hit.
-- Rust NLIP core: `8818 / 14187` lines hit, with `0` unhit branch-like lines
+- IPOPT Algorithm C++: `11891 / 18642` lines and `1594 / 3556` branches hit.
+- Rust NLIP core: `13098 / 20494` lines hit, with `0` unhit branch-like lines
   still classified as `needs audit`.
 - `IpDefaultIterateInitializer.cpp`: `498 / 532` lines and `58 / 70` branches
   hit after adding the requested `least_square_init_primal=yes` witness.
 - `IpIpoptAlg.cpp` convergence-status cases for max-iteration, diverging
   iterates, CPU time, wall time, acceptable termination, and user-requested
   stop are now covered by focused witnesses.
-- `IpBacktrackingLineSearch.cpp`: `717 / 993` lines and `188 / 252` branches
-  hit, with active-watch uncovered branch lines at `35 / 51`.
+- `IpBacktrackingLineSearch.cpp`: `824 / 993` lines and `200 / 252` branches
+  hit, with active-watch uncovered branch lines at `26 / 42`.
 
 The script exits nonzero if any unhit Rust core branch-like line remains
 classified as `needs audit`; those branches must either get a focused witness or
@@ -88,6 +88,10 @@ The latest focused run added source-option witnesses for:
   `kappa_sigma=1` accepted-trial safeguard witness
 - `IpIpoptCalculatedQuantities.cpp::kappa_d=0` plus
   `IpOrigIpoptNLP.cpp::bound_relax_factor=0` on a bound-constrained problem
+- `IpPDPerturbationHandler.cpp::perturb_always_cd=yes`, where NLIP now applies
+  IPOPT's permanent `delta_c` / `delta_d` constraint-linearization perturbation
+  from the first augmented-system solve instead of waiting for a singularity
+  trigger
 - `IpBacktrackingLineSearch.cpp::alpha_red_factor` through NLIP's
   `line_search_beta` option
 - `IpBacktrackingLineSearch.cpp::Eval_Error` trial backtracking: the IPOPT
@@ -141,7 +145,8 @@ The latest focused run added source-option witnesses for:
   unpromoted until a deterministic source-built witness appears.
 - `IpBacktrackingLineSearch.cpp::tiny_step_tol=0`
 - `IpBacktrackingLineSearch.cpp::alpha_for_y` values `bound-mult`, `min`,
-  `max`, `full`, `primal-and-full`, and `dual-and-full`
+  `max`, `full`, `min-dual-infeas`, `safer-min-dual-infeas`,
+  `primal-and-full`, and `dual-and-full`
 - `IpBacktrackingLineSearch.cpp::alpha_for_y_tol` through strict
   `primal-and-full` / `dual-and-full` option profiles
 - `IpIpoptAlg.cpp::ConvergenceCheck::MAXITER_EXCEEDED` via `max_iter=0`
@@ -165,6 +170,32 @@ The latest focused run added source-option witnesses for:
   iterations and `IpRestoConvCheck.cpp` restoration-phase callback stops
 - `IpOptErrorConvCheck.cpp::CONVERGED_TO_ACCEPTABLE_POINT` via tight strict
   tolerances, loose acceptable tolerances, and `acceptable_iter=1`
+- `IpBacktrackingLineSearch.cpp::PerformMagicStep` via `magic_steps=yes` on the
+  linearly constrained quadratic witness. NLIP now exposes the option and
+  applies IPOPT's upper-slack projection slice before trial acceptability.
+- `IpAdaptiveMuUpdate.cpp::adaptive_mu_restore_previous_iterate=yes` plus
+  non-default `adaptive_mu_kkterror_red_iters` /
+  `adaptive_mu_kkterror_red_fact`: NLIP now snapshots the accepted free-mu
+  iterate, restores it on free-to-fixed mode switches, computes the first fixed
+  barrier parameter from the restored complementarity and safeguard terms, and
+  restarts the same outer iteration so state, residuals, Hessian, and KKT RHS
+  are recomputed from the restored point before the solve.
+- `IpAlgBuilder.cpp` restoration-phase `resto.mu_strategy=adaptive` handoff:
+  NLIP now exposes restoration-prefixed mu strategy/oracle/globalization/minimum
+  options, applies IPOPT's more conservative default restoration `mu_min`, and
+  compares the explicit `resto.mu_strategy=adaptive`, `resto.mu_oracle=loqo`,
+  `resto.adaptive_mu_globalization=never-monotone-mode` square-equality
+  restoration witness against source-built IPOPT.
+- `IpQualityFunctionMuOracle.cpp` `HaveDeltas` handoff:
+  the quality-function oracle now stores the combined affine-plus-centering
+  direction, `PDSearchDirCalc` seeds the main search-direction solve from it,
+  and the seeded direction goes through IPOPT's full-space residual/refinement
+  loop before accept.  The golden-section search is pinned to IPOPT 3.14's
+  identity `ScaleSigma` / `UnscaleSigma` behavior.
+- `IpPDSearchDirCalc.cpp::mehrotra_algorithm`:
+  the non-default probing/Mehrotra branch now uses the affine direction to build
+  the source complementarity RHS for variable and slack bounds, and the explicit
+  bound-RHS residual replay path is covered by the focused source-built witness.
 - `IpBacktrackingLineSearch.cpp::DetectTinyStep` via intentionally large
   `tiny_step_tol` and `tiny_step_y_tol`
 - `IpRestoIpoptNLP.cpp` / `IpRestoIterateInitializer.cpp` restoration NLP
@@ -210,28 +241,65 @@ The latest focused run added source-option witnesses for:
   as source IPOPT, including `IpIpoptAlg.cpp::ComputeFeasibilityMultipliersPostprocess`
   and `SolveSucceeded` classification when the postprocessed square point also
   satisfies the full KKT convergence test
+- `IpPDFullSpaceSolver.cpp::RegisterOptions` / `InitializeImpl` and
+  `Solve::ComputeResidualRatio`: NLIP now exposes the source refinement options
+  `min_refinement_steps`, `max_refinement_steps`, `residual_ratio_max`,
+  `residual_ratio_singular`, and `residual_improvement_factor`, validates the
+  IPOPT order checks, and consumes those values in both regular and restoration
+  `SpralSrc` full-space refinement. The focused non-default witness
+  `compare_native_and_ipopt_with_full_space_refinement_options` keeps NLIP and
+  source IPOPT at seven iterations on the linearly constrained quadratic problem.
 
 These witnesses are wired through `IpoptOptions::raw_options` so normal IPOPT
 solve behavior is unchanged unless a test or diagnostic explicitly requests a
 source option.
+
+## Current Known Differences
+
+This is the hand-maintained backlog for nonlinear IPOPT parity. It is fed by
+the generated `branch-ledger.md` active/watch rows, source inspection, and
+NLIP/IPOPT comparison traces. Every active/watch branch family must either
+appear here, be explicitly unreachable under the current exact-Hessian parity
+options, or be classified as diagnostic/bookkeeping/error handling in the
+generated report.
+
+| Priority | IPOPT source anchor | Rust parity surface | Default-lane impact | Current evidence | Required witness or test |
+| --- | --- | --- | --- | --- | --- |
+| P0 | `IpAugRestoSystemSolver.cpp` restoration KKT reduction | Restoration linear solve inside `optimization/src/interior_point.rs` | Closed hard default-lane gap; current glider trace has no tracked direction, alpha, accepted-direction, or accepted-state drift | The current glider first-divergence diagnostic reports `nlip_steps=152 ipopt_steps=152`, no direction gaps above `1e-8`, no `alpha_pr` / `alpha_du` / `alpha_y` gaps above `1e-16`, no accepted-direction gaps above `1e-8`, and no accepted-state gaps above `1e-10` except barrier subproblem error at index 18 (`3.201e-10`, with no gap above `1e-8`). Mixed/inequality and equality-only restoration both use the pure-Rust reduced restoration KKT path under `SpralSrc`, and prior reduced/regular solve-boundary dumps remain the restoration regression evidence. | Keep the glider first-divergence diagnostic and reduced restoration KKT tests as regressions. Reopen this item only if a fresh witness shows source-order mismatch in reduced RHS, refinement, copy-back, or post-restoration regular KKT assembly. |
+| P1 | IPOPT source defaults plus OCP/studio option wiring | `IpoptOptions::default`, OCP `default_nlip_config`, optimization studio settings | Config/profile gap, not an algorithmic parity gap | `IpoptOptions::default` mirrors IPOPT source termination defaults, but OCP/studio still use a stricter profile. Source-default glider now has a passing NLIP/IPOPT accepted-trace witness. | Decide whether the OCP/studio experience should move from the strict profile to the IPOPT-source-default profile, and pin that choice with explicit option-summary tests. |
+| P2 | `IpAdaptiveMuUpdate.cpp`, `IpAlgBuilder.cpp::BuildMuUpdate`, `IpQualityFunctionMuOracle.cpp`, `IpProbingMuOracle.cpp` | Partial Rust adaptive/free-mu implementation | Mostly covered non-default exact-Hessian feature lane | The `mu_strategy=adaptive` lane now covers `loqo` with `never-monotone-mode`, `loqo` with IPOPT's objective/constraint filter globalization, default and non-default `quality-function` with objective/constraint filter, `probing` with objective/constraint filter, default `kkt-error` globalization, nonzero `adaptive_mu_safeguard_factor`, non-default KKT-error reduction knobs, `adaptive_mu_restore_previous_iterate`, explicit restoration-phase adaptive handoff through `resto.mu_strategy=adaptive`, quality-function `HaveDeltas` seeded search-direction refinement, and the IPOPT identity sigma-space golden-section search. Source-built IPOPT comparisons pass for the linearly constrained quadratic witnesses, the variable-bound `bound_constrained_quadratic_adaptive_quality_function` witness, non-default quality-function norm witnesses (`1-norm`, `2-norm`, `max-norm`), the non-default quality-function centrality/balancing/search witness, and the square-equality adaptive-restoration witness. Helper tests pin adaptive filter coordinate acceptability/frontier update, KKT-error reference-window semantics, fixed/free-mode switch, restore-previous-iterate fixed-mode state selection, restoration-prefixed option overrides/default `mu_min`, the safeguard's initial normalized infeasibility ratio formula, non-default quality-function KKT error terms, and identity sigma-space section search. Remaining adaptive gap is narrower: a natural accepted-trace fixed-mode switch if one is found. | Add a natural accepted-trace fixed-mode switch witness if one is found; otherwise keep the synthetic fixed/free-mode tests as branch coverage. |
+| P3 | `IpFilterLSAcceptor.cpp::TryCorrector` | Rust primal-dual/affine corrector branch in `optimization/src/interior_point.rs` | Covered non-default exact-Hessian feature lane; default profile still keeps `corrector_type=none` | NLIP now mirrors the `TryCorrector` pre-backtracking slot, skip gates, affine/primal-dual complementarity RHS construction, `allow_inexact=true` correction solve, original-alpha filter acceptability test, affine complementarity-reduction rejection, and accepted corrector trial mutation. Focused source-built witnesses `compare_native_and_ipopt_with_primal_dual_corrector` and `compare_native_and_ipopt_with_affine_corrector` pass against IPOPT/SPRAL-source on the linearly constrained quadratic problem. | Broaden only if a natural model uses `corrector_type` and exposes accepted-trace drift; default-lane generated coverage may continue to mark corrector rows unreachable because source defaults set `corrector_type=none`. |
+| P4 | `IpPDPerturbationHandler.cpp` degeneracy and inertia retry branches | Regularization and inertia retry loop | Coverage active-watch backlog | Current glider lane aligns regularization and inertia. Non-default `perturb_always_cd=yes` is implemented and pinned against IPOPT; generated coverage still lists active/watch uncovered branch lines for degeneracy tests, max perturbation, and degen-iteration status transitions. | Reduced witnesses that force each remaining degeneracy/status family while keeping KKT/RHS/direction comparable before the branch. |
+| P5 | `IpPDFullSpaceSolver.cpp::Solve`, `SolveOnce`, `ComputeResidualRatio` | Full-space residual replay, refinement, quality retry | Partly covered non-default exact-Hessian feature lane; remaining rows are live failure/quality witnesses | Regular `SpralSrc` lane is source-backed, the full-space refinement option surface now mirrors IPOPT defaults and non-default settings for `min_refinement_steps`, `max_refinement_steps`, `residual_ratio_max`, `residual_ratio_singular`, and `residual_improvement_factor`, and the failed-refinement branch table now mirrors IPOPT's order: one `IncreaseQuality()` retry, `residual_ratio_singular` accept-current versus pretend-singular split, and accept-current after one pretend-singular retry. Unit tests pin that decision order, and the source-built full-space refinement witness still keeps NLIP/IPOPT at seven iterations. `TryCorrector` covers the `beta != 0` / `Solve(1,1,...)` final assembly shape for affine/primal-dual corrector profiles, and quality-function adaptive mode now covers the `improve_solution=true` seeded residual/refinement path. | Natural reduced witnesses for failed solve, quality retry, pretend-singular and accept-current info markers; no linear-solver-internal edits unless exact KKT/RHS evidence regresses. |
+| P6 | `IpBacktrackingLineSearch.cpp` globalization branches | Line search, watchdog, soft restoration, tiny step, alpha-for-y | Coverage active-watch backlog | Many default and option branches are implemented and tested, including `magic_steps=yes` and the `min-dual-infeas` / `safer-min-dual-infeas` `PerformDualStep` projection formulas; active/watch leftovers remain for fallback, acceptable-restoration fallbacks, almost-feasible restoration, active-watchdog pre-line tiny-step, and natural uppercase `S`. | Focused branch witnesses, starting from natural source-built cases where possible; otherwise synthetic witnesses that still compare accepted state immediately before the branch. |
+| P7 | `IpFilterLSAcceptor.cpp` filter/SOC branches | `optimization/src/filter.rs` and SOC trial loop | Coverage active-watch backlog | Filter formulas, theta-max rejection, objective max-increase rejection, filter-reset counter semantics, SOC method 0/1 paths, and the feasible-reference tiny positive `reference_gradBarrTDelta_` adjustment are covered. Active/watch leftovers remain for natural filter-reset and objective-max witnesses plus SOC switch/failure paths. | Focused accept/reject witnesses with matching trial values and filter state before the branch. |
+| P8 | `IpDefaultIterateInitializer.cpp` initialization branches | Initial iterate setup and least-square primal/dual initialization | Coverage active-watch backlog | Default and several non-default initialization options are covered; generated active/watch rows remain for equality multiplier calculator, initializer failure/error paths, default switch branch, and low-push variants. The apparent zero-`bound_push` main-initializer branch is option-rejected by IPOPT's registered lower bound and should not be chased as a user option witness. | Max-iter-0 state witnesses or explicit option/error classification for branches that cannot be reached through normal TNLP inputs. |
+| P9 | `IpIpoptCalculatedQuantities.cpp` cache/component branches | NLIP diagnostic snapshots and direct component recomputation | Bookkeeping unless values drift | Generated coverage still has active/watch component rows, while cache-hit/miss rows are classified as bookkeeping. | Promote only rows that produce a component-value mismatch in `curr_grad_f`, Jacobian products, damping, bounds, slack distances, or KKT stationarity snapshots. |
+
+The generated coverage report remains the working checklist. When it reports a
+new active/watch line, the line must be assigned to one of the rows above or
+explicitly reclassified as unreachable under parity options,
+diagnostic/bookkeeping, or an option/error path.
 
 ## Branch Ledger
 
 | Branch surface | IPOPT source anchor | Rust parity surface | Classification |
 | --- | --- | --- | --- |
 | Initial bound/slack push and default multiplier setup | `IpDefaultIterateInitializer.cpp` | initial iterate setup, scalar push helpers, `least_square_primal_initialization`, and `least_square_dual_initialization` | Mirrors IPOPT for default parity options plus focused non-default push, multiplier value, mu-based multiplier, `constr_mult_init_max=0`, low-cap least-square rejection, square-problem zero-multiplier witnesses, and requested `least_square_init_primal=yes` / `least_square_init_duals=yes`; warm-start remains unreachable under parity options |
+| Source termination defaults | `IpIpoptData.cpp`, `IpOptErrorConvCheck.cpp` | `IpoptOptions::default`; OCP/studio strict profile remains separate | `IpoptOptions::default` mirrors IPOPT source defaults for `max_iter`, `tol`, absolute infeasibility tolerances, and acceptable-iterate secondary termination. OCP/studio defaults are not flipped yet, but the source-default glider profile now passes with matching accepted-trace length through restoration |
 | Trial vector mutation | `IpIpoptData.cpp::SetTrial*FromStep` | current-plus-step helpers and accepted-trial construction | Mirrors IPOPT dense add branch order; coverage should include alpha-1 and general-alpha paths |
 | Accepted point mutation and bound multiplier correction | `IpIpoptAlg.cpp::AcceptTrialPoint`, `correct_bound_multiplier` | accepted-trial commit and bound multiplier safeguard | Mirrors IPOPT; default branch remains dormant under the broad `kappa_sigma` band, and the focused `kappa_sigma=1` witness forces correction of accepted trial multipliers against source IPOPT |
 | Fixed variables | `IpTNLPAdapter.cpp::fixed_variable_treatment=make_parameter` plus Algorithm component snapshots | fixed-variable projection, sparse column reduction, and full-vector expansion | Mirrors IPOPT's default fixed-variable profile for the fixed-bound quadratic witness; `make_constraint`, `make_parameter_nodual`, and `relax_bounds` fixed-variable modes are outside the parity option profile |
-| Monotone barrier update and line-search reset | `IpMonotoneMuUpdate.cpp`, `IpBacktrackingLineSearch.cpp::Reset` | `next_barrier_parameter`, filter/watchdog reset on mu change | Mirrors IPOPT monotone mode, including positive `mu_target`; adaptive/free-mu branches are unreachable in this lane |
-| Search direction construction | `IpPDSearchDirCalc.cpp` | reduced KKT RHS assembly and direction sign conversion | Mirrors IPOPT for `SpralSrc`; Mehrotra/fast-step branches are unreachable in parity options |
-| Full-space residual and refinement | `IpPDFullSpaceSolver.cpp` | residual replay, refinement, and correction RHS conversion | Mirrors IPOPT; linear-solver-specific internals are out of this nonlinear audit unless exact KKT/RHS evidence regresses |
+| Monotone barrier update and line-search reset | `IpMonotoneMuUpdate.cpp`, `IpBacktrackingLineSearch.cpp::Reset` | `next_barrier_parameter`, filter/watchdog reset on mu change | Mirrors IPOPT's exact-Hessian default monotone mode, including positive `mu_target` |
+| Adaptive barrier update | `IpAdaptiveMuUpdate.cpp`, `IpAlgBuilder.cpp::BuildMuUpdate`, `IpLoqoMuOracle.cpp`, `IpQualityFunctionMuOracle.cpp`, `IpProbingMuOracle.cpp`, `IpFilter.cpp` | `InteriorPointMuStrategy::Adaptive`, LOQO centrality rule, quality-function affine/centering oracle, probing affine oracle, quality-function norm/centrality/balancing/search knobs, identity sigma-space section search, lazy `mu_min`, initial `mu_max_fact`, free-mode `tau`, objective/constraint adaptive filter, default KKT-error reference window, nonzero safeguard, non-default KKT-error reduction knobs, fixed/free-mode switch, restore-previous-iterate, restoration-prefixed option handoff, and line-search reset on source-matching update paths | Mostly covered non-default feature lane. Mirrors `loqo`, `quality-function`, and `probing` source slices against source-built IPOPT for the default adaptive option families, non-default quality-function options, and explicit `resto.mu_strategy=adaptive`; remaining active gap is a natural fixed-mode accepted-trace witness |
+| Search direction construction | `IpPDSearchDirCalc.cpp` | reduced KKT RHS assembly and direction sign conversion | Mirrors IPOPT for `SpralSrc`; non-default Mehrotra probing RHS is implemented and covered, while fast-step remains an option-profile branch |
+| Full-space residual and refinement | `IpPDFullSpaceSolver.cpp` | residual replay, refinement, correction RHS conversion, seeded improve-solution path, and source refinement option surface | Mirrors IPOPT defaults and focused non-default `min_refinement_steps` / `max_refinement_steps` / residual-ratio options; remaining uncovered rows are failure/quality branches or linear-solver-specific internals outside this nonlinear audit unless exact KKT/RHS evidence regresses |
 | Calculated-quantity cache hit/miss | `IpIpoptCalculatedQuantities.cpp::*_cache_.GetCachedResult*` | eager NLIP component snapshots and direct recomputation | Cache hit/miss branches are classified as cache bookkeeping; they may affect runtime but not accepted-state semantics, while component vector values remain covered by callback snapshot assertions |
-| Perturbation and inertia retry policy | `IpPDPerturbationHandler.cpp` | KKT regularization and retry loop | Mirrors IPOPT for active glider lane; degeneracy branches need coverage witnesses before behavior changes |
-| Filter local/global acceptability | `IpFilterLSAcceptor.cpp` | `optimization/src/filter.rs` and line-search trial assessment | Mirrors IPOPT filter formulas and the forced-accept `UpdateForNextIteration` f/h tagging used by `accept_every_trial_step` / `accept_after_max_steps`; coverage must keep f-type, h-type, dominated, and rejection paths visible |
-| Alpha-for-y and dual step | `IpBacktrackingLineSearch.cpp::PerformDualStep` | `alpha_y`, `alpha_du`, multiplier step application | Mirrors IPOPT for the default primal strategy, implemented option-profile strategies, and `alpha_for_y_tol` threshold profiles covered by focused tests |
+| Perturbation and inertia retry policy | `IpPDPerturbationHandler.cpp` | KKT regularization and retry loop | Mirrors IPOPT for active glider lane and non-default `perturb_always_cd`; remaining degeneracy branches need coverage witnesses before behavior changes |
+| Filter local/global acceptability | `IpFilterLSAcceptor.cpp` | `optimization/src/filter.rs` and line-search trial assessment | Mirrors IPOPT filter formulas, theta-max rejection, objective max-increase rejection, the feasible-reference tiny positive `reference_gradBarrTDelta_` adjustment in `IsFtype`, filter-reset counter semantics, and the forced-accept `UpdateForNextIteration` f/h tagging used by `accept_every_trial_step` / `accept_after_max_steps`; coverage must keep f-type, h-type, dominated, and rejection paths visible |
+| Alpha-for-y and dual step | `IpBacktrackingLineSearch.cpp::PerformDualStep` | `alpha_y`, `alpha_du`, multiplier step application | Mirrors IPOPT for the default primal strategy, implemented option-profile strategies, `min-dual-infeas` / `safer-min-dual-infeas` trial dual-infeasibility projection, and `alpha_for_y_tol` threshold profiles covered by focused tests |
 | SOC | `IpFilterLSAcceptor.cpp::TrySecondOrderCorrection` | SOC trial loop and corrected accepted trial | Mirrors active IPOPT branch including dense `AddOneVector` order and both `soc_method=0` and `soc_method=1` x/s RHS scaling; fallback corrector variants are unreachable |
-| Primal-dual corrector | `IpFilterLSAcceptor.cpp::TryCorrector` | none under parity options | Unreachable under the current parity option profile, which keeps `corrector_type=none`; do not enable IPOPT `corrector_type` raw options for parity acceptance until the full branch is ported source-faithfully |
+| Primal-dual/affine corrector | `IpFilterLSAcceptor.cpp::TryCorrector` | `InteriorPointCorrectorType::{PrimalDual, Affine}` | Mirrors IPOPT for focused non-default option profiles; unreachable under source-default parity options because IPOPT defaults `corrector_type=none` |
 | Watchdog | `IpBacktrackingLineSearch.cpp` watchdog gates | watchdog reference, shortened-step streak, successful watchdog exit, lowercase watchdog trial, StopWatchDog restore/retry, and watchdog trial diagnostics | Mirrors IPOPT state machine for arming after current-direction construction, active-watchdog max-step-only trial search, successful `W` exit under the trace-clean `watchdog_shortened_iter_trigger=3` hanging-chain profile, lowercase `w` non-success trial acceptance, trial-budget `StopWatchDog` restore/retry under a focused CasADi Rosenbrock profile, and evaluation-error `StopWatchDog` retry alpha semantics. The active-watchdog pre-line-search tiny-step stop is implemented with the source distinction that it does not set `skip_first_trial_point`, but no natural end-to-end witness has been found yet |
 | Soft restoration | `IpBacktrackingLineSearch.cpp::TrySoftRestoStep` | `soft_restoration_pderror_reduction_factor`, `max_soft_restoration_iters`, and soft-restoration line-search state | Mirrors IPOPT's soft-restoration entry after failed rigorous line search for the lowercase `s` primal-dual-error reduction path, including the original-filter augmentation, same-alpha primal/dual trial step, and skipped watchdog shortened-step update while `in_soft_resto_phase_` remains active. The uppercase `S` return-to-original-criterion path is implemented and now has a bounded quiet-journal search, but no natural focused witness has been found |
 | Tiny step | `IpBacktrackingLineSearch.cpp::DetectTinyStep` | tiny-step acceptance and barrier-update tag | Mirrors IPOPT; focused tests exercise unchecked tiny-step acceptance, while the `tiny_step_tol=0` witness covers the disabled branch |
@@ -241,7 +309,7 @@ source option.
 | Wall-time exit | `IpOptErrorConvCheck.cpp::max_wall_time`, `IpIpoptAlg.cpp::WALLTIME_EXCEEDED` | `InteriorPointSolveError::WallTimeExceeded` and failure context | Mirrors IPOPT's positive-option bound and termination ordering after convergence/divergence; focused test forces the iteration-0 branch with `max_wall_time=1e-12` and compares IPOPT's `MaximumWallTimeExceeded` status |
 | CPU-time exit | `IpOptErrorConvCheck.cpp::max_cpu_time`, `IpIpoptAlg.cpp::CPUTIME_EXCEEDED` | `InteriorPointSolveError::CpuTimeExceeded` and failure context | Mirrors IPOPT's positive-option bound and source termination ordering before wall time; focused test forces the iteration-0 branch with `max_cpu_time=1e-12` and compares IPOPT's `MaximumCpuTimeExceeded` status |
 | User-requested stop | `IpOptErrorConvCheck.cpp::IntermediateCallBack`, `IpRestoConvCheck.cpp::CheckConvergence`, `IpIpoptAlg.cpp::USER_STOP` / `RESTORATION_USER_STOP` | `solve_nlp_interior_point_with_control_callback` and `InteriorPointSolveError::UserRequestedStop` | Mirrors IPOPT's false intermediate-callback return path after an accepted step and inside restoration; focused tests compare both solvers' retained state and IPOPT's `UserRequestedStop` status |
-| Restoration | `IpBacktrackingLineSearch.cpp` restoration entry plus `IpRestoIpoptNLP.cpp` / `IpRestoIterateInitializer.cpp` / `IpRestoMinC_1Nrm.cpp` / `IpRestoConvCheck.cpp` / `IpIpoptAlg.cpp` emergency mode | restoration diagnostic path | Mirrors IPOPT for the current source-SPRAL parity profile; the restoration NLP mirrors IPOPT's `rho`, `eta=sqrt(mu)`, objective/Jacobian/Hessian shape, original-objective eval-error probe, raised `resto.theta_max_fact`, source `n_c` / `p_c` and `n_d` / `p_d` quadratic initializer for equality and `d-s` residuals. On a restoration return, NLIP copies the restoration slack, applies IPOPT's `ComputeBoundMultiplierStep` plus the default `bound_mult_reset_threshold=1e3`, resets original constraint multipliers to zero like `resto.constr_mult_init_max=0`, gates the return through IPOPT's `RestoConvergenceCheck` original-problem progress rules with the active `max_iter` budget, `max_resto_iter` successive-iteration limit, and `expect_infeasible_problem` first-restoration return threshold, maps square-problem feasible restoration returns through `ComputeFeasibilityMultipliersPostprocess` and classifies them as `Converged` when the full KKT test is satisfied or `FeasiblePointFound` otherwise, maps restoration callback stops to `UserRequestedStop`, maps restoration iteration-limit exits to `MaxIterations`, maps restoration original-objective evaluation-error max-iteration cases to `MaxIterations`, maps emergency-restoration local infeasibility and one-shot `start_with_resto` entry to `InteriorPointSolveError::LocalInfeasibility` like IPOPT's `InfeasibleProblemDetected`, and mirrors the expect-infeasible y-multiplier restoration shortcut. No source-SPRAL restoration behavior mismatch is known after the current focused suite and glider diagnostic |
+| Restoration | `IpBacktrackingLineSearch.cpp` restoration entry plus `IpRestoIpoptNLP.cpp` / `IpRestoIterateInitializer.cpp` / `IpRestoMinC_1Nrm.cpp` / `IpIpoptAlg.cpp` emergency mode / `IpAugRestoSystemSolver.cpp` | restoration diagnostic path | Mirrors IPOPT for the restoration NLP shape, initialization, original-objective eval-error probe, raised `resto.theta_max_fact`, source `n_c` / `p_c` and `n_d` / `p_d` quadratic initializer, original-progress return gate, copied slack, bound multiplier copy-back/reset, default zeroed original constraint multipliers, callback stops, iteration-limit exits, emergency local-infeasibility entry, one-shot `start_with_resto`, and expect-infeasible y-multiplier shortcut. Phase tests pin `IpAugRestoSystemSolver` formulas for `sigma_tilde_*`, `D_x_plus_wr_d`, equality and inequality `Rhs_*R`, source `D_d` overwrite behavior, and residual-variable back-substitution. Mixed/inequality and equality-only restoration now use the reduced-KKT production path under `SpralSrc`; the current glider first-divergence diagnostic has no tracked direction, alpha, accepted-direction, or accepted-state drift above the report thresholds |
 
 ## Rust-Only Branch Audit
 
@@ -255,62 +323,44 @@ part of IPOPT parity must be either unreachable or diagnostic:
 | SQP/trust-region solver branches in `optimization/src/lib.rs` | Out of scope for NLIP/IPOPT parity |
 | Verbose logging and debug dump branches | Diagnostic only; they must not change accepted state |
 | Error reporting and failure-context construction | Diagnostic only except deterministic failure witnesses such as the source-backed `max_iter=0` and `max_iter=1` status tests |
+| Restoration status mapping | Source-backed status classification; covered by restoration subproblem and phase status tests, and not an accepted-state mutation branch |
 
 The active Rust core parity surface has no accepted-state-changing branch that
 is intentionally Rust-only. Any future branch found by `rust-core.lcov` that is
 active under the `SpralSrc` parity profile must be classified here before a
 behavior change is accepted.
 
-Known remaining nonlinear parity witness searches:
+Known remaining nonlinear parity work:
 
-- IPOPT active-watchdog `StopWatchDog` after trial-budget exhaustion is now
-  covered: NLIP restores the stored watchdog iterate and direction, clears the
-  active watchdog state, skips the already-tested first trial, and retries from
-  the stored line-search reference. NLIP also carries the pre-line-search
-  `in_watchdog_ && tiny_step` stop path from
-  `IpBacktrackingLineSearch.cpp::FindAcceptableTrialPoint`; unlike the
-  trial-budget branch, this path retries the stored direction at the stored
-  maximum step without setting `skip_first_trial_point`, and the rule is pinned
-  by a focused unit test plus the ignored `print_watchdog_tiny_stop_profile_sweep`
-  search harness. The current empirical sweep did not find a natural source-built
-  problem witness for that path. Evaluation-error trial handling is now covered
-  by a deterministic nonfinite-trial witness and the watchdog restore alpha
-  branch is pinned to IPOPT's skip-first semantics. The restoration diagnostic
-  path now carries IPOPT's `n_c` / `p_c` and `n_d` / `p_d` residual variables,
-  uses `RestoIterateInitializer`'s quadratic formula for both equality and
-  `d-s` residuals, copies restoration slack back to the original iterate, and
-  applies `MinC_1NrmRestorationPhase::ComputeBoundMultiplierStep` before
-  resetting default restoration constraint multipliers to zero. It also applies
-  `RestoConvergenceCheck`'s original-problem return gate, including square
-  problem feasibility and filter/current-iterate acceptability, and carries
-  `MinC_1NrmRestorationPhase::PerformRestoration`'s square
-  `FEASIBILITY_PROBLEM_SOLVED` result as a native `FeasiblePointFound`
-  termination. The emergency `goto_resto` path after failed
-  `ComputeSearchDirection` is now covered by an impossible square-equality
-  witness that matches IPOPT's local-infeasibility return status, the one-shot
-  `start_with_resto` option and the expect-infeasible y-multiplier shortcut now
-  have matching natural witnesses, and the same witness now pins
-  restoration-phase user callback stops to IPOPT's outer
-  `UserRequestedStop` status. NLIP also mirrors
-  `RestoIpoptNLP::f`'s default original-objective eval-error probe and
-  `RestoConvergenceCheck::InitializeImpl`'s active `max_iter` budget instead of
-  applying a Rust-only restoration iteration clamp. The focused
-  `max_resto_iter=0` witness now pins `RestoConvCheck`'s successive restoration
-  iteration limit and IPOPT's restoration iteration numbering. The restoration
-  subproblem now also mirrors `MinC_1NrmRestorationPhase`'s raised default
-  `resto.theta_max_fact=1e8`. The synthetic restoration original-objective
-  eval-error case now matches IPOPT's tiny restoration-step
-  `MaximumIterationsExceeded` behavior. No accepted-state-changing nonlinear
-  behavior difference is known in the source-SPRAL parity profile. Remaining
-  witness searches are for naturally occurring IPOPT `RESTORATION_FAILED` /
-  recoverable restoration returns, a natural uppercase `S` soft-restoration
-  return-to-original-criterion path, and a natural active-watchdog pre-line
-  tiny-step path; the corresponding Rust branches are implemented or classified
-  but do not currently have natural end-to-end witnesses.
+1. Keep P0 as a regression, not an active implementation gap: the current
+   glider first-divergence diagnostic reports `nlip_steps=152 ipopt_steps=152`
+   with no tracked direction, alpha, accepted-direction, or accepted-state
+   drift above the report thresholds. The next implementation should only
+   touch restoration if a fresh witness shows a source-order mismatch in
+   restoration reduced RHS, solution, refinement, copy-back arithmetic, or
+   post-restoration regular KKT assembly.
+2. Decide whether OCP and optimization-studio defaults should move from the
+   current strict profile to the IPOPT-source-default profile. Profile
+   differences must not be reported as algorithmic parity gaps.
+3. Treat adaptive mu and corrector support as non-default exact-Hessian feature
+   lanes. Both now have source-built witness coverage for the implemented option
+   families; the remaining adaptive item is a natural accepted-trace fixed-mode
+   switch witness if one can be found.
+4. Burn down the coverage active/watch backlog by family: perturbation/inertia,
+   full-space refinement and quality retry, line-search/fallback/watchdog/soft
+   restoration, filter/SOC edge cases, initialization edge cases, and
+   calculated-quantity component branches. Each accepted-state-changing branch
+   needs a deterministic IPOPT/NLIP witness; cache-only and diagnostic branches
+   should stay classified as bookkeeping.
+5. Keep searching for natural end-to-end witnesses for IPOPT
+   `RESTORATION_FAILED` / recoverable restoration returns, uppercase `S` soft
+   restoration return-to-original-criterion, and the active-watchdog
+   pre-line-search tiny-step path. The corresponding Rust branches are
+   implemented or classified, but still lack natural source-built witnesses.
 
-The generated `branch-ledger.md` report is the working checklist for this
-audit. IPOPT uncovered branches in the watched routines should either gain a
-focused witness or stay explicitly unreachable for the current option profile.
-Rust branch-like lines reported as `needs audit` should be driven to one of the
-classifications above, or converted into a source-backed test if they affect
-accepted state.
+The generated `branch-ledger.md` report is the working checklist for this audit.
+IPOPT uncovered branches in the watched routines must either map to the
+`Current Known Differences` table, gain a focused witness, or stay explicitly
+unreachable/diagnostic for the current exact-Hessian option profile. Rust
+branch-like lines reported as `needs audit` must be driven to one of those
+classifications before the coverage run is accepted.

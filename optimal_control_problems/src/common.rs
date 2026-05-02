@@ -89,8 +89,10 @@ pub enum ControlSemantic {
     TimeGridBreakpoint,
     TimeGridFirstIntervalFraction,
     SolverMethod,
+    SolverProfile,
     SolverGlobalization,
     SolverMaxIterations,
+    SolverOverallTolerance,
     SolverHessianRegularization,
     SolverNlipLinearSolver,
     SolverNlipSpralPivotMethod,
@@ -162,6 +164,14 @@ pub struct ControlSpec {
     pub value_display: ControlValueDisplay,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub choices: Vec<ControlChoice>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profile_defaults: Vec<ControlProfileDefault>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct ControlProfileDefault {
+    pub profile: f64,
+    pub value: f64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1567,12 +1577,29 @@ fn nlip_failure_diagnostic_lines(error: &InteriorPointSolveError) -> Vec<String>
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SolverConfig {
+    pub profile: SolverProfile,
     pub max_iters: usize,
+    pub overall_tol: f64,
     pub dual_tol: f64,
     pub constraint_tol: f64,
     pub complementarity_tol: f64,
     pub sqp: SqpMethodConfig,
     pub nlip: NlipConfig,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SolverProfile {
+    StrictOcp,
+    IpoptDefault,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SolverProfileDefaults {
+    max_iters: usize,
+    overall_tol: f64,
+    dual_tol: f64,
+    constraint_tol: f64,
+    complementarity_tol: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2228,8 +2255,10 @@ enum SharedControlId {
     SxFunctionBoundaryInequalities,
     SxFunctionMultipleShootingIntegrator,
     SolverMethod,
+    SolverProfile,
     SolverGlobalization,
     SolverMaxIterations,
+    SolverOverallTolerance,
     SolverHessianRegularization,
     SolverNlipLinearSolver,
     SolverNlipSpralPivotMethod,
@@ -2289,8 +2318,10 @@ impl SharedControlId {
             Self::SxFunctionBoundaryInequalities => "sxf_boundary_inequalities",
             Self::SxFunctionMultipleShootingIntegrator => "sxf_multiple_shooting_integrator",
             Self::SolverMethod => "solver_method",
+            Self::SolverProfile => "solver_profile",
             Self::SolverGlobalization => "solver_globalization",
             Self::SolverMaxIterations => "solver_max_iters",
+            Self::SolverOverallTolerance => "solver_overall_tol",
             Self::SolverHessianRegularization => "solver_hessian_regularization",
             Self::SolverNlipLinearSolver => "solver_nlip_linear_solver",
             Self::SolverNlipSpralPivotMethod => "solver_nlip_spral_pivot_method",
@@ -3862,22 +3893,66 @@ pub fn default_sqp_method_config() -> SqpMethodConfig {
 pub const fn default_nlip_config() -> NlipConfig {
     NlipConfig {
         // IPOPT 3.14.20 `IpSpralSolverInterface` defaults to native SPRAL with
-        // matching ordering/scaling and block APP pivoting. The Rust SPRAL
-        // reimplementation is still an explicit non-default comparison lane.
+        // matching ordering/scaling and `spral_pivot_method=block`. IPOPT maps
+        // that option to raw SPRAL control value 1, which corresponds to
+        // SPRAL's aggressive APP constant in the native C/Fortran API.
         linear_solver: InteriorPointLinearSolver::SpralSrc,
-        spral_pivot_method: InteriorPointSpralPivotMethod::BlockAposteriori,
+        spral_pivot_method: InteriorPointSpralPivotMethod::AggressiveAposteriori,
         spral_action_on_zero_pivot: true,
         spral_small_pivot_tolerance: 1.0e-20,
         spral_threshold_pivot_u: 1.0e-8,
     }
 }
 
-pub fn default_solver_config() -> SolverConfig {
-    SolverConfig {
+pub fn default_solver_profile() -> SolverProfile {
+    SolverProfile::StrictOcp
+}
+
+fn strict_ocp_solver_profile_defaults() -> SolverProfileDefaults {
+    SolverProfileDefaults {
         max_iters: 200,
+        overall_tol: 1.0e-8,
         dual_tol: 1.0e-6,
         constraint_tol: 1.0e-8,
         complementarity_tol: 1.0e-6,
+    }
+}
+
+fn ipopt_default_solver_profile_defaults() -> SolverProfileDefaults {
+    SolverProfileDefaults {
+        max_iters: 3000,
+        overall_tol: 1.0e-8,
+        dual_tol: 1.0,
+        constraint_tol: 1.0e-4,
+        complementarity_tol: 1.0e-4,
+    }
+}
+
+fn solver_profile_defaults_for(
+    strict_defaults: SolverConfig,
+    profile: SolverProfile,
+) -> SolverProfileDefaults {
+    match profile {
+        SolverProfile::StrictOcp => SolverProfileDefaults {
+            max_iters: strict_defaults.max_iters,
+            overall_tol: strict_defaults.overall_tol,
+            dual_tol: strict_defaults.dual_tol,
+            constraint_tol: strict_defaults.constraint_tol,
+            complementarity_tol: strict_defaults.complementarity_tol,
+        },
+        SolverProfile::IpoptDefault => ipopt_default_solver_profile_defaults(),
+    }
+}
+
+pub fn default_solver_config() -> SolverConfig {
+    let defaults = strict_ocp_solver_profile_defaults();
+    SolverConfig {
+        profile: default_solver_profile(),
+        max_iters: defaults.max_iters,
+        overall_tol: defaults.overall_tol,
+        dual_tol: defaults.dual_tol,
+        constraint_tol: defaults.constraint_tol,
+        complementarity_tol: defaults.complementarity_tol,
         sqp: default_sqp_method_config(),
         nlip: default_nlip_config(),
     }
@@ -4080,6 +4155,24 @@ where
 
 fn with_control_panel(mut control: ControlSpec, panel: ControlPanel) -> ControlSpec {
     control.panel = Some(panel);
+    control
+}
+
+fn with_solver_profile_defaults(
+    mut control: ControlSpec,
+    strict_value: f64,
+    ipopt_default_value: f64,
+) -> ControlSpec {
+    control.profile_defaults = vec![
+        ControlProfileDefault {
+            profile: solver_profile_value(SolverProfile::StrictOcp),
+            value: strict_value,
+        },
+        ControlProfileDefault {
+            profile: solver_profile_value(SolverProfile::IpoptDefault),
+            value: ipopt_default_value,
+        },
+    ];
     control
 }
 
@@ -4358,6 +4451,7 @@ fn time_grid_slider_control(
         semantic,
         value_display: ControlValueDisplay::Scalar,
         choices: Vec::new(),
+        profile_defaults: Vec::new(),
     }
 }
 
@@ -4496,6 +4590,7 @@ fn transcription_interval_control(default: usize, supported_intervals: &[usize])
         semantic: ControlSemantic::TranscriptionIntervals,
         value_display: ControlValueDisplay::Integer,
         choices: Vec::new(),
+        profile_defaults: Vec::new(),
     }
 }
 
@@ -4516,6 +4611,7 @@ fn interval_bounds(supported_intervals: &[usize], default: usize) -> (usize, usi
 }
 
 pub fn solver_controls(default_method: SolverMethod, default: SolverConfig) -> Vec<ControlSpec> {
+    let ipopt_profile_defaults = ipopt_default_solver_profile_defaults();
     let default_line_search = config_line_search(&default);
     let default_filter = config_filter(&default);
     let default_trust_region = config_trust_region(&default);
@@ -4542,6 +4638,17 @@ pub fn solver_controls(default_method: SolverMethod, default: SolverConfig) -> V
             ControlSemantic::SolverMethod,
         ),
         select_control(
+            SharedControlId::SolverProfile.id(),
+            "Profile",
+            solver_profile_value(default.profile),
+            "",
+            "Choose the default solver option profile. Text fields left blank inherit the selected profile; entered values are explicit overrides.",
+            &solver_profile_choices(),
+            ControlSection::Solver,
+            ControlVisibility::Always,
+            ControlSemantic::SolverProfile,
+        ),
+        select_control(
             SharedControlId::SolverGlobalization.id(),
             "SQP Globalization",
             sqp_globalization_mode_value(default_globalization),
@@ -4552,14 +4659,31 @@ pub fn solver_controls(default_method: SolverMethod, default: SolverConfig) -> V
             ControlVisibility::Always,
             ControlSemantic::SolverGlobalization,
         ),
-        text_control(
-            SharedControlId::SolverMaxIterations.id(),
-            "Max Iterations",
+        with_solver_profile_defaults(
+            text_control(
+                SharedControlId::SolverMaxIterations.id(),
+                "Max Iterations",
+                default.max_iters as f64,
+                "",
+                "Maximum nonlinear iterations before the selected solver terminates.",
+                ControlSemantic::SolverMaxIterations,
+                ControlValueDisplay::Integer,
+            ),
             default.max_iters as f64,
-            "",
-            "Maximum nonlinear iterations before the selected solver terminates.",
-            ControlSemantic::SolverMaxIterations,
-            ControlValueDisplay::Integer,
+            ipopt_profile_defaults.max_iters as f64,
+        ),
+        with_solver_profile_defaults(
+            text_control(
+                SharedControlId::SolverOverallTolerance.id(),
+                "Overall Tolerance",
+                default.overall_tol,
+                "",
+                "Termination threshold on the scaled overall NLP error.",
+                ControlSemantic::SolverOverallTolerance,
+                ControlValueDisplay::Scientific,
+            ),
+            default.overall_tol,
+            ipopt_profile_defaults.overall_tol,
         ),
         select_control(
             SharedControlId::SolverHessianRegularization.id(),
@@ -4592,7 +4716,7 @@ pub fn solver_controls(default_method: SolverMethod, default: SolverConfig) -> V
             "NLIP SPRAL Pivoting",
             nlip_spral_pivot_method_value(default.nlip.spral_pivot_method),
             "",
-            "Pivoting strategy for SPRAL-based NLIP KKT solves. Ipopt defaults to block a posteriori pivoting.",
+            "Pivoting strategy for SPRAL-based NLIP KKT solves. IPOPT's spral_pivot_method=block default maps to native SPRAL raw control value 1.",
             &nlip_spral_pivot_method_choices(),
             ControlSection::Solver,
             ControlVisibility::Always,
@@ -4631,32 +4755,44 @@ pub fn solver_controls(default_method: SolverMethod, default: SolverConfig) -> V
             ControlSemantic::SolverNlipSpralPivotU,
             ControlValueDisplay::Scientific,
         ),
-        text_control(
-            SharedControlId::SolverDualTolerance.id(),
-            "Dual Tolerance",
+        with_solver_profile_defaults(
+            text_control(
+                SharedControlId::SolverDualTolerance.id(),
+                "Dual Tolerance",
+                default.dual_tol,
+                "",
+                "Termination threshold on the dual infeasibility norm.",
+                ControlSemantic::SolverDualTolerance,
+                ControlValueDisplay::Scientific,
+            ),
             default.dual_tol,
-            "",
-            "Termination threshold on the dual infeasibility norm.",
-            ControlSemantic::SolverDualTolerance,
-            ControlValueDisplay::Scientific,
+            ipopt_profile_defaults.dual_tol,
         ),
-        text_control(
-            SharedControlId::SolverConstraintTolerance.id(),
-            "Constraint Tolerance",
+        with_solver_profile_defaults(
+            text_control(
+                SharedControlId::SolverConstraintTolerance.id(),
+                "Constraint Tolerance",
+                default.constraint_tol,
+                "",
+                "Termination threshold on equality and inequality infeasibility.",
+                ControlSemantic::SolverConstraintTolerance,
+                ControlValueDisplay::Scientific,
+            ),
             default.constraint_tol,
-            "",
-            "Termination threshold on equality and inequality infeasibility.",
-            ControlSemantic::SolverConstraintTolerance,
-            ControlValueDisplay::Scientific,
+            ipopt_profile_defaults.constraint_tol,
         ),
-        text_control(
-            SharedControlId::SolverComplementarityTolerance.id(),
-            "Complementarity Tolerance",
+        with_solver_profile_defaults(
+            text_control(
+                SharedControlId::SolverComplementarityTolerance.id(),
+                "Complementarity Tolerance",
+                default.complementarity_tol,
+                "",
+                "Termination threshold on complementarity residuals.",
+                ControlSemantic::SolverComplementarityTolerance,
+                ControlValueDisplay::Scientific,
+            ),
             default.complementarity_tol,
-            "",
-            "Termination threshold on complementarity residuals.",
-            ControlSemantic::SolverComplementarityTolerance,
-            ControlValueDisplay::Scientific,
+            ipopt_profile_defaults.complementarity_tol,
         ),
         text_control(
             SharedControlId::SolverExactMeritPenalty.id(),
@@ -4889,6 +5025,17 @@ fn solver_method_choices() -> Vec<(f64, &'static str)> {
     out
 }
 
+fn solver_profile_value(profile: SolverProfile) -> f64 {
+    match profile {
+        SolverProfile::StrictOcp => 0.0,
+        SolverProfile::IpoptDefault => 1.0,
+    }
+}
+
+fn solver_profile_choices() -> Vec<(f64, &'static str)> {
+    vec![(0.0, "Strict OCP"), (1.0, "IPOPT Default")]
+}
+
 fn solver_globalization_choices() -> Vec<(f64, &'static str)> {
     vec![
         (0.0, "LS Filter"),
@@ -4926,8 +5073,8 @@ fn nlip_spral_pivot_method_value(method: InteriorPointSpralPivotMethod) -> f64 {
 
 fn nlip_spral_pivot_method_choices() -> Vec<(f64, &'static str)> {
     vec![
-        (0.0, "Aggressive APP"),
-        (1.0, "Block APP"),
+        (0.0, "Aggressive APP / IPOPT block"),
+        (1.0, "Block APP / SPRAL raw 2"),
         (2.0, "Threshold Partial"),
     ]
 }
@@ -4957,15 +5104,37 @@ pub fn solver_config_from_map(
     let default_line_search = config_line_search(&default);
     let default_filter = config_filter(&default);
     let default_trust_region = config_trust_region(&default);
+    let profile = match parse_enum_choice(
+        sample_shared_or_default(
+            values,
+            SharedControlId::SolverProfile,
+            solver_profile_value(default.profile),
+        ),
+        SharedControlId::SolverProfile,
+        &[0.0, 1.0],
+    )? {
+        0 => SolverProfile::StrictOcp,
+        1 => SolverProfile::IpoptDefault,
+        _ => unreachable!("validated solver profile choice"),
+    };
+    let profile_defaults = solver_profile_defaults_for(default, profile);
     let max_iters = expect_nonnegative_finite(
         sample_shared_or_default(
             values,
             SharedControlId::SolverMaxIterations,
-            default.max_iters as f64,
+            profile_defaults.max_iters as f64,
         ),
         SharedControlId::SolverMaxIterations.id(),
     )?
     .round() as usize;
+    let overall_tol = expect_positive_finite(
+        sample_shared_or_default(
+            values,
+            SharedControlId::SolverOverallTolerance,
+            profile_defaults.overall_tol,
+        ),
+        SharedControlId::SolverOverallTolerance.id(),
+    )?;
     let hessian_regularization_enabled = match parse_enum_choice(
         sample_shared_or_default(
             values,
@@ -4987,7 +5156,7 @@ pub fn solver_config_from_map(
         sample_shared_or_default(
             values,
             SharedControlId::SolverDualTolerance,
-            default.dual_tol,
+            profile_defaults.dual_tol,
         ),
         SharedControlId::SolverDualTolerance.id(),
     )?;
@@ -4995,7 +5164,7 @@ pub fn solver_config_from_map(
         sample_shared_or_default(
             values,
             SharedControlId::SolverConstraintTolerance,
-            default.constraint_tol,
+            profile_defaults.constraint_tol,
         ),
         SharedControlId::SolverConstraintTolerance.id(),
     )?;
@@ -5003,7 +5172,7 @@ pub fn solver_config_from_map(
         sample_shared_or_default(
             values,
             SharedControlId::SolverComplementarityTolerance,
-            default.complementarity_tol,
+            profile_defaults.complementarity_tol,
         ),
         SharedControlId::SolverComplementarityTolerance.id(),
     )?;
@@ -5483,7 +5652,9 @@ pub fn solver_config_from_map(
         _ => unreachable!("validated SQP globalization choice"),
     };
     Ok(SolverConfig {
+        profile,
         max_iters,
+        overall_tol,
         dual_tol,
         constraint_tol,
         complementarity_tol,
@@ -6020,23 +6191,52 @@ pub fn sqp_options(config: &SolverConfig) -> ClarabelSqpOptions {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct AcceptableTerminationOptions {
+    tol: f64,
+    iter: usize,
+    dual_inf_tol: f64,
+    constr_viol_tol: f64,
+    compl_inf_tol: f64,
+    obj_change_tol: f64,
+}
+
+fn acceptable_termination_options(config: &SolverConfig) -> AcceptableTerminationOptions {
+    let tol = (100.0 * config.overall_tol).max(config.overall_tol);
+    match config.profile {
+        SolverProfile::StrictOcp => AcceptableTerminationOptions {
+            tol,
+            iter: 15,
+            dual_inf_tol: config.dual_tol,
+            constr_viol_tol: config.constraint_tol,
+            compl_inf_tol: config.complementarity_tol,
+            obj_change_tol: 1.0e20,
+        },
+        SolverProfile::IpoptDefault => AcceptableTerminationOptions {
+            tol,
+            iter: 15,
+            dual_inf_tol: 1.0e10,
+            constr_viol_tol: 1.0e-2,
+            compl_inf_tol: 1.0e-2,
+            obj_change_tol: 1.0e20,
+        },
+    }
+}
+
 pub fn nlip_options(config: &SolverConfig) -> InteriorPointOptions {
-    let tol = config
-        .dual_tol
-        .min(config.constraint_tol)
-        .min(config.complementarity_tol);
+    let acceptable = acceptable_termination_options(config);
     InteriorPointOptions {
         max_iters: config.max_iters,
         dual_tol: config.dual_tol,
         constraint_tol: config.constraint_tol,
         complementarity_tol: config.complementarity_tol,
-        overall_tol: tol,
-        acceptable_tol: tol,
-        acceptable_iter: 0,
-        acceptable_dual_inf_tol: config.dual_tol,
-        acceptable_constr_viol_tol: config.constraint_tol,
-        acceptable_compl_inf_tol: config.complementarity_tol,
-        acceptable_obj_change_tol: 1e20,
+        overall_tol: config.overall_tol,
+        acceptable_tol: acceptable.tol,
+        acceptable_iter: acceptable.iter,
+        acceptable_dual_inf_tol: acceptable.dual_inf_tol,
+        acceptable_constr_viol_tol: acceptable.constr_viol_tol,
+        acceptable_compl_inf_tol: acceptable.compl_inf_tol,
+        acceptable_obj_change_tol: acceptable.obj_change_tol,
         linear_solver: config.nlip.linear_solver,
         spral_pivot_method: config.nlip.spral_pivot_method,
         spral_action_on_zero_pivot: config.nlip.spral_action_on_zero_pivot,
@@ -6048,14 +6248,16 @@ pub fn nlip_options(config: &SolverConfig) -> InteriorPointOptions {
 
 #[cfg(feature = "ipopt")]
 pub fn ipopt_options(config: &SolverConfig) -> IpoptOptions {
-    let tol = config
-        .dual_tol
-        .min(config.constraint_tol)
-        .min(config.complementarity_tol);
+    let acceptable = acceptable_termination_options(config);
     IpoptOptions {
         max_iters: config.max_iters,
-        tol,
-        acceptable_tol: Some((100.0 * tol).max(tol)),
+        tol: config.overall_tol,
+        acceptable_tol: Some(acceptable.tol),
+        acceptable_iter: Some(acceptable.iter),
+        acceptable_dual_tol: Some(acceptable.dual_inf_tol),
+        acceptable_constraint_tol: Some(acceptable.constr_viol_tol),
+        acceptable_complementarity_tol: Some(acceptable.compl_inf_tol),
+        acceptable_obj_change_tol: Some(acceptable.obj_change_tol),
         constraint_tol: Some(config.constraint_tol),
         complementarity_tol: Some(config.complementarity_tol),
         dual_tol: Some(config.dual_tol),
@@ -6216,6 +6418,7 @@ pub fn select_control<S: AsRef<str>>(
         semantic,
         value_display: ControlValueDisplay::Scalar,
         choices: choice_list,
+        profile_defaults: Vec::new(),
     }
 }
 
@@ -6244,6 +6447,7 @@ pub fn text_control(
         semantic,
         value_display,
         choices: Vec::new(),
+        profile_defaults: Vec::new(),
     }
 }
 
@@ -6320,6 +6524,7 @@ fn problem_slider_control_with_display(
         semantic: ControlSemantic::ProblemParameter,
         value_display,
         choices: Vec::new(),
+        profile_defaults: Vec::new(),
     }
 }
 
@@ -9587,9 +9792,45 @@ mod tests {
         );
     }
 
+    fn assert_nlip_ipopt_termination_options_match(config: SolverConfig) {
+        let nlip = nlip_options(&config);
+        assert_eq!(nlip.overall_tol, config.overall_tol);
+        assert_eq!(nlip.acceptable_iter, 15);
+
+        #[cfg(feature = "ipopt")]
+        {
+            let ipopt = ipopt_options(&config);
+            assert_eq!(nlip.max_iters, ipopt.max_iters);
+            assert_eq!(nlip.overall_tol, ipopt.tol);
+            assert_eq!(nlip.dual_tol, ipopt.dual_tol.unwrap());
+            assert_eq!(nlip.constraint_tol, ipopt.constraint_tol.unwrap());
+            assert_eq!(nlip.complementarity_tol, ipopt.complementarity_tol.unwrap());
+            assert_eq!(Some(nlip.acceptable_tol), ipopt.acceptable_tol);
+            assert_eq!(Some(nlip.acceptable_iter), ipopt.acceptable_iter);
+            assert_eq!(
+                Some(nlip.acceptable_dual_inf_tol),
+                ipopt.acceptable_dual_tol
+            );
+            assert_eq!(
+                Some(nlip.acceptable_constr_viol_tol),
+                ipopt.acceptable_constraint_tol
+            );
+            assert_eq!(
+                Some(nlip.acceptable_compl_inf_tol),
+                ipopt.acceptable_complementarity_tol
+            );
+            assert_eq!(
+                Some(nlip.acceptable_obj_change_tol),
+                ipopt.acceptable_obj_change_tol
+            );
+        }
+    }
+
     #[test]
-    fn nlip_overall_tolerance_tracks_ipopt_tol() {
+    fn nlip_and_ipopt_strict_ocp_profile_termination_options_match() {
         let config = SolverConfig {
+            profile: SolverProfile::StrictOcp,
+            overall_tol: 1.0e-8,
             dual_tol: 1.0e-5,
             constraint_tol: 1.0e-8,
             complementarity_tol: 1.0e-6,
@@ -9598,13 +9839,38 @@ mod tests {
 
         let nlip = nlip_options(&config);
         assert_eq!(nlip.overall_tol, 1.0e-8);
-        assert_eq!(nlip.acceptable_tol, 1.0e-8);
+        assert_eq!(nlip.acceptable_tol, 1.0e-6);
+        assert_eq!(nlip.acceptable_iter, 15);
+        assert_eq!(nlip.acceptable_dual_inf_tol, config.dual_tol);
+        assert_eq!(nlip.acceptable_constr_viol_tol, config.constraint_tol);
+        assert_eq!(nlip.acceptable_compl_inf_tol, config.complementarity_tol);
 
-        #[cfg(feature = "ipopt")]
-        {
-            let ipopt = ipopt_options(&config);
-            assert_eq!(nlip.overall_tol, ipopt.tol);
-        }
+        assert_nlip_ipopt_termination_options_match(config);
+    }
+
+    #[test]
+    fn nlip_and_ipopt_source_default_profile_termination_options_match() {
+        let parsed = solver_config_from_map(
+            &BTreeMap::from([("solver_profile".to_string(), 1.0)]),
+            default_solver_config(),
+        )
+        .expect("solver config should parse source-default profile");
+
+        assert_eq!(parsed.profile, SolverProfile::IpoptDefault);
+        assert_eq!(parsed.max_iters, 3000);
+        assert_eq!(parsed.overall_tol, 1.0e-8);
+        assert_eq!(parsed.dual_tol, 1.0);
+        assert_eq!(parsed.constraint_tol, 1.0e-4);
+        assert_eq!(parsed.complementarity_tol, 1.0e-4);
+
+        let nlip = nlip_options(&parsed);
+        assert_eq!(nlip.acceptable_tol, 1.0e-6);
+        assert_eq!(nlip.acceptable_iter, 15);
+        assert_eq!(nlip.acceptable_dual_inf_tol, 1.0e10);
+        assert_eq!(nlip.acceptable_constr_viol_tol, 1.0e-2);
+        assert_eq!(nlip.acceptable_compl_inf_tol, 1.0e-2);
+
+        assert_nlip_ipopt_termination_options_match(parsed);
     }
 
     #[test]
@@ -10051,6 +10317,78 @@ mod tests {
     }
 
     #[test]
+    fn solver_controls_expose_profile_defaults_for_text_overrides() {
+        let controls = solver_controls(default_solver_method(), default_solver_config());
+        let profile = controls
+            .iter()
+            .find(|control| control.id == "solver_profile")
+            .expect("expected solver profile control");
+        assert_eq!(profile.editor, ControlEditor::Select);
+        assert_eq!(
+            profile.default,
+            solver_profile_value(SolverProfile::StrictOcp)
+        );
+        assert_eq!(profile.choices[0].label, "Strict OCP");
+        assert_eq!(profile.choices[1].label, "IPOPT Default");
+
+        let max_iters = controls
+            .iter()
+            .find(|control| control.id == "solver_max_iters")
+            .expect("expected max-iterations control");
+        assert_eq!(
+            max_iters.profile_defaults,
+            vec![
+                ControlProfileDefault {
+                    profile: solver_profile_value(SolverProfile::StrictOcp),
+                    value: 200.0,
+                },
+                ControlProfileDefault {
+                    profile: solver_profile_value(SolverProfile::IpoptDefault),
+                    value: 3000.0,
+                },
+            ]
+        );
+
+        let dual_tol = controls
+            .iter()
+            .find(|control| control.id == "solver_dual_tol")
+            .expect("expected dual tolerance control");
+        assert_eq!(dual_tol.profile_defaults[0].value, 1.0e-6);
+        assert_eq!(dual_tol.profile_defaults[1].value, 1.0);
+    }
+
+    #[test]
+    fn solver_config_from_map_uses_selected_profile_defaults_and_text_overrides() {
+        let parsed = solver_config_from_map(
+            &BTreeMap::from([("solver_profile".to_string(), 1.0)]),
+            default_solver_config(),
+        )
+        .expect("solver config should parse IPOPT profile");
+        assert_eq!(parsed.profile, SolverProfile::IpoptDefault);
+        assert_eq!(parsed.max_iters, 3000);
+        assert_eq!(parsed.overall_tol, 1.0e-8);
+        assert_eq!(parsed.dual_tol, 1.0);
+        assert_eq!(parsed.constraint_tol, 1.0e-4);
+        assert_eq!(parsed.complementarity_tol, 1.0e-4);
+
+        let parsed = solver_config_from_map(
+            &BTreeMap::from([
+                ("solver_profile".to_string(), 1.0),
+                ("solver_max_iters".to_string(), 42.0),
+                ("solver_overall_tol".to_string(), 1.0e-10),
+                ("solver_dual_tol".to_string(), 1.0e-9),
+            ]),
+            default_solver_config(),
+        )
+        .expect("solver config should parse overridden IPOPT profile");
+        assert_eq!(parsed.profile, SolverProfile::IpoptDefault);
+        assert_eq!(parsed.max_iters, 42);
+        assert_eq!(parsed.overall_tol, 1.0e-10);
+        assert_eq!(parsed.dual_tol, 1.0e-9);
+        assert_eq!(parsed.constraint_tol, 1.0e-4);
+    }
+
+    #[test]
     fn solver_config_from_map_parses_nlip_linear_solver_choice() {
         let mut values = BTreeMap::new();
         values.insert("solver_nlip_linear_solver".to_string(), 2.0);
@@ -10088,8 +10426,21 @@ mod tests {
     #[test]
     fn default_ipopt_options_select_spral_explicitly() {
         let options = ipopt_options(&default_solver_config());
+        assert_eq!(options.max_iters, 200);
+        assert_eq!(options.tol, 1.0e-8);
+        assert_eq!(options.dual_tol, Some(1.0e-6));
+        assert_eq!(options.constraint_tol, Some(1.0e-8));
+        assert_eq!(options.complementarity_tol, Some(1.0e-6));
+        assert_eq!(options.acceptable_tol, Some(1.0e-6));
+        assert_eq!(options.acceptable_iter, Some(15));
+        assert_eq!(options.acceptable_dual_tol, Some(1.0e-6));
+        assert_eq!(options.acceptable_constraint_tol, Some(1.0e-8));
+        assert_eq!(options.acceptable_complementarity_tol, Some(1.0e-6));
         assert_eq!(options.linear_solver, Some(IpoptLinearSolver::Spral));
+        assert_eq!(options.mu_strategy, optimization::IpoptMuStrategy::Monotone);
         assert!(format_ipopt_settings_summary(&options).contains("linear_solver=spral"));
+        assert!(format_ipopt_settings_summary(&options).contains("mu_strategy=monotone"));
+        assert!(format_ipopt_settings_summary(&options).contains("acceptable_iter=15"));
     }
 
     #[test]
@@ -10098,7 +10449,7 @@ mod tests {
         assert_eq!(default.linear_solver, InteriorPointLinearSolver::SpralSrc);
         assert_eq!(
             default.spral_pivot_method,
-            InteriorPointSpralPivotMethod::BlockAposteriori
+            InteriorPointSpralPivotMethod::AggressiveAposteriori
         );
         assert!(default.spral_action_on_zero_pivot);
         assert_eq!(default.spral_small_pivot_tolerance, 1.0e-20);

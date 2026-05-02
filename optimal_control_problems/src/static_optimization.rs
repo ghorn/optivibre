@@ -136,6 +136,7 @@ impl Default for HangingChainParams {
     fn default() -> Self {
         let mut solver = default_solver_config();
         solver.max_iters = 120;
+        solver.overall_tol = 1.0e-9;
         solver.constraint_tol = 1.0e-9;
         solver.dual_tol = 1.0e-7;
         solver.complementarity_tol = 1.0e-7;
@@ -247,6 +248,7 @@ impl Default for RosenbrockParams {
     fn default() -> Self {
         let mut solver = default_solver_config();
         solver.max_iters = 80;
+        solver.overall_tol = 1.0e-9;
         solver.dual_tol = 1.0e-8;
         solver.constraint_tol = 1.0e-9;
         solver.complementarity_tol = 1.0e-8;

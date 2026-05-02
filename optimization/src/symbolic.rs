@@ -1056,9 +1056,29 @@ impl CompiledJitNlp {
         inequality_multipliers: &[f64],
         out: &mut [f64],
     ) -> SqpAdapterTiming {
+        self.lagrangian_hessian_values_with_objective_factor_timed(
+            x,
+            parameters,
+            1.0,
+            equality_multipliers,
+            inequality_multipliers,
+            out,
+        )
+    }
+
+    fn lagrangian_hessian_values_with_objective_factor_timed(
+        &self,
+        x: &[f64],
+        parameters: &[ParameterMatrix<'_>],
+        objective_factor: f64,
+        equality_multipliers: &[f64],
+        inequality_multipliers: &[f64],
+        out: &mut [f64],
+    ) -> SqpAdapterTiming {
         let timing = self.lagrangian_hessian_values.eval_hessian_timed(
             x,
             parameters,
+            objective_factor,
             equality_multipliers,
             inequality_multipliers,
             out,
@@ -3114,6 +3134,35 @@ where
             *value *= factor;
         }
     }
+
+    fn lagrangian_hessian_values_with_objective_factor(
+        &self,
+        x: &[f64],
+        parameters: &[ParameterMatrix<'_>],
+        objective_factor: f64,
+        equality_multipliers: &[f64],
+        inequality_multipliers: &[f64],
+        out: &mut [f64],
+    ) {
+        let unscaled_x = self.scaling.unscale_x(x);
+        let base_equality_multipliers = self
+            .scaling
+            .scale_hessian_equality_multipliers(equality_multipliers);
+        let base_inequality_multipliers = self
+            .scaling
+            .scale_hessian_inequality_multipliers(inequality_multipliers);
+        self.base.lagrangian_hessian_values_with_objective_factor(
+            &unscaled_x,
+            parameters,
+            objective_factor,
+            &base_equality_multipliers,
+            &base_inequality_multipliers,
+            out,
+        );
+        for (value, factor) in out.iter_mut().zip(self.scaling.hessian_factors.iter()) {
+            *value *= factor;
+        }
+    }
 }
 
 impl CompiledNlpProblem for CompiledJitNlp {
@@ -3207,6 +3256,25 @@ impl CompiledNlpProblem for CompiledJitNlp {
             out,
         );
     }
+
+    fn lagrangian_hessian_values_with_objective_factor(
+        &self,
+        x: &[f64],
+        parameters: &[ParameterMatrix<'_>],
+        objective_factor: f64,
+        equality_multipliers: &[f64],
+        inequality_multipliers: &[f64],
+        out: &mut [f64],
+    ) {
+        let _ = self.lagrangian_hessian_values_with_objective_factor_timed(
+            x,
+            parameters,
+            objective_factor,
+            equality_multipliers,
+            inequality_multipliers,
+            out,
+        );
+    }
 }
 
 impl CompiledNlpProblem for DynamicCompiledJitNlp {
@@ -3295,6 +3363,25 @@ impl CompiledNlpProblem for DynamicCompiledJitNlp {
         self.inner.lagrangian_hessian_values(
             x,
             parameters,
+            equality_multipliers,
+            inequality_multipliers,
+            out,
+        );
+    }
+
+    fn lagrangian_hessian_values_with_objective_factor(
+        &self,
+        x: &[f64],
+        parameters: &[ParameterMatrix<'_>],
+        objective_factor: f64,
+        equality_multipliers: &[f64],
+        inequality_multipliers: &[f64],
+        out: &mut [f64],
+    ) {
+        self.inner.lagrangian_hessian_values_with_objective_factor(
+            x,
+            parameters,
+            objective_factor,
             equality_multipliers,
             inequality_multipliers,
             out,
@@ -3449,6 +3536,40 @@ impl CompiledNlpProblem for RuntimeBoundedJitNlp<'_> {
             layout_projection: layout_started.elapsed(),
         });
     }
+
+    fn lagrangian_hessian_values_with_objective_factor(
+        &self,
+        x: &[f64],
+        parameters: &[ParameterMatrix<'_>],
+        objective_factor: f64,
+        equality_multipliers: &[f64],
+        inequality_multipliers: &[f64],
+        out: &mut [f64],
+    ) {
+        let layout_started = Instant::now();
+        let mut base_inequality_multipliers = vec![0.0; self.base.inequality_base_count()];
+        for (multiplier, transform) in inequality_multipliers
+            .iter()
+            .zip(self.inequality_mapping.rows.iter())
+        {
+            base_inequality_multipliers[transform.source_index] += transform.sign * multiplier;
+        }
+        let base_timing = self
+            .base
+            .lagrangian_hessian_values_with_objective_factor_timed(
+                x,
+                parameters,
+                objective_factor,
+                equality_multipliers,
+                &base_inequality_multipliers,
+                out,
+            );
+        self.record_adapter_timing(SqpAdapterTiming {
+            callback_evaluation: base_timing.callback_evaluation,
+            output_marshalling: base_timing.output_marshalling,
+            layout_projection: layout_started.elapsed(),
+        });
+    }
 }
 
 impl InequalityMapping {
@@ -3524,7 +3645,7 @@ impl JitKernel {
         parameters: &[ParameterMatrix<'_>],
     ) -> (f64, KernelEvalTiming) {
         let mut context = lock_context(&self.context);
-        load_jit_inputs(&self.function, &mut context, x, parameters, &[], &[]);
+        load_jit_inputs(&self.function, &mut context, x, parameters, 1.0, &[], &[]);
         let eval_started = Instant::now();
         self.function.eval(&mut context);
         let evaluation = eval_started.elapsed();
@@ -3547,7 +3668,7 @@ impl JitKernel {
         out: &mut [f64],
     ) -> KernelEvalTiming {
         let mut context = lock_context(&self.context);
-        load_jit_inputs(&self.function, &mut context, x, parameters, &[], &[]);
+        load_jit_inputs(&self.function, &mut context, x, parameters, 1.0, &[], &[]);
         let eval_started = Instant::now();
         self.function.eval(&mut context);
         let evaluation = eval_started.elapsed();
@@ -3564,6 +3685,7 @@ impl JitKernel {
         &self,
         x: &[f64],
         parameters: &[ParameterMatrix<'_>],
+        objective_factor: f64,
         equality_multipliers: &[f64],
         inequality_multipliers: &[f64],
         out: &mut [f64],
@@ -3574,6 +3696,7 @@ impl JitKernel {
             &mut context,
             x,
             parameters,
+            objective_factor,
             equality_multipliers,
             inequality_multipliers,
         );
@@ -3783,7 +3906,9 @@ fn derive_symbolic_functions(
 
     let mut hessian_inputs = base_inputs.clone();
     let lagrangian_started = Instant::now();
-    let mut lagrangian = symbolic.objective.scalar_expr()?;
+    let objective_factor = SXMatrix::sym("objective_factor", CoreCcs::scalar())?;
+    let mut lagrangian = objective_factor.scalar_expr()? * symbolic.objective.scalar_expr()?;
+    hessian_inputs.push(NamedMatrix::new("objective_factor", objective_factor)?);
     let equality_count = symbolic.equalities.as_ref().map_or(0, SXMatrix::nnz);
     if let Some(equalities) = &symbolic.equalities {
         let lambda = SXMatrix::sym("lambda_equalities", CoreCcs::column_vector(equality_count)?)?;
@@ -3866,6 +3991,7 @@ fn lock_context<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CompiledNlpInputRole {
     DecisionVariables,
+    ObjectiveFactor,
     EqualityMultipliers,
     InequalityMultipliers,
     Parameter,
@@ -3874,6 +4000,7 @@ enum CompiledNlpInputRole {
 fn compiled_nlp_input_role(slot_name: &str) -> CompiledNlpInputRole {
     match slot_name {
         "x" => CompiledNlpInputRole::DecisionVariables,
+        "objective_factor" => CompiledNlpInputRole::ObjectiveFactor,
         "lambda_equalities" => CompiledNlpInputRole::EqualityMultipliers,
         "lambda_inequalities" => CompiledNlpInputRole::InequalityMultipliers,
         _ => CompiledNlpInputRole::Parameter,
@@ -3885,6 +4012,7 @@ fn load_jit_inputs(
     context: &mut JitExecutionContext,
     x: &[f64],
     parameters: &[ParameterMatrix<'_>],
+    objective_factor: f64,
     equality_multipliers: &[f64],
     inequality_multipliers: &[f64],
 ) {
@@ -3893,6 +4021,7 @@ fn load_jit_inputs(
         let input = context.input_mut(slot_index);
         match compiled_nlp_input_role(&slot.name) {
             CompiledNlpInputRole::DecisionVariables => input.copy_from_slice(x),
+            CompiledNlpInputRole::ObjectiveFactor => input[0] = objective_factor,
             CompiledNlpInputRole::EqualityMultipliers => {
                 input.copy_from_slice(equality_multipliers)
             }

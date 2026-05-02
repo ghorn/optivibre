@@ -3,11 +3,15 @@
 use approx::assert_abs_diff_eq;
 use optimization::{
     CCS, CompiledNlpProblem, ConstraintBounds, FilterAcceptanceMode,
+    InteriorPointAdaptiveMuGlobalization, InteriorPointAdaptiveMuOracle,
     InteriorPointAlphaForYStrategy, InteriorPointBoundMultiplierInitMethod,
-    InteriorPointIterationEvent, InteriorPointIterationPhase, InteriorPointIterationSnapshot,
-    InteriorPointOptions, InteriorPointSecondOrderCorrectionMethod, InteriorPointSolveError,
-    InteriorPointStatusKind, InteriorPointStepKind, InteriorPointTermination, IpoptIterationPhase,
-    IpoptIterationSnapshot, IpoptOptions, IpoptRawOption, IpoptRawStatus, IpoptSolveError,
+    InteriorPointCorrectorType, InteriorPointIterationEvent, InteriorPointIterationPhase,
+    InteriorPointIterationSnapshot, InteriorPointLinearSolver, InteriorPointMuStrategy,
+    InteriorPointOptions, InteriorPointQualityFunctionBalancingTerm,
+    InteriorPointQualityFunctionCentrality, InteriorPointQualityFunctionNorm,
+    InteriorPointSecondOrderCorrectionMethod, InteriorPointSolveError, InteriorPointStatusKind,
+    InteriorPointStepKind, InteriorPointTermination, IpoptIterationPhase, IpoptIterationSnapshot,
+    IpoptMuStrategy, IpoptOptions, IpoptRawOption, IpoptRawStatus, IpoptSolveError,
     ParameterMatrix, apply_native_spral_parity_to_ipopt_options,
     apply_native_spral_parity_to_nlip_options, solve_nlp_interior_point,
     solve_nlp_interior_point_with_callback, solve_nlp_interior_point_with_control_callback,
@@ -2135,6 +2139,281 @@ fn compare_native_and_ipopt_with_soc_method_one() {
 }
 
 #[test]
+fn compare_native_and_ipopt_with_primal_dual_corrector() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        native_options_with(|options| {
+            options.max_iters = 200;
+            options.corrector_type = InteriorPointCorrectorType::PrimalDual;
+            options.skip_corrector_if_negative_curvature = false;
+            options.skip_corrector_in_monotone_mode = false;
+            options.second_order_correction = false;
+            options.max_second_order_corrections = 0;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        ipopt_options_with(|options| {
+            options.max_iters = 200;
+            options
+                .raw_options
+                .push(IpoptRawOption::text("corrector_type", "primal-dual"));
+            options
+                .raw_options
+                .push(IpoptRawOption::text("skip_corr_if_neg_curv", "no"));
+            options
+                .raw_options
+                .push(IpoptRawOption::text("skip_corr_in_monotone_mode", "no"));
+            options
+                .raw_options
+                .push(IpoptRawOption::integer("max_soc", 0));
+        }),
+    );
+    assert_native_event_seen(
+        "linearly_constrained_quadratic_primal_dual_corrector",
+        &native,
+        InteriorPointIterationEvent::CorrectorAttempted,
+    );
+    assert_native_event_seen(
+        "linearly_constrained_quadratic_primal_dual_corrector",
+        &native,
+        InteriorPointIterationEvent::CorrectorAccepted,
+    );
+    assert_native_matches_ipopt(
+        "linearly_constrained_quadratic_primal_dual_corrector",
+        None,
+        &native,
+        &ipopt,
+        1e-6,
+        1e-6,
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_with_affine_corrector() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        native_options_with(|options| {
+            options.max_iters = 200;
+            options.corrector_type = InteriorPointCorrectorType::Affine;
+            options.skip_corrector_if_negative_curvature = false;
+            options.skip_corrector_in_monotone_mode = false;
+            options.second_order_correction = false;
+            options.max_second_order_corrections = 0;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        ipopt_options_with(|options| {
+            options.max_iters = 200;
+            options
+                .raw_options
+                .push(IpoptRawOption::text("corrector_type", "affine"));
+            options
+                .raw_options
+                .push(IpoptRawOption::text("skip_corr_if_neg_curv", "no"));
+            options
+                .raw_options
+                .push(IpoptRawOption::text("skip_corr_in_monotone_mode", "no"));
+            options
+                .raw_options
+                .push(IpoptRawOption::integer("max_soc", 0));
+        }),
+    );
+    assert_native_event_seen(
+        "linearly_constrained_quadratic_affine_corrector",
+        &native,
+        InteriorPointIterationEvent::CorrectorAttempted,
+    );
+    assert_native_matches_ipopt(
+        "linearly_constrained_quadratic_affine_corrector",
+        None,
+        &native,
+        &ipopt,
+        1e-6,
+        1e-6,
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_with_perturb_always_cd() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        native_options_with(|options| {
+            options.max_iters = 200;
+            options.perturb_always_cd = true;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        ipopt_options_with(|options| {
+            options.max_iters = 200;
+            options
+                .raw_options
+                .push(IpoptRawOption::text("perturb_always_cd", "yes"));
+        }),
+    );
+
+    assert_native_matches_ipopt(
+        "linearly_constrained_quadratic_perturb_always_cd",
+        None,
+        &native,
+        &ipopt,
+        1e-6,
+        1e-6,
+    );
+    assert_accepted_trace_parity(
+        "linearly_constrained_quadratic_perturb_always_cd",
+        &native,
+        &ipopt,
+        AcceptedTraceParityTolerances {
+            max_iteration_gap: 2,
+            max_step_tag_mismatches: 2,
+            max_primal_log_gap: 1.5,
+            max_dual_log_gap: 13.0,
+            max_mu_log_gap: 2.0,
+            max_regularization_log_gap: 1.0,
+        },
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_with_full_space_refinement_options() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        native_options_with(|options| {
+            options.max_iters = 200;
+            options.min_refinement_steps = 2;
+            options.max_refinement_steps = 2;
+            options.residual_ratio_max = 1.0e-10;
+            options.residual_ratio_singular = 1.0e-5;
+            options.residual_improvement_factor = 0.5;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        ipopt_options_with(|options| {
+            options.max_iters = 200;
+            options
+                .raw_options
+                .push(IpoptRawOption::integer("min_refinement_steps", 2));
+            options
+                .raw_options
+                .push(IpoptRawOption::integer("max_refinement_steps", 2));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("residual_ratio_max", 1.0e-10));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("residual_ratio_singular", 1.0e-5));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("residual_improvement_factor", 0.5));
+        }),
+    );
+
+    assert_native_matches_ipopt(
+        "linearly_constrained_quadratic_refinement_options",
+        None,
+        &native,
+        &ipopt,
+        1e-6,
+        1e-6,
+    );
+    assert_accepted_trace_parity(
+        "linearly_constrained_quadratic_refinement_options",
+        &native,
+        &ipopt,
+        AcceptedTraceParityTolerances {
+            max_iteration_gap: 2,
+            max_step_tag_mismatches: 2,
+            max_primal_log_gap: 1.5,
+            max_dual_log_gap: 13.0,
+            max_mu_log_gap: 2.0,
+            max_regularization_log_gap: 1.0,
+        },
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_with_magic_steps() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        native_options_with(|options| {
+            options.max_iters = 200;
+            options.magic_steps = true;
+            options.second_order_correction = false;
+            options.max_second_order_corrections = 0;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        ipopt_options_with(|options| {
+            options.max_iters = 200;
+            options
+                .raw_options
+                .push(IpoptRawOption::text("magic_steps", "yes"));
+            options
+                .raw_options
+                .push(IpoptRawOption::integer("max_soc", 0));
+        }),
+    );
+    assert_native_matches_ipopt(
+        "linearly_constrained_quadratic_magic_steps",
+        None,
+        &native,
+        &ipopt,
+        1e-6,
+        1e-6,
+    );
+    assert_accepted_trace_parity(
+        "linearly_constrained_quadratic_magic_steps",
+        &native,
+        &ipopt,
+        AcceptedTraceParityTolerances {
+            max_iteration_gap: 0,
+            max_step_tag_mismatches: 0,
+            max_primal_log_gap: 0.05,
+            max_dual_log_gap: 0.05,
+            // This tiny witness exercises the magic-step branch but remains
+            // sensitive to the already-known final monotone-mu update edge.
+            max_mu_log_gap: 2.0,
+            max_regularization_log_gap: 0.05,
+        },
+    );
+}
+
+#[test]
 fn compare_native_and_ipopt_on_box_bounds_regression() {
     skip_without_native_spral!();
     let problem = BoundConstrainedQuadraticProblem;
@@ -3295,6 +3574,610 @@ fn compare_native_and_ipopt_with_positive_mu_target() {
 }
 
 #[test]
+fn compare_native_and_ipopt_with_adaptive_loqo_never_monotone_mu() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        native_options_with(|options| {
+            options.mu_strategy = InteriorPointMuStrategy::Adaptive;
+            options.adaptive_mu_oracle = InteriorPointAdaptiveMuOracle::Loqo;
+            options.adaptive_mu_globalization =
+                InteriorPointAdaptiveMuGlobalization::NeverMonotoneMode;
+            options.max_iters = 200;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        ipopt_options_with(|options| {
+            options.mu_strategy = IpoptMuStrategy::Adaptive;
+            options.max_iters = 200;
+            options
+                .raw_options
+                .push(IpoptRawOption::text("mu_oracle", "loqo"));
+            options.raw_options.push(IpoptRawOption::text(
+                "adaptive_mu_globalization",
+                "never-monotone-mode",
+            ));
+        }),
+    );
+    assert_native_matches_ipopt_with_final_tolerances(
+        "linearly_constrained_quadratic_adaptive_loqo_never_monotone_mu",
+        None,
+        &native,
+        &ipopt,
+        FinalParityTolerances {
+            x: 1e-5,
+            objective: 1e-5,
+            primal: 1e-5,
+            native_dual: 1e-4,
+            ipopt_dual: 1e-5,
+            complementarity: 1e-5,
+        },
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_with_adaptive_loqo_obj_constr_filter_mu() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        native_options_with(|options| {
+            options.mu_strategy = InteriorPointMuStrategy::Adaptive;
+            options.adaptive_mu_oracle = InteriorPointAdaptiveMuOracle::Loqo;
+            options.adaptive_mu_globalization =
+                InteriorPointAdaptiveMuGlobalization::ObjectiveConstraintFilter;
+            options.max_iters = 200;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        ipopt_options_with(|options| {
+            options.mu_strategy = IpoptMuStrategy::Adaptive;
+            options.max_iters = 200;
+            options
+                .raw_options
+                .push(IpoptRawOption::text("mu_oracle", "loqo"));
+            options.raw_options.push(IpoptRawOption::text(
+                "adaptive_mu_globalization",
+                "obj-constr-filter",
+            ));
+        }),
+    );
+    assert_native_matches_ipopt_with_final_tolerances(
+        "linearly_constrained_quadratic_adaptive_loqo_obj_constr_filter_mu",
+        None,
+        &native,
+        &ipopt,
+        FinalParityTolerances {
+            x: 1e-5,
+            objective: 1e-5,
+            primal: 1e-5,
+            native_dual: 1e-4,
+            ipopt_dual: 1e-5,
+            complementarity: 1e-5,
+        },
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_with_adaptive_loqo_nonzero_safeguard() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        native_options_with(|options| {
+            options.mu_strategy = InteriorPointMuStrategy::Adaptive;
+            options.adaptive_mu_oracle = InteriorPointAdaptiveMuOracle::Loqo;
+            options.adaptive_mu_globalization =
+                InteriorPointAdaptiveMuGlobalization::ObjectiveConstraintFilter;
+            options.adaptive_mu_safeguard_factor = 0.25;
+            options.max_iters = 300;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        ipopt_options_with(|options| {
+            options.mu_strategy = IpoptMuStrategy::Adaptive;
+            options.max_iters = 300;
+            options
+                .raw_options
+                .push(IpoptRawOption::text("mu_oracle", "loqo"));
+            options.raw_options.push(IpoptRawOption::text(
+                "adaptive_mu_globalization",
+                "obj-constr-filter",
+            ));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("adaptive_mu_safeguard_factor", 0.25));
+        }),
+    );
+    assert_native_matches_ipopt_with_final_tolerances(
+        "linearly_constrained_quadratic_adaptive_loqo_nonzero_safeguard",
+        None,
+        &native,
+        &ipopt,
+        FinalParityTolerances {
+            x: 1e-5,
+            objective: 1e-5,
+            primal: 1e-5,
+            native_dual: 1e-4,
+            ipopt_dual: 1e-5,
+            complementarity: 1e-5,
+        },
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_with_adaptive_loqo_kkt_error_globalization() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        native_options_with(|options| {
+            options.mu_strategy = InteriorPointMuStrategy::Adaptive;
+            options.adaptive_mu_oracle = InteriorPointAdaptiveMuOracle::Loqo;
+            options.adaptive_mu_globalization = InteriorPointAdaptiveMuGlobalization::KktError;
+            options.max_iters = 300;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        ipopt_options_with(|options| {
+            options.mu_strategy = IpoptMuStrategy::Adaptive;
+            options.max_iters = 300;
+            options
+                .raw_options
+                .push(IpoptRawOption::text("mu_oracle", "loqo"));
+            options.raw_options.push(IpoptRawOption::text(
+                "adaptive_mu_globalization",
+                "kkt-error",
+            ));
+        }),
+    );
+    assert_native_matches_ipopt_with_final_tolerances(
+        "linearly_constrained_quadratic_adaptive_loqo_kkt_error_globalization",
+        None,
+        &native,
+        &ipopt,
+        FinalParityTolerances {
+            x: 1e-5,
+            objective: 1e-5,
+            primal: 1e-5,
+            native_dual: 1e-4,
+            ipopt_dual: 1e-5,
+            complementarity: 1e-5,
+        },
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_with_adaptive_loqo_restore_previous_iterate() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        native_options_with(|options| {
+            options.mu_strategy = InteriorPointMuStrategy::Adaptive;
+            options.adaptive_mu_oracle = InteriorPointAdaptiveMuOracle::Loqo;
+            options.adaptive_mu_globalization = InteriorPointAdaptiveMuGlobalization::KktError;
+            options.adaptive_mu_restore_previous_iterate = true;
+            // IPOPT 3.14.20 accepts `adaptive_mu_kkterror_red_iters=0`, but with
+            // restore-previous-iterate it can switch before any accepted point
+            // was remembered. Use one reference plus a tiny required decrease
+            // to force the same source branch after a real free-mu accepted
+            // point exists.
+            options.adaptive_mu_kkt_error_red_iters = 1;
+            options.adaptive_mu_kkt_error_red_fact = 1e-16;
+            options.max_iters = 300;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        ipopt_options_with(|options| {
+            options.mu_strategy = IpoptMuStrategy::Adaptive;
+            options.max_iters = 300;
+            options
+                .raw_options
+                .push(IpoptRawOption::text("mu_oracle", "loqo"));
+            options.raw_options.push(IpoptRawOption::text(
+                "adaptive_mu_globalization",
+                "kkt-error",
+            ));
+            options.raw_options.push(IpoptRawOption::text(
+                "adaptive_mu_restore_previous_iterate",
+                "yes",
+            ));
+            options
+                .raw_options
+                .push(IpoptRawOption::integer("adaptive_mu_kkterror_red_iters", 1));
+            options.raw_options.push(IpoptRawOption::number(
+                "adaptive_mu_kkterror_red_fact",
+                1e-16,
+            ));
+        }),
+    );
+    assert_native_matches_ipopt_with_final_tolerances(
+        "linearly_constrained_quadratic_adaptive_loqo_restore_previous_iterate",
+        None,
+        &native,
+        &ipopt,
+        FinalParityTolerances {
+            x: 1e-5,
+            objective: 1e-5,
+            primal: 1e-5,
+            native_dual: 1e-4,
+            ipopt_dual: 1e-5,
+            complementarity: 1e-5,
+        },
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_with_adaptive_quality_function_obj_constr_filter_mu() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        native_options_with(|options| {
+            options.mu_strategy = InteriorPointMuStrategy::Adaptive;
+            options.adaptive_mu_oracle = InteriorPointAdaptiveMuOracle::QualityFunction;
+            options.adaptive_mu_globalization =
+                InteriorPointAdaptiveMuGlobalization::ObjectiveConstraintFilter;
+            options.linear_solver = InteriorPointLinearSolver::SpralSrc;
+            options.max_iters = 200;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        ipopt_options_with(|options| {
+            options.mu_strategy = IpoptMuStrategy::Adaptive;
+            options.max_iters = 200;
+            options
+                .raw_options
+                .push(IpoptRawOption::text("mu_oracle", "quality-function"));
+            options.raw_options.push(IpoptRawOption::text(
+                "adaptive_mu_globalization",
+                "obj-constr-filter",
+            ));
+        }),
+    );
+    assert_native_matches_ipopt_with_final_tolerances(
+        "linearly_constrained_quadratic_adaptive_quality_function_obj_constr_filter_mu",
+        None,
+        &native,
+        &ipopt,
+        FinalParityTolerances {
+            x: 1e-5,
+            objective: 1e-5,
+            primal: 1e-5,
+            native_dual: 1e-4,
+            ipopt_dual: 1e-5,
+            complementarity: 1e-5,
+        },
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_with_adaptive_quality_function_on_box_bounds() {
+    skip_without_native_spral!();
+    let problem = BoundConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[-10.0, 10.0],
+        &[],
+        native_options_with(|options| {
+            options.mu_strategy = InteriorPointMuStrategy::Adaptive;
+            options.adaptive_mu_oracle = InteriorPointAdaptiveMuOracle::QualityFunction;
+            options.adaptive_mu_globalization =
+                InteriorPointAdaptiveMuGlobalization::ObjectiveConstraintFilter;
+            options.linear_solver = InteriorPointLinearSolver::SpralSrc;
+            options.max_iters = 200;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[-10.0, 10.0],
+        &[],
+        ipopt_options_with(|options| {
+            options.mu_strategy = IpoptMuStrategy::Adaptive;
+            options.max_iters = 200;
+            options
+                .raw_options
+                .push(IpoptRawOption::text("mu_oracle", "quality-function"));
+            options.raw_options.push(IpoptRawOption::text(
+                "adaptive_mu_globalization",
+                "obj-constr-filter",
+            ));
+        }),
+    );
+    assert_native_matches_ipopt_with_final_tolerances(
+        "bound_constrained_quadratic_adaptive_quality_function",
+        None,
+        &native,
+        &ipopt,
+        FinalParityTolerances {
+            x: 1e-5,
+            objective: 1e-5,
+            primal: 1e-5,
+            native_dual: 1e-4,
+            ipopt_dual: 1e-5,
+            complementarity: 1e-5,
+        },
+    );
+}
+
+#[rstest]
+#[case::one_norm(InteriorPointQualityFunctionNorm::OneNorm, "1-norm")]
+#[case::max_norm(InteriorPointQualityFunctionNorm::MaxNorm, "max-norm")]
+#[case::two_norm(InteriorPointQualityFunctionNorm::TwoNorm, "2-norm")]
+fn compare_native_and_ipopt_with_adaptive_quality_function_nondefault_norm(
+    #[case] norm: InteriorPointQualityFunctionNorm,
+    #[case] ipopt_norm: &str,
+) {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        native_options_with(|options| {
+            options.mu_strategy = InteriorPointMuStrategy::Adaptive;
+            options.adaptive_mu_oracle = InteriorPointAdaptiveMuOracle::QualityFunction;
+            options.adaptive_mu_globalization =
+                InteriorPointAdaptiveMuGlobalization::ObjectiveConstraintFilter;
+            options.quality_function_norm_type = norm;
+            options.linear_solver = InteriorPointLinearSolver::SpralSrc;
+            options.max_iters = 200;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        ipopt_options_with(|options| {
+            options.mu_strategy = IpoptMuStrategy::Adaptive;
+            options.max_iters = 200;
+            options
+                .raw_options
+                .push(IpoptRawOption::text("mu_oracle", "quality-function"));
+            options.raw_options.push(IpoptRawOption::text(
+                "adaptive_mu_globalization",
+                "obj-constr-filter",
+            ));
+            options.raw_options.push(IpoptRawOption::text(
+                "quality_function_norm_type",
+                ipopt_norm,
+            ));
+        }),
+    );
+    assert_native_matches_ipopt_with_final_tolerances(
+        "linearly_constrained_quadratic_adaptive_quality_function_nondefault_norm",
+        None,
+        &native,
+        &ipopt,
+        FinalParityTolerances {
+            x: 1e-5,
+            objective: 1e-5,
+            primal: 1e-5,
+            native_dual: 1e-4,
+            ipopt_dual: 1e-5,
+            complementarity: 1e-5,
+        },
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_with_adaptive_quality_function_nondefault_terms_and_search() {
+    skip_without_native_spral!();
+    let problem = BoundConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[-10.0, 10.0],
+        &[],
+        native_options_with(|options| {
+            options.mu_strategy = InteriorPointMuStrategy::Adaptive;
+            options.adaptive_mu_oracle = InteriorPointAdaptiveMuOracle::QualityFunction;
+            options.adaptive_mu_globalization =
+                InteriorPointAdaptiveMuGlobalization::ObjectiveConstraintFilter;
+            options.quality_function_centrality = InteriorPointQualityFunctionCentrality::Log;
+            options.quality_function_balancing_term =
+                InteriorPointQualityFunctionBalancingTerm::Cubic;
+            options.quality_function_max_section_steps = 2;
+            options.quality_function_section_sigma_tol = 5e-2;
+            options.quality_function_section_qf_tol = 1e-3;
+            options.sigma_min = 1e-4;
+            options.sigma_max = 10.0;
+            options.linear_solver = InteriorPointLinearSolver::SpralSrc;
+            options.max_iters = 200;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[-10.0, 10.0],
+        &[],
+        ipopt_options_with(|options| {
+            options.mu_strategy = IpoptMuStrategy::Adaptive;
+            options.max_iters = 200;
+            options
+                .raw_options
+                .push(IpoptRawOption::text("mu_oracle", "quality-function"));
+            options.raw_options.push(IpoptRawOption::text(
+                "adaptive_mu_globalization",
+                "obj-constr-filter",
+            ));
+            options
+                .raw_options
+                .push(IpoptRawOption::text("quality_function_centrality", "log"));
+            options.raw_options.push(IpoptRawOption::text(
+                "quality_function_balancing_term",
+                "cubic",
+            ));
+            options.raw_options.push(IpoptRawOption::integer(
+                "quality_function_max_section_steps",
+                2,
+            ));
+            options.raw_options.push(IpoptRawOption::number(
+                "quality_function_section_sigma_tol",
+                5e-2,
+            ));
+            options.raw_options.push(IpoptRawOption::number(
+                "quality_function_section_qf_tol",
+                1e-3,
+            ));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("sigma_min", 1e-4));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("sigma_max", 10.0));
+        }),
+    );
+    assert_native_matches_ipopt_with_final_tolerances(
+        "bound_constrained_quadratic_adaptive_quality_function_nondefault_terms_and_search",
+        None,
+        &native,
+        &ipopt,
+        FinalParityTolerances {
+            x: 1e-5,
+            objective: 1e-5,
+            primal: 1e-5,
+            native_dual: 1e-4,
+            ipopt_dual: 1e-5,
+            complementarity: 1e-5,
+        },
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_with_adaptive_probing_obj_constr_filter_mu() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        native_options_with(|options| {
+            options.mu_strategy = InteriorPointMuStrategy::Adaptive;
+            options.adaptive_mu_oracle = InteriorPointAdaptiveMuOracle::Probing;
+            options.adaptive_mu_globalization =
+                InteriorPointAdaptiveMuGlobalization::ObjectiveConstraintFilter;
+            options.linear_solver = InteriorPointLinearSolver::SpralSrc;
+            options.max_iters = 300;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        ipopt_options_with(|options| {
+            options.mu_strategy = IpoptMuStrategy::Adaptive;
+            options.max_iters = 300;
+            options
+                .raw_options
+                .push(IpoptRawOption::text("mu_oracle", "probing"));
+            options.raw_options.push(IpoptRawOption::text(
+                "adaptive_mu_globalization",
+                "obj-constr-filter",
+            ));
+        }),
+    );
+    assert_native_matches_ipopt_with_final_tolerances(
+        "linearly_constrained_quadratic_adaptive_probing_obj_constr_filter_mu",
+        None,
+        &native,
+        &ipopt,
+        FinalParityTolerances {
+            x: 1e-5,
+            objective: 1e-5,
+            primal: 1e-5,
+            native_dual: 1e-4,
+            ipopt_dual: 1e-5,
+            complementarity: 1e-5,
+        },
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_with_mehrotra_algorithm() {
+    skip_without_native_spral!();
+    let problem = BoundConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[-10.0, 10.0],
+        &[],
+        native_options_with(|options| {
+            options.mehrotra_algorithm = true;
+            options.mu_strategy = InteriorPointMuStrategy::Adaptive;
+            options.adaptive_mu_oracle = InteriorPointAdaptiveMuOracle::Probing;
+            options.adaptive_mu_globalization =
+                InteriorPointAdaptiveMuGlobalization::NeverMonotoneMode;
+            options.accept_every_trial_step = true;
+            options.corrector_type = InteriorPointCorrectorType::None;
+            options.bound_push = 10.0;
+            options.bound_frac = 0.2;
+            options.bound_mult_init_val = 10.0;
+            options.constr_mult_init_max = 0.0;
+            options.alpha_for_y = InteriorPointAlphaForYStrategy::BoundMultiplier;
+            options.least_square_init_primal = true;
+            options.linear_solver = InteriorPointLinearSolver::SpralSrc;
+            options.max_iters = 200;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[-10.0, 10.0],
+        &[],
+        ipopt_options_with(|options| {
+            options.mu_strategy = IpoptMuStrategy::Adaptive;
+            options.max_iters = 200;
+            options
+                .raw_options
+                .push(IpoptRawOption::text("mehrotra_algorithm", "yes"));
+        }),
+    );
+    assert_native_matches_ipopt_with_final_tolerances(
+        "bound_constrained_quadratic_mehrotra_algorithm",
+        None,
+        &native,
+        &ipopt,
+        FinalParityTolerances {
+            x: 1e-5,
+            objective: 1e-5,
+            primal: 1e-5,
+            native_dual: 1e-4,
+            ipopt_dual: 1e-5,
+            complementarity: 1e-5,
+        },
+    );
+}
+
+#[test]
 fn compare_native_and_ipopt_alpha_for_y_option_profiles() {
     skip_without_native_spral!();
     let problem = LinearlyConstrainedQuadraticProblem;
@@ -3308,6 +4191,18 @@ fn compare_native_and_ipopt_alpha_for_y_option_profiles() {
         ("min", InteriorPointAlphaForYStrategy::Min, "min", None),
         ("max", InteriorPointAlphaForYStrategy::Max, "max", None),
         ("full", InteriorPointAlphaForYStrategy::Full, "full", None),
+        (
+            "min_dual_infeas",
+            InteriorPointAlphaForYStrategy::MinDualInfeas,
+            "min-dual-infeas",
+            None,
+        ),
+        (
+            "safer_min_dual_infeas",
+            InteriorPointAlphaForYStrategy::SaferMinDualInfeas,
+            "safer-min-dual-infeas",
+            None,
+        ),
         (
             "primal_and_full",
             InteriorPointAlphaForYStrategy::PrimalAndFull,
@@ -4022,6 +4917,94 @@ fn compare_native_and_ipopt_expect_infeasible_multiplier_restoration() {
     assert_eq!(ipopt.status, IpoptRawStatus::SolveSucceeded);
     assert_native_matches_ipopt(
         "square_equality_expect_infeasible_restoration",
+        None,
+        &native,
+        &ipopt,
+        1e-6,
+        1e-6,
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_adaptive_restoration_mu_update() {
+    skip_without_native_spral!();
+    let problem = SquareEqualityQuadraticProblem;
+    let mut native_restoration_callbacks = 0usize;
+    let native = solve_nlp_interior_point_with_control_callback(
+        &problem,
+        &[8.0, -3.0],
+        &[],
+        &native_options_with(|options| {
+            options.max_iters = 80;
+            options.least_square_init_duals = true;
+            options.second_order_correction = false;
+            options.expect_infeasible_problem = true;
+            options.expect_infeasible_problem_ytol = 1.0e-12;
+            options.restoration_mu_strategy = Some(InteriorPointMuStrategy::Adaptive);
+            options.restoration_adaptive_mu_oracle = Some(InteriorPointAdaptiveMuOracle::Loqo);
+            options.restoration_adaptive_mu_globalization =
+                Some(InteriorPointAdaptiveMuGlobalization::NeverMonotoneMode);
+        }),
+        |snapshot| {
+            if snapshot.phase == InteriorPointIterationPhase::Restoration {
+                native_restoration_callbacks += 1;
+            }
+            true
+        },
+    )
+    .expect("NLIP adaptive-restoration square witness should solve");
+    let mut ipopt_restoration_callbacks = 0usize;
+    let ipopt = solve_nlp_ipopt_with_control_callback(
+        &problem,
+        &[8.0, -3.0],
+        &[],
+        &ipopt_options_with(|options| {
+            options.max_iters = 80;
+            options
+                .raw_options
+                .push(IpoptRawOption::text("least_square_init_duals", "yes"));
+            options
+                .raw_options
+                .push(IpoptRawOption::integer("max_soc", 0));
+            options
+                .raw_options
+                .push(IpoptRawOption::text("expect_infeasible_problem", "yes"));
+            options.raw_options.push(IpoptRawOption::number(
+                "expect_infeasible_problem_ytol",
+                1.0e-12,
+            ));
+            options
+                .raw_options
+                .push(IpoptRawOption::text("resto.mu_strategy", "adaptive"));
+            options
+                .raw_options
+                .push(IpoptRawOption::text("resto.mu_oracle", "loqo"));
+            options.raw_options.push(IpoptRawOption::text(
+                "resto.adaptive_mu_globalization",
+                "never-monotone-mode",
+            ));
+        }),
+        |snapshot| {
+            if snapshot.phase == IpoptIterationPhase::Restoration {
+                ipopt_restoration_callbacks += 1;
+            }
+            true
+        },
+    )
+    .expect("IPOPT adaptive-restoration square witness should solve");
+
+    assert!(
+        native_restoration_callbacks > 0,
+        "NLIP should enter restoration with resto.mu_strategy=adaptive"
+    );
+    assert!(
+        ipopt_restoration_callbacks > 0,
+        "IPOPT should enter restoration with resto.mu_strategy=adaptive"
+    );
+    assert_eq!(native.termination, InteriorPointTermination::Converged);
+    assert_eq!(ipopt.status, IpoptRawStatus::SolveSucceeded);
+    assert_native_matches_ipopt(
+        "square_equality_adaptive_restoration_mu_update",
         None,
         &native,
         &ipopt,
@@ -5041,7 +6024,8 @@ fn compare_native_and_ipopt_with_least_square_dual_initialization() {
         native_options_with(|options| {
             options.max_iters = 0;
             // IPOPT's OrigIpoptNLP::relax_bounds caps bound relaxation by
-            // constr_viol_tol.  Match IPOPT's default here so this witness
+            // constr_viol_tol. Keep this focused witness on the historical
+            // strict cap so it
             // isolates DefaultIterateInitializer::CalculateLeastSquareDuals.
             options.constraint_tol = 1e-8;
             options.least_square_init_duals = true;
@@ -5052,6 +6036,7 @@ fn compare_native_and_ipopt_with_least_square_dual_initialization() {
         &[-10.0, 10.0],
         ipopt_options_with(|options| {
             options.max_iters = 0;
+            options.constraint_tol = Some(1e-8);
             options
                 .raw_options
                 .push(IpoptRawOption::text("least_square_init_duals", "yes"));
@@ -5090,6 +6075,7 @@ fn compare_native_and_ipopt_with_least_square_dual_initialization() {
         &[-10.0, 10.0],
         &[],
         ipopt_options_with(|options| {
+            options.constraint_tol = Some(1e-8);
             options
                 .raw_options
                 .push(IpoptRawOption::text("least_square_init_duals", "yes"));

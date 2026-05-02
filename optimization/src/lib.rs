@@ -36,8 +36,9 @@ pub use filter::{
     FilterInfo as SqpFilterInfo,
 };
 pub use interior_point::{
+    InteriorPointAdaptiveMuGlobalization, InteriorPointAdaptiveMuOracle,
     InteriorPointAlphaForYStrategy, InteriorPointBoundMultiplierInitMethod,
-    InteriorPointBoundaryLimiter, InteriorPointBoundaryLimiterKind,
+    InteriorPointBoundaryLimiter, InteriorPointBoundaryLimiterKind, InteriorPointCorrectorType,
     InteriorPointDirectionDiagnostics, InteriorPointFailureContext, InteriorPointIterationEvent,
     InteriorPointIterationPhase, InteriorPointIterationSnapshot, InteriorPointIterationTiming,
     InteriorPointLineSearchInfo, InteriorPointLineSearchTrial,
@@ -45,7 +46,9 @@ pub use interior_point::{
     InteriorPointLinearDebugReport, InteriorPointLinearDebugSchedule,
     InteriorPointLinearDebugVerdict, InteriorPointLinearInertia, InteriorPointLinearSolveAttempt,
     InteriorPointLinearSolveDiagnostics, InteriorPointLinearSolveFailureKind,
-    InteriorPointLinearSolver, InteriorPointOptions, InteriorPointProfiling,
+    InteriorPointLinearSolver, InteriorPointMuStrategy, InteriorPointOptions,
+    InteriorPointProfiling, InteriorPointQualityFunctionBalancingTerm,
+    InteriorPointQualityFunctionCentrality, InteriorPointQualityFunctionNorm,
     InteriorPointRestorationFailureStatus, InteriorPointSecondOrderCorrectionMethod,
     InteriorPointSolveError, InteriorPointSpralPivotMethod, InteriorPointStatusKind,
     InteriorPointStepDirectionSnapshot, InteriorPointStepKind, InteriorPointSummary,
@@ -352,6 +355,26 @@ pub fn native_spral_parity_nlip_options() -> InteriorPointOptions {
     options
 }
 
+pub fn apply_ipopt_source_exact_hessian_defaults_to_nlip_options(
+    options: &mut InteriorPointOptions,
+) {
+    // These are the IPOPT 3.14 exact-Hessian termination defaults from
+    // IpOptErrorConvCheck.cpp / IpIpoptData.cpp. They deliberately do not
+    // select a linear solver or scaling policy; callers layer the SPRAL parity
+    // profile on top when they want the source-built nonlinear oracle lane.
+    options.max_iters = 3000;
+    options.overall_tol = 1.0e-8;
+    options.dual_tol = 1.0;
+    options.constraint_tol = 1.0e-4;
+    options.complementarity_tol = 1.0e-4;
+    options.acceptable_tol = 1.0e-6;
+    options.acceptable_iter = 15;
+    options.acceptable_dual_inf_tol = 1.0e10;
+    options.acceptable_constr_viol_tol = 1.0e-2;
+    options.acceptable_compl_inf_tol = 1.0e-2;
+    options.acceptable_obj_change_tol = 1.0e20;
+}
+
 pub fn native_spral_parity_fail_closed_requested() -> bool {
     std::env::var_os(NATIVE_SPRAL_PARITY_FAIL_CLOSED_ENV).is_some_and(|value| {
         matches!(
@@ -364,8 +387,8 @@ pub fn native_spral_parity_fail_closed_requested() -> bool {
 #[cfg(feature = "ipopt")]
 pub fn apply_native_spral_parity_to_ipopt_options(options: &mut IpoptOptions) {
     let profile = native_spral_parity_profile();
-    // NLIP currently implements IPOPT's monotone barrier-update path, not the
-    // adaptive strategy, so parity runs force IPOPT onto the same update mode.
+    // IPOPT's exact-Hessian default is monotone. Keep parity runs explicit so
+    // non-default adaptive callers cannot silently enter this lane.
     options.mu_strategy = IpoptMuStrategy::Monotone;
     // IPOPT's default gradient-based NLP scaling changes the KKT system before
     // the linear solver sees it. Keep native-SPRAL parity on the same unscaled
@@ -1199,6 +1222,21 @@ pub trait CompiledNlpProblem {
     fn ipopt_nlp_scaling_method(&self) -> Option<&'static str> {
         None
     }
+    fn second_level_restoration_trial_x(
+        &self,
+        _x: &[f64],
+        _slack: &[f64],
+        _barrier_parameter: f64,
+        _parameters: &[ParameterMatrix<'_>],
+    ) -> Option<Vec<f64>> {
+        None
+    }
+    fn relax_variable_lower_bound(&self, _index: Index) -> bool {
+        true
+    }
+    fn relax_variable_upper_bound(&self, _index: Index) -> bool {
+        true
+    }
     fn interior_point_set_barrier_parameter(&self, _barrier_parameter: f64) {}
     fn sqp_adapter_timing_snapshot(&self) -> Option<SqpAdapterTiming> {
         None
@@ -1232,6 +1270,40 @@ pub trait CompiledNlpProblem {
         inequality_multipliers: &[f64],
         out: &mut [f64],
     );
+    fn lagrangian_hessian_values_with_objective_factor(
+        &self,
+        x: &[f64],
+        parameters: &[ParameterMatrix<'_>],
+        objective_factor: f64,
+        equality_multipliers: &[f64],
+        inequality_multipliers: &[f64],
+        out: &mut [f64],
+    ) {
+        self.lagrangian_hessian_values(
+            x,
+            parameters,
+            equality_multipliers,
+            inequality_multipliers,
+            out,
+        );
+        if objective_factor == 1.0 {
+            return;
+        }
+
+        let mut objective_hessian = vec![0.0; self.lagrangian_hessian_ccs().nnz()];
+        let zero_equality_multipliers = vec![0.0; self.equality_count()];
+        let zero_inequality_multipliers = vec![0.0; self.inequality_count()];
+        self.lagrangian_hessian_values(
+            x,
+            parameters,
+            &zero_equality_multipliers,
+            &zero_inequality_multipliers,
+            &mut objective_hessian,
+        );
+        for (value, objective_value) in out.iter_mut().zip(objective_hessian.iter()) {
+            *value += (objective_factor - 1.0) * objective_value;
+        }
+    }
 }
 
 fn benchmark_kernel(
@@ -5285,6 +5357,7 @@ mod tests {
     fn native_spral_parity_ipopt_options_force_spral_profile() {
         let options = super::native_spral_parity_ipopt_options();
 
+        assert_eq!(options.mu_strategy, super::IpoptMuStrategy::Monotone);
         assert_eq!(options.linear_solver, Some(super::IpoptLinearSolver::Spral));
         assert_eq!(
             options.spral_ordering,
@@ -5303,6 +5376,25 @@ mod tests {
         assert_eq!(options.spral_pivot_tolerance_max, Some(1.0e-4));
         assert_eq!(options.spral_use_gpu, Some(false));
         assert!(options.capture_provenance);
+    }
+
+    #[cfg(feature = "ipopt")]
+    #[test]
+    fn ipopt_options_default_to_source_exact_hessian_mu_strategy() {
+        let options = super::IpoptOptions::default();
+
+        assert_eq!(options.max_iters, 3000);
+        assert_eq!(options.tol, 1.0e-8);
+        assert_eq!(options.mu_strategy, super::IpoptMuStrategy::Monotone);
+        assert_eq!(options.acceptable_tol, Some(1.0e-6));
+        assert_eq!(options.acceptable_iter, Some(15));
+        assert_eq!(options.dual_tol, Some(1.0));
+        assert_eq!(options.constraint_tol, Some(1.0e-4));
+        assert_eq!(options.complementarity_tol, Some(1.0e-4));
+        assert_eq!(options.acceptable_dual_tol, Some(1.0e10));
+        assert_eq!(options.acceptable_constraint_tol, Some(1.0e-2));
+        assert_eq!(options.acceptable_complementarity_tol, Some(1.0e-2));
+        assert_eq!(options.acceptable_obj_change_tol, Some(1.0e20));
     }
 
     #[cfg(feature = "ipopt")]

@@ -1430,9 +1430,9 @@ mod tests {
     {
         text.lines()
             .find_map(|line| line.strip_prefix(prefix))
-            .expect("expected dump key to be present")
+            .unwrap_or_else(|| panic!("expected dump key {prefix:?} to be present"))
             .parse::<T>()
-            .expect("expected dump scalar to parse")
+            .unwrap_or_else(|error| panic!("expected dump scalar {prefix:?} to parse: {error:?}"))
     }
 
     fn parse_dump_vec<T>(text: &str, prefix: &str) -> Vec<T>
@@ -1442,8 +1442,9 @@ mod tests {
         let value = text
             .lines()
             .find_map(|line| line.strip_prefix(prefix))
-            .expect("expected dump vector to be present");
-        serde_json::from_str(value).expect("expected dump vector to parse")
+            .unwrap_or_else(|| panic!("expected dump vector {prefix:?} to be present"));
+        serde_json::from_str(value)
+            .unwrap_or_else(|error| panic!("expected dump vector {prefix:?} to parse: {error:?}"))
     }
 
     fn parse_optional_dump_vec<T>(text: &str, prefix: &str) -> Option<Vec<T>>
@@ -1605,23 +1606,29 @@ mod tests {
         }
     }
 
-    fn load_ipopt_full_space_residual_dump(path: &Path) -> IpoptFullSpaceResidualDump {
-        let text = fs::read_to_string(path).expect("expected IPOPT residual dump to exist");
-        IpoptFullSpaceResidualDump {
-            call_index: parse_dump_value(&text, "call_index="),
-            resid_x: parse_dump_vec(&text, "resid_x="),
-            resid_x_after_w: parse_dump_vec(&text, "resid_x_after_W="),
-            resid_x_after_jc: parse_dump_vec(&text, "resid_x_after_Jc="),
-            resid_x_after_jd: parse_dump_vec(&text, "resid_x_after_Jd="),
-            resid_x_after_pxl: parse_dump_vec(&text, "resid_x_after_PxL="),
-            resid_x_after_pxu: parse_dump_vec(&text, "resid_x_after_PxU="),
-            resid_x_after_add_two_vectors: parse_dump_vec(&text, "resid_x_after_AddTwoVectors="),
-            resid_s: parse_dump_vec(&text, "resid_s="),
-            resid_s_after_pdu: parse_dump_vec(&text, "resid_s_after_PdU="),
-            resid_s_after_pdl: parse_dump_vec(&text, "resid_s_after_PdL="),
-            resid_s_after_add_two_vectors: parse_dump_vec(&text, "resid_s_after_AddTwoVectors="),
-            resid_s_after_delta: parse_dump_vec(&text, "resid_s_after_delta="),
-        }
+    fn try_load_ipopt_full_space_residual_dump(path: &Path) -> Option<IpoptFullSpaceResidualDump> {
+        let text = fs::read_to_string(path).ok()?;
+        Some(IpoptFullSpaceResidualDump {
+            call_index: parse_optional_dump_value(&text, "call_index=")?,
+            resid_x: parse_optional_dump_vec(&text, "resid_x=")?,
+            resid_x_after_w: parse_optional_dump_vec(&text, "resid_x_after_W=")?,
+            resid_x_after_jc: parse_optional_dump_vec(&text, "resid_x_after_Jc=")?,
+            resid_x_after_jd: parse_optional_dump_vec(&text, "resid_x_after_Jd=")?,
+            resid_x_after_pxl: parse_optional_dump_vec(&text, "resid_x_after_PxL=")?,
+            resid_x_after_pxu: parse_optional_dump_vec(&text, "resid_x_after_PxU=")?,
+            resid_x_after_add_two_vectors: parse_optional_dump_vec(
+                &text,
+                "resid_x_after_AddTwoVectors=",
+            )?,
+            resid_s: parse_optional_dump_vec(&text, "resid_s=")?,
+            resid_s_after_pdu: parse_optional_dump_vec(&text, "resid_s_after_PdU=")?,
+            resid_s_after_pdl: parse_optional_dump_vec(&text, "resid_s_after_PdL=")?,
+            resid_s_after_add_two_vectors: parse_optional_dump_vec(
+                &text,
+                "resid_s_after_AddTwoVectors=",
+            )?,
+            resid_s_after_delta: parse_optional_dump_vec(&text, "resid_s_after_delta=")?,
+        })
     }
 
     fn failure_linear_debug_report<T>(
@@ -4230,6 +4237,28 @@ mod tests {
             }
         }
 
+        fn restoration_bridge_state_matches(nlip: &TracePoint, ipopt: &TracePoint) -> bool {
+            nlip.step_tag == "r"
+                && (nlip.objective - ipopt.objective).abs() <= 1.0e-5
+                && (nlip.primal_inf - ipopt.primal_inf).abs() <= 1.0e-6
+                && (nlip.dual_inf - ipopt.dual_inf).abs() <= 1.0e-6
+                && (nlip.mu - ipopt.mu).abs() <= 1.0e-12
+                && (nlip.tf - ipopt.tf).abs() <= 1.0e-6
+                && (nlip.terminal_x - ipopt.terminal_x).abs() <= 1.0e-5
+                && nlip.trial_count.abs_diff(ipopt.trial_count) <= 1
+        }
+
+        fn is_restoration_bridge_trace_index(
+            nlip_trace: &[TracePoint],
+            ipopt_trace: &[TracePoint],
+            index: usize,
+        ) -> bool {
+            nlip_trace
+                .get(index)
+                .zip(ipopt_trace.get(index))
+                .is_some_and(|(nlip, ipopt)| restoration_bridge_state_matches(nlip, ipopt))
+        }
+
         fn parse_ipopt_step_tags(journal_output: Option<&str>) -> BTreeMap<usize, String> {
             let mut tags = BTreeMap::new();
             let Some(journal) = journal_output else {
@@ -5762,15 +5791,18 @@ mod tests {
                 return;
             }
             let nlip = load_glider_linear_debug_dump(&nlip_path);
-            let ipopt = sorted_ipopt_full_space_residual_dump_paths(ipopt_dump_dir)
+            let residual_paths = sorted_ipopt_full_space_residual_dump_paths(ipopt_dump_dir);
+            let ipopt = residual_paths
                 .iter()
-                .map(|path| load_ipopt_full_space_residual_dump(path))
+                .filter_map(|path| try_load_ipopt_full_space_residual_dump(path))
                 .collect::<Vec<_>>();
+            let skipped = residual_paths.len().saturating_sub(ipopt.len());
             println!(
-                "ipopt residual dump comparison dir={} nlip_iter={} calls={}",
+                "ipopt residual dump comparison dir={} nlip_iter={} calls={} skipped_incomplete={}",
                 ipopt_dump_dir.display(),
                 dump_iteration,
                 ipopt.len(),
+                skipped,
             );
             if ipopt.is_empty() {
                 return;
@@ -6173,9 +6205,11 @@ mod tests {
             })
         }
 
-        fn print_ipopt_spral_interface_dump_fingerprints(
+        fn print_ipopt_spral_interface_dump_fingerprints_for_iteration(
+            label: &str,
             ipopt_dump_dir: Option<&Path>,
             nlip_dump_dir: Option<&Path>,
+            dump_iteration: usize,
             intervals: usize,
             order: usize,
         ) {
@@ -6186,11 +6220,10 @@ mod tests {
                 println!("ipopt spral dump comparison unavailable: missing NLIP dump dir");
                 return;
             };
-            let dump_iteration = glider_augmented_fingerprint_iteration();
             let nlip_path = nlip_dump_dir.join(format!("nlip_kkt_iter_{dump_iteration:04}.txt"));
             if !nlip_path.exists() {
                 println!(
-                    "ipopt spral dump comparison unavailable: missing {}",
+                    "{label} dump comparison unavailable: missing {}",
                     nlip_path.display()
                 );
                 return;
@@ -6221,7 +6254,7 @@ mod tests {
                 .map(|path| load_ipopt_spral_interface_dump(path))
                 .collect::<Vec<_>>();
             println!(
-                "ipopt spral dump comparison dir={} nlip_iter={} before={} after_factor={} after_solve={}",
+                "{label} dump comparison dir={} nlip_iter={} before={} after_factor={} after_solve={}",
                 ipopt_dump_dir.display(),
                 dump_iteration,
                 before.len(),
@@ -6251,7 +6284,7 @@ mod tests {
                     .find(|dump| dump.call_index == *call_index)
                     .expect("ranked matrix call should exist");
                 println!(
-                    "  ipopt_spral_best_matrix_match[{rank}] call={call_index} max_abs_diff={max_abs_diff:.17e} [{}] {} {}",
+                    "  {label}_best_matrix_match[{rank}] call={call_index} max_abs_diff={max_abs_diff:.17e} [{}] {} {}",
                     journal_vector_fingerprint_text(journal_vector_fingerprint(&dump.values)),
                     ipopt_spral_structure_diff_summary_text(&nlip, dump),
                     ipopt_spral_factor_info_text(after_factor.get(call_index)),
@@ -6269,7 +6302,7 @@ mod tests {
             }
 
             let best_spral_rhs_match = print_ranked_ipopt_spral_rhs_matches(
-                "ipopt_spral",
+                label,
                 nlip_trace_rhs,
                 &before,
                 &nlip,
@@ -6279,7 +6312,7 @@ mod tests {
 
             if let Some(nlip_solution) = nlip.linear_trace_solution_prefinal_unrefined.as_ref() {
                 best_spral_solution_match = print_ranked_ipopt_spral_solution_matches(
-                    "ipopt_spral",
+                    label,
                     nlip_solution,
                     &after_solve,
                     &nlip,
@@ -6290,7 +6323,7 @@ mod tests {
             if let Some(refinement_rhs) = nlip.linear_trace_refinement_rhs.as_ref() {
                 for (step, rhs) in refinement_rhs.iter().enumerate() {
                     let candidate = print_ranked_ipopt_spral_rhs_matches(
-                        &format!("ipopt_spral_refinement_rhs[{step}]"),
+                        &format!("{label}_refinement_rhs[{step}]"),
                         rhs,
                         &before,
                         &nlip,
@@ -6309,7 +6342,7 @@ mod tests {
             if let Some(refinement_solution) = nlip.linear_trace_refinement_solution.as_ref() {
                 for (step, solution) in refinement_solution.iter().enumerate() {
                     let candidate = print_ranked_ipopt_spral_solution_matches(
-                        &format!("ipopt_spral_refinement_solution[{step}]"),
+                        &format!("{label}_refinement_solution[{step}]"),
                         solution,
                         &after_solve,
                         &nlip,
@@ -6326,7 +6359,7 @@ mod tests {
             if let Some(accumulated) = nlip.linear_trace_refinement_accumulated_solution.as_ref() {
                 for (step, solution) in accumulated.iter().enumerate() {
                     let candidate = print_ranked_ipopt_spral_cumulative_solution_matches(
-                        &format!("ipopt_spral_refinement_accumulated_solution[{step}]"),
+                        &format!("{label}_refinement_accumulated_solution[{step}]"),
                         solution,
                         &after_solve,
                         &nlip,
@@ -6344,7 +6377,7 @@ mod tests {
                 }
             }
             println!(
-                "  ipopt_spral_solve_boundary_summary iter={} {} {} {} {} {}",
+                "  {label}_solve_boundary_summary iter={} {} {} {} {} {}",
                 dump_iteration,
                 solve_boundary_match_text("rhs_prefinal", best_spral_rhs_match),
                 solve_boundary_match_text("sol_prefinal_unrefined", best_spral_solution_match),
@@ -6358,6 +6391,90 @@ mod tests {
                     best_spral_refinement_accumulated_match,
                 ),
             );
+        }
+
+        fn print_ipopt_spral_interface_dump_fingerprints(
+            ipopt_dump_dir: Option<&Path>,
+            nlip_dump_dir: Option<&Path>,
+            intervals: usize,
+            order: usize,
+        ) {
+            print_ipopt_spral_interface_dump_fingerprints_for_iteration(
+                "ipopt_spral",
+                ipopt_dump_dir,
+                nlip_dump_dir,
+                glider_augmented_fingerprint_iteration(),
+                intervals,
+                order,
+            );
+        }
+
+        fn sorted_nlip_restoration_dump_dirs(base_dir: &Path) -> Vec<std::path::PathBuf> {
+            let mut paths = fs::read_dir(base_dir)
+                .ok()
+                .into_iter()
+                .flat_map(|entries| entries.filter_map(Result::ok))
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .collect::<Vec<_>>();
+            paths.sort();
+            paths
+        }
+
+        fn print_ipopt_spral_restoration_dump_fingerprints(
+            ipopt_dump_dir: Option<&Path>,
+            intervals: usize,
+            order: usize,
+        ) {
+            let Some(restoration_base_dir) =
+                std::env::var_os("NLIP_RESTORATION_LINEAR_DEBUG_DUMP_DIR")
+                    .map(std::path::PathBuf::from)
+            else {
+                return;
+            };
+            let dump_iteration = std::env::var("GLIDER_PARITY_NLIP_RESTORATION_AUGMENTED_ITER")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let max_dirs = std::env::var("GLIDER_PARITY_NLIP_RESTORATION_MAX_DUMP_DIRS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(4);
+            let dirs = sorted_nlip_restoration_dump_dirs(&restoration_base_dir);
+            println!(
+                "ipopt spral restoration dump comparison base_dir={} dirs={} nlip_iter={} max_dirs={}",
+                restoration_base_dir.display(),
+                dirs.len(),
+                dump_iteration,
+                max_dirs,
+            );
+            for dir in dirs.into_iter().take(max_dirs) {
+                let label = format!(
+                    "ipopt_spral_restoration_{}",
+                    dir.file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("unknown")
+                );
+                print_ipopt_spral_interface_dump_fingerprints_for_iteration(
+                    &label,
+                    ipopt_dump_dir,
+                    Some(&dir),
+                    dump_iteration,
+                    intervals,
+                    order,
+                );
+                let inner_dir = dir.join("aug_resto_inner");
+                if inner_dir.is_dir() {
+                    print_ipopt_spral_interface_dump_fingerprints_for_iteration(
+                        &format!("{label}_inner"),
+                        ipopt_dump_dir,
+                        Some(&inner_dir),
+                        dump_iteration,
+                        intervals,
+                        order,
+                    );
+                }
+            }
         }
 
         fn print_ipopt_spral_solve_boundary_ladder(
@@ -7740,6 +7857,9 @@ mod tests {
                 .iter()
                 .map(|&threshold| {
                     let marker = (1..nlip_trace.len().min(ipopt_trace.len())).find_map(|index| {
+                        if is_restoration_bridge_trace_index(nlip_trace, ipopt_trace, index) {
+                            return None;
+                        }
                         let gap = max_direction_estimate_diff(
                             &nlip_trace[index - 1],
                             &nlip_trace[index],
@@ -7775,6 +7895,9 @@ mod tests {
                         let marker = (0..compared).find_map(|index| {
                             let nlip = &nlip_trace[index];
                             let ipopt = &ipopt_trace[index];
+                            if is_restoration_bridge_trace_index(nlip_trace, ipopt_trace, index) {
+                                return None;
+                            }
                             let gap = gap(nlip, ipopt);
                             (gap.is_finite() && gap > threshold).then_some((index, gap))
                         });
@@ -7836,6 +7959,9 @@ mod tests {
                     .iter()
                     .map(|&threshold| {
                         let marker = (1..compared).find_map(|index| {
+                            if is_restoration_bridge_trace_index(nlip_trace, ipopt_trace, index) {
+                                return None;
+                            }
                             let gap = gap(index);
                             (gap > threshold).then_some((index, gap))
                         });
@@ -9281,9 +9407,16 @@ mod tests {
         let order = params.transcription.collocation_degree;
 
         let mut nlip_options = crate::common::nlip_options(&params.solver);
+        if std::env::var_os("GLIDER_PARITY_SOURCE_DEFAULTS").is_some() {
+            optimization::apply_ipopt_source_exact_hessian_defaults_to_nlip_options(
+                &mut nlip_options,
+            );
+        }
         optimization::apply_native_spral_parity_to_nlip_options(&mut nlip_options);
-        nlip_options.max_iters = 400;
-        nlip_options.acceptable_iter = 0;
+        if std::env::var_os("GLIDER_PARITY_SOURCE_DEFAULTS").is_none() {
+            nlip_options.max_iters = 400;
+            nlip_options.acceptable_iter = 0;
+        }
         nlip_options.verbose = false;
         if let Some(max_iters) = std::env::var("GLIDER_PARITY_NLIP_MAX_ITERS")
             .ok()
@@ -9311,6 +9444,9 @@ mod tests {
         });
 
         let mut ipopt_options = crate::common::ipopt_options(&params.solver);
+        if std::env::var_os("GLIDER_PARITY_SOURCE_DEFAULTS").is_some() {
+            ipopt_options = optimization::IpoptOptions::default();
+        }
         optimization::apply_native_spral_parity_to_ipopt_options(&mut ipopt_options);
         if let Some(print_level) = std::env::var("GLIDER_PARITY_IPOPT_PRINT_LEVEL")
             .ok()
@@ -9340,6 +9476,147 @@ mod tests {
             compiled.solve_interior_point_with_callback(&runtime, &nlip_options, |snapshot| {
                 nlip_ocp_snapshots.push(snapshot.clone());
             });
+        if std::env::var_os("GLIDER_PARITY_PRINT_NLIP_RESTORATION_TRACE").is_some() {
+            let start = std::env::var("GLIDER_PARITY_RESTORATION_TRACE_START")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let end = std::env::var("GLIDER_PARITY_RESTORATION_TRACE_END")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(usize::MAX);
+            for snapshot in nlip_ocp_snapshots.iter().filter(|snapshot| {
+                snapshot.solver.phase == optimization::InteriorPointIterationPhase::Restoration
+                    && (start..=end).contains(&snapshot.solver.iteration)
+            }) {
+                println!(
+                    "nlip_resto iter={} obj={:.8e} primal={:.8e} dual={:.8e} comp={:.8e} overall={:.8e} mu={:.8e} tf={:.8e} xT={:.8e} alpha={:?} alpha_pr={:?} alpha_du={:?} alpha_y={:?} ls={} tag={:?} events={} barrier_obj={:?} theta={:?} step_inf={:?}",
+                    snapshot.solver.iteration,
+                    snapshot.solver.objective,
+                    snapshot
+                        .solver
+                        .eq_inf
+                        .unwrap_or(0.0)
+                        .max(snapshot.solver.ineq_inf.unwrap_or(0.0)),
+                    snapshot.solver.dual_inf,
+                    snapshot.solver.comp_inf.unwrap_or(0.0),
+                    snapshot.solver.overall_inf,
+                    snapshot.solver.barrier_parameter.unwrap_or(0.0),
+                    snapshot.trajectories.tf,
+                    snapshot.trajectories.x.terminal.x,
+                    snapshot.solver.alpha,
+                    snapshot.solver.alpha_pr,
+                    snapshot.solver.alpha_du,
+                    snapshot.solver.alpha_y,
+                    snapshot.solver.line_search_trials,
+                    snapshot.solver.step_tag,
+                    optimization::nlip_event_codes_for_events(&snapshot.solver.events),
+                    snapshot.solver.barrier_objective,
+                    snapshot.solver.filter_theta,
+                    snapshot.solver.step_inf,
+                );
+            }
+        }
+        if std::env::var_os("GLIDER_PARITY_PRINT_NLIP_LINE_SEARCH_TRACE").is_some() {
+            let start = std::env::var("GLIDER_PARITY_LINE_SEARCH_TRACE_START")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let end = std::env::var("GLIDER_PARITY_LINE_SEARCH_TRACE_END")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(usize::MAX);
+            for snapshot in nlip_ocp_snapshots.iter().filter(|snapshot| {
+                matches!(
+                    snapshot.solver.phase,
+                    optimization::InteriorPointIterationPhase::AcceptedStep
+                        | optimization::InteriorPointIterationPhase::Restoration
+                ) && (start..=end).contains(&snapshot.solver.iteration)
+            }) {
+                let Some(line_search) = snapshot.solver.line_search.as_ref() else {
+                    continue;
+                };
+                println!(
+                    "nlip_ls iter={} phase={:?} tag={:?} obj={:.8e} primal={:.8e} dual={:.8e} mu={:.8e} tf={:.8e} xT={:.8e} alpha0={:.17e} alpha_du0={:?} alpha_y0={:?} accepted={:?} accepted_du={:?} accepted_y={:?} last={:.17e} last_du={:?} last_y={:?} backtracks={} alpha_min={:.17e} sigma={:.8e} current_barrier={:.8e} current_primal={:.8e} rejected={} soc_attempted={} soc_used={} watchdog_active={} watchdog_accepted={} tiny_step={} mode={:?}",
+                    snapshot.solver.iteration,
+                    snapshot.solver.phase,
+                    snapshot.solver.step_tag,
+                    snapshot.solver.objective,
+                    snapshot
+                        .solver
+                        .eq_inf
+                        .unwrap_or(0.0)
+                        .max(snapshot.solver.ineq_inf.unwrap_or(0.0)),
+                    snapshot.solver.dual_inf,
+                    snapshot.solver.barrier_parameter.unwrap_or(0.0),
+                    snapshot.trajectories.tf,
+                    snapshot.trajectories.x.terminal.x,
+                    line_search.initial_alpha_pr,
+                    line_search.initial_alpha_du,
+                    line_search.initial_alpha_y,
+                    line_search.accepted_alpha,
+                    line_search.accepted_alpha_du,
+                    line_search.accepted_alpha_y,
+                    line_search.last_tried_alpha,
+                    line_search.last_tried_alpha_du,
+                    line_search.last_tried_alpha_y,
+                    line_search.backtrack_count,
+                    line_search.alpha_min,
+                    line_search.sigma,
+                    line_search.current_barrier_objective,
+                    line_search.current_primal_inf,
+                    line_search.rejected_trials.len(),
+                    line_search.second_order_correction_attempted,
+                    line_search.second_order_correction_used,
+                    line_search.watchdog_active,
+                    line_search.watchdog_accepted,
+                    line_search.tiny_step,
+                    line_search.filter_acceptance_mode,
+                );
+                for (index, trial) in line_search.rejected_trials.iter().enumerate().take(8) {
+                    println!(
+                        "  nlip_ls_rejected[{index}] alpha={:.17e} alpha_du={:?} slack_positive={} multipliers_positive={} merit={:?} barrier={:?} primal={:?} dual={:?} comp={:?} local_filter={:?} filter={:?} dominated={:?} sufficient_phi={:?} sufficient_theta={:?} switching={:?}",
+                        trial.alpha,
+                        trial.alpha_du,
+                        trial.slack_positive,
+                        trial.multipliers_positive,
+                        trial.merit,
+                        trial.barrier_objective,
+                        trial.primal_inf,
+                        trial.dual_inf,
+                        trial.comp_inf,
+                        trial.local_filter_acceptable,
+                        trial.filter_acceptable,
+                        trial.filter_dominated,
+                        trial.filter_sufficient_objective_reduction,
+                        trial.filter_sufficient_violation_reduction,
+                        trial.switching_condition_satisfied,
+                    );
+                }
+                if line_search.rejected_trials.len() > 8
+                    && let Some(trial) = line_search.rejected_trials.last()
+                {
+                    println!(
+                        "  nlip_ls_rejected[last] alpha={:.17e} alpha_du={:?} slack_positive={} multipliers_positive={} merit={:?} barrier={:?} primal={:?} dual={:?} comp={:?} local_filter={:?} filter={:?} dominated={:?} sufficient_phi={:?} sufficient_theta={:?} switching={:?}",
+                        trial.alpha,
+                        trial.alpha_du,
+                        trial.slack_positive,
+                        trial.multipliers_positive,
+                        trial.merit,
+                        trial.barrier_objective,
+                        trial.primal_inf,
+                        trial.dual_inf,
+                        trial.comp_inf,
+                        trial.local_filter_acceptable,
+                        trial.filter_acceptable,
+                        trial.filter_dominated,
+                        trial.filter_sufficient_objective_reduction,
+                        trial.filter_sufficient_violation_reduction,
+                        trial.switching_condition_satisfied,
+                    );
+                }
+            }
+        }
         if let Err(err) = &nlip {
             println!("nlip_err={err}");
             let context = match err {
@@ -9520,6 +9797,13 @@ mod tests {
                 .as_deref()
                 .map(Path::new),
             nlip_augmented_dump_dir.as_deref(),
+            intervals,
+            order,
+        );
+        print_ipopt_spral_restoration_dump_fingerprints(
+            std::env::var_os("GLIDER_PARITY_IPOPT_SPRAL_DUMP_DIR")
+                .as_deref()
+                .map(Path::new),
             intervals,
             order,
         );
@@ -9961,6 +10245,9 @@ mod tests {
             .unwrap_or(1.0e-1);
         if let Some((direction_index, direction_gap)) = (1..nlip_trace.len().min(ipopt_trace.len()))
             .find_map(|index| {
+                if is_restoration_bridge_trace_index(&nlip_trace, &ipopt_trace, index) {
+                    return None;
+                }
                 let gap = max_direction_estimate_diff(
                     &nlip_trace[index - 1],
                     &nlip_trace[index],
@@ -10053,14 +10340,15 @@ mod tests {
             let alpha_pr_gap = (nlip_point.alpha_pr - ipopt_point.alpha_pr).abs();
             let alpha_du_gap = (nlip_point.alpha_du - ipopt_point.alpha_du).abs();
             let trial_gap = nlip_point.trial_count.abs_diff(ipopt_point.trial_count);
+            let restoration_bridge = restoration_bridge_state_matches(nlip_point, ipopt_point);
             let step_tag_mismatch = nlip_point.step_tag != "-"
                 && ipopt_point.step_tag != "-"
                 && nlip_point.step_tag != ipopt_point.step_tag;
             let divergence_kind = if step_tag_mismatch {
                 Some(DivergenceKind::StepTag)
-            } else if alpha_pr_gap > 1.0e-2 {
+            } else if !restoration_bridge && alpha_pr_gap > 1.0e-2 {
                 Some(DivergenceKind::AlphaPr)
-            } else if alpha_du_gap > 1.0e-2 {
+            } else if !restoration_bridge && alpha_du_gap > 1.0e-2 {
                 Some(DivergenceKind::AlphaDu)
             } else if regularization_gap > 0.5 {
                 Some(DivergenceKind::Regularization)

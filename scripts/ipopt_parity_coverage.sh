@@ -381,6 +381,62 @@ def rust_unhit_branch_like(records):
 def classify_rust_line(path, line_no, text):
     file_name = pathlib.Path(path).name
     if file_name == "interior_point.rs":
+        if "options.mehrotra_algorithm" in text:
+            return "option/display reporting"
+        if "options.adaptive_mu_restore_previous_iterate" in text:
+            return "option/display reporting"
+        if "let schedule = match options.schedule" in text:
+            return "diagnostic linear replay"
+        if "pivot_method: match" in text:
+            return "linear solver option mapping"
+        if "InteriorPointTermination::Acceptable | InteriorPointTermination::FeasiblePointFound" in text:
+            return "termination display/reporting"
+        if "InteriorPointTermination::Converged =>" in text:
+            return "termination display/reporting"
+        if 16950 <= line_no <= 17180:
+            return "unit-test parity witness"
+        if 17680 <= line_no <= 17810:
+            return "unit-test parity witness"
+        if "let ineq_text = if has_inequality_like_constraints" in text:
+            return "solve summary/reporting"
+        if "let comp_text = if has_inequality_like_constraints" in text:
+            return "solve summary/reporting"
+        if "let count_cell = match count" in text:
+            return "solve summary/reporting"
+        if "Some(count) => format!" in text:
+            return "solve summary/reporting"
+        if "None => format!" in text:
+            return "solve summary/reporting"
+        if "log_boxed_section" in text:
+            return "solve summary/reporting"
+        if text == "if !matches!(":
+            return "option validation"
+        if "override length" in text:
+            return "error handling"
+        if "InteriorPointBoundMultiplierInitMethod::MuBased" in text:
+            return "initialization option-profile branch"
+        if "'restart_current_iteration: loop" in text:
+            return "main solve loop"
+        if "InteriorPointMuStrategy::Monotone" in text:
+            return "monotone barrier update"
+        if "InteriorPointMuStrategy::Adaptive" in text:
+            return "adaptive barrier update"
+        if "prepare_spral_workspace" in text or "prepare_native_spral_workspace" in text:
+            return "linear-solver workspace setup"
+        if "Ok(workspace)" in text:
+            return "linear-solver workspace setup"
+        if "options.linear_solver == InteriorPointLinearSolver::SpralSrc" in text:
+            return "linear-solver workspace setup"
+        if "tiny_step_unchecked_accept" in text:
+            return "line-search tiny-step branch"
+        if "watchdog_active" in text or "watchdog_reference" in text or "watchdog_assessment" in text or "stored_point" in text:
+            return "watchdog globalization branch"
+        if "step_kind == InteriorPointStepKind::Feasibility" in text:
+            return "watchdog globalization branch"
+        if "IpoptRestorationAlgorithmStatus::MaxIterationsExceeded" in text:
+            return "restoration status mapping"
+        if 24700 <= line_no <= 24740:
+            return "restoration status mapping"
         if line_no < 760:
             return "option/display/reporting"
         if 1200 <= line_no <= 1560:
@@ -395,6 +451,8 @@ def classify_rust_line(path, line_no, text):
             return "solve summary/reporting"
         if 1930 <= line_no <= 2180 and "ssids_rs" in text:
             return "unreachable: non-parity linear solver/debug branch"
+        if 2160 <= line_no <= 2200:
+            return "restoration status mapping"
         if 2030 <= line_no <= 2180:
             return "linear-solver workspace setup"
         if 2200 <= line_no <= 2290:

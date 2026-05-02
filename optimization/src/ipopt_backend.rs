@@ -203,6 +203,31 @@ pub struct IpoptOptions {
     pub max_iters: Index,
     pub tol: f64,
     pub acceptable_tol: Option<f64>,
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub acceptable_iter: Option<Index>,
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub acceptable_dual_tol: Option<f64>,
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub acceptable_constraint_tol: Option<f64>,
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub acceptable_complementarity_tol: Option<f64>,
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub acceptable_obj_change_tol: Option<f64>,
     pub constraint_tol: Option<f64>,
     pub complementarity_tol: Option<f64>,
     pub dual_tol: Option<f64>,
@@ -241,16 +266,21 @@ pub struct IpoptOptions {
 impl Default for IpoptOptions {
     fn default() -> Self {
         Self {
-            max_iters: 100,
+            max_iters: 3000,
             tol: 1e-8,
             acceptable_tol: Some(1e-6),
-            constraint_tol: Some(1e-8),
-            complementarity_tol: Some(1e-8),
-            dual_tol: Some(1e-8),
+            acceptable_iter: Some(15),
+            acceptable_dual_tol: Some(1e10),
+            acceptable_constraint_tol: Some(1e-2),
+            acceptable_complementarity_tol: Some(1e-2),
+            acceptable_obj_change_tol: Some(1e20),
+            constraint_tol: Some(1e-4),
+            complementarity_tol: Some(1e-4),
+            dual_tol: Some(1.0),
             print_level: 0,
             journal_print_level: None,
             suppress_banner: true,
-            mu_strategy: IpoptMuStrategy::Adaptive,
+            mu_strategy: IpoptMuStrategy::Monotone,
             nlp_scaling_method: None,
             kappa_d: 1e-5,
             linear_solver: None,
@@ -269,7 +299,7 @@ impl Default for IpoptOptions {
 
 pub fn format_ipopt_settings_summary(options: &IpoptOptions) -> String {
     format!(
-        "mu_strategy={}; nlp_scaling={}; kappa_d={:.1e}; acceptable_tol={}; print_level={}; journal_print_level={}; banner={}; linear_solver={}; spral_pivot={}; spral_order={}; spral_scaling={}; spral_small={}; spral_u={}; spral_umax={}; spral_gpu={}; raw_options={}; provenance={}",
+        "mu_strategy={}; nlp_scaling={}; kappa_d={:.1e}; acceptable_tol={}; acceptable_iter={}; print_level={}; journal_print_level={}; banner={}; linear_solver={}; spral_pivot={}; spral_order={}; spral_scaling={}; spral_small={}; spral_u={}; spral_umax={}; spral_gpu={}; raw_options={}; provenance={}",
         options.mu_strategy.as_str(),
         options
             .nlp_scaling_method
@@ -279,6 +309,10 @@ pub fn format_ipopt_settings_summary(options: &IpoptOptions) -> String {
             .acceptable_tol
             .map(|value| format!("{value:.3e}"))
             .unwrap_or_else(|| "off".to_string()),
+        options
+            .acceptable_iter
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "default".to_string()),
         options.print_level,
         options
             .journal_print_level
@@ -812,13 +846,15 @@ where
         let equality_multipliers = vec![0.0; self.problem.equality_count()];
         let inequality_multipliers = vec![0.0; self.problem.inequality_count()];
         let started = Instant::now();
-        self.problem.lagrangian_hessian_values(
-            x,
-            self.parameters,
-            &equality_multipliers,
-            &inequality_multipliers,
-            vals,
-        );
+        self.problem
+            .lagrangian_hessian_values_with_objective_factor(
+                x,
+                self.parameters,
+                1.0,
+                &equality_multipliers,
+                &inequality_multipliers,
+                vals,
+            );
         self.runtime
             .borrow_mut()
             .profiling
@@ -1000,24 +1036,15 @@ where
         let started = Instant::now();
         let equality_count = self.problem.equality_count();
         let (equality_multipliers, inequality_multipliers) = lambda.split_at(equality_count);
-        let mut objective_hessian = vec![0.0; vals.len()];
-        self.problem.lagrangian_hessian_values(
-            x,
-            self.parameters,
-            &vec![0.0; equality_count],
-            &vec![0.0; self.problem.inequality_count()],
-            &mut objective_hessian,
-        );
-        self.problem.lagrangian_hessian_values(
-            x,
-            self.parameters,
-            equality_multipliers,
-            inequality_multipliers,
-            vals,
-        );
-        for (value, objective_value) in vals.iter_mut().zip(objective_hessian.iter()) {
-            *value += (obj_factor - 1.0) * objective_value;
-        }
+        self.problem
+            .lagrangian_hessian_values_with_objective_factor(
+                x,
+                self.parameters,
+                obj_factor,
+                equality_multipliers,
+                inequality_multipliers,
+                vals,
+            );
         self.runtime
             .borrow_mut()
             .profiling
@@ -1170,6 +1197,21 @@ where
     set_ipopt_option(solver, "tol", options.tol)?;
     if let Some(value) = options.acceptable_tol {
         set_ipopt_option(solver, "acceptable_tol", value)?;
+    }
+    if let Some(value) = options.acceptable_iter {
+        set_ipopt_option(solver, "acceptable_iter", value as i32)?;
+    }
+    if let Some(value) = options.acceptable_dual_tol {
+        set_ipopt_option(solver, "acceptable_dual_inf_tol", value)?;
+    }
+    if let Some(value) = options.acceptable_constraint_tol {
+        set_ipopt_option(solver, "acceptable_constr_viol_tol", value)?;
+    }
+    if let Some(value) = options.acceptable_complementarity_tol {
+        set_ipopt_option(solver, "acceptable_compl_inf_tol", value)?;
+    }
+    if let Some(value) = options.acceptable_obj_change_tol {
+        set_ipopt_option(solver, "acceptable_obj_change_tol", value)?;
     }
     if let Some(value) = options.constraint_tol {
         set_ipopt_option(solver, "constr_viol_tol", value)?;

@@ -1616,7 +1616,9 @@ mod tests {
             cross_track_limit_m: 30.0,
             solver_method: SolverMethod::Sqp,
             solver: SolverConfig {
+                profile: crate::common::SolverProfile::StrictOcp,
                 max_iters: 8,
+                overall_tol: 1.0e-4,
                 dual_tol: 1.0e-1,
                 constraint_tol: 1.0e-4,
                 complementarity_tol: 1.0e-4,

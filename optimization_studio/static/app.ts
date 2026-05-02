@@ -91,6 +91,8 @@ const CONTROL_SEMANTIC = Object.freeze({
   timeGridFocusWidth: 45,
   timeGridBreakpoint: 46,
   timeGridFirstIntervalFraction: 47,
+  solverProfile: 48,
+  solverOverallTolerance: 49,
 } as const);
 const CONTROL_SEMANTIC_FROM_WIRE = Object.freeze({
   transcription_method: CONTROL_SEMANTIC.transcriptionMethod,
@@ -104,8 +106,11 @@ const CONTROL_SEMANTIC_FROM_WIRE = Object.freeze({
   time_grid_breakpoint: CONTROL_SEMANTIC.timeGridBreakpoint,
   time_grid_first_interval_fraction: CONTROL_SEMANTIC.timeGridFirstIntervalFraction,
   solver_method: CONTROL_SEMANTIC.solverMethod,
+  solver_profile: CONTROL_SEMANTIC.solverProfile,
   solver_globalization: CONTROL_SEMANTIC.solverGlobalization,
   solver_max_iterations: CONTROL_SEMANTIC.solverMaxIterations,
+  solver_overall_tolerance: CONTROL_SEMANTIC.solverOverallTolerance,
+  solver_overall_tol: CONTROL_SEMANTIC.solverOverallTolerance,
   solver_hessian_regularization: CONTROL_SEMANTIC.solverHessianRegularization,
   solver_nlip_linear_solver: CONTROL_SEMANTIC.solverNlipLinearSolver,
   solver_nlip_spral_pivot_method: CONTROL_SEMANTIC.solverNlipSpralPivotMethod,
@@ -425,6 +430,11 @@ interface ControlChoice {
   label: string;
 }
 
+interface ControlProfileDefault {
+  profile: number;
+  value: number;
+}
+
 interface WireControlSpec {
   id: string;
   label: string;
@@ -441,6 +451,7 @@ interface WireControlSpec {
   semantic?: string | number;
   value_display?: string | number;
   choices?: ControlChoice[];
+  profile_defaults?: ControlProfileDefault[];
 }
 
 interface ControlSpec {
@@ -459,6 +470,7 @@ interface ControlSpec {
   semantic: ControlSemanticCode;
   value_display: ControlValueDisplayCode;
   choices: ControlChoice[];
+  profile_defaults: ControlProfileDefault[];
 }
 
 interface LatexSection {
@@ -1132,9 +1144,24 @@ function readControlChoice(value: JsonValue | undefined, context: string): Contr
   };
 }
 
+function readControlProfileDefault(
+  value: JsonValue | undefined,
+  context: string,
+): ControlProfileDefault {
+  const object = readJsonObject(value, context);
+  return {
+    profile: readJsonNumber(readJsonValueAt(object, "profile"), `${context}.profile`),
+    value: readJsonNumber(readJsonValueAt(object, "value"), `${context}.value`),
+  };
+}
+
 function readWireControlSpec(value: JsonValue | undefined, context: string): WireControlSpec {
   const object = readJsonObject(value, context);
   const choicesValue = readOptionalJsonArray(readJsonValueAt(object, "choices"), `${context}.choices`);
+  const profileDefaultsValue = readOptionalJsonArray(
+    readJsonValueAt(object, "profile_defaults"),
+    `${context}.profile_defaults`,
+  );
   return {
     id: readJsonString(readJsonValueAt(object, "id"), `${context}.id`),
     label: readJsonString(readJsonValueAt(object, "label"), `${context}.label`),
@@ -1161,6 +1188,8 @@ function readWireControlSpec(value: JsonValue | undefined, context: string): Wir
     ),
     choices: choicesValue?.map((choice, index) =>
       readControlChoice(choice, `${context}.choices[${index}]`)),
+    profile_defaults: profileDefaultsValue?.map((profileDefault, index) =>
+      readControlProfileDefault(profileDefault, `${context}.profile_defaults[${index}]`)),
   };
 }
 
@@ -2503,6 +2532,7 @@ function normalizeControl(control: WireControlSpec): ControlSpec {
       CONTROL_VALUE_DISPLAY.scalar,
     ),
     choices: control.choices ?? [],
+    profile_defaults: control.profile_defaults ?? [],
   };
 }
 
@@ -2701,12 +2731,37 @@ function findControlBySemantic(
   return spec?.controls.find((control) => control.semantic === semantic) ?? null;
 }
 
+function hasControlOverride(control: ControlSpec): boolean {
+  return Object.prototype.hasOwnProperty.call(state.values, control.id);
+}
+
+function currentSolverProfileValue(): number {
+  const control = findControlBySemantic(currentSpec(), CONTROL_SEMANTIC.solverProfile);
+  if (!control) {
+    return 0;
+  }
+  return Number(hasControlOverride(control) ? state.values[control.id] : control.default);
+}
+
+function profileDefaultForControl(control: ControlSpec): number {
+  const profile = currentSolverProfileValue();
+  const profileDefault = control.profile_defaults.find(
+    (entry) => Number(entry.profile) === Number(profile),
+  );
+  return Number(profileDefault?.value ?? control.default);
+}
+
+function effectiveControlValue(control: ControlSpec): number {
+  return Number(hasControlOverride(control) ? state.values[control.id] : profileDefaultForControl(control));
+}
+
 function currentSharedControlValue(semantic: ControlSemanticCode, fallback = 0): number {
   const control = findControlBySemantic(currentSpec(), semantic);
   if (!control) {
     return fallback;
   }
-  return Number(state.values[control.id] ?? control.default ?? fallback);
+  const numeric = effectiveControlValue(control);
+  return Number.isFinite(numeric) ? numeric : fallback;
 }
 
 function formatSharedControlValue(
@@ -2717,7 +2772,7 @@ function formatSharedControlValue(
   if (!control) {
     return fallback;
   }
-  const numeric = Number(state.values[control.id] ?? control.default);
+  const numeric = effectiveControlValue(control);
   if (!Number.isFinite(numeric)) {
     return fallback;
   }
@@ -2914,6 +2969,7 @@ function handleControlUpdate(control: ControlSpec): void {
     control.semantic === CONTROL_SEMANTIC.transcriptionMethod
     || control.semantic === CONTROL_SEMANTIC.timeGrid
     || control.semantic === CONTROL_SEMANTIC.solverMethod
+    || control.semantic === CONTROL_SEMANTIC.solverProfile
     || control.semantic === CONTROL_SEMANTIC.solverGlobalization
     || control.semantic === CONTROL_SEMANTIC.solverNlipLinearSolver
   ) {
@@ -3123,7 +3179,8 @@ function phaseLabel(phase: SolvePhaseCode): string {
 function appendControl(wrapperParent: HTMLElement, control: ControlSpec): void {
   const wrapper = document.createElement("section");
   wrapper.className = "control-group";
-  const value = state.values[control.id];
+  const value = effectiveControlValue(control);
+  const initialHasOverride = hasControlOverride(control);
   const choiceMap = new Map<number, string>(
     (control.choices ?? []).map((choice) => [Number(choice.value), choice.label]),
   );
@@ -3139,7 +3196,7 @@ function appendControl(wrapperParent: HTMLElement, control: ControlSpec): void {
     const options = control.choices
       .map(
         (choice) =>
-          `<option value="${choice.value}"${Number(choice.value) === Number(value) ? " selected" : ""}>${choice.label}</option>`,
+          `<option value="${choice.value}"${Number(choice.value) === value ? " selected" : ""}>${choice.label}</option>`,
       )
       .join("");
     wrapper.innerHTML = `
@@ -3148,7 +3205,7 @@ function appendControl(wrapperParent: HTMLElement, control: ControlSpec): void {
           <div class="control-label">${control.label}</div>
           <div class="control-help">${control.help}</div>
         </div>
-        <div class="value-pill">${formatValue(Number(value))}</div>
+        <div class="value-pill">${formatValue(value)}</div>
       </div>
       <div class="control-inputs control-inputs-select">
         <select>${options}</select>
@@ -3168,22 +3225,33 @@ function appendControl(wrapperParent: HTMLElement, control: ControlSpec): void {
   }
 
   if (isTextEntryControl(control)) {
+    const placeholderValue = profileDefaultForControl(control);
+    const inputValue = initialHasOverride ? formatValue(Number(state.values[control.id])) : "";
     wrapper.innerHTML = `
       <div class="control-header">
         <div>
           <div class="control-label">${control.label}</div>
           <div class="control-help">${control.help}</div>
         </div>
-        <div class="value-pill">${formatValue(Number(value))}</div>
+        <div class="value-pill">${formatValue(value)}</div>
       </div>
       <div class="control-inputs control-inputs-select">
-        <input type="text" value="${formatValue(Number(value))}" placeholder="${formatValue(control.default)}" spellcheck="false" />
+        <input type="text" value="${inputValue}" placeholder="${formatValue(placeholderValue)}" spellcheck="false" />
       </div>
     `;
     const textInput = requiredChild<HTMLInputElement>(wrapper, "input");
     const pill = requiredChild<HTMLDivElement>(wrapper, ".value-pill");
     const sync = (raw: string): void => {
-      const numeric = Number(raw);
+      const trimmed = raw.trim();
+      if (trimmed.length === 0) {
+        if (hasControlOverride(control)) {
+          delete state.values[control.id];
+        }
+        pill.textContent = formatValue(profileDefaultForControl(control));
+        handleControlUpdate(control);
+        return;
+      }
+      const numeric = Number(trimmed);
       if (!Number.isFinite(numeric)) {
         return;
       }
@@ -3202,7 +3270,9 @@ function appendControl(wrapperParent: HTMLElement, control: ControlSpec): void {
       sync(target.value);
     });
     textInput.addEventListener("blur", () => {
-      textInput.value = formatValue(Number(state.values[control.id]));
+      textInput.value = hasControlOverride(control)
+        ? formatValue(Number(state.values[control.id]))
+        : "";
     });
     wrapperParent.appendChild(wrapper);
     return;
@@ -3214,7 +3284,7 @@ function appendControl(wrapperParent: HTMLElement, control: ControlSpec): void {
         <div class="control-label">${control.label}</div>
         <div class="control-help">${control.help}</div>
       </div>
-      <div class="value-pill">${formatValue(Number(value))}</div>
+      <div class="value-pill">${formatValue(value)}</div>
     </div>
     <div class="control-inputs">
       <input type="range" min="${control.min}" max="${control.max}" step="${control.step}" value="${value}" />
@@ -3275,7 +3345,7 @@ function appendControl(wrapperParent: HTMLElement, control: ControlSpec): void {
   });
 
   const normalizeNumberInput = (): void => {
-    numberInput.value = String(state.values[control.id]);
+    numberInput.value = String(effectiveControlValue(control));
   };
 
   numberInput.addEventListener("blur", () => {
@@ -3727,7 +3797,11 @@ function selectProblem(problemId: ProblemIdCode): void {
   clearScheduledPrewarm();
   stopAnimation();
   state.selectedId = problemId;
-  state.values = Object.fromEntries(spec.controls.map((control) => [control.id, control.default]));
+  state.values = Object.fromEntries(
+    spec.controls
+      .filter((control) => !isTextEntryControl(control) || control.profile_defaults.length === 0)
+      .map((control) => [control.id, control.default]),
+  );
   state.artifact = null;
   state.animationIndex = 0;
   state.sceneView = null;
