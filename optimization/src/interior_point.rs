@@ -12676,6 +12676,196 @@ fn next_ipopt_hessian_perturbation(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IpoptPerturbationTestStatus {
+    NoTest,
+    DeltaCEq0DeltaXEq0,
+    DeltaCGt0DeltaXEq0,
+    DeltaCEq0DeltaXGt0,
+    DeltaCGt0DeltaXGt0,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IpoptPerturbationRetryConfig {
+    previous_hessian_perturbation: Option<f64>,
+    first_hessian_perturbation: f64,
+    first_growth_factor: f64,
+    growth_factor: f64,
+    decay_factor: f64,
+    max_regularization: f64,
+    jacobian_regularization: f64,
+    perturb_always_cd: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct IpoptPerturbationRetry {
+    regularization: f64,
+    jacobian_regularization: f64,
+    test_status: IpoptPerturbationTestStatus,
+}
+
+fn initial_ipopt_perturbation_test_status(
+    perturb_always_cd: bool,
+    jacobian_regularization_already_active: bool,
+) -> IpoptPerturbationTestStatus {
+    if perturb_always_cd {
+        IpoptPerturbationTestStatus::DeltaCGt0DeltaXEq0
+    } else if jacobian_regularization_already_active {
+        IpoptPerturbationTestStatus::NoTest
+    } else {
+        IpoptPerturbationTestStatus::DeltaCEq0DeltaXEq0
+    }
+}
+
+fn ipopt_perturbation_retry_config(
+    system: &ReducedKktSystem<'_>,
+    max_regularization: f64,
+) -> IpoptPerturbationRetryConfig {
+    IpoptPerturbationRetryConfig {
+        previous_hessian_perturbation: system.previous_hessian_perturbation,
+        first_hessian_perturbation: system.first_hessian_perturbation,
+        first_growth_factor: system.regularization_first_growth_factor,
+        growth_factor: system.regularization_growth_factor,
+        decay_factor: system.regularization_decay_factor,
+        max_regularization,
+        jacobian_regularization: ipopt_jacobian_perturbation(system),
+        perturb_always_cd: system.perturb_always_cd,
+    }
+}
+
+fn ipopt_next_hessian_perturbation_from_config(
+    current_regularization: f64,
+    config: IpoptPerturbationRetryConfig,
+) -> Option<f64> {
+    next_ipopt_hessian_perturbation(
+        current_regularization,
+        config.previous_hessian_perturbation,
+        config.first_hessian_perturbation,
+        config.first_growth_factor,
+        config.growth_factor,
+        config.decay_factor,
+        config.max_regularization,
+    )
+}
+
+fn ipopt_perturb_for_singularity(
+    current_regularization: f64,
+    current_jacobian_regularization: f64,
+    test_status: IpoptPerturbationTestStatus,
+    config: IpoptPerturbationRetryConfig,
+) -> Option<IpoptPerturbationRetry> {
+    let jacobian_regularization = config.jacobian_regularization;
+    match test_status {
+        IpoptPerturbationTestStatus::DeltaCEq0DeltaXEq0 => {
+            if jacobian_regularization > 0.0 {
+                Some(IpoptPerturbationRetry {
+                    regularization: current_regularization,
+                    jacobian_regularization,
+                    test_status: IpoptPerturbationTestStatus::DeltaCGt0DeltaXEq0,
+                })
+            } else {
+                None
+            }
+        }
+        IpoptPerturbationTestStatus::DeltaCGt0DeltaXEq0 => {
+            let next_regularization =
+                ipopt_next_hessian_perturbation_from_config(current_regularization, config)?;
+            Some(IpoptPerturbationRetry {
+                regularization: next_regularization,
+                jacobian_regularization: if config.perturb_always_cd {
+                    current_jacobian_regularization.max(jacobian_regularization)
+                } else {
+                    0.0
+                },
+                test_status: if config.perturb_always_cd {
+                    IpoptPerturbationTestStatus::DeltaCGt0DeltaXGt0
+                } else {
+                    IpoptPerturbationTestStatus::DeltaCEq0DeltaXGt0
+                },
+            })
+        }
+        IpoptPerturbationTestStatus::DeltaCEq0DeltaXGt0 => {
+            let next_regularization =
+                ipopt_next_hessian_perturbation_from_config(current_regularization, config)?;
+            Some(IpoptPerturbationRetry {
+                regularization: next_regularization,
+                jacobian_regularization,
+                test_status: IpoptPerturbationTestStatus::DeltaCGt0DeltaXGt0,
+            })
+        }
+        IpoptPerturbationTestStatus::DeltaCGt0DeltaXGt0 => {
+            let next_regularization =
+                ipopt_next_hessian_perturbation_from_config(current_regularization, config)?;
+            Some(IpoptPerturbationRetry {
+                regularization: next_regularization,
+                jacobian_regularization: current_jacobian_regularization
+                    .max(jacobian_regularization),
+                test_status: IpoptPerturbationTestStatus::DeltaCGt0DeltaXGt0,
+            })
+        }
+        IpoptPerturbationTestStatus::NoTest => {
+            if current_jacobian_regularization > 0.0 {
+                let next_regularization =
+                    ipopt_next_hessian_perturbation_from_config(current_regularization, config)?;
+                Some(IpoptPerturbationRetry {
+                    regularization: next_regularization,
+                    jacobian_regularization: current_jacobian_regularization,
+                    test_status,
+                })
+            } else if jacobian_regularization > 0.0 {
+                Some(IpoptPerturbationRetry {
+                    regularization: current_regularization,
+                    jacobian_regularization,
+                    test_status,
+                })
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn ipopt_perturb_for_wrong_inertia(
+    current_regularization: f64,
+    current_jacobian_regularization: f64,
+    test_status: IpoptPerturbationTestStatus,
+    has_constraints: bool,
+    config: IpoptPerturbationRetryConfig,
+) -> Option<IpoptPerturbationRetry> {
+    if let Some(next_regularization) =
+        ipopt_next_hessian_perturbation_from_config(current_regularization, config)
+    {
+        return Some(IpoptPerturbationRetry {
+            regularization: next_regularization,
+            jacobian_regularization: current_jacobian_regularization,
+            test_status,
+        });
+    }
+
+    if !has_constraints
+        || current_jacobian_regularization > 0.0
+        || config.jacobian_regularization <= 0.0
+    {
+        return None;
+    }
+
+    let next_regularization = next_ipopt_hessian_perturbation(
+        0.0,
+        None,
+        config.first_hessian_perturbation,
+        config.first_growth_factor,
+        config.growth_factor,
+        config.decay_factor,
+        config.max_regularization,
+    )?;
+
+    Some(IpoptPerturbationRetry {
+        regularization: next_regularization,
+        jacobian_regularization: config.jacobian_regularization,
+        test_status: IpoptPerturbationTestStatus::NoTest,
+    })
+}
+
 fn ipopt_jacobian_perturbation_value(
     jacobian_regularization_value: f64,
     barrier_parameter: f64,
@@ -13753,8 +13943,12 @@ fn solve_reduced_kkt_with_spral_src_oriented(
 
     let mut attempts: Vec<InteriorPointLinearSolveAttempt> = Vec::new();
     let mut current_regularization = system.regularization.max(0.0);
-    let (mut current_jacobian_regularization, mut tried_jacobian_regularization) =
+    let (mut current_jacobian_regularization, jacobian_regularization_already_active) =
         ipopt_initial_jacobian_regularization(system);
+    let mut perturbation_test_status = initial_ipopt_perturbation_test_status(
+        system.perturb_always_cd,
+        jacobian_regularization_already_active,
+    );
     let mut quality_retry_detail: Option<String> = None;
     // Mirrors IpPDFullSpaceSolver::augsys_improved_: scoped to this
     // primal-dual system solve, and not reset by perturbation retries because
@@ -13893,41 +14087,37 @@ fn solve_reduced_kkt_with_spral_src_oriented(
                 if full_space_refinement_pretend_singular {
                     pretend_singular_refinement_last_time = true;
                 }
-                if singularity_like_failure
-                    && meq + mineq > 0
-                    && !tried_jacobian_regularization
-                    && current_jacobian_regularization <= 0.0
-                {
-                    current_jacobian_regularization = ipopt_jacobian_perturbation(system);
-                    tried_jacobian_regularization = true;
-                    if current_jacobian_regularization > 0.0 {
+                if singularity_like_failure && meq + mineq > 0 {
+                    if let Some(next_perturbation) = ipopt_perturb_for_singularity(
+                        current_regularization,
+                        current_jacobian_regularization,
+                        perturbation_test_status,
+                        ipopt_perturbation_retry_config(system, max_regularization),
+                    ) {
+                        current_regularization = next_perturbation.regularization;
+                        current_jacobian_regularization = next_perturbation.jacobian_regularization;
+                        perturbation_test_status = next_perturbation.test_status;
                         continue;
                     }
-                }
-                if singularity_like_failure
-                    && current_jacobian_regularization > 0.0
-                    && current_regularization <= 0.0
-                    && !system.perturb_always_cd
-                {
-                    current_jacobian_regularization = 0.0;
+                    break;
                 }
             }
         }
         if retry_index == max_retry_count || current_regularization >= max_regularization {
             break;
         }
-        let Some(next_regularization) = next_ipopt_hessian_perturbation(
+        let Some(next_perturbation) = ipopt_perturb_for_wrong_inertia(
             current_regularization,
-            system.previous_hessian_perturbation,
-            system.first_hessian_perturbation,
-            system.regularization_first_growth_factor,
-            system.regularization_growth_factor,
-            system.regularization_decay_factor,
-            max_regularization,
+            current_jacobian_regularization,
+            perturbation_test_status,
+            meq + mineq > 0,
+            ipopt_perturbation_retry_config(system, max_regularization),
         ) else {
             break;
         };
-        current_regularization = next_regularization;
+        current_regularization = next_perturbation.regularization;
+        current_jacobian_regularization = next_perturbation.jacobian_regularization;
+        perturbation_test_status = next_perturbation.test_status;
     }
     Err(attempts)
 }
@@ -14010,8 +14200,12 @@ fn solve_restoration_reduced_kkt_with_spral_src(
 
     let mut attempts: Vec<InteriorPointLinearSolveAttempt> = Vec::new();
     let mut current_regularization = reduced_system.regularization.max(0.0);
-    let (mut current_jacobian_regularization, mut tried_jacobian_regularization) =
+    let (mut current_jacobian_regularization, jacobian_regularization_already_active) =
         ipopt_initial_jacobian_regularization(reduced_system);
+    let mut perturbation_test_status = initial_ipopt_perturbation_test_status(
+        reduced_system.perturb_always_cd,
+        jacobian_regularization_already_active,
+    );
     let mut quality_retry_detail: Option<String> = None;
     let mut solver_quality_improved = false;
     let max_regularization = reduced_system
@@ -14248,40 +14442,42 @@ fn solve_restoration_reduced_kkt_with_spral_src(
                                 refinement_options.residual_ratio_singular,
                             ));
                             pretend_singular_refinement_last_time = true;
-                            if full_meq + full_mineq > 0
-                                && !tried_jacobian_regularization
-                                && current_jacobian_regularization <= 0.0
-                            {
-                                current_jacobian_regularization =
-                                    ipopt_jacobian_perturbation(reduced_system);
-                                tried_jacobian_regularization = true;
-                                if current_jacobian_regularization > 0.0 {
+                            if full_meq + full_mineq > 0 {
+                                if let Some(next_perturbation) = ipopt_perturb_for_singularity(
+                                    current_regularization,
+                                    current_jacobian_regularization,
+                                    perturbation_test_status,
+                                    ipopt_perturbation_retry_config(
+                                        reduced_system,
+                                        max_regularization,
+                                    ),
+                                ) {
+                                    current_regularization = next_perturbation.regularization;
+                                    current_jacobian_regularization =
+                                        next_perturbation.jacobian_regularization;
+                                    perturbation_test_status = next_perturbation.test_status;
                                     continue;
                                 }
-                            }
-                            if current_jacobian_regularization > 0.0
-                                && current_regularization <= 0.0
-                                && !reduced_system.perturb_always_cd
-                            {
-                                current_jacobian_regularization = 0.0;
+                                break;
                             }
                             if retry_index == max_retry_count
                                 || current_regularization >= max_regularization
                             {
                                 break;
                             }
-                            let Some(next_regularization) = next_ipopt_hessian_perturbation(
+                            let Some(next_perturbation) = ipopt_perturb_for_wrong_inertia(
                                 current_regularization,
-                                reduced_system.previous_hessian_perturbation,
-                                reduced_system.first_hessian_perturbation,
-                                reduced_system.regularization_first_growth_factor,
-                                reduced_system.regularization_growth_factor,
-                                reduced_system.regularization_decay_factor,
-                                max_regularization,
+                                current_jacobian_regularization,
+                                perturbation_test_status,
+                                full_meq + full_mineq > 0,
+                                ipopt_perturbation_retry_config(reduced_system, max_regularization),
                             ) else {
                                 break;
                             };
-                            current_regularization = next_regularization;
+                            current_regularization = next_perturbation.regularization;
+                            current_jacobian_regularization =
+                                next_perturbation.jacobian_regularization;
+                            perturbation_test_status = next_perturbation.test_status;
                             continue;
                         }
                         IpoptRefinementFailureDecision::AcceptCurrentSolution { .. } => {
@@ -14354,23 +14550,19 @@ fn solve_restoration_reduced_kkt_with_spral_src(
                     quality_retry_detail = Some(quality_detail);
                     continue;
                 }
-                if singularity_like_failure
-                    && full_meq + full_mineq > 0
-                    && !tried_jacobian_regularization
-                    && current_jacobian_regularization <= 0.0
-                {
-                    current_jacobian_regularization = ipopt_jacobian_perturbation(reduced_system);
-                    tried_jacobian_regularization = true;
-                    if current_jacobian_regularization > 0.0 {
+                if singularity_like_failure && full_meq + full_mineq > 0 {
+                    if let Some(next_perturbation) = ipopt_perturb_for_singularity(
+                        current_regularization,
+                        current_jacobian_regularization,
+                        perturbation_test_status,
+                        ipopt_perturbation_retry_config(reduced_system, max_regularization),
+                    ) {
+                        current_regularization = next_perturbation.regularization;
+                        current_jacobian_regularization = next_perturbation.jacobian_regularization;
+                        perturbation_test_status = next_perturbation.test_status;
                         continue;
                     }
-                }
-                if singularity_like_failure
-                    && current_jacobian_regularization > 0.0
-                    && current_regularization <= 0.0
-                    && !reduced_system.perturb_always_cd
-                {
-                    current_jacobian_regularization = 0.0;
+                    break;
                 }
             }
         }
@@ -14378,18 +14570,18 @@ fn solve_restoration_reduced_kkt_with_spral_src(
         if retry_index == max_retry_count || current_regularization >= max_regularization {
             break;
         }
-        let Some(next_regularization) = next_ipopt_hessian_perturbation(
+        let Some(next_perturbation) = ipopt_perturb_for_wrong_inertia(
             current_regularization,
-            reduced_system.previous_hessian_perturbation,
-            reduced_system.first_hessian_perturbation,
-            reduced_system.regularization_first_growth_factor,
-            reduced_system.regularization_growth_factor,
-            reduced_system.regularization_decay_factor,
-            max_regularization,
+            current_jacobian_regularization,
+            perturbation_test_status,
+            full_meq + full_mineq > 0,
+            ipopt_perturbation_retry_config(reduced_system, max_regularization),
         ) else {
             break;
         };
-        current_regularization = next_regularization;
+        current_regularization = next_perturbation.regularization;
+        current_jacobian_regularization = next_perturbation.jacobian_regularization;
+        perturbation_test_status = next_perturbation.test_status;
     }
 
     Err(linear_solve_error(
@@ -16033,6 +16225,179 @@ mod tests {
 
         assert_eq!(regularization.to_bits(), 0.0_f64.to_bits());
         assert!(!tried);
+    }
+
+    fn test_perturbation_config(perturb_always_cd: bool) -> IpoptPerturbationRetryConfig {
+        IpoptPerturbationRetryConfig {
+            previous_hessian_perturbation: None,
+            first_hessian_perturbation: 1.0e-4,
+            first_growth_factor: 100.0,
+            growth_factor: 8.0,
+            decay_factor: 1.0 / 3.0,
+            max_regularization: 1.0e4,
+            jacobian_regularization: 1.0e-9,
+            perturb_always_cd,
+        }
+    }
+
+    fn assert_perturbation_retry(
+        actual: IpoptPerturbationRetry,
+        expected_regularization: f64,
+        expected_jacobian_regularization: f64,
+        expected_test_status: IpoptPerturbationTestStatus,
+    ) {
+        assert!(
+            (actual.regularization - expected_regularization).abs()
+                <= expected_regularization.abs().max(1.0) * 1.0e-15,
+            "regularization actual={:.17e} expected={:.17e}",
+            actual.regularization,
+            expected_regularization
+        );
+        assert!(
+            (actual.jacobian_regularization - expected_jacobian_regularization).abs()
+                <= expected_jacobian_regularization.abs().max(1.0) * 1.0e-15,
+            "jacobian regularization actual={:.17e} expected={:.17e}",
+            actual.jacobian_regularization,
+            expected_jacobian_regularization
+        );
+        assert_eq!(actual.test_status, expected_test_status);
+    }
+
+    #[test]
+    fn singularity_perturbation_cycles_through_ipopt_degeneracy_tests() {
+        let config = test_perturbation_config(false);
+        let mut status = initial_ipopt_perturbation_test_status(false, false);
+        let mut regularization = 0.0;
+        let mut jacobian_regularization = 0.0;
+
+        // IpPDPerturbationHandler::PerturbForSingularity first tests
+        // the constraint regularization alone.
+        let retry =
+            ipopt_perturb_for_singularity(regularization, jacobian_regularization, status, config)
+                .expect("constraint-only perturbation");
+        assert_perturbation_retry(
+            retry,
+            0.0,
+            1.0e-9,
+            IpoptPerturbationTestStatus::DeltaCGt0DeltaXEq0,
+        );
+        regularization = retry.regularization;
+        jacobian_regularization = retry.jacobian_regularization;
+        status = retry.test_status;
+
+        // If the constraint-only test is still singular, IPOPT resets
+        // delta_c/delta_d and tries a Hessian perturbation alone.
+        let retry =
+            ipopt_perturb_for_singularity(regularization, jacobian_regularization, status, config)
+                .expect("hessian-only perturbation");
+        assert_perturbation_retry(
+            retry,
+            1.0e-4,
+            0.0,
+            IpoptPerturbationTestStatus::DeltaCEq0DeltaXGt0,
+        );
+        regularization = retry.regularization;
+        jacobian_regularization = retry.jacobian_regularization;
+        status = retry.test_status;
+
+        // The next singularity combines both perturbations and keeps using
+        // get_deltas_for_wrong_inertia for subsequent Hessian growth.
+        let retry =
+            ipopt_perturb_for_singularity(regularization, jacobian_regularization, status, config)
+                .expect("combined perturbation");
+        assert_perturbation_retry(
+            retry,
+            1.0e-2,
+            1.0e-9,
+            IpoptPerturbationTestStatus::DeltaCGt0DeltaXGt0,
+        );
+        regularization = retry.regularization;
+        jacobian_regularization = retry.jacobian_regularization;
+        status = retry.test_status;
+
+        let retry =
+            ipopt_perturb_for_singularity(regularization, jacobian_regularization, status, config)
+                .expect("continued combined perturbation growth");
+        assert_perturbation_retry(
+            retry,
+            1.0,
+            1.0e-9,
+            IpoptPerturbationTestStatus::DeltaCGt0DeltaXGt0,
+        );
+    }
+
+    #[test]
+    fn perturb_always_cd_singularity_keeps_constraint_regularization() {
+        let config = test_perturbation_config(true);
+        let mut status = initial_ipopt_perturbation_test_status(true, true);
+        let mut regularization = 0.0;
+        let mut jacobian_regularization = config.jacobian_regularization;
+
+        let retry =
+            ipopt_perturb_for_singularity(regularization, jacobian_regularization, status, config)
+                .expect("first always-cd hessian perturbation");
+        assert_perturbation_retry(
+            retry,
+            1.0e-4,
+            1.0e-9,
+            IpoptPerturbationTestStatus::DeltaCGt0DeltaXGt0,
+        );
+        regularization = retry.regularization;
+        jacobian_regularization = retry.jacobian_regularization;
+        status = retry.test_status;
+
+        let retry =
+            ipopt_perturb_for_singularity(regularization, jacobian_regularization, status, config)
+                .expect("second always-cd hessian perturbation");
+        assert_perturbation_retry(
+            retry,
+            1.0e-2,
+            1.0e-9,
+            IpoptPerturbationTestStatus::DeltaCGt0DeltaXGt0,
+        );
+    }
+
+    #[test]
+    fn forced_jacobian_regularization_preserves_no_test_retry_state() {
+        let config = test_perturbation_config(false);
+        let status = initial_ipopt_perturbation_test_status(false, true);
+
+        let retry = ipopt_perturb_for_singularity(1.0e-4, 2.5e-7, status, config)
+            .expect("forced jacobian regularization retries through wrong-inertia growth");
+        assert_perturbation_retry(retry, 1.0e-2, 2.5e-7, IpoptPerturbationTestStatus::NoTest);
+    }
+
+    #[test]
+    fn wrong_inertia_max_hessian_fallback_matches_ipopt_delta_c_retry() {
+        let config = IpoptPerturbationRetryConfig {
+            max_regularization: 2.0,
+            ..test_perturbation_config(false)
+        };
+
+        // IpPDPerturbationHandler::PerturbForWrongInertia retries with
+        // delta_c/delta_d and resets delta_x/delta_s when Hessian growth
+        // alone exceeds max_hessian_perturbation.
+        let retry = ipopt_perturb_for_wrong_inertia(
+            1.0,
+            0.0,
+            IpoptPerturbationTestStatus::NoTest,
+            true,
+            config,
+        )
+        .expect("delta-c fallback after max Hessian perturbation");
+        assert_perturbation_retry(retry, 1.0e-4, 1.0e-9, IpoptPerturbationTestStatus::NoTest);
+
+        assert!(
+            ipopt_perturb_for_wrong_inertia(
+                1.0,
+                0.0,
+                IpoptPerturbationTestStatus::NoTest,
+                false,
+                config,
+            )
+            .is_none(),
+            "IPOPT only applies the delta-c fallback when constraints are present"
+        );
     }
 
     #[test]

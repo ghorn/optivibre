@@ -395,6 +395,10 @@ def classify_rust_line(path, line_no, text):
             return "termination display/reporting"
         if 16680 <= line_no <= 16770:
             return "unit-test parity witness"
+        if 17450 <= line_no <= 17680:
+            return "unit-test parity witness"
+        if 18180 <= line_no <= 18300:
+            return "unit-test parity witness"
         if 16950 <= line_no <= 17320:
             return "unit-test parity witness"
         if 17680 <= line_no <= 17920:
@@ -438,6 +442,8 @@ def classify_rust_line(path, line_no, text):
         if "IpoptRestorationAlgorithmStatus::MaxIterationsExceeded" in text:
             return "restoration status mapping"
         if 24700 <= line_no <= 24740:
+            return "restoration status mapping"
+        if 25170 <= line_no <= 25250:
             return "restoration status mapping"
         if line_no < 760:
             return "option/display/reporting"
@@ -513,10 +519,14 @@ def classify_rust_line(path, line_no, text):
             return "unreachable: non-parity linear solver/debug branch"
         if 11980 <= line_no <= 12120:
             return "watchdog globalization start gate"
+        if 12650 <= line_no <= 12920:
+            return "perturbation and inertia retry policy"
         if 12120 <= line_no <= 14330:
             return "SOC/watchdog globalization branch"
         if 14330 <= line_no <= 14920:
             return "accepted-step and watchdog state bookkeeping"
+        if 16200 <= line_no <= 16460:
+            return "unit-test parity witness"
         if 14920 <= line_no <= 16730:
             return "iteration log formatting/reporting"
         if 16750 <= line_no <= 16795:
