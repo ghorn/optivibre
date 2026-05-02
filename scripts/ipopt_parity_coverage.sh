@@ -393,9 +393,11 @@ def classify_rust_line(path, line_no, text):
             return "termination display/reporting"
         if "InteriorPointTermination::Converged =>" in text:
             return "termination display/reporting"
-        if 16950 <= line_no <= 17180:
+        if 16680 <= line_no <= 16770:
             return "unit-test parity witness"
-        if 17680 <= line_no <= 17810:
+        if 16950 <= line_no <= 17320:
+            return "unit-test parity witness"
+        if 17680 <= line_no <= 17920:
             return "unit-test parity witness"
         if "let ineq_text = if has_inequality_like_constraints" in text:
             return "solve summary/reporting"
@@ -519,6 +521,8 @@ def classify_rust_line(path, line_no, text):
             return "iteration log formatting/reporting"
         if 16750 <= line_no <= 16795:
             return "iteration log formatting/reporting"
+        if 24800 <= line_no <= 24900:
+            return "restoration status mapping"
         if 14720 <= line_no <= 14770:
             return "iteration log formatting/reporting"
     if any(token in text for token in ["SparseQdldl", "SsidsRs", "Auto", "compare_solvers"]):

@@ -10847,6 +10847,35 @@ enum IpoptRefinementFailureDecision {
     AcceptCurrentSolution { after_pretend_singular_retry: bool },
 }
 
+fn ipopt_refinement_failure_detail(decision: IpoptRefinementFailureDecision) -> &'static str {
+    match decision {
+        IpoptRefinementFailureDecision::RetryWithHigherQuality => "spral_quality_retry_requested",
+        IpoptRefinementFailureDecision::PretendSingular => {
+            "ipopt_pretend_singular_after_refinement_failure"
+        }
+        IpoptRefinementFailureDecision::AcceptCurrentSolution {
+            after_pretend_singular_retry: true,
+        } => "ipopt_accept_current_solution_after_pretend_singular_refinement_failure",
+        IpoptRefinementFailureDecision::AcceptCurrentSolution {
+            after_pretend_singular_retry: false,
+        } => "ipopt_accept_current_solution_after_refinement_failure",
+    }
+}
+
+#[cfg(test)]
+fn ipopt_refinement_failure_info_marker(decision: IpoptRefinementFailureDecision) -> Option<char> {
+    match decision {
+        IpoptRefinementFailureDecision::RetryWithHigherQuality => Some('q'),
+        IpoptRefinementFailureDecision::PretendSingular => Some('s'),
+        IpoptRefinementFailureDecision::AcceptCurrentSolution {
+            after_pretend_singular_retry: false,
+        } => Some('S'),
+        IpoptRefinementFailureDecision::AcceptCurrentSolution {
+            after_pretend_singular_retry: true,
+        } => None,
+    }
+}
+
 fn ipopt_refinement_failure_decision(
     residual_ratio: f64,
     options: IpoptLinearRefinementOptions,
@@ -13399,13 +13428,14 @@ fn factor_solve_spral_src(
             "ipopt_full_space_iterative_refinement_failed residual_ratio={:.3e}",
             refinement.residual_ratio
         );
-        match ipopt_refinement_failure_decision(
+        let failure_decision = ipopt_refinement_failure_decision(
             refinement.residual_ratio,
             refinement_options,
             context.native_spral_quality_was_increased,
             native_spral_quality_can_increase(workspace, system),
             context.pretend_singular_last_time,
-        ) {
+        );
+        match failure_decision {
             IpoptRefinementFailureDecision::RetryWithHigherQuality => {
                 return Err(InteriorPointLinearSolveAttempt {
                     solver: InteriorPointLinearSolver::SpralSrc,
@@ -13413,7 +13443,8 @@ fn factor_solve_spral_src(
                     inertia: Some(Box::new(interior_point_linear_inertia(factor_info.inertia))),
                     failure_kind: InteriorPointLinearSolveFailureKind::ResidualTooLarge,
                     detail: Some(format!(
-                        "{refinement_detail}; spral_quality_retry_requested"
+                        "{refinement_detail}; {}",
+                        ipopt_refinement_failure_detail(failure_decision)
                     )),
                     solution_inf: Some(
                         full_space_solution
@@ -13433,7 +13464,8 @@ fn factor_solve_spral_src(
                     inertia: Some(Box::new(interior_point_linear_inertia(factor_info.inertia))),
                     failure_kind: InteriorPointLinearSolveFailureKind::ResidualTooLarge,
                     detail: Some(format!(
-                        "{refinement_detail}; ipopt_pretend_singular_after_refinement_failure"
+                        "{refinement_detail}; {}",
+                        ipopt_refinement_failure_detail(failure_decision)
                     )),
                     solution_inf: Some(
                         full_space_solution
@@ -13446,14 +13478,8 @@ fn factor_solve_spral_src(
                     residual_inf_limit: Some(refinement_options.residual_ratio_singular),
                 });
             }
-            IpoptRefinementFailureDecision::AcceptCurrentSolution {
-                after_pretend_singular_retry,
-            } => {
-                let accept_detail = if after_pretend_singular_retry {
-                    "ipopt_accept_current_solution_after_pretend_singular_refinement_failure"
-                } else {
-                    "ipopt_accept_current_solution_after_refinement_failure"
-                };
+            IpoptRefinementFailureDecision::AcceptCurrentSolution { .. } => {
+                let accept_detail = ipopt_refinement_failure_detail(failure_decision);
                 detail = Some(match detail.take() {
                     Some(existing) => format!("{existing}; {refinement_detail}; {accept_detail}"),
                     None => format!("{refinement_detail}; {accept_detail}"),
@@ -13735,10 +13761,7 @@ fn solve_reduced_kkt_with_spral_src_oriented(
     // IPOPT's cache dependencies exclude the perturbation shifts.
     let mut solver_quality_improved = false;
     let mut pretend_singular_refinement_last_time = false;
-    let max_regularization = system
-        .regularization_max
-        .max(current_regularization)
-        .max(system.first_hessian_perturbation);
+    let max_regularization = system.regularization_max.max(current_regularization);
     let max_retry_count = system.adaptive_regularization_retries + 2;
     for retry_index in 0..=max_retry_count {
         let primal_shift = current_regularization;
@@ -13993,8 +14016,7 @@ fn solve_restoration_reduced_kkt_with_spral_src(
     let mut solver_quality_improved = false;
     let max_regularization = reduced_system
         .regularization_max
-        .max(current_regularization)
-        .max(reduced_system.first_hessian_perturbation);
+        .max(current_regularization);
     let max_retry_count = reduced_system.adaptive_regularization_retries + 2;
     let mut pretend_singular_refinement_last_time = false;
 
@@ -14189,19 +14211,20 @@ fn solve_restoration_reduced_kkt_with_spral_src(
 
                 if refinement.failed {
                     let refinement_options = full_system.refinement_options();
-                    match ipopt_refinement_failure_decision(
+                    let failure_decision = ipopt_refinement_failure_decision(
                         refinement.residual_ratio,
                         refinement_options,
                         solver_quality_improved,
                         native_spral_quality_can_increase(workspace, reduced_system),
                         pretend_singular_refinement_last_time,
-                    ) {
+                    );
+                    match failure_decision {
                         IpoptRefinementFailureDecision::RetryWithHigherQuality => {
                             let mut attempt = spral_refinement_failure_attempt(
                                 current_regularization,
                                 backend_stats.inertia,
                                 &refinement,
-                                "spral_quality_retry_requested",
+                                ipopt_refinement_failure_detail(failure_decision),
                                 refinement_options.residual_ratio_max,
                             );
                             if let Some((old_u, new_u)) =
@@ -14221,7 +14244,7 @@ fn solve_restoration_reduced_kkt_with_spral_src(
                                 current_regularization,
                                 backend_stats.inertia,
                                 &refinement,
-                                "ipopt_pretend_singular_after_refinement_failure",
+                                ipopt_refinement_failure_detail(failure_decision),
                                 refinement_options.residual_ratio_singular,
                             ));
                             pretend_singular_refinement_last_time = true;
@@ -14261,14 +14284,8 @@ fn solve_restoration_reduced_kkt_with_spral_src(
                             current_regularization = next_regularization;
                             continue;
                         }
-                        IpoptRefinementFailureDecision::AcceptCurrentSolution {
-                            after_pretend_singular_retry,
-                        } => {
-                            let accept_detail = if after_pretend_singular_retry {
-                                "ipopt_accept_current_solution_after_pretend_singular_refinement_failure"
-                            } else {
-                                "ipopt_accept_current_solution_after_refinement_failure"
-                            };
+                        IpoptRefinementFailureDecision::AcceptCurrentSolution { .. } => {
+                            let accept_detail = ipopt_refinement_failure_detail(failure_decision);
                             detail = Some(format!(
                                 "{}; ipopt_full_space_iterative_refinement_failed residual_ratio={:.3e}; {accept_detail}",
                                 detail.expect("restoration refinement detail"),
@@ -16019,6 +16036,64 @@ mod tests {
     }
 
     #[test]
+    fn hessian_perturbation_growth_matches_ipopt_max_check() {
+        fn assert_close(actual: Option<f64>, expected: f64) {
+            let actual = actual.expect("expected a perturbation value");
+            assert!(
+                (actual - expected).abs() <= expected.abs().max(1.0) * 1.0e-15,
+                "actual={actual:.17e} expected={expected:.17e}"
+            );
+        }
+
+        // IpPDPerturbationHandler::get_deltas_for_wrong_inertia starts with
+        // first_hessian_perturbation when there is no current or previous
+        // successful perturbation, and then rejects that trial if it exceeds
+        // max_hessian_perturbation. The caller must not widen the max to the
+        // first trial value.
+        assert_close(
+            next_ipopt_hessian_perturbation(0.0, None, 1.0e-4, 100.0, 8.0, 1.0 / 3.0, 1.0e-3),
+            1.0e-4,
+        );
+        assert_eq!(
+            next_ipopt_hessian_perturbation(0.0, None, 1.0e-4, 100.0, 8.0, 1.0 / 3.0, 1.0e-5),
+            None
+        );
+
+        // After a successful perturbation on an earlier system, IPOPT decays
+        // from that last value for the next fresh matrix. Repeated failures use
+        // the special first growth factor only while current is still far above
+        // the last successful value; otherwise they use perturb_inc_fact.
+        assert_close(
+            next_ipopt_hessian_perturbation(0.0, Some(9.0e-3), 1.0e-4, 100.0, 8.0, 1.0 / 3.0, 1.0),
+            3.0e-3,
+        );
+        assert_close(
+            next_ipopt_hessian_perturbation(
+                2.0e-2,
+                Some(1.0e-9),
+                1.0e-4,
+                100.0,
+                8.0,
+                1.0 / 3.0,
+                10.0,
+            ),
+            2.0,
+        );
+        assert_close(
+            next_ipopt_hessian_perturbation(
+                2.0e-2,
+                Some(1.0e-2),
+                1.0e-4,
+                100.0,
+                8.0,
+                1.0 / 3.0,
+                10.0,
+            ),
+            1.6e-1,
+        );
+    }
+
+    #[test]
     fn full_space_refinement_loop_matches_ipopt_option_thresholds() {
         let options = IpoptLinearRefinementOptions {
             min_refinement_steps: 2,
@@ -16095,6 +16170,62 @@ mod tests {
             IpoptRefinementFailureDecision::AcceptCurrentSolution {
                 after_pretend_singular_retry: true
             }
+        );
+    }
+
+    #[test]
+    fn full_space_refinement_failure_markers_match_ipopt_source() {
+        let options = IpoptLinearRefinementOptions {
+            min_refinement_steps: 1,
+            max_refinement_steps: 1,
+            residual_ratio_max: 1.0e-8,
+            residual_ratio_singular: 1.0e-5,
+            residual_improvement_factor: 1.0,
+        };
+
+        let retry_quality = ipopt_refinement_failure_decision(1.0e-3, options, false, true, false);
+        let pretend_singular =
+            ipopt_refinement_failure_decision(1.0e-3, options, true, true, false);
+        let accept_current = ipopt_refinement_failure_decision(1.0e-6, options, true, false, false);
+        let accept_after_pretend =
+            ipopt_refinement_failure_decision(1.0e-3, options, true, false, true);
+
+        // IpPDFullSpaceSolver::Solve appends q when IncreaseQuality()
+        // succeeds, lowercase s when it retries pretending singular, and
+        // uppercase S when residual_ratio_singular_ says the current solution
+        // is good enough. The final accept-after-pretend retry appends no
+        // source info marker.
+        assert_eq!(
+            ipopt_refinement_failure_info_marker(retry_quality),
+            Some('q')
+        );
+        assert_eq!(
+            ipopt_refinement_failure_detail(retry_quality),
+            "spral_quality_retry_requested"
+        );
+        assert_eq!(
+            ipopt_refinement_failure_info_marker(pretend_singular),
+            Some('s')
+        );
+        assert_eq!(
+            ipopt_refinement_failure_detail(pretend_singular),
+            "ipopt_pretend_singular_after_refinement_failure"
+        );
+        assert_eq!(
+            ipopt_refinement_failure_info_marker(accept_current),
+            Some('S')
+        );
+        assert_eq!(
+            ipopt_refinement_failure_detail(accept_current),
+            "ipopt_accept_current_solution_after_refinement_failure"
+        );
+        assert_eq!(
+            ipopt_refinement_failure_info_marker(accept_after_pretend),
+            None
+        );
+        assert_eq!(
+            ipopt_refinement_failure_detail(accept_after_pretend),
+            "ipopt_accept_current_solution_after_pretend_singular_refinement_failure"
         );
     }
 
