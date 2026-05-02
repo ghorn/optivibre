@@ -7292,18 +7292,31 @@ fn spral_small_leaf_tpp_host_gemm_rank1_update(
     // The row < col writes are normally unused by SSIDS' lower-triangle access
     // paths, but keeping them populated removes a source-shape difference and
     // lets the native trace compare the full host_gemm target rectangle.
-    for (col, &preserved) in ld.iter().enumerate().take(n).skip(start) {
-        let update_base = col * ldl;
-        for row in start..m {
+    let trailing_rows = m.saturating_sub(start);
+    if use_scalar_fma {
+        for (col, &preserved) in ld.iter().enumerate().take(n).skip(start) {
             // SAFETY: small-leaf `lcol` is allocated as `n` columns of stride
             // `ldl`, with `ldl >= m`. The multiplier column is the eliminated
             // pivot column and each update column is a distinct trailing column.
             unsafe {
-                let entry = lcol_ptr.add(update_base + row);
-                let multiplier = *lcol_ptr.add(multiplier_base + row);
-                if use_scalar_fma {
+                let update_ptr = lcol_ptr.add(col * ldl + start);
+                let multiplier_ptr = lcol_ptr.add(multiplier_base + start);
+                for offset in 0..trailing_rows {
+                    let entry = update_ptr.add(offset);
+                    let multiplier = *multiplier_ptr.add(offset);
                     *entry = (-multiplier).mul_add(preserved, *entry);
-                } else {
+                }
+            }
+        }
+    } else {
+        for (col, &preserved) in ld.iter().enumerate().take(n).skip(start) {
+            // SAFETY: see the scalar-FMA branch above.
+            unsafe {
+                let update_ptr = lcol_ptr.add(col * ldl + start);
+                let multiplier_ptr = lcol_ptr.add(multiplier_base + start);
+                for offset in 0..trailing_rows {
+                    let entry = update_ptr.add(offset);
+                    let multiplier = *multiplier_ptr.add(offset);
                     *entry -= multiplier * preserved;
                 }
             }
@@ -7330,22 +7343,40 @@ fn spral_small_leaf_tpp_host_gemm_rank2_update(
     // host_gemm(OP_N, OP_T, m-start, n-start, 2, -1.0,
     //           &a[pivot*lda+start], lda, &ld[start], ldld,
     //           1.0, &a[start*lda+start], lda).
-    for col in start..n {
-        let first_preserved = ld[col];
-        let second_preserved = ld[ldld + col];
-        let update_base = col * ldl;
-        for row in start..m {
+    let trailing_rows = m.saturating_sub(start);
+    if use_scalar_fma {
+        for col in start..n {
+            let first_preserved = ld[col];
+            let second_preserved = ld[ldld + col];
             // SAFETY: see `spral_small_leaf_tpp_host_gemm_rank1_update`; the
             // two multiplier columns are eliminated columns and the update
             // column is trailing.
             unsafe {
-                let entry = lcol_ptr.add(update_base + row);
-                let l1_row = *lcol_ptr.add(first_multiplier_base + row);
-                let l2_row = *lcol_ptr.add(second_multiplier_base + row);
-                if use_scalar_fma {
+                let update_ptr = lcol_ptr.add(col * ldl + start);
+                let first_multiplier_ptr = lcol_ptr.add(first_multiplier_base + start);
+                let second_multiplier_ptr = lcol_ptr.add(second_multiplier_base + start);
+                for offset in 0..trailing_rows {
+                    let entry = update_ptr.add(offset);
+                    let l1_row = *first_multiplier_ptr.add(offset);
+                    let l2_row = *second_multiplier_ptr.add(offset);
                     let updated = (-l1_row).mul_add(first_preserved, *entry);
                     *entry = (-l2_row).mul_add(second_preserved, updated);
-                } else {
+                }
+            }
+        }
+    } else {
+        for col in start..n {
+            let first_preserved = ld[col];
+            let second_preserved = ld[ldld + col];
+            // SAFETY: see the scalar-FMA branch above.
+            unsafe {
+                let update_ptr = lcol_ptr.add(col * ldl + start);
+                let first_multiplier_ptr = lcol_ptr.add(first_multiplier_base + start);
+                let second_multiplier_ptr = lcol_ptr.add(second_multiplier_base + start);
+                for offset in 0..trailing_rows {
+                    let entry = update_ptr.add(offset);
+                    let l1_row = *first_multiplier_ptr.add(offset);
+                    let l2_row = *second_multiplier_ptr.add(offset);
                     *entry -= l2_row.mul_add(second_preserved, l1_row * first_preserved);
                 }
             }
@@ -7536,7 +7567,6 @@ fn spral_small_leaf_calc_ld_op_n(
 }
 
 struct SpralSmallLeafContribution {
-    square: Vec<f64>,
     calc_ld_time: Duration,
     gemm_time: Duration,
 }
@@ -7549,17 +7579,18 @@ fn spral_small_leaf_form_contribution(
     n: usize,
     ldl: usize,
     nelim: usize,
+    contrib: &mut [f64],
     profile_enabled: bool,
     work: &mut Vec<f64>,
 ) -> SpralSmallLeafContribution {
     let contrib_dim = m - n;
     if contrib_dim == 0 {
         return SpralSmallLeafContribution {
-            square: Vec::new(),
             calc_ld_time: Duration::default(),
             gemm_time: Duration::default(),
         };
     }
+    debug_assert_eq!(contrib.len(), contrib_dim * contrib_dim);
     let ldld = spral_align_lda_f64(contrib_dim);
     let ld_len = nelim * ldld;
     if work.len() < ld_len {
@@ -7573,7 +7604,6 @@ fn spral_small_leaf_form_contribution(
         .unwrap_or_default();
 
     let gemm_started = profile_enabled.then(Instant::now);
-    let mut contrib = vec![0.0; contrib_dim * contrib_dim];
     let lcol_ptr = lcol.as_ptr();
     let ld_ptr = ld.as_ptr();
     let contrib_ptr = contrib.as_mut_ptr();
@@ -7625,7 +7655,6 @@ fn spral_small_leaf_form_contribution(
         .unwrap_or_default();
 
     SpralSmallLeafContribution {
-        square: contrib,
         calc_ld_time,
         gemm_time,
     }
@@ -7921,18 +7950,37 @@ fn factorize_spral_small_leaf_aligned_tpp_in_place(
     let mut contribution_gemm_time = Duration::default();
     let empty_contribution;
     let interface_contribution = if nelim > 0 {
-        let contribution =
-            spral_small_leaf_form_contribution(lcol, d, m, n, ldl, nelim, profile_enabled, work);
-        contribution_calc_ld_time = contribution.calc_ld_time;
-        contribution_gemm_time = contribution.gemm_time;
-        profile.spral_small_leaf_contribution_calc_ld_time += contribution_calc_ld_time;
-        profile.spral_small_leaf_contribution_gemm_time += contribution_gemm_time;
-        node.contrib = if contribution_dim > 0 {
-            Some(contribution.square)
+        if contribution_dim > 0 {
+            let expected_len = contribution_dim * contribution_dim;
+            if !matches!(node.contrib.as_ref(), Some(contrib) if contrib.len() == expected_len) {
+                node.contrib = Some(vec![0.0; expected_len]);
+            }
+            let contribution_storage = node
+                .contrib
+                .as_mut()
+                .expect("small-leaf contribution storage was just ensured");
+            // Reuse the node-local contribution storage while preserving the
+            // previous zeroed-square semantics of the allocation path.
+            contribution_storage.fill(0.0);
+            let contribution = spral_small_leaf_form_contribution(
+                lcol,
+                d,
+                m,
+                n,
+                ldl,
+                nelim,
+                contribution_storage,
+                profile_enabled,
+                work,
+            );
+            contribution_calc_ld_time = contribution.calc_ld_time;
+            contribution_gemm_time = contribution.gemm_time;
+            profile.spral_small_leaf_contribution_calc_ld_time += contribution_calc_ld_time;
+            profile.spral_small_leaf_contribution_gemm_time += contribution_gemm_time;
+            node.contrib.as_deref().unwrap_or(&[])
         } else {
-            None
-        };
-        node.contrib.as_deref().unwrap_or(&[])
+            &[]
+        }
     } else {
         if !has_children {
             // Mirrors SmallLeafNumericSubtree::factor_node: a no-elimination
