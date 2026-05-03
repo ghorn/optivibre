@@ -17111,6 +17111,39 @@ mod tests {
     }
 
     #[test]
+    fn tiny_step_detection_checks_slack_relative_step_like_ipopt() {
+        let options = InteriorPointOptions {
+            tiny_step_tol: 1.0e-3,
+            ..InteriorPointOptions::default()
+        };
+
+        // IpBacktrackingLineSearch::DetectTinyStep first checks x, then checks
+        // s using |delta_s| / (1 + |s|), and only then applies the constraint
+        // violation guard.
+        assert!(is_tiny_ip_step(
+            &[10.0],
+            &[9.0],
+            &test_direction(&[1.0e-4], &[9.0e-3]),
+            0.0,
+            &options
+        ));
+        assert!(!is_tiny_ip_step(
+            &[10.0],
+            &[9.0],
+            &test_direction(&[1.0e-4], &[1.1e-2]),
+            0.0,
+            &options
+        ));
+        assert!(!is_tiny_ip_step(
+            &[10.0],
+            &[9.0],
+            &test_direction(&[1.0e-4], &[9.0e-3]),
+            2.0e-4,
+            &options
+        ));
+    }
+
+    #[test]
     fn alpha_for_y_respects_primal_and_full_threshold() {
         let direction = test_direction(&[1e-3], &[2e-3]);
         let mut options = InteriorPointOptions {

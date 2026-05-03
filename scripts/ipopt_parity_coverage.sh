@@ -543,7 +543,7 @@ def classify_rust_line(path, line_no, text):
             return "iteration log formatting/reporting"
         if 16750 <= line_no <= 16795:
             return "iteration log formatting/reporting"
-        if 16900 <= line_no <= 18730:
+        if 16900 <= line_no <= 18760:
             return "unit-test parity witness"
         if 24800 <= line_no <= 24900:
             return "restoration status mapping"
@@ -551,7 +551,7 @@ def classify_rust_line(path, line_no, text):
             return "restoration status mapping"
         if 25480 <= line_no <= 25560:
             return "restoration status mapping"
-        if 25690 <= line_no <= 25810:
+        if 25690 <= line_no <= 25845:
             return "restoration status mapping"
         if 14720 <= line_no <= 14770:
             return "iteration log formatting/reporting"
@@ -639,7 +639,7 @@ def classify_ipopt_line(file_name, line_no, text):
         if line_no == 422:
             return "covered by tiny-step dual-threshold witness"
         if line_no == 1261:
-            return "tiny-step witness gap"
+            return "covered by reduced tiny-step slack-step witness"
         if line_no in {455, 458, 546, 1144, 1167, 1172, 1182}:
             return "soft-restoration witness gap"
         if line_no == 520:
