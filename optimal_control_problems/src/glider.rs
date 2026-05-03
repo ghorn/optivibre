@@ -2961,6 +2961,12 @@ mod tests {
             .max(1);
         let profile_side =
             std::env::var("SSIDS_GLIDER_INPROCESS_SIDE").unwrap_or_else(|_| "paired".to_string());
+        let print_samples = std::env::var("SSIDS_GLIDER_INPROCESS_PRINT_SAMPLES")
+            .ok()
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        let rotate_order = std::env::var("SSIDS_GLIDER_INPROCESS_ROTATE_ORDER")
+            .ok()
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
         let (run_rust, run_native) = match profile_side.as_str() {
             "paired" => (true, true),
             "rust" => (true, false),
@@ -2998,7 +3004,9 @@ mod tests {
         );
         let warmup_rust_blocks = augmented_step_blocks(&dump, &warmup_rust.solution);
         let warmup_native_blocks = augmented_step_blocks(&dump, &warmup_native.solution);
-        eprintln!("ssids_glider_side_profile_begin side={profile_side} repeats={repeats}");
+        eprintln!(
+            "ssids_glider_side_profile_begin side={profile_side} repeats={repeats} print_samples={print_samples} rotate_order={rotate_order}"
+        );
 
         let mut rust_factor_times = Vec::with_capacity(repeats);
         let mut rust_solve_times = Vec::with_capacity(repeats);
@@ -3015,13 +3023,31 @@ mod tests {
         let mut final_dlambda_delta = 0.0;
         let mut final_dz_delta = 0.0;
 
-        for _ in 0..repeats {
-            let rust_exact =
-                run_rust.then(|| replay_rust_augmented_spral_with_symbolic(&dump, &symbolic));
-            let rust_unprofiled_exact = run_rust
-                .then(|| replay_rust_augmented_spral_unprofiled_with_symbolic(&dump, &symbolic));
-            let native_exact = run_native
-                .then(|| replay_native_augmented_spral_with_session(&dump, &mut native_session));
+        for sample_index in 0..repeats {
+            let mut rust_exact = None;
+            let mut rust_unprofiled_exact = None;
+            let mut native_exact = None;
+            let order_offset = if rotate_order { sample_index % 3 } else { 0 };
+            for order_slot in 0..3 {
+                match (order_slot + order_offset) % 3 {
+                    0 if run_rust => {
+                        rust_exact =
+                            Some(replay_rust_augmented_spral_with_symbolic(&dump, &symbolic));
+                    }
+                    1 if run_rust => {
+                        rust_unprofiled_exact = Some(
+                            replay_rust_augmented_spral_unprofiled_with_symbolic(&dump, &symbolic),
+                        );
+                    }
+                    2 if run_native => {
+                        native_exact = Some(replay_native_augmented_spral_with_session(
+                            &dump,
+                            &mut native_session,
+                        ));
+                    }
+                    _ => {}
+                }
+            }
             let rust_reference = rust_exact.as_ref().unwrap_or(&warmup_rust);
             let native_reference = native_exact.as_ref().unwrap_or(&warmup_native);
             assert_eq!(rust_reference.inertia, native_reference.inertia);
@@ -3064,16 +3090,49 @@ mod tests {
             }
 
             if let Some(rust_exact) = rust_exact {
+                if print_samples {
+                    println!(
+                        "  ssids_glider_sample index={} impl=rust profile=profiled factor={:?} solve={:?} residual={:.3e} solution_inf={:.3e} inertia={}",
+                        sample_index,
+                        rust_exact.factor_time,
+                        rust_exact.solve_time,
+                        rust_exact.residual_inf,
+                        rust_exact.solution_inf,
+                        rust_exact.inertia,
+                    );
+                }
                 rust_factor_times.push(rust_exact.factor_time);
                 rust_solve_times.push(rust_exact.solve_time);
                 rust_factor_profiles.push(rust_exact.factor_profile.expect("rust factor profile"));
                 rust_solve_profiles.push(rust_exact.solve_profile.expect("rust solve profile"));
             }
             if let Some(rust_unprofiled_exact) = rust_unprofiled_exact {
+                if print_samples {
+                    println!(
+                        "  ssids_glider_sample index={} impl=rust profile=unprofiled factor={:?} solve={:?} residual={:.3e} solution_inf={:.3e} inertia={}",
+                        sample_index,
+                        rust_unprofiled_exact.factor_time,
+                        rust_unprofiled_exact.solve_time,
+                        rust_unprofiled_exact.residual_inf,
+                        rust_unprofiled_exact.solution_inf,
+                        rust_unprofiled_exact.inertia,
+                    );
+                }
                 rust_unprofiled_factor_times.push(rust_unprofiled_exact.factor_time);
                 rust_unprofiled_solve_times.push(rust_unprofiled_exact.solve_time);
             }
             if let Some(native_exact) = native_exact {
+                if print_samples {
+                    println!(
+                        "  ssids_glider_sample index={} impl=native profile=native factor={:?} solve={:?} residual={:.3e} solution_inf={:.3e} inertia={}",
+                        sample_index,
+                        native_exact.factor_time,
+                        native_exact.solve_time,
+                        native_exact.residual_inf,
+                        native_exact.solution_inf,
+                        native_exact.inertia,
+                    );
+                }
                 native_factor_times.push(native_exact.factor_time);
                 native_solve_times.push(native_exact.solve_time);
             }

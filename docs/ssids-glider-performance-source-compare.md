@@ -261,10 +261,30 @@ Default modes:
 - `mixed-rayon-omp`: varies Rayon and OpenMP together as an oversubscription
   stress case.
 
-The script writes `timings.csv`, `timings.md`, and `timings.svg` under
-`target/ssids-thread-scaling/<timestamp>/`. The plot shows factor and solve
+The script writes `timings.csv`, `timings.md`, and standalone interactive
+`timings.html` under `target/ssids-thread-scaling/<timestamp>/`. The runner sets
+`SSIDS_GLIDER_INPROCESS_PRINT_SAMPLES=1` and
+`SSIDS_GLIDER_INPROCESS_ROTATE_ORDER=1`, so the CSV and HTML include every
+in-process repeat as `row_type=sample` plus the legacy median rows as
+`row_type=summary`, while Rust profiled, Rust unprofiled, and native SPRAL are
+rotated through first/second/third measurement position. No outliers are
+discarded. The Plotly page inlines its JavaScript bundle, labels every chart
+axis, and shows factor, solve, and total
 timing versus thread count for native `spral-src`, Rust `ssids-rs` unprofiled,
-and Rust `ssids-rs` profiled.
+and Rust `ssids-rs` profiled. Each plotted box is the raw repeat distribution;
+the median line and summary ratios are the robust center estimate, and p10-p90
+spread is shown in the table/hover text. Total time is computed per repeat as
+factor plus solve, so total medians can differ from factor medians plus solve
+medians. Charts use a robust default y-range: extreme scheduler spikes are not
+discarded, but are drawn as top-edge clipped-outlier triangles whose hover text
+reports the actual raw time. This keeps the normal 1-10ms timing band readable
+when an oversubscribed run has a 100ms+ spike. The page groups plots by
+threading mode, caps chart width for wide displays, and adds derived cards for
+the serial baseline, best total time, worst total ratio, and whether raw sample
+distributions are available. The profiled Rust trace includes instrumentation
+overhead and is for attribution, not direct native comparison. The HTML
+generator reads `SSIDS_PLOTLY_JS_PATH` when set; otherwise it caches Plotly under
+`target/ssids-thread-scaling/` and embeds that cached bundle.
 
 A pointer-hoisted `while`-loop rewrite of the rank-1/2 update helpers preserved
 the native prefix trace but regressed the glider unprofiled factor profile to

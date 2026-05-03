@@ -53,6 +53,8 @@ run_case() {
       AD_CODEGEN_REQUIRE_NATIVE_SPRAL_PARITY=1 \
       SSIDS_GLIDER_INPROCESS_SIDE=paired \
       SSIDS_GLIDER_INPROCESS_REPEATS="$REPEATS" \
+      SSIDS_GLIDER_INPROCESS_PRINT_SAMPLES=1 \
+      SSIDS_GLIDER_INPROCESS_ROTATE_ORDER=1 \
       cargo test -p optimal_control_problems --release --no-default-features \
         --features "$features" \
         "$TEST_NAME" \
@@ -123,10 +125,10 @@ done
 
 python3 scripts/ssids_plot_thread_scaling.py "$LOG_DIR" \
   --csv "${OUT_DIR}/timings.csv" \
-  --svg "${OUT_DIR}/timings.svg" \
+  --html "${OUT_DIR}/timings.html" \
   --markdown "${OUT_DIR}/timings.md"
 
 printf '\nWrote:\n'
 printf '  %s\n' "${OUT_DIR}/timings.csv"
-printf '  %s\n' "${OUT_DIR}/timings.svg"
+printf '  %s\n' "${OUT_DIR}/timings.html"
 printf '  %s\n' "${OUT_DIR}/timings.md"
