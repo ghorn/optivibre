@@ -543,7 +543,7 @@ def classify_rust_line(path, line_no, text):
             return "iteration log formatting/reporting"
         if 16750 <= line_no <= 16795:
             return "iteration log formatting/reporting"
-        if 16900 <= line_no <= 18760:
+        if 16900 <= line_no <= 18840:
             return "unit-test parity witness"
         if 24800 <= line_no <= 24900:
             return "restoration status mapping"
@@ -551,7 +551,7 @@ def classify_rust_line(path, line_no, text):
             return "restoration status mapping"
         if 25480 <= line_no <= 25560:
             return "restoration status mapping"
-        if 25690 <= line_no <= 25845:
+        if 25690 <= line_no <= 25945:
             return "restoration status mapping"
         if 14720 <= line_no <= 14770:
             return "iteration log formatting/reporting"
@@ -683,7 +683,7 @@ def classify_ipopt_line(file_name, line_no, text):
         return "unreachable under parity options"
     if file_name == "IpMonotoneMuUpdate.cpp":
         if line_no == 158:
-            return "tiny-step best-possible termination witness gap"
+            return "covered by tiny-step best-possible termination witness"
         if line_no == 176:
             return "covered by reduced monotone barrier helper"
         if line_no == 188:

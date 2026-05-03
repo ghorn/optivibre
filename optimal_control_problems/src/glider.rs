@@ -1646,6 +1646,7 @@ mod tests {
             | optimization::InteriorPointSolveError::CpuTimeExceeded { context, .. }
             | optimization::InteriorPointSolveError::WallTimeExceeded { context, .. }
             | optimization::InteriorPointSolveError::UserRequestedStop { context }
+            | optimization::InteriorPointSolveError::SearchDirectionTooSmall { context }
             | optimization::InteriorPointSolveError::MaxIterations { context, .. } => context,
             optimization::InteriorPointSolveError::InvalidInput(_) => return None,
         };
@@ -9628,6 +9629,7 @@ mod tests {
                 | optimization::InteriorPointSolveError::CpuTimeExceeded { context, .. }
                 | optimization::InteriorPointSolveError::WallTimeExceeded { context, .. }
                 | optimization::InteriorPointSolveError::UserRequestedStop { context }
+                | optimization::InteriorPointSolveError::SearchDirectionTooSmall { context }
                 | optimization::InteriorPointSolveError::MaxIterations { context, .. } => {
                     Some(context.as_ref())
                 }

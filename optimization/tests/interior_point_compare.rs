@@ -783,6 +783,9 @@ fn nlip_error_label(error: &InteriorPointSolveError) -> String {
         InteriorPointSolveError::CpuTimeExceeded { .. } => "cpu-time".to_string(),
         InteriorPointSolveError::WallTimeExceeded { .. } => "wall-time".to_string(),
         InteriorPointSolveError::UserRequestedStop { .. } => "user-stop".to_string(),
+        InteriorPointSolveError::SearchDirectionTooSmall { .. } => {
+            "search-direction-too-small".to_string()
+        }
         InteriorPointSolveError::MaxIterations { iterations, .. } => {
             format!("max-iter:{iterations}")
         }
@@ -823,6 +826,7 @@ fn nlip_error_last_accepted_tag(error: &InteriorPointSolveError) -> Option<char>
         | InteriorPointSolveError::CpuTimeExceeded { context, .. }
         | InteriorPointSolveError::WallTimeExceeded { context, .. }
         | InteriorPointSolveError::UserRequestedStop { context }
+        | InteriorPointSolveError::SearchDirectionTooSmall { context }
         | InteriorPointSolveError::MaxIterations { context, .. } => context
             .last_accepted_state
             .as_ref()
@@ -6207,6 +6211,77 @@ fn compare_native_and_ipopt_forced_tiny_step_acceptance() {
         &ipopt,
         1e-6,
         1e-6,
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_tiny_step_at_mu_target_stops_as_too_small() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_nlp_interior_point(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        &native_options_with(|options| {
+            options.max_iters = 20;
+            options.mu_init = 1e-1;
+            options.mu_target = 1e-1;
+            options.tiny_step_tol = 1e6;
+            options.tiny_step_y_tol = 1e6;
+        }),
+    );
+    let ipopt = solve_nlp_ipopt(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        &ipopt_options_with(|options| {
+            options.max_iters = 20;
+            enable_ipopt_trace_journal(options);
+            options
+                .raw_options
+                .push(IpoptRawOption::number("mu_init", 1e-1));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("mu_target", 1e-1));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("tiny_step_tol", 1e6));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("tiny_step_y_tol", 1e6));
+        }),
+    );
+
+    match &native {
+        Err(InteriorPointSolveError::SearchDirectionTooSmall { context }) => {
+            let last = context
+                .last_accepted_state
+                .as_ref()
+                .or(context.final_state.as_ref())
+                .expect("NLIP tiny-step stop should retain the tiny accepted state");
+            assert_eq!(last.step_tag, Some('T'));
+            assert!(
+                last.events.contains(&InteriorPointIterationEvent::TinyStep),
+                "NLIP tiny-step stop should retain the tiny-step marker"
+            );
+        }
+        other => panic!("native tiny-step stop status mismatch: {other:?}"),
+    }
+    match &ipopt {
+        Err(IpoptSolveError::Solve {
+            status, iterations, ..
+        }) => {
+            assert_eq!(status, &IpoptRawStatus::SearchDirectionBecomesTooSmall);
+            assert!(
+                *iterations >= 1,
+                "IPOPT tiny-step stop should happen after at least one accepted tiny step"
+            );
+        }
+        other => panic!("IPOPT tiny-step stop status mismatch: {other:?}"),
+    }
+    assert!(
+        ipopt_result_has_step_tag(&ipopt, &["T"]),
+        "IPOPT should report the repeated-tiny-step T marker before STOP_AT_TINY_STEP"
     );
 }
 

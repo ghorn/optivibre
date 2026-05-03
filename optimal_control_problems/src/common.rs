@@ -1508,6 +1508,7 @@ fn nlip_failure_diagnostic_lines(error: &InteriorPointSolveError) -> Vec<String>
         | InteriorPointSolveError::CpuTimeExceeded { context, .. }
         | InteriorPointSolveError::WallTimeExceeded { context, .. }
         | InteriorPointSolveError::UserRequestedStop { context }
+        | InteriorPointSolveError::SearchDirectionTooSmall { context }
         | InteriorPointSolveError::MaxIterations { context, .. } => context.as_ref(),
     };
     let mut lines = vec![String::new(), "failure diagnostics (NLIP):".to_string()];
@@ -1554,6 +1555,9 @@ fn nlip_failure_diagnostic_lines(error: &InteriorPointSolveError) -> Vec<String>
         )),
         InteriorPointSolveError::UserRequestedStop { .. } => {
             lines.push("  termination=user_requested_stop".to_string())
+        }
+        InteriorPointSolveError::SearchDirectionTooSmall { .. } => {
+            lines.push("  termination=search_direction_too_small".to_string())
         }
         InteriorPointSolveError::MaxIterations { iterations, .. } => {
             lines.push(format!("  termination=max_iterations limit={iterations}"))
@@ -9513,6 +9517,14 @@ pub fn nlip_failure_solver_report(
         ),
         InteriorPointSolveError::UserRequestedStop { context } => (
             "Stopped: user requested stop".to_string(),
+            context
+                .final_state
+                .as_ref()
+                .map(|state| state.iteration as usize),
+            &context.profiling,
+        ),
+        InteriorPointSolveError::SearchDirectionTooSmall { context } => (
+            "Failed: search direction too small".to_string(),
             context
                 .final_state
                 .as_ref()

@@ -1558,6 +1558,10 @@ pub enum InteriorPointSolveError {
     UserRequestedStop {
         context: Box<InteriorPointFailureContext>,
     },
+    #[error("NLIP search direction is becoming too small")]
+    SearchDirectionTooSmall {
+        context: Box<InteriorPointFailureContext>,
+    },
     #[error("NLIP failed to converge in {iterations} iterations")]
     MaxIterations {
         iterations: Index,
@@ -1712,6 +1716,9 @@ struct InteriorPointWatchdogState {
     remaining_iters: Index,
     shortened_step_streak: Index,
     tiny_step_last_iteration: bool,
+    // Mirrors IpData().tiny_step_flag(), which is distinct from
+    // BacktrackingLineSearch::tiny_step_last_iteration_.
+    tiny_step_barrier_update_pending: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3139,6 +3146,9 @@ fn ipopt_restoration_subproblem_error_status(
         }
         InteriorPointSolveError::UserRequestedStop { .. } => {
             Some(IpoptRestorationSubproblemStatus::UserRequestedStop)
+        }
+        InteriorPointSolveError::SearchDirectionTooSmall { .. } => {
+            Some(IpoptRestorationSubproblemStatus::StopAtTinyStep)
         }
         InteriorPointSolveError::LocalInfeasibility { .. } => {
             Some(IpoptRestorationSubproblemStatus::LocalInfeasibility)
@@ -6313,13 +6323,19 @@ fn next_barrier_parameter_once(barrier_parameter: f64, options: &InteriorPointOp
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MonotoneBarrierUpdate {
+    barrier_parameter: f64,
+    stop_at_tiny_step: bool,
+}
+
 fn next_barrier_parameter<F>(
     barrier_parameter: f64,
     tiny_step: bool,
     mu_update_initialized: bool,
     options: &InteriorPointOptions,
     mut barrier_error: F,
-) -> f64
+) -> MonotoneBarrierUpdate
 where
     F: FnMut(f64) -> f64,
 {
@@ -6338,6 +6354,12 @@ where
         // new_mu` to decide whether the barrier changed; avoid a local
         // tolerance that can skip a source-visible mu update near the floor.
         if next_barrier == current_barrier {
+            if current_tiny_step {
+                return MonotoneBarrierUpdate {
+                    barrier_parameter: current_barrier.max(minimum_barrier),
+                    stop_at_tiny_step: true,
+                };
+            }
             break;
         }
         current_barrier = next_barrier.max(minimum_barrier);
@@ -6346,7 +6368,10 @@ where
         }
         current_tiny_step = false;
     }
-    current_barrier.max(minimum_barrier)
+    MonotoneBarrierUpdate {
+        barrier_parameter: current_barrier.max(minimum_barrier),
+        stop_at_tiny_step: false,
+    }
 }
 
 fn skip_first_restoration_barrier_update(
@@ -12538,6 +12563,7 @@ fn interior_point_error_context(
         | InteriorPointSolveError::CpuTimeExceeded { context, .. }
         | InteriorPointSolveError::WallTimeExceeded { context, .. }
         | InteriorPointSolveError::UserRequestedStop { context }
+        | InteriorPointSolveError::SearchDirectionTooSmall { context }
         | InteriorPointSolveError::MaxIterations { context, .. } => Some(context),
         InteriorPointSolveError::InvalidInput(_) => None,
     }
@@ -12785,6 +12811,19 @@ fn with_interior_point_failure_profiling(
         },
         InteriorPointSolveError::UserRequestedStop { context } => {
             InteriorPointSolveError::UserRequestedStop {
+                context: interior_point_failure_context(
+                    final_state.or(context.final_state),
+                    last_accepted_state.or(context.last_accepted_state),
+                    context.failed_linear_solve,
+                    context.failed_line_search,
+                    context.failed_direction_diagnostics,
+                    profiling,
+                    solve_started,
+                ),
+            }
+        }
+        InteriorPointSolveError::SearchDirectionTooSmall { context } => {
+            InteriorPointSolveError::SearchDirectionTooSmall {
                 context: interior_point_failure_context(
                     final_state.or(context.final_state),
                     last_accepted_state.or(context.last_accepted_state),
@@ -16469,6 +16508,14 @@ mod tests {
         );
         assert_eq!(
             ipopt_restoration_subproblem_error_status(
+                &InteriorPointSolveError::SearchDirectionTooSmall {
+                    context: empty_failure_context(),
+                },
+            ),
+            Some(IpoptRestorationSubproblemStatus::StopAtTinyStep)
+        );
+        assert_eq!(
+            ipopt_restoration_subproblem_error_status(
                 &InteriorPointSolveError::LocalInfeasibility {
                     context: empty_failure_context(),
                 },
@@ -17700,7 +17747,24 @@ mod tests {
         // therefore stops after the forced one-step update.
         let next = next_barrier_parameter(1e-1, true, true, &options, |_| 1e6);
 
-        assert!((next - 2e-2).abs() <= f64::EPSILON);
+        assert!(!next.stop_at_tiny_step);
+        assert!((next.barrier_parameter - 2e-2).abs() <= f64::EPSILON);
+    }
+
+    #[test]
+    fn monotone_mu_tiny_step_at_floor_requests_best_possible_stop() {
+        let options = InteriorPointOptions {
+            mu_target: 1e-1,
+            ..InteriorPointOptions::default()
+        };
+
+        // IPOPT IpMonotoneMuUpdate::UpdateBarrierParameter throws
+        // TINY_STEP_DETECTED when tiny_step_flag is set but CalcNewMuAndTau
+        // leaves mu unchanged.
+        let next = next_barrier_parameter(1e-1, true, true, &options, |_| 1e6);
+
+        assert!(next.stop_at_tiny_step);
+        assert_eq!(next.barrier_parameter.to_bits(), 1e-1f64.to_bits());
     }
 
     #[test]
@@ -17718,8 +17782,10 @@ mod tests {
         let first_call = next_barrier_parameter(1e-1, false, false, &options, |_| 0.0);
         let later_call = next_barrier_parameter(1e-1, false, true, &options, |_| 0.0);
 
-        assert!((first_call - 1e-12 / 11.0).abs() <= f64::EPSILON);
-        assert!((later_call - 2e-2).abs() <= f64::EPSILON);
+        assert!(!first_call.stop_at_tiny_step);
+        assert!(!later_call.stop_at_tiny_step);
+        assert!((first_call.barrier_parameter - 1e-12 / 11.0).abs() <= f64::EPSILON);
+        assert!((later_call.barrier_parameter - 2e-2).abs() <= f64::EPSILON);
     }
 
     #[test]
@@ -17748,7 +17814,8 @@ mod tests {
         // is therefore source-visible.
         let next = next_barrier_parameter(just_above_floor, false, true, &options, |_| 0.0);
 
-        assert_eq!(next.to_bits(), floor.to_bits());
+        assert!(!next.stop_at_tiny_step);
+        assert_eq!(next.barrier_parameter.to_bits(), floor.to_bits());
     }
 
     #[test]
@@ -20874,8 +20941,11 @@ where
             }
             last_objective_value = state.objective_value;
 
+            let mut tiny_step_barrier_update = false;
             if barrier_pair_count > 0 && !skip_adaptive_mu_update_this_iteration {
                 let previous_barrier_parameter = barrier_parameter_value;
+                tiny_step_barrier_update = watchdog_state.tiny_step_barrier_update_pending;
+                watchdog_state.tiny_step_barrier_update_pending = false;
                 let (next_barrier_parameter_value, reset_line_search_state, restored_iterate) =
                     match options.mu_strategy {
                         InteriorPointMuStrategy::Monotone => {
@@ -20883,12 +20953,15 @@ where
                                 restoration_depth,
                                 monotone_mu_update_initialized,
                             );
-                            let next_barrier_parameter_value = if skip_barrier_update {
-                                previous_barrier_parameter
+                            let monotone_update = if skip_barrier_update {
+                                MonotoneBarrierUpdate {
+                                    barrier_parameter: previous_barrier_parameter,
+                                    stop_at_tiny_step: false,
+                                }
                             } else {
                                 next_barrier_parameter(
                                     barrier_parameter_value,
-                                    watchdog_state.tiny_step_last_iteration,
+                                    tiny_step_barrier_update,
                                     monotone_mu_update_initialized,
                                     options,
                                     |candidate_barrier_parameter| {
@@ -20913,6 +20986,23 @@ where
                                     },
                                 )
                             };
+                            if monotone_update.stop_at_tiny_step {
+                                return Err(InteriorPointSolveError::SearchDirectionTooSmall {
+                                    context: interior_point_failure_context(
+                                        Some(snapshot_with_nlip_events(
+                                            current_snapshot.clone(),
+                                            &iteration_events,
+                                        )),
+                                        last_accepted_state.clone(),
+                                        None,
+                                        None,
+                                        None,
+                                        &profiling,
+                                        solve_started,
+                                    ),
+                                });
+                            }
+                            let next_barrier_parameter_value = monotone_update.barrier_parameter;
                             monotone_mu_update_initialized = true;
                             fraction_to_boundary_tau_value = current_fraction_to_boundary_tau(
                                 next_barrier_parameter_value,
@@ -20935,7 +21025,7 @@ where
                                 barrier_subproblem_error,
                                 barrier_parameter_value,
                                 fraction_to_boundary_tau_value,
-                                watchdog_state.tiny_step_last_iteration,
+                                tiny_step_barrier_update,
                                 false,
                                 &slack_barrier,
                                 &z,
@@ -21320,7 +21410,7 @@ where
                     barrier_subproblem_error,
                     barrier_parameter_value,
                     fraction_to_boundary_tau_value,
-                    watchdog_state.tiny_step_last_iteration,
+                    tiny_step_barrier_update,
                     false,
                     reduced_kkt_system
                         .as_ref()
@@ -26681,6 +26771,7 @@ where
             }
             let dual_step_norm =
                 step_inf_norm(&direction.d_lambda).max(step_inf_norm(&direction.d_ineq));
+            watchdog_state.tiny_step_barrier_update_pending = tiny_step_barrier_update;
             watchdog_state.tiny_step_last_iteration =
                 tiny_step && dual_step_norm < options.tiny_step_y_tol;
             if accepted_trial.watchdog_accepted {
