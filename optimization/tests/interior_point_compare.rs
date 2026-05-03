@@ -6102,6 +6102,72 @@ fn compare_native_and_ipopt_acceptable_termination_status() {
 }
 
 #[test]
+fn compare_native_and_ipopt_acceptable_iter_backup_before_termination() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        native_options_with(|options| {
+            options.overall_tol = 1e-14;
+            options.dual_tol = 1e-14;
+            options.constraint_tol = 1e-14;
+            options.complementarity_tol = 1e-14;
+            options.acceptable_tol = 1e-6;
+            options.acceptable_dual_inf_tol = 1e-6;
+            options.acceptable_constr_viol_tol = 1e-6;
+            options.acceptable_compl_inf_tol = 1e-6;
+            options.acceptable_obj_change_tol = 1e20;
+            options.acceptable_iter = 2;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        ipopt_options_with(|options| {
+            options.tol = 1e-14;
+            options.dual_tol = Some(1e-14);
+            options.constraint_tol = Some(1e-14);
+            options.complementarity_tol = Some(1e-14);
+            options.acceptable_tol = Some(1e-6);
+            options
+                .raw_options
+                .push(IpoptRawOption::integer("acceptable_iter", 2));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("acceptable_dual_inf_tol", 1e-6));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("acceptable_constr_viol_tol", 1e-6));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("acceptable_compl_inf_tol", 1e-6));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("acceptable_obj_change_tol", 1e20));
+        }),
+    );
+
+    assert_eq!(native.termination, InteriorPointTermination::Acceptable);
+    assert_eq!(native.status_kind, InteriorPointStatusKind::Warning);
+    assert_eq!(ipopt.status, IpoptRawStatus::SolvedToAcceptableLevel);
+    assert!(
+        nlip_accepted_trace(&native).len() >= 2,
+        "acceptable_iter=2 should pass through an acceptable backup point before termination"
+    );
+    assert_native_matches_ipopt(
+        "linearly_constrained_quadratic_acceptable_iter_backup",
+        None,
+        &native,
+        &ipopt,
+        1e-6,
+        1e-6,
+    );
+}
+
+#[test]
 fn compare_native_and_ipopt_forced_tiny_step_acceptance() {
     skip_without_native_spral!();
     let problem = LinearlyConstrainedQuadraticProblem;

@@ -646,7 +646,9 @@ def classify_ipopt_line(file_name, line_no, text):
             return "expect-infeasible restoration witness gap"
         if line_no in {902, 931, 933}:
             return "covered by alpha_for_y option-profile witness"
-        if line_no in {1283, 1300}:
+        if line_no == 1283:
+            return "covered by acceptable-iterate backup witness"
+        if line_no == 1300:
             return "acceptable-point fallback witness gap"
         if line_no == 1316:
             return "failure/fallback witness gap"
