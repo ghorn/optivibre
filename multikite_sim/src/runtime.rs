@@ -21,7 +21,7 @@ pub const UPPER_NODES: usize = BASE_TETHER_NODES * TETHER_NODE_MULTIPLIER;
 pub const FREE_COMMON_NODES: usize = 0;
 pub const FREE_UPPER_NODES: usize = 0;
 const Y2_INITIAL_TENSION_N: f64 = 0.0;
-const Y2_TARGET_PAYLOAD_ALTITUDE_M: f64 = 50.0;
+const Y2_TARGET_PAYLOAD_ALTITUDE_M: f64 = 100.0;
 const Y2_HIGH_PAYLOAD_ALTITUDE_OFFSET_M: f64 = 50.0;
 const Y2_LAUNCH_COMMON_LENGTH_FRACTION: f64 = 0.999;
 
@@ -144,6 +144,7 @@ fn base_params<const NK: usize>(init: &InitRequest) -> Result<Params<f64, NK>> {
             speed_ref,
             disk_center_n: vec3(export.controller.disk_center_n),
             disk_radius: export.controller.disk_radius,
+            tuning: Default::default(),
         },
     };
     if is_y2_preset(init.preset) {
@@ -157,11 +158,9 @@ fn apply_y2_controller_overrides<const NK: usize>(params: &mut Params<f64, NK>) 
         env_tuning_value("MULTIKITE_Y2_RABBIT_DISTANCE_M", 90.0).max(1.0);
     params.controller.phase_lag_to_radius =
         env_tuning_value("MULTIKITE_Y2_PHASE_LAG_TO_RADIUS", -2.0);
-    params.controller.speed_ref = env_tuning_value(
-        "MULTIKITE_Y2_REF_SPEED_REF_MPS",
-        params.controller.speed_ref,
-    )
-    .clamp(5.0, 80.0);
+    params.controller.speed_ref =
+        env_tuning_value("MULTIKITE_Y2_SPEED_REF_MPS", params.controller.speed_ref)
+            .clamp(5.0, 80.0);
     apply_y2_geometry_overrides(params);
 }
 
@@ -267,6 +266,7 @@ fn apply_simulation_config_to_params<const NK: usize>(
     if is_y2_preset(preset) {
         apply_y2_controller_overrides(params);
     }
+    params.controller.tuning = config.controller_tuning.clone();
 }
 
 fn simple_tether_params(init: &InitRequest) -> Result<Params<f64, 0>> {
@@ -294,6 +294,7 @@ fn kite_with_consistent_tether<const N_UPPER: usize>(
     mut body: BodyState<f64>,
     splitter: &TetherNode<f64>,
     params: &KiteParams<f64>,
+    initial_actuators: &KiteControls<f64>,
     top_guess: TetherNode<f64>,
     use_bridle_velocity: bool,
 ) -> KiteState<f64, N_UPPER> {
@@ -302,6 +303,7 @@ fn kite_with_consistent_tether<const N_UPPER: usize>(
         let kite = KiteState {
             body: body.clone(),
             rotor_speed: params.rotor.initial_speed,
+            actuators: initial_actuators.clone(),
             tether: interpolate_nodes::<N_UPPER>(splitter, &top),
         };
         let bridle_node = compute_bridle_node(&kite, params);
@@ -315,6 +317,7 @@ fn kite_with_consistent_tether<const N_UPPER: usize>(
     let kite = KiteState {
         body: body.clone(),
         rotor_speed: params.rotor.initial_speed,
+        actuators: initial_actuators.clone(),
         tether: interpolate_nodes::<N_UPPER>(splitter, &top),
     };
     let bridle_node = compute_bridle_node(&kite, params);
@@ -327,6 +330,7 @@ fn kite_with_consistent_tether<const N_UPPER: usize>(
     KiteState {
         body,
         rotor_speed: params.rotor.initial_speed,
+        actuators: initial_actuators.clone(),
         tether: interpolate_nodes::<N_UPPER>(splitter, &top),
     }
 }
@@ -376,7 +380,14 @@ pub fn star_configuration<const NK: usize, const N_COMMON: usize, const N_UPPER:
             pos_n: bridle_pos_n,
             vel_n: Vector3::zeros(),
         };
-        kite_with_consistent_tether(body, &splitter, &params.kites[index], top, false)
+        kite_with_consistent_tether(
+            body,
+            &splitter,
+            &params.kites[index],
+            &params.controller.trim,
+            top,
+            false,
+        )
     });
     State {
         kites,
@@ -526,7 +537,14 @@ fn y2_kite_state_at_phase<const N_UPPER: usize>(
         pos_n: bridle_pos_n,
         vel_n: Vector3::zeros(),
     };
-    kite_with_consistent_tether(body, splitter, &params.kites[index], top, true)
+    kite_with_consistent_tether(
+        body,
+        splitter,
+        &params.kites[index],
+        &params.controller.trim,
+        top,
+        true,
+    )
 }
 
 fn y2_kite_cad_altitude<const N_UPPER: usize>(
@@ -555,6 +573,7 @@ pub fn free_flight_configuration<const N_COMMON: usize, const N_UPPER: usize>(
         kites: [KiteState {
             body,
             rotor_speed: params.kites[0].rotor.initial_speed,
+            actuators: params.controller.trim.clone(),
             tether: std::array::from_fn(|_| TetherNode {
                 pos_n: Vector3::zeros(),
                 vel_n: Vector3::zeros(),
@@ -919,7 +938,11 @@ fn simulate<
 ) -> Result<RunResult<NK, N_COMMON, N_UPPER>> {
     let mut params = base_params::<NK>(init)?;
     apply_simulation_config_to_params(&mut params, config, init.preset);
-    let mut dryden = DrydenField::<NK>::new(0xD15E_A5E0_u64 ^ NK as u64);
+    let mut dryden_config = config
+        .dryden
+        .finite_or_default(&crate::types::DrydenConfig::default());
+    dryden_config.seed ^= NK as u64;
+    let mut dryden = DrydenField::<NK>::new(dryden_config);
     params.kite_gusts_n = if config.sim_noise_enabled {
         dryden.gusts_n()
     } else {
@@ -1137,25 +1160,9 @@ fn simulate_passive<
 pub fn available_presets() -> Vec<PresetInfo> {
     vec![
         PresetInfo {
-            preset: Preset::FreeFlight1,
-            name: "FreeFlight1",
-            description: "Single-kite free-flight bring-up harness with direct roll, pitch, and airspeed references.",
-            kites: 1,
-            common_nodes: FREE_COMMON_NODES,
-            upper_nodes: FREE_UPPER_NODES,
-        },
-        PresetInfo {
-            preset: Preset::Star1,
-            name: "Star1",
-            description: "Single-kite star/orbit preset for controller bring-up.",
-            kites: 1,
-            common_nodes: COMMON_NODES,
-            upper_nodes: UPPER_NODES,
-        },
-        PresetInfo {
             preset: Preset::Y2Low,
             name: "Y2Low",
-            description: "Two-kite Y launch case: payload starts on ground with a near-slack common tether and kites below the 50 m payload target disk.",
+            description: "Two-kite Y launch case: payload starts on ground with a near-slack common tether and kites below the payload target disk.",
             kites: 2,
             common_nodes: COMMON_NODES,
             upper_nodes: UPPER_NODES,
@@ -1163,7 +1170,7 @@ pub fn available_presets() -> Vec<PresetInfo> {
         PresetInfo {
             preset: Preset::Y2,
             name: "Y2",
-            description: "Two-kite Y case initialized exactly on the controller disk for a 50 m payload target.",
+            description: "Two-kite Y case initialized exactly on the controller disk for the configured payload target.",
             kites: 2,
             common_nodes: COMMON_NODES,
             upper_nodes: UPPER_NODES,
@@ -1171,7 +1178,7 @@ pub fn available_presets() -> Vec<PresetInfo> {
         PresetInfo {
             preset: Preset::Y2High,
             name: "Y2High",
-            description: "Two-kite Y descent case: payload and kites start above the 50 m payload target disk.",
+            description: "Two-kite Y descent case: payload and kites start above the payload target disk.",
             kites: 2,
             common_nodes: COMMON_NODES,
             upper_nodes: UPPER_NODES,
@@ -1193,9 +1200,25 @@ pub fn available_presets() -> Vec<PresetInfo> {
             upper_nodes: UPPER_NODES,
         },
         PresetInfo {
+            preset: Preset::Star1,
+            name: "Star1",
+            description: "Single-kite star/orbit preset for controller bring-up.",
+            kites: 1,
+            common_nodes: COMMON_NODES,
+            upper_nodes: UPPER_NODES,
+        },
+        PresetInfo {
+            preset: Preset::FreeFlight1,
+            name: "FreeFlight1",
+            description: "Single-kite free-flight bring-up harness with direct roll, pitch, and airspeed references.",
+            kites: 1,
+            common_nodes: FREE_COMMON_NODES,
+            upper_nodes: FREE_UPPER_NODES,
+        },
+        PresetInfo {
             preset: Preset::SimpleTether,
             name: "SimpleTether",
-            description: "Pinned single tether with a 100 kg payload and zero-velocity horizontal start.",
+            description: "Pinned single tether with configured payload mass and zero-velocity horizontal start.",
             kites: 0,
             common_nodes: COMMON_NODES,
             upper_nodes: 0,
@@ -1650,6 +1673,7 @@ mod tests {
         rudder: f64,
     ) -> f64 {
         controls.kites[0].surfaces.rudder = rudder;
+        state.kites[0].actuators.surfaces.rudder = rudder;
         let (xdot, _) = evaluate_rhs(&state, &controls, params);
         let dt = 1.0e-3;
         state.kites[0].body.pos_n += xdot.kites[0].body.pos_n * dt;
@@ -1657,6 +1681,7 @@ mod tests {
         state.kites[0].body.quat_n2b.coords += xdot.kites[0].body.quat_n2b.coords * dt;
         state.kites[0].body.omega_b += xdot.kites[0].body.omega_b * dt;
         state.kites[0].rotor_speed += xdot.kites[0].rotor_speed * dt;
+        state.kites[0].actuators.surfaces.rudder += xdot.kites[0].actuators.surfaces.rudder * dt;
         state.renormalize_attitudes();
         let (_, diag) = evaluate_rhs(&state, &controls, params);
         diag.kites[0].beta
@@ -1698,12 +1723,16 @@ mod tests {
             "negative rudder sideforce should reduce positive beta in one tiny free-flight step"
         );
 
+        let mut positive_state = state.clone();
         let mut positive_controls = controls.clone();
         positive_controls.kites[0].surfaces.rudder = 10.0_f64.to_radians();
-        let (_, positive_diag) = evaluate_rhs(&state, &positive_controls, &params);
+        positive_state.kites[0].actuators.surfaces.rudder = 10.0_f64.to_radians();
+        let (_, positive_diag) = evaluate_rhs(&positive_state, &positive_controls, &params);
+        let mut negative_state = state;
         let mut negative_controls = controls;
         negative_controls.kites[0].surfaces.rudder = -10.0_f64.to_radians();
-        let (_, negative_diag) = evaluate_rhs(&state, &negative_controls, &params);
+        negative_state.kites[0].actuators.surfaces.rudder = -10.0_f64.to_radians();
+        let (_, negative_diag) = evaluate_rhs(&negative_state, &negative_controls, &params);
         assert!(
             positive_diag.kites[0].rudder_moment_b[2] < negative_diag.kites[0].rudder_moment_b[2],
             "positive rudder should create the negative body-yaw moment needed by the Y2 beta/yaw loop"
@@ -1800,9 +1829,18 @@ mod tests {
         let target_params = base_params::<2>(&target_init).expect("Y2 params");
         let disk_altitude = -target_params.controller.disk_center_n[2]
             - target_params.kites[0].tether.contact.ground_altitude;
+        let upper_length = y2_upper_initial_length(&target_params);
+        let disk_radius = target_params.controller.disk_radius;
+        let upper_vertical = (upper_length * upper_length - disk_radius * disk_radius)
+            .max(0.0)
+            .sqrt();
+        let expected_disk_altitude = y2_target_payload_altitude_m()
+            + target_params.common_tether.natural_length
+            + upper_vertical
+            + y2_cad_altitude_offset_from_bridle(&target_params, disk_radius);
         assert!(
-            (disk_altitude - 297.0).abs() < 5.0,
-            "control disk should be raised for a 50 m payload target, got {disk_altitude:.3} m",
+            (disk_altitude - expected_disk_altitude).abs() < 1.0e-9,
+            "control disk altitude should be derived from tether geometry, got {disk_altitude:.3} m expected {expected_disk_altitude:.3} m",
         );
 
         let launch_state = y_low_configuration::<COMMON_NODES, UPPER_NODES>(&target_params);

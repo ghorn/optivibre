@@ -9,15 +9,16 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use multikite_sim::{
-    COMMON_NODES, FREE_COMMON_NODES, FREE_UPPER_NODES, InitRequest, LongitudinalMode, PhaseMode,
-    Preset, RunSummary, SimulationConfig, SimulationFrame, SimulationProgress, UPPER_NODES,
-    available_presets, build_aero_analysis, simulate_free_flight1_with_callbacks,
-    simulate_free_flight1_with_progress, simulate_simple_tether_with_callbacks,
-    simulate_simple_tether_with_progress, simulate_star1_with_callbacks,
-    simulate_star1_with_progress, simulate_star3_with_callbacks, simulate_star3_with_progress,
-    simulate_star4_with_callbacks, simulate_star4_with_progress, simulate_y2_high_with_callbacks,
-    simulate_y2_high_with_progress, simulate_y2_low_with_callbacks, simulate_y2_low_with_progress,
-    simulate_y2_with_callbacks, simulate_y2_with_progress,
+    COMMON_NODES, ControllerTuning, DrydenConfig, FREE_COMMON_NODES, FREE_UPPER_NODES, InitRequest,
+    LongitudinalMode, PhaseMode, Preset, RunSummary, SimulationConfig, SimulationFrame,
+    SimulationProgress, UPPER_NODES, available_presets, build_aero_analysis,
+    simulate_free_flight1_with_callbacks, simulate_free_flight1_with_progress,
+    simulate_simple_tether_with_callbacks, simulate_simple_tether_with_progress,
+    simulate_star1_with_callbacks, simulate_star1_with_progress, simulate_star3_with_callbacks,
+    simulate_star3_with_progress, simulate_star4_with_callbacks, simulate_star4_with_progress,
+    simulate_y2_high_with_callbacks, simulate_y2_high_with_progress,
+    simulate_y2_low_with_callbacks, simulate_y2_low_with_progress, simulate_y2_with_callbacks,
+    simulate_y2_with_progress,
 };
 use nalgebra::UnitQuaternion;
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,9 @@ const GENERATED_AERO_ANALYSIS_JS: &str =
     include_str!(concat!(env!("OUT_DIR"), "/aero_analysis.js"));
 static LAST_SUMMARY: OnceLock<Mutex<Option<RunSummary>>> = OnceLock::new();
 
+#[derive(Debug)]
+struct StreamCancelled;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "multikite_webapp",
@@ -48,14 +52,20 @@ struct Cli {
 struct RunRequest {
     preset: Preset,
     duration: f64,
+    dt_control: Option<f64>,
     phase_mode: PhaseMode,
     #[serde(default)]
     longitudinal_mode: LongitudinalMode,
     payload_mass_kg: Option<f64>,
     wind_speed_mps: Option<f64>,
     sample_stride: Option<usize>,
+    rk_abs_tol: Option<f64>,
+    rk_rel_tol: Option<f64>,
+    max_substeps: Option<usize>,
+    controller_tuning: Option<ControllerTuning<f64>>,
     #[serde(default)]
     sim_noise_enabled: bool,
+    dryden: Option<DrydenConfig>,
     #[serde(default = "default_true")]
     bridle_enabled: bool,
 }
@@ -172,11 +182,17 @@ struct ApiFrame {
     yaw_r_term: Vec<f64>,
     yaw_rudder_term: Vec<f64>,
     aileron_cmd_deg: Vec<f64>,
+    aileron_applied_deg: Vec<f64>,
     flap_cmd_deg: Vec<f64>,
+    flap_applied_deg: Vec<f64>,
     winglet_cmd_deg: Vec<f64>,
+    winglet_applied_deg: Vec<f64>,
     elevator_cmd_deg: Vec<f64>,
+    elevator_applied_deg: Vec<f64>,
     rudder_cmd_deg: Vec<f64>,
+    rudder_applied_deg: Vec<f64>,
     motor_torque: Vec<f64>,
+    motor_torque_applied: Vec<f64>,
     total_work: f64,
     total_dissipated_work: f64,
     total_kinetic_energy: f64,
@@ -215,6 +231,7 @@ async fn main() -> Result<()> {
         .route("/favicon.svg", get(favicon))
         .route("/favicon.ico", get(favicon))
         .route("/api/presets", get(presets))
+        .route("/api/default_config", get(default_config))
         .route("/api/run", post(run))
         .route("/api/run_stream", post(run_stream))
         .route("/api/aero_analysis", get(aero_analysis))
@@ -260,6 +277,10 @@ async fn presets() -> Json<Vec<multikite_sim::PresetInfo>> {
     Json(available_presets())
 }
 
+async fn default_config() -> Json<SimulationConfig> {
+    Json(SimulationConfig::default())
+}
+
 async fn healthz() -> StatusCode {
     StatusCode::NO_CONTENT
 }
@@ -281,6 +302,7 @@ async fn last_summary() -> Json<Option<RunSummary>> {
 }
 
 fn config_from_request(request: &RunRequest) -> (InitRequest, SimulationConfig) {
+    let defaults = SimulationConfig::default();
     (
         InitRequest {
             preset: request.preset,
@@ -289,14 +311,38 @@ fn config_from_request(request: &RunRequest) -> (InitRequest, SimulationConfig) 
         },
         SimulationConfig {
             duration: request.duration,
+            dt_control: positive_f64_or_default(request.dt_control, defaults.dt_control),
             phase_mode: request.phase_mode,
             longitudinal_mode: request.longitudinal_mode,
             sample_stride: request.sample_stride.unwrap_or(1).max(1),
+            rk_abs_tol: positive_f64_or_default(request.rk_abs_tol, defaults.rk_abs_tol),
+            rk_rel_tol: positive_f64_or_default(request.rk_rel_tol, defaults.rk_rel_tol),
+            max_substeps: request
+                .max_substeps
+                .unwrap_or(defaults.max_substeps)
+                .max(1)
+                .min(1_000_000),
+            controller_tuning: request
+                .controller_tuning
+                .clone()
+                .unwrap_or_else(|| defaults.controller_tuning.clone())
+                .finite_or_default(&defaults.controller_tuning),
             sim_noise_enabled: request.sim_noise_enabled,
+            dryden: request
+                .dryden
+                .unwrap_or(defaults.dryden)
+                .finite_or_default(&defaults.dryden),
             bridle_enabled: request.bridle_enabled,
-            ..SimulationConfig::default()
+            ..defaults
         },
     )
+}
+
+fn positive_f64_or_default(value: Option<f64>, default: f64) -> f64 {
+    match value {
+        Some(value) if value.is_finite() && value > 0.0 => value,
+        _ => default,
+    }
 }
 
 fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
@@ -858,11 +904,23 @@ fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
             .iter()
             .map(|control| control.surfaces.aileron.to_degrees())
             .collect(),
+        aileron_applied_deg: frame
+            .state
+            .kites
+            .iter()
+            .map(|kite| kite.actuators.surfaces.aileron.to_degrees())
+            .collect(),
         flap_cmd_deg: frame
             .controls
             .kites
             .iter()
             .map(|control| control.surfaces.flap.to_degrees())
+            .collect(),
+        flap_applied_deg: frame
+            .state
+            .kites
+            .iter()
+            .map(|kite| kite.actuators.surfaces.flap.to_degrees())
             .collect(),
         winglet_cmd_deg: frame
             .controls
@@ -870,11 +928,23 @@ fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
             .iter()
             .map(|control| control.surfaces.winglet.to_degrees())
             .collect(),
+        winglet_applied_deg: frame
+            .state
+            .kites
+            .iter()
+            .map(|kite| kite.actuators.surfaces.winglet.to_degrees())
+            .collect(),
         elevator_cmd_deg: frame
             .controls
             .kites
             .iter()
             .map(|control| control.surfaces.elevator.to_degrees())
+            .collect(),
+        elevator_applied_deg: frame
+            .state
+            .kites
+            .iter()
+            .map(|kite| kite.actuators.surfaces.elevator.to_degrees())
             .collect(),
         rudder_cmd_deg: frame
             .controls
@@ -882,11 +952,23 @@ fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
             .iter()
             .map(|control| control.surfaces.rudder.to_degrees())
             .collect(),
+        rudder_applied_deg: frame
+            .state
+            .kites
+            .iter()
+            .map(|kite| kite.actuators.surfaces.rudder.to_degrees())
+            .collect(),
         motor_torque: frame
             .controls
             .kites
             .iter()
             .map(|control| control.motor_torque)
+            .collect(),
+        motor_torque_applied: frame
+            .state
+            .kites
+            .iter()
+            .map(|kite| kite.actuators.motor_torque)
             .collect(),
         total_work: frame.state.total_work,
         total_dissipated_work: frame.state.total_dissipated_work,
@@ -1032,8 +1114,13 @@ async fn run_stream(
             &sender,
             StreamEvent::Log {
                 message: format!(
-                    "starting preset={:?} duration={:.1}s phase_mode={:?}",
-                    request.preset, request.duration, request.phase_mode
+                    "starting preset={:?} duration={:.1}s dt_control={:.4}s phase_mode={:?}",
+                    request.preset,
+                    request.duration,
+                    request
+                        .dt_control
+                        .unwrap_or_else(|| SimulationConfig::default().dt_control),
+                    request.phase_mode
                 ),
             },
         )
@@ -1042,24 +1129,35 @@ async fn run_stream(
         let request_for_run = request.clone();
         let progress_sender = sender.clone();
         let outcome = tokio::task::spawn_blocking(move || {
-            let mut progress_cb = |progress: SimulationProgress| {
-                let _ = send_stream_event_blocking(
-                    &progress_sender,
-                    StreamEvent::Progress { progress },
-                );
-            };
             let mut plot_buffer = Vec::<ApiFrame>::new();
+            let mut progress_cb = |progress: SimulationProgress| {
+                if send_stream_event_blocking(&progress_sender, StreamEvent::Progress { progress })
+                    .is_err()
+                {
+                    std::panic::panic_any(StreamCancelled);
+                }
+            };
             let mut frame_cb = |frame: ApiFrame| {
                 plot_buffer.push(frame.clone());
-                let _ = send_stream_event_blocking(&progress_sender, StreamEvent::Frame { frame });
+                if send_stream_event_blocking(&progress_sender, StreamEvent::Frame { frame })
+                    .is_err()
+                {
+                    std::panic::panic_any(StreamCancelled);
+                }
             };
-            let result = run_preset_streaming(&request_for_run, &mut progress_cb, &mut frame_cb);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_preset_streaming(&request_for_run, &mut progress_cb, &mut frame_cb)
+            }));
             drop(frame_cb);
-            (result, plot_buffer)
+            match result {
+                Ok(result) => Some((result, plot_buffer)),
+                Err(payload) if payload.is::<StreamCancelled>() => None,
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
         })
         .await;
         match outcome {
-            Ok((Ok(summary), plot_frames)) => {
+            Ok(Some((Ok(summary), plot_frames))) => {
                 let _ = send_stream_event(
                     &sender,
                     StreamEvent::Log {
@@ -1093,7 +1191,7 @@ async fn run_stream(
                 )
                 .await;
             }
-            Ok((Err(error), plot_frames)) => {
+            Ok(Some((Err(error), plot_frames))) => {
                 let _ = send_stream_event(
                     &sender,
                     StreamEvent::Log {
@@ -1119,6 +1217,7 @@ async fn run_stream(
                 )
                 .await;
             }
+            Ok(None) => {}
             Err(error) => {
                 let _ = send_stream_event(
                     &sender,

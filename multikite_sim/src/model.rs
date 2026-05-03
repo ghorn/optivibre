@@ -7,8 +7,8 @@ use crate::math::{
     rotate_body_to_nav, rotate_nav_to_body, scale, smooth_enable, square, sub,
 };
 use crate::types::{
-    BodyState, Controls, Diagnostics, KiteControls, KiteDiagnostics, KiteParams, KiteState, Params,
-    State, TetherNode, TetherParams,
+    BodyState, ControlSurfaces, Controls, Diagnostics, KiteControls, KiteDiagnostics, KiteParams,
+    KiteState, Params, State, TetherNode, TetherParams,
 };
 use anyhow::Result;
 use nalgebra::{Quaternion, Vector3};
@@ -599,6 +599,25 @@ pub(crate) fn eval_force_moment_flap<T: Scalar>(
     )
 }
 
+fn actuator_lag_derivative<T: Scalar>(
+    actual: &KiteControls<T>,
+    command: &KiteControls<T>,
+    tuning: &crate::types::ControllerTuning<T>,
+) -> KiteControls<T> {
+    let surface_tau = tuning.actuator_surface_tau_s.max(T::from_f64(1.0e-6));
+    let motor_tau = tuning.actuator_motor_tau_s.max(T::from_f64(1.0e-6));
+    KiteControls {
+        surfaces: ControlSurfaces {
+            aileron: (command.surfaces.aileron - actual.surfaces.aileron) / surface_tau,
+            flap: (command.surfaces.flap - actual.surfaces.flap) / surface_tau,
+            winglet: (command.surfaces.winglet - actual.surfaces.winglet) / surface_tau,
+            elevator: (command.surfaces.elevator - actual.surfaces.elevator) / surface_tau,
+            rudder: (command.surfaces.rudder - actual.surfaces.rudder) / surface_tau,
+        },
+        motor_torque: (command.motor_torque - actual.motor_torque) / motor_tau,
+    }
+}
+
 pub(crate) fn eval_aero_coeffs<T: Scalar>(
     alpha: T,
     beta: T,
@@ -668,6 +687,7 @@ fn compute_kite<T: Scalar, const N_UPPER: usize>(
     common_params: &Params<T, 1>,
     splitter: &TetherNode<T>,
 ) -> (KiteState<T, N_UPPER>, KiteDiagnostics<T>, Vector3<T>) {
+    let applied_control = &kite.actuators;
     let last_node = kite.tether.last().unwrap_or(splitter);
     let (bridle_pos_n, bridle_vel_n, bridle_offset_b) = bridle_geometry(
         &kite.body,
@@ -717,7 +737,7 @@ fn compute_kite<T: Scalar, const N_UPPER: usize>(
         &kite.body.omega_b,
         airspeed,
         &params.aero,
-        control,
+        applied_control,
     );
     let force_scale = qbar * params.aero.ref_area;
     let moment_scale = qbar * params.aero.ref_area;
@@ -771,15 +791,18 @@ fn compute_kite<T: Scalar, const N_UPPER: usize>(
     let rotor_fit = reference_rotor_fit_ref();
     let rotor_aero_thrust = eval_quartic2(&rotor_fit.aero_thrust, airspeed, kite.rotor_speed);
     let rotor_aero_torque = eval_quartic2(&rotor_fit.aero_torque, airspeed, kite.rotor_speed);
-    let rotor_speed_dot = (control.motor_torque - rotor_aero_torque) / params.rotor.inertia;
+    let rotor_speed_dot = (applied_control.motor_torque - rotor_aero_torque) / params.rotor.inertia;
     let rotor_axis_b = normalize_exact(&params.rotor.axis_b);
     let motor_force = rotor_aero_thrust;
     let motor_force_b = scale(&rotor_axis_b, rotor_aero_thrust);
     let motor_moment_b = add(
-        &scale(&rotor_axis_b, -control.motor_torque * params.rotor.sign),
+        &scale(
+            &rotor_axis_b,
+            -applied_control.motor_torque * params.rotor.sign,
+        ),
         &cross(&params.rotor.position_b, &motor_force_b),
     );
-    let motor_power = control.motor_torque * kite.rotor_speed;
+    let motor_power = applied_control.motor_torque * kite.rotor_speed;
     let rotor_dissipated_power =
         rotor_aero_torque * kite.rotor_speed - dot(&motor_force_b, &kite.body.vel_b);
     let aero_dissipated_power =
@@ -873,6 +896,11 @@ fn compute_kite<T: Scalar, const N_UPPER: usize>(
         KiteState {
             body: body_ddt,
             rotor_speed: rotor_speed_dot,
+            actuators: actuator_lag_derivative(
+                applied_control,
+                control,
+                &common_params.controller.tuning,
+            ),
             tether: upper_tether.node_ddt,
         },
         KiteDiagnostics {
@@ -983,6 +1011,16 @@ pub fn evaluate_rhs<T: Scalar, const NK: usize, const N_COMMON: usize, const N_U
             omega_b: zero_vec(),
         },
         rotor_speed: T::zero(),
+        actuators: KiteControls {
+            surfaces: ControlSurfaces {
+                aileron: T::zero(),
+                flap: T::zero(),
+                winglet: T::zero(),
+                elevator: T::zero(),
+                rudder: T::zero(),
+            },
+            motor_torque: T::zero(),
+        },
         tether: std::array::from_fn(|_| TetherNode {
             pos_n: zero_vec(),
             vel_n: zero_vec(),
@@ -1720,17 +1758,8 @@ mod tests {
                 speed_ref: 0.0,
                 disk_center_n: Vector3::zeros(),
                 disk_radius: 1.0,
+                tuning: Default::default(),
             },
-        };
-        let state = KiteState::<f64, 0> {
-            body: BodyState {
-                pos_n: Vector3::new(2.0, -3.0, -40.0),
-                vel_b: Vector3::new(21.0, -1.5, 2.8),
-                quat_n2b: Quaternion::new(1.0, 0.0, 0.0, 0.0),
-                omega_b: Vector3::new(0.6, -0.4, 0.2),
-            },
-            rotor_speed: 335.0,
-            tether: [],
         };
         let controls = KiteControls {
             surfaces: ControlSurfaces {
@@ -1741,6 +1770,17 @@ mod tests {
                 rudder: -0.05,
             },
             motor_torque: 0.0,
+        };
+        let state = KiteState::<f64, 0> {
+            body: BodyState {
+                pos_n: Vector3::new(2.0, -3.0, -40.0),
+                vel_b: Vector3::new(21.0, -1.5, 2.8),
+                quat_n2b: Quaternion::new(1.0, 0.0, 0.0, 0.0),
+                omega_b: Vector3::new(0.6, -0.4, 0.2),
+            },
+            rotor_speed: 335.0,
+            actuators: controls.clone(),
+            tether: [],
         };
         let splitter = TetherNode {
             pos_n: Vector3::new(10.0, 0.0, -100.0),

@@ -49,27 +49,16 @@
             Preset
             <select id="preset"></select>
           </label>
-          <label>
-            Duration (s)
-            <input id="duration" type="number" min="1" step="1" value="10" />
-          </label>
-          <label>
-            Phase Mode
-            <select id="phase-mode">
-              <option value="adaptive">Adaptive</option>
-              <option value="open_loop">Open Loop</option>
-            </select>
-          </label>
-          <label>
-            Payload (kg)
-            <input id="payload-mass" type="number" min="1" step="1" value="100" />
-          </label>
-          <label>
-            Wind (m/s)
-            <input id="wind-speed" type="number" min="0" step="0.5" value="5" />
-          </label>
           <div class="form-section">
             <div class="form-section-title">Model Options</div>
+            <label>
+              Payload (kg)
+              <input id="payload-mass" type="number" min="1" step="1" value="100" />
+            </label>
+            <label>
+              Wind (m/s)
+              <input id="wind-speed" type="number" min="0" step="0.5" value="5" />
+            </label>
             <label class="checkbox-label">
               <input id="bridle-enabled" type="checkbox" checked />
               <span>Enable bridle model</span>
@@ -80,25 +69,89 @@
               <span>Enable Dryden gusts</span>
             </label>
             <div class="form-hint">Off by default. Wind remains steady unless this is enabled.</div>
+            <div id="dryden-tuning-fields" class="tuning-fields dryden-tuning-fields">
+              <label>
+                Dryden seed
+                <input id="dryden-seed" type="number" min="0" step="1" value="3512640992" />
+                <span class="form-hint">Deterministic random seed for repeatable gusts.</span>
+              </label>
+              <label>
+                Dryden intensity scale
+                <input id="dryden-intensity-scale" type="number" min="0" step="0.1" value="1" />
+                <span class="form-hint">Multiplies turbulence intensities σu, σv, σw. Use 0 for no gust amplitude.</span>
+              </label>
+              <label>
+                Dryden length-scale factor
+                <input id="dryden-length-scale" type="number" min="0.01" step="0.1" value="1" />
+                <span class="form-hint">Multiplies Lu, Lv, Lw. Larger values make gusts vary more slowly.</span>
+              </label>
+              <label class="checkbox-label">
+                <input id="dryden-altitude-intensity-enabled" type="checkbox" checked />
+                <span>Altitude-dependent intensity</span>
+              </label>
+              <label class="checkbox-label">
+                <input id="dryden-altitude-length-enabled" type="checkbox" checked />
+                <span>Altitude-dependent length scales</span>
+              </label>
+            </div>
             <label class="checkbox-label">
-              <input id="max-throttle-altitude-pitch" type="checkbox" />
-              <span>Max throttle, pitch altitude</span>
+              <input id="wind-shear-enabled" type="checkbox" />
+              <span>Show visualization wind shear</span>
             </label>
-            <div class="form-hint">
-              Experiment mode for lateral tuning: motor torque stays at max; pitch regulates altitude.
+            <label>
+              Wind shear 90% height (m)
+              <input id="wind-shear-90-height" type="number" min="0" step="any" placeholder="No shear" />
+              <span class="form-hint">Leave blank for no shear. Particle-only model: clean wind is zero at ground and reaches 90% of the specified wind at this altitude.</span>
+            </label>
+          </div>
+          <div class="form-section run-panel">
+            <div class="form-section-title">Run Options</div>
+            <label>
+              Duration (s)
+              <input id="duration" type="number" min="1" step="1" value="30" />
+            </label>
+            <label>
+              Sample Period / Rate
+              <input id="dt-control" type="number" min="0.001" step="0.001" value="0.01" />
+              <span class="form-hint">Control and plot sample interval in seconds. 0.01 s = 100 Hz.</span>
+            </label>
+            <div class="form-subsection">
+              <div class="form-subsection-title">RK45 Integrator</div>
+              <label>
+                Absolute Tol
+                <input id="rk-abs-tol" type="number" min="1e-12" step="any" value="1e-6" />
+              </label>
+              <label>
+                Relative Tol
+                <input id="rk-rel-tol" type="number" min="1e-12" step="any" value="1e-6" />
+              </label>
+              <label>
+                Max Substeps
+                <input id="max-substeps" type="number" min="1" step="1" value="1000" />
+              </label>
+            </div>
+            <label>
+              Time Dilation
+              <select id="time-dilation">
+                <option value="fast">Fast as possible</option>
+                <option value="10">10x</option>
+                <option value="5">5x</option>
+                <option value="2">2x</option>
+                <option value="1" selected>1x</option>
+                <option value="0.5">0.5x</option>
+                <option value="0.1">0.1x</option>
+              </select>
+            </label>
+            <a class="secondary-action" href="/aero_analysis" target="_blank" rel="noopener">
+              Open Aero Analysis
+            </a>
+            <div class="run-actions">
+              <button id="run-button" type="submit">Run</button>
+              <button id="restart-button" class="secondary-action" type="button" disabled>Restart</button>
             </div>
           </div>
-          <label>
-            Time Dilation
-            <select id="time-dilation">
-              <option value="fast">Fast as possible</option>
-              <option value="1">1x</option>
-              <option value="0.5">0.5x</option>
-              <option value="0.1">0.1x</option>
-            </select>
-          </label>
-          <div class="form-section">
-            <div class="form-section-title">View Follow</div>
+          <details class="form-section visualization-panel" id="visualization-panel">
+            <summary class="form-section-title">Visualization</summary>
             <label>
               Camera Target
               <select id="camera-follow-target">
@@ -114,11 +167,101 @@
               <input id="control-labels-enabled" type="checkbox" />
               <span>Show floating control labels</span>
             </label>
-          </div>
-          <a class="secondary-action" href="/aero_analysis" target="_blank" rel="noopener">
-            Open Aero Analysis
-          </a>
-          <button id="run-button" type="submit">Run</button>
+            <label class="checkbox-label">
+              <input id="control-disk-enabled" type="checkbox" checked />
+              <span>Show control disk</span>
+            </label>
+            <label class="checkbox-label">
+              <input id="control-features-enabled" type="checkbox" checked />
+              <span>Show control features</span>
+            </label>
+            <label class="checkbox-label">
+              <input id="control-feature-lines-enabled" type="checkbox" checked />
+              <span>Show control feature lines</span>
+            </label>
+            <label>
+              Control feature scale
+              <input id="control-feature-scale" type="number" min="0.1" step="0.05" value="0.5" />
+            </label>
+            <label class="checkbox-label">
+              <input id="tether-nodes-enabled" type="checkbox" checked />
+              <span>Show tether nodes</span>
+            </label>
+            <label>
+              Tether node scale
+              <input id="tether-node-scale" type="number" min="0" step="0.1" value="1.5" />
+            </label>
+            <label>
+              Tether tension color scale
+              <select id="tether-tension-scale-mode">
+                <option value="payload" selected>Payload estimate</option>
+                <option value="run_peak">Observed run peak</option>
+                <option value="fixed">Fixed range</option>
+              </select>
+            </label>
+            <label class="tension-scale-field" data-tension-scale-mode="payload">
+              Payload tension margin
+              <input id="tether-tension-payload-margin" type="number" min="0.1" step="0.1" value="3" />
+              <span class="form-hint">Red at payload weight × this margin; blue at zero tension.</span>
+            </label>
+            <label class="tension-scale-field" data-tension-scale-mode="fixed">
+              Fixed min tension (N)
+              <input id="tether-tension-fixed-min" type="number" step="any" value="0" />
+            </label>
+            <label class="tension-scale-field" data-tension-scale-mode="fixed">
+              Fixed max tension (N)
+              <input id="tether-tension-fixed-max" type="number" step="any" value="3000" />
+            </label>
+            <div class="form-hint tension-scale-field" data-tension-scale-mode="run_peak">
+              Uses the min and max tether tension observed so far in the current run, with a small margin.
+            </div>
+            <label class="checkbox-label">
+              <input id="fog-enabled" type="checkbox" />
+              <span>Show distance fog</span>
+            </label>
+            <label class="checkbox-label">
+              <input id="air-particles-enabled" type="checkbox" checked />
+              <span>Show air particles</span>
+            </label>
+            <label>
+              Air particle opacity
+              <input id="air-particle-opacity" type="number" min="0" max="1" step="0.05" value="0.45" />
+            </label>
+            <label class="checkbox-label">
+              <input id="wingtip-trails-enabled" type="checkbox" checked />
+              <span>Show wingtip trails</span>
+            </label>
+            <label class="checkbox-label">
+              <input id="wingtip-convection-enabled" type="checkbox" checked />
+              <span>Convect wingtip trails by birth wind</span>
+            </label>
+            <div class="form-hint">When enabled, each new wingtip particle captures the local wind at birth and keeps that velocity until it fades.</div>
+          </details>
+          <details class="form-section tuning-panel" id="controller-tuning-panel" open>
+            <summary class="form-section-title">Control Options</summary>
+            <div class="form-hint">
+              Overrides the controller gains for the next run or restart. Mode-specific fields are shown only when that mode is active.
+            </div>
+            <label>
+              Phase Mode
+              <select id="phase-mode">
+                <option value="adaptive">Adaptive</option>
+                <option value="open_loop">Open Loop</option>
+              </select>
+            </label>
+            <div class="tuning-group controller-mode-group">
+              <div class="tuning-group-title">Controller Mode</div>
+              <label class="checkbox-label controller-mode-toggle">
+                <input id="max-throttle-altitude-pitch" type="checkbox" />
+                <span>Max throttle, pitch altitude</span>
+              </label>
+              <div class="form-hint">
+                Experiment mode for lateral tuning: motor torque stays at max; pitch regulates altitude.
+                When off, the total-energy controller regulates airspeed and altitude together.
+              </div>
+            </div>
+            <div id="controller-tuning-fields" class="tuning-fields"></div>
+          </details>
         </form>
         <div id="failure-pill" class="failure-pill"></div>
         <section class="summary">
@@ -131,12 +274,21 @@
         <div id="control-vis-legend" class="control-vis-legend" aria-label="Control visualization legend">
           <div class="legend-title">Control Vis</div>
           <div class="legend-row"><span class="legend-swatch lookahead"></span>Lookahead target / path</div>
+          <div class="legend-row"><span class="legend-swatch lookahead-disk"></span>Lookahead before radial offset</div>
           <div class="legend-row"><span class="legend-swatch projected"></span>Projected phase point</div>
-          <div class="legend-row"><span class="legend-swatch slot"></span>Fixed phase slot</div>
-          <div class="legend-row"><span class="legend-swatch disk"></span>Control ring / center</div>
+          <div class="legend-row"><span class="legend-swatch slot"></span>Formation phase slot</div>
+          <div class="legend-row"><span class="legend-swatch disk"></span>Control ring</div>
         </div>
         <div id="control-label-layer" class="control-label-layer" aria-hidden="true"></div>
       </section>
+      <div
+        id="scene-resize-handle"
+        class="scene-resize-handle"
+        role="separator"
+        aria-label="Resize 3D view"
+        aria-orientation="horizontal"
+        tabindex="0"
+      ></div>
       <section class="panel runtime-panel">
         <div class="runtime-tabs" role="tablist" aria-label="Run output">
           <button id="runtime-tab-console" class="runtime-tab active" type="button">Console Log</button>
@@ -153,7 +305,7 @@
         <div class="docs-head">
           <div class="docs-eyebrow">Controller Math</div>
           <h2>Control Laws</h2>
-          <div class="docs-subtitle">Rendered from the current Rust implementation, not the historical intent.</div>
+          <div class="docs-subtitle">Generated from <code>multikite_sim/src/controller.rs</code>.</div>
         </div>
         <div id="controller-docs"></div>
       </section>

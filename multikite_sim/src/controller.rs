@@ -1,84 +1,28 @@
 use crate::math::{circular_mean, clamp, rotate_body_to_nav, rotate_nav_to_body, sub, wrap_angle};
 use crate::types::{
-    ControlSurfaces, Controls, Diagnostics, KiteControls, LongitudinalMode, Params, PhaseMode,
-    State,
+    ControlSurfaces, ControllerTuning, Controls, Diagnostics, KiteControls, LongitudinalMode,
+    Params, PhaseMode, State,
 };
 use nalgebra::Vector3;
 
-const SPEED_INTEGRATOR_PHASE_GAIN: f64 = 10.0;
-const SPEED_INTEGRATOR_MIN_MPS: f64 = 18.0;
-const SPEED_INTEGRATOR_MAX_MPS: f64 = 35.0;
-const ROLL_FEEDFORWARD_GAIN: f64 = 1.0;
-const ROLL_FROM_CURVATURE_P: f64 = 18.0;
-const ROLL_FROM_CURVATURE_I: f64 = 2.0;
-const ROLL_CURVATURE_INTEGRATOR_LIMIT: f64 = 0.04;
-const ROLL_REF_LIMIT_RAD: f64 = 35.0_f64.to_radians();
-const TETHERED_ROLL_REF_RATE_LIMIT_RADPS: f64 = 90.0_f64.to_radians();
-const AILERON_ROLL_P: f64 = 1.8;
-const AILERON_ROLL_D: f64 = 0.25;
-const RABBIT_CURVATURE_LAG_S: f64 = 0.1;
-const TETHERED_AILERON_ROLL_P: f64 = 3.5;
-const TETHERED_AILERON_ROLL_D: f64 = 0.35;
-const TETHERED_RUDDER_BETA_P: f64 = 1.8;
-const TETHERED_RUDDER_RATE_D: f64 = 0.35;
-const TETHERED_RUDDER_WORLD_Z_P: f64 = 0.0;
-const TETHERED_RUDDER_TRIM_OFFSET_RAD: f64 = 0.0;
 const TETHERED_CURVATURE_Y_INTEGRATOR_OUTPUT_LIMIT: f64 = 0.1;
 const TETHERED_CURVATURE_Z_INTEGRATOR_OUTPUT_LIMIT: f64 = 0.05;
-const GUIDANCE_MIN_LOOKAHEAD_FRACTION: f64 = 0.25;
-const GUIDANCE_LATERAL_LOOKAHEAD_RATIO_LIMIT: f64 = 0.75;
-const GUIDANCE_CURVATURE_LIMIT: f64 = 0.04;
-const FREE_FLIGHT_PITCH_REF_LIMIT_RAD: f64 = 14.0_f64.to_radians();
-const TETHERED_PITCH_REF_LIMIT_RAD: f64 = 3.8_f64.to_radians();
-const ELEVATOR_PITCH_P: f64 = 0.85;
-const ELEVATOR_PITCH_D: f64 = 0.25;
-const ALTITUDE_PITCH_P: f64 = 0.01;
-const ALTITUDE_PITCH_I: f64 = 0.001;
-const TECS_ALTITUDE_ERROR_LIMIT_M: f64 = 25.0;
-const TECS_THRUST_KINETIC_P: f64 = 0.3;
-const TECS_THRUST_KINETIC_I: f64 = 0.06;
-const TECS_THRUST_INTEGRATOR_LIMIT_NM: f64 = 8.0;
-const TETHERED_THRUST_POSITIVE_POTENTIAL_BLEND: f64 = 0.02;
-const TETHERED_TECS_POTENTIAL_ERROR_LIMIT: f64 = 245.0;
-const TETHERED_TECS_POTENTIAL_BALANCE_WEIGHT: f64 = 0.9;
-const TETHERED_TECS_KINETIC_DEFICIT_BALANCE_WEIGHT: f64 = 1.1;
-const TETHERED_TECS_KINETIC_SURPLUS_BALANCE_WEIGHT: f64 = 1.0;
-const TECS_PITCH_BALANCE_P: f64 = 0.0012;
-const TECS_PITCH_BALANCE_I: f64 = 0.00035;
-const TECS_PITCH_INTEGRATOR_LIMIT_RAD: f64 = 7.0_f64.to_radians();
 const FREE_FLIGHT_DEMO_STAGE_S: f64 = 10.0;
 const FREE_FLIGHT_DEMO_SPEED_STEP_MPS: f64 = 3.0;
 const FREE_FLIGHT_DEMO_ALTITUDE_STEP_UP_M: f64 = 12.0;
 const FREE_FLIGHT_DEMO_ALTITUDE_STEP_DOWN_M: f64 = -8.0;
-const ALPHA_PROTECTION_MIN_RAD: f64 = -8.0_f64.to_radians();
-const ALPHA_PROTECTION_MAX_RAD: f64 = 10.0_f64.to_radians();
-const ALPHA_TO_ELEVATOR: f64 = 20.0;
-const RUDDER_BETA_P: f64 = -0.3;
-const RUDDER_OMEGA_WORLD_Z_P: f64 = 0.0;
-const SURFACE_LIMIT_AILERON_RAD: f64 = 0.5;
-const SURFACE_LIMIT_RUDDER_RAD: f64 = 25.0_f64.to_radians();
-const SURFACE_LIMIT_ELEVATOR_RAD: f64 = 0.3;
-const MOTOR_TORQUE_MAX_NM: f64 = 45.6;
-const ROTOR_SPEED_SOFT_LIMIT_RADPS: f64 = 800.0;
-const ROTOR_SPEED_HARD_LIMIT_RADPS: f64 = 900.0;
-
-fn tuning_value(name: &str, default: f64) -> f64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(default)
-}
+const GUIDANCE_MODE_RABBIT: u8 = 0;
+const GUIDANCE_MODE_CURVATURE: u8 = 1;
+const GUIDANCE_MODE_SWITCH: u8 = 2;
 
 #[derive(Clone, Debug)]
 struct KiteControllerState {
     thrust_energy_integrator: f64,
     pitch_energy_integrator: f64,
     curvature_to_roll_integrator: f64,
+    rabbit_bearing_to_roll_integrator: f64,
     roll_ref_command: f64,
-    rabbit_lag_n: Vector3<f64>,
-    rabbit_lag2_n: Vector3<f64>,
-    rabbit_lag_initialized: bool,
+    roll_ref_initialized: bool,
     curvature_y_integrator: f64,
     curvature_z_integrator: f64,
 }
@@ -127,10 +71,9 @@ impl<const NK: usize> ControllerState<NK> {
                 thrust_energy_integrator: 0.0,
                 pitch_energy_integrator: 0.0,
                 curvature_to_roll_integrator: 0.0,
+                rabbit_bearing_to_roll_integrator: 0.0,
                 roll_ref_command: 0.0,
-                rabbit_lag_n: Vector3::zeros(),
-                rabbit_lag2_n: Vector3::zeros(),
-                rabbit_lag_initialized: false,
+                roll_ref_initialized: false,
                 curvature_y_integrator: 0.0,
                 curvature_z_integrator: 0.0,
             }),
@@ -174,21 +117,15 @@ fn open_loop_phase_errors<const NK: usize>(
     })
 }
 
-fn speed_integrator_target(phase_error: f64, speed_ref: f64) -> f64 {
-    let phase_gain = tuning_value(
-        "MULTIKITE_SPEED_INTEGRATOR_PHASE_GAIN",
-        SPEED_INTEGRATOR_PHASE_GAIN,
-    );
-    let min_speed = tuning_value(
-        "MULTIKITE_SPEED_INTEGRATOR_MIN_MPS",
-        SPEED_INTEGRATOR_MIN_MPS,
-    );
-    let max_speed = tuning_value(
-        "MULTIKITE_SPEED_INTEGRATOR_MAX_MPS",
-        SPEED_INTEGRATOR_MAX_MPS,
-    );
+fn speed_integrator_target(
+    phase_error: f64,
+    speed_ref: f64,
+    tuning: &ControllerTuning<f64>,
+) -> f64 {
+    let min_speed = tuning.speed_min_mps;
+    let max_speed = tuning.speed_max_mps;
     clamp(
-        speed_ref + phase_gain * phase_error,
+        speed_ref + tuning.speed_phase_gain * phase_error,
         min_speed.min(max_speed),
         max_speed.max(min_speed),
     )
@@ -264,11 +201,12 @@ fn tecs_terms(
     speed_ref: f64,
     gravity: f64,
     tethered: bool,
+    tuning: &ControllerTuning<f64>,
 ) -> TecsTerms {
     let altitude_error = clamp(
         altitude_ref_raw - altitude,
-        -TECS_ALTITUDE_ERROR_LIMIT_M,
-        TECS_ALTITUDE_ERROR_LIMIT_M,
+        -tuning.tecs_altitude_error_limit_m,
+        tuning.tecs_altitude_error_limit_m,
     );
     let kinetic_energy = 0.5 * airspeed * airspeed;
     let kinetic_energy_ref = 0.5 * speed_ref * speed_ref;
@@ -278,8 +216,8 @@ fn tecs_terms(
     let potential_energy_error = if tethered {
         clamp(
             potential_energy_error_raw,
-            -TETHERED_TECS_POTENTIAL_ERROR_LIMIT,
-            TETHERED_TECS_POTENTIAL_ERROR_LIMIT,
+            -tuning.tethered_tecs_potential_error_limit,
+            tuning.tethered_tecs_potential_error_limit,
         )
     } else {
         potential_energy_error_raw
@@ -287,14 +225,14 @@ fn tecs_terms(
     let altitude_ref = altitude + potential_energy_error / gravity.max(1.0e-6);
     let potential_energy_ref = potential_energy + potential_energy_error;
     let kinetic_balance_weight = if tethered && kinetic_energy_error > 0.0 {
-        TETHERED_TECS_KINETIC_DEFICIT_BALANCE_WEIGHT
+        tuning.tethered_tecs_kinetic_deficit_balance_weight
     } else if tethered {
-        TETHERED_TECS_KINETIC_SURPLUS_BALANCE_WEIGHT
+        tuning.tethered_tecs_kinetic_surplus_balance_weight
     } else {
         1.0
     };
     let potential_balance_weight = if tethered {
-        TETHERED_TECS_POTENTIAL_BALANCE_WEIGHT
+        tuning.tethered_tecs_potential_balance_weight
     } else {
         1.0
     };
@@ -350,31 +288,32 @@ fn tethered_rudder_command(
     omega_z: f64,
     omega_world_z: f64,
     omega_world_z_ref: f64,
+    tuning: &ControllerTuning<f64>,
 ) -> f64 {
-    let beta_p = tuning_value("MULTIKITE_TETHERED_RUDDER_BETA_P", TETHERED_RUDDER_BETA_P);
-    let rate_d = tuning_value("MULTIKITE_TETHERED_RUDDER_RATE_D", TETHERED_RUDDER_RATE_D);
-    let world_z_p = tuning_value(
-        "MULTIKITE_TETHERED_RUDDER_WORLD_Z_P",
-        TETHERED_RUDDER_WORLD_Z_P,
-    );
-    let limit = tethered_rudder_limit_rad();
+    let limit = tuning.surface_limit_rudder_deg.to_radians().abs();
     clamp(
-        trim - beta_p * beta
-            + TETHERED_RUDDER_TRIM_OFFSET_RAD
-            + rate_d * omega_z
-            + world_z_p * (omega_world_z - omega_world_z_ref),
+        trim - tuning.tethered_rudder_beta_p * beta
+            + tuning.tethered_rudder_trim_offset_deg.to_radians()
+            + tuning.tethered_rudder_rate_d * omega_z
+            + tuning.tethered_rudder_world_z_p * (omega_world_z - omega_world_z_ref),
         -limit,
         limit,
     )
 }
 
-fn tethered_aileron_command(trim: f64, roll_ref: f64, roll_angle: f64, omega_x: f64) -> f64 {
-    let roll_p = tuning_value("MULTIKITE_TETHERED_AILERON_ROLL_P", TETHERED_AILERON_ROLL_P);
-    let roll_d = tuning_value("MULTIKITE_TETHERED_AILERON_ROLL_D", TETHERED_AILERON_ROLL_D);
+fn tethered_aileron_command(
+    trim: f64,
+    roll_ref: f64,
+    roll_angle: f64,
+    omega_x: f64,
+    tuning: &ControllerTuning<f64>,
+) -> f64 {
+    let surface_limit = tuning.surface_limit_aileron_deg.to_radians().abs();
     clamp(
-        trim - roll_p * wrap_angle(roll_ref - roll_angle) + roll_d * omega_x,
-        -SURFACE_LIMIT_AILERON_RAD,
-        SURFACE_LIMIT_AILERON_RAD,
+        trim - tuning.tethered_aileron_roll_p * wrap_angle(roll_ref - roll_angle)
+            + tuning.tethered_aileron_roll_d * omega_x,
+        -surface_limit,
+        surface_limit,
     )
 }
 
@@ -382,68 +321,170 @@ fn orbit_curvature_y_reference(radius: f64) -> f64 {
     1.0 / radius.max(1.0)
 }
 
-fn orbit_roll_feedforward(inertial_speed: f64, orbit_radius: f64, g: f64) -> f64 {
-    tuning_value("MULTIKITE_ROLL_FEEDFORWARD_GAIN", ROLL_FEEDFORWARD_GAIN)
+fn orbit_roll_feedforward(
+    inertial_speed: f64,
+    orbit_radius: f64,
+    g: f64,
+    tuning: &ControllerTuning<f64>,
+) -> f64 {
+    tuning.roll_feedforward_gain
         * (inertial_speed * inertial_speed * orbit_curvature_y_reference(orbit_radius) / g).atan()
 }
 
-fn roll_curvature_gain_p() -> f64 {
-    tuning_value("MULTIKITE_ROLL_FROM_CURVATURE_P", ROLL_FROM_CURVATURE_P)
-}
-
-fn roll_curvature_gain_i() -> f64 {
-    tuning_value("MULTIKITE_ROLL_FROM_CURVATURE_I", ROLL_FROM_CURVATURE_I)
-}
-
-fn tethered_rudder_limit_rad() -> f64 {
-    tuning_value(
-        "MULTIKITE_TETHERED_RUDDER_LIMIT_DEG",
-        SURFACE_LIMIT_RUDDER_RAD.to_degrees(),
+fn scheduled_rabbit_distance(
+    speed_target: f64,
+    fallback_distance: f64,
+    tuning: &ControllerTuning<f64>,
+) -> f64 {
+    let scheduled = speed_target.max(0.0) * tuning.rabbit_speed_to_distance_s;
+    let default_distance = fallback_distance.max(1.0);
+    let min_distance = if tuning.rabbit_min_distance_m > 0.0 {
+        tuning.rabbit_min_distance_m
+    } else {
+        default_distance
+    };
+    let max_distance = if tuning.rabbit_max_distance_m > 0.0 {
+        tuning.rabbit_max_distance_m
+    } else {
+        default_distance
+    };
+    clamp(
+        scheduled,
+        min_distance.min(max_distance),
+        min_distance.max(max_distance),
     )
-    .to_radians()
-    .abs()
 }
 
 fn rate_limit(current: f64, target: f64, max_rate: f64, dt: f64) -> f64 {
     current + clamp(target - current, -max_rate * dt, max_rate * dt)
 }
 
-fn guidance_minimum_lookahead(rabbit_distance: f64) -> f64 {
-    GUIDANCE_MIN_LOOKAHEAD_FRACTION * rabbit_distance.max(1.0)
+fn guidance_minimum_lookahead(rabbit_distance: f64, tuning: &ControllerTuning<f64>) -> f64 {
+    tuning.guidance_min_lookahead_fraction * rabbit_distance.max(1.0)
 }
 
 fn pursuit_curvatures_from_body_vector(
     rabbit_vector_b: &Vector3<f64>,
     minimum_lookahead: f64,
+    tuning: &ControllerTuning<f64>,
 ) -> (f64, f64) {
     let lookahead = rabbit_vector_b[0].max(minimum_lookahead.max(1.0));
-    let lateral_limit = GUIDANCE_LATERAL_LOOKAHEAD_RATIO_LIMIT * lookahead;
+    let lateral_limit = tuning.guidance_lateral_lookahead_ratio_limit * lookahead;
     let lateral_y = clamp(rabbit_vector_b[1], -lateral_limit, lateral_limit);
     let lateral_z = clamp(rabbit_vector_b[2], -lateral_limit, lateral_limit);
     let denominator = lookahead * lookahead;
     (
         clamp(
             2.0 * lateral_y / denominator,
-            -GUIDANCE_CURVATURE_LIMIT,
-            GUIDANCE_CURVATURE_LIMIT,
+            -tuning.guidance_curvature_limit,
+            tuning.guidance_curvature_limit,
         ),
         clamp(
             2.0 * lateral_z / denominator,
-            -GUIDANCE_CURVATURE_LIMIT,
-            GUIDANCE_CURVATURE_LIMIT,
+            -tuning.guidance_curvature_limit,
+            tuning.guidance_curvature_limit,
         ),
     )
 }
 
-fn limit_motor_torque_for_rotor_speed(commanded_torque: f64, rotor_speed: f64) -> f64 {
-    if rotor_speed <= ROTOR_SPEED_SOFT_LIMIT_RADPS {
+fn direct_rabbit_bearing_y(rabbit_vector_b: &Vector3<f64>) -> f64 {
+    if rabbit_vector_b[0].hypot(rabbit_vector_b[1]) <= 1.0e-9 {
+        0.0
+    } else {
+        rabbit_vector_b[1].atan2(rabbit_vector_b[0])
+    }
+}
+
+fn direct_rabbit_roll_reference(
+    rabbit_vector_b: &Vector3<f64>,
+    control_state: &mut KiteControllerState,
+    dt_control: f64,
+    tuning: &ControllerTuning<f64>,
+) -> f64 {
+    let bearing_y = direct_rabbit_bearing_y(rabbit_vector_b);
+    let limit = tuning.roll_ref_limit_deg.to_radians().abs();
+    if tuning.rabbit_bearing_roll_i.abs() > 1.0e-9 {
+        control_state.rabbit_bearing_to_roll_integrator += bearing_y * dt_control;
+        let integrator_limit = limit / tuning.rabbit_bearing_roll_i.abs();
+        control_state.rabbit_bearing_to_roll_integrator = clamp(
+            control_state.rabbit_bearing_to_roll_integrator,
+            -integrator_limit,
+            integrator_limit,
+        );
+    } else {
+        control_state.rabbit_bearing_to_roll_integrator = 0.0;
+    }
+    clamp(
+        tuning.rabbit_bearing_roll_p * bearing_y
+            + tuning.rabbit_bearing_roll_i * control_state.rabbit_bearing_to_roll_integrator,
+        -limit,
+        limit,
+    )
+}
+
+fn guidance_mode(tuning: &ControllerTuning<f64>) -> u8 {
+    if !tuning.guidance_mode.is_finite() {
+        return GUIDANCE_MODE_RABBIT;
+    }
+    match tuning.guidance_mode.round() as i32 {
+        1 => GUIDANCE_MODE_CURVATURE,
+        2 => GUIDANCE_MODE_SWITCH,
+        _ => GUIDANCE_MODE_RABBIT,
+    }
+}
+
+fn lateral_guidance_curvatures(
+    rabbit_vector_b: &Vector3<f64>,
+    _orbit_radius: f64,
+    rabbit_distance: f64,
+    tuning: &ControllerTuning<f64>,
+) -> (f64, f64) {
+    let minimum_lookahead = guidance_minimum_lookahead(rabbit_distance, tuning);
+    let rabbit_curvature =
+        pursuit_curvatures_from_body_vector(rabbit_vector_b, minimum_lookahead, tuning);
+    match guidance_mode(tuning) {
+        GUIDANCE_MODE_CURVATURE => rabbit_curvature,
+        GUIDANCE_MODE_SWITCH => {
+            if rabbit_vector_b[0] >= minimum_lookahead.max(1.0) {
+                (0.0, 0.0)
+            } else {
+                rabbit_curvature
+            }
+        }
+        _ => (0.0, 0.0),
+    }
+}
+
+fn guidance_uses_direct_rabbit(
+    rabbit_vector_b: &Vector3<f64>,
+    rabbit_distance: f64,
+    tuning: &ControllerTuning<f64>,
+) -> bool {
+    match guidance_mode(tuning) {
+        GUIDANCE_MODE_CURVATURE => false,
+        GUIDANCE_MODE_SWITCH => {
+            rabbit_vector_b[0] >= guidance_minimum_lookahead(rabbit_distance, tuning).max(1.0)
+        }
+        _ => true,
+    }
+}
+
+fn limit_motor_torque_for_rotor_speed(
+    commanded_torque: f64,
+    rotor_speed: f64,
+    tuning: &ControllerTuning<f64>,
+) -> f64 {
+    if rotor_speed <= tuning.rotor_speed_soft_limit_radps {
         return commanded_torque;
     }
 
-    let fade = ((ROTOR_SPEED_HARD_LIMIT_RADPS - rotor_speed)
-        / (ROTOR_SPEED_HARD_LIMIT_RADPS - ROTOR_SPEED_SOFT_LIMIT_RADPS))
-        .clamp(0.0, 1.0);
-    commanded_torque.min(MOTOR_TORQUE_MAX_NM * fade).max(0.0)
+    let denominator = (tuning.rotor_speed_hard_limit_radps - tuning.rotor_speed_soft_limit_radps)
+        .abs()
+        .max(1.0e-9);
+    let fade = ((tuning.rotor_speed_hard_limit_radps - rotor_speed) / denominator).clamp(0.0, 1.0);
+    commanded_torque
+        .min(tuning.motor_torque_max_nm * fade)
+        .max(0.0)
 }
 
 pub fn controller_step<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
@@ -524,10 +565,35 @@ where
     };
     let max_throttle_altitude_pitch =
         longitudinal_mode == LongitudinalMode::MaxThrottleAltitudePitch;
+    let is_free_flight = N_COMMON == 0 && N_UPPER == 0;
+    let speed_targets: [f64; NK] = std::array::from_fn(|index| {
+        if is_free_flight {
+            free_flight_reference(
+                index,
+                time,
+                state.initial_altitude[index],
+                params.controller.speed_ref,
+            )
+            .speed_target
+        } else {
+            speed_integrator_target(
+                phase_errors[index],
+                params.controller.speed_ref,
+                &params.controller.tuning,
+            )
+        }
+    });
+    let rabbit_distances: [f64; NK] = std::array::from_fn(|index| {
+        scheduled_rabbit_distance(
+            speed_targets[index],
+            params.controller.rabbit_distance,
+            &params.controller.tuning,
+        )
+    });
 
     let rabbit_phases = std::array::from_fn(|index| {
         diag.kites[index].phase_angle
-            + params.controller.rabbit_distance / params.controller.disk_radius.max(1.0e-6)
+            + rabbit_distances[index] / params.controller.disk_radius.max(1.0e-6)
     });
     let rabbit_radii = std::array::from_fn(|index| {
         params.controller.disk_radius
@@ -536,18 +602,22 @@ where
                     * params.controller.phase_lag_to_radius)
     });
     let rabbit_targets_n = std::array::from_fn(|index| {
-        let kite_diag = &diag.kites[index];
         Vector3::new(
             params.controller.disk_center_n[0] + rabbit_radii[index] * rabbit_phases[index].cos(),
             params.controller.disk_center_n[1] + rabbit_radii[index] * rabbit_phases[index].sin(),
-            params.controller.disk_center_n[2]
-                - kite_diag.cad_velocity_n[2] * params.controller.vert_vel_to_rabbit_height,
+            params.controller.disk_center_n[2],
         )
     });
+    let tethered_altitude_ref_raw = |index: usize| {
+        -params.controller.disk_center_n[2]
+            + diag.kites[index].cad_velocity_n[2] * params.controller.vert_vel_to_rabbit_height
+            - params.kites[index].tether.contact.ground_altitude
+    };
 
     let controls = Controls {
         kites: std::array::from_fn(|index| {
             let kite_diag = &diag.kites[index];
+            let tuning = &params.controller.tuning;
             let free_reference = if N_COMMON == 0 && N_UPPER == 0 {
                 Some(free_flight_reference(
                     index,
@@ -566,15 +636,12 @@ where
             let omega_n =
                 rotate_body_to_nav(&plant_state.kites[index].body.quat_n2b, &kite_diag.omega_b);
             let tethered_lateral = N_COMMON != 0 || N_UPPER != 0;
-            let rudder_beta_p = if N_COMMON == 0 && N_UPPER == 0 {
-                0.0
-            } else {
-                RUDDER_BETA_P
-            };
-            let alpha_protection = if kite_diag.alpha > ALPHA_PROTECTION_MAX_RAD {
-                kite_diag.alpha - ALPHA_PROTECTION_MAX_RAD
-            } else if kite_diag.alpha < ALPHA_PROTECTION_MIN_RAD {
-                kite_diag.alpha - ALPHA_PROTECTION_MIN_RAD
+            let alpha_min = tuning.alpha_protection_min_deg.to_radians();
+            let alpha_max = tuning.alpha_protection_max_deg.to_radians();
+            let alpha_protection = if kite_diag.alpha > alpha_max {
+                kite_diag.alpha - alpha_max
+            } else if kite_diag.alpha < alpha_min {
+                kite_diag.alpha - alpha_min
             } else {
                 0.0
             };
@@ -587,108 +654,110 @@ where
                 omega_world_z_ref,
                 k_tg_y,
                 k_tg_z,
-                _rabbit_k_b_y,
             ) = if N_COMMON == 0 && N_UPPER == 0 {
                 let reference = free_reference.expect("free-flight reference");
                 (
-                    reference.speed_target,
+                    speed_targets[index],
                     reference.altitude_ref_raw,
                     reference.roll_ref,
                     0.0,
                     0.0,
                     0.0,
                     0.0,
-                    0.0,
                 )
             } else {
-                let speed_target =
-                    speed_integrator_target(phase_errors[index], params.controller.speed_ref);
-                let altitude_ref_raw = -rabbit_targets_n[index][2]
-                    - params.kites[index].tether.contact.ground_altitude;
-                let rabbit_from_center_n =
-                    sub(&rabbit_targets_n[index], &params.controller.disk_center_n);
-                if !control_state.rabbit_lag_initialized {
-                    control_state.rabbit_lag_n = rabbit_from_center_n;
-                    control_state.rabbit_lag2_n = rabbit_from_center_n;
+                let speed_target = speed_targets[index];
+                let altitude_ref_raw = tethered_altitude_ref_raw(index);
+                if !control_state.roll_ref_initialized {
                     control_state.roll_ref_command = roll_angle;
-                    control_state.rabbit_lag_initialized = true;
+                    control_state.roll_ref_initialized = true;
                 }
-                let rabbit_lag = clamp(dt_control / RABBIT_CURVATURE_LAG_S, 0.0, 1.0);
-                control_state.rabbit_lag_n = rabbit_from_center_n * rabbit_lag
-                    + control_state.rabbit_lag_n * (1.0 - rabbit_lag);
-                control_state.rabbit_lag2_n = rabbit_from_center_n * (0.5 * rabbit_lag)
-                    + control_state.rabbit_lag2_n * (1.0 - 0.5 * rabbit_lag);
-                let rc_y = (rabbit_from_center_n - control_state.rabbit_lag2_n)
-                    .norm()
-                    .max(1.0e-9);
-                let rc_vect = (rabbit_from_center_n + control_state.rabbit_lag2_n) * 0.5
-                    - control_state.rabbit_lag_n;
-                let rabbit_k_n = rc_vect * (rc_vect.norm() / rc_y);
-                let rabbit_k_b =
-                    rotate_nav_to_body(&plant_state.kites[index].body.quat_n2b, &rabbit_k_n);
                 let rabbit_vector_n = sub(&rabbit_targets_n[index], &kite_diag.cad_position_n);
                 let rabbit_vector_b =
                     rotate_nav_to_body(&plant_state.kites[index].body.quat_n2b, &rabbit_vector_n);
-                let (_pursuit_k_tg_y, k_tg_z) = pursuit_curvatures_from_body_vector(
-                    &rabbit_vector_b,
-                    guidance_minimum_lookahead(params.controller.rabbit_distance),
-                );
-                let k_tg_y = orbit_curvature_y_reference(rabbit_radii[index]);
-                let curvature_y_est = omega_n[2] / inertial_speed.max(1.0);
-                let gain_int_y = params.controller.gain_int_y.abs().max(1.0e-9);
-                let gain_int_z = params.controller.gain_int_z.abs().max(1.0e-9);
-                control_state.curvature_y_integrator = clamp(
-                    control_state.curvature_y_integrator
-                        + (kite_diag.curvature_y_b - k_tg_y) * dt_control
-                        - alpha_exceeded * 0.5,
-                    -TETHERED_CURVATURE_Y_INTEGRATOR_OUTPUT_LIMIT / gain_int_y,
-                    TETHERED_CURVATURE_Y_INTEGRATOR_OUTPUT_LIMIT / gain_int_y,
-                );
-                control_state.curvature_z_integrator = clamp(
-                    control_state.curvature_z_integrator
-                        + (kite_diag.curvature_z_b - k_tg_z) * dt_control
-                        - alpha_exceeded * 0.5,
-                    -TETHERED_CURVATURE_Z_INTEGRATOR_OUTPUT_LIMIT / gain_int_z,
-                    TETHERED_CURVATURE_Z_INTEGRATOR_OUTPUT_LIMIT / gain_int_z,
-                );
-                let roll_feedforward = orbit_roll_feedforward(
-                    inertial_speed,
-                    rabbit_radii[index],
-                    params.environment.g,
-                );
-                control_state.curvature_to_roll_integrator = clamp(
-                    control_state.curvature_to_roll_integrator
-                        + (k_tg_y - curvature_y_est) * dt_control,
-                    -ROLL_CURVATURE_INTEGRATOR_LIMIT,
-                    ROLL_CURVATURE_INTEGRATOR_LIMIT,
-                );
-                let roll_ref = clamp(
-                    roll_feedforward
-                        + roll_curvature_gain_p() * (k_tg_y - curvature_y_est)
-                        + roll_curvature_gain_i() * control_state.curvature_to_roll_integrator,
-                    -ROLL_REF_LIMIT_RAD,
-                    ROLL_REF_LIMIT_RAD,
-                );
+                let uses_direct_rabbit =
+                    guidance_uses_direct_rabbit(&rabbit_vector_b, rabbit_distances[index], tuning);
+                let (roll_ref, roll_feedforward, omega_world_z_ref, k_tg_y, k_tg_z) =
+                    if uses_direct_rabbit {
+                        (
+                            direct_rabbit_roll_reference(
+                                &rabbit_vector_b,
+                                control_state,
+                                dt_control,
+                                tuning,
+                            ),
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                        )
+                    } else {
+                        let (k_tg_y, k_tg_z) = lateral_guidance_curvatures(
+                            &rabbit_vector_b,
+                            rabbit_radii[index],
+                            rabbit_distances[index],
+                            tuning,
+                        );
+                        let curvature_y_est = omega_n[2] / inertial_speed.max(1.0);
+                        let gain_int_y = params.controller.gain_int_y.abs().max(1.0e-9);
+                        let gain_int_z = params.controller.gain_int_z.abs().max(1.0e-9);
+                        control_state.curvature_y_integrator = clamp(
+                            control_state.curvature_y_integrator
+                                + (kite_diag.curvature_y_b - k_tg_y) * dt_control
+                                - alpha_exceeded * 0.5,
+                            -TETHERED_CURVATURE_Y_INTEGRATOR_OUTPUT_LIMIT / gain_int_y,
+                            TETHERED_CURVATURE_Y_INTEGRATOR_OUTPUT_LIMIT / gain_int_y,
+                        );
+                        control_state.curvature_z_integrator = clamp(
+                            control_state.curvature_z_integrator
+                                + (kite_diag.curvature_z_b - k_tg_z) * dt_control
+                                - alpha_exceeded * 0.5,
+                            -TETHERED_CURVATURE_Z_INTEGRATOR_OUTPUT_LIMIT / gain_int_z,
+                            TETHERED_CURVATURE_Z_INTEGRATOR_OUTPUT_LIMIT / gain_int_z,
+                        );
+                        let roll_feedforward = orbit_roll_feedforward(
+                            inertial_speed,
+                            rabbit_radii[index],
+                            params.environment.g,
+                            tuning,
+                        );
+                        control_state.curvature_to_roll_integrator = clamp(
+                            control_state.curvature_to_roll_integrator
+                                + (k_tg_y - curvature_y_est) * dt_control,
+                            -tuning.roll_curvature_integrator_limit,
+                            tuning.roll_curvature_integrator_limit,
+                        );
+                        let roll_ref = clamp(
+                            roll_feedforward
+                                + tuning.roll_curvature_p * (k_tg_y - curvature_y_est)
+                                + tuning.roll_curvature_i
+                                    * control_state.curvature_to_roll_integrator,
+                            -tuning.roll_ref_limit_deg.to_radians(),
+                            tuning.roll_ref_limit_deg.to_radians(),
+                        );
+                        (
+                            roll_ref,
+                            roll_feedforward,
+                            inertial_speed * k_tg_y,
+                            k_tg_y,
+                            k_tg_z,
+                        )
+                    };
                 (
                     speed_target,
                     altitude_ref_raw,
                     roll_ref,
                     roll_feedforward,
-                    inertial_speed * k_tg_y,
+                    omega_world_z_ref,
                     k_tg_y,
                     k_tg_z,
-                    rabbit_k_b[1],
                 )
             };
             let roll_ref = if tethered_lateral {
                 control_state.roll_ref_command = rate_limit(
                     control_state.roll_ref_command,
                     raw_roll_ref,
-                    tuning_value(
-                        "MULTIKITE_TETHERED_ROLL_REF_RATE_LIMIT_DEGPS",
-                        TETHERED_ROLL_REF_RATE_LIMIT_RADPS.to_degrees(),
-                    )
-                    .to_radians(),
+                    tuning.tethered_roll_ref_rate_limit_degps.to_radians(),
                     dt_control,
                 );
                 control_state.roll_ref_command
@@ -702,11 +771,12 @@ where
                 params.kites[index].tether.contact.ground_altitude,
             );
             let pitch_ref_limit = if tethered_lateral {
-                TETHERED_PITCH_REF_LIMIT_RAD
+                tuning.tethered_pitch_ref_limit_deg.to_radians()
             } else {
-                FREE_FLIGHT_PITCH_REF_LIMIT_RAD
+                tuning.free_pitch_ref_limit_deg.to_radians()
             };
-            let motor_torque_max = MOTOR_TORQUE_MAX_NM;
+            let pitch_integrator_limit = tuning.tecs_pitch_integrator_limit_deg.to_radians();
+            let motor_torque_max = tuning.motor_torque_max_nm;
             let tecs = tecs_terms(
                 altitude,
                 altitude_ref_raw,
@@ -714,12 +784,13 @@ where
                 speed_target,
                 params.environment.g,
                 tethered_lateral,
+                tuning,
             );
             let pitch_ref = if max_throttle_altitude_pitch {
                 let altitude_error = clamp(
                     altitude_ref_raw - altitude,
-                    -TECS_ALTITUDE_ERROR_LIMIT_M,
-                    TECS_ALTITUDE_ERROR_LIMIT_M,
+                    -tuning.tecs_altitude_error_limit_m,
+                    tuning.tecs_altitude_error_limit_m,
                 );
                 saturated_pi(
                     &mut control_state.pitch_energy_integrator,
@@ -727,12 +798,12 @@ where
                     dt_control,
                     SaturatedPiConfig {
                         bias: 0.0,
-                        kp: ALTITUDE_PITCH_P,
-                        ki: ALTITUDE_PITCH_I,
+                        kp: tuning.altitude_pitch_p,
+                        ki: tuning.altitude_pitch_i,
                         output_min: -pitch_ref_limit,
                         output_max: pitch_ref_limit,
-                        integrator_min: -TECS_PITCH_INTEGRATOR_LIMIT_RAD,
-                        integrator_max: TECS_PITCH_INTEGRATOR_LIMIT_RAD,
+                        integrator_min: -pitch_integrator_limit,
+                        integrator_max: pitch_integrator_limit,
                     },
                 )
             } else {
@@ -742,18 +813,18 @@ where
                     dt_control,
                     SaturatedPiConfig {
                         bias: 0.0,
-                        kp: TECS_PITCH_BALANCE_P,
-                        ki: TECS_PITCH_BALANCE_I,
+                        kp: tuning.tecs_pitch_balance_p,
+                        ki: tuning.tecs_pitch_balance_i,
                         output_min: -pitch_ref_limit,
                         output_max: pitch_ref_limit,
-                        integrator_min: -TECS_PITCH_INTEGRATOR_LIMIT_RAD,
-                        integrator_max: TECS_PITCH_INTEGRATOR_LIMIT_RAD,
+                        integrator_min: -pitch_integrator_limit,
+                        integrator_max: pitch_integrator_limit,
                     },
                 )
             };
             let thrust_energy_error = if tethered_lateral {
                 tecs.kinetic_energy_error
-                    + TETHERED_THRUST_POSITIVE_POTENTIAL_BLEND
+                    + tuning.tethered_thrust_positive_potential_blend
                         * tecs.potential_energy_error.max(0.0)
             } else {
                 tecs.kinetic_energy_error
@@ -768,67 +839,51 @@ where
                     dt_control,
                     SaturatedPiConfig {
                         bias: params.controller.trim.motor_torque,
-                        kp: TECS_THRUST_KINETIC_P,
-                        ki: TECS_THRUST_KINETIC_I,
+                        kp: tuning.tecs_thrust_kinetic_p,
+                        ki: tuning.tecs_thrust_kinetic_i,
                         output_min: 0.0,
                         output_max: motor_torque_max,
-                        integrator_min: -TECS_THRUST_INTEGRATOR_LIMIT_NM,
-                        integrator_max: TECS_THRUST_INTEGRATOR_LIMIT_NM,
+                        integrator_min: -tuning.tecs_thrust_integrator_limit_nm,
+                        integrator_max: tuning.tecs_thrust_integrator_limit_nm,
                     },
                 )
             };
             let motor_torque = limit_motor_torque_for_rotor_speed(
                 commanded_motor_torque,
                 plant_state.kites[index].rotor_speed,
+                tuning,
             );
             if max_throttle_altitude_pitch {
                 control_state.thrust_energy_integrator = motor_torque;
             }
-            let (aileron, rudder) = if tethered_lateral {
-                (
-                    tethered_aileron_command(
-                        params.controller.trim.surfaces.aileron,
-                        roll_ref,
-                        roll_angle,
-                        kite_diag.omega_b[0],
-                    ),
-                    tethered_rudder_command(
-                        params.controller.trim.surfaces.rudder,
-                        kite_diag.beta,
-                        kite_diag.omega_b[2],
-                        omega_n[2],
-                        omega_world_z_ref,
-                    ),
-                )
-            } else {
-                (
-                    clamp(
-                        params.controller.trim.surfaces.aileron
-                            - AILERON_ROLL_P * wrap_angle(roll_ref - roll_angle)
-                            + AILERON_ROLL_D * kite_diag.omega_b[0],
-                        -SURFACE_LIMIT_AILERON_RAD,
-                        SURFACE_LIMIT_AILERON_RAD,
-                    ),
-                    clamp(
-                        params.controller.trim.surfaces.rudder - rudder_beta_p * kite_diag.beta
-                            + RUDDER_OMEGA_WORLD_Z_P * (omega_n[2] - omega_world_z_ref),
-                        -SURFACE_LIMIT_RUDDER_RAD,
-                        SURFACE_LIMIT_RUDDER_RAD,
-                    ),
-                )
-            };
+            let aileron = tethered_aileron_command(
+                params.controller.trim.surfaces.aileron,
+                roll_ref,
+                roll_angle,
+                kite_diag.omega_b[0],
+                tuning,
+            );
+            let rudder = tethered_rudder_command(
+                params.controller.trim.surfaces.rudder,
+                kite_diag.beta,
+                kite_diag.omega_b[2],
+                omega_n[2],
+                omega_world_z_ref,
+                tuning,
+            );
 
+            let elevator_limit = tuning.surface_limit_elevator_deg.to_radians().abs();
             let surfaces = ControlSurfaces {
                 aileron,
                 flap: params.controller.trim.surfaces.flap,
                 winglet: params.controller.trim.surfaces.winglet,
                 elevator: clamp(
                     params.controller.trim.surfaces.elevator
-                        - ELEVATOR_PITCH_P * (pitch_ref - pitch_angle)
-                        + ELEVATOR_PITCH_D * kite_diag.omega_b[1]
-                        + ALPHA_TO_ELEVATOR * alpha_protection,
-                    -SURFACE_LIMIT_ELEVATOR_RAD,
-                    SURFACE_LIMIT_ELEVATOR_RAD,
+                        - tuning.elevator_pitch_p * (pitch_ref - pitch_angle)
+                        + tuning.elevator_pitch_d * kite_diag.omega_b[1]
+                        + tuning.alpha_to_elevator * alpha_protection,
+                    -elevator_limit,
+                    elevator_limit,
                 ),
                 rudder,
             };
@@ -842,7 +897,6 @@ where
         }),
     };
 
-    let is_free_flight = N_COMMON == 0 && N_UPPER == 0;
     let free_reference_for = |index: usize| {
         free_flight_reference(
             index,
@@ -851,18 +905,12 @@ where
             params.controller.speed_ref,
         )
     };
-    let speed_target_for = |index: usize| {
-        if is_free_flight {
-            free_reference_for(index).speed_target
-        } else {
-            speed_integrator_target(phase_errors[index], params.controller.speed_ref)
-        }
-    };
+    let speed_target_for = |index: usize| speed_targets[index];
     let altitude_ref_raw_for = |index: usize| {
         if is_free_flight {
             free_reference_for(index).altitude_ref_raw
         } else {
-            -rabbit_targets_n[index][2] - params.kites[index].tether.contact.ground_altitude
+            tethered_altitude_ref_raw(index)
         }
     };
 
@@ -891,6 +939,7 @@ where
                     speed_target,
                     params.environment.g,
                     !is_free_flight,
+                    &params.controller.tuning,
                 )
                 .altitude_ref
             }),
@@ -908,6 +957,7 @@ where
                     speed_target,
                     params.environment.g,
                     !is_free_flight,
+                    &params.controller.tuning,
                 )
                 .kinetic_energy
             }),
@@ -929,6 +979,7 @@ where
                     speed_target,
                     params.environment.g,
                     !is_free_flight,
+                    &params.controller.tuning,
                 )
                 .kinetic_energy_error
             }),
@@ -953,6 +1004,7 @@ where
                     speed_target,
                     params.environment.g,
                     !is_free_flight,
+                    &params.controller.tuning,
                 )
                 .potential_energy_ref
             }),
@@ -970,6 +1022,7 @@ where
                     speed_target,
                     params.environment.g,
                     !is_free_flight,
+                    &params.controller.tuning,
                 )
                 .potential_energy_error
             }),
@@ -987,6 +1040,7 @@ where
                     speed_target,
                     params.environment.g,
                     !is_free_flight,
+                    &params.controller.tuning,
                 )
                 .total_energy_error
             }),
@@ -1004,6 +1058,7 @@ where
                     speed_target,
                     params.environment.g,
                     !is_free_flight,
+                    &params.controller.tuning,
                 )
                 .energy_balance_error
             }),
@@ -1020,7 +1075,19 @@ where
                 if N_COMMON == 0 && N_UPPER == 0 {
                     0.0
                 } else {
-                    orbit_curvature_y_reference(rabbit_radii[index])
+                    let kite_diag = &diag.kites[index];
+                    let rabbit_vector_n = sub(&rabbit_targets_n[index], &kite_diag.cad_position_n);
+                    let rabbit_vector_b = rotate_nav_to_body(
+                        &plant_state.kites[index].body.quat_n2b,
+                        &rabbit_vector_n,
+                    );
+                    lateral_guidance_curvatures(
+                        &rabbit_vector_b,
+                        rabbit_radii[index],
+                        rabbit_distances[index],
+                        &params.controller.tuning,
+                    )
+                    .0
                 }
             }),
             curvature_y_estimates: std::array::from_fn(|index| {
@@ -1034,8 +1101,18 @@ where
                     0.0
                 } else {
                     let kite_diag = &diag.kites[index];
-                    kite_diag.cad_velocity_n.norm()
-                        * orbit_curvature_y_reference(rabbit_radii[index])
+                    let rabbit_vector_n = sub(&rabbit_targets_n[index], &kite_diag.cad_position_n);
+                    let rabbit_vector_b = rotate_nav_to_body(
+                        &plant_state.kites[index].body.quat_n2b,
+                        &rabbit_vector_n,
+                    );
+                    let (k_tg_y, _) = lateral_guidance_curvatures(
+                        &rabbit_vector_b,
+                        rabbit_radii[index],
+                        rabbit_distances[index],
+                        &params.controller.tuning,
+                    );
+                    kite_diag.cad_velocity_n.norm() * k_tg_y
                 }
             }),
             omega_world_z: std::array::from_fn(|index| {
@@ -1057,12 +1134,26 @@ where
                     0.0
                 } else {
                     let kite_diag = &diag.kites[index];
-                    let inertial_speed = kite_diag.cad_velocity_n.norm().max(1.0);
-                    orbit_roll_feedforward(
-                        inertial_speed,
-                        rabbit_radii[index],
-                        params.environment.g,
-                    )
+                    let rabbit_vector_n = sub(&rabbit_targets_n[index], &kite_diag.cad_position_n);
+                    let rabbit_vector_b = rotate_nav_to_body(
+                        &plant_state.kites[index].body.quat_n2b,
+                        &rabbit_vector_n,
+                    );
+                    if guidance_uses_direct_rabbit(
+                        &rabbit_vector_b,
+                        rabbit_distances[index],
+                        &params.controller.tuning,
+                    ) {
+                        0.0
+                    } else {
+                        let inertial_speed = kite_diag.cad_velocity_n.norm().max(1.0);
+                        orbit_roll_feedforward(
+                            inertial_speed,
+                            rabbit_radii[index],
+                            params.environment.g,
+                            &params.controller.tuning,
+                        )
+                    }
                 }
             }),
             pitch_refs: std::array::from_fn(|index| {
@@ -1079,27 +1170,36 @@ where
                     speed_target,
                     params.environment.g,
                     !is_free_flight,
+                    &params.controller.tuning,
                 );
                 let pitch_ref_limit = if is_free_flight {
-                    FREE_FLIGHT_PITCH_REF_LIMIT_RAD
+                    params
+                        .controller
+                        .tuning
+                        .free_pitch_ref_limit_deg
+                        .to_radians()
                 } else {
-                    TETHERED_PITCH_REF_LIMIT_RAD
+                    params
+                        .controller
+                        .tuning
+                        .tethered_pitch_ref_limit_deg
+                        .to_radians()
                 };
                 if max_throttle_altitude_pitch {
                     let altitude_error = clamp(
                         altitude_ref_raw - altitude,
-                        -TECS_ALTITUDE_ERROR_LIMIT_M,
-                        TECS_ALTITUDE_ERROR_LIMIT_M,
+                        -params.controller.tuning.tecs_altitude_error_limit_m,
+                        params.controller.tuning.tecs_altitude_error_limit_m,
                     );
                     clamp(
-                        ALTITUDE_PITCH_P * altitude_error
+                        params.controller.tuning.altitude_pitch_p * altitude_error
                             + state.kites[index].pitch_energy_integrator,
                         -pitch_ref_limit,
                         pitch_ref_limit,
                     )
                 } else {
                     clamp(
-                        TECS_PITCH_BALANCE_P * tecs.energy_balance_error
+                        params.controller.tuning.tecs_pitch_balance_p * tecs.energy_balance_error
                             + state.kites[index].pitch_energy_integrator,
                         -pitch_ref_limit,
                         pitch_ref_limit,
@@ -1116,9 +1216,11 @@ where
                         &plant_state.kites[index].body.quat_n2b,
                         &rabbit_vector_n,
                     );
-                    pursuit_curvatures_from_body_vector(
+                    lateral_guidance_curvatures(
                         &rabbit_vector_b,
-                        guidance_minimum_lookahead(params.controller.rabbit_distance),
+                        rabbit_radii[index],
+                        rabbit_distances[index],
+                        &params.controller.tuning,
                     )
                     .1
                 }
@@ -1173,55 +1275,107 @@ mod tests {
 
     #[test]
     fn tethered_rudder_feedback_damps_beta_and_body_z_rate() {
+        let tuning = ControllerTuning::default();
         let beta_error = 5.0_f64.to_radians();
-        assert!(tethered_rudder_command(0.0, beta_error, 0.0, 0.0, 0.0) < 0.0);
-        assert!(tethered_rudder_command(0.0, -beta_error, 0.0, 0.0, 0.0) > 0.0);
-        assert!(tethered_rudder_command(0.0, 0.0, 0.5, 0.0, 0.0) > 0.0);
-        assert!(tethered_rudder_command(0.0, 0.0, -0.5, 0.0, 0.0) < 0.0);
+        assert!(tethered_rudder_command(0.0, beta_error, 0.0, 0.0, 0.0, &tuning) < 0.0);
+        assert!(tethered_rudder_command(0.0, -beta_error, 0.0, 0.0, 0.0, &tuning) > 0.0);
+        assert!(tethered_rudder_command(0.0, 0.0, 0.5, 0.0, 0.0, &tuning) > 0.0);
+        assert!(tethered_rudder_command(0.0, 0.0, -0.5, 0.0, 0.0, &tuning) < 0.0);
     }
 
     #[test]
     fn tethered_aileron_feedback_closes_roll_error_and_damps_roll_rate() {
+        let tuning = ControllerTuning::default();
         let roll_error = 5.0_f64.to_radians();
-        assert!(tethered_aileron_command(0.0, roll_error, 0.0, 0.0) < 0.0);
-        assert!(tethered_aileron_command(0.0, -roll_error, 0.0, 0.0) > 0.0);
-        assert!(tethered_aileron_command(0.0, 0.0, 0.0, 0.5) > 0.0);
-        assert!(tethered_aileron_command(0.0, 0.0, 0.0, -0.5) < 0.0);
+        assert!(tethered_aileron_command(0.0, roll_error, 0.0, 0.0, &tuning) < 0.0);
+        assert!(tethered_aileron_command(0.0, -roll_error, 0.0, 0.0, &tuning) > 0.0);
+        assert!(tethered_aileron_command(0.0, 0.0, 0.0, 0.5, &tuning) > 0.0);
+        assert!(tethered_aileron_command(0.0, 0.0, 0.0, -0.5, &tuning) < 0.0);
+    }
+
+    #[test]
+    fn guidance_mode_selects_direct_rabbit_or_curvature_conversion() {
+        let mut tuning = ControllerTuning::default();
+        let rabbit_vector_b = Vector3::new(40.0, 10.0, -5.0);
+
+        tuning.guidance_mode = GUIDANCE_MODE_RABBIT as f64;
+        let rabbit = lateral_guidance_curvatures(&rabbit_vector_b, 120.0, 40.0, &tuning);
+        assert_eq!(rabbit, (0.0, 0.0));
+        assert!(direct_rabbit_bearing_y(&rabbit_vector_b) > 0.0);
+
+        tuning.guidance_mode = GUIDANCE_MODE_CURVATURE as f64;
+        let curvature = lateral_guidance_curvatures(&rabbit_vector_b, 120.0, 40.0, &tuning);
+        assert!((curvature.0 - 0.0125).abs() < 1.0e-12);
+        assert!((curvature.1 + 0.00625).abs() < 1.0e-12);
+
+        tuning.guidance_mode = GUIDANCE_MODE_SWITCH as f64;
+        let ahead = lateral_guidance_curvatures(&rabbit_vector_b, 120.0, 40.0, &tuning);
+        assert_eq!(ahead, (0.0, 0.0));
+        let behind =
+            lateral_guidance_curvatures(&Vector3::new(-2.0, 10.0, 0.0), 120.0, 40.0, &tuning);
+        assert!(behind.0 > 0.0);
+        assert!(behind.0 <= tuning.guidance_curvature_limit);
+    }
+
+    #[test]
+    fn rabbit_distance_is_scheduled_from_speed_with_bounds() {
+        let tuning = ControllerTuning::default();
+        assert!((scheduled_rabbit_distance(25.0, 90.0, &tuning) - 90.0).abs() < 1.0e-12);
+        assert_eq!(
+            scheduled_rabbit_distance(1.0, 90.0, &tuning),
+            tuning.rabbit_min_distance_m
+        );
+        assert_eq!(
+            scheduled_rabbit_distance(100.0, 90.0, &tuning),
+            tuning.rabbit_max_distance_m
+        );
     }
 
     #[test]
     fn positive_phase_error_schedules_higher_speed() {
+        let tuning = ControllerTuning::default();
         let speed_ref = 25.0;
         let phase_error = 0.1;
-        assert!(speed_integrator_target(phase_error, speed_ref) > speed_ref);
-        assert!(speed_integrator_target(-phase_error, speed_ref) < speed_ref);
+        assert!(speed_integrator_target(phase_error, speed_ref, &tuning) > speed_ref);
+        assert!(speed_integrator_target(-phase_error, speed_ref, &tuning) < speed_ref);
     }
 
     #[test]
     fn rotor_speed_limiter_fades_torque_above_fit_range() {
-        let commanded = MOTOR_TORQUE_MAX_NM;
+        let tuning = ControllerTuning::default();
+        let commanded = tuning.motor_torque_max_nm;
         assert_eq!(
-            limit_motor_torque_for_rotor_speed(commanded, ROTOR_SPEED_SOFT_LIMIT_RADPS - 1.0),
+            limit_motor_torque_for_rotor_speed(
+                commanded,
+                tuning.rotor_speed_soft_limit_radps - 1.0,
+                &tuning
+            ),
             commanded
         );
         assert!(
-            limit_motor_torque_for_rotor_speed(commanded, 850.0) < commanded,
+            limit_motor_torque_for_rotor_speed(commanded, 850.0, &tuning) < commanded,
             "torque should fade inside the overspeed band"
         );
         assert_eq!(
-            limit_motor_torque_for_rotor_speed(commanded, ROTOR_SPEED_HARD_LIMIT_RADPS + 1.0),
+            limit_motor_torque_for_rotor_speed(
+                commanded,
+                tuning.rotor_speed_hard_limit_radps + 1.0,
+                &tuning
+            ),
             0.0
         );
     }
 
     #[test]
     fn tethered_tecs_clamps_potential_and_weights_kinetic_deficit() {
-        let tethered = tecs_terms(100.0, 200.0, 10.0, 20.0, 9.81, true);
+        let tuning = ControllerTuning::default();
+        let tethered = tecs_terms(100.0, 200.0, 10.0, 20.0, 9.81, true, &tuning);
         assert!(
-            (tethered.potential_energy_error - TETHERED_TECS_POTENTIAL_ERROR_LIMIT).abs() < 1.0e-9
+            (tethered.potential_energy_error - tuning.tethered_tecs_potential_error_limit).abs()
+                < 1.0e-9
         );
 
-        let free = tecs_terms(100.0, 200.0, 10.0, 20.0, 9.81, false);
+        let free = tecs_terms(100.0, 200.0, 10.0, 20.0, 9.81, false, &tuning);
         assert!(free.potential_energy_error > tethered.potential_energy_error);
         assert!(tethered.energy_balance_error < free.energy_balance_error);
     }

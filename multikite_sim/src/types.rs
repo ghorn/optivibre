@@ -22,6 +22,47 @@ impl Default for LongitudinalMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DrydenConfig {
+    pub seed: u64,
+    pub intensity_scale: f64,
+    pub length_scale: f64,
+    pub altitude_intensity_enabled: bool,
+    pub altitude_length_scale_enabled: bool,
+}
+
+impl Default for DrydenConfig {
+    fn default() -> Self {
+        Self {
+            seed: 0xD15E_A5E0_u64,
+            intensity_scale: 1.0,
+            length_scale: 1.0,
+            altitude_intensity_enabled: true,
+            altitude_length_scale_enabled: true,
+        }
+    }
+}
+
+impl DrydenConfig {
+    pub fn finite_or_default(self, default: &Self) -> Self {
+        Self {
+            seed: self.seed,
+            intensity_scale: if self.intensity_scale.is_finite() && self.intensity_scale >= 0.0 {
+                self.intensity_scale
+            } else {
+                default.intensity_scale
+            },
+            length_scale: if self.length_scale.is_finite() && self.length_scale > 0.0 {
+                self.length_scale
+            } else {
+                default.length_scale
+            },
+            altitude_intensity_enabled: self.altitude_intensity_enabled,
+            altitude_length_scale_enabled: self.altitude_length_scale_enabled,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Preset {
@@ -45,23 +86,28 @@ pub struct SimulationConfig {
     pub phase_mode: PhaseMode,
     pub sample_stride: usize,
     pub sim_noise_enabled: bool,
+    #[serde(default)]
+    pub dryden: DrydenConfig,
     pub bridle_enabled: bool,
     pub longitudinal_mode: LongitudinalMode,
+    pub controller_tuning: ControllerTuning<f64>,
 }
 
 impl Default for SimulationConfig {
     fn default() -> Self {
         Self {
-            duration: 10.0,
-            dt_control: 0.02,
-            rk_abs_tol: 1.0e-4,
-            rk_rel_tol: 1.0e-4,
-            max_substeps: 4096,
+            duration: 30.0,
+            dt_control: 0.01,
+            rk_abs_tol: 1.0e-6,
+            rk_rel_tol: 1.0e-6,
+            max_substeps: 1000,
             phase_mode: PhaseMode::Adaptive,
             sample_stride: 1,
             sim_noise_enabled: false,
+            dryden: DrydenConfig::default(),
             bridle_enabled: true,
             longitudinal_mode: LongitudinalMode::TotalEnergy,
+            controller_tuning: ControllerTuning::default(),
         }
     }
 }
@@ -152,6 +198,7 @@ pub struct BodyState<T> {
 pub struct KiteState<T, const N_UPPER: usize> {
     pub body: BodyState<T>,
     pub rotor_speed: T,
+    pub actuators: KiteControls<T>,
     pub tether: [TetherNode<T>; N_UPPER],
 }
 
@@ -274,6 +321,336 @@ pub struct Environment<T> {
     pub wind_n: Vector3<T>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Vectorize)]
+pub struct ControllerTuning<T> {
+    pub speed_phase_gain: T,
+    pub speed_min_mps: T,
+    pub speed_max_mps: T,
+    pub rabbit_speed_to_distance_s: T,
+    pub rabbit_min_distance_m: T,
+    pub rabbit_max_distance_m: T,
+    pub roll_feedforward_gain: T,
+    pub rabbit_bearing_roll_p: T,
+    pub rabbit_bearing_roll_i: T,
+    pub roll_curvature_p: T,
+    pub roll_curvature_i: T,
+    pub roll_curvature_integrator_limit: T,
+    pub roll_ref_limit_deg: T,
+    #[serde(default)]
+    pub guidance_mode: T,
+    pub tethered_roll_ref_rate_limit_degps: T,
+    pub free_aileron_roll_p: T,
+    pub free_aileron_roll_d: T,
+    pub tethered_aileron_roll_p: T,
+    pub tethered_aileron_roll_d: T,
+    pub free_rudder_beta_p: T,
+    pub free_rudder_world_z_p: T,
+    pub tethered_rudder_beta_p: T,
+    pub tethered_rudder_rate_d: T,
+    pub tethered_rudder_world_z_p: T,
+    pub tethered_rudder_trim_offset_deg: T,
+    pub guidance_min_lookahead_fraction: T,
+    pub guidance_lateral_lookahead_ratio_limit: T,
+    pub guidance_curvature_limit: T,
+    pub free_pitch_ref_limit_deg: T,
+    pub tethered_pitch_ref_limit_deg: T,
+    pub elevator_pitch_p: T,
+    pub elevator_pitch_d: T,
+    pub altitude_pitch_p: T,
+    pub altitude_pitch_i: T,
+    pub tecs_altitude_error_limit_m: T,
+    pub tecs_thrust_kinetic_p: T,
+    pub tecs_thrust_kinetic_i: T,
+    pub tecs_thrust_integrator_limit_nm: T,
+    pub tethered_thrust_positive_potential_blend: T,
+    pub tethered_tecs_potential_error_limit: T,
+    pub tethered_tecs_potential_balance_weight: T,
+    pub tethered_tecs_kinetic_deficit_balance_weight: T,
+    pub tethered_tecs_kinetic_surplus_balance_weight: T,
+    pub tecs_pitch_balance_p: T,
+    pub tecs_pitch_balance_i: T,
+    pub tecs_pitch_integrator_limit_deg: T,
+    pub alpha_protection_min_deg: T,
+    pub alpha_protection_max_deg: T,
+    pub alpha_to_elevator: T,
+    pub surface_limit_aileron_deg: T,
+    pub surface_limit_rudder_deg: T,
+    pub surface_limit_elevator_deg: T,
+    pub motor_torque_max_nm: T,
+    pub actuator_surface_tau_s: T,
+    pub actuator_motor_tau_s: T,
+    pub rotor_speed_soft_limit_radps: T,
+    pub rotor_speed_hard_limit_radps: T,
+}
+
+impl Default for ControllerTuning<f64> {
+    fn default() -> Self {
+        Self {
+            speed_phase_gain: 10.0,
+            speed_min_mps: 18.0,
+            speed_max_mps: 35.0,
+            rabbit_speed_to_distance_s: 3.6,
+            rabbit_min_distance_m: 35.0,
+            rabbit_max_distance_m: 140.0,
+            roll_feedforward_gain: 1.0,
+            rabbit_bearing_roll_p: 1.0,
+            rabbit_bearing_roll_i: 0.2,
+            roll_curvature_p: 18.0,
+            roll_curvature_i: 2.0,
+            roll_curvature_integrator_limit: 0.04,
+            roll_ref_limit_deg: 35.0,
+            guidance_mode: 0.0,
+            tethered_roll_ref_rate_limit_degps: 90.0,
+            free_aileron_roll_p: 3.5,
+            free_aileron_roll_d: 0.35,
+            tethered_aileron_roll_p: 3.5,
+            tethered_aileron_roll_d: 0.35,
+            free_rudder_beta_p: 1.8,
+            free_rudder_world_z_p: 0.0,
+            tethered_rudder_beta_p: 1.8,
+            tethered_rudder_rate_d: 0.35,
+            tethered_rudder_world_z_p: 0.0,
+            tethered_rudder_trim_offset_deg: 0.0,
+            guidance_min_lookahead_fraction: 0.25,
+            guidance_lateral_lookahead_ratio_limit: 0.75,
+            guidance_curvature_limit: 0.04,
+            free_pitch_ref_limit_deg: 14.0,
+            tethered_pitch_ref_limit_deg: 14.0,
+            elevator_pitch_p: 0.85,
+            elevator_pitch_d: 0.25,
+            altitude_pitch_p: 0.01,
+            altitude_pitch_i: 0.001,
+            tecs_altitude_error_limit_m: 25.0,
+            tecs_thrust_kinetic_p: 0.3,
+            tecs_thrust_kinetic_i: 0.06,
+            tecs_thrust_integrator_limit_nm: 8.0,
+            tethered_thrust_positive_potential_blend: 0.02,
+            tethered_tecs_potential_error_limit: 245.0,
+            tethered_tecs_potential_balance_weight: 0.9,
+            tethered_tecs_kinetic_deficit_balance_weight: 1.1,
+            tethered_tecs_kinetic_surplus_balance_weight: 1.0,
+            tecs_pitch_balance_p: 0.0012,
+            tecs_pitch_balance_i: 0.00035,
+            tecs_pitch_integrator_limit_deg: 14.0,
+            alpha_protection_min_deg: -8.0,
+            alpha_protection_max_deg: 10.0,
+            alpha_to_elevator: 20.0,
+            surface_limit_aileron_deg: 28.64788975654116,
+            surface_limit_rudder_deg: 25.0,
+            surface_limit_elevator_deg: 17.188733853924695,
+            motor_torque_max_nm: 45.6,
+            actuator_surface_tau_s: 0.04,
+            actuator_motor_tau_s: 0.08,
+            rotor_speed_soft_limit_radps: 800.0,
+            rotor_speed_hard_limit_radps: 900.0,
+        }
+    }
+}
+
+impl ControllerTuning<f64> {
+    pub fn finite_or_default(self, default: &Self) -> Self {
+        fn finite(value: f64, default: f64) -> f64 {
+            if value.is_finite() { value } else { default }
+        }
+
+        Self {
+            speed_phase_gain: finite(self.speed_phase_gain, default.speed_phase_gain),
+            speed_min_mps: finite(self.speed_min_mps, default.speed_min_mps),
+            speed_max_mps: finite(self.speed_max_mps, default.speed_max_mps),
+            rabbit_speed_to_distance_s: finite(
+                self.rabbit_speed_to_distance_s,
+                default.rabbit_speed_to_distance_s,
+            )
+            .max(0.0),
+            rabbit_min_distance_m: finite(
+                self.rabbit_min_distance_m,
+                default.rabbit_min_distance_m,
+            )
+            .max(0.0),
+            rabbit_max_distance_m: finite(
+                self.rabbit_max_distance_m,
+                default.rabbit_max_distance_m,
+            )
+            .max(0.0),
+            roll_feedforward_gain: finite(
+                self.roll_feedforward_gain,
+                default.roll_feedforward_gain,
+            ),
+            rabbit_bearing_roll_p: finite(
+                self.rabbit_bearing_roll_p,
+                default.rabbit_bearing_roll_p,
+            ),
+            rabbit_bearing_roll_i: finite(
+                self.rabbit_bearing_roll_i,
+                default.rabbit_bearing_roll_i,
+            ),
+            roll_curvature_p: finite(self.roll_curvature_p, default.roll_curvature_p),
+            roll_curvature_i: finite(self.roll_curvature_i, default.roll_curvature_i),
+            roll_curvature_integrator_limit: finite(
+                self.roll_curvature_integrator_limit,
+                default.roll_curvature_integrator_limit,
+            )
+            .abs(),
+            roll_ref_limit_deg: finite(self.roll_ref_limit_deg, default.roll_ref_limit_deg).abs(),
+            guidance_mode: finite(self.guidance_mode, default.guidance_mode).clamp(0.0, 2.0),
+            tethered_roll_ref_rate_limit_degps: finite(
+                self.tethered_roll_ref_rate_limit_degps,
+                default.tethered_roll_ref_rate_limit_degps,
+            )
+            .abs(),
+            free_aileron_roll_p: finite(self.free_aileron_roll_p, default.free_aileron_roll_p),
+            free_aileron_roll_d: finite(self.free_aileron_roll_d, default.free_aileron_roll_d),
+            tethered_aileron_roll_p: finite(
+                self.tethered_aileron_roll_p,
+                default.tethered_aileron_roll_p,
+            ),
+            tethered_aileron_roll_d: finite(
+                self.tethered_aileron_roll_d,
+                default.tethered_aileron_roll_d,
+            ),
+            free_rudder_beta_p: finite(self.free_rudder_beta_p, default.free_rudder_beta_p),
+            free_rudder_world_z_p: finite(
+                self.free_rudder_world_z_p,
+                default.free_rudder_world_z_p,
+            ),
+            tethered_rudder_beta_p: finite(
+                self.tethered_rudder_beta_p,
+                default.tethered_rudder_beta_p,
+            ),
+            tethered_rudder_rate_d: finite(
+                self.tethered_rudder_rate_d,
+                default.tethered_rudder_rate_d,
+            ),
+            tethered_rudder_world_z_p: finite(
+                self.tethered_rudder_world_z_p,
+                default.tethered_rudder_world_z_p,
+            ),
+            tethered_rudder_trim_offset_deg: finite(
+                self.tethered_rudder_trim_offset_deg,
+                default.tethered_rudder_trim_offset_deg,
+            ),
+            guidance_min_lookahead_fraction: finite(
+                self.guidance_min_lookahead_fraction,
+                default.guidance_min_lookahead_fraction,
+            )
+            .max(0.0),
+            guidance_lateral_lookahead_ratio_limit: finite(
+                self.guidance_lateral_lookahead_ratio_limit,
+                default.guidance_lateral_lookahead_ratio_limit,
+            )
+            .abs(),
+            guidance_curvature_limit: finite(
+                self.guidance_curvature_limit,
+                default.guidance_curvature_limit,
+            )
+            .abs(),
+            free_pitch_ref_limit_deg: finite(
+                self.free_pitch_ref_limit_deg,
+                default.free_pitch_ref_limit_deg,
+            )
+            .abs(),
+            tethered_pitch_ref_limit_deg: finite(
+                self.tethered_pitch_ref_limit_deg,
+                default.tethered_pitch_ref_limit_deg,
+            )
+            .abs(),
+            elevator_pitch_p: finite(self.elevator_pitch_p, default.elevator_pitch_p),
+            elevator_pitch_d: finite(self.elevator_pitch_d, default.elevator_pitch_d),
+            altitude_pitch_p: finite(self.altitude_pitch_p, default.altitude_pitch_p),
+            altitude_pitch_i: finite(self.altitude_pitch_i, default.altitude_pitch_i),
+            tecs_altitude_error_limit_m: finite(
+                self.tecs_altitude_error_limit_m,
+                default.tecs_altitude_error_limit_m,
+            )
+            .abs(),
+            tecs_thrust_kinetic_p: finite(
+                self.tecs_thrust_kinetic_p,
+                default.tecs_thrust_kinetic_p,
+            ),
+            tecs_thrust_kinetic_i: finite(
+                self.tecs_thrust_kinetic_i,
+                default.tecs_thrust_kinetic_i,
+            ),
+            tecs_thrust_integrator_limit_nm: finite(
+                self.tecs_thrust_integrator_limit_nm,
+                default.tecs_thrust_integrator_limit_nm,
+            )
+            .abs(),
+            tethered_thrust_positive_potential_blend: finite(
+                self.tethered_thrust_positive_potential_blend,
+                default.tethered_thrust_positive_potential_blend,
+            ),
+            tethered_tecs_potential_error_limit: finite(
+                self.tethered_tecs_potential_error_limit,
+                default.tethered_tecs_potential_error_limit,
+            )
+            .abs(),
+            tethered_tecs_potential_balance_weight: finite(
+                self.tethered_tecs_potential_balance_weight,
+                default.tethered_tecs_potential_balance_weight,
+            ),
+            tethered_tecs_kinetic_deficit_balance_weight: finite(
+                self.tethered_tecs_kinetic_deficit_balance_weight,
+                default.tethered_tecs_kinetic_deficit_balance_weight,
+            ),
+            tethered_tecs_kinetic_surplus_balance_weight: finite(
+                self.tethered_tecs_kinetic_surplus_balance_weight,
+                default.tethered_tecs_kinetic_surplus_balance_weight,
+            ),
+            tecs_pitch_balance_p: finite(self.tecs_pitch_balance_p, default.tecs_pitch_balance_p),
+            tecs_pitch_balance_i: finite(self.tecs_pitch_balance_i, default.tecs_pitch_balance_i),
+            tecs_pitch_integrator_limit_deg: finite(
+                self.tecs_pitch_integrator_limit_deg,
+                default.tecs_pitch_integrator_limit_deg,
+            )
+            .abs(),
+            alpha_protection_min_deg: finite(
+                self.alpha_protection_min_deg,
+                default.alpha_protection_min_deg,
+            ),
+            alpha_protection_max_deg: finite(
+                self.alpha_protection_max_deg,
+                default.alpha_protection_max_deg,
+            ),
+            alpha_to_elevator: finite(self.alpha_to_elevator, default.alpha_to_elevator),
+            surface_limit_aileron_deg: finite(
+                self.surface_limit_aileron_deg,
+                default.surface_limit_aileron_deg,
+            )
+            .abs(),
+            surface_limit_rudder_deg: finite(
+                self.surface_limit_rudder_deg,
+                default.surface_limit_rudder_deg,
+            )
+            .abs(),
+            surface_limit_elevator_deg: finite(
+                self.surface_limit_elevator_deg,
+                default.surface_limit_elevator_deg,
+            )
+            .abs(),
+            motor_torque_max_nm: finite(self.motor_torque_max_nm, default.motor_torque_max_nm)
+                .max(0.0),
+            actuator_surface_tau_s: finite(
+                self.actuator_surface_tau_s,
+                default.actuator_surface_tau_s,
+            )
+            .max(0.0),
+            actuator_motor_tau_s: finite(self.actuator_motor_tau_s, default.actuator_motor_tau_s)
+                .max(0.0),
+            rotor_speed_soft_limit_radps: finite(
+                self.rotor_speed_soft_limit_radps,
+                default.rotor_speed_soft_limit_radps,
+            )
+            .max(0.0),
+            rotor_speed_hard_limit_radps: finite(
+                self.rotor_speed_hard_limit_radps,
+                default.rotor_speed_hard_limit_radps,
+            )
+            .max(0.0),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Vectorize)]
 pub struct ControllerGains<T> {
     pub trim: KiteControls<T>,
@@ -290,6 +667,7 @@ pub struct ControllerGains<T> {
     pub speed_ref: T,
     pub disk_center_n: Vector3<T>,
     pub disk_radius: T,
+    pub tuning: ControllerTuning<T>,
 }
 
 #[derive(Clone, Debug, Vectorize)]

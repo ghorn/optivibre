@@ -23,9 +23,9 @@ pub use runtime::{
     star_configuration, y_configuration, y_high_configuration, y_low_configuration,
 };
 pub use types::{
-    AeroParams, BodyState, ControlSurfaces, ControllerGains, Controls, Diagnostics, Environment,
-    InitRequest, KiteControls, KiteDiagnostics, KiteParams, KiteState, LongitudinalMode,
-    MassContactParams, Params, PhaseMode, Preset, PresetInfo, RotorParams, RunResult, RunSummary,
-    SimulationConfig, SimulationFailure, SimulationFrame, SimulationProgress, State, TetherNode,
-    TetherParams,
+    AeroParams, BodyState, ControlSurfaces, ControllerGains, ControllerTuning, Controls,
+    Diagnostics, DrydenConfig, Environment, InitRequest, KiteControls, KiteDiagnostics, KiteParams,
+    KiteState, LongitudinalMode, MassContactParams, Params, PhaseMode, Preset, PresetInfo,
+    RotorParams, RunResult, RunSummary, SimulationConfig, SimulationFailure, SimulationFrame,
+    SimulationProgress, State, TetherNode, TetherParams,
 };
