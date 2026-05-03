@@ -1948,7 +1948,7 @@ mod tests {
                 control.motor_torque
             );
             assert!(
-                trace.thrust_energy_integrators[index] >= 45.6 - 1.0e-12,
+                trace.kites[index].thrust_energy_integrator >= 45.6 - 1.0e-12,
                 "kite {index} thrust integrator should reflect max-throttle command"
             );
         }
@@ -2155,7 +2155,7 @@ mod tests {
 
             let kite_diag = &diagnostics.kites[0];
             let roll = roll_angle_from_quat_n2b(&state.kites[0].body.quat_n2b);
-            let roll_ref = trace.roll_refs[0];
+            let roll_ref = trace.kites[0].roll_ref;
             let settled = (2.2..3.0).contains(&time)
                 || (4.2..5.0).contains(&time)
                 || (6.2..7.0).contains(&time);

@@ -1509,7 +1509,7 @@ function controllerDocsHtml(phaseMode: PhaseMode, longitudinalMode: Longitudinal
     <section class="docs-card">
       <div class="docs-card-head">
         <div class="docs-card-title">Implementation Scope</div>
-        <div class="docs-card-note">These equations are generated directly from <code>multikite_sim/src/controller.rs</code>. The equations show the nominal feedback laws; bounds, trims, and other implementation-specific saturations are called out separately.</div>
+        <div class="docs-card-note">These equations are generated directly from the Rust controller module under <code>multikite_sim/src/controller/</code>. The equations show the nominal feedback laws; bounds, trims, and other implementation-specific saturations are called out separately.</div>
       </div>
       <div class="docs-card-body">
         <div class="docs-grid">
