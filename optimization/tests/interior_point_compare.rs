@@ -2360,6 +2360,58 @@ fn compare_native_and_ipopt_with_full_space_refinement_options() {
 }
 
 #[test]
+fn compare_native_and_ipopt_with_negative_curvature_test_options() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        native_options_with(|options| {
+            options.max_iters = 200;
+            options.negative_curvature_test_tolerance = 1.0e-12;
+            options.negative_curvature_test_regularized = false;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        ipopt_options_with(|options| {
+            options.max_iters = 200;
+            options
+                .raw_options
+                .push(IpoptRawOption::number("neg_curv_test_tol", 1.0e-12));
+            options
+                .raw_options
+                .push(IpoptRawOption::text("neg_curv_test_reg", "no"));
+        }),
+    );
+
+    assert_native_matches_ipopt(
+        "linearly_constrained_quadratic_neg_curv_test_options",
+        None,
+        &native,
+        &ipopt,
+        1e-6,
+        1e-6,
+    );
+    assert_accepted_trace_parity(
+        "linearly_constrained_quadratic_neg_curv_test_options",
+        &native,
+        &ipopt,
+        AcceptedTraceParityTolerances {
+            max_iteration_gap: 2,
+            max_step_tag_mismatches: 2,
+            max_primal_log_gap: 1.5,
+            max_dual_log_gap: 13.0,
+            max_mu_log_gap: 2.0,
+            max_regularization_log_gap: 1.0,
+        },
+    );
+}
+
+#[test]
 fn compare_native_and_ipopt_with_magic_steps() {
     skip_without_native_spral!();
     let problem = LinearlyConstrainedQuadraticProblem;

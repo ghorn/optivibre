@@ -517,6 +517,8 @@ def classify_rust_line(path, line_no, text):
             return "solve summary/reporting"
         if 11050 <= line_no <= 11340:
             return "solve summary/reporting"
+        if 11360 <= line_no <= 11440:
+            return "covered by reduced negative-curvature helper"
         if 11340 <= line_no <= 11840:
             return "initialization option-profile branch"
         if 11640 <= line_no <= 11790:
@@ -529,6 +531,8 @@ def classify_rust_line(path, line_no, text):
             return "watchdog globalization start gate"
         if 12650 <= line_no <= 12920:
             return "perturbation and inertia retry policy"
+        if 13680 <= line_no <= 13795:
+            return "full-space negative-curvature option branch"
         if 12120 <= line_no <= 14330:
             return "SOC/watchdog globalization branch"
         if 14330 <= line_no <= 14920:
@@ -539,13 +543,15 @@ def classify_rust_line(path, line_no, text):
             return "iteration log formatting/reporting"
         if 16750 <= line_no <= 16795:
             return "iteration log formatting/reporting"
-        if 16900 <= line_no <= 18650:
+        if 16900 <= line_no <= 18730:
             return "unit-test parity witness"
         if 24800 <= line_no <= 24900:
             return "restoration status mapping"
         if 25240 <= line_no <= 25330:
             return "restoration status mapping"
         if 25480 <= line_no <= 25560:
+            return "restoration status mapping"
+        if 25690 <= line_no <= 25740:
             return "restoration status mapping"
         if 14720 <= line_no <= 14770:
             return "iteration log formatting/reporting"
@@ -559,7 +565,7 @@ def classify_rust_line(path, line_no, text):
         return "diagnostic linear replay"
     if any(token in text for token in ["linear_debug", "trace", "dump", "verbose", "debug"]):
         return "diagnostic only"
-    if any(token in text for token in ["spral_action", "least_square_init", "mu_allow", "second_order_correction"]):
+    if any(token in text for token in ["spral_action", "least_square_init", "mu_allow", "second_order_correction", "expect_infeasible_problem"]):
         return "option/reporting"
     if "restoration" in text or "Restoration" in text:
         return "diagnostic/restoration branch"
@@ -601,7 +607,7 @@ def classify_ipopt_line(file_name, line_no, text):
         if line_no in {843, 857, 866, 871, 882, 895}:
             return "covered by perturbation retry witnesses"
         if line_no in {831, 908, 913, 925, 939}:
-            return "non-default neg-curvature option gap"
+            return "covered by negative-curvature option/helper witnesses"
         if 1030 <= line_no <= 1090:
             return "diagnostic only"
         if line_no == 1198:

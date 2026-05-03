@@ -467,6 +467,13 @@ pub struct InteriorPointOptions {
         serde(default = "default_ipopt_linear_residual_improvement_factor")
     )]
     pub residual_improvement_factor: f64,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub negative_curvature_test_tolerance: f64,
+    #[cfg_attr(
+        feature = "serde",
+        serde(default = "default_ipopt_negative_curvature_test_regularized")
+    )]
+    pub negative_curvature_test_regularized: bool,
     pub second_order_correction: bool,
     pub max_second_order_corrections: Index,
     pub second_order_correction_method: InteriorPointSecondOrderCorrectionMethod,
@@ -614,6 +621,8 @@ impl Default for InteriorPointOptions {
             residual_ratio_max: default_ipopt_linear_residual_ratio_max(),
             residual_ratio_singular: default_ipopt_linear_residual_ratio_singular(),
             residual_improvement_factor: default_ipopt_linear_residual_improvement_factor(),
+            negative_curvature_test_tolerance: 0.0,
+            negative_curvature_test_regularized: true,
             second_order_correction: true,
             max_second_order_corrections: 4,
             second_order_correction_method:
@@ -654,7 +663,7 @@ impl Default for InteriorPointOptions {
 
 pub fn format_nlip_settings_summary(options: &InteriorPointOptions) -> String {
     format!(
-        "filter={}; linear_solver={}; linear_debug={}; spral=[pivot={}, action={}, small={}, u={}, umax={}]; beta={}; c1={}; force_accept=[every={}, after={}]; magic_steps={}; min_step={}; diverging_tol={}; max_cpu_time={}; max_wall_time={}; tau={}; alpha_y=[strategy={}, tol={}] ; init=[least_square_primal={}, bound_push={}, bound_frac={}, slack_push={}, slack_frac={}, bound_relax={}, slack_move={}]; dual_init=[method={}, val={}, least_square={}, max={}] ; regularization={} (first={}, first_growth={}, retries={}, growth={}, decay={}, max={}, jacobian={}, jac_exp={}, always_cd={}); linear_refinement=[min={}, max={}, residual_max={}, residual_singular={}, improvement={}]; soc={} (max={}, method={}, kappa={}); corrector=[type={}, skip_neg_curv={}, skip_monotone={}, compl_red={}]; restoration=[on={}, start={}, expect_infeasible={}, ctol={}, ytol={}, soft_factor={}, max_soft={}, max_iters={}, mu_strategy={}, mu_oracle={}, mu_globalization={}, mu_min={}]; watchdog=[trigger={}, max={}]; filter_reset=[max={}, trigger={}]; tiny_step=[x={}, y={}]; mu=[strategy={}, oracle={}, globalization={}, mehrotra={}, init={}, target={}, min={}, max_fact={}, max={}, safeguard={}, filter_margin={}, filter_max_margin={}, restore_prev={}, monotone_init_factor={}, kkt_red_iters={}, kkt_red_fact={}, barrier_tol={}, linear={}, superlinear={}, fast={}, kappa_d={}]; quality_function=[norm={}, centrality={}, balancing={}, sigma_min={}, sigma_max={}, section_steps={}, sigma_tol={}, qf_tol={}]; theta=[{}, {}]; acceptable_iter={}",
+        "filter={}; linear_solver={}; linear_debug={}; spral=[pivot={}, action={}, small={}, u={}, umax={}]; beta={}; c1={}; force_accept=[every={}, after={}]; magic_steps={}; min_step={}; diverging_tol={}; max_cpu_time={}; max_wall_time={}; tau={}; alpha_y=[strategy={}, tol={}] ; init=[least_square_primal={}, bound_push={}, bound_frac={}, slack_push={}, slack_frac={}, bound_relax={}, slack_move={}]; dual_init=[method={}, val={}, least_square={}, max={}] ; regularization={} (first={}, first_growth={}, retries={}, growth={}, decay={}, max={}, jacobian={}, jac_exp={}, always_cd={}); linear_refinement=[min={}, max={}, residual_max={}, residual_singular={}, improvement={}, neg_curv_tol={}, neg_curv_reg={}]; soc={} (max={}, method={}, kappa={}); corrector=[type={}, skip_neg_curv={}, skip_monotone={}, compl_red={}]; restoration=[on={}, start={}, expect_infeasible={}, ctol={}, ytol={}, soft_factor={}, max_soft={}, max_iters={}, mu_strategy={}, mu_oracle={}, mu_globalization={}, mu_min={}]; watchdog=[trigger={}, max={}]; filter_reset=[max={}, trigger={}]; tiny_step=[x={}, y={}]; mu=[strategy={}, oracle={}, globalization={}, mehrotra={}, init={}, target={}, min={}, max_fact={}, max={}, safeguard={}, filter_margin={}, filter_max_margin={}, restore_prev={}, monotone_init_factor={}, kkt_red_iters={}, kkt_red_fact={}, barrier_tol={}, linear={}, superlinear={}, fast={}, kappa_d={}]; quality_function=[norm={}, centrality={}, balancing={}, sigma_min={}, sigma_max={}, section_steps={}, sigma_tol={}, qf_tol={}]; theta=[{}, {}]; acceptable_iter={}",
         "on",
         options.linear_solver.label(),
         format_nlip_linear_debug_summary(options.linear_debug.as_ref()),
@@ -723,6 +732,12 @@ pub fn format_nlip_settings_summary(options: &InteriorPointOptions) -> String {
         sci_text(options.residual_ratio_max),
         sci_text(options.residual_ratio_singular),
         sci_text(options.residual_improvement_factor),
+        sci_text(options.negative_curvature_test_tolerance),
+        if options.negative_curvature_test_regularized {
+            "yes"
+        } else {
+            "no"
+        },
         if options.second_order_correction {
             "on"
         } else {
@@ -2357,6 +2372,8 @@ impl RestorationReducedKktSystem {
             residual_ratio_max: source.residual_ratio_max,
             residual_ratio_singular: source.residual_ratio_singular,
             residual_improvement_factor: source.residual_improvement_factor,
+            negative_curvature_test_tolerance: source.negative_curvature_test_tolerance,
+            negative_curvature_test_regularized: source.negative_curvature_test_regularized,
             spral_pivot_method: source.spral_pivot_method,
             spral_action_on_zero_pivot: source.spral_action_on_zero_pivot,
             spral_small_pivot_tolerance: source.spral_small_pivot_tolerance,
@@ -3459,6 +3476,8 @@ struct ReducedKktSystem<'a> {
     residual_ratio_max: f64,
     residual_ratio_singular: f64,
     residual_improvement_factor: f64,
+    negative_curvature_test_tolerance: f64,
+    negative_curvature_test_regularized: bool,
     spral_pivot_method: InteriorPointSpralPivotMethod,
     spral_action_on_zero_pivot: bool,
     spral_small_pivot_tolerance: f64,
@@ -3525,6 +3544,8 @@ impl<'a> ReducedKktSystem<'a> {
             residual_ratio_max: self.residual_ratio_max,
             residual_ratio_singular: self.residual_ratio_singular,
             residual_improvement_factor: self.residual_improvement_factor,
+            negative_curvature_test_tolerance: self.negative_curvature_test_tolerance,
+            negative_curvature_test_regularized: self.negative_curvature_test_regularized,
             spral_pivot_method: self.spral_pivot_method,
             spral_action_on_zero_pivot: self.spral_action_on_zero_pivot,
             spral_small_pivot_tolerance: self.spral_small_pivot_tolerance,
@@ -3577,6 +3598,8 @@ impl<'a> ReducedKktSystem<'a> {
             residual_ratio_max: self.residual_ratio_max,
             residual_ratio_singular: self.residual_ratio_singular,
             residual_improvement_factor: self.residual_improvement_factor,
+            negative_curvature_test_tolerance: self.negative_curvature_test_tolerance,
+            negative_curvature_test_regularized: self.negative_curvature_test_regularized,
             spral_pivot_method: self.spral_pivot_method,
             spral_action_on_zero_pivot: self.spral_action_on_zero_pivot,
             spral_small_pivot_tolerance: self.spral_small_pivot_tolerance,
@@ -3643,6 +3666,8 @@ impl<'a> ReducedKktSystem<'a> {
             residual_ratio_max: self.residual_ratio_max,
             residual_ratio_singular: self.residual_ratio_singular,
             residual_improvement_factor: self.residual_improvement_factor,
+            negative_curvature_test_tolerance: self.negative_curvature_test_tolerance,
+            negative_curvature_test_regularized: self.negative_curvature_test_regularized,
             spral_pivot_method: self.spral_pivot_method,
             spral_action_on_zero_pivot: self.spral_action_on_zero_pivot,
             spral_small_pivot_tolerance: self.spral_small_pivot_tolerance,
@@ -3700,6 +3725,8 @@ impl<'a> ReducedKktSystem<'a> {
             residual_ratio_max: self.residual_ratio_max,
             residual_ratio_singular: self.residual_ratio_singular,
             residual_improvement_factor: self.residual_improvement_factor,
+            negative_curvature_test_tolerance: self.negative_curvature_test_tolerance,
+            negative_curvature_test_regularized: self.negative_curvature_test_regularized,
             spral_pivot_method: self.spral_pivot_method,
             spral_action_on_zero_pivot: self.spral_action_on_zero_pivot,
             spral_small_pivot_tolerance: self.spral_small_pivot_tolerance,
@@ -4223,6 +4250,8 @@ impl InteriorPointKktSnapshot {
             residual_ratio_max: default_ipopt_linear_residual_ratio_max(),
             residual_ratio_singular: default_ipopt_linear_residual_ratio_singular(),
             residual_improvement_factor: default_ipopt_linear_residual_improvement_factor(),
+            negative_curvature_test_tolerance: 0.0,
+            negative_curvature_test_regularized: true,
             spral_pivot_method: self.spral_pivot_method,
             spral_action_on_zero_pivot: self.spral_action_on_zero_pivot,
             spral_small_pivot_tolerance: self.spral_small_pivot_tolerance,
@@ -10959,6 +10988,11 @@ fn default_ipopt_linear_residual_improvement_factor() -> f64 {
     IPOPT_LINEAR_RESIDUAL_IMPROVEMENT_FACTOR
 }
 
+#[cfg(feature = "serde")]
+fn default_ipopt_negative_curvature_test_regularized() -> bool {
+    true
+}
+
 fn default_ipopt_slack_move() -> f64 {
     f64::EPSILON.powf(0.75)
 }
@@ -11323,6 +11357,63 @@ struct IpoptLinearRefinementShifts {
     primal: f64,
     slack: f64,
     dual: f64,
+}
+
+struct IpoptNegativeCurvatureTestInputs<'a> {
+    hessian: &'a SparseSymmetricMatrix,
+    bound_diagonal: &'a [f64],
+    slack_sigma: &'a [f64],
+    x_direction: &'a [f64],
+    slack_direction: &'a [f64],
+    shifts: IpoptLinearRefinementShifts,
+    include_regularization: bool,
+    tolerance: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IpoptNegativeCurvatureTestResult {
+    x_w_x: f64,
+    x_s_norm_squared: f64,
+    threshold: f64,
+    sufficiently_positive: bool,
+}
+
+fn weighted_square_sum(values: &[f64], weights: &[f64]) -> f64 {
+    debug_assert_eq!(values.len(), weights.len());
+    values
+        .iter()
+        .zip(weights.iter())
+        .fold(0.0, |acc, (&value, &weight)| {
+            weight.mul_add(value * value, acc)
+        })
+}
+
+fn ipopt_negative_curvature_test(
+    inputs: IpoptNegativeCurvatureTestInputs<'_>,
+) -> IpoptNegativeCurvatureTestResult {
+    debug_assert_eq!(inputs.bound_diagonal.len(), inputs.x_direction.len());
+    debug_assert_eq!(inputs.slack_sigma.len(), inputs.slack_direction.len());
+    let wx = symmetric_ccs_lower_mat_vec_ipopt_order(
+        &inputs.hessian.lower_triangle,
+        &inputs.hessian.values,
+        inputs.x_direction,
+    );
+    let mut x_w_x = dot(&wx, inputs.x_direction);
+    x_w_x += weighted_square_sum(inputs.x_direction, inputs.bound_diagonal);
+    x_w_x += weighted_square_sum(inputs.slack_direction, inputs.slack_sigma);
+    if inputs.include_regularization {
+        x_w_x += inputs.shifts.primal * squared_l2_norm(inputs.x_direction);
+        x_w_x += inputs.shifts.slack * squared_l2_norm(inputs.slack_direction);
+    }
+    let x_s_norm_squared =
+        squared_l2_norm(inputs.x_direction) + squared_l2_norm(inputs.slack_direction);
+    let threshold = inputs.tolerance * x_s_norm_squared;
+    IpoptNegativeCurvatureTestResult {
+        x_w_x,
+        x_s_norm_squared,
+        threshold,
+        sufficiently_positive: x_w_x >= threshold,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -13590,7 +13681,8 @@ fn factor_solve_spral_src(
     workspace.factor_regularization = Some(regularization);
 
     let expected_inertia = spral_expected_augmented_inertia(&workspace.pattern);
-    if factor_info.inertia != expected_inertia {
+    let inertia_matches = factor_info.inertia == expected_inertia;
+    if !inertia_matches && system.negative_curvature_test_tolerance == 0.0 {
         return Err(InteriorPointLinearSolveAttempt {
             solver: InteriorPointLinearSolver::SpralSrc,
             regularization,
@@ -13649,6 +13741,47 @@ fn factor_solve_spral_src(
         upper_slack_multiplier_step,
     };
     let mut solve_time = solve_started.elapsed();
+    if !inertia_matches && system.negative_curvature_test_tolerance > 0.0 {
+        let slack_sigma = system
+            .multipliers
+            .iter()
+            .zip(system.slack.iter())
+            .map(|(&multiplier, &slack)| multiplier / slack)
+            .collect::<Vec<_>>();
+        let curvature = ipopt_negative_curvature_test(IpoptNegativeCurvatureTestInputs {
+            hessian: system.hessian,
+            bound_diagonal: system.bound_diagonal,
+            slack_sigma: &slack_sigma,
+            x_direction: &full_space_solution.augmented_solution
+                [..system.hessian.lower_triangle.nrow],
+            slack_direction: &full_space_solution.augmented_solution
+                [workspace.pattern.p_offset..workspace.pattern.p_offset + system.r_cent.len()],
+            shifts: context.shifts,
+            include_regularization: system.negative_curvature_test_regularized,
+            tolerance: system.negative_curvature_test_tolerance,
+        });
+        if !curvature.sufficiently_positive {
+            profiling.linear_backsolves += 1;
+            profiling.linear_backsolve_time += solve_time;
+            return Err(InteriorPointLinearSolveAttempt {
+                solver: InteriorPointLinearSolver::SpralSrc,
+                regularization,
+                inertia: Some(Box::new(interior_point_linear_inertia(factor_info.inertia))),
+                failure_kind: InteriorPointLinearSolveFailureKind::InertiaMismatch,
+                detail: Some(format!(
+                    "inertia_free_curvature_test_failed; {}; xWx={:.3e} threshold={:.3e} xs_norm_sq={:.3e}",
+                    inertia_mismatch_detail(expected_inertia, factor_info.inertia),
+                    curvature.x_w_x,
+                    curvature.threshold,
+                    curvature.x_s_norm_squared,
+                )),
+                solution_inf: Some(step_inf_norm(&full_space_solution.augmented_solution)),
+                solution_inf_limit: None,
+                residual_inf: None,
+                residual_inf_limit: None,
+            });
+        }
+    }
     let refinement = if context.allow_inexact {
         // IpFilterLSAcceptor::TrySecondOrderCorrection calls
         // PDSystemSolver::Solve(..., allow_inexact=true), and
@@ -16880,6 +17013,44 @@ mod tests {
     }
 
     #[test]
+    fn full_space_negative_curvature_test_matches_ipopt_formula() {
+        let hessian = SparseSymmetricMatrix {
+            lower_triangle: Arc::new(CCS::new(2, 2, vec![0, 2, 3], vec![0, 1, 1])),
+            values: vec![2.0, 1.0, 4.0],
+        };
+        let x_direction = vec![2.0, -1.0];
+        let slack_direction = vec![3.0];
+        let inputs = |include_regularization, tolerance| IpoptNegativeCurvatureTestInputs {
+            hessian: &hessian,
+            bound_diagonal: &[0.5, 2.0],
+            slack_sigma: &[4.0],
+            x_direction: &x_direction,
+            slack_direction: &slack_direction,
+            shifts: IpoptLinearRefinementShifts {
+                primal: 0.1,
+                slack: 0.2,
+                dual: 0.0,
+            },
+            include_regularization,
+            tolerance,
+        };
+
+        // IpPDFullSpaceSolver::SolveOnce tests
+        // x'*(W+Sigma_x+delta_x I)*x + s'*(Sigma_s+delta_s I)*s
+        // against neg_curv_test_tol * (||x||_2^2 + ||s||_2^2).
+        let regularized = ipopt_negative_curvature_test(inputs(true, 4.0));
+        assert!((regularized.x_w_x - 50.3).abs() <= 1.0e-14);
+        assert_eq!(regularized.x_s_norm_squared.to_bits(), 14.0_f64.to_bits());
+        assert_eq!(regularized.threshold.to_bits(), 56.0_f64.to_bits());
+        assert!(!regularized.sufficiently_positive);
+
+        let unregularized = ipopt_negative_curvature_test(inputs(false, 3.0));
+        assert!((unregularized.x_w_x - 48.0).abs() <= 1.0e-14);
+        assert_eq!(unregularized.threshold.to_bits(), 42.0_f64.to_bits());
+        assert!(unregularized.sufficiently_positive);
+    }
+
+    #[test]
     fn full_space_refinement_option_validation_matches_ipopt_order_checks() {
         let mut options = InteriorPointOptions {
             min_refinement_steps: 3,
@@ -16899,6 +17070,14 @@ mod tests {
             validate_interior_point_options(&options),
             Err(InteriorPointSolveError::InvalidInput(message))
                 if message.contains("residual_ratio_singular")
+        ));
+
+        options.residual_ratio_singular = 1.0e-4;
+        options.negative_curvature_test_tolerance = -f64::EPSILON;
+        assert!(matches!(
+            validate_interior_point_options(&options),
+            Err(InteriorPointSolveError::InvalidInput(message))
+                if message.contains("negative_curvature_test_tolerance")
         ));
     }
 
@@ -19175,6 +19354,14 @@ fn validate_interior_point_options(
             options.residual_improvement_factor
         )));
     }
+    if !options.negative_curvature_test_tolerance.is_finite()
+        || options.negative_curvature_test_tolerance < 0.0
+    {
+        return Err(InteriorPointSolveError::InvalidInput(format!(
+            "negative_curvature_test_tolerance must be finite and non-negative, got {}",
+            options.negative_curvature_test_tolerance
+        )));
+    }
     if let Some(linear_debug) = options.linear_debug.as_ref()
         && linear_debug
             .compare_solvers
@@ -20877,6 +21064,8 @@ where
                 residual_ratio_max: options.residual_ratio_max,
                 residual_ratio_singular: options.residual_ratio_singular,
                 residual_improvement_factor: options.residual_improvement_factor,
+                negative_curvature_test_tolerance: options.negative_curvature_test_tolerance,
+                negative_curvature_test_regularized: options.negative_curvature_test_regularized,
                 spral_pivot_method: options.spral_pivot_method,
                 spral_action_on_zero_pivot: options.spral_action_on_zero_pivot,
                 spral_small_pivot_tolerance: options.spral_small_pivot_tolerance,
@@ -21214,6 +21403,10 @@ where
                         residual_ratio_max: options.residual_ratio_max,
                         residual_ratio_singular: options.residual_ratio_singular,
                         residual_improvement_factor: options.residual_improvement_factor,
+                        negative_curvature_test_tolerance: options
+                            .negative_curvature_test_tolerance,
+                        negative_curvature_test_regularized: options
+                            .negative_curvature_test_regularized,
                         spral_pivot_method: options.spral_pivot_method,
                         spral_action_on_zero_pivot: options.spral_action_on_zero_pivot,
                         spral_small_pivot_tolerance: options.spral_small_pivot_tolerance,
