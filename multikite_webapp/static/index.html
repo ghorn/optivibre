@@ -49,15 +49,41 @@
             Preset
             <select id="preset"></select>
           </label>
+          <div id="swarm-options" class="form-section">
+            <div class="form-section-title">Swarm Setup</div>
+            <label>
+              Number of kites
+              <select id="swarm-kites">
+                <option value="1">1</option>
+                <option value="2" selected>2</option>
+                <option value="3">3</option>
+                <option value="4">4</option>
+                <option value="5">5</option>
+                <option value="6">6</option>
+                <option value="7">7</option>
+                <option value="8">8</option>
+                <option value="9">9</option>
+                <option value="10">10</option>
+                <option value="11">11</option>
+                <option value="12">12</option>
+              </select>
+              <span class="form-hint">Compile-specialized swarm size for the next run.</span>
+            </label>
+            <label>
+              Initial altitude offset (m)
+              <input id="initial-altitude-offset" type="number" step="any" value="0" />
+              <span class="form-hint">Relative to nominal payload altitude. Negative starts low; positive starts high.</span>
+            </label>
+          </div>
           <div class="form-section">
             <div class="form-section-title">Model Options</div>
             <label>
               Payload (kg)
-              <input id="payload-mass" type="number" min="1" step="1" value="100" />
+              <input id="payload-mass" type="number" min="1" step="any" value="100" />
             </label>
             <label>
               Wind (m/s)
-              <input id="wind-speed" type="number" min="0" step="0.5" value="5" />
+              <input id="wind-speed" type="number" min="0" step="any" value="5" />
             </label>
             <label class="checkbox-label">
               <input id="bridle-enabled" type="checkbox" checked />
@@ -72,17 +98,17 @@
             <div id="dryden-tuning-fields" class="tuning-fields dryden-tuning-fields">
               <label>
                 Dryden seed
-                <input id="dryden-seed" type="number" min="0" step="1" value="3512640992" />
+                <input id="dryden-seed" type="number" min="0" step="1" value="42" />
                 <span class="form-hint">Deterministic random seed for repeatable gusts.</span>
               </label>
               <label>
                 Dryden intensity scale
-                <input id="dryden-intensity-scale" type="number" min="0" step="0.1" value="1" />
+                <input id="dryden-intensity-scale" type="number" min="0" step="any" value="1" />
                 <span class="form-hint">Multiplies turbulence intensities σu, σv, σw. Use 0 for no gust amplitude.</span>
               </label>
               <label>
                 Dryden length-scale factor
-                <input id="dryden-length-scale" type="number" min="0.01" step="0.1" value="1" />
+                <input id="dryden-length-scale" type="number" min="0.01" step="any" value="1" />
                 <span class="form-hint">Multiplies Lu, Lv, Lw. Larger values make gusts vary more slowly.</span>
               </label>
               <label class="checkbox-label">
@@ -108,11 +134,11 @@
             <div class="form-section-title">Run Options</div>
             <label>
               Duration (s)
-              <input id="duration" type="number" min="1" step="1" value="30" />
+              <input id="duration" type="number" min="0.001" step="any" value="30" />
             </label>
             <label>
               Sample Period / Rate
-              <input id="dt-control" type="number" min="0.001" step="0.001" value="0.01" />
+              <input id="dt-control" type="number" min="0.001" step="any" value="0.01" />
               <span class="form-hint">Control and plot sample interval in seconds. 0.01 s = 100 Hz.</span>
             </label>
             <div class="form-subsection">
@@ -190,7 +216,7 @@
             </label>
             <label>
               Control feature scale
-              <input id="control-feature-scale" type="number" min="0.1" step="0.05" value="0.5" />
+              <input id="control-feature-scale" type="number" min="0.1" step="any" value="0.5" />
             </label>
             <label class="checkbox-label">
               <input id="tether-nodes-enabled" type="checkbox" checked />
@@ -198,7 +224,7 @@
             </label>
             <label>
               Tether node scale
-              <input id="tether-node-scale" type="number" min="0" step="0.1" value="1.5" />
+              <input id="tether-node-scale" type="number" min="0" step="any" value="1.5" />
             </label>
             <label>
               Tether tension color scale
@@ -210,8 +236,8 @@
             </label>
             <label class="tension-scale-field" data-tension-scale-mode="payload">
               Payload tension margin
-              <input id="tether-tension-payload-margin" type="number" min="0.1" step="0.1" value="3" />
-              <span class="form-hint">Red at payload weight × this margin; blue at zero tension.</span>
+              <input id="tether-tension-payload-margin" type="number" min="0.1" step="any" value="3" />
+              <span class="form-hint">Red at payload weight × this margin; slack links are gray, low tension is blue.</span>
             </label>
             <label class="tension-scale-field" data-tension-scale-mode="fixed">
               Fixed min tension (N)
@@ -234,7 +260,7 @@
             </label>
             <label>
               Air particle opacity
-              <input id="air-particle-opacity" type="number" min="0" max="1" step="0.05" value="0.45" />
+              <input id="air-particle-opacity" type="number" min="0" max="1" step="any" value="0.45" />
             </label>
             <label class="checkbox-label">
               <input id="wingtip-trails-enabled" type="checkbox" checked />
