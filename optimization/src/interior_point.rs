@@ -373,6 +373,8 @@ pub struct InteriorPointOptions {
     pub slack_bound_push: f64,
     pub slack_bound_frac: f64,
     pub bound_relax_factor: f64,
+    #[cfg_attr(feature = "serde", serde(default = "default_ipopt_slack_move"))]
+    pub slack_move: f64,
     pub line_search_beta: f64,
     pub line_search_c1: f64,
     pub accept_every_trial_step: bool,
@@ -542,6 +544,7 @@ impl Default for InteriorPointOptions {
             slack_bound_push: 1e-2,
             slack_bound_frac: 1e-2,
             bound_relax_factor: 1e-8,
+            slack_move: default_ipopt_slack_move(),
             line_search_beta: 0.5,
             line_search_c1: 1e-4,
             accept_every_trial_step: false,
@@ -651,7 +654,7 @@ impl Default for InteriorPointOptions {
 
 pub fn format_nlip_settings_summary(options: &InteriorPointOptions) -> String {
     format!(
-        "filter={}; linear_solver={}; linear_debug={}; spral=[pivot={}, action={}, small={}, u={}, umax={}]; beta={}; c1={}; force_accept=[every={}, after={}]; magic_steps={}; min_step={}; diverging_tol={}; max_cpu_time={}; max_wall_time={}; tau={}; alpha_y=[strategy={}, tol={}] ; init=[least_square_primal={}, bound_push={}, bound_frac={}, slack_push={}, slack_frac={}, bound_relax={}]; dual_init=[method={}, val={}, least_square={}, max={}] ; regularization={} (first={}, first_growth={}, retries={}, growth={}, decay={}, max={}, jacobian={}, jac_exp={}, always_cd={}); linear_refinement=[min={}, max={}, residual_max={}, residual_singular={}, improvement={}]; soc={} (max={}, method={}, kappa={}); corrector=[type={}, skip_neg_curv={}, skip_monotone={}, compl_red={}]; restoration=[on={}, start={}, expect_infeasible={}, ctol={}, ytol={}, soft_factor={}, max_soft={}, max_iters={}, mu_strategy={}, mu_oracle={}, mu_globalization={}, mu_min={}]; watchdog=[trigger={}, max={}]; filter_reset=[max={}, trigger={}]; tiny_step=[x={}, y={}]; mu=[strategy={}, oracle={}, globalization={}, mehrotra={}, init={}, target={}, min={}, max_fact={}, max={}, safeguard={}, filter_margin={}, filter_max_margin={}, restore_prev={}, monotone_init_factor={}, kkt_red_iters={}, kkt_red_fact={}, barrier_tol={}, linear={}, superlinear={}, fast={}, kappa_d={}]; quality_function=[norm={}, centrality={}, balancing={}, sigma_min={}, sigma_max={}, section_steps={}, sigma_tol={}, qf_tol={}]; theta=[{}, {}]; acceptable_iter={}",
+        "filter={}; linear_solver={}; linear_debug={}; spral=[pivot={}, action={}, small={}, u={}, umax={}]; beta={}; c1={}; force_accept=[every={}, after={}]; magic_steps={}; min_step={}; diverging_tol={}; max_cpu_time={}; max_wall_time={}; tau={}; alpha_y=[strategy={}, tol={}] ; init=[least_square_primal={}, bound_push={}, bound_frac={}, slack_push={}, slack_frac={}, bound_relax={}, slack_move={}]; dual_init=[method={}, val={}, least_square={}, max={}] ; regularization={} (first={}, first_growth={}, retries={}, growth={}, decay={}, max={}, jacobian={}, jac_exp={}, always_cd={}); linear_refinement=[min={}, max={}, residual_max={}, residual_singular={}, improvement={}]; soc={} (max={}, method={}, kappa={}); corrector=[type={}, skip_neg_curv={}, skip_monotone={}, compl_red={}]; restoration=[on={}, start={}, expect_infeasible={}, ctol={}, ytol={}, soft_factor={}, max_soft={}, max_iters={}, mu_strategy={}, mu_oracle={}, mu_globalization={}, mu_min={}]; watchdog=[trigger={}, max={}]; filter_reset=[max={}, trigger={}]; tiny_step=[x={}, y={}]; mu=[strategy={}, oracle={}, globalization={}, mehrotra={}, init={}, target={}, min={}, max_fact={}, max={}, safeguard={}, filter_margin={}, filter_max_margin={}, restore_prev={}, monotone_init_factor={}, kkt_red_iters={}, kkt_red_fact={}, barrier_tol={}, linear={}, superlinear={}, fast={}, kappa_d={}]; quality_function=[norm={}, centrality={}, balancing={}, sigma_min={}, sigma_max={}, section_steps={}, sigma_tol={}, qf_tol={}]; theta=[{}, {}]; acceptable_iter={}",
         "on",
         options.linear_solver.label(),
         format_nlip_linear_debug_summary(options.linear_debug.as_ref()),
@@ -692,6 +695,7 @@ pub fn format_nlip_settings_summary(options: &InteriorPointOptions) -> String {
         sci_text(options.slack_bound_push),
         sci_text(options.slack_bound_frac),
         sci_text(options.bound_relax_factor),
+        sci_text(options.slack_move),
         options.bound_mult_init_method.label(),
         sci_text(options.bound_mult_init_val),
         if options.least_square_init_duals {
@@ -1045,6 +1049,7 @@ pub enum InteriorPointIterationEvent {
     FilterReset,
     LinearSolverQualityIncreased,
     BoundMultiplierSafeguardApplied,
+    BoundsAdjustedForTinySlack,
     BarrierParameterUpdated,
     AdaptiveRegularizationUsed,
     RestorationPhaseAccepted,
@@ -1100,6 +1105,10 @@ pub fn nlip_event_legend_entries_for_events(
                 'B',
                 "B=accepted step corrected bound multipliers via IPOPT kappa_sigma safeguard",
             )),
+            InteriorPointIterationEvent::BoundsAdjustedForTinySlack => entries.push((
+                'b',
+                "b=accepted step shifted bounds for IPOPT tiny-slack correction",
+            )),
             InteriorPointIterationEvent::BarrierParameterUpdated => entries.push((
                 'U',
                 "U=barrier parameter updated and IPOPT line-search state was reset",
@@ -1145,8 +1154,8 @@ pub fn nlip_event_codes(snapshot: &InteriorPointIterationSnapshot) -> String {
     nlip_event_codes_for_events(&snapshot.events)
 }
 
-const NLIP_EVENT_SLOT_ORDER: [char; 17] = [
-    'L', 'F', 's', 'S', 'c', 'C', 'A', 'W', 'w', 'X', 'q', 'B', 'U', 'V', 'R', 'T', 'M',
+const NLIP_EVENT_SLOT_ORDER: [char; 18] = [
+    'L', 'F', 's', 'S', 'c', 'C', 'A', 'W', 'w', 'X', 'q', 'B', 'b', 'U', 'V', 'R', 'T', 'M',
 ];
 const NLIP_EVENT_CELL_WIDTH: usize = NLIP_EVENT_SLOT_ORDER.len();
 
@@ -1613,6 +1622,7 @@ struct AcceptedInteriorPointTrial {
     watchdog_accepted: bool,
     tiny_step: bool,
     bound_multiplier_corrected: bool,
+    bound_adjustment: Option<AcceptedTrialBoundAdjustment>,
     forced_termination: Option<InteriorPointTermination>,
 }
 
@@ -1621,6 +1631,13 @@ struct AcceptedTrialMultiplierState {
     z_lower: Vec<f64>,
     z_upper: Vec<f64>,
     dual_inf: f64,
+}
+
+#[derive(Clone)]
+struct AcceptedTrialBoundAdjustment {
+    adjusted_slacks: Index,
+    bounds: BoundConstraints,
+    slack_upper_bounds: Vec<f64>,
 }
 
 struct InteriorPointInitialStateOverride {
@@ -5554,6 +5571,149 @@ fn slack_barrier_values(slack: &[f64], upper_bounds: &[f64]) -> Vec<f64> {
         .zip(slack.iter())
         .map(|(&upper, &value)| upper - value)
         .collect()
+}
+
+#[derive(Clone)]
+struct TrialSafeSlackState {
+    lower_slack: Vec<f64>,
+    upper_slack: Vec<f64>,
+    slack_barrier: Vec<f64>,
+    adjusted_slacks: Index,
+    bounds: BoundConstraints,
+    slack_upper_bounds: Vec<f64>,
+}
+
+impl TrialSafeSlackState {
+    fn all_strictly_positive(&self) -> bool {
+        self.lower_slack.iter().all(|value| *value > 0.0)
+            && self.upper_slack.iter().all(|value| *value > 0.0)
+            && self.slack_barrier.iter().all(|value| *value > 0.0)
+    }
+
+    fn bound_adjustment(&self) -> Option<AcceptedTrialBoundAdjustment> {
+        (self.adjusted_slacks > 0).then(|| AcceptedTrialBoundAdjustment {
+            adjusted_slacks: self.adjusted_slacks,
+            bounds: self.bounds.clone(),
+            slack_upper_bounds: self.slack_upper_bounds.clone(),
+        })
+    }
+}
+
+struct TrialSafeSlackInputs<'a> {
+    trial_x: &'a [f64],
+    trial_slack: &'a [f64],
+    bounds: &'a BoundConstraints,
+    slack_upper_bounds: &'a [f64],
+    current_z_lower: &'a [f64],
+    current_z_upper: &'a [f64],
+    current_z: &'a [f64],
+    mu: f64,
+    slack_move: f64,
+}
+
+fn ipopt_safe_slack_min(mu: f64) -> f64 {
+    let mut s_min = f64::EPSILON * 1.0_f64.min(mu);
+    if s_min == 0.0 {
+        s_min = f64::MIN_POSITIVE;
+    }
+    s_min
+}
+
+fn ipopt_calculate_safe_slack(
+    slack: f64,
+    bound: f64,
+    multiplier: f64,
+    mu: f64,
+    slack_move: f64,
+) -> (f64, bool) {
+    let s_min = ipopt_safe_slack_min(mu);
+    if slack >= s_min {
+        return (slack, false);
+    }
+
+    let nonnegative_slack = slack.max(0.0);
+    let target = (mu / multiplier).max(s_min);
+    let max_moved = slack_move.mul_add(bound.abs().max(1.0), nonnegative_slack);
+    (target.min(max_moved), true)
+}
+
+fn trial_safe_slack_state(inputs: TrialSafeSlackInputs<'_>) -> TrialSafeSlackState {
+    debug_assert_eq!(
+        inputs.bounds.lower_indices.len(),
+        inputs.current_z_lower.len()
+    );
+    debug_assert_eq!(
+        inputs.bounds.upper_indices.len(),
+        inputs.current_z_upper.len()
+    );
+    debug_assert_eq!(inputs.slack_upper_bounds.len(), inputs.trial_slack.len());
+    debug_assert_eq!(inputs.current_z.len(), inputs.trial_slack.len());
+
+    let mut adjusted_slacks = 0;
+    let mut adjusted_bounds = inputs.bounds.clone();
+    let lower_slack = inputs
+        .bounds
+        .lower_indices
+        .iter()
+        .zip(inputs.bounds.lower_values.iter())
+        .zip(inputs.current_z_lower.iter())
+        .zip(adjusted_bounds.lower_values.iter_mut())
+        .map(|(((&index, &lower), &multiplier), adjusted_lower)| {
+            let slack = native_lower_bound_slack(inputs.trial_x, index, lower);
+            let (safe_slack, adjusted) =
+                ipopt_calculate_safe_slack(slack, lower, multiplier, inputs.mu, inputs.slack_move);
+            if adjusted {
+                adjusted_slacks += 1;
+            }
+            *adjusted_lower = inputs.trial_x[index] - safe_slack;
+            safe_slack
+        })
+        .collect::<Vec<_>>();
+    let upper_slack = inputs
+        .bounds
+        .upper_indices
+        .iter()
+        .zip(inputs.bounds.upper_values.iter())
+        .zip(inputs.current_z_upper.iter())
+        .zip(adjusted_bounds.upper_values.iter_mut())
+        .map(|(((&index, &upper), &multiplier), adjusted_upper)| {
+            let slack = native_upper_bound_slack(inputs.trial_x, index, upper);
+            let (safe_slack, adjusted) =
+                ipopt_calculate_safe_slack(slack, upper, multiplier, inputs.mu, inputs.slack_move);
+            if adjusted {
+                adjusted_slacks += 1;
+            }
+            *adjusted_upper = inputs.trial_x[index] + safe_slack;
+            safe_slack
+        })
+        .collect::<Vec<_>>();
+    let mut adjusted_slack_upper_bounds = inputs.slack_upper_bounds.to_vec();
+    let slack_barrier = inputs
+        .slack_upper_bounds
+        .iter()
+        .zip(inputs.trial_slack.iter())
+        .zip(inputs.current_z.iter())
+        .zip(adjusted_slack_upper_bounds.iter_mut())
+        .map(|(((&upper, &slack_value), &multiplier), adjusted_upper)| {
+            let slack = upper - slack_value;
+            let (safe_slack, adjusted) =
+                ipopt_calculate_safe_slack(slack, upper, multiplier, inputs.mu, inputs.slack_move);
+            if adjusted {
+                adjusted_slacks += 1;
+            }
+            *adjusted_upper = slack_value + safe_slack;
+            safe_slack
+        })
+        .collect::<Vec<_>>();
+
+    TrialSafeSlackState {
+        lower_slack,
+        upper_slack,
+        slack_barrier,
+        adjusted_slacks,
+        bounds: adjusted_bounds,
+        slack_upper_bounds: adjusted_slack_upper_bounds,
+    }
 }
 
 fn apply_ipopt_upper_slack_magic_step(
@@ -10799,6 +10959,10 @@ fn default_ipopt_linear_residual_improvement_factor() -> f64 {
     IPOPT_LINEAR_RESIDUAL_IMPROVEMENT_FACTOR
 }
 
+fn default_ipopt_slack_move() -> f64 {
+    f64::EPSILON.powf(0.75)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct IpoptLinearRefinementOptions {
     min_refinement_steps: usize,
@@ -15507,18 +15671,28 @@ mod tests {
         ]);
         let barrier_update =
             snapshot_with_events(vec![InteriorPointIterationEvent::BarrierParameterUpdated]);
+        let bounds_adjusted = snapshot_with_events(vec![
+            InteriorPointIterationEvent::BoundsAdjustedForTinySlack,
+        ]);
 
         let watchdog_stop = snapshot_with_events(vec![
             InteriorPointIterationEvent::WatchdogStoppedBeforeLineSearch,
         ]);
 
-        assert_eq!(nlip_event_slot_codes(&filter_soc), " F S             ");
-        assert_eq!(nlip_event_slot_codes(&filter_watchdog), " F     W         ");
-        assert_eq!(nlip_event_slot_codes(&watchdog_stop), "        w        ");
-        assert_eq!(nlip_event_slot_codes(&filter_reset), "         X       ");
-        assert_eq!(nlip_event_slot_codes(&watchdog_only), "       W         ");
-        assert_eq!(nlip_event_slot_codes(&linear_quality), "          q      ");
-        assert_eq!(nlip_event_slot_codes(&barrier_update), "            U    ");
+        assert_eq!(nlip_event_slot_codes(&filter_soc), " F S              ");
+        assert_eq!(
+            nlip_event_slot_codes(&filter_watchdog),
+            " F     W          "
+        );
+        assert_eq!(nlip_event_slot_codes(&watchdog_stop), "        w         ");
+        assert_eq!(nlip_event_slot_codes(&filter_reset), "         X        ");
+        assert_eq!(nlip_event_slot_codes(&watchdog_only), "       W          ");
+        assert_eq!(nlip_event_slot_codes(&linear_quality), "          q       ");
+        assert_eq!(
+            nlip_event_slot_codes(&bounds_adjusted),
+            "            b     "
+        );
+        assert_eq!(nlip_event_slot_codes(&barrier_update), "             U    ");
     }
 
     #[test]
@@ -15561,6 +15735,65 @@ mod tests {
         assert_eq!(slack[1].to_bits(), (-0.3_f64).to_bits());
         assert!((slack[2] + 1.2).abs() <= f64::EPSILON);
         assert_eq!(slack[3].to_bits(), 0.0_f64.to_bits());
+    }
+
+    #[test]
+    fn ipopt_safe_slack_uses_source_floor_target_and_move_cap() {
+        let slack_move = 1.0e-3;
+
+        let (capped, adjusted) = ipopt_calculate_safe_slack(-1.0e-12, 10.0, 2.0, 0.1, slack_move);
+        assert!(adjusted);
+        assert_eq!(capped.to_bits(), 0.01_f64.to_bits());
+
+        let zero_mu_floor = ipopt_safe_slack_min(0.0);
+        assert_eq!(zero_mu_floor.to_bits(), f64::MIN_POSITIVE.to_bits());
+        let (floored, adjusted) =
+            ipopt_calculate_safe_slack(0.0, 0.0, f64::INFINITY, 0.0, slack_move);
+        assert!(adjusted);
+        assert_eq!(floored.to_bits(), zero_mu_floor.to_bits());
+
+        let large_slack = ipopt_safe_slack_min(0.1) * 2.0;
+        let (unchanged, adjusted) =
+            ipopt_calculate_safe_slack(large_slack, 1.0, 1.0, 0.1, slack_move);
+        assert!(!adjusted);
+        assert_eq!(unchanged.to_bits(), large_slack.to_bits());
+    }
+
+    #[test]
+    fn ipopt_safe_slack_adjusts_bounds_like_calculated_quantities() {
+        let options = InteriorPointOptions {
+            slack_move: 1.0e-3,
+            ..InteriorPointOptions::default()
+        };
+        let bounds = BoundConstraints {
+            lower_indices: vec![0],
+            lower_values: vec![2.0],
+            upper_indices: vec![1],
+            upper_values: vec![5.0],
+        };
+        let trial_x = vec![2.0, 5.0];
+        let trial_slack = vec![0.0];
+        let slack_upper_bounds = vec![0.0];
+        let state = trial_safe_slack_state(TrialSafeSlackInputs {
+            trial_x: &trial_x,
+            trial_slack: &trial_slack,
+            bounds: &bounds,
+            slack_upper_bounds: &slack_upper_bounds,
+            current_z_lower: &[1.0],
+            current_z_upper: &[2.0],
+            current_z: &[4.0],
+            mu: 0.1,
+            slack_move: options.slack_move,
+        });
+
+        assert_eq!(state.adjusted_slacks, 3);
+        assert!(state.all_strictly_positive());
+        assert_eq!(state.lower_slack[0].to_bits(), 0.002_f64.to_bits());
+        assert_eq!(state.upper_slack[0].to_bits(), 0.005_f64.to_bits());
+        assert_eq!(state.slack_barrier[0].to_bits(), 0.001_f64.to_bits());
+        assert_eq!(state.bounds.lower_values[0].to_bits(), 1.998_f64.to_bits());
+        assert_eq!(state.bounds.upper_values[0].to_bits(), 5.005_f64.to_bits());
+        assert_eq!(state.slack_upper_bounds[0].to_bits(), 0.001_f64.to_bits());
     }
 
     #[test]
@@ -18892,6 +19125,12 @@ fn validate_interior_point_options(
             options.diverging_iterates_tol
         )));
     }
+    if !options.slack_move.is_finite() || options.slack_move < 0.0 {
+        return Err(InteriorPointSolveError::InvalidInput(format!(
+            "slack_move must be finite and non-negative, got {}",
+            options.slack_move
+        )));
+    }
     if !options.max_cpu_time.is_finite() || options.max_cpu_time <= 0.0 {
         return Err(InteriorPointSolveError::InvalidInput(format!(
             "max_cpu_time must be finite and positive, got {}",
@@ -19219,7 +19458,7 @@ where
 
     let equality_count = problem.equality_count();
     let inequality_count = problem.inequality_count();
-    let (bounds, fixed_variables) = collect_interior_point_bounds_and_fixed(problem, options)?;
+    let (mut bounds, fixed_variables) = collect_interior_point_bounds_and_fixed(problem, options)?;
     let augmented_inequality_count = inequality_count;
     let barrier_bound_count = bounds.total_count();
     let barrier_pair_count = augmented_inequality_count + barrier_bound_count;
@@ -19272,7 +19511,7 @@ where
     let mut z_lower = vec![1.0; bounds.lower_indices.len()];
     let mut z_upper = vec![1.0; bounds.upper_indices.len()];
     let mut slack = vec![1.0; augmented_inequality_count];
-    let slack_upper_bounds = slack_upper_bound_values(augmented_inequality_count, options);
+    let mut slack_upper_bounds = slack_upper_bound_values(augmented_inequality_count, options);
     let mut event_state = SqpEventLegendState::default();
     let mut last_adapter_timing = problem.adapter_timing_snapshot();
     profiling.adapter_timing = last_adapter_timing;
@@ -22134,6 +22373,7 @@ where
                                         watchdog_accepted: watchdog_active,
                                         tiny_step: false,
                                         bound_multiplier_corrected,
+                                        bound_adjustment: None,
                                         forced_termination: None,
                                     });
                                 }
@@ -22213,7 +22453,21 @@ where
                     );
                     trial_state_cache = Some(magic_state);
                 }
-                let trial_slack_barrier = slack_barrier_values(&trial_slack, &slack_upper_bounds);
+                let trial_safe_slacks = trial_safe_slack_state(TrialSafeSlackInputs {
+                    trial_x: &trial_x,
+                    trial_slack: &trial_slack,
+                    bounds: &bounds,
+                    slack_upper_bounds: &slack_upper_bounds,
+                    current_z_lower: &z_lower,
+                    current_z_upper: &z_upper,
+                    current_z: &z,
+                    mu: barrier_parameter_value,
+                    slack_move: options.slack_move,
+                });
+                let trial_bound_adjustment = trial_safe_slacks.bound_adjustment();
+                let trial_slack_barrier = trial_safe_slacks.slack_barrier.clone();
+                let trial_bounds = &trial_safe_slacks.bounds;
+                let trial_slack_upper_bounds = &trial_safe_slacks.slack_upper_bounds;
                 let trial_z = z
                     .iter()
                     .zip(direction.dz.iter())
@@ -22235,16 +22489,7 @@ where
                         ipopt_dense_current_plus_step(*value, trial_alpha_du, *delta)
                     })
                     .collect::<Vec<_>>();
-                let trial_bounds_positive = bounds
-                    .lower_indices
-                    .iter()
-                    .zip(bounds.lower_values.iter())
-                    .all(|(&index, &lower)| trial_x[index] > lower)
-                    && bounds
-                        .upper_indices
-                        .iter()
-                        .zip(bounds.upper_values.iter())
-                        .all(|(&index, &upper)| trial_x[index] < upper);
+                let trial_bounds_positive = trial_safe_slacks.all_strictly_positive();
                 let trial_bound_multipliers_positive =
                     trial_z_lower.iter().all(|value| *value > 0.0)
                         && trial_z_upper.iter().all(|value| *value > 0.0);
@@ -22341,7 +22586,7 @@ where
                     &trial_z,
                     &trial_z_lower,
                     &trial_z_upper,
-                    &bounds,
+                    trial_bounds,
                     options,
                 );
                 last_tried_alpha_y = trial_alpha_y;
@@ -22366,7 +22611,7 @@ where
                 let trial_eq_inf = inf_norm(&trial_state.equality_values);
                 let trial_ineq_inf = inequality_upper_bound_inf_norm(
                     &trial_state.augmented_inequality_values,
-                    &slack_upper_bounds,
+                    trial_slack_upper_bounds,
                 );
                 let trial_internal_ineq_inf = slack_form_inequality_inf_norm(
                     &trial_state.augmented_inequality_values,
@@ -22383,7 +22628,7 @@ where
                 let mut trial_dual_residual = trial_raw_dual_residual.clone();
                 add_native_bound_multiplier_terms(
                     &mut trial_dual_residual,
-                    &bounds,
+                    trial_bounds,
                     &trial_z_lower,
                     &trial_z_upper,
                 );
@@ -22396,7 +22641,7 @@ where
                         &trial_slack_barrier,
                         &trial_z,
                         &trial_x,
-                        &bounds,
+                        trial_bounds,
                         &trial_z_lower,
                         &trial_z_upper,
                     )
@@ -22440,7 +22685,7 @@ where
                     &trial_raw_dual_residual,
                     &fixed_variables,
                     &trial_x,
-                    &bounds,
+                    trial_bounds,
                     &trial_slack_barrier,
                     &trial_z,
                     &trial_z_lower,
@@ -22452,7 +22697,7 @@ where
                     trial_state.objective_value,
                     &trial_slack_barrier,
                     &trial_x,
-                    &bounds,
+                    trial_bounds,
                     barrier_parameter_value,
                     options.kappa_d,
                 );
@@ -22473,7 +22718,7 @@ where
                             &trial_slack_barrier,
                             &corrected.z,
                             &trial_x,
-                            &bounds,
+                            trial_bounds,
                             &corrected.z_lower,
                             &corrected.z_upper,
                         );
@@ -22527,7 +22772,7 @@ where
                             &trial_slack_barrier,
                             &accepted_z,
                             &trial_x,
-                            &bounds,
+                            trial_bounds,
                             &accepted_z_lower,
                             &accepted_z_upper,
                             &trial_lambda,
@@ -22545,7 +22790,7 @@ where
                         ),
                         kkt_x_stationarity: snapshot_damped_lagrangian_gradient_x_with_bound_terms(
                             &trial_raw_dual_residual,
-                            &bounds,
+                            trial_bounds,
                             &fixed_variables,
                             &accepted_z_lower,
                             &accepted_z_upper,
@@ -22578,7 +22823,7 @@ where
                         ),
                         curr_grad_lag_x: snapshot_lagrangian_gradient_x_with_bound_terms(
                             &trial_raw_dual_residual,
-                            &bounds,
+                            trial_bounds,
                             &fixed_variables,
                             &accepted_z_lower,
                             &accepted_z_upper,
@@ -22626,6 +22871,7 @@ where
                         watchdog_accepted: false,
                         tiny_step: true,
                         bound_multiplier_corrected,
+                        bound_adjustment: trial_bound_adjustment.clone(),
                         forced_termination: None,
                     });
                     break;
@@ -22705,7 +22951,7 @@ where
                             &trial_slack_barrier,
                             &corrected.z,
                             &trial_x,
-                            &bounds,
+                            trial_bounds,
                             &corrected.z_lower,
                             &corrected.z_upper,
                         );
@@ -22759,7 +23005,7 @@ where
                             &trial_slack_barrier,
                             &accepted_z,
                             &trial_x,
-                            &bounds,
+                            trial_bounds,
                             &accepted_z_lower,
                             &accepted_z_upper,
                             &trial_lambda,
@@ -22777,7 +23023,7 @@ where
                         ),
                         kkt_x_stationarity: snapshot_damped_lagrangian_gradient_x_with_bound_terms(
                             &trial_raw_dual_residual,
-                            &bounds,
+                            trial_bounds,
                             &fixed_variables,
                             &accepted_z_lower,
                             &accepted_z_upper,
@@ -22810,7 +23056,7 @@ where
                         ),
                         curr_grad_lag_x: snapshot_lagrangian_gradient_x_with_bound_terms(
                             &trial_raw_dual_residual,
-                            &bounds,
+                            trial_bounds,
                             &fixed_variables,
                             &accepted_z_lower,
                             &accepted_z_upper,
@@ -22869,6 +23115,7 @@ where
                         watchdog_accepted: watchdog_active,
                         tiny_step: false,
                         bound_multiplier_corrected,
+                        bound_adjustment: trial_bound_adjustment.clone(),
                         forced_termination: None,
                     });
                     break;
@@ -23462,6 +23709,7 @@ where
                                 watchdog_accepted: watchdog_active,
                                 tiny_step: false,
                                 bound_multiplier_corrected,
+                                bound_adjustment: None,
                                 forced_termination: None,
                             });
                             break;
@@ -23761,6 +24009,7 @@ where
                         watchdog_accepted: watchdog_accept,
                         tiny_step: false,
                         bound_multiplier_corrected,
+                        bound_adjustment: None,
                         forced_termination: None,
                     });
                     break;
@@ -24327,6 +24576,7 @@ where
                             watchdog_accepted: false,
                             tiny_step: false,
                             bound_multiplier_corrected,
+                            bound_adjustment: None,
                             forced_termination: None,
                         });
                         line_search_iterations = restore_line_search_iterations;
@@ -24861,6 +25111,7 @@ where
                                     watchdog_accepted: false,
                                     tiny_step: false,
                                     bound_multiplier_corrected,
+                                    bound_adjustment: None,
                                     forced_termination: None,
                                 });
                                 if satisfies_original_criterion {
@@ -25150,6 +25401,7 @@ where
                         watchdog_accepted: false,
                         tiny_step: false,
                         bound_multiplier_corrected: false,
+                        bound_adjustment: None,
                         forced_termination: None,
                     });
                 }
@@ -25761,6 +26013,7 @@ where
                             watchdog_accepted: false,
                             tiny_step: false,
                             bound_multiplier_corrected: restoration_bound_multiplier_reset,
+                            bound_adjustment: None,
                             forced_termination: forced_restoration_termination,
                         });
                     }
@@ -25815,6 +26068,7 @@ where
             let step_inf = ipopt_primal_step_inf_norm(&direction);
             let tiny_step = accepted_trial.tiny_step;
             let forced_termination = accepted_trial.forced_termination;
+            let accepted_bound_adjustment = accepted_trial.bound_adjustment.clone();
             // BacktrackingLineSearch skips the normal shortened-step/watchdog
             // update while it remains in the soft-restoration phase.
             let shortened_step = !matches!(accepted_trial.step_tag, 's' | 'r' | 'R')
@@ -25882,6 +26136,15 @@ where
                 push_unique_nlip_event(
                     &mut events,
                     InteriorPointIterationEvent::BoundMultiplierSafeguardApplied,
+                );
+            }
+            if accepted_bound_adjustment
+                .as_ref()
+                .is_some_and(|adjustment| adjustment.adjusted_slacks > 0)
+            {
+                push_unique_nlip_event(
+                    &mut events,
+                    InteriorPointIterationEvent::BoundsAdjustedForTinySlack,
                 );
             }
             if tiny_step {
@@ -26069,6 +26332,10 @@ where
             z = accepted_trial.z;
             z_lower = accepted_trial.z_lower;
             z_upper = accepted_trial.z_upper;
+            if let Some(bound_adjustment) = accepted_bound_adjustment {
+                bounds = bound_adjustment.bounds;
+                slack_upper_bounds = bound_adjustment.slack_upper_bounds;
+            }
             filter_entries = next_filter_entries;
             nonlinear_inequality_multipliers = lambda_ineq.clone();
             if let Some(termination) = forced_termination {

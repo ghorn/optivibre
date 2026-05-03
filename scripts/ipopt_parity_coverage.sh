@@ -463,6 +463,8 @@ def classify_rust_line(path, line_no, text):
             return "diagnostic/restoration branch"
         if "barrier_parameter: if barrier_pair_count > 0" in text:
             return "solve summary/reporting"
+        if 1040 <= line_no <= 1135:
+            return "diagnostic/reporting"
         if 1930 <= line_no <= 2180 and "ssids_rs" in text:
             return "unreachable: non-parity linear solver/debug branch"
         if 2160 <= line_no <= 2200:
@@ -537,11 +539,13 @@ def classify_rust_line(path, line_no, text):
             return "iteration log formatting/reporting"
         if 16750 <= line_no <= 16795:
             return "iteration log formatting/reporting"
-        if 18000 <= line_no <= 18340:
+        if 16900 <= line_no <= 18650:
             return "unit-test parity witness"
         if 24800 <= line_no <= 24900:
             return "restoration status mapping"
         if 25240 <= line_no <= 25330:
+            return "restoration status mapping"
+        if 25480 <= line_no <= 25560:
             return "restoration status mapping"
         if 14720 <= line_no <= 14770:
             return "iteration log formatting/reporting"
@@ -675,9 +679,9 @@ def classify_ipopt_line(file_name, line_no, text):
             return "search-direction failure/status witness gap"
     if file_name == "IpIpoptCalculatedQuantities.cpp":
         if line_no == 474:
-            return "adjusted-slack zero-mu floor witness gap"
+            return "covered by reduced adjusted-slack helper"
         if line_no == 479:
-            return "adjusted-slack bound-shift witness gap"
+            return "covered by reduced adjusted-slack helper"
         if line_no in {702, 715}:
             return "objective-depends-on-mu TNLP feature gap"
         if line_no in {928, 1021}:
@@ -721,7 +725,7 @@ def classify_ipopt_line(file_name, line_no, text):
         if line_no == 657:
             return "skipped line-search witness gap"
         if line_no in {667, 670}:
-            return "adjusted-slack bound-shift witness gap"
+            return "covered by reduced adjusted-slack helper"
         if line_no in {723, 733, 743, 753, 764}:
             return "covered by kappa_sigma bound-multiplier witness"
         if line_no in {777, 792, 797}:
