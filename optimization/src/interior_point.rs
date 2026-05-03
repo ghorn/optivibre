@@ -17058,7 +17058,7 @@ mod tests {
             ..InteriorPointOptions::default()
         };
         assert!(matches!(
-            validate_interior_point_options(&options),
+            validate_interior_point_options(&options, false),
             Err(InteriorPointSolveError::InvalidInput(message))
                 if message.contains("max_refinement_steps")
         ));
@@ -17067,7 +17067,7 @@ mod tests {
         options.residual_ratio_max = 1.0e-4;
         options.residual_ratio_singular = 1.0e-5;
         assert!(matches!(
-            validate_interior_point_options(&options),
+            validate_interior_point_options(&options, false),
             Err(InteriorPointSolveError::InvalidInput(message))
                 if message.contains("residual_ratio_singular")
         ));
@@ -17075,7 +17075,7 @@ mod tests {
         options.residual_ratio_singular = 1.0e-4;
         options.negative_curvature_test_tolerance = -f64::EPSILON;
         assert!(matches!(
-            validate_interior_point_options(&options),
+            validate_interior_point_options(&options, false),
             Err(InteriorPointSolveError::InvalidInput(message))
                 if message.contains("negative_curvature_test_tolerance")
         ));
@@ -19285,6 +19285,7 @@ fn finalise_interior_point_profiling(
 
 fn validate_interior_point_options(
     options: &InteriorPointOptions,
+    allow_zero_initializer_push: bool,
 ) -> std::result::Result<(), InteriorPointSolveError> {
     if !options.overall_tol.is_finite() || options.overall_tol < 0.0 {
         return Err(InteriorPointSolveError::InvalidInput(format!(
@@ -19326,6 +19327,64 @@ fn validate_interior_point_options(
         return Err(InteriorPointSolveError::InvalidInput(format!(
             "max_refinement_steps must be greater than or equal to min_refinement_steps, got max={} min={}",
             options.max_refinement_steps, options.min_refinement_steps
+        )));
+    }
+    if !options.bound_push.is_finite()
+        || options.bound_push < 0.0
+        || (!allow_zero_initializer_push && options.bound_push == 0.0)
+    {
+        return Err(InteriorPointSolveError::InvalidInput(format!(
+            "bound_push must be finite and {}, got {}",
+            if allow_zero_initializer_push {
+                "non-negative"
+            } else {
+                "positive"
+            },
+            options.bound_push
+        )));
+    }
+    if !options.bound_frac.is_finite()
+        || options.bound_frac < 0.0
+        || (!allow_zero_initializer_push && options.bound_frac == 0.0)
+        || options.bound_frac > 0.5
+    {
+        return Err(InteriorPointSolveError::InvalidInput(format!(
+            "bound_frac must be finite and in {}0,0.5], got {}",
+            if allow_zero_initializer_push {
+                "["
+            } else {
+                "("
+            },
+            options.bound_frac
+        )));
+    }
+    if !options.slack_bound_push.is_finite()
+        || options.slack_bound_push < 0.0
+        || (!allow_zero_initializer_push && options.slack_bound_push == 0.0)
+    {
+        return Err(InteriorPointSolveError::InvalidInput(format!(
+            "slack_bound_push must be finite and {}, got {}",
+            if allow_zero_initializer_push {
+                "non-negative"
+            } else {
+                "positive"
+            },
+            options.slack_bound_push
+        )));
+    }
+    if !options.slack_bound_frac.is_finite()
+        || options.slack_bound_frac < 0.0
+        || (!allow_zero_initializer_push && options.slack_bound_frac == 0.0)
+        || options.slack_bound_frac > 0.5
+    {
+        return Err(InteriorPointSolveError::InvalidInput(format!(
+            "slack_bound_frac must be finite and in {}0,0.5], got {}",
+            if allow_zero_initializer_push {
+                "["
+            } else {
+                "("
+            },
+            options.slack_bound_frac
         )));
     }
     if !options.residual_ratio_max.is_finite() || options.residual_ratio_max <= 0.0 {
@@ -19631,7 +19690,7 @@ where
         .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
     validate_parameter_inputs(problem, parameters)
         .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
-    validate_interior_point_options(options)?;
+    validate_interior_point_options(options, restoration_depth > 0)?;
     profiling.preprocessing_steps += 1;
     profiling.preprocessing_time += validation_started.elapsed();
 

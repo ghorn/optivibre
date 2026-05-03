@@ -551,7 +551,7 @@ def classify_rust_line(path, line_no, text):
             return "restoration status mapping"
         if 25480 <= line_no <= 25560:
             return "restoration status mapping"
-        if 25690 <= line_no <= 25740:
+        if 25690 <= line_no <= 25795:
             return "restoration status mapping"
         if 14720 <= line_no <= 14770:
             return "iteration log formatting/reporting"
@@ -676,7 +676,7 @@ def classify_ipopt_line(file_name, line_no, text):
         if line_no == 284:
             return "option/error handling"
         if line_no == 493:
-            return "IPOPT option-lower-bound unreachable branch"
+            return "covered by initializer push option-rejection witness"
     if file_name == "IpDefaultIterateInitializer.cpp" and line_no in {208, 302}:
         return "unreachable under parity options"
     if file_name == "IpMonotoneMuUpdate.cpp":

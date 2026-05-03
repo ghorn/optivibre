@@ -6527,6 +6527,66 @@ fn compare_native_and_ipopt_with_least_square_dual_initialization() {
 }
 
 #[test]
+fn compare_native_and_ipopt_reject_invalid_initializer_push_options() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+
+    macro_rules! assert_rejected {
+        ($field:ident, $value:expr, $raw_name:literal) => {{
+            let native = solve_nlp_interior_point(
+                &problem,
+                &[0.1, 0.9],
+                &[],
+                &native_options_with(|options| {
+                    options.$field = $value;
+                }),
+            );
+            assert!(
+                matches!(
+                    native,
+                    Err(InteriorPointSolveError::InvalidInput(ref message))
+                        if message.contains(stringify!($field))
+                ),
+                "NLIP should reject {}={}: {:?}",
+                stringify!($field),
+                $value,
+                native
+            );
+
+            let ipopt = solve_nlp_ipopt(
+                &problem,
+                &[0.1, 0.9],
+                &[],
+                &ipopt_options_with(|options| {
+                    options
+                        .raw_options
+                        .push(IpoptRawOption::number($raw_name, $value));
+                }),
+            );
+            assert!(
+                matches!(
+                    ipopt,
+                    Err(IpoptSolveError::OptionRejected { ref name }) if name == $raw_name
+                ),
+                "IPOPT should reject {}={}: {:?}",
+                $raw_name,
+                $value,
+                ipopt
+            );
+        }};
+    }
+
+    // IpDefaultIterateInitializer::RegisterOptions makes these public options
+    // strictly positive, with the fractional variants capped at 0.5.
+    assert_rejected!(bound_push, 0.0, "bound_push");
+    assert_rejected!(bound_frac, 0.0, "bound_frac");
+    assert_rejected!(bound_frac, 0.5000000001, "bound_frac");
+    assert_rejected!(slack_bound_push, 0.0, "slack_bound_push");
+    assert_rejected!(slack_bound_frac, 0.0, "slack_bound_frac");
+    assert_rejected!(slack_bound_frac, 0.5000000001, "slack_bound_frac");
+}
+
+#[test]
 fn compare_invalid_shape_rejected_by_both_solvers() {
     let invalid = invalid_shape_problem();
     assert!(solve_nlp_interior_point(&invalid, &[0.0, 0.0], &[], &native_options()).is_err());
