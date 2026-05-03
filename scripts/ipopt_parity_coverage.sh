@@ -634,7 +634,9 @@ def classify_ipopt_line(file_name, line_no, text):
             return "restoration/fallback witness gap"
         if line_no == 403:
             return "covered by tiny-step eval-error fallback witness"
-        if line_no in {422, 1261}:
+        if line_no == 422:
+            return "covered by tiny-step dual-threshold witness"
+        if line_no == 1261:
             return "tiny-step witness gap"
         if line_no in {455, 458, 546, 1144, 1167, 1172, 1182}:
             return "soft-restoration witness gap"

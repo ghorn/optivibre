@@ -6145,6 +6145,85 @@ fn compare_native_and_ipopt_forced_tiny_step_acceptance() {
 }
 
 #[test]
+fn compare_native_and_ipopt_forced_tiny_step_without_dual_tiny_state() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_nlp_interior_point(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        &native_options_with(|options| {
+            options.max_iters = 1;
+            options.tiny_step_tol = 1e6;
+            options.tiny_step_y_tol = 0.0;
+        }),
+    );
+    let ipopt = solve_nlp_ipopt(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        &ipopt_options_with(|options| {
+            options.max_iters = 1;
+            options
+                .raw_options
+                .push(IpoptRawOption::number("tiny_step_tol", 1e6));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("tiny_step_y_tol", 0.0));
+        }),
+    );
+
+    let native_state = match native {
+        Err(InteriorPointSolveError::MaxIterations {
+            iterations: 1,
+            context,
+        }) => context
+            .final_state
+            .expect("NLIP tiny-step dual threshold witness should retain accepted state"),
+        other => panic!("native tiny-step dual threshold status mismatch: {other:?}"),
+    };
+    let (ipopt_state, ipopt_tags) = match ipopt {
+        Err(IpoptSolveError::Solve {
+            status,
+            snapshots,
+            journal_output,
+            ..
+        }) => {
+            assert_eq!(status, IpoptRawStatus::MaximumIterationsExceeded);
+            let state = snapshots
+                .into_iter()
+                .find(|snapshot| {
+                    snapshot.iteration == 1
+                        && snapshot.phase == optimization::IpoptIterationPhase::Regular
+                })
+                .expect("IPOPT tiny-step dual threshold witness should retain accepted iteration");
+            (state, parse_ipopt_step_tags(journal_output.as_deref()))
+        }
+        other => panic!("IPOPT tiny-step dual threshold status mismatch: {other:?}"),
+    };
+
+    assert_abs_diff_eq!(native_state.x[0], ipopt_state.x[0], epsilon = 1e-10);
+    assert_abs_diff_eq!(native_state.x[1], ipopt_state.x[1], epsilon = 1e-10);
+    assert_abs_diff_eq!(
+        native_state.alpha_pr.expect("NLIP accepted alpha_pr"),
+        ipopt_state.alpha_pr,
+        epsilon = 1e-12
+    );
+    assert!(
+        native_state.step_tag == Some('t'),
+        "forced tiny-step profile should accept an unchecked tiny step"
+    );
+    assert!(
+        native_state.step_tag != Some('T'),
+        "zero tiny_step_y_tol should keep tiny_step_last_iteration false"
+    );
+    assert!(
+        !ipopt_tags.values().any(|tag| tag == "T"),
+        "IPOPT should not emit the repeated-tiny-step marker with zero tiny_step_y_tol"
+    );
+}
+
+#[test]
 fn compare_native_and_ipopt_with_least_square_primal_initialization() {
     skip_without_native_spral!();
 
