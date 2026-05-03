@@ -8,5 +8,5 @@
     "noEmitOnError": true,
     "lib": ["DOM", "ES2022"]
   },
-  "include": ["static/app.ts"]
+  "include": ["static/app.ts", "static/aero_analysis.ts"]
 }

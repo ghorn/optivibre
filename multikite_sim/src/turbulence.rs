@@ -1,4 +1,4 @@
-use crate::types::Diagnostics;
+use crate::types::{Diagnostics, DrydenConfig};
 use nalgebra::Vector3;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -33,14 +33,17 @@ pub struct DrydenField<const NK: usize> {
     states: [DrydenState; NK],
     gusts_n: [Vector3<f64>; NK],
     rng: StdRng,
+    config: DrydenConfig,
 }
 
 impl<const NK: usize> DrydenField<NK> {
-    pub fn new(seed: u64) -> Self {
+    pub fn new(config: DrydenConfig) -> Self {
+        let config = config.finite_or_default(&DrydenConfig::default());
         Self {
             states: std::array::from_fn(|_| DrydenState::zero()),
             gusts_n: std::array::from_fn(|_| Vector3::zeros()),
-            rng: StdRng::seed_from_u64(seed),
+            rng: StdRng::seed_from_u64(config.seed),
+            config,
         }
     }
 
@@ -69,10 +72,11 @@ impl<const NK: usize> DrydenField<NK> {
                 agl_m,
                 airspeed_mps,
                 std_noise,
+                &self.config,
                 &self.states[kite_index],
             );
             self.gusts_n[kite_index] =
-                calc_wind_turbulence(agl_m, clean_wind_n, &self.states[kite_index]);
+                calc_wind_turbulence(agl_m, clean_wind_n, &self.config, &self.states[kite_index]);
         }
     }
 }
@@ -89,22 +93,44 @@ fn smooth_saturate(bounds: (f64, f64), value: f64) -> f64 {
     magnitude * 2.0 * (1.0 / (1.0 + (-c * (value - mean)).exp()) - 0.5) + mean
 }
 
-fn calc_dryden_turb_length_scale(agl_ft: f64) -> Vector3<f64> {
-    let l_wg = smooth_saturate((10.0, 1000.0), agl_ft);
+fn calc_dryden_turb_length_scale(agl_ft: f64, config: &DrydenConfig) -> Vector3<f64> {
+    let effective_agl_ft = if config.altitude_length_scale_enabled {
+        agl_ft
+    } else {
+        1000.0
+    };
+    let l_wg = smooth_saturate((10.0, 1000.0), effective_agl_ft);
     let l_uvg = l_wg / (0.177 + 0.000823 * l_wg).powf(1.2);
-    Vector3::new(l_uvg, l_uvg, l_wg)
+    Vector3::new(l_uvg, l_uvg, l_wg) * config.length_scale
 }
 
-fn calc_dryden_turb_intensities(agl_ft: f64, wind20_ft: f64) -> Vector3<f64> {
-    let agl_sat_ft = smooth_saturate((0.0, 1000.0), agl_ft);
+fn calc_dryden_turb_intensities(
+    agl_ft: f64,
+    wind20_ft: f64,
+    config: &DrydenConfig,
+) -> Vector3<f64> {
+    let effective_agl_ft = if config.altitude_intensity_enabled {
+        agl_ft
+    } else {
+        1000.0
+    };
+    let agl_sat_ft = smooth_saturate((0.0, 1000.0), effective_agl_ft);
     let sigma_wg = 0.1 * wind20_ft;
     let sigma_uvg = sigma_wg / (0.177 + 0.000823 * agl_sat_ft).powf(0.4);
-    Vector3::new(sigma_uvg, sigma_uvg, sigma_wg)
+    Vector3::new(sigma_uvg, sigma_uvg, sigma_wg) * config.intensity_scale
 }
 
-fn calc_dryden_turb(agl_m: f64, wind_n: &Vector3<f64>, dryden_state: &DrydenState) -> Vector3<f64> {
-    let sigma_ft =
-        calc_dryden_turb_intensities(METERS_TO_FEET * agl_m, METERS_TO_FEET * wind_n.norm());
+fn calc_dryden_turb(
+    agl_m: f64,
+    wind_n: &Vector3<f64>,
+    config: &DrydenConfig,
+    dryden_state: &DrydenState,
+) -> Vector3<f64> {
+    let sigma_ft = calc_dryden_turb_intensities(
+        METERS_TO_FEET * agl_m,
+        METERS_TO_FEET * wind_n.norm(),
+        config,
+    );
     let noise = Vector3::new(
         dryden_state.x_noise_f_z1[0],
         dryden_state.x_noise2_f_z1[1],
@@ -116,6 +142,7 @@ fn calc_dryden_turb(agl_m: f64, wind_n: &Vector3<f64>, dryden_state: &DrydenStat
 fn calc_wind_turbulence(
     agl_m: f64,
     wind_n: &Vector3<f64>,
+    config: &DrydenConfig,
     dryden_state: &DrydenState,
 ) -> Vector3<f64> {
     let wind_dir = (-wind_n[1]).atan2(-wind_n[0]);
@@ -124,7 +151,7 @@ fn calc_wind_turbulence(
         Vector3::new(-wind_dir.sin(), wind_dir.cos(), 0.0),
         Vector3::new(0.0, 0.0, 1.0),
     ];
-    let wind_turb_w = calc_dryden_turb(agl_m, wind_n, dryden_state);
+    let wind_turb_w = calc_dryden_turb(agl_m, wind_n, config, dryden_state);
     dcm_w2n[0] * wind_turb_w[0] + dcm_w2n[1] * wind_turb_w[1] + dcm_w2n[2] * wind_turb_w[2]
 }
 
@@ -133,10 +160,11 @@ fn update_dryden_turb(
     agl_m: f64,
     apparent_airspeed_mps: f64,
     std_noise: Vector3<f64>,
+    config: &DrydenConfig,
     state: &DrydenState,
 ) -> DrydenState {
     let v_app_norm_ft = (1.0 + (METERS_TO_FEET * apparent_airspeed_mps).powi(2)).sqrt();
-    let l_ft = calc_dryden_turb_length_scale(METERS_TO_FEET * agl_m);
+    let l_ft = calc_dryden_turb_length_scale(METERS_TO_FEET * agl_m, config);
     let tc = l_ft / v_app_norm_ft;
     let noise_prime = std_noise * (PI / dt_seconds.max(1.0e-6)).sqrt();
     let too = Vector3::new(2.0, 1.0, 1.0);
@@ -162,18 +190,30 @@ fn update_dryden_turb(
 mod tests {
     use super::{DrydenField, calc_wind_turbulence};
     use crate::model::blank_diagnostics;
+    use crate::types::DrydenConfig;
     use nalgebra::Vector3;
 
     #[test]
     fn zero_state_produces_zero_turbulence() {
-        let field = DrydenField::<1>::new(7);
-        let gust = calc_wind_turbulence(100.0, &Vector3::new(5.0, 0.0, 0.0), &field.states[0]);
+        let field = DrydenField::<1>::new(DrydenConfig {
+            seed: 7,
+            ..DrydenConfig::default()
+        });
+        let gust = calc_wind_turbulence(
+            100.0,
+            &Vector3::new(5.0, 0.0, 0.0),
+            &DrydenConfig::default(),
+            &field.states[0],
+        );
         assert!(gust.norm() < 1.0e-12);
     }
 
     #[test]
     fn dryden_update_stays_finite() {
-        let mut field = DrydenField::<2>::new(9);
+        let mut field = DrydenField::<2>::new(DrydenConfig {
+            seed: 9,
+            ..DrydenConfig::default()
+        });
         let mut diagnostics = blank_diagnostics::<f64, 2>();
         diagnostics.kites[0].cad_position_n = Vector3::new(0.0, 0.0, -120.0);
         diagnostics.kites[1].cad_position_n = Vector3::new(0.0, 0.0, -180.0);
@@ -183,5 +223,19 @@ mod tests {
         for gust in field.gusts_n() {
             assert!(gust.iter().all(|value| value.is_finite()));
         }
+    }
+
+    #[test]
+    fn zero_intensity_scale_suppresses_gust_output() {
+        let mut field = DrydenField::<1>::new(DrydenConfig {
+            seed: 11,
+            intensity_scale: 0.0,
+            ..DrydenConfig::default()
+        });
+        let mut diagnostics = blank_diagnostics::<f64, 1>();
+        diagnostics.kites[0].cad_position_n = Vector3::new(0.0, 0.0, -120.0);
+        diagnostics.kites[0].airspeed = 25.0;
+        field.advance(0.02, &diagnostics, &Vector3::new(5.0, 0.0, 0.0), 0.0);
+        assert!(field.gusts_n()[0].norm() < 1.0e-12);
     }
 }

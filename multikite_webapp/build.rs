@@ -6,7 +6,9 @@ use std::process::Command;
 fn main() {
     for path in [
         "static/app.ts",
+        "static/aero_analysis.ts",
         "static/index.html",
+        "static/aero_analysis.html",
         "static/styles.css",
         "tsconfig.json",
         "package.json",

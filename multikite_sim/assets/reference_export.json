@@ -40,9 +40,11 @@
   },
   "rotor": {
     "axis_b": [1.0, 0.0, 0.0],
+    "position_b": [1.0, 0.0, 0.0],
     "radius": 0.07,
-    "torque_to_force": 3.6,
-    "force_to_power": 18.0
+    "inertia": 0.01,
+    "sign": 1.0,
+    "initial_speed": 335.0
   },
   "bridle": {
     "pivot_b": [0.05, 0.0, 0.2],

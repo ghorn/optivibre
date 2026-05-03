@@ -420,7 +420,11 @@ fn construct_value_expr(ty: &Type, leaf_ident: &Ident) -> proc_macro2::TokenStre
         if ident == "Vector3" {
             quote!(::nalgebra::Vector3::new(f(), f(), f()))
         } else if ident == "Quaternion" {
-            quote!(::nalgebra::Quaternion::new(f(), f(), f(), f()))
+            quote!(::nalgebra::Quaternion {
+                coords: ::nalgebra::SVector::<U, 4>::from_array_storage(::nalgebra::ArrayStorage(
+                    [[f(), f(), f(), f()]]
+                ))
+            })
         } else {
             quote!(<#ty>::__vectorize_from_flat::<U>(f))
         }

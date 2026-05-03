@@ -9,14 +9,17 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use multikite_sim::{
-    COMMON_NODES, FREE_COMMON_NODES, FREE_UPPER_NODES, InitRequest, PhaseMode, Preset, RunSummary,
-    SimulationConfig, SimulationFrame, SimulationProgress, UPPER_NODES, available_presets,
+    COMMON_NODES, ControllerTuning, DrydenConfig, FREE_COMMON_NODES, FREE_UPPER_NODES, InitRequest,
+    LongitudinalMode, PhaseMode, Preset, RunSummary, SimulationConfig, SimulationFrame,
+    SimulationProgress, UPPER_NODES, available_presets, build_aero_analysis,
     simulate_free_flight1_with_callbacks, simulate_free_flight1_with_progress,
     simulate_simple_tether_with_callbacks, simulate_simple_tether_with_progress,
     simulate_star1_with_callbacks, simulate_star1_with_progress, simulate_star3_with_callbacks,
     simulate_star3_with_progress, simulate_star4_with_callbacks, simulate_star4_with_progress,
-    simulate_y2_reference_with_callbacks, simulate_y2_reference_with_progress,
-    simulate_y2_with_callbacks, simulate_y2_with_progress,
+    simulate_y2_high_with_callbacks, simulate_y2_high_with_progress,
+    simulate_y2_launch_with_callbacks, simulate_y2_launch_with_progress,
+    simulate_y2_low_with_callbacks, simulate_y2_low_with_progress, simulate_y2_with_callbacks,
+    simulate_y2_with_progress,
 };
 use nalgebra::UnitQuaternion;
 use serde::{Deserialize, Serialize};
@@ -29,9 +32,12 @@ const TEXT_CSS_UTF8: &str = "text/css; charset=utf-8";
 const IMAGE_SVG_XML: &str = "image/svg+xml";
 const APPLICATION_NDJSON_UTF8: &str = "application/x-ndjson; charset=utf-8";
 const GENERATED_APP_JS: &str = include_str!(concat!(env!("OUT_DIR"), "/app.js"));
-const STREAM_SCENE_FRAME_STRIDE: usize = 10;
-
+const GENERATED_AERO_ANALYSIS_JS: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/aero_analysis.js"));
 static LAST_SUMMARY: OnceLock<Mutex<Option<RunSummary>>> = OnceLock::new();
+
+#[derive(Debug)]
+struct StreamCancelled;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -47,10 +53,26 @@ struct Cli {
 struct RunRequest {
     preset: Preset,
     duration: f64,
+    dt_control: Option<f64>,
     phase_mode: PhaseMode,
+    #[serde(default)]
+    longitudinal_mode: LongitudinalMode,
     payload_mass_kg: Option<f64>,
     wind_speed_mps: Option<f64>,
     sample_stride: Option<usize>,
+    rk_abs_tol: Option<f64>,
+    rk_rel_tol: Option<f64>,
+    max_substeps: Option<usize>,
+    controller_tuning: Option<ControllerTuning<f64>>,
+    #[serde(default)]
+    sim_noise_enabled: bool,
+    dryden: Option<DrydenConfig>,
+    #[serde(default = "default_true")]
+    bridle_enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -82,6 +104,7 @@ struct ApiFrame {
     kite_positions_n: Vec<[f64; 3]>,
     kite_quaternions_n2b: Vec<[f64; 4]>,
     kite_attitudes_rpy_deg: Vec<[f64; 3]>,
+    kite_control_roll_pitch_deg: Vec<[f64; 2]>,
     rabbit_targets_n: Vec<[f64; 3]>,
     phase_error: Vec<f64>,
     speed_target: Vec<f64>,
@@ -99,6 +122,7 @@ struct ApiFrame {
     pitch_energy_integrator: Vec<f64>,
     inertial_speed: Vec<f64>,
     airspeed: Vec<f64>,
+    rotor_speed: Vec<f64>,
     alpha_deg: Vec<f64>,
     beta_deg: Vec<f64>,
     body_omega_b: Vec<[f64; 3]>,
@@ -112,9 +136,27 @@ struct ApiFrame {
     beta_ref_deg: Vec<f64>,
     roll_ref_deg: Vec<f64>,
     roll_ff_deg: Vec<f64>,
+    roll_p_deg: Vec<f64>,
+    roll_i_deg: Vec<f64>,
     pitch_ref_deg: Vec<f64>,
+    pitch_ref_p_deg: Vec<f64>,
+    pitch_ref_i_deg: Vec<f64>,
     curvature_z_b: Vec<f64>,
     curvature_z_ref: Vec<f64>,
+    aileron_trim_deg: Vec<f64>,
+    aileron_roll_p_deg: Vec<f64>,
+    aileron_roll_d_deg: Vec<f64>,
+    rudder_trim_deg: Vec<f64>,
+    rudder_beta_p_deg: Vec<f64>,
+    rudder_rate_d_deg: Vec<f64>,
+    rudder_world_z_p_deg: Vec<f64>,
+    elevator_trim_deg: Vec<f64>,
+    elevator_pitch_p_deg: Vec<f64>,
+    elevator_pitch_d_deg: Vec<f64>,
+    elevator_alpha_protection_deg: Vec<f64>,
+    motor_torque_trim: Vec<f64>,
+    motor_torque_p: Vec<f64>,
+    motor_torque_i: Vec<f64>,
     top_tension: Vec<f64>,
     total_force_b: Vec<[f64; 3]>,
     aero_force_b: Vec<[f64; 3]>,
@@ -126,7 +168,10 @@ struct ApiFrame {
     motor_force_b: Vec<[f64; 3]>,
     total_moment_b: Vec<[f64; 3]>,
     aero_moment_b: Vec<[f64; 3]>,
+    rudder_force_b: Vec<[f64; 3]>,
+    rudder_moment_b: Vec<[f64; 3]>,
     tether_moment_b: Vec<[f64; 3]>,
+    motor_moment_b: Vec<[f64; 3]>,
     cl_total: Vec<f64>,
     cl_0_term: Vec<f64>,
     cl_alpha_term: Vec<f64>,
@@ -156,15 +201,24 @@ struct ApiFrame {
     yaw_r_term: Vec<f64>,
     yaw_rudder_term: Vec<f64>,
     aileron_cmd_deg: Vec<f64>,
+    aileron_applied_deg: Vec<f64>,
     flap_cmd_deg: Vec<f64>,
+    flap_applied_deg: Vec<f64>,
     winglet_cmd_deg: Vec<f64>,
+    winglet_applied_deg: Vec<f64>,
     elevator_cmd_deg: Vec<f64>,
+    elevator_applied_deg: Vec<f64>,
     rudder_cmd_deg: Vec<f64>,
+    rudder_applied_deg: Vec<f64>,
     motor_torque: Vec<f64>,
+    motor_torque_applied: Vec<f64>,
     total_work: f64,
+    total_dissipated_work: f64,
     total_kinetic_energy: f64,
     total_potential_energy: f64,
     total_tether_strain_energy: f64,
+    total_mechanical_energy: f64,
+    energy_conservation_residual: f64,
     work_minus_potential: f64,
 }
 
@@ -189,13 +243,17 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/", get(index))
+        .route("/aero_analysis", get(aero_analysis_page))
         .route("/app.js", get(app_js))
+        .route("/aero_analysis.js", get(aero_analysis_js))
         .route("/styles.css", get(styles_css))
         .route("/favicon.svg", get(favicon))
         .route("/favicon.ico", get(favicon))
         .route("/api/presets", get(presets))
+        .route("/api/default_config", get(default_config))
         .route("/api/run", post(run))
         .route("/api/run_stream", post(run_stream))
+        .route("/api/aero_analysis", get(aero_analysis))
         .route("/api/last_summary", get(last_summary))
         .route("/healthz", get(healthz));
 
@@ -214,8 +272,16 @@ async fn index() -> impl IntoResponse {
     static_text_response(TEXT_HTML_UTF8, include_str!("../static/index.html"))
 }
 
+async fn aero_analysis_page() -> impl IntoResponse {
+    static_text_response(TEXT_HTML_UTF8, include_str!("../static/aero_analysis.html"))
+}
+
 async fn app_js() -> impl IntoResponse {
     static_text_response(TEXT_JAVASCRIPT_UTF8, GENERATED_APP_JS)
+}
+
+async fn aero_analysis_js() -> impl IntoResponse {
+    static_text_response(TEXT_JAVASCRIPT_UTF8, GENERATED_AERO_ANALYSIS_JS)
 }
 
 async fn styles_css() -> impl IntoResponse {
@@ -230,8 +296,18 @@ async fn presets() -> Json<Vec<multikite_sim::PresetInfo>> {
     Json(available_presets())
 }
 
+async fn default_config() -> Json<SimulationConfig> {
+    Json(SimulationConfig::default())
+}
+
 async fn healthz() -> StatusCode {
     StatusCode::NO_CONTENT
+}
+
+async fn aero_analysis() -> Result<Json<multikite_sim::AeroAnalysis>, (StatusCode, String)> {
+    build_aero_analysis()
+        .map(Json)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
 }
 
 async fn last_summary() -> Json<Option<RunSummary>> {
@@ -245,6 +321,7 @@ async fn last_summary() -> Json<Option<RunSummary>> {
 }
 
 fn config_from_request(request: &RunRequest) -> (InitRequest, SimulationConfig) {
+    let defaults = SimulationConfig::default();
     (
         InitRequest {
             preset: request.preset,
@@ -253,11 +330,38 @@ fn config_from_request(request: &RunRequest) -> (InitRequest, SimulationConfig) 
         },
         SimulationConfig {
             duration: request.duration,
+            dt_control: positive_f64_or_default(request.dt_control, defaults.dt_control),
             phase_mode: request.phase_mode,
+            longitudinal_mode: request.longitudinal_mode,
             sample_stride: request.sample_stride.unwrap_or(1).max(1),
-            ..SimulationConfig::default()
+            rk_abs_tol: positive_f64_or_default(request.rk_abs_tol, defaults.rk_abs_tol),
+            rk_rel_tol: positive_f64_or_default(request.rk_rel_tol, defaults.rk_rel_tol),
+            max_substeps: request
+                .max_substeps
+                .unwrap_or(defaults.max_substeps)
+                .max(1)
+                .min(1_000_000),
+            controller_tuning: request
+                .controller_tuning
+                .clone()
+                .unwrap_or_else(|| defaults.controller_tuning.clone())
+                .finite_or_default(&defaults.controller_tuning),
+            sim_noise_enabled: request.sim_noise_enabled,
+            dryden: request
+                .dryden
+                .unwrap_or(defaults.dryden)
+                .finite_or_default(&defaults.dryden),
+            bridle_enabled: request.bridle_enabled,
+            ..defaults
         },
     )
+}
+
+fn positive_f64_or_default(value: Option<f64>, default: f64) -> f64 {
+    match value {
+        Some(value) if value.is_finite() && value > 0.0 => value,
+        _ => default,
+    }
 }
 
 fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
@@ -344,6 +448,12 @@ fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
             .kites
             .iter()
             .map(|kite| quaternion_to_rpy_deg(kite.body.quat_n2b))
+            .collect(),
+        kite_control_roll_pitch_deg: frame
+            .state
+            .kites
+            .iter()
+            .map(|kite| control_roll_pitch_deg(kite.body.quat_n2b))
             .collect(),
         rabbit_targets_n: frame
             .diagnostics
@@ -447,6 +557,12 @@ fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
             .iter()
             .map(|diag| diag.airspeed)
             .collect(),
+        rotor_speed: frame
+            .state
+            .kites
+            .iter()
+            .map(|kite| kite.rotor_speed)
+            .collect(),
         alpha_deg: frame
             .diagnostics
             .kites
@@ -525,11 +641,35 @@ fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
             .iter()
             .map(|diag| diag.roll_ff.to_degrees())
             .collect(),
+        roll_p_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.roll_p.to_degrees())
+            .collect(),
+        roll_i_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.roll_i.to_degrees())
+            .collect(),
         pitch_ref_deg: frame
             .diagnostics
             .kites
             .iter()
             .map(|diag| diag.pitch_ref.to_degrees())
+            .collect(),
+        pitch_ref_p_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.pitch_ref_p.to_degrees())
+            .collect(),
+        pitch_ref_i_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.pitch_ref_i.to_degrees())
             .collect(),
         curvature_z_b: frame
             .diagnostics
@@ -542,6 +682,90 @@ fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
             .kites
             .iter()
             .map(|diag| diag.curvature_z_ref)
+            .collect(),
+        aileron_trim_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.aileron_trim.to_degrees())
+            .collect(),
+        aileron_roll_p_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.aileron_roll_p.to_degrees())
+            .collect(),
+        aileron_roll_d_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.aileron_roll_d.to_degrees())
+            .collect(),
+        rudder_trim_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.rudder_trim.to_degrees())
+            .collect(),
+        rudder_beta_p_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.rudder_beta_p.to_degrees())
+            .collect(),
+        rudder_rate_d_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.rudder_rate_d.to_degrees())
+            .collect(),
+        rudder_world_z_p_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.rudder_world_z_p.to_degrees())
+            .collect(),
+        elevator_trim_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.elevator_trim.to_degrees())
+            .collect(),
+        elevator_pitch_p_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.elevator_pitch_p.to_degrees())
+            .collect(),
+        elevator_pitch_d_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.elevator_pitch_d.to_degrees())
+            .collect(),
+        elevator_alpha_protection_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.elevator_alpha_protection.to_degrees())
+            .collect(),
+        motor_torque_trim: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.motor_torque_trim)
+            .collect(),
+        motor_torque_p: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.motor_torque_p)
+            .collect(),
+        motor_torque_i: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.motor_torque_i)
             .collect(),
         top_tension: frame
             .diagnostics
@@ -609,11 +833,29 @@ fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
             .iter()
             .map(|diag| vec3(diag.aero_moment_b))
             .collect(),
+        rudder_force_b: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| vec3(diag.rudder_force_b))
+            .collect(),
+        rudder_moment_b: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| vec3(diag.rudder_moment_b))
+            .collect(),
         tether_moment_b: frame
             .diagnostics
             .kites
             .iter()
             .map(|diag| vec3(diag.tether_moment_b))
+            .collect(),
+        motor_moment_b: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| vec3(diag.motor_moment_b))
             .collect(),
         cl_total: frame
             .diagnostics
@@ -789,11 +1031,23 @@ fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
             .iter()
             .map(|control| control.surfaces.aileron.to_degrees())
             .collect(),
+        aileron_applied_deg: frame
+            .state
+            .kites
+            .iter()
+            .map(|kite| kite.actuators.surfaces.aileron.to_degrees())
+            .collect(),
         flap_cmd_deg: frame
             .controls
             .kites
             .iter()
             .map(|control| control.surfaces.flap.to_degrees())
+            .collect(),
+        flap_applied_deg: frame
+            .state
+            .kites
+            .iter()
+            .map(|kite| kite.actuators.surfaces.flap.to_degrees())
             .collect(),
         winglet_cmd_deg: frame
             .controls
@@ -801,11 +1055,23 @@ fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
             .iter()
             .map(|control| control.surfaces.winglet.to_degrees())
             .collect(),
+        winglet_applied_deg: frame
+            .state
+            .kites
+            .iter()
+            .map(|kite| kite.actuators.surfaces.winglet.to_degrees())
+            .collect(),
         elevator_cmd_deg: frame
             .controls
             .kites
             .iter()
             .map(|control| control.surfaces.elevator.to_degrees())
+            .collect(),
+        elevator_applied_deg: frame
+            .state
+            .kites
+            .iter()
+            .map(|kite| kite.actuators.surfaces.elevator.to_degrees())
             .collect(),
         rudder_cmd_deg: frame
             .controls
@@ -813,16 +1079,31 @@ fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
             .iter()
             .map(|control| control.surfaces.rudder.to_degrees())
             .collect(),
+        rudder_applied_deg: frame
+            .state
+            .kites
+            .iter()
+            .map(|kite| kite.actuators.surfaces.rudder.to_degrees())
+            .collect(),
         motor_torque: frame
             .controls
             .kites
             .iter()
             .map(|control| control.motor_torque)
             .collect(),
+        motor_torque_applied: frame
+            .state
+            .kites
+            .iter()
+            .map(|kite| kite.actuators.motor_torque)
+            .collect(),
         total_work: frame.state.total_work,
+        total_dissipated_work: frame.state.total_dissipated_work,
         total_kinetic_energy: frame.diagnostics.total_kinetic_energy,
         total_potential_energy: frame.diagnostics.total_potential_energy,
         total_tether_strain_energy: frame.diagnostics.total_tether_strain_energy,
+        total_mechanical_energy: frame.diagnostics.total_mechanical_energy,
+        energy_conservation_residual: frame.diagnostics.energy_conservation_residual,
         work_minus_potential: frame.diagnostics.work_minus_potential,
     }
 }
@@ -835,6 +1116,14 @@ fn quaternion_to_rpy_deg(quat_n2b: nalgebra::Quaternion<f64>) -> [f64; 3] {
     let unit = UnitQuaternion::from_quaternion(quat_n2b);
     let (roll, pitch, yaw) = unit.euler_angles();
     [roll.to_degrees(), pitch.to_degrees(), yaw.to_degrees()]
+}
+
+fn control_roll_pitch_deg(quat_n2b: nalgebra::Quaternion<f64>) -> [f64; 2] {
+    let down_b =
+        UnitQuaternion::from_quaternion(quat_n2b).transform_vector(&nalgebra::Vector3::z());
+    let roll = down_b[1].atan2(down_b[2]);
+    let pitch = (-down_b[0]).atan2((down_b[1] * down_b[1] + down_b[2] * down_b[2]).sqrt());
+    [roll.to_degrees(), pitch.to_degrees()]
 }
 
 fn run_preset(request: &RunRequest) -> Result<ApiRunResponse> {
@@ -868,6 +1157,26 @@ fn run_preset_with_progress<F: FnMut(SimulationProgress)>(
                     .collect(),
             )
         }
+        Preset::Y2Low => {
+            let run = simulate_y2_low_with_progress(&init, &config, progress_cb)?;
+            (
+                run.summary,
+                run.frames
+                    .into_iter()
+                    .map(|frame| to_api_frame(&frame))
+                    .collect(),
+            )
+        }
+        Preset::Y2Launch => {
+            let run = simulate_y2_launch_with_progress(&init, &config, progress_cb)?;
+            (
+                run.summary,
+                run.frames
+                    .into_iter()
+                    .map(|frame| to_api_frame(&frame))
+                    .collect(),
+            )
+        }
         Preset::Y2 => {
             let run = simulate_y2_with_progress(&init, &config, progress_cb)?;
             (
@@ -878,8 +1187,8 @@ fn run_preset_with_progress<F: FnMut(SimulationProgress)>(
                     .collect(),
             )
         }
-        Preset::Y2Reference => {
-            let run = simulate_y2_reference_with_progress(&init, &config, progress_cb)?;
+        Preset::Y2High => {
+            let run = simulate_y2_high_with_progress(&init, &config, progress_cb)?;
             (
                 run.summary,
                 run.frames
@@ -936,14 +1245,19 @@ async fn run(
 async fn run_stream(
     Json(request): Json<RunRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let (sender, receiver) = mpsc::channel::<Result<Bytes, Infallible>>(64);
+    let (sender, receiver) = mpsc::channel::<Result<Bytes, Infallible>>(256);
     tokio::spawn(async move {
         let _ = send_stream_event(
             &sender,
             StreamEvent::Log {
                 message: format!(
-                    "starting preset={:?} duration={:.1}s phase_mode={:?}",
-                    request.preset, request.duration, request.phase_mode
+                    "starting preset={:?} duration={:.1}s dt_control={:.4}s phase_mode={:?}",
+                    request.preset,
+                    request.duration,
+                    request
+                        .dt_control
+                        .unwrap_or_else(|| SimulationConfig::default().dt_control),
+                    request.phase_mode
                 ),
             },
         )
@@ -952,38 +1266,35 @@ async fn run_stream(
         let request_for_run = request.clone();
         let progress_sender = sender.clone();
         let outcome = tokio::task::spawn_blocking(move || {
-            let mut progress_cb = |progress: SimulationProgress| {
-                let _ = send_stream_event_blocking(
-                    &progress_sender,
-                    StreamEvent::Progress { progress },
-                );
-            };
             let mut plot_buffer = Vec::<ApiFrame>::new();
-            let mut latest_scene_frame = None::<ApiFrame>;
-            let mut frames_since_scene_flush = 0usize;
-            let flush_scene_frame = |latest_scene_frame: &mut Option<ApiFrame>| {
-                if let Some(frame) = latest_scene_frame.take() {
-                    let _ =
-                        send_stream_event_blocking(&progress_sender, StreamEvent::Frame { frame });
+            let mut progress_cb = |progress: SimulationProgress| {
+                if send_stream_event_blocking(&progress_sender, StreamEvent::Progress { progress })
+                    .is_err()
+                {
+                    std::panic::panic_any(StreamCancelled);
                 }
             };
             let mut frame_cb = |frame: ApiFrame| {
                 plot_buffer.push(frame.clone());
-                latest_scene_frame = Some(frame);
-                frames_since_scene_flush += 1;
-                if frames_since_scene_flush >= STREAM_SCENE_FRAME_STRIDE {
-                    flush_scene_frame(&mut latest_scene_frame);
-                    frames_since_scene_flush = 0;
+                if send_stream_event_blocking(&progress_sender, StreamEvent::Frame { frame })
+                    .is_err()
+                {
+                    std::panic::panic_any(StreamCancelled);
                 }
             };
-            let result = run_preset_streaming(&request_for_run, &mut progress_cb, &mut frame_cb);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_preset_streaming(&request_for_run, &mut progress_cb, &mut frame_cb)
+            }));
             drop(frame_cb);
-            flush_scene_frame(&mut latest_scene_frame);
-            result.map(|summary| (summary, plot_buffer))
+            match result {
+                Ok(result) => Some((result, plot_buffer)),
+                Err(payload) if payload.is::<StreamCancelled>() => None,
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
         })
         .await;
         match outcome {
-            Ok(Ok((summary, plot_frames))) => {
+            Ok(Some((Ok(summary), plot_frames))) => {
                 let _ = send_stream_event(
                     &sender,
                     StreamEvent::Log {
@@ -1017,7 +1328,7 @@ async fn run_stream(
                 )
                 .await;
             }
-            Ok(Err(error)) => {
+            Ok(Some((Err(error), plot_frames))) => {
                 let _ = send_stream_event(
                     &sender,
                     StreamEvent::Log {
@@ -1025,7 +1336,25 @@ async fn run_stream(
                     },
                 )
                 .await;
+                let _ = send_stream_event(
+                    &sender,
+                    StreamEvent::Log {
+                        message: format!(
+                            "sending final plot buffer after failure: {} samples",
+                            plot_frames.len()
+                        ),
+                    },
+                )
+                .await;
+                let _ = send_stream_event(
+                    &sender,
+                    StreamEvent::Plots {
+                        frames: plot_frames,
+                    },
+                )
+                .await;
             }
+            Ok(None) => {}
             Err(error) => {
                 let _ = send_stream_event(
                     &sender,
@@ -1087,18 +1416,29 @@ fn run_preset_streaming<P: FnMut(SimulationProgress), G: FnMut(ApiFrame)>(
             };
             simulate_star1_with_callbacks(&init, &config, progress_cb, &mut send_frame)?.summary
         }
+        Preset::Y2Low => {
+            let mut send_frame = |frame: SimulationFrame<f64, 2, COMMON_NODES, UPPER_NODES>| {
+                frame_cb(to_api_frame(&frame));
+            };
+            simulate_y2_low_with_callbacks(&init, &config, progress_cb, &mut send_frame)?.summary
+        }
+        Preset::Y2Launch => {
+            let mut send_frame = |frame: SimulationFrame<f64, 2, COMMON_NODES, UPPER_NODES>| {
+                frame_cb(to_api_frame(&frame));
+            };
+            simulate_y2_launch_with_callbacks(&init, &config, progress_cb, &mut send_frame)?.summary
+        }
         Preset::Y2 => {
             let mut send_frame = |frame: SimulationFrame<f64, 2, COMMON_NODES, UPPER_NODES>| {
                 frame_cb(to_api_frame(&frame));
             };
             simulate_y2_with_callbacks(&init, &config, progress_cb, &mut send_frame)?.summary
         }
-        Preset::Y2Reference => {
+        Preset::Y2High => {
             let mut send_frame = |frame: SimulationFrame<f64, 2, COMMON_NODES, UPPER_NODES>| {
                 frame_cb(to_api_frame(&frame));
             };
-            simulate_y2_reference_with_callbacks(&init, &config, progress_cb, &mut send_frame)?
-                .summary
+            simulate_y2_high_with_callbacks(&init, &config, progress_cb, &mut send_frame)?.summary
         }
         Preset::Star3 => {
             let mut send_frame = |frame: SimulationFrame<f64, 3, COMMON_NODES, UPPER_NODES>| {
