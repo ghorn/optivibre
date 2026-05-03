@@ -16539,6 +16539,44 @@ mod tests {
     }
 
     #[test]
+    fn full_space_refinement_failure_uses_strict_singular_threshold() {
+        let options = IpoptLinearRefinementOptions {
+            min_refinement_steps: 1,
+            max_refinement_steps: 1,
+            residual_ratio_max: 1.0e-8,
+            residual_ratio_singular: 1.0e-5,
+            residual_improvement_factor: 1.0,
+        };
+
+        // IpPDFullSpaceSolver::Solve uses `< residual_ratio_singular_`, not
+        // `<=`, when deciding whether to accept the current failed-refinement
+        // solution with the uppercase S marker.
+        assert_eq!(
+            ipopt_refinement_failure_decision(1.0e-5, options, true, false, false),
+            IpoptRefinementFailureDecision::PretendSingular
+        );
+        assert_eq!(
+            ipopt_refinement_failure_decision(
+                f64::from_bits(1.0e-5_f64.to_bits() - 1),
+                options,
+                true,
+                false,
+                false
+            ),
+            IpoptRefinementFailureDecision::AcceptCurrentSolution {
+                after_pretend_singular_retry: false
+            }
+        );
+
+        // If quality cannot be improved, IPOPT goes directly to the same
+        // singular/accept-current split even before any quality retry.
+        assert_eq!(
+            ipopt_refinement_failure_decision(1.0e-3, options, false, false, false),
+            IpoptRefinementFailureDecision::PretendSingular
+        );
+    }
+
+    #[test]
     fn full_space_refinement_failure_markers_match_ipopt_source() {
         let options = IpoptLinearRefinementOptions {
             min_refinement_steps: 1,
@@ -16592,6 +16630,20 @@ mod tests {
             ipopt_refinement_failure_detail(accept_after_pretend),
             "ipopt_accept_current_solution_after_pretend_singular_refinement_failure"
         );
+    }
+
+    #[test]
+    fn full_space_residual_ratio_zero_rhs_and_solution_matches_ipopt() {
+        let ccs = CCS::new(1, 1, vec![0, 1], vec![0]);
+        let values = vec![0.0];
+        let rhs = vec![0.0];
+        let solution = vec![0.0];
+
+        // IpPDFullSpaceSolver::ComputeResidualRatio returns the residual norm
+        // directly when both rhs and solution norms are zero.
+        let (residual, ratio) = ipopt_refinement_residual_ratio_ccs(&ccs, &values, &rhs, &solution);
+        assert_eq!(residual, vec![0.0]);
+        assert_eq!(ratio.to_bits(), 0.0_f64.to_bits());
     }
 
     #[test]

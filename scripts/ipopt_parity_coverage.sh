@@ -161,6 +161,12 @@ cargo test \
   -- --nocapture
 
 cargo test \
+  -p optimization \
+  --lib full_space \
+  --features ipopt,native-spral-src \
+  -- --nocapture
+
+cargo test \
   -p optimal_control_problems \
   --release \
   --features ipopt,native-spral-src \
@@ -531,7 +537,11 @@ def classify_rust_line(path, line_no, text):
             return "iteration log formatting/reporting"
         if 16750 <= line_no <= 16795:
             return "iteration log formatting/reporting"
+        if 18000 <= line_no <= 18340:
+            return "unit-test parity witness"
         if 24800 <= line_no <= 24900:
+            return "restoration status mapping"
+        if 25240 <= line_no <= 25330:
             return "restoration status mapping"
         if 14720 <= line_no <= 14770:
             return "iteration log formatting/reporting"
@@ -560,6 +570,29 @@ def classify_ipopt_line(file_name, line_no, text):
         return "restoration branch"
     if file_name == "IpPDFullSpaceSolver.cpp" and line_no < 320:
         return "diagnostic only"
+    if file_name == "IpPDFullSpaceSolver.cpp":
+        if line_no in {409, 414, 566}:
+            return "option/error handling"
+        if line_no in {423, 839, 849, 885, 900, 945}:
+            return "linear-solver error path"
+        if line_no in {524, 794}:
+            return "linear-solver-failure witness gap"
+        if line_no in {559, 560, 577, 578, 579}:
+            return "covered by refinement option/reduced threshold witnesses"
+        if line_no in {590, 595, 600, 621, 626, 651}:
+            return "covered by reduced failed-refinement witness"
+        if line_no == 656:
+            return "covered by full-space final assembly witnesses"
+        if line_no in {773, 819}:
+            return "quality/pretend retry witness gap"
+        if line_no in {843, 857, 866, 871, 882, 895}:
+            return "covered by perturbation retry witnesses"
+        if line_no in {831, 908, 913, 925, 939}:
+            return "non-default neg-curvature option gap"
+        if 1030 <= line_no <= 1090:
+            return "diagnostic only"
+        if line_no == 1198:
+            return "covered by reduced residual-ratio witness"
     if file_name == "IpFilterLSAcceptor.cpp" and 665 <= line_no <= 868:
         return "unreachable under parity options"
     if file_name == "IpFilterLSAcceptor.cpp":
