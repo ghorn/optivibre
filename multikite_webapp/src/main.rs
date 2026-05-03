@@ -224,6 +224,7 @@ struct ApiFrame {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum StreamEvent {
     Log { message: String },
+    Error { message: String },
     Progress { progress: SimulationProgress },
     Frame { frame: ApiFrame },
     Plots { frames: Vec<ApiFrame> },
@@ -1314,10 +1315,18 @@ async fn run_stream(
                 .await;
             }
             Ok(Some((Err(error), plot_frames))) => {
+                let error_message = format!("run failed: {error}");
                 let _ = send_stream_event(
                     &sender,
                     StreamEvent::Log {
-                        message: format!("run failed: {error}"),
+                        message: error_message.clone(),
+                    },
+                )
+                .await;
+                let _ = send_stream_event(
+                    &sender,
+                    StreamEvent::Error {
+                        message: error_message,
                     },
                 )
                 .await;

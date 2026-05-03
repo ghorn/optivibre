@@ -304,6 +304,7 @@ interface KiteVisualDimensions {
 
 type StreamEvent =
   | { kind: "log"; message: string }
+  | { kind: "error"; message: string }
   | { kind: "progress"; progress: SimulationProgress }
   | { kind: "frame"; frame: ApiFrame }
   | { kind: "plots"; frames: ApiFrame[] }
@@ -383,6 +384,7 @@ const wingtipConvectionEnabledInput = document.querySelector<HTMLInputElement>(
 )!;
 const summaryNode = document.querySelector<HTMLElement>("#summary")!;
 const failureNode = document.querySelector<HTMLElement>("#failure-pill")!;
+const sceneFailureNode = document.querySelector<HTMLElement>("#scene-failure-banner")!;
 const runtimeConsoleTab = document.querySelector<HTMLButtonElement>("#runtime-tab-console")!;
 const runtimePlotsTab = document.querySelector<HTMLButtonElement>("#runtime-tab-plots")!;
 const runtimeConsoleView = document.querySelector<HTMLElement>("#runtime-console-view")!;
@@ -918,6 +920,8 @@ let activeSummaryRequest: {
 let runInProgress = false;
 let runStreamComplete = false;
 let playbackPaused = false;
+let playbackReleased = false;
+let lastFailureConsoleKey: string | null = null;
 let streamAbortController: AbortController | null = null;
 let activeRunSequence = 0;
 let controllerTuningChangedDuringRun = false;
@@ -2257,10 +2261,55 @@ sceneResizeHandle.addEventListener("keydown", handleSceneResizeKeydown);
 restoreSidebarWidth();
 syncOrbitTargetMarker();
 
+function failureKey(failure: SimulationFailure): string {
+  return [
+    failure.kite_index,
+    failure.quantity,
+    failure.time.toFixed(6),
+    failure.value_deg.toFixed(6),
+    failure.alpha_deg.toFixed(6),
+    failure.beta_deg.toFixed(6)
+  ].join(":");
+}
+
+function failureTitle(failure: SimulationFailure): string {
+  return `Kite ${failure.kite_index + 1} ${failure.quantity} = ${failure.value_deg.toFixed(2)} deg`;
+}
+
+function failureLimitText(failure: SimulationFailure): string {
+  return `limit [${failure.lower_limit_deg.toFixed(1)}, ${failure.upper_limit_deg.toFixed(1)}] deg`;
+}
+
+function failureChipHtml(failure: SimulationFailure): string {
+  return `
+    <div class="failure-chip-row">
+      <div class="failure-chip">AOA ${failure.alpha_deg.toFixed(2)} deg</div>
+      <div class="failure-chip">AOS ${failure.beta_deg.toFixed(2)} deg</div>
+    </div>`;
+}
+
+function logFailureIfNeeded(failure: SimulationFailure | null): void {
+  if (!failure) {
+    return;
+  }
+  const key = failureKey(failure);
+  if (key === lastFailureConsoleKey) {
+    return;
+  }
+  lastFailureConsoleKey = key;
+  appendConsole(
+    `TERMINATED: ${failureTitle(failure)} at t=${failure.time.toFixed(2)}s; ` +
+      `${failureLimitText(failure)}; AOA=${failure.alpha_deg.toFixed(2)} deg, ` +
+      `AOS=${failure.beta_deg.toFixed(2)} deg`
+  );
+}
+
 function setFailure(failure: SimulationFailure | null): void {
   if (!failure) {
     failureNode.innerHTML = "";
     failureNode.classList.remove("visible");
+    sceneFailureNode.innerHTML = "";
+    sceneFailureNode.classList.remove("visible");
     return;
   }
   failureNode.innerHTML = `
@@ -2268,17 +2317,37 @@ function setFailure(failure: SimulationFailure | null): void {
       <div class="failure-kicker">Simulation Terminated</div>
       <div class="failure-time">t = ${failure.time.toFixed(2)} s</div>
     </div>
-    <div class="failure-title">
-      Kite ${failure.kite_index + 1} ${escapeHtml(failure.quantity)} = ${failure.value_deg.toFixed(2)} deg
-    </div>
+    <div class="failure-title">${escapeHtml(failureTitle(failure))}</div>
     <div class="failure-detail">
       Allowed range: ${failure.lower_limit_deg.toFixed(1)} to ${failure.upper_limit_deg.toFixed(1)} deg
     </div>
-    <div class="failure-chip-row">
-      <div class="failure-chip">AOA ${failure.alpha_deg.toFixed(2)} deg</div>
-      <div class="failure-chip">AOS ${failure.beta_deg.toFixed(2)} deg</div>
-    </div>`;
+    ${failureChipHtml(failure)}`;
+  sceneFailureNode.innerHTML = `
+    <div class="scene-failure-kicker">Protection Limit</div>
+    <div class="scene-failure-title">${escapeHtml(failureTitle(failure))}</div>
+    <div class="scene-failure-meta">
+      t = ${failure.time.toFixed(2)} s · ${escapeHtml(failureLimitText(failure))}
+    </div>
+    ${failureChipHtml(failure)}`;
   failureNode.classList.add("visible");
+  sceneFailureNode.classList.add("visible");
+}
+
+function setSolverFailure(message: string, time: number | null): void {
+  const timeText = time === null ? "time unavailable" : `t = ${time.toFixed(2)} s`;
+  failureNode.innerHTML = `
+    <div class="failure-head">
+      <div class="failure-kicker">Simulation Failed</div>
+      <div class="failure-time">${escapeHtml(timeText)}</div>
+    </div>
+    <div class="failure-title">${escapeHtml(message)}</div>
+    <div class="failure-detail">The integrator or runtime stopped before producing a completed summary.</div>`;
+  sceneFailureNode.innerHTML = `
+    <div class="scene-failure-kicker">Solver Failure</div>
+    <div class="scene-failure-title">${escapeHtml(message)}</div>
+    <div class="scene-failure-meta">${escapeHtml(timeText)}</div>`;
+  failureNode.classList.add("visible");
+  sceneFailureNode.classList.add("visible");
 }
 
 function presetKiteCount(preset: Preset): number {
@@ -2608,7 +2677,13 @@ function applyTimeDilationSelection(logChange: boolean): void {
 function setRunControls(): void {
   runButton.disabled = false;
   if (runInProgress) {
-    runButton.textContent = runStreamComplete ? "Run" : playbackPaused ? "Resume" : "Pause";
+    runButton.textContent = runStreamComplete
+      ? "Run"
+      : !playbackReleased
+        ? "Solving"
+        : playbackPaused
+          ? "Resume"
+          : "Pause";
   } else {
     runButton.textContent = "Run";
   }
@@ -2624,7 +2699,7 @@ function resumePlaybackClock(): void {
 }
 
 function togglePlaybackPause(): void {
-  if (!runInProgress) {
+  if (!runInProgress || !playbackReleased) {
     return;
   }
   playbackPaused = !playbackPaused;
@@ -2658,6 +2733,7 @@ function resetPlaybackState(label: string, rate: number | null): void {
   pendingSummary = null;
   latestProgressState = null;
   playbackPaused = false;
+  playbackReleased = false;
   currentPlaybackLabel = label;
   currentPlaybackRate = rate;
   playbackStartWallTimeMs = null;
@@ -6129,7 +6205,7 @@ function renderFrameBatch(frames: ApiFrame[]): void {
 }
 
 function drainPendingFrames(timestamp: number): void {
-  if (playbackPaused) {
+  if (!playbackReleased || playbackPaused) {
     return;
   }
   if (pendingPlaybackFrames.length === 0) {
@@ -6515,19 +6591,16 @@ function queueFrames(frames: ApiFrame[]): void {
   }
   frames.forEach(recordFrameTetherTensions);
   framesReceived += frames.length;
-  if (
-    framesRendered === 0 &&
-    playbackStartWallTimeMs === null &&
-    pendingPlaybackFrames.length === 0
-  ) {
-    const [firstFrame, ...remainingFrames] = frames;
-    renderFrameBatch([firstFrame]);
-    playbackStartWallTimeMs = performance.now();
-    playbackStartSimTime = firstFrame.time;
-    pendingPlaybackFrames.push(...remainingFrames);
-  } else {
-    pendingPlaybackFrames.push(...frames);
-  }
+  pendingPlaybackFrames.push(...frames);
+  refreshProgressSummary();
+}
+
+function releaseBufferedPlayback(): void {
+  playbackReleased = true;
+  playbackPaused = false;
+  playbackStartWallTimeMs = currentPlaybackRate === null ? null : performance.now();
+  playbackStartSimTime = pendingPlaybackFrames[0]?.time ?? lastRenderedFrame?.time ?? 0;
+  setRunControls();
   refreshProgressSummary();
 }
 
@@ -6625,6 +6698,7 @@ async function startSimulation(): Promise<void> {
   clearConsole();
   clearPlots("Run starting. Plots will be replaced when the solver finishes.");
   setFailure(null);
+  lastFailureConsoleKey = null;
 
   const selectedTimeDilation = timeDilationSelect.value as TimeDilationPreset;
   const playbackLabel = timeDilationLabel(selectedTimeDilation);
@@ -6665,6 +6739,7 @@ async function startSimulation(): Promise<void> {
   runInProgress = true;
   runStreamComplete = false;
   playbackPaused = false;
+  playbackReleased = false;
   controllerTuningChangedDuringRun = false;
   setRunControls();
   activeSummaryRequest = {
@@ -6771,6 +6846,10 @@ async function startSimulation(): Promise<void> {
           appendConsole(event.message);
           continue;
         }
+        if (event.kind === "error") {
+          setSolverFailure(event.message, latestProgressState?.time ?? null);
+          continue;
+        }
         if (event.kind === "progress") {
           latestProgressState = event.progress;
           refreshProgressSummary();
@@ -6800,6 +6879,7 @@ async function startSimulation(): Promise<void> {
         summary = event.summary;
         pendingSummary = event.summary;
         setFailure(event.summary.failure ?? null);
+        logFailureIfNeeded(event.summary.failure ?? null);
       }
       queueFrames(sceneFramesInChunk);
     }
@@ -6808,6 +6888,8 @@ async function startSimulation(): Promise<void> {
       const event = JSON.parse(buffer) as StreamEvent;
       if (event.kind === "log") {
         appendConsole(event.message);
+      } else if (event.kind === "error") {
+        setSolverFailure(event.message, latestProgressState?.time ?? null);
       } else if (event.kind === "progress") {
         latestProgressState = event.progress;
         refreshProgressSummary();
@@ -6820,6 +6902,7 @@ async function startSimulation(): Promise<void> {
         summary = event.summary;
         pendingSummary = event.summary;
         setFailure(event.summary.failure ?? null);
+        logFailureIfNeeded(event.summary.failure ?? null);
       }
     }
 
@@ -6828,7 +6911,7 @@ async function startSimulation(): Promise<void> {
       try {
         showRuntimeTab("plots");
         await renderFinalPlots(finalPlotFrames, kiteCount);
-        appendConsole("plots rendered; draining any remaining 3D playback");
+        appendConsole("plots rendered; starting 3D playback");
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         clearPlots(`Plot rendering failed: ${message}`);
@@ -6841,14 +6924,7 @@ async function startSimulation(): Promise<void> {
     if (runSequence !== activeRunSequence) {
       return;
     }
-    runStreamComplete = true;
-    setRunControls();
-    if (playbackPaused) {
-      playbackPaused = false;
-      resumePlaybackClock();
-      setRunControls();
-      appendConsole("run completed; resuming paused playback drain");
-    }
+    releaseBufferedPlayback();
     await waitForPlaybackDrain();
     if (runSequence !== activeRunSequence) {
       return;
@@ -6888,6 +6964,7 @@ async function startSimulation(): Promise<void> {
       runInProgress = false;
       runStreamComplete = false;
       playbackPaused = false;
+      playbackReleased = false;
       streamAbortController = null;
       setRunControls();
     }

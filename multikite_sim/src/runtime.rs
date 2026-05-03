@@ -23,6 +23,7 @@ pub const FREE_COMMON_NODES: usize = 0;
 pub const FREE_UPPER_NODES: usize = 0;
 const SWARM_INITIAL_TENSION_N: f64 = 0.0;
 const SWARM_TARGET_PAYLOAD_ALTITUDE_M: f64 = 100.0;
+const GROUND_CLAMP_CLEARANCE_M: f64 = 1.0e-3;
 
 fn vec3(values: [f64; 3]) -> Vector3<f64> {
     Vector3::new(values[0], values[1], values[2])
@@ -285,113 +286,35 @@ fn interpolate_nodes<const N: usize>(
     })
 }
 
-fn ground_launch_splitter_position<const NK: usize>(params: &Params<f64, NK>) -> Vector3<f64> {
-    let ground_z = -params.common_tether.contact.ground_altitude;
-    let offset_y = (0.35 * params.common_tether.natural_length)
-        .clamp(10.0, 0.45 * params.controller.disk_radius.max(10.0));
-    Vector3::new(0.0, -offset_y, ground_z)
+fn clamp_node_above_ground(node: &mut TetherNode<f64>, ground_altitude: f64) {
+    let ground_z = -ground_altitude - GROUND_CLAMP_CLEARANCE_M;
+    if node.pos_n[2] > ground_z {
+        node.pos_n[2] = ground_z;
+    }
 }
 
-fn ground_serpentine_nodes<const N: usize>(
-    bottom_pos_n: &Vector3<f64>,
-    top_pos_n: &Vector3<f64>,
-    ground_altitude: f64,
-    natural_length: f64,
-    lane_angle: f64,
-) -> [TetherNode<f64>; N] {
-    let ground_z = -ground_altitude;
-    let bottom = Vector3::new(bottom_pos_n[0], bottom_pos_n[1], ground_z);
-    let top = Vector3::new(top_pos_n[0], top_pos_n[1], ground_z);
-    let delta = top - bottom;
-    let horizontal = delta[0].hypot(delta[1]);
-    let dir = if horizontal > 1.0e-9 {
-        Vector3::new(delta[0] / horizontal, delta[1] / horizontal, 0.0)
-    } else {
-        Vector3::new(lane_angle.cos(), lane_angle.sin(), 0.0)
-    };
-    let perp = Vector3::new(-dir[1], dir[0], 0.0);
-    let slack = (natural_length - horizontal).max(0.0);
-    let amplitude = if slack > 1.0 {
-        (0.2 * slack).clamp(0.5, 0.16 * natural_length.max(1.0))
-    } else {
-        (0.025 * natural_length.max(1.0)).min(2.0)
-    };
-    let turns = (N as f64 / 4.0).clamp(1.0, 4.0);
-
-    from_fn(|index| {
-        let frac = (index as f64 + 0.5) / N as f64;
-        let wave = (2.0 * std::f64::consts::PI * turns * frac).sin();
-        let taper = (std::f64::consts::PI * frac).sin();
-        let pos_n = bottom + delta * frac + perp * (amplitude * wave * taper);
-        TetherNode {
-            pos_n,
-            vel_n: Vector3::zeros(),
-        }
-    })
+fn clamp_body_above_ground(body: &mut BodyState<f64>, ground_altitude: f64) {
+    let ground_z = -ground_altitude - GROUND_CLAMP_CLEARANCE_M;
+    if body.pos_n[2] > ground_z {
+        body.pos_n[2] = ground_z;
+    }
 }
 
-fn ground_stowed_to_airborne_nodes<const N: usize>(
-    bottom_pos_n: &Vector3<f64>,
-    top_pos_n: &Vector3<f64>,
+fn clamp_swarm_state_above_ground<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
+    state: &mut State<f64, NK, N_COMMON, N_UPPER>,
     ground_altitude: f64,
-    natural_length: f64,
-    lane_angle: f64,
-) -> [TetherNode<f64>; N] {
-    let ground_z = -ground_altitude;
-    let bottom = Vector3::new(bottom_pos_n[0], bottom_pos_n[1], ground_z);
-    let top_ground = Vector3::new(top_pos_n[0], top_pos_n[1], ground_z);
-    let delta_ground = top_ground - bottom;
-    let horizontal = delta_ground[0].hypot(delta_ground[1]);
-    let dir = if horizontal > 1.0e-9 {
-        Vector3::new(
-            delta_ground[0] / horizontal,
-            delta_ground[1] / horizontal,
-            0.0,
-        )
-    } else {
-        Vector3::new(lane_angle.cos(), lane_angle.sin(), 0.0)
-    };
-    let perp = Vector3::new(-dir[1], dir[0], 0.0);
-    let tail_nodes = if N <= 1 {
-        N
-    } else {
-        ((N + 3) / 4).clamp(2, N - 1)
-    };
-    let ground_nodes = N.saturating_sub(tail_nodes);
-    let tail_horizontal = (0.12 * natural_length.max(1.0))
-        .clamp(4.0, 25.0)
-        .min(0.35 * horizontal.max(1.0));
-    let lift_start = if ground_nodes == 0 {
-        bottom
-    } else {
-        top_ground - dir * tail_horizontal
-    };
-    let ground_delta = lift_start - bottom;
-    let ground_distance = ground_delta[0].hypot(ground_delta[1]);
-    let slack = (0.7 * natural_length - ground_distance).max(0.0);
-    let amplitude = if slack > 1.0 {
-        (0.12 * slack).clamp(1.0, 0.08 * natural_length.max(1.0))
-    } else {
-        (0.02 * natural_length.max(1.0)).clamp(0.5, 4.0)
-    };
-    let turns = (ground_nodes as f64 / 4.0).clamp(1.0, 5.0);
-
-    from_fn(|index| {
-        let pos_n = if index < ground_nodes {
-            let frac = (index as f64 + 0.5) / ground_nodes as f64;
-            let wave = (2.0 * std::f64::consts::PI * turns * frac).sin();
-            let taper = (std::f64::consts::PI * frac).sin();
-            bottom + ground_delta * frac + perp * (amplitude * wave * taper)
-        } else {
-            let tail_index = index - ground_nodes;
-            let frac = (tail_index as f64 + 0.5) / tail_nodes.max(1) as f64;
-            lift_start * (1.0 - frac) + *top_pos_n * frac
-        };
-        TetherNode {
-            pos_n,
-            vel_n: Vector3::zeros(),
+) {
+    clamp_node_above_ground(&mut state.payload, ground_altitude);
+    clamp_node_above_ground(&mut state.splitter, ground_altitude);
+    for node in &mut state.common_tether {
+        clamp_node_above_ground(node, ground_altitude);
+    }
+    for kite in &mut state.kites {
+        clamp_body_above_ground(&mut kite.body, ground_altitude);
+        for node in &mut kite.tether {
+            clamp_node_above_ground(node, ground_altitude);
         }
-    })
+    }
 }
 
 fn kite_with_consistent_tether<const N_UPPER: usize>(
@@ -443,7 +366,7 @@ pub fn swarm_configuration<const NK: usize, const N_COMMON: usize, const N_UPPER
     params: &Params<f64, NK>,
     initial_altitude_offset_m: f64,
 ) -> State<f64, NK, N_COMMON, N_UPPER> {
-    let target_altitude = (swarm_target_payload_altitude_m() + initial_altitude_offset_m).max(0.0);
+    let target_altitude = swarm_target_payload_altitude_m() + initial_altitude_offset_m;
     swarm_payload_configuration(params, target_altitude, 1.0)
 }
 
@@ -455,7 +378,7 @@ fn swarm_payload_configuration<const NK: usize, const N_COMMON: usize, const N_U
     let common_length =
         params.common_tether.natural_length * common_length_fraction.clamp(0.0, 1.0);
     let target_cad_altitude = -params.controller.disk_center_n[2]
-        + (payload_altitude_above_ground.max(0.0) - swarm_target_payload_altitude_m())
+        + (payload_altitude_above_ground - swarm_target_payload_altitude_m())
         + (common_length - params.common_tether.natural_length);
     swarm_payload_configuration_with_kite_cad_altitude(
         params,
@@ -476,8 +399,6 @@ fn swarm_payload_configuration_with_kite_cad_altitude<
     target_cad_altitude: f64,
 ) -> State<f64, NK, N_COMMON, N_UPPER> {
     let ground_altitude = params.kites[0].tether.contact.ground_altitude;
-    let payload_altitude_above_ground = payload_altitude_above_ground.max(0.0);
-    let ground_launch = payload_altitude_above_ground <= 1.0e-9;
     let payload_altitude = ground_altitude + payload_altitude_above_ground;
     let payload = TetherNode {
         pos_n: Vector3::new(0.0, 0.0, -payload_altitude),
@@ -485,17 +406,9 @@ fn swarm_payload_configuration_with_kite_cad_altitude<
     };
     let common_length =
         params.common_tether.natural_length * common_length_fraction.clamp(0.0, 1.0);
-    let splitter_altitude = if ground_launch {
-        ground_altitude
-    } else {
-        payload_altitude + common_length
-    };
+    let splitter_altitude = payload_altitude + common_length;
     let splitter = TetherNode {
-        pos_n: if ground_launch {
-            ground_launch_splitter_position(params)
-        } else {
-            Vector3::new(0.0, 0.0, -splitter_altitude)
-        },
+        pos_n: Vector3::new(0.0, 0.0, -splitter_altitude),
         vel_n: Vector3::zeros(),
     };
 
@@ -534,7 +447,7 @@ fn swarm_payload_configuration_with_kite_cad_altitude<
 
     let kites = from_fn(|index| {
         let theta = 2.0 * std::f64::consts::PI * index as f64 / NK as f64;
-        let mut kite = swarm_kite_state_at_phase(
+        swarm_kite_state_at_phase(
             params,
             &splitter,
             index,
@@ -544,39 +457,20 @@ fn swarm_payload_configuration_with_kite_cad_altitude<
             speed_ref,
             omega_world_z,
             coordinated_roll,
-        );
-        if ground_launch {
-            let bridle_node = compute_bridle_node(&kite, &params.kites[index]);
-            kite.tether = ground_stowed_to_airborne_nodes(
-                &splitter.pos_n,
-                &bridle_node.pos_n,
-                ground_altitude,
-                params.kites[index].tether.natural_length,
-                theta,
-            );
-        }
-        kite
+        )
     });
 
-    State {
+    let mut state = State {
         kites,
         splitter: splitter.clone(),
-        common_tether: if ground_launch {
-            ground_serpentine_nodes(
-                &payload.pos_n,
-                &splitter.pos_n,
-                ground_altitude,
-                params.common_tether.natural_length,
-                -std::f64::consts::FRAC_PI_2,
-            )
-        } else {
-            interpolate_nodes(&payload, &splitter)
-        },
+        common_tether: interpolate_nodes(&payload, &splitter),
         payload,
         total_work: 0.0,
         total_dissipated_work: 0.0,
         mechanical_energy_reference: 0.0,
-    }
+    };
+    clamp_swarm_state_above_ground(&mut state, ground_altitude);
+    state
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1648,6 +1542,10 @@ mod tests {
             &target_params,
             -swarm_target_payload_altitude_m(),
         );
+        let very_low_state = swarm_configuration::<2, COMMON_NODES, UPPER_NODES>(
+            &target_params,
+            -swarm_target_payload_altitude_m() - 50.0,
+        );
         let reference_state =
             swarm_configuration::<2, COMMON_NODES, UPPER_NODES>(&target_params, 0.0);
         let high_state = swarm_configuration::<2, COMMON_NODES, UPPER_NODES>(&target_params, 50.0);
@@ -1665,8 +1563,12 @@ mod tests {
         };
 
         assert!(
-            payload_altitude(&low_state).abs() < 1.0e-9,
-            "low-offset swarm payload should start on the ground"
+            (payload_altitude(&low_state) - GROUND_CLAMP_CLEARANCE_M).abs() < 1.0e-9,
+            "low-offset swarm payload should be clamped just above the ground"
+        );
+        assert!(
+            (payload_altitude(&very_low_state) - GROUND_CLAMP_CLEARANCE_M).abs() < 1.0e-9,
+            "below-ground swarm payload should be clamped just above the ground"
         );
         assert!(
             (payload_altitude(&reference_state) - swarm_target_payload_altitude_m()).abs() < 1.0e-9,
@@ -1676,15 +1578,32 @@ mod tests {
             payload_altitude(&high_state) > swarm_target_payload_altitude_m(),
             "positive-offset swarm payload should start above the target altitude"
         );
+        let expected_low_kite_altitude = disk_altitude - swarm_target_payload_altitude_m();
         assert!(
-            kite_altitude(&low_state) < disk_altitude - 10.0,
-            "negative-offset swarm kites should start below the control disk"
+            (kite_altitude(&low_state) - expected_low_kite_altitude).abs() < 1.0e-9,
+            "low-offset swarm kites should use the same disk-relative geometry as above-ground starts"
         );
-        let ground_z = -target_params.common_tether.contact.ground_altitude;
-        for (index, node) in low_state.common_tether.iter().enumerate() {
+        let expected_very_low_kite_altitude =
+            disk_altitude - swarm_target_payload_altitude_m() - 50.0;
+        assert!(
+            (kite_altitude(&very_low_state) - expected_very_low_kite_altitude).abs() < 1.0e-9,
+            "below-ground payload clamp should not re-offset kites that are already above ground"
+        );
+        let clearance_z =
+            -target_params.common_tether.contact.ground_altitude - GROUND_CLAMP_CLEARANCE_M;
+        let assert_not_below_ground = |label: &str, pos_n: &Vector3<f64>| {
             assert!(
-                (node.pos_n[2] - ground_z).abs() < 1.0e-12,
-                "ground-launch common tether node {index} should be on the ground"
+                pos_n[2] <= clearance_z + 1.0e-12,
+                "{label} should not initialize below clearance: z={} clearance_z={clearance_z}",
+                pos_n[2]
+            );
+        };
+        assert_not_below_ground("low-offset payload", &low_state.payload.pos_n);
+        assert_not_below_ground("low-offset splitter", &low_state.splitter.pos_n);
+        for (index, node) in low_state.common_tether.iter().enumerate() {
+            assert_not_below_ground(
+                &format!("low-offset common tether node {index}"),
+                &node.pos_n,
             );
         }
         for link_index in 0..=COMMON_NODES {
@@ -1700,26 +1619,35 @@ mod tests {
             };
             assert!(
                 (upper - lower).norm() > 1.0e-6,
-                "ground-launch common tether link {link_index} should be non-degenerate"
+                "low-offset common tether link {link_index} should be non-degenerate"
             );
         }
+        let common_tensions = compute_tether_link_tensions(
+            &low_state.payload,
+            &low_state.splitter,
+            &target_params.common_tether,
+            &low_state.common_tether,
+        );
+        assert!(
+            common_tensions.iter().all(|tension| tension.abs() < 1.0e-9),
+            "low-offset common tether should be slack, got tensions {common_tensions:?}"
+        );
         for (kite_index, kite) in low_state.kites.iter().enumerate() {
-            let grounded_nodes = kite
-                .tether
-                .iter()
-                .filter(|node| (node.pos_n[2] - ground_z).abs() < 1.0e-12)
-                .count();
-            assert!(
-                grounded_nodes >= UPPER_NODES / 2,
-                "ground-launch kite {kite_index} should stow most upper tether nodes on the ground"
+            assert_not_below_ground(
+                &format!("low-offset kite {kite_index} body"),
+                &kite.body.pos_n,
             );
-            assert!(
-                kite.tether
-                    .iter()
-                    .any(|node| (node.pos_n[2] - ground_z).abs() > 1.0),
-                "ground-launch kite {kite_index} should lift the last upper tether nodes toward the bridle"
-            );
+            for (node_index, node) in kite.tether.iter().enumerate() {
+                assert_not_below_ground(
+                    &format!("low-offset kite {kite_index} upper tether node {node_index}"),
+                    &node.pos_n,
+                );
+            }
             let bridle_node = compute_bridle_node(kite, &target_params.kites[kite_index]);
+            assert_not_below_ground(
+                &format!("low-offset kite {kite_index} bridle node"),
+                &bridle_node.pos_n,
+            );
             for link_index in 0..=UPPER_NODES {
                 let lower = if link_index == 0 {
                     low_state.splitter.pos_n
@@ -1733,9 +1661,19 @@ mod tests {
                 };
                 assert!(
                     (upper - lower).norm() > 1.0e-6,
-                    "ground-launch kite {kite_index} upper tether link {link_index} should be non-degenerate"
+                    "low-offset kite {kite_index} upper tether link {link_index} should be non-degenerate"
                 );
             }
+            let upper_tensions = compute_tether_link_tensions(
+                &low_state.splitter,
+                &bridle_node,
+                &target_params.kites[kite_index].tether,
+                &kite.tether,
+            );
+            assert!(
+                upper_tensions.iter().all(|tension| *tension < 25.0),
+                "low-offset kite {kite_index} upper tether should only have small initial clamp tension, got tensions {upper_tensions:?}"
+            );
         }
         assert!(
             (kite_altitude(&reference_state) - disk_altitude).abs() < 1.0e-9,

@@ -203,14 +203,16 @@ fn mass_contact_model<T: Scalar>(
     vel_n: &Vector3<T>,
 ) -> MassContactOutput<T> {
     let delta_pz = pos_n[2] + params.ground_altitude;
-    let enable = smooth_enable(delta_pz / params.enable_length);
+    let penetration = delta_pz.max(T::zero());
+    let enable = smooth_enable(penetration / params.enable_length);
     let spring_constant = contact_mass * gravity / params.enable_length;
     let damping_constant = T::from_f64(2.0) * (spring_constant * contact_mass).sqrt() * params.zeta;
-    let spring_force_z = enable * (-spring_constant * delta_pz);
-    let damping_force_z = enable * (-damping_constant * vel_n[2]);
+    let downward_velocity = vel_n[2].max(T::zero());
+    let spring_force_z = enable * (-spring_constant * penetration);
+    let damping_force_z = enable * (-damping_constant * downward_velocity);
     MassContactOutput {
         total_force_n: Vector3::new(T::zero(), T::zero(), spring_force_z + damping_force_z),
-        dissipated_power: enable * damping_constant * square(vel_n[2]),
+        dissipated_power: enable * damping_constant * square(downward_velocity),
     }
 }
 
@@ -219,16 +221,27 @@ fn spring_energy<T: Scalar>(ea: T, natural_length: T, current_length: T) -> T {
     T::from_f64(0.5) * ea * natural_length * strain * strain
 }
 
-fn tether_link_tension<T: Scalar>(
+fn tether_link_force_scalar<T: Scalar>(
     delta_pos: &Vector3<T>,
     delta_vel: &Vector3<T>,
     natural_length: T,
     current_length: T,
     params: &TetherParams<T>,
 ) -> T {
-    let elastic_tension = params.ea * (current_length / natural_length - T::one());
+    let elastic_tension = (params.ea * (current_length / natural_length - T::one())).max(T::zero());
     let damping_tension = params.viscous_damping_coeff * dot(delta_pos, delta_vel);
-    (elastic_tension + damping_tension).max(T::zero())
+    elastic_tension + damping_tension
+}
+
+fn tether_link_reported_tension<T: Scalar>(
+    delta_pos: &Vector3<T>,
+    delta_vel: &Vector3<T>,
+    natural_length: T,
+    current_length: T,
+    params: &TetherParams<T>,
+) -> T {
+    tether_link_force_scalar(delta_pos, delta_vel, natural_length, current_length, params)
+        .max(T::zero())
 }
 
 fn tether_damping_power<T: Scalar>(
@@ -236,10 +249,9 @@ fn tether_damping_power<T: Scalar>(
     delta_vel: &Vector3<T>,
     current_length: T,
     params: &TetherParams<T>,
-    tension: T,
 ) -> T {
-    let active = tension / (tension + T::from_f64(1.0e-30));
-    active * params.viscous_damping_coeff * square(dot(delta_pos, delta_vel)) / current_length
+    let length = current_length.max(T::from_f64(1.0e-9));
+    params.viscous_damping_coeff * square(dot(delta_pos, delta_vel)) / length
 }
 
 fn compute_tether<T: Scalar, const N: usize>(
@@ -296,6 +308,8 @@ fn compute_tether<T: Scalar, const N: usize>(
         let upper_delta_vel = sub(&upper.vel_n, &current.vel_n);
         let lower_length = norm_exact(&lower_delta_pos);
         let upper_length = norm_exact(&upper_delta_pos);
+        let lower_force_length = lower_length.max(T::from_f64(1.0e-9));
+        let upper_force_length = upper_length.max(T::from_f64(1.0e-9));
         let lower_natural = if index == 0 {
             T::from_f64(0.5) * segment_length
         } else {
@@ -307,22 +321,22 @@ fn compute_tether<T: Scalar, const N: usize>(
             segment_length
         };
 
-        let lower_tension = tether_link_tension(
+        let lower_link_force = tether_link_force_scalar(
             &lower_delta_pos,
             &lower_delta_vel,
             lower_natural,
             lower_length,
             params,
         );
-        let upper_tension = tether_link_tension(
+        let upper_link_force = tether_link_force_scalar(
             &upper_delta_pos,
             &upper_delta_vel,
             upper_natural,
             upper_length,
             params,
         );
-        lower_tether_forces[index] = scale(&lower_delta_pos, lower_tension / lower_length);
-        upper_tether_forces[index] = scale(&upper_delta_pos, upper_tension / upper_length);
+        lower_tether_forces[index] = scale(&lower_delta_pos, lower_link_force / lower_force_length);
+        upper_tether_forces[index] = scale(&upper_delta_pos, upper_link_force / upper_force_length);
 
         let tangent_before = if index == 0 {
             lower.pos_n
@@ -335,7 +349,7 @@ fn compute_tether<T: Scalar, const N: usize>(
             scale(&add(&current.pos_n, &upper.pos_n), T::from_f64(0.5))
         };
         let tangent = sub(&tangent_after, &tangent_before);
-        let tangent_hat = normalize_exact(&tangent);
+        let tangent_hat = scale(&tangent, T::one() / norm(&tangent));
         let apparent_wind_n = sub(&current.vel_n, wind_n);
         let apparent_tangent = scale(&tangent_hat, dot(&apparent_wind_n, &tangent_hat));
         let apparent_normal = sub(&apparent_wind_n, &apparent_tangent);
@@ -368,24 +382,12 @@ fn compute_tether<T: Scalar, const N: usize>(
         };
 
         if index + 1 == N {
-            top_tension = upper_tension;
+            top_tension = upper_link_force.max(T::zero());
             dissipated_power = dissipated_power
-                + tether_damping_power(
-                    &upper_delta_pos,
-                    &upper_delta_vel,
-                    upper_length,
-                    params,
-                    upper_tension,
-                );
+                + tether_damping_power(&upper_delta_pos, &upper_delta_vel, upper_length, params);
         }
         dissipated_power = dissipated_power
-            + tether_damping_power(
-                &lower_delta_pos,
-                &lower_delta_vel,
-                lower_length,
-                params,
-                lower_tension,
-            )
+            + tether_damping_power(&lower_delta_pos, &lower_delta_vel, lower_length, params)
             + drag_dissipated_power
             + contact.dissipated_power;
         if index == 0 {
@@ -457,14 +459,14 @@ pub(crate) fn compute_tether_link_tensions<const N: usize>(
             segment_length
         };
 
-        let lower_total = tether_link_tension(
+        let lower_total = tether_link_reported_tension(
             &lower_delta_pos,
             &lower_delta_vel,
             lower_natural,
             lower_length,
             params,
         );
-        let upper_total = tether_link_tension(
+        let upper_total = tether_link_reported_tension(
             &upper_delta_pos,
             &upper_delta_vel,
             upper_natural,
@@ -1350,7 +1352,8 @@ impl<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>
 mod tests {
     use super::{
         CompiledRhs, bridle_geometry, compute_kite, compute_tether, compute_tether_link_tensions,
-        eval_aero_coeffs, eval_quartic2,
+        eval_aero_coeffs, eval_quartic2, mass_contact_model, tether_damping_power,
+        tether_link_force_scalar,
     };
     use crate::assets::reference_rotor_fit_ref;
     use crate::types::{
@@ -1522,6 +1525,96 @@ mod tests {
         assert_relative_eq!(output.top_tension, 0.0, epsilon = 1.0e-12);
         assert_relative_eq!(output.strain_energy, 0.0, epsilon = 1.0e-12);
         assert_eq!(link_tensions, vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn tether_spring_is_tension_only_but_damping_is_two_sided() {
+        let params = TetherParams {
+            natural_length: 1.0,
+            total_mass: 1.0,
+            ea: 1000.0,
+            viscous_damping_coeff: 3.0,
+            cd_phi: 0.0,
+            diameter: 0.01,
+            contact: MassContactParams {
+                zeta: 0.0,
+                enable_length: 1.0,
+                ground_altitude: 1000.0,
+            },
+        };
+        let delta_pos = Vector3::new(0.5, 0.0, 0.0);
+        let compression_static = tether_link_force_scalar(
+            &delta_pos,
+            &Vector3::zeros(),
+            1.0,
+            delta_pos.norm(),
+            &params,
+        );
+        let compression_closing = tether_link_force_scalar(
+            &delta_pos,
+            &Vector3::new(-1.0, 0.0, 0.0),
+            1.0,
+            delta_pos.norm(),
+            &params,
+        );
+        let compression_opening = tether_link_force_scalar(
+            &delta_pos,
+            &Vector3::new(1.0, 0.0, 0.0),
+            1.0,
+            delta_pos.norm(),
+            &params,
+        );
+
+        assert_relative_eq!(compression_static, 0.0, epsilon = 1.0e-12);
+        assert!(compression_closing < 0.0);
+        assert!(compression_opening > 0.0);
+        assert_relative_eq!(
+            tether_damping_power(
+                &delta_pos,
+                &Vector3::new(-1.0, 0.0, 0.0),
+                delta_pos.norm(),
+                &params
+            ),
+            1.5,
+            epsilon = 1.0e-12
+        );
+    }
+
+    #[test]
+    fn ground_contact_does_not_pull_above_ground_or_stick_on_rebound() {
+        let params = MassContactParams {
+            zeta: 0.7,
+            enable_length: 0.2,
+            ground_altitude: 0.0,
+        };
+        let above = mass_contact_model(
+            2.0,
+            9.81,
+            &params,
+            &Vector3::new(0.0, 0.0, -0.001),
+            &Vector3::new(0.0, 0.0, 10.0),
+        );
+        let rebounding = mass_contact_model(
+            2.0,
+            9.81,
+            &params,
+            &Vector3::new(0.0, 0.0, 0.1),
+            &Vector3::new(0.0, 0.0, -10.0),
+        );
+        let impacting = mass_contact_model(
+            2.0,
+            9.81,
+            &params,
+            &Vector3::new(0.0, 0.0, 0.1),
+            &Vector3::new(0.0, 0.0, 10.0),
+        );
+
+        assert_vec_close(&above.total_force_n, [0.0, 0.0, 0.0], 1.0e-12);
+        assert_relative_eq!(above.dissipated_power, 0.0, epsilon = 1.0e-12);
+        assert!(rebounding.total_force_n[2] < 0.0);
+        assert_relative_eq!(rebounding.dissipated_power, 0.0, epsilon = 1.0e-12);
+        assert!(impacting.total_force_n[2] < rebounding.total_force_n[2]);
+        assert!(impacting.dissipated_power > 0.0);
     }
 
     #[test]
