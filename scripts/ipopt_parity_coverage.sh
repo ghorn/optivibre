@@ -641,6 +641,17 @@ def classify_ipopt_line(file_name, line_no, text):
         return "unreachable under parity options"
     if file_name == "IpDefaultIterateInitializer.cpp" and 360 <= line_no <= 470:
         return "unreachable under parity options"
+    if file_name == "IpDefaultIterateInitializer.cpp":
+        if line_no == 157:
+            return "covered by least-square dual initializer witnesses"
+        if line_no in {160, 702}:
+            return "equality-multiplier calculator failure witness gap"
+        if line_no == 192:
+            return "TNLP initialization failure path"
+        if line_no == 284:
+            return "option/error handling"
+        if line_no == 493:
+            return "IPOPT option-lower-bound unreachable branch"
     if file_name == "IpDefaultIterateInitializer.cpp" and line_no in {208, 302}:
         return "unreachable under parity options"
     if any(token in text for token in ["Optivibre", "dump", "Dump", "std::fprintf", "file", "Jnlst", "ProduceOutput"]):
