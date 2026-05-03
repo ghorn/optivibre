@@ -654,6 +654,38 @@ def classify_ipopt_line(file_name, line_no, text):
             return "IPOPT option-lower-bound unreachable branch"
     if file_name == "IpDefaultIterateInitializer.cpp" and line_no in {208, 302}:
         return "unreachable under parity options"
+    if file_name == "IpIpoptData.cpp":
+        if line_no in {95, 171, 271}:
+            return "unreachable under parity options"
+        if line_no == 135:
+            return "initialization failure path"
+        if line_no == 187:
+            return "trial-container allocation bookkeeping"
+    if file_name == "IpIpoptAlg.cpp":
+        if line_no == 132:
+            return "option/display reporting"
+        if line_no == 450:
+            return "termination/error status"
+        if line_no == 456:
+            return "termination watchdog cleanup witness gap"
+        if line_no in {484, 542}:
+            return "square feasibility multiplier postprocess witness gap"
+        if line_no == 586:
+            return "barrier-update status reporting"
+        if line_no == 613:
+            return "search-direction status reporting"
+        if line_no == 657:
+            return "skipped line-search witness gap"
+        if line_no in {667, 670}:
+            return "adjusted-slack bound-shift witness gap"
+        if line_no in {723, 733, 743, 753, 764}:
+            return "covered by kappa_sigma bound-multiplier witness"
+        if line_no in {777, 792, 797}:
+            return "unreachable under parity options"
+        if line_no == 823 or line_no >= 998:
+            return "diagnostic problem-statistics reporting"
+        if 857 <= line_no <= 990:
+            return "square feasibility multiplier postprocess witness gap"
     if any(token in text for token in ["Optivibre", "dump", "Dump", "std::fprintf", "file", "Jnlst", "ProduceOutput"]):
         return "diagnostic only"
     if any(token in text for token in ["GetNumericValue", "GetBoolValue", "GetStringValue", "GetEnumValue", "ASSERT_EXCEPTION", "OPTION_INVALID", "FAILED_INITIALIZATION", "INTERNAL_ABORT"]):
