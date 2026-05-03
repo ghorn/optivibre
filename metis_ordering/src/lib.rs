@@ -3205,7 +3205,7 @@ fn grow_bisection_edge_state(
         }
 
         compute_2way_partition_params(graph, &mut state);
-        ensure_2way_balance_is_source_noop(graph, &state)?;
+        balance_2way_edge(graph, &mut state, rng);
         fm_2way_cut_refine(graph, &mut state, 10, rng);
 
         if run == 0 || best_cut.is_some_and(|cut| cut > state.mincut) {
@@ -3257,10 +3257,7 @@ fn compute_2way_partition_params(graph: &MetisGraph, state: &mut EdgePartitionSt
     state.mincut /= 2;
 }
 
-fn ensure_2way_balance_is_source_noop(
-    graph: &MetisGraph,
-    state: &EdgePartitionState,
-) -> Result<(), OrderingError> {
+fn balance_2way_edge(graph: &MetisGraph, state: &mut EdgePartitionState, rng: &mut MetisRng) {
     let total_weight = graph.total_vertex_weight();
     let vertex_count = total_weight as f64;
     let ubfactor = 1.0 + 0.001 * 200.0 + 0.000_049_9;
@@ -3271,24 +3268,233 @@ fn ensure_2way_balance_is_source_noop(
         .fold(0.0, f64::max)
         - ubfactor;
     if imbalance <= 0.0 {
-        return Ok(());
+        return;
     }
 
     let target_left = metis_real_to_idx(0.5 * total_weight as f64);
     let balance_slop = 3 * total_weight / graph.vertex_count() as isize;
     if (target_left - state.part_weights[0]).abs() < balance_slop {
-        return Ok(());
+        return;
     }
 
     if state.boundary.is_empty() {
-        Err(OrderingError::Algorithm(
-            "METIS General2WayBalance branch is not yet ported".into(),
-        ))
+        general_2way_balance(graph, state, rng);
     } else {
-        Err(OrderingError::Algorithm(
-            "METIS Bnd2WayBalance branch is not yet ported".into(),
-        ))
+        bnd_2way_balance(graph, state, rng);
     }
+}
+
+fn bnd_2way_balance(graph: &MetisGraph, state: &mut EdgePartitionState, rng: &mut MetisRng) {
+    let vertex_count = graph.vertex_count();
+    let total_weight = graph.total_vertex_weight();
+    let target_weights = [
+        metis_real_to_idx(total_weight as f64 * 0.5),
+        total_weight - metis_real_to_idx(total_weight as f64 * 0.5),
+    ];
+    let min_difference = (target_weights[0] - state.part_weights[0]).abs();
+    let from = if state.part_weights[0] < target_weights[0] {
+        1
+    } else {
+        0
+    };
+    let to = (from + 1) % 2;
+    let mut moved = vec![-1isize; vertex_count];
+    let mut queue = SourcePriorityQueue::new(vertex_count);
+    let mut boundary_count = state.boundary.len();
+    let mut permutation = vec![0usize; boundary_count];
+    rng.rand_array_permute(&mut permutation, boundary_count / 5, true);
+
+    for &boundary_position in &permutation {
+        let vertex = state.boundary[boundary_position];
+        debug_assert!(
+            state.external_degree[vertex] > 0 || state.internal_degree[vertex] == 0,
+            "source METIS boundary invariant"
+        );
+        debug_assert_ne!(state.boundary_ptr[vertex], usize::MAX);
+        if state.where_part[vertex] == from && graph.vertex_weight(vertex) <= min_difference {
+            queue.insert(
+                vertex,
+                state.external_degree[vertex] - state.internal_degree[vertex],
+            );
+        }
+    }
+
+    let mut mincut = state.mincut;
+    for swap_index in 0..vertex_count {
+        let Some(high_gain) = queue.get_top() else {
+            break;
+        };
+        debug_assert_ne!(state.boundary_ptr[high_gain], usize::MAX);
+
+        let high_gain_weight = graph.vertex_weight(high_gain);
+        if state.part_weights[to] + high_gain_weight > target_weights[to] {
+            break;
+        }
+
+        let gain = state.external_degree[high_gain] - state.internal_degree[high_gain];
+        mincut -= gain;
+        state.part_weights[to] += high_gain_weight;
+        state.part_weights[from] -= high_gain_weight;
+        state.where_part[high_gain] = to;
+        moved[high_gain] = swap_index as isize;
+
+        std::mem::swap(
+            &mut state.internal_degree[high_gain],
+            &mut state.external_degree[high_gain],
+        );
+        if state.external_degree[high_gain] == 0 && graph.degree(high_gain) > 0 {
+            state.delete_boundary(high_gain);
+            boundary_count -= 1;
+        }
+
+        for edge in graph.edge_range(high_gain) {
+            let neighbor = graph.neighbors[edge];
+            let weight = graph.edge_weight(edge);
+            let edge_delta = if to == state.where_part[neighbor] {
+                weight
+            } else {
+                -weight
+            };
+            state.internal_degree[neighbor] += edge_delta;
+            state.external_degree[neighbor] -= edge_delta;
+
+            if state.boundary_ptr[neighbor] != usize::MAX {
+                if state.external_degree[neighbor] == 0 {
+                    state.delete_boundary(neighbor);
+                    boundary_count -= 1;
+                    if moved[neighbor] == -1
+                        && state.where_part[neighbor] == from
+                        && graph.vertex_weight(neighbor) <= min_difference
+                    {
+                        queue.delete(neighbor);
+                    }
+                } else if moved[neighbor] == -1
+                    && state.where_part[neighbor] == from
+                    && graph.vertex_weight(neighbor) <= min_difference
+                {
+                    queue.update(
+                        neighbor,
+                        state.external_degree[neighbor] - state.internal_degree[neighbor],
+                    );
+                }
+            } else if state.external_degree[neighbor] > 0 {
+                state.insert_boundary(neighbor);
+                boundary_count += 1;
+                if moved[neighbor] == -1
+                    && state.where_part[neighbor] == from
+                    && graph.vertex_weight(neighbor) <= min_difference
+                {
+                    queue.insert(
+                        neighbor,
+                        state.external_degree[neighbor] - state.internal_degree[neighbor],
+                    );
+                }
+            }
+        }
+    }
+
+    state.mincut = mincut;
+    debug_assert_eq!(boundary_count, state.boundary.len());
+}
+
+fn general_2way_balance(graph: &MetisGraph, state: &mut EdgePartitionState, rng: &mut MetisRng) {
+    let vertex_count = graph.vertex_count();
+    let total_weight = graph.total_vertex_weight();
+    let target_weights = [
+        metis_real_to_idx(total_weight as f64 * 0.5),
+        total_weight - metis_real_to_idx(total_weight as f64 * 0.5),
+    ];
+    let min_difference = (target_weights[0] - state.part_weights[0]).abs();
+    let from = if state.part_weights[0] < target_weights[0] {
+        1
+    } else {
+        0
+    };
+    let to = (from + 1) % 2;
+    let mut moved = vec![-1isize; vertex_count];
+    let mut queue = SourcePriorityQueue::new(vertex_count);
+    let mut permutation = vec![0usize; vertex_count];
+    rng.rand_array_permute(&mut permutation, vertex_count / 5, true);
+
+    for &vertex in &permutation {
+        if state.where_part[vertex] == from && graph.vertex_weight(vertex) <= min_difference {
+            queue.insert(
+                vertex,
+                state.external_degree[vertex] - state.internal_degree[vertex],
+            );
+        }
+    }
+
+    let mut mincut = state.mincut;
+    let mut boundary_count = state.boundary.len();
+    for swap_index in 0..vertex_count {
+        let Some(high_gain) = queue.get_top() else {
+            break;
+        };
+
+        let high_gain_weight = graph.vertex_weight(high_gain);
+        if state.part_weights[to] + high_gain_weight > target_weights[to] {
+            break;
+        }
+
+        let gain = state.external_degree[high_gain] - state.internal_degree[high_gain];
+        mincut -= gain;
+        state.part_weights[to] += high_gain_weight;
+        state.part_weights[from] -= high_gain_weight;
+        state.where_part[high_gain] = to;
+        moved[high_gain] = swap_index as isize;
+
+        std::mem::swap(
+            &mut state.internal_degree[high_gain],
+            &mut state.external_degree[high_gain],
+        );
+        if state.external_degree[high_gain] == 0
+            && state.boundary_ptr[high_gain] != usize::MAX
+            && graph.degree(high_gain) > 0
+        {
+            state.delete_boundary(high_gain);
+            boundary_count -= 1;
+        }
+        if state.external_degree[high_gain] > 0 && state.boundary_ptr[high_gain] == usize::MAX {
+            state.insert_boundary(high_gain);
+            boundary_count += 1;
+        }
+
+        for edge in graph.edge_range(high_gain) {
+            let neighbor = graph.neighbors[edge];
+            let weight = graph.edge_weight(edge);
+            let edge_delta = if to == state.where_part[neighbor] {
+                weight
+            } else {
+                -weight
+            };
+            state.internal_degree[neighbor] += edge_delta;
+            state.external_degree[neighbor] -= edge_delta;
+
+            if moved[neighbor] == -1
+                && state.where_part[neighbor] == from
+                && graph.vertex_weight(neighbor) <= min_difference
+            {
+                queue.update(
+                    neighbor,
+                    state.external_degree[neighbor] - state.internal_degree[neighbor],
+                );
+            }
+
+            if state.external_degree[neighbor] == 0 && state.boundary_ptr[neighbor] != usize::MAX {
+                state.delete_boundary(neighbor);
+                boundary_count -= 1;
+            } else if state.external_degree[neighbor] > 0
+                && state.boundary_ptr[neighbor] == usize::MAX
+            {
+                state.insert_boundary(neighbor);
+                boundary_count += 1;
+            }
+        }
+    }
+
+    state.mincut = mincut;
+    debug_assert_eq!(boundary_count, state.boundary.len());
 }
 
 fn fm_2way_cut_refine(
@@ -4966,6 +5172,60 @@ mod tests {
         assert_eq!(trace.boundary, &[0, 1, 3, 6]);
         assert_eq!(trace.internal_degree, &[3, 0, 1, 0, 1, 1, 0]);
         assert_eq!(trace.external_degree, &[3, 1, 0, 1, 0, 0, 1]);
+    }
+
+    #[test]
+    fn metis_bnd_2way_balance_moves_boundary_vertices_without_fail_closed_escape() {
+        let edges = (0..9)
+            .map(|vertex| (vertex, vertex + 1))
+            .collect::<Vec<_>>();
+        let graph = MetisGraph::from_csr_graph(&CsrGraph::from_edges(10, &edges).unwrap());
+        let mut state = EdgePartitionState::new(10, graph.total_vertex_weight());
+        for vertex in 0..9 {
+            state.where_part[vertex] = 0;
+        }
+        compute_2way_partition_params(&graph, &mut state);
+        assert!(!state.boundary.is_empty());
+        assert_eq!(state.part_weights, [9, 1]);
+
+        let mut rng = MetisRng::with_metis_seed(-1);
+        balance_2way_edge(&graph, &mut state, &mut rng);
+
+        assert_eq!(state.part_weights, [5, 5]);
+        assert_eq!(state.mincut, 1);
+        assert_eq!(state.where_part, &[0, 0, 0, 0, 0, 1, 1, 1, 1, 1]);
+        assert_eq!(state.boundary.len(), 2);
+    }
+
+    #[test]
+    fn metis_general_2way_balance_moves_disconnected_vertices_without_fail_closed_escape() {
+        let mut edges = (0..9)
+            .map(|vertex| (vertex, vertex + 1))
+            .collect::<Vec<_>>();
+        edges.push((10, 11));
+        let graph = MetisGraph::from_csr_graph(&CsrGraph::from_edges(12, &edges).unwrap());
+        let mut state = EdgePartitionState::new(12, graph.total_vertex_weight());
+        for vertex in 0..10 {
+            state.where_part[vertex] = 0;
+        }
+        compute_2way_partition_params(&graph, &mut state);
+        assert!(state.boundary.is_empty());
+        assert_eq!(state.part_weights, [10, 2]);
+
+        let mut rng = MetisRng::with_metis_seed(-1);
+        balance_2way_edge(&graph, &mut state, &mut rng);
+
+        assert_eq!(state.part_weights, [6, 6]);
+        assert_eq!(
+            state.where_part.iter().filter(|&&part| part == 0).count(),
+            6
+        );
+        assert_eq!(
+            state.where_part.iter().filter(|&&part| part == 1).count(),
+            6
+        );
+        assert_eq!(state.mincut, 1);
+        assert!(!state.boundary.is_empty());
     }
 
     #[test]

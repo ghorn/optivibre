@@ -223,13 +223,13 @@ const LINEAR_SSIDS_BRANCH_LEDGER: &[(&str, &str, &str)] = &[
     ),
     (
         "metis.balance.general_2way",
-        "guarded",
-        "Rust returns a fail-closed error if reached",
+        "hit",
+        "Rust source-port fixture moves disconnected overweight vertices",
     ),
     (
         "metis.balance.boundary_2way",
-        "guarded",
-        "Rust returns a fail-closed error if reached",
+        "hit",
+        "Rust source-port fixture moves boundary overweight vertices",
     ),
     (
         "metis.general.vertex_weights",
@@ -270,6 +270,31 @@ const LINEAR_SSIDS_BRANCH_LEDGER: &[(&str, &str, &str)] = &[
         "ssids.factor.app_dense.maxloc",
         "hit",
         "native APP maxloc tests",
+    ),
+    (
+        "ssids.factor.app_dense.one_by_one_pivots",
+        "hit",
+        "dense APP branch telemetry fixtures",
+    ),
+    (
+        "ssids.factor.app_dense.two_by_two_pivots",
+        "hit",
+        "dense case 59 branch telemetry fixture",
+    ),
+    (
+        "ssids.factor.app_dense.zero_pivots",
+        "guarded",
+        "zero-pivot APP telemetry is classified if a future witness reaches it",
+    ),
+    (
+        "ssids.factor.app_dense.diagonal_one_by_one",
+        "hit",
+        "diagonal-dominant APP branch telemetry fixture",
+    ),
+    (
+        "ssids.factor.app_dense.offdiag_one_by_one",
+        "hit",
+        "unstable off-diagonal APP branch telemetry fixture",
     ),
     (
         "ssids.solve.app_dense.forward_diag_backward",
@@ -357,6 +382,35 @@ fn random_dense_dyadic_matrix(dimension: usize, rng: &mut DenseBoundaryRng) -> V
         }
         row += 1;
     }
+    matrix
+}
+
+fn diagonal_dominant_dense_app_matrix(dimension: usize) -> Vec<Vec<f64>> {
+    let mut matrix = vec![vec![0.0; dimension]; dimension];
+    let mut row = 0;
+    while row < dimension {
+        let mut col = 0;
+        while col <= row {
+            let value = if row == col {
+                1_000.0 + row as f64
+            } else {
+                f64::from(((row + 3 * col) % 7 + 1) as u32) / 1_048_576.0
+            };
+            matrix[row][col] = value;
+            matrix[col][row] = value;
+            col += 1;
+        }
+        row += 1;
+    }
+    matrix
+}
+
+fn offdiag_one_by_one_dense_app_matrix(dimension: usize) -> Vec<Vec<f64>> {
+    let mut matrix = diagonal_dominant_dense_app_matrix(dimension);
+    matrix[0][0] = 9.9;
+    matrix[1][1] = 9.9;
+    matrix[1][0] = 10.0;
+    matrix[0][1] = 10.0;
     matrix
 }
 
@@ -742,6 +796,8 @@ fn rust_app_factor_and_solve_branch_telemetry_covers_dense_kernel_witness() {
             "ssids.factor.app_dense.block_ldlt",
             "ssids.factor.app_dense.accepted_update",
             "ssids.factor.app_dense.maxloc",
+            "ssids.factor.app_dense.one_by_one_pivots",
+            "ssids.factor.app_dense.two_by_two_pivots",
         ],
     );
 
@@ -753,6 +809,56 @@ fn rust_app_factor_and_solve_branch_telemetry_covers_dense_kernel_witness() {
         "dense_case_59_solve_profile",
         &solve_hits,
         &["ssids.solve.app_dense.forward_diag_backward"],
+    );
+}
+
+#[test]
+fn rust_app_factor_branch_telemetry_covers_one_by_one_variants() {
+    let dimension = 64;
+    let order = (0..dimension).collect::<Vec<_>>();
+
+    let diagonal_matrix = diagonal_dominant_dense_app_matrix(dimension);
+    let (col_ptrs, row_indices, values) = dense_to_lower_csc(&diagonal_matrix);
+    let matrix = SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
+        .expect("valid diagonal-dominant APP branch fixture");
+    let (symbolic, _) = analyse_with_user_ordering(matrix, &order).expect("user-order analyse");
+    let matrix = SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
+        .expect("valid diagonal-dominant APP branch fixture");
+    let (_, _, profile) =
+        factorize_with_profile(matrix, &symbolic, &NumericFactorOptions::default())
+            .expect("diagonal-dominant APP factor profile");
+    let hits = profile.debug_branch_hits();
+    assert_eq!(
+        profile.app_two_by_two_pivots, 0,
+        "diagonal-dominant fixture should stay on the 1x1 APP path"
+    );
+    assert_branch_hits_include(
+        "diagonal_dominant_app_factor_profile",
+        &hits,
+        &[
+            "ssids.factor.app_dense.one_by_one_pivots",
+            "ssids.factor.app_dense.diagonal_one_by_one",
+        ],
+    );
+
+    let offdiag_matrix = offdiag_one_by_one_dense_app_matrix(dimension);
+    let (col_ptrs, row_indices, values) = dense_to_lower_csc(&offdiag_matrix);
+    let matrix = SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
+        .expect("valid off-diagonal one-by-one APP branch fixture");
+    let (symbolic, _) = analyse_with_user_ordering(matrix, &order).expect("user-order analyse");
+    let matrix = SymmetricCscMatrix::new(dimension, &col_ptrs, &row_indices, Some(&values))
+        .expect("valid off-diagonal one-by-one APP branch fixture");
+    let (_, _, profile) =
+        factorize_with_profile(matrix, &symbolic, &NumericFactorOptions::default())
+            .expect("off-diagonal one-by-one APP factor profile");
+    let hits = profile.debug_branch_hits();
+    assert_branch_hits_include(
+        "offdiag_one_by_one_app_factor_profile",
+        &hits,
+        &[
+            "ssids.factor.app_dense.one_by_one_pivots",
+            "ssids.factor.app_dense.offdiag_one_by_one",
+        ],
     );
 }
 

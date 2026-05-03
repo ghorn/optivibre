@@ -1314,12 +1314,15 @@ mod tests {
         approximate_minimum_degree_permutation as spral_amd_permutation,
         factorize as spral_factorize, factorize_with_profile as spral_factorize_with_profile,
     };
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
+    #[cfg(feature = "ipopt")]
+    use std::collections::BTreeSet;
     use std::fs;
     use std::path::Path;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
+    #[allow(dead_code)]
     #[derive(Debug)]
     struct GliderLinearDebugDump {
         matrix_dimension: usize,
@@ -1367,6 +1370,7 @@ mod tests {
         linear_trace_refinement_residual_v_upper: Option<Vec<Vec<f64>>>,
     }
 
+    #[cfg(feature = "ipopt")]
     #[derive(Debug)]
     struct IpoptSpralInterfaceDump {
         call_index: usize,
@@ -1385,6 +1389,7 @@ mod tests {
         scaling: Option<Vec<f64>>,
     }
 
+    #[cfg(feature = "ipopt")]
     #[derive(Debug)]
     struct IpoptFullSpaceResidualDump {
         call_index: usize,
@@ -1414,7 +1419,7 @@ mod tests {
         solve_profile: Option<SolveProfile>,
     }
 
-    #[derive(Debug)]
+    #[derive(Clone, Debug)]
     struct AugmentedStepBlocks {
         dx: Vec<f64>,
         ds: Vec<f64>,
@@ -1455,6 +1460,7 @@ mod tests {
         Some(serde_json::from_str(value).expect("expected optional dump vector to parse"))
     }
 
+    #[cfg(feature = "ipopt")]
     fn parse_optional_dump_value<T>(text: &str, prefix: &str) -> Option<T>
     where
         T: std::str::FromStr,
@@ -1586,6 +1592,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ipopt")]
     fn load_ipopt_spral_interface_dump(path: &Path) -> IpoptSpralInterfaceDump {
         let text = fs::read_to_string(path).expect("expected IPOPT SPRAL dump to exist");
         IpoptSpralInterfaceDump {
@@ -1809,6 +1816,52 @@ mod tests {
         }
     }
 
+    fn replay_rust_augmented_spral_unprofiled_with_symbolic(
+        dump: &GliderLinearDebugDump,
+        symbolic: &SymbolicFactor,
+    ) -> ExactAugmentedReplay {
+        let factor_started = Instant::now();
+        let numeric = SymmetricCscMatrix::new(
+            dump.matrix_dimension,
+            &dump.col_ptrs,
+            &dump.row_indices,
+            Some(&dump.values),
+        )
+        .expect("dumped augmented CSC values should validate");
+        let (mut factor, _) = spral_factorize(numeric, symbolic, &NumericFactorOptions::default())
+            .expect("rust spral factorization should succeed on dumped KKT");
+        let factor_time = factor_started.elapsed();
+        let solve_started = Instant::now();
+        let mut solution = factor
+            .solve(&dump.rhs)
+            .expect("rust spral solve should succeed on dumped KKT");
+        let mut solve_time = solve_started.elapsed();
+        for _ in 0..10 {
+            let residual = residual_vector(dump, &solution);
+            if residual.iter().all(|value| value.abs() <= f64::EPSILON) {
+                break;
+            }
+            let correction_started = Instant::now();
+            let correction = factor
+                .solve(&residual)
+                .expect("rust spral iterative refinement should succeed on dumped KKT");
+            solve_time += correction_started.elapsed();
+            for (solution_i, correction_i) in solution.iter_mut().zip(correction.iter()) {
+                *solution_i += correction_i;
+            }
+        }
+        ExactAugmentedReplay {
+            factor_time,
+            solve_time,
+            residual_inf: residual_inf(dump, &solution),
+            solution_inf: solution_inf(&solution),
+            solution,
+            inertia: format!("{:?}", factor.inertia()),
+            factor_profile: None,
+            solve_profile: None,
+        }
+    }
+
     fn replay_native_augmented_spral(dump: &GliderLinearDebugDump) -> ExactAugmentedReplay {
         let structure = SymmetricCscMatrix::new(
             dump.matrix_dimension,
@@ -1936,6 +1989,16 @@ mod tests {
     ) -> Duration {
         let values = profiles.iter().map(select).collect::<Vec<_>>();
         median_duration(&values)
+    }
+
+    fn median_profile_usize(
+        profiles: &[FactorProfile],
+        select: impl Fn(&FactorProfile) -> usize,
+    ) -> usize {
+        assert!(!profiles.is_empty());
+        let mut values = profiles.iter().map(select).collect::<Vec<_>>();
+        values.sort_unstable();
+        values[values.len() / 2]
     }
 
     fn median_solve_profile_duration(
@@ -2779,17 +2842,83 @@ mod tests {
                 profile.root_delayed_blocks,
             );
             println!(
-                "  rust_spral dense_front_profile tpp={:?} app_pivot_factor={:?} app_block_apply={:?} app_block_trsm={:?} app_block_diag={:?} app_failed_scan={:?} app_restore={:?} app_accepted_update={:?} app_column_storage={:?} solve_panel_build={:?}",
+                "  rust_spral front_detail_profile child_merge={:?} row_setup={:?} matrix_entries={:?} contribution={:?} local_merge={:?} zeroed_bytes={} child_results={} child_contrib_entries={} child_factor_cols={} child_solve_panels={} local_factor_cols={} local_solve_panels={}",
+                profile.front_child_result_merge_time,
+                profile.front_row_setup_time,
+                profile.front_matrix_entry_assembly_time,
+                profile.front_contribution_assembly_time,
+                profile.front_local_result_merge_time,
+                profile.local_dense_bytes_zeroed,
+                profile.front_child_result_count,
+                profile.front_child_contribution_entries,
+                profile.front_child_factor_columns,
+                profile.front_child_solve_panels,
+                profile.front_local_factor_columns,
+                profile.front_local_solve_panels,
+            );
+            println!(
+                "  rust_spral small_leaf_profile subtrees={} fronts={} app_fronts={} columns={} dense_entries={} small_leaf_tpp={:?} small_leaf_pivot_search={:?} small_leaf_pivot_factor={:?} small_leaf_pivot_scale={:?} small_leaf_pivot_update={:?} small_leaf_calc_ld={:?} small_leaf_gemm={:?} small_leaf_pack={:?} small_leaf_solve_panel={:?} small_leaf_output={:?}",
+                profile.spral_small_leaf_subtrees,
+                profile.spral_small_leaf_fronts,
+                profile.spral_small_leaf_app_fronts,
+                profile.spral_small_leaf_columns,
+                profile.spral_small_leaf_dense_entries,
+                profile.spral_small_leaf_tpp_time,
+                profile.spral_small_leaf_pivot_search_time,
+                profile.spral_small_leaf_pivot_factor_time,
+                profile.spral_small_leaf_pivot_scale_time,
+                profile.spral_small_leaf_pivot_update_time,
+                profile.spral_small_leaf_contribution_calc_ld_time,
+                profile.spral_small_leaf_contribution_gemm_time,
+                profile.spral_small_leaf_contribution_pack_time,
+                profile.spral_small_leaf_solve_panel_build_time,
+                profile.spral_small_leaf_output_append_time,
+            );
+            println!(
+                "  rust_spral dense_front_profile tpp={:?} tpp_pivot_search={:?} tpp_pivot_factor={:?} tpp_column_storage={:?} tpp_contribution_pack={:?} app_pivot_factor={:?} app_maxloc={:?} app_swap={:?} app_pivot_update={:?} app_block_apply={:?} app_block_trsm={:?} app_block_diag={:?} app_failed_scan={:?} app_backup={:?} app_restore={:?} app_accepted_update={:?} app_accepted_ld={:?} app_accepted_gemm={:?} app_column_storage={:?} solve_panel_build={:?}",
                 profile.tpp_factorization_time,
+                profile.tpp_pivot_search_time,
+                profile.tpp_pivot_factor_time,
+                profile.tpp_column_storage_time,
+                profile.tpp_contribution_pack_time,
                 profile.app_pivot_factor_time,
+                profile.app_maxloc_time,
+                profile.app_symmetric_swap_time,
+                profile.app_pivot_update_time,
                 profile.app_block_pivot_apply_time,
                 profile.app_block_triangular_solve_time,
                 profile.app_block_diagonal_apply_time,
                 profile.app_failed_pivot_scan_time,
+                profile.app_backup_time,
                 profile.app_restore_time,
                 profile.app_accepted_update_time,
+                profile.app_accepted_ld_time,
+                profile.app_accepted_gemm_time,
                 profile.app_column_storage_time,
                 profile.solve_panel_build_time,
+            );
+            println!(
+                "  rust_spral dense_front_counters tpp_fronts={} tpp_pivots={} tpp_factor_entries={} app_fronts={} app_panels={} app_maxloc_calls={} app_swaps={} app_1x1={} app_2x2={} app_zero={} app_diag_1x1={} app_offdiag_1x1={} app_front_le32={} app_front_33_64={} app_front_65_96={} app_front_97_128={} app_front_129_160={} app_front_161_256={} app_front_257_512={} app_front_gt512={}",
+                profile.tpp_front_count,
+                profile.tpp_pivots,
+                profile.tpp_factor_column_entries,
+                profile.app_front_count,
+                profile.app_panel_count,
+                profile.app_maxloc_calls,
+                profile.app_symmetric_swaps,
+                profile.app_one_by_one_pivots,
+                profile.app_two_by_two_pivots,
+                profile.app_zero_pivots,
+                profile.app_diagonal_one_by_one_pivots,
+                profile.app_offdiag_one_by_one_pivots,
+                profile.app_front_size_histogram[0],
+                profile.app_front_size_histogram[1],
+                profile.app_front_size_histogram[2],
+                profile.app_front_size_histogram[3],
+                profile.app_front_size_histogram[4],
+                profile.app_front_size_histogram[5],
+                profile.app_front_size_histogram[6],
+                profile.app_front_size_histogram[7],
             );
         }
         if let Some(profile) = &rust_exact.solve_profile {
@@ -2843,6 +2972,22 @@ mod tests {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(15)
             .max(1);
+        let profile_side =
+            std::env::var("SSIDS_GLIDER_INPROCESS_SIDE").unwrap_or_else(|_| "paired".to_string());
+        let print_samples = std::env::var("SSIDS_GLIDER_INPROCESS_PRINT_SAMPLES")
+            .ok()
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        let rotate_order = std::env::var("SSIDS_GLIDER_INPROCESS_ROTATE_ORDER")
+            .ok()
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        let (run_rust, run_native) = match profile_side.as_str() {
+            "paired" => (true, true),
+            "rust" => (true, false),
+            "native" => (false, true),
+            other => {
+                panic!("SSIDS_GLIDER_INPROCESS_SIDE must be paired, rust, or native; got {other:?}")
+            }
+        };
         let dump = load_current_glider_iteration0_augmented_dump();
         let symbolic = glider_iteration0_rust_symbolic(&dump);
         let structure = SymmetricCscMatrix::new(
@@ -2870,9 +3015,16 @@ mod tests {
             delta_inf(&warmup_rust.solution, &warmup_native.solution) <= 1e-12,
             "warmup augmented solution delta too large"
         );
+        let warmup_rust_blocks = augmented_step_blocks(&dump, &warmup_rust.solution);
+        let warmup_native_blocks = augmented_step_blocks(&dump, &warmup_native.solution);
+        eprintln!(
+            "ssids_glider_side_profile_begin side={profile_side} repeats={repeats} print_samples={print_samples} rotate_order={rotate_order}"
+        );
 
         let mut rust_factor_times = Vec::with_capacity(repeats);
         let mut rust_solve_times = Vec::with_capacity(repeats);
+        let mut rust_unprofiled_factor_times = Vec::with_capacity(repeats);
+        let mut rust_unprofiled_solve_times = Vec::with_capacity(repeats);
         let mut native_factor_times = Vec::with_capacity(repeats);
         let mut native_solve_times = Vec::with_capacity(repeats);
         let mut rust_factor_profiles = Vec::with_capacity(repeats);
@@ -2884,22 +3036,51 @@ mod tests {
         let mut final_dlambda_delta = 0.0;
         let mut final_dz_delta = 0.0;
 
-        for _ in 0..repeats {
-            let rust_exact = replay_rust_augmented_spral_with_symbolic(&dump, &symbolic);
-            let native_exact =
-                replay_native_augmented_spral_with_session(&dump, &mut native_session);
-            assert_eq!(rust_exact.inertia, native_exact.inertia);
+        for sample_index in 0..repeats {
+            let mut rust_exact = None;
+            let mut rust_unprofiled_exact = None;
+            let mut native_exact = None;
+            let order_offset = if rotate_order { sample_index % 3 } else { 0 };
+            for order_slot in 0..3 {
+                match (order_slot + order_offset) % 3 {
+                    0 if run_rust => {
+                        rust_exact =
+                            Some(replay_rust_augmented_spral_with_symbolic(&dump, &symbolic));
+                    }
+                    1 if run_rust => {
+                        rust_unprofiled_exact = Some(
+                            replay_rust_augmented_spral_unprofiled_with_symbolic(&dump, &symbolic),
+                        );
+                    }
+                    2 if run_native => {
+                        native_exact = Some(replay_native_augmented_spral_with_session(
+                            &dump,
+                            &mut native_session,
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            let rust_reference = rust_exact.as_ref().unwrap_or(&warmup_rust);
+            let native_reference = native_exact.as_ref().unwrap_or(&warmup_native);
+            assert_eq!(rust_reference.inertia, native_reference.inertia);
             assert!(
-                rust_exact.residual_inf <= 1e-10,
-                "rust residual too large: {rust_exact:?}"
+                rust_reference.residual_inf <= 1e-10,
+                "rust residual too large: {rust_reference:?}"
             );
             assert!(
-                native_exact.residual_inf <= 1e-10,
-                "native residual too large: {native_exact:?}"
+                native_reference.residual_inf <= 1e-10,
+                "native residual too large: {native_reference:?}"
             );
-            let rust_blocks = augmented_step_blocks(&dump, &rust_exact.solution);
-            let native_blocks = augmented_step_blocks(&dump, &native_exact.solution);
-            final_solution_delta = delta_inf(&rust_exact.solution, &native_exact.solution);
+            let rust_blocks = rust_exact
+                .as_ref()
+                .map(|exact| augmented_step_blocks(&dump, &exact.solution))
+                .unwrap_or_else(|| warmup_rust_blocks.clone());
+            let native_blocks = native_exact
+                .as_ref()
+                .map(|exact| augmented_step_blocks(&dump, &exact.solution))
+                .unwrap_or_else(|| warmup_native_blocks.clone());
+            final_solution_delta = delta_inf(&rust_reference.solution, &native_reference.solution);
             final_dx_delta = delta_inf(&rust_blocks.dx, &native_blocks.dx);
             final_dp_delta = delta_inf(&rust_blocks.p, &native_blocks.p);
             final_ds_delta = delta_inf(&rust_blocks.ds, &native_blocks.ds);
@@ -2909,129 +3090,306 @@ mod tests {
                 final_solution_delta <= 1e-12,
                 "augmented solution delta too large"
             );
+            if let Some(rust_unprofiled_exact) = &rust_unprofiled_exact {
+                assert_eq!(rust_unprofiled_exact.inertia, native_reference.inertia);
+                assert!(
+                    rust_unprofiled_exact.residual_inf <= 1e-10,
+                    "unprofiled rust residual too large: {rust_unprofiled_exact:?}"
+                );
+                assert!(
+                    delta_inf(&rust_unprofiled_exact.solution, &native_reference.solution) <= 1e-12,
+                    "unprofiled augmented solution delta too large"
+                );
+            }
 
-            rust_factor_times.push(rust_exact.factor_time);
-            rust_solve_times.push(rust_exact.solve_time);
-            native_factor_times.push(native_exact.factor_time);
-            native_solve_times.push(native_exact.solve_time);
-            rust_factor_profiles.push(rust_exact.factor_profile.expect("rust factor profile"));
-            rust_solve_profiles.push(rust_exact.solve_profile.expect("rust solve profile"));
+            if let Some(rust_exact) = rust_exact {
+                if print_samples {
+                    println!(
+                        "  ssids_glider_sample index={} impl=rust profile=profiled factor={:?} solve={:?} residual={:.3e} solution_inf={:.3e} inertia={}",
+                        sample_index,
+                        rust_exact.factor_time,
+                        rust_exact.solve_time,
+                        rust_exact.residual_inf,
+                        rust_exact.solution_inf,
+                        rust_exact.inertia,
+                    );
+                }
+                rust_factor_times.push(rust_exact.factor_time);
+                rust_solve_times.push(rust_exact.solve_time);
+                rust_factor_profiles.push(rust_exact.factor_profile.expect("rust factor profile"));
+                rust_solve_profiles.push(rust_exact.solve_profile.expect("rust solve profile"));
+            }
+            if let Some(rust_unprofiled_exact) = rust_unprofiled_exact {
+                if print_samples {
+                    println!(
+                        "  ssids_glider_sample index={} impl=rust profile=unprofiled factor={:?} solve={:?} residual={:.3e} solution_inf={:.3e} inertia={}",
+                        sample_index,
+                        rust_unprofiled_exact.factor_time,
+                        rust_unprofiled_exact.solve_time,
+                        rust_unprofiled_exact.residual_inf,
+                        rust_unprofiled_exact.solution_inf,
+                        rust_unprofiled_exact.inertia,
+                    );
+                }
+                rust_unprofiled_factor_times.push(rust_unprofiled_exact.factor_time);
+                rust_unprofiled_solve_times.push(rust_unprofiled_exact.solve_time);
+            }
+            if let Some(native_exact) = native_exact {
+                if print_samples {
+                    println!(
+                        "  ssids_glider_sample index={} impl=native profile=native factor={:?} solve={:?} residual={:.3e} solution_inf={:.3e} inertia={}",
+                        sample_index,
+                        native_exact.factor_time,
+                        native_exact.solve_time,
+                        native_exact.residual_inf,
+                        native_exact.solution_inf,
+                        native_exact.inertia,
+                    );
+                }
+                native_factor_times.push(native_exact.factor_time);
+                native_solve_times.push(native_exact.solve_time);
+            }
         }
 
-        let rust_factor = median_duration(&rust_factor_times);
-        let rust_solve = median_duration(&rust_solve_times);
-        let native_factor = median_duration(&native_factor_times);
-        let native_solve = median_duration(&native_solve_times);
         println!("\n=== glider NLIP iteration-0 in-process augmented profile ===");
         println!(
-            "  repeats={} dimension={} nnz={}",
+            "  repeats={} side={} dimension={} nnz={}",
             repeats,
+            profile_side,
             dump.matrix_dimension,
             dump.values.len()
         );
-        println!(
-            "  rust_spral factor={:?} solve={:?} residual={:.3e} solution_inf={:.3e} inertia={}",
-            rust_factor,
-            rust_solve,
-            warmup_rust.residual_inf,
-            warmup_rust.solution_inf,
-            warmup_rust.inertia,
-        );
-        println!(
-            "  rust_spral factor_profile symbolic_tree={:?} pattern={:?} values={:?} fronts={:?} root_delayed={:?} inverse={:?} lower_storage={:?} solve_panel_storage={:?} diagonal_storage={:?} bytes={:?} recorded={:?}",
-            median_profile_duration(&rust_factor_profiles, |profile| profile
-                .symbolic_front_tree_time),
-            median_profile_duration(&rust_factor_profiles, |profile| profile
-                .permuted_pattern_time),
-            median_profile_duration(&rust_factor_profiles, |profile| profile
-                .permuted_values_time),
-            median_profile_duration(&rust_factor_profiles, |profile| profile
-                .front_factorization_time),
-            median_profile_duration(&rust_factor_profiles, |profile| profile
-                .root_delayed_factorization_time),
-            median_profile_duration(&rust_factor_profiles, |profile| profile.factor_inverse_time),
-            median_profile_duration(&rust_factor_profiles, |profile| profile.lower_storage_time),
-            median_profile_duration(&rust_factor_profiles, |profile| profile
-                .solve_panel_storage_time),
-            median_profile_duration(&rust_factor_profiles, |profile| profile
-                .diagonal_storage_time),
-            median_profile_duration(&rust_factor_profiles, |profile| profile.factor_bytes_time),
-            median_duration(
-                &rust_factor_profiles
-                    .iter()
-                    .map(FactorProfile::total_recorded_time)
-                    .collect::<Vec<_>>()
-            ),
-        );
-        println!(
-            "  rust_spral front_profile assembly={:?} dense_factor={:?} fronts={} local_dense_entries={} root_delayed_blocks={}",
-            median_profile_duration(&rust_factor_profiles, |profile| profile.front_assembly_time),
-            median_profile_duration(&rust_factor_profiles, |profile| profile
-                .dense_front_factorization_time),
-            rust_factor_profiles[0].front_count,
-            rust_factor_profiles[0].local_dense_entries,
-            rust_factor_profiles[0].root_delayed_blocks,
-        );
-        println!(
-            "  rust_spral dense_front_profile tpp={:?} app_pivot_factor={:?} app_block_apply={:?} app_block_trsm={:?} app_block_diag={:?} app_failed_scan={:?} app_restore={:?} app_accepted_update={:?} app_column_storage={:?} solve_panel_build={:?}",
-            median_profile_duration(&rust_factor_profiles, |profile| profile
-                .tpp_factorization_time),
-            median_profile_duration(&rust_factor_profiles, |profile| profile
-                .app_pivot_factor_time),
-            median_profile_duration(&rust_factor_profiles, |profile| profile
-                .app_block_pivot_apply_time),
-            median_profile_duration(&rust_factor_profiles, |profile| profile
-                .app_block_triangular_solve_time),
-            median_profile_duration(&rust_factor_profiles, |profile| profile
-                .app_block_diagonal_apply_time),
-            median_profile_duration(&rust_factor_profiles, |profile| profile
-                .app_failed_pivot_scan_time),
-            median_profile_duration(&rust_factor_profiles, |profile| profile.app_restore_time),
-            median_profile_duration(&rust_factor_profiles, |profile| profile
-                .app_accepted_update_time),
-            median_profile_duration(&rust_factor_profiles, |profile| profile
-                .app_column_storage_time),
-            median_profile_duration(&rust_factor_profiles, |profile| profile
-                .solve_panel_build_time),
-        );
-        println!(
-            "  rust_spral solve_profile input_perm={:?} forward={:?} diagonal={:?} backward={:?} output_perm={:?} recorded={:?}",
-            median_solve_profile_duration(&rust_solve_profiles, |profile| profile
-                .input_permutation_time),
-            median_solve_profile_duration(&rust_solve_profiles, |profile| profile
-                .forward_substitution_time),
-            median_solve_profile_duration(&rust_solve_profiles, |profile| profile
-                .diagonal_solve_time),
-            median_solve_profile_duration(&rust_solve_profiles, |profile| profile
-                .backward_substitution_time),
-            median_solve_profile_duration(&rust_solve_profiles, |profile| profile
-                .output_permutation_time),
-            median_duration(
-                &rust_solve_profiles
-                    .iter()
-                    .map(SolveProfile::total_recorded_time)
-                    .collect::<Vec<_>>()
-            ),
-        );
-        println!(
-            "  rust_spral backward_profile trailing_update={:?} triangular={:?} trailing_columns={} trailing_dense_entries={} triangular_columns={} triangular_dense_entries={}",
-            median_solve_profile_duration(&rust_solve_profiles, |profile| profile
-                .backward_trailing_update_time),
-            median_solve_profile_duration(&rust_solve_profiles, |profile| profile
-                .backward_triangular_solve_time),
-            rust_solve_profiles[0].backward_trailing_update_columns,
-            rust_solve_profiles[0].backward_trailing_update_dense_entries,
-            rust_solve_profiles[0].backward_triangular_columns,
-            rust_solve_profiles[0].backward_triangular_dense_entries,
-        );
-        println!(
-            "  native_spral factor={:?} solve={:?} residual={:.3e} solution_inf={:.3e} inertia={}",
-            native_factor,
-            native_solve,
-            warmup_native.residual_inf,
-            warmup_native.solution_inf,
-            warmup_native.inertia,
-        );
+        if !rust_factor_times.is_empty() {
+            let rust_factor = median_duration(&rust_factor_times);
+            let rust_solve = median_duration(&rust_solve_times);
+            println!(
+                "  rust_spral factor={:?} solve={:?} residual={:.3e} solution_inf={:.3e} inertia={}",
+                rust_factor,
+                rust_solve,
+                warmup_rust.residual_inf,
+                warmup_rust.solution_inf,
+                warmup_rust.inertia,
+            );
+            let rust_unprofiled_factor = median_duration(&rust_unprofiled_factor_times);
+            let rust_unprofiled_solve = median_duration(&rust_unprofiled_solve_times);
+            println!(
+                "  rust_spral_unprofiled factor={:?} solve={:?} residual={:.3e} solution_inf={:.3e} inertia={}",
+                rust_unprofiled_factor,
+                rust_unprofiled_solve,
+                warmup_rust.residual_inf,
+                warmup_rust.solution_inf,
+                warmup_rust.inertia,
+            );
+            println!(
+                "  rust_spral factor_profile symbolic_tree={:?} pattern={:?} values={:?} fronts={:?} root_delayed={:?} inverse={:?} lower_storage={:?} solve_panel_storage={:?} diagonal_storage={:?} bytes={:?} recorded={:?}",
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .symbolic_front_tree_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .permuted_pattern_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .permuted_values_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .front_factorization_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .root_delayed_factorization_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .factor_inverse_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .lower_storage_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .solve_panel_storage_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .diagonal_storage_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile.factor_bytes_time),
+                median_duration(
+                    &rust_factor_profiles
+                        .iter()
+                        .map(FactorProfile::total_recorded_time)
+                        .collect::<Vec<_>>()
+                ),
+            );
+            println!(
+                "  rust_spral front_profile assembly={:?} dense_factor={:?} fronts={} local_dense_entries={} root_delayed_blocks={}",
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .front_assembly_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .dense_front_factorization_time),
+                rust_factor_profiles[0].front_count,
+                rust_factor_profiles[0].local_dense_entries,
+                rust_factor_profiles[0].root_delayed_blocks,
+            );
+            println!(
+                "  rust_spral front_detail_profile child_merge={:?} row_setup={:?} matrix_entries={:?} contribution={:?} local_merge={:?} zeroed_bytes={} child_results={} child_contrib_entries={} child_factor_cols={} child_solve_panels={} local_factor_cols={} local_solve_panels={}",
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .front_child_result_merge_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .front_row_setup_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .front_matrix_entry_assembly_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .front_contribution_assembly_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .front_local_result_merge_time),
+                rust_factor_profiles[0].local_dense_bytes_zeroed,
+                rust_factor_profiles[0].front_child_result_count,
+                rust_factor_profiles[0].front_child_contribution_entries,
+                rust_factor_profiles[0].front_child_factor_columns,
+                rust_factor_profiles[0].front_child_solve_panels,
+                rust_factor_profiles[0].front_local_factor_columns,
+                rust_factor_profiles[0].front_local_solve_panels,
+            );
+            println!(
+                "  rust_spral small_leaf_profile subtrees={} fronts={} app_fronts={} columns={} dense_entries={} small_leaf_tpp={:?} small_leaf_pivot_search={:?} small_leaf_pivot_factor={:?} small_leaf_pivot_scale={:?} small_leaf_pivot_update={:?} small_leaf_calc_ld={:?} small_leaf_gemm={:?} small_leaf_pack={:?} small_leaf_solve_panel={:?} small_leaf_output={:?}",
+                median_profile_usize(&rust_factor_profiles, |profile| profile
+                    .spral_small_leaf_subtrees),
+                median_profile_usize(&rust_factor_profiles, |profile| profile
+                    .spral_small_leaf_fronts),
+                median_profile_usize(&rust_factor_profiles, |profile| profile
+                    .spral_small_leaf_app_fronts),
+                median_profile_usize(&rust_factor_profiles, |profile| profile
+                    .spral_small_leaf_columns),
+                median_profile_usize(&rust_factor_profiles, |profile| profile
+                    .spral_small_leaf_dense_entries),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .spral_small_leaf_tpp_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .spral_small_leaf_pivot_search_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .spral_small_leaf_pivot_factor_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .spral_small_leaf_pivot_scale_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .spral_small_leaf_pivot_update_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .spral_small_leaf_contribution_calc_ld_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .spral_small_leaf_contribution_gemm_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .spral_small_leaf_contribution_pack_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .spral_small_leaf_solve_panel_build_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .spral_small_leaf_output_append_time),
+            );
+            println!(
+                "  rust_spral dense_front_profile tpp={:?} tpp_pivot_search={:?} tpp_pivot_factor={:?} tpp_column_storage={:?} tpp_contribution_pack={:?} app_pivot_factor={:?} app_maxloc={:?} app_swap={:?} app_pivot_update={:?} app_block_apply={:?} app_block_trsm={:?} app_block_diag={:?} app_failed_scan={:?} app_backup={:?} app_restore={:?} app_accepted_update={:?} app_accepted_ld={:?} app_accepted_gemm={:?} app_column_storage={:?} solve_panel_build={:?}",
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .tpp_factorization_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .tpp_pivot_search_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .tpp_pivot_factor_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .tpp_column_storage_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .tpp_contribution_pack_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .app_pivot_factor_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile.app_maxloc_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .app_symmetric_swap_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .app_pivot_update_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .app_block_pivot_apply_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .app_block_triangular_solve_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .app_block_diagonal_apply_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .app_failed_pivot_scan_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile.app_backup_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile.app_restore_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .app_accepted_update_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .app_accepted_ld_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .app_accepted_gemm_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .app_column_storage_time),
+                median_profile_duration(&rust_factor_profiles, |profile| profile
+                    .solve_panel_build_time),
+            );
+            println!(
+                "  rust_spral dense_front_counters tpp_fronts={} tpp_pivots={} tpp_factor_entries={} app_fronts={} app_panels={} app_maxloc_calls={} app_swaps={} app_1x1={} app_2x2={} app_zero={} app_diag_1x1={} app_offdiag_1x1={} app_front_le32={} app_front_33_64={} app_front_65_96={} app_front_97_128={} app_front_129_160={} app_front_161_256={} app_front_257_512={} app_front_gt512={}",
+                median_profile_usize(&rust_factor_profiles, |profile| profile.tpp_front_count),
+                median_profile_usize(&rust_factor_profiles, |profile| profile.tpp_pivots),
+                median_profile_usize(&rust_factor_profiles, |profile| profile
+                    .tpp_factor_column_entries),
+                median_profile_usize(&rust_factor_profiles, |profile| profile.app_front_count),
+                median_profile_usize(&rust_factor_profiles, |profile| profile.app_panel_count),
+                median_profile_usize(&rust_factor_profiles, |profile| profile.app_maxloc_calls),
+                median_profile_usize(&rust_factor_profiles, |profile| profile.app_symmetric_swaps),
+                median_profile_usize(&rust_factor_profiles, |profile| profile
+                    .app_one_by_one_pivots),
+                median_profile_usize(&rust_factor_profiles, |profile| profile
+                    .app_two_by_two_pivots),
+                median_profile_usize(&rust_factor_profiles, |profile| profile.app_zero_pivots),
+                median_profile_usize(&rust_factor_profiles, |profile| profile
+                    .app_diagonal_one_by_one_pivots),
+                median_profile_usize(&rust_factor_profiles, |profile| profile
+                    .app_offdiag_one_by_one_pivots),
+                median_profile_usize(&rust_factor_profiles, |profile| profile
+                    .app_front_size_histogram[0]),
+                median_profile_usize(&rust_factor_profiles, |profile| profile
+                    .app_front_size_histogram[1]),
+                median_profile_usize(&rust_factor_profiles, |profile| profile
+                    .app_front_size_histogram[2]),
+                median_profile_usize(&rust_factor_profiles, |profile| profile
+                    .app_front_size_histogram[3]),
+                median_profile_usize(&rust_factor_profiles, |profile| profile
+                    .app_front_size_histogram[4]),
+                median_profile_usize(&rust_factor_profiles, |profile| profile
+                    .app_front_size_histogram[5]),
+                median_profile_usize(&rust_factor_profiles, |profile| profile
+                    .app_front_size_histogram[6]),
+                median_profile_usize(&rust_factor_profiles, |profile| profile
+                    .app_front_size_histogram[7]),
+            );
+            println!(
+                "  rust_spral solve_profile input_perm={:?} forward={:?} diagonal={:?} backward={:?} output_perm={:?} recorded={:?}",
+                median_solve_profile_duration(&rust_solve_profiles, |profile| profile
+                    .input_permutation_time),
+                median_solve_profile_duration(&rust_solve_profiles, |profile| profile
+                    .forward_substitution_time),
+                median_solve_profile_duration(&rust_solve_profiles, |profile| profile
+                    .diagonal_solve_time),
+                median_solve_profile_duration(&rust_solve_profiles, |profile| profile
+                    .backward_substitution_time),
+                median_solve_profile_duration(&rust_solve_profiles, |profile| profile
+                    .output_permutation_time),
+                median_duration(
+                    &rust_solve_profiles
+                        .iter()
+                        .map(SolveProfile::total_recorded_time)
+                        .collect::<Vec<_>>()
+                ),
+            );
+            println!(
+                "  rust_spral backward_profile trailing_update={:?} triangular={:?} trailing_columns={} trailing_dense_entries={} triangular_columns={} triangular_dense_entries={}",
+                median_solve_profile_duration(&rust_solve_profiles, |profile| profile
+                    .backward_trailing_update_time),
+                median_solve_profile_duration(&rust_solve_profiles, |profile| profile
+                    .backward_triangular_solve_time),
+                rust_solve_profiles[0].backward_trailing_update_columns,
+                rust_solve_profiles[0].backward_trailing_update_dense_entries,
+                rust_solve_profiles[0].backward_triangular_columns,
+                rust_solve_profiles[0].backward_triangular_dense_entries,
+            );
+        }
+        if !native_factor_times.is_empty() {
+            let native_factor = median_duration(&native_factor_times);
+            let native_solve = median_duration(&native_solve_times);
+            println!(
+                "  native_spral factor={:?} solve={:?} residual={:.3e} solution_inf={:.3e} inertia={}",
+                native_factor,
+                native_solve,
+                warmup_native.residual_inf,
+                warmup_native.solution_inf,
+                warmup_native.inertia,
+            );
+        }
         println!(
             "  augmented deltas: solution={:.6e} dx={:.6e} dp={:.6e} ds={:.6e} dlambda={:.6e} dz={:.6e}",
             final_solution_delta,
@@ -3041,6 +3399,81 @@ mod tests {
             final_dlambda_delta,
             final_dz_delta,
         );
+    }
+
+    #[test]
+    #[ignore = "manual glider SSIDS small-leaf TPP exact-panel capture helper"]
+    fn print_current_glider_small_leaf_tpp_panel_capture_summary() {
+        let dump = load_current_glider_iteration0_augmented_dump();
+        let symbolic = glider_iteration0_rust_symbolic(&dump);
+
+        ssids_rs::debug_disable_spral_small_leaf_tpp_panel_captures();
+        ssids_rs::debug_clear_spral_small_leaf_tpp_panel_captures();
+        let rust_exact = replay_rust_augmented_spral_unprofiled_with_symbolic(&dump, &symbolic);
+        let captures = ssids_rs::debug_take_spral_small_leaf_tpp_panel_captures();
+
+        assert!(
+            rust_exact.residual_inf <= 1e-10,
+            "rust residual too large: {rust_exact:?}"
+        );
+        assert!(
+            !captures.is_empty(),
+            "glider replay did not capture any small-leaf TPP panels"
+        );
+
+        let mut ordered = (0..captures.len()).collect::<Vec<_>>();
+        ordered.sort_by_key(|&index| {
+            let capture = &captures[index];
+            std::cmp::Reverse((
+                capture.m * capture.n,
+                capture.m,
+                capture.n,
+                capture.front_id,
+            ))
+        });
+        let total_lower_entries = captures
+            .iter()
+            .map(|capture| capture.lcol.len())
+            .sum::<usize>();
+        let total_dense_area = captures
+            .iter()
+            .map(|capture| capture.m * capture.n)
+            .sum::<usize>();
+        let limit = std::env::var("SSIDS_GLIDER_TPP_PANEL_CAPTURE_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(16)
+            .min(captures.len());
+
+        println!("\n=== glider small-leaf TPP exact-panel capture summary ===");
+        println!(
+            "  panels={} total_dense_area={} total_lower_entries={} residual={:.3e}",
+            captures.len(),
+            total_dense_area,
+            total_lower_entries,
+            rust_exact.residual_inf
+        );
+        println!("  top panels by m*n:");
+        for &index in ordered.iter().take(limit) {
+            let capture = &captures[index];
+            println!(
+                "    index={} front={} m={} n={} ldl={} lcol_len={} hash={:#018x} rows_prefix={:?} perm_prefix={:?}",
+                index,
+                capture.front_id,
+                capture.m,
+                capture.n,
+                capture.ldl,
+                capture.lcol.len(),
+                capture.stable_hash,
+                &capture.rows[..capture.rows.len().min(8)],
+                &capture.perm[..capture.perm.len().min(8)],
+            );
+        }
+
+        if std::env::var("SSIDS_GLIDER_TPP_PANEL_CAPTURE_PRINT_LITERAL").is_ok() {
+            let capture = &captures[ordered[0]];
+            println!("  largest_panel_debug={capture:#?}");
+        }
     }
 
     #[test]
@@ -3865,6 +4298,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ipopt")]
     #[ignore = "manual IPOPT diagnostics helper"]
     fn print_current_glider_ipopt_repro() {
         let params = Params {
@@ -3919,6 +4353,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ipopt")]
     #[ignore = "manual local-SPRAL IPOPT strategy comparison for the glider repro"]
     fn print_current_glider_ipopt_mu_strategy_compare() {
         fn local_spral_ipopt_options(config: &SolverConfig) -> optimization::IpoptOptions {

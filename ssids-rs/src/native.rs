@@ -763,11 +763,8 @@ fn native_spral_library_candidates() -> Vec<PathBuf> {
         candidates.push(PathBuf::from(override_path));
     }
     candidates.extend([
-        PathBuf::from("/Users/greg/local/ipopt-spral/lib/libspral.dylib"),
-        PathBuf::from("/Users/greg/local/ipopt-spral/lib/libspral.so"),
         PathBuf::from("target/native/spral-upstream/builddir/libspral.dylib"),
-        PathBuf::from("libspral.dylib"),
-        PathBuf::from("libspral.so"),
+        PathBuf::from("target/native/spral-upstream/builddir/libspral.so"),
     ]);
     candidates
 }

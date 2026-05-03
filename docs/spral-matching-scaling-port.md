@@ -19,7 +19,7 @@ native METIS; those libraries are oracles for parity tests only.
 | METIS `mmd.c::genmmd` / `ometis.c::MMDOrder` leaf ordering | `metis_ordering::mmd::mmd_order` | `native_metis_mmd_fixture_phase_tests` direct `libmetis__genmmd` oracle | Native-matching on path, star, disconnected, and empty fixtures; wired into recursive NodeND leaves |
 | METIS `coarsen.c::BucketSortKeysInc`, `Match_RM`, `Match_2Hop*`, `Match_SHEM`, `CreateCoarseGraph` | `bucket_sort_keys_inc`, `metis_match_rm_coarsen`, `metis_match_2hop`, `metis_match_shem_coarsen`, `create_coarse_graph_from_match` | `metis_l1_match_rm_coarsening_matches_native_path_54_fixture`, `native_metis_node_nd_fixture_phase_tests` | Native-matching for identity self-match path/star, `path_54_match_rm`, `path_121`, `path_300`, and `path_1000`; multi-constraint matching remains out of scope for SPRAL NodeND |
 | METIS `initpart.c::RandomBisection` zero-edge branch | `random_bisection_edge_state`, `balance_2way_no_edge` | `metis_node_nd_orders_empty_three_fixture`, native `empty_3` top-separator and NodeND fixtures | Native-matching for the SPRAL-default zero-edge graph path reached by structurally singular matching graphs |
-| METIS `initpart.c::GrowBisection` plus `refine.c::Compute2WayPartitionParams` and cut FM no-op branch | `metis_debug_l1_edge_bisection_from_lower_csc` | `metis_l1_edge_bisection_matches_native_*`, `native_metis_node_bisection_stage_phase_tests` | Phase-tested for path/star and `path_54_match_rm` edge partition state; active no-edge branch now dispatches to `RandomBisection` |
+| METIS `initpart.c::GrowBisection` plus `refine.c::Compute2WayPartitionParams`, `balance.c::Balance2Way`, and cut FM branch | `metis_debug_l1_edge_bisection_from_lower_csc`, `balance_2way_edge`, `bnd_2way_balance`, `general_2way_balance` | `metis_l1_edge_bisection_matches_native_*`, `native_metis_node_bisection_stage_phase_tests`, `metis_bnd_2way_balance_moves_boundary_vertices_without_fail_closed_escape`, `metis_general_2way_balance_moves_disconnected_vertices_without_fail_closed_escape` | Phase-tested for path/star and `path_54_match_rm` edge partition state; boundary and general `Balance2Way` branches are source-ported instead of fail-closed |
 | METIS `separator.c::ConstructSeparator`, `srefine.c::Compute2WayNodePartitionParams`, `sfm.c::FM_2WayNodeRefine*` coarse separator refinement | `metis_debug_l1_construct_separator_from_lower_csc` | `metis_l1_construct_separator_matches_native_*`, `native_metis_node_bisection_stage_phase_tests` | Native-matching for path/star and the 54-vertex Match_RM coarse separator; `ctrl->compress` rollback limits are ported |
 | METIS `srefine.c::Project2WayNodePartition`, `Refine2WayNode`, active `FM_2WayNodeBalance` | `project_node_separator_state_through_coarsening`, `metis_l1_projected_separator_trace`, `fm_2way_node_balance` | `metis_l1_projected_separator_matches_native_path_54_fixture`, `native_metis_node_nd_fixture_phase_tests` | Native-matching for path/star no-op projection plus multi-level path projections through `path_1000` and L2 projection on `path_5000` |
 | METIS `ometis.c::MlevelNodeBisectionL2` large-graph separator path | `metis_l2_node_bisection_trace_with_rng`, `metis_coarsen_graph_nlevels_with_maps` | `metis_node_nd_orders_path_5000_l2_fixture`, `native_metis_node_nd_top_separator_compression_retry_phase_test`, `native_metis_node_nd_fixture_phase_tests` | Native-matching on `path_5000`: four-level pre-coarsening, five L1 retry runs, best-separator restore, and final projection are pinned |
@@ -302,3 +302,38 @@ Release performance notes on dense case 58:
   and row order. A five-repeat case-59 release profile measured native/Rust
   saved-scaling factor medians at about `254us`/`264us`, with Rust
   `app_accepted_ld` around `3us` and `app_accepted_update` around `41us`.
+- The APP pivot profile now splits the in-block bucket into `app_maxloc`,
+  `app_swap`, and `app_pivot_update`. These are Rust-only attribution buckets
+  under the existing `app_pivot` total; they do not change pivot selection,
+  swap order, or update arithmetic, but they localize the remaining dense-front
+  gap before another kernel change is attempted. The fine-grained timers are
+  opt-in via `SPRAL_SSIDS_DEBUG_FACTOR_APP_SUBPHASES=1` so default side-by-side
+  release profiles keep their existing timing overhead.
+- APP factor profiles now also report low-overhead front-shape counters when
+  profiling is enabled: APP front count, panel count, maxloc calls, symmetric
+  swaps, 1x1/2x2/zero pivot counts, and an eight-bucket APP front-size
+  histogram. These are counted only on profiled runs and are parsed by
+  `scripts/ssids_rs_release_profile.sh` as integer attribution metrics, not as
+  native timing comparisons.
+- The glider exact augmented replay currently exercises 88 APP fronts and 88
+  APP panels: 75 fronts in the 33-64 bucket and 13 in the 65-96 bucket. The
+  observed pivot mix is all diagonal-maxloc 1x1 (`2816` pivots), with `0`
+  off-diagonal-maxloc 1x1 pivots, 2x2 pivots, or zero pivots, `2816` maxloc calls,
+  and roughly `2420` symmetric swaps. That makes glider's remaining factor gap
+  a many-small-front diagonal-1x1 APP path rather than the dense case-59
+  two-by-two-heavy path.
+- APP branch telemetry now separates diagonal 1x1 choices from unstable
+  off-diagonal maxloc entries that select a 1x1 pivot, and keeps a
+  separate 2x2/zero-pivot classification. The branch ledger has deterministic
+  dense APP fixtures for the two 1x1 variants and case-59 coverage for the
+  2x2 path, so future glider-specific APP changes can fail closed on the exact
+  pivot-shape branch they are trying to optimize.
+- Dense symmetric swaps now exchange the row-tail part of the dense front as
+  one contiguous slice while preserving the same column/row swap order and the
+  same diagonal/cross-term handling. A five-repeat case-59 release profile
+  measured native/Rust saved-scaling factor medians at about `277us`/`287us`
+  with bitwise-identical solves. A glider exact augmented replay measured
+  native/Rust factor at about `967us`/`3.51ms` and solve at about
+  `1.97ms`/`2.37ms`; the exact augmented solution delta remained
+  `6.94e-18`, and the remaining glider factor gap is still the many-small-front
+  APP path as a whole rather than the symmetric swap tail alone.

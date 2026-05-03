@@ -81,9 +81,13 @@ micro = "\N{MICRO SIGN}"
 duration_re = re.compile(f"^([0-9.]+)(ns|{micro}s|us|ms|s)$")
 factor_re = re.compile(r"^\[ssids_rs::factorize\].*scaling=([^ ]+) (.*)$")
 dense_re = re.compile(r"^(native_matching_scaling|native_captured_order_no_scaling|rust_captured_order_no_scaling|rust_spral_matching_saved_scaling) (.*)$")
-glider_factor_re = re.compile(r"^\s*(rust_spral|native_spral) factor=([^ ]+) solve=([^ ]+)")
+glider_factor_re = re.compile(r"^\s*(rust_spral(?:_unprofiled)?|native_spral) factor=([^ ]+) solve=([^ ]+)")
+glider_front_detail_re = re.compile(r"^\s*rust_spral front_detail_profile (.*)$")
+glider_small_leaf_re = re.compile(r"^\s*rust_spral small_leaf_profile (.*)$")
 glider_dense_re = re.compile(r"^\s*rust_spral dense_front_profile (.*)$")
+glider_counter_re = re.compile(r"^\s*rust_spral dense_front_counters (.*)$")
 repeat_re = re.compile(r"\s+repeat=\d+\b")
+integer_re = re.compile(r"^[0-9]+$")
 
 
 def seconds(raw):
@@ -111,11 +115,19 @@ def fields(text):
         value = value.rstrip(",")
         parsed = seconds(value)
         if parsed is not None:
-            out[key] = parsed
+            out[key] = (parsed, "duration")
+        elif integer_re.match(value):
+            out[key] = (float(value), "count")
     return out
 
 
 series = {}
+metric_kinds = {}
+
+def add_series(case, label, key, value, kind):
+    series.setdefault((case, label, key), []).append(value)
+    metric_kinds[(case, label, key)] = kind
+
 current = "unknown"
 with open(path, "r", encoding="utf-8", errors="replace") as handle:
     for line in handle:
@@ -126,28 +138,47 @@ with open(path, "r", encoding="utf-8", errors="replace") as handle:
         match = factor_re.match(line)
         if match:
             scaling = match.group(1)
-            for key, value in fields(match.group(2)).items():
-                series.setdefault((current, f"rust_factor_profile[{scaling}]", key), []).append(value)
+            for key, (value, kind) in fields(match.group(2)).items():
+                add_series(current, f"rust_factor_profile[{scaling}]", key, value, kind)
             continue
         match = dense_re.match(line)
         if match:
             label = match.group(1)
-            for key, value in fields(match.group(2)).items():
-                series.setdefault((current, label, key), []).append(value)
+            for key, (value, kind) in fields(match.group(2)).items():
+                add_series(current, label, key, value, kind)
             continue
         match = glider_factor_re.match(line)
         if match:
             label = f"glider_{match.group(1)}"
-            series.setdefault((current, label, "factor"), []).append(seconds(match.group(2)))
-            series.setdefault((current, label, "solve"), []).append(seconds(match.group(3)))
+            add_series(current, label, "factor", seconds(match.group(2)), "duration")
+            add_series(current, label, "solve", seconds(match.group(3)), "duration")
+            continue
+        match = glider_front_detail_re.match(line)
+        if match:
+            for key, (value, kind) in fields(match.group(1)).items():
+                add_series(current, "glider_rust_front_detail_profile", key, value, kind)
+            continue
+        match = glider_small_leaf_re.match(line)
+        if match:
+            for key, (value, kind) in fields(match.group(1)).items():
+                add_series(current, "glider_rust_small_leaf_profile", key, value, kind)
             continue
         match = glider_dense_re.match(line)
         if match:
-            for key, value in fields(match.group(1)).items():
-                series.setdefault((current, "glider_rust_dense_front_profile", key), []).append(value)
+            for key, (value, kind) in fields(match.group(1)).items():
+                add_series(current, "glider_rust_dense_front_profile", key, value, kind)
+            continue
+        match = glider_counter_re.match(line)
+        if match:
+            for key, (value, kind) in fields(match.group(1)).items():
+                add_series(current, "glider_rust_dense_front_counters", key, value, kind)
 
 
-def fmt(value):
+def fmt(value, kind="duration"):
+    if kind == "count":
+        if abs(value - round(value)) < 1e-9:
+            return str(int(round(value)))
+        return f"{value:.3f}"
     sign = "-" if value < 0 else ""
     value = abs(value)
     if value < 1e-6:
@@ -215,6 +246,13 @@ for case in sorted({case for case, _, _ in medians}):
         "glider_rust_spral",
         ["factor", "solve"],
     )
+    printed_any |= side_by_side(
+        case,
+        "glider_unprofiled",
+        "glider_native_spral",
+        "glider_rust_spral_unprofiled",
+        ["factor", "solve"],
+    )
 if not printed_any:
     print("(no native/rust pairs found)")
 
@@ -222,12 +260,17 @@ print("\n== rust-only attribution bucket medians ==")
 for (case, label, key), value in sorted(medians.items()):
     if not (
         label.startswith("rust_factor_profile[")
+        or label == "glider_rust_front_detail_profile"
+        or label == "glider_rust_small_leaf_profile"
         or label == "glider_rust_dense_front_profile"
+        or label == "glider_rust_dense_front_counters"
     ):
         continue
-    print(f"{case} | {label} | {key} | n={counts[(case, label, key)]} median={fmt(value)}")
+    kind = metric_kinds[(case, label, key)]
+    print(f"{case} | {label} | {key} | n={counts[(case, label, key)]} median={fmt(value, kind)}")
 
 print("\n== all raw medians ==")
 for (case, label, key), value in sorted(medians.items()):
-    print(f"{case} | {label} | {key} | n={counts[(case, label, key)]} median={fmt(value)}")
+    kind = metric_kinds[(case, label, key)]
+    print(f"{case} | {label} | {key} | n={counts[(case, label, key)]} median={fmt(value, kind)}")
 PY
