@@ -7,6 +7,7 @@ type Preset =
   | "free_flight1"
   | "star1"
   | "y2_low"
+  | "y2_launch"
   | "y2"
   | "y2_high"
   | "star3"
@@ -200,9 +201,27 @@ interface ApiFrame {
   beta_ref_deg: number[];
   roll_ref_deg: number[];
   roll_ff_deg: number[];
+  roll_p_deg: number[];
+  roll_i_deg: number[];
   pitch_ref_deg: number[];
+  pitch_ref_p_deg: number[];
+  pitch_ref_i_deg: number[];
   curvature_z_b: number[];
   curvature_z_ref: number[];
+  aileron_trim_deg: number[];
+  aileron_roll_p_deg: number[];
+  aileron_roll_d_deg: number[];
+  rudder_trim_deg: number[];
+  rudder_beta_p_deg: number[];
+  rudder_rate_d_deg: number[];
+  rudder_world_z_p_deg: number[];
+  elevator_trim_deg: number[];
+  elevator_pitch_p_deg: number[];
+  elevator_pitch_d_deg: number[];
+  elevator_alpha_protection_deg: number[];
+  motor_torque_trim: number[];
+  motor_torque_p: number[];
+  motor_torque_i: number[];
   top_tension: number[];
   total_force_b: [number, number, number][];
   aero_force_b: [number, number, number][];
@@ -335,6 +354,7 @@ const timeDilationSelect = document.querySelector<HTMLSelectElement>("#time-dila
 const cameraFollowTargetSelect = document.querySelector<HTMLSelectElement>("#camera-follow-target")!;
 const cameraFollowYawInput = document.querySelector<HTMLInputElement>("#camera-follow-yaw")!;
 const cameraFollowYawLabel = cameraFollowYawInput.closest<HTMLLabelElement>(".checkbox-label")!;
+const trackpadNavigationInput = document.querySelector<HTMLInputElement>("#trackpad-navigation")!;
 const controlLabelsEnabledInput = document.querySelector<HTMLInputElement>("#control-labels-enabled")!;
 const controlDiskEnabledInput = document.querySelector<HTMLInputElement>("#control-disk-enabled")!;
 const controlFeaturesEnabledInput = document.querySelector<HTMLInputElement>(
@@ -374,6 +394,7 @@ const runtimePlotsView = document.querySelector<HTMLElement>("#runtime-plots-vie
 const plotsNode = document.querySelector<HTMLElement>("#plots")!;
 const layoutNode = document.querySelector<HTMLElement>(".layout")!;
 const viewport = document.querySelector<HTMLElement>("#viewport")!;
+const sidebarResizeHandle = document.querySelector<HTMLElement>("#sidebar-resize-handle")!;
 const sceneResizeHandle = document.querySelector<HTMLElement>("#scene-resize-handle")!;
 const controlLabelLayer = document.querySelector<HTMLElement>("#control-label-layer")!;
 const runForm = document.querySelector<HTMLFormElement>("#run-form")!;
@@ -401,6 +422,12 @@ interface ControllerTuningField {
   min?: string;
   mode?: TuningMode;
   guidanceModes?: GuidanceMode[];
+}
+
+interface ControllerTuningSection {
+  title: string;
+  description: string;
+  groups: string[];
 }
 
 const CONTROLLER_TUNING_FIELDS: ControllerTuningField[] = [
@@ -489,6 +516,38 @@ const CONTROLLER_TUNING_FIELDS: ControllerTuningField[] = [
   { key: "rotor_speed_hard_limit_radps", label: "Rotor hard speed limit", group: "Actuator limits", step: "10", unit: "rad/s", min: "0" }
 ];
 
+const CONTROLLER_TUNING_SECTIONS: ControllerTuningSection[] = [
+  {
+    title: "Formation Scheduling",
+    description: "Phase error and target-speed scheduling before the individual kite controller.",
+    groups: ["Phase / speed scheduling", "Rabbit distance schedule"]
+  },
+  {
+    title: "Lateral Outer Loop",
+    description: "Rabbit geometry, guidance mode, lookahead, and the commanded roll reference.",
+    groups: ["Lateral outer loop", "Lateral outer loop / guidance geometry"]
+  },
+  {
+    title: "Lateral Inner Loops",
+    description: "Direct roll and sideslip/yaw-damper gains that command aileron and rudder.",
+    groups: ["Roll inner loop", "Sideslip / yaw damper"]
+  },
+  {
+    title: "Longitudinal",
+    description: "Pitch, altitude, airspeed, and TECS gains. Mode-specific fields hide when inactive.",
+    groups: ["Longitudinal shared", "Pitch inner loop", "Max-throttle altitude mode", "TECS mode"]
+  },
+  {
+    title: "Protection & Actuators",
+    description: "Alpha protection, actuator authority limits, rotor limits, and first-order actuator lag.",
+    groups: ["Alpha protection", "Actuator limits", "Actuator dynamics"]
+  }
+];
+
+const CONTROLLER_TUNING_GROUP_TO_SECTION = new Map<string, ControllerTuningSection>(
+  CONTROLLER_TUNING_SECTIONS.flatMap((section) => section.groups.map((group) => [group, section] as const))
+);
+
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(window.devicePixelRatio);
 renderer.setSize(viewport.clientWidth, viewport.clientHeight);
@@ -504,14 +563,19 @@ camera.position.set(240, -280, 290);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.set(0, 0, 220);
 controls.screenSpacePanning = false;
-controls.mouseButtons = {
-  LEFT: THREE.MOUSE.PAN,
-  MIDDLE: null,
-  RIGHT: THREE.MOUSE.ROTATE
-};
 controls.minPolarAngle = 0.05;
 controls.maxPolarAngle = Math.PI - 0.05;
-controls.update();
+
+function applyPointerNavigationMode(): void {
+  const trackpadMode = trackpadNavigationInput.checked;
+  controls.mouseButtons = {
+    LEFT: trackpadMode ? THREE.MOUSE.ROTATE : THREE.MOUSE.PAN,
+    MIDDLE: null,
+    RIGHT: trackpadMode ? THREE.MOUSE.PAN : THREE.MOUSE.ROTATE
+  };
+  controls.update();
+}
+applyPointerNavigationMode();
 
 const WORLD_Z_AXIS = new THREE.Vector3(0, 0, 1);
 const middlePanStart = new THREE.Vector2();
@@ -520,6 +584,13 @@ const middlePanVertical = new THREE.Vector3();
 let middleZPanPointerId: number | null = null;
 const SCENE_RESIZE_MIN_HEIGHT = 360;
 const SCENE_RESIZE_MAX_HEIGHT = 1400;
+const SIDEBAR_WIDTH_STORAGE_KEY = "multikite.sidebarWidthPx";
+const SIDEBAR_RESIZE_MIN_WIDTH = 280;
+const SIDEBAR_RESIZE_MAX_WIDTH = 760;
+const RIGHT_WORKBENCH_MIN_WIDTH = 520;
+let sidebarResizePointerId: number | null = null;
+let sidebarResizeStartX = 0;
+let sidebarResizeStartWidth = 0;
 let sceneResizePointerId: number | null = null;
 let sceneResizeStartY = 0;
 let sceneResizeStartHeight = 0;
@@ -538,6 +609,7 @@ grid.rotation.x = Math.PI / 2;
 scene.add(grid);
 const GRID_SIZE = 600;
 const GRID_HALF_EXTENT = GRID_SIZE / 2;
+const AIR_PARTICLE_DISK_CLEARANCE_M = 100;
 
 const payloadMesh = new THREE.Mesh(
   new THREE.SphereGeometry(7, 24, 24),
@@ -843,6 +915,7 @@ let activeSummaryRequest: {
   controller_tuning: ControllerTuning;
 } | null = null;
 let runInProgress = false;
+let runStreamComplete = false;
 let playbackPaused = false;
 let streamAbortController: AbortController | null = null;
 let activeRunSequence = 0;
@@ -876,6 +949,7 @@ interface PlotTraceDefinition {
   legendName?: string;
   kiteIndex?: number;
   alwaysVisible?: boolean;
+  defaultVisible?: boolean;
   dash?: PlotDash;
   width?: number;
   shape?: "linear" | "hv";
@@ -935,6 +1009,7 @@ interface KiteBreakdownTraceDefinition {
   dash?: PlotDash;
   width?: number;
   alpha?: number;
+  defaultVisible?: boolean;
 }
 
 function appendConsole(message: string): void {
@@ -1990,6 +2065,84 @@ function preventMiddleAuxClick(event: MouseEvent): void {
   }
 }
 
+function sidebarMaxWidth(): number {
+  return Math.max(
+    SIDEBAR_RESIZE_MIN_WIDTH,
+    Math.min(SIDEBAR_RESIZE_MAX_WIDTH, layoutNode.getBoundingClientRect().width - RIGHT_WORKBENCH_MIN_WIDTH)
+  );
+}
+
+function clampSidebarWidth(widthPx: number): number {
+  return THREE.MathUtils.clamp(widthPx, SIDEBAR_RESIZE_MIN_WIDTH, sidebarMaxWidth());
+}
+
+function setSidebarWidth(widthPx: number, persist: boolean): void {
+  const width = clampSidebarWidth(widthPx);
+  layoutNode.style.setProperty("--controls-width", `${width.toFixed(0)}px`);
+  if (persist) {
+    localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, width.toFixed(0));
+  }
+  resizeSceneRenderer();
+}
+
+function restoreSidebarWidth(): void {
+  const saved = Number(localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY));
+  if (Number.isFinite(saved) && saved > 0) {
+    setSidebarWidth(saved, false);
+  }
+}
+
+function sidebarResizeWidthFromEvent(event: PointerEvent): number {
+  return sidebarResizeStartWidth + event.clientX - sidebarResizeStartX;
+}
+
+function handleSidebarResizeStart(event: PointerEvent): void {
+  if (event.pointerType === "mouse" && event.button !== 0) {
+    return;
+  }
+  event.preventDefault();
+  sidebarResizePointerId = event.pointerId;
+  sidebarResizeStartX = event.clientX;
+  sidebarResizeStartWidth = document.querySelector<HTMLElement>(".controls")!.getBoundingClientRect().width;
+  sidebarResizeHandle.setPointerCapture(event.pointerId);
+  layoutNode.classList.add("sidebar-resizing");
+}
+
+function handleSidebarResizeMove(event: PointerEvent): void {
+  if (event.pointerId !== sidebarResizePointerId) {
+    return;
+  }
+  event.preventDefault();
+  setSidebarWidth(sidebarResizeWidthFromEvent(event), true);
+}
+
+function endSidebarResize(event?: PointerEvent): void {
+  if (sidebarResizePointerId === null) {
+    return;
+  }
+  if (event && event.pointerId !== sidebarResizePointerId) {
+    return;
+  }
+  if (event && sidebarResizeHandle.hasPointerCapture(event.pointerId)) {
+    sidebarResizeHandle.releasePointerCapture(event.pointerId);
+  }
+  sidebarResizePointerId = null;
+  layoutNode.classList.remove("sidebar-resizing");
+  resizeSceneRenderer();
+}
+
+function handleSidebarResizeKeydown(event: KeyboardEvent): void {
+  const step = event.shiftKey ? 80 : 24;
+  const currentWidth = document.querySelector<HTMLElement>(".controls")!.getBoundingClientRect().width;
+  if (event.key === "ArrowLeft") {
+    event.preventDefault();
+    setSidebarWidth(currentWidth - step, true);
+  } else if (event.key === "ArrowRight") {
+    event.preventDefault();
+    setSidebarWidth(currentWidth + step, true);
+  }
+}
+
 function sceneResizeHeightFromEvent(event: PointerEvent): number {
   return THREE.MathUtils.clamp(
     sceneResizeStartHeight + event.clientY - sceneResizeStartY,
@@ -2073,20 +2226,29 @@ renderer.domElement.addEventListener("pointercancel", handleViewportPointerEnd);
 renderer.domElement.addEventListener("lostpointercapture", handleViewportPointerEnd);
 window.addEventListener("pointerup", (event) => {
   endMiddleZPan(event);
+  endSidebarResize(event);
   endSceneResize(event);
   handleViewportPointerEnd();
 });
 window.addEventListener("pointercancel", (event) => {
   endMiddleZPan(event);
+  endSidebarResize(event);
   endSceneResize(event);
   handleViewportPointerEnd();
 });
+sidebarResizeHandle.addEventListener("pointerdown", handleSidebarResizeStart);
+sidebarResizeHandle.addEventListener("pointermove", handleSidebarResizeMove);
+sidebarResizeHandle.addEventListener("pointerup", endSidebarResize);
+sidebarResizeHandle.addEventListener("pointercancel", endSidebarResize);
+sidebarResizeHandle.addEventListener("lostpointercapture", () => endSidebarResize());
+sidebarResizeHandle.addEventListener("keydown", handleSidebarResizeKeydown);
 sceneResizeHandle.addEventListener("pointerdown", handleSceneResizeStart);
 sceneResizeHandle.addEventListener("pointermove", handleSceneResizeMove);
 sceneResizeHandle.addEventListener("pointerup", endSceneResize);
 sceneResizeHandle.addEventListener("pointercancel", endSceneResize);
 sceneResizeHandle.addEventListener("lostpointercapture", () => endSceneResize());
 sceneResizeHandle.addEventListener("keydown", handleSceneResizeKeydown);
+restoreSidebarWidth();
 syncOrbitTargetMarker();
 
 function setFailure(failure: SimulationFailure | null): void {
@@ -2206,17 +2368,43 @@ function compactNumberInputValue(value: number): string {
 
 function renderControllerTuningControls(tuning: ControllerTuning): void {
   controllerTuningFieldsNode.innerHTML = "";
+  const sections = new Map<string, HTMLElement>();
   const groups = new Map<string, HTMLElement>();
+
+  const ensureSection = (section: ControllerTuningSection): HTMLElement => {
+    const existing = sections.get(section.title);
+    if (existing) {
+      return existing;
+    }
+    const node = document.createElement("section");
+    node.className = "tuning-section";
+    node.dataset.section = section.title;
+    node.innerHTML = `
+      <div class="tuning-section-head">
+        <div class="tuning-section-title">${escapeHtml(section.title)}</div>
+        <div class="tuning-section-description">${escapeHtml(section.description)}</div>
+      </div>
+    `;
+    sections.set(section.title, node);
+    controllerTuningFieldsNode.append(node);
+    return node;
+  };
 
   CONTROLLER_TUNING_FIELDS.forEach((field) => {
     let group = groups.get(field.group);
     if (!group) {
+      const section = CONTROLLER_TUNING_GROUP_TO_SECTION.get(field.group) ?? {
+        title: "Other",
+        description: "Less commonly adjusted controller parameters.",
+        groups: [field.group]
+      };
+      const sectionNode = ensureSection(section);
       group = document.createElement("section");
       group.className = "tuning-group";
       group.dataset.group = field.group;
       group.innerHTML = `<div class="tuning-group-title">${escapeHtml(field.group)}</div>`;
       groups.set(field.group, group);
-      controllerTuningFieldsNode.append(group);
+      sectionNode.append(group);
     }
 
     const row = document.createElement("label");
@@ -2365,6 +2553,10 @@ function syncControllerTuningVisibility(): void {
     const fields = Array.from(group.querySelectorAll<HTMLElement>(".tuning-field"));
     group.hidden = fields.length > 0 && fields.every((field) => field.hidden);
   });
+  controllerTuningFieldsNode.querySelectorAll<HTMLElement>(".tuning-section").forEach((section) => {
+    const groups = Array.from(section.querySelectorAll<HTMLElement>(".tuning-group"));
+    section.hidden = groups.length > 0 && groups.every((group) => group.hidden);
+  });
 }
 
 function playbackAnchorSimTime(): number {
@@ -2393,12 +2585,11 @@ function applyTimeDilationSelection(logChange: boolean): void {
 function setRunControls(): void {
   runButton.disabled = false;
   if (runInProgress) {
-    runButton.textContent = playbackPaused ? "Resume" : "Pause";
-    restartButton.disabled = false;
+    runButton.textContent = runStreamComplete ? "Run" : playbackPaused ? "Resume" : "Pause";
   } else {
     runButton.textContent = "Run";
-    restartButton.disabled = true;
   }
+  restartButton.disabled = false;
 }
 
 function resumePlaybackClock(): void {
@@ -2514,8 +2705,19 @@ function plotSignalKey(trace: PlotTraceDefinition): string {
   return trace.signalKey ?? trace.legendName ?? trace.name;
 }
 
+function plotSignalDefaultVisible(signalKey: string): boolean {
+  for (const section of activePlotSections) {
+    for (const trace of section.traces) {
+      if (plotSignalKey(trace) === signalKey) {
+        return trace.defaultVisible ?? true;
+      }
+    }
+  }
+  return true;
+}
+
 function plotSignalVisible(trace: PlotTraceDefinition): boolean {
-  return plotSignalVisibility.get(plotSignalKey(trace)) ?? true;
+  return plotSignalVisibility.get(plotSignalKey(trace)) ?? trace.defaultVisible ?? true;
 }
 
 function plotKiteTraceVisible(trace: PlotTraceDefinition): boolean {
@@ -2660,7 +2862,7 @@ function syncPlotSignalLegendUi(): void {
     if (!signalKey) {
       return;
     }
-    const visible = plotSignalVisibility.get(signalKey) ?? true;
+    const visible = plotSignalVisibility.get(signalKey) ?? plotSignalDefaultVisible(signalKey);
     const state = button.querySelector<HTMLElement>(".plot-signal-state");
     button.classList.toggle("muted", !visible);
     button.setAttribute("aria-pressed", String(visible));
@@ -2707,7 +2909,7 @@ function renderPlotSignalLegend(container: HTMLElement, traces: PlotTraceDefinit
     state.textContent = "shown";
 
     button.addEventListener("click", () => {
-      const nextVisible = !(plotSignalVisibility.get(item.key) ?? true);
+      const nextVisible = !(plotSignalVisibility.get(item.key) ?? plotSignalDefaultVisible(item.key));
       plotSignalVisibility.set(item.key, nextVisible);
       applyPlotKiteVisibility();
     });
@@ -2793,6 +2995,7 @@ function buildPerKiteBreakdownGroup(
         signalKey: `${title}:${trace.name}`,
         legendName: `${legendBase} ${trace.name}`,
         kiteIndex,
+        defaultVisible: trace.defaultVisible,
         dash: trace.dash,
         width: trace.width,
         value: (frame) => trace.value(frame, kiteIndex)
@@ -2991,6 +3194,229 @@ function buildTecsPitchCommandGroup(kiteCount: number): PlotGroupDefinition {
   );
 }
 
+function buildRollReferenceBreakdownGroup(kiteCount: number): PlotGroupDefinition {
+  return buildPerKiteBreakdownGroup(
+    kiteCount,
+    "Roll Reference Breakdown (deg)",
+    "deg",
+    [
+      {
+        name: "Total",
+        width: 2.6,
+        value: (frame, kiteIndex) => frame.roll_ref_deg[kiteIndex] ?? 0
+      },
+      {
+        name: "Feedforward",
+        dash: "dash",
+        alpha: 0.7,
+        defaultVisible: false,
+        value: (frame, kiteIndex) => frame.roll_ff_deg[kiteIndex] ?? 0
+      },
+      {
+        name: "P",
+        dash: "dot",
+        alpha: 0.7,
+        defaultVisible: false,
+        value: (frame, kiteIndex) => frame.roll_p_deg[kiteIndex] ?? 0
+      },
+      {
+        name: "I",
+        dash: "dashdot",
+        alpha: 0.7,
+        defaultVisible: false,
+        value: (frame, kiteIndex) => frame.roll_i_deg[kiteIndex] ?? 0
+      }
+    ]
+  );
+}
+
+function buildAileronBreakdownGroup(kiteCount: number): PlotGroupDefinition {
+  return buildPerKiteBreakdownGroup(
+    kiteCount,
+    "Aileron Command Breakdown (deg)",
+    "deg",
+    [
+      {
+        name: "Total",
+        width: 2.6,
+        value: (frame, kiteIndex) => frame.aileron_cmd_deg[kiteIndex] ?? 0
+      },
+      {
+        name: "Trim",
+        dash: "dash",
+        alpha: 0.68,
+        defaultVisible: false,
+        value: (frame, kiteIndex) => frame.aileron_trim_deg[kiteIndex] ?? 0
+      },
+      {
+        name: "Roll P",
+        dash: "dot",
+        alpha: 0.68,
+        defaultVisible: false,
+        value: (frame, kiteIndex) => frame.aileron_roll_p_deg[kiteIndex] ?? 0
+      },
+      {
+        name: "Roll-rate D",
+        dash: "dashdot",
+        alpha: 0.68,
+        defaultVisible: false,
+        value: (frame, kiteIndex) => frame.aileron_roll_d_deg[kiteIndex] ?? 0
+      }
+    ]
+  );
+}
+
+function buildRudderBreakdownGroup(kiteCount: number): PlotGroupDefinition {
+  return buildPerKiteBreakdownGroup(
+    kiteCount,
+    "Rudder Command Breakdown (deg)",
+    "deg",
+    [
+      {
+        name: "Total",
+        width: 2.6,
+        value: (frame, kiteIndex) => frame.rudder_cmd_deg[kiteIndex] ?? 0
+      },
+      {
+        name: "Trim/offset",
+        dash: "dash",
+        alpha: 0.68,
+        defaultVisible: false,
+        value: (frame, kiteIndex) => frame.rudder_trim_deg[kiteIndex] ?? 0
+      },
+      {
+        name: "Beta P",
+        dash: "dot",
+        alpha: 0.68,
+        defaultVisible: false,
+        value: (frame, kiteIndex) => frame.rudder_beta_p_deg[kiteIndex] ?? 0
+      },
+      {
+        name: "Body-rate D",
+        dash: "dashdot",
+        alpha: 0.68,
+        defaultVisible: false,
+        value: (frame, kiteIndex) => frame.rudder_rate_d_deg[kiteIndex] ?? 0
+      },
+      {
+        name: "Turn-rate P",
+        dash: "longdash",
+        alpha: 0.68,
+        defaultVisible: false,
+        value: (frame, kiteIndex) => frame.rudder_world_z_p_deg[kiteIndex] ?? 0
+      }
+    ]
+  );
+}
+
+function buildMotorTorqueBreakdownGroup(kiteCount: number): PlotGroupDefinition {
+  return buildPerKiteBreakdownGroup(
+    kiteCount,
+    "Motor Torque Breakdown (N m)",
+    "N m",
+    [
+      {
+        name: "Total",
+        width: 2.6,
+        value: (frame, kiteIndex) => frame.motor_torque[kiteIndex] ?? 0
+      },
+      {
+        name: "Trim",
+        dash: "dash",
+        alpha: 0.68,
+        defaultVisible: false,
+        value: (frame, kiteIndex) => frame.motor_torque_trim[kiteIndex] ?? 0
+      },
+      {
+        name: "Kinetic P",
+        dash: "dot",
+        alpha: 0.68,
+        defaultVisible: false,
+        value: (frame, kiteIndex) => frame.motor_torque_p[kiteIndex] ?? 0
+      },
+      {
+        name: "Kinetic I",
+        dash: "dashdot",
+        alpha: 0.68,
+        defaultVisible: false,
+        value: (frame, kiteIndex) => frame.motor_torque_i[kiteIndex] ?? 0
+      }
+    ]
+  );
+}
+
+function buildPitchReferenceBreakdownGroup(kiteCount: number): PlotGroupDefinition {
+  return buildPerKiteBreakdownGroup(
+    kiteCount,
+    "Pitch Reference Breakdown (deg)",
+    "deg",
+    [
+      {
+        name: "Total",
+        width: 2.6,
+        value: (frame, kiteIndex) => frame.pitch_ref_deg[kiteIndex] ?? 0
+      },
+      {
+        name: "Energy P",
+        dash: "dot",
+        alpha: 0.68,
+        defaultVisible: false,
+        value: (frame, kiteIndex) => frame.pitch_ref_p_deg[kiteIndex] ?? 0
+      },
+      {
+        name: "Energy I",
+        dash: "dashdot",
+        alpha: 0.68,
+        defaultVisible: false,
+        value: (frame, kiteIndex) => frame.pitch_ref_i_deg[kiteIndex] ?? 0
+      }
+    ]
+  );
+}
+
+function buildElevatorBreakdownGroup(kiteCount: number): PlotGroupDefinition {
+  return buildPerKiteBreakdownGroup(
+    kiteCount,
+    "Elevator Command Breakdown (deg)",
+    "deg",
+    [
+      {
+        name: "Total",
+        width: 2.6,
+        value: (frame, kiteIndex) => frame.elevator_cmd_deg[kiteIndex] ?? 0
+      },
+      {
+        name: "Trim",
+        dash: "dash",
+        alpha: 0.68,
+        defaultVisible: false,
+        value: (frame, kiteIndex) => frame.elevator_trim_deg[kiteIndex] ?? 0
+      },
+      {
+        name: "Pitch P",
+        dash: "dot",
+        alpha: 0.68,
+        defaultVisible: false,
+        value: (frame, kiteIndex) => frame.elevator_pitch_p_deg[kiteIndex] ?? 0
+      },
+      {
+        name: "Pitch-rate D",
+        dash: "dashdot",
+        alpha: 0.68,
+        defaultVisible: false,
+        value: (frame, kiteIndex) => frame.elevator_pitch_d_deg[kiteIndex] ?? 0
+      },
+      {
+        name: "AOA protection",
+        dash: "longdash",
+        alpha: 0.68,
+        defaultVisible: false,
+        value: (frame, kiteIndex) => frame.elevator_alpha_protection_deg[kiteIndex] ?? 0
+      }
+    ]
+  );
+}
+
 interface LimiterLaneDefinition {
   label: string;
   color: string;
@@ -3112,8 +3538,8 @@ function runUsesTetheredPitchLimit(): boolean {
 
 function pitchReferenceLimitDeg(tuning: ControllerTuning): number {
   return runUsesTetheredPitchLimit()
-    ? tuningNumber(tuning, "tethered_pitch_ref_limit_deg", 14)
-    : tuningNumber(tuning, "free_pitch_ref_limit_deg", 14);
+    ? tuningNumber(tuning, "tethered_pitch_ref_limit_deg", 22)
+    : tuningNumber(tuning, "free_pitch_ref_limit_deg", 22);
 }
 
 function limiterLaneDefinitions(): LimiterLaneDefinition[] {
@@ -3225,7 +3651,7 @@ function limiterLaneDefinitions(): LimiterLaneDefinition[] {
       active: (frame, kiteIndex, tuning) =>
         signedLimiterActivation(
           ((frame.pitch_energy_integrator[kiteIndex] ?? 0) * 180) / Math.PI,
-          tuningNumber(tuning, "tecs_pitch_integrator_limit_deg", 14),
+          tuningNumber(tuning, "tecs_pitch_integrator_limit_deg", 22),
           "positive pitch integrator limit",
           "negative pitch integrator limit",
           "deg"
@@ -3305,7 +3731,7 @@ function limiterLaneDefinitions(): LimiterLaneDefinition[] {
         const speedTarget = frame.speed_target[kiteIndex] ?? Number.NaN;
         return (
           upperLimiterActivation(speedTarget, tuningNumber(tuning, "speed_max_mps", 35), "speed target at max clamp", "m/s") ??
-          lowerLimiterActivation(speedTarget, tuningNumber(tuning, "speed_min_mps", 18), "speed target at min clamp", "m/s")
+          lowerLimiterActivation(speedTarget, tuningNumber(tuning, "speed_min_mps", 30), "speed target at min clamp", "m/s")
         );
       }
     },
@@ -3477,6 +3903,7 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
         "Innermost lateral channel first. In direct-rabbit mode, body-frame rabbit bearing commands roll directly. In curvature modes, converted path curvature commands roll. The aileron then closes roll with body-rate damping; rudder is a sideslip/yaw-damper loop using beta and body z-rate.",
       groups: [
         buildRollCommandGroup(kiteCount),
+        buildRollReferenceBreakdownGroup(kiteCount),
         buildPerKiteGroup(
           kiteCount,
           "Body Rate p (rad/s)",
@@ -3484,6 +3911,7 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
           (frame, kiteIndex) => frame.body_omega_b[kiteIndex]?.[0] ?? 0
         ),
         buildAileronCommandGroup(kiteCount),
+        buildAileronBreakdownGroup(kiteCount),
         buildPerKiteGroup(
           kiteCount,
           "Sideslip Beta (deg)",
@@ -3498,6 +3926,7 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
           (frame, kiteIndex) => frame.body_omega_b[kiteIndex]?.[2] ?? 0
         ),
         buildRudderCommandGroup(kiteCount),
+        buildRudderBreakdownGroup(kiteCount),
         buildPerKiteGroup(
           kiteCount,
           "Curvature Y Desired vs Estimated (1/m)",
@@ -3543,6 +3972,7 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
           (frame, kiteIndex) => frame.kinetic_energy_ref_specific[kiteIndex] ?? 0
         ),
         buildMotorTorqueCommandGroup(kiteCount),
+        buildMotorTorqueBreakdownGroup(kiteCount),
         buildAltitudeCommandGroup(kiteCount),
         buildPerKiteGroup(
           kiteCount,
@@ -3552,6 +3982,7 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
           (frame, kiteIndex) => frame.potential_energy_ref_specific[kiteIndex] ?? 0
         ),
         buildTecsPitchCommandGroup(kiteCount),
+        buildPitchReferenceBreakdownGroup(kiteCount),
         buildPerKiteGroup(
           kiteCount,
           "Specific Total Energy Desired vs Actual (m²/s²)",
@@ -3625,6 +4056,7 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
           (frame, kiteIndex) => frame.body_omega_b[kiteIndex]?.[1] ?? 0
         ),
         buildElevatorCommandGroup(kiteCount),
+        buildElevatorBreakdownGroup(kiteCount),
         buildPerKiteGroup(
           kiteCount,
           "Flap Command vs Applied (deg)",
@@ -4384,20 +4816,30 @@ function randomBoxPosition(
     .addScaledVector(vertical, randomCentered(verticalSpan));
 }
 
-function randomGridVolumePosition(): THREE.Vector3 {
+function airParticleVolumeTop(frame?: ApiFrame): number {
+  const diskCenter = frame?.control_ring_center_n;
+  if (!diskCenter) {
+    return GRID_HALF_EXTENT;
+  }
+  const diskAltitude = -diskCenter[2];
+  return Math.max(GRID_HALF_EXTENT, diskAltitude + AIR_PARTICLE_DISK_CLEARANCE_M);
+}
+
+function randomGridVolumePosition(frame?: ApiFrame): THREE.Vector3 {
+  const top = airParticleVolumeTop(frame);
   return toThree([
     randomCentered(GRID_HALF_EXTENT),
     randomCentered(GRID_HALF_EXTENT),
-    -Math.random() * GRID_HALF_EXTENT
+    -Math.random() * top
   ]);
 }
 
-function isOutsideGridVolume(position: THREE.Vector3): boolean {
+function isOutsideGridVolume(position: THREE.Vector3, frame?: ApiFrame): boolean {
   return (
     Math.abs(position.x) > GRID_HALF_EXTENT ||
     Math.abs(position.y) > GRID_HALF_EXTENT ||
     position.z < 0 ||
-    position.z > GRID_HALF_EXTENT
+    position.z > airParticleVolumeTop(frame)
   );
 }
 
@@ -4485,7 +4927,7 @@ function initializeAmbientParticles(frame: ApiFrame, velocity: THREE.Vector3): v
 
   for (let index = 0; index < AIRFLOW_AMBIENT_PARTICLE_COUNT; index += 1) {
     const state = ambientParticleStates[index];
-    state.position.copy(randomGridVolumePosition());
+    state.position.copy(randomGridVolumePosition(frame));
     state.age = 0;
     state.life = (2.2 * GRID_SIZE) / Math.max(2.0, flowMagnitude) * (0.8 + 0.4 * Math.random());
     state.drift = 0.35 + 0.65 * Math.random();
@@ -4499,7 +4941,7 @@ function initializeAmbientParticles(frame: ApiFrame, velocity: THREE.Vector3): v
 function resetAmbientParticle(index: number, frame: ApiFrame, velocity: THREE.Vector3): void {
   const flowMagnitude = Math.max(2.0, velocity.length());
   const state = ambientParticleStates[index];
-  state.position.copy(randomGridVolumePosition());
+  state.position.copy(randomGridVolumePosition(frame));
   state.age = 0;
   state.life = (2.2 * GRID_SIZE) / flowMagnitude * (0.8 + 0.4 * Math.random());
   state.drift = 0.35 + 0.65 * Math.random();
@@ -4526,7 +4968,7 @@ function updateAmbientParticles(dtSimSeconds: number, frame: ApiFrame, velocity:
     state.age += dtSimSeconds;
     state.position.addScaledVector(velocity, dtSimSeconds);
 
-    if (isOutsideGridVolume(state.position)) {
+    if (isOutsideGridVolume(state.position, frame)) {
       resetAmbientParticle(index, frame, velocity);
     }
 
@@ -4553,7 +4995,7 @@ function gustParticleColor(gustMagnitude: number): THREE.Color {
 
 function resetGustParticle(index: number, frame: ApiFrame, velocity: THREE.Vector3): void {
   const state = gustParticleStates[index];
-  state.position.copy(randomGridVolumePosition());
+  state.position.copy(randomGridVolumePosition(frame));
   state.age = 0;
   state.life = (1.6 * GRID_SIZE) / Math.max(1.0, velocity.length()) * (0.75 + 0.4 * Math.random());
   state.drift = 0.35 + 0.65 * Math.random();
@@ -4569,7 +5011,7 @@ function initializeGustParticles(frame: ApiFrame, velocity: THREE.Vector3): void
   const color = gustParticleColor(gustStrength);
   for (let index = 0; index < AIRFLOW_GUST_PARTICLE_COUNT; index += 1) {
     const state = gustParticleStates[index];
-    state.position.copy(randomGridVolumePosition());
+    state.position.copy(randomGridVolumePosition(frame));
     state.age = 0;
     state.life = (2.0 * GRID_SIZE) / Math.max(1.0, velocity.length()) * (0.8 + 0.45 * Math.random());
     state.drift = 0.35 + 0.65 * Math.random();
@@ -4596,7 +5038,7 @@ function updateGustParticles(dtSimSeconds: number, frame: ApiFrame, velocity: TH
     state.age += dtSimSeconds;
     state.position.addScaledVector(velocity, dtSimSeconds);
 
-    if (isOutsideGridVolume(state.position)) {
+    if (isOutsideGridVolume(state.position, frame)) {
       resetGustParticle(index, frame, velocity);
     }
 
@@ -6127,7 +6569,11 @@ async function loadPresets(): Promise<void> {
 
 async function runSimulation(): Promise<void> {
   if (runInProgress) {
-    togglePlaybackPause();
+    if (runStreamComplete) {
+      restartSimulation();
+    } else {
+      togglePlaybackPause();
+    }
     return;
   }
   await startSimulation();
@@ -6183,6 +6629,7 @@ async function startSimulation(): Promise<void> {
   const abortController = new AbortController();
   streamAbortController = abortController;
   runInProgress = true;
+  runStreamComplete = false;
   playbackPaused = false;
   controllerTuningChangedDuringRun = false;
   setRunControls();
@@ -6350,6 +6797,11 @@ async function startSimulation(): Promise<void> {
       clearPlots("No plot samples were returned for this run.");
       appendConsole("no final plot buffer received");
     }
+    if (runSequence !== activeRunSequence) {
+      return;
+    }
+    runStreamComplete = true;
+    setRunControls();
     if (playbackPaused) {
       playbackPaused = false;
       resumePlaybackClock();
@@ -6357,13 +6809,21 @@ async function startSimulation(): Promise<void> {
       appendConsole("run completed; resuming paused playback drain");
     }
     await waitForPlaybackDrain();
+    if (runSequence !== activeRunSequence) {
+      return;
+    }
     if (pendingSummary) {
-      summaryNode.innerHTML = formatRunSummary(
+      const finalSummaryHtml = formatRunSummary(
         pendingSummary,
         framesReceived,
         framesRendered,
         currentPlaybackLabel
       );
+      summaryNode.innerHTML = finalSummaryHtml;
+      lastSummaryHtml = finalSummaryHtml;
+      latestProgressState = null;
+      activeSummaryRequest = null;
+      summaryRefreshPending = false;
     }
     appendConsole(`received ${framesReceived} frames, rendered ${framesRendered}`);
     if (!summary) {
@@ -6377,6 +6837,7 @@ async function startSimulation(): Promise<void> {
     if (error instanceof DOMException && error.name === "AbortError") {
       appendConsole("run aborted");
     } else {
+      runStreamComplete = false;
       summaryNode.innerHTML = `<div class="summary-error">Run failed: ${escapeHtml(message)}</div>`;
       setFailure(null);
       appendConsole(`error: ${message}`);
@@ -6384,6 +6845,7 @@ async function startSimulation(): Promise<void> {
   } finally {
     if (runSequence === activeRunSequence) {
       runInProgress = false;
+      runStreamComplete = false;
       playbackPaused = false;
       streamAbortController = null;
       setRunControls();
@@ -6466,6 +6928,10 @@ cameraFollowTargetSelect.addEventListener("change", () => {
 
 cameraFollowYawInput.addEventListener("change", () => {
   resetCameraFollowState();
+});
+
+trackpadNavigationInput.addEventListener("change", () => {
+  applyPointerNavigationMode();
 });
 
 controlLabelsEnabledInput.addEventListener("change", () => {
@@ -6554,6 +7020,8 @@ window.addEventListener("mermaid-ready", () => {
 });
 
 window.addEventListener("resize", () => {
+  const controlsWidth = document.querySelector<HTMLElement>(".controls")!.getBoundingClientRect().width;
+  setSidebarWidth(controlsWidth, false);
   resizeSceneRenderer();
   activePlotSections.forEach((section) => {
     Plotly.Plots?.resize(section.plot);

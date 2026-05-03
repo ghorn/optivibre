@@ -164,6 +164,15 @@
               <span>Follow Kite Yaw</span>
             </label>
             <label class="checkbox-label">
+              <input id="trackpad-navigation" type="checkbox" />
+              <span>Trackpad navigation</span>
+            </label>
+            <span class="form-hint">
+              Swaps the canvas drag mapping: primary click-drag rotates, secondary/two-finger
+              click-drag pans. Browsers expose trackpads as mouse input, so this also affects
+              physical mouse buttons while enabled.
+            </span>
+            <label class="checkbox-label">
               <input id="control-labels-enabled" type="checkbox" />
               <span>Show floating control labels</span>
             </label>
@@ -242,24 +251,30 @@
             <div class="form-hint">
               Overrides the controller gains for the next run or restart. Mode-specific fields are shown only when that mode is active.
             </div>
-            <label>
-              Phase Mode
-              <select id="phase-mode">
-                <option value="adaptive">Adaptive</option>
-                <option value="open_loop">Open Loop</option>
-              </select>
-            </label>
-            <div class="tuning-group controller-mode-group">
-              <div class="tuning-group-title">Controller Mode</div>
-              <label class="checkbox-label controller-mode-toggle">
-                <input id="max-throttle-altitude-pitch" type="checkbox" />
-                <span>Max throttle, pitch altitude</span>
-              </label>
-              <div class="form-hint">
-                Experiment mode for lateral tuning: motor torque stays at max; pitch regulates altitude.
-                When off, the total-energy controller regulates airspeed and altitude together.
+            <section class="controller-option-card">
+              <div class="tuning-section-head">
+                <div class="tuning-section-title">Mode & Phase</div>
+                <div class="tuning-section-description">Run-level controller modes that change which tuning fields are active.</div>
               </div>
-            </div>
+              <label>
+                Phase Mode
+                <select id="phase-mode">
+                  <option value="adaptive">Adaptive</option>
+                  <option value="open_loop">Open Loop</option>
+                </select>
+              </label>
+              <div class="tuning-group controller-mode-group">
+                <div class="tuning-group-title">Controller Mode</div>
+                <label class="checkbox-label controller-mode-toggle">
+                  <input id="max-throttle-altitude-pitch" type="checkbox" />
+                  <span>Max throttle, pitch altitude</span>
+                </label>
+                <div class="form-hint">
+                  Experiment mode for lateral tuning: motor torque stays at max; pitch regulates altitude.
+                  When off, the total-energy controller regulates airspeed and altitude together.
+                </div>
+              </div>
+            </section>
             <div id="controller-tuning-fields" class="tuning-fields"></div>
           </details>
         </form>
@@ -269,6 +284,14 @@
           <div id="summary"></div>
         </section>
       </section>
+      <div
+        id="sidebar-resize-handle"
+        class="sidebar-resize-handle"
+        role="separator"
+        aria-label="Resize controls panel"
+        aria-orientation="vertical"
+        tabindex="0"
+      ></div>
       <section class="panel scene">
         <div id="viewport"></div>
         <div id="control-vis-legend" class="control-vis-legend" aria-label="Control visualization legend">

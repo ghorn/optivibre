@@ -4,8 +4,8 @@ use multikite_sim::{
     InitRequest, LongitudinalMode, PhaseMode, Preset, SimulationConfig, simulate_free_flight1,
     simulate_free_flight1_with_callbacks, simulate_simple_tether, simulate_star1,
     simulate_star1_with_callbacks, simulate_star3, simulate_star4, simulate_y2, simulate_y2_high,
-    simulate_y2_high_with_callbacks, simulate_y2_low, simulate_y2_low_with_callbacks,
-    simulate_y2_with_callbacks,
+    simulate_y2_high_with_callbacks, simulate_y2_launch, simulate_y2_launch_with_callbacks,
+    simulate_y2_low, simulate_y2_low_with_callbacks, simulate_y2_with_callbacks,
 };
 use nalgebra::Vector3;
 
@@ -14,6 +14,7 @@ enum PresetArg {
     FreeFlight1,
     Star1,
     Y2Low,
+    Y2Launch,
     Y2,
     Y2High,
     Star3,
@@ -81,6 +82,7 @@ fn main() -> Result<()> {
             PresetArg::FreeFlight1 => Preset::FreeFlight1,
             PresetArg::Star1 => Preset::Star1,
             PresetArg::Y2Low => Preset::Y2Low,
+            PresetArg::Y2Launch => Preset::Y2Launch,
             PresetArg::Y2 => Preset::Y2,
             PresetArg::Y2High => Preset::Y2High,
             PresetArg::Star3 => Preset::Star3,
@@ -131,6 +133,16 @@ fn main() -> Result<()> {
             })?
             .summary
         }
+        (PresetArg::Y2Launch, Some(trace_every)) => {
+            let mut frame_index = 0usize;
+            simulate_y2_launch_with_callbacks(&init, &config, &mut |_| {}, &mut |frame| {
+                if frame_index % trace_every == 0 {
+                    print_trace_frame(frame_index, frame.time, &frame);
+                }
+                frame_index += 1;
+            })?
+            .summary
+        }
         (PresetArg::Y2High, Some(trace_every)) => {
             let mut frame_index = 0usize;
             simulate_y2_high_with_callbacks(&init, &config, &mut |_| {}, &mut |frame| {
@@ -143,12 +155,13 @@ fn main() -> Result<()> {
         }
         (_, Some(_)) => {
             anyhow::bail!(
-                "--trace-every is currently implemented for free-flight1, star1, y2-low, y2, and y2-high"
+                "--trace-every is currently implemented for free-flight1, star1, y2-low, y2-launch, y2, and y2-high"
             );
         }
         (PresetArg::FreeFlight1, None) => simulate_free_flight1(&init, &config)?.summary,
         (PresetArg::Star1, None) => simulate_star1(&init, &config)?.summary,
         (PresetArg::Y2Low, None) => simulate_y2_low(&init, &config)?.summary,
+        (PresetArg::Y2Launch, None) => simulate_y2_launch(&init, &config)?.summary,
         (PresetArg::Y2, None) => simulate_y2(&init, &config)?.summary,
         (PresetArg::Y2High, None) => simulate_y2_high(&init, &config)?.summary,
         (PresetArg::Star3, None) => simulate_star3(&init, &config)?.summary,

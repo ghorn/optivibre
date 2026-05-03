@@ -17,6 +17,7 @@ use multikite_sim::{
     simulate_star1_with_callbacks, simulate_star1_with_progress, simulate_star3_with_callbacks,
     simulate_star3_with_progress, simulate_star4_with_callbacks, simulate_star4_with_progress,
     simulate_y2_high_with_callbacks, simulate_y2_high_with_progress,
+    simulate_y2_launch_with_callbacks, simulate_y2_launch_with_progress,
     simulate_y2_low_with_callbacks, simulate_y2_low_with_progress, simulate_y2_with_callbacks,
     simulate_y2_with_progress,
 };
@@ -135,9 +136,27 @@ struct ApiFrame {
     beta_ref_deg: Vec<f64>,
     roll_ref_deg: Vec<f64>,
     roll_ff_deg: Vec<f64>,
+    roll_p_deg: Vec<f64>,
+    roll_i_deg: Vec<f64>,
     pitch_ref_deg: Vec<f64>,
+    pitch_ref_p_deg: Vec<f64>,
+    pitch_ref_i_deg: Vec<f64>,
     curvature_z_b: Vec<f64>,
     curvature_z_ref: Vec<f64>,
+    aileron_trim_deg: Vec<f64>,
+    aileron_roll_p_deg: Vec<f64>,
+    aileron_roll_d_deg: Vec<f64>,
+    rudder_trim_deg: Vec<f64>,
+    rudder_beta_p_deg: Vec<f64>,
+    rudder_rate_d_deg: Vec<f64>,
+    rudder_world_z_p_deg: Vec<f64>,
+    elevator_trim_deg: Vec<f64>,
+    elevator_pitch_p_deg: Vec<f64>,
+    elevator_pitch_d_deg: Vec<f64>,
+    elevator_alpha_protection_deg: Vec<f64>,
+    motor_torque_trim: Vec<f64>,
+    motor_torque_p: Vec<f64>,
+    motor_torque_i: Vec<f64>,
     top_tension: Vec<f64>,
     total_force_b: Vec<[f64; 3]>,
     aero_force_b: Vec<[f64; 3]>,
@@ -622,11 +641,35 @@ fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
             .iter()
             .map(|diag| diag.roll_ff.to_degrees())
             .collect(),
+        roll_p_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.roll_p.to_degrees())
+            .collect(),
+        roll_i_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.roll_i.to_degrees())
+            .collect(),
         pitch_ref_deg: frame
             .diagnostics
             .kites
             .iter()
             .map(|diag| diag.pitch_ref.to_degrees())
+            .collect(),
+        pitch_ref_p_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.pitch_ref_p.to_degrees())
+            .collect(),
+        pitch_ref_i_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.pitch_ref_i.to_degrees())
             .collect(),
         curvature_z_b: frame
             .diagnostics
@@ -639,6 +682,90 @@ fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
             .kites
             .iter()
             .map(|diag| diag.curvature_z_ref)
+            .collect(),
+        aileron_trim_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.aileron_trim.to_degrees())
+            .collect(),
+        aileron_roll_p_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.aileron_roll_p.to_degrees())
+            .collect(),
+        aileron_roll_d_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.aileron_roll_d.to_degrees())
+            .collect(),
+        rudder_trim_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.rudder_trim.to_degrees())
+            .collect(),
+        rudder_beta_p_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.rudder_beta_p.to_degrees())
+            .collect(),
+        rudder_rate_d_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.rudder_rate_d.to_degrees())
+            .collect(),
+        rudder_world_z_p_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.rudder_world_z_p.to_degrees())
+            .collect(),
+        elevator_trim_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.elevator_trim.to_degrees())
+            .collect(),
+        elevator_pitch_p_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.elevator_pitch_p.to_degrees())
+            .collect(),
+        elevator_pitch_d_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.elevator_pitch_d.to_degrees())
+            .collect(),
+        elevator_alpha_protection_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.elevator_alpha_protection.to_degrees())
+            .collect(),
+        motor_torque_trim: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.motor_torque_trim)
+            .collect(),
+        motor_torque_p: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.motor_torque_p)
+            .collect(),
+        motor_torque_i: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.motor_torque_i)
             .collect(),
         top_tension: frame
             .diagnostics
@@ -1040,6 +1167,16 @@ fn run_preset_with_progress<F: FnMut(SimulationProgress)>(
                     .collect(),
             )
         }
+        Preset::Y2Launch => {
+            let run = simulate_y2_launch_with_progress(&init, &config, progress_cb)?;
+            (
+                run.summary,
+                run.frames
+                    .into_iter()
+                    .map(|frame| to_api_frame(&frame))
+                    .collect(),
+            )
+        }
         Preset::Y2 => {
             let run = simulate_y2_with_progress(&init, &config, progress_cb)?;
             (
@@ -1284,6 +1421,12 @@ fn run_preset_streaming<P: FnMut(SimulationProgress), G: FnMut(ApiFrame)>(
                 frame_cb(to_api_frame(&frame));
             };
             simulate_y2_low_with_callbacks(&init, &config, progress_cb, &mut send_frame)?.summary
+        }
+        Preset::Y2Launch => {
+            let mut send_frame = |frame: SimulationFrame<f64, 2, COMMON_NODES, UPPER_NODES>| {
+                frame_cb(to_api_frame(&frame));
+            };
+            simulate_y2_launch_with_callbacks(&init, &config, progress_cb, &mut send_frame)?.summary
         }
         Preset::Y2 => {
             let mut send_frame = |frame: SimulationFrame<f64, 2, COMMON_NODES, UPPER_NODES>| {

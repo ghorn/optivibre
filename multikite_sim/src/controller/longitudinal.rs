@@ -37,6 +37,14 @@ pub(super) struct SaturatedPiConfig {
     pub integrator_max: f64,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SaturatedPiBreakdown {
+    pub bias: f64,
+    pub proportional: f64,
+    pub integrator: f64,
+    pub total: f64,
+}
+
 pub(super) fn default_free_flight_reference(
     _index: usize,
     time: f64,
@@ -106,12 +114,12 @@ pub(super) fn tecs_terms(
     }
 }
 
-pub(super) fn saturated_pi(
+pub(super) fn saturated_pi_breakdown(
     integrator: &mut f64,
     error: f64,
     dt: f64,
     config: SaturatedPiConfig,
-) -> f64 {
+) -> SaturatedPiBreakdown {
     // Hold the integrator when it would drive an already-saturated output farther into saturation.
     let candidate_integrator = clamp(
         *integrator + config.ki * error * dt,
@@ -124,11 +132,17 @@ pub(super) fn saturated_pi(
     if !(blocked_high || blocked_low) {
         *integrator = candidate_integrator;
     }
-    clamp(
-        config.bias + config.kp * error + *integrator,
-        config.output_min,
-        config.output_max,
-    )
+    let proportional = config.kp * error;
+    SaturatedPiBreakdown {
+        bias: config.bias,
+        proportional,
+        integrator: *integrator,
+        total: clamp(
+            config.bias + proportional + *integrator,
+            config.output_min,
+            config.output_max,
+        ),
+    }
 }
 
 pub(super) fn limit_motor_torque_for_rotor_speed(

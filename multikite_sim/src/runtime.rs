@@ -23,6 +23,7 @@ pub const FREE_UPPER_NODES: usize = 0;
 const Y2_INITIAL_TENSION_N: f64 = 0.0;
 const Y2_TARGET_PAYLOAD_ALTITUDE_M: f64 = 100.0;
 const Y2_HIGH_PAYLOAD_ALTITUDE_OFFSET_M: f64 = 50.0;
+const Y2_LAUNCH_KITE_CAD_ALTITUDE_M: f64 = 20.0;
 const Y2_LAUNCH_COMMON_LENGTH_FRACTION: f64 = 0.999;
 
 fn vec3(values: [f64; 3]) -> Vector3<f64> {
@@ -201,7 +202,10 @@ fn env_tuning_value(name: &str, default: f64) -> f64 {
 }
 
 fn is_y2_preset(preset: Preset) -> bool {
-    matches!(preset, Preset::Y2Low | Preset::Y2 | Preset::Y2High)
+    matches!(
+        preset,
+        Preset::Y2Low | Preset::Y2Launch | Preset::Y2 | Preset::Y2High
+    )
 }
 
 fn y2_target_payload_altitude_m() -> f64 {
@@ -218,6 +222,14 @@ fn y2_high_payload_altitude_m() -> f64 {
         y2_target_payload_altitude_m() + Y2_HIGH_PAYLOAD_ALTITUDE_OFFSET_M,
     )
     .max(y2_target_payload_altitude_m())
+}
+
+fn y2_launch_kite_cad_altitude_m() -> f64 {
+    env_tuning_value(
+        "MULTIKITE_Y2_LAUNCH_KITE_CAD_ALTITUDE_M",
+        Y2_LAUNCH_KITE_CAD_ALTITUDE_M,
+    )
+    .max(0.0)
 }
 
 fn y2_launch_common_length_fraction() -> f64 {
@@ -406,6 +418,17 @@ pub fn y_low_configuration<const N_COMMON: usize, const N_UPPER: usize>(
     y_payload_configuration(params, 0.0, y2_launch_common_length_fraction())
 }
 
+pub fn y_launch_configuration<const N_COMMON: usize, const N_UPPER: usize>(
+    params: &Params<f64, 2>,
+) -> State<f64, 2, N_COMMON, N_UPPER> {
+    y_payload_configuration_with_kite_cad_altitude(
+        params,
+        0.0,
+        y2_launch_common_length_fraction(),
+        y2_launch_kite_cad_altitude_m(),
+    )
+}
+
 pub fn y_configuration<const N_COMMON: usize, const N_UPPER: usize>(
     params: &Params<f64, 2>,
 ) -> State<f64, 2, N_COMMON, N_UPPER> {
@@ -422,6 +445,25 @@ fn y_payload_configuration<const N_COMMON: usize, const N_UPPER: usize>(
     params: &Params<f64, 2>,
     payload_altitude_above_ground: f64,
     common_length_fraction: f64,
+) -> State<f64, 2, N_COMMON, N_UPPER> {
+    let common_length =
+        params.common_tether.natural_length * common_length_fraction.clamp(0.0, 1.0);
+    let target_cad_altitude = -params.controller.disk_center_n[2]
+        + (payload_altitude_above_ground.max(0.0) - y2_target_payload_altitude_m())
+        + (common_length - params.common_tether.natural_length);
+    y_payload_configuration_with_kite_cad_altitude(
+        params,
+        payload_altitude_above_ground,
+        common_length_fraction,
+        target_cad_altitude,
+    )
+}
+
+fn y_payload_configuration_with_kite_cad_altitude<const N_COMMON: usize, const N_UPPER: usize>(
+    params: &Params<f64, 2>,
+    payload_altitude_above_ground: f64,
+    common_length_fraction: f64,
+    target_cad_altitude: f64,
 ) -> State<f64, 2, N_COMMON, N_UPPER> {
     let ground_altitude = params.kites[0].tether.contact.ground_altitude;
     let payload_altitude = ground_altitude + payload_altitude_above_ground.max(0.0);
@@ -445,9 +487,6 @@ fn y_payload_configuration<const N_COMMON: usize, const N_UPPER: usize>(
     let upper_vertical = (upper_length * upper_length - bridle_orbit_radius * bridle_orbit_radius)
         .max(0.0)
         .sqrt();
-    let target_cad_altitude = -params.controller.disk_center_n[2]
-        + (payload_altitude_above_ground.max(0.0) - y2_target_payload_altitude_m())
-        + (common_length - params.common_tether.natural_length);
     let mut bridle_altitude = splitter_altitude + upper_vertical;
     let turn_radius = bridle_orbit_radius.max(1.0);
     let speed_ref = params.controller.speed_ref;
@@ -1168,6 +1207,14 @@ pub fn available_presets() -> Vec<PresetInfo> {
             upper_nodes: UPPER_NODES,
         },
         PresetInfo {
+            preset: Preset::Y2Launch,
+            name: "Y2Launch",
+            description: "Two-kite Y launch case: payload starts on ground and kite CAD points start at 20 m altitude.",
+            kites: 2,
+            common_nodes: COMMON_NODES,
+            upper_nodes: UPPER_NODES,
+        },
+        PresetInfo {
             preset: Preset::Y2,
             name: "Y2",
             description: "Two-kite Y case initialized exactly on the controller disk for the configured payload target.",
@@ -1365,6 +1412,54 @@ pub fn simulate_y2_low_with_callbacks<
         init,
         config,
         y_low_configuration::<COMMON_NODES, UPPER_NODES>,
+        progress_cb,
+        frame_cb,
+    )
+}
+
+pub fn simulate_y2_launch(
+    init: &InitRequest,
+    config: &SimulationConfig,
+) -> Result<RunResult<2, COMMON_NODES, UPPER_NODES>> {
+    let mut progress_cb = |_| {};
+    let mut frame_cb = |_| {};
+    simulate::<2, COMMON_NODES, UPPER_NODES, _, _>(
+        init,
+        config,
+        y_launch_configuration::<COMMON_NODES, UPPER_NODES>,
+        &mut progress_cb,
+        &mut frame_cb,
+    )
+}
+
+pub fn simulate_y2_launch_with_progress<F: FnMut(SimulationProgress)>(
+    init: &InitRequest,
+    config: &SimulationConfig,
+    progress_cb: &mut F,
+) -> Result<RunResult<2, COMMON_NODES, UPPER_NODES>> {
+    let mut frame_cb = |_| {};
+    simulate::<2, COMMON_NODES, UPPER_NODES, _, _>(
+        init,
+        config,
+        y_launch_configuration::<COMMON_NODES, UPPER_NODES>,
+        progress_cb,
+        &mut frame_cb,
+    )
+}
+
+pub fn simulate_y2_launch_with_callbacks<
+    P: FnMut(SimulationProgress),
+    G: FnMut(SimulationFrame<f64, 2, COMMON_NODES, UPPER_NODES>),
+>(
+    init: &InitRequest,
+    config: &SimulationConfig,
+    progress_cb: &mut P,
+    frame_cb: &mut G,
+) -> Result<RunResult<2, COMMON_NODES, UPPER_NODES>> {
+    simulate::<2, COMMON_NODES, UPPER_NODES, _, _>(
+        init,
+        config,
+        y_launch_configuration::<COMMON_NODES, UPPER_NODES>,
         progress_cb,
         frame_cb,
     )
@@ -1844,6 +1939,7 @@ mod tests {
         );
 
         let launch_state = y_low_configuration::<COMMON_NODES, UPPER_NODES>(&target_params);
+        let kite_launch_state = y_launch_configuration::<COMMON_NODES, UPPER_NODES>(&target_params);
         let reference_state = y_configuration::<COMMON_NODES, UPPER_NODES>(&target_params);
         let high_state = y_high_configuration::<COMMON_NODES, UPPER_NODES>(&target_params);
 
@@ -1864,6 +1960,10 @@ mod tests {
             "launch preset payload should start on the ground"
         );
         assert!(
+            payload_altitude(&kite_launch_state).abs() < 1.0e-9,
+            "20 m launch preset payload should start on the ground"
+        );
+        assert!(
             (payload_altitude(&reference_state) - y2_target_payload_altitude_m()).abs() < 1.0e-9,
             "reference preset payload should start at the target altitude"
         );
@@ -1874,6 +1974,12 @@ mod tests {
         assert!(
             kite_altitude(&launch_state) < disk_altitude - 10.0,
             "launch kites should start below the control disk"
+        );
+        assert!(
+            (kite_altitude(&kite_launch_state) - y2_launch_kite_cad_altitude_m()).abs() < 1.0e-9,
+            "20 m launch preset kites should start at {:.3} m, got {:.9} m",
+            y2_launch_kite_cad_altitude_m(),
+            kite_altitude(&kite_launch_state)
         );
         assert!(
             (kite_altitude(&reference_state) - disk_altitude).abs() < 1.0e-9,

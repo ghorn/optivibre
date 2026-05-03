@@ -9,6 +9,14 @@ pub(super) const GUIDANCE_MODE_RABBIT: u8 = 0;
 pub(super) const GUIDANCE_MODE_CURVATURE: u8 = 1;
 pub(super) const GUIDANCE_MODE_SWITCH: u8 = 2;
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RollReferenceBreakdown {
+    pub total: f64,
+    pub feedforward: f64,
+    pub proportional: f64,
+    pub integrator: f64,
+}
+
 pub(super) fn speed_integrator_target(
     phase_error: f64,
     speed_ref: f64,
@@ -69,12 +77,12 @@ pub(super) fn direct_rabbit_bearing_y(rabbit_vector_b: &Vector3<f64>) -> f64 {
     }
 }
 
-pub(super) fn direct_rabbit_roll_reference(
+pub(super) fn direct_rabbit_roll_reference_breakdown(
     rabbit_vector_b: &Vector3<f64>,
     control_state: &mut KiteControllerState,
     dt_control: f64,
     tuning: &ControllerTuning<f64>,
-) -> f64 {
+) -> RollReferenceBreakdown {
     let bearing_y = direct_rabbit_bearing_y(rabbit_vector_b);
     let limit = tuning.roll_ref_limit_deg.to_radians().abs();
     if tuning.rabbit_bearing_roll_i.abs() > 1.0e-9 {
@@ -88,12 +96,14 @@ pub(super) fn direct_rabbit_roll_reference(
     } else {
         control_state.rabbit_bearing_to_roll_integrator = 0.0;
     }
-    clamp(
-        tuning.rabbit_bearing_roll_p * bearing_y
-            + tuning.rabbit_bearing_roll_i * control_state.rabbit_bearing_to_roll_integrator,
-        -limit,
-        limit,
-    )
+    let proportional = tuning.rabbit_bearing_roll_p * bearing_y;
+    let integrator = tuning.rabbit_bearing_roll_i * control_state.rabbit_bearing_to_roll_integrator;
+    RollReferenceBreakdown {
+        total: clamp(proportional + integrator, -limit, limit),
+        feedforward: 0.0,
+        proportional,
+        integrator,
+    }
 }
 
 pub(super) fn lateral_guidance_curvatures(

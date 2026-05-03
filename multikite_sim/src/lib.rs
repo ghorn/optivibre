@@ -18,9 +18,11 @@ pub use runtime::{
     simulate_star1_with_progress, simulate_star3, simulate_star3_with_callbacks,
     simulate_star3_with_progress, simulate_star4, simulate_star4_with_callbacks,
     simulate_star4_with_progress, simulate_y2, simulate_y2_high, simulate_y2_high_with_callbacks,
-    simulate_y2_high_with_progress, simulate_y2_low, simulate_y2_low_with_callbacks,
+    simulate_y2_high_with_progress, simulate_y2_launch, simulate_y2_launch_with_callbacks,
+    simulate_y2_launch_with_progress, simulate_y2_low, simulate_y2_low_with_callbacks,
     simulate_y2_low_with_progress, simulate_y2_with_callbacks, simulate_y2_with_progress,
-    star_configuration, y_configuration, y_high_configuration, y_low_configuration,
+    star_configuration, y_configuration, y_high_configuration, y_launch_configuration,
+    y_low_configuration,
 };
 pub use types::{
     AeroParams, BodyState, ControlSurfaces, ControllerGains, ControllerTuning, Controls,
