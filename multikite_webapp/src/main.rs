@@ -9,17 +9,13 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use multikite_sim::{
-    COMMON_NODES, ControllerTuning, DrydenConfig, FREE_COMMON_NODES, FREE_UPPER_NODES, InitRequest,
-    LongitudinalMode, PhaseMode, Preset, RunSummary, SimulationConfig, SimulationFrame,
-    SimulationProgress, UPPER_NODES, available_presets, build_aero_analysis,
+    COMMON_NODES, ControllerTuning, DEFAULT_INITIAL_ALTITUDE_OFFSET_M, DEFAULT_SWARM_KITES,
+    DrydenConfig, FREE_COMMON_NODES, FREE_UPPER_NODES, InitRequest, LongitudinalMode,
+    MAX_SWARM_KITES, MIN_SWARM_KITES, PhaseMode, Preset, RunSummary, SimulationConfig,
+    SimulationFrame, SimulationProgress, UPPER_NODES, available_presets, build_aero_analysis,
     simulate_free_flight1_with_callbacks, simulate_free_flight1_with_progress,
     simulate_simple_tether_with_callbacks, simulate_simple_tether_with_progress,
-    simulate_star1_with_callbacks, simulate_star1_with_progress, simulate_star3_with_callbacks,
-    simulate_star3_with_progress, simulate_star4_with_callbacks, simulate_star4_with_progress,
-    simulate_y2_high_with_callbacks, simulate_y2_high_with_progress,
-    simulate_y2_launch_with_callbacks, simulate_y2_launch_with_progress,
-    simulate_y2_low_with_callbacks, simulate_y2_low_with_progress, simulate_y2_with_callbacks,
-    simulate_y2_with_progress,
+    simulate_swarm_with_callbacks, simulate_swarm_with_progress,
 };
 use nalgebra::UnitQuaternion;
 use serde::{Deserialize, Serialize};
@@ -52,6 +48,8 @@ struct Cli {
 #[derive(Clone, Debug, Deserialize)]
 struct RunRequest {
     preset: Preset,
+    swarm_kites: Option<usize>,
+    initial_altitude_offset_m: Option<f64>,
     duration: f64,
     dt_control: Option<f64>,
     phase_mode: PhaseMode,
@@ -327,6 +325,14 @@ fn config_from_request(request: &RunRequest) -> (InitRequest, SimulationConfig) 
             preset: request.preset,
             payload_mass_kg: request.payload_mass_kg,
             wind_speed_mps: request.wind_speed_mps,
+            swarm_kites: request
+                .swarm_kites
+                .unwrap_or(DEFAULT_SWARM_KITES)
+                .clamp(MIN_SWARM_KITES, MAX_SWARM_KITES),
+            initial_altitude_offset_m: finite_f64_or_default(
+                request.initial_altitude_offset_m,
+                DEFAULT_INITIAL_ALTITUDE_OFFSET_M,
+            ),
         },
         SimulationConfig {
             duration: request.duration,
@@ -360,6 +366,13 @@ fn config_from_request(request: &RunRequest) -> (InitRequest, SimulationConfig) 
 fn positive_f64_or_default(value: Option<f64>, default: f64) -> f64 {
     match value {
         Some(value) if value.is_finite() && value > 0.0 => value,
+        _ => default,
+    }
+}
+
+fn finite_f64_or_default(value: Option<f64>, default: f64) -> f64 {
+    match value {
+        Some(value) if value.is_finite() => value,
         _ => default,
     }
 }
@@ -1126,6 +1139,43 @@ fn control_roll_pitch_deg(quat_n2b: nalgebra::Quaternion<f64>) -> [f64; 2] {
     [roll.to_degrees(), pitch.to_degrees()]
 }
 
+fn run_swarm_with_progress<F: FnMut(SimulationProgress)>(
+    init: &InitRequest,
+    config: &SimulationConfig,
+    progress_cb: &mut F,
+) -> Result<(RunSummary, Vec<ApiFrame>)> {
+    macro_rules! run_swarm {
+        ($nk:literal) => {{
+            let run = simulate_swarm_with_progress::<$nk, _>(init, config, progress_cb)?;
+            Ok((
+                run.summary,
+                run.frames
+                    .into_iter()
+                    .map(|frame| to_api_frame(&frame))
+                    .collect(),
+            ))
+        }};
+    }
+
+    match init.swarm_kites {
+        1 => run_swarm!(1),
+        2 => run_swarm!(2),
+        3 => run_swarm!(3),
+        4 => run_swarm!(4),
+        5 => run_swarm!(5),
+        6 => run_swarm!(6),
+        7 => run_swarm!(7),
+        8 => run_swarm!(8),
+        9 => run_swarm!(9),
+        10 => run_swarm!(10),
+        11 => run_swarm!(11),
+        12 => run_swarm!(12),
+        count => anyhow::bail!(
+            "swarm_kites must be in {MIN_SWARM_KITES}..={MAX_SWARM_KITES}, got {count}"
+        ),
+    }
+}
+
 fn run_preset(request: &RunRequest) -> Result<ApiRunResponse> {
     let mut progress_cb = |_| {};
     run_preset_with_progress(request, &mut progress_cb)
@@ -1137,78 +1187,9 @@ fn run_preset_with_progress<F: FnMut(SimulationProgress)>(
 ) -> Result<ApiRunResponse> {
     let (init, config) = config_from_request(request);
     let (summary, frames) = match request.preset {
+        Preset::Swarm => run_swarm_with_progress(&init, &config, progress_cb)?,
         Preset::FreeFlight1 => {
             let run = simulate_free_flight1_with_progress(&init, &config, progress_cb)?;
-            (
-                run.summary,
-                run.frames
-                    .into_iter()
-                    .map(|frame| to_api_frame(&frame))
-                    .collect(),
-            )
-        }
-        Preset::Star1 => {
-            let run = simulate_star1_with_progress(&init, &config, progress_cb)?;
-            (
-                run.summary,
-                run.frames
-                    .into_iter()
-                    .map(|frame| to_api_frame(&frame))
-                    .collect(),
-            )
-        }
-        Preset::Y2Low => {
-            let run = simulate_y2_low_with_progress(&init, &config, progress_cb)?;
-            (
-                run.summary,
-                run.frames
-                    .into_iter()
-                    .map(|frame| to_api_frame(&frame))
-                    .collect(),
-            )
-        }
-        Preset::Y2Launch => {
-            let run = simulate_y2_launch_with_progress(&init, &config, progress_cb)?;
-            (
-                run.summary,
-                run.frames
-                    .into_iter()
-                    .map(|frame| to_api_frame(&frame))
-                    .collect(),
-            )
-        }
-        Preset::Y2 => {
-            let run = simulate_y2_with_progress(&init, &config, progress_cb)?;
-            (
-                run.summary,
-                run.frames
-                    .into_iter()
-                    .map(|frame| to_api_frame(&frame))
-                    .collect(),
-            )
-        }
-        Preset::Y2High => {
-            let run = simulate_y2_high_with_progress(&init, &config, progress_cb)?;
-            (
-                run.summary,
-                run.frames
-                    .into_iter()
-                    .map(|frame| to_api_frame(&frame))
-                    .collect(),
-            )
-        }
-        Preset::Star3 => {
-            let run = simulate_star3_with_progress(&init, &config, progress_cb)?;
-            (
-                run.summary,
-                run.frames
-                    .into_iter()
-                    .map(|frame| to_api_frame(&frame))
-                    .collect(),
-            )
-        }
-        Preset::Star4 => {
-            let run = simulate_star4_with_progress(&init, &config, progress_cb)?;
             (
                 run.summary,
                 run.frames
@@ -1251,8 +1232,12 @@ async fn run_stream(
             &sender,
             StreamEvent::Log {
                 message: format!(
-                    "starting preset={:?} duration={:.1}s dt_control={:.4}s phase_mode={:?}",
+                    "starting preset={:?} kites={} initial_altitude_offset={:.2}m duration={:.1}s dt_control={:.4}s phase_mode={:?}",
                     request.preset,
+                    request.swarm_kites.unwrap_or(DEFAULT_SWARM_KITES),
+                    request
+                        .initial_altitude_offset_m
+                        .unwrap_or(DEFAULT_INITIAL_ALTITUDE_OFFSET_M),
                     request.duration,
                     request
                         .dt_control
@@ -1395,6 +1380,46 @@ fn stream_event_bytes(event: &StreamEvent) -> Bytes {
     Bytes::from(serde_json::to_vec(event).expect("stream event should serialize"))
 }
 
+fn run_swarm_streaming<P: FnMut(SimulationProgress), G: FnMut(ApiFrame)>(
+    init: &InitRequest,
+    config: &SimulationConfig,
+    progress_cb: &mut P,
+    frame_cb: &mut G,
+) -> Result<RunSummary> {
+    macro_rules! run_swarm {
+        ($nk:literal) => {{
+            let mut send_frame = |frame: SimulationFrame<f64, $nk, COMMON_NODES, UPPER_NODES>| {
+                frame_cb(to_api_frame(&frame));
+            };
+            Ok(simulate_swarm_with_callbacks::<$nk, _, _>(
+                init,
+                config,
+                progress_cb,
+                &mut send_frame,
+            )?
+            .summary)
+        }};
+    }
+
+    match init.swarm_kites {
+        1 => run_swarm!(1),
+        2 => run_swarm!(2),
+        3 => run_swarm!(3),
+        4 => run_swarm!(4),
+        5 => run_swarm!(5),
+        6 => run_swarm!(6),
+        7 => run_swarm!(7),
+        8 => run_swarm!(8),
+        9 => run_swarm!(9),
+        10 => run_swarm!(10),
+        11 => run_swarm!(11),
+        12 => run_swarm!(12),
+        count => anyhow::bail!(
+            "swarm_kites must be in {MIN_SWARM_KITES}..={MAX_SWARM_KITES}, got {count}"
+        ),
+    }
+}
+
 fn run_preset_streaming<P: FnMut(SimulationProgress), G: FnMut(ApiFrame)>(
     request: &RunRequest,
     progress_cb: &mut P,
@@ -1402,6 +1427,7 @@ fn run_preset_streaming<P: FnMut(SimulationProgress), G: FnMut(ApiFrame)>(
 ) -> Result<RunSummary> {
     let (init, config) = config_from_request(request);
     let summary = match request.preset {
+        Preset::Swarm => run_swarm_streaming(&init, &config, progress_cb, frame_cb)?,
         Preset::FreeFlight1 => {
             let mut send_frame =
                 |frame: SimulationFrame<f64, 1, FREE_COMMON_NODES, FREE_UPPER_NODES>| {
@@ -1409,48 +1435,6 @@ fn run_preset_streaming<P: FnMut(SimulationProgress), G: FnMut(ApiFrame)>(
                 };
             simulate_free_flight1_with_callbacks(&init, &config, progress_cb, &mut send_frame)?
                 .summary
-        }
-        Preset::Star1 => {
-            let mut send_frame = |frame: SimulationFrame<f64, 1, COMMON_NODES, UPPER_NODES>| {
-                frame_cb(to_api_frame(&frame));
-            };
-            simulate_star1_with_callbacks(&init, &config, progress_cb, &mut send_frame)?.summary
-        }
-        Preset::Y2Low => {
-            let mut send_frame = |frame: SimulationFrame<f64, 2, COMMON_NODES, UPPER_NODES>| {
-                frame_cb(to_api_frame(&frame));
-            };
-            simulate_y2_low_with_callbacks(&init, &config, progress_cb, &mut send_frame)?.summary
-        }
-        Preset::Y2Launch => {
-            let mut send_frame = |frame: SimulationFrame<f64, 2, COMMON_NODES, UPPER_NODES>| {
-                frame_cb(to_api_frame(&frame));
-            };
-            simulate_y2_launch_with_callbacks(&init, &config, progress_cb, &mut send_frame)?.summary
-        }
-        Preset::Y2 => {
-            let mut send_frame = |frame: SimulationFrame<f64, 2, COMMON_NODES, UPPER_NODES>| {
-                frame_cb(to_api_frame(&frame));
-            };
-            simulate_y2_with_callbacks(&init, &config, progress_cb, &mut send_frame)?.summary
-        }
-        Preset::Y2High => {
-            let mut send_frame = |frame: SimulationFrame<f64, 2, COMMON_NODES, UPPER_NODES>| {
-                frame_cb(to_api_frame(&frame));
-            };
-            simulate_y2_high_with_callbacks(&init, &config, progress_cb, &mut send_frame)?.summary
-        }
-        Preset::Star3 => {
-            let mut send_frame = |frame: SimulationFrame<f64, 3, COMMON_NODES, UPPER_NODES>| {
-                frame_cb(to_api_frame(&frame));
-            };
-            simulate_star3_with_callbacks(&init, &config, progress_cb, &mut send_frame)?.summary
-        }
-        Preset::Star4 => {
-            let mut send_frame = |frame: SimulationFrame<f64, 4, COMMON_NODES, UPPER_NODES>| {
-                frame_cb(to_api_frame(&frame));
-            };
-            simulate_star4_with_callbacks(&init, &config, progress_cb, &mut send_frame)?.summary
         }
         Preset::SimpleTether => {
             let mut send_frame = |frame: SimulationFrame<f64, 0, COMMON_NODES, UPPER_NODES>| {

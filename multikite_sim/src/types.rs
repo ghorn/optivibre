@@ -34,7 +34,7 @@ pub struct DrydenConfig {
 impl Default for DrydenConfig {
     fn default() -> Self {
         Self {
-            seed: 0xD15E_A5E0_u64,
+            seed: 42,
             intensity_scale: 1.0,
             length_scale: 1.0,
             altitude_intensity_enabled: true,
@@ -66,16 +66,15 @@ impl DrydenConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Preset {
+    Swarm,
     FreeFlight1,
-    Star1,
-    Y2Low,
-    Y2Launch,
-    Y2,
-    Y2High,
-    Star3,
-    Star4,
     SimpleTether,
 }
+
+pub const DEFAULT_SWARM_KITES: usize = 2;
+pub const MIN_SWARM_KITES: usize = 1;
+pub const MAX_SWARM_KITES: usize = 12;
+pub const DEFAULT_INITIAL_ALTITUDE_OFFSET_M: f64 = 0.0;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SimulationConfig {
@@ -118,14 +117,18 @@ pub struct InitRequest {
     pub preset: Preset,
     pub payload_mass_kg: Option<f64>,
     pub wind_speed_mps: Option<f64>,
+    pub swarm_kites: usize,
+    pub initial_altitude_offset_m: f64,
 }
 
 impl Default for InitRequest {
     fn default() -> Self {
         Self {
-            preset: Preset::Y2,
+            preset: Preset::Swarm,
             payload_mass_kg: None,
             wind_speed_mps: None,
+            swarm_kites: DEFAULT_SWARM_KITES,
+            initial_altitude_offset_m: DEFAULT_INITIAL_ALTITUDE_OFFSET_M,
         }
     }
 }

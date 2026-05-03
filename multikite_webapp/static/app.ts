@@ -3,16 +3,7 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
 type PhaseMode = "adaptive" | "open_loop";
 type LongitudinalMode = "total_energy" | "max_throttle_altitude_pitch";
-type Preset =
-  | "free_flight1"
-  | "star1"
-  | "y2_low"
-  | "y2_launch"
-  | "y2"
-  | "y2_high"
-  | "star3"
-  | "star4"
-  | "simple_tether";
+type Preset = "swarm" | "free_flight1" | "simple_tether";
 type TimeDilationPreset = "fast" | "10" | "5" | "2" | "1" | "0.5" | "0.1";
 type CameraFollowTarget = "manual" | "disk_center" | `kite:${number}`;
 type RuntimeTab = "console" | "plots";
@@ -319,6 +310,11 @@ type StreamEvent =
   | { kind: "summary"; summary: RunSummary };
 
 const presetSelect = document.querySelector<HTMLSelectElement>("#preset")!;
+const swarmOptionsNode = document.querySelector<HTMLElement>("#swarm-options")!;
+const swarmKitesSelect = document.querySelector<HTMLSelectElement>("#swarm-kites")!;
+const initialAltitudeOffsetInput = document.querySelector<HTMLInputElement>(
+  "#initial-altitude-offset"
+)!;
 const durationInput = document.querySelector<HTMLInputElement>("#duration")!;
 const dtControlInput = document.querySelector<HTMLInputElement>("#dt-control")!;
 const phaseModeSelect = document.querySelector<HTMLSelectElement>("#phase-mode")!;
@@ -405,7 +401,7 @@ const controllerDocsNode = document.querySelector<HTMLElement>("#controller-docs
 
 let presetInfoById = new Map<Preset, PresetInfo>();
 let simulationDefaults: SimulationDefaults | null = null;
-const DEFAULT_PRESET: Preset = "y2";
+const DEFAULT_PRESET: Preset = "swarm";
 
 type TuningMode = "total_energy" | "max_throttle_altitude_pitch";
 type GuidanceMode = "rabbit" | "curvature" | "switch";
@@ -874,12 +870,15 @@ const tetherSegmentGeometry = new THREE.CylinderGeometry(1, 1, 1, 12, 1, true);
 const tetherNodeGeometry = new THREE.SphereGeometry(1, 16, 16);
 const tetherAxis = new THREE.Vector3(0, 1, 0);
 const tetherNodeColor = new THREE.Color("#c8b894");
+const tensionColorSlack = new THREE.Color("#46515e");
 const tensionColorLow = new THREE.Color("#2f7dff");
 const tensionColorMid = new THREE.Color("#f0d98a");
 const tensionColorHigh = new THREE.Color("#ff2f2f");
 const TETHER_TENSION_FALLBACK_MIN_N = 0;
 const TETHER_TENSION_FALLBACK_MAX_N = 3000;
 const TETHER_TENSION_PEAK_PADDING_FRACTION = 0.08;
+const TETHER_SLACK_TENSION_N = 0.5;
+const TETHER_SLACK_RANGE_FRACTION = 0.005;
 const CONTROL_RING_SEGMENTS = 96;
 const COMMON_SEGMENT_RADIUS = 0.46 / 3;
 const UPPER_SEGMENT_RADIUS = 0.34 / 3;
@@ -903,6 +902,8 @@ let pendingSummary: RunSummary | null = null;
 let latestProgressState: SimulationProgress | null = null;
 let activeSummaryRequest: {
   preset: string;
+  swarm_kites: number;
+  initial_altitude_offset_m: number;
   phase_mode: PhaseMode;
   longitudinal_mode: LongitudinalMode;
   sim_noise_enabled: boolean;
@@ -1742,7 +1743,7 @@ function nonnegativeIntegerInputValue(input: HTMLInputElement, fallback: number)
 function defaultDrydenConfig(): DrydenConfig {
   return (
     simulationDefaults?.dryden ?? {
-      seed: 0xd15ea5e0,
+      seed: 42,
       intensity_scale: 1,
       length_scale: 1,
       altitude_intensity_enabled: true,
@@ -1845,6 +1846,11 @@ function tetherTensionColorRange(): { min: number; max: number } {
     default:
       return payloadTetherTensionRange();
   }
+}
+
+function tetherSlackThresholdN(): number {
+  const { max } = tetherTensionColorRange();
+  return Math.max(TETHER_SLACK_TENSION_N, max * TETHER_SLACK_RANGE_FRACTION);
 }
 
 function syncTetherTensionScaleVisibility(): void {
@@ -2276,12 +2282,29 @@ function setFailure(failure: SimulationFailure | null): void {
 }
 
 function presetKiteCount(preset: Preset): number {
+  if (preset === "swarm") {
+    return selectedSwarmKiteCount();
+  }
   const presetInfo = presetInfoById.get(preset);
   if (presetInfo) {
     return presetInfo.kites;
   }
   const option = Array.from(presetSelect.options).find((item) => item.value === preset);
   return Number(option?.dataset.kites ?? 0);
+}
+
+function selectedSwarmKiteCount(): number {
+  const value = Number(swarmKitesSelect.value);
+  return Number.isInteger(value) ? Math.min(12, Math.max(1, value)) : 2;
+}
+
+function selectedInitialAltitudeOffsetM(): number {
+  const value = Number(initialAltitudeOffsetInput.value);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function syncSwarmOptionsVisibility(): void {
+  swarmOptionsNode.hidden = presetSelect.value !== "swarm";
 }
 
 function hexToRgba(hex: string, alpha: number): string {
@@ -3533,7 +3556,7 @@ function upperLowerModes(colorUpper = "#ff7b72", colorLower = "#66b8ff"): Limite
 
 function runUsesTetheredPitchLimit(): boolean {
   const preset = activeSummaryRequest?.preset ?? presetSelect.value;
-  return preset !== "free_flight1" && preset !== "star1";
+  return preset !== "free_flight1";
 }
 
 function pitchReferenceLimitDeg(tuning: ControllerTuning): number {
@@ -4620,6 +4643,8 @@ function makeTetherMaterial(color = 0x66b8ff): THREE.MeshStandardMaterial {
     color,
     emissive: color,
     emissiveIntensity: 0.22,
+    transparent: true,
+    opacity: 1.0,
     roughness: 0.28,
     metalness: 0.08
   });
@@ -5159,6 +5184,9 @@ function recordFrameTetherTensions(frame: ApiFrame): void {
 }
 
 function tensionToColor(tensionN: number): THREE.Color {
+  if (!Number.isFinite(tensionN) || tensionN <= tetherSlackThresholdN()) {
+    return tensionColorSlack.clone();
+  }
   const { min, max } = tetherTensionColorRange();
   const span = Math.max(1.0e-9, max - min);
   const normalized = THREE.MathUtils.clamp((tensionN - min) / span, 0, 1);
@@ -5379,10 +5407,13 @@ function updateSegmentMesh(
   mesh.position.copy(startVec).add(endVec).multiplyScalar(0.5);
   mesh.quaternion.setFromUnitVectors(tetherAxis, delta.normalize());
   mesh.scale.set(mesh.userData.segmentRadius as number, length, mesh.userData.segmentRadius as number);
+  const isSlack = !Number.isFinite(tensionN) || tensionN <= tetherSlackThresholdN();
   const color = tensionToColor(tensionN);
   const material = mesh.material as THREE.MeshStandardMaterial;
   material.color.copy(color);
   material.emissive.copy(color);
+  material.emissiveIntensity = isSlack ? 0.04 : 0.22;
+  material.opacity = isSlack ? 0.46 : 1.0;
 }
 
 function updateNodeMesh(mesh: THREE.Mesh, point: [number, number, number]): void {
@@ -6563,6 +6594,7 @@ async function loadPresets(): Promise<void> {
   if (presetInfoById.has(DEFAULT_PRESET)) {
     presetSelect.value = DEFAULT_PRESET;
   }
+  syncSwarmOptionsVisibility();
   applyPresetDefaults();
   updateCameraFollowOptions(presetKiteCount(presetSelect.value as Preset));
 }
@@ -6607,6 +6639,8 @@ async function startSimulation(): Promise<void> {
   );
   const request = {
     preset: presetSelect.value,
+    swarm_kites: selectedSwarmKiteCount(),
+    initial_altitude_offset_m: selectedInitialAltitudeOffsetM(),
     duration: durationSeconds,
     dt_control: dtControl,
     phase_mode: phaseModeSelect.value as PhaseMode,
@@ -6635,6 +6669,8 @@ async function startSimulation(): Promise<void> {
   setRunControls();
   activeSummaryRequest = {
     preset: request.preset,
+    swarm_kites: request.swarm_kites,
+    initial_altitude_offset_m: request.initial_altitude_offset_m,
     phase_mode: request.phase_mode,
     longitudinal_mode: request.longitudinal_mode,
     sim_noise_enabled: request.sim_noise_enabled,
@@ -6653,6 +6689,11 @@ async function startSimulation(): Promise<void> {
     "Waiting for first solver update",
     [
       { label: "Preset", value: request.preset },
+      { label: "Kites", value: String(kiteCount) },
+      {
+        label: "Altitude Offset",
+        value: `${compactNumberInputValue(request.initial_altitude_offset_m)} m`
+      },
       { label: "Phase Mode", value: request.phase_mode },
       { label: "Longitudinal", value: longitudinalModeLabel(request.longitudinal_mode) },
       { label: "Bridle", value: request.bridle_enabled ? "Enabled" : "CG attach" },
@@ -6684,7 +6725,7 @@ async function startSimulation(): Promise<void> {
     "Run requested"
   );
   appendConsole(
-    `run requested: preset=${request.preset}, duration=${request.duration}s, dt_control=${compactNumberInputValue(request.dt_control)}s (${(1 / request.dt_control).toFixed(1)} Hz), phase=${request.phase_mode}, longitudinal=${request.longitudinal_mode}, bridle=${request.bridle_enabled ? "enabled" : "cg_attach"}, noise=${request.sim_noise_enabled ? "dryden" : "off"}, dryden_intensity=${compactNumberInputValue(request.dryden.intensity_scale)}, dryden_length=${compactNumberInputValue(request.dryden.length_scale)}, dryden_seed=${request.dryden.seed}, rk_abs_tol=${toleranceLabel(request.rk_abs_tol)}, rk_rel_tol=${toleranceLabel(request.rk_rel_tol)}, max_substeps=${request.max_substeps}, time_dilation=${playbackLabel}`
+    `run requested: preset=${request.preset}, kites=${request.swarm_kites}, altitude_offset=${compactNumberInputValue(request.initial_altitude_offset_m)}m, duration=${request.duration}s, dt_control=${compactNumberInputValue(request.dt_control)}s (${(1 / request.dt_control).toFixed(1)} Hz), phase=${request.phase_mode}, longitudinal=${request.longitudinal_mode}, bridle=${request.bridle_enabled ? "enabled" : "cg_attach"}, noise=${request.sim_noise_enabled ? "dryden" : "off"}, dryden_intensity=${compactNumberInputValue(request.dryden.intensity_scale)}, dryden_length=${compactNumberInputValue(request.dryden.length_scale)}, dryden_seed=${request.dryden.seed}, rk_abs_tol=${toleranceLabel(request.rk_abs_tol)}, rk_rel_tol=${toleranceLabel(request.rk_rel_tol)}, max_substeps=${request.max_substeps}, time_dilation=${playbackLabel}`
   );
   appendConsole(controllerTuningSnapshotLabel(request.controller_tuning));
 
@@ -6871,7 +6912,14 @@ runtimePlotsTab.addEventListener("click", () => {
 });
 
 presetSelect.addEventListener("change", () => {
+  syncSwarmOptionsVisibility();
   applyPresetDefaults();
+  updateCameraFollowOptions(presetKiteCount(presetSelect.value as Preset));
+  shouldSnapOrbitTargetToFrame = true;
+  resetCameraFollowState();
+});
+
+swarmKitesSelect.addEventListener("change", () => {
   updateCameraFollowOptions(presetKiteCount(presetSelect.value as Preset));
   shouldSnapOrbitTargetToFrame = true;
   resetCameraFollowState();

@@ -4,10 +4,11 @@ use crate::math::{roll_yaw_quaternion_n2b, rotate_nav_to_body, yaw_quaternion_n2
 use crate::model::{CompiledRhs, compute_bridle_node, compute_tether_link_tensions};
 use crate::turbulence::DrydenField;
 use crate::types::{
-    AeroParams, BodyState, BridleParams, ControlSurfaces, ControllerGains, Controls, Diagnostics,
-    Environment, InitRequest, KiteControls, KiteParams, KiteState, MassContactParams, Params,
-    Preset, PresetInfo, RotorParams, RunResult, RunSummary, SimulationConfig, SimulationFailure,
-    SimulationFrame, SimulationProgress, State, TetherNode, TetherParams,
+    AeroParams, BodyState, BridleParams, ControlSurfaces, ControllerGains, Controls,
+    DEFAULT_SWARM_KITES, Diagnostics, Environment, InitRequest, KiteControls, KiteParams,
+    KiteState, MAX_SWARM_KITES, MIN_SWARM_KITES, MassContactParams, Params, Preset, PresetInfo,
+    RotorParams, RunResult, RunSummary, SimulationConfig, SimulationFailure, SimulationFrame,
+    SimulationProgress, State, TetherNode, TetherParams,
 };
 use anyhow::{Result, bail};
 use nalgebra::Vector3;
@@ -20,11 +21,8 @@ pub const COMMON_NODES: usize = BASE_TETHER_NODES * TETHER_NODE_MULTIPLIER;
 pub const UPPER_NODES: usize = BASE_TETHER_NODES * TETHER_NODE_MULTIPLIER;
 pub const FREE_COMMON_NODES: usize = 0;
 pub const FREE_UPPER_NODES: usize = 0;
-const Y2_INITIAL_TENSION_N: f64 = 0.0;
-const Y2_TARGET_PAYLOAD_ALTITUDE_M: f64 = 100.0;
-const Y2_HIGH_PAYLOAD_ALTITUDE_OFFSET_M: f64 = 50.0;
-const Y2_LAUNCH_KITE_CAD_ALTITUDE_M: f64 = 20.0;
-const Y2_LAUNCH_COMMON_LENGTH_FRACTION: f64 = 0.999;
+const SWARM_INITIAL_TENSION_N: f64 = 0.0;
+const SWARM_TARGET_PAYLOAD_ALTITUDE_M: f64 = 100.0;
 
 fn vec3(values: [f64; 3]) -> Vector3<f64> {
     Vector3::new(values[0], values[1], values[2])
@@ -148,48 +146,51 @@ fn base_params<const NK: usize>(init: &InitRequest) -> Result<Params<f64, NK>> {
             tuning: Default::default(),
         },
     };
-    if is_y2_preset(init.preset) {
-        apply_y2_controller_overrides(&mut params);
+    if is_swarm_preset(init.preset) {
+        apply_swarm_controller_overrides(&mut params);
     }
     Ok(params)
 }
 
-fn apply_y2_controller_overrides<const NK: usize>(params: &mut Params<f64, NK>) {
+fn apply_swarm_controller_overrides<const NK: usize>(params: &mut Params<f64, NK>) {
     params.controller.rabbit_distance =
-        env_tuning_value("MULTIKITE_Y2_RABBIT_DISTANCE_M", 90.0).max(1.0);
+        env_tuning_value("MULTIKITE_SWARM_RABBIT_DISTANCE_M", 90.0).max(1.0);
     params.controller.phase_lag_to_radius =
-        env_tuning_value("MULTIKITE_Y2_PHASE_LAG_TO_RADIUS", -2.0);
+        env_tuning_value("MULTIKITE_SWARM_PHASE_LAG_TO_RADIUS", -2.0);
     params.controller.speed_ref =
-        env_tuning_value("MULTIKITE_Y2_SPEED_REF_MPS", params.controller.speed_ref)
+        env_tuning_value("MULTIKITE_SWARM_SPEED_REF_MPS", params.controller.speed_ref)
             .clamp(5.0, 80.0);
-    apply_y2_geometry_overrides(params);
+    apply_swarm_geometry_overrides(params);
 }
 
-fn apply_y2_geometry_overrides<const NK: usize>(params: &mut Params<f64, NK>) {
-    let upper_length = y2_upper_initial_length(params);
-    let disk_radius = env_tuning_value("MULTIKITE_Y2_DISK_RADIUS_M", params.controller.disk_radius)
-        .clamp(1.0, upper_length * 0.98);
+fn apply_swarm_geometry_overrides<const NK: usize>(params: &mut Params<f64, NK>) {
+    let upper_length = swarm_upper_initial_length(params);
+    let disk_radius = env_tuning_value(
+        "MULTIKITE_SWARM_DISK_RADIUS_M",
+        params.controller.disk_radius,
+    )
+    .clamp(1.0, upper_length * 0.98);
     let upper_vertical = (upper_length * upper_length - disk_radius * disk_radius)
         .max(0.0)
         .sqrt();
     let ground_altitude = params.kites[0].tether.contact.ground_altitude;
-    let target_payload_altitude = y2_target_payload_altitude_m();
+    let target_payload_altitude = swarm_target_payload_altitude_m();
     let target_cad_altitude = ground_altitude
         + target_payload_altitude
         + params.common_tether.natural_length
         + upper_vertical
-        + y2_cad_altitude_offset_from_bridle(params, disk_radius);
+        + swarm_cad_altitude_offset_from_bridle(params, disk_radius);
 
     params.controller.disk_radius = disk_radius;
     params.controller.disk_center_n[2] = -target_cad_altitude;
 }
 
-fn y2_initial_tension_n() -> f64 {
-    std::env::var("MULTIKITE_Y2_INITIAL_TENSION_N")
+fn swarm_initial_tension_n() -> f64 {
+    std::env::var("MULTIKITE_SWARM_INITIAL_TENSION_N")
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite())
-        .unwrap_or(Y2_INITIAL_TENSION_N)
+        .unwrap_or(SWARM_INITIAL_TENSION_N)
         .max(0.0)
 }
 
@@ -201,67 +202,49 @@ fn env_tuning_value(name: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
-fn is_y2_preset(preset: Preset) -> bool {
-    matches!(
-        preset,
-        Preset::Y2Low | Preset::Y2Launch | Preset::Y2 | Preset::Y2High
-    )
+fn is_swarm_preset(preset: Preset) -> bool {
+    matches!(preset, Preset::Swarm)
 }
 
-fn y2_target_payload_altitude_m() -> f64 {
+fn swarm_target_payload_altitude_m() -> f64 {
     env_tuning_value(
-        "MULTIKITE_Y2_TARGET_PAYLOAD_ALTITUDE_M",
-        Y2_TARGET_PAYLOAD_ALTITUDE_M,
+        "MULTIKITE_SWARM_TARGET_PAYLOAD_ALTITUDE_M",
+        SWARM_TARGET_PAYLOAD_ALTITUDE_M,
     )
     .max(0.0)
 }
 
-fn y2_high_payload_altitude_m() -> f64 {
-    env_tuning_value(
-        "MULTIKITE_Y2_HIGH_PAYLOAD_ALTITUDE_M",
-        y2_target_payload_altitude_m() + Y2_HIGH_PAYLOAD_ALTITUDE_OFFSET_M,
-    )
-    .max(y2_target_payload_altitude_m())
+fn swarm_coordinated_roll<const NK: usize>(params: &Params<f64, NK>, turn_radius: f64) -> f64 {
+    let speed = swarm_initial_speed_target(params);
+    (speed * speed / (params.environment.g * turn_radius.max(1.0)))
+        .atan()
+        .clamp(-35.0_f64.to_radians(), 35.0_f64.to_radians())
 }
 
-fn y2_launch_kite_cad_altitude_m() -> f64 {
-    env_tuning_value(
-        "MULTIKITE_Y2_LAUNCH_KITE_CAD_ALTITUDE_M",
-        Y2_LAUNCH_KITE_CAD_ALTITUDE_M,
-    )
-    .max(0.0)
+fn swarm_initial_speed_target<const NK: usize>(params: &Params<f64, NK>) -> f64 {
+    let min_speed = params.controller.tuning.speed_min_mps;
+    let max_speed = params.controller.tuning.speed_max_mps;
+    params
+        .controller
+        .speed_ref
+        .clamp(min_speed.min(max_speed), min_speed.max(max_speed))
 }
 
-fn y2_launch_common_length_fraction() -> f64 {
-    env_tuning_value(
-        "MULTIKITE_Y2_LAUNCH_COMMON_LENGTH_FRACTION",
-        Y2_LAUNCH_COMMON_LENGTH_FRACTION,
-    )
-    .clamp(0.0, 1.0)
-}
-
-fn y2_coordinated_roll<const NK: usize>(params: &Params<f64, NK>, turn_radius: f64) -> f64 {
-    (params.controller.speed_ref * params.controller.speed_ref
-        / (params.environment.g * turn_radius.max(1.0)))
-    .atan()
-    .clamp(-35.0_f64.to_radians(), 35.0_f64.to_radians())
-}
-
-fn y2_cad_altitude_offset_from_bridle<const NK: usize>(
+fn swarm_cad_altitude_offset_from_bridle<const NK: usize>(
     params: &Params<f64, NK>,
     turn_radius: f64,
 ) -> f64 {
     let quat_n2b = roll_yaw_quaternion_n2b(
-        y2_coordinated_roll(params, turn_radius),
+        swarm_coordinated_roll(params, turn_radius),
         std::f64::consts::FRAC_PI_2,
     );
     let pivot_n = crate::math::rotate_body_to_nav(&quat_n2b, &params.kites[0].bridle.pivot_b);
     params.kites[0].bridle.radius + pivot_n[2]
 }
 
-fn y2_upper_initial_length<const NK: usize>(params: &Params<f64, NK>) -> f64 {
+fn swarm_upper_initial_length<const NK: usize>(params: &Params<f64, NK>) -> f64 {
     params.kites[0].tether.natural_length
-        * (1.0 + y2_initial_tension_n() / params.kites[0].tether.ea)
+        * (1.0 + swarm_initial_tension_n() / params.kites[0].tether.ea)
 }
 
 fn apply_simulation_config_to_params<const NK: usize>(
@@ -275,8 +258,8 @@ fn apply_simulation_config_to_params<const NK: usize>(
             kite.bridle.radius = 0.0;
         }
     }
-    if is_y2_preset(preset) {
-        apply_y2_controller_overrides(params);
+    if is_swarm_preset(preset) {
+        apply_swarm_controller_overrides(params);
     }
     params.controller.tuning = config.controller_tuning.clone();
 }
@@ -298,6 +281,115 @@ fn interpolate_nodes<const N: usize>(
         TetherNode {
             pos_n: bottom.pos_n * (1.0 - frac) + top.pos_n * frac,
             vel_n: bottom.vel_n * (1.0 - frac) + top.vel_n * frac,
+        }
+    })
+}
+
+fn ground_launch_splitter_position<const NK: usize>(params: &Params<f64, NK>) -> Vector3<f64> {
+    let ground_z = -params.common_tether.contact.ground_altitude;
+    let offset_y = (0.35 * params.common_tether.natural_length)
+        .clamp(10.0, 0.45 * params.controller.disk_radius.max(10.0));
+    Vector3::new(0.0, -offset_y, ground_z)
+}
+
+fn ground_serpentine_nodes<const N: usize>(
+    bottom_pos_n: &Vector3<f64>,
+    top_pos_n: &Vector3<f64>,
+    ground_altitude: f64,
+    natural_length: f64,
+    lane_angle: f64,
+) -> [TetherNode<f64>; N] {
+    let ground_z = -ground_altitude;
+    let bottom = Vector3::new(bottom_pos_n[0], bottom_pos_n[1], ground_z);
+    let top = Vector3::new(top_pos_n[0], top_pos_n[1], ground_z);
+    let delta = top - bottom;
+    let horizontal = delta[0].hypot(delta[1]);
+    let dir = if horizontal > 1.0e-9 {
+        Vector3::new(delta[0] / horizontal, delta[1] / horizontal, 0.0)
+    } else {
+        Vector3::new(lane_angle.cos(), lane_angle.sin(), 0.0)
+    };
+    let perp = Vector3::new(-dir[1], dir[0], 0.0);
+    let slack = (natural_length - horizontal).max(0.0);
+    let amplitude = if slack > 1.0 {
+        (0.2 * slack).clamp(0.5, 0.16 * natural_length.max(1.0))
+    } else {
+        (0.025 * natural_length.max(1.0)).min(2.0)
+    };
+    let turns = (N as f64 / 4.0).clamp(1.0, 4.0);
+
+    from_fn(|index| {
+        let frac = (index as f64 + 0.5) / N as f64;
+        let wave = (2.0 * std::f64::consts::PI * turns * frac).sin();
+        let taper = (std::f64::consts::PI * frac).sin();
+        let pos_n = bottom + delta * frac + perp * (amplitude * wave * taper);
+        TetherNode {
+            pos_n,
+            vel_n: Vector3::zeros(),
+        }
+    })
+}
+
+fn ground_stowed_to_airborne_nodes<const N: usize>(
+    bottom_pos_n: &Vector3<f64>,
+    top_pos_n: &Vector3<f64>,
+    ground_altitude: f64,
+    natural_length: f64,
+    lane_angle: f64,
+) -> [TetherNode<f64>; N] {
+    let ground_z = -ground_altitude;
+    let bottom = Vector3::new(bottom_pos_n[0], bottom_pos_n[1], ground_z);
+    let top_ground = Vector3::new(top_pos_n[0], top_pos_n[1], ground_z);
+    let delta_ground = top_ground - bottom;
+    let horizontal = delta_ground[0].hypot(delta_ground[1]);
+    let dir = if horizontal > 1.0e-9 {
+        Vector3::new(
+            delta_ground[0] / horizontal,
+            delta_ground[1] / horizontal,
+            0.0,
+        )
+    } else {
+        Vector3::new(lane_angle.cos(), lane_angle.sin(), 0.0)
+    };
+    let perp = Vector3::new(-dir[1], dir[0], 0.0);
+    let tail_nodes = if N <= 1 {
+        N
+    } else {
+        ((N + 3) / 4).clamp(2, N - 1)
+    };
+    let ground_nodes = N.saturating_sub(tail_nodes);
+    let tail_horizontal = (0.12 * natural_length.max(1.0))
+        .clamp(4.0, 25.0)
+        .min(0.35 * horizontal.max(1.0));
+    let lift_start = if ground_nodes == 0 {
+        bottom
+    } else {
+        top_ground - dir * tail_horizontal
+    };
+    let ground_delta = lift_start - bottom;
+    let ground_distance = ground_delta[0].hypot(ground_delta[1]);
+    let slack = (0.7 * natural_length - ground_distance).max(0.0);
+    let amplitude = if slack > 1.0 {
+        (0.12 * slack).clamp(1.0, 0.08 * natural_length.max(1.0))
+    } else {
+        (0.02 * natural_length.max(1.0)).clamp(0.5, 4.0)
+    };
+    let turns = (ground_nodes as f64 / 4.0).clamp(1.0, 5.0);
+
+    from_fn(|index| {
+        let pos_n = if index < ground_nodes {
+            let frac = (index as f64 + 0.5) / ground_nodes as f64;
+            let wave = (2.0 * std::f64::consts::PI * turns * frac).sin();
+            let taper = (std::f64::consts::PI * frac).sin();
+            bottom + ground_delta * frac + perp * (amplitude * wave * taper)
+        } else {
+            let tail_index = index - ground_nodes;
+            let frac = (tail_index as f64 + 0.5) / tail_nodes.max(1) as f64;
+            lift_start * (1.0 - frac) + *top_pos_n * frac
+        };
+        TetherNode {
+            pos_n,
+            vel_n: Vector3::zeros(),
         }
     })
 }
@@ -347,111 +439,25 @@ fn kite_with_consistent_tether<const N_UPPER: usize>(
     }
 }
 
-pub fn star_configuration<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
+pub fn swarm_configuration<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
     params: &Params<f64, NK>,
+    initial_altitude_offset_m: f64,
 ) -> State<f64, NK, N_COMMON, N_UPPER> {
-    const PAYLOAD_ALTITUDE_0_M: f64 = 10.0;
-    const CONE_ANGLE_DEG: f64 = 45.0;
-    const BODY_SPEED_0_MPS: f64 = 20.0;
-
-    let payload = TetherNode {
-        pos_n: Vector3::new(0.0, 0.0, -PAYLOAD_ALTITUDE_0_M),
-        vel_n: Vector3::zeros(),
-    };
-    let splitter_altitude = PAYLOAD_ALTITUDE_0_M + params.common_tether.natural_length;
-    let splitter = TetherNode {
-        pos_n: Vector3::new(0.0, 0.0, -splitter_altitude),
-        vel_n: Vector3::zeros(),
-    };
-    let cone_angle = CONE_ANGLE_DEG.to_radians();
-    let bridle_radius = params.kites[0].tether.natural_length * cone_angle.sin();
-    let bridle_altitude =
-        splitter_altitude + params.kites[0].tether.natural_length * cone_angle.cos();
-    let kites = from_fn(|index| {
-        let theta = 2.0 * std::f64::consts::PI * index as f64 / NK as f64;
-        let bridle_pos_n = Vector3::new(
-            bridle_radius * theta.cos(),
-            bridle_radius * theta.sin(),
-            -bridle_altitude,
-        );
-        let quat_n2b = yaw_quaternion_n2b(theta + std::f64::consts::FRAC_PI_2);
-        let body_vel_b = Vector3::new(BODY_SPEED_0_MPS, 0.0, 0.0)
-            + rotate_nav_to_body(&quat_n2b, &params.environment.wind_n);
-        let bridle_to_body_b =
-            -(params.kites[index].bridle.pivot_b + params.kites[index].rigid_body.cad_offset_b);
-        let body_pos_n = bridle_pos_n
-            + Vector3::new(0.0, 0.0, -params.kites[index].bridle.radius)
-            + crate::math::rotate_body_to_nav(&quat_n2b, &bridle_to_body_b);
-        let body = BodyState {
-            pos_n: body_pos_n,
-            vel_b: body_vel_b,
-            quat_n2b,
-            omega_b: Vector3::zeros(),
-        };
-        let top = TetherNode {
-            pos_n: bridle_pos_n,
-            vel_n: Vector3::zeros(),
-        };
-        kite_with_consistent_tether(
-            body,
-            &splitter,
-            &params.kites[index],
-            &params.controller.trim,
-            top,
-            false,
-        )
-    });
-    State {
-        kites,
-        splitter: splitter.clone(),
-        common_tether: interpolate_nodes(&payload, &splitter),
-        payload,
-        total_work: 0.0,
-        total_dissipated_work: 0.0,
-        mechanical_energy_reference: 0.0,
-    }
+    let target_altitude = (swarm_target_payload_altitude_m() + initial_altitude_offset_m).max(0.0);
+    swarm_payload_configuration(params, target_altitude, 1.0)
 }
 
-pub fn y_low_configuration<const N_COMMON: usize, const N_UPPER: usize>(
-    params: &Params<f64, 2>,
-) -> State<f64, 2, N_COMMON, N_UPPER> {
-    y_payload_configuration(params, 0.0, y2_launch_common_length_fraction())
-}
-
-pub fn y_launch_configuration<const N_COMMON: usize, const N_UPPER: usize>(
-    params: &Params<f64, 2>,
-) -> State<f64, 2, N_COMMON, N_UPPER> {
-    y_payload_configuration_with_kite_cad_altitude(
-        params,
-        0.0,
-        y2_launch_common_length_fraction(),
-        y2_launch_kite_cad_altitude_m(),
-    )
-}
-
-pub fn y_configuration<const N_COMMON: usize, const N_UPPER: usize>(
-    params: &Params<f64, 2>,
-) -> State<f64, 2, N_COMMON, N_UPPER> {
-    y_payload_configuration(params, y2_target_payload_altitude_m(), 1.0)
-}
-
-pub fn y_high_configuration<const N_COMMON: usize, const N_UPPER: usize>(
-    params: &Params<f64, 2>,
-) -> State<f64, 2, N_COMMON, N_UPPER> {
-    y_payload_configuration(params, y2_high_payload_altitude_m(), 1.0)
-}
-
-fn y_payload_configuration<const N_COMMON: usize, const N_UPPER: usize>(
-    params: &Params<f64, 2>,
+fn swarm_payload_configuration<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
+    params: &Params<f64, NK>,
     payload_altitude_above_ground: f64,
     common_length_fraction: f64,
-) -> State<f64, 2, N_COMMON, N_UPPER> {
+) -> State<f64, NK, N_COMMON, N_UPPER> {
     let common_length =
         params.common_tether.natural_length * common_length_fraction.clamp(0.0, 1.0);
     let target_cad_altitude = -params.controller.disk_center_n[2]
-        + (payload_altitude_above_ground.max(0.0) - y2_target_payload_altitude_m())
+        + (payload_altitude_above_ground.max(0.0) - swarm_target_payload_altitude_m())
         + (common_length - params.common_tether.natural_length);
-    y_payload_configuration_with_kite_cad_altitude(
+    swarm_payload_configuration_with_kite_cad_altitude(
         params,
         payload_altitude_above_ground,
         common_length_fraction,
@@ -459,27 +465,41 @@ fn y_payload_configuration<const N_COMMON: usize, const N_UPPER: usize>(
     )
 }
 
-fn y_payload_configuration_with_kite_cad_altitude<const N_COMMON: usize, const N_UPPER: usize>(
-    params: &Params<f64, 2>,
+fn swarm_payload_configuration_with_kite_cad_altitude<
+    const NK: usize,
+    const N_COMMON: usize,
+    const N_UPPER: usize,
+>(
+    params: &Params<f64, NK>,
     payload_altitude_above_ground: f64,
     common_length_fraction: f64,
     target_cad_altitude: f64,
-) -> State<f64, 2, N_COMMON, N_UPPER> {
+) -> State<f64, NK, N_COMMON, N_UPPER> {
     let ground_altitude = params.kites[0].tether.contact.ground_altitude;
-    let payload_altitude = ground_altitude + payload_altitude_above_ground.max(0.0);
+    let payload_altitude_above_ground = payload_altitude_above_ground.max(0.0);
+    let ground_launch = payload_altitude_above_ground <= 1.0e-9;
+    let payload_altitude = ground_altitude + payload_altitude_above_ground;
     let payload = TetherNode {
         pos_n: Vector3::new(0.0, 0.0, -payload_altitude),
         vel_n: Vector3::zeros(),
     };
     let common_length =
         params.common_tether.natural_length * common_length_fraction.clamp(0.0, 1.0);
-    let splitter_altitude = payload_altitude + common_length;
+    let splitter_altitude = if ground_launch {
+        ground_altitude
+    } else {
+        payload_altitude + common_length
+    };
     let splitter = TetherNode {
-        pos_n: Vector3::new(0.0, 0.0, -splitter_altitude),
+        pos_n: if ground_launch {
+            ground_launch_splitter_position(params)
+        } else {
+            Vector3::new(0.0, 0.0, -splitter_altitude)
+        },
         vel_n: Vector3::zeros(),
     };
 
-    let upper_length = y2_upper_initial_length(params);
+    let upper_length = swarm_upper_initial_length(params);
     let bridle_orbit_radius = params
         .controller
         .disk_radius
@@ -489,12 +509,12 @@ fn y_payload_configuration_with_kite_cad_altitude<const N_COMMON: usize, const N
         .sqrt();
     let mut bridle_altitude = splitter_altitude + upper_vertical;
     let turn_radius = bridle_orbit_radius.max(1.0);
-    let speed_ref = params.controller.speed_ref;
-    let coordinated_roll = y2_coordinated_roll(params, turn_radius);
+    let speed_ref = swarm_initial_speed_target(params);
+    let coordinated_roll = swarm_coordinated_roll(params, turn_radius);
     let omega_world_z = speed_ref / turn_radius;
 
     for _ in 0..8 {
-        let kite: KiteState<f64, N_UPPER> = y2_kite_state_at_phase(
+        let kite: KiteState<f64, N_UPPER> = swarm_kite_state_at_phase(
             params,
             &splitter,
             0,
@@ -505,7 +525,7 @@ fn y_payload_configuration_with_kite_cad_altitude<const N_COMMON: usize, const N
             omega_world_z,
             coordinated_roll,
         );
-        let altitude_error = target_cad_altitude - y2_kite_cad_altitude(&kite, &params.kites[0]);
+        let altitude_error = target_cad_altitude - swarm_kite_cad_altitude(&kite, &params.kites[0]);
         bridle_altitude += altitude_error;
         if altitude_error.abs() < 1.0e-10 {
             break;
@@ -513,8 +533,8 @@ fn y_payload_configuration_with_kite_cad_altitude<const N_COMMON: usize, const N
     }
 
     let kites = from_fn(|index| {
-        let theta = 2.0 * std::f64::consts::PI * index as f64 / 2.0;
-        y2_kite_state_at_phase(
+        let theta = 2.0 * std::f64::consts::PI * index as f64 / NK as f64;
+        let mut kite = swarm_kite_state_at_phase(
             params,
             &splitter,
             index,
@@ -524,13 +544,34 @@ fn y_payload_configuration_with_kite_cad_altitude<const N_COMMON: usize, const N
             speed_ref,
             omega_world_z,
             coordinated_roll,
-        )
+        );
+        if ground_launch {
+            let bridle_node = compute_bridle_node(&kite, &params.kites[index]);
+            kite.tether = ground_stowed_to_airborne_nodes(
+                &splitter.pos_n,
+                &bridle_node.pos_n,
+                ground_altitude,
+                params.kites[index].tether.natural_length,
+                theta,
+            );
+        }
+        kite
     });
 
     State {
         kites,
         splitter: splitter.clone(),
-        common_tether: interpolate_nodes(&payload, &splitter),
+        common_tether: if ground_launch {
+            ground_serpentine_nodes(
+                &payload.pos_n,
+                &splitter.pos_n,
+                ground_altitude,
+                params.common_tether.natural_length,
+                -std::f64::consts::FRAC_PI_2,
+            )
+        } else {
+            interpolate_nodes(&payload, &splitter)
+        },
         payload,
         total_work: 0.0,
         total_dissipated_work: 0.0,
@@ -539,8 +580,8 @@ fn y_payload_configuration_with_kite_cad_altitude<const N_COMMON: usize, const N
 }
 
 #[allow(clippy::too_many_arguments)]
-fn y2_kite_state_at_phase<const N_UPPER: usize>(
-    params: &Params<f64, 2>,
+fn swarm_kite_state_at_phase<const NK: usize, const N_UPPER: usize>(
+    params: &Params<f64, NK>,
     splitter: &TetherNode<f64>,
     index: usize,
     theta: f64,
@@ -586,7 +627,7 @@ fn y2_kite_state_at_phase<const N_UPPER: usize>(
     )
 }
 
-fn y2_kite_cad_altitude<const N_UPPER: usize>(
+fn swarm_kite_cad_altitude<const N_UPPER: usize>(
     kite: &KiteState<f64, N_UPPER>,
     params: &KiteParams<f64>,
 ) -> f64 {
@@ -971,7 +1012,7 @@ fn simulate<
 >(
     init: &InitRequest,
     config: &SimulationConfig,
-    initializer: fn(&Params<f64, NK>) -> State<f64, NK, N_COMMON, N_UPPER>,
+    initializer: impl Fn(&Params<f64, NK>) -> State<f64, NK, N_COMMON, N_UPPER>,
     progress_cb: &mut P,
     frame_cb: &mut G,
 ) -> Result<RunResult<NK, N_COMMON, N_UPPER>> {
@@ -1199,58 +1240,10 @@ fn simulate_passive<
 pub fn available_presets() -> Vec<PresetInfo> {
     vec![
         PresetInfo {
-            preset: Preset::Y2Low,
-            name: "Y2Low",
-            description: "Two-kite Y launch case: payload starts on ground with a near-slack common tether and kites below the payload target disk.",
-            kites: 2,
-            common_nodes: COMMON_NODES,
-            upper_nodes: UPPER_NODES,
-        },
-        PresetInfo {
-            preset: Preset::Y2Launch,
-            name: "Y2Launch",
-            description: "Two-kite Y launch case: payload starts on ground and kite CAD points start at 20 m altitude.",
-            kites: 2,
-            common_nodes: COMMON_NODES,
-            upper_nodes: UPPER_NODES,
-        },
-        PresetInfo {
-            preset: Preset::Y2,
-            name: "Y2",
-            description: "Two-kite Y case initialized exactly on the controller disk for the configured payload target.",
-            kites: 2,
-            common_nodes: COMMON_NODES,
-            upper_nodes: UPPER_NODES,
-        },
-        PresetInfo {
-            preset: Preset::Y2High,
-            name: "Y2High",
-            description: "Two-kite Y descent case: payload and kites start above the payload target disk.",
-            kites: 2,
-            common_nodes: COMMON_NODES,
-            upper_nodes: UPPER_NODES,
-        },
-        PresetInfo {
-            preset: Preset::Star3,
-            name: "Star3",
-            description: "Three-kite equal-phase star preset.",
-            kites: 3,
-            common_nodes: COMMON_NODES,
-            upper_nodes: UPPER_NODES,
-        },
-        PresetInfo {
-            preset: Preset::Star4,
-            name: "Star4",
-            description: "Four-kite equal-phase star preset.",
-            kites: 4,
-            common_nodes: COMMON_NODES,
-            upper_nodes: UPPER_NODES,
-        },
-        PresetInfo {
-            preset: Preset::Star1,
-            name: "Star1",
-            description: "Single-kite star/orbit preset for controller bring-up.",
-            kites: 1,
+            preset: Preset::Swarm,
+            name: "Swarm",
+            description: "Configurable equal-phase tethered swarm. Choose 1-12 kites and an initial payload-altitude offset.",
+            kites: DEFAULT_SWARM_KITES,
             common_nodes: COMMON_NODES,
             upper_nodes: UPPER_NODES,
         },
@@ -1273,18 +1266,46 @@ pub fn available_presets() -> Vec<PresetInfo> {
     ]
 }
 
-pub fn simulate_star1(
+pub fn simulate_swarm<const NK: usize>(
     init: &InitRequest,
     config: &SimulationConfig,
-) -> Result<RunResult<1, COMMON_NODES, UPPER_NODES>> {
+) -> Result<RunResult<NK, COMMON_NODES, UPPER_NODES>> {
     let mut progress_cb = |_| {};
     let mut frame_cb = |_| {};
-    simulate::<1, COMMON_NODES, UPPER_NODES, _, _>(
+    simulate_swarm_with_callbacks::<NK, _, _>(init, config, &mut progress_cb, &mut frame_cb)
+}
+
+pub fn simulate_swarm_with_progress<const NK: usize, F: FnMut(SimulationProgress)>(
+    init: &InitRequest,
+    config: &SimulationConfig,
+    progress_cb: &mut F,
+) -> Result<RunResult<NK, COMMON_NODES, UPPER_NODES>> {
+    let mut frame_cb = |_| {};
+    simulate_swarm_with_callbacks::<NK, _, _>(init, config, progress_cb, &mut frame_cb)
+}
+
+pub fn simulate_swarm_with_callbacks<
+    const NK: usize,
+    P: FnMut(SimulationProgress),
+    G: FnMut(SimulationFrame<f64, NK, COMMON_NODES, UPPER_NODES>),
+>(
+    init: &InitRequest,
+    config: &SimulationConfig,
+    progress_cb: &mut P,
+    frame_cb: &mut G,
+) -> Result<RunResult<NK, COMMON_NODES, UPPER_NODES>> {
+    if !(MIN_SWARM_KITES..=MAX_SWARM_KITES).contains(&NK) {
+        bail!("swarm kites must be in {MIN_SWARM_KITES}..={MAX_SWARM_KITES}, got {NK}");
+    }
+    let initial_altitude_offset_m = init.initial_altitude_offset_m;
+    simulate::<NK, COMMON_NODES, UPPER_NODES, _, _>(
         init,
         config,
-        star_configuration::<1, COMMON_NODES, UPPER_NODES>,
-        &mut progress_cb,
-        &mut frame_cb,
+        |params| {
+            swarm_configuration::<NK, COMMON_NODES, UPPER_NODES>(params, initial_altitude_offset_m)
+        },
+        progress_cb,
+        frame_cb,
     )
 }
 
@@ -1331,327 +1352,6 @@ pub fn simulate_free_flight1_with_callbacks<
         init,
         config,
         free_flight_configuration::<FREE_COMMON_NODES, FREE_UPPER_NODES>,
-        progress_cb,
-        frame_cb,
-    )
-}
-
-pub fn simulate_star1_with_progress<F: FnMut(SimulationProgress)>(
-    init: &InitRequest,
-    config: &SimulationConfig,
-    progress_cb: &mut F,
-) -> Result<RunResult<1, COMMON_NODES, UPPER_NODES>> {
-    let mut frame_cb = |_| {};
-    simulate::<1, COMMON_NODES, UPPER_NODES, _, _>(
-        init,
-        config,
-        star_configuration::<1, COMMON_NODES, UPPER_NODES>,
-        progress_cb,
-        &mut frame_cb,
-    )
-}
-
-pub fn simulate_star1_with_callbacks<
-    P: FnMut(SimulationProgress),
-    G: FnMut(SimulationFrame<f64, 1, COMMON_NODES, UPPER_NODES>),
->(
-    init: &InitRequest,
-    config: &SimulationConfig,
-    progress_cb: &mut P,
-    frame_cb: &mut G,
-) -> Result<RunResult<1, COMMON_NODES, UPPER_NODES>> {
-    simulate::<1, COMMON_NODES, UPPER_NODES, _, _>(
-        init,
-        config,
-        star_configuration::<1, COMMON_NODES, UPPER_NODES>,
-        progress_cb,
-        frame_cb,
-    )
-}
-
-pub fn simulate_y2_low(
-    init: &InitRequest,
-    config: &SimulationConfig,
-) -> Result<RunResult<2, COMMON_NODES, UPPER_NODES>> {
-    let mut progress_cb = |_| {};
-    let mut frame_cb = |_| {};
-    simulate::<2, COMMON_NODES, UPPER_NODES, _, _>(
-        init,
-        config,
-        y_low_configuration::<COMMON_NODES, UPPER_NODES>,
-        &mut progress_cb,
-        &mut frame_cb,
-    )
-}
-
-pub fn simulate_y2_low_with_progress<F: FnMut(SimulationProgress)>(
-    init: &InitRequest,
-    config: &SimulationConfig,
-    progress_cb: &mut F,
-) -> Result<RunResult<2, COMMON_NODES, UPPER_NODES>> {
-    let mut frame_cb = |_| {};
-    simulate::<2, COMMON_NODES, UPPER_NODES, _, _>(
-        init,
-        config,
-        y_low_configuration::<COMMON_NODES, UPPER_NODES>,
-        progress_cb,
-        &mut frame_cb,
-    )
-}
-
-pub fn simulate_y2_low_with_callbacks<
-    P: FnMut(SimulationProgress),
-    G: FnMut(SimulationFrame<f64, 2, COMMON_NODES, UPPER_NODES>),
->(
-    init: &InitRequest,
-    config: &SimulationConfig,
-    progress_cb: &mut P,
-    frame_cb: &mut G,
-) -> Result<RunResult<2, COMMON_NODES, UPPER_NODES>> {
-    simulate::<2, COMMON_NODES, UPPER_NODES, _, _>(
-        init,
-        config,
-        y_low_configuration::<COMMON_NODES, UPPER_NODES>,
-        progress_cb,
-        frame_cb,
-    )
-}
-
-pub fn simulate_y2_launch(
-    init: &InitRequest,
-    config: &SimulationConfig,
-) -> Result<RunResult<2, COMMON_NODES, UPPER_NODES>> {
-    let mut progress_cb = |_| {};
-    let mut frame_cb = |_| {};
-    simulate::<2, COMMON_NODES, UPPER_NODES, _, _>(
-        init,
-        config,
-        y_launch_configuration::<COMMON_NODES, UPPER_NODES>,
-        &mut progress_cb,
-        &mut frame_cb,
-    )
-}
-
-pub fn simulate_y2_launch_with_progress<F: FnMut(SimulationProgress)>(
-    init: &InitRequest,
-    config: &SimulationConfig,
-    progress_cb: &mut F,
-) -> Result<RunResult<2, COMMON_NODES, UPPER_NODES>> {
-    let mut frame_cb = |_| {};
-    simulate::<2, COMMON_NODES, UPPER_NODES, _, _>(
-        init,
-        config,
-        y_launch_configuration::<COMMON_NODES, UPPER_NODES>,
-        progress_cb,
-        &mut frame_cb,
-    )
-}
-
-pub fn simulate_y2_launch_with_callbacks<
-    P: FnMut(SimulationProgress),
-    G: FnMut(SimulationFrame<f64, 2, COMMON_NODES, UPPER_NODES>),
->(
-    init: &InitRequest,
-    config: &SimulationConfig,
-    progress_cb: &mut P,
-    frame_cb: &mut G,
-) -> Result<RunResult<2, COMMON_NODES, UPPER_NODES>> {
-    simulate::<2, COMMON_NODES, UPPER_NODES, _, _>(
-        init,
-        config,
-        y_launch_configuration::<COMMON_NODES, UPPER_NODES>,
-        progress_cb,
-        frame_cb,
-    )
-}
-
-pub fn simulate_y2(
-    init: &InitRequest,
-    config: &SimulationConfig,
-) -> Result<RunResult<2, COMMON_NODES, UPPER_NODES>> {
-    let mut progress_cb = |_| {};
-    let mut frame_cb = |_| {};
-    simulate::<2, COMMON_NODES, UPPER_NODES, _, _>(
-        init,
-        config,
-        y_configuration::<COMMON_NODES, UPPER_NODES>,
-        &mut progress_cb,
-        &mut frame_cb,
-    )
-}
-
-pub fn simulate_y2_with_progress<F: FnMut(SimulationProgress)>(
-    init: &InitRequest,
-    config: &SimulationConfig,
-    progress_cb: &mut F,
-) -> Result<RunResult<2, COMMON_NODES, UPPER_NODES>> {
-    let mut frame_cb = |_| {};
-    simulate::<2, COMMON_NODES, UPPER_NODES, _, _>(
-        init,
-        config,
-        y_configuration::<COMMON_NODES, UPPER_NODES>,
-        progress_cb,
-        &mut frame_cb,
-    )
-}
-
-pub fn simulate_y2_with_callbacks<
-    P: FnMut(SimulationProgress),
-    G: FnMut(SimulationFrame<f64, 2, COMMON_NODES, UPPER_NODES>),
->(
-    init: &InitRequest,
-    config: &SimulationConfig,
-    progress_cb: &mut P,
-    frame_cb: &mut G,
-) -> Result<RunResult<2, COMMON_NODES, UPPER_NODES>> {
-    simulate::<2, COMMON_NODES, UPPER_NODES, _, _>(
-        init,
-        config,
-        y_configuration::<COMMON_NODES, UPPER_NODES>,
-        progress_cb,
-        frame_cb,
-    )
-}
-
-pub fn simulate_y2_high(
-    init: &InitRequest,
-    config: &SimulationConfig,
-) -> Result<RunResult<2, COMMON_NODES, UPPER_NODES>> {
-    let mut progress_cb = |_| {};
-    let mut frame_cb = |_| {};
-    simulate::<2, COMMON_NODES, UPPER_NODES, _, _>(
-        init,
-        config,
-        y_high_configuration::<COMMON_NODES, UPPER_NODES>,
-        &mut progress_cb,
-        &mut frame_cb,
-    )
-}
-
-pub fn simulate_y2_high_with_progress<F: FnMut(SimulationProgress)>(
-    init: &InitRequest,
-    config: &SimulationConfig,
-    progress_cb: &mut F,
-) -> Result<RunResult<2, COMMON_NODES, UPPER_NODES>> {
-    let mut frame_cb = |_| {};
-    simulate::<2, COMMON_NODES, UPPER_NODES, _, _>(
-        init,
-        config,
-        y_high_configuration::<COMMON_NODES, UPPER_NODES>,
-        progress_cb,
-        &mut frame_cb,
-    )
-}
-
-pub fn simulate_y2_high_with_callbacks<
-    P: FnMut(SimulationProgress),
-    G: FnMut(SimulationFrame<f64, 2, COMMON_NODES, UPPER_NODES>),
->(
-    init: &InitRequest,
-    config: &SimulationConfig,
-    progress_cb: &mut P,
-    frame_cb: &mut G,
-) -> Result<RunResult<2, COMMON_NODES, UPPER_NODES>> {
-    simulate::<2, COMMON_NODES, UPPER_NODES, _, _>(
-        init,
-        config,
-        y_high_configuration::<COMMON_NODES, UPPER_NODES>,
-        progress_cb,
-        frame_cb,
-    )
-}
-
-pub fn simulate_star3(
-    init: &InitRequest,
-    config: &SimulationConfig,
-) -> Result<RunResult<3, COMMON_NODES, UPPER_NODES>> {
-    let mut progress_cb = |_| {};
-    let mut frame_cb = |_| {};
-    simulate::<3, COMMON_NODES, UPPER_NODES, _, _>(
-        init,
-        config,
-        star_configuration::<3, COMMON_NODES, UPPER_NODES>,
-        &mut progress_cb,
-        &mut frame_cb,
-    )
-}
-
-pub fn simulate_star3_with_progress<F: FnMut(SimulationProgress)>(
-    init: &InitRequest,
-    config: &SimulationConfig,
-    progress_cb: &mut F,
-) -> Result<RunResult<3, COMMON_NODES, UPPER_NODES>> {
-    let mut frame_cb = |_| {};
-    simulate::<3, COMMON_NODES, UPPER_NODES, _, _>(
-        init,
-        config,
-        star_configuration::<3, COMMON_NODES, UPPER_NODES>,
-        progress_cb,
-        &mut frame_cb,
-    )
-}
-
-pub fn simulate_star3_with_callbacks<
-    P: FnMut(SimulationProgress),
-    G: FnMut(SimulationFrame<f64, 3, COMMON_NODES, UPPER_NODES>),
->(
-    init: &InitRequest,
-    config: &SimulationConfig,
-    progress_cb: &mut P,
-    frame_cb: &mut G,
-) -> Result<RunResult<3, COMMON_NODES, UPPER_NODES>> {
-    simulate::<3, COMMON_NODES, UPPER_NODES, _, _>(
-        init,
-        config,
-        star_configuration::<3, COMMON_NODES, UPPER_NODES>,
-        progress_cb,
-        frame_cb,
-    )
-}
-
-pub fn simulate_star4(
-    init: &InitRequest,
-    config: &SimulationConfig,
-) -> Result<RunResult<4, COMMON_NODES, UPPER_NODES>> {
-    let mut progress_cb = |_| {};
-    let mut frame_cb = |_| {};
-    simulate::<4, COMMON_NODES, UPPER_NODES, _, _>(
-        init,
-        config,
-        star_configuration::<4, COMMON_NODES, UPPER_NODES>,
-        &mut progress_cb,
-        &mut frame_cb,
-    )
-}
-
-pub fn simulate_star4_with_progress<F: FnMut(SimulationProgress)>(
-    init: &InitRequest,
-    config: &SimulationConfig,
-    progress_cb: &mut F,
-) -> Result<RunResult<4, COMMON_NODES, UPPER_NODES>> {
-    let mut frame_cb = |_| {};
-    simulate::<4, COMMON_NODES, UPPER_NODES, _, _>(
-        init,
-        config,
-        star_configuration::<4, COMMON_NODES, UPPER_NODES>,
-        progress_cb,
-        &mut frame_cb,
-    )
-}
-
-pub fn simulate_star4_with_callbacks<
-    P: FnMut(SimulationProgress),
-    G: FnMut(SimulationFrame<f64, 4, COMMON_NODES, UPPER_NODES>),
->(
-    init: &InitRequest,
-    config: &SimulationConfig,
-    progress_cb: &mut P,
-    frame_cb: &mut G,
-) -> Result<RunResult<4, COMMON_NODES, UPPER_NODES>> {
-    simulate::<4, COMMON_NODES, UPPER_NODES, _, _>(
-        init,
-        config,
-        star_configuration::<4, COMMON_NODES, UPPER_NODES>,
         progress_cb,
         frame_cb,
     )
@@ -1788,6 +1488,7 @@ mod tests {
             preset: Preset::FreeFlight1,
             payload_mass_kg: None,
             wind_speed_mps: Some(0.0),
+            ..InitRequest::default()
         };
         let params = base_params::<1>(&init).expect("free-flight params");
         let mut state = free_flight_configuration::<FREE_COMMON_NODES, FREE_UPPER_NODES>(&params);
@@ -1830,24 +1531,27 @@ mod tests {
         let (_, negative_diag) = evaluate_rhs(&negative_state, &negative_controls, &params);
         assert!(
             positive_diag.kites[0].rudder_moment_b[2] < negative_diag.kites[0].rudder_moment_b[2],
-            "positive rudder should create the negative body-yaw moment needed by the Y2 beta/yaw loop"
+            "positive rudder should create the negative body-yaw moment needed by the swarm beta/yaw loop"
         );
     }
 
     #[test]
-    fn y2_initializes_on_controller_speed_and_altitude_refs() {
+    fn swarm_initializes_on_controller_speed_and_altitude_refs() {
         let init = InitRequest {
-            preset: Preset::Y2,
+            preset: Preset::Swarm,
             payload_mass_kg: None,
             wind_speed_mps: None,
+            swarm_kites: 2,
+            initial_altitude_offset_m: 0.0,
         };
-        let params = base_params::<2>(&init).expect("Y2 params");
-        let state = y_configuration::<COMMON_NODES, UPPER_NODES>(&params);
+        let params = base_params::<2>(&init).expect("swarm params");
+        let state = swarm_configuration::<2, COMMON_NODES, UPPER_NODES>(&params, 0.0);
         let controls = initial_controls(&params);
-        let rhs = CompiledRhs::<2, COMMON_NODES, UPPER_NODES>::shared().expect("compiled Y2 rhs");
+        let rhs =
+            CompiledRhs::<2, COMMON_NODES, UPPER_NODES>::shared().expect("compiled swarm rhs");
         let (_, mut diagnostics) = rhs
             .eval(&state, &controls, &params)
-            .expect("initial Y2 diagnostics");
+            .expect("initial swarm diagnostics");
         let mut controller_state = ControllerState::<2>::new(&diagnostics);
         let (_, trace) = controller_step(
             &mut controller_state,
@@ -1863,14 +1567,14 @@ mod tests {
 
         let expected_altitude =
             -params.controller.disk_center_n[2] - params.kites[0].tether.contact.ground_altitude;
-        let expected_speed = params.controller.speed_ref;
+        let expected_speed = swarm_initial_speed_target(&params);
         let payload_altitude =
             -state.payload.pos_n[2] - params.kites[0].tether.contact.ground_altitude;
 
         assert!(
-            (payload_altitude - y2_target_payload_altitude_m()).abs() < 1.0e-9,
-            "Y2 payload altitude should be {:.3} m, got {payload_altitude:.9} m",
-            y2_target_payload_altitude_m(),
+            (payload_altitude - swarm_target_payload_altitude_m()).abs() < 1.0e-9,
+            "swarm payload altitude should be {:.3} m, got {payload_altitude:.9} m",
+            swarm_target_payload_altitude_m(),
         );
 
         for (index, kite_diag) in diagnostics.kites.iter().enumerate() {
@@ -1898,7 +1602,7 @@ mod tests {
             );
             assert!(
                 reference_speed_error < 1.0e-9,
-                "kite {index} initial speed reference is not controller speed_ref: ref={:.9}, expected={expected_speed:.9}, error={reference_speed_error:e}",
+                "kite {index} initial speed reference is not the effective swarm speed target: ref={:.9}, expected={expected_speed:.9}, error={reference_speed_error:e}",
                 kite_diag.speed_target,
             );
             assert!(
@@ -1915,33 +1619,38 @@ mod tests {
     }
 
     #[test]
-    fn y2_initial_altitude_variants_position_payload_and_kites_relative_to_disk() {
+    fn swarm_initial_altitude_offsets_position_payload_and_kites_relative_to_disk() {
         let target_init = InitRequest {
-            preset: Preset::Y2,
+            preset: Preset::Swarm,
             payload_mass_kg: None,
             wind_speed_mps: None,
+            swarm_kites: 2,
+            initial_altitude_offset_m: 0.0,
         };
-        let target_params = base_params::<2>(&target_init).expect("Y2 params");
+        let target_params = base_params::<2>(&target_init).expect("swarm params");
         let disk_altitude = -target_params.controller.disk_center_n[2]
             - target_params.kites[0].tether.contact.ground_altitude;
-        let upper_length = y2_upper_initial_length(&target_params);
+        let upper_length = swarm_upper_initial_length(&target_params);
         let disk_radius = target_params.controller.disk_radius;
         let upper_vertical = (upper_length * upper_length - disk_radius * disk_radius)
             .max(0.0)
             .sqrt();
-        let expected_disk_altitude = y2_target_payload_altitude_m()
+        let expected_disk_altitude = swarm_target_payload_altitude_m()
             + target_params.common_tether.natural_length
             + upper_vertical
-            + y2_cad_altitude_offset_from_bridle(&target_params, disk_radius);
+            + swarm_cad_altitude_offset_from_bridle(&target_params, disk_radius);
         assert!(
             (disk_altitude - expected_disk_altitude).abs() < 1.0e-9,
             "control disk altitude should be derived from tether geometry, got {disk_altitude:.3} m expected {expected_disk_altitude:.3} m",
         );
 
-        let launch_state = y_low_configuration::<COMMON_NODES, UPPER_NODES>(&target_params);
-        let kite_launch_state = y_launch_configuration::<COMMON_NODES, UPPER_NODES>(&target_params);
-        let reference_state = y_configuration::<COMMON_NODES, UPPER_NODES>(&target_params);
-        let high_state = y_high_configuration::<COMMON_NODES, UPPER_NODES>(&target_params);
+        let low_state = swarm_configuration::<2, COMMON_NODES, UPPER_NODES>(
+            &target_params,
+            -swarm_target_payload_altitude_m(),
+        );
+        let reference_state =
+            swarm_configuration::<2, COMMON_NODES, UPPER_NODES>(&target_params, 0.0);
+        let high_state = swarm_configuration::<2, COMMON_NODES, UPPER_NODES>(&target_params, 50.0);
 
         let payload_altitude = |state: &State<f64, 2, COMMON_NODES, UPPER_NODES>| {
             -state.payload.pos_n[2] - target_params.kites[0].tether.contact.ground_altitude
@@ -1956,55 +1665,105 @@ mod tests {
         };
 
         assert!(
-            payload_altitude(&launch_state).abs() < 1.0e-9,
-            "launch preset payload should start on the ground"
+            payload_altitude(&low_state).abs() < 1.0e-9,
+            "low-offset swarm payload should start on the ground"
         );
         assert!(
-            payload_altitude(&kite_launch_state).abs() < 1.0e-9,
-            "20 m launch preset payload should start on the ground"
+            (payload_altitude(&reference_state) - swarm_target_payload_altitude_m()).abs() < 1.0e-9,
+            "zero-offset swarm payload should start at the target altitude"
         );
         assert!(
-            (payload_altitude(&reference_state) - y2_target_payload_altitude_m()).abs() < 1.0e-9,
-            "reference preset payload should start at the target altitude"
+            payload_altitude(&high_state) > swarm_target_payload_altitude_m(),
+            "positive-offset swarm payload should start above the target altitude"
         );
         assert!(
-            payload_altitude(&high_state) > y2_target_payload_altitude_m(),
-            "high preset payload should start above the target altitude"
+            kite_altitude(&low_state) < disk_altitude - 10.0,
+            "negative-offset swarm kites should start below the control disk"
         );
-        assert!(
-            kite_altitude(&launch_state) < disk_altitude - 10.0,
-            "launch kites should start below the control disk"
-        );
-        assert!(
-            (kite_altitude(&kite_launch_state) - y2_launch_kite_cad_altitude_m()).abs() < 1.0e-9,
-            "20 m launch preset kites should start at {:.3} m, got {:.9} m",
-            y2_launch_kite_cad_altitude_m(),
-            kite_altitude(&kite_launch_state)
-        );
+        let ground_z = -target_params.common_tether.contact.ground_altitude;
+        for (index, node) in low_state.common_tether.iter().enumerate() {
+            assert!(
+                (node.pos_n[2] - ground_z).abs() < 1.0e-12,
+                "ground-launch common tether node {index} should be on the ground"
+            );
+        }
+        for link_index in 0..=COMMON_NODES {
+            let lower = if link_index == 0 {
+                low_state.payload.pos_n
+            } else {
+                low_state.common_tether[link_index - 1].pos_n
+            };
+            let upper = if link_index == COMMON_NODES {
+                low_state.splitter.pos_n
+            } else {
+                low_state.common_tether[link_index].pos_n
+            };
+            assert!(
+                (upper - lower).norm() > 1.0e-6,
+                "ground-launch common tether link {link_index} should be non-degenerate"
+            );
+        }
+        for (kite_index, kite) in low_state.kites.iter().enumerate() {
+            let grounded_nodes = kite
+                .tether
+                .iter()
+                .filter(|node| (node.pos_n[2] - ground_z).abs() < 1.0e-12)
+                .count();
+            assert!(
+                grounded_nodes >= UPPER_NODES / 2,
+                "ground-launch kite {kite_index} should stow most upper tether nodes on the ground"
+            );
+            assert!(
+                kite.tether
+                    .iter()
+                    .any(|node| (node.pos_n[2] - ground_z).abs() > 1.0),
+                "ground-launch kite {kite_index} should lift the last upper tether nodes toward the bridle"
+            );
+            let bridle_node = compute_bridle_node(kite, &target_params.kites[kite_index]);
+            for link_index in 0..=UPPER_NODES {
+                let lower = if link_index == 0 {
+                    low_state.splitter.pos_n
+                } else {
+                    kite.tether[link_index - 1].pos_n
+                };
+                let upper = if link_index == UPPER_NODES {
+                    bridle_node.pos_n
+                } else {
+                    kite.tether[link_index].pos_n
+                };
+                assert!(
+                    (upper - lower).norm() > 1.0e-6,
+                    "ground-launch kite {kite_index} upper tether link {link_index} should be non-degenerate"
+                );
+            }
+        }
         assert!(
             (kite_altitude(&reference_state) - disk_altitude).abs() < 1.0e-9,
-            "reference kites should start on the control disk"
+            "zero-offset swarm kites should start on the control disk"
         );
         assert!(
             kite_altitude(&high_state) > disk_altitude + 10.0,
-            "high kites should start above the control disk"
+            "positive-offset swarm kites should start above the control disk"
         );
     }
 
     #[test]
-    fn y2_star_initialization_is_wind_aware() {
+    fn swarm_initialization_is_wind_aware() {
         let init = InitRequest {
-            preset: Preset::Y2,
+            preset: Preset::Swarm,
             payload_mass_kg: None,
             wind_speed_mps: Some(5.0),
+            swarm_kites: 2,
+            initial_altitude_offset_m: 0.0,
         };
-        let params = base_params::<2>(&init).expect("Y2 params");
-        let state = y_configuration::<COMMON_NODES, UPPER_NODES>(&params);
+        let params = base_params::<2>(&init).expect("swarm params");
+        let state = swarm_configuration::<2, COMMON_NODES, UPPER_NODES>(&params, 0.0);
         let controls = initial_controls(&params);
-        let rhs = CompiledRhs::<2, COMMON_NODES, UPPER_NODES>::shared().expect("compiled Y2 rhs");
+        let rhs =
+            CompiledRhs::<2, COMMON_NODES, UPPER_NODES>::shared().expect("compiled swarm rhs");
         let (_, diagnostics) = rhs
             .eval(&state, &controls, &params)
-            .expect("initial Y2 diagnostics");
+            .expect("initial swarm diagnostics");
 
         for (index, kite_diag) in diagnostics.kites.iter().enumerate() {
             assert!(
@@ -2021,19 +1780,22 @@ mod tests {
     }
 
     #[test]
-    fn max_throttle_altitude_pitch_mode_commands_motor_limit_for_y2() {
+    fn max_throttle_altitude_pitch_mode_commands_motor_limit_for_swarm() {
         let init = InitRequest {
-            preset: Preset::Y2,
+            preset: Preset::Swarm,
             payload_mass_kg: None,
             wind_speed_mps: None,
+            swarm_kites: 2,
+            initial_altitude_offset_m: 0.0,
         };
-        let params = base_params::<2>(&init).expect("Y2 params");
-        let state = y_configuration::<COMMON_NODES, UPPER_NODES>(&params);
+        let params = base_params::<2>(&init).expect("swarm params");
+        let state = swarm_configuration::<2, COMMON_NODES, UPPER_NODES>(&params, 0.0);
         let controls = initial_controls(&params);
-        let rhs = CompiledRhs::<2, COMMON_NODES, UPPER_NODES>::shared().expect("compiled Y2 rhs");
+        let rhs =
+            CompiledRhs::<2, COMMON_NODES, UPPER_NODES>::shared().expect("compiled swarm rhs");
         let (_, diagnostics) = rhs
             .eval(&state, &controls, &params)
-            .expect("initial Y2 diagnostics");
+            .expect("initial swarm diagnostics");
         let mut controller_state = ControllerState::<2>::new(&diagnostics);
 
         let (next_controls, trace) = controller_step(
@@ -2066,6 +1828,7 @@ mod tests {
             preset: Preset::FreeFlight1,
             payload_mass_kg: None,
             wind_speed_mps: None,
+            ..InitRequest::default()
         };
         let params = base_params::<1>(&init).expect("free-flight params");
         let config = SimulationConfig {
@@ -2203,6 +1966,7 @@ mod tests {
             preset: Preset::FreeFlight1,
             payload_mass_kg: None,
             wind_speed_mps: None,
+            ..InitRequest::default()
         };
         let params = base_params::<1>(&init).expect("free-flight params");
         let config = SimulationConfig {

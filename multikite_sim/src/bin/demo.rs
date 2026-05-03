@@ -1,24 +1,17 @@
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use multikite_sim::{
-    InitRequest, LongitudinalMode, PhaseMode, Preset, SimulationConfig, simulate_free_flight1,
-    simulate_free_flight1_with_callbacks, simulate_simple_tether, simulate_star1,
-    simulate_star1_with_callbacks, simulate_star3, simulate_star4, simulate_y2, simulate_y2_high,
-    simulate_y2_high_with_callbacks, simulate_y2_launch, simulate_y2_launch_with_callbacks,
-    simulate_y2_low, simulate_y2_low_with_callbacks, simulate_y2_with_callbacks,
+    DEFAULT_INITIAL_ALTITUDE_OFFSET_M, DEFAULT_SWARM_KITES, InitRequest, LongitudinalMode,
+    MAX_SWARM_KITES, MIN_SWARM_KITES, PhaseMode, Preset, SimulationConfig, simulate_free_flight1,
+    simulate_free_flight1_with_callbacks, simulate_simple_tether, simulate_swarm,
+    simulate_swarm_with_callbacks,
 };
 use nalgebra::Vector3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum PresetArg {
+    Swarm,
     FreeFlight1,
-    Star1,
-    Y2Low,
-    Y2Launch,
-    Y2,
-    Y2High,
-    Star3,
-    Star4,
     SimpleTether,
 }
 
@@ -36,8 +29,12 @@ enum LongitudinalModeArg {
 
 #[derive(Debug, Parser)]
 struct Cli {
-    #[arg(long, default_value = "y2")]
+    #[arg(long, default_value = "swarm")]
     preset: PresetArg,
+    #[arg(long, default_value_t = DEFAULT_SWARM_KITES)]
+    swarm_kites: usize,
+    #[arg(long, default_value_t = DEFAULT_INITIAL_ALTITUDE_OFFSET_M)]
+    initial_altitude_offset_m: f64,
     #[arg(long, default_value_t = 10.0)]
     duration: f64,
     #[arg(long, default_value = "adaptive")]
@@ -79,20 +76,17 @@ fn main() -> Result<()> {
     };
     let init = InitRequest {
         preset: match cli.preset {
+            PresetArg::Swarm => Preset::Swarm,
             PresetArg::FreeFlight1 => Preset::FreeFlight1,
-            PresetArg::Star1 => Preset::Star1,
-            PresetArg::Y2Low => Preset::Y2Low,
-            PresetArg::Y2Launch => Preset::Y2Launch,
-            PresetArg::Y2 => Preset::Y2,
-            PresetArg::Y2High => Preset::Y2High,
-            PresetArg::Star3 => Preset::Star3,
-            PresetArg::Star4 => Preset::Star4,
             PresetArg::SimpleTether => Preset::SimpleTether,
         },
         payload_mass_kg: cli.payload_mass_kg,
         wind_speed_mps: cli.wind_speed_mps,
+        swarm_kites: cli.swarm_kites.clamp(MIN_SWARM_KITES, MAX_SWARM_KITES),
+        initial_altitude_offset_m: cli.initial_altitude_offset_m,
     };
     let summary = match (cli.preset, cli.trace_every) {
+        (PresetArg::Swarm, Some(trace_every)) => simulate_swarm_trace(&init, &config, trace_every)?,
         (PresetArg::FreeFlight1, Some(trace_every)) => {
             let mut frame_index = 0usize;
             simulate_free_flight1_with_callbacks(&init, &config, &mut |_| {}, &mut |frame| {
@@ -103,73 +97,84 @@ fn main() -> Result<()> {
             })?
             .summary
         }
-        (PresetArg::Star1, Some(trace_every)) => {
-            let mut frame_index = 0usize;
-            simulate_star1_with_callbacks(&init, &config, &mut |_| {}, &mut |frame| {
-                if frame_index % trace_every == 0 {
-                    print_trace_frame(frame_index, frame.time, &frame);
-                }
-                frame_index += 1;
-            })?
-            .summary
-        }
-        (PresetArg::Y2Low, Some(trace_every)) => {
-            let mut frame_index = 0usize;
-            simulate_y2_low_with_callbacks(&init, &config, &mut |_| {}, &mut |frame| {
-                if frame_index % trace_every == 0 {
-                    print_trace_frame(frame_index, frame.time, &frame);
-                }
-                frame_index += 1;
-            })?
-            .summary
-        }
-        (PresetArg::Y2, Some(trace_every)) => {
-            let mut frame_index = 0usize;
-            simulate_y2_with_callbacks(&init, &config, &mut |_| {}, &mut |frame| {
-                if frame_index % trace_every == 0 {
-                    print_trace_frame(frame_index, frame.time, &frame);
-                }
-                frame_index += 1;
-            })?
-            .summary
-        }
-        (PresetArg::Y2Launch, Some(trace_every)) => {
-            let mut frame_index = 0usize;
-            simulate_y2_launch_with_callbacks(&init, &config, &mut |_| {}, &mut |frame| {
-                if frame_index % trace_every == 0 {
-                    print_trace_frame(frame_index, frame.time, &frame);
-                }
-                frame_index += 1;
-            })?
-            .summary
-        }
-        (PresetArg::Y2High, Some(trace_every)) => {
-            let mut frame_index = 0usize;
-            simulate_y2_high_with_callbacks(&init, &config, &mut |_| {}, &mut |frame| {
-                if frame_index % trace_every == 0 {
-                    print_trace_frame(frame_index, frame.time, &frame);
-                }
-                frame_index += 1;
-            })?
-            .summary
-        }
         (_, Some(_)) => {
-            anyhow::bail!(
-                "--trace-every is currently implemented for free-flight1, star1, y2-low, y2-launch, y2, and y2-high"
-            );
+            anyhow::bail!("--trace-every is implemented for swarm and free-flight1");
         }
+        (PresetArg::Swarm, None) => simulate_swarm_summary(&init, &config)?,
         (PresetArg::FreeFlight1, None) => simulate_free_flight1(&init, &config)?.summary,
-        (PresetArg::Star1, None) => simulate_star1(&init, &config)?.summary,
-        (PresetArg::Y2Low, None) => simulate_y2_low(&init, &config)?.summary,
-        (PresetArg::Y2Launch, None) => simulate_y2_launch(&init, &config)?.summary,
-        (PresetArg::Y2, None) => simulate_y2(&init, &config)?.summary,
-        (PresetArg::Y2High, None) => simulate_y2_high(&init, &config)?.summary,
-        (PresetArg::Star3, None) => simulate_star3(&init, &config)?.summary,
-        (PresetArg::Star4, None) => simulate_star4(&init, &config)?.summary,
         (PresetArg::SimpleTether, None) => simulate_simple_tether(&init, &config)?.summary,
     };
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
+}
+
+fn simulate_swarm_summary(
+    init: &InitRequest,
+    config: &SimulationConfig,
+) -> Result<multikite_sim::RunSummary> {
+    macro_rules! run_swarm {
+        ($nk:literal) => {
+            Ok(simulate_swarm::<$nk>(init, config)?.summary)
+        };
+    }
+    match init.swarm_kites {
+        1 => run_swarm!(1),
+        2 => run_swarm!(2),
+        3 => run_swarm!(3),
+        4 => run_swarm!(4),
+        5 => run_swarm!(5),
+        6 => run_swarm!(6),
+        7 => run_swarm!(7),
+        8 => run_swarm!(8),
+        9 => run_swarm!(9),
+        10 => run_swarm!(10),
+        11 => run_swarm!(11),
+        12 => run_swarm!(12),
+        count => anyhow::bail!(
+            "swarm kites must be in {MIN_SWARM_KITES}..={MAX_SWARM_KITES}, got {count}"
+        ),
+    }
+}
+
+fn simulate_swarm_trace(
+    init: &InitRequest,
+    config: &SimulationConfig,
+    trace_every: usize,
+) -> Result<multikite_sim::RunSummary> {
+    macro_rules! run_swarm {
+        ($nk:literal) => {{
+            let mut frame_index = 0usize;
+            Ok(simulate_swarm_with_callbacks::<$nk, _, _>(
+                init,
+                config,
+                &mut |_| {},
+                &mut |frame| {
+                    if frame_index % trace_every == 0 {
+                        print_trace_frame(frame_index, frame.time, &frame);
+                    }
+                    frame_index += 1;
+                },
+            )?
+            .summary)
+        }};
+    }
+    match init.swarm_kites {
+        1 => run_swarm!(1),
+        2 => run_swarm!(2),
+        3 => run_swarm!(3),
+        4 => run_swarm!(4),
+        5 => run_swarm!(5),
+        6 => run_swarm!(6),
+        7 => run_swarm!(7),
+        8 => run_swarm!(8),
+        9 => run_swarm!(9),
+        10 => run_swarm!(10),
+        11 => run_swarm!(11),
+        12 => run_swarm!(12),
+        count => anyhow::bail!(
+            "swarm kites must be in {MIN_SWARM_KITES}..={MAX_SWARM_KITES}, got {count}"
+        ),
+    }
 }
 
 fn print_trace_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
