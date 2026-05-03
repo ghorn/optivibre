@@ -2360,6 +2360,166 @@ fn compare_native_and_ipopt_with_full_space_refinement_options() {
 }
 
 #[test]
+fn compare_native_and_ipopt_with_refinement_quality_retry_accept_current() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        native_options_with(|options| {
+            options.max_iters = 200;
+            options.min_refinement_steps = 0;
+            options.max_refinement_steps = 0;
+            options.residual_ratio_max = 1.0e-300;
+            options.residual_ratio_singular = 1.0;
+            options.residual_improvement_factor = 0.5;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        ipopt_options_with(|options| {
+            options.max_iters = 200;
+            enable_ipopt_trace_journal(options);
+            options
+                .raw_options
+                .push(IpoptRawOption::integer("min_refinement_steps", 0));
+            options
+                .raw_options
+                .push(IpoptRawOption::integer("max_refinement_steps", 0));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("residual_ratio_max", 1.0e-300));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("residual_ratio_singular", 1.0));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("residual_improvement_factor", 0.5));
+        }),
+    );
+
+    assert_native_event_seen(
+        "linearly_constrained_quadratic_refinement_quality_retry_accept_current",
+        &native,
+        InteriorPointIterationEvent::LinearSolverQualityIncreased,
+    );
+    assert_ipopt_info_string_seen(
+        "linearly_constrained_quadratic_refinement_quality_retry_accept_current",
+        &ipopt,
+        'q',
+    );
+    assert_ipopt_info_string_seen(
+        "linearly_constrained_quadratic_refinement_quality_retry_accept_current",
+        &ipopt,
+        'S',
+    );
+    assert_native_matches_ipopt(
+        "linearly_constrained_quadratic_refinement_quality_retry_accept_current",
+        None,
+        &native,
+        &ipopt,
+        1e-6,
+        1e-6,
+    );
+    assert_accepted_trace_parity(
+        "linearly_constrained_quadratic_refinement_quality_retry_accept_current",
+        &native,
+        &ipopt,
+        AcceptedTraceParityTolerances {
+            max_iteration_gap: 2,
+            max_step_tag_mismatches: 2,
+            max_primal_log_gap: 1.5,
+            max_dual_log_gap: 13.0,
+            max_mu_log_gap: 2.0,
+            max_regularization_log_gap: 1.0,
+        },
+    );
+}
+
+#[test]
+fn compare_native_and_ipopt_with_refinement_pretend_singular_retry() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+    let native = solve_native_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        native_options_with(|options| {
+            options.max_iters = 200;
+            options.min_refinement_steps = 0;
+            options.max_refinement_steps = 0;
+            options.residual_ratio_max = 1.0e-300;
+            options.residual_ratio_singular = 1.0e-300;
+            options.residual_improvement_factor = 0.5;
+        }),
+    );
+    let ipopt = solve_ipopt_with_options_ok(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        ipopt_options_with(|options| {
+            options.max_iters = 200;
+            enable_ipopt_trace_journal(options);
+            options
+                .raw_options
+                .push(IpoptRawOption::integer("min_refinement_steps", 0));
+            options
+                .raw_options
+                .push(IpoptRawOption::integer("max_refinement_steps", 0));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("residual_ratio_max", 1.0e-300));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("residual_ratio_singular", 1.0e-300));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("residual_improvement_factor", 0.5));
+        }),
+    );
+
+    assert_native_event_seen(
+        "linearly_constrained_quadratic_refinement_pretend_singular_retry",
+        &native,
+        InteriorPointIterationEvent::LinearSolverQualityIncreased,
+    );
+    assert_ipopt_info_string_seen(
+        "linearly_constrained_quadratic_refinement_pretend_singular_retry",
+        &ipopt,
+        'q',
+    );
+    assert_ipopt_info_string_seen(
+        "linearly_constrained_quadratic_refinement_pretend_singular_retry",
+        &ipopt,
+        's',
+    );
+    assert_native_matches_ipopt(
+        "linearly_constrained_quadratic_refinement_pretend_singular_retry",
+        None,
+        &native,
+        &ipopt,
+        1e-6,
+        1e-6,
+    );
+    assert_accepted_trace_parity(
+        "linearly_constrained_quadratic_refinement_pretend_singular_retry",
+        &native,
+        &ipopt,
+        AcceptedTraceParityTolerances {
+            max_iteration_gap: 2,
+            max_step_tag_mismatches: 2,
+            max_primal_log_gap: 1.5,
+            max_dual_log_gap: 13.0,
+            max_mu_log_gap: 2.0,
+            max_regularization_log_gap: 1.0,
+        },
+    );
+}
+
+#[test]
 fn compare_native_and_ipopt_with_negative_curvature_test_options() {
     skip_without_native_spral!();
     let problem = LinearlyConstrainedQuadraticProblem;

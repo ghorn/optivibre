@@ -599,11 +599,11 @@ def classify_ipopt_line(file_name, line_no, text):
         if line_no in {559, 560, 577, 578, 579}:
             return "covered by refinement option/reduced threshold witnesses"
         if line_no in {590, 595, 600, 621, 626, 651}:
-            return "covered by reduced failed-refinement witness"
+            return "covered by reduced and live failed-refinement witnesses"
         if line_no == 656:
             return "covered by full-space final assembly witnesses"
         if line_no in {773, 819}:
-            return "quality/pretend retry witness gap"
+            return "covered by live quality/pretend retry witnesses"
         if line_no in {843, 857, 866, 871, 882, 895}:
             return "covered by perturbation retry witnesses"
         if line_no in {831, 908, 913, 925, 939}:
