@@ -677,9 +677,13 @@ pub fn source_built_spral_parity_preflight_errors(
 ) -> Vec<String> {
     let mut errors = source_built_spral_parity_ipopt_provenance_errors(&preflight.ipopt);
 
-    if !cfg!(feature = "native-spral-src") {
+    if !cfg!(any(
+        feature = "native-spral-src",
+        feature = "native-spral-src-pthreads",
+        feature = "native-spral-src-openmp"
+    )) {
         errors.push(
-            "optimization must be built with native-spral-src for source-built SPRAL parity"
+            "optimization must be built with a native-spral-src feature for source-built SPRAL parity"
                 .to_string(),
         );
     }
@@ -5324,7 +5328,14 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "ipopt", feature = "native-spral-src"))]
+    #[cfg(all(
+        feature = "ipopt",
+        any(
+            feature = "native-spral-src",
+            feature = "native-spral-src-pthreads",
+            feature = "native-spral-src-openmp"
+        )
+    ))]
     #[test]
     fn source_built_spral_parity_preflight_accepts_linked_source_inputs() {
         let preflight = super::SourceBuiltSpralParityPreflight {

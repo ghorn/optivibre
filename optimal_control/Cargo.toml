@@ -15,6 +15,8 @@ workspace = true
 [features]
 ipopt = ["optimization/ipopt"]
 native-spral-src = ["optimization/native-spral-src"]
+native-spral-src-pthreads = ["optimization/native-spral-src-pthreads"]
+native-spral-src-openmp = ["optimization/native-spral-src-openmp"]
 dynamic-spral-parity = ["optimization/dynamic-spral-parity"]
 
 [dependencies]

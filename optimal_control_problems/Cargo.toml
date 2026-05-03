@@ -16,6 +16,14 @@ workspace = true
 default = ["ipopt"]
 ipopt = ["optimal_control/ipopt", "optimization/ipopt"]
 native-spral-src = ["optimal_control/native-spral-src", "optimization/native-spral-src"]
+native-spral-src-pthreads = [
+    "optimal_control/native-spral-src-pthreads",
+    "optimization/native-spral-src-pthreads",
+]
+native-spral-src-openmp = [
+    "optimal_control/native-spral-src-openmp",
+    "optimization/native-spral-src-openmp",
+]
 dynamic-spral-parity = [
     "optimal_control/dynamic-spral-parity",
     "optimization/dynamic-spral-parity",

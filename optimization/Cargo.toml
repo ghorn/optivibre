@@ -16,6 +16,8 @@ workspace = true
 ipopt = ["dep:ipopt"]
 nalgebra = ["vectorize/nalgebra"]
 native-spral-src = ["ssids_rs/native-spral-src"]
+native-spral-src-pthreads = ["ssids_rs/native-spral-src-pthreads"]
+native-spral-src-openmp = ["ssids_rs/native-spral-src-openmp"]
 dynamic-spral-parity = ["ssids_rs/dynamic-spral-parity"]
 serde = ["dep:serde"]
 

@@ -236,6 +236,32 @@ That run captured `235` exact glider small-leaf panels with total dense area
 | `169` | `208` | `70` | `55` | `70` | `3850` | `0x8983e2923e0e13c8` |
 | `152` | `191` | `70` | `55` | `70` | `3850` | `0x9c85e106818f2f6f` |
 
+### Thread Scaling Harness
+
+`scripts/ssids_glider_thread_scaling.sh` runs the glider in-process profile
+across serial and bounded threaded configurations, always reporting both
+source-built native `spral-src` and pure Rust `ssids-rs` from the paired profile
+test. It refuses to run unless `SSIDS_THREAD_SCALING_CONFIRMED=1` is set, so the
+machine can be made quiet first.
+
+Default modes:
+
+- `serial`: `RAYON_NUM_THREADS=1`, `OMP_NUM_THREADS=1`,
+  `OPENBLAS_NUM_THREADS=1`, feature `native-spral-src`.
+- `ssids-rs-rayon`: varies Rayon threads with native/OpenBLAS pinned to 1.
+- `spral-src-omp`: varies `OMP_NUM_THREADS` with Rayon/OpenBLAS pinned to 1.
+- `spral-src-openblas-pthreads`: uses source-built
+  `native-spral-src-pthreads` and varies `OPENBLAS_NUM_THREADS`.
+- `spral-src-openblas-openmp`: uses source-built `native-spral-src-openmp` and
+  varies OpenMP/OpenBLAS thread controls together.
+- `mixed-rayon-omp`: varies Rayon and OpenMP together as an oversubscription
+  stress case.
+
+The script writes `timings.csv`, `timings.md`, and `timings.svg` under
+`target/ssids-thread-scaling/<timestamp>/`. The plot shows factor and solve
+timing versus thread count for native `spral-src`, Rust `ssids-rs` unprofiled,
+and Rust `ssids-rs` profiled.
+
 A pointer-hoisted `while`-loop rewrite of the rank-1/2 update helpers preserved
 the native prefix trace but regressed the glider unprofiled factor profile to
 `1.256ms` vs native `1.039ms` (`1.210x`). It was rejected because it was a
