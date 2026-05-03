@@ -562,6 +562,38 @@ def classify_ipopt_line(file_name, line_no, text):
         return "diagnostic only"
     if file_name == "IpFilterLSAcceptor.cpp" and 665 <= line_no <= 868:
         return "unreachable under parity options"
+    if file_name == "IpFilterLSAcceptor.cpp":
+        if line_no in {283, 284}:
+            return "covered by reduced filter witness"
+        if line_no == 341:
+            return "covered by theta-max filter witness"
+        if line_no == 409:
+            return "source-dead filter reset cap branch"
+        if line_no == 487:
+            return "covered by objective max-increase witness"
+        if line_no == 576:
+            return "covered by SOC method option witnesses"
+        if line_no == 609:
+            return "linear-solver-failure witness gap"
+    if file_name == "IpBacktrackingLineSearch.cpp":
+        if line_no == 203:
+            return "covered by alpha_for_y option-profile witness"
+        if line_no in {307, 568, 580, 581, 584, 611, 614}:
+            return "restoration/fallback witness gap"
+        if line_no in {403, 422, 1261}:
+            return "tiny-step witness gap"
+        if line_no in {455, 458, 546, 1144, 1167, 1172, 1182}:
+            return "soft-restoration witness gap"
+        if line_no == 520:
+            return "unreachable under parity options"
+        if line_no == 800:
+            return "expect-infeasible restoration witness gap"
+        if line_no in {902, 931, 933}:
+            return "covered by alpha_for_y option-profile witness"
+        if line_no in {1283, 1300}:
+            return "acceptable-point fallback witness gap"
+        if line_no == 1316:
+            return "failure/fallback witness gap"
     if "GetCachedResult" in text or "_cache_" in text:
         return "cache bookkeeping"
     if "IsValid(add_cq_)" in text:
