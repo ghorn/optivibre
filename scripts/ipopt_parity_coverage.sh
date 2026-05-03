@@ -568,6 +568,15 @@ def classify_ipopt_line(file_name, line_no, text):
         if any(token in text for token in ["Jnlst", "Output", "Printf", "print_", "WallclockTime"]):
             return "diagnostic/restoration branch"
         return "restoration branch"
+    if file_name == "IpPDPerturbationHandler.cpp":
+        if 472 <= line_no <= 529:
+            return "structural degeneracy finalization/status witness gap"
+        if line_no in {386, 395}:
+            return "covered by hessian-perturbation growth witness"
+        if line_no in {435, 443}:
+            return "covered by wrong-inertia fallback witness"
+        if 158 <= line_no <= 338:
+            return "covered by perturbation retry state-machine witnesses"
     if file_name == "IpPDFullSpaceSolver.cpp" and line_no < 320:
         return "diagnostic only"
     if file_name == "IpPDFullSpaceSolver.cpp":
