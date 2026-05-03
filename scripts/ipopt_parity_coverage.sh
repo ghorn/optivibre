@@ -543,8 +543,12 @@ def classify_rust_line(path, line_no, text):
             return "iteration log formatting/reporting"
         if 16750 <= line_no <= 16795:
             return "iteration log formatting/reporting"
-        if 16900 <= line_no <= 18840:
+        if 16900 <= line_no <= 19020:
             return "unit-test parity witness"
+        if 25945 <= line_no <= 26170:
+            return "covered by acceptable restoration fallback helper"
+        if 26420 <= line_no <= 26445:
+            return "covered by acceptable restoration fallback helper"
         if 24800 <= line_no <= 24900:
             return "restoration status mapping"
         if 25240 <= line_no <= 25330:
@@ -632,8 +636,10 @@ def classify_ipopt_line(file_name, line_no, text):
     if file_name == "IpBacktrackingLineSearch.cpp":
         if line_no == 203:
             return "covered by alpha_for_y option-profile witness"
-        if line_no in {307, 568, 580, 581, 584, 611, 614}:
-            return "restoration/fallback witness gap"
+        if line_no == 307:
+            return "source-dead: stock BacktrackingLSAcceptor::DoFallback is false"
+        if line_no in {568, 580, 581, 584, 611, 614}:
+            return "covered by acceptable restoration fallback helper"
         if line_no == 403:
             return "covered by tiny-step eval-error fallback witness"
         if line_no == 422:
@@ -651,9 +657,9 @@ def classify_ipopt_line(file_name, line_no, text):
         if line_no == 1283:
             return "covered by acceptable-iterate backup witness"
         if line_no == 1300:
-            return "acceptable-point fallback witness gap"
+            return "covered by acceptable restoration fallback helper"
         if line_no == 1316:
-            return "failure/fallback witness gap"
+            return "source fallback activation condition"
     if "GetCachedResult" in text or "_cache_" in text:
         return "cache bookkeeping"
     if "IsValid(add_cq_)" in text:

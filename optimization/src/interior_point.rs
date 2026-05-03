@@ -8479,6 +8479,91 @@ fn interior_point_current_is_acceptable(
         && relative_objective_change <= options.acceptable_obj_change_tol
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IpoptRestorationFallbackDecision {
+    AcceptablePointReached,
+    RestoreAcceptablePoint,
+    StepComputationFailed,
+    CallRestoration,
+}
+
+fn ipopt_restoration_fallback_decision(
+    current_is_acceptable: bool,
+    almost_feasible: bool,
+    acceptable_backup_available: bool,
+) -> IpoptRestorationFallbackDecision {
+    if current_is_acceptable {
+        return IpoptRestorationFallbackDecision::AcceptablePointReached;
+    }
+    if almost_feasible {
+        return if acceptable_backup_available {
+            IpoptRestorationFallbackDecision::RestoreAcceptablePoint
+        } else {
+            IpoptRestorationFallbackDecision::StepComputationFailed
+        };
+    }
+    IpoptRestorationFallbackDecision::CallRestoration
+}
+
+fn interior_point_acceptable_summary_from_snapshot(
+    final_state: InteriorPointIterationSnapshot,
+    mut snapshots: Vec<InteriorPointIterationSnapshot>,
+    iterations: Index,
+    profiling: InteriorPointProfiling,
+    linear_solver: InteriorPointLinearSolver,
+    solve_started: Instant,
+    options: &InteriorPointOptions,
+) -> InteriorPointSummary {
+    if !snapshots.iter().any(|snapshot| snapshot == &final_state) {
+        snapshots.push(final_state.clone());
+    }
+    let equality_inf = final_state.eq_inf.unwrap_or(0.0);
+    let inequality_inf = final_state.ineq_inf.unwrap_or(0.0);
+    let primal_inf = final_state
+        .barrier_primal_inf
+        .unwrap_or_else(|| equality_inf.max(inequality_inf));
+    let complementarity_inf = final_state.comp_inf.unwrap_or(0.0);
+    let barrier_parameter = final_state.barrier_parameter.unwrap_or(options.mu_target);
+    let mut summary = InteriorPointSummary {
+        x: final_state.x.clone(),
+        equality_multipliers: final_state.equality_multipliers.clone().unwrap_or_default(),
+        inequality_multipliers: final_state
+            .inequality_multipliers
+            .clone()
+            .unwrap_or_default(),
+        lower_bound_multipliers: final_state
+            .lower_bound_multipliers
+            .clone()
+            .unwrap_or_default(),
+        upper_bound_multipliers: final_state
+            .upper_bound_multipliers
+            .clone()
+            .unwrap_or_default(),
+        slack: final_state.slack_primal.clone().unwrap_or_default(),
+        objective: final_state.objective,
+        iterations,
+        equality_inf_norm: equality_inf,
+        inequality_inf_norm: inequality_inf,
+        primal_inf_norm: primal_inf,
+        dual_inf_norm: final_state.dual_inf,
+        complementarity_inf_norm: complementarity_inf,
+        overall_inf_norm: final_state.overall_inf,
+        barrier_parameter,
+        termination: InteriorPointTermination::Acceptable,
+        status_kind: InteriorPointStatusKind::Warning,
+        snapshots,
+        final_state: final_state.clone(),
+        last_accepted_state: Some(final_state),
+        profiling,
+        linear_solver,
+    };
+    finalise_interior_point_profiling(&mut summary.profiling, solve_started);
+    if options.verbose {
+        log_interior_point_status_summary(&summary, options);
+    }
+    summary
+}
+
 fn step_inf_norm(step: &[f64]) -> f64 {
     step.iter().fold(0.0, |acc, value| acc.max(value.abs()))
 }
@@ -16620,6 +16705,85 @@ mod tests {
     }
 
     #[test]
+    fn restoration_fallback_decision_matches_ipopt_branch_order() {
+        assert_eq!(
+            ipopt_restoration_fallback_decision(false, false, false),
+            IpoptRestorationFallbackDecision::CallRestoration
+        );
+        assert_eq!(
+            ipopt_restoration_fallback_decision(true, false, false),
+            IpoptRestorationFallbackDecision::AcceptablePointReached
+        );
+        assert_eq!(
+            ipopt_restoration_fallback_decision(false, true, true),
+            IpoptRestorationFallbackDecision::RestoreAcceptablePoint
+        );
+        assert_eq!(
+            ipopt_restoration_fallback_decision(false, true, false),
+            IpoptRestorationFallbackDecision::StepComputationFailed
+        );
+        assert_eq!(
+            ipopt_restoration_fallback_decision(true, true, true),
+            IpoptRestorationFallbackDecision::AcceptablePointReached,
+            "BacktrackingLineSearch checks CurrentIsAcceptable before the almost-feasible guard"
+        );
+    }
+
+    #[test]
+    fn acceptable_restore_summary_uses_stored_iterate_as_final_state() {
+        let mut backup = snapshot_with_events(Vec::new());
+        backup.iteration = 4;
+        backup.x = vec![1.0, 2.0];
+        backup.slack_primal = Some(vec![0.5]);
+        backup.equality_multipliers = Some(vec![3.0]);
+        backup.inequality_multipliers = Some(vec![4.0]);
+        backup.slack_multipliers = Some(vec![5.0]);
+        backup.lower_bound_multipliers = Some(vec![6.0]);
+        backup.upper_bound_multipliers = Some(vec![7.0]);
+        backup.objective = 8.0;
+        backup.eq_inf = Some(1.0e-7);
+        backup.ineq_inf = Some(2.0e-7);
+        backup.dual_inf = 3.0e-7;
+        backup.comp_inf = Some(4.0e-7);
+        backup.overall_inf = 5.0e-7;
+        backup.barrier_primal_inf = Some(6.0e-7);
+        backup.barrier_parameter = Some(1.0e-3);
+
+        let options = InteriorPointOptions {
+            verbose: false,
+            ..InteriorPointOptions::default()
+        };
+        let summary = interior_point_acceptable_summary_from_snapshot(
+            backup.clone(),
+            Vec::new(),
+            9,
+            InteriorPointProfiling::default(),
+            InteriorPointLinearSolver::SpralSrc,
+            Instant::now(),
+            &options,
+        );
+
+        assert_eq!(summary.termination, InteriorPointTermination::Acceptable);
+        assert_eq!(summary.status_kind, InteriorPointStatusKind::Warning);
+        assert_eq!(summary.iterations, 9);
+        assert_eq!(summary.x, vec![1.0, 2.0]);
+        assert_eq!(summary.slack, vec![0.5]);
+        assert_eq!(summary.equality_multipliers, vec![3.0]);
+        assert_eq!(summary.inequality_multipliers, vec![4.0]);
+        assert_eq!(summary.lower_bound_multipliers, vec![6.0]);
+        assert_eq!(summary.upper_bound_multipliers, vec![7.0]);
+        assert_eq!(summary.objective.to_bits(), 8.0_f64.to_bits());
+        assert_eq!(summary.primal_inf_norm.to_bits(), 6.0e-7_f64.to_bits());
+        assert_eq!(summary.dual_inf_norm.to_bits(), 3.0e-7_f64.to_bits());
+        assert_eq!(summary.final_state, backup);
+        assert_eq!(
+            summary.last_accepted_state.as_ref(),
+            Some(&summary.final_state)
+        );
+        assert_eq!(summary.snapshots.last(), Some(&summary.final_state));
+    }
+
+    #[test]
     fn perturb_always_cd_initializes_ipopt_jacobian_regularization() {
         let (regularization, tried) =
             ipopt_initial_jacobian_regularization_value(None, true, 1.0e-8, 1.0e-4, 0.25);
@@ -20116,6 +20280,7 @@ where
     let mut successive_filter_rejections = 0;
     let mut snapshots = Vec::new();
     let mut last_accepted_state: Option<InteriorPointIterationSnapshot> = None;
+    let mut acceptable_backup_state: Option<InteriorPointIterationSnapshot> = None;
     let mut acceptable_counter = 0;
     let mut last_objective_value = initial_state.objective_value;
     let initial_theta = filter_theta_l1_norm(
@@ -20682,6 +20847,7 @@ where
                 );
             if acceptable_iterate {
                 acceptable_counter += 1;
+                acceptable_backup_state = Some(current_snapshot.clone());
             } else {
                 acceptable_counter = 0;
             }
@@ -25799,8 +25965,57 @@ where
                     });
                 }
             }
+            let restoration_fallback_decision = if accepted.is_none() && options.restoration_phase {
+                // Mirrors BacktrackingLineSearch before
+                // MinC_1NrmRestorationPhase::PerformRestoration: an acceptable
+                // current iterate returns immediately, and an almost-feasible
+                // current iterate may only abort through the stored acceptable
+                // backup instead of entering restoration.
+                let almost_feasible = line_search_current_primal_inf
+                    <= 1.0e-2 * options.overall_tol
+                    && line_search_current_primal_inf <= 1.0e-1 * options.constraint_tol;
+                let decision = ipopt_restoration_fallback_decision(
+                    acceptable_iterate,
+                    almost_feasible,
+                    acceptable_backup_state.is_some(),
+                );
+                match decision {
+                    IpoptRestorationFallbackDecision::AcceptablePointReached => {
+                        return Ok(interior_point_acceptable_summary_from_snapshot(
+                            current_snapshot.clone(),
+                            snapshots,
+                            iteration,
+                            profiling,
+                            last_linear_solver,
+                            solve_started,
+                            options,
+                        ));
+                    }
+                    IpoptRestorationFallbackDecision::RestoreAcceptablePoint => {
+                        if let Some(acceptable_backup) = acceptable_backup_state.clone() {
+                            return Ok(interior_point_acceptable_summary_from_snapshot(
+                                acceptable_backup,
+                                snapshots,
+                                iteration,
+                                profiling,
+                                last_linear_solver,
+                                solve_started,
+                                options,
+                            ));
+                        }
+                    }
+                    IpoptRestorationFallbackDecision::StepComputationFailed
+                    | IpoptRestorationFallbackDecision::CallRestoration => {}
+                }
+                decision
+            } else {
+                IpoptRestorationFallbackDecision::CallRestoration
+            };
+
             if accepted.is_none()
                 && options.restoration_phase
+                && restoration_fallback_decision
+                    == IpoptRestorationFallbackDecision::CallRestoration
                 && let Some(restoration_result) = solve_equality_restoration_problem(
                     problem,
                     &x,
@@ -25874,6 +26089,21 @@ where
                             square_equality_problem,
                             restoration_phase_status,
                         );
+                        if matches!(
+                            restoration_algorithm_status,
+                            IpoptRestorationAlgorithmStatus::RestorationFailed(_)
+                        ) && let Some(acceptable_backup) = acceptable_backup_state.clone()
+                        {
+                            return Ok(interior_point_acceptable_summary_from_snapshot(
+                                acceptable_backup,
+                                snapshots,
+                                iteration,
+                                profiling,
+                                last_linear_solver,
+                                solve_started,
+                                options,
+                            ));
+                        }
                         let failure_context = interior_point_failure_context(
                             Some(snapshot_with_nlip_events(
                                 current_snapshot.clone(),
@@ -26196,6 +26426,17 @@ where
                             });
                         }
                         IpoptRestorationAlgorithmStatus::RestorationFailed(status) => {
+                            if let Some(acceptable_backup) = acceptable_backup_state.clone() {
+                                return Ok(interior_point_acceptable_summary_from_snapshot(
+                                    acceptable_backup,
+                                    snapshots,
+                                    iteration,
+                                    profiling,
+                                    last_linear_solver,
+                                    solve_started,
+                                    options,
+                                ));
+                            }
                             return Err(InteriorPointSolveError::RestorationFailed {
                                 status,
                                 context: interior_point_failure_context(
