@@ -654,6 +654,16 @@ def classify_ipopt_line(file_name, line_no, text):
             return "IPOPT option-lower-bound unreachable branch"
     if file_name == "IpDefaultIterateInitializer.cpp" and line_no in {208, 302}:
         return "unreachable under parity options"
+    if file_name == "IpMonotoneMuUpdate.cpp":
+        if line_no == 158:
+            return "tiny-step best-possible termination witness gap"
+        if line_no == 176:
+            return "covered by reduced monotone barrier helper"
+        if line_no == 188:
+            return "covered by reduced monotone line-search reset helper"
+    if file_name == "IpPDSearchDirCalc.cpp":
+        if line_no == 133:
+            return "search-direction failure/status witness gap"
     if file_name == "IpIpoptData.cpp":
         if line_no in {95, 171, 271}:
             return "unreachable under parity options"
