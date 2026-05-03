@@ -673,6 +673,31 @@ def classify_ipopt_line(file_name, line_no, text):
     if file_name == "IpPDSearchDirCalc.cpp":
         if line_no == 133:
             return "search-direction failure/status witness gap"
+    if file_name == "IpIpoptCalculatedQuantities.cpp":
+        if line_no == 474:
+            return "adjusted-slack zero-mu floor witness gap"
+        if line_no == 479:
+            return "adjusted-slack bound-shift witness gap"
+        if line_no in {702, 715}:
+            return "objective-depends-on-mu TNLP feature gap"
+        if line_no in {928, 1021}:
+            return "covered by zero/nonzero kappa_d damping witnesses"
+        if line_no in {1552, 1906, 1920}:
+            return "unscaled constraint-violation dimension witness gap"
+        if line_no in {1600, 1636, 1738, 1743, 1778, 1783}:
+            return "original-bound violation/bound-relaxation witness gap"
+        if line_no in {1811, 1832, 1855, 2781}:
+            return "unreachable under parity options"
+        if line_no in {1818, 1839, 1868, 3757, 3766}:
+            return "cache bookkeeping"
+        if line_no in {2528, 2563}:
+            return "option/error handling"
+        if line_no in {2543, 2544}:
+            return "component norm option witness gap"
+        if line_no == 2911:
+            return "mu-target complementarity witness gap"
+        if line_no in {2981, 2991, 3238, 3245, 3298, 3305, 3587, 3642}:
+            return "zero-dimension component witness gap"
     if file_name == "IpIpoptData.cpp":
         if line_no in {95, 171, 271}:
             return "unreachable under parity options"
