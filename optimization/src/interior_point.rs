@@ -19387,6 +19387,24 @@ fn validate_interior_point_options(
             options.slack_bound_frac
         )));
     }
+    if !options.theta_max_fact.is_finite() || options.theta_max_fact <= 0.0 {
+        return Err(InteriorPointSolveError::InvalidInput(format!(
+            "theta_max_fact must be finite and positive, got {}",
+            options.theta_max_fact
+        )));
+    }
+    if !options.theta_min_fact.is_finite() || options.theta_min_fact <= 0.0 {
+        return Err(InteriorPointSolveError::InvalidInput(format!(
+            "theta_min_fact must be finite and positive, got {}",
+            options.theta_min_fact
+        )));
+    }
+    if options.theta_min_fact >= options.theta_max_fact {
+        return Err(InteriorPointSolveError::InvalidInput(format!(
+            "theta_min_fact must be less than theta_max_fact, got min={} max={}",
+            options.theta_min_fact, options.theta_max_fact
+        )));
+    }
     if !options.residual_ratio_max.is_finite() || options.residual_ratio_max <= 0.0 {
         return Err(InteriorPointSolveError::InvalidInput(format!(
             "residual_ratio_max must be finite and positive, got {}",

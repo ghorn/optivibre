@@ -6587,6 +6587,104 @@ fn compare_native_and_ipopt_reject_invalid_initializer_push_options() {
 }
 
 #[test]
+fn compare_native_and_ipopt_reject_invalid_filter_theta_factors() {
+    skip_without_native_spral!();
+    let problem = LinearlyConstrainedQuadraticProblem;
+
+    let native = solve_nlp_interior_point(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        &native_options_with(|options| {
+            options.theta_min_fact = 1.0;
+            options.theta_max_fact = 1.0;
+        }),
+    );
+    assert!(
+        matches!(
+            native,
+            Err(InteriorPointSolveError::InvalidInput(ref message))
+                if message.contains("theta_min_fact")
+        ),
+        "NLIP should reject theta_min_fact >= theta_max_fact: {:?}",
+        native
+    );
+
+    let ipopt = solve_nlp_ipopt(
+        &problem,
+        &[0.1, 0.9],
+        &[],
+        &ipopt_options_with(|options| {
+            options
+                .raw_options
+                .push(IpoptRawOption::number("theta_min_fact", 1.0));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("theta_max_fact", 1.0));
+        }),
+    );
+    assert!(
+        matches!(
+            ipopt,
+            Err(IpoptSolveError::Solve {
+                status: IpoptRawStatus::InvalidOption,
+                ..
+            })
+        ),
+        "IPOPT should reject theta_min_fact >= theta_max_fact: {:?}",
+        ipopt
+    );
+
+    macro_rules! assert_lower_bound_rejected {
+        ($field:ident, $raw_name:literal) => {{
+            let native = solve_nlp_interior_point(
+                &problem,
+                &[0.1, 0.9],
+                &[],
+                &native_options_with(|options| {
+                    options.$field = 0.0;
+                }),
+            );
+            assert!(
+                matches!(
+                    native,
+                    Err(InteriorPointSolveError::InvalidInput(ref message))
+                        if message.contains(stringify!($field))
+                ),
+                "NLIP should reject {}=0: {:?}",
+                stringify!($field),
+                native
+            );
+
+            let ipopt = solve_nlp_ipopt(
+                &problem,
+                &[0.1, 0.9],
+                &[],
+                &ipopt_options_with(|options| {
+                    options
+                        .raw_options
+                        .push(IpoptRawOption::number($raw_name, 0.0));
+                }),
+            );
+            assert!(
+                matches!(
+                    ipopt,
+                    Err(IpoptSolveError::OptionRejected { ref name }) if name == $raw_name
+                ),
+                "IPOPT should reject {}=0: {:?}",
+                $raw_name,
+                ipopt
+            );
+        }};
+    }
+
+    // IpFilterLSAcceptor::RegisterOptions enforces strict positivity, and
+    // InitializeImpl rejects theta_min_fact >= theta_max_fact.
+    assert_lower_bound_rejected!(theta_min_fact, "theta_min_fact");
+    assert_lower_bound_rejected!(theta_max_fact, "theta_max_fact");
+}
+
+#[test]
 fn compare_invalid_shape_rejected_by_both_solvers() {
     let invalid = invalid_shape_problem();
     assert!(solve_nlp_interior_point(&invalid, &[0.0, 0.0], &[], &native_options()).is_err());

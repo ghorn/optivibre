@@ -551,7 +551,7 @@ def classify_rust_line(path, line_no, text):
             return "restoration status mapping"
         if 25480 <= line_no <= 25560:
             return "restoration status mapping"
-        if 25690 <= line_no <= 25795:
+        if 25690 <= line_no <= 25810:
             return "restoration status mapping"
         if 14720 <= line_no <= 14770:
             return "iteration log formatting/reporting"
@@ -615,6 +615,8 @@ def classify_ipopt_line(file_name, line_no, text):
     if file_name == "IpFilterLSAcceptor.cpp" and 665 <= line_no <= 868:
         return "unreachable under parity options"
     if file_name == "IpFilterLSAcceptor.cpp":
+        if line_no == 214:
+            return "covered by filter theta option-rejection witness"
         if line_no in {283, 284}:
             return "covered by reduced filter witness"
         if line_no == 341:
