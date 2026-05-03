@@ -63,13 +63,13 @@ run_case() {
 mode_features() {
   case "$1" in
     serial|ssids-rs-rayon|spral-src-omp)
-      printf '%s\n' "ipopt,native-spral-src"
+      printf '%s\n' "native-spral-src"
       ;;
     spral-src-openblas-pthreads)
-      printf '%s\n' "ipopt,native-spral-src-pthreads"
+      printf '%s\n' "native-spral-src-pthreads"
       ;;
     spral-src-openblas-openmp|mixed-rayon-omp)
-      printf '%s\n' "ipopt,native-spral-src-openmp"
+      printf '%s\n' "native-spral-src-openmp"
       ;;
     *)
       echo "unknown SSIDS thread-scaling mode: $1" >&2

@@ -238,11 +238,15 @@ That run captured `235` exact glider small-leaf panels with total dense area
 
 ### Thread Scaling Harness
 
-`scripts/ssids_glider_thread_scaling.sh` runs the glider in-process profile
-across serial and bounded threaded configurations, always reporting both
-source-built native `spral-src` and pure Rust `ssids-rs` from the paired profile
-test. It refuses to run unless `SSIDS_THREAD_SCALING_CONFIRMED=1` is set, so the
-machine can be made quiet first.
+`scripts/ssids_glider_thread_scaling.sh` runs the dumped IPOPT/NLIP glider KKT
+in-process profile across serial and bounded threaded configurations, always
+reporting both source-built native `spral-src` and pure Rust `ssids-rs` from the
+paired profile test. It intentionally does not enable the `ipopt` crate feature:
+the KKT is already an IPOPT-shaped replay, and omitting `ipopt` avoids Cargo
+unifying IPOPT's serial OpenBLAS feature with the pthread/OpenMP `spral-src`
+variants being benchmarked. It refuses to run unless
+`SSIDS_THREAD_SCALING_CONFIRMED=1` is set, so the machine can be made quiet
+first.
 
 Default modes:
 

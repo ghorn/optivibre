@@ -1314,12 +1314,15 @@ mod tests {
         approximate_minimum_degree_permutation as spral_amd_permutation,
         factorize as spral_factorize, factorize_with_profile as spral_factorize_with_profile,
     };
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
+    #[cfg(feature = "ipopt")]
+    use std::collections::BTreeSet;
     use std::fs;
     use std::path::Path;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
+    #[allow(dead_code)]
     #[derive(Debug)]
     struct GliderLinearDebugDump {
         matrix_dimension: usize,
@@ -1367,6 +1370,7 @@ mod tests {
         linear_trace_refinement_residual_v_upper: Option<Vec<Vec<f64>>>,
     }
 
+    #[cfg(feature = "ipopt")]
     #[derive(Debug)]
     struct IpoptSpralInterfaceDump {
         call_index: usize,
@@ -1385,6 +1389,7 @@ mod tests {
         scaling: Option<Vec<f64>>,
     }
 
+    #[cfg(feature = "ipopt")]
     #[derive(Debug)]
     struct IpoptFullSpaceResidualDump {
         call_index: usize,
@@ -1454,6 +1459,7 @@ mod tests {
         Some(serde_json::from_str(value).expect("expected optional dump vector to parse"))
     }
 
+    #[cfg(feature = "ipopt")]
     fn parse_optional_dump_value<T>(text: &str, prefix: &str) -> Option<T>
     where
         T: std::str::FromStr,
@@ -1585,6 +1591,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ipopt")]
     fn load_ipopt_spral_interface_dump(path: &Path) -> IpoptSpralInterfaceDump {
         let text = fs::read_to_string(path).expect("expected IPOPT SPRAL dump to exist");
         IpoptSpralInterfaceDump {
@@ -1605,6 +1612,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ipopt")]
     fn load_ipopt_full_space_residual_dump(path: &Path) -> IpoptFullSpaceResidualDump {
         let text = fs::read_to_string(path).expect("expected IPOPT residual dump to exist");
         IpoptFullSpaceResidualDump {
@@ -4218,6 +4226,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ipopt")]
     #[ignore = "manual IPOPT diagnostics helper"]
     fn print_current_glider_ipopt_repro() {
         let params = Params {
@@ -4272,6 +4281,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ipopt")]
     #[ignore = "manual local-SPRAL IPOPT strategy comparison for the glider repro"]
     fn print_current_glider_ipopt_mu_strategy_compare() {
         fn local_spral_ipopt_options(config: &SolverConfig) -> optimization::IpoptOptions {
