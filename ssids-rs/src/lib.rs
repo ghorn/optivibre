@@ -480,6 +480,147 @@ impl NumericFactorOptions {
     }
 }
 
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpralSmallLeafTppPanelCapture {
+    pub front_id: usize,
+    pub m: usize,
+    pub n: usize,
+    pub ldl: usize,
+    pub rows: Vec<usize>,
+    pub perm: Vec<usize>,
+    pub lcol: Vec<f64>,
+    pub action_on_zero_pivot: bool,
+    pub threshold_pivot_u: f64,
+    pub small_pivot_tolerance: f64,
+    pub stable_hash: u64,
+}
+
+static SPRAL_SMALL_LEAF_TPP_PANEL_CAPTURE_ENABLED: AtomicUsize = AtomicUsize::new(0);
+static SPRAL_SMALL_LEAF_TPP_PANEL_CAPTURES: OnceLock<
+    Mutex<Option<Vec<SpralSmallLeafTppPanelCapture>>>,
+> = OnceLock::new();
+
+fn spral_small_leaf_tpp_panel_captures()
+-> &'static Mutex<Option<Vec<SpralSmallLeafTppPanelCapture>>> {
+    SPRAL_SMALL_LEAF_TPP_PANEL_CAPTURES.get_or_init(|| Mutex::new(None))
+}
+
+#[doc(hidden)]
+pub fn debug_clear_spral_small_leaf_tpp_panel_captures() {
+    let mut captures = spral_small_leaf_tpp_panel_captures()
+        .lock()
+        .expect("small-leaf TPP panel capture mutex poisoned");
+    *captures = Some(Vec::new());
+    SPRAL_SMALL_LEAF_TPP_PANEL_CAPTURE_ENABLED.store(1, Ordering::Release);
+}
+
+#[doc(hidden)]
+pub fn debug_disable_spral_small_leaf_tpp_panel_captures() {
+    SPRAL_SMALL_LEAF_TPP_PANEL_CAPTURE_ENABLED.store(0, Ordering::Release);
+    let mut captures = spral_small_leaf_tpp_panel_captures()
+        .lock()
+        .expect("small-leaf TPP panel capture mutex poisoned");
+    *captures = None;
+}
+
+#[doc(hidden)]
+pub fn debug_take_spral_small_leaf_tpp_panel_captures() -> Vec<SpralSmallLeafTppPanelCapture> {
+    SPRAL_SMALL_LEAF_TPP_PANEL_CAPTURE_ENABLED.store(0, Ordering::Release);
+    let mut captures = spral_small_leaf_tpp_panel_captures()
+        .lock()
+        .expect("small-leaf TPP panel capture mutex poisoned");
+    captures.take().unwrap_or_default()
+}
+
+#[doc(hidden)]
+pub fn debug_spral_small_leaf_tpp_panel_capture_count() -> usize {
+    if SPRAL_SMALL_LEAF_TPP_PANEL_CAPTURE_ENABLED.load(Ordering::Acquire) == 0 {
+        return 0;
+    }
+    let captures = spral_small_leaf_tpp_panel_captures()
+        .lock()
+        .expect("small-leaf TPP panel capture mutex poisoned");
+    captures.as_ref().map_or(0, Vec::len)
+}
+
+fn spral_small_leaf_tpp_panel_hash_update_u64(hash: &mut u64, value: u64) {
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    for byte in value.to_le_bytes() {
+        *hash ^= u64::from(byte);
+        *hash = hash.wrapping_mul(FNV_PRIME);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spral_small_leaf_tpp_panel_stable_hash(
+    front_id: usize,
+    m: usize,
+    n: usize,
+    ldl: usize,
+    rows: &[usize],
+    perm: &[usize],
+    lcol: &[f64],
+    options: NumericFactorOptions,
+) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325;
+    for value in [front_id, m, n, ldl, rows.len(), perm.len(), lcol.len()] {
+        spral_small_leaf_tpp_panel_hash_update_u64(&mut hash, value as u64);
+    }
+    for &row in rows {
+        spral_small_leaf_tpp_panel_hash_update_u64(&mut hash, row as u64);
+    }
+    for &entry in perm {
+        spral_small_leaf_tpp_panel_hash_update_u64(&mut hash, entry as u64);
+    }
+    for &value in lcol {
+        spral_small_leaf_tpp_panel_hash_update_u64(&mut hash, value.to_bits());
+    }
+    spral_small_leaf_tpp_panel_hash_update_u64(&mut hash, u64::from(options.action_on_zero_pivot));
+    spral_small_leaf_tpp_panel_hash_update_u64(&mut hash, options.threshold_pivot_u.to_bits());
+    spral_small_leaf_tpp_panel_hash_update_u64(&mut hash, options.small_pivot_tolerance.to_bits());
+    hash
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_capture_spral_small_leaf_tpp_panel(
+    front_id: usize,
+    m: usize,
+    n: usize,
+    ldl: usize,
+    rows: &[usize],
+    perm: &[usize],
+    lcol: &[f64],
+    options: NumericFactorOptions,
+) {
+    if SPRAL_SMALL_LEAF_TPP_PANEL_CAPTURE_ENABLED.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let lower_len = n * ldl;
+    let lower = lcol[..lower_len].to_vec();
+    let stable_hash =
+        spral_small_leaf_tpp_panel_stable_hash(front_id, m, n, ldl, rows, perm, &lower, options);
+    let capture = SpralSmallLeafTppPanelCapture {
+        front_id,
+        m,
+        n,
+        ldl,
+        rows: rows.to_vec(),
+        perm: perm.to_vec(),
+        lcol: lower,
+        action_on_zero_pivot: options.action_on_zero_pivot,
+        threshold_pivot_u: options.threshold_pivot_u,
+        small_pivot_tolerance: options.small_pivot_tolerance,
+        stable_hash,
+    };
+    let mut captures = spral_small_leaf_tpp_panel_captures()
+        .lock()
+        .expect("small-leaf TPP panel capture mutex poisoned");
+    if let Some(captures) = captures.as_mut() {
+        captures.push(capture);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Inertia {
     pub positive: usize,
@@ -7747,6 +7888,16 @@ fn factorize_spral_small_leaf_aligned_tpp_in_place(
     let n = node.ncol;
     let ldl = node.ldl;
     let d_offset = spral_small_leaf_d_offset(ldl, n);
+    maybe_capture_spral_small_leaf_tpp_panel(
+        node.front_id,
+        m,
+        n,
+        ldl,
+        &node.rows,
+        &node.perm,
+        &node.lcol[..d_offset],
+        options,
+    );
     let (lcol, d) = node.lcol.split_at_mut(d_offset);
     let d = &mut d[..2 * n];
     let mut stats = PanelFactorStats::default();
@@ -9593,20 +9744,23 @@ mod tests {
         DiagonalBlock, FactorBlockRecord, FactorOutput, FrontFactorScratch, FrontWorkspace,
         NativeOrdering, NativeSpral, NumericFactorOptions, OrderingStrategy, PanelFactorStats,
         PermutedLowerMatrix, PivotMethod, SmallLeafAssemblyScratch, SolvePanel, SpralPartRange,
-        SpralSmallLeafNumericNode, SsidsError, SsidsOptions, SymbolicFront, SymbolicFrontTree,
-        SymmetricCscMatrix, analyse, app_adjust_passed_prefix, app_apply_accepted_prefix_update,
-        app_apply_block_pivots_to_trailing_rows, app_backup_trailing_lower,
-        app_build_factor_columns_for_prefix, app_build_ld_tile_workspace, app_build_ld_workspace,
-        app_first_failed_trailing_column, app_gemv_forward_singleton_column,
-        app_restore_trailing_from_block_backup, app_solve_block_triangular_to_trailing_rows,
-        app_target_block_uses_gemv_forward, app_truncate_records_to_prefix, app_two_by_two_inverse,
-        app_update_one_by_one, app_update_two_by_two, apply_permuted_symmetric_scaling,
+        SpralSmallLeafNumericNode, SpralSmallLeafTppPanelCapture, SsidsError, SsidsOptions,
+        SymbolicFront, SymbolicFrontTree, SymmetricCscMatrix, analyse, app_adjust_passed_prefix,
+        app_apply_accepted_prefix_update, app_apply_block_pivots_to_trailing_rows,
+        app_backup_trailing_lower, app_build_factor_columns_for_prefix,
+        app_build_ld_tile_workspace, app_build_ld_workspace, app_first_failed_trailing_column,
+        app_gemv_forward_singleton_column, app_restore_trailing_from_block_backup,
+        app_solve_block_triangular_to_trailing_rows, app_target_block_uses_gemv_forward,
+        app_truncate_records_to_prefix, app_two_by_two_inverse, app_update_one_by_one,
+        app_update_two_by_two, apply_permuted_symmetric_scaling,
         apply_spral_part_contribution_input_flags, assemble_spral_small_leaf_node_post,
         build_dense_front_solve_panel_record, build_factor_solve_panel_record,
         build_native_row_list_supernodes, build_native_row_list_supernodes_fast,
         build_native_row_list_supernodes_guarded, build_permuted_lower_csc_pattern,
         build_spral_small_leaf_symbolic_plan, build_symbolic_front_tree,
-        classify_spral_small_leaf_fronts, dense_find_maxloc, dense_lower_offset,
+        classify_spral_small_leaf_fronts, debug_clear_spral_small_leaf_tpp_panel_captures,
+        debug_disable_spral_small_leaf_tpp_panel_captures,
+        debug_take_spral_small_leaf_tpp_panel_captures, dense_find_maxloc, dense_lower_offset,
         dense_symmetric_swap_with_workspace, expand_symmetric_pattern, factor_front_recursive,
         factor_one_by_one_common, factor_spral_small_leaf_node, factor_two_by_two_common,
         factorize, factorize_dense_front, factorize_dense_tpp_tail_in_place,
@@ -9623,8 +9777,8 @@ mod tests {
         spral_small_leaf_factor_two_by_two, spral_small_leaf_find_rc_abs_max_exclude,
         spral_small_leaf_find_row_abs_max, spral_small_leaf_lcol_len,
         spral_small_leaf_pack_remaining_contribution, spral_small_leaf_swap_cols,
-        spral_small_leaf_zero_col, symbolic_factor_pattern, tpp_test_two_by_two,
-        try_factor_spral_small_leaf_subtree_serial, zero_dense_column_until,
+        spral_small_leaf_tpp_panel_stable_hash, spral_small_leaf_zero_col, symbolic_factor_pattern,
+        tpp_test_two_by_two, try_factor_spral_small_leaf_subtree_serial, zero_dense_column_until,
     };
 
     #[derive(Clone, Debug)]
@@ -14279,6 +14433,91 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         }
     }
 
+    fn native_small_leaf_ldlt_tpp_factor_from_capture(
+        shim: &NativeKernelShim,
+        capture: &SpralSmallLeafTppPanelCapture,
+    ) -> SmallLeafTppKernelResult {
+        debug_assert!(capture.n <= capture.m);
+        debug_assert!(capture.lcol.len() >= capture.n * capture.ldl);
+        let options = NumericFactorOptions {
+            action_on_zero_pivot: capture.action_on_zero_pivot,
+            threshold_pivot_u: capture.threshold_pivot_u,
+            small_pivot_tolerance: capture.small_pivot_tolerance,
+            ..NumericFactorOptions::default()
+        };
+        let mut lcol = capture.lcol.clone();
+        let mut perm = capture
+            .perm
+            .iter()
+            .map(|entry| *entry as c_int)
+            .collect::<Vec<_>>();
+        let mut diagonal = vec![0.0; 2 * capture.n.max(1)];
+        let mut ld = vec![0.0; 2 * capture.m.max(1)];
+        let eliminated = unsafe {
+            (shim.ldlt_tpp_factor)(
+                capture.m as c_int,
+                capture.n as c_int,
+                perm.as_mut_ptr(),
+                lcol.as_mut_ptr(),
+                capture.ldl as c_int,
+                diagonal.as_mut_ptr(),
+                ld.as_mut_ptr(),
+                capture.m as c_int,
+                i32::from(options.action_on_zero_pivot),
+                options.threshold_pivot_u,
+                options.small_pivot_tolerance,
+                0,
+                ptr::null_mut(),
+                0,
+            )
+        };
+        assert!(
+            eliminated >= 0,
+            "native captured small-leaf ldlt_tpp_factor returned {eliminated}"
+        );
+        SmallLeafTppKernelResult {
+            eliminated: eliminated as usize,
+            perm: perm.into_iter().map(|entry| entry as usize).collect(),
+            lcol,
+            ldl: capture.ldl,
+            diagonal,
+        }
+    }
+
+    fn rust_small_leaf_ldlt_tpp_factor_from_capture(
+        capture: &SpralSmallLeafTppPanelCapture,
+    ) -> SmallLeafTppKernelResult {
+        debug_assert!(capture.n <= capture.m);
+        debug_assert!(capture.lcol.len() >= capture.n * capture.ldl);
+        let options = NumericFactorOptions {
+            action_on_zero_pivot: capture.action_on_zero_pivot,
+            threshold_pivot_u: capture.threshold_pivot_u,
+            small_pivot_tolerance: capture.small_pivot_tolerance,
+            ..NumericFactorOptions::default()
+        };
+        let mut lcol = capture.lcol.clone();
+        let mut perm = capture.perm.clone();
+        let mut diagonal = vec![0.0; 2 * capture.n.max(1)];
+        let mut work = vec![0.0; 2 * capture.m.max(1)];
+        let eliminated = rust_small_leaf_ldlt_tpp_factor_kernel_in_place(
+            &mut lcol,
+            capture.ldl,
+            capture.m,
+            capture.n,
+            &mut perm,
+            &mut diagonal,
+            &mut work,
+            options,
+        );
+        SmallLeafTppKernelResult {
+            eliminated,
+            perm,
+            lcol,
+            ldl: capture.ldl,
+            diagonal,
+        }
+    }
+
     fn assert_small_leaf_tpp_kernel_results_equal(
         label: &str,
         rust: &SmallLeafTppKernelResult,
@@ -16927,6 +17166,72 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
                 assert_small_leaf_tpp_trace_steps_equal(&label, &rust, &native, dimension, ncol);
             }
         }
+    }
+
+    #[test]
+    fn small_leaf_tpp_panel_capture_replays_against_native_kernel() {
+        let Some(shim) = native_kernel_shim_or_skip() else {
+            return;
+        };
+        let options = NumericFactorOptions::default();
+        let size = 48;
+        let ncol = 20;
+        let dense = small_leaf_tpp_glider_shape_lower(1, size);
+        let (initial_lcol, ldl) = copy_lower_dense_to_small_leaf_lcol(&dense, size, ncol);
+        let expected_hash = spral_small_leaf_tpp_panel_stable_hash(
+            0,
+            size,
+            ncol,
+            ldl,
+            &(0..size).collect::<Vec<_>>(),
+            &(0..ncol).collect::<Vec<_>>(),
+            &initial_lcol[..ncol * ldl],
+            options,
+        );
+
+        debug_disable_spral_small_leaf_tpp_panel_captures();
+        debug_clear_spral_small_leaf_tpp_panel_captures();
+        let direct_rust =
+            rust_small_leaf_ldlt_tpp_factor_from_lower_dense(&dense, size, ncol, options);
+        let captures = debug_take_spral_small_leaf_tpp_panel_captures();
+        let capture = captures
+            .iter()
+            .find(|capture| capture.stable_hash == expected_hash)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected captured small-leaf panel hash {expected_hash:#018x}, got {:?}",
+                    captures
+                        .iter()
+                        .map(|capture| capture.stable_hash)
+                        .collect::<Vec<_>>()
+                )
+            });
+
+        assert_eq!(capture.front_id, 0);
+        assert_eq!(capture.m, size);
+        assert_eq!(capture.n, ncol);
+        assert_eq!(capture.ldl, ldl);
+        assert_eq!(capture.rows, (0..size).collect::<Vec<_>>());
+        assert_eq!(capture.perm, (0..ncol).collect::<Vec<_>>());
+        assert_eq!(capture.lcol, initial_lcol[..ncol * ldl]);
+        assert_eq!(capture.stable_hash, expected_hash);
+
+        let replayed_rust = rust_small_leaf_ldlt_tpp_factor_from_capture(capture);
+        let replayed_native = native_small_leaf_ldlt_tpp_factor_from_capture(shim, capture);
+        assert_small_leaf_tpp_kernel_results_equal(
+            "captured small-leaf TPP panel native replay",
+            &replayed_rust,
+            &replayed_native,
+            size,
+            ncol,
+        );
+        assert_small_leaf_tpp_kernel_results_equal(
+            "captured small-leaf TPP panel direct rust replay",
+            &direct_rust,
+            &replayed_rust,
+            size,
+            ncol,
+        );
     }
 
     #[test]

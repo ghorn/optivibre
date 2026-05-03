@@ -210,6 +210,32 @@ glider factor delta should be treated as a full small-leaf/front orchestration
 gap until we can time the exact glider panels on both sides or add native bucket
 timing for `SmallLeafNumericSubtree`.
 
+A native-free exact-panel capture hook now records each small-leaf TPP panel
+before Rust factorization. It captures `m`, `n`, `ldl`, row ids, pre-factor
+`perm`, lower `lcol`, numeric options, and a stable FNV hash. The focused
+`small_leaf_tpp_panel_capture_replays_against_native_kernel` test proves a
+captured panel can be replayed bitwise through both Rust and the source-built
+native `ldlt_tpp_factor` shim.
+
+Latest glider capture command:
+
+```text
+RAYON_NUM_THREADS=1 OMP_NUM_THREADS=1 OMP_CANCELLATION=true \
+AD_CODEGEN_REQUIRE_NATIVE_SPRAL_PARITY=1 \
+cargo test -p optimal_control_problems --release --features ipopt,native-spral-src \
+  print_current_glider_small_leaf_tpp_panel_capture_summary \
+  -- --ignored --nocapture
+```
+
+That run captured `235` exact glider small-leaf panels with total dense area
+`170752` and total lower entries `172140`; the largest panels were:
+
+| capture index | front | `m` | `n` | `ldl` | lower entries | hash |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `8` | `24` | `71` | `57` | `72` | `4104` | `0x5c45f34fbf8835fc` |
+| `169` | `208` | `70` | `55` | `70` | `3850` | `0x8983e2923e0e13c8` |
+| `152` | `191` | `70` | `55` | `70` | `3850` | `0x9c85e106818f2f6f` |
+
 A pointer-hoisted `while`-loop rewrite of the rank-1/2 update helpers preserved
 the native prefix trace but regressed the glider unprofiled factor profile to
 `1.256ms` vs native `1.039ms` (`1.210x`). It was rejected because it was a
@@ -230,7 +256,8 @@ next boundary is performance-parity work inside that branch:
 1. Do not continue blind Rust-only TPP loop rewrites. The release native/Rust
    TPP timing fixture shows synthetic panels are not slower in Rust, and the
    pointer-hoisted rewrite regressed the real glider profile. The next useful
-   step is exact-panel or native-bucket timing for `SmallLeafNumericSubtree`.
+   step is native timing of the exact captured glider panels or broader native
+   bucket timing for `SmallLeafNumericSubtree`.
    The stricter `small_leaf_aligned_tpp_prefix_trace_matches_native_kernel`
    fixture remains the correctness gate for any retained kernel change.
 2. Revisit contribution formation only after TPP narrows further; the

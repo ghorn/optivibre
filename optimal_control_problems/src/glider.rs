@@ -3322,6 +3322,81 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual glider SSIDS small-leaf TPP exact-panel capture helper"]
+    fn print_current_glider_small_leaf_tpp_panel_capture_summary() {
+        let dump = load_current_glider_iteration0_augmented_dump();
+        let symbolic = glider_iteration0_rust_symbolic(&dump);
+
+        ssids_rs::debug_disable_spral_small_leaf_tpp_panel_captures();
+        ssids_rs::debug_clear_spral_small_leaf_tpp_panel_captures();
+        let rust_exact = replay_rust_augmented_spral_unprofiled_with_symbolic(&dump, &symbolic);
+        let captures = ssids_rs::debug_take_spral_small_leaf_tpp_panel_captures();
+
+        assert!(
+            rust_exact.residual_inf <= 1e-10,
+            "rust residual too large: {rust_exact:?}"
+        );
+        assert!(
+            !captures.is_empty(),
+            "glider replay did not capture any small-leaf TPP panels"
+        );
+
+        let mut ordered = (0..captures.len()).collect::<Vec<_>>();
+        ordered.sort_by_key(|&index| {
+            let capture = &captures[index];
+            std::cmp::Reverse((
+                capture.m * capture.n,
+                capture.m,
+                capture.n,
+                capture.front_id,
+            ))
+        });
+        let total_lower_entries = captures
+            .iter()
+            .map(|capture| capture.lcol.len())
+            .sum::<usize>();
+        let total_dense_area = captures
+            .iter()
+            .map(|capture| capture.m * capture.n)
+            .sum::<usize>();
+        let limit = std::env::var("SSIDS_GLIDER_TPP_PANEL_CAPTURE_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(16)
+            .min(captures.len());
+
+        println!("\n=== glider small-leaf TPP exact-panel capture summary ===");
+        println!(
+            "  panels={} total_dense_area={} total_lower_entries={} residual={:.3e}",
+            captures.len(),
+            total_dense_area,
+            total_lower_entries,
+            rust_exact.residual_inf
+        );
+        println!("  top panels by m*n:");
+        for &index in ordered.iter().take(limit) {
+            let capture = &captures[index];
+            println!(
+                "    index={} front={} m={} n={} ldl={} lcol_len={} hash={:#018x} rows_prefix={:?} perm_prefix={:?}",
+                index,
+                capture.front_id,
+                capture.m,
+                capture.n,
+                capture.ldl,
+                capture.lcol.len(),
+                capture.stable_hash,
+                &capture.rows[..capture.rows.len().min(8)],
+                &capture.perm[..capture.perm.len().min(8)],
+            );
+        }
+
+        if std::env::var("SSIDS_GLIDER_TPP_PANEL_CAPTURE_PRINT_LITERAL").is_ok() {
+            let capture = &captures[ordered[0]];
+            println!("  largest_panel_debug={capture:#?}");
+        }
+    }
+
+    #[test]
     #[ignore = "manual release-oriented native-vs-rust SPRAL parity check"]
     fn glider_native_spral_matches_rust_spral_extremely_closely() {
         if NativeSpral::load().is_err() {
