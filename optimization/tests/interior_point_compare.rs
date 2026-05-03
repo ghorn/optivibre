@@ -5754,6 +5754,84 @@ fn compare_native_and_ipopt_nonfinite_trial_backtracks_like_eval_error() {
 }
 
 #[test]
+fn compare_native_and_ipopt_tiny_step_eval_error_falls_back_to_backtracking() {
+    skip_without_native_spral!();
+    let problem = NonFiniteFirstTrialQuadraticProblem;
+    let native = solve_nlp_interior_point(
+        &problem,
+        &[0.0],
+        &[],
+        &native_options_with(|options| {
+            options.max_iters = 1;
+            options.second_order_correction = false;
+            options.tiny_step_tol = 1e6;
+            options.tiny_step_y_tol = 1e6;
+        }),
+    );
+    let ipopt = solve_nlp_ipopt(
+        &problem,
+        &[0.0],
+        &[],
+        &ipopt_options_with(|options| {
+            options.max_iters = 1;
+            options
+                .raw_options
+                .push(IpoptRawOption::integer("max_soc", 0));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("tiny_step_tol", 1e6));
+            options
+                .raw_options
+                .push(IpoptRawOption::number("tiny_step_y_tol", 1e6));
+        }),
+    );
+
+    let native_state = match native {
+        Err(InteriorPointSolveError::MaxIterations {
+            iterations: 1,
+            context,
+        }) => context
+            .final_state
+            .expect("NLIP tiny-step eval-error witness should retain accepted state"),
+        other => panic!("native tiny-step eval-error status mismatch: {other:?}"),
+    };
+    let ipopt_state = match ipopt {
+        Err(IpoptSolveError::Solve {
+            status, snapshots, ..
+        }) => {
+            assert_eq!(status, IpoptRawStatus::MaximumIterationsExceeded);
+            snapshots
+                .into_iter()
+                .find(|snapshot| {
+                    snapshot.iteration == 1
+                        && snapshot.phase == optimization::IpoptIterationPhase::Regular
+                })
+                .expect("IPOPT tiny-step eval-error witness should retain accepted iteration")
+        }
+        other => panic!("IPOPT tiny-step eval-error status mismatch: {other:?}"),
+    };
+    assert_abs_diff_eq!(native_state.x[0], 0.5, epsilon = 1e-12);
+    assert_abs_diff_eq!(ipopt_state.x[0], 0.5, epsilon = 1e-12);
+    assert_abs_diff_eq!(
+        native_state.alpha_pr.expect("NLIP accepted alpha_pr"),
+        ipopt_state.alpha_pr,
+        epsilon = 1e-12
+    );
+    assert!(
+        !native_state
+            .events
+            .contains(&InteriorPointIterationEvent::TinyStep),
+        "evaluation failure should clear the unchecked tiny-step accept path before the regular backtracking accept"
+    );
+    let native_line_search = native_state
+        .line_search
+        .as_ref()
+        .expect("NLIP accepted state should retain line-search diagnostics");
+    assert_eq!(native_line_search.backtrack_count, 1);
+    assert_eq!(ipopt_state.line_search_trials, 2);
+}
+
+#[test]
 fn compare_native_and_ipopt_accept_every_trial_step() {
     skip_without_native_spral!();
     let problem = LinearlyConstrainedQuadraticProblem;
