@@ -162,6 +162,11 @@ interface ApiFrame {
   kite_attitudes_rpy_deg: [number, number, number][];
   kite_control_roll_pitch_deg: [number, number][];
   rabbit_targets_n: [number, number, number][];
+  phase_projected_n: [number, number, number][];
+  closest_disk_n: [number, number, number][];
+  disk_plane_projection_n: [number, number, number][];
+  lookahead_on_disk_n: [number, number, number][];
+  phase_slot_n: [number, number, number][];
   phase_error: number[];
   speed_target: number[];
   altitude: number[];
@@ -184,6 +189,10 @@ interface ApiFrame {
   body_omega_b: [number, number, number][];
   orbit_radius: number[];
   rabbit_radius: number[];
+  rabbit_distance: number[];
+  rabbit_target_distance: number[];
+  rabbit_bearing_y_deg: number[];
+  rabbit_vector_b: [number, number, number][];
   curvature_y_b: number[];
   curvature_y_ref: number[];
   curvature_y_est: number[];
@@ -359,6 +368,12 @@ const controlFeaturesEnabledInput = document.querySelector<HTMLInputElement>(
 )!;
 const controlFeatureLinesEnabledInput = document.querySelector<HTMLInputElement>(
   "#control-feature-lines-enabled"
+)!;
+const controlFeaturesAtTargetAltitudeInput = document.querySelector<HTMLInputElement>(
+  "#control-features-at-target-altitude"
+)!;
+const controlFeaturesAtAircraftAltitudeInput = document.querySelector<HTMLInputElement>(
+  "#control-features-at-aircraft-altitude"
 )!;
 const controlFeatureScaleInput = document.querySelector<HTMLInputElement>("#control-feature-scale")!;
 const tetherNodesEnabledInput = document.querySelector<HTMLInputElement>("#tether-nodes-enabled")!;
@@ -651,6 +666,19 @@ const controlRingLine = new THREE.LineLoop(
 controlRingLine.visible = false;
 scene.add(controlRingLine);
 
+const aircraftControlRingLine = new THREE.LineLoop(
+  new THREE.BufferGeometry(),
+  new THREE.LineBasicMaterial({
+    color: 0x36d5c1,
+    transparent: true,
+    opacity: 0.26
+  })
+);
+aircraftControlRingLine.visible = false;
+scene.add(aircraftControlRingLine);
+
+type ControlFeatureAltitudeLayer = "target" | "aircraft";
+
 const CONTROL_VIS_COLORS = {
   lookahead: "#ff5c74",
   lookaheadOnDisk: "#ff7a66",
@@ -673,9 +701,60 @@ const projectedPhaseMeshes: THREE.Mesh[] = [];
 const guidanceLines: THREE.Line[] = [];
 const lookaheadRadialOffsetLines: THREE.Line[] = [];
 const projectedToDiskLines: THREE.Line[] = [];
-const aircraftToDiskPlaneLines: THREE.Line[] = [];
 const phaseSlotToClosestDiskLines: THREE.Line[] = [];
 const phaseSlotMeshes: THREE.Mesh[] = [];
+const aircraftRabbitMeshes: THREE.Mesh[] = [];
+const aircraftLookaheadOnDiskMeshes: THREE.Mesh[] = [];
+const aircraftProjectedPhaseMeshes: THREE.Mesh[] = [];
+const aircraftGuidanceLines: THREE.Line[] = [];
+const aircraftLookaheadRadialOffsetLines: THREE.Line[] = [];
+const aircraftProjectedToDiskLines: THREE.Line[] = [];
+const aircraftPhaseSlotToClosestDiskLines: THREE.Line[] = [];
+const aircraftPhaseSlotMeshes: THREE.Mesh[] = [];
+
+interface ControlFeatureLayerMeshes {
+  mode: ControlFeatureAltitudeLayer;
+  controlRingLine: THREE.LineLoop;
+  rabbitMeshes: THREE.Mesh[];
+  lookaheadOnDiskMeshes: THREE.Mesh[];
+  projectedPhaseMeshes: THREE.Mesh[];
+  guidanceLines: THREE.Line[];
+  lookaheadRadialOffsetLines: THREE.Line[];
+  projectedToDiskLines: THREE.Line[];
+  phaseSlotToClosestDiskLines: THREE.Line[];
+  phaseSlotMeshes: THREE.Mesh[];
+}
+
+const targetControlFeatureLayer: ControlFeatureLayerMeshes = {
+  mode: "target",
+  controlRingLine,
+  rabbitMeshes,
+  lookaheadOnDiskMeshes,
+  projectedPhaseMeshes,
+  guidanceLines,
+  lookaheadRadialOffsetLines,
+  projectedToDiskLines,
+  phaseSlotToClosestDiskLines,
+  phaseSlotMeshes
+};
+
+const aircraftControlFeatureLayer: ControlFeatureLayerMeshes = {
+  mode: "aircraft",
+  controlRingLine: aircraftControlRingLine,
+  rabbitMeshes: aircraftRabbitMeshes,
+  lookaheadOnDiskMeshes: aircraftLookaheadOnDiskMeshes,
+  projectedPhaseMeshes: aircraftProjectedPhaseMeshes,
+  guidanceLines: aircraftGuidanceLines,
+  lookaheadRadialOffsetLines: aircraftLookaheadRadialOffsetLines,
+  projectedToDiskLines: aircraftProjectedToDiskLines,
+  phaseSlotToClosestDiskLines: aircraftPhaseSlotToClosestDiskLines,
+  phaseSlotMeshes: aircraftPhaseSlotMeshes
+};
+
+const controlFeatureLayers: ControlFeatureLayerMeshes[] = [
+  targetControlFeatureLayer,
+  aircraftControlFeatureLayer
+];
 const commonSegmentMeshes: THREE.Mesh[] = [];
 const commonNodeMeshes: THREE.Mesh[] = [];
 const upperSegmentMeshes: THREE.Mesh[][] = [];
@@ -931,6 +1010,7 @@ let playbackStartWallTimeMs: number | null = null;
 let playbackStartSimTime = 0;
 let shouldSnapOrbitTargetToFrame = true;
 let lastRenderedFrame: ApiFrame | null = null;
+let hasRenderedSimulationFrame = false;
 let lastCameraFollowHeadingRad: number | null = null;
 let lastCameraFollowTarget: CameraFollowTarget | null = null;
 let lastAirflowFrameTime: number | null = null;
@@ -1002,10 +1082,12 @@ const MAX_PLOT_COLUMNS = 3;
 const PLOT_GROUP_HEIGHT_PX = 330;
 const LIMITER_TIMELINE_HEIGHT_PX = 280;
 const GRAVITY_MPS2 = 9.80665;
+const RAD_TO_DEG = 180 / Math.PI;
 let activePlotSections: ActivePlotSection[] = [];
 let plotKiteVisibility: boolean[] = [];
 let plotSignalVisibility = new Map<string, boolean>();
 let collapsedPlotSections = new Set<string>();
+let activePlotTabKey: string | null = null;
 let syncingPlotXAxes = false;
 
 interface KiteBreakdownTraceDefinition {
@@ -1779,6 +1861,20 @@ function controlFeatureLinesVisible(): boolean {
   return controlFeatureLinesEnabledInput.checked;
 }
 
+function controlFeaturesAtTargetAltitude(): boolean {
+  return controlFeaturesAtTargetAltitudeInput.checked;
+}
+
+function controlFeaturesAtAircraftAltitude(): boolean {
+  return controlFeaturesAtAircraftAltitudeInput.checked;
+}
+
+function controlFeatureLayerVisible(layer: ControlFeatureAltitudeLayer): boolean {
+  return layer === "aircraft"
+    ? controlFeaturesAtAircraftAltitude()
+    : controlFeaturesAtTargetAltitude();
+}
+
 function controlFeatureScale(): number {
   return clampedInputValue(controlFeatureScaleInput, 0.5, 0.05, 8);
 }
@@ -1933,10 +2029,12 @@ function applyAirParticleOpacity(): void {
 function applyVisualizationScales(): void {
   const markerScale = controlFeatureScale();
   payloadMesh.scale.setScalar(markerScale);
-  rabbitMeshes.forEach((mesh) => mesh.scale.setScalar(markerScale));
-  lookaheadOnDiskMeshes.forEach((mesh) => mesh.scale.setScalar(markerScale));
-  projectedPhaseMeshes.forEach((mesh) => mesh.scale.setScalar(markerScale));
-  phaseSlotMeshes.forEach((mesh) => mesh.scale.setScalar(markerScale));
+  controlFeatureLayers.forEach((layer) => {
+    layer.rabbitMeshes.forEach((mesh) => mesh.scale.setScalar(markerScale));
+    layer.lookaheadOnDiskMeshes.forEach((mesh) => mesh.scale.setScalar(markerScale));
+    layer.projectedPhaseMeshes.forEach((mesh) => mesh.scale.setScalar(markerScale));
+    layer.phaseSlotMeshes.forEach((mesh) => mesh.scale.setScalar(markerScale));
+  });
 
   const nodeScale = tetherNodeScale();
   commonNodeMeshes.forEach((mesh) => {
@@ -1976,37 +2074,42 @@ function applyVisualizationVisibility(): void {
     });
   });
 
-  rabbitMeshes.forEach((mesh, kiteIndex) => {
-    mesh.visible = showControlFeatures && (!frame || kiteIndex < kiteCount);
-  });
-  lookaheadOnDiskMeshes.forEach((mesh, kiteIndex) => {
-    mesh.visible = showControlFeatures && (!frame || kiteIndex < kiteCount);
-  });
-  projectedPhaseMeshes.forEach((mesh, kiteIndex) => {
-    mesh.visible = showControlFeatures && (!frame || kiteIndex < kiteCount);
-  });
-  [
-    guidanceLines,
-    lookaheadRadialOffsetLines,
-    projectedToDiskLines,
-    aircraftToDiskPlaneLines,
-    phaseSlotToClosestDiskLines
-  ].forEach((lines) => {
-    lines.forEach((line, kiteIndex) => {
-      line.visible = showControlLines && (!frame || kiteIndex < kiteCount);
+  controlFeatureLayers.forEach((layer) => {
+    const layerVisible = controlFeatureLayerVisible(layer.mode);
+    const markerVisible = showControlFeatures && layerVisible;
+    const lineVisible = showControlLines && layerVisible;
+    layer.rabbitMeshes.forEach((mesh, kiteIndex) => {
+      mesh.visible = markerVisible && (!frame || kiteIndex < kiteCount);
     });
-  });
-  phaseSlotMeshes.forEach((mesh) => {
-    mesh.visible = showControlFeatures && mesh.visible;
+    layer.lookaheadOnDiskMeshes.forEach((mesh, kiteIndex) => {
+      mesh.visible = markerVisible && (!frame || kiteIndex < kiteCount);
+    });
+    layer.projectedPhaseMeshes.forEach((mesh, kiteIndex) => {
+      mesh.visible = markerVisible && (!frame || kiteIndex < kiteCount);
+    });
+    [
+      layer.guidanceLines,
+      layer.lookaheadRadialOffsetLines,
+      layer.projectedToDiskLines,
+      layer.phaseSlotToClosestDiskLines
+    ].forEach((lines) => {
+      lines.forEach((line, kiteIndex) => {
+        line.visible = lineVisible && (!frame || kiteIndex < kiteCount);
+      });
+    });
+    layer.phaseSlotMeshes.forEach((mesh, kiteIndex) => {
+      mesh.visible = markerVisible && (!frame || kiteIndex < kiteCount);
+    });
   });
 
   applyFogVisibility();
   applyAirParticleOpacity();
   applyVisualizationScales();
   if (frame) {
-    updateControlRing(frame);
+    renderFrame(frame);
   } else {
     controlRingLine.visible = false;
+    aircraftControlRingLine.visible = false;
   }
   updateControlLabels();
 }
@@ -2738,7 +2841,7 @@ function resetPlaybackState(label: string, rate: number | null): void {
   currentPlaybackRate = rate;
   playbackStartWallTimeMs = null;
   playbackStartSimTime = 0;
-  shouldSnapOrbitTargetToFrame = true;
+  shouldSnapOrbitTargetToFrame = !hasRenderedSimulationFrame && currentCameraFollowTarget() === "manual";
   lastRenderedFrame = null;
   observedTetherTensionMin = Number.POSITIVE_INFINITY;
   observedTetherTensionMax = Number.NEGATIVE_INFINITY;
@@ -3229,9 +3332,9 @@ function buildOrbitRadiusGroup(kiteCount: number): PlotGroupDefinition {
 function buildPhaseErrorGroup(kiteCount: number): PlotGroupDefinition {
   return buildPerKiteGroup(
     kiteCount,
-    "Phase Error (rad)",
-    "rad",
-    (frame, kiteIndex) => frame.phase_error[kiteIndex] ?? 0,
+    "Phase Error (deg)",
+    "deg",
+    (frame, kiteIndex) => (frame.phase_error[kiteIndex] ?? 0) * RAD_TO_DEG,
     undefined,
     [
       {
@@ -3241,6 +3344,66 @@ function buildPhaseErrorGroup(kiteCount: number): PlotGroupDefinition {
         value: () => 0
       }
     ]
+  );
+}
+
+function buildRabbitBearingGroup(kiteCount: number): PlotGroupDefinition {
+  return buildPerKiteGroup(
+    kiteCount,
+    "Rabbit Bearing Error (deg)",
+    "deg",
+    (frame, kiteIndex) => frame.rabbit_bearing_y_deg[kiteIndex] ?? 0,
+    undefined,
+    [
+      {
+        name: "Zero Ref",
+        color: ZERO_REF_COLOR,
+        dash: "dash",
+        value: () => 0
+      }
+    ]
+  );
+}
+
+function buildRabbitDistanceGroup(kiteCount: number): PlotGroupDefinition {
+  return buildPerKiteGroup(
+    kiteCount,
+    "Rabbit Lead / Target Distance (m)",
+    "m",
+    (frame, kiteIndex) => frame.rabbit_target_distance[kiteIndex] ?? 0,
+    (frame, kiteIndex) => frame.rabbit_distance[kiteIndex] ?? 0
+  );
+}
+
+function buildRabbitVectorGroup(kiteCount: number): PlotGroupDefinition {
+  return buildPerKiteBreakdownGroup(kiteCount, "Rabbit Vector in Body Frame (m)", "m", [
+    {
+      name: "Forward x",
+      alpha: 0.95,
+      value: (frame, kiteIndex) => bodyComponent(frame.rabbit_vector_b, kiteIndex, 0)
+    },
+    {
+      name: "Lateral y",
+      alpha: 0.78,
+      dash: "dash",
+      value: (frame, kiteIndex) => bodyComponent(frame.rabbit_vector_b, kiteIndex, 1)
+    },
+    {
+      name: "Vertical z",
+      alpha: 0.62,
+      dash: "dot",
+      defaultVisible: false,
+      value: (frame, kiteIndex) => bodyComponent(frame.rabbit_vector_b, kiteIndex, 2)
+    }
+  ]);
+}
+
+function buildSpeedTargetGroup(kiteCount: number): PlotGroupDefinition {
+  return buildPerKiteGroup(
+    kiteCount,
+    "Scheduled Speed Target (m/s)",
+    "m/s",
+    (frame, kiteIndex) => frame.speed_target[kiteIndex] ?? 0
   );
 }
 
@@ -4053,8 +4216,12 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
       description:
         "Outer lateral path loop. Phase coordination biases rabbit radius and speed scheduling; desired speed schedules rabbit lead distance before the target point feeds the selected guidance mode.",
       groups: [
+        buildRabbitBearingGroup(kiteCount),
+        buildRabbitVectorGroup(kiteCount),
+        buildRabbitDistanceGroup(kiteCount),
         buildOrbitRadiusGroup(kiteCount),
-        buildPhaseErrorGroup(kiteCount)
+        buildPhaseErrorGroup(kiteCount),
+        buildSpeedTargetGroup(kiteCount)
       ]
     },
     {
@@ -4614,7 +4781,10 @@ function formatRunSummary(
         label: "Accepted / Rejected",
         value: `${summary.accepted_steps} / ${summary.rejected_steps}`
       },
-      { label: "Max Phase Error", value: summary.max_phase_error.toFixed(4) },
+      {
+        label: "Max Phase Error",
+        value: `${(summary.max_phase_error * RAD_TO_DEG).toFixed(2)} deg`
+      },
       { label: "Final Motor Work", value: summary.final_total_work.toFixed(3) },
       {
         label: "Final Dissipated Work",
@@ -5450,6 +5620,17 @@ function makeLookaheadOnDiskMesh(): THREE.Mesh {
   );
 }
 
+function makeRabbitMesh(): THREE.Mesh {
+  return new THREE.Mesh(
+    new THREE.SphereGeometry(2.4, 12, 12),
+    new THREE.MeshStandardMaterial({
+      color: controlLookaheadColor,
+      emissive: controlLookaheadColor,
+      emissiveIntensity: 0.32
+    })
+  );
+}
+
 function makePhaseSlotMesh(): THREE.Mesh {
   return new THREE.Mesh(
     new THREE.SphereGeometry(1.25, 12, 12),
@@ -5528,34 +5709,35 @@ function renderTether(
   }
 }
 
-function updateControlRing(frame: ApiFrame): void {
+function updateControlRing(frame: ApiFrame, layer: ControlFeatureLayerMeshes): void {
   const kiteCount = frame.kite_positions_n.length;
   const ringVisible = kiteCount > 0 && frame.control_ring_radius > 1.0e-6;
-  controlRingLine.visible = ringVisible && controlDiskEnabledInput.checked;
+  const layerVisible = controlFeatureLayerVisible(layer.mode);
+  layer.controlRingLine.visible = ringVisible && controlDiskEnabledInput.checked && layerVisible;
 
   if (!ringVisible) {
-    phaseSlotMeshes.forEach((mesh) => {
+    layer.phaseSlotMeshes.forEach((mesh) => {
       mesh.visible = false;
     });
     return;
   }
 
-  const center = frame.control_ring_center_n;
   const radius = frame.control_ring_radius;
+  const ringDown = displayControlRingDown(frame, layer.mode);
   const ringPoints = Array.from({ length: CONTROL_RING_SEGMENTS }, (_, index) => {
     const theta = (2 * Math.PI * index) / CONTROL_RING_SEGMENTS;
-    return controlRingPoint(frame, theta, radius);
+    return controlRingPoint(frame, theta, radius, ringDown);
   });
-  (controlRingLine.geometry as THREE.BufferGeometry).setFromPoints(ringPoints);
+  (layer.controlRingLine.geometry as THREE.BufferGeometry).setFromPoints(ringPoints);
 
   const showAdaptiveSlots = activeSummaryRequest?.phase_mode === "adaptive";
-  ensureMeshCount(showAdaptiveSlots ? kiteCount : 0, phaseSlotMeshes, makePhaseSlotMesh);
+  ensureMeshCount(showAdaptiveSlots ? kiteCount : 0, layer.phaseSlotMeshes, makePhaseSlotMesh);
   if (showAdaptiveSlots) {
     for (let index = 0; index < kiteCount; index += 1) {
-      phaseSlotMeshes[index].visible = controlFeaturesVisible();
-      phaseSlotMeshes[index].position.copy(phaseSlotPosition(frame, index));
+      layer.phaseSlotMeshes[index].visible = controlFeaturesVisible() && layerVisible;
+      layer.phaseSlotMeshes[index].position.copy(phaseSlotPosition(frame, index, layer.mode));
       setMaterialColor(
-        phaseSlotMeshes[index].material,
+        layer.phaseSlotMeshes[index].material,
         controlPhaseSlotColor,
         0.18
       );
@@ -5563,70 +5745,135 @@ function updateControlRing(frame: ApiFrame): void {
   }
 }
 
-function controlRingPoint(frame: ApiFrame, theta: number, radius = frame.control_ring_radius): THREE.Vector3 {
+function updateControlRings(frame: ApiFrame): void {
+  controlFeatureLayers.forEach((layer) => updateControlRing(frame, layer));
+}
+
+function averageKiteDown(frame: ApiFrame): number {
+  if (frame.kite_positions_n.length === 0) {
+    return frame.control_ring_center_n[2];
+  }
+  return frame.kite_positions_n.reduce((sum, position) => sum + position[2], 0) /
+    frame.kite_positions_n.length;
+}
+
+function displayControlRingDown(frame: ApiFrame, layer: ControlFeatureAltitudeLayer): number {
+  return layer === "aircraft" ? averageKiteDown(frame) : frame.control_ring_center_n[2];
+}
+
+function displayFeatureDown(
+  frame: ApiFrame,
+  kiteIndex: number,
+  layer: ControlFeatureAltitudeLayer
+): number | null {
+  if (layer !== "aircraft") {
+    return null;
+  }
+  return frame.kite_positions_n[kiteIndex]?.[2] ?? frame.control_ring_center_n[2];
+}
+
+function toDisplayDiskFeature(
+  frame: ApiFrame,
+  kiteIndex: number,
+  point: [number, number, number],
+  layer: ControlFeatureAltitudeLayer
+): THREE.Vector3 {
+  const featureDown = displayFeatureDown(frame, kiteIndex, layer);
+  return toThree([point[0], point[1], featureDown ?? point[2]]);
+}
+
+function controlRingPoint(
+  frame: ApiFrame,
+  theta: number,
+  radius = frame.control_ring_radius,
+  down = frame.control_ring_center_n[2]
+): THREE.Vector3 {
   const center = frame.control_ring_center_n;
   return toThree([
     center[0] + radius * Math.cos(theta),
     center[1] + radius * Math.sin(theta),
-    center[2]
+    down
   ]);
-}
-
-function phaseAngleForPosition(frame: ApiFrame, position: [number, number, number]): number {
-  const controlCenter = frame.control_ring_center_n;
-  return Math.atan2(position[1] - controlCenter[1], position[0] - controlCenter[0]);
-}
-
-function adaptiveFormationPhaseOffset(frame: ApiFrame): number {
-  const kiteCount = frame.kite_positions_n.length;
-  if (kiteCount === 0) {
-    return 0;
-  }
-  let sinSum = 0;
-  let cosSum = 0;
-  frame.kite_positions_n.forEach((position, index) => {
-    const desiredSlot = (2 * Math.PI * index) / kiteCount;
-    const slotError = wrapAngleRad(phaseAngleForPosition(frame, position) - desiredSlot);
-    sinSum += Math.sin(slotError);
-    cosSum += Math.cos(slotError);
-  });
-  if (Math.abs(sinSum) < 1.0e-12 && Math.abs(cosSum) < 1.0e-12) {
-    return 0;
-  }
-  return Math.atan2(sinSum, cosSum);
 }
 
 function projectedPhasePosition(
   frame: ApiFrame,
   kiteIndex: number,
-  position: [number, number, number]
+  layer: ControlFeatureAltitudeLayer
 ): THREE.Vector3 {
-  const phaseAngle = phaseAngleForPosition(frame, position);
-  const orbitRadius = frame.orbit_radius[kiteIndex] ?? frame.control_ring_radius;
-  return controlRingPoint(frame, phaseAngle, orbitRadius);
+  return toDisplayDiskFeature(
+    frame,
+    kiteIndex,
+    frame.phase_projected_n[kiteIndex] ?? frame.kite_positions_n[kiteIndex],
+    layer
+  );
 }
 
-function closestDiskPosition(frame: ApiFrame, position: [number, number, number]): THREE.Vector3 {
-  return controlRingPoint(frame, phaseAngleForPosition(frame, position), frame.control_ring_radius);
+function closestDiskPosition(
+  frame: ApiFrame,
+  kiteIndex: number,
+  layer: ControlFeatureAltitudeLayer
+): THREE.Vector3 {
+  return toDisplayDiskFeature(
+    frame,
+    kiteIndex,
+    frame.closest_disk_n[kiteIndex] ?? frame.kite_positions_n[kiteIndex],
+    layer
+  );
 }
 
 function diskPlaneProjectionPosition(
   frame: ApiFrame,
-  position: [number, number, number]
+  kiteIndex: number,
+  layer: ControlFeatureAltitudeLayer
 ): THREE.Vector3 {
-  return toThree([position[0], position[1], frame.control_ring_center_n[2]]);
+  return toDisplayDiskFeature(
+    frame,
+    kiteIndex,
+    frame.disk_plane_projection_n[kiteIndex] ?? frame.kite_positions_n[kiteIndex],
+    layer
+  );
 }
 
-function lookaheadOnDiskPosition(frame: ApiFrame, kiteIndex: number): THREE.Vector3 {
-  const target = frame.rabbit_targets_n[kiteIndex] ?? frame.kite_positions_n[kiteIndex];
-  return controlRingPoint(frame, phaseAngleForPosition(frame, target), frame.control_ring_radius);
+function lookaheadOnDiskPosition(
+  frame: ApiFrame,
+  kiteIndex: number,
+  layer: ControlFeatureAltitudeLayer
+): THREE.Vector3 {
+  return toDisplayDiskFeature(
+    frame,
+    kiteIndex,
+    frame.lookahead_on_disk_n[kiteIndex] ??
+      frame.rabbit_targets_n[kiteIndex] ??
+      frame.kite_positions_n[kiteIndex],
+    layer
+  );
 }
 
-function phaseSlotPosition(frame: ApiFrame, kiteIndex: number): THREE.Vector3 {
-  const kiteCount = frame.kite_positions_n.length;
-  const formationPhase = adaptiveFormationPhaseOffset(frame);
-  const theta = formationPhase + (2 * Math.PI * kiteIndex) / Math.max(1, kiteCount);
-  return controlRingPoint(frame, theta);
+function rabbitTargetPosition(
+  frame: ApiFrame,
+  kiteIndex: number,
+  layer: ControlFeatureAltitudeLayer
+): THREE.Vector3 {
+  return toDisplayDiskFeature(
+    frame,
+    kiteIndex,
+    frame.rabbit_targets_n[kiteIndex] ?? frame.kite_positions_n[kiteIndex],
+    layer
+  );
+}
+
+function phaseSlotPosition(
+  frame: ApiFrame,
+  kiteIndex: number,
+  layer: ControlFeatureAltitudeLayer
+): THREE.Vector3 {
+  return toDisplayDiskFeature(
+    frame,
+    kiteIndex,
+    frame.phase_slot_n[kiteIndex] ?? frame.kite_positions_n[kiteIndex],
+    layer
+  );
 }
 
 interface ControlLabelSpec {
@@ -5677,6 +5924,8 @@ function updateControlLabels(): void {
   const frame = lastRenderedFrame;
   const enabled =
     controlLabelsEnabledInput.checked &&
+    controlFeaturesVisible() &&
+    (controlFeaturesAtTargetAltitude() || controlFeaturesAtAircraftAltitude()) &&
     frame &&
     frame.kite_positions_n.length > 0;
   controlLabelLayer.classList.toggle("visible", Boolean(enabled));
@@ -5689,33 +5938,35 @@ function updateControlLabels(): void {
 
   const specs: ControlLabelSpec[] = [];
   const showAdaptiveSlots = activeSummaryRequest?.phase_mode === "adaptive";
+  const labelLayer: ControlFeatureAltitudeLayer =
+    controlFeaturesAtTargetAltitude() ? "target" : "aircraft";
 
-  frame.kite_positions_n.forEach((position, kiteIndex) => {
+  frame.kite_positions_n.forEach((_position, kiteIndex) => {
     const kiteLabel = `K${kiteIndex + 1}`;
     specs.push({
       key: `lookahead-${kiteIndex}`,
       text: `${kiteLabel} lookahead`,
       color: CONTROL_VIS_COLORS.lookahead,
-      position: toThree(frame.rabbit_targets_n[kiteIndex] ?? position)
+      position: rabbitTargetPosition(frame, kiteIndex, labelLayer)
     });
     specs.push({
       key: `lookahead-disk-${kiteIndex}`,
       text: `${kiteLabel} lookahead on disk`,
       color: CONTROL_VIS_COLORS.lookaheadOnDisk,
-      position: lookaheadOnDiskPosition(frame, kiteIndex)
+      position: lookaheadOnDiskPosition(frame, kiteIndex, labelLayer)
     });
     specs.push({
       key: `projected-${kiteIndex}`,
       text: `${kiteLabel} projected phase`,
       color: CONTROL_VIS_COLORS.projectedPhase,
-      position: projectedPhasePosition(frame, kiteIndex, position)
+      position: projectedPhasePosition(frame, kiteIndex, labelLayer)
     });
     if (showAdaptiveSlots) {
       specs.push({
         key: `slot-${kiteIndex}`,
         text: `${kiteLabel} phase slot`,
         color: CONTROL_VIS_COLORS.phaseSlot,
-        position: phaseSlotPosition(frame, kiteIndex)
+        position: phaseSlotPosition(frame, kiteIndex, labelLayer)
       });
     }
   });
@@ -5944,14 +6195,7 @@ function ensureKites(count: number, frame: ApiFrame): void {
     kiteMeshes.push(group);
     scene.add(group);
 
-    const rabbit = new THREE.Mesh(
-      new THREE.SphereGeometry(2.4, 12, 12),
-      new THREE.MeshStandardMaterial({
-        color: controlLookaheadColor,
-        emissive: controlLookaheadColor,
-        emissiveIntensity: 0.32
-      })
-    );
+    const rabbit = makeRabbitMesh();
     rabbitMeshes.push(rabbit);
     scene.add(rabbit);
 
@@ -5975,13 +6219,37 @@ function ensureKites(count: number, frame: ApiFrame): void {
     projectedToDiskLines.push(projectedToDiskLine);
     scene.add(projectedToDiskLine);
 
-    const aircraftToDiskPlaneLine = makeSceneLine(0xd6c3ff, 0.38);
-    aircraftToDiskPlaneLines.push(aircraftToDiskPlaneLine);
-    scene.add(aircraftToDiskPlaneLine);
-
     const phaseSlotToClosestDiskLine = makeSceneLine(0xff7a66, 0.42);
     phaseSlotToClosestDiskLines.push(phaseSlotToClosestDiskLine);
     scene.add(phaseSlotToClosestDiskLine);
+
+    const aircraftRabbit = makeRabbitMesh();
+    aircraftRabbitMeshes.push(aircraftRabbit);
+    scene.add(aircraftRabbit);
+
+    const aircraftLookaheadOnDisk = makeLookaheadOnDiskMesh();
+    aircraftLookaheadOnDiskMeshes.push(aircraftLookaheadOnDisk);
+    scene.add(aircraftLookaheadOnDisk);
+
+    const aircraftProjectedPhase = makeProjectedPhaseMesh();
+    aircraftProjectedPhaseMeshes.push(aircraftProjectedPhase);
+    scene.add(aircraftProjectedPhase);
+
+    const aircraftGuidanceLine = makeFadedSceneLine(0xff5c74);
+    aircraftGuidanceLines.push(aircraftGuidanceLine);
+    scene.add(aircraftGuidanceLine);
+
+    const aircraftLookaheadRadialOffsetLine = makeSceneLine(0xff7a66, 0.44);
+    aircraftLookaheadRadialOffsetLines.push(aircraftLookaheadRadialOffsetLine);
+    scene.add(aircraftLookaheadRadialOffsetLine);
+
+    const aircraftProjectedToDiskLine = makeSceneLine(0xd6c3ff, 0.36);
+    aircraftProjectedToDiskLines.push(aircraftProjectedToDiskLine);
+    scene.add(aircraftProjectedToDiskLine);
+
+    const aircraftPhaseSlotToClosestDiskLine = makeSceneLine(0xff7a66, 0.34);
+    aircraftPhaseSlotToClosestDiskLines.push(aircraftPhaseSlotToClosestDiskLine);
+    scene.add(aircraftPhaseSlotToClosestDiskLine);
 
     upperSegmentMeshes.push([]);
     upperNodeMeshes.push([]);
@@ -5989,17 +6257,23 @@ function ensureKites(count: number, frame: ApiFrame): void {
 
   kiteMeshes.forEach((mesh, index) => {
     const visible = index < count;
-    const markerVisible = visible && controlFeaturesVisible();
-    const lineVisible = visible && controlFeatureLinesVisible();
     mesh.visible = visible;
-    rabbitMeshes[index].visible = markerVisible;
-    lookaheadOnDiskMeshes[index].visible = markerVisible;
-    projectedPhaseMeshes[index].visible = markerVisible;
-    guidanceLines[index].visible = lineVisible;
-    lookaheadRadialOffsetLines[index].visible = lineVisible;
-    projectedToDiskLines[index].visible = lineVisible;
-    aircraftToDiskPlaneLines[index].visible = lineVisible;
-    phaseSlotToClosestDiskLines[index].visible = lineVisible;
+    controlFeatureLayers.forEach((layer) => {
+      const layerVisible = controlFeatureLayerVisible(layer.mode);
+      const markerVisible = visible && controlFeaturesVisible() && layerVisible;
+      const lineVisible = visible && controlFeatureLinesVisible() && layerVisible;
+      layer.rabbitMeshes[index].visible = markerVisible;
+      layer.lookaheadOnDiskMeshes[index].visible = markerVisible;
+      layer.projectedPhaseMeshes[index].visible = markerVisible;
+      layer.guidanceLines[index].visible = lineVisible;
+      layer.lookaheadRadialOffsetLines[index].visible = lineVisible;
+      layer.projectedToDiskLines[index].visible = lineVisible;
+      layer.phaseSlotToClosestDiskLines[index].visible = lineVisible;
+      const phaseSlotMesh = layer.phaseSlotMeshes[index];
+      if (phaseSlotMesh) {
+        phaseSlotMesh.visible = markerVisible;
+      }
+    });
     upperSegmentMeshes[index].forEach((segment) => {
       segment.visible = visible;
     });
@@ -6010,11 +6284,93 @@ function ensureKites(count: number, frame: ApiFrame): void {
   applyVisualizationScales();
 }
 
+function renderControlFeatureLayer(
+  frame: ApiFrame,
+  index: number,
+  layer: ControlFeatureLayerMeshes,
+  showAdaptiveSlots: boolean
+): void {
+  const rabbitMesh = layer.rabbitMeshes[index];
+  const lookaheadOnDiskMesh = layer.lookaheadOnDiskMeshes[index];
+  const projectedPhaseMesh = layer.projectedPhaseMeshes[index];
+  const guidanceLine = layer.guidanceLines[index];
+  const lookaheadRadialOffsetLine = layer.lookaheadRadialOffsetLines[index];
+  const projectedToDiskLine = layer.projectedToDiskLines[index];
+  const phaseSlotToClosestDiskLine = layer.phaseSlotToClosestDiskLines[index];
+  if (
+    !rabbitMesh ||
+    !lookaheadOnDiskMesh ||
+    !projectedPhaseMesh ||
+    !guidanceLine ||
+    !lookaheadRadialOffsetLine ||
+    !projectedToDiskLine ||
+    !phaseSlotToClosestDiskLine
+  ) {
+    return;
+  }
+
+  const layerVisible = controlFeatureLayerVisible(layer.mode);
+  const showControlFeatures = controlFeaturesVisible() && layerVisible;
+  const showControlLines = controlFeatureLinesVisible() && layerVisible;
+  const rabbitPosition = rabbitTargetPosition(frame, index, layer.mode);
+
+  rabbitMesh.position.copy(rabbitPosition);
+  rabbitMesh.visible = showControlFeatures;
+  setMaterialColor(rabbitMesh.material, controlLookaheadColor, 0.34);
+
+  const lookaheadOnDisk = lookaheadOnDiskPosition(frame, index, layer.mode);
+  lookaheadOnDiskMesh.position.copy(lookaheadOnDisk);
+  lookaheadOnDiskMesh.visible = showControlFeatures;
+  setMaterialColor(lookaheadOnDiskMesh.material, controlLookaheadOnDiskColor, 0.22);
+
+  const projectedPhase = projectedPhasePosition(frame, index, layer.mode);
+  const closestDisk = closestDiskPosition(frame, index, layer.mode);
+  const diskPlaneProjection = diskPlaneProjectionPosition(frame, index, layer.mode);
+  projectedPhaseMesh.position.copy(projectedPhase);
+  projectedPhaseMesh.visible = showControlFeatures;
+  setMaterialColor(projectedPhaseMesh.material, controlProjectedPhaseColor, 0.28);
+
+  const phaseSlot = phaseSlotPosition(frame, index, layer.mode);
+
+  updateFadedLine(
+    guidanceLine,
+    diskPlaneProjection,
+    rabbitPosition,
+    controlLookaheadColor,
+    1.0,
+    0.4,
+    showControlLines
+  );
+  updateLine(
+    lookaheadRadialOffsetLine,
+    lookaheadOnDisk,
+    rabbitPosition,
+    controlRabbitRelationshipLineColor,
+    0.62,
+    showControlLines
+  );
+  updateLine(
+    projectedToDiskLine,
+    projectedPhase,
+    closestDisk,
+    controlClosestDiskColor,
+    0.56,
+    showControlLines
+  );
+  updateLine(
+    phaseSlotToClosestDiskLine,
+    phaseSlot,
+    closestDisk,
+    controlRabbitRelationshipLineColor,
+    0.46,
+    showControlLines && showAdaptiveSlots
+  );
+}
+
 function renderFrame(frame: ApiFrame): void {
   lastRenderedFrame = frame;
+  hasRenderedSimulationFrame = true;
   ensureKites(frame.kite_positions_n.length, frame);
-  const showControlFeatures = controlFeaturesVisible();
-  const showControlLines = controlFeatureLinesVisible();
   const showAdaptiveSlots = activeSummaryRequest?.phase_mode === "adaptive";
   payloadMesh.position.copy(toThree(frame.payload_position_n));
   payloadMesh.visible = true;
@@ -6027,7 +6383,7 @@ function renderFrame(frame: ApiFrame): void {
     shouldSnapOrbitTargetToFrame = false;
   }
   applyCameraFollow(frame);
-  updateControlRing(frame);
+  updateControlRings(frame);
   renderTether(
     frame.common_tether,
     frame.common_tether_tensions,
@@ -6039,27 +6395,11 @@ function renderFrame(frame: ApiFrame): void {
 
   frame.kite_positions_n.forEach((position, index) => {
     const mesh = kiteMeshes[index];
-    const rabbitMesh = rabbitMeshes[index];
-    const lookaheadOnDiskMesh = lookaheadOnDiskMeshes[index];
-    const projectedPhaseMesh = projectedPhaseMeshes[index];
-    const guidanceLine = guidanceLines[index];
-    const lookaheadRadialOffsetLine = lookaheadRadialOffsetLines[index];
-    const projectedToDiskLine = projectedToDiskLines[index];
-    const aircraftToDiskPlaneLine = aircraftToDiskPlaneLines[index];
-    const phaseSlotToClosestDiskLine = phaseSlotToClosestDiskLines[index];
     const upperSegments = upperSegmentMeshes[index];
     const upperNodes = upperNodeMeshes[index];
     const quatData = frame.kite_quaternions_n2b[index];
     if (
       !mesh ||
-      !rabbitMesh ||
-      !lookaheadOnDiskMesh ||
-      !projectedPhaseMesh ||
-      !guidanceLine ||
-      !lookaheadRadialOffsetLine ||
-      !projectedToDiskLine ||
-      !aircraftToDiskPlaneLine ||
-      !phaseSlotToClosestDiskLine ||
       !upperSegments ||
       !upperNodes ||
       !quatData
@@ -6070,68 +6410,9 @@ function renderFrame(frame: ApiFrame): void {
     mesh.position.copy(kitePosition);
     const quat = kiteQuaternionToThree(quatData);
     mesh.setRotationFromQuaternion(quat);
-    const rabbitTarget = frame.rabbit_targets_n[index] ?? position;
-    const rabbitPosition = toThree(rabbitTarget);
-
-    rabbitMesh.position.copy(rabbitPosition);
-    rabbitMesh.visible = showControlFeatures;
-    setMaterialColor(rabbitMesh.material, controlLookaheadColor, 0.34);
-
-    const lookaheadOnDisk = lookaheadOnDiskPosition(frame, index);
-    lookaheadOnDiskMesh.position.copy(lookaheadOnDisk);
-    lookaheadOnDiskMesh.visible = showControlFeatures;
-    setMaterialColor(lookaheadOnDiskMesh.material, controlLookaheadOnDiskColor, 0.22);
-
-    const projectedPhase = projectedPhasePosition(frame, index, position);
-    const closestDisk = closestDiskPosition(frame, position);
-    const diskPlaneProjection = diskPlaneProjectionPosition(frame, position);
-    projectedPhaseMesh.position.copy(projectedPhase);
-    projectedPhaseMesh.visible = showControlFeatures;
-    setMaterialColor(projectedPhaseMesh.material, controlProjectedPhaseColor, 0.28);
-
-    const phaseSlot = phaseSlotPosition(frame, index);
-
-    updateFadedLine(
-      guidanceLine,
-      diskPlaneProjection,
-      rabbitPosition,
-      controlLookaheadColor,
-      1.0,
-      0.4,
-      showControlLines
-    );
-    updateLine(
-      lookaheadRadialOffsetLine,
-      lookaheadOnDisk,
-      rabbitPosition,
-      controlRabbitRelationshipLineColor,
-      0.62,
-      showControlLines
-    );
-    updateLine(
-      projectedToDiskLine,
-      projectedPhase,
-      closestDisk,
-      controlClosestDiskColor,
-      0.56,
-      showControlLines
-    );
-    updateLine(
-      aircraftToDiskPlaneLine,
-      kitePosition,
-      diskPlaneProjection,
-      controlClosestDiskColor,
-      0.42,
-      showControlLines
-    );
-    updateLine(
-      phaseSlotToClosestDiskLine,
-      phaseSlot,
-      closestDisk,
-      controlRabbitRelationshipLineColor,
-      0.46,
-      showControlLines && showAdaptiveSlots
-    );
+    controlFeatureLayers.forEach((layer) => {
+      renderControlFeatureLayer(frame, index, layer, showAdaptiveSlots);
+    });
 
     renderTether(
       frame.upper_tethers[index],
@@ -6426,6 +6707,37 @@ function plotSectionKey(definition: PlotSectionDefinition): string {
   return definition.title;
 }
 
+function plotTabLabel(definition: PlotSectionDefinition): string {
+  return definition.title
+    .replace(/^Controller\s*\/\s*(?:\d+\.\s*)?/i, "")
+    .replace(/^Physics\s*\/\s*/i, "")
+    .trim();
+}
+
+interface PlotTabEntry {
+  key: string;
+  button: HTMLButtonElement;
+  host: HTMLElement;
+  plots: HTMLElement[];
+}
+
+function activatePlotTab(key: string, entries: PlotTabEntry[]): void {
+  activePlotTabKey = key;
+  entries.forEach((entry) => {
+    const active = entry.key === key;
+    entry.button.classList.toggle("active", active);
+    entry.button.setAttribute("aria-selected", String(active));
+    entry.host.classList.toggle("tab-inactive", !active);
+    if (active) {
+      entry.plots.forEach((plot) => {
+        if (plot.childElementCount > 0) {
+          Plotly.Plots?.resize(plot);
+        }
+      });
+    }
+  });
+}
+
 function applyPlotSectionCollapsed(
   host: HTMLElement,
   body: HTMLElement,
@@ -6451,6 +6763,7 @@ function clearPlots(message: string): void {
     Plotly.purge(section.plot);
   });
   activePlotSections = [];
+  activePlotTabKey = null;
   plotsNode.innerHTML = "";
   const placeholder = document.createElement("div");
   placeholder.className = "plots-placeholder";
@@ -6465,13 +6778,36 @@ async function renderFinalPlots(frames: ApiFrame[], kiteCount: number): Promise<
   activePlotSections = [];
   plotSignalVisibility = new Map<string, boolean>();
   collapsedPlotSections = new Set<string>();
+  const requestedTabKey = activePlotTabKey;
   plotsNode.innerHTML = "";
   ensurePlotKiteVisibility(kiteCount);
 
   const definitions = buildPlotSections(kiteCount);
+  const tabEntries: PlotTabEntry[] = [];
+  const tabs = document.createElement("div");
+  tabs.className = "plot-tabs";
+  tabs.setAttribute("role", "tablist");
+  tabs.setAttribute("aria-label", "Plot sections");
+  const tabPanels = document.createElement("div");
+  tabPanels.className = "plot-tab-panels";
+  plotsNode.append(tabs, tabPanels);
+
   const sectionPromises = definitions.map(async (definition) => {
     const host = document.createElement("section");
     host.className = "plot-section";
+    const sectionKey = plotSectionKey(definition);
+    host.dataset.plotSection = sectionKey;
+
+    const tabButton = document.createElement("button");
+    tabButton.className = "plot-tab";
+    tabButton.type = "button";
+    tabButton.textContent = plotTabLabel(definition);
+    tabButton.setAttribute("role", "tab");
+    tabButton.setAttribute("aria-selected", "false");
+    tabButton.addEventListener("click", () => {
+      activatePlotTab(sectionKey, tabEntries);
+    });
+    tabs.append(tabButton);
 
     const header = document.createElement("div");
     header.className = "plot-section-head";
@@ -6510,11 +6846,16 @@ async function renderFinalPlots(frames: ApiFrame[], kiteCount: number): Promise<
     header.append(headerCopy, headerActions);
     body.append(plotGrid);
     host.append(header, body);
-    plotsNode.append(host);
+    tabPanels.append(host);
 
     const sectionPlots: HTMLElement[] = [];
+    tabEntries.push({
+      key: sectionKey,
+      button: tabButton,
+      host,
+      plots: sectionPlots
+    });
 
-    const sectionKey = plotSectionKey(definition);
     applyPlotSectionCollapsed(
       host,
       body,
@@ -6582,6 +6923,13 @@ async function renderFinalPlots(frames: ApiFrame[], kiteCount: number): Promise<
   });
 
   await Promise.all(sectionPromises);
+  const nextActiveTabKey =
+    (requestedTabKey && tabEntries.some((entry) => entry.key === requestedTabKey)
+      ? requestedTabKey
+      : tabEntries[0]?.key) ?? null;
+  if (nextActiveTabKey) {
+    activatePlotTab(nextActiveTabKey, tabEntries);
+  }
   applyPlotKiteVisibility();
 }
 
@@ -7072,6 +7420,14 @@ controlFeaturesEnabledInput.addEventListener("change", () => {
 });
 
 controlFeatureLinesEnabledInput.addEventListener("change", () => {
+  applyVisualizationVisibility();
+});
+
+controlFeaturesAtTargetAltitudeInput.addEventListener("change", () => {
+  applyVisualizationVisibility();
+});
+
+controlFeaturesAtAircraftAltitudeInput.addEventListener("change", () => {
   applyVisualizationVisibility();
 });
 

@@ -13,11 +13,11 @@ use multikite_sim::{
     DrydenConfig, FREE_COMMON_NODES, FREE_UPPER_NODES, InitRequest, LongitudinalMode,
     MAX_SWARM_KITES, MIN_SWARM_KITES, PhaseMode, Preset, RunSummary, SimulationConfig,
     SimulationFrame, SimulationProgress, UPPER_NODES, available_presets, build_aero_analysis,
+    control_roll_pitch_deg_from_quat_n2b, euler_rpy_deg_from_quat_n2b,
     simulate_free_flight1_with_callbacks, simulate_free_flight1_with_progress,
     simulate_simple_tether_with_callbacks, simulate_simple_tether_with_progress,
     simulate_swarm_with_callbacks, simulate_swarm_with_progress,
 };
-use nalgebra::UnitQuaternion;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -104,6 +104,11 @@ struct ApiFrame {
     kite_attitudes_rpy_deg: Vec<[f64; 3]>,
     kite_control_roll_pitch_deg: Vec<[f64; 2]>,
     rabbit_targets_n: Vec<[f64; 3]>,
+    phase_projected_n: Vec<[f64; 3]>,
+    closest_disk_n: Vec<[f64; 3]>,
+    disk_plane_projection_n: Vec<[f64; 3]>,
+    lookahead_on_disk_n: Vec<[f64; 3]>,
+    phase_slot_n: Vec<[f64; 3]>,
     phase_error: Vec<f64>,
     speed_target: Vec<f64>,
     altitude: Vec<f64>,
@@ -126,6 +131,10 @@ struct ApiFrame {
     body_omega_b: Vec<[f64; 3]>,
     orbit_radius: Vec<f64>,
     rabbit_radius: Vec<f64>,
+    rabbit_distance: Vec<f64>,
+    rabbit_target_distance: Vec<f64>,
+    rabbit_bearing_y_deg: Vec<f64>,
+    rabbit_vector_b: Vec<[f64; 3]>,
     curvature_y_b: Vec<f64>,
     curvature_y_ref: Vec<f64>,
     curvature_y_est: Vec<f64>,
@@ -407,6 +416,66 @@ fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
                 .collect::<Vec<_>>()
         })
         .collect();
+    let phase_projected_n = frame
+        .diagnostics
+        .kites
+        .iter()
+        .map(|diag| {
+            control_ring_point_n(
+                &frame.control_ring_center_n,
+                diag.orbit_radius,
+                diag.phase_angle,
+            )
+        })
+        .collect();
+    let closest_disk_n = frame
+        .diagnostics
+        .kites
+        .iter()
+        .map(|diag| {
+            control_ring_point_n(
+                &frame.control_ring_center_n,
+                frame.control_ring_radius,
+                diag.phase_angle,
+            )
+        })
+        .collect();
+    let disk_plane_projection_n = frame
+        .diagnostics
+        .kites
+        .iter()
+        .map(|diag| {
+            vec3(nalgebra::Vector3::new(
+                diag.cad_position_n[0],
+                diag.cad_position_n[1],
+                frame.control_ring_center_n[2],
+            ))
+        })
+        .collect();
+    let lookahead_on_disk_n = frame
+        .diagnostics
+        .kites
+        .iter()
+        .map(|diag| {
+            control_ring_point_n(
+                &frame.control_ring_center_n,
+                frame.control_ring_radius,
+                diag.rabbit_phase,
+            )
+        })
+        .collect();
+    let phase_slot_n = frame
+        .diagnostics
+        .kites
+        .iter()
+        .map(|diag| {
+            control_ring_point_n(
+                &frame.control_ring_center_n,
+                frame.control_ring_radius,
+                diag.phase_angle + diag.phase_error,
+            )
+        })
+        .collect();
     ApiFrame {
         time: frame.time,
         payload_position_n,
@@ -461,13 +530,13 @@ fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
             .state
             .kites
             .iter()
-            .map(|kite| quaternion_to_rpy_deg(kite.body.quat_n2b))
+            .map(|kite| euler_rpy_deg_from_quat_n2b(&kite.body.quat_n2b))
             .collect(),
         kite_control_roll_pitch_deg: frame
             .state
             .kites
             .iter()
-            .map(|kite| control_roll_pitch_deg(kite.body.quat_n2b))
+            .map(|kite| control_roll_pitch_deg_from_quat_n2b(&kite.body.quat_n2b))
             .collect(),
         rabbit_targets_n: frame
             .diagnostics
@@ -475,6 +544,11 @@ fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
             .iter()
             .map(|diag| vec3(diag.rabbit_target_n))
             .collect(),
+        phase_projected_n,
+        closest_disk_n,
+        disk_plane_projection_n,
+        lookahead_on_disk_n,
+        phase_slot_n,
         phase_error: frame
             .diagnostics
             .kites
@@ -606,6 +680,30 @@ fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
             .kites
             .iter()
             .map(|diag| diag.rabbit_radius)
+            .collect(),
+        rabbit_distance: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.rabbit_distance)
+            .collect(),
+        rabbit_target_distance: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.rabbit_target_distance)
+            .collect(),
+        rabbit_bearing_y_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.rabbit_bearing_y.to_degrees())
+            .collect(),
+        rabbit_vector_b: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| vec3(diag.rabbit_vector_b))
             .collect(),
         curvature_y_b: frame
             .diagnostics
@@ -1126,18 +1224,28 @@ fn vec3(value: nalgebra::Vector3<f64>) -> [f64; 3] {
     [value[0], value[1], value[2]]
 }
 
-fn quaternion_to_rpy_deg(quat_n2b: nalgebra::Quaternion<f64>) -> [f64; 3] {
-    let unit = UnitQuaternion::from_quaternion(quat_n2b);
-    let (roll, pitch, yaw) = unit.euler_angles();
-    [roll.to_degrees(), pitch.to_degrees(), yaw.to_degrees()]
+fn control_ring_point_n(center_n: &nalgebra::Vector3<f64>, radius: f64, phase: f64) -> [f64; 3] {
+    [
+        center_n[0] + radius * phase.cos(),
+        center_n[1] + radius * phase.sin(),
+        center_n[2],
+    ]
 }
 
-fn control_roll_pitch_deg(quat_n2b: nalgebra::Quaternion<f64>) -> [f64; 2] {
-    let down_b =
-        UnitQuaternion::from_quaternion(quat_n2b).transform_vector(&nalgebra::Vector3::z());
-    let roll = down_b[1].atan2(down_b[2]);
-    let pitch = (-down_b[0]).atan2((down_b[1] * down_b[1] + down_b[2] * down_b[2]).sqrt());
-    [roll.to_degrees(), pitch.to_degrees()]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_roll_pitch_uses_controller_quaternion_convention() {
+        let roll = 35.0_f64.to_radians();
+        let quat_n2b = nalgebra::Quaternion::new((roll / 2.0).cos(), (roll / 2.0).sin(), 0.0, 0.0);
+
+        let [roll_deg, pitch_deg] = control_roll_pitch_deg_from_quat_n2b(&quat_n2b);
+
+        assert!((roll_deg - 35.0).abs() < 1.0e-12);
+        assert!(pitch_deg.abs() < 1.0e-12);
+    }
 }
 
 fn run_swarm_with_progress<F: FnMut(SimulationProgress)>(

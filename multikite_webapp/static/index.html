@@ -176,102 +176,6 @@
               <button id="restart-button" class="secondary-action" type="button" disabled>Restart</button>
             </div>
           </div>
-          <details class="form-section visualization-panel" id="visualization-panel">
-            <summary class="form-section-title">Visualization</summary>
-            <label>
-              Camera Target
-              <select id="camera-follow-target">
-                <option value="manual">Manual</option>
-                <option value="disk_center">Disk Center</option>
-              </select>
-            </label>
-            <label class="checkbox-label">
-              <input id="camera-follow-yaw" type="checkbox" />
-              <span>Follow Kite Yaw</span>
-            </label>
-            <label class="checkbox-label">
-              <input id="trackpad-navigation" type="checkbox" />
-              <span>Trackpad navigation</span>
-            </label>
-            <span class="form-hint">
-              Swaps the canvas drag mapping: primary click-drag rotates, secondary/two-finger
-              click-drag pans. Browsers expose trackpads as mouse input, so this also affects
-              physical mouse buttons while enabled.
-            </span>
-            <label class="checkbox-label">
-              <input id="control-labels-enabled" type="checkbox" />
-              <span>Show floating control labels</span>
-            </label>
-            <label class="checkbox-label">
-              <input id="control-disk-enabled" type="checkbox" checked />
-              <span>Show control disk</span>
-            </label>
-            <label class="checkbox-label">
-              <input id="control-features-enabled" type="checkbox" checked />
-              <span>Show control features</span>
-            </label>
-            <label class="checkbox-label">
-              <input id="control-feature-lines-enabled" type="checkbox" checked />
-              <span>Show control feature lines</span>
-            </label>
-            <label>
-              Control feature scale
-              <input id="control-feature-scale" type="number" min="0.1" step="any" value="0.5" />
-            </label>
-            <label class="checkbox-label">
-              <input id="tether-nodes-enabled" type="checkbox" checked />
-              <span>Show tether nodes</span>
-            </label>
-            <label>
-              Tether node scale
-              <input id="tether-node-scale" type="number" min="0" step="any" value="1.5" />
-            </label>
-            <label>
-              Tether tension color scale
-              <select id="tether-tension-scale-mode">
-                <option value="payload" selected>Payload estimate</option>
-                <option value="run_peak">Observed run peak</option>
-                <option value="fixed">Fixed range</option>
-              </select>
-            </label>
-            <label class="tension-scale-field" data-tension-scale-mode="payload">
-              Payload tension margin
-              <input id="tether-tension-payload-margin" type="number" min="0.1" step="any" value="3" />
-              <span class="form-hint">Red at payload weight × this margin; slack links are gray, low tension is blue.</span>
-            </label>
-            <label class="tension-scale-field" data-tension-scale-mode="fixed">
-              Fixed min tension (N)
-              <input id="tether-tension-fixed-min" type="number" step="any" value="0" />
-            </label>
-            <label class="tension-scale-field" data-tension-scale-mode="fixed">
-              Fixed max tension (N)
-              <input id="tether-tension-fixed-max" type="number" step="any" value="3000" />
-            </label>
-            <div class="form-hint tension-scale-field" data-tension-scale-mode="run_peak">
-              Uses the min and max tether tension observed so far in the current run, with a small margin.
-            </div>
-            <label class="checkbox-label">
-              <input id="fog-enabled" type="checkbox" />
-              <span>Show distance fog</span>
-            </label>
-            <label class="checkbox-label">
-              <input id="air-particles-enabled" type="checkbox" checked />
-              <span>Show air particles</span>
-            </label>
-            <label>
-              Air particle opacity
-              <input id="air-particle-opacity" type="number" min="0" max="1" step="any" value="0.45" />
-            </label>
-            <label class="checkbox-label">
-              <input id="wingtip-trails-enabled" type="checkbox" checked />
-              <span>Show wingtip trails</span>
-            </label>
-            <label class="checkbox-label">
-              <input id="wingtip-convection-enabled" type="checkbox" checked />
-              <span>Convect wingtip trails by birth wind</span>
-            </label>
-            <div class="form-hint">When enabled, each new wingtip particle captures the local wind at birth and keeps that velocity until it fades.</div>
-          </details>
           <details class="form-section tuning-panel" id="controller-tuning-panel" open>
             <summary class="form-section-title">Control Options</summary>
             <div class="form-hint">
@@ -321,6 +225,115 @@
       <section class="panel scene">
         <div id="viewport"></div>
         <div id="scene-failure-banner" class="scene-failure-banner" aria-live="polite"></div>
+        <details class="form-section visualization-panel scene-visualization-panel" id="visualization-panel" open>
+          <summary class="form-section-title">Visualization</summary>
+          <label>
+            Camera Target
+            <select id="camera-follow-target">
+              <option value="manual">Manual</option>
+              <option value="disk_center">Disk Center</option>
+            </select>
+          </label>
+          <label class="checkbox-label">
+            <input id="camera-follow-yaw" type="checkbox" />
+            <span>Follow Kite Yaw</span>
+          </label>
+          <label class="checkbox-label">
+            <input id="trackpad-navigation" type="checkbox" />
+            <span>Trackpad navigation</span>
+          </label>
+          <span class="form-hint">
+            Swaps the canvas drag mapping: primary click-drag rotates, secondary/two-finger
+            click-drag pans. Browsers expose trackpads as mouse input, so this also affects
+            physical mouse buttons while enabled.
+          </span>
+          <label class="checkbox-label">
+            <input id="control-labels-enabled" type="checkbox" />
+            <span>Show floating control labels</span>
+          </label>
+          <label class="checkbox-label">
+            <input id="control-disk-enabled" type="checkbox" checked />
+            <span>Show control disk</span>
+          </label>
+          <label class="checkbox-label">
+            <input id="control-features-enabled" type="checkbox" checked />
+            <span>Show control features</span>
+          </label>
+          <label class="checkbox-label">
+            <input id="control-feature-lines-enabled" type="checkbox" checked />
+            <span>Show control feature lines</span>
+          </label>
+          <label class="checkbox-label">
+            <input id="control-features-at-target-altitude" type="checkbox" checked />
+            <span>Disk-plane features at target altitude</span>
+          </label>
+          <label class="checkbox-label">
+            <input id="control-features-at-aircraft-altitude" type="checkbox" />
+            <span>Disk-plane features at aircraft altitude</span>
+          </label>
+          <div class="form-hint">
+            Visual-only projection layers. Target altitude uses the controller disk plane. Aircraft
+            altitude lifts each kite’s disk-plane markers to that kite and draws the ring at the
+            average kite altitude.
+          </div>
+          <label>
+            Control feature scale
+            <input id="control-feature-scale" type="number" min="0.1" step="any" value="0.5" />
+          </label>
+          <label class="checkbox-label">
+            <input id="tether-nodes-enabled" type="checkbox" checked />
+            <span>Show tether nodes</span>
+          </label>
+          <label>
+            Tether node scale
+            <input id="tether-node-scale" type="number" min="0" step="any" value="1.5" />
+          </label>
+          <label>
+            Tether tension color scale
+            <select id="tether-tension-scale-mode">
+              <option value="payload" selected>Payload estimate</option>
+              <option value="run_peak">Observed run peak</option>
+              <option value="fixed">Fixed range</option>
+            </select>
+          </label>
+          <label class="tension-scale-field" data-tension-scale-mode="payload">
+            Payload tension margin
+            <input id="tether-tension-payload-margin" type="number" min="0.1" step="any" value="3" />
+            <span class="form-hint">Red at payload weight × this margin; slack links are gray, low tension is blue.</span>
+          </label>
+          <label class="tension-scale-field" data-tension-scale-mode="fixed">
+            Fixed min tension (N)
+            <input id="tether-tension-fixed-min" type="number" step="any" value="0" />
+          </label>
+          <label class="tension-scale-field" data-tension-scale-mode="fixed">
+            Fixed max tension (N)
+            <input id="tether-tension-fixed-max" type="number" step="any" value="3000" />
+          </label>
+          <div class="form-hint tension-scale-field" data-tension-scale-mode="run_peak">
+            Uses the min and max tether tension observed so far in the current run, with a small margin.
+          </div>
+          <label class="checkbox-label">
+            <input id="fog-enabled" type="checkbox" />
+            <span>Show distance fog</span>
+          </label>
+          <label class="checkbox-label">
+            <input id="air-particles-enabled" type="checkbox" checked />
+            <span>Show air particles</span>
+          </label>
+          <label>
+            Air particle opacity
+            <input id="air-particle-opacity" type="number" min="0" max="1" step="any" value="0.45" />
+          </label>
+          <label class="checkbox-label">
+            <input id="wingtip-trails-enabled" type="checkbox" checked />
+            <span>Show wingtip trails</span>
+          </label>
+          <label class="checkbox-label">
+            <input id="wingtip-convection-enabled" type="checkbox" checked />
+            <span>Convect wingtip trails by birth wind</span>
+          </label>
+          <div class="form-hint">When enabled, each new wingtip particle captures the local wind at birth and keeps that velocity until it fades.</div>
+        </details>
         <div id="control-vis-legend" class="control-vis-legend" aria-label="Control visualization legend">
           <div class="legend-title">Control Vis</div>
           <div class="legend-row"><span class="legend-swatch lookahead"></span>Lookahead target / path</div>

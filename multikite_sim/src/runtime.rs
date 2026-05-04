@@ -1304,6 +1304,7 @@ mod tests {
     use crate::controller::{
         FreeFlightReference, controller_step, controller_step_with_free_flight_reference,
     };
+    use crate::math::{pitch_angle_from_quat_n2b, roll_angle_from_quat_n2b};
     use crate::model::evaluate_rhs;
     use crate::types::{LongitudinalMode, PhaseMode};
 
@@ -1329,16 +1330,6 @@ mod tests {
         controls.kites[0].surfaces.aileron = params.controller.trim.surfaces.aileron;
         controls.kites[0].surfaces.rudder = params.controller.trim.surfaces.rudder;
         controls.kites[0].surfaces.winglet = params.controller.trim.surfaces.winglet;
-    }
-
-    fn roll_angle_from_quat_n2b(quat_n2b: &nalgebra::Quaternion<f64>) -> f64 {
-        let down_b = rotate_nav_to_body(quat_n2b, &Vector3::new(0.0, 0.0, 1.0));
-        down_b[1].atan2(down_b[2])
-    }
-
-    fn pitch_angle_from_quat_n2b(quat_n2b: &nalgebra::Quaternion<f64>) -> f64 {
-        let down_b = rotate_nav_to_body(quat_n2b, &Vector3::new(0.0, 0.0, 1.0));
-        (-down_b[0]).atan2((down_b[1] * down_b[1] + down_b[2] * down_b[2]).sqrt())
     }
 
     fn roll_reversal_reference(time: f64) -> f64 {

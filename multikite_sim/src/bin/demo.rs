@@ -2,11 +2,11 @@ use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use multikite_sim::{
     DEFAULT_INITIAL_ALTITUDE_OFFSET_M, DEFAULT_SWARM_KITES, InitRequest, LongitudinalMode,
-    MAX_SWARM_KITES, MIN_SWARM_KITES, PhaseMode, Preset, SimulationConfig, simulate_free_flight1,
+    MAX_SWARM_KITES, MIN_SWARM_KITES, PhaseMode, Preset, SimulationConfig,
+    control_roll_pitch_rad_from_quat_n2b, simulate_free_flight1,
     simulate_free_flight1_with_callbacks, simulate_simple_tether, simulate_swarm,
     simulate_swarm_with_callbacks,
 };
-use nalgebra::Vector3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum PresetArg {
@@ -186,8 +186,7 @@ fn print_trace_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usiz
         let kite = &frame.diagnostics.kites[kite_index];
         let controls = &frame.controls.kites[kite_index];
         let quat = &frame.state.kites[kite_index].body.quat_n2b;
-        let roll = roll_angle_from_quat_n2b(quat);
-        let pitch = pitch_angle_from_quat_n2b(quat);
+        let [roll, pitch] = control_roll_pitch_rad_from_quat_n2b(quat);
         eprintln!(
             concat!(
                 "trace frame={frame_index} t={time:.3} kite={kite} ",
@@ -267,24 +266,4 @@ fn print_trace_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usiz
             omega_z_ref = kite.omega_world_z_ref,
         );
     }
-}
-
-fn rotate_nav_to_body(
-    quat_n2b: &nalgebra::Quaternion<f64>,
-    value_n: &Vector3<f64>,
-) -> Vector3<f64> {
-    let pure = nalgebra::Quaternion::new(0.0, value_n[0], value_n[1], value_n[2]);
-    let conjugate = quat_n2b.conjugate();
-    let rotated = conjugate * pure * quat_n2b;
-    Vector3::new(rotated.coords[0], rotated.coords[1], rotated.coords[2])
-}
-
-fn roll_angle_from_quat_n2b(quat_n2b: &nalgebra::Quaternion<f64>) -> f64 {
-    let down_b = rotate_nav_to_body(quat_n2b, &Vector3::new(0.0, 0.0, 1.0));
-    down_b[1].atan2(down_b[2])
-}
-
-fn pitch_angle_from_quat_n2b(quat_n2b: &nalgebra::Quaternion<f64>) -> f64 {
-    let down_b = rotate_nav_to_body(quat_n2b, &Vector3::new(0.0, 0.0, 1.0));
-    (-down_b[0]).atan2((down_b[1] * down_b[1] + down_b[2] * down_b[2]).sqrt())
 }

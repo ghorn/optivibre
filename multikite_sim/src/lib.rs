@@ -9,6 +9,10 @@ mod types;
 
 pub use aero_analysis::{AeroAnalysis, AeroSurfaceGrid, AeroSurfaceGroup, build_aero_analysis};
 pub use assets::{AssetManifest, ReferenceExport, asset_manifest, reference_export};
+pub use math::{
+    control_roll_pitch_deg_from_quat_n2b, control_roll_pitch_rad_from_quat_n2b,
+    euler_rpy_deg_from_quat_n2b,
+};
 pub use runtime::{
     COMMON_NODES, FREE_COMMON_NODES, FREE_UPPER_NODES, UPPER_NODES, available_presets,
     free_flight_configuration, simple_tether_configuration, simulate_free_flight1,
