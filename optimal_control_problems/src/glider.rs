@@ -1613,6 +1613,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ipopt")]
     fn try_load_ipopt_full_space_residual_dump(path: &Path) -> Option<IpoptFullSpaceResidualDump> {
         let text = fs::read_to_string(path).ok()?;
         Some(IpoptFullSpaceResidualDump {
