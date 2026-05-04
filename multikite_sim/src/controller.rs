@@ -22,13 +22,13 @@ use state::KiteControllerState;
 
 use crate::math::{
     circular_mean, clamp, pitch_angle_from_quat_n2b, roll_angle_from_quat_n2b, rotate_body_to_nav,
-    rotate_nav_to_body, sub, wrap_angle,
+    rotate_nav_to_body, wrap_angle, yaw_angle_from_quat_n2b, yaw_quaternion_n2b,
 };
 use crate::types::{
     ControlSurfaces, Controls, Diagnostics, KiteControls, LongitudinalMode, Params, PhaseMode,
     State,
 };
-use nalgebra::Vector3;
+use nalgebra::{Quaternion, Vector3};
 
 fn pairwise_phase_errors<const NK: usize>(diag: &Diagnostics<f64, NK>) -> [f64; NK] {
     let slot_errors: [f64; NK] = std::array::from_fn(|index| {
@@ -37,6 +37,27 @@ fn pairwise_phase_errors<const NK: usize>(diag: &Diagnostics<f64, NK>) -> [f64; 
     });
     let mean_error = circular_mean(&slot_errors);
     std::array::from_fn(|index| wrap_angle(mean_error - slot_errors[index]))
+}
+
+fn lateral_rabbit_vector_n(
+    rabbit_target_n: &Vector3<f64>,
+    cad_position_n: &Vector3<f64>,
+) -> Vector3<f64> {
+    Vector3::new(
+        rabbit_target_n[0] - cad_position_n[0],
+        rabbit_target_n[1] - cad_position_n[1],
+        0.0,
+    )
+}
+
+fn lateral_rabbit_vector_yaw_b(
+    quat_n2b: &Quaternion<f64>,
+    rabbit_target_n: &Vector3<f64>,
+    cad_position_n: &Vector3<f64>,
+) -> Vector3<f64> {
+    let rabbit_vector_n = lateral_rabbit_vector_n(rabbit_target_n, cad_position_n);
+    let yaw_n2b = yaw_quaternion_n2b(yaw_angle_from_quat_n2b(quat_n2b));
+    rotate_nav_to_body(&yaw_n2b, &rabbit_vector_n)
 }
 
 fn open_loop_phase_errors<const NK: usize>(
@@ -162,10 +183,10 @@ where
 
         // The swarm scheduler has already chosen this kite's rabbit point.
         // Below this boundary the controller only sees one aircraft.
-        let rabbit_vector_n = sub(&request.schedule.rabbit_target_n, &kite_diag.cad_position_n);
-        let rabbit_vector_b = rotate_nav_to_body(
+        let rabbit_vector_b = lateral_rabbit_vector_yaw_b(
             &request.plant_state.kites[index].body.quat_n2b,
-            &rabbit_vector_n,
+            &request.schedule.rabbit_target_n,
+            &kite_diag.cad_position_n,
         );
         let rabbit_bearing_y = direct_rabbit_bearing_y(&rabbit_vector_b);
         let uses_direct_rabbit =
@@ -718,6 +739,29 @@ mod tests {
             lateral_guidance_curvatures(&Vector3::new(-2.0, 10.0, 0.0), 120.0, 40.0, &tuning);
         assert!(behind.0 > 0.0);
         assert!(behind.0 <= tuning.guidance_curvature_limit);
+    }
+
+    #[test]
+    fn lateral_rabbit_vector_ignores_altitude_error() {
+        let target = Vector3::new(120.0, -30.0, -300.0);
+        let aircraft = Vector3::new(20.0, -80.0, -75.0);
+        let vector = lateral_rabbit_vector_n(&target, &aircraft);
+        assert_eq!(vector, Vector3::new(100.0, 50.0, 0.0));
+    }
+
+    #[test]
+    fn lateral_rabbit_vector_rotates_with_yaw_only() {
+        let target = Vector3::new(120.0, -30.0, -300.0);
+        let aircraft = Vector3::new(20.0, -80.0, -75.0);
+        let yaw = 0.4;
+        let full_attitude =
+            *nalgebra::UnitQuaternion::from_euler_angles(0.7, -0.3, yaw).quaternion();
+        let yaw_only = yaw_quaternion_n2b(yaw);
+        let expected = rotate_nav_to_body(&yaw_only, &Vector3::new(100.0, 50.0, 0.0));
+        let actual = lateral_rabbit_vector_yaw_b(&full_attitude, &target, &aircraft);
+
+        assert!((actual - expected).norm() < 1.0e-12);
+        assert!(actual[2].abs() < 1.0e-12);
     }
 
     #[test]

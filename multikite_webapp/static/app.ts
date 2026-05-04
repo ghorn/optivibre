@@ -1426,23 +1426,29 @@ function controllerDocsHtml(phaseMode: PhaseMode, longitudinalMode: Longitudinal
   const lateralGuidanceEquation = String.raw`
           \[
           \begin{aligned}
-          q_i^n &= p_i^r - p_i^{\mathrm{cad}},\\
-          q_i^b &= R_{n\to b} q_i^n,\\
-          \theta_{r,i} &= \operatorname{atan2}(q_{i,y}^b,q_{i,x}^b),\\
+          \bar p_i^r &=
+          \begin{bmatrix}
+            p_{i,x}^{r} \\
+            p_{i,y}^{r} \\
+            p_{i,z}^{\mathrm{cad}}
+          \end{bmatrix},\\
+          q_i^n &= \bar p_i^r - p_i^{\mathrm{cad}},\\
+          q_i^\chi &= R_z(\chi_i)^\top q_i^n,\qquad \chi_i = \operatorname{yaw}(q_{n\to b,i}),\\
+          \theta_{r,i} &= \operatorname{atan2}(q_{i,y}^\chi,q_{i,x}^\chi),\\
           \phi_{i,\mathrm{rabbit}}^\star &= k_{\phi\theta,p}\theta_{r,i}
             + k_{\phi\theta,i}\int\theta_{r,i}\,dt,\\
-          x_i &= \max\!\left(q_{i,x}^b, f_x d_{r,i}, 1\right),\\
-          \tilde q_{i,y}^b &= \operatorname{sat}_{\rho x_i}\!\left(q_{i,y}^b\right),
+          x_i &= \max\!\left(q_{i,x}^\chi, f_x d_{r,i}, 1\right),\\
+          \tilde q_{i,y}^\chi &= \operatorname{sat}_{\rho x_i}\!\left(q_{i,y}^\chi\right),
           \qquad
-          \tilde q_{i,z}^b = \operatorname{sat}_{\rho x_i}\!\left(q_{i,z}^b\right),\\
-          \kappa_{y,i}^{R} &= \operatorname{sat}_{\kappa_{\max}}\!\left(\frac{2\tilde q_{i,y}^b}{x_i^2}\right),
+          \tilde q_{i,z}^\chi = 0,\\
+          \kappa_{y,i}^{R} &= \operatorname{sat}_{\kappa_{\max}}\!\left(\frac{2\tilde q_{i,y}^\chi}{x_i^2}\right),
           \qquad
-          \kappa_{z,i}^{R} = \operatorname{sat}_{\kappa_{\max}}\!\left(\frac{2\tilde q_{i,z}^b}{x_i^2}\right),\\
+          \kappa_{z,i}^{R} = 0,\\
           (\phi_i^\star,\kappa_{y,i}^{\star},\kappa_{z,i}^{\star}) &=
           \begin{cases}
           (\phi_{i,\mathrm{rabbit}}^\star,0,0), & \text{rabbit mode},\\
           (\mathrm{curv2roll}(\kappa_{y,i}^{R}),\kappa_{y,i}^{R},\kappa_{z,i}^{R}), & \text{curvature mode},\\
-          (\phi_{i,\mathrm{rabbit}}^\star,0,0), & \text{switch mode and } q_{i,x}^b \ge \max(f_xd_{r,i},1),\\
+          (\phi_{i,\mathrm{rabbit}}^\star,0,0), & \text{switch mode and } q_{i,x}^\chi \ge \max(f_xd_{r,i},1),\\
           (\mathrm{curv2roll}(\kappa_{y,i}^{R}),\kappa_{y,i}^{R},\kappa_{z,i}^{R}), & \text{switch mode otherwise}.
           \end{cases}
           \end{aligned}
@@ -1733,7 +1739,7 @@ function controllerDocsHtml(phaseMode: PhaseMode, longitudinalMode: Longitudinal
     <section class="docs-card">
       <div class="docs-card-head">
         <div class="docs-card-title">Lateral Guidance And Integral States</div>
-        <div class="docs-card-note">Rabbit geometry is a lateral target in the control-disk plane. Default guidance is direct rabbit bearing. Curvature mode converts the rabbit vector to pure-pursuit curvature; switch mode uses direct rabbit while the target is ahead and curvature conversion when it falls behind.</div>
+        <div class="docs-card-note">Rabbit geometry is a lateral target in the control-disk plane. Lateral guidance uses that target's X/Y coordinates projected to the aircraft altitude and rotated only by body yaw, so roll, pitch, and altitude error stay out of the lateral bearing. Default guidance is direct rabbit bearing. Curvature mode converts the rabbit vector to pure-pursuit curvature; switch mode uses direct rabbit while the target is ahead and curvature conversion when it falls behind.</div>
       </div>
       <div class="docs-card-body">
         ${docsEquation("Lateral rabbit geometry", rabbitGeometryEquation, phaseLegend)}

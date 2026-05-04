@@ -210,6 +210,10 @@ pub fn euler_rpy_deg_from_quat_n2b(quat_n2b: &Quaternion<f64>) -> [f64; 3] {
     [roll.to_degrees(), pitch.to_degrees(), yaw.to_degrees()]
 }
 
+pub fn yaw_angle_from_quat_n2b(quat_n2b: &Quaternion<f64>) -> f64 {
+    UnitQuaternion::from_quaternion(*quat_n2b).euler_angles().2
+}
+
 pub fn ddt_quat_n2b<T: Scalar>(quat_n2b: &Quaternion<T>, omega_b: &Vector3<T>) -> Quaternion<T> {
     let half = T::from_f64(0.5);
     Quaternion::new(
