@@ -29,7 +29,8 @@ use optimization::{
 };
 #[cfg(feature = "ipopt")]
 use optimization::{
-    IpoptLinearSolver, IpoptOptions, IpoptRawStatus, IpoptSummary, format_ipopt_settings_summary,
+    IpoptLinearSolver, IpoptOptions, IpoptRawOption, IpoptRawStatus, IpoptSummary,
+    format_ipopt_settings_summary,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{IpoptProfiling, IpoptSolveError};
@@ -6268,6 +6269,7 @@ pub fn ipopt_options(config: &SolverConfig) -> IpoptOptions {
         print_level: 5,
         suppress_banner: false,
         linear_solver: Some(IpoptLinearSolver::Spral),
+        raw_options: vec![IpoptRawOption::text("print_timing_statistics", "yes")],
         ..IpoptOptions::default()
     }
 }
@@ -10453,6 +10455,19 @@ mod tests {
         assert!(format_ipopt_settings_summary(&options).contains("linear_solver=spral"));
         assert!(format_ipopt_settings_summary(&options).contains("mu_strategy=monotone"));
         assert!(format_ipopt_settings_summary(&options).contains("acceptable_iter=15"));
+    }
+
+    #[cfg(feature = "ipopt")]
+    #[test]
+    fn default_ipopt_options_print_timing_statistics() {
+        let options = ipopt_options(&default_solver_config());
+        assert!(options.raw_options.iter().any(|option| {
+            option.name == "print_timing_statistics"
+                && matches!(
+                    &option.value,
+                    optimization::IpoptRawOptionValue::Text(value) if value == "yes"
+                )
+        }));
     }
 
     #[test]

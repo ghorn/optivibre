@@ -4044,28 +4044,10 @@ function parseDurationLabelToMs(value: string): number | null {
   }
 }
 
-function normalizeProfilingHeatScore(
-  durationMs: number | null,
-  bestMs: number | null,
-  worstMs: number | null,
-): number | null {
-  if (durationMs == null || bestMs == null || worstMs == null) {
-    return null;
-  }
-  if (Math.abs(worstMs - bestMs) < 1e-12) {
-    return 0.6;
-  }
-  return Math.max(0, Math.min(1, (durationMs - bestMs) / (worstMs - bestMs)));
-}
-
-function deriveChildProfilingHeatScore(
-  parentScore: number | null,
+function profilingShareHeatScore(
   parentDurationMs: number | null,
   childDurationMs: number | null,
 ): number | null {
-  if (parentScore == null) {
-    return null;
-  }
   if (
     childDurationMs == null ||
     parentDurationMs == null ||
@@ -4073,10 +4055,21 @@ function deriveChildProfilingHeatScore(
     !Number.isFinite(parentDurationMs) ||
     parentDurationMs <= 1e-12
   ) {
+    return null;
+  }
+  return Math.max(0, Math.min(1, childDurationMs / parentDurationMs));
+}
+
+function childProfilingHeatScore(
+  siblingCount: number,
+  parentScore: number | null,
+  parentDurationMs: number | null,
+  childDurationMs: number | null,
+): number | null {
+  if (siblingCount <= 1) {
     return parentScore;
   }
-  const share = Math.max(0, Math.min(1, childDurationMs / parentDurationMs));
-  return parentScore * share;
+  return profilingShareHeatScore(parentDurationMs, childDurationMs) ?? parentScore;
 }
 
 function profilingHeatColorCode(score: number | null): number | null {
@@ -4274,7 +4267,8 @@ function flattenProfilingSection(
   for (const [index, child] of children.entries()) {
     const childIsLast = index === children.length - 1;
     if (child.kind === "section") {
-      const childHeatScore = deriveChildProfilingHeatScore(
+      const childHeatScore = childProfilingHeatScore(
+        children.length,
         sectionHeatScore,
         section.durationMs,
         child.section.durationMs,
@@ -4295,7 +4289,12 @@ function flattenProfilingSection(
       label: `${profilingTreePrefix(nextAncestors, childIsLast)}${item.label}`,
       value: item.value,
       metadata: formatProfilingLeafMetadata(item),
-      heatScore: deriveChildProfilingHeatScore(sectionHeatScore, section.durationMs, item.durationMs),
+      heatScore: childProfilingHeatScore(
+        children.length,
+        sectionHeatScore,
+        section.durationMs,
+        item.durationMs,
+      ),
     });
   }
   return lines;
@@ -4444,15 +4443,9 @@ function appendSolveProfilingLog(solver: SolverReport | null | undefined): void 
   if (sections.length === 0) {
     return;
   }
-  const rootDurations = sections
-    .map((section) => section.durationMs)
-    .filter((durationMs): durationMs is number => durationMs != null && Number.isFinite(durationMs));
-  const rootBestMs =
-    rootDurations.length > 0 ? rootDurations.reduce((best, value) => Math.min(best, value)) : null;
-  const rootWorstMs =
-    rootDurations.length > 0 ? rootDurations.reduce((worst, value) => Math.max(worst, value)) : null;
+  const rootTotalMs = sumProfilingDurations(sections);
   const renderedBlocks = sections.map((section, index) => {
-    const sectionHeatScore = normalizeProfilingHeatScore(section.durationMs, rootBestMs, rootWorstMs);
+    const sectionHeatScore = profilingShareHeatScore(rootTotalMs, section.durationMs);
     return flattenProfilingSection(
       section,
       [],
