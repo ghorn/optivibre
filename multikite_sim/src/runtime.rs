@@ -5,10 +5,10 @@ use crate::model::{CompiledRhs, compute_bridle_node, compute_tether_link_tension
 use crate::turbulence::DrydenField;
 use crate::types::{
     AeroParams, BodyState, BridleParams, ControlSurfaces, ControllerGains, Controls,
-    DEFAULT_SWARM_KITES, Diagnostics, Environment, InitRequest, KiteControls, KiteParams,
-    KiteState, MAX_SWARM_KITES, MIN_SWARM_KITES, MassContactParams, Params, Preset, PresetInfo,
-    RotorParams, RunResult, RunSummary, SimulationConfig, SimulationFailure, SimulationFrame,
-    SimulationProgress, State, TetherNode, TetherParams,
+    DEFAULT_SWARM_KITES, DEFAULT_SWARM_PAYLOAD_ALTITUDE_M, Diagnostics, Environment, InitRequest,
+    KiteControls, KiteParams, KiteState, MAX_SWARM_KITES, MIN_SWARM_KITES, MassContactParams,
+    Params, Preset, PresetInfo, RotorParams, RunResult, RunSummary, SimulationConfig,
+    SimulationFailure, SimulationFrame, SimulationProgress, State, TetherNode, TetherParams,
 };
 use anyhow::{Result, bail};
 use nalgebra::Vector3;
@@ -22,7 +22,6 @@ pub const UPPER_NODES: usize = BASE_TETHER_NODES * TETHER_NODE_MULTIPLIER;
 pub const FREE_COMMON_NODES: usize = 0;
 pub const FREE_UPPER_NODES: usize = 0;
 const SWARM_INITIAL_TENSION_N: f64 = 0.0;
-const SWARM_TARGET_PAYLOAD_ALTITUDE_M: f64 = 100.0;
 const GROUND_CLAMP_CLEARANCE_M: f64 = 1.0e-3;
 
 fn vec3(values: [f64; 3]) -> Vector3<f64> {
@@ -148,12 +147,15 @@ fn base_params<const NK: usize>(init: &InitRequest) -> Result<Params<f64, NK>> {
         },
     };
     if is_swarm_preset(init.preset) {
-        apply_swarm_controller_overrides(&mut params);
+        apply_swarm_controller_overrides(&mut params, init);
     }
     Ok(params)
 }
 
-fn apply_swarm_controller_overrides<const NK: usize>(params: &mut Params<f64, NK>) {
+fn apply_swarm_controller_overrides<const NK: usize>(
+    params: &mut Params<f64, NK>,
+    init: &InitRequest,
+) {
     params.controller.rabbit_distance =
         env_tuning_value("MULTIKITE_SWARM_RABBIT_DISTANCE_M", 90.0).max(1.0);
     params.controller.phase_lag_to_radius =
@@ -161,29 +163,67 @@ fn apply_swarm_controller_overrides<const NK: usize>(params: &mut Params<f64, NK
     params.controller.speed_ref =
         env_tuning_value("MULTIKITE_SWARM_SPEED_REF_MPS", params.controller.speed_ref)
             .clamp(5.0, 80.0);
-    apply_swarm_geometry_overrides(params);
+    apply_swarm_geometry_overrides(params, init);
 }
 
-fn apply_swarm_geometry_overrides<const NK: usize>(params: &mut Params<f64, NK>) {
-    let upper_length = swarm_upper_initial_length(params);
-    let disk_radius = env_tuning_value(
-        "MULTIKITE_SWARM_DISK_RADIUS_M",
-        params.controller.disk_radius,
-    )
-    .clamp(1.0, upper_length * 0.98);
+fn apply_swarm_geometry_overrides<const NK: usize>(
+    params: &mut Params<f64, NK>,
+    init: &InitRequest,
+) {
+    let common_length = positive_request_value(
+        init.swarm_common_tether_length_m,
+        params.common_tether.natural_length,
+    );
+    let upper_length = positive_request_value(
+        init.swarm_upper_tether_length_m,
+        params.kites[0].tether.natural_length,
+    );
+    params.common_tether.natural_length = common_length;
+    for kite in &mut params.kites {
+        kite.tether.natural_length = upper_length;
+    }
+
+    let requested_disk_radius = init
+        .swarm_disk_diameter_m
+        .and_then(|diameter| finite_positive(diameter).map(|value| 0.5 * value));
+    let disk_radius = requested_disk_radius
+        .unwrap_or_else(|| {
+            env_tuning_value(
+                "MULTIKITE_SWARM_DISK_RADIUS_M",
+                params.controller.disk_radius,
+            )
+        })
+        .max(1.0);
+    let payload_altitude = swarm_payload_altitude_m(init);
+    let default_disk_altitude = swarm_default_disk_altitude(
+        params,
+        payload_altitude,
+        common_length,
+        upper_length,
+        disk_radius,
+    );
+    let disk_altitude =
+        nonnegative_request_value(init.swarm_disk_altitude_m, default_disk_altitude);
+    let ground_altitude = params.kites[0].tether.contact.ground_altitude;
+
+    params.controller.disk_radius = disk_radius;
+    params.controller.disk_center_n[2] = -(ground_altitude + disk_altitude);
+}
+
+fn swarm_default_disk_altitude<const NK: usize>(
+    params: &Params<f64, NK>,
+    payload_altitude: f64,
+    common_length: f64,
+    upper_length: f64,
+    disk_radius: f64,
+) -> f64 {
     let upper_vertical = (upper_length * upper_length - disk_radius * disk_radius)
         .max(0.0)
         .sqrt();
-    let ground_altitude = params.kites[0].tether.contact.ground_altitude;
-    let target_payload_altitude = swarm_target_payload_altitude_m();
-    let target_cad_altitude = ground_altitude
-        + target_payload_altitude
-        + params.common_tether.natural_length
+    payload_altitude
+        + common_length
         + upper_vertical
-        + swarm_cad_altitude_offset_from_bridle(params, disk_radius);
-
-    params.controller.disk_radius = disk_radius;
-    params.controller.disk_center_n[2] = -target_cad_altitude;
+        + swarm_cad_altitude_offset_from_bridle(params, disk_radius)
 }
 
 fn swarm_initial_tension_n() -> f64 {
@@ -203,16 +243,41 @@ fn env_tuning_value(name: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
+fn finite_positive(value: f64) -> Option<f64> {
+    if value.is_finite() && value > 0.0 {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn positive_request_value(value: Option<f64>, default: f64) -> f64 {
+    value.and_then(finite_positive).unwrap_or(default)
+}
+
+fn nonnegative_request_value(value: Option<f64>, default: f64) -> f64 {
+    value
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(default)
+}
+
 fn is_swarm_preset(preset: Preset) -> bool {
     matches!(preset, Preset::Swarm)
 }
 
-fn swarm_target_payload_altitude_m() -> f64 {
+fn default_swarm_payload_altitude_m() -> f64 {
     env_tuning_value(
         "MULTIKITE_SWARM_TARGET_PAYLOAD_ALTITUDE_M",
-        SWARM_TARGET_PAYLOAD_ALTITUDE_M,
+        DEFAULT_SWARM_PAYLOAD_ALTITUDE_M,
     )
     .max(0.0)
+}
+
+fn swarm_payload_altitude_m(init: &InitRequest) -> f64 {
+    nonnegative_request_value(
+        init.swarm_payload_altitude_m,
+        default_swarm_payload_altitude_m(),
+    )
 }
 
 fn swarm_coordinated_roll<const NK: usize>(params: &Params<f64, NK>, turn_radius: f64) -> f64 {
@@ -251,7 +316,7 @@ fn swarm_upper_initial_length<const NK: usize>(params: &Params<f64, NK>) -> f64 
 fn apply_simulation_config_to_params<const NK: usize>(
     params: &mut Params<f64, NK>,
     config: &SimulationConfig,
-    preset: Preset,
+    init: &InitRequest,
 ) {
     if !config.bridle_enabled {
         for kite in &mut params.kites {
@@ -259,8 +324,8 @@ fn apply_simulation_config_to_params<const NK: usize>(
             kite.bridle.radius = 0.0;
         }
     }
-    if is_swarm_preset(preset) {
-        apply_swarm_controller_overrides(params);
+    if is_swarm_preset(init.preset) {
+        apply_swarm_controller_overrides(params, init);
     }
     params.controller.tuning = config.controller_tuning.clone();
 }
@@ -364,27 +429,31 @@ fn kite_with_consistent_tether<const N_UPPER: usize>(
 
 pub fn swarm_configuration<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
     params: &Params<f64, NK>,
-    initial_altitude_offset_m: f64,
+    init: &InitRequest,
 ) -> State<f64, NK, N_COMMON, N_UPPER> {
-    let target_altitude = swarm_target_payload_altitude_m() + initial_altitude_offset_m;
-    swarm_payload_configuration(params, target_altitude, 1.0)
+    let ground_altitude = params.kites[0].tether.contact.ground_altitude;
+    let disk_altitude = -params.controller.disk_center_n[2] - ground_altitude;
+    let aircraft_altitude =
+        nonnegative_request_value(init.swarm_aircraft_altitude_m, disk_altitude);
+    swarm_payload_configuration(
+        params,
+        swarm_payload_altitude_m(init),
+        1.0,
+        aircraft_altitude,
+    )
 }
 
 fn swarm_payload_configuration<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
     params: &Params<f64, NK>,
     payload_altitude_above_ground: f64,
     common_length_fraction: f64,
+    aircraft_altitude_above_ground: f64,
 ) -> State<f64, NK, N_COMMON, N_UPPER> {
-    let common_length =
-        params.common_tether.natural_length * common_length_fraction.clamp(0.0, 1.0);
-    let target_cad_altitude = -params.controller.disk_center_n[2]
-        + (payload_altitude_above_ground - swarm_target_payload_altitude_m())
-        + (common_length - params.common_tether.natural_length);
     swarm_payload_configuration_with_kite_cad_altitude(
         params,
         payload_altitude_above_ground,
         common_length_fraction,
-        target_cad_altitude,
+        aircraft_altitude_above_ground,
     )
 }
 
@@ -911,7 +980,7 @@ fn simulate<
     frame_cb: &mut G,
 ) -> Result<RunResult<NK, N_COMMON, N_UPPER>> {
     let mut params = base_params::<NK>(init)?;
-    apply_simulation_config_to_params(&mut params, config, init.preset);
+    apply_simulation_config_to_params(&mut params, config, init);
     let mut dryden_config = config
         .dryden
         .finite_or_default(&crate::types::DrydenConfig::default());
@@ -1045,7 +1114,11 @@ fn simulate_passive<
     progress_cb: &mut P,
     frame_cb: &mut G,
 ) -> Result<RunResult<NK, N_COMMON, N_UPPER>> {
-    apply_simulation_config_to_params(&mut params, config, Preset::SimpleTether);
+    let simple_init = InitRequest {
+        preset: Preset::SimpleTether,
+        ..InitRequest::default()
+    };
+    apply_simulation_config_to_params(&mut params, config, &simple_init);
     let rhs = CompiledRhs::<NK, N_COMMON, N_UPPER>::shared()?;
     let mut state = initializer(&params);
     let controls = initial_controls(&params);
@@ -1136,7 +1209,7 @@ pub fn available_presets() -> Vec<PresetInfo> {
         PresetInfo {
             preset: Preset::Swarm,
             name: "Swarm",
-            description: "Configurable equal-phase tethered swarm. Choose 1-12 kites and an initial payload-altitude offset.",
+            description: "Configurable equal-phase tethered swarm with explicit payload, disk, aircraft, and tether geometry.",
             kites: DEFAULT_SWARM_KITES,
             common_nodes: COMMON_NODES,
             upper_nodes: UPPER_NODES,
@@ -1191,13 +1264,10 @@ pub fn simulate_swarm_with_callbacks<
     if !(MIN_SWARM_KITES..=MAX_SWARM_KITES).contains(&NK) {
         bail!("swarm kites must be in {MIN_SWARM_KITES}..={MAX_SWARM_KITES}, got {NK}");
     }
-    let initial_altitude_offset_m = init.initial_altitude_offset_m;
     simulate::<NK, COMMON_NODES, UPPER_NODES, _, _>(
         init,
         config,
-        |params| {
-            swarm_configuration::<NK, COMMON_NODES, UPPER_NODES>(params, initial_altitude_offset_m)
-        },
+        |params| swarm_configuration::<NK, COMMON_NODES, UPPER_NODES>(params, init),
         progress_cb,
         frame_cb,
     )
@@ -1427,10 +1497,10 @@ mod tests {
             payload_mass_kg: None,
             wind_speed_mps: None,
             swarm_kites: 2,
-            initial_altitude_offset_m: 0.0,
+            ..InitRequest::default()
         };
         let params = base_params::<2>(&init).expect("swarm params");
-        let state = swarm_configuration::<2, COMMON_NODES, UPPER_NODES>(&params, 0.0);
+        let state = swarm_configuration::<2, COMMON_NODES, UPPER_NODES>(&params, &init);
         let controls = initial_controls(&params);
         let rhs =
             CompiledRhs::<2, COMMON_NODES, UPPER_NODES>::shared().expect("compiled swarm rhs");
@@ -1457,9 +1527,9 @@ mod tests {
             -state.payload.pos_n[2] - params.kites[0].tether.contact.ground_altitude;
 
         assert!(
-            (payload_altitude - swarm_target_payload_altitude_m()).abs() < 1.0e-9,
+            (payload_altitude - default_swarm_payload_altitude_m()).abs() < 1.0e-9,
             "swarm payload altitude should be {:.3} m, got {payload_altitude:.9} m",
-            swarm_target_payload_altitude_m(),
+            default_swarm_payload_altitude_m(),
         );
 
         for (index, kite_diag) in diagnostics.kites.iter().enumerate() {
@@ -1504,175 +1574,91 @@ mod tests {
     }
 
     #[test]
-    fn swarm_initial_altitude_offsets_position_payload_and_kites_relative_to_disk() {
+    fn swarm_geometry_request_sets_tether_lengths_and_altitudes() {
         let target_init = InitRequest {
             preset: Preset::Swarm,
             payload_mass_kg: None,
             wind_speed_mps: None,
             swarm_kites: 2,
-            initial_altitude_offset_m: 0.0,
+            ..InitRequest::default()
         };
         let target_params = base_params::<2>(&target_init).expect("swarm params");
         let disk_altitude = -target_params.controller.disk_center_n[2]
             - target_params.kites[0].tether.contact.ground_altitude;
         let upper_length = swarm_upper_initial_length(&target_params);
         let disk_radius = target_params.controller.disk_radius;
-        let upper_vertical = (upper_length * upper_length - disk_radius * disk_radius)
-            .max(0.0)
-            .sqrt();
-        let expected_disk_altitude = swarm_target_payload_altitude_m()
-            + target_params.common_tether.natural_length
-            + upper_vertical
-            + swarm_cad_altitude_offset_from_bridle(&target_params, disk_radius);
+        let expected_disk_altitude = swarm_default_disk_altitude(
+            &target_params,
+            default_swarm_payload_altitude_m(),
+            target_params.common_tether.natural_length,
+            upper_length,
+            disk_radius,
+        );
         assert!(
             (disk_altitude - expected_disk_altitude).abs() < 1.0e-9,
             "control disk altitude should be derived from tether geometry, got {disk_altitude:.3} m expected {expected_disk_altitude:.3} m",
         );
 
-        let low_state = swarm_configuration::<2, COMMON_NODES, UPPER_NODES>(
-            &target_params,
-            -swarm_target_payload_altitude_m(),
-        );
-        let very_low_state = swarm_configuration::<2, COMMON_NODES, UPPER_NODES>(
-            &target_params,
-            -swarm_target_payload_altitude_m() - 50.0,
-        );
         let reference_state =
-            swarm_configuration::<2, COMMON_NODES, UPPER_NODES>(&target_params, 0.0);
-        let high_state = swarm_configuration::<2, COMMON_NODES, UPPER_NODES>(&target_params, 50.0);
+            swarm_configuration::<2, COMMON_NODES, UPPER_NODES>(&target_params, &target_init);
 
-        let payload_altitude = |state: &State<f64, 2, COMMON_NODES, UPPER_NODES>| {
-            -state.payload.pos_n[2] - target_params.kites[0].tether.contact.ground_altitude
-        };
-        let kite_altitude = |state: &State<f64, 2, COMMON_NODES, UPPER_NODES>| {
-            let cad_pos_n = state.kites[0].body.pos_n
-                + crate::math::rotate_body_to_nav(
-                    &state.kites[0].body.quat_n2b,
-                    &target_params.kites[0].rigid_body.cad_offset_b,
-                );
-            -cad_pos_n[2] - target_params.kites[0].tether.contact.ground_altitude
-        };
+        let payload_altitude =
+            |params: &Params<f64, 2>, state: &State<f64, 2, COMMON_NODES, UPPER_NODES>| {
+                -state.payload.pos_n[2] - params.kites[0].tether.contact.ground_altitude
+            };
+        let kite_altitude =
+            |params: &Params<f64, 2>, state: &State<f64, 2, COMMON_NODES, UPPER_NODES>| {
+                let cad_pos_n = state.kites[0].body.pos_n
+                    + crate::math::rotate_body_to_nav(
+                        &state.kites[0].body.quat_n2b,
+                        &params.kites[0].rigid_body.cad_offset_b,
+                    );
+                -cad_pos_n[2] - params.kites[0].tether.contact.ground_altitude
+            };
 
         assert!(
-            (payload_altitude(&low_state) - GROUND_CLAMP_CLEARANCE_M).abs() < 1.0e-9,
-            "low-offset swarm payload should be clamped just above the ground"
+            (payload_altitude(&target_params, &reference_state)
+                - default_swarm_payload_altitude_m())
+            .abs()
+                < 1.0e-9,
+            "default swarm payload should start at the configured payload altitude"
         );
         assert!(
-            (payload_altitude(&very_low_state) - GROUND_CLAMP_CLEARANCE_M).abs() < 1.0e-9,
-            "below-ground swarm payload should be clamped just above the ground"
+            (kite_altitude(&target_params, &reference_state) - disk_altitude).abs() < 1.0e-9,
+            "default swarm kites should start on the control disk"
         );
-        assert!(
-            (payload_altitude(&reference_state) - swarm_target_payload_altitude_m()).abs() < 1.0e-9,
-            "zero-offset swarm payload should start at the target altitude"
-        );
-        assert!(
-            payload_altitude(&high_state) > swarm_target_payload_altitude_m(),
-            "positive-offset swarm payload should start above the target altitude"
-        );
-        let expected_low_kite_altitude = disk_altitude - swarm_target_payload_altitude_m();
-        assert!(
-            (kite_altitude(&low_state) - expected_low_kite_altitude).abs() < 1.0e-9,
-            "low-offset swarm kites should use the same disk-relative geometry as above-ground starts"
-        );
-        let expected_very_low_kite_altitude =
-            disk_altitude - swarm_target_payload_altitude_m() - 50.0;
-        assert!(
-            (kite_altitude(&very_low_state) - expected_very_low_kite_altitude).abs() < 1.0e-9,
-            "below-ground payload clamp should not re-offset kites that are already above ground"
-        );
-        let clearance_z =
-            -target_params.common_tether.contact.ground_altitude - GROUND_CLAMP_CLEARANCE_M;
-        let assert_not_below_ground = |label: &str, pos_n: &Vector3<f64>| {
-            assert!(
-                pos_n[2] <= clearance_z + 1.0e-12,
-                "{label} should not initialize below clearance: z={} clearance_z={clearance_z}",
-                pos_n[2]
-            );
+
+        let custom_init = InitRequest {
+            preset: Preset::Swarm,
+            swarm_kites: 2,
+            swarm_payload_altitude_m: Some(10.0),
+            swarm_common_tether_length_m: Some(80.0),
+            swarm_upper_tether_length_m: Some(95.0),
+            swarm_disk_diameter_m: Some(120.0),
+            swarm_disk_altitude_m: Some(150.0),
+            swarm_aircraft_altitude_m: Some(160.0),
+            ..InitRequest::default()
         };
-        assert_not_below_ground("low-offset payload", &low_state.payload.pos_n);
-        assert_not_below_ground("low-offset splitter", &low_state.splitter.pos_n);
-        for (index, node) in low_state.common_tether.iter().enumerate() {
-            assert_not_below_ground(
-                &format!("low-offset common tether node {index}"),
-                &node.pos_n,
-            );
-        }
-        for link_index in 0..=COMMON_NODES {
-            let lower = if link_index == 0 {
-                low_state.payload.pos_n
-            } else {
-                low_state.common_tether[link_index - 1].pos_n
-            };
-            let upper = if link_index == COMMON_NODES {
-                low_state.splitter.pos_n
-            } else {
-                low_state.common_tether[link_index].pos_n
-            };
-            assert!(
-                (upper - lower).norm() > 1.0e-6,
-                "low-offset common tether link {link_index} should be non-degenerate"
-            );
-        }
-        let common_tensions = compute_tether_link_tensions(
-            &low_state.payload,
-            &low_state.splitter,
-            &target_params.common_tether,
-            &low_state.common_tether,
+        let custom_params = base_params::<2>(&custom_init).expect("custom swarm params");
+        let custom_state =
+            swarm_configuration::<2, COMMON_NODES, UPPER_NODES>(&custom_params, &custom_init);
+        assert!((custom_params.common_tether.natural_length - 80.0).abs() < 1.0e-12);
+        assert!((custom_params.kites[0].tether.natural_length - 95.0).abs() < 1.0e-12);
+        assert!((custom_params.controller.disk_radius - 60.0).abs() < 1.0e-12);
+        assert!(
+            (-custom_params.controller.disk_center_n[2]
+                - custom_params.kites[0].tether.contact.ground_altitude
+                - 150.0)
+                .abs()
+                < 1.0e-12
         );
         assert!(
-            common_tensions.iter().all(|tension| tension.abs() < 1.0e-9),
-            "low-offset common tether should be slack, got tensions {common_tensions:?}"
-        );
-        for (kite_index, kite) in low_state.kites.iter().enumerate() {
-            assert_not_below_ground(
-                &format!("low-offset kite {kite_index} body"),
-                &kite.body.pos_n,
-            );
-            for (node_index, node) in kite.tether.iter().enumerate() {
-                assert_not_below_ground(
-                    &format!("low-offset kite {kite_index} upper tether node {node_index}"),
-                    &node.pos_n,
-                );
-            }
-            let bridle_node = compute_bridle_node(kite, &target_params.kites[kite_index]);
-            assert_not_below_ground(
-                &format!("low-offset kite {kite_index} bridle node"),
-                &bridle_node.pos_n,
-            );
-            for link_index in 0..=UPPER_NODES {
-                let lower = if link_index == 0 {
-                    low_state.splitter.pos_n
-                } else {
-                    kite.tether[link_index - 1].pos_n
-                };
-                let upper = if link_index == UPPER_NODES {
-                    bridle_node.pos_n
-                } else {
-                    kite.tether[link_index].pos_n
-                };
-                assert!(
-                    (upper - lower).norm() > 1.0e-6,
-                    "low-offset kite {kite_index} upper tether link {link_index} should be non-degenerate"
-                );
-            }
-            let upper_tensions = compute_tether_link_tensions(
-                &low_state.splitter,
-                &bridle_node,
-                &target_params.kites[kite_index].tether,
-                &kite.tether,
-            );
-            assert!(
-                upper_tensions.iter().all(|tension| *tension < 25.0),
-                "low-offset kite {kite_index} upper tether should only have small initial clamp tension, got tensions {upper_tensions:?}"
-            );
-        }
-        assert!(
-            (kite_altitude(&reference_state) - disk_altitude).abs() < 1.0e-9,
-            "zero-offset swarm kites should start on the control disk"
+            (payload_altitude(&custom_params, &custom_state) - 10.0).abs() < 1.0e-9,
+            "explicit payload altitude should be honored"
         );
         assert!(
-            kite_altitude(&high_state) > disk_altitude + 10.0,
-            "positive-offset swarm kites should start above the control disk"
+            (kite_altitude(&custom_params, &custom_state) - 160.0).abs() < 1.0e-9,
+            "explicit aircraft start altitude should be honored"
         );
     }
 
@@ -1683,10 +1669,10 @@ mod tests {
             payload_mass_kg: None,
             wind_speed_mps: Some(5.0),
             swarm_kites: 2,
-            initial_altitude_offset_m: 0.0,
+            ..InitRequest::default()
         };
         let params = base_params::<2>(&init).expect("swarm params");
-        let state = swarm_configuration::<2, COMMON_NODES, UPPER_NODES>(&params, 0.0);
+        let state = swarm_configuration::<2, COMMON_NODES, UPPER_NODES>(&params, &init);
         let controls = initial_controls(&params);
         let rhs =
             CompiledRhs::<2, COMMON_NODES, UPPER_NODES>::shared().expect("compiled swarm rhs");
@@ -1715,10 +1701,10 @@ mod tests {
             payload_mass_kg: None,
             wind_speed_mps: None,
             swarm_kites: 2,
-            initial_altitude_offset_m: 0.0,
+            ..InitRequest::default()
         };
         let params = base_params::<2>(&init).expect("swarm params");
-        let state = swarm_configuration::<2, COMMON_NODES, UPPER_NODES>(&params, 0.0);
+        let state = swarm_configuration::<2, COMMON_NODES, UPPER_NODES>(&params, &init);
         let controls = initial_controls(&params);
         let rhs =
             CompiledRhs::<2, COMMON_NODES, UPPER_NODES>::shared().expect("compiled swarm rhs");

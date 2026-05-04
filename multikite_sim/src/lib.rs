@@ -23,7 +23,7 @@ pub use runtime::{
 };
 pub use types::{
     AeroParams, BodyState, ControlSurfaces, ControllerGains, ControllerTuning, Controls,
-    DEFAULT_INITIAL_ALTITUDE_OFFSET_M, DEFAULT_SWARM_KITES, Diagnostics, DrydenConfig, Environment,
+    DEFAULT_SWARM_KITES, DEFAULT_SWARM_PAYLOAD_ALTITUDE_M, Diagnostics, DrydenConfig, Environment,
     InitRequest, KiteControls, KiteDiagnostics, KiteParams, KiteState, LongitudinalMode,
     MAX_SWARM_KITES, MIN_SWARM_KITES, MassContactParams, Params, PhaseMode, Preset, PresetInfo,
     RotorParams, RunResult, RunSummary, SimulationConfig, SimulationFailure, SimulationFrame,

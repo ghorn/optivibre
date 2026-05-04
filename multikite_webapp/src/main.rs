@@ -9,14 +9,14 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use multikite_sim::{
-    COMMON_NODES, ControllerTuning, DEFAULT_INITIAL_ALTITUDE_OFFSET_M, DEFAULT_SWARM_KITES,
-    DrydenConfig, FREE_COMMON_NODES, FREE_UPPER_NODES, InitRequest, LongitudinalMode,
-    MAX_SWARM_KITES, MIN_SWARM_KITES, PhaseMode, Preset, RunSummary, SimulationConfig,
-    SimulationFrame, SimulationProgress, UPPER_NODES, available_presets, build_aero_analysis,
-    control_roll_pitch_deg_from_quat_n2b, euler_rpy_deg_from_quat_n2b,
-    simulate_free_flight1_with_callbacks, simulate_free_flight1_with_progress,
-    simulate_simple_tether_with_callbacks, simulate_simple_tether_with_progress,
-    simulate_swarm_with_callbacks, simulate_swarm_with_progress,
+    COMMON_NODES, ControllerTuning, DEFAULT_SWARM_KITES, DrydenConfig, FREE_COMMON_NODES,
+    FREE_UPPER_NODES, InitRequest, LongitudinalMode, MAX_SWARM_KITES, MIN_SWARM_KITES, PhaseMode,
+    Preset, RunSummary, SimulationConfig, SimulationFrame, SimulationProgress, UPPER_NODES,
+    available_presets, build_aero_analysis, control_roll_pitch_deg_from_quat_n2b,
+    euler_rpy_deg_from_quat_n2b, simulate_free_flight1_with_callbacks,
+    simulate_free_flight1_with_progress, simulate_simple_tether_with_callbacks,
+    simulate_simple_tether_with_progress, simulate_swarm_with_callbacks,
+    simulate_swarm_with_progress,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -49,7 +49,12 @@ struct Cli {
 struct RunRequest {
     preset: Preset,
     swarm_kites: Option<usize>,
-    initial_altitude_offset_m: Option<f64>,
+    swarm_payload_altitude_m: Option<f64>,
+    swarm_disk_altitude_m: Option<f64>,
+    swarm_aircraft_altitude_m: Option<f64>,
+    swarm_disk_diameter_m: Option<f64>,
+    swarm_upper_tether_length_m: Option<f64>,
+    swarm_common_tether_length_m: Option<f64>,
     duration: f64,
     dt_control: Option<f64>,
     phase_mode: PhaseMode,
@@ -339,10 +344,12 @@ fn config_from_request(request: &RunRequest) -> (InitRequest, SimulationConfig) 
                 .swarm_kites
                 .unwrap_or(DEFAULT_SWARM_KITES)
                 .clamp(MIN_SWARM_KITES, MAX_SWARM_KITES),
-            initial_altitude_offset_m: finite_f64_or_default(
-                request.initial_altitude_offset_m,
-                DEFAULT_INITIAL_ALTITUDE_OFFSET_M,
-            ),
+            swarm_payload_altitude_m: finite_optional_f64(request.swarm_payload_altitude_m),
+            swarm_disk_altitude_m: finite_optional_f64(request.swarm_disk_altitude_m),
+            swarm_aircraft_altitude_m: finite_optional_f64(request.swarm_aircraft_altitude_m),
+            swarm_disk_diameter_m: finite_optional_f64(request.swarm_disk_diameter_m),
+            swarm_upper_tether_length_m: finite_optional_f64(request.swarm_upper_tether_length_m),
+            swarm_common_tether_length_m: finite_optional_f64(request.swarm_common_tether_length_m),
         },
         SimulationConfig {
             duration: request.duration,
@@ -380,11 +387,14 @@ fn positive_f64_or_default(value: Option<f64>, default: f64) -> f64 {
     }
 }
 
-fn finite_f64_or_default(value: Option<f64>, default: f64) -> f64 {
-    match value {
-        Some(value) if value.is_finite() => value,
-        _ => default,
-    }
+fn finite_optional_f64(value: Option<f64>) -> Option<f64> {
+    value.filter(|value| value.is_finite())
+}
+
+fn optional_f64_label(value: Option<f64>) -> String {
+    finite_optional_f64(value)
+        .map(|value| format!("{value:.3}m"))
+        .unwrap_or_else(|| "auto".to_string())
 }
 
 fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
@@ -1341,12 +1351,15 @@ async fn run_stream(
             &sender,
             StreamEvent::Log {
                 message: format!(
-                    "starting preset={:?} kites={} initial_altitude_offset={:.2}m duration={:.1}s dt_control={:.4}s phase_mode={:?}",
+                    "starting preset={:?} kites={} payload_altitude={} disk_altitude={} aircraft_altitude={} disk_diameter={} upper_tether={} common_tether={} duration={:.1}s dt_control={:.4}s phase_mode={:?}",
                     request.preset,
                     request.swarm_kites.unwrap_or(DEFAULT_SWARM_KITES),
-                    request
-                        .initial_altitude_offset_m
-                        .unwrap_or(DEFAULT_INITIAL_ALTITUDE_OFFSET_M),
+                    optional_f64_label(request.swarm_payload_altitude_m),
+                    optional_f64_label(request.swarm_disk_altitude_m),
+                    optional_f64_label(request.swarm_aircraft_altitude_m),
+                    optional_f64_label(request.swarm_disk_diameter_m),
+                    optional_f64_label(request.swarm_upper_tether_length_m),
+                    optional_f64_label(request.swarm_common_tether_length_m),
                     request.duration,
                     request
                         .dt_control

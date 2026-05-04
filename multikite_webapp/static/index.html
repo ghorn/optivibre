@@ -55,8 +55,8 @@
               Number of kites
               <select id="swarm-kites">
                 <option value="1">1</option>
-                <option value="2" selected>2</option>
-                <option value="3">3</option>
+                <option value="2">2</option>
+                <option value="3" selected>3</option>
                 <option value="4">4</option>
                 <option value="5">5</option>
                 <option value="6">6</option>
@@ -70,9 +70,34 @@
               <span class="form-hint">Compile-specialized swarm size for the next run.</span>
             </label>
             <label>
-              Initial altitude offset (m)
-              <input id="initial-altitude-offset" type="number" step="any" value="0" />
-              <span class="form-hint">Relative to nominal payload altitude. Negative starts low; positive starts high.</span>
+              Payload altitude (m)
+              <input id="swarm-payload-altitude" type="number" min="0" step="any" value="100" />
+              <span class="form-hint">Target payload height above ground for the swarm geometry.</span>
+            </label>
+            <label>
+              Disk diameter (m)
+              <input id="swarm-disk-diameter" type="number" min="1" step="any" value="140" />
+              <span class="form-hint">Also sets the controller ring radius for the next run.</span>
+            </label>
+            <label>
+              Lower tether length (m)
+              <input id="swarm-common-tether-length" type="number" min="0.001" step="any" value="150" />
+              <span class="form-hint">Payload to Y/splitter natural length.</span>
+            </label>
+            <label>
+              Upper tether length (m)
+              <input id="swarm-upper-tether-length" type="number" min="0.001" step="any" value="120" />
+              <span class="form-hint">Y/splitter to each aircraft natural length.</span>
+            </label>
+            <label>
+              Disk altitude (m)
+              <input id="swarm-disk-altitude" type="number" min="0" step="any" placeholder="Auto" />
+              <span class="form-hint">Blank derives the disk from payload altitude and tether geometry.</span>
+            </label>
+            <label>
+              Starting aircraft altitude (m)
+              <input id="swarm-aircraft-altitude" type="number" min="0" step="any" placeholder="Auto" />
+              <span class="form-hint">Blank starts aircraft on the control disk altitude.</span>
             </label>
           </div>
           <div class="form-section">

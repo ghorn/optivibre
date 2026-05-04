@@ -322,8 +322,23 @@ type StreamEvent =
 const presetSelect = document.querySelector<HTMLSelectElement>("#preset")!;
 const swarmOptionsNode = document.querySelector<HTMLElement>("#swarm-options")!;
 const swarmKitesSelect = document.querySelector<HTMLSelectElement>("#swarm-kites")!;
-const initialAltitudeOffsetInput = document.querySelector<HTMLInputElement>(
-  "#initial-altitude-offset"
+const swarmPayloadAltitudeInput = document.querySelector<HTMLInputElement>(
+  "#swarm-payload-altitude"
+)!;
+const swarmDiskAltitudeInput = document.querySelector<HTMLInputElement>(
+  "#swarm-disk-altitude"
+)!;
+const swarmAircraftAltitudeInput = document.querySelector<HTMLInputElement>(
+  "#swarm-aircraft-altitude"
+)!;
+const swarmDiskDiameterInput = document.querySelector<HTMLInputElement>(
+  "#swarm-disk-diameter"
+)!;
+const swarmUpperTetherLengthInput = document.querySelector<HTMLInputElement>(
+  "#swarm-upper-tether-length"
+)!;
+const swarmCommonTetherLengthInput = document.querySelector<HTMLInputElement>(
+  "#swarm-common-tether-length"
 )!;
 const durationInput = document.querySelector<HTMLInputElement>("#duration")!;
 const dtControlInput = document.querySelector<HTMLInputElement>("#dt-control")!;
@@ -984,7 +999,12 @@ let latestProgressState: SimulationProgress | null = null;
 let activeSummaryRequest: {
   preset: string;
   swarm_kites: number;
-  initial_altitude_offset_m: number;
+  swarm_payload_altitude_m: number | null;
+  swarm_disk_altitude_m: number | null;
+  swarm_aircraft_altitude_m: number | null;
+  swarm_disk_diameter_m: number | null;
+  swarm_upper_tether_length_m: number | null;
+  swarm_common_tether_length_m: number | null;
   phase_mode: PhaseMode;
   longitudinal_mode: LongitudinalMode;
   sim_noise_enabled: boolean;
@@ -2476,9 +2496,16 @@ function selectedSwarmKiteCount(): number {
   return Number.isInteger(value) ? Math.min(12, Math.max(1, value)) : 2;
 }
 
-function selectedInitialAltitudeOffsetM(): number {
-  const value = Number(initialAltitudeOffsetInput.value);
-  return Number.isFinite(value) ? value : 0;
+function optionalInputValue(input: HTMLInputElement): number | null {
+  if (input.value.trim() === "") {
+    return null;
+  }
+  const value = input.valueAsNumber;
+  return Number.isFinite(value) ? value : null;
+}
+
+function optionalMetersLabel(value: number | null): string {
+  return value === null ? "auto" : `${compactNumberInputValue(value)} m`;
 }
 
 function syncSwarmOptionsVisibility(): void {
@@ -2541,6 +2568,11 @@ function timeDilationLabel(preset: TimeDilationPreset): string {
 function positiveInputValue(input: HTMLInputElement, fallback: number): number {
   const value = input.valueAsNumber;
   return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function nonnegativeInputValue(input: HTMLInputElement, fallback: number): number {
+  const value = input.valueAsNumber;
+  return Number.isFinite(value) && value >= 0 ? value : fallback;
 }
 
 function positiveIntegerInputValue(input: HTMLInputElement, fallback: number): number {
@@ -4701,6 +4733,12 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
 function formatProgressSummary(
   request: {
     preset: string;
+    swarm_payload_altitude_m: number | null;
+    swarm_disk_altitude_m: number | null;
+    swarm_aircraft_altitude_m: number | null;
+    swarm_disk_diameter_m: number | null;
+    swarm_upper_tether_length_m: number | null;
+    swarm_common_tether_length_m: number | null;
     phase_mode: PhaseMode;
     longitudinal_mode: LongitudinalMode;
     sim_noise_enabled: boolean;
@@ -4725,6 +4763,20 @@ function formatProgressSummary(
     [
       { label: "Progress", value: `${pct.toFixed(1)}%` },
       { label: "Preset", value: request.preset },
+      {
+        label: "Payload Altitude",
+        value: `${compactNumberInputValue(request.swarm_payload_altitude_m ?? 100)} m`
+      },
+      { label: "Disk Altitude", value: optionalMetersLabel(request.swarm_disk_altitude_m) },
+      { label: "Aircraft Altitude", value: optionalMetersLabel(request.swarm_aircraft_altitude_m) },
+      {
+        label: "Disk Diameter",
+        value: `${compactNumberInputValue(request.swarm_disk_diameter_m ?? 140)} m`
+      },
+      {
+        label: "Tethers",
+        value: `lower ${compactNumberInputValue(request.swarm_common_tether_length_m ?? 150)} m / upper ${compactNumberInputValue(request.swarm_upper_tether_length_m ?? 120)} m`
+      },
       { label: "Phase Mode", value: request.phase_mode },
       { label: "Longitudinal", value: longitudinalModeLabel(request.longitudinal_mode) },
       { label: "Bridle", value: request.bridle_enabled ? "Enabled" : "CG attach" },
@@ -7065,10 +7117,21 @@ async function startSimulation(): Promise<void> {
     maxSubstepsInput,
     simulationDefaults?.max_substeps ?? 1000
   );
+  const swarmPayloadAltitudeM = nonnegativeInputValue(swarmPayloadAltitudeInput, 100);
+  const swarmDiskAltitudeM = optionalInputValue(swarmDiskAltitudeInput);
+  const swarmAircraftAltitudeM = optionalInputValue(swarmAircraftAltitudeInput);
+  const swarmDiskDiameterM = positiveInputValue(swarmDiskDiameterInput, 140);
+  const swarmUpperTetherLengthM = positiveInputValue(swarmUpperTetherLengthInput, 120);
+  const swarmCommonTetherLengthM = positiveInputValue(swarmCommonTetherLengthInput, 150);
   const request = {
     preset: presetSelect.value,
     swarm_kites: selectedSwarmKiteCount(),
-    initial_altitude_offset_m: selectedInitialAltitudeOffsetM(),
+    swarm_payload_altitude_m: swarmPayloadAltitudeM,
+    swarm_disk_altitude_m: swarmDiskAltitudeM,
+    swarm_aircraft_altitude_m: swarmAircraftAltitudeM,
+    swarm_disk_diameter_m: swarmDiskDiameterM,
+    swarm_upper_tether_length_m: swarmUpperTetherLengthM,
+    swarm_common_tether_length_m: swarmCommonTetherLengthM,
     duration: durationSeconds,
     dt_control: dtControl,
     phase_mode: phaseModeSelect.value as PhaseMode,
@@ -7099,7 +7162,12 @@ async function startSimulation(): Promise<void> {
   activeSummaryRequest = {
     preset: request.preset,
     swarm_kites: request.swarm_kites,
-    initial_altitude_offset_m: request.initial_altitude_offset_m,
+    swarm_payload_altitude_m: request.swarm_payload_altitude_m,
+    swarm_disk_altitude_m: request.swarm_disk_altitude_m,
+    swarm_aircraft_altitude_m: request.swarm_aircraft_altitude_m,
+    swarm_disk_diameter_m: request.swarm_disk_diameter_m,
+    swarm_upper_tether_length_m: request.swarm_upper_tether_length_m,
+    swarm_common_tether_length_m: request.swarm_common_tether_length_m,
     phase_mode: request.phase_mode,
     longitudinal_mode: request.longitudinal_mode,
     sim_noise_enabled: request.sim_noise_enabled,
@@ -7119,9 +7187,13 @@ async function startSimulation(): Promise<void> {
     [
       { label: "Preset", value: request.preset },
       { label: "Kites", value: String(kiteCount) },
+      { label: "Payload Altitude", value: `${compactNumberInputValue(request.swarm_payload_altitude_m)} m` },
+      { label: "Disk Altitude", value: optionalMetersLabel(request.swarm_disk_altitude_m) },
+      { label: "Aircraft Altitude", value: optionalMetersLabel(request.swarm_aircraft_altitude_m) },
+      { label: "Disk Diameter", value: `${compactNumberInputValue(request.swarm_disk_diameter_m)} m` },
       {
-        label: "Altitude Offset",
-        value: `${compactNumberInputValue(request.initial_altitude_offset_m)} m`
+        label: "Tethers",
+        value: `lower ${compactNumberInputValue(request.swarm_common_tether_length_m)} m / upper ${compactNumberInputValue(request.swarm_upper_tether_length_m)} m`
       },
       { label: "Phase Mode", value: request.phase_mode },
       { label: "Longitudinal", value: longitudinalModeLabel(request.longitudinal_mode) },
@@ -7154,7 +7226,7 @@ async function startSimulation(): Promise<void> {
     "Run requested"
   );
   appendConsole(
-    `run requested: preset=${request.preset}, kites=${request.swarm_kites}, altitude_offset=${compactNumberInputValue(request.initial_altitude_offset_m)}m, duration=${request.duration}s, dt_control=${compactNumberInputValue(request.dt_control)}s (${(1 / request.dt_control).toFixed(1)} Hz), phase=${request.phase_mode}, longitudinal=${request.longitudinal_mode}, bridle=${request.bridle_enabled ? "enabled" : "cg_attach"}, noise=${request.sim_noise_enabled ? "dryden" : "off"}, dryden_intensity=${compactNumberInputValue(request.dryden.intensity_scale)}, dryden_length=${compactNumberInputValue(request.dryden.length_scale)}, dryden_seed=${request.dryden.seed}, rk_abs_tol=${toleranceLabel(request.rk_abs_tol)}, rk_rel_tol=${toleranceLabel(request.rk_rel_tol)}, max_substeps=${request.max_substeps}, time_dilation=${playbackLabel}`
+    `run requested: preset=${request.preset}, kites=${request.swarm_kites}, payload_alt=${compactNumberInputValue(request.swarm_payload_altitude_m)}m, disk_alt=${optionalMetersLabel(request.swarm_disk_altitude_m)}, aircraft_alt=${optionalMetersLabel(request.swarm_aircraft_altitude_m)}, disk_diameter=${compactNumberInputValue(request.swarm_disk_diameter_m)}m, lower_tether=${compactNumberInputValue(request.swarm_common_tether_length_m)}m, upper_tether=${compactNumberInputValue(request.swarm_upper_tether_length_m)}m, duration=${request.duration}s, dt_control=${compactNumberInputValue(request.dt_control)}s (${(1 / request.dt_control).toFixed(1)} Hz), phase=${request.phase_mode}, longitudinal=${request.longitudinal_mode}, bridle=${request.bridle_enabled ? "enabled" : "cg_attach"}, noise=${request.sim_noise_enabled ? "dryden" : "off"}, dryden_intensity=${compactNumberInputValue(request.dryden.intensity_scale)}, dryden_length=${compactNumberInputValue(request.dryden.length_scale)}, dryden_seed=${request.dryden.seed}, rk_abs_tol=${toleranceLabel(request.rk_abs_tol)}, rk_rel_tol=${toleranceLabel(request.rk_rel_tol)}, max_substeps=${request.max_substeps}, time_dilation=${playbackLabel}`
   );
   appendConsole(controllerTuningSnapshotLabel(request.controller_tuning));
 

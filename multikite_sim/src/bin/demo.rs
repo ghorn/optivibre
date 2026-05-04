@@ -1,11 +1,10 @@
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use multikite_sim::{
-    DEFAULT_INITIAL_ALTITUDE_OFFSET_M, DEFAULT_SWARM_KITES, InitRequest, LongitudinalMode,
-    MAX_SWARM_KITES, MIN_SWARM_KITES, PhaseMode, Preset, SimulationConfig,
-    control_roll_pitch_rad_from_quat_n2b, simulate_free_flight1,
-    simulate_free_flight1_with_callbacks, simulate_simple_tether, simulate_swarm,
-    simulate_swarm_with_callbacks,
+    DEFAULT_SWARM_KITES, InitRequest, LongitudinalMode, MAX_SWARM_KITES, MIN_SWARM_KITES,
+    PhaseMode, Preset, SimulationConfig, control_roll_pitch_rad_from_quat_n2b,
+    simulate_free_flight1, simulate_free_flight1_with_callbacks, simulate_simple_tether,
+    simulate_swarm, simulate_swarm_with_callbacks,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -33,8 +32,18 @@ struct Cli {
     preset: PresetArg,
     #[arg(long, default_value_t = DEFAULT_SWARM_KITES)]
     swarm_kites: usize,
-    #[arg(long, default_value_t = DEFAULT_INITIAL_ALTITUDE_OFFSET_M)]
-    initial_altitude_offset_m: f64,
+    #[arg(long)]
+    swarm_payload_altitude_m: Option<f64>,
+    #[arg(long)]
+    swarm_disk_altitude_m: Option<f64>,
+    #[arg(long)]
+    swarm_aircraft_altitude_m: Option<f64>,
+    #[arg(long)]
+    swarm_disk_diameter_m: Option<f64>,
+    #[arg(long)]
+    swarm_upper_tether_length_m: Option<f64>,
+    #[arg(long)]
+    swarm_common_tether_length_m: Option<f64>,
     #[arg(long, default_value_t = 10.0)]
     duration: f64,
     #[arg(long, default_value = "adaptive")]
@@ -83,7 +92,12 @@ fn main() -> Result<()> {
         payload_mass_kg: cli.payload_mass_kg,
         wind_speed_mps: cli.wind_speed_mps,
         swarm_kites: cli.swarm_kites.clamp(MIN_SWARM_KITES, MAX_SWARM_KITES),
-        initial_altitude_offset_m: cli.initial_altitude_offset_m,
+        swarm_payload_altitude_m: cli.swarm_payload_altitude_m,
+        swarm_disk_altitude_m: cli.swarm_disk_altitude_m,
+        swarm_aircraft_altitude_m: cli.swarm_aircraft_altitude_m,
+        swarm_disk_diameter_m: cli.swarm_disk_diameter_m,
+        swarm_upper_tether_length_m: cli.swarm_upper_tether_length_m,
+        swarm_common_tether_length_m: cli.swarm_common_tether_length_m,
     };
     let summary = match (cli.preset, cli.trace_every) {
         (PresetArg::Swarm, Some(trace_every)) => simulate_swarm_trace(&init, &config, trace_every)?,
