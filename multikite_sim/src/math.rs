@@ -175,6 +175,41 @@ pub fn rotate_body_to_nav<T: Scalar>(quat_n2b: &Quaternion<T>, value_b: &Vector3
     Vector3::new(rotated.coords[0], rotated.coords[1], rotated.coords[2])
 }
 
+pub fn nav_down_in_body<T: Scalar>(quat_n2b: &Quaternion<T>) -> Vector3<T> {
+    rotate_nav_to_body(quat_n2b, &Vector3::new(T::zero(), T::zero(), T::one()))
+}
+
+pub fn roll_pitch_from_quat_n2b<T: Scalar>(quat_n2b: &Quaternion<T>) -> (T, T) {
+    let down_b = nav_down_in_body(quat_n2b);
+    let roll = down_b[1].atan2(down_b[2]);
+    let pitch = (-down_b[0]).atan2((down_b[1] * down_b[1] + down_b[2] * down_b[2]).sqrt());
+    (roll, pitch)
+}
+
+pub fn roll_angle_from_quat_n2b<T: Scalar>(quat_n2b: &Quaternion<T>) -> T {
+    roll_pitch_from_quat_n2b(quat_n2b).0
+}
+
+pub fn pitch_angle_from_quat_n2b<T: Scalar>(quat_n2b: &Quaternion<T>) -> T {
+    roll_pitch_from_quat_n2b(quat_n2b).1
+}
+
+pub fn control_roll_pitch_rad_from_quat_n2b(quat_n2b: &Quaternion<f64>) -> [f64; 2] {
+    let (roll, pitch) = roll_pitch_from_quat_n2b(quat_n2b);
+    [roll, pitch]
+}
+
+pub fn control_roll_pitch_deg_from_quat_n2b(quat_n2b: &Quaternion<f64>) -> [f64; 2] {
+    let [roll, pitch] = control_roll_pitch_rad_from_quat_n2b(quat_n2b);
+    [roll.to_degrees(), pitch.to_degrees()]
+}
+
+pub fn euler_rpy_deg_from_quat_n2b(quat_n2b: &Quaternion<f64>) -> [f64; 3] {
+    let unit = UnitQuaternion::from_quaternion(*quat_n2b);
+    let (roll, pitch, yaw) = unit.euler_angles();
+    [roll.to_degrees(), pitch.to_degrees(), yaw.to_degrees()]
+}
+
 pub fn ddt_quat_n2b<T: Scalar>(quat_n2b: &Quaternion<T>, omega_b: &Vector3<T>) -> Quaternion<T> {
     let half = T::from_f64(0.5);
     Quaternion::new(
@@ -261,13 +296,6 @@ mod tests {
         ))
     }
 
-    fn roll_pitch_from_quat(quat_n2b: &Quaternion<f64>) -> (f64, f64) {
-        let down_b = rotate_nav_to_body(quat_n2b, &Vector3::new(0.0, 0.0, 1.0));
-        let roll = down_b[1].atan2(down_b[2]);
-        let pitch = (-down_b[0]).atan2((down_b[1] * down_b[1] + down_b[2] * down_b[2]).sqrt());
-        (roll, pitch)
-    }
-
     #[test]
     fn body_x_rate_changes_roll_independently_of_yaw() {
         let dt = 0.02;
@@ -279,7 +307,7 @@ mod tests {
         ] {
             let quat = yaw_quaternion_n2b(yaw);
             let next = integrate_once(quat, omega_b, dt);
-            let (roll, pitch) = roll_pitch_from_quat(&next);
+            let (roll, pitch) = roll_pitch_from_quat_n2b(&next);
             assert!(
                 (roll - dt).abs() < 1.0e-4,
                 "yaw={yaw}: roll={roll}, expected {dt}"
@@ -302,7 +330,7 @@ mod tests {
         ] {
             let quat = yaw_quaternion_n2b(yaw);
             let next = integrate_once(quat, omega_b, dt);
-            let (roll, pitch) = roll_pitch_from_quat(&next);
+            let (roll, pitch) = roll_pitch_from_quat_n2b(&next);
             assert!(
                 roll.abs() < 1.0e-4,
                 "yaw={yaw}: body-y rate leaked into roll={roll}"
@@ -324,7 +352,7 @@ mod tests {
             std::f64::consts::FRAC_PI_2,
         ] {
             let quat = roll_yaw_quaternion_n2b(expected_roll, yaw);
-            let (roll, pitch) = roll_pitch_from_quat(&quat);
+            let (roll, pitch) = roll_pitch_from_quat_n2b(&quat);
             assert!(
                 (roll - expected_roll).abs() < 1.0e-12,
                 "yaw={yaw}: roll={roll}, expected {expected_roll}"

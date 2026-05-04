@@ -268,8 +268,18 @@ form {
 
 .tuning-panel summary,
 .visualization-panel summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
   cursor: pointer;
   list-style: none;
+  column-gap: 16px;
+}
+
+.tuning-panel summary.form-section-title,
+.visualization-panel summary.form-section-title {
+  display: flex;
 }
 
 .tuning-panel summary::-webkit-details-marker,
@@ -280,10 +290,12 @@ form {
 .tuning-panel summary::after,
 .visualization-panel summary::after {
   content: "Show";
-  float: right;
+  flex: 0 0 auto;
   color: #bfe5d5;
   font-size: 0.7rem;
   letter-spacing: 0.08em;
+  margin-left: auto;
+  padding-left: 16px;
 }
 
 .tuning-panel[open] summary::after,
@@ -293,6 +305,25 @@ form {
 
 .visualization-panel[open] {
   gap: 13px;
+}
+
+.scene-visualization-panel {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  z-index: 11;
+  width: min(340px, calc(100% - 32px));
+  max-height: calc(100% - 32px);
+  margin: 0;
+  overflow: auto;
+  background:
+    linear-gradient(180deg, rgba(9, 19, 29, 0.88) 0%, rgba(4, 10, 16, 0.94) 100%);
+  box-shadow: 0 18px 46px rgba(0, 0, 0, 0.34);
+  backdrop-filter: blur(16px);
+}
+
+.scene-visualization-panel:not([open]) {
+  width: auto;
 }
 
 .visualization-panel .checkbox-label {
@@ -561,6 +592,54 @@ button:disabled,
   width: 100%;
   height: 100%;
   min-height: 0;
+}
+
+.scene-failure-banner {
+  display: none;
+  position: absolute;
+  top: 18px;
+  left: 50%;
+  z-index: 12;
+  width: min(840px, calc(100% - 48px));
+  transform: translateX(-50%);
+  padding: 16px 18px;
+  border: 1px solid rgba(255, 145, 145, 0.34);
+  border-radius: 18px;
+  background:
+    radial-gradient(circle at 12% 0%, rgba(255, 210, 150, 0.22), transparent 28%),
+    linear-gradient(135deg, rgba(144, 19, 39, 0.96) 0%, rgba(206, 38, 58, 0.94) 100%);
+  color: #fff4f4;
+  pointer-events: none;
+  box-shadow:
+    0 18px 54px rgba(100, 6, 22, 0.44),
+    0 0 0 1px rgba(255, 255, 255, 0.04) inset;
+  backdrop-filter: blur(10px);
+}
+
+.scene-failure-banner.visible {
+  display: block;
+}
+
+.scene-failure-kicker {
+  color: rgba(255, 238, 238, 0.78);
+  font-size: 0.74rem;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.scene-failure-title {
+  margin-top: 5px;
+  font-size: clamp(1.05rem, 1.4vw, 1.42rem);
+  font-weight: 900;
+  line-height: 1.12;
+}
+
+.scene-failure-meta {
+  margin-top: 6px;
+  color: rgba(255, 244, 244, 0.9);
+  font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+  font-size: 0.88rem;
 }
 
 .control-vis-legend {
@@ -854,6 +933,70 @@ button:disabled,
   display: grid;
   gap: 16px;
   align-content: start;
+}
+
+.plot-tabs {
+  position: sticky;
+  top: 0;
+  z-index: 8;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  padding: 10px;
+  border: 1px solid rgba(115, 146, 168, 0.18);
+  border-radius: 14px;
+  background:
+    linear-gradient(180deg, rgba(7, 15, 23, 0.94) 0%, rgba(4, 9, 14, 0.98) 100%);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.22);
+  backdrop-filter: blur(12px);
+}
+
+.plot-tab {
+  width: auto;
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(115, 146, 168, 0.2);
+  border-radius: 999px;
+  background: rgba(5, 12, 18, 0.76);
+  color: #9db4c8;
+  box-shadow: none;
+  font-size: 0.68rem;
+  font-weight: 900;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  transition:
+    border-color 140ms ease,
+    color 140ms ease,
+    background 140ms ease,
+    transform 140ms ease;
+}
+
+.plot-tab:hover {
+  transform: translateY(-1px);
+  border-color: rgba(102, 184, 255, 0.38);
+  color: #d9ecfb;
+}
+
+.plot-tab.active {
+  border-color: rgba(69, 215, 167, 0.52);
+  background:
+    linear-gradient(180deg, rgba(14, 48, 42, 0.72) 0%, rgba(5, 18, 18, 0.9) 100%);
+  color: #effff7;
+  box-shadow: 0 0 24px rgba(69, 215, 167, 0.12);
+}
+
+.plot-tab-panels {
+  position: relative;
+  min-width: 0;
+}
+
+.plot-section.tab-inactive {
+  position: absolute;
+  left: -200vw;
+  top: 0;
+  width: 100%;
+  visibility: hidden;
+  pointer-events: none;
 }
 
 .plot-kite-controls {

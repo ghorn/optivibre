@@ -8,9 +8,10 @@ pub use state::{ControllerState, ControllerTrace, KiteControllerTrace};
 use actuators::{elevator_breakdown, tethered_aileron_breakdown, tethered_rudder_breakdown};
 use lateral::{
     RollReferenceBreakdown, TETHERED_CURVATURE_Y_INTEGRATOR_OUTPUT_LIMIT,
-    TETHERED_CURVATURE_Z_INTEGRATOR_OUTPUT_LIMIT, direct_rabbit_roll_reference_breakdown,
-    guidance_uses_direct_rabbit, lateral_guidance_curvatures, orbit_roll_feedforward, rate_limit,
-    scheduled_rabbit_distance, speed_integrator_target,
+    TETHERED_CURVATURE_Z_INTEGRATOR_OUTPUT_LIMIT, direct_rabbit_bearing_y,
+    direct_rabbit_roll_reference_breakdown, guidance_uses_direct_rabbit,
+    lateral_guidance_curvatures, orbit_roll_feedforward, rate_limit, scheduled_rabbit_distance,
+    speed_integrator_target,
 };
 pub(crate) use longitudinal::FreeFlightReference;
 use longitudinal::{
@@ -19,22 +20,15 @@ use longitudinal::{
 };
 use state::KiteControllerState;
 
-use crate::math::{circular_mean, clamp, rotate_body_to_nav, rotate_nav_to_body, sub, wrap_angle};
+use crate::math::{
+    circular_mean, clamp, pitch_angle_from_quat_n2b, roll_angle_from_quat_n2b, rotate_body_to_nav,
+    rotate_nav_to_body, sub, wrap_angle,
+};
 use crate::types::{
     ControlSurfaces, Controls, Diagnostics, KiteControls, LongitudinalMode, Params, PhaseMode,
     State,
 };
 use nalgebra::Vector3;
-
-fn roll_angle_from_quat_n2b(quat_n2b: &nalgebra::Quaternion<f64>) -> f64 {
-    let down_b = rotate_nav_to_body(quat_n2b, &Vector3::new(0.0, 0.0, 1.0));
-    down_b[1].atan2(down_b[2])
-}
-
-fn pitch_angle_from_quat_n2b(quat_n2b: &nalgebra::Quaternion<f64>) -> f64 {
-    let down_b = rotate_nav_to_body(quat_n2b, &Vector3::new(0.0, 0.0, 1.0));
-    (-down_b[0]).atan2((down_b[1] * down_b[1] + down_b[2] * down_b[2]).sqrt())
-}
 
 fn pairwise_phase_errors<const NK: usize>(diag: &Diagnostics<f64, NK>) -> [f64; NK] {
     let slot_errors: [f64; NK] = std::array::from_fn(|index| {
@@ -127,124 +121,133 @@ where
     };
     let alpha_exceeded = clamp(kite_diag.alpha, 0.0, 0.15);
 
-    let (altitude_ref_raw, raw_roll_breakdown, omega_world_z_ref, k_tg_y, k_tg_z) =
-        if is_free_flight {
-            let reference = free_flight_reference(
-                index,
-                request.time,
-                request.initial_altitude,
-                request.params.controller.speed_ref,
-            );
+    let (
+        altitude_ref_raw,
+        raw_roll_breakdown,
+        omega_world_z_ref,
+        k_tg_y,
+        k_tg_z,
+        rabbit_vector_b,
+        rabbit_bearing_y,
+    ) = if is_free_flight {
+        let reference = free_flight_reference(
+            index,
+            request.time,
+            request.initial_altitude,
+            request.params.controller.speed_ref,
+        );
+        (
+            reference.altitude_ref_raw,
+            RollReferenceBreakdown {
+                total: reference.roll_ref,
+                feedforward: 0.0,
+                proportional: 0.0,
+                integrator: 0.0,
+            },
+            0.0,
+            0.0,
+            0.0,
+            Vector3::<f64>::zeros(),
+            0.0,
+        )
+    } else {
+        let altitude_ref_raw = -request.params.controller.disk_center_n[2]
+            + kite_diag.cad_velocity_n[2] * request.params.controller.vert_vel_to_rabbit_height
+            - request.params.kites[index].tether.contact.ground_altitude;
+
+        if !control_state.roll_ref_initialized {
+            control_state.roll_ref_command = roll_angle;
+            control_state.roll_ref_initialized = true;
+        }
+
+        // The swarm scheduler has already chosen this kite's rabbit point.
+        // Below this boundary the controller only sees one aircraft.
+        let rabbit_vector_n = sub(&request.schedule.rabbit_target_n, &kite_diag.cad_position_n);
+        let rabbit_vector_b = rotate_nav_to_body(
+            &request.plant_state.kites[index].body.quat_n2b,
+            &rabbit_vector_n,
+        );
+        let rabbit_bearing_y = direct_rabbit_bearing_y(&rabbit_vector_b);
+        let uses_direct_rabbit =
+            guidance_uses_direct_rabbit(&rabbit_vector_b, request.schedule.rabbit_distance, tuning);
+        let (roll_breakdown, omega_world_z_ref, k_tg_y, k_tg_z) = if uses_direct_rabbit {
             (
-                reference.altitude_ref_raw,
-                RollReferenceBreakdown {
-                    total: reference.roll_ref,
-                    feedforward: 0.0,
-                    proportional: 0.0,
-                    integrator: 0.0,
-                },
+                direct_rabbit_roll_reference_breakdown(
+                    &rabbit_vector_b,
+                    control_state,
+                    request.dt_control,
+                    tuning,
+                ),
                 0.0,
                 0.0,
                 0.0,
             )
         } else {
-            let altitude_ref_raw = -request.params.controller.disk_center_n[2]
-                + kite_diag.cad_velocity_n[2] * request.params.controller.vert_vel_to_rabbit_height
-                - request.params.kites[index].tether.contact.ground_altitude;
-
-            if !control_state.roll_ref_initialized {
-                control_state.roll_ref_command = roll_angle;
-                control_state.roll_ref_initialized = true;
-            }
-
-            // The swarm scheduler has already chosen this kite's rabbit point.
-            // Below this boundary the controller only sees one aircraft.
-            let rabbit_vector_n = sub(&request.schedule.rabbit_target_n, &kite_diag.cad_position_n);
-            let rabbit_vector_b = rotate_nav_to_body(
-                &request.plant_state.kites[index].body.quat_n2b,
-                &rabbit_vector_n,
-            );
-            let uses_direct_rabbit = guidance_uses_direct_rabbit(
+            let (k_tg_y, k_tg_z) = lateral_guidance_curvatures(
                 &rabbit_vector_b,
+                request.schedule.rabbit_radius,
                 request.schedule.rabbit_distance,
                 tuning,
             );
-            let (roll_breakdown, omega_world_z_ref, k_tg_y, k_tg_z) = if uses_direct_rabbit {
-                (
-                    direct_rabbit_roll_reference_breakdown(
-                        &rabbit_vector_b,
-                        control_state,
-                        request.dt_control,
-                        tuning,
-                    ),
-                    0.0,
-                    0.0,
-                    0.0,
-                )
-            } else {
-                let (k_tg_y, k_tg_z) = lateral_guidance_curvatures(
-                    &rabbit_vector_b,
-                    request.schedule.rabbit_radius,
-                    request.schedule.rabbit_distance,
-                    tuning,
-                );
-                let curvature_y_est = omega_n[2] / inertial_speed.max(1.0);
-                let gain_int_y = request.params.controller.gain_int_y.abs().max(1.0e-9);
-                let gain_int_z = request.params.controller.gain_int_z.abs().max(1.0e-9);
-                control_state.curvature_y_integrator = clamp(
-                    control_state.curvature_y_integrator
-                        + (kite_diag.curvature_y_b - k_tg_y) * request.dt_control
-                        - alpha_exceeded * 0.5,
-                    -TETHERED_CURVATURE_Y_INTEGRATOR_OUTPUT_LIMIT / gain_int_y,
-                    TETHERED_CURVATURE_Y_INTEGRATOR_OUTPUT_LIMIT / gain_int_y,
-                );
-                control_state.curvature_z_integrator = clamp(
-                    control_state.curvature_z_integrator
-                        + (kite_diag.curvature_z_b - k_tg_z) * request.dt_control
-                        - alpha_exceeded * 0.5,
-                    -TETHERED_CURVATURE_Z_INTEGRATOR_OUTPUT_LIMIT / gain_int_z,
-                    TETHERED_CURVATURE_Z_INTEGRATOR_OUTPUT_LIMIT / gain_int_z,
-                );
-                let roll_feedforward = orbit_roll_feedforward(
-                    inertial_speed,
-                    request.schedule.rabbit_radius,
-                    request.params.environment.g,
-                    tuning,
-                );
-                control_state.curvature_to_roll_integrator = clamp(
-                    control_state.curvature_to_roll_integrator
-                        + (k_tg_y - curvature_y_est) * request.dt_control,
-                    -tuning.roll_curvature_integrator_limit,
-                    tuning.roll_curvature_integrator_limit,
-                );
-                let roll_proportional = tuning.roll_curvature_p * (k_tg_y - curvature_y_est);
-                let roll_integrator =
-                    tuning.roll_curvature_i * control_state.curvature_to_roll_integrator;
-                let roll_ref = clamp(
-                    roll_feedforward + roll_proportional + roll_integrator,
-                    -tuning.roll_ref_limit_deg.to_radians(),
-                    tuning.roll_ref_limit_deg.to_radians(),
-                );
-                (
-                    RollReferenceBreakdown {
-                        total: roll_ref,
-                        feedforward: roll_feedforward,
-                        proportional: roll_proportional,
-                        integrator: roll_integrator,
-                    },
-                    inertial_speed * k_tg_y,
-                    k_tg_y,
-                    k_tg_z,
-                )
-            };
+            let curvature_y_est = omega_n[2] / inertial_speed.max(1.0);
+            let gain_int_y = request.params.controller.gain_int_y.abs().max(1.0e-9);
+            let gain_int_z = request.params.controller.gain_int_z.abs().max(1.0e-9);
+            control_state.curvature_y_integrator = clamp(
+                control_state.curvature_y_integrator
+                    + (kite_diag.curvature_y_b - k_tg_y) * request.dt_control
+                    - alpha_exceeded * 0.5,
+                -TETHERED_CURVATURE_Y_INTEGRATOR_OUTPUT_LIMIT / gain_int_y,
+                TETHERED_CURVATURE_Y_INTEGRATOR_OUTPUT_LIMIT / gain_int_y,
+            );
+            control_state.curvature_z_integrator = clamp(
+                control_state.curvature_z_integrator
+                    + (kite_diag.curvature_z_b - k_tg_z) * request.dt_control
+                    - alpha_exceeded * 0.5,
+                -TETHERED_CURVATURE_Z_INTEGRATOR_OUTPUT_LIMIT / gain_int_z,
+                TETHERED_CURVATURE_Z_INTEGRATOR_OUTPUT_LIMIT / gain_int_z,
+            );
+            let roll_feedforward = orbit_roll_feedforward(
+                inertial_speed,
+                request.schedule.rabbit_radius,
+                request.params.environment.g,
+                tuning,
+            );
+            control_state.curvature_to_roll_integrator = clamp(
+                control_state.curvature_to_roll_integrator
+                    + (k_tg_y - curvature_y_est) * request.dt_control,
+                -tuning.roll_curvature_integrator_limit,
+                tuning.roll_curvature_integrator_limit,
+            );
+            let roll_proportional = tuning.roll_curvature_p * (k_tg_y - curvature_y_est);
+            let roll_integrator =
+                tuning.roll_curvature_i * control_state.curvature_to_roll_integrator;
+            let roll_ref = clamp(
+                roll_feedforward + roll_proportional + roll_integrator,
+                -tuning.roll_ref_limit_deg.to_radians(),
+                tuning.roll_ref_limit_deg.to_radians(),
+            );
             (
-                altitude_ref_raw,
-                roll_breakdown,
-                omega_world_z_ref,
+                RollReferenceBreakdown {
+                    total: roll_ref,
+                    feedforward: roll_feedforward,
+                    proportional: roll_proportional,
+                    integrator: roll_integrator,
+                },
+                inertial_speed * k_tg_y,
                 k_tg_y,
                 k_tg_z,
             )
         };
+        (
+            altitude_ref_raw,
+            roll_breakdown,
+            omega_world_z_ref,
+            k_tg_y,
+            k_tg_z,
+            rabbit_vector_b,
+            rabbit_bearing_y,
+        )
+    };
 
     let roll_ref = if tethered_lateral {
         control_state.roll_ref_command = rate_limit(
@@ -410,6 +413,10 @@ where
             pitch_energy_integrator: control_state.pitch_energy_integrator,
             rabbit_phase: request.schedule.rabbit_phase,
             rabbit_radius: request.schedule.rabbit_radius,
+            rabbit_distance: request.schedule.rabbit_distance,
+            rabbit_target_distance: rabbit_vector_b.norm(),
+            rabbit_bearing_y,
+            rabbit_vector_b,
             rabbit_target_n: request.schedule.rabbit_target_n,
             curvature_y_ref: k_tg_y,
             curvature_y_estimate: omega_n[2] / inertial_speed.max(1.0),
@@ -625,6 +632,10 @@ pub fn apply_trace<const NK: usize>(
         diagnostics.kites[index].pitch_energy_integrator = kite_trace.pitch_energy_integrator;
         diagnostics.kites[index].rabbit_phase = kite_trace.rabbit_phase;
         diagnostics.kites[index].rabbit_radius = kite_trace.rabbit_radius;
+        diagnostics.kites[index].rabbit_distance = kite_trace.rabbit_distance;
+        diagnostics.kites[index].rabbit_target_distance = kite_trace.rabbit_target_distance;
+        diagnostics.kites[index].rabbit_bearing_y = kite_trace.rabbit_bearing_y;
+        diagnostics.kites[index].rabbit_vector_b = kite_trace.rabbit_vector_b;
         diagnostics.kites[index].rabbit_target_n = kite_trace.rabbit_target_n;
         diagnostics.kites[index].curvature_y_ref = kite_trace.curvature_y_ref;
         diagnostics.kites[index].curvature_y_est = kite_trace.curvature_y_estimate;
