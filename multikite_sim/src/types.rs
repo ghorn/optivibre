@@ -74,7 +74,8 @@ pub enum Preset {
 pub const DEFAULT_SWARM_KITES: usize = 3;
 pub const MIN_SWARM_KITES: usize = 1;
 pub const MAX_SWARM_KITES: usize = 12;
-pub const DEFAULT_SWARM_PAYLOAD_ALTITUDE_M: f64 = 100.0;
+pub const DEFAULT_SWARM_DISK_ALTITUDE_M: f64 = 350.0;
+pub const DEFAULT_SWARM_DISK_RADIUS_M: f64 = 70.0;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SimulationConfig {
@@ -118,10 +119,9 @@ pub struct InitRequest {
     pub payload_mass_kg: Option<f64>,
     pub wind_speed_mps: Option<f64>,
     pub swarm_kites: usize,
-    pub swarm_payload_altitude_m: Option<f64>,
     pub swarm_disk_altitude_m: Option<f64>,
+    pub swarm_disk_radius_m: Option<f64>,
     pub swarm_aircraft_altitude_m: Option<f64>,
-    pub swarm_disk_diameter_m: Option<f64>,
     pub swarm_upper_tether_length_m: Option<f64>,
     pub swarm_common_tether_length_m: Option<f64>,
 }
@@ -133,10 +133,9 @@ impl Default for InitRequest {
             payload_mass_kg: None,
             wind_speed_mps: None,
             swarm_kites: DEFAULT_SWARM_KITES,
-            swarm_payload_altitude_m: None,
             swarm_disk_altitude_m: None,
+            swarm_disk_radius_m: None,
             swarm_aircraft_altitude_m: None,
-            swarm_disk_diameter_m: None,
             swarm_upper_tether_length_m: None,
             swarm_common_tether_length_m: None,
         }

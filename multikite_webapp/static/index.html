@@ -70,14 +70,14 @@
               <span class="form-hint">Compile-specialized swarm size for the next run.</span>
             </label>
             <label>
-              Payload altitude (m)
-              <input id="swarm-payload-altitude" type="number" min="0" step="any" value="100" />
-              <span class="form-hint">Target payload height above ground for the swarm geometry.</span>
+              Disk altitude (m)
+              <input id="swarm-disk-altitude" type="number" min="0" step="any" value="350" />
+              <span class="form-hint">Control ring center height above ground.</span>
             </label>
             <label>
-              Disk diameter (m)
-              <input id="swarm-disk-diameter" type="number" min="1" step="any" value="140" />
-              <span class="form-hint">Also sets the controller ring radius for the next run.</span>
+              Disk radius (m)
+              <input id="swarm-disk-radius" type="number" min="1" step="any" value="70" />
+              <span class="form-hint">Control ring radius and initial upper-tether horizontal offset.</span>
             </label>
             <label>
               Lower tether length (m)
@@ -90,14 +90,9 @@
               <span class="form-hint">Y/splitter to each aircraft natural length.</span>
             </label>
             <label>
-              Disk altitude (m)
-              <input id="swarm-disk-altitude" type="number" min="0" step="any" placeholder="Auto" />
-              <span class="form-hint">Blank derives the disk from payload altitude and tether geometry.</span>
-            </label>
-            <label>
               Starting aircraft altitude (m)
-              <input id="swarm-aircraft-altitude" type="number" min="0" step="any" placeholder="Auto" />
-              <span class="form-hint">Blank starts aircraft on the control disk altitude.</span>
+              <input id="swarm-aircraft-altitude" type="number" min="0" step="any" value="350" />
+              <span class="form-hint">Initial aircraft CAD altitude. Payload height is derived from disk altitude and tether lengths.</span>
             </label>
           </div>
           <div class="form-section">
@@ -257,6 +252,7 @@
             <select id="camera-follow-target">
               <option value="manual">Manual</option>
               <option value="disk_center">Disk Center</option>
+              <option value="y_joint">Y Joint</option>
             </select>
           </label>
           <label class="checkbox-label">

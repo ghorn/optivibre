@@ -5,7 +5,7 @@ use crate::model::{CompiledRhs, compute_bridle_node, compute_tether_link_tension
 use crate::turbulence::DrydenField;
 use crate::types::{
     AeroParams, BodyState, BridleParams, ControlSurfaces, ControllerGains, Controls,
-    DEFAULT_SWARM_KITES, DEFAULT_SWARM_PAYLOAD_ALTITUDE_M, Diagnostics, Environment, InitRequest,
+    DEFAULT_SWARM_DISK_ALTITUDE_M, DEFAULT_SWARM_KITES, Diagnostics, Environment, InitRequest,
     KiteControls, KiteParams, KiteState, MAX_SWARM_KITES, MIN_SWARM_KITES, MassContactParams,
     Params, Preset, PresetInfo, RotorParams, RunResult, RunSummary, SimulationConfig,
     SimulationFailure, SimulationFrame, SimulationProgress, State, TetherNode, TetherParams,
@@ -183,9 +183,7 @@ fn apply_swarm_geometry_overrides<const NK: usize>(
         kite.tether.natural_length = upper_length;
     }
 
-    let requested_disk_radius = init
-        .swarm_disk_diameter_m
-        .and_then(|diameter| finite_positive(diameter).map(|value| 0.5 * value));
+    let requested_disk_radius = init.swarm_disk_radius_m.and_then(finite_positive);
     let disk_radius = requested_disk_radius
         .unwrap_or_else(|| {
             env_tuning_value(
@@ -194,36 +192,40 @@ fn apply_swarm_geometry_overrides<const NK: usize>(
             )
         })
         .max(1.0);
-    let payload_altitude = swarm_payload_altitude_m(init);
-    let default_disk_altitude = swarm_default_disk_altitude(
-        params,
-        payload_altitude,
-        common_length,
-        upper_length,
-        disk_radius,
-    );
     let disk_altitude =
-        nonnegative_request_value(init.swarm_disk_altitude_m, default_disk_altitude);
+        nonnegative_request_value(init.swarm_disk_altitude_m, default_swarm_disk_altitude_m());
     let ground_altitude = params.kites[0].tether.contact.ground_altitude;
 
     params.controller.disk_radius = disk_radius;
     params.controller.disk_center_n[2] = -(ground_altitude + disk_altitude);
 }
 
-fn swarm_default_disk_altitude<const NK: usize>(
-    params: &Params<f64, NK>,
-    payload_altitude: f64,
-    common_length: f64,
-    upper_length: f64,
-    disk_radius: f64,
-) -> f64 {
-    let upper_vertical = (upper_length * upper_length - disk_radius * disk_radius)
+fn swarm_upper_vertical(upper_length: f64, disk_radius: f64) -> f64 {
+    (upper_length * upper_length - disk_radius * disk_radius)
         .max(0.0)
-        .sqrt();
-    payload_altitude
-        + common_length
-        + upper_vertical
-        + swarm_cad_altitude_offset_from_bridle(params, disk_radius)
+        .sqrt()
+}
+
+fn default_swarm_disk_altitude_m() -> f64 {
+    env_tuning_value(
+        "MULTIKITE_SWARM_DISK_ALTITUDE_M",
+        DEFAULT_SWARM_DISK_ALTITUDE_M,
+    )
+    .max(0.0)
+}
+
+fn swarm_payload_altitude_from_disk<const NK: usize>(
+    params: &Params<f64, NK>,
+    disk_altitude: f64,
+) -> f64 {
+    let disk_radius = params.controller.disk_radius;
+    let upper_length = swarm_upper_initial_length(params);
+    let upper_vertical = swarm_upper_vertical(upper_length, disk_radius);
+    let payload_altitude = disk_altitude
+        - params.common_tether.natural_length
+        - upper_vertical
+        - swarm_cad_altitude_offset_from_bridle(params, disk_radius);
+    payload_altitude.max(GROUND_CLAMP_CLEARANCE_M)
 }
 
 fn swarm_initial_tension_n() -> f64 {
@@ -263,21 +265,6 @@ fn nonnegative_request_value(value: Option<f64>, default: f64) -> f64 {
 
 fn is_swarm_preset(preset: Preset) -> bool {
     matches!(preset, Preset::Swarm)
-}
-
-fn default_swarm_payload_altitude_m() -> f64 {
-    env_tuning_value(
-        "MULTIKITE_SWARM_TARGET_PAYLOAD_ALTITUDE_M",
-        DEFAULT_SWARM_PAYLOAD_ALTITUDE_M,
-    )
-    .max(0.0)
-}
-
-fn swarm_payload_altitude_m(init: &InitRequest) -> f64 {
-    nonnegative_request_value(
-        init.swarm_payload_altitude_m,
-        default_swarm_payload_altitude_m(),
-    )
 }
 
 fn swarm_coordinated_roll<const NK: usize>(params: &Params<f64, NK>, turn_radius: f64) -> f64 {
@@ -437,7 +424,7 @@ pub fn swarm_configuration<const NK: usize, const N_COMMON: usize, const N_UPPER
         nonnegative_request_value(init.swarm_aircraft_altitude_m, disk_altitude);
     swarm_payload_configuration(
         params,
-        swarm_payload_altitude_m(init),
+        swarm_payload_altitude_from_disk(params, disk_altitude),
         1.0,
         aircraft_altitude,
     )
@@ -486,9 +473,7 @@ fn swarm_payload_configuration_with_kite_cad_altitude<
         .controller
         .disk_radius
         .clamp(1.0, upper_length * 0.98);
-    let upper_vertical = (upper_length * upper_length - bridle_orbit_radius * bridle_orbit_radius)
-        .max(0.0)
-        .sqrt();
+    let upper_vertical = swarm_upper_vertical(upper_length, bridle_orbit_radius);
     let mut bridle_altitude = splitter_altitude + upper_vertical;
     let turn_radius = bridle_orbit_radius.max(1.0);
     let speed_ref = swarm_initial_speed_target(params);
@@ -1209,7 +1194,7 @@ pub fn available_presets() -> Vec<PresetInfo> {
         PresetInfo {
             preset: Preset::Swarm,
             name: "Swarm",
-            description: "Configurable equal-phase tethered swarm with explicit payload, disk, aircraft, and tether geometry.",
+            description: "Configurable equal-phase tethered swarm with explicit disk, aircraft, and tether geometry.",
             kites: DEFAULT_SWARM_KITES,
             common_nodes: COMMON_NODES,
             upper_nodes: UPPER_NODES,
@@ -1525,11 +1510,13 @@ mod tests {
         let expected_speed = swarm_initial_speed_target(&params);
         let payload_altitude =
             -state.payload.pos_n[2] - params.kites[0].tether.contact.ground_altitude;
+        let expected_payload_altitude =
+            swarm_payload_altitude_from_disk(&params, expected_altitude);
 
         assert!(
-            (payload_altitude - default_swarm_payload_altitude_m()).abs() < 1.0e-9,
+            (payload_altitude - expected_payload_altitude).abs() < 1.0e-9,
             "swarm payload altitude should be {:.3} m, got {payload_altitude:.9} m",
-            default_swarm_payload_altitude_m(),
+            expected_payload_altitude,
         );
 
         for (index, kite_diag) in diagnostics.kites.iter().enumerate() {
@@ -1585,18 +1572,10 @@ mod tests {
         let target_params = base_params::<2>(&target_init).expect("swarm params");
         let disk_altitude = -target_params.controller.disk_center_n[2]
             - target_params.kites[0].tether.contact.ground_altitude;
-        let upper_length = swarm_upper_initial_length(&target_params);
-        let disk_radius = target_params.controller.disk_radius;
-        let expected_disk_altitude = swarm_default_disk_altitude(
-            &target_params,
-            default_swarm_payload_altitude_m(),
-            target_params.common_tether.natural_length,
-            upper_length,
-            disk_radius,
-        );
+        let expected_disk_altitude = default_swarm_disk_altitude_m();
         assert!(
             (disk_altitude - expected_disk_altitude).abs() < 1.0e-9,
-            "control disk altitude should be derived from tether geometry, got {disk_altitude:.3} m expected {expected_disk_altitude:.3} m",
+            "control disk altitude should use the configured disk altitude, got {disk_altitude:.3} m expected {expected_disk_altitude:.3} m",
         );
 
         let reference_state =
@@ -1618,10 +1597,10 @@ mod tests {
 
         assert!(
             (payload_altitude(&target_params, &reference_state)
-                - default_swarm_payload_altitude_m())
+                - swarm_payload_altitude_from_disk(&target_params, disk_altitude))
             .abs()
                 < 1.0e-9,
-            "default swarm payload should start at the configured payload altitude"
+            "default swarm payload should be derived from disk altitude and tether geometry"
         );
         assert!(
             (kite_altitude(&target_params, &reference_state) - disk_altitude).abs() < 1.0e-9,
@@ -1631,10 +1610,9 @@ mod tests {
         let custom_init = InitRequest {
             preset: Preset::Swarm,
             swarm_kites: 2,
-            swarm_payload_altitude_m: Some(10.0),
             swarm_common_tether_length_m: Some(80.0),
             swarm_upper_tether_length_m: Some(95.0),
-            swarm_disk_diameter_m: Some(120.0),
+            swarm_disk_radius_m: Some(60.0),
             swarm_disk_altitude_m: Some(150.0),
             swarm_aircraft_altitude_m: Some(160.0),
             ..InitRequest::default()
@@ -1653,8 +1631,11 @@ mod tests {
                 < 1.0e-12
         );
         assert!(
-            (payload_altitude(&custom_params, &custom_state) - 10.0).abs() < 1.0e-9,
-            "explicit payload altitude should be honored"
+            (payload_altitude(&custom_params, &custom_state)
+                - swarm_payload_altitude_from_disk(&custom_params, 150.0))
+            .abs()
+                < 1.0e-9,
+            "payload altitude should be derived from disk altitude and tether geometry"
         );
         assert!(
             (kite_altitude(&custom_params, &custom_state) - 160.0).abs() < 1.0e-9,

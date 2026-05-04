@@ -49,10 +49,9 @@ struct Cli {
 struct RunRequest {
     preset: Preset,
     swarm_kites: Option<usize>,
-    swarm_payload_altitude_m: Option<f64>,
     swarm_disk_altitude_m: Option<f64>,
+    swarm_disk_radius_m: Option<f64>,
     swarm_aircraft_altitude_m: Option<f64>,
-    swarm_disk_diameter_m: Option<f64>,
     swarm_upper_tether_length_m: Option<f64>,
     swarm_common_tether_length_m: Option<f64>,
     duration: f64,
@@ -344,10 +343,9 @@ fn config_from_request(request: &RunRequest) -> (InitRequest, SimulationConfig) 
                 .swarm_kites
                 .unwrap_or(DEFAULT_SWARM_KITES)
                 .clamp(MIN_SWARM_KITES, MAX_SWARM_KITES),
-            swarm_payload_altitude_m: finite_optional_f64(request.swarm_payload_altitude_m),
             swarm_disk_altitude_m: finite_optional_f64(request.swarm_disk_altitude_m),
+            swarm_disk_radius_m: finite_optional_f64(request.swarm_disk_radius_m),
             swarm_aircraft_altitude_m: finite_optional_f64(request.swarm_aircraft_altitude_m),
-            swarm_disk_diameter_m: finite_optional_f64(request.swarm_disk_diameter_m),
             swarm_upper_tether_length_m: finite_optional_f64(request.swarm_upper_tether_length_m),
             swarm_common_tether_length_m: finite_optional_f64(request.swarm_common_tether_length_m),
         },
@@ -1351,13 +1349,12 @@ async fn run_stream(
             &sender,
             StreamEvent::Log {
                 message: format!(
-                    "starting preset={:?} kites={} payload_altitude={} disk_altitude={} aircraft_altitude={} disk_diameter={} upper_tether={} common_tether={} duration={:.1}s dt_control={:.4}s phase_mode={:?}",
+                    "starting preset={:?} kites={} disk_altitude={} disk_radius={} aircraft_altitude={} upper_tether={} common_tether={} duration={:.1}s dt_control={:.4}s phase_mode={:?}",
                     request.preset,
                     request.swarm_kites.unwrap_or(DEFAULT_SWARM_KITES),
-                    optional_f64_label(request.swarm_payload_altitude_m),
                     optional_f64_label(request.swarm_disk_altitude_m),
+                    optional_f64_label(request.swarm_disk_radius_m),
                     optional_f64_label(request.swarm_aircraft_altitude_m),
-                    optional_f64_label(request.swarm_disk_diameter_m),
                     optional_f64_label(request.swarm_upper_tether_length_m),
                     optional_f64_label(request.swarm_common_tether_length_m),
                     request.duration,

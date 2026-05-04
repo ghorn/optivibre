@@ -33,13 +33,11 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_SWARM_KITES)]
     swarm_kites: usize,
     #[arg(long)]
-    swarm_payload_altitude_m: Option<f64>,
-    #[arg(long)]
     swarm_disk_altitude_m: Option<f64>,
     #[arg(long)]
-    swarm_aircraft_altitude_m: Option<f64>,
+    swarm_disk_radius_m: Option<f64>,
     #[arg(long)]
-    swarm_disk_diameter_m: Option<f64>,
+    swarm_aircraft_altitude_m: Option<f64>,
     #[arg(long)]
     swarm_upper_tether_length_m: Option<f64>,
     #[arg(long)]
@@ -92,10 +90,9 @@ fn main() -> Result<()> {
         payload_mass_kg: cli.payload_mass_kg,
         wind_speed_mps: cli.wind_speed_mps,
         swarm_kites: cli.swarm_kites.clamp(MIN_SWARM_KITES, MAX_SWARM_KITES),
-        swarm_payload_altitude_m: cli.swarm_payload_altitude_m,
         swarm_disk_altitude_m: cli.swarm_disk_altitude_m,
+        swarm_disk_radius_m: cli.swarm_disk_radius_m,
         swarm_aircraft_altitude_m: cli.swarm_aircraft_altitude_m,
-        swarm_disk_diameter_m: cli.swarm_disk_diameter_m,
         swarm_upper_tether_length_m: cli.swarm_upper_tether_length_m,
         swarm_common_tether_length_m: cli.swarm_common_tether_length_m,
     };

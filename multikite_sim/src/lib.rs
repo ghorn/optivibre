@@ -23,9 +23,9 @@ pub use runtime::{
 };
 pub use types::{
     AeroParams, BodyState, ControlSurfaces, ControllerGains, ControllerTuning, Controls,
-    DEFAULT_SWARM_KITES, DEFAULT_SWARM_PAYLOAD_ALTITUDE_M, Diagnostics, DrydenConfig, Environment,
-    InitRequest, KiteControls, KiteDiagnostics, KiteParams, KiteState, LongitudinalMode,
-    MAX_SWARM_KITES, MIN_SWARM_KITES, MassContactParams, Params, PhaseMode, Preset, PresetInfo,
-    RotorParams, RunResult, RunSummary, SimulationConfig, SimulationFailure, SimulationFrame,
-    SimulationProgress, State, TetherNode, TetherParams,
+    DEFAULT_SWARM_DISK_ALTITUDE_M, DEFAULT_SWARM_DISK_RADIUS_M, DEFAULT_SWARM_KITES, Diagnostics,
+    DrydenConfig, Environment, InitRequest, KiteControls, KiteDiagnostics, KiteParams, KiteState,
+    LongitudinalMode, MAX_SWARM_KITES, MIN_SWARM_KITES, MassContactParams, Params, PhaseMode,
+    Preset, PresetInfo, RotorParams, RunResult, RunSummary, SimulationConfig, SimulationFailure,
+    SimulationFrame, SimulationProgress, State, TetherNode, TetherParams,
 };
