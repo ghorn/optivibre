@@ -49,6 +49,8 @@ struct Cli {
     #[arg(long)]
     payload_mass_kg: Option<f64>,
     #[arg(long)]
+    performance_scale_percent: Option<f64>,
+    #[arg(long)]
     wind_speed_mps: Option<f64>,
     #[arg(long, default_value = "total-energy")]
     longitudinal_mode: LongitudinalModeArg,
@@ -88,6 +90,7 @@ fn main() -> Result<()> {
             PresetArg::SimpleTether => Preset::SimpleTether,
         },
         payload_mass_kg: cli.payload_mass_kg,
+        performance_scale_percent: cli.performance_scale_percent,
         wind_speed_mps: cli.wind_speed_mps,
         swarm_kites: cli.swarm_kites.clamp(MIN_SWARM_KITES, MAX_SWARM_KITES),
         swarm_disk_altitude_m: cli.swarm_disk_altitude_m,

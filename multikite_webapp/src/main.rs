@@ -3,6 +3,7 @@ use std::sync::{Mutex, OnceLock};
 
 use anyhow::Result;
 use axum::body::Bytes;
+use axum::extract::Query;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -16,7 +17,7 @@ use multikite_sim::{
     euler_rpy_deg_from_quat_n2b, simulate_free_flight1_with_callbacks,
     simulate_free_flight1_with_progress, simulate_simple_tether_with_callbacks,
     simulate_simple_tether_with_progress, simulate_swarm_with_callbacks,
-    simulate_swarm_with_progress,
+    simulate_swarm_with_progress, vehicle_performance_scaling_preview,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -60,6 +61,7 @@ struct RunRequest {
     #[serde(default)]
     longitudinal_mode: LongitudinalMode,
     payload_mass_kg: Option<f64>,
+    performance_scale_percent: Option<f64>,
     wind_speed_mps: Option<f64>,
     sample_stride: Option<usize>,
     rk_abs_tol: Option<f64>,
@@ -71,6 +73,11 @@ struct RunRequest {
     dryden: Option<DrydenConfig>,
     #[serde(default = "default_true")]
     bridle_enabled: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct PerformanceScalingQuery {
+    scale_percent: Option<f64>,
 }
 
 fn default_true() -> bool {
@@ -99,6 +106,11 @@ struct ApiFrame {
     kite_bridle_radius: Vec<f64>,
     control_ring_center_n: [f64; 3],
     control_ring_radius: f64,
+    kite_masses_kg: Vec<f64>,
+    sum_kite_masses_kg: f64,
+    tether_mass_kg: f64,
+    payload_mass_kg: f64,
+    payload_to_lifter_mass_ratio: f64,
     common_tether: Vec<[f64; 3]>,
     common_tether_tensions: Vec<f64>,
     upper_tethers: Vec<Vec<[f64; 3]>>,
@@ -169,6 +181,9 @@ struct ApiFrame {
     motor_torque_p: Vec<f64>,
     motor_torque_i: Vec<f64>,
     top_tension: Vec<f64>,
+    felt_accel_g_b: Vec<[f64; 3]>,
+    tether_load_g_b: Vec<[f64; 3]>,
+    aero_load_g_b: Vec<[f64; 3]>,
     total_force_b: Vec<[f64; 3]>,
     aero_force_b: Vec<[f64; 3]>,
     aero_force_drag_b: Vec<[f64; 3]>,
@@ -263,6 +278,7 @@ async fn main() -> Result<()> {
         .route("/favicon.ico", get(favicon))
         .route("/api/presets", get(presets))
         .route("/api/default_config", get(default_config))
+        .route("/api/performance_scaling", get(performance_scaling))
         .route("/api/run", post(run))
         .route("/api/run_stream", post(run_stream))
         .route("/api/aero_analysis", get(aero_analysis))
@@ -312,6 +328,14 @@ async fn default_config() -> Json<SimulationConfig> {
     Json(SimulationConfig::default())
 }
 
+async fn performance_scaling(
+    Query(query): Query<PerformanceScalingQuery>,
+) -> Result<Json<multikite_sim::VehiclePerformanceScalingPreview>, (StatusCode, String)> {
+    vehicle_performance_scaling_preview(finite_optional_f64(query.scale_percent))
+        .map(Json)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+}
+
 async fn healthz() -> StatusCode {
     StatusCode::NO_CONTENT
 }
@@ -338,6 +362,7 @@ fn config_from_request(request: &RunRequest) -> (InitRequest, SimulationConfig) 
         InitRequest {
             preset: request.preset,
             payload_mass_kg: request.payload_mass_kg,
+            performance_scale_percent: finite_optional_f64(request.performance_scale_percent),
             wind_speed_mps: request.wind_speed_mps,
             swarm_kites: request
                 .swarm_kites
@@ -511,6 +536,11 @@ fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
         kite_bridle_radius: frame.kite_bridle_radii.to_vec(),
         control_ring_center_n,
         control_ring_radius: frame.control_ring_radius,
+        kite_masses_kg: frame.kite_masses_kg.to_vec(),
+        sum_kite_masses_kg: frame.sum_kite_masses_kg,
+        tether_mass_kg: frame.tether_mass_kg,
+        payload_mass_kg: frame.payload_mass_kg,
+        payload_to_lifter_mass_ratio: frame.payload_to_lifter_mass_ratio,
         common_tether,
         common_tether_tensions: frame.common_tether_tensions.clone(),
         upper_tethers,
@@ -892,6 +922,24 @@ fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
             .kites
             .iter()
             .map(|diag| diag.top_tension)
+            .collect(),
+        felt_accel_g_b: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| vec3(diag.felt_accel_g_b))
+            .collect(),
+        tether_load_g_b: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| vec3(diag.tether_load_g_b))
+            .collect(),
+        aero_load_g_b: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| vec3(diag.aero_load_g_b))
             .collect(),
         total_force_b: frame
             .diagnostics

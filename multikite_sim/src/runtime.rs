@@ -9,6 +9,7 @@ use crate::types::{
     KiteControls, KiteParams, KiteState, MAX_SWARM_KITES, MIN_SWARM_KITES, MassContactParams,
     Params, Preset, PresetInfo, RotorParams, RunResult, RunSummary, SimulationConfig,
     SimulationFailure, SimulationFrame, SimulationProgress, State, TetherNode, TetherParams,
+    VehiclePerformanceScalingPreview, VehiclePerformanceSnapshot,
 };
 use anyhow::{Result, bail};
 use nalgebra::Vector3;
@@ -112,6 +113,8 @@ fn base_params<const NK: usize>(init: &InitRequest) -> Result<Params<f64, NK>> {
             axis_b: vec3(export.rotor.axis_b),
             position_b: vec3(export.rotor.position_b),
             radius: export.rotor.radius,
+            thrust_scale: 1.0,
+            torque_scale: 1.0,
             inertia: export.rotor.inertia,
             sign: export.rotor.sign,
             initial_speed: export.rotor.initial_speed,
@@ -146,6 +149,7 @@ fn base_params<const NK: usize>(init: &InitRequest) -> Result<Params<f64, NK>> {
             tuning: Default::default(),
         },
     };
+    apply_vehicle_performance_scale(&mut params, init);
     if is_swarm_preset(init.preset) {
         apply_swarm_controller_overrides(&mut params, init);
     }
@@ -315,6 +319,95 @@ fn apply_simulation_config_to_params<const NK: usize>(
         apply_swarm_controller_overrides(params, init);
     }
     params.controller.tuning = config.controller_tuning.clone();
+    apply_controller_performance_scale(params, init);
+}
+
+fn vehicle_performance_scale(init: &InitRequest) -> f64 {
+    init.performance_scale_percent
+        .and_then(finite_positive)
+        .map(|percent| percent / 100.0)
+        .unwrap_or(1.0)
+}
+
+fn apply_vehicle_performance_scale<const NK: usize>(
+    params: &mut Params<f64, NK>,
+    init: &InitRequest,
+) {
+    let mu = vehicle_performance_scale(init);
+    if (mu - 1.0).abs() < f64::EPSILON {
+        return;
+    }
+    let sqrt_mu = mu.sqrt();
+    let inertia_scale = mu * mu;
+    for kite in &mut params.kites {
+        kite.rigid_body.mass *= mu;
+        kite.rigid_body.inertia_diagonal *= inertia_scale;
+        kite.aero.ref_area *= mu;
+        kite.aero.ref_span *= sqrt_mu;
+        kite.aero.ref_chord *= sqrt_mu;
+        kite.rotor.thrust_scale *= mu;
+        kite.rotor.torque_scale *= mu;
+    }
+    params.controller.trim.motor_torque *= mu;
+}
+
+fn apply_controller_performance_scale<const NK: usize>(
+    params: &mut Params<f64, NK>,
+    init: &InitRequest,
+) {
+    let mu = vehicle_performance_scale(init);
+    if (mu - 1.0).abs() < f64::EPSILON {
+        return;
+    }
+    params.controller.tuning.motor_torque_max_nm *= mu;
+    params.controller.tuning.tecs_thrust_integrator_limit_nm *= mu;
+}
+
+fn vehicle_performance_snapshot<const NK: usize>(
+    params: &Params<f64, NK>,
+    init: &InitRequest,
+) -> VehiclePerformanceSnapshot {
+    let kite = &params.kites[0];
+    let inertia = kite.rigid_body.inertia_diagonal;
+    let mu = vehicle_performance_scale(init);
+    VehiclePerformanceSnapshot {
+        scale_percent: 100.0 * mu,
+        mu,
+        mass_kg: kite.rigid_body.mass,
+        s_ref_m2: kite.aero.ref_area,
+        b_ref_m: kite.aero.ref_span,
+        c_ref_m: kite.aero.ref_chord,
+        thrust_capacity_scale: kite.rotor.thrust_scale,
+        power_capacity_scale: kite.rotor.torque_scale,
+        inertia_kg_m2: [inertia[0], inertia[1], inertia[2]],
+        trim_motor_torque_nm: params.controller.trim.motor_torque,
+        motor_torque_max_nm: params.controller.tuning.motor_torque_max_nm,
+        tecs_thrust_integrator_limit_nm: params.controller.tuning.tecs_thrust_integrator_limit_nm,
+    }
+}
+
+fn performance_preview_params(scale_percent: Option<f64>) -> Result<(Params<f64, 1>, InitRequest)> {
+    let init = InitRequest {
+        preset: Preset::Swarm,
+        swarm_kites: 1,
+        performance_scale_percent: scale_percent,
+        ..InitRequest::default()
+    };
+    let mut params = base_params::<1>(&init)?;
+    let config = SimulationConfig::default();
+    apply_simulation_config_to_params(&mut params, &config, &init);
+    Ok((params, init))
+}
+
+pub fn vehicle_performance_scaling_preview(
+    scale_percent: Option<f64>,
+) -> Result<VehiclePerformanceScalingPreview> {
+    let (baseline_params, baseline_init) = performance_preview_params(None)?;
+    let (scaled_params, scaled_init) = performance_preview_params(scale_percent)?;
+    Ok(VehiclePerformanceScalingPreview {
+        baseline: vehicle_performance_snapshot(&baseline_params, &baseline_init),
+        scaled: vehicle_performance_snapshot(&scaled_params, &scaled_init),
+    })
 }
 
 fn simple_tether_params(init: &InitRequest) -> Result<Params<f64, 0>> {
@@ -827,6 +920,41 @@ fn frame_tether_tensions<const NK: usize, const N_COMMON: usize, const N_UPPER: 
     (common_tensions, upper_tensions)
 }
 
+#[derive(Clone, Copy)]
+struct FrameMassSummary<const NK: usize> {
+    kite_masses_kg: [f64; NK],
+    sum_kite_masses_kg: f64,
+    tether_mass_kg: f64,
+    payload_mass_kg: f64,
+    payload_to_lifter_mass_ratio: f64,
+}
+
+fn frame_mass_summary<const NK: usize>(params: &Params<f64, NK>) -> FrameMassSummary<NK> {
+    let kite_masses_kg = from_fn(|index| params.kites[index].rigid_body.mass);
+    let sum_kite_masses_kg = kite_masses_kg.iter().copied().sum::<f64>();
+    let upper_tether_mass = params
+        .kites
+        .iter()
+        .map(|kite| kite.tether.total_mass)
+        .sum::<f64>();
+    let tether_mass_kg = params.common_tether.total_mass + upper_tether_mass;
+    let payload_mass_kg = params.payload_mass;
+    let lifter_mass_kg = sum_kite_masses_kg + tether_mass_kg;
+    let payload_to_lifter_mass_ratio = if lifter_mass_kg > 0.0 {
+        payload_mass_kg / lifter_mass_kg
+    } else {
+        0.0
+    };
+
+    FrameMassSummary {
+        kite_masses_kg,
+        sum_kite_masses_kg,
+        tether_mass_kg,
+        payload_mass_kg,
+        payload_to_lifter_mass_ratio,
+    }
+}
+
 fn finalize_summary<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
     duration: f64,
     accepted_steps: usize,
@@ -992,6 +1120,7 @@ fn simulate<
     let mut rejected_steps_interval = 0usize;
     let mut substeps_interval = 0usize;
     let mut interval_dt = 0.0_f64;
+    let frame_masses = frame_mass_summary(&params);
 
     loop {
         let (_, diagnostics_for_controller) = rhs.eval(&state, &controls, &params)?;
@@ -1030,6 +1159,11 @@ fn simulate<
                 kite_bridle_positions_n,
                 control_ring_center_n: params.controller.disk_center_n,
                 control_ring_radius: params.controller.disk_radius,
+                kite_masses_kg: frame_masses.kite_masses_kg,
+                sum_kite_masses_kg: frame_masses.sum_kite_masses_kg,
+                tether_mass_kg: frame_masses.tether_mass_kg,
+                payload_mass_kg: frame_masses.payload_mass_kg,
+                payload_to_lifter_mass_ratio: frame_masses.payload_to_lifter_mass_ratio,
                 common_tether_tensions,
                 upper_tether_tensions,
             };
@@ -1119,6 +1253,7 @@ fn simulate_passive<
     let mut rejected_steps_interval = 0usize;
     let mut substeps_interval = 0usize;
     let mut interval_dt = 0.0_f64;
+    let frame_masses = frame_mass_summary(&params);
 
     loop {
         let (_, diagnostics) = rhs.eval(&state, &controls, &params)?;
@@ -1145,6 +1280,11 @@ fn simulate_passive<
                 kite_bridle_positions_n,
                 control_ring_center_n: params.controller.disk_center_n,
                 control_ring_radius: params.controller.disk_radius,
+                kite_masses_kg: frame_masses.kite_masses_kg,
+                sum_kite_masses_kg: frame_masses.sum_kite_masses_kg,
+                tether_mass_kg: frame_masses.tether_mass_kg,
+                payload_mass_kg: frame_masses.payload_mass_kg,
+                payload_to_lifter_mass_ratio: frame_masses.payload_to_lifter_mass_ratio,
                 common_tether_tensions,
                 upper_tether_tensions,
             };
@@ -1420,6 +1560,96 @@ mod tests {
         state.renormalize_attitudes();
         let (_, diag) = evaluate_rhs(&state, &controls, params);
         diag.kites[0].beta
+    }
+
+    fn assert_close(actual: f64, expected: f64, tolerance: f64, label: &str) {
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{label}: expected {expected:.12}, got {actual:.12}"
+        );
+    }
+
+    #[test]
+    fn performance_scale_applies_vehicle_family_laws() {
+        let base_init = InitRequest {
+            preset: Preset::Swarm,
+            swarm_kites: 2,
+            ..InitRequest::default()
+        };
+        let scaled_init = InitRequest {
+            preset: Preset::Swarm,
+            swarm_kites: 2,
+            performance_scale_percent: Some(225.0),
+            ..InitRequest::default()
+        };
+        let base = base_params::<2>(&base_init).expect("base params");
+        let mut scaled = base_params::<2>(&scaled_init).expect("scaled params");
+        let mu = 2.25_f64;
+        let sqrt_mu = mu.sqrt();
+
+        assert_close(
+            scaled.kites[0].rigid_body.mass,
+            base.kites[0].rigid_body.mass * mu,
+            1.0e-12,
+            "vehicle mass",
+        );
+        assert_close(
+            scaled.kites[0].aero.ref_area,
+            base.kites[0].aero.ref_area * mu,
+            1.0e-12,
+            "reference area",
+        );
+        assert_close(
+            scaled.kites[0].aero.ref_span,
+            base.kites[0].aero.ref_span * sqrt_mu,
+            1.0e-12,
+            "reference span",
+        );
+        assert_close(
+            scaled.kites[0].aero.ref_chord,
+            base.kites[0].aero.ref_chord * sqrt_mu,
+            1.0e-12,
+            "reference chord",
+        );
+        assert_close(
+            scaled.kites[0].rigid_body.inertia_diagonal[0],
+            base.kites[0].rigid_body.inertia_diagonal[0] * mu * mu,
+            1.0e-12,
+            "body inertia",
+        );
+        assert_close(
+            scaled.kites[0].rotor.thrust_scale,
+            base.kites[0].rotor.thrust_scale * mu,
+            1.0e-12,
+            "rotor thrust capacity",
+        );
+        assert_close(
+            scaled.kites[0].rotor.torque_scale,
+            base.kites[0].rotor.torque_scale * mu,
+            1.0e-12,
+            "rotor power capacity",
+        );
+        assert_close(
+            scaled.controller.trim.motor_torque,
+            base.controller.trim.motor_torque * mu,
+            1.0e-12,
+            "trim motor torque",
+        );
+
+        let config = SimulationConfig::default();
+        apply_simulation_config_to_params(&mut scaled, &config, &scaled_init);
+        assert_close(
+            scaled.controller.tuning.motor_torque_max_nm,
+            config.controller_tuning.motor_torque_max_nm * mu,
+            1.0e-12,
+            "controller motor torque limit",
+        );
+        assert_close(
+            scaled.controller.tuning.tecs_thrust_integrator_limit_nm,
+            config.controller_tuning.tecs_thrust_integrator_limit_nm * mu,
+            1.0e-12,
+            "TECS thrust integrator limit",
+        );
     }
 
     #[test]

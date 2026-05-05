@@ -102,6 +102,29 @@
               <input id="payload-mass" type="number" min="1" step="any" value="100" />
             </label>
             <label>
+              Vehicle performance scale (%)
+              <input id="performance-scale-percent" type="text" inputmode="decimal" placeholder="100 [%]" />
+              <span class="form-hint">Blank is 100%. Scales the aircraft as a similar vehicle family before the run.</span>
+            </label>
+            <details class="performance-scale-card" aria-label="Vehicle performance scaling equations">
+              <summary class="performance-scale-title">Performance scaling law</summary>
+              <div class="performance-scale-body">
+                <div class="performance-scale-equations">
+                  <code>μ = scale / 100%</code>
+                  <code>m = m0 * μ</code>
+                  <code>S_ref = S0 * μ</code>
+                  <code>b_ref = b0 * sqrt(μ)</code>
+                  <code>c_ref = c0 * sqrt(μ)</code>
+                  <code>T_max = T0 * μ</code>
+                  <code>P_max = P0 * μ</code>
+                  <code>I_body = I0 * μ^2</code>
+                </div>
+                <div id="performance-scale-preview" class="performance-scale-preview" aria-live="polite">
+                  <div class="performance-scale-loading">Loading scale preview...</div>
+                </div>
+              </div>
+            </details>
+            <label>
               Wind (m/s)
               <input id="wind-speed" type="number" min="0" step="any" value="5" />
             </label>
@@ -245,12 +268,14 @@
       <section class="panel scene">
         <div id="viewport"></div>
         <div id="scene-failure-banner" class="scene-failure-banner" aria-live="polite"></div>
+        <div id="mass-overlay" class="mass-overlay" aria-live="polite" hidden></div>
         <details class="form-section visualization-panel scene-visualization-panel" id="visualization-panel" open>
           <summary class="form-section-title">Visualization</summary>
           <label>
             Camera Target
             <select id="camera-follow-target">
               <option value="manual">Manual</option>
+              <option value="kite_center" selected>Kite Center</option>
               <option value="disk_center">Disk Center</option>
               <option value="y_joint">Y Joint</option>
             </select>

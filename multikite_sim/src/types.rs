@@ -117,6 +117,7 @@ impl Default for SimulationConfig {
 pub struct InitRequest {
     pub preset: Preset,
     pub payload_mass_kg: Option<f64>,
+    pub performance_scale_percent: Option<f64>,
     pub wind_speed_mps: Option<f64>,
     pub swarm_kites: usize,
     pub swarm_disk_altitude_m: Option<f64>,
@@ -131,6 +132,7 @@ impl Default for InitRequest {
         Self {
             preset: Preset::Swarm,
             payload_mass_kg: None,
+            performance_scale_percent: None,
             wind_speed_mps: None,
             swarm_kites: DEFAULT_SWARM_KITES,
             swarm_disk_altitude_m: None,
@@ -140,6 +142,28 @@ impl Default for InitRequest {
             swarm_common_tether_length_m: None,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VehiclePerformanceSnapshot {
+    pub scale_percent: f64,
+    pub mu: f64,
+    pub mass_kg: f64,
+    pub s_ref_m2: f64,
+    pub b_ref_m: f64,
+    pub c_ref_m: f64,
+    pub thrust_capacity_scale: f64,
+    pub power_capacity_scale: f64,
+    pub inertia_kg_m2: [f64; 3],
+    pub trim_motor_torque_nm: f64,
+    pub motor_torque_max_nm: f64,
+    pub tecs_thrust_integrator_limit_nm: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VehiclePerformanceScalingPreview {
+    pub baseline: VehiclePerformanceSnapshot,
+    pub scaled: VehiclePerformanceSnapshot,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -313,6 +337,8 @@ pub struct RotorParams<T> {
     pub axis_b: Vector3<T>,
     pub position_b: Vector3<T>,
     pub radius: T,
+    pub thrust_scale: T,
+    pub torque_scale: T,
     pub inertia: T,
     pub sign: T,
     pub initial_speed: T,
@@ -700,6 +726,9 @@ pub struct KiteDiagnostics<T> {
     pub cad_velocity_n: Vector3<T>,
     pub body_accel_b: Vector3<T>,
     pub body_accel_n: Vector3<T>,
+    pub felt_accel_g_b: Vector3<T>,
+    pub tether_load_g_b: Vector3<T>,
+    pub aero_load_g_b: Vector3<T>,
     pub omega_b: Vector3<T>,
     pub airspeed: T,
     pub alpha: T,
@@ -840,6 +869,11 @@ pub struct SimulationFrame<T, const NK: usize, const N_COMMON: usize, const N_UP
     pub kite_bridle_positions_n: [Vector3<T>; NK],
     pub control_ring_center_n: Vector3<T>,
     pub control_ring_radius: T,
+    pub kite_masses_kg: [T; NK],
+    pub sum_kite_masses_kg: T,
+    pub tether_mass_kg: T,
+    pub payload_mass_kg: T,
+    pub payload_to_lifter_mass_ratio: T,
     pub common_tether_tensions: Vec<T>,
     pub upper_tether_tensions: Vec<Vec<T>>,
 }

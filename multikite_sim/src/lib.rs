@@ -19,7 +19,7 @@ pub use runtime::{
     simulate_free_flight1_with_callbacks, simulate_free_flight1_with_progress,
     simulate_simple_tether, simulate_simple_tether_with_callbacks,
     simulate_simple_tether_with_progress, simulate_swarm, simulate_swarm_with_callbacks,
-    simulate_swarm_with_progress, swarm_configuration,
+    simulate_swarm_with_progress, swarm_configuration, vehicle_performance_scaling_preview,
 };
 pub use types::{
     AeroParams, BodyState, ControlSurfaces, ControllerGains, ControllerTuning, Controls,
@@ -28,4 +28,5 @@ pub use types::{
     LongitudinalMode, MAX_SWARM_KITES, MIN_SWARM_KITES, MassContactParams, Params, PhaseMode,
     Preset, PresetInfo, RotorParams, RunResult, RunSummary, SimulationConfig, SimulationFailure,
     SimulationFrame, SimulationProgress, State, TetherNode, TetherParams,
+    VehiclePerformanceScalingPreview, VehiclePerformanceSnapshot,
 };

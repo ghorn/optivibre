@@ -5,7 +5,7 @@ type PhaseMode = "adaptive" | "open_loop";
 type LongitudinalMode = "total_energy" | "max_throttle_altitude_pitch";
 type Preset = "swarm" | "free_flight1" | "simple_tether";
 type TimeDilationPreset = "fast" | "10" | "5" | "2" | "1" | "0.5" | "0.1";
-type CameraFollowTarget = "manual" | "disk_center" | "y_joint" | `kite:${number}`;
+type CameraFollowTarget = "manual" | "kite_center" | "disk_center" | "y_joint" | `kite:${number}`;
 type RuntimeTab = "console" | "plots";
 type TetherTensionScaleMode = "payload" | "run_peak" | "fixed";
 
@@ -97,6 +97,26 @@ interface SimulationDefaults {
   controller_tuning: ControllerTuning;
 }
 
+interface VehiclePerformanceSnapshot {
+  scale_percent: number;
+  mu: number;
+  mass_kg: number;
+  s_ref_m2: number;
+  b_ref_m: number;
+  c_ref_m: number;
+  thrust_capacity_scale: number;
+  power_capacity_scale: number;
+  inertia_kg_m2: [number, number, number];
+  trim_motor_torque_nm: number;
+  motor_torque_max_nm: number;
+  tecs_thrust_integrator_limit_nm: number;
+}
+
+interface VehiclePerformanceScalingPreview {
+  baseline: VehiclePerformanceSnapshot;
+  scaled: VehiclePerformanceSnapshot;
+}
+
 interface RunSummary {
   duration: number;
   accepted_steps: number;
@@ -153,6 +173,11 @@ interface ApiFrame {
   kite_bridle_radius: number[];
   control_ring_center_n: [number, number, number];
   control_ring_radius: number;
+  kite_masses_kg: number[];
+  sum_kite_masses_kg: number;
+  tether_mass_kg: number;
+  payload_mass_kg: number;
+  payload_to_lifter_mass_ratio: number;
   common_tether: [number, number, number][];
   common_tether_tensions: number[];
   upper_tethers: [number, number, number][][];
@@ -223,6 +248,9 @@ interface ApiFrame {
   motor_torque_p: number[];
   motor_torque_i: number[];
   top_tension: number[];
+  felt_accel_g_b: [number, number, number][];
+  tether_load_g_b: [number, number, number][];
+  aero_load_g_b: [number, number, number][];
   total_force_b: [number, number, number][];
   aero_force_b: [number, number, number][];
   aero_force_drag_b: [number, number, number][];
@@ -341,6 +369,12 @@ const durationInput = document.querySelector<HTMLInputElement>("#duration")!;
 const dtControlInput = document.querySelector<HTMLInputElement>("#dt-control")!;
 const phaseModeSelect = document.querySelector<HTMLSelectElement>("#phase-mode")!;
 const payloadInput = document.querySelector<HTMLInputElement>("#payload-mass")!;
+const performanceScaleInput = document.querySelector<HTMLInputElement>(
+  "#performance-scale-percent"
+)!;
+const performanceScalePreviewNode = document.querySelector<HTMLElement>(
+  "#performance-scale-preview"
+)!;
 const windInput = document.querySelector<HTMLInputElement>("#wind-speed")!;
 const bridleEnabledInput = document.querySelector<HTMLInputElement>("#bridle-enabled")!;
 const simNoiseInput = document.querySelector<HTMLInputElement>("#sim-noise")!;
@@ -421,6 +455,7 @@ const layoutNode = document.querySelector<HTMLElement>(".layout")!;
 const viewport = document.querySelector<HTMLElement>("#viewport")!;
 const sidebarResizeHandle = document.querySelector<HTMLElement>("#sidebar-resize-handle")!;
 const sceneResizeHandle = document.querySelector<HTMLElement>("#scene-resize-handle")!;
+const massOverlayNode = document.querySelector<HTMLElement>("#mass-overlay")!;
 const controlLabelLayer = document.querySelector<HTMLElement>("#control-label-layer")!;
 const runForm = document.querySelector<HTMLFormElement>("#run-form")!;
 const runButton = document.querySelector<HTMLButtonElement>("#run-button")!;
@@ -430,7 +465,9 @@ const controllerDocsNode = document.querySelector<HTMLElement>("#controller-docs
 
 let presetInfoById = new Map<Preset, PresetInfo>();
 let simulationDefaults: SimulationDefaults | null = null;
+let performanceScalePreviewRequestSerial = 0;
 const DEFAULT_PRESET: Preset = "swarm";
+const DEFAULT_CAMERA_FOLLOW_TARGET: CameraFollowTarget = "kite_center";
 
 type TuningMode = "total_energy" | "max_throttle_altitude_pitch";
 type GuidanceMode = "rabbit" | "curvature" | "switch";
@@ -1010,6 +1047,7 @@ let activeSummaryRequest: {
   rk_abs_tol: number;
   rk_rel_tol: number;
   max_substeps: number;
+  performance_scale_percent: number | null;
   controller_tuning: ControllerTuning;
 } | null = null;
 let runInProgress = false;
@@ -1154,6 +1192,47 @@ function escapeHtml(value: string): string {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+function formatMassKg(massKg: number): string {
+  if (!Number.isFinite(massKg)) {
+    return "--";
+  }
+  return `${massKg.toFixed(1)} kg`;
+}
+
+function massRowHtml(label: string, value: string, extraClass = ""): string {
+  return `
+    <div class="mass-row ${extraClass}">
+      <div class="mass-label">${escapeHtml(label)}</div>
+      <div class="mass-value">${escapeHtml(value)}</div>
+    </div>`;
+}
+
+function clearMassOverlay(): void {
+  massOverlayNode.innerHTML = "";
+  massOverlayNode.hidden = true;
+}
+
+function renderMassOverlay(frame: ApiFrame): void {
+  const kiteRows = frame.kite_masses_kg.length > 0
+    ? frame.kite_masses_kg
+        .map((massKg, index) => massRowHtml(`Kite ${index + 1}`, formatMassKg(massKg)))
+        .join("")
+    : massRowHtml("Kites", "none");
+  const ratio = Number.isFinite(frame.payload_to_lifter_mass_ratio)
+    ? frame.payload_to_lifter_mass_ratio.toFixed(3)
+    : "--";
+
+  massOverlayNode.innerHTML = `
+    <div class="mass-title">Mass Summary</div>
+    ${kiteRows}
+    <div class="mass-divider"></div>
+    ${massRowHtml("Kites total", formatMassKg(frame.sum_kite_masses_kg))}
+    ${massRowHtml("Tether", formatMassKg(frame.tether_mass_kg))}
+    ${massRowHtml("Payload", formatMassKg(frame.payload_mass_kg))}
+    ${massRowHtml("Payload / (kites + tether)", ratio, "mass-ratio")}`;
+  massOverlayNode.hidden = false;
 }
 
 function summaryRowsHtml(rows: SummaryMetric[]): string {
@@ -2493,15 +2572,20 @@ function selectedSwarmKiteCount(): number {
 }
 
 function optionalInputValue(input: HTMLInputElement): number | null {
-  if (input.value.trim() === "") {
+  const trimmed = input.value.trim();
+  if (trimmed === "") {
     return null;
   }
-  const value = input.valueAsNumber;
+  const value = Number(trimmed);
   return Number.isFinite(value) ? value : null;
 }
 
 function optionalMetersLabel(value: number | null): string {
   return value === null ? "auto" : `${compactNumberInputValue(value)} m`;
+}
+
+function optionalPercentLabel(value: number | null): string {
+  return value === null ? "100%" : `${compactNumberInputValue(value)}%`;
 }
 
 function syncSwarmOptionsVisibility(): void {
@@ -2593,6 +2677,88 @@ function compactNumberInputValue(value: number): string {
     return value.toExponential(3).replace(/\.?0+e/, "e");
   }
   return String(Number(value.toPrecision(8)));
+}
+
+function formatPerformanceScalar(value: number, unit = ""): string {
+  const formatted = compactNumberInputValue(value);
+  return unit === "" ? formatted : `${formatted} ${unit}`;
+}
+
+function formatPerformanceVector(values: [number, number, number], unit: string): string {
+  return `${values.map((value) => compactNumberInputValue(value)).join(" / ")} ${unit}`;
+}
+
+function performancePreviewRow(
+  label: string,
+  baseline: string,
+  scaled: string
+): string {
+  return `
+    <div class="performance-scale-preview-row">
+      <div class="performance-scale-preview-label">${escapeHtml(label)}</div>
+      <div class="performance-scale-preview-value">${escapeHtml(baseline)}</div>
+      <div class="performance-scale-preview-value">${escapeHtml(scaled)}</div>
+    </div>`;
+}
+
+function renderPerformanceScalePreview(preview: VehiclePerformanceScalingPreview): void {
+  const base = preview.baseline;
+  const scaled = preview.scaled;
+  const rows = [
+    ["Scale", formatPerformanceScalar(base.scale_percent, "%"), formatPerformanceScalar(scaled.scale_percent, "%")],
+    ["μ", formatPerformanceScalar(base.mu), formatPerformanceScalar(scaled.mu)],
+    ["m", formatPerformanceScalar(base.mass_kg, "kg"), formatPerformanceScalar(scaled.mass_kg, "kg")],
+    ["S_ref", formatPerformanceScalar(base.s_ref_m2, "m^2"), formatPerformanceScalar(scaled.s_ref_m2, "m^2")],
+    ["b_ref", formatPerformanceScalar(base.b_ref_m, "m"), formatPerformanceScalar(scaled.b_ref_m, "m")],
+    ["c_ref", formatPerformanceScalar(base.c_ref_m, "m"), formatPerformanceScalar(scaled.c_ref_m, "m")],
+    ["T_max scale", formatPerformanceScalar(base.thrust_capacity_scale), formatPerformanceScalar(scaled.thrust_capacity_scale)],
+    ["P_max scale", formatPerformanceScalar(base.power_capacity_scale), formatPerformanceScalar(scaled.power_capacity_scale)],
+    ["I_body xyz", formatPerformanceVector(base.inertia_kg_m2, "kg m^2"), formatPerformanceVector(scaled.inertia_kg_m2, "kg m^2")],
+    ["Trim torque", formatPerformanceScalar(base.trim_motor_torque_nm, "N m"), formatPerformanceScalar(scaled.trim_motor_torque_nm, "N m")],
+    ["Torque limit", formatPerformanceScalar(base.motor_torque_max_nm, "N m"), formatPerformanceScalar(scaled.motor_torque_max_nm, "N m")],
+    [
+      "TECS thrust I limit",
+      formatPerformanceScalar(base.tecs_thrust_integrator_limit_nm, "N m"),
+      formatPerformanceScalar(scaled.tecs_thrust_integrator_limit_nm, "N m")
+    ]
+  ];
+  performanceScalePreviewNode.innerHTML = `
+    <div class="performance-scale-preview-row performance-scale-preview-head">
+      <div>Quantity</div>
+      <div>Default</div>
+      <div>Current</div>
+    </div>
+    ${rows.map(([label, baseline, current]) => performancePreviewRow(label, baseline, current)).join("")}`;
+}
+
+async function refreshPerformanceScalePreview(): Promise<void> {
+  const requestSerial = ++performanceScalePreviewRequestSerial;
+  const scalePercent = optionalInputValue(performanceScaleInput);
+  const query = new URLSearchParams();
+  if (scalePercent !== null) {
+    query.set("scale_percent", String(scalePercent));
+  }
+
+  try {
+    const url = query.size > 0
+      ? `/api/performance_scaling?${query.toString()}`
+      : "/api/performance_scaling";
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`server returned ${response.status}`);
+    }
+    const preview = (await response.json()) as VehiclePerformanceScalingPreview;
+    if (requestSerial === performanceScalePreviewRequestSerial) {
+      renderPerformanceScalePreview(preview);
+    }
+  } catch (error) {
+    if (requestSerial !== performanceScalePreviewRequestSerial) {
+      return;
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    performanceScalePreviewNode.innerHTML = `
+      <div class="performance-scale-error">Failed to load scale preview: ${escapeHtml(message)}</div>`;
+  }
 }
 
 function renderControllerTuningControls(tuning: ControllerTuning): void {
@@ -2877,6 +3043,7 @@ function resetPlaybackState(label: string, rate: number | null): void {
   playbackStartSimTime = 0;
   shouldSnapOrbitTargetToFrame = !hasRenderedSimulationFrame && currentCameraFollowTarget() === "manual";
   lastRenderedFrame = null;
+  clearMassOverlay();
   observedTetherTensionMin = Number.POSITIVE_INFINITY;
   observedTetherTensionMax = Number.NEGATIVE_INFINITY;
   resetCameraFollowState();
@@ -3247,6 +3414,14 @@ function bodyComponent(
   axis: 0 | 1 | 2
 ): number {
   return values?.[kiteIndex]?.[axis] ?? 0;
+}
+
+function bodyVectorMagnitude(
+  values: [number, number, number][] | undefined,
+  kiteIndex: number
+): number {
+  const value = values?.[kiteIndex];
+  return value ? Math.hypot(value[0], value[1], value[2]) : 0;
 }
 
 function buildEnergyGroups(): PlotGroupDefinition[] {
@@ -4458,8 +4633,92 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
     {
       title: "Physics / Forces & Moments",
       description:
-        "Body-axis loads generated by the simulated plant. These plots separate total force or moment from the source terms that create it, so you can see whether the tether, aerodynamics, gravity, or propulsion is driving the motion.",
+        "Body-axis loads generated by the simulated plant. Load-factor plots are in g units; force and moment plots separate the source terms that drive the motion.",
       groups: [
+        buildPerKiteGroup(
+          kiteCount,
+          "Felt Acceleration Magnitude (g)",
+          "g",
+          (frame, kiteIndex) => bodyVectorMagnitude(frame.felt_accel_g_b, kiteIndex)
+        ),
+        buildPerKiteBreakdownGroup(kiteCount, "Felt Acceleration Components (g)", "g", [
+          {
+            name: "Body X",
+            width: 2.5,
+            alpha: 0.95,
+            value: (frame, kiteIndex) => bodyComponent(frame.felt_accel_g_b, kiteIndex, 0)
+          },
+          {
+            name: "Body Y",
+            dash: "dash",
+            width: 2.2,
+            alpha: 0.86,
+            value: (frame, kiteIndex) => bodyComponent(frame.felt_accel_g_b, kiteIndex, 1)
+          },
+          {
+            name: "Body Z",
+            dash: "dot",
+            width: 2.1,
+            alpha: 0.82,
+            value: (frame, kiteIndex) => bodyComponent(frame.felt_accel_g_b, kiteIndex, 2)
+          }
+        ]),
+        buildPerKiteGroup(
+          kiteCount,
+          "Tether Load Magnitude (g)",
+          "g",
+          (frame, kiteIndex) => bodyVectorMagnitude(frame.tether_load_g_b, kiteIndex)
+        ),
+        buildPerKiteBreakdownGroup(kiteCount, "Tether Load Components (g)", "g", [
+          {
+            name: "Body X",
+            width: 2.5,
+            alpha: 0.95,
+            value: (frame, kiteIndex) => bodyComponent(frame.tether_load_g_b, kiteIndex, 0)
+          },
+          {
+            name: "Body Y",
+            dash: "dash",
+            width: 2.2,
+            alpha: 0.86,
+            value: (frame, kiteIndex) => bodyComponent(frame.tether_load_g_b, kiteIndex, 1)
+          },
+          {
+            name: "Body Z",
+            dash: "dot",
+            width: 2.1,
+            alpha: 0.82,
+            value: (frame, kiteIndex) => bodyComponent(frame.tether_load_g_b, kiteIndex, 2)
+          }
+        ]),
+        buildPerKiteGroup(
+          kiteCount,
+          "Aero Load Magnitude (g)",
+          "g",
+          (frame, kiteIndex) => bodyVectorMagnitude(frame.aero_load_g_b, kiteIndex)
+        ),
+        buildPerKiteBreakdownGroup(kiteCount, "Aero Load Components (g)", "g", [
+          {
+            name: "Body X",
+            width: 2.5,
+            alpha: 0.95,
+            value: (frame, kiteIndex) => bodyComponent(frame.aero_load_g_b, kiteIndex, 0)
+          },
+          {
+            name: "Body Y",
+            dash: "dash",
+            width: 2.2,
+            alpha: 0.86,
+            value: (frame, kiteIndex) => bodyComponent(frame.aero_load_g_b, kiteIndex, 1)
+          },
+          {
+            name: "Body Z",
+            dash: "dot",
+            width: 2.1,
+            alpha: 0.82,
+            value: (frame, kiteIndex) => bodyComponent(frame.aero_load_g_b, kiteIndex, 2)
+          }
+        ]),
         buildPerKiteBreakdownGroup(kiteCount, "Body X Force Breakdown (N)", "N", [
           {
             name: "Total",
@@ -4670,7 +4929,7 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
           }
         ])
       ],
-      maxColumns: 2
+      maxColumns: 3
     },
     {
       title: "Physics / Aero Model Terms",
@@ -4743,6 +5002,7 @@ function formatProgressSummary(
     rk_abs_tol: number;
     rk_rel_tol: number;
     max_substeps: number;
+    performance_scale_percent: number | null;
   },
   progress: SimulationProgress,
   receivedFrames: number,
@@ -4767,6 +5027,7 @@ function formatProgressSummary(
       },
       { label: "Phase Mode", value: request.phase_mode },
       { label: "Longitudinal", value: longitudinalModeLabel(request.longitudinal_mode) },
+      { label: "Performance Scale", value: optionalPercentLabel(request.performance_scale_percent) },
       { label: "Bridle", value: request.bridle_enabled ? "Enabled" : "CG attach" },
       { label: "Sim Noise", value: request.sim_noise_enabled ? "Dryden gusts" : "Off" },
       {
@@ -4821,6 +5082,10 @@ function formatRunSummary(
       {
         label: "Longitudinal",
         value: longitudinalModeLabel(activeSummaryRequest?.longitudinal_mode ?? "total_energy")
+      },
+      {
+        label: "Performance Scale",
+        value: optionalPercentLabel(activeSummaryRequest?.performance_scale_percent ?? null)
       },
       { label: "Frames", value: `${receivedFrames} received / ${renderedFrames} rendered` },
       {
@@ -4906,6 +5171,7 @@ function updateCameraFollowOptions(kiteCount: number): void {
 
   const options: Array<{ value: CameraFollowTarget; label: string }> = [
     { value: "manual", label: "Manual" },
+    { value: "kite_center", label: "Kite Center" },
     { value: "disk_center", label: "Disk Center" },
     { value: "y_joint", label: "Y Joint" }
   ];
@@ -4926,7 +5192,7 @@ function updateCameraFollowOptions(kiteCount: number): void {
 
   const nextValue = options.some((optionDef) => optionDef.value === previousValue)
     ? previousValue
-    : "disk_center";
+    : DEFAULT_CAMERA_FOLLOW_TARGET;
   cameraFollowTargetSelect.value = nextValue;
   updateCameraFollowUiState();
 }
@@ -5003,6 +5269,11 @@ function cameraFollowTargetPosition(frame: ApiFrame): THREE.Vector3 | null {
   const selection = currentCameraFollowTarget();
   if (selection === "manual") {
     return null;
+  }
+  if (selection === "kite_center") {
+    return frame.kite_positions_n.length > 0
+      ? toThree(meanVector(frame.kite_positions_n))
+      : toThree(frame.splitter_position_n);
   }
   if (selection === "disk_center") {
     if (frame.kite_positions_n.length > 0 && frame.control_ring_radius > 1.0e-6) {
@@ -6420,6 +6691,7 @@ function renderControlFeatureLayer(
 function renderFrame(frame: ApiFrame): void {
   lastRenderedFrame = frame;
   hasRenderedSimulationFrame = true;
+  renderMassOverlay(frame);
   ensureKites(frame.kite_positions_n.length, frame);
   const showAdaptiveSlots = activeSummaryRequest?.phase_mode === "adaptive";
   payloadMesh.position.copy(toThree(frame.payload_position_n));
@@ -7114,6 +7386,7 @@ async function startSimulation(): Promise<void> {
   const swarmAircraftAltitudeM = optionalInputValue(swarmAircraftAltitudeInput);
   const swarmUpperTetherLengthM = positiveInputValue(swarmUpperTetherLengthInput, 120);
   const swarmCommonTetherLengthM = positiveInputValue(swarmCommonTetherLengthInput, 150);
+  const performanceScalePercent = optionalInputValue(performanceScaleInput);
   const request = {
     preset: presetSelect.value,
     swarm_kites: selectedSwarmKiteCount(),
@@ -7129,6 +7402,7 @@ async function startSimulation(): Promise<void> {
       ? "max_throttle_altitude_pitch"
       : "total_energy") as LongitudinalMode,
     payload_mass_kg: Number(payloadInput.value),
+    performance_scale_percent: performanceScalePercent,
     wind_speed_mps: Number(windInput.value),
     bridle_enabled: bridleEnabledInput.checked,
     sim_noise_enabled: simNoiseInput.checked,
@@ -7166,6 +7440,7 @@ async function startSimulation(): Promise<void> {
     rk_abs_tol: request.rk_abs_tol,
     rk_rel_tol: request.rk_rel_tol,
     max_substeps: request.max_substeps,
+    performance_scale_percent: request.performance_scale_percent,
     controller_tuning: request.controller_tuning
   };
   resetPlaybackState(playbackLabel, playbackRate);
@@ -7185,6 +7460,7 @@ async function startSimulation(): Promise<void> {
       },
       { label: "Phase Mode", value: request.phase_mode },
       { label: "Longitudinal", value: longitudinalModeLabel(request.longitudinal_mode) },
+      { label: "Performance Scale", value: optionalPercentLabel(request.performance_scale_percent) },
       { label: "Bridle", value: request.bridle_enabled ? "Enabled" : "CG attach" },
       { label: "Sim Noise", value: request.sim_noise_enabled ? "Dryden gusts" : "Off" },
       {
@@ -7214,7 +7490,7 @@ async function startSimulation(): Promise<void> {
     "Run requested"
   );
   appendConsole(
-    `run requested: preset=${request.preset}, kites=${request.swarm_kites}, disk_alt=${optionalMetersLabel(request.swarm_disk_altitude_m)}, disk_radius=${optionalMetersLabel(request.swarm_disk_radius_m)}, aircraft_alt=${optionalMetersLabel(request.swarm_aircraft_altitude_m)}, lower_tether=${compactNumberInputValue(request.swarm_common_tether_length_m)}m, upper_tether=${compactNumberInputValue(request.swarm_upper_tether_length_m)}m, duration=${request.duration}s, dt_control=${compactNumberInputValue(request.dt_control)}s (${(1 / request.dt_control).toFixed(1)} Hz), phase=${request.phase_mode}, longitudinal=${request.longitudinal_mode}, bridle=${request.bridle_enabled ? "enabled" : "cg_attach"}, noise=${request.sim_noise_enabled ? "dryden" : "off"}, dryden_intensity=${compactNumberInputValue(request.dryden.intensity_scale)}, dryden_length=${compactNumberInputValue(request.dryden.length_scale)}, dryden_seed=${request.dryden.seed}, rk_abs_tol=${toleranceLabel(request.rk_abs_tol)}, rk_rel_tol=${toleranceLabel(request.rk_rel_tol)}, max_substeps=${request.max_substeps}, time_dilation=${playbackLabel}`
+    `run requested: preset=${request.preset}, kites=${request.swarm_kites}, disk_alt=${optionalMetersLabel(request.swarm_disk_altitude_m)}, disk_radius=${optionalMetersLabel(request.swarm_disk_radius_m)}, aircraft_alt=${optionalMetersLabel(request.swarm_aircraft_altitude_m)}, lower_tether=${compactNumberInputValue(request.swarm_common_tether_length_m)}m, upper_tether=${compactNumberInputValue(request.swarm_upper_tether_length_m)}m, duration=${request.duration}s, dt_control=${compactNumberInputValue(request.dt_control)}s (${(1 / request.dt_control).toFixed(1)} Hz), phase=${request.phase_mode}, longitudinal=${request.longitudinal_mode}, performance_scale=${optionalPercentLabel(request.performance_scale_percent)}, bridle=${request.bridle_enabled ? "enabled" : "cg_attach"}, noise=${request.sim_noise_enabled ? "dryden" : "off"}, dryden_intensity=${compactNumberInputValue(request.dryden.intensity_scale)}, dryden_length=${compactNumberInputValue(request.dryden.length_scale)}, dryden_seed=${request.dryden.seed}, rk_abs_tol=${toleranceLabel(request.rk_abs_tol)}, rk_rel_tol=${toleranceLabel(request.rk_rel_tol)}, max_substeps=${request.max_substeps}, time_dilation=${playbackLabel}`
   );
   appendConsole(controllerTuningSnapshotLabel(request.controller_tuning));
 
@@ -7451,6 +7727,10 @@ function handleControllerTuningFieldEdit(event: Event): void {
 controllerTuningFieldsNode.addEventListener("input", handleControllerTuningFieldEdit);
 controllerTuningFieldsNode.addEventListener("change", handleControllerTuningFieldEdit);
 
+performanceScaleInput.addEventListener("input", () => {
+  void refreshPerformanceScalePreview();
+});
+
 timeDilationSelect.addEventListener("change", () => {
   applyTimeDilationSelection(true);
 });
@@ -7579,6 +7859,7 @@ void Promise.all([loadDefaultConfig(), loadPresets()]).then(() => {
   syncDrydenTuningVisibility();
   syncTetherTensionScaleVisibility();
   applyPresetDefaults();
+  void refreshPerformanceScalePreview();
   renderControllerDocs();
   return runSimulation();
 });

@@ -70,6 +70,9 @@ fn blank_kite_diag<T: Scalar>() -> KiteDiagnostics<T> {
         cad_velocity_n: zero_vec(),
         body_accel_b: zero_vec(),
         body_accel_n: zero_vec(),
+        felt_accel_g_b: zero_vec(),
+        tether_load_g_b: zero_vec(),
+        aero_load_g_b: zero_vec(),
         omega_b: zero_vec(),
         airspeed: T::zero(),
         alpha: T::zero(),
@@ -850,8 +853,10 @@ fn compute_kite<T: Scalar, const N_UPPER: usize>(
     );
 
     let rotor_fit = reference_rotor_fit_ref();
-    let rotor_aero_thrust = eval_quartic2(&rotor_fit.aero_thrust, airspeed, kite.rotor_speed);
-    let rotor_aero_torque = eval_quartic2(&rotor_fit.aero_torque, airspeed, kite.rotor_speed);
+    let rotor_aero_thrust = params.rotor.thrust_scale
+        * eval_quartic2(&rotor_fit.aero_thrust, airspeed, kite.rotor_speed);
+    let rotor_aero_torque = params.rotor.torque_scale
+        * eval_quartic2(&rotor_fit.aero_torque, airspeed, kite.rotor_speed);
     let rotor_speed_dot = (applied_control.motor_torque - rotor_aero_torque) / params.rotor.inertia;
     let rotor_axis_b = normalize_exact(&params.rotor.axis_b);
     let motor_force = rotor_aero_thrust;
@@ -891,6 +896,17 @@ fn compute_kite<T: Scalar, const N_UPPER: usize>(
         &cross(&kite.body.omega_b, &kite.body.vel_b),
     );
     let inertial_accel_n = rotate_body_to_nav(&kite.body.quat_n2b, &inertial_accel_b);
+    let inv_g = T::one() / common_params.environment.g;
+    let inv_weight = T::one() / (params.rigid_body.mass * common_params.environment.g);
+    let felt_accel_g_b = scale(
+        &sub(
+            &inertial_accel_b,
+            &scale(&gravity_b, T::one() / params.rigid_body.mass),
+        ),
+        inv_g,
+    );
+    let tether_load_g_b = scale(&tether_force_b, inv_weight);
+    let aero_load_g_b = scale(&aero_force_b, inv_weight);
     let angular_momentum = Vector3::new(
         params.rigid_body.inertia_diagonal[0] * kite.body.omega_b[0],
         params.rigid_body.inertia_diagonal[1] * kite.body.omega_b[1],
@@ -969,6 +985,9 @@ fn compute_kite<T: Scalar, const N_UPPER: usize>(
             cad_velocity_n,
             body_accel_b: inertial_accel_b,
             body_accel_n: inertial_accel_n,
+            felt_accel_g_b,
+            tether_load_g_b,
+            aero_load_g_b,
             omega_b: kite.body.omega_b,
             airspeed,
             alpha,
@@ -1439,6 +1458,8 @@ mod tests {
                 axis_b: Vector3::new(1.0, 0.0, 0.0),
                 position_b: Vector3::new(1.0, 0.0, 0.0),
                 radius: 0.07,
+                thrust_scale: 1.0,
+                torque_scale: 1.0,
                 inertia: 0.01,
                 sign: 1.0,
                 initial_speed: 335.0,
