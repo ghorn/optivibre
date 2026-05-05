@@ -10,8 +10,8 @@ use lateral::{
     RollReferenceBreakdown, TETHERED_CURVATURE_Y_INTEGRATOR_OUTPUT_LIMIT,
     TETHERED_CURVATURE_Z_INTEGRATOR_OUTPUT_LIMIT, direct_rabbit_bearing_y,
     direct_rabbit_roll_reference_breakdown, guidance_uses_direct_rabbit,
-    lateral_guidance_curvatures, orbit_roll_feedforward, rate_limit, scheduled_rabbit_distance,
-    speed_integrator_target,
+    lateral_guidance_curvatures, orbit_roll_feedforward, rate_limit, roll_integrator_output_limit,
+    roll_integrator_with_reference_antiwindup, scheduled_rabbit_distance, speed_integrator_target,
 };
 pub(crate) use longitudinal::FreeFlightReference;
 use longitudinal::{
@@ -233,18 +233,18 @@ where
                 request.params.environment.g,
                 tuning,
             );
-            control_state.curvature_to_roll_integrator = clamp(
-                control_state.curvature_to_roll_integrator
-                    + (k_tg_y - curvature_y_est) * request.dt_control,
-                -tuning.roll_curvature_integrator_limit,
-                tuning.roll_curvature_integrator_limit,
-            );
-            let roll_proportional = tuning.roll_curvature_p * (k_tg_y - curvature_y_est);
-            let roll_integrator =
-                tuning.roll_curvature_i * control_state.curvature_to_roll_integrator;
-            let roll_ref = clamp(
-                roll_feedforward + roll_proportional + roll_integrator,
-                -tuning.roll_ref_limit_deg.to_radians(),
+            let curvature_roll_error = k_tg_y - curvature_y_est;
+            let roll_proportional = tuning.roll_curvature_p * curvature_roll_error;
+            let (roll_integrator, roll_ref) = roll_integrator_with_reference_antiwindup(
+                &mut control_state.curvature_to_roll_integrator,
+                curvature_roll_error,
+                request.dt_control,
+                tuning.roll_curvature_i,
+                roll_integrator_output_limit(
+                    tuning.roll_curvature_i,
+                    tuning.roll_curvature_integrator_limit,
+                ),
+                roll_feedforward + roll_proportional,
                 tuning.roll_ref_limit_deg.to_radians(),
             );
             (
@@ -715,6 +715,49 @@ mod tests {
         assert!(tethered_aileron_breakdown(0.0, -roll_error, 0.0, 0.0, &tuning).total > 0.0);
         assert!(tethered_aileron_breakdown(0.0, 0.0, 0.0, 0.5, &tuning).total > 0.0);
         assert!(tethered_aileron_breakdown(0.0, 0.0, 0.0, -0.5, &tuning).total < 0.0);
+    }
+
+    #[test]
+    fn roll_reference_antiwindup_freezes_only_when_pushing_saturation() {
+        let mut integrator_output_state = 0.0;
+        let (integrator, total) = roll_integrator_with_reference_antiwindup(
+            &mut integrator_output_state,
+            1.0,
+            0.1,
+            1.0,
+            1.0,
+            2.0,
+            1.0,
+        );
+        assert_eq!(integrator_output_state, 0.0);
+        assert_eq!(integrator, 0.0);
+        assert_eq!(total, 1.0);
+
+        let (integrator, total) = roll_integrator_with_reference_antiwindup(
+            &mut integrator_output_state,
+            -1.0,
+            0.1,
+            1.0,
+            1.0,
+            2.0,
+            1.0,
+        );
+        assert!((integrator_output_state + 0.1).abs() < 1.0e-12);
+        assert_eq!(integrator, 0.0);
+        assert_eq!(total, 1.0);
+
+        let (integrator, total) = roll_integrator_with_reference_antiwindup(
+            &mut integrator_output_state,
+            1.0,
+            0.1,
+            1.0,
+            1.0,
+            0.0,
+            1.0,
+        );
+        assert_eq!(integrator_output_state, 0.0);
+        assert!((integrator + 0.1).abs() < 1.0e-12);
+        assert!((total + 0.1).abs() < 1.0e-12);
     }
 
     #[test]

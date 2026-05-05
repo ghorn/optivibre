@@ -69,6 +69,72 @@ pub(super) fn rate_limit(current: f64, target: f64, max_rate: f64, dt: f64) -> f
     current + clamp(target - current, -max_rate * dt, max_rate * dt)
 }
 
+pub(super) fn roll_integrator_with_reference_antiwindup(
+    integrator_output_state: &mut f64,
+    error: f64,
+    dt_control: f64,
+    integrator_gain: f64,
+    integrator_output_limit: f64,
+    command_without_integrator: f64,
+    command_limit: f64,
+) -> (f64, f64) {
+    let command_limit = command_limit.abs();
+    let integrator_output_limit = integrator_output_limit.abs();
+    if command_limit <= 0.0
+        || integrator_output_limit <= 0.0
+        || dt_control <= 0.0
+        || integrator_gain.abs() <= 1.0e-9
+    {
+        *integrator_output_state = 0.0;
+        return (
+            0.0,
+            clamp(command_without_integrator, -command_limit, command_limit),
+        );
+    }
+
+    let integrator = clamp(
+        *integrator_output_state,
+        -integrator_output_limit,
+        integrator_output_limit,
+    );
+    *integrator_output_state = integrator;
+
+    let unclamped_total = command_without_integrator + integrator;
+    let (total, allow_negative_increment, allow_positive_increment) =
+        if unclamped_total > command_limit {
+            (command_limit, true, false)
+        } else if unclamped_total < -command_limit {
+            (-command_limit, false, true)
+        } else {
+            (unclamped_total, true, true)
+        };
+
+    let mut increment = error * integrator_gain * dt_control;
+    if allow_negative_increment && !allow_positive_increment {
+        increment = increment.min(0.0);
+    } else if allow_positive_increment && !allow_negative_increment {
+        increment = increment.max(0.0);
+    }
+    *integrator_output_state = clamp(
+        *integrator_output_state + increment,
+        -integrator_output_limit,
+        integrator_output_limit,
+    );
+
+    (integrator, total)
+}
+
+pub(super) fn roll_integrator_output_limit(
+    integrator_gain: f64,
+    legacy_integrator_state_limit: f64,
+) -> f64 {
+    if integrator_gain.abs() > 1.0e-9 {
+        integrator_gain.abs() * legacy_integrator_state_limit.abs()
+    } else {
+        0.0
+    }
+}
+
 pub(super) fn direct_rabbit_bearing_y(rabbit_vector_b: &Vector3<f64>) -> f64 {
     if rabbit_vector_b[0].hypot(rabbit_vector_b[1]) <= 1.0e-9 {
         0.0
@@ -85,21 +151,18 @@ pub(super) fn direct_rabbit_roll_reference_breakdown(
 ) -> RollReferenceBreakdown {
     let bearing_y = direct_rabbit_bearing_y(rabbit_vector_b);
     let limit = tuning.roll_ref_limit_deg.to_radians().abs();
-    if tuning.rabbit_bearing_roll_i.abs() > 1.0e-9 {
-        control_state.rabbit_bearing_to_roll_integrator += bearing_y * dt_control;
-        let integrator_limit = limit / tuning.rabbit_bearing_roll_i.abs();
-        control_state.rabbit_bearing_to_roll_integrator = clamp(
-            control_state.rabbit_bearing_to_roll_integrator,
-            -integrator_limit,
-            integrator_limit,
-        );
-    } else {
-        control_state.rabbit_bearing_to_roll_integrator = 0.0;
-    }
     let proportional = tuning.rabbit_bearing_roll_p * bearing_y;
-    let integrator = tuning.rabbit_bearing_roll_i * control_state.rabbit_bearing_to_roll_integrator;
+    let (integrator, total) = roll_integrator_with_reference_antiwindup(
+        &mut control_state.rabbit_bearing_to_roll_integrator,
+        bearing_y,
+        dt_control,
+        tuning.rabbit_bearing_roll_i,
+        limit,
+        proportional,
+        limit,
+    );
     RollReferenceBreakdown {
-        total: clamp(proportional + integrator, -limit, limit),
+        total,
         feedforward: 0.0,
         proportional,
         integrator,
