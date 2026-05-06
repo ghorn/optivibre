@@ -120,6 +120,8 @@ pub struct SimulationConfig {
     pub transition_to_forward_s: f64,
     #[serde(default)]
     pub transition_to_orbit_s: Option<f64>,
+    #[serde(default = "default_timed_transition_recenter_lead_radii")]
+    pub timed_transition_recenter_lead_radii: f64,
     pub sample_stride: usize,
     pub sim_noise_enabled: bool,
     #[serde(default)]
@@ -142,6 +144,7 @@ impl Default for SimulationConfig {
             forward_frame_mode: ForwardFrameMode::WorldFixed,
             transition_to_forward_s: default_transition_to_forward_s(),
             transition_to_orbit_s: Some(65.0),
+            timed_transition_recenter_lead_radii: default_timed_transition_recenter_lead_radii(),
             sample_stride: 1,
             sim_noise_enabled: true,
             dryden: DrydenConfig::default(),
@@ -154,6 +157,10 @@ impl Default for SimulationConfig {
 
 fn default_transition_to_forward_s() -> f64 {
     5.0
+}
+
+fn default_timed_transition_recenter_lead_radii() -> f64 {
+    1.0
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -598,7 +605,10 @@ impl ControllerTuning<f64> {
             guidance_mode: finite(self.guidance_mode, default.guidance_mode).clamp(0.0, 2.0),
             forward_heading_deg: finite(self.forward_heading_deg, default.forward_heading_deg),
             forward_lookahead_scale: {
-                let scale = finite(self.forward_lookahead_scale, default.forward_lookahead_scale);
+                let scale = finite(
+                    self.forward_lookahead_scale,
+                    default.forward_lookahead_scale,
+                );
                 if scale > 0.0 {
                     scale
                 } else {

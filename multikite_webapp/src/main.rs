@@ -67,6 +67,7 @@ struct RunRequest {
     forward_frame_mode: ForwardFrameMode,
     transition_to_forward_s: Option<f64>,
     transition_to_orbit_s: Option<f64>,
+    timed_transition_recenter_lead_radii: Option<f64>,
     #[serde(default)]
     longitudinal_mode: LongitudinalMode,
     payload_mass_kg: Option<f64>,
@@ -407,6 +408,10 @@ fn config_from_request(request: &RunRequest) -> (InitRequest, SimulationConfig) 
                 defaults.transition_to_forward_s,
             ),
             transition_to_orbit_s: finite_optional_f64(request.transition_to_orbit_s),
+            timed_transition_recenter_lead_radii: nonnegative_f64_or_default(
+                request.timed_transition_recenter_lead_radii,
+                defaults.timed_transition_recenter_lead_radii,
+            ),
             longitudinal_mode: request.longitudinal_mode,
             sample_stride: request.sample_stride.unwrap_or(1).max(1),
             rk_abs_tol: positive_f64_or_default(request.rk_abs_tol, defaults.rk_abs_tol),
@@ -435,6 +440,13 @@ fn config_from_request(request: &RunRequest) -> (InitRequest, SimulationConfig) 
 fn positive_f64_or_default(value: Option<f64>, default: f64) -> f64 {
     match value {
         Some(value) if value.is_finite() && value > 0.0 => value,
+        _ => default,
+    }
+}
+
+fn nonnegative_f64_or_default(value: Option<f64>, default: f64) -> f64 {
+    match value {
+        Some(value) if value.is_finite() && value >= 0.0 => value,
         _ => default,
     }
 }

@@ -85,7 +85,7 @@ fn lateral_outer_mode_value(mode: LateralOuterMode) -> f64 {
     }
 }
 
-fn active_lateral_outer_mode(
+pub(crate) fn active_lateral_outer_mode(
     configured: LateralOuterMode,
     time: f64,
     transition_to_forward_s: f64,
@@ -122,7 +122,7 @@ pub(crate) fn forward_formation_spacing<const NK: usize>(params: &Params<f64, NK
     }
 }
 
-fn forward_frame_heading<const NK: usize>(
+pub(crate) fn forward_frame_heading<const NK: usize>(
     diag: &Diagnostics<f64, NK>,
     mode: ForwardFrameMode,
     fallback_heading_deg: f64,

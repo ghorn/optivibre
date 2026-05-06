@@ -1,3 +1,4 @@
+use crate::math::wrap_angle;
 use crate::types::Diagnostics;
 use nalgebra::Vector3;
 
@@ -112,5 +113,16 @@ impl<const NK: usize> ControllerState<NK> {
                 (-initial_diag.kites[index].cad_position_n[2]).max(0.0)
             }),
         }
+    }
+
+    pub(crate) fn reset_open_loop_phase_reference(
+        &mut self,
+        diag: &Diagnostics<f64, NK>,
+        omega_ref: f64,
+        time: f64,
+    ) {
+        self.initial_phase = std::array::from_fn(|index| {
+            wrap_angle(diag.kites[index].phase_angle - omega_ref * time)
+        });
     }
 }

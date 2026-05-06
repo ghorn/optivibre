@@ -1,18 +1,18 @@
 use crate::assets::{asset_manifest, reference_export};
 use crate::controller::{
-    ControllerState, apply_trace, controller_step, forward_formation_spacing,
-    horizontal_axes_from_heading, lane_slot,
+    ControllerState, active_lateral_outer_mode, apply_trace, controller_step,
+    forward_formation_spacing, forward_frame_heading, horizontal_axes_from_heading, lane_slot,
 };
 use crate::math::{roll_yaw_quaternion_n2b, rotate_nav_to_body, yaw_quaternion_n2b, zero_if_nan};
 use crate::model::{CompiledRhs, compute_bridle_node, compute_tether_link_tensions};
 use crate::turbulence::DrydenField;
 use crate::types::{
     AeroParams, BodyState, BridleParams, ControlSurfaces, ControllerGains, Controls,
-    DEFAULT_SWARM_DISK_ALTITUDE_M, DEFAULT_SWARM_KITES, Diagnostics, Environment, InitRequest,
-    KiteControls, KiteParams, KiteState, MAX_SWARM_KITES, MIN_SWARM_KITES, MassContactParams,
-    Params, Preset, PresetInfo, RotorParams, RunResult, RunSummary, SimulationConfig,
-    SimulationFailure, SimulationFrame, SimulationProgress, State, TetherNode, TetherParams,
-    VehiclePerformanceScalingPreview, VehiclePerformanceSnapshot,
+    DEFAULT_SWARM_DISK_ALTITUDE_M, DEFAULT_SWARM_KITES, Diagnostics, Environment, ForwardFrameMode,
+    InitRequest, KiteControls, KiteParams, KiteState, LateralOuterMode, MAX_SWARM_KITES,
+    MIN_SWARM_KITES, MassContactParams, Params, Preset, PresetInfo, RotorParams, RunResult,
+    RunSummary, SimulationConfig, SimulationFailure, SimulationFrame, SimulationProgress, State,
+    TetherNode, TetherParams, VehiclePerformanceScalingPreview, VehiclePerformanceSnapshot,
 };
 use anyhow::{Result, bail};
 use nalgebra::{Quaternion, Vector3};
@@ -323,6 +323,73 @@ fn apply_simulation_config_to_params<const NK: usize>(
     }
     params.controller.tuning = config.controller_tuning.clone();
     apply_controller_performance_scale(params, init);
+}
+
+fn mean_kite_cad_position_n<const NK: usize>(diag: &Diagnostics<f64, NK>) -> Option<Vector3<f64>> {
+    if NK == 0 {
+        return None;
+    }
+
+    Some(
+        diag.kites
+            .iter()
+            .fold(Vector3::<f64>::zeros(), |acc, kite| {
+                acc + kite.cad_position_n
+            })
+            / NK as f64,
+    )
+}
+
+fn recentered_orbit_disk_center_n(
+    current_center_n: &Vector3<f64>,
+    disk_radius: f64,
+    lead_radii: f64,
+    mean_kite_cad_n: &Vector3<f64>,
+    forward_f_n: &Vector3<f64>,
+) -> Vector3<f64> {
+    let lead_distance = disk_radius * lead_radii.max(0.0);
+    Vector3::new(
+        mean_kite_cad_n[0] + forward_f_n[0] * lead_distance,
+        mean_kite_cad_n[1] + forward_f_n[1] * lead_distance,
+        current_center_n[2],
+    )
+}
+
+fn recenter_orbit_disk_after_forward<const NK: usize>(
+    params: &mut Params<f64, NK>,
+    diag: &Diagnostics<f64, NK>,
+    forward_frame_mode: ForwardFrameMode,
+    lead_radii: f64,
+) -> bool {
+    let Some(mean_kite_cad_n) = mean_kite_cad_position_n(diag) else {
+        return false;
+    };
+    let heading = forward_frame_heading(
+        diag,
+        forward_frame_mode,
+        params.controller.tuning.forward_heading_deg,
+    );
+    let (forward_f_n, _) = horizontal_axes_from_heading(heading);
+    params.controller.disk_center_n = recentered_orbit_disk_center_n(
+        &params.controller.disk_center_n,
+        params.controller.disk_radius,
+        lead_radii,
+        &mean_kite_cad_n,
+        &forward_f_n,
+    );
+    true
+}
+
+fn should_recenter_orbit_disk_after_forward(
+    configured: LateralOuterMode,
+    previous: Option<LateralOuterMode>,
+    current: LateralOuterMode,
+    is_free_flight: bool,
+) -> bool {
+    configured == LateralOuterMode::TimedTransition
+        && !is_free_flight
+        && previous == Some(LateralOuterMode::ForwardFormation)
+        && current == LateralOuterMode::Orbit
 }
 
 fn vehicle_performance_scale(init: &InitRequest) -> f64 {
@@ -1270,9 +1337,41 @@ fn simulate<
     let mut substeps_interval = 0usize;
     let mut interval_dt = 0.0_f64;
     let frame_masses = frame_mass_summary(&params);
+    let is_free_flight = N_COMMON == 0 && N_UPPER == 0;
+    let mut previous_lateral_mode = None;
 
     loop {
-        let (_, diagnostics_for_controller) = rhs.eval(&state, &controls, &params)?;
+        let (_, mut diagnostics_for_controller) = rhs.eval(&state, &controls, &params)?;
+        let active_lateral_mode = if is_free_flight {
+            LateralOuterMode::Orbit
+        } else {
+            active_lateral_outer_mode(
+                config.lateral_outer_mode,
+                time,
+                config.transition_to_forward_s,
+                config.transition_to_orbit_s,
+            )
+        };
+        if should_recenter_orbit_disk_after_forward(
+            config.lateral_outer_mode,
+            previous_lateral_mode,
+            active_lateral_mode,
+            is_free_flight,
+        ) && recenter_orbit_disk_after_forward(
+            &mut params,
+            &diagnostics_for_controller,
+            config.forward_frame_mode,
+            config.timed_transition_recenter_lead_radii,
+        ) {
+            let (_, refreshed_diagnostics) = rhs.eval(&state, &controls, &params)?;
+            diagnostics_for_controller = refreshed_diagnostics;
+            controller_state.reset_open_loop_phase_reference(
+                &diagnostics_for_controller,
+                params.controller.speed_ref / params.controller.disk_radius.max(1.0e-6),
+                time,
+            );
+        }
+        previous_lateral_mode = Some(active_lateral_mode);
         let (next_controls, trace) = controller_step(
             &mut controller_state,
             &state,
@@ -1720,6 +1819,52 @@ mod tests {
             (actual - expected).abs() <= tolerance,
             "{label}: expected {expected:.12}, got {actual:.12}"
         );
+    }
+
+    #[test]
+    fn recentered_orbit_disk_center_preserves_z_and_uses_configured_lead() {
+        let current_center_n = Vector3::new(30.0, -40.0, -350.0);
+        let mean_kite_cad_n = Vector3::new(10.0, 20.0, -275.0);
+        let forward_f_n = Vector3::new(0.0, 1.0, 0.0);
+        let recentered = recentered_orbit_disk_center_n(
+            &current_center_n,
+            70.0,
+            1.5,
+            &mean_kite_cad_n,
+            &forward_f_n,
+        );
+
+        assert_close(recentered[0], 10.0, 1.0e-12, "recentered x");
+        assert_close(recentered[1], 125.0, 1.0e-12, "recentered y");
+        assert_close(recentered[2], -350.0, 1.0e-12, "preserved z");
+    }
+
+    #[test]
+    fn timed_transition_recenter_triggers_only_from_forward_to_orbit() {
+        assert!(!should_recenter_orbit_disk_after_forward(
+            LateralOuterMode::TimedTransition,
+            Some(LateralOuterMode::Orbit),
+            LateralOuterMode::ForwardFormation,
+            false,
+        ));
+        assert!(should_recenter_orbit_disk_after_forward(
+            LateralOuterMode::TimedTransition,
+            Some(LateralOuterMode::ForwardFormation),
+            LateralOuterMode::Orbit,
+            false,
+        ));
+        assert!(!should_recenter_orbit_disk_after_forward(
+            LateralOuterMode::ForwardFormation,
+            Some(LateralOuterMode::ForwardFormation),
+            LateralOuterMode::Orbit,
+            false,
+        ));
+        assert!(!should_recenter_orbit_disk_after_forward(
+            LateralOuterMode::TimedTransition,
+            Some(LateralOuterMode::ForwardFormation),
+            LateralOuterMode::Orbit,
+            true,
+        ));
     }
 
     #[test]

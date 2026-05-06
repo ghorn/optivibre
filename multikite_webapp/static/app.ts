@@ -95,6 +95,7 @@ interface SimulationDefaults {
   forward_frame_mode: ForwardFrameMode;
   transition_to_forward_s: number;
   transition_to_orbit_s: number | null;
+  timed_transition_recenter_lead_radii: number;
   sample_stride: number;
   sim_noise_enabled: boolean;
   dryden: DrydenConfig;
@@ -396,6 +397,9 @@ const transitionToForwardInput = document.querySelector<HTMLInputElement>(
 const transitionToOrbitInput = document.querySelector<HTMLInputElement>(
   "#transition-to-orbit-s"
 )!;
+const transitionRecenterLeadRadiiInput = document.querySelector<HTMLInputElement>(
+  "#transition-recenter-lead-radii"
+)!;
 const forwardFormationOptionsNode = document.querySelector<HTMLElement>(
   "#forward-formation-options"
 )!;
@@ -669,6 +673,12 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color("#071019");
 const sceneFog = new THREE.Fog("#071019", 240, 1800);
 scene.fog = null;
+
+function dynamicSceneObject<T extends THREE.Object3D>(object: T): T {
+  object.frustumCulled = false;
+  return object;
+}
+
 const camera = new THREE.PerspectiveCamera(48, viewport.clientWidth / viewport.clientHeight, 0.1, 5000);
 camera.up.set(0, 0, 1);
 camera.position.set(240, -280, 290);
@@ -723,19 +733,19 @@ const GRID_SIZE = 600;
 const GRID_HALF_EXTENT = GRID_SIZE / 2;
 const AIR_PARTICLE_DISK_CLEARANCE_M = 100;
 
-const payloadMesh = new THREE.Mesh(
+const payloadMesh = dynamicSceneObject(new THREE.Mesh(
   new THREE.SphereGeometry(7, 24, 24),
   new THREE.MeshStandardMaterial({ color: 0xff7b72, roughness: 0.35, metalness: 0.08 })
-);
+));
 scene.add(payloadMesh);
 
-const splitterMesh = new THREE.Mesh(
+const splitterMesh = dynamicSceneObject(new THREE.Mesh(
   new THREE.SphereGeometry(4, 16, 16),
   new THREE.MeshStandardMaterial({ color: 0x45d7a7, roughness: 0.24, metalness: 0.15 })
-);
+));
 
-const orbitTargetMarker = new THREE.Group();
-const orbitTargetCore = new THREE.Mesh(
+const orbitTargetMarker = dynamicSceneObject(new THREE.Group());
+const orbitTargetCore = dynamicSceneObject(new THREE.Mesh(
   new THREE.SphereGeometry(1.0, 18, 18),
   new THREE.MeshStandardMaterial({
     color: 0xffd36b,
@@ -746,7 +756,7 @@ const orbitTargetCore = new THREE.Mesh(
     roughness: 0.2,
     metalness: 0.08
   })
-);
+));
 orbitTargetMarker.add(orbitTargetCore);
 orbitTargetMarker.visible = false;
 scene.add(orbitTargetMarker);
@@ -754,25 +764,25 @@ scene.add(orbitTargetMarker);
 const ORBIT_TARGET_CORE_RADIUS_WORLD = 1.0;
 const ORBIT_TARGET_CORE_PIXELS = 14;
 
-const controlRingLine = new THREE.LineLoop(
+const controlRingLine = dynamicSceneObject(new THREE.LineLoop(
   new THREE.BufferGeometry(),
   new THREE.LineBasicMaterial({
     color: 0x36d5c1,
     transparent: true,
     opacity: 0.42
   })
-);
+));
 controlRingLine.visible = false;
 scene.add(controlRingLine);
 
-const aircraftControlRingLine = new THREE.LineLoop(
+const aircraftControlRingLine = dynamicSceneObject(new THREE.LineLoop(
   new THREE.BufferGeometry(),
   new THREE.LineBasicMaterial({
     color: 0x36d5c1,
     transparent: true,
     opacity: 0.26
   })
-);
+));
 aircraftControlRingLine.visible = false;
 scene.add(aircraftControlRingLine);
 
@@ -975,6 +985,7 @@ const ambientParticleCloud = new THREE.Points(
   ambientParticleGeometry,
   makeSoftParticleMaterial(2.6, 0.45)
 );
+dynamicSceneObject(ambientParticleCloud);
 ambientParticleCloud.visible = false;
 scene.add(ambientParticleCloud);
 
@@ -991,6 +1002,7 @@ const gustParticleCloud = new THREE.Points(
   gustParticleGeometry,
   makeSoftParticleMaterial(3.15, 0.63)
 );
+dynamicSceneObject(gustParticleCloud);
 gustParticleCloud.visible = false;
 scene.add(gustParticleCloud);
 
@@ -1045,6 +1057,7 @@ const wingtipTrailMaterial = new THREE.ShaderMaterial({
   `
 });
 const wingtipTrailCloud = new THREE.Points(wingtipTrailGeometry, wingtipTrailMaterial);
+dynamicSceneObject(wingtipTrailCloud);
 wingtipTrailCloud.visible = false;
 scene.add(wingtipTrailCloud);
 
@@ -1096,6 +1109,7 @@ let activeSummaryRequest: {
   forward_frame_mode: ForwardFrameMode;
   transition_to_forward_s: number;
   transition_to_orbit_s: number | null;
+  timed_transition_recenter_lead_radii: number;
   longitudinal_mode: LongitudinalMode;
   sim_noise_enabled: boolean;
   dryden?: DrydenConfig;
@@ -6140,14 +6154,14 @@ function ensureLineCount(target: number, bucket: THREE.Line[], factory: () => TH
 }
 
 function makeSceneLine(color: number, opacity: number): THREE.Line {
-  return new THREE.Line(
+  return dynamicSceneObject(new THREE.Line(
     new THREE.BufferGeometry(),
     new THREE.LineBasicMaterial({
       color,
       transparent: true,
       opacity
     })
-  );
+  ));
 }
 
 function makeFadedSceneLine(color: number): THREE.Line {
@@ -6175,7 +6189,7 @@ function makeFadedSceneLine(color: number): THREE.Line {
     transparent: true,
     depthWrite: false
   });
-  return new THREE.Line(new THREE.BufferGeometry(), material);
+  return dynamicSceneObject(new THREE.Line(new THREE.BufferGeometry(), material));
 }
 
 function updateLine(
@@ -6191,7 +6205,9 @@ function updateLine(
     return;
   }
   line.visible = true;
-  (line.geometry as THREE.BufferGeometry).setFromPoints([start, end]);
+  const geometry = line.geometry as THREE.BufferGeometry;
+  geometry.setFromPoints([start, end]);
+  geometry.computeBoundingSphere();
   const material = line.material as THREE.LineBasicMaterial;
   material.color.copy(color);
   material.opacity = opacity;
@@ -6245,7 +6261,7 @@ function ensureMeshCount(target: number, bucket: THREE.Mesh[], factory: () => TH
 }
 
 function makeTetherSegmentMesh(radius: number): THREE.Mesh {
-  const mesh = new THREE.Mesh(tetherSegmentGeometry, makeTetherMaterial());
+  const mesh = dynamicSceneObject(new THREE.Mesh(tetherSegmentGeometry, makeTetherMaterial()));
   mesh.userData.segmentRadius = radius;
   mesh.castShadow = false;
   mesh.receiveShadow = false;
@@ -6253,7 +6269,7 @@ function makeTetherSegmentMesh(radius: number): THREE.Mesh {
 }
 
 function makeTetherNodeMesh(radius: number): THREE.Mesh {
-  const mesh = new THREE.Mesh(tetherNodeGeometry, makeTetherMaterial());
+  const mesh = dynamicSceneObject(new THREE.Mesh(tetherNodeGeometry, makeTetherMaterial()));
   mesh.scale.setScalar(radius * tetherNodeScale());
   mesh.userData.nodeRadius = radius;
   mesh.castShadow = false;
@@ -6263,7 +6279,7 @@ function makeTetherNodeMesh(radius: number): THREE.Mesh {
 }
 
 function makeProjectedPhaseMesh(): THREE.Mesh {
-  return new THREE.Mesh(
+  return dynamicSceneObject(new THREE.Mesh(
     new THREE.SphereGeometry(1.75, 14, 14),
     new THREE.MeshStandardMaterial({
       color: controlProjectedPhaseColor,
@@ -6272,11 +6288,11 @@ function makeProjectedPhaseMesh(): THREE.Mesh {
       roughness: 0.2,
       metalness: 0.06
     })
-  );
+  ));
 }
 
 function makeLookaheadOnDiskMesh(): THREE.Mesh {
-  return new THREE.Mesh(
+  return dynamicSceneObject(new THREE.Mesh(
     new THREE.SphereGeometry(1.45, 14, 14),
     new THREE.MeshStandardMaterial({
       color: controlLookaheadOnDiskColor,
@@ -6287,22 +6303,22 @@ function makeLookaheadOnDiskMesh(): THREE.Mesh {
       roughness: 0.24,
       metalness: 0.04
     })
-  );
+  ));
 }
 
 function makeRabbitMesh(): THREE.Mesh {
-  return new THREE.Mesh(
+  return dynamicSceneObject(new THREE.Mesh(
     new THREE.SphereGeometry(2.4, 12, 12),
     new THREE.MeshStandardMaterial({
       color: controlLookaheadColor,
       emissive: controlLookaheadColor,
       emissiveIntensity: 0.32
     })
-  );
+  ));
 }
 
 function makePhaseSlotMesh(): THREE.Mesh {
-  return new THREE.Mesh(
+  return dynamicSceneObject(new THREE.Mesh(
     new THREE.SphereGeometry(1.25, 12, 12),
     new THREE.MeshStandardMaterial({
       color: controlPhaseSlotColor,
@@ -6313,7 +6329,7 @@ function makePhaseSlotMesh(): THREE.Mesh {
       roughness: 0.34,
       metalness: 0.02
     })
-  );
+  ));
 }
 
 function updateSegmentMesh(
@@ -6397,7 +6413,9 @@ function updateControlRing(frame: ApiFrame, layer: ControlFeatureLayerMeshes): v
     const theta = (2 * Math.PI * index) / CONTROL_RING_SEGMENTS;
     return controlRingPoint(frame, theta, radius, ringDown);
   });
-  (layer.controlRingLine.geometry as THREE.BufferGeometry).setFromPoints(ringPoints);
+  const ringGeometry = layer.controlRingLine.geometry as THREE.BufferGeometry;
+  ringGeometry.setFromPoints(ringPoints);
+  ringGeometry.computeBoundingSphere();
 
   const showAdaptiveSlots = activeSummaryRequest?.phase_mode === "adaptive";
   const showForwardSlots = anyForwardLateralMode(frame);
@@ -6809,16 +6827,16 @@ function cylinderAlongX(
   length: number,
   material: THREE.Material
 ): THREE.Mesh {
-  const mesh = new THREE.Mesh(
+  const mesh = dynamicSceneObject(new THREE.Mesh(
     new THREE.CylinderGeometry(radiusEnd, radiusStart, Math.max(length, 0.02), 18, 1),
     material
-  );
+  ));
   mesh.rotation.z = Math.PI / 2;
   return mesh;
 }
 
 function makeKiteMesh(dimensions: KiteVisualDimensions): THREE.Group {
-  const group = new THREE.Group();
+  const group = dynamicSceneObject(new THREE.Group());
   const fuselageMaterial = new THREE.MeshStandardMaterial({
     color: 0x7db7df,
     roughness: 0.36,
@@ -6858,10 +6876,10 @@ function makeKiteMesh(dimensions: KiteVisualDimensions): THREE.Group {
   tube.position.x = 0.5 * (tubeStart + tubeEnd);
   group.add(tube);
 
-  const nose = new THREE.Mesh(
+  const nose = dynamicSceneObject(new THREE.Mesh(
     new THREE.ConeGeometry(dimensions.fuselageRadius * 0.94, dimensions.noseLength, 18, 1),
     fuselageMaterial
-  );
+  ));
   nose.rotation.z = -Math.PI / 2;
   nose.position.x = foreX - 0.5 * dimensions.noseLength;
   group.add(nose);
@@ -6875,44 +6893,44 @@ function makeKiteMesh(dimensions: KiteVisualDimensions): THREE.Group {
   tailCone.position.x = aftX + 0.5 * dimensions.tailConeLength;
   group.add(tailCone);
 
-  const canopy = new THREE.Mesh(
+  const canopy = dynamicSceneObject(new THREE.Mesh(
     new THREE.SphereGeometry(dimensions.fuselageRadius * 0.72, 18, 14),
     canopyMaterial
-  );
+  ));
   canopy.scale.set(1.25, 0.95, 0.72);
   canopy.position.set(0.18 * dimensions.fuselageLength, 0, dimensions.fuselageRadius * 0.55);
   group.add(canopy);
 
-  const wing = new THREE.Mesh(
+  const wing = dynamicSceneObject(new THREE.Mesh(
     new THREE.BoxGeometry(
       dimensions.wingChord,
       dimensions.wingSpan,
       dimensions.wingThickness
     ),
     wingMaterial
-  );
+  ));
   wing.position.set(dimensions.wingX, 0, 0);
   group.add(wing);
 
-  const horizontalTail = new THREE.Mesh(
+  const horizontalTail = dynamicSceneObject(new THREE.Mesh(
     new THREE.BoxGeometry(
       dimensions.horizontalTailChord,
       dimensions.horizontalTailSpan,
       dimensions.tailThickness
     ),
     tailMaterial
-  );
+  ));
   horizontalTail.position.set(dimensions.tailX, 0, 0.02);
   group.add(horizontalTail);
 
-  const verticalTail = new THREE.Mesh(
+  const verticalTail = dynamicSceneObject(new THREE.Mesh(
     new THREE.BoxGeometry(
       dimensions.verticalTailChord,
       dimensions.tailThickness * 1.15,
       dimensions.verticalTailHeight
     ),
     tailMaterial
-  );
+  ));
   verticalTail.position.set(
     dimensions.tailX - 0.08 * dimensions.horizontalTailChord,
     0,
@@ -6920,7 +6938,7 @@ function makeKiteMesh(dimensions: KiteVisualDimensions): THREE.Group {
   );
   group.add(verticalTail);
 
-  const bridlePickup = new THREE.Mesh(
+  const bridlePickup = dynamicSceneObject(new THREE.Mesh(
     new THREE.SphereGeometry(Math.max(0.028, 0.55 * dimensions.bridleRadius), 12, 12),
     new THREE.MeshStandardMaterial({
       color: 0xffde9c,
@@ -6929,7 +6947,7 @@ function makeKiteMesh(dimensions: KiteVisualDimensions): THREE.Group {
       roughness: 0.32,
       metalness: 0.1
     })
-  );
+  ));
   bridlePickup.position.set(
     dimensions.bridlePivotB[0],
     dimensions.bridlePivotB[1],
@@ -7775,6 +7793,9 @@ async function loadDefaultConfig(): Promise<void> {
       simulationDefaults.transition_to_orbit_s === null
         ? ""
         : compactNumberInputValue(simulationDefaults.transition_to_orbit_s);
+    transitionRecenterLeadRadiiInput.value = compactNumberInputValue(
+      simulationDefaults.timed_transition_recenter_lead_radii
+    );
     bridleEnabledInput.checked = simulationDefaults.bridle_enabled;
     simNoiseInput.checked = simulationDefaults.sim_noise_enabled;
     drydenSeedInput.value = String(simulationDefaults.dryden.seed);
@@ -7868,6 +7889,10 @@ async function startSimulation(): Promise<void> {
     simulationDefaults?.transition_to_forward_s ?? 5
   );
   const transitionToOrbitS = optionalInputValue(transitionToOrbitInput);
+  const timedTransitionRecenterLeadRadii = nonnegativeInputValue(
+    transitionRecenterLeadRadiiInput,
+    simulationDefaults?.timed_transition_recenter_lead_radii ?? 1
+  );
   const request = {
     preset: presetSelect.value,
     swarm_kites: selectedSwarmKiteCount(),
@@ -7884,6 +7909,7 @@ async function startSimulation(): Promise<void> {
     forward_frame_mode: forwardFrameModeSelect.value as ForwardFrameMode,
     transition_to_forward_s: transitionToForwardS,
     transition_to_orbit_s: transitionToOrbitS,
+    timed_transition_recenter_lead_radii: timedTransitionRecenterLeadRadii,
     longitudinal_mode: (maxThrottleAltitudePitchInput.checked
       ? "max_throttle_altitude_pitch"
       : "total_energy") as LongitudinalMode,
@@ -7923,6 +7949,7 @@ async function startSimulation(): Promise<void> {
     forward_frame_mode: request.forward_frame_mode,
     transition_to_forward_s: request.transition_to_forward_s,
     transition_to_orbit_s: request.transition_to_orbit_s,
+    timed_transition_recenter_lead_radii: request.timed_transition_recenter_lead_radii,
     longitudinal_mode: request.longitudinal_mode,
     sim_noise_enabled: request.sim_noise_enabled,
     dryden: request.dryden,
@@ -7960,6 +7987,13 @@ async function startSimulation(): Promise<void> {
         value:
           request.lateral_outer_mode === "orbit" ? "inactive" : request.forward_frame_mode
       },
+      {
+        label: "Orbit Recenter Lead",
+        value:
+          request.lateral_outer_mode === "timed_transition"
+            ? `${compactNumberInputValue(request.timed_transition_recenter_lead_radii)} radii`
+            : "inactive"
+      },
       { label: "Longitudinal", value: longitudinalModeLabel(request.longitudinal_mode) },
       { label: "Performance Scale", value: optionalPercentLabel(request.performance_scale_percent) },
       { label: "Bridle", value: request.bridle_enabled ? "Enabled" : "CG attach" },
@@ -7991,7 +8025,7 @@ async function startSimulation(): Promise<void> {
     "Run requested"
   );
   appendConsole(
-    `run requested: preset=${request.preset}, kites=${request.swarm_kites}, init_layout=${request.swarm_forward_flight_init ? "forward" : "orbit"}, disk_alt=${optionalMetersLabel(request.swarm_disk_altitude_m)}, disk_diameter=${optionalMetersLabel(request.swarm_disk_diameter_m)}, aircraft_alt=${optionalMetersLabel(request.swarm_aircraft_altitude_m)}, lower_tether=${compactNumberInputValue(request.swarm_common_tether_length_m)}m, upper_tether=${compactNumberInputValue(request.swarm_upper_tether_length_m)}m, duration=${request.duration}s, dt_control=${compactNumberInputValue(request.dt_control)}s (${(1 / request.dt_control).toFixed(1)} Hz), phase=${request.phase_mode}, lateral=${request.lateral_outer_mode}, forward_frame=${request.forward_frame_mode}, transition_to_forward=${compactNumberInputValue(request.transition_to_forward_s)}s, transition_to_orbit=${request.transition_to_orbit_s === null ? "none" : `${compactNumberInputValue(request.transition_to_orbit_s)}s`}, longitudinal=${request.longitudinal_mode}, performance_scale=${optionalPercentLabel(request.performance_scale_percent)}, bridle=${request.bridle_enabled ? "enabled" : "cg_attach"}, noise=${request.sim_noise_enabled ? "dryden" : "off"}, dryden_intensity=${compactNumberInputValue(request.dryden.intensity_scale)}, dryden_length=${compactNumberInputValue(request.dryden.length_scale)}, dryden_seed=${request.dryden.seed}, rk_abs_tol=${toleranceLabel(request.rk_abs_tol)}, rk_rel_tol=${toleranceLabel(request.rk_rel_tol)}, max_substeps=${request.max_substeps}, time_dilation=${playbackLabel}`
+    `run requested: preset=${request.preset}, kites=${request.swarm_kites}, init_layout=${request.swarm_forward_flight_init ? "forward" : "orbit"}, disk_alt=${optionalMetersLabel(request.swarm_disk_altitude_m)}, disk_diameter=${optionalMetersLabel(request.swarm_disk_diameter_m)}, aircraft_alt=${optionalMetersLabel(request.swarm_aircraft_altitude_m)}, lower_tether=${compactNumberInputValue(request.swarm_common_tether_length_m)}m, upper_tether=${compactNumberInputValue(request.swarm_upper_tether_length_m)}m, duration=${request.duration}s, dt_control=${compactNumberInputValue(request.dt_control)}s (${(1 / request.dt_control).toFixed(1)} Hz), phase=${request.phase_mode}, lateral=${request.lateral_outer_mode}, forward_frame=${request.forward_frame_mode}, transition_to_forward=${compactNumberInputValue(request.transition_to_forward_s)}s, transition_to_orbit=${request.transition_to_orbit_s === null ? "none" : `${compactNumberInputValue(request.transition_to_orbit_s)}s`}, recenter_lead=${compactNumberInputValue(request.timed_transition_recenter_lead_radii)} radii, longitudinal=${request.longitudinal_mode}, performance_scale=${optionalPercentLabel(request.performance_scale_percent)}, bridle=${request.bridle_enabled ? "enabled" : "cg_attach"}, noise=${request.sim_noise_enabled ? "dryden" : "off"}, dryden_intensity=${compactNumberInputValue(request.dryden.intensity_scale)}, dryden_length=${compactNumberInputValue(request.dryden.length_scale)}, dryden_seed=${request.dryden.seed}, rk_abs_tol=${toleranceLabel(request.rk_abs_tol)}, rk_rel_tol=${toleranceLabel(request.rk_rel_tol)}, max_substeps=${request.max_substeps}, time_dilation=${playbackLabel}`
   );
   appendConsole(controllerTuningSnapshotLabel(request.controller_tuning));
 
