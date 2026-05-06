@@ -49,8 +49,66 @@
             Preset
             <select id="preset"></select>
           </label>
-          <div id="swarm-options" class="form-section">
-            <div class="form-section-title">Swarm Setup</div>
+          <div class="form-section run-actions-panel">
+            <div class="form-section-title">Run</div>
+            <div class="run-actions">
+              <a class="secondary-action" href="/aero_analysis" target="_blank" rel="noopener">
+                Aero
+              </a>
+              <button id="run-button" type="submit">Run</button>
+              <button id="restart-button" class="secondary-action" type="button" disabled>Restart</button>
+            </div>
+          </div>
+          <details class="form-section run-options-panel">
+            <summary class="form-section-title">Run Options</summary>
+            <label>
+              Duration (s)
+              <input id="duration" type="number" min="0.001" step="any" value="30" />
+            </label>
+            <label>
+              Sample Period / Rate
+              <input id="dt-control" type="number" min="0.001" step="any" value="0.01" />
+              <span class="form-hint">Control and plot sample interval in seconds. 0.01 s = 100 Hz.</span>
+            </label>
+            <div class="form-subsection">
+              <div class="form-subsection-title">RK45 Integrator</div>
+              <label>
+                Absolute Tol
+                <input id="rk-abs-tol" type="number" min="1e-12" step="any" value="1e-6" />
+              </label>
+              <label>
+                Relative Tol
+                <input id="rk-rel-tol" type="number" min="1e-12" step="any" value="1e-6" />
+              </label>
+              <label>
+                Max Substeps
+                <input id="max-substeps" type="number" min="1" step="1" value="1000" />
+              </label>
+            </div>
+            <label>
+              Time Dilation
+              <select id="time-dilation">
+                <option value="fast">Fast as possible</option>
+                <option value="10">10x</option>
+                <option value="5">5x</option>
+                <option value="2">2x</option>
+                <option value="1" selected>1x</option>
+                <option value="0.5">0.5x</option>
+                <option value="0.1">0.1x</option>
+              </select>
+            </label>
+          </details>
+          <details id="swarm-options" class="form-section swarm-panel">
+            <summary class="form-section-title">Swarm Setup</summary>
+            <label class="checkbox-label">
+              <input id="swarm-forward-flight-init" type="checkbox" />
+              <span>Start aligned for forward flight</span>
+            </label>
+            <span class="form-hint">
+              Places the aircraft in lateral lanes with forward speed and heading from the forward
+              formation settings. Use with Forward formation mode to skip the orbit-to-forward
+              transient during tuning.
+            </span>
             <label>
               Number of kites
               <select id="swarm-kites">
@@ -94,18 +152,9 @@
               <input id="swarm-aircraft-altitude" type="number" min="0" step="any" value="350" />
               <span class="form-hint">Initial aircraft CAD altitude. Payload height is derived from disk altitude and tether lengths.</span>
             </label>
-            <label class="checkbox-label">
-              <input id="swarm-forward-flight-init" type="checkbox" />
-              <span>Start aligned for forward flight</span>
-            </label>
-            <span class="form-hint">
-              Places the aircraft in lateral lanes with forward speed and heading from the forward
-              formation settings. Use with Forward formation mode to skip the orbit-to-forward
-              transient during tuning.
-            </span>
-          </div>
-          <div class="form-section">
-            <div class="form-section-title">Model Options</div>
+          </details>
+          <details class="form-section model-panel">
+            <summary class="form-section-title">Model Options</summary>
             <label>
               Payload (kg)
               <input id="payload-mass" type="number" min="1" step="any" value="100" />
@@ -143,10 +192,10 @@
             </label>
             <div class="form-hint">When off, upper tethers attach at each kite CG with zero bridle moment.</div>
             <label class="checkbox-label">
-              <input id="sim-noise" type="checkbox" />
+              <input id="sim-noise" type="checkbox" checked />
               <span>Enable Dryden gusts</span>
             </label>
-            <div class="form-hint">Off by default. Wind remains steady unless this is enabled.</div>
+            <div class="form-hint">On by default. Disable this for steady wind.</div>
             <div id="dryden-tuning-fields" class="tuning-fields dryden-tuning-fields">
               <label>
                 Dryden seed
@@ -181,54 +230,8 @@
               <input id="wind-shear-90-height" type="number" min="0" step="any" placeholder="No shear" />
               <span class="form-hint">Leave blank for no shear. Particle-only model: clean wind is zero at ground and reaches 90% of the specified wind at this altitude.</span>
             </label>
-          </div>
-          <div class="form-section run-panel">
-            <div class="form-section-title">Run Options</div>
-            <label>
-              Duration (s)
-              <input id="duration" type="number" min="0.001" step="any" value="30" />
-            </label>
-            <label>
-              Sample Period / Rate
-              <input id="dt-control" type="number" min="0.001" step="any" value="0.01" />
-              <span class="form-hint">Control and plot sample interval in seconds. 0.01 s = 100 Hz.</span>
-            </label>
-            <div class="form-subsection">
-              <div class="form-subsection-title">RK45 Integrator</div>
-              <label>
-                Absolute Tol
-                <input id="rk-abs-tol" type="number" min="1e-12" step="any" value="1e-6" />
-              </label>
-              <label>
-                Relative Tol
-                <input id="rk-rel-tol" type="number" min="1e-12" step="any" value="1e-6" />
-              </label>
-              <label>
-                Max Substeps
-                <input id="max-substeps" type="number" min="1" step="1" value="1000" />
-              </label>
-            </div>
-            <label>
-              Time Dilation
-              <select id="time-dilation">
-                <option value="fast">Fast as possible</option>
-                <option value="10">10x</option>
-                <option value="5">5x</option>
-                <option value="2">2x</option>
-                <option value="1" selected>1x</option>
-                <option value="0.5">0.5x</option>
-                <option value="0.1">0.1x</option>
-              </select>
-            </label>
-            <a class="secondary-action" href="/aero_analysis" target="_blank" rel="noopener">
-              Open Aero Analysis
-            </a>
-            <div class="run-actions">
-              <button id="run-button" type="submit">Run</button>
-              <button id="restart-button" class="secondary-action" type="button" disabled>Restart</button>
-            </div>
-          </div>
-          <details class="form-section tuning-panel" id="controller-tuning-panel" open>
+          </details>
+          <details class="form-section tuning-panel" id="controller-tuning-panel">
             <summary class="form-section-title">Control Options</summary>
             <div class="form-hint">
               Overrides the controller gains for the next run or restart. Mode-specific fields are shown only when that mode is active.
@@ -276,7 +279,7 @@
                 </label>
                 <label>
                   Switch back to orbit (s)
-                  <input id="transition-to-orbit-s" type="number" min="0" step="any" value="20" />
+                  <input id="transition-to-orbit-s" type="number" min="0" step="any" value="65" />
                 </label>
                 <div class="form-hint">Leave switch-back blank to stay in forward formation.</div>
               </div>
@@ -312,9 +315,8 @@
       <section class="panel scene">
         <div id="viewport"></div>
         <div id="scene-failure-banner" class="scene-failure-banner" aria-live="polite"></div>
-        <div id="mass-overlay" class="mass-overlay" aria-live="polite" hidden></div>
         <details class="form-section visualization-panel scene-visualization-panel" id="visualization-panel" open>
-          <summary class="form-section-title">Visualization</summary>
+          <summary class="form-section-title">Vis Options</summary>
           <label>
             Camera Target
             <select id="camera-follow-target">
@@ -341,26 +343,36 @@
             <input id="control-labels-enabled" type="checkbox" />
             <span>Show floating control labels</span>
           </label>
-          <label class="checkbox-label">
-            <input id="control-disk-enabled" type="checkbox" checked />
-            <span>Show control disk</span>
-          </label>
-          <label class="checkbox-label">
-            <input id="control-features-enabled" type="checkbox" checked />
-            <span>Show control features</span>
-          </label>
-          <label class="checkbox-label">
-            <input id="control-feature-lines-enabled" type="checkbox" checked />
-            <span>Show control feature lines</span>
-          </label>
-          <label class="checkbox-label">
-            <input id="control-features-at-target-altitude" type="checkbox" checked />
-            <span>Disk-plane features at target altitude</span>
-          </label>
-          <label class="checkbox-label">
-            <input id="control-features-at-aircraft-altitude" type="checkbox" />
-            <span>Disk-plane features at aircraft altitude</span>
-          </label>
+          <div class="control-layer-group">
+            <div class="control-layer-title">Target altitude</div>
+            <label class="checkbox-label">
+              <input id="target-control-disk-enabled" type="checkbox" checked />
+              <span>Disk</span>
+            </label>
+            <label class="checkbox-label">
+              <input id="target-control-lines-enabled" type="checkbox" checked />
+              <span>Lines</span>
+            </label>
+            <label class="checkbox-label">
+              <input id="target-control-features-enabled" type="checkbox" checked />
+              <span>Features</span>
+            </label>
+          </div>
+          <div class="control-layer-group">
+            <div class="control-layer-title">Aircraft altitude</div>
+            <label class="checkbox-label">
+              <input id="aircraft-control-disk-enabled" type="checkbox" />
+              <span>Disk</span>
+            </label>
+            <label class="checkbox-label">
+              <input id="aircraft-control-lines-enabled" type="checkbox" />
+              <span>Lines</span>
+            </label>
+            <label class="checkbox-label">
+              <input id="aircraft-control-features-enabled" type="checkbox" />
+              <span>Features</span>
+            </label>
+          </div>
           <div class="form-hint">
             Visual-only projection layers. Target altitude uses the controller disk plane. Aircraft
             altitude lifts each kite’s disk-plane markers to that kite and draws the ring at the
@@ -424,13 +436,16 @@
           </label>
           <div class="form-hint">When enabled, each new wingtip particle captures the local wind at birth and keeps that velocity until it fades.</div>
         </details>
-        <div id="control-vis-legend" class="control-vis-legend" aria-label="Control visualization legend">
-          <div class="legend-title">Control Vis</div>
-          <div class="legend-row"><span class="legend-swatch lookahead"></span>Orbit lookahead / forward target</div>
-          <div class="legend-row"><span class="legend-swatch lookahead-disk"></span>Orbit disk target / forward lane point</div>
-          <div class="legend-row"><span class="legend-swatch projected"></span>Phase projection / aircraft projection</div>
-          <div class="legend-row"><span class="legend-swatch slot"></span>Phase slot / formation Y-error tip</div>
-          <div class="legend-row"><span class="legend-swatch disk"></span>Control ring</div>
+        <div class="scene-bottom-left-overlays">
+          <div id="control-vis-legend" class="control-vis-legend" aria-label="Control visualization legend">
+            <div class="legend-title">Control Vis</div>
+            <div class="legend-row"><span class="legend-swatch lookahead"></span>Orbit lookahead / forward target</div>
+            <div class="legend-row"><span class="legend-swatch lookahead-disk"></span>Orbit disk target / forward lane point</div>
+            <div class="legend-row"><span class="legend-swatch projected"></span>Phase projection / aircraft projection</div>
+            <div class="legend-row"><span class="legend-swatch slot"></span>Phase slot / formation Y-error tip</div>
+            <div class="legend-row"><span class="legend-swatch disk"></span>Control ring</div>
+          </div>
+          <div id="mass-overlay" class="mass-overlay" aria-live="polite" hidden></div>
         </div>
         <div id="control-label-layer" class="control-label-layer" aria-hidden="true"></div>
       </section>
@@ -446,6 +461,7 @@
         <div class="runtime-tabs" role="tablist" aria-label="Run output">
           <button id="runtime-tab-console" class="runtime-tab active" type="button">Console Log</button>
           <button id="runtime-tab-plots" class="runtime-tab" type="button">Plots</button>
+          <button id="runtime-tab-docs" class="runtime-tab" type="button">Control Laws</button>
         </div>
         <div id="runtime-console-view" class="runtime-view active">
           <pre id="console"></pre>
@@ -453,14 +469,16 @@
         <div id="runtime-plots-view" class="runtime-view">
           <div id="plots"></div>
         </div>
-      </section>
-      <section class="panel docs-panel">
-        <div class="docs-head">
-          <div class="docs-eyebrow">Controller Math</div>
-          <h2>Control Laws</h2>
-          <div class="docs-subtitle">Generated from <code>multikite_sim/src/controller.rs</code>.</div>
+        <div id="runtime-docs-view" class="runtime-view">
+          <section class="docs-panel">
+            <div class="docs-head">
+              <div class="docs-eyebrow">Controller Math</div>
+              <h2>Control Laws</h2>
+              <div class="docs-subtitle">Generated from <code>multikite_sim/src/controller.rs</code>.</div>
+            </div>
+            <div id="controller-docs"></div>
+          </section>
         </div>
-        <div id="controller-docs"></div>
       </section>
     </main>
     <script type="module" src="/app.js"></script>

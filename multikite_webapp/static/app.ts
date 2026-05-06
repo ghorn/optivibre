@@ -8,7 +8,7 @@ type LongitudinalMode = "total_energy" | "max_throttle_altitude_pitch";
 type Preset = "swarm" | "free_flight1" | "simple_tether";
 type TimeDilationPreset = "fast" | "10" | "5" | "2" | "1" | "0.5" | "0.1";
 type CameraFollowTarget = "manual" | "kite_center" | "disk_center" | "y_joint" | `kite:${number}`;
-type RuntimeTab = "console" | "plots";
+type RuntimeTab = "console" | "plots" | "docs";
 type TetherTensionScaleMode = "payload" | "run_peak" | "fixed";
 
 type PlotlyDatum = Record<string, unknown>;
@@ -442,18 +442,23 @@ const cameraFollowYawInput = document.querySelector<HTMLInputElement>("#camera-f
 const cameraFollowYawLabel = cameraFollowYawInput.closest<HTMLLabelElement>(".checkbox-label")!;
 const trackpadNavigationInput = document.querySelector<HTMLInputElement>("#trackpad-navigation")!;
 const controlLabelsEnabledInput = document.querySelector<HTMLInputElement>("#control-labels-enabled")!;
-const controlDiskEnabledInput = document.querySelector<HTMLInputElement>("#control-disk-enabled")!;
-const controlFeaturesEnabledInput = document.querySelector<HTMLInputElement>(
-  "#control-features-enabled"
+const targetControlDiskEnabledInput = document.querySelector<HTMLInputElement>(
+  "#target-control-disk-enabled"
 )!;
-const controlFeatureLinesEnabledInput = document.querySelector<HTMLInputElement>(
-  "#control-feature-lines-enabled"
+const targetControlLinesEnabledInput = document.querySelector<HTMLInputElement>(
+  "#target-control-lines-enabled"
 )!;
-const controlFeaturesAtTargetAltitudeInput = document.querySelector<HTMLInputElement>(
-  "#control-features-at-target-altitude"
+const targetControlFeaturesEnabledInput = document.querySelector<HTMLInputElement>(
+  "#target-control-features-enabled"
 )!;
-const controlFeaturesAtAircraftAltitudeInput = document.querySelector<HTMLInputElement>(
-  "#control-features-at-aircraft-altitude"
+const aircraftControlDiskEnabledInput = document.querySelector<HTMLInputElement>(
+  "#aircraft-control-disk-enabled"
+)!;
+const aircraftControlLinesEnabledInput = document.querySelector<HTMLInputElement>(
+  "#aircraft-control-lines-enabled"
+)!;
+const aircraftControlFeaturesEnabledInput = document.querySelector<HTMLInputElement>(
+  "#aircraft-control-features-enabled"
 )!;
 const controlFeatureScaleInput = document.querySelector<HTMLInputElement>("#control-feature-scale")!;
 const tetherNodesEnabledInput = document.querySelector<HTMLInputElement>("#tether-nodes-enabled")!;
@@ -482,8 +487,10 @@ const failureNode = document.querySelector<HTMLElement>("#failure-pill")!;
 const sceneFailureNode = document.querySelector<HTMLElement>("#scene-failure-banner")!;
 const runtimeConsoleTab = document.querySelector<HTMLButtonElement>("#runtime-tab-console")!;
 const runtimePlotsTab = document.querySelector<HTMLButtonElement>("#runtime-tab-plots")!;
+const runtimeDocsTab = document.querySelector<HTMLButtonElement>("#runtime-tab-docs")!;
 const runtimeConsoleView = document.querySelector<HTMLElement>("#runtime-console-view")!;
 const runtimePlotsView = document.querySelector<HTMLElement>("#runtime-plots-view")!;
+const runtimeDocsView = document.querySelector<HTMLElement>("#runtime-docs-view")!;
 const plotsNode = document.querySelector<HTMLElement>("#plots")!;
 const layoutNode = document.querySelector<HTMLElement>(".layout")!;
 const viewport = document.querySelector<HTMLElement>("#viewport")!;
@@ -545,7 +552,8 @@ const CONTROLLER_TUNING_FIELDS: ControllerTuningField[] = [
   { key: "roll_ref_limit_deg", label: "Roll reference limit", group: "Lateral outer loop", step: "1", unit: "deg", min: "0" },
   { key: "tethered_roll_ref_rate_limit_degps", label: "Tethered roll ref rate limit", group: "Lateral outer loop", step: "5", unit: "deg/s", min: "0" },
   { key: "forward_heading_deg", label: "Forward heading", group: "Forward formation", step: "1", unit: "deg", lateralModes: ["forward_formation", "timed_transition"], frameModes: ["world_fixed"], help: "World-fixed formation heading. Used as fallback when mean-velocity heading is too slow." },
-  { key: "formation_spacing_m", label: "Formation spacing", group: "Forward formation", step: "1", unit: "m", min: "0", lateralModes: ["forward_formation", "timed_transition"], help: "0 = auto spacing from disk diameter / max(N - 1, 1)." },
+  { key: "forward_lookahead_scale", label: "Forward lookahead scale", group: "Forward formation", step: "0.1", unit: "x", min: "0.01", lateralModes: ["forward_formation", "timed_transition"], help: "Forward formation only. Multiplies the scheduled rabbit distance before placing the target ahead along the formation lane. Use 2.0 to double forward lookahead without changing orbit mode." },
+  { key: "formation_spacing_m", label: "Formation spacing", group: "Forward formation", step: "1", unit: "m", min: "0", lateralModes: ["forward_formation", "timed_transition"], help: "0 = auto spacing from half the disk diameter / max(N - 1, 1)." },
   { key: "formation_lateral_offset_i_per_s", label: "Lane error to target offset I", group: "Forward formation", step: "0.01", unit: "1/s", lateralModes: ["forward_formation", "timed_transition"], help: "Integrates lane cross-track error into a lateral rabbit-target offset. This does not command roll directly." },
   { key: "formation_lateral_offset_limit_m", label: "Target lateral offset limit", group: "Forward formation", step: "1", unit: "m", min: "0", lateralModes: ["forward_formation", "timed_transition"], help: "Clamp on the integrated lateral target offset." },
   { key: "formation_lateral_error_limit_m", label: "Lane error integrator clamp", group: "Forward formation", step: "1", unit: "m", min: "0", lateralModes: ["forward_formation", "timed_transition"], help: "Clamp on the cross-track error before it is integrated." },
@@ -1189,7 +1197,6 @@ const RAD_TO_DEG = 180 / Math.PI;
 let activePlotSections: ActivePlotSection[] = [];
 let plotKiteVisibility: boolean[] = [];
 let plotSignalVisibility = new Map<string, boolean>();
-let collapsedPlotSections = new Set<string>();
 let activePlotTabKey: string | null = null;
 let syncingPlotXAxes = false;
 
@@ -1219,13 +1226,18 @@ function clearConsole(): void {
 
 function showRuntimeTab(tab: RuntimeTab): void {
   const showConsole = tab === "console";
+  const showPlots = tab === "plots";
+  const showDocs = tab === "docs";
   runtimeConsoleTab.classList.toggle("active", showConsole);
-  runtimePlotsTab.classList.toggle("active", !showConsole);
+  runtimePlotsTab.classList.toggle("active", showPlots);
+  runtimeDocsTab.classList.toggle("active", showDocs);
   runtimeConsoleView.classList.toggle("active", showConsole);
-  runtimePlotsView.classList.toggle("active", !showConsole);
+  runtimePlotsView.classList.toggle("active", showPlots);
+  runtimeDocsView.classList.toggle("active", showDocs);
   runtimeConsoleTab.setAttribute("aria-selected", String(showConsole));
-  runtimePlotsTab.setAttribute("aria-selected", String(!showConsole));
-  if (!showConsole) {
+  runtimePlotsTab.setAttribute("aria-selected", String(showPlots));
+  runtimeDocsTab.setAttribute("aria-selected", String(showDocs));
+  if (showPlots) {
     requestAnimationFrame(() => {
       activePlotSections.forEach((section) => {
         Plotly.Plots?.resize(section.plot);
@@ -2103,26 +2115,26 @@ function syncDrydenTuningVisibility(): void {
   drydenTuningFieldsNode.hidden = !simNoiseInput.checked;
 }
 
-function controlFeaturesVisible(): boolean {
-  return controlFeaturesEnabledInput.checked;
-}
-
-function controlFeatureLinesVisible(): boolean {
-  return controlFeatureLinesEnabledInput.checked;
-}
-
-function controlFeaturesAtTargetAltitude(): boolean {
-  return controlFeaturesAtTargetAltitudeInput.checked;
-}
-
-function controlFeaturesAtAircraftAltitude(): boolean {
-  return controlFeaturesAtAircraftAltitudeInput.checked;
-}
-
-function controlFeatureLayerVisible(layer: ControlFeatureAltitudeLayer): boolean {
+function controlFeatureDiskVisible(layer: ControlFeatureAltitudeLayer): boolean {
   return layer === "aircraft"
-    ? controlFeaturesAtAircraftAltitude()
-    : controlFeaturesAtTargetAltitude();
+    ? aircraftControlDiskEnabledInput.checked
+    : targetControlDiskEnabledInput.checked;
+}
+
+function controlFeatureLinesVisible(layer: ControlFeatureAltitudeLayer): boolean {
+  return layer === "aircraft"
+    ? aircraftControlLinesEnabledInput.checked
+    : targetControlLinesEnabledInput.checked;
+}
+
+function controlFeatureMarkerVisible(layer: ControlFeatureAltitudeLayer): boolean {
+  return layer === "aircraft"
+    ? aircraftControlFeaturesEnabledInput.checked
+    : targetControlFeaturesEnabledInput.checked;
+}
+
+function anyControlFeatureMarkersVisible(): boolean {
+  return controlFeatureMarkerVisible("target") || controlFeatureMarkerVisible("aircraft");
 }
 
 function controlFeatureScale(): number {
@@ -2306,8 +2318,6 @@ function resizeSceneRenderer(): void {
 }
 
 function applyVisualizationVisibility(): void {
-  const showControlFeatures = controlFeaturesVisible();
-  const showControlLines = controlFeatureLinesVisible();
   const showTetherNodes = tetherNodesVisible();
   const frame = lastRenderedFrame;
   const kiteCount = frame?.kite_positions_n.length ?? 0;
@@ -2325,9 +2335,8 @@ function applyVisualizationVisibility(): void {
   });
 
   controlFeatureLayers.forEach((layer) => {
-    const layerVisible = controlFeatureLayerVisible(layer.mode);
-    const markerVisible = showControlFeatures && layerVisible;
-    const lineVisible = showControlLines && layerVisible;
+    const markerVisible = controlFeatureMarkerVisible(layer.mode);
+    const lineVisible = controlFeatureLinesVisible(layer.mode);
     layer.rabbitMeshes.forEach((mesh, kiteIndex) => {
       mesh.visible = markerVisible && (!frame || kiteIndex < kiteCount);
     });
@@ -5427,30 +5436,11 @@ function formatProgressSummary(
   );
 }
 
-function formatRunSummary(
-  summary: RunSummary,
-  receivedFrames: number,
-  renderedFrames: number,
-  playbackLabel: string
-): string {
+function formatRunSummary(summary: RunSummary): string {
   return renderSummaryCard(
     summary.failure ? "Terminated Early" : "Completed",
     `${summary.duration.toFixed(2)} s simulated`,
     [
-      { label: "Time Dilation", value: playbackLabel },
-      {
-        label: "Longitudinal",
-        value: longitudinalModeLabel(activeSummaryRequest?.longitudinal_mode ?? "total_energy")
-      },
-      {
-        label: "Performance Scale",
-        value: optionalPercentLabel(activeSummaryRequest?.performance_scale_percent ?? null)
-      },
-      { label: "Frames", value: `${receivedFrames} received / ${renderedFrames} rendered` },
-      {
-        label: "Accepted / Rejected",
-        value: `${summary.accepted_steps} / ${summary.rejected_steps}`
-      },
       {
         label: "Max Phase Error",
         value: `${(summary.max_phase_error * RAD_TO_DEG).toFixed(2)} deg`
@@ -6392,8 +6382,7 @@ function renderTether(
 function updateControlRing(frame: ApiFrame, layer: ControlFeatureLayerMeshes): void {
   const kiteCount = frame.kite_positions_n.length;
   const ringVisible = kiteCount > 0 && frame.control_ring_radius > 1.0e-6;
-  const layerVisible = controlFeatureLayerVisible(layer.mode);
-  layer.controlRingLine.visible = ringVisible && controlDiskEnabledInput.checked && layerVisible;
+  layer.controlRingLine.visible = ringVisible && controlFeatureDiskVisible(layer.mode);
 
   if (!ringVisible) {
     layer.phaseSlotMeshes.forEach((mesh) => {
@@ -6419,7 +6408,7 @@ function updateControlRing(frame: ApiFrame, layer: ControlFeatureLayerMeshes): v
   );
   if (showAdaptiveSlots || showForwardSlots) {
     for (let index = 0; index < kiteCount; index += 1) {
-      layer.phaseSlotMeshes[index].visible = controlFeaturesVisible() && layerVisible;
+      layer.phaseSlotMeshes[index].visible = controlFeatureMarkerVisible(layer.mode);
       if (isForwardLateralMode(frame, index)) {
         layer.phaseSlotMeshes[index].position.copy(
           forwardFormationErrorTipPosition(frame, index, layer.mode)
@@ -6650,8 +6639,7 @@ function updateControlLabels(): void {
   const frame = lastRenderedFrame;
   const enabled =
     controlLabelsEnabledInput.checked &&
-    controlFeaturesVisible() &&
-    (controlFeaturesAtTargetAltitude() || controlFeaturesAtAircraftAltitude()) &&
+    anyControlFeatureMarkersVisible() &&
     frame &&
     frame.kite_positions_n.length > 0;
   controlLabelLayer.classList.toggle("visible", Boolean(enabled));
@@ -6665,7 +6653,7 @@ function updateControlLabels(): void {
   const specs: ControlLabelSpec[] = [];
   const showAdaptiveSlots = activeSummaryRequest?.phase_mode === "adaptive";
   const labelLayer: ControlFeatureAltitudeLayer =
-    controlFeaturesAtTargetAltitude() ? "target" : "aircraft";
+    controlFeatureMarkerVisible("target") ? "target" : "aircraft";
 
   frame.kite_positions_n.forEach((_position, kiteIndex) => {
     const kiteLabel = `K${kiteIndex + 1}`;
@@ -7040,9 +7028,8 @@ function ensureKites(count: number, frame: ApiFrame): void {
     const visible = index < count;
     mesh.visible = visible;
     controlFeatureLayers.forEach((layer) => {
-      const layerVisible = controlFeatureLayerVisible(layer.mode);
-      const markerVisible = visible && controlFeaturesVisible() && layerVisible;
-      const lineVisible = visible && controlFeatureLinesVisible() && layerVisible;
+      const markerVisible = visible && controlFeatureMarkerVisible(layer.mode);
+      const lineVisible = visible && controlFeatureLinesVisible(layer.mode);
       layer.rabbitMeshes[index].visible = markerVisible;
       layer.lookaheadOnDiskMeshes[index].visible = markerVisible;
       layer.projectedPhaseMeshes[index].visible = markerVisible;
@@ -7090,9 +7077,8 @@ function renderControlFeatureLayer(
     return;
   }
 
-  const layerVisible = controlFeatureLayerVisible(layer.mode);
-  const showControlFeatures = controlFeaturesVisible() && layerVisible;
-  const showControlLines = controlFeatureLinesVisible() && layerVisible;
+  const showControlFeatures = controlFeatureMarkerVisible(layer.mode);
+  const showControlLines = controlFeatureLinesVisible(layer.mode);
   const rabbitPosition = rabbitTargetPosition(frame, index, layer.mode);
 
   if (isForwardLateralMode(frame, index)) {
@@ -7581,26 +7567,6 @@ function activatePlotTab(key: string, entries: PlotTabEntry[]): void {
   });
 }
 
-function applyPlotSectionCollapsed(
-  host: HTMLElement,
-  body: HTMLElement,
-  toggle: HTMLButtonElement,
-  plots: HTMLElement[],
-  collapsed: boolean
-): void {
-  host.classList.toggle("collapsed", collapsed);
-  body.hidden = collapsed;
-  toggle.setAttribute("aria-expanded", String(!collapsed));
-  toggle.textContent = collapsed ? "Show plots" : "Hide plots";
-  if (!collapsed) {
-    plots.forEach((plot) => {
-      if (plot.childElementCount > 0) {
-        Plotly.Plots?.resize(plot);
-      }
-    });
-  }
-}
-
 function clearPlots(message: string): void {
   activePlotSections.forEach((section) => {
     Plotly.purge(section.plot);
@@ -7620,7 +7586,6 @@ async function renderFinalPlots(frames: ApiFrame[], kiteCount: number): Promise<
   });
   activePlotSections = [];
   plotSignalVisibility = new Map<string, boolean>();
-  collapsedPlotSections = new Set<string>();
   const requestedTabKey = activePlotTabKey;
   plotsNode.innerHTML = "";
   ensurePlotKiteVisibility(kiteCount);
@@ -7671,9 +7636,6 @@ async function renderFinalPlots(frames: ApiFrame[], kiteCount: number): Promise<
     } else {
       renderPlotKiteControls(controls, kiteCount);
     }
-    const collapseButton = document.createElement("button");
-    collapseButton.className = "plot-section-collapse";
-    collapseButton.type = "button";
 
     const body = document.createElement("div");
     body.className = "plot-section-body";
@@ -7685,7 +7647,7 @@ async function renderFinalPlots(frames: ApiFrame[], kiteCount: number): Promise<
     );
 
     headerCopy.append(title, description);
-    headerActions.append(controls, collapseButton);
+    headerActions.append(controls);
     header.append(headerCopy, headerActions);
     body.append(plotGrid);
     host.append(header, body);
@@ -7697,23 +7659,6 @@ async function renderFinalPlots(frames: ApiFrame[], kiteCount: number): Promise<
       button: tabButton,
       host,
       plots: sectionPlots
-    });
-
-    applyPlotSectionCollapsed(
-      host,
-      body,
-      collapseButton,
-      sectionPlots,
-      collapsedPlotSections.has(sectionKey)
-    );
-    collapseButton.addEventListener("click", () => {
-      const nextCollapsed = !collapsedPlotSections.has(sectionKey);
-      if (nextCollapsed) {
-        collapsedPlotSections.add(sectionKey);
-      } else {
-        collapsedPlotSections.delete(sectionKey);
-      }
-      applyPlotSectionCollapsed(host, body, collapseButton, sectionPlots, nextCollapsed);
     });
 
     const plotPromises = definition.groups.map(async (group) => {
@@ -8176,12 +8121,7 @@ async function startSimulation(): Promise<void> {
       return;
     }
     if (pendingSummary) {
-      const finalSummaryHtml = formatRunSummary(
-        pendingSummary,
-        framesReceived,
-        framesRendered,
-        currentPlaybackLabel
-      );
+      const finalSummaryHtml = formatRunSummary(pendingSummary);
       summaryNode.innerHTML = finalSummaryHtml;
       lastSummaryHtml = finalSummaryHtml;
       latestProgressState = null;
@@ -8232,6 +8172,10 @@ runtimeConsoleTab.addEventListener("click", () => {
 
 runtimePlotsTab.addEventListener("click", () => {
   showRuntimeTab("plots");
+});
+
+runtimeDocsTab.addEventListener("click", () => {
+  showRuntimeTab("docs");
 });
 
 presetSelect.addEventListener("change", () => {
@@ -8323,24 +8267,17 @@ controlLabelsEnabledInput.addEventListener("change", () => {
   updateControlLabels();
 });
 
-controlDiskEnabledInput.addEventListener("change", () => {
-  applyVisualizationVisibility();
-});
-
-controlFeaturesEnabledInput.addEventListener("change", () => {
-  applyVisualizationVisibility();
-});
-
-controlFeatureLinesEnabledInput.addEventListener("change", () => {
-  applyVisualizationVisibility();
-});
-
-controlFeaturesAtTargetAltitudeInput.addEventListener("change", () => {
-  applyVisualizationVisibility();
-});
-
-controlFeaturesAtAircraftAltitudeInput.addEventListener("change", () => {
-  applyVisualizationVisibility();
+[
+  targetControlDiskEnabledInput,
+  targetControlLinesEnabledInput,
+  targetControlFeaturesEnabledInput,
+  aircraftControlDiskEnabledInput,
+  aircraftControlLinesEnabledInput,
+  aircraftControlFeaturesEnabledInput
+].forEach((input) => {
+  input.addEventListener("change", () => {
+    applyVisualizationVisibility();
+  });
 });
 
 controlFeatureScaleInput.addEventListener("input", () => {

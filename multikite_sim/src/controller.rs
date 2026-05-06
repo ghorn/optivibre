@@ -118,7 +118,7 @@ pub(crate) fn forward_formation_spacing<const NK: usize>(params: &Params<f64, NK
     if configured > 0.0 {
         configured
     } else {
-        2.0 * params.controller.disk_radius / ((NK.saturating_sub(1)).max(1) as f64)
+        params.controller.disk_radius / ((NK.saturating_sub(1)).max(1) as f64)
     }
 }
 
@@ -211,6 +211,13 @@ fn update_forward_lateral_offset(
     control_state.forward_lateral_offset_m
 }
 
+fn forward_lookahead_distance(
+    rabbit_distance: f64,
+    tuning: &crate::types::ControllerTuning<f64>,
+) -> f64 {
+    rabbit_distance * tuning.forward_lookahead_scale.max(0.0)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ForwardScheduleTerms {
     lane_y: f64,
@@ -287,7 +294,8 @@ fn forward_schedule_target<const NK: usize>(
     let lane_point_xy = origin + *forward_f_n * x_i + *forward_l_n * lane_y;
     let offset_lane_point_xy = lane_point_xy + *forward_l_n * lateral_offset;
     let lane_point_n = Vector3::new(lane_point_xy[0], lane_point_xy[1], origin[2]);
-    let target_xy = offset_lane_point_xy + *forward_f_n * rabbit_distance;
+    let forward_lookahead = forward_lookahead_distance(rabbit_distance, &params.controller.tuning);
+    let target_xy = offset_lane_point_xy + *forward_f_n * forward_lookahead;
     let target_n = Vector3::new(target_xy[0], target_xy[1], origin[2]);
 
     let prev_y_f = if index > 0 {
@@ -1201,7 +1209,11 @@ mod tests {
             LateralOuterMode::ForwardFormation
         );
         assert_eq!(
-            active_lateral_outer_mode(LateralOuterMode::TimedTransition, 20.0, 5.0, Some(20.0)),
+            active_lateral_outer_mode(LateralOuterMode::TimedTransition, 20.0, 5.0, Some(65.0)),
+            LateralOuterMode::ForwardFormation
+        );
+        assert_eq!(
+            active_lateral_outer_mode(LateralOuterMode::TimedTransition, 65.0, 5.0, Some(65.0)),
             LateralOuterMode::Orbit
         );
     }
@@ -1252,6 +1264,16 @@ mod tests {
 
         let offset = update_forward_lateral_offset(&mut state, -4.0, 1.0, &tuning);
         assert_eq!(offset, 0.0);
+    }
+
+    #[test]
+    fn forward_lookahead_scale_multiplies_scheduled_rabbit_distance() {
+        let tuning = ControllerTuning {
+            forward_lookahead_scale: 2.0,
+            ..ControllerTuning::default()
+        };
+
+        assert_eq!(forward_lookahead_distance(25.0, &tuning), 50.0);
     }
 
     #[test]

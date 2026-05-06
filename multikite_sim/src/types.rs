@@ -141,9 +141,9 @@ impl Default for SimulationConfig {
             lateral_outer_mode: LateralOuterMode::Orbit,
             forward_frame_mode: ForwardFrameMode::WorldFixed,
             transition_to_forward_s: default_transition_to_forward_s(),
-            transition_to_orbit_s: Some(20.0),
+            transition_to_orbit_s: Some(65.0),
             sample_stride: 1,
-            sim_noise_enabled: false,
+            sim_noise_enabled: true,
             dryden: DrydenConfig::default(),
             bridle_enabled: true,
             longitudinal_mode: LongitudinalMode::TotalEnergy,
@@ -426,6 +426,8 @@ pub struct ControllerTuning<T> {
     #[serde(default)]
     pub forward_heading_deg: T,
     #[serde(default)]
+    pub forward_lookahead_scale: T,
+    #[serde(default)]
     pub formation_spacing_m: T,
     #[serde(default)]
     pub formation_lateral_offset_i_per_s: T,
@@ -496,6 +498,7 @@ impl Default for ControllerTuning<f64> {
             roll_ref_limit_deg: 35.0,
             guidance_mode: 0.0,
             forward_heading_deg: 0.0,
+            forward_lookahead_scale: 1.0,
             formation_spacing_m: 0.0,
             formation_lateral_offset_i_per_s: 0.08,
             formation_lateral_offset_limit_m: 20.0,
@@ -594,6 +597,14 @@ impl ControllerTuning<f64> {
             roll_ref_limit_deg: finite(self.roll_ref_limit_deg, default.roll_ref_limit_deg).abs(),
             guidance_mode: finite(self.guidance_mode, default.guidance_mode).clamp(0.0, 2.0),
             forward_heading_deg: finite(self.forward_heading_deg, default.forward_heading_deg),
+            forward_lookahead_scale: {
+                let scale = finite(self.forward_lookahead_scale, default.forward_lookahead_scale);
+                if scale > 0.0 {
+                    scale
+                } else {
+                    default.forward_lookahead_scale
+                }
+            },
             formation_spacing_m: finite(self.formation_spacing_m, default.formation_spacing_m)
                 .max(0.0),
             formation_lateral_offset_i_per_s: finite(
