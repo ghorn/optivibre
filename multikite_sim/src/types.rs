@@ -22,6 +22,33 @@ impl Default for LongitudinalMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LateralOuterMode {
+    Orbit,
+    ForwardFormation,
+    TimedTransition,
+}
+
+impl Default for LateralOuterMode {
+    fn default() -> Self {
+        Self::Orbit
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForwardFrameMode {
+    WorldFixed,
+    MeanVelocity,
+}
+
+impl Default for ForwardFrameMode {
+    fn default() -> Self {
+        Self::WorldFixed
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DrydenConfig {
     pub seed: u64,
@@ -85,6 +112,14 @@ pub struct SimulationConfig {
     pub rk_rel_tol: f64,
     pub max_substeps: usize,
     pub phase_mode: PhaseMode,
+    #[serde(default)]
+    pub lateral_outer_mode: LateralOuterMode,
+    #[serde(default)]
+    pub forward_frame_mode: ForwardFrameMode,
+    #[serde(default = "default_transition_to_forward_s")]
+    pub transition_to_forward_s: f64,
+    #[serde(default)]
+    pub transition_to_orbit_s: Option<f64>,
     pub sample_stride: usize,
     pub sim_noise_enabled: bool,
     #[serde(default)]
@@ -103,6 +138,10 @@ impl Default for SimulationConfig {
             rk_rel_tol: 1.0e-6,
             max_substeps: 1000,
             phase_mode: PhaseMode::Adaptive,
+            lateral_outer_mode: LateralOuterMode::Orbit,
+            forward_frame_mode: ForwardFrameMode::WorldFixed,
+            transition_to_forward_s: default_transition_to_forward_s(),
+            transition_to_orbit_s: Some(20.0),
             sample_stride: 1,
             sim_noise_enabled: false,
             dryden: DrydenConfig::default(),
@@ -113,6 +152,10 @@ impl Default for SimulationConfig {
     }
 }
 
+fn default_transition_to_forward_s() -> f64 {
+    5.0
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct InitRequest {
     pub preset: Preset,
@@ -120,6 +163,8 @@ pub struct InitRequest {
     pub performance_scale_percent: Option<f64>,
     pub wind_speed_mps: Option<f64>,
     pub swarm_kites: usize,
+    #[serde(default)]
+    pub swarm_forward_flight_init: bool,
     pub swarm_disk_altitude_m: Option<f64>,
     pub swarm_disk_radius_m: Option<f64>,
     pub swarm_aircraft_altitude_m: Option<f64>,
@@ -135,6 +180,7 @@ impl Default for InitRequest {
             performance_scale_percent: None,
             wind_speed_mps: None,
             swarm_kites: DEFAULT_SWARM_KITES,
+            swarm_forward_flight_init: false,
             swarm_disk_altitude_m: None,
             swarm_disk_radius_m: None,
             swarm_aircraft_altitude_m: None,
@@ -377,6 +423,16 @@ pub struct ControllerTuning<T> {
     pub roll_ref_limit_deg: T,
     #[serde(default)]
     pub guidance_mode: T,
+    #[serde(default)]
+    pub forward_heading_deg: T,
+    #[serde(default)]
+    pub formation_spacing_m: T,
+    #[serde(default)]
+    pub formation_lateral_offset_i_per_s: T,
+    #[serde(default)]
+    pub formation_lateral_offset_limit_m: T,
+    #[serde(default)]
+    pub formation_lateral_error_limit_m: T,
     pub tethered_roll_ref_rate_limit_degps: T,
     pub free_aileron_roll_p: T,
     pub free_aileron_roll_d: T,
@@ -439,6 +495,11 @@ impl Default for ControllerTuning<f64> {
             roll_curvature_integrator_limit: 0.04,
             roll_ref_limit_deg: 35.0,
             guidance_mode: 0.0,
+            forward_heading_deg: 0.0,
+            formation_spacing_m: 0.0,
+            formation_lateral_offset_i_per_s: 0.08,
+            formation_lateral_offset_limit_m: 20.0,
+            formation_lateral_error_limit_m: 40.0,
             tethered_roll_ref_rate_limit_degps: 90.0,
             free_aileron_roll_p: 2.0,
             free_aileron_roll_d: 0.35,
@@ -532,6 +593,23 @@ impl ControllerTuning<f64> {
             .abs(),
             roll_ref_limit_deg: finite(self.roll_ref_limit_deg, default.roll_ref_limit_deg).abs(),
             guidance_mode: finite(self.guidance_mode, default.guidance_mode).clamp(0.0, 2.0),
+            forward_heading_deg: finite(self.forward_heading_deg, default.forward_heading_deg),
+            formation_spacing_m: finite(self.formation_spacing_m, default.formation_spacing_m)
+                .max(0.0),
+            formation_lateral_offset_i_per_s: finite(
+                self.formation_lateral_offset_i_per_s,
+                default.formation_lateral_offset_i_per_s,
+            ),
+            formation_lateral_offset_limit_m: finite(
+                self.formation_lateral_offset_limit_m,
+                default.formation_lateral_offset_limit_m,
+            )
+            .abs(),
+            formation_lateral_error_limit_m: finite(
+                self.formation_lateral_error_limit_m,
+                default.formation_lateral_error_limit_m,
+            )
+            .abs(),
             tethered_roll_ref_rate_limit_degps: finite(
                 self.tethered_roll_ref_rate_limit_degps,
                 default.tethered_roll_ref_rate_limit_degps,
@@ -756,6 +834,17 @@ pub struct KiteDiagnostics<T> {
     pub rabbit_bearing_y: T,
     pub rabbit_vector_b: Vector3<T>,
     pub rabbit_target_n: Vector3<T>,
+    pub lateral_outer_mode: T,
+    pub forward_frame_heading: T,
+    pub forward_lane_y: T,
+    pub forward_cross_track_error: T,
+    pub forward_neighbor_prev_y_f: T,
+    pub forward_neighbor_next_y_f: T,
+    pub forward_formation_error: T,
+    pub forward_formation_spacing: T,
+    pub forward_lateral_offset: T,
+    pub forward_lane_point_n: Vector3<T>,
+    pub forward_formation_error_tip_n: Vector3<T>,
     pub orbit_radius: T,
     pub curvature_y_b: T,
     pub curvature_y_ref: T,

@@ -1,5 +1,8 @@
 use crate::assets::{asset_manifest, reference_export};
-use crate::controller::{ControllerState, apply_trace, controller_step};
+use crate::controller::{
+    ControllerState, apply_trace, controller_step, forward_formation_spacing,
+    horizontal_axes_from_heading, lane_slot,
+};
 use crate::math::{roll_yaw_quaternion_n2b, rotate_nav_to_body, yaw_quaternion_n2b, zero_if_nan};
 use crate::model::{CompiledRhs, compute_bridle_node, compute_tether_link_tensions};
 use crate::turbulence::DrydenField;
@@ -12,7 +15,7 @@ use crate::types::{
     VehiclePerformanceScalingPreview, VehiclePerformanceSnapshot,
 };
 use anyhow::{Result, bail};
-use nalgebra::Vector3;
+use nalgebra::{Quaternion, Vector3};
 use optimization::{flatten_value, unflatten_value};
 use std::array::from_fn;
 
@@ -520,6 +523,7 @@ pub fn swarm_configuration<const NK: usize, const N_COMMON: usize, const N_UPPER
         swarm_payload_altitude_from_disk(params, disk_altitude),
         1.0,
         aircraft_altitude,
+        init.swarm_forward_flight_init,
     )
 }
 
@@ -528,12 +532,14 @@ fn swarm_payload_configuration<const NK: usize, const N_COMMON: usize, const N_U
     payload_altitude_above_ground: f64,
     common_length_fraction: f64,
     aircraft_altitude_above_ground: f64,
+    forward_flight_init: bool,
 ) -> State<f64, NK, N_COMMON, N_UPPER> {
     swarm_payload_configuration_with_kite_cad_altitude(
         params,
         payload_altitude_above_ground,
         common_length_fraction,
         aircraft_altitude_above_ground,
+        forward_flight_init,
     )
 }
 
@@ -546,6 +552,7 @@ fn swarm_payload_configuration_with_kite_cad_altitude<
     payload_altitude_above_ground: f64,
     common_length_fraction: f64,
     target_cad_altitude: f64,
+    forward_flight_init: bool,
 ) -> State<f64, NK, N_COMMON, N_UPPER> {
     let ground_altitude = params.kites[0].tether.contact.ground_altitude;
     let payload_altitude = ground_altitude + payload_altitude_above_ground;
@@ -561,6 +568,31 @@ fn swarm_payload_configuration_with_kite_cad_altitude<
         vel_n: Vector3::zeros(),
     };
 
+    let kites = if forward_flight_init {
+        forward_formation_initial_kites(params, &splitter, target_cad_altitude)
+    } else {
+        orbit_initial_kites(params, &splitter, splitter_altitude, target_cad_altitude)
+    };
+
+    let mut state = State {
+        kites,
+        splitter: splitter.clone(),
+        common_tether: interpolate_nodes(&payload, &splitter),
+        payload,
+        total_work: 0.0,
+        total_dissipated_work: 0.0,
+        mechanical_energy_reference: 0.0,
+    };
+    clamp_swarm_state_above_ground(&mut state, ground_altitude);
+    state
+}
+
+fn orbit_initial_kites<const NK: usize, const N_UPPER: usize>(
+    params: &Params<f64, NK>,
+    splitter: &TetherNode<f64>,
+    splitter_altitude: f64,
+    target_cad_altitude: f64,
+) -> [KiteState<f64, N_UPPER>; NK] {
     let upper_length = swarm_upper_initial_length(params);
     let bridle_orbit_radius = params
         .controller
@@ -576,7 +608,7 @@ fn swarm_payload_configuration_with_kite_cad_altitude<
     for _ in 0..8 {
         let kite: KiteState<f64, N_UPPER> = swarm_kite_state_at_phase(
             params,
-            &splitter,
+            splitter,
             0,
             0.0,
             bridle_orbit_radius,
@@ -592,11 +624,11 @@ fn swarm_payload_configuration_with_kite_cad_altitude<
         }
     }
 
-    let kites = from_fn(|index| {
+    from_fn(|index| {
         let theta = 2.0 * std::f64::consts::PI * index as f64 / NK as f64;
         swarm_kite_state_at_phase(
             params,
-            &splitter,
+            splitter,
             index,
             theta,
             bridle_orbit_radius,
@@ -605,19 +637,53 @@ fn swarm_payload_configuration_with_kite_cad_altitude<
             omega_world_z,
             coordinated_roll,
         )
-    });
+    })
+}
 
-    let mut state = State {
-        kites,
-        splitter: splitter.clone(),
-        common_tether: interpolate_nodes(&payload, &splitter),
-        payload,
-        total_work: 0.0,
-        total_dissipated_work: 0.0,
-        mechanical_energy_reference: 0.0,
-    };
-    clamp_swarm_state_above_ground(&mut state, ground_altitude);
-    state
+fn forward_formation_initial_kites<const NK: usize, const N_UPPER: usize>(
+    params: &Params<f64, NK>,
+    splitter: &TetherNode<f64>,
+    target_cad_altitude: f64,
+) -> [KiteState<f64, N_UPPER>; NK] {
+    let speed_ref = swarm_initial_speed_target(params);
+    let heading = params.controller.tuning.forward_heading_deg.to_radians();
+    let (forward_n, left_n) = horizontal_axes_from_heading(heading);
+    let spacing = forward_formation_spacing(params);
+    let quat_n2b = roll_yaw_quaternion_n2b(0.0, heading);
+    let bridle_pivots_n: [Vector3<f64>; NK] = from_fn(|index| {
+        crate::math::rotate_body_to_nav(&quat_n2b, &params.kites[index].bridle.pivot_b)
+    });
+    let max_bridle_lane_offset = bridle_pivots_n
+        .iter()
+        .enumerate()
+        .map(|(index, pivot_n)| (lane_slot(index, NK, spacing) + pivot_n.dot(&left_n)).abs())
+        .fold(0.0_f64, f64::max);
+    let ground_altitude = params.kites[0].tether.contact.ground_altitude;
+    let cad_altitude = ground_altitude + target_cad_altitude;
+    let pivot_n = bridle_pivots_n[0];
+    let bridle_altitude = cad_altitude - params.kites[0].bridle.radius - pivot_n[2];
+    let upper_vertical = (bridle_altitude + splitter.pos_n[2]).abs();
+    let upper_length = swarm_upper_initial_length(params);
+    let forward_offset = (upper_length * upper_length
+        - upper_vertical * upper_vertical
+        - max_bridle_lane_offset * max_bridle_lane_offset)
+        .max(0.0)
+        .sqrt()
+        - pivot_n.dot(&forward_n);
+
+    from_fn(|index| {
+        swarm_kite_state_in_forward_lane(
+            params,
+            splitter,
+            index,
+            &forward_n,
+            &left_n,
+            forward_offset,
+            cad_altitude,
+            speed_ref,
+            spacing,
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -643,6 +709,89 @@ fn swarm_kite_state_at_phase<const NK: usize, const N_UPPER: usize>(
         params.controller.disk_center_n[1] + bridle_orbit_radius * theta.sin(),
         -bridle_altitude,
     );
+    swarm_kite_state_at_bridle(
+        params,
+        splitter,
+        index,
+        bridle_pos_n,
+        quat_n2b,
+        body_vel_b,
+        omega_b,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn swarm_kite_state_in_forward_lane<const NK: usize, const N_UPPER: usize>(
+    params: &Params<f64, NK>,
+    splitter: &TetherNode<f64>,
+    index: usize,
+    forward_n: &Vector3<f64>,
+    left_n: &Vector3<f64>,
+    forward_offset: f64,
+    cad_altitude: f64,
+    speed_ref: f64,
+    spacing: f64,
+) -> KiteState<f64, N_UPPER> {
+    let heading = params.controller.tuning.forward_heading_deg.to_radians();
+    let quat_n2b = roll_yaw_quaternion_n2b(0.0, heading);
+    let omega_b = Vector3::zeros();
+    let body_vel_b = Vector3::new(speed_ref, 0.0, 0.0)
+        + rotate_nav_to_body(&quat_n2b, &params.environment.wind_n);
+    let lane_y = lane_slot(index, NK, spacing);
+    let cad_pos_n = Vector3::new(
+        params.controller.disk_center_n[0],
+        params.controller.disk_center_n[1],
+        -cad_altitude,
+    ) + *forward_n * forward_offset
+        + *left_n * lane_y;
+    let mut bridle_pos_n = cad_pos_n
+        + Vector3::new(0.0, 0.0, params.kites[index].bridle.radius)
+        + crate::math::rotate_body_to_nav(&quat_n2b, &params.kites[index].bridle.pivot_b);
+    let mut kite = swarm_kite_state_at_bridle(
+        params,
+        splitter,
+        index,
+        bridle_pos_n,
+        quat_n2b,
+        body_vel_b,
+        omega_b,
+    );
+
+    // The bridle offset depends on tether direction, so solve against the real model geometry.
+    for _ in 0..8 {
+        let actual_cad_pos_n = kite.body.pos_n
+            + crate::math::rotate_body_to_nav(
+                &kite.body.quat_n2b,
+                &params.kites[index].rigid_body.cad_offset_b,
+            );
+        let cad_error_n = cad_pos_n - actual_cad_pos_n;
+        if cad_error_n.norm() < 1.0e-10 {
+            break;
+        }
+        bridle_pos_n += cad_error_n;
+        kite = swarm_kite_state_at_bridle(
+            params,
+            splitter,
+            index,
+            bridle_pos_n,
+            quat_n2b,
+            body_vel_b,
+            omega_b,
+        );
+    }
+
+    kite
+}
+
+fn swarm_kite_state_at_bridle<const NK: usize, const N_UPPER: usize>(
+    params: &Params<f64, NK>,
+    splitter: &TetherNode<f64>,
+    index: usize,
+    bridle_pos_n: Vector3<f64>,
+    quat_n2b: Quaternion<f64>,
+    body_vel_b: Vector3<f64>,
+    omega_b: Vector3<f64>,
+) -> KiteState<f64, N_UPPER> {
     let bridle_to_body_b =
         -(params.kites[index].bridle.pivot_b + params.kites[index].rigid_body.cad_offset_b);
     let body_pos_n = bridle_pos_n
@@ -1131,6 +1280,10 @@ fn simulate<
             &params,
             config.dt_control,
             config.phase_mode,
+            config.lateral_outer_mode,
+            config.forward_frame_mode,
+            config.transition_to_forward_s,
+            config.transition_to_orbit_s,
             config.longitudinal_mode,
             time,
         );
@@ -1501,7 +1654,7 @@ mod tests {
     };
     use crate::math::{pitch_angle_from_quat_n2b, roll_angle_from_quat_n2b};
     use crate::model::evaluate_rhs;
-    use crate::types::{LongitudinalMode, PhaseMode};
+    use crate::types::{ForwardFrameMode, LateralOuterMode, LongitudinalMode, PhaseMode};
 
     use super::*;
     use nalgebra::UnitQuaternion;
@@ -1730,6 +1883,10 @@ mod tests {
             &params,
             TEST_DT_CONTROL,
             PhaseMode::Adaptive,
+            LateralOuterMode::Orbit,
+            ForwardFrameMode::WorldFixed,
+            5.0,
+            Some(20.0),
             LongitudinalMode::TotalEnergy,
             0.0,
         );
@@ -1874,6 +2031,70 @@ mod tests {
     }
 
     #[test]
+    fn swarm_forward_flight_initialization_places_cad_points_in_lanes() {
+        let mut params = base_params::<3>(&InitRequest {
+            preset: Preset::Swarm,
+            payload_mass_kg: None,
+            wind_speed_mps: Some(0.0),
+            swarm_kites: 3,
+            swarm_aircraft_altitude_m: Some(350.0),
+            swarm_forward_flight_init: true,
+            ..InitRequest::default()
+        })
+        .expect("swarm params");
+        params.controller.tuning.forward_heading_deg = 15.0;
+        params.controller.tuning.formation_spacing_m = 40.0;
+
+        let init = InitRequest {
+            preset: Preset::Swarm,
+            payload_mass_kg: None,
+            wind_speed_mps: Some(0.0),
+            swarm_kites: 3,
+            swarm_aircraft_altitude_m: Some(350.0),
+            swarm_forward_flight_init: true,
+            ..InitRequest::default()
+        };
+        let state = swarm_configuration::<3, COMMON_NODES, UPPER_NODES>(&params, &init);
+        let (forward_n, left_n) =
+            horizontal_axes_from_heading(params.controller.tuning.forward_heading_deg.to_radians());
+        let speed_ref = swarm_initial_speed_target(&params);
+
+        for index in 0..3 {
+            let cad_pos_n = state.kites[index].body.pos_n
+                + crate::math::rotate_body_to_nav(
+                    &state.kites[index].body.quat_n2b,
+                    &params.kites[index].rigid_body.cad_offset_b,
+                );
+            let offset_n = cad_pos_n - params.controller.disk_center_n;
+            let lane_error = offset_n.dot(&left_n)
+                - lane_slot(index, 3, params.controller.tuning.formation_spacing_m);
+            let altitude = -cad_pos_n[2] - params.kites[index].tether.contact.ground_altitude;
+
+            assert!(
+                lane_error.abs() < 1.0e-9,
+                "kite {index} CAD point should start in its forward lane, lane error {lane_error:e}"
+            );
+            assert!(
+                (altitude - 350.0).abs() < 1.0e-9,
+                "kite {index} CAD altitude should be 350 m, got {altitude:.12}"
+            );
+            assert!(
+                state.kites[index].body.vel_b[0] - speed_ref < 1.0e-9
+                    && state.kites[index].body.vel_b[0] - speed_ref > -1.0e-9,
+                "kite {index} body-x airspeed should start at speed target"
+            );
+            assert!(
+                state.kites[index].body.vel_b[1].abs() < 1.0e-9,
+                "kite {index} body-y velocity should start at zero"
+            );
+            assert!(
+                offset_n.dot(&forward_n).is_finite(),
+                "kite {index} forward offset should be finite"
+            );
+        }
+    }
+
+    #[test]
     fn swarm_initialization_is_wind_aware() {
         let init = InitRequest {
             preset: Preset::Swarm,
@@ -1931,6 +2152,10 @@ mod tests {
             &params,
             TEST_DT_CONTROL,
             PhaseMode::Adaptive,
+            LateralOuterMode::Orbit,
+            ForwardFrameMode::WorldFixed,
+            5.0,
+            Some(20.0),
             LongitudinalMode::MaxThrottleAltitudePitch,
             0.0,
         );
@@ -2019,6 +2244,10 @@ mod tests {
                 &params,
                 config.dt_control,
                 config.phase_mode,
+                config.lateral_outer_mode,
+                config.forward_frame_mode,
+                config.transition_to_forward_s,
+                config.transition_to_orbit_s,
                 config.longitudinal_mode,
                 time,
                 reference,
@@ -2143,6 +2372,10 @@ mod tests {
                 &params,
                 config.dt_control,
                 config.phase_mode,
+                config.lateral_outer_mode,
+                config.forward_frame_mode,
+                config.transition_to_forward_s,
+                config.transition_to_orbit_s,
                 config.longitudinal_mode,
                 time,
                 reference,

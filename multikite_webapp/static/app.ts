@@ -2,6 +2,8 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
 type PhaseMode = "adaptive" | "open_loop";
+type LateralOuterMode = "orbit" | "forward_formation" | "timed_transition";
+type ForwardFrameMode = "world_fixed" | "mean_velocity";
 type LongitudinalMode = "total_energy" | "max_throttle_altitude_pitch";
 type Preset = "swarm" | "free_flight1" | "simple_tether";
 type TimeDilationPreset = "fast" | "10" | "5" | "2" | "1" | "0.5" | "0.1";
@@ -89,6 +91,10 @@ interface SimulationDefaults {
   rk_rel_tol: number;
   max_substeps: number;
   phase_mode: PhaseMode;
+  lateral_outer_mode: LateralOuterMode;
+  forward_frame_mode: ForwardFrameMode;
+  transition_to_forward_s: number;
+  transition_to_orbit_s: number | null;
   sample_stride: number;
   sim_noise_enabled: boolean;
   dryden: DrydenConfig;
@@ -218,6 +224,17 @@ interface ApiFrame {
   rabbit_target_distance: number[];
   rabbit_bearing_y_deg: number[];
   rabbit_vector_b: [number, number, number][];
+  lateral_outer_mode: number[];
+  forward_frame_heading_deg: number[];
+  forward_lane_y: number[];
+  forward_cross_track_error: number[];
+  forward_neighbor_prev_y_f: number[];
+  forward_neighbor_next_y_f: number[];
+  forward_formation_error: number[];
+  forward_formation_spacing: number[];
+  forward_lateral_offset: number[];
+  forward_lane_point_n: [number, number, number][];
+  forward_formation_error_tip_n: [number, number, number][];
   curvature_y_b: number[];
   curvature_y_ref: number[];
   curvature_y_est: number[];
@@ -350,11 +367,14 @@ type StreamEvent =
 const presetSelect = document.querySelector<HTMLSelectElement>("#preset")!;
 const swarmOptionsNode = document.querySelector<HTMLElement>("#swarm-options")!;
 const swarmKitesSelect = document.querySelector<HTMLSelectElement>("#swarm-kites")!;
+const swarmForwardFlightInitInput = document.querySelector<HTMLInputElement>(
+  "#swarm-forward-flight-init"
+)!;
 const swarmDiskAltitudeInput = document.querySelector<HTMLInputElement>(
   "#swarm-disk-altitude"
 )!;
-const swarmDiskRadiusInput = document.querySelector<HTMLInputElement>(
-  "#swarm-disk-radius"
+const swarmDiskDiameterInput = document.querySelector<HTMLInputElement>(
+  "#swarm-disk-diameter"
 )!;
 const swarmAircraftAltitudeInput = document.querySelector<HTMLInputElement>(
   "#swarm-aircraft-altitude"
@@ -368,6 +388,20 @@ const swarmCommonTetherLengthInput = document.querySelector<HTMLInputElement>(
 const durationInput = document.querySelector<HTMLInputElement>("#duration")!;
 const dtControlInput = document.querySelector<HTMLInputElement>("#dt-control")!;
 const phaseModeSelect = document.querySelector<HTMLSelectElement>("#phase-mode")!;
+const lateralOuterModeSelect = document.querySelector<HTMLSelectElement>("#lateral-outer-mode")!;
+const forwardFrameModeSelect = document.querySelector<HTMLSelectElement>("#forward-frame-mode")!;
+const transitionToForwardInput = document.querySelector<HTMLInputElement>(
+  "#transition-to-forward-s"
+)!;
+const transitionToOrbitInput = document.querySelector<HTMLInputElement>(
+  "#transition-to-orbit-s"
+)!;
+const forwardFormationOptionsNode = document.querySelector<HTMLElement>(
+  "#forward-formation-options"
+)!;
+const timedTransitionOptionsNode = document.querySelector<HTMLElement>(
+  "#timed-transition-options"
+)!;
 const payloadInput = document.querySelector<HTMLInputElement>("#payload-mass")!;
 const performanceScaleInput = document.querySelector<HTMLInputElement>(
   "#performance-scale-percent"
@@ -456,6 +490,7 @@ const viewport = document.querySelector<HTMLElement>("#viewport")!;
 const sidebarResizeHandle = document.querySelector<HTMLElement>("#sidebar-resize-handle")!;
 const sceneResizeHandle = document.querySelector<HTMLElement>("#scene-resize-handle")!;
 const massOverlayNode = document.querySelector<HTMLElement>("#mass-overlay")!;
+const controlVisLegendNode = document.querySelector<HTMLElement>("#control-vis-legend")!;
 const controlLabelLayer = document.querySelector<HTMLElement>("#control-label-layer")!;
 const runForm = document.querySelector<HTMLFormElement>("#run-form")!;
 const runButton = document.querySelector<HTMLButtonElement>("#run-button")!;
@@ -484,6 +519,8 @@ interface ControllerTuningField {
   min?: string;
   mode?: TuningMode;
   guidanceModes?: GuidanceMode[];
+  lateralModes?: LateralOuterMode[];
+  frameModes?: ForwardFrameMode[];
 }
 
 interface ControllerTuningSection {
@@ -507,6 +544,11 @@ const CONTROLLER_TUNING_FIELDS: ControllerTuningField[] = [
   { key: "roll_curvature_integrator_limit", label: "Curvature integrator limit", group: "Lateral outer loop", step: "0.005", min: "0", guidanceModes: ["curvature", "switch"] },
   { key: "roll_ref_limit_deg", label: "Roll reference limit", group: "Lateral outer loop", step: "1", unit: "deg", min: "0" },
   { key: "tethered_roll_ref_rate_limit_degps", label: "Tethered roll ref rate limit", group: "Lateral outer loop", step: "5", unit: "deg/s", min: "0" },
+  { key: "forward_heading_deg", label: "Forward heading", group: "Forward formation", step: "1", unit: "deg", lateralModes: ["forward_formation", "timed_transition"], frameModes: ["world_fixed"], help: "World-fixed formation heading. Used as fallback when mean-velocity heading is too slow." },
+  { key: "formation_spacing_m", label: "Formation spacing", group: "Forward formation", step: "1", unit: "m", min: "0", lateralModes: ["forward_formation", "timed_transition"], help: "0 = auto spacing from disk diameter / max(N - 1, 1)." },
+  { key: "formation_lateral_offset_i_per_s", label: "Lane error to target offset I", group: "Forward formation", step: "0.01", unit: "1/s", lateralModes: ["forward_formation", "timed_transition"], help: "Integrates lane cross-track error into a lateral rabbit-target offset. This does not command roll directly." },
+  { key: "formation_lateral_offset_limit_m", label: "Target lateral offset limit", group: "Forward formation", step: "1", unit: "m", min: "0", lateralModes: ["forward_formation", "timed_transition"], help: "Clamp on the integrated lateral target offset." },
+  { key: "formation_lateral_error_limit_m", label: "Lane error integrator clamp", group: "Forward formation", step: "1", unit: "m", min: "0", lateralModes: ["forward_formation", "timed_transition"], help: "Clamp on the cross-track error before it is integrated." },
   {
     key: "guidance_mode",
     label: "Lateral guidance mode",
@@ -586,8 +628,8 @@ const CONTROLLER_TUNING_SECTIONS: ControllerTuningSection[] = [
   },
   {
     title: "Lateral Outer Loop",
-    description: "Rabbit geometry, guidance mode, lookahead, and the commanded roll reference.",
-    groups: ["Lateral outer loop", "Lateral outer loop / guidance geometry"]
+    description: "Orbit/rabbit geometry, forward-formation geometry, lookahead, and the commanded roll reference.",
+    groups: ["Lateral outer loop", "Forward formation", "Lateral outer loop / guidance geometry"]
   },
   {
     title: "Lateral Inner Loops",
@@ -734,6 +776,7 @@ const CONTROL_VIS_COLORS = {
   projectedPhase: "#66b8ff",
   closestDisk: "#d6c3ff",
   phaseSlot: "#ffd36b",
+  formationError: "#ffd36b",
   disk: "#36d5c1"
 } as const;
 const controlLookaheadColor = new THREE.Color(CONTROL_VIS_COLORS.lookahead);
@@ -741,6 +784,7 @@ const controlLookaheadOnDiskColor = new THREE.Color(CONTROL_VIS_COLORS.lookahead
 const controlProjectedPhaseColor = new THREE.Color(CONTROL_VIS_COLORS.projectedPhase);
 const controlClosestDiskColor = new THREE.Color(CONTROL_VIS_COLORS.closestDisk);
 const controlPhaseSlotColor = new THREE.Color(CONTROL_VIS_COLORS.phaseSlot);
+const controlFormationErrorColor = new THREE.Color(CONTROL_VIS_COLORS.formationError);
 const controlRabbitRelationshipLineColor = controlLookaheadOnDiskColor;
 
 const kiteMeshes: THREE.Group[] = [];
@@ -1033,12 +1077,17 @@ let latestProgressState: SimulationProgress | null = null;
 let activeSummaryRequest: {
   preset: string;
   swarm_kites: number;
+  swarm_forward_flight_init: boolean;
   swarm_disk_altitude_m: number | null;
-  swarm_disk_radius_m: number | null;
+  swarm_disk_diameter_m: number | null;
   swarm_aircraft_altitude_m: number | null;
   swarm_upper_tether_length_m: number | null;
   swarm_common_tether_length_m: number | null;
   phase_mode: PhaseMode;
+  lateral_outer_mode: LateralOuterMode;
+  forward_frame_mode: ForwardFrameMode;
+  transition_to_forward_s: number;
+  transition_to_orbit_s: number | null;
   longitudinal_mode: LongitudinalMode;
   sim_noise_enabled: boolean;
   dryden?: DrydenConfig;
@@ -1146,7 +1195,7 @@ let syncingPlotXAxes = false;
 
 interface KiteBreakdownTraceDefinition {
   name: string;
-  value: (frame: ApiFrame, kiteIndex: number) => number;
+  value: (frame: ApiFrame, kiteIndex: number) => number | null;
   dash?: PlotDash;
   width?: number;
   alpha?: number;
@@ -1438,8 +1487,22 @@ function docsEquation(caption: string, latex: string, legendHtml: string, noteHt
     </div>`;
 }
 
-function controllerDocsHtml(phaseMode: PhaseMode, longitudinalMode: LongitudinalMode): string {
+function controllerDocsHtml(
+  phaseMode: PhaseMode,
+  longitudinalMode: LongitudinalMode,
+  lateralOuterMode: LateralOuterMode,
+  forwardFrameMode: ForwardFrameMode
+): string {
   const modeLabel = phaseMode === "adaptive" ? "Adaptive" : "Open Loop";
+  const lateralLabel =
+    lateralOuterMode === "forward_formation"
+      ? "Forward formation"
+      : lateralOuterMode === "timed_transition"
+        ? "Timed transition"
+        : "Orbit / rabbit";
+  const forwardFrameLabel =
+    forwardFrameMode === "mean_velocity" ? "Swarm mean velocity" : "World fixed";
+  const usesForwardLateral = lateralOuterMode !== "orbit";
   const longitudinalLabel = longitudinalModeLabel(longitudinalMode);
   const usesMaxThrottle = longitudinalMode === "max_throttle_altitude_pitch";
   const verticalBlock = usesMaxThrottle
@@ -1530,8 +1593,11 @@ function controllerDocsHtml(phaseMode: PhaseMode, longitudinalMode: Longitudinal
           q_i^n &= \bar p_i^r - p_i^{\mathrm{cad}},\\
           q_i^\chi &= R_z(\chi_i)^\top q_i^n,\qquad \chi_i = \operatorname{yaw}(q_{n\to b,i}),\\
           \theta_{r,i} &= \operatorname{atan2}(q_{i,y}^\chi,q_{i,x}^\chi),\\
-          \phi_{i,\mathrm{rabbit}}^\star &= k_{\phi\theta,p}\theta_{r,i}
-            + k_{\phi\theta,i}\int\theta_{r,i}\,dt,\\
+          \tilde I_{\theta\phi,i} &= \operatorname{sat}_{I_\phi}\!\left(I_{\theta\phi,i}\right),\\
+          \phi_{i,\mathrm{rabbit}}^\star &= \operatorname{sat}_{\phi_{\max}}\!\left(k_{\phi\theta,p}\theta_{r,i}
+            + \tilde I_{\theta\phi,i}\right),\\
+          I_{\theta\phi,i}^{+} &= \operatorname{sat}_{I_\phi}\!\left(\tilde I_{\theta\phi,i}
+            + \operatorname{aw}_{\phi}\!\left(k_{\phi\theta,i}\theta_{r,i}\Delta t;\phi_{i,\mathrm{rabbit}}^\star\right)\right),\\
           x_i &= \max\!\left(q_{i,x}^\chi, f_x d_{r,i}, 1\right),\\
           \tilde q_{i,y}^\chi &= \operatorname{sat}_{\rho x_i}\!\left(q_{i,y}^\chi\right),
           \qquad
@@ -1548,13 +1614,38 @@ function controllerDocsHtml(phaseMode: PhaseMode, longitudinalMode: Longitudinal
           \end{cases}
           \end{aligned}
           \]`;
-  const lateralGuidanceNote = `<div class="docs-card-note">Here \\(k_{dv}\\) is the speed-to-distance factor, \\(f_x\\) is the minimum-forward-lookahead fraction, \\(\\rho\\) is the lateral clamp ratio, and \\(\\kappa_{\\max}\\) is the curvature clamp. The direct rabbit path does not convert the rabbit vector to curvature.</div>`;
+  const lateralGuidanceNote = `<div class="docs-card-note">Here \\(k_{dv}\\) is the speed-to-distance factor, \\(f_x\\) is the minimum-forward-lookahead fraction, \\(\\rho\\) is the lateral clamp ratio, and \\(\\kappa_{\\max}\\) is the curvature clamp. The direct rabbit path does not convert the rabbit vector to curvature. \\(\\operatorname{aw}_{\\phi}\\) passes both integration directions inside the roll-reference limits, but at a saturated limit only passes increments that move the roll reference back toward the feasible interval.</div>`;
+  const forwardFormationEquation = String.raw`
+          \[
+          \begin{aligned}
+          f^n &= [\cos\psi_f,\ \sin\psi_f,\ 0]^\top,
+          \qquad
+          l^n = [-\sin\psi_f,\ \cos\psi_f,\ 0]^\top,\\
+          y_i^\star &= \left(i-\frac{N_K-1}{2}\right)d_f,\\
+          x_i &= (p_i-c)^\top f^n,\qquad
+          y_i = (p_i-c)^\top l^n,\\
+          e_{y,i} &= y_i-y_i^\star,\\
+          \eta_i^+ &= \operatorname{sat}_{\eta_{\max}}\!\left(\eta_i-k_{\eta}e_{y,i}\Delta t\right),\\
+          p_{i,\eta}^n &= c + f^n x_i + l^n(y_i^\star+\eta_i),\\
+          p_i^r &= p_{i,\eta}^n + f^n d_{r,i},\\
+          q_i^\chi &= R_z(\chi_i)^\top(p_i^r-p_i),\qquad
+          \theta_{r,i} = \operatorname{atan2}(q_{i,y}^{\chi},q_{i,x}^{\chi}),\\
+          e_{\mathrm{form},i}
+            &= \mathbf{1}_{i>0}(y_{i-1}^{f}+d_f)
+             + \mathbf{1}_{i+1<N_K}(y_{i+1}^{f}-d_f),\\
+          \phi_i^\star &= \phi_{i,\mathrm{rabbit}}^\star(\theta_{r,i}).
+          \end{aligned}
+          \]`;
+  const forwardFormationNote = `<div class="docs-card-note">Forward mode is a 2D lateral outer loop. It bypasses orbit phase-to-radius and phase-to-speed scheduling; the speed target is the configured base speed clamped by the existing min/max speed limits. Lane cross-track error only moves the rabbit target laterally; the roll command still comes from the same direct rabbit-bearing controller used by orbit mode.</div>`;
   const curvatureTrackingEquation = String.raw`
           \[
           \begin{aligned}
           \hat\kappa_{y,i} &= \frac{\omega_{n,z,i}}{\lVert v_i^{\mathrm{cad}} \rVert},\\
-          I_{\kappa\phi,i}^{+} &= I_{\kappa\phi,i} + \Delta t\left(\kappa_{y,i}^{\star} - \hat\kappa_{y,i}\right),\\
-          \phi_i^{\star} &= k_{\phi\kappa,p}\left(\kappa_{y,i}^{\star} - \hat\kappa_{y,i}\right) + k_{\phi\kappa,i} I_{\kappa\phi,i}.
+          e_{\kappa,i} &= \kappa_{y,i}^{\star} - \hat\kappa_{y,i},\\
+          \tilde I_{\kappa\phi,i} &= \operatorname{sat}_{I_\phi}\!\left(I_{\kappa\phi,i}\right),\\
+          \phi_i^{\star} &= \operatorname{sat}_{\phi_{\max}}\!\left(\phi_{i,\mathrm{ff}} + k_{\phi\kappa,p}e_{\kappa,i} + \tilde I_{\kappa\phi,i}\right),\\
+          I_{\kappa\phi,i}^{+} &= \operatorname{sat}_{I_\phi}\!\left(\tilde I_{\kappa\phi,i}
+            + \operatorname{aw}_{\phi}\!\left(k_{\phi\kappa,i}e_{\kappa,i}\Delta t;\phi_i^\star\right)\right).
           \end{aligned}
           \]`;
   const energyStateEquation = String.raw`
@@ -1598,6 +1689,20 @@ function controllerDocsHtml(phaseMode: PhaseMode, longitudinalMode: Longitudinal
     D --> F["${verticalBlock}"]
     F --> G["${torqueBlock}"]
     F --> I["${pitchBlock}"]
+    classDef block fill:#112231,stroke:#3ecf9b,color:#edf6ff;`;
+  const lateralModeDiagram = String.raw`flowchart LR
+    A["Lateral outer mode"] --> B{"Mode selector"}
+    B -->|"orbit"| C["Phase scheduling<br/>radius, speed, rabbit lead"]
+    B -->|"forward"| D["Forward frame<br/>heading, lanes, target offset, lead distance"]
+    B -->|"timed"| E["Time switch<br/>orbit → forward → orbit"]
+    E --> C
+    E --> D
+    C --> F["Orbit rabbit target<br/>p_i^r"]
+    D --> G["Forward rabbit target<br/>p_i^r"]
+    F --> H["Selected orbit guidance"]
+    G --> J["Direct rabbit-bearing guidance"]
+    H --> I["Roll reference<br/>φ_i^*"]
+    J --> I
     classDef block fill:#112231,stroke:#3ecf9b,color:#edf6ff;`;
   const innerLoopDiagram = String.raw`flowchart LR
     A["Rabbit target<br/>p_i^r"] --> B["Guidance selector<br/>direct bearing or curvature"]
@@ -1679,6 +1784,11 @@ function controllerDocsHtml(phaseMode: PhaseMode, longitudinalMode: Longitudinal
       meaning: "Direct-rabbit PI gains from bearing error to roll reference."
     },
     {
+      symbol: String.raw`\operatorname{aw}_{\phi}`,
+      source: "roll_integrator_with_reference_antiwindup",
+      meaning: "Directional anti-windup for roll-reference integrators at the roll-reference clamp."
+    },
+    {
       symbol: String.raw`f_x,\;\rho,\;\kappa_{\max}`,
       source: [
         "guidance_min_lookahead_fraction",
@@ -1696,6 +1806,32 @@ function controllerDocsHtml(phaseMode: PhaseMode, longitudinalMode: Longitudinal
       symbol: String.raw`\hat\kappa_{y,i},\;I_{\kappa\phi,i},\;k_{\phi\kappa,p},\;k_{\phi\kappa,i}`,
       source: ["omega_world_z", "roll_curvature_p", "roll_curvature_i"],
       meaning: "Estimated lateral curvature, curvature-to-roll integrator, and curvature-to-roll gains."
+    }
+  ]);
+  const forwardLegend = docsSymbolLegend([
+    {
+      symbol: String.raw`\psi_f,\;f^n,\;l^n`,
+      source: ["forward_frame_mode", "forward_heading_deg"],
+      meaning: "Forward-frame heading and horizontal forward/lateral axes."
+    },
+    {
+      symbol: String.raw`d_f,\;y_i^\star`,
+      source: ["formation_spacing_m", "lane_slot"],
+      meaning: "Formation lane spacing and assigned lateral lane for kite i."
+    },
+    {
+      symbol: String.raw`d_{r,i},\;p_i^r,\;\theta_{r,i}`,
+      source: ["rabbit_distance", "rabbit_targets_n", "direct_rabbit_bearing_y"],
+      meaning: "Forward lead distance, navigation target, and yaw-only target bearing."
+    },
+    {
+      symbol: String.raw`e_{y,i},\;\eta_i,\;p_{i,\eta}^n`,
+      source: [
+        "forward_cross_track_error",
+        "formation_lateral_offset_i_per_s",
+        "formation_lateral_offset_limit_m"
+      ],
+      meaning: "Forward lane cross-track error, integrated lateral target offset, and offset lane point."
     }
   ]);
   const energyLegend = docsSymbolLegend([
@@ -1778,6 +1914,12 @@ function controllerDocsHtml(phaseMode: PhaseMode, longitudinalMode: Longitudinal
         <div class="docs-grid">
           <div class="docs-prose">
             <div class="docs-phase-pill">Active UI phase mode <strong>${modeLabel}</strong></div>
+            <div class="docs-phase-pill">Active lateral mode <strong>${lateralLabel}</strong></div>
+            ${
+              usesForwardLateral
+                ? `<div class="docs-phase-pill">Forward frame <strong>${forwardFrameLabel}</strong></div>`
+                : ""
+            }
             <div class="docs-phase-pill">Active longitudinal mode <strong>${longitudinalLabel}</strong></div>
             ${propulsionParagraph}
             <p>The controller is naturally read as a cascade: phase scheduling, lateral rabbit geometry, selectable lateral guidance, an independent altitude/speed energy layer, then roll/pitch inner loops and actuator commands.</p>
@@ -1839,6 +1981,7 @@ function controllerDocsHtml(phaseMode: PhaseMode, longitudinalMode: Longitudinal
       <div class="docs-card-body">
         ${docsEquation("Lateral rabbit geometry", rabbitGeometryEquation, phaseLegend)}
         ${docsEquation("Selectable lateral guidance", lateralGuidanceEquation, guidanceLegend, lateralGuidanceNote)}
+        ${docsEquation("Forward formation lateral outer loop", forwardFormationEquation, forwardLegend, forwardFormationNote)}
         ${docsEquation("Curvature-to-roll tracking", curvatureTrackingEquation, guidanceLegend)}
       </div>
     </section>
@@ -1871,8 +2014,12 @@ function controllerDocsHtml(phaseMode: PhaseMode, longitudinalMode: Longitudinal
             <div class="docs-diagram-caption">Figure 1. Phase mode selection and rabbit scheduling feed lateral guidance; disk-height altitude and scheduled speed feed TECS.</div>
           </div>
           <div class="docs-diagram">
+            <div class="mermaid">${lateralModeDiagram}</div>
+            <div class="docs-diagram-caption">Figure 2. The lateral outer mode selects orbit/rabbit guidance, forward formation, or a timed hard switch between them.</div>
+          </div>
+          <div class="docs-diagram">
             <div class="mermaid">${innerLoopDiagram}</div>
-            <div class="docs-diagram-caption">Figure 2. Body-frame guidance, lateral roll cascade, TECS pitch cascade, and direct actuator channels.</div>
+            <div class="docs-diagram-caption">Figure 3. Body-frame guidance, lateral roll cascade, TECS pitch cascade, and direct actuator channels.</div>
           </div>
         </div>
       </div>
@@ -1885,7 +2032,9 @@ function renderControllerDocs(): void {
     : "total_energy") as LongitudinalMode;
   controllerDocsNode.innerHTML = controllerDocsHtml(
     phaseModeSelect.value as PhaseMode,
-    longitudinalMode
+    longitudinalMode,
+    activeLateralOuterMode(),
+    activeForwardFrameMode()
   );
   typesetMath(controllerDocsNode);
   renderMermaid(controllerDocsNode);
@@ -2810,6 +2959,12 @@ function renderControllerTuningControls(tuning: ControllerTuning): void {
     if (field.guidanceModes) {
       row.dataset.guidanceModes = field.guidanceModes.join(",");
     }
+    if (field.lateralModes) {
+      row.dataset.lateralModes = field.lateralModes.join(",");
+    }
+    if (field.frameModes) {
+      row.dataset.frameModes = field.frameModes.join(",");
+    }
     const value = tuning[field.key] ?? 0;
     const controlId = `controller-tuning-${field.key}`;
     const control =
@@ -2925,11 +3080,29 @@ function activeGuidanceMode(): GuidanceMode {
   }
 }
 
+function activeLateralOuterMode(): LateralOuterMode {
+  return lateralOuterModeSelect.value as LateralOuterMode;
+}
+
+function activeForwardFrameMode(): ForwardFrameMode {
+  return forwardFrameModeSelect.value as ForwardFrameMode;
+}
+
+function syncLateralOuterModeVisibility(): void {
+  const mode = activeLateralOuterMode();
+  const usesForward = mode === "forward_formation" || mode === "timed_transition";
+  forwardFormationOptionsNode.hidden = !usesForward;
+  timedTransitionOptionsNode.hidden = mode !== "timed_transition";
+  syncControllerTuningVisibility();
+}
+
 function syncControllerTuningVisibility(): void {
   const activeMode: TuningMode = maxThrottleAltitudePitchInput.checked
     ? "max_throttle_altitude_pitch"
     : "total_energy";
   const guidanceMode = activeGuidanceMode();
+  const lateralMode = activeLateralOuterMode();
+  const forwardFrameMode = activeForwardFrameMode();
   controllerTuningFieldsNode.querySelectorAll<HTMLElement>(".tuning-field").forEach((field) => {
     field.hidden = false;
   });
@@ -2943,6 +3116,18 @@ function syncControllerTuningVisibility(): void {
     .forEach((field) => {
       const allowed = (field.dataset.guidanceModes ?? "").split(",");
       field.hidden ||= !allowed.includes(guidanceMode);
+    });
+  controllerTuningFieldsNode
+    .querySelectorAll<HTMLElement>(".tuning-field[data-lateral-modes]")
+    .forEach((field) => {
+      const allowed = (field.dataset.lateralModes ?? "").split(",");
+      field.hidden ||= !allowed.includes(lateralMode);
+    });
+  controllerTuningFieldsNode
+    .querySelectorAll<HTMLElement>(".tuning-field[data-frame-modes]")
+    .forEach((field) => {
+      const allowed = (field.dataset.frameModes ?? "").split(",");
+      field.hidden ||= !allowed.includes(forwardFrameMode);
     });
   controllerTuningFieldsNode.querySelectorAll<HTMLElement>(".tuning-group").forEach((group) => {
     const fields = Array.from(group.querySelectorAll<HTMLElement>(".tuning-field"));
@@ -3337,8 +3522,8 @@ function buildPerKiteGroup(
   kiteCount: number,
   title: string,
   yTitle: string,
-  actualValue: (frame: ApiFrame, kiteIndex: number) => number,
-  referenceValue?: (frame: ApiFrame, kiteIndex: number) => number,
+  actualValue: (frame: ApiFrame, kiteIndex: number) => number | null,
+  referenceValue?: (frame: ApiFrame, kiteIndex: number) => number | null,
   extraTraces: PlotTraceDefinition[] = []
 ): PlotGroupDefinition {
   const traces: PlotTraceDefinition[] = [];
@@ -3605,6 +3790,168 @@ function buildRabbitVectorGroup(kiteCount: number): PlotGroupDefinition {
       value: (frame, kiteIndex) => bodyComponent(frame.rabbit_vector_b, kiteIndex, 2)
     }
   ]);
+}
+
+function frameUsesForwardLateral(frame: ApiFrame, kiteIndex: number): boolean {
+  return Math.abs((frame.lateral_outer_mode[kiteIndex] ?? 0) - 1) < 0.5;
+}
+
+function forwardOnly(
+  frame: ApiFrame,
+  kiteIndex: number,
+  value: number | null | undefined
+): number | null {
+  return frameUsesForwardLateral(frame, kiteIndex) ? (value ?? 0) : null;
+}
+
+function buildLateralOuterModeGroup(kiteCount: number): PlotGroupDefinition {
+  const traces: PlotTraceDefinition[] = [];
+  for (let kiteIndex = 0; kiteIndex < kiteCount; kiteIndex += 1) {
+    traces.push({
+      name: `Kite ${kiteIndex + 1}`,
+      color: kiteColor(kiteIndex),
+      signalKey: "Active Lateral Outer Mode:mode",
+      legendName: "Active mode",
+      kiteIndex,
+      shape: "hv",
+      value: (frame) => frame.lateral_outer_mode[kiteIndex] ?? 0
+    });
+  }
+  return {
+    title: "Active Lateral Outer Mode",
+    yTitle: "mode",
+    traces,
+    yTickVals: [0, 1],
+    yTickText: ["orbit", "forward"],
+    yRange: [-0.2, 1.2]
+  };
+}
+
+function buildForwardBearingGroup(kiteCount: number): PlotGroupDefinition {
+  return buildPerKiteGroup(
+    kiteCount,
+    "Forward Bearing Error (deg)",
+    "deg",
+    (frame, kiteIndex) => forwardOnly(frame, kiteIndex, frame.rabbit_bearing_y_deg[kiteIndex]),
+    undefined,
+    [
+      {
+        name: "Zero Ref",
+        color: ZERO_REF_COLOR,
+        dash: "dash",
+        value: () => 0
+      }
+    ]
+  );
+}
+
+function buildForwardTargetOffsetGroup(kiteCount: number): PlotGroupDefinition {
+  return buildPerKiteBreakdownGroup(
+    kiteCount,
+    "Forward Target Offset (m)",
+    "m",
+    [
+      {
+        name: "Integrated target offset",
+        width: 2.6,
+        value: (frame, kiteIndex) =>
+          forwardOnly(frame, kiteIndex, frame.forward_lateral_offset[kiteIndex])
+      },
+      {
+        name: "Lane cross-track error",
+        dash: "dash",
+        alpha: 0.72,
+        value: (frame, kiteIndex) =>
+          forwardOnly(frame, kiteIndex, frame.forward_cross_track_error[kiteIndex])
+      }
+    ]
+  );
+}
+
+function buildForwardLaneGroup(kiteCount: number): PlotGroupDefinition {
+  return buildPerKiteBreakdownGroup(kiteCount, "Forward Lane Geometry (m)", "m", [
+    {
+      name: "Cross-track error",
+      value: (frame, kiteIndex) =>
+        forwardOnly(frame, kiteIndex, frame.forward_cross_track_error[kiteIndex])
+    },
+    {
+      name: "Lane slot",
+      dash: "dash",
+      alpha: 0.62,
+      defaultVisible: false,
+      value: (frame, kiteIndex) =>
+        forwardOnly(frame, kiteIndex, frame.forward_lane_y[kiteIndex])
+    },
+    {
+      name: "Zero Ref",
+      dash: "dot",
+      alpha: 0.55,
+      value: (frame, kiteIndex) => (frameUsesForwardLateral(frame, kiteIndex) ? 0 : null)
+    }
+  ]);
+}
+
+function buildForwardNeighborGroup(kiteCount: number): PlotGroupDefinition {
+  return buildPerKiteBreakdownGroup(kiteCount, "Forward Neighbor Formation-Y (m)", "m", [
+    {
+      name: "Previous neighbor y",
+      value: (frame, kiteIndex) =>
+        forwardOnly(frame, kiteIndex, frame.forward_neighbor_prev_y_f[kiteIndex])
+    },
+    {
+      name: "Next neighbor y",
+      dash: "dash",
+      alpha: 0.78,
+      value: (frame, kiteIndex) =>
+        forwardOnly(frame, kiteIndex, frame.forward_neighbor_next_y_f[kiteIndex])
+    },
+    {
+      name: "Previous desired y",
+      dash: "dot",
+      alpha: 0.55,
+      defaultVisible: false,
+      value: (frame, kiteIndex) =>
+        forwardOnly(frame, kiteIndex, -(frame.forward_formation_spacing[kiteIndex] ?? 0))
+    },
+    {
+      name: "Next desired y",
+      dash: "dot",
+      alpha: 0.55,
+      defaultVisible: false,
+      value: (frame, kiteIndex) =>
+        forwardOnly(frame, kiteIndex, frame.forward_formation_spacing[kiteIndex])
+    }
+  ]);
+}
+
+function buildForwardFormationErrorGroup(kiteCount: number): PlotGroupDefinition {
+  return buildPerKiteGroup(
+    kiteCount,
+    "Forward Formation Error (m)",
+    "m",
+    (frame, kiteIndex) =>
+      forwardOnly(frame, kiteIndex, frame.forward_formation_error[kiteIndex]),
+    undefined,
+    [
+      {
+        name: "Zero Ref",
+        color: ZERO_REF_COLOR,
+        dash: "dash",
+        value: () => 0
+      }
+    ]
+  );
+}
+
+function buildForwardFrameHeadingGroup(kiteCount: number): PlotGroupDefinition {
+  return buildPerKiteGroup(
+    kiteCount,
+    "Forward Frame Heading (deg)",
+    "deg",
+    (frame, kiteIndex) =>
+      forwardOnly(frame, kiteIndex, frame.forward_frame_heading_deg[kiteIndex])
+  );
 }
 
 function buildSpeedTargetGroup(kiteCount: number): PlotGroupDefinition {
@@ -4423,14 +4770,21 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
     {
       title: "Controller / 2. Lateral Outer Loop",
       description:
-        "Outer lateral path loop. Phase coordination biases rabbit radius and speed scheduling; desired speed schedules rabbit lead distance before the target point feeds the selected guidance mode.",
+        "Outer lateral path loop. Orbit mode uses phase coordination to bias rabbit radius and speed scheduling. Forward-formation mode integrates lane cross-track error into a lateral rabbit-target offset, then uses the same direct rabbit-bearing roll path.",
       groups: [
+        buildLateralOuterModeGroup(kiteCount),
         buildRabbitBearingGroup(kiteCount),
         buildRabbitVectorGroup(kiteCount),
         buildRabbitDistanceGroup(kiteCount),
         buildOrbitRadiusGroup(kiteCount),
         buildPhaseErrorGroup(kiteCount),
-        buildSpeedTargetGroup(kiteCount)
+        buildSpeedTargetGroup(kiteCount),
+        buildForwardBearingGroup(kiteCount),
+        buildForwardTargetOffsetGroup(kiteCount),
+        buildForwardLaneGroup(kiteCount),
+        buildForwardNeighborGroup(kiteCount),
+        buildForwardFormationErrorGroup(kiteCount),
+        buildForwardFrameHeadingGroup(kiteCount)
       ]
     },
     {
@@ -4988,8 +5342,9 @@ function buildPlotSections(kiteCount: number): PlotSectionDefinition[] {
 function formatProgressSummary(
   request: {
     preset: string;
+    swarm_forward_flight_init: boolean;
     swarm_disk_altitude_m: number | null;
-    swarm_disk_radius_m: number | null;
+    swarm_disk_diameter_m: number | null;
     swarm_aircraft_altitude_m: number | null;
     swarm_upper_tether_length_m: number | null;
     swarm_common_tether_length_m: number | null;
@@ -5018,8 +5373,12 @@ function formatProgressSummary(
     [
       { label: "Progress", value: `${pct.toFixed(1)}%` },
       { label: "Preset", value: request.preset },
+      {
+        label: "Initial Layout",
+        value: request.swarm_forward_flight_init ? "Forward formation" : "Orbit"
+      },
       { label: "Disk Altitude", value: optionalMetersLabel(request.swarm_disk_altitude_m) },
-      { label: "Disk Radius", value: optionalMetersLabel(request.swarm_disk_radius_m) },
+      { label: "Disk Diameter", value: optionalMetersLabel(request.swarm_disk_diameter_m) },
       { label: "Aircraft Altitude", value: optionalMetersLabel(request.swarm_aircraft_altitude_m) },
       {
         label: "Tethers",
@@ -6052,16 +6411,24 @@ function updateControlRing(frame: ApiFrame, layer: ControlFeatureLayerMeshes): v
   (layer.controlRingLine.geometry as THREE.BufferGeometry).setFromPoints(ringPoints);
 
   const showAdaptiveSlots = activeSummaryRequest?.phase_mode === "adaptive";
-  ensureMeshCount(showAdaptiveSlots ? kiteCount : 0, layer.phaseSlotMeshes, makePhaseSlotMesh);
-  if (showAdaptiveSlots) {
+  const showForwardSlots = anyForwardLateralMode(frame);
+  ensureMeshCount(
+    showAdaptiveSlots || showForwardSlots ? kiteCount : 0,
+    layer.phaseSlotMeshes,
+    makePhaseSlotMesh
+  );
+  if (showAdaptiveSlots || showForwardSlots) {
     for (let index = 0; index < kiteCount; index += 1) {
       layer.phaseSlotMeshes[index].visible = controlFeaturesVisible() && layerVisible;
-      layer.phaseSlotMeshes[index].position.copy(phaseSlotPosition(frame, index, layer.mode));
-      setMaterialColor(
-        layer.phaseSlotMeshes[index].material,
-        controlPhaseSlotColor,
-        0.18
-      );
+      if (isForwardLateralMode(frame, index)) {
+        layer.phaseSlotMeshes[index].position.copy(
+          forwardFormationErrorTipPosition(frame, index, layer.mode)
+        );
+        setMaterialColor(layer.phaseSlotMeshes[index].material, controlFormationErrorColor, 0.18);
+      } else {
+        layer.phaseSlotMeshes[index].position.copy(phaseSlotPosition(frame, index, layer.mode));
+        setMaterialColor(layer.phaseSlotMeshes[index].material, controlPhaseSlotColor, 0.18);
+      }
     }
   }
 }
@@ -6115,6 +6482,44 @@ function controlRingPoint(
     center[1] + radius * Math.sin(theta),
     down
   ]);
+}
+
+function isForwardLateralMode(frame: ApiFrame, kiteIndex: number): boolean {
+  return Math.abs((frame.lateral_outer_mode[kiteIndex] ?? 0) - 1) < 0.5;
+}
+
+function anyForwardLateralMode(frame: ApiFrame): boolean {
+  return frame.lateral_outer_mode.some((mode) => Math.abs(mode - 1) < 0.5);
+}
+
+function forwardLanePointPosition(
+  frame: ApiFrame,
+  kiteIndex: number,
+  layer: ControlFeatureAltitudeLayer
+): THREE.Vector3 {
+  return toDisplayDiskFeature(
+    frame,
+    kiteIndex,
+    frame.forward_lane_point_n[kiteIndex] ??
+      frame.disk_plane_projection_n[kiteIndex] ??
+      frame.kite_positions_n[kiteIndex],
+    layer
+  );
+}
+
+function forwardFormationErrorTipPosition(
+  frame: ApiFrame,
+  kiteIndex: number,
+  layer: ControlFeatureAltitudeLayer
+): THREE.Vector3 {
+  return toDisplayDiskFeature(
+    frame,
+    kiteIndex,
+    frame.forward_formation_error_tip_n[kiteIndex] ??
+      frame.forward_lane_point_n[kiteIndex] ??
+      frame.kite_positions_n[kiteIndex],
+    layer
+  );
 }
 
 function projectedPhasePosition(
@@ -6264,31 +6669,58 @@ function updateControlLabels(): void {
 
   frame.kite_positions_n.forEach((_position, kiteIndex) => {
     const kiteLabel = `K${kiteIndex + 1}`;
-    specs.push({
-      key: `lookahead-${kiteIndex}`,
-      text: `${kiteLabel} lookahead`,
-      color: CONTROL_VIS_COLORS.lookahead,
-      position: rabbitTargetPosition(frame, kiteIndex, labelLayer)
-    });
-    specs.push({
-      key: `lookahead-disk-${kiteIndex}`,
-      text: `${kiteLabel} lookahead on disk`,
-      color: CONTROL_VIS_COLORS.lookaheadOnDisk,
-      position: lookaheadOnDiskPosition(frame, kiteIndex, labelLayer)
-    });
-    specs.push({
-      key: `projected-${kiteIndex}`,
-      text: `${kiteLabel} projected phase`,
-      color: CONTROL_VIS_COLORS.projectedPhase,
-      position: projectedPhasePosition(frame, kiteIndex, labelLayer)
-    });
-    if (showAdaptiveSlots) {
+    if (isForwardLateralMode(frame, kiteIndex)) {
+      specs.push({
+        key: `lookahead-${kiteIndex}`,
+        text: `${kiteLabel} forward target`,
+        color: CONTROL_VIS_COLORS.lookahead,
+        position: rabbitTargetPosition(frame, kiteIndex, labelLayer)
+      });
+      specs.push({
+        key: `lookahead-disk-${kiteIndex}`,
+        text: `${kiteLabel} lane point`,
+        color: CONTROL_VIS_COLORS.lookaheadOnDisk,
+        position: forwardLanePointPosition(frame, kiteIndex, labelLayer)
+      });
+      specs.push({
+        key: `projected-${kiteIndex}`,
+        text: `${kiteLabel} aircraft projection`,
+        color: CONTROL_VIS_COLORS.projectedPhase,
+        position: diskPlaneProjectionPosition(frame, kiteIndex, labelLayer)
+      });
       specs.push({
         key: `slot-${kiteIndex}`,
-        text: `${kiteLabel} phase slot`,
-        color: CONTROL_VIS_COLORS.phaseSlot,
-        position: phaseSlotPosition(frame, kiteIndex, labelLayer)
+        text: `${kiteLabel} offset lane target`,
+        color: CONTROL_VIS_COLORS.formationError,
+        position: forwardFormationErrorTipPosition(frame, kiteIndex, labelLayer)
       });
+    } else {
+      specs.push({
+        key: `lookahead-${kiteIndex}`,
+        text: `${kiteLabel} lookahead`,
+        color: CONTROL_VIS_COLORS.lookahead,
+        position: rabbitTargetPosition(frame, kiteIndex, labelLayer)
+      });
+      specs.push({
+        key: `lookahead-disk-${kiteIndex}`,
+        text: `${kiteLabel} lookahead on disk`,
+        color: CONTROL_VIS_COLORS.lookaheadOnDisk,
+        position: lookaheadOnDiskPosition(frame, kiteIndex, labelLayer)
+      });
+      specs.push({
+        key: `projected-${kiteIndex}`,
+        text: `${kiteLabel} projected phase`,
+        color: CONTROL_VIS_COLORS.projectedPhase,
+        position: projectedPhasePosition(frame, kiteIndex, labelLayer)
+      });
+      if (showAdaptiveSlots) {
+        specs.push({
+          key: `slot-${kiteIndex}`,
+          text: `${kiteLabel} phase slot`,
+          color: CONTROL_VIS_COLORS.phaseSlot,
+          position: phaseSlotPosition(frame, kiteIndex, labelLayer)
+        });
+      }
     }
   });
 
@@ -6299,6 +6731,34 @@ function updateControlLabels(): void {
     }
   });
   specs.forEach(setControlLabel);
+}
+
+function updateControlVisLegend(frame: ApiFrame): void {
+  const forwardMode = anyForwardLateralMode(frame);
+  const rows = forwardMode
+    ? [
+        ["lookahead", "Forward lookahead target"],
+        ["lookahead-disk", "Forward lane point"],
+        ["projected", "Aircraft projection"],
+        ["slot", "Integrated lane offset"],
+        ["disk", "Control ring"]
+      ]
+    : [
+        ["lookahead", "Orbit lookahead target"],
+        ["lookahead-disk", "Lookahead before radial offset"],
+        ["projected", "Projected phase point"],
+        ["slot", "Formation phase slot"],
+        ["disk", "Control ring"]
+      ];
+  controlVisLegendNode.innerHTML = `
+    <div class="legend-title">Control Vis</div>
+    ${rows
+      .map(
+        ([className, label]) =>
+          `<div class="legend-row"><span class="legend-swatch ${className}"></span>${label}</div>`
+      )
+      .join("")}
+  `;
 }
 
 function deriveKiteVisualDimensions(frame: ApiFrame, index: number): KiteVisualDimensions | null {
@@ -6635,6 +7095,66 @@ function renderControlFeatureLayer(
   const showControlLines = controlFeatureLinesVisible() && layerVisible;
   const rabbitPosition = rabbitTargetPosition(frame, index, layer.mode);
 
+  if (isForwardLateralMode(frame, index)) {
+    const lanePoint = forwardLanePointPosition(frame, index, layer.mode);
+    const projection = diskPlaneProjectionPosition(frame, index, layer.mode);
+    const formationErrorTip = forwardFormationErrorTipPosition(frame, index, layer.mode);
+    const phaseSlotMesh = layer.phaseSlotMeshes[index];
+
+    rabbitMesh.position.copy(rabbitPosition);
+    rabbitMesh.visible = showControlFeatures;
+    setMaterialColor(rabbitMesh.material, controlLookaheadColor, 0.34);
+
+    lookaheadOnDiskMesh.position.copy(lanePoint);
+    lookaheadOnDiskMesh.visible = showControlFeatures;
+    setMaterialColor(lookaheadOnDiskMesh.material, controlLookaheadOnDiskColor, 0.22);
+
+    projectedPhaseMesh.position.copy(projection);
+    projectedPhaseMesh.visible = showControlFeatures;
+    setMaterialColor(projectedPhaseMesh.material, controlProjectedPhaseColor, 0.28);
+
+    if (phaseSlotMesh) {
+      phaseSlotMesh.position.copy(formationErrorTip);
+      phaseSlotMesh.visible = showControlFeatures;
+      setMaterialColor(phaseSlotMesh.material, controlFormationErrorColor, 0.18);
+    }
+
+    updateFadedLine(
+      guidanceLine,
+      projection,
+      rabbitPosition,
+      controlLookaheadColor,
+      0.9,
+      0.36,
+      showControlLines
+    );
+    updateLine(
+      lookaheadRadialOffsetLine,
+      lanePoint,
+      rabbitPosition,
+      controlRabbitRelationshipLineColor,
+      0.62,
+      showControlLines
+    );
+    updateLine(
+      projectedToDiskLine,
+      projection,
+      lanePoint,
+      controlClosestDiskColor,
+      0.56,
+      showControlLines
+    );
+    updateLine(
+      phaseSlotToClosestDiskLine,
+      lanePoint,
+      formationErrorTip,
+      controlFormationErrorColor,
+      0.54,
+      showControlLines
+    );
+    return;
+  }
+
   rabbitMesh.position.copy(rabbitPosition);
   rabbitMesh.visible = showControlFeatures;
   setMaterialColor(rabbitMesh.material, controlLookaheadColor, 0.34);
@@ -6692,6 +7212,7 @@ function renderFrame(frame: ApiFrame): void {
   lastRenderedFrame = frame;
   hasRenderedSimulationFrame = true;
   renderMassOverlay(frame);
+  updateControlVisLegend(frame);
   ensureKites(frame.kite_positions_n.length, frame);
   const showAdaptiveSlots = activeSummaryRequest?.phase_mode === "adaptive";
   payloadMesh.position.copy(toThree(frame.payload_position_n));
@@ -7300,6 +7821,15 @@ async function loadDefaultConfig(): Promise<void> {
     durationInput.value = String(simulationDefaults.duration);
     dtControlInput.value = compactNumberInputValue(simulationDefaults.dt_control);
     phaseModeSelect.value = simulationDefaults.phase_mode;
+    lateralOuterModeSelect.value = simulationDefaults.lateral_outer_mode;
+    forwardFrameModeSelect.value = simulationDefaults.forward_frame_mode;
+    transitionToForwardInput.value = compactNumberInputValue(
+      simulationDefaults.transition_to_forward_s
+    );
+    transitionToOrbitInput.value =
+      simulationDefaults.transition_to_orbit_s === null
+        ? ""
+        : compactNumberInputValue(simulationDefaults.transition_to_orbit_s);
     bridleEnabledInput.checked = simulationDefaults.bridle_enabled;
     simNoiseInput.checked = simulationDefaults.sim_noise_enabled;
     drydenSeedInput.value = String(simulationDefaults.dryden.seed);
@@ -7316,6 +7846,7 @@ async function loadDefaultConfig(): Promise<void> {
     rkRelTolInput.value = toleranceInputValue(simulationDefaults.rk_rel_tol);
     maxSubstepsInput.value = String(simulationDefaults.max_substeps);
     renderControllerTuningControls(simulationDefaults.controller_tuning);
+    syncLateralOuterModeVisibility();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     appendConsole(`warning: failed to load default sim config: ${message}`);
@@ -7382,22 +7913,32 @@ async function startSimulation(): Promise<void> {
     simulationDefaults?.max_substeps ?? 1000
   );
   const swarmDiskAltitudeM = nonnegativeInputValue(swarmDiskAltitudeInput, 350);
-  const swarmDiskRadiusM = positiveInputValue(swarmDiskRadiusInput, 70);
+  const swarmDiskDiameterM = positiveInputValue(swarmDiskDiameterInput, 140);
   const swarmAircraftAltitudeM = optionalInputValue(swarmAircraftAltitudeInput);
   const swarmUpperTetherLengthM = positiveInputValue(swarmUpperTetherLengthInput, 120);
   const swarmCommonTetherLengthM = positiveInputValue(swarmCommonTetherLengthInput, 150);
   const performanceScalePercent = optionalInputValue(performanceScaleInput);
+  const transitionToForwardS = nonnegativeInputValue(
+    transitionToForwardInput,
+    simulationDefaults?.transition_to_forward_s ?? 5
+  );
+  const transitionToOrbitS = optionalInputValue(transitionToOrbitInput);
   const request = {
     preset: presetSelect.value,
     swarm_kites: selectedSwarmKiteCount(),
+    swarm_forward_flight_init: swarmForwardFlightInitInput.checked,
     swarm_disk_altitude_m: swarmDiskAltitudeM,
-    swarm_disk_radius_m: swarmDiskRadiusM,
+    swarm_disk_diameter_m: swarmDiskDiameterM,
     swarm_aircraft_altitude_m: swarmAircraftAltitudeM,
     swarm_upper_tether_length_m: swarmUpperTetherLengthM,
     swarm_common_tether_length_m: swarmCommonTetherLengthM,
     duration: durationSeconds,
     dt_control: dtControl,
     phase_mode: phaseModeSelect.value as PhaseMode,
+    lateral_outer_mode: lateralOuterModeSelect.value as LateralOuterMode,
+    forward_frame_mode: forwardFrameModeSelect.value as ForwardFrameMode,
+    transition_to_forward_s: transitionToForwardS,
+    transition_to_orbit_s: transitionToOrbitS,
     longitudinal_mode: (maxThrottleAltitudePitchInput.checked
       ? "max_throttle_altitude_pitch"
       : "total_energy") as LongitudinalMode,
@@ -7426,12 +7967,17 @@ async function startSimulation(): Promise<void> {
   activeSummaryRequest = {
     preset: request.preset,
     swarm_kites: request.swarm_kites,
+    swarm_forward_flight_init: request.swarm_forward_flight_init,
     swarm_disk_altitude_m: request.swarm_disk_altitude_m,
-    swarm_disk_radius_m: request.swarm_disk_radius_m,
+    swarm_disk_diameter_m: request.swarm_disk_diameter_m,
     swarm_aircraft_altitude_m: request.swarm_aircraft_altitude_m,
     swarm_upper_tether_length_m: request.swarm_upper_tether_length_m,
     swarm_common_tether_length_m: request.swarm_common_tether_length_m,
     phase_mode: request.phase_mode,
+    lateral_outer_mode: request.lateral_outer_mode,
+    forward_frame_mode: request.forward_frame_mode,
+    transition_to_forward_s: request.transition_to_forward_s,
+    transition_to_orbit_s: request.transition_to_orbit_s,
     longitudinal_mode: request.longitudinal_mode,
     sim_noise_enabled: request.sim_noise_enabled,
     dryden: request.dryden,
@@ -7451,14 +7997,24 @@ async function startSimulation(): Promise<void> {
     [
       { label: "Preset", value: request.preset },
       { label: "Kites", value: String(kiteCount) },
+      {
+        label: "Initial Layout",
+        value: request.swarm_forward_flight_init ? "Forward formation" : "Orbit"
+      },
       { label: "Disk Altitude", value: optionalMetersLabel(request.swarm_disk_altitude_m) },
-      { label: "Disk Radius", value: optionalMetersLabel(request.swarm_disk_radius_m) },
+      { label: "Disk Diameter", value: optionalMetersLabel(request.swarm_disk_diameter_m) },
       { label: "Aircraft Altitude", value: optionalMetersLabel(request.swarm_aircraft_altitude_m) },
       {
         label: "Tethers",
         value: `lower ${compactNumberInputValue(request.swarm_common_tether_length_m)} m / upper ${compactNumberInputValue(request.swarm_upper_tether_length_m)} m`
       },
       { label: "Phase Mode", value: request.phase_mode },
+      { label: "Lateral Mode", value: request.lateral_outer_mode },
+      {
+        label: "Forward Frame",
+        value:
+          request.lateral_outer_mode === "orbit" ? "inactive" : request.forward_frame_mode
+      },
       { label: "Longitudinal", value: longitudinalModeLabel(request.longitudinal_mode) },
       { label: "Performance Scale", value: optionalPercentLabel(request.performance_scale_percent) },
       { label: "Bridle", value: request.bridle_enabled ? "Enabled" : "CG attach" },
@@ -7490,7 +8046,7 @@ async function startSimulation(): Promise<void> {
     "Run requested"
   );
   appendConsole(
-    `run requested: preset=${request.preset}, kites=${request.swarm_kites}, disk_alt=${optionalMetersLabel(request.swarm_disk_altitude_m)}, disk_radius=${optionalMetersLabel(request.swarm_disk_radius_m)}, aircraft_alt=${optionalMetersLabel(request.swarm_aircraft_altitude_m)}, lower_tether=${compactNumberInputValue(request.swarm_common_tether_length_m)}m, upper_tether=${compactNumberInputValue(request.swarm_upper_tether_length_m)}m, duration=${request.duration}s, dt_control=${compactNumberInputValue(request.dt_control)}s (${(1 / request.dt_control).toFixed(1)} Hz), phase=${request.phase_mode}, longitudinal=${request.longitudinal_mode}, performance_scale=${optionalPercentLabel(request.performance_scale_percent)}, bridle=${request.bridle_enabled ? "enabled" : "cg_attach"}, noise=${request.sim_noise_enabled ? "dryden" : "off"}, dryden_intensity=${compactNumberInputValue(request.dryden.intensity_scale)}, dryden_length=${compactNumberInputValue(request.dryden.length_scale)}, dryden_seed=${request.dryden.seed}, rk_abs_tol=${toleranceLabel(request.rk_abs_tol)}, rk_rel_tol=${toleranceLabel(request.rk_rel_tol)}, max_substeps=${request.max_substeps}, time_dilation=${playbackLabel}`
+    `run requested: preset=${request.preset}, kites=${request.swarm_kites}, init_layout=${request.swarm_forward_flight_init ? "forward" : "orbit"}, disk_alt=${optionalMetersLabel(request.swarm_disk_altitude_m)}, disk_diameter=${optionalMetersLabel(request.swarm_disk_diameter_m)}, aircraft_alt=${optionalMetersLabel(request.swarm_aircraft_altitude_m)}, lower_tether=${compactNumberInputValue(request.swarm_common_tether_length_m)}m, upper_tether=${compactNumberInputValue(request.swarm_upper_tether_length_m)}m, duration=${request.duration}s, dt_control=${compactNumberInputValue(request.dt_control)}s (${(1 / request.dt_control).toFixed(1)} Hz), phase=${request.phase_mode}, lateral=${request.lateral_outer_mode}, forward_frame=${request.forward_frame_mode}, transition_to_forward=${compactNumberInputValue(request.transition_to_forward_s)}s, transition_to_orbit=${request.transition_to_orbit_s === null ? "none" : `${compactNumberInputValue(request.transition_to_orbit_s)}s`}, longitudinal=${request.longitudinal_mode}, performance_scale=${optionalPercentLabel(request.performance_scale_percent)}, bridle=${request.bridle_enabled ? "enabled" : "cg_attach"}, noise=${request.sim_noise_enabled ? "dryden" : "off"}, dryden_intensity=${compactNumberInputValue(request.dryden.intensity_scale)}, dryden_length=${compactNumberInputValue(request.dryden.length_scale)}, dryden_seed=${request.dryden.seed}, rk_abs_tol=${toleranceLabel(request.rk_abs_tol)}, rk_rel_tol=${toleranceLabel(request.rk_rel_tol)}, max_substeps=${request.max_substeps}, time_dilation=${playbackLabel}`
   );
   appendConsole(controllerTuningSnapshotLabel(request.controller_tuning));
 
@@ -7696,6 +8252,16 @@ phaseModeSelect.addEventListener("change", () => {
   renderControllerDocs();
 });
 
+lateralOuterModeSelect.addEventListener("change", () => {
+  syncLateralOuterModeVisibility();
+  renderControllerDocs();
+});
+
+forwardFrameModeSelect.addEventListener("change", () => {
+  syncLateralOuterModeVisibility();
+  renderControllerDocs();
+});
+
 simNoiseInput.addEventListener("change", () => {
   syncDrydenTuningVisibility();
 });
@@ -7857,6 +8423,7 @@ window.addEventListener("resize", () => {
 
 void Promise.all([loadDefaultConfig(), loadPresets()]).then(() => {
   syncDrydenTuningVisibility();
+  syncLateralOuterModeVisibility();
   syncTetherTensionScaleVisibility();
   applyPresetDefaults();
   void refreshPerformanceScalePreview();

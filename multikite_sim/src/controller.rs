@@ -25,8 +25,8 @@ use crate::math::{
     rotate_nav_to_body, wrap_angle, yaw_angle_from_quat_n2b, yaw_quaternion_n2b,
 };
 use crate::types::{
-    ControlSurfaces, Controls, Diagnostics, KiteControls, LongitudinalMode, Params, PhaseMode,
-    State,
+    ControlSurfaces, Controls, Diagnostics, ForwardFrameMode, KiteControls, LateralOuterMode,
+    LongitudinalMode, Params, PhaseMode, State,
 };
 use nalgebra::{Quaternion, Vector3};
 
@@ -77,14 +77,271 @@ fn altitude_from_position_n(pos_n: &Vector3<f64>, ground_altitude: f64) -> f64 {
     (-pos_n[2] - ground_altitude).max(0.0)
 }
 
+fn lateral_outer_mode_value(mode: LateralOuterMode) -> f64 {
+    match mode {
+        LateralOuterMode::Orbit => 0.0,
+        LateralOuterMode::ForwardFormation => 1.0,
+        LateralOuterMode::TimedTransition => 2.0,
+    }
+}
+
+fn active_lateral_outer_mode(
+    configured: LateralOuterMode,
+    time: f64,
+    transition_to_forward_s: f64,
+    transition_to_orbit_s: Option<f64>,
+) -> LateralOuterMode {
+    match configured {
+        LateralOuterMode::Orbit => LateralOuterMode::Orbit,
+        LateralOuterMode::ForwardFormation => LateralOuterMode::ForwardFormation,
+        LateralOuterMode::TimedTransition => {
+            if time < transition_to_forward_s {
+                LateralOuterMode::Orbit
+            } else if transition_to_orbit_s.is_some_and(|transition| time >= transition) {
+                LateralOuterMode::Orbit
+            } else {
+                LateralOuterMode::ForwardFormation
+            }
+        }
+    }
+}
+
+fn clamped_base_speed_target<const NK: usize>(params: &Params<f64, NK>) -> f64 {
+    let tuning = &params.controller.tuning;
+    let min_speed = tuning.speed_min_mps.min(tuning.speed_max_mps);
+    let max_speed = tuning.speed_min_mps.max(tuning.speed_max_mps);
+    clamp(params.controller.speed_ref, min_speed, max_speed)
+}
+
+pub(crate) fn forward_formation_spacing<const NK: usize>(params: &Params<f64, NK>) -> f64 {
+    let configured = params.controller.tuning.formation_spacing_m;
+    if configured > 0.0 {
+        configured
+    } else {
+        2.0 * params.controller.disk_radius / ((NK.saturating_sub(1)).max(1) as f64)
+    }
+}
+
+fn forward_frame_heading<const NK: usize>(
+    diag: &Diagnostics<f64, NK>,
+    mode: ForwardFrameMode,
+    fallback_heading_deg: f64,
+) -> f64 {
+    let fallback = fallback_heading_deg.to_radians();
+    match mode {
+        ForwardFrameMode::WorldFixed => fallback,
+        ForwardFrameMode::MeanVelocity => {
+            let mean_velocity = diag
+                .kites
+                .iter()
+                .fold(Vector3::<f64>::zeros(), |acc, kite| {
+                    acc + kite.cad_velocity_n
+                })
+                / NK.max(1) as f64;
+            let horizontal_speed = mean_velocity[0].hypot(mean_velocity[1]);
+            if horizontal_speed > 1.0e-3 {
+                mean_velocity[1].atan2(mean_velocity[0])
+            } else {
+                fallback
+            }
+        }
+    }
+}
+
+pub(crate) fn horizontal_axes_from_heading(heading_rad: f64) -> (Vector3<f64>, Vector3<f64>) {
+    let f_n = Vector3::new(heading_rad.cos(), heading_rad.sin(), 0.0);
+    let l_n = Vector3::new(-heading_rad.sin(), heading_rad.cos(), 0.0);
+    (f_n, l_n)
+}
+
+pub(crate) fn lane_slot(index: usize, nk: usize, spacing: f64) -> f64 {
+    (index as f64 - (nk as f64 - 1.0) * 0.5) * spacing
+}
+
+fn formation_error_from_neighbor_y(
+    index: usize,
+    nk: usize,
+    prev_y_f: Option<f64>,
+    next_y_f: Option<f64>,
+    spacing: f64,
+) -> f64 {
+    let mut error = 0.0;
+    if index > 0 {
+        error += prev_y_f.unwrap_or(0.0) + spacing;
+    }
+    if index + 1 < nk {
+        error += next_y_f.unwrap_or(0.0) - spacing;
+    }
+    error
+}
+
+fn formation_frame_lateral_component(
+    from_n: &Vector3<f64>,
+    to_n: &Vector3<f64>,
+    forward_l_n: &Vector3<f64>,
+) -> f64 {
+    let vector_n = Vector3::new(to_n[0] - from_n[0], to_n[1] - from_n[1], 0.0);
+    vector_n.dot(forward_l_n)
+}
+
+fn update_forward_lateral_offset(
+    control_state: &mut KiteControllerState,
+    lateral_error: f64,
+    dt_control: f64,
+    tuning: &crate::types::ControllerTuning<f64>,
+) -> f64 {
+    let offset_limit = tuning.formation_lateral_offset_limit_m.abs();
+    if offset_limit <= 1.0e-9 {
+        control_state.forward_lateral_offset_m = 0.0;
+        return 0.0;
+    }
+
+    let error_limit = tuning.formation_lateral_error_limit_m.abs();
+    let limited_error = if error_limit > 1.0e-9 {
+        clamp(lateral_error, -error_limit, error_limit)
+    } else {
+        lateral_error
+    };
+    control_state.forward_lateral_offset_m = clamp(
+        control_state.forward_lateral_offset_m
+            - tuning.formation_lateral_offset_i_per_s * limited_error * dt_control.max(0.0),
+        -offset_limit,
+        offset_limit,
+    );
+    control_state.forward_lateral_offset_m
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ForwardScheduleTerms {
+    lane_y: f64,
+    cross_track_error: f64,
+    prev_y_f: f64,
+    next_y_f: f64,
+    formation_error: f64,
+    formation_spacing: f64,
+    lateral_offset: f64,
+    lane_point_n: Vector3<f64>,
+    formation_error_tip_n: Vector3<f64>,
+}
+
+impl ForwardScheduleTerms {
+    fn zero(spacing: f64) -> Self {
+        Self {
+            lane_y: 0.0,
+            cross_track_error: 0.0,
+            prev_y_f: 0.0,
+            next_y_f: 0.0,
+            formation_error: 0.0,
+            formation_spacing: spacing,
+            lateral_offset: 0.0,
+            lane_point_n: Vector3::zeros(),
+            formation_error_tip_n: Vector3::zeros(),
+        }
+    }
+}
+
+fn orbit_schedule_target<const NK: usize>(
+    index: usize,
+    diag: &Diagnostics<f64, NK>,
+    params: &Params<f64, NK>,
+    rabbit_distance: f64,
+    phase_error: f64,
+) -> (f64, f64, Vector3<f64>) {
+    let rabbit_phase =
+        diag.kites[index].phase_angle + rabbit_distance / params.controller.disk_radius.max(1.0e-6);
+    let rabbit_radius = params.controller.disk_radius
+        * (1.0 + phase_error / std::f64::consts::PI * params.controller.phase_lag_to_radius);
+    let target_n = Vector3::new(
+        params.controller.disk_center_n[0] + rabbit_radius * rabbit_phase.cos(),
+        params.controller.disk_center_n[1] + rabbit_radius * rabbit_phase.sin(),
+        params.controller.disk_center_n[2],
+    );
+    (rabbit_phase, rabbit_radius, target_n)
+}
+
+fn forward_schedule_target<const NK: usize>(
+    index: usize,
+    control_state: &mut KiteControllerState,
+    diag: &Diagnostics<f64, NK>,
+    params: &Params<f64, NK>,
+    rabbit_distance: f64,
+    spacing: f64,
+    forward_f_n: &Vector3<f64>,
+    forward_l_n: &Vector3<f64>,
+    dt_control: f64,
+) -> (f64, f64, Vector3<f64>, ForwardScheduleTerms) {
+    let p_i = diag.kites[index].cad_position_n;
+    let origin = params.controller.disk_center_n;
+    let offset = p_i - origin;
+    let x_i = offset.dot(forward_f_n);
+    let y_i = offset.dot(forward_l_n);
+    let lane_y = lane_slot(index, NK, spacing);
+
+    let lateral_offset = update_forward_lateral_offset(
+        control_state,
+        y_i - lane_y,
+        dt_control,
+        &params.controller.tuning,
+    );
+
+    let lane_point_xy = origin + *forward_f_n * x_i + *forward_l_n * lane_y;
+    let offset_lane_point_xy = lane_point_xy + *forward_l_n * lateral_offset;
+    let lane_point_n = Vector3::new(lane_point_xy[0], lane_point_xy[1], origin[2]);
+    let target_xy = offset_lane_point_xy + *forward_f_n * rabbit_distance;
+    let target_n = Vector3::new(target_xy[0], target_xy[1], origin[2]);
+
+    let prev_y_f = if index > 0 {
+        formation_frame_lateral_component(&p_i, &diag.kites[index - 1].cad_position_n, forward_l_n)
+    } else {
+        0.0
+    };
+    let next_y_f = if index + 1 < NK {
+        formation_frame_lateral_component(&p_i, &diag.kites[index + 1].cad_position_n, forward_l_n)
+    } else {
+        0.0
+    };
+    let neighbor_formation_error = formation_error_from_neighbor_y(
+        index,
+        NK,
+        (index > 0).then_some(prev_y_f),
+        (index + 1 < NK).then_some(next_y_f),
+        spacing,
+    );
+    let formation_error_tip_n =
+        Vector3::new(offset_lane_point_xy[0], offset_lane_point_xy[1], origin[2]);
+
+    let phase_origin = target_n - origin;
+    let terms = ForwardScheduleTerms {
+        lane_y,
+        cross_track_error: y_i - lane_y,
+        prev_y_f,
+        next_y_f,
+        formation_error: neighbor_formation_error,
+        formation_spacing: spacing,
+        lateral_offset,
+        lane_point_n,
+        formation_error_tip_n,
+    };
+    (
+        phase_origin[1].atan2(phase_origin[0]),
+        phase_origin[0].hypot(phase_origin[1]).max(1.0e-6),
+        target_n,
+        terms,
+    )
+}
+
 #[derive(Clone, Debug)]
 struct KiteSchedule {
+    lateral_outer_mode: LateralOuterMode,
+    lateral_outer_mode_value: f64,
     phase_error: f64,
     speed_target: f64,
     rabbit_distance: f64,
     rabbit_phase: f64,
     rabbit_radius: f64,
     rabbit_target_n: Vector3<f64>,
+    forward_frame_heading: f64,
+    forward: ForwardScheduleTerms,
 }
 
 struct KiteControlRequest<'a, const NK: usize, const N_COMMON: usize, const N_UPPER: usize> {
@@ -189,76 +446,81 @@ where
             &kite_diag.cad_position_n,
         );
         let rabbit_bearing_y = direct_rabbit_bearing_y(&rabbit_vector_b);
-        let uses_direct_rabbit =
-            guidance_uses_direct_rabbit(&rabbit_vector_b, request.schedule.rabbit_distance, tuning);
-        let (roll_breakdown, omega_world_z_ref, k_tg_y, k_tg_z) = if uses_direct_rabbit {
-            (
-                direct_rabbit_roll_reference_breakdown(
+        let (roll_breakdown, omega_world_z_ref, k_tg_y, k_tg_z) =
+            if request.schedule.lateral_outer_mode == LateralOuterMode::ForwardFormation
+                || guidance_uses_direct_rabbit(
                     &rabbit_vector_b,
-                    control_state,
-                    request.dt_control,
+                    request.schedule.rabbit_distance,
                     tuning,
-                ),
-                0.0,
-                0.0,
-                0.0,
-            )
-        } else {
-            let (k_tg_y, k_tg_z) = lateral_guidance_curvatures(
-                &rabbit_vector_b,
-                request.schedule.rabbit_radius,
-                request.schedule.rabbit_distance,
-                tuning,
-            );
-            let curvature_y_est = omega_n[2] / inertial_speed.max(1.0);
-            let gain_int_y = request.params.controller.gain_int_y.abs().max(1.0e-9);
-            let gain_int_z = request.params.controller.gain_int_z.abs().max(1.0e-9);
-            control_state.curvature_y_integrator = clamp(
-                control_state.curvature_y_integrator
-                    + (kite_diag.curvature_y_b - k_tg_y) * request.dt_control
-                    - alpha_exceeded * 0.5,
-                -TETHERED_CURVATURE_Y_INTEGRATOR_OUTPUT_LIMIT / gain_int_y,
-                TETHERED_CURVATURE_Y_INTEGRATOR_OUTPUT_LIMIT / gain_int_y,
-            );
-            control_state.curvature_z_integrator = clamp(
-                control_state.curvature_z_integrator
-                    + (kite_diag.curvature_z_b - k_tg_z) * request.dt_control
-                    - alpha_exceeded * 0.5,
-                -TETHERED_CURVATURE_Z_INTEGRATOR_OUTPUT_LIMIT / gain_int_z,
-                TETHERED_CURVATURE_Z_INTEGRATOR_OUTPUT_LIMIT / gain_int_z,
-            );
-            let roll_feedforward = orbit_roll_feedforward(
-                inertial_speed,
-                request.schedule.rabbit_radius,
-                request.params.environment.g,
-                tuning,
-            );
-            let curvature_roll_error = k_tg_y - curvature_y_est;
-            let roll_proportional = tuning.roll_curvature_p * curvature_roll_error;
-            let (roll_integrator, roll_ref) = roll_integrator_with_reference_antiwindup(
-                &mut control_state.curvature_to_roll_integrator,
-                curvature_roll_error,
-                request.dt_control,
-                tuning.roll_curvature_i,
-                roll_integrator_output_limit(
+                )
+            {
+                (
+                    direct_rabbit_roll_reference_breakdown(
+                        &rabbit_vector_b,
+                        control_state,
+                        request.dt_control,
+                        tuning,
+                    ),
+                    0.0,
+                    0.0,
+                    0.0,
+                )
+            } else {
+                let (k_tg_y, k_tg_z) = lateral_guidance_curvatures(
+                    &rabbit_vector_b,
+                    request.schedule.rabbit_radius,
+                    request.schedule.rabbit_distance,
+                    tuning,
+                );
+                let curvature_y_est = omega_n[2] / inertial_speed.max(1.0);
+                let gain_int_y = request.params.controller.gain_int_y.abs().max(1.0e-9);
+                let gain_int_z = request.params.controller.gain_int_z.abs().max(1.0e-9);
+                control_state.curvature_y_integrator = clamp(
+                    control_state.curvature_y_integrator
+                        + (kite_diag.curvature_y_b - k_tg_y) * request.dt_control
+                        - alpha_exceeded * 0.5,
+                    -TETHERED_CURVATURE_Y_INTEGRATOR_OUTPUT_LIMIT / gain_int_y,
+                    TETHERED_CURVATURE_Y_INTEGRATOR_OUTPUT_LIMIT / gain_int_y,
+                );
+                control_state.curvature_z_integrator = clamp(
+                    control_state.curvature_z_integrator
+                        + (kite_diag.curvature_z_b - k_tg_z) * request.dt_control
+                        - alpha_exceeded * 0.5,
+                    -TETHERED_CURVATURE_Z_INTEGRATOR_OUTPUT_LIMIT / gain_int_z,
+                    TETHERED_CURVATURE_Z_INTEGRATOR_OUTPUT_LIMIT / gain_int_z,
+                );
+                let roll_feedforward = orbit_roll_feedforward(
+                    inertial_speed,
+                    request.schedule.rabbit_radius,
+                    request.params.environment.g,
+                    tuning,
+                );
+                let curvature_roll_error = k_tg_y - curvature_y_est;
+                let roll_proportional = tuning.roll_curvature_p * curvature_roll_error;
+                let (roll_integrator, roll_ref) = roll_integrator_with_reference_antiwindup(
+                    &mut control_state.curvature_to_roll_integrator,
+                    curvature_roll_error,
+                    request.dt_control,
                     tuning.roll_curvature_i,
-                    tuning.roll_curvature_integrator_limit,
-                ),
-                roll_feedforward + roll_proportional,
-                tuning.roll_ref_limit_deg.to_radians(),
-            );
-            (
-                RollReferenceBreakdown {
-                    total: roll_ref,
-                    feedforward: roll_feedforward,
-                    proportional: roll_proportional,
-                    integrator: roll_integrator,
-                },
-                inertial_speed * k_tg_y,
-                k_tg_y,
-                k_tg_z,
-            )
-        };
+                    roll_integrator_output_limit(
+                        tuning.roll_curvature_i,
+                        tuning.roll_curvature_integrator_limit,
+                    ),
+                    roll_feedforward + roll_proportional,
+                    tuning.roll_ref_limit_deg.to_radians(),
+                );
+                (
+                    RollReferenceBreakdown {
+                        total: roll_ref,
+                        feedforward: roll_feedforward,
+                        proportional: roll_proportional,
+                        integrator: roll_integrator,
+                    },
+                    inertial_speed * k_tg_y,
+                    k_tg_y,
+                    k_tg_z,
+                )
+            };
         (
             altitude_ref_raw,
             roll_breakdown,
@@ -439,6 +701,17 @@ where
             rabbit_bearing_y,
             rabbit_vector_b,
             rabbit_target_n: request.schedule.rabbit_target_n,
+            lateral_outer_mode: request.schedule.lateral_outer_mode_value,
+            forward_frame_heading: request.schedule.forward_frame_heading,
+            forward_lane_y: request.schedule.forward.lane_y,
+            forward_cross_track_error: request.schedule.forward.cross_track_error,
+            forward_neighbor_prev_y_f: request.schedule.forward.prev_y_f,
+            forward_neighbor_next_y_f: request.schedule.forward.next_y_f,
+            forward_formation_error: request.schedule.forward.formation_error,
+            forward_formation_spacing: request.schedule.forward.formation_spacing,
+            forward_lateral_offset: request.schedule.forward.lateral_offset,
+            forward_lane_point_n: request.schedule.forward.lane_point_n,
+            forward_formation_error_tip_n: request.schedule.forward.formation_error_tip_n,
             curvature_y_ref: k_tg_y,
             curvature_y_estimate: omega_n[2] / inertial_speed.max(1.0),
             omega_world_z_ref,
@@ -477,6 +750,10 @@ pub fn controller_step<const NK: usize, const N_COMMON: usize, const N_UPPER: us
     params: &Params<f64, NK>,
     dt_control: f64,
     phase_mode: PhaseMode,
+    lateral_outer_mode: LateralOuterMode,
+    forward_frame_mode: ForwardFrameMode,
+    transition_to_forward_s: f64,
+    transition_to_orbit_s: Option<f64>,
     longitudinal_mode: LongitudinalMode,
     time: f64,
 ) -> (Controls<f64, NK>, ControllerTrace<NK>) {
@@ -487,6 +764,10 @@ pub fn controller_step<const NK: usize, const N_COMMON: usize, const N_UPPER: us
         params,
         dt_control,
         phase_mode,
+        lateral_outer_mode,
+        forward_frame_mode,
+        transition_to_forward_s,
+        transition_to_orbit_s,
         longitudinal_mode,
         time,
         default_free_flight_reference,
@@ -506,6 +787,10 @@ pub(crate) fn controller_step_with_free_flight_reference<
     params: &Params<f64, NK>,
     dt_control: f64,
     phase_mode: PhaseMode,
+    lateral_outer_mode: LateralOuterMode,
+    forward_frame_mode: ForwardFrameMode,
+    transition_to_forward_s: f64,
+    transition_to_orbit_s: Option<f64>,
     longitudinal_mode: LongitudinalMode,
     time: f64,
     free_flight_reference: F,
@@ -520,6 +805,10 @@ where
         params,
         dt_control,
         phase_mode,
+        lateral_outer_mode,
+        forward_frame_mode,
+        transition_to_forward_s,
+        transition_to_orbit_s,
         longitudinal_mode,
         time,
         free_flight_reference,
@@ -533,6 +822,10 @@ fn controller_step_impl<const NK: usize, const N_COMMON: usize, const N_UPPER: u
     params: &Params<f64, NK>,
     dt_control: f64,
     phase_mode: PhaseMode,
+    lateral_outer_mode: LateralOuterMode,
+    forward_frame_mode: ForwardFrameMode,
+    transition_to_forward_s: f64,
+    transition_to_orbit_s: Option<f64>,
     longitudinal_mode: LongitudinalMode,
     time: f64,
     free_flight_reference: F,
@@ -547,6 +840,23 @@ where
         PhaseMode::OpenLoop => open_loop_phase_errors,
     };
     let is_free_flight = N_COMMON == 0 && N_UPPER == 0;
+    let active_lateral_mode = if is_free_flight {
+        LateralOuterMode::Orbit
+    } else {
+        active_lateral_outer_mode(
+            lateral_outer_mode,
+            time,
+            transition_to_forward_s,
+            transition_to_orbit_s,
+        )
+    };
+    let forward_spacing = forward_formation_spacing(params);
+    let forward_heading = forward_frame_heading(
+        diag,
+        forward_frame_mode,
+        params.controller.tuning.forward_heading_deg,
+    );
+    let (forward_f_n, forward_l_n) = horizontal_axes_from_heading(forward_heading);
 
     let speed_targets: [f64; NK] = std::array::from_fn(|index| {
         if is_free_flight {
@@ -557,6 +867,8 @@ where
                 params.controller.speed_ref,
             )
             .speed_target
+        } else if active_lateral_mode == LateralOuterMode::ForwardFormation {
+            clamped_base_speed_target(params)
         } else {
             speed_integrator_target(
                 phase_errors[index],
@@ -576,23 +888,50 @@ where
     // Swarm coordination is the only multi-aircraft step in this module.
     // Everything below receives one scheduled kite at a time.
     let schedules: [KiteSchedule; NK] = std::array::from_fn(|index| {
-        let rabbit_phase = diag.kites[index].phase_angle
-            + rabbit_distances[index] / params.controller.disk_radius.max(1.0e-6);
-        let rabbit_radius = params.controller.disk_radius
-            * (1.0
-                + phase_errors[index] / std::f64::consts::PI
-                    * params.controller.phase_lag_to_radius);
+        let phase_error = if active_lateral_mode == LateralOuterMode::ForwardFormation {
+            0.0
+        } else {
+            phase_errors[index]
+        };
+        let (rabbit_phase, rabbit_radius, rabbit_target_n, forward) =
+            if active_lateral_mode == LateralOuterMode::ForwardFormation {
+                forward_schedule_target(
+                    index,
+                    &mut state.kites[index],
+                    diag,
+                    params,
+                    rabbit_distances[index],
+                    forward_spacing,
+                    &forward_f_n,
+                    &forward_l_n,
+                    dt_control,
+                )
+            } else {
+                let (rabbit_phase, rabbit_radius, rabbit_target_n) = orbit_schedule_target(
+                    index,
+                    diag,
+                    params,
+                    rabbit_distances[index],
+                    phase_errors[index],
+                );
+                (
+                    rabbit_phase,
+                    rabbit_radius,
+                    rabbit_target_n,
+                    ForwardScheduleTerms::zero(forward_spacing),
+                )
+            };
         KiteSchedule {
-            phase_error: phase_errors[index],
+            lateral_outer_mode: active_lateral_mode,
+            lateral_outer_mode_value: lateral_outer_mode_value(active_lateral_mode),
+            phase_error,
             speed_target: speed_targets[index],
             rabbit_distance: rabbit_distances[index],
             rabbit_phase,
             rabbit_radius,
-            rabbit_target_n: Vector3::new(
-                params.controller.disk_center_n[0] + rabbit_radius * rabbit_phase.cos(),
-                params.controller.disk_center_n[1] + rabbit_radius * rabbit_phase.sin(),
-                params.controller.disk_center_n[2],
-            ),
+            rabbit_target_n,
+            forward_frame_heading: forward_heading,
+            forward,
         }
     });
 
@@ -658,6 +997,18 @@ pub fn apply_trace<const NK: usize>(
         diagnostics.kites[index].rabbit_bearing_y = kite_trace.rabbit_bearing_y;
         diagnostics.kites[index].rabbit_vector_b = kite_trace.rabbit_vector_b;
         diagnostics.kites[index].rabbit_target_n = kite_trace.rabbit_target_n;
+        diagnostics.kites[index].lateral_outer_mode = kite_trace.lateral_outer_mode;
+        diagnostics.kites[index].forward_frame_heading = kite_trace.forward_frame_heading;
+        diagnostics.kites[index].forward_lane_y = kite_trace.forward_lane_y;
+        diagnostics.kites[index].forward_cross_track_error = kite_trace.forward_cross_track_error;
+        diagnostics.kites[index].forward_neighbor_prev_y_f = kite_trace.forward_neighbor_prev_y_f;
+        diagnostics.kites[index].forward_neighbor_next_y_f = kite_trace.forward_neighbor_next_y_f;
+        diagnostics.kites[index].forward_formation_error = kite_trace.forward_formation_error;
+        diagnostics.kites[index].forward_formation_spacing = kite_trace.forward_formation_spacing;
+        diagnostics.kites[index].forward_lateral_offset = kite_trace.forward_lateral_offset;
+        diagnostics.kites[index].forward_lane_point_n = kite_trace.forward_lane_point_n;
+        diagnostics.kites[index].forward_formation_error_tip_n =
+            kite_trace.forward_formation_error_tip_n;
         diagnostics.kites[index].curvature_y_ref = kite_trace.curvature_y_ref;
         diagnostics.kites[index].curvature_y_est = kite_trace.curvature_y_estimate;
         diagnostics.kites[index].omega_world_z_ref = kite_trace.omega_world_z_ref;
@@ -694,6 +1045,7 @@ mod tests {
         GUIDANCE_MODE_CURVATURE, GUIDANCE_MODE_RABBIT, GUIDANCE_MODE_SWITCH,
         direct_rabbit_bearing_y,
     };
+    use super::state::KiteControllerState;
     use super::*;
     use crate::types::ControllerTuning;
 
@@ -828,6 +1180,93 @@ mod tests {
         let phase_error = 0.1;
         assert!(speed_integrator_target(phase_error, speed_ref, &tuning) > speed_ref);
         assert!(speed_integrator_target(-phase_error, speed_ref, &tuning) < speed_ref);
+    }
+
+    #[test]
+    fn timed_lateral_outer_mode_selects_orbit_forward_orbit() {
+        assert_eq!(
+            active_lateral_outer_mode(LateralOuterMode::Orbit, 100.0, 5.0, Some(20.0)),
+            LateralOuterMode::Orbit
+        );
+        assert_eq!(
+            active_lateral_outer_mode(LateralOuterMode::ForwardFormation, 0.0, 5.0, Some(20.0),),
+            LateralOuterMode::ForwardFormation
+        );
+        assert_eq!(
+            active_lateral_outer_mode(LateralOuterMode::TimedTransition, 4.9, 5.0, Some(20.0)),
+            LateralOuterMode::Orbit
+        );
+        assert_eq!(
+            active_lateral_outer_mode(LateralOuterMode::TimedTransition, 5.0, 5.0, Some(20.0)),
+            LateralOuterMode::ForwardFormation
+        );
+        assert_eq!(
+            active_lateral_outer_mode(LateralOuterMode::TimedTransition, 20.0, 5.0, Some(20.0)),
+            LateralOuterMode::Orbit
+        );
+    }
+
+    #[test]
+    fn forward_formation_error_omits_missing_neighbors() {
+        let spacing = 12.0;
+        assert_eq!(
+            formation_error_from_neighbor_y(0, 1, None, None, spacing),
+            0.0
+        );
+        assert_eq!(
+            formation_error_from_neighbor_y(1, 3, Some(-spacing), Some(spacing), spacing),
+            0.0
+        );
+        assert_eq!(
+            formation_error_from_neighbor_y(0, 3, None, Some(spacing), spacing),
+            0.0
+        );
+        assert_eq!(
+            formation_error_from_neighbor_y(2, 3, Some(-spacing), None, spacing),
+            0.0
+        );
+    }
+
+    #[test]
+    fn forward_lateral_offset_integrator_targets_opposite_lane_error() {
+        let mut state = KiteControllerState {
+            thrust_energy_integrator: 0.0,
+            pitch_energy_integrator: 0.0,
+            curvature_to_roll_integrator: 0.0,
+            rabbit_bearing_to_roll_integrator: 0.0,
+            forward_lateral_offset_m: 0.0,
+            roll_ref_command: 0.0,
+            roll_ref_initialized: false,
+            curvature_y_integrator: 0.0,
+            curvature_z_integrator: 0.0,
+        };
+        let tuning = ControllerTuning {
+            formation_lateral_offset_i_per_s: 0.5,
+            formation_lateral_offset_limit_m: 2.0,
+            formation_lateral_error_limit_m: 10.0,
+            ..ControllerTuning::default()
+        };
+
+        let offset = update_forward_lateral_offset(&mut state, 4.0, 1.0, &tuning);
+        assert_eq!(offset, -2.0);
+
+        let offset = update_forward_lateral_offset(&mut state, -4.0, 1.0, &tuning);
+        assert_eq!(offset, 0.0);
+    }
+
+    #[test]
+    fn orbit_mode_keeps_phase_speed_scheduling_active() {
+        let tuning = ControllerTuning::default();
+        let speed_ref = 32.0;
+        let phase_error = 0.1;
+        assert_eq!(
+            active_lateral_outer_mode(LateralOuterMode::Orbit, 10.0, 5.0, Some(20.0)),
+            LateralOuterMode::Orbit
+        );
+        assert_ne!(
+            speed_integrator_target(phase_error, speed_ref, &tuning),
+            speed_ref
+        );
     }
 
     #[test]

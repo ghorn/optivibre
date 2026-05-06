@@ -93,6 +93,7 @@ fn main() -> Result<()> {
         performance_scale_percent: cli.performance_scale_percent,
         wind_speed_mps: cli.wind_speed_mps,
         swarm_kites: cli.swarm_kites.clamp(MIN_SWARM_KITES, MAX_SWARM_KITES),
+        swarm_forward_flight_init: false,
         swarm_disk_altitude_m: cli.swarm_disk_altitude_m,
         swarm_disk_radius_m: cli.swarm_disk_radius_m,
         swarm_aircraft_altitude_m: cli.swarm_aircraft_altitude_m,

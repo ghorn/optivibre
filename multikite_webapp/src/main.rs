@@ -11,13 +11,14 @@ use axum::{Json, Router};
 use clap::Parser;
 use multikite_sim::{
     COMMON_NODES, ControllerTuning, DEFAULT_SWARM_KITES, DrydenConfig, FREE_COMMON_NODES,
-    FREE_UPPER_NODES, InitRequest, LongitudinalMode, MAX_SWARM_KITES, MIN_SWARM_KITES, PhaseMode,
-    Preset, RunSummary, SimulationConfig, SimulationFrame, SimulationProgress, UPPER_NODES,
-    available_presets, build_aero_analysis, control_roll_pitch_deg_from_quat_n2b,
-    euler_rpy_deg_from_quat_n2b, simulate_free_flight1_with_callbacks,
-    simulate_free_flight1_with_progress, simulate_simple_tether_with_callbacks,
-    simulate_simple_tether_with_progress, simulate_swarm_with_callbacks,
-    simulate_swarm_with_progress, vehicle_performance_scaling_preview,
+    FREE_UPPER_NODES, ForwardFrameMode, InitRequest, LateralOuterMode, LongitudinalMode,
+    MAX_SWARM_KITES, MIN_SWARM_KITES, PhaseMode, Preset, RunSummary, SimulationConfig,
+    SimulationFrame, SimulationProgress, UPPER_NODES, available_presets, build_aero_analysis,
+    control_roll_pitch_deg_from_quat_n2b, euler_rpy_deg_from_quat_n2b,
+    simulate_free_flight1_with_callbacks, simulate_free_flight1_with_progress,
+    simulate_simple_tether_with_callbacks, simulate_simple_tether_with_progress,
+    simulate_swarm_with_callbacks, simulate_swarm_with_progress,
+    vehicle_performance_scaling_preview,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -50,14 +51,22 @@ struct Cli {
 struct RunRequest {
     preset: Preset,
     swarm_kites: Option<usize>,
+    #[serde(default)]
+    swarm_forward_flight_init: bool,
     swarm_disk_altitude_m: Option<f64>,
-    swarm_disk_radius_m: Option<f64>,
+    swarm_disk_diameter_m: Option<f64>,
     swarm_aircraft_altitude_m: Option<f64>,
     swarm_upper_tether_length_m: Option<f64>,
     swarm_common_tether_length_m: Option<f64>,
     duration: f64,
     dt_control: Option<f64>,
     phase_mode: PhaseMode,
+    #[serde(default)]
+    lateral_outer_mode: LateralOuterMode,
+    #[serde(default)]
+    forward_frame_mode: ForwardFrameMode,
+    transition_to_forward_s: Option<f64>,
+    transition_to_orbit_s: Option<f64>,
     #[serde(default)]
     longitudinal_mode: LongitudinalMode,
     payload_mass_kg: Option<f64>,
@@ -151,6 +160,17 @@ struct ApiFrame {
     rabbit_target_distance: Vec<f64>,
     rabbit_bearing_y_deg: Vec<f64>,
     rabbit_vector_b: Vec<[f64; 3]>,
+    lateral_outer_mode: Vec<f64>,
+    forward_frame_heading_deg: Vec<f64>,
+    forward_lane_y: Vec<f64>,
+    forward_cross_track_error: Vec<f64>,
+    forward_neighbor_prev_y_f: Vec<f64>,
+    forward_neighbor_next_y_f: Vec<f64>,
+    forward_formation_error: Vec<f64>,
+    forward_formation_spacing: Vec<f64>,
+    forward_lateral_offset: Vec<f64>,
+    forward_lane_point_n: Vec<[f64; 3]>,
+    forward_formation_error_tip_n: Vec<[f64; 3]>,
     curvature_y_b: Vec<f64>,
     curvature_y_ref: Vec<f64>,
     curvature_y_est: Vec<f64>,
@@ -368,8 +388,10 @@ fn config_from_request(request: &RunRequest) -> (InitRequest, SimulationConfig) 
                 .swarm_kites
                 .unwrap_or(DEFAULT_SWARM_KITES)
                 .clamp(MIN_SWARM_KITES, MAX_SWARM_KITES),
+            swarm_forward_flight_init: request.swarm_forward_flight_init,
             swarm_disk_altitude_m: finite_optional_f64(request.swarm_disk_altitude_m),
-            swarm_disk_radius_m: finite_optional_f64(request.swarm_disk_radius_m),
+            swarm_disk_radius_m: finite_optional_f64(request.swarm_disk_diameter_m)
+                .map(|diameter| 0.5 * diameter),
             swarm_aircraft_altitude_m: finite_optional_f64(request.swarm_aircraft_altitude_m),
             swarm_upper_tether_length_m: finite_optional_f64(request.swarm_upper_tether_length_m),
             swarm_common_tether_length_m: finite_optional_f64(request.swarm_common_tether_length_m),
@@ -378,6 +400,13 @@ fn config_from_request(request: &RunRequest) -> (InitRequest, SimulationConfig) 
             duration: request.duration,
             dt_control: positive_f64_or_default(request.dt_control, defaults.dt_control),
             phase_mode: request.phase_mode,
+            lateral_outer_mode: request.lateral_outer_mode,
+            forward_frame_mode: request.forward_frame_mode,
+            transition_to_forward_s: positive_f64_or_default(
+                request.transition_to_forward_s,
+                defaults.transition_to_forward_s,
+            ),
+            transition_to_orbit_s: finite_optional_f64(request.transition_to_orbit_s),
             longitudinal_mode: request.longitudinal_mode,
             sample_stride: request.sample_stride.unwrap_or(1).max(1),
             rk_abs_tol: positive_f64_or_default(request.rk_abs_tol, defaults.rk_abs_tol),
@@ -742,6 +771,72 @@ fn to_api_frame<const NK: usize, const N_COMMON: usize, const N_UPPER: usize>(
             .kites
             .iter()
             .map(|diag| vec3(diag.rabbit_vector_b))
+            .collect(),
+        lateral_outer_mode: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.lateral_outer_mode)
+            .collect(),
+        forward_frame_heading_deg: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.forward_frame_heading.to_degrees())
+            .collect(),
+        forward_lane_y: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.forward_lane_y)
+            .collect(),
+        forward_cross_track_error: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.forward_cross_track_error)
+            .collect(),
+        forward_neighbor_prev_y_f: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.forward_neighbor_prev_y_f)
+            .collect(),
+        forward_neighbor_next_y_f: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.forward_neighbor_next_y_f)
+            .collect(),
+        forward_formation_error: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.forward_formation_error)
+            .collect(),
+        forward_formation_spacing: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.forward_formation_spacing)
+            .collect(),
+        forward_lateral_offset: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| diag.forward_lateral_offset)
+            .collect(),
+        forward_lane_point_n: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| vec3(diag.forward_lane_point_n))
+            .collect(),
+        forward_formation_error_tip_n: frame
+            .diagnostics
+            .kites
+            .iter()
+            .map(|diag| vec3(diag.forward_formation_error_tip_n))
             .collect(),
         curvature_y_b: frame
             .diagnostics
@@ -1397,11 +1492,16 @@ async fn run_stream(
             &sender,
             StreamEvent::Log {
                 message: format!(
-                    "starting preset={:?} kites={} disk_altitude={} disk_radius={} aircraft_altitude={} upper_tether={} common_tether={} duration={:.1}s dt_control={:.4}s phase_mode={:?}",
+                    "starting preset={:?} kites={} init_layout={} disk_altitude={} disk_diameter={} aircraft_altitude={} upper_tether={} common_tether={} duration={:.1}s dt_control={:.4}s phase_mode={:?} lateral_mode={:?} forward_frame={:?}",
                     request.preset,
                     request.swarm_kites.unwrap_or(DEFAULT_SWARM_KITES),
+                    if request.swarm_forward_flight_init {
+                        "forward"
+                    } else {
+                        "orbit"
+                    },
                     optional_f64_label(request.swarm_disk_altitude_m),
-                    optional_f64_label(request.swarm_disk_radius_m),
+                    optional_f64_label(request.swarm_disk_diameter_m),
                     optional_f64_label(request.swarm_aircraft_altitude_m),
                     optional_f64_label(request.swarm_upper_tether_length_m),
                     optional_f64_label(request.swarm_common_tether_length_m),
@@ -1409,7 +1509,9 @@ async fn run_stream(
                     request
                         .dt_control
                         .unwrap_or_else(|| SimulationConfig::default().dt_control),
-                    request.phase_mode
+                    request.phase_mode,
+                    request.lateral_outer_mode,
+                    request.forward_frame_mode
                 ),
             },
         )

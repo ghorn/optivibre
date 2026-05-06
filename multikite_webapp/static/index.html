@@ -75,14 +75,9 @@
               <span class="form-hint">Control ring center height above ground.</span>
             </label>
             <label>
-              Disk radius (m)
-              <input id="swarm-disk-radius" type="number" min="1" step="any" value="70" />
-              <span class="form-hint">Control ring radius and initial upper-tether horizontal offset.</span>
-            </label>
-            <label>
-              Lower tether length (m)
-              <input id="swarm-common-tether-length" type="number" min="0.001" step="any" value="150" />
-              <span class="form-hint">Payload to Y/splitter natural length.</span>
+              Disk diameter (m)
+              <input id="swarm-disk-diameter" type="number" min="2" step="any" value="140" />
+              <span class="form-hint">Control ring diameter. The sim uses half of this as the upper-tether horizontal offset.</span>
             </label>
             <label>
               Upper tether length (m)
@@ -90,10 +85,24 @@
               <span class="form-hint">Y/splitter to each aircraft natural length.</span>
             </label>
             <label>
+              Lower tether length (m)
+              <input id="swarm-common-tether-length" type="number" min="0.001" step="any" value="150" />
+              <span class="form-hint">Payload to Y/splitter natural length.</span>
+            </label>
+            <label>
               Starting aircraft altitude (m)
               <input id="swarm-aircraft-altitude" type="number" min="0" step="any" value="350" />
               <span class="form-hint">Initial aircraft CAD altitude. Payload height is derived from disk altitude and tether lengths.</span>
             </label>
+            <label class="checkbox-label">
+              <input id="swarm-forward-flight-init" type="checkbox" />
+              <span>Start aligned for forward flight</span>
+            </label>
+            <span class="form-hint">
+              Places the aircraft in lateral lanes with forward speed and heading from the forward
+              formation settings. Use with Forward formation mode to skip the orbit-to-forward
+              transient during tuning.
+            </span>
           </div>
           <div class="form-section">
             <div class="form-section-title">Model Options</div>
@@ -236,6 +245,41 @@
                   <option value="open_loop">Open Loop</option>
                 </select>
               </label>
+              <label>
+                Lateral Outer Mode
+                <select id="lateral-outer-mode">
+                  <option value="orbit" selected>Orbit / rabbit</option>
+                  <option value="forward_formation">Forward formation</option>
+                  <option value="timed_transition">Timed orbit → forward → orbit</option>
+                </select>
+              </label>
+              <div id="forward-formation-options" class="tuning-group">
+                <div class="tuning-group-title">Forward Formation Frame</div>
+                <label>
+                  Frame mode
+                  <select id="forward-frame-mode">
+                    <option value="world_fixed" selected>World fixed</option>
+                    <option value="mean_velocity">Swarm mean velocity</option>
+                  </select>
+                </label>
+                <div class="form-hint">
+                  Forward mode uses a 2D lateral frame. World-fixed uses the heading tuning field;
+                  mean-velocity follows the swarm's horizontal mean velocity with the same heading
+                  as fallback.
+                </div>
+              </div>
+              <div id="timed-transition-options" class="tuning-group">
+                <div class="tuning-group-title">Timed Transition</div>
+                <label>
+                  Switch to forward (s)
+                  <input id="transition-to-forward-s" type="number" min="0" step="any" value="5" />
+                </label>
+                <label>
+                  Switch back to orbit (s)
+                  <input id="transition-to-orbit-s" type="number" min="0" step="any" value="20" />
+                </label>
+                <div class="form-hint">Leave switch-back blank to stay in forward formation.</div>
+              </div>
               <div class="tuning-group controller-mode-group">
                 <div class="tuning-group-title">Controller Mode</div>
                 <label class="checkbox-label controller-mode-toggle">
@@ -382,10 +426,10 @@
         </details>
         <div id="control-vis-legend" class="control-vis-legend" aria-label="Control visualization legend">
           <div class="legend-title">Control Vis</div>
-          <div class="legend-row"><span class="legend-swatch lookahead"></span>Lookahead target / path</div>
-          <div class="legend-row"><span class="legend-swatch lookahead-disk"></span>Lookahead before radial offset</div>
-          <div class="legend-row"><span class="legend-swatch projected"></span>Projected phase point</div>
-          <div class="legend-row"><span class="legend-swatch slot"></span>Formation phase slot</div>
+          <div class="legend-row"><span class="legend-swatch lookahead"></span>Orbit lookahead / forward target</div>
+          <div class="legend-row"><span class="legend-swatch lookahead-disk"></span>Orbit disk target / forward lane point</div>
+          <div class="legend-row"><span class="legend-swatch projected"></span>Phase projection / aircraft projection</div>
+          <div class="legend-row"><span class="legend-swatch slot"></span>Phase slot / formation Y-error tip</div>
           <div class="legend-row"><span class="legend-swatch disk"></span>Control ring</div>
         </div>
         <div id="control-label-layer" class="control-label-layer" aria-hidden="true"></div>
