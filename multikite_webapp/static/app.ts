@@ -2168,7 +2168,7 @@ function tetherTensionScaleMode(): TetherTensionScaleMode {
 }
 
 function tetherTensionPayloadMargin(): number {
-  return clampedInputValue(tetherTensionPayloadMarginInput, 3, 0.1, 20);
+  return clampedInputValue(tetherTensionPayloadMarginInput, 1.5, 0.1, 20);
 }
 
 function fallbackTetherTensionRange(): { min: number; max: number } {
@@ -2178,9 +2178,9 @@ function fallbackTetherTensionRange(): { min: number; max: number } {
   };
 }
 
-function payloadTetherTensionRange(): { min: number; max: number } {
+function payloadTetherTensionRange(loadShareDivisor = 1): { min: number; max: number } {
   const payloadMassKg = Math.max(1, numericInputValue(payloadInput, 100));
-  const max = payloadMassKg * GRAVITY_MPS2 * tetherTensionPayloadMargin();
+  const max = payloadMassKg * GRAVITY_MPS2 * tetherTensionPayloadMargin() / Math.max(1, loadShareDivisor);
   return {
     min: 0,
     max: Math.max(1, max)
@@ -2212,20 +2212,20 @@ function fixedTetherTensionRange(): { min: number; max: number } | null {
   return { min, max };
 }
 
-function tetherTensionColorRange(): { min: number; max: number } {
+function tetherTensionColorRange(loadShareDivisor = 1): { min: number; max: number } {
   switch (tetherTensionScaleMode()) {
     case "run_peak":
-      return observedTetherTensionRange() ?? payloadTetherTensionRange();
+      return observedTetherTensionRange() ?? payloadTetherTensionRange(loadShareDivisor);
     case "fixed":
       return fixedTetherTensionRange() ?? fallbackTetherTensionRange();
     case "payload":
     default:
-      return payloadTetherTensionRange();
+      return payloadTetherTensionRange(loadShareDivisor);
   }
 }
 
-function tetherSlackThresholdN(): number {
-  const { max } = tetherTensionColorRange();
+function tetherSlackThresholdN(loadShareDivisor = 1): number {
+  const { max } = tetherTensionColorRange(loadShareDivisor);
   return Math.max(TETHER_SLACK_TENSION_N, max * TETHER_SLACK_RANGE_FRACTION);
 }
 
@@ -6113,11 +6113,11 @@ function recordFrameTetherTensions(frame: ApiFrame): void {
   });
 }
 
-function tensionToColor(tensionN: number): THREE.Color {
-  if (!Number.isFinite(tensionN) || tensionN <= tetherSlackThresholdN()) {
+function tensionToColor(tensionN: number, loadShareDivisor = 1): THREE.Color {
+  if (!Number.isFinite(tensionN) || tensionN <= tetherSlackThresholdN(loadShareDivisor)) {
     return tensionColorSlack.clone();
   }
-  const { min, max } = tetherTensionColorRange();
+  const { min, max } = tetherTensionColorRange(loadShareDivisor);
   const span = Math.max(1.0e-9, max - min);
   const normalized = THREE.MathUtils.clamp((tensionN - min) / span, 0, 1);
   const shaped = Math.pow(normalized, 0.85);
@@ -6336,7 +6336,8 @@ function updateSegmentMesh(
   mesh: THREE.Mesh,
   start: [number, number, number],
   end: [number, number, number],
-  tensionN: number
+  tensionN: number,
+  loadShareDivisor = 1
 ): void {
   const startVec = toThree(start);
   const endVec = toThree(end);
@@ -6350,8 +6351,8 @@ function updateSegmentMesh(
   mesh.position.copy(startVec).add(endVec).multiplyScalar(0.5);
   mesh.quaternion.setFromUnitVectors(tetherAxis, delta.normalize());
   mesh.scale.set(mesh.userData.segmentRadius as number, length, mesh.userData.segmentRadius as number);
-  const isSlack = !Number.isFinite(tensionN) || tensionN <= tetherSlackThresholdN();
-  const color = tensionToColor(tensionN);
+  const isSlack = !Number.isFinite(tensionN) || tensionN <= tetherSlackThresholdN(loadShareDivisor);
+  const color = tensionToColor(tensionN, loadShareDivisor);
   const material = mesh.material as THREE.MeshStandardMaterial;
   material.color.copy(color);
   material.emissive.copy(color);
@@ -6372,7 +6373,8 @@ function renderTether(
   segmentMeshes: THREE.Mesh[],
   nodeMeshes: THREE.Mesh[],
   segmentRadius: number,
-  nodeRadius: number
+  nodeRadius: number,
+  loadShareDivisor = 1
 ): void {
   const safePoints = points ?? [];
   const safeTensions = tensions ?? [];
@@ -6386,7 +6388,8 @@ function renderTether(
       segmentMeshes[index],
       safePoints[index],
       safePoints[index + 1],
-      safeTensions[index] ?? 0
+      safeTensions[index] ?? 0,
+      loadShareDivisor
     );
   }
 
@@ -7240,6 +7243,7 @@ function renderFrame(frame: ApiFrame): void {
     COMMON_NODE_RADIUS
   );
 
+  const upperTetherLoadShareDivisor = Math.max(1, frame.kite_positions_n.length);
   frame.kite_positions_n.forEach((position, index) => {
     const mesh = kiteMeshes[index];
     const upperSegments = upperSegmentMeshes[index];
@@ -7267,7 +7271,8 @@ function renderFrame(frame: ApiFrame): void {
       upperSegments,
       upperNodes,
       UPPER_SEGMENT_RADIUS,
-      UPPER_NODE_RADIUS
+      UPPER_NODE_RADIUS,
+      upperTetherLoadShareDivisor
     );
   });
 }
