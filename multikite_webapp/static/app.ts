@@ -705,7 +705,10 @@ const middlePanEnd = new THREE.Vector2();
 const middlePanVertical = new THREE.Vector3();
 let middleZPanPointerId: number | null = null;
 const SCENE_RESIZE_MIN_HEIGHT = 360;
-const SCENE_RESIZE_MAX_HEIGHT = 1400;
+const SCENE_RESIZE_MAX_HEIGHT = 2200;
+const SCENE_RESIZE_DRAG_SCALE = 1.35;
+const SCENE_RESIZE_VERTICAL_CHROME_PX = 70;
+const SCENE_RESIZE_MIN_RUNTIME_VISIBLE_PX = 56;
 const SIDEBAR_WIDTH_STORAGE_KEY = "multikite.sidebarWidthPx";
 const SIDEBAR_RESIZE_MIN_WIDTH = 280;
 const SIDEBAR_RESIZE_MAX_WIDTH = 760;
@@ -726,12 +729,47 @@ const rim = new THREE.DirectionalLight(0x5e87ff, 0.45);
 rim.position.set(-220, 160, 180);
 scene.add(rim);
 
-const grid = new THREE.GridHelper(600, 30, 0x1fa874, 0x274355);
-grid.rotation.x = Math.PI / 2;
-scene.add(grid);
-const GRID_SIZE = 600;
+const GRID_SIZE = 500;
+const GRID_DIVISIONS = 20;
+const GRID_MINOR_SPACING = GRID_SIZE / GRID_DIVISIONS;
 const GRID_HALF_EXTENT = GRID_SIZE / 2;
+const GRID_FADE_SOLID_RADIUS = GRID_SIZE * 0.75;
+const GRID_FADE_VISIBLE_RADIUS = GRID_SIZE * 4.2;
+const GRID_MINOR_MAX_OPACITY = 0.86;
+const GRID_MAJOR_MAX_OPACITY = 0.92;
+const GRID_MIN_VISIBLE_OPACITY = 0.01;
+const GRID_LINE_SEGMENTS = 64;
+const GRID_LINE_RADIUS_STEPS = Math.ceil(GRID_FADE_VISIBLE_RADIUS / GRID_MINOR_SPACING) + 2;
+const AIR_PARTICLE_FADE_SOLID_RADIUS = GRID_FADE_SOLID_RADIUS;
+const AIR_PARTICLE_FADE_VISIBLE_RADIUS = GRID_FADE_VISIBLE_RADIUS;
+const AIR_PARTICLE_VOLUME_PADDING_M = GRID_SIZE * 0.5;
 const AIR_PARTICLE_DISK_CLEARANCE_M = 100;
+const AIR_PARTICLE_MIN_ALTITUDE_M = 2;
+const AIR_PARTICLE_VOLUME_MIN_VERTICAL_HALF_M = 220;
+
+type LocalGridLineAxis = "x" | "y";
+
+interface LocalGridLine {
+  line: THREE.Line;
+  axis: LocalGridLineAxis;
+  offsetIndex: number;
+}
+
+const gridMinorColor = new THREE.Color(0x4f819a);
+const gridMajorColor = new THREE.Color(0x1fa874);
+
+function makeLocalGridLine(axis: LocalGridLineAxis, offsetIndex: number): LocalGridLine {
+  const line = makeFadedSceneLine(0x274355);
+  line.visible = false;
+  scene.add(line);
+  return { line, axis, offsetIndex };
+}
+
+const gridLines: LocalGridLine[] = [];
+for (let offsetIndex = -GRID_LINE_RADIUS_STEPS; offsetIndex <= GRID_LINE_RADIUS_STEPS; offsetIndex += 1) {
+  gridLines.push(makeLocalGridLine("x", offsetIndex));
+  gridLines.push(makeLocalGridLine("y", offsetIndex));
+}
 
 const payloadMesh = dynamicSceneObject(new THREE.Mesh(
   new THREE.SphereGeometry(7, 24, 24),
@@ -871,8 +909,8 @@ const commonNodeMeshes: THREE.Mesh[] = [];
 const upperSegmentMeshes: THREE.Mesh[][] = [];
 const upperNodeMeshes: THREE.Mesh[][] = [];
 let kiteVisualGeometryKey: string | null = null;
-const AIRFLOW_AMBIENT_PARTICLE_COUNT = 260;
-const AIRFLOW_GUST_PARTICLES_PER_KITE = 48;
+const AIRFLOW_AMBIENT_PARTICLE_COUNT = 900;
+const AIRFLOW_GUST_PARTICLES_PER_KITE = 96;
 const AIRFLOW_MAX_KITES = 4;
 const AIRFLOW_GUST_PARTICLE_COUNT = AIRFLOW_MAX_KITES * AIRFLOW_GUST_PARTICLES_PER_KITE;
 const WINGTIP_TRAIL_LIFETIME_S = 5.0;
@@ -885,6 +923,16 @@ interface AirParticleState {
   drift: number;
 }
 
+interface AirParticleVolume {
+  center: THREE.Vector3;
+  forward: THREE.Vector3;
+  lateral: THREE.Vector3;
+  vertical: THREE.Vector3;
+  longHalf: number;
+  crossHalf: number;
+  verticalHalf: number;
+}
+
 interface WingtipTrailParticleState {
   position: THREE.Vector3;
   velocity: THREE.Vector3;
@@ -895,8 +943,10 @@ interface WingtipTrailParticleState {
 
 const ambientParticlePositions = new Float32Array(AIRFLOW_AMBIENT_PARTICLE_COUNT * 3);
 const ambientParticleColors = new Float32Array(AIRFLOW_AMBIENT_PARTICLE_COUNT * 3);
+const ambientParticleAlpha = new Float32Array(AIRFLOW_AMBIENT_PARTICLE_COUNT);
 const gustParticlePositions = new Float32Array(AIRFLOW_GUST_PARTICLE_COUNT * 3);
 const gustParticleColors = new Float32Array(AIRFLOW_GUST_PARTICLE_COUNT * 3);
+const gustParticleAlpha = new Float32Array(AIRFLOW_GUST_PARTICLE_COUNT);
 const wingtipTrailPositions = new Float32Array(WINGTIP_TRAIL_PARTICLE_COUNT * 3);
 const wingtipTrailColors = new Float32Array(WINGTIP_TRAIL_PARTICLE_COUNT * 3);
 const wingtipTrailAlpha = new Float32Array(WINGTIP_TRAIL_PARTICLE_COUNT);
@@ -944,11 +994,14 @@ function makeSoftParticleMaterial(
       uOpacity: { value: opacity }
     },
     vertexShader: `
+      attribute float alpha;
       varying vec3 vColor;
+      varying float vAlpha;
       uniform float uPointSize;
 
       void main() {
         vColor = color;
+        vAlpha = alpha;
         vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
         float attenuation = clamp(180.0 / max(1.0, -mvPosition.z), 0.85, 2.1);
         gl_PointSize = uPointSize * attenuation;
@@ -957,6 +1010,7 @@ function makeSoftParticleMaterial(
     `,
     fragmentShader: `
       varying vec3 vColor;
+      varying float vAlpha;
       uniform float uOpacity;
 
       void main() {
@@ -966,7 +1020,7 @@ function makeSoftParticleMaterial(
         }
         float soft_edge = 1.0 - smoothstep(0.08, 0.5, distance_from_center);
         soft_edge = pow(soft_edge, 1.35);
-        gl_FragColor = vec4(vColor, uOpacity * soft_edge);
+        gl_FragColor = vec4(vColor, uOpacity * vAlpha * soft_edge);
       }
     `
   });
@@ -980,6 +1034,10 @@ ambientParticleGeometry.setAttribute(
 ambientParticleGeometry.setAttribute(
   "color",
   new THREE.BufferAttribute(ambientParticleColors, 3).setUsage(THREE.DynamicDrawUsage)
+);
+ambientParticleGeometry.setAttribute(
+  "alpha",
+  new THREE.BufferAttribute(ambientParticleAlpha, 1).setUsage(THREE.DynamicDrawUsage)
 );
 const ambientParticleCloud = new THREE.Points(
   ambientParticleGeometry,
@@ -997,6 +1055,10 @@ gustParticleGeometry.setAttribute(
 gustParticleGeometry.setAttribute(
   "color",
   new THREE.BufferAttribute(gustParticleColors, 3).setUsage(THREE.DynamicDrawUsage)
+);
+gustParticleGeometry.setAttribute(
+  "alpha",
+  new THREE.BufferAttribute(gustParticleAlpha, 1).setUsage(THREE.DynamicDrawUsage)
 );
 const gustParticleCloud = new THREE.Points(
   gustParticleGeometry,
@@ -2529,16 +2591,28 @@ function handleSidebarResizeKeydown(event: KeyboardEvent): void {
   }
 }
 
-function sceneResizeHeightFromEvent(event: PointerEvent): number {
-  return THREE.MathUtils.clamp(
-    sceneResizeStartHeight + event.clientY - sceneResizeStartY,
+function sceneResizeMaxHeight(): number {
+  const viewportMax =
+    window.innerHeight - SCENE_RESIZE_VERTICAL_CHROME_PX - SCENE_RESIZE_MIN_RUNTIME_VISIBLE_PX;
+  return Math.max(
     SCENE_RESIZE_MIN_HEIGHT,
-    SCENE_RESIZE_MAX_HEIGHT
+    Math.min(SCENE_RESIZE_MAX_HEIGHT, viewportMax)
+  );
+}
+
+function clampSceneHeight(heightPx: number): number {
+  return THREE.MathUtils.clamp(heightPx, SCENE_RESIZE_MIN_HEIGHT, sceneResizeMaxHeight());
+}
+
+function sceneResizeHeightFromEvent(event: PointerEvent): number {
+  return clampSceneHeight(
+    sceneResizeStartHeight + (event.clientY - sceneResizeStartY) * SCENE_RESIZE_DRAG_SCALE
   );
 }
 
 function setSceneHeight(heightPx: number): void {
-  layoutNode.style.setProperty("--top-workbench-height", `${heightPx.toFixed(0)}px`);
+  const height = clampSceneHeight(heightPx);
+  layoutNode.style.setProperty("--top-workbench-height", `${height.toFixed(0)}px`);
   resizeSceneRenderer();
 }
 
@@ -2581,10 +2655,10 @@ function handleSceneResizeKeydown(event: KeyboardEvent): void {
   const step = event.shiftKey ? 80 : 24;
   if (event.key === "ArrowUp") {
     event.preventDefault();
-    setSceneHeight(Math.max(SCENE_RESIZE_MIN_HEIGHT, viewport.getBoundingClientRect().height - step));
+    setSceneHeight(viewport.getBoundingClientRect().height - step);
   } else if (event.key === "ArrowDown") {
     event.preventDefault();
-    setSceneHeight(Math.min(SCENE_RESIZE_MAX_HEIGHT, viewport.getBoundingClientRect().height + step));
+    setSceneHeight(viewport.getBoundingClientRect().height + step);
   }
 }
 
@@ -5609,11 +5683,18 @@ function flowBasis(direction: THREE.Vector3): {
   return { forward, lateral, vertical };
 }
 
-function airflowCenter(frame: ApiFrame): THREE.Vector3 {
-  if (frame.kite_positions_n.length > 0 && frame.control_ring_radius > 1.0e-6) {
+function airflowVisualCenter(frame: ApiFrame): THREE.Vector3 {
+  if (frame.kite_positions_n.length > 0) {
+    return toThree(meanVector(frame.kite_positions_n));
+  }
+  if (frame.control_ring_radius > 1.0e-6) {
     return toThree(frame.control_ring_center_n);
   }
   return toThree(frame.splitter_position_n);
+}
+
+function airflowCenter(frame: ApiFrame): THREE.Vector3 {
+  return airflowVisualCenter(frame);
 }
 
 function airflowLongitudinalSpan(frame: ApiFrame): number {
@@ -5626,6 +5707,60 @@ function airflowLongitudinalSpan(frame: ApiFrame): number {
 
 function airflowCrossSpan(frame: ApiFrame): number {
   return Math.max(55, frame.control_ring_radius * 1.2);
+}
+
+function nearestGridMinorCoordinate(value: number): number {
+  return Math.round(value / GRID_MINOR_SPACING) * GRID_MINOR_SPACING;
+}
+
+function isMajorGridCoordinate(value: number): boolean {
+  const minorIndex = Math.round(value / GRID_MINOR_SPACING);
+  return minorIndex % GRID_DIVISIONS === 0;
+}
+
+function gridFadeAtPoint(x: number, y: number, center: THREE.Vector3): number {
+  const distance = Math.hypot(x - center.x, y - center.y);
+  if (distance <= GRID_FADE_SOLID_RADIUS) {
+    return 1;
+  }
+  return 1 - THREE.MathUtils.smoothstep(distance, GRID_FADE_SOLID_RADIUS, GRID_FADE_VISIBLE_RADIUS);
+}
+
+function updateLocalGrid(frame: ApiFrame): void {
+  const center = airflowVisualCenter(frame);
+  const baseX = nearestGridMinorCoordinate(center.x);
+  const baseY = nearestGridMinorCoordinate(center.y);
+  const pointCount = GRID_LINE_SEGMENTS + 1;
+  gridLines.forEach((gridLine) => {
+    const coordinate =
+      (gridLine.axis === "x" ? baseX : baseY) + gridLine.offsetIndex * GRID_MINOR_SPACING;
+    const major = isMajorGridCoordinate(coordinate);
+    const maxOpacity = major ? GRID_MAJOR_MAX_OPACITY : GRID_MINOR_MAX_OPACITY;
+    const positions = new Float32Array(pointCount * 3);
+    const alphas = new Float32Array(pointCount);
+    let peakOpacity = 0;
+
+    for (let index = 0; index < pointCount; index += 1) {
+      const t = index / GRID_LINE_SEGMENTS;
+      const offset = (t * 2 - 1) * GRID_FADE_VISIBLE_RADIUS;
+      const x = gridLine.axis === "x" ? coordinate : center.x + offset;
+      const y = gridLine.axis === "x" ? center.y + offset : coordinate;
+      const alpha = maxOpacity * gridFadeAtPoint(x, y, center);
+      positions[index * 3] = x;
+      positions[index * 3 + 1] = y;
+      positions[index * 3 + 2] = 0;
+      alphas[index] = alpha;
+      peakOpacity = Math.max(peakOpacity, alpha);
+    }
+
+    gridLine.line.visible = peakOpacity >= GRID_MIN_VISIBLE_OPACITY;
+    const geometry = gridLine.line.geometry as THREE.BufferGeometry;
+    geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute("lineAlpha", new THREE.BufferAttribute(alphas, 1));
+    geometry.computeBoundingSphere();
+    const material = gridLine.line.material as THREE.ShaderMaterial;
+    (material.uniforms.uColor.value as THREE.Color).copy(major ? gridMajorColor : gridMinorColor);
+  });
 }
 
 function cameraFollowTargetPosition(frame: ApiFrame): THREE.Vector3 | null {
@@ -5722,9 +5857,11 @@ function applyCameraFollow(frame: ApiFrame): void {
 function setParticleArrayEntry(
   positions: Float32Array,
   colors: Float32Array,
+  alphas: Float32Array,
   index: number,
   position: THREE.Vector3,
-  color: THREE.Color
+  color: THREE.Color,
+  alpha: number
 ): void {
   const base = index * 3;
   positions[base] = position.x;
@@ -5733,6 +5870,7 @@ function setParticleArrayEntry(
   colors[base] = color.r;
   colors[base + 1] = color.g;
   colors[base + 2] = color.b;
+  alphas[index] = THREE.MathUtils.clamp(alpha, 0, 1);
 }
 
 function setWingtipTrailEntry(
@@ -5780,22 +5918,78 @@ function airParticleVolumeTop(frame?: ApiFrame): number {
   return Math.max(GRID_HALF_EXTENT, diskAltitude + AIR_PARTICLE_DISK_CLEARANCE_M);
 }
 
-function randomGridVolumePosition(frame?: ApiFrame): THREE.Vector3 {
+function airParticleVolume(frame: ApiFrame, velocity: THREE.Vector3): AirParticleVolume {
   const top = airParticleVolumeTop(frame);
-  return toThree([
-    randomCentered(GRID_HALF_EXTENT),
-    randomCentered(GRID_HALF_EXTENT),
-    -Math.random() * top
-  ]);
+  const basis = flowBasis(velocity);
+  const horizontalHalf = AIR_PARTICLE_FADE_VISIBLE_RADIUS + AIR_PARTICLE_VOLUME_PADDING_M;
+  return {
+    center: airflowVisualCenter(frame),
+    forward: basis.forward,
+    lateral: basis.lateral,
+    vertical: basis.vertical,
+    longHalf: Math.max(horizontalHalf, airflowLongitudinalSpan(frame) * 1.8),
+    crossHalf: Math.max(horizontalHalf, airflowCrossSpan(frame) * 2.2),
+    verticalHalf: Math.max(
+      AIR_PARTICLE_VOLUME_MIN_VERTICAL_HALF_M,
+      Math.min(AIR_PARTICLE_FADE_VISIBLE_RADIUS * 0.55, top * 0.7),
+      frame.control_ring_radius * 2.0
+    )
+  };
 }
 
-function isOutsideGridVolume(position: THREE.Vector3, frame?: ApiFrame): boolean {
-  return (
-    Math.abs(position.x) > GRID_HALF_EXTENT ||
-    Math.abs(position.y) > GRID_HALF_EXTENT ||
-    position.z < 0 ||
-    position.z > airParticleVolumeTop(frame)
+function airParticleFade(position: THREE.Vector3, volume: AirParticleVolume): number {
+  const offset = position.clone().sub(volume.center);
+  const forward = offset.dot(volume.forward);
+  const lateral = offset.dot(volume.lateral);
+  const vertical = offset.dot(volume.vertical);
+  const horizontalDistance = Math.hypot(forward, lateral);
+  const horizontalAlpha = horizontalDistance <= AIR_PARTICLE_FADE_SOLID_RADIUS
+    ? 1
+    : 1 - THREE.MathUtils.smoothstep(
+      horizontalDistance,
+      AIR_PARTICLE_FADE_SOLID_RADIUS,
+      AIR_PARTICLE_FADE_VISIBLE_RADIUS
+    );
+  const verticalAlpha = 1 - THREE.MathUtils.smoothstep(
+    Math.abs(vertical),
+    volume.verticalHalf * 0.72,
+    volume.verticalHalf * 0.95
   );
+  return horizontalAlpha * verticalAlpha;
+}
+
+function randomAirParticlePosition(volume: AirParticleVolume): THREE.Vector3 {
+  const position = volume.center
+    .clone()
+    .addScaledVector(volume.forward, randomCentered(volume.longHalf))
+    .addScaledVector(volume.lateral, randomCentered(volume.crossHalf))
+    .addScaledVector(volume.vertical, randomCentered(volume.verticalHalf));
+  if (position.z < AIR_PARTICLE_MIN_ALTITUDE_M) {
+    position.z = AIR_PARTICLE_MIN_ALTITUDE_M + Math.random() * 8;
+  }
+  return position;
+}
+
+function wrapVolumeOffset(value: number, halfExtent: number): number {
+  const span = 2 * halfExtent;
+  if (span <= 0) {
+    return 0;
+  }
+  return ((((value + halfExtent) % span) + span) % span) - halfExtent;
+}
+
+function wrapAirParticleIntoVolume(position: THREE.Vector3, volume: AirParticleVolume): void {
+  const offset = position.clone().sub(volume.center);
+  const forward = wrapVolumeOffset(offset.dot(volume.forward), volume.longHalf);
+  const lateral = wrapVolumeOffset(offset.dot(volume.lateral), volume.crossHalf);
+  const vertical = wrapVolumeOffset(offset.dot(volume.vertical), volume.verticalHalf);
+  position.copy(volume.center)
+    .addScaledVector(volume.forward, forward)
+    .addScaledVector(volume.lateral, lateral)
+    .addScaledVector(volume.vertical, vertical);
+  if (position.z < AIR_PARTICLE_MIN_ALTITUDE_M) {
+    position.z = AIR_PARTICLE_MIN_ALTITUDE_M;
+  }
 }
 
 function kiteQuaternionToThree(
@@ -5874,6 +6068,7 @@ function initializeAmbientParticles(frame: ApiFrame, velocity: THREE.Vector3): v
   if (!ambientParticleCloud.visible) {
     return;
   }
+  const volume = airParticleVolume(frame, velocity);
 
   const color = ambientAirColor.clone().lerp(
     ambientAirColorHigh,
@@ -5882,23 +6077,36 @@ function initializeAmbientParticles(frame: ApiFrame, velocity: THREE.Vector3): v
 
   for (let index = 0; index < AIRFLOW_AMBIENT_PARTICLE_COUNT; index += 1) {
     const state = ambientParticleStates[index];
-    state.position.copy(randomGridVolumePosition(frame));
+    state.position.copy(randomAirParticlePosition(volume));
     state.age = 0;
-    state.life = (2.2 * GRID_SIZE) / Math.max(2.0, flowMagnitude) * (0.8 + 0.4 * Math.random());
+    state.life = (4.4 * volume.longHalf) / Math.max(2.0, flowMagnitude) * (0.8 + 0.4 * Math.random());
     state.drift = 0.35 + 0.65 * Math.random();
-    setParticleArrayEntry(ambientParticlePositions, ambientParticleColors, index, state.position, color);
+    setParticleArrayEntry(
+      ambientParticlePositions,
+      ambientParticleColors,
+      ambientParticleAlpha,
+      index,
+      state.position,
+      color,
+      airParticleFade(state.position, volume)
+    );
   }
 
   (ambientParticleGeometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
   (ambientParticleGeometry.attributes.color as THREE.BufferAttribute).needsUpdate = true;
+  (ambientParticleGeometry.attributes.alpha as THREE.BufferAttribute).needsUpdate = true;
 }
 
-function resetAmbientParticle(index: number, frame: ApiFrame, velocity: THREE.Vector3): void {
+function resetAmbientParticle(
+  index: number,
+  velocity: THREE.Vector3,
+  volume: AirParticleVolume
+): void {
   const flowMagnitude = Math.max(2.0, velocity.length());
   const state = ambientParticleStates[index];
-  state.position.copy(randomGridVolumePosition(frame));
+  state.position.copy(randomAirParticlePosition(volume));
   state.age = 0;
-  state.life = (2.2 * GRID_SIZE) / flowMagnitude * (0.8 + 0.4 * Math.random());
+  state.life = (4.4 * volume.longHalf) / flowMagnitude * (0.8 + 0.4 * Math.random());
   state.drift = 0.35 + 0.65 * Math.random();
 }
 
@@ -5908,6 +6116,7 @@ function updateAmbientParticles(dtSimSeconds: number, frame: ApiFrame, velocity:
   if (!ambientParticleCloud.visible) {
     return;
   }
+  const volume = airParticleVolume(frame, velocity);
 
   const color = ambientAirColor.clone().lerp(
     ambientAirColorHigh,
@@ -5917,27 +6126,27 @@ function updateAmbientParticles(dtSimSeconds: number, frame: ApiFrame, velocity:
   for (let index = 0; index < AIRFLOW_AMBIENT_PARTICLE_COUNT; index += 1) {
     const state = ambientParticleStates[index];
     if (state.life <= 0 || state.age >= state.life) {
-      resetAmbientParticle(index, frame, velocity);
+      resetAmbientParticle(index, velocity, volume);
     }
 
     state.age += dtSimSeconds;
     state.position.addScaledVector(velocity, dtSimSeconds);
-
-    if (isOutsideGridVolume(state.position, frame)) {
-      resetAmbientParticle(index, frame, velocity);
-    }
+    wrapAirParticleIntoVolume(state.position, volume);
 
     setParticleArrayEntry(
       ambientParticlePositions,
       ambientParticleColors,
+      ambientParticleAlpha,
       index,
       state.position,
-      color
+      color,
+      airParticleFade(state.position, volume)
     );
   }
 
   (ambientParticleGeometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
   (ambientParticleGeometry.attributes.color as THREE.BufferAttribute).needsUpdate = true;
+  (ambientParticleGeometry.attributes.alpha as THREE.BufferAttribute).needsUpdate = true;
 }
 
 function gustParticleColor(gustMagnitude: number): THREE.Color {
@@ -5948,11 +6157,11 @@ function gustParticleColor(gustMagnitude: number): THREE.Color {
   return gustAirColorMid.clone().lerp(gustAirColorHigh, (normalized - 0.5) / 0.5);
 }
 
-function resetGustParticle(index: number, frame: ApiFrame, velocity: THREE.Vector3): void {
+function resetGustParticle(index: number, velocity: THREE.Vector3, volume: AirParticleVolume): void {
   const state = gustParticleStates[index];
-  state.position.copy(randomGridVolumePosition(frame));
+  state.position.copy(randomAirParticlePosition(volume));
   state.age = 0;
-  state.life = (1.6 * GRID_SIZE) / Math.max(1.0, velocity.length()) * (0.75 + 0.4 * Math.random());
+  state.life = (3.2 * volume.longHalf) / Math.max(1.0, velocity.length()) * (0.75 + 0.4 * Math.random());
   state.drift = 0.35 + 0.65 * Math.random();
 }
 
@@ -5964,17 +6173,27 @@ function initializeGustParticles(frame: ApiFrame, velocity: THREE.Vector3): void
   }
 
   const color = gustParticleColor(gustStrength);
+  const volume = airParticleVolume(frame, velocity);
   for (let index = 0; index < AIRFLOW_GUST_PARTICLE_COUNT; index += 1) {
     const state = gustParticleStates[index];
-    state.position.copy(randomGridVolumePosition(frame));
+    state.position.copy(randomAirParticlePosition(volume));
     state.age = 0;
-    state.life = (2.0 * GRID_SIZE) / Math.max(1.0, velocity.length()) * (0.8 + 0.45 * Math.random());
+    state.life = (4.0 * volume.longHalf) / Math.max(1.0, velocity.length()) * (0.8 + 0.45 * Math.random());
     state.drift = 0.35 + 0.65 * Math.random();
-    setParticleArrayEntry(gustParticlePositions, gustParticleColors, index, state.position, color);
+    setParticleArrayEntry(
+      gustParticlePositions,
+      gustParticleColors,
+      gustParticleAlpha,
+      index,
+      state.position,
+      color,
+      airParticleFade(state.position, volume)
+    );
   }
 
   (gustParticleGeometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
   (gustParticleGeometry.attributes.color as THREE.BufferAttribute).needsUpdate = true;
+  (gustParticleGeometry.attributes.alpha as THREE.BufferAttribute).needsUpdate = true;
 }
 
 function updateGustParticles(dtSimSeconds: number, frame: ApiFrame, velocity: THREE.Vector3): void {
@@ -5983,31 +6202,32 @@ function updateGustParticles(dtSimSeconds: number, frame: ApiFrame, velocity: TH
   if (!gustParticleCloud.visible) {
     return;
   }
+  const volume = airParticleVolume(frame, velocity);
 
   for (let index = 0; index < AIRFLOW_GUST_PARTICLE_COUNT; index += 1) {
     const state = gustParticleStates[index];
     if (state.life <= 0 || state.age >= state.life) {
-      resetGustParticle(index, frame, velocity);
+      resetGustParticle(index, velocity, volume);
     }
 
     state.age += dtSimSeconds;
     state.position.addScaledVector(velocity, dtSimSeconds);
-
-    if (isOutsideGridVolume(state.position, frame)) {
-      resetGustParticle(index, frame, velocity);
-    }
+    wrapAirParticleIntoVolume(state.position, volume);
 
     setParticleArrayEntry(
       gustParticlePositions,
       gustParticleColors,
+      gustParticleAlpha,
       index,
       state.position,
-      gustParticleColor(gustStrength)
+      gustParticleColor(gustStrength),
+      airParticleFade(state.position, volume)
     );
   }
 
   (gustParticleGeometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
   (gustParticleGeometry.attributes.color as THREE.BufferAttribute).needsUpdate = true;
+  (gustParticleGeometry.attributes.alpha as THREE.BufferAttribute).needsUpdate = true;
 }
 
 function emitWingtipTrailParticle(
@@ -7220,6 +7440,7 @@ function renderFrame(frame: ApiFrame): void {
   hasRenderedSimulationFrame = true;
   renderMassOverlay(frame);
   updateControlVisLegend(frame);
+  updateLocalGrid(frame);
   ensureKites(frame.kite_positions_n.length, frame);
   const showAdaptiveSlots = activeSummaryRequest?.phase_mode === "adaptive";
   payloadMesh.position.copy(toThree(frame.payload_position_n));
@@ -7761,6 +7982,15 @@ function releaseBufferedPlayback(): void {
   playbackStartSimTime = pendingPlaybackFrames[0]?.time ?? lastRenderedFrame?.time ?? 0;
   setRunControls();
   refreshProgressSummary();
+}
+
+function showIdleRunState(): void {
+  summaryNode.innerHTML = renderSummaryCard(
+    "Ready",
+    "No run started",
+    []
+  );
+  clearPlots("No plot data.");
 }
 
 function waitForPlaybackDrain(): Promise<void> {
@@ -8391,7 +8621,11 @@ window.addEventListener("mermaid-ready", () => {
 window.addEventListener("resize", () => {
   const controlsWidth = document.querySelector<HTMLElement>(".controls")!.getBoundingClientRect().width;
   setSidebarWidth(controlsWidth, false);
-  resizeSceneRenderer();
+  if (window.matchMedia("(max-width: 980px)").matches) {
+    resizeSceneRenderer();
+  } else {
+    setSceneHeight(viewport.getBoundingClientRect().height);
+  }
   activePlotSections.forEach((section) => {
     Plotly.Plots?.resize(section.plot);
   });
@@ -8404,5 +8638,5 @@ void Promise.all([loadDefaultConfig(), loadPresets()]).then(() => {
   applyPresetDefaults();
   void refreshPerformanceScalePreview();
   renderControllerDocs();
-  return runSimulation();
+  showIdleRunState();
 });
