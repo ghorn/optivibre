@@ -233,6 +233,35 @@ h2 {
   font-family: "IBM Plex Serif", Georgia, serif;
 }
 
+.app-title {
+  min-height: 5.9rem;
+  font-size: 2.05rem;
+  line-height: 0.96;
+  text-wrap: balance;
+  overflow-wrap: anywhere;
+  transition:
+    opacity 520ms ease,
+    transform 520ms ease,
+    filter 520ms ease;
+}
+
+.app-title.is-transitioning {
+  opacity: 0;
+  transform: translateY(-5px);
+  filter: blur(2px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-title {
+    transition: none;
+  }
+
+  .app-title.is-transitioning {
+    transform: none;
+    filter: none;
+  }
+}
+
 form {
   display: grid;
   gap: 12px;

@@ -48,6 +48,36 @@ interface PlotlyLike {
 
 declare const Plotly: PlotlyLike;
 
+const LOCKED_APP_TITLES = [
+  "Multikite Madness",
+  "Kite Riot",
+  "Tether Party",
+  "Loop Soup",
+  "Tether Disco",
+  "Sky Spaghetti",
+  "Loop Goblins",
+  "Tether Tango",
+  "Orbit Blender",
+  "Kite Knot Club",
+  "Tether Tornado",
+  "The Sky Noodle Incident",
+  "Forbidden Tether Geometry",
+  "The Many-Kite Problem",
+  "Department of Suspicious Loops",
+  "Three Kites In A Trenchcoat",
+  "Violent Agreement With Physics",
+  "Kite Math Disaster Zone",
+  "Infinite Tether Committee",
+  "Swarm Of Theseus",
+  "Extremely Legal Kite Formation",
+  "Tether Goblin Supreme",
+  "Orbital Pasta Authority"
+] as const;
+
+const APP_TITLE_STORAGE_KEY = "multikite.lastAppTitle";
+const APP_TITLE_INTERVAL_MS = 30_000;
+const APP_TITLE_TRANSITION_MS = 520;
+
 interface PlotlyRelayoutEvent {
   [key: string]: unknown;
 }
@@ -365,6 +395,7 @@ type StreamEvent =
   | { kind: "plots"; frames: ApiFrame[] }
   | { kind: "summary"; summary: RunSummary };
 
+const appTitleNode = document.querySelector<HTMLHeadingElement>("#app-title")!;
 const presetSelect = document.querySelector<HTMLSelectElement>("#preset")!;
 const swarmOptionsNode = document.querySelector<HTMLElement>("#swarm-options")!;
 const swarmKitesSelect = document.querySelector<HTMLSelectElement>("#swarm-kites")!;
@@ -508,6 +539,71 @@ const runButton = document.querySelector<HTMLButtonElement>("#run-button")!;
 const restartButton = document.querySelector<HTMLButtonElement>("#restart-button")!;
 const consoleNode = document.querySelector<HTMLElement>("#console")!;
 const controllerDocsNode = document.querySelector<HTMLElement>("#controller-docs")!;
+
+type LockedAppTitle = (typeof LOCKED_APP_TITLES)[number];
+
+function randomInt(maxExclusive: number): number {
+  if (maxExclusive <= 1) {
+    return 0;
+  }
+  if (globalThis.crypto?.getRandomValues) {
+    const buffer = new Uint32Array(1);
+    const range = 0x1_0000_0000;
+    const limit = Math.floor(range / maxExclusive) * maxExclusive;
+    let value = 0;
+    do {
+      globalThis.crypto.getRandomValues(buffer);
+      value = buffer[0];
+    } while (value >= limit);
+    return value % maxExclusive;
+  }
+  return Math.floor(Math.random() * maxExclusive);
+}
+
+function readLastAppTitle(): LockedAppTitle | null {
+  try {
+    const storedTitle = window.localStorage.getItem(APP_TITLE_STORAGE_KEY);
+    return LOCKED_APP_TITLES.includes(storedTitle as LockedAppTitle)
+      ? storedTitle as LockedAppTitle
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function rememberAppTitle(title: LockedAppTitle): void {
+  try {
+    window.localStorage.setItem(APP_TITLE_STORAGE_KEY, title);
+  } catch {
+    // Browsers can disable storage; the title rotation should still work.
+  }
+}
+
+function chooseAppTitle(excludedTitle: string | null): LockedAppTitle {
+  const choices = LOCKED_APP_TITLES.filter((title) => title !== excludedTitle);
+  return choices[randomInt(choices.length)] ?? LOCKED_APP_TITLES[0];
+}
+
+function applyAppTitle(title: LockedAppTitle): void {
+  appTitleNode.textContent = title;
+  document.title = title;
+  rememberAppTitle(title);
+}
+
+function initializeAppTitleRotation(): void {
+  applyAppTitle(chooseAppTitle(readLastAppTitle()));
+  window.setInterval(() => {
+    const currentTitle = appTitleNode.textContent ?? null;
+    const nextTitle = chooseAppTitle(currentTitle);
+    appTitleNode.classList.add("is-transitioning");
+    window.setTimeout(() => {
+      applyAppTitle(nextTitle);
+      appTitleNode.classList.remove("is-transitioning");
+    }, APP_TITLE_TRANSITION_MS);
+  }, APP_TITLE_INTERVAL_MS);
+}
+
+initializeAppTitleRotation();
 
 let presetInfoById = new Map<Preset, PresetInfo>();
 let simulationDefaults: SimulationDefaults | null = null;
