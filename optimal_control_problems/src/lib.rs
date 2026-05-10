@@ -7,6 +7,7 @@
 #![allow(clippy::unnecessary_cast)]
 #![allow(clippy::collapsible_if)]
 
+pub mod albatross;
 mod benchmark_report;
 mod common;
 pub mod crane;
@@ -65,6 +66,7 @@ pub(crate) struct ProblemEntry {
 fn problem_entries() -> &'static [ProblemEntry] {
     static ENTRIES: LazyLock<Vec<ProblemEntry>> = LazyLock::new(|| {
         vec![
+            albatross::problem_entry(),
             glider::problem_entry(),
             linear_s::problem_entry(),
             sailboat::problem_entry(),
@@ -127,6 +129,9 @@ pub fn compile_variant_for_problem(
     id: ProblemId,
     values: &BTreeMap<String, f64>,
 ) -> Option<(String, String)> {
+    if id == ProblemId::AlbatrossDynamicSoaring {
+        return albatross::compile_variant_for_values(values);
+    }
     if let Some(variant) = static_optimization::compile_variant_for_problem(id) {
         return Some(variant);
     }

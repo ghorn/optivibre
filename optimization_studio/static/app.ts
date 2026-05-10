@@ -36,11 +36,13 @@ const CONTROL_EDITOR = Object.freeze({
   slider: 0,
   select: 1,
   text: 2,
+  checkbox: 3,
 } as const);
 const CONTROL_EDITOR_FROM_WIRE = Object.freeze({
   slider: CONTROL_EDITOR.slider,
   select: CONTROL_EDITOR.select,
   text: CONTROL_EDITOR.text,
+  checkbox: CONTROL_EDITOR.checkbox,
 } as const);
 const CONTROL_SEMANTIC = Object.freeze({
   transcriptionMethod: 0,
@@ -383,20 +385,23 @@ const STREAM_EVENT_KIND_FROM_WIRE = Object.freeze({
 } as const);
 const PROBLEM_ID = Object.freeze({
   optimalDistanceGlider: 0,
-  linearSManeuver: 1,
-  sailboatUpwind: 2,
-  craneTransfer: 3,
-  hangingChainStatic: 4,
-  rosenbrockVariants: 5,
+  albatrossDynamicSoaring: 1,
+  linearSManeuver: 2,
+  sailboatUpwind: 3,
+  craneTransfer: 4,
+  hangingChainStatic: 5,
+  rosenbrockVariants: 6,
 } as const);
 const PROBLEM_ID_FROM_WIRE = Object.freeze({
   optimal_distance_glider: PROBLEM_ID.optimalDistanceGlider,
+  albatross_dynamic_soaring: PROBLEM_ID.albatrossDynamicSoaring,
   linear_s_maneuver: PROBLEM_ID.linearSManeuver,
   sailboat_upwind: PROBLEM_ID.sailboatUpwind,
   crane_transfer: PROBLEM_ID.craneTransfer,
   hanging_chain_static: PROBLEM_ID.hangingChainStatic,
   rosenbrock_variants: PROBLEM_ID.rosenbrockVariants,
 } as const);
+const ALBATROSS_DESIGN_PREFIXES = ["delta_l", "h0", "vx0", "tf"] as const;
 const COMPILE_CACHE_STATE = Object.freeze({
   warming: 0,
   ready: 1,
@@ -862,6 +867,12 @@ interface ChartView {
   linkXRange: boolean;
 }
 
+interface PlotlyView {
+  plotEl: PlotlyHostElement;
+  sceneCamera?: PlotlyObject | null;
+  sceneInteractionBound?: boolean;
+}
+
 interface ChartPanelChart {
   kind: "chart";
   key: string;
@@ -880,7 +891,8 @@ interface ChartPanelVisualization {
 
 type ChartPanel = ChartPanelChart | ChartPanelVisualization;
 
-interface SceneView {
+interface Scene2DView {
+  kind: "scene_2d";
   scene: Scene2D;
   shell: HTMLDivElement;
   meta: HTMLDivElement;
@@ -888,6 +900,20 @@ interface SceneView {
   slider: HTMLInputElement | null;
   plotEl: PlotlyHostElement;
 }
+
+interface Scene3DView {
+  kind: "paths_3d";
+  visualization: Paths3DVisualization;
+  shell: HTMLDivElement;
+  meta: HTMLDivElement;
+  playButton: null;
+  slider: null;
+  plotEl: PlotlyHostElement;
+  sceneCamera: PlotlyObject | null;
+  sceneInteractionBound: boolean;
+}
+
+type SceneView = Scene2DView | Scene3DView;
 
 interface ControlSectionView {
   key: ControlSectionCode;
@@ -2039,6 +2065,10 @@ function isTextEntryControl(control: ControlSpec): boolean {
   return control.editor === CONTROL_EDITOR.text;
 }
 
+function isCheckboxControl(control: ControlSpec): boolean {
+  return control.editor === CONTROL_EDITOR.checkbox;
+}
+
 function formatControlValue(control: ControlSpec, numeric: number): string {
   switch (control.value_display) {
     case CONTROL_VALUE_DISPLAY.integer:
@@ -2724,6 +2754,10 @@ function currentSpec(): ProblemSpec | undefined {
   return state.specs.find((spec) => spec.id === state.selectedId);
 }
 
+function findControlById(spec: ProblemSpec | undefined, id: string): ControlSpec | null {
+  return spec?.controls.find((control) => control.id === id) ?? null;
+}
+
 function findControlBySemantic(
   spec: ProblemSpec | undefined,
   semantic: ControlSemanticCode,
@@ -2753,6 +2787,30 @@ function profileDefaultForControl(control: ControlSpec): number {
 
 function effectiveControlValue(control: ControlSpec): number {
   return Number(hasControlOverride(control) ? state.values[control.id] : profileDefaultForControl(control));
+}
+
+function albatrossDesignPrefix(controlId: string): string | null {
+  return ALBATROSS_DESIGN_PREFIXES.find((prefix) => controlId.startsWith(`${prefix}_`)) ?? null;
+}
+
+function isAlbatrossDesignModeControl(control: ControlSpec): boolean {
+  return currentSpec()?.id === PROBLEM_ID.albatrossDynamicSoaring
+    && ALBATROSS_DESIGN_PREFIXES.some((prefix) => control.id === `${prefix}_free`);
+}
+
+function isAlbatrossDesignBoundsControl(control: ControlSpec): boolean {
+  return currentSpec()?.id === PROBLEM_ID.albatrossDynamicSoaring
+    && (control.id.endsWith("_lower") || control.id.endsWith("_upper"))
+    && albatrossDesignPrefix(control.id) !== null;
+}
+
+function albatrossDesignBoundsVisible(control: ControlSpec): boolean {
+  const prefix = albatrossDesignPrefix(control.id);
+  if (!prefix) {
+    return true;
+  }
+  const modeControl = findControlById(currentSpec(), `${prefix}_free`);
+  return modeControl ? effectiveControlValue(modeControl) >= 0.5 : true;
 }
 
 function currentSharedControlValue(semantic: ControlSemanticCode, fallback = 0): number {
@@ -2851,6 +2909,9 @@ function isLineSearchMeritSelected(): boolean {
 }
 
 function isStructuralControl(control: ControlSpec): boolean {
+  if (currentSpec()?.id === PROBLEM_ID.albatrossDynamicSoaring && control.id === "objective") {
+    return true;
+  }
   switch (control.semantic) {
     case CONTROL_SEMANTIC.transcriptionMethod:
     case CONTROL_SEMANTIC.transcriptionIntervals:
@@ -2972,8 +3033,10 @@ function handleControlUpdate(control: ControlSpec): void {
     || control.semantic === CONTROL_SEMANTIC.solverProfile
     || control.semantic === CONTROL_SEMANTIC.solverGlobalization
     || control.semantic === CONTROL_SEMANTIC.solverNlipLinearSolver
+    || isAlbatrossDesignModeControl(control)
   ) {
     renderControls();
+    renderTrustRegionPlotVisibility();
   }
   if (isStructuralControl(control)) {
     renderCompileCacheStatus();
@@ -2982,6 +3045,9 @@ function handleControlUpdate(control: ControlSpec): void {
 }
 
 function isControlVisible(control: ControlSpec): boolean {
+  if (isAlbatrossDesignBoundsControl(control)) {
+    return albatrossDesignBoundsVisible(control);
+  }
   if (control.semantic === CONTROL_SEMANTIC.timeGridStrength) {
     return currentTranscriptionMethodValue() === DIRECT_COLLOCATION_VALUE
       && currentTimeGridUsesStrength();
@@ -3278,6 +3344,36 @@ function appendControl(wrapperParent: HTMLElement, control: ControlSpec): void {
     return;
   }
 
+  if (isCheckboxControl(control)) {
+    const checked = value >= 0.5;
+    wrapper.innerHTML = `
+      <div class="control-header">
+        <div>
+          <div class="control-label">${control.label}</div>
+          <div class="control-help">${control.help}</div>
+        </div>
+        <div class="value-pill">${checked ? "On" : "Off"}</div>
+      </div>
+      <label class="control-inputs control-inputs-checkbox">
+        <input type="checkbox" aria-label="${control.label}"${checked ? " checked" : ""} />
+        <span>${checked ? "Free" : "Fixed"}</span>
+      </label>
+    `;
+    const checkboxInput = requiredChild<HTMLInputElement>(wrapper, 'input[type="checkbox"]');
+    const checkboxLabel = requiredChild<HTMLSpanElement>(wrapper, ".control-inputs-checkbox span");
+    const pill = requiredChild<HTMLDivElement>(wrapper, ".value-pill");
+    checkboxInput.addEventListener("input", (event) => {
+      const target = readCurrentInputTarget(event, `${control.id} checkbox input`);
+      const numeric = target.checked ? 1 : 0;
+      state.values[control.id] = numeric;
+      pill.textContent = target.checked ? "On" : "Off";
+      checkboxLabel.textContent = target.checked ? "Free" : "Fixed";
+      handleControlUpdate(control);
+    });
+    wrapperParent.appendChild(wrapper);
+    return;
+  }
+
   wrapper.innerHTML = `
     <div class="control-header">
       <div>
@@ -3489,7 +3585,7 @@ function syncLinkedChartRange(sourceView: ChartView, eventData: PlotlyRelayoutPa
   });
 }
 
-function createSceneView(scene: Scene2D): SceneView {
+function createSceneView(scene: Scene2D): Scene2DView {
   const shell = document.createElement("div");
   shell.className = "scene-shell";
 
@@ -3536,12 +3632,40 @@ function createSceneView(scene: Scene2D): SceneView {
   shell.append(toolbar, plotEl);
 
   return {
+    kind: "scene_2d",
     scene,
     shell,
     meta,
     playButton,
     slider,
     plotEl,
+  };
+}
+
+function createScene3DView(visualization: Paths3DVisualization): Scene3DView {
+  const shell = document.createElement("div");
+  shell.className = "scene-shell scene-shell-3d";
+
+  const toolbar = document.createElement("div");
+  toolbar.className = "scene-toolbar";
+  const meta = document.createElement("div");
+  meta.className = "scene-meta";
+  meta.textContent = visualizationSubtitle(visualization);
+  toolbar.appendChild(meta);
+
+  const plotEl = createPlotlyHostElement("plot-surface scene-plot-surface plot-surface-3d");
+  shell.append(toolbar, plotEl);
+
+  return {
+    kind: "paths_3d",
+    visualization,
+    shell,
+    meta,
+    playButton: null,
+    slider: null,
+    plotEl,
+    sceneCamera: null,
+    sceneInteractionBound: false,
   };
 }
 
@@ -3696,6 +3820,9 @@ function updateScenePlot(view: SceneView): void {
   if (!window.Plotly) {
     return;
   }
+  if (view.kind !== "scene_2d") {
+    return;
+  }
   const scene = view.scene;
   const bounds = scenePlotBounds(scene);
   const data = [
@@ -3753,6 +3880,31 @@ function updateScenePlot(view: SceneView): void {
   window.Plotly.react(view.plotEl, data, layout, config);
 }
 
+function shouldShowTrustRegionPlot(): boolean {
+  return currentSolverMethodValue() === SOLVER_METHOD.sqp
+    && (
+      Boolean(state.latestProgress?.trust_region)
+      || isTrustRegionGlobalizationSelected()
+    );
+}
+
+function renderTrustRegionPlotVisibility(): void {
+  const visible = shouldShowTrustRegionPlot();
+  trustRegionPlotEl.hidden = !visible;
+  if (!visible) {
+    if (window.Plotly && state.trustRegionPlotReady) {
+      window.Plotly.purge(trustRegionPlotEl);
+    }
+    trustRegionPlotEl.replaceChildren();
+    state.trustRegionPlotReady = false;
+    return;
+  }
+  if (!state.trustRegionPlotReady && trustRegionPlotEl.childElementCount === 0) {
+    trustRegionPlotEl.innerHTML =
+      `<div class="placeholder">Trust-region telemetry will appear here during trust-region SQP solves.</div>`;
+  }
+}
+
 function resetSolverPanel(): void {
   clearScheduledArtifactRender();
   state.renderScheduled = false;
@@ -3779,11 +3931,10 @@ function resetSolverPanel(): void {
   }
   progressPlotEl.innerHTML = `<div class="placeholder">Solve a problem to populate the live convergence history.</div>`;
   filterPlotEl.innerHTML = `<div class="placeholder">SQP filter telemetry will appear here during the solve.</div>`;
-  trustRegionPlotEl.innerHTML =
-    `<div class="placeholder">Trust-region telemetry will appear here during trust-region SQP solves.</div>`;
   state.progressPlotReady = false;
   state.filterPlotReady = false;
   state.trustRegionPlotReady = false;
+  renderTrustRegionPlotVisibility();
   state.lastFilterPointKey = null;
   state.filterRecentPath = [];
   renderCompileCacheStatus();
@@ -5423,8 +5574,10 @@ function updateTrustRegionPlot(progress: SolveProgress): void {
   }
   const trustRegion = progress.trust_region;
   if (!trustRegion) {
+    renderTrustRegionPlotVisibility();
     return;
   }
+  trustRegionPlotEl.hidden = false;
   ensureTrustRegionPlot();
   const iteration = progress.iteration;
   const radius = positiveLogValue(trustRegion.radius);
@@ -5662,15 +5815,27 @@ function scheduleIterationUpdate(): void {
   });
 }
 
-function applyIterationEvent(event: IterationSolveEvent, updateRunningStatus: boolean): void {
+function shouldRenderIterationArtifact(event: IterationSolveEvent, forceArtifactRender: boolean): boolean {
+  return forceArtifactRender
+    || state.artifact == null
+    || event.progress.iteration % 25 === 0;
+}
+
+function applyIterationEvent(
+  event: IterationSolveEvent,
+  updateRunningStatus: boolean,
+  forceArtifactRender = false,
+): void {
   state.latestProgress = event.progress;
   state.liveSolver = event.artifact.solver;
-  state.artifact = event.artifact;
   renderSolverSummary();
   updateProgressPlot(event.progress);
   updateTrustRegionPlot(event.progress);
   updateFilterPlot(event.progress);
-  scheduleArtifactRender();
+  if (shouldRenderIterationArtifact(event, forceArtifactRender)) {
+    state.artifact = event.artifact;
+    scheduleArtifactRender(forceArtifactRender);
+  }
   if (updateRunningStatus && state.liveStatus?.stage === SOLVE_STAGE.solving) {
     setStatusDisplay(statusDisplayForSolveStatus(state.liveStatus, event.progress.iteration));
   }
@@ -5684,7 +5849,7 @@ function applySolveFailure(message: string): void {
   if (state.pendingIterationEvent) {
     const pendingEvent = state.pendingIterationEvent;
     state.pendingIterationEvent = null;
-    applyIterationEvent(pendingEvent, false);
+    applyIterationEvent(pendingEvent, false, true);
   }
   state.liveStatus = null;
   state.terminalSolver =
@@ -5829,6 +5994,32 @@ function collectSceneBounds(scene: Scene2D): SceneBounds {
 }
 
 function renderScene(): void {
+  const visualization = primarySceneVisualization(state.artifact);
+  if (visualization) {
+    sceneSubtitleEl.textContent = visualization.title;
+    if (!window.Plotly) {
+      state.sceneView = null;
+      sceneEl.innerHTML = `<div class="placeholder">Plotly is still loading.</div>`;
+      return;
+    }
+    if (
+      !state.sceneView
+      || state.sceneView.kind !== "paths_3d"
+      || state.sceneView.visualization.title !== visualization.title
+    ) {
+      state.sceneView = createScene3DView(visualization);
+      sceneEl.replaceChildren(state.sceneView.shell);
+    }
+    const view = state.sceneView;
+    if (view.kind !== "paths_3d") {
+      return;
+    }
+    view.visualization = visualization;
+    view.meta.textContent = visualizationSubtitle(visualization);
+    updatePaths3DVisualization(view, visualization);
+    return;
+  }
+
   const scene = state.artifact?.scene;
   sceneSubtitleEl.textContent = scene?.title ?? "";
   if (!scene) {
@@ -5841,13 +6032,13 @@ function renderScene(): void {
     sceneEl.innerHTML = `<div class="placeholder">Plotly is still loading.</div>`;
     return;
   }
-  if (!state.sceneView || state.sceneView.scene !== scene) {
+  if (!state.sceneView || state.sceneView.kind !== "scene_2d" || state.sceneView.scene !== scene) {
     state.sceneView = createSceneView(scene);
     sceneEl.replaceChildren(state.sceneView.shell);
   }
 
   const view = state.sceneView;
-  if (!view) {
+  if (!view || view.kind !== "scene_2d") {
     return;
   }
   view.meta.textContent = `${scene.x_label} · ${scene.y_label}`;
@@ -5870,10 +6061,22 @@ function visualizationSubtitle(visualization: ArtifactVisualization): string {
   return `${visualization.x_label} · ${visualization.y_label}`;
 }
 
+function isPaths3DVisualization(visualization: ArtifactVisualization): visualization is Paths3DVisualization {
+  return visualization.kind === "paths_3d";
+}
+
+function primarySceneVisualization(artifact: SolveArtifact | null): Paths3DVisualization | null {
+  return artifact?.visualizations.find(isPaths3DVisualization) ?? null;
+}
+
 function artifactChartPanels(artifact: SolveArtifact | null): ChartPanel[] {
   if (!artifact) {
     return [];
   }
+  const sceneVisualization = primarySceneVisualization(artifact);
+  const secondaryVisualizations = artifact.visualizations.filter(
+    (visualization) => visualization !== sceneVisualization,
+  );
   return [
     ...artifact.charts.map((chart, index): ChartPanel => ({
       kind: "chart",
@@ -5882,7 +6085,7 @@ function artifactChartPanels(artifact: SolveArtifact | null): ChartPanel[] {
       subtitle: chart.y_label,
       chart,
     })),
-    ...artifact.visualizations.map((visualization, index): ChartPanel => ({
+    ...secondaryVisualizations.map((visualization, index): ChartPanel => ({
       kind: "visualization",
       key: `visualization:${index}:${visualization.kind}:${visualization.title}`,
       title: visualization.title,
@@ -5945,7 +6148,7 @@ function updateChart(view: ChartView | undefined, chart: Chart): void {
     const paletteIndex = colorIndexFor(group);
     const role = series.role ?? TIME_SERIES_ROLE.data;
     const isBound = role === TIME_SERIES_ROLE.lowerBound || role === TIME_SERIES_ROLE.upperBound;
-    const color = isBound ? "#f25f5c" : PALETTE[paletteIndex % PALETTE.length];
+    const color = PALETTE[paletteIndex % PALETTE.length];
     const dash = role === TIME_SERIES_ROLE.lowerBound
       ? "dash"
       : role === TIME_SERIES_ROLE.upperBound
@@ -6158,28 +6361,184 @@ function updateContourVisualization(
   window.Plotly.react(view.plotEl, data, layout, config);
 }
 
+interface Paths3DTraceStyle {
+  label: string;
+  group: string;
+  color: string;
+  width: number;
+  opacity: number;
+  mode: string;
+  markerSize: number;
+}
+
+const DEFAULT_PATHS_3D_CAMERA: PlotlyObject = {
+  up: { x: 0, y: 0, z: 1 },
+  eye: { x: 1.65, y: -1.45, z: 0.95 },
+};
+
+function isPlotlyObject(value: PlotlyValue | undefined): value is PlotlyObject {
+  return value != null && typeof value === "object" && !Array.isArray(value);
+}
+
+function bindPaths3DInteraction(view: PlotlyView): void {
+  if (view.sceneInteractionBound) {
+    return;
+  }
+  view.plotEl.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+  });
+  if (typeof view.plotEl.on === "function") {
+    view.plotEl.on("plotly_relayout", (eventData) => {
+      const camera = eventData["scene.camera"];
+      if (isPlotlyObject(camera)) {
+        view.sceneCamera = camera;
+      }
+    });
+  }
+  view.sceneInteractionBound = true;
+}
+
+function paths3DTraceStyle(path: ScenePath3D, index: number): Paths3DTraceStyle {
+  const name = path.name.toLowerCase();
+  if (name === "trajectory") {
+    return {
+      label: "Trajectory",
+      group: "trajectory",
+      color: "#5bd1b5",
+      width: 7,
+      opacity: 1,
+      mode: "lines",
+      markerSize: 0,
+    };
+  }
+  if (name.startsWith("lift")) {
+    return {
+      label: "Lift vectors",
+      group: "lift",
+      color: "#b8f2e6",
+      width: 5,
+      opacity: 0.82,
+      mode: "lines+markers",
+      markerSize: 3,
+    };
+  }
+  if (name.startsWith("drag")) {
+    return {
+      label: "Drag vectors",
+      group: "drag",
+      color: "#f25f5c",
+      width: 4,
+      opacity: 0.82,
+      mode: "lines+markers",
+      markerSize: 3,
+    };
+  }
+  if (name.startsWith("aero accel")) {
+    return {
+      label: "Aero acceleration",
+      group: "aero",
+      color: "#f7b267",
+      width: 4,
+      opacity: 0.78,
+      mode: "lines+markers",
+      markerSize: 3,
+    };
+  }
+  if (name.startsWith("wind shear")) {
+    return {
+      label: "Wind shear",
+      group: "wind-shear",
+      color: "#7cc6fe",
+      width: 5,
+      opacity: 0.52,
+      mode: "lines",
+      markerSize: 0,
+    };
+  }
+  if (name.startsWith("wind")) {
+    return {
+      label: "Wind vectors",
+      group: "wind",
+      color: "#7cc6fe",
+      width: 4,
+      opacity: 0.74,
+      mode: "lines+markers",
+      markerSize: 3,
+    };
+  }
+  if (name.startsWith("air axis")) {
+    return {
+      label: "Air-relative axis",
+      group: "air-axis",
+      color: "#e5f1f4",
+      width: 3,
+      opacity: 0.58,
+      mode: "lines+markers",
+      markerSize: 2,
+    };
+  }
+  if (name.startsWith("zero-bank frame")) {
+    return {
+      label: "Zero-bank frame",
+      group: "zero-bank-frame",
+      color: "#d7aefb",
+      width: 3,
+      opacity: 0.62,
+      mode: "lines+markers",
+      markerSize: 2,
+    };
+  }
+  if (name.startsWith("side frame")) {
+    return {
+      label: "Bank side frame",
+      group: "side-frame",
+      color: "#b8f2e6",
+      width: 3,
+      opacity: 0.62,
+      mode: "lines+markers",
+      markerSize: 2,
+    };
+  }
+  return {
+    label: path.name,
+    group: path.name,
+    color: PALETTE[index % PALETTE.length],
+    width: 3,
+    opacity: 0.48,
+    mode: "lines",
+    markerSize: 0,
+  };
+}
+
 function updatePaths3DVisualization(
-  view: ChartView | undefined,
+  view: PlotlyView | undefined,
   visualization: Paths3DVisualization,
 ): void {
   if (!window.Plotly || !view) {
     return;
   }
-  const lastIndex = visualization.paths.length - 1;
+  const visibleLegendGroups = new Set<string>();
   const data: PlotlyTrace[] = visualization.paths.map((path, index) => {
-    const isLatest = index === lastIndex;
+    const style = paths3DTraceStyle(path, index);
+    const showlegend = !visibleLegendGroups.has(style.group);
+    visibleLegendGroups.add(style.group);
     return {
       type: "scatter3d",
-      mode: "lines",
-      name: path.name,
+      mode: style.mode,
+      name: style.label,
+      legendgroup: style.group,
       x: path.x,
       y: path.y,
       z: path.z,
-      showlegend: visualization.paths.length <= 8 || index === 0 || isLatest,
-      opacity: isLatest ? 1 : 0.48,
+      showlegend,
+      opacity: style.opacity,
       line: {
-        color: isLatest ? "#5bd1b5" : PALETTE[index % PALETTE.length],
-        width: isLatest ? 7 : 3,
+        color: style.color,
+        width: style.width,
+      },
+      marker: {
+        color: style.color,
+        size: style.markerSize,
       },
       hovertemplate:
         `${visualization.x_label}: %{x:.3f}<br>${visualization.y_label}: %{y:.3f}<br>` +
@@ -6202,6 +6561,7 @@ function updatePaths3DVisualization(
       x: 0.01,
       font: { color: "#94b6bd", size: 11 },
     },
+    dragmode: "pan",
     scene: {
       domain: { x: [0, 1], y: [0, 1] },
       bgcolor: "rgba(4, 15, 22, 0.92)",
@@ -6225,10 +6585,7 @@ function updatePaths3DVisualization(
         zerolinecolor: "rgba(229, 241, 244, 0.18)",
         titlefont: { color: "#94b6bd" },
       },
-      camera: {
-        up: { x: 0, y: 0, z: 1 },
-        eye: { x: 1.65, y: -1.45, z: 0.95 },
-      },
+      camera: view.sceneCamera ?? DEFAULT_PATHS_3D_CAMERA,
     },
   };
   const config: PlotlyConfig = {
@@ -6238,7 +6595,9 @@ function updatePaths3DVisualization(
     scrollZoom: false,
     modeBarButtonsToRemove: ["toImage"],
   };
-  window.Plotly.react(view.plotEl, data, layout, config);
+  window.Plotly.react(view.plotEl, data, layout, config).then(() => {
+    bindPaths3DInteraction(view);
+  });
 }
 
 function updateVisualization(

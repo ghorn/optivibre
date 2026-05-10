@@ -162,6 +162,22 @@ fn glider_derivative_check_api_smoke() {
 }
 
 #[test]
+fn albatross_default_fixed_derivative_check_api_smoke() {
+    run_with_large_stack("albatross-derivative-check-smoke", || {
+        let check = validate_problem_derivatives(
+            ProblemId::AlbatrossDynamicSoaring,
+            &request_for(TranscriptionMethod::MultipleShooting, None),
+        )
+        .expect("albatross derivative check should compile and validate");
+        assert!(
+            check.first_order_is_within_tolerances(FIRST_ORDER_TOLERANCES),
+            "albatross first-order derivative check failed\n{}",
+            format_check(&check),
+        );
+    });
+}
+
+#[test]
 #[ignore = "manual full derivative sweep over all OCP problems and both transcriptions"]
 fn all_ocp_problems_first_order_derivatives_stay_clean() {
     require_release_mode_for_manual_derivative_sweeps();

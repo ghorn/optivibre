@@ -36,6 +36,7 @@ const TEXT_JAVASCRIPT_UTF8: &str = "text/javascript; charset=utf-8";
 const TEXT_CSS_UTF8: &str = "text/css; charset=utf-8";
 const APPLICATION_NDJSON_UTF8: &str = "application/x-ndjson; charset=utf-8";
 const GENERATED_APP_JS: &str = include_str!(concat!(env!("OUT_DIR"), "/app.js"));
+const SOLVE_WORKER_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 type ApiError = (StatusCode, Json<ErrorResponse>);
 type ApiResult<T> = Result<T, ApiError>;
@@ -153,6 +154,7 @@ struct WebappCli {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    ensure_native_spral_runtime_env();
     let cli = WebappCli::parse();
     let port = cli.port;
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
@@ -171,6 +173,16 @@ async fn main() -> Result<()> {
 
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn ensure_native_spral_runtime_env() {
+    if std::env::var_os("OMP_CANCELLATION").is_none() {
+        // SPRAL's OpenMP cancellation check happens inside the native solver.
+        // Set the repo's usual default before any problem actor can initialize it.
+        unsafe {
+            std::env::set_var("OMP_CANCELLATION", "true");
+        }
+    }
 }
 
 fn static_text_response(content_type: &'static str, body: &'static str) -> impl IntoResponse {
@@ -336,7 +348,11 @@ impl ProblemActor {
         ));
         let worker_shared = shared.clone();
         let worker_descriptor = descriptor.clone();
-        thread::spawn(move || actor_worker_loop(problem, worker_descriptor, worker_shared));
+        thread::Builder::new()
+            .name(format!("problem-worker-{}", problem.as_str()))
+            .stack_size(SOLVE_WORKER_STACK_SIZE)
+            .spawn(move || actor_worker_loop(problem, worker_descriptor, worker_shared))
+            .expect("failed to spawn problem actor worker");
         Arc::new(Self { descriptor, shared })
     }
 

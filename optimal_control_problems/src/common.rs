@@ -65,6 +65,7 @@ pub enum ControlEditor {
     Slider,
     Select,
     Text,
+    Checkbox,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -185,6 +186,7 @@ pub struct LatexSection {
 #[serde(rename_all = "snake_case")]
 pub enum ProblemId {
     OptimalDistanceGlider,
+    AlbatrossDynamicSoaring,
     LinearSManeuver,
     SailboatUpwind,
     CraneTransfer,
@@ -196,6 +198,7 @@ impl ProblemId {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OptimalDistanceGlider => "optimal_distance_glider",
+            Self::AlbatrossDynamicSoaring => "albatross_dynamic_soaring",
             Self::LinearSManeuver => "linear_s_maneuver",
             Self::SailboatUpwind => "sailboat_upwind",
             Self::CraneTransfer => "crane_transfer",
@@ -211,6 +214,7 @@ impl std::str::FromStr for ProblemId {
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         match value {
             "optimal_distance_glider" => Ok(Self::OptimalDistanceGlider),
+            "albatross_dynamic_soaring" => Ok(Self::AlbatrossDynamicSoaring),
             "linear_s_maneuver" => Ok(Self::LinearSManeuver),
             "sailboat_upwind" => Ok(Self::SailboatUpwind),
             "crane_transfer" => Ok(Self::CraneTransfer),

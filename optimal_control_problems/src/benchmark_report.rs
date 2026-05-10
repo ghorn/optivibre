@@ -152,6 +152,7 @@ impl Default for OcpBenchmarkSuiteConfig {
         Self {
             problems: vec![
                 ProblemId::OptimalDistanceGlider,
+                ProblemId::AlbatrossDynamicSoaring,
                 ProblemId::LinearSManeuver,
                 ProblemId::SailboatUpwind,
                 ProblemId::CraneTransfer,
@@ -1795,6 +1796,7 @@ fn transcription_id(method: TranscriptionMethod) -> &'static str {
 const fn problem_label(problem_id: ProblemId) -> &'static str {
     match problem_id {
         ProblemId::OptimalDistanceGlider => "Optimal Distance Glider",
+        ProblemId::AlbatrossDynamicSoaring => "Albatross Dynamic Soaring",
         ProblemId::LinearSManeuver => "Linear Point-to-Point S Maneuver",
         ProblemId::SailboatUpwind => "Sailboat Upwind",
         ProblemId::CraneTransfer => "Crane Transfer",
