@@ -59,6 +59,8 @@ enum CliProblemSetSelection {
 enum CliTestSetSelection {
     Core,
     BurkardtTestNonlin,
+    #[value(name = "schittkowski-306", alias = "schittkowski_306")]
+    Schittkowski306,
     All,
 }
 
@@ -219,6 +221,7 @@ impl CliTestSetSelection {
         match self {
             Self::Core => Some(ProblemTestSet::Core),
             Self::BurkardtTestNonlin => Some(ProblemTestSet::BurkardtTestNonlin),
+            Self::Schittkowski306 => Some(ProblemTestSet::Schittkowski306),
             Self::All => None,
         }
     }

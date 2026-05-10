@@ -297,6 +297,27 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
       border-width: 2px;
       box-shadow: inset 0 1px 0 rgba(226, 232, 240, 0.08);
     }}
+    .family-matrix .suite-row td {{
+      background: rgba(30, 41, 59, 0.62);
+      border-top: 2px solid rgba(148, 163, 184, 0.26);
+      font-weight: 700;
+    }}
+    .family-matrix .suite-row td:first-child {{
+      color: #bfdbfe;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }}
+    .family-matrix .suite-row .matrix-cell {{
+      background: rgba(15, 23, 42, 0.76);
+    }}
+    .family-matrix .family-row td:first-child {{
+      padding-left: 26px;
+      color: #cbd5e1;
+    }}
+    .family-matrix .family-row td:first-child::before {{
+      content: "- ";
+      color: var(--muted);
+    }}
     .matrix-cell {{
       border-radius: 12px;
       border: 1px solid var(--border-soft);
@@ -478,7 +499,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
 
     <div class="card">
       <h2>Family Summary</h2>
-      <div class="subtitle" style="margin-top:0; margin-bottom:10px">One row per family, one column per solver. Cells are color-coded by aggregate result.</div>
+      <div class="subtitle" style="margin-top:0; margin-bottom:10px">Suites are grouped above their families. One column per solver, with cells color-coded by aggregate result.</div>
       <div id="family-summary"></div>
     </div>
 
@@ -960,9 +981,9 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
     }}
 
     function renderFamilySummary(records) {{
-      const families = unique(records.map((record) => record.descriptor.family));
+      const suites = unique(records.map((record) => record.descriptor.test_set));
       const solvers = unique(records.map((record) => record.solver), solverOrder);
-      if (!families.length) {{
+      if (!suites.length) {{
         byId('family-summary').innerHTML = '<div class="empty-state">No runs match the current filters.</div>';
         return;
       }}
@@ -971,7 +992,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
           <table class="family-matrix">
             <thead>
               <tr>
-                <th>Family</th>
+                <th>Suite / Family</th>
                 ${{solvers.map((solver) => `<th class="solver-${{solver}}">${{solverLabel(solver)}}</th>`).join('')}}
                 <th>Total</th>
               </tr>
@@ -982,14 +1003,25 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
                 ${{solvers.map((solver) => familyMatrixCell(records.filter((record) => record.solver === solver))).join('')}}
                 <td>${{formatDuration(records.reduce((sum, record) => sum + record.timing.total_wall_time, 0))}}</td>
               </tr>
-              ${{families.map((family) => {{
-                const familyRecords = records.filter((record) => record.descriptor.family === family);
-                const totalTime = familyRecords.reduce((sum, record) => sum + record.timing.total_wall_time, 0);
-                return `<tr>
-                  <td class="mono">${{htmlEscape(family)}}</td>
-                  ${{solvers.map((solver) => familyMatrixCell(familyRecords.filter((record) => record.solver === solver))).join('')}}
-                  <td>${{formatDuration(totalTime)}}</td>
+              ${{suites.map((suite) => {{
+                const suiteRecords = records.filter((record) => record.descriptor.test_set === suite);
+                const suiteFamilies = unique(suiteRecords.map((record) => record.descriptor.family));
+                const suiteTime = suiteRecords.reduce((sum, record) => sum + record.timing.total_wall_time, 0);
+                const suiteRow = `<tr class="suite-row">
+                  <td class="mono">${{htmlEscape(suite)}}</td>
+                  ${{solvers.map((solver) => familyMatrixCell(suiteRecords.filter((record) => record.solver === solver))).join('')}}
+                  <td>${{formatDuration(suiteTime)}}</td>
                 </tr>`;
+                const familyRows = suiteFamilies.map((family) => {{
+                  const familyRecords = suiteRecords.filter((record) => record.descriptor.family === family);
+                  const totalTime = familyRecords.reduce((sum, record) => sum + record.timing.total_wall_time, 0);
+                  return `<tr class="family-row">
+                    <td class="mono">${{htmlEscape(family)}}</td>
+                    ${{solvers.map((solver) => familyMatrixCell(familyRecords.filter((record) => record.solver === solver))).join('')}}
+                    <td>${{formatDuration(totalTime)}}</td>
+                  </tr>`;
+                }}).join('');
+                return suiteRow + familyRows;
               }}).join('')}}
             </tbody>
           </table>

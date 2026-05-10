@@ -8,6 +8,7 @@ mod hs035;
 mod hs071;
 mod parameterized_quadratic;
 mod powell_singular;
+mod schittkowski_306;
 mod trigonometric;
 mod wood;
 
@@ -103,6 +104,7 @@ impl CaseMetadata {
 pub(crate) fn all_cases() -> Vec<ProblemCase> {
     let mut cases = Vec::new();
     cases.extend(burkardt_test_nonlin::cases());
+    cases.extend(schittkowski_306::cases());
     cases.extend(generalized_rosenbrock::cases());
     cases.push(disk_rosenbrock::case());
     cases.push(powell_singular::case());

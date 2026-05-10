@@ -323,10 +323,10 @@ fn summary_html_table(results: &RunResults) -> String {
 }
 
 fn family_summary(results: &RunResults) -> String {
-    let (columns, rows_data) = family_summary_matrix(results);
+    let (columns, rows_data) = family_summary_hierarchy(results);
     let mut rows = Vec::with_capacity(rows_data.len());
-    for (family, by_column) in rows_data {
-        let mut row = vec![family];
+    for (label, _is_suite, by_column) in rows_data {
+        let mut row = vec![label];
         let mut total = Duration::ZERO;
         for column in &columns {
             if let Some((cases, passed, reduced, total_time)) = by_column.get(column) {
@@ -352,7 +352,7 @@ fn family_summary(results: &RunResults) -> String {
         rows.push(row);
     }
     let mut out = String::from("## Family Summary\n\n");
-    let mut headers = vec!["Family".to_string()];
+    let mut headers = vec!["Suite / Family".to_string()];
     headers.extend(columns.iter().cloned());
     headers.push("Total".to_string());
     let mut align = vec![Align::Left];
@@ -364,17 +364,27 @@ fn family_summary(results: &RunResults) -> String {
 }
 
 fn family_summary_html(results: &RunResults) -> String {
-    let (columns, rows_data) = family_summary_matrix(results);
+    let (columns, rows_data) = family_summary_hierarchy(results);
     let mut out = String::from(
-        "<div class=\"tp-table-wrap\"><table class=\"tp-table tp-table-compact\">\n<thead><tr><th>Family</th>",
+        "<div class=\"tp-table-wrap\"><table class=\"tp-table tp-table-compact\">\n<thead><tr><th>Suite / Family</th>",
     );
     for column in &columns {
         let _ = write!(out, "<th>{}</th>", html_escape(column));
     }
     out.push_str("<th>Total</th></tr></thead>\n<tbody>\n");
-    for (family, by_column) in rows_data {
+    for (label, is_suite, by_column) in rows_data {
+        let row_class = if is_suite {
+            "tp-suite-row"
+        } else {
+            "tp-family-row"
+        };
+        let display_label = label.trim_start_matches("  - ");
         let mut family_total = Duration::ZERO;
-        let _ = write!(out, "<tr><td>{}</td>", html_escape(&family));
+        let _ = write!(
+            out,
+            "<tr class=\"{row_class}\"><td>{}</td>",
+            html_escape(display_label)
+        );
         for column in &columns {
             if let Some((cases, passed, reduced, total_time)) = by_column.get(column) {
                 family_total += *total_time;
@@ -519,9 +529,40 @@ fn test_set_summary_html(results: &RunResults) -> String {
 type FamilySummaryCell = (usize, usize, usize, Duration);
 type FamilySummaryRow = BTreeMap<String, FamilySummaryCell>;
 type FamilySummaryRows = BTreeMap<String, FamilySummaryRow>;
+type HierarchicalFamilySummaryRows = Vec<(String, bool, FamilySummaryRow)>;
 
-fn family_summary_matrix(results: &RunResults) -> (Vec<String>, FamilySummaryRows) {
-    summary_matrix_by(results, |record| record.descriptor.family.clone())
+fn family_summary_hierarchy(results: &RunResults) -> (Vec<String>, HierarchicalFamilySummaryRows) {
+    let (columns, suite_rows) = summary_matrix_by(results, |record| {
+        record.descriptor.test_set.label().to_string()
+    });
+    let (_, family_rows) = summary_matrix_by(results, |record| {
+        format!(
+            "{}\t{}",
+            record.descriptor.test_set.label(),
+            record.descriptor.family
+        )
+    });
+
+    let mut families_by_suite = BTreeMap::<String, Vec<(String, FamilySummaryRow)>>::new();
+    for (key, row) in family_rows {
+        if let Some((suite, family)) = key.split_once('\t') {
+            families_by_suite
+                .entry(suite.to_string())
+                .or_default()
+                .push((family.to_string(), row));
+        }
+    }
+
+    let mut rows = Vec::new();
+    for (suite, suite_row) in suite_rows {
+        rows.push((suite.clone(), true, suite_row));
+        if let Some(families) = families_by_suite.remove(&suite) {
+            for (family, family_row) in families {
+                rows.push((format!("  - {family}"), false, family_row));
+            }
+        }
+    }
+    (columns, rows)
 }
 
 fn summary_matrix_by(
@@ -971,6 +1012,10 @@ code { font-family: ui-monospace, SFMono-Regular, monospace; }
 .tp-skip { background: #e5e7eb; color: #374151; }
 .tp-neutral { background: #e2e8f0; color: #334155; }
 .tp-family-cell { min-width: 110px; }
+.tp-suite-row td { background: #172033; border-top: 2px solid #475569; font-weight: 700; }
+.tp-suite-row td:first-child { color: #bfdbfe; text-transform: uppercase; letter-spacing: 0.03em; }
+.tp-family-row td:first-child { padding-left: 24px; color: #cbd5e1; }
+.tp-family-row td:first-child::before { content: "- "; color: #94a3b8; }
 .tp-family-meta { margin-top: 4px; font-size: 11px; color: #cbd5e1; }
 .tp-family-ok { background: #102417; }
 .tp-family-warn { background: #2b2212; }

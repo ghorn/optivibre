@@ -20,6 +20,7 @@ pub enum ProblemSpeed {
 pub enum ProblemTestSet {
     Core,
     BurkardtTestNonlin,
+    Schittkowski306,
 }
 
 impl ProblemTestSet {
@@ -27,6 +28,7 @@ impl ProblemTestSet {
         match self {
             Self::Core => "core",
             Self::BurkardtTestNonlin => "burkardt_test_nonlin",
+            Self::Schittkowski306 => "schittkowski_306",
         }
     }
 }
@@ -164,6 +166,24 @@ pub const fn slow_burkardt_manifest_entry(
         max_iters,
         speed: ProblemSpeed::Slow,
         test_set: ProblemTestSet::BurkardtTestNonlin,
+    }
+}
+
+pub const fn schittkowski_manifest_entry(
+    id: &'static str,
+    sqp: KnownStatus,
+    nlip: KnownStatus,
+    ipopt: KnownStatus,
+    max_iters: IterationLimits,
+) -> ProblemManifestEntry {
+    ProblemManifestEntry {
+        id,
+        sqp,
+        nlip,
+        ipopt,
+        max_iters,
+        speed: ProblemSpeed::Fast,
+        test_set: ProblemTestSet::Schittkowski306,
     }
 }
 
@@ -862,6 +882,76 @@ const MANIFEST: &[ProblemManifestEntry] = &[
     slow_burkardt_manifest_entry(
         "burkardt_p23_chandrasekhar_n20",
         KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    schittkowski_manifest_entry(
+        "schittkowski_tp001",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    schittkowski_manifest_entry(
+        "schittkowski_tp002",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    schittkowski_manifest_entry(
+        "schittkowski_tp003",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    schittkowski_manifest_entry(
+        "schittkowski_tp004",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    schittkowski_manifest_entry(
+        "schittkowski_tp005",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    schittkowski_manifest_entry(
+        "schittkowski_tp006",
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    schittkowski_manifest_entry(
+        "schittkowski_tp007",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    schittkowski_manifest_entry(
+        "schittkowski_tp008",
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    schittkowski_manifest_entry(
+        "schittkowski_tp009",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    schittkowski_manifest_entry(
+        "schittkowski_tp010",
+        KnownStatus::KnownFailing,
         KnownStatus::KnownPassing,
         KnownStatus::KnownFailing,
         IterationLimits::with_default(500),
