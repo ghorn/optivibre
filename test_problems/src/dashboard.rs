@@ -365,6 +365,9 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
       background: rgba(15, 23, 42, 0.92);
       border: 1px solid rgba(148, 163, 184, 0.18);
     }}
+    .matrix-segment {{
+      cursor: help;
+    }}
     .matrix-segment.pass {{ background: var(--pass); }}
     .matrix-segment.reduced {{ background: var(--reduced); }}
     .matrix-segment.panic {{ background: #dc2626; }}
@@ -645,6 +648,16 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
       solve_error: "Solver returned an unclassified solve error.",
       skip: "Skipped by the manifest.",
     }})[segment] || segment.replaceAll("_", " ");
+
+    const segmentTooltip = (segment, count, total, label) => {{
+      const pct = total ? (count / total * 100).toFixed(0) : '0';
+      return `${{label}}: ${{count}} of ${{total}} (${{pct}}%)\\n${{segmentDescription(segment)}}`;
+    }};
+
+    const tooltipAttrs = (text) => {{
+      const escaped = htmlEscape(text);
+      return `data-tip="${{escaped}}" aria-label="${{escaped}}"`;
+    }};
 
     const segmentOrder = [
       "pass",
@@ -1005,14 +1018,10 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
         .filter(([, count]) => count > 0);
       const countParts = segments
         .map(([segment, count, label]) => {{
-          const title = `${{label}}: ${{count}}\\n${{segmentDescription(segment)}}`;
-          return `<span class="matrix-count ${{segment}}" title="${{htmlEscape(title)}}">${{htmlEscape(label)}} ${{count}}</span>`;
+          return `<span class="matrix-count ${{segment}}" ${{tooltipAttrs(segmentTooltip(segment, count, total, label))}}>${{htmlEscape(label)}} ${{count}}</span>`;
         }})
         .join(' · ');
-      const title = segments
-        .map(([segment, count, label]) => `${{label}}: ${{count}} - ${{segmentDescription(segment)}}`)
-        .join('\\n');
-      return `<td><div class="matrix-cell ${{cellClass}}" title="${{htmlEscape(title)}}"><div class="matrix-bars">${{segments.map(([kind, count, label]) => `<div class="matrix-segment ${{kind}}" title="${{htmlEscape(`${{label}}: ${{count}}\\n${{segmentDescription(kind)}}`)}}" style="width:${{(count / total * 100).toFixed(3)}}%"></div>`).join('')}}</div><div class="matrix-main">${{rate}}% accepted</div><div class="matrix-counts">${{countParts || '<span class="matrix-sub">none</span>'}}</div><div class="matrix-sub">${{formatDuration(totalTime)}}</div></div></td>`;
+      return `<td><div class="matrix-cell ${{cellClass}}"><div class="matrix-bars">${{segments.map(([kind, count, label]) => `<div class="matrix-segment ${{kind}}" ${{tooltipAttrs(segmentTooltip(kind, count, total, label))}} style="width:${{(count / total * 100).toFixed(3)}}%"></div>`).join('')}}</div><div class="matrix-main">${{rate}}% accepted</div><div class="matrix-counts">${{countParts || '<span class="matrix-sub">none</span>'}}</div><div class="matrix-sub">${{formatDuration(totalTime)}}</div></div></td>`;
     }}
 
     function renderAllRuns(records) {{
