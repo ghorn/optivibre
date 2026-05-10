@@ -19,7 +19,7 @@ use optimal_control::runtime::{
     DirectCollocation, MultipleShooting, direct_collocation_root_arcs,
     direct_collocation_state_like_arcs,
 };
-use optimal_control::{Bounds1D, InterpolatedTrajectory, IntervalArc, Ocp};
+use optimal_control::{Bounds1D, FinalTime, InterpolatedTrajectory, IntervalArc, Ocp};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use sx_core::SX;
@@ -770,6 +770,7 @@ fn continuous_guess(
             .iter()
             .map(|force_rate| Control { force: *force_rate })
             .collect(),
+        global: FinalTime { tf: params.tf_s },
         tf: params.tf_s,
     })
 }

@@ -1,5 +1,5 @@
 use approx::assert_abs_diff_eq;
-use optimal_control::{Bounds1D, Ocp};
+use optimal_control::{Bounds1D, FinalTime, Ocp};
 use optimization::{ClarabelSqpOptions, Vectorize};
 use sx_core::SX;
 
@@ -111,9 +111,11 @@ fn runtime_multiple_shooting_compiles_solves_and_projects() {
         beq: State { x: 1.0 },
         bineq_bounds: (),
         path_bounds: (),
-        tf_bounds: Bounds1D {
-            lower: Some(1.0),
-            upper: Some(1.0),
+        global_bounds: FinalTime {
+            tf: Bounds1D {
+                lower: Some(1.0),
+                upper: Some(1.0),
+            },
         },
         initial_guess: optimal_control::runtime::MultipleShootingInitialGuess::Constant {
             x: State { x: 1.0 },
@@ -156,9 +158,11 @@ fn runtime_direct_collocation_compiles_solves_and_projects() {
         beq: State { x: 1.0 },
         bineq_bounds: (),
         path_bounds: (),
-        tf_bounds: Bounds1D {
-            lower: Some(1.0),
-            upper: Some(1.0),
+        global_bounds: FinalTime {
+            tf: Bounds1D {
+                lower: Some(1.0),
+                upper: Some(1.0),
+            },
         },
         initial_guess: optimal_control::runtime::DirectCollocationInitialGuess::Constant {
             x: State { x: 1.0 },

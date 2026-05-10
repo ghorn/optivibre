@@ -9,7 +9,7 @@ use optimal_control::runtime::{
     DirectCollocation, DirectCollocationInitialGuess, MultipleShooting,
     MultipleShootingInitialGuess,
 };
-use optimal_control::{Bounds1D, CollocationFamily, Ocp};
+use optimal_control::{Bounds1D, CollocationFamily, FinalTime, Ocp};
 use optimization::{ClarabelSqpOptions, Vectorize};
 use sx_core::SX;
 
@@ -234,6 +234,7 @@ fn ms_interpolated_guess<const N: usize>()
             .iter()
             .map(|sample| sample.2.clone())
             .collect(),
+        global: FinalTime { tf: TF },
         tf: TF,
     }
 }
@@ -303,6 +304,7 @@ fn dc_explicit_guess<const N: usize, const K: usize>()
                 })
                 .collect(),
         },
+        global: FinalTime { tf: TF },
         tf: TF,
     }
 }
@@ -428,9 +430,11 @@ fn multiple_shooting_tracks_finite_horizon_lqr_reference_and_emits_structured_ca
         beq: beq.clone(),
         bineq_bounds: (),
         path_bounds: (),
-        tf_bounds: Bounds1D {
-            lower: Some(TF),
-            upper: Some(TF),
+        global_bounds: FinalTime {
+            tf: Bounds1D {
+                lower: Some(TF),
+                upper: Some(TF),
+            },
         },
         initial_guess: MultipleShootingInitialGuess::Interpolated(ms_interpolated_guess::<N>()),
         scaling: None,
@@ -470,9 +474,11 @@ fn direct_collocation_tracks_finite_horizon_lqr_reference() {
         ),
         bineq_bounds: (),
         path_bounds: (),
-        tf_bounds: Bounds1D {
-            lower: Some(TF),
-            upper: Some(TF),
+        global_bounds: FinalTime {
+            tf: Bounds1D {
+                lower: Some(TF),
+                upper: Some(TF),
+            },
         },
         initial_guess: DirectCollocationInitialGuess::Explicit(dc_explicit_guess::<N, K>()),
         scaling: None,
@@ -513,9 +519,11 @@ fn rollout_initial_guess_from_steady_state_lqr_gain_converges() {
         ),
         bineq_bounds: (),
         path_bounds: (),
-        tf_bounds: Bounds1D {
-            lower: Some(TF),
-            upper: Some(TF),
+        global_bounds: FinalTime {
+            tf: Bounds1D {
+                lower: Some(TF),
+                upper: Some(TF),
+            },
         },
         initial_guess: MultipleShootingInitialGuess::Rollout {
             x0: State {

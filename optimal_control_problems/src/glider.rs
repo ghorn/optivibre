@@ -19,7 +19,7 @@ use optimal_control::runtime::{
     DirectCollocation, MultipleShooting, direct_collocation_root_arcs,
     direct_collocation_state_like_arcs,
 };
-use optimal_control::{Bounds1D, InterpolatedTrajectory, IntervalArc, Ocp, OcpScaling};
+use optimal_control::{Bounds1D, FinalTime, InterpolatedTrajectory, IntervalArc, Ocp, OcpScaling};
 use serde::Serialize;
 use std::f64::consts::PI;
 use sx_core::SX;
@@ -891,6 +891,7 @@ fn continuous_guess(
             .iter()
             .map(|alpha| Control { alpha: *alpha })
             .collect(),
+        global: FinalTime { tf },
         tf,
     })
 }
@@ -949,7 +950,9 @@ fn glider_scaling(params: &Params) -> OcpScaling<ModelParams<f64>, State<f64>, C
         control_rate: Control {
             alpha: deg_to_rad(GLIDER_ALPHA_RATE_SCALE_DEG_S),
         },
-        final_time: GLIDER_FINAL_TIME_SCALE_S,
+        global: FinalTime {
+            tf: GLIDER_FINAL_TIME_SCALE_S,
+        },
         parameters: ModelParams {
             alpha_rate_weight: 1.0,
         },
@@ -2048,7 +2051,7 @@ mod tests {
             epsilon = 1e-12
         );
         assert_abs_diff_eq!(
-            scaling.final_time,
+            scaling.global.tf,
             GLIDER_FINAL_TIME_SCALE_S,
             epsilon = 1e-12
         );

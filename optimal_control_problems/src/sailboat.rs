@@ -18,7 +18,7 @@ use optimal_control::runtime::{
     DirectCollocation, MultipleShooting, direct_collocation_root_arcs,
     direct_collocation_state_like_arcs,
 };
-use optimal_control::{Bounds1D, InterpolatedTrajectory, IntervalArc, Ocp};
+use optimal_control::{Bounds1D, FinalTime, InterpolatedTrajectory, IntervalArc, Ocp};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::f64::consts::PI;
@@ -965,6 +965,7 @@ fn continuous_guess(
         x_samples,
         u_samples,
         dudt_samples,
+        global: FinalTime { tf },
         tf,
     })
 }

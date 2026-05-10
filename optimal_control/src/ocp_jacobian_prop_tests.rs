@@ -16,7 +16,9 @@ use crate::runtime::{
     DirectCollocation, DirectCollocationInitialGuess, DirectCollocationRuntimeValues,
     MultipleShooting, MultipleShootingInitialGuess, MultipleShootingRuntimeValues,
 };
-use crate::{Bounds1D, CollocationFamily, Ocp, OcpCompileOptions, OcpSymbolicFunctionOptions};
+use crate::{
+    Bounds1D, CollocationFamily, FinalTime, Ocp, OcpCompileOptions, OcpSymbolicFunctionOptions,
+};
 
 use crate::jacobian_proptest::{
     CaseFeatures, CaseProfile, CoverageCounters, DenseMatrix, ExprAst, FunctionAst, GeneratedCase,
@@ -527,9 +529,11 @@ fn ms_runtime(
             c1: symmetric_bounds(limit),
             c2: symmetric_bounds(limit),
         },
-        tf_bounds: Bounds1D {
-            lower: Some(0.5),
-            upper: Some(1.5),
+        global_bounds: FinalTime {
+            tf: Bounds1D {
+                lower: Some(0.5),
+                upper: Some(1.5),
+            },
         },
         initial_guess: MultipleShootingInitialGuess::Constant {
             x,
@@ -570,9 +574,11 @@ fn dc_runtime(
             c1: symmetric_bounds(limit),
             c2: symmetric_bounds(limit),
         },
-        tf_bounds: Bounds1D {
-            lower: Some(0.5),
-            upper: Some(1.5),
+        global_bounds: FinalTime {
+            tf: Bounds1D {
+                lower: Some(0.5),
+                upper: Some(1.5),
+            },
         },
         initial_guess: DirectCollocationInitialGuess::Constant {
             x,

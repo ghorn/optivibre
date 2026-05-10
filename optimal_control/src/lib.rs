@@ -51,18 +51,42 @@ pub struct IntervalArc<T> {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct InterpolatedTrajectory<X, U> {
+pub struct InterpolatedTrajectory<X, U, G = FinalTime<f64>> {
     pub sample_times: Vec<f64>,
     pub x_samples: Vec<X>,
     pub u_samples: Vec<U>,
     pub dudt_samples: Vec<U>,
+    pub global: G,
     pub tf: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, optimization::Vectorize)]
+pub struct FinalTime<T> {
+    pub tf: T,
+}
+
+pub trait OcpGlobalDesign<T: optimization::ScalarLeaf>: Vectorize<T> + Clone {
+    fn final_time(&self) -> T;
+    fn from_final_time(tf: T) -> Self;
+}
+
+impl<T> OcpGlobalDesign<T> for FinalTime<T>
+where
+    T: Copy + optimization::ScalarLeaf,
+{
+    fn final_time(&self) -> T {
+        self.tf
+    }
+
+    fn from_final_time(tf: T) -> Self {
+        Self { tf }
+    }
 }
 
 pub type ControllerFn<X, U, P> = dyn Fn(f64, &X, &U, &P) -> U + Send + Sync;
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct OcpScaling<P, X, U> {
+pub struct OcpScaling<P, X, U, G = FinalTime<f64>> {
     /// User-facing OCP reference scales in the original problem units.
     ///
     /// The transcribed NLP is normalized internally with `q' = q / q_scale`.
@@ -70,7 +94,7 @@ pub struct OcpScaling<P, X, U> {
     pub state: X,
     pub control: U,
     pub control_rate: U,
-    pub final_time: f64,
+    pub global: G,
     pub parameters: P,
     pub path: Vec<f64>,
     pub boundary_equalities: Vec<f64>,
@@ -127,31 +151,31 @@ pub struct OcpConstraintViolationReport {
 }
 
 type ObjectiveLagrangeFn<X, U, P> = dyn Fn(&X, &U, &U, &P) -> SX + Send + Sync;
-type ObjectiveMayerFn<X, U, P> = dyn Fn(&X, &U, &X, &U, &P, &SX) -> SX + Send + Sync;
+type ObjectiveMayerFn<X, U, P, G> = dyn Fn(&X, &U, &X, &U, &P, &G) -> SX + Send + Sync;
 type OdeFn<X, U, P> = dyn Fn(&X, &U, &P) -> X + Send + Sync;
 type PathConstraintsFn<X, U, P, C> = dyn Fn(&X, &U, &U, &P) -> C + Send + Sync;
-type BoundaryFn<X, U, P, B> = dyn Fn(&X, &U, &X, &U, &P, &SX) -> B + Send + Sync;
+type BoundaryFn<X, U, P, G, B> = dyn Fn(&X, &U, &X, &U, &P, &G) -> B + Send + Sync;
 
-pub struct Ocp<X, U, P, C, Beq, Bineq, Scheme> {
+pub struct Ocp<X, U, P, C, Beq, Bineq, Scheme, G = FinalTime<SX>> {
     name: String,
     scheme: Scheme,
     objective_lagrange: Box<ObjectiveLagrangeFn<X, U, P>>,
-    objective_mayer: Box<ObjectiveMayerFn<X, U, P>>,
+    objective_mayer: Box<ObjectiveMayerFn<X, U, P, G>>,
     ode: Box<OdeFn<X, U, P>>,
     path_constraints: Box<PathConstraintsFn<X, U, P, C>>,
-    boundary_equalities: Box<BoundaryFn<X, U, P, Beq>>,
-    boundary_inequalities: Box<BoundaryFn<X, U, P, Bineq>>,
+    boundary_equalities: Box<BoundaryFn<X, U, P, G, Beq>>,
+    boundary_inequalities: Box<BoundaryFn<X, U, P, G, Bineq>>,
 }
 
-pub struct OcpBuilder<X, U, P, C, Beq, Bineq, Scheme> {
+pub struct OcpBuilder<X, U, P, C, Beq, Bineq, Scheme, G = FinalTime<SX>> {
     name: String,
     scheme: Scheme,
     objective_lagrange: Option<Box<ObjectiveLagrangeFn<X, U, P>>>,
-    objective_mayer: Option<Box<ObjectiveMayerFn<X, U, P>>>,
+    objective_mayer: Option<Box<ObjectiveMayerFn<X, U, P, G>>>,
     ode: Option<Box<OdeFn<X, U, P>>>,
     path_constraints: Option<Box<PathConstraintsFn<X, U, P, C>>>,
-    boundary_equalities: Option<Box<BoundaryFn<X, U, P, Beq>>>,
-    boundary_inequalities: Option<Box<BoundaryFn<X, U, P, Bineq>>>,
+    boundary_equalities: Option<Box<BoundaryFn<X, U, P, G, Beq>>>,
+    boundary_inequalities: Option<Box<BoundaryFn<X, U, P, G, Bineq>>>,
 }
 
 #[derive(Debug, Error)]
@@ -489,11 +513,11 @@ impl OcpHelperCompileStats {
     }
 }
 
-impl<X, U, P, C, Beq, Bineq, Scheme> Ocp<X, U, P, C, Beq, Bineq, Scheme> {
+impl<X, U, P, C, Beq, Bineq, Scheme, G> Ocp<X, U, P, C, Beq, Bineq, Scheme, G> {
     pub fn new(
         name: impl Into<String>,
         scheme: Scheme,
-    ) -> OcpBuilder<X, U, P, C, Beq, Bineq, Scheme> {
+    ) -> OcpBuilder<X, U, P, C, Beq, Bineq, Scheme, G> {
         OcpBuilder {
             name: name.into(),
             scheme,
@@ -507,7 +531,7 @@ impl<X, U, P, C, Beq, Bineq, Scheme> Ocp<X, U, P, C, Beq, Bineq, Scheme> {
     }
 }
 
-impl<X, U, P, C, Beq, Bineq, Scheme> OcpBuilder<X, U, P, C, Beq, Bineq, Scheme> {
+impl<X, U, P, C, Beq, Bineq, Scheme, G> OcpBuilder<X, U, P, C, Beq, Bineq, Scheme, G> {
     pub fn objective_lagrange<F>(mut self, f: F) -> Self
     where
         F: Fn(&X, &U, &U, &P) -> SX + Send + Sync + 'static,
@@ -519,6 +543,18 @@ impl<X, U, P, C, Beq, Bineq, Scheme> OcpBuilder<X, U, P, C, Beq, Bineq, Scheme> 
     pub fn objective_mayer<F>(mut self, f: F) -> Self
     where
         F: Fn(&X, &U, &X, &U, &P, &SX) -> SX + Send + Sync + 'static,
+        G: OcpGlobalDesign<SX>,
+    {
+        self.objective_mayer = Some(Box::new(move |x0, u0, xf, uf, p, global| {
+            let tf = global.final_time();
+            f(x0, u0, xf, uf, p, &tf)
+        }));
+        self
+    }
+
+    pub fn objective_mayer_global<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&X, &U, &X, &U, &P, &G) -> SX + Send + Sync + 'static,
     {
         self.objective_mayer = Some(Box::new(f));
         self
@@ -543,6 +579,18 @@ impl<X, U, P, C, Beq, Bineq, Scheme> OcpBuilder<X, U, P, C, Beq, Bineq, Scheme> 
     pub fn boundary_equalities<F>(mut self, f: F) -> Self
     where
         F: Fn(&X, &U, &X, &U, &P, &SX) -> Beq + Send + Sync + 'static,
+        G: OcpGlobalDesign<SX>,
+    {
+        self.boundary_equalities = Some(Box::new(move |x0, u0, xf, uf, p, global| {
+            let tf = global.final_time();
+            f(x0, u0, xf, uf, p, &tf)
+        }));
+        self
+    }
+
+    pub fn boundary_equalities_global<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&X, &U, &X, &U, &P, &G) -> Beq + Send + Sync + 'static,
     {
         self.boundary_equalities = Some(Box::new(f));
         self
@@ -551,12 +599,24 @@ impl<X, U, P, C, Beq, Bineq, Scheme> OcpBuilder<X, U, P, C, Beq, Bineq, Scheme> 
     pub fn boundary_inequalities<F>(mut self, f: F) -> Self
     where
         F: Fn(&X, &U, &X, &U, &P, &SX) -> Bineq + Send + Sync + 'static,
+        G: OcpGlobalDesign<SX>,
+    {
+        self.boundary_inequalities = Some(Box::new(move |x0, u0, xf, uf, p, global| {
+            let tf = global.final_time();
+            f(x0, u0, xf, uf, p, &tf)
+        }));
+        self
+    }
+
+    pub fn boundary_inequalities_global<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&X, &U, &X, &U, &P, &G) -> Bineq + Send + Sync + 'static,
     {
         self.boundary_inequalities = Some(Box::new(f));
         self
     }
 
-    pub fn build(self) -> Result<Ocp<X, U, P, C, Beq, Bineq, Scheme>, OcpBuildError> {
+    pub fn build(self) -> Result<Ocp<X, U, P, C, Beq, Bineq, Scheme, G>, OcpBuildError> {
         if self.name.trim().is_empty() {
             return Err(OcpBuildError::EmptyName);
         }
@@ -583,11 +643,12 @@ impl<X, U, P, C, Beq, Bineq, Scheme> OcpBuilder<X, U, P, C, Beq, Bineq, Scheme> 
     }
 }
 
-impl<X, U, P, C, Beq, Bineq, Scheme> Ocp<X, U, P, C, Beq, Bineq, Scheme>
+impl<X, U, P, C, Beq, Bineq, Scheme, G> Ocp<X, U, P, C, Beq, Bineq, Scheme, G>
 where
     X: Vectorize<SX, Rebind<SX> = X> + Clone,
     U: Vectorize<SX, Rebind<SX> = U> + Clone,
     P: Vectorize<SX, Rebind<SX> = P>,
+    G: OcpGlobalDesign<SX> + Vectorize<SX, Rebind<SX> = G>,
     C: Vectorize<SX, Rebind<SX> = C>,
     Beq: Vectorize<SX, Rebind<SX> = Beq>,
     Bineq: Vectorize<SX, Rebind<SX> = Bineq>,
@@ -683,8 +744,8 @@ where
             let xf = symbolic_value::<X>("xf")?;
             let uf = symbolic_value::<U>("uf")?;
             let p = symbolic_value::<P>("p")?;
-            let tf = SX::sym("tf");
-            let objective = (self.objective_mayer)(&x0, &u0, &xf, &uf, &p, &tf);
+            let g = symbolic_value::<G>("g")?;
+            let objective = (self.objective_mayer)(&x0, &u0, &xf, &uf, &p, &g);
             SXFunction::new(
                 format!("{}_objective_mayer", self.name),
                 vec![
@@ -693,7 +754,7 @@ where
                     NamedMatrix::new("xf", symbolic_column(&xf)?)?,
                     NamedMatrix::new("uf", symbolic_column(&uf)?)?,
                     NamedMatrix::new("p", symbolic_column(&p)?)?,
-                    NamedMatrix::new("tf", SXMatrix::dense_column(vec![tf])?)?,
+                    NamedMatrix::new("g", symbolic_column(&g)?)?,
                 ],
                 vec![NamedMatrix::new("objective", SXMatrix::scalar(objective))?],
             )
@@ -733,8 +794,8 @@ where
             let xf = symbolic_value::<X>("xf")?;
             let uf = symbolic_value::<U>("uf")?;
             let p = symbolic_value::<P>("p")?;
-            let tf = SX::sym("tf");
-            let values = (self.boundary_equalities)(&x0, &u0, &xf, &uf, &p, &tf);
+            let g = symbolic_value::<G>("g")?;
+            let values = (self.boundary_equalities)(&x0, &u0, &xf, &uf, &p, &g);
             SXFunction::new(
                 format!("{}_boundary_equalities", self.name),
                 vec![
@@ -743,7 +804,7 @@ where
                     NamedMatrix::new("xf", symbolic_column(&xf)?)?,
                     NamedMatrix::new("uf", symbolic_column(&uf)?)?,
                     NamedMatrix::new("p", symbolic_column(&p)?)?,
-                    NamedMatrix::new("tf", SXMatrix::dense_column(vec![tf])?)?,
+                    NamedMatrix::new("g", symbolic_column(&g)?)?,
                 ],
                 vec![NamedMatrix::new("boundary_eq", symbolic_column(&values)?)?],
             )
@@ -760,8 +821,8 @@ where
             let xf = symbolic_value::<X>("xf")?;
             let uf = symbolic_value::<U>("uf")?;
             let p = symbolic_value::<P>("p")?;
-            let tf = SX::sym("tf");
-            let values = (self.boundary_inequalities)(&x0, &u0, &xf, &uf, &p, &tf);
+            let g = symbolic_value::<G>("g")?;
+            let values = (self.boundary_inequalities)(&x0, &u0, &xf, &uf, &p, &g);
             SXFunction::new(
                 format!("{}_boundary_inequalities", self.name),
                 vec![
@@ -770,7 +831,7 @@ where
                     NamedMatrix::new("xf", symbolic_column(&xf)?)?,
                     NamedMatrix::new("uf", symbolic_column(&uf)?)?,
                     NamedMatrix::new("p", symbolic_column(&p)?)?,
-                    NamedMatrix::new("tf", SXMatrix::dense_column(vec![tf])?)?,
+                    NamedMatrix::new("g", symbolic_column(&g)?)?,
                 ],
                 vec![NamedMatrix::new(
                     "boundary_ineq",
@@ -827,7 +888,7 @@ where
         xf: &X,
         uf: &U,
         parameters: &P,
-        tf: &SX,
+        global: &G,
     ) -> Result<SX, SxError> {
         match &library.objective_mayer {
             Some(function) => function.call_scalar(&[
@@ -836,9 +897,9 @@ where
                 symbolic_column(xf)?,
                 symbolic_column(uf)?,
                 symbolic_column(parameters)?,
-                SXMatrix::dense_column(vec![*tf])?,
+                symbolic_column(global)?,
             ]),
-            None => Ok((self.objective_mayer)(x0, u0, xf, uf, parameters, tf)),
+            None => Ok((self.objective_mayer)(x0, u0, xf, uf, parameters, global)),
         }
     }
 
@@ -872,7 +933,7 @@ where
         xf: &X,
         uf: &U,
         parameters: &P,
-        tf: &SX,
+        global: &G,
     ) -> Result<Beq, SxError> {
         match &library.boundary_equalities {
             Some(function) => call_typed_unary_output::<Beq>(
@@ -883,10 +944,12 @@ where
                     symbolic_column(xf)?,
                     symbolic_column(uf)?,
                     symbolic_column(parameters)?,
-                    SXMatrix::dense_column(vec![*tf])?,
+                    symbolic_column(global)?,
                 ],
             ),
-            None => Ok((self.boundary_equalities)(x0, u0, xf, uf, parameters, tf)),
+            None => Ok((self.boundary_equalities)(
+                x0, u0, xf, uf, parameters, global,
+            )),
         }
     }
 
@@ -898,7 +961,7 @@ where
         xf: &X,
         uf: &U,
         parameters: &P,
-        tf: &SX,
+        global: &G,
     ) -> Result<Bineq, SxError> {
         match &library.boundary_inequalities {
             Some(function) => call_typed_unary_output::<Bineq>(
@@ -909,10 +972,12 @@ where
                     symbolic_column(xf)?,
                     symbolic_column(uf)?,
                     symbolic_column(parameters)?,
-                    SXMatrix::dense_column(vec![*tf])?,
+                    symbolic_column(global)?,
                 ],
             ),
-            None => Ok((self.boundary_inequalities)(x0, u0, xf, uf, parameters, tf)),
+            None => Ok((self.boundary_inequalities)(
+                x0, u0, xf, uf, parameters, global,
+            )),
         }
     }
 }
@@ -1195,33 +1260,37 @@ fn combine_affine_targets(lhs: Option<SX>, rhs: Option<SX>) -> Option<Option<SX>
     }
 }
 
-fn build_raw_bounds<C, Beq, Bineq>(
+fn build_raw_bounds<C, Beq, Bineq, G>(
     plan: &PromotionPlan,
     offsets: &[f64],
     path_bounds: &BoundTemplate<C>,
     bineq_bounds: &BoundTemplate<Bineq>,
-    tf_bounds: Bounds1D,
+    global_bounds: &BoundTemplate<G>,
     variable_count: usize,
 ) -> Result<(Vec<Option<f64>>, Vec<Option<f64>>), GuessError>
 where
     C: Vectorize<SX>,
     Bineq: Vectorize<SX>,
     Beq: Vectorize<SX>,
+    G: Vectorize<SX>,
     BoundTemplate<C>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<C>>,
     BoundTemplate<Bineq>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<Bineq>>,
+    BoundTemplate<G>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<G>>,
 {
     let mut variable_lower = vec![None; variable_count];
     let mut variable_upper = vec![None; variable_count];
-    let tf_index = variable_count - 1;
-    apply_bounds_to_coordinate(
-        &mut variable_lower,
-        &mut variable_upper,
-        tf_index,
-        1.0,
-        0.0,
-        tf_bounds.lower,
-        tf_bounds.upper,
-    )?;
+    let global_start = variable_count - G::LEN;
+    for (offset, bounds) in flatten_bounds(global_bounds).into_iter().enumerate() {
+        apply_bounds_to_coordinate(
+            &mut variable_lower,
+            &mut variable_upper,
+            global_start + offset,
+            1.0,
+            0.0,
+            bounds.lower,
+            bounds.upper,
+        )?;
+    }
     let boundary_ineq = flatten_bounds(bineq_bounds);
     let path = flatten_bounds(path_bounds);
     let mut boundary_ineq_index = 0usize;
@@ -1802,8 +1871,8 @@ where
     ))
 }
 
-fn validate_interpolation_samples<X, U>(
-    samples: &InterpolatedTrajectory<X, U>,
+fn validate_interpolation_samples<X, U, G>(
+    samples: &InterpolatedTrajectory<X, U, G>,
 ) -> Result<(), GuessError> {
     if samples.sample_times.len() < 2 {
         return Err(GuessError::Invalid(
@@ -2129,6 +2198,34 @@ mod tests {
         target: T,
     }
 
+    #[derive(Clone, Debug, PartialEq, optimization::Vectorize)]
+    struct TestGlobals<T> {
+        tf: T,
+        terminal_target: T,
+    }
+
+    impl<T> OcpGlobalDesign<T> for TestGlobals<T>
+    where
+        T: Clone + ScalarLeaf,
+    {
+        fn final_time(&self) -> T {
+            self.tf.clone()
+        }
+
+        fn from_final_time(tf: T) -> Self {
+            Self {
+                tf: tf.clone(),
+                terminal_target: tf,
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, optimization::Vectorize)]
+    struct GlobalBoundary<T> {
+        start: T,
+        terminal_target: T,
+    }
+
     fn lqr_ocp_ms<const N: usize, const RK4_SUBSTEPS: usize>()
     -> Ocp<State<SX>, Control<SX>, Params<SX>, (), State<SX>, (), runtime::MultipleShooting> {
         Ocp::new(
@@ -2225,6 +2322,61 @@ mod tests {
         .expect("builder should succeed")
     }
 
+    fn global_design_ocp_ms<const N: usize, const RK4_SUBSTEPS: usize>() -> Ocp<
+        State<SX>,
+        Control<SX>,
+        Params<SX>,
+        (),
+        GlobalBoundary<SX>,
+        (),
+        runtime::MultipleShooting,
+        TestGlobals<SX>,
+    > {
+        Ocp::new(
+            "global_design_ms",
+            runtime::MultipleShooting {
+                intervals: N,
+                rk4_substeps: RK4_SUBSTEPS,
+            },
+        )
+        .objective_lagrange(
+            |x: &State<SX>, u: &Control<SX>, dudt: &Control<SX>, _: &Params<SX>| {
+                x.x.sqr() + x.v.sqr() + u.u.sqr() + 1e-3 * dudt.u.sqr()
+            },
+        )
+        .objective_mayer_global(
+            |_: &State<SX>,
+             _: &Control<SX>,
+             x_t: &State<SX>,
+             _: &Control<SX>,
+             _: &Params<SX>,
+             g: &TestGlobals<SX>| { 10.0 * (x_t.x - g.terminal_target).sqr() },
+        )
+        .ode(|x: &State<SX>, u: &Control<SX>, _: &Params<SX>| State { x: x.v, v: u.u })
+        .path_constraints(|_: &State<SX>, _: &Control<SX>, _: &Control<SX>, _: &Params<SX>| ())
+        .boundary_equalities_global(
+            |x0: &State<SX>,
+             _: &Control<SX>,
+             x_t: &State<SX>,
+             _: &Control<SX>,
+             _: &Params<SX>,
+             g: &TestGlobals<SX>| GlobalBoundary {
+                start: x0.x,
+                terminal_target: x_t.x - g.terminal_target,
+            },
+        )
+        .boundary_inequalities_global(
+            |_: &State<SX>,
+             _: &Control<SX>,
+             _: &State<SX>,
+             _: &Control<SX>,
+             _: &Params<SX>,
+             _: &TestGlobals<SX>| (),
+        )
+        .build()
+        .expect("builder should succeed")
+    }
+
     #[test]
     fn multiple_shooting_scaling_maps_into_flat_nlp_scaling() {
         const N: usize = 2;
@@ -2238,9 +2390,11 @@ mod tests {
             beq: State { x: 0.0, v: 0.0 },
             bineq_bounds: (),
             path_bounds: (),
-            tf_bounds: Bounds1D {
-                lower: Some(1.0),
-                upper: Some(1.0),
+            global_bounds: FinalTime {
+                tf: Bounds1D {
+                    lower: Some(1.0),
+                    upper: Some(1.0),
+                },
             },
             initial_guess: runtime::MultipleShootingInitialGuess::Constant {
                 x: State { x: 0.0, v: 0.0 },
@@ -2253,7 +2407,7 @@ mod tests {
                 state: State { x: 2.0, v: 3.0 },
                 control: Control { u: 5.0 },
                 control_rate: Control { u: 11.0 },
-                final_time: 13.0,
+                global: FinalTime { tf: 13.0 },
                 parameters: Params { target: 17.0 },
                 path: Vec::new(),
                 boundary_equalities: vec![19.0, 23.0],
@@ -2280,6 +2434,66 @@ mod tests {
     }
 
     #[test]
+    fn multiple_shooting_global_design_variables_are_vectorized() {
+        const N: usize = 1;
+        const RK4_SUBSTEPS: usize = 1;
+
+        let compiled = global_design_ocp_ms::<N, RK4_SUBSTEPS>()
+            .compile_jit()
+            .expect("global-design multiple shooting OCP should compile");
+        let runtime = runtime::MultipleShootingRuntimeValues {
+            parameters: Params { target: 1.0 },
+            beq: GlobalBoundary {
+                start: 0.0,
+                terminal_target: 0.0,
+            },
+            bineq_bounds: (),
+            path_bounds: (),
+            global_bounds: TestGlobals {
+                tf: Bounds1D {
+                    lower: Some(1.0),
+                    upper: Some(1.0),
+                },
+                terminal_target: Bounds1D {
+                    lower: Some(4.0),
+                    upper: Some(5.0),
+                },
+            },
+            initial_guess: runtime::MultipleShootingInitialGuess::ConstantGlobal {
+                x: State { x: 0.0, v: 0.0 },
+                u: Control { u: 0.0 },
+                dudt: Control { u: 0.0 },
+                global: TestGlobals {
+                    tf: 1.0,
+                    terminal_target: 4.5,
+                },
+            },
+            scaling: None,
+        };
+
+        let initial_guess = compiled
+            .test_initial_guess_flat(&runtime)
+            .expect("initial guess should flatten");
+        assert_eq!(&initial_guess[initial_guess.len() - 2..], &[1.0, 4.5]);
+
+        let (bounds, _) = compiled
+            .test_runtime_bounds(&runtime)
+            .expect("runtime bounds should build");
+        let lower = bounds
+            .variables
+            .lower
+            .as_ref()
+            .expect("variable lower bounds should exist");
+        let upper = bounds
+            .variables
+            .upper
+            .as_ref()
+            .expect("variable upper bounds should exist");
+        assert_eq!(&lower[lower.len() - 2..], &[Some(1.0), Some(4.0)]);
+        assert_eq!(&upper[upper.len() - 2..], &[Some(1.0), Some(5.0)]);
+    }
+
+    #[test]
     fn direct_collocation_scaling_maps_into_flat_nlp_scaling() {
         const N: usize = 2;
         const K: usize = 2;
@@ -2292,9 +2506,11 @@ mod tests {
             beq: State { x: 0.0, v: 0.0 },
             bineq_bounds: (),
             path_bounds: (),
-            tf_bounds: Bounds1D {
-                lower: Some(1.0),
-                upper: Some(1.0),
+            global_bounds: FinalTime {
+                tf: Bounds1D {
+                    lower: Some(1.0),
+                    upper: Some(1.0),
+                },
             },
             initial_guess: runtime::DirectCollocationInitialGuess::Constant {
                 x: State { x: 0.0, v: 0.0 },
@@ -2307,7 +2523,7 @@ mod tests {
                 state: State { x: 2.0, v: 3.0 },
                 control: Control { u: 5.0 },
                 control_rate: Control { u: 11.0 },
-                final_time: 13.0,
+                global: FinalTime { tf: 13.0 },
                 parameters: Params { target: 17.0 },
                 path: Vec::new(),
                 boundary_equalities: vec![19.0, 23.0],

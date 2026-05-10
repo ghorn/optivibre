@@ -130,26 +130,28 @@ impl<T> IntervalGrid<T> {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct MultipleShootingTrajectories<X, U> {
+pub struct MultipleShootingTrajectories<X, U, G = FinalTime<f64>> {
     pub x: Mesh<X>,
     pub u: Mesh<U>,
     pub dudt: Vec<U>,
+    pub global: G,
     pub tf: f64,
 }
 
-impl<X, U> MultipleShootingTrajectories<X, U> {
+impl<X, U, G> MultipleShootingTrajectories<X, U, G> {
     pub fn interval_count(&self) -> usize {
         self.dudt.len()
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct DirectCollocationTrajectories<X, U> {
+pub struct DirectCollocationTrajectories<X, U, G = FinalTime<f64>> {
     pub x: Mesh<X>,
     pub u: Mesh<U>,
     pub root_x: IntervalGrid<X>,
     pub root_u: IntervalGrid<U>,
     pub root_dudt: IntervalGrid<U>,
+    pub global: G,
     pub tf: f64,
 }
 
@@ -295,115 +297,157 @@ where
         .collect()
 }
 
-pub enum MultipleShootingInitialGuess<X, U, P> {
-    Explicit(MultipleShootingTrajectories<X, U>),
+pub enum MultipleShootingInitialGuess<X, U, P, G = FinalTime<f64>> {
+    Explicit(MultipleShootingTrajectories<X, U, G>),
     Constant {
         x: X,
         u: U,
         dudt: U,
         tf: f64,
     },
-    Interpolated(InterpolatedTrajectory<X, U>),
+    ConstantGlobal {
+        x: X,
+        u: U,
+        dudt: U,
+        global: G,
+    },
+    Interpolated(InterpolatedTrajectory<X, U, G>),
     Rollout {
         x0: X,
         u0: U,
         tf: f64,
         controller: Box<ControllerFn<X, U, P>>,
     },
+    RolloutGlobal {
+        x0: X,
+        u0: U,
+        global: G,
+        controller: Box<ControllerFn<X, U, P>>,
+    },
 }
 
-pub enum DirectCollocationInitialGuess<X, U, P> {
-    Explicit(DirectCollocationTrajectories<X, U>),
+pub enum DirectCollocationInitialGuess<X, U, P, G = FinalTime<f64>> {
+    Explicit(DirectCollocationTrajectories<X, U, G>),
     Constant {
         x: X,
         u: U,
         dudt: U,
         tf: f64,
     },
-    Interpolated(InterpolatedTrajectory<X, U>),
+    ConstantGlobal {
+        x: X,
+        u: U,
+        dudt: U,
+        global: G,
+    },
+    Interpolated(InterpolatedTrajectory<X, U, G>),
     Rollout {
         x0: X,
         u0: U,
         tf: f64,
         controller: Box<ControllerFn<X, U, P>>,
     },
+    RolloutGlobal {
+        x0: X,
+        u0: U,
+        global: G,
+        controller: Box<ControllerFn<X, U, P>>,
+    },
 }
 
-pub struct MultipleShootingRuntimeValues<P, C, Beq, Bineq, X, U> {
+pub struct MultipleShootingRuntimeValues<
+    P,
+    C,
+    Beq,
+    Bineq,
+    X,
+    U,
+    G = FinalTime<f64>,
+    GBounds = FinalTime<Bounds1D>,
+> {
     pub parameters: P,
     pub beq: Beq,
     pub bineq_bounds: Bineq,
     pub path_bounds: C,
-    pub tf_bounds: Bounds1D,
-    pub initial_guess: MultipleShootingInitialGuess<X, U, P>,
-    pub scaling: Option<OcpScaling<P, X, U>>,
+    pub global_bounds: GBounds,
+    pub initial_guess: MultipleShootingInitialGuess<X, U, P, G>,
+    pub scaling: Option<OcpScaling<P, X, U, G>>,
 }
 
-pub struct DirectCollocationRuntimeValues<P, C, Beq, Bineq, X, U> {
+pub struct DirectCollocationRuntimeValues<
+    P,
+    C,
+    Beq,
+    Bineq,
+    X,
+    U,
+    G = FinalTime<f64>,
+    GBounds = FinalTime<Bounds1D>,
+> {
     pub parameters: P,
     pub beq: Beq,
     pub bineq_bounds: Bineq,
     pub path_bounds: C,
-    pub tf_bounds: Bounds1D,
-    pub initial_guess: DirectCollocationInitialGuess<X, U, P>,
-    pub scaling: Option<OcpScaling<P, X, U>>,
+    pub global_bounds: GBounds,
+    pub initial_guess: DirectCollocationInitialGuess<X, U, P, G>,
+    pub scaling: Option<OcpScaling<P, X, U, G>>,
 }
 
 #[derive(Clone, Debug)]
-pub struct MultipleShootingSqpSnapshot<X, U> {
-    pub trajectories: MultipleShootingTrajectories<X, U>,
+pub struct MultipleShootingSqpSnapshot<X, U, G = FinalTime<f64>> {
+    pub trajectories: MultipleShootingTrajectories<X, U, G>,
     pub time_grid: MultipleShootingTimeGrid,
     pub solver: SqpIterationSnapshot,
 }
 
 #[derive(Clone, Debug)]
-pub struct DirectCollocationSqpSnapshot<X, U> {
-    pub trajectories: DirectCollocationTrajectories<X, U>,
+pub struct DirectCollocationSqpSnapshot<X, U, G = FinalTime<f64>> {
+    pub trajectories: DirectCollocationTrajectories<X, U, G>,
     pub time_grid: DirectCollocationTimeGrid,
     pub solver: SqpIterationSnapshot,
 }
 
 #[derive(Clone, Debug)]
-pub struct MultipleShootingInteriorPointSnapshot<X, U> {
-    pub trajectories: MultipleShootingTrajectories<X, U>,
+pub struct MultipleShootingInteriorPointSnapshot<X, U, G = FinalTime<f64>> {
+    pub trajectories: MultipleShootingTrajectories<X, U, G>,
     pub time_grid: MultipleShootingTimeGrid,
     pub solver: InteriorPointIterationSnapshot,
 }
 
 #[derive(Clone, Debug)]
-pub struct DirectCollocationInteriorPointSnapshot<X, U> {
-    pub trajectories: DirectCollocationTrajectories<X, U>,
+pub struct DirectCollocationInteriorPointSnapshot<X, U, G = FinalTime<f64>> {
+    pub trajectories: DirectCollocationTrajectories<X, U, G>,
     pub time_grid: DirectCollocationTimeGrid,
     pub solver: InteriorPointIterationSnapshot,
 }
 
 #[derive(Clone, Debug)]
-pub struct MultipleShootingSqpSolveResult<X, U> {
-    pub trajectories: MultipleShootingTrajectories<X, U>,
+pub struct MultipleShootingSqpSolveResult<X, U, G = FinalTime<f64>> {
+    pub trajectories: MultipleShootingTrajectories<X, U, G>,
     pub time_grid: MultipleShootingTimeGrid,
     pub solver: ClarabelSqpSummary,
     pub setup_timing: OcpSolveSetupTiming,
 }
 
 #[derive(Clone, Debug)]
-pub struct DirectCollocationSqpSolveResult<X, U> {
-    pub trajectories: DirectCollocationTrajectories<X, U>,
+pub struct DirectCollocationSqpSolveResult<X, U, G = FinalTime<f64>> {
+    pub trajectories: DirectCollocationTrajectories<X, U, G>,
     pub time_grid: DirectCollocationTimeGrid,
     pub solver: ClarabelSqpSummary,
     pub setup_timing: OcpSolveSetupTiming,
 }
 
 #[derive(Clone, Debug)]
-pub struct MultipleShootingInteriorPointSolveResult<X, U> {
-    pub trajectories: MultipleShootingTrajectories<X, U>,
+pub struct MultipleShootingInteriorPointSolveResult<X, U, G = FinalTime<f64>> {
+    pub trajectories: MultipleShootingTrajectories<X, U, G>,
     pub time_grid: MultipleShootingTimeGrid,
     pub solver: InteriorPointSummary,
     pub setup_timing: OcpSolveSetupTiming,
 }
 
 #[derive(Clone, Debug)]
-pub struct DirectCollocationInteriorPointSolveResult<X, U> {
-    pub trajectories: DirectCollocationTrajectories<X, U>,
+pub struct DirectCollocationInteriorPointSolveResult<X, U, G = FinalTime<f64>> {
+    pub trajectories: DirectCollocationTrajectories<X, U, G>,
     pub time_grid: DirectCollocationTimeGrid,
     pub solver: InteriorPointSummary,
     pub setup_timing: OcpSolveSetupTiming,
@@ -411,8 +455,8 @@ pub struct DirectCollocationInteriorPointSolveResult<X, U> {
 
 #[cfg(feature = "ipopt")]
 #[derive(Clone, Debug)]
-pub struct MultipleShootingIpoptSolveResult<X, U> {
-    pub trajectories: MultipleShootingTrajectories<X, U>,
+pub struct MultipleShootingIpoptSolveResult<X, U, G = FinalTime<f64>> {
+    pub trajectories: MultipleShootingTrajectories<X, U, G>,
     pub time_grid: MultipleShootingTimeGrid,
     pub solver: IpoptSummary,
     pub setup_timing: OcpSolveSetupTiming,
@@ -420,8 +464,8 @@ pub struct MultipleShootingIpoptSolveResult<X, U> {
 
 #[cfg(feature = "ipopt")]
 #[derive(Clone, Debug)]
-pub struct DirectCollocationIpoptSolveResult<X, U> {
-    pub trajectories: DirectCollocationTrajectories<X, U>,
+pub struct DirectCollocationIpoptSolveResult<X, U, G = FinalTime<f64>> {
+    pub trajectories: DirectCollocationTrajectories<X, U, G>,
     pub time_grid: DirectCollocationTimeGrid,
     pub solver: IpoptSummary,
     pub setup_timing: OcpSolveSetupTiming,
@@ -429,16 +473,16 @@ pub struct DirectCollocationIpoptSolveResult<X, U> {
 
 #[cfg(feature = "ipopt")]
 #[derive(Clone, Debug)]
-pub struct MultipleShootingIpoptSnapshot<X, U> {
-    pub trajectories: MultipleShootingTrajectories<X, U>,
+pub struct MultipleShootingIpoptSnapshot<X, U, G = FinalTime<f64>> {
+    pub trajectories: MultipleShootingTrajectories<X, U, G>,
     pub time_grid: MultipleShootingTimeGrid,
     pub solver: IpoptIterationSnapshot,
 }
 
 #[cfg(feature = "ipopt")]
 #[derive(Clone, Debug)]
-pub struct DirectCollocationIpoptSnapshot<X, U> {
-    pub trajectories: DirectCollocationTrajectories<X, U>,
+pub struct DirectCollocationIpoptSnapshot<X, U, G = FinalTime<f64>> {
+    pub trajectories: DirectCollocationTrajectories<X, U, G>,
     pub time_grid: DirectCollocationTimeGrid,
     pub solver: IpoptIterationSnapshot,
 }
@@ -465,7 +509,7 @@ struct DcTranscription {
     path: Vec<SX>,
 }
 
-pub struct CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq> {
+pub struct CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq, G = FinalTime<SX>> {
     compiled: DynamicCompiledJitNlp,
     scheme: MultipleShooting,
     promotion_plan: PromotionPlan,
@@ -473,10 +517,10 @@ pub struct CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq> {
     xdot_helper: CompiledXdot<X, U, P>,
     rk4_arc_helper: CompiledMultipleShootingArcDyn<X, U, P>,
     helper_compile_stats: OcpHelperCompileStats,
-    _marker: PhantomData<fn() -> (C, Bineq)>,
+    _marker: PhantomData<fn() -> (C, Bineq, G)>,
 }
 
-pub struct CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq> {
+pub struct CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq, G = FinalTime<SX>> {
     compiled: DynamicCompiledJitNlp,
     scheme: DirectCollocation,
     promotion_plan: PromotionPlan,
@@ -484,15 +528,16 @@ pub struct CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq> {
     xdot_helper: CompiledXdot<X, U, P>,
     coefficients: CollocationCoefficients,
     helper_compile_stats: OcpHelperCompileStats,
-    _marker: PhantomData<fn() -> (C, Bineq)>,
+    _marker: PhantomData<fn() -> (C, Bineq, G)>,
 }
 
-fn ms_variable_count<X, U>(intervals: usize) -> usize
+fn ms_variable_count<X, U, G>(intervals: usize) -> usize
 where
     X: Vectorize<SX>,
     U: Vectorize<SX>,
+    G: Vectorize<SX>,
 {
-    (intervals + 1) * (X::LEN + U::LEN) + intervals * U::LEN + 1
+    (intervals + 1) * (X::LEN + U::LEN) + intervals * U::LEN + G::LEN
 }
 
 fn ms_equality_count<X, U>(intervals: usize) -> usize
@@ -512,12 +557,13 @@ where
     Beq::LEN + Bineq::LEN + intervals * C::LEN
 }
 
-fn dc_variable_count<X, U>(intervals: usize, order: usize) -> usize
+fn dc_variable_count<X, U, G>(intervals: usize, order: usize) -> usize
 where
     X: Vectorize<SX>,
     U: Vectorize<SX>,
+    G: Vectorize<SX>,
 {
-    (intervals + 1) * (X::LEN + U::LEN) + intervals * order * (X::LEN + 2 * U::LEN) + 1
+    (intervals + 1) * (X::LEN + U::LEN) + intervals * order * (X::LEN + 2 * U::LEN) + G::LEN
 }
 
 fn dc_equality_count<X, U>(intervals: usize, order: usize) -> usize
@@ -1234,11 +1280,12 @@ where
     }
 }
 
-impl<X, U, P, C, Beq, Bineq> Ocp<X, U, P, C, Beq, Bineq, MultipleShooting>
+impl<X, U, P, C, Beq, Bineq, G> Ocp<X, U, P, C, Beq, Bineq, MultipleShooting, G>
 where
     X: Vectorize<SX, Rebind<SX> = X> + Clone,
     U: Vectorize<SX, Rebind<SX> = U> + Clone,
     P: Vectorize<SX, Rebind<SX> = P>,
+    G: OcpGlobalDesign<SX> + Vectorize<SX, Rebind<SX> = G>,
     C: Vectorize<SX, Rebind<SX> = C>,
     Beq: Vectorize<SX, Rebind<SX> = Beq>,
     Bineq: Vectorize<SX, Rebind<SX> = Bineq>,
@@ -1340,12 +1387,13 @@ where
         x_mesh: &Mesh<X>,
         u_mesh: &Mesh<U>,
         dudt: &[U],
-        tf: &SX,
+        global: &G,
         parameters: &P,
         beq: &Beq,
         symbolic_library: &OcpSymbolicFunctionLibrary,
     ) -> Result<MsTranscription, SxError> {
-        let step = *tf / self.scheme.intervals as f64;
+        let tf = global.final_time();
+        let step = tf / self.scheme.intervals as f64;
         let mut objective = SX::zero();
         let mut equalities = Vec::with_capacity(ms_equality_count::<X, U>(self.scheme.intervals));
         let mut path = Vec::with_capacity(self.scheme.intervals * C::LEN);
@@ -1395,7 +1443,7 @@ where
             &x_mesh.terminal,
             &u_mesh.terminal,
             parameters,
-            tf,
+            global,
         )?;
         let boundary_eq_residual = subtract_vectorized(&boundary_eq_values, beq)?.flatten_cloned();
         let boundary_ineq = self
@@ -1406,7 +1454,7 @@ where
                 &x_mesh.terminal,
                 &u_mesh.terminal,
                 parameters,
-                tf,
+                global,
             )?
             .flatten_cloned();
         objective += self.eval_objective_mayer_symbolic(
@@ -1416,7 +1464,7 @@ where
             &x_mesh.terminal,
             &u_mesh.terminal,
             parameters,
-            tf,
+            global,
         )?;
 
         Ok(MsTranscription {
@@ -1430,28 +1478,28 @@ where
 
     pub fn compile_jit(
         &self,
-    ) -> Result<CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq>, OcpCompileError> {
+    ) -> Result<CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq, G>, OcpCompileError> {
         self.compile_jit_with_options(FunctionCompileOptions::from(LlvmOptimizationLevel::O3))
     }
 
     pub fn compile_jit_with_options(
         &self,
         options: FunctionCompileOptions,
-    ) -> Result<CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq>, OcpCompileError> {
+    ) -> Result<CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq, G>, OcpCompileError> {
         self.compile_jit_with_ocp_options(OcpCompileOptions::for_multiple_shooting(options))
     }
 
     pub fn compile_jit_with_ocp_options(
         &self,
         options: OcpCompileOptions,
-    ) -> Result<CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq>, OcpCompileError> {
+    ) -> Result<CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq, G>, OcpCompileError> {
         self.compile_jit_with_ocp_options_and_progress_callback(options, |_| {})
     }
 
     pub fn compile_jit_with_progress_callback<CB>(
         &self,
         callback: CB,
-    ) -> Result<CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq>, OcpCompileError>
+    ) -> Result<CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq, G>, OcpCompileError>
     where
         CB: FnMut(OcpCompileProgress),
     {
@@ -1467,7 +1515,7 @@ where
         &self,
         options: OcpCompileOptions,
         mut on_progress: CB,
-    ) -> Result<CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq>, OcpCompileError>
+    ) -> Result<CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq, G>, OcpCompileError>
     where
         CB: FnMut(OcpCompileProgress),
     {
@@ -1486,7 +1534,7 @@ where
             options.symbolic_functions,
         )?;
         let decision_symbols =
-            symbolic_dense_vector("w", ms_variable_count::<X, U>(self.scheme.intervals));
+            symbolic_dense_vector("w", ms_variable_count::<X, U, G>(self.scheme.intervals));
         let decision_matrix = SXMatrix::dense_column(decision_symbols.clone())?;
         let mut decision_index = 0usize;
         let x_mesh = take_symbolic_mesh::<X>(
@@ -1506,9 +1554,7 @@ where
                 &mut decision_index,
             )?);
         }
-        let tf = *take_symbolic_chunk(&decision_symbols, &mut decision_index, 1)?
-            .first()
-            .expect("scalar slice should contain one entry");
+        let global = take_symbolic_value::<G>(&decision_symbols, &mut decision_index)?;
 
         let runtime_param_len = P::LEN + Beq::LEN;
         let parameter_symbols = symbolic_dense_vector("p", runtime_param_len);
@@ -1528,7 +1574,7 @@ where
             &x_mesh,
             &u_mesh,
             &dudt,
-            &tf,
+            &global,
             &parameters,
             &beq,
             &symbolic_library,
@@ -1670,16 +1716,18 @@ where
     }
 }
 
-fn build_multiple_shooting_interpolated_guess<X, U>(
-    samples: &InterpolatedTrajectory<X, U>,
+fn build_multiple_shooting_interpolated_guess<X, U, G>(
+    samples: &InterpolatedTrajectory<X, U, G>,
     intervals: usize,
-) -> Result<MultipleShootingTrajectories<X, U>, GuessError>
+) -> Result<MultipleShootingTrajectories<X, U, G>, GuessError>
 where
     X: Clone,
     U: Clone,
+    G: OcpGlobalDesign<f64> + Clone,
 {
     validate_interpolation_samples(samples)?;
-    let times = mesh_times(samples.tf, intervals);
+    let tf = samples.global.final_time();
+    let times = mesh_times(tf, intervals);
     Ok(MultipleShootingTrajectories {
         x: Mesh {
             nodes: times
@@ -1702,28 +1750,32 @@ where
             .iter()
             .map(|&time| interpolate_at(&samples.sample_times, &samples.dudt_samples, time))
             .collect(),
-        tf: samples.tf,
+        global: samples.global.clone(),
+        tf,
     })
 }
 
-fn build_multiple_shooting_rollout_guess<X, U, P>(
+fn build_multiple_shooting_rollout_guess<X, U, P, G>(
     xdot: &CompiledXdot<X, U, P>,
     x0: &Numeric<X>,
     u0: &Numeric<U>,
-    tf: f64,
+    global: Numeric<G>,
     parameters: &Numeric<P>,
     controller: &ControllerFn<Numeric<X>, Numeric<U>, Numeric<P>>,
     intervals: usize,
     rk4_substeps: usize,
-) -> Result<MultipleShootingTrajectories<Numeric<X>, Numeric<U>>, GuessError>
+) -> Result<MultipleShootingTrajectories<Numeric<X>, Numeric<U>, Numeric<G>>, GuessError>
 where
     X: Vectorize<SX>,
     U: Vectorize<SX>,
     P: Vectorize<SX>,
+    G: Vectorize<SX>,
     Numeric<X>: Vectorize<f64, Rebind<f64> = Numeric<X>> + Clone,
     Numeric<U>: Vectorize<f64, Rebind<f64> = Numeric<U>> + Clone,
     Numeric<P>: Vectorize<f64, Rebind<f64> = Numeric<P>>,
+    Numeric<G>: OcpGlobalDesign<f64> + Clone,
 {
+    let tf = global.final_time();
     let h = tf / intervals as f64;
     let mut x = x0.clone();
     let mut u = u0.clone();
@@ -1751,19 +1803,22 @@ where
             terminal: u,
         },
         dudt: rates,
+        global,
         tf,
     })
 }
 
-fn project_multiple_shooting<X, U>(
+fn project_multiple_shooting<X, U, G>(
     values: &[f64],
     intervals: usize,
-) -> Result<MultipleShootingTrajectories<Numeric<X>, Numeric<U>>, VectorizeLayoutError>
+) -> Result<MultipleShootingTrajectories<Numeric<X>, Numeric<U>, Numeric<G>>, VectorizeLayoutError>
 where
     X: Vectorize<SX>,
     U: Vectorize<SX>,
+    G: Vectorize<SX>,
     Numeric<X>: Vectorize<f64, Rebind<f64> = Numeric<X>>,
     Numeric<U>: Vectorize<f64, Rebind<f64> = Numeric<U>>,
+    Numeric<G>: OcpGlobalDesign<f64> + Vectorize<f64, Rebind<f64> = Numeric<G>>,
 {
     let mut index = 0usize;
     let x = take_numeric_mesh::<X>(values, &mut index, intervals)?;
@@ -1772,30 +1827,38 @@ where
     for _ in 0..intervals {
         dudt.push(take_numeric_value::<U>(values, &mut index)?);
     }
-    let tf = *take_numeric_chunk(values, &mut index, 1)?
-        .first()
-        .expect("scalar slice should contain one entry");
+    let global = take_numeric_value::<G>(values, &mut index)?;
+    let tf = global.final_time();
     if index != values.len() {
         return Err(VectorizeLayoutError::LengthMismatch {
             expected: index,
             got: values.len(),
         });
     }
-    Ok(MultipleShootingTrajectories { x, u, dudt, tf })
+    Ok(MultipleShootingTrajectories {
+        x,
+        u,
+        dudt,
+        global,
+        tf,
+    })
 }
 
-impl<X, U, P, C, Beq, Bineq> CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq>
+impl<X, U, P, C, Beq, Bineq, G> CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq, G>
 where
     X: Vectorize<SX, Rebind<SX> = X> + Clone,
     U: Vectorize<SX, Rebind<SX> = U> + Clone,
     P: Vectorize<SX, Rebind<SX> = P>,
+    G: OcpGlobalDesign<SX> + Vectorize<SX, Rebind<SX> = G>,
     C: Vectorize<SX, Rebind<SX> = C>,
     Beq: Vectorize<SX, Rebind<SX> = Beq>,
     Bineq: Vectorize<SX, Rebind<SX> = Bineq>,
     Numeric<X>: Vectorize<f64, Rebind<f64> = Numeric<X>> + Clone,
     Numeric<U>: Vectorize<f64, Rebind<f64> = Numeric<U>> + Clone,
     Numeric<P>: Vectorize<f64, Rebind<f64> = Numeric<P>> + Clone,
+    Numeric<G>: OcpGlobalDesign<f64> + Vectorize<f64, Rebind<f64> = Numeric<G>> + Clone,
     Numeric<Beq>: Vectorize<f64, Rebind<f64> = Numeric<Beq>> + Clone,
+    BoundTemplate<G>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<G>> + Clone,
     BoundTemplate<C>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<C>>,
     BoundTemplate<Bineq>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<Bineq>>,
 {
@@ -1834,6 +1897,8 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
     ) -> AnyResult<Vec<f64>> {
         Ok(self.build_initial_guess(values)?)
@@ -1849,6 +1914,8 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
     ) -> AnyResult<(RuntimeNlpBounds, Option<RuntimeNlpScaling>)> {
         Ok(self.build_runtime_bounds(values)?)
@@ -1868,6 +1935,8 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
         options: NlpEvaluationBenchmarkOptions,
     ) -> AnyResult<NlpEvaluationBenchmark> {
@@ -1883,6 +1952,8 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
         options: NlpEvaluationBenchmarkOptions,
         on_progress: CB,
@@ -1912,6 +1983,8 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
         equality_multipliers: &[f64],
         inequality_multipliers: &[f64],
@@ -1937,9 +2010,12 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
         options: &ClarabelSqpOptions,
-    ) -> Result<MultipleShootingSqpSolveResult<Numeric<X>, Numeric<U>>, ClarabelSqpError> {
+    ) -> Result<MultipleShootingSqpSolveResult<Numeric<X>, Numeric<U>, Numeric<G>>, ClarabelSqpError>
+    {
         let initial_guess_started = Instant::now();
         let x0 = self
             .build_initial_guess(values)
@@ -1958,7 +2034,7 @@ where
             scaling.as_ref(),
             options,
         )?;
-        let trajectories = project_multiple_shooting::<X, U>(&summary.x, self.scheme.intervals)
+        let trajectories = project_multiple_shooting::<X, U, G>(&summary.x, self.scheme.intervals)
             .map_err(|err| ClarabelSqpError::InvalidInput(err.to_string()))?;
         Ok(MultipleShootingSqpSolveResult {
             time_grid: MultipleShootingTimeGrid {
@@ -1982,12 +2058,14 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
         options: &ClarabelSqpOptions,
         mut callback: CB,
-    ) -> Result<MultipleShootingSqpSolveResult<Numeric<X>, Numeric<U>>, ClarabelSqpError>
+    ) -> Result<MultipleShootingSqpSolveResult<Numeric<X>, Numeric<U>, Numeric<G>>, ClarabelSqpError>
     where
-        CB: FnMut(&MultipleShootingSqpSnapshot<Numeric<X>, Numeric<U>>),
+        CB: FnMut(&MultipleShootingSqpSnapshot<Numeric<X>, Numeric<U>, Numeric<G>>),
     {
         let initial_guess_started = Instant::now();
         let x0 = self
@@ -2008,7 +2086,7 @@ where
             options,
             |snapshot| {
                 let trajectories =
-                    project_multiple_shooting::<X, U>(&snapshot.x, self.scheme.intervals)
+                    project_multiple_shooting::<X, U, G>(&snapshot.x, self.scheme.intervals)
                         .expect("solver iterate should match runtime OCP layout");
                 callback(&MultipleShootingSqpSnapshot {
                     time_grid: MultipleShootingTimeGrid {
@@ -2019,7 +2097,7 @@ where
                 });
             },
         )?;
-        let trajectories = project_multiple_shooting::<X, U>(&summary.x, self.scheme.intervals)
+        let trajectories = project_multiple_shooting::<X, U, G>(&summary.x, self.scheme.intervals)
             .map_err(|err| ClarabelSqpError::InvalidInput(err.to_string()))?;
         Ok(MultipleShootingSqpSolveResult {
             time_grid: MultipleShootingTimeGrid {
@@ -2043,10 +2121,12 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
         options: &InteriorPointOptions,
     ) -> Result<
-        MultipleShootingInteriorPointSolveResult<Numeric<X>, Numeric<U>>,
+        MultipleShootingInteriorPointSolveResult<Numeric<X>, Numeric<U>, Numeric<G>>,
         InteriorPointSolveError,
     > {
         let initial_guess_started = Instant::now();
@@ -2067,7 +2147,7 @@ where
             scaling.as_ref(),
             options,
         )?;
-        let trajectories = project_multiple_shooting::<X, U>(&summary.x, self.scheme.intervals)
+        let trajectories = project_multiple_shooting::<X, U, G>(&summary.x, self.scheme.intervals)
             .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
         Ok(MultipleShootingInteriorPointSolveResult {
             time_grid: MultipleShootingTimeGrid {
@@ -2091,15 +2171,17 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
         options: &InteriorPointOptions,
         mut callback: CB,
     ) -> Result<
-        MultipleShootingInteriorPointSolveResult<Numeric<X>, Numeric<U>>,
+        MultipleShootingInteriorPointSolveResult<Numeric<X>, Numeric<U>, Numeric<G>>,
         InteriorPointSolveError,
     >
     where
-        CB: FnMut(&MultipleShootingInteriorPointSnapshot<Numeric<X>, Numeric<U>>),
+        CB: FnMut(&MultipleShootingInteriorPointSnapshot<Numeric<X>, Numeric<U>, Numeric<G>>),
     {
         let initial_guess_started = Instant::now();
         let x0 = self
@@ -2120,7 +2202,7 @@ where
             options,
             |snapshot| {
                 let trajectories =
-                    project_multiple_shooting::<X, U>(&snapshot.x, self.scheme.intervals)
+                    project_multiple_shooting::<X, U, G>(&snapshot.x, self.scheme.intervals)
                         .expect("solver iterate should match runtime OCP layout");
                 callback(&MultipleShootingInteriorPointSnapshot {
                     time_grid: MultipleShootingTimeGrid {
@@ -2131,7 +2213,7 @@ where
                 });
             },
         )?;
-        let trajectories = project_multiple_shooting::<X, U>(&summary.x, self.scheme.intervals)
+        let trajectories = project_multiple_shooting::<X, U, G>(&summary.x, self.scheme.intervals)
             .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
         Ok(MultipleShootingInteriorPointSolveResult {
             time_grid: MultipleShootingTimeGrid {
@@ -2156,9 +2238,12 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
         options: &IpoptOptions,
-    ) -> Result<MultipleShootingIpoptSolveResult<Numeric<X>, Numeric<U>>, IpoptSolveError> {
+    ) -> Result<MultipleShootingIpoptSolveResult<Numeric<X>, Numeric<U>, Numeric<G>>, IpoptSolveError>
+    {
         let initial_guess_started = Instant::now();
         let x0 = self
             .build_initial_guess(values)
@@ -2177,7 +2262,7 @@ where
             scaling.as_ref(),
             options,
         )?;
-        let trajectories = project_multiple_shooting::<X, U>(&summary.x, self.scheme.intervals)
+        let trajectories = project_multiple_shooting::<X, U, G>(&summary.x, self.scheme.intervals)
             .map_err(|err| IpoptSolveError::InvalidInput(err.to_string()))?;
         Ok(MultipleShootingIpoptSolveResult {
             time_grid: MultipleShootingTimeGrid {
@@ -2202,12 +2287,14 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
         options: &IpoptOptions,
         mut callback: CB,
-    ) -> Result<MultipleShootingIpoptSolveResult<Numeric<X>, Numeric<U>>, IpoptSolveError>
+    ) -> Result<MultipleShootingIpoptSolveResult<Numeric<X>, Numeric<U>, Numeric<G>>, IpoptSolveError>
     where
-        CB: FnMut(&MultipleShootingIpoptSnapshot<Numeric<X>, Numeric<U>>),
+        CB: FnMut(&MultipleShootingIpoptSnapshot<Numeric<X>, Numeric<U>, Numeric<G>>),
     {
         let initial_guess_started = Instant::now();
         let x0 = self
@@ -2228,7 +2315,7 @@ where
             options,
             |snapshot| {
                 if let Ok(trajectories) =
-                    project_multiple_shooting::<X, U>(&snapshot.x, self.scheme.intervals)
+                    project_multiple_shooting::<X, U, G>(&snapshot.x, self.scheme.intervals)
                 {
                     callback(&MultipleShootingIpoptSnapshot {
                         time_grid: MultipleShootingTimeGrid {
@@ -2240,7 +2327,7 @@ where
                 }
             },
         )?;
-        let trajectories = project_multiple_shooting::<X, U>(&summary.x, self.scheme.intervals)
+        let trajectories = project_multiple_shooting::<X, U, G>(&summary.x, self.scheme.intervals)
             .map_err(|err| IpoptSolveError::InvalidInput(err.to_string()))?;
         Ok(MultipleShootingIpoptSolveResult {
             time_grid: MultipleShootingTimeGrid {
@@ -2257,7 +2344,7 @@ where
 
     pub fn interval_arcs(
         &self,
-        trajectories: &MultipleShootingTrajectories<Numeric<X>, Numeric<U>>,
+        trajectories: &MultipleShootingTrajectories<Numeric<X>, Numeric<U>, Numeric<G>>,
         parameters: &Numeric<P>,
     ) -> AnyResult<(Vec<IntervalArc<Numeric<X>>>, Vec<IntervalArc<Numeric<U>>>)> {
         let step = trajectories.tf / self.scheme.intervals as f64;
@@ -2313,8 +2400,10 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
-        trajectories: &MultipleShootingTrajectories<Numeric<X>, Numeric<U>>,
+        trajectories: &MultipleShootingTrajectories<Numeric<X>, Numeric<U>, Numeric<G>>,
         tolerance: f64,
     ) -> Result<OcpConstraintViolationReport, VectorizeLayoutError> {
         let decision = self.flatten_decision(trajectories);
@@ -2392,13 +2481,12 @@ where
             OcpConstraintCategory::Path,
             tolerance,
         );
-        accumulate_inequality_group(
+        add_repeated_inequalities(
             &mut inequality_groups,
-            "T",
+            &flatten_value(&trajectories.global),
+            &prefixed_leaf_names::<G>("g"),
+            &flatten_bounds(&values.global_bounds),
             OcpConstraintCategory::FinalTime,
-            trajectories.tf,
-            values.tf_bounds.lower,
-            values.tf_bounds.upper,
             tolerance,
         );
         let mut report = OcpConstraintViolationReport {
@@ -2416,15 +2504,15 @@ where
 
     fn flatten_decision(
         &self,
-        trajectories: &MultipleShootingTrajectories<Numeric<X>, Numeric<U>>,
+        trajectories: &MultipleShootingTrajectories<Numeric<X>, Numeric<U>, Numeric<G>>,
     ) -> Vec<f64> {
-        let mut flat = Vec::with_capacity(ms_variable_count::<X, U>(self.scheme.intervals));
+        let mut flat = Vec::with_capacity(ms_variable_count::<X, U, G>(self.scheme.intervals));
         flat.extend(flatten_mesh::<Numeric<X>, f64>(&trajectories.x));
         flat.extend(flatten_mesh::<Numeric<U>, f64>(&trajectories.u));
         flat.extend(flatten_dynamic_values::<Numeric<U>, f64>(
             &trajectories.dudt,
         ));
-        flat.push(trajectories.tf);
+        flat.extend(flatten_value(&trajectories.global));
         flat
     }
 
@@ -2437,6 +2525,8 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
     ) -> Result<Vec<f64>, GuessError> {
         let trajectories = match &values.initial_guess {
@@ -2452,7 +2542,23 @@ where
                         terminal: u.clone(),
                     },
                     dudt: vec![dudt.clone(); self.scheme.intervals],
+                    global: Numeric::<G>::from_final_time(*tf),
                     tf: *tf,
+                }
+            }
+            MultipleShootingInitialGuess::ConstantGlobal { x, u, dudt, global } => {
+                MultipleShootingTrajectories {
+                    x: Mesh {
+                        nodes: vec![x.clone(); self.scheme.intervals],
+                        terminal: x.clone(),
+                    },
+                    u: Mesh {
+                        nodes: vec![u.clone(); self.scheme.intervals],
+                        terminal: u.clone(),
+                    },
+                    dudt: vec![dudt.clone(); self.scheme.intervals],
+                    global: global.clone(),
+                    tf: global.final_time(),
                 }
             }
             MultipleShootingInitialGuess::Interpolated(samples) => {
@@ -2463,11 +2569,26 @@ where
                 u0,
                 tf,
                 controller,
-            } => build_multiple_shooting_rollout_guess(
+            } => build_multiple_shooting_rollout_guess::<X, U, P, G>(
                 &self.xdot_helper,
                 x0,
                 u0,
-                *tf,
+                Numeric::<G>::from_final_time(*tf),
+                &values.parameters,
+                controller.as_ref(),
+                self.scheme.intervals,
+                self.scheme.rk4_substeps,
+            )?,
+            MultipleShootingInitialGuess::RolloutGlobal {
+                x0,
+                u0,
+                global,
+                controller,
+            } => build_multiple_shooting_rollout_guess::<X, U, P, G>(
+                &self.xdot_helper,
+                x0,
+                u0,
+                global.clone(),
                 &values.parameters,
                 controller.as_ref(),
                 self.scheme.intervals,
@@ -2486,18 +2607,20 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
     ) -> Result<(RuntimeNlpBounds, Option<RuntimeNlpScaling>), GuessError> {
         let runtime_params: OcpParametersNum<P, Beq> =
             (values.parameters.clone(), values.beq.clone());
         let offsets = self.promotion_offsets.eval(&runtime_params)?;
-        let (variable_lower, variable_upper) = build_raw_bounds::<C, Beq, Bineq>(
+        let (variable_lower, variable_upper) = build_raw_bounds::<C, Beq, Bineq, G>(
             &self.promotion_plan,
             &offsets,
             &values.path_bounds,
             &values.bineq_bounds,
-            values.tf_bounds.clone(),
-            ms_variable_count::<X, U>(self.scheme.intervals),
+            &values.global_bounds,
+            ms_variable_count::<X, U, G>(self.scheme.intervals),
         )?;
         let scaling = values
             .scaling
@@ -2531,7 +2654,7 @@ where
 
     fn build_nlp_scaling(
         &self,
-        scaling: &OcpScaling<Numeric<P>, Numeric<X>, Numeric<U>>,
+        scaling: &OcpScaling<Numeric<P>, Numeric<X>, Numeric<U>, Numeric<G>>,
     ) -> Result<RuntimeNlpScaling, GuessError> {
         if scaling.path.len() != C::LEN {
             return Err(GuessError::Invalid(format!(
@@ -2555,7 +2678,7 @@ where
             )));
         }
 
-        let mut variables = Vec::with_capacity(ms_variable_count::<X, U>(self.scheme.intervals));
+        let mut variables = Vec::with_capacity(ms_variable_count::<X, U, G>(self.scheme.intervals));
         for _ in 0..=self.scheme.intervals {
             variables.extend(flatten_value(&scaling.state));
         }
@@ -2565,7 +2688,7 @@ where
         for _ in 0..self.scheme.intervals {
             variables.extend(flatten_value(&scaling.control_rate));
         }
-        variables.push(scaling.final_time);
+        variables.extend(flatten_value(&scaling.global));
 
         let state_scale = flatten_value(&scaling.state);
         let control_scale = flatten_value(&scaling.control);
@@ -2593,18 +2716,20 @@ where
     }
 }
 
-fn build_direct_collocation_interpolated_guess<X, U>(
-    samples: &InterpolatedTrajectory<X, U>,
+fn build_direct_collocation_interpolated_guess<X, U, G>(
+    samples: &InterpolatedTrajectory<X, U, G>,
     coeffs: &CollocationCoefficients,
     intervals: usize,
     time_grid: TimeGrid,
-) -> Result<DirectCollocationTrajectories<X, U>, GuessError>
+) -> Result<DirectCollocationTrajectories<X, U, G>, GuessError>
 where
     X: Clone,
     U: Clone,
+    G: OcpGlobalDesign<f64> + Clone,
 {
     validate_interpolation_samples(samples)?;
-    let times = direct_collocation_times(samples.tf, coeffs, intervals, time_grid);
+    let tf = samples.global.final_time();
+    let times = direct_collocation_times(tf, coeffs, intervals, time_grid);
     Ok(DirectCollocationTrajectories {
         x: Mesh {
             nodes: times
@@ -2677,29 +2802,33 @@ where
                 })
                 .collect(),
         },
-        tf: samples.tf,
+        global: samples.global.clone(),
+        tf,
     })
 }
 
-fn build_direct_collocation_rollout_guess<X, U, P>(
+fn build_direct_collocation_rollout_guess<X, U, P, G>(
     xdot: &CompiledXdot<X, U, P>,
     x0: &Numeric<X>,
     u0: &Numeric<U>,
-    tf: f64,
+    global: Numeric<G>,
     parameters: &Numeric<P>,
     controller: &ControllerFn<Numeric<X>, Numeric<U>, Numeric<P>>,
     coeffs: &CollocationCoefficients,
     intervals: usize,
     time_grid: TimeGrid,
-) -> Result<DirectCollocationTrajectories<Numeric<X>, Numeric<U>>, GuessError>
+) -> Result<DirectCollocationTrajectories<Numeric<X>, Numeric<U>, Numeric<G>>, GuessError>
 where
     X: Vectorize<SX>,
     U: Vectorize<SX>,
     P: Vectorize<SX>,
+    G: Vectorize<SX>,
     Numeric<X>: Vectorize<f64, Rebind<f64> = Numeric<X>> + Clone,
     Numeric<U>: Vectorize<f64, Rebind<f64> = Numeric<U>> + Clone,
     Numeric<P>: Vectorize<f64, Rebind<f64> = Numeric<P>>,
+    Numeric<G>: OcpGlobalDesign<f64> + Clone,
 {
+    let tf = global.final_time();
     let mesh_times = time_grid_mesh_unchecked(tf, intervals, time_grid);
     let mut x = x0.clone();
     let mut u = u0.clone();
@@ -2752,20 +2881,23 @@ where
         root_dudt: IntervalGrid {
             intervals: root_dudt,
         },
+        global,
         tf,
     })
 }
 
-fn project_direct_collocation<X, U>(
+fn project_direct_collocation<X, U, G>(
     values: &[f64],
     intervals: usize,
     order: usize,
-) -> Result<DirectCollocationTrajectories<Numeric<X>, Numeric<U>>, VectorizeLayoutError>
+) -> Result<DirectCollocationTrajectories<Numeric<X>, Numeric<U>, Numeric<G>>, VectorizeLayoutError>
 where
     X: Vectorize<SX>,
     U: Vectorize<SX>,
+    G: Vectorize<SX>,
     Numeric<X>: Vectorize<f64, Rebind<f64> = Numeric<X>>,
     Numeric<U>: Vectorize<f64, Rebind<f64> = Numeric<U>>,
+    Numeric<G>: OcpGlobalDesign<f64> + Vectorize<f64, Rebind<f64> = Numeric<G>>,
 {
     let mut index = 0usize;
     let x = take_numeric_mesh::<X>(values, &mut index, intervals)?;
@@ -2773,9 +2905,8 @@ where
     let root_x = take_numeric_interval_grid::<X>(values, &mut index, intervals, order)?;
     let root_u = take_numeric_interval_grid::<U>(values, &mut index, intervals, order)?;
     let root_dudt = take_numeric_interval_grid::<U>(values, &mut index, intervals, order)?;
-    let tf = *take_numeric_chunk(values, &mut index, 1)?
-        .first()
-        .expect("scalar slice should contain one entry");
+    let global = take_numeric_value::<G>(values, &mut index)?;
+    let tf = global.final_time();
     if index != values.len() {
         return Err(VectorizeLayoutError::LengthMismatch {
             expected: index,
@@ -2788,15 +2919,17 @@ where
         root_x,
         root_u,
         root_dudt,
+        global,
         tf,
     })
 }
 
-impl<X, U, P, C, Beq, Bineq> Ocp<X, U, P, C, Beq, Bineq, DirectCollocation>
+impl<X, U, P, C, Beq, Bineq, G> Ocp<X, U, P, C, Beq, Bineq, DirectCollocation, G>
 where
     X: Vectorize<SX, Rebind<SX> = X> + Clone,
     U: Vectorize<SX, Rebind<SX> = U> + Clone,
     P: Vectorize<SX, Rebind<SX> = P>,
+    G: OcpGlobalDesign<SX> + Vectorize<SX, Rebind<SX> = G>,
     C: Vectorize<SX, Rebind<SX> = C>,
     Beq: Vectorize<SX, Rebind<SX> = Beq>,
     Bineq: Vectorize<SX, Rebind<SX> = Bineq>,
@@ -2812,12 +2945,13 @@ where
         root_x: &IntervalGrid<X>,
         root_u: &IntervalGrid<U>,
         root_dudt: &IntervalGrid<U>,
-        tf: &SX,
+        global: &G,
         parameters: &P,
         beq: &Beq,
         coeffs: &CollocationCoefficients,
         symbolic_library: &OcpSymbolicFunctionLibrary,
     ) -> Result<DcTranscription, SxError> {
+        let tf = global.final_time();
         let interval_fractions =
             time_grid_interval_fractions(self.scheme.intervals, self.scheme.time_grid);
         let mut collocation_x =
@@ -2835,7 +2969,7 @@ where
             .enumerate()
             .take(self.scheme.intervals)
         {
-            let step = *tf * interval_fraction;
+            let step = tf * interval_fraction;
             let x_start = x_mesh.nodes[interval].clone();
             let u_start = u_mesh.nodes[interval].clone();
             let mut basis_x = Vec::with_capacity(self.scheme.order + 1);
@@ -2906,7 +3040,7 @@ where
             &x_mesh.terminal,
             &u_mesh.terminal,
             parameters,
-            tf,
+            global,
         )?;
         let boundary_eq_residual = subtract_vectorized(&boundary_eq_values, beq)?.flatten_cloned();
         let boundary_ineq = self
@@ -2917,7 +3051,7 @@ where
                 &x_mesh.terminal,
                 &u_mesh.terminal,
                 parameters,
-                tf,
+                global,
             )?
             .flatten_cloned();
         objective += self.eval_objective_mayer_symbolic(
@@ -2927,7 +3061,7 @@ where
             &x_mesh.terminal,
             &u_mesh.terminal,
             parameters,
-            tf,
+            global,
         )?;
 
         let mut equalities = Vec::with_capacity(dc_equality_count::<X, U>(
@@ -2950,21 +3084,21 @@ where
 
     pub fn compile_jit(
         &self,
-    ) -> Result<CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq>, OcpCompileError> {
+    ) -> Result<CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq, G>, OcpCompileError> {
         self.compile_jit_with_options(FunctionCompileOptions::from(LlvmOptimizationLevel::O3))
     }
 
     pub fn compile_jit_with_options(
         &self,
         options: FunctionCompileOptions,
-    ) -> Result<CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq>, OcpCompileError> {
+    ) -> Result<CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq, G>, OcpCompileError> {
         self.compile_jit_with_ocp_options(OcpCompileOptions::for_direct_collocation(options))
     }
 
     pub fn compile_jit_with_ocp_options(
         &self,
         options: OcpCompileOptions,
-    ) -> Result<CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq>, OcpCompileError> {
+    ) -> Result<CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq, G>, OcpCompileError> {
         self.compile_jit_with_ocp_options_and_progress_callback(options, |_| {})
     }
 
@@ -2972,7 +3106,7 @@ where
         &self,
         options: OcpCompileOptions,
         mut on_progress: CB,
-    ) -> Result<CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq>, OcpCompileError>
+    ) -> Result<CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq, G>, OcpCompileError>
     where
         CB: FnMut(OcpCompileProgress),
     {
@@ -2991,7 +3125,7 @@ where
         let symbolic_library = self.build_symbolic_function_library(options.symbolic_functions)?;
         let decision_symbols = symbolic_dense_vector(
             "w",
-            dc_variable_count::<X, U>(self.scheme.intervals, self.scheme.order),
+            dc_variable_count::<X, U, G>(self.scheme.intervals, self.scheme.order),
         );
         let decision_matrix = SXMatrix::dense_column(decision_symbols.clone())?;
         let mut decision_index = 0usize;
@@ -3023,9 +3157,7 @@ where
             self.scheme.intervals,
             self.scheme.order,
         )?;
-        let tf = *take_symbolic_chunk(&decision_symbols, &mut decision_index, 1)?
-            .first()
-            .expect("scalar slice should contain one entry");
+        let global = take_symbolic_value::<G>(&decision_symbols, &mut decision_index)?;
 
         let runtime_param_len = P::LEN + Beq::LEN;
         let parameter_symbols = symbolic_dense_vector("p", runtime_param_len);
@@ -3048,7 +3180,7 @@ where
             &root_x,
             &root_u,
             &root_dudt,
-            &tf,
+            &global,
             &parameters,
             &beq,
             &coefficients,
@@ -3163,18 +3295,21 @@ where
     }
 }
 
-impl<X, U, P, C, Beq, Bineq> CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq>
+impl<X, U, P, C, Beq, Bineq, G> CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq, G>
 where
     X: Vectorize<SX, Rebind<SX> = X> + Clone,
     U: Vectorize<SX, Rebind<SX> = U> + Clone,
     P: Vectorize<SX, Rebind<SX> = P>,
+    G: OcpGlobalDesign<SX> + Vectorize<SX, Rebind<SX> = G>,
     C: Vectorize<SX, Rebind<SX> = C>,
     Beq: Vectorize<SX, Rebind<SX> = Beq>,
     Bineq: Vectorize<SX, Rebind<SX> = Bineq>,
     Numeric<X>: Vectorize<f64, Rebind<f64> = Numeric<X>> + Clone,
     Numeric<U>: Vectorize<f64, Rebind<f64> = Numeric<U>> + Clone,
     Numeric<P>: Vectorize<f64, Rebind<f64> = Numeric<P>> + Clone,
+    Numeric<G>: OcpGlobalDesign<f64> + Vectorize<f64, Rebind<f64> = Numeric<G>> + Clone,
     Numeric<Beq>: Vectorize<f64, Rebind<f64> = Numeric<Beq>> + Clone,
+    BoundTemplate<G>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<G>> + Clone,
     BoundTemplate<C>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<C>>,
     BoundTemplate<Bineq>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<Bineq>>,
 {
@@ -3213,6 +3348,8 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
     ) -> AnyResult<Vec<f64>> {
         Ok(self.build_initial_guess(values)?)
@@ -3228,6 +3365,8 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
     ) -> AnyResult<(RuntimeNlpBounds, Option<RuntimeNlpScaling>)> {
         Ok(self.build_runtime_bounds(values)?)
@@ -3242,6 +3381,8 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
         options: NlpEvaluationBenchmarkOptions,
     ) -> AnyResult<NlpEvaluationBenchmark> {
@@ -3257,6 +3398,8 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
         options: NlpEvaluationBenchmarkOptions,
         on_progress: CB,
@@ -3286,6 +3429,8 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
         equality_multipliers: &[f64],
         inequality_multipliers: &[f64],
@@ -3320,9 +3465,12 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
         options: &ClarabelSqpOptions,
-    ) -> Result<DirectCollocationSqpSolveResult<Numeric<X>, Numeric<U>>, ClarabelSqpError> {
+    ) -> Result<DirectCollocationSqpSolveResult<Numeric<X>, Numeric<U>, Numeric<G>>, ClarabelSqpError>
+    {
         let initial_guess_started = Instant::now();
         let x0 = self
             .build_initial_guess(values)
@@ -3341,7 +3489,7 @@ where
             scaling.as_ref(),
             options,
         )?;
-        let trajectories = project_direct_collocation::<X, U>(
+        let trajectories = project_direct_collocation::<X, U, G>(
             &summary.x,
             self.scheme.intervals,
             self.scheme.order,
@@ -3367,12 +3515,14 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
         options: &ClarabelSqpOptions,
         mut callback: CB,
-    ) -> Result<DirectCollocationSqpSolveResult<Numeric<X>, Numeric<U>>, ClarabelSqpError>
+    ) -> Result<DirectCollocationSqpSolveResult<Numeric<X>, Numeric<U>, Numeric<G>>, ClarabelSqpError>
     where
-        CB: FnMut(&DirectCollocationSqpSnapshot<Numeric<X>, Numeric<U>>),
+        CB: FnMut(&DirectCollocationSqpSnapshot<Numeric<X>, Numeric<U>, Numeric<G>>),
     {
         let initial_guess_started = Instant::now();
         let x0 = self
@@ -3392,7 +3542,7 @@ where
             scaling.as_ref(),
             options,
             |snapshot| {
-                let trajectories = project_direct_collocation::<X, U>(
+                let trajectories = project_direct_collocation::<X, U, G>(
                     &snapshot.x,
                     self.scheme.intervals,
                     self.scheme.order,
@@ -3405,7 +3555,7 @@ where
                 });
             },
         )?;
-        let trajectories = project_direct_collocation::<X, U>(
+        let trajectories = project_direct_collocation::<X, U, G>(
             &summary.x,
             self.scheme.intervals,
             self.scheme.order,
@@ -3431,10 +3581,12 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
         options: &InteriorPointOptions,
     ) -> Result<
-        DirectCollocationInteriorPointSolveResult<Numeric<X>, Numeric<U>>,
+        DirectCollocationInteriorPointSolveResult<Numeric<X>, Numeric<U>, Numeric<G>>,
         InteriorPointSolveError,
     > {
         let initial_guess_started = Instant::now();
@@ -3455,7 +3607,7 @@ where
             scaling.as_ref(),
             options,
         )?;
-        let trajectories = project_direct_collocation::<X, U>(
+        let trajectories = project_direct_collocation::<X, U, G>(
             &summary.x,
             self.scheme.intervals,
             self.scheme.order,
@@ -3481,15 +3633,17 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
         options: &InteriorPointOptions,
         mut callback: CB,
     ) -> Result<
-        DirectCollocationInteriorPointSolveResult<Numeric<X>, Numeric<U>>,
+        DirectCollocationInteriorPointSolveResult<Numeric<X>, Numeric<U>, Numeric<G>>,
         InteriorPointSolveError,
     >
     where
-        CB: FnMut(&DirectCollocationInteriorPointSnapshot<Numeric<X>, Numeric<U>>),
+        CB: FnMut(&DirectCollocationInteriorPointSnapshot<Numeric<X>, Numeric<U>, Numeric<G>>),
     {
         let initial_guess_started = Instant::now();
         let x0 = self
@@ -3509,7 +3663,7 @@ where
             scaling.as_ref(),
             options,
             |snapshot| {
-                let trajectories = project_direct_collocation::<X, U>(
+                let trajectories = project_direct_collocation::<X, U, G>(
                     &snapshot.x,
                     self.scheme.intervals,
                     self.scheme.order,
@@ -3522,7 +3676,7 @@ where
                 });
             },
         )?;
-        let trajectories = project_direct_collocation::<X, U>(
+        let trajectories = project_direct_collocation::<X, U, G>(
             &summary.x,
             self.scheme.intervals,
             self.scheme.order,
@@ -3549,9 +3703,14 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
         options: &IpoptOptions,
-    ) -> Result<DirectCollocationIpoptSolveResult<Numeric<X>, Numeric<U>>, IpoptSolveError> {
+    ) -> Result<
+        DirectCollocationIpoptSolveResult<Numeric<X>, Numeric<U>, Numeric<G>>,
+        IpoptSolveError,
+    > {
         let initial_guess_started = Instant::now();
         let x0 = self
             .build_initial_guess(values)
@@ -3570,7 +3729,7 @@ where
             scaling.as_ref(),
             options,
         )?;
-        let trajectories = project_direct_collocation::<X, U>(
+        let trajectories = project_direct_collocation::<X, U, G>(
             &summary.x,
             self.scheme.intervals,
             self.scheme.order,
@@ -3597,12 +3756,17 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
         options: &IpoptOptions,
         mut callback: CB,
-    ) -> Result<DirectCollocationIpoptSolveResult<Numeric<X>, Numeric<U>>, IpoptSolveError>
+    ) -> Result<
+        DirectCollocationIpoptSolveResult<Numeric<X>, Numeric<U>, Numeric<G>>,
+        IpoptSolveError,
+    >
     where
-        CB: FnMut(&DirectCollocationIpoptSnapshot<Numeric<X>, Numeric<U>>),
+        CB: FnMut(&DirectCollocationIpoptSnapshot<Numeric<X>, Numeric<U>, Numeric<G>>),
     {
         let initial_guess_started = Instant::now();
         let x0 = self
@@ -3622,7 +3786,7 @@ where
             scaling.as_ref(),
             options,
             |snapshot| {
-                if let Ok(trajectories) = project_direct_collocation::<X, U>(
+                if let Ok(trajectories) = project_direct_collocation::<X, U, G>(
                     &snapshot.x,
                     self.scheme.intervals,
                     self.scheme.order,
@@ -3635,7 +3799,7 @@ where
                 }
             },
         )?;
-        let trajectories = project_direct_collocation::<X, U>(
+        let trajectories = project_direct_collocation::<X, U, G>(
             &summary.x,
             self.scheme.intervals,
             self.scheme.order,
@@ -3661,8 +3825,10 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
-        trajectories: &DirectCollocationTrajectories<Numeric<X>, Numeric<U>>,
+        trajectories: &DirectCollocationTrajectories<Numeric<X>, Numeric<U>, Numeric<G>>,
         tolerance: f64,
     ) -> Result<OcpConstraintViolationReport, VectorizeLayoutError> {
         let decision = self.flatten_decision(trajectories);
@@ -3767,13 +3933,12 @@ where
             OcpConstraintCategory::Path,
             tolerance,
         );
-        accumulate_inequality_group(
+        add_repeated_inequalities(
             &mut inequality_groups,
-            "T",
+            &flatten_value(&trajectories.global),
+            &prefixed_leaf_names::<G>("g"),
+            &flatten_bounds(&values.global_bounds),
             OcpConstraintCategory::FinalTime,
-            trajectories.tf,
-            values.tf_bounds.lower,
-            values.tf_bounds.upper,
             tolerance,
         );
 
@@ -3792,9 +3957,9 @@ where
 
     fn flatten_decision(
         &self,
-        trajectories: &DirectCollocationTrajectories<Numeric<X>, Numeric<U>>,
+        trajectories: &DirectCollocationTrajectories<Numeric<X>, Numeric<U>, Numeric<G>>,
     ) -> Vec<f64> {
-        let mut flat = Vec::with_capacity(dc_variable_count::<X, U>(
+        let mut flat = Vec::with_capacity(dc_variable_count::<X, U, G>(
             self.scheme.intervals,
             self.scheme.order,
         ));
@@ -3809,7 +3974,7 @@ where
         flat.extend(flatten_interval_grid::<Numeric<U>, f64>(
             &trajectories.root_dudt,
         ));
-        flat.push(trajectories.tf);
+        flat.extend(flatten_value(&trajectories.global));
         flat
     }
 
@@ -3822,6 +3987,8 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
     ) -> Result<Vec<f64>, GuessError> {
         let trajectories = match &values.initial_guess {
@@ -3848,7 +4015,34 @@ where
                             self.scheme.intervals
                         ],
                     },
+                    global: Numeric::<G>::from_final_time(*tf),
                     tf: *tf,
+                }
+            }
+            DirectCollocationInitialGuess::ConstantGlobal { x, u, dudt, global } => {
+                DirectCollocationTrajectories {
+                    x: Mesh {
+                        nodes: vec![x.clone(); self.scheme.intervals],
+                        terminal: x.clone(),
+                    },
+                    u: Mesh {
+                        nodes: vec![u.clone(); self.scheme.intervals],
+                        terminal: u.clone(),
+                    },
+                    root_x: IntervalGrid {
+                        intervals: vec![vec![x.clone(); self.scheme.order]; self.scheme.intervals],
+                    },
+                    root_u: IntervalGrid {
+                        intervals: vec![vec![u.clone(); self.scheme.order]; self.scheme.intervals],
+                    },
+                    root_dudt: IntervalGrid {
+                        intervals: vec![
+                            vec![dudt.clone(); self.scheme.order];
+                            self.scheme.intervals
+                        ],
+                    },
+                    global: global.clone(),
+                    tf: global.final_time(),
                 }
             }
             DirectCollocationInitialGuess::Interpolated(samples) => {
@@ -3864,11 +4058,27 @@ where
                 u0,
                 tf,
                 controller,
-            } => build_direct_collocation_rollout_guess(
+            } => build_direct_collocation_rollout_guess::<X, U, P, G>(
                 &self.xdot_helper,
                 x0,
                 u0,
-                *tf,
+                Numeric::<G>::from_final_time(*tf),
+                &values.parameters,
+                controller.as_ref(),
+                &self.coefficients,
+                self.scheme.intervals,
+                self.scheme.time_grid,
+            )?,
+            DirectCollocationInitialGuess::RolloutGlobal {
+                x0,
+                u0,
+                global,
+                controller,
+            } => build_direct_collocation_rollout_guess::<X, U, P, G>(
+                &self.xdot_helper,
+                x0,
+                u0,
+                global.clone(),
                 &values.parameters,
                 controller.as_ref(),
                 &self.coefficients,
@@ -3888,18 +4098,20 @@ where
             BoundTemplate<Bineq>,
             Numeric<X>,
             Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
         >,
     ) -> Result<(RuntimeNlpBounds, Option<RuntimeNlpScaling>), GuessError> {
         let runtime_params: OcpParametersNum<P, Beq> =
             (values.parameters.clone(), values.beq.clone());
         let offsets = self.promotion_offsets.eval(&runtime_params)?;
-        let (variable_lower, variable_upper) = build_raw_bounds::<C, Beq, Bineq>(
+        let (variable_lower, variable_upper) = build_raw_bounds::<C, Beq, Bineq, G>(
             &self.promotion_plan,
             &offsets,
             &values.path_bounds,
             &values.bineq_bounds,
-            values.tf_bounds.clone(),
-            dc_variable_count::<X, U>(self.scheme.intervals, self.scheme.order),
+            &values.global_bounds,
+            dc_variable_count::<X, U, G>(self.scheme.intervals, self.scheme.order),
         )?;
         let scaling = values
             .scaling
@@ -3933,7 +4145,7 @@ where
 
     fn build_nlp_scaling(
         &self,
-        scaling: &OcpScaling<Numeric<P>, Numeric<X>, Numeric<U>>,
+        scaling: &OcpScaling<Numeric<P>, Numeric<X>, Numeric<U>, Numeric<G>>,
     ) -> Result<RuntimeNlpScaling, GuessError> {
         if scaling.path.len() != C::LEN {
             return Err(GuessError::Invalid(format!(
@@ -3957,7 +4169,7 @@ where
             )));
         }
 
-        let mut variables = Vec::with_capacity(dc_variable_count::<X, U>(
+        let mut variables = Vec::with_capacity(dc_variable_count::<X, U, G>(
             self.scheme.intervals,
             self.scheme.order,
         ));
@@ -3976,7 +4188,7 @@ where
         for _ in 0..(self.scheme.intervals * self.scheme.order) {
             variables.extend(flatten_value(&scaling.control_rate));
         }
-        variables.push(scaling.final_time);
+        variables.extend(flatten_value(&scaling.global));
 
         let state_scale = flatten_value(&scaling.state);
         let control_scale = flatten_value(&scaling.control);

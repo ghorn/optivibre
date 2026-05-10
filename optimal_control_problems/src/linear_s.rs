@@ -18,7 +18,7 @@ use optimal_control::runtime::{
     DirectCollocation, MultipleShooting, direct_collocation_root_arcs,
     direct_collocation_state_like_arcs,
 };
-use optimal_control::{Bounds1D, InterpolatedTrajectory, IntervalArc, Ocp};
+use optimal_control::{Bounds1D, FinalTime, InterpolatedTrajectory, IntervalArc, Ocp};
 use serde::Serialize;
 use std::f64::consts::PI;
 use sx_core::SX;
@@ -750,6 +750,7 @@ fn continuous_guess(
             .zip(jy.iter())
             .map(|(ax, ay)| Control { ax: *ax, ay: *ay })
             .collect(),
+        global: FinalTime { tf: params.tf_s },
         tf: params.tf_s,
     })
 }
