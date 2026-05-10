@@ -10,7 +10,8 @@ mod transcript;
 pub use dashboard::write_dashboard;
 pub use manifest::{
     DEFAULT_MAX_ITERS, IterationLimits, KnownStatus, ProblemManifestEntry, ProblemSpeed,
-    manifest_entries, manifest_entry, manifest_entry_by_id, slow_manifest_entry,
+    ProblemTestSet, burkardt_manifest_entry, manifest_entries, manifest_entry,
+    manifest_entry_by_id, slow_burkardt_manifest_entry, slow_manifest_entry,
 };
 pub use model::{
     CallPolicyMode, JitOptLevel, ProblemCase, ProblemDescriptor, ProblemRunOptions,

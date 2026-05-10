@@ -3,7 +3,7 @@ use std::time::Duration;
 use optimization::{CallPolicy, CallPolicyConfig, FunctionCompileOptions, LlvmOptimizationLevel};
 use serde::{Serialize, ser::SerializeStruct};
 
-use crate::manifest::KnownStatus;
+use crate::manifest::{KnownStatus, ProblemTestSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -143,6 +143,7 @@ pub enum ValidationTier {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ProblemDescriptor {
     pub id: String,
+    pub test_set: ProblemTestSet,
     pub family: String,
     pub variant: String,
     pub source: String,
@@ -300,6 +301,7 @@ pub struct RunArtifacts {
 
 pub struct ProblemCase {
     pub id: &'static str,
+    pub test_set: ProblemTestSet,
     pub family: &'static str,
     pub variant: &'static str,
     pub source: &'static str,
@@ -326,6 +328,7 @@ impl std::fmt::Debug for ProblemCase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProblemCase")
             .field("id", &self.id)
+            .field("test_set", &self.test_set)
             .field("family", &self.family)
             .field("variant", &self.variant)
             .field("source", &self.source)

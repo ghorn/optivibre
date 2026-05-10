@@ -1,9 +1,11 @@
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
 use anyhow::{Result, anyhow, bail};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use serde::Serialize;
 
-use crate::manifest::{KnownStatus, ProblemSpeed, manifest_entry_by_id};
+use crate::manifest::{KnownStatus, ProblemSpeed, ProblemTestSet, manifest_entry_by_id};
 use crate::model::{
     CallPolicyMode, JitOptLevel, ProblemCase, ProblemDescriptor, ProblemRunOptions,
     ProblemRunRecord, RunStatus, SolverKind, ValidationOutcome, ValidationTier,
@@ -18,6 +20,7 @@ pub struct RunRequest {
     pub jobs: Option<usize>,
     pub include_skipped: bool,
     pub problem_set: Option<ProblemSpeed>,
+    pub test_set: Option<ProblemTestSet>,
     pub progress: bool,
 }
 
@@ -33,6 +36,7 @@ impl Default for RunRequest {
             jobs: None,
             include_skipped: false,
             problem_set: None,
+            test_set: None,
             progress: false,
         }
     }
@@ -75,6 +79,9 @@ pub fn run_cases(request: &RunRequest) -> Result<RunResults> {
                     if request.problem_set.is_some_and(|set| manifest.speed != set) {
                         return Ok(None);
                     }
+                    if request.test_set.is_some_and(|set| manifest.test_set != set) {
+                        return Ok(None);
+                    }
                     let max_iters_limit = match solver {
                         SolverKind::Sqp => manifest.max_iters.sqp,
                         SolverKind::Nlip => manifest.max_iters.nlip,
@@ -108,7 +115,21 @@ pub fn run_cases(request: &RunRequest) -> Result<RunResults> {
                     KnownStatus::Skipped => {
                         skipped_record(case, *solver, *run_options, *expected, *max_iters_limit)
                     }
-                    _ => case.run(*solver, *run_options, *max_iters_limit, *expected),
+                    _ => {
+                        match catch_unwind(AssertUnwindSafe(|| {
+                            case.run(*solver, *run_options, *max_iters_limit, *expected)
+                        })) {
+                            Ok(record) => record,
+                            Err(payload) => panic_record(
+                                case,
+                                *solver,
+                                *run_options,
+                                *expected,
+                                *max_iters_limit,
+                                panic_payload_message(&payload),
+                            ),
+                        }
+                    }
                 };
                 if let Some(progress) = &progress {
                     progress.inc(1);
@@ -194,6 +215,7 @@ fn skipped_record(
         status: RunStatus::Skipped,
         descriptor: ProblemDescriptor {
             id: case.id.to_string(),
+            test_set: case.test_set,
             family: case.family.to_string(),
             variant: case.variant.to_string(),
             source: case.source.to_string(),
@@ -224,6 +246,65 @@ fn skipped_record(
     }
 }
 
+fn panic_record(
+    case: &ProblemCase,
+    solver: SolverKind,
+    options: ProblemRunOptions,
+    expected: KnownStatus,
+    max_iters_limit: usize,
+    panic_message: String,
+) -> ProblemRunRecord {
+    let detail = format!("solver panicked: {panic_message}");
+    ProblemRunRecord {
+        id: case.id.to_string(),
+        solver,
+        options,
+        expected,
+        max_iters_limit,
+        status: RunStatus::SolveError,
+        descriptor: ProblemDescriptor {
+            id: case.id.to_string(),
+            test_set: case.test_set,
+            family: case.family.to_string(),
+            variant: case.variant.to_string(),
+            source: case.source.to_string(),
+            description: case.description.to_string(),
+            parameterized: case.parameterized,
+            num_vars: 0,
+            num_eq: 0,
+            num_ineq: 0,
+            num_box: 0,
+            dof: 0,
+            constrained: false,
+        },
+        solution: None,
+        metrics: crate::model::SolverMetrics::default(),
+        timing: crate::model::SolverTimingBreakdown::default(),
+        validation: ValidationOutcome {
+            tier: ValidationTier::Failed,
+            tolerance: "solver must not panic".to_string(),
+            detail: detail.clone(),
+        },
+        solver_thresholds: None,
+        solver_settings: None,
+        error: Some(detail),
+        compile_report: None,
+        console_output: None,
+        console_output_path: None,
+        filter_replay: None,
+    }
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
 fn make_progress_bar(total: usize) -> ProgressBar {
     let progress = ProgressBar::new(total as u64);
     let style = ProgressStyle::with_template(
@@ -240,6 +321,8 @@ fn failure_brief(record: &ProblemRunRecord) -> String {
     if let Some(error) = &record.error {
         if error.contains("failed to converge") {
             "max_iters".to_string()
+        } else if error.contains("solver panicked") {
+            "panic".to_string()
         } else if error.contains("line search failed") {
             "line_search".to_string()
         } else if error.contains("PrimalInfeasible") {

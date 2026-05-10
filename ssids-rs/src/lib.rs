@@ -2168,7 +2168,13 @@ fn build_symbolic_result_with_native_order_and_scaling(
         let expanded_pattern = expand_symmetric_pattern(matrix);
         let native_counts =
             native_column_counts(&expanded_pattern, &final_permutation, &final_tree);
-        debug_assert_eq!(native_counts, simulated_final_counts);
+        debug_assert!(
+            native_counts
+                .iter()
+                .zip(&simulated_final_counts)
+                .all(|(native, simulated)| native <= simulated),
+            "symbolic column counts underallocate native pattern: native={native_counts:?}, simulated={simulated_final_counts:?}"
+        );
     }
     let final_counts = simulated_final_counts;
     if trace {

@@ -15,6 +15,22 @@ pub enum ProblemSpeed {
     Slow,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProblemTestSet {
+    Core,
+    BurkardtTestNonlin,
+}
+
+impl ProblemTestSet {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Core => "core",
+            Self::BurkardtTestNonlin => "burkardt_test_nonlin",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IterationLimits {
     pub sqp: usize,
@@ -40,6 +56,7 @@ pub struct ProblemManifestEntry {
     pub ipopt: KnownStatus,
     pub max_iters: IterationLimits,
     pub speed: ProblemSpeed,
+    pub test_set: ProblemTestSet,
 }
 
 pub const DEFAULT_MAX_ITERS: usize = 300;
@@ -57,6 +74,7 @@ pub const fn manifest_entry(
         ipopt: nlip,
         max_iters,
         speed: ProblemSpeed::Fast,
+        test_set: ProblemTestSet::Core,
     }
 }
 
@@ -74,6 +92,7 @@ pub const fn manifest_entry_with_ipopt(
         ipopt,
         max_iters,
         speed: ProblemSpeed::Fast,
+        test_set: ProblemTestSet::Core,
     }
 }
 
@@ -90,6 +109,7 @@ pub const fn slow_manifest_entry(
         ipopt: nlip,
         max_iters,
         speed: ProblemSpeed::Slow,
+        test_set: ProblemTestSet::Core,
     }
 }
 
@@ -107,6 +127,43 @@ pub const fn slow_manifest_entry_with_ipopt(
         ipopt,
         max_iters,
         speed: ProblemSpeed::Slow,
+        test_set: ProblemTestSet::Core,
+    }
+}
+
+pub const fn burkardt_manifest_entry(
+    id: &'static str,
+    sqp: KnownStatus,
+    nlip: KnownStatus,
+    ipopt: KnownStatus,
+    max_iters: IterationLimits,
+) -> ProblemManifestEntry {
+    ProblemManifestEntry {
+        id,
+        sqp,
+        nlip,
+        ipopt,
+        max_iters,
+        speed: ProblemSpeed::Fast,
+        test_set: ProblemTestSet::BurkardtTestNonlin,
+    }
+}
+
+pub const fn slow_burkardt_manifest_entry(
+    id: &'static str,
+    sqp: KnownStatus,
+    nlip: KnownStatus,
+    ipopt: KnownStatus,
+    max_iters: IterationLimits,
+) -> ProblemManifestEntry {
+    ProblemManifestEntry {
+        id,
+        sqp,
+        nlip,
+        ipopt,
+        max_iters,
+        speed: ProblemSpeed::Slow,
+        test_set: ProblemTestSet::BurkardtTestNonlin,
     }
 }
 
@@ -458,6 +515,356 @@ const MANIFEST: &[ProblemManifestEntry] = &[
             nlip: 400,
             ipopt: 400,
         },
+    ),
+    slow_burkardt_manifest_entry(
+        "burkardt_p01_generalized_rosenbrock_n02",
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    burkardt_manifest_entry(
+        "burkardt_p01_generalized_rosenbrock_n10",
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    slow_burkardt_manifest_entry(
+        "burkardt_p01_generalized_rosenbrock_n20",
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    burkardt_manifest_entry(
+        "burkardt_p02_powell_singular_n04",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    burkardt_manifest_entry(
+        "burkardt_p03_powell_badly_scaled_n02",
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    burkardt_manifest_entry(
+        "burkardt_p04_wood_n04",
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    burkardt_manifest_entry(
+        "burkardt_p05_helical_valley_n03",
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    slow_burkardt_manifest_entry(
+        "burkardt_p06_watson_n02",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    burkardt_manifest_entry(
+        "burkardt_p06_watson_n10",
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    slow_burkardt_manifest_entry(
+        "burkardt_p06_watson_n20",
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    slow_burkardt_manifest_entry(
+        "burkardt_p07_chebyquad_n01",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        IterationLimits::with_default(500),
+    ),
+    slow_burkardt_manifest_entry(
+        "burkardt_p07_chebyquad_n02",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    slow_burkardt_manifest_entry(
+        "burkardt_p07_chebyquad_n03",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    slow_burkardt_manifest_entry(
+        "burkardt_p07_chebyquad_n04",
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    slow_burkardt_manifest_entry(
+        "burkardt_p07_chebyquad_n05",
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    slow_burkardt_manifest_entry(
+        "burkardt_p07_chebyquad_n06",
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    slow_burkardt_manifest_entry(
+        "burkardt_p07_chebyquad_n07",
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    burkardt_manifest_entry(
+        "burkardt_p07_chebyquad_n09",
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    slow_burkardt_manifest_entry(
+        "burkardt_p08_brown_almost_linear_n01",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    burkardt_manifest_entry(
+        "burkardt_p08_brown_almost_linear_n10",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    slow_burkardt_manifest_entry(
+        "burkardt_p08_brown_almost_linear_n20",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    slow_burkardt_manifest_entry(
+        "burkardt_p09_discrete_boundary_value_n01",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    burkardt_manifest_entry(
+        "burkardt_p09_discrete_boundary_value_n10",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    slow_burkardt_manifest_entry(
+        "burkardt_p09_discrete_boundary_value_n20",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    slow_burkardt_manifest_entry(
+        "burkardt_p10_discrete_integral_equation_n01",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    burkardt_manifest_entry(
+        "burkardt_p10_discrete_integral_equation_n10",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    slow_burkardt_manifest_entry(
+        "burkardt_p10_discrete_integral_equation_n20",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    slow_burkardt_manifest_entry(
+        "burkardt_p11_trigonometric_n01",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    burkardt_manifest_entry(
+        "burkardt_p11_trigonometric_n10",
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    slow_burkardt_manifest_entry(
+        "burkardt_p11_trigonometric_n20",
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    slow_burkardt_manifest_entry(
+        "burkardt_p12_variably_dimensioned_n01",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    burkardt_manifest_entry(
+        "burkardt_p12_variably_dimensioned_n10",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    slow_burkardt_manifest_entry(
+        "burkardt_p12_variably_dimensioned_n20",
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    slow_burkardt_manifest_entry(
+        "burkardt_p13_broyden_tridiagonal_n01",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    burkardt_manifest_entry(
+        "burkardt_p13_broyden_tridiagonal_n10",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    slow_burkardt_manifest_entry(
+        "burkardt_p13_broyden_tridiagonal_n20",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    slow_burkardt_manifest_entry(
+        "burkardt_p14_broyden_banded_n01",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    burkardt_manifest_entry(
+        "burkardt_p14_broyden_banded_n10",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    slow_burkardt_manifest_entry(
+        "burkardt_p14_broyden_banded_n20",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    burkardt_manifest_entry(
+        "burkardt_p15_hammarling_2x2_n04",
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    burkardt_manifest_entry(
+        "burkardt_p16_hammarling_3x3_n09",
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    burkardt_manifest_entry(
+        "burkardt_p17_dennis_schnabel_n02",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    burkardt_manifest_entry(
+        "burkardt_p18_sample18_n02",
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    burkardt_manifest_entry(
+        "burkardt_p19_sample19_n02",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    burkardt_manifest_entry(
+        "burkardt_p20_scalar_n01",
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    burkardt_manifest_entry(
+        "burkardt_p21_freudenstein_roth_n02",
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    burkardt_manifest_entry(
+        "burkardt_p22_boggs_n02",
+        KnownStatus::KnownFailing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    slow_burkardt_manifest_entry(
+        "burkardt_p23_chandrasekhar_n01",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    burkardt_manifest_entry(
+        "burkardt_p23_chandrasekhar_n10",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
+    ),
+    slow_burkardt_manifest_entry(
+        "burkardt_p23_chandrasekhar_n20",
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownPassing,
+        KnownStatus::KnownFailing,
+        IterationLimits::with_default(500),
     ),
 ];
 

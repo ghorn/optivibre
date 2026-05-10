@@ -4,9 +4,9 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use test_problems::{
-    CallPolicyMode, JitOptLevel, ProblemRunOptions, ProblemSpeed, RunRequest, SolverKind,
-    render_markdown_report, render_terminal_report, run_cases, write_dashboard, write_html_report,
-    write_json_report, write_transcript_artifacts,
+    CallPolicyMode, JitOptLevel, ProblemRunOptions, ProblemSpeed, ProblemTestSet, RunRequest,
+    SolverKind, render_markdown_report, render_terminal_report, run_cases, write_dashboard,
+    write_html_report, write_json_report, write_transcript_artifacts,
 };
 
 #[derive(Debug, Parser)]
@@ -21,6 +21,8 @@ struct TestProblemsCli {
     solver: Option<CliSolverSelection>,
     #[arg(long = "problem-set", value_enum)]
     problem_set: Option<CliProblemSetSelection>,
+    #[arg(long = "test-set", value_enum)]
+    test_set: Option<CliTestSetSelection>,
     #[arg(long = "jit-opt", value_enum)]
     jit_opt: Option<CliJitOptSelection>,
     #[arg(long = "call-policy", value_enum)]
@@ -50,6 +52,13 @@ enum CliSolverSelection {
 enum CliProblemSetSelection {
     Fast,
     Slow,
+    All,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliTestSetSelection {
+    Core,
+    BurkardtTestNonlin,
     All,
 }
 
@@ -93,6 +102,9 @@ fn main() -> Result<()> {
     }
     if let Some(selection) = cli.problem_set {
         request.problem_set = selection.problem_speed();
+    }
+    if let Some(selection) = cli.test_set {
+        request.test_set = selection.test_set();
     }
     if let Some(selection) = cli.jit_opt {
         let call_policies = request
@@ -197,6 +209,16 @@ impl CliProblemSetSelection {
         match self {
             Self::Fast => Some(ProblemSpeed::Fast),
             Self::Slow => Some(ProblemSpeed::Slow),
+            Self::All => None,
+        }
+    }
+}
+
+impl CliTestSetSelection {
+    fn test_set(self) -> Option<ProblemTestSet> {
+        match self {
+            Self::Core => Some(ProblemTestSet::Core),
+            Self::BurkardtTestNonlin => Some(ProblemTestSet::BurkardtTestNonlin),
             Self::All => None,
         }
     }

@@ -279,6 +279,24 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
     .family-matrix td {{
       min-width: 150px;
     }}
+    .family-matrix .summary-row td {{
+      background: linear-gradient(180deg, rgba(30, 41, 59, 0.98), rgba(15, 23, 42, 0.94));
+      border-bottom: 4px solid rgba(96, 165, 250, 0.82);
+      font-weight: 700;
+      position: sticky;
+      top: 34px;
+      z-index: 1;
+    }}
+    .family-matrix .summary-row td:first-child {{
+      color: #e0f2fe;
+      font-size: 14px;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+    }}
+    .family-matrix .summary-row .matrix-cell {{
+      border-width: 2px;
+      box-shadow: inset 0 1px 0 rgba(226, 232, 240, 0.08);
+    }}
     .matrix-cell {{
       border-radius: 12px;
       border: 1px solid var(--border-soft);
@@ -307,6 +325,70 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
     .matrix-sub {{
       color: var(--muted);
       font-size: 12px;
+    }}
+    .matrix-counts {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0 8px;
+      align-items: center;
+      font-size: 12px;
+      line-height: 1.35;
+    }}
+    .matrix-count {{
+      font-weight: 700;
+      cursor: help;
+      text-decoration: underline;
+      text-decoration-thickness: 1px;
+      text-underline-offset: 3px;
+      text-decoration-color: rgba(148, 163, 184, 0.35);
+    }}
+    .matrix-count.pass {{ color: var(--pass); }}
+    .matrix-count.reduced {{ color: var(--reduced); }}
+    .matrix-count.panic {{ color: #fca5a5; }}
+    .matrix-count.max_iters {{ color: #fb7185; }}
+    .matrix-count.line_search {{ color: #f97316; }}
+    .matrix-count.restoration {{ color: #ec4899; }}
+    .matrix-count.step_computation {{ color: #c084fc; }}
+    .matrix-count.local_infeasible {{ color: #ef4444; }}
+    .matrix-count.non_finite {{ color: #a78bfa; }}
+    .matrix-count.objective {{ color: #f43f5e; }}
+    .matrix-count.primal {{ color: #e11d48; }}
+    .matrix-count.dual {{ color: #be123c; }}
+    .matrix-count.validation {{ color: #f87171; }}
+    .matrix-count.solve_error {{ color: var(--fail); }}
+    .matrix-count.skip {{ color: var(--skip); }}
+    .matrix-bars {{
+      display: flex;
+      height: 9px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.92);
+      border: 1px solid rgba(148, 163, 184, 0.18);
+    }}
+    .matrix-segment.pass {{ background: var(--pass); }}
+    .matrix-segment.reduced {{ background: var(--reduced); }}
+    .matrix-segment.panic {{ background: #dc2626; }}
+    .matrix-segment.max_iters {{ background: #fb7185; }}
+    .matrix-segment.line_search {{ background: #f97316; }}
+    .matrix-segment.restoration {{ background: #ec4899; }}
+    .matrix-segment.step_computation {{ background: #c084fc; }}
+    .matrix-segment.local_infeasible {{ background: #ef4444; }}
+    .matrix-segment.non_finite {{ background: #a78bfa; }}
+    .matrix-segment.objective {{ background: #f43f5e; }}
+    .matrix-segment.primal {{ background: #e11d48; }}
+    .matrix-segment.dual {{ background: #be123c; }}
+    .matrix-segment.validation {{ background: #f87171; }}
+    .matrix-segment.solve_error {{ background: var(--fail); }}
+    .matrix-segment.skip {{ background: var(--skip); }}
+    .detail-cell {{
+      min-width: 240px;
+      max-width: 420px;
+      color: var(--muted);
+      line-height: 1.35;
+      white-space: normal;
+    }}
+    .detail-cell.error {{
+      color: #fecaca;
     }}
     .empty-state {{
       color: var(--muted);
@@ -343,6 +425,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
       <div class="controls-grid">
         <div class="control"><label for="filter-search">Problem search</label><input id="filter-search" type="text" placeholder="problem id or variant"></div>
         <div class="control"><label for="filter-solver">Solver</label><select id="filter-solver"></select></div>
+        <div class="control"><label for="filter-test-set">Test set</label><select id="filter-test-set"></select></div>
         <div class="control"><label for="filter-family">Family</label><select id="filter-family"></select></div>
         <div class="control"><label for="filter-status">Status</label><select id="filter-status"></select></div>
         <div class="control"><label for="filter-jit">JIT</label><select id="filter-jit"></select></div>
@@ -410,6 +493,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
     const filterIds = [
       "filter-search",
       "filter-solver",
+      "filter-test-set",
       "filter-family",
       "filter-status",
       "filter-jit",
@@ -505,19 +589,89 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
       const text = failureReason(record).toLowerCase();
       if (record.status === "passed") return "--";
       if (record.status === "reduced_accuracy") return "reduced";
-      if (text.includes("max iteration")) return "max_iters";
-      if (text.includes("line search")) return "line_search";
-      if (text.includes("primal infeasible")) return "primal_infeasible";
+      if (text.includes("panicked")) return "panic";
+      if (text.includes("max iteration") || text.includes("failed to converge")) return "max_iters";
+      if (text.includes("line search") || text.includes("armijo")) return "line_search";
+      if (text.includes("restoration")) return "restoration";
+      if (text.includes("errorinstepcomputation") || text.includes("step computation")) return "step_computation";
+      if (text.includes("primal infeasible") || text.includes("local infeasibility")) return "local_infeasible";
       if (text.includes("non-finite") || text.includes("nan") || text.includes("inf")) return "non_finite";
+      if (record.status === "failed_validation" && text.includes("objective")) return "objective";
+      if (record.status === "failed_validation" && text.includes("primal")) return "primal";
+      if (record.status === "failed_validation" && text.includes("dual")) return "dual";
       if (text.includes("validation")) return "validation";
       return statusLabel(record.status);
     }};
+
+    const resultSegment = (record) => {{
+      if (record.status === "passed") return "pass";
+      if (record.status === "reduced_accuracy") return "reduced";
+      if (record.status === "skipped") return "skip";
+      return failureCode(record);
+    }};
+
+    const segmentLabel = (segment) => ({{
+      pass: "pass",
+      reduced: "reduced",
+      panic: "panic",
+      max_iters: "max iters",
+      line_search: "line search",
+      restoration: "restoration",
+      step_computation: "step comp",
+      local_infeasible: "infeasible",
+      non_finite: "non-finite",
+      objective: "objective",
+      primal: "primal",
+      dual: "dual",
+      validation: "validation",
+      solve_error: "solve error",
+      skip: "skip",
+    }})[segment] || segment.replaceAll("_", " ");
+
+    const segmentDescription = (segment) => ({{
+      pass: "Solver returned success and strict validation passed.",
+      reduced: "Accepted by the reduced-accuracy residual thresholds.",
+      panic: "Solver panicked; the runner captured it as a solve error.",
+      max_iters: "Solver stopped at its iteration limit.",
+      line_search: "Line search or Armijo backtracking failed.",
+      restoration: "Restoration phase failed before finding a feasible point.",
+      step_computation: "IPOPT reported an error in step computation.",
+      local_infeasible: "Solver reported local or primal infeasibility.",
+      non_finite: "A non-finite value was encountered.",
+      objective: "Objective validation failed.",
+      primal: "Primal or constraint-residual validation failed.",
+      dual: "Dual optimality validation failed.",
+      validation: "Run completed but validation failed.",
+      solve_error: "Solver returned an unclassified solve error.",
+      skip: "Skipped by the manifest.",
+    }})[segment] || segment.replaceAll("_", " ");
+
+    const segmentOrder = [
+      "pass",
+      "reduced",
+      "panic",
+      "max_iters",
+      "line_search",
+      "restoration",
+      "step_computation",
+      "local_infeasible",
+      "non_finite",
+      "objective",
+      "primal",
+      "dual",
+      "validation",
+      "solve_error",
+      "skip",
+    ];
+
+    const detailClass = (record) => record.status === "solve_error" ? "detail-cell error" : "detail-cell";
 
     const problemHref = (record) => record.console_output_path || null;
 
     const hoverText = (record, xLabel, yLabel, xValue, yValue) => {{
       return [
         `problem: ${{record.id}}`,
+        `test set: ${{record.descriptor.test_set}}`,
         `family: ${{record.descriptor.family}} / ${{record.descriptor.variant}}`,
         `solver: ${{solverLabel(record.solver)}} / ${{record.options.jit_opt_level.toUpperCase()}} / ${{record.options.call_policy}}`,
         `status: ${{statusLabel(record.status)}}`,
@@ -551,6 +705,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
 
     function initializeFilters() {{
       populateSelect('filter-solver', unique(records.map((record) => record.solver), solverOrder), solverLabel);
+      populateSelect('filter-test-set', unique(records.map((record) => record.descriptor.test_set)));
       populateSelect('filter-family', unique(records.map((record) => record.descriptor.family)));
       populateSelect('filter-status', unique(records.map((record) => record.status), statusOrder), statusLabel);
       populateSelect('filter-jit', unique(records.map((record) => record.options.jit_opt_level.toUpperCase())));
@@ -569,6 +724,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
     function filteredRecords() {{
       const search = byId('filter-search').value.trim().toLowerCase();
       const solver = byId('filter-solver').value;
+      const testSet = byId('filter-test-set').value;
       const family = byId('filter-family').value;
       const status = byId('filter-status').value;
       const jit = byId('filter-jit').value;
@@ -583,6 +739,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
           if (!haystack.includes(search)) return false;
         }}
         if (solver && record.solver !== solver) return false;
+        if (testSet && record.descriptor.test_set !== testSet) return false;
         if (family && record.descriptor.family !== family) return false;
         if (status && record.status !== status) return false;
         if (jit && record.options.jit_opt_level.toUpperCase() !== jit) return false;
@@ -735,7 +892,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
       const html = `
         <div class="table-scroll">
           <table>
-            <thead><tr><th>Problem</th><th>Solver</th><th>Status</th><th>Iters</th><th>Elastic</th><th>Total</th><th>Reason</th></tr></thead>
+            <thead><tr><th>Problem</th><th>Solver</th><th>Status</th><th>Iters</th><th>Elastic</th><th>Total</th><th>Reason</th><th>Detail</th></tr></thead>
             <tbody>
               ${{rows.map((record) => `
                 <tr>
@@ -746,6 +903,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
                   <td>${{htmlEscape(elasticText(record))}}</td>
                   <td>${{formatDuration(record.timing.total_wall_time)}}</td>
                   <td>${{htmlEscape(failureCode(record))}}</td>
+                  <td class="${{detailClass(record)}}">${{htmlEscape(failureReason(record))}}</td>
                 </tr>`).join('')}}
             </tbody>
           </table>
@@ -806,6 +964,11 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
               </tr>
             </thead>
             <tbody>
+              <tr class="summary-row">
+                <td>Total</td>
+                ${{solvers.map((solver) => familyMatrixCell(records.filter((record) => record.solver === solver))).join('')}}
+                <td>${{formatDuration(records.reduce((sum, record) => sum + record.timing.total_wall_time, 0))}}</td>
+              </tr>
               ${{families.map((family) => {{
                 const familyRecords = records.filter((record) => record.descriptor.family === family);
                 const totalTime = familyRecords.reduce((sum, record) => sum + record.timing.total_wall_time, 0);
@@ -823,15 +986,33 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
 
     function familyMatrixCell(records) {{
       if (!records.length) return '<td>--</td>';
-      const accepted = records.filter((record) => record.status === 'passed' || record.status === 'reduced_accuracy').length;
+      const passed = records.filter((record) => record.status === 'passed').length;
       const reduced = records.filter((record) => record.status === 'reduced_accuracy').length;
       const total = records.length;
-      const fail = records.filter((record) => record.status === 'failed_validation' || record.status === 'solve_error').length;
+      const skipped = records.filter((record) => record.status === 'skipped').length;
+      const accepted = passed + reduced;
+      const fail = total - accepted - skipped;
       const cellClass = fail === 0 ? (reduced > 0 ? 'warn' : 'ok') : (accepted > 0 ? 'warn' : 'bad');
       const totalTime = records.reduce((sum, record) => sum + record.timing.total_wall_time, 0);
       const rate = total ? (accepted / total * 100).toFixed(0) : '0';
-      const extra = reduced > 0 ? `, ${{reduced}} reduced` : '';
-      return `<td><div class="matrix-cell ${{cellClass}}"><div class="matrix-main">${{accepted}}/${{total}} (${{rate}}%)</div><div class="matrix-sub">${{formatDuration(totalTime)}}${{extra}}</div></div></td>`;
+      const counts = new Map();
+      for (const record of records) {{
+        const segment = resultSegment(record);
+        counts.set(segment, (counts.get(segment) || 0) + 1);
+      }}
+      const segments = segmentOrder
+        .map((segment) => [segment, counts.get(segment) || 0, segmentLabel(segment)])
+        .filter(([, count]) => count > 0);
+      const countParts = segments
+        .map(([segment, count, label]) => {{
+          const title = `${{label}}: ${{count}}\\n${{segmentDescription(segment)}}`;
+          return `<span class="matrix-count ${{segment}}" title="${{htmlEscape(title)}}">${{htmlEscape(label)}} ${{count}}</span>`;
+        }})
+        .join(' · ');
+      const title = segments
+        .map(([segment, count, label]) => `${{label}}: ${{count}} - ${{segmentDescription(segment)}}`)
+        .join('\\n');
+      return `<td><div class="matrix-cell ${{cellClass}}" title="${{htmlEscape(title)}}"><div class="matrix-bars">${{segments.map(([kind, count, label]) => `<div class="matrix-segment ${{kind}}" title="${{htmlEscape(`${{label}}: ${{count}}\\n${{segmentDescription(kind)}}`)}}" style="width:${{(count / total * 100).toFixed(3)}}%"></div>`).join('')}}</div><div class="matrix-main">${{rate}}% accepted</div><div class="matrix-counts">${{countParts || '<span class="matrix-sub">none</span>'}}</div><div class="matrix-sub">${{formatDuration(totalTime)}}</div></div></td>`;
     }}
 
     function renderAllRuns(records) {{
@@ -849,8 +1030,9 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
           <table>
             <thead>
               <tr>
-                <th>Problem</th>
-                <th>Family</th>
+	                <th>Problem</th>
+	                <th>Set</th>
+	                <th>Family</th>
                 <th>Solver</th>
                 <th>JIT</th>
                 <th>Status</th>
@@ -862,13 +1044,15 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
                 <th>Elastic</th>
                 <th>Total</th>
                 <th>Reason</th>
+                <th>Detail</th>
               </tr>
             </thead>
             <tbody>
               ${{rows.map((record) => `
                 <tr>
-                  <td class="mono">${{problemCell(record)}}</td>
-                  <td class="mono">${{htmlEscape(record.descriptor.family)}}</td>
+	                  <td class="mono">${{problemCell(record)}}</td>
+	                  <td class="mono">${{htmlEscape(record.descriptor.test_set)}}</td>
+	                  <td class="mono">${{htmlEscape(record.descriptor.family)}}</td>
                   <td class="solver-${{record.solver}}">${{solverLabel(record.solver)}}</td>
                   <td>${{record.options.jit_opt_level.toUpperCase()}} / ${{record.options.call_policy}}</td>
                   <td><span class="pill ${{statusClass(record.status)}}">${{htmlEscape(statusLabel(record.status))}}</span></td>
@@ -880,6 +1064,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
                   <td>${{htmlEscape(elasticText(record))}}</td>
                   <td>${{formatDuration(record.timing.total_wall_time)}}</td>
                   <td>${{htmlEscape(failureCode(record))}}</td>
+                  <td class="${{detailClass(record)}}">${{htmlEscape(failureReason(record))}}</td>
                 </tr>`).join('')}}
             </tbody>
           </table>
