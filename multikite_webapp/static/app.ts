@@ -8217,12 +8217,12 @@ async function startSimulation(): Promise<void> {
   const performanceScalePercent = optionalInputValue(performanceScaleInput);
   const transitionToForwardS = nonnegativeInputValue(
     transitionToForwardInput,
-    simulationDefaults?.transition_to_forward_s ?? 5
+    simulationDefaults?.transition_to_forward_s ?? 10
   );
   const transitionToOrbitS = optionalInputValue(transitionToOrbitInput);
   const timedTransitionRecenterLeadRadii = nonnegativeInputValue(
     transitionRecenterLeadRadiiInput,
-    simulationDefaults?.timed_transition_recenter_lead_radii ?? 1
+    simulationDefaults?.timed_transition_recenter_lead_radii ?? 3
   );
   const request = {
     preset: presetSelect.value,

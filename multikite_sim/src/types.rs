@@ -134,16 +134,16 @@ pub struct SimulationConfig {
 impl Default for SimulationConfig {
     fn default() -> Self {
         Self {
-            duration: 30.0,
+            duration: 90.0,
             dt_control: 0.01,
             rk_abs_tol: 1.0e-6,
             rk_rel_tol: 1.0e-6,
             max_substeps: 1000,
             phase_mode: PhaseMode::Adaptive,
-            lateral_outer_mode: LateralOuterMode::Orbit,
+            lateral_outer_mode: LateralOuterMode::TimedTransition,
             forward_frame_mode: ForwardFrameMode::WorldFixed,
             transition_to_forward_s: default_transition_to_forward_s(),
-            transition_to_orbit_s: Some(65.0),
+            transition_to_orbit_s: Some(45.0),
             timed_transition_recenter_lead_radii: default_timed_transition_recenter_lead_radii(),
             sample_stride: 1,
             sim_noise_enabled: true,
@@ -156,11 +156,11 @@ impl Default for SimulationConfig {
 }
 
 fn default_transition_to_forward_s() -> f64 {
-    5.0
+    10.0
 }
 
 fn default_timed_transition_recenter_lead_radii() -> f64 {
-    1.0
+    3.0
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

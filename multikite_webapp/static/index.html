@@ -63,7 +63,7 @@
             <summary class="form-section-title">Run Options</summary>
             <label>
               Duration (s)
-              <input id="duration" type="number" min="0.001" step="any" value="30" />
+              <input id="duration" type="number" min="0.001" step="any" value="90" />
             </label>
             <label>
               Sample Period / Rate
@@ -251,9 +251,9 @@
               <label>
                 Lateral Outer Mode
                 <select id="lateral-outer-mode">
-                  <option value="orbit" selected>Orbit / rabbit</option>
+                  <option value="orbit">Orbit / rabbit</option>
                   <option value="forward_formation">Forward formation</option>
-                  <option value="timed_transition">Timed orbit → forward → orbit</option>
+                  <option value="timed_transition" selected>Timed orbit → forward → orbit</option>
                 </select>
               </label>
               <div id="forward-formation-options" class="tuning-group">
@@ -275,15 +275,15 @@
                 <div class="tuning-group-title">Timed Transition</div>
                 <label>
                   Switch to forward (s)
-                  <input id="transition-to-forward-s" type="number" min="0" step="any" value="5" />
+                  <input id="transition-to-forward-s" type="number" min="0" step="any" value="10" />
                 </label>
                 <label>
                   Switch back to orbit (s)
-                  <input id="transition-to-orbit-s" type="number" min="0" step="any" value="65" />
+                  <input id="transition-to-orbit-s" type="number" min="0" step="any" value="45" />
                 </label>
                 <label>
                   Orbit recenter lead (radii)
-                  <input id="transition-recenter-lead-radii" type="number" min="0" step="any" value="1" />
+                  <input id="transition-recenter-lead-radii" type="number" min="0" step="any" value="3" />
                 </label>
                 <div class="form-hint">Leave switch-back blank to stay in forward formation.</div>
               </div>
