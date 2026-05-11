@@ -1,11 +1,11 @@
 use std::time::Duration;
 
 use optimization::{CallPolicy, CallPolicyConfig, FunctionCompileOptions, LlvmOptimizationLevel};
-use serde::{Serialize, ser::SerializeStruct};
+use serde::{Deserialize, Serialize, ser::SerializeStruct};
 
 use crate::manifest::{KnownStatus, ProblemTestSet};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SolverKind {
     Sqp,
@@ -25,7 +25,7 @@ impl SolverKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JitOptLevel {
     O0,
@@ -55,7 +55,7 @@ impl JitOptLevel {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProblemRunOptions {
     pub jit_opt_level: JitOptLevel,
     pub call_policy: CallPolicyMode,
@@ -81,7 +81,7 @@ impl ProblemRunOptions {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CallPolicyMode {
     InlineAtCall,
@@ -111,7 +111,7 @@ impl CallPolicyMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     Passed,
@@ -131,7 +131,7 @@ impl RunStatus {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ValidationTier {
     #[default]
@@ -140,7 +140,7 @@ pub enum ValidationTier {
     ReducedAccuracy,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProblemDescriptor {
     pub id: String,
     pub test_set: ProblemTestSet,
@@ -157,7 +157,7 @@ pub struct ProblemDescriptor {
     pub constrained: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SolverMetrics {
     pub iterations: Option<usize>,
     pub objective: Option<f64>,
@@ -180,7 +180,7 @@ pub struct SolverTimingBreakdown {
     pub total_wall_time: Duration,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ValidationOutcome {
     pub tier: ValidationTier,
     pub tolerance: String,
@@ -196,13 +196,13 @@ impl ValidationOutcome {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FilterReplayPoint {
     pub violation: f64,
     pub objective: f64,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FilterReplayFrame {
     pub iteration: usize,
     pub phase: String,
@@ -215,13 +215,13 @@ pub struct FilterReplayFrame {
     pub accepted_mode: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct FilterReplay {
     #[serde(default)]
     pub frames: Vec<FilterReplayFrame>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SetupProfileBreakdown {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbolic_construction_s: Option<f64>,
@@ -241,7 +241,7 @@ pub struct SetupProfileBreakdown {
     pub llvm_jit_s: Option<f64>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CompileStatsSummary {
     pub symbolic_function_count: usize,
     pub call_site_count: usize,
@@ -258,7 +258,7 @@ pub struct CompileStatsSummary {
     pub llvm_call_instructions_emitted: usize,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CompileReportSummary {
     pub setup: SetupProfileBreakdown,
     pub stats: CompileStatsSummary,
@@ -266,7 +266,23 @@ pub struct CompileReportSummary {
     pub warnings: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResultCacheStatus {
+    Miss,
+    Hit,
+    Bypassed,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ResultCacheInfo {
+    pub status: ResultCacheStatus,
+    pub key: String,
+    pub written_at_unix_ms: Option<u128>,
+    pub lookup_time_s: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProblemRunRecord {
     pub id: String,
     pub solver: SolverKind,
@@ -290,6 +306,8 @@ pub struct ProblemRunRecord {
     pub console_output_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filter_replay: Option<FilterReplay>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache: Option<ResultCacheInfo>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -372,5 +390,34 @@ impl Serialize for SolverTimingBreakdown {
         )?;
         state.serialize_field("total_wall_time", &self.total_wall_time.as_secs_f64())?;
         state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for SolverTimingBreakdown {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            function_creation_time: Option<f64>,
+            derivative_generation_time: Option<f64>,
+            jit_time: Option<f64>,
+            compile_wall_time: Option<f64>,
+            solve_time: Option<f64>,
+            total_wall_time: f64,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            function_creation_time: wire.function_creation_time.map(Duration::from_secs_f64),
+            derivative_generation_time: wire
+                .derivative_generation_time
+                .map(Duration::from_secs_f64),
+            jit_time: wire.jit_time.map(Duration::from_secs_f64),
+            compile_wall_time: wire.compile_wall_time.map(Duration::from_secs_f64),
+            solve_time: wire.solve_time.map(Duration::from_secs_f64),
+            total_wall_time: Duration::from_secs_f64(wire.total_wall_time),
+        })
     }
 }

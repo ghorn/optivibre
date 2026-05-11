@@ -274,6 +274,7 @@ where
             console_output: None,
             console_output_path: None,
             filter_replay: None,
+            cache: None,
         },
     }
 }
@@ -353,6 +354,7 @@ where
                 console_output: None,
                 console_output_path: None,
                 filter_replay: None,
+                cache: None,
             };
         }
     };
@@ -415,6 +417,7 @@ where
                         console_output: None,
                         console_output_path: None,
                         filter_replay: None,
+                        cache: None,
                     };
                     record.validation = validate(&record);
                     if !record.validation.passed() {
@@ -460,6 +463,7 @@ where
                         console_output: None,
                         console_output_path: None,
                         filter_replay: None,
+                        cache: None,
                     };
                     promote_solve_error_if_reduced_accuracy(&mut record, REDUCED_TERMINATION_TOL);
                     promote_solve_error_if_validation_accepts(&mut record, validate);
@@ -519,6 +523,7 @@ where
                         console_output: None,
                         console_output_path: None,
                         filter_replay: None,
+                        cache: None,
                     };
                     record.validation = validate(&record);
                     if !record.validation.passed() {
@@ -564,6 +569,7 @@ where
                         console_output: None,
                         console_output_path: None,
                         filter_replay: None,
+                        cache: None,
                     };
                     promote_solve_error_if_reduced_accuracy(&mut record, REDUCED_TERMINATION_TOL);
                     record.console_output = Some(render_nlip_transcript(
@@ -624,6 +630,7 @@ where
                         console_output: None,
                         console_output_path: None,
                         filter_replay: None,
+                        cache: None,
                     };
                     record.validation = validate(&record);
                     if !record.validation.passed() {
@@ -664,6 +671,7 @@ where
                         console_output: None,
                         console_output_path: None,
                         filter_replay: None,
+                        cache: None,
                     };
                     promote_solve_error_if_reduced_accuracy(&mut record, REDUCED_TERMINATION_TOL);
                     record.console_output =

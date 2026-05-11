@@ -4,9 +4,10 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use test_problems::{
-    CallPolicyMode, JitOptLevel, ProblemRunOptions, ProblemSpeed, ProblemTestSet, RunRequest,
-    SolverKind, render_markdown_report, render_terminal_report, run_cases, write_dashboard,
-    write_html_report, write_json_report, write_transcript_artifacts,
+    CallPolicyMode, JitOptLevel, ProblemRunOptions, ProblemSpeed, ProblemTestSet, RunCacheOptions,
+    RunRequest, SolverKind, default_result_cache_dir, render_markdown_report,
+    render_terminal_report, run_cases_with_cache, write_dashboard, write_html_report,
+    write_json_report, write_transcript_artifacts,
 };
 
 #[derive(Debug, Parser)]
@@ -35,6 +36,12 @@ struct TestProblemsCli {
     include_skipped: bool,
     #[arg(long)]
     no_progress: bool,
+    #[arg(long)]
+    force: bool,
+    #[arg(long)]
+    no_cache: bool,
+    #[arg(long = "cache-dir")]
+    cache_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -150,7 +157,12 @@ fn main() -> Result<()> {
     request.include_skipped = cli.include_skipped;
 
     fs::create_dir_all(&cli.output_dir)?;
-    let mut results = run_cases(&request)?;
+    let cache_options = RunCacheOptions {
+        enabled: !cli.no_cache,
+        force: cli.force,
+        cache_dir: cli.cache_dir.unwrap_or_else(default_result_cache_dir),
+    };
+    let mut results = run_cases_with_cache(&request, &cache_options, None)?;
     write_transcript_artifacts(&mut results, &cli.output_dir)?;
     let markdown = render_markdown_report(&results);
     let terminal = render_terminal_report(&results);

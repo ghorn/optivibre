@@ -6,11 +6,11 @@ use anyhow::Result;
 use crate::runner::RunResults;
 
 pub fn write_dashboard(results: &RunResults, path: &Path) -> Result<()> {
-    fs::write(path, render_dashboard(results)?)?;
+    fs::write(path, render_dashboard_html(results)?)?;
     Ok(())
 }
 
-fn render_dashboard(results: &RunResults) -> Result<String> {
+pub fn render_dashboard_html(results: &RunResults) -> Result<String> {
     let records_json = serde_json::to_string(&results.records)?;
     Ok(format!(
         r##"<!doctype html>
@@ -457,6 +457,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
         <div class="control"><label for="filter-constrained">Constraint class</label><select id="filter-constrained"></select></div>
         <div class="control"><label for="filter-parameterized">Parameterized</label><select id="filter-parameterized"></select></div>
         <div class="control"><label for="filter-source">Source</label><select id="filter-source"></select></div>
+        <div class="control"><label for="filter-cache">Cache</label><select id="filter-cache"></select></div>
         <div class="control-actions">
           <button id="reset-filters" type="button" class="secondary">Reset filters</button>
         </div>
@@ -525,6 +526,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
       "filter-constrained",
       "filter-parameterized",
       "filter-source",
+      "filter-cache",
     ];
 
     const statusOrder = ["passed", "reduced_accuracy", "failed_validation", "solve_error", "skipped"];
@@ -568,6 +570,8 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
         default: return solver;
       }}
     }};
+
+    const cacheStatus = (record) => record.cache?.status || "none";
 
     const formatDuration = (seconds) => {{
       if (seconds >= 1) return `${{seconds.toFixed(2)}}s`;
@@ -747,6 +751,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
       populateSelect('filter-constrained', ['constrained', 'unconstrained']);
       populateSelect('filter-parameterized', ['parameterized', 'non_parameterized']);
       populateSelect('filter-source', unique(records.map((record) => record.descriptor.source)));
+      populateSelect('filter-cache', unique(records.map(cacheStatus)));
     }}
 
     function unique(values, preferredOrder = []) {{
@@ -766,6 +771,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
       const constrained = byId('filter-constrained').value;
       const parameterized = byId('filter-parameterized').value;
       const source = byId('filter-source').value;
+      const cache = byId('filter-cache').value;
 
       return records.filter((record) => {{
         if (search) {{
@@ -779,6 +785,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
         if (jit && record.options.jit_opt_level.toUpperCase() !== jit) return false;
         if (expected && record.expected !== expected) return false;
         if (source && record.descriptor.source !== source) return false;
+        if (cache && cacheStatus(record) !== cache) return false;
         if (constrained) {{
           const want = constrained === 'constrained';
           if (record.descriptor.constrained !== want) return false;
@@ -926,13 +933,14 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
       const html = `
         <div class="table-scroll">
           <table>
-            <thead><tr><th>Problem</th><th>Solver</th><th>Status</th><th>Iters</th><th>Elastic</th><th>Total</th><th>Reason</th><th>Detail</th></tr></thead>
+            <thead><tr><th>Problem</th><th>Solver</th><th>Status</th><th>Cache</th><th>Iters</th><th>Elastic</th><th>Total</th><th>Reason</th><th>Detail</th></tr></thead>
             <tbody>
               ${{rows.map((record) => `
                 <tr>
                   <td class="mono">${{problemCell(record)}}</td>
                   <td class="solver-${{record.solver}}">${{solverLabel(record.solver)}} / ${{record.options.jit_opt_level.toUpperCase()}} / ${{record.options.call_policy}}</td>
                   <td><span class="pill ${{statusClass(record.status)}}">${{htmlEscape(statusLabel(record.status))}}</span></td>
+                  <td>${{htmlEscape(cacheStatus(record))}}</td>
                   <td>${{intText(record.metrics.iterations)}}</td>
                   <td>${{htmlEscape(elasticText(record))}}</td>
                   <td>${{formatDuration(record.timing.total_wall_time)}}</td>
@@ -1077,6 +1085,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
                 <th>Solver</th>
                 <th>JIT</th>
                 <th>Status</th>
+                <th>Cache</th>
                 <th>Expected</th>
                 <th>Vars</th>
                 <th>DOF</th>
@@ -1097,6 +1106,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
                   <td class="solver-${{record.solver}}">${{solverLabel(record.solver)}}</td>
                   <td>${{record.options.jit_opt_level.toUpperCase()}} / ${{record.options.call_policy}}</td>
                   <td><span class="pill ${{statusClass(record.status)}}">${{htmlEscape(statusLabel(record.status))}}</span></td>
+                  <td>${{htmlEscape(cacheStatus(record))}}</td>
                   <td>${{htmlEscape(record.expected)}}</td>
                   <td>${{record.descriptor.num_vars}}</td>
                   <td>${{record.descriptor.dof}}</td>
