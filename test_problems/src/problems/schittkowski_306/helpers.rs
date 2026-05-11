@@ -365,6 +365,45 @@ where
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn nonsmooth_objective_only_case_no_ineq<const N: usize, const NE: usize, F>(
+    id: &'static str,
+    family: &'static str,
+    description: &'static str,
+    x0: [f64; N],
+    lower: [Option<f64>; N],
+    upper: [Option<f64>; N],
+    fex: f64,
+    build: F,
+) -> ProblemCase
+where
+    F: Fn(VecN<SX, N>) -> SymbolicNlpOutputs<VecN<SX, NE>, ()> + Copy + Send + Sync + 'static,
+{
+    make_typed_case::<VecN<SX, N>, (), VecN<SX, NE>, (), _, _>(
+        metadata(id, family, description),
+        move |options| {
+            let compiled = symbolic_compile::<VecN<SX, N>, (), VecN<SX, NE>, (), _>(
+                id,
+                move |x, ()| build(x.clone()),
+                options,
+            )?;
+            Ok(TypedProblemData {
+                compiled,
+                x0: VecN { values: x0 },
+                parameters: (),
+                bounds: TypedRuntimeNlpBounds {
+                    variable_lower: Some(VecN { values: lower }),
+                    variable_upper: Some(VecN { values: upper }),
+                    inequality_lower: None,
+                    inequality_upper: None,
+                    scaling: None,
+                },
+            })
+        },
+        objective_value_validation(fex, 1e-8, 1e-6, PRIMAL_TOL),
+    )
+}
+
 pub(super) fn tp284_285_case(
     id: &'static str,
     family: &'static str,
@@ -730,41 +769,41 @@ pub(super) fn tp101_103_case(
         fex,
         move |x| {
             let [x1, x2, x3, x4, x5, x6, x7] = x.values;
-            let term1 = 10.0 * x1 * x4.powf(2.0) * x7.powf(a7) / (x2 * x6.powf(3.0));
-            let term2 = 15.0 * x3 * x4 / (x1 * x2.powf(2.0) * x5 * x7.sqrt());
-            let term3 = 20.0 * x2 * x6 / (x1.powf(2.0) * x4 * x5.powf(2.0));
-            let term4 = 25.0 * x1.powf(2.0) * x2.powf(2.0) * x5.sqrt() * x7 / (x3 * x6.powf(2.0));
+            let term1 = 10.0 * x1 * x4.powi(2) * x7.powf(a7) / (x2 * x6.powi(3));
+            let term2 = 15.0 * x3 * x4 / (x1 * x2.powi(2) * x5 * x7.sqrt());
+            let term3 = 20.0 * x2 * x6 / (x1.powi(2) * x4 * x5.powi(2));
+            let term4 = 25.0 * x1.powi(2) * x2.powi(2) * x5.sqrt() * x7 / (x3 * x6.powi(2));
             let objective = term1 + term2 + term3 + term4;
             let g1 = 1.0
-                - 0.5 * x1.abs().sqrt() * x7 / (x3 * x6.powf(2.0))
-                - 0.7 * x1.powf(3.0) * x2 * x6 * x7.abs().sqrt() / x3.powf(2.0)
+                - 0.5 * x1.abs().sqrt() * x7 / (x3 * x6.powi(2))
+                - 0.7 * x1.powi(3) * x2 * x6 * x7.abs().sqrt() / x3.powi(2)
                 - 0.2 * x3 * x6.abs().powf(2.0 / 3.0) * x7.abs().powf(0.25)
                     / (x2 * x4.abs().sqrt());
             let g2 = 1.0
                 - 1.3 * x2 * x6 / (x1.abs().sqrt() * x3 * x5)
-                - 0.8 * x3 * x6.powf(2.0) / (x4 * x5)
-                - 3.1 * x2.abs().sqrt() * x6.abs().powf(1.0 / 3.0) / (x1 * x4.powf(2.0) * x5);
+                - 0.8 * x3 * x6.powi(2) / (x4 * x5)
+                - 3.1 * x2.abs().sqrt() * x6.abs().powf(1.0 / 3.0) / (x1 * x4.powi(2) * x5);
             let g3 = 1.0
                 - 2.0 * x1 * x5 * x7.abs().powf(1.0 / 3.0) / (x3.abs().powf(1.5) * x6)
                 - 0.1 * x2 * x5 / ((x3 * x7).abs().sqrt() * x6)
                 - x2 * x3.abs().sqrt() * x5 / x1
-                - 0.65 * x3 * x5 * x7 / (x2.powf(2.0) * x6);
+                - 0.65 * x3 * x5 * x7 / (x2.powi(2) * x6);
             let g4 = 1.0
-                - 0.2 * x2 * x5.abs().sqrt() * x7.abs().powf(1.0 / 3.0) / (x1.powf(2.0) * x4)
+                - 0.2 * x2 * x5.abs().sqrt() * x7.abs().powf(1.0 / 3.0) / (x1.powi(2) * x4)
                 - 0.3
                     * x1.abs().sqrt()
-                    * x2.powf(2.0)
+                    * x2.powi(2)
                     * x3
                     * x4.abs().powf(1.0 / 3.0)
                     * x7.abs().powf(0.25)
                     / x5.abs().powf(2.0 / 3.0)
-                - 0.4 * x3 * x5 * x7.abs().powf(0.75) / (x1.powf(3.0) * x2.powf(2.0))
-                - 0.5 * x4 * x7.abs().sqrt() / x3.powf(2.0);
+                - 0.4 * x3 * x5 * x7.abs().powf(0.75) / (x1.powi(3) * x2.powi(2))
+                - 0.5 * x4 * x7.abs().sqrt() / x3.powi(2);
             SymbolicNlpOutputs {
                 objective,
                 equalities: VecN { values: [] },
                 inequalities: VecN {
-                    values: [-g1, -g2, -g3, -g4, objective - 100.0, -objective + 3000.0],
+                    values: [-g1, -g2, -g3, -g4, 100.0 - objective, objective - 3000.0],
                 },
             }
         },

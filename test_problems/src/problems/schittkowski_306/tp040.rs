@@ -20,7 +20,7 @@ pub(super) fn tp040() -> ProblemCase {
                         objective: -x0 * x1 * x2 * x3,
                         equalities: VecN {
                             values: [
-                                x0.powf(3.0) + x1.sqr() - 1.0,
+                                x0.powi(3) + x1.sqr() - 1.0,
                                 x0.sqr() * x3 - x2,
                                 x3.sqr() - x1,
                             ],

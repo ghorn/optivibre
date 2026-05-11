@@ -26,7 +26,7 @@ pub(super) fn tp104() -> ProblemCase {
                 objective: bx,
                 equalities: VecN { values: [] },
                 inequalities: VecN {
-                    values: [-g1, -g2, -g3, -g4, bx - 1.0, -bx + 4.2],
+                    values: [-g1, -g2, -g3, -g4, 1.0 - bx, bx - 4.2],
                 },
             }
         },

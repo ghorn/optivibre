@@ -43,29 +43,29 @@ pub(super) fn tp107() -> ProblemCase {
             let y6 = (x8 - x9).cos();
             SymbolicNlpOutputs {
                 objective: 3000.0 * x1
-                    + 1000.0 * x1.powf(3.0)
+                    + 1000.0 * x1.powi(3)
                     + 2000.0 * x2
-                    + 666.66666667 * x2.powf(3.0),
+                    + 666.66666667 * x2.powi(3),
                 equalities: VecN {
                     values: [
                         0.4 - x1
-                            + 2.0 * c * x5.powf(2.0)
+                            + 2.0 * c * x5.powi(2)
                             + x5 * x6 * (-d * y1 - c * y2)
                             + x5 * x7 * (-d * y3 - c * y4),
                         0.4 - x2
-                            + 2.0 * c * x6.powf(2.0)
+                            + 2.0 * c * x6.powi(2)
                             + x5 * x6 * (d * y1 - c * y2)
                             + x6 * x7 * (d * y5 - c * y6),
-                        0.8 + 2.0 * c * x7.powf(2.0)
+                        0.8 + 2.0 * c * x7.powi(2)
                             + x5 * x7 * (d * y3 - c * y4)
                             + x6 * x7 * (-d * y5 - c * y6),
-                        0.2 - x3 + 2.0 * d * x5.powf(2.0)
+                        0.2 - x3 + 2.0 * d * x5.powi(2)
                             - x5 * x6 * (-c * y1 + d * y2)
                             - x5 * x7 * (-c * y3 + d * y4),
-                        0.2 - x4 + 2.0 * d * x6.powf(2.0)
+                        0.2 - x4 + 2.0 * d * x6.powi(2)
                             - x5 * x6 * (c * y1 + d * y2)
                             - x6 * x7 * (c * y5 + d * y6),
-                        -0.337 + 2.0 * d * x7.powf(2.0)
+                        -0.337 + 2.0 * d * x7.powi(2)
                             - x5 * x7 * (c * y3 + d * y4)
                             - x6 * x7 * (-c * y5 + d * y6),
                     ],

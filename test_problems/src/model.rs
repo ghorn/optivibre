@@ -1,6 +1,9 @@
 use std::time::Duration;
 
-use optimization::{CallPolicy, CallPolicyConfig, FunctionCompileOptions, LlvmOptimizationLevel};
+use optimization::{
+    CallPolicy, CallPolicyConfig, FunctionCompileOptions, InteriorPointLinearSolver,
+    LlvmOptimizationLevel,
+};
 use serde::{Deserialize, Serialize, ser::SerializeStruct};
 
 use crate::manifest::{KnownStatus, ProblemTestSet};
@@ -59,14 +62,17 @@ impl JitOptLevel {
 pub struct ProblemRunOptions {
     pub jit_opt_level: JitOptLevel,
     pub call_policy: CallPolicyMode,
+    #[serde(default)]
+    pub nlip_linear_solver: NlipLinearSolverMode,
 }
 
 impl ProblemRunOptions {
     pub fn label(self) -> String {
         format!(
-            "{} / {}",
+            "{} / {} / nlip_linear={}",
             self.jit_opt_level.label(),
-            self.call_policy.label()
+            self.call_policy.label(),
+            self.nlip_linear_solver.label(),
         )
     }
 
@@ -77,6 +83,36 @@ impl ProblemRunOptions {
                 default_policy: self.call_policy.into_sx(),
                 respect_function_overrides: true,
             },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NlipLinearSolverMode {
+    #[default]
+    Auto,
+    SsidsRs,
+    SpralSrc,
+    SparseQdldl,
+}
+
+impl NlipLinearSolverMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::SsidsRs => "ssids_rs",
+            Self::SpralSrc => "spral_src",
+            Self::SparseQdldl => "sparse_qdldl",
+        }
+    }
+
+    pub const fn into_solver(self) -> InteriorPointLinearSolver {
+        match self {
+            Self::Auto => InteriorPointLinearSolver::Auto,
+            Self::SsidsRs => InteriorPointLinearSolver::SsidsRs,
+            Self::SpralSrc => InteriorPointLinearSolver::SpralSrc,
+            Self::SparseQdldl => InteriorPointLinearSolver::SparseQdldl,
         }
     }
 }
@@ -297,6 +333,8 @@ pub struct ProblemRunRecord {
     pub validation: ValidationOutcome,
     pub solver_thresholds: Option<String>,
     pub solver_settings: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linear_solver_backend: Option<String>,
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compile_report: Option<CompileReportSummary>,

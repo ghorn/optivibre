@@ -14,9 +14,9 @@ use crate::manifest::{
     KnownStatus, ProblemManifestEntry, ProblemSpeed, ProblemTestSet, manifest_entry_by_id,
 };
 use crate::model::{
-    CallPolicyMode, JitOptLevel, ProblemCase, ProblemDescriptor, ProblemRunOptions,
-    ProblemRunRecord, ResultCacheInfo, ResultCacheStatus, RunStatus, SolverKind, ValidationOutcome,
-    ValidationTier,
+    CallPolicyMode, JitOptLevel, NlipLinearSolverMode, ProblemCase, ProblemDescriptor,
+    ProblemRunOptions, ProblemRunRecord, ResultCacheInfo, ResultCacheStatus, RunStatus, SolverKind,
+    ValidationOutcome, ValidationTier,
 };
 use crate::registry::registry;
 
@@ -44,6 +44,7 @@ impl Default for RunRequest {
             run_options: vec![ProblemRunOptions {
                 jit_opt_level: JitOptLevel::O3,
                 call_policy: CallPolicyMode::InlineAtLowering,
+                nlip_linear_solver: NlipLinearSolverMode::Auto,
             }],
             jobs: None,
             include_skipped: false,
@@ -166,6 +167,7 @@ pub struct RunPreviewEntry {
     pub test_set: ProblemTestSet,
     pub family: String,
     pub solver: SolverKind,
+    pub nlip_linear_solver: Option<String>,
     pub problem_speed: ProblemSpeed,
     pub cache_status: ResultCacheStatus,
 }
@@ -360,6 +362,8 @@ pub fn preview_run(request: &RunRequest, cache_dir: &Path) -> Result<Vec<RunPrev
                 test_set: task.planned.test_set,
                 family: task.case.family.to_string(),
                 solver: task.planned.solver,
+                nlip_linear_solver: (task.planned.solver == SolverKind::Nlip)
+                    .then(|| task.planned.options.nlip_linear_solver.label().to_string()),
                 problem_speed: task.planned.problem_speed,
                 cache_status,
             }
@@ -740,6 +744,7 @@ fn skipped_record(
         },
         solver_thresholds: None,
         solver_settings: None,
+        linear_solver_backend: None,
         error: None,
         compile_report: None,
         console_output: None,
@@ -790,6 +795,7 @@ fn panic_record(
         },
         solver_thresholds: None,
         solver_settings: None,
+        linear_solver_backend: None,
         error: Some(detail),
         compile_report: None,
         console_output: None,
@@ -862,12 +868,47 @@ mod tests {
         changed_request.run_options = vec![ProblemRunOptions {
             jit_opt_level: JitOptLevel::O2,
             call_policy: CallPolicyMode::InlineAtLowering,
+            nlip_linear_solver: NlipLinearSolverMode::Auto,
         }];
         let changed = cache_key(
             &planned_run_tasks(&changed_request)
                 .expect("changed planned tasks")
                 .remove(0),
         );
+        assert_ne!(base.hash, changed.hash);
+    }
+
+    #[test]
+    fn cache_key_changes_when_nlip_linear_solver_changes() {
+        let mut request = rosenbrock_sqp_request();
+        request.solvers = vec![SolverKind::Nlip];
+        let mut tasks = planned_run_tasks(&request).expect("planned tasks");
+        let base = cache_key(&tasks.remove(0));
+
+        let mut changed_request = request;
+        changed_request.run_options = vec![ProblemRunOptions {
+            jit_opt_level: JitOptLevel::O3,
+            call_policy: CallPolicyMode::InlineAtLowering,
+            nlip_linear_solver: NlipLinearSolverMode::SsidsRs,
+        }];
+        let changed = cache_key(
+            &planned_run_tasks(&changed_request)
+                .expect("changed planned tasks")
+                .remove(0),
+        );
+        assert_ne!(base.hash, changed.hash);
+    }
+
+    #[test]
+    fn cache_key_changes_when_max_iters_limit_changes() {
+        let request = rosenbrock_sqp_request();
+        let mut task = planned_run_tasks(&request)
+            .expect("planned tasks")
+            .remove(0);
+        let base = cache_key(&task);
+
+        task.max_iters_limit += 1;
+        let changed = cache_key(&task);
         assert_ne!(base.hash, changed.hash);
     }
 

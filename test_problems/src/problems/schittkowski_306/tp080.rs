@@ -18,7 +18,7 @@ pub(super) fn tp080() -> ProblemCase {
                     values: [
                         x0.sqr() + x1.sqr() + x2.sqr() + x3.sqr() + x4.sqr() - 10.0,
                         x1 * x2 - 5.0 * x3 * x4,
-                        x0.powf(3.0) + x1.powf(3.0) + 1.0,
+                        x0.powi(3) + x1.powi(3) + 1.0,
                     ],
                 },
                 inequalities: (),

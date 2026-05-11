@@ -18,7 +18,7 @@ pub(super) fn tp032() -> ProblemCase {
                     SymbolicNlpOutputs {
                         objective: (x0 + 3.0 * x1 + x2).sqr() + 4.0 * (x0 - x1).sqr(),
                         equalities: 1.0 - x0 - x1 - x2,
-                        inequalities: x0.powf(3.0) - 6.0 * x1 - 4.0 * x2 + 3.0,
+                        inequalities: x0.powi(3) - 6.0 * x1 - 4.0 * x2 + 3.0,
                     }
                 },
                 options,

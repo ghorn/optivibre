@@ -1,8 +1,7 @@
-use super::helpers::*;
-use super::*;
+use super::{helpers::*, *};
 
 pub(super) fn tp109() -> ProblemCase {
-    objective_only_case_no_ineq(
+    objective_only_case(
         "schittkowski_tp109",
         "tp109",
         "Schittkowski TP109 nine-variable power-flow design problem",
@@ -36,49 +35,52 @@ pub(super) fn tp109() -> ProblemCase {
             let ra = 1.0 / a;
             let b = 0.25_f64.sin();
             let c = 0.25_f64.cos();
+            let g1 = x4 - x3 + 0.55;
+            let g2 = x3 - x4 + 0.55;
+            let g3 = 2.25e6 - x1.powi(2) - x8.powi(2);
+            let g4 = 2.25e6 - x2.powi(2) - x9.powi(2);
+            let g5 = (x5 * x6 * (-x3 - 0.25).sin()
+                + x5 * x7 * (-x4 - 0.25).sin()
+                + 2.0 * x5.powi(2) * b)
+                * ra
+                + 400.0
+                - x1;
+            let g6 = (x5 * x6 * (x3 - 0.25).sin()
+                + x6 * x7 * (x3 - x4 - 0.25).sin()
+                + 2.0 * x6.powi(2) * b)
+                * ra
+                + 400.0
+                - x2;
+            let g7 = (x5 * x7 * (x4 - 0.25).sin()
+                + x6 * x7 * (x4 - x3 - 0.25).sin()
+                + 2.0 * x7.powi(2) * b)
+                * ra
+                + 881.779;
+            let g8 = x8
+                + (x5 * x6 * (-x3 - 0.25).cos() + x5 * x7 * (-x4 - 0.25).cos()
+                    - 2.0 * x5.powi(2) * c)
+                    * ra
+                + 0.0007533 * x5.powi(2)
+                - 200.0;
+            let g9 = x9
+                + (x5 * x6 * (x3 - 0.25).cos() + x7 * x6 * (x3 - x4 - 0.25).cos()
+                    - 2.0 * x6.powi(2) * c)
+                    * ra
+                + 0.0007533 * x6.powi(2)
+                - 200.0;
+            let g10 = (x5 * x7 * (x4 - 0.25).cos() + x6 * x7 * (x4 - x3 - 0.25).cos()
+                - 2.0 * x7.powi(2) * c)
+                * ra
+                + 0.0007533 * x7.powi(2)
+                - 22.938;
             SymbolicNlpOutputs {
-                objective: 3.0 * x1 + 1e-6 * x1.powf(3.0) + 0.522074e-6 * x2.powf(3.0) + 2.0 * x2,
+                objective: 3.0 * x1 + 1e-6 * x1.powi(3) + 0.522074e-6 * x2.powi(3) + 2.0 * x2,
                 equalities: VecN {
-                    values: [
-                        x4 - x3 + 0.55,
-                        x3 - x4 + 0.55,
-                        2.25e6 - x1.powf(2.0) - x8.powf(2.0),
-                        2.25e6 - x2.powf(2.0) - x9.powf(2.0),
-                        (x5 * x6 * (-x3 - 0.25).sin()
-                            + x5 * x7 * (-x4 - 0.25).sin()
-                            + 2.0 * x5.powf(2.0) * b)
-                            * ra
-                            + 400.0
-                            - x1,
-                        (x5 * x6 * (x3 - 0.25).sin()
-                            + x6 * x7 * (x3 - x4 - 0.25).sin()
-                            + 2.0 * x6.powf(2.0) * b)
-                            * ra
-                            + 400.0
-                            - x2,
-                        (x5 * x7 * (x4 - 0.25).sin()
-                            + x6 * x7 * (x4 - x3 - 0.25).sin()
-                            + 2.0 * x7.powf(2.0) * b)
-                            * ra
-                            + 881.779,
-                        x8 + (x5 * x6 * (-x3 - 0.25).cos() + x5 * x7 * (-x4 - 0.25).cos()
-                            - 2.0 * x5.powf(2.0) * c)
-                            * ra
-                            + 0.0007533 * x5.powf(2.0)
-                            - 200.0,
-                        x9 + (x5 * x6 * (x3 - 0.25).cos() + x7 * x6 * (x3 - x4 - 0.25).cos()
-                            - 2.0 * x6.powf(2.0) * c)
-                            * ra
-                            + 0.0007533 * x6.powf(2.0)
-                            - 200.0,
-                        (x5 * x7 * (x4 - 0.25).cos() + x6 * x7 * (x4 - x3 - 0.25).cos()
-                            - 2.0 * x7.powf(2.0) * c)
-                            * ra
-                            + 0.0007533 * x7.powf(2.0)
-                            - 22.938,
-                    ],
+                    values: [g5, g6, g7, g8, g9, g10],
                 },
-                inequalities: (),
+                inequalities: VecN {
+                    values: [-g1, -g2, -g3, -g4],
+                },
             }
         },
     )

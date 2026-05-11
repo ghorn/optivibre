@@ -14,7 +14,7 @@ pub(super) fn tp013() -> ProblemCase {
                 |x, ()| SymbolicNlpOutputs {
                     objective: (x.x - 2.0).sqr() + x.y.sqr(),
                     equalities: (),
-                    inequalities: x.y - (1.0 - x.x).powf(3.0),
+                    inequalities: x.y - (1.0 - x.x).powi(3),
                 },
                 options,
             )?;

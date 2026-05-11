@@ -1,7 +1,7 @@
 use super::{helpers::*, *};
 
 pub(super) fn tp281() -> ProblemCase {
-    objective_only_case_no_ineq(
+    nonsmooth_objective_only_case_no_ineq(
         "schittkowski_tp281",
         "tp281",
         "Schittkowski TP281",

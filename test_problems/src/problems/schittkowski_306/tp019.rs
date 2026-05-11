@@ -12,7 +12,7 @@ pub(super) fn tp019() -> ProblemCase {
             let compiled = symbolic_compile::<Pair<SX>, (), (), VecN<SX, 2>, _>(
                 "schittkowski_tp019",
                 |x, ()| SymbolicNlpOutputs {
-                    objective: (x.x - 10.0).powf(3.0) + (x.y - 20.0).powf(3.0),
+                    objective: (x.x - 10.0).powi(3) + (x.y - 20.0).powi(3),
                     equalities: (),
                     inequalities: VecN {
                         values: [

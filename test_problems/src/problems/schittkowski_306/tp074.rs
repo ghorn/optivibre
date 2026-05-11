@@ -14,10 +14,7 @@ pub(super) fn tp074() -> ProblemCase {
             let [x0, x1, x2, x3] = x.values;
             let a = 0.55;
             SymbolicNlpOutputs {
-                objective: 3.0 * x0
-                    + 1.0e-6 * x0.powf(3.0)
-                    + 2.0 * x1
-                    + 2.0e-6 / 3.0 * x1.powf(3.0),
+                objective: 3.0 * x0 + 1.0e-6 * x0.powi(3) + 2.0 * x1 + 2.0e-6 / 3.0 * x1.powi(3),
                 equalities: VecN {
                     values: [
                         1000.0 * ((-x2 - 0.25).sin() + (-x3 - 0.25).sin()) + 894.8 - x0,

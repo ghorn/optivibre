@@ -14,7 +14,7 @@ pub(super) fn tp024() -> ProblemCase {
                 |x, ()| {
                     let a = 3.0_f64.sqrt();
                     SymbolicNlpOutputs {
-                        objective: ((x.x - 3.0).sqr() - 9.0) * x.y.powf(3.0) / (27.0 * a),
+                        objective: ((x.x - 3.0).sqr() - 9.0) * x.y.powi(3) / (27.0 * a),
                         equalities: (),
                         inequalities: VecN {
                             values: [x.y - x.x / a, -x.x - a * x.y, x.x + a * x.y - 6.0],

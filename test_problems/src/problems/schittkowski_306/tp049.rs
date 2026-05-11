@@ -20,8 +20,8 @@ pub(super) fn tp049() -> ProblemCase {
                     SymbolicNlpOutputs {
                         objective: (x0 - x1).sqr()
                             + (x2 - 1.0).sqr()
-                            + (x3 - 1.0).powf(4.0)
-                            + (x4 - 1.0).powf(6.0),
+                            + (x3 - 1.0).powi(4)
+                            + (x4 - 1.0).powi(6),
                         equalities: VecN {
                             values: [x0 + x1 + x2 + 4.0 * x3 - 7.0, x2 + 5.0 * x4 - 6.0],
                         },

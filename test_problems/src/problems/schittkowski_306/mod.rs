@@ -3,7 +3,7 @@ use sx_core::SX;
 
 use super::{
     CaseMetadata, Pair, ProblemCase, TypedProblemData, VecN, exact_solution_validation,
-    make_typed_case, objective_validation, symbolic_compile,
+    make_typed_case, objective_validation, objective_value_validation, symbolic_compile,
 };
 use crate::manifest::ProblemTestSet;
 

@@ -16,11 +16,11 @@ pub(super) fn tp079() -> ProblemCase {
                 objective: (x0 - 1.0).sqr()
                     + (x0 - x1).sqr()
                     + (x1 - x2).sqr()
-                    + (x2 - x3).powf(4.0)
-                    + (x3 - x4).powf(4.0),
+                    + (x2 - x3).powi(4)
+                    + (x3 - x4).powi(4),
                 equalities: VecN {
                     values: [
-                        x0 + x1.sqr() + x2.powf(3.0) - 2.0 - 3.0 * 2.0_f64.sqrt(),
+                        x0 + x1.sqr() + x2.powi(3) - 2.0 - 3.0 * 2.0_f64.sqrt(),
                         x1 - x2.sqr() + x3 + 2.0 - 2.0 * 2.0_f64.sqrt(),
                         x0 * x4 - 2.0,
                     ],
