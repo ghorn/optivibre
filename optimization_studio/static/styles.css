@@ -1330,17 +1330,36 @@ select {
 .compile-cache-metrics {
   grid-column: 1 / -1;
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(78px, 1fr));
-  gap: 4px 8px;
-  padding-top: 7px;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 10px 18px;
+  padding-top: 9px;
   border-top: 1px solid rgba(177, 214, 222, 0.08);
 }
 
-.compile-cache-metric {
+.compile-cache-metric-group {
+  min-width: 0;
+}
+
+.compile-cache-metric-group-title {
+  margin-bottom: 5px;
+  color: var(--accent);
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.compile-cache-metric-list {
   display: grid;
-  grid-template-columns: min-content minmax(0, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(104px, 1fr));
+  gap: 4px 12px;
+}
+
+.compile-cache-metric {
+  display: flex;
   align-items: baseline;
-  gap: 4px;
+  justify-content: space-between;
+  gap: 8px;
   min-width: 0;
   color: color-mix(in srgb, var(--ink) 88%, var(--muted));
   font-variant-numeric: tabular-nums;
@@ -1350,15 +1369,14 @@ select {
 .compile-cache-metric-label {
   color: var(--muted);
   font-size: 0.66rem;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
+  letter-spacing: 0.01em;
+  text-transform: none;
+  white-space: nowrap;
 }
 
 .compile-cache-metric-value {
   min-width: 0;
-  overflow: hidden;
   text-align: right;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -1508,6 +1526,11 @@ select {
   }
 
   .compile-cache-metrics {
-    grid-template-columns: repeat(auto-fit, minmax(68px, 1fr));
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
+  .compile-cache-metric-list {
+    grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
   }
 }

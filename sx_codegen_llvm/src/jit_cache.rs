@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
 use std::io::Write as _;
@@ -8,11 +7,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sx_codegen::{Instruction, LoweredFunction, LoweredSubfunction, Slot, ValueRef};
-use sx_core::{
-    BinaryOp, CCS, CallPolicyConfig, NamedMatrix, NodeView, SX, SXFunction, SXMatrix,
-    lookup_function_ref,
-};
+use sx_codegen::{Instruction, LoweredFunction, Slot, ValueRef};
+use sx_core::{BinaryOp, CCS, CallPolicy, CallPolicyConfig, SXFunction, UnaryOp};
 
 use crate::LlvmOptimizationLevel;
 
@@ -106,21 +102,20 @@ pub(crate) fn cache_key_metadata(
 }
 
 pub(crate) fn cache_key_metadata_for_function(
-    function: &SXFunction,
+    _function: &SXFunction,
     lowered: &LoweredFunction,
-    call_policy: CallPolicyConfig,
+    _call_policy: CallPolicyConfig,
     opt_level: LlvmOptimizationLevel,
     target_triple: String,
     cpu_name: String,
     cpu_features: String,
 ) -> CacheKeyMetadata {
     let lowered_fingerprint = lowered_function_fingerprint(lowered);
-    let symbolic_fingerprint = symbolic_function_fingerprint(function, call_policy);
     build_cache_key_metadata(
         CacheKeyFingerprintInput {
             lowered_name: lowered.name.clone(),
             lowered_fingerprint: lowered_fingerprint.clone(),
-            symbolic_fingerprint: Some(symbolic_fingerprint.clone()),
+            symbolic_fingerprint: None,
             entry_key_kind: "lowered_fingerprint",
             entry_key_fingerprint: lowered_fingerprint,
         },
@@ -393,379 +388,147 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn lowered_function_fingerprint(lowered: &LoweredFunction) -> String {
-    let mut subfunction_memo = vec![None; lowered.subfunctions.len()];
-    callable_fingerprint(
-        CallableFingerprintShape {
-            name: Some(&lowered.name),
-            inputs: &lowered.inputs,
-            outputs: &lowered.outputs,
-            instructions: &lowered.instructions,
-            output_values: &lowered.output_values,
-            call_policy: None,
-        },
-        &lowered.subfunctions,
-        &mut subfunction_memo,
-    )
-}
-
-struct CallableFingerprintShape<'a> {
-    name: Option<&'a str>,
-    inputs: &'a [Slot],
-    outputs: &'a [Slot],
-    instructions: &'a [Instruction],
-    output_values: &'a [Vec<ValueRef>],
-    call_policy: Option<&'a str>,
-}
-
-fn symbolic_function_fingerprint(function: &SXFunction, call_policy: CallPolicyConfig) -> String {
-    let mut function_memo = HashMap::new();
-    symbolic_function_fingerprint_recursive(function, call_policy, &mut function_memo)
-}
-
-fn symbolic_function_fingerprint_recursive(
-    function: &SXFunction,
-    call_policy: CallPolicyConfig,
-    function_memo: &mut HashMap<usize, String>,
-) -> String {
-    if let Some(existing) = function_memo.get(&function.id()) {
-        return existing.clone();
-    }
-
-    let input_bindings = function.input_bindings();
-    let mut expr_memo = HashMap::new();
     let mut hasher = Sha256::new();
-    write_string(&mut hasher, function.name());
-    write_string(&mut hasher, &format!("{:?}", call_policy.default_policy));
-    hasher.update([u8::from(call_policy.respect_function_overrides)]);
-    write_string(
+    write_string(&mut hasher, &lowered.name);
+    write_callable_program(
         &mut hasher,
-        &format!("{:?}", function.call_policy_override()),
+        &lowered.inputs,
+        &lowered.outputs,
+        &lowered.instructions,
+        &lowered.output_values,
     );
-    write_named_matrices(
-        &mut hasher,
-        function.inputs(),
-        None,
-        &input_bindings,
-        &mut expr_memo,
-        function_memo,
-        call_policy,
-    );
-    write_named_matrices(
-        &mut hasher,
-        function.outputs(),
-        Some(function),
-        &input_bindings,
-        &mut expr_memo,
-        function_memo,
-        call_policy,
-    );
-    let fingerprint = hex_encode(&hasher.finalize());
-    function_memo.insert(function.id(), fingerprint.clone());
-    fingerprint
+    write_usize(&mut hasher, lowered.subfunctions.len());
+    for subfunction in &lowered.subfunctions {
+        write_call_policy(&mut hasher, subfunction.call_policy);
+        write_callable_program(
+            &mut hasher,
+            &subfunction.inputs,
+            &subfunction.outputs,
+            &subfunction.instructions,
+            &subfunction.output_values,
+        );
+    }
+    hex_encode(&hasher.finalize())
 }
 
-fn write_named_matrices(
+fn write_callable_program(
     hasher: &mut Sha256,
-    matrices: &[NamedMatrix],
-    owner: Option<&SXFunction>,
-    input_bindings: &HashMap<SX, (usize, usize)>,
-    expr_memo: &mut HashMap<SX, String>,
-    function_memo: &mut HashMap<usize, String>,
-    call_policy: CallPolicyConfig,
+    inputs: &[Slot],
+    outputs: &[Slot],
+    instructions: &[Instruction],
+    output_values: &[Vec<ValueRef>],
 ) {
-    write_usize(hasher, matrices.len());
-    for matrix in matrices {
-        write_string(hasher, matrix.name());
-        write_ccs(hasher, matrix.matrix().ccs());
-        if owner.is_some() {
-            write_usize(hasher, matrix.matrix().nnz());
-            for &value in matrix.matrix().nonzeros() {
-                let fingerprint = sx_value_fingerprint(
-                    value,
-                    input_bindings,
-                    expr_memo,
-                    function_memo,
-                    call_policy,
-                );
-                write_string(hasher, &fingerprint);
-            }
-        }
-    }
-}
-
-fn sx_matrix_fingerprint(
-    matrix: &SXMatrix,
-    input_bindings: &HashMap<SX, (usize, usize)>,
-    expr_memo: &mut HashMap<SX, String>,
-    function_memo: &mut HashMap<usize, String>,
-    call_policy: CallPolicyConfig,
-) -> String {
-    let mut hasher = Sha256::new();
-    write_ccs(&mut hasher, matrix.ccs());
-    write_usize(&mut hasher, matrix.nnz());
-    for &value in matrix.nonzeros() {
-        let fingerprint =
-            sx_value_fingerprint(value, input_bindings, expr_memo, function_memo, call_policy);
-        write_string(&mut hasher, &fingerprint);
-    }
-    hex_encode(&hasher.finalize())
-}
-
-fn sx_value_fingerprint(
-    value: SX,
-    input_bindings: &HashMap<SX, (usize, usize)>,
-    expr_memo: &mut HashMap<SX, String>,
-    function_memo: &mut HashMap<usize, String>,
-    call_policy: CallPolicyConfig,
-) -> String {
-    if let Some(existing) = expr_memo.get(&value) {
-        return existing.clone();
-    }
-
-    let fingerprint = match value.inspect() {
-        NodeView::Constant(value) => hash_parts(&[&[0], &value.to_le_bytes()]),
-        NodeView::Symbol { name, serial } => {
-            if let Some(&(slot, offset)) = input_bindings.get(&value) {
-                hash_parts(&[
-                    &[1],
-                    &(slot as u64).to_le_bytes(),
-                    &(offset as u64).to_le_bytes(),
-                ])
-            } else {
-                hash_parts(&[&[2], name.as_bytes(), &(serial as u64).to_le_bytes()])
-            }
-        }
-        NodeView::Unary { op, arg } => {
-            let arg =
-                sx_value_fingerprint(arg, input_bindings, expr_memo, function_memo, call_policy);
-            hash_parts(&[&[3], format!("{op:?}").as_bytes(), arg.as_bytes()])
-        }
-        NodeView::Binary { op, lhs, rhs } => {
-            let lhs =
-                sx_value_fingerprint(lhs, input_bindings, expr_memo, function_memo, call_policy);
-            let rhs =
-                sx_value_fingerprint(rhs, input_bindings, expr_memo, function_memo, call_policy);
-            let (lhs, rhs) =
-                if matches!(op, BinaryOp::Add | BinaryOp::Mul | BinaryOp::Hypot) && rhs < lhs {
-                    (rhs, lhs)
-                } else {
-                    (lhs, rhs)
-                };
-            hash_parts(&[
-                &[4],
-                format!("{op:?}").as_bytes(),
-                lhs.as_bytes(),
-                rhs.as_bytes(),
-            ])
-        }
-        NodeView::Call {
-            function_id,
-            function_name,
-            inputs,
-            output_slot,
-            output_offset,
-        } => {
-            let callee = lookup_function_ref(function_id)
-                .expect("symbolic function fingerprint should only reference registered callees");
-            let callee_fingerprint =
-                symbolic_function_fingerprint_recursive(&callee, call_policy, function_memo);
-            let mut parts: Vec<Vec<u8>> = vec![
-                vec![5],
-                function_name.into_bytes(),
-                callee_fingerprint.into_bytes(),
-                (output_slot as u64).to_le_bytes().to_vec(),
-                (output_offset as u64).to_le_bytes().to_vec(),
-            ];
-            for input in &inputs {
-                parts.push(
-                    sx_matrix_fingerprint(
-                        input,
-                        input_bindings,
-                        expr_memo,
-                        function_memo,
-                        call_policy,
-                    )
-                    .into_bytes(),
-                );
-            }
-            let part_refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
-            hash_parts(&part_refs)
-        }
-    };
-
-    expr_memo.insert(value, fingerprint.clone());
-    fingerprint
-}
-
-fn callable_fingerprint(
-    shape: CallableFingerprintShape<'_>,
-    subfunctions: &[LoweredSubfunction],
-    subfunction_memo: &mut [Option<String>],
-) -> String {
-    let definitions = build_temp_definitions(shape.instructions);
-    let mut temp_memo = vec![None; definitions.len()];
-    let mut hasher = Sha256::new();
-    if let Some(name) = shape.name {
-        write_string(&mut hasher, name);
-    }
-    if let Some(call_policy) = shape.call_policy {
-        write_string(&mut hasher, call_policy);
-    }
-    write_slots(&mut hasher, shape.inputs);
-    write_slots(&mut hasher, shape.outputs);
-    write_usize(&mut hasher, shape.output_values.len());
-    for values in shape.output_values {
-        write_usize(&mut hasher, values.len());
-        for &value in values {
-            let fingerprint = value_ref_fingerprint(
-                value,
-                &definitions,
-                &mut temp_memo,
-                subfunctions,
-                subfunction_memo,
-            );
-            write_string(&mut hasher, &fingerprint);
-        }
-    }
-    hex_encode(&hasher.finalize())
-}
-
-#[derive(Clone, Copy)]
-struct TempDefinition<'a> {
-    instruction: &'a Instruction,
-    output_index: usize,
-}
-
-fn build_temp_definitions(instructions: &[Instruction]) -> Vec<Option<TempDefinition<'_>>> {
-    let max_temp = instructions
-        .iter()
-        .flat_map(Instruction::output_temps)
-        .copied()
-        .max()
-        .map_or(0, |temp| temp + 1);
-    let mut definitions = vec![None; max_temp];
+    write_slots(hasher, inputs);
+    write_slots(hasher, outputs);
+    write_usize(hasher, instructions.len());
     for instruction in instructions {
-        for (output_index, &temp) in instruction.output_temps().iter().enumerate() {
-            definitions[temp] = Some(TempDefinition {
-                instruction,
-                output_index,
-            });
+        write_instruction(hasher, instruction);
+    }
+    write_usize(hasher, output_values.len());
+    for values in output_values {
+        write_usize(hasher, values.len());
+        for &value in values {
+            write_value_ref(hasher, value);
         }
     }
-    definitions
 }
 
-fn value_ref_fingerprint(
-    value: ValueRef,
-    definitions: &[Option<TempDefinition<'_>>],
-    temp_memo: &mut [Option<String>],
-    subfunctions: &[LoweredSubfunction],
-    subfunction_memo: &mut [Option<String>],
-) -> String {
-    match value {
-        ValueRef::Input { slot, offset } => hash_parts(&[
-            &[0],
-            &(slot as u64).to_le_bytes(),
-            &(offset as u64).to_le_bytes(),
-        ]),
-        ValueRef::Const(value) => hash_parts(&[&[1], &value.to_le_bytes()]),
-        ValueRef::Temp(temp) => {
-            if let Some(existing) = &temp_memo[temp] {
-                return existing.clone();
+fn write_instruction(hasher: &mut Sha256, instruction: &Instruction) {
+    match instruction {
+        Instruction::Unary { temp, op, input } => {
+            hasher.update([0]);
+            write_usize(hasher, *temp);
+            write_unary_op(hasher, *op);
+            write_value_ref(hasher, *input);
+        }
+        Instruction::Binary { temp, op, lhs, rhs } => {
+            hasher.update([1]);
+            write_usize(hasher, *temp);
+            write_binary_op(hasher, *op);
+            write_value_ref(hasher, *lhs);
+            write_value_ref(hasher, *rhs);
+        }
+        Instruction::Call {
+            temps,
+            callee,
+            inputs,
+        } => {
+            hasher.update([2]);
+            write_usize_slice(hasher, temps);
+            write_usize(hasher, *callee);
+            write_usize(hasher, inputs.len());
+            for &input in inputs {
+                write_value_ref(hasher, input);
             }
-            let definition =
-                definitions[temp].expect("temporary should have a defining instruction");
-            let fingerprint = match definition.instruction {
-                Instruction::Unary { op, input, .. } => {
-                    let input = value_ref_fingerprint(
-                        *input,
-                        definitions,
-                        temp_memo,
-                        subfunctions,
-                        subfunction_memo,
-                    );
-                    hash_parts(&[&[2], format!("{op:?}").as_bytes(), input.as_bytes()])
-                }
-                Instruction::Binary { op, lhs, rhs, .. } => {
-                    let lhs = value_ref_fingerprint(
-                        *lhs,
-                        definitions,
-                        temp_memo,
-                        subfunctions,
-                        subfunction_memo,
-                    );
-                    let rhs = value_ref_fingerprint(
-                        *rhs,
-                        definitions,
-                        temp_memo,
-                        subfunctions,
-                        subfunction_memo,
-                    );
-                    let (lhs, rhs) =
-                        if matches!(op, BinaryOp::Add | BinaryOp::Mul | BinaryOp::Hypot)
-                            && rhs < lhs
-                        {
-                            (rhs, lhs)
-                        } else {
-                            (lhs, rhs)
-                        };
-                    hash_parts(&[
-                        &[3],
-                        format!("{op:?}").as_bytes(),
-                        lhs.as_bytes(),
-                        rhs.as_bytes(),
-                    ])
-                }
-                Instruction::Call { callee, inputs, .. } => {
-                    let callee = subfunction_fingerprint(*callee, subfunctions, subfunction_memo);
-                    let output_index = (definition.output_index as u64).to_le_bytes();
-                    let mut parts: Vec<Vec<u8>> =
-                        vec![vec![4], output_index.to_vec(), callee.into_bytes()];
-                    for input in inputs {
-                        parts.push(
-                            value_ref_fingerprint(
-                                *input,
-                                definitions,
-                                temp_memo,
-                                subfunctions,
-                                subfunction_memo,
-                            )
-                            .into_bytes(),
-                        );
-                    }
-                    let part_refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
-                    hash_parts(&part_refs)
-                }
-            };
-            temp_memo[temp] = Some(fingerprint.clone());
-            fingerprint
         }
     }
 }
 
-fn subfunction_fingerprint(
-    subfunction_index: usize,
-    subfunctions: &[LoweredSubfunction],
-    subfunction_memo: &mut [Option<String>],
-) -> String {
-    if let Some(existing) = &subfunction_memo[subfunction_index] {
-        return existing.clone();
+fn write_value_ref(hasher: &mut Sha256, value: ValueRef) {
+    match value {
+        ValueRef::Input { slot, offset } => {
+            hasher.update([0]);
+            write_usize(hasher, slot);
+            write_usize(hasher, offset);
+        }
+        ValueRef::Temp(temp) => {
+            hasher.update([1]);
+            write_usize(hasher, temp);
+        }
+        ValueRef::Const(value) => {
+            hasher.update([2]);
+            hasher.update(value.to_le_bytes());
+        }
     }
-    let subfunction = &subfunctions[subfunction_index];
-    let fingerprint = callable_fingerprint(
-        CallableFingerprintShape {
-            name: None,
-            inputs: &subfunction.inputs,
-            outputs: &subfunction.outputs,
-            instructions: &subfunction.instructions,
-            output_values: &subfunction.output_values,
-            call_policy: Some(&format!("{:?}", subfunction.call_policy)),
-        },
-        subfunctions,
-        subfunction_memo,
-    );
-    subfunction_memo[subfunction_index] = Some(fingerprint.clone());
-    fingerprint
+}
+
+fn write_call_policy(hasher: &mut Sha256, policy: CallPolicy) {
+    hasher.update([match policy {
+        CallPolicy::InlineAtCall => 0,
+        CallPolicy::InlineAtLowering => 1,
+        CallPolicy::InlineInLLVM => 2,
+        CallPolicy::NoInlineLLVM => 3,
+    }]);
+}
+
+fn write_unary_op(hasher: &mut Sha256, op: UnaryOp) {
+    hasher.update([match op {
+        UnaryOp::Abs => 0,
+        UnaryOp::Sign => 1,
+        UnaryOp::Floor => 2,
+        UnaryOp::Ceil => 3,
+        UnaryOp::Round => 4,
+        UnaryOp::Trunc => 5,
+        UnaryOp::Sqrt => 6,
+        UnaryOp::Exp => 7,
+        UnaryOp::Log => 8,
+        UnaryOp::Sin => 9,
+        UnaryOp::Cos => 10,
+        UnaryOp::Tan => 11,
+        UnaryOp::Asin => 12,
+        UnaryOp::Acos => 13,
+        UnaryOp::Atan => 14,
+        UnaryOp::Sinh => 15,
+        UnaryOp::Cosh => 16,
+        UnaryOp::Tanh => 17,
+        UnaryOp::Asinh => 18,
+        UnaryOp::Acosh => 19,
+        UnaryOp::Atanh => 20,
+    }]);
+}
+
+fn write_binary_op(hasher: &mut Sha256, op: BinaryOp) {
+    hasher.update([match op {
+        BinaryOp::Add => 0,
+        BinaryOp::Sub => 1,
+        BinaryOp::Mul => 2,
+        BinaryOp::Div => 3,
+        BinaryOp::Pow => 4,
+        BinaryOp::Atan2 => 5,
+        BinaryOp::Hypot => 6,
+        BinaryOp::Mod => 7,
+        BinaryOp::Copysign => 8,
+    }]);
 }
 
 fn write_slots(hasher: &mut Sha256, slots: &[Slot]) {
@@ -966,7 +729,7 @@ mod tests {
     }
 
     #[test]
-    fn function_cache_manifest_records_symbolic_fingerprint() {
+    fn function_cache_manifest_uses_lowered_fingerprint_without_symbolic_walk() {
         with_temp_cache_root(|_| {
             let function = demo_function("cache_symbolic_demo", 8.0);
             let options = FunctionCompileOptions::from(JitOptimizationLevel::O0);
@@ -993,7 +756,7 @@ mod tests {
             )
             .expect("manifest json");
             assert_eq!(manifest.entry_key_kind, "lowered_fingerprint");
-            assert!(manifest.symbolic_fingerprint.is_some());
+            assert!(manifest.symbolic_fingerprint.is_none());
         });
     }
 

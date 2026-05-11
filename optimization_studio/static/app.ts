@@ -2834,35 +2834,22 @@ function renderCompileCacheStatus(): void {
     const report = row.compile_report;
     const rowEl = document.createElement("div");
     rowEl.className = "compile-cache-row";
-    const timingCells = [
-      ["Build", "Symbolic model construction", formatCompileDuration(row.symbolic_build_s)],
-      ["Deriv", "Symbolic derivative generation", formatCompileDuration(row.symbolic_derivatives_s)],
-      ["Lower", "SX lowering", formatCompileDuration(report?.lowering_s ?? null)],
-      ["Key", "LLVM cache-key and fingerprint generation", formatCompileDuration(report?.llvm_cache_key_s ?? null)],
-      ["Module", "LLVM module construction", formatCompileDuration(report?.llvm_module_build_s ?? null)],
-      ["Opt", "LLVM optimization passes", formatCompileDuration(report?.llvm_optimization_s ?? null)],
-      ["Emit", "LLVM object-code emission", formatCompileDuration(report?.llvm_object_emit_s ?? null)],
-      ["IR FP", "Optimized LLVM IR fingerprint generation", formatCompileDuration(report?.llvm_ir_fingerprint_s ?? null)],
-      ["Check", "LLVM cache manifest lookup and validation", formatCompileDuration(report?.llvm_cache_check_s ?? null)],
-      ["Read", "Cached object file read", formatCompileDuration(report?.llvm_cache_read_s ?? null)],
-      ["Write", "Cached object file write", formatCompileDuration(report?.llvm_cache_write_s ?? null)],
-      ["Load", "LLVM object materialization/load", formatCompileDuration(report?.llvm_cache_materialize_s ?? null)],
-      ["Ctx", "JIT execution-context allocation", formatCompileDuration(report?.jit_context_s ?? null)],
-      ["LLVM", "LLVM compile/load total", formatCompileDuration(report?.llvm_jit_s ?? null)],
-      ["Total", "Outer JIT phase total", formatJitDuration(row.jit_s, row.jit_disk_cache_hit)],
-    ]
-      .map(([label, title, value]) => `
-        <div class="compile-cache-metric" title="${escapeHtml(title)}">
-          <span class="compile-cache-metric-label">${escapeHtml(label)}</span>
-          <span class="compile-cache-metric-value">${escapeHtml(value)}</span>
-        </div>
-      `)
+    const timingGroups = renderCompileCacheTimingGroups(row, report);
+    const problemTitle = escapeHtml(row.problem_name);
+    const variantTitle = escapeHtml(row.variant_label);
+    const statusTitle = report == null
+      ? "Compile report pending"
+      : `cache hits/misses: ${report.llvm_cache_hits}/${report.llvm_cache_misses}; kernels: ${report.kernels.length}`;
+    const statusText = statusLabel === "ready" && row.jit_s != null
+      ? `${statusLabel}${row.jit_disk_cache_hit ? " · disk hit" : " · disk miss"}`
+      : statusLabel;
+    const timingHtml = timingGroups
       .join("");
     rowEl.innerHTML = `
-      <div class="compile-cache-problem">${escapeHtml(row.problem_name)}</div>
-      <div class="compile-cache-variant">${escapeHtml(row.variant_label)}</div>
-      <div class="compile-cache-status"><span class="compile-cache-badge compile-cache-badge-${statusLabel}">${statusLabel}</span></div>
-      <div class="compile-cache-metrics">${timingCells}</div>
+      <div class="compile-cache-problem" title="${problemTitle}">${problemTitle}</div>
+      <div class="compile-cache-variant" title="${variantTitle}">${variantTitle}</div>
+      <div class="compile-cache-status" title="${escapeHtml(statusTitle)}"><span class="compile-cache-badge compile-cache-badge-${statusLabel}">${escapeHtml(statusText)}</span></div>
+      <div class="compile-cache-metrics">${timingHtml}</div>
     `;
     const cacheHits = report?.llvm_cache_hits ?? 0;
     const cacheMisses = report?.llvm_cache_misses ?? 0;
@@ -2872,6 +2859,110 @@ function renderCompileCacheStatus(): void {
   }
 
   prewarmStatusEl.replaceChildren(table);
+}
+
+type CompileCacheMetric = {
+  label: string;
+  title: string;
+  value: string;
+};
+
+function compileDurationMetric(
+  label: string,
+  title: string,
+  seconds: number | null | undefined,
+  options: { always?: boolean } = {},
+): CompileCacheMetric | null {
+  if (!options.always && (seconds == null || seconds === 0)) {
+    return null;
+  }
+  return {
+    label,
+    title,
+    value: formatCompileDuration(seconds),
+  };
+}
+
+function compileCountMetric(
+  label: string,
+  title: string,
+  value: number | null | undefined,
+): CompileCacheMetric | null {
+  if (value == null) {
+    return null;
+  }
+  return {
+    label,
+    title,
+    value: String(value),
+  };
+}
+
+function renderCompileCacheMetric(metric: CompileCacheMetric): string {
+  return `
+    <div class="compile-cache-metric" title="${escapeHtml(metric.title)}">
+      <span class="compile-cache-metric-label">${escapeHtml(metric.label)}</span>
+      <span class="compile-cache-metric-value">${escapeHtml(metric.value)}</span>
+    </div>
+  `;
+}
+
+function renderCompileCacheTimingGroup(
+  title: string,
+  metrics: Array<CompileCacheMetric | null>,
+): string {
+  const visibleMetrics = metrics.filter((metric): metric is CompileCacheMetric => metric != null);
+  if (visibleMetrics.length === 0) {
+    return "";
+  }
+  return `
+    <section class="compile-cache-metric-group" aria-label="${escapeHtml(title)} timings">
+      <div class="compile-cache-metric-group-title">${escapeHtml(title)}</div>
+      <div class="compile-cache-metric-list">
+        ${visibleMetrics.map(renderCompileCacheMetric).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderCompileCacheTimingGroups(
+  row: CompileCacheStatus,
+  report: WireCompileReportSummary | null,
+): string[] {
+  return [
+    renderCompileCacheTimingGroup("Symbolic", [
+      compileDurationMetric("Build", "Symbolic model construction", row.symbolic_build_s, { always: true }),
+      compileDurationMetric("Derivatives", "Symbolic derivative generation", row.symbolic_derivatives_s, { always: true }),
+      compileDurationMetric("Hessian", "Lagrangian Hessian generation", report?.hessian_generation_s ?? null),
+      compileDurationMetric("Total", "Symbolic setup total", row.symbolic_setup_s, { always: true }),
+    ]),
+    renderCompileCacheTimingGroup("JIT Cache", [
+      compileCountMetric("Hits", "LLVM JIT disk-cache hits", report?.llvm_cache_hits),
+      compileCountMetric("Misses", "LLVM JIT disk-cache misses", report?.llvm_cache_misses),
+      compileDurationMetric("Key", "Cache-key and lowered-function fingerprint generation", report?.llvm_cache_key_s ?? null),
+      compileDurationMetric("Check", "Cache manifest lookup and validation", report?.llvm_cache_check_s ?? null),
+      compileDurationMetric("Read", "Cached object file read", report?.llvm_cache_read_s ?? null),
+      compileDurationMetric("Write", "Cached object file write", report?.llvm_cache_write_s ?? null),
+      compileDurationMetric("Hit path", "Total cache-hit load path", report?.llvm_cache_load_s ?? null),
+      compileDurationMetric("Materialize", "LLVM object materialization", report?.llvm_cache_materialize_s ?? null),
+    ]),
+    renderCompileCacheTimingGroup("Lowering / LLVM", [
+      compileDurationMetric("SX lowering", "SX lowering", report?.lowering_s ?? null),
+      compileDurationMetric("Module", "LLVM module construction", report?.llvm_module_build_s ?? null),
+      compileDurationMetric("Optimize", "LLVM optimization passes", report?.llvm_optimization_s ?? null),
+      compileDurationMetric("Emit object", "LLVM object-code emission", report?.llvm_object_emit_s ?? null),
+      compileDurationMetric("IR fingerprint", "Optimized LLVM IR fingerprint generation", report?.llvm_ir_fingerprint_s ?? null),
+      compileDurationMetric("LLVM total", "LLVM compile/load total", report?.llvm_jit_s ?? null),
+      compileDurationMetric("Context", "JIT execution-context allocation", report?.jit_context_s ?? null),
+    ]),
+    renderCompileCacheTimingGroup("Overall", [
+      {
+        label: "JIT total",
+        title: "Outer JIT phase total",
+        value: formatJitDuration(row.jit_s, row.jit_disk_cache_hit),
+      },
+    ]),
+  ].filter((group) => group.length > 0);
 }
 
 function decodeWireEnum<T extends number>(
