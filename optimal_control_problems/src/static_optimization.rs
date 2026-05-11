@@ -1135,6 +1135,7 @@ where
                 stage: SolveStage::Solving,
                 solver_method: Some(solver_method),
                 solver: running_solver.clone().with_solve_seconds(0.0),
+                compile_report: None,
             },
         });
     }
@@ -1301,6 +1302,7 @@ fn emit_solver_failure_status<F>(
                 stage: SolveStage::Solving,
                 solver_method: Some(solver_method),
                 solver: report,
+                compile_report: None,
             },
         });
     }
@@ -1819,6 +1821,7 @@ fn hanging_chain_compile_cache_statuses() -> Vec<CompileCacheStatus> {
                     &variant_label,
                     compiled.backend_timing_metadata(),
                     compile_report_is_fully_cached(&summary),
+                    Some(summary),
                 )
             })
             .collect()
@@ -1842,6 +1845,7 @@ fn rosenbrock_compile_cache_statuses() -> Vec<CompileCacheStatus> {
                     &variant_label,
                     compiled.backend_timing_metadata(),
                     compile_report_is_fully_cached(&summary),
+                    Some(summary),
                 )
             })
             .collect()

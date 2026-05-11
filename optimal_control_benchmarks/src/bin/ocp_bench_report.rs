@@ -112,6 +112,8 @@ enum CliProblemSelection {
     All,
     #[value(name = "optimal_distance_glider")]
     OptimalDistanceGlider,
+    #[value(name = "albatross_dynamic_soaring")]
+    AlbatrossDynamicSoaring,
     #[value(name = "linear_s_maneuver")]
     LinearSManeuver,
     #[value(name = "sailboat_upwind")]
@@ -175,6 +177,9 @@ fn expand_problem_selections(selections: &[CliProblemSelection]) -> Result<Vec<P
         OcpBenchmarkSuiteConfig::default().problems,
         |selection| match selection {
             CliProblemSelection::OptimalDistanceGlider => Some(ProblemId::OptimalDistanceGlider),
+            CliProblemSelection::AlbatrossDynamicSoaring => {
+                Some(ProblemId::AlbatrossDynamicSoaring)
+            }
             CliProblemSelection::LinearSManeuver => Some(ProblemId::LinearSManeuver),
             CliProblemSelection::SailboatUpwind => Some(ProblemId::SailboatUpwind),
             CliProblemSelection::CraneTransfer => Some(ProblemId::CraneTransfer),
@@ -2828,6 +2833,7 @@ fn matrix_problem_groups(row_keys: &[(ProblemId, TranscriptionMethod)]) -> Vec<(
 fn matrix_problem_title(problem_id: ProblemId) -> &'static str {
     match problem_id {
         ProblemId::OptimalDistanceGlider => "Glider",
+        ProblemId::AlbatrossDynamicSoaring => "Albatross",
         ProblemId::LinearSManeuver => "Linear-S",
         ProblemId::SailboatUpwind => "Sailboat",
         ProblemId::CraneTransfer => "Crane",
@@ -3989,6 +3995,7 @@ fn stage_cell(cell: &CaseCell, stage: MatrixStage) -> StageCell {
 fn short_problem_label(problem_id: ProblemId) -> &'static str {
     match problem_id {
         ProblemId::OptimalDistanceGlider => "Gld",
+        ProblemId::AlbatrossDynamicSoaring => "Alb",
         ProblemId::LinearSManeuver => "Lin",
         ProblemId::SailboatUpwind => "Sai",
         ProblemId::CraneTransfer => "Crn",

@@ -16,6 +16,7 @@ pub mod linear_s;
 pub mod sailboat;
 mod static_optimization;
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
@@ -61,6 +62,43 @@ pub(crate) struct ProblemEntry {
         optimization::NlpEvaluationBenchmarkOptions,
         &mut dyn FnMut(benchmark_report::BenchmarkCaseProgress),
     ) -> Result<OcpBenchmarkRecord>,
+}
+
+type SolveCancellationCheck = Box<dyn Fn() -> bool + Send>;
+
+thread_local! {
+    static SOLVE_CANCELLATION_CHECK: RefCell<Option<SolveCancellationCheck>> =
+        RefCell::new(None);
+}
+
+struct SolveCancellationGuard {
+    previous: Option<SolveCancellationCheck>,
+}
+
+impl Drop for SolveCancellationGuard {
+    fn drop(&mut self) {
+        SOLVE_CANCELLATION_CHECK.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+pub fn with_solve_cancellation_check<R, F, C>(should_continue: C, run: F) -> R
+where
+    F: FnOnce() -> R,
+    C: Fn() -> bool + Send + 'static,
+{
+    let previous = SOLVE_CANCELLATION_CHECK.with(|slot| {
+        slot.borrow_mut()
+            .replace(Box::new(should_continue) as SolveCancellationCheck)
+    });
+    let _guard = SolveCancellationGuard { previous };
+    run()
+}
+
+pub(crate) fn solve_should_continue() -> bool {
+    SOLVE_CANCELLATION_CHECK
+        .with(|slot| slot.borrow().as_ref().map(|check| check()).unwrap_or(true))
 }
 
 fn problem_entries() -> &'static [ProblemEntry] {

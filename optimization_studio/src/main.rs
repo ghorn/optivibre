@@ -22,7 +22,7 @@ use optimal_control_problems::{
     CompileCacheState, CompileCacheStatus, ControlSemantic, ProblemId, SolveArtifact,
     SolveLogLevel, SolveRequest, SolveStage, SolveStatus, SolveStreamEvent, SolverMethod,
     SolverReport, compile_variant_for_problem, prewarm_problem_with_progress, problem_specs,
-    solve_problem, solve_problem_with_progress,
+    solve_problem, solve_problem_with_progress, with_solve_cancellation_check,
 };
 use optimization::{AnsiColorMode, InteriorPointLinearSolver, set_ansi_color_mode};
 use serde::Serialize;
@@ -559,6 +559,10 @@ fn forward_compile_event(shared: &Arc<ActorShared>, event: &SolveStreamEvent) {
 }
 
 fn run_solve_stream(problem: ProblemId, values: BTreeMap<String, f64>, sender: StreamSender) {
+    if sender.is_closed() {
+        return;
+    }
+
     let _capture_lock = solve_stdio_lock()
         .lock()
         .expect("stdio capture lock poisoned");
@@ -567,12 +571,18 @@ fn run_solve_stream(problem: ProblemId, values: BTreeMap<String, f64>, sender: S
     #[cfg(unix)]
     let capture_state = StreamStdIoCapture::start(&sender);
 
+    let sender_for_cancel = sender.clone();
     let sender_for_progress = sender.clone();
-    let result = solve_problem_with_progress(problem, &values, move |event| {
-        if should_forward_solve_event(&event) {
-            send_stream_event(&sender_for_progress, event);
-        }
-    });
+    let result = with_solve_cancellation_check(
+        move || !sender_for_cancel.is_closed(),
+        move || {
+            solve_problem_with_progress(problem, &values, move |event| {
+                if !sender_for_progress.is_closed() && should_forward_solve_event(&event) {
+                    send_stream_event(&sender_for_progress, event);
+                }
+            })
+        },
+    );
 
     #[cfg(unix)]
     if let Some(capture_state) = capture_state {
@@ -624,10 +634,13 @@ fn compile_cache_status_from_parts(
         variant_id: descriptor.signature.variant_id.clone(),
         variant_label: descriptor.variant_label.clone(),
         state,
+        symbolic_build_s: status.and_then(|status| status.solver.symbolic_build_s),
+        symbolic_derivatives_s: status.and_then(|status| status.solver.symbolic_derivatives_s),
         symbolic_setup_s: status.and_then(|status| status.solver.symbolic_setup_s),
         jit_s: status.and_then(|status| status.solver.jit_s),
         jit_disk_cache_hit: status
             .is_some_and(|status| status.solver.jit_disk_cache_hit || status.solver.compile_cached),
+        compile_report: status.and_then(|status| status.compile_report.clone()),
     }
 }
 
@@ -639,6 +652,7 @@ fn ready_solve_status(
         stage: SolveStage::Solving,
         solver_method,
         solver: SolverReport::in_progress(solver_running_label(solver_method)),
+        compile_report: None,
     });
     status.stage = SolveStage::Solving;
     status.solver_method = solver_method;

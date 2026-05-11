@@ -32,16 +32,18 @@ const DEFAULT_COLLOCATION_DEGREE: usize = 3;
 const SUPPORTED_INTERVALS: [usize; 6] = [12, 18, DEFAULT_INTERVALS, 36, 48, 64];
 const SUPPORTED_DEGREES: [usize; 4] = [2, DEFAULT_COLLOCATION_DEGREE, 4, 5];
 
-const GRAVITY: f64 = 9.81;
-const AIR_DENSITY: f64 = 1.225;
-const MASS_KG: f64 = 8.5;
-const REFERENCE_AREA_M2: f64 = 0.65;
-const ASPECT_RATIO: f64 = 18.0;
-const OSWALD: f64 = 0.85;
-const CL_SLOPE: f64 = 5.7;
-const CD0: f64 = 0.018;
-const SPEED_EPS: f64 = 1.0e-3;
-const FRAME_EPS: f64 = 1.0e-4;
+const DEFAULT_GRAVITY_MPS2: f64 = 9.81;
+const DEFAULT_AIR_DENSITY_KG_M3: f64 = 1.2;
+const DEFAULT_MASS_KG: f64 = 8.5;
+const DEFAULT_REFERENCE_AREA_M2: f64 = 0.65;
+const DEFAULT_CL_SLOPE_PER_RAD: f64 = 5.7;
+const DEFAULT_CD0: f64 = 0.0125;
+const DEFAULT_ASPECT_RATIO: f64 = 10.0;
+const DEFAULT_OSWALD_EFFICIENCY: f64 = 0.65;
+const DEFAULT_SPEED_EPS_MPS: f64 = 1.0e-3;
+const DEFAULT_FRAME_EPS: f64 = 1.0e-4;
+const WIND_SHEAR_PROFILE_SAMPLES: usize = 73;
+const WIND_SHEAR_PROFILE_LANES: usize = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ObjectiveKind {
@@ -74,7 +76,7 @@ impl ObjectiveKind {
     const fn label(self) -> &'static str {
         match self {
             Self::AverageSpeed => "Average Speed",
-            Self::WindWork => "Wind Work",
+            Self::WindWork => "Average Wind Power",
             Self::TerminalEnergy => "Terminal Energy",
             Self::ControlRegularization => "Control Regularization",
         }
@@ -146,7 +148,18 @@ where
 
 #[derive(Clone, Debug, PartialEq, Vectorize)]
 struct ModelParams<T> {
-    wind_azimuth_rad: T,
+    gravity_mps2: T,
+    air_density_kg_m3: T,
+    mass_kg: T,
+    reference_area_m2: T,
+    cl_slope_per_rad: T,
+    cd0: T,
+    aspect_ratio: T,
+    oswald_efficiency: T,
+    speed_eps_mps: T,
+    frame_eps: T,
+    wind_dir_x: T,
+    wind_dir_y: T,
     wind_low_mps: T,
     wind_high_mps: T,
     wind_mid_altitude_m: T,
@@ -227,6 +240,16 @@ pub struct Params {
     h0: DesignControl,
     vx0: DesignControl,
     tf: DesignControl,
+    gravity_mps2: f64,
+    air_density_kg_m3: f64,
+    mass_kg: f64,
+    reference_area_m2: f64,
+    cl_slope_per_rad: f64,
+    cd0: f64,
+    aspect_ratio: f64,
+    oswald_efficiency: f64,
+    speed_eps_mps: f64,
+    frame_eps: f64,
     wind_azimuth_deg: f64,
     wind_low_mps: f64,
     wind_high_mps: f64,
@@ -236,6 +259,7 @@ pub struct Params {
     initial_wave_rotation_deg: f64,
     initial_alpha_deg: f64,
     initial_roll_amplitude_deg: f64,
+    min_altitude_m: f64,
     min_airspeed_mps: f64,
     max_airspeed_mps: f64,
     max_load_factor: f64,
@@ -258,37 +282,48 @@ impl Default for Params {
             objective: ObjectiveKind::AverageSpeed,
             delta_l: DesignControl {
                 fixed: true,
-                value: 200.0,
-                lower: 120.0,
-                upper: 320.0,
+                value: 90.0,
+                lower: 50.0,
+                upper: 220.0,
             },
             h0: DesignControl {
                 fixed: true,
-                value: 25.0,
-                lower: 10.0,
-                upper: 60.0,
+                value: 1.5,
+                lower: 0.5,
+                upper: 5.0,
             },
             vx0: DesignControl {
                 fixed: true,
-                value: 20.0,
-                lower: 12.0,
-                upper: 35.0,
+                value: 15.0,
+                lower: 10.0,
+                upper: 22.0,
             },
             tf: DesignControl {
                 fixed: true,
-                value: 10.0,
-                lower: 6.0,
-                upper: 24.0,
+                value: 6.0,
+                lower: 3.0,
+                upper: 12.0,
             },
-            wind_azimuth_deg: 0.0,
+            gravity_mps2: DEFAULT_GRAVITY_MPS2,
+            air_density_kg_m3: DEFAULT_AIR_DENSITY_KG_M3,
+            mass_kg: DEFAULT_MASS_KG,
+            reference_area_m2: DEFAULT_REFERENCE_AREA_M2,
+            cl_slope_per_rad: DEFAULT_CL_SLOPE_PER_RAD,
+            cd0: DEFAULT_CD0,
+            aspect_ratio: DEFAULT_ASPECT_RATIO,
+            oswald_efficiency: DEFAULT_OSWALD_EFFICIENCY,
+            speed_eps_mps: DEFAULT_SPEED_EPS_MPS,
+            frame_eps: DEFAULT_FRAME_EPS,
+            wind_azimuth_deg: -90.0,
             wind_low_mps: 0.0,
-            wind_high_mps: 12.0,
-            wind_mid_altitude_m: 20.0,
-            wind_transition_height_m: 8.0,
-            initial_wave_amplitude_m: 14.0,
+            wind_high_mps: 6.0,
+            wind_mid_altitude_m: 3.0,
+            wind_transition_height_m: 1.5,
+            initial_wave_amplitude_m: 10.0,
             initial_wave_rotation_deg: 45.0,
-            initial_alpha_deg: 4.0,
+            initial_alpha_deg: 5.0,
             initial_roll_amplitude_deg: 35.0,
+            min_altitude_m: 0.5,
             min_airspeed_mps: 5.0,
             max_airspeed_mps: 70.0,
             max_load_factor: 8.0,
@@ -375,6 +410,43 @@ impl FromMap for Params {
             h0: read_design(values, "h0", &defaults.h0)?,
             vx0: read_design(values, "vx0", &defaults.vx0)?,
             tf: read_design(values, "tf", &defaults.tf)?,
+            gravity_mps2: expect_finite(
+                sample_or_default(values, "gravity_mps2", defaults.gravity_mps2),
+                "gravity_mps2",
+            )?,
+            air_density_kg_m3: expect_finite(
+                sample_or_default(values, "air_density_kg_m3", defaults.air_density_kg_m3),
+                "air_density_kg_m3",
+            )?,
+            mass_kg: expect_finite(
+                sample_or_default(values, "mass_kg", defaults.mass_kg),
+                "mass_kg",
+            )?,
+            reference_area_m2: expect_finite(
+                sample_or_default(values, "reference_area_m2", defaults.reference_area_m2),
+                "reference_area_m2",
+            )?,
+            cl_slope_per_rad: expect_finite(
+                sample_or_default(values, "cl_slope_per_rad", defaults.cl_slope_per_rad),
+                "cl_slope_per_rad",
+            )?,
+            cd0: expect_finite(sample_or_default(values, "cd0", defaults.cd0), "cd0")?,
+            aspect_ratio: expect_finite(
+                sample_or_default(values, "aspect_ratio", defaults.aspect_ratio),
+                "aspect_ratio",
+            )?,
+            oswald_efficiency: expect_finite(
+                sample_or_default(values, "oswald_efficiency", defaults.oswald_efficiency),
+                "oswald_efficiency",
+            )?,
+            speed_eps_mps: expect_finite(
+                sample_or_default(values, "speed_eps_mps", defaults.speed_eps_mps),
+                "speed_eps_mps",
+            )?,
+            frame_eps: expect_finite(
+                sample_or_default(values, "frame_eps", defaults.frame_eps),
+                "frame_eps",
+            )?,
             wind_azimuth_deg: expect_finite(
                 sample_or_default(values, "wind_azimuth_deg", defaults.wind_azimuth_deg),
                 "wind_azimuth_deg",
@@ -427,6 +499,10 @@ impl FromMap for Params {
                 ),
                 "initial_roll_amplitude_deg",
             )?,
+            min_altitude_m: expect_finite(
+                sample_or_default(values, "min_altitude_m", defaults.min_altitude_m),
+                "min_altitude_m",
+            )?,
             min_airspeed_mps: expect_finite(
                 sample_or_default(values, "min_airspeed_mps", defaults.min_airspeed_mps),
                 "min_airspeed_mps",
@@ -473,6 +549,42 @@ impl FromMap for Params {
         if params.wind_transition_height_m <= 0.0 {
             return Err(anyhow!("wind_transition_height_m must be positive"));
         }
+        if params.gravity_mps2 <= 0.0 {
+            return Err(anyhow!("gravity_mps2 must be positive"));
+        }
+        if params.air_density_kg_m3 <= 0.0 {
+            return Err(anyhow!("air_density_kg_m3 must be positive"));
+        }
+        if params.mass_kg <= 0.0 {
+            return Err(anyhow!("mass_kg must be positive"));
+        }
+        if params.reference_area_m2 <= 0.0 {
+            return Err(anyhow!("reference_area_m2 must be positive"));
+        }
+        if params.cl_slope_per_rad <= 0.0 {
+            return Err(anyhow!("cl_slope_per_rad must be positive"));
+        }
+        if params.cd0 < 0.0 {
+            return Err(anyhow!("cd0 must be nonnegative"));
+        }
+        if params.aspect_ratio <= 0.0 {
+            return Err(anyhow!("aspect_ratio must be positive"));
+        }
+        if params.oswald_efficiency <= 0.0 {
+            return Err(anyhow!("oswald_efficiency must be positive"));
+        }
+        if params.oswald_efficiency > 1.0 {
+            return Err(anyhow!("oswald_efficiency must be less than or equal to 1"));
+        }
+        if params.speed_eps_mps <= 0.0 {
+            return Err(anyhow!("speed_eps_mps must be positive"));
+        }
+        if params.frame_eps <= 0.0 {
+            return Err(anyhow!("frame_eps must be positive"));
+        }
+        if params.min_altitude_m < 0.0 {
+            return Err(anyhow!("min_altitude_m must be nonnegative"));
+        }
         if params.min_airspeed_mps > params.max_airspeed_mps {
             return Err(anyhow!(
                 "min_airspeed_mps must be less than or equal to max_airspeed_mps"
@@ -482,6 +594,16 @@ impl FromMap for Params {
         validate_design_domain("h0", &params.h0, 0.0, true, "nonnegative")?;
         validate_design_domain("vx0", &params.vx0, 0.0, false, "positive")?;
         validate_design_domain("tf", &params.tf, 0.0, false, "positive")?;
+        if params.h0.fixed && params.h0.value < params.min_altitude_m {
+            return Err(anyhow!(
+                "h0_value must be greater than or equal to min_altitude_m"
+            ));
+        }
+        if !params.h0.fixed && params.h0.upper < params.min_altitude_m {
+            return Err(anyhow!(
+                "h0_upper must be greater than or equal to min_altitude_m when h0 is free"
+            ));
+        }
         if params.initial_wave_amplitude_m < 0.0 {
             return Err(anyhow!("initial_wave_amplitude_m must be nonnegative"));
         }
@@ -597,7 +719,7 @@ pub fn spec() -> ProblemSpec {
         "Symbolic objective variant. Changing this intentionally compiles a separate NLP.",
         &[
             (0.0, "Average speed"),
-            (1.0, "Wind work"),
+            (1.0, "Average wind power"),
             (2.0, "Terminal energy"),
             (3.0, "Control regularization"),
         ],
@@ -616,6 +738,106 @@ pub fn spec() -> ProblemSpec {
     extra.extend(design_controls("tf", "T", "s", &defaults.tf));
     extra.extend([
         problem_slider_control(
+            "gravity_mps2",
+            "Gravity",
+            1.0,
+            20.0,
+            0.01,
+            defaults.gravity_mps2,
+            "m/s^2",
+            "Runtime gravity parameter used in dynamics, load factor, and mechanical energy.",
+        ),
+        problem_slider_control(
+            "air_density_kg_m3",
+            "Air Density",
+            0.2,
+            2.0,
+            0.01,
+            defaults.air_density_kg_m3,
+            "kg/m^3",
+            "Runtime air-density parameter in dynamic pressure.",
+        ),
+        problem_slider_control(
+            "mass_kg",
+            "Mass",
+            0.5,
+            40.0,
+            0.1,
+            defaults.mass_kg,
+            "kg",
+            "Runtime aircraft mass parameter.",
+        ),
+        problem_slider_control(
+            "reference_area_m2",
+            "Reference Area",
+            0.05,
+            3.0,
+            0.01,
+            defaults.reference_area_m2,
+            "m^2",
+            "Runtime aerodynamic reference area parameter.",
+        ),
+        problem_slider_control(
+            "cl_slope_per_rad",
+            "CL Slope",
+            0.5,
+            10.0,
+            0.05,
+            defaults.cl_slope_per_rad,
+            "1/rad",
+            "Runtime lift-curve slope used by CL = CL_slope * alpha.",
+        ),
+        problem_scientific_slider_control(
+            "cd0",
+            "CD0",
+            0.0,
+            0.1,
+            0.0005,
+            defaults.cd0,
+            "",
+            "Runtime zero-lift drag coefficient.",
+        ),
+        problem_slider_control(
+            "aspect_ratio",
+            "Aspect Ratio",
+            2.0,
+            30.0,
+            0.1,
+            defaults.aspect_ratio,
+            "",
+            "Runtime wing aspect ratio used in CD = CD0 + CL^2/(pi AR e).",
+        ),
+        problem_slider_control(
+            "oswald_efficiency",
+            "Oswald Efficiency",
+            0.1,
+            1.0,
+            0.01,
+            defaults.oswald_efficiency,
+            "",
+            "Runtime Oswald span efficiency used in CD = CD0 + CL^2/(pi AR e).",
+        ),
+        problem_scientific_slider_control(
+            "speed_eps_mps",
+            "Airspeed Eps",
+            1.0e-6,
+            1.0e-1,
+            1.0e-4,
+            defaults.speed_eps_mps,
+            "m/s",
+            "Runtime epsilon inside the smooth airspeed norm.",
+        ),
+        problem_scientific_slider_control(
+            "frame_eps",
+            "Frame Eps",
+            1.0e-8,
+            1.0e-2,
+            1.0e-5,
+            defaults.frame_eps,
+            "",
+            "Runtime epsilon for the projected-up lift-frame normalization.",
+        ),
+        problem_slider_control(
             "wind_azimuth_deg",
             "Wind Azimuth",
             -180.0,
@@ -623,7 +845,7 @@ pub fn spec() -> ProblemSpec {
             1.0,
             defaults.wind_azimuth_deg,
             "deg",
-            "Horizontal wind direction. 0 deg is +X.",
+            "Horizontal wind direction. 0 deg is downwind with +X travel; -90 deg is crosswind along -Y and matches the default 45 deg guess climbing upwind. Converted to runtime wind-direction parameters, so changing it reuses the compiled NLP.",
         ),
         problem_slider_control(
             "wind_low_mps",
@@ -704,6 +926,16 @@ pub fn spec() -> ProblemSpec {
             defaults.initial_roll_amplitude_deg,
             "deg",
             "Sinusoidal roll seed amplitude.",
+        ),
+        problem_slider_control(
+            "min_altitude_m",
+            "Min Altitude",
+            0.0,
+            10.0,
+            0.1,
+            defaults.min_altitude_m,
+            "m",
+            "Lower path bound on center-of-mass altitude above the water.",
         ),
         problem_slider_control(
             "min_airspeed_mps",
@@ -802,6 +1034,10 @@ pub fn spec() -> ProblemSpec {
                 entries: vec![r"W(p_z)=\hat w\left(W_\ell+\frac{1}{2}(W_h-W_\ell)(1+\tanh((p_z-z_m)/z_s))\right)".to_string()],
             },
             LatexSection {
+                title: "Aero Polar".to_string(),
+                entries: vec![r"C_L=C_{L_\alpha}\alpha,\quad C_D=C_{D0}+\frac{C_L^2}{\pi ARe}".to_string()],
+            },
+            LatexSection {
                 title: "Lift Frame".to_string(),
                 entries: vec![r"\hat d=-a/V_a,\quad n_0=\mathrm{normalize}(\hat z-(\hat z\cdot\hat a)\hat a),\quad \hat l=\cos\phi\,n_0+\sin\phi\,(\hat a\times n_0)".to_string()],
             },
@@ -817,22 +1053,30 @@ fn deg_to_rad(value: f64) -> f64 {
     value * std::f64::consts::PI / 180.0
 }
 
-fn cl_sx(alpha: SX) -> SX {
-    CL_SLOPE * alpha
+fn cl_sx(alpha: SX, p: &ModelParams<SX>) -> SX {
+    p.cl_slope_per_rad.clone() * alpha
 }
 
-fn cd_sx(alpha: SX) -> SX {
-    let cl = cl_sx(alpha);
-    CD0 + cl.sqr() / (std::f64::consts::PI * ASPECT_RATIO * OSWALD)
+fn cd_sx(alpha: SX, p: &ModelParams<SX>) -> SX {
+    let cl = cl_sx(alpha, p);
+    p.cd0.clone() + induced_drag_factor_sx(p) * cl.sqr()
 }
 
-fn cl_numeric(alpha: f64) -> f64 {
-    CL_SLOPE * alpha
+fn cl_numeric(alpha: f64, params: &Params) -> f64 {
+    params.cl_slope_per_rad * alpha
 }
 
-fn cd_numeric(alpha: f64) -> f64 {
-    let cl = cl_numeric(alpha);
-    CD0 + cl * cl / (std::f64::consts::PI * ASPECT_RATIO * OSWALD)
+fn cd_numeric(alpha: f64, params: &Params) -> f64 {
+    let cl = cl_numeric(alpha, params);
+    params.cd0 + induced_drag_factor_numeric(params) * cl * cl
+}
+
+fn induced_drag_factor_sx(p: &ModelParams<SX>) -> SX {
+    1.0 / (std::f64::consts::PI * p.aspect_ratio.clone() * p.oswald_efficiency.clone())
+}
+
+fn induced_drag_factor_numeric(params: &Params) -> f64 {
+    1.0 / (std::f64::consts::PI * params.aspect_ratio * params.oswald_efficiency)
 }
 
 #[derive(Clone)]
@@ -852,8 +1096,8 @@ fn wind_sx(pz: SX, p: &ModelParams<SX>) -> (SX, SX, SX, SX) {
         ((pz - p.wind_mid_altitude_m.clone()) / p.wind_transition_height_m.clone()).tanh();
     let speed = p.wind_low_mps.clone()
         + 0.5 * (p.wind_high_mps.clone() - p.wind_low_mps.clone()) * (1.0 + transition);
-    let wx = speed.clone() * p.wind_azimuth_rad.clone().cos();
-    let wy = speed.clone() * p.wind_azimuth_rad.clone().sin();
+    let wx = speed.clone() * p.wind_dir_x.clone();
+    let wy = speed.clone() * p.wind_dir_y.clone();
     (wx, wy, SX::zero(), speed)
 }
 
@@ -862,8 +1106,10 @@ fn aero_sx(state: &State<SX>, control: &Control<SX>, p: &ModelParams<SX>) -> Aer
     let ax_rel = state.vx.clone() - wx.clone();
     let ay_rel = state.vy.clone() - wy.clone();
     let az_rel = state.vz.clone() - wz.clone();
-    let va2 =
-        ax_rel.clone().sqr() + ay_rel.clone().sqr() + az_rel.clone().sqr() + SPEED_EPS * SPEED_EPS;
+    let va2 = ax_rel.clone().sqr()
+        + ay_rel.clone().sqr()
+        + az_rel.clone().sqr()
+        + p.speed_eps_mps.clone().sqr();
     let va = va2.clone().sqrt();
     let inv_va = SX::one() / va.clone();
     let ahx = ax_rel * inv_va.clone();
@@ -877,7 +1123,7 @@ fn aero_sx(state: &State<SX>, control: &Control<SX>, p: &ModelParams<SX>) -> Aer
     let nry = -dot_up.clone() * ahy.clone();
     let nrz = SX::one() - dot_up * ahz.clone();
     let frame_guard = (nrx.clone().sqr() + nry.clone().sqr() + nrz.clone().sqr()).sqrt();
-    let inv_n = SX::one() / (frame_guard.clone().sqr() + FRAME_EPS * FRAME_EPS).sqrt();
+    let inv_n = SX::one() / (frame_guard.clone().sqr() + p.frame_eps.clone().sqr()).sqrt();
     let nx = nrx * inv_n.clone();
     let ny = nry * inv_n.clone();
     let nz = nrz * inv_n.clone();
@@ -889,16 +1135,17 @@ fn aero_sx(state: &State<SX>, control: &Control<SX>, p: &ModelParams<SX>) -> Aer
     let lx = cr.clone() * nx + sr.clone() * sx_x;
     let ly = cr.clone() * ny + sr.clone() * sx_y;
     let lz = cr * nz + sr * sx_z;
-    let cl = cl_sx(control.alpha.clone());
-    let cd = cd_sx(control.alpha.clone());
-    let q_over_m = 0.5 * AIR_DENSITY * REFERENCE_AREA_M2 * va2 / MASS_KG;
+    let cl = cl_sx(control.alpha.clone(), p);
+    let cd = cd_sx(control.alpha.clone(), p);
+    let q_over_m =
+        0.5 * p.air_density_kg_m3.clone() * p.reference_area_m2.clone() * va2 / p.mass_kg.clone();
     let aero_x = q_over_m.clone() * (cl.clone() * lx + cd.clone() * dhx);
     let aero_y = q_over_m.clone() * (cl.clone() * ly + cd.clone() * dhy);
     let aero_z = q_over_m * (cl.clone() * lz + cd.clone() * dhz);
-    let load_factor =
-        (aero_x.clone().sqr() + aero_y.clone().sqr() + aero_z.clone().sqr()).sqrt() / GRAVITY;
+    let load_factor = (aero_x.clone().sqr() + aero_y.clone().sqr() + aero_z.clone().sqr()).sqrt()
+        / p.gravity_mps2.clone();
     let wind_work_rate =
-        MASS_KG * (aero_x.clone() * wx + aero_y.clone() * wy + aero_z.clone() * wz);
+        p.mass_kg.clone() * (aero_x.clone() * wx + aero_y.clone() * wy + aero_z.clone() * wz);
     AeroSx {
         ax: aero_x,
         ay: aero_y,
@@ -916,12 +1163,18 @@ fn model<Scheme>(
     objective: ObjectiveKind,
 ) -> Ocp<State<SX>, Control<SX>, ModelParams<SX>, Path<SX>, Boundary<SX>, (), Scheme, Design<SX>> {
     Ocp::new("albatross_dynamic_soaring", scheme)
-        .objective_lagrange(
-            move |x: &State<SX>, u: &Control<SX>, dudt: &Control<SX>, p: &ModelParams<SX>| {
+        .objective_lagrange_global(
+            move |x: &State<SX>,
+                  u: &Control<SX>,
+                  dudt: &Control<SX>,
+                  p: &ModelParams<SX>,
+                  g: &Design<SX>| {
                 let rate_cost =
                     p.rate_weight.clone() * (dudt.alpha.clone().sqr() + dudt.roll.clone().sqr());
                 match objective {
-                    ObjectiveKind::WindWork => rate_cost - aero_sx(x, u, p).wind_work_rate,
+                    ObjectiveKind::WindWork => {
+                        rate_cost - aero_sx(x, u, p).wind_work_rate / g.tf.clone()
+                    }
                     ObjectiveKind::ControlRegularization
                     | ObjectiveKind::AverageSpeed
                     | ObjectiveKind::TerminalEnergy => rate_cost,
@@ -933,15 +1186,15 @@ fn model<Scheme>(
                   _: &Control<SX>,
                   xf: &State<SX>,
                   _: &Control<SX>,
-                  _: &ModelParams<SX>,
+                  p: &ModelParams<SX>,
                   g: &Design<SX>| {
                 match objective {
                     ObjectiveKind::AverageSpeed => -g.delta_l.clone() / g.tf.clone(),
                     ObjectiveKind::TerminalEnergy => {
                         -(0.5
-                            * MASS_KG
+                            * p.mass_kg.clone()
                             * (xf.vx.clone().sqr() + xf.vy.clone().sqr() + xf.vz.clone().sqr())
-                            + MASS_KG * GRAVITY * xf.pz.clone())
+                            + p.mass_kg.clone() * p.gravity_mps2.clone() * xf.pz.clone())
                     }
                     ObjectiveKind::WindWork | ObjectiveKind::ControlRegularization => SX::zero(),
                 }
@@ -955,7 +1208,7 @@ fn model<Scheme>(
                 pz: x.vz.clone(),
                 vx: aero.ax,
                 vy: aero.ay,
-                vz: aero.az - GRAVITY,
+                vz: aero.az - p.gravity_mps2.clone(),
             }
         })
         .path_constraints(|x, u, dudt, p| {
@@ -1029,9 +1282,44 @@ fn design_bounds(control: &DesignControl) -> Bounds1D {
     }
 }
 
+fn finite_min_max(values: impl IntoIterator<Item = f64>) -> Option<(f64, f64)> {
+    let mut iter = values.into_iter().filter(|value| value.is_finite());
+    let first = iter.next()?;
+    let mut min_value = first;
+    let mut max_value = first;
+    for value in iter {
+        min_value = min_value.min(value);
+        max_value = max_value.max(value);
+    }
+    Some((min_value, max_value))
+}
+
+fn linspace(start: f64, end: f64, count: usize) -> Vec<f64> {
+    match count {
+        0 => Vec::new(),
+        1 => vec![start],
+        _ => {
+            let step = (end - start) / (count - 1) as f64;
+            (0..count).map(|idx| start + idx as f64 * step).collect()
+        }
+    }
+}
+
 fn model_params(params: &Params) -> ModelParams<f64> {
+    let az = deg_to_rad(params.wind_azimuth_deg);
     ModelParams {
-        wind_azimuth_rad: deg_to_rad(params.wind_azimuth_deg),
+        gravity_mps2: params.gravity_mps2,
+        air_density_kg_m3: params.air_density_kg_m3,
+        mass_kg: params.mass_kg,
+        reference_area_m2: params.reference_area_m2,
+        cl_slope_per_rad: params.cl_slope_per_rad,
+        cd0: params.cd0,
+        aspect_ratio: params.aspect_ratio,
+        oswald_efficiency: params.oswald_efficiency,
+        speed_eps_mps: params.speed_eps_mps,
+        frame_eps: params.frame_eps,
+        wind_dir_x: az.cos(),
+        wind_dir_y: az.sin(),
         wind_low_mps: params.wind_low_mps,
         wind_high_mps: params.wind_high_mps,
         wind_mid_altitude_m: params.wind_mid_altitude_m,
@@ -1047,6 +1335,92 @@ fn wind_numeric(pz: f64, params: &Params) -> ([f64; 3], f64) {
             * (params.wind_high_mps - params.wind_low_mps)
             * (1.0 + ((pz - params.wind_mid_altitude_m) / params.wind_transition_height_m).tanh());
     ([speed * az.cos(), speed * az.sin(), 0.0], speed)
+}
+
+fn wind_shear_z_upper(params: &Params, pz: &[f64]) -> f64 {
+    let max_state_altitude = finite_min_max(pz.iter().copied())
+        .map(|(_, upper)| upper)
+        .unwrap_or(params.h0.value);
+    let design_altitude = if params.h0.fixed {
+        params.h0.value
+    } else {
+        params.h0.upper.max(params.h0.value)
+    };
+    max_state_altitude
+        .max(design_altitude + params.initial_wave_amplitude_m.abs())
+        .max(params.wind_mid_altitude_m + 5.0 * params.wind_transition_height_m)
+        .max(params.min_altitude_m)
+        .max(1.0)
+}
+
+fn xy_from_wind_basis(
+    along: f64,
+    cross: f64,
+    along_dir: [f64; 2],
+    cross_dir: [f64; 2],
+) -> (f64, f64) {
+    (
+        along * along_dir[0] + cross * cross_dir[0],
+        along * along_dir[1] + cross * cross_dir[1],
+    )
+}
+
+fn wind_shear_scene_paths(params: &Params, px: &[f64], py: &[f64], pz: &[f64]) -> Vec<ScenePath3D> {
+    let az = deg_to_rad(params.wind_azimuth_deg);
+    let along_dir = [az.cos(), az.sin()];
+    let cross_dir = [-along_dir[1], along_dir[0]];
+    let along_projection = px
+        .iter()
+        .zip(py.iter())
+        .map(|(x, y)| x * along_dir[0] + y * along_dir[1]);
+    let cross_projection = px
+        .iter()
+        .zip(py.iter())
+        .map(|(x, y)| x * cross_dir[0] + y * cross_dir[1]);
+    let (along_min, along_max) = finite_min_max(along_projection).unwrap_or((0.0, 1.0));
+    let (cross_min, cross_max) = finite_min_max(cross_projection).unwrap_or((-15.0, 15.0));
+    let along_span = (along_max - along_min)
+        .abs()
+        .max(params.delta_l.value.abs())
+        .max(40.0);
+    let cross_center = 0.5 * (cross_min + cross_max);
+    let cross_span = (cross_max - cross_min).abs().max(40.0);
+    let panel_along = along_max + 0.10 * along_span;
+    let cross_left = cross_center - 0.55 * cross_span;
+    let cross_right = cross_center + 0.55 * cross_span;
+    let profile_cross_offsets = linspace(cross_left, cross_right, WIND_SHEAR_PROFILE_LANES);
+    let z_upper = wind_shear_z_upper(params, pz);
+    let profile_z = linspace(0.0, z_upper, WIND_SHEAR_PROFILE_SAMPLES);
+    let profile_scale = 2.2;
+    let mut paths = Vec::new();
+    let (left_x, left_y) = xy_from_wind_basis(panel_along, cross_left, along_dir, cross_dir);
+    let (right_x, right_y) = xy_from_wind_basis(panel_along, cross_right, along_dir, cross_dir);
+    paths.push(ScenePath3D {
+        name: "wind shear frame".to_string(),
+        x: vec![left_x, right_x, right_x, left_x, left_x],
+        y: vec![left_y, right_y, right_y, left_y, left_y],
+        z: vec![0.0, 0.0, z_upper, z_upper, 0.0],
+    });
+    for (lane, cross) in profile_cross_offsets.iter().enumerate() {
+        let (base_x, base_y) = xy_from_wind_basis(panel_along, *cross, along_dir, cross_dir);
+        let wind_vectors = profile_z
+            .iter()
+            .map(|z| wind_numeric(*z, params).0)
+            .collect::<Vec<_>>();
+        paths.push(ScenePath3D {
+            name: format!("wind shear profile lane={lane}"),
+            x: wind_vectors
+                .iter()
+                .map(|wind| base_x + wind[0] * profile_scale)
+                .collect(),
+            y: wind_vectors
+                .iter()
+                .map(|wind| base_y + wind[1] * profile_scale)
+                .collect(),
+            z: profile_z.clone(),
+        });
+    }
+    paths
 }
 
 #[derive(Clone, Debug)]
@@ -1070,13 +1444,17 @@ struct AeroNum {
 fn aero_numeric(state: &State<f64>, control: &Control<f64>, params: &Params) -> AeroNum {
     let (wind, wind_speed) = wind_numeric(state.pz, params);
     let rel = [state.vx - wind[0], state.vy - wind[1], state.vz - wind[2]];
-    let va = (rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2] + SPEED_EPS * SPEED_EPS).sqrt();
+    let va = (rel[0] * rel[0]
+        + rel[1] * rel[1]
+        + rel[2] * rel[2]
+        + params.speed_eps_mps * params.speed_eps_mps)
+        .sqrt();
     let ah = [rel[0] / va, rel[1] / va, rel[2] / va];
     let dh = [-ah[0], -ah[1], -ah[2]];
     let dot_up = ah[2];
     let nr = [-dot_up * ah[0], -dot_up * ah[1], 1.0 - dot_up * ah[2]];
     let frame_guard = (nr[0] * nr[0] + nr[1] * nr[1] + nr[2] * nr[2]).sqrt();
-    let inv_n = 1.0 / (frame_guard * frame_guard + FRAME_EPS * FRAME_EPS).sqrt();
+    let inv_n = 1.0 / (frame_guard * frame_guard + params.frame_eps * params.frame_eps).sqrt();
     let n = [nr[0] * inv_n, nr[1] * inv_n, nr[2] * inv_n];
     let side = [
         ah[1] * n[2] - ah[2] * n[1],
@@ -1090,9 +1468,10 @@ fn aero_numeric(state: &State<f64>, control: &Control<f64>, params: &Params) -> 
         cr * n[1] + sr * side[1],
         cr * n[2] + sr * side[2],
     ];
-    let cl = cl_numeric(control.alpha);
-    let cd = cd_numeric(control.alpha);
-    let q_over_m = 0.5 * AIR_DENSITY * REFERENCE_AREA_M2 * va * va / MASS_KG;
+    let cl = cl_numeric(control.alpha, params);
+    let cd = cd_numeric(control.alpha, params);
+    let q_over_m =
+        0.5 * params.air_density_kg_m3 * params.reference_area_m2 * va * va / params.mass_kg;
     let lift_accel = [
         q_over_m * cl * lift_dir[0],
         q_over_m * cl * lift_dir[1],
@@ -1112,9 +1491,9 @@ fn aero_numeric(state: &State<f64>, control: &Control<f64>, params: &Params) -> 
         + aero_accel[1] * aero_accel[1]
         + aero_accel[2] * aero_accel[2])
         .sqrt()
-        / GRAVITY;
-    let wind_work_rate =
-        MASS_KG * (aero_accel[0] * wind[0] + aero_accel[1] * wind[1] + aero_accel[2] * wind[2]);
+        / params.gravity_mps2;
+    let wind_work_rate = params.mass_kg
+        * (aero_accel[0] * wind[0] + aero_accel[1] * wind[1] + aero_accel[2] * wind[2]);
     AeroNum {
         aero_accel,
         lift_accel,
@@ -1285,7 +1664,7 @@ fn validate_initial_guess(
 fn path_bounds(params: &Params) -> Path<Bounds1D> {
     Path {
         altitude: Bounds1D {
-            lower: Some(0.0),
+            lower: Some(params.min_altitude_m),
             upper: None,
         },
         airspeed: Bounds1D {
@@ -1293,7 +1672,7 @@ fn path_bounds(params: &Params) -> Path<Bounds1D> {
             upper: Some(params.max_airspeed_mps),
         },
         cl: Bounds1D {
-            lower: Some(-1.0),
+            lower: Some(0.0),
             upper: Some(1.5),
         },
         load_factor: Bounds1D {
@@ -1416,7 +1795,12 @@ fn scaling(
         state: State {
             px: params.delta_l.value.abs().max(100.0),
             py: params.initial_wave_amplitude_m.max(10.0),
-            pz: params.h0.value.abs().max(20.0),
+            pz: params
+                .h0
+                .value
+                .abs()
+                .max(params.initial_wave_amplitude_m)
+                .max(5.0),
             vx: params.vx0.value.abs().max(10.0),
             vy: params.vx0.value.abs().max(10.0),
             vz: params.vx0.value.abs().max(10.0),
@@ -1431,20 +1815,31 @@ fn scaling(
         },
         global: Design {
             delta_l: params.delta_l.value.abs().max(100.0),
-            h0: params.h0.value.abs().max(20.0),
+            h0: params.h0.value.abs().max(5.0),
             vx0: params.vx0.value.abs().max(10.0),
             tf: params.tf.value.abs().max(5.0),
         },
         parameters: ModelParams {
-            wind_azimuth_rad: 1.0,
-            wind_low_mps: 10.0,
-            wind_high_mps: 10.0,
-            wind_mid_altitude_m: 20.0,
-            wind_transition_height_m: 10.0,
+            gravity_mps2: params.gravity_mps2.abs().max(10.0),
+            air_density_kg_m3: params.air_density_kg_m3.abs().max(1.0),
+            mass_kg: params.mass_kg.abs().max(10.0),
+            reference_area_m2: params.reference_area_m2.abs().max(1.0),
+            cl_slope_per_rad: params.cl_slope_per_rad.abs().max(1.0),
+            cd0: params.cd0.abs().max(0.01),
+            aspect_ratio: params.aspect_ratio.abs().max(10.0),
+            oswald_efficiency: params.oswald_efficiency.abs().max(0.5),
+            speed_eps_mps: params.speed_eps_mps.abs().max(1.0e-3),
+            frame_eps: params.frame_eps.abs().max(1.0e-4),
+            wind_dir_x: 1.0,
+            wind_dir_y: 0.0,
+            wind_low_mps: 5.0,
+            wind_high_mps: 5.0,
+            wind_mid_altitude_m: 5.0,
+            wind_transition_height_m: 2.0,
             rate_weight: 1.0,
         },
         path: vec![
-            20.0,
+            10.0,
             20.0,
             1.0,
             5.0,
@@ -1956,7 +2351,7 @@ fn artifact_common(
         .collect::<Vec<_>>();
     let q = airspeed
         .iter()
-        .map(|v| 0.5 * AIR_DENSITY * v * v)
+        .map(|v| 0.5 * params.air_density_kg_m3 * v * v)
         .collect::<Vec<_>>();
     let regularization_density = rates
         .iter()
@@ -1968,7 +2363,7 @@ fn artifact_common(
         .map(|((a, _), u)| {
             let regularization = params.rate_regularization * (u.alpha * u.alpha + u.roll * u.roll);
             match params.objective {
-                ObjectiveKind::WindWork => regularization - a.wind_work_rate,
+                ObjectiveKind::WindWork => regularization - a.wind_work_rate / tf,
                 ObjectiveKind::AverageSpeed
                 | ObjectiveKind::TerminalEnergy
                 | ObjectiveKind::ControlRegularization => regularization,
@@ -1977,11 +2372,11 @@ fn artifact_common(
         .collect::<Vec<_>>();
     let kinetic = states
         .iter()
-        .map(|s| 0.5 * MASS_KG * (s.vx * s.vx + s.vy * s.vy + s.vz * s.vz))
+        .map(|s| 0.5 * params.mass_kg * (s.vx * s.vx + s.vy * s.vy + s.vz * s.vz))
         .collect::<Vec<_>>();
     let potential = states
         .iter()
-        .map(|s| MASS_KG * GRAVITY * s.pz)
+        .map(|s| params.mass_kg * params.gravity_mps2 * s.pz)
         .collect::<Vec<_>>();
     let total_energy = kinetic
         .iter()
@@ -2144,7 +2539,7 @@ fn artifact_common(
             "alpha lower from CL",
             "alpha",
             &times,
-            rad_to_deg(lower / CL_SLOPE),
+            rad_to_deg(lower / params.cl_slope_per_rad),
             crate::common::TimeSeriesRole::LowerBound,
         ));
     }
@@ -2153,7 +2548,7 @@ fn artifact_common(
             "alpha upper from CL",
             "alpha",
             &times,
-            rad_to_deg(upper / CL_SLOPE),
+            rad_to_deg(upper / params.cl_slope_per_rad),
             crate::common::TimeSeriesRole::UpperBound,
         ));
     }
@@ -2314,27 +2709,7 @@ fn artifact_common(
             z: vec![state.pz, state.pz + frame_scale * aero.side_dir[2]],
         });
     }
-    for y_offset in [-30.0, 0.0, 30.0] {
-        let z_values = (0..=24).map(|i| i as f64 * 3.0).collect::<Vec<_>>();
-        let wind_vectors = z_values
-            .iter()
-            .map(|z| wind_numeric(*z, params).0)
-            .collect::<Vec<_>>();
-        let x_values = wind_vectors
-            .iter()
-            .map(|wind| wind[0] * 3.0)
-            .collect::<Vec<_>>();
-        let y_values = wind_vectors
-            .iter()
-            .map(|wind| y_offset + wind[1] * 3.0)
-            .collect::<Vec<_>>();
-        paths.push(ScenePath3D {
-            name: format!("wind shear y={y_offset:.0}"),
-            x: x_values,
-            y: y_values,
-            z: z_values,
-        });
-    }
+    paths.extend(wind_shear_scene_paths(params, &px, &py, &pz));
     let average_speed = global.delta_l / tf;
     let mut summary = transcription_metrics(&params.transcription).to_vec();
     summary.extend([
@@ -2500,16 +2875,60 @@ mod tests {
     }
 
     #[test]
+    fn default_albatross_parameters_match_crosswind_reference_seed() {
+        let params = Params::default();
+        assert_eq!(params.delta_l.value, 90.0);
+        assert_eq!(params.delta_l.lower, 50.0);
+        assert_eq!(params.delta_l.upper, 220.0);
+        assert_eq!(params.h0.value, 1.5);
+        assert_eq!(params.h0.lower, 0.5);
+        assert_eq!(params.h0.upper, 5.0);
+        assert_eq!(params.vx0.value, 15.0);
+        assert_eq!(params.vx0.lower, 10.0);
+        assert_eq!(params.vx0.upper, 22.0);
+        assert_eq!(params.tf.value, 6.0);
+        assert_eq!(params.tf.lower, 3.0);
+        assert_eq!(params.tf.upper, 12.0);
+        assert_eq!(params.gravity_mps2, DEFAULT_GRAVITY_MPS2);
+        assert_eq!(params.air_density_kg_m3, DEFAULT_AIR_DENSITY_KG_M3);
+        assert_eq!(params.mass_kg, DEFAULT_MASS_KG);
+        assert_eq!(params.reference_area_m2, DEFAULT_REFERENCE_AREA_M2);
+        assert_eq!(params.cl_slope_per_rad, DEFAULT_CL_SLOPE_PER_RAD);
+        assert_eq!(params.cd0, DEFAULT_CD0);
+        assert_eq!(params.aspect_ratio, DEFAULT_ASPECT_RATIO);
+        assert_eq!(params.oswald_efficiency, DEFAULT_OSWALD_EFFICIENCY);
+        assert_eq!(params.speed_eps_mps, DEFAULT_SPEED_EPS_MPS);
+        assert_eq!(params.frame_eps, DEFAULT_FRAME_EPS);
+        assert_eq!(params.wind_azimuth_deg, -90.0);
+        assert_eq!(params.wind_high_mps, 6.0);
+        assert_eq!(params.wind_mid_altitude_m, 3.0);
+        assert_eq!(params.wind_transition_height_m, 1.5);
+        assert_eq!(params.initial_wave_amplitude_m, 10.0);
+        assert_eq!(params.initial_alpha_deg, 5.0);
+        assert_eq!(params.min_altitude_m, 0.5);
+
+        let alpha_best_glide = 0.5 / params.cl_slope_per_rad;
+        let best_glide = 0.5 / cd_numeric(alpha_best_glide, &params);
+        let expected_drag_factor =
+            1.0 / (std::f64::consts::PI * DEFAULT_ASPECT_RATIO * DEFAULT_OSWALD_EFFICIENCY);
+        let expected_best_glide = 0.5 / (DEFAULT_CD0 + expected_drag_factor * 0.25);
+        assert!((induced_drag_factor_numeric(&params) - expected_drag_factor).abs() < 1.0e-12);
+        assert!((best_glide - expected_best_glide).abs() < 1.0e-12);
+    }
+
+    #[test]
     fn parses_wind_controls_and_design_bounds() {
         let mut values = BTreeMap::new();
         values.insert("wind_azimuth_deg".to_string(), 45.0);
         values.insert("wind_high_mps".to_string(), 18.0);
+        values.insert("min_altitude_m".to_string(), 0.75);
         values.insert("delta_l_free".to_string(), 1.0);
         values.insert("delta_l_value".to_string(), 180.0);
         values.insert("delta_l_lower".to_string(), 100.0);
         values.insert("delta_l_upper".to_string(), 250.0);
         let params = Params::from_map(&values).expect("params should parse");
         assert_eq!(params.wind_azimuth_deg, 45.0);
+        assert_eq!(params.min_altitude_m, 0.75);
         assert!(!params.delta_l.fixed);
         assert_eq!(
             active_design(&params)
@@ -2527,6 +2946,28 @@ mod tests {
         values.insert("h0_upper".to_string(), 20.0);
         let err = Params::from_map(&values).expect_err("invalid h0 bounds should fail");
         assert!(err.to_string().contains("h0_lower"));
+    }
+
+    #[test]
+    fn invalid_aero_parameters_fail() {
+        let mut values = BTreeMap::new();
+        values.insert("aspect_ratio".to_string(), 0.0);
+        let err = Params::from_map(&values).expect_err("nonpositive aspect ratio should fail");
+        assert!(err.to_string().contains("aspect_ratio"));
+
+        values.clear();
+        values.insert("oswald_efficiency".to_string(), 1.1);
+        let err = Params::from_map(&values).expect_err("Oswald efficiency above one should fail");
+        assert!(err.to_string().contains("oswald_efficiency"));
+    }
+
+    #[test]
+    fn fixed_h0_below_min_altitude_fails() {
+        let mut values = BTreeMap::new();
+        values.insert("h0_value".to_string(), 0.25);
+        values.insert("min_altitude_m".to_string(), 0.5);
+        let err = Params::from_map(&values).expect_err("h0 below minimum altitude should fail");
+        assert!(err.to_string().contains("min_altitude_m"));
     }
 
     #[test]
@@ -2572,6 +3013,64 @@ mod tests {
     }
 
     #[test]
+    fn wind_azimuth_changes_runtime_parameters_not_compile_key() {
+        let mut values = BTreeMap::new();
+        values.insert("wind_azimuth_deg".to_string(), 0.0);
+        let x_wind = compile_variant_for_values(&values).expect("x-wind variant");
+        let x_params = Params::from_map(&values).expect("x-wind params");
+        let x_model = model_params(&x_params);
+
+        values.insert("wind_azimuth_deg".to_string(), 90.0);
+        let y_wind = compile_variant_for_values(&values).expect("y-wind variant");
+        let y_params = Params::from_map(&values).expect("y-wind params");
+        let y_model = model_params(&y_params);
+
+        assert_eq!(x_wind, y_wind);
+        assert!((x_model.wind_dir_x - 1.0).abs() < 1.0e-12);
+        assert!(x_model.wind_dir_y.abs() < 1.0e-12);
+        assert!(y_model.wind_dir_x.abs() < 1.0e-12);
+        assert!((y_model.wind_dir_y - 1.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn aircraft_aero_controls_change_runtime_parameters_not_compile_key() {
+        let mut values = BTreeMap::new();
+        let default_variant = compile_variant_for_values(&values).expect("default variant");
+
+        values.insert("gravity_mps2".to_string(), 9.7);
+        values.insert("air_density_kg_m3".to_string(), 1.0);
+        values.insert("mass_kg".to_string(), 10.0);
+        values.insert("reference_area_m2".to_string(), 0.8);
+        values.insert("cl_slope_per_rad".to_string(), 6.0);
+        values.insert("cd0".to_string(), 0.02);
+        values.insert("aspect_ratio".to_string(), 12.0);
+        values.insert("oswald_efficiency".to_string(), 0.8);
+        values.insert("speed_eps_mps".to_string(), 0.002);
+        values.insert("frame_eps".to_string(), 0.0002);
+
+        let changed_variant = compile_variant_for_values(&values).expect("changed variant");
+        let params = Params::from_map(&values).expect("changed params");
+        let model = model_params(&params);
+
+        assert_eq!(default_variant, changed_variant);
+        assert_eq!(model.gravity_mps2, 9.7);
+        assert_eq!(model.air_density_kg_m3, 1.0);
+        assert_eq!(model.mass_kg, 10.0);
+        assert_eq!(model.reference_area_m2, 0.8);
+        assert_eq!(model.cl_slope_per_rad, 6.0);
+        assert_eq!(model.cd0, 0.02);
+        assert_eq!(model.aspect_ratio, 12.0);
+        assert_eq!(model.oswald_efficiency, 0.8);
+        assert_eq!(model.speed_eps_mps, 0.002);
+        assert_eq!(model.frame_eps, 0.0002);
+        assert!(
+            (induced_drag_factor_numeric(&params) - 1.0 / (std::f64::consts::PI * 12.0 * 0.8))
+                .abs()
+                < 1.0e-12
+        );
+    }
+
+    #[test]
     fn artifact_visualization_includes_force_wind_and_frame_paths() {
         let params = Params::default();
         let guess = continuous_guess(&params).expect("default guess should build");
@@ -2606,6 +3105,24 @@ mod tests {
             paths
                 .iter()
                 .any(|path| path.name.starts_with("wind shear "))
+        );
+        let shear_profiles = paths
+            .iter()
+            .filter(|path| path.name.starts_with("wind shear profile"))
+            .collect::<Vec<_>>();
+        assert_eq!(shear_profiles.len(), WIND_SHEAR_PROFILE_LANES);
+        assert!(paths.iter().any(|path| path.name == "wind shear frame"));
+        assert!(
+            shear_profiles
+                .iter()
+                .all(|path| path.z.len() == WIND_SHEAR_PROFILE_SAMPLES)
+        );
+        assert!(
+            paths
+                .iter()
+                .filter(|path| path.name.starts_with("wind shear vector"))
+                .count()
+                == 0
         );
         assert!(paths.iter().any(|path| path.name.starts_with("air axis ")));
         assert!(
@@ -2642,5 +3159,33 @@ mod tests {
             .find(|series| series.name == "CL upper")
             .expect("aero coefficient chart should label the CL upper bound");
         assert_eq!(cl_upper.legend_group.as_deref(), Some("CL"));
+    }
+
+    #[test]
+    fn wind_shear_profile_follows_azimuth_direction() {
+        let px = vec![0.0, 90.0];
+        let py = vec![0.0, 0.0];
+        let pz = vec![1.5, 1.5];
+
+        let mut values = BTreeMap::new();
+        values.insert("wind_azimuth_deg".to_string(), 0.0);
+        let x_params = Params::from_map(&values).expect("x wind params");
+        let x_paths = wind_shear_scene_paths(&x_params, &px, &py, &pz);
+        let x_profile = x_paths
+            .iter()
+            .find(|path| path.name.starts_with("wind shear profile"))
+            .expect("x wind profile should be present");
+        assert!(x_profile.x.last().unwrap() > x_profile.x.first().unwrap());
+        assert!((x_profile.y.last().unwrap() - x_profile.y.first().unwrap()).abs() < 1.0e-10);
+
+        values.insert("wind_azimuth_deg".to_string(), 90.0);
+        let y_params = Params::from_map(&values).expect("y wind params");
+        let y_paths = wind_shear_scene_paths(&y_params, &px, &py, &pz);
+        let y_profile = y_paths
+            .iter()
+            .find(|path| path.name.starts_with("wind shear profile"))
+            .expect("y wind profile should be present");
+        assert!((y_profile.x.last().unwrap() - y_profile.x.first().unwrap()).abs() < 1.0e-10);
+        assert!(y_profile.y.last().unwrap() > y_profile.y.first().unwrap());
     }
 }

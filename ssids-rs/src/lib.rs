@@ -2068,7 +2068,7 @@ fn build_symbolic_result_with_native_order_and_scaling(
         }
     }
 
-    let (elimination_tree, simulated_column_counts, column_pattern) = if postorder_is_identity {
+    let (elimination_tree, simulated_column_counts, _column_pattern) = if postorder_is_identity {
         if trace {
             analyse_debug_log(format!(
                 "[ssids_rs::analyse] symbolic final_factor_pattern reused_initial=true total={:.6}s",
@@ -2089,14 +2089,16 @@ fn build_symbolic_result_with_native_order_and_scaling(
         factor_pattern
     };
     let phase_started = Instant::now();
-    #[cfg(debug_assertions)]
-    {
-        let expanded_pattern = expand_symmetric_pattern(matrix);
-        let native_counts =
-            native_column_counts(&expanded_pattern, &current_permutation, &elimination_tree);
-        debug_assert_eq!(native_counts, simulated_column_counts);
+    let expanded_pattern = expand_symmetric_pattern(matrix);
+    let column_counts =
+        native_column_counts(&expanded_pattern, &current_permutation, &elimination_tree);
+    if trace && column_counts != simulated_column_counts {
+        analyse_debug_log(format!(
+            "[ssids_rs::analyse] symbolic column_count_simulation_disagreement native_sum={} simulated_sum={}",
+            column_counts.iter().sum::<usize>(),
+            simulated_column_counts.iter().sum::<usize>(),
+        ));
     }
-    let column_counts = simulated_column_counts;
     if trace {
         analyse_debug_log(format!(
             "[ssids_rs::analyse] symbolic column_counts elapsed={:.6}s total={:.6}s",
@@ -2114,38 +2116,15 @@ fn build_symbolic_result_with_native_order_and_scaling(
             symbolic_started.elapsed().as_secs_f64(),
         ));
     }
-    if is_identity_order(&supernode_layout.permutation) {
-        let phase_started = Instant::now();
-        let supernodes = build_native_row_list_supernodes_guarded(
-            matrix,
-            &current_permutation,
-            &supernode_layout,
-            &column_pattern,
-        );
-        if trace {
-            analyse_debug_log(format!(
-                "[ssids_rs::analyse] symbolic row_lists elapsed={:.6}s total={:.6}s",
-                phase_started.elapsed().as_secs_f64(),
-                symbolic_started.elapsed().as_secs_f64(),
-            ));
-        }
-        return Ok(build_symbolic_result(
-            current_permutation,
-            elimination_tree,
-            column_counts,
-            column_pattern,
-            supernodes,
-            ordering_kind,
-            saved_matching_scaling,
-        ));
-    }
-
     let phase_started = Instant::now();
-    let final_permutation = compose_ordering_with_symbolic_permutation(
-        &current_permutation,
-        &supernode_layout.permutation,
-    )?;
-    let final_graph = permute_graph(graph, &final_permutation);
+    let final_permutation = if is_identity_order(&supernode_layout.permutation) {
+        current_permutation
+    } else {
+        compose_ordering_with_symbolic_permutation(
+            &current_permutation,
+            &supernode_layout.permutation,
+        )?
+    };
     if trace {
         analyse_debug_log(format!(
             "[ssids_rs::analyse] symbolic supernode_apply elapsed={:.6}s total={:.6}s",
@@ -2154,37 +2133,10 @@ fn build_symbolic_result_with_native_order_and_scaling(
         ));
     }
     let phase_started = Instant::now();
-    let (final_tree, simulated_final_counts, final_pattern) = symbolic_factor_pattern(&final_graph);
-    if trace {
-        analyse_debug_log(format!(
-            "[ssids_rs::analyse] symbolic supernode_factor_pattern elapsed={:.6}s total={:.6}s",
-            phase_started.elapsed().as_secs_f64(),
-            symbolic_started.elapsed().as_secs_f64(),
-        ));
-    }
-    let phase_started = Instant::now();
-    #[cfg(debug_assertions)]
-    {
-        let expanded_pattern = expand_symmetric_pattern(matrix);
-        let native_counts =
-            native_column_counts(&expanded_pattern, &final_permutation, &final_tree);
-        debug_assert_eq!(native_counts, simulated_final_counts);
-    }
-    let final_counts = simulated_final_counts;
-    if trace {
-        analyse_debug_log(format!(
-            "[ssids_rs::analyse] symbolic final_column_counts elapsed={:.6}s total={:.6}s",
-            phase_started.elapsed().as_secs_f64(),
-            symbolic_started.elapsed().as_secs_f64(),
-        ));
-    }
-    let phase_started = Instant::now();
-    let final_supernodes = build_native_row_list_supernodes_guarded(
-        matrix,
-        &final_permutation,
-        &supernode_layout,
-        &final_pattern,
-    );
+    let final_supernodes =
+        build_native_row_list_supernodes_guarded(matrix, &final_permutation, &supernode_layout);
+    let (final_tree, final_counts, final_pattern) =
+        symbolic_pattern_from_supernodes(final_permutation.len(), &final_supernodes);
     if trace {
         analyse_debug_log(format!(
             "[ssids_rs::analyse] symbolic final_row_lists elapsed={:.6}s total={:.6}s",
@@ -2472,7 +2424,6 @@ fn expand_symmetric_pattern(matrix: SymmetricCscMatrix<'_>) -> ExpandedSymmetric
     }
 }
 
-#[cfg(any(debug_assertions, test))]
 fn native_column_counts(
     pattern: &ExpandedSymmetricPattern,
     permutation: &Permutation,
@@ -2532,7 +2483,6 @@ fn native_column_counts(
         .collect()
 }
 
-#[cfg(any(debug_assertions, test))]
 fn native_virtual_forest_find(virtual_forest: &mut [Option<usize>], node: usize) -> usize {
     let mut current = node;
     while let Some(parent) = virtual_forest[current] {
@@ -2624,10 +2574,10 @@ fn symbolic_edge_set(edge_bits: &mut [u64], words_per_row: usize, row: usize, co
 
 fn build_native_row_list_supernodes_fast(
     layout: &NativeSupernodeLayout,
-    column_pattern: &[Vec<usize>],
+    dimension: usize,
 ) -> Option<Vec<Supernode>> {
     let range = layout.ranges.first()?;
-    if layout.ranges.len() != 1 || range.start != 0 || range.end != column_pattern.len() {
+    if layout.ranges.len() != 1 || range.start != 0 || range.end != dimension {
         return None;
     }
     if layout.parents.as_slice() != [None] {
@@ -2640,7 +2590,7 @@ fn build_native_row_list_supernodes_fast(
     // node with no trailing rows.
     Some(vec![Supernode {
         start_column: 0,
-        end_column: column_pattern.len(),
+        end_column: dimension,
         trailing_rows: Vec::new(),
     }])
 }
@@ -2649,18 +2599,12 @@ fn build_native_row_list_supernodes_guarded(
     matrix: SymmetricCscMatrix<'_>,
     permutation: &Permutation,
     layout: &NativeSupernodeLayout,
-    column_pattern: &[Vec<usize>],
 ) -> Vec<Supernode> {
-    if let Some(fast) = build_native_row_list_supernodes_fast(layout, column_pattern) {
+    if let Some(fast) = build_native_row_list_supernodes_fast(layout, permutation.len()) {
         #[cfg(debug_assertions)]
         {
             let expanded_pattern = expand_symmetric_pattern(matrix);
-            let generic = build_native_row_list_supernodes(
-                &expanded_pattern,
-                permutation,
-                layout,
-                column_pattern,
-            );
+            let generic = build_native_row_list_supernodes(&expanded_pattern, permutation, layout);
             debug_assert_eq!(
                 fast, generic,
                 "single-supernode symbolic row-list shortcut diverged from source-shaped row-list builder"
@@ -2670,14 +2614,13 @@ fn build_native_row_list_supernodes_guarded(
     }
 
     let expanded_pattern = expand_symmetric_pattern(matrix);
-    build_native_row_list_supernodes(&expanded_pattern, permutation, layout, column_pattern)
+    build_native_row_list_supernodes(&expanded_pattern, permutation, layout)
 }
 
 fn build_native_row_list_supernodes(
     expanded_pattern: &ExpandedSymmetricPattern,
     permutation: &Permutation,
     layout: &NativeSupernodeLayout,
-    column_pattern: &[Vec<usize>],
 ) -> Vec<Supernode> {
     let mut supernodes = Vec::new();
     let native_row_lists = native_row_lists(
@@ -2689,7 +2632,7 @@ fn build_native_row_list_supernodes(
     let mut next_column = 0;
     for (range, row_list) in layout.ranges.iter().zip(native_row_lists.iter()) {
         for column in next_column..range.start {
-            supernodes.push(unit_supernode(column, column_pattern));
+            supernodes.push(native_unit_supernode(expanded_pattern, permutation, column));
         }
         let trailing_rows = row_list
             .iter()
@@ -2703,8 +2646,8 @@ fn build_native_row_list_supernodes(
         });
         next_column = range.end;
     }
-    for column in next_column..column_pattern.len() {
-        supernodes.push(unit_supernode(column, column_pattern));
+    for column in next_column..permutation.len() {
+        supernodes.push(native_unit_supernode(expanded_pattern, permutation, column));
     }
     supernodes
 }
@@ -2775,17 +2718,49 @@ fn native_row_lists(
     row_lists
 }
 
-fn unit_supernode(column: usize, column_pattern: &[Vec<usize>]) -> Supernode {
-    let trailing_rows = column_pattern[column]
+fn native_unit_supernode(
+    expanded_pattern: &ExpandedSymmetricPattern,
+    permutation: &Permutation,
+    column: usize,
+) -> Supernode {
+    let original_col = permutation.perm()[column];
+    let mut trailing_rows = expanded_pattern.row_indices
+        [expanded_pattern.col_ptrs[original_col]..expanded_pattern.col_ptrs[original_col + 1]]
         .iter()
-        .copied()
+        .map(|&row| permutation.inverse()[row])
         .filter(|&row| row > column)
         .collect::<Vec<_>>();
+    trailing_rows.sort_unstable();
     Supernode {
         start_column: column,
         end_column: column + 1,
         trailing_rows,
     }
+}
+
+fn symbolic_pattern_from_supernodes(
+    dimension: usize,
+    supernodes: &[Supernode],
+) -> (Vec<Option<usize>>, Vec<usize>, Vec<Vec<usize>>) {
+    let mut column_pattern = vec![Vec::new(); dimension];
+    for supernode in supernodes {
+        for column in supernode.start_column..supernode.end_column {
+            let mut pattern = (column..supernode.end_column).collect::<Vec<_>>();
+            pattern.extend(supernode.trailing_rows.iter().copied());
+            column_pattern[column] = pattern;
+        }
+    }
+    for (column, pattern) in column_pattern.iter_mut().enumerate() {
+        if pattern.is_empty() {
+            pattern.push(column);
+        }
+    }
+    let elimination_tree = column_pattern
+        .iter()
+        .map(|pattern| pattern.get(1).copied())
+        .collect::<Vec<_>>();
+    let column_counts = column_pattern.iter().map(Vec::len).collect::<Vec<_>>();
+    (elimination_tree, column_counts, column_pattern)
 }
 
 fn build_symbolic_result(
@@ -9758,7 +9733,9 @@ mod tests {
         build_native_row_list_supernodes, build_native_row_list_supernodes_fast,
         build_native_row_list_supernodes_guarded, build_permuted_lower_csc_pattern,
         build_spral_small_leaf_symbolic_plan, build_symbolic_front_tree,
-        classify_spral_small_leaf_fronts, debug_clear_spral_small_leaf_tpp_panel_captures,
+        build_symbolic_result_with_native_order_and_scaling, classify_spral_small_leaf_fronts,
+        compose_ordering_with_symbolic_permutation,
+        debug_clear_spral_small_leaf_tpp_panel_captures,
         debug_disable_spral_small_leaf_tpp_panel_captures,
         debug_take_spral_small_leaf_tpp_panel_captures, dense_find_maxloc, dense_lower_offset,
         dense_symmetric_swap_with_workspace, expand_symmetric_pattern, factor_front_recursive,
@@ -16730,6 +16707,62 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
     }
 
     #[test]
+    fn native_column_counts_are_source_shaped_for_postordered_trees() {
+        let dense = vec![
+            vec![4.0, 1.0, 0.0, 1.0],
+            vec![1.0, 4.0, 1.0, 0.0],
+            vec![0.0, 1.0, 4.0, 0.0],
+            vec![1.0, 0.0, 0.0, 4.0],
+        ];
+        let (col_ptrs, row_indices, values) = dense_to_lower_csc(&dense);
+        let matrix =
+            SymmetricCscMatrix::new(4, &col_ptrs, &row_indices, Some(&values)).expect("valid CSC");
+        let graph = CsrGraph::from_symmetric_csc(4, &col_ptrs, &row_indices).expect("valid graph");
+        let permutation = Permutation::new(vec![0, 2, 3, 1]).expect("valid permutation");
+        let permuted_graph = permute_graph(&graph, &permutation);
+        let (elimination_tree, simulated_counts, _) = symbolic_factor_pattern(&permuted_graph);
+        let expanded_pattern = expand_symmetric_pattern(matrix);
+        let native_counts =
+            native_column_counts(&expanded_pattern, &permutation, &elimination_tree);
+
+        assert_eq!(simulated_counts, vec![3, 2, 2, 1]);
+        assert_eq!(native_counts, vec![3, 2, 1, 1]);
+
+        let column_has_entries = vec![true; 4];
+        let (postorder, _) =
+            native_postorder_permutation(&elimination_tree, &permutation, &column_has_entries);
+        let postordered_permutation =
+            compose_ordering_with_symbolic_permutation(&permutation, &postorder)
+                .expect("valid postorder composition");
+        let postordered_graph = permute_graph(&graph, &postordered_permutation);
+        let (postordered_tree, postordered_simulated_counts, _) =
+            symbolic_factor_pattern(&postordered_graph);
+        let postordered_native_counts = native_column_counts(
+            &expanded_pattern,
+            &postordered_permutation,
+            &postordered_tree,
+        );
+
+        assert_eq!(postordered_native_counts, postordered_simulated_counts);
+
+        let column_has_entries = vec![true; 4];
+        let (symbolic, info) = build_symbolic_result_with_native_order_and_scaling(
+            matrix,
+            &graph,
+            permutation,
+            &column_has_entries,
+            "test",
+            None,
+        )
+        .expect("native analyse should accept native/source-shaped column counts");
+
+        assert_eq!(info.ordering_kind, "test");
+        for (count, pattern) in symbolic.column_counts.iter().zip(&symbolic.column_pattern) {
+            assert_eq!(*count, pattern.len());
+        }
+    }
+
+    #[test]
     fn bitset_permute_graph_matches_sorted_edge_path() {
         let edges = vec![
             (0, 1),
@@ -16772,29 +16805,19 @@ extern "C" int spral_kernel_block_prefix_trace_32_source(
         let graph = CsrGraph::from_symmetric_csc(4, &col_ptrs, &row_indices).expect("valid graph");
         let permutation = Permutation::identity(4);
         let permuted_graph = permute_graph(&graph, &permutation);
-        let (elimination_tree, column_counts, column_pattern) =
+        let (elimination_tree, column_counts, _column_pattern) =
             symbolic_factor_pattern(&permuted_graph);
         let layout = native_supernode_layout(&elimination_tree, &column_counts, 4);
         assert_eq!(layout.ranges, vec![0..4]);
 
         let expanded_pattern = expand_symmetric_pattern(matrix);
-        let generic = build_native_row_list_supernodes(
-            &expanded_pattern,
-            &permutation,
-            &layout,
-            &column_pattern,
-        );
-        let fast = build_native_row_list_supernodes_fast(&layout, &column_pattern)
+        let generic = build_native_row_list_supernodes(&expanded_pattern, &permutation, &layout);
+        let fast = build_native_row_list_supernodes_fast(&layout, permutation.len())
             .expect("single full supernode fast path");
 
         assert_eq!(fast, generic);
         assert_eq!(
-            build_native_row_list_supernodes_guarded(
-                matrix,
-                &permutation,
-                &layout,
-                &column_pattern
-            ),
+            build_native_row_list_supernodes_guarded(matrix, &permutation, &layout),
             generic
         );
     }

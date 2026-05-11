@@ -2916,6 +2916,12 @@ where
     apply_ipopt_restoration_mu_update_options(&mut restoration_options, options);
     let mut max_restoration_iters_exceeded = false;
     let mut max_restoration_iter_count = 0usize;
+    let restoration_display_mode = InteriorPointDisplayMode::strict(&restoration_options);
+    let restoration_has_equalities = restoration_problem.equality_count() > 0;
+    let restoration_has_inequalities = restoration_problem.inequality_count() > 0;
+    let restoration_iteration_limit = restoration_options.max_iters;
+    let restoration_verbose = options.verbose;
+    let mut restoration_event_state = SqpEventLegendState::default();
     // IpRestoConvCheck::CheckConvergence consumes its `first_resto_iter_`
     // continue branch on the initialized restoration point before the first
     // nested restoration step. NLIP callbacks are emitted only for accepted
@@ -2934,6 +2940,27 @@ where
         // iteration counter with outer_iter_count + 1 before launching the
         // nested algorithm.
         restoration_snapshot.iteration = restoration_iteration_offset + snapshot.iteration;
+        if restoration_verbose {
+            log_interior_point_iteration_snapshot(
+                &restoration_snapshot,
+                restoration_snapshot.iteration,
+                InteriorPointIterationPhase::Restoration,
+                InteriorPointIterationLogFlags {
+                    has_equalities: restoration_has_equalities,
+                    has_inequalities: restoration_has_inequalities,
+                    filter_accepted: restoration_snapshot
+                        .filter
+                        .as_ref()
+                        .and_then(|filter| filter.accepted_mode)
+                        == Some(FilterAcceptanceMode::ViolationReduction),
+                    watchdog_active: restoration_snapshot.watchdog_active,
+                    iteration_limit_reached: snapshot.iteration + 1 == restoration_iteration_limit,
+                    ..InteriorPointIterationLogFlags::default()
+                },
+                restoration_display_mode,
+                &mut restoration_event_state,
+            );
+        }
         if !callback(&restoration_snapshot) {
             return false;
         }
@@ -15542,22 +15569,6 @@ fn fmt_optional_ip_sci(value: Option<f64>) -> String {
     }
 }
 
-fn fmt_optional_index(value: Option<Index>) -> String {
-    match value {
-        Some(value) => format!("{value:>5}"),
-        None => format!("{:>5}", "--"),
-    }
-}
-
-fn style_ip_line_search_cell(iterations: Option<Index>) -> String {
-    let cell = fmt_optional_index(iterations);
-    match iterations {
-        Some(iterations) if iterations >= 10 => style_red_bold(&cell),
-        Some(iterations) if iterations >= 4 => style_yellow_bold(&cell),
-        _ => cell,
-    }
-}
-
 struct InteriorPointIterationLog {
     iteration: Index,
     phase: InteriorPointIterationPhase,
@@ -15593,6 +15604,47 @@ struct InteriorPointIterationLogFlags {
     watchdog_active: bool,
     tiny_step: bool,
     iteration_limit_reached: bool,
+}
+
+fn log_interior_point_iteration_snapshot(
+    snapshot: &InteriorPointIterationSnapshot,
+    iteration: Index,
+    phase: InteriorPointIterationPhase,
+    flags: InteriorPointIterationLogFlags,
+    display_mode: InteriorPointDisplayMode,
+    event_state: &mut SqpEventLegendState,
+) {
+    log_interior_point_iteration(
+        &InteriorPointIterationLog {
+            iteration,
+            phase,
+            flags,
+            extra_events: snapshot.events.clone(),
+            display_mode,
+            objective_value: snapshot.objective,
+            barrier_objective: snapshot.barrier_objective.unwrap_or(snapshot.objective),
+            equality_inf: snapshot.eq_inf.unwrap_or(0.0),
+            inequality_inf: snapshot.ineq_inf.unwrap_or(0.0),
+            dual_inf: snapshot.dual_inf,
+            complementarity_inf: snapshot.comp_inf.unwrap_or(0.0),
+            overall_inf: snapshot.overall_inf,
+            barrier_parameter: snapshot.barrier_parameter.unwrap_or(0.0),
+            alpha: snapshot.alpha,
+            alpha_pr: snapshot.alpha_pr,
+            alpha_du: snapshot.alpha_du,
+            alpha_y: snapshot.alpha_y,
+            line_search_iterations: snapshot.line_search_iterations.or_else(|| {
+                (snapshot.line_search_trials > 0).then_some(snapshot.line_search_trials)
+            }),
+            regularization_size: snapshot.regularization_size,
+            step_kind: snapshot.step_kind,
+            step_tag: snapshot.step_tag,
+            linear_time_secs: snapshot
+                .linear_solve_time
+                .map(|duration| duration.as_secs_f64()),
+        },
+        event_state,
+    );
 }
 
 fn nlip_log_snapshot(log: &InteriorPointIterationLog) -> InteriorPointIterationSnapshot {
@@ -15731,8 +15783,8 @@ fn fmt_ip_event_header_row() -> String {
         format!("{:>9}", IP_COMP_INF_LABEL),
         format!("{:>9}", OVERALL_INF_LABEL),
         format!("{:>9}", "mu"),
-        format!("{:>9}", "α"),
-        format!("{:>5}", "ls_it"),
+        format!("{:>9}", "alpha_pr"),
+        format!("{:>9}", "alpha_du"),
         format!("{:>7}", "lin_t"),
     ]
     .join("  ")
@@ -15790,8 +15842,8 @@ fn log_interior_point_iteration(
             true,
         ),
         format!("{:>9}", sci_text(log.barrier_parameter)),
-        fmt_optional_ip_sci(log.alpha),
-        style_ip_line_search_cell(log.line_search_iterations),
+        fmt_optional_ip_sci(log.alpha_pr.or(log.alpha)),
+        fmt_optional_ip_sci(log.alpha_du),
         match log.linear_time_secs {
             Some(seconds) => format!("{:>7}", compact_duration_text(seconds)),
             None => format!("{:>7}", "--"),

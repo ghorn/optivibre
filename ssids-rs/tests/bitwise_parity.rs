@@ -116,6 +116,28 @@ fn random_dyadic_solution(dimension: usize, rng: &mut DenseBoundaryRng) -> Vec<f
     (0..dimension).map(|_| rng.dyadic(8, 4)).collect()
 }
 
+fn grid_laplacian_dyadic_matrix(rows: usize, cols: usize) -> Vec<Vec<f64>> {
+    let dimension = rows * cols;
+    let mut matrix = vec![vec![0.0; dimension]; dimension];
+    for row in 0..rows {
+        for col in 0..cols {
+            let index = row * cols + col;
+            matrix[index][index] = 4.0;
+            if row + 1 < rows {
+                let neighbor = (row + 1) * cols + col;
+                matrix[index][neighbor] = -0.25;
+                matrix[neighbor][index] = -0.25;
+            }
+            if col + 1 < cols {
+                let neighbor = row * cols + col + 1;
+                matrix[index][neighbor] = -0.25;
+                matrix[neighbor][index] = -0.25;
+            }
+        }
+    }
+    matrix
+}
+
 fn dense_boundary_case(seed: u64, case_index: usize) -> (usize, Vec<Vec<f64>>, Vec<f64>) {
     let mut rng = DenseBoundaryRng::new(seed);
     let mut dimension = 0;
@@ -202,6 +224,47 @@ fn rust_and_native_spral_match_app_block_boundary_33x33_pivot_stats() {
         native_info.delayed_pivots
     );
     assert_eq!(rust_factor.pivot_stats().two_by_two_pivots, 2);
+}
+
+#[test]
+fn rust_and_native_spral_match_symbolic_analyse_stats_on_sparse_grid_pattern() {
+    let Some(native) = load_native_or_skip() else {
+        return;
+    };
+
+    let matrix_dense = grid_laplacian_dyadic_matrix(10, 10);
+    let (col_ptrs, row_indices, values) = dense_to_lower_csc(&matrix_dense);
+    let matrix = SymmetricCscMatrix::new(100, &col_ptrs, &row_indices, Some(&values))
+        .expect("valid sparse grid CSC");
+    let options = NumericFactorOptions::default();
+
+    let (symbolic, rust_info) = analyse(
+        matrix,
+        &SsidsOptions {
+            ordering: OrderingStrategy::Natural,
+        },
+    )
+    .expect("rust analyse");
+    let rust_max_front_size = symbolic
+        .supernodes
+        .iter()
+        .map(|supernode| supernode.width() + supernode.trailing_rows.len())
+        .max()
+        .unwrap_or(0);
+
+    let mut native_session = native
+        .analyse_with_options_and_ordering(matrix, &options, NativeOrdering::Natural)
+        .expect("native analyse");
+    let native_analyse = native_session.analyse_info();
+    let native_factor = native_session.factorize(matrix).expect("native factorize");
+
+    assert_eq!(rust_info.supernode_count, native_analyse.supernode_count);
+    assert_eq!(
+        rust_info.max_supernode_width,
+        native_analyse.max_supernode_width
+    );
+    assert_eq!(rust_max_front_size, native_analyse.max_front_size);
+    assert_eq!(rust_info.estimated_fill_nnz, native_factor.factor_entries);
 }
 
 #[test]
@@ -361,7 +424,7 @@ fn assert_exact_bitwise_parity_witness(matrix_dense: &[Vec<f64>], expected_solut
             .expect("valid witness CSC");
     let options = NumericFactorOptions::default();
 
-    let (symbolic, _) = analyse(
+    let (symbolic, rust_analyse_info) = analyse(
         matrix,
         &SsidsOptions {
             ordering: OrderingStrategy::Natural,
@@ -373,7 +436,14 @@ fn assert_exact_bitwise_parity_witness(matrix_dense: &[Vec<f64>], expected_solut
     let mut native_session = native
         .analyse_with_options_and_ordering(matrix, &options, NativeOrdering::Natural)
         .expect("native analyse");
+    let native_analyse_info = native_session.analyse_info();
     let native_factorization = native_session.factorize(matrix);
+    let rust_max_front_size = symbolic
+        .supernodes
+        .iter()
+        .map(|supernode| supernode.width() + supernode.trailing_rows.len())
+        .max()
+        .unwrap_or(0);
 
     let rhs = dense_mul(matrix_dense, expected_solution);
 
@@ -431,6 +501,30 @@ fn assert_exact_bitwise_parity_witness(matrix_dense: &[Vec<f64>], expected_solut
         ),
         (Err(_), Err(_)) => return,
         (Ok((rust_factor, _)), Ok(native_info)) => {
+            assert_eq!(
+                rust_analyse_info.supernode_count,
+                native_analyse_info.supernode_count,
+                "symbolic supernode_count mismatch\n{}",
+                mismatch_context(None, None, None, None)
+            );
+            assert_eq!(
+                rust_analyse_info.max_supernode_width,
+                native_analyse_info.max_supernode_width,
+                "symbolic max_supernode_width mismatch\n{}",
+                mismatch_context(None, None, None, None)
+            );
+            assert_eq!(
+                rust_max_front_size,
+                native_analyse_info.max_front_size,
+                "symbolic max_front_size mismatch\n{}",
+                mismatch_context(None, None, None, None)
+            );
+            assert_eq!(
+                rust_analyse_info.estimated_fill_nnz,
+                native_info.factor_entries,
+                "symbolic factor-entry estimate mismatch\n{}",
+                mismatch_context(None, None, None, None)
+            );
             assert_eq!(
                 rust_factor.inertia(),
                 native_info.inertia,

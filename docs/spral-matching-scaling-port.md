@@ -141,10 +141,10 @@ Release performance notes on dense case 58:
   identity, replacing per-fill-edge linear membership checks with word-wise
   bitset fill propagation, and building permuted CSR graphs directly.
 - Rust captured-order/no-scaling analyse moved further to roughly
-  `0.5-0.65ms` on this witness after using the already-computed symbolic
-  column counts in release builds and short-circuiting SPRAL's row-list result
-  for the single full-rank supernode case. The debug/test build still checks
-  the source-faithful `find_col_counts` port against the symbolic counts.
+  `0.5-0.65ms` on this witness after using source-shaped postordered column
+  counts and short-circuiting SPRAL's row-list result for the single full-rank
+  supernode case. Final scalar column patterns now come from the native-shaped
+  supernode row lists instead of a second post-supernode scalar count pass.
 - Rust captured-order/no-scaling analyse then moved to roughly `0.4ms` after
   switching small/medium graph permutation to a sorted bitset construction and
   removing a per-column temporary allocation in symbolic fill simulation.

@@ -160,10 +160,29 @@ impl From<LlvmOptimizationLevel> for FunctionCompileOptions {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FunctionCompileReport {
     pub lowering_time: Duration,
+    pub cache_key_time: Duration,
     pub llvm_time: Duration,
+    pub llvm_module_build_time: Duration,
+    pub llvm_optimization_time: Duration,
+    pub llvm_object_emit_time: Duration,
+    pub llvm_ir_fingerprint_time: Duration,
     pub cache: JitCacheReport,
+    pub object_size_bytes: Option<usize>,
     pub stats: CompileStats,
     pub warnings: Vec<CompileWarning>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LlvmObjectBuildTiming {
+    module_build_time: Duration,
+    optimization_time: Duration,
+    object_emit_time: Duration,
+}
+
+#[derive(Debug)]
+struct LlvmObjectBuildResult {
+    object: LLVMMemoryBufferRef,
+    timing: LlvmObjectBuildTiming,
 }
 
 #[derive(Debug)]
@@ -204,6 +223,7 @@ impl CompiledJitFunction {
         let lowering_started = Instant::now();
         let lowered = lower_function_with_policies(function, options.call_policy)?;
         let lowering_time = lowering_started.elapsed();
+        let cache_key_started = Instant::now();
         let (target_triple, cpu_name, cpu_features) =
             native_cache_target_info(&LlvmTarget::Native)?;
         let cache_metadata = jit_cache::cache_key_metadata_for_function(
@@ -215,10 +235,12 @@ impl CompiledJitFunction {
             cpu_name,
             cpu_features,
         );
+        let cache_key_time = cache_key_started.elapsed();
         Self::compile_lowered_with_report(
             &lowered,
             options.opt_level,
             lowering_time,
+            cache_key_time,
             Some(cache_metadata),
         )
     }
@@ -227,13 +249,14 @@ impl CompiledJitFunction {
         lowered: &LoweredFunction,
         opt_level: LlvmOptimizationLevel,
     ) -> Result<Self> {
-        Self::compile_lowered_with_report(lowered, opt_level, Duration::ZERO, None)
+        Self::compile_lowered_with_report(lowered, opt_level, Duration::ZERO, Duration::ZERO, None)
     }
 
     fn compile_lowered_with_report(
         lowered: &LoweredFunction,
         opt_level: LlvmOptimizationLevel,
         lowering_time: Duration,
+        cache_key_time: Duration,
         cache_metadata: Option<jit_cache::CacheKeyMetadata>,
     ) -> Result<Self> {
         validate_lowered_output_shapes(lowered)?;
@@ -246,18 +269,31 @@ impl CompiledJitFunction {
 
         let cache_started = Instant::now();
         if let Some(cached) = jit_cache::try_load_cached_object(&metadata) {
+            let materialize_started = Instant::now();
             match load_jit_function_from_object_bytes(&cached.object_bytes, &lowered.name) {
                 Ok((lljit, function)) => {
+                    let materialize_time = materialize_started.elapsed();
                     let llvm_time = cache_started.elapsed();
+                    let object_size_bytes = cached.object_bytes.len();
                     return Ok(Self {
                         lowered: lowered.clone(),
                         compile_report: FunctionCompileReport {
                             lowering_time,
+                            cache_key_time,
                             llvm_time,
+                            llvm_module_build_time: Duration::ZERO,
+                            llvm_optimization_time: Duration::ZERO,
+                            llvm_object_emit_time: Duration::ZERO,
+                            llvm_ir_fingerprint_time: Duration::ZERO,
                             cache: JitCacheReport {
                                 hit: true,
+                                check_time: cached.check_time,
+                                read_time: cached.read_time,
+                                write_time: Duration::ZERO,
                                 load_time: llvm_time,
+                                materialize_time,
                             },
+                            object_size_bytes: Some(object_size_bytes),
                             stats: lowered.stats.clone(),
                             warnings: lowered.warnings.clone(),
                         },
@@ -270,26 +306,46 @@ impl CompiledJitFunction {
                 }
             }
         }
+        let cache_check_time = cache_started.elapsed();
 
         let llvm_started = Instant::now();
-        let object = build_object_buffer(lowered, opt_level, &target, LlvmCompileMode::Jit)?;
-        let object_bytes = unsafe { memory_buffer_to_bytes(object) }?;
-        unsafe { LLVMDisposeMemoryBuffer(object) };
+        let object_build =
+            build_object_buffer_timed(lowered, opt_level, &target, LlvmCompileMode::Jit)?;
+        let object_bytes = unsafe { memory_buffer_to_bytes(object_build.object) }?;
+        unsafe { LLVMDisposeMemoryBuffer(object_build.object) };
+        let object_size_bytes = object_bytes.len();
+        let ir_fingerprint_started = Instant::now();
         let llvm_ir_fingerprint = optimized_jit_ir_fingerprint(lowered, opt_level, &target).ok();
-        let _ = jit_cache::write_cached_object(
+        let llvm_ir_fingerprint_time = ir_fingerprint_started.elapsed();
+        let cache_write_started = Instant::now();
+        let _cache_write_result = jit_cache::write_cached_object(
             &metadata,
             &object_bytes,
             llvm_ir_fingerprint.as_deref(),
         );
+        let cache_write_time = cache_write_started.elapsed();
+        let materialize_started = Instant::now();
         let (lljit, function) = load_jit_function_from_object_bytes(&object_bytes, &lowered.name)?;
+        let materialize_time = materialize_started.elapsed();
         let llvm_time = llvm_started.elapsed();
 
         Ok(Self {
             lowered: lowered.clone(),
             compile_report: FunctionCompileReport {
                 lowering_time,
+                cache_key_time,
                 llvm_time,
-                cache: JitCacheReport::default(),
+                llvm_module_build_time: object_build.timing.module_build_time,
+                llvm_optimization_time: object_build.timing.optimization_time,
+                llvm_object_emit_time: object_build.timing.object_emit_time,
+                llvm_ir_fingerprint_time,
+                cache: JitCacheReport {
+                    check_time: cache_check_time,
+                    write_time: cache_write_time,
+                    materialize_time,
+                    ..JitCacheReport::default()
+                },
+                object_size_bytes: Some(object_size_bytes),
                 stats: lowered.stats.clone(),
                 warnings: lowered.warnings.clone(),
             },
@@ -576,9 +632,19 @@ fn build_object_buffer(
     target: &LlvmTarget,
     compile_mode: LlvmCompileMode,
 ) -> Result<LLVMMemoryBufferRef> {
+    Ok(build_object_buffer_timed(lowered, opt_level, target, compile_mode)?.object)
+}
+
+fn build_object_buffer_timed(
+    lowered: &LoweredFunction,
+    opt_level: LlvmOptimizationLevel,
+    target: &LlvmTarget,
+    compile_mode: LlvmCompileMode,
+) -> Result<LlvmObjectBuildResult> {
     unsafe {
         let context = LLVMContextCreate();
         let (target_machine, triple) = create_target_machine(opt_level, target, compile_mode)?;
+        let module_started = Instant::now();
         let module = match build_module(lowered, context, target_machine, &triple) {
             Ok(module) => module,
             Err(error) => {
@@ -587,12 +653,25 @@ fn build_object_buffer(
                 return Err(error);
             }
         };
+        let module_build_time = module_started.elapsed();
 
-        let object = (|| -> Result<LLVMMemoryBufferRef> {
+        let object = (|| -> Result<LlvmObjectBuildResult> {
+            let optimize_started = Instant::now();
             verify_module(module, "before optimization")?;
             run_default_pass_pipeline(module, target_machine, opt_level)?;
             verify_module(module, "after optimization")?;
-            emit_object_buffer(module, target_machine)
+            let optimization_time = optimize_started.elapsed();
+            let emit_started = Instant::now();
+            let object = emit_object_buffer(module, target_machine)?;
+            let object_emit_time = emit_started.elapsed();
+            Ok(LlvmObjectBuildResult {
+                object,
+                timing: LlvmObjectBuildTiming {
+                    module_build_time,
+                    optimization_time,
+                    object_emit_time,
+                },
+            })
         })();
 
         llvm_sys::core::LLVMDisposeModule(module);

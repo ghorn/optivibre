@@ -6,9 +6,13 @@ interface PlotlyObject {
 }
 
 type PlotlyRelayoutPayload = PlotlyObject;
+type PlotlyRelayoutEventName = "plotly_relayout" | "plotly_relayouting";
 
 interface PlotlyHostElement extends HTMLDivElement {
-  on?: (eventName: "plotly_relayout", callback: (eventData: PlotlyRelayoutPayload) => void) => void;
+  on?: (
+    eventName: PlotlyRelayoutEventName,
+    callback: (eventData: PlotlyRelayoutPayload) => void,
+  ) => void;
 }
 
 interface PlotlyStatic {

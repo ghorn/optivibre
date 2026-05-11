@@ -70,6 +70,7 @@
             <div class="solve-primary">
               <div class="solve-actions">
                 <button id="solve-button" type="button" class="solve-button">Solve</button>
+                <button id="stop-button" type="button" class="stop-button" disabled>Stop</button>
               </div>
               <div class="solver-overview">
                 <div id="status" class="status">Loading problem definitions...</div>
@@ -83,7 +84,13 @@
             </div>
             <div class="solve-console">
               <div class="console-toolbar">
-                <div class="console-label">Console</div>
+                <div class="console-title-row">
+                  <div class="console-label">Console</div>
+                  <label class="console-follow-toggle" title="Keep the newest console line visible.">
+                    <input id="console-follow-checkbox" type="checkbox" checked />
+                    <span>Follow output</span>
+                  </label>
+                </div>
                 <button
                   id="copy-console-button"
                   type="button"

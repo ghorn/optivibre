@@ -150,7 +150,7 @@ pub struct OcpConstraintViolationReport {
     pub inequalities: Vec<OcpInequalityViolationGroup>,
 }
 
-type ObjectiveLagrangeFn<X, U, P> = dyn Fn(&X, &U, &U, &P) -> SX + Send + Sync;
+type ObjectiveLagrangeFn<X, U, P, G> = dyn Fn(&X, &U, &U, &P, &G) -> SX + Send + Sync;
 type ObjectiveMayerFn<X, U, P, G> = dyn Fn(&X, &U, &X, &U, &P, &G) -> SX + Send + Sync;
 type OdeFn<X, U, P> = dyn Fn(&X, &U, &P) -> X + Send + Sync;
 type PathConstraintsFn<X, U, P, C> = dyn Fn(&X, &U, &U, &P) -> C + Send + Sync;
@@ -159,7 +159,7 @@ type BoundaryFn<X, U, P, G, B> = dyn Fn(&X, &U, &X, &U, &P, &G) -> B + Send + Sy
 pub struct Ocp<X, U, P, C, Beq, Bineq, Scheme, G = FinalTime<SX>> {
     name: String,
     scheme: Scheme,
-    objective_lagrange: Box<ObjectiveLagrangeFn<X, U, P>>,
+    objective_lagrange: Box<ObjectiveLagrangeFn<X, U, P, G>>,
     objective_mayer: Box<ObjectiveMayerFn<X, U, P, G>>,
     ode: Box<OdeFn<X, U, P>>,
     path_constraints: Box<PathConstraintsFn<X, U, P, C>>,
@@ -170,7 +170,7 @@ pub struct Ocp<X, U, P, C, Beq, Bineq, Scheme, G = FinalTime<SX>> {
 pub struct OcpBuilder<X, U, P, C, Beq, Bineq, Scheme, G = FinalTime<SX>> {
     name: String,
     scheme: Scheme,
-    objective_lagrange: Option<Box<ObjectiveLagrangeFn<X, U, P>>>,
+    objective_lagrange: Option<Box<ObjectiveLagrangeFn<X, U, P, G>>>,
     objective_mayer: Option<Box<ObjectiveMayerFn<X, U, P, G>>>,
     ode: Option<Box<OdeFn<X, U, P>>>,
     path_constraints: Option<Box<PathConstraintsFn<X, U, P, C>>>,
@@ -499,11 +499,17 @@ pub struct OcpHelperCompileStats {
     pub multiple_shooting_arc_helper_total_instructions: Option<usize>,
     pub llvm_cache_hits: usize,
     pub llvm_cache_misses: usize,
+    pub llvm_cache_check_time: Duration,
+    pub llvm_cache_read_time: Duration,
     pub llvm_cache_load_time: Duration,
+    pub llvm_cache_materialize_time: Duration,
 }
 
 impl OcpHelperCompileStats {
     fn record_compile_report(&mut self, report: &sx_codegen_llvm::FunctionCompileReport) {
+        self.llvm_cache_check_time += report.cache.check_time;
+        self.llvm_cache_read_time += report.cache.read_time;
+        self.llvm_cache_materialize_time += report.cache.materialize_time;
         if report.cache.hit {
             self.llvm_cache_hits += 1;
             self.llvm_cache_load_time += report.cache.load_time;
@@ -535,6 +541,14 @@ impl<X, U, P, C, Beq, Bineq, Scheme, G> OcpBuilder<X, U, P, C, Beq, Bineq, Schem
     pub fn objective_lagrange<F>(mut self, f: F) -> Self
     where
         F: Fn(&X, &U, &U, &P) -> SX + Send + Sync + 'static,
+    {
+        self.objective_lagrange = Some(Box::new(move |x, u, dudt, p, _global| f(x, u, dudt, p)));
+        self
+    }
+
+    pub fn objective_lagrange_global<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&X, &U, &U, &P, &G) -> SX + Send + Sync + 'static,
     {
         self.objective_lagrange = Some(Box::new(f));
         self
@@ -720,7 +734,8 @@ where
             let u = symbolic_value::<U>("u")?;
             let dudt = symbolic_value::<U>("dudt")?;
             let p = symbolic_value::<P>("p")?;
-            let objective = (self.objective_lagrange)(&x, &u, &dudt, &p);
+            let g = symbolic_value::<G>("g")?;
+            let objective = (self.objective_lagrange)(&x, &u, &dudt, &p, &g);
             SXFunction::new(
                 format!("{}_objective_lagrange", self.name),
                 vec![
@@ -728,6 +743,7 @@ where
                     NamedMatrix::new("u", symbolic_column(&u)?)?,
                     NamedMatrix::new("dudt", symbolic_column(&dudt)?)?,
                     NamedMatrix::new("p", symbolic_column(&p)?)?,
+                    NamedMatrix::new("g", symbolic_column(&g)?)?,
                 ],
                 vec![NamedMatrix::new("objective", SXMatrix::scalar(objective))?],
             )
@@ -868,6 +884,7 @@ where
         u: &U,
         dudt: &U,
         parameters: &P,
+        global: &G,
     ) -> Result<SX, SxError> {
         match &library.objective_lagrange {
             Some(function) => function.call_scalar(&[
@@ -875,8 +892,9 @@ where
                 symbolic_column(u)?,
                 symbolic_column(dudt)?,
                 symbolic_column(parameters)?,
+                symbolic_column(global)?,
             ]),
-            None => Ok((self.objective_lagrange)(x, u, dudt, parameters)),
+            None => Ok((self.objective_lagrange)(x, u, dudt, parameters, global)),
         }
     }
 

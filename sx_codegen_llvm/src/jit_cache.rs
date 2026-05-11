@@ -4,7 +4,7 @@ use std::fs::{self, File};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -25,13 +25,19 @@ const OPTIVIBRE_JIT_CACHE_VERSION_DIR: &str = "v2";
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct JitCacheReport {
     pub hit: bool,
+    pub check_time: Duration,
+    pub read_time: Duration,
+    pub write_time: Duration,
     pub load_time: Duration,
+    pub materialize_time: Duration,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CachedObject {
     pub object_bytes: Vec<u8>,
     pub entry_dir: PathBuf,
+    pub check_time: Duration,
+    pub read_time: Duration,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -200,6 +206,7 @@ impl CacheKeyMetadata {
 }
 
 pub(crate) fn try_load_cached_object(metadata: &CacheKeyMetadata) -> Option<CachedObject> {
+    let check_started = Instant::now();
     let entry_dir = metadata.entry_dir().ok()?;
     let manifest_path = entry_dir.join("manifest.json");
     let object_path = entry_dir.join("object.o");
@@ -208,13 +215,18 @@ pub(crate) fn try_load_cached_object(metadata: &CacheKeyMetadata) -> Option<Cach
     if !manifest_matches(&manifest, metadata) {
         return None;
     }
+    let check_time = check_started.elapsed();
+    let read_started = Instant::now();
     let object_bytes = fs::read(&object_path).ok()?;
+    let read_time = read_started.elapsed();
     if object_bytes.is_empty() || object_bytes.len() != manifest.object_size_bytes {
         return None;
     }
     Some(CachedObject {
         object_bytes,
         entry_dir,
+        check_time,
+        read_time,
     })
 }
 

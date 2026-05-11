@@ -4,6 +4,7 @@ const INEQ_INF_LABEL = "‖ineq₊‖∞";
 const DUAL_INF_LABEL = "‖∇L‖∞";
 const TRUST_REGION_RADIUS_LABEL = "TR radius";
 const STEP_INF_LABEL = "‖Δx‖∞";
+const ITERATION_ARTIFACT_RENDER_STRIDE = 1;
 
 type EnumValue<T extends Record<string, number>> = T[keyof T];
 type NumericPoint = [number, number];
@@ -402,6 +403,7 @@ const PROBLEM_ID_FROM_WIRE = Object.freeze({
   rosenbrock_variants: PROBLEM_ID.rosenbrockVariants,
 } as const);
 const ALBATROSS_DESIGN_PREFIXES = ["delta_l", "h0", "vx0", "tf"] as const;
+type AlbatrossDesignPrefix = (typeof ALBATROSS_DESIGN_PREFIXES)[number];
 const COMPILE_CACHE_STATE = Object.freeze({
   warming: 0,
   ready: 1,
@@ -508,13 +510,74 @@ interface WireCompileCacheStatus {
   variant_id: string;
   variant_label: string;
   state: string | number;
+  symbolic_build_s?: number | null;
+  symbolic_derivatives_s?: number | null;
   symbolic_setup_s?: number | null;
   jit_s?: number | null;
   jit_disk_cache_hit?: boolean;
+  compile_report?: WireCompileReportSummary | null;
 }
 
 interface WireCompileCacheSnapshot {
   entries?: WireCompileCacheStatus[];
+}
+
+interface WireCompileKernelSummary {
+  name: string;
+  lowering_s?: number | null;
+  llvm_cache_key_s?: number | null;
+  llvm_s?: number | null;
+  llvm_cache_hit?: boolean;
+  llvm_module_build_s?: number | null;
+  llvm_optimization_s?: number | null;
+  llvm_object_emit_s?: number | null;
+  llvm_ir_fingerprint_s?: number | null;
+  context_s?: number | null;
+  llvm_cache_check_s?: number | null;
+  llvm_cache_read_s?: number | null;
+  llvm_cache_write_s?: number | null;
+  llvm_cache_load_s?: number | null;
+  llvm_cache_materialize_s?: number | null;
+  object_size_bytes?: number | null;
+  llvm_root_instructions_emitted: number;
+  llvm_total_instructions_emitted: number;
+  llvm_subfunctions_emitted: number;
+  llvm_call_instructions_emitted: number;
+}
+
+interface WireCompileReportSummary {
+  symbolic_construction_s?: number | null;
+  objective_gradient_s?: number | null;
+  equality_jacobian_s?: number | null;
+  inequality_jacobian_s?: number | null;
+  lagrangian_assembly_s?: number | null;
+  hessian_generation_s?: number | null;
+  lowering_s?: number | null;
+  llvm_cache_key_s?: number | null;
+  llvm_jit_s?: number | null;
+  llvm_module_build_s?: number | null;
+  llvm_optimization_s?: number | null;
+  llvm_object_emit_s?: number | null;
+  llvm_ir_fingerprint_s?: number | null;
+  jit_context_s?: number | null;
+  llvm_cache_check_s?: number | null;
+  llvm_cache_read_s?: number | null;
+  llvm_cache_write_s?: number | null;
+  llvm_cache_load_s?: number | null;
+  llvm_cache_materialize_s?: number | null;
+  llvm_cache_hits: number;
+  llvm_cache_misses: number;
+  symbolic_function_count: number;
+  call_site_count: number;
+  max_call_depth: number;
+  inlines_at_call: number;
+  inlines_at_lowering: number;
+  llvm_root_instructions_emitted: number;
+  llvm_total_instructions_emitted: number;
+  llvm_subfunctions_emitted: number;
+  llvm_call_instructions_emitted: number;
+  kernels: WireCompileKernelSummary[];
+  warnings: string[];
 }
 
 interface CompileCacheStatus {
@@ -524,9 +587,12 @@ interface CompileCacheStatus {
   variant_id: string;
   variant_label: string;
   state: CompileCacheStateCode;
+  symbolic_build_s: number | null;
+  symbolic_derivatives_s: number | null;
   symbolic_setup_s: number | null;
   jit_s: number | null;
   jit_disk_cache_hit: boolean;
+  compile_report: WireCompileReportSummary | null;
 }
 
 interface Metric {
@@ -712,6 +778,8 @@ interface SolveProgress {
   step_inf?: number | null;
   penalty: number;
   alpha?: number | null;
+  alpha_pr?: number | null;
+  alpha_du?: number | null;
   line_search_iterations?: number | null;
   filter?: FilterInfo | null;
   trust_region?: SolveTrustRegionInfo | null;
@@ -740,6 +808,8 @@ interface SolverReport {
   status_label: string;
   status_kind: SolverStatusKindCode;
   iterations?: number | null;
+  symbolic_build_s?: number | null;
+  symbolic_derivatives_s?: number | null;
   symbolic_setup_s?: number | null;
   jit_s?: number | null;
   solve_s?: number | null;
@@ -871,6 +941,7 @@ interface PlotlyView {
   plotEl: PlotlyHostElement;
   sceneCamera?: PlotlyObject | null;
   sceneInteractionBound?: boolean;
+  sceneInteracting?: boolean;
 }
 
 interface ChartPanelChart {
@@ -911,6 +982,7 @@ interface Scene3DView {
   plotEl: PlotlyHostElement;
   sceneCamera: PlotlyObject | null;
   sceneInteractionBound: boolean;
+  sceneInteracting: boolean;
 }
 
 type SceneView = Scene2DView | Scene3DView;
@@ -924,12 +996,21 @@ interface ControlSectionView {
 
 type ControlSectionCollapseState = Record<ControlSectionCode, boolean>;
 type ControlPanelCollapseState = Record<ControlPanelCode, boolean>;
+type ControlBlockCollapseState = Record<string, boolean>;
 
 interface ControlPanelView {
   key: ControlPanelCode;
   title: string;
   subtitle: string;
   controls: ControlSpec[];
+}
+
+interface ControlBlockView {
+  key: string;
+  title: string;
+  subtitle: string;
+  defaultCollapsed: boolean;
+  appendBody: (body: HTMLElement) => void;
 }
 
 interface FrontendState {
@@ -939,6 +1020,7 @@ interface FrontendState {
   compileCacheStatuses: CompileCacheStatus[];
   collapsedControlSections: ControlSectionCollapseState;
   collapsedControlPanels: ControlPanelCollapseState;
+  collapsedControlBlocks: ControlBlockCollapseState;
   artifact: SolveArtifact | null;
   animationIndex: number;
   playing: boolean;
@@ -958,6 +1040,8 @@ interface FrontendState {
   liveStatus: SolveStatus | null;
   liveSolver: SolverReport | null;
   terminalSolver: SolverReport | null;
+  solveAbortController: AbortController | null;
+  solveStopRequested: boolean;
   pendingIterationEvent: IterationSolveEvent | null;
   iterationFlushScheduled: boolean;
   sceneView: SceneView | null;
@@ -1252,12 +1336,21 @@ function readWireCompileCacheStatus(
   context: string,
 ): WireCompileCacheStatus {
   const object = readJsonObject(value, context);
+  const compileReportValue = readJsonValueAt(object, "compile_report");
   return {
     problem_id: readJsonStringOrNumber(readJsonValueAt(object, "problem_id"), `${context}.problem_id`),
     problem_name: readJsonString(readJsonValueAt(object, "problem_name"), `${context}.problem_name`),
     variant_id: readJsonString(readJsonValueAt(object, "variant_id"), `${context}.variant_id`),
     variant_label: readJsonString(readJsonValueAt(object, "variant_label"), `${context}.variant_label`),
     state: readJsonStringOrNumber(readJsonValueAt(object, "state"), `${context}.state`),
+    symbolic_build_s:
+      readOptionalJsonNumber(readJsonValueAt(object, "symbolic_build_s"), `${context}.symbolic_build_s`) ??
+      null,
+    symbolic_derivatives_s:
+      readOptionalJsonNumber(
+        readJsonValueAt(object, "symbolic_derivatives_s"),
+        `${context}.symbolic_derivatives_s`,
+      ) ?? null,
     symbolic_setup_s:
       readOptionalJsonNumber(readJsonValueAt(object, "symbolic_setup_s"), `${context}.symbolic_setup_s`) ??
       null,
@@ -1267,6 +1360,186 @@ function readWireCompileCacheStatus(
         readJsonValueAt(object, "jit_disk_cache_hit"),
         `${context}.jit_disk_cache_hit`,
       ) ?? false,
+    compile_report:
+      compileReportValue == null
+        ? null
+        : readWireCompileReportSummary(compileReportValue, `${context}.compile_report`),
+  };
+}
+
+function readWireCompileKernelSummary(
+  value: JsonValue | undefined,
+  context: string,
+): WireCompileKernelSummary {
+  const object = readJsonObject(value, context);
+  return {
+    name: readJsonString(readJsonValueAt(object, "name"), `${context}.name`),
+    lowering_s: readOptionalJsonNumber(readJsonValueAt(object, "lowering_s"), `${context}.lowering_s`) ?? null,
+    llvm_cache_key_s:
+      readOptionalJsonNumber(readJsonValueAt(object, "llvm_cache_key_s"), `${context}.llvm_cache_key_s`) ??
+      null,
+    llvm_s: readOptionalJsonNumber(readJsonValueAt(object, "llvm_s"), `${context}.llvm_s`) ?? null,
+    llvm_cache_hit:
+      readOptionalJsonBoolean(readJsonValueAt(object, "llvm_cache_hit"), `${context}.llvm_cache_hit`) ??
+      false,
+    llvm_module_build_s:
+      readOptionalJsonNumber(readJsonValueAt(object, "llvm_module_build_s"), `${context}.llvm_module_build_s`) ??
+      null,
+    llvm_optimization_s:
+      readOptionalJsonNumber(readJsonValueAt(object, "llvm_optimization_s"), `${context}.llvm_optimization_s`) ??
+      null,
+    llvm_object_emit_s:
+      readOptionalJsonNumber(readJsonValueAt(object, "llvm_object_emit_s"), `${context}.llvm_object_emit_s`) ??
+      null,
+    llvm_ir_fingerprint_s:
+      readOptionalJsonNumber(readJsonValueAt(object, "llvm_ir_fingerprint_s"), `${context}.llvm_ir_fingerprint_s`) ??
+      null,
+    context_s: readOptionalJsonNumber(readJsonValueAt(object, "context_s"), `${context}.context_s`) ?? null,
+    llvm_cache_check_s:
+      readOptionalJsonNumber(readJsonValueAt(object, "llvm_cache_check_s"), `${context}.llvm_cache_check_s`) ??
+      null,
+    llvm_cache_read_s:
+      readOptionalJsonNumber(readJsonValueAt(object, "llvm_cache_read_s"), `${context}.llvm_cache_read_s`) ??
+      null,
+    llvm_cache_write_s:
+      readOptionalJsonNumber(readJsonValueAt(object, "llvm_cache_write_s"), `${context}.llvm_cache_write_s`) ??
+      null,
+    llvm_cache_load_s:
+      readOptionalJsonNumber(readJsonValueAt(object, "llvm_cache_load_s"), `${context}.llvm_cache_load_s`) ??
+      null,
+    llvm_cache_materialize_s:
+      readOptionalJsonNumber(
+        readJsonValueAt(object, "llvm_cache_materialize_s"),
+        `${context}.llvm_cache_materialize_s`,
+      ) ?? null,
+    object_size_bytes:
+      readOptionalJsonNumber(readJsonValueAt(object, "object_size_bytes"), `${context}.object_size_bytes`) ??
+      null,
+    llvm_root_instructions_emitted: readJsonNumber(
+      readJsonValueAt(object, "llvm_root_instructions_emitted"),
+      `${context}.llvm_root_instructions_emitted`,
+    ),
+    llvm_total_instructions_emitted: readJsonNumber(
+      readJsonValueAt(object, "llvm_total_instructions_emitted"),
+      `${context}.llvm_total_instructions_emitted`,
+    ),
+    llvm_subfunctions_emitted: readJsonNumber(
+      readJsonValueAt(object, "llvm_subfunctions_emitted"),
+      `${context}.llvm_subfunctions_emitted`,
+    ),
+    llvm_call_instructions_emitted: readJsonNumber(
+      readJsonValueAt(object, "llvm_call_instructions_emitted"),
+      `${context}.llvm_call_instructions_emitted`,
+    ),
+  };
+}
+
+function readWireCompileReportSummary(
+  value: JsonValue | undefined,
+  context: string,
+): WireCompileReportSummary {
+  const object = readJsonObject(value, context);
+  const kernels = readOptionalJsonArray(readJsonValueAt(object, "kernels"), `${context}.kernels`);
+  const warnings = readOptionalJsonArray(readJsonValueAt(object, "warnings"), `${context}.warnings`);
+  return {
+    symbolic_construction_s:
+      readOptionalJsonNumber(
+        readJsonValueAt(object, "symbolic_construction_s"),
+        `${context}.symbolic_construction_s`,
+      ) ?? null,
+    objective_gradient_s:
+      readOptionalJsonNumber(readJsonValueAt(object, "objective_gradient_s"), `${context}.objective_gradient_s`) ??
+      null,
+    equality_jacobian_s:
+      readOptionalJsonNumber(readJsonValueAt(object, "equality_jacobian_s"), `${context}.equality_jacobian_s`) ??
+      null,
+    inequality_jacobian_s:
+      readOptionalJsonNumber(
+        readJsonValueAt(object, "inequality_jacobian_s"),
+        `${context}.inequality_jacobian_s`,
+      ) ?? null,
+    lagrangian_assembly_s:
+      readOptionalJsonNumber(
+        readJsonValueAt(object, "lagrangian_assembly_s"),
+        `${context}.lagrangian_assembly_s`,
+      ) ?? null,
+    hessian_generation_s:
+      readOptionalJsonNumber(
+        readJsonValueAt(object, "hessian_generation_s"),
+        `${context}.hessian_generation_s`,
+      ) ?? null,
+    lowering_s: readOptionalJsonNumber(readJsonValueAt(object, "lowering_s"), `${context}.lowering_s`) ?? null,
+    llvm_cache_key_s:
+      readOptionalJsonNumber(readJsonValueAt(object, "llvm_cache_key_s"), `${context}.llvm_cache_key_s`) ??
+      null,
+    llvm_jit_s: readOptionalJsonNumber(readJsonValueAt(object, "llvm_jit_s"), `${context}.llvm_jit_s`) ?? null,
+    llvm_module_build_s:
+      readOptionalJsonNumber(readJsonValueAt(object, "llvm_module_build_s"), `${context}.llvm_module_build_s`) ??
+      null,
+    llvm_optimization_s:
+      readOptionalJsonNumber(readJsonValueAt(object, "llvm_optimization_s"), `${context}.llvm_optimization_s`) ??
+      null,
+    llvm_object_emit_s:
+      readOptionalJsonNumber(readJsonValueAt(object, "llvm_object_emit_s"), `${context}.llvm_object_emit_s`) ??
+      null,
+    llvm_ir_fingerprint_s:
+      readOptionalJsonNumber(readJsonValueAt(object, "llvm_ir_fingerprint_s"), `${context}.llvm_ir_fingerprint_s`) ??
+      null,
+    jit_context_s:
+      readOptionalJsonNumber(readJsonValueAt(object, "jit_context_s"), `${context}.jit_context_s`) ??
+      null,
+    llvm_cache_check_s:
+      readOptionalJsonNumber(readJsonValueAt(object, "llvm_cache_check_s"), `${context}.llvm_cache_check_s`) ??
+      null,
+    llvm_cache_read_s:
+      readOptionalJsonNumber(readJsonValueAt(object, "llvm_cache_read_s"), `${context}.llvm_cache_read_s`) ??
+      null,
+    llvm_cache_write_s:
+      readOptionalJsonNumber(readJsonValueAt(object, "llvm_cache_write_s"), `${context}.llvm_cache_write_s`) ??
+      null,
+    llvm_cache_load_s:
+      readOptionalJsonNumber(readJsonValueAt(object, "llvm_cache_load_s"), `${context}.llvm_cache_load_s`) ??
+      null,
+    llvm_cache_materialize_s:
+      readOptionalJsonNumber(
+        readJsonValueAt(object, "llvm_cache_materialize_s"),
+        `${context}.llvm_cache_materialize_s`,
+      ) ?? null,
+    llvm_cache_hits: readOptionalJsonNumber(readJsonValueAt(object, "llvm_cache_hits"), `${context}.llvm_cache_hits`) ?? 0,
+    llvm_cache_misses:
+      readOptionalJsonNumber(readJsonValueAt(object, "llvm_cache_misses"), `${context}.llvm_cache_misses`) ?? 0,
+    symbolic_function_count:
+      readOptionalJsonNumber(readJsonValueAt(object, "symbolic_function_count"), `${context}.symbolic_function_count`) ??
+      0,
+    call_site_count: readOptionalJsonNumber(readJsonValueAt(object, "call_site_count"), `${context}.call_site_count`) ?? 0,
+    max_call_depth: readOptionalJsonNumber(readJsonValueAt(object, "max_call_depth"), `${context}.max_call_depth`) ?? 0,
+    inlines_at_call: readOptionalJsonNumber(readJsonValueAt(object, "inlines_at_call"), `${context}.inlines_at_call`) ?? 0,
+    inlines_at_lowering:
+      readOptionalJsonNumber(readJsonValueAt(object, "inlines_at_lowering"), `${context}.inlines_at_lowering`) ?? 0,
+    llvm_root_instructions_emitted:
+      readOptionalJsonNumber(
+        readJsonValueAt(object, "llvm_root_instructions_emitted"),
+        `${context}.llvm_root_instructions_emitted`,
+      ) ?? 0,
+    llvm_total_instructions_emitted:
+      readOptionalJsonNumber(
+        readJsonValueAt(object, "llvm_total_instructions_emitted"),
+        `${context}.llvm_total_instructions_emitted`,
+      ) ?? 0,
+    llvm_subfunctions_emitted:
+      readOptionalJsonNumber(
+        readJsonValueAt(object, "llvm_subfunctions_emitted"),
+        `${context}.llvm_subfunctions_emitted`,
+      ) ?? 0,
+    llvm_call_instructions_emitted:
+      readOptionalJsonNumber(
+        readJsonValueAt(object, "llvm_call_instructions_emitted"),
+        `${context}.llvm_call_instructions_emitted`,
+      ) ?? 0,
+    kernels: kernels?.map((kernel, index) =>
+      readWireCompileKernelSummary(kernel, `${context}.kernels[${index}]`)) ?? [],
+    warnings: warnings?.map((warning, index) =>
+      readJsonString(warning, `${context}.warnings[${index}]`)) ?? [],
   };
 }
 
@@ -1560,6 +1833,10 @@ function readWireSolveProgress(value: JsonValue | undefined, context: string): W
       readOptionalJsonNumber(readJsonValueAt(object, "step_inf"), `${context}.step_inf`) ?? null,
     penalty: readJsonNumber(readJsonValueAt(object, "penalty"), `${context}.penalty`),
     alpha: readOptionalJsonNumber(readJsonValueAt(object, "alpha"), `${context}.alpha`) ?? null,
+    alpha_pr:
+      readOptionalJsonNumber(readJsonValueAt(object, "alpha_pr"), `${context}.alpha_pr`) ?? null,
+    alpha_du:
+      readOptionalJsonNumber(readJsonValueAt(object, "alpha_du"), `${context}.alpha_du`) ?? null,
     line_search_iterations:
       readOptionalJsonNumber(
         readJsonValueAt(object, "line_search_iterations"),
@@ -1665,6 +1942,14 @@ function readWireSolverReport(value: JsonValue | undefined, context: string): Wi
       `${context}.status_kind`,
     ),
     iterations: readOptionalJsonNumber(readJsonValueAt(object, "iterations"), `${context}.iterations`) ?? null,
+    symbolic_build_s:
+      readOptionalJsonNumber(readJsonValueAt(object, "symbolic_build_s"), `${context}.symbolic_build_s`) ??
+      null,
+    symbolic_derivatives_s:
+      readOptionalJsonNumber(
+        readJsonValueAt(object, "symbolic_derivatives_s"),
+        `${context}.symbolic_derivatives_s`,
+      ) ?? null,
     symbolic_setup_s:
       readOptionalJsonNumber(readJsonValueAt(object, "symbolic_setup_s"), `${context}.symbolic_setup_s`) ??
       null,
@@ -1789,6 +2074,7 @@ const state: FrontendState = {
   collapsedControlPanels: {
     [CONTROL_PANEL.sxFunctions]: true,
   },
+  collapsedControlBlocks: {},
   artifact: null,
   animationIndex: 0,
   playing: false,
@@ -1808,6 +2094,8 @@ const state: FrontendState = {
   liveStatus: null,
   liveSolver: null,
   terminalSolver: null,
+  solveAbortController: null,
+  solveStopRequested: false,
   pendingIterationEvent: null,
   iterationFlushScheduled: false,
   sceneView: null,
@@ -1824,6 +2112,7 @@ const problemList = requiredElement<HTMLDivElement>("#problem-list");
 const controls = requiredElement<HTMLDivElement>("#controls");
 const controlsForm = requiredElement<HTMLFormElement>("#controls-form");
 const solveButton = requiredElement<HTMLButtonElement>("#solve-button");
+const stopButton = requiredElement<HTMLButtonElement>("#stop-button");
 const statusEl = requiredElement<HTMLDivElement>("#status");
 const problemNameEl = requiredElement<HTMLDivElement>("#problem-name");
 const problemDescriptionEl = requiredElement<HTMLParagraphElement>("#problem-description");
@@ -1838,6 +2127,7 @@ const progressPlotEl = requiredElement<PlotlyHostElement>("#progress-plot");
 const filterPlotEl = requiredElement<PlotlyHostElement>("#filter-plot");
 const trustRegionPlotEl = requiredElement<PlotlyHostElement>("#trust-region-plot");
 const copyConsoleButton = requiredElement<HTMLButtonElement>("#copy-console-button");
+const consoleFollowCheckbox = requiredElement<HTMLInputElement>("#console-follow-checkbox");
 const clearJitCacheButton = requiredElement<HTMLButtonElement>("#clear-jit-cache-button");
 const solverLogEl = requiredElement<HTMLPreElement>("#solver-log");
 const prewarmStatusEl = requiredElement<HTMLDivElement>("#prewarm-status");
@@ -2223,6 +2513,9 @@ function buildStatusSolverReport(status: SolveStatus): SolverReport {
   const nextSolver = status.solver;
   return {
     ...nextSolver,
+    symbolic_build_s: nextSolver.symbolic_build_s ?? liveSolver?.symbolic_build_s ?? null,
+    symbolic_derivatives_s:
+      nextSolver.symbolic_derivatives_s ?? liveSolver?.symbolic_derivatives_s ?? null,
     symbolic_setup_s: nextSolver.symbolic_setup_s ?? liveSolver?.symbolic_setup_s ?? null,
     jit_s: nextSolver.jit_s ?? liveSolver?.jit_s ?? null,
     solve_s: nextSolver.solve_s ?? liveSolver?.solve_s ?? null,
@@ -2243,6 +2536,8 @@ function buildFailureSolverReport(message: string): SolverReport {
         : "Failed",
     status_kind: SOLVER_STATUS_KIND.error,
     iterations: state.latestProgress?.iteration ?? null,
+    symbolic_build_s: liveSolver?.symbolic_build_s ?? null,
+    symbolic_derivatives_s: liveSolver?.symbolic_derivatives_s ?? null,
     symbolic_setup_s: liveSolver?.symbolic_setup_s ?? null,
     jit_s: liveSolver?.jit_s ?? null,
     solve_s: liveSolver?.solve_s ?? null,
@@ -2253,6 +2548,25 @@ function buildFailureSolverReport(message: string): SolverReport {
   };
 }
 
+function buildStoppedSolverReport(): SolverReport {
+  const liveSolver = state.liveSolver;
+  return {
+    completed: true,
+    status_label: "Stopped",
+    status_kind: SOLVER_STATUS_KIND.warning,
+    iterations: state.latestProgress?.iteration ?? null,
+    symbolic_build_s: liveSolver?.symbolic_build_s ?? null,
+    symbolic_derivatives_s: liveSolver?.symbolic_derivatives_s ?? null,
+    symbolic_setup_s: liveSolver?.symbolic_setup_s ?? null,
+    jit_s: liveSolver?.jit_s ?? null,
+    solve_s: liveSolver?.solve_s ?? null,
+    compile_cached: liveSolver?.compile_cached ?? false,
+    jit_disk_cache_hit: liveSolver?.jit_disk_cache_hit ?? false,
+    phase_details: normalizeSolverPhaseDetails(liveSolver?.phase_details),
+    failure_message: "Solve stopped by user.",
+  };
+}
+
 function mergeSolverReport(
   next: SolverReport,
   fallback: SolverReport | null | undefined,
@@ -2260,6 +2574,9 @@ function mergeSolverReport(
   return {
     ...next,
     iterations: next.iterations ?? fallback?.iterations ?? null,
+    symbolic_build_s: next.symbolic_build_s ?? fallback?.symbolic_build_s ?? null,
+    symbolic_derivatives_s:
+      next.symbolic_derivatives_s ?? fallback?.symbolic_derivatives_s ?? null,
     symbolic_setup_s: next.symbolic_setup_s ?? fallback?.symbolic_setup_s ?? null,
     jit_s: next.jit_s ?? fallback?.jit_s ?? null,
     solve_s: next.solve_s ?? fallback?.solve_s ?? null,
@@ -2346,11 +2663,6 @@ function ansiToHtml(raw: string): string {
   }
   pushAnsiSegment(parts, input.slice(lastIndex), state);
   return parts.join("");
-}
-
-function shouldConsoleStickToBottom(): boolean {
-  const bottomSlackPx = 12;
-  return solverLogEl.scrollHeight - (solverLogEl.scrollTop + solverLogEl.clientHeight) <= bottomSlackPx;
 }
 
 function clearCopyConsoleFeedbackTimer(): void {
@@ -2447,13 +2759,24 @@ async function copyConsoleTranscript(): Promise<void> {
   }
 }
 
-function syncConsoleFollowState(): void {
-  state.followSolverLog = shouldConsoleStickToBottom();
+function setConsoleFollowState(follow: boolean): void {
+  state.followSolverLog = follow;
+  consoleFollowCheckbox.checked = follow;
 }
 
 function scrollConsoleToBottom(): void {
   solverLogEl.scrollTop = solverLogEl.scrollHeight;
-  state.followSolverLog = true;
+}
+
+function enableConsoleFollow(): void {
+  setConsoleFollowState(true);
+  scrollConsoleToBottom();
+}
+
+function disableConsoleFollowForManualScroll(): void {
+  if (state.followSolverLog) {
+    setConsoleFollowState(false);
+  }
 }
 
 function buildLogLineElements(entries: readonly LogLine[]): DocumentFragment {
@@ -2469,10 +2792,9 @@ function buildLogLineElements(entries: readonly LogLine[]): DocumentFragment {
 
 function renderLog(): void {
   const previousScrollTop = solverLogEl.scrollTop;
-  const shouldStickToBottom = state.followSolverLog || shouldConsoleStickToBottom();
   solverLogEl.replaceChildren(buildLogLineElements(state.logLines));
   syncCopyConsoleButtonAvailability();
-  if (shouldStickToBottom) {
+  if (state.followSolverLog) {
     scrollConsoleToBottom();
     return;
   }
@@ -2503,23 +2825,49 @@ function renderCompileCacheStatus(): void {
   header.innerHTML = `
     <div class="compile-cache-problem">Problem</div>
     <div class="compile-cache-variant">Variant</div>
-    <div class="compile-cache-timing">Symbolic</div>
-    <div class="compile-cache-timing">JIT</div>
     <div class="compile-cache-status">Status</div>
   `;
   table.appendChild(header);
 
   for (const row of rows) {
     const statusLabel = row.state === COMPILE_CACHE_STATE.warming ? "warming" : "ready";
+    const report = row.compile_report;
     const rowEl = document.createElement("div");
     rowEl.className = "compile-cache-row";
+    const timingCells = [
+      ["Build", "Symbolic model construction", formatCompileDuration(row.symbolic_build_s)],
+      ["Deriv", "Symbolic derivative generation", formatCompileDuration(row.symbolic_derivatives_s)],
+      ["Lower", "SX lowering", formatCompileDuration(report?.lowering_s ?? null)],
+      ["Key", "LLVM cache-key and fingerprint generation", formatCompileDuration(report?.llvm_cache_key_s ?? null)],
+      ["Module", "LLVM module construction", formatCompileDuration(report?.llvm_module_build_s ?? null)],
+      ["Opt", "LLVM optimization passes", formatCompileDuration(report?.llvm_optimization_s ?? null)],
+      ["Emit", "LLVM object-code emission", formatCompileDuration(report?.llvm_object_emit_s ?? null)],
+      ["IR FP", "Optimized LLVM IR fingerprint generation", formatCompileDuration(report?.llvm_ir_fingerprint_s ?? null)],
+      ["Check", "LLVM cache manifest lookup and validation", formatCompileDuration(report?.llvm_cache_check_s ?? null)],
+      ["Read", "Cached object file read", formatCompileDuration(report?.llvm_cache_read_s ?? null)],
+      ["Write", "Cached object file write", formatCompileDuration(report?.llvm_cache_write_s ?? null)],
+      ["Load", "LLVM object materialization/load", formatCompileDuration(report?.llvm_cache_materialize_s ?? null)],
+      ["Ctx", "JIT execution-context allocation", formatCompileDuration(report?.jit_context_s ?? null)],
+      ["LLVM", "LLVM compile/load total", formatCompileDuration(report?.llvm_jit_s ?? null)],
+      ["Total", "Outer JIT phase total", formatJitDuration(row.jit_s, row.jit_disk_cache_hit)],
+    ]
+      .map(([label, title, value]) => `
+        <div class="compile-cache-metric" title="${escapeHtml(title)}">
+          <span class="compile-cache-metric-label">${escapeHtml(label)}</span>
+          <span class="compile-cache-metric-value">${escapeHtml(value)}</span>
+        </div>
+      `)
+      .join("");
     rowEl.innerHTML = `
       <div class="compile-cache-problem">${escapeHtml(row.problem_name)}</div>
       <div class="compile-cache-variant">${escapeHtml(row.variant_label)}</div>
-      <div class="compile-cache-timing">${escapeHtml(formatCompileDuration(row.symbolic_setup_s))}</div>
-      <div class="compile-cache-timing">${escapeHtml(formatJitDuration(row.jit_s, row.jit_disk_cache_hit))}</div>
       <div class="compile-cache-status"><span class="compile-cache-badge compile-cache-badge-${statusLabel}">${statusLabel}</span></div>
+      <div class="compile-cache-metrics">${timingCells}</div>
     `;
+    const cacheHits = report?.llvm_cache_hits ?? 0;
+    const cacheMisses = report?.llvm_cache_misses ?? 0;
+    const kernelCount = report?.kernels.length ?? 0;
+    rowEl.title = `symbolic total: ${formatCompileDuration(row.symbolic_setup_s)}; cache hits/misses: ${cacheHits}/${cacheMisses}; kernels: ${kernelCount}`;
     table.appendChild(rowEl);
   }
 
@@ -2583,9 +2931,12 @@ function normalizeCompileCacheStatus(status: WireCompileCacheStatus): CompileCac
     wire_problem_id: String(status.problem_id),
     problem_id: decodeWireEnum(PROBLEM_ID_FROM_WIRE, status.problem_id, PROBLEM_ID.optimalDistanceGlider),
     state: decodeWireEnum(COMPILE_CACHE_STATE_FROM_WIRE, status.state, COMPILE_CACHE_STATE.ready),
+    symbolic_build_s: status.symbolic_build_s ?? null,
+    symbolic_derivatives_s: status.symbolic_derivatives_s ?? null,
     symbolic_setup_s: status.symbolic_setup_s ?? null,
     jit_s: status.jit_s ?? null,
     jit_disk_cache_hit: status.jit_disk_cache_hit ?? false,
+    compile_report: status.compile_report ?? null,
   };
 }
 
@@ -2789,8 +3140,21 @@ function effectiveControlValue(control: ControlSpec): number {
   return Number(hasControlOverride(control) ? state.values[control.id] : profileDefaultForControl(control));
 }
 
-function albatrossDesignPrefix(controlId: string): string | null {
+function albatrossDesignPrefix(controlId: string): AlbatrossDesignPrefix | null {
   return ALBATROSS_DESIGN_PREFIXES.find((prefix) => controlId.startsWith(`${prefix}_`)) ?? null;
+}
+
+function albatrossDesignLabel(prefix: AlbatrossDesignPrefix): string {
+  switch (prefix) {
+    case "delta_l":
+      return "Delta L";
+    case "h0":
+      return "h0";
+    case "vx0":
+      return "vx0";
+    case "tf":
+      return "T";
+  }
 }
 
 function isAlbatrossDesignModeControl(control: ControlSpec): boolean {
@@ -3238,15 +3602,37 @@ function toggleControlPanel(panel: ControlPanelCode): void {
   renderControls();
 }
 
+function isControlBlockCollapsed(block: ControlBlockView): boolean {
+  return state.collapsedControlBlocks[block.key] ?? block.defaultCollapsed;
+}
+
+function toggleControlBlock(block: ControlBlockView): void {
+  state.collapsedControlBlocks[block.key] = !isControlBlockCollapsed(block);
+  renderControls();
+}
+
 function phaseLabel(phase: SolvePhaseCode): string {
   return PHASE_LABEL.get(phase) ?? "--";
 }
 
-function appendControl(wrapperParent: HTMLElement, control: ControlSpec): void {
+interface AppendControlOptions {
+  className?: string;
+  label?: string;
+  help?: string;
+  checkboxText?: string;
+}
+
+function appendControl(
+  wrapperParent: HTMLElement,
+  control: ControlSpec,
+  options: AppendControlOptions = {},
+): void {
   const wrapper = document.createElement("section");
-  wrapper.className = "control-group";
+  wrapper.className = options.className ?? "control-group";
   const value = effectiveControlValue(control);
   const initialHasOverride = hasControlOverride(control);
+  const label = options.label ?? control.label;
+  const help = options.help ?? control.help;
   const choiceMap = new Map<number, string>(
     (control.choices ?? []).map((choice) => [Number(choice.value), choice.label]),
   );
@@ -3268,8 +3654,8 @@ function appendControl(wrapperParent: HTMLElement, control: ControlSpec): void {
     wrapper.innerHTML = `
       <div class="control-header">
         <div>
-          <div class="control-label">${control.label}</div>
-          <div class="control-help">${control.help}</div>
+          <div class="control-label">${label}</div>
+          <div class="control-help">${help}</div>
         </div>
         <div class="value-pill">${formatValue(value)}</div>
       </div>
@@ -3296,8 +3682,8 @@ function appendControl(wrapperParent: HTMLElement, control: ControlSpec): void {
     wrapper.innerHTML = `
       <div class="control-header">
         <div>
-          <div class="control-label">${control.label}</div>
-          <div class="control-help">${control.help}</div>
+          <div class="control-label">${label}</div>
+          <div class="control-help">${help}</div>
         </div>
         <div class="value-pill">${formatValue(value)}</div>
       </div>
@@ -3346,17 +3732,18 @@ function appendControl(wrapperParent: HTMLElement, control: ControlSpec): void {
 
   if (isCheckboxControl(control)) {
     const checked = value >= 0.5;
+    const checkboxText = options.checkboxText ?? (checked ? "Free" : "Fixed");
     wrapper.innerHTML = `
       <div class="control-header">
         <div>
-          <div class="control-label">${control.label}</div>
-          <div class="control-help">${control.help}</div>
+          <div class="control-label">${label}</div>
+          <div class="control-help">${help}</div>
         </div>
         <div class="value-pill">${checked ? "On" : "Off"}</div>
       </div>
       <label class="control-inputs control-inputs-checkbox">
-        <input type="checkbox" aria-label="${control.label}"${checked ? " checked" : ""} />
-        <span>${checked ? "Free" : "Fixed"}</span>
+        <input type="checkbox" aria-label="${label}"${checked ? " checked" : ""} />
+        <span>${checkboxText}</span>
       </label>
     `;
     const checkboxInput = requiredChild<HTMLInputElement>(wrapper, 'input[type="checkbox"]');
@@ -3367,7 +3754,7 @@ function appendControl(wrapperParent: HTMLElement, control: ControlSpec): void {
       const numeric = target.checked ? 1 : 0;
       state.values[control.id] = numeric;
       pill.textContent = target.checked ? "On" : "Off";
-      checkboxLabel.textContent = target.checked ? "Free" : "Fixed";
+      checkboxLabel.textContent = options.checkboxText ?? (target.checked ? "Free" : "Fixed");
       handleControlUpdate(control);
     });
     wrapperParent.appendChild(wrapper);
@@ -3377,8 +3764,8 @@ function appendControl(wrapperParent: HTMLElement, control: ControlSpec): void {
   wrapper.innerHTML = `
     <div class="control-header">
       <div>
-        <div class="control-label">${control.label}</div>
-        <div class="control-help">${control.help}</div>
+        <div class="control-label">${label}</div>
+        <div class="control-help">${help}</div>
       </div>
       <div class="value-pill">${formatValue(value)}</div>
     </div>
@@ -3514,6 +3901,442 @@ function appendControlPanel(wrapperParent: HTMLElement, panel: ControlPanelView)
     }
   }
   wrapperParent.appendChild(shell);
+}
+
+function controlBlockKey(section: ControlSectionCode, slug: string): string {
+  const spec = currentSpec();
+  return `${spec?.wire_id ?? "unknown"}:${section}:${slug}`;
+}
+
+function appendControlBlock(wrapperParent: HTMLElement, block: ControlBlockView): void {
+  const shell = document.createElement("section");
+  shell.className = "control-panel control-block";
+  const collapsed = isControlBlockCollapsed(block);
+  shell.dataset.collapsed = collapsed ? "true" : "false";
+
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "control-panel-toggle";
+  toggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+
+  const text = document.createElement("div");
+  text.className = "control-panel-header-text";
+
+  const title = document.createElement("div");
+  title.className = "control-panel-title";
+  title.textContent = block.title;
+
+  const help = document.createElement("div");
+  help.className = "control-panel-help";
+  help.textContent = block.subtitle;
+
+  text.append(title, help);
+
+  const chevron = document.createElement("span");
+  chevron.className = "control-panel-chevron";
+  chevron.setAttribute("aria-hidden", "true");
+  chevron.textContent = "⌄";
+
+  toggle.append(text, chevron);
+
+  const body = document.createElement("div");
+  body.className = "control-panel-body";
+  body.id = `control-block-body-${block.key.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+  toggle.setAttribute("aria-controls", body.id);
+  toggle.addEventListener("click", () => {
+    toggleControlBlock(block);
+  });
+
+  shell.append(toggle, body);
+  if (!collapsed) {
+    block.appendBody(body);
+  }
+  wrapperParent.appendChild(shell);
+}
+
+function appendAlbatrossDesignGroup(
+  wrapperParent: HTMLElement,
+  controlsForSection: readonly ControlSpec[],
+  prefix: AlbatrossDesignPrefix,
+): void {
+  const modeControl = controlsForSection.find((control) => control.id === `${prefix}_free`);
+  const valueControl = controlsForSection.find((control) => control.id === `${prefix}_value`);
+  if (!modeControl || !valueControl) {
+    return;
+  }
+  const lowerControl = controlsForSection.find((control) => control.id === `${prefix}_lower`);
+  const upperControl = controlsForSection.find((control) => control.id === `${prefix}_upper`);
+  const isFree = effectiveControlValue(modeControl) >= 0.5;
+  const label = albatrossDesignLabel(prefix);
+  const shell = document.createElement("section");
+  shell.className = "design-variable-group";
+  shell.dataset.designMode = isFree ? "free" : "fixed";
+
+  const header = document.createElement("div");
+  header.className = "design-variable-header";
+  header.innerHTML = `
+    <div>
+      <div class="design-variable-title">${label}</div>
+      <div class="design-variable-help">${isFree
+        ? "Optimized as a global design variable."
+        : "Held fixed by equal lower and upper global bounds."}</div>
+    </div>
+    <div class="value-pill">${isFree ? "Free" : "Fixed"}</div>
+  `;
+
+  const body = document.createElement("div");
+  body.className = "design-variable-body";
+  appendControl(body, modeControl, {
+    className: "design-control-row design-control-row-mode",
+    label: "Mode",
+    help: "Check Free to optimize this design variable; leave it unchecked to hold the fixed value.",
+    checkboxText: "Free",
+  });
+  appendControl(body, valueControl, {
+    className: "design-control-row",
+    label: `${label} ${isFree ? "Guess" : "Fixed"}`,
+    help: isFree
+      ? "Initial guess for the free design variable. It must satisfy the active bounds."
+      : "Fixed value used as equal lower and upper bounds.",
+  });
+  if (isFree && lowerControl) {
+    appendControl(body, lowerControl, {
+      className: "design-control-row",
+      label: "Lower Bound",
+      help: `Lower bound for free ${label}.`,
+    });
+  }
+  if (isFree && upperControl) {
+    appendControl(body, upperControl, {
+      className: "design-control-row",
+      label: "Upper Bound",
+      help: `Upper bound for free ${label}.`,
+    });
+  }
+
+  shell.append(header, body);
+  wrapperParent.appendChild(shell);
+}
+
+function appendControlList(wrapperParent: HTMLElement, controlsForSection: readonly ControlSpec[]): void {
+  for (const control of controlsForSection) {
+    appendControl(wrapperParent, control);
+  }
+}
+
+function controlBlockFromControls(
+  section: ControlSectionCode,
+  slug: string,
+  title: string,
+  subtitle: string,
+  controlsForBlock: readonly ControlSpec[],
+  defaultCollapsed = false,
+): ControlBlockView | null {
+  if (controlsForBlock.length === 0) {
+    return null;
+  }
+  return {
+    key: controlBlockKey(section, slug),
+    title,
+    subtitle,
+    defaultCollapsed,
+    appendBody: (body) => appendControlList(body, controlsForBlock),
+  };
+}
+
+function makeControlTaker(controlsForSection: readonly ControlSpec[]): {
+  remainingControls: () => ControlSpec[];
+  takeIds: (ids: readonly string[]) => ControlSpec[];
+  takePrefix: (prefix: string) => ControlSpec[];
+} {
+  const remaining = new Set(controlsForSection.map((control) => control.id));
+  const takeWhere = (predicate: (control: ControlSpec) => boolean): ControlSpec[] => {
+    const taken: ControlSpec[] = [];
+    for (const control of controlsForSection) {
+      if (!remaining.has(control.id) || !predicate(control)) {
+        continue;
+      }
+      remaining.delete(control.id);
+      taken.push(control);
+    }
+    return taken;
+  };
+  return {
+    remainingControls: () => controlsForSection.filter((control) => remaining.has(control.id)),
+    takeIds: (ids) => {
+      const idSet = new Set(ids);
+      return takeWhere((control) => idSet.has(control.id));
+    },
+    takePrefix: (prefix) => takeWhere((control) => control.id.startsWith(prefix)),
+  };
+}
+
+function albatrossProblemControlBlocks(controlsForSection: readonly ControlSpec[]): ControlBlockView[] {
+  const section = CONTROL_SECTION.problem;
+  const taker = makeControlTaker(controlsForSection);
+  const blocks: ControlBlockView[] = [];
+  const push = (block: ControlBlockView | null): void => {
+    if (block) {
+      blocks.push(block);
+    }
+  };
+
+  push(controlBlockFromControls(
+    section,
+    "objective",
+    "Objective",
+    "Choose the symbolic objective variant.",
+    taker.takeIds(["objective"]),
+  ));
+
+  const designPrefixes = ALBATROSS_DESIGN_PREFIXES.filter((prefix) => (
+    controlsForSection.some((control) => control.id === `${prefix}_free`)
+    || controlsForSection.some((control) => control.id === `${prefix}_value`)
+  ));
+  for (const prefix of designPrefixes) {
+    taker.takePrefix(`${prefix}_`);
+  }
+  if (designPrefixes.length > 0) {
+    blocks.push({
+      key: controlBlockKey(section, "design_variables"),
+      title: "Design Variables",
+      subtitle: "Fixed values, guesses, and free-variable bounds.",
+      defaultCollapsed: false,
+      appendBody: (body) => {
+        for (const prefix of designPrefixes) {
+          appendAlbatrossDesignGroup(body, controlsForSection, prefix);
+        }
+      },
+    });
+  }
+
+  push(controlBlockFromControls(
+    section,
+    "aircraft_aero",
+    "Aircraft & Aero",
+    "Runtime aircraft, atmosphere, polar, and regularization parameters.",
+    taker.takeIds([
+      "gravity_mps2",
+      "air_density_kg_m3",
+      "mass_kg",
+      "reference_area_m2",
+      "cl_slope_per_rad",
+      "cd0",
+      "aspect_ratio",
+      "oswald_efficiency",
+      "speed_eps_mps",
+      "frame_eps",
+    ]),
+    true,
+  ));
+
+  push(controlBlockFromControls(
+    section,
+    "wind_shear",
+    "Wind Shear",
+    "Wind direction and smooth tanh shear profile.",
+    taker.takeIds([
+      "wind_azimuth_deg",
+      "wind_low_mps",
+      "wind_high_mps",
+      "wind_mid_altitude_m",
+      "wind_transition_height_m",
+    ]),
+  ));
+  push(controlBlockFromControls(
+    section,
+    "initial_guess",
+    "Initial Guess",
+    "Trajectory wave and periodic control seed.",
+    taker.takeIds([
+      "initial_wave_amplitude_m",
+      "initial_wave_rotation_deg",
+      "initial_alpha_deg",
+      "initial_roll_amplitude_deg",
+    ]),
+    true,
+  ));
+  push(controlBlockFromControls(
+    section,
+    "path_limits",
+    "Path Limits",
+    "Airspeed, load-factor, and control-rate bounds.",
+    taker.takeIds([
+      "min_altitude_m",
+      "min_airspeed_mps",
+      "max_airspeed_mps",
+      "max_load_factor",
+      "max_alpha_rate_deg_s",
+      "max_roll_rate_deg_s",
+    ]),
+    true,
+  ));
+  push(controlBlockFromControls(
+    section,
+    "weights_scaling",
+    "Weights & Scaling",
+    "Regularization and numerical scaling controls.",
+    taker.takeIds(["rate_regularization", "scaling_enabled"]),
+    true,
+  ));
+  push(controlBlockFromControls(
+    section,
+    "other_problem",
+    "Other Problem Settings",
+    "Additional problem-specific controls.",
+    taker.remainingControls(),
+    true,
+  ));
+  return blocks;
+}
+
+function transcriptionControlBlocks(controlsForSection: readonly ControlSpec[]): ControlBlockView[] {
+  const section = CONTROL_SECTION.transcription;
+  const taker = makeControlTaker(controlsForSection);
+  return [
+    controlBlockFromControls(
+      section,
+      "mesh",
+      "Mesh",
+      "Transcription method and interval count.",
+      taker.takeIds(["transcription_intervals", "transcription_method"]),
+    ),
+    controlBlockFromControls(
+      section,
+      "collocation",
+      "Collocation",
+      "Collocation family and node count.",
+      taker.takePrefix("collocation_"),
+    ),
+    controlBlockFromControls(
+      section,
+      "time_grid",
+      "Time Grid",
+      "Direct-collocation mesh spacing controls.",
+      taker.takePrefix("time_grid"),
+      true,
+    ),
+    controlBlockFromControls(
+      section,
+      "other_transcription",
+      "Other Transcription Settings",
+      "Additional transcription controls.",
+      taker.remainingControls(),
+      true,
+    ),
+  ].filter((block): block is ControlBlockView => block !== null);
+}
+
+function solverControlBlocks(controlsForSection: readonly ControlSpec[]): ControlBlockView[] {
+  const section = CONTROL_SECTION.solver;
+  const taker = makeControlTaker(controlsForSection);
+  const globalizationIds = [
+    "solver_globalization",
+    "solver_exact_merit_penalty",
+    "solver_armijo_c1",
+    "solver_wolfe_c2",
+    "solver_line_search_beta",
+    "solver_line_search_max_steps",
+    "solver_min_step",
+    "solver_penalty_increase_factor",
+    "solver_max_penalty_updates",
+  ];
+  const globalizationControls = [
+    ...taker.takeIds(globalizationIds),
+    ...taker.takePrefix("solver_filter_"),
+    ...taker.takePrefix("solver_trust_region_"),
+  ];
+  return [
+    controlBlockFromControls(
+      section,
+      "core",
+      "Core Solver",
+      "Solver choice, profile, iteration budget, and overall tolerance.",
+      taker.takeIds([
+        "solver_method",
+        "solver_profile",
+        "solver_max_iters",
+        "solver_overall_tol",
+        "solver_hessian_regularization",
+      ]),
+    ),
+    controlBlockFromControls(
+      section,
+      "tolerances",
+      "Tolerances",
+      "Dual, constraint, and complementarity termination thresholds.",
+      taker.takeIds([
+        "solver_dual_tol",
+        "solver_constraint_tol",
+        "solver_complementarity_tol",
+      ]),
+      true,
+    ),
+    controlBlockFromControls(
+      section,
+      "nlip_linear_solver",
+      "NLIP Linear Solver",
+      "Sparse KKT backend and SPRAL pivot controls.",
+      taker.takePrefix("solver_nlip_"),
+      true,
+    ),
+    controlBlockFromControls(
+      section,
+      "globalization",
+      "Globalization",
+      "Line-search, filter, trust-region, and merit controls.",
+      globalizationControls,
+      true,
+    ),
+    controlBlockFromControls(
+      section,
+      "other_solver",
+      "Other Solver Settings",
+      "Additional solver controls.",
+      taker.remainingControls(),
+      true,
+    ),
+  ].filter((block): block is ControlBlockView => block !== null);
+}
+
+function defaultProblemControlBlocks(controlsForSection: readonly ControlSpec[]): ControlBlockView[] {
+  return [
+    controlBlockFromControls(
+      CONTROL_SECTION.problem,
+      "problem_parameters",
+      "Problem Parameters",
+      "Problem-specific physical parameters and scenario settings.",
+      controlsForSection,
+    ),
+  ].filter((block): block is ControlBlockView => block !== null);
+}
+
+function controlBlocksForSection(
+  section: ControlSectionCode,
+  controlsForSection: readonly ControlSpec[],
+): ControlBlockView[] {
+  switch (section) {
+    case CONTROL_SECTION.transcription:
+      return transcriptionControlBlocks(controlsForSection);
+    case CONTROL_SECTION.solver:
+      return solverControlBlocks(controlsForSection);
+    case CONTROL_SECTION.problem:
+      return currentSpec()?.id === PROBLEM_ID.albatrossDynamicSoaring
+        ? albatrossProblemControlBlocks(controlsForSection)
+        : defaultProblemControlBlocks(controlsForSection);
+  }
+  return defaultProblemControlBlocks(controlsForSection);
+}
+
+function appendControlBlocksForSection(
+  wrapperParent: HTMLElement,
+  section: ControlSectionCode,
+  controlsForSection: readonly ControlSpec[],
+): void {
+  const blocks = controlBlocksForSection(section, controlsForSection);
+  for (const block of blocks) {
+    appendControlBlock(wrapperParent, block);
+  }
 }
 
 function resetChartViews(): void {
@@ -3666,6 +4489,7 @@ function createScene3DView(visualization: Paths3DVisualization): Scene3DView {
     plotEl,
     sceneCamera: null,
     sceneInteractionBound: false,
+    sceneInteracting: false,
   };
 }
 
@@ -3915,7 +4739,7 @@ function resetSolverPanel(): void {
   state.pendingIterationEvent = null;
   state.iterationFlushScheduled = false;
   state.logLines = [];
-  state.followSolverLog = true;
+  setConsoleFollowState(true);
   renderSolverSummary();
   renderConstraintPanels();
   solverLogEl.replaceChildren();
@@ -4047,9 +4871,7 @@ function renderControls(): void {
 
     if (!collapsed) {
       const grouped = groupedControls(section.controls);
-      for (const control of grouped.ungrouped) {
-        appendControl(body, control);
-      }
+      appendControlBlocksForSection(body, section.key, grouped.ungrouped);
       for (const panel of grouped.panels) {
         appendControlPanel(body, panel);
       }
@@ -4661,7 +5483,18 @@ function solveSummaryItems(
       label: STEP_INF_LABEL,
       value: progress.step_inf == null ? "--" : progress.step_inf.toExponential(3),
     });
-    items.push({ label: "α", value: progress.alpha == null ? "--" : progress.alpha.toExponential(3) });
+    if (progress.alpha_pr != null || progress.alpha_du != null) {
+      items.push({
+        label: "α_pr",
+        value: progress.alpha_pr == null ? "--" : progress.alpha_pr.toExponential(3),
+      });
+      items.push({
+        label: "α_du",
+        value: progress.alpha_du == null ? "--" : progress.alpha_du.toExponential(3),
+      });
+    } else {
+      items.push({ label: "α", value: progress.alpha == null ? "--" : progress.alpha.toExponential(3) });
+    }
     return items;
   }
 
@@ -5038,10 +5871,9 @@ function appendLogLine(line: string, level: LogLevelCode = LOG_LEVEL.console): v
   }
   const entries = parts.map((textPart) => ({ text: textPart, level }));
   state.logLines.push(...entries);
-  const shouldStickToBottom = state.followSolverLog || shouldConsoleStickToBottom();
   solverLogEl.appendChild(buildLogLineElements(entries));
   syncCopyConsoleButtonAvailability();
-  if (shouldStickToBottom) {
+  if (state.followSolverLog) {
     scrollConsoleToBottom();
   }
 }
@@ -5818,7 +6650,7 @@ function scheduleIterationUpdate(): void {
 function shouldRenderIterationArtifact(event: IterationSolveEvent, forceArtifactRender: boolean): boolean {
   return forceArtifactRender
     || state.artifact == null
-    || event.progress.iteration % 25 === 0;
+    || event.progress.iteration % ITERATION_ARTIFACT_RENDER_STRIDE === 0;
 }
 
 function applyIterationEvent(
@@ -5869,6 +6701,23 @@ function applySolveFailure(message: string): void {
   void refreshCompileCacheStatus();
   appendSolveProfilingLog(state.terminalSolver);
   appendLogLine(`error: ${message}`, LOG_LEVEL.error);
+  setStatusDisplay(statusDisplayForSolverReport(state.terminalSolver));
+}
+
+function applySolveStopped(): void {
+  if (state.pendingIterationEvent) {
+    const pendingEvent = state.pendingIterationEvent;
+    state.pendingIterationEvent = null;
+    applyIterationEvent(pendingEvent, false, true);
+  }
+  state.liveStatus = null;
+  state.terminalSolver = buildStoppedSolverReport();
+  state.liveSolver = null;
+  renderSolverSummary();
+  renderMetrics();
+  renderCompileCacheStatus();
+  void refreshCompileCacheStatus();
+  appendLogLine("solve stopped by user", LOG_LEVEL.warning);
   setStatusDisplay(statusDisplayForSolverReport(state.terminalSolver));
 }
 
@@ -6380,21 +7229,37 @@ function isPlotlyObject(value: PlotlyValue | undefined): value is PlotlyObject {
   return value != null && typeof value === "object" && !Array.isArray(value);
 }
 
+function capturePaths3DCamera(view: PlotlyView, eventData: PlotlyRelayoutPayload): void {
+  const camera = eventData["scene.camera"];
+  if (isPlotlyObject(camera)) {
+    view.sceneCamera = camera;
+  }
+}
+
 function bindPaths3DInteraction(view: PlotlyView): void {
   if (view.sceneInteractionBound) {
     return;
   }
-  view.plotEl.addEventListener("contextmenu", (event) => {
-    event.preventDefault();
-  });
+  const markIdle = (): void => {
+    view.sceneInteracting = false;
+    scheduleArtifactRender();
+  };
   if (typeof view.plotEl.on === "function") {
+    view.plotEl.on("plotly_relayouting", (eventData) => {
+      view.sceneInteracting = true;
+      capturePaths3DCamera(view, eventData);
+    });
     view.plotEl.on("plotly_relayout", (eventData) => {
-      const camera = eventData["scene.camera"];
-      if (isPlotlyObject(camera)) {
-        view.sceneCamera = camera;
-      }
+      capturePaths3DCamera(view, eventData);
+      view.sceneInteracting = false;
     });
   }
+  view.plotEl.addEventListener("pointerdown", () => {
+    view.sceneInteracting = true;
+  });
+  window.addEventListener("pointerup", markIdle);
+  window.addEventListener("pointercancel", markIdle);
+  window.addEventListener("blur", markIdle);
   view.sceneInteractionBound = true;
 }
 
@@ -6449,8 +7314,8 @@ function paths3DTraceStyle(path: ScenePath3D, index: number): Paths3DTraceStyle 
       label: "Wind shear",
       group: "wind-shear",
       color: "#7cc6fe",
-      width: 5,
-      opacity: 0.52,
+      width: name.startsWith("wind shear frame") ? 2 : 3,
+      opacity: name.startsWith("wind shear frame") ? 0.18 : 0.34,
       mode: "lines",
       markerSize: 0,
     };
@@ -6517,6 +7382,9 @@ function updatePaths3DVisualization(
   if (!window.Plotly || !view) {
     return;
   }
+  if (view.sceneInteracting) {
+    return;
+  }
   const visibleLegendGroups = new Set<string>();
   const data: PlotlyTrace[] = visualization.paths.map((path, index) => {
     const style = paths3DTraceStyle(path, index);
@@ -6547,6 +7415,7 @@ function updatePaths3DVisualization(
   });
   const layout: PlotlyLayout = {
     uirevision: visualization.title,
+    dragmode: "turntable",
     paper_bgcolor: "rgba(0,0,0,0)",
     plot_bgcolor: "rgba(4, 15, 22, 0.92)",
     font: {
@@ -6561,7 +7430,6 @@ function updatePaths3DVisualization(
       x: 0.01,
       font: { color: "#94b6bd", size: 11 },
     },
-    dragmode: "pan",
     scene: {
       domain: { x: [0, 1], y: [0, 1] },
       bgcolor: "rgba(4, 15, 22, 0.92)",
@@ -6569,30 +7437,35 @@ function updatePaths3DVisualization(
       aspectratio: { x: 2.35, y: 1.25, z: 1.0 },
       xaxis: {
         title: visualization.x_label,
-        gridcolor: "rgba(229, 241, 244, 0.08)",
-        zerolinecolor: "rgba(229, 241, 244, 0.18)",
+        showgrid: false,
+        zeroline: false,
         titlefont: { color: "#94b6bd" },
       },
       yaxis: {
         title: visualization.y_label,
-        gridcolor: "rgba(229, 241, 244, 0.08)",
-        zerolinecolor: "rgba(229, 241, 244, 0.18)",
+        showgrid: false,
+        zeroline: false,
         titlefont: { color: "#94b6bd" },
       },
       zaxis: {
         title: visualization.z_label,
-        gridcolor: "rgba(229, 241, 244, 0.08)",
-        zerolinecolor: "rgba(229, 241, 244, 0.18)",
+        showgrid: false,
+        zeroline: false,
         titlefont: { color: "#94b6bd" },
       },
-      camera: view.sceneCamera ?? DEFAULT_PATHS_3D_CAMERA,
     },
   };
+  if (view.sceneCamera == null) {
+    const scene = layout.scene;
+    if (isPlotlyObject(scene)) {
+      scene.camera = DEFAULT_PATHS_3D_CAMERA;
+    }
+  }
   const config: PlotlyConfig = {
     responsive: true,
     displaylogo: false,
     displayModeBar: "hover",
-    scrollZoom: false,
+    scrollZoom: true,
     modeBarButtonsToRemove: ["toImage"],
   };
   window.Plotly.react(view.plotEl, data, layout, config).then(() => {
@@ -6774,13 +7647,17 @@ async function solveCurrentProblem(event?: Event): Promise<void> {
   if (!spec || state.solving) {
     return;
   }
+  const abortController = new AbortController();
 
   try {
     state.solving = true;
+    state.solveStopRequested = false;
+    state.solveAbortController = abortController;
     syncCompileStatusPolling();
     clearScheduledPrewarm();
     solveButton.disabled = true;
     solveButton.setAttribute("aria-busy", "true");
+    stopButton.disabled = false;
     stopAnimation();
     state.artifact = null;
     state.animationIndex = 0;
@@ -6795,6 +7672,7 @@ async function solveCurrentProblem(event?: Event): Promise<void> {
     const response = await fetch(`/api/solve_stream/${spec.wire_id}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal: abortController.signal,
       body: JSON.stringify({ values: state.values }),
     });
 
@@ -6805,6 +7683,10 @@ async function solveCurrentProblem(event?: Event): Promise<void> {
 
     await readNdjsonStream(response, handleSolveEvent);
   } catch (error) {
+    if (state.solveStopRequested && error instanceof DOMException && error.name === "AbortError") {
+      applySolveStopped();
+      return;
+    }
     applySolveFailure(
       describeThrownValue(
         error != null && typeof error === "object" ? error : String(error),
@@ -6812,11 +7694,32 @@ async function solveCurrentProblem(event?: Event): Promise<void> {
     );
   } finally {
     state.solving = false;
+    state.solveAbortController = null;
+    state.solveStopRequested = false;
     syncCompileStatusPolling();
     solveButton.disabled = false;
     solveButton.setAttribute("aria-busy", "false");
+    stopButton.disabled = true;
     renderCompileCacheStatus();
   }
+}
+
+function stopCurrentSolve(event?: Event): void {
+  event?.preventDefault?.();
+  if (!state.solving || !state.solveAbortController) {
+    return;
+  }
+  state.solveStopRequested = true;
+  stopButton.disabled = true;
+  appendLogLine("stop requested; closing solve stream", LOG_LEVEL.warning);
+  setStatusDisplay({
+    eyebrow: "Run Status",
+    title: "Stopping solve",
+    detail: "Waiting for the backend solver to observe the closed stream.",
+    kind: "warning",
+    active: true,
+  });
+  state.solveAbortController.abort();
 }
 
 async function init(): Promise<void> {
@@ -6831,13 +7734,25 @@ async function init(): Promise<void> {
     }
     controlsForm.addEventListener("submit", solveCurrentProblem);
     solveButton.addEventListener("click", solveCurrentProblem);
+    stopButton.addEventListener("click", stopCurrentSolve);
     copyConsoleButton.addEventListener("click", () => {
       void copyConsoleTranscript();
+    });
+    consoleFollowCheckbox.addEventListener("change", () => {
+      if (consoleFollowCheckbox.checked) {
+        enableConsoleFollow();
+      } else {
+        setConsoleFollowState(false);
+      }
+    });
+    solverLogEl.addEventListener("wheel", disableConsoleFollowForManualScroll, { passive: true });
+    solverLogEl.addEventListener("touchstart", disableConsoleFollowForManualScroll, {
+      passive: true,
     });
     clearJitCacheButton.addEventListener("click", () => {
       void clearJitCache();
     });
-    solverLogEl.addEventListener("scroll", syncConsoleFollowState);
+    setConsoleFollowState(state.followSolverLog);
     resetCopyConsoleButton();
     selectProblem(state.specs[0].id);
     void refreshCompileCacheStatus();

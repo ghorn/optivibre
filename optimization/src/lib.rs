@@ -879,7 +879,34 @@ pub struct SymbolicSetupProfile {
     pub lagrangian_assembly: Option<Duration>,
     pub hessian_generation: Option<Duration>,
     pub lowering: Option<Duration>,
+    pub llvm_cache_key: Option<Duration>,
+    pub llvm_module_build: Option<Duration>,
+    pub llvm_optimization: Option<Duration>,
+    pub llvm_object_emit: Option<Duration>,
+    pub llvm_ir_fingerprint: Option<Duration>,
     pub llvm_jit: Option<Duration>,
+    pub jit_context: Option<Duration>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KernelCompileReport {
+    pub name: String,
+    pub lowering_time: Duration,
+    pub cache_key_time: Duration,
+    pub llvm_time: Duration,
+    pub llvm_module_build_time: Duration,
+    pub llvm_optimization_time: Duration,
+    pub llvm_object_emit_time: Duration,
+    pub llvm_ir_fingerprint_time: Duration,
+    pub context_time: Duration,
+    pub llvm_cache_hit: bool,
+    pub llvm_cache_check_time: Duration,
+    pub llvm_cache_read_time: Duration,
+    pub llvm_cache_write_time: Duration,
+    pub llvm_cache_load_time: Duration,
+    pub llvm_cache_materialize_time: Duration,
+    pub object_size_bytes: Option<usize>,
+    pub stats: CompileStats,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -887,6 +914,7 @@ pub struct BackendCompileReport {
     pub timing: BackendTimingMetadata,
     pub setup_profile: SymbolicSetupProfile,
     pub llvm_jit_cache: LlvmJitCacheStats,
+    pub kernels: Vec<KernelCompileReport>,
     pub stats: CompileStats,
     pub warnings: Vec<CompileWarning>,
 }
@@ -897,7 +925,15 @@ pub struct LlvmJitCacheStats {
     pub hits: Index,
     pub misses: Index,
     #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
+    pub check_time: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
+    pub read_time: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
+    pub write_time: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
     pub load_time: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
+    pub materialize_time: Duration,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]

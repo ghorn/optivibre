@@ -249,10 +249,14 @@ pub struct CompileCacheStatus {
     pub variant_id: String,
     pub variant_label: String,
     pub state: CompileCacheState,
+    pub symbolic_build_s: Option<f64>,
+    pub symbolic_derivatives_s: Option<f64>,
     pub symbolic_setup_s: Option<f64>,
     pub jit_s: Option<f64>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub jit_disk_cache_hit: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compile_report: Option<CompileReportSummary>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -603,6 +607,10 @@ pub struct SolveProgress {
     pub step_inf: Option<f64>,
     pub penalty: f64,
     pub alpha: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alpha_pr: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alpha_du: Option<f64>,
     pub line_search_iterations: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<SolveFilterInfo>,
@@ -624,6 +632,8 @@ pub struct SolveStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub solver_method: Option<SolverMethod>,
     pub solver: SolverReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compile_report: Option<CompileReportSummary>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -661,6 +671,26 @@ pub fn emit_solve_status<F>(
             stage,
             solver_method,
             solver,
+            compile_report: None,
+        },
+    });
+}
+
+pub fn emit_compile_status<F>(
+    emit: &mut F,
+    stage: SolveStage,
+    solver_method: Option<SolverMethod>,
+    solver: SolverReport,
+    compile_report: Option<CompileReportSummary>,
+) where
+    F: FnMut(SolveStreamEvent),
+{
+    emit(SolveStreamEvent::Status {
+        status: SolveStatus {
+            stage,
+            solver_method,
+            solver,
+            compile_report,
         },
     });
 }
@@ -774,6 +804,7 @@ where
                 stage: SolveStage::Solving,
                 solver_method: Some(solver_method),
                 solver,
+                compile_report: None,
             },
         },
     );
@@ -1740,6 +1771,10 @@ pub struct SolverReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub iterations: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbolic_build_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbolic_derivatives_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub symbolic_setup_s: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jit_s: Option<f64>,
@@ -1751,6 +1786,45 @@ pub struct SolverReport {
     pub jit_disk_cache_hit: bool,
     #[serde(default, skip_serializing_if = "SolverPhaseDetails::is_empty")]
     pub phase_details: SolverPhaseDetails,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct CompileKernelSummary {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lowering_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llvm_cache_key_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llvm_s: Option<f64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub llvm_cache_hit: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llvm_module_build_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llvm_optimization_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llvm_object_emit_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llvm_ir_fingerprint_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llvm_cache_check_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llvm_cache_read_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llvm_cache_write_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llvm_cache_load_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llvm_cache_materialize_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object_size_bytes: Option<usize>,
+    pub llvm_root_instructions_emitted: usize,
+    pub llvm_total_instructions_emitted: usize,
+    pub llvm_subfunctions_emitted: usize,
+    pub llvm_call_instructions_emitted: usize,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -1770,9 +1844,29 @@ pub struct CompileReportSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lowering_s: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub llvm_cache_key_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub llvm_jit_s: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub llvm_module_build_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llvm_optimization_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llvm_object_emit_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llvm_ir_fingerprint_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jit_context_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llvm_cache_check_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llvm_cache_read_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llvm_cache_write_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub llvm_cache_load_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llvm_cache_materialize_s: Option<f64>,
     pub llvm_cache_hits: usize,
     pub llvm_cache_misses: usize,
     pub symbolic_function_count: usize,
@@ -1785,6 +1879,8 @@ pub struct CompileReportSummary {
     pub llvm_subfunctions_emitted: usize,
     pub llvm_call_instructions_emitted: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kernels: Vec<CompileKernelSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
 
@@ -1795,6 +1891,8 @@ impl SolverReport {
             status_label: "Not solved".to_string(),
             status_kind: SolverStatusKind::Info,
             iterations: None,
+            symbolic_build_s: None,
+            symbolic_derivatives_s: None,
             symbolic_setup_s: None,
             jit_s: None,
             solve_s: None,
@@ -1810,6 +1908,8 @@ impl SolverReport {
             status_label: status_label.into(),
             status_kind: SolverStatusKind::Info,
             iterations: None,
+            symbolic_build_s: None,
+            symbolic_derivatives_s: None,
             symbolic_setup_s: None,
             jit_s: None,
             solve_s: None,
@@ -1820,6 +1920,8 @@ impl SolverReport {
     }
 
     pub fn with_backend_timing(mut self, timing: BackendTimingMetadata) -> Self {
+        self.symbolic_build_s = duration_seconds(timing.function_creation_time);
+        self.symbolic_derivatives_s = duration_seconds(timing.derivative_generation_time);
         self.symbolic_setup_s = symbolic_setup_seconds(timing);
         self.jit_s = duration_seconds(timing.jit_time);
         self
@@ -1863,8 +1965,18 @@ pub fn summarize_backend_compile_report(report: &BackendCompileReport) -> Compil
         lagrangian_assembly_s: duration_seconds(report.setup_profile.lagrangian_assembly),
         hessian_generation_s: duration_seconds(report.setup_profile.hessian_generation),
         lowering_s: duration_seconds(report.setup_profile.lowering),
+        llvm_cache_key_s: duration_seconds(report.setup_profile.llvm_cache_key),
         llvm_jit_s: duration_seconds(report.setup_profile.llvm_jit),
+        llvm_module_build_s: duration_seconds(report.setup_profile.llvm_module_build),
+        llvm_optimization_s: duration_seconds(report.setup_profile.llvm_optimization),
+        llvm_object_emit_s: duration_seconds(report.setup_profile.llvm_object_emit),
+        llvm_ir_fingerprint_s: duration_seconds(report.setup_profile.llvm_ir_fingerprint),
+        jit_context_s: duration_seconds(report.setup_profile.jit_context),
+        llvm_cache_check_s: duration_seconds(Some(report.llvm_jit_cache.check_time)),
+        llvm_cache_read_s: duration_seconds(Some(report.llvm_jit_cache.read_time)),
+        llvm_cache_write_s: duration_seconds(Some(report.llvm_jit_cache.write_time)),
         llvm_cache_load_s: duration_seconds(Some(report.llvm_jit_cache.load_time)),
+        llvm_cache_materialize_s: duration_seconds(Some(report.llvm_jit_cache.materialize_time)),
         llvm_cache_hits: report.llvm_jit_cache.hits,
         llvm_cache_misses: report.llvm_jit_cache.misses,
         symbolic_function_count: report.stats.symbolic_function_count,
@@ -1876,6 +1988,34 @@ pub fn summarize_backend_compile_report(report: &BackendCompileReport) -> Compil
         llvm_total_instructions_emitted: report.stats.llvm_total_instructions_emitted,
         llvm_subfunctions_emitted: report.stats.llvm_subfunctions_emitted,
         llvm_call_instructions_emitted: report.stats.llvm_call_instructions_emitted,
+        kernels: report
+            .kernels
+            .iter()
+            .map(|kernel| CompileKernelSummary {
+                name: kernel.name.clone(),
+                lowering_s: duration_seconds(Some(kernel.lowering_time)),
+                llvm_cache_key_s: duration_seconds(Some(kernel.cache_key_time)),
+                llvm_s: duration_seconds(Some(kernel.llvm_time)),
+                llvm_cache_hit: kernel.llvm_cache_hit,
+                llvm_module_build_s: duration_seconds(Some(kernel.llvm_module_build_time)),
+                llvm_optimization_s: duration_seconds(Some(kernel.llvm_optimization_time)),
+                llvm_object_emit_s: duration_seconds(Some(kernel.llvm_object_emit_time)),
+                llvm_ir_fingerprint_s: duration_seconds(Some(kernel.llvm_ir_fingerprint_time)),
+                context_s: duration_seconds(Some(kernel.context_time)),
+                llvm_cache_check_s: duration_seconds(Some(kernel.llvm_cache_check_time)),
+                llvm_cache_read_s: duration_seconds(Some(kernel.llvm_cache_read_time)),
+                llvm_cache_write_s: duration_seconds(Some(kernel.llvm_cache_write_time)),
+                llvm_cache_load_s: duration_seconds(Some(kernel.llvm_cache_load_time)),
+                llvm_cache_materialize_s: duration_seconds(Some(
+                    kernel.llvm_cache_materialize_time,
+                )),
+                object_size_bytes: kernel.object_size_bytes,
+                llvm_root_instructions_emitted: kernel.stats.llvm_root_instructions_emitted,
+                llvm_total_instructions_emitted: kernel.stats.llvm_total_instructions_emitted,
+                llvm_subfunctions_emitted: kernel.stats.llvm_subfunctions_emitted,
+                llvm_call_instructions_emitted: kernel.stats.llvm_call_instructions_emitted,
+            })
+            .collect(),
         warnings: report
             .warnings
             .iter()
@@ -3198,6 +3338,7 @@ pub fn compile_cache_status(
     variant_label: &str,
     timing: BackendTimingMetadata,
     jit_disk_cache_hit: bool,
+    compile_report: Option<CompileReportSummary>,
 ) -> CompileCacheStatus {
     CompileCacheStatus {
         problem_id,
@@ -3205,9 +3346,12 @@ pub fn compile_cache_status(
         variant_id: variant_id.to_string(),
         variant_label: variant_label.to_string(),
         state: CompileCacheState::Ready,
+        symbolic_build_s: duration_seconds(timing.function_creation_time),
+        symbolic_derivatives_s: duration_seconds(timing.derivative_generation_time),
         symbolic_setup_s: symbolic_setup_seconds(timing),
         jit_s: duration_seconds(timing.jit_time),
         jit_disk_cache_hit,
+        compile_report,
     }
 }
 
@@ -3432,6 +3576,8 @@ where
         .map(|(key, compiled)| {
             let (variant_id, variant_label) = describe_variant(key);
             let compiled = compiled.borrow();
+            let compile_report =
+                summarize_backend_compile_report(compiled.backend_compile_report());
             compile_cache_status(
                 problem_id,
                 problem_name,
@@ -3439,11 +3585,10 @@ where
                 &variant_label,
                 compiled.backend_timing_metadata(),
                 compile_is_fully_disk_cached(
-                    Some(&summarize_backend_compile_report(
-                        compiled.backend_compile_report(),
-                    )),
+                    Some(&compile_report),
                     compiled.helper_compile_stats(),
                 ),
+                Some(compile_report),
             )
         })
         .collect()
@@ -3631,6 +3776,49 @@ fn llvm_cache_load_seconds(
     (total > 0.0).then_some(total)
 }
 
+fn llvm_cache_check_seconds(
+    compile_report: Option<&CompileReportSummary>,
+    helper_stats: OcpHelperCompileStats,
+) -> Option<f64> {
+    let nlp = compile_report
+        .and_then(|report| report.llvm_cache_check_s)
+        .unwrap_or(0.0);
+    let helper = duration_seconds(Some(helper_stats.llvm_cache_check_time)).unwrap_or(0.0);
+    let total = nlp + helper;
+    (total > 0.0).then_some(total)
+}
+
+fn llvm_cache_read_seconds(
+    compile_report: Option<&CompileReportSummary>,
+    helper_stats: OcpHelperCompileStats,
+) -> Option<f64> {
+    let nlp = compile_report
+        .and_then(|report| report.llvm_cache_read_s)
+        .unwrap_or(0.0);
+    let helper = duration_seconds(Some(helper_stats.llvm_cache_read_time)).unwrap_or(0.0);
+    let total = nlp + helper;
+    (total > 0.0).then_some(total)
+}
+
+fn llvm_cache_write_seconds(compile_report: Option<&CompileReportSummary>) -> Option<f64> {
+    let total = compile_report
+        .and_then(|report| report.llvm_cache_write_s)
+        .unwrap_or(0.0);
+    (total > 0.0).then_some(total)
+}
+
+fn llvm_cache_materialize_seconds(
+    compile_report: Option<&CompileReportSummary>,
+    helper_stats: OcpHelperCompileStats,
+) -> Option<f64> {
+    let nlp = compile_report
+        .and_then(|report| report.llvm_cache_materialize_s)
+        .unwrap_or(0.0);
+    let helper = duration_seconds(Some(helper_stats.llvm_cache_materialize_time)).unwrap_or(0.0);
+    let total = nlp + helper;
+    (total > 0.0).then_some(total)
+}
+
 fn compile_is_fully_disk_cached(
     compile_report: Option<&CompileReportSummary>,
     helper_stats: OcpHelperCompileStats,
@@ -3654,13 +3842,225 @@ fn llvm_cache_phase_details(
         phase_detail("LLVM Cache Hits", hits.to_string(), 0),
         phase_detail("LLVM Cache Misses", misses.to_string(), 0),
     ];
+    if let Some(check_s) = llvm_cache_check_seconds(compile_report, helper_stats) {
+        if check_s > 0.0 {
+            details.push(phase_detail(
+                "LLVM Cache Check",
+                format_phase_duration(Duration::from_secs_f64(check_s)),
+                0,
+            ));
+        }
+    }
+    if let Some(read_s) = llvm_cache_read_seconds(compile_report, helper_stats) {
+        if read_s > 0.0 {
+            details.push(phase_detail(
+                "LLVM Cache Object Read",
+                format_phase_duration(Duration::from_secs_f64(read_s)),
+                0,
+            ));
+        }
+    }
+    if let Some(write_s) = llvm_cache_write_seconds(compile_report) {
+        if write_s > 0.0 {
+            details.push(phase_detail(
+                "LLVM Cache Object Write",
+                format_phase_duration(Duration::from_secs_f64(write_s)),
+                0,
+            ));
+        }
+    }
     if let Some(load_s) = llvm_cache_load_seconds(compile_report, helper_stats) {
         if load_s > 0.0 {
             details.push(phase_detail(
-                "LLVM Cache Load",
+                "LLVM Cache Hit Total",
                 format_phase_duration(Duration::from_secs_f64(load_s)),
                 0,
             ));
+        }
+    }
+    if let Some(materialize_s) = llvm_cache_materialize_seconds(compile_report, helper_stats) {
+        if materialize_s > 0.0 {
+            details.push(phase_detail(
+                "LLVM Object Materialization",
+                format_phase_duration(Duration::from_secs_f64(materialize_s)),
+                0,
+            ));
+        }
+    }
+    details
+}
+
+fn compile_report_jit_phase_details(
+    compile_report: Option<&CompileReportSummary>,
+) -> Vec<SolverPhaseDetail> {
+    let Some(report) = compile_report else {
+        return Vec::new();
+    };
+    let mut details = Vec::new();
+    if let Some(lowering_s) = report.lowering_s {
+        details.push(phase_detail(
+            "SX Lowering",
+            format_phase_duration(Duration::from_secs_f64(lowering_s)),
+            0,
+        ));
+    }
+    if let Some(cache_key_s) = report.llvm_cache_key_s {
+        details.push(phase_detail(
+            "LLVM Cache Key",
+            format_phase_duration(Duration::from_secs_f64(cache_key_s)),
+            0,
+        ));
+    }
+    if let Some(module_s) = report.llvm_module_build_s {
+        if module_s > 0.0 {
+            details.push(phase_detail(
+                "LLVM Module Build",
+                format_phase_duration(Duration::from_secs_f64(module_s)),
+                0,
+            ));
+        }
+    }
+    if let Some(optimize_s) = report.llvm_optimization_s {
+        if optimize_s > 0.0 {
+            details.push(phase_detail(
+                "LLVM Optimize",
+                format_phase_duration(Duration::from_secs_f64(optimize_s)),
+                0,
+            ));
+        }
+    }
+    if let Some(emit_s) = report.llvm_object_emit_s {
+        if emit_s > 0.0 {
+            details.push(phase_detail(
+                "LLVM Object Emit",
+                format_phase_duration(Duration::from_secs_f64(emit_s)),
+                0,
+            ));
+        }
+    }
+    if let Some(fingerprint_s) = report.llvm_ir_fingerprint_s {
+        if fingerprint_s > 0.0 {
+            details.push(phase_detail(
+                "LLVM IR Fingerprint",
+                format_phase_duration(Duration::from_secs_f64(fingerprint_s)),
+                0,
+            ));
+        }
+    }
+    if let Some(llvm_s) = report.llvm_jit_s {
+        details.push(phase_detail(
+            "LLVM Compile / Load",
+            format_phase_duration(Duration::from_secs_f64(llvm_s)),
+            0,
+        ));
+    }
+    if let Some(context_s) = report.jit_context_s {
+        details.push(phase_detail(
+            "JIT Context Allocation",
+            format_phase_duration(Duration::from_secs_f64(context_s)),
+            0,
+        ));
+    }
+    for kernel in &report.kernels {
+        if let Some(lowering_s) = kernel.lowering_s {
+            details.push(phase_detail(
+                format!("{} Lowering", kernel.name),
+                format_phase_duration(Duration::from_secs_f64(lowering_s)),
+                0,
+            ));
+        }
+        if let Some(cache_key_s) = kernel.llvm_cache_key_s {
+            details.push(phase_detail(
+                format!("{} Cache Key", kernel.name),
+                format_phase_duration(Duration::from_secs_f64(cache_key_s)),
+                0,
+            ));
+        }
+        if let Some(llvm_s) = kernel.llvm_s {
+            details.push(phase_detail(
+                format!("{} LLVM", kernel.name),
+                format_phase_duration(Duration::from_secs_f64(llvm_s)),
+                0,
+            ));
+        }
+        if let Some(module_s) = kernel.llvm_module_build_s {
+            if module_s > 0.0 {
+                details.push(phase_detail(
+                    format!("{} Module", kernel.name),
+                    format_phase_duration(Duration::from_secs_f64(module_s)),
+                    0,
+                ));
+            }
+        }
+        if let Some(optimize_s) = kernel.llvm_optimization_s {
+            if optimize_s > 0.0 {
+                details.push(phase_detail(
+                    format!("{} Optimize", kernel.name),
+                    format_phase_duration(Duration::from_secs_f64(optimize_s)),
+                    0,
+                ));
+            }
+        }
+        if let Some(emit_s) = kernel.llvm_object_emit_s {
+            if emit_s > 0.0 {
+                details.push(phase_detail(
+                    format!("{} Object Emit", kernel.name),
+                    format_phase_duration(Duration::from_secs_f64(emit_s)),
+                    0,
+                ));
+            }
+        }
+        if let Some(fingerprint_s) = kernel.llvm_ir_fingerprint_s {
+            if fingerprint_s > 0.0 {
+                details.push(phase_detail(
+                    format!("{} IR Fingerprint", kernel.name),
+                    format_phase_duration(Duration::from_secs_f64(fingerprint_s)),
+                    0,
+                ));
+            }
+        }
+        if let Some(context_s) = kernel.context_s {
+            details.push(phase_detail(
+                format!("{} Context", kernel.name),
+                format_phase_duration(Duration::from_secs_f64(context_s)),
+                0,
+            ));
+        }
+        if let Some(check_s) = kernel.llvm_cache_check_s {
+            if check_s > 0.0 {
+                details.push(phase_detail(
+                    format!("{} Cache Check", kernel.name),
+                    format_phase_duration(Duration::from_secs_f64(check_s)),
+                    0,
+                ));
+            }
+        }
+        if let Some(read_s) = kernel.llvm_cache_read_s {
+            if read_s > 0.0 {
+                details.push(phase_detail(
+                    format!("{} Cache Read", kernel.name),
+                    format_phase_duration(Duration::from_secs_f64(read_s)),
+                    0,
+                ));
+            }
+        }
+        if let Some(write_s) = kernel.llvm_cache_write_s {
+            if write_s > 0.0 {
+                details.push(phase_detail(
+                    format!("{} Cache Write", kernel.name),
+                    format_phase_duration(Duration::from_secs_f64(write_s)),
+                    0,
+                ));
+            }
+        }
+        if let Some(materialize_s) = kernel.llvm_cache_materialize_s {
+            if materialize_s > 0.0 {
+                details.push(phase_detail(
+                    format!("{} Materialize", kernel.name),
+                    format_phase_duration(Duration::from_secs_f64(materialize_s)),
+                    0,
+                ));
+            }
         }
     }
     details
@@ -3720,6 +4120,7 @@ pub fn compile_progress_info(
     compile_report: Option<CompileReportSummary>,
 ) -> CompileProgressInfo {
     let mut jit = jit_phase_details(stats, helper_kernel_count);
+    jit.extend(compile_report_jit_phase_details(compile_report.as_ref()));
     jit.extend(helper_compile_phase_details(helper_stats));
     jit.extend(llvm_cache_phase_details(
         compile_report.as_ref(),
@@ -3961,7 +4362,7 @@ pub fn default_solver_profile() -> SolverProfile {
 
 fn strict_ocp_solver_profile_defaults() -> SolverProfileDefaults {
     SolverProfileDefaults {
-        max_iters: 200,
+        max_iters: 2000,
         overall_tol: 1.0e-8,
         dual_tol: 1.0e-6,
         constraint_tol: 1.0e-8,
@@ -4150,7 +4551,7 @@ where
     {
         emit_symbolic_setup_status(&mut self.emit);
         let mut on_symbolic_ready = |update: CompileProgressUpdate| {
-            emit_solve_status(
+            emit_compile_status(
                 &mut self.emit,
                 SolveStage::JitCompilation,
                 None,
@@ -4158,6 +4559,7 @@ where
                     .with_backend_timing(update.timing)
                     .with_compile_cached(update.compile_cached)
                     .with_phase_details(update.phase_details),
+                None,
             );
         };
         compile(&mut on_symbolic_ready)
@@ -4177,6 +4579,16 @@ where
             .with_backend_timing(progress.timing)
             .with_compile_cached(progress.compile_cached)
             .with_phase_details(progress.phase_details);
+        emit_compile_status(
+            &mut self.emit,
+            SolveStage::JitCompilation,
+            None,
+            SolverReport::in_progress("JIT ready.")
+                .with_backend_timing(progress.timing)
+                .with_compile_cached(progress.compile_cached)
+                .with_phase_details(running_solver.phase_details.clone()),
+            progress.compile_report.clone(),
+        );
         Ok((compiled, running_solver, progress.compile_report))
     }
 
@@ -4187,7 +4599,7 @@ where
         ) -> Result<(Compiled, CompileProgressInfo)>,
     {
         let (_, progress) = self.compile_progress(compile)?;
-        emit_solve_status(
+        emit_compile_status(
             &mut self.emit,
             SolveStage::JitCompilation,
             None,
@@ -4195,6 +4607,7 @@ where
                 .with_backend_timing(progress.timing)
                 .with_compile_cached(progress.compile_cached)
                 .with_phase_details(progress.phase_details),
+            progress.compile_report,
         );
         Ok(())
     }
@@ -6975,6 +7388,10 @@ pub trait MultipleShootingCompiled: CompiledOcpMetadata {
         options: &InteriorPointOptions,
     ) -> Result<MultipleShootingInteriorPointSolveResult<Self::XNum, Self::UNum, Self::GNum>>;
 
+    #[expect(
+        dead_code,
+        reason = "Retained as the non-canceling callback variant of the NLIP trait API."
+    )]
     fn run_nlip_with_callback<CB>(
         &self,
         values: &MultipleShootingRuntimeValues<
@@ -6992,6 +7409,26 @@ pub trait MultipleShootingCompiled: CompiledOcpMetadata {
     ) -> Result<MultipleShootingInteriorPointSolveResult<Self::XNum, Self::UNum, Self::GNum>>
     where
         CB: FnMut(&MultipleShootingInteriorPointSnapshot<Self::XNum, Self::UNum, Self::GNum>);
+
+    fn run_nlip_with_control_callback<CB>(
+        &self,
+        values: &MultipleShootingRuntimeValues<
+            Self::PNum,
+            Self::CBounds,
+            Self::BeqNum,
+            Self::BineqBounds,
+            Self::XNum,
+            Self::UNum,
+            Self::GNum,
+            Self::GBounds,
+        >,
+        options: &InteriorPointOptions,
+        callback: CB,
+    ) -> Result<MultipleShootingInteriorPointSolveResult<Self::XNum, Self::UNum, Self::GNum>>
+    where
+        CB: FnMut(
+            &MultipleShootingInteriorPointSnapshot<Self::XNum, Self::UNum, Self::GNum>,
+        ) -> bool;
 
     #[cfg(feature = "ipopt")]
     fn run_ipopt(
@@ -7144,6 +7581,10 @@ pub trait DirectCollocationCompiled: CompiledOcpMetadata {
         options: &InteriorPointOptions,
     ) -> Result<DirectCollocationInteriorPointSolveResult<Self::XNum, Self::UNum, Self::GNum>>;
 
+    #[expect(
+        dead_code,
+        reason = "Retained as the non-canceling callback variant of the NLIP trait API."
+    )]
     fn run_nlip_with_callback<CB>(
         &self,
         values: &DirectCollocationRuntimeValues<
@@ -7161,6 +7602,26 @@ pub trait DirectCollocationCompiled: CompiledOcpMetadata {
     ) -> Result<DirectCollocationInteriorPointSolveResult<Self::XNum, Self::UNum, Self::GNum>>
     where
         CB: FnMut(&DirectCollocationInteriorPointSnapshot<Self::XNum, Self::UNum, Self::GNum>);
+
+    fn run_nlip_with_control_callback<CB>(
+        &self,
+        values: &DirectCollocationRuntimeValues<
+            Self::PNum,
+            Self::CBounds,
+            Self::BeqNum,
+            Self::BineqBounds,
+            Self::XNum,
+            Self::UNum,
+            Self::GNum,
+            Self::GBounds,
+        >,
+        options: &InteriorPointOptions,
+        callback: CB,
+    ) -> Result<DirectCollocationInteriorPointSolveResult<Self::XNum, Self::UNum, Self::GNum>>
+    where
+        CB: FnMut(
+            &DirectCollocationInteriorPointSnapshot<Self::XNum, Self::UNum, Self::GNum>,
+        ) -> bool;
 
     #[cfg(feature = "ipopt")]
     fn run_ipopt(
@@ -7410,6 +7871,35 @@ where
         CB: FnMut(&MultipleShootingInteriorPointSnapshot<Self::XNum, Self::UNum, Self::GNum>),
     {
         ocp_runtime::CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, G>::solve_interior_point_with_callback(
+            self,
+            values,
+            options,
+            callback,
+        )
+        .map_err(Into::into)
+    }
+
+    fn run_nlip_with_control_callback<CB>(
+        &self,
+        values: &MultipleShootingRuntimeValues<
+            Self::PNum,
+            Self::CBounds,
+            Self::BeqNum,
+            Self::BineqBounds,
+            Self::XNum,
+            Self::UNum,
+            Self::GNum,
+            Self::GBounds,
+        >,
+        options: &InteriorPointOptions,
+        callback: CB,
+    ) -> Result<MultipleShootingInteriorPointSolveResult<Self::XNum, Self::UNum, Self::GNum>>
+    where
+        CB: FnMut(
+            &MultipleShootingInteriorPointSnapshot<Self::XNum, Self::UNum, Self::GNum>,
+        ) -> bool,
+    {
+        ocp_runtime::CompiledMultipleShootingOcp::<X, U, P, C, Beq, Bineq, G>::solve_interior_point_with_control_callback(
             self,
             values,
             options,
@@ -7727,6 +8217,35 @@ where
         .map_err(Into::into)
     }
 
+    fn run_nlip_with_control_callback<CB>(
+        &self,
+        values: &DirectCollocationRuntimeValues<
+            Self::PNum,
+            Self::CBounds,
+            Self::BeqNum,
+            Self::BineqBounds,
+            Self::XNum,
+            Self::UNum,
+            Self::GNum,
+            Self::GBounds,
+        >,
+        options: &InteriorPointOptions,
+        callback: CB,
+    ) -> Result<DirectCollocationInteriorPointSolveResult<Self::XNum, Self::UNum, Self::GNum>>
+    where
+        CB: FnMut(
+            &DirectCollocationInteriorPointSnapshot<Self::XNum, Self::UNum, Self::GNum>,
+        ) -> bool,
+    {
+        ocp_runtime::CompiledDirectCollocationOcp::<X, U, P, C, Beq, Bineq, G>::solve_interior_point_with_control_callback(
+            self,
+            values,
+            options,
+            callback,
+        )
+        .map_err(Into::into)
+    }
+
     #[cfg(feature = "ipopt")]
     fn run_ipopt(
         &self,
@@ -8009,6 +8528,7 @@ where
                         stage: SolveStage::Solving,
                         solver_method: Some(solver_method),
                         solver: running_solver.clone().with_solve_seconds(0.0),
+                        compile_report: None,
                     },
                 },
             );
@@ -8111,6 +8631,7 @@ where
                         stage: SolveStage::Solving,
                         solver_method: Some(solver_method),
                         solver: running_solver.clone().with_solve_seconds(0.0),
+                        compile_report: None,
                     },
                 },
             );
@@ -8124,44 +8645,53 @@ where
                 |submit| {
                     let build_for_callback = build_artifact.clone();
                     let options_for_callback = options.clone();
-                    compiled.run_nlip_with_callback(
+                    compiled.run_nlip_with_control_callback(
                         runtime,
                         &options_for_callback,
-                        move |snapshot| match compiled
-                            .build_interval_arcs(&snapshot.trajectories, &runtime.parameters)
-                        {
-                            Ok((x_arcs, u_arcs)) => {
-                                let mut builder = build_for_callback
-                                    .lock()
-                                    .expect("artifact builder poisoned");
-                                let mut artifact =
-                                    (*builder)(&snapshot.trajectories, &x_arcs, &u_arcs);
-                                drop(builder);
-                                let progress = nlip_progress(&snapshot.solver);
-                                artifact.solver = running_solver_for_callback
-                                    .clone()
-                                    .with_iterations(progress.iteration)
-                                    .with_solve_seconds(solve_started.elapsed().as_secs_f64());
-                                if let Err(error) = try_attach_multiple_shooting_constraint_panels(
-                                    &mut artifact,
-                                    compiled,
-                                    runtime,
-                                    &snapshot.trajectories,
-                                    solver_config.constraint_tol,
-                                ) {
-                                    submit.submit(SolveStreamEvent::Log {
-                                        line: format!(
-                                            "[constraint violation report failed: {error}]"
-                                        ),
-                                        level: SolveLogLevel::Info,
-                                    });
-                                }
-                                submit.submit(SolveStreamEvent::Iteration { progress, artifact });
+                        move |snapshot| {
+                            if !crate::solve_should_continue() {
+                                return false;
                             }
-                            Err(error) => submit.submit(SolveStreamEvent::Log {
-                                line: format!("[iteration visualization failed: {error}]"),
-                                level: SolveLogLevel::Info,
-                            }),
+                            match compiled
+                                .build_interval_arcs(&snapshot.trajectories, &runtime.parameters)
+                            {
+                                Ok((x_arcs, u_arcs)) => {
+                                    let mut builder = build_for_callback
+                                        .lock()
+                                        .expect("artifact builder poisoned");
+                                    let mut artifact =
+                                        (*builder)(&snapshot.trajectories, &x_arcs, &u_arcs);
+                                    drop(builder);
+                                    let progress = nlip_progress(&snapshot.solver);
+                                    artifact.solver = running_solver_for_callback
+                                        .clone()
+                                        .with_iterations(progress.iteration)
+                                        .with_solve_seconds(solve_started.elapsed().as_secs_f64());
+                                    if let Err(error) =
+                                        try_attach_multiple_shooting_constraint_panels(
+                                            &mut artifact,
+                                            compiled,
+                                            runtime,
+                                            &snapshot.trajectories,
+                                            solver_config.constraint_tol,
+                                        )
+                                    {
+                                        submit.submit(SolveStreamEvent::Log {
+                                            line: format!(
+                                                "[constraint violation report failed: {error}]"
+                                            ),
+                                            level: SolveLogLevel::Info,
+                                        });
+                                    }
+                                    submit
+                                        .submit(SolveStreamEvent::Iteration { progress, artifact });
+                                }
+                                Err(error) => submit.submit(SolveStreamEvent::Log {
+                                    line: format!("[iteration visualization failed: {error}]"),
+                                    level: SolveLogLevel::Info,
+                                }),
+                            }
+                            crate::solve_should_continue()
                         },
                     )
                 },
@@ -8214,6 +8744,7 @@ where
                         stage: SolveStage::Solving,
                         solver_method: Some(solver_method),
                         solver: running_solver.clone().with_solve_seconds(0.0),
+                        compile_report: None,
                     },
                 },
             );
@@ -8496,6 +9027,7 @@ where
                         stage: SolveStage::Solving,
                         solver_method: Some(solver_method),
                         solver: running_solver.clone().with_solve_seconds(0.0),
+                        compile_report: None,
                     },
                 },
             );
@@ -8586,6 +9118,7 @@ where
                         stage: SolveStage::Solving,
                         solver_method: Some(solver_method),
                         solver: running_solver.clone().with_solve_seconds(0.0),
+                        compile_report: None,
                     },
                 },
             );
@@ -8599,10 +9132,13 @@ where
                 |submit| {
                     let build_for_callback = build_artifact.clone();
                     let options_for_callback = options.clone();
-                    compiled.run_nlip_with_callback(
+                    compiled.run_nlip_with_control_callback(
                         runtime,
                         &options_for_callback,
                         move |snapshot| {
+                            if !crate::solve_should_continue() {
+                                return false;
+                            }
                             let mut artifact = {
                                 let mut builder = build_for_callback
                                     .lock()
@@ -8627,6 +9163,7 @@ where
                                 });
                             }
                             submit.submit(SolveStreamEvent::Iteration { progress, artifact });
+                            crate::solve_should_continue()
                         },
                     )
                 },
@@ -8677,6 +9214,7 @@ where
                         stage: SolveStage::Solving,
                         solver_method: Some(solver_method),
                         solver: running_solver.clone().with_solve_seconds(0.0),
+                        compile_report: None,
                     },
                 },
             );
@@ -8816,6 +9354,11 @@ pub fn sqp_progress(snapshot: &SqpIterationSnapshot) -> SolveProgress {
             .line_search
             .as_ref()
             .map(|info| info.accepted_alpha),
+        alpha_pr: snapshot
+            .line_search
+            .as_ref()
+            .map(|info| info.accepted_alpha),
+        alpha_du: None,
         line_search_iterations: snapshot
             .line_search
             .as_ref()
@@ -8881,6 +9424,8 @@ pub fn nlip_progress(snapshot: &InteriorPointIterationSnapshot) -> SolveProgress
         step_inf: snapshot.step_inf,
         penalty: snapshot.barrier_parameter.unwrap_or(0.0),
         alpha: snapshot.alpha,
+        alpha_pr: snapshot.alpha_pr.or(snapshot.alpha),
+        alpha_du: snapshot.alpha_du,
         line_search_iterations: snapshot.line_search_iterations.map(|value| value as usize),
         filter: snapshot.filter.as_ref().map(|filter| SolveFilterInfo {
             current: SolveFilterPoint {
@@ -8924,6 +9469,8 @@ pub fn ipopt_progress(snapshot: &optimization::IpoptIterationSnapshot) -> SolveP
         step_inf: Some(snapshot.step_inf),
         penalty: snapshot.barrier_parameter,
         alpha: Some(snapshot.alpha_pr),
+        alpha_pr: Some(snapshot.alpha_pr),
+        alpha_du: Some(snapshot.alpha_du),
         line_search_iterations: Some(snapshot.line_search_trials as usize),
         filter: None,
         trust_region: None,
@@ -9023,6 +9570,10 @@ pub fn sqp_solver_report(
         status_label: sqp_termination_label(summary),
         status_kind: sqp_status_kind(summary),
         iterations: Some(summary.iterations),
+        symbolic_build_s: duration_seconds(summary.profiling.backend_timing.function_creation_time),
+        symbolic_derivatives_s: duration_seconds(
+            summary.profiling.backend_timing.derivative_generation_time,
+        ),
         symbolic_setup_s: symbolic_setup_seconds(summary.profiling.backend_timing),
         jit_s: duration_seconds(summary.profiling.backend_timing.jit_time),
         solve_s: Some(summary.profiling.total_time.as_secs_f64()),
@@ -9047,6 +9598,10 @@ pub fn nlip_solver_report(
         status_label: nlip_termination_label(summary),
         status_kind: nlip_status_kind(summary),
         iterations: Some(summary.iterations),
+        symbolic_build_s: duration_seconds(summary.profiling.backend_timing.function_creation_time),
+        symbolic_derivatives_s: duration_seconds(
+            summary.profiling.backend_timing.derivative_generation_time,
+        ),
         symbolic_setup_s: symbolic_setup_seconds(summary.profiling.backend_timing),
         jit_s: duration_seconds(summary.profiling.backend_timing.jit_time),
         solve_s: Some(summary.profiling.total_time.as_secs_f64()),
@@ -9069,6 +9624,10 @@ pub fn ipopt_solver_report(summary: &IpoptSummary, options: &IpoptOptions) -> So
         status_label: ipopt_status_label(summary.status),
         status_kind: ipopt_status_kind(summary.status),
         iterations: Some(summary.iterations),
+        symbolic_build_s: duration_seconds(summary.profiling.backend_timing.function_creation_time),
+        symbolic_derivatives_s: duration_seconds(
+            summary.profiling.backend_timing.derivative_generation_time,
+        ),
         symbolic_setup_s: symbolic_setup_seconds(summary.profiling.backend_timing),
         jit_s: duration_seconds(summary.profiling.backend_timing.jit_time),
         solve_s: Some(summary.profiling.total_time.as_secs_f64()),
@@ -9517,6 +10076,10 @@ fn merge_failure_solver_report(
 ) -> SolverReport {
     let mut phase_details = fallback.phase_details.clone();
     phase_details.solve = solve_details;
+    report.symbolic_build_s = report.symbolic_build_s.or(fallback.symbolic_build_s);
+    report.symbolic_derivatives_s = report
+        .symbolic_derivatives_s
+        .or(fallback.symbolic_derivatives_s);
     report.symbolic_setup_s = report.symbolic_setup_s.or(fallback.symbolic_setup_s);
     report.jit_s = report.jit_s.or(fallback.jit_s);
     report.solve_s = report.solve_s.or(fallback.solve_s);
@@ -9569,6 +10132,12 @@ pub fn sqp_failure_solver_report(
                 .final_state
                 .as_ref()
                 .map(|state| state.iteration as usize),
+            symbolic_build_s: duration_seconds(
+                context.profiling.backend_timing.function_creation_time,
+            ),
+            symbolic_derivatives_s: duration_seconds(
+                context.profiling.backend_timing.derivative_generation_time,
+            ),
             symbolic_setup_s: symbolic_setup_seconds(context.profiling.backend_timing),
             jit_s: duration_seconds(context.profiling.backend_timing.jit_time),
             solve_s: Some(context.profiling.total_time.as_secs_f64()),
@@ -9708,6 +10277,10 @@ pub fn nlip_failure_solver_report(
             status_label,
             status_kind: SolverStatusKind::Error,
             iterations,
+            symbolic_build_s: duration_seconds(profiling.backend_timing.function_creation_time),
+            symbolic_derivatives_s: duration_seconds(
+                profiling.backend_timing.derivative_generation_time,
+            ),
             symbolic_setup_s: symbolic_setup_seconds(profiling.backend_timing),
             jit_s: duration_seconds(profiling.backend_timing.jit_time),
             solve_s: Some(profiling.total_time.as_secs_f64()),
@@ -9750,6 +10323,10 @@ pub fn ipopt_failure_solver_report(
             status_label,
             status_kind: SolverStatusKind::Error,
             iterations,
+            symbolic_build_s: duration_seconds(profiling.backend_timing.function_creation_time),
+            symbolic_derivatives_s: duration_seconds(
+                profiling.backend_timing.derivative_generation_time,
+            ),
             symbolic_setup_s: symbolic_setup_seconds(profiling.backend_timing),
             jit_s: duration_seconds(profiling.backend_timing.jit_time),
             solve_s: Some(profiling.total_time.as_secs_f64()),
@@ -10296,6 +10873,7 @@ mod tests {
                     stage: SolveStage::SymbolicSetup,
                     solver_method: None,
                     solver: SolverReport::in_progress("Setting up symbolic model..."),
+                    compile_report: None,
                 },
             },
             SolveStreamEvent::Status {
@@ -10304,6 +10882,7 @@ mod tests {
                     solver_method: None,
                     solver: SolverReport::in_progress("Compiling JIT...")
                         .with_backend_timing(symbolic_timing),
+                    compile_report: None,
                 },
             },
             SolveStreamEvent::Status {
@@ -10313,6 +10892,7 @@ mod tests {
                     solver: SolverReport::in_progress("Running SQP...")
                         .with_backend_timing(symbolic_timing)
                         .with_solve_seconds(0.0),
+                    compile_report: None,
                 },
             },
         ];
@@ -10478,10 +11058,10 @@ mod tests {
         assert!(max_iters.max > max_iters.default);
 
         let mut values = BTreeMap::new();
-        values.insert("solver_max_iters".to_string(), 1000.0);
+        values.insert("solver_max_iters".to_string(), 4000.0);
         let parsed = solver_config_from_map(&values, default_solver_config())
             .expect("solver config should parse");
-        assert_eq!(parsed.max_iters, 1000);
+        assert_eq!(parsed.max_iters, 4000);
     }
 
     #[test]
@@ -10508,7 +11088,7 @@ mod tests {
             vec![
                 ControlProfileDefault {
                     profile: solver_profile_value(SolverProfile::StrictOcp),
-                    value: 200.0,
+                    value: 2000.0,
                 },
                 ControlProfileDefault {
                     profile: solver_profile_value(SolverProfile::IpoptDefault),
@@ -10594,7 +11174,7 @@ mod tests {
     #[test]
     fn default_ipopt_options_select_spral_explicitly() {
         let options = ipopt_options(&default_solver_config());
-        assert_eq!(options.max_iters, 200);
+        assert_eq!(options.max_iters, 2000);
         assert_eq!(options.tol, 1.0e-8);
         assert_eq!(options.dual_tol, Some(1.0e-6));
         assert_eq!(options.constraint_tol, Some(1.0e-8));
@@ -10808,6 +11388,8 @@ mod tests {
         assert!(report.completed);
         assert_eq!(report.status_kind, SolverStatusKind::Error);
         assert_eq!(report.status_label, "Failed: line search");
+        assert_eq!(report.symbolic_build_s, Some(0.15));
+        assert_eq!(report.symbolic_derivatives_s, Some(0.25));
         assert_eq!(report.symbolic_setup_s, Some(0.4));
         assert_eq!(report.jit_s, Some(0.5));
         assert_eq!(report.solve_s, Some(0.321));

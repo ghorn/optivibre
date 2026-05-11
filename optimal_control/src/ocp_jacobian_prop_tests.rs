@@ -1325,6 +1325,7 @@ fn preserved_call_multiple_shooting_integrator_wrapper_identity_jacobian_is_fixe
             constant_column(&u_const),
             constant_column(&dudt_const),
             constant_column(&()),
+            constant_column(&FinalTime { tf: 0.5 }),
             SXMatrix::dense_column(vec![SX::from(0.5)]).expect("dt column should build"),
         ])
         .expect("integrator wrapper call should build");
@@ -1468,6 +1469,7 @@ fn diagnose_preserved_call_multiple_shooting_integrator_wrapper_jacobian_structu
                 u1: sample(&case, 1),
             }),
             constant_column(&()),
+            constant_column(&FinalTime { tf: 0.5 }),
             SXMatrix::dense_column(vec![SX::from(0.5)]).expect("dt column should build"),
         ])
         .expect("integrator wrapper call should build");
@@ -1505,6 +1507,7 @@ fn diagnose_preserved_call_multiple_shooting_integrator_wrapper_forward_path() {
                 u1: sample(&case, 1),
             }),
             constant_column(&()),
+            constant_column(&FinalTime { tf: 0.5 }),
             SXMatrix::dense_column(vec![SX::from(0.5)]).expect("dt column should build"),
         ])
         .expect("integrator wrapper call should build");

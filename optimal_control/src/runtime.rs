@@ -1305,6 +1305,7 @@ where
                 let u = symbolic_value::<U>("u")?;
                 let dudt = symbolic_value::<U>("dudt")?;
                 let p = symbolic_value::<P>("p")?;
+                let g = symbolic_value::<G>("g")?;
                 let dt = SX::sym("dt");
                 let (x_next, u_next, objective) = rk4_integrate_symbolic(
                     &x,
@@ -1314,7 +1315,9 @@ where
                     self.scheme.rk4_substeps,
                     |x_eval, u_eval| self.eval_ode_symbolic(&library, x_eval, u_eval, &p),
                     |x_eval, u_eval| {
-                        self.eval_objective_lagrange_symbolic(&library, x_eval, u_eval, &dudt, &p)
+                        self.eval_objective_lagrange_symbolic(
+                            &library, x_eval, u_eval, &dudt, &p, &g,
+                        )
                     },
                 )?;
                 SXFunction::new(
@@ -1324,6 +1327,7 @@ where
                         NamedMatrix::new("u", symbolic_column(&u)?)?,
                         NamedMatrix::new("dudt", symbolic_column(&dudt)?)?,
                         NamedMatrix::new("p", symbolic_column(&p)?)?,
+                        NamedMatrix::new("g", symbolic_column(&g)?)?,
                         NamedMatrix::new("dt", SXMatrix::dense_column(vec![dt])?)?,
                     ],
                     vec![
@@ -1343,6 +1347,7 @@ where
         u: &U,
         dudt: &U,
         parameters: &P,
+        global: &G,
         dt: SX,
     ) -> Result<(X, U, SX), SxError> {
         match &library.multiple_shooting_integrator {
@@ -1352,6 +1357,7 @@ where
                     symbolic_column(u)?,
                     symbolic_column(dudt)?,
                     symbolic_column(parameters)?,
+                    symbolic_column(global)?,
                     SXMatrix::dense_column(vec![dt])?,
                 ])?;
                 Ok((
@@ -1368,7 +1374,9 @@ where
                 self.scheme.rk4_substeps,
                 |x_eval, u_eval| self.eval_ode_symbolic(library, x_eval, u_eval, parameters),
                 |x_eval, u_eval| {
-                    self.eval_objective_lagrange_symbolic(library, x_eval, u_eval, dudt, parameters)
+                    self.eval_objective_lagrange_symbolic(
+                        library, x_eval, u_eval, dudt, parameters, global,
+                    )
                 },
             ),
         }
@@ -1419,6 +1427,7 @@ where
                 u_start,
                 dudt_interval,
                 parameters,
+                global,
                 step,
             )?;
             objective += q_end;
@@ -1530,6 +1539,7 @@ where
             ));
         }
 
+        let symbolic_construction_started = Instant::now();
         let symbolic_library = self.build_runtime_multiple_shooting_symbolic_function_library(
             options.symbolic_functions,
         )?;
@@ -1586,6 +1596,19 @@ where
             .chain(outputs.path.iter())
             .copied()
             .collect::<Vec<_>>();
+        let symbolic = symbolic_nlp_dynamic(
+            self.name.clone(),
+            decision_matrix,
+            parameter_matrix,
+            outputs.objective,
+            (!outputs.equalities.is_empty())
+                .then(|| SXMatrix::dense_column(outputs.equalities.clone()))
+                .transpose()?,
+            (!inequalities.is_empty())
+                .then(|| SXMatrix::dense_column(inequalities))
+                .transpose()?,
+        )?
+        .with_construction_time(symbolic_construction_started.elapsed());
         let promotion_plan = build_promotion_plan_flat(
             &decision_symbols,
             &outputs.boundary_eq_residual,
@@ -1601,19 +1624,6 @@ where
         if let Some(function) = &promotion_offsets.function {
             helper_compile_stats.record_compile_report(function.function.compile_report());
         }
-
-        let symbolic = symbolic_nlp_dynamic(
-            self.name.clone(),
-            decision_matrix,
-            parameter_matrix,
-            outputs.objective,
-            (!outputs.equalities.is_empty())
-                .then(|| SXMatrix::dense_column(outputs.equalities.clone()))
-                .transpose()?,
-            (!inequalities.is_empty())
-                .then(|| SXMatrix::dense_column(inequalities))
-                .transpose()?,
-        )?;
         let compiled = symbolic.compile_jit_with_compile_options_and_symbolic_progress_callback(
             SymbolicNlpCompileOptions {
                 function_options: options.function_options,
@@ -1709,7 +1719,10 @@ where
                 multiple_shooting_arc_helper_total_instructions: Some(arc_total_instructions),
                 llvm_cache_hits: helper_compile_stats.llvm_cache_hits,
                 llvm_cache_misses: helper_compile_stats.llvm_cache_misses,
+                llvm_cache_check_time: helper_compile_stats.llvm_cache_check_time,
+                llvm_cache_read_time: helper_compile_stats.llvm_cache_read_time,
                 llvm_cache_load_time: helper_compile_stats.llvm_cache_load_time,
+                llvm_cache_materialize_time: helper_compile_stats.llvm_cache_materialize_time,
             },
             _marker: PhantomData,
         })
@@ -2183,6 +2196,35 @@ where
     where
         CB: FnMut(&MultipleShootingInteriorPointSnapshot<Numeric<X>, Numeric<U>, Numeric<G>>),
     {
+        self.solve_interior_point_with_control_callback(values, options, |snapshot| {
+            callback(snapshot);
+            true
+        })
+    }
+
+    pub fn solve_interior_point_with_control_callback<CB>(
+        &self,
+        values: &MultipleShootingRuntimeValues<
+            Numeric<P>,
+            BoundTemplate<C>,
+            Numeric<Beq>,
+            BoundTemplate<Bineq>,
+            Numeric<X>,
+            Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
+        >,
+        options: &InteriorPointOptions,
+        mut callback: CB,
+    ) -> Result<
+        MultipleShootingInteriorPointSolveResult<Numeric<X>, Numeric<U>, Numeric<G>>,
+        InteriorPointSolveError,
+    >
+    where
+        CB: FnMut(
+            &MultipleShootingInteriorPointSnapshot<Numeric<X>, Numeric<U>, Numeric<G>>,
+        ) -> bool,
+    {
         let initial_guess_started = Instant::now();
         let x0 = self
             .build_initial_guess(values)
@@ -2194,7 +2236,7 @@ where
             .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
         let runtime_bounds_time = runtime_bounds_started.elapsed();
         let runtime_params = self.runtime_parameters(&values.parameters, &values.beq);
-        let summary = self.compiled.solve_interior_point_with_callback(
+        let summary = self.compiled.solve_interior_point_with_control_callback(
             &x0,
             runtime_params.as_deref(),
             &bounds,
@@ -2210,7 +2252,7 @@ where
                     },
                     trajectories,
                     solver: snapshot.clone(),
-                });
+                })
             },
         )?;
         let trajectories = project_multiple_shooting::<X, U, G>(&summary.x, self.scheme.intervals)
@@ -3015,6 +3057,7 @@ where
                         &root_u.intervals[interval][root],
                         &root_dudt.intervals[interval][root],
                         parameters,
+                        global,
                     )?;
             }
             let x_end = weighted_sum_vectorized(&basis_x, &coeffs.d_vector)?;
@@ -3121,6 +3164,7 @@ where
             ));
         }
         validate_time_grid(self.scheme.time_grid)?;
+        let symbolic_construction_started = Instant::now();
         let coefficients = collocation_coefficients(self.scheme.family, self.scheme.order)?;
         let symbolic_library = self.build_symbolic_function_library(options.symbolic_functions)?;
         let decision_symbols = symbolic_dense_vector(
@@ -3193,6 +3237,19 @@ where
             .chain(outputs.path.iter())
             .copied()
             .collect::<Vec<_>>();
+        let symbolic = symbolic_nlp_dynamic(
+            self.name.clone(),
+            decision_matrix,
+            parameter_matrix,
+            outputs.objective,
+            (!outputs.equalities.is_empty())
+                .then(|| SXMatrix::dense_column(outputs.equalities))
+                .transpose()?,
+            (!inequalities.is_empty())
+                .then(|| SXMatrix::dense_column(inequalities))
+                .transpose()?,
+        )?
+        .with_construction_time(symbolic_construction_started.elapsed());
         let promotion_plan = build_promotion_plan_flat(
             &decision_symbols,
             &outputs.boundary_eq_residual,
@@ -3208,18 +3265,6 @@ where
         if let Some(function) = &promotion_offsets.function {
             helper_compile_stats.record_compile_report(function.function.compile_report());
         }
-        let symbolic = symbolic_nlp_dynamic(
-            self.name.clone(),
-            decision_matrix,
-            parameter_matrix,
-            outputs.objective,
-            (!outputs.equalities.is_empty())
-                .then(|| SXMatrix::dense_column(outputs.equalities))
-                .transpose()?,
-            (!inequalities.is_empty())
-                .then(|| SXMatrix::dense_column(inequalities))
-                .transpose()?,
-        )?;
         let compiled = symbolic.compile_jit_with_compile_options_and_symbolic_progress_callback(
             SymbolicNlpCompileOptions {
                 function_options: options.function_options,
@@ -3288,7 +3333,10 @@ where
                 multiple_shooting_arc_helper_total_instructions: None,
                 llvm_cache_hits: helper_compile_stats.llvm_cache_hits,
                 llvm_cache_misses: helper_compile_stats.llvm_cache_misses,
+                llvm_cache_check_time: helper_compile_stats.llvm_cache_check_time,
+                llvm_cache_read_time: helper_compile_stats.llvm_cache_read_time,
                 llvm_cache_load_time: helper_compile_stats.llvm_cache_load_time,
+                llvm_cache_materialize_time: helper_compile_stats.llvm_cache_materialize_time,
             },
             _marker: PhantomData,
         })
@@ -3645,6 +3693,35 @@ where
     where
         CB: FnMut(&DirectCollocationInteriorPointSnapshot<Numeric<X>, Numeric<U>, Numeric<G>>),
     {
+        self.solve_interior_point_with_control_callback(values, options, |snapshot| {
+            callback(snapshot);
+            true
+        })
+    }
+
+    pub fn solve_interior_point_with_control_callback<CB>(
+        &self,
+        values: &DirectCollocationRuntimeValues<
+            Numeric<P>,
+            BoundTemplate<C>,
+            Numeric<Beq>,
+            BoundTemplate<Bineq>,
+            Numeric<X>,
+            Numeric<U>,
+            Numeric<G>,
+            BoundTemplate<G>,
+        >,
+        options: &InteriorPointOptions,
+        mut callback: CB,
+    ) -> Result<
+        DirectCollocationInteriorPointSolveResult<Numeric<X>, Numeric<U>, Numeric<G>>,
+        InteriorPointSolveError,
+    >
+    where
+        CB: FnMut(
+            &DirectCollocationInteriorPointSnapshot<Numeric<X>, Numeric<U>, Numeric<G>>,
+        ) -> bool,
+    {
         let initial_guess_started = Instant::now();
         let x0 = self
             .build_initial_guess(values)
@@ -3656,7 +3733,7 @@ where
             .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
         let runtime_bounds_time = runtime_bounds_started.elapsed();
         let runtime_params = self.runtime_parameters(&values.parameters, &values.beq);
-        let summary = self.compiled.solve_interior_point_with_callback(
+        let summary = self.compiled.solve_interior_point_with_control_callback(
             &x0,
             runtime_params.as_deref(),
             &bounds,
@@ -3673,7 +3750,7 @@ where
                     time_grid: self.time_grid_for_tf(trajectories.tf),
                     trajectories,
                     solver: snapshot.clone(),
-                });
+                })
             },
         )?;
         let trajectories = project_direct_collocation::<X, U, G>(

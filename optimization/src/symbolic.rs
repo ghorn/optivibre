@@ -14,7 +14,7 @@ use crate::{
     BackendCompileReport, BackendTimingMetadata, CCS, ClarabelSqpError, ClarabelSqpOptions,
     ClarabelSqpSummary, CompiledNlpProblem, FiniteDifferenceValidationOptions, Index,
     InteriorPointIterationSnapshot, InteriorPointOptions, InteriorPointSolveError,
-    InteriorPointSummary, NlpCompileStats, NlpConstraintViolationReport,
+    InteriorPointSummary, KernelCompileReport, NlpCompileStats, NlpConstraintViolationReport,
     NlpDerivativeValidationReport, NlpEqualityViolation, NlpEvaluationBenchmark,
     NlpEvaluationBenchmarkOptions, NlpEvaluationKernelKind, NlpInequalitySource,
     NlpInequalityViolation, ParameterMatrix, SqpAdapterTiming, SqpFailureContext,
@@ -22,7 +22,7 @@ use crate::{
     SymbolicCompileStageProgress, SymbolicSetupProfile, Vectorize,
     benchmark_compiled_nlp_problem_with_progress, classify_constraint_satisfaction,
     constraint_bound_side, flatten_optional_value, flatten_value, solve_nlp_interior_point,
-    solve_nlp_interior_point_with_callback, solve_nlp_sqp, solve_nlp_sqp_with_callback,
+    solve_nlp_interior_point_with_control_callback, solve_nlp_sqp, solve_nlp_sqp_with_callback,
     symbolic_column, symbolic_value, validate_compiled_nlp_problem_derivatives,
     worst_bound_violation,
 };
@@ -347,6 +347,7 @@ pub struct RuntimeBoundedJitNlp<'a> {
 struct JitKernel {
     function: CompiledJitFunction,
     context: Mutex<JitExecutionContext>,
+    context_creation_time: Duration,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -746,6 +747,13 @@ pub fn symbolic_nlp_dynamic(
     })
 }
 
+impl DynamicSymbolicNlp {
+    pub fn with_construction_time(mut self, construction_time: Duration) -> Self {
+        self.symbolic.construction_time = Some(construction_time);
+        self
+    }
+}
+
 impl CompiledJitNlp {
     fn compile_stats(&self) -> NlpCompileStats {
         NlpCompileStats {
@@ -853,21 +861,33 @@ impl CompiledJitNlp {
             setup_profile: functions.setup_profile.clone(),
             ..BackendCompileReport::default()
         };
-        absorb_kernel_compile_report(&mut backend_compile_report, &objective_value);
-        absorb_kernel_compile_report(&mut backend_compile_report, &objective_gradient);
+        absorb_kernel_compile_report(&mut backend_compile_report, "objective", &objective_value);
+        absorb_kernel_compile_report(
+            &mut backend_compile_report,
+            "objective_gradient",
+            &objective_gradient,
+        );
         if let Some(kernel) = &equality_values {
-            absorb_kernel_compile_report(&mut backend_compile_report, kernel);
+            absorb_kernel_compile_report(&mut backend_compile_report, "equality_values", kernel);
         }
         if let Some(kernel) = &equality_jacobian_values {
-            absorb_kernel_compile_report(&mut backend_compile_report, kernel);
+            absorb_kernel_compile_report(&mut backend_compile_report, "equality_jacobian", kernel);
         }
         if let Some(kernel) = &inequality_values {
-            absorb_kernel_compile_report(&mut backend_compile_report, kernel);
+            absorb_kernel_compile_report(&mut backend_compile_report, "inequality_values", kernel);
         }
         if let Some(kernel) = &inequality_jacobian_values {
-            absorb_kernel_compile_report(&mut backend_compile_report, kernel);
+            absorb_kernel_compile_report(
+                &mut backend_compile_report,
+                "inequality_jacobian",
+                kernel,
+            );
         }
-        absorb_kernel_compile_report(&mut backend_compile_report, &lagrangian_hessian_values);
+        absorb_kernel_compile_report(
+            &mut backend_compile_report,
+            "lagrangian_hessian",
+            &lagrangian_hessian_values,
+        );
 
         Ok(Self {
             dimension: symbolic.variables.nnz(),
@@ -1382,6 +1402,32 @@ impl DynamicCompiledJitNlp {
     where
         CB: FnMut(&InteriorPointIterationSnapshot),
     {
+        let mut callback = callback;
+        self.solve_interior_point_with_control_callback(
+            x0,
+            parameters,
+            bounds,
+            scaling,
+            options,
+            |snapshot| {
+                callback(snapshot);
+                true
+            },
+        )
+    }
+
+    pub fn solve_interior_point_with_control_callback<CB>(
+        &self,
+        x0: &[f64],
+        parameters: Option<&[f64]>,
+        bounds: &RuntimeNlpBounds,
+        scaling: Option<&RuntimeNlpScaling>,
+        options: &InteriorPointOptions,
+        callback: CB,
+    ) -> Result<InteriorPointSummary, InteriorPointSolveError>
+    where
+        CB: FnMut(&InteriorPointIterationSnapshot) -> bool,
+    {
         let projection_started = Instant::now();
         let bound_problem = self
             .bind_runtime_bounds(bounds)
@@ -1401,7 +1447,7 @@ impl DynamicCompiledJitNlp {
                 scaling: scaling.clone(),
             };
             let mut callback = callback;
-            solve_nlp_interior_point_with_callback(
+            solve_nlp_interior_point_with_control_callback(
                 &scaled_problem,
                 &x0_values,
                 &parameter_storage,
@@ -1410,7 +1456,7 @@ impl DynamicCompiledJitNlp {
             )
             .map(|summary| scaling.transform_interior_point_summary(&summary))
         } else {
-            solve_nlp_interior_point_with_callback(
+            solve_nlp_interior_point_with_control_callback(
                 &bound_problem,
                 &x0_values,
                 &parameter_storage,
@@ -2233,6 +2279,30 @@ where
     where
         CB: FnMut(&InteriorPointIterationSnapshot),
     {
+        let mut callback = callback;
+        self.solve_interior_point_with_control_callback(
+            x0,
+            parameters,
+            bounds,
+            options,
+            |snapshot| {
+                callback(snapshot);
+                true
+            },
+        )
+    }
+
+    pub fn solve_interior_point_with_control_callback<CB>(
+        &self,
+        x0: &<X as Vectorize<SX>>::Rebind<f64>,
+        parameters: &<P as Vectorize<SX>>::Rebind<f64>,
+        bounds: &TypedRuntimeNlpBounds<X, I>,
+        options: &InteriorPointOptions,
+        callback: CB,
+    ) -> Result<InteriorPointSummary, InteriorPointSolveError>
+    where
+        CB: FnMut(&InteriorPointIterationSnapshot) -> bool,
+    {
         let projection_started = Instant::now();
         let bound_problem = self
             .bind_runtime_bounds(bounds)
@@ -2251,7 +2321,7 @@ where
                 scaling: scaling.clone(),
             };
             let mut callback = callback;
-            solve_nlp_interior_point_with_callback(
+            solve_nlp_interior_point_with_control_callback(
                 &scaled_problem,
                 &x0_values,
                 &parameter_storage,
@@ -2260,7 +2330,7 @@ where
             )
             .map(|summary| scaling.transform_interior_point_summary(&summary))
         } else {
-            solve_nlp_interior_point_with_callback(
+            solve_nlp_interior_point_with_control_callback(
                 &bound_problem,
                 &x0_values,
                 &parameter_storage,
@@ -2514,13 +2584,45 @@ fn add_duration(total: &mut Option<Duration>, elapsed: Duration) {
     *total = Some(total.unwrap_or_default() + elapsed);
 }
 
-fn absorb_kernel_compile_report(report: &mut BackendCompileReport, kernel: &JitKernel) {
+fn absorb_kernel_compile_report(
+    report: &mut BackendCompileReport,
+    name: impl Into<String>,
+    kernel: &JitKernel,
+) {
     let compile_report = kernel.function.compile_report();
     add_duration(
         &mut report.setup_profile.lowering,
         compile_report.lowering_time,
     );
+    add_duration(
+        &mut report.setup_profile.llvm_cache_key,
+        compile_report.cache_key_time,
+    );
+    add_duration(
+        &mut report.setup_profile.llvm_module_build,
+        compile_report.llvm_module_build_time,
+    );
+    add_duration(
+        &mut report.setup_profile.llvm_optimization,
+        compile_report.llvm_optimization_time,
+    );
+    add_duration(
+        &mut report.setup_profile.llvm_object_emit,
+        compile_report.llvm_object_emit_time,
+    );
+    add_duration(
+        &mut report.setup_profile.llvm_ir_fingerprint,
+        compile_report.llvm_ir_fingerprint_time,
+    );
     add_duration(&mut report.setup_profile.llvm_jit, compile_report.llvm_time);
+    add_duration(
+        &mut report.setup_profile.jit_context,
+        kernel.context_creation_time,
+    );
+    report.llvm_jit_cache.check_time += compile_report.cache.check_time;
+    report.llvm_jit_cache.read_time += compile_report.cache.read_time;
+    report.llvm_jit_cache.write_time += compile_report.cache.write_time;
+    report.llvm_jit_cache.materialize_time += compile_report.cache.materialize_time;
     if compile_report.cache.hit {
         report.llvm_jit_cache.hits += 1;
         report.llvm_jit_cache.load_time += compile_report.cache.load_time;
@@ -2531,6 +2633,25 @@ fn absorb_kernel_compile_report(report: &mut BackendCompileReport, kernel: &JitK
     report
         .warnings
         .extend(compile_report.warnings.iter().cloned());
+    report.kernels.push(KernelCompileReport {
+        name: name.into(),
+        lowering_time: compile_report.lowering_time,
+        cache_key_time: compile_report.cache_key_time,
+        llvm_time: compile_report.llvm_time,
+        llvm_module_build_time: compile_report.llvm_module_build_time,
+        llvm_optimization_time: compile_report.llvm_optimization_time,
+        llvm_object_emit_time: compile_report.llvm_object_emit_time,
+        llvm_ir_fingerprint_time: compile_report.llvm_ir_fingerprint_time,
+        context_time: kernel.context_creation_time,
+        llvm_cache_hit: compile_report.cache.hit,
+        llvm_cache_check_time: compile_report.cache.check_time,
+        llvm_cache_read_time: compile_report.cache.read_time,
+        llvm_cache_write_time: compile_report.cache.write_time,
+        llvm_cache_load_time: compile_report.cache.load_time,
+        llvm_cache_materialize_time: compile_report.cache.materialize_time,
+        object_size_bytes: compile_report.object_size_bytes,
+        stats: compile_report.stats.clone(),
+    });
 }
 
 impl RuntimeBoundedJitNlp<'_> {
@@ -3632,10 +3753,13 @@ impl JitKernel {
         options: FunctionCompileOptions,
     ) -> AnyResult<Self> {
         let compiled = CompiledJitFunction::compile_function_with_options(function, options)?;
+        let context_started = Instant::now();
         let context = Mutex::new(compiled.create_context());
+        let context_creation_time = context_started.elapsed();
         Ok(Self {
             function: compiled,
             context,
+            context_creation_time,
         })
     }
 
