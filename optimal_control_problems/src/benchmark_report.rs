@@ -115,7 +115,9 @@ impl OcpBenchmarkPreset {
     }
 
     pub fn compile_options(self, opt_level: LlvmOptimizationLevel) -> OcpCompileOptions {
-        self.sx_function_config().compile_options(opt_level)
+        self.sx_function_config()
+            .with_opt_level(opt_level)
+            .compile_options(opt_level)
     }
 
     pub fn sx_function_config(self) -> OcpSxFunctionConfig {
@@ -348,7 +350,9 @@ pub(crate) fn opt_level_for_transcription(method: TranscriptionMethod) -> LlvmOp
         TranscriptionMethod::MultipleShooting => {
             crate::common::interactive_multiple_shooting_opt_level()
         }
-        TranscriptionMethod::DirectCollocation => LlvmOptimizationLevel::O3,
+        TranscriptionMethod::DirectCollocation => {
+            crate::common::interactive_direct_collocation_opt_level()
+        }
     }
 }
 

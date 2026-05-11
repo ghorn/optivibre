@@ -77,6 +77,7 @@ enum WorkerPhase {
 struct ProblemActorState {
     phase: WorkerPhase,
     ready: bool,
+    shutdown_requested: bool,
     latest_compile_status: Option<SolveStatus>,
     pending_prewarm_replies: Vec<oneshot::Sender<Result<(), String>>>,
     pending_solves: VecDeque<PendingSolveJob>,
@@ -215,6 +216,7 @@ async fn prewarm_status() -> ApiResult<Json<CompileCacheSnapshot>> {
 async fn clear_jit_cache() -> ApiResult<StatusCode> {
     optimization::clear_optivibre_jit_cache()
         .map_err(|error| internal_error(format!("failed to clear LLVM JIT cache: {error}")))?;
+    problem_backend().clear_compile_actors();
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -294,6 +296,16 @@ impl ProblemBackend {
         CompileCacheSnapshot { entries }
     }
 
+    fn clear_compile_actors(&self) {
+        let actors = {
+            let mut actors = self.actors.lock().expect("problem actor registry poisoned");
+            actors.drain().map(|(_, actor)| actor).collect::<Vec<_>>()
+        };
+        for actor in actors {
+            actor.request_shutdown();
+        }
+    }
+
     fn prewarm(
         &self,
         problem: ProblemId,
@@ -340,6 +352,7 @@ impl ProblemActor {
             Mutex::new(ProblemActorState {
                 phase: WorkerPhase::Idle,
                 ready: false,
+                shutdown_requested: false,
                 latest_compile_status: None,
                 pending_prewarm_replies: Vec::new(),
                 pending_solves: VecDeque::new(),
@@ -360,6 +373,13 @@ impl ProblemActor {
         let (lock, _) = &*self.shared;
         let state = lock.lock().expect("problem actor state poisoned");
         compile_status_from_state(&self.descriptor, &state)
+    }
+
+    fn request_shutdown(&self) {
+        let (lock, cvar) = &*self.shared;
+        let mut state = lock.lock().expect("problem actor state poisoned");
+        state.shutdown_requested = true;
+        cvar.notify_one();
     }
 
     fn enqueue_prewarm(&self) -> oneshot::Receiver<Result<(), String>> {
@@ -425,6 +445,13 @@ fn actor_worker_loop(problem: ProblemId, descriptor: CompileDescriptor, shared: 
             let (lock, cvar) = &*shared;
             let mut state = lock.lock().expect("problem actor state poisoned");
             loop {
+                if state.shutdown_requested
+                    && state.phase == WorkerPhase::Idle
+                    && state.pending_prewarm_replies.is_empty()
+                    && state.pending_solves.is_empty()
+                {
+                    return;
+                }
                 if state.phase == WorkerPhase::Idle {
                     if !state.ready {
                         if !state.pending_prewarm_replies.is_empty()
@@ -640,6 +667,10 @@ fn compile_cache_status_from_parts(
         jit_s: status.and_then(|status| status.solver.jit_s),
         jit_disk_cache_hit: status
             .is_some_and(|status| status.solver.jit_disk_cache_hit || status.solver.compile_cached),
+        phase_details: status.map_or_else(
+            optimal_control_problems::SolverPhaseDetails::default,
+            |status| status.solver.phase_details.clone(),
+        ),
         compile_report: status.and_then(|status| status.compile_report.clone()),
     }
 }

@@ -325,7 +325,7 @@ pub struct OcpCompileOptions {
 
 impl Default for OcpCompileOptions {
     fn default() -> Self {
-        Self::from(FunctionCompileOptions::from(LlvmOptimizationLevel::O3))
+        Self::from(FunctionCompileOptions::from(LlvmOptimizationLevel::O0))
     }
 }
 
@@ -501,6 +501,7 @@ pub struct OcpHelperCompileStats {
     pub llvm_cache_misses: usize,
     pub llvm_cache_check_time: Duration,
     pub llvm_cache_read_time: Duration,
+    pub llvm_cache_write_time: Duration,
     pub llvm_cache_load_time: Duration,
     pub llvm_cache_materialize_time: Duration,
 }
@@ -509,6 +510,7 @@ impl OcpHelperCompileStats {
     fn record_compile_report(&mut self, report: &sx_codegen_llvm::FunctionCompileReport) {
         self.llvm_cache_check_time += report.cache.check_time;
         self.llvm_cache_read_time += report.cache.read_time;
+        self.llvm_cache_write_time += report.cache.write_time;
         self.llvm_cache_materialize_time += report.cache.materialize_time;
         if report.cache.hit {
             self.llvm_cache_hits += 1;

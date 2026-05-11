@@ -1488,7 +1488,7 @@ where
     pub fn compile_jit(
         &self,
     ) -> Result<CompiledMultipleShootingOcp<X, U, P, C, Beq, Bineq, G>, OcpCompileError> {
-        self.compile_jit_with_options(FunctionCompileOptions::from(LlvmOptimizationLevel::O3))
+        self.compile_jit_with_options(FunctionCompileOptions::from(LlvmOptimizationLevel::O0))
     }
 
     pub fn compile_jit_with_options(
@@ -1514,7 +1514,7 @@ where
     {
         self.compile_jit_with_ocp_options_and_progress_callback(
             OcpCompileOptions::for_multiple_shooting(FunctionCompileOptions::from(
-                LlvmOptimizationLevel::O3,
+                LlvmOptimizationLevel::O0,
             )),
             callback,
         )
@@ -1721,6 +1721,7 @@ where
                 llvm_cache_misses: helper_compile_stats.llvm_cache_misses,
                 llvm_cache_check_time: helper_compile_stats.llvm_cache_check_time,
                 llvm_cache_read_time: helper_compile_stats.llvm_cache_read_time,
+                llvm_cache_write_time: helper_compile_stats.llvm_cache_write_time,
                 llvm_cache_load_time: helper_compile_stats.llvm_cache_load_time,
                 llvm_cache_materialize_time: helper_compile_stats.llvm_cache_materialize_time,
             },
@@ -3128,7 +3129,7 @@ where
     pub fn compile_jit(
         &self,
     ) -> Result<CompiledDirectCollocationOcp<X, U, P, C, Beq, Bineq, G>, OcpCompileError> {
-        self.compile_jit_with_options(FunctionCompileOptions::from(LlvmOptimizationLevel::O3))
+        self.compile_jit_with_options(FunctionCompileOptions::from(LlvmOptimizationLevel::O0))
     }
 
     pub fn compile_jit_with_options(
@@ -3335,6 +3336,7 @@ where
                 llvm_cache_misses: helper_compile_stats.llvm_cache_misses,
                 llvm_cache_check_time: helper_compile_stats.llvm_cache_check_time,
                 llvm_cache_read_time: helper_compile_stats.llvm_cache_read_time,
+                llvm_cache_write_time: helper_compile_stats.llvm_cache_write_time,
                 llvm_cache_load_time: helper_compile_stats.llvm_cache_load_time,
                 llvm_cache_materialize_time: helper_compile_stats.llvm_cache_materialize_time,
             },

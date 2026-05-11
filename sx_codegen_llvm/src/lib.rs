@@ -70,7 +70,7 @@ fn kernel_symbol_name(name: &str) -> String {
     format!("__sx_codegen_llvm_{}", sanitize_ident(name))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LlvmOptimizationLevel {
     O0,
     O2,

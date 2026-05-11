@@ -98,7 +98,7 @@ pub struct SymbolicNlpCompileOptions {
 
 impl Default for SymbolicNlpCompileOptions {
     fn default() -> Self {
-        Self::from(FunctionCompileOptions::from(LlvmOptimizationLevel::O3))
+        Self::from(FunctionCompileOptions::from(LlvmOptimizationLevel::O0))
     }
 }
 
@@ -502,7 +502,7 @@ impl DynamicSymbolicNlp {
     }
 
     pub fn compile_jit(&self) -> Result<DynamicCompiledJitNlp, SymbolicNlpCompileError> {
-        self.compile_jit_with_options(FunctionCompileOptions::from(LlvmOptimizationLevel::O3))
+        self.compile_jit_with_options(FunctionCompileOptions::from(LlvmOptimizationLevel::O0))
     }
 
     pub fn compile_jit_with_options(
@@ -545,7 +545,7 @@ where
     I: Vectorize<SX, Rebind<SX> = I>,
 {
     pub fn compile_jit(&self) -> Result<TypedCompiledJitNlp<X, P, E, I>, SymbolicNlpCompileError> {
-        self.compile_jit_with_options(FunctionCompileOptions::from(LlvmOptimizationLevel::O3))
+        self.compile_jit_with_options(FunctionCompileOptions::from(LlvmOptimizationLevel::O0))
     }
 
     pub fn compile_jit_with_symbolic_callback<CB>(
@@ -556,7 +556,7 @@ where
         CB: FnMut(SymbolicCompileMetadata),
     {
         self.compile_jit_with_options_and_symbolic_progress_callback(
-            FunctionCompileOptions::from(LlvmOptimizationLevel::O3),
+            FunctionCompileOptions::from(LlvmOptimizationLevel::O0),
             |progress| {
                 if let SymbolicCompileProgress::Ready(metadata) = progress {
                     on_symbolic_ready(metadata);

@@ -520,7 +520,7 @@ pub fn rosenbrock_spec() -> ProblemSpec {
 fn static_compile_options() -> SymbolicNlpCompileOptions {
     SymbolicNlpCompileOptions {
         function_options: FunctionCompileOptions::new(
-            LlvmOptimizationLevel::O3,
+            LlvmOptimizationLevel::O0,
             CallPolicyConfig {
                 default_policy: CallPolicy::InlineAtLowering,
                 respect_function_overrides: true,

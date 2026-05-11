@@ -255,6 +255,8 @@ pub struct CompileCacheStatus {
     pub jit_s: Option<f64>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub jit_disk_cache_hit: bool,
+    #[serde(default, skip_serializing_if = "SolverPhaseDetails::is_empty")]
+    pub phase_details: SolverPhaseDetails,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compile_report: Option<CompileReportSummary>,
 }
@@ -2102,6 +2104,7 @@ impl OcpKernelStrategy {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct OcpSxFunctionConfig {
+    pub opt_level: LlvmOptimizationLevel,
     pub global_call_policy: CallPolicy,
     pub override_behavior: OcpOverrideBehavior,
     pub hessian_strategy: HessianStrategy,
@@ -2117,6 +2120,7 @@ pub struct OcpSxFunctionConfig {
 impl OcpSxFunctionConfig {
     pub const fn inline_all() -> Self {
         Self {
+            opt_level: LlvmOptimizationLevel::O0,
             global_call_policy: CallPolicy::InlineAtLowering,
             override_behavior: OcpOverrideBehavior::RespectFunctionOverrides,
             hessian_strategy: HessianStrategy::LowerTriangleByColumn,
@@ -2132,6 +2136,7 @@ impl OcpSxFunctionConfig {
 
     pub const fn all_functions_with_global_policy(policy: CallPolicy) -> Self {
         Self {
+            opt_level: LlvmOptimizationLevel::O0,
             global_call_policy: policy,
             override_behavior: OcpOverrideBehavior::RespectFunctionOverrides,
             hessian_strategy: HessianStrategy::LowerTriangleByColumn,
@@ -2143,6 +2148,11 @@ impl OcpSxFunctionConfig {
             boundary_inequalities: OcpKernelStrategy::FunctionUseGlobalPolicy,
             multiple_shooting_integrator: OcpKernelStrategy::FunctionUseGlobalPolicy,
         }
+    }
+
+    pub const fn with_opt_level(mut self, opt_level: LlvmOptimizationLevel) -> Self {
+        self.opt_level = opt_level;
+        self
     }
 
     pub const fn call_policy_config(self) -> CallPolicyConfig {
@@ -2167,9 +2177,12 @@ impl OcpSxFunctionConfig {
         }
     }
 
-    pub const fn compile_options(self, opt_level: LlvmOptimizationLevel) -> OcpCompileOptions {
+    pub const fn compile_options(self, _opt_level: LlvmOptimizationLevel) -> OcpCompileOptions {
         OcpCompileOptions {
-            function_options: FunctionCompileOptions::new(opt_level, self.call_policy_config()),
+            function_options: FunctionCompileOptions::new(
+                self.opt_level,
+                self.call_policy_config(),
+            ),
             symbolic_functions: self.symbolic_functions(),
             hessian_strategy: self.hessian_strategy,
         }
@@ -2177,7 +2190,8 @@ impl OcpSxFunctionConfig {
 
     pub fn variant_id_suffix(self) -> String {
         format!(
-            "g{}_ov{}_h{}_ode{}_lag{}_may{}_path{}_beq{}_biq{}_msi{}",
+            "o{}_g{}_ov{}_h{}_ode{}_lag{}_may{}_path{}_beq{}_biq{}_msi{}",
+            opt_level_variant_token(self.opt_level),
             call_policy_variant_token(self.global_call_policy),
             match self.override_behavior {
                 OcpOverrideBehavior::RespectFunctionOverrides => "r",
@@ -2195,26 +2209,42 @@ impl OcpSxFunctionConfig {
     }
 
     pub fn variant_label_suffix(self) -> Option<String> {
-        if self == Self::default() {
-            None
-        } else if self == Self::inline_all() {
-            Some("SXF Inline All".to_string())
-        } else if self == Self::all_functions_with_global_policy(CallPolicy::InlineAtCall) {
-            Some("SXF All Functions / Inline At Call".to_string())
-        } else if self == Self::all_functions_with_global_policy(CallPolicy::InlineAtLowering) {
-            Some("SXF All Functions / Inline At Lowering".to_string())
-        } else if self == Self::all_functions_with_global_policy(CallPolicy::InlineInLLVM) {
-            Some("SXF All Functions / Inline In LLVM".to_string())
-        } else if self == Self::all_functions_with_global_policy(CallPolicy::NoInlineLLVM) {
-            Some("SXF All Functions / NoInline LLVM".to_string())
+        let jit_label = format!("JIT {}", self.opt_level.label());
+        let default = Self::default();
+        let config_without_opt_delta = self.with_opt_level(default.opt_level);
+        if config_without_opt_delta == default {
+            Some(jit_label)
+        } else if config_without_opt_delta == Self::inline_all() {
+            Some(format!("{jit_label} · SXF Inline All"))
+        } else if config_without_opt_delta
+            == Self::all_functions_with_global_policy(CallPolicy::InlineAtCall)
+        {
+            Some(format!("{jit_label} · SXF All Functions / Inline At Call"))
+        } else if config_without_opt_delta
+            == Self::all_functions_with_global_policy(CallPolicy::InlineAtLowering)
+        {
+            Some(format!(
+                "{jit_label} · SXF All Functions / Inline At Lowering"
+            ))
+        } else if config_without_opt_delta
+            == Self::all_functions_with_global_policy(CallPolicy::InlineInLLVM)
+        {
+            Some(format!("{jit_label} · SXF All Functions / Inline In LLVM"))
+        } else if config_without_opt_delta
+            == Self::all_functions_with_global_policy(CallPolicy::NoInlineLLVM)
+        {
+            Some(format!("{jit_label} · SXF All Functions / NoInline LLVM"))
         } else {
-            Some("SXF Custom".to_string())
+            Some(format!("{jit_label} · SXF Custom"))
         }
     }
 
     pub fn delta_summary(self) -> Vec<String> {
         let default = Self::default();
         let mut deltas = Vec::new();
+        if self.opt_level != default.opt_level {
+            deltas.push(format!("JIT {}", self.opt_level.label()));
+        }
         if self.global_call_policy != default.global_call_policy {
             deltas.push(format!(
                 "Global {}",
@@ -2274,6 +2304,7 @@ impl OcpSxFunctionConfig {
 impl Default for OcpSxFunctionConfig {
     fn default() -> Self {
         Self {
+            opt_level: LlvmOptimizationLevel::O0,
             global_call_policy: CallPolicy::InlineAtLowering,
             override_behavior: OcpOverrideBehavior::RespectFunctionOverrides,
             hessian_strategy: HessianStrategy::LowerTriangleByColumn,
@@ -2372,6 +2403,15 @@ const fn hessian_strategy_variant_token(strategy: HessianStrategy) -> &'static s
     }
 }
 
+const fn opt_level_variant_token(opt_level: LlvmOptimizationLevel) -> &'static str {
+    match opt_level {
+        LlvmOptimizationLevel::O0 => "0",
+        LlvmOptimizationLevel::O2 => "2",
+        LlvmOptimizationLevel::O3 => "3",
+        LlvmOptimizationLevel::Os => "s",
+    }
+}
+
 const fn call_policy_variant_token(policy: CallPolicy) -> &'static str {
     match policy {
         CallPolicy::InlineAtCall => "c",
@@ -2393,6 +2433,7 @@ enum SharedControlId {
     TimeGridFocusWidth,
     TimeGridBreakpoint,
     TimeGridFirstIntervalFraction,
+    SxFunctionOptLevel,
     SxFunctionGlobalCallPolicy,
     SxFunctionOverrideBehavior,
     SxFunctionHessianStrategy,
@@ -2456,6 +2497,7 @@ impl SharedControlId {
             Self::TimeGridFocusWidth => "time_grid_focus_width",
             Self::TimeGridBreakpoint => "time_grid_breakpoint",
             Self::TimeGridFirstIntervalFraction => "time_grid_first_interval_fraction",
+            Self::SxFunctionOptLevel => "sxf_opt_level",
             Self::SxFunctionGlobalCallPolicy => "sxf_global_call_policy",
             Self::SxFunctionOverrideBehavior => "sxf_override_behavior",
             Self::SxFunctionHessianStrategy => "sxf_hessian_strategy",
@@ -3351,6 +3393,7 @@ pub fn compile_cache_status(
         symbolic_setup_s: symbolic_setup_seconds(timing),
         jit_s: duration_seconds(timing.jit_time),
         jit_disk_cache_hit,
+        phase_details: SolverPhaseDetails::default(),
         compile_report,
     }
 }
@@ -3578,16 +3621,14 @@ where
             let compiled = compiled.borrow();
             let compile_report =
                 summarize_backend_compile_report(compiled.backend_compile_report());
+            let helper_stats = compiled.helper_compile_stats();
             compile_cache_status(
                 problem_id,
                 problem_name,
                 &variant_id,
                 &variant_label,
-                compiled.backend_timing_metadata(),
-                compile_is_fully_disk_cached(
-                    Some(&compile_report),
-                    compiled.helper_compile_stats(),
-                ),
+                timing_with_helper_compile_time(compiled.backend_timing_metadata(), helper_stats),
+                compile_is_fully_disk_cached(Some(&compile_report), helper_stats),
                 Some(compile_report),
             )
         })
@@ -3800,10 +3841,15 @@ fn llvm_cache_read_seconds(
     (total > 0.0).then_some(total)
 }
 
-fn llvm_cache_write_seconds(compile_report: Option<&CompileReportSummary>) -> Option<f64> {
-    let total = compile_report
+fn llvm_cache_write_seconds(
+    compile_report: Option<&CompileReportSummary>,
+    helper_stats: OcpHelperCompileStats,
+) -> Option<f64> {
+    let nlp = compile_report
         .and_then(|report| report.llvm_cache_write_s)
         .unwrap_or(0.0);
+    let helper = duration_seconds(Some(helper_stats.llvm_cache_write_time)).unwrap_or(0.0);
+    let total = nlp + helper;
     (total > 0.0).then_some(total)
 }
 
@@ -3860,7 +3906,7 @@ fn llvm_cache_phase_details(
             ));
         }
     }
-    if let Some(write_s) = llvm_cache_write_seconds(compile_report) {
+    if let Some(write_s) = llvm_cache_write_seconds(compile_report, helper_stats) {
         if write_s > 0.0 {
             details.push(phase_detail(
                 "LLVM Cache Object Write",
@@ -4089,6 +4135,7 @@ pub fn ocp_compile_progress_update(
             )];
         }
         OcpCompileProgress::NlpKernelCompiled { elapsed, .. } => {
+            add_jit_phase_elapsed(&mut state.timing, elapsed);
             upsert_phase_detail(
                 &mut state.phase_details.jit,
                 "NLP Kernel JIT",
@@ -4098,6 +4145,7 @@ pub fn ocp_compile_progress_update(
         OcpCompileProgress::HelperCompiled {
             helper, elapsed, ..
         } => {
+            add_jit_phase_elapsed(&mut state.timing, elapsed);
             upsert_phase_detail(
                 &mut state.phase_details.jit,
                 helper_compile_detail_label(helper),
@@ -4110,6 +4158,31 @@ pub fn ocp_compile_progress_update(
         phase_details: state.phase_details.clone(),
         compile_cached: false,
     }
+}
+
+fn add_jit_phase_elapsed(timing: &mut BackendTimingMetadata, elapsed: Duration) {
+    if elapsed <= Duration::ZERO {
+        return;
+    }
+    timing.jit_time = Some(timing.jit_time.unwrap_or_default() + elapsed);
+}
+
+fn helper_compile_total_time(helper_stats: OcpHelperCompileStats) -> Duration {
+    helper_stats.xdot_helper_time.unwrap_or_default()
+        + helper_stats
+            .multiple_shooting_arc_helper_time
+            .unwrap_or_default()
+}
+
+fn timing_with_helper_compile_time(
+    mut timing: BackendTimingMetadata,
+    helper_stats: OcpHelperCompileStats,
+) -> BackendTimingMetadata {
+    let helper_time = helper_compile_total_time(helper_stats);
+    if helper_time > Duration::ZERO {
+        timing.jit_time = Some(timing.jit_time.unwrap_or_default() + helper_time);
+    }
+    timing
 }
 
 pub fn compile_progress_info(
@@ -4127,7 +4200,7 @@ pub fn compile_progress_info(
         helper_stats,
     ));
     CompileProgressInfo {
-        timing,
+        timing: timing_with_helper_compile_time(timing, helper_stats),
         compile_cached: compile_is_fully_disk_cached(compile_report.as_ref(), helper_stats),
         phase_details: SolverPhaseDetails {
             symbolic_setup: symbolic_phase_details(stats, None),
@@ -4512,7 +4585,7 @@ pub const fn interactive_multiple_shooting_opt_level() -> LlvmOptimizationLevel 
 }
 
 pub const fn interactive_direct_collocation_opt_level() -> LlvmOptimizationLevel {
-    LlvmOptimizationLevel::O3
+    LlvmOptimizationLevel::O0
 }
 
 pub fn solver_running_label(method: SolverMethod) -> &'static str {
@@ -4640,6 +4713,10 @@ fn with_solver_profile_defaults(
     control
 }
 
+fn llvm_opt_level_control_choices() -> [(f64, &'static str); 4] {
+    [(0.0, "O0"), (1.0, "O2"), (2.0, "O3"), (3.0, "Os")]
+}
+
 fn call_policy_control_choices() -> [(f64, &'static str); 4] {
     [
         (0.0, "Inline At Call"),
@@ -4675,6 +4752,20 @@ fn kernel_strategy_control_choices() -> [(f64, &'static str); 6] {
 fn ocp_sx_function_controls(default: OcpSxFunctionConfig) -> Vec<ControlSpec> {
     let panel = ControlPanel::SxFunctions;
     vec![
+        with_control_panel(
+            select_control(
+                SharedControlId::SxFunctionOptLevel.id(),
+                "LLVM Opt Level",
+                llvm_opt_level_choice_value(default.opt_level),
+                "",
+                "LLVM optimization pipeline used for generated JIT kernels. O0 is the interactive default; higher levels may improve callback throughput but can make cold compiles much slower.",
+                &llvm_opt_level_control_choices(),
+                ControlSection::Transcription,
+                ControlVisibility::Always,
+                ControlSemantic::SxFunctionOption,
+            ),
+            panel,
+        ),
         with_control_panel(
             select_control(
                 SharedControlId::SxFunctionGlobalCallPolicy.id(),
@@ -6394,6 +6485,18 @@ fn parse_call_policy_choice(value: f64, key: SharedControlId) -> Result<CallPoli
     )
 }
 
+fn parse_llvm_opt_level_choice(value: f64, key: SharedControlId) -> Result<LlvmOptimizationLevel> {
+    Ok(
+        match parse_enum_choice(value, key, &[0.0, 1.0, 2.0, 3.0])? {
+            0 => LlvmOptimizationLevel::O0,
+            1 => LlvmOptimizationLevel::O2,
+            2 => LlvmOptimizationLevel::O3,
+            3 => LlvmOptimizationLevel::Os,
+            _ => unreachable!("validated LLVM optimization level choice index"),
+        },
+    )
+}
+
 fn parse_kernel_strategy_choice(value: f64, key: SharedControlId) -> Result<OcpKernelStrategy> {
     Ok(
         match parse_enum_choice(value, key, &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0])? {
@@ -6421,6 +6524,14 @@ pub fn ocp_sx_function_config_from_map(
     values: &BTreeMap<String, f64>,
     default: OcpSxFunctionConfig,
 ) -> Result<OcpSxFunctionConfig> {
+    let opt_level = parse_llvm_opt_level_choice(
+        sample_shared_or_default(
+            values,
+            SharedControlId::SxFunctionOptLevel,
+            llvm_opt_level_choice_value(default.opt_level),
+        ),
+        SharedControlId::SxFunctionOptLevel,
+    )?;
     let global_call_policy = parse_call_policy_choice(
         sample_shared_or_default(
             values,
@@ -6443,6 +6554,7 @@ pub fn ocp_sx_function_config_from_map(
         _ => unreachable!("validated override behavior choice index"),
     };
     Ok(OcpSxFunctionConfig {
+        opt_level,
         global_call_policy,
         override_behavior,
         hessian_strategy: parse_hessian_strategy_choice(
@@ -6517,6 +6629,15 @@ pub fn ocp_sx_function_config_from_map_lossy(
     default: OcpSxFunctionConfig,
 ) -> OcpSxFunctionConfig {
     ocp_sx_function_config_from_map(values, default).unwrap_or(default)
+}
+
+fn llvm_opt_level_choice_value(opt_level: LlvmOptimizationLevel) -> f64 {
+    match opt_level {
+        LlvmOptimizationLevel::O0 => 0.0,
+        LlvmOptimizationLevel::O2 => 1.0,
+        LlvmOptimizationLevel::O3 => 2.0,
+        LlvmOptimizationLevel::Os => 3.0,
+    }
 }
 
 fn call_policy_choice_value(policy: CallPolicy) -> f64 {
@@ -10833,6 +10954,18 @@ mod tests {
         assert_eq!(symbolic.phase_details.jit.len(), 1);
         assert_eq!(symbolic.phase_details.jit[0].label, "NLP Kernels");
 
+        let nlp = ocp_compile_progress_update(
+            OcpCompileProgress::NlpKernelCompiled {
+                elapsed: Duration::from_secs(2),
+                root_instructions: 21,
+                total_instructions: 21,
+            },
+            &mut state,
+        );
+        assert_eq!(nlp.timing.jit_time, Some(Duration::from_secs(2)));
+        assert_eq!(nlp.phase_details.jit.len(), 2);
+        assert_eq!(nlp.phase_details.jit[1].label, "NLP Kernel JIT");
+
         let xdot = ocp_compile_progress_update(
             OcpCompileProgress::HelperCompiled {
                 helper: OcpCompileHelperKind::Xdot,
@@ -10842,9 +10975,10 @@ mod tests {
             },
             &mut state,
         );
-        assert_eq!(xdot.phase_details.jit.len(), 2);
-        assert_eq!(xdot.phase_details.jit[1].label, "Xdot Helper");
-        assert_eq!(xdot.phase_details.jit[1].value, "125 ms");
+        assert_eq!(xdot.timing.jit_time, Some(Duration::from_millis(2125)));
+        assert_eq!(xdot.phase_details.jit.len(), 3);
+        assert_eq!(xdot.phase_details.jit[2].label, "Xdot Helper");
+        assert_eq!(xdot.phase_details.jit[2].value, "125 ms");
 
         let arc = ocp_compile_progress_update(
             OcpCompileProgress::HelperCompiled {
@@ -10855,9 +10989,10 @@ mod tests {
             },
             &mut state,
         );
-        assert_eq!(arc.phase_details.jit.len(), 3);
-        assert_eq!(arc.phase_details.jit[2].label, "RK4 Arc Helper");
-        assert_eq!(arc.phase_details.jit[2].value, "4.50 s");
+        assert_eq!(arc.timing.jit_time, Some(Duration::from_millis(6625)));
+        assert_eq!(arc.phase_details.jit.len(), 4);
+        assert_eq!(arc.phase_details.jit[3].label, "RK4 Arc Helper");
+        assert_eq!(arc.phase_details.jit[3].value, "4.50 s");
     }
 
     #[test]
@@ -10911,6 +11046,14 @@ mod tests {
             .iter()
             .find(|control| control.id == "sxf_hessian_strategy")
             .expect("expected sx function Hessian strategy control");
+        let opt_level = controls
+            .iter()
+            .find(|control| control.id == "sxf_opt_level")
+            .expect("expected LLVM opt-level control");
+        assert_eq!(opt_level.section, ControlSection::Transcription);
+        assert_eq!(opt_level.panel, Some(ControlPanel::SxFunctions));
+        assert_eq!(opt_level.semantic, ControlSemantic::SxFunctionOption);
+        assert_eq!(opt_level.default, 0.0);
         assert_eq!(ode.section, ControlSection::Transcription);
         assert_eq!(ode.panel, Some(ControlPanel::SxFunctions));
         assert_eq!(ode.semantic, ControlSemantic::SxFunctionOption);
@@ -11245,7 +11388,32 @@ mod tests {
             ..default
         };
         assert_ne!(default.variant_id_suffix(), custom.variant_id_suffix());
-        assert_eq!(custom.variant_label_suffix().as_deref(), Some("SXF Custom"));
+        assert_eq!(default.variant_label_suffix().as_deref(), Some("JIT O0"));
+        assert_eq!(
+            custom.variant_label_suffix().as_deref(),
+            Some("JIT O0 · SXF Custom")
+        );
+        assert_eq!(
+            default
+                .with_opt_level(LlvmOptimizationLevel::O3)
+                .variant_label_suffix()
+                .as_deref(),
+            Some("JIT O3")
+        );
+    }
+
+    #[test]
+    fn sx_function_config_parses_llvm_opt_level() {
+        let mut values = BTreeMap::new();
+        values.insert("sxf_opt_level".to_string(), 2.0);
+        let parsed = ocp_sx_function_config_from_map(&values, OcpSxFunctionConfig::default())
+            .expect("O3 opt-level choice should parse");
+        assert_eq!(parsed.opt_level, LlvmOptimizationLevel::O3);
+
+        values.insert("sxf_opt_level".to_string(), 99.0);
+        let error = ocp_sx_function_config_from_map(&values, OcpSxFunctionConfig::default())
+            .expect_err("invalid opt-level choice should fail");
+        assert!(error.to_string().contains("sxf_opt_level"));
     }
 
     #[test]

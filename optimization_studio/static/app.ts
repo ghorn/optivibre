@@ -515,6 +515,7 @@ interface WireCompileCacheStatus {
   symbolic_setup_s?: number | null;
   jit_s?: number | null;
   jit_disk_cache_hit?: boolean;
+  phase_details?: SolverPhaseDetails;
   compile_report?: WireCompileReportSummary | null;
 }
 
@@ -592,6 +593,7 @@ interface CompileCacheStatus {
   symbolic_setup_s: number | null;
   jit_s: number | null;
   jit_disk_cache_hit: boolean;
+  phase_details: SolverPhaseDetails;
   compile_report: WireCompileReportSummary | null;
 }
 
@@ -828,6 +830,7 @@ interface SolveArtifact {
   title: string;
   summary: Metric[];
   solver: SolverReport;
+  compile_report: WireCompileReportSummary | null;
   constraint_panels: ConstraintPanels;
   charts: Chart[];
   scene: Scene2D;
@@ -837,10 +840,11 @@ interface SolveArtifact {
 
 interface WireSolveArtifact extends Omit<
   SolveArtifact,
-  "summary" | "solver" | "constraint_panels" | "charts" | "visualizations"
+  "summary" | "solver" | "compile_report" | "constraint_panels" | "charts" | "visualizations"
 > {
   summary?: WireMetric[];
   solver: WireSolverReport;
+  compile_report?: WireCompileReportSummary | null;
   constraint_panels?: WireConstraintPanels | null;
   charts?: WireChart[];
   visualizations?: ArtifactVisualization[];
@@ -850,6 +854,7 @@ interface SolveStatus {
   stage: SolveStageCode;
   solver_method?: SolverMethodCode | null;
   solver: SolverReport;
+  compile_report?: WireCompileReportSummary | null;
 }
 
 interface StatusSolveEvent {
@@ -895,6 +900,7 @@ interface WireSolveStatus extends Omit<SolveStatus, "stage" | "solver_method" | 
   stage: string | number;
   solver_method?: string | number | null;
   solver: WireSolverReport;
+  compile_report?: WireCompileReportSummary | null;
 }
 
 interface WireLogSolveEvent {
@@ -1360,6 +1366,8 @@ function readWireCompileCacheStatus(
         readJsonValueAt(object, "jit_disk_cache_hit"),
         `${context}.jit_disk_cache_hit`,
       ) ?? false,
+    phase_details:
+      readSolverPhaseDetails(readJsonValueAt(object, "phase_details"), `${context}.phase_details`),
     compile_report:
       compileReportValue == null
         ? null
@@ -1974,6 +1982,7 @@ function readWireSolverReport(value: JsonValue | undefined, context: string): Wi
 function readWireSolveArtifact(value: JsonValue | undefined, context: string): WireSolveArtifact {
   const object = readJsonObject(value, context);
   const summary = readOptionalJsonArray(readJsonValueAt(object, "summary"), `${context}.summary`);
+  const compileReportValue = readJsonValueAt(object, "compile_report");
   const charts = readOptionalJsonArray(readJsonValueAt(object, "charts"), `${context}.charts`);
   const visualizations = readOptionalJsonArray(
     readJsonValueAt(object, "visualizations"),
@@ -1985,6 +1994,10 @@ function readWireSolveArtifact(value: JsonValue | undefined, context: string): W
     title: readJsonString(readJsonValueAt(object, "title"), `${context}.title`),
     summary: summary?.map((metric, index) => readWireMetric(metric, `${context}.summary[${index}]`)),
     solver: readWireSolverReport(readJsonValueAt(object, "solver"), `${context}.solver`),
+    compile_report:
+      compileReportValue == null
+        ? null
+        : readWireCompileReportSummary(compileReportValue, `${context}.compile_report`),
     constraint_panels:
       constraintPanels == null
         ? null
@@ -1999,6 +2012,7 @@ function readWireSolveArtifact(value: JsonValue | undefined, context: string): W
 
 function readWireSolveStatus(value: JsonValue | undefined, context: string): WireSolveStatus {
   const object = readJsonObject(value, context);
+  const compileReportValue = readJsonValueAt(object, "compile_report");
   return {
     stage: readJsonStringOrNumber(readJsonValueAt(object, "stage"), `${context}.stage`),
     solver_method:
@@ -2007,6 +2021,10 @@ function readWireSolveStatus(value: JsonValue | undefined, context: string): Wir
         `${context}.solver_method`,
       ) ?? null,
     solver: readWireSolverReport(readJsonValueAt(object, "solver"), `${context}.solver`),
+    compile_report:
+      compileReportValue == null
+        ? null
+        : readWireCompileReportSummary(compileReportValue, `${context}.compile_report`),
   };
 }
 
@@ -2387,15 +2405,91 @@ function formatCompileDuration(seconds: number | null | undefined): string {
   return formatDuration(seconds);
 }
 
-function formatJitDuration(
+type CompileTimingTotals = {
+  symbolic_setup_s?: number | null;
+  jit_s?: number | null;
+};
+
+function sumKnownDurations(values: Array<number | null | undefined>): number | null {
+  let total = 0.0;
+  let sawValue = false;
+  for (const value of values) {
+    if (value == null || !Number.isFinite(value)) {
+      continue;
+    }
+    total += value;
+    sawValue = true;
+  }
+  return sawValue ? total : null;
+}
+
+function preSolveSeconds(timing: CompileTimingTotals | null | undefined): number | null {
+  if (!timing) {
+    return null;
+  }
+  if (
+    timing.symbolic_setup_s == null ||
+    timing.jit_s == null ||
+    !Number.isFinite(timing.symbolic_setup_s) ||
+    !Number.isFinite(timing.jit_s)
+  ) {
+    return null;
+  }
+  return sumKnownDurations([timing.symbolic_setup_s, timing.jit_s]);
+}
+
+type JitCacheOutcome = "unknown" | "disk_hit" | "disk_miss" | "mixed";
+
+type JitCacheCounts = {
+  hits: number;
+  misses: number;
+};
+
+function cacheOutcomeFromCounts(counts: JitCacheCounts | null): JitCacheOutcome {
+  if (!counts) {
+    return "unknown";
+  }
+  if (counts.hits > 0 && counts.misses === 0) {
+    return "disk_hit";
+  }
+  if (counts.misses > 0 && counts.hits === 0) {
+    return "disk_miss";
+  }
+  if (counts.hits > 0 && counts.misses > 0) {
+    return "mixed";
+  }
+  return "unknown";
+}
+
+function cacheOutcomeFromFlag(jitDiskCacheHit: boolean): JitCacheOutcome {
+  return jitDiskCacheHit ? "disk_hit" : "disk_miss";
+}
+
+function cacheOutcomeSuffix(outcome: JitCacheOutcome): string {
+  switch (outcome) {
+    case "disk_hit":
+      return "disk hit";
+    case "disk_miss":
+      return "disk miss";
+    case "mixed":
+      return "mixed cache";
+    default:
+      return "cache unknown";
+  }
+}
+
+function formatJitDurationWithOutcome(
   seconds: number | null | undefined,
-  jitDiskCacheHit: boolean,
+  outcome: JitCacheOutcome,
 ): string {
   const formatted = formatDuration(seconds);
   if (formatted === "--") {
     return formatted;
   }
-  return `${formatted} (${jitDiskCacheHit ? "disk hit" : "disk miss"})`;
+  if (outcome === "unknown") {
+    return formatted;
+  }
+  return `${formatted} (${cacheOutcomeSuffix(outcome)})`;
 }
 
 function emptySolverPhaseDetails(): SolverPhaseDetails {
@@ -2837,11 +2931,13 @@ function renderCompileCacheStatus(): void {
     const timingGroups = renderCompileCacheTimingGroups(row, report);
     const problemTitle = escapeHtml(row.problem_name);
     const variantTitle = escapeHtml(row.variant_label);
+    const cacheCounts = cacheCountsForCompileRow(row, report);
+    const cacheOutcome = cacheOutcomeForCompileRow(row, report);
     const statusTitle = report == null
       ? "Compile report pending"
-      : `cache hits/misses: ${report.llvm_cache_hits}/${report.llvm_cache_misses}; kernels: ${report.kernels.length}`;
+      : `cache ${cacheCountsText(cacheCounts)}; kernels: ${report.kernels.length}`;
     const statusText = statusLabel === "ready" && row.jit_s != null
-      ? `${statusLabel}${row.jit_disk_cache_hit ? " · disk hit" : " · disk miss"}`
+      ? `${statusLabel}${cacheOutcome === "unknown" ? "" : ` · ${cacheOutcomeSuffix(cacheOutcome)}`}`
       : statusLabel;
     const timingHtml = timingGroups
       .join("");
@@ -2851,10 +2947,8 @@ function renderCompileCacheStatus(): void {
       <div class="compile-cache-status" title="${escapeHtml(statusTitle)}"><span class="compile-cache-badge compile-cache-badge-${statusLabel}">${escapeHtml(statusText)}</span></div>
       <div class="compile-cache-metrics">${timingHtml}</div>
     `;
-    const cacheHits = report?.llvm_cache_hits ?? 0;
-    const cacheMisses = report?.llvm_cache_misses ?? 0;
     const kernelCount = report?.kernels.length ?? 0;
-    rowEl.title = `symbolic total: ${formatCompileDuration(row.symbolic_setup_s)}; cache hits/misses: ${cacheHits}/${cacheMisses}; kernels: ${kernelCount}`;
+    rowEl.title = `pre-solve: ${formatCompileDuration(preSolveSeconds(row))}; symbolic total: ${formatCompileDuration(row.symbolic_setup_s)}; ${cacheCountsText(cacheCounts)}; kernels: ${kernelCount}`;
     table.appendChild(rowEl);
   }
 
@@ -2866,6 +2960,235 @@ type CompileCacheMetric = {
   title: string;
   value: string;
 };
+
+type CompileMetricSource = {
+  row: CompileCacheStatus;
+  report: WireCompileReportSummary | null;
+  details: SolverPhaseDetail[];
+};
+
+type CompileMetricSpec = {
+  label: string;
+  title: string;
+  phaseLabel?: string;
+  seconds?: (source: CompileMetricSource) => number | null | undefined;
+  count?: (source: CompileMetricSource) => number | null | undefined;
+  value?: (source: CompileMetricSource) => string | null | undefined;
+  always?: boolean;
+  preferNumeric?: boolean;
+};
+
+const SYMBOLIC_PHASE_LABEL = {
+  build: "Build Problem",
+  objectiveGradient: "Objective Gradient",
+  equalityJacobian: "Equality Jacobian",
+  inequalityJacobian: "Inequality Jacobian",
+  lagrangianAssembly: "Lagrangian Assembly",
+  hessianGeneration: "Hessian Generation",
+} as const;
+
+const JIT_PHASE_LABEL = {
+  sxLowering: "SX Lowering",
+  llvmCacheKey: "LLVM Cache Key",
+  llvmCacheHits: "LLVM Cache Hits",
+  llvmCacheMisses: "LLVM Cache Misses",
+  llvmCacheCheck: "LLVM Cache Check",
+  llvmCacheRead: "LLVM Cache Object Read",
+  llvmCacheWrite: "LLVM Cache Object Write",
+  llvmCacheHitTotal: "LLVM Cache Hit Total",
+  llvmObjectMaterialization: "LLVM Object Materialization",
+  llvmModuleBuild: "LLVM Module Build",
+  llvmOptimize: "LLVM Optimize",
+  llvmObjectEmit: "LLVM Object Emit",
+  llvmIrFingerprint: "LLVM IR Fingerprint",
+  llvmCompileLoad: "LLVM Compile / Load",
+  jitContextAllocation: "JIT Context Allocation",
+  xdotHelper: "Xdot Helper",
+  rk4ArcHelper: "RK4 Arc Helper",
+} as const;
+
+const SYMBOLIC_COMPONENT_METRICS: CompileMetricSpec[] = [
+  {
+    label: "Build",
+    title: "Symbolic model construction",
+    phaseLabel: SYMBOLIC_PHASE_LABEL.build,
+    seconds: ({ row, report }) => report?.symbolic_construction_s ?? row.symbolic_build_s,
+    always: true,
+    preferNumeric: true,
+  },
+  {
+    label: "Objective grad",
+    title: "Objective gradient generation",
+    phaseLabel: SYMBOLIC_PHASE_LABEL.objectiveGradient,
+    seconds: ({ report }) => report?.objective_gradient_s,
+    preferNumeric: true,
+  },
+  {
+    label: "Eq Jacobian",
+    title: "Equality Jacobian generation",
+    phaseLabel: SYMBOLIC_PHASE_LABEL.equalityJacobian,
+    seconds: ({ report }) => report?.equality_jacobian_s,
+    preferNumeric: true,
+  },
+  {
+    label: "Ineq Jacobian",
+    title: "Inequality Jacobian generation",
+    phaseLabel: SYMBOLIC_PHASE_LABEL.inequalityJacobian,
+    seconds: ({ report }) => report?.inequality_jacobian_s,
+    preferNumeric: true,
+  },
+  {
+    label: "Lagrangian",
+    title: "Lagrangian assembly",
+    phaseLabel: SYMBOLIC_PHASE_LABEL.lagrangianAssembly,
+    seconds: ({ report }) => report?.lagrangian_assembly_s,
+    preferNumeric: true,
+  },
+  {
+    label: "Hessian",
+    title: "Lagrangian Hessian generation",
+    phaseLabel: SYMBOLIC_PHASE_LABEL.hessianGeneration,
+    seconds: ({ report }) => report?.hessian_generation_s,
+    preferNumeric: true,
+  },
+];
+
+const SYMBOLIC_FALLBACK_METRICS: CompileMetricSpec[] = [
+  {
+    label: "Build",
+    title: "Symbolic model construction",
+    seconds: ({ row }) => row.symbolic_build_s,
+    always: true,
+  },
+  {
+    label: "Symbolic work",
+    title: "Elapsed symbolic setup work after model construction",
+    seconds: ({ row }) => row.symbolic_derivatives_s,
+    always: true,
+  },
+  {
+    label: "Elapsed",
+    title: "Elapsed symbolic setup time",
+    seconds: ({ row }) => row.symbolic_setup_s,
+    always: true,
+  },
+];
+
+const JIT_CACHE_METRICS: CompileMetricSpec[] = [
+  {
+    label: "Hits",
+    title: "LLVM JIT disk-cache hits across NLP and helper kernels",
+    phaseLabel: JIT_PHASE_LABEL.llvmCacheHits,
+    count: ({ report }) => report?.llvm_cache_hits,
+  },
+  {
+    label: "Misses",
+    title: "LLVM JIT disk-cache misses across NLP and helper kernels",
+    phaseLabel: JIT_PHASE_LABEL.llvmCacheMisses,
+    count: ({ report }) => report?.llvm_cache_misses,
+  },
+  {
+    label: "Key",
+    title: "Cache-key and lowered-function fingerprint generation",
+    phaseLabel: JIT_PHASE_LABEL.llvmCacheKey,
+    seconds: ({ report }) => report?.llvm_cache_key_s,
+  },
+  {
+    label: "Check",
+    title: "Cache manifest lookup and validation across NLP and helper kernels",
+    phaseLabel: JIT_PHASE_LABEL.llvmCacheCheck,
+    seconds: ({ report }) => report?.llvm_cache_check_s,
+  },
+  {
+    label: "Read",
+    title: "Cached object file read across NLP and helper kernels",
+    phaseLabel: JIT_PHASE_LABEL.llvmCacheRead,
+    seconds: ({ report }) => report?.llvm_cache_read_s,
+  },
+  {
+    label: "Write",
+    title: "Cached object file write across NLP and helper kernels",
+    phaseLabel: JIT_PHASE_LABEL.llvmCacheWrite,
+    seconds: ({ report }) => report?.llvm_cache_write_s,
+  },
+  {
+    label: "Hit path",
+    title: "Total cache-hit load path across NLP and helper kernels",
+    phaseLabel: JIT_PHASE_LABEL.llvmCacheHitTotal,
+    seconds: ({ report }) => report?.llvm_cache_load_s,
+  },
+  {
+    label: "Materialize",
+    title: "LLVM object materialization across NLP and helper kernels",
+    phaseLabel: JIT_PHASE_LABEL.llvmObjectMaterialization,
+    seconds: ({ report }) => report?.llvm_cache_materialize_s,
+  },
+];
+
+const JIT_NLP_LLVM_METRICS: CompileMetricSpec[] = [
+  {
+    label: "SX lowering",
+    title: "SX lowering",
+    phaseLabel: JIT_PHASE_LABEL.sxLowering,
+    seconds: ({ report }) => report?.lowering_s,
+    preferNumeric: true,
+  },
+  {
+    label: "Module",
+    title: "LLVM module construction",
+    phaseLabel: JIT_PHASE_LABEL.llvmModuleBuild,
+    seconds: ({ report }) => report?.llvm_module_build_s,
+    preferNumeric: true,
+  },
+  {
+    label: "Optimize",
+    title: "LLVM optimization passes",
+    phaseLabel: JIT_PHASE_LABEL.llvmOptimize,
+    seconds: ({ report }) => report?.llvm_optimization_s,
+    preferNumeric: true,
+  },
+  {
+    label: "Emit object",
+    title: "LLVM object-code emission",
+    phaseLabel: JIT_PHASE_LABEL.llvmObjectEmit,
+    seconds: ({ report }) => report?.llvm_object_emit_s,
+    preferNumeric: true,
+  },
+  {
+    label: "IR fingerprint",
+    title: "Optimized LLVM IR fingerprint generation",
+    phaseLabel: JIT_PHASE_LABEL.llvmIrFingerprint,
+    seconds: ({ report }) => report?.llvm_ir_fingerprint_s,
+    preferNumeric: true,
+  },
+  {
+    label: "LLVM total",
+    title: "LLVM compile/load total",
+    phaseLabel: JIT_PHASE_LABEL.llvmCompileLoad,
+    seconds: ({ report }) => report?.llvm_jit_s,
+    preferNumeric: true,
+  },
+  {
+    label: "Context",
+    title: "JIT execution-context allocation",
+    phaseLabel: JIT_PHASE_LABEL.jitContextAllocation,
+    seconds: ({ report }) => report?.jit_context_s,
+    preferNumeric: true,
+  },
+];
+
+const JIT_HELPER_METRICS: CompileMetricSpec[] = [
+  {
+    label: "Xdot helper",
+    title: "OCP dynamics helper compile",
+    phaseLabel: JIT_PHASE_LABEL.xdotHelper,
+  },
+  {
+    label: "RK4 helper",
+    title: "Multiple-shooting arc helper compile",
+    phaseLabel: JIT_PHASE_LABEL.rk4ArcHelper,
+  },
+];
 
 function compileDurationMetric(
   label: string,
@@ -2925,43 +3248,305 @@ function renderCompileCacheTimingGroup(
   `;
 }
 
+function findSolverPhaseDetail(
+  details: SolverPhaseDetail[],
+  label: string,
+): SolverPhaseDetail | null {
+  return details.find((detail) => detail.label === label) ?? null;
+}
+
+function parseCompileDurationSeconds(value: string): number | null {
+  const match = value.trim().match(/^([0-9]+(?:\.[0-9]+)?)\s*(us|µs|ms|s)$/i);
+  if (!match) {
+    return null;
+  }
+  const amount = Number(match[1]);
+  if (!Number.isFinite(amount)) {
+    return null;
+  }
+  switch (match[2].toLowerCase()) {
+    case "s":
+      return amount;
+    case "ms":
+      return amount / 1.0e3;
+    case "us":
+    case "µs":
+      return amount / 1.0e6;
+    default:
+      return null;
+  }
+}
+
+function phaseDetailSeconds(details: SolverPhaseDetail[], label: string): number | null {
+  const detail = findSolverPhaseDetail(details, label);
+  return detail ? parseCompileDurationSeconds(detail.value) : null;
+}
+
+function phaseDetailInteger(details: SolverPhaseDetail[], label: string): number | null {
+  const detail = findSolverPhaseDetail(details, label);
+  if (!detail) {
+    return null;
+  }
+  const parsed = Number(detail.value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function compileMetricFromPhaseDetail(
+  details: SolverPhaseDetail[],
+  spec: CompileMetricSpec,
+): CompileCacheMetric | null {
+  if (!spec.phaseLabel) {
+    return null;
+  }
+  const detail = findSolverPhaseDetail(details, spec.phaseLabel);
+  if (!detail) {
+    return null;
+  }
+  return {
+    label: spec.label,
+    title: spec.title,
+    value: detail.value,
+  };
+}
+
+function compileMetricFromNumericSource(
+  source: CompileMetricSource,
+  spec: CompileMetricSpec,
+): CompileCacheMetric | null {
+  if (spec.value) {
+    const value = spec.value(source);
+    if (value == null || (!spec.always && value === "--")) {
+      return null;
+    }
+    return {
+      label: spec.label,
+      title: spec.title,
+      value,
+    };
+  }
+  if (spec.count) {
+    return compileCountMetric(spec.label, spec.title, spec.count(source));
+  }
+  if (spec.seconds) {
+    return compileDurationMetric(spec.label, spec.title, spec.seconds(source), {
+      always: spec.always,
+    });
+  }
+  return null;
+}
+
+function compileMetricFromSpec(
+  source: CompileMetricSource,
+  spec: CompileMetricSpec,
+): CompileCacheMetric | null {
+  if (spec.preferNumeric) {
+    const numericMetric = compileMetricFromNumericSource(source, spec);
+    if (numericMetric && numericMetric.value !== "--") {
+      return numericMetric;
+    }
+    return compileMetricFromPhaseDetail(source.details, spec) ?? numericMetric;
+  }
+  return (
+    compileMetricFromPhaseDetail(source.details, spec) ??
+    compileMetricFromNumericSource(source, spec)
+  );
+}
+
+function compileMetricsFromSpecs(
+  source: CompileMetricSource,
+  specs: CompileMetricSpec[],
+): Array<CompileCacheMetric | null> {
+  return specs.map((spec) => compileMetricFromSpec(source, spec));
+}
+
+function compileMetricSecondsFromSpec(
+  source: CompileMetricSource,
+  spec: CompileMetricSpec,
+): number | null {
+  if (spec.preferNumeric) {
+    const numeric = spec.seconds?.(source);
+    if (numeric != null) {
+      return numeric;
+    }
+  }
+  if (spec.phaseLabel) {
+    const phaseSeconds = phaseDetailSeconds(source.details, spec.phaseLabel);
+    if (phaseSeconds != null) {
+      return phaseSeconds;
+    }
+  }
+  return spec.seconds?.(source) ?? null;
+}
+
+function hasAnyPhaseDetail(details: SolverPhaseDetail[], specs: CompileMetricSpec[]): boolean {
+  return specs.some((spec) => spec.phaseLabel && findSolverPhaseDetail(details, spec.phaseLabel));
+}
+
+function cacheCountsFromReport(report: WireCompileReportSummary | null | undefined): JitCacheCounts | null {
+  if (!report) {
+    return null;
+  }
+  return {
+    hits: report.llvm_cache_hits,
+    misses: report.llvm_cache_misses,
+  };
+}
+
+function cacheCountsFromPhaseDetails(details: SolverPhaseDetail[]): JitCacheCounts | null {
+  const hits = phaseDetailInteger(details, JIT_PHASE_LABEL.llvmCacheHits);
+  const misses = phaseDetailInteger(details, JIT_PHASE_LABEL.llvmCacheMisses);
+  if (hits == null && misses == null) {
+    return null;
+  }
+  return {
+    hits: hits ?? 0,
+    misses: misses ?? 0,
+  };
+}
+
+function cacheCountsForCompileRow(
+  row: CompileCacheStatus,
+  report: WireCompileReportSummary | null,
+): JitCacheCounts | null {
+  return cacheCountsFromPhaseDetails(row.phase_details.jit) ?? cacheCountsFromReport(report);
+}
+
+function cacheCountsText(counts: JitCacheCounts | null): string {
+  if (!counts) {
+    return "cache counts pending";
+  }
+  return `${counts.hits} hit${counts.hits === 1 ? "" : "s"} / ${counts.misses} miss${counts.misses === 1 ? "" : "es"}`;
+}
+
+function cacheOutcomeForCompileRow(
+  row: CompileCacheStatus,
+  report: WireCompileReportSummary | null,
+): JitCacheOutcome {
+  const counted = cacheOutcomeFromCounts(cacheCountsForCompileRow(row, report));
+  if (counted !== "unknown") {
+    return counted;
+  }
+  if (row.jit_s != null) {
+    return cacheOutcomeFromFlag(row.jit_disk_cache_hit);
+  }
+  return "unknown";
+}
+
+function currentCompileReport(): WireCompileReportSummary | null {
+  return state.liveStatus?.compile_report ?? state.artifact?.compile_report ?? null;
+}
+
+function cacheOutcomeForSolver(solver: SolverReport | null | undefined): JitCacheOutcome {
+  const fromReport = cacheOutcomeFromCounts(cacheCountsFromReport(currentCompileReport()));
+  if (fromReport !== "unknown") {
+    return fromReport;
+  }
+  if (solver?.jit_s != null) {
+    return cacheOutcomeFromFlag(solver.jit_disk_cache_hit || solver.compile_cached);
+  }
+  return "unknown";
+}
+
+function sumKnownSymbolicSeconds(values: Array<number | null | undefined>): number {
+  return values.reduce<number>((sum, value) => sum + (value ?? 0), 0);
+}
+
+function knownSymbolicSeconds(source: CompileMetricSource): number {
+  return sumKnownSymbolicSeconds(
+    SYMBOLIC_COMPONENT_METRICS.map((spec) => compileMetricSecondsFromSpec(source, spec)),
+  );
+}
+
+function residualCompileMetric(
+  label: string,
+  title: string,
+  totalSeconds: number | null | undefined,
+  knownSeconds: number,
+): CompileCacheMetric | null {
+  if (totalSeconds == null) {
+    return null;
+  }
+  const residualSeconds = totalSeconds - knownSeconds;
+  if (residualSeconds <= 1.0e-3) {
+    return null;
+  }
+  return {
+    label,
+    title,
+    value: formatCompileDuration(residualSeconds),
+  };
+}
+
+function symbolicCompileMetrics(
+  row: CompileCacheStatus,
+  report: WireCompileReportSummary | null,
+): Array<CompileCacheMetric | null> {
+  const source = {
+    row,
+    report,
+    details: row.phase_details.symbolic_setup,
+  };
+  const hasDetailedSymbolicMetrics = hasAnyPhaseDetail(
+    source.details,
+    SYMBOLIC_COMPONENT_METRICS.filter((spec) => spec.phaseLabel !== SYMBOLIC_PHASE_LABEL.build),
+  );
+
+  if (!report && !hasDetailedSymbolicMetrics) {
+    return compileMetricsFromSpecs(source, SYMBOLIC_FALLBACK_METRICS);
+  }
+
+  return [
+    ...compileMetricsFromSpecs(source, SYMBOLIC_COMPONENT_METRICS),
+    residualCompileMetric(
+      !report && row.state === COMPILE_CACHE_STATE.warming ? "Current / other" : "Other",
+      report
+        ? "Symbolic setup time not covered by visible symbolic buckets"
+        : "Elapsed symbolic setup time not covered by completed visible symbolic buckets",
+      row.symbolic_setup_s,
+      knownSymbolicSeconds(source),
+    ),
+    compileDurationMetric(
+      !report && row.state === COMPILE_CACHE_STATE.warming ? "Elapsed" : "Total",
+      "Symbolic setup total",
+      row.symbolic_setup_s,
+      { always: true },
+    ),
+  ];
+}
+
 function renderCompileCacheTimingGroups(
   row: CompileCacheStatus,
   report: WireCompileReportSummary | null,
 ): string[] {
+  const symbolicMetrics = symbolicCompileMetrics(row, report);
+  const jitSource = {
+    row,
+    report,
+    details: row.phase_details.jit,
+  };
+  const cacheOutcome = cacheOutcomeForCompileRow(row, report);
   return [
-    renderCompileCacheTimingGroup("Symbolic", [
-      compileDurationMetric("Build", "Symbolic model construction", row.symbolic_build_s, { always: true }),
-      compileDurationMetric("Derivatives", "Symbolic derivative generation", row.symbolic_derivatives_s, { always: true }),
-      compileDurationMetric("Hessian", "Lagrangian Hessian generation", report?.hessian_generation_s ?? null),
-      compileDurationMetric("Total", "Symbolic setup total", row.symbolic_setup_s, { always: true }),
-    ]),
-    renderCompileCacheTimingGroup("JIT Cache", [
-      compileCountMetric("Hits", "LLVM JIT disk-cache hits", report?.llvm_cache_hits),
-      compileCountMetric("Misses", "LLVM JIT disk-cache misses", report?.llvm_cache_misses),
-      compileDurationMetric("Key", "Cache-key and lowered-function fingerprint generation", report?.llvm_cache_key_s ?? null),
-      compileDurationMetric("Check", "Cache manifest lookup and validation", report?.llvm_cache_check_s ?? null),
-      compileDurationMetric("Read", "Cached object file read", report?.llvm_cache_read_s ?? null),
-      compileDurationMetric("Write", "Cached object file write", report?.llvm_cache_write_s ?? null),
-      compileDurationMetric("Hit path", "Total cache-hit load path", report?.llvm_cache_load_s ?? null),
-      compileDurationMetric("Materialize", "LLVM object materialization", report?.llvm_cache_materialize_s ?? null),
-    ]),
-    renderCompileCacheTimingGroup("Lowering / LLVM", [
-      compileDurationMetric("SX lowering", "SX lowering", report?.lowering_s ?? null),
-      compileDurationMetric("Module", "LLVM module construction", report?.llvm_module_build_s ?? null),
-      compileDurationMetric("Optimize", "LLVM optimization passes", report?.llvm_optimization_s ?? null),
-      compileDurationMetric("Emit object", "LLVM object-code emission", report?.llvm_object_emit_s ?? null),
-      compileDurationMetric("IR fingerprint", "Optimized LLVM IR fingerprint generation", report?.llvm_ir_fingerprint_s ?? null),
-      compileDurationMetric("LLVM total", "LLVM compile/load total", report?.llvm_jit_s ?? null),
-      compileDurationMetric("Context", "JIT execution-context allocation", report?.jit_context_s ?? null),
-    ]),
-    renderCompileCacheTimingGroup("Overall", [
-      {
-        label: "JIT total",
-        title: "Outer JIT phase total",
-        value: formatJitDuration(row.jit_s, row.jit_disk_cache_hit),
-      },
-    ]),
+    renderCompileCacheTimingGroup("Symbolic", symbolicMetrics),
+    renderCompileCacheTimingGroup("JIT Cache", compileMetricsFromSpecs(jitSource, JIT_CACHE_METRICS)),
+    renderCompileCacheTimingGroup("NLP Lowering / LLVM", compileMetricsFromSpecs(jitSource, JIT_NLP_LLVM_METRICS)),
+    renderCompileCacheTimingGroup("OCP Helpers", compileMetricsFromSpecs(jitSource, JIT_HELPER_METRICS)),
+    renderCompileCacheTimingGroup(
+      "Overall",
+      compileMetricsFromSpecs(jitSource, [
+        {
+          label: "Pre-solve",
+          title: "Symbolic setup plus JIT stage before calling the NLP solver",
+          value: ({ row: sourceRow }) => formatCompileDuration(preSolveSeconds(sourceRow)),
+          always: true,
+        },
+        {
+          label: "JIT stage",
+          title: "JIT stage total, including OCP helper kernels when reported",
+          value: ({ row: sourceRow }) => formatJitDurationWithOutcome(sourceRow.jit_s, cacheOutcome),
+          always: true,
+        },
+      ]),
+    ),
   ].filter((group) => group.length > 0);
 }
 
@@ -3027,6 +3612,7 @@ function normalizeCompileCacheStatus(status: WireCompileCacheStatus): CompileCac
     symbolic_setup_s: status.symbolic_setup_s ?? null,
     jit_s: status.jit_s ?? null,
     jit_disk_cache_hit: status.jit_disk_cache_hit ?? false,
+    phase_details: normalizeSolverPhaseDetails(status.phase_details),
     compile_report: status.compile_report ?? null,
   };
 }
@@ -3141,6 +3727,7 @@ function normalizeSolveStatus(status: WireSolveStatus): SolveStatus {
         ? null
         : decodeWireEnum(SOLVER_METHOD_FROM_WIRE, status.solver_method, SOLVER_METHOD.nlip),
     solver: normalizeSolverReport(status.solver),
+    compile_report: status.compile_report ?? null,
   };
 }
 
@@ -3148,6 +3735,7 @@ function normalizeArtifact(artifact: WireSolveArtifact): SolveArtifact {
   return {
     ...artifact,
     solver: normalizeSolverReport(artifact.solver),
+    compile_report: artifact.compile_report ?? null,
     summary: (artifact.summary ?? []).map(normalizeMetric),
     constraint_panels: normalizeConstraintPanels(artifact.constraint_panels),
     charts: (artifact.charts ?? []).map(normalizeChart),
@@ -3428,7 +4016,9 @@ async function clearJitCache(): Promise<void> {
     if (!response.ok) {
       throw new Error(readOptionalErrorMessage(payload) ?? `Request failed with ${response.status}`);
     }
-    appendLogLine("Cleared on-disk LLVM JIT cache.", LOG_LEVEL.info);
+    state.compileCacheStatuses = [];
+    renderCompileCacheStatus();
+    appendLogLine("Cleared on-disk LLVM JIT cache and in-process compile statuses.", LOG_LEVEL.info);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn("failed to clear LLVM JIT cache", error);
@@ -4988,11 +5578,13 @@ function renderMetrics(): void {
     },
     {
       label: "JIT",
-      value: formatJitDuration(
-        solver?.jit_s ?? null,
-        solver?.jit_disk_cache_hit ?? solver?.compile_cached ?? false,
-      ),
+      value: formatJitDurationWithOutcome(solver?.jit_s ?? null, cacheOutcomeForSolver(solver)),
       active: activeStage === SOLVE_STAGE.jitCompilation,
+    },
+    {
+      label: "Pre-solve",
+      value: formatCompileDuration(preSolveSeconds(solver)),
+      active: activeStage === SOLVE_STAGE.symbolicSetup || activeStage === SOLVE_STAGE.jitCompilation,
     },
   ];
   metricsEl.className = "metrics";
@@ -5788,10 +6380,7 @@ function renderSolverPhaseSummary(solver: SolverReport): HTMLElement {
     }),
     createSolverPhaseCard({
       label: "JIT",
-      value: formatJitDuration(
-        solver.jit_s ?? null,
-        solver.jit_disk_cache_hit || solver.compile_cached,
-      ),
+      value: formatJitDurationWithOutcome(solver.jit_s ?? null, cacheOutcomeForSolver(solver)),
       active: activeStage === SOLVE_STAGE.jitCompilation,
       details: solver.phase_details.jit,
       fallbackText: "Compiling numeric evaluation kernels.",
