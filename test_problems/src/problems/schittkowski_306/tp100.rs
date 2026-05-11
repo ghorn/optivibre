@@ -15,18 +15,18 @@ pub(super) fn tp100() -> ProblemCase {
             SymbolicNlpOutputs {
                 objective: (x0 - 10.0).sqr()
                     + 5.0 * (x1 - 12.0).sqr()
-                    + x2.powf(4.0)
+                    + x2.powi(4)
                     + 3.0 * (x3 - 11.0).sqr()
-                    + 10.0 * x4.powf(6.0)
+                    + 10.0 * x4.powi(6)
                     + 7.0 * x5.sqr()
-                    + x6.powf(4.0)
+                    + x6.powi(4)
                     - 4.0 * x5 * x6
                     - 10.0 * x5
                     - 8.0 * x6,
                 equalities: VecN { values: [] },
                 inequalities: VecN {
                     values: [
-                        -(-2.0 * x0.sqr() - 3.0 * x1.powf(4.0) - x2 - 4.0 * x3.sqr() - 5.0 * x4
+                        -(-2.0 * x0.sqr() - 3.0 * x1.powi(4) - x2 - 4.0 * x3.sqr() - 5.0 * x4
                             + 127.0),
                         -(-7.0 * x0 - 3.0 * x1 - 10.0 * x2.sqr() - x3 + x4 + 282.0),
                         -(-23.0 * x0 - x1.sqr() - 6.0 * x5.sqr() + 8.0 * x6 + 196.0),

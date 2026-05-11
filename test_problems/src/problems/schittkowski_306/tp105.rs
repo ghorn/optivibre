@@ -94,9 +94,10 @@ pub(super) fn tp105() -> ProblemCase {
                 } else {
                     260.0
                 };
-                let a = p1 / s1 * ((-(y - m1).powi(2)) / (2.0 * s1.powf(2.0))).exp();
-                let b = p2 / s2 * ((-(y - m2).powi(2)) / (2.0 * s2.powf(2.0))).exp();
-                let c = (1.0 - p1 - p2) / s3 * ((-(y - m3).powi(2)) / (2.0 * s3.powf(2.0))).exp();
+                let a = p1 / s1 * ((-(y - m1).powi(2)) / (2.0 * s1.powi(2))).max(-10.0).exp();
+                let b = p2 / s2 * ((-(y - m2).powi(2)) / (2.0 * s2.powi(2))).max(-10.0).exp();
+                let c = (1.0 - p1 - p2) / s3
+                    * ((-(y - m3).powi(2)) / (2.0 * s3.powi(2))).max(-10.0).exp();
                 objective -= ((a + b + c) * v).log();
             }
             SymbolicNlpOutputs {

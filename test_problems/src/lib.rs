@@ -14,9 +14,9 @@ pub use manifest::{
     manifest_entry_by_id, slow_burkardt_manifest_entry, slow_manifest_entry,
 };
 pub use model::{
-    CallPolicyMode, JitOptLevel, ProblemCase, ProblemDescriptor, ProblemRunOptions,
-    ProblemRunRecord, ResultCacheInfo, ResultCacheStatus, RunArtifacts, RunStatus, SolverKind,
-    SolverMetrics, SolverTimingBreakdown, ValidationOutcome,
+    CallPolicyMode, JitOptLevel, NlipLinearSolverMode, ProblemCase, ProblemDescriptor,
+    ProblemRunOptions, ProblemRunRecord, ResultCacheInfo, ResultCacheStatus, RunArtifacts,
+    RunStatus, SolverKind, SolverMetrics, SolverTimingBreakdown, ValidationOutcome,
 };
 pub use registry::registry;
 pub use report::{

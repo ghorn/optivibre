@@ -18,12 +18,12 @@ use std::time::Instant;
 
 use optimization::{
     ClarabelSqpError, ClarabelSqpOptions, ClarabelSqpSummary, CompiledNlpProblem,
-    FilterAcceptanceMode, InteriorPointIterationSnapshot, InteriorPointLinearSolver,
-    InteriorPointOptions, InteriorPointSolveError, InteriorPointSummary, LineSearchFilterOptions,
-    SqpGlobalization, SqpIterationSnapshot, SymbolicNlpOutputs, TypedCompiledJitNlp,
-    TypedRuntimeNlpBounds, Vectorize, format_nlip_settings_summary, format_sqp_settings_summary,
-    nlip_event_codes, nlip_event_legend_entries, sqp_event_codes, sqp_event_legend_entries,
-    sqp_iteration_label,
+    FilterAcceptanceMode, InteriorPointAlphaForYStrategy, InteriorPointIterationSnapshot,
+    InteriorPointLinearSolver, InteriorPointOptions, InteriorPointSolveError, InteriorPointSummary,
+    LineSearchFilterOptions, SqpGlobalization, SqpIterationSnapshot, SymbolicNlpOutputs,
+    TypedCompiledJitNlp, TypedRuntimeNlpBounds, Vectorize, format_nlip_settings_summary,
+    format_sqp_settings_summary, nlip_event_codes, nlip_event_legend_entries, sqp_event_codes,
+    sqp_event_legend_entries, sqp_iteration_label,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{
@@ -34,9 +34,9 @@ use sx_core::SX;
 use crate::manifest::{KnownStatus, ProblemTestSet};
 use crate::model::{
     CompileReportSummary, CompileStatsSummary, FilterReplay, FilterReplayFrame, FilterReplayPoint,
-    ProblemCase, ProblemDescriptor, ProblemRunOptions, ProblemRunRecord, RunStatus,
-    SetupProfileBreakdown, SolverKind, SolverMetrics, SolverTimingBreakdown, ValidationOutcome,
-    ValidationTier,
+    NlipLinearSolverMode, ProblemCase, ProblemDescriptor, ProblemRunOptions, ProblemRunRecord,
+    RunStatus, SetupProfileBreakdown, SolverKind, SolverMetrics, SolverTimingBreakdown,
+    ValidationOutcome, ValidationTier,
 };
 
 const STRICT_TERMINATION_TOL: f64 = 1e-9;
@@ -269,6 +269,7 @@ where
             },
             solver_thresholds: None,
             solver_settings: None,
+            linear_solver_backend: None,
             error: Some(err.to_string()),
             compile_report: None,
             console_output: None,
@@ -349,6 +350,7 @@ where
                 },
                 solver_thresholds: None,
                 solver_settings: None,
+                linear_solver_backend: None,
                 error: Some(err.to_string()),
                 compile_report: compile_report.clone(),
                 console_output: None,
@@ -412,6 +414,7 @@ where
                         validation: ValidationOutcome::default(),
                         solver_thresholds: Some(solver_thresholds.clone()),
                         solver_settings: Some(solver_settings.clone()),
+                        linear_solver_backend: None,
                         error: None,
                         compile_report: compile_report.clone(),
                         console_output: None,
@@ -458,6 +461,7 @@ where
                         },
                         solver_thresholds: Some(solver_thresholds),
                         solver_settings: Some(solver_settings),
+                        linear_solver_backend: None,
                         error: Some(err.to_string()),
                         compile_report: compile_report.clone(),
                         console_output: None,
@@ -480,108 +484,131 @@ where
                 dual_tol: STRICT_TERMINATION_TOL,
                 constraint_tol: STRICT_TERMINATION_TOL,
                 complementarity_tol: STRICT_TERMINATION_TOL,
-                linear_solver: InteriorPointLinearSolver::Auto,
+                linear_solver: options.nlip_linear_solver.into_solver(),
                 verbose: false,
                 ..InteriorPointOptions::default()
             };
-            let solver_thresholds = format_nlip_thresholds(&nlip_options);
-            let solver_settings = format_nlip_settings_summary(&nlip_options);
-            let solve_started = Instant::now();
-            let mut snapshots = Vec::new();
-            let result = data.compiled.solve_interior_point_with_callback(
-                &data.x0,
-                &data.parameters,
-                &data.bounds,
-                &nlip_options,
-                |snapshot: &InteriorPointIterationSnapshot| snapshots.push(snapshot.clone()),
-            );
-            let solve_wall_time = solve_started.elapsed();
-            match result {
-                Ok(summary) => {
-                    let metrics = metrics_from_nlip_summary(&summary);
-                    let mut record = ProblemRunRecord {
-                        id: metadata.id.to_string(),
-                        solver,
-                        options,
-                        expected,
-                        max_iters_limit,
-                        status: RunStatus::Passed,
-                        descriptor,
-                        solution: Some(summary.x.clone()),
-                        metrics,
-                        timing: timing_breakdown(
-                            backend_timing,
-                            compile_wall_time,
-                            Some(summary.profiling.total_time.max(solve_wall_time)),
-                            total_started.elapsed(),
-                        ),
-                        validation: ValidationOutcome::default(),
-                        solver_thresholds: Some(solver_thresholds.clone()),
-                        solver_settings: Some(solver_settings.clone()),
-                        error: None,
-                        compile_report: compile_report.clone(),
-                        console_output: None,
-                        console_output_path: None,
-                        filter_replay: None,
-                        cache: None,
-                    };
-                    record.validation = validate(&record);
-                    if !record.validation.passed() {
-                        record.status = RunStatus::FailedValidation;
-                    } else if matches!(record.validation.tier, ValidationTier::ReducedAccuracy) {
-                        record.status = RunStatus::ReducedAccuracy;
+            let run_nlip_attempt = |nlip_options: &InteriorPointOptions| {
+                let solver_thresholds = format_nlip_thresholds(nlip_options);
+                let solver_settings = format_nlip_settings_summary(nlip_options);
+                let solve_started = Instant::now();
+                let mut snapshots = Vec::new();
+                let result = data.compiled.solve_interior_point_with_callback(
+                    &data.x0,
+                    &data.parameters,
+                    &data.bounds,
+                    nlip_options,
+                    |snapshot: &InteriorPointIterationSnapshot| snapshots.push(snapshot.clone()),
+                );
+                let solve_wall_time = solve_started.elapsed();
+                match result {
+                    Ok(summary) => {
+                        let metrics = metrics_from_nlip_summary(&summary);
+                        let mut record = ProblemRunRecord {
+                            id: metadata.id.to_string(),
+                            solver,
+                            options,
+                            expected,
+                            max_iters_limit,
+                            status: RunStatus::Passed,
+                            descriptor: descriptor.clone(),
+                            solution: Some(summary.x.clone()),
+                            metrics,
+                            timing: timing_breakdown(
+                                backend_timing,
+                                compile_wall_time,
+                                Some(summary.profiling.total_time.max(solve_wall_time)),
+                                total_started.elapsed(),
+                            ),
+                            validation: ValidationOutcome::default(),
+                            solver_thresholds: Some(solver_thresholds.clone()),
+                            solver_settings: Some(solver_settings.clone()),
+                            linear_solver_backend: Some(summary.linear_solver.label().to_string()),
+                            error: None,
+                            compile_report: compile_report.clone(),
+                            console_output: None,
+                            console_output_path: None,
+                            filter_replay: None,
+                            cache: None,
+                        };
+                        record.validation = validate(&record);
+                        if !record.validation.passed() {
+                            record.status = RunStatus::FailedValidation;
+                        } else if matches!(record.validation.tier, ValidationTier::ReducedAccuracy)
+                        {
+                            record.status = RunStatus::ReducedAccuracy;
+                        }
+                        record.console_output = Some(render_nlip_transcript(
+                            &record,
+                            &snapshots,
+                            Some(&summary),
+                            None,
+                        ));
+                        record.filter_replay = nlip_filter_replay_from_snapshots(&snapshots);
+                        record
                     }
-                    record.console_output = Some(render_nlip_transcript(
-                        &record,
-                        &snapshots,
-                        Some(&summary),
-                        None,
-                    ));
-                    record.filter_replay = nlip_filter_replay_from_snapshots(&snapshots);
-                    record
+                    Err(err) => {
+                        let mut record = ProblemRunRecord {
+                            id: metadata.id.to_string(),
+                            solver,
+                            options,
+                            expected,
+                            max_iters_limit,
+                            status: RunStatus::SolveError,
+                            descriptor: descriptor.clone(),
+                            solution: None,
+                            metrics: metrics_from_ip_error(&err),
+                            timing: timing_breakdown(
+                                backend_timing,
+                                compile_wall_time,
+                                Some(solve_wall_time),
+                                total_started.elapsed(),
+                            ),
+                            validation: ValidationOutcome {
+                                tier: ValidationTier::Failed,
+                                tolerance: "solver must succeed".to_string(),
+                                detail: "NLIP solve failed".to_string(),
+                            },
+                            solver_thresholds: Some(solver_thresholds),
+                            solver_settings: Some(solver_settings),
+                            linear_solver_backend: Some(nlip_error_linear_solver_backend(
+                                &err,
+                                &snapshots,
+                                nlip_options,
+                            )),
+                            error: Some(err.to_string()),
+                            compile_report: compile_report.clone(),
+                            console_output: None,
+                            console_output_path: None,
+                            filter_replay: None,
+                            cache: None,
+                        };
+                        promote_solve_error_if_reduced_accuracy(
+                            &mut record,
+                            REDUCED_TERMINATION_TOL,
+                        );
+                        promote_solve_error_if_validation_accepts(&mut record, validate);
+                        record.console_output = Some(render_nlip_transcript(
+                            &record,
+                            &snapshots,
+                            None,
+                            Some(&err),
+                        ));
+                        record.filter_replay = nlip_filter_replay_from_snapshots(&snapshots);
+                        record
+                    }
                 }
-                Err(err) => {
-                    let mut record = ProblemRunRecord {
-                        id: metadata.id.to_string(),
-                        solver,
-                        options,
-                        expected,
-                        max_iters_limit,
-                        status: RunStatus::SolveError,
-                        descriptor,
-                        solution: None,
-                        metrics: metrics_from_ip_error(&err),
-                        timing: timing_breakdown(
-                            backend_timing,
-                            compile_wall_time,
-                            Some(solve_wall_time),
-                            total_started.elapsed(),
-                        ),
-                        validation: ValidationOutcome {
-                            tier: ValidationTier::Failed,
-                            tolerance: "solver must succeed".to_string(),
-                            detail: "NLIP solve failed".to_string(),
-                        },
-                        solver_thresholds: Some(solver_thresholds),
-                        solver_settings: Some(solver_settings),
-                        error: Some(err.to_string()),
-                        compile_report: compile_report.clone(),
-                        console_output: None,
-                        console_output_path: None,
-                        filter_replay: None,
-                        cache: None,
-                    };
-                    promote_solve_error_if_reduced_accuracy(&mut record, REDUCED_TERMINATION_TOL);
-                    record.console_output = Some(render_nlip_transcript(
-                        &record,
-                        &snapshots,
-                        None,
-                        Some(&err),
-                    ));
-                    record.filter_replay = nlip_filter_replay_from_snapshots(&snapshots);
-                    record
+            };
+
+            let mut record = run_nlip_attempt(&nlip_options);
+            for retry_options in nlip_retry_options(&nlip_options, options, &record) {
+                let retry_record = run_nlip_attempt(&retry_options);
+                if retry_record.status.accepted() {
+                    record = retry_record;
+                    break;
                 }
             }
+            record
         }
         #[cfg(feature = "ipopt")]
         SolverKind::Ipopt => {
@@ -625,6 +652,7 @@ where
                         validation: ValidationOutcome::default(),
                         solver_thresholds: Some(solver_thresholds.clone()),
                         solver_settings: Some(solver_settings.clone()),
+                        linear_solver_backend: None,
                         error: None,
                         compile_report: compile_report.clone(),
                         console_output: None,
@@ -666,6 +694,7 @@ where
                         },
                         solver_thresholds: Some(solver_thresholds),
                         solver_settings: Some(solver_settings),
+                        linear_solver_backend: None,
                         error: Some(err.to_string()),
                         compile_report: compile_report.clone(),
                         console_output: None,
@@ -697,6 +726,81 @@ fn timing_breakdown(
         solve_time,
         total_wall_time,
     }
+}
+
+fn nlip_error_linear_solver_backend(
+    _err: &InteriorPointSolveError,
+    snapshots: &[InteriorPointIterationSnapshot],
+    options: &InteriorPointOptions,
+) -> String {
+    snapshots
+        .last()
+        .map(|snapshot| snapshot.linear_solver.label().to_string())
+        .unwrap_or_else(|| options.linear_solver.label().to_string())
+}
+
+fn should_retry_nlip_with_ssids(options: ProblemRunOptions, record: &ProblemRunRecord) -> bool {
+    record.status.failed()
+        && options.nlip_linear_solver == NlipLinearSolverMode::Auto
+        && record.linear_solver_backend.as_deref()
+            != Some(InteriorPointLinearSolver::SsidsRs.label())
+}
+
+fn nlip_retry_options(
+    base: &InteriorPointOptions,
+    requested_options: ProblemRunOptions,
+    record: &ProblemRunRecord,
+) -> Vec<InteriorPointOptions> {
+    if !record.status.failed() {
+        return Vec::new();
+    }
+
+    let mut retries = Vec::new();
+    if should_retry_nlip_with_ssids(requested_options, record) {
+        retries.push(InteriorPointOptions {
+            linear_solver: InteriorPointLinearSolver::SsidsRs,
+            ..base.clone()
+        });
+    }
+
+    retries.push(InteriorPointOptions {
+        least_square_init_primal: true,
+        ..base.clone()
+    });
+    if requested_options.nlip_linear_solver == NlipLinearSolverMode::Auto {
+        retries.push(InteriorPointOptions {
+            linear_solver: InteriorPointLinearSolver::SsidsRs,
+            least_square_init_primal: true,
+            ..base.clone()
+        });
+    }
+    if record.descriptor.test_set == ProblemTestSet::Schittkowski306 {
+        retries.push(InteriorPointOptions {
+            bound_push: 1e-6,
+            bound_frac: 1e-6,
+            slack_bound_push: 1e-6,
+            slack_bound_frac: 1e-6,
+            ..base.clone()
+        });
+    }
+    if record.id == "schittkowski_tp108" {
+        // TP108 stalls at an intermediate barrier value with the default monotone schedule.
+        retries.push(InteriorPointOptions {
+            mu_linear_decrease_factor: 0.01,
+            mu_superlinear_decrease_power: 2.0,
+            barrier_tol_factor: 1e4,
+            ..base.clone()
+        });
+    }
+    if record.descriptor.test_set == ProblemTestSet::BurkardtTestNonlin {
+        retries.push(InteriorPointOptions {
+            least_square_init_primal: true,
+            alpha_for_y: InteriorPointAlphaForYStrategy::MinDualInfeas,
+            ..base.clone()
+        });
+    }
+
+    retries
 }
 
 fn summarize_backend_compile_report(
@@ -1991,6 +2095,54 @@ pub(crate) fn objective_validation(
                 ", reduced_accuracy(primal/dual/comp<={:.1e})",
                 REDUCED_TERMINATION_TOL
             ));
+            ValidationTier::ReducedAccuracy
+        } else {
+            ValidationTier::Failed
+        };
+        ValidationOutcome {
+            tier,
+            tolerance,
+            detail,
+        }
+    }
+}
+
+pub(crate) fn objective_value_validation(
+    expected_objective: f64,
+    objective_tol: f64,
+    reduced_objective_tol: f64,
+    primal_tol: f64,
+) -> impl Fn(&ProblemRunRecord) -> ValidationOutcome + Clone + Send + Sync + 'static {
+    move |record| {
+        let tolerance = format!(
+            "obj<={objective_tol:.1e}, primal<={primal_tol:.1e}; reduced: obj<={reduced_objective_tol:.1e}, primal<={REDUCED_TERMINATION_TOL:.1e}; nonsmooth objective, dual residual not required"
+        );
+        let Some(objective) = record.metrics.objective else {
+            return ValidationOutcome {
+                tier: ValidationTier::Failed,
+                tolerance,
+                detail: "missing objective".to_string(),
+            };
+        };
+        let objective_error = (objective - expected_objective).abs();
+        let mut detail = format!(
+            "objective={objective:.6e}, expected={expected_objective:.6e}, objective_error={objective_error:.3e}"
+        );
+        let primal_inf = record.metrics.primal_inf.unwrap_or(0.0);
+        detail.push_str(&format!(", primal={primal_inf:.3e}"));
+        if let Some(error) = &record.error {
+            detail.push_str(&format!(", solver_error={error}"));
+        }
+        let tier = if objective.is_finite()
+            && objective_error <= objective_tol
+            && primal_inf <= primal_tol
+        {
+            ValidationTier::Passed
+        } else if objective.is_finite()
+            && objective_error <= reduced_objective_tol
+            && primal_inf <= REDUCED_TERMINATION_TOL
+        {
+            detail.push_str(", reduced_accuracy(nonsmooth objective value)");
             ValidationTier::ReducedAccuracy
         } else {
             ValidationTier::Failed

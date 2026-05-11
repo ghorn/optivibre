@@ -36,7 +36,7 @@ pub(super) fn tp086() -> ProblemCase {
             let b = [-40.0, -2.0, -0.25, -4.0, -4.0, -1.0, -40.0, -60.0, 5.0, 1.0];
             let mut obj = SX::zero();
             for i in 0..5 {
-                obj += e[i] * x.values[i] + d[i] * x.values[i].powf(3.0);
+                obj += e[i] * x.values[i] + d[i] * x.values[i].powi(3);
                 for j in 0..5 {
                     obj += c[j][i] * x.values[i] * x.values[j];
                 }

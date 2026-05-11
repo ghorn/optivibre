@@ -16,10 +16,8 @@ pub(super) fn tp060() -> ProblemCase {
                     let x1 = x.values[1];
                     let x2 = x.values[2];
                     SymbolicNlpOutputs {
-                        objective: (x0 - 1.0).sqr() + (x0 - x1).sqr() + (x1 - x2).powf(4.0),
-                        equalities: x0 * (1.0 + x1.sqr()) + x2.powf(4.0)
-                            - 4.0
-                            - 3.0 * 2.0_f64.sqrt(),
+                        objective: (x0 - 1.0).sqr() + (x0 - x1).sqr() + (x1 - x2).powi(4),
+                        equalities: x0 * (1.0 + x1.sqr()) + x2.powi(4) - 4.0 - 3.0 * 2.0_f64.sqrt(),
                         inequalities: (),
                     }
                 },

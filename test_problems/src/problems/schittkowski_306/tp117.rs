@@ -38,7 +38,7 @@ pub(super) fn tp117() -> ProblemCase {
             let mut quadratic = SX::zero();
             let mut cubic = SX::zero();
             for j in 0..5 {
-                cubic += D[j] * x.values[10 + j].powf(3.0);
+                cubic += D[j] * x.values[10 + j].powi(3);
                 for (i, row) in C.iter().enumerate() {
                     quadratic += row[j] * x.values[10 + i] * x.values[10 + j];
                 }

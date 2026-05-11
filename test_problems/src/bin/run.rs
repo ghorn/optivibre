@@ -4,10 +4,10 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use test_problems::{
-    CallPolicyMode, JitOptLevel, ProblemRunOptions, ProblemSpeed, ProblemTestSet, RunCacheOptions,
-    RunRequest, SolverKind, default_result_cache_dir, render_markdown_report,
-    render_terminal_report, run_cases_with_cache, write_dashboard, write_html_report,
-    write_json_report, write_transcript_artifacts,
+    CallPolicyMode, JitOptLevel, NlipLinearSolverMode, ProblemRunOptions, ProblemSpeed,
+    ProblemTestSet, RunCacheOptions, RunRequest, SolverKind, default_result_cache_dir,
+    render_markdown_report, render_terminal_report, run_cases_with_cache, write_dashboard,
+    write_html_report, write_json_report, write_transcript_artifacts,
 };
 
 #[derive(Debug, Parser)]
@@ -28,6 +28,8 @@ struct TestProblemsCli {
     jit_opt: Option<CliJitOptSelection>,
     #[arg(long = "call-policy", value_enum)]
     call_policy: Option<CliCallPolicySelection>,
+    #[arg(long = "nlip-linear-solver", value_enum)]
+    nlip_linear_solver: Option<CliNlipLinearSolverSelection>,
     #[arg(long, value_parser = parse_positive_usize)]
     jobs: Option<usize>,
     #[arg(long = "output-dir", default_value = "target/test-problems")]
@@ -93,6 +95,14 @@ enum CliCallPolicySelection {
     All,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliNlipLinearSolverSelection {
+    Auto,
+    SsidsRs,
+    SpralSrc,
+    SparseQdldl,
+}
+
 fn main() -> Result<()> {
     let cli = TestProblemsCli::parse();
     let mut request = RunRequest {
@@ -131,6 +141,7 @@ fn main() -> Result<()> {
                     .map(move |call_policy| ProblemRunOptions {
                         jit_opt_level,
                         call_policy,
+                        ..ProblemRunOptions::default()
                     })
             })
             .collect();
@@ -150,9 +161,15 @@ fn main() -> Result<()> {
                     .map(move |call_policy| ProblemRunOptions {
                         jit_opt_level,
                         call_policy,
+                        ..ProblemRunOptions::default()
                     })
             })
             .collect();
+    }
+    if let Some(selection) = cli.nlip_linear_solver {
+        for run_options in &mut request.run_options {
+            run_options.nlip_linear_solver = selection.nlip_linear_solver();
+        }
     }
     request.include_skipped = cli.include_skipped;
 
@@ -269,6 +286,17 @@ impl CliCallPolicySelection {
                 CallPolicyMode::InlineInLlvm,
                 CallPolicyMode::NoInlineLlvm,
             ],
+        }
+    }
+}
+
+impl CliNlipLinearSolverSelection {
+    const fn nlip_linear_solver(self) -> NlipLinearSolverMode {
+        match self {
+            Self::Auto => NlipLinearSolverMode::Auto,
+            Self::SsidsRs => NlipLinearSolverMode::SsidsRs,
+            Self::SpralSrc => NlipLinearSolverMode::SpralSrc,
+            Self::SparseQdldl => NlipLinearSolverMode::SparseQdldl,
         }
     }
 }

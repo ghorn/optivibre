@@ -5,7 +5,7 @@ pub(super) fn tp214_value(x1: SX, x2: SX) -> SX {
 }
 
 pub(super) fn tp214() -> ProblemCase {
-    objective_only_case_no_ineq(
+    nonsmooth_objective_only_case_no_ineq(
         "schittkowski_tp214",
         "tp214",
         "Schittkowski TP214",

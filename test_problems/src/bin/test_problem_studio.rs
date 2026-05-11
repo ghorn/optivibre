@@ -21,11 +21,12 @@ use axum::{
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use test_problems::{
-    CallPolicyMode, JitOptLevel, KnownStatus, PlannedRunTask, ProblemRunOptions, ProblemSpeed,
-    ProblemTestSet, RunCacheOptions, RunPreviewEntry, RunProgressEvent, RunRequest, RunResults,
-    RunStage, SolverKind, cached_result_records, clear_result_cache, default_result_cache_dir,
-    manifest_entry_by_id, planned_run_tasks, registry, render_dashboard_html,
-    render_markdown_report, run_cases_with_cache, write_json_report, write_transcript_artifacts,
+    CallPolicyMode, JitOptLevel, KnownStatus, NlipLinearSolverMode, PlannedRunTask,
+    ProblemRunOptions, ProblemSpeed, ProblemTestSet, RunCacheOptions, RunPreviewEntry,
+    RunProgressEvent, RunRequest, RunResults, RunStage, SolverKind, cached_result_records,
+    clear_result_cache, default_result_cache_dir, manifest_entry_by_id, planned_run_tasks,
+    registry, render_dashboard_html, render_markdown_report, run_cases_with_cache,
+    write_json_report, write_transcript_artifacts,
 };
 use tokio::sync::mpsc;
 use tokio_stream::{StreamExt, wrappers::UnboundedReceiverStream};
@@ -85,6 +86,7 @@ struct RunCreateRequest {
     solver: Option<String>,
     jit_opt: Option<String>,
     call_policy: Option<String>,
+    nlip_linear_solver: Option<String>,
     jobs: Option<usize>,
     include_skipped: Option<bool>,
     force: Option<bool>,
@@ -106,6 +108,7 @@ struct Catalog {
     solvers: Vec<&'static str>,
     jit_opts: Vec<&'static str>,
     call_policies: Vec<&'static str>,
+    nlip_linear_solvers: Vec<&'static str>,
     problems: Vec<CatalogProblem>,
     cache_dir: String,
 }
@@ -208,6 +211,7 @@ async fn catalog(State(state): State<AppState>) -> Result<Json<Catalog>, ApiErro
             "inline_in_llvm",
             "no_inline_llvm",
         ],
+        nlip_linear_solvers: vec!["auto", "ssids_rs", "spral_src", "sparse_qdldl"],
         problems,
         cache_dir: state.cache_dir.display().to_string(),
     }))
@@ -682,6 +686,9 @@ impl RunCreateRequest {
                 call_policy: parse_call_policy(
                     self.call_policy.as_deref().unwrap_or("inline_at_lowering"),
                 )?,
+                nlip_linear_solver: parse_nlip_linear_solver(
+                    self.nlip_linear_solver.as_deref().unwrap_or("auto"),
+                )?,
             }],
             jobs: self.jobs,
             include_skipped: self.include_skipped.unwrap_or(false),
@@ -741,6 +748,16 @@ fn parse_call_policy(value: &str) -> Result<CallPolicyMode> {
         "inline_in_llvm" => Ok(CallPolicyMode::InlineInLlvm),
         "no_inline_llvm" => Ok(CallPolicyMode::NoInlineLlvm),
         other => bail!("unknown call policy {other}"),
+    }
+}
+
+fn parse_nlip_linear_solver(value: &str) -> Result<NlipLinearSolverMode> {
+    match normalized(value).as_str() {
+        "auto" => Ok(NlipLinearSolverMode::Auto),
+        "ssids_rs" | "ssids-rs" | "ssids" => Ok(NlipLinearSolverMode::SsidsRs),
+        "spral_src" | "spral-src" | "spral" => Ok(NlipLinearSolverMode::SpralSrc),
+        "sparse_qdldl" | "sparse-qdldl" | "qdldl" => Ok(NlipLinearSolverMode::SparseQdldl),
+        other => bail!("unknown NLIP linear solver {other}"),
     }
 }
 
@@ -821,7 +838,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .sub { color:var(--muted); }
     .card { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:14px; }
     .config-grid { display:grid; grid-template-columns:minmax(260px, 1fr) minmax(520px, 2.9fr); gap:14px; align-items:stretch; }
-    .config-main { display:grid; grid-template-columns:minmax(190px, .9fr) minmax(160px, .8fr) minmax(120px, .65fr) minmax(190px, .9fr); gap:12px; align-items:end; }
+    .config-main { display:grid; grid-template-columns:minmax(190px, .9fr) minmax(160px, .75fr) minmax(260px, 1.05fr) minmax(120px, .55fr) minmax(240px, 1fr); gap:12px; align-items:end; }
     .action-stack { display:grid; grid-template-columns:minmax(90px, .8fr) minmax(90px, .7fr) minmax(140px, 1fr); gap:10px; align-items:end; }
     label, .control-label { display:grid; gap:5px; color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
     select, input { width:100%; background:#0b1220; color:var(--text); border:1px solid var(--line); border-radius:9px; padding:8px 9px; }
@@ -962,7 +979,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .dashboard-shell { display:grid; gap:14px; }
     .dashboard-card h2 { margin:0; font-size:20px; }
     .dashboard-summary { display:grid; grid-template-columns:minmax(330px, .72fr) minmax(520px, 1.28fr); gap:12px; align-items:start; }
-    .dashboard-breakdown-grid { display:grid; grid-template-columns:minmax(150px, .6fr) minmax(300px, 1.4fr) minmax(190px, .8fr); gap:10px; }
+    .dashboard-breakdown-grid { display:grid; grid-template-columns:minmax(150px, .65fr) minmax(260px, 1.2fr) minmax(190px, .85fr) minmax(220px, 1fr); gap:10px; }
     .dashboard-summary .dashboard-grid { grid-template-columns:repeat(2, minmax(130px, 1fr)); }
     .dashboard-table-head { display:flex; justify-content:space-between; gap:10px; align-items:baseline; margin:14px 0 6px; }
     .dashboard-table-head h3 { margin:0; font-size:15px; }
@@ -1019,6 +1036,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
         <div class="control-label">Solvers <div id="solver-checks" class="checks">
           <label><input type="checkbox" value="sqp" checked>SQP</label>
           <label><input type="checkbox" value="nlip" checked>NLIP</label>
+        </div></div>
+        <div class="control-label">NLIP linear <div id="nlip-linear-solver" class="segmented" title="Configured linear solver for NLIP runs. Auto uses sparse_qdldl for unconstrained systems and ssids_rs for constrained systems.">
+          <label><input type="radio" name="nlip-linear-solver" value="auto" checked>Auto</label>
+          <label><input type="radio" name="nlip-linear-solver" value="ssids_rs">SSIDS-RS</label>
+          <label><input type="radio" name="nlip-linear-solver" value="sparse_qdldl">QDLDL</label>
+          <label><input type="radio" name="nlip-linear-solver" value="spral_src">SPRAL</label>
         </div></div>
         <label>Jobs <input id="jobs" type="number" min="1" value="4"></label>
         <div class="action-stack">
@@ -1286,7 +1309,7 @@ function renderPreview(entries) {
   const hitDeg = total ? hits / total * 360 : 0;
   byId('cache-donut').title = `Planned solver-runs: ${total}. Cached results: ${hits}. Fresh solves: ${misses}.`;
   byId('cache-donut').style.background = `conic-gradient(var(--hit) 0deg ${hitDeg}deg, var(--miss) ${hitDeg}deg 360deg)`;
-  const solverCounts = groupCountsWithCache(previewEntries, (entry) => entry.solver);
+  const solverCounts = groupCountsWithCache(previewEntries, previewSolverLabel);
   const suiteCounts = groupCountsWithCache(previewEntries, (entry) => entry.test_set);
   byId('preview-solvers').innerHTML = miniBars(solverCounts.rows, total, solverCounts.details);
   byId('preview-suites').innerHTML = miniBars(suiteCounts.rows, total, suiteCounts.details);
@@ -1384,9 +1407,22 @@ function stagedCellMap() {
 }
 function solvedRecordMap() {
   const map = new Map();
-  for (const record of cachedRecords) map.set(cellKey(record.id, record.solver), record);
-  for (const record of resultRecords) map.set(cellKey(record.id, record.solver), record);
+  for (const record of cachedRecords) {
+    if (recordMatchesSelectedOptions(record)) map.set(cellKey(record.id, record.solver), record);
+  }
+  for (const record of resultRecords) {
+    if (recordMatchesSelectedOptions(record)) map.set(cellKey(record.id, record.solver), record);
+  }
   return map;
+}
+function recordMatchesSelectedOptions(record) {
+  const options = record.options || {};
+  const jit = (options.jit_opt_level || 'o3').toLowerCase();
+  const callPolicy = options.call_policy || 'inline_at_lowering';
+  const nlipLinear = options.nlip_linear_solver || 'auto';
+  return jit === 'o3'
+    && callPolicy === 'inline_at_lowering'
+    && nlipLinear === (checkedRadio('nlip-linear-solver') || 'auto');
 }
 function cellKey(problemId, solver) {
   return `${problemId}::${solver}`;
@@ -1455,12 +1491,14 @@ function solverCellHtml(solver, state, staged) {
     return `<div class="solver-cell running${stagedClass}" title="${escapeHtml(title)}"><span class="solver-label">running</span><span class="cell-note">${escapeHtml(solver)}</span></div>`;
   }
   if (state.kind === 'solved') {
-    const title = `${solver}: ${statusShortLabel(state.status)}${state.cacheStatus === 'hit' ? ' from the results cache' : ' from the current run'}${staged ? '; also staged by current filters' : ''}.`;
+    const linear = state.record ? ` Linear solver: ${linearSolverLabel(state.record)}.` : '';
+    const title = `${solver}: ${statusShortLabel(state.status)}${state.cacheStatus === 'hit' ? ' from the results cache' : ' from the current run'}${staged ? '; also staged by current filters' : ''}.${linear}`;
     return `<div class="solver-cell ${escapeHtml(state.status)}${stagedClass}" title="${escapeHtml(title)}"><span class="solver-label">${statusShortLabel(state.status)}</span><span class="cell-note">${state.cacheStatus === 'hit' ? 'cached' : 'done'}</span></div>`;
   }
   if (state.kind === 'staged') {
     const note = state.cacheStatus === 'hit' ? 'cached' : 'fresh';
-    const title = `${solver}: staged to solve with the current filters; ${state.cacheStatus === 'hit' ? 'a cached result is available' : 'will require a fresh solve'}.`;
+    const linear = solver === 'nlip' ? ` NLIP linear solver: ${checkedRadio('nlip-linear-solver') || 'auto'}.` : '';
+    const title = `${solver}: staged to solve with the current filters; ${state.cacheStatus === 'hit' ? 'a cached result is available' : 'will require a fresh solve'}.${linear}`;
     return `<div class="solver-cell staged" title="${escapeHtml(title)}"><span class="solver-label">staged</span><span class="cell-note">${note}</span></div>`;
   }
   const title = `${solver}: no cached or current result; not staged by the current filters.`;
@@ -1490,6 +1528,11 @@ function groupCountsWithCache(items, keyFn) {
     rows: Array.from(details.entries()).map(([label, detail]) => [label, detail.total]).sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(String(b[0]))),
     details,
   };
+}
+function previewSolverLabel(entry) {
+  return entry.solver === 'nlip' && entry.nlip_linear_solver
+    ? `nlip (${entry.nlip_linear_solver})`
+    : entry.solver;
 }
 function miniBars(rows, total, details) {
   if (!rows.length) return '<div class="progress-sub">No runs selected.</div>';
@@ -1798,6 +1841,7 @@ function requestBody() {
     test_set: checkedRadio('test-set') || null,
     problem_set: checkedRadio('problem-set') || null,
     solver: checkedSolvers(),
+    nlip_linear_solver: checkedRadio('nlip-linear-solver') || 'auto',
     jobs: Number(byId('jobs').value || 4),
     force: false,
   };
@@ -1858,6 +1902,7 @@ function renderLiveDashboard() {
           ${dashboardBreakdown('By solver', groupCounts(records, (r) => r.solver), records.length)}
           ${dashboardBreakdown('By test set', groupCounts(records, (r) => r.descriptor.test_set), records.length)}
           ${dashboardBreakdown('By status', groupCounts(records, (r) => r.status), records.length)}
+          ${dashboardBreakdown('By linear solver', groupCounts(records, linearSolverLabel), records.length)}
         </div>
       </div>
       <div class="dashboard-table-head">
@@ -1869,8 +1914,8 @@ function renderLiveDashboard() {
         <h3>Slowest Runs</h3>
         <div class="progress-sub">Top ${slowest.length} by preserved solver time</div>
       </div>
-      <table class="dash-table"><thead><tr><th>Problem</th><th>Set / Family</th><th>Solver</th><th>Status</th><th>Cache</th><th>Iters</th><th>Total</th><th>Reason</th></tr></thead><tbody>
-        ${slowest.map((record) => `<tr><td>${escapeHtml(record.id)}</td><td>${escapeHtml(record.descriptor.test_set)} / ${escapeHtml(record.descriptor.family)}</td><td>${escapeHtml(record.solver)}</td><td><span class="status-pill ${record.status}">${escapeHtml(record.status)}</span></td><td>${escapeHtml(record.cache ? record.cache.status : 'none')}</td><td>${record.metrics.iterations == null ? '--' : record.metrics.iterations}</td><td>${formatDuration(record.timing.total_wall_time)}</td><td>${escapeHtml(record.error || record.validation.detail || '--')}</td></tr>`).join('')}
+      <table class="dash-table"><thead><tr><th>Problem</th><th>Set / Family</th><th>Solver</th><th>Linear</th><th>Status</th><th>Cache</th><th>Iters</th><th>Total</th><th>Reason</th></tr></thead><tbody>
+        ${slowest.map((record) => `<tr><td>${escapeHtml(record.id)}</td><td>${escapeHtml(record.descriptor.test_set)} / ${escapeHtml(record.descriptor.family)}</td><td>${escapeHtml(record.solver)}</td><td>${escapeHtml(linearSolverLabel(record))}</td><td><span class="status-pill ${record.status}">${escapeHtml(record.status)}</span></td><td>${escapeHtml(record.cache ? record.cache.status : 'none')}</td><td>${record.metrics.iterations == null ? '--' : record.metrics.iterations}</td><td>${formatDuration(record.timing.total_wall_time)}</td><td>${escapeHtml(record.error || record.validation.detail || '--')}</td></tr>`).join('')}
       </tbody></table>
     </section>`;
 }
@@ -1943,6 +1988,12 @@ function failureCategory(record) {
   if (text.includes('panic')) return 'panic';
   if (text.includes('step inf-norm')) return 'step failure';
   return record.status === 'solve_error' ? 'solve error' : String(record.status || 'other').replaceAll('_', ' ');
+}
+function linearSolverLabel(record) {
+  if (record.solver !== 'nlip') return `${record.solver}: n/a`;
+  const configured = record.options && record.options.nlip_linear_solver ? record.options.nlip_linear_solver : 'auto';
+  const backend = record.linear_solver_backend || configured;
+  return configured === backend ? `nlip: ${backend}` : `nlip: ${configured} -> ${backend}`;
 }
 function isAcceptedStatus(status) {
   return status === 'passed' || status === 'reduced_accuracy';

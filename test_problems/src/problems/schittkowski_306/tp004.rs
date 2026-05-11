@@ -12,7 +12,7 @@ pub(super) fn tp004() -> ProblemCase {
             let compiled = symbolic_compile::<Pair<SX>, (), (), (), _>(
                 "schittkowski_tp004",
                 |x, ()| SymbolicNlpOutputs {
-                    objective: (x.x + 1.0).powf(3.0) / 3.0 + x.y,
+                    objective: (x.x + 1.0).powi(3) / 3.0 + x.y,
                     equalities: (),
                     inequalities: (),
                 },

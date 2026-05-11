@@ -20,12 +20,12 @@ pub(super) fn tp046() -> ProblemCase {
                     SymbolicNlpOutputs {
                         objective: (x0 - x1).sqr()
                             + (x2 - 1.0).sqr()
-                            + (x3 - 1.0).powf(4.0)
-                            + (x4 - 1.0).powf(6.0),
+                            + (x3 - 1.0).powi(4)
+                            + (x4 - 1.0).powi(6),
                         equalities: VecN {
                             values: [
                                 x0.sqr() * x3 + (x3 - x4).sin() - 1.0,
-                                x1 + x2.powf(4.0) * x3.sqr() - 2.0,
+                                x1 + x2.powi(4) * x3.sqr() - 2.0,
                             ],
                         },
                         inequalities: (),

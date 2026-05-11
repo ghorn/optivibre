@@ -19,7 +19,7 @@ pub(super) fn tp039() -> ProblemCase {
                     SymbolicNlpOutputs {
                         objective: -x0,
                         equalities: VecN {
-                            values: [x1 - x0.powf(3.0) - x2.sqr(), x0.sqr() - x1 - x3.sqr()],
+                            values: [x1 - x0.powi(3) - x2.sqr(), x0.sqr() - x1 - x3.sqr()],
                         },
                         inequalities: (),
                     }

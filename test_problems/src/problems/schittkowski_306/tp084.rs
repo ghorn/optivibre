@@ -35,8 +35,8 @@ pub(super) fn tp084() -> ProblemCase {
                 1.6643076e4,
                 3.0988146e4,
             ];
-            let v1 = x0 * (a[7] + a[8] * x1 + a[9] * x2 + a[10] * x3 + a[11] * x4);
-            let v2 = x0 * (a[12] + a[13] * x1 + a[14] * x2 + a[15] * x3 + a[16] * x4);
+            let v1 = x0 * (a[6] + a[7] * x1 + a[8] * x2 + a[9] * x3 + a[10] * x4);
+            let v2 = x0 * (a[11] + a[12] * x1 + a[13] * x2 + a[14] * x3 + a[15] * x4);
             let v3 = x0 * (a[16] + a[17] * x1 + a[18] * x2 + a[19] * x3 + a[20] * x4);
             SymbolicNlpOutputs {
                 objective: -(a[0] + x0 * (a[1] + a[2] * x1 + a[3] * x2 + a[4] * x3 + a[5] * x4)),
