@@ -2734,6 +2734,7 @@ name = "test_problems"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "indicatif",
  "optimization",
@@ -2741,6 +2742,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sx_core",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]

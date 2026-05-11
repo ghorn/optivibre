@@ -4,8 +4,9 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use test_problems::{
-    CallPolicyMode, JitOptLevel, ProblemRunOptions, ProblemSpeed, RunRequest, SolverKind,
-    render_markdown_report, render_terminal_report, run_cases, write_dashboard, write_html_report,
+    CallPolicyMode, JitOptLevel, ProblemRunOptions, ProblemSpeed, ProblemTestSet, RunCacheOptions,
+    RunRequest, SolverKind, default_result_cache_dir, render_markdown_report,
+    render_terminal_report, run_cases_with_cache, write_dashboard, write_html_report,
     write_json_report, write_transcript_artifacts,
 };
 
@@ -21,6 +22,8 @@ struct TestProblemsCli {
     solver: Option<CliSolverSelection>,
     #[arg(long = "problem-set", value_enum)]
     problem_set: Option<CliProblemSetSelection>,
+    #[arg(long = "test-set", value_enum)]
+    test_set: Option<CliTestSetSelection>,
     #[arg(long = "jit-opt", value_enum)]
     jit_opt: Option<CliJitOptSelection>,
     #[arg(long = "call-policy", value_enum)]
@@ -33,6 +36,12 @@ struct TestProblemsCli {
     include_skipped: bool,
     #[arg(long)]
     no_progress: bool,
+    #[arg(long)]
+    force: bool,
+    #[arg(long)]
+    no_cache: bool,
+    #[arg(long = "cache-dir")]
+    cache_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -50,6 +59,15 @@ enum CliSolverSelection {
 enum CliProblemSetSelection {
     Fast,
     Slow,
+    All,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliTestSetSelection {
+    Core,
+    BurkardtTestNonlin,
+    #[value(name = "schittkowski-306", alias = "schittkowski_306")]
+    Schittkowski306,
     All,
 }
 
@@ -94,6 +112,9 @@ fn main() -> Result<()> {
     if let Some(selection) = cli.problem_set {
         request.problem_set = selection.problem_speed();
     }
+    if let Some(selection) = cli.test_set {
+        request.test_set = selection.test_set();
+    }
     if let Some(selection) = cli.jit_opt {
         let call_policies = request
             .run_options
@@ -136,7 +157,12 @@ fn main() -> Result<()> {
     request.include_skipped = cli.include_skipped;
 
     fs::create_dir_all(&cli.output_dir)?;
-    let mut results = run_cases(&request)?;
+    let cache_options = RunCacheOptions {
+        enabled: !cli.no_cache,
+        force: cli.force,
+        cache_dir: cli.cache_dir.unwrap_or_else(default_result_cache_dir),
+    };
+    let mut results = run_cases_with_cache(&request, &cache_options, None)?;
     write_transcript_artifacts(&mut results, &cli.output_dir)?;
     let markdown = render_markdown_report(&results);
     let terminal = render_terminal_report(&results);
@@ -197,6 +223,17 @@ impl CliProblemSetSelection {
         match self {
             Self::Fast => Some(ProblemSpeed::Fast),
             Self::Slow => Some(ProblemSpeed::Slow),
+            Self::All => None,
+        }
+    }
+}
+
+impl CliTestSetSelection {
+    fn test_set(self) -> Option<ProblemTestSet> {
+        match self {
+            Self::Core => Some(ProblemTestSet::Core),
+            Self::BurkardtTestNonlin => Some(ProblemTestSet::BurkardtTestNonlin),
+            Self::Schittkowski306 => Some(ProblemTestSet::Schittkowski306),
             Self::All => None,
         }
     }

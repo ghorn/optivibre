@@ -41,6 +41,7 @@ pub fn render_markdown_report(results: &RunResults) -> String {
         }
     }
     out.push_str(&family_summary(results));
+    out.push_str(&test_set_summary(results));
 
     let regressions = collect_records(results, |record| {
         matches!(record.expected, KnownStatus::KnownPassing) && !record.status.accepted()
@@ -104,6 +105,7 @@ pub fn render_terminal_report(results: &RunResults) -> String {
         }
     }
     out.push_str(&family_summary(results));
+    out.push_str(&test_set_summary(results));
 
     let regressions = collect_records(results, |record| {
         matches!(record.expected, KnownStatus::KnownPassing) && !record.status.accepted()
@@ -153,6 +155,8 @@ pub fn render_html_report(results: &RunResults) -> String {
     }
     body.push_str("<h2>Family Summary</h2>\n");
     body.push_str(&family_summary_html(results));
+    body.push_str("<h2>Test Set Summary</h2>\n");
+    body.push_str(&test_set_summary_html(results));
 
     let regressions = collect_records(results, |record| {
         matches!(record.expected, KnownStatus::KnownPassing) && !record.status.accepted()
@@ -319,10 +323,10 @@ fn summary_html_table(results: &RunResults) -> String {
 }
 
 fn family_summary(results: &RunResults) -> String {
-    let (columns, rows_data) = family_summary_matrix(results);
+    let (columns, rows_data) = family_summary_hierarchy(results);
     let mut rows = Vec::with_capacity(rows_data.len());
-    for (family, by_column) in rows_data {
-        let mut row = vec![family];
+    for (label, _is_suite, by_column) in rows_data {
+        let mut row = vec![label];
         let mut total = Duration::ZERO;
         for column in &columns {
             if let Some((cases, passed, reduced, total_time)) = by_column.get(column) {
@@ -348,7 +352,7 @@ fn family_summary(results: &RunResults) -> String {
         rows.push(row);
     }
     let mut out = String::from("## Family Summary\n\n");
-    let mut headers = vec!["Family".to_string()];
+    let mut headers = vec!["Suite / Family".to_string()];
     headers.extend(columns.iter().cloned());
     headers.push("Total".to_string());
     let mut align = vec![Align::Left];
@@ -360,17 +364,27 @@ fn family_summary(results: &RunResults) -> String {
 }
 
 fn family_summary_html(results: &RunResults) -> String {
-    let (columns, rows_data) = family_summary_matrix(results);
+    let (columns, rows_data) = family_summary_hierarchy(results);
     let mut out = String::from(
-        "<div class=\"tp-table-wrap\"><table class=\"tp-table tp-table-compact\">\n<thead><tr><th>Family</th>",
+        "<div class=\"tp-table-wrap\"><table class=\"tp-table tp-table-compact\">\n<thead><tr><th>Suite / Family</th>",
     );
     for column in &columns {
         let _ = write!(out, "<th>{}</th>", html_escape(column));
     }
     out.push_str("<th>Total</th></tr></thead>\n<tbody>\n");
-    for (family, by_column) in rows_data {
+    for (label, is_suite, by_column) in rows_data {
+        let row_class = if is_suite {
+            "tp-suite-row"
+        } else {
+            "tp-family-row"
+        };
+        let display_label = label.trim_start_matches("  - ");
         let mut family_total = Duration::ZERO;
-        let _ = write!(out, "<tr><td>{}</td>", html_escape(&family));
+        let _ = write!(
+            out,
+            "<tr class=\"{row_class}\"><td>{}</td>",
+            html_escape(display_label)
+        );
         for column in &columns {
             if let Some((cases, passed, reduced, total_time)) = by_column.get(column) {
                 family_total += *total_time;
@@ -413,11 +427,148 @@ fn family_summary_html(results: &RunResults) -> String {
     out
 }
 
+fn test_set_summary(results: &RunResults) -> String {
+    let (columns, rows_data) = summary_matrix_by(results, |record| {
+        record.descriptor.test_set.label().to_string()
+    });
+    let mut rows = Vec::with_capacity(rows_data.len());
+    for (test_set, by_column) in rows_data {
+        let mut row = vec![test_set];
+        let mut total = Duration::ZERO;
+        for column in &columns {
+            if let Some((cases, passed, reduced, total_time)) = by_column.get(column) {
+                total += *total_time;
+                if *reduced > 0 {
+                    row.push(format!(
+                        "{passed}/{cases} ({reduced} reduced, {:.0}%, {})",
+                        percentage(*passed, *cases),
+                        format_duration(*total_time)
+                    ));
+                } else {
+                    row.push(format!(
+                        "{passed}/{cases} ({:.0}%, {})",
+                        percentage(*passed, *cases),
+                        format_duration(*total_time)
+                    ));
+                }
+            } else {
+                row.push("--".to_string());
+            }
+        }
+        row.push(format_duration(total));
+        rows.push(row);
+    }
+    let mut out = String::from("## Test Set Summary\n\n");
+    let mut headers = vec!["Test Set".to_string()];
+    headers.extend(columns.iter().cloned());
+    headers.push("Total".to_string());
+    let mut align = vec![Align::Left];
+    align.extend(std::iter::repeat_n(Align::Left, columns.len()));
+    align.push(Align::Right);
+    out.push_str(&render_text_table_dyn(&headers, &align, &rows));
+    out.push('\n');
+    out
+}
+
+fn test_set_summary_html(results: &RunResults) -> String {
+    let (columns, rows_data) = summary_matrix_by(results, |record| {
+        record.descriptor.test_set.label().to_string()
+    });
+    let mut out = String::from(
+        "<div class=\"tp-table-wrap\"><table class=\"tp-table tp-table-compact\">\n<thead><tr><th>Test Set</th>",
+    );
+    for column in &columns {
+        let _ = write!(out, "<th>{}</th>", html_escape(column));
+    }
+    out.push_str("<th>Total</th></tr></thead>\n<tbody>\n");
+    for (test_set, by_column) in rows_data {
+        let mut test_set_total = Duration::ZERO;
+        let _ = write!(out, "<tr><td>{}</td>", html_escape(&test_set));
+        for column in &columns {
+            if let Some((cases, passed, reduced, total_time)) = by_column.get(column) {
+                test_set_total += *total_time;
+                let pass_class = if *passed == *cases {
+                    "tp-ok"
+                } else if *passed == 0 {
+                    "tp-fail"
+                } else {
+                    "tp-warn"
+                };
+                let cell_class = if *passed == *cases && *reduced == 0 {
+                    "tp-family-cell tp-family-ok"
+                } else if *passed == 0 {
+                    "tp-family-cell tp-family-fail"
+                } else {
+                    "tp-family-cell tp-family-warn"
+                };
+                let reduced_meta = if *reduced > 0 {
+                    format!(" · {reduced} reduced")
+                } else {
+                    String::new()
+                };
+                let _ = write!(
+                    out,
+                    "<td class=\"{cell_class}\"><span class=\"tp-badge {pass_class}\">{passed}/{cases}</span><div class=\"tp-family-meta\">{:.1}% · {}{reduced_meta}</div></td>",
+                    percentage(*passed, *cases),
+                    format_duration(*total_time),
+                );
+            } else {
+                out.push_str("<td class=\"tp-family-cell tp-family-empty\">--</td>");
+            }
+        }
+        let _ = writeln!(
+            out,
+            "<td class=\"tp-num\">{}</td></tr>",
+            format_duration(test_set_total)
+        );
+    }
+    out.push_str("</tbody></table></div>\n");
+    out
+}
+
 type FamilySummaryCell = (usize, usize, usize, Duration);
 type FamilySummaryRow = BTreeMap<String, FamilySummaryCell>;
 type FamilySummaryRows = BTreeMap<String, FamilySummaryRow>;
+type HierarchicalFamilySummaryRows = Vec<(String, bool, FamilySummaryRow)>;
 
-fn family_summary_matrix(results: &RunResults) -> (Vec<String>, FamilySummaryRows) {
+fn family_summary_hierarchy(results: &RunResults) -> (Vec<String>, HierarchicalFamilySummaryRows) {
+    let (columns, suite_rows) = summary_matrix_by(results, |record| {
+        record.descriptor.test_set.label().to_string()
+    });
+    let (_, family_rows) = summary_matrix_by(results, |record| {
+        format!(
+            "{}\t{}",
+            record.descriptor.test_set.label(),
+            record.descriptor.family
+        )
+    });
+
+    let mut families_by_suite = BTreeMap::<String, Vec<(String, FamilySummaryRow)>>::new();
+    for (key, row) in family_rows {
+        if let Some((suite, family)) = key.split_once('\t') {
+            families_by_suite
+                .entry(suite.to_string())
+                .or_default()
+                .push((family.to_string(), row));
+        }
+    }
+
+    let mut rows = Vec::new();
+    for (suite, suite_row) in suite_rows {
+        rows.push((suite.clone(), true, suite_row));
+        if let Some(families) = families_by_suite.remove(&suite) {
+            for (family, family_row) in families {
+                rows.push((format!("  - {family}"), false, family_row));
+            }
+        }
+    }
+    (columns, rows)
+}
+
+fn summary_matrix_by(
+    results: &RunResults,
+    key: impl Fn(&ProblemRunRecord) -> String,
+) -> (Vec<String>, FamilySummaryRows) {
     let show_jit = results
         .records
         .iter()
@@ -440,7 +591,7 @@ fn family_summary_matrix(results: &RunResults) -> (Vec<String>, FamilySummaryRow
         };
         columns.insert(column.clone());
         let entry = rows
-            .entry(record.descriptor.family.clone())
+            .entry(key(record))
             .or_default()
             .entry(column)
             .or_insert((0usize, 0usize, 0usize, Duration::ZERO));
@@ -545,6 +696,7 @@ fn record_table(
         let info = failure_info(record);
         let mut row = vec![
             problem_markdown(record),
+            record.descriptor.test_set.label().to_string(),
             solver_display(record.solver).to_string(),
             record.options.label().to_string(),
         ];
@@ -572,8 +724,8 @@ fn record_table(
         rows.push(row);
     }
 
-    let mut headers = vec!["Problem", "Solver", "JIT"];
-    let mut align = vec![Align::Left, Align::Left, Align::Left];
+    let mut headers = vec!["Problem", "Set", "Solver", "JIT"];
+    let mut align = vec![Align::Left, Align::Left, Align::Left, Align::Left];
     if include_expected {
         headers.push("Exp");
         align.push(Align::Left);
@@ -617,7 +769,7 @@ fn record_html_table(
     include_detail: bool,
 ) -> String {
     let mut out = String::from("<table class=\"tp-table\">\n<thead><tr>");
-    out.push_str("<th>Problem</th><th>Solver</th><th>JIT</th>");
+    out.push_str("<th>Problem</th><th>Set</th><th>Solver</th><th>JIT</th>");
     if include_expected {
         out.push_str("<th>Exp</th>");
     }
@@ -634,8 +786,9 @@ fn record_html_table(
         let status_badge = status_badge(record.status);
         let _ = write!(
             out,
-            "<tr><td>{}</td><td>{}</td><td>{}</td>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
             problem_html(record),
+            record.descriptor.test_set.label(),
             solver_display(record.solver),
             record.options.label(),
         );
@@ -688,7 +841,9 @@ fn constraint_summary(record: &ProblemRunRecord) -> String {
 }
 
 fn classify_solve_error(error: &str) -> FailureInfo {
-    if error.contains("failed to converge") {
+    if error.contains("solver panicked") {
+        FailureInfo::fail(Cow::Borrowed("panic"), squash_whitespace(error))
+    } else if error.contains("failed to converge") {
         if let Some(start) = error.find("failed to converge in ") {
             let tail = &error[start + "failed to converge in ".len()..];
             if let Some(end) = tail.find(" iterations") {
@@ -857,6 +1012,10 @@ code { font-family: ui-monospace, SFMono-Regular, monospace; }
 .tp-skip { background: #e5e7eb; color: #374151; }
 .tp-neutral { background: #e2e8f0; color: #334155; }
 .tp-family-cell { min-width: 110px; }
+.tp-suite-row td { background: #172033; border-top: 2px solid #475569; font-weight: 700; }
+.tp-suite-row td:first-child { color: #bfdbfe; text-transform: uppercase; letter-spacing: 0.03em; }
+.tp-family-row td:first-child { padding-left: 24px; color: #cbd5e1; }
+.tp-family-row td:first-child::before { content: "- "; color: #94a3b8; }
 .tp-family-meta { margin-top: 4px; font-size: 11px; color: #cbd5e1; }
 .tp-family-ok { background: #102417; }
 .tp-family-warn { background: #2b2212; }

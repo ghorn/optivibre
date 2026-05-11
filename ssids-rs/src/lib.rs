@@ -2744,10 +2744,15 @@ fn symbolic_pattern_from_supernodes(
 ) -> (Vec<Option<usize>>, Vec<usize>, Vec<Vec<usize>>) {
     let mut column_pattern = vec![Vec::new(); dimension];
     for supernode in supernodes {
-        for column in supernode.start_column..supernode.end_column {
+        for (column, column_pattern) in column_pattern
+            .iter_mut()
+            .enumerate()
+            .take(supernode.end_column)
+            .skip(supernode.start_column)
+        {
             let mut pattern = (column..supernode.end_column).collect::<Vec<_>>();
             pattern.extend(supernode.trailing_rows.iter().copied());
-            column_pattern[column] = pattern;
+            *column_pattern = pattern;
         }
     }
     for (column, pattern) in column_pattern.iter_mut().enumerate() {

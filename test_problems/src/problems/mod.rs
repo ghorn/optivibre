@@ -1,4 +1,5 @@
 mod brown_almost_linear;
+mod burkardt_test_nonlin;
 mod disk_rosenbrock;
 mod generalized_rosenbrock;
 mod hanging_chain;
@@ -7,6 +8,7 @@ mod hs035;
 mod hs071;
 mod parameterized_quadratic;
 mod powell_singular;
+mod schittkowski_306;
 mod trigonometric;
 mod wood;
 
@@ -29,7 +31,7 @@ use optimization::{
 };
 use sx_core::SX;
 
-use crate::manifest::KnownStatus;
+use crate::manifest::{KnownStatus, ProblemTestSet};
 use crate::model::{
     CompileReportSummary, CompileStatsSummary, FilterReplay, FilterReplayFrame, FilterReplayPoint,
     ProblemCase, ProblemDescriptor, ProblemRunOptions, ProblemRunRecord, RunStatus,
@@ -65,6 +67,7 @@ pub(crate) struct Chain<T, const N: usize> {
 #[derive(Clone, Copy)]
 pub(crate) struct CaseMetadata {
     id: &'static str,
+    test_set: ProblemTestSet,
     family: &'static str,
     variant: &'static str,
     source: &'static str,
@@ -83,6 +86,7 @@ impl CaseMetadata {
     ) -> Self {
         Self {
             id,
+            test_set: ProblemTestSet::Core,
             family,
             variant,
             source,
@@ -90,10 +94,17 @@ impl CaseMetadata {
             parameterized,
         }
     }
+
+    pub(crate) const fn with_test_set(mut self, test_set: ProblemTestSet) -> Self {
+        self.test_set = test_set;
+        self
+    }
 }
 
 pub(crate) fn all_cases() -> Vec<ProblemCase> {
     let mut cases = Vec::new();
+    cases.extend(burkardt_test_nonlin::cases());
+    cases.extend(schittkowski_306::cases());
     cases.extend(generalized_rosenbrock::cases());
     cases.push(disk_rosenbrock::case());
     cases.push(powell_singular::case());
@@ -163,6 +174,7 @@ where
 {
     ProblemCase {
         id: metadata.id,
+        test_set: metadata.test_set,
         family: metadata.family,
         variant: metadata.variant,
         source: metadata.source,
@@ -230,6 +242,7 @@ where
             status: RunStatus::SolveError,
             descriptor: ProblemDescriptor {
                 id: metadata.id.to_string(),
+                test_set: metadata.test_set,
                 family: metadata.family.to_string(),
                 variant: metadata.variant.to_string(),
                 source: metadata.source.to_string(),
@@ -261,6 +274,7 @@ where
             console_output: None,
             console_output_path: None,
             filter_replay: None,
+            cache: None,
         },
     }
 }
@@ -307,6 +321,7 @@ where
                 status: RunStatus::SolveError,
                 descriptor: ProblemDescriptor {
                     id: metadata.id.to_string(),
+                    test_set: metadata.test_set,
                     family: metadata.family.to_string(),
                     variant: metadata.variant.to_string(),
                     source: metadata.source.to_string(),
@@ -339,6 +354,7 @@ where
                 console_output: None,
                 console_output_path: None,
                 filter_replay: None,
+                cache: None,
             };
         }
     };
@@ -401,6 +417,7 @@ where
                         console_output: None,
                         console_output_path: None,
                         filter_replay: None,
+                        cache: None,
                     };
                     record.validation = validate(&record);
                     if !record.validation.passed() {
@@ -446,6 +463,7 @@ where
                         console_output: None,
                         console_output_path: None,
                         filter_replay: None,
+                        cache: None,
                     };
                     promote_solve_error_if_reduced_accuracy(&mut record, REDUCED_TERMINATION_TOL);
                     promote_solve_error_if_validation_accepts(&mut record, validate);
@@ -505,6 +523,7 @@ where
                         console_output: None,
                         console_output_path: None,
                         filter_replay: None,
+                        cache: None,
                     };
                     record.validation = validate(&record);
                     if !record.validation.passed() {
@@ -550,6 +569,7 @@ where
                         console_output: None,
                         console_output_path: None,
                         filter_replay: None,
+                        cache: None,
                     };
                     promote_solve_error_if_reduced_accuracy(&mut record, REDUCED_TERMINATION_TOL);
                     record.console_output = Some(render_nlip_transcript(
@@ -610,6 +630,7 @@ where
                         console_output: None,
                         console_output_path: None,
                         filter_replay: None,
+                        cache: None,
                     };
                     record.validation = validate(&record);
                     if !record.validation.passed() {
@@ -650,6 +671,7 @@ where
                         console_output: None,
                         console_output_path: None,
                         filter_replay: None,
+                        cache: None,
                     };
                     promote_solve_error_if_reduced_accuracy(&mut record, REDUCED_TERMINATION_TOL);
                     record.console_output =
@@ -777,6 +799,7 @@ where
     let dof = num_vars.saturating_sub(num_eq + fixed_box);
     ProblemDescriptor {
         id: metadata.id.to_string(),
+        test_set: metadata.test_set,
         family: metadata.family.to_string(),
         variant: metadata.variant.to_string(),
         source: metadata.source.to_string(),
@@ -1054,6 +1077,7 @@ fn metrics_from_ip_error(error: &InteriorPointSolveError) -> SolverMetrics {
         | InteriorPointSolveError::CpuTimeExceeded { context, .. }
         | InteriorPointSolveError::WallTimeExceeded { context, .. }
         | InteriorPointSolveError::UserRequestedStop { context }
+        | InteriorPointSolveError::SearchDirectionTooSmall { context, .. }
         | InteriorPointSolveError::MaxIterations { context, .. } => context.as_ref(),
     };
     let snapshot = context
@@ -1548,6 +1572,7 @@ fn render_nlip_transcript(
             | InteriorPointSolveError::CpuTimeExceeded { context, .. }
             | InteriorPointSolveError::WallTimeExceeded { context, .. }
             | InteriorPointSolveError::UserRequestedStop { context }
+            | InteriorPointSolveError::SearchDirectionTooSmall { context, .. }
             | InteriorPointSolveError::MaxIterations { context, .. } => Some(context.as_ref()),
         };
         if let Some(context) = context {
@@ -1792,6 +1817,7 @@ fn nlip_error_code(error: &InteriorPointSolveError) -> &'static str {
         InteriorPointSolveError::CpuTimeExceeded { .. } => "max_cpu_time",
         InteriorPointSolveError::WallTimeExceeded { .. } => "max_wall_time",
         InteriorPointSolveError::UserRequestedStop { .. } => "user_stop",
+        InteriorPointSolveError::SearchDirectionTooSmall { .. } => "search_direction_too_small",
         InteriorPointSolveError::MaxIterations { .. } => "max_iters",
     }
 }
