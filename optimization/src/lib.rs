@@ -5197,8 +5197,35 @@ fn fmt_line_search_iterations(iterations: Option<Index>) -> String {
     }
 }
 
+const ITERATION_NUMBER_COLUMN_WIDTH: usize = 4;
+const ITERATION_SUFFIX_COLUMN_WIDTH: usize = 1;
+const ITERATION_LABEL_COLUMN_WIDTH: usize =
+    ITERATION_NUMBER_COLUMN_WIDTH + ITERATION_SUFFIX_COLUMN_WIDTH;
+
 pub(crate) fn fmt_iteration_label(label: &str) -> String {
-    format!("{label:>5}")
+    if !label.is_empty() && label.chars().all(|character| character.is_ascii_digit()) {
+        return format!(
+            "{label:>width$}{suffix:>suffix_width$}",
+            suffix = "",
+            width = ITERATION_NUMBER_COLUMN_WIDTH,
+            suffix_width = ITERATION_SUFFIX_COLUMN_WIDTH,
+        );
+    }
+
+    if let Some((suffix_start, suffix)) = label.char_indices().last() {
+        let number = &label[..suffix_start];
+        if suffix.is_ascii_alphabetic()
+            && !number.is_empty()
+            && number.chars().all(|character| character.is_ascii_digit())
+        {
+            return format!(
+                "{number:>width$}{suffix}",
+                width = ITERATION_NUMBER_COLUMN_WIDTH,
+            );
+        }
+    }
+
+    format!("{label:>width$}", width = ITERATION_LABEL_COLUMN_WIDTH)
 }
 
 pub(crate) fn style_iteration_label_cell(label: &str, iteration_limit_reached: bool) -> String {
@@ -5334,14 +5361,24 @@ fn log_boxed_section(title: &str, lines: &[String], title_style: fn(&str) -> Str
 mod tests {
     use super::{
         IPOPT_MAX_HESSIAN_PERTURBATION, IPOPT_PERTURB_INC_FACT, InteriorPointLinearSolver,
-        NATIVE_SPRAL_PARITY_INERTIA_CORRECTION_RETRIES, native_spral_parity_nlip_options,
-        visible_len,
+        NATIVE_SPRAL_PARITY_INERTIA_CORRECTION_RETRIES, fmt_iteration_label,
+        native_spral_parity_nlip_options, visible_len,
     };
 
     #[test]
     fn visible_len_ignores_ansi_and_counts_unicode_chars() {
         let styled = "\u{1b}[1m‖ineq₊‖∞=1.70e-08\u{1b}[0m";
         assert_eq!(visible_len(styled), "‖ineq₊‖∞=1.70e-08".chars().count());
+    }
+
+    #[test]
+    fn iteration_labels_reserve_suffix_slot() {
+        let accepted = fmt_iteration_label("616");
+        let restoration = fmt_iteration_label("616r");
+
+        assert_eq!(accepted, " 616 ");
+        assert_eq!(restoration, " 616r");
+        assert_eq!(&accepted[..4], &restoration[..4]);
     }
 
     #[test]

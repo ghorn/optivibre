@@ -28,10 +28,11 @@ use super::{
     Index, OVERALL_INF_LABEL, PRIMAL_INF_LABEL, ParameterMatrix, SolverAdapterTiming,
     SqpEventLegendState, boxed_line, choose_summary_duration_unit, compact_duration_text,
     complementarity_inf_norm, declared_box_constraint_count, dense_fill_percent,
-    fmt_duration_in_unit, fmt_optional_duration_in_unit, inf_norm, log_boxed_section,
-    lower_tri_fill_percent, scaled_overall_inf_norm, sci_text, style_bold, style_cyan_bold,
-    style_green_bold, style_iteration_label_cell, style_metric_against_tolerance, style_red_bold,
-    style_yellow_bold, time_callback, validate_nlp_problem_shapes, validate_parameter_inputs,
+    fmt_duration_in_unit, fmt_iteration_label, fmt_optional_duration_in_unit, inf_norm,
+    log_boxed_section, lower_tri_fill_percent, scaled_overall_inf_norm, sci_text, style_bold,
+    style_cyan_bold, style_green_bold, style_iteration_label_cell, style_metric_against_tolerance,
+    style_red_bold, style_yellow_bold, time_callback, validate_nlp_problem_shapes,
+    validate_parameter_inputs,
 };
 
 const IP_COMP_INF_LABEL: &str = "‖s∘z‖∞";
@@ -15798,12 +15799,12 @@ fn fmt_ip_event_prefix_cell() -> String {
 }
 
 fn ip_event_legend_prefix() -> String {
-    [format!("{:>4}", ""), fmt_ip_event_prefix_cell()].join("  ")
+    [fmt_iteration_label(""), fmt_ip_event_prefix_cell()].join("  ")
 }
 
 fn fmt_ip_event_header_row() -> String {
     [
-        format!("{:>4}", "iter"),
+        fmt_iteration_label("iter"),
         fmt_ip_event_header(),
         format!("{:>9}", "f"),
         format!("{:>9}", EQ_INF_LABEL),

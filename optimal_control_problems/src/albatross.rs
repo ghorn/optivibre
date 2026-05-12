@@ -310,7 +310,7 @@ impl Default for Params {
                 lower: 3.0,
                 upper: 12.0,
             },
-            constrain_vy0_zero: true,
+            constrain_vy0_zero: false,
             gravity_mps2: DEFAULT_GRAVITY_MPS2,
             air_density_kg_m3: DEFAULT_AIR_DENSITY_KG_M3,
             mass_kg: DEFAULT_MASS_KG,
@@ -1037,8 +1037,8 @@ pub fn spec() -> ProblemSpec {
         problem_scientific_slider_control(
             "alpha_rate_regularization",
             "Alpha Rate Weight",
-            1.0e-3,
-            1.0e3,
+            1.0e-6,
+            1.0e6,
             1.0e-2,
             defaults.alpha_rate_regularization,
             "",
@@ -1047,8 +1047,8 @@ pub fn spec() -> ProblemSpec {
         problem_scientific_slider_control(
             "roll_rate_regularization",
             "Roll Rate Weight",
-            1.0e-3,
-            1.0e3,
+            1.0e-6,
+            1.0e6,
             1.0e-2,
             defaults.roll_rate_regularization,
             "",
@@ -3287,7 +3287,7 @@ mod tests {
         assert_eq!(params.tf.value, 6.0);
         assert_eq!(params.tf.lower, 3.0);
         assert_eq!(params.tf.upper, 12.0);
-        assert!(params.constrain_vy0_zero);
+        assert!(!params.constrain_vy0_zero);
         assert_eq!(params.gravity_mps2, DEFAULT_GRAVITY_MPS2);
         assert_eq!(params.air_density_kg_m3, DEFAULT_AIR_DENSITY_KG_M3);
         assert_eq!(params.mass_kg, DEFAULT_MASS_KG);
@@ -3387,22 +3387,23 @@ mod tests {
     #[test]
     fn vy0_anchor_checkbox_switches_global_bounds_only() {
         let mut values = BTreeMap::new();
-        let anchored = Params::from_map(&values).expect("default params should parse");
-        let anchored_bounds = global_bounds(&anchored);
-        assert_eq!(anchored_bounds.vy0.lower, Some(0.0));
-        assert_eq!(anchored_bounds.vy0.upper, Some(0.0));
-
-        let anchored_variant = compile_variant_for_values(&values).expect("anchored variant");
-        values.insert("constrain_vy0_zero".to_string(), 0.0);
-        let relaxed = Params::from_map(&values).expect("relaxed params should parse");
+        let relaxed = Params::from_map(&values).expect("default params should parse");
         let relaxed_bounds = global_bounds(&relaxed);
         let relaxed_variant = compile_variant_for_values(&values).expect("relaxed variant");
 
+        values.insert("constrain_vy0_zero".to_string(), 1.0);
+        let anchored = Params::from_map(&values).expect("anchored params should parse");
+        let anchored_bounds = global_bounds(&anchored);
+        let anchored_variant = compile_variant_for_values(&values).expect("anchored variant");
+
         assert!(!relaxed.constrain_vy0_zero);
+        assert!(anchored.constrain_vy0_zero);
         assert_eq!(anchored_variant, relaxed_variant);
         assert_eq!(active_design(&relaxed).expect("active design").vy0, 0.0);
         assert_eq!(relaxed_bounds.vy0.lower, Some(-relaxed.max_airspeed_mps));
         assert_eq!(relaxed_bounds.vy0.upper, Some(relaxed.max_airspeed_mps));
+        assert_eq!(anchored_bounds.vy0.lower, Some(0.0));
+        assert_eq!(anchored_bounds.vy0.upper, Some(0.0));
     }
 
     #[test]

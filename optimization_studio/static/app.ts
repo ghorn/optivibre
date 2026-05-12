@@ -1,4 +1,17 @@
 const PALETTE = ["#f7b267", "#5bd1b5", "#7cc6fe", "#f25f5c", "#d7aefb", "#b8f2e6"] as const;
+const PLOT_LINE_WIDTH = Object.freeze({
+  primary: 1.2,
+  secondary: 0.95,
+  bound: 0.7,
+  tolerance: 0.6,
+  scenePrimary: 1.4,
+  sceneSecondary: 0.9,
+  shape: 0.8,
+});
+const PLOT_MARKER_SIZE = Object.freeze({
+  primary: 2.4,
+  secondary: 2.0,
+});
 const EQ_INF_LABEL = "‖eq‖∞";
 const INEQ_INF_LABEL = "‖ineq₊‖∞";
 const DUAL_INF_LABEL = "‖∇L‖∞";
@@ -2489,6 +2502,9 @@ function rangeValueToControlValue(control: ControlSpec, numeric: number): number
 }
 
 function formatControlInputValue(control: ControlSpec, numeric: number): string {
+  if (control.value_display === CONTROL_VALUE_DISPLAY.scientific) {
+    return Number(numeric).toExponential(1);
+  }
   if (!usesLogRangeControl(control)) {
     return String(numeric);
   }
@@ -5414,7 +5430,7 @@ function scenePathTraces(scene: Scene2D): PlotlyTrace[] {
     y: path.y,
     line: {
       color: PALETTE[index % PALETTE.length],
-      width: index === 0 ? 4 : 2.5,
+      width: index === 0 ? PLOT_LINE_WIDTH.scenePrimary : PLOT_LINE_WIDTH.sceneSecondary,
       shape: "linear",
     },
     hovertemplate: `${scene.x_label}: %{x:.3f}<br>${scene.y_label}: %{y:.3f}<extra>${path.name}</extra>`,
@@ -5446,7 +5462,7 @@ function sceneFrameTraces(scene: Scene2D, frameIndex: number): PlotlyTrace[] {
       hoverinfo: "skip",
       line: {
         color: "#e5f1f4",
-        width: 3,
+        width: PLOT_LINE_WIDTH.sceneSecondary,
       },
     });
   }
@@ -5468,10 +5484,10 @@ function sceneFrameTraces(scene: Scene2D, frameIndex: number): PlotlyTrace[] {
       showlegend: false,
       marker: {
         color: "#5bd1b5",
-        size: 8,
+        size: 4,
         line: {
           color: "#e5f1f4",
-          width: 1,
+          width: PLOT_LINE_WIDTH.tolerance,
         },
       },
       hovertemplate: `${scene.x_label}: %{x:.3f}<br>${scene.y_label}: %{y:.3f}<extra>%{text}</extra>`,
@@ -5492,7 +5508,7 @@ function sceneShapes(scene: Scene2D): PlotlyTrace[] {
     y1: circle.cy + circle.radius,
     line: {
       color: "#f25f5c",
-      width: 2,
+      width: PLOT_LINE_WIDTH.shape,
       dash: "dash",
     },
     fillcolor: "rgba(242, 95, 92, 0.13)",
@@ -5533,7 +5549,7 @@ function sceneAnnotations(scene: Scene2D): PlotlyTrace[] {
       text: arrow.label,
       showarrow: true,
       arrowhead: 3,
-      arrowwidth: 2.5,
+      arrowwidth: PLOT_LINE_WIDTH.secondary,
       arrowcolor: "#f7b267",
       font: {
         color: "#f7b267",
@@ -6739,6 +6755,17 @@ function renderConstraintPanel(
       `;
       return;
     }
+    if (kind === "ineq") {
+      target.innerHTML = `
+        <article class="constraint-entry constraint-entry-success constraint-entry-summary">
+          <div class="constraint-entry-inline">
+            <span class="constraint-inline-label">Violations</span>
+            <span class="constraint-inline-value">0</span>
+          </div>
+        </article>
+      `;
+      return;
+    }
     target.innerHTML = `
       <article class="constraint-entry constraint-entry-success constraint-entry-summary">
         <div class="constraint-entry-inline">
@@ -7001,7 +7028,7 @@ function progressToleranceTrace(name: string, color: string, dash: string): Plot
     showlegend: false,
     line: {
       color,
-      width: 1,
+      width: PLOT_LINE_WIDTH.tolerance,
       dash,
     },
     marker: {
@@ -7010,7 +7037,7 @@ function progressToleranceTrace(name: string, color: string, dash: string): Plot
       color,
       line: {
         color,
-        width: 1,
+        width: PLOT_LINE_WIDTH.tolerance,
       },
     },
     opacity: 0.35,
@@ -7120,8 +7147,8 @@ function ensureProgressPlot(): void {
       x: [],
       y: [],
       yaxis: "y2",
-      line: { color: PALETTE[0], width: 2.5 },
-      marker: { size: 5 },
+      line: { color: PALETTE[0], width: PLOT_LINE_WIDTH.primary },
+      marker: { size: PLOT_MARKER_SIZE.primary },
     },
     {
       type: "scatter",
@@ -7129,8 +7156,8 @@ function ensureProgressPlot(): void {
       name: EQ_INF_LABEL,
       x: [],
       y: [],
-      line: { color: PALETTE[1], width: 2.5 },
-      marker: { size: 5 },
+      line: { color: PALETTE[1], width: PLOT_LINE_WIDTH.primary },
+      marker: { size: PLOT_MARKER_SIZE.primary },
     },
     {
       type: "scatter",
@@ -7138,8 +7165,8 @@ function ensureProgressPlot(): void {
       name: INEQ_INF_LABEL,
       x: [],
       y: [],
-      line: { color: PALETTE[2], width: 2.5 },
-      marker: { size: 5 },
+      line: { color: PALETTE[2], width: PLOT_LINE_WIDTH.primary },
+      marker: { size: PLOT_MARKER_SIZE.primary },
     },
     {
       type: "scatter",
@@ -7147,8 +7174,8 @@ function ensureProgressPlot(): void {
       name: DUAL_INF_LABEL,
       x: [],
       y: [],
-      line: { color: PALETTE[3], width: 2.5 },
-      marker: { size: 5 },
+      line: { color: PALETTE[3], width: PLOT_LINE_WIDTH.primary },
+      marker: { size: PLOT_MARKER_SIZE.primary },
     },
     progressToleranceTrace(`${EQ_INF_LABEL} threshold`, PALETTE[1], "dot"),
     progressToleranceTrace(`${INEQ_INF_LABEL} threshold`, PALETTE[2], "longdash"),
@@ -7300,7 +7327,7 @@ function ensureTrustRegionPlot(): void {
       name: TRUST_REGION_RADIUS_LABEL,
       x: [],
       y: [],
-      line: { color: PALETTE[0], width: 2.8 },
+      line: { color: PALETTE[0], width: PLOT_LINE_WIDTH.primary },
       hoverinfo: "skip",
     },
     {
@@ -7314,7 +7341,7 @@ function ensureTrustRegionPlot(): void {
         size: [],
         symbol: [],
         color: PALETTE[1],
-        line: { color: "rgba(229, 241, 244, 0.22)", width: 1.1 },
+        line: { color: "rgba(229, 241, 244, 0.22)", width: PLOT_LINE_WIDTH.tolerance },
       },
       hovertemplate: "%{text}<extra></extra>",
     },
@@ -7329,7 +7356,7 @@ function ensureTrustRegionPlot(): void {
         size: [],
         symbol: [],
         color: PALETTE[3],
-        line: { color: "rgba(229, 241, 244, 0.22)", width: 1.1 },
+        line: { color: "rgba(229, 241, 244, 0.22)", width: PLOT_LINE_WIDTH.tolerance },
       },
       hovertemplate: "%{text}<extra></extra>",
     },
@@ -7464,7 +7491,7 @@ function ensureFilterPlot(): void {
       name: "Filter frontier",
       x: [],
       y: [],
-      line: { color: PALETTE[1], width: 1.5, dash: "solid" },
+      line: { color: PALETTE[1], width: PLOT_LINE_WIDTH.secondary, dash: "solid" },
       marker: {
         size: 3,
         color: "#2f9f89",
@@ -8011,13 +8038,17 @@ function buildChartTraces(chart: Chart): ChartTraceBuild {
       y: series.y,
       line: {
         color,
-        width: isBound ? 1.8 : paletteIndex === 0 ? 3.5 : 2.4,
+        width: isBound
+          ? PLOT_LINE_WIDTH.bound
+          : paletteIndex === 0
+            ? PLOT_LINE_WIDTH.primary
+            : PLOT_LINE_WIDTH.secondary,
         shape: "linear",
         dash,
       },
       marker: {
         color,
-        size: isBound ? 0 : 6,
+        size: isBound ? 0 : PLOT_MARKER_SIZE.primary,
       },
     };
   });
@@ -8128,7 +8159,7 @@ function circleShapes(circles: SceneCircle[]): PlotlyTrace[] {
     y1: circle.cy + circle.radius,
     line: {
       color: "#f25f5c",
-      width: 2,
+      width: PLOT_LINE_WIDTH.shape,
       dash: "dash",
     },
     fillcolor: "rgba(242, 95, 92, 0.13)",
@@ -8169,12 +8200,12 @@ function updateContourVisualization(
     y: path.y,
     line: {
       color: index === 0 ? "#5bd1b5" : PALETTE[index % PALETTE.length],
-      width: index === 0 ? 3.5 : 2.3,
+      width: index === 0 ? PLOT_LINE_WIDTH.primary : PLOT_LINE_WIDTH.secondary,
     },
     marker: {
       color: index === 0 ? "#5bd1b5" : PALETTE[index % PALETTE.length],
-      size: 6,
-      line: { color: "#041016", width: 1 },
+      size: PLOT_MARKER_SIZE.primary,
+      line: { color: "#041016", width: PLOT_LINE_WIDTH.tolerance },
     },
     hovertemplate: `${visualization.x_label}: %{x:.4f}<br>${visualization.y_label}: %{y:.4f}<extra>${path.name}</extra>`,
   }));
@@ -8192,7 +8223,7 @@ function updateContourVisualization(
       },
       line: {
         color: "rgba(229, 241, 244, 0.28)",
-        width: 0.7,
+        width: PLOT_LINE_WIDTH.tolerance,
       },
       colorbar: {
         title: "f",
@@ -8261,6 +8292,7 @@ interface Paths3DTraceStyle {
   opacity: number;
   mode: string;
   markerSize: number;
+  visible: true | "legendonly";
 }
 
 interface Paths3DTraceBuild {
@@ -8294,8 +8326,8 @@ function paths3DHoverTemplate(visualization: Paths3DVisualization, label: string
 
 const DEFAULT_PATHS_3D_CAMERA: PlotlyObject = {
   up: { x: 0, y: 0, z: 1 },
-  eye: { x: -1.75, y: -1.85, z: 1.05 },
-  center: { x: 0.0, y: 0.0, z: -0.04 },
+  eye: { x: 1.05, y: -2.2, z: 1.35 },
+  center: { x: 0.04, y: 0.0, z: -0.08 },
 };
 
 function isPlotlyObject(value: PlotlyValue | undefined): value is PlotlyObject {
@@ -8430,6 +8462,7 @@ function paths3DTraceStyle(path: ScenePath3D, index: number): Paths3DTraceStyle 
       opacity: 1,
       mode: "lines",
       markerSize: 0,
+      visible: true,
     };
   }
   if (name.startsWith("lift")) {
@@ -8441,6 +8474,7 @@ function paths3DTraceStyle(path: ScenePath3D, index: number): Paths3DTraceStyle 
       opacity: 0.78,
       mode: "lines",
       markerSize: 0,
+      visible: "legendonly",
     };
   }
   if (name.startsWith("drag")) {
@@ -8452,6 +8486,7 @@ function paths3DTraceStyle(path: ScenePath3D, index: number): Paths3DTraceStyle 
       opacity: 0.9,
       mode: "lines",
       markerSize: 0,
+      visible: "legendonly",
     };
   }
   if (name.startsWith("aero accel")) {
@@ -8463,6 +8498,7 @@ function paths3DTraceStyle(path: ScenePath3D, index: number): Paths3DTraceStyle 
       opacity: 0.74,
       mode: "lines",
       markerSize: 0,
+      visible: true,
     };
   }
   if (name.startsWith("wind shear")) {
@@ -8474,6 +8510,7 @@ function paths3DTraceStyle(path: ScenePath3D, index: number): Paths3DTraceStyle 
       opacity: name.startsWith("wind shear frame") ? 0.16 : 0.3,
       mode: "lines",
       markerSize: 0,
+      visible: "legendonly",
     };
   }
   if (name.startsWith("wind")) {
@@ -8485,6 +8522,7 @@ function paths3DTraceStyle(path: ScenePath3D, index: number): Paths3DTraceStyle 
       opacity: 0.68,
       mode: "lines",
       markerSize: 0,
+      visible: "legendonly",
     };
   }
   if (name.startsWith("air axis")) {
@@ -8496,6 +8534,7 @@ function paths3DTraceStyle(path: ScenePath3D, index: number): Paths3DTraceStyle 
       opacity: 0.56,
       mode: "lines",
       markerSize: 0,
+      visible: "legendonly",
     };
   }
   if (name.startsWith("zero-bank frame")) {
@@ -8507,6 +8546,7 @@ function paths3DTraceStyle(path: ScenePath3D, index: number): Paths3DTraceStyle 
       opacity: 0.58,
       mode: "lines",
       markerSize: 0,
+      visible: "legendonly",
     };
   }
   if (name.startsWith("side frame")) {
@@ -8518,6 +8558,7 @@ function paths3DTraceStyle(path: ScenePath3D, index: number): Paths3DTraceStyle 
       opacity: 0.58,
       mode: "lines",
       markerSize: 0,
+      visible: "legendonly",
     };
   }
   return {
@@ -8528,6 +8569,7 @@ function paths3DTraceStyle(path: ScenePath3D, index: number): Paths3DTraceStyle 
     opacity: 0.48,
     mode: "lines",
     markerSize: 0,
+    visible: "legendonly",
   };
 }
 
@@ -8547,6 +8589,7 @@ function buildPaths3DTraces(visualization: Paths3DVisualization): Paths3DTraceBu
       style.opacity,
       style.mode,
       style.markerSize,
+      style.visible,
       showlegend,
     ]);
     return {
@@ -8557,6 +8600,7 @@ function buildPaths3DTraces(visualization: Paths3DVisualization): Paths3DTraceBu
       x: path.x,
       y: path.y,
       z: path.z,
+      visible: style.visible,
       showlegend,
       opacity: style.opacity,
       line: {
