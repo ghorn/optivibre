@@ -39,6 +39,15 @@ const IP_COMP_INF_LABEL: &str = "‖s∘z‖∞";
 const LINEAR_SOLUTION_MAX_RELATIVE_INF_NORM: f64 = 1e12;
 const LINEAR_SOLUTION_MAX_RELATIVE_RESIDUAL: f64 = 1e-7;
 const LINEAR_DEBUG_RELATIVE_DELTA_TOLERANCE: f64 = 1e-8;
+const IP_STEP_FULL_DISPLAY_THRESHOLD: f64 = 0.995;
+const IP_STEP_SMALL_RED_THRESHOLD: f64 = 1e-4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InteriorPointStepColor {
+    Full,
+    Reduced,
+    Tiny,
+}
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InteriorPointLinearSolver {
@@ -15569,6 +15578,26 @@ fn fmt_optional_ip_sci(value: Option<f64>) -> String {
     }
 }
 
+fn classify_ip_step(value: f64) -> InteriorPointStepColor {
+    if !value.is_finite() || value < IP_STEP_SMALL_RED_THRESHOLD {
+        InteriorPointStepColor::Tiny
+    } else if value >= IP_STEP_FULL_DISPLAY_THRESHOLD {
+        InteriorPointStepColor::Full
+    } else {
+        InteriorPointStepColor::Reduced
+    }
+}
+
+fn style_ip_step_cell(value: Option<f64>) -> String {
+    let cell = fmt_optional_ip_sci(value);
+    match value.map(classify_ip_step) {
+        Some(InteriorPointStepColor::Tiny) => style_red_bold(&cell),
+        Some(InteriorPointStepColor::Full) => style_green_bold(&cell),
+        Some(InteriorPointStepColor::Reduced) => style_yellow_bold(&cell),
+        None => cell,
+    }
+}
+
 struct InteriorPointIterationLog {
     iteration: Index,
     phase: InteriorPointIterationPhase,
@@ -15842,8 +15871,8 @@ fn log_interior_point_iteration(
             true,
         ),
         format!("{:>9}", sci_text(log.barrier_parameter)),
-        fmt_optional_ip_sci(log.alpha_pr.or(log.alpha)),
-        fmt_optional_ip_sci(log.alpha_du),
+        style_ip_step_cell(log.alpha_pr.or(log.alpha)),
+        style_ip_step_cell(log.alpha_du),
         match log.linear_time_secs {
             Some(seconds) => format!("{:>7}", compact_duration_text(seconds)),
             None => format!("{:>7}", "--"),
@@ -16754,6 +16783,22 @@ mod tests {
             style_ip_metric("x", 3e-2, InteriorPointResidualMetric::Dual, mode),
             style_red_bold("x")
         );
+    }
+
+    #[test]
+    fn step_alpha_display_classifies_full_reduced_and_tiny_steps() {
+        assert_eq!(classify_ip_step(1.0), InteriorPointStepColor::Full);
+        assert_eq!(classify_ip_step(0.995), InteriorPointStepColor::Full);
+        assert_eq!(classify_ip_step(0.5), InteriorPointStepColor::Reduced);
+        assert_eq!(
+            classify_ip_step(IP_STEP_SMALL_RED_THRESHOLD),
+            InteriorPointStepColor::Reduced
+        );
+        assert_eq!(
+            classify_ip_step(IP_STEP_SMALL_RED_THRESHOLD * 0.5),
+            InteriorPointStepColor::Tiny
+        );
+        assert_eq!(classify_ip_step(f64::NAN), InteriorPointStepColor::Tiny);
     }
 
     #[test]

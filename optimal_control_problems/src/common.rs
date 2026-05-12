@@ -16,16 +16,17 @@ use optimal_control::{
 };
 use optimization::{
     BackendCompileReport, BackendTimingMetadata, CallPolicy, CallPolicyConfig, ClarabelSqpError,
-    ClarabelSqpOptions, ClarabelSqpProfiling, ClarabelSqpSummary, ConstraintSatisfaction,
-    FilterAcceptanceMode, FiniteDifferenceValidationOptions, FunctionCompileOptions,
-    InteriorPointIterationSnapshot, InteriorPointLinearSolver, InteriorPointOptions,
-    InteriorPointProfiling, InteriorPointSolveError, InteriorPointSpralPivotMethod,
-    InteriorPointSummary, LineSearchFilterOptions, LineSearchMeritOptions, LlvmOptimizationLevel,
-    NlpCompileStats, NlpDerivativeValidationReport, NlpEvaluationBenchmark,
-    NlpEvaluationBenchmarkOptions, NlpEvaluationKernelKind, SqpFilterOptions, SqpGlobalization,
-    SqpIterationEvent, SqpIterationPhase, SqpIterationSnapshot, SqpLineSearchOptions,
-    SqpTrustRegionOptions, SymbolicSetupProfile, TrustRegionFilterOptions, TrustRegionMeritOptions,
-    ValidationTolerances, Vectorize, format_nlip_settings_summary, format_sqp_settings_summary,
+    ClarabelSqpOptions, ClarabelSqpProfiling, ClarabelSqpSummary, ConstraintBoundSide,
+    ConstraintSatisfaction, FilterAcceptanceMode, FiniteDifferenceValidationOptions,
+    FunctionCompileOptions, InteriorPointIterationSnapshot, InteriorPointLinearSolver,
+    InteriorPointOptions, InteriorPointProfiling, InteriorPointSolveError,
+    InteriorPointSpralPivotMethod, InteriorPointSummary, LineSearchFilterOptions,
+    LineSearchMeritOptions, LlvmOptimizationLevel, NlpCompileStats, NlpDerivativeValidationReport,
+    NlpEvaluationBenchmark, NlpEvaluationBenchmarkOptions, NlpEvaluationKernelKind,
+    SqpFilterOptions, SqpGlobalization, SqpIterationEvent, SqpIterationPhase, SqpIterationSnapshot,
+    SqpLineSearchOptions, SqpTrustRegionOptions, SymbolicSetupProfile, TrustRegionFilterOptions,
+    TrustRegionMeritOptions, ValidationTolerances, Vectorize, format_nlip_settings_summary,
+    format_sqp_settings_summary,
 };
 #[cfg(feature = "ipopt")]
 use optimization::{
@@ -515,6 +516,16 @@ pub enum ConstraintPanelCategory {
     FinalTime,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConstraintPanelBoundSide {
+    #[default]
+    None,
+    Lower,
+    Upper,
+    Both,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ConstraintPanelEntry {
     pub label: String,
@@ -531,6 +542,22 @@ pub struct ConstraintPanelEntry {
     pub lower_severity: Option<ConstraintPanelSeverity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upper_severity: Option<ConstraintPanelSeverity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bound_side: Option<ConstraintPanelBoundSide>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_bound_side: Option<ConstraintPanelBoundSide>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_instances: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lower_active_instances: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upper_active_instances: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_active_margin: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_lower_margin: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_upper_margin: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -2152,6 +2179,11 @@ impl OcpSxFunctionConfig {
 
     pub const fn with_opt_level(mut self, opt_level: LlvmOptimizationLevel) -> Self {
         self.opt_level = opt_level;
+        self
+    }
+
+    pub const fn with_hessian_strategy(mut self, hessian_strategy: HessianStrategy) -> Self {
+        self.hessian_strategy = hessian_strategy;
         self
     }
 
@@ -4417,11 +4449,7 @@ pub fn default_sqp_method_config() -> SqpMethodConfig {
 
 pub const fn default_nlip_config() -> NlipConfig {
     NlipConfig {
-        // IPOPT 3.14.20 `IpSpralSolverInterface` defaults to native SPRAL with
-        // matching ordering/scaling and `spral_pivot_method=block`. IPOPT maps
-        // that option to raw SPRAL control value 1, which corresponds to
-        // SPRAL's aggressive APP constant in the native C/Fortran API.
-        linear_solver: InteriorPointLinearSolver::SpralSrc,
+        linear_solver: InteriorPointLinearSolver::SsidsRs,
         spral_pivot_method: InteriorPointSpralPivotMethod::AggressiveAposteriori,
         spral_action_on_zero_pivot: true,
         spral_small_pivot_tolerance: 1.0e-20,
@@ -7354,6 +7382,15 @@ fn panel_category_from_core(value: OcpConstraintCategory) -> ConstraintPanelCate
     }
 }
 
+fn panel_bound_side_from_core(value: ConstraintBoundSide) -> ConstraintPanelBoundSide {
+    match value {
+        ConstraintBoundSide::Equality => ConstraintPanelBoundSide::None,
+        ConstraintBoundSide::Lower => ConstraintPanelBoundSide::Lower,
+        ConstraintBoundSide::Upper => ConstraintPanelBoundSide::Upper,
+        ConstraintBoundSide::Both => ConstraintPanelBoundSide::Both,
+    }
+}
+
 fn constraint_panels_from_report(report: OcpConstraintViolationReport) -> ConstraintPanels {
     ConstraintPanels {
         equalities: report
@@ -7370,6 +7407,14 @@ fn constraint_panels_from_report(report: OcpConstraintViolationReport) -> Constr
                 upper_bound: None,
                 lower_severity: None,
                 upper_severity: None,
+                bound_side: None,
+                active_bound_side: None,
+                active_instances: None,
+                lower_active_instances: None,
+                upper_active_instances: None,
+                min_active_margin: None,
+                min_lower_margin: None,
+                min_upper_margin: None,
             })
             .collect(),
         inequalities: report
@@ -7386,6 +7431,14 @@ fn constraint_panels_from_report(report: OcpConstraintViolationReport) -> Constr
                 upper_bound: group.upper_bound,
                 lower_severity: group.lower_satisfaction.map(panel_severity_from_core),
                 upper_severity: group.upper_satisfaction.map(panel_severity_from_core),
+                bound_side: Some(panel_bound_side_from_core(group.bound_side)),
+                active_bound_side: Some(panel_bound_side_from_core(group.active_bound_side)),
+                active_instances: Some(group.active_instances),
+                lower_active_instances: Some(group.lower_active_instances),
+                upper_active_instances: Some(group.upper_active_instances),
+                min_active_margin: group.min_active_margin,
+                min_lower_margin: group.min_lower_margin,
+                min_upper_margin: group.min_upper_margin,
             })
             .collect(),
     }
@@ -11348,9 +11401,9 @@ mod tests {
     }
 
     #[test]
-    fn default_nlip_config_matches_ipopt_spral_defaults() {
+    fn default_nlip_config_uses_ssids_rs_with_spral_option_defaults() {
         let default = default_nlip_config();
-        assert_eq!(default.linear_solver, InteriorPointLinearSolver::SpralSrc);
+        assert_eq!(default.linear_solver, InteriorPointLinearSolver::SsidsRs);
         assert_eq!(
             default.spral_pivot_method,
             InteriorPointSpralPivotMethod::AggressiveAposteriori

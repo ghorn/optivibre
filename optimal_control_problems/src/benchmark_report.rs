@@ -20,6 +20,7 @@ use optimization::{
     NlpEvaluationKernelKind,
 };
 use serde::Serialize;
+use sx_core::HessianStrategy;
 
 use crate::OcpSxFunctionConfig;
 use crate::common::{CompileReportSummary, ProblemId, TranscriptionMethod};
@@ -28,7 +29,11 @@ use crate::common::{CompileReportSummary, ProblemId, TranscriptionMethod};
 #[serde(rename_all = "snake_case")]
 pub enum OcpBenchmarkPreset {
     Baseline,
+    BaselineHessianSelectedOutputs,
+    BaselineHessianColored,
     InlineAll,
+    InlineAllHessianSelectedOutputs,
+    InlineAllHessianColored,
     FunctionInlineAtCall,
     FunctionInlineAtLowering,
     FunctionInlineInLlvm,
@@ -49,7 +54,11 @@ impl OcpBenchmarkPreset {
     pub const fn all() -> &'static [Self] {
         &[
             Self::Baseline,
+            Self::BaselineHessianSelectedOutputs,
+            Self::BaselineHessianColored,
             Self::InlineAll,
+            Self::InlineAllHessianSelectedOutputs,
+            Self::InlineAllHessianColored,
             Self::FunctionInlineAtCall,
             Self::FunctionInlineAtLowering,
             Self::FunctionInlineInLlvm,
@@ -60,7 +69,11 @@ impl OcpBenchmarkPreset {
     pub const fn id(self) -> &'static str {
         match self {
             Self::Baseline => "baseline",
+            Self::BaselineHessianSelectedOutputs => "baseline_hessian_selected_outputs",
+            Self::BaselineHessianColored => "baseline_hessian_colored",
             Self::InlineAll => "inline_all",
+            Self::InlineAllHessianSelectedOutputs => "inline_all_hessian_selected_outputs",
+            Self::InlineAllHessianColored => "inline_all_hessian_colored",
             Self::FunctionInlineAtCall => "function_inline_at_call",
             Self::FunctionInlineAtLowering => "function_inline_at_lowering",
             Self::FunctionInlineInLlvm => "function_inline_in_llvm",
@@ -71,7 +84,11 @@ impl OcpBenchmarkPreset {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Baseline => "Baseline",
+            Self::BaselineHessianSelectedOutputs => "Baseline / Hessian Selected Outputs",
+            Self::BaselineHessianColored => "Baseline / Hessian Colored",
             Self::InlineAll => "Inline All",
+            Self::InlineAllHessianSelectedOutputs => "Inline All / Hessian Selected Outputs",
+            Self::InlineAllHessianColored => "Inline All / Hessian Colored",
             Self::FunctionInlineAtCall => "Functions / Inline At Call",
             Self::FunctionInlineAtLowering => "Functions / Inline At Lowering",
             Self::FunctionInlineInLlvm => "Functions / Inline In LLVM",
@@ -84,8 +101,20 @@ impl OcpBenchmarkPreset {
             Self::Baseline => {
                 "Current OCP defaults: reusable leaf kernels where configured, with LLVM-level inlining overrides on the default reusable kernels."
             }
+            Self::BaselineHessianSelectedOutputs => {
+                "Current OCP defaults, but generate the Lagrangian Hessian with selected-output lower-triangle sweeps."
+            }
+            Self::BaselineHessianColored => {
+                "Current OCP defaults, but generate the Lagrangian Hessian with colored lower-triangle sweeps."
+            }
             Self::InlineAll => {
                 "Disable reusable OCP symbolic functions and inline repeated kernels immediately."
+            }
+            Self::InlineAllHessianSelectedOutputs => {
+                "Inline repeated OCP kernels immediately and generate the Lagrangian Hessian with selected-output lower-triangle sweeps."
+            }
+            Self::InlineAllHessianColored => {
+                "Inline repeated OCP kernels immediately and generate the Lagrangian Hessian with colored lower-triangle sweeps."
             }
             Self::FunctionInlineAtCall => {
                 "Build all OCP kernels as symbolic functions but expand them at call construction time."
@@ -105,7 +134,11 @@ impl OcpBenchmarkPreset {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "baseline" => Some(Self::Baseline),
+            "baseline_hessian_selected_outputs" => Some(Self::BaselineHessianSelectedOutputs),
+            "baseline_hessian_colored" => Some(Self::BaselineHessianColored),
             "inline_all" => Some(Self::InlineAll),
+            "inline_all_hessian_selected_outputs" => Some(Self::InlineAllHessianSelectedOutputs),
+            "inline_all_hessian_colored" => Some(Self::InlineAllHessianColored),
             "function_inline_at_call" => Some(Self::FunctionInlineAtCall),
             "function_inline_at_lowering" => Some(Self::FunctionInlineAtLowering),
             "function_inline_in_llvm" => Some(Self::FunctionInlineInLlvm),
@@ -123,7 +156,15 @@ impl OcpBenchmarkPreset {
     pub fn sx_function_config(self) -> OcpSxFunctionConfig {
         match self {
             Self::Baseline => OcpSxFunctionConfig::default(),
+            Self::BaselineHessianSelectedOutputs => OcpSxFunctionConfig::default()
+                .with_hessian_strategy(HessianStrategy::LowerTriangleSelectedOutputs),
+            Self::BaselineHessianColored => OcpSxFunctionConfig::default()
+                .with_hessian_strategy(HessianStrategy::LowerTriangleColored),
             Self::InlineAll => OcpSxFunctionConfig::inline_all(),
+            Self::InlineAllHessianSelectedOutputs => OcpSxFunctionConfig::inline_all()
+                .with_hessian_strategy(HessianStrategy::LowerTriangleSelectedOutputs),
+            Self::InlineAllHessianColored => OcpSxFunctionConfig::inline_all()
+                .with_hessian_strategy(HessianStrategy::LowerTriangleColored),
             Self::FunctionInlineAtCall => {
                 OcpSxFunctionConfig::all_functions_with_global_policy(CallPolicy::InlineAtCall)
             }

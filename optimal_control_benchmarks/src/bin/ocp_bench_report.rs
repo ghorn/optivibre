@@ -44,7 +44,7 @@ fn main() -> Result<()> {
     let mut config = OcpBenchmarkSuiteConfig::default();
     let output = cli.output;
 
-    ensure_release_mode()?;
+    ensure_optimized_build()?;
 
     config.eval_options.measured_iterations = cli.eval_iterations;
     config.eval_options.warmup_iterations = cli.warmup_iterations;
@@ -127,8 +127,16 @@ enum CliPresetSelection {
     All,
     #[value(name = "baseline")]
     Baseline,
+    #[value(name = "baseline_hessian_selected_outputs")]
+    BaselineHessianSelectedOutputs,
+    #[value(name = "baseline_hessian_colored")]
+    BaselineHessianColored,
     #[value(name = "inline_all")]
     InlineAll,
+    #[value(name = "inline_all_hessian_selected_outputs")]
+    InlineAllHessianSelectedOutputs,
+    #[value(name = "inline_all_hessian_colored")]
+    InlineAllHessianColored,
     #[value(name = "function_inline_at_call")]
     FunctionInlineAtCall,
     #[value(name = "function_inline_at_lowering")]
@@ -196,7 +204,19 @@ fn expand_preset_selections(selections: &[CliPresetSelection]) -> Result<Vec<Ocp
         OcpBenchmarkPreset::all().to_vec(),
         |selection| match selection {
             CliPresetSelection::Baseline => Some(OcpBenchmarkPreset::Baseline),
+            CliPresetSelection::BaselineHessianSelectedOutputs => {
+                Some(OcpBenchmarkPreset::BaselineHessianSelectedOutputs)
+            }
+            CliPresetSelection::BaselineHessianColored => {
+                Some(OcpBenchmarkPreset::BaselineHessianColored)
+            }
             CliPresetSelection::InlineAll => Some(OcpBenchmarkPreset::InlineAll),
+            CliPresetSelection::InlineAllHessianSelectedOutputs => {
+                Some(OcpBenchmarkPreset::InlineAllHessianSelectedOutputs)
+            }
+            CliPresetSelection::InlineAllHessianColored => {
+                Some(OcpBenchmarkPreset::InlineAllHessianColored)
+            }
             CliPresetSelection::FunctionInlineAtCall => {
                 Some(OcpBenchmarkPreset::FunctionInlineAtCall)
             }
@@ -266,10 +286,10 @@ where
     Ok(values)
 }
 
-fn ensure_release_mode() -> Result<()> {
-    if cfg!(debug_assertions) {
+fn ensure_optimized_build() -> Result<()> {
+    if matches!(option_env!("OPTIVIBRE_OPT_LEVEL"), Some("0")) {
         bail!(
-            "ocp_bench_report must be run in release mode\n\ntry:\n  cargo run -p optimal_control_benchmarks --release --bin ocp_bench_report -- --output target/ocp_bench_report.html --presets all"
+            "ocp_bench_report was compiled with opt-level=0; benchmark timings require an optimized binary\n\ntry:\n  cargo run -p optimal_control_benchmarks --release --bin ocp_bench_report -- --output target/ocp_bench_report.html --presets all"
         );
     }
     Ok(())
@@ -1669,9 +1689,29 @@ fn preset_legend_entries() -> Vec<(OcpBenchmarkPreset, &'static str, &'static st
     vec![
         (OcpBenchmarkPreset::Baseline, "baseline", "OCP defaults"),
         (
+            OcpBenchmarkPreset::BaselineHessianSelectedOutputs,
+            "base-hsel",
+            "defaults with selected-output Hessian",
+        ),
+        (
+            OcpBenchmarkPreset::BaselineHessianColored,
+            "base-hcol",
+            "defaults with colored Hessian",
+        ),
+        (
             OcpBenchmarkPreset::InlineAll,
             "inline",
             "inline repeated kernels immediately",
+        ),
+        (
+            OcpBenchmarkPreset::InlineAllHessianSelectedOutputs,
+            "inl-hsel",
+            "inline kernels with selected-output Hessian",
+        ),
+        (
+            OcpBenchmarkPreset::InlineAllHessianColored,
+            "inl-hcol",
+            "inline kernels with colored Hessian",
         ),
         (
             OcpBenchmarkPreset::FunctionInlineAtCall,
@@ -2027,8 +2067,28 @@ fn preset_display_name_with_detail(
 ) -> &'static str {
     match (preset, detail) {
         (OcpBenchmarkPreset::Baseline, _) => "Baseline",
+        (OcpBenchmarkPreset::BaselineHessianSelectedOutputs, LabelDetail::Short) => "BaseSel",
+        (OcpBenchmarkPreset::BaselineHessianSelectedOutputs, LabelDetail::Medium) => "Base HSel",
+        (OcpBenchmarkPreset::BaselineHessianSelectedOutputs, LabelDetail::Full) => {
+            "Baseline Hessian Selected"
+        }
+        (OcpBenchmarkPreset::BaselineHessianColored, LabelDetail::Short) => "BaseCol",
+        (OcpBenchmarkPreset::BaselineHessianColored, LabelDetail::Medium) => "Base HCol",
+        (OcpBenchmarkPreset::BaselineHessianColored, LabelDetail::Full) => {
+            "Baseline Hessian Colored"
+        }
         (OcpBenchmarkPreset::InlineAll, LabelDetail::Short) => "Inline",
         (OcpBenchmarkPreset::InlineAll, _) => "Inline All",
+        (OcpBenchmarkPreset::InlineAllHessianSelectedOutputs, LabelDetail::Short) => "InlSel",
+        (OcpBenchmarkPreset::InlineAllHessianSelectedOutputs, LabelDetail::Medium) => "Inl HSel",
+        (OcpBenchmarkPreset::InlineAllHessianSelectedOutputs, LabelDetail::Full) => {
+            "Inline Hessian Selected"
+        }
+        (OcpBenchmarkPreset::InlineAllHessianColored, LabelDetail::Short) => "InlCol",
+        (OcpBenchmarkPreset::InlineAllHessianColored, LabelDetail::Medium) => "Inl HCol",
+        (OcpBenchmarkPreset::InlineAllHessianColored, LabelDetail::Full) => {
+            "Inline Hessian Colored"
+        }
         (OcpBenchmarkPreset::FunctionInlineAtCall, LabelDetail::Short) => "Call",
         (OcpBenchmarkPreset::FunctionInlineAtCall, LabelDetail::Medium) => "At Call",
         (OcpBenchmarkPreset::FunctionInlineAtCall, LabelDetail::Full) => "Inline At Call",
@@ -2258,7 +2318,11 @@ fn best_preset_for_case_metric(
 fn winner_preset_label(preset: OcpBenchmarkPreset) -> &'static str {
     match preset {
         OcpBenchmarkPreset::Baseline => "Base",
+        OcpBenchmarkPreset::BaselineHessianSelectedOutputs => "B-Sel",
+        OcpBenchmarkPreset::BaselineHessianColored => "B-Col",
         OcpBenchmarkPreset::InlineAll => "Inl",
+        OcpBenchmarkPreset::InlineAllHessianSelectedOutputs => "I-Sel",
+        OcpBenchmarkPreset::InlineAllHessianColored => "I-Col",
         OcpBenchmarkPreset::FunctionInlineAtCall => "Call",
         OcpBenchmarkPreset::FunctionInlineAtLowering => "Low",
         OcpBenchmarkPreset::FunctionInlineInLlvm => "LLVM",

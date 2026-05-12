@@ -141,6 +141,13 @@ pub struct OcpInequalityViolationGroup {
     pub lower_satisfaction: Option<ConstraintSatisfaction>,
     pub upper_satisfaction: Option<ConstraintSatisfaction>,
     pub bound_side: ConstraintBoundSide,
+    pub active_instances: usize,
+    pub lower_active_instances: usize,
+    pub upper_active_instances: usize,
+    pub active_bound_side: ConstraintBoundSide,
+    pub min_lower_margin: Option<f64>,
+    pub min_upper_margin: Option<f64>,
+    pub min_active_margin: Option<f64>,
     pub satisfaction: ConstraintSatisfaction,
 }
 
@@ -397,6 +404,11 @@ struct InequalityGroupAccumulator {
     upper_worst_violation: f64,
     lower_violated: bool,
     upper_violated: bool,
+    active_instances: usize,
+    lower_active_instances: usize,
+    upper_active_instances: usize,
+    lower_min_margin: Option<f64>,
+    upper_min_margin: Option<f64>,
 }
 
 type OcpParameters<P, Beq> = (P, Beq);
@@ -1489,6 +1501,16 @@ fn accumulate_equality_group(
     }
 }
 
+fn bounds_are_equality_style(lower_bound: Option<f64>, upper_bound: Option<f64>) -> bool {
+    match (lower_bound, upper_bound) {
+        (Some(lower), Some(upper)) if lower.is_finite() && upper.is_finite() => {
+            let scale = lower.abs().max(upper.abs()).max(1.0);
+            (lower - upper).abs() <= 1.0e-12 * scale
+        }
+        _ => false,
+    }
+}
+
 fn accumulate_inequality_group(
     groups: &mut HashMap<(OcpConstraintCategory, String), InequalityGroupAccumulator>,
     label: &str,
@@ -1503,6 +1525,18 @@ fn accumulate_inequality_group(
     }
     let (lower_violation, upper_violation) = worst_bound_violation(value, lower_bound, upper_bound);
     let worst_violation = lower_violation.max(upper_violation);
+    let active_tolerance = active_constraint_tolerance(tolerance);
+    let lower_margin = lower_bound.map(|lower| value - lower);
+    let upper_margin = upper_bound.map(|upper| upper - value);
+    let equality_style_bounds = bounds_are_equality_style(lower_bound, upper_bound);
+    let lower_active = !equality_style_bounds
+        && lower_margin
+            .filter(|margin| margin.is_finite())
+            .is_some_and(|margin| margin.abs() <= active_tolerance);
+    let upper_active = !equality_style_bounds
+        && upper_margin
+            .filter(|margin| margin.is_finite())
+            .is_some_and(|margin| margin.abs() <= active_tolerance);
     let entry = groups
         .entry((category, label.to_string()))
         .or_insert_with(|| InequalityGroupAccumulator {
@@ -1517,6 +1551,11 @@ fn accumulate_inequality_group(
             upper_worst_violation: 0.0,
             lower_violated: false,
             upper_violated: false,
+            active_instances: 0,
+            lower_active_instances: 0,
+            upper_active_instances: 0,
+            lower_min_margin: None,
+            upper_min_margin: None,
         });
     entry.lower_bound = entry.lower_bound.or(lower_bound);
     entry.upper_bound = entry.upper_bound.or(upper_bound);
@@ -1528,6 +1567,37 @@ fn accumulate_inequality_group(
     entry.upper_violated |= upper_violation > 0.0;
     if worst_violation > tolerance {
         entry.violating_instances += 1;
+    }
+    if lower_active || upper_active {
+        entry.active_instances += 1;
+    }
+    if lower_active {
+        entry.lower_active_instances += 1;
+    }
+    if upper_active {
+        entry.upper_active_instances += 1;
+    }
+    if let Some(margin) = lower_margin.filter(|margin| margin.is_finite()) {
+        entry.lower_min_margin = Some(
+            entry
+                .lower_min_margin
+                .map_or(margin.abs(), |current| current.min(margin.abs())),
+        );
+    }
+    if let Some(margin) = upper_margin.filter(|margin| margin.is_finite()) {
+        entry.upper_min_margin = Some(
+            entry
+                .upper_min_margin
+                .map_or(margin.abs(), |current| current.min(margin.abs())),
+        );
+    }
+}
+
+fn active_constraint_tolerance(tolerance: f64) -> f64 {
+    if tolerance.is_finite() && tolerance > 0.0 {
+        (100.0 * tolerance).max(1.0e-8)
+    } else {
+        1.0e-8
     }
 }
 
@@ -1554,25 +1624,52 @@ fn inequality_groups_from_map(
 ) -> Vec<OcpInequalityViolationGroup> {
     groups
         .into_values()
-        .map(|group| OcpInequalityViolationGroup {
-            label: group.label,
-            category: group.category,
-            worst_violation: group.worst_violation,
-            violating_instances: group.violating_instances,
-            total_instances: group.total_instances,
-            lower_bound: group.lower_bound,
-            upper_bound: group.upper_bound,
-            lower_satisfaction: group
-                .lower_bound
-                .map(|_| classify_constraint_satisfaction(group.lower_worst_violation, tolerance)),
-            upper_satisfaction: group
-                .upper_bound
-                .map(|_| classify_constraint_satisfaction(group.upper_worst_violation, tolerance)),
-            bound_side: constraint_bound_side(
-                if group.lower_violated { 1.0 } else { 0.0 },
-                if group.upper_violated { 1.0 } else { 0.0 },
-            ),
-            satisfaction: classify_constraint_satisfaction(group.worst_violation, tolerance),
+        .map(|group| {
+            let min_active_margin = match (group.lower_min_margin, group.upper_min_margin) {
+                (Some(lower), Some(upper)) => Some(lower.min(upper)),
+                (Some(lower), None) => Some(lower),
+                (None, Some(upper)) => Some(upper),
+                (None, None) => None,
+            }
+            .filter(|_| group.active_instances > 0);
+            OcpInequalityViolationGroup {
+                label: group.label,
+                category: group.category,
+                worst_violation: group.worst_violation,
+                violating_instances: group.violating_instances,
+                total_instances: group.total_instances,
+                lower_bound: group.lower_bound,
+                upper_bound: group.upper_bound,
+                lower_satisfaction: group.lower_bound.map(|_| {
+                    classify_constraint_satisfaction(group.lower_worst_violation, tolerance)
+                }),
+                upper_satisfaction: group.upper_bound.map(|_| {
+                    classify_constraint_satisfaction(group.upper_worst_violation, tolerance)
+                }),
+                bound_side: constraint_bound_side(
+                    if group.lower_violated { 1.0 } else { 0.0 },
+                    if group.upper_violated { 1.0 } else { 0.0 },
+                ),
+                active_instances: group.active_instances,
+                lower_active_instances: group.lower_active_instances,
+                upper_active_instances: group.upper_active_instances,
+                active_bound_side: constraint_bound_side(
+                    if group.lower_active_instances > 0 {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                    if group.upper_active_instances > 0 {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                ),
+                min_lower_margin: group.lower_min_margin,
+                min_upper_margin: group.upper_min_margin,
+                min_active_margin,
+                satisfaction: classify_constraint_satisfaction(group.worst_violation, tolerance),
+            }
         })
         .collect()
 }
@@ -2238,6 +2335,93 @@ mod tests {
                 terminal_target: tf,
             }
         }
+    }
+
+    #[test]
+    fn inequality_groups_track_active_and_violated_bound_sides() {
+        let mut groups = HashMap::new();
+        let tolerance = 1.0e-8;
+
+        accumulate_inequality_group(
+            &mut groups,
+            "airspeed",
+            OcpConstraintCategory::Path,
+            5.0,
+            Some(5.0),
+            Some(25.0),
+            tolerance,
+        );
+        accumulate_inequality_group(
+            &mut groups,
+            "airspeed",
+            OcpConstraintCategory::Path,
+            25.0,
+            Some(5.0),
+            Some(25.0),
+            tolerance,
+        );
+        accumulate_inequality_group(
+            &mut groups,
+            "airspeed",
+            OcpConstraintCategory::Path,
+            26.0,
+            Some(5.0),
+            Some(25.0),
+            tolerance,
+        );
+
+        let group = inequality_groups_from_map(groups, tolerance)
+            .pop()
+            .expect("expected grouped path constraint");
+        assert_eq!(group.bound_side, ConstraintBoundSide::Upper);
+        assert_eq!(group.active_bound_side, ConstraintBoundSide::Both);
+        assert_eq!(group.violating_instances, 1);
+        assert_eq!(group.active_instances, 2);
+        assert_eq!(group.lower_active_instances, 1);
+        assert_eq!(group.upper_active_instances, 1);
+        assert_abs_diff_eq!(group.worst_violation, 1.0);
+        assert_abs_diff_eq!(group.min_active_margin.unwrap(), 0.0);
+        assert_abs_diff_eq!(group.min_lower_margin.unwrap(), 0.0);
+        assert_abs_diff_eq!(group.min_upper_margin.unwrap(), 0.0);
+    }
+
+    #[test]
+    fn equality_style_bounds_do_not_report_active_inequalities() {
+        let mut groups = HashMap::new();
+        let tolerance = 1.0e-8;
+
+        accumulate_inequality_group(
+            &mut groups,
+            "g.vx0",
+            OcpConstraintCategory::FinalTime,
+            15.0,
+            Some(15.0),
+            Some(15.0),
+            tolerance,
+        );
+        accumulate_inequality_group(
+            &mut groups,
+            "g.vx0",
+            OcpConstraintCategory::FinalTime,
+            14.5,
+            Some(15.0),
+            Some(15.0),
+            tolerance,
+        );
+
+        let group = inequality_groups_from_map(groups, tolerance)
+            .pop()
+            .expect("expected fixed-bound group");
+        assert_eq!(group.bound_side, ConstraintBoundSide::Lower);
+        assert_eq!(group.active_bound_side, ConstraintBoundSide::Equality);
+        assert_eq!(group.violating_instances, 1);
+        assert_eq!(group.active_instances, 0);
+        assert_eq!(group.lower_active_instances, 0);
+        assert_eq!(group.upper_active_instances, 0);
+        assert_abs_diff_eq!(group.worst_violation, 0.5);
+        assert_eq!(group.min_active_margin, None);
+        assert_abs_diff_eq!(group.min_lower_margin.unwrap(), 0.0);
+        assert_abs_diff_eq!(group.min_upper_margin.unwrap(), 0.0);
     }
 
     #[derive(Clone, Debug, PartialEq, optimization::Vectorize)]

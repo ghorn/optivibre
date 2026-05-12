@@ -236,6 +236,18 @@ const CONSTRAINT_PANEL_CATEGORY_FROM_WIRE = Object.freeze({
   collocation_control: CONSTRAINT_PANEL_CATEGORY.collocationControl,
   final_time: CONSTRAINT_PANEL_CATEGORY.finalTime,
 } as const);
+const CONSTRAINT_PANEL_BOUND_SIDE = Object.freeze({
+  none: 0,
+  lower: 1,
+  upper: 2,
+  both: 3,
+} as const);
+const CONSTRAINT_PANEL_BOUND_SIDE_FROM_WIRE = Object.freeze({
+  none: CONSTRAINT_PANEL_BOUND_SIDE.none,
+  lower: CONSTRAINT_PANEL_BOUND_SIDE.lower,
+  upper: CONSTRAINT_PANEL_BOUND_SIDE.upper,
+  both: CONSTRAINT_PANEL_BOUND_SIDE.both,
+} as const);
 const METRIC_KEY = Object.freeze({
   custom: 0,
   transcriptionMethod: 1,
@@ -424,6 +436,7 @@ type TimeSeriesRoleCode = EnumValue<typeof TIME_SERIES_ROLE>;
 type SolverStatusKindCode = EnumValue<typeof SOLVER_STATUS_KIND>;
 type ConstraintPanelSeverityCode = EnumValue<typeof CONSTRAINT_PANEL_SEVERITY>;
 type ConstraintPanelCategoryCode = EnumValue<typeof CONSTRAINT_PANEL_CATEGORY>;
+type ConstraintPanelBoundSideCode = EnumValue<typeof CONSTRAINT_PANEL_BOUND_SIDE>;
 type MetricKeyCode = EnumValue<typeof METRIC_KEY>;
 type SolvePhaseCode = EnumValue<typeof SOLVE_PHASE>;
 type SolverMethodCode = EnumValue<typeof SOLVER_METHOD>;
@@ -715,16 +728,31 @@ interface ConstraintPanelEntry {
   upper_bound?: number | null;
   lower_severity?: ConstraintPanelSeverityCode | null;
   upper_severity?: ConstraintPanelSeverityCode | null;
+  bound_side?: ConstraintPanelBoundSideCode | null;
+  active_bound_side?: ConstraintPanelBoundSideCode | null;
+  active_instances?: number | null;
+  lower_active_instances?: number | null;
+  upper_active_instances?: number | null;
+  min_active_margin?: number | null;
+  min_lower_margin?: number | null;
+  min_upper_margin?: number | null;
 }
 
 interface WireConstraintPanelEntry extends Omit<
   ConstraintPanelEntry,
-  "category" | "severity" | "lower_severity" | "upper_severity"
+  | "category"
+  | "severity"
+  | "lower_severity"
+  | "upper_severity"
+  | "bound_side"
+  | "active_bound_side"
 > {
   category: string | number;
   severity: string | number;
   lower_severity?: string | number | null;
   upper_severity?: string | number | null;
+  bound_side?: string | number | null;
+  active_bound_side?: string | number | null;
 }
 
 interface ConstraintPanels {
@@ -941,6 +969,7 @@ interface ChartView {
   plotEl: PlotlyHostElement;
   linkedRangeBound: boolean;
   linkXRange: boolean;
+  chartTraceSignature: string | null;
 }
 
 interface PlotlyView {
@@ -948,6 +977,9 @@ interface PlotlyView {
   sceneCamera?: PlotlyObject | null;
   sceneInteractionBound?: boolean;
   sceneInteracting?: boolean;
+  scenePointerActive?: boolean;
+  sceneIdleFrameHandle?: number | null;
+  sceneTraceSignature?: string | null;
 }
 
 interface ChartPanelChart {
@@ -989,6 +1021,9 @@ interface Scene3DView {
   sceneCamera: PlotlyObject | null;
   sceneInteractionBound: boolean;
   sceneInteracting: boolean;
+  scenePointerActive: boolean;
+  sceneIdleFrameHandle: number | null;
+  sceneTraceSignature: string | null;
 }
 
 type SceneView = Scene2DView | Scene3DView;
@@ -1063,8 +1098,13 @@ interface FrontendState {
 type PlotlyTrace = PlotlyObject;
 type PlotlyLayout = PlotlyObject;
 type PlotlyConfig = PlotlyObject;
-type ConstraintPanelKind = "eq" | "ineq";
+type ConstraintPanelKind = "eq" | "ineq" | "active";
 type AnsiColor = "red" | "green" | "yellow" | "cyan";
+
+interface ChartTraceBuild {
+  data: PlotlyTrace[];
+  signature: string;
+}
 
 interface AnsiState {
   bold: boolean;
@@ -1782,6 +1822,38 @@ function readWireConstraintPanelEntry(
       readJsonValueAt(object, "upper_severity"),
       `${context}.upper_severity`,
     ),
+    bound_side: readOptionalJsonStringOrNumber(
+      readJsonValueAt(object, "bound_side"),
+      `${context}.bound_side`,
+    ),
+    active_bound_side: readOptionalJsonStringOrNumber(
+      readJsonValueAt(object, "active_bound_side"),
+      `${context}.active_bound_side`,
+    ),
+    active_instances: readOptionalJsonNumber(
+      readJsonValueAt(object, "active_instances"),
+      `${context}.active_instances`,
+    ),
+    lower_active_instances: readOptionalJsonNumber(
+      readJsonValueAt(object, "lower_active_instances"),
+      `${context}.lower_active_instances`,
+    ),
+    upper_active_instances: readOptionalJsonNumber(
+      readJsonValueAt(object, "upper_active_instances"),
+      `${context}.upper_active_instances`,
+    ),
+    min_active_margin: readOptionalJsonNumber(
+      readJsonValueAt(object, "min_active_margin"),
+      `${context}.min_active_margin`,
+    ),
+    min_lower_margin: readOptionalJsonNumber(
+      readJsonValueAt(object, "min_lower_margin"),
+      `${context}.min_lower_margin`,
+    ),
+    min_upper_margin: readOptionalJsonNumber(
+      readJsonValueAt(object, "min_upper_margin"),
+      `${context}.min_upper_margin`,
+    ),
   };
 }
 
@@ -2151,6 +2223,7 @@ const solverLogEl = requiredElement<HTMLPreElement>("#solver-log");
 const prewarmStatusEl = requiredElement<HTMLDivElement>("#prewarm-status");
 const eqViolationsEl = requiredElement<HTMLDivElement>("#eq-violations");
 const ineqViolationsEl = requiredElement<HTMLDivElement>("#ineq-violations");
+const activeConstraintsEl = requiredElement<HTMLDivElement>("#active-constraints");
 
 const SECTION_META: ReadonlyArray<Omit<ControlSectionView, "controls">> = [
   {
@@ -2386,6 +2459,40 @@ function formatControlValue(control: ControlSpec, numeric: number): string {
     default:
       return `${fmt(numeric, 3)} ${control.unit}`.trim();
   }
+}
+
+const LOG_RANGE_CONTROL_IDS = new Set<string>([
+  "alpha_rate_regularization",
+  "roll_rate_regularization",
+]);
+
+function usesLogRangeControl(control: ControlSpec): boolean {
+  return LOG_RANGE_CONTROL_IDS.has(control.id)
+    && Number.isFinite(control.min)
+    && Number.isFinite(control.max)
+    && control.min > 0
+    && control.max > control.min;
+}
+
+function controlValueToRangeValue(control: ControlSpec, numeric: number): number {
+  if (!usesLogRangeControl(control)) {
+    return numeric;
+  }
+  return Math.log10(Math.max(control.min, Math.min(control.max, numeric)));
+}
+
+function rangeValueToControlValue(control: ControlSpec, numeric: number): number {
+  if (!usesLogRangeControl(control)) {
+    return numeric;
+  }
+  return 10 ** numeric;
+}
+
+function formatControlInputValue(control: ControlSpec, numeric: number): string {
+  if (!usesLogRangeControl(control)) {
+    return String(numeric);
+  }
+  return Number(numeric.toPrecision(6)).toString();
 }
 
 function formatDuration(seconds: number | null | undefined): string {
@@ -3684,6 +3791,22 @@ function normalizeConstraintPanelEntry(entry: WireConstraintPanelEntry): Constra
             entry.upper_severity,
             CONSTRAINT_PANEL_SEVERITY.fullAccuracy,
           ),
+    bound_side:
+      entry.bound_side == null
+        ? null
+        : decodeWireEnum(
+            CONSTRAINT_PANEL_BOUND_SIDE_FROM_WIRE,
+            entry.bound_side,
+            CONSTRAINT_PANEL_BOUND_SIDE.none,
+          ),
+    active_bound_side:
+      entry.active_bound_side == null
+        ? null
+        : decodeWireEnum(
+            CONSTRAINT_PANEL_BOUND_SIDE_FROM_WIRE,
+            entry.active_bound_side,
+            CONSTRAINT_PANEL_BOUND_SIDE.none,
+          ),
   };
 }
 
@@ -4413,7 +4536,7 @@ function appendControl(
 
   if (isCheckboxControl(control)) {
     const checked = value >= 0.5;
-    const checkboxText = options.checkboxText ?? (checked ? "Free" : "Fixed");
+    const checkboxText = options.checkboxText ?? (checked ? "Enabled" : "Disabled");
     wrapper.innerHTML = `
       <div class="control-header">
         <div>
@@ -4435,13 +4558,17 @@ function appendControl(
       const numeric = target.checked ? 1 : 0;
       state.values[control.id] = numeric;
       pill.textContent = target.checked ? "On" : "Off";
-      checkboxLabel.textContent = options.checkboxText ?? (target.checked ? "Free" : "Fixed");
+      checkboxLabel.textContent = options.checkboxText ?? (target.checked ? "Enabled" : "Disabled");
       handleControlUpdate(control);
     });
     wrapperParent.appendChild(wrapper);
     return;
   }
 
+  const rangeMin = usesLogRangeControl(control) ? Math.log10(control.min) : control.min;
+  const rangeMax = usesLogRangeControl(control) ? Math.log10(control.max) : control.max;
+  const rangeStep = usesLogRangeControl(control) ? control.step : control.step;
+  const rangeValue = controlValueToRangeValue(control, value);
   wrapper.innerHTML = `
     <div class="control-header">
       <div>
@@ -4451,12 +4578,12 @@ function appendControl(
       <div class="value-pill">${formatValue(value)}</div>
     </div>
     <div class="control-inputs">
-      <input type="range" min="${control.min}" max="${control.max}" step="${control.step}" value="${value}" />
+      <input type="range" min="${rangeMin}" max="${rangeMax}" step="${rangeStep}" value="${rangeValue}" />
       <input
         class="control-number-input"
         type="text"
         inputmode="decimal"
-        value="${value}"
+        value="${formatControlInputValue(control, value)}"
         placeholder="${control.default}"
         spellcheck="false"
       />
@@ -4486,9 +4613,9 @@ function appendControl(
 
   const syncCommittedValue = (numeric: number, writeNumberInput = true): void => {
     state.values[control.id] = numeric;
-    rangeInput.value = String(numeric);
+    rangeInput.value = String(controlValueToRangeValue(control, numeric));
     if (writeNumberInput) {
-      numberInput.value = String(numeric);
+      numberInput.value = formatControlInputValue(control, numeric);
     }
     pill.textContent = formatValue(numeric);
     handleControlUpdate(control);
@@ -4496,7 +4623,7 @@ function appendControl(
 
   rangeInput.addEventListener("input", (event) => {
     const target = readCurrentInputTarget(event, `${control.id} range input`);
-    syncCommittedValue(Number(target.value));
+    syncCommittedValue(rangeValueToControlValue(control, Number(target.value)));
   });
 
   numberInput.addEventListener("input", (event) => {
@@ -4509,7 +4636,7 @@ function appendControl(
   });
 
   const normalizeNumberInput = (): void => {
-    numberInput.value = String(effectiveControlValue(control));
+    numberInput.value = formatControlInputValue(control, effectiveControlValue(control));
   };
 
   numberInput.addEventListener("blur", () => {
@@ -4705,13 +4832,58 @@ function appendControlList(wrapperParent: HTMLElement, controlsForSection: reado
   }
 }
 
+interface ControlSubgroupView {
+  title: string;
+  subtitle: string;
+  controls: readonly ControlSpec[];
+}
+
+function appendControlSubgroup(wrapperParent: HTMLElement, subgroup: ControlSubgroupView): void {
+  if (subgroup.controls.length === 0) {
+    return;
+  }
+  const shell = document.createElement("section");
+  shell.className = "control-subgroup";
+
+  const header = document.createElement("div");
+  header.className = "control-subgroup-header";
+
+  const title = document.createElement("div");
+  title.className = "control-subgroup-title";
+  title.textContent = subgroup.title;
+
+  const help = document.createElement("div");
+  help.className = "control-subgroup-help";
+  help.textContent = subgroup.subtitle;
+
+  header.append(title, help);
+
+  const body = document.createElement("div");
+  body.className = "control-subgroup-body";
+  appendControlList(body, subgroup.controls);
+
+  shell.append(header, body);
+  wrapperParent.appendChild(shell);
+}
+
+function appendControlListWithSubgroups(
+  wrapperParent: HTMLElement,
+  controlsForBlock: readonly ControlSpec[],
+  subgroups: readonly ControlSubgroupView[],
+): void {
+  appendControlList(wrapperParent, controlsForBlock);
+  for (const subgroup of subgroups) {
+    appendControlSubgroup(wrapperParent, subgroup);
+  }
+}
+
 function controlBlockFromControls(
   section: ControlSectionCode,
   slug: string,
   title: string,
   subtitle: string,
   controlsForBlock: readonly ControlSpec[],
-  defaultCollapsed = false,
+  defaultCollapsed = true,
 ): ControlBlockView | null {
   if (controlsForBlock.length === 0) {
     return null;
@@ -4722,6 +4894,28 @@ function controlBlockFromControls(
     subtitle,
     defaultCollapsed,
     appendBody: (body) => appendControlList(body, controlsForBlock),
+  };
+}
+
+function controlBlockFromGroups(
+  section: ControlSectionCode,
+  slug: string,
+  title: string,
+  subtitle: string,
+  controlsForBlock: readonly ControlSpec[],
+  subgroups: readonly ControlSubgroupView[],
+  defaultCollapsed = true,
+): ControlBlockView | null {
+  const nonEmptySubgroups = subgroups.filter((subgroup) => subgroup.controls.length > 0);
+  if (controlsForBlock.length === 0 && nonEmptySubgroups.length === 0) {
+    return null;
+  }
+  return {
+    key: controlBlockKey(section, slug),
+    title,
+    subtitle,
+    defaultCollapsed,
+    appendBody: (body) => appendControlListWithSubgroups(body, controlsForBlock, nonEmptySubgroups),
   };
 }
 
@@ -4762,12 +4956,19 @@ function albatrossProblemControlBlocks(controlsForSection: readonly ControlSpec[
     }
   };
 
-  push(controlBlockFromControls(
+  push(controlBlockFromGroups(
     section,
-    "objective",
-    "Objective",
-    "Choose the symbolic objective variant.",
+    "objective_weights",
+    "Objective & Weights",
+    "Objective variant and rate-penalty tuning.",
     taker.takeIds(["objective"]),
+    [
+      {
+        title: "Rate Penalties",
+        subtitle: "Separate alpha-rate and roll-rate regularization weights.",
+        controls: taker.takeIds(["alpha_rate_regularization", "roll_rate_regularization"]),
+      },
+    ],
   ));
 
   const designPrefixes = ALBATROSS_DESIGN_PREFIXES.filter((prefix) => (
@@ -4777,38 +4978,54 @@ function albatrossProblemControlBlocks(controlsForSection: readonly ControlSpec[
   for (const prefix of designPrefixes) {
     taker.takePrefix(`${prefix}_`);
   }
+  const boundaryAnchorControls = taker.takeIds(["constrain_vy0_zero"]);
   if (designPrefixes.length > 0) {
     blocks.push({
       key: controlBlockKey(section, "design_variables"),
       title: "Design Variables",
-      subtitle: "Fixed values, guesses, and free-variable bounds.",
-      defaultCollapsed: false,
+      subtitle: "Fixed values, guesses, free-variable bounds, and boundary anchors.",
+      defaultCollapsed: true,
       appendBody: (body) => {
         for (const prefix of designPrefixes) {
           appendAlbatrossDesignGroup(body, controlsForSection, prefix);
         }
+        appendControlSubgroup(body, {
+          title: "Boundary Anchors",
+          subtitle: "Optional fixed initial lateral-velocity anchor.",
+          controls: boundaryAnchorControls,
+        });
       },
     });
   }
 
-  push(controlBlockFromControls(
+  push(controlBlockFromGroups(
     section,
     "aircraft_aero",
     "Aircraft & Aero",
-    "Runtime aircraft, atmosphere, polar, and regularization parameters.",
-    taker.takeIds([
-      "gravity_mps2",
-      "air_density_kg_m3",
-      "mass_kg",
-      "reference_area_m2",
-      "cl_slope_per_rad",
-      "cd0",
-      "aspect_ratio",
-      "oswald_efficiency",
-      "speed_eps_mps",
-      "frame_eps",
-    ]),
-    true,
+    "Runtime aircraft, atmosphere, and aerodynamic polar parameters.",
+    [],
+    [
+      {
+        title: "Aircraft & Atmosphere",
+        subtitle: "Gravity, density, mass, and reference area.",
+        controls: taker.takeIds([
+          "gravity_mps2",
+          "air_density_kg_m3",
+          "mass_kg",
+          "reference_area_m2",
+        ]),
+      },
+      {
+        title: "Aero Polar",
+        subtitle: "Lift slope and induced-drag model parameters.",
+        controls: taker.takeIds([
+          "cl_slope_per_rad",
+          "cd0",
+          "aspect_ratio",
+          "oswald_efficiency",
+        ]),
+      },
+    ],
   ));
 
   push(controlBlockFromControls(
@@ -4824,6 +5041,22 @@ function albatrossProblemControlBlocks(controlsForSection: readonly ControlSpec[
       "wind_transition_height_m",
     ]),
   ));
+
+  push(controlBlockFromControls(
+    section,
+    "path_limits",
+    "Bounds & Limits",
+    "Altitude, airspeed, load-factor, and control-rate bounds.",
+    taker.takeIds([
+      "min_altitude_m",
+      "min_airspeed_mps",
+      "max_airspeed_mps",
+      "max_load_factor",
+      "max_alpha_rate_deg_s",
+      "max_roll_rate_deg_s",
+    ]),
+  ));
+
   push(controlBlockFromControls(
     section,
     "initial_guess",
@@ -4835,38 +5068,34 @@ function albatrossProblemControlBlocks(controlsForSection: readonly ControlSpec[
       "initial_alpha_deg",
       "initial_roll_amplitude_deg",
     ]),
-    true,
   ));
-  push(controlBlockFromControls(
+
+  push(controlBlockFromGroups(
     section,
-    "path_limits",
-    "Path Limits",
-    "Airspeed, load-factor, and control-rate bounds.",
-    taker.takeIds([
-      "min_altitude_m",
-      "min_airspeed_mps",
-      "max_airspeed_mps",
-      "max_load_factor",
-      "max_alpha_rate_deg_s",
-      "max_roll_rate_deg_s",
-    ]),
-    true,
+    "numerics_scaling",
+    "Numerics & Scaling",
+    "Smooth-norm regularization and OCP scaling controls.",
+    [],
+    [
+      {
+        title: "Smooth Guards",
+        subtitle: "Epsilon values used in smooth airspeed and lift-frame norms.",
+        controls: taker.takeIds(["speed_eps_mps", "frame_eps"]),
+      },
+      {
+        title: "Scaling",
+        subtitle: "Numerical scaling for the compiled OCP.",
+        controls: taker.takeIds(["scaling_enabled"]),
+      },
+    ],
   ));
-  push(controlBlockFromControls(
-    section,
-    "weights_scaling",
-    "Weights & Scaling",
-    "Regularization and numerical scaling controls.",
-    taker.takeIds(["rate_regularization", "scaling_enabled"]),
-    true,
-  ));
+
   push(controlBlockFromControls(
     section,
     "other_problem",
     "Other Problem Settings",
     "Additional problem-specific controls.",
     taker.remainingControls(),
-    true,
   ));
   return blocks;
 }
@@ -4875,27 +5104,24 @@ function transcriptionControlBlocks(controlsForSection: readonly ControlSpec[]):
   const section = CONTROL_SECTION.transcription;
   const taker = makeControlTaker(controlsForSection);
   return [
-    controlBlockFromControls(
+    controlBlockFromGroups(
       section,
       "mesh",
       "Mesh",
-      "Transcription method and interval count.",
+      "Transcription size, collocation nodes, and mesh spacing.",
       taker.takeIds(["transcription_intervals", "transcription_method"]),
-    ),
-    controlBlockFromControls(
-      section,
-      "collocation",
-      "Collocation",
-      "Collocation family and node count.",
-      taker.takePrefix("collocation_"),
-    ),
-    controlBlockFromControls(
-      section,
-      "time_grid",
-      "Time Grid",
-      "Direct-collocation mesh spacing controls.",
-      taker.takePrefix("time_grid"),
-      true,
+      [
+        {
+          title: "Collocation",
+          subtitle: "Direct-collocation family and node count.",
+          controls: taker.takePrefix("collocation_"),
+        },
+        {
+          title: "Time Grid",
+          subtitle: "Direct-collocation interval spacing controls.",
+          controls: taker.takePrefix("time_grid"),
+        },
+      ],
     ),
     controlBlockFromControls(
       section,
@@ -4928,46 +5154,44 @@ function solverControlBlocks(controlsForSection: readonly ControlSpec[]): Contro
     ...taker.takePrefix("solver_trust_region_"),
   ];
   return [
-    controlBlockFromControls(
+    controlBlockFromGroups(
       section,
       "core",
-      "Core Solver",
-      "Solver choice, profile, iteration budget, and overall tolerance.",
+      "NLP Solver",
+      "Solver method, profile, iteration budget, and method-specific options.",
       taker.takeIds([
         "solver_method",
         "solver_profile",
         "solver_max_iters",
         "solver_overall_tol",
-        "solver_hessian_regularization",
       ]),
-    ),
-    controlBlockFromControls(
-      section,
-      "tolerances",
-      "Tolerances",
-      "Dual, constraint, and complementarity termination thresholds.",
-      taker.takeIds([
-        "solver_dual_tol",
-        "solver_constraint_tol",
-        "solver_complementarity_tol",
-      ]),
-      true,
-    ),
-    controlBlockFromControls(
-      section,
-      "nlip_linear_solver",
-      "NLIP Linear Solver",
-      "Sparse KKT backend and SPRAL pivot controls.",
-      taker.takePrefix("solver_nlip_"),
-      true,
-    ),
-    controlBlockFromControls(
-      section,
-      "globalization",
-      "Globalization",
-      "Line-search, filter, trust-region, and merit controls.",
-      globalizationControls,
-      true,
+      [
+        {
+          title: "NLIP Linear Solver",
+          subtitle: "Sparse KKT backend and SPRAL pivot controls.",
+          controls: [
+            ...taker.takeIds(["solver_nlip_linear_solver"]),
+            ...taker.takePrefix("solver_nlip_spral_"),
+          ],
+        },
+        {
+          title: "Termination Tolerances",
+          subtitle: "Dual, constraint, and complementarity thresholds.",
+          controls: taker.takeIds([
+            "solver_dual_tol",
+            "solver_constraint_tol",
+            "solver_complementarity_tol",
+          ]),
+        },
+        {
+          title: "SQP Globalization",
+          subtitle: "SQP Hessian regularization, line-search, filter, trust-region, and merit controls.",
+          controls: [
+            ...taker.takeIds(["solver_hessian_regularization"]),
+            ...globalizationControls,
+          ],
+        },
+      ],
     ),
     controlBlockFromControls(
       section,
@@ -4975,7 +5199,6 @@ function solverControlBlocks(controlsForSection: readonly ControlSpec[]): Contro
       "Other Solver Settings",
       "Additional solver controls.",
       taker.remainingControls(),
-      true,
     ),
   ].filter((block): block is ControlBlockView => block !== null);
 }
@@ -4988,6 +5211,7 @@ function defaultProblemControlBlocks(controlsForSection: readonly ControlSpec[])
       "Problem Parameters",
       "Problem-specific physical parameters and scenario settings.",
       controlsForSection,
+      true,
     ),
   ].filter((block): block is ControlBlockView => block !== null);
 }
@@ -5171,6 +5395,9 @@ function createScene3DView(visualization: Paths3DVisualization): Scene3DView {
     sceneCamera: null,
     sceneInteractionBound: false,
     sceneInteracting: false,
+    scenePointerActive: false,
+    sceneIdleFrameHandle: null,
+    sceneTraceSignature: null,
   };
 }
 
@@ -5343,7 +5570,7 @@ function updateScenePlot(view: SceneView): void {
       family: '"Avenir Next", Futura, "Trebuchet MS", sans-serif',
       size: 12,
     },
-    margin: { l: 74, r: 24, t: 18, b: 62 },
+    margin: { l: 74, r: 24, t: 18, b: 52 },
     legend: {
       orientation: "h",
       y: -0.22,
@@ -6447,6 +6674,37 @@ function worstConstraintViolation(entries: ConstraintPanelEntry[]): number | nul
   return worst;
 }
 
+function activeConstraintThreshold(tolerance: number | null | undefined): number {
+  const numericTolerance = tolerance ?? Number.NaN;
+  if (Number.isFinite(numericTolerance) && numericTolerance > 0) {
+    return Math.max(100 * numericTolerance, 1e-8);
+  }
+  return 1e-8;
+}
+
+function isEqualityStyleBoundEntry(entry: ConstraintPanelEntry): boolean {
+  const lower = entry.lower_bound;
+  const upper = entry.upper_bound;
+  if (lower == null || upper == null || !Number.isFinite(lower) || !Number.isFinite(upper)) {
+    return false;
+  }
+  const scale = Math.max(Math.abs(lower), Math.abs(upper), 1);
+  return Math.abs(lower - upper) <= 1e-12 * scale;
+}
+
+function constraintBoundSideLabel(side: ConstraintPanelBoundSideCode | null | undefined): string {
+  switch (side) {
+    case CONSTRAINT_PANEL_BOUND_SIDE.lower:
+      return "lower";
+    case CONSTRAINT_PANEL_BOUND_SIDE.upper:
+      return "upper";
+    case CONSTRAINT_PANEL_BOUND_SIDE.both:
+      return "lower + upper";
+    default:
+      return "none";
+  }
+}
+
 function renderBoundToken(
   value: number | null | undefined,
   severity: ConstraintPanelSeverityCode | null | undefined,
@@ -6470,6 +6728,17 @@ function renderConstraintPanel(
       target.innerHTML = `<div class="placeholder">${pendingText}</div>`;
       return;
     }
+    if (kind === "active") {
+      target.innerHTML = `
+        <article class="constraint-entry constraint-entry-success constraint-entry-summary">
+          <div class="constraint-entry-inline">
+            <span class="constraint-inline-label">Active</span>
+            <span class="constraint-inline-value">0</span>
+          </div>
+        </article>
+      `;
+      return;
+    }
     target.innerHTML = `
       <article class="constraint-entry constraint-entry-success constraint-entry-summary">
         <div class="constraint-entry-inline">
@@ -6482,11 +6751,29 @@ function renderConstraintPanel(
   }
   target.innerHTML = entries
     .map((entry) => {
-      const severityKind = constraintSeverityClass(entry.severity);
+      const isActivePanel = kind === "active";
+      const severityKind = isActivePanel ? "warning" : constraintSeverityClass(entry.severity);
       const severityClass =
         severityKind === "success" ? "" : `constraint-entry-${severityKind}`;
+      const countMarkup = isActivePanel
+        ? `active ${entry.active_instances ?? 0}/${entry.total_instances}`
+        : `viol ${entry.violating_instances}/${entry.total_instances}`;
+      const primaryLabel = isActivePanel ? "Nearest" : "Worst";
+      const primaryValue = isActivePanel
+        ? formatConstraintSummaryValue(entry.min_active_margin)
+        : entry.worst_violation.toExponential(3);
+      const side = isActivePanel ? entry.active_bound_side : entry.bound_side;
+      const sideText = constraintBoundSideLabel(side);
+      const sideMarkup =
+        kind === "eq" || sideText === "none"
+          ? ""
+          : `
+          <div class="constraint-entry-inline">
+            <span class="constraint-inline-label">${isActivePanel ? "Active Bound" : "Violated Bound"}</span>
+            <span class="constraint-inline-value">${sideText}</span>
+          </div>`;
       const boundsMarkup =
-        kind === "ineq"
+        kind !== "eq"
           ? `
           <div class="constraint-entry-inline">
             <span class="constraint-inline-label">Bounds</span>
@@ -6499,12 +6786,13 @@ function renderConstraintPanel(
         <article class="constraint-entry ${severityClass}">
           <div class="constraint-entry-top">
             <div class="constraint-entry-label">${entry.label}</div>
-            <div class="constraint-entry-count">viol ${entry.violating_instances}/${entry.total_instances}</div>
+            <div class="constraint-entry-count">${countMarkup}</div>
           </div>
           <div class="constraint-entry-inline">
-            <span class="constraint-inline-label">Worst</span>
-            <span class="constraint-inline-value">${entry.worst_violation.toExponential(3)}</span>
+            <span class="constraint-inline-label">${primaryLabel}</span>
+            <span class="constraint-inline-value">${primaryValue}</span>
           </div>
+          ${sideMarkup}
           ${boundsMarkup}
         </article>
       `;
@@ -6518,11 +6806,23 @@ function renderConstraintPanels(): void {
   const allInequalities = panels.inequalities;
   const activeEqualities = allEqualities.filter((entry) => entry.violating_instances > 0);
   const activeInequalities = allInequalities.filter((entry) => entry.violating_instances > 0);
+  const activeBoundConstraints = allInequalities
+    .filter((entry) => (entry.active_instances ?? 0) > 0 && !isEqualityStyleBoundEntry(entry))
+    .sort((lhs, rhs) => (lhs.min_active_margin ?? Number.POSITIVE_INFINITY)
+      - (rhs.min_active_margin ?? Number.POSITIVE_INFINITY));
+  const toleranceValue = currentSharedControlValue(
+    CONTROL_SEMANTIC.solverConstraintTolerance,
+    Number.NaN,
+  );
+  const activeToleranceText = formatConstraintSummaryValue(activeConstraintThreshold(toleranceValue));
   const toleranceText = formatSharedControlValue(
     CONTROL_SEMANTIC.solverConstraintTolerance,
   );
   const pendingText = state.artifact == null && !state.solving
     ? `tol ${toleranceText}`
+    : "pending";
+  const activePendingText = state.artifact == null && !state.solving
+    ? `active ≤ ${activeToleranceText}`
     : "pending";
   renderConstraintPanel(
     eqViolationsEl,
@@ -6537,6 +6837,13 @@ function renderConstraintPanels(): void {
     activeInequalities,
     pendingText,
     "ineq",
+  );
+  renderConstraintPanel(
+    activeConstraintsEl,
+    allInequalities,
+    activeBoundConstraints,
+    activePendingText,
+    "active",
   );
 }
 
@@ -7657,14 +7964,12 @@ function ensureChartViews(panels: ChartPanel[]): void {
       plotEl,
       linkedRangeBound: false,
       linkXRange: panel.kind === "chart",
+      chartTraceSignature: null,
     });
   }
 }
 
-function updateChart(view: ChartView | undefined, chart: Chart): void {
-  if (!window.Plotly || !view) {
-    return;
-  }
+function buildChartTraces(chart: Chart): ChartTraceBuild {
   const groupOrder = new Map<string, number>();
   const colorIndexFor = (group: string): number => {
     if (!groupOrder.has(group)) {
@@ -7672,9 +7977,10 @@ function updateChart(view: ChartView | undefined, chart: Chart): void {
     }
     return groupOrder.get(group)!;
   };
+  const signatureTraces: PlotlyValue[] = [];
   const data = chart.series.map((series) => {
-    const group = series.legend_group ?? series.name;
-    const paletteIndex = colorIndexFor(group);
+    const colorGroup = series.legend_group ?? series.name;
+    const paletteIndex = colorIndexFor(colorGroup);
     const role = series.role ?? TIME_SERIES_ROLE.data;
     const isBound = role === TIME_SERIES_ROLE.lowerBound || role === TIME_SERIES_ROLE.upperBound;
     const color = PALETTE[paletteIndex % PALETTE.length];
@@ -7683,12 +7989,24 @@ function updateChart(view: ChartView | undefined, chart: Chart): void {
       : role === TIME_SERIES_ROLE.upperBound
         ? "longdash"
         : "solid";
+    const mode = series.mode ?? "lines";
+    const showlegend = series.show_legend ?? true;
+    signatureTraces.push([
+      series.name,
+      colorGroup,
+      role,
+      mode,
+      showlegend,
+      color,
+      dash,
+      isBound,
+    ]);
     return {
       type: "scatter",
-      mode: series.mode ?? "lines",
+      mode,
       name: series.name,
-      legendgroup: group,
-      showlegend: series.show_legend ?? true,
+      legendgroup: series.name,
+      showlegend,
       x: series.x,
       y: series.y,
       line: {
@@ -7703,6 +8021,48 @@ function updateChart(view: ChartView | undefined, chart: Chart): void {
       },
     };
   });
+  const signature = JSON.stringify({
+    title: chart.title,
+    xLabel: chart.x_label,
+    yLabel: chart.y_label,
+    traces: signatureTraces,
+  });
+  return { data, signature };
+}
+
+function restyleChartData(view: ChartView, chart: Chart, signature: string): void {
+  const plotly = window.Plotly;
+  if (!plotly) {
+    return;
+  }
+  const traceIndices = chart.series.map((_, index) => index);
+  void plotly.restyle(
+    view.plotEl,
+    {
+      x: chart.series.map((series) => series.x),
+      y: chart.series.map((series) => series.y),
+    },
+    traceIndices,
+  ).then(() => {
+    view.chartTraceSignature = signature;
+  }).catch((error) => {
+    console.warn("chart restyle failed; rebuilding chart", error);
+    view.chartTraceSignature = null;
+    if (view.plotEl.isConnected) {
+      scheduleArtifactRender(true);
+    }
+  });
+}
+
+function updateChart(view: ChartView | undefined, chart: Chart): void {
+  if (!window.Plotly || !view) {
+    return;
+  }
+  const { data, signature } = buildChartTraces(chart);
+  if (view.chartTraceSignature === signature) {
+    restyleChartData(view, chart, signature);
+    return;
+  }
   const layout: PlotlyLayout & { xaxis: PlotlyObject & { range?: number[] } } = {
     paper_bgcolor: "rgba(0,0,0,0)",
     plot_bgcolor: "rgba(4, 15, 22, 0.92)",
@@ -7719,13 +8079,12 @@ function updateChart(view: ChartView | undefined, chart: Chart): void {
       font: { color: "#94b6bd", size: 11 },
     },
     xaxis: {
-      title: chart.x_label,
+      title: "",
       autorange: state.linkedChartAutorange,
       gridcolor: "rgba(229, 241, 244, 0.08)",
       linecolor: "rgba(177, 214, 222, 0.18)",
       zeroline: false,
       ticks: "outside",
-      titlefont: { color: "#94b6bd" },
     },
     yaxis: {
       title: chart.y_label,
@@ -7745,12 +8104,16 @@ function updateChart(view: ChartView | undefined, chart: Chart): void {
     layout.xaxis.range = state.linkedChartRange.slice();
   }
   window.Plotly.react(view.plotEl, data, layout, config).then(() => {
+    view.chartTraceSignature = signature;
     if (view.linkXRange && !view.linkedRangeBound && typeof view.plotEl.on === "function") {
       view.plotEl.on("plotly_relayout", (eventData) => {
         syncLinkedChartRange(view, eventData);
       });
       view.linkedRangeBound = true;
     }
+  }).catch((error) => {
+    view.chartTraceSignature = null;
+    console.warn("chart rebuild failed", error);
   });
 }
 
@@ -7900,18 +8263,111 @@ interface Paths3DTraceStyle {
   markerSize: number;
 }
 
+interface Paths3DTraceBuild {
+  data: PlotlyTrace[];
+  signature: string;
+}
+
+function escapePlotlyHoverText(value: string): string {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function compactAxisLabel(label: string): string {
+  const trimmed = label.trim();
+  const unitStart = trimmed.indexOf(" (");
+  if (unitStart > 0) {
+    return trimmed.slice(0, unitStart);
+  }
+  return trimmed;
+}
+
+function paths3DHoverTemplate(visualization: Paths3DVisualization, label: string): string {
+  const xLabel = escapePlotlyHoverText(compactAxisLabel(visualization.x_label));
+  const yLabel = escapePlotlyHoverText(compactAxisLabel(visualization.y_label));
+  const zLabel = escapePlotlyHoverText(compactAxisLabel(visualization.z_label));
+  return `<b>${escapePlotlyHoverText(label)}</b><br>`
+    + `${xLabel} %{x:.1f} · ${yLabel} %{y:.1f} · ${zLabel} %{z:.0f}<extra></extra>`;
+}
+
 const DEFAULT_PATHS_3D_CAMERA: PlotlyObject = {
   up: { x: 0, y: 0, z: 1 },
-  eye: { x: 1.65, y: -1.45, z: 0.95 },
+  eye: { x: -1.75, y: -1.85, z: 1.05 },
+  center: { x: 0.0, y: 0.0, z: -0.04 },
 };
 
 function isPlotlyObject(value: PlotlyValue | undefined): value is PlotlyObject {
   return value != null && typeof value === "object" && !Array.isArray(value);
 }
 
-function capturePaths3DCamera(view: PlotlyView, eventData: PlotlyRelayoutPayload): void {
+function clonePlotlyObject(value: PlotlyObject): PlotlyObject {
+  return JSON.parse(JSON.stringify(value)) as PlotlyObject;
+}
+
+function plotlyObjectProperty(object: PlotlyObject | null, key: string): PlotlyObject | null {
+  const value = object?.[key];
+  return isPlotlyObject(value) ? value : null;
+}
+
+function currentPaths3DCamera(view: PlotlyView): PlotlyObject | null {
+  const plotEl = view.plotEl as PlotlyHostElement & {
+    layout?: PlotlyObject;
+    _fullLayout?: PlotlyObject;
+  };
+  const layoutCamera = plotlyObjectProperty(
+    plotlyObjectProperty(plotEl.layout ?? null, "scene"),
+    "camera",
+  );
+  if (layoutCamera) {
+    return clonePlotlyObject(layoutCamera);
+  }
+  const fullLayoutCamera = plotlyObjectProperty(
+    plotlyObjectProperty(plotEl._fullLayout ?? null, "scene"),
+    "camera",
+  );
+  return fullLayoutCamera ? clonePlotlyObject(fullLayoutCamera) : null;
+}
+
+function paths3DCameraFromRelayout(
+  view: PlotlyView,
+  eventData: PlotlyRelayoutPayload,
+): PlotlyObject | null {
   const camera = eventData["scene.camera"];
   if (isPlotlyObject(camera)) {
+    return clonePlotlyObject(camera);
+  }
+
+  let hasCameraField = false;
+  const merged = currentPaths3DCamera(view) ?? clonePlotlyObject(DEFAULT_PATHS_3D_CAMERA);
+  for (const [key, value] of Object.entries(eventData)) {
+    const prefix = "scene.camera.";
+    if (!key.startsWith(prefix)) {
+      continue;
+    }
+    const parts = key.slice(prefix.length).split(".");
+    if (parts.length !== 2) {
+      continue;
+    }
+    const [section, component] = parts;
+    if (!section || !component) {
+      continue;
+    }
+    let sectionObject = merged[section];
+    if (!isPlotlyObject(sectionObject)) {
+      sectionObject = {};
+      merged[section] = sectionObject;
+    }
+    sectionObject[component] = value;
+    hasCameraField = true;
+  }
+  return hasCameraField ? merged : null;
+}
+
+function capturePaths3DCamera(view: PlotlyView, eventData: PlotlyRelayoutPayload): void {
+  const camera = paths3DCameraFromRelayout(view, eventData) ?? currentPaths3DCamera(view);
+  if (camera) {
     view.sceneCamera = camera;
   }
 }
@@ -7920,9 +8376,28 @@ function bindPaths3DInteraction(view: PlotlyView): void {
   if (view.sceneInteractionBound) {
     return;
   }
+  const cancelIdleFrame = (): void => {
+    if (view.sceneIdleFrameHandle != null) {
+      window.cancelAnimationFrame(view.sceneIdleFrameHandle);
+      view.sceneIdleFrameHandle = null;
+    }
+  };
+  const markActive = (): void => {
+    cancelIdleFrame();
+    view.scenePointerActive = true;
+    view.sceneInteracting = true;
+  };
   const markIdle = (): void => {
-    view.sceneInteracting = false;
-    scheduleArtifactRender();
+    view.scenePointerActive = false;
+    cancelIdleFrame();
+    view.sceneIdleFrameHandle = window.requestAnimationFrame(() => {
+      view.sceneIdleFrameHandle = null;
+      view.sceneCamera = currentPaths3DCamera(view) ?? view.sceneCamera ?? null;
+      view.sceneInteracting = false;
+      if (view.plotEl.isConnected) {
+        scheduleArtifactRender();
+      }
+    });
   };
   if (typeof view.plotEl.on === "function") {
     view.plotEl.on("plotly_relayouting", (eventData) => {
@@ -7931,12 +8406,13 @@ function bindPaths3DInteraction(view: PlotlyView): void {
     });
     view.plotEl.on("plotly_relayout", (eventData) => {
       capturePaths3DCamera(view, eventData);
-      view.sceneInteracting = false;
+      if (!view.scenePointerActive) {
+        view.sceneInteracting = false;
+        scheduleArtifactRender();
+      }
     });
   }
-  view.plotEl.addEventListener("pointerdown", () => {
-    view.sceneInteracting = true;
-  });
+  view.plotEl.addEventListener("pointerdown", markActive, { capture: true });
   window.addEventListener("pointerup", markIdle);
   window.addEventListener("pointercancel", markIdle);
   window.addEventListener("blur", markIdle);
@@ -7945,12 +8421,12 @@ function bindPaths3DInteraction(view: PlotlyView): void {
 
 function paths3DTraceStyle(path: ScenePath3D, index: number): Paths3DTraceStyle {
   const name = path.name.toLowerCase();
-  if (name === "trajectory") {
+  if (name === "trajectory" || name.startsWith("trajectory arc")) {
     return {
       label: "Trajectory",
       group: "trajectory",
       color: "#5bd1b5",
-      width: 7,
+      width: 2.8,
       opacity: 1,
       mode: "lines",
       markerSize: 0,
@@ -7961,10 +8437,10 @@ function paths3DTraceStyle(path: ScenePath3D, index: number): Paths3DTraceStyle 
       label: "Lift vectors",
       group: "lift",
       color: "#b8f2e6",
-      width: 5,
-      opacity: 0.82,
-      mode: "lines+markers",
-      markerSize: 3,
+      width: 1.15,
+      opacity: 0.78,
+      mode: "lines",
+      markerSize: 0,
     };
   }
   if (name.startsWith("drag")) {
@@ -7972,10 +8448,10 @@ function paths3DTraceStyle(path: ScenePath3D, index: number): Paths3DTraceStyle 
       label: "Drag vectors",
       group: "drag",
       color: "#f25f5c",
-      width: 4,
-      opacity: 0.82,
-      mode: "lines+markers",
-      markerSize: 3,
+      width: 1.25,
+      opacity: 0.9,
+      mode: "lines",
+      markerSize: 0,
     };
   }
   if (name.startsWith("aero accel")) {
@@ -7983,10 +8459,10 @@ function paths3DTraceStyle(path: ScenePath3D, index: number): Paths3DTraceStyle 
       label: "Aero acceleration",
       group: "aero",
       color: "#f7b267",
-      width: 4,
-      opacity: 0.78,
-      mode: "lines+markers",
-      markerSize: 3,
+      width: 1.2,
+      opacity: 0.74,
+      mode: "lines",
+      markerSize: 0,
     };
   }
   if (name.startsWith("wind shear")) {
@@ -7994,8 +8470,8 @@ function paths3DTraceStyle(path: ScenePath3D, index: number): Paths3DTraceStyle 
       label: "Wind shear",
       group: "wind-shear",
       color: "#7cc6fe",
-      width: name.startsWith("wind shear frame") ? 2 : 3,
-      opacity: name.startsWith("wind shear frame") ? 0.18 : 0.34,
+      width: name.startsWith("wind shear frame") ? 0.9 : 1.05,
+      opacity: name.startsWith("wind shear frame") ? 0.16 : 0.3,
       mode: "lines",
       markerSize: 0,
     };
@@ -8005,10 +8481,10 @@ function paths3DTraceStyle(path: ScenePath3D, index: number): Paths3DTraceStyle 
       label: "Wind vectors",
       group: "wind",
       color: "#7cc6fe",
-      width: 4,
-      opacity: 0.74,
-      mode: "lines+markers",
-      markerSize: 3,
+      width: 1.1,
+      opacity: 0.68,
+      mode: "lines",
+      markerSize: 0,
     };
   }
   if (name.startsWith("air axis")) {
@@ -8016,10 +8492,10 @@ function paths3DTraceStyle(path: ScenePath3D, index: number): Paths3DTraceStyle 
       label: "Air-relative axis",
       group: "air-axis",
       color: "#e5f1f4",
-      width: 3,
-      opacity: 0.58,
-      mode: "lines+markers",
-      markerSize: 2,
+      width: 0.95,
+      opacity: 0.56,
+      mode: "lines",
+      markerSize: 0,
     };
   }
   if (name.startsWith("zero-bank frame")) {
@@ -8027,10 +8503,10 @@ function paths3DTraceStyle(path: ScenePath3D, index: number): Paths3DTraceStyle 
       label: "Zero-bank frame",
       group: "zero-bank-frame",
       color: "#d7aefb",
-      width: 3,
-      opacity: 0.62,
-      mode: "lines+markers",
-      markerSize: 2,
+      width: 0.95,
+      opacity: 0.58,
+      mode: "lines",
+      markerSize: 0,
     };
   }
   if (name.startsWith("side frame")) {
@@ -8038,38 +8514,41 @@ function paths3DTraceStyle(path: ScenePath3D, index: number): Paths3DTraceStyle 
       label: "Bank side frame",
       group: "side-frame",
       color: "#b8f2e6",
-      width: 3,
-      opacity: 0.62,
-      mode: "lines+markers",
-      markerSize: 2,
+      width: 0.95,
+      opacity: 0.58,
+      mode: "lines",
+      markerSize: 0,
     };
   }
   return {
     label: path.name,
     group: path.name,
     color: PALETTE[index % PALETTE.length],
-    width: 3,
+    width: 1,
     opacity: 0.48,
     mode: "lines",
     markerSize: 0,
   };
 }
 
-function updatePaths3DVisualization(
-  view: PlotlyView | undefined,
-  visualization: Paths3DVisualization,
-): void {
-  if (!window.Plotly || !view) {
-    return;
-  }
-  if (view.sceneInteracting) {
-    return;
-  }
+function buildPaths3DTraces(visualization: Paths3DVisualization): Paths3DTraceBuild {
   const visibleLegendGroups = new Set<string>();
-  const data: PlotlyTrace[] = visualization.paths.map((path, index) => {
+  const signatureTraces: PlotlyValue[] = [];
+  const data = visualization.paths.map((path, index) => {
     const style = paths3DTraceStyle(path, index);
     const showlegend = !visibleLegendGroups.has(style.group);
     visibleLegendGroups.add(style.group);
+    signatureTraces.push([
+      path.name,
+      style.label,
+      style.group,
+      style.color,
+      style.width,
+      style.opacity,
+      style.mode,
+      style.markerSize,
+      showlegend,
+    ]);
     return {
       type: "scatter3d",
       mode: style.mode,
@@ -8088,11 +8567,66 @@ function updatePaths3DVisualization(
         color: style.color,
         size: style.markerSize,
       },
-      hovertemplate:
-        `${visualization.x_label}: %{x:.3f}<br>${visualization.y_label}: %{y:.3f}<br>` +
-        `${visualization.z_label}: %{z:.0f}<extra>${path.name}</extra>`,
+      hovertemplate: paths3DHoverTemplate(visualization, style.label),
+      hoverlabel: {
+        bgcolor: "rgba(4, 15, 22, 0.94)",
+        bordercolor: style.color,
+        font: {
+          color: "#e5f1f4",
+          size: 11,
+        },
+      },
     };
   });
+  const signature = JSON.stringify({
+    title: visualization.title,
+    labels: [visualization.x_label, visualization.y_label, visualization.z_label],
+    traces: signatureTraces,
+  });
+  return { data, signature };
+}
+
+function restylePaths3DVisualization(
+  view: PlotlyView,
+  visualization: Paths3DVisualization,
+  signature: string,
+): void {
+  const traceIndices = visualization.paths.map((_, index) => index);
+  void window.Plotly?.restyle(
+    view.plotEl,
+    {
+      x: visualization.paths.map((path) => path.x),
+      y: visualization.paths.map((path) => path.y),
+      z: visualization.paths.map((path) => path.z),
+    },
+    traceIndices,
+  ).then(() => {
+    view.sceneTraceSignature = signature;
+  }).catch((error) => {
+    console.warn("3D scene restyle failed; rebuilding figure", error);
+    view.sceneTraceSignature = null;
+    if (view.plotEl.isConnected) {
+      scheduleArtifactRender(true);
+    }
+  });
+}
+
+function updatePaths3DVisualization(
+  view: PlotlyView | undefined,
+  visualization: Paths3DVisualization,
+): void {
+  if (!window.Plotly || !view) {
+    return;
+  }
+  const { data, signature } = buildPaths3DTraces(visualization);
+  const canRestyle = view.sceneTraceSignature === signature;
+  if (canRestyle) {
+    restylePaths3DVisualization(view, visualization, signature);
+    return;
+  }
+  if (view.sceneInteracting) {
+    return;
+  }
   const layout: PlotlyLayout = {
     uirevision: visualization.title,
     dragmode: "turntable",
@@ -8114,7 +8648,7 @@ function updatePaths3DVisualization(
       domain: { x: [0, 1], y: [0, 1] },
       bgcolor: "rgba(4, 15, 22, 0.92)",
       aspectmode: "manual",
-      aspectratio: { x: 2.35, y: 1.25, z: 1.0 },
+      aspectratio: { x: 1.9, y: 1.05, z: 1.0 },
       xaxis: {
         title: visualization.x_label,
         showgrid: false,
@@ -8135,11 +8669,13 @@ function updatePaths3DVisualization(
       },
     },
   };
-  if (view.sceneCamera == null) {
-    const scene = layout.scene;
-    if (isPlotlyObject(scene)) {
-      scene.camera = DEFAULT_PATHS_3D_CAMERA;
-    }
+  const scene = layout.scene;
+  if (isPlotlyObject(scene)) {
+    const camera = view.sceneCamera
+      ?? currentPaths3DCamera(view)
+      ?? clonePlotlyObject(DEFAULT_PATHS_3D_CAMERA);
+    view.sceneCamera = camera;
+    scene.camera = clonePlotlyObject(camera);
   }
   const config: PlotlyConfig = {
     responsive: true,
@@ -8149,7 +8685,11 @@ function updatePaths3DVisualization(
     modeBarButtonsToRemove: ["toImage"],
   };
   window.Plotly.react(view.plotEl, data, layout, config).then(() => {
+    view.sceneTraceSignature = signature;
     bindPaths3DInteraction(view);
+  }).catch((error) => {
+    view.sceneTraceSignature = null;
+    console.warn("3D scene rebuild failed", error);
   });
 }
 

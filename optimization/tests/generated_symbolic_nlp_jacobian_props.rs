@@ -481,9 +481,9 @@ fn generated_symbolic_nlp_call_heavy_ci() {
 }
 
 fn require_release_mode_for_manual_property_runs() {
-    #[cfg(debug_assertions)]
-    panic!(
-        "manual symbolic NLP Jacobian stress runs must be executed in release mode\n\ntry:\n  cargo test -p optimization --release --test generated_symbolic_nlp_jacobian_props generated_symbolic_nlp_call_heavy_stress -- --ignored"
+    assert!(
+        !matches!(option_env!("OPTIVIBRE_OPT_LEVEL"), Some("0")),
+        "manual symbolic NLP Jacobian stress runs must be executed with an optimized binary; current opt-level=0\n\ntry:\n  cargo test -p optimization --release --test generated_symbolic_nlp_jacobian_props generated_symbolic_nlp_call_heavy_stress -- --ignored"
     );
 }
 

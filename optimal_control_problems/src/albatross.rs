@@ -1,5 +1,5 @@
 use crate::common::{
-    ArtifactVisualization, CompileCacheStatus, CompileProgressInfo, CompileProgressUpdate,
+    ArtifactVisualization, Chart, CompileCacheStatus, CompileProgressInfo, CompileProgressUpdate,
     CompiledDirectCollocationOcp, CompiledMultipleShootingOcp, DirectCollocationRuntimeValues,
     DirectCollocationTimeGrid, DirectCollocationTrajectories, FromMap, LatexSection, MetricKey,
     MultipleShootingRuntimeValues, MultipleShootingTrajectories, OcpCompileProgressState,
@@ -27,9 +27,9 @@ use sx_core::SX;
 
 const PROBLEM_NAME: &str = "Albatross Dynamic Soaring";
 const RK4_SUBSTEPS: usize = 2;
-const DEFAULT_INTERVALS: usize = 28;
+const DEFAULT_INTERVALS: usize = 50;
 const DEFAULT_COLLOCATION_DEGREE: usize = 3;
-const SUPPORTED_INTERVALS: [usize; 6] = [12, 18, DEFAULT_INTERVALS, 36, 48, 64];
+const SUPPORTED_INTERVALS: [usize; 7] = [12, 18, 28, 36, 48, DEFAULT_INTERVALS, 64];
 const SUPPORTED_DEGREES: [usize; 4] = [2, DEFAULT_COLLOCATION_DEGREE, 4, 5];
 
 const DEFAULT_GRAVITY_MPS2: f64 = 9.81;
@@ -44,6 +44,7 @@ const DEFAULT_SPEED_EPS_MPS: f64 = 1.0e-3;
 const DEFAULT_FRAME_EPS: f64 = 1.0e-4;
 const WIND_SHEAR_PROFILE_SAMPLES: usize = 73;
 const WIND_SHEAR_PROFILE_LANES: usize = 5;
+const DRAG_GLYPH_EXAGGERATION: f64 = 5.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ObjectiveKind {
@@ -125,6 +126,7 @@ struct Design<T> {
     delta_l: T,
     h0: T,
     vx0: T,
+    vy0: T,
     tf: T,
 }
 
@@ -141,6 +143,7 @@ where
             delta_l: tf.clone(),
             h0: tf.clone(),
             vx0: tf.clone(),
+            vy0: tf.clone(),
             tf,
         }
     }
@@ -164,7 +167,8 @@ struct ModelParams<T> {
     wind_high_mps: T,
     wind_mid_altitude_m: T,
     wind_transition_height_m: T,
-    rate_weight: T,
+    alpha_rate_weight: T,
+    roll_rate_weight: T,
 }
 
 #[derive(Clone, Debug, PartialEq, Vectorize)]
@@ -189,7 +193,7 @@ struct Boundary<T> {
     vx0: T,
     vx_periodic: T,
     vy0: T,
-    vy_t: T,
+    vy_periodic: T,
     vz0: T,
     vz_t: T,
     alpha_periodic: T,
@@ -240,6 +244,7 @@ pub struct Params {
     h0: DesignControl,
     vx0: DesignControl,
     tf: DesignControl,
+    constrain_vy0_zero: bool,
     gravity_mps2: f64,
     air_density_kg_m3: f64,
     mass_kg: f64,
@@ -265,7 +270,8 @@ pub struct Params {
     max_load_factor: f64,
     max_alpha_rate_deg_s: f64,
     max_roll_rate_deg_s: f64,
-    rate_regularization: f64,
+    alpha_rate_regularization: f64,
+    roll_rate_regularization: f64,
     scaling_enabled: bool,
     solver_method: SolverMethod,
     solver: SolverConfig,
@@ -277,9 +283,9 @@ impl Default for Params {
     fn default() -> Self {
         let transcription = default_transcription(DEFAULT_INTERVALS);
         let mut solver = default_solver_config();
-        solver.nlip.linear_solver = InteriorPointLinearSolver::SparseQdldl;
+        solver.nlip.linear_solver = InteriorPointLinearSolver::SsidsRs;
         Self {
-            objective: ObjectiveKind::AverageSpeed,
+            objective: ObjectiveKind::WindWork,
             delta_l: DesignControl {
                 fixed: true,
                 value: 90.0,
@@ -304,6 +310,7 @@ impl Default for Params {
                 lower: 3.0,
                 upper: 12.0,
             },
+            constrain_vy0_zero: true,
             gravity_mps2: DEFAULT_GRAVITY_MPS2,
             air_density_kg_m3: DEFAULT_AIR_DENSITY_KG_M3,
             mass_kg: DEFAULT_MASS_KG,
@@ -329,7 +336,8 @@ impl Default for Params {
             max_load_factor: 8.0,
             max_alpha_rate_deg_s: 45.0,
             max_roll_rate_deg_s: 160.0,
-            rate_regularization: 1.0e-3,
+            alpha_rate_regularization: 13.0,
+            roll_rate_regularization: 23.0,
             scaling_enabled: true,
             solver_method: SolverMethod::Nlip,
             solver,
@@ -397,6 +405,16 @@ fn read_design(
     })
 }
 
+fn sample_regularization_weight(
+    values: &BTreeMap<String, f64>,
+    id: &str,
+    legacy_id: &str,
+    default: f64,
+) -> Result<f64> {
+    let legacy_or_default = sample_or_default(values, legacy_id, default);
+    expect_finite(sample_or_default(values, id, legacy_or_default), id)
+}
+
 impl FromMap for Params {
     fn from_map(values: &BTreeMap<String, f64>) -> Result<Self> {
         let defaults = Self::default();
@@ -410,6 +428,15 @@ impl FromMap for Params {
             h0: read_design(values, "h0", &defaults.h0)?,
             vx0: read_design(values, "vx0", &defaults.vx0)?,
             tf: read_design(values, "tf", &defaults.tf)?,
+            constrain_vy0_zero: sample_or_default(
+                values,
+                "constrain_vy0_zero",
+                if defaults.constrain_vy0_zero {
+                    1.0
+                } else {
+                    0.0
+                },
+            ) >= 0.5,
             gravity_mps2: expect_finite(
                 sample_or_default(values, "gravity_mps2", defaults.gravity_mps2),
                 "gravity_mps2",
@@ -527,9 +554,17 @@ impl FromMap for Params {
                 sample_or_default(values, "max_roll_rate_deg_s", defaults.max_roll_rate_deg_s),
                 "max_roll_rate_deg_s",
             )?,
-            rate_regularization: expect_finite(
-                sample_or_default(values, "rate_regularization", defaults.rate_regularization),
+            alpha_rate_regularization: sample_regularization_weight(
+                values,
+                "alpha_rate_regularization",
                 "rate_regularization",
+                defaults.alpha_rate_regularization,
+            )?,
+            roll_rate_regularization: sample_regularization_weight(
+                values,
+                "roll_rate_regularization",
+                "rate_regularization",
+                defaults.roll_rate_regularization,
             )?,
             scaling_enabled: sample_or_default(
                 values,
@@ -589,6 +624,12 @@ impl FromMap for Params {
             return Err(anyhow!(
                 "min_airspeed_mps must be less than or equal to max_airspeed_mps"
             ));
+        }
+        if params.alpha_rate_regularization < 0.0 {
+            return Err(anyhow!("alpha_rate_regularization must be nonnegative"));
+        }
+        if params.roll_rate_regularization < 0.0 {
+            return Err(anyhow!("roll_rate_regularization must be nonnegative"));
         }
         validate_design_domain("delta_l", &params.delta_l, 0.0, false, "positive")?;
         validate_design_domain("h0", &params.h0, 0.0, true, "nonnegative")?;
@@ -737,6 +778,12 @@ pub fn spec() -> ProblemSpec {
     extra.extend(design_controls("vx0", "vx0", "m/s", &defaults.vx0));
     extra.extend(design_controls("tf", "T", "s", &defaults.tf));
     extra.extend([
+        checkbox_control(
+            "constrain_vy0_zero",
+            "Vy(0) = 0",
+            defaults.constrain_vy0_zero,
+            "When checked, the lateral initial velocity is fixed at zero. When unchecked, vy(0) is a free global design variable while vy(T)-vy(0)=0 remains enforced.",
+        ),
         problem_slider_control(
             "gravity_mps2",
             "Gravity",
@@ -905,7 +952,7 @@ pub fn spec() -> ProblemSpec {
             1.0,
             defaults.initial_wave_rotation_deg,
             "deg",
-            "Rotation of the initial wave in the Y/Z plane about +X.",
+            "Signed rotation away from vertical for the initial climbing wave. 0 deg is pure altitude; positive and negative values choose opposite Y sides.",
         ),
         problem_slider_control(
             "initial_alpha_deg",
@@ -988,14 +1035,24 @@ pub fn spec() -> ProblemSpec {
             "Path bound on roll rate.",
         ),
         problem_scientific_slider_control(
-            "rate_regularization",
-            "Rate Weight",
-            0.0,
-            1.0,
-            1.0e-4,
-            defaults.rate_regularization,
+            "alpha_rate_regularization",
+            "Alpha Rate Weight",
+            1.0e-3,
+            1.0e3,
+            1.0e-2,
+            defaults.alpha_rate_regularization,
             "",
-            "Quadratic regularization on alpha and roll rates.",
+            "Time-averaged quadratic regularization weight on alpha_dot^2.",
+        ),
+        problem_scientific_slider_control(
+            "roll_rate_regularization",
+            "Roll Rate Weight",
+            1.0e-3,
+            1.0e3,
+            1.0e-2,
+            defaults.roll_rate_regularization,
+            "",
+            "Time-averaged quadratic regularization weight on roll_dot^2.",
         ),
         select_control(
             "scaling_enabled",
@@ -1026,20 +1083,40 @@ pub fn spec() -> ProblemSpec {
                 title: "States, Controls, and Globals".to_string(),
                 entries: vec![
                     r"x = [p_x,p_y,p_z,v_x,v_y,v_z]^T,\quad u=[\alpha,\phi]^T".to_string(),
-                    r"g=[\Delta L,h_0,v_{x0},T]^T".to_string(),
+                    r"g=[\Delta L,h_0,v_{x0},v_{y0},T]^T".to_string(),
                 ],
             },
             LatexSection {
                 title: "Wind Shear".to_string(),
-                entries: vec![r"W(p_z)=\hat w\left(W_\ell+\frac{1}{2}(W_h-W_\ell)(1+\tanh((p_z-z_m)/z_s))\right)".to_string()],
+                entries: vec![
+                    r"W(p_z)=\hat w\left(W_\ell+\frac{1}{2}(W_h-W_\ell)(1+\tanh((p_z-z_m)/z_s))\right)".to_string(),
+                    r"a=v-W(p_z),\quad V_a=\sqrt{a^Ta+\epsilon_V^2},\quad \hat a=a/V_a".to_string(),
+                ],
             },
             LatexSection {
                 title: "Aero Polar".to_string(),
                 entries: vec![r"C_L=C_{L_\alpha}\alpha,\quad C_D=C_{D0}+\frac{C_L^2}{\pi ARe}".to_string()],
             },
             LatexSection {
-                title: "Lift Frame".to_string(),
-                entries: vec![r"\hat d=-a/V_a,\quad n_0=\mathrm{normalize}(\hat z-(\hat z\cdot\hat a)\hat a),\quad \hat l=\cos\phi\,n_0+\sin\phi\,(\hat a\times n_0)".to_string()],
+                title: "Lift and Drag Axes".to_string(),
+                entries: vec![
+                    r"\hat d=-\hat a\quad\text{(drag force axis, opposite air-relative velocity)}".to_string(),
+                    r"n_0=\mathrm{normalize}\left(\hat z-(\hat z\cdot\hat a)\hat a\right)\quad\text{(zero-bank lift axis)}".to_string(),
+                    r"\hat l=\cos\phi\,n_0+\sin\phi\,(\hat a\times n_0),\quad \hat l^T\hat a=0".to_string(),
+                    r"\dot v=\frac{qS}{m}\left(C_L\hat l+C_D\hat d\right)-g\hat z".to_string(),
+                ],
+            },
+            LatexSection {
+                title: "Boundary Conditions".to_string(),
+                entries: vec![
+                    r"p_x(0)=0,\quad p_x(T)-p_x(0)=\Delta L".to_string(),
+                    r"p_y(0)=0,\quad p_y(T)=0".to_string(),
+                    r"p_z(0)=h_0,\quad p_z(T)-p_z(0)=0".to_string(),
+                    r"v_x(0)=v_{x0},\quad v_x(T)-v_x(0)=0".to_string(),
+                    r"v_y(0)=v_{y0},\quad v_y(T)-v_y(0)=0,\quad v_{y0}=0\ \text{when the boundary anchor is enabled}".to_string(),
+                    r"v_z(0)=0,\quad v_z(T)=0".to_string(),
+                    r"\alpha(T)-\alpha(0)=0,\quad \phi(T)-\phi(0)=0".to_string(),
+                ],
             },
         ],
         vec![
@@ -1169,8 +1246,9 @@ fn model<Scheme>(
                   dudt: &Control<SX>,
                   p: &ModelParams<SX>,
                   g: &Design<SX>| {
-                let rate_cost =
-                    p.rate_weight.clone() * (dudt.alpha.clone().sqr() + dudt.roll.clone().sqr());
+                let rate_cost = (p.alpha_rate_weight.clone() * dudt.alpha.clone().sqr()
+                    + p.roll_rate_weight.clone() * dudt.roll.clone().sqr())
+                    / g.tf.clone();
                 match objective {
                     ObjectiveKind::WindWork => {
                         rate_cost - aero_sx(x, u, p).wind_work_rate / g.tf.clone()
@@ -1232,8 +1310,8 @@ fn model<Scheme>(
             pz_periodic: xt.pz.clone() - x0.pz.clone(),
             vx0: x0.vx.clone() - g.vx0.clone(),
             vx_periodic: xt.vx.clone() - x0.vx.clone(),
-            vy0: x0.vy.clone(),
-            vy_t: xt.vy.clone(),
+            vy0: x0.vy.clone() - g.vy0.clone(),
+            vy_periodic: xt.vy.clone() - x0.vy.clone(),
             vz0: x0.vz.clone(),
             vz_t: xt.vz.clone(),
             alpha_periodic: ut.alpha.clone() - u0.alpha.clone(),
@@ -1264,6 +1342,7 @@ fn active_design(params: &Params) -> Result<Design<f64>> {
         delta_l: active_design_value("delta_l", &params.delta_l)?,
         h0: active_design_value("h0", &params.h0)?,
         vx0: active_design_value("vx0", &params.vx0)?,
+        vy0: 0.0,
         tf: active_design_value("tf", &params.tf)?,
     })
 }
@@ -1305,6 +1384,53 @@ fn linspace(start: f64, end: f64, count: usize) -> Vec<f64> {
     }
 }
 
+fn norm3(v: [f64; 3]) -> f64 {
+    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+}
+
+fn finite_span(values: &[f64]) -> f64 {
+    finite_min_max(values.iter().copied())
+        .map(|(lower, upper)| upper - lower)
+        .unwrap_or(0.0)
+}
+
+fn scene_glyph_target_length(params: &Params, px: &[f64], py: &[f64], pz: &[f64]) -> f64 {
+    let span = finite_span(px)
+        .max(finite_span(py))
+        .max(finite_span(pz))
+        .max(params.delta_l.value.abs())
+        .max(params.h0.value.abs())
+        .max(40.0);
+    (0.07 * span).clamp(3.0, 9.0)
+}
+
+fn acceleration_glyph_scale(diagnostics: &[(AeroNum, f64)], target_length: f64) -> f64 {
+    let max_accel = diagnostics
+        .iter()
+        .flat_map(|(aero, _)| [aero.lift_accel, aero.drag_accel, aero.aero_accel])
+        .map(norm3)
+        .filter(|value| value.is_finite())
+        .fold(0.0, f64::max);
+    if max_accel > 1.0e-12 {
+        target_length / max_accel
+    } else {
+        0.0
+    }
+}
+
+fn wind_glyph_scale(diagnostics: &[(AeroNum, f64)], target_length: f64) -> f64 {
+    let max_wind = diagnostics
+        .iter()
+        .map(|(aero, _)| norm3(aero.wind))
+        .filter(|value| value.is_finite())
+        .fold(0.0, f64::max);
+    if max_wind > target_length && max_wind > 1.0e-12 {
+        target_length / max_wind
+    } else {
+        1.0
+    }
+}
+
 fn model_params(params: &Params) -> ModelParams<f64> {
     let az = deg_to_rad(params.wind_azimuth_deg);
     ModelParams {
@@ -1324,7 +1450,8 @@ fn model_params(params: &Params) -> ModelParams<f64> {
         wind_high_mps: params.wind_high_mps,
         wind_mid_altitude_m: params.wind_mid_altitude_m,
         wind_transition_height_m: params.wind_transition_height_m,
-        rate_weight: params.rate_regularization,
+        alpha_rate_weight: params.alpha_rate_regularization,
+        roll_rate_weight: params.roll_rate_regularization,
     }
 }
 
@@ -1537,8 +1664,8 @@ fn continuous_guess(
     let tf = g.tf;
     let dt = tf / (sample_count as f64 - 1.0);
     let theta = deg_to_rad(params.initial_wave_rotation_deg);
-    let amp_y = params.initial_wave_amplitude_m * theta.cos();
-    let amp_z = params.initial_wave_amplitude_m * theta.sin();
+    let amp_y = params.initial_wave_amplitude_m * theta.sin();
+    let amp_z = params.initial_wave_amplitude_m * theta.cos().abs();
     let x_sine = (g.vx0 * tf - g.delta_l) / (2.0 * std::f64::consts::PI);
     let alpha0 = deg_to_rad(params.initial_alpha_deg);
     let roll_amp = deg_to_rad(params.initial_roll_amplitude_deg);
@@ -1612,8 +1739,8 @@ fn validate_initial_guess(
         ("pz(T)-pz(0)", last.pz - first.pz),
         ("vx(0)-vx0", first.vx - g.vx0),
         ("vx(T)-vx(0)", last.vx - first.vx),
-        ("vy(0)", first.vy),
-        ("vy(T)", last.vy),
+        ("vy(0)-vy0", first.vy - g.vy0),
+        ("vy(T)-vy(0)", last.vy - first.vy),
         ("vz(0)", first.vz),
         ("vz(T)", last.vz),
     ];
@@ -1695,10 +1822,26 @@ fn path_bounds(params: &Params) -> Path<Bounds1D> {
 }
 
 fn global_bounds(params: &Params) -> Design<Bounds1D> {
+    let vy0_speed_bound = params
+        .max_airspeed_mps
+        .abs()
+        .max(params.min_airspeed_mps.abs())
+        .max(1.0);
     Design {
         delta_l: design_bounds(&params.delta_l),
         h0: design_bounds(&params.h0),
         vx0: design_bounds(&params.vx0),
+        vy0: if params.constrain_vy0_zero {
+            Bounds1D {
+                lower: Some(0.0),
+                upper: Some(0.0),
+            }
+        } else {
+            Bounds1D {
+                lower: Some(-vy0_speed_bound),
+                upper: Some(vy0_speed_bound),
+            }
+        },
         tf: design_bounds(&params.tf),
     }
 }
@@ -1729,7 +1872,7 @@ fn ms_runtime(
             vx0: 0.0,
             vx_periodic: 0.0,
             vy0: 0.0,
-            vy_t: 0.0,
+            vy_periodic: 0.0,
             vz0: 0.0,
             vz_t: 0.0,
             alpha_periodic: 0.0,
@@ -1771,7 +1914,7 @@ fn dc_runtime(
             vx0: 0.0,
             vx_periodic: 0.0,
             vy0: 0.0,
-            vy_t: 0.0,
+            vy_periodic: 0.0,
             vz0: 0.0,
             vz_t: 0.0,
             alpha_periodic: 0.0,
@@ -1817,6 +1960,7 @@ fn scaling(
             delta_l: params.delta_l.value.abs().max(100.0),
             h0: params.h0.value.abs().max(5.0),
             vx0: params.vx0.value.abs().max(10.0),
+            vy0: params.max_airspeed_mps.abs().max(10.0),
             tf: params.tf.value.abs().max(5.0),
         },
         parameters: ModelParams {
@@ -1836,7 +1980,8 @@ fn scaling(
             wind_high_mps: 5.0,
             wind_mid_altitude_m: 5.0,
             wind_transition_height_m: 2.0,
-            rate_weight: 1.0,
+            alpha_rate_weight: 1.0,
+            roll_rate_weight: 1.0,
         },
         path: vec![
             10.0,
@@ -2100,6 +2245,13 @@ fn runtime_dc_for_standard(
     dc_runtime(params).expect("validated albatross direct-collocation runtime")
 }
 
+fn validate_runtime(params: &Params) -> Result<()> {
+    match params.transcription.method {
+        crate::common::TranscriptionMethod::MultipleShooting => ms_runtime(params).map(|_| ()),
+        crate::common::TranscriptionMethod::DirectCollocation => dc_runtime(params).map(|_| ()),
+    }
+}
+
 pub fn solve(params: &Params) -> Result<SolveArtifact> {
     active_design(params)?;
     match params.transcription.method {
@@ -2136,6 +2288,7 @@ where
     F: FnMut(SolveStreamEvent) + Send,
 {
     active_design(params)?;
+    validate_runtime(params)?;
     crate::common::solve_standard_ocp_with_progress::<_, _, _, _, _, _, _, _, _, _>(
         params,
         params.transcription.method,
@@ -2184,6 +2337,7 @@ pub fn validate_derivatives(
     params: &Params,
     request: &crate::common::DerivativeCheckRequest,
 ) -> Result<crate::common::ProblemDerivativeCheck> {
+    validate_runtime(params)?;
     crate::common::validate_standard_ocp_derivatives::<_, _, _, _, _, _, _>(
         ProblemId::AlbatrossDynamicSoaring,
         PROBLEM_NAME,
@@ -2247,47 +2401,116 @@ pub(crate) fn benchmark_default_case_with_progress(
     )
 }
 
-fn series(name: &str, x: Vec<f64>, y: Vec<f64>) -> TimeSeries {
-    TimeSeries {
-        name: name.to_string(),
-        x,
-        y,
-        mode: Some(PlotMode::LinesMarkers),
-        legend_group: Some(name.to_string()),
-        show_legend: true,
-        role: crate::common::TimeSeriesRole::Data,
+fn full_segment(len: usize) -> Vec<std::ops::Range<usize>> {
+    std::iter::once(0..len).collect()
+}
+
+fn push_segmented_trajectory_paths(
+    paths: &mut Vec<ScenePath3D>,
+    px: &[f64],
+    py: &[f64],
+    pz: &[f64],
+    segments: &[std::ops::Range<usize>],
+) {
+    for (index, segment) in segments.iter().enumerate() {
+        let start = segment.start.min(px.len()).min(py.len()).min(pz.len());
+        let end = segment.end.min(px.len()).min(py.len()).min(pz.len());
+        if start >= end {
+            continue;
+        }
+        paths.push(ScenePath3D {
+            name: if segments.len() == 1 {
+                "trajectory".to_string()
+            } else {
+                format!("trajectory arc {index}")
+            },
+            x: px[start..end].to_vec(),
+            y: py[start..end].to_vec(),
+            z: pz[start..end].to_vec(),
+        });
     }
+}
+
+fn segmented_series_from_values(
+    name: &str,
+    legend_group: &str,
+    times: &[f64],
+    y: &[f64],
+    segments: &[std::ops::Range<usize>],
+    mode: PlotMode,
+    role: crate::common::TimeSeriesRole,
+) -> Vec<TimeSeries> {
+    segments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, segment)| {
+            let start = segment.start.min(times.len()).min(y.len());
+            let end = segment.end.min(times.len()).min(y.len());
+            (start < end).then(|| TimeSeries {
+                name: name.to_string(),
+                x: times[start..end].to_vec(),
+                y: y[start..end].to_vec(),
+                mode: Some(mode),
+                legend_group: Some(legend_group.to_string()),
+                show_legend: index == 0,
+                role,
+            })
+        })
+        .collect()
 }
 
 fn constant_bound_series(
     name: &str,
     legend_group: &str,
     times: &[f64],
+    segments: &[std::ops::Range<usize>],
     value: f64,
     role: crate::common::TimeSeriesRole,
-) -> TimeSeries {
-    TimeSeries {
-        name: name.to_string(),
-        x: times.to_vec(),
-        y: vec![value; times.len()],
-        mode: Some(PlotMode::Lines),
-        legend_group: Some(legend_group.to_string()),
-        show_legend: true,
+) -> Vec<TimeSeries> {
+    let y = vec![value; times.len()];
+    segmented_series_from_values(
+        name,
+        legend_group,
+        times,
+        &y,
+        segments,
+        PlotMode::Lines,
         role,
-    }
+    )
+}
+
+fn scalar_chart(
+    title: &str,
+    y_label: &str,
+    name: &str,
+    times: &[f64],
+    y: Vec<f64>,
+    segments: &[std::ops::Range<usize>],
+) -> Chart {
+    chart(
+        title,
+        y_label,
+        segmented_series_from_values(
+            name,
+            name,
+            times,
+            &y,
+            segments,
+            PlotMode::LinesMarkers,
+            crate::common::TimeSeriesRole::Data,
+        ),
+    )
 }
 
 fn diagnostics_for_nodes(
     params: &Params,
     states: &[State<f64>],
     controls: &[Control<f64>],
-    rates: &[Control<f64>],
 ) -> Vec<(AeroNum, f64)> {
     states
         .iter()
         .zip(controls.iter())
-        .zip(rates.iter())
-        .map(|((state, control), _rate)| {
+        .map(|(state, control)| {
             let aero = aero_numeric(state, control, params);
             let ground_speed =
                 (state.vx * state.vx + state.vy * state.vy + state.vz * state.vz).sqrt();
@@ -2302,11 +2525,14 @@ fn artifact_common(
     controls: Vec<Control<f64>>,
     rates: Vec<Control<f64>>,
     times: Vec<f64>,
+    rate_times: Vec<f64>,
+    sample_segments: Vec<std::ops::Range<usize>>,
+    rate_segments: Vec<std::ops::Range<usize>>,
     tf: f64,
     global: &Design<f64>,
     notes: Vec<String>,
 ) -> SolveArtifact {
-    let diagnostics = diagnostics_for_nodes(params, &states, &controls, &rates);
+    let diagnostics = diagnostics_for_nodes(params, &states, &controls);
     let px = states.iter().map(|s| s.px).collect::<Vec<_>>();
     let py = states.iter().map(|s| s.py).collect::<Vec<_>>();
     let pz = states.iter().map(|s| s.pz).collect::<Vec<_>>();
@@ -2353,22 +2579,18 @@ fn artifact_common(
         .iter()
         .map(|v| 0.5 * params.air_density_kg_m3 * v * v)
         .collect::<Vec<_>>();
-    let regularization_density = rates
+    let inv_tf = 1.0 / tf;
+    let alpha_rate_regularization_density = rates
         .iter()
-        .map(|u| params.rate_regularization * (u.alpha * u.alpha + u.roll * u.roll))
+        .map(|u| params.alpha_rate_regularization * u.alpha * u.alpha * inv_tf)
         .collect::<Vec<_>>();
-    let objective_density = diagnostics
+    let roll_rate_regularization_density = rates
         .iter()
-        .zip(rates.iter())
-        .map(|((a, _), u)| {
-            let regularization = params.rate_regularization * (u.alpha * u.alpha + u.roll * u.roll);
-            match params.objective {
-                ObjectiveKind::WindWork => regularization - a.wind_work_rate / tf,
-                ObjectiveKind::AverageSpeed
-                | ObjectiveKind::TerminalEnergy
-                | ObjectiveKind::ControlRegularization => regularization,
-            }
-        })
+        .map(|u| params.roll_rate_regularization * u.roll * u.roll * inv_tf)
+        .collect::<Vec<_>>();
+    let wind_power_objective_density = wind_work
+        .iter()
+        .map(|power| -power * inv_tf)
         .collect::<Vec<_>>();
     let kinetic = states
         .iter()
@@ -2384,302 +2606,423 @@ fn artifact_common(
         .map(|(k, p)| k + p)
         .collect::<Vec<_>>();
     let path_bounds = path_bounds(params);
-    let mut charts = vec![
-        chart(
-            "Position",
-            "m",
-            vec![
-                series("px", times.clone(), px.clone()),
-                series("py", times.clone(), py.clone()),
-                series("pz", times.clone(), pz.clone()),
-            ],
-        ),
-        chart(
-            "Velocity",
-            "m/s",
-            vec![
-                series("vx", times.clone(), vx),
-                series("vy", times.clone(), vy),
-                series("vz", times.clone(), vz),
-            ],
-        ),
-        chart(
-            "Controls",
-            "deg",
-            vec![
-                series(
-                    "alpha",
-                    times.clone(),
-                    controls.iter().map(|u| rad_to_deg(u.alpha)).collect(),
-                ),
-                series(
-                    "roll",
-                    times.clone(),
-                    controls.iter().map(|u| rad_to_deg(u.roll)).collect(),
-                ),
-            ],
-        ),
-        chart(
-            "Control Rates",
-            "deg/s",
-            vec![
-                series(
-                    "alpha_dot",
-                    times.clone(),
-                    rates.iter().map(|u| rad_to_deg(u.alpha)).collect(),
-                ),
-                series(
-                    "roll_dot",
-                    times.clone(),
-                    rates.iter().map(|u| rad_to_deg(u.roll)).collect(),
-                ),
-            ],
-        ),
-        chart(
-            "Airspeed and Wind",
-            "m/s",
-            vec![
-                series("airspeed", times.clone(), airspeed.clone()),
-                series("ground speed", times.clone(), ground_speed),
-                series("wind speed", times.clone(), wind_speed),
-            ],
-        ),
-        chart(
-            "Wind Components",
-            "m/s",
-            vec![
-                series("Wx", times.clone(), wind_x),
-                series("Wy", times.clone(), wind_y),
-                series("Wz", times.clone(), wind_z),
-            ],
-        ),
-        chart(
-            "Aero Coefficients",
-            "-",
-            vec![
-                series("CL", times.clone(), cl.clone()),
-                series("CD", times.clone(), cd),
-                series("L/D", times.clone(), ld),
-            ],
-        ),
-        chart(
-            "Path Constraints",
-            "-",
-            vec![
-                series("load factor", times.clone(), load),
-                series("frame guard", times.clone(), frame_guard),
-            ],
-        ),
-        chart(
-            "Energy",
-            "J",
-            vec![
-                series("kinetic", times.clone(), kinetic),
-                series("potential", times.clone(), potential),
-                series("total", times.clone(), total_energy),
-            ],
-        ),
-        chart(
-            "Wind Work Rate",
-            "W",
-            vec![series("F_aero · W", times.clone(), wind_work)],
-        ),
-        chart(
-            "Objective Contribution",
-            "-",
-            vec![
-                series("objective density", times.clone(), objective_density),
-                series("rate regularization", times.clone(), regularization_density),
-            ],
-        ),
-        chart(
-            "Dynamic Pressure",
-            "Pa",
-            vec![series("q", times.clone(), q)],
-        ),
-    ];
+    let px_chart = scalar_chart(
+        "Position px",
+        "m",
+        "px",
+        &times,
+        px.clone(),
+        &sample_segments,
+    );
+    let py_chart = scalar_chart(
+        "Position py",
+        "m",
+        "py",
+        &times,
+        py.clone(),
+        &sample_segments,
+    );
+    let mut pz_chart = scalar_chart(
+        "Altitude pz",
+        "m",
+        "pz",
+        &times,
+        pz.clone(),
+        &sample_segments,
+    );
+    let vx_chart = scalar_chart("Velocity vx", "m/s", "vx", &times, vx, &sample_segments);
+    let vy_chart = scalar_chart("Velocity vy", "m/s", "vy", &times, vy, &sample_segments);
+    let vz_chart = scalar_chart("Velocity vz", "m/s", "vz", &times, vz, &sample_segments);
+    let mut alpha_chart = scalar_chart(
+        "Alpha",
+        "deg",
+        "alpha",
+        &times,
+        controls.iter().map(|u| rad_to_deg(u.alpha)).collect(),
+        &sample_segments,
+    );
+    let roll_chart = scalar_chart(
+        "Roll",
+        "deg",
+        "roll",
+        &times,
+        controls.iter().map(|u| rad_to_deg(u.roll)).collect(),
+        &sample_segments,
+    );
+    let mut alpha_rate_chart = scalar_chart(
+        "Alpha Rate",
+        "deg/s",
+        "alpha_dot",
+        &rate_times,
+        rates.iter().map(|u| rad_to_deg(u.alpha)).collect(),
+        &rate_segments,
+    );
+    let mut roll_rate_chart = scalar_chart(
+        "Roll Rate",
+        "deg/s",
+        "roll_dot",
+        &rate_times,
+        rates.iter().map(|u| rad_to_deg(u.roll)).collect(),
+        &rate_segments,
+    );
+    let mut airspeed_chart = scalar_chart(
+        "Airspeed",
+        "m/s",
+        "airspeed",
+        &times,
+        airspeed.clone(),
+        &sample_segments,
+    );
+    let ground_speed_chart = scalar_chart(
+        "Ground Speed",
+        "m/s",
+        "ground speed",
+        &times,
+        ground_speed,
+        &sample_segments,
+    );
+    let wind_speed_chart = scalar_chart(
+        "Wind Speed",
+        "m/s",
+        "wind speed",
+        &times,
+        wind_speed,
+        &sample_segments,
+    );
+    let wind_x_chart = scalar_chart("Wind Wx", "m/s", "Wx", &times, wind_x, &sample_segments);
+    let wind_y_chart = scalar_chart("Wind Wy", "m/s", "Wy", &times, wind_y, &sample_segments);
+    let wind_z_chart = scalar_chart("Wind Wz", "m/s", "Wz", &times, wind_z, &sample_segments);
+    let mut cl_chart = scalar_chart("CL", "-", "CL", &times, cl.clone(), &sample_segments);
+    let cd_chart = scalar_chart("CD", "-", "CD", &times, cd, &sample_segments);
+    let ld_chart = scalar_chart("L/D", "-", "L/D", &times, ld, &sample_segments);
+    let mut load_chart = scalar_chart(
+        "Load Factor",
+        "-",
+        "load factor",
+        &times,
+        load,
+        &sample_segments,
+    );
+    let mut frame_guard_chart = scalar_chart(
+        "Frame Guard",
+        "-",
+        "frame guard",
+        &times,
+        frame_guard,
+        &sample_segments,
+    );
+    let kinetic_chart = scalar_chart(
+        "Kinetic Energy",
+        "J",
+        "kinetic",
+        &times,
+        kinetic,
+        &sample_segments,
+    );
+    let potential_chart = scalar_chart(
+        "Potential Energy",
+        "J",
+        "potential",
+        &times,
+        potential,
+        &sample_segments,
+    );
+    let total_energy_chart = scalar_chart(
+        "Total Energy",
+        "J",
+        "total",
+        &times,
+        total_energy,
+        &sample_segments,
+    );
+    let wind_work_chart = scalar_chart(
+        "Wind Work Rate",
+        "W",
+        "F_aero · W",
+        &times,
+        wind_work,
+        &sample_segments,
+    );
+    let mut objective_contribution_series = Vec::new();
+    if params.objective == ObjectiveKind::WindWork {
+        objective_contribution_series.extend(segmented_series_from_values(
+            "-wind power/T",
+            "-wind power/T",
+            &times,
+            &wind_power_objective_density,
+            &sample_segments,
+            PlotMode::LinesMarkers,
+            crate::common::TimeSeriesRole::Data,
+        ));
+    }
+    objective_contribution_series.extend(segmented_series_from_values(
+        "alpha rate^2/T",
+        "alpha rate^2/T",
+        &rate_times,
+        &alpha_rate_regularization_density,
+        &rate_segments,
+        PlotMode::LinesMarkers,
+        crate::common::TimeSeriesRole::Data,
+    ));
+    objective_contribution_series.extend(segmented_series_from_values(
+        "roll rate^2/T",
+        "roll rate^2/T",
+        &rate_times,
+        &roll_rate_regularization_density,
+        &rate_segments,
+        PlotMode::LinesMarkers,
+        crate::common::TimeSeriesRole::Data,
+    ));
+    let objective_contributions_chart = chart(
+        "Objective Contributions",
+        "-",
+        objective_contribution_series,
+    );
+    let alpha_rate_regularization_chart = scalar_chart(
+        "Alpha Rate Regularization",
+        "-",
+        "alpha rate^2/T",
+        &rate_times,
+        alpha_rate_regularization_density,
+        &rate_segments,
+    );
+    let roll_rate_regularization_chart = scalar_chart(
+        "Roll Rate Regularization",
+        "-",
+        "roll rate^2/T",
+        &rate_times,
+        roll_rate_regularization_density,
+        &rate_segments,
+    );
+    let q_chart = scalar_chart("Dynamic Pressure", "Pa", "q", &times, q, &sample_segments);
     if let Some(lower) = path_bounds.altitude.lower {
-        charts[0].series.push(constant_bound_series(
+        pz_chart.series.extend(constant_bound_series(
             "pz lower",
             "pz",
             &times,
+            &sample_segments,
             lower,
             crate::common::TimeSeriesRole::LowerBound,
         ));
     }
     if let Some(upper) = path_bounds.altitude.upper {
-        charts[0].series.push(constant_bound_series(
+        pz_chart.series.extend(constant_bound_series(
             "pz upper",
             "pz",
             &times,
+            &sample_segments,
             upper,
             crate::common::TimeSeriesRole::UpperBound,
         ));
     }
     if let Some(lower) = path_bounds.airspeed.lower {
-        charts[4].series.push(constant_bound_series(
+        airspeed_chart.series.extend(constant_bound_series(
             "airspeed lower",
             "airspeed",
             &times,
+            &sample_segments,
             lower,
             crate::common::TimeSeriesRole::LowerBound,
         ));
     }
     if let Some(upper) = path_bounds.airspeed.upper {
-        charts[4].series.push(constant_bound_series(
+        airspeed_chart.series.extend(constant_bound_series(
             "airspeed upper",
             "airspeed",
             &times,
+            &sample_segments,
             upper,
             crate::common::TimeSeriesRole::UpperBound,
         ));
     }
     if let Some(lower) = path_bounds.cl.lower {
-        charts[2].series.push(constant_bound_series(
+        alpha_chart.series.extend(constant_bound_series(
             "alpha lower from CL",
             "alpha",
             &times,
+            &sample_segments,
             rad_to_deg(lower / params.cl_slope_per_rad),
             crate::common::TimeSeriesRole::LowerBound,
         ));
     }
     if let Some(upper) = path_bounds.cl.upper {
-        charts[2].series.push(constant_bound_series(
+        alpha_chart.series.extend(constant_bound_series(
             "alpha upper from CL",
             "alpha",
             &times,
+            &sample_segments,
             rad_to_deg(upper / params.cl_slope_per_rad),
             crate::common::TimeSeriesRole::UpperBound,
         ));
     }
     if let Some(lower) = path_bounds.alpha_rate.lower {
-        charts[3].series.push(constant_bound_series(
+        alpha_rate_chart.series.extend(constant_bound_series(
             "alpha_dot lower",
             "alpha_dot",
-            &times,
+            &rate_times,
+            &rate_segments,
             rad_to_deg(lower),
             crate::common::TimeSeriesRole::LowerBound,
         ));
     }
     if let Some(upper) = path_bounds.alpha_rate.upper {
-        charts[3].series.push(constant_bound_series(
+        alpha_rate_chart.series.extend(constant_bound_series(
             "alpha_dot upper",
             "alpha_dot",
-            &times,
+            &rate_times,
+            &rate_segments,
             rad_to_deg(upper),
             crate::common::TimeSeriesRole::UpperBound,
         ));
     }
     if let Some(lower) = path_bounds.roll_rate.lower {
-        charts[3].series.push(constant_bound_series(
+        roll_rate_chart.series.extend(constant_bound_series(
             "roll_dot lower",
             "roll_dot",
-            &times,
+            &rate_times,
+            &rate_segments,
             rad_to_deg(lower),
             crate::common::TimeSeriesRole::LowerBound,
         ));
     }
     if let Some(upper) = path_bounds.roll_rate.upper {
-        charts[3].series.push(constant_bound_series(
+        roll_rate_chart.series.extend(constant_bound_series(
             "roll_dot upper",
             "roll_dot",
-            &times,
+            &rate_times,
+            &rate_segments,
             rad_to_deg(upper),
             crate::common::TimeSeriesRole::UpperBound,
         ));
     }
     if let Some(lower) = path_bounds.cl.lower {
-        charts[6].series.push(constant_bound_series(
+        cl_chart.series.extend(constant_bound_series(
             "CL lower",
             "CL",
             &times,
+            &sample_segments,
             lower,
             crate::common::TimeSeriesRole::LowerBound,
         ));
     }
     if let Some(upper) = path_bounds.cl.upper {
-        charts[6].series.push(constant_bound_series(
+        cl_chart.series.extend(constant_bound_series(
             "CL upper",
             "CL",
             &times,
+            &sample_segments,
             upper,
             crate::common::TimeSeriesRole::UpperBound,
         ));
     }
     if let Some(lower) = path_bounds.load_factor.lower {
-        charts[7].series.push(constant_bound_series(
+        load_chart.series.extend(constant_bound_series(
             "load lower",
             "load factor",
             &times,
+            &sample_segments,
             lower,
             crate::common::TimeSeriesRole::LowerBound,
         ));
     }
     if let Some(upper) = path_bounds.load_factor.upper {
-        charts[7].series.push(constant_bound_series(
+        load_chart.series.extend(constant_bound_series(
             "load upper",
             "load factor",
             &times,
+            &sample_segments,
             upper,
             crate::common::TimeSeriesRole::UpperBound,
         ));
     }
     if let Some(lower) = path_bounds.frame_guard.lower {
-        charts[7].series.push(constant_bound_series(
+        frame_guard_chart.series.extend(constant_bound_series(
             "frame guard lower",
             "frame guard",
             &times,
+            &sample_segments,
             lower,
             crate::common::TimeSeriesRole::LowerBound,
         ));
     }
     if let Some(upper) = path_bounds.frame_guard.upper {
-        charts[7].series.push(constant_bound_series(
+        frame_guard_chart.series.extend(constant_bound_series(
             "frame guard upper",
             "frame guard",
             &times,
+            &sample_segments,
             upper,
             crate::common::TimeSeriesRole::UpperBound,
         ));
     }
-    let mut paths = vec![ScenePath3D {
-        name: "trajectory".to_string(),
-        x: px.clone(),
-        y: py.clone(),
-        z: pz.clone(),
-    }];
-    let stride = (states.len() / 12).max(1);
+    let charts = vec![
+        px_chart,
+        py_chart,
+        pz_chart,
+        vx_chart,
+        vy_chart,
+        vz_chart,
+        alpha_chart,
+        roll_chart,
+        alpha_rate_chart,
+        roll_rate_chart,
+        airspeed_chart,
+        ground_speed_chart,
+        wind_speed_chart,
+        wind_x_chart,
+        wind_y_chart,
+        wind_z_chart,
+        cl_chart,
+        cd_chart,
+        ld_chart,
+        load_chart,
+        frame_guard_chart,
+        kinetic_chart,
+        potential_chart,
+        total_energy_chart,
+        wind_work_chart,
+        objective_contributions_chart,
+        alpha_rate_regularization_chart,
+        roll_rate_regularization_chart,
+        q_chart,
+    ];
+    let mut paths = Vec::new();
+    push_segmented_trajectory_paths(&mut paths, &px, &py, &pz, &sample_segments);
+    let glyph_target = scene_glyph_target_length(params, &px, &py, &pz);
+    let accel_scale = acceleration_glyph_scale(&diagnostics, glyph_target);
+    let drag_scale = DRAG_GLYPH_EXAGGERATION * accel_scale;
+    let wind_scale = wind_glyph_scale(&diagnostics, 0.85 * glyph_target);
+    let frame_scale = (0.70 * glyph_target).clamp(3.0, 5.5);
+    let stride = (states.len() / 24).max(1);
     for (idx, (state, (aero, _))) in states
         .iter()
         .zip(diagnostics.iter())
         .enumerate()
         .step_by(stride)
     {
-        let scale = 2.0;
-        let frame_scale = 6.0;
         paths.push(ScenePath3D {
             name: format!("lift {idx}"),
-            x: vec![state.px, state.px + scale * aero.lift_accel[0]],
-            y: vec![state.py, state.py + scale * aero.lift_accel[1]],
-            z: vec![state.pz, state.pz + scale * aero.lift_accel[2]],
+            x: vec![state.px, state.px + accel_scale * aero.lift_accel[0]],
+            y: vec![state.py, state.py + accel_scale * aero.lift_accel[1]],
+            z: vec![state.pz, state.pz + accel_scale * aero.lift_accel[2]],
         });
         paths.push(ScenePath3D {
             name: format!("drag {idx}"),
-            x: vec![state.px, state.px + scale * aero.drag_accel[0]],
-            y: vec![state.py, state.py + scale * aero.drag_accel[1]],
-            z: vec![state.pz, state.pz + scale * aero.drag_accel[2]],
+            x: vec![state.px, state.px + drag_scale * aero.drag_accel[0]],
+            y: vec![state.py, state.py + drag_scale * aero.drag_accel[1]],
+            z: vec![state.pz, state.pz + drag_scale * aero.drag_accel[2]],
         });
         paths.push(ScenePath3D {
             name: format!("aero accel {idx}"),
-            x: vec![state.px, state.px + scale * aero.aero_accel[0]],
-            y: vec![state.py, state.py + scale * aero.aero_accel[1]],
-            z: vec![state.pz, state.pz + scale * aero.aero_accel[2]],
+            x: vec![state.px, state.px + accel_scale * aero.aero_accel[0]],
+            y: vec![state.py, state.py + accel_scale * aero.aero_accel[1]],
+            z: vec![state.pz, state.pz + accel_scale * aero.aero_accel[2]],
         });
         paths.push(ScenePath3D {
             name: format!("wind {idx}"),
-            x: vec![state.px, state.px + aero.wind[0]],
-            y: vec![state.py, state.py + aero.wind[1]],
-            z: vec![state.pz, state.pz + aero.wind[2]],
+            x: vec![state.px, state.px + wind_scale * aero.wind[0]],
+            y: vec![state.py, state.py + wind_scale * aero.wind[1]],
+            z: vec![state.pz, state.pz + wind_scale * aero.wind[2]],
         });
         paths.push(ScenePath3D {
             name: format!("air axis {idx}"),
@@ -2777,12 +3120,17 @@ fn artifact_from_ms(
         alpha: 0.0,
         roll: 0.0,
     }));
+    let sample_segments = full_segment(times.len());
+    let rate_segments = sample_segments.clone();
     let mut artifact = artifact_common(
         params,
         states,
         controls,
         rates,
+        times.clone(),
         times,
+        sample_segments,
+        rate_segments,
         trajectories.tf,
         &trajectories.global,
         vec!["Multiple shooting renders mesh-node diagnostics; RK4 interval arcs are still used for state continuity internally.".to_string()],
@@ -2807,38 +3155,41 @@ fn artifact_from_dc(
         direct_collocation_state_like_arcs(&trajectories.u, &trajectories.root_u, time_grid)
             .expect("collocation control arcs should match");
     let dudt_arcs = direct_collocation_root_arcs(&trajectories.root_dudt, time_grid);
-    let times = x_arcs
-        .iter()
-        .flat_map(|arc| arc.times.iter().copied())
-        .collect::<Vec<_>>();
-    let states = x_arcs
-        .iter()
-        .flat_map(|arc| arc.values.iter().cloned())
-        .collect::<Vec<_>>();
-    let controls = u_arcs
-        .iter()
-        .flat_map(|arc| arc.values.iter().cloned())
-        .collect::<Vec<_>>();
-    let mut rates = dudt_arcs
-        .iter()
-        .flat_map(|arc| arc.values.iter().cloned())
-        .collect::<Vec<_>>();
-    while rates.len() < states.len() {
-        rates.push(rates.last().cloned().unwrap_or(Control {
-            alpha: 0.0,
-            roll: 0.0,
-        }));
-    }
+    let (times, states, sample_segments) = flatten_interval_arcs(&x_arcs);
+    let (_, controls, _) = flatten_interval_arcs(&u_arcs);
+    let (rate_times, rates, rate_segments) = flatten_interval_arcs(&dudt_arcs);
     artifact_common(
         params,
         states,
         controls,
         rates,
         times,
+        rate_times,
+        sample_segments,
+        rate_segments,
         trajectories.tf,
         &trajectories.global,
-        vec!["Direct collocation charts include interval-local start/root/end state and control samples; rate diagnostics use root controls padded to state-like samples for plotting.".to_string()],
+        vec!["Direct collocation charts render each interval as a separate arc; control-rate diagnostics are plotted only at collocation roots.".to_string()],
     )
+}
+
+fn flatten_interval_arcs<T: Clone>(
+    arcs: &[IntervalArc<T>],
+) -> (Vec<f64>, Vec<T>, Vec<std::ops::Range<usize>>) {
+    let total_len = arcs.iter().map(|arc| arc.values.len()).sum();
+    let mut times = Vec::with_capacity(total_len);
+    let mut values = Vec::with_capacity(total_len);
+    let mut segments = Vec::with_capacity(arcs.len());
+    for arc in arcs {
+        let start = values.len();
+        times.extend(arc.times.iter().copied());
+        values.extend(arc.values.iter().cloned());
+        let end = values.len();
+        if start < end {
+            segments.push(start..end);
+        }
+    }
+    (times, values, segments)
 }
 
 pub(crate) fn problem_entry() -> crate::ProblemEntry {
@@ -2875,8 +3226,55 @@ mod tests {
     }
 
     #[test]
+    fn model_description_documents_force_axes_and_boundaries() {
+        let spec = spec();
+        let force_axes = spec
+            .math_sections
+            .iter()
+            .find(|section| section.title == "Lift and Drag Axes")
+            .expect("force-axis section should be present");
+        assert!(
+            force_axes
+                .entries
+                .iter()
+                .any(|entry| entry.contains(r"\hat d=-\hat a"))
+        );
+        assert!(
+            force_axes
+                .entries
+                .iter()
+                .any(|entry| entry.contains(r"\hat l^T\hat a=0"))
+        );
+
+        let boundaries = spec
+            .math_sections
+            .iter()
+            .find(|section| section.title == "Boundary Conditions")
+            .expect("boundary section should be present");
+        assert!(
+            boundaries
+                .entries
+                .iter()
+                .any(|entry| entry.contains(r"p_x(T)-p_x(0)=\Delta L"))
+        );
+        assert!(
+            boundaries
+                .entries
+                .iter()
+                .any(|entry| entry.contains(r"v_y(T)-v_y(0)=0"))
+        );
+        assert!(
+            boundaries
+                .entries
+                .iter()
+                .any(|entry| entry.contains(r"\alpha(T)-\alpha(0)=0"))
+        );
+    }
+
+    #[test]
     fn default_albatross_parameters_match_crosswind_reference_seed() {
         let params = Params::default();
+        assert_eq!(params.objective, ObjectiveKind::WindWork);
         assert_eq!(params.delta_l.value, 90.0);
         assert_eq!(params.delta_l.lower, 50.0);
         assert_eq!(params.delta_l.upper, 220.0);
@@ -2889,6 +3287,7 @@ mod tests {
         assert_eq!(params.tf.value, 6.0);
         assert_eq!(params.tf.lower, 3.0);
         assert_eq!(params.tf.upper, 12.0);
+        assert!(params.constrain_vy0_zero);
         assert_eq!(params.gravity_mps2, DEFAULT_GRAVITY_MPS2);
         assert_eq!(params.air_density_kg_m3, DEFAULT_AIR_DENSITY_KG_M3);
         assert_eq!(params.mass_kg, DEFAULT_MASS_KG);
@@ -2906,6 +3305,8 @@ mod tests {
         assert_eq!(params.initial_wave_amplitude_m, 10.0);
         assert_eq!(params.initial_alpha_deg, 5.0);
         assert_eq!(params.min_altitude_m, 0.5);
+        assert_eq!(params.alpha_rate_regularization, 13.0);
+        assert_eq!(params.roll_rate_regularization, 23.0);
 
         let alpha_best_glide = 0.5 / params.cl_slope_per_rad;
         let best_glide = 0.5 / cd_numeric(alpha_best_glide, &params);
@@ -2984,6 +3385,27 @@ mod tests {
     }
 
     #[test]
+    fn vy0_anchor_checkbox_switches_global_bounds_only() {
+        let mut values = BTreeMap::new();
+        let anchored = Params::from_map(&values).expect("default params should parse");
+        let anchored_bounds = global_bounds(&anchored);
+        assert_eq!(anchored_bounds.vy0.lower, Some(0.0));
+        assert_eq!(anchored_bounds.vy0.upper, Some(0.0));
+
+        let anchored_variant = compile_variant_for_values(&values).expect("anchored variant");
+        values.insert("constrain_vy0_zero".to_string(), 0.0);
+        let relaxed = Params::from_map(&values).expect("relaxed params should parse");
+        let relaxed_bounds = global_bounds(&relaxed);
+        let relaxed_variant = compile_variant_for_values(&values).expect("relaxed variant");
+
+        assert!(!relaxed.constrain_vy0_zero);
+        assert_eq!(anchored_variant, relaxed_variant);
+        assert_eq!(active_design(&relaxed).expect("active design").vy0, 0.0);
+        assert_eq!(relaxed_bounds.vy0.lower, Some(-relaxed.max_airspeed_mps));
+        assert_eq!(relaxed_bounds.vy0.upper, Some(relaxed.max_airspeed_mps));
+    }
+
+    #[test]
     fn free_final_time_must_have_positive_lower_bound() {
         let mut values = BTreeMap::new();
         values.insert("tf_free".to_string(), 1.0);
@@ -3000,6 +3422,21 @@ mod tests {
         let params = Params::default();
         let guess = continuous_guess(&params).expect("default initial guess should be feasible");
         validate_initial_guess(&params, &guess).expect("initial guess should validate");
+    }
+
+    #[test]
+    fn negative_guess_rotation_stays_above_altitude_floor() {
+        let values = BTreeMap::from([("initial_wave_rotation_deg".to_string(), -45.0)]);
+        let params = Params::from_map(&values).expect("params should parse");
+        let guess = continuous_guess(&params).expect("negative rotation guess should be feasible");
+        validate_initial_guess(&params, &guess).expect("negative rotation guess should validate");
+
+        let min_altitude = guess
+            .x_samples
+            .iter()
+            .map(|state| state.pz)
+            .fold(f64::INFINITY, f64::min);
+        assert!(min_altitude >= params.min_altitude_m);
     }
 
     #[test]
@@ -3047,6 +3484,8 @@ mod tests {
         values.insert("oswald_efficiency".to_string(), 0.8);
         values.insert("speed_eps_mps".to_string(), 0.002);
         values.insert("frame_eps".to_string(), 0.0002);
+        values.insert("alpha_rate_regularization".to_string(), 0.002);
+        values.insert("roll_rate_regularization".to_string(), 0.004);
 
         let changed_variant = compile_variant_for_values(&values).expect("changed variant");
         let params = Params::from_map(&values).expect("changed params");
@@ -3063,6 +3502,8 @@ mod tests {
         assert_eq!(model.oswald_efficiency, 0.8);
         assert_eq!(model.speed_eps_mps, 0.002);
         assert_eq!(model.frame_eps, 0.0002);
+        assert_eq!(model.alpha_rate_weight, 0.002);
+        assert_eq!(model.roll_rate_weight, 0.004);
         assert!(
             (induced_drag_factor_numeric(&params) - 1.0 / (std::f64::consts::PI * 12.0 * 0.8))
                 .abs()
@@ -3080,6 +3521,9 @@ mod tests {
             guess.u_samples.clone(),
             guess.dudt_samples.clone(),
             guess.sample_times.clone(),
+            guess.sample_times.clone(),
+            full_segment(guess.sample_times.len()),
+            full_segment(guess.sample_times.len()),
             guess.tf,
             &guess.global,
             Vec::new(),
@@ -3135,30 +3579,182 @@ mod tests {
                 .iter()
                 .any(|path| path.name.starts_with("side frame "))
         );
+        let segment_length = |path: &ScenePath3D| {
+            let dx = path.x[1] - path.x[0];
+            let dy = path.y[1] - path.y[0];
+            let dz = path.z[1] - path.z[0];
+            (dx * dx + dy * dy + dz * dz).sqrt()
+        };
+        let max_accel_glyph = paths
+            .iter()
+            .filter(|path| path.name.starts_with("lift ") || path.name.starts_with("aero accel "))
+            .map(segment_length)
+            .fold(0.0, f64::max);
+        assert!(
+            max_accel_glyph <= 9.0 + 1.0e-9,
+            "acceleration glyphs should be scene-scaled, got {max_accel_glyph}"
+        );
+        let max_drag_glyph = paths
+            .iter()
+            .filter(|path| path.name.starts_with("drag "))
+            .map(segment_length)
+            .fold(0.0, f64::max);
+        assert!(
+            max_drag_glyph <= DRAG_GLYPH_EXAGGERATION * 9.0 + 1.0e-9,
+            "drag glyphs should only exceed normal scale by the configured exaggeration, got {max_drag_glyph}"
+        );
+        let max_wind_glyph = paths
+            .iter()
+            .filter(|path| path.name.starts_with("wind ") && !path.name.starts_with("wind shear"))
+            .map(segment_length)
+            .fold(0.0, f64::max);
+        assert!(
+            max_wind_glyph <= 7.65 + 1.0e-9,
+            "wind glyphs should be scene-scaled, got {max_wind_glyph}"
+        );
 
         let position = artifact
             .charts
             .iter()
-            .find(|chart| chart.title == "Position")
-            .expect("position chart should exist");
+            .find(|chart| chart.title == "Altitude pz")
+            .expect("altitude chart should exist");
         let altitude_lower = position
             .series
             .iter()
             .find(|series| series.name == "pz lower")
-            .expect("position chart should label the altitude lower bound");
+            .expect("altitude chart should label the altitude lower bound");
         assert_eq!(altitude_lower.legend_group.as_deref(), Some("pz"));
 
         let aero_coefficients = artifact
             .charts
             .iter()
-            .find(|chart| chart.title == "Aero Coefficients")
-            .expect("aero coefficient chart should exist");
+            .find(|chart| chart.title == "CL")
+            .expect("CL chart should exist");
         let cl_upper = aero_coefficients
             .series
             .iter()
             .find(|series| series.name == "CL upper")
             .expect("aero coefficient chart should label the CL upper bound");
         assert_eq!(cl_upper.legend_group.as_deref(), Some("CL"));
+
+        let objective_contributions = artifact
+            .charts
+            .iter()
+            .find(|chart| chart.title == "Objective Contributions")
+            .expect("combined objective contribution chart should exist");
+        assert!(
+            !objective_contributions
+                .series
+                .iter()
+                .any(|series| series.name == "objective density")
+        );
+        assert!(
+            objective_contributions
+                .series
+                .iter()
+                .any(|series| series.name == "alpha rate^2/T")
+        );
+        assert!(
+            objective_contributions
+                .series
+                .iter()
+                .any(|series| series.name == "roll rate^2/T")
+        );
+        assert!(
+            objective_contributions
+                .series
+                .iter()
+                .any(|series| series.name == "-wind power/T")
+        );
+        assert_eq!(objective_contributions.series.len(), 3);
+    }
+
+    #[test]
+    fn direct_collocation_rate_plot_samples_stay_interval_local() {
+        let root_rates = vec![
+            IntervalArc {
+                times: vec![0.2, 0.5],
+                values: vec![
+                    Control {
+                        alpha: 1.0,
+                        roll: 10.0,
+                    },
+                    Control {
+                        alpha: 2.0,
+                        roll: 20.0,
+                    },
+                ],
+            },
+            IntervalArc {
+                times: vec![1.2, 1.5],
+                values: vec![
+                    Control {
+                        alpha: 3.0,
+                        roll: 30.0,
+                    },
+                    Control {
+                        alpha: 4.0,
+                        roll: 40.0,
+                    },
+                ],
+            },
+        ];
+
+        let (times, rates, segments) = flatten_interval_arcs(&root_rates);
+        let alpha = rates.iter().map(|rate| rate.alpha).collect::<Vec<_>>();
+        let roll = rates.iter().map(|rate| rate.roll).collect::<Vec<_>>();
+
+        assert_eq!(times, vec![0.2, 0.5, 1.2, 1.5]);
+        assert_eq!(alpha, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(roll, vec![10.0, 20.0, 30.0, 40.0]);
+        assert_eq!(segments, vec![0..2, 2..4]);
+    }
+
+    #[test]
+    fn segmented_trajectory_paths_do_not_bridge_intervals() {
+        let mut paths = Vec::new();
+        let px = vec![0.0, 1.0, 10.0, 11.0];
+        let py = vec![0.0, 0.0, 0.0, 0.0];
+        let pz = vec![1.0, 2.0, 3.0, 4.0];
+        push_segmented_trajectory_paths(&mut paths, &px, &py, &pz, &[0..2, 2..4]);
+
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].name, "trajectory arc 0");
+        assert_eq!(paths[1].name, "trajectory arc 1");
+        assert_eq!(paths[0].x, vec![0.0, 1.0]);
+        assert_eq!(paths[1].x, vec![10.0, 11.0]);
+    }
+
+    #[test]
+    fn wind_work_objective_contributions_label_running_term() {
+        let mut params = Params::default();
+        params.objective = ObjectiveKind::WindWork;
+        let guess = continuous_guess(&params).expect("default guess should build");
+        let artifact = artifact_common(
+            &params,
+            guess.x_samples.clone(),
+            guess.u_samples.clone(),
+            guess.dudt_samples.clone(),
+            guess.sample_times.clone(),
+            guess.sample_times.clone(),
+            full_segment(guess.sample_times.len()),
+            full_segment(guess.sample_times.len()),
+            guess.tf,
+            &guess.global,
+            Vec::new(),
+        );
+        let objective_contributions = artifact
+            .charts
+            .iter()
+            .find(|chart| chart.title == "Objective Contributions")
+            .expect("combined objective contribution chart should exist");
+        assert!(
+            objective_contributions
+                .series
+                .iter()
+                .any(|series| series.name == "-wind power/T")
+        );
+        assert_eq!(objective_contributions.series.len(), 3);
     }
 
     #[test]

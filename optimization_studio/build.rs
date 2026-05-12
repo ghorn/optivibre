@@ -4,6 +4,10 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=OPT_LEVEL");
+    let opt_level = env::var("OPT_LEVEL").unwrap_or_else(|_| "unknown".to_string());
+    println!("cargo:rustc-env=OPTIVIBRE_OPT_LEVEL={opt_level}");
+
     for path in [
         "static/app.ts",
         "static/globals.d.ts",

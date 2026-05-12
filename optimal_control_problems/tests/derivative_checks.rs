@@ -11,9 +11,9 @@ const FIRST_ORDER_TOLERANCES: ValidationTolerances = ValidationTolerances::new(5
 const SECOND_ORDER_TOLERANCES: ValidationTolerances = ValidationTolerances::new(1.0e-4, 1.0e-3);
 
 fn require_release_mode_for_manual_derivative_sweeps() {
-    #[cfg(debug_assertions)]
-    panic!(
-        "manual derivative sweeps must be run in release mode\n\ntry:\n  cargo test -p optimal_control_problems --release --test derivative_checks all_ocp_problems_policy_matrix_first_order_derivatives_stay_clean -- --ignored --nocapture"
+    assert!(
+        !matches!(option_env!("OPTIVIBRE_OPT_LEVEL"), Some("0")),
+        "manual derivative sweeps must be run with an optimized binary; current opt-level=0\n\ntry:\n  cargo test -p optimal_control_problems --release --test derivative_checks all_ocp_problems_policy_matrix_first_order_derivatives_stay_clean -- --ignored --nocapture"
     );
 }
 

@@ -78,10 +78,14 @@ fn parse_positive_u64(value: &str) -> std::result::Result<u64, String> {
 }
 
 fn profile_name() -> &'static str {
-    if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
+    match option_env!("OPTIVIBRE_OPT_LEVEL").unwrap_or("unknown") {
+        "0" => "opt-level=0",
+        "1" => "opt-level=1",
+        "2" => "opt-level=2",
+        "3" => "opt-level=3",
+        "s" => "opt-level=s",
+        "z" => "opt-level=z",
+        _ => "opt-level=unknown",
     }
 }
 
@@ -159,7 +163,7 @@ fn llvm_opt_level() -> LlvmOptimizationLevel {
             _ => {}
         }
     }
-    if cfg!(debug_assertions) {
+    if matches!(option_env!("OPTIVIBRE_OPT_LEVEL"), Some("0")) {
         LlvmOptimizationLevel::O0
     } else {
         LlvmOptimizationLevel::O3

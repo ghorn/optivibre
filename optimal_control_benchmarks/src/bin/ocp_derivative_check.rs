@@ -14,7 +14,7 @@ use optimization::{FiniteDifferenceValidationOptions, ValidationSummary, Validat
 
 fn main() -> Result<()> {
     let cli = OcpDerivativeCli::parse();
-    ensure_release_mode()?;
+    ensure_optimized_build()?;
     let problems = expand_problem_selections(&cli.problems)?;
     let transcriptions = expand_transcription_selections(&cli.transcriptions)?;
     let presets = expand_preset_selections(&cli.presets)?;
@@ -112,10 +112,10 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn ensure_release_mode() -> Result<()> {
-    if cfg!(debug_assertions) {
+fn ensure_optimized_build() -> Result<()> {
+    if matches!(option_env!("OPTIVIBRE_OPT_LEVEL"), Some("0")) {
         bail!(
-            "ocp_derivative_check must be run in release mode\n\ntry:\n  cargo run -p optimal_control_benchmarks --release --bin ocp_derivative_check -- --problems all --transcriptions all --presets all --order first"
+            "ocp_derivative_check was compiled with opt-level=0; derivative-sweep timings require an optimized binary\n\ntry:\n  cargo run -p optimal_control_benchmarks --release --bin ocp_derivative_check -- --problems all --transcriptions all --presets all --order first"
         );
     }
     Ok(())

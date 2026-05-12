@@ -1170,9 +1170,9 @@ fn run_policy_differential(scenario: &'static PropertyScenario) {
 }
 
 fn require_release_mode_for_manual_property_runs() {
-    #[cfg(debug_assertions)]
-    panic!(
-        "manual OCP Jacobian property stress runs must be executed in release mode\n\ntry:\n  cargo test -p optimal_control --release generated_direct_collocation_inequality_stress -- --ignored --nocapture"
+    assert!(
+        !matches!(option_env!("OPTIVIBRE_OPT_LEVEL"), Some("0")),
+        "manual OCP Jacobian property stress runs must be executed with an optimized binary; current opt-level=0\n\ntry:\n  cargo test -p optimal_control --release generated_direct_collocation_inequality_stress -- --ignored --nocapture"
     );
 }
 

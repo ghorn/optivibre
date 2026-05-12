@@ -18,17 +18,17 @@ use sx_core::{HessianStrategy, SX};
 use crate::benchmark_report::{BenchmarkCaseProgress, OcpBenchmarkPreset, OcpBenchmarkRecord};
 use crate::common::{
     ArtifactVisualization, Chart, CompileCacheStatus, CompileProgressInfo, CompileProgressUpdate,
-    ConstraintPanelCategory, ConstraintPanelEntry, ConstraintPanelSeverity, ConstraintPanels,
-    ControlSection, ControlSemantic, ControlSpec, ControlVisibility, FromMap, LatexSection,
-    MetricKey, PlotMode, ProblemDerivativeCheck, ProblemId, ProblemSpec, Scene2D, SceneCircle,
-    ScenePath, ScenePath3D, SharedCompileCache, SolveArtifact, SolveStage, SolveStatus,
-    SolveStreamEvent, SolverConfig, SolverMethod, SolverPhaseDetail, SolverPhaseDetails,
-    SolverReport, TimeSeries, TimeSeriesRole, append_nlip_termination_metric,
-    append_termination_metric, cached_compile_with_progress, compile_cache_status,
-    default_solver_config, metric_with_key, nlip_failure_solver_report, nlip_options,
-    nlip_progress, numeric_metric_with_key, problem_slider_control, problem_spec, select_control,
-    solver_config_from_map, solver_controls, solver_method_from_map, sqp_failure_solver_report,
-    sqp_options, sqp_progress, summarize_backend_compile_report,
+    ConstraintPanelBoundSide, ConstraintPanelCategory, ConstraintPanelEntry,
+    ConstraintPanelSeverity, ConstraintPanels, ControlSection, ControlSemantic, ControlSpec,
+    ControlVisibility, FromMap, LatexSection, MetricKey, PlotMode, ProblemDerivativeCheck,
+    ProblemId, ProblemSpec, Scene2D, SceneCircle, ScenePath, ScenePath3D, SharedCompileCache,
+    SolveArtifact, SolveStage, SolveStatus, SolveStreamEvent, SolverConfig, SolverMethod,
+    SolverPhaseDetail, SolverPhaseDetails, SolverReport, TimeSeries, TimeSeriesRole,
+    append_nlip_termination_metric, append_termination_metric, cached_compile_with_progress,
+    compile_cache_status, default_solver_config, metric_with_key, nlip_failure_solver_report,
+    nlip_options, nlip_progress, numeric_metric_with_key, problem_slider_control, problem_spec,
+    select_control, solver_config_from_map, solver_controls, solver_method_from_map,
+    sqp_failure_solver_report, sqp_options, sqp_progress, summarize_backend_compile_report,
 };
 #[cfg(feature = "ipopt")]
 use crate::common::{
@@ -1395,6 +1395,14 @@ fn panel_severity(value: f64, tolerance: f64) -> ConstraintPanelSeverity {
     }
 }
 
+fn active_bound_tolerance(tolerance: f64) -> f64 {
+    if tolerance.is_finite() && tolerance > 0.0 {
+        (100.0 * tolerance).max(1.0e-8)
+    } else {
+        1.0e-8
+    }
+}
+
 fn equality_entry(
     label: impl Into<String>,
     violation: f64,
@@ -1411,6 +1419,14 @@ fn equality_entry(
         upper_bound: None,
         lower_severity: None,
         upper_severity: None,
+        bound_side: None,
+        active_bound_side: None,
+        active_instances: None,
+        lower_active_instances: None,
+        upper_active_instances: None,
+        min_active_margin: None,
+        min_lower_margin: None,
+        min_upper_margin: None,
     }
 }
 
@@ -1421,6 +1437,8 @@ fn inequality_entry(
     tolerance: f64,
 ) -> ConstraintPanelEntry {
     let violation = (value - upper_bound).max(0.0);
+    let upper_distance = (upper_bound - value).abs();
+    let upper_active = upper_distance <= active_bound_tolerance(tolerance);
     ConstraintPanelEntry {
         label: label.into(),
         category: ConstraintPanelCategory::Path,
@@ -1432,6 +1450,22 @@ fn inequality_entry(
         upper_bound: Some(upper_bound),
         lower_severity: None,
         upper_severity: Some(panel_severity(violation, tolerance)),
+        bound_side: Some(if violation > 0.0 {
+            ConstraintPanelBoundSide::Upper
+        } else {
+            ConstraintPanelBoundSide::None
+        }),
+        active_bound_side: Some(if upper_active {
+            ConstraintPanelBoundSide::Upper
+        } else {
+            ConstraintPanelBoundSide::None
+        }),
+        active_instances: Some(usize::from(upper_active)),
+        lower_active_instances: Some(0),
+        upper_active_instances: Some(usize::from(upper_active)),
+        min_active_margin: Some(upper_distance),
+        min_lower_margin: None,
+        min_upper_margin: Some(upper_distance),
     }
 }
 

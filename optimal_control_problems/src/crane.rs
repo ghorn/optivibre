@@ -1188,8 +1188,8 @@ mod tests {
 
     fn require_release_mode_for_manual_hessian_checks() {
         assert!(
-            !cfg!(debug_assertions),
-            "manual crane Hessian policy checks must be run in release mode\n\ntry:\n  cargo test -p optimal_control_problems --release direct_collocation_hessian_policies_stay_clean -- --ignored --nocapture"
+            !matches!(option_env!("OPTIVIBRE_OPT_LEVEL"), Some("0")),
+            "manual crane Hessian policy checks must be run with an optimized binary; current opt-level=0\n\ntry:\n  cargo test -p optimal_control_problems --release direct_collocation_hessian_policies_stay_clean -- --ignored --nocapture"
         );
     }
 

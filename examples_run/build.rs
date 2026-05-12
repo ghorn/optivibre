@@ -80,6 +80,10 @@ fn write_llvm_wrapper_bundle(
 }
 
 fn main() -> Result<()> {
+    println!("cargo:rerun-if-env-changed=OPT_LEVEL");
+    let opt_level = env::var("OPT_LEVEL").unwrap_or_else(|_| "unknown".to_string());
+    println!("cargo:rustc-env=OPTIVIBRE_OPT_LEVEL={opt_level}");
+
     let out_dir = PathBuf::from(env::var("OUT_DIR")?).canonicalize()?;
     write_llvm_wrapper_bundle(
         &out_dir.join("generated_examples_llvm_aot.rs"),

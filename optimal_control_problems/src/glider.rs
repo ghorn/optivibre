@@ -11013,15 +11013,15 @@ mod tests {
 
     fn require_release_mode_for_manual_policy_checks() {
         assert!(
-            !cfg!(debug_assertions),
-            "manual reduced glider Jacobian policy checks must be run in release mode\n\ntry:\n  cargo test -p optimal_control_problems --release reduced_direct_collocation_jacobian_policies_stay_clean -- --ignored"
+            !matches!(option_env!("OPTIVIBRE_OPT_LEVEL"), Some("0")),
+            "manual reduced glider Jacobian policy checks must be run with an optimized binary; current opt-level=0\n\ntry:\n  cargo test -p optimal_control_problems --release reduced_direct_collocation_jacobian_policies_stay_clean -- --ignored"
         );
     }
 
     fn require_release_mode_for_manual_hessian_checks() {
         assert!(
-            !cfg!(debug_assertions),
-            "manual glider Hessian policy checks must be run in release mode\n\ntry:\n  cargo test -p optimal_control_problems --release direct_collocation_hessian_policies_stay_clean -- --ignored --nocapture"
+            !matches!(option_env!("OPTIVIBRE_OPT_LEVEL"), Some("0")),
+            "manual glider Hessian policy checks must be run with an optimized binary; current opt-level=0\n\ntry:\n  cargo test -p optimal_control_problems --release direct_collocation_hessian_policies_stay_clean -- --ignored --nocapture"
         );
     }
 

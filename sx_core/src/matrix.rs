@@ -76,6 +76,10 @@ const JACOBIAN_BATCH_WIDTH: usize = 8;
 
 type HessianRowSupports = (SX, Vec<Vec<Index>>, Vec<Vec<Index>>);
 
+fn non_optimized_build() -> bool {
+    matches!(option_env!("OPTIVIBRE_OPT_LEVEL"), Some("0"))
+}
+
 impl SXMatrix {
     fn build_lower_triangle(size: Index, columns: Vec<Vec<(Index, SX)>>) -> Result<SXMatrix> {
         let mut positions = Vec::new();
@@ -444,6 +448,12 @@ impl SXMatrix {
         wrt: &SXMatrix,
         options: HessianOptions,
     ) -> Result<SXMatrix> {
+        if non_optimized_build() {
+            eprintln!(
+                "warning: symbolic Hessian generation is running in a non-optimized build (opt-level=0); this can be substantially slower than optimized builds"
+            );
+        }
+
         match options.strategy {
             HessianStrategy::LowerTriangleByColumn => self.hessian_lower_triangle_by_column(wrt),
             HessianStrategy::LowerTriangleSelectedOutputs => {

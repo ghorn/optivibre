@@ -194,7 +194,19 @@ fn static_text_response(content_type: &'static str, body: &'static str) -> impl 
 }
 
 async fn index() -> impl IntoResponse {
-    static_text_response(TEXT_HTML_UTF8, include_str!("../static/index.html"))
+    let debug_pill = if matches!(option_env!("OPTIVIBRE_OPT_LEVEL"), Some("0")) {
+        r#"<div class="debug-mode-pill" title="This server was compiled with opt-level=0. Symbolic setup and Hessian generation can be much slower than optimized builds.">DEBUG MODE</div>"#
+    } else {
+        ""
+    };
+    let body = include_str!("../static/index.html").replace("<!-- debug-mode-pill -->", debug_pill);
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(TEXT_HTML_UTF8),
+        )],
+        body,
+    )
 }
 
 async fn app_js() -> impl IntoResponse {

@@ -51,6 +51,26 @@ body {
   padding: 16px;
 }
 
+.debug-mode-pill {
+  grid-column: 1 / -1;
+  justify-self: start;
+  display: inline-flex;
+  align-items: center;
+  min-height: 42px;
+  padding: 10px 18px;
+  border: 1px solid rgba(255, 213, 150, 0.72);
+  border-radius: 999px;
+  background: linear-gradient(135deg, #ffb347, #f7811d);
+  color: #1b0d02;
+  box-shadow: 0 14px 34px rgba(247, 129, 29, 0.28);
+  font-family: "Avenir Next", Futura, "Trebuchet MS", sans-serif;
+  font-size: 1rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
 .panel {
   background: var(--panel);
   border: 1px solid var(--line);
@@ -311,6 +331,38 @@ h2 {
 .control-panel-body {
   display: grid;
   gap: 10px;
+}
+
+.control-subgroup {
+  display: grid;
+  gap: 9px;
+  padding: 10px;
+  border-radius: 12px;
+  background: rgba(2, 12, 18, 0.42);
+  border: 1px solid rgba(177, 214, 222, 0.11);
+}
+
+.control-subgroup-header {
+  display: grid;
+  gap: 3px;
+}
+
+.control-subgroup-title {
+  font-family: "Avenir Next", Futura, "Trebuchet MS", sans-serif;
+  font-weight: 700;
+  font-size: 0.78rem;
+  color: var(--accent-2);
+}
+
+.control-subgroup-help {
+  color: var(--muted);
+  font-size: 0.75rem;
+  line-height: 1.32;
+}
+
+.control-subgroup-body {
+  display: grid;
+  gap: 9px;
 }
 
 .solve-button,
@@ -717,7 +769,7 @@ select {
 
 .content-grid {
   display: grid;
-  grid-template-columns: minmax(320px, 0.88fr) minmax(420px, 1.12fr);
+  grid-template-columns: minmax(300px, 0.78fr) minmax(560px, 1.22fr);
   gap: 16px;
 }
 
@@ -808,11 +860,16 @@ select {
 
 .charts {
   display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 480px), 1fr));
   gap: 14px;
 }
 
+.chart-shell-3d {
+  grid-column: 1 / -1;
+}
+
 .plot-surface {
-  min-height: 260px;
+  min-height: 280px;
   border-radius: 16px;
   background:
     radial-gradient(circle at top left, rgba(124, 198, 254, 0.06), transparent 35%),
@@ -843,7 +900,7 @@ select {
   grid-column: 1 / -1;
   grid-row: 2;
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
 }
 
@@ -1511,6 +1568,10 @@ select {
   .solve-filter-plot {
     min-height: 300px;
     max-height: none;
+  }
+
+  .charts {
+    grid-template-columns: 1fr;
   }
 
   .compile-cache-row {

@@ -467,9 +467,9 @@ fn generated_jacobians_domain_ops_ci() {
 }
 
 fn require_release_mode_for_manual_property_runs() {
-    #[cfg(debug_assertions)]
-    panic!(
-        "manual Jacobian property stress runs must be executed in release mode\n\ntry:\n  cargo test -p sx_codegen_llvm --release --test generated_jacobian_props generated_jacobians_stress -- --ignored"
+    assert!(
+        !matches!(option_env!("OPTIVIBRE_OPT_LEVEL"), Some("0")),
+        "manual Jacobian property stress runs must be executed with an optimized binary; current opt-level=0\n\ntry:\n  cargo test -p sx_codegen_llvm --release --test generated_jacobian_props generated_jacobians_stress -- --ignored"
     );
 }
 
