@@ -364,6 +364,8 @@ pub struct MultipleShootingRuntimeValues<
     U,
     G = FinalTime<f64>,
     GBounds = FinalTime<Bounds1D>,
+    CScale = Vec<f64>,
+    BineqScale = Vec<f64>,
 > {
     pub parameters: P,
     pub beq: Beq,
@@ -371,7 +373,7 @@ pub struct MultipleShootingRuntimeValues<
     pub path_bounds: C,
     pub global_bounds: GBounds,
     pub initial_guess: MultipleShootingInitialGuess<X, U, P, G>,
-    pub scaling: Option<OcpScaling<P, X, U, G>>,
+    pub scaling: Option<OcpScaling<P, X, U, CScale, Beq, BineqScale, G>>,
 }
 
 pub struct DirectCollocationRuntimeValues<
@@ -383,6 +385,8 @@ pub struct DirectCollocationRuntimeValues<
     U,
     G = FinalTime<f64>,
     GBounds = FinalTime<Bounds1D>,
+    CScale = Vec<f64>,
+    BineqScale = Vec<f64>,
 > {
     pub parameters: P,
     pub beq: Beq,
@@ -390,7 +394,7 @@ pub struct DirectCollocationRuntimeValues<
     pub path_bounds: C,
     pub global_bounds: GBounds,
     pub initial_guess: DirectCollocationInitialGuess<X, U, P, G>,
-    pub scaling: Option<OcpScaling<P, X, U, G>>,
+    pub scaling: Option<OcpScaling<P, X, U, CScale, Beq, BineqScale, G>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1870,8 +1874,10 @@ where
     Numeric<X>: Vectorize<f64, Rebind<f64> = Numeric<X>> + Clone,
     Numeric<U>: Vectorize<f64, Rebind<f64> = Numeric<U>> + Clone,
     Numeric<P>: Vectorize<f64, Rebind<f64> = Numeric<P>> + Clone,
+    Numeric<C>: Vectorize<f64, Rebind<f64> = Numeric<C>>,
     Numeric<G>: OcpGlobalDesign<f64> + Vectorize<f64, Rebind<f64> = Numeric<G>> + Clone,
     Numeric<Beq>: Vectorize<f64, Rebind<f64> = Numeric<Beq>> + Clone,
+    Numeric<Bineq>: Vectorize<f64, Rebind<f64> = Numeric<Bineq>>,
     BoundTemplate<G>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<G>> + Clone,
     BoundTemplate<C>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<C>>,
     BoundTemplate<Bineq>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<Bineq>>,
@@ -1913,6 +1919,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
     ) -> AnyResult<Vec<f64>> {
         Ok(self.build_initial_guess(values)?)
@@ -1930,6 +1938,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
     ) -> AnyResult<(RuntimeNlpBounds, Option<RuntimeNlpScaling>)> {
         Ok(self.build_runtime_bounds(values)?)
@@ -1951,6 +1961,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
         options: NlpEvaluationBenchmarkOptions,
     ) -> AnyResult<NlpEvaluationBenchmark> {
@@ -1968,6 +1980,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
         options: NlpEvaluationBenchmarkOptions,
         on_progress: CB,
@@ -1999,6 +2013,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
         equality_multipliers: &[f64],
         inequality_multipliers: &[f64],
@@ -2026,6 +2042,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
         options: &ClarabelSqpOptions,
     ) -> Result<MultipleShootingSqpSolveResult<Numeric<X>, Numeric<U>, Numeric<G>>, ClarabelSqpError>
@@ -2074,6 +2092,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
         options: &ClarabelSqpOptions,
         mut callback: CB,
@@ -2137,6 +2157,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
         options: &InteriorPointOptions,
     ) -> Result<
@@ -2187,6 +2209,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
         options: &InteriorPointOptions,
         mut callback: CB,
@@ -2214,6 +2238,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
         options: &InteriorPointOptions,
         mut callback: CB,
@@ -2283,6 +2309,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
         options: &IpoptOptions,
     ) -> Result<MultipleShootingIpoptSolveResult<Numeric<X>, Numeric<U>, Numeric<G>>, IpoptSolveError>
@@ -2332,6 +2360,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
         options: &IpoptOptions,
         mut callback: CB,
@@ -2445,6 +2475,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
         trajectories: &MultipleShootingTrajectories<Numeric<X>, Numeric<U>, Numeric<G>>,
         tolerance: f64,
@@ -2570,6 +2602,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
     ) -> Result<Vec<f64>, GuessError> {
         let trajectories = match &values.initial_guess {
@@ -2652,6 +2686,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
     ) -> Result<(RuntimeNlpBounds, Option<RuntimeNlpScaling>), GuessError> {
         let runtime_params: OcpParametersNum<P, Beq> =
@@ -2697,27 +2733,39 @@ where
 
     fn build_nlp_scaling(
         &self,
-        scaling: &OcpScaling<Numeric<P>, Numeric<X>, Numeric<U>, Numeric<G>>,
+        scaling: &OcpScaling<
+            Numeric<P>,
+            Numeric<X>,
+            Numeric<U>,
+            Numeric<C>,
+            Numeric<Beq>,
+            Numeric<Bineq>,
+            Numeric<G>,
+        >,
     ) -> Result<RuntimeNlpScaling, GuessError> {
-        if scaling.path.len() != C::LEN {
+        let path_scale = flatten_value(&scaling.path);
+        let boundary_eq_scale = flatten_value(&scaling.boundary_equalities);
+        let boundary_ineq_scale = flatten_value(&scaling.boundary_inequalities);
+
+        if path_scale.len() != C::LEN {
             return Err(GuessError::Invalid(format!(
                 "path scaling length mismatch: expected {}, got {}",
                 C::LEN,
-                scaling.path.len()
+                path_scale.len()
             )));
         }
-        if scaling.boundary_equalities.len() != Beq::LEN {
+        if boundary_eq_scale.len() != Beq::LEN {
             return Err(GuessError::Invalid(format!(
                 "boundary equality scaling length mismatch: expected {}, got {}",
                 Beq::LEN,
-                scaling.boundary_equalities.len()
+                boundary_eq_scale.len()
             )));
         }
-        if scaling.boundary_inequalities.len() != Bineq::LEN {
+        if boundary_ineq_scale.len() != Bineq::LEN {
             return Err(GuessError::Invalid(format!(
                 "boundary inequality scaling length mismatch: expected {}, got {}",
                 Bineq::LEN,
-                scaling.boundary_inequalities.len()
+                boundary_ineq_scale.len()
             )));
         }
 
@@ -2745,10 +2793,10 @@ where
         for _ in 0..self.scheme.intervals {
             constraints.extend_from_slice(&control_scale);
         }
-        constraints.extend_from_slice(&scaling.boundary_equalities);
-        constraints.extend_from_slice(&scaling.boundary_inequalities);
+        constraints.extend_from_slice(&boundary_eq_scale);
+        constraints.extend_from_slice(&boundary_ineq_scale);
         for _ in 0..self.scheme.intervals {
-            constraints.extend_from_slice(&scaling.path);
+            constraints.extend_from_slice(&path_scale);
         }
         let _ = &scaling.parameters;
         Ok(RuntimeNlpScaling {
@@ -3038,15 +3086,21 @@ where
                 )?;
                 collocation_x.extend(
                     subtract_vectorized(
-                        &scale_vectorized(&xdot, step)?,
-                        &weighted_sum_vectorized(&basis_x, &coeffs.c_matrix[root])?,
+                        &xdot,
+                        &scale_vectorized(
+                            &weighted_sum_vectorized(&basis_x, &coeffs.c_matrix[root])?,
+                            1.0 / step,
+                        )?,
                     )?
                     .flatten_cloned(),
                 );
                 collocation_u.extend(
                     subtract_vectorized(
-                        &scale_vectorized(&root_dudt.intervals[interval][root], step)?,
-                        &weighted_sum_vectorized(&basis_u, &coeffs.c_matrix[root])?,
+                        &root_dudt.intervals[interval][root],
+                        &scale_vectorized(
+                            &weighted_sum_vectorized(&basis_u, &coeffs.c_matrix[root])?,
+                            1.0 / step,
+                        )?,
                     )?
                     .flatten_cloned(),
                 );
@@ -3357,8 +3411,10 @@ where
     Numeric<X>: Vectorize<f64, Rebind<f64> = Numeric<X>> + Clone,
     Numeric<U>: Vectorize<f64, Rebind<f64> = Numeric<U>> + Clone,
     Numeric<P>: Vectorize<f64, Rebind<f64> = Numeric<P>> + Clone,
+    Numeric<C>: Vectorize<f64, Rebind<f64> = Numeric<C>>,
     Numeric<G>: OcpGlobalDesign<f64> + Vectorize<f64, Rebind<f64> = Numeric<G>> + Clone,
     Numeric<Beq>: Vectorize<f64, Rebind<f64> = Numeric<Beq>> + Clone,
+    Numeric<Bineq>: Vectorize<f64, Rebind<f64> = Numeric<Bineq>>,
     BoundTemplate<G>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<G>> + Clone,
     BoundTemplate<C>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<C>>,
     BoundTemplate<Bineq>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<Bineq>>,
@@ -3400,6 +3456,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
     ) -> AnyResult<Vec<f64>> {
         Ok(self.build_initial_guess(values)?)
@@ -3417,6 +3475,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
     ) -> AnyResult<(RuntimeNlpBounds, Option<RuntimeNlpScaling>)> {
         Ok(self.build_runtime_bounds(values)?)
@@ -3433,6 +3493,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
         options: NlpEvaluationBenchmarkOptions,
     ) -> AnyResult<NlpEvaluationBenchmark> {
@@ -3450,6 +3512,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
         options: NlpEvaluationBenchmarkOptions,
         on_progress: CB,
@@ -3481,6 +3545,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
         equality_multipliers: &[f64],
         inequality_multipliers: &[f64],
@@ -3517,6 +3583,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
         options: &ClarabelSqpOptions,
     ) -> Result<DirectCollocationSqpSolveResult<Numeric<X>, Numeric<U>, Numeric<G>>, ClarabelSqpError>
@@ -3567,6 +3635,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
         options: &ClarabelSqpOptions,
         mut callback: CB,
@@ -3633,6 +3703,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
         options: &InteriorPointOptions,
     ) -> Result<
@@ -3685,6 +3757,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
         options: &InteriorPointOptions,
         mut callback: CB,
@@ -3712,6 +3786,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
         options: &InteriorPointOptions,
         mut callback: CB,
@@ -3784,6 +3860,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
         options: &IpoptOptions,
     ) -> Result<
@@ -3837,6 +3915,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
         options: &IpoptOptions,
         mut callback: CB,
@@ -3906,6 +3986,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
         trajectories: &DirectCollocationTrajectories<Numeric<X>, Numeric<U>, Numeric<G>>,
         tolerance: f64,
@@ -4068,6 +4150,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
     ) -> Result<Vec<f64>, GuessError> {
         let trajectories = match &values.initial_guess {
@@ -4179,6 +4263,8 @@ where
             Numeric<U>,
             Numeric<G>,
             BoundTemplate<G>,
+            Numeric<C>,
+            Numeric<Bineq>,
         >,
     ) -> Result<(RuntimeNlpBounds, Option<RuntimeNlpScaling>), GuessError> {
         let runtime_params: OcpParametersNum<P, Beq> =
@@ -4224,27 +4310,39 @@ where
 
     fn build_nlp_scaling(
         &self,
-        scaling: &OcpScaling<Numeric<P>, Numeric<X>, Numeric<U>, Numeric<G>>,
+        scaling: &OcpScaling<
+            Numeric<P>,
+            Numeric<X>,
+            Numeric<U>,
+            Numeric<C>,
+            Numeric<Beq>,
+            Numeric<Bineq>,
+            Numeric<G>,
+        >,
     ) -> Result<RuntimeNlpScaling, GuessError> {
-        if scaling.path.len() != C::LEN {
+        let path_scale = flatten_value(&scaling.path);
+        let boundary_eq_scale = flatten_value(&scaling.boundary_equalities);
+        let boundary_ineq_scale = flatten_value(&scaling.boundary_inequalities);
+
+        if path_scale.len() != C::LEN {
             return Err(GuessError::Invalid(format!(
                 "path scaling length mismatch: expected {}, got {}",
                 C::LEN,
-                scaling.path.len()
+                path_scale.len()
             )));
         }
-        if scaling.boundary_equalities.len() != Beq::LEN {
+        if boundary_eq_scale.len() != Beq::LEN {
             return Err(GuessError::Invalid(format!(
                 "boundary equality scaling length mismatch: expected {}, got {}",
                 Beq::LEN,
-                scaling.boundary_equalities.len()
+                boundary_eq_scale.len()
             )));
         }
-        if scaling.boundary_inequalities.len() != Bineq::LEN {
+        if boundary_ineq_scale.len() != Bineq::LEN {
             return Err(GuessError::Invalid(format!(
                 "boundary inequality scaling length mismatch: expected {}, got {}",
                 Bineq::LEN,
-                scaling.boundary_inequalities.len()
+                boundary_ineq_scale.len()
             )));
         }
 
@@ -4270,16 +4368,18 @@ where
         variables.extend(flatten_value(&scaling.global));
 
         let state_scale = flatten_value(&scaling.state);
+        let state_derivative_scale = flatten_value(&scaling.state_derivative);
         let control_scale = flatten_value(&scaling.control);
+        let control_rate_scale = flatten_value(&scaling.control_rate);
         let mut constraints = Vec::with_capacity(
             dc_equality_count::<X, U>(self.scheme.intervals, self.scheme.order)
                 + dc_inequality_count::<C, Beq, Bineq>(self.scheme.intervals, self.scheme.order),
         );
         for _ in 0..(self.scheme.intervals * self.scheme.order) {
-            constraints.extend_from_slice(&state_scale);
+            constraints.extend_from_slice(&state_derivative_scale);
         }
         for _ in 0..(self.scheme.intervals * self.scheme.order) {
-            constraints.extend_from_slice(&control_scale);
+            constraints.extend_from_slice(&control_rate_scale);
         }
         for _ in 0..self.scheme.intervals {
             constraints.extend_from_slice(&state_scale);
@@ -4287,10 +4387,10 @@ where
         for _ in 0..self.scheme.intervals {
             constraints.extend_from_slice(&control_scale);
         }
-        constraints.extend_from_slice(&scaling.boundary_equalities);
-        constraints.extend_from_slice(&scaling.boundary_inequalities);
+        constraints.extend_from_slice(&boundary_eq_scale);
+        constraints.extend_from_slice(&boundary_ineq_scale);
         for _ in 0..(self.scheme.intervals * self.scheme.order) {
-            constraints.extend_from_slice(&scaling.path);
+            constraints.extend_from_slice(&path_scale);
         }
         let _ = &scaling.parameters;
         Ok(RuntimeNlpScaling {

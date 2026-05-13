@@ -2606,7 +2606,20 @@ pub type MultipleShootingRuntimeValues<
     U,
     G = FinalTime<f64>,
     GBounds = FinalTime<Bounds1D>,
-> = ocp_runtime::MultipleShootingRuntimeValues<P, C, Beq, Bineq, X, U, G, GBounds>;
+    CScale = Vec<f64>,
+    BineqScale = Vec<f64>,
+> = ocp_runtime::MultipleShootingRuntimeValues<
+    P,
+    C,
+    Beq,
+    Bineq,
+    X,
+    U,
+    G,
+    GBounds,
+    CScale,
+    BineqScale,
+>;
 pub type DirectCollocationRuntimeValues<
     P,
     C,
@@ -2616,7 +2629,20 @@ pub type DirectCollocationRuntimeValues<
     U,
     G = FinalTime<f64>,
     GBounds = FinalTime<Bounds1D>,
-> = ocp_runtime::DirectCollocationRuntimeValues<P, C, Beq, Bineq, X, U, G, GBounds>;
+    CScale = Vec<f64>,
+    BineqScale = Vec<f64>,
+> = ocp_runtime::DirectCollocationRuntimeValues<
+    P,
+    C,
+    Beq,
+    Bineq,
+    X,
+    U,
+    G,
+    GBounds,
+    CScale,
+    BineqScale,
+>;
 pub type MultipleShootingTrajectories<X, U, G = FinalTime<f64>> =
     ocp_runtime::MultipleShootingTrajectories<X, U, G>;
 pub type DirectCollocationTrajectories<X, U, G = FinalTime<f64>> =
@@ -2715,7 +2741,22 @@ impl<X, U, P, G> ContinuousInitialGuess<X, U, P, G> {
 
 pub fn multiple_shooting_runtime_from_spec<P, C, Beq, Bineq, X, U>(
     spec: OcpRuntimeSpec<P, C, Beq, Bineq, X, U>,
-) -> ocp_runtime::MultipleShootingRuntimeValues<P, C, Beq, Bineq, X, U> {
+) -> ocp_runtime::MultipleShootingRuntimeValues<
+    P,
+    C,
+    Beq,
+    Bineq,
+    X,
+    U,
+    FinalTime<f64>,
+    FinalTime<Bounds1D>,
+    <C as Vectorize<Bounds1D>>::Rebind<f64>,
+    <Bineq as Vectorize<Bounds1D>>::Rebind<f64>,
+>
+where
+    C: Vectorize<Bounds1D>,
+    Bineq: Vectorize<Bounds1D>,
+{
     ocp_runtime::MultipleShootingRuntimeValues {
         parameters: spec.parameters,
         beq: spec.beq,
@@ -2729,7 +2770,22 @@ pub fn multiple_shooting_runtime_from_spec<P, C, Beq, Bineq, X, U>(
 
 pub fn direct_collocation_runtime_from_spec<P, C, Beq, Bineq, X, U>(
     spec: OcpRuntimeSpec<P, C, Beq, Bineq, X, U>,
-) -> ocp_runtime::DirectCollocationRuntimeValues<P, C, Beq, Bineq, X, U> {
+) -> ocp_runtime::DirectCollocationRuntimeValues<
+    P,
+    C,
+    Beq,
+    Bineq,
+    X,
+    U,
+    FinalTime<f64>,
+    FinalTime<Bounds1D>,
+    <C as Vectorize<Bounds1D>>::Rebind<f64>,
+    <Bineq as Vectorize<Bounds1D>>::Rebind<f64>,
+>
+where
+    C: Vectorize<Bounds1D>,
+    Bineq: Vectorize<Bounds1D>,
+{
     ocp_runtime::DirectCollocationRuntimeValues {
         parameters: spec.parameters,
         beq: spec.beq,
@@ -2941,6 +2997,8 @@ where
         MsCompiled::UNum,
         MsCompiled::GNum,
         MsCompiled::GBounds,
+        MsCompiled::CScale,
+        MsCompiled::BineqScale,
     >,
     DcRuntimeFn: Fn(
         &Params,
@@ -2953,6 +3011,8 @@ where
         DcCompiled::UNum,
         DcCompiled::GNum,
         DcCompiled::GBounds,
+        DcCompiled::CScale,
+        DcCompiled::BineqScale,
     >,
     MsArtifact: FnMut(
         &MultipleShootingTrajectories<MsCompiled::XNum, MsCompiled::UNum, MsCompiled::GNum>,
@@ -3037,6 +3097,8 @@ where
         MsCompiled::UNum,
         MsCompiled::GNum,
         MsCompiled::GBounds,
+        MsCompiled::CScale,
+        MsCompiled::BineqScale,
     >,
     DcRuntimeFn: Fn(
         &Params,
@@ -3049,6 +3111,8 @@ where
         DcCompiled::UNum,
         DcCompiled::GNum,
         DcCompiled::GBounds,
+        DcCompiled::CScale,
+        DcCompiled::BineqScale,
     >,
     MsArtifact: FnMut(
         &MultipleShootingTrajectories<MsCompiled::XNum, MsCompiled::UNum, MsCompiled::GNum>,
@@ -3142,6 +3206,8 @@ where
         MsCompiled::UNum,
         MsCompiled::GNum,
         MsCompiled::GBounds,
+        MsCompiled::CScale,
+        MsCompiled::BineqScale,
     >,
     DcRuntimeFn: Fn(
         &Params,
@@ -3154,6 +3220,8 @@ where
         DcCompiled::UNum,
         DcCompiled::GNum,
         DcCompiled::GBounds,
+        DcCompiled::CScale,
+        DcCompiled::BineqScale,
     >,
     E: Into<anyhow::Error>,
 {
@@ -3263,6 +3331,8 @@ where
         MsCompiled::UNum,
         MsCompiled::GNum,
         MsCompiled::GBounds,
+        MsCompiled::CScale,
+        MsCompiled::BineqScale,
     >,
     DcRuntimeFn: Fn(
         &Params,
@@ -3275,6 +3345,8 @@ where
         DcCompiled::UNum,
         DcCompiled::GNum,
         DcCompiled::GBounds,
+        DcCompiled::CScale,
+        DcCompiled::BineqScale,
     >,
 {
     match transcription {
@@ -7460,6 +7532,8 @@ fn try_attach_multiple_shooting_constraint_panels<Compiled>(
         Compiled::UNum,
         Compiled::GNum,
         Compiled::GBounds,
+        Compiled::CScale,
+        Compiled::BineqScale,
     >,
     trajectories: &MultipleShootingTrajectories<Compiled::XNum, Compiled::UNum, Compiled::GNum>,
     tolerance: f64,
@@ -7484,6 +7558,8 @@ fn try_attach_direct_collocation_constraint_panels<Compiled>(
         Compiled::UNum,
         Compiled::GNum,
         Compiled::GBounds,
+        Compiled::CScale,
+        Compiled::BineqScale,
     >,
     trajectories: &DirectCollocationTrajectories<Compiled::XNum, Compiled::UNum, Compiled::GNum>,
     tolerance: f64,
@@ -7513,6 +7589,8 @@ pub trait MultipleShootingCompiled: CompiledOcpMetadata {
     type UNum: Clone;
     type GNum: Clone;
     type GBounds;
+    type CScale;
+    type BineqScale;
 
     fn run_sqp(
         &self,
@@ -7525,6 +7603,8 @@ pub trait MultipleShootingCompiled: CompiledOcpMetadata {
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &ClarabelSqpOptions,
     ) -> Result<MultipleShootingSqpSolveResult<Self::XNum, Self::UNum, Self::GNum>>;
@@ -7540,6 +7620,8 @@ pub trait MultipleShootingCompiled: CompiledOcpMetadata {
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &ClarabelSqpOptions,
         callback: CB,
@@ -7558,6 +7640,8 @@ pub trait MultipleShootingCompiled: CompiledOcpMetadata {
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &InteriorPointOptions,
     ) -> Result<MultipleShootingInteriorPointSolveResult<Self::XNum, Self::UNum, Self::GNum>>;
@@ -7577,6 +7661,8 @@ pub trait MultipleShootingCompiled: CompiledOcpMetadata {
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &InteriorPointOptions,
         callback: CB,
@@ -7595,6 +7681,8 @@ pub trait MultipleShootingCompiled: CompiledOcpMetadata {
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &InteriorPointOptions,
         callback: CB,
@@ -7616,6 +7704,8 @@ pub trait MultipleShootingCompiled: CompiledOcpMetadata {
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &IpoptOptions,
     ) -> Result<MultipleShootingIpoptSolveResult<Self::XNum, Self::UNum, Self::GNum>>;
@@ -7632,6 +7722,8 @@ pub trait MultipleShootingCompiled: CompiledOcpMetadata {
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &IpoptOptions,
         callback: CB,
@@ -7656,6 +7748,8 @@ pub trait MultipleShootingCompiled: CompiledOcpMetadata {
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         trajectories: &MultipleShootingTrajectories<Self::XNum, Self::UNum, Self::GNum>,
         tolerance: f64,
@@ -7672,6 +7766,8 @@ pub trait MultipleShootingCompiled: CompiledOcpMetadata {
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         equality_multipliers: &[f64],
         inequality_multipliers: &[f64],
@@ -7689,6 +7785,8 @@ pub trait MultipleShootingCompiled: CompiledOcpMetadata {
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: NlpEvaluationBenchmarkOptions,
         on_progress: CB,
@@ -7706,6 +7804,8 @@ pub trait DirectCollocationCompiled: CompiledOcpMetadata {
     type UNum: Clone;
     type GNum: Clone;
     type GBounds;
+    type CScale;
+    type BineqScale;
 
     fn run_sqp(
         &self,
@@ -7718,6 +7818,8 @@ pub trait DirectCollocationCompiled: CompiledOcpMetadata {
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &ClarabelSqpOptions,
     ) -> Result<DirectCollocationSqpSolveResult<Self::XNum, Self::UNum, Self::GNum>>;
@@ -7733,6 +7835,8 @@ pub trait DirectCollocationCompiled: CompiledOcpMetadata {
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &ClarabelSqpOptions,
         callback: CB,
@@ -7751,6 +7855,8 @@ pub trait DirectCollocationCompiled: CompiledOcpMetadata {
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &InteriorPointOptions,
     ) -> Result<DirectCollocationInteriorPointSolveResult<Self::XNum, Self::UNum, Self::GNum>>;
@@ -7770,6 +7876,8 @@ pub trait DirectCollocationCompiled: CompiledOcpMetadata {
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &InteriorPointOptions,
         callback: CB,
@@ -7788,6 +7896,8 @@ pub trait DirectCollocationCompiled: CompiledOcpMetadata {
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &InteriorPointOptions,
         callback: CB,
@@ -7809,6 +7919,8 @@ pub trait DirectCollocationCompiled: CompiledOcpMetadata {
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &IpoptOptions,
     ) -> Result<DirectCollocationIpoptSolveResult<Self::XNum, Self::UNum, Self::GNum>>;
@@ -7825,6 +7937,8 @@ pub trait DirectCollocationCompiled: CompiledOcpMetadata {
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &IpoptOptions,
         callback: CB,
@@ -7843,6 +7957,8 @@ pub trait DirectCollocationCompiled: CompiledOcpMetadata {
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         trajectories: &DirectCollocationTrajectories<Self::XNum, Self::UNum, Self::GNum>,
         tolerance: f64,
@@ -7859,6 +7975,8 @@ pub trait DirectCollocationCompiled: CompiledOcpMetadata {
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         equality_multipliers: &[f64],
         inequality_multipliers: &[f64],
@@ -7876,6 +7994,8 @@ pub trait DirectCollocationCompiled: CompiledOcpMetadata {
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: NlpEvaluationBenchmarkOptions,
         on_progress: CB,
@@ -7897,8 +8017,10 @@ where
     Numeric<X>: Vectorize<f64, Rebind<f64> = Numeric<X>> + Clone,
     Numeric<U>: Vectorize<f64, Rebind<f64> = Numeric<U>> + Clone,
     Numeric<P>: Vectorize<f64, Rebind<f64> = Numeric<P>> + Clone,
+    Numeric<C>: Vectorize<f64, Rebind<f64> = Numeric<C>>,
     Numeric<G>: OcpGlobalDesign<f64> + Vectorize<f64, Rebind<f64> = Numeric<G>> + Clone,
     Numeric<Beq>: Vectorize<f64, Rebind<f64> = Numeric<Beq>> + Clone,
+    Numeric<Bineq>: Vectorize<f64, Rebind<f64> = Numeric<Bineq>>,
     BoundTemplate<G>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<G>> + Clone,
     BoundTemplate<C>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<C>>,
     BoundTemplate<Bineq>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<Bineq>>,
@@ -7947,8 +8069,10 @@ where
     Numeric<X>: Vectorize<f64, Rebind<f64> = Numeric<X>> + Clone,
     Numeric<U>: Vectorize<f64, Rebind<f64> = Numeric<U>> + Clone,
     Numeric<P>: Vectorize<f64, Rebind<f64> = Numeric<P>> + Clone,
+    Numeric<C>: Vectorize<f64, Rebind<f64> = Numeric<C>>,
     Numeric<G>: OcpGlobalDesign<f64> + Vectorize<f64, Rebind<f64> = Numeric<G>> + Clone,
     Numeric<Beq>: Vectorize<f64, Rebind<f64> = Numeric<Beq>> + Clone,
+    Numeric<Bineq>: Vectorize<f64, Rebind<f64> = Numeric<Bineq>>,
     BoundTemplate<G>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<G>> + Clone,
     BoundTemplate<C>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<C>>,
     BoundTemplate<Bineq>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<Bineq>>,
@@ -7961,6 +8085,8 @@ where
     type UNum = Numeric<U>;
     type GNum = Numeric<G>;
     type GBounds = BoundTemplate<G>;
+    type CScale = Numeric<C>;
+    type BineqScale = Numeric<Bineq>;
 
     fn run_sqp(
         &self,
@@ -7973,6 +8099,8 @@ where
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &ClarabelSqpOptions,
     ) -> Result<MultipleShootingSqpSolveResult<Self::XNum, Self::UNum, Self::GNum>> {
@@ -7993,6 +8121,8 @@ where
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &ClarabelSqpOptions,
         callback: CB,
@@ -8017,6 +8147,8 @@ where
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &InteriorPointOptions,
     ) -> Result<MultipleShootingInteriorPointSolveResult<Self::XNum, Self::UNum, Self::GNum>> {
@@ -8037,6 +8169,8 @@ where
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &InteriorPointOptions,
         callback: CB,
@@ -8064,6 +8198,8 @@ where
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &InteriorPointOptions,
         callback: CB,
@@ -8094,6 +8230,8 @@ where
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &IpoptOptions,
     ) -> Result<MultipleShootingIpoptSolveResult<Self::XNum, Self::UNum, Self::GNum>> {
@@ -8115,6 +8253,8 @@ where
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &IpoptOptions,
         callback: CB,
@@ -8155,6 +8295,8 @@ where
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         trajectories: &MultipleShootingTrajectories<Self::XNum, Self::UNum, Self::GNum>,
         tolerance: f64,
@@ -8179,6 +8321,8 @@ where
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         equality_multipliers: &[f64],
         inequality_multipliers: &[f64],
@@ -8205,6 +8349,8 @@ where
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: NlpEvaluationBenchmarkOptions,
         on_progress: CB,
@@ -8235,8 +8381,10 @@ where
     Numeric<X>: Vectorize<f64, Rebind<f64> = Numeric<X>> + Clone,
     Numeric<U>: Vectorize<f64, Rebind<f64> = Numeric<U>> + Clone,
     Numeric<P>: Vectorize<f64, Rebind<f64> = Numeric<P>> + Clone,
+    Numeric<C>: Vectorize<f64, Rebind<f64> = Numeric<C>>,
     Numeric<G>: OcpGlobalDesign<f64> + Vectorize<f64, Rebind<f64> = Numeric<G>> + Clone,
     Numeric<Beq>: Vectorize<f64, Rebind<f64> = Numeric<Beq>> + Clone,
+    Numeric<Bineq>: Vectorize<f64, Rebind<f64> = Numeric<Bineq>>,
     BoundTemplate<G>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<G>> + Clone,
     BoundTemplate<C>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<C>>,
     BoundTemplate<Bineq>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<Bineq>>,
@@ -8285,8 +8433,10 @@ where
     Numeric<X>: Vectorize<f64, Rebind<f64> = Numeric<X>> + Clone,
     Numeric<U>: Vectorize<f64, Rebind<f64> = Numeric<U>> + Clone,
     Numeric<P>: Vectorize<f64, Rebind<f64> = Numeric<P>> + Clone,
+    Numeric<C>: Vectorize<f64, Rebind<f64> = Numeric<C>>,
     Numeric<G>: OcpGlobalDesign<f64> + Vectorize<f64, Rebind<f64> = Numeric<G>> + Clone,
     Numeric<Beq>: Vectorize<f64, Rebind<f64> = Numeric<Beq>> + Clone,
+    Numeric<Bineq>: Vectorize<f64, Rebind<f64> = Numeric<Bineq>>,
     BoundTemplate<G>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<G>> + Clone,
     BoundTemplate<C>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<C>>,
     BoundTemplate<Bineq>: Vectorize<Bounds1D, Rebind<Bounds1D> = BoundTemplate<Bineq>>,
@@ -8299,6 +8449,8 @@ where
     type UNum = Numeric<U>;
     type GNum = Numeric<G>;
     type GBounds = BoundTemplate<G>;
+    type CScale = Numeric<C>;
+    type BineqScale = Numeric<Bineq>;
 
     fn run_sqp(
         &self,
@@ -8311,6 +8463,8 @@ where
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &ClarabelSqpOptions,
     ) -> Result<DirectCollocationSqpSolveResult<Self::XNum, Self::UNum, Self::GNum>> {
@@ -8331,6 +8485,8 @@ where
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &ClarabelSqpOptions,
         callback: CB,
@@ -8355,6 +8511,8 @@ where
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &InteriorPointOptions,
     ) -> Result<DirectCollocationInteriorPointSolveResult<Self::XNum, Self::UNum, Self::GNum>> {
@@ -8375,6 +8533,8 @@ where
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &InteriorPointOptions,
         callback: CB,
@@ -8402,6 +8562,8 @@ where
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &InteriorPointOptions,
         callback: CB,
@@ -8432,6 +8594,8 @@ where
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &IpoptOptions,
     ) -> Result<DirectCollocationIpoptSolveResult<Self::XNum, Self::UNum, Self::GNum>> {
@@ -8453,6 +8617,8 @@ where
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: &IpoptOptions,
         callback: CB,
@@ -8477,6 +8643,8 @@ where
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         trajectories: &DirectCollocationTrajectories<Self::XNum, Self::UNum, Self::GNum>,
         tolerance: f64,
@@ -8501,6 +8669,8 @@ where
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         equality_multipliers: &[f64],
         inequality_multipliers: &[f64],
@@ -8527,6 +8697,8 @@ where
             Self::UNum,
             Self::GNum,
             Self::GBounds,
+            Self::CScale,
+            Self::BineqScale,
         >,
         options: NlpEvaluationBenchmarkOptions,
         on_progress: CB,
@@ -8555,6 +8727,8 @@ pub fn solve_multiple_shooting_problem<Compiled, Build>(
         Compiled::UNum,
         Compiled::GNum,
         Compiled::GBounds,
+        Compiled::CScale,
+        Compiled::BineqScale,
     >,
     solver_method: SolverMethod,
     solver_config: &SolverConfig,
@@ -8639,6 +8813,8 @@ pub fn solve_cached_multiple_shooting_problem<Compiled, Build>(
         Compiled::UNum,
         Compiled::GNum,
         Compiled::GBounds,
+        Compiled::CScale,
+        Compiled::BineqScale,
     >,
     solver_method: SolverMethod,
     solver_config: &SolverConfig,
@@ -8673,6 +8849,8 @@ pub fn solve_multiple_shooting_problem_with_progress<Compiled, Emit, Build>(
         Compiled::UNum,
         Compiled::GNum,
         Compiled::GBounds,
+        Compiled::CScale,
+        Compiled::BineqScale,
     >,
     solver_method: SolverMethod,
     solver_config: &SolverConfig,
@@ -9024,6 +9202,8 @@ pub fn solve_cached_multiple_shooting_problem_with_progress<Compiled, Emit, Buil
         Compiled::UNum,
         Compiled::GNum,
         Compiled::GBounds,
+        Compiled::CScale,
+        Compiled::BineqScale,
     >,
     solver_method: SolverMethod,
     solver_config: &SolverConfig,
@@ -9063,6 +9243,8 @@ pub fn solve_direct_collocation_problem<Compiled, Build>(
         Compiled::UNum,
         Compiled::GNum,
         Compiled::GBounds,
+        Compiled::CScale,
+        Compiled::BineqScale,
     >,
     solver_method: SolverMethod,
     solver_config: &SolverConfig,
@@ -9140,6 +9322,8 @@ pub fn solve_cached_direct_collocation_problem<Compiled, Build>(
         Compiled::UNum,
         Compiled::GNum,
         Compiled::GBounds,
+        Compiled::CScale,
+        Compiled::BineqScale,
     >,
     solver_method: SolverMethod,
     solver_config: &SolverConfig,
@@ -9173,6 +9357,8 @@ pub fn solve_direct_collocation_problem_with_progress<Compiled, Emit, Build>(
         Compiled::UNum,
         Compiled::GNum,
         Compiled::GBounds,
+        Compiled::CScale,
+        Compiled::BineqScale,
     >,
     solver_method: SolverMethod,
     solver_config: &SolverConfig,
@@ -9483,6 +9669,8 @@ pub fn solve_cached_direct_collocation_problem_with_progress<Compiled, Emit, Bui
         Compiled::UNum,
         Compiled::GNum,
         Compiled::GBounds,
+        Compiled::CScale,
+        Compiled::BineqScale,
     >,
     solver_method: SolverMethod,
     solver_config: &SolverConfig,

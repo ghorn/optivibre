@@ -86,19 +86,20 @@ where
 pub type ControllerFn<X, U, P> = dyn Fn(f64, &X, &U, &P) -> U + Send + Sync;
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct OcpScaling<P, X, U, G = FinalTime<f64>> {
+pub struct OcpScaling<P, X, U, C = (), Beq = (), Bineq = (), G = FinalTime<f64>> {
     /// User-facing OCP reference scales in the original problem units.
     ///
     /// The transcribed NLP is normalized internally with `q' = q / q_scale`.
     pub objective: f64,
     pub state: X,
+    pub state_derivative: X,
     pub control: U,
     pub control_rate: U,
     pub global: G,
     pub parameters: P,
-    pub path: Vec<f64>,
-    pub boundary_equalities: Vec<f64>,
-    pub boundary_inequalities: Vec<f64>,
+    pub path: C,
+    pub boundary_equalities: Beq,
+    pub boundary_inequalities: Bineq,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2609,13 +2610,14 @@ mod tests {
             scaling: Some(OcpScaling {
                 objective: 7.0,
                 state: State { x: 2.0, v: 3.0 },
+                state_derivative: State { x: 29.0, v: 31.0 },
                 control: Control { u: 5.0 },
                 control_rate: Control { u: 11.0 },
                 global: FinalTime { tf: 13.0 },
                 parameters: Params { target: 17.0 },
-                path: Vec::new(),
-                boundary_equalities: vec![19.0, 23.0],
-                boundary_inequalities: Vec::new(),
+                path: (),
+                boundary_equalities: State { x: 19.0, v: 23.0 },
+                boundary_inequalities: (),
             }),
         };
 
@@ -2725,13 +2727,14 @@ mod tests {
             scaling: Some(OcpScaling {
                 objective: 7.0,
                 state: State { x: 2.0, v: 3.0 },
+                state_derivative: State { x: 29.0, v: 31.0 },
                 control: Control { u: 5.0 },
                 control_rate: Control { u: 11.0 },
                 global: FinalTime { tf: 13.0 },
                 parameters: Params { target: 17.0 },
-                path: Vec::new(),
-                boundary_equalities: vec![19.0, 23.0],
-                boundary_inequalities: Vec::new(),
+                path: (),
+                boundary_equalities: State { x: 19.0, v: 23.0 },
+                boundary_inequalities: (),
             }),
         };
 
@@ -2750,8 +2753,8 @@ mod tests {
         assert_eq!(
             scaling.constraints,
             vec![
-                2.0, 3.0, 2.0, 3.0, 2.0, 3.0, 2.0, 3.0, 5.0, 5.0, 5.0, 5.0, 2.0, 3.0, 2.0, 3.0,
-                5.0, 5.0, 19.0, 23.0,
+                29.0, 31.0, 29.0, 31.0, 29.0, 31.0, 29.0, 31.0, 11.0, 11.0, 11.0, 11.0, 2.0, 3.0,
+                2.0, 3.0, 5.0, 5.0, 19.0, 23.0,
             ]
         );
         assert_abs_diff_eq!(scaling.objective, 7.0, epsilon = 1e-12);

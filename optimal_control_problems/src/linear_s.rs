@@ -814,6 +814,10 @@ fn ms_runtime(
     (),
     State<f64>,
     Control<f64>,
+    FinalTime<f64>,
+    FinalTime<Bounds1D>,
+    Path<f64>,
+    (),
 > {
     multiple_shooting_runtime_from_spec(runtime_spec(params))
 }
@@ -826,6 +830,10 @@ fn dc_runtime(
     (),
     State<f64>,
     Control<f64>,
+    FinalTime<f64>,
+    FinalTime<Bounds1D>,
+    Path<f64>,
+    (),
 > {
     direct_collocation_runtime_from_spec(runtime_spec(params))
 }

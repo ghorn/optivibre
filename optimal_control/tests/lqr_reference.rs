@@ -28,9 +28,31 @@ type Boundary<T> = (State<T>, Control<T>);
 type Mesh<T> = ocp_runtime::Mesh<T>;
 type IntervalGrid<T> = ocp_runtime::IntervalGrid<T>;
 type MultipleShootingRuntimeValues<P, C, Beq, Bineq, X, U> =
-    ocp_runtime::MultipleShootingRuntimeValues<P, C, Beq, Bineq, X, U>;
+    ocp_runtime::MultipleShootingRuntimeValues<
+        P,
+        C,
+        Beq,
+        Bineq,
+        X,
+        U,
+        FinalTime<f64>,
+        FinalTime<Bounds1D>,
+        (),
+        (),
+    >;
 type DirectCollocationRuntimeValues<P, C, Beq, Bineq, X, U> =
-    ocp_runtime::DirectCollocationRuntimeValues<P, C, Beq, Bineq, X, U>;
+    ocp_runtime::DirectCollocationRuntimeValues<
+        P,
+        C,
+        Beq,
+        Bineq,
+        X,
+        U,
+        FinalTime<f64>,
+        FinalTime<Bounds1D>,
+        (),
+        (),
+    >;
 type MultipleShootingTrajectories<X, U> = ocp_runtime::MultipleShootingTrajectories<X, U>;
 type DirectCollocationTrajectories<X, U> = ocp_runtime::DirectCollocationTrajectories<X, U>;
 

@@ -509,6 +509,10 @@ fn ms_runtime(
     BoundaryIneq<Bounds1D>,
     StageState<f64>,
     StageControl<f64>,
+    FinalTime<f64>,
+    FinalTime<Bounds1D>,
+    PathIneq<f64>,
+    BoundaryIneq<f64>,
 > {
     let x = constant_state(case);
     let u = constant_control(case);
@@ -554,6 +558,10 @@ fn dc_runtime(
     BoundaryIneq<Bounds1D>,
     StageState<f64>,
     StageControl<f64>,
+    FinalTime<f64>,
+    FinalTime<Bounds1D>,
+    PathIneq<f64>,
+    BoundaryIneq<f64>,
 > {
     let x = constant_state(case);
     let u = constant_control(case);

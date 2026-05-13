@@ -106,7 +106,18 @@ fn runtime_multiple_shooting_compiles_solves_and_projects() {
     let compiled = runtime_ms_ocp(intervals, 4)
         .compile_jit()
         .expect("runtime multiple-shooting OCP should compile");
-    let runtime = optimal_control::runtime::MultipleShootingRuntimeValues {
+    let runtime: optimal_control::runtime::MultipleShootingRuntimeValues<
+        (),
+        (),
+        State<f64>,
+        (),
+        State<f64>,
+        Control<f64>,
+        FinalTime<f64>,
+        FinalTime<Bounds1D>,
+        (),
+        (),
+    > = optimal_control::runtime::MultipleShootingRuntimeValues {
         parameters: (),
         beq: State { x: 1.0 },
         bineq_bounds: (),
@@ -153,7 +164,18 @@ fn runtime_direct_collocation_compiles_solves_and_projects() {
     )
     .compile_jit()
     .expect("runtime direct-collocation OCP should compile");
-    let runtime = optimal_control::runtime::DirectCollocationRuntimeValues {
+    let runtime: optimal_control::runtime::DirectCollocationRuntimeValues<
+        (),
+        (),
+        State<f64>,
+        (),
+        State<f64>,
+        Control<f64>,
+        FinalTime<f64>,
+        FinalTime<Bounds1D>,
+        (),
+        (),
+    > = optimal_control::runtime::DirectCollocationRuntimeValues {
         parameters: (),
         beq: State { x: 1.0 },
         bineq_bounds: (),

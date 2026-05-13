@@ -1858,6 +1858,8 @@ fn ms_runtime(
         Control<f64>,
         Design<f64>,
         Design<Bounds1D>,
+        Path<f64>,
+        (),
     >,
 > {
     Ok(MultipleShootingRuntimeValues {
@@ -1900,6 +1902,8 @@ fn dc_runtime(
         Control<f64>,
         Design<f64>,
         Design<Bounds1D>,
+        Path<f64>,
+        (),
     >,
 > {
     Ok(DirectCollocationRuntimeValues {
@@ -1932,35 +1936,51 @@ fn dc_runtime(
 
 fn scaling(
     params: &Params,
-) -> optimal_control::OcpScaling<ModelParams<f64>, State<f64>, Control<f64>, Design<f64>> {
+) -> optimal_control::OcpScaling<
+    ModelParams<f64>,
+    State<f64>,
+    Control<f64>,
+    Path<f64>,
+    Boundary<f64>,
+    (),
+    Design<f64>,
+> {
     optimal_control::OcpScaling {
         objective: 100.0,
         state: State {
             px: params.delta_l.value.abs().max(100.0),
-            py: params.initial_wave_amplitude_m.max(10.0),
+            py: params.initial_wave_amplitude_m.max(25.0),
             pz: params
                 .h0
                 .value
                 .abs()
                 .max(params.initial_wave_amplitude_m)
-                .max(5.0),
-            vx: params.vx0.value.abs().max(10.0),
-            vy: params.vx0.value.abs().max(10.0),
-            vz: params.vx0.value.abs().max(10.0),
+                .max(20.0),
+            vx: params.vx0.value.abs().max(30.0),
+            vy: params.vx0.value.abs().max(25.0),
+            vz: params.vx0.value.abs().max(15.0),
+        },
+        state_derivative: State {
+            px: 30.0,
+            py: 25.0,
+            pz: 20.0,
+            vx: 30.0,
+            vy: 40.0,
+            vz: 30.0,
         },
         control: Control {
-            alpha: deg_to_rad(5.0),
-            roll: deg_to_rad(45.0),
+            alpha: deg_to_rad(15.0),
+            roll: deg_to_rad(90.0),
         },
         control_rate: Control {
             alpha: deg_to_rad(30.0),
-            roll: deg_to_rad(120.0),
+            roll: deg_to_rad(160.0),
         },
         global: Design {
             delta_l: params.delta_l.value.abs().max(100.0),
             h0: params.h0.value.abs().max(5.0),
-            vx0: params.vx0.value.abs().max(10.0),
-            vy0: params.max_airspeed_mps.abs().max(10.0),
+            vx0: params.vx0.value.abs().max(25.0),
+            vy0: 15.0,
             tf: params.tf.value.abs().max(5.0),
         },
         parameters: ModelParams {
@@ -1983,17 +2003,37 @@ fn scaling(
             alpha_rate_weight: 1.0,
             roll_rate_weight: 1.0,
         },
-        path: vec![
-            10.0,
-            20.0,
-            1.0,
-            5.0,
-            1.0,
-            deg_to_rad(30.0),
-            deg_to_rad(120.0),
-        ],
-        boundary_equalities: vec![1.0; Boundary::<f64>::LEN],
-        boundary_inequalities: Vec::new(),
+        path: Path {
+            altitude: 20.0,
+            airspeed: params.vx0.value.abs().max(30.0),
+            cl: 1.5,
+            load_factor: 5.0,
+            frame_guard: 1.0,
+            alpha_rate: deg_to_rad(30.0),
+            roll_rate: deg_to_rad(160.0),
+        },
+        boundary_equalities: Boundary {
+            px0: params.delta_l.value.abs().max(100.0),
+            delta_l: params.delta_l.value.abs().max(100.0),
+            py0: params.initial_wave_amplitude_m.max(25.0),
+            py_t: params.initial_wave_amplitude_m.max(25.0),
+            h0: params.h0.value.abs().max(5.0),
+            pz_periodic: params
+                .h0
+                .value
+                .abs()
+                .max(params.initial_wave_amplitude_m)
+                .max(20.0),
+            vx0: params.vx0.value.abs().max(25.0),
+            vx_periodic: params.vx0.value.abs().max(30.0),
+            vy0: 15.0,
+            vy_periodic: params.vx0.value.abs().max(25.0),
+            vz0: params.vx0.value.abs().max(15.0),
+            vz_t: params.vx0.value.abs().max(15.0),
+            alpha_periodic: deg_to_rad(15.0),
+            roll_periodic: deg_to_rad(90.0),
+        },
+        boundary_inequalities: (),
     }
 }
 
@@ -2226,6 +2266,8 @@ fn runtime_ms_for_standard(
     Control<f64>,
     Design<f64>,
     Design<Bounds1D>,
+    Path<f64>,
+    (),
 > {
     ms_runtime(params).expect("validated albatross multiple-shooting runtime")
 }
@@ -2241,6 +2283,8 @@ fn runtime_dc_for_standard(
     Control<f64>,
     Design<f64>,
     Design<Bounds1D>,
+    Path<f64>,
+    (),
 > {
     dc_runtime(params).expect("validated albatross direct-collocation runtime")
 }
@@ -3315,6 +3359,70 @@ mod tests {
         let expected_best_glide = 0.5 / (DEFAULT_CD0 + expected_drag_factor * 0.25);
         assert!((induced_drag_factor_numeric(&params) - expected_drag_factor).abs() < 1.0e-12);
         assert!((best_glide - expected_best_glide).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn default_albatross_scaling_matches_physical_nominals() {
+        let params = Params::default();
+        let scaling = scaling(&params);
+
+        assert_eq!(scaling.state.px, 100.0);
+        assert_eq!(scaling.state.py, 25.0);
+        assert_eq!(scaling.state.pz, 20.0);
+        assert_eq!(scaling.state.vx, 30.0);
+        assert_eq!(scaling.state.vy, 25.0);
+        assert_eq!(scaling.state.vz, 15.0);
+
+        assert_eq!(scaling.state_derivative.px, 30.0);
+        assert_eq!(scaling.state_derivative.py, 25.0);
+        assert_eq!(scaling.state_derivative.pz, 20.0);
+        assert_eq!(scaling.state_derivative.vx, 30.0);
+        assert_eq!(scaling.state_derivative.vy, 40.0);
+        assert_eq!(scaling.state_derivative.vz, 30.0);
+
+        assert_eq!(scaling.control.alpha, deg_to_rad(15.0));
+        assert_eq!(scaling.control.roll, deg_to_rad(90.0));
+        assert_eq!(scaling.control_rate.alpha, deg_to_rad(30.0));
+        assert_eq!(scaling.control_rate.roll, deg_to_rad(160.0));
+
+        assert_eq!(scaling.global.delta_l, 100.0);
+        assert_eq!(scaling.global.h0, 5.0);
+        assert_eq!(scaling.global.vx0, 25.0);
+        assert_eq!(scaling.global.vy0, 15.0);
+        assert_eq!(scaling.global.tf, 6.0);
+
+        assert_eq!(
+            scaling.path,
+            Path {
+                altitude: 20.0,
+                airspeed: 30.0,
+                cl: 1.5,
+                load_factor: 5.0,
+                frame_guard: 1.0,
+                alpha_rate: deg_to_rad(30.0),
+                roll_rate: deg_to_rad(160.0),
+            }
+        );
+        assert_eq!(
+            scaling.boundary_equalities,
+            Boundary {
+                px0: 100.0,
+                delta_l: 100.0,
+                py0: 25.0,
+                py_t: 25.0,
+                h0: 5.0,
+                pz_periodic: 20.0,
+                vx0: 25.0,
+                vx_periodic: 30.0,
+                vy0: 15.0,
+                vy_periodic: 25.0,
+                vz0: 15.0,
+                vz_t: 15.0,
+                alpha_periodic: deg_to_rad(15.0),
+                roll_periodic: deg_to_rad(90.0),
+            }
+        );
+        assert_eq!(scaling.boundary_inequalities, ());
     }
 
     #[test]

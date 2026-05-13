@@ -935,7 +935,9 @@ fn runtime_spec(
     }
 }
 
-fn glider_scaling(params: &Params) -> OcpScaling<ModelParams<f64>, State<f64>, Control<f64>> {
+fn glider_scaling(
+    params: &Params,
+) -> OcpScaling<ModelParams<f64>, State<f64>, Control<f64>, Path<f64>, Boundary<f64>, ()> {
     OcpScaling {
         objective: GLIDER_OBJECTIVE_SCALE,
         state: State {
@@ -943,6 +945,12 @@ fn glider_scaling(params: &Params) -> OcpScaling<ModelParams<f64>, State<f64>, C
             altitude: GLIDER_ALTITUDE_SCALE_M,
             vx: params.launch_speed_mps,
             vy: params.launch_speed_mps,
+        },
+        state_derivative: State {
+            x: params.launch_speed_mps,
+            altitude: params.launch_speed_mps,
+            vx: GRAVITY,
+            vy: GRAVITY,
         },
         control: Control {
             alpha: deg_to_rad(GLIDER_ALPHA_SCALE_DEG),
@@ -956,18 +964,18 @@ fn glider_scaling(params: &Params) -> OcpScaling<ModelParams<f64>, State<f64>, C
         parameters: ModelParams {
             alpha_rate_weight: 1.0,
         },
-        path: vec![
-            GLIDER_ALTITUDE_SCALE_M,
-            params.launch_speed_mps,
-            GLIDER_CL_SCALE,
-            deg_to_rad(GLIDER_ALPHA_RATE_SCALE_DEG_S),
-        ],
-        boundary_equalities: vec![
-            GLIDER_X0_SCALE_M,
-            INITIAL_ALTITUDE_M,
-            params.launch_speed_mps.powi(2),
-        ],
-        boundary_inequalities: Vec::new(),
+        path: Path {
+            altitude: GLIDER_ALTITUDE_SCALE_M,
+            vx: params.launch_speed_mps,
+            cl: GLIDER_CL_SCALE,
+            alpha_rate: deg_to_rad(GLIDER_ALPHA_RATE_SCALE_DEG_S),
+        },
+        boundary_equalities: Boundary {
+            x0: GLIDER_X0_SCALE_M,
+            altitude0: INITIAL_ALTITUDE_M,
+            speed_sq0: params.launch_speed_mps.powi(2),
+        },
+        boundary_inequalities: (),
     }
 }
 
@@ -980,6 +988,10 @@ fn ms_runtime(
     (),
     State<f64>,
     Control<f64>,
+    FinalTime<f64>,
+    FinalTime<Bounds1D>,
+    Path<f64>,
+    (),
 > {
     let mut runtime = multiple_shooting_runtime_from_spec(runtime_spec(params));
     runtime.scaling = params.scaling_enabled.then(|| glider_scaling(params));
@@ -995,6 +1007,10 @@ fn dc_runtime(
     (),
     State<f64>,
     Control<f64>,
+    FinalTime<f64>,
+    FinalTime<Bounds1D>,
+    Path<f64>,
+    (),
 > {
     let mut runtime = direct_collocation_runtime_from_spec(runtime_spec(params));
     runtime.scaling = params.scaling_enabled.then(|| glider_scaling(params));
@@ -2041,6 +2057,18 @@ mod tests {
         assert_abs_diff_eq!(scaling.state.vx, params.launch_speed_mps, epsilon = 1e-12);
         assert_abs_diff_eq!(scaling.state.vy, params.launch_speed_mps, epsilon = 1e-12);
         assert_abs_diff_eq!(
+            scaling.state_derivative.x,
+            params.launch_speed_mps,
+            epsilon = 1e-12
+        );
+        assert_abs_diff_eq!(
+            scaling.state_derivative.altitude,
+            params.launch_speed_mps,
+            epsilon = 1e-12
+        );
+        assert_abs_diff_eq!(scaling.state_derivative.vx, GRAVITY, epsilon = 1e-12);
+        assert_abs_diff_eq!(scaling.state_derivative.vy, GRAVITY, epsilon = 1e-12);
+        assert_abs_diff_eq!(
             scaling.control.alpha,
             deg_to_rad(GLIDER_ALPHA_SCALE_DEG),
             epsilon = 1e-12
@@ -2057,22 +2085,22 @@ mod tests {
         );
         assert_eq!(
             scaling.path,
-            vec![
-                GLIDER_ALTITUDE_SCALE_M,
-                params.launch_speed_mps,
-                GLIDER_CL_SCALE,
-                deg_to_rad(GLIDER_ALPHA_RATE_SCALE_DEG_S),
-            ]
+            super::Path {
+                altitude: GLIDER_ALTITUDE_SCALE_M,
+                vx: params.launch_speed_mps,
+                cl: GLIDER_CL_SCALE,
+                alpha_rate: deg_to_rad(GLIDER_ALPHA_RATE_SCALE_DEG_S),
+            }
         );
         assert_eq!(
             scaling.boundary_equalities,
-            vec![
-                GLIDER_X0_SCALE_M,
-                INITIAL_ALTITUDE_M,
-                params.launch_speed_mps.powi(2),
-            ]
+            Boundary {
+                x0: GLIDER_X0_SCALE_M,
+                altitude0: INITIAL_ALTITUDE_M,
+                speed_sq0: params.launch_speed_mps.powi(2),
+            }
         );
-        assert!(scaling.boundary_inequalities.is_empty());
+        assert_eq!(scaling.boundary_inequalities, ());
     }
 
     #[test]
