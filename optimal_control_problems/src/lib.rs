@@ -34,12 +34,12 @@ pub use common::{
     LatexSection, Metric, MetricKey, OcpKernelStrategy, OcpOverrideBehavior, OcpSxFunctionConfig,
     PlotMode, ProblemDerivativeCheck, ProblemId, ProblemSpec, Scene2D, SceneAnimation, SceneArrow,
     SceneCircle, SceneFrame, ScenePath, ScenePath3D, SolveArtifact, SolveLogLevel, SolvePhase,
-    SolveProgress, SolveRequest, SolveStage, SolveStatus, SolveStreamEvent, SolverMethod,
-    SolverPhaseDetail, SolverPhaseDetails, SolverReport, SolverStatusKind, TimeGrid, TimeSeries,
-    TimeSeriesRole, TranscriptionConfig, TranscriptionMethod, direct_collocation_variant,
-    direct_collocation_variant_with_sx, find_metric, metric, metric_with_key,
-    multiple_shooting_variant, multiple_shooting_variant_with_sx, numeric_metric_with_key,
-    ocp_sx_function_config_from_map_lossy, time_grid_from_map_lossy,
+    SolveProgress, SolveRequest, SolveStage, SolveStatus, SolveStreamEvent, SolveTimingSample,
+    SolverMethod, SolverPhaseDetail, SolverPhaseDetails, SolverReport, SolverStatusKind, TimeGrid,
+    TimeSeries, TimeSeriesRole, TranscriptionConfig, TranscriptionMethod,
+    direct_collocation_variant, direct_collocation_variant_with_sx, find_metric, metric,
+    metric_with_key, multiple_shooting_variant, multiple_shooting_variant_with_sx,
+    numeric_metric_with_key, ocp_sx_function_config_from_map_lossy, time_grid_from_map_lossy,
 };
 
 pub(crate) struct ProblemEntry {

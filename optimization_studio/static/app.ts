@@ -391,9 +391,11 @@ const SOLVE_STAGE_FROM_WIRE = Object.freeze({
 const STREAM_EVENT_KIND = Object.freeze({
   status: 0,
   log: 1,
-  iteration: 2,
-  final: 3,
-  error: 4,
+  progress: 2,
+  timing: 3,
+  iteration: 4,
+  final: 5,
+  error: 6,
 } as const);
 const FILTER_TRACE = Object.freeze({
   history: 0,
@@ -405,6 +407,8 @@ const FILTER_RECENT_POINT_LIMIT = 48;
 const STREAM_EVENT_KIND_FROM_WIRE = Object.freeze({
   status: STREAM_EVENT_KIND.status,
   log: STREAM_EVENT_KIND.log,
+  progress: STREAM_EVENT_KIND.progress,
+  timing: STREAM_EVENT_KIND.timing,
   iteration: STREAM_EVENT_KIND.iteration,
   final: STREAM_EVENT_KIND.final,
   error: STREAM_EVENT_KIND.error,
@@ -834,6 +838,14 @@ interface WireSolveProgress extends Omit<SolveProgress, "phase" | "filter" | "tr
   trust_region?: WireSolveTrustRegionInfo | null;
 }
 
+interface SolveTimingSample {
+  label: string;
+  iteration?: number | null;
+  seconds: number;
+}
+
+interface WireSolveTimingSample extends SolveTimingSample {}
+
 interface SolverPhaseDetail {
   label: string;
   value: string;
@@ -909,6 +921,16 @@ interface LogSolveEvent {
   level: LogLevelCode;
 }
 
+interface ProgressSolveEvent {
+  kind: typeof STREAM_EVENT_KIND.progress;
+  progress: SolveProgress;
+}
+
+interface TimingSolveEvent {
+  kind: typeof STREAM_EVENT_KIND.timing;
+  timing: SolveTimingSample;
+}
+
 interface IterationSolveEvent {
   kind: typeof STREAM_EVENT_KIND.iteration;
   progress: SolveProgress;
@@ -928,6 +950,8 @@ interface ErrorSolveEvent {
 type SolveEvent =
   | StatusSolveEvent
   | LogSolveEvent
+  | ProgressSolveEvent
+  | TimingSolveEvent
   | IterationSolveEvent
   | FinalSolveEvent
   | ErrorSolveEvent;
@@ -956,6 +980,16 @@ interface WireIterationSolveEvent {
   artifact: WireSolveArtifact;
 }
 
+interface WireProgressSolveEvent {
+  kind: "progress";
+  progress: WireSolveProgress;
+}
+
+interface WireTimingSolveEvent {
+  kind: "timing";
+  timing: WireSolveTimingSample;
+}
+
 interface WireFinalSolveEvent {
   kind: "final";
   artifact: WireSolveArtifact;
@@ -969,6 +1003,8 @@ interface WireErrorSolveEvent {
 type WireSolveEvent =
   | WireStatusSolveEvent
   | WireLogSolveEvent
+  | WireProgressSolveEvent
+  | WireTimingSolveEvent
   | WireIterationSolveEvent
   | WireFinalSolveEvent
   | WireErrorSolveEvent;
@@ -1114,10 +1150,14 @@ interface FrontendState {
   chartViews: Map<string, ChartView>;
   chartLayoutKey: string;
   progressPlotReady: boolean;
+  streamTimingPlotReady: boolean;
+  streamTimingRenderScheduled: boolean;
+  streamTimingSamples: SolveTimingSample[];
   filterPlotReady: boolean;
   trustRegionPlotReady: boolean;
   filterRecentPath: FilterEntry[];
   lastFilterPointKey: string | null;
+  lastProgressUiKey: string | null;
   logLines: LogLine[];
   followSolverLog: boolean;
   latestProgress: SolveProgress | null;
@@ -1982,6 +2022,18 @@ function readWireSolveProgress(value: JsonValue | undefined, context: string): W
   };
 }
 
+function readWireSolveTimingSample(
+  value: JsonValue | undefined,
+  context: string,
+): WireSolveTimingSample {
+  const object = readJsonObject(value, context);
+  return {
+    label: readJsonString(readJsonValueAt(object, "label"), `${context}.label`),
+    iteration: readOptionalJsonNumber(readJsonValueAt(object, "iteration"), `${context}.iteration`) ?? null,
+    seconds: readJsonNumber(readJsonValueAt(object, "seconds"), `${context}.seconds`),
+  };
+}
+
 function readWireSolveTrustRegionInfo(
   value: JsonValue | undefined,
   context: string,
@@ -2168,6 +2220,22 @@ function readWireSolveEvent(value: JsonValue | undefined): WireSolveEvent {
           "solve stream event.level",
         ),
       };
+    case STREAM_EVENT_KIND.progress:
+      return {
+        kind: "progress",
+        progress: readWireSolveProgress(
+          readJsonValueAt(object, "progress"),
+          "solve stream event.progress",
+        ),
+      };
+    case STREAM_EVENT_KIND.timing:
+      return {
+        kind: "timing",
+        timing: readWireSolveTimingSample(
+          readJsonValueAt(object, "timing"),
+          "solve stream event.timing",
+        ),
+      };
     case STREAM_EVENT_KIND.iteration:
       return {
         kind: "iteration",
@@ -2220,10 +2288,14 @@ const state: FrontendState = {
   chartViews: new Map<string, ChartView>(),
   chartLayoutKey: "",
   progressPlotReady: false,
+  streamTimingPlotReady: false,
+  streamTimingRenderScheduled: false,
+  streamTimingSamples: [],
   filterPlotReady: false,
   trustRegionPlotReady: false,
   filterRecentPath: [],
   lastFilterPointKey: null,
+  lastProgressUiKey: null,
   logLines: [],
   followSolverLog: true,
   latestProgress: null,
@@ -2263,6 +2335,7 @@ const modelEl = requiredElement<HTMLDivElement>("#model");
 const notesEl = requiredElement<HTMLDivElement>("#notes");
 const solverSummaryEl = requiredElement<HTMLDivElement>("#solver-summary");
 const progressPlotEl = requiredElement<PlotlyHostElement>("#progress-plot");
+const streamTimingPlotEl = requiredElement<PlotlyHostElement>("#stream-timing-plot");
 const filterPlotEl = requiredElement<PlotlyHostElement>("#filter-plot");
 const trustRegionPlotEl = requiredElement<PlotlyHostElement>("#trust-region-plot");
 const copyConsoleButton = requiredElement<HTMLButtonElement>("#copy-console-button");
@@ -2320,6 +2393,11 @@ function setStatus(message: string, kind: StatusClassName = "info"): void {
 }
 
 function setStatusDisplay(display: StatusDisplay): void {
+  statusEl.hidden = display.active && (
+    display.title === "Symbolic Setup"
+    || display.title === "JIT"
+    || display.title === "Solving"
+  );
   statusEl.className = `status ${display.kind} ${display.active ? "status-active" : ""}`.trim();
 
   const eyebrow = document.createElement("div");
@@ -3934,6 +4012,16 @@ function normalizeSolveEvent(event: WireSolveEvent): SolveEvent {
         kind: STREAM_EVENT_KIND.log,
         line: event.line,
         level: decodeWireEnum(LOG_LEVEL_FROM_WIRE, event.level, LOG_LEVEL.console),
+      };
+    case "progress":
+      return {
+        kind: STREAM_EVENT_KIND.progress,
+        progress: normalizeProgress(event.progress),
+      };
+    case "timing":
+      return {
+        kind: STREAM_EVENT_KIND.timing,
+        timing: event.timing,
       };
     case "iteration":
       return {
@@ -5859,6 +5947,7 @@ function resetSolverPanel(): void {
   state.pendingIterationEvent = null;
   state.iterationFlushScheduled = false;
   state.deferredInteractionIterations = [];
+  state.lastProgressUiKey = null;
   state.logLines = [];
   setConsoleFollowState(true);
   renderSolverSummary();
@@ -5868,6 +5957,9 @@ function resetSolverPanel(): void {
   if (window.Plotly && state.progressPlotReady) {
     window.Plotly.purge(progressPlotEl);
   }
+  if (window.Plotly && state.streamTimingPlotReady) {
+    window.Plotly.purge(streamTimingPlotEl);
+  }
   if (window.Plotly && state.filterPlotReady) {
     window.Plotly.purge(filterPlotEl);
   }
@@ -5875,8 +5967,12 @@ function resetSolverPanel(): void {
     window.Plotly.purge(trustRegionPlotEl);
   }
   progressPlotEl.innerHTML = `<div class="placeholder">Solve a problem to populate the live convergence history.</div>`;
+  streamTimingPlotEl.innerHTML = `<div class="placeholder">Streaming timing telemetry will appear here during the solve.</div>`;
   filterPlotEl.innerHTML = `<div class="placeholder">SQP filter telemetry will appear here during the solve.</div>`;
   state.progressPlotReady = false;
+  state.streamTimingPlotReady = false;
+  state.streamTimingRenderScheduled = false;
+  state.streamTimingSamples = [];
   state.filterPlotReady = false;
   state.trustRegionPlotReady = false;
   renderTrustRegionPlotVisibility();
@@ -7480,6 +7576,201 @@ function updateProgressPlot(progress: SolveProgress): void {
   updateProgressThresholds(progress);
 }
 
+const STREAM_TIMING_SAMPLE_LIMIT = 500;
+const STREAM_TIMING_LABELS = [
+  "callback interval",
+  "callback wall",
+  "callback enqueue",
+  "backend queue wait",
+  "artifact build",
+  "constraint panels",
+  "stream serialize",
+  "stream send",
+  "frontend receive gap",
+  "frontend parse+normalize",
+  "frontend progress UI",
+  "frontend charts",
+  "frontend scene",
+  "frontend summary",
+] as const;
+
+function normalizedTimingSample(sample: SolveTimingSample): SolveTimingSample | null {
+  if (!Number.isFinite(sample.seconds) || sample.seconds < 0) {
+    return null;
+  }
+  return {
+    label: sample.label,
+    iteration: sample.iteration ?? state.latestProgress?.iteration ?? null,
+    seconds: sample.seconds,
+  };
+}
+
+function recordTimingSample(sample: SolveTimingSample | null | undefined): void {
+  const normalized = sample == null ? null : normalizedTimingSample(sample);
+  if (normalized == null) {
+    return;
+  }
+  state.streamTimingSamples.push(normalized);
+  if (state.streamTimingSamples.length > STREAM_TIMING_SAMPLE_LIMIT) {
+    state.streamTimingSamples.splice(0, state.streamTimingSamples.length - STREAM_TIMING_SAMPLE_LIMIT);
+  }
+  scheduleStreamTimingPlot();
+}
+
+function recordFrontendTiming(label: string, startedAt: number): void {
+  recordTimingSample({
+    label,
+    iteration: state.latestProgress?.iteration ?? null,
+    seconds: Math.max(0, performance.now() - startedAt) / 1000,
+  });
+}
+
+function scheduleStreamTimingPlot(): void {
+  if (state.streamTimingRenderScheduled) {
+    return;
+  }
+  state.streamTimingRenderScheduled = true;
+  requestAnimationFrame(() => {
+    state.streamTimingRenderScheduled = false;
+    renderStreamTimingPlot();
+  });
+}
+
+function ensureStreamTimingPlot(): void {
+  if (state.streamTimingPlotReady || !window.Plotly) {
+    return;
+  }
+  streamTimingPlotEl.innerHTML = "";
+  window.Plotly.newPlot(streamTimingPlotEl, [], streamTimingLayout(), {
+    responsive: true,
+    displaylogo: false,
+    displayModeBar: false,
+  });
+  state.streamTimingPlotReady = true;
+}
+
+function streamTimingLayout(): PlotlyLayout {
+  return {
+    paper_bgcolor: "rgba(0,0,0,0)",
+    plot_bgcolor: "rgba(4, 15, 22, 0.92)",
+    font: {
+      color: "#e5f1f4",
+      family: '"Avenir Next", Futura, "Trebuchet MS", sans-serif',
+      size: 11,
+    },
+    margin: { l: 74, r: 24, t: 26, b: 54 },
+    legend: {
+      orientation: "h",
+      y: -0.24,
+      x: 0,
+      font: { color: "#94b6bd", size: 10 },
+    },
+    grid: { rows: 1, columns: 2, pattern: "independent" },
+    xaxis: {
+      title: "sample (-)",
+      gridcolor: "rgba(229, 241, 244, 0.08)",
+      linecolor: "rgba(177, 214, 222, 0.18)",
+      zeroline: false,
+    },
+    yaxis: {
+      title: "duration (ms)",
+      type: "log",
+      gridcolor: "rgba(229, 241, 244, 0.08)",
+      linecolor: "rgba(177, 214, 222, 0.18)",
+      zeroline: false,
+    },
+    xaxis2: {
+      title: "duration (ms)",
+      type: "log",
+      gridcolor: "rgba(229, 241, 244, 0.08)",
+      linecolor: "rgba(177, 214, 222, 0.18)",
+      zeroline: false,
+    },
+    yaxis2: {
+      title: "count (-)",
+      gridcolor: "rgba(229, 241, 244, 0.08)",
+      linecolor: "rgba(177, 214, 222, 0.18)",
+      zeroline: false,
+    },
+    annotations: [
+      {
+        text: "Timing time-series",
+        xref: "paper",
+        yref: "paper",
+        x: 0,
+        y: 1.1,
+        showarrow: false,
+        font: { color: "#94b6bd", size: 12 },
+      },
+      {
+        text: "Timing histogram",
+        xref: "paper",
+        yref: "paper",
+        x: 0.62,
+        y: 1.1,
+        showarrow: false,
+        font: { color: "#94b6bd", size: 12 },
+      },
+    ],
+  };
+}
+
+function timingColor(label: string, index: number): string {
+  const paletteIndex = Math.abs(
+    [...label].reduce((acc, char) => acc + char.charCodeAt(0), index),
+  ) % PALETTE.length;
+  return PALETTE[paletteIndex];
+}
+
+function renderStreamTimingPlot(): void {
+  if (!window.Plotly) {
+    return;
+  }
+  ensureStreamTimingPlot();
+  const labels = [
+    ...STREAM_TIMING_LABELS,
+    ...Array.from(new Set(state.streamTimingSamples.map((sample) => sample.label))).filter(
+      (label) => !(STREAM_TIMING_LABELS as readonly string[]).includes(label),
+    ),
+  ];
+  const traces: PlotlyTrace[] = [];
+  labels.forEach((label, index) => {
+    const samples = state.streamTimingSamples.filter((sample) => sample.label === label);
+    if (samples.length === 0) {
+      return;
+    }
+    const color = timingColor(label, index);
+    const valuesMs = samples.map((sample) => Math.max(sample.seconds * 1000, 1.0e-6));
+    traces.push({
+      type: "scatter",
+      mode: "lines",
+      name: label,
+      x: samples.map((_, sampleIndex) => sampleIndex),
+      y: valuesMs,
+      line: { color, width: PLOT_LINE_WIDTH.primary },
+      hovertemplate: `${label}<br>sample=%{x}<br>duration=%{y:.3f} ms<extra></extra>`,
+    });
+    traces.push({
+      type: "histogram",
+      name: `${label} hist`,
+      x: valuesMs,
+      xaxis: "x2",
+      yaxis: "y2",
+      marker: { color, opacity: 0.36 },
+      opacity: 0.36,
+      showlegend: false,
+      nbinsx: 24,
+      hovertemplate: `${label}<br>duration=%{x:.3f} ms<br>count=%{y}<extra></extra>`,
+    });
+  });
+  window.Plotly.react(streamTimingPlotEl, traces, streamTimingLayout(), {
+    responsive: true,
+    displaylogo: false,
+    displayModeBar: false,
+  });
+  state.streamTimingPlotReady = true;
+}
+
 function trustRegionHoverText(
   progress: SolveProgress,
   trustRegion: SolveTrustRegionInfo,
@@ -7895,23 +8186,81 @@ function updateLiveIterationState(event: IterationSolveEvent): void {
   }
 }
 
-function applyIterationUi(event: IterationSolveEvent): void {
+function progressUiKey(progress: SolveProgress): string {
+  return [
+    progress.iteration,
+    progress.phase,
+    progress.objective,
+    progress.eq_inf ?? "",
+    progress.ineq_inf ?? "",
+    progress.dual_inf,
+    progress.step_inf ?? "",
+    progress.alpha ?? "",
+    progress.alpha_pr ?? "",
+    progress.alpha_du ?? "",
+  ].join(":");
+}
+
+function updateLiveProgressState(progress: SolveProgress): void {
+  state.latestProgress = progress;
+  if (state.liveSolver) {
+    state.liveSolver = {
+      ...state.liveSolver,
+      iterations: progress.iteration,
+    };
+  }
+  if (!state.solverPhaseAutoCollapsed) {
+    state.solverPhaseCardOpen.jit = false;
+    state.solverPhaseAutoCollapsed = true;
+  }
+}
+
+function applyProgressUi(progress: SolveProgress): void {
+  const summaryStarted = performance.now();
   renderSolverSummary();
-  updateProgressPlot(event.progress);
-  updateTrustRegionPlot(event.progress);
-  updateFilterPlot(event.progress);
+  recordFrontendTiming("frontend summary", summaryStarted);
+  const key = progressUiKey(progress);
+  if (state.lastProgressUiKey === key) {
+    return;
+  }
+  state.lastProgressUiKey = key;
+  const progressStarted = performance.now();
+  updateProgressPlot(progress);
+  updateTrustRegionPlot(progress);
+  updateFilterPlot(progress);
+  recordFrontendTiming("frontend progress UI", progressStarted);
+}
+
+function applyProgressEvent(event: ProgressSolveEvent): void {
+  updateLiveProgressState(event.progress);
+  applyProgressUi(event.progress);
+}
+
+function applyTimingEvent(event: TimingSolveEvent): void {
+  recordTimingSample(event.timing);
+}
+
+function applyIterationUi(event: IterationSolveEvent): void {
+  applyProgressUi(event.progress);
+}
+
+function renderArtifactPanelsExceptScene(): void {
+  renderMetrics();
+  renderConstraintPanels();
+  const chartsStarted = performance.now();
+  renderCharts();
+  recordFrontendTiming("frontend charts", chartsStarted);
+  renderNotes(state.artifact?.notes ?? currentSpec()?.notes ?? []);
 }
 
 function flushDeferredSceneInteractionUpdates(): void {
   if (state.deferredInteractionIterations.length === 0) {
+    if (state.artifact) {
+      renderScene();
+    }
     return;
   }
   const deferred = state.deferredInteractionIterations.splice(0);
-  for (const event of deferred) {
-    updateProgressPlot(event.progress);
-    updateTrustRegionPlot(event.progress);
-    updateFilterPlot(event.progress);
-  }
   const latest = deferred[deferred.length - 1];
   if (!latest) {
     return;
@@ -7920,7 +8269,10 @@ function flushDeferredSceneInteractionUpdates(): void {
   renderSolverSummary();
   if (shouldRenderIterationArtifact(latest, true)) {
     state.artifact = latest.artifact;
-    scheduleArtifactRender(true);
+    renderArtifactPanelsExceptScene();
+    const sceneStarted = performance.now();
+    renderScene();
+    recordFrontendTiming("frontend scene", sceneStarted);
   }
   if (state.liveStatus?.stage === SOLVE_STAGE.solving) {
     setStatusDisplay(statusDisplayForSolveStatus(state.liveStatus, latest.progress.iteration));
@@ -7934,9 +8286,11 @@ function applyIterationEvent(
 ): void {
   updateLiveIterationState(event);
   if (isThreeSceneInteracting() && !forceArtifactRender) {
-    state.deferredInteractionIterations.push(event);
+    state.deferredInteractionIterations = [event];
+    applyIterationUi(event);
     if (shouldRenderIterationArtifact(event, false)) {
       state.artifact = event.artifact;
+      renderArtifactPanelsExceptScene();
     }
     if (updateRunningStatus && state.liveStatus?.stage === SOLVE_STAGE.solving) {
       setStatusDisplay(statusDisplayForSolveStatus(state.liveStatus, event.progress.iteration));
@@ -9864,8 +10218,12 @@ function requestArtifactRenderFrame(): void {
     state.renderScheduled = false;
     renderMetrics();
     renderConstraintPanels();
+    const sceneStarted = performance.now();
     renderScene();
+    recordFrontendTiming("frontend scene", sceneStarted);
+    const chartsStarted = performance.now();
     renderCharts();
+    recordFrontendTiming("frontend charts", chartsStarted);
     renderNotes(state.artifact?.notes ?? currentSpec()?.notes ?? []);
   });
 }
@@ -9897,6 +10255,12 @@ function handleSolveEvent(event: SolveEvent): void {
       }
     case STREAM_EVENT_KIND.log:
       appendLogLine(event.line, event.level ?? LOG_LEVEL.console);
+      break;
+    case STREAM_EVENT_KIND.progress:
+      applyProgressEvent(event);
+      break;
+    case STREAM_EVENT_KIND.timing:
+      applyTimingEvent(event);
       break;
     case STREAM_EVENT_KIND.iteration:
       state.pendingIterationEvent = event;
@@ -9934,6 +10298,7 @@ async function readNdjsonStream(response: Response, onEvent: (event: SolveEvent)
   }
   const decoder = new TextDecoder();
   let buffer = "";
+  let previousEventAt: number | null = null;
 
   while (true) {
     const { value, done } = await reader.read();
@@ -9948,13 +10313,28 @@ async function readNdjsonStream(response: Response, onEvent: (event: SolveEvent)
       if (!trimmed) {
         continue;
       }
-      onEvent(normalizeSolveEvent(readWireSolveEvent(parseJsonValue(trimmed, "solve stream event"))));
+      const receivedAt = performance.now();
+      if (previousEventAt != null) {
+        recordTimingSample({
+          label: "frontend receive gap",
+          iteration: state.latestProgress?.iteration ?? null,
+          seconds: (receivedAt - previousEventAt) / 1000,
+        });
+      }
+      previousEventAt = receivedAt;
+      const parseStarted = performance.now();
+      const normalized = normalizeSolveEvent(readWireSolveEvent(parseJsonValue(trimmed, "solve stream event")));
+      recordFrontendTiming("frontend parse+normalize", parseStarted);
+      onEvent(normalized);
     }
   }
 
   const tail = buffer.trim();
   if (tail) {
-    onEvent(normalizeSolveEvent(readWireSolveEvent(parseJsonValue(tail, "solve stream event"))));
+    const parseStarted = performance.now();
+    const normalized = normalizeSolveEvent(readWireSolveEvent(parseJsonValue(tail, "solve stream event")));
+    recordFrontendTiming("frontend parse+normalize", parseStarted);
+    onEvent(normalized);
   }
 }
 

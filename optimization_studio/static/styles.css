@@ -1111,6 +1111,10 @@ select {
   min-height: 300px;
 }
 
+.solve-stream-timing-plot {
+  min-height: 320px;
+}
+
 .solve-filter-plot {
   min-height: 300px;
 }

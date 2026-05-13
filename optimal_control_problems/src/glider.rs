@@ -2341,6 +2341,8 @@ mod tests {
                         ));
                     }
                     crate::common::SolveStreamEvent::Log { line, .. } => log_lines.push(line),
+                    crate::common::SolveStreamEvent::Progress { .. } => {}
+                    crate::common::SolveStreamEvent::Timing { .. } => {}
                     crate::common::SolveStreamEvent::Error { message } => {
                         log_lines.push(format!("error: {message}"));
                     }
@@ -2473,6 +2475,8 @@ mod tests {
                 ));
             }
             crate::common::SolveStreamEvent::Log { line, .. } => log_lines.push(line),
+            crate::common::SolveStreamEvent::Progress { .. } => {}
+            crate::common::SolveStreamEvent::Timing { .. } => {}
             crate::common::SolveStreamEvent::Error { message } => {
                 log_lines.push(format!("error: {message}"));
             }

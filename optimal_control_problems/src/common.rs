@@ -647,6 +647,14 @@ pub struct SolveProgress {
     pub trust_region: Option<SolveTrustRegionInfo>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct SolveTimingSample {
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iteration: Option<usize>,
+    pub seconds: f64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SolveStage {
@@ -674,6 +682,12 @@ pub enum SolveStreamEvent {
     Log {
         line: String,
         level: SolveLogLevel,
+    },
+    Progress {
+        progress: SolveProgress,
+    },
+    Timing {
+        timing: SolveTimingSample,
     },
     Iteration {
         progress: SolveProgress,
@@ -851,6 +865,18 @@ where
                 level: SolveLogLevel::Console,
             },
         );
+    }
+}
+
+fn timing_sample(
+    label: impl Into<String>,
+    iteration: Option<usize>,
+    duration: std::time::Duration,
+) -> SolveTimingSample {
+    SolveTimingSample {
+        label: label.into(),
+        iteration,
+        seconds: duration.as_secs_f64(),
     }
 }
 
@@ -5225,8 +5251,9 @@ pub fn transcription_controls(
     controls
 }
 
-fn transcription_interval_control(default: usize, supported_intervals: &[usize]) -> ControlSpec {
-    let (min, max) = interval_bounds(supported_intervals, default);
+fn transcription_interval_control(default: usize, _supported_intervals: &[usize]) -> ControlSpec {
+    let min = 1;
+    let max = usize::MAX;
     ControlSpec {
         id: SharedControlId::TranscriptionIntervals.id().to_string(),
         label: "Intervals".to_string(),
@@ -5235,9 +5262,7 @@ fn transcription_interval_control(default: usize, supported_intervals: &[usize])
         step: 1.0,
         default: default as f64,
         unit: String::new(),
-        help: format!(
-            "Number of mesh intervals. Enter an integer from {min} to {max}; changing this compiles a matching transcription variant on demand."
-        ),
+        help: "Number of mesh intervals. Enter any positive integer; changing this compiles a matching transcription variant on demand.".to_string(),
         section: ControlSection::Transcription,
         panel: None,
         editor: ControlEditor::Text,
@@ -5247,22 +5272,6 @@ fn transcription_interval_control(default: usize, supported_intervals: &[usize])
         choices: Vec::new(),
         profile_defaults: Vec::new(),
     }
-}
-
-fn interval_bounds(supported_intervals: &[usize], default: usize) -> (usize, usize) {
-    let min = supported_intervals
-        .iter()
-        .copied()
-        .min()
-        .unwrap_or(default)
-        .max(1);
-    let max = supported_intervals
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(default)
-        .max(min);
-    (min, max)
 }
 
 pub fn solver_controls(default_method: SolverMethod, default: SolverConfig) -> Vec<ControlSpec> {
@@ -6359,7 +6368,7 @@ pub fn solver_method_from_map(
 pub fn transcription_from_map(
     values: &BTreeMap<String, f64>,
     default: TranscriptionConfig,
-    supported_intervals: &[usize],
+    _supported_intervals: &[usize],
     supported_degrees: &[usize],
 ) -> Result<TranscriptionConfig> {
     let method = match parse_enum_choice(
@@ -6388,15 +6397,6 @@ pub fn transcription_from_map(
         SharedControlId::TranscriptionIntervals.id(),
     )?
     .round() as usize;
-    let (min_intervals, max_intervals) = interval_bounds(supported_intervals, default.intervals);
-    if intervals < min_intervals || intervals > max_intervals {
-        return Err(anyhow!(
-            "unsupported {} {}; expected {min_intervals}..={max_intervals}",
-            SharedControlId::TranscriptionIntervals.id(),
-            intervals
-        ));
-    }
-
     let collocation_family = match parse_enum_choice(
         sample_shared_or_default(
             values,
@@ -8887,6 +8887,7 @@ where
             let emit_for_worker = emit.clone();
             let solve_started = started;
             let running_solver_for_callback = running_solver.clone();
+            let emit_for_progress = emit.clone();
             let solved = match with_latest_only_worker(
                 move |event| {
                     emit_event(&emit_for_worker, event);
@@ -8894,44 +8895,56 @@ where
                 |submit| {
                     let build_for_callback = build_artifact.clone();
                     let options_for_callback = options.clone();
+                    let emit_progress_for_callback = emit_for_progress.clone();
                     compiled.run_sqp_with_callback(
                         runtime,
                         &options_for_callback,
-                        move |snapshot| match compiled
-                            .build_interval_arcs(&snapshot.trajectories, &runtime.parameters)
-                        {
-                            Ok((x_arcs, u_arcs)) => {
-                                let mut builder = build_for_callback
-                                    .lock()
-                                    .expect("artifact builder poisoned");
-                                let mut artifact =
-                                    (*builder)(&snapshot.trajectories, &x_arcs, &u_arcs);
-                                drop(builder);
-                                let progress = sqp_progress(&snapshot.solver);
-                                artifact.solver = running_solver_for_callback
-                                    .clone()
-                                    .with_iterations(progress.iteration)
-                                    .with_solve_seconds(solve_started.elapsed().as_secs_f64());
-                                if let Err(error) = try_attach_multiple_shooting_constraint_panels(
-                                    &mut artifact,
-                                    compiled,
-                                    runtime,
-                                    &snapshot.trajectories,
-                                    solver_config.constraint_tol,
-                                ) {
-                                    submit.submit(SolveStreamEvent::Log {
-                                        line: format!(
-                                            "[constraint violation report failed: {error}]"
-                                        ),
-                                        level: SolveLogLevel::Info,
-                                    });
+                        move |snapshot| {
+                            let progress = sqp_progress(&snapshot.solver);
+                            emit_event(
+                                &emit_progress_for_callback,
+                                SolveStreamEvent::Progress {
+                                    progress: progress.clone(),
+                                },
+                            );
+                            match compiled
+                                .build_interval_arcs(&snapshot.trajectories, &runtime.parameters)
+                            {
+                                Ok((x_arcs, u_arcs)) => {
+                                    let mut builder = build_for_callback
+                                        .lock()
+                                        .expect("artifact builder poisoned");
+                                    let mut artifact =
+                                        (*builder)(&snapshot.trajectories, &x_arcs, &u_arcs);
+                                    drop(builder);
+                                    artifact.solver = running_solver_for_callback
+                                        .clone()
+                                        .with_iterations(progress.iteration)
+                                        .with_solve_seconds(solve_started.elapsed().as_secs_f64());
+                                    if let Err(error) =
+                                        try_attach_multiple_shooting_constraint_panels(
+                                            &mut artifact,
+                                            compiled,
+                                            runtime,
+                                            &snapshot.trajectories,
+                                            solver_config.constraint_tol,
+                                        )
+                                    {
+                                        submit.submit(SolveStreamEvent::Log {
+                                            line: format!(
+                                                "[constraint violation report failed: {error}]"
+                                            ),
+                                            level: SolveLogLevel::Info,
+                                        });
+                                    }
+                                    submit
+                                        .submit(SolveStreamEvent::Iteration { progress, artifact });
                                 }
-                                submit.submit(SolveStreamEvent::Iteration { progress, artifact });
+                                Err(error) => submit.submit(SolveStreamEvent::Log {
+                                    line: format!("[iteration visualization failed: {error}]"),
+                                    level: SolveLogLevel::Info,
+                                }),
                             }
-                            Err(error) => submit.submit(SolveStreamEvent::Log {
-                                line: format!("[iteration visualization failed: {error}]"),
-                                level: SolveLogLevel::Info,
-                            }),
                         },
                     )
                 },
@@ -8990,6 +9003,7 @@ where
             let emit_for_worker = emit.clone();
             let solve_started = started;
             let running_solver_for_callback = running_solver.clone();
+            let emit_for_progress = emit.clone();
             let solved = match with_latest_only_worker(
                 move |event| {
                     emit_event(&emit_for_worker, event);
@@ -8997,6 +9011,7 @@ where
                 |submit| {
                     let build_for_callback = build_artifact.clone();
                     let options_for_callback = options.clone();
+                    let emit_progress_for_callback = emit_for_progress.clone();
                     compiled.run_nlip_with_control_callback(
                         runtime,
                         &options_for_callback,
@@ -9004,6 +9019,13 @@ where
                             if !crate::solve_should_continue() {
                                 return false;
                             }
+                            let progress = nlip_progress(&snapshot.solver);
+                            emit_event(
+                                &emit_progress_for_callback,
+                                SolveStreamEvent::Progress {
+                                    progress: progress.clone(),
+                                },
+                            );
                             match compiled
                                 .build_interval_arcs(&snapshot.trajectories, &runtime.parameters)
                             {
@@ -9014,7 +9036,6 @@ where
                                     let mut artifact =
                                         (*builder)(&snapshot.trajectories, &x_arcs, &u_arcs);
                                     drop(builder);
-                                    let progress = nlip_progress(&snapshot.solver);
                                     artifact.solver = running_solver_for_callback
                                         .clone()
                                         .with_iterations(progress.iteration)
@@ -9103,50 +9124,63 @@ where
             let emit_for_worker = emit.clone();
             let solve_started = started;
             let running_solver_for_callback = running_solver.clone();
+            let emit_for_progress = emit.clone();
             let solved = match with_latest_only_worker(
                 move |event| {
                     emit_event(&emit_for_worker, event);
                 },
                 |submit| {
                     let build_for_callback = build_artifact.clone();
+                    let emit_progress_for_callback = emit_for_progress.clone();
                     compiled.run_ipopt_with_callback(
                         runtime,
                         &ipopt_options(solver_config),
-                        move |snapshot| match compiled
-                            .build_interval_arcs(&snapshot.trajectories, &runtime.parameters)
-                        {
-                            Ok((x_arcs, u_arcs)) => {
-                                let mut builder = build_for_callback
-                                    .lock()
-                                    .expect("artifact builder poisoned");
-                                let mut artifact =
-                                    (*builder)(&snapshot.trajectories, &x_arcs, &u_arcs);
-                                drop(builder);
-                                let progress = ipopt_progress(&snapshot.solver);
-                                artifact.solver = running_solver_for_callback
-                                    .clone()
-                                    .with_iterations(progress.iteration)
-                                    .with_solve_seconds(solve_started.elapsed().as_secs_f64());
-                                if let Err(error) = try_attach_multiple_shooting_constraint_panels(
-                                    &mut artifact,
-                                    compiled,
-                                    runtime,
-                                    &snapshot.trajectories,
-                                    solver_config.constraint_tol,
-                                ) {
-                                    submit.submit(SolveStreamEvent::Log {
-                                        line: format!(
-                                            "[constraint violation report failed: {error}]"
-                                        ),
-                                        level: SolveLogLevel::Info,
-                                    });
+                        move |snapshot| {
+                            let progress = ipopt_progress(&snapshot.solver);
+                            emit_event(
+                                &emit_progress_for_callback,
+                                SolveStreamEvent::Progress {
+                                    progress: progress.clone(),
+                                },
+                            );
+                            match compiled
+                                .build_interval_arcs(&snapshot.trajectories, &runtime.parameters)
+                            {
+                                Ok((x_arcs, u_arcs)) => {
+                                    let mut builder = build_for_callback
+                                        .lock()
+                                        .expect("artifact builder poisoned");
+                                    let mut artifact =
+                                        (*builder)(&snapshot.trajectories, &x_arcs, &u_arcs);
+                                    drop(builder);
+                                    artifact.solver = running_solver_for_callback
+                                        .clone()
+                                        .with_iterations(progress.iteration)
+                                        .with_solve_seconds(solve_started.elapsed().as_secs_f64());
+                                    if let Err(error) =
+                                        try_attach_multiple_shooting_constraint_panels(
+                                            &mut artifact,
+                                            compiled,
+                                            runtime,
+                                            &snapshot.trajectories,
+                                            solver_config.constraint_tol,
+                                        )
+                                    {
+                                        submit.submit(SolveStreamEvent::Log {
+                                            line: format!(
+                                                "[constraint violation report failed: {error}]"
+                                            ),
+                                            level: SolveLogLevel::Info,
+                                        });
+                                    }
+                                    submit
+                                        .submit(SolveStreamEvent::Iteration { progress, artifact });
                                 }
-                                submit.submit(SolveStreamEvent::Iteration { progress, artifact });
+                                Err(error) => submit.submit(SolveStreamEvent::Log {
+                                    line: format!("[iteration visualization failed: {error}]"),
+                                    level: SolveLogLevel::Info,
+                                }),
                             }
-                            Err(error) => submit.submit(SolveStreamEvent::Log {
-                                line: format!("[iteration visualization failed: {error}]"),
-                                level: SolveLogLevel::Info,
-                            }),
                         },
                     )
                 },
@@ -9394,6 +9428,8 @@ where
             let emit_for_worker = emit.clone();
             let solve_started = started;
             let running_solver_for_callback = running_solver.clone();
+            let emit_for_progress = emit.clone();
+            let mut previous_callback_at: Option<Instant> = None;
             let solved = match with_latest_only_worker(
                 move |event| {
                     emit_event(&emit_for_worker, event);
@@ -9401,21 +9437,57 @@ where
                 |submit| {
                     let build_for_callback = build_artifact.clone();
                     let options_for_callback = options.clone();
+                    let emit_progress_for_callback = emit_for_progress.clone();
                     compiled.run_sqp_with_callback(
                         runtime,
                         &options_for_callback,
                         move |snapshot| {
+                            let callback_started = Instant::now();
+                            let interval = previous_callback_at
+                                .replace(callback_started)
+                                .map(|previous| callback_started.duration_since(previous));
+                            let progress = sqp_progress(&snapshot.solver);
+                            if let Some(interval) = interval {
+                                emit_event(
+                                    &emit_progress_for_callback,
+                                    SolveStreamEvent::Timing {
+                                        timing: timing_sample(
+                                            "callback interval",
+                                            Some(progress.iteration),
+                                            interval,
+                                        ),
+                                    },
+                                );
+                            }
+                            emit_event(
+                                &emit_progress_for_callback,
+                                SolveStreamEvent::Progress {
+                                    progress: progress.clone(),
+                                },
+                            );
+                            let artifact_started = Instant::now();
                             let mut artifact = {
                                 let mut builder = build_for_callback
                                     .lock()
                                     .expect("artifact builder poisoned");
                                 (*builder)(&snapshot.trajectories, &snapshot.time_grid)
                             };
-                            let progress = sqp_progress(&snapshot.solver);
+                            let artifact_build = artifact_started.elapsed();
+                            emit_event(
+                                &emit_progress_for_callback,
+                                SolveStreamEvent::Timing {
+                                    timing: timing_sample(
+                                        "artifact build",
+                                        Some(progress.iteration),
+                                        artifact_build,
+                                    ),
+                                },
+                            );
                             artifact.solver = running_solver_for_callback
                                 .clone()
                                 .with_iterations(progress.iteration)
                                 .with_solve_seconds(solve_started.elapsed().as_secs_f64());
+                            let constraint_started = Instant::now();
                             if let Err(error) = try_attach_direct_collocation_constraint_panels(
                                 &mut artifact,
                                 compiled,
@@ -9428,7 +9500,28 @@ where
                                     level: SolveLogLevel::Info,
                                 });
                             }
+                            emit_event(
+                                &emit_progress_for_callback,
+                                SolveStreamEvent::Timing {
+                                    timing: timing_sample(
+                                        "constraint panels",
+                                        Some(progress.iteration),
+                                        constraint_started.elapsed(),
+                                    ),
+                                },
+                            );
+                            let iteration = progress.iteration;
                             submit.submit(SolveStreamEvent::Iteration { progress, artifact });
+                            emit_event(
+                                &emit_progress_for_callback,
+                                SolveStreamEvent::Timing {
+                                    timing: timing_sample(
+                                        "callback wall",
+                                        Some(iteration),
+                                        callback_started.elapsed(),
+                                    ),
+                                },
+                            );
                         },
                     )
                 },
@@ -9485,6 +9578,8 @@ where
             let emit_for_worker = emit.clone();
             let solve_started = started;
             let running_solver_for_callback = running_solver.clone();
+            let emit_for_progress = emit.clone();
+            let mut previous_callback_at: Option<Instant> = None;
             let solved = match with_latest_only_worker(
                 move |event| {
                     emit_event(&emit_for_worker, event);
@@ -9492,6 +9587,7 @@ where
                 |submit| {
                     let build_for_callback = build_artifact.clone();
                     let options_for_callback = options.clone();
+                    let emit_progress_for_callback = emit_for_progress.clone();
                     compiled.run_nlip_with_control_callback(
                         runtime,
                         &options_for_callback,
@@ -9499,17 +9595,52 @@ where
                             if !crate::solve_should_continue() {
                                 return false;
                             }
+                            let callback_started = Instant::now();
+                            let interval = previous_callback_at
+                                .replace(callback_started)
+                                .map(|previous| callback_started.duration_since(previous));
+                            let progress = nlip_progress(&snapshot.solver);
+                            if let Some(interval) = interval {
+                                emit_event(
+                                    &emit_progress_for_callback,
+                                    SolveStreamEvent::Timing {
+                                        timing: timing_sample(
+                                            "callback interval",
+                                            Some(progress.iteration),
+                                            interval,
+                                        ),
+                                    },
+                                );
+                            }
+                            emit_event(
+                                &emit_progress_for_callback,
+                                SolveStreamEvent::Progress {
+                                    progress: progress.clone(),
+                                },
+                            );
+                            let artifact_started = Instant::now();
                             let mut artifact = {
                                 let mut builder = build_for_callback
                                     .lock()
                                     .expect("artifact builder poisoned");
                                 (*builder)(&snapshot.trajectories, &snapshot.time_grid)
                             };
-                            let progress = nlip_progress(&snapshot.solver);
+                            let artifact_build = artifact_started.elapsed();
+                            emit_event(
+                                &emit_progress_for_callback,
+                                SolveStreamEvent::Timing {
+                                    timing: timing_sample(
+                                        "artifact build",
+                                        Some(progress.iteration),
+                                        artifact_build,
+                                    ),
+                                },
+                            );
                             artifact.solver = running_solver_for_callback
                                 .clone()
                                 .with_iterations(progress.iteration)
                                 .with_solve_seconds(solve_started.elapsed().as_secs_f64());
+                            let constraint_started = Instant::now();
                             if let Err(error) = try_attach_direct_collocation_constraint_panels(
                                 &mut artifact,
                                 compiled,
@@ -9522,7 +9653,28 @@ where
                                     level: SolveLogLevel::Info,
                                 });
                             }
+                            let iteration = progress.iteration;
                             submit.submit(SolveStreamEvent::Iteration { progress, artifact });
+                            emit_event(
+                                &emit_progress_for_callback,
+                                SolveStreamEvent::Timing {
+                                    timing: timing_sample(
+                                        "constraint panels",
+                                        Some(iteration),
+                                        constraint_started.elapsed(),
+                                    ),
+                                },
+                            );
+                            emit_event(
+                                &emit_progress_for_callback,
+                                SolveStreamEvent::Timing {
+                                    timing: timing_sample(
+                                        "callback wall",
+                                        Some(iteration),
+                                        callback_started.elapsed(),
+                                    ),
+                                },
+                            );
                             crate::solve_should_continue()
                         },
                     )
@@ -9592,13 +9744,16 @@ where
                         runtime,
                         &options_for_callback,
                         move |snapshot| {
+                            let progress = ipopt_progress(&snapshot.solver);
+                            submit.submit(SolveStreamEvent::Progress {
+                                progress: progress.clone(),
+                            });
                             let mut artifact = {
                                 let mut builder = build_for_callback
                                     .lock()
                                     .expect("artifact builder poisoned");
                                 (*builder)(&snapshot.trajectories, &snapshot.time_grid)
                             };
-                            let progress = ipopt_progress(&snapshot.solver);
                             artifact.solver = running_solver_for_callback
                                 .clone()
                                 .with_iterations(progress.iteration)
@@ -11320,14 +11475,14 @@ mod tests {
         assert_eq!(intervals.editor, ControlEditor::Text);
         assert_eq!(intervals.value_display, ControlValueDisplay::Integer);
         assert!(intervals.choices.is_empty());
-        assert_eq!(intervals.min, 10.0);
-        assert_eq!(intervals.max, 40.0);
+        assert_eq!(intervals.min, 1.0);
+        assert_eq!(intervals.max, usize::MAX as f64);
         assert_eq!(collocation_nodes.editor, ControlEditor::Select);
         assert_eq!(collocation_nodes.choices.len(), 3);
     }
 
     #[test]
-    fn transcription_from_map_accepts_any_interval_inside_configured_range() {
+    fn transcription_from_map_accepts_any_positive_interval() {
         let default = default_transcription(30);
         let mut values = BTreeMap::new();
         values.insert("transcription_intervals".to_string(), 25.0);
@@ -11337,9 +11492,14 @@ mod tests {
         assert_eq!(parsed.intervals, 25);
 
         values.insert("transcription_intervals".to_string(), 45.0);
+        let parsed = transcription_from_map(&values, default, &[10, 20, 30, 40], &[3])
+            .expect("interval outside suggested presets should still parse");
+        assert_eq!(parsed.intervals, 45);
+
+        values.insert("transcription_intervals".to_string(), 0.0);
         let error = transcription_from_map(&values, default, &[10, 20, 30, 40], &[3])
-            .expect_err("interval outside range should fail");
-        assert!(error.to_string().contains("expected 10..=40"));
+            .expect_err("nonpositive interval should fail");
+        assert!(error.to_string().contains("transcription_intervals"));
     }
 
     #[test]

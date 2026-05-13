@@ -5,6 +5,7 @@ use std::io;
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::fd::{FromRawFd, RawFd};
+use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 
@@ -20,9 +21,9 @@ use axum::{
 use clap::Parser;
 use optimal_control_problems::{
     CompileCacheState, CompileCacheStatus, ControlSemantic, ProblemId, SolveArtifact,
-    SolveLogLevel, SolveRequest, SolveStage, SolveStatus, SolveStreamEvent, SolverMethod,
-    SolverReport, compile_variant_for_problem, prewarm_problem_with_progress, problem_specs,
-    solve_problem, solve_problem_with_progress, with_solve_cancellation_check,
+    SolveLogLevel, SolveRequest, SolveStage, SolveStatus, SolveStreamEvent, SolveTimingSample,
+    SolverMethod, SolverReport, compile_variant_for_problem, prewarm_problem_with_progress,
+    problem_specs, solve_problem, solve_problem_with_progress, with_solve_cancellation_check,
 };
 use optimization::{AnsiColorMode, InteriorPointLinearSolver, set_ansi_color_mode};
 use serde::Serialize;
@@ -567,6 +568,8 @@ fn forward_compile_event(shared: &Arc<ActorShared>, event: &SolveStreamEvent) {
     let status = match event {
         SolveStreamEvent::Status { status } if is_compile_stage(status.stage) => status.clone(),
         SolveStreamEvent::Log { .. }
+        | SolveStreamEvent::Progress { .. }
+        | SolveStreamEvent::Timing { .. }
         | SolveStreamEvent::Iteration { .. }
         | SolveStreamEvent::Final { .. }
         | SolveStreamEvent::Error { .. }
@@ -597,6 +600,11 @@ fn forward_compile_event(shared: &Arc<ActorShared>, event: &SolveStreamEvent) {
     }
 }
 
+struct QueuedSolveEvent {
+    event: SolveStreamEvent,
+    queued_at: std::time::Instant,
+}
+
 fn run_solve_stream(problem: ProblemId, values: BTreeMap<String, f64>, sender: StreamSender) {
     if sender.is_closed() {
         return;
@@ -611,17 +619,60 @@ fn run_solve_stream(problem: ProblemId, values: BTreeMap<String, f64>, sender: S
     let capture_state = StreamStdIoCapture::start(&sender);
 
     let sender_for_cancel = sender.clone();
-    let sender_for_progress = sender.clone();
+    let (event_tx, event_rx) = std_mpsc::channel::<QueuedSolveEvent>();
+    let relay_sender = sender.clone();
+    let relay_handle = thread::spawn(move || {
+        while let Ok(queued) = event_rx.recv() {
+            if relay_sender.is_closed() {
+                break;
+            }
+            let iteration = stream_event_iteration(&queued.event);
+            send_stream_event_raw(
+                &relay_sender,
+                SolveStreamEvent::Timing {
+                    timing: SolveTimingSample {
+                        label: "backend queue wait".to_string(),
+                        iteration,
+                        seconds: queued.queued_at.elapsed().as_secs_f64(),
+                    },
+                },
+            );
+            let event = queued.event;
+            send_stream_event_timed(&relay_sender, event);
+        }
+    });
+    let event_tx_for_progress = event_tx.clone();
     let result = with_solve_cancellation_check(
         move || !sender_for_cancel.is_closed(),
         move || {
             solve_problem_with_progress(problem, &values, move |event| {
-                if !sender_for_progress.is_closed() && should_forward_solve_event(&event) {
-                    send_stream_event(&sender_for_progress, event);
+                if should_forward_solve_event(&event) {
+                    let iteration = stream_event_iteration(&event);
+                    let should_time_enqueue = !matches!(event, SolveStreamEvent::Timing { .. });
+                    let enqueue_started = std::time::Instant::now();
+                    let sent = event_tx_for_progress.send(QueuedSolveEvent {
+                        event,
+                        queued_at: std::time::Instant::now(),
+                    });
+                    let enqueue_s = enqueue_started.elapsed().as_secs_f64();
+                    if sent.is_ok() && should_time_enqueue {
+                        let _ = event_tx_for_progress.send(QueuedSolveEvent {
+                            event: SolveStreamEvent::Timing {
+                                timing: SolveTimingSample {
+                                    label: "callback enqueue".to_string(),
+                                    iteration,
+                                    seconds: enqueue_s,
+                                },
+                            },
+                            queued_at: std::time::Instant::now(),
+                        });
+                    }
                 }
             })
         },
     );
+    drop(event_tx);
+    let _ = relay_handle.join();
 
     #[cfg(unix)]
     if let Some(capture_state) = capture_state {
@@ -822,9 +873,40 @@ fn send_stream_error(sender: &StreamSender, error: impl ToString) {
 }
 
 fn send_stream_event(sender: &StreamSender, event: SolveStreamEvent) {
+    send_stream_event_raw(sender, event);
+}
+
+fn send_stream_event_timed(sender: &StreamSender, event: SolveStreamEvent) {
+    let iteration = stream_event_iteration(&event);
+    let serialize_started = std::time::Instant::now();
     if let Ok(mut payload) = serde_json::to_vec(&event) {
+        let serialize_s = serialize_started.elapsed().as_secs_f64();
         payload.push(b'\n');
+        let send_started = std::time::Instant::now();
         let _ = sender.blocking_send(Ok(Bytes::from(payload)));
+        let send_s = send_started.elapsed().as_secs_f64();
+        if !matches!(event, SolveStreamEvent::Timing { .. }) {
+            send_stream_event_raw(
+                sender,
+                SolveStreamEvent::Timing {
+                    timing: SolveTimingSample {
+                        label: "stream serialize".to_string(),
+                        iteration,
+                        seconds: serialize_s,
+                    },
+                },
+            );
+            send_stream_event_raw(
+                sender,
+                SolveStreamEvent::Timing {
+                    timing: SolveTimingSample {
+                        label: "stream send".to_string(),
+                        iteration,
+                        seconds: send_s,
+                    },
+                },
+            );
+        }
     }
 }
 
@@ -832,6 +914,23 @@ async fn send_stream_event_async(sender: &StreamSender, event: SolveStreamEvent)
     if let Ok(mut payload) = serde_json::to_vec(&event) {
         payload.push(b'\n');
         let _ = sender.send(Ok(Bytes::from(payload))).await;
+    }
+}
+
+fn send_stream_event_raw(sender: &StreamSender, event: SolveStreamEvent) {
+    if let Ok(mut payload) = serde_json::to_vec(&event) {
+        payload.push(b'\n');
+        let _ = sender.blocking_send(Ok(Bytes::from(payload)));
+    }
+}
+
+fn stream_event_iteration(event: &SolveStreamEvent) -> Option<usize> {
+    match event {
+        SolveStreamEvent::Progress { progress } | SolveStreamEvent::Iteration { progress, .. } => {
+            Some(progress.iteration)
+        }
+        SolveStreamEvent::Timing { timing } => timing.iteration,
+        _ => None,
     }
 }
 
