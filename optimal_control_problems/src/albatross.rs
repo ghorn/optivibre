@@ -127,6 +127,7 @@ struct Design<T> {
     h0: T,
     vx0: T,
     vy0: T,
+    vz0: T,
     tf: T,
 }
 
@@ -144,6 +145,7 @@ where
             h0: tf.clone(),
             vx0: tf.clone(),
             vy0: tf.clone(),
+            vz0: tf.clone(),
             tf,
         }
     }
@@ -245,6 +247,7 @@ pub struct Params {
     vx0: DesignControl,
     tf: DesignControl,
     constrain_vy0_zero: bool,
+    constrain_vz0_zero: bool,
     gravity_mps2: f64,
     air_density_kg_m3: f64,
     mass_kg: f64,
@@ -310,7 +313,8 @@ impl Default for Params {
                 lower: 3.0,
                 upper: 12.0,
             },
-            constrain_vy0_zero: false,
+            constrain_vy0_zero: true,
+            constrain_vz0_zero: false,
             gravity_mps2: DEFAULT_GRAVITY_MPS2,
             air_density_kg_m3: DEFAULT_AIR_DENSITY_KG_M3,
             mass_kg: DEFAULT_MASS_KG,
@@ -432,6 +436,15 @@ impl FromMap for Params {
                 values,
                 "constrain_vy0_zero",
                 if defaults.constrain_vy0_zero {
+                    1.0
+                } else {
+                    0.0
+                },
+            ) >= 0.5,
+            constrain_vz0_zero: sample_or_default(
+                values,
+                "constrain_vz0_zero",
+                if defaults.constrain_vz0_zero {
                     1.0
                 } else {
                     0.0
@@ -780,9 +793,15 @@ pub fn spec() -> ProblemSpec {
     extra.extend([
         checkbox_control(
             "constrain_vy0_zero",
-            "Vy(0) = 0",
+            "vy(0) Anchor",
             defaults.constrain_vy0_zero,
-            "When checked, the lateral initial velocity is fixed at zero. When unchecked, vy(0) is a free global design variable while vy(T)-vy(0)=0 remains enforced.",
+            "Choose whether vy(0) is constrained to zero or left as a periodic free global value.",
+        ),
+        checkbox_control(
+            "constrain_vz0_zero",
+            "vz(0) Anchor",
+            defaults.constrain_vz0_zero,
+            "Choose whether vz(0) is constrained to zero or left as a periodic free global value.",
         ),
         problem_slider_control(
             "gravity_mps2",
@@ -1113,8 +1132,8 @@ pub fn spec() -> ProblemSpec {
                     r"p_y(0)=0,\quad p_y(T)=0".to_string(),
                     r"p_z(0)=h_0,\quad p_z(T)-p_z(0)=0".to_string(),
                     r"v_x(0)=v_{x0},\quad v_x(T)-v_x(0)=0".to_string(),
-                    r"v_y(0)=v_{y0},\quad v_y(T)-v_y(0)=0,\quad v_{y0}=0\ \text{when the boundary anchor is enabled}".to_string(),
-                    r"v_z(0)=0,\quad v_z(T)=0".to_string(),
+                    r"v_y(0)=v_{y0},\quad v_y(T)-v_y(0)=0,\quad v_{y0}=0\ \text{when the }v_y\text{ anchor is enabled}".to_string(),
+                    r"v_z(0)=v_{z0},\quad v_z(T)=0,\quad v_{z0}=0\ \text{when the }v_z\text{ anchor is enabled}".to_string(),
                     r"\alpha(T)-\alpha(0)=0,\quad \phi(T)-\phi(0)=0".to_string(),
                 ],
             },
@@ -1312,7 +1331,7 @@ fn model<Scheme>(
             vx_periodic: xt.vx.clone() - x0.vx.clone(),
             vy0: x0.vy.clone() - g.vy0.clone(),
             vy_periodic: xt.vy.clone() - x0.vy.clone(),
-            vz0: x0.vz.clone(),
+            vz0: x0.vz.clone() - g.vz0.clone(),
             vz_t: xt.vz.clone(),
             alpha_periodic: ut.alpha.clone() - u0.alpha.clone(),
             roll_periodic: ut.roll.clone() - u0.roll.clone(),
@@ -1343,6 +1362,7 @@ fn active_design(params: &Params) -> Result<Design<f64>> {
         h0: active_design_value("h0", &params.h0)?,
         vx0: active_design_value("vx0", &params.vx0)?,
         vy0: 0.0,
+        vz0: 0.0,
         tf: active_design_value("tf", &params.tf)?,
     })
 }
@@ -1822,7 +1842,7 @@ fn path_bounds(params: &Params) -> Path<Bounds1D> {
 }
 
 fn global_bounds(params: &Params) -> Design<Bounds1D> {
-    let vy0_speed_bound = params
+    let initial_velocity_bound = params
         .max_airspeed_mps
         .abs()
         .max(params.min_airspeed_mps.abs())
@@ -1838,8 +1858,19 @@ fn global_bounds(params: &Params) -> Design<Bounds1D> {
             }
         } else {
             Bounds1D {
-                lower: Some(-vy0_speed_bound),
-                upper: Some(vy0_speed_bound),
+                lower: Some(-initial_velocity_bound),
+                upper: Some(initial_velocity_bound),
+            }
+        },
+        vz0: if params.constrain_vz0_zero {
+            Bounds1D {
+                lower: Some(0.0),
+                upper: Some(0.0),
+            }
+        } else {
+            Bounds1D {
+                lower: Some(-initial_velocity_bound),
+                upper: Some(initial_velocity_bound),
             }
         },
         tf: design_bounds(&params.tf),
@@ -1981,6 +2012,7 @@ fn scaling(
             h0: params.h0.value.abs().max(5.0),
             vx0: params.vx0.value.abs().max(25.0),
             vy0: 15.0,
+            vz0: 15.0,
             tf: params.tf.value.abs().max(5.0),
         },
         parameters: ModelParams {
@@ -3331,7 +3363,8 @@ mod tests {
         assert_eq!(params.tf.value, 6.0);
         assert_eq!(params.tf.lower, 3.0);
         assert_eq!(params.tf.upper, 12.0);
-        assert!(!params.constrain_vy0_zero);
+        assert!(params.constrain_vy0_zero);
+        assert!(!params.constrain_vz0_zero);
         assert_eq!(params.gravity_mps2, DEFAULT_GRAVITY_MPS2);
         assert_eq!(params.air_density_kg_m3, DEFAULT_AIR_DENSITY_KG_M3);
         assert_eq!(params.mass_kg, DEFAULT_MASS_KG);
@@ -3493,25 +3526,45 @@ mod tests {
     }
 
     #[test]
-    fn vy0_anchor_checkbox_switches_global_bounds_only() {
+    fn initial_velocity_anchor_controls_switch_global_bounds_only() {
         let mut values = BTreeMap::new();
-        let relaxed = Params::from_map(&values).expect("default params should parse");
-        let relaxed_bounds = global_bounds(&relaxed);
-        let relaxed_variant = compile_variant_for_values(&values).expect("relaxed variant");
+        let default_params = Params::from_map(&values).expect("default params should parse");
+        let default_bounds = global_bounds(&default_params);
+        let default_variant = compile_variant_for_values(&values).expect("default variant");
 
-        values.insert("constrain_vy0_zero".to_string(), 1.0);
-        let anchored = Params::from_map(&values).expect("anchored params should parse");
-        let anchored_bounds = global_bounds(&anchored);
-        let anchored_variant = compile_variant_for_values(&values).expect("anchored variant");
+        values.insert("constrain_vy0_zero".to_string(), 0.0);
+        values.insert("constrain_vz0_zero".to_string(), 1.0);
+        let switched = Params::from_map(&values).expect("switched anchor params should parse");
+        let switched_bounds = global_bounds(&switched);
+        let switched_variant = compile_variant_for_values(&values).expect("switched variant");
 
-        assert!(!relaxed.constrain_vy0_zero);
-        assert!(anchored.constrain_vy0_zero);
-        assert_eq!(anchored_variant, relaxed_variant);
-        assert_eq!(active_design(&relaxed).expect("active design").vy0, 0.0);
-        assert_eq!(relaxed_bounds.vy0.lower, Some(-relaxed.max_airspeed_mps));
-        assert_eq!(relaxed_bounds.vy0.upper, Some(relaxed.max_airspeed_mps));
-        assert_eq!(anchored_bounds.vy0.lower, Some(0.0));
-        assert_eq!(anchored_bounds.vy0.upper, Some(0.0));
+        assert!(default_params.constrain_vy0_zero);
+        assert!(!default_params.constrain_vz0_zero);
+        assert!(!switched.constrain_vy0_zero);
+        assert!(switched.constrain_vz0_zero);
+        assert_eq!(switched_variant, default_variant);
+        assert_eq!(
+            active_design(&default_params).expect("active design").vy0,
+            0.0
+        );
+        assert_eq!(
+            active_design(&default_params).expect("active design").vz0,
+            0.0
+        );
+        assert_eq!(default_bounds.vy0.lower, Some(0.0));
+        assert_eq!(default_bounds.vy0.upper, Some(0.0));
+        assert_eq!(
+            default_bounds.vz0.lower,
+            Some(-default_params.max_airspeed_mps)
+        );
+        assert_eq!(
+            default_bounds.vz0.upper,
+            Some(default_params.max_airspeed_mps)
+        );
+        assert_eq!(switched_bounds.vy0.lower, Some(-switched.max_airspeed_mps));
+        assert_eq!(switched_bounds.vy0.upper, Some(switched.max_airspeed_mps));
+        assert_eq!(switched_bounds.vz0.lower, Some(0.0));
+        assert_eq!(switched_bounds.vz0.upper, Some(0.0));
     }
 
     #[test]

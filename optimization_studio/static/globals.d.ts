@@ -57,4 +57,5 @@ interface MathJaxStatic {
 interface Window {
   MathJax?: MathJaxStatic;
   Plotly?: PlotlyStatic;
+  THREE?: any;
 }

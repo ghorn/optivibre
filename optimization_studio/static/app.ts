@@ -1023,6 +1023,25 @@ interface Scene2DView {
   plotEl: PlotlyHostElement;
 }
 
+interface ThreeSceneLayerOption {
+  visible: boolean;
+  scale: number;
+}
+
+interface ThreeScenePointerState {
+  pointerId: number;
+  mode: "rotate" | "pan";
+  lastX: number;
+  lastY: number;
+}
+
+interface ThreeSceneCameraState {
+  target: [number, number, number];
+  yaw: number;
+  pitch: number;
+  distance: number;
+}
+
 interface Scene3DView {
   kind: "paths_3d";
   visualization: Paths3DVisualization;
@@ -1030,13 +1049,24 @@ interface Scene3DView {
   meta: HTMLDivElement;
   playButton: null;
   slider: null;
-  plotEl: PlotlyHostElement;
-  sceneCamera: PlotlyObject | null;
-  sceneInteractionBound: boolean;
-  sceneInteracting: boolean;
-  scenePointerActive: boolean;
-  sceneIdleFrameHandle: number | null;
-  sceneTraceSignature: string | null;
+  surfaceEl: HTMLDivElement;
+  renderer: any;
+  threeScene: any;
+  camera: any;
+  dataRoot: any;
+  gridRoot: any;
+  legendEl: HTMLDivElement;
+  layerPanel: HTMLDetailsElement;
+  layerOptions: Record<string, ThreeSceneLayerOption>;
+  pointerState: ThreeScenePointerState | null;
+  cameraState: ThreeSceneCameraState;
+  defaultCameraState: ThreeSceneCameraState | null;
+  cameraInitialized: boolean;
+  renderFrameHandle: number | null;
+  interactionFrameHandle: number | null;
+  interactionDirty: boolean;
+  resizeObserver: ResizeObserver | null;
+  controlsAbortController: AbortController | null;
 }
 
 type SceneView = Scene2DView | Scene3DView;
@@ -1094,10 +1124,13 @@ interface FrontendState {
   liveStatus: SolveStatus | null;
   liveSolver: SolverReport | null;
   terminalSolver: SolverReport | null;
+  solverPhaseCardOpen: Record<string, boolean>;
+  solverPhaseAutoCollapsed: boolean;
   solveAbortController: AbortController | null;
   solveStopRequested: boolean;
   pendingIterationEvent: IterationSolveEvent | null;
   iterationFlushScheduled: boolean;
+  deferredInteractionIterations: IterationSolveEvent[];
   sceneView: SceneView | null;
   linkedChartRange: NumericRange | null;
   linkedChartAutorange: boolean;
@@ -2197,10 +2230,13 @@ const state: FrontendState = {
   liveStatus: null,
   liveSolver: null,
   terminalSolver: null,
+  solverPhaseCardOpen: {},
+  solverPhaseAutoCollapsed: false,
   solveAbortController: null,
   solveStopRequested: false,
   pendingIterationEvent: null,
   iterationFlushScheduled: false,
+  deferredInteractionIterations: [],
   sceneView: null,
   linkedChartRange: null,
   linkedChartAutorange: true,
@@ -4442,6 +4478,14 @@ interface AppendControlOptions {
   checkboxText?: string;
 }
 
+interface SegmentedBooleanOptions {
+  className?: string;
+  label: string;
+  help?: string;
+  falseLabel: string;
+  trueLabel: string;
+}
+
 function appendControl(
   wrapperParent: HTMLElement,
   control: ControlSpec,
@@ -4679,6 +4723,58 @@ function appendControl(
   wrapperParent.appendChild(wrapper);
 }
 
+function appendSegmentedBooleanControl(
+  wrapperParent: HTMLElement,
+  control: ControlSpec,
+  options: SegmentedBooleanOptions,
+): void {
+  const wrapper = document.createElement("section");
+  wrapper.className = options.className ?? "control-group segmented-control-group";
+  const value = effectiveControlValue(control) >= 0.5 ? 1 : 0;
+
+  const header = document.createElement("div");
+  header.className = "segmented-control-header";
+
+  const label = document.createElement("div");
+  label.className = "control-label";
+  label.textContent = options.label;
+  header.appendChild(label);
+
+  if (options.help && options.help.length > 0) {
+    const help = document.createElement("div");
+    help.className = "control-help";
+    help.textContent = options.help;
+    header.appendChild(help);
+  }
+
+  const segmented = document.createElement("div");
+  segmented.className = "segmented-control";
+  segmented.setAttribute("role", "radiogroup");
+  segmented.setAttribute("aria-label", options.label);
+
+  const setValue = (numeric: 0 | 1): void => {
+    state.values[control.id] = numeric;
+    handleControlUpdate(control);
+  };
+
+  const appendOption = (numeric: 0 | 1, optionLabel: string): void => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "segmented-option";
+    button.dataset.active = value === numeric ? "true" : "false";
+    button.setAttribute("role", "radio");
+    button.setAttribute("aria-checked", value === numeric ? "true" : "false");
+    button.textContent = optionLabel;
+    button.addEventListener("click", () => setValue(numeric));
+    segmented.appendChild(button);
+  };
+
+  appendOption(0, options.falseLabel);
+  appendOption(1, options.trueLabel);
+  wrapper.append(header, segmented);
+  wrapperParent.appendChild(wrapper);
+}
+
 function appendControlPanel(wrapperParent: HTMLElement, panel: ControlPanelView): void {
   const shell = document.createElement("section");
   shell.className = "control-panel";
@@ -4802,23 +4898,22 @@ function appendAlbatrossDesignGroup(
     <div>
       <div class="design-variable-title">${label}</div>
       <div class="design-variable-help">${isFree
-        ? "Optimized as a global design variable."
-        : "Held fixed by equal lower and upper global bounds."}</div>
+        ? "Initial guess plus explicit lower and upper bounds."
+        : "One fixed value represented as equal global bounds."}</div>
     </div>
-    <div class="value-pill">${isFree ? "Free" : "Fixed"}</div>
   `;
 
   const body = document.createElement("div");
   body.className = "design-variable-body";
-  appendControl(body, modeControl, {
+  appendSegmentedBooleanControl(body, modeControl, {
     className: "design-control-row design-control-row-mode",
     label: "Mode",
-    help: "Check Free to optimize this design variable; leave it unchecked to hold the fixed value.",
-    checkboxText: "Free",
+    falseLabel: "Fixed",
+    trueLabel: "Free",
   });
   appendControl(body, valueControl, {
     className: "design-control-row",
-    label: `${label} ${isFree ? "Guess" : "Fixed"}`,
+    label: isFree ? "Initial Guess" : "Fixed Value",
     help: isFree
       ? "Initial guess for the free design variable. It must satisfy the active bounds."
       : "Fixed value used as equal lower and upper bounds.",
@@ -4835,6 +4930,49 @@ function appendAlbatrossDesignGroup(
       className: "design-control-row",
       label: "Upper Bound",
       help: `Upper bound for free ${label}.`,
+    });
+  }
+
+  shell.append(header, body);
+  wrapperParent.appendChild(shell);
+}
+
+function appendAlbatrossBoundaryAnchorGroup(
+  wrapperParent: HTMLElement,
+  controls: readonly ControlSpec[],
+): void {
+  if (controls.length === 0) {
+    return;
+  }
+  const shell = document.createElement("section");
+  shell.className = "control-subgroup boundary-anchor-group";
+
+  const header = document.createElement("div");
+  header.className = "control-subgroup-header";
+
+  const title = document.createElement("div");
+  title.className = "control-subgroup-title";
+  title.textContent = "Initial Velocity Anchors";
+
+  const help = document.createElement("div");
+  help.className = "control-subgroup-help";
+  help.textContent = "Periodic velocity constraints always remain enforced; these only choose whether the initial component is anchored at zero.";
+
+  header.append(title, help);
+
+  const body = document.createElement("div");
+  body.className = "control-subgroup-body";
+  for (const control of controls) {
+    const label = control.id === "constrain_vy0_zero"
+      ? "vy(0)"
+      : control.id === "constrain_vz0_zero"
+        ? "vz(0)"
+        : control.label;
+    appendSegmentedBooleanControl(body, control, {
+      className: "design-control-row boundary-anchor-row",
+      label,
+      falseLabel: "Free",
+      trueLabel: "Zero",
     });
   }
 
@@ -4994,22 +5132,18 @@ function albatrossProblemControlBlocks(controlsForSection: readonly ControlSpec[
   for (const prefix of designPrefixes) {
     taker.takePrefix(`${prefix}_`);
   }
-  const boundaryAnchorControls = taker.takeIds(["constrain_vy0_zero"]);
+  const boundaryAnchorControls = taker.takeIds(["constrain_vy0_zero", "constrain_vz0_zero"]);
   if (designPrefixes.length > 0) {
     blocks.push({
       key: controlBlockKey(section, "design_variables"),
-      title: "Design Variables",
-      subtitle: "Fixed values, guesses, free-variable bounds, and boundary anchors.",
+      title: "Design Variables & Anchors",
+      subtitle: "Global design-variable modes and optional initial velocity anchors.",
       defaultCollapsed: true,
       appendBody: (body) => {
         for (const prefix of designPrefixes) {
           appendAlbatrossDesignGroup(body, controlsForSection, prefix);
         }
-        appendControlSubgroup(body, {
-          title: "Boundary Anchors",
-          subtitle: "Optional fixed initial lateral-velocity anchor.",
-          controls: boundaryAnchorControls,
-        });
+        appendAlbatrossBoundaryAnchorGroup(body, boundaryAnchorControls);
       },
     });
   }
@@ -5387,34 +5521,94 @@ function createSceneView(scene: Scene2D): Scene2DView {
 }
 
 function createScene3DView(visualization: Paths3DVisualization): Scene3DView {
+  const three = window.THREE;
+  if (!three) {
+    throw new Error("Three.js is not available");
+  }
   const shell = document.createElement("div");
   shell.className = "scene-shell scene-shell-3d";
 
-  const toolbar = document.createElement("div");
-  toolbar.className = "scene-toolbar";
   const meta = document.createElement("div");
   meta.className = "scene-meta";
-  meta.textContent = visualizationSubtitle(visualization);
-  toolbar.appendChild(meta);
 
-  const plotEl = createPlotlyHostElement("plot-surface scene-plot-surface plot-surface-3d");
-  shell.append(toolbar, plotEl);
+  const surfaceEl = document.createElement("div");
+  surfaceEl.className = "plot-surface scene-plot-surface plot-surface-3d three-scene-surface";
+  surfaceEl.tabIndex = 0;
+  surfaceEl.setAttribute(
+    "aria-label",
+    "3D dynamic soaring scene. Left drag rotates, right drag pans, wheel zooms, double click resets.",
+  );
 
-  return {
+  const renderer = new three.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setClearColor(0x041016, 0);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  surfaceEl.appendChild(renderer.domElement);
+
+  const threeScene = new three.Scene();
+  const camera = new three.PerspectiveCamera(37, 1, 0.1, 10000);
+  camera.up.set(0, 0, 1);
+
+  const dataRoot = new three.Group();
+  const gridRoot = new three.Group();
+  threeScene.add(gridRoot);
+  threeScene.add(dataRoot);
+
+  const legendEl = document.createElement("div");
+  legendEl.className = "three-scene-legend";
+  const stopLegendSceneEvent = (event: Event): void => {
+    event.stopPropagation();
+  };
+  legendEl.addEventListener("pointerdown", stopLegendSceneEvent);
+  legendEl.addEventListener("pointerup", stopLegendSceneEvent);
+  legendEl.addEventListener("dblclick", stopLegendSceneEvent);
+  legendEl.addEventListener("wheel", stopLegendSceneEvent);
+  surfaceEl.appendChild(legendEl);
+
+  const layerPanel = document.createElement("details");
+  layerPanel.className = "three-scene-layer-panel";
+  layerPanel.open = false;
+
+  const layerOptions = createDefaultThreeSceneLayerOptions();
+
+  const view: Scene3DView = {
     kind: "paths_3d",
     visualization,
     shell,
     meta,
     playButton: null,
     slider: null,
-    plotEl,
-    sceneCamera: null,
-    sceneInteractionBound: false,
-    sceneInteracting: false,
-    scenePointerActive: false,
-    sceneIdleFrameHandle: null,
-    sceneTraceSignature: null,
+    surfaceEl,
+    renderer,
+    threeScene,
+    camera,
+    dataRoot,
+    gridRoot,
+    legendEl,
+    layerPanel,
+    layerOptions,
+    pointerState: null,
+    cameraState: {
+      target: [0, 0, 0],
+      yaw: THREE_SCENE_DEFAULT_YAW,
+      pitch: THREE_SCENE_DEFAULT_PITCH,
+      distance: 100,
+    },
+    defaultCameraState: null,
+    cameraInitialized: false,
+    renderFrameHandle: null,
+    interactionFrameHandle: null,
+    interactionDirty: false,
+    resizeObserver: null,
+    controlsAbortController: null,
   };
+  populateThreeSceneLayerPanel(view);
+  shell.append(surfaceEl, layerPanel);
+  bindThreeSceneControls(view);
+  view.resizeObserver = new ResizeObserver(() => {
+    requestThreeSceneRender(view);
+  });
+  view.resizeObserver.observe(surfaceEl);
+  return view;
 }
 
 function scenePlotBounds(scene: Scene2D): SceneBounds {
@@ -5660,8 +5854,11 @@ function resetSolverPanel(): void {
   state.liveStatus = null;
   state.liveSolver = null;
   state.terminalSolver = null;
+  state.solverPhaseCardOpen = {};
+  state.solverPhaseAutoCollapsed = false;
   state.pendingIterationEvent = null;
   state.iterationFlushScheduled = false;
+  state.deferredInteractionIterations = [];
   state.logLines = [];
   setConsoleFollowState(true);
   renderSolverSummary();
@@ -5703,6 +5900,7 @@ function selectProblem(problemId: ProblemIdCode): void {
   );
   state.artifact = null;
   state.animationIndex = 0;
+  disposeSceneView(state.sceneView);
   state.sceneView = null;
   resetChartViews();
   resetSolverPanel();
@@ -6528,22 +6726,36 @@ function createLongSolverPhaseDetail(detail: SolverPhaseDetail): HTMLElement {
 }
 
 function createSolverPhaseCard(options: {
+  key: string;
   label: string;
   value: string;
   active: boolean;
   details: SolverPhaseDetail[];
   fallbackText: string;
 }): HTMLElement {
-  const card = document.createElement("article");
+  const card = document.createElement("details");
   card.className = `solver-phase-card ${options.active ? "solver-phase-card-active" : ""}`.trim();
+  card.open = state.solverPhaseCardOpen[options.key] ?? true;
+  card.addEventListener("toggle", () => {
+    state.solverPhaseCardOpen[options.key] = card.open;
+  });
 
-  const head = document.createElement("div");
-  head.className = "solver-phase-head";
+  const head = document.createElement("summary");
+  head.className = "solver-phase-head solver-phase-summary";
 
-  const label = document.createElement("div");
+  const labelGroup = document.createElement("div");
+  labelGroup.className = "solver-phase-label-group";
+
+  const chevron = document.createElement("span");
+  chevron.className = "solver-phase-chevron";
+  chevron.textContent = "⌄";
+  labelGroup.appendChild(chevron);
+
+  const label = document.createElement("span");
   label.className = "solver-phase-label";
   label.textContent = options.label;
-  head.appendChild(label);
+  labelGroup.appendChild(label);
+  head.appendChild(labelGroup);
 
   const value = document.createElement("div");
   value.className = `solver-phase-time ${options.active ? "solver-phase-time-active" : ""}`.trim();
@@ -6615,6 +6827,7 @@ function renderSolverPhaseSummary(solver: SolverReport): HTMLElement {
   grid.className = "solver-phase-grid";
   grid.append(
     createSolverPhaseCard({
+      key: "symbolic_setup",
       label: "Symbolic Setup",
       value: formatCompileDuration(solver.symbolic_setup_s ?? null),
       active: activeStage === SOLVE_STAGE.symbolicSetup,
@@ -6622,6 +6835,7 @@ function renderSolverPhaseSummary(solver: SolverReport): HTMLElement {
       fallbackText: "Building symbolic model and derivatives.",
     }),
     createSolverPhaseCard({
+      key: "jit",
       label: "JIT",
       value: formatJitDurationWithOutcome(solver.jit_s ?? null, cacheOutcomeForSolver(solver)),
       active: activeStage === SOLVE_STAGE.jitCompilation,
@@ -6629,6 +6843,7 @@ function renderSolverPhaseSummary(solver: SolverReport): HTMLElement {
       fallbackText: "Compiling numeric evaluation kernels.",
     }),
     createSolverPhaseCard({
+      key: "solve",
       label: "Solve",
       value: formatDuration(solver.solve_s ?? null),
       active: activeStage === SOLVE_STAGE.solving,
@@ -7667,17 +7882,68 @@ function shouldRenderIterationArtifact(event: IterationSolveEvent, forceArtifact
     || event.progress.iteration % ITERATION_ARTIFACT_RENDER_STRIDE === 0;
 }
 
+function isThreeSceneInteracting(): boolean {
+  return state.sceneView?.kind === "paths_3d" && state.sceneView.pointerState != null;
+}
+
+function updateLiveIterationState(event: IterationSolveEvent): void {
+  state.latestProgress = event.progress;
+  state.liveSolver = event.artifact.solver;
+  if (!state.solverPhaseAutoCollapsed) {
+    state.solverPhaseCardOpen.jit = false;
+    state.solverPhaseAutoCollapsed = true;
+  }
+}
+
+function applyIterationUi(event: IterationSolveEvent): void {
+  renderSolverSummary();
+  updateProgressPlot(event.progress);
+  updateTrustRegionPlot(event.progress);
+  updateFilterPlot(event.progress);
+}
+
+function flushDeferredSceneInteractionUpdates(): void {
+  if (state.deferredInteractionIterations.length === 0) {
+    return;
+  }
+  const deferred = state.deferredInteractionIterations.splice(0);
+  for (const event of deferred) {
+    updateProgressPlot(event.progress);
+    updateTrustRegionPlot(event.progress);
+    updateFilterPlot(event.progress);
+  }
+  const latest = deferred[deferred.length - 1];
+  if (!latest) {
+    return;
+  }
+  updateLiveIterationState(latest);
+  renderSolverSummary();
+  if (shouldRenderIterationArtifact(latest, true)) {
+    state.artifact = latest.artifact;
+    scheduleArtifactRender(true);
+  }
+  if (state.liveStatus?.stage === SOLVE_STAGE.solving) {
+    setStatusDisplay(statusDisplayForSolveStatus(state.liveStatus, latest.progress.iteration));
+  }
+}
+
 function applyIterationEvent(
   event: IterationSolveEvent,
   updateRunningStatus: boolean,
   forceArtifactRender = false,
 ): void {
-  state.latestProgress = event.progress;
-  state.liveSolver = event.artifact.solver;
-  renderSolverSummary();
-  updateProgressPlot(event.progress);
-  updateTrustRegionPlot(event.progress);
-  updateFilterPlot(event.progress);
+  updateLiveIterationState(event);
+  if (isThreeSceneInteracting() && !forceArtifactRender) {
+    state.deferredInteractionIterations.push(event);
+    if (shouldRenderIterationArtifact(event, false)) {
+      state.artifact = event.artifact;
+    }
+    if (updateRunningStatus && state.liveStatus?.stage === SOLVE_STAGE.solving) {
+      setStatusDisplay(statusDisplayForSolveStatus(state.liveStatus, event.progress.iteration));
+    }
+    return;
+  }
+  applyIterationUi(event);
   if (shouldRenderIterationArtifact(event, forceArtifactRender)) {
     state.artifact = event.artifact;
     scheduleArtifactRender(forceArtifactRender);
@@ -7697,6 +7963,7 @@ function applySolveFailure(message: string): void {
     state.pendingIterationEvent = null;
     applyIterationEvent(pendingEvent, false, true);
   }
+  flushDeferredSceneInteractionUpdates();
   state.liveStatus = null;
   state.terminalSolver =
     reportedFailureSolver == null
@@ -7724,6 +7991,7 @@ function applySolveStopped(): void {
     state.pendingIterationEvent = null;
     applyIterationEvent(pendingEvent, false, true);
   }
+  flushDeferredSceneInteractionUpdates();
   state.liveStatus = null;
   state.terminalSolver = buildStoppedSolverReport();
   state.liveSolver = null;
@@ -7860,9 +8128,10 @@ function renderScene(): void {
   const visualization = primarySceneVisualization(state.artifact);
   if (visualization) {
     sceneSubtitleEl.textContent = visualization.title;
-    if (!window.Plotly) {
+    if (!window.THREE) {
+      disposeSceneView(state.sceneView);
       state.sceneView = null;
-      sceneEl.innerHTML = `<div class="placeholder">Plotly is still loading.</div>`;
+      sceneEl.innerHTML = `<div class="placeholder">Three.js is still loading.</div>`;
       return;
     }
     if (
@@ -7870,6 +8139,7 @@ function renderScene(): void {
       || state.sceneView.kind !== "paths_3d"
       || state.sceneView.visualization.title !== visualization.title
     ) {
+      disposeSceneView(state.sceneView);
       state.sceneView = createScene3DView(visualization);
       sceneEl.replaceChildren(state.sceneView.shell);
     }
@@ -7879,23 +8149,26 @@ function renderScene(): void {
     }
     view.visualization = visualization;
     view.meta.textContent = visualizationSubtitle(visualization);
-    updatePaths3DVisualization(view, visualization);
+    updateThreePaths3DVisualization(view, visualization);
     return;
   }
 
   const scene = state.artifact?.scene;
   sceneSubtitleEl.textContent = scene?.title ?? "";
   if (!scene) {
+    disposeSceneView(state.sceneView);
     state.sceneView = null;
     sceneEl.innerHTML = `<div class="placeholder">Solve a problem to render the semantic scene view.</div>`;
     return;
   }
   if (!window.Plotly) {
+    disposeSceneView(state.sceneView);
     state.sceneView = null;
     sceneEl.innerHTML = `<div class="placeholder">Plotly is still loading.</div>`;
     return;
   }
   if (!state.sceneView || state.sceneView.kind !== "scene_2d" || state.sceneView.scene !== scene) {
+    disposeSceneView(state.sceneView);
     state.sceneView = createSceneView(scene);
     sceneEl.replaceChildren(state.sceneView.shell);
   }
@@ -8330,6 +8603,148 @@ const DEFAULT_PATHS_3D_CAMERA: PlotlyObject = {
   center: { x: 0.04, y: 0.0, z: -0.08 },
 };
 
+interface ThreeSceneLayerDefinition {
+  key: string;
+  label: string;
+  color: string;
+  defaultVisible: boolean;
+  defaultScale: number;
+  scaleEditable: boolean;
+  scaleLabel: string;
+  minScale: number;
+  maxScale: number;
+  scaleStep: number;
+}
+
+const THREE_SCENE_DEFAULT_YAW = -1.12;
+const THREE_SCENE_DEFAULT_PITCH = 0.52;
+const THREE_SCENE_MIN_PITCH = -1.34;
+const THREE_SCENE_MAX_PITCH = 1.34;
+const THREE_SCENE_GRID_SPACING = 20;
+
+const THREE_SCENE_LAYER_DEFINITIONS: ThreeSceneLayerDefinition[] = [
+  {
+    key: "trajectory",
+    label: "Trajectory",
+    color: "#5bd1b5",
+    defaultVisible: true,
+    defaultScale: 1,
+    scaleEditable: false,
+    scaleLabel: "Scale",
+    minScale: 1,
+    maxScale: 1,
+    scaleStep: 1,
+  },
+  {
+    key: "aero",
+    label: "Aero acceleration",
+    color: "#f7b267",
+    defaultVisible: true,
+    defaultScale: 1,
+    scaleEditable: true,
+    scaleLabel: "Scale",
+    minScale: 0,
+    maxScale: 5,
+    scaleStep: 0.1,
+  },
+  {
+    key: "lift",
+    label: "Lift vectors",
+    color: "#b8f2e6",
+    defaultVisible: false,
+    defaultScale: 1,
+    scaleEditable: true,
+    scaleLabel: "Scale",
+    minScale: 0,
+    maxScale: 5,
+    scaleStep: 0.1,
+  },
+  {
+    key: "drag",
+    label: "Drag vectors",
+    color: "#f25f5c",
+    defaultVisible: false,
+    defaultScale: 6,
+    scaleEditable: true,
+    scaleLabel: "Exaggeration",
+    minScale: 0,
+    maxScale: 25,
+    scaleStep: 0.5,
+  },
+  {
+    key: "wind",
+    label: "Wind vectors",
+    color: "#7cc6fe",
+    defaultVisible: false,
+    defaultScale: 1,
+    scaleEditable: true,
+    scaleLabel: "Scale",
+    minScale: 0,
+    maxScale: 5,
+    scaleStep: 0.1,
+  },
+  {
+    key: "air-axis",
+    label: "Air-relative axis",
+    color: "#e5f1f4",
+    defaultVisible: false,
+    defaultScale: 1,
+    scaleEditable: true,
+    scaleLabel: "Scale",
+    minScale: 0,
+    maxScale: 5,
+    scaleStep: 0.1,
+  },
+  {
+    key: "zero-bank-frame",
+    label: "Zero-bank frame",
+    color: "#d7aefb",
+    defaultVisible: false,
+    defaultScale: 1,
+    scaleEditable: true,
+    scaleLabel: "Scale",
+    minScale: 0,
+    maxScale: 5,
+    scaleStep: 0.1,
+  },
+  {
+    key: "side-frame",
+    label: "Bank side frame",
+    color: "#b8f2e6",
+    defaultVisible: false,
+    defaultScale: 1,
+    scaleEditable: true,
+    scaleLabel: "Scale",
+    minScale: 0,
+    maxScale: 5,
+    scaleStep: 0.1,
+  },
+  {
+    key: "wind-shear",
+    label: "Wind shear",
+    color: "#7cc6fe",
+    defaultVisible: false,
+    defaultScale: 1,
+    scaleEditable: false,
+    scaleLabel: "Scale",
+    minScale: 1,
+    maxScale: 1,
+    scaleStep: 1,
+  },
+  {
+    key: "ground-grid",
+    label: "Ground grid",
+    color: "#386174",
+    defaultVisible: true,
+    defaultScale: 1,
+    scaleEditable: false,
+    scaleLabel: "Scale",
+    minScale: 1,
+    maxScale: 1,
+    scaleStep: 1,
+  },
+];
+
 function isPlotlyObject(value: PlotlyValue | undefined): value is PlotlyObject {
   return value != null && typeof value === "object" && !Array.isArray(value);
 }
@@ -8571,6 +8986,643 @@ function paths3DTraceStyle(path: ScenePath3D, index: number): Paths3DTraceStyle 
     markerSize: 0,
     visible: "legendonly",
   };
+}
+
+function threeLayerDefinition(key: string): ThreeSceneLayerDefinition | null {
+  return THREE_SCENE_LAYER_DEFINITIONS.find((definition) => definition.key === key) ?? null;
+}
+
+function createDefaultThreeSceneLayerOptions(): Record<string, ThreeSceneLayerOption> {
+  return Object.fromEntries(
+    THREE_SCENE_LAYER_DEFINITIONS.map((definition) => [
+      definition.key,
+      {
+        visible: definition.defaultVisible,
+        scale: definition.defaultScale,
+      },
+    ]),
+  );
+}
+
+function ensureThreeSceneLayerOption(
+  view: Scene3DView,
+  key: string,
+  fallbackVisible: boolean,
+): ThreeSceneLayerOption {
+  const existing = view.layerOptions[key];
+  if (existing) {
+    return existing;
+  }
+  const definition = threeLayerDefinition(key);
+  const option = {
+    visible: definition?.defaultVisible ?? fallbackVisible,
+    scale: definition?.defaultScale ?? 1,
+  };
+  view.layerOptions[key] = option;
+  return option;
+}
+
+function isFiniteScenePoint(x: number | undefined, y: number | undefined, z: number | undefined): boolean {
+  return Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z);
+}
+
+function clampSceneNumber(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+function cloneThreeCameraState(stateValue: ThreeSceneCameraState): ThreeSceneCameraState {
+  return {
+    target: [...stateValue.target],
+    yaw: stateValue.yaw,
+    pitch: stateValue.pitch,
+    distance: stateValue.distance,
+  };
+}
+
+function populateThreeSceneLayerPanel(view: Scene3DView): void {
+  view.layerPanel.innerHTML = "";
+  const summary = document.createElement("summary");
+  summary.className = "three-scene-layer-summary";
+  const summaryLabel = document.createElement("span");
+  summaryLabel.textContent = "Layers";
+  const summaryChevron = document.createElement("span");
+  summaryChevron.className = "three-scene-layer-chevron";
+  summaryChevron.textContent = "⌄";
+  summary.append(summaryLabel, summaryChevron);
+  view.layerPanel.appendChild(summary);
+
+  const body = document.createElement("div");
+  body.className = "three-scene-layer-body";
+
+  for (const definition of THREE_SCENE_LAYER_DEFINITIONS) {
+    const option = ensureThreeSceneLayerOption(view, definition.key, definition.defaultVisible);
+    const row = document.createElement("label");
+    row.className = "three-scene-layer-row";
+    row.style.setProperty("--layer-color", definition.color);
+
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = option.visible;
+    checkbox.addEventListener("change", () => {
+      setThreeSceneLayerVisible(view, definition.key, checkbox.checked);
+    });
+
+    const label = document.createElement("span");
+    label.className = "three-scene-layer-label";
+    label.textContent = definition.label;
+
+    row.append(checkbox, label);
+
+    if (definition.scaleEditable) {
+      const scaleWrap = document.createElement("span");
+      scaleWrap.className = "three-scene-layer-scale";
+      const scaleLabel = document.createElement("span");
+      scaleLabel.textContent = definition.scaleLabel;
+      const range = document.createElement("input");
+      range.type = "range";
+      range.min = String(definition.minScale);
+      range.max = String(definition.maxScale);
+      range.step = String(definition.scaleStep);
+      range.value = String(option.scale);
+      const number = document.createElement("input");
+      number.type = "number";
+      number.min = String(definition.minScale);
+      number.max = String(definition.maxScale);
+      number.step = String(definition.scaleStep);
+      number.value = String(option.scale);
+      const syncScale = (nextValue: number): void => {
+        const clamped = clampSceneNumber(nextValue, definition.minScale, definition.maxScale);
+        option.scale = clamped;
+        range.value = String(clamped);
+        number.value = String(clamped);
+        updateThreePaths3DVisualization(view, view.visualization);
+      };
+      range.addEventListener("input", () => {
+        syncScale(Number(range.value));
+      });
+      number.addEventListener("change", () => {
+        syncScale(Number(number.value));
+      });
+      scaleWrap.append(scaleLabel, range, number);
+      row.appendChild(scaleWrap);
+    }
+
+    body.appendChild(row);
+  }
+  view.layerPanel.appendChild(body);
+  updateThreeSceneLegend(view);
+}
+
+function setThreeSceneLayerVisible(
+  view: Scene3DView,
+  key: string,
+  visible: boolean,
+): void {
+  const definition = threeLayerDefinition(key);
+  const option = ensureThreeSceneLayerOption(view, key, definition?.defaultVisible ?? false);
+  if (option.visible === visible) {
+    return;
+  }
+  option.visible = visible;
+  populateThreeSceneLayerPanel(view);
+  updateThreePaths3DVisualization(view, view.visualization);
+}
+
+function updateThreeSceneLegend(view: Scene3DView): void {
+  view.legendEl.innerHTML = "";
+  const entries = THREE_SCENE_LAYER_DEFINITIONS.filter((definition) => definition.key !== "ground-grid");
+  for (const definition of entries) {
+    const option = ensureThreeSceneLayerOption(view, definition.key, definition.defaultVisible);
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = option.visible ? "three-scene-legend-item" : "three-scene-legend-item muted";
+    item.setAttribute("aria-pressed", String(option.visible));
+    item.title = `${option.visible ? "Hide" : "Show"} ${definition.label}`;
+    item.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setThreeSceneLayerVisible(view, definition.key, !option.visible);
+    });
+    const swatch = document.createElement("span");
+    swatch.className = "three-scene-legend-swatch";
+    swatch.style.background = definition.color;
+    const label = document.createElement("span");
+    label.textContent = definition.label;
+    item.append(swatch, label);
+    view.legendEl.appendChild(item);
+  }
+}
+
+function disposeThreeObject(object: any): void {
+  object.traverse?.((child: any) => {
+    if (child.geometry) {
+      child.geometry.dispose();
+    }
+    const material = child.material;
+    if (Array.isArray(material)) {
+      material.forEach((entry) => entry?.dispose?.());
+    } else {
+      material?.dispose?.();
+    }
+  });
+}
+
+function clearThreeGroup(group: any): void {
+  for (const child of [...group.children]) {
+    group.remove(child);
+    disposeThreeObject(child);
+  }
+}
+
+interface ThreeSceneBounds {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+  minZ: number;
+  maxZ: number;
+}
+
+function emptyThreeSceneBounds(): ThreeSceneBounds {
+  return {
+    minX: Number.POSITIVE_INFINITY,
+    maxX: Number.NEGATIVE_INFINITY,
+    minY: Number.POSITIVE_INFINITY,
+    maxY: Number.NEGATIVE_INFINITY,
+    minZ: Number.POSITIVE_INFINITY,
+    maxZ: Number.NEGATIVE_INFINITY,
+  };
+}
+
+function addPointToThreeBounds(bounds: ThreeSceneBounds, x: number, y: number, z: number): void {
+  bounds.minX = Math.min(bounds.minX, x);
+  bounds.maxX = Math.max(bounds.maxX, x);
+  bounds.minY = Math.min(bounds.minY, y);
+  bounds.maxY = Math.max(bounds.maxY, y);
+  bounds.minZ = Math.min(bounds.minZ, z);
+  bounds.maxZ = Math.max(bounds.maxZ, z);
+}
+
+function hasFiniteThreeBounds(bounds: ThreeSceneBounds): boolean {
+  return Number.isFinite(bounds.minX)
+    && Number.isFinite(bounds.maxX)
+    && Number.isFinite(bounds.minY)
+    && Number.isFinite(bounds.maxY)
+    && Number.isFinite(bounds.minZ)
+    && Number.isFinite(bounds.maxZ);
+}
+
+function collectPaths3DBounds(visualization: Paths3DVisualization): ThreeSceneBounds {
+  let bounds = emptyThreeSceneBounds();
+  for (const path of visualization.paths) {
+    const style = paths3DTraceStyle(path, 0);
+    if (style.group !== "trajectory") {
+      continue;
+    }
+    for (let index = 0; index < path.x.length; index += 1) {
+      const x = path.x[index];
+      const y = path.y[index];
+      const z = path.z[index];
+      if (isFiniteScenePoint(x, y, z)) {
+        addPointToThreeBounds(bounds, x, y, z);
+      }
+    }
+  }
+  if (hasFiniteThreeBounds(bounds)) {
+    return bounds;
+  }
+
+  bounds = emptyThreeSceneBounds();
+  for (const path of visualization.paths) {
+    for (let index = 0; index < path.x.length; index += 1) {
+      const x = path.x[index];
+      const y = path.y[index];
+      const z = path.z[index];
+      if (isFiniteScenePoint(x, y, z)) {
+        addPointToThreeBounds(bounds, x, y, z);
+      }
+    }
+  }
+  return hasFiniteThreeBounds(bounds)
+    ? bounds
+    : { minX: -20, maxX: 80, minY: -30, maxY: 30, minZ: 0, maxZ: 20 };
+}
+
+function expandThreeBounds(bounds: ThreeSceneBounds): ThreeSceneBounds {
+  const spanX = Math.max(bounds.maxX - bounds.minX, 20);
+  const spanY = Math.max(bounds.maxY - bounds.minY, 20);
+  const spanZ = Math.max(bounds.maxZ - bounds.minZ, 8);
+  return {
+    minX: bounds.minX - spanX * 0.08,
+    maxX: bounds.maxX + spanX * 0.08,
+    minY: bounds.minY - spanY * 0.12,
+    maxY: bounds.maxY + spanY * 0.12,
+    minZ: Math.min(0, bounds.minZ - spanZ * 0.08),
+    maxZ: bounds.maxZ + spanZ * 0.16,
+  };
+}
+
+function cameraStateForThreeBounds(bounds: ThreeSceneBounds): ThreeSceneCameraState {
+  const expanded = expandThreeBounds(bounds);
+  const centerX = 0.5 * (expanded.minX + expanded.maxX);
+  const centerY = 0.5 * (expanded.minY + expanded.maxY);
+  const centerZ = 0.48 * (expanded.minZ + expanded.maxZ);
+  const spanX = expanded.maxX - expanded.minX;
+  const spanY = expanded.maxY - expanded.minY;
+  const spanZ = expanded.maxZ - expanded.minZ;
+  return {
+    target: [centerX, centerY, centerZ],
+    yaw: THREE_SCENE_DEFAULT_YAW,
+    pitch: THREE_SCENE_DEFAULT_PITCH,
+    distance: Math.max(45, Math.hypot(spanX, spanY, spanZ) * 1.12),
+  };
+}
+
+function applyThreeCameraState(view: Scene3DView): void {
+  const three = window.THREE;
+  if (!three) {
+    return;
+  }
+  const [tx, ty, tz] = view.cameraState.target;
+  const horizontal = Math.cos(view.cameraState.pitch) * view.cameraState.distance;
+  const x = tx + horizontal * Math.cos(view.cameraState.yaw);
+  const y = ty + horizontal * Math.sin(view.cameraState.yaw);
+  const z = tz + Math.sin(view.cameraState.pitch) * view.cameraState.distance;
+  view.camera.position.set(x, y, z);
+  view.camera.up.set(0, 0, 1);
+  view.camera.lookAt(new three.Vector3(tx, ty, tz));
+}
+
+function drawThreeScene(view: Scene3DView): void {
+  resizeThreeScene(view);
+  applyThreeCameraState(view);
+  view.renderer.render(view.threeScene, view.camera);
+}
+
+function requestThreeSceneRender(view: Scene3DView): void {
+  if (view.renderFrameHandle != null) {
+    return;
+  }
+  view.renderFrameHandle = window.requestAnimationFrame(() => {
+    view.renderFrameHandle = null;
+    drawThreeScene(view);
+  });
+}
+
+function renderThreeSceneNow(view: Scene3DView): void {
+  if (view.renderFrameHandle != null) {
+    window.cancelAnimationFrame(view.renderFrameHandle);
+    view.renderFrameHandle = null;
+  }
+  drawThreeScene(view);
+}
+
+function requestThreeInteractionRender(view: Scene3DView): void {
+  view.interactionDirty = true;
+  if (view.interactionFrameHandle != null) {
+    return;
+  }
+  const renderInteractionFrame = (): void => {
+    view.interactionFrameHandle = null;
+    if (view.renderFrameHandle != null) {
+      window.cancelAnimationFrame(view.renderFrameHandle);
+      view.renderFrameHandle = null;
+    }
+    if (view.interactionDirty || view.pointerState != null) {
+      view.interactionDirty = false;
+      drawThreeScene(view);
+    }
+    if (view.pointerState != null) {
+      view.interactionFrameHandle = window.requestAnimationFrame(renderInteractionFrame);
+    }
+  };
+  view.interactionFrameHandle = window.requestAnimationFrame(renderInteractionFrame);
+}
+
+function resizeThreeScene(view: Scene3DView): void {
+  const rect = view.surfaceEl.getBoundingClientRect();
+  const width = Math.max(1, Math.floor(rect.width));
+  const height = Math.max(1, Math.floor(rect.height));
+  const canvas = view.renderer.domElement as HTMLCanvasElement;
+  if (canvas.width !== Math.floor(width * view.renderer.getPixelRatio())
+    || canvas.height !== Math.floor(height * view.renderer.getPixelRatio())) {
+    view.renderer.setSize(width, height, false);
+    view.camera.aspect = width / height;
+    view.camera.updateProjectionMatrix();
+  }
+}
+
+function threePathSegments(path: ScenePath3D, group: string, scale: number): number[][] {
+  const segments: number[][] = [];
+  let current: number[] = [];
+  const vectorScale = path.x.length === 2
+    && group !== "trajectory"
+    && group !== "wind-shear"
+    && group !== "ground-grid";
+  const anchor = vectorScale
+    && isFiniteScenePoint(path.x[0], path.y[0], path.z[0])
+    ? [path.x[0], path.y[0], path.z[0]]
+    : null;
+  for (let index = 0; index < path.x.length; index += 1) {
+    const rawX = path.x[index];
+    const rawY = path.y[index];
+    const rawZ = path.z[index];
+    if (!isFiniteScenePoint(rawX, rawY, rawZ)) {
+      if (current.length >= 6) {
+        segments.push(current);
+      }
+      current = [];
+      continue;
+    }
+    let x = rawX;
+    let y = rawY;
+    let z = rawZ;
+    if (anchor && index > 0) {
+      x = anchor[0] + (rawX - anchor[0]) * scale;
+      y = anchor[1] + (rawY - anchor[1]) * scale;
+      z = anchor[2] + (rawZ - anchor[2]) * scale;
+    }
+    current.push(x, y, z);
+  }
+  if (current.length >= 6) {
+    segments.push(current);
+  }
+  return segments;
+}
+
+function addThreePathToGroup(view: Scene3DView, path: ScenePath3D, style: Paths3DTraceStyle, scale: number): void {
+  const three = window.THREE;
+  if (!three) {
+    return;
+  }
+  const material = new three.LineBasicMaterial({
+    color: style.color,
+    transparent: true,
+    opacity: style.opacity,
+    linewidth: style.width,
+    depthWrite: false,
+  });
+  for (const segment of threePathSegments(path, style.group, scale)) {
+    const geometry = new three.BufferGeometry();
+    geometry.setAttribute("position", new three.Float32BufferAttribute(segment, 3));
+    const line = new three.Line(geometry, material.clone());
+    view.dataRoot.add(line);
+  }
+  material.dispose();
+}
+
+function updateThreeGroundGrid(view: Scene3DView, bounds: ThreeSceneBounds): void {
+  const three = window.THREE;
+  if (!three) {
+    return;
+  }
+  clearThreeGroup(view.gridRoot);
+  const option = ensureThreeSceneLayerOption(view, "ground-grid", true);
+  if (!option.visible) {
+    return;
+  }
+  const expanded = expandThreeBounds(bounds);
+  const minX = Math.floor(expanded.minX / THREE_SCENE_GRID_SPACING) * THREE_SCENE_GRID_SPACING;
+  const maxX = Math.ceil(expanded.maxX / THREE_SCENE_GRID_SPACING) * THREE_SCENE_GRID_SPACING;
+  const minY = Math.floor(expanded.minY / THREE_SCENE_GRID_SPACING) * THREE_SCENE_GRID_SPACING;
+  const maxY = Math.ceil(expanded.maxY / THREE_SCENE_GRID_SPACING) * THREE_SCENE_GRID_SPACING;
+  const positions: number[] = [];
+  for (let x = minX; x <= maxX; x += THREE_SCENE_GRID_SPACING) {
+    positions.push(x, minY, 0, x, maxY, 0);
+  }
+  for (let y = minY; y <= maxY; y += THREE_SCENE_GRID_SPACING) {
+    positions.push(minX, y, 0, maxX, y, 0);
+  }
+  const geometry = new three.BufferGeometry();
+  geometry.setAttribute("position", new three.Float32BufferAttribute(positions, 3));
+  const material = new three.LineBasicMaterial({
+    color: "#386174",
+    transparent: true,
+    opacity: 0.34,
+    depthWrite: false,
+  });
+  view.gridRoot.add(new three.LineSegments(geometry, material));
+
+  const axisPositions = [minX, 0, 0, maxX, 0, 0, 0, minY, 0, 0, maxY, 0];
+  const axisGeometry = new three.BufferGeometry();
+  axisGeometry.setAttribute("position", new three.Float32BufferAttribute(axisPositions, 3));
+  const axisMaterial = new three.LineBasicMaterial({
+    color: "#5f94aa",
+    transparent: true,
+    opacity: 0.52,
+    depthWrite: false,
+  });
+  view.gridRoot.add(new three.LineSegments(axisGeometry, axisMaterial));
+}
+
+function updateThreePaths3DVisualization(view: Scene3DView, visualization: Paths3DVisualization): void {
+  view.visualization = visualization;
+  const bounds = collectPaths3DBounds(visualization);
+  if (!view.cameraInitialized) {
+    view.cameraState = cameraStateForThreeBounds(bounds);
+    view.defaultCameraState = cloneThreeCameraState(view.cameraState);
+    view.cameraInitialized = true;
+  }
+  clearThreeGroup(view.dataRoot);
+  updateThreeGroundGrid(view, bounds);
+
+  visualization.paths.forEach((path, index) => {
+    const style = paths3DTraceStyle(path, index);
+    const option = ensureThreeSceneLayerOption(view, style.group, style.visible === true);
+    if (!option.visible) {
+      return;
+    }
+    addThreePathToGroup(view, path, style, option.scale);
+  });
+  updateThreeSceneLegend(view);
+  requestThreeSceneRender(view);
+}
+
+function resetThreeSceneCamera(view: Scene3DView): void {
+  view.defaultCameraState = cameraStateForThreeBounds(collectPaths3DBounds(view.visualization));
+  view.cameraState = cloneThreeCameraState(view.defaultCameraState);
+  renderThreeSceneNow(view);
+}
+
+function eventTargetInsideElement(event: Event, element: Element): boolean {
+  return event.target instanceof Node && element.contains(event.target);
+}
+
+function eventTargetInsideThreeSceneUi(event: Event, view: Scene3DView): boolean {
+  return eventTargetInsideElement(event, view.layerPanel)
+    || eventTargetInsideElement(event, view.legendEl);
+}
+
+function bindThreeSceneControls(view: Scene3DView): void {
+  view.controlsAbortController?.abort();
+  const controlsAbortController = new AbortController();
+  view.controlsAbortController = controlsAbortController;
+  const listenerOptions = { signal: controlsAbortController.signal };
+  view.surfaceEl.addEventListener("contextmenu", (event) => {
+    if (eventTargetInsideThreeSceneUi(event, view)) {
+      return;
+    }
+    event.preventDefault();
+  }, listenerOptions);
+  view.surfaceEl.addEventListener("pointerdown", (event) => {
+    if (eventTargetInsideThreeSceneUi(event, view)) {
+      return;
+    }
+    if (event.button !== 0 && event.button !== 1 && event.button !== 2) {
+      return;
+    }
+    event.preventDefault();
+    view.surfaceEl.focus();
+    view.surfaceEl.setPointerCapture(event.pointerId);
+    view.pointerState = {
+      pointerId: event.pointerId,
+      mode: event.button === 0 ? "rotate" : "pan",
+      lastX: event.clientX,
+      lastY: event.clientY,
+    };
+    clearScheduledArtifactRender();
+    requestThreeInteractionRender(view);
+  }, listenerOptions);
+  window.addEventListener("pointermove", (event) => {
+    const pointer = view.pointerState;
+    if (!pointer || pointer.pointerId !== event.pointerId) {
+      return;
+    }
+    event.preventDefault();
+    const dx = event.clientX - pointer.lastX;
+    const dy = event.clientY - pointer.lastY;
+    pointer.lastX = event.clientX;
+    pointer.lastY = event.clientY;
+    if (pointer.mode === "rotate") {
+      view.cameraState.yaw -= dx * 0.008;
+      view.cameraState.pitch = clampSceneNumber(
+        view.cameraState.pitch + dy * 0.006,
+        THREE_SCENE_MIN_PITCH,
+        THREE_SCENE_MAX_PITCH,
+      );
+    } else {
+      const three = window.THREE;
+      if (three) {
+        const rect = view.surfaceEl.getBoundingClientRect();
+        const pixelScale = 2
+          * view.cameraState.distance
+          * Math.tan((view.camera.fov * Math.PI / 180) / 2)
+          / Math.max(rect.height, 1);
+        const right = new three.Vector3(1, 0, 0).applyQuaternion(view.camera.quaternion);
+        const up = new three.Vector3(0, 1, 0).applyQuaternion(view.camera.quaternion);
+        view.cameraState.target[0] += (-dx * right.x + dy * up.x) * pixelScale;
+        view.cameraState.target[1] += (-dx * right.y + dy * up.y) * pixelScale;
+        view.cameraState.target[2] += (-dx * right.z + dy * up.z) * pixelScale;
+      }
+    }
+    requestThreeInteractionRender(view);
+  }, listenerOptions);
+  const releasePointer = (event: PointerEvent): void => {
+    const pointer = view.pointerState;
+    if (!pointer || pointer.pointerId !== event.pointerId) {
+      return;
+    }
+    view.pointerState = null;
+    if (view.surfaceEl.hasPointerCapture(event.pointerId)) {
+      view.surfaceEl.releasePointerCapture(event.pointerId);
+    }
+    requestThreeInteractionRender(view);
+    flushDeferredSceneInteractionUpdates();
+  };
+  const releaseActivePointer = (): void => {
+    if (!view.pointerState) {
+      return;
+    }
+    view.pointerState = null;
+    requestThreeInteractionRender(view);
+    flushDeferredSceneInteractionUpdates();
+  };
+  window.addEventListener("pointerup", releasePointer, listenerOptions);
+  window.addEventListener("pointercancel", releasePointer, listenerOptions);
+  window.addEventListener("blur", releaseActivePointer, listenerOptions);
+  view.surfaceEl.addEventListener("wheel", (event) => {
+    if (eventTargetInsideThreeSceneUi(event, view)) {
+      return;
+    }
+    event.preventDefault();
+    view.cameraState.distance = clampSceneNumber(
+      view.cameraState.distance * Math.exp(event.deltaY * 0.0012),
+      4,
+      5000,
+    );
+    requestThreeInteractionRender(view);
+  }, { passive: false, signal: controlsAbortController.signal });
+  view.surfaceEl.addEventListener("dblclick", (event) => {
+    if (eventTargetInsideThreeSceneUi(event, view)) {
+      return;
+    }
+    event.preventDefault();
+    resetThreeSceneCamera(view);
+  }, listenerOptions);
+}
+
+function disposeSceneView(view: SceneView | null): void {
+  if (!view) {
+    return;
+  }
+  if (view.kind === "paths_3d") {
+    if (view.renderFrameHandle != null) {
+      window.cancelAnimationFrame(view.renderFrameHandle);
+      view.renderFrameHandle = null;
+    }
+    if (view.interactionFrameHandle != null) {
+      window.cancelAnimationFrame(view.interactionFrameHandle);
+      view.interactionFrameHandle = null;
+    }
+    view.controlsAbortController?.abort();
+    view.controlsAbortController = null;
+    view.resizeObserver?.disconnect();
+    clearThreeGroup(view.dataRoot);
+    clearThreeGroup(view.gridRoot);
+    view.renderer.dispose();
+  } else if (window.Plotly) {
+    window.Plotly.purge(view.plotEl);
+  }
 }
 
 function buildPaths3DTraces(visualization: Paths3DVisualization): Paths3DTraceBuild {
@@ -8851,6 +9903,7 @@ function handleSolveEvent(event: SolveEvent): void {
       scheduleIterationUpdate();
       break;
     case STREAM_EVENT_KIND.final:
+      flushDeferredSceneInteractionUpdates();
       state.pendingIterationEvent = null;
       state.liveStatus = null;
       state.terminalSolver = mergeSolverReport(event.artifact.solver, state.liveSolver);
@@ -8925,6 +9978,7 @@ async function solveCurrentProblem(event?: Event): Promise<void> {
     stopAnimation();
     state.artifact = null;
     state.animationIndex = 0;
+    disposeSceneView(state.sceneView);
     state.sceneView = null;
     resetSolverPanel();
     renderMetrics();
