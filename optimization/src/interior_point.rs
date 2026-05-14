@@ -15837,6 +15837,7 @@ fn log_interior_point_iteration(
         InteriorPointIterationPhase::Restoration => format!("{}r", log.iteration),
         InteriorPointIterationPhase::Converged => "post".to_string(),
     };
+    let restoration_row = matches!(log.phase, InteriorPointIterationPhase::Restoration);
     let row = [
         style_iteration_label_cell(&iteration_label, log.flags.iteration_limit_reached),
         style_ip_event_cell(log),
@@ -15845,13 +15846,13 @@ fn log_interior_point_iteration(
             log.equality_inf,
             InteriorPointResidualMetric::Constraint,
             log.display_mode,
-            log.flags.has_equalities,
+            log.flags.has_equalities && !restoration_row,
         ),
         style_ip_residual_cell(
             log.inequality_inf,
             InteriorPointResidualMetric::Constraint,
             log.display_mode,
-            log.flags.has_inequalities,
+            log.flags.has_inequalities && !restoration_row,
         ),
         style_ip_residual_cell(
             log.dual_inf,

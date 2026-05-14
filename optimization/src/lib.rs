@@ -5232,6 +5232,11 @@ pub(crate) fn style_iteration_label_cell(label: &str, iteration_limit_reached: b
     let cell = fmt_iteration_label(label);
     if iteration_limit_reached {
         style_red_bold(&cell)
+    } else if label
+        .strip_suffix('r')
+        .is_some_and(|number| !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()))
+    {
+        style_yellow_bold(&cell)
     } else {
         cell
     }

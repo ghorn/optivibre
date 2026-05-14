@@ -7422,7 +7422,7 @@ function updateProgressThresholds(progress: SolveProgress | null | undefined): v
     PALETTE[1],
     "dot",
     constraintTol,
-    residualValue(progress?.eq_inf),
+    progress == null ? null : progressPlotValue(progress, progress.eq_inf),
     maxX,
   );
   updateProgressThresholdTrace(
@@ -7431,7 +7431,7 @@ function updateProgressThresholds(progress: SolveProgress | null | undefined): v
     PALETTE[2],
     "longdash",
     constraintTol,
-    residualValue(progress?.ineq_inf),
+    progress == null ? null : progressPlotValue(progress, progress.ineq_inf),
     maxX,
   );
   updateProgressThresholdTrace(
@@ -7440,7 +7440,7 @@ function updateProgressThresholds(progress: SolveProgress | null | undefined): v
     PALETTE[3],
     "dashdot",
     dualTol,
-    residualValue(progress?.dual_inf),
+    progress == null ? null : progressPlotValue(progress, progress.dual_inf),
     maxX,
   );
 }
@@ -7554,6 +7554,20 @@ function residualValue(value: number | null | undefined): number | null {
   return positiveLogValue(value);
 }
 
+function progressPlotValue(progress: SolveProgress, value: number | null | undefined): number | null {
+  if (progress.phase === SOLVE_PHASE.restoration) {
+    return null;
+  }
+  return residualValue(value);
+}
+
+function progressPlotObjective(progress: SolveProgress): number | null {
+  if (progress.phase === SOLVE_PHASE.restoration || !Number.isFinite(progress.objective)) {
+    return null;
+  }
+  return progress.objective;
+}
+
 function updateProgressPlot(progress: SolveProgress): void {
   if (!window.Plotly) {
     return;
@@ -7565,10 +7579,10 @@ function updateProgressPlot(progress: SolveProgress): void {
     {
       x: [[iteration], [iteration], [iteration], [iteration]],
       y: [
-        [progress.objective],
-        [residualValue(progress.eq_inf)],
-        [residualValue(progress.ineq_inf)],
-        [residualValue(progress.dual_inf)],
+        [progressPlotObjective(progress)],
+        [progressPlotValue(progress, progress.eq_inf)],
+        [progressPlotValue(progress, progress.ineq_inf)],
+        [progressPlotValue(progress, progress.dual_inf)],
       ],
     },
     [0, 1, 2, 3],
@@ -7680,12 +7694,12 @@ function streamTimingLayout(): PlotlyLayout {
       zeroline: false,
     },
     xaxis2: {
-      title: "duration (ms)",
-      type: "log",
+      title: "duration",
       gridcolor: "rgba(229, 241, 244, 0.08)",
       linecolor: "rgba(177, 214, 222, 0.18)",
       zeroline: false,
     },
+    barmode: "overlay",
     yaxis2: {
       title: "count (-)",
       gridcolor: "rgba(229, 241, 244, 0.08)",
@@ -7722,6 +7736,61 @@ function timingColor(label: string, index: number): string {
   return PALETTE[paletteIndex];
 }
 
+function log10(value: number): number {
+  return Math.log(value) / Math.LN10;
+}
+
+function timingHistogramDomain(valuesMs: readonly number[]): { min: number; max: number } {
+  const logs = valuesMs
+    .filter((value) => Number.isFinite(value) && value > 0)
+    .map((value) => log10(value));
+  if (logs.length === 0) {
+    return { min: -6, max: 3 };
+  }
+  let min = Math.floor(Math.min(...logs));
+  let max = Math.ceil(Math.max(...logs));
+  if (min === max) {
+    min -= 1;
+    max += 1;
+  }
+  return { min, max };
+}
+
+function timingHistogramTicks(domain: { min: number; max: number }): {
+  tickvals: number[];
+  ticktext: string[];
+} {
+  const tickvals: number[] = [];
+  const ticktext: string[] = [];
+  for (let tick = Math.ceil(domain.min); tick <= Math.floor(domain.max); tick += 1) {
+    tickvals.push(tick);
+    ticktext.push(formatDuration(10 ** tick / 1000));
+  }
+  return { tickvals, ticktext };
+}
+
+function logTimingHistogram(valuesMs: readonly number[], domain: { min: number; max: number }) {
+  const binCount = 24;
+  const width = (domain.max - domain.min) / binCount;
+  const counts = Array.from({ length: binCount }, () => 0);
+  for (const value of valuesMs) {
+    if (!Number.isFinite(value) || value <= 0) {
+      continue;
+    }
+    const logValue = log10(value);
+    const rawIndex = Math.floor((logValue - domain.min) / width);
+    const index = Math.min(binCount - 1, Math.max(0, rawIndex));
+    counts[index] += 1;
+  }
+  const centers = counts.map((_, index) => domain.min + (index + 0.5) * width);
+  return {
+    centers,
+    counts,
+    width,
+    labels: centers.map((center) => formatDuration(10 ** center / 1000)),
+  };
+}
+
 function renderStreamTimingPlot(): void {
   if (!window.Plotly) {
     return;
@@ -7734,6 +7803,11 @@ function renderStreamTimingPlot(): void {
     ),
   ];
   const traces: PlotlyTrace[] = [];
+  const allValuesMs = state.streamTimingSamples.map((sample) =>
+    Math.max(sample.seconds * 1000, 1.0e-6),
+  );
+  const histogramDomain = timingHistogramDomain(allValuesMs);
+  const histogramTicks = timingHistogramTicks(histogramDomain);
   labels.forEach((label, index) => {
     const samples = state.streamTimingSamples.filter((sample) => sample.label === label);
     if (samples.length === 0) {
@@ -7750,24 +7824,41 @@ function renderStreamTimingPlot(): void {
       line: { color, width: PLOT_LINE_WIDTH.primary },
       hovertemplate: `${label}<br>sample=%{x}<br>duration=%{y:.3f} ms<extra></extra>`,
     });
+    const histogram = logTimingHistogram(valuesMs, histogramDomain);
     traces.push({
-      type: "histogram",
+      type: "bar",
       name: `${label} hist`,
-      x: valuesMs,
+      x: histogram.centers,
+      y: histogram.counts,
+      width: histogram.width * 0.82,
       xaxis: "x2",
       yaxis: "y2",
+      customdata: histogram.labels,
       marker: { color, opacity: 0.36 },
       opacity: 0.36,
       showlegend: false,
-      nbinsx: 24,
-      hovertemplate: `${label}<br>duration=%{x:.3f} ms<br>count=%{y}<extra></extra>`,
+      hovertemplate: `${label}<br>duration=%{customdata}<br>count=%{y}<extra></extra>`,
     });
   });
-  window.Plotly.react(streamTimingPlotEl, traces, streamTimingLayout(), {
-    responsive: true,
-    displaylogo: false,
-    displayModeBar: false,
-  });
+  const layout = streamTimingLayout();
+  window.Plotly.react(
+    streamTimingPlotEl,
+    traces,
+    {
+      ...layout,
+      xaxis2: {
+        ...((layout.xaxis2 ?? {}) as PlotlyObject),
+        range: [histogramDomain.min, histogramDomain.max],
+        tickvals: histogramTicks.tickvals,
+        ticktext: histogramTicks.ticktext,
+      },
+    },
+    {
+      responsive: true,
+      displaylogo: false,
+      displayModeBar: false,
+    },
+  );
   state.streamTimingPlotReady = true;
 }
 
