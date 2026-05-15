@@ -1021,7 +1021,7 @@ fn interior_point_native_spral_matches_hanging_chain() {
 }
 
 #[test]
-fn interior_point_spral_reuses_symbolic_analysis_and_refactorizes() {
+fn interior_point_ssids_rs_matching_reanalyses_numeric_pattern() {
     let problem = build_problem_ok(hs021_problem(CallbackBackend::Aot), CallbackBackend::Aot);
     let summary = solve_ok(
         &problem,
@@ -1034,9 +1034,12 @@ fn interior_point_spral_reuses_symbolic_analysis_and_refactorizes() {
     );
 
     assert_eq!(summary.linear_solver, InteriorPointLinearSolver::SsidsRs);
-    assert_eq!(summary.profiling.sparse_symbolic_analyses, 1);
+    // The source-SPRAL parity path uses SPRAL matching ordering/scaling by
+    // default. Matching is value-dependent, so the Rust backend must reanalyse
+    // instead of reusing a stale symbolic object across numeric updates.
+    assert!(summary.profiling.sparse_symbolic_analyses > 1);
     assert!(summary.profiling.sparse_numeric_factorizations >= 1);
-    assert!(summary.profiling.sparse_numeric_refactorizations >= 1);
+    assert_eq!(summary.profiling.sparse_numeric_refactorizations, 0);
 }
 
 #[test]

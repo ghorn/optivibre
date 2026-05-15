@@ -4637,11 +4637,6 @@ fn run_rust_spral_matching(
     )
 }
 
-#[cfg(any(
-    feature = "native-spral-src",
-    feature = "native-spral-src-pthreads",
-    feature = "native-spral-src-openmp"
-))]
 fn lower_csc_pattern_from_edges(
     dimension: usize,
     edges: &[(usize, usize)],
@@ -4668,11 +4663,6 @@ fn lower_csc_pattern_from_edges(
     (col_ptrs, row_indices)
 }
 
-#[cfg(any(
-    feature = "native-spral-src",
-    feature = "native-spral-src-pthreads",
-    feature = "native-spral-src-openmp"
-))]
 fn twin_path_edges(groups: usize) -> Vec<(usize, usize)> {
     let mut edges = Vec::with_capacity(groups + 4 * groups.saturating_sub(1));
     for group in 0..groups {

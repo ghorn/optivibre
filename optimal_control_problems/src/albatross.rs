@@ -290,25 +290,25 @@ impl Default for Params {
         Self {
             objective: ObjectiveKind::WindWork,
             delta_l: DesignControl {
-                fixed: true,
+                fixed: false,
                 value: 90.0,
                 lower: 50.0,
                 upper: 220.0,
             },
             h0: DesignControl {
-                fixed: true,
+                fixed: false,
                 value: 1.5,
                 lower: 0.5,
                 upper: 5.0,
             },
             vx0: DesignControl {
-                fixed: true,
+                fixed: false,
                 value: 15.0,
                 lower: 10.0,
                 upper: 22.0,
             },
             tf: DesignControl {
-                fixed: true,
+                fixed: false,
                 value: 6.0,
                 lower: 3.0,
                 upper: 12.0,
@@ -726,19 +726,19 @@ fn design_controls(
     vec![
         checkbox_control(
             &format!("{prefix}_free"),
-            &format!("Free {label}"),
+            &format!("{label} Mode"),
             !defaults.fixed,
-            "When checked, the lower and upper bound editors define this global design variable. When unchecked, the fixed value editor is used as an equality bound.",
+            "Select Fixed to use one equality-bound value, or Free to use lower and upper global bounds with this value as the initial guess.",
         ),
         problem_slider_control(
             format!("{prefix}_value"),
-            format!("{label} Fixed/Guess"),
+            format!("{label} Value"),
             defaults.lower.min(defaults.value) * 0.5,
             defaults.upper.max(defaults.value) * 1.5,
             0.5,
             defaults.value,
             unit,
-            "Fixed value when not free; initial guess when free. It must already satisfy active bounds.",
+            "Fixed value in Fixed mode; initial guess in Free mode. It must already satisfy active bounds.",
         ),
         problem_slider_control(
             format!("{prefix}_lower"),
@@ -3285,6 +3285,884 @@ pub(crate) fn problem_entry() -> crate::ProblemEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::de::DeserializeOwned;
+    use ssids_rs::{
+        NativeOrdering, NativeSpral, NumericFactorOptions, PivotMethod, SsidsOptions,
+        SymmetricCscMatrix, analyse as spral_analyse, factorize as spral_factorize,
+    };
+    use tempfile::TempDir;
+
+    #[derive(Debug)]
+    struct AlbatrossLinearDebugDump {
+        matrix_dimension: usize,
+        expected_inertia: Option<ssids_rs::Inertia>,
+        col_ptrs: Vec<usize>,
+        row_indices: Vec<usize>,
+        values: Vec<f64>,
+        rhs: Vec<f64>,
+    }
+
+    #[derive(Debug)]
+    struct AlbatrossLinearReplay {
+        solution: Vec<f64>,
+        residual_inf: f64,
+        solution_inf: f64,
+        inertia: ssids_rs::Inertia,
+    }
+
+    fn parse_dump_value<T>(text: &str, prefix: &str) -> T
+    where
+        T: std::str::FromStr,
+        T::Err: std::fmt::Debug,
+    {
+        text.lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("expected dump key {prefix:?} to be present"))
+            .parse::<T>()
+            .unwrap_or_else(|error| panic!("expected dump scalar {prefix:?} to parse: {error:?}"))
+    }
+
+    fn parse_dump_vec<T>(text: &str, prefix: &str) -> Vec<T>
+    where
+        T: DeserializeOwned,
+    {
+        let value = text
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("expected dump vector {prefix:?} to be present"));
+        serde_json::from_str(value)
+            .unwrap_or_else(|error| panic!("expected dump vector {prefix:?} to parse: {error:?}"))
+    }
+
+    fn parse_dump_expected_inertia(text: &str) -> Option<ssids_rs::Inertia> {
+        let value = text
+            .lines()
+            .find_map(|line| line.strip_prefix("expected_inertia="))?;
+        let (positive_text, rest) = value.strip_prefix('+')?.split_once("/-")?;
+        let (negative_text, zero_text) = rest.split_once("/0=")?;
+        Some(ssids_rs::Inertia {
+            positive: positive_text.parse().ok()?,
+            negative: negative_text.parse().ok()?,
+            zero: zero_text.parse().ok()?,
+        })
+    }
+
+    fn load_albatross_linear_debug_dump(path: &std::path::Path) -> AlbatrossLinearDebugDump {
+        let text = std::fs::read_to_string(path).expect("expected Albatross KKT dump to exist");
+        AlbatrossLinearDebugDump {
+            matrix_dimension: parse_dump_value(&text, "matrix_dimension="),
+            expected_inertia: parse_dump_expected_inertia(&text),
+            col_ptrs: parse_dump_vec(&text, "col_ptrs="),
+            row_indices: parse_dump_vec(&text, "row_indices="),
+            values: parse_dump_vec(&text, "values="),
+            rhs: parse_dump_vec(&text, "rhs="),
+        }
+    }
+
+    fn collect_albatross_linear_debug_dumps(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        fn visit(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    visit(&path, out);
+                } else if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("nlip_kkt_iter_"))
+                {
+                    out.push(path);
+                }
+            }
+        }
+        let mut paths = Vec::new();
+        visit(root, &mut paths);
+        paths.sort();
+        paths
+    }
+
+    fn optional_persistent_albatross_dump_dir(
+        env_key: &str,
+    ) -> (std::path::PathBuf, Option<TempDir>) {
+        if let Some(path) = std::env::var_os(env_key).map(std::path::PathBuf::from) {
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap_or_else(|error| {
+                panic!("failed to create {env_key} dump dir {path:?}: {error}")
+            });
+            (path, None)
+        } else {
+            let temp = TempDir::new().expect("Albatross dump temp dir should be created");
+            (temp.path().to_path_buf(), Some(temp))
+        }
+    }
+
+    fn symmetric_lower_mat_vec(dump: &AlbatrossLinearDebugDump, x: &[f64]) -> Vec<f64> {
+        let mut y = vec![0.0; dump.matrix_dimension];
+        for col in 0..dump.matrix_dimension {
+            for position in dump.col_ptrs[col]..dump.col_ptrs[col + 1] {
+                let row = dump.row_indices[position];
+                let value = dump.values[position];
+                y[row] += value * x[col];
+                if row != col {
+                    y[col] += value * x[row];
+                }
+            }
+        }
+        y
+    }
+
+    fn residual_vector(dump: &AlbatrossLinearDebugDump, solution: &[f64]) -> Vec<f64> {
+        symmetric_lower_mat_vec(dump, solution)
+            .into_iter()
+            .zip(dump.rhs.iter().copied())
+            .map(|(lhs, rhs)| rhs - lhs)
+            .collect()
+    }
+
+    fn residual_inf(dump: &AlbatrossLinearDebugDump, solution: &[f64]) -> f64 {
+        residual_vector(dump, solution)
+            .into_iter()
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()))
+    }
+
+    fn solution_inf(solution: &[f64]) -> f64 {
+        solution
+            .iter()
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()))
+    }
+
+    fn delta_inf(lhs: &[f64], rhs: &[f64]) -> f64 {
+        lhs.iter()
+            .zip(rhs.iter())
+            .fold(0.0_f64, |acc, (lhs_i, rhs_i)| {
+                acc.max((lhs_i - rhs_i).abs())
+            })
+    }
+
+    fn albatross_replay_numeric_options() -> NumericFactorOptions {
+        NumericFactorOptions {
+            // IPOPT maps `spral_pivot_method=block` onto raw SPRAL control value
+            // 1, which SPRAL documents as aggressive APP. Match the NLIP parity
+            // profile here so dump replay does not test a different pivot lane.
+            pivot_method: PivotMethod::AggressiveAposteriori,
+            ..NumericFactorOptions::spral_default()
+        }
+    }
+
+    fn try_refine_replay_solution(
+        dump: &AlbatrossLinearDebugDump,
+        solution: &mut [f64],
+        mut solve_correction: impl FnMut(&[f64]) -> Result<Vec<f64>, String>,
+    ) -> Result<(), String> {
+        let mut previous_residual_inf = f64::INFINITY;
+        for _ in 0..10 {
+            let residual = residual_vector(dump, solution);
+            let residual_inf = residual
+                .iter()
+                .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+            if residual_inf <= 128.0 * f64::EPSILON
+                || residual_inf >= previous_residual_inf * (1.0 - 1e-6)
+            {
+                break;
+            }
+            previous_residual_inf = residual_inf;
+            let correction = solve_correction(&residual)?;
+            if correction.len() != solution.len() {
+                return Err(format!(
+                    "refinement correction length mismatch: correction={} solution={}",
+                    correction.len(),
+                    solution.len()
+                ));
+            }
+            if correction.iter().all(|value| value.abs() <= f64::EPSILON) {
+                break;
+            }
+            for (solution_i, correction_i) in solution.iter_mut().zip(correction.iter()) {
+                *solution_i += correction_i;
+            }
+        }
+        Ok(())
+    }
+
+    fn try_replay_albatross_dump_with_ssids_rs(
+        dump: &AlbatrossLinearDebugDump,
+    ) -> Result<AlbatrossLinearReplay, String> {
+        let matrix = SymmetricCscMatrix::new(
+            dump.matrix_dimension,
+            &dump.col_ptrs,
+            &dump.row_indices,
+            Some(&dump.values),
+        )
+        .map_err(|error| format!("SSIDS-RS matrix validation failed: {error:?}"))?;
+        let (symbolic, _) = spral_analyse(matrix, &SsidsOptions::spral_default())
+            .map_err(|error| format!("SSIDS-RS analysis failed: {error:?}"))?;
+        let (mut factor, _) =
+            spral_factorize(matrix, &symbolic, &albatross_replay_numeric_options())
+                .map_err(|error| format!("SSIDS-RS factorization failed: {error:?}"))?;
+        if let Some(expected) = dump.expected_inertia
+            && factor.inertia() != expected
+        {
+            return Err(format!(
+                "wrong inertia; expected (+{}, -{}, 0={}), got (+{}, -{}, 0={})",
+                expected.positive,
+                expected.negative,
+                expected.zero,
+                factor.inertia().positive,
+                factor.inertia().negative,
+                factor.inertia().zero
+            ));
+        }
+        let mut solution = factor
+            .solve(&dump.rhs)
+            .map_err(|error| format!("SSIDS-RS solve failed: {error:?}"))?;
+        try_refine_replay_solution(dump, &mut solution, |residual| {
+            factor
+                .solve(residual)
+                .map_err(|error| format!("SSIDS-RS refinement solve failed: {error:?}"))
+        })?;
+        Ok(AlbatrossLinearReplay {
+            residual_inf: residual_inf(dump, &solution),
+            solution_inf: solution_inf(&solution),
+            solution,
+            inertia: factor.inertia(),
+        })
+    }
+
+    fn replay_albatross_dump_with_ssids_rs(
+        dump: &AlbatrossLinearDebugDump,
+    ) -> AlbatrossLinearReplay {
+        try_replay_albatross_dump_with_ssids_rs(dump)
+            .expect("SSIDS-RS should replay dumped Albatross KKT")
+    }
+
+    fn try_replay_albatross_dump_with_source_spral(
+        dump: &AlbatrossLinearDebugDump,
+    ) -> Result<AlbatrossLinearReplay, String> {
+        let native =
+            NativeSpral::load().map_err(|error| format!("native SPRAL load failed: {error:?}"))?;
+        let matrix = SymmetricCscMatrix::new(
+            dump.matrix_dimension,
+            &dump.col_ptrs,
+            &dump.row_indices,
+            Some(&dump.values),
+        )
+        .map_err(|error| format!("source-SPRAL matrix validation failed: {error:?}"))?;
+        let mut session = native
+            .analyse_ipopt_compatible_with_options_and_ordering(
+                matrix,
+                &albatross_replay_numeric_options(),
+                NativeOrdering::Matching,
+            )
+            .map_err(|error| format!("source-SPRAL analysis failed: {error:?}"))?;
+        let factor_info = session
+            .factorize(matrix)
+            .map_err(|error| format!("source-SPRAL factorization failed: {error:?}"))?;
+        if let Some(expected) = dump.expected_inertia
+            && factor_info.inertia != expected
+        {
+            return Err(format!(
+                "wrong inertia; expected (+{}, -{}, 0={}), got (+{}, -{}, 0={})",
+                expected.positive,
+                expected.negative,
+                expected.zero,
+                factor_info.inertia.positive,
+                factor_info.inertia.negative,
+                factor_info.inertia.zero
+            ));
+        }
+        let mut solution = session
+            .solve_ipopt_single_rhs(&dump.rhs)
+            .map_err(|error| format!("source-SPRAL solve failed: {error:?}"))?;
+        try_refine_replay_solution(dump, &mut solution, |residual| {
+            session
+                .solve_ipopt_single_rhs(residual)
+                .map_err(|error| format!("source-SPRAL refinement solve failed: {error:?}"))
+        })?;
+        Ok(AlbatrossLinearReplay {
+            residual_inf: residual_inf(dump, &solution),
+            solution_inf: solution_inf(&solution),
+            solution,
+            inertia: factor_info.inertia,
+        })
+    }
+
+    fn replay_albatross_dump_with_source_spral(
+        dump: &AlbatrossLinearDebugDump,
+    ) -> AlbatrossLinearReplay {
+        try_replay_albatross_dump_with_source_spral(dump)
+            .expect("source-SPRAL should replay dumped Albatross KKT")
+    }
+
+    fn replay_failure_signature(error: &str) -> &'static str {
+        let lower = error.to_ascii_lowercase();
+        if lower.contains("wrong inertia") || lower.contains("wrong_inertia") {
+            "wrong_inertia"
+        } else if lower.contains("factor") {
+            "factorization"
+        } else if lower.contains("analysis") || lower.contains("analyse") {
+            "analysis"
+        } else if lower.contains("solve") {
+            "solve"
+        } else {
+            "other"
+        }
+    }
+
+    fn assert_albatross_replay_consistency(
+        label: &str,
+        ssids_rs: &AlbatrossLinearReplay,
+        source_spral: &AlbatrossLinearReplay,
+    ) {
+        let ssids_summary = format!(
+            "inertia={:?} residual={:.3e} solution_inf={:.3e}",
+            ssids_rs.inertia, ssids_rs.residual_inf, ssids_rs.solution_inf
+        );
+        let source_summary = format!(
+            "inertia={:?} residual={:.3e} solution_inf={:.3e}",
+            source_spral.inertia, source_spral.residual_inf, source_spral.solution_inf
+        );
+        assert_eq!(
+            ssids_rs.inertia, source_spral.inertia,
+            "{label}: SSIDS-RS/source-SPRAL inertia mismatch; ssids_rs=({ssids_summary}); source_spral=({source_summary})"
+        );
+        assert!(
+            ssids_rs.residual_inf <= 1e-7 * (1.0 + ssids_rs.solution_inf),
+            "{label}: SSIDS-RS replay residual too large: {ssids_summary}"
+        );
+        assert!(
+            source_spral.residual_inf <= 1e-7 * (1.0 + source_spral.solution_inf),
+            "{label}: source-SPRAL replay residual too large: {source_summary}"
+        );
+        let solution_gap = delta_inf(&ssids_rs.solution, &source_spral.solution);
+        assert!(
+            solution_gap <= 1e-7 * (1.0 + ssids_rs.solution_inf.max(source_spral.solution_inf)),
+            "{label}: SSIDS-RS/source-SPRAL dumped Albatross replay solution gap {solution_gap:.3e}; ssids_rs=({ssids_summary}); source_spral=({source_summary})"
+        );
+    }
+
+    #[cfg(feature = "ipopt")]
+    #[derive(Clone, Debug)]
+    struct AlbatrossNonlinearTracePoint {
+        iteration: usize,
+        phase: &'static str,
+        objective: f64,
+        eq_inf: Option<f64>,
+        ineq_inf: Option<f64>,
+        dual_inf: f64,
+        comp_inf: Option<f64>,
+        mu: Option<f64>,
+        step_inf: Option<f64>,
+        alpha_pr: Option<f64>,
+        alpha_du: Option<f64>,
+        step_tag: Option<char>,
+    }
+
+    #[cfg(feature = "ipopt")]
+    fn nlip_trace_point(
+        snapshot: &optimization::InteriorPointIterationSnapshot,
+    ) -> AlbatrossNonlinearTracePoint {
+        AlbatrossNonlinearTracePoint {
+            iteration: snapshot.iteration,
+            phase: match snapshot.phase {
+                optimization::InteriorPointIterationPhase::Initial => "initial",
+                optimization::InteriorPointIterationPhase::Restoration => "restoration",
+                optimization::InteriorPointIterationPhase::AcceptedStep => "accepted",
+                optimization::InteriorPointIterationPhase::Converged => "converged",
+            },
+            objective: snapshot.objective,
+            eq_inf: snapshot.eq_inf,
+            ineq_inf: snapshot.ineq_inf,
+            dual_inf: snapshot.dual_inf,
+            comp_inf: snapshot.comp_inf,
+            mu: snapshot.barrier_parameter,
+            step_inf: snapshot.step_inf,
+            alpha_pr: snapshot.alpha_pr,
+            alpha_du: snapshot.alpha_du,
+            step_tag: snapshot.step_tag,
+        }
+    }
+
+    #[cfg(feature = "ipopt")]
+    fn ipopt_trace_point(
+        snapshot: &optimization::IpoptIterationSnapshot,
+    ) -> AlbatrossNonlinearTracePoint {
+        AlbatrossNonlinearTracePoint {
+            iteration: snapshot.iteration,
+            phase: match snapshot.phase {
+                optimization::IpoptIterationPhase::Regular => "regular",
+                optimization::IpoptIterationPhase::Restoration => "restoration",
+            },
+            objective: snapshot.objective,
+            eq_inf: Some(snapshot.primal_inf),
+            ineq_inf: None,
+            dual_inf: snapshot.dual_inf,
+            comp_inf: Some(snapshot.curr_complementarity),
+            mu: Some(snapshot.barrier_parameter),
+            step_inf: Some(snapshot.step_inf),
+            alpha_pr: Some(snapshot.alpha_pr),
+            alpha_du: Some(snapshot.alpha_du),
+            step_tag: None,
+        }
+    }
+
+    #[cfg(feature = "ipopt")]
+    fn trace_value_gap(label: &str, lhs: Option<f64>, rhs: Option<f64>) -> Option<String> {
+        match (lhs, rhs) {
+            (Some(lhs), Some(rhs))
+                if (lhs - rhs).abs() > 1.0e-7 * (1.0 + lhs.abs().max(rhs.abs())) =>
+            {
+                Some(format!("{label}: nlip={lhs:.6e} ipopt={rhs:.6e}"))
+            }
+            (Some(lhs), None) => Some(format!("{label}: nlip={lhs:.6e} ipopt=--")),
+            (None, Some(rhs)) => Some(format!("{label}: nlip=-- ipopt={rhs:.6e}")),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "ipopt")]
+    fn first_albatross_trace_divergence(
+        nlip: &[AlbatrossNonlinearTracePoint],
+        ipopt: &[AlbatrossNonlinearTracePoint],
+    ) -> Option<String> {
+        for (index, (nlip_point, ipopt_point)) in nlip.iter().zip(ipopt.iter()).enumerate() {
+            let mut gaps = Vec::new();
+            if nlip_point.phase != ipopt_point.phase {
+                gaps.push(format!(
+                    "phase: nlip={} ipopt={}",
+                    nlip_point.phase, ipopt_point.phase
+                ));
+            }
+            if nlip_point.iteration != ipopt_point.iteration {
+                gaps.push(format!(
+                    "iteration: nlip={} ipopt={}",
+                    nlip_point.iteration, ipopt_point.iteration
+                ));
+            }
+            if nlip_point.step_tag.is_some()
+                && ipopt_point.step_tag.is_some()
+                && nlip_point.step_tag != ipopt_point.step_tag
+            {
+                gaps.push(format!(
+                    "step_tag: nlip={:?} ipopt={:?}",
+                    nlip_point.step_tag, ipopt_point.step_tag
+                ));
+            }
+            if (nlip_point.objective - ipopt_point.objective).abs()
+                > 1.0e-7 * (1.0 + nlip_point.objective.abs().max(ipopt_point.objective.abs()))
+            {
+                gaps.push(format!(
+                    "objective: nlip={:.6e} ipopt={:.6e}",
+                    nlip_point.objective, ipopt_point.objective
+                ));
+            }
+            for gap in [
+                trace_value_gap("eq_inf", nlip_point.eq_inf, ipopt_point.eq_inf),
+                trace_value_gap("ineq_inf", nlip_point.ineq_inf, ipopt_point.ineq_inf),
+                trace_value_gap("comp_inf", nlip_point.comp_inf, ipopt_point.comp_inf),
+                trace_value_gap("mu", nlip_point.mu, ipopt_point.mu),
+                trace_value_gap("step_inf", nlip_point.step_inf, ipopt_point.step_inf),
+                trace_value_gap("alpha_pr", nlip_point.alpha_pr, ipopt_point.alpha_pr),
+                trace_value_gap("alpha_du", nlip_point.alpha_du, ipopt_point.alpha_du),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                gaps.push(gap);
+            }
+            if (nlip_point.dual_inf - ipopt_point.dual_inf).abs()
+                > 1.0e-7 * (1.0 + nlip_point.dual_inf.abs().max(ipopt_point.dual_inf.abs()))
+            {
+                gaps.push(format!(
+                    "dual_inf: nlip={:.6e} ipopt={:.6e}",
+                    nlip_point.dual_inf, ipopt_point.dual_inf
+                ));
+            }
+            if !gaps.is_empty() {
+                let nlip_window = nlip
+                    .iter()
+                    .skip(index.saturating_sub(2))
+                    .take(5)
+                    .collect::<Vec<_>>();
+                let ipopt_window = ipopt
+                    .iter()
+                    .skip(index.saturating_sub(2))
+                    .take(5)
+                    .collect::<Vec<_>>();
+                return Some(format!(
+                    "first Albatross NLIP/IPOPT divergence at trace index {index}: {}\nNLIP window={nlip_window:#?}\nIPOPT window={ipopt_window:#?}",
+                    gaps.join("; ")
+                ));
+            }
+        }
+        (nlip.len() != ipopt.len()).then(|| {
+            format!(
+                "Albatross NLIP/IPOPT traces matched for {} entries but lengths differ: nlip={} ipopt={}",
+                nlip.len().min(ipopt.len()),
+                nlip.len(),
+                ipopt.len()
+            )
+        })
+    }
+
+    fn native_spral_available() -> bool {
+        match NativeSpral::load() {
+            Ok(_) => true,
+            Err(error) => {
+                if std::env::var_os("AD_CODEGEN_REQUIRE_NATIVE_SPRAL_PARITY").is_some() {
+                    panic!("native SPRAL is required for fail-closed Albatross parity: {error}");
+                }
+                eprintln!("skipping Albatross native SPRAL parity: {error}");
+                false
+            }
+        }
+    }
+
+    fn run_with_large_stack(name: &str, task: impl FnOnce() + Send + 'static) {
+        let handle = std::thread::Builder::new()
+            .name(name.to_string())
+            .stack_size(64 * 1024 * 1024)
+            .spawn(task)
+            .expect("large-stack Albatross parity thread should spawn");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    fn nlip_error_context(
+        error: &optimization::InteriorPointSolveError,
+    ) -> Option<&optimization::InteriorPointFailureContext> {
+        match error {
+            optimization::InteriorPointSolveError::LinearSolve { context, .. }
+            | optimization::InteriorPointSolveError::LineSearchFailed { context, .. }
+            | optimization::InteriorPointSolveError::RestorationFailed { context, .. }
+            | optimization::InteriorPointSolveError::LocalInfeasibility { context }
+            | optimization::InteriorPointSolveError::DivergingIterates { context, .. }
+            | optimization::InteriorPointSolveError::CpuTimeExceeded { context, .. }
+            | optimization::InteriorPointSolveError::WallTimeExceeded { context, .. }
+            | optimization::InteriorPointSolveError::UserRequestedStop { context }
+            | optimization::InteriorPointSolveError::SearchDirectionTooSmall { context }
+            | optimization::InteriorPointSolveError::MaxIterations { context, .. } => Some(context),
+            optimization::InteriorPointSolveError::InvalidInput(_) => None,
+        }
+    }
+
+    fn assert_default_albatross_ssids_rs_source_spral_reports(
+        schedule: optimization::InteriorPointLinearDebugSchedule,
+        max_iters: usize,
+    ) {
+        if !native_spral_available() {
+            return;
+        }
+
+        let params = Params::default();
+        let runtime = dc_runtime(&params).expect("default Albatross DC runtime should build");
+        let compiled = cached_direct_collocation(&params, params.transcription.collocation_family)
+            .expect("default Albatross DC transcription should compile");
+        let compiled = compiled.compiled.borrow();
+        let mut options = crate::common::nlip_options(&params.solver);
+        options.max_iters = max_iters;
+        options.linear_solver = optimization::InteriorPointLinearSolver::SsidsRs;
+        options.linear_debug = Some(optimization::InteriorPointLinearDebugOptions {
+            compare_solvers: vec![optimization::InteriorPointLinearSolver::SpralSrc],
+            schedule,
+            dump_dir: None,
+        });
+
+        let solve_result = compiled.solve_interior_point(&runtime, &options);
+        let mut reports = match &solve_result {
+            Ok(solved) => solved
+                .solver
+                .snapshots
+                .iter()
+                .filter_map(|snapshot| snapshot.linear_debug.clone())
+                .collect::<Vec<_>>(),
+            Err(error) => nlip_error_context(error)
+                .and_then(|context| {
+                    context
+                        .failed_linear_solve
+                        .as_ref()
+                        .and_then(|diagnostics| diagnostics.debug_report.clone())
+                        .or_else(|| {
+                            context
+                                .final_state
+                                .as_ref()
+                                .and_then(|snapshot| snapshot.linear_debug.clone())
+                        })
+                })
+                .into_iter()
+                .collect(),
+        };
+        if schedule == optimization::InteriorPointLinearDebugSchedule::FirstIteration {
+            reports.truncate(1);
+        }
+        assert!(
+            !reports.is_empty(),
+            "Albatross SSIDS-RS/source-SPRAL parity should emit at least one linear-debug report; solve_result={solve_result:#?}"
+        );
+
+        for report in &reports {
+            assert_eq!(
+                report.primary_solver,
+                optimization::InteriorPointLinearSolver::SsidsRs
+            );
+            let primary = report
+                .results
+                .iter()
+                .find(|result| result.solver == optimization::InteriorPointLinearSolver::SsidsRs)
+                .expect("SSIDS-RS primary result should be present");
+            let native = report
+                .results
+                .iter()
+                .find(|result| result.solver == optimization::InteriorPointLinearSolver::SpralSrc)
+                .expect("source-SPRAL comparison result should be present");
+            assert_eq!(
+                native.success, primary.success,
+                "Albatross SSIDS-RS/source-SPRAL solve outcome mismatch: {report:#?}"
+            );
+            assert_eq!(native.inertia, primary.inertia);
+            if primary.success {
+                assert_eq!(
+                    report.verdict,
+                    optimization::InteriorPointLinearDebugVerdict::Consistent,
+                    "Albatross successful SSIDS-RS/source-SPRAL KKT mismatch: {report:#?}"
+                );
+                assert!(
+                    native
+                        .detail
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("native_spral_factor"),
+                    "source-SPRAL comparison should expose native factor diagnostics: {native:#?}"
+                );
+            } else {
+                assert_eq!(
+                    report.verdict,
+                    optimization::InteriorPointLinearDebugVerdict::ConsistentFailure,
+                    "Albatross failed SSIDS-RS/source-SPRAL KKT should fail consistently: {report:#?}"
+                );
+                assert_eq!(
+                    primary.detail, native.detail,
+                    "Albatross failed SSIDS-RS/source-SPRAL KKT diagnostics differ: {report:#?}"
+                );
+            }
+            for result in &report.results {
+                assert!(
+                    !result
+                        .detail
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("fallback_to_spral_src"),
+                    "linear-debug results must not include hidden source-SPRAL fallback: {result:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn default_albatross_first_kkt_ssids_rs_matches_source_spral() {
+        run_with_large_stack("albatross-first-kkt-ssids-parity", || {
+            assert_default_albatross_ssids_rs_source_spral_reports(
+                optimization::InteriorPointLinearDebugSchedule::FirstIteration,
+                1,
+            );
+        });
+    }
+
+    #[test]
+    fn default_albatross_first_kkt_dump_replays_with_ssids_rs_and_source_spral() {
+        run_with_large_stack("albatross-first-kkt-dump-replay", || {
+            if !native_spral_available() {
+                return;
+            }
+
+            let params = Params::default();
+            let runtime = dc_runtime(&params).expect("default Albatross DC runtime should build");
+            let compiled =
+                cached_direct_collocation(&params, params.transcription.collocation_family)
+                    .expect("default Albatross DC transcription should compile");
+            let compiled = compiled.compiled.borrow();
+            let (dump_dir, _dump_temp) =
+                optional_persistent_albatross_dump_dir("AD_ALBATROSS_FIRST_KKT_DUMP_DIR");
+            let mut options = crate::common::nlip_options(&params.solver);
+            options.max_iters = 1;
+            options.linear_solver = optimization::InteriorPointLinearSolver::SsidsRs;
+            options.linear_debug = Some(optimization::InteriorPointLinearDebugOptions {
+                compare_solvers: vec![optimization::InteriorPointLinearSolver::SpralSrc],
+                schedule: optimization::InteriorPointLinearDebugSchedule::FirstIteration,
+                dump_dir: Some(dump_dir.clone()),
+            });
+
+            let _ = compiled.solve_interior_point(&runtime, &options);
+            let dump = load_albatross_linear_debug_dump(&dump_dir.join("nlip_kkt_iter_0000.txt"));
+            assert_eq!(dump.matrix_dimension, dump.col_ptrs.len() - 1);
+            assert_eq!(dump.values.len(), dump.row_indices.len());
+            let ssids_rs = replay_albatross_dump_with_ssids_rs(&dump);
+            let source_spral = replay_albatross_dump_with_source_spral(&dump);
+            assert_albatross_replay_consistency(
+                "first Albatross KKT dump",
+                &ssids_rs,
+                &source_spral,
+            );
+        });
+    }
+
+    #[test]
+    fn default_albatross_restoration_kkt_failure_matches_source_spral() {
+        run_with_large_stack("albatross-ssids-parity-200", || {
+            assert_default_albatross_ssids_rs_source_spral_reports(
+                optimization::InteriorPointLinearDebugSchedule::EveryIteration,
+                200,
+            );
+        });
+    }
+
+    #[test]
+    fn default_albatross_restoration_or_failure_kkt_dump_replays_or_fails_consistently() {
+        run_with_large_stack("albatross-restoration-inner-kkt-replay", || {
+            if !native_spral_available() {
+                return;
+            }
+
+            let params = Params::default();
+            let runtime = dc_runtime(&params).expect("default Albatross DC runtime should build");
+            let compiled =
+                cached_direct_collocation(&params, params.transcription.collocation_family)
+                    .expect("default Albatross DC transcription should compile");
+            let compiled = compiled.compiled.borrow();
+            let (dump_dir, _dump_temp) =
+                optional_persistent_albatross_dump_dir("AD_ALBATROSS_RESTORATION_DUMP_DIR");
+            let mut options = crate::common::nlip_options(&params.solver);
+            options.max_iters = 3;
+            options.verbose = false;
+            options.linear_solver = optimization::InteriorPointLinearSolver::SsidsRs;
+            options.linear_debug = Some(optimization::InteriorPointLinearDebugOptions {
+                compare_solvers: vec![optimization::InteriorPointLinearSolver::SpralSrc],
+                schedule: optimization::InteriorPointLinearDebugSchedule::EveryIteration,
+                dump_dir: Some(dump_dir.clone()),
+            });
+
+            let solve_result = compiled.solve_interior_point(&runtime, &options);
+            let restoration_dump_root = dump_dir.join("aug_resto_inner");
+            let mut dump_paths = collect_albatross_linear_debug_dumps(&restoration_dump_root);
+            let dump_root = if dump_paths.is_empty() {
+                dump_paths = collect_albatross_linear_debug_dumps(&dump_dir);
+                dump_dir.clone()
+            } else {
+                restoration_dump_root
+            };
+            assert!(
+                !dump_paths.is_empty(),
+                "Albatross linear debug should emit at least one replay dump under {}; solve_result={solve_result:#?}",
+                dump_root.display()
+            );
+            let first_dump_path = dump_paths
+                .last()
+                .expect("non-empty Albatross KKT dump list after assertion");
+            let dump = load_albatross_linear_debug_dump(first_dump_path);
+            assert_eq!(dump.matrix_dimension, dump.col_ptrs.len() - 1);
+            assert_eq!(dump.values.len(), dump.row_indices.len());
+
+            let ssids_rs = try_replay_albatross_dump_with_ssids_rs(&dump);
+            let source_spral = try_replay_albatross_dump_with_source_spral(&dump);
+            match (&ssids_rs, &source_spral) {
+                (Ok(ssids_rs), Ok(source_spral)) => {
+                    assert_albatross_replay_consistency(
+                        &format!("restoration reduced KKT dump {}", first_dump_path.display()),
+                        ssids_rs,
+                        source_spral,
+                    );
+                }
+                (Err(ssids_error), Err(source_error)) => {
+                    let ssids_signature = replay_failure_signature(ssids_error);
+                    let source_signature = replay_failure_signature(source_error);
+                    assert_ne!(
+                        ssids_signature,
+                        "other",
+                        "unclassified SSIDS-RS replay failure for {}: {ssids_error}",
+                        first_dump_path.display()
+                    );
+                    assert_eq!(
+                        ssids_signature,
+                        source_signature,
+                        "SSIDS-RS/source-SPRAL restoration reduced KKT replay failures diverged for {}:\nSSIDS-RS: {ssids_error}\nsource-SPRAL: {source_error}",
+                        first_dump_path.display()
+                    );
+                }
+                (Ok(ssids_rs), Err(source_error)) => panic!(
+                    "SSIDS-RS replay succeeded but source-SPRAL failed for {}:\nSSIDS-RS: {ssids_rs:#?}\nsource-SPRAL: {source_error}",
+                    first_dump_path.display()
+                ),
+                (Err(ssids_error), Ok(source_spral)) => panic!(
+                    "source-SPRAL replay succeeded but SSIDS-RS failed for {}:\nSSIDS-RS: {ssids_error}\nsource-SPRAL: {source_spral:#?}",
+                    first_dump_path.display()
+                ),
+            }
+        });
+    }
+
+    #[cfg(feature = "ipopt")]
+    #[test]
+    #[ignore = "diagnostic nonlinear restoration parity witness; run explicitly when closing Albatross NLIP/IPOPT drift"]
+    fn default_albatross_nlip_spral_src_vs_ipopt_restoration_witness() {
+        run_with_large_stack("albatross-nlip-ipopt-restoration-witness", || {
+            if !native_spral_available() {
+                return;
+            }
+
+            let params = Params::default();
+            let runtime = dc_runtime(&params).expect("default Albatross DC runtime should build");
+            let compiled =
+                cached_direct_collocation(&params, params.transcription.collocation_family)
+                    .expect("default Albatross DC transcription should compile");
+            let compiled = compiled.compiled.borrow();
+
+            let mut nlip_options = crate::common::nlip_options(&params.solver);
+            nlip_options.max_iters = 200;
+            optimization::apply_native_spral_parity_to_nlip_options(&mut nlip_options);
+            nlip_options.linear_solver = optimization::InteriorPointLinearSolver::SpralSrc;
+
+            let mut nlip_trace = Vec::new();
+            let nlip_result =
+                compiled.solve_interior_point_with_callback(&runtime, &nlip_options, |snapshot| {
+                    nlip_trace.push(nlip_trace_point(&snapshot.solver))
+                });
+            assert!(
+                !nlip_trace.is_empty(),
+                "NLIP Albatross witness should record at least one callback; result={nlip_result:#?}"
+            );
+
+            let mut ipopt_options = crate::common::ipopt_options(&params.solver);
+            ipopt_options.max_iters = 200;
+            ipopt_options.print_level = 0;
+            ipopt_options.suppress_banner = true;
+            ipopt_options.journal_print_level = Some(5);
+            ipopt_options
+                .raw_options
+                .push(optimization::IpoptRawOption::text(
+                    "print_info_string",
+                    "yes",
+                ));
+            optimization::apply_native_spral_parity_to_ipopt_options(&mut ipopt_options);
+
+            let mut ipopt_trace = Vec::new();
+            let ipopt_result =
+                compiled.solve_ipopt_with_callback(&runtime, &ipopt_options, |snapshot| {
+                    ipopt_trace.push(ipopt_trace_point(&snapshot.solver));
+                });
+            assert!(
+                !ipopt_trace.is_empty(),
+                "IPOPT Albatross witness should record at least one callback; result={ipopt_result:#?}"
+            );
+
+            if let Some(report) = first_albatross_trace_divergence(&nlip_trace, &ipopt_trace) {
+                panic!(
+                    "{report}\nNLIP result status={nlip_result:#?}\nIPOPT result status={ipopt_result:#?}"
+                );
+            }
+        });
+    }
 
     #[test]
     fn default_transcription_is_direct_collocation() {
@@ -3351,15 +4229,19 @@ mod tests {
     fn default_albatross_parameters_match_crosswind_reference_seed() {
         let params = Params::default();
         assert_eq!(params.objective, ObjectiveKind::WindWork);
+        assert!(!params.delta_l.fixed);
         assert_eq!(params.delta_l.value, 90.0);
         assert_eq!(params.delta_l.lower, 50.0);
         assert_eq!(params.delta_l.upper, 220.0);
+        assert!(!params.h0.fixed);
         assert_eq!(params.h0.value, 1.5);
         assert_eq!(params.h0.lower, 0.5);
         assert_eq!(params.h0.upper, 5.0);
+        assert!(!params.vx0.fixed);
         assert_eq!(params.vx0.value, 15.0);
         assert_eq!(params.vx0.lower, 10.0);
         assert_eq!(params.vx0.upper, 22.0);
+        assert!(!params.tf.fixed);
         assert_eq!(params.tf.value, 6.0);
         assert_eq!(params.tf.lower, 3.0);
         assert_eq!(params.tf.upper, 12.0);
@@ -3506,6 +4388,7 @@ mod tests {
     #[test]
     fn fixed_h0_below_min_altitude_fails() {
         let mut values = BTreeMap::new();
+        values.insert("h0_free".to_string(), 0.0);
         values.insert("h0_value".to_string(), 0.25);
         values.insert("min_altitude_m".to_string(), 0.5);
         let err = Params::from_map(&values).expect_err("h0 below minimum altitude should fail");

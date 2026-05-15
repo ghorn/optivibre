@@ -4840,8 +4840,18 @@ function appendSegmentedBooleanControl(
   segmented.setAttribute("role", "radiogroup");
   segmented.setAttribute("aria-label", options.label);
 
+  const optionButtons: Array<{ numeric: 0 | 1; button: HTMLButtonElement }> = [];
+  const updateButtons = (activeValue: 0 | 1): void => {
+    for (const option of optionButtons) {
+      const active = option.numeric === activeValue;
+      option.button.dataset.active = active ? "true" : "false";
+      option.button.setAttribute("aria-checked", active ? "true" : "false");
+    }
+  };
+
   const setValue = (numeric: 0 | 1): void => {
     state.values[control.id] = numeric;
+    updateButtons(numeric);
     handleControlUpdate(control);
   };
 
@@ -4849,16 +4859,16 @@ function appendSegmentedBooleanControl(
     const button = document.createElement("button");
     button.type = "button";
     button.className = "segmented-option";
-    button.dataset.active = value === numeric ? "true" : "false";
     button.setAttribute("role", "radio");
-    button.setAttribute("aria-checked", value === numeric ? "true" : "false");
     button.textContent = optionLabel;
     button.addEventListener("click", () => setValue(numeric));
+    optionButtons.push({ numeric, button });
     segmented.appendChild(button);
   };
 
   appendOption(0, options.falseLabel);
   appendOption(1, options.trueLabel);
+  updateButtons(value);
   wrapper.append(header, segmented);
   wrapperParent.appendChild(wrapper);
 }

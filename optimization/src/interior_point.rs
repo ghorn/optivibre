@@ -6,6 +6,7 @@ use ssids_rs::{
     AnalyseInfo as SpralAnalyseInfo, Inertia as SpralInertia,
     NativeOrdering as SpralNativeOrdering, NativeSpral as NativeSpralLibrary, NativeSpralSession,
     NumericFactor as SpralNumericFactor, NumericFactorOptions as SpralNumericFactorOptions,
+    NumericScalingStrategy as SpralNumericScalingStrategy,
     OrderingStrategy as SpralOrderingStrategy, PivotMethod as SpralPivotMethod,
     SsidsOptions as SpralSsidsOptions, SymbolicFactor as SpralSymbolicFactor,
     SymmetricCscMatrix as SpralSymmetricCscMatrix, analyse as spral_analyse,
@@ -116,6 +117,7 @@ pub struct InteriorPointLinearInertia {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InteriorPointLinearDebugVerdict {
     Consistent,
+    ConsistentFailure,
     LinearSolverMismatch,
     ComparisonIncomplete,
 }
@@ -890,6 +892,7 @@ fn spral_numeric_factor_options(options: &InteriorPointOptions) -> SpralNumericF
         },
         small_pivot_tolerance: options.spral_small_pivot_tolerance,
         threshold_pivot_u: options.spral_threshold_pivot_u,
+        scaling: SpralNumericScalingStrategy::SavedMatching,
         ..SpralNumericFactorOptions::default()
     }
 }
@@ -906,6 +909,7 @@ fn system_spral_numeric_factor_options(system: &ReducedKktSystem<'_>) -> SpralNu
         },
         small_pivot_tolerance: system.spral_small_pivot_tolerance,
         threshold_pivot_u: system.spral_threshold_pivot_u,
+        scaling: SpralNumericScalingStrategy::SavedMatching,
         ..SpralNumericFactorOptions::default()
     }
 }
@@ -1415,6 +1419,10 @@ impl InteriorPointLinearSolveFailureKind {
 pub struct InteriorPointLinearSolveAttempt {
     pub solver: InteriorPointLinearSolver,
     pub regularization: f64,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub primal_diagonal_shift: Option<f64>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub dual_regularization: Option<f64>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub inertia: Option<Box<InteriorPointLinearInertia>>,
     pub failure_kind: InteriorPointLinearSolveFailureKind,
@@ -3811,7 +3819,7 @@ impl SpralAugmentedKktPattern {
 struct SpralAugmentedKktWorkspace {
     pattern: SpralAugmentedKktPattern,
     values: Vec<f64>,
-    symbolic: SpralSymbolicFactor,
+    symbolic: Option<SpralSymbolicFactor>,
     factor: Option<SpralNumericFactor>,
     factor_regularization: Option<f64>,
     auto_fallback_disabled: bool,
@@ -4075,7 +4083,7 @@ impl SpralAugmentedKktWorkspace {
             equality_jacobian,
             inequality_jacobian,
         )?;
-        let matrix = SpralSymmetricCscMatrix::new(
+        let _matrix = SpralSymmetricCscMatrix::new(
             pattern.dimension(),
             &pattern.ccs.col_ptrs,
             &pattern.ccs.row_indices,
@@ -4086,30 +4094,22 @@ impl SpralAugmentedKktWorkspace {
                 "invalid sparse KKT structure for ssids_rs: {error}"
             ))
         })?;
-        let (symbolic, info) = spral_analyse(
-            matrix,
-            &SpralSsidsOptions {
-                // Large NLP KKT systems can spend a long time estimating natural-order fill
-                // inside `Auto`; AMD is a safer sparse default for this integration seam.
-                ordering: SpralOrderingStrategy::ApproximateMinimumDegree,
-            },
-        )
-        .map_err(|error| {
-            InteriorPointSolveError::InvalidInput(format!(
-                "failed to analyse sparse KKT structure for ssids_rs: {error}"
-            ))
-        })?;
         let values = vec![0.0; pattern.ccs.nnz()];
         Ok((
             Self {
                 pattern,
                 values,
-                symbolic,
+                symbolic: None,
                 factor: None,
                 factor_regularization: None,
                 auto_fallback_disabled: false,
             },
-            info,
+            SpralAnalyseInfo {
+                estimated_fill_nnz: 0,
+                supernode_count: 0,
+                max_supernode_width: 0,
+                ordering_kind: "ssids_rs_spral_matching_value_dependent",
+            },
         ))
     }
 }
@@ -4545,6 +4545,16 @@ fn linear_debug_matches_primary(
         && scaled_linear_debug_delta_matches(result.dz_delta_inf, slice_inf_norm(&primary.dz))
 }
 
+fn linear_debug_failure_matches_primary(
+    primary: &InteriorPointLinearDebugBackendResult,
+    result: &InteriorPointLinearDebugBackendResult,
+) -> bool {
+    !primary.success
+        && !result.success
+        && primary.inertia == result.inertia
+        && primary.detail == result.detail
+}
+
 fn newton_direction_from_augmented_solution(
     snapshot: &InteriorPointKktSnapshot,
     solver: InteriorPointLinearSolver,
@@ -4737,6 +4747,8 @@ fn replay_snapshot_with_solver(
         InteriorPointLinearSolver::Auto => Err(vec![InteriorPointLinearSolveAttempt {
             solver,
             regularization: snapshot.regularization,
+            primal_diagonal_shift: None,
+            dual_regularization: None,
             inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::FactorizationFailed,
             detail: Some("auto is not a concrete comparison backend".into()),
@@ -4785,6 +4797,8 @@ fn run_linear_debug_report_on_success(
                 let fallback_attempt = InteriorPointLinearSolveAttempt {
                     solver,
                     regularization: snapshot.regularization,
+                    primal_diagonal_shift: None,
+                    dual_regularization: None,
                     inertia: None,
                     failure_kind: InteriorPointLinearSolveFailureKind::FactorizationFailed,
                     detail: Some("comparison backend failed without diagnostics".into()),
@@ -4838,11 +4852,13 @@ fn run_linear_debug_report_on_failure(
     debug_state: &mut InteriorPointLinearDebugState,
 ) -> InteriorPointLinearDebugReport {
     let compare_solvers = normalized_compare_solvers(&debug_state.options, preferred_solver);
-    let mut results = vec![linear_debug_result_from_attempt(
+    let primary_result = linear_debug_result_from_attempt(
         preferred_solver,
         attempts.last().unwrap_or(&InteriorPointLinearSolveAttempt {
             solver: preferred_solver,
             regularization: snapshot.regularization,
+            primal_diagonal_shift: None,
+            dual_regularization: None,
             inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::FactorizationFailed,
             detail: Some("primary backend failed without diagnostics".into()),
@@ -4851,7 +4867,8 @@ fn run_linear_debug_report_on_failure(
             residual_inf: None,
             residual_inf_limit: None,
         }),
-    )];
+    );
+    let mut results = vec![primary_result.clone()];
     let mut notes = attempts
         .iter()
         .filter_map(|attempt| {
@@ -4864,6 +4881,9 @@ fn run_linear_debug_report_on_failure(
         })
         .collect::<Vec<_>>();
     let mut compare_success = false;
+    let mut compare_mismatch = false;
+    let mut compare_incomplete = compare_solvers.is_empty();
+    let mut matching_failures = Vec::new();
     for solver in compare_solvers {
         match replay_snapshot_with_solver(snapshot, solver, debug_state) {
             Ok(direction) => {
@@ -4878,6 +4898,8 @@ fn run_linear_debug_report_on_failure(
                 let fallback_attempt = InteriorPointLinearSolveAttempt {
                     solver,
                     regularization: snapshot.regularization,
+                    primal_diagonal_shift: None,
+                    dual_regularization: None,
                     inertia: None,
                     failure_kind: InteriorPointLinearSolveFailureKind::FactorizationFailed,
                     detail: Some("comparison backend failed without diagnostics".into()),
@@ -4895,15 +4917,32 @@ fn run_linear_debug_report_on_failure(
                         .clone()
                         .unwrap_or_else(|| attempt.failure_kind.label().into())
                 ));
-                results.push(linear_debug_result_from_attempt(solver, attempt));
+                let result = linear_debug_result_from_attempt(solver, attempt);
+                if linear_debug_failure_matches_primary(&primary_result, &result) {
+                    matching_failures.push(solver.label());
+                } else {
+                    compare_mismatch = true;
+                    if result.detail.is_none() && result.inertia.is_none() {
+                        compare_incomplete = true;
+                    }
+                }
+                results.push(result);
             }
         }
+    }
+    if !matching_failures.is_empty() {
+        notes.push(format!(
+            "matched primary failure: {}",
+            matching_failures.join(", ")
+        ));
     }
     InteriorPointLinearDebugReport {
         primary_solver: preferred_solver,
         schedule: debug_state.options.schedule,
-        verdict: if compare_success {
+        verdict: if compare_success || compare_mismatch {
             InteriorPointLinearDebugVerdict::LinearSolverMismatch
+        } else if !compare_incomplete && !matching_failures.is_empty() {
+            InteriorPointLinearDebugVerdict::ConsistentFailure
         } else {
             InteriorPointLinearDebugVerdict::ComparisonIncomplete
         },
@@ -5211,6 +5250,7 @@ fn dump_restoration_inner_linear_debug_snapshot(
     parent_dump_dir: Option<&std::path::Path>,
     iteration: Index,
     phase: InteriorPointIterationPhase,
+    primary_solver: InteriorPointLinearSolver,
     restoration_reduced_kkt: &RestorationReducedKktSystem,
     initial_reduced_rhs: &RestorationReducedAugmentedRhs,
     reduced_system: &ReducedKktSystem<'_>,
@@ -5229,7 +5269,7 @@ fn dump_restoration_inner_linear_debug_snapshot(
     let Ok(mut snapshot) = build_interior_point_kkt_snapshot(
         iteration,
         phase,
-        InteriorPointLinearSolver::SpralSrc,
+        primary_solver,
         reduced_system,
         primal_shift,
         dual_shift,
@@ -5296,7 +5336,7 @@ fn dump_restoration_inner_linear_debug_snapshot(
         dz: vec![0.0; mineq],
         dz_lower: Vec::new(),
         dz_upper: Vec::new(),
-        solver_used: InteriorPointLinearSolver::SpralSrc,
+        solver_used: primary_solver,
         regularization_used: primal_shift,
         dual_regularization_used: dual_shift,
         primal_diagonal_shift_used: primal_shift,
@@ -5306,7 +5346,7 @@ fn dump_restoration_inner_linear_debug_snapshot(
         linear_debug: None,
     };
     let report = InteriorPointLinearDebugReport {
-        primary_solver: InteriorPointLinearSolver::SpralSrc,
+        primary_solver,
         schedule: InteriorPointLinearDebugSchedule::EveryIteration,
         verdict: InteriorPointLinearDebugVerdict::Consistent,
         results: vec![linear_debug_result_from_stats(
@@ -5388,6 +5428,70 @@ fn dump_restoration_inner_linear_debug_snapshot(
         restoration_reduced_kkt.bound_rhs,
     ));
     let _ = fs::write(component_path, body);
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Diagnostic-only dump preserves failed reduced AugResto solve inputs."
+)]
+fn dump_restoration_inner_linear_debug_failure_snapshot(
+    parent_dump_dir: Option<&std::path::Path>,
+    iteration: Index,
+    retry_index: Index,
+    phase: InteriorPointIterationPhase,
+    primary_solver: InteriorPointLinearSolver,
+    reduced_system: &ReducedKktSystem<'_>,
+    augmented_values: &[f64],
+    rhs_prefinal: &[f64],
+    primal_shift: f64,
+    dual_shift: f64,
+    attempt: &InteriorPointLinearSolveAttempt,
+) {
+    let Some(parent_dump_dir) = parent_dump_dir else {
+        return;
+    };
+    let Ok(mut snapshot) = build_interior_point_kkt_snapshot(
+        iteration,
+        phase,
+        primary_solver,
+        reduced_system,
+        primal_shift,
+        dual_shift,
+        reduced_system.barrier_parameter,
+        0.0,
+        0.0,
+        0.0,
+        0,
+    ) else {
+        return;
+    };
+    if snapshot.augmented_values.len() != augmented_values.len()
+        || snapshot.augmented_rhs.len() != rhs_prefinal.len()
+    {
+        return;
+    }
+    snapshot.augmented_values.copy_from_slice(augmented_values);
+    snapshot.augmented_rhs.copy_from_slice(rhs_prefinal);
+    let report = InteriorPointLinearDebugReport {
+        primary_solver,
+        schedule: InteriorPointLinearDebugSchedule::EveryIteration,
+        verdict: InteriorPointLinearDebugVerdict::ConsistentFailure,
+        results: vec![linear_debug_result_from_attempt(primary_solver, attempt)],
+        notes: vec![
+            "aug_resto_inner_reduced_system_failed".to_string(),
+            format!("retry_index={retry_index}"),
+        ],
+    };
+    let options = InteriorPointLinearDebugOptions {
+        compare_solvers: Vec::new(),
+        schedule: InteriorPointLinearDebugSchedule::EveryIteration,
+        dump_dir: Some(
+            parent_dump_dir
+                .join("aug_resto_inner")
+                .join(format!("retry_{retry_index:02}")),
+        ),
+    };
+    dump_linear_debug_snapshot(&options, &snapshot, &report, None);
 }
 
 fn spawn_spral_stage_heartbeat(label: &'static str) -> (Arc<AtomicBool>, thread::JoinHandle<()>) {
@@ -10966,6 +11070,8 @@ fn assess_linear_solution(
         return Err(InteriorPointLinearSolveAttempt {
             solver: InteriorPointLinearSolver::Auto,
             regularization: 0.0,
+            primal_diagonal_shift: None,
+            dual_regularization: None,
             inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::NonFiniteSolution,
             detail: None,
@@ -10979,6 +11085,8 @@ fn assess_linear_solution(
         return Err(InteriorPointLinearSolveAttempt {
             solver: InteriorPointLinearSolver::Auto,
             regularization: 0.0,
+            primal_diagonal_shift: None,
+            dual_regularization: None,
             inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::SolutionNormTooLarge,
             detail: None,
@@ -11011,6 +11119,8 @@ fn assess_linear_solution(
         return Err(InteriorPointLinearSolveAttempt {
             solver: InteriorPointLinearSolver::Auto,
             regularization: 0.0,
+            primal_diagonal_shift: None,
+            dual_regularization: None,
             inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::ResidualTooLarge,
             detail: None,
@@ -11045,6 +11155,8 @@ fn assess_linear_solution_ccs(
         return Err(InteriorPointLinearSolveAttempt {
             solver: InteriorPointLinearSolver::Auto,
             regularization: 0.0,
+            primal_diagonal_shift: None,
+            dual_regularization: None,
             inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::NonFiniteSolution,
             detail: None,
@@ -11058,6 +11170,8 @@ fn assess_linear_solution_ccs(
         return Err(InteriorPointLinearSolveAttempt {
             solver: InteriorPointLinearSolver::Auto,
             regularization: 0.0,
+            primal_diagonal_shift: None,
+            dual_regularization: None,
             inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::SolutionNormTooLarge,
             detail: None,
@@ -11090,6 +11204,8 @@ fn assess_linear_solution_ccs(
         return Err(InteriorPointLinearSolveAttempt {
             solver: InteriorPointLinearSolver::Auto,
             regularization: 0.0,
+            primal_diagonal_shift: None,
+            dual_regularization: None,
             inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::ResidualTooLarge,
             detail: None,
@@ -12130,6 +12246,8 @@ fn spral_error_attempt(
     InteriorPointLinearSolveAttempt {
         solver: InteriorPointLinearSolver::SsidsRs,
         regularization,
+        primal_diagonal_shift: None,
+        dual_regularization: None,
         inertia: None,
         failure_kind,
         detail: Some(error.to_string()),
@@ -12148,6 +12266,8 @@ fn native_spral_error_attempt(
     InteriorPointLinearSolveAttempt {
         solver: InteriorPointLinearSolver::SpralSrc,
         regularization,
+        primal_diagonal_shift: None,
+        dual_regularization: None,
         inertia: None,
         failure_kind,
         detail: Some(error.to_string()),
@@ -12156,6 +12276,24 @@ fn native_spral_error_attempt(
         residual_inf: None,
         residual_inf_limit: None,
     }
+}
+
+fn set_linear_attempt_shifts(
+    attempt: &mut InteriorPointLinearSolveAttempt,
+    primal_diagonal_shift: f64,
+    dual_regularization: f64,
+) {
+    attempt.primal_diagonal_shift = Some(primal_diagonal_shift);
+    attempt.dual_regularization = Some(dual_regularization);
+}
+
+fn linear_attempt_with_shifts(
+    mut attempt: InteriorPointLinearSolveAttempt,
+    primal_diagonal_shift: f64,
+    dual_regularization: f64,
+) -> InteriorPointLinearSolveAttempt {
+    set_linear_attempt_shifts(&mut attempt, primal_diagonal_shift, dual_regularization);
+    attempt
 }
 
 fn default_dsigns(dimension: usize) -> Vec<i8> {
@@ -12179,6 +12317,8 @@ fn factor_solve_sparse_qdldl_with_metrics(
         return Err(InteriorPointLinearSolveAttempt {
             solver: InteriorPointLinearSolver::SparseQdldl,
             regularization,
+            primal_diagonal_shift: None,
+            dual_regularization: None,
             inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::FactorizationFailed,
             detail: None,
@@ -12193,6 +12333,8 @@ fn factor_solve_sparse_qdldl_with_metrics(
         return Err(InteriorPointLinearSolveAttempt {
             solver: InteriorPointLinearSolver::SparseQdldl,
             regularization,
+            primal_diagonal_shift: None,
+            dual_regularization: None,
             inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::FactorizationFailed,
             detail: None,
@@ -12215,6 +12357,8 @@ fn factor_solve_sparse_qdldl_with_metrics(
         InteriorPointLinearSolveAttempt {
             solver: InteriorPointLinearSolver::SparseQdldl,
             regularization,
+            primal_diagonal_shift: None,
+            dual_regularization: None,
             inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::FactorizationFailed,
             detail: None,
@@ -12289,6 +12433,8 @@ fn factor_solve_spral_ssids_symmetric_with_metrics(
         return Err(InteriorPointLinearSolveAttempt {
             solver: InteriorPointLinearSolver::SsidsRs,
             regularization,
+            primal_diagonal_shift: None,
+            dual_regularization: None,
             inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::FactorizationFailed,
             detail: None,
@@ -12319,27 +12465,18 @@ fn factor_solve_spral_ssids_symmetric_with_metrics(
         lower_matrix.rowval.clone(),
     );
     let factor_started = Instant::now();
-    let (symbolic, _) = spral_analyse(
-        spral_matrix,
-        &SpralSsidsOptions {
-            // IPOPT's SPRAL path does not have this crate's `Auto` heuristic.
-            // Keep sparse auxiliary solves on explicit AMD, matching the Rust
-            // augmented-KKT integration and avoiding Auto's natural-order fill
-            // simulation on glider-sized least-squares multiplier systems.
-            ordering: SpralOrderingStrategy::ApproximateMinimumDegree,
-        },
-    )
-    .map_err(|error| {
-        spral_error_attempt(
-            regularization,
-            InteriorPointLinearSolveFailureKind::FactorizationFailed,
-            error,
-        )
-    })?;
+    let (symbolic, _) =
+        spral_analyse(spral_matrix, &SpralSsidsOptions::spral_default()).map_err(|error| {
+            spral_error_attempt(
+                regularization,
+                InteriorPointLinearSolveFailureKind::FactorizationFailed,
+                error,
+            )
+        })?;
     let mut factor = spral_factorize(
         spral_matrix,
         &symbolic,
-        &SpralNumericFactorOptions::default(),
+        &SpralNumericFactorOptions::spral_default(),
     )
     .map_err(|error| {
         spral_error_attempt(
@@ -12412,6 +12549,8 @@ fn factor_solve_spral_src_symmetric_with_metrics(
         return Err(InteriorPointLinearSolveAttempt {
             solver: InteriorPointLinearSolver::SpralSrc,
             regularization,
+            primal_diagonal_shift: None,
+            dual_regularization: None,
             inertia: None,
             failure_kind: InteriorPointLinearSolveFailureKind::FactorizationFailed,
             detail: None,
@@ -13052,11 +13191,9 @@ fn spral_augmented_kkt_regularization_shifts(
     regularization: f64,
 ) -> (f64, f64) {
     match solver {
-        InteriorPointLinearSolver::SpralSrc => (regularization.max(0.0), 0.0),
-        InteriorPointLinearSolver::SsidsRs | InteriorPointLinearSolver::Auto => (
-            sparse_hessian_diagonal_shift(system.hessian, regularization),
-            regularization.max(1e-8),
-        ),
+        InteriorPointLinearSolver::SpralSrc
+        | InteriorPointLinearSolver::SsidsRs
+        | InteriorPointLinearSolver::Auto => (regularization.max(0.0), 0.0),
         InteriorPointLinearSolver::SparseQdldl => (
             sparse_hessian_diagonal_shift(system.hessian, regularization),
             regularization.max(1e-8),
@@ -13565,6 +13702,64 @@ fn factor_solve_spral_ssids(
     // factorization path versus native SPRAL; keep the solver's own small pivot
     // floor instead.
     let numeric_options = system_spral_numeric_factor_options(system);
+    let analysis_options = SpralSsidsOptions::spral_default();
+    let value_dependent_analysis = matches!(
+        analysis_options.ordering,
+        SpralOrderingStrategy::SpralMatching
+    );
+    let mut reused_symbolic =
+        workspace.factor_regularization.is_some() && !value_dependent_analysis;
+    if value_dependent_analysis || workspace.symbolic.is_none() {
+        let started = Instant::now();
+        profiling.sparse_symbolic_analyses += 1;
+        if verbose {
+            println!(
+                "[NLIP][SPRAL] Starting value-dependent symbolic analysis: dim={} nnz={} ordering=spral_matching",
+                workspace.pattern.dimension(),
+                workspace.pattern.ccs.nnz(),
+            );
+        }
+        let analysis_heartbeat =
+            verbose.then(|| spawn_spral_stage_heartbeat("[NLIP][SPRAL] Symbolic analysis"));
+        match spral_analyse(matrix, &analysis_options) {
+            Ok((symbolic, info)) => {
+                if let Some((finished, handle)) = analysis_heartbeat {
+                    finished.store(true, Ordering::Relaxed);
+                    handle.thread().unpark();
+                    let _ = handle.join();
+                }
+                let elapsed = started.elapsed();
+                profiling.sparse_symbolic_analysis_time += elapsed;
+                if verbose {
+                    println!(
+                        "[NLIP][SPRAL] Symbolic analysis completed in {}: est_fill={} supernodes={} max_width={} ordering={}",
+                        compact_duration_text(elapsed.as_secs_f64()),
+                        info.estimated_fill_nnz,
+                        info.supernode_count,
+                        info.max_supernode_width,
+                        info.ordering_kind,
+                    );
+                }
+                workspace.symbolic = Some(symbolic);
+                workspace.factor = None;
+                workspace.factor_regularization = None;
+                reused_symbolic = false;
+            }
+            Err(error) => {
+                if let Some((finished, handle)) = analysis_heartbeat {
+                    finished.store(true, Ordering::Relaxed);
+                    handle.thread().unpark();
+                    let _ = handle.join();
+                }
+                profiling.sparse_symbolic_analysis_time += started.elapsed();
+                return Err(spral_error_attempt(
+                    regularization,
+                    InteriorPointLinearSolveFailureKind::FactorizationFailed,
+                    error,
+                ));
+            }
+        }
+    }
 
     let needs_new_factor = workspace.factor.is_none()
         || workspace
@@ -13631,7 +13826,11 @@ fn factor_solve_spral_ssids(
         }
         let factorization_heartbeat =
             verbose.then(|| spawn_spral_stage_heartbeat("[NLIP][SPRAL] Numeric factorization"));
-        match spral_factorize(matrix, &workspace.symbolic, &numeric_options) {
+        let symbolic = workspace
+            .symbolic
+            .as_ref()
+            .expect("SSIDS-RS symbolic factor must exist before numeric factorization");
+        match spral_factorize(matrix, symbolic, &numeric_options) {
             Ok((factor, _)) => {
                 if let Some((finished, handle)) = factorization_heartbeat {
                     finished.store(true, Ordering::Relaxed);
@@ -13668,7 +13867,6 @@ fn factor_solve_spral_ssids(
         }
     }
 
-    let reused_symbolic = !needs_new_factor;
     let factor = workspace.factor.as_mut().expect("factorization must exist");
     let expected_inertia = spral_expected_augmented_inertia(&workspace.pattern);
     let actual_inertia = factor.inertia();
@@ -13676,6 +13874,8 @@ fn factor_solve_spral_ssids(
         return Err(InteriorPointLinearSolveAttempt {
             solver: InteriorPointLinearSolver::SsidsRs,
             regularization,
+            primal_diagonal_shift: None,
+            dual_regularization: None,
             inertia: Some(Box::new(interior_point_linear_inertia(actual_inertia))),
             failure_kind: InteriorPointLinearSolveFailureKind::InertiaMismatch,
             detail: Some(inertia_mismatch_detail(expected_inertia, actual_inertia)),
@@ -13847,6 +14047,8 @@ fn factor_solve_spral_src(
         return Err(InteriorPointLinearSolveAttempt {
             solver: InteriorPointLinearSolver::SpralSrc,
             regularization,
+            primal_diagonal_shift: None,
+            dual_regularization: None,
             inertia: Some(Box::new(interior_point_linear_inertia(factor_info.inertia))),
             failure_kind: InteriorPointLinearSolveFailureKind::InertiaMismatch,
             detail: Some(inertia_mismatch_detail(
@@ -13927,6 +14129,8 @@ fn factor_solve_spral_src(
             return Err(InteriorPointLinearSolveAttempt {
                 solver: InteriorPointLinearSolver::SpralSrc,
                 regularization,
+                primal_diagonal_shift: None,
+                dual_regularization: None,
                 inertia: Some(Box::new(interior_point_linear_inertia(factor_info.inertia))),
                 failure_kind: InteriorPointLinearSolveFailureKind::InertiaMismatch,
                 detail: Some(format!(
@@ -14088,6 +14292,8 @@ fn factor_solve_spral_src(
                 return Err(InteriorPointLinearSolveAttempt {
                     solver: InteriorPointLinearSolver::SpralSrc,
                     regularization,
+                    primal_diagonal_shift: None,
+                    dual_regularization: None,
                     inertia: Some(Box::new(interior_point_linear_inertia(factor_info.inertia))),
                     failure_kind: InteriorPointLinearSolveFailureKind::ResidualTooLarge,
                     detail: Some(format!(
@@ -14109,6 +14315,8 @@ fn factor_solve_spral_src(
                 return Err(InteriorPointLinearSolveAttempt {
                     solver: InteriorPointLinearSolver::SpralSrc,
                     regularization,
+                    primal_diagonal_shift: None,
+                    dual_regularization: None,
                     inertia: Some(Box::new(interior_point_linear_inertia(factor_info.inertia))),
                     failure_kind: InteriorPointLinearSolveFailureKind::ResidualTooLarge,
                     detail: Some(format!(
@@ -14515,6 +14723,7 @@ fn solve_reduced_kkt_with_spral_src_oriented(
                 });
             }
             Err(attempt) => {
+                let attempt = linear_attempt_with_shifts(attempt, primal_shift, dual_shift);
                 let singularity_like_failure = is_singularity_like_linear_failure(&attempt);
                 let too_few_negative_eigenvalues = is_negative_eigenvalues_too_few(&attempt);
                 let full_space_refinement_quality_retry = attempt.failure_kind
@@ -14605,6 +14814,8 @@ fn spral_refinement_failure_attempt(
     InteriorPointLinearSolveAttempt {
         solver: InteriorPointLinearSolver::SpralSrc,
         regularization,
+        primal_diagonal_shift: None,
+        dual_regularization: None,
         inertia: inertia.map(Box::new),
         failure_kind: InteriorPointLinearSolveFailureKind::ResidualTooLarge,
         detail: Some(format!(
@@ -14804,6 +15015,7 @@ fn solve_restoration_reduced_kkt_with_spral_src(
                     debug_dump_dir,
                     iteration,
                     phase,
+                    InteriorPointLinearSolver::SpralSrc,
                     restoration_reduced_kkt,
                     &initial_reduced_rhs,
                     reduced_system,
@@ -14879,6 +15091,7 @@ fn solve_restoration_reduced_kkt_with_spral_src(
                                 ipopt_refinement_failure_detail(failure_decision),
                                 refinement_options.residual_ratio_max,
                             );
+                            set_linear_attempt_shifts(&mut attempt, primal_shift, dual_shift);
                             if let Some((old_u, new_u)) =
                                 try_increase_native_spral_quality(workspace, reduced_system)
                             {
@@ -14892,12 +15105,16 @@ fn solve_restoration_reduced_kkt_with_spral_src(
                             }
                         }
                         IpoptRefinementFailureDecision::PretendSingular => {
-                            attempts.push(spral_refinement_failure_attempt(
-                                current_regularization,
-                                backend_stats.inertia,
-                                &refinement,
-                                ipopt_refinement_failure_detail(failure_decision),
-                                refinement_options.residual_ratio_singular,
+                            attempts.push(linear_attempt_with_shifts(
+                                spral_refinement_failure_attempt(
+                                    current_regularization,
+                                    backend_stats.inertia,
+                                    &refinement,
+                                    ipopt_refinement_failure_detail(failure_decision),
+                                    refinement_options.residual_ratio_singular,
+                                ),
+                                primal_shift,
+                                dual_shift,
                             ));
                             pretend_singular_refinement_last_time = true;
                             if full_meq + full_mineq > 0 {
@@ -14992,6 +15209,20 @@ fn solve_restoration_reduced_kkt_with_spral_src(
                 });
             }
             Err(attempt) => {
+                let attempt = linear_attempt_with_shifts(attempt, primal_shift, dual_shift);
+                dump_restoration_inner_linear_debug_failure_snapshot(
+                    debug_dump_dir,
+                    iteration,
+                    retry_index,
+                    phase,
+                    InteriorPointLinearSolver::SpralSrc,
+                    reduced_system,
+                    &workspace.values,
+                    &initial_reduced_rhs.augmented_rhs,
+                    current_regularization,
+                    current_jacobian_regularization,
+                    &attempt,
+                );
                 let singularity_like_failure = is_singularity_like_linear_failure(&attempt);
                 let too_few_negative_eigenvalues = is_negative_eigenvalues_too_few(&attempt);
                 attempts.push(attempt);
@@ -15049,6 +15280,385 @@ fn solve_restoration_reduced_kkt_with_spral_src(
     ))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Restoration reduced KKT solve mirrors IPOPT call inputs and diagnostic context."
+)]
+fn solve_restoration_reduced_kkt_with_spral_ssids(
+    full_system: &ReducedKktSystem<'_>,
+    restoration_reduced_kkt: &RestorationReducedKktSystem,
+    reduced_system: &ReducedKktSystem<'_>,
+    workspace: &mut SpralAugmentedKktWorkspace,
+    profiling: &mut InteriorPointProfiling,
+    verbose: bool,
+    capture_trace: bool,
+    debug_dump_dir: Option<&std::path::Path>,
+    iteration: Index,
+    phase: InteriorPointIterationPhase,
+) -> std::result::Result<NewtonDirection, InteriorPointSolveError> {
+    let full_pattern = build_spral_augmented_kkt_pattern(
+        full_system.hessian.lower_triangle.as_ref(),
+        full_system.equality_jacobian.structure.as_ref(),
+        full_system.inequality_jacobian.structure.as_ref(),
+    )?;
+    let full_n = full_system.hessian.lower_triangle.nrow;
+    let full_meq = full_system.equality_jacobian.nrows();
+    let full_mineq = full_system.inequality_jacobian.nrows();
+    let rhs_started = Instant::now();
+    let full_rhs = build_ipopt_augmented_kkt_rhs(
+        full_system,
+        &full_pattern,
+        IpoptLinearRhsOrientation::PreFinal,
+    );
+    let initial_reduced_rhs = restoration_reduced_kkt.reduce_augmented_rhs(
+        &full_pattern,
+        &workspace.pattern,
+        &full_rhs,
+    )?;
+    profiling.linear_rhs_assemblies += 1;
+    profiling.linear_rhs_assembly_time += rhs_started.elapsed();
+
+    let mut attempts: Vec<InteriorPointLinearSolveAttempt> = Vec::new();
+    let mut current_regularization = reduced_system.regularization.max(1e-12);
+    let (mut current_jacobian_regularization, jacobian_regularization_already_active) =
+        ipopt_initial_jacobian_regularization(reduced_system);
+    let mut perturbation_test_status = initial_ipopt_perturbation_test_status(
+        reduced_system.perturb_always_cd,
+        jacobian_regularization_already_active,
+    );
+    let max_regularization = reduced_system
+        .regularization_max
+        .max(current_regularization);
+    let max_retry_count = reduced_system.adaptive_regularization_retries + 2;
+    let mut pretend_singular_refinement_last_time = false;
+
+    for retry_index in 0..=max_retry_count {
+        let primal_shift = current_regularization.max(0.0);
+        let slack_shift = primal_shift;
+        let dual_shift = current_jacobian_regularization;
+        let values_started = Instant::now();
+        fill_spral_augmented_kkt_values(
+            &workspace.pattern,
+            &mut workspace.values,
+            reduced_system,
+            primal_shift,
+            slack_shift,
+            dual_shift,
+        );
+        profiling.linear_kkt_value_assemblies += 1;
+        profiling.linear_kkt_value_assembly_time += values_started.elapsed();
+
+        match factor_solve_spral_ssids(
+            reduced_system,
+            workspace,
+            &initial_reduced_rhs.augmented_rhs,
+            current_regularization,
+            profiling,
+            verbose,
+        ) {
+            Ok((reduced_solution, mut backend_stats)) => {
+                let reduced_pattern = workspace.pattern.clone();
+                let inner_solution_prefinal_unrefined = reduced_solution.clone();
+                let solution_prefinal_unrefined = restoration_reduced_kkt
+                    .expand_prefinal_augmented_vector(
+                        &reduced_pattern,
+                        &full_pattern,
+                        &reduced_solution,
+                        &initial_reduced_rhs,
+                    );
+                let mut full_space_solution = restoration_reduced_kkt
+                    .expand_prefinal_full_space_solution(
+                        &reduced_pattern,
+                        full_system,
+                        &full_pattern,
+                        &reduced_solution,
+                        &initial_reduced_rhs,
+                    );
+                let mut refinement_solve_time = Duration::ZERO;
+                let refinement_context = IpoptLinearSolveContext {
+                    shifts: IpoptLinearRefinementShifts {
+                        primal: primal_shift,
+                        slack: slack_shift,
+                        dual: dual_shift,
+                    },
+                    rhs_orientation: IpoptLinearRhsOrientation::PreFinal,
+                    allow_inexact: false,
+                    native_spral_quality_was_increased: false,
+                    pretend_singular_last_time: pretend_singular_refinement_last_time,
+                    capture_trace,
+                };
+                let mut inner_refinement_corrections = Vec::new();
+                let refinement = refine_ipopt_full_space_solution(
+                    full_system,
+                    &full_pattern,
+                    &mut full_space_solution,
+                    &refinement_context,
+                    &mut refinement_solve_time,
+                    |full_correction_rhs| {
+                        let reduced_correction_rhs = restoration_reduced_kkt
+                            .reduce_augmented_rhs(
+                                &full_pattern,
+                                &reduced_pattern,
+                                full_correction_rhs,
+                            )
+                            .map_err(|error| {
+                                spral_error_attempt(
+                                    current_regularization,
+                                    InteriorPointLinearSolveFailureKind::FactorizationFailed,
+                                    error,
+                                )
+                            })?;
+                        let factor = workspace.factor.as_mut().ok_or_else(|| {
+                            spral_error_attempt(
+                                current_regularization,
+                                InteriorPointLinearSolveFailureKind::FactorizationFailed,
+                                "ssids_rs factor missing during restoration refinement",
+                            )
+                        })?;
+                        let reduced_correction = factor
+                            .solve(&reduced_correction_rhs.augmented_rhs)
+                            .map_err(|error| {
+                                spral_error_attempt(
+                                    current_regularization,
+                                    InteriorPointLinearSolveFailureKind::FactorizationFailed,
+                                    error,
+                                )
+                            })?;
+                        if capture_trace {
+                            inner_refinement_corrections.push((
+                                reduced_correction_rhs.augmented_rhs.clone(),
+                                reduced_correction.clone(),
+                            ));
+                        }
+                        Ok(restoration_reduced_kkt.expand_prefinal_augmented_vector(
+                            &reduced_pattern,
+                            &full_pattern,
+                            &reduced_correction,
+                            &reduced_correction_rhs,
+                        ))
+                    },
+                )
+                .map_err(|attempt| {
+                    linear_solve_error(
+                        InteriorPointLinearSolver::SsidsRs,
+                        full_pattern.dimension(),
+                        vec![attempt],
+                    )
+                })?;
+                dump_restoration_inner_linear_debug_snapshot(
+                    debug_dump_dir,
+                    iteration,
+                    phase,
+                    InteriorPointLinearSolver::SsidsRs,
+                    restoration_reduced_kkt,
+                    &initial_reduced_rhs,
+                    reduced_system,
+                    &workspace.values,
+                    &initial_reduced_rhs.augmented_rhs,
+                    &inner_solution_prefinal_unrefined,
+                    &inner_refinement_corrections,
+                    &refinement.trace_steps,
+                    primal_shift,
+                    dual_shift,
+                    &backend_stats,
+                );
+                backend_stats.solve_time += refinement_solve_time;
+                profiling.linear_backsolve_time += refinement_solve_time;
+
+                let mut detail = Some(format!(
+                    "aug_resto_full_space_iterative_refinement_steps={} residual_ratio={:.3e}->{:.3e} residuals=[{}]->[{}]",
+                    refinement.steps,
+                    refinement.initial_residual_ratio,
+                    refinement.residual_ratio,
+                    ipopt_full_space_residual_metrics_text(refinement.initial_residual),
+                    ipopt_full_space_residual_metrics_text(refinement.final_residual),
+                ));
+                if let Some(inner_detail) = backend_stats.detail.take() {
+                    detail = Some(format!(
+                        "{}; aug_resto_inner=[{}]",
+                        detail.expect("restoration refinement detail"),
+                        inner_detail
+                    ));
+                }
+                if !attempts.is_empty() {
+                    let attempt_detail = attempts
+                        .iter()
+                        .map(|attempt| {
+                            format!(
+                                "reg={:.3e}:{}:{}",
+                                attempt.regularization,
+                                attempt.failure_kind.label(),
+                                attempt.detail.as_deref().unwrap_or("--")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    detail = Some(format!(
+                        "{}; prior_attempts=[{}]",
+                        detail.expect("restoration refinement detail"),
+                        attempt_detail
+                    ));
+                }
+
+                if refinement.failed {
+                    let refinement_options = full_system.refinement_options();
+                    let failure_decision = ipopt_refinement_failure_decision(
+                        refinement.residual_ratio,
+                        refinement_options,
+                        false,
+                        false,
+                        pretend_singular_refinement_last_time,
+                    );
+                    match failure_decision {
+                        IpoptRefinementFailureDecision::RetryWithHigherQuality => {}
+                        IpoptRefinementFailureDecision::PretendSingular => {
+                            let mut attempt = spral_refinement_failure_attempt(
+                                current_regularization,
+                                backend_stats.inertia,
+                                &refinement,
+                                ipopt_refinement_failure_detail(failure_decision),
+                                refinement_options.residual_ratio_singular,
+                            );
+                            attempt.solver = InteriorPointLinearSolver::SsidsRs;
+                            set_linear_attempt_shifts(&mut attempt, primal_shift, dual_shift);
+                            attempts.push(attempt);
+                            pretend_singular_refinement_last_time = true;
+                            if full_meq + full_mineq > 0 {
+                                if let Some(next_perturbation) = ipopt_perturb_for_singularity(
+                                    current_regularization,
+                                    current_jacobian_regularization,
+                                    perturbation_test_status,
+                                    ipopt_perturbation_retry_config(
+                                        reduced_system,
+                                        max_regularization,
+                                    ),
+                                ) {
+                                    current_regularization = next_perturbation.regularization;
+                                    current_jacobian_regularization =
+                                        next_perturbation.jacobian_regularization;
+                                    perturbation_test_status = next_perturbation.test_status;
+                                    workspace.factor = None;
+                                    workspace.factor_regularization = None;
+                                    continue;
+                                }
+                                break;
+                            }
+                        }
+                        IpoptRefinementFailureDecision::AcceptCurrentSolution { .. } => {
+                            let accept_detail = ipopt_refinement_failure_detail(failure_decision);
+                            detail = Some(format!(
+                                "{}; ipopt_full_space_iterative_refinement_failed residual_ratio={:.3e}; {accept_detail}",
+                                detail.expect("restoration refinement detail"),
+                                refinement.residual_ratio
+                            ));
+                        }
+                    }
+                }
+
+                let linear_trace = capture_trace.then(|| IpoptLinearSolveTrace {
+                    rhs_prefinal: full_rhs.clone(),
+                    solution_prefinal_unrefined,
+                    refinement_steps: refinement.trace_steps.clone(),
+                });
+                negate_spral_full_space_solution(&mut full_space_solution);
+                let SpralSrcFullSpaceSolution {
+                    augmented_solution: solution,
+                    lower_bound_multiplier_step,
+                    upper_bound_multiplier_step,
+                    upper_slack_multiplier_step,
+                } = full_space_solution;
+                backend_stats.residual_inf = refinement.final_residual.residual_inf;
+                backend_stats.solution_inf = refinement.final_residual.solution_inf;
+                backend_stats.detail = detail;
+                let dx = solution[..full_n].to_vec();
+                let ds =
+                    solution[full_pattern.p_offset..full_pattern.p_offset + full_mineq].to_vec();
+                let d_lambda = solution
+                    [full_pattern.lambda_offset..full_pattern.lambda_offset + full_meq]
+                    .to_vec();
+                let d_ineq =
+                    solution[full_pattern.z_offset..full_pattern.z_offset + full_mineq].to_vec();
+                let dz = upper_slack_multiplier_step;
+                return Ok(NewtonDirection {
+                    dx,
+                    d_lambda,
+                    d_ineq,
+                    ds,
+                    dz,
+                    dz_lower: lower_bound_multiplier_step,
+                    dz_upper: upper_bound_multiplier_step,
+                    solver_used: InteriorPointLinearSolver::SsidsRs,
+                    regularization_used: current_regularization.max(primal_shift),
+                    dual_regularization_used: dual_shift,
+                    primal_diagonal_shift_used: primal_shift,
+                    linear_solution: solution,
+                    linear_trace,
+                    backend_stats,
+                    linear_debug: None,
+                });
+            }
+            Err(attempt) => {
+                let attempt = linear_attempt_with_shifts(attempt, primal_shift, dual_shift);
+                dump_restoration_inner_linear_debug_failure_snapshot(
+                    debug_dump_dir,
+                    iteration,
+                    retry_index,
+                    phase,
+                    InteriorPointLinearSolver::SsidsRs,
+                    reduced_system,
+                    &workspace.values,
+                    &initial_reduced_rhs.augmented_rhs,
+                    current_regularization,
+                    current_jacobian_regularization,
+                    &attempt,
+                );
+                let singularity_like_failure = is_singularity_like_linear_failure(&attempt);
+                attempts.push(attempt);
+                workspace.factor = None;
+                workspace.factor_regularization = None;
+                if singularity_like_failure && full_meq + full_mineq > 0 {
+                    if let Some(next_perturbation) = ipopt_perturb_for_singularity(
+                        current_regularization,
+                        current_jacobian_regularization,
+                        perturbation_test_status,
+                        ipopt_perturbation_retry_config(reduced_system, max_regularization),
+                    ) {
+                        current_regularization = next_perturbation.regularization;
+                        current_jacobian_regularization = next_perturbation.jacobian_regularization;
+                        perturbation_test_status = next_perturbation.test_status;
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+
+        if retry_index == max_retry_count || current_regularization >= max_regularization {
+            break;
+        }
+        let Some(next_perturbation) = ipopt_perturb_for_wrong_inertia(
+            current_regularization,
+            current_jacobian_regularization,
+            perturbation_test_status,
+            full_meq + full_mineq > 0,
+            ipopt_perturbation_retry_config(reduced_system, max_regularization),
+        ) else {
+            break;
+        };
+        current_regularization = next_perturbation.regularization;
+        current_jacobian_regularization = next_perturbation.jacobian_regularization;
+        perturbation_test_status = next_perturbation.test_status;
+        workspace.factor = None;
+        workspace.factor_regularization = None;
+    }
+
+    Err(linear_solve_error(
+        InteriorPointLinearSolver::SsidsRs,
+        full_pattern.dimension(),
+        attempts,
+    ))
+}
+
 fn solve_reduced_kkt_with_spral_ssids(
     system: &ReducedKktSystem<'_>,
     workspace: &mut SpralAugmentedKktWorkspace,
@@ -15062,24 +15672,25 @@ fn solve_reduced_kkt_with_spral_ssids(
     let rhs = build_ipopt_augmented_kkt_rhs(
         system,
         &workspace.pattern,
-        IpoptLinearRhsOrientation::FinalDirection,
+        IpoptLinearRhsOrientation::PreFinal,
     );
     profiling.linear_rhs_assemblies += 1;
     profiling.linear_rhs_assembly_time += rhs_started.elapsed();
 
     let mut attempts = Vec::new();
-    let mut current_regularization = if system.forced_jacobian_regularization.is_some() {
-        system.regularization.max(0.0)
-    } else {
-        system.regularization.max(1e-12)
-    };
+    let mut current_regularization = system.regularization.max(0.0);
+    let (mut current_jacobian_regularization, jacobian_regularization_already_active) =
+        ipopt_initial_jacobian_regularization(system);
+    let mut perturbation_test_status = initial_ipopt_perturbation_test_status(
+        system.perturb_always_cd,
+        jacobian_regularization_already_active,
+    );
     let max_regularization = system.regularization_max.max(current_regularization);
-    for retry_index in 0..=system.adaptive_regularization_retries {
-        let primal_shift = sparse_hessian_diagonal_shift(system.hessian, current_regularization);
+    let max_retry_count = system.adaptive_regularization_retries + 2;
+    for retry_index in 0..=max_retry_count {
+        let primal_shift = current_regularization;
         let slack_shift = primal_shift;
-        let dual_shift = system
-            .forced_jacobian_regularization
-            .unwrap_or_else(|| current_regularization.max(1e-8));
+        let dual_shift = current_jacobian_regularization;
         let values_started = Instant::now();
         assemble_spral_augmented_kkt_values(
             workspace,
@@ -15098,7 +15709,119 @@ fn solve_reduced_kkt_with_spral_ssids(
             profiling,
             verbose,
         ) {
-            Ok((solution, backend_stats)) => {
+            Ok((solution, mut backend_stats)) => {
+                let (lower_bound_multiplier_step, upper_bound_multiplier_step) =
+                    system.bound_data.map_or_else(
+                        || (Vec::new(), Vec::new()),
+                        |bound_data| {
+                            ipopt_bound_multiplier_steps_for_orientation(
+                                system,
+                                bound_data,
+                                &solution[..n],
+                                IpoptLinearRhsOrientation::PreFinal,
+                            )
+                        },
+                    );
+                let upper_slack_multiplier_step =
+                    ipopt_upper_slack_bound_multiplier_steps_for_orientation(
+                        system,
+                        &solution[workspace.pattern.p_offset..workspace.pattern.p_offset + mineq],
+                        IpoptLinearRhsOrientation::PreFinal,
+                    );
+                let mut full_space_solution = SpralSrcFullSpaceSolution {
+                    augmented_solution: solution,
+                    lower_bound_multiplier_step,
+                    upper_bound_multiplier_step,
+                    upper_slack_multiplier_step,
+                };
+                let context = IpoptLinearSolveContext {
+                    shifts: IpoptLinearRefinementShifts {
+                        primal: primal_shift,
+                        slack: slack_shift,
+                        dual: dual_shift,
+                    },
+                    rhs_orientation: IpoptLinearRhsOrientation::PreFinal,
+                    allow_inexact: false,
+                    native_spral_quality_was_increased: false,
+                    pretend_singular_last_time: false,
+                    capture_trace: false,
+                };
+                let mut full_space_refinement_time = Duration::ZERO;
+                let refinement = {
+                    let factor = workspace
+                        .factor
+                        .as_mut()
+                        .expect("SSIDS-RS factor must exist after linear solve");
+                    refine_ipopt_full_space_solution(
+                        system,
+                        &workspace.pattern,
+                        &mut full_space_solution,
+                        &context,
+                        &mut full_space_refinement_time,
+                        |residual| {
+                            factor.solve(residual).map_err(|error| {
+                                spral_error_attempt(
+                                    current_regularization,
+                                    InteriorPointLinearSolveFailureKind::FactorizationFailed,
+                                    error,
+                                )
+                            })
+                        },
+                    )
+                };
+                match refinement {
+                    Ok(refinement) => {
+                        profiling.linear_backsolves += refinement.steps;
+                        profiling.linear_backsolve_time += full_space_refinement_time;
+                        backend_stats.solve_time += full_space_refinement_time;
+                        if refinement.steps > 0 || refinement.failed {
+                            let detail = format!(
+                                "full_space_iterative_refinement_steps={} residual_ratio={:.3e}->{:.3e} residuals=[{}]->[{}]{}",
+                                refinement.steps,
+                                refinement.initial_residual_ratio,
+                                refinement.residual_ratio,
+                                ipopt_full_space_residual_metrics_text(refinement.initial_residual),
+                                ipopt_full_space_residual_metrics_text(refinement.final_residual),
+                                if refinement.failed {
+                                    "; refinement_failed_accepted_for_ssids_rs"
+                                } else {
+                                    ""
+                                },
+                            );
+                            backend_stats.detail = Some(match backend_stats.detail.take() {
+                                Some(existing) => format!("{existing}; {detail}"),
+                                None => detail,
+                            });
+                        }
+                    }
+                    Err(attempt) => {
+                        attempts.push(linear_attempt_with_shifts(
+                            attempt,
+                            primal_shift,
+                            dual_shift,
+                        ));
+                        workspace.factor = None;
+                        workspace.factor_regularization = None;
+                        continue;
+                    }
+                }
+                negate_spral_full_space_solution(&mut full_space_solution);
+                let final_rhs = rhs.iter().map(|value| -*value).collect::<Vec<_>>();
+                if let Ok(assessment) = assess_linear_solution_ccs(
+                    &workspace.pattern.ccs,
+                    &workspace.values,
+                    &final_rhs,
+                    &full_space_solution.augmented_solution,
+                ) {
+                    backend_stats.residual_inf = assessment.residual_inf;
+                    backend_stats.solution_inf = assessment.solution_inf;
+                }
+                let SpralSrcFullSpaceSolution {
+                    augmented_solution: solution,
+                    lower_bound_multiplier_step,
+                    upper_bound_multiplier_step,
+                    upper_slack_multiplier_step,
+                } = full_space_solution;
                 let dx = solution[..n].to_vec();
                 let ipopt_ds = solution
                     [workspace.pattern.p_offset..workspace.pattern.p_offset + mineq]
@@ -15110,24 +15833,15 @@ fn solve_reduced_kkt_with_spral_ssids(
                 let d_ineq = solution
                     [workspace.pattern.z_offset..workspace.pattern.z_offset + mineq]
                     .to_vec();
-                let dz = system
-                    .r_cent
-                    .iter()
-                    .zip(system.multipliers.iter())
-                    .zip(system.slack.iter())
-                    .zip(ds.iter())
-                    .map(|(((r_cent_i, z_i), s_i), ds_i)| {
-                        ipopt_final_upper_slack_bound_multiplier_step(*s_i, *z_i, *r_cent_i, *ds_i)
-                    })
-                    .collect::<Vec<_>>();
+                let dz = upper_slack_multiplier_step;
                 return Ok(NewtonDirection {
                     dx,
                     d_lambda,
                     d_ineq,
                     ds,
                     dz,
-                    dz_lower: Vec::new(),
-                    dz_upper: Vec::new(),
+                    dz_lower: lower_bound_multiplier_step,
+                    dz_upper: upper_bound_multiplier_step,
                     solver_used: InteriorPointLinearSolver::SsidsRs,
                     regularization_used: current_regularization.max(primal_shift),
                     dual_regularization_used: dual_shift,
@@ -15139,23 +15853,46 @@ fn solve_reduced_kkt_with_spral_ssids(
                 });
             }
             Err(attempt) => {
+                let attempt = linear_attempt_with_shifts(attempt, primal_shift, dual_shift);
+                let singularity_like_failure = is_singularity_like_linear_failure(&attempt);
+                let too_few_negative_eigenvalues = is_negative_eigenvalues_too_few(&attempt);
                 attempts.push(attempt);
                 workspace.factor = None;
                 workspace.factor_regularization = None;
+                if singularity_like_failure && meq + mineq > 0 {
+                    if let Some(next_perturbation) = ipopt_perturb_for_singularity(
+                        current_regularization,
+                        current_jacobian_regularization,
+                        perturbation_test_status,
+                        ipopt_perturbation_retry_config(system, max_regularization),
+                    ) {
+                        current_regularization = next_perturbation.regularization;
+                        current_jacobian_regularization = next_perturbation.jacobian_regularization;
+                        perturbation_test_status = next_perturbation.test_status;
+                        continue;
+                    }
+                    break;
+                }
+                if too_few_negative_eigenvalues {
+                    // Fall through to the IPOPT wrong-inertia perturbation update below.
+                }
             }
         }
-        if retry_index == system.adaptive_regularization_retries
-            || current_regularization >= max_regularization
-        {
+        if retry_index == max_retry_count || current_regularization >= max_regularization {
             break;
         }
-        let next_regularization = (current_regularization
-            * system.regularization_growth_factor.max(1.0))
-        .min(max_regularization);
-        if next_regularization <= current_regularization {
+        let Some(next_perturbation) = ipopt_perturb_for_wrong_inertia(
+            current_regularization,
+            current_jacobian_regularization,
+            perturbation_test_status,
+            meq + mineq > 0,
+            ipopt_perturbation_retry_config(system, max_regularization),
+        ) else {
             break;
-        }
-        current_regularization = next_regularization;
+        };
+        current_regularization = next_perturbation.regularization;
+        current_jacobian_regularization = next_perturbation.jacobian_regularization;
+        perturbation_test_status = next_perturbation.test_status;
     }
     Err(attempts)
 }
@@ -15465,17 +16202,19 @@ fn solve_reduced_kkt(
         system.equality_jacobian.nrows(),
         system.inequality_jacobian.nrows(),
     );
+    let mut spral_workspace = spral_workspace;
+    let mut native_spral_workspace = native_spral_workspace;
     let spral_matrix_dimension = spral_workspace
         .as_ref()
         .map(|workspace| workspace.pattern.dimension());
     let mut attempts = Vec::new();
 
     if preferred_solver == InteriorPointLinearSolver::SpralSrc
-        && let Some(workspace) = native_spral_workspace
+        && let Some(workspace) = native_spral_workspace.as_mut()
     {
         return solve_reduced_kkt_with_spral_src(
             system,
-            workspace,
+            *workspace,
             profiling,
             verbose,
             allow_inexact,
@@ -15487,24 +16226,43 @@ fn solve_reduced_kkt(
     }
 
     if preferred_solver == InteriorPointLinearSolver::SsidsRs
-        && let Some(workspace) = spral_workspace
-        && !workspace.auto_fallback_disabled
+        && let Some(workspace) = spral_workspace.as_mut()
     {
-        match solve_reduced_kkt_with_spral_ssids(system, workspace, profiling, verbose) {
-            Ok(direction) => return Ok(direction),
-            Err(mut spral_attempts) => {
-                attempts.append(&mut spral_attempts);
-                if secondary_linear_solver(system.solver).is_some() {
-                    workspace.auto_fallback_disabled = true;
-                } else {
-                    return Err(linear_solve_error(
-                        preferred_solver,
-                        workspace.pattern.dimension(),
-                        attempts,
-                    ));
+        if !workspace.auto_fallback_disabled {
+            match solve_reduced_kkt_with_spral_ssids(system, workspace, profiling, verbose) {
+                Ok(direction) => return Ok(direction),
+                Err(mut spral_attempts) => {
+                    attempts.append(&mut spral_attempts);
+                    if native_spral_workspace.is_some() {
+                        workspace.auto_fallback_disabled = true;
+                    } else if secondary_linear_solver(system.solver).is_some() {
+                        workspace.auto_fallback_disabled = true;
+                    } else {
+                        return Err(linear_solve_error(
+                            preferred_solver,
+                            workspace.pattern.dimension(),
+                            attempts,
+                        ));
+                    }
                 }
             }
         }
+    }
+
+    if preferred_solver == InteriorPointLinearSolver::SsidsRs
+        && secondary_linear_solver(system.solver).is_none()
+        && !attempts.is_empty()
+    {
+        let matrix_dimension = spral_matrix_dimension.unwrap_or_else(|| {
+            system.hessian.lower_triangle.nrow
+                + system.equality_jacobian.nrows()
+                + 2 * system.inequality_jacobian.nrows()
+        });
+        return Err(linear_solve_error(
+            preferred_solver,
+            matrix_dimension,
+            attempts,
+        ));
     }
 
     match solve_reduced_kkt_with_sparse_qdldl(system) {
@@ -16801,6 +17559,73 @@ mod tests {
             InteriorPointStepColor::Tiny
         );
         assert_eq!(classify_ip_step(f64::NAN), InteriorPointStepColor::Tiny);
+    }
+
+    #[test]
+    fn linear_debug_failure_match_requires_same_failure_signature() {
+        let failed_result =
+            |solver: InteriorPointLinearSolver, detail: Option<&str>, success: bool| {
+                InteriorPointLinearDebugBackendResult {
+                    solver,
+                    success,
+                    regularization: 1e-6,
+                    inertia: Some(InteriorPointLinearInertia {
+                        positive: 2,
+                        negative: 1,
+                        zero: 0,
+                    }),
+                    residual_inf: None,
+                    solution_inf: None,
+                    step_inf: None,
+                    factorization_time: None,
+                    solve_time: None,
+                    reused_symbolic: None,
+                    step_delta_inf: None,
+                    dx_delta_inf: None,
+                    d_lambda_delta_inf: None,
+                    ds_delta_inf: None,
+                    dz_delta_inf: None,
+                    detail: detail.map(str::to_string),
+                }
+            };
+        let primary = failed_result(
+            InteriorPointLinearSolver::SsidsRs,
+            Some("wrong inertia"),
+            false,
+        );
+        let matching = failed_result(
+            InteriorPointLinearSolver::SpralSrc,
+            Some("wrong inertia"),
+            false,
+        );
+        assert!(linear_debug_failure_matches_primary(&primary, &matching));
+
+        let different_detail = failed_result(
+            InteriorPointLinearSolver::SpralSrc,
+            Some("singular matrix"),
+            false,
+        );
+        assert!(!linear_debug_failure_matches_primary(
+            &primary,
+            &different_detail
+        ));
+
+        let mut different_inertia = matching.clone();
+        different_inertia.inertia = Some(InteriorPointLinearInertia {
+            positive: 1,
+            negative: 2,
+            zero: 0,
+        });
+        assert!(!linear_debug_failure_matches_primary(
+            &primary,
+            &different_inertia
+        ));
+
+        let successful_compare = failed_result(InteriorPointLinearSolver::SpralSrc, None, true);
+        assert!(!linear_debug_failure_matches_primary(
+            &primary,
+            &successful_compare
+        ));
     }
 
     #[test]
@@ -21539,7 +22364,10 @@ where
             });
             current_snapshot.linear_solver = preferred_solver;
             let use_restoration_reduced_kkt = restoration_reduction.is_some()
-                && preferred_solver == InteriorPointLinearSolver::SpralSrc;
+                && matches!(
+                    preferred_solver,
+                    InteriorPointLinearSolver::SsidsRs | InteriorPointLinearSolver::SpralSrc
+                );
             if std::env::var_os("NLIP_RESTORATION_REDUCED_DEBUG").is_some()
                 && (restoration_depth > 0 || restoration_reduction.is_some())
             {
@@ -21594,7 +22422,10 @@ where
             }
             if !native_spral_workspace_unavailable
                 && native_spral_workspace.is_none()
-                && preferred_solver == InteriorPointLinearSolver::SpralSrc
+                && matches!(
+                    preferred_solver,
+                    InteriorPointLinearSolver::SsidsRs | InteriorPointLinearSolver::SpralSrc
+                )
                 && !use_restoration_reduced_kkt
             {
                 match prepare_native_spral_workspace(
@@ -21968,29 +22799,67 @@ where
             } else if let Some(error) = restoration_reduced_build_error {
                 Err(error)
             } else if let Some(reduced_system) = restoration_reduced_system.as_ref() {
-                match prepare_native_spral_workspace(
-                    reduced_system.hessian.lower_triangle.as_ref(),
-                    reduced_system.equality_jacobian.structure.as_ref(),
-                    reduced_system.inequality_jacobian.structure.as_ref(),
-                    &spral_numeric_factor_options(options),
-                    &mut profiling,
-                    options.verbose,
-                ) {
-                    Ok(mut workspace) => solve_restoration_reduced_kkt_with_spral_src(
-                        &reduced_kkt_system,
-                        restoration_reduced_kkt
-                            .as_ref()
-                            .expect("restoration reduced system exists"),
-                        reduced_system,
-                        &mut workspace,
+                match preferred_solver {
+                    InteriorPointLinearSolver::SsidsRs => {
+                        match prepare_spral_workspace(
+                            reduced_system.hessian.lower_triangle.as_ref(),
+                            reduced_system.equality_jacobian.structure.as_ref(),
+                            reduced_system.inequality_jacobian.structure.as_ref(),
+                            &mut profiling,
+                            options.verbose,
+                        ) {
+                            Ok(mut workspace) => solve_restoration_reduced_kkt_with_spral_ssids(
+                                &reduced_kkt_system,
+                                restoration_reduced_kkt
+                                    .as_ref()
+                                    .expect("restoration reduced system exists"),
+                                reduced_system,
+                                &mut workspace,
+                                &mut profiling,
+                                options.verbose,
+                                capture_linear_trace,
+                                restoration_inner_debug_dump_dir.as_deref(),
+                                iteration,
+                                current_snapshot.phase,
+                            ),
+                            Err(error) => Err(error),
+                        }
+                    }
+                    InteriorPointLinearSolver::SpralSrc => match prepare_native_spral_workspace(
+                        reduced_system.hessian.lower_triangle.as_ref(),
+                        reduced_system.equality_jacobian.structure.as_ref(),
+                        reduced_system.inequality_jacobian.structure.as_ref(),
+                        &spral_numeric_factor_options(options),
                         &mut profiling,
                         options.verbose,
-                        capture_linear_trace,
-                        restoration_inner_debug_dump_dir.as_deref(),
-                        iteration,
-                        current_snapshot.phase,
-                    ),
-                    Err(error) => Err(error),
+                    ) {
+                        Ok(mut workspace) => solve_restoration_reduced_kkt_with_spral_src(
+                            &reduced_kkt_system,
+                            restoration_reduced_kkt
+                                .as_ref()
+                                .expect("restoration reduced system exists"),
+                            reduced_system,
+                            &mut workspace,
+                            &mut profiling,
+                            options.verbose,
+                            capture_linear_trace,
+                            restoration_inner_debug_dump_dir.as_deref(),
+                            iteration,
+                            current_snapshot.phase,
+                        ),
+                        Err(error) => Err(error),
+                    },
+                    InteriorPointLinearSolver::Auto | InteriorPointLinearSolver::SparseQdldl => {
+                        solve_reduced_kkt(
+                            &reduced_kkt_system,
+                            spral_workspace.as_mut(),
+                            native_spral_workspace.as_mut(),
+                            &mut profiling,
+                            options.verbose,
+                            false,
+                            capture_linear_trace,
+                        )
+                    }
                 }
             } else {
                 solve_reduced_kkt(
@@ -22059,24 +22928,30 @@ where
                         && let Some(diagnostics) = context.failed_linear_solve.as_ref()
                     {
                         current_snapshot.linear_solver = *solver;
-                        let regularization = diagnostics
-                            .attempts
-                            .last()
+                        let last_attempt = diagnostics.attempts.last();
+                        let regularization = last_attempt
                             .map_or(reduced_kkt_system.regularization, |attempt| {
                                 attempt.regularization
                             });
                         let active_kkt_system = if use_restoration_reduced_kkt {
-                            &reduced_kkt_system
-                        } else {
                             restoration_reduced_system
                                 .as_ref()
                                 .unwrap_or(&reduced_kkt_system)
+                        } else {
+                            &reduced_kkt_system
                         };
-                        let (primal_shift, dual_shift) = spral_augmented_kkt_regularization_shifts(
-                            active_kkt_system,
-                            *solver,
-                            regularization,
-                        );
+                        let (default_primal_shift, default_dual_shift) =
+                            spral_augmented_kkt_regularization_shifts(
+                                active_kkt_system,
+                                *solver,
+                                regularization,
+                            );
+                        let primal_shift = last_attempt
+                            .and_then(|attempt| attempt.primal_diagonal_shift)
+                            .unwrap_or(default_primal_shift);
+                        let dual_shift = last_attempt
+                            .and_then(|attempt| attempt.dual_regularization)
+                            .unwrap_or(default_dual_shift);
                         if let Ok(snapshot) = build_interior_point_kkt_snapshot(
                             iteration,
                             current_snapshot.phase,
